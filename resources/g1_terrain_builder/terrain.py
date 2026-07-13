@@ -1,4 +1,7 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import hashlib
+import json
+import math
 import os
 import pickle
 import struct
@@ -6,12 +9,118 @@ import warnings
 
 import numpy as np
 from pxr import Usd, UsdGeom
-from scipy.spatial import cKDTree
 
 
 LOOKAHEAD = np.array([0.25, 0.50, 0.75, 1.00], np.float64)
 USD_DIR = "/home/ubuntu/datasets/GRAIL/data/curb/object_usd"
 RECON_DIR = "/home/ubuntu/datasets/GRAIL/data/curb/recon"
+BBOX_TOLERANCE_M = 1e-12
+PROJECTED_AREA_EPSILON_M2 = 1e-12
+BARYCENTRIC_TOLERANCE = 1e-10
+HEIGHTFIELD_HEADER = struct.Struct("<4sIII4f")
+HEIGHTFIELD_VERSION = 2
+HEIGHTFIELD_DIAGONAL = "min-x-min-z_to_max-x-max-z"
+HEIGHTFIELD_INTERPOLATION = "fixed-diagonal-triangles"
+HEIGHTFIELD_SCALAR_ENCODING = "ieee754-binary32-little-endian"
+HEIGHTFIELD_DOMAIN_POLICY = "inclusive-authoritative-node-rectangle"
+HEIGHTFIELD_GRID_LINE_POLICY = "positive-index-cell-except-maximum-edge"
+HEIGHTFIELD_DIAGONAL_TIE_POLICY = \
+    "tx-greater-or-equal-tz-uses-p00-p10-p11"
+HEIGHTFIELD_RASTER_BOUNDS_POLICY = \
+    "float32-minimum-rounded-down-and-maximum-ceil-covered"
+HEIGHTFIELD_OBJ_VERTEX_ORDER = "z-major-x-minor"
+HEIGHTFIELD_OBJ_FACE_ORDER = "p00-p11-p10_then_p00-p01-p11"
+HEIGHTFIELD_OBJ_FLOAT_FORMAT = ".9g-final-newline"
+HEIGHTFIELD_EXTERIOR_NORMAL = (0.0, 1.0, 0.0)
+HEIGHTFIELD_MAX_SAMPLES = np.iinfo(np.int32).max
+HEIGHTFIELD_MIN_NORMAL = float(np.finfo(np.float32).tiny)
+HEIGHTFIELD_SOURCE_NODE_ENCODING = \
+    "binary32-header-values-promoted-to-binary64-arithmetic"
+HEIGHTFIELD_RUNTIME_QUERY_ENCODING = \
+    "normal-or-zero-binary32-canonicalized-positive-and-promoted-to-binary64"
+HEIGHTFIELD_SCALAR_DOMAIN = "normal-or-zero-binary32"
+HEIGHTFIELD_CELL_DOMAIN = "positive-normal-binary32"
+HEIGHTFIELD_RUNTIME_NODE_DOMAIN = "normal-or-zero-binary32"
+HEIGHTFIELD_RUNTIME_QUERY_DOMAIN = "normal-or-zero-binary32-coordinates"
+HEIGHTFIELD_RUNTIME_PARITY_DOMAIN = "normal-or-zero-binary32-coordinates"
+HEIGHTFIELD_DENORMAL_POLICY = "reject-nonzero-binary32-subnormals"
+HEIGHTFIELD_EVALUATION_PRECISION = \
+    "binary64-from-binary32-samples-and-promoted-node-weights"
+HEIGHTFIELD_RUNTIME_HEIGHT_OUTPUT = \
+    "finite-binary64-interpolation-rounded-to-binary32"
+HEIGHTFIELD_NORMAL_EVALUATION = \
+    "selected-triangle-binary64-gradient-scale-safe-unit-normalization"
+HEIGHTFIELD_RUNTIME_NORMAL_OUTPUT = \
+    "unit-normal-components-rounded-to-binary32"
+HEIGHTFIELD_RUNTIME_OUTPUT_FTZ_POLICY = \
+    "binary32-subnormals-and-signed-zero-canonicalized-to-positive-zero"
+HEIGHTFIELD_ZERO_ENCODING = "canonical-positive-zero"
+HEIGHTFIELD_RUNTIME_NODE_DISTINGUISHABILITY_POLICY = \
+    "normal-or-positive-zero-strictly-increasing-proven-by-endpoints-" \
+    "near-zero-candidates-max-binary32-spacing-and-aligned-equality"
+HEIGHTFIELD_OBJ_COORDINATE_QUANTIZATION = \
+    "binary32-round-of-promoted-origin-plus-index-times-cell"
+
+SURFACE_SEMANTICS = {
+    "schema": "g1-terrain-surface/v1",
+    "coordinate_signature": "holden-y-up-right-handed-forward-plus-z",
+    "source_query": "vertical-triangle-top",
+    "polygon_triangulation": "fan-from-first-index",
+    "overlap_height_policy": "maximum-y",
+    "projected_boundary_policy": "closed",
+    "triangle_winding_policy": "orientation-independent",
+    "degenerate_projected_triangle_policy": "ignore",
+    "projected_area_measure": "absolute-two-times-area",
+    "bbox_tolerance_m": BBOX_TOLERANCE_M,
+    "projected_area_epsilon_m2": PROJECTED_AREA_EPSILON_M2,
+    "barycentric_tolerance": BARYCENTRIC_TOLERANCE,
+    "heightfield_schema": "G1HF/v2",
+    "heightfield_version": HEIGHTFIELD_VERSION,
+    "heightfield_interpolation": HEIGHTFIELD_INTERPOLATION,
+    "heightfield_diagonal": HEIGHTFIELD_DIAGONAL,
+    "heightfield_scalar_encoding": HEIGHTFIELD_SCALAR_ENCODING,
+    "heightfield_domain_policy": HEIGHTFIELD_DOMAIN_POLICY,
+    "heightfield_grid_line_policy": HEIGHTFIELD_GRID_LINE_POLICY,
+    "heightfield_diagonal_tie_policy": HEIGHTFIELD_DIAGONAL_TIE_POLICY,
+    "heightfield_exterior_normal": HEIGHTFIELD_EXTERIOR_NORMAL,
+    "heightfield_source_node_encoding": HEIGHTFIELD_SOURCE_NODE_ENCODING,
+    "heightfield_runtime_query_encoding": HEIGHTFIELD_RUNTIME_QUERY_ENCODING,
+    "heightfield_scalar_domain": HEIGHTFIELD_SCALAR_DOMAIN,
+    "heightfield_cell_domain": HEIGHTFIELD_CELL_DOMAIN,
+    "heightfield_runtime_node_domain": HEIGHTFIELD_RUNTIME_NODE_DOMAIN,
+    "heightfield_runtime_query_domain": HEIGHTFIELD_RUNTIME_QUERY_DOMAIN,
+    "heightfield_runtime_parity_domain": HEIGHTFIELD_RUNTIME_PARITY_DOMAIN,
+    "heightfield_denormal_policy": HEIGHTFIELD_DENORMAL_POLICY,
+    "heightfield_evaluation_precision": HEIGHTFIELD_EVALUATION_PRECISION,
+    "heightfield_runtime_height_output": HEIGHTFIELD_RUNTIME_HEIGHT_OUTPUT,
+    "heightfield_normal_evaluation": HEIGHTFIELD_NORMAL_EVALUATION,
+    "heightfield_runtime_normal_output": HEIGHTFIELD_RUNTIME_NORMAL_OUTPUT,
+    "heightfield_runtime_output_ftz_policy":
+        HEIGHTFIELD_RUNTIME_OUTPUT_FTZ_POLICY,
+    "heightfield_zero_encoding": HEIGHTFIELD_ZERO_ENCODING,
+    "heightfield_runtime_node_distinguishability_policy":
+        HEIGHTFIELD_RUNTIME_NODE_DISTINGUISHABILITY_POLICY,
+    "heightfield_obj_coordinate_quantization":
+        HEIGHTFIELD_OBJ_COORDINATE_QUANTIZATION,
+    "heightfield_raster_bounds_policy": HEIGHTFIELD_RASTER_BOUNDS_POLICY,
+    "heightfield_obj_vertex_order": HEIGHTFIELD_OBJ_VERTEX_ORDER,
+    "heightfield_obj_face_order": HEIGHTFIELD_OBJ_FACE_ORDER,
+    "heightfield_obj_float_format": HEIGHTFIELD_OBJ_FLOAT_FORMAT,
+    "cell_size_m": 0.02,
+    "exterior_height_m": 0.0,
+}
+
+
+def surface_semantics() -> dict:
+    return json.loads(json.dumps(SURFACE_SEMANTICS, sort_keys=True))
+
+
+def surface_semantics_signature() -> str:
+    payload = json.dumps(
+        SURFACE_SEMANTICS, sort_keys=True, separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 class FlatTerrain:
@@ -109,11 +218,12 @@ def _load_usd_mesh(base: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     for prim in stage.Traverse():
         if prim.IsA(UsdGeom.Mesh):
             mesh = UsdGeom.Mesh(prim)
-            points = np.asarray(mesh.GetPointsAttr().Get(), np.float64)
-            counts = np.asarray(
-                mesh.GetFaceVertexCountsAttr().Get(), np.int32)
-            indices = np.asarray(
-                mesh.GetFaceVertexIndicesAttr().Get(), np.int32)
+            points = np.array(
+                mesh.GetPointsAttr().Get(), np.float64, copy=True)
+            counts = _checked_int32_topology(
+                mesh.GetFaceVertexCountsAttr().Get(), "face counts")
+            indices = _checked_int32_topology(
+                mesh.GetFaceVertexIndicesAttr().Get(), "face indices")
             if points.ndim != 2 or points.shape[1:] != (3,):
                 raise ValueError(f"invalid GRAIL mesh points in {path}")
             if counts.ndim != 1 or indices.ndim != 1:
@@ -164,46 +274,116 @@ def _validate_mesh_topology(
             f"face indices must be in [0, {vertex_count})")
 
 
-def _densify_faces(
+def _checked_int32_topology(values, name: str) -> np.ndarray:
+    array = np.asarray(values)
+    if not np.issubdtype(array.dtype, np.integer):
+        raise ValueError(f"{name} must use an integer dtype")
+    if array.size:
+        minimum = int(array.min())
+        maximum = int(array.max())
+        limits = np.iinfo(np.int32)
+        if minimum < limits.min or maximum > limits.max:
+            raise ValueError(f"{name} must fit int32")
+    return np.array(array, np.int32, copy=True)
+
+
+def triangulate_faces(
     vertices: np.ndarray,
     face_counts: np.ndarray,
     face_indices: np.ndarray,
-    resolution: int = 6,
 ) -> np.ndarray:
     vertices = np.asarray(vertices, np.float64)
-    face_counts = np.asarray(face_counts, np.int32)
-    face_indices = np.asarray(face_indices, np.int32)
-    _validate_mesh_topology(vertices, face_counts, face_indices)
-    if resolution < 2:
-        raise ValueError("face sampling resolution must be at least 2")
+    counts = _checked_int32_topology(face_counts, "face counts")
+    indices = _checked_int32_topology(face_indices, "face indices")
+    _validate_mesh_topology(vertices, counts, indices)
+    triangles = []
+    cursor = 0
+    for count in counts:
+        face = indices[cursor:cursor + int(count)]
+        cursor += int(count)
+        triangles.extend(
+            (int(face[0]), int(face[index]), int(face[index + 1]))
+            for index in range(1, int(count) - 1)
+        )
+    return np.asarray(triangles, np.int32)
 
-    dense = [vertices]
-    offset = 0
-    uv = np.linspace(0.0, 1.0, resolution)
-    u, v = np.meshgrid(uv, uv)
-    u = u.ravel()
-    v = v.ravel()
-    for count in face_counts:
-        indices = face_indices[offset:offset + count]
-        offset += count
-        if count == 4:
-            a, b, c, d = vertices[indices]
-            bottom = a[None] * (1.0 - u[:, None]) + b[None] * u[:, None]
-            top = d[None] * (1.0 - u[:, None]) + c[None] * u[:, None]
-            dense.append(bottom * (1.0 - v[:, None]) + top * v[:, None])
-            continue
-        if count < 3:
-            raise ValueError(f"terrain face has only {count} vertices")
-        for index in range(1, count - 1):
-            a, b, c = vertices[[indices[0], indices[index], indices[index + 1]]]
-            samples = []
-            for ib in range(resolution + 1):
-                for ic in range(resolution + 1 - ib):
-                    wb = ib / resolution
-                    wc = ic / resolution
-                    samples.append(a * (1.0 - wb - wc) + b * wb + c * wc)
-            dense.append(np.asarray(samples, np.float64))
-    return np.concatenate(dense, axis=0)
+
+class VerticalTriangleSurface:
+    def __init__(
+        self,
+        vertices: np.ndarray,
+        triangles: np.ndarray,
+        exterior_height: float = 0.0,
+    ):
+        self.vertices = np.array(vertices, np.float64, copy=True)
+        self.triangles = _checked_int32_topology(
+            triangles, "surface triangle indices")
+        if self.vertices.ndim != 2 or self.vertices.shape[1:] != (3,) \
+                or not len(self.vertices):
+            raise ValueError("surface vertices must have non-empty shape (N, 3)")
+        if self.triangles.ndim != 2 or self.triangles.shape[1:] != (3,) \
+                or not len(self.triangles):
+            raise ValueError("surface triangles must have non-empty shape (M, 3)")
+        if np.any(self.triangles < 0) or np.any(self.triangles >= len(self.vertices)):
+            raise ValueError("surface triangle index is outside the vertex array")
+        if not np.isfinite(self.vertices).all() or not np.isfinite(exterior_height):
+            raise ValueError("surface vertices and exterior height must be finite")
+        self.exterior_height = float(exterior_height)
+        self._triangle_vertices = self.vertices[self.triangles]
+        projected = self._triangle_vertices[:, :, (0, 2)]
+        self._minimum_xz = projected.min(axis=1)
+        self._maximum_xz = projected.max(axis=1)
+        for array in (
+            self.vertices,
+            self.triangles,
+            self._triangle_vertices,
+            self._minimum_xz,
+            self._maximum_xz,
+        ):
+            array.setflags(write=False)
+
+    def height(self, x: float, z: float) -> float:
+        x, z = float(x), float(z)
+        if not np.isfinite(x) or not np.isfinite(z):
+            raise ValueError("terrain query coordinates must be finite")
+        candidates = np.flatnonzero(
+            (self._minimum_xz[:, 0] - BBOX_TOLERANCE_M <= x)
+            & (x <= self._maximum_xz[:, 0] + BBOX_TOLERANCE_M)
+            & (self._minimum_xz[:, 1] - BBOX_TOLERANCE_M <= z)
+            & (z <= self._maximum_xz[:, 1] + BBOX_TOLERANCE_M)
+        )
+        if not len(candidates):
+            return self.exterior_height
+        triangle = self._triangle_vertices[candidates]
+        a = triangle[:, 0]
+        b = triangle[:, 1]
+        c = triangle[:, 2]
+        v0x, v0z = b[:, 0] - a[:, 0], b[:, 2] - a[:, 2]
+        v1x, v1z = c[:, 0] - a[:, 0], c[:, 2] - a[:, 2]
+        px, pz = x - a[:, 0], z - a[:, 2]
+        determinant = v0x * v1z - v0z * v1x
+        projected = np.abs(determinant) > PROJECTED_AREA_EPSILON_M2
+        u = np.zeros_like(determinant)
+        v = np.zeros_like(determinant)
+        u[projected] = (
+            px[projected] * v1z[projected]
+            - pz[projected] * v1x[projected]
+        ) / determinant[projected]
+        v[projected] = (
+            v0x[projected] * pz[projected]
+            - v0z[projected] * px[projected]
+        ) / determinant[projected]
+        w = 1.0 - u - v
+        inside = projected \
+            & (u >= -BARYCENTRIC_TOLERANCE) \
+            & (v >= -BARYCENTRIC_TOLERANCE) \
+            & (w >= -BARYCENTRIC_TOLERANCE)
+        if not np.any(inside):
+            return self.exterior_height
+        heights = w[inside] * a[inside, 1] \
+            + u[inside] * b[inside, 1] \
+            + v[inside] * c[inside, 1]
+        return float(np.max(heights))
 
 
 def _mujoco_to_holden(points: np.ndarray) -> np.ndarray:
@@ -211,64 +391,36 @@ def _mujoco_to_holden(points: np.ndarray) -> np.ndarray:
     return np.column_stack((points[:, 0], points[:, 2], -points[:, 1]))
 
 
-class GrailTerrain:
-    def __init__(
-        self,
-        render_vertices: np.ndarray,
-        face_counts: np.ndarray,
-        face_indices: np.ndarray,
-        query_points: np.ndarray,
-        radius: float = 0.14,
-    ):
-        self._vertices = np.asarray(render_vertices, np.float64)
-        self._face_counts = np.asarray(face_counts, np.int32)
-        self._face_indices = np.asarray(face_indices, np.int32)
-        self._points = np.asarray(query_points, np.float64)
+class GrailTerrain(VerticalTriangleSurface):
+    def __init__(self, render_vertices, face_counts, face_indices):
+        self._vertices = np.array(render_vertices, np.float64, copy=True)
+        self._face_counts = _checked_int32_topology(
+            face_counts, "face counts")
+        self._face_indices = _checked_int32_topology(
+            face_indices, "face indices")
         _validate_mesh_topology(
             self._vertices, self._face_counts, self._face_indices)
-        if (
-            self._points.ndim != 2
-            or self._points.shape[1:] != (3,)
-            or not len(self._points)
-        ):
-            raise ValueError(
-                "GRAIL terrain query points must have non-empty shape (N, 3)")
-        if (
-            not np.all(np.isfinite(self._vertices))
-            or not np.all(np.isfinite(self._points))
-        ):
-            raise ValueError("GRAIL terrain points must be finite")
-        if radius <= 0.0:
-            raise ValueError(
-                "GRAIL terrain requires points and a positive query radius")
-        self._radius = float(radius)
-        self._tree = cKDTree(self._points[:, (0, 2)])
-        self._max_height = float(self._points[:, 1].max())
+        super().__init__(
+            self._vertices,
+            triangulate_faces(
+                self._vertices, self._face_counts, self._face_indices),
+            exterior_height=0.0,
+        )
+        self._max_height = float(self._vertices[:, 1].max())
+        self._vertices.setflags(write=False)
+        self._face_counts.setflags(write=False)
+        self._face_indices.setflags(write=False)
 
     @classmethod
     def from_base(cls, base: str) -> "GrailTerrain":
         vertices, face_counts, face_indices = _load_usd_mesh(base)
         rotation, translation = _object_pose0(base)
-        dense = _densify_faces(vertices, face_counts, face_indices)
         world_vertices = (rotation @ vertices.T).T + translation
-        world_dense = (rotation @ dense.T).T + translation
-        return cls(
-            _mujoco_to_holden(world_vertices),
-            face_counts,
-            face_indices,
-            _mujoco_to_holden(world_dense),
-        )
-
-    def height(self, x: float, z: float) -> float:
-        if not np.isfinite(x) or not np.isfinite(z):
-            raise ValueError("terrain query coordinates must be finite")
-        indices = self._tree.query_ball_point([x, z], self._radius)
-        if not indices:
-            return 0.0
-        return float(self._points[indices, 1].max())
+        return cls(_mujoco_to_holden(world_vertices), face_counts, face_indices)
 
     def footprint(self) -> dict:
-        top = self._points[self._points[:, 1] > self._max_height - 0.02]
+        top = self._vertices[
+            self._vertices[:, 1] > self._max_height - 0.02]
         return {
             "x": (float(top[:, 0].min()), float(top[:, 0].max())),
             "z": (float(top[:, 2].min()), float(top[:, 2].max())),
@@ -276,12 +428,11 @@ class GrailTerrain:
         }
 
     def xz_bounds(self) -> tuple[float, float, float, float]:
-        """Return complete render/query bounds as xmin, xmax, zmin, zmax."""
         return (
-            float(min(self._vertices[:, 0].min(), self._points[:, 0].min())),
-            float(max(self._vertices[:, 0].max(), self._points[:, 0].max())),
-            float(min(self._vertices[:, 2].min(), self._points[:, 2].min())),
-            float(max(self._vertices[:, 2].max(), self._points[:, 2].max())),
+            float(self._vertices[:, 0].min()),
+            float(self._vertices[:, 0].max()),
+            float(self._vertices[:, 2].min()),
+            float(self._vertices[:, 2].max()),
         )
 
     def export_obj(self, path: str) -> None:
@@ -293,6 +444,386 @@ class GrailTerrain:
                 indices = self._face_indices[offset:offset + count] + 1
                 offset += count
                 stream.write("f " + " ".join(str(int(i)) for i in indices) + "\n")
+
+
+def _authoritative_float32(value, name: str) -> float:
+    try:
+        value = float(value)
+        with np.errstate(over="ignore", invalid="ignore"):
+            encoded = np.float32(value)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(f"heightfield {name} must encode as float32") from error
+    decoded = float(encoded)
+    if not math.isfinite(decoded):
+        raise ValueError(f"heightfield {name} must encode as finite float32")
+    return 0.0 if decoded == 0.0 else decoded
+
+
+def _validate_heightfield_shape(shape: tuple[int, ...]) -> tuple[int, int]:
+    if len(shape) != 2 or shape[0] < 2 or shape[1] < 2:
+        raise ValueError("heightfield heights must have shape (nz, nx), both at least 2")
+    nz, nx = int(shape[0]), int(shape[1])
+    if nx > HEIGHTFIELD_MAX_SAMPLES or nz > HEIGHTFIELD_MAX_SAMPLES \
+            or nx * nz > HEIGHTFIELD_MAX_SAMPLES:
+        raise ValueError("heightfield dimensions and sample count must fit INT_MAX")
+    return nz, nx
+
+
+def _runtime_node_coordinate(
+    origin: float,
+    index: int,
+    cell_size: float,
+) -> tuple[float, float]:
+    source_coordinate = origin + index * cell_size
+    with np.errstate(over="ignore", invalid="ignore"):
+        runtime_coordinate = float(np.float32(source_coordinate))
+    if runtime_coordinate == 0.0:
+        runtime_coordinate = 0.0
+    return source_coordinate, runtime_coordinate
+
+
+def _is_normal_or_zero_binary32(value: float) -> bool:
+    return value == 0.0 or abs(value) >= HEIGHTFIELD_MIN_NORMAL
+
+
+def _require_normal_or_zero_binary32(value: float, name: str) -> None:
+    if not _is_normal_or_zero_binary32(value):
+        raise ValueError(
+            f"heightfield {name} must encode as normal-or-zero binary32")
+
+
+def _maximum_inward_spacing(
+    first: float,
+    last: float,
+    binary32: bool,
+) -> float:
+    def next_toward(value: float, direction: float) -> float:
+        if binary32:
+            return float(np.nextafter(
+                np.float32(value), np.float32(direction)))
+        return math.nextafter(value, direction)
+
+    if first >= 0.0:
+        return last - next_toward(last, -math.inf)
+    if last <= 0.0:
+        return next_toward(first, math.inf) - first
+    return max(
+        next_toward(first, math.inf) - first,
+        last - next_toward(last, -math.inf),
+    )
+
+
+def _validate_runtime_axis(
+    origin: float,
+    count: int,
+    cell_size: float,
+    axis: str,
+) -> None:
+    first_source, first_runtime = _runtime_node_coordinate(
+        origin, 0, cell_size)
+    second_source, second_runtime = _runtime_node_coordinate(
+        origin, 1, cell_size)
+    penultimate_source, penultimate_runtime = _runtime_node_coordinate(
+        origin, count - 2, cell_size)
+    last_source, last_runtime = _runtime_node_coordinate(
+        origin, count - 1, cell_size)
+    nodes = (
+        first_source, first_runtime, second_source, second_runtime,
+        penultimate_source, penultimate_runtime, last_source, last_runtime,
+    )
+    if not all(math.isfinite(value) for value in nodes) \
+            or second_source <= first_source \
+            or second_runtime <= first_runtime \
+            or last_source <= penultimate_source \
+            or last_runtime <= penultimate_runtime:
+        raise ValueError(
+            f"heightfield {axis} nodes must be finite and runtime-distinguishable")
+    if not all(_is_normal_or_zero_binary32(value) for value in (
+            first_runtime, second_runtime,
+            penultimate_runtime, last_runtime)):
+        raise ValueError(
+            f"heightfield {axis} nodes must be normal-or-zero binary32")
+
+    if first_source < 0.0 < last_source:
+        zero_index = -origin / cell_size
+        base = math.floor(zero_index)
+        for index in range(max(0, base - 1), min(count, base + 3)):
+            _, runtime = _runtime_node_coordinate(origin, index, cell_size)
+            if not _is_normal_or_zero_binary32(runtime):
+                raise ValueError(
+                    f"heightfield {axis} nodes must be "
+                    "normal-or-zero binary32")
+    if count <= 3:
+        return
+
+    # Float rounding is monotone, and representable spacing grows only with
+    # distance from zero. Endpoint-inward gaps therefore bound every rounding
+    # bucket in this uniform interval. A step larger than that bound cannot
+    # collapse; equality is safe only on the same representable cell lattice.
+    maximum_spacing = max(
+        _maximum_inward_spacing(
+            first_source, last_source, binary32=False),
+        _maximum_inward_spacing(
+            first_runtime, last_runtime, binary32=True),
+    )
+    quotient = origin / cell_size
+    aligned_equality = cell_size == maximum_spacing \
+        and math.isfinite(quotient) and quotient.is_integer()
+    if cell_size < maximum_spacing \
+            or (cell_size == maximum_spacing and not aligned_equality):
+        raise ValueError(
+            f"heightfield {axis} nodes must be finite and runtime-distinguishable")
+
+
+@dataclass(frozen=True)
+class HeightGrid:
+    heights: np.ndarray
+    origin_x: float
+    origin_z: float
+    cell_size: float
+    exterior_height: float
+    version: int = field(default=HEIGHTFIELD_VERSION, init=False)
+
+    def __post_init__(self) -> None:
+        source = np.asarray(self.heights)
+        nz, nx = _validate_heightfield_shape(source.shape)
+        if np.iscomplexobj(source):
+            raise ValueError("heightfield heights must be real-valued")
+        origin_x = _authoritative_float32(self.origin_x, "origin_x")
+        origin_z = _authoritative_float32(self.origin_z, "origin_z")
+        cell_size = _authoritative_float32(self.cell_size, "cell_size")
+        exterior_height = _authoritative_float32(
+            self.exterior_height, "exterior_height")
+        _require_normal_or_zero_binary32(origin_x, "origin_x")
+        _require_normal_or_zero_binary32(origin_z, "origin_z")
+        _require_normal_or_zero_binary32(exterior_height, "exterior_height")
+        if cell_size < HEIGHTFIELD_MIN_NORMAL:
+            raise ValueError(
+                "heightfield cell_size must encode as positive normal binary32")
+        _validate_runtime_axis(origin_x, nx, cell_size, "X")
+        _validate_runtime_axis(origin_z, nz, cell_size, "Z")
+        try:
+            with np.errstate(over="ignore", invalid="ignore"):
+                heights = np.array(source, dtype="<f4", order="C", copy=True)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "heightfield heights must be real-valued float32 samples") \
+                from error
+        if not np.all(np.isfinite(heights)):
+            raise ValueError("heightfield heights must encode as finite float32")
+        subnormal = (heights != 0.0) \
+            & (np.abs(heights) < HEIGHTFIELD_MIN_NORMAL)
+        if np.any(subnormal):
+            raise ValueError(
+                "heightfield heights must encode as normal-or-zero binary32")
+        heights[heights == 0.0] = np.float32(0.0)
+        heights.setflags(write=False)
+        object.__setattr__(self, "heights", heights)
+        object.__setattr__(self, "origin_x", origin_x)
+        object.__setattr__(self, "origin_z", origin_z)
+        object.__setattr__(self, "cell_size", cell_size)
+        object.__setattr__(self, "exterior_height", exterior_height)
+
+    @property
+    def nx(self) -> int:
+        return int(self.heights.shape[1])
+
+    @property
+    def nz(self) -> int:
+        return int(self.heights.shape[0])
+
+    @property
+    def max_x(self) -> float:
+        return self.origin_x + (self.nx - 1) * self.cell_size
+
+    @property
+    def max_z(self) -> float:
+        return self.origin_z + (self.nz - 1) * self.cell_size
+
+    @staticmethod
+    def _query_coordinate(value, name: str) -> float:
+        try:
+            value = float(value)
+        except (OverflowError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"heightfield query {name} must be finite") from error
+        if not math.isfinite(value):
+            raise ValueError(f"heightfield query {name} must be finite")
+        return 0.0 if value == 0.0 else value
+
+    def _axis_cell(
+        self,
+        value: float,
+        origin: float,
+        count: int,
+    ) -> tuple[int, float]:
+        coordinate = (value - origin) / self.cell_size
+        index = min(max(int(math.floor(coordinate)), 0), count - 2)
+        while index > 0 and value < origin + index * self.cell_size:
+            index -= 1
+        while index < count - 2 \
+                and value >= origin + (index + 1) * self.cell_size:
+            index += 1
+        fraction = (value - (origin + index * self.cell_size)) \
+            / self.cell_size
+        return index, min(max(fraction, 0.0), 1.0)
+
+    def _cell(self, x, z) -> tuple[int, int, float, float] | None:
+        x = self._query_coordinate(x, "x")
+        z = self._query_coordinate(z, "z")
+        if x < self.origin_x or x > self.max_x \
+                or z < self.origin_z or z > self.max_z:
+            return None
+        ix, tx = self._axis_cell(x, self.origin_x, self.nx)
+        iz, tz = self._axis_cell(z, self.origin_z, self.nz)
+        return ix, iz, tx, tz
+
+    def height(self, x: float, z: float) -> float:
+        cell = self._cell(x, z)
+        if cell is None:
+            return self.exterior_height
+        ix, iz, tx, tz = cell
+        h00 = float(self.heights[iz, ix])
+        h10 = float(self.heights[iz, ix + 1])
+        h01 = float(self.heights[iz + 1, ix])
+        h11 = float(self.heights[iz + 1, ix + 1])
+        if tx >= tz:
+            return h00 + tx * (h10 - h00) + tz * (h11 - h10)
+        return h00 + tx * (h11 - h01) + tz * (h01 - h00)
+
+    def normal(self, x: float, z: float) -> np.ndarray:
+        cell = self._cell(x, z)
+        if cell is None:
+            return np.asarray(HEIGHTFIELD_EXTERIOR_NORMAL, np.float64)
+        ix, iz, tx, tz = cell
+        h00 = float(self.heights[iz, ix])
+        h10 = float(self.heights[iz, ix + 1])
+        h01 = float(self.heights[iz + 1, ix])
+        h11 = float(self.heights[iz + 1, ix + 1])
+        if tx >= tz:
+            slope_x = (h10 - h00) / self.cell_size
+            slope_z = (h11 - h10) / self.cell_size
+        else:
+            slope_x = (h11 - h01) / self.cell_size
+            slope_z = (h01 - h00) / self.cell_size
+        normal = np.array([-slope_x, 1.0, -slope_z], np.float64)
+        scaled = normal / np.max(np.abs(normal))
+        return scaled / np.linalg.norm(scaled)
+
+    def g1hf_bytes(self) -> bytes:
+        return HEIGHTFIELD_HEADER.pack(
+            b"G1HF",
+            self.version,
+            self.nx,
+            self.nz,
+            self.origin_x,
+            self.origin_z,
+            self.cell_size,
+            self.exterior_height,
+        ) + self.heights.tobytes(order="C")
+
+    def obj_bytes(self) -> bytes:
+        lines = []
+        for iz in range(self.nz):
+            _, z = _runtime_node_coordinate(
+                self.origin_z, iz, self.cell_size)
+            for ix in range(self.nx):
+                _, x = _runtime_node_coordinate(
+                    self.origin_x, ix, self.cell_size)
+                y = float(self.heights[iz, ix])
+                lines.append(f"v {x:.9g} {y:.9g} {z:.9g}\n")
+        for iz in range(self.nz - 1):
+            for ix in range(self.nx - 1):
+                p00 = iz * self.nx + ix + 1
+                p10 = p00 + 1
+                p01 = p00 + self.nx
+                p11 = p01 + 1
+                lines.append(f"f {p00} {p11} {p10}\n")
+                lines.append(f"f {p00} {p01} {p11}\n")
+        return "".join(lines).encode("ascii")
+
+    def metadata(self) -> dict:
+        return {
+            "schema": "G1HF/v2",
+            "version": self.version,
+            "nx": self.nx,
+            "nz": self.nz,
+            "origin_x": self.origin_x,
+            "origin_z": self.origin_z,
+            "cell_size_m": self.cell_size,
+            "exterior_height_m": self.exterior_height,
+            "interpolation": HEIGHTFIELD_INTERPOLATION,
+            "diagonal": HEIGHTFIELD_DIAGONAL,
+        }
+
+
+def _raster_dimension(origin: float, maximum: float, cell_size: float) -> int:
+    span = (maximum - origin) / cell_size
+    if not math.isfinite(span) or span > HEIGHTFIELD_MAX_SAMPLES - 1:
+        raise ValueError("heightfield raster dimension must fit INT_MAX")
+    steps = int(math.ceil(span))
+    if origin + steps * cell_size < maximum:
+        steps += 1
+    count = steps + 1
+    if count > HEIGHTFIELD_MAX_SAMPLES:
+        raise ValueError("heightfield raster dimension must fit INT_MAX")
+    return count
+
+
+def rasterize_heightfield(
+    terrain,
+    bounds: tuple[float, float, float, float],
+    cell_size: float = 0.02,
+) -> HeightGrid:
+    try:
+        xmin, xmax, zmin, zmax = (float(value) for value in bounds)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError("heightfield bounds must contain four numbers") from error
+    if not np.all(np.isfinite([xmin, xmax, zmin, zmax])):
+        raise ValueError("heightfield bounds must be finite")
+    if xmax <= xmin:
+        raise ValueError("heightfield xmax must be greater than xmin")
+    if zmax <= zmin:
+        raise ValueError("heightfield zmax must be greater than zmin")
+    encoded_cell = _authoritative_float32(cell_size, "cell_size")
+    if encoded_cell < HEIGHTFIELD_MIN_NORMAL:
+        raise ValueError(
+            "heightfield cell_size must encode as positive normal binary32")
+
+    def rounded_down(value: float, name: str) -> float:
+        encoded = np.float32(_authoritative_float32(value, name))
+        if float(encoded) > value:
+            encoded = np.nextafter(encoded, np.float32(-np.inf))
+        decoded = float(encoded)
+        if not math.isfinite(decoded):
+            raise ValueError(f"heightfield {name} cannot be rounded down in float32")
+        _require_normal_or_zero_binary32(decoded, name)
+        return decoded
+
+    origin_x = rounded_down(xmin, "origin_x")
+    origin_z = rounded_down(zmin, "origin_z")
+    nx = _raster_dimension(origin_x, xmax, encoded_cell)
+    nz = _raster_dimension(origin_z, zmax, encoded_cell)
+    if nx * nz > HEIGHTFIELD_MAX_SAMPLES:
+        raise ValueError("heightfield raster sample count must fit INT_MAX")
+    _validate_runtime_axis(origin_x, nx, encoded_cell, "X")
+    _validate_runtime_axis(origin_z, nz, encoded_cell, "Z")
+
+    heights = np.empty((nz, nx), np.float64)
+    for iz in range(nz):
+        z = origin_z + iz * encoded_cell
+        for ix in range(nx):
+            x = origin_x + ix * encoded_cell
+            heights[iz, ix] = terrain.height(x, z)
+    return HeightGrid(heights, origin_x, origin_z, encoded_cell, 0.0)
+
+
+def export_heightfield_obj(grid: HeightGrid, path: str) -> None:
+    if not isinstance(grid, HeightGrid):
+        raise TypeError("heightfield OBJ export requires a HeightGrid")
+    payload = grid.obj_bytes()
+    with open(path, "wb") as stream:
+        stream.write(payload)
 
 
 def export_heightfield(
