@@ -4631,8 +4631,11 @@ git commit -m "feat: define hashed G1 scene packs"
   cross-slopes, and `full-course` for the mixed scene.
 - Locks stress/blocked route IDs to `up-landing-down` for the 15-degree ramp
   and `wall-safe-stop`/`ramp-safe-stop` for the blocked course.
-- Every course has a flat `2.0 m` spawn lead, and every certified route point
-  has at least `1.0 m` of heightfield margin in X and Z.
+- Every course has a flat `2.0 m` spawn lead. Its derived terminal Z is
+  normalized to binary32 once before provenance, routes, playable bounds, and
+  heightfield bounds consume it. Every traverse/stress route point has at least
+  `1.0 m` of decoded heightfield margin in X and Z; the heightfield/lookahead
+  Z maximum is the least binary32 value not below serialized `course_end + 1`.
 - G1WM safe/stress corridor classification expands the published center bounds
   by exactly binary32 `0.25 m` in X and Z, including spawn and terminal ends,
   so the later `0.20 m` circular footprint has lattice allowance. Playable and
@@ -4695,6 +4698,7 @@ def decoded_footprint_classes(
     dx = np.float32(xs[np.newaxis, :] - np.float32(x))
     dz = np.float32(zs[:, np.newaxis] - np.float32(z))
     radius_squared = np.float32(np.float32(radius) * np.float32(radius))
+    # Match the C++ runtime's squared-radius boundary allowance exactly.
     inside = np.float32(dx * dx + dz * dz) <= np.float32(
         radius_squared + np.float32(1e-8))
     if not np.any(inside):
@@ -4945,6 +4949,10 @@ class ProceduralSceneTests(unittest.TestCase):
                             set(decoded_footprint_classes(
                                 grid, walkability, *points[0])),
                             {1})
+                        self.assertEqual(
+                            set(decoded_footprint_classes(
+                                grid, walkability, *points[-1])),
+                            {0})
         self.assertEqual(expected_only_routes, 9)
         self.assertEqual(safe_stop_routes, 2)
 
@@ -4976,6 +4984,14 @@ class ProceduralSceneTests(unittest.TestCase):
                 metadata["spawn"]["position"][0],
                 metadata["spawn"]["position"][2],
             )
+            course_end = metadata["provenance"]["parameters"][
+                "course_end_z_m"]
+            self.assertEqual(
+                struct.unpack("<f", struct.pack("<f", course_end))[0],
+                course_end)
+            self.assertEqual(
+                metadata["bounds"]["playable_max_xz"][1], course_end)
+            self.assertGreaterEqual(maximum[2] - course_end, 1.0)
             for route in metadata["routes"]:
                 points = tuple(
                     tuple(point) for point in route["waypoints_xz"])
@@ -5068,19 +5084,49 @@ class ProceduralSceneTests(unittest.TestCase):
         ramp_start = p["block_starts_z_m"][-1] + p["block_top_length_m"]
         assert_continuous(mixed, ramp_start)
         assert_continuous(mixed, ramp_start + p["return_ramp_run_m"])
+        mixed_ascent_faces = tuple(
+            p["flat_spawn_length_m"] + sum(p["stair_runs_m"][:index])
+            for index in range(len(p["stair_runs_m"]))
+        )
+        for face, rise in zip(mixed_ascent_faces, p["stair_rises_m"]):
+            before = mixed.surface.height(
+                0.0, np.nextafter(face, -np.inf))
+            self.assertAlmostEqual(
+                mixed.surface.height(0.0, face) - before, rise, places=9)
         for start, change in zip(
                 p["block_starts_z_m"], p["block_height_changes_m"]):
             before = mixed.surface.height(0.0, np.nextafter(start, -np.inf))
             self.assertAlmostEqual(
                 mixed.surface.height(0.0, start) - before, change, places=9)
 
-        stairs = self.definitions["stairs-shallow"]
-        first_step = stairs.provenance["parameters"]["flat_spawn_length_m"]
-        self.assertAlmostEqual(
-            stairs.surface.height(0.0, first_step)
-            - stairs.surface.height(
-                0.0, np.nextafter(first_step, -np.inf)),
-            0.08, places=9)
+        for scene_id in (
+                "stairs-shallow", "stairs-standard",
+                "stairs-unseen-variable"):
+            stairs = self.definitions[scene_id]
+            p = stairs.provenance["parameters"]
+            ascent_faces = tuple(
+                p["flat_spawn_length_m"] + sum(p["runs_m"][:index])
+                for index in range(len(p["runs_m"]))
+            )
+            for face, rise in zip(ascent_faces, p["rises_m"]):
+                before = stairs.surface.height(
+                    0.0, np.nextafter(face, -np.inf))
+                self.assertAlmostEqual(
+                    stairs.surface.height(0.0, face) - before,
+                    rise, places=9)
+            reversed_runs = tuple(reversed(p["runs_m"]))
+            descent_faces = tuple(
+                p["descent_start_z_m"]
+                + sum(reversed_runs[:index + 1])
+                for index in range(len(reversed_runs))
+            )
+            for face, rise in zip(
+                    descent_faces, reversed(p["rises_m"])):
+                before = stairs.surface.height(
+                    0.0, np.nextafter(face, -np.inf))
+                self.assertAlmostEqual(
+                    stairs.surface.height(0.0, face) - before,
+                    -rise, places=9)
 
         blocked = self.definitions["blocked-course"].surface
         self.assertEqual(
@@ -5095,21 +5141,40 @@ class ProceduralSceneTests(unittest.TestCase):
         self.assertEqual(blocked.height(-0.8, wall_end), blocked.wall_height)
         self.assertEqual(
             blocked.height(-0.8, np.nextafter(wall_end, np.inf)), 0.0)
-        ramp_end = blocked.obstacle_start_z + blocked.ramp_run \
-            + blocked.ramp_top_length
+        ramp_ascent_end = blocked.obstacle_start_z + blocked.ramp_run
+        self.assertAlmostEqual(
+            blocked.height(
+                0.8, np.nextafter(ramp_ascent_end, -np.inf)),
+            blocked.ramp_rise, places=9)
+        self.assertEqual(
+            blocked.height(0.8, ramp_ascent_end), blocked.ramp_rise)
+        ramp_end = ramp_ascent_end + blocked.ramp_top_length
         self.assertEqual(blocked.height(0.8, ramp_end), blocked.ramp_rise)
         self.assertEqual(
             blocked.height(0.8, np.nextafter(ramp_end, np.inf)), 0.0)
-        wall_x_edge = blocked.wall_center_x + blocked.lane_half_width
-        self.assertEqual(
-            blocked.height(
-                wall_x_edge, blocked.obstacle_start_z + 0.25),
-            blocked.wall_height)
-        self.assertEqual(
-            blocked.height(
-                np.nextafter(wall_x_edge, np.inf),
-                blocked.obstacle_start_z + 0.25),
-            0.0)
+        wall_top_z = blocked.obstacle_start_z + 0.25
+        wall_x_edges = (
+            (blocked.wall_center_x - blocked.lane_half_width, -np.inf),
+            (blocked.wall_center_x + blocked.lane_half_width, np.inf),
+        )
+        for edge, outward in wall_x_edges:
+            self.assertEqual(
+                blocked.height(edge, wall_top_z), blocked.wall_height)
+            self.assertEqual(
+                blocked.height(np.nextafter(edge, outward), wall_top_z),
+                0.0)
+
+        ramp_top_z = ramp_ascent_end + 0.25
+        ramp_x_edges = (
+            (blocked.ramp_center_x - blocked.lane_half_width, -np.inf),
+            (blocked.ramp_center_x + blocked.lane_half_width, np.inf),
+        )
+        for edge, outward in ramp_x_edges:
+            self.assertEqual(
+                blocked.height(edge, ramp_top_z), blocked.ramp_rise)
+            self.assertEqual(
+                blocked.height(np.nextafter(edge, outward), ramp_top_z),
+                0.0)
 ~~~
 
 - [ ] **Step 2: Run the procedural tests and verify the missing API failure**
@@ -5131,6 +5196,16 @@ Add to `scenes.py` after the scene dataclasses:
 COURSE_HALF_WIDTH = 0.60
 FLAT_SPAWN_LENGTH = 2.0
 LOOKAHEAD_MARGIN = 1.0
+
+
+def _runtime_f32_upper_ceiling(value, label):
+    target = _finite_real(value, label)
+    result = _runtime_f32(target, label)
+    if result < target:
+        result = _runtime_f32(
+            np.nextafter(np.float32(result), np.float32(np.inf)),
+            f"{label} upper ceiling")
+    return result
 
 
 def _walkability_classification_bounds(bounds):
@@ -5217,17 +5292,24 @@ class BlockedCourseSurface:
         x, z = float(x), float(z)
         if not np.isfinite([x, z]).all():
             raise ValueError("blocked-course query must be finite")
-        if abs(x - self.wall_center_x) <= self.lane_half_width:
+        wall_min_x = self.wall_center_x - self.lane_half_width
+        wall_max_x = self.wall_center_x + self.lane_half_width
+        ramp_min_x = self.ramp_center_x - self.lane_half_width
+        ramp_max_x = self.ramp_center_x + self.lane_half_width
+        wall_end_z = self.obstacle_start_z + self.wall_top_length
+        ramp_ascent_end_z = self.obstacle_start_z + self.ramp_run
+        ramp_end_z = ramp_ascent_end_z + self.ramp_top_length
+        if wall_min_x <= x <= wall_max_x:
             if self.obstacle_start_z <= z \
-                    <= self.obstacle_start_z + self.wall_top_length:
+                    <= wall_end_z:
                 return self.wall_height
-        if abs(x - self.ramp_center_x) <= self.lane_half_width:
-            phase = z - self.obstacle_start_z
-            if 0.0 <= phase < self.ramp_run:
+        if ramp_min_x <= x <= ramp_max_x:
+            if self.obstacle_start_z <= z < ramp_ascent_end_z:
+                phase = z - self.obstacle_start_z
                 return float(
                     phase *
                     np.tan(np.deg2rad(self.ramp_angle_degrees)))
-            if self.ramp_run <= phase <= self.ramp_run + self.ramp_top_length:
+            if ramp_ascent_end_z <= z <= ramp_end_z:
                 return self.ramp_rise
         return 0.0
 
@@ -5240,13 +5322,15 @@ def _corridor_definition(
     scene_id, label, surface, course_end_z, parameters, route,
     walkability_class,
 ):
+    heightfield_end_z = _runtime_f32_upper_ceiling(
+        course_end_z + LOOKAHEAD_MARGIN, "heightfield zmax")
     playable = (-COURSE_HALF_WIDTH, COURSE_HALF_WIDTH, 0.0, course_end_z)
     classification = _walkability_classification_bounds(playable)
     bounds = (
         -COURSE_HALF_WIDTH - LOOKAHEAD_MARGIN,
         COURSE_HALF_WIDTH + LOOKAHEAD_MARGIN,
         -LOOKAHEAD_MARGIN,
-        course_end_z + LOOKAHEAD_MARGIN,
+        heightfield_end_z,
     )
     region_name = "certified" if walkability_class == 1 else "stress"
     regions = {"certified": (), "stress": (), "blocked": ()}
@@ -5276,6 +5360,12 @@ def _corridor_definition(
 operation per expanded edge. The unexpanded `playable` tuple remains the
 authoritative published center-bound contract.
 
+Each definition normalizes `course_end_z` once before putting it into
+provenance, its terminal route/playable bound, and `_corridor_definition`.
+`_runtime_f32_upper_ceiling` then preserves at least a full metre above that
+serialized terminal after `_strict_bounds` and G1HF binary32 encoding; it does
+not change playable/region bounds or classification thresholds.
+
 The `0.5 m` transitions are part of each `4.0 m` cross-slope segment; the
 preceding `2.0 m` spawn area plus `1.0 m` entry and the following `1.0 m` exit
 remain exactly flat. The route centerline stays at height zero while the support
@@ -5287,28 +5377,36 @@ Add:
 
 ~~~python
 def _stair_profile(rises, runs, landing_length=2.0):
-    pairs = tuple(zip(tuple(rises), tuple(runs)))
-    ascent_end = FLAT_SPAWN_LENGTH + sum(runs)
+    rises = tuple(rises)
+    runs = tuple(runs)
+    pairs = tuple(zip(rises, runs))
+    ascent_ends = tuple(
+        FLAT_SPAWN_LENGTH + sum(runs[:index + 1])
+        for index in range(len(runs))
+    )
+    ascent_end = ascent_ends[-1]
     descent_start = ascent_end + landing_length
-    course_end = descent_start + sum(runs) + 1.0
+    reversed_pairs = tuple(reversed(pairs))
+    reversed_runs = tuple(run for _, run in reversed_pairs)
+    descent_ends = tuple(
+        descent_start + sum(reversed_runs[:index + 1])
+        for index in range(len(reversed_runs))
+    )
+    course_end = descent_ends[-1] + 1.0
 
     def profile(z):
         if z < FLAT_SPAWN_LENGTH:
             return 0.0
-        cursor = FLAT_SPAWN_LENGTH
         height = 0.0
-        for rise, run in pairs:
+        for (rise, _), end in zip(pairs, ascent_ends):
             height += rise
-            if z < cursor + run:
+            if z < end:
                 return height
-            cursor += run
-        if z < cursor + landing_length:
+        if z < descent_start:
             return height
-        cursor += landing_length
-        for rise, run in reversed(pairs):
-            if z < cursor + run:
+        for (rise, _), end in zip(reversed_pairs, descent_ends):
+            if z < end:
                 return height
-            cursor += run
             height -= rise
         return 0.0
 
@@ -5317,6 +5415,7 @@ def _stair_profile(rises, runs, landing_length=2.0):
 
 def _stair_definition(scene_id, label, rises, runs, unseen):
     profile, ascent_end, descent_start, course_end = _stair_profile(rises, runs)
+    course_end = _runtime_f32(course_end, f"{scene_id} course end z")
     parameters = {
         "primitive": "stairs-up-landing-down",
         "rises_m": list(rises),
@@ -5367,6 +5466,7 @@ def _ramp_profile(angle_degrees):
 def _ramp_definition(scene_id, label, angle_degrees, stress):
     profile, run, ascent_end, descent_start, course_end = _ramp_profile(
         angle_degrees)
+    course_end = _runtime_f32(course_end, f"{scene_id} course end z")
     walkability_class = 2 if stress else 1
     expected_outcome = "traverse-or-safe-stop" if stress else "traverse"
     parameters = {
@@ -5405,6 +5505,7 @@ def _cross_slope_definition(angle_degrees):
     grade_start = FLAT_SPAWN_LENGTH + flat_entry_length
     course_end = grade_start + 4.0 + 1.0
     scene_id = f"cross-slope-{angle_degrees:02d}"
+    course_end = _runtime_f32(course_end, f"{scene_id} course end z")
     parameters = {
         "primitive": "cross-slope",
         "angle_degrees": float(angle_degrees),
@@ -5431,33 +5532,35 @@ def _cross_slope_definition(angle_degrees):
 def _mixed_definition():
     stair_runs = (0.30, 0.30, 0.30, 0.30)
     stair_rises = (0.08, 0.08, 0.08, 0.08)
-    ascent_end = FLAT_SPAWN_LENGTH + sum(stair_runs)
+    stair_ascent_ends = tuple(
+        FLAT_SPAWN_LENGTH + sum(stair_runs[:index + 1])
+        for index in range(len(stair_runs))
+    )
+    ascent_end = stair_ascent_ends[-1]
     elevated_end = ascent_end + 3.0
     changes = (0.08, -0.12, 0.04)
     block_starts = tuple(elevated_end + 0.60 * i for i in range(3))
     ramp_start = elevated_end + 3 * 0.60
+    block_ends = block_starts[1:] + (ramp_start,)
     ramp_run = float(
         sum(stair_rises) / np.tan(np.deg2rad(10.0)))
     course_end = ramp_start + ramp_run + 1.0
+    course_end = _runtime_f32(course_end, "mixed-multilevel course end z")
 
     def profile(z):
         if z < FLAT_SPAWN_LENGTH:
             return 0.0
-        cursor = FLAT_SPAWN_LENGTH
         height = 0.0
-        for rise, run in zip(stair_rises, stair_runs):
+        for rise, end in zip(stair_rises, stair_ascent_ends):
             height += rise
-            if z < cursor + run:
+            if z < end:
                 return height
-            cursor += run
         if z < elevated_end:
             return height
-        block_cursor = elevated_end
-        for change in changes:
+        for change, end in zip(changes, block_ends):
             height += change
-            if z < block_cursor + 0.60:
+            if z < end:
                 return height
-            block_cursor += 0.60
         if z < ramp_start + ramp_run:
             return height * (1.0 - (z - ramp_start) / ramp_run)
         return 0.0
@@ -5493,11 +5596,17 @@ def _mixed_definition():
 def _blocked_definition():
     surface = BlockedCourseSurface()
     obstacle_start = surface.obstacle_start_z
-    course_end = obstacle_start + surface.ramp_run \
-        + surface.ramp_top_length + 1.0
+    ramp_run = surface.ramp_run
+    ramp_ascent_end = obstacle_start + ramp_run
+    ramp_end = ramp_ascent_end + surface.ramp_top_length
+    course_end = _runtime_f32(
+        ramp_end + 1.0, "blocked-course course end z")
+    heightfield_end_z = _runtime_f32_upper_ceiling(
+        course_end + LOOKAHEAD_MARGIN,
+        "blocked-course heightfield zmax")
     playable = (-1.4, 1.4, 0.0, course_end)
     classification = _walkability_classification_bounds(playable)
-    bounds = (-2.4, 2.4, -1.0, course_end + 1.0)
+    bounds = (-2.4, 2.4, -1.0, heightfield_end_z)
 
     def walkability(x, z):
         if not _bounds_contains(classification, x, z):
@@ -5515,7 +5624,7 @@ def _blocked_definition():
         "ramp_center_x_m": surface.ramp_center_x,
         "ramp_rise_m": surface.ramp_rise,
         "ramp_angle_degrees": surface.ramp_angle_degrees,
-        "ramp_run_m": surface.ramp_run,
+        "ramp_run_m": ramp_run,
         "ramp_top_length_m": surface.ramp_top_length,
         "flat_spawn_length_m": FLAT_SPAWN_LENGTH,
         "course_end_z_m": course_end,
@@ -5551,7 +5660,7 @@ def _blocked_definition():
             SceneRoute(
                 "ramp-safe-stop",
                 ((0.0, 0.0), (0.8, 1.5),
-                 (0.8, obstacle_start + surface.ramp_run / 2.0)),
+                 (0.8, obstacle_start + ramp_run / 2.0)),
                 "safe-stop", 0, 0.0),
         ),
         walkability=walkability,
@@ -5617,7 +5726,8 @@ region-cell product nonempty and class-pure, and give each `0.20 m` endpoint
 footprint the expected class. Both blocked routes have one mixed `{1, 0}`
 boundary cover between pure prefixes/suffixes. Provenance is native JSON, the
 deliberate piecewise joins/edges match their declarations, and rebuilding all
-four bytes of every procedural scene is byte-identical.
+four bytes of every procedural scene is byte-identical within the supported
+pinned Python/NumPy stack and process environment.
 
 - [ ] **Step 7: Commit the deterministic procedural catalog**
 
