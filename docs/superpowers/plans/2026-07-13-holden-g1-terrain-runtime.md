@@ -106,8 +106,23 @@ int main()
     assert(!terrain_features_load(
         rejected, "/tmp/test_bad_g1tf.bin", err, sizeof(err)));
     assert(strstr(err, "truncated") != NULL);
+
+    // The final test file also uses table-driven corruptions for both formats:
+    // bad magic/version/dimensions, zero or overflowing sizes, non-finite
+    // metadata/payloads, truncation, and trailing bytes. Every failed load
+    // must preserve a previously loaded destination object.
 }
 ~~~
+
+Add explicit assertions that:
+
+- G1TF rejects `frames == 0`, `frames > INT_MAX/4`, NaN/Inf features, and a
+  header claiming more bytes than the file contains before allocating;
+- G1HF rejects `nx,nz < 2`, `nx*nz > INT_MAX`, nonpositive/nonfinite cell size,
+  nonfinite origin/exterior/heights, truncation, and trailing bytes;
+- a failed load leaves the destination's prior dimensions and sentinel values
+  unchanged; and
+- nonfinite sample coordinates return `exterior_height` without indexing.
 
 - [ ] **Step 2: Compile and verify the missing-header failure**
 
@@ -122,13 +137,22 @@ Expected: compilation fails because terrain_runtime.h is missing.
 
 - [ ] **Step 3: Implement strict loaders and bilinear sampling**
 
-Create terrain_runtime.h:
+Create terrain_runtime.h. Use `uint32_t` for on-disk integers and reject
+dimensions that cannot be safely represented by Holden's signed-int arrays.
+Before resizing, preflight the exact file length with overflow-safe `size_t`
+arithmetic, including the header, and reject both shorter and longer files.
+Read into a temporary `terrain_feature_set` or `heightfield`, validate every
+float with `isfinite`, then assign to `out` only after the complete file passes.
+This provides transactional failure behavior and prevents hostile headers from
+reaching `array.h`'s signed multiplication/allocation path.
 
 ~~~cpp
 #pragma once
 #include "array.h"
 #include "vec.h"
+#include <limits.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -205,6 +229,7 @@ static inline bool heightfield_load(
 
 static inline float heightfield_sample(const heightfield& h, float x, float z)
 {
+    if (!isfinite(x) || !isfinite(z)) return h.exterior_height;
     float gx = (x - h.origin_x) / h.cell_size;
     float gz = (z - h.origin_z) / h.cell_size;
     if (gx < 0 || gz < 0 || gx > h.nx - 1 || gz > h.nz - 1)
@@ -229,7 +254,11 @@ g++ -std=c++17 -I. tests/cpp/test_terrain_runtime.cpp \
 /tmp/test_terrain_runtime
 ~~~
 
-Expected: exit 0 and no output.
+Expected: exit 0 and no output. Also compile with `-Wall -Wextra -pedantic` and
+run a read-only integration probe against
+`resources/g1_terrain/{terrain_features.bin,terrain.bin}`; require 459,682x4
+terrain rows, a 261x228 finite heightfield, and successful representative
+interior/exterior samples.
 
 - [ ] **Step 5: Commit strict runtime formats**
 
