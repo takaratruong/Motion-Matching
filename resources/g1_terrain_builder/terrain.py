@@ -89,6 +89,8 @@ def sample_terrain_features(terrain, centerline: np.ndarray) -> np.ndarray:
     line = np.asarray(centerline, np.float64)
     if line.ndim != 2 or line.shape[1:] != (2,) or not len(line):
         raise ValueError(f"centerline must have non-empty shape (N, 2), got {line.shape}")
+    if not np.all(np.isfinite(line)):
+        raise ValueError("centerline coordinates must be finite")
     root_height = terrain.height(*line[0])
     features = np.array([
         terrain.height(*_point_at_arc_distance(line, distance)) - root_height
@@ -116,8 +118,7 @@ def _load_usd_mesh(base: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
                 raise ValueError(f"invalid GRAIL mesh points in {path}")
             if counts.ndim != 1 or indices.ndim != 1:
                 raise ValueError(f"invalid GRAIL mesh topology in {path}")
-            if counts.sum() != len(indices):
-                raise ValueError(f"inconsistent GRAIL mesh topology in {path}")
+            _validate_mesh_topology(points, counts, indices)
             return points, counts, indices
     raise ValueError(f"no mesh found in GRAIL terrain USD: {path}")
 
@@ -142,6 +143,23 @@ def _object_pose0(base: str) -> tuple[np.ndarray, np.ndarray]:
     return rotation, translation
 
 
+def _validate_mesh_topology(
+    vertices: np.ndarray,
+    face_counts: np.ndarray,
+    face_indices: np.ndarray,
+) -> None:
+    if face_counts.ndim != 1 or face_indices.ndim != 1:
+        raise ValueError("face counts and indices must be one-dimensional")
+    if np.any(face_counts < 3):
+        raise ValueError("terrain faces must have at least three vertices")
+    if int(face_counts.sum()) != len(face_indices):
+        raise ValueError("face counts do not match the number of face indices")
+    vertex_count = len(vertices)
+    if np.any(face_indices < 0) or np.any(face_indices >= vertex_count):
+        raise ValueError(
+            f"face indices must be in [0, {vertex_count})")
+
+
 def _densify_faces(
     vertices: np.ndarray,
     face_counts: np.ndarray,
@@ -151,6 +169,7 @@ def _densify_faces(
     vertices = np.asarray(vertices, np.float64)
     face_counts = np.asarray(face_counts, np.int32)
     face_indices = np.asarray(face_indices, np.int32)
+    _validate_mesh_topology(vertices, face_counts, face_indices)
     if resolution < 2:
         raise ValueError("face sampling resolution must be at least 2")
 
@@ -201,6 +220,8 @@ class GrailTerrain:
         self._face_counts = np.asarray(face_counts, np.int32)
         self._face_indices = np.asarray(face_indices, np.int32)
         self._points = np.asarray(query_points, np.float64)
+        _validate_mesh_topology(
+            self._vertices, self._face_counts, self._face_indices)
         if not np.all(np.isfinite(self._vertices)) or not np.all(np.isfinite(self._points)):
             raise ValueError("GRAIL terrain points must be finite")
         if len(self._points) == 0 or radius <= 0.0:
@@ -259,8 +280,12 @@ def export_heightfield(
     xmin, xmax, zmin, zmax = (float(value) for value in bounds)
     if not np.all(np.isfinite([xmin, xmax, zmin, zmax, cell_size])):
         raise ValueError("heightfield bounds and cell size must be finite")
-    if xmax < xmin or zmax < zmin or cell_size <= 0.0:
-        raise ValueError("heightfield bounds and cell size are invalid")
+    if xmax <= xmin:
+        raise ValueError("heightfield xmax must be greater than xmin")
+    if zmax <= zmin:
+        raise ValueError("heightfield zmax must be greater than zmin")
+    if cell_size <= 0.0:
+        raise ValueError("heightfield cell size must be positive")
     nx = int(np.ceil((xmax - xmin) / cell_size)) + 1
     nz = int(np.ceil((zmax - zmin) / cell_size)) + 1
     values = np.empty((nz, nx), dtype="<f4")

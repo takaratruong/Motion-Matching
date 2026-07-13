@@ -1,11 +1,15 @@
 import os
+import pickle
 import struct
 import tempfile
 import unittest
+import warnings
 
 import numpy as np
+from pxr import Usd, UsdGeom
 
 from resources.g1_terrain_builder.terrain import (
+    FlatTerrain,
     GrailTerrain,
     StepTerrain,
     _densify_faces,
@@ -13,6 +17,10 @@ from resources.g1_terrain_builder.terrain import (
     export_heightfield,
     sample_terrain_features,
 )
+
+
+GRAIL_USD_DIR = "/home/ubuntu/datasets/GRAIL/data/curb/object_usd"
+GRAIL_RECON_DIR = "/home/ubuntu/datasets/GRAIL/data/curb/recon"
 
 
 class TerrainTests(unittest.TestCase):
@@ -26,7 +34,11 @@ class TerrainTests(unittest.TestCase):
         np.testing.assert_allclose(line[-1], [1.0, 0.0], atol=1e-6)
 
     def test_step_features_are_ground_relative(self):
-        terrain = StepTerrain(edge_x=0.5, height=0.29)
+        class ElevatedStepTerrain:
+            def height(self, x, z):
+                return 1.0 + (0.29 if x >= 0.5 else 0.0)
+
+        terrain = ElevatedStepTerrain()
         line = np.array([
             [0.0, 0.0],
             [0.25, 0.0],
@@ -39,6 +51,28 @@ class TerrainTests(unittest.TestCase):
 
         np.testing.assert_allclose(
             features, [0.0, 0.29, 0.29, 0.29], atol=1e-6)
+
+    def test_curved_centerline_features_follow_geometric_arc_distance(self):
+        class LinearTerrain:
+            def height(self, x, z):
+                return x + 10.0 * z
+
+        root = np.array([0.0, 0.0])
+        headings = np.array([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+        path = np.array([[0.0, 0.0], [0.5, 0.0], [0.5, 0.5]])
+
+        line = build_facing_centerline(root, headings, path)
+        features = sample_terrain_features(LinearTerrain(), line)
+
+        np.testing.assert_allclose(line, path, atol=1e-7)
+        np.testing.assert_allclose(features, [0.25, 0.5, 3.0, 5.5], atol=1e-6)
+
+    def test_nonfinite_centerline_is_rejected_before_flat_terrain_query(self):
+        for bad_value in (np.nan, np.inf, -np.inf):
+            with self.subTest(bad_value=bad_value):
+                line = np.array([[0.0, 0.0], [bad_value, 0.0]])
+                with self.assertRaisesRegex(ValueError, "centerline.*finite"):
+                    sample_terrain_features(FlatTerrain(), line)
 
     def test_heightfield_binary_contract(self):
         terrain = StepTerrain(edge_x=0.5, height=0.29)
@@ -71,6 +105,19 @@ class TerrainTests(unittest.TestCase):
         np.testing.assert_allclose(
             values.reshape(nz, nx)[0], [0.0, 0.29, 0.29], atol=1e-6)
 
+    def test_heightfield_rejects_non_strict_bounds_without_writing(self):
+        cases = (
+            ((0.0, 0.0, 0.0, 1.0), "xmax must be greater than xmin"),
+            ((0.0, 1.0, 0.0, 0.0), "zmax must be greater than zmin"),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            for index, (bounds, message) in enumerate(cases):
+                with self.subTest(bounds=bounds):
+                    path = os.path.join(tmp, f"invalid-{index}.bin")
+                    with self.assertRaisesRegex(ValueError, message):
+                        export_heightfield(FlatTerrain(), bounds, 0.5, path)
+                    self.assertFalse(os.path.exists(path))
+
     def test_face_densification_is_deterministic_for_triangles(self):
         vertices = np.array([
             [0.0, 0.0, 0.0],
@@ -86,8 +133,31 @@ class TerrainTests(unittest.TestCase):
         self.assertTrue(np.array_equal(first, second))
         self.assertTrue(np.any(np.all(np.isclose(first, [1 / 3, 1 / 3, 0]), axis=1)))
 
+    def test_densification_rejects_invalid_face_indices(self):
+        vertices = np.eye(3)
+        counts = np.array([3], np.int32)
+        for bad_index in (-1, len(vertices)):
+            with self.subTest(bad_index=bad_index):
+                indices = np.array([0, 1, bad_index], np.int32)
+                with self.assertRaisesRegex(
+                    ValueError, r"face indices must be in \[0, 3\)"
+                ):
+                    _densify_faces(vertices, counts, indices, resolution=3)
+
+    def test_terrain_rejects_topology_that_could_export_invalid_obj_indices(self):
+        vertices = np.eye(3)
+        counts = np.array([3], np.int32)
+        for bad_index in (-1, len(vertices)):
+            with self.subTest(bad_index=bad_index):
+                indices = np.array([0, 1, bad_index], np.int32)
+                with self.assertRaisesRegex(
+                    ValueError, r"face indices must be in \[0, 3\)"
+                ):
+                    GrailTerrain(vertices, counts, indices, vertices)
+
     def test_real_grail_curb_has_expected_height_and_stable_obj(self):
-        terrain = GrailTerrain.from_base("terrain_curbs__curb_000__000")
+        base = "terrain_curbs__curb_000__000"
+        terrain = GrailTerrain.from_base(base)
         footprint = terrain.footprint()
         self.assertGreater(footprint["height"], 0.1)
         self.assertLess(footprint["height"], 0.5)
@@ -110,12 +180,45 @@ class TerrainTests(unittest.TestCase):
         vertices = [line for line in text.splitlines() if line.startswith("v ")]
         faces = [line for line in text.splitlines() if line.startswith("f ")]
         self.assertEqual((len(vertices), len(faces)), (120, 30))
-        self.assertEqual(faces[0], "f 1 2 3 4")
-        self.assertAlmostEqual(
-            max(float(line.split()[2]) for line in vertices),
-            footprint["height"],
-            places=6,
-        )
+
+        stage = Usd.Stage.Open(os.path.join(GRAIL_USD_DIR, base + ".usd"))
+        for prim in stage.Traverse():
+            if prim.IsA(UsdGeom.Mesh):
+                mesh = UsdGeom.Mesh(prim)
+                raw_points = np.asarray(mesh.GetPointsAttr().Get(), np.float64)
+                raw_counts = np.asarray(
+                    mesh.GetFaceVertexCountsAttr().Get(), np.int32)
+                raw_indices = np.asarray(
+                    mesh.GetFaceVertexIndicesAttr().Get(), np.int32)
+                break
+        else:
+            self.fail("real GRAIL fixture has no USD mesh")
+        with open(os.path.join(GRAIL_RECON_DIR, base + ".pkl"), "rb") as stream:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                reconstruction = pickle.load(stream)
+        object_data = reconstruction["obj_data"]
+        rotation = np.asarray(object_data["obj_R"], np.float64)[0]
+        translation = np.asarray(object_data["obj_t"], np.float64)[0]
+        mujoco_world = (rotation @ raw_points.T).T + translation
+        expected_vertices = np.column_stack((
+            mujoco_world[:, 0], mujoco_world[:, 2], -mujoco_world[:, 1]))
+        actual_vertices = np.array([
+            [float(value) for value in line.split()[1:]] for line in vertices
+        ])
+        np.testing.assert_allclose(actual_vertices, expected_vertices, atol=1e-8)
+
+        expected_faces = []
+        offset = 0
+        for count in raw_counts:
+            expected_faces.append(
+                (raw_indices[offset:offset + count] + 1).tolist())
+            offset += count
+        actual_faces = [
+            [int(value) for value in line.split()[1:]] for line in faces
+        ]
+        self.assertEqual(actual_faces, expected_faces)
+        self.assertAlmostEqual(actual_vertices[:, 1].max(), footprint["height"], places=6)
 
 
 if __name__ == "__main__":
