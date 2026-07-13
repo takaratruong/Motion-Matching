@@ -405,6 +405,33 @@ static void test_heightfield_open_failure_is_actionable_and_transactional()
     expect_heightfield_rejected(path, "cannot open");
 }
 
+static void test_heightfield_rejects_float_rounded_upper_grid_index()
+{
+    heightfield field;
+    field.nx = 16777220;
+    field.nz = 2;
+    field.origin_x = 0.0f;
+    field.origin_z = 0.0f;
+    field.cell_size = 1.0f;
+    field.exterior_height = -99.0f;
+    field.heights.resize(field.nx * field.nz);
+    field.heights.zero();
+
+    const float rounded_upper_x = static_cast<float>(field.nx - 1);
+    assert(static_cast<double>(rounded_upper_x) >
+           static_cast<double>(field.nx - 1));
+    const volatile float outward_sample =
+        heightfield_sample(field, rounded_upper_x, 1.0f);
+    assert(outward_sample == field.exterior_height);
+
+    const float inward_x = nextafterf(rounded_upper_x, -INFINITY);
+    const int inward_x0 = static_cast<int>(floorf(inward_x));
+    assert(inward_x0 >= 0 && inward_x0 + 1 < field.nx);
+    const volatile float inward_sample =
+        heightfield_sample(field, inward_x, 1.0f);
+    assert(inward_sample == 0.0f);
+}
+
 static void probe_generated_artifacts(
     const char* sidecar_path, const char* heightfield_path)
 {
@@ -451,6 +478,7 @@ int main(int argc, char** argv)
     test_heightfield_rejects_invalid_schema_and_sizes();
     test_heightfield_rejects_nonfinite_metadata_and_heights();
     test_heightfield_open_failure_is_actionable_and_transactional();
+    test_heightfield_rejects_float_rounded_upper_grid_index();
     if (argc == 3) {
         probe_generated_artifacts(argv[1], argv[2]);
     }

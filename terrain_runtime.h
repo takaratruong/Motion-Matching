@@ -453,6 +453,9 @@ static inline float heightfield_sample(
 
     const int x0 = static_cast<int>(floorf(grid_x));
     const int z0 = static_cast<int>(floorf(grid_z));
+    if (x0 < 0 || x0 >= field.nx || z0 < 0 || z0 >= field.nz) {
+        return field.exterior_height;
+    }
     const int x1 = x0 < field.nx - 1 ? x0 + 1 : x0;
     const int z1 = z0 < field.nz - 1 ? z0 + 1 : z0;
     const float tx = grid_x - static_cast<float>(x0);
