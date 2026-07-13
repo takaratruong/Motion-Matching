@@ -3379,6 +3379,20 @@ git commit -m "feat: serialize G1 support and walkability"
   runtime scalars are separately quantized to finite normal-or-positive-zero
   float32 and promoted to JSON numbers; authoritative heightfield extrema use
   binary64 arithmetic from decoded float32 G1HF values.
+- Defines the exact binary32 `WALKABILITY_CLASSIFICATION_HALO = 0.25`. It is a
+  G1WM callback-classification allowance for the later `0.20 m` footprint plus
+  lattice rounding; it never changes published playable or region bounds.
+- Produces `_walkability_indices`, `_region_cell_indices`, and
+  `_route_cell_covers`. Region validation covers the inclusive Cartesian
+  product of the exact nearest-node indices selected at its float32 bounds;
+  route validation covers that product for every adjacent exact half-cell
+  sample pair. Thus offset boundaries and diagonal corner grazes cannot hide a
+  wrong-class Voronoi cell.
+- The flat fixture deliberately documents a lattice alias: with serialized
+  `origin_x=-1.0f` and `cell_size=0.02f`, query `x=-0.5f` selects index 25,
+  whose promoted classifier coordinate is approximately
+  `-0.5000000111758709`. Its classification-only halo therefore covers all
+  four sides; its published playable and certified bounds remain unchanged.
 
 - [ ] **Step 1: Write failing schema, hash, route, and ordered-index tests**
 
@@ -3398,6 +3412,8 @@ import numpy as np
 from resources.g1_terrain_builder.artifacts import read_walkability
 from resources.g1_terrain_builder.scenes import (
     REQUIRED_SCENE_IDS,
+    SCENE_CELL_SIZE,
+    WALKABILITY_CLASSIFICATION_HALO,
     BuiltScene,
     SceneDefinition,
     SceneRoute,
@@ -3405,7 +3421,11 @@ from resources.g1_terrain_builder.scenes import (
     build_scene_pack,
     canonical_json_bytes,
     sha256_hex,
+    _region_cell_indices,
     _route_samples,
+    _route_cell_covers,
+    _validate_region_classes,
+    _validate_route_classes,
     _walkability_at,
 )
 from resources.g1_terrain_builder.terrain import FlatTerrain, HeightGrid, \
@@ -3439,7 +3459,14 @@ def flat_definition(scene_id="grail-curb-default"):
             walkability_class=1,
             landing_hold_seconds=2.0,
         ),),
-        walkability=lambda x, z: 1 if -0.5 <= x <= 0.5 and 0 <= z <= 2 else 0,
+        # Query x=-0.5 selects node 25, whose promoted classifier coordinate
+        # is -0.5000000111758709. Apply the shared classification-only halo on
+        # all sides without moving the published playable/region boundary.
+        walkability=lambda x, z: (
+            1 if -0.5 - WALKABILITY_CLASSIFICATION_HALO <= x
+            <= 0.5 + WALKABILITY_CLASSIFICATION_HALO
+            and -WALKABILITY_CLASSIFICATION_HALO <= z
+            <= 2.0 + WALKABILITY_CLASSIFICATION_HALO else 0),
     )
 
 
@@ -3466,6 +3493,43 @@ class SceneSchemaTests(unittest.TestCase):
             "terrain_feature_distances_m", "heightfield", "mesh",
             "walkability", "bounds", "spawn", "regions", "routes",
         })
+        self.assertEqual(set(metadata["provenance"]), {
+            "kind", "source_ids", "parameters",
+        })
+        self.assertEqual(set(metadata["heightfield"]), {
+            "path", "schema", "version", "nx", "nz",
+            "origin_x", "origin_z", "cell_size_m", "exterior_height_m",
+            "interpolation", "diagonal", "sha256",
+        })
+        self.assertEqual(set(metadata["mesh"]), {
+            "path", "schema", "sha256",
+        })
+        self.assertEqual(set(metadata["walkability"]), {
+            "path", "schema", "version", "nx", "nz", "classes", "sha256",
+        })
+        self.assertEqual(set(metadata["walkability"]["classes"]), {
+            "blocked", "certified", "stress",
+        })
+        self.assertEqual(set(metadata["bounds"]), {
+            "mesh_min_xyz", "mesh_max_xyz",
+            "heightfield_min_xyz", "heightfield_max_xyz",
+            "playable_min_xz", "playable_max_xz",
+            "lookahead_min_xz", "lookahead_max_xz",
+        })
+        self.assertEqual(set(metadata["spawn"]), {
+            "position", "yaw_radians",
+        })
+        self.assertEqual(set(metadata["regions"]), {
+            "certified", "stress", "blocked",
+        })
+        for entries in metadata["regions"].values():
+            for entry in entries:
+                self.assertEqual(set(entry), {"id", "bounds_xz"})
+        for route in metadata["routes"]:
+            self.assertEqual(set(route), {
+                "id", "waypoints_xz", "expected_outcome",
+                "walkability_class", "landing_hold_seconds",
+            })
         self.assertEqual(metadata["schema"], "g1-terrain-scene/v1")
         self.assertEqual(metadata["heightfield"]["path"], "terrain.bin")
         self.assertEqual(metadata["heightfield"]["schema"], "G1HF/v2")
@@ -3506,9 +3570,16 @@ class SceneSchemaTests(unittest.TestCase):
             z = float(oz) + iz * float(cell)
             for ix in range(nx):
                 x = float(ox) + ix * float(cell)
-                expected_classes[iz, ix] = \
-                    1 if -0.5 <= x <= 0.5 and 0.0 <= z <= 2.0 else 0
+                expected_classes[iz, ix] = 1 if (
+                    -0.5 - WALKABILITY_CLASSIFICATION_HALO <= x
+                    <= 0.5 + WALKABILITY_CLASSIFICATION_HALO
+                    and -WALKABILITY_CLASSIFICATION_HALO <= z
+                    <= 2.0 + WALKABILITY_CLASSIFICATION_HALO) else 0
         np.testing.assert_array_equal(decoded, expected_classes)
+        alias_x = float(ox) + 25 * float(cell)
+        self.assertEqual(alias_x, -0.5000000111758709)
+        self.assertLess(alias_x, -0.5)
+        self.assertEqual(int(decoded[50, 25]), 1)
         heightfield_min = [float(ox), 0.0, float(oz)]
         heightfield_max = [
             float(ox) + (nx - 1) * float(cell), 0.0,
@@ -3598,16 +3669,86 @@ class SceneSchemaTests(unittest.TestCase):
         self.assertEqual(_walkability_at(grid, classes, one_below, 0.0), 1)
         self.assertEqual(_walkability_at(grid, classes, half, 0.0), 1)
         self.assertEqual(_walkability_at(grid, classes, one_above, 0.0), 1)
+
+    def test_route_interpolation_uses_separate_mul_add_on_both_axes(self):
+        def from_bits(bits):
+            return struct.unpack("<f", struct.pack("<I", bits))[0]
+
+        def bits(value):
+            return struct.unpack("<I", struct.pack("<f", value))[0]
+
+        start = from_bits(0x3eb95abd)
+        stop = from_bits(0xbfd6c975)
+        delta = np.float32(np.float32(stop) - np.float32(start))
+        self.assertEqual(bits(delta), 0xc0029012)
         samples = _route_samples(
-            ((0.0, 0.0), (float(one_above), 0.0)), np.float32(0.25))
-        one_third = np.float32(np.float32(1.0) / np.float32(3.0))
-        two_thirds = np.float32(np.float32(2.0) / np.float32(3.0))
+            ((start, start), (stop, stop)), np.float32(1.0))
+        # The exact f32 squared-distance/sqrt/divide path yields count=3.
+        self.assertEqual(len(samples), 4)
+        self.assertEqual((bits(samples[0][0]), bits(samples[-1][0])),
+                         (0x3eb95abd, 0xbfd6c975))
+        for axis in (0, 1):
+            self.assertEqual(bits(samples[1][axis]), 0xbea2d01f)
+        alpha = np.float32(np.float32(1.0) / np.float32(3.0))
+        fused_once = np.float32(
+            float(start) + float(alpha) * float(delta))
+        self.assertEqual(bits(fused_once), 0xbea2d01e)
+
+    def test_region_supercover_rejects_offset_boundary_alias(self):
+        grid = HeightGrid(
+            heights=np.zeros((2, 3), np.float32),
+            origin_x=0.0, origin_z=0.0, cell_size=1.0,
+            exterior_height=0.0,
+        )
+        classes = np.array([[1, 0, 0], [1, 0, 0]], np.uint8)
+        bounds = (0.0, 0.51, 0.0, 1.0)
+        # The old node-center oracle saw only x=0 and incorrectly passed.
+        old_observed = [
+            int(classes[iz, ix])
+            for iz in range(grid.nz)
+            for ix in range(grid.nx)
+            if bounds[0] <= grid.origin_x + ix * grid.cell_size <= bounds[1]
+            and bounds[2] <= grid.origin_z + iz * grid.cell_size <= bounds[3]
+        ]
+        self.assertEqual(set(old_observed), {1})
+        self.assertEqual(set(_region_cell_indices(grid, bounds)), {
+            (0, 0), (0, 1), (1, 0), (1, 1),
+        })
         self.assertEqual(
-            [struct.pack("<f", point[0]) for point in samples],
-            [struct.pack("<f", value) for value in (
-                0.0, np.float32(one_third * one_above),
-                np.float32(two_thirds * one_above), one_above,
-            )])
+            set(_region_cell_indices(grid, (0.0, 2.0, 0.0, 1.0))),
+            {(iz, ix) for iz in range(2) for ix in range(3)})
+        regions = {
+            "certified": [{"id": "offset", "bounds_xz": list(bounds)}],
+            "stress": [], "blocked": [],
+        }
+        with self.assertRaisesRegex(ValueError, "region disagrees with G1WM"):
+            _validate_region_classes(regions, grid, classes)
+
+    def test_route_supercover_rejects_diagonal_corner_graze(self):
+        grid = HeightGrid(
+            heights=np.zeros((3, 3), np.float32),
+            origin_x=0.0, origin_z=0.0, cell_size=1.0,
+            exterior_height=0.0,
+        )
+        classes = np.ones((3, 3), np.uint8)
+        classes[0, 1] = 0
+        points = ((0.25, 0.25), (0.75, 0.75))
+        samples = _route_samples(points, np.float32(0.5))
+        self.assertEqual(
+            [_walkability_at(grid, classes, *point) for point in samples],
+            [1, 1, 1])
+        covers = _route_cell_covers(grid, points)
+        self.assertIn(
+            {(0, 0), (0, 1), (1, 0), (1, 1)},
+            [set(cover) for cover in covers])
+        routes = [{
+            "waypoints_xz": [list(point) for point in points],
+            "walkability_class": 1,
+        }]
+        with self.assertRaisesRegex(
+                ValueError, "expected route enters wrong walkability class"):
+            _validate_route_classes(
+                routes, grid, classes, (0.0, 2.0, 0.0, 2.0))
 
     def test_scene_pack_requires_exact_order_and_stable_index_fields(self):
         definitions = [flat_definition(scene_id) for scene_id in REQUIRED_SCENE_IDS]
@@ -3617,6 +3758,12 @@ class SceneSchemaTests(unittest.TestCase):
             "path": f"scenes/{scene.scene_id}/scene.json",
             "sha256": hashlib.sha256(scene.scene_json).hexdigest(),
         } for scene in pack.scenes]
+        self.assertEqual(set(pack.index), {
+            "schema", "default_scene_id", "scene_ids", "scenes",
+            "coordinate_signature", "surface_signature",
+        })
+        for descriptor in pack.index["scenes"]:
+            self.assertEqual(set(descriptor), {"id", "path", "sha256"})
         self.assertEqual(pack.index, {
             "schema": "g1-terrain-scene-index/v1",
             "default_scene_id": "grail-curb-default",
@@ -3814,6 +3961,7 @@ REQUIRED_SCENE_IDS = (
 COORDINATE_SIGNATURE = "holden-y-up-right-handed-forward-plus-z"
 TERRAIN_DISTANCES = (0.25, 0.50, 0.75, 1.00)
 SCENE_CELL_SIZE = 0.02
+WALKABILITY_CLASSIFICATION_HALO = 0.25
 SCENE_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
 OUTCOME_CLASS = {
     "traverse": 1,
@@ -4053,21 +4201,29 @@ def _classify_grid(definition, grid):
     return values
 
 
+def _walkability_axis_index(value, origin, cell, count, axis):
+    query = _runtime_f32(value, f"walkability {axis} query")
+    normalized = _f32_div(
+        _f32_sub(query, origin, f"walkability {axis} numerator"),
+        cell, f"walkability {axis} normalized")
+    if not 0.0 <= normalized <= count - 1:
+        raise ValueError("route or region leaves walkability grid")
+    shifted = _f32_add(
+        normalized, 0.5, f"walkability {axis} tie offset")
+    return min(int(np.floor(np.float32(shifted))), count - 1)
+
+
+def _walkability_indices(grid, x, z):
+    return (
+        _walkability_axis_index(
+            x, grid.origin_x, grid.cell_size, grid.nx, "x"),
+        _walkability_axis_index(
+            z, grid.origin_z, grid.cell_size, grid.nz, "z"),
+    )
+
+
 def _walkability_at(grid, values, x, z):
-    x = _runtime_f32(x, "route sample x")
-    z = _runtime_f32(z, "route sample z")
-    gx = _f32_div(
-        _f32_sub(x, grid.origin_x, "walkability gx numerator"),
-        grid.cell_size, "walkability gx")
-    gz = _f32_div(
-        _f32_sub(z, grid.origin_z, "walkability gz numerator"),
-        grid.cell_size, "walkability gz")
-    if not (0.0 <= gx <= grid.nx - 1 and 0.0 <= gz <= grid.nz - 1):
-        raise ValueError("route sample is outside walkability grid")
-    ix = min(int(np.floor(np.float32(
-        _f32_add(gx, 0.5, "walkability gx tie offset")))), grid.nx - 1)
-    iz = min(int(np.floor(np.float32(
-        _f32_add(gz, 0.5, "walkability gz tie offset")))), grid.nz - 1)
+    ix, iz = _walkability_indices(grid, x, z)
     return int(values[iz, ix])
 
 
@@ -4102,47 +4258,82 @@ def _route_samples(points, maximum_step):
     return tuple(output)
 
 
+def _segment_cell_supercover(grid, start, stop):
+    start_ix, start_iz = _walkability_indices(grid, *start)
+    stop_ix, stop_iz = _walkability_indices(grid, *stop)
+    if abs(stop_ix - start_ix) > 1 or abs(stop_iz - start_iz) > 1:
+        raise ValueError("route half-cell subsegment skipped a grid cell")
+    return tuple(
+        (iz, ix)
+        for iz in range(min(start_iz, stop_iz), max(start_iz, stop_iz) + 1)
+        for ix in range(min(start_ix, stop_ix), max(start_ix, stop_ix) + 1)
+    )
+
+
+def _route_cell_covers(grid, points):
+    samples = _route_samples(
+        points, _f32_div(
+            grid.cell_size, 2.0, "route half-cell sample step"))
+    return tuple(
+        _segment_cell_supercover(grid, start, stop)
+        for start, stop in zip(samples, samples[1:])
+    )
+
+
+def _region_cell_indices(grid, bounds):
+    xmin, xmax, zmin, zmax = bounds
+    minimum_ix, minimum_iz = _walkability_indices(grid, xmin, zmin)
+    maximum_ix, maximum_iz = _walkability_indices(grid, xmax, zmax)
+    if minimum_ix > maximum_ix or minimum_iz > maximum_iz:
+        raise ValueError("region nearest-node mapping is not monotone")
+    return tuple(
+        (iz, ix)
+        for iz in range(minimum_iz, maximum_iz + 1)
+        for ix in range(minimum_ix, maximum_ix + 1)
+    )
+
+
 def _validate_route_classes(routes, grid, classes, lookahead):
     for route in routes:
         points = tuple(tuple(point) for point in route["waypoints_xz"])
-        samples = _route_samples(
-            points, _f32_div(
-                grid.cell_size, 2.0, "route half-cell sample step"))
-        for x, z in samples:
+        for x, z in points:
             if not _bounds_contains(lookahead, x, z):
                 raise ValueError("scene route leaves lookahead bounds")
-        sampled_classes = tuple(
-            _walkability_at(grid, classes, x, z) for x, z in samples)
+        cover_classes = tuple(
+            frozenset(int(classes[iz, ix]) for iz, ix in cover)
+            for cover in _route_cell_covers(grid, points)
+        )
         expected = route["walkability_class"]
         if expected in (1, 2):
-            if any(value != expected for value in sampled_classes):
+            if any(values != {expected} for values in cover_classes):
                 raise ValueError("expected route enters wrong walkability class")
         else:
-            if sampled_classes[0] != 1 or sampled_classes[-1] != 0:
+            boundary = [
+                index for index, values in enumerate(cover_classes)
+                if values == {0, 1}
+            ]
+            if len(boundary) != 1:
                 raise ValueError(
-                    "safe-stop route must approach from certified into blocked")
-            first_blocked = sampled_classes.index(0)
-            if any(value != 1 for value in sampled_classes[:first_blocked]) \
-                    or any(value != 0 for value in sampled_classes[first_blocked:]):
-                raise ValueError("safe-stop route re-enters traversable cells")
+                    "safe-stop route needs exactly one certified-blocked cover")
+            split = boundary[0]
+            if split == 0 or split == len(cover_classes) - 1 \
+                    or any(values != {1} for values in cover_classes[:split]) \
+                    or any(values != {0} for values in cover_classes[split + 1:]):
+                raise ValueError(
+                    "safe-stop route must have pure certified and blocked sides")
 
 
 def _validate_region_classes(regions, grid, classes):
     expected_classes = {"blocked": 0, "certified": 1, "stress": 2}
     for class_name, entries in regions.items():
         for entry in entries:
-            xmin, xmax, zmin, zmax = entry["bounds_xz"]
-            observed = []
-            for iz in range(grid.nz):
-                z = float(grid.origin_z) + iz * float(grid.cell_size)
-                if not zmin <= z <= zmax:
-                    continue
-                for ix in range(grid.nx):
-                    x = float(grid.origin_x) + ix * float(grid.cell_size)
-                    if xmin <= x <= xmax:
-                        observed.append(int(classes[iz, ix]))
-            if not observed or any(
-                    value != expected_classes[class_name] for value in observed):
+            observed = tuple(
+                int(classes[iz, ix])
+                for iz, ix in _region_cell_indices(
+                    grid, entry["bounds_xz"])
+            )
+            if any(value != expected_classes[class_name]
+                   for value in observed):
                 raise ValueError(
                     f"{class_name} region disagrees with G1WM classes")
 
@@ -4376,14 +4567,26 @@ actual first/last serialized vertex coordinates; do not assume the two maxima
 are numerically identical. G1WM is decoded as uint8 and must match G1HF `nx`/
 `nz`; it is never described as a float sidecar.
 
+Nearest-node classification is monotone independently on X and Z under the
+named float32 subtract/divide/add sequence. Mapping both inclusive bounds of a
+published rectangle and taking their Cartesian index product therefore covers
+every clipped nearest-neighbor Voronoi cell the rectangle intersects. Route
+segments retain the exact half-cell sampling lattice, but each adjacent pair is
+certified by the inclusive Cartesian product of its endpoint indices. A
+half-cell Euclidean step can change each nearest index by at most one, so this
+is a conservative at-most-`2 x 2` supercover and includes both side cells when
+a diagonal subsegment grazes a corner. A larger index jump is an invariant
+failure, never permission to skip cells.
+
 The sibling C++ scene-catalog consumer must reproduce `_f32_add`, `_f32_sub`,
 `_f32_mul`, `_f32_div`, and `_f32_sqrt` with exactly one binary32 rounding per
 named operation. Route interpolation deliberately performs separate multiply
 then add; FMA contraction is forbidden even under `-ffast-math`. Its strict and
-release tests must use the same half-cell `nextafterf` and three-sample oracle
-above before it consumes these routes. This is a cross-plan handoff requirement;
-do not weaken the independent Python oracle here to accommodate a wider C++
-evaluation path.
+release tests must use the same half-cell `nextafterf`, nonzero-start four-point
+FMA discriminator, region Cartesian coverage, and diagonal supercover oracles
+above before it consumes these routes. This is a cross-plan handoff
+requirement; do not weaken the independent Python oracle here to accommodate a
+wider C++ evaluation path.
 
 - [ ] **Step 5: Run the scene-schema tests**
 
@@ -4394,10 +4597,12 @@ Run:
   tests.python.test_scenes -v
 ~~~
 
-Expected: 8 tests pass; every serialized artifact hash matches the exact cached
-bytes held by `BuiltScene`, one-shot generators are consumed once, repeat builds
-are byte-identical, caller mutation cannot alter cached bytes, decoded G1WM
-classes match route/region semantics, and reversing the catalog is rejected.
+Expected: 11 tests pass; every nested schema and serialized artifact hash
+matches the exact cached bytes held by `BuiltScene`, one-shot generators are
+consumed once, repeat builds are byte-identical, caller mutation cannot alter
+cached bytes, decoded G1WM classes pass conservative region/route supercovers,
+the malicious offset and diagonal-corner fixtures are rejected, and reversing
+the catalog is rejected.
 
 - [ ] **Step 6: Commit the scene pack boundary**
 
@@ -4416,9 +4621,11 @@ git commit -m "feat: define hashed G1 scene packs"
 **Interfaces:**
 - Produces: `procedural_scene_definitions() -> tuple[SceneDefinition, ...]` in
   `REQUIRED_SCENE_IDS[4:]` order.
-- Produces exact continuous `LongitudinalProfileSurface`, `CrossSlopeSurface`,
-  and `BlockedCourseSurface` providers; scene rasterization still occurs only
-  once in `build_scene`.
+- Produces deterministic piecewise `LongitudinalProfileSurface`,
+  `CrossSlopeSurface`, and `BlockedCourseSurface` providers; scene
+  rasterization still occurs only once in `build_scene`. Ramp and cross-slope
+  joins are continuous, while stair faces, signed block edges, wall edges, and
+  declared terminal drops are intentional vertical discontinuities.
 - Locks certified route IDs to `ascent-landing-descent` for stairs,
   `up-landing-down` for 5/10-degree ramps, `forward-cross-slope` for both
   cross-slopes, and `full-course` for the mixed scene.
@@ -4426,19 +4633,98 @@ git commit -m "feat: define hashed G1 scene packs"
   and `wall-safe-stop`/`ramp-safe-stop` for the blocked course.
 - Every course has a flat `2.0 m` spawn lead, and every certified route point
   has at least `1.0 m` of heightfield margin in X and Z.
+- G1WM safe/stress corridor classification expands the published center bounds
+  by exactly binary32 `0.25 m` in X and Z, including spawn and terminal ends,
+  so the later `0.20 m` circular footprint has lattice allowance. Playable and
+  region metadata remain unexpanded center bounds. The blocked-course outer
+  classification bounds get the same halo, but its obstacle threshold remains
+  exactly `obstacle_start_z - SCENE_CELL_SIZE` and is never expanded.
+- Every decoded adjacent-half-cell route supercover must contain only the
+  declared class on all nine traverse/stress routes. Each of the two safe-stop
+  routes must have a pure-class-1 prefix, exactly one mixed `{1, 0}` boundary
+  cover, and a pure-class-0 suffix.
 
 - [ ] **Step 1: Write failing geometry, route, and walkability tests**
 
 Extend the `scenes` import in `tests/python/test_scenes.py` with
-`procedural_scene_definitions`, then add:
+`procedural_scene_definitions`. Reuse Task 8's imported
+`_route_cell_covers` and `_region_cell_indices` exact coverage helpers; do not
+introduce a point-only route or node-center region oracle. Then add:
 
 ~~~python
+def decoded_scene_grid_and_walkability(scene):
+    magic, version, nx, nz, ox, oz, cell, exterior = struct.unpack_from(
+        "<4sIII4f", scene.terrain_bin)
+    header = (magic, version, nx, nz)
+    if header[:2] != (b"G1HF", 2):
+        raise AssertionError(f"bad test G1HF header {header}")
+    heights = np.frombuffer(
+        scene.terrain_bin, "<f4", nx * nz, 32).reshape(nz, nx).copy()
+    grid = HeightGrid(
+        heights=heights, origin_x=float(ox), origin_z=float(oz),
+        cell_size=float(cell), exterior_height=float(exterior),
+    )
+    wm_magic, wm_version, wm_nx, wm_nz = struct.unpack_from(
+        "<4sIII", scene.walkability_bin)
+    if (wm_magic, wm_version, wm_nx, wm_nz) \
+            != (b"G1WM", 1, nx, nz):
+        raise AssertionError("test G1WM header differs from G1HF")
+    if len(scene.walkability_bin) != 16 + nx * nz:
+        raise AssertionError("test G1WM byte size changed")
+    walkability = np.frombuffer(
+        scene.walkability_bin, np.uint8, nx * nz, 16,
+    ).reshape(nz, nx).copy()
+    return grid, walkability
+
+
+def decoded_footprint_classes(
+        grid, walkability, x, z, radius=0.20):
+    # Reconstruct promoted binary32 source nodes from the decoded G1HF header,
+    # then inspect exactly the circular node footprint consumed by runtime.
+    origin_x = np.float32(grid.origin_x)
+    origin_z = np.float32(grid.origin_z)
+    cell = np.float32(grid.cell_size)
+    xs = np.asarray([
+        np.float32(origin_x + np.float32(ix) * cell)
+        for ix in range(grid.nx)
+    ], dtype=np.float32)
+    zs = np.asarray([
+        np.float32(origin_z + np.float32(iz) * cell)
+        for iz in range(grid.nz)
+    ], dtype=np.float32)
+    dx = np.float32(xs[np.newaxis, :] - np.float32(x))
+    dz = np.float32(zs[:, np.newaxis] - np.float32(z))
+    radius_squared = np.float32(np.float32(radius) * np.float32(radius))
+    inside = np.float32(dx * dx + dz * dz) <= np.float32(
+        radius_squared + np.float32(1e-8))
+    if not np.any(inside):
+        raise AssertionError("decoded footprint did not contain a grid node")
+    return tuple(int(value) for value in walkability[inside])
+
+
+def assert_native_json_value(test, value, label="provenance"):
+    if type(value) is dict:
+        test.assertTrue(all(type(key) is str for key in value), label)
+        for key, child in value.items():
+            assert_native_json_value(test, child, f"{label}.{key}")
+        return
+    if type(value) is list:
+        for index, child in enumerate(value):
+            assert_native_json_value(test, child, f"{label}[{index}]")
+        return
+    test.assertIn(type(value), (str, int, float, bool, type(None)), label)
+
+
 class ProceduralSceneTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.definitions = {
             scene.scene_id: scene
             for scene in procedural_scene_definitions()
+        }
+        cls.built = {
+            scene_id: build_scene(definition)
+            for scene_id, definition in cls.definitions.items()
         }
 
     def test_procedural_catalog_order_and_route_contracts(self):
@@ -4567,6 +4853,263 @@ class ProceduralSceneTests(unittest.TestCase):
         self.assertEqual(scene.walkability(0.8, 2.01), 0)
         self.assertAlmostEqual(scene.surface.height(-0.8, 2.25), 0.45)
         self.assertGreater(scene.surface.height(0.8, 2.25), 0.0)
+
+    def test_binary32_halo_expands_only_classification_outer_bounds(self):
+        halo = np.float32(WALKABILITY_CLASSIFICATION_HALO)
+
+        def expanded(bounds):
+            xmin, xmax, zmin, zmax = (np.float32(value) for value in bounds)
+            return tuple(float(value) for value in (
+                np.float32(xmin - halo), np.float32(xmax + halo),
+                np.float32(zmin - halo), np.float32(zmax + halo),
+            ))
+
+        for scene_id, scene in self.definitions.items():
+            if scene_id == "blocked-course":
+                continue
+            expected = scene.routes[0].walkability_class
+            xmin, xmax, zmin, zmax = expanded(scene.playable_bounds_xz)
+            self.assertEqual(scene.walkability(xmin, 0.0), expected)
+            self.assertEqual(scene.walkability(xmax, 0.0), expected)
+            self.assertEqual(scene.walkability(0.0, zmin), expected)
+            self.assertEqual(scene.walkability(0.0, zmax), expected)
+            self.assertEqual(
+                scene.walkability(np.nextafter(xmin, -np.inf), 0.0), 0)
+            self.assertEqual(
+                scene.walkability(np.nextafter(xmax, np.inf), 0.0), 0)
+            self.assertEqual(
+                scene.walkability(0.0, np.nextafter(zmin, -np.inf)), 0)
+            self.assertEqual(
+                scene.walkability(0.0, np.nextafter(zmax, np.inf)), 0)
+
+        blocked = self.definitions["blocked-course"]
+        xmin, xmax, zmin, _ = expanded(blocked.playable_bounds_xz)
+        self.assertEqual(blocked.walkability(xmin, 0.0), 1)
+        self.assertEqual(blocked.walkability(xmax, 0.0), 1)
+        self.assertEqual(blocked.walkability(0.0, zmin), 1)
+        self.assertEqual(
+            blocked.walkability(np.nextafter(xmin, -np.inf), 0.0), 0)
+        threshold = blocked.surface.obstacle_start_z - SCENE_CELL_SIZE
+        self.assertEqual(blocked.walkability(0.0, threshold), 1)
+        self.assertEqual(
+            blocked.walkability(
+                0.0, np.nextafter(threshold, np.inf)),
+            0)
+
+    def test_decoded_routes_and_endpoint_footprints_match_g1wm(self):
+        expected_only_routes = 0
+        safe_stop_routes = 0
+        for scene_id, scene in self.built.items():
+            with self.subTest(scene=scene_id):
+                grid, walkability = decoded_scene_grid_and_walkability(scene)
+                metadata = scene.metadata
+                spawn_xz = (
+                    metadata["spawn"]["position"][0],
+                    metadata["spawn"]["position"][2],
+                )
+                for route in metadata["routes"]:
+                    points = tuple(
+                        tuple(point) for point in route["waypoints_xz"])
+                    self.assertEqual(points[0], spawn_xz)
+                    observed = tuple(
+                        frozenset(
+                            int(walkability[iz, ix])
+                            for iz, ix in cover)
+                        for cover in _route_cell_covers(grid, points)
+                    )
+                    expected = route["walkability_class"]
+                    if expected in (1, 2):
+                        expected_only_routes += 1
+                        self.assertTrue(all(
+                            values == {expected} for values in observed))
+                        for endpoint in (points[0], points[-1]):
+                            self.assertEqual(
+                                set(decoded_footprint_classes(
+                                    grid, walkability, *endpoint)),
+                                {expected})
+                    else:
+                        safe_stop_routes += 1
+                        boundary = [
+                            index for index, values in enumerate(observed)
+                            if values == {0, 1}
+                        ]
+                        self.assertEqual(len(boundary), 1)
+                        split = boundary[0]
+                        self.assertGreater(split, 0)
+                        self.assertLess(split, len(observed) - 1)
+                        self.assertTrue(all(
+                            values == {1} for values in observed[:split]))
+                        self.assertTrue(all(
+                            values == {0} for values in observed[split + 1:]))
+                        self.assertEqual(
+                            set(decoded_footprint_classes(
+                                grid, walkability, *points[0])),
+                            {1})
+        self.assertEqual(expected_only_routes, 9)
+        self.assertEqual(safe_stop_routes, 2)
+
+    def test_decoded_regions_are_nonempty_and_class_pure(self):
+        expected_classes = {"blocked": 0, "certified": 1, "stress": 2}
+        for scene_id, scene in self.built.items():
+            grid, walkability = decoded_scene_grid_and_walkability(scene)
+            for class_name, regions in scene.metadata["regions"].items():
+                for region in regions:
+                    with self.subTest(
+                            scene=scene_id, region=region["id"]):
+                        cells = _region_cell_indices(
+                            grid, region["bounds_xz"])
+                        self.assertTrue(cells)
+                        observed = tuple(
+                            int(walkability[iz, ix]) for iz, ix in cells)
+                        self.assertEqual(
+                            set(observed),
+                            {expected_classes[class_name]})
+
+    def test_serialized_routes_hold_landings_and_derived_margins(self):
+        for scene_id, built in self.built.items():
+            metadata = built.metadata
+            definition = self.definitions[scene_id]
+            grid, _ = decoded_scene_grid_and_walkability(built)
+            minimum = metadata["bounds"]["heightfield_min_xyz"]
+            maximum = metadata["bounds"]["heightfield_max_xyz"]
+            spawn_xz = (
+                metadata["spawn"]["position"][0],
+                metadata["spawn"]["position"][2],
+            )
+            for route in metadata["routes"]:
+                points = tuple(
+                    tuple(point) for point in route["waypoints_xz"])
+                self.assertEqual(points[0], spawn_xz)
+                self.assertTrue(all(
+                    start != stop
+                    for start, stop in zip(points, points[1:])))
+                for point in points:
+                    for coordinate in point:
+                        packed = struct.pack("<f", coordinate)
+                        self.assertEqual(
+                            struct.unpack("<f", packed)[0], coordinate)
+                        if coordinate == 0.0:
+                            self.assertEqual(
+                                struct.unpack("<I", packed)[0], 0)
+                if route["expected_outcome"] != "safe-stop":
+                    for x, z in points:
+                        self.assertGreaterEqual(x - minimum[0], 1.0)
+                        self.assertGreaterEqual(maximum[0] - x, 1.0)
+                        self.assertGreaterEqual(z - minimum[2], 1.0)
+                        self.assertGreaterEqual(maximum[2] - z, 1.0)
+                if route["landing_hold_seconds"] > 0.0:
+                    x, z = points[2]
+                    landing_height = definition.surface.height(x, z)
+                    self.assertGreater(
+                        landing_height,
+                        definition.surface.height(*spawn_xz))
+                    self.assertAlmostEqual(
+                        definition.surface.height(x, z - grid.cell_size),
+                        landing_height, places=9)
+                    self.assertAlmostEqual(
+                        definition.surface.height(x, z + grid.cell_size),
+                        landing_height, places=9)
+
+    def test_provenance_is_native_json_and_builds_repeat_byte_exactly(self):
+        for scene_id, definition in self.definitions.items():
+            with self.subTest(scene=scene_id):
+                assert_native_json_value(self, definition.provenance)
+                canonical_json_bytes(definition.provenance)
+                rebuilt = build_scene(definition)
+                original = self.built[scene_id]
+                self.assertEqual(rebuilt.scene_json, original.scene_json)
+                self.assertEqual(rebuilt.terrain_bin, original.terrain_bin)
+                self.assertEqual(rebuilt.terrain_obj, original.terrain_obj)
+                self.assertEqual(
+                    rebuilt.walkability_bin, original.walkability_bin)
+        blocked = self.definitions["blocked-course"].surface
+        self.assertIs(type(blocked.ramp_run), float)
+        self.assertIs(type(blocked.height(0.8, 2.1)), float)
+        for scene_id in ("cross-slope-05", "cross-slope-10"):
+            self.assertIs(
+                type(self.definitions[scene_id].surface.height(0.6, 5.0)),
+                float)
+
+    def test_piecewise_continuous_joins_and_declared_vertical_edges(self):
+        def assert_continuous(scene, z, x=0.0):
+            center = scene.surface.height(x, z)
+            self.assertAlmostEqual(
+                scene.surface.height(x, np.nextafter(z, -np.inf)),
+                center, places=9)
+            self.assertAlmostEqual(
+                center,
+                scene.surface.height(x, np.nextafter(z, np.inf)),
+                places=9)
+
+        for degrees in (5, 10, 15):
+            scene_id = f"ramp-{degrees:02d}-" + (
+                "stress" if degrees == 15 else "up-down")
+            scene = self.definitions[scene_id]
+            p = scene.provenance["parameters"]
+            for join in (
+                    p["flat_spawn_length_m"], p["ascent_end_z_m"],
+                    p["descent_start_z_m"],
+                    p["descent_start_z_m"] + p["run_m"]):
+                assert_continuous(scene, join)
+
+        for degrees in (5, 10):
+            scene = self.definitions[f"cross-slope-{degrees:02d}"]
+            p = scene.provenance["parameters"]
+            start = p["flat_spawn_length_m"] + p["flat_entry_length_m"]
+            length = p["grade_length_m"]
+            transition = p["transition_length_m"]
+            for join in (
+                    start, start + transition,
+                    start + length - transition, start + length):
+                assert_continuous(scene, join, x=0.6)
+
+        mixed = self.definitions["mixed-multilevel"]
+        p = mixed.provenance["parameters"]
+        ramp_start = p["block_starts_z_m"][-1] + p["block_top_length_m"]
+        assert_continuous(mixed, ramp_start)
+        assert_continuous(mixed, ramp_start + p["return_ramp_run_m"])
+        for start, change in zip(
+                p["block_starts_z_m"], p["block_height_changes_m"]):
+            before = mixed.surface.height(0.0, np.nextafter(start, -np.inf))
+            self.assertAlmostEqual(
+                mixed.surface.height(0.0, start) - before, change, places=9)
+
+        stairs = self.definitions["stairs-shallow"]
+        first_step = stairs.provenance["parameters"]["flat_spawn_length_m"]
+        self.assertAlmostEqual(
+            stairs.surface.height(0.0, first_step)
+            - stairs.surface.height(
+                0.0, np.nextafter(first_step, -np.inf)),
+            0.08, places=9)
+
+        blocked = self.definitions["blocked-course"].surface
+        self.assertEqual(
+            blocked.height(-0.8, blocked.obstacle_start_z),
+            blocked.wall_height)
+        self.assertEqual(
+            blocked.height(
+                -0.8,
+                np.nextafter(blocked.obstacle_start_z, -np.inf)),
+            0.0)
+        wall_end = blocked.obstacle_start_z + blocked.wall_top_length
+        self.assertEqual(blocked.height(-0.8, wall_end), blocked.wall_height)
+        self.assertEqual(
+            blocked.height(-0.8, np.nextafter(wall_end, np.inf)), 0.0)
+        ramp_end = blocked.obstacle_start_z + blocked.ramp_run \
+            + blocked.ramp_top_length
+        self.assertEqual(blocked.height(0.8, ramp_end), blocked.ramp_rise)
+        self.assertEqual(
+            blocked.height(0.8, np.nextafter(ramp_end, np.inf)), 0.0)
+        wall_x_edge = blocked.wall_center_x + blocked.lane_half_width
+        self.assertEqual(
+            blocked.height(
+                wall_x_edge, blocked.obstacle_start_z + 0.25),
+            blocked.wall_height)
+        self.assertEqual(
+            blocked.height(
+                np.nextafter(wall_x_edge, np.inf),
+                blocked.obstacle_start_z + 0.25),
+            0.0)
 ~~~
 
 - [ ] **Step 2: Run the procedural tests and verify the missing API failure**
@@ -4588,6 +5131,24 @@ Add to `scenes.py` after the scene dataclasses:
 COURSE_HALF_WIDTH = 0.60
 FLAT_SPAWN_LENGTH = 2.0
 LOOKAHEAD_MARGIN = 1.0
+
+
+def _walkability_classification_bounds(bounds):
+    # The JSON playable/region bounds remain center bounds. Only the promoted
+    # source-node G1WM callback receives this exact binary32 footprint halo.
+    values = tuple(
+        _runtime_f32(value, f"walkability center bound {index}")
+        for index, value in enumerate(bounds)
+    )
+    halo = _runtime_f32(
+        WALKABILITY_CLASSIFICATION_HALO,
+        "walkability classification halo")
+    return (
+        _f32_sub(values[0], halo, "walkability classification xmin"),
+        _f32_add(values[1], halo, "walkability classification xmax"),
+        _f32_sub(values[2], halo, "walkability classification zmin"),
+        _f32_add(values[3], halo, "walkability classification zmax"),
+    )
 
 
 @dataclass(frozen=True)
@@ -4630,7 +5191,8 @@ class CrossSlopeSurface:
             phase / self.transition_length,
             (self.grade_length - phase) / self.transition_length,
         )
-        return x * np.tan(np.deg2rad(self.angle_degrees)) * factor
+        return float(
+            x * np.tan(np.deg2rad(self.angle_degrees)) * factor)
 
 
 @dataclass(frozen=True)
@@ -4647,7 +5209,9 @@ class BlockedCourseSurface:
 
     @property
     def ramp_run(self):
-        return self.ramp_rise / np.tan(np.deg2rad(self.ramp_angle_degrees))
+        return float(
+            self.ramp_rise /
+            np.tan(np.deg2rad(self.ramp_angle_degrees)))
 
     def height(self, x, z):
         x, z = float(x), float(z)
@@ -4660,7 +5224,9 @@ class BlockedCourseSurface:
         if abs(x - self.ramp_center_x) <= self.lane_half_width:
             phase = z - self.obstacle_start_z
             if 0.0 <= phase < self.ramp_run:
-                return phase * np.tan(np.deg2rad(self.ramp_angle_degrees))
+                return float(
+                    phase *
+                    np.tan(np.deg2rad(self.ramp_angle_degrees)))
             if self.ramp_run <= phase <= self.ramp_run + self.ramp_top_length:
                 return self.ramp_rise
         return 0.0
@@ -4675,6 +5241,7 @@ def _corridor_definition(
     walkability_class,
 ):
     playable = (-COURSE_HALF_WIDTH, COURSE_HALF_WIDTH, 0.0, course_end_z)
+    classification = _walkability_classification_bounds(playable)
     bounds = (
         -COURSE_HALF_WIDTH - LOOKAHEAD_MARGIN,
         COURSE_HALF_WIDTH + LOOKAHEAD_MARGIN,
@@ -4699,10 +5266,15 @@ def _corridor_definition(
         spawn_yaw_radians=0.0,
         regions=regions,
         routes=(route,),
-        walkability=lambda x, z, c=walkability_class, b=playable: (
+        walkability=lambda x, z, c=walkability_class, b=classification: (
             c if _bounds_contains(b, x, z) else 0),
     )
 ~~~
+
+`WALKABILITY_CLASSIFICATION_HALO` is exactly representable as binary32
+`0.25f`. `_walkability_classification_bounds` performs one named binary32
+operation per expanded edge. The unexpanded `playable` tuple remains the
+authoritative published center-bound contract.
 
 The `0.5 m` transitions are part of each `4.0 m` cross-slope segment; the
 preceding `2.0 m` spawn area plus `1.0 m` entry and the following `1.0 m` exit
@@ -4773,7 +5345,7 @@ def _stair_definition(scene_id, label, rises, runs, unseen):
 
 def _ramp_profile(angle_degrees):
     rise = 0.36
-    run = rise / np.tan(np.deg2rad(angle_degrees))
+    run = float(rise / np.tan(np.deg2rad(angle_degrees)))
     ascent_end = FLAT_SPAWN_LENGTH + run
     descent_start = ascent_end + 2.0
     course_end = descent_start + run + 1.0
@@ -4864,7 +5436,8 @@ def _mixed_definition():
     changes = (0.08, -0.12, 0.04)
     block_starts = tuple(elevated_end + 0.60 * i for i in range(3))
     ramp_start = elevated_end + 3 * 0.60
-    ramp_run = sum(stair_rises) / np.tan(np.deg2rad(10.0))
+    ramp_run = float(
+        sum(stair_rises) / np.tan(np.deg2rad(10.0)))
     course_end = ramp_start + ramp_run + 1.0
 
     def profile(z):
@@ -4923,11 +5496,14 @@ def _blocked_definition():
     course_end = obstacle_start + surface.ramp_run \
         + surface.ramp_top_length + 1.0
     playable = (-1.4, 1.4, 0.0, course_end)
+    classification = _walkability_classification_bounds(playable)
     bounds = (-2.4, 2.4, -1.0, course_end + 1.0)
 
     def walkability(x, z):
-        if not _bounds_contains(playable, x, z):
+        if not _bounds_contains(classification, x, z):
             return 0
+        # Expand only the outer course bounds. This obstacle threshold is the
+        # published safety boundary and deliberately receives no halo.
         return 1 if z <= obstacle_start - SCENE_CELL_SIZE else 0
 
     parameters = {
@@ -5035,8 +5611,13 @@ PY
 ~~~
 
 Expected: the scene suite passes and the inspection prints exactly
-`VALID procedural-scenes=10`. The 15-degree route is class 2; both blocked
-routes target class-0 cells after a class-1 approach.
+`VALID procedural-scenes=10`. Decoded G1WM bytes keep all nine non-blocked
+route supercovers exclusively in their declared class, keep every conservative
+region-cell product nonempty and class-pure, and give each `0.20 m` endpoint
+footprint the expected class. Both blocked routes have one mixed `{1, 0}`
+boundary cover between pure prefixes/suffixes. Provenance is native JSON, the
+deliberate piecewise joins/edges match their declarations, and rebuilding all
+four bytes of every procedural scene is byte-identical.
 
 - [ ] **Step 7: Commit the deterministic procedural catalog**
 
