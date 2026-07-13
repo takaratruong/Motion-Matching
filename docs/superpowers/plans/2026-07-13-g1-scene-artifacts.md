@@ -951,6 +951,9 @@ remain unstaged.
 - Generated, never committed: `/tmp/g1_gate_a_before.csv`
 - Generated, never committed: `/tmp/g1_gate_a_before.sha256`
 - Generated, never committed: `/tmp/g1_gate_a_commit.txt`
+- Generated, never committed: `/tmp/g1_gate_a_report.txt`
+- Generated, never committed: `/tmp/g1_gate_a_status_before.txt`
+- Generated, never committed: `/tmp/g1_gate_a_status_after.txt`
 
 **Interfaces:**
 - Consumes the pre-existing G1HF/v1 `resources/g1_terrain/` pack and the exact Task 1 controller.
@@ -961,17 +964,26 @@ remain unstaged.
 Run:
 
 ~~~bash
+for path in /tmp/g1_gate_a_before.csv /tmp/g1_gate_a_before.sha256 \
+  /tmp/g1_gate_a_commit.txt /tmp/g1_gate_a_report.txt \
+  /tmp/g1_gate_a_status_before.txt /tmp/g1_gate_a_status_after.txt
+do
+  test ! -e "$path"
+done
+git status --short > /tmp/g1_gate_a_status_before.txt
 git rev-parse HEAD > /tmp/g1_gate_a_commit.txt
 sha256sum resources/g1_terrain/database.bin \
   resources/g1_terrain/terrain_features.bin \
   resources/g1_terrain/terrain.bin \
   resources/g1_terrain/terrain.obj \
   resources/g1_terrain/manifest.json \
+  resources/g1_terrain/validation.json \
   > /tmp/g1_gate_a_before.sha256
 ~~~
 
-Expected: both commands exit 0; `git status --short` is unchanged because every
-output is under `/tmp`.
+Expected: every evidence path was absent, all commands exit 0, and the exact
+pre-task dirty status is saved before any run. Refuse to overwrite prior
+evidence; choose a separately reviewed evidence basename if a rerun is needed.
 
 - [ ] **Step 2: Run the deterministic terrain-weight-four curb approach**
 
@@ -982,6 +994,7 @@ DISPLAY=:1 G1_TERRAIN_DIR=resources/g1_terrain \
   MM_TEST_MODE=terrain MM_TERRAIN_WEIGHT=4 MM_TEST_FRAMES=375 \
   MM_LOG=/tmp/g1_gate_a_before.csv \
   /tmp/controller_g1_gate_a
+test "$(wc -l < /tmp/g1_gate_a_before.csv)" -eq 376
 ~~~
 
 Expected: normal cleanup and exit 0 after exactly 375 updates; the CSV contains
@@ -994,7 +1007,11 @@ Run:
 
 ~~~bash
 /home/ubuntu/miniconda3/envs/diffsim/bin/python \
-  resources/check_g1_runtime_log.py /tmp/g1_gate_a_before.csv --gate-a
+  resources/check_g1_runtime_log.py /tmp/g1_gate_a_before.csv --gate-a \
+  | tee /tmp/g1_gate_a_report.txt
+test "$(grep -c '^VALID gate-a ' /tmp/g1_gate_a_report.txt)" -eq 1
+grep -Eq 'classification=(raw-selected|blended-rendered|no-penetration)' \
+  /tmp/g1_gate_a_report.txt
 ~~~
 
 Expected: exit 0 with a `VALID gate-a` line containing a finite
@@ -1010,11 +1027,13 @@ Run:
 
 ~~~bash
 sha256sum --check /tmp/g1_gate_a_before.sha256
-git status --short
+git status --short > /tmp/g1_gate_a_status_after.txt
+diff -u /tmp/g1_gate_a_status_before.txt /tmp/g1_gate_a_status_after.txt
 ~~~
 
 Expected: every checksum reports `OK`; repository status contains only the
-user's pre-existing changes and no Gate A output. There is no commit for this
+exact saved pre-task changes and no Gate A output. The report persistently
+records the measured classification, and there is no commit for this
 evidence-only task.
 
 ### Task 3: Replace radius dilation with exact vertical-triangle GRAIL queries
