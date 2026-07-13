@@ -158,6 +158,31 @@ class ArtifactTests(unittest.TestCase):
             self.assertEqual(os.listdir(output), ["old"])
             self._assert_no_publication_scratch(temporary, output)
 
+    def test_publish_recovers_crash_backup_before_new_staging_failure(self):
+        artifacts = ArtifactSet.empty(4, 2)
+        manifest = {"schema": "test", "validation": {"ok": True}}
+        with tempfile.TemporaryDirectory() as temporary:
+            output = os.path.join(temporary, "published")
+            backup = output + ".previous"
+            os.mkdir(backup)
+            with open(os.path.join(backup, "old"), "w") as stream:
+                stream.write("last-good")
+
+            def failed_writer(staging):
+                raise RuntimeError("injected terrain export failure")
+
+            with self.assertRaisesRegex(RuntimeError, "injected"):
+                publish_artifacts(output, artifacts, manifest, failed_writer)
+
+            self.assertTrue(
+                os.path.isdir(output),
+                "crash backup was not recovered as the authoritative output",
+            )
+            with open(os.path.join(output, "old")) as stream:
+                self.assertEqual(stream.read(), "last-good")
+            self.assertEqual(os.listdir(output), ["old"])
+            self._assert_no_publication_scratch(temporary, output)
+
     def test_publish_requires_both_terrain_outputs_before_replacing(self):
         artifacts = ArtifactSet.empty(4, 2)
         manifest = {"schema": "test", "validation": {"ok": True}}

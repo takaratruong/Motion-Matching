@@ -151,7 +151,10 @@ def publish_artifacts(
     parent = os.path.dirname(output_dir)
     os.makedirs(parent, exist_ok=True)
     backup = output_dir + ".previous"
-    _remove_path(backup)
+    if not os.path.lexists(output_dir) and os.path.lexists(backup):
+        os.replace(backup, output_dir)
+    else:
+        _remove_path(backup)
     staging = tempfile.mkdtemp(prefix=".g1_terrain-", dir=parent)
     previous_moved = False
     try:
