@@ -337,10 +337,12 @@ columns.
 
 The initial index contains these deterministic scenes:
 
-1. `grail-curb-default`: corrected exact-surface version of the current demo.
+1. `grail-curb-default`: corrected exact-surface version of the current demo;
+   its measured 0.292 m maximum makes this a class-2 stress route.
 2. `grail-curb-low`, `grail-curb-medium`, and `grail-curb-high`: choose the
    lexically first GRAIL candidate nearest measured maximum heights 0.12, 0.24,
-   and 0.36 m respectively.
+   and 0.36 m respectively. Low is certified; medium and high are class-2
+   stress routes.
 3. `stairs-shallow`: four 0.08 m rises, 0.30 m runs, 1.20 m width, and a 2.0 m
    raised landing.
 4. `stairs-standard`: three 0.12 m rises, 0.32 m runs, 1.20 m width, and a 2.0 m
@@ -382,7 +384,9 @@ At each fixed 25 Hz update:
 11. optionally apply bounded G1 terrain IK and rerun affected FK;
 12. compute clearance and acceptance diagnostics; and
 13. render the shared query/clearance surface, skeleton, trajectory, samples,
-    support state, contacts, and blocked markers.
+    support state, contacts, and blocked markers. Only after every correctness
+    gate passes, an optional rigid-link G1 visual mesh may replace the skeleton
+    for drawing while consuming the same final FK transforms as const input.
 
 Scene switching occurs only between updates and performs the complete reset
 after candidate validation.
@@ -473,7 +477,7 @@ existing sub-stride detector.
 
 ### Gate D: Traversability
 
-On `blocked-course` and every stress case that cannot satisfy traversal gates:
+On the two class-0 `blocked-course` routes:
 
 - the swept planar footprint never enters a blocked cell;
 - applied speed reaches zero before the visible boundary;
@@ -497,6 +501,16 @@ Compare matched IK-off and IK-on runs for each certified route:
   body lift; and
 - disabling IK reproduces the support-retargeted Gate C baseline.
 
+Run the same matched pair for every class-2 route:
+`grail-curb-default/curb-forward`, `grail-curb-medium/curb-forward`,
+`grail-curb-high/curb-forward`, and
+`ramp-15-stress/up-landing-down`. Each must either complete within the same
+physical bounds or request a reason-backed safe stop before scripted route
+completion. A safe stop rolls back the unsafe pose, cancels actual planar
+velocity/acceleration on the following update, preserves accepted-pose
+clearance through the tail, and does not require the open-loop route-complete
+flag to remain false.
+
 ### Gate F: Scene switching and live use
 
 - Repeatedly cycle through every scene without reloading the motion library,
@@ -506,7 +520,24 @@ Compare matched IK-off and IK-on runs for each certified route:
   and blocked state agree with the CSV.
 - The controller maintains its fixed 25 Hz target and closes through normal
   model/window cleanup.
-- Leave the approved multiscene build open on `DISPLAY=:1` for user testing.
+- Complete the deterministic display/cleanup smoke on `DISPLAY=:1`; the one
+  persistent live launch is deferred until the optional last-only visual-mesh
+  decision below.
+
+### Optional last-only visual gate
+
+After Gates A--F and all paired Gate E routes pass, try the G1 visual assets
+from the local `g1_29dof.xml` tree as rigid link meshes. This is a rendering
+experiment only: it must not write matching, support, IK, route, scene, or log
+state. Skeleton rendering remains the default, live toggle, and fallback.
+
+The mesh path is accepted only when the XML body/asset mapping is complete,
+conversion is deterministic, all models load and unload transactionally,
+skeleton and mesh CSVs are byte-identical, memory/timing stay within the
+implementation plan's ease thresholds, and Gates A--F remain green. Any
+failure records a deferral and leaves the verified skeleton controller as the
+result. The final persistent `DISPLAY=:1` launch uses the mesh only if this
+optional gate passes.
 
 ## Non-goals
 
