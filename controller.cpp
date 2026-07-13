@@ -26,6 +26,31 @@ static inline Vector3 to_Vector3(vec3 v)
     return (Vector3){ v.x, v.y, v.z };
 }
 
+//-------------------------------------- MM_DISCRETE instrumentation
+#ifdef MM_DISCRETE
+#include <cstdio>
+#include <cstdlib>
+int          g_frame = 0;
+static bool  g_force_strafe = false;
+static FILE* g_log = nullptr;
+// yaw (deg) of the facing direction produced by a quat, matches how
+// desired_rotation is derived (atan2 of a rotated forward vector)
+static inline float dbg_yaw_deg(quat q)
+{
+    vec3 f = quat_mul_vec3(q, vec3(0.0f, 0.0f, 1.0f));
+    return atan2f(f.x, f.z) * 180.0f / PIf;
+}
+static inline float dbg_quat_angle_deg(quat q)
+{
+    q = quat_abs(q);
+    return 2.0f * acosf(clampf(q.w, -1.0f, 1.0f)) * 180.0f / PIf;
+}
+static inline float dbg_angle_between_deg(quat a, quat b)
+{
+    return quat_angle_between(a, b) * 180.0f / PIf;
+}
+#endif
+
 //--------------------------------------
 
 // Perform linear blend skinning and copy 
@@ -103,6 +128,52 @@ vec3 gamepad_get_stick(int stick, const float deadzone = 0.2f)
 {
     float gamepadx = GetGamepadAxisMovement(GAMEPAD_PLAYER, stick == GAMEPAD_STICK_LEFT ? GAMEPAD_AXIS_LEFT_X : GAMEPAD_AXIS_RIGHT_X);
     float gamepady = GetGamepadAxisMovement(GAMEPAD_PLAYER, stick == GAMEPAD_STICK_LEFT ? GAMEPAD_AXIS_LEFT_Y : GAMEPAD_AXIS_RIGHT_Y);
+
+#ifdef MM_AUTODRIVE
+    // self-driving test mode: walk in a slowly-turning circle
+    if (stick == GAMEPAD_STICK_LEFT)
+    {
+        float t = (float)GetTime();
+        return vec3(0.7f*sinf(0.4f*t), 0.0f, -0.7f*cosf(0.4f*t));
+    }
+#endif
+#ifdef MM_DISCRETE
+    // discrete-keyboard test mode. Scripted phases mimic a user mashing keys:
+    //   frames   0-119 : hold W (forward, -Z)
+    //   frames 120-179 : hold S (backward, +Z)   <- 180 deg move reversal
+    //   frames 180-239 : hold A (strafe-left, -X)
+    //   frames 240-299 : hold D (strafe-right, +X)
+    //   frames 300-399 : hold W again (forward)
+    // Heading is ALSO snapped via camera_azimuth in the main loop.
+    if (stick == GAMEPAD_STICK_LEFT)
+    {
+        int f = g_frame;
+        if      (f < 120) return vec3( 0.0f, 0.0f, -0.9f); // W forward
+        else if (f < 180) return vec3( 0.0f, 0.0f, +0.9f); // S backward (180 flip)
+        else if (f < 240) return vec3(-0.9f, 0.0f,  0.0f); // A left
+        else if (f < 300) return vec3(+0.9f, 0.0f,  0.0f); // D right
+        else              return vec3( 0.0f, 0.0f, -0.9f); // W forward
+    }
+    else
+    {
+        return vec3(); // right stick unused; azimuth is snapped directly
+    }
+#endif
+    // keyboard fallback: WASD -> left stick (move), arrows -> right stick (camera)
+    if (stick == GAMEPAD_STICK_LEFT)
+    {
+        if (IsKeyDown(KEY_A)) gamepadx -= 1.0f;
+        if (IsKeyDown(KEY_D)) gamepadx += 1.0f;
+        if (IsKeyDown(KEY_W)) gamepady -= 1.0f;
+        if (IsKeyDown(KEY_S)) gamepady += 1.0f;
+    }
+    else
+    {
+        if (IsKeyDown(KEY_LEFT))  gamepadx -= 1.0f;
+        if (IsKeyDown(KEY_RIGHT)) gamepadx += 1.0f;
+        if (IsKeyDown(KEY_UP))    gamepady -= 1.0f;
+        if (IsKeyDown(KEY_DOWN))  gamepady += 1.0f;
+    }
     float gamepadmag = sqrtf(gamepadx*gamepadx + gamepady*gamepady);
     
     if (gamepadmag > deadzone)
@@ -149,8 +220,8 @@ float orbit_camera_update_distance(
     const float dt)
 {
     float gamepadzoom = 
-        IsGamepadButtonDown(GAMEPAD_PLAYER, GAMEPAD_BUTTON_LEFT_TRIGGER_1)  ? +1.0f :
-        IsGamepadButtonDown(GAMEPAD_PLAYER, GAMEPAD_BUTTON_RIGHT_TRIGGER_1) ? -1.0f : 0.0f;
+        (IsGamepadButtonDown(GAMEPAD_PLAYER, GAMEPAD_BUTTON_LEFT_TRIGGER_1) || IsKeyDown(KEY_Q))  ? +1.0f :
+        (IsGamepadButtonDown(GAMEPAD_PLAYER, GAMEPAD_BUTTON_RIGHT_TRIGGER_1) || IsKeyDown(KEY_E)) ? -1.0f : 0.0f;
         
     return clampf(distance +  10.0f * dt * gamepadzoom, 0.1f, 100.0f);
 }
@@ -186,7 +257,7 @@ void orbit_camera_update(
 
 bool desired_strafe_update()
 {
-    return IsGamepadButtonDown(GAMEPAD_PLAYER, GAMEPAD_BUTTON_LEFT_TRIGGER_2) > 0.5f;
+    return IsGamepadButtonDown(GAMEPAD_PLAYER, GAMEPAD_BUTTON_LEFT_TRIGGER_2) > 0.5f || IsKeyDown(KEY_LEFT_CONTROL);
 }
 
 void desired_gait_update(
@@ -198,7 +269,7 @@ void desired_gait_update(
     simple_spring_damper_exact(
         desired_gait, 
         desired_gait_velocity,
-        IsGamepadButtonDown(GAMEPAD_PLAYER, GAMEPAD_BUTTON_RIGHT_FACE_DOWN) ? 1.0f : 0.0f,
+        (IsGamepadButtonDown(GAMEPAD_PLAYER, GAMEPAD_BUTTON_RIGHT_FACE_DOWN) || IsKeyDown(KEY_LEFT_SHIFT)) ? 1.0f : 0.0f,
         gait_change_halflife,
         dt);
 }
@@ -1245,14 +1316,9 @@ int main(void)
     
     // Character
     
-    character character_data;
-    character_load(character_data, "./resources/character.bin");
-    
-    Shader character_shader = LoadShader("./resources/character.vs", "./resources/character.fs");
-    Mesh character_mesh = make_character_mesh(character_data);
-    Model character_model = LoadModelFromMesh(character_mesh);
-    character_model.materials[0].shader = character_shader;
-    
+    // G1: no character.bin skinned mesh — the skeleton is drawn directly from
+    // bone transforms in the render loop, so mesh/shader loading is skipped.
+
     // Load Animation Data and build Matching Database
     
     database db;
@@ -1277,7 +1343,7 @@ int main(void)
     // Pose & Inertializer Data
     
     int frame_index = db.range_starts(0);
-    float inertialize_blending_halflife = 0.1f;
+    float inertialize_blending_halflife = 0.10f;
 
     array1d<vec3> curr_bone_positions = db.bone_positions(frame_index);
     array1d<vec3> curr_bone_velocities = db.bone_velocities(frame_index);
@@ -1345,8 +1411,11 @@ int main(void)
         0.0f);
         
     // Trajectory & Gameplay Data
-    
+
     float search_time = 0.1f;
+#ifdef MM_DISCRETE
+    if (const char* e = getenv("MM_SEARCHT")) search_time = atof(e);
+#endif
     float search_timer = search_time;
     float force_search_timer = search_time;
     
@@ -1373,13 +1442,16 @@ int main(void)
     float simulation_rotation_halflife = 0.27f;
     
     // All speeds in m/s
-    float simulation_run_fwrd_speed = 4.0f;
-    float simulation_run_side_speed = 3.0f;
-    float simulation_run_back_speed = 2.5f;
+    // G1: takara walk DB only contains ~0.4-0.5 m/s of motion. Commanding
+    // 4 m/s made the sim target outrun the feet (sliding), thrash the match
+    // (leg twitch) and spin the root. Match speeds to what the data provides.
+    float simulation_run_fwrd_speed = 0.9f;
+    float simulation_run_side_speed = 0.6f;
+    float simulation_run_back_speed = 0.6f;
     
-    float simulation_walk_fwrd_speed = 1.75f;
-    float simulation_walk_side_speed = 1.5f;
-    float simulation_walk_back_speed = 1.25f;
+    float simulation_walk_fwrd_speed = 0.5f;
+    float simulation_walk_side_speed = 0.4f;
+    float simulation_walk_back_speed = 0.4f;
     
     array1d<vec3> trajectory_desired_velocities(4);
     array1d<quat> trajectory_desired_rotations(4);
@@ -1420,9 +1492,10 @@ int main(void)
     
     // Contact and Foot Locking data
     
+    // G1 31-bone database: LeftToe=7, RightToe=13 (index 0 = Simulation bone)
     array1d<int> contact_bones(2);
-    contact_bones(0) = Bone_LeftToe;
-    contact_bones(1) = Bone_RightToe;
+    contact_bones(0) = 7;   // G1 LeftToe (was Bone_LeftToe=5 for LAFAN)
+    contact_bones(1) = 13;  // G1 RightToe (was Bone_RightToe=9 for LAFAN)
     
     array1d<bool> contact_states(contact_bones.size);
     array1d<bool> contact_locks(contact_bones.size);
@@ -1492,15 +1565,62 @@ int main(void)
 
     float dt = 1.0f / 60.0f;
 
+#ifdef MM_DISCRETE
+    // Optional env overrides so we can sweep halflife without recompiling.
+    if (const char* e = getenv("MM_HALFLIFE"))  inertialize_blending_halflife = atof(e);
+    if (const char* e = getenv("MM_SIMROT_HL")) simulation_rotation_halflife  = atof(e);
+    if (const char* e = getenv("MM_STRAFE"))    g_force_strafe = (atoi(e) != 0);
+    const char* logpath = getenv("MM_LOG");
+    g_log = fopen(logpath ? logpath : "/home/ubuntu/projects/motion-matching/discrete_log.txt", "w");
+    if (!g_log) g_log = stderr;
+    fprintf(g_log, "# MM_DISCRETE run: hold-forward + azimuth snaps at f=120,240,360\n");
+    fprintf(g_log, "# inertialize_blending_halflife=%.3f sim_rot_halflife=%.3f strafe=%d\n",
+        inertialize_blending_halflife, simulation_rotation_halflife, (int)g_force_strafe);
+#endif
+
     auto update_func = [&]()
     {
-      
+
+#ifdef MM_DISCRETE
+        // Camera-azimuth scripting. MM_MODE selects the pattern:
+        //   0 (default): a few big 90-deg snaps (arrow taps)
+        //   1: rapid alternating +/-90 snaps every N frames (arrow mashing)
+        //   2: continuous azimuth ramp (arrow held), 2 rad/s like the real cam
+        static int mode = -2;
+        static int snapN = 12;
+        if (mode == -2) { const char* m=getenv("MM_MODE"); mode=m?atoi(m):0;
+                          const char* n=getenv("MM_SNAPN"); if(n) snapN=atoi(n); }
+        if (mode == 0)
+        {
+            if (g_frame == 120) camera_azimuth += 0.5f * PIf;
+            if (g_frame == 240) camera_azimuth += 0.5f * PIf;
+            if (g_frame == 360) camera_azimuth -= 0.5f * PIf;
+        }
+        else if (mode == 1)
+        {
+            if (g_frame >= 60 && (g_frame % snapN) == 0)
+                camera_azimuth += ((g_frame / snapN) % 2 ? -1.0f : 1.0f) * 0.5f * PIf;
+        }
+        else if (mode == 2)
+        {
+            if (g_frame >= 60) camera_azimuth += 2.0f * (1.0f/60.0f); // arrow held
+        }
+        else if (mode == 3)
+        {
+            // alternating 180-deg azimuth snaps -> antipodal desired_rotation
+            if (g_frame >= 60 && (g_frame % snapN) == 0) camera_azimuth += PIf;
+        }
+#endif
+
         // Get gamepad stick states
         vec3 gamepadstick_left = gamepad_get_stick(GAMEPAD_STICK_LEFT);
         vec3 gamepadstick_right = gamepad_get_stick(GAMEPAD_STICK_RIGHT);
-        
+
         // Get if strafe is desired
         bool desired_strafe = desired_strafe_update();
+#ifdef MM_DISCRETE
+        desired_strafe = g_force_strafe;
+#endif
         
         // Get the desired gait (walk / run)
         desired_gait_update(
@@ -1628,6 +1748,14 @@ int main(void)
         bool end_of_anim = database_trajectory_index_clamp(db, frame_index, 1) == frame_index;
         
         // Do we need to search?
+#ifdef MM_DISCRETE
+        int   dbg_best_index = frame_index;   // -1 == no search this frame
+        bool  dbg_did_search = (force_search || search_timer <= 0.0f || end_of_anim);
+        bool  dbg_did_transition = false;
+        quat  dbg_root_before = bone_rotations(0);
+        quat  dbg_off_before  = bone_offset_rotations(0);
+        quat  dbg_trns_dst_rot = trns_bone_rotations(0);
+#endif
         if (force_search || search_timer <= 0.0f || end_of_anim)
         {
             if (lmm_enabled)
@@ -1740,7 +1868,14 @@ int main(void)
                         trns_bone_angular_velocities);
                     
                     frame_index = best_index;
+#ifdef MM_DISCRETE
+                    dbg_did_transition = true;
+                    dbg_trns_dst_rot = trns_bone_rotations(0);
+#endif
                 }
+#ifdef MM_DISCRETE
+                dbg_best_index = best_index;
+#endif
             }
 
             // Reset search timer
@@ -1947,6 +2082,51 @@ int main(void)
                 adjusted_rotation);
         }
         
+#ifdef MM_DISCRETE
+        {
+            // Per-frame instrumentation. All angles in degrees.
+            quat root_q   = bone_rotations(0);          // final rendered root rotation
+            vec3 root_p   = bone_positions(0);
+            quat off_q    = bone_offset_rotations(0);   // inertialize root ROTATION offset
+            vec3 off_av   = bone_offset_angular_velocities(0);
+            static float  prev_root_yaw = dbg_yaw_deg(root_q);
+            static quat   prev_root_q   = root_q;
+            float root_yaw   = dbg_yaw_deg(root_q);
+            float jump_deg   = dbg_angle_between_deg(prev_root_q, root_q); // full 3D jump
+            float des_yaw    = dbg_yaw_deg(desired_rotation);
+            float sim_yaw    = dbg_yaw_deg(simulation_rotation);
+            float off_ang    = dbg_quat_angle_deg(off_q);           // magnitude of root offset
+            float dst_yaw    = dbg_yaw_deg(transition_dst_rotation);
+            float src_yaw    = dbg_yaw_deg(transition_src_rotation);
+
+            fprintf(g_log,
+                "f=%d az=%.1f | rootYaw=%.1f jump3D=%.1f | desYaw=%.1f simYaw=%.1f "
+                "| offAng=%.2f offW=%.3f offAV=%.2f | best=%d srch=%d trns=%d "
+                "| dstYaw=%.1f srcYaw=%.1f | fi=%d\n",
+                g_frame, camera_azimuth * 180.0f / PIf,
+                root_yaw, jump_deg,
+                des_yaw, sim_yaw,
+                off_ang, off_q.w, length(off_av),
+                dbg_best_index, (int)dbg_did_search, (int)dbg_did_transition,
+                dst_yaw, src_yaw, frame_index);
+
+            if (jump_deg > 30.0f)
+            {
+                fprintf(g_log,
+                    "  *** ROOT JUMP %.1f deg at f=%d: prevYaw=%.1f -> yaw=%.1f "
+                    "offAng=%.2f best=%d trns=%d dstYaw=%.1f srcYaw=%.1f\n",
+                    jump_deg, g_frame, prev_root_yaw, root_yaw,
+                    off_ang, dbg_best_index, (int)dbg_did_transition, dst_yaw, src_yaw);
+            }
+            fflush(g_log);
+
+            prev_root_yaw = root_yaw;
+            prev_root_q   = root_q;
+            g_frame++;
+            if (g_frame >= 400) { fflush(g_log); fclose(g_log); _Exit(0); }
+        }
+#endif
+
         // Contact fixup with foot locking and IK
 
         adjusted_bone_positions = bone_positions;
@@ -2161,14 +2341,19 @@ int main(void)
             obstacles_positions,
             obstacles_scales);
         
-        deform_character_mesh(
-            character_mesh, 
-            character_data, 
-            global_bone_positions, 
-            global_bone_rotations,
-            db.bone_parents);
-        
-        DrawModel(character_model, (Vector3){0.0f, 0.0f, 0.0f}, 1.0f, RAYWHITE);
+        // G1: no skinned mesh — draw the skeleton directly from bone transforms.
+        // Sphere at each joint, capsule (cylinder) from each bone to its parent.
+        for (int bi = 1; bi < db.nbones(); bi++)
+        {
+            vec3 bp = global_bone_positions(bi);
+            DrawSphereWires(to_Vector3(bp), 0.028f, 4, 8, DARKBLUE);
+            int par = db.bone_parents(bi);
+            if (par > 0)
+            {
+                DrawCylinderEx(to_Vector3(global_bone_positions(par)), to_Vector3(bp),
+                    0.018f, 0.018f, 6, SKYBLUE);
+            }
+        }
         
         // Draw matched features
         
@@ -2176,8 +2361,9 @@ int main(void)
         denormalize_features(current_features, db.features_offset, db.features_scale);        
         draw_features(current_features, bone_positions(0), bone_rotations(0), MAROON);
         
+// (diagnostic MM_LOGROOT block removed)
         // Draw Simuation Bone
-        
+
         DrawSphereWires(to_Vector3(bone_positions(0)), 0.05f, 4, 10, MAROON);
         DrawLine3D(to_Vector3(bone_positions(0)), to_Vector3(
             bone_positions(0) + 0.6f * quat_mul_vec3(bone_rotations(0), vec3(0.0f, 0.0f, 1.0f))), MAROON);
@@ -2475,10 +2661,8 @@ int main(void)
     }
 #endif
 
-    // Unload stuff and finish
-    UnloadModel(character_model);
+    // Unload stuff and finish (G1: no character mesh/shader to unload)
     UnloadModel(ground_plane_model);
-    UnloadShader(character_shader);
     UnloadShader(ground_plane_shader);
 
     CloseWindow();

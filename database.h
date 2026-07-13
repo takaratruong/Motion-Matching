@@ -547,12 +547,17 @@ void database_build_matching_features(
     db.features_offset.resize(nfeatures);
     db.features_scale.resize(nfeatures);
     
+    // G1 31-bone skeleton indices (index 0 = Simulation bone):
+    //   Hips=1, LeftAnkle=6, LeftToe=7, RightAnkle=12, RightToe=13.
+    // Holden's Bone_LeftFoot(4)/Bone_RightFoot(8) map to HIP joints on the G1,
+    // so match on the G1 foot (ankle) bones instead.
+    const int G1_LeftFoot = 6, G1_RightFoot = 12, G1_Hips = 1;
     int offset = 0;
-    compute_bone_position_feature(db, offset, Bone_LeftFoot, feature_weight_foot_position);
-    compute_bone_position_feature(db, offset, Bone_RightFoot, feature_weight_foot_position);
-    compute_bone_velocity_feature(db, offset, Bone_LeftFoot, feature_weight_foot_velocity);
-    compute_bone_velocity_feature(db, offset, Bone_RightFoot, feature_weight_foot_velocity);
-    compute_bone_velocity_feature(db, offset, Bone_Hips, feature_weight_hip_velocity);
+    compute_bone_position_feature(db, offset, G1_LeftFoot, feature_weight_foot_position);
+    compute_bone_position_feature(db, offset, G1_RightFoot, feature_weight_foot_position);
+    compute_bone_velocity_feature(db, offset, G1_LeftFoot, feature_weight_foot_velocity);
+    compute_bone_velocity_feature(db, offset, G1_RightFoot, feature_weight_foot_velocity);
+    compute_bone_velocity_feature(db, offset, G1_Hips, feature_weight_hip_velocity);
     compute_trajectory_position_feature(db, offset, feature_weight_trajectory_positions);
     compute_trajectory_direction_feature(db, offset, feature_weight_trajectory_directions);
     

@@ -146,11 +146,15 @@ static inline void decay_spring_damper_exact(
     const float halflife, 
     const float dt)
 {
-    float y = halflife_to_damping(halflife) / 2.0f; 
-    
-    vec3 j0 = quat_to_scaled_angle_axis(x);
+    float y = halflife_to_damping(halflife) / 2.0f;
+
+    // quat_abs: take the shortest-arc hemisphere before log, else an offset in
+    // the negative-w hemisphere logs to ~±2pi and the spring decays toward a
+    // FULL rotation (root "flips out"). Only bites on data that produces
+    // negative-w offset quats (e.g. omnidirectional G1 walk).
+    vec3 j0 = quat_to_scaled_angle_axis(quat_abs(x));
     vec3 j1 = v + j0*y;
-    
+
     float eydt = fast_negexpf(y*dt);
 
     x = quat_from_scaled_angle_axis(eydt*(j0 + j1*dt));
