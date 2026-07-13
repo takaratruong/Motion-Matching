@@ -825,8 +825,8 @@ static void probe_generated_artifacts(
         field, heightfield_path, error, static_cast<int>(sizeof(error)));
     check(heightfield_loaded,
           error[0] != '\0' ? error : "generated terrain heightfield load");
-    check(field.nx == 261, "generated terrain heightfield nx");
-    check(field.nz == 228, "generated terrain heightfield nz");
+    check(field.nx == 265, "generated terrain heightfield nx");
+    check(field.nz == 399, "generated terrain heightfield nz");
     check(field.heights.size == field.nx * field.nz,
           "generated terrain heightfield value count");
 

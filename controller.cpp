@@ -14,9 +14,13 @@
 #include "character.h"
 #include "database.h"
 #include "g1_skeleton.h"
+#include "terrain_runtime.h"
 #include "nnet.h"
 #include "lmm.h"
 
+#include <errno.h>
+#include <limits.h>
+#include <stdlib.h>
 #include <initializer_list>
 #include <functional>
 
@@ -25,6 +29,346 @@
 static inline Vector3 to_Vector3(vec3 v)
 {
     return (Vector3){ v.x, v.y, v.z };
+}
+
+static bool g1_artifact_path(
+    char* output,
+    const size_t capacity,
+    const char* directory,
+    const char* filename,
+    char* error,
+    const int error_capacity)
+{
+    if (directory == NULL || directory[0] == '\0')
+    {
+        return g1_error(
+            error, error_capacity, "G1_TERRAIN_DIR must not be empty");
+    }
+
+    const int length = snprintf(output, capacity, "%s/%s", directory, filename);
+    if (length < 0 || static_cast<size_t>(length) >= capacity)
+    {
+        return g1_error(
+            error,
+            error_capacity,
+            "G1 terrain path is too long for %s",
+            filename);
+    }
+    return true;
+}
+
+static bool g1_probe_required_file(
+    const char* path, char* error, const int error_capacity)
+{
+    FILE* file = fopen(path, "rb");
+    if (file == NULL)
+    {
+        return g1_error(
+            error,
+            error_capacity,
+            "%s: cannot open required G1 terrain artifact (%s)",
+            path,
+            strerror(errno));
+    }
+    if (fseek(file, 0, SEEK_END) != 0)
+    {
+        fclose(file);
+        return g1_error(
+            error, error_capacity, "%s: cannot size required artifact", path);
+    }
+    const long size = ftell(file);
+    const bool close_failed = fclose(file) != 0;
+    if (size <= 0 || close_failed)
+    {
+        return g1_error(
+            error,
+            error_capacity,
+            "%s: required artifact is empty or unreadable",
+            path);
+    }
+    return true;
+}
+
+static bool g1_parse_terrain_weight(
+    float& weight, char* error, const int error_capacity)
+{
+    const char* text = getenv("MM_TERRAIN_WEIGHT");
+    if (text == NULL) return true;
+
+    errno = 0;
+    char* end = NULL;
+    const float parsed = strtof(text, &end);
+    if (text[0] == '\0' || end == text || *end != '\0' || errno == ERANGE ||
+        !terrain_float_is_finite(parsed) || parsed < 0.0f || parsed > 10.0f)
+    {
+        return g1_error(
+            error,
+            error_capacity,
+            "MM_TERRAIN_WEIGHT must be a finite number in [0,10], got '%s'",
+            text);
+    }
+    weight = parsed;
+    return true;
+}
+
+static bool g1_parse_test_frames(
+    int& frame_limit, char* error, const int error_capacity)
+{
+    const char* text = getenv("MM_TEST_FRAMES");
+    if (text == NULL) return true;
+
+    errno = 0;
+    char* end = NULL;
+    const long parsed = strtol(text, &end, 10);
+    if (text[0] == '\0' || end == text || *end != '\0' || errno == ERANGE ||
+        parsed <= 0 || parsed > INT_MAX)
+    {
+        return g1_error(
+            error,
+            error_capacity,
+            "MM_TEST_FRAMES must be a positive integer, got '%s'",
+            text);
+    }
+    frame_limit = static_cast<int>(parsed);
+    return true;
+}
+
+template<typename T>
+static bool g1_validate_animation_shape(
+    const array2d<T>& values,
+    const int frames,
+    const int bones,
+    const char* name,
+    char* error,
+    const int error_capacity)
+{
+    if (values.rows != frames || values.cols != bones || values.data == NULL)
+    {
+        return g1_error(
+            error,
+            error_capacity,
+            "G1 database %s shape mismatch: expected %dx%d, got %dx%d",
+            name,
+            frames,
+            bones,
+            values.rows,
+            values.cols);
+    }
+    return true;
+}
+
+static bool g1_database_validate(
+    const database& db, char* error, const int error_capacity)
+{
+    const int frames = db.nframes();
+    const int bones = db.nbones();
+    if (frames <= 0)
+    {
+        return g1_error(error, error_capacity, "G1 database has no frames");
+    }
+    if (!g1_validate_animation_shape(
+            db.bone_positions,
+            frames,
+            bones,
+            "bone_positions",
+            error,
+            error_capacity) ||
+        !g1_validate_animation_shape(
+            db.bone_velocities,
+            frames,
+            bones,
+            "bone_velocities",
+            error,
+            error_capacity) ||
+        !g1_validate_animation_shape(
+            db.bone_rotations,
+            frames,
+            bones,
+            "bone_rotations",
+            error,
+            error_capacity) ||
+        !g1_validate_animation_shape(
+            db.bone_angular_velocities,
+            frames,
+            bones,
+            "bone_angular_velocities",
+            error,
+            error_capacity))
+    {
+        return false;
+    }
+    if (db.contact_states.rows != frames || db.contact_states.cols != 2 ||
+        db.contact_states.data == NULL)
+    {
+        return g1_error(
+            error,
+            error_capacity,
+            "G1 database contact shape mismatch: expected %dx2, got %dx%d",
+            frames,
+            db.contact_states.rows,
+            db.contact_states.cols);
+    }
+    if (db.range_starts.size <= 0 ||
+        db.range_stops.size != db.range_starts.size ||
+        db.range_starts.data == NULL || db.range_stops.data == NULL)
+    {
+        return g1_error(
+            error,
+            error_capacity,
+            "G1 database range arrays must be nonempty and equal-sized");
+    }
+
+    int expected_start = 0;
+    for (int range = 0; range < db.nranges(); ++range)
+    {
+        const int start = db.range_starts(range);
+        const int stop = db.range_stops(range);
+        if (start != expected_start || stop <= start || stop > frames)
+        {
+            return g1_error(
+                error,
+                error_capacity,
+                "G1 database range %d is not contiguous/in-bounds: "
+                "expected start %d, got [%d,%d) for %d frames",
+                range,
+                expected_start,
+                start,
+                stop,
+                frames);
+        }
+        expected_start = stop;
+    }
+    if (expected_start != frames)
+    {
+        return g1_error(
+            error,
+            error_capacity,
+            "G1 database ranges stop at %d instead of covering %d frames",
+            expected_start,
+            frames);
+    }
+    return true;
+}
+
+static bool g1_feature_value_is_safe(const float value)
+{
+    const uint32_t magnitude = feature_float_bits(value) & UINT32_C(0x7fffffff);
+    return feature_float_is_finite(value) && magnitude != UINT32_C(0x7f7fffff);
+}
+
+static bool g1_matching_features_validate(
+    const database& db, char* error, const int error_capacity)
+{
+    const int expected_features = 31;
+    if (db.features.rows != db.nframes() ||
+        db.features.cols != expected_features || db.features.data == NULL ||
+        db.features_offset.size != expected_features ||
+        db.features_scale.size != expected_features ||
+        db.features_offset.data == NULL || db.features_scale.data == NULL)
+    {
+        return g1_error(
+            error,
+            error_capacity,
+            "G1 matching feature build failed: expected %dx%d features, got %dx%d",
+            db.nframes(),
+            expected_features,
+            db.features.rows,
+            db.features.cols);
+    }
+
+    for (int feature = 0; feature < expected_features; ++feature)
+    {
+        if (!g1_feature_value_is_safe(db.features_offset(feature)) ||
+            !feature_float_is_positive_finite(db.features_scale(feature)))
+        {
+            return g1_error(
+                error,
+                error_capacity,
+                "G1 matching feature %d has invalid offset/scale",
+                feature);
+        }
+    }
+    for (int value = 0; value < db.features.rows * db.features.cols; ++value)
+    {
+        if (!g1_feature_value_is_safe(db.features.data[value]))
+        {
+            return g1_error(
+                error,
+                error_capacity,
+                "G1 matching feature row payload is invalid at value %d",
+                value);
+        }
+    }
+
+    const int small_rows =
+        (db.nframes() + BOUND_SM_SIZE - 1) / BOUND_SM_SIZE;
+    const int large_rows =
+        (db.nframes() + BOUND_LR_SIZE - 1) / BOUND_LR_SIZE;
+    const array2d<float>* bounds[4] = {
+        &db.bound_sm_min, &db.bound_sm_max, &db.bound_lr_min, &db.bound_lr_max
+    };
+    const int expected_rows[4] = {
+        small_rows, small_rows, large_rows, large_rows
+    };
+    for (int bound = 0; bound < 4; ++bound)
+    {
+        if (bounds[bound]->rows != expected_rows[bound] ||
+            bounds[bound]->cols != expected_features ||
+            bounds[bound]->data == NULL)
+        {
+            return g1_error(
+                error,
+                error_capacity,
+                "G1 matching bound %d shape mismatch: expected %dx%d, got %dx%d",
+                bound,
+                expected_rows[bound],
+                expected_features,
+                bounds[bound]->rows,
+                bounds[bound]->cols);
+        }
+        for (int value = 0; value < bounds[bound]->rows * bounds[bound]->cols;
+             ++value)
+        {
+            if (!g1_feature_value_is_safe(bounds[bound]->data[value]))
+            {
+                return g1_error(
+                    error,
+                    error_capacity,
+                    "G1 matching bound %d has invalid value at %d",
+                    bound,
+                    value);
+            }
+        }
+    }
+    for (int value = 0; value < small_rows * expected_features; ++value)
+    {
+        if (db.bound_sm_min.data[value] > db.bound_sm_max.data[value])
+        {
+            return g1_error(
+                error, error_capacity, "G1 small matching bounds are inverted");
+        }
+    }
+    for (int value = 0; value < large_rows * expected_features; ++value)
+    {
+        if (db.bound_lr_min.data[value] > db.bound_lr_max.data[value])
+        {
+            return g1_error(
+                error, error_capacity, "G1 large matching bounds are inverted");
+        }
+    }
+    return true;
+}
+
+static int g1_active_range(const database& db, const int frame)
+{
+    for (int range = 0; range < db.nranges(); ++range)
+    {
+        if (frame >= db.range_starts(range) && frame < db.range_stops(range))
+        {
+            return range;
+        }
+    }
+    return -1;
 }
 
 //-------------------------------------- MM_DISCRETE instrumentation
@@ -1272,15 +1616,184 @@ void update_callback(void* args)
 
 int main(void)
 {
-    // Init Window
-    
     const int screen_width = 1280;
     const int screen_height = 720;
-    
-    SetConfigFlags(FLAG_VSYNC_HINT);
-    SetConfigFlags(FLAG_MSAA_4X_HINT);
-    InitWindow(screen_width, screen_height, "raylib [data vs code driven displacement]");
-    SetTargetFPS(60);
+
+    const char* terrain_directory = getenv("G1_TERRAIN_DIR");
+    if (terrain_directory == NULL)
+    {
+        terrain_directory = "./resources/g1_terrain";
+    }
+    char database_path[1024] = {};
+    char feature_path[1024] = {};
+    char heightfield_path[1024] = {};
+    char mesh_path[1024] = {};
+    char manifest_path[1024] = {};
+    char artifact_error[512] = {};
+    if (!g1_artifact_path(
+            database_path,
+            sizeof(database_path),
+            terrain_directory,
+            "database.bin",
+            artifact_error,
+            sizeof(artifact_error)) ||
+        !g1_artifact_path(
+            feature_path,
+            sizeof(feature_path),
+            terrain_directory,
+            "terrain_features.bin",
+            artifact_error,
+            sizeof(artifact_error)) ||
+        !g1_artifact_path(
+            heightfield_path,
+            sizeof(heightfield_path),
+            terrain_directory,
+            "terrain.bin",
+            artifact_error,
+            sizeof(artifact_error)) ||
+        !g1_artifact_path(
+            mesh_path,
+            sizeof(mesh_path),
+            terrain_directory,
+            "terrain.obj",
+            artifact_error,
+            sizeof(artifact_error)) ||
+        !g1_artifact_path(
+            manifest_path,
+            sizeof(manifest_path),
+            terrain_directory,
+            "manifest.json",
+            artifact_error,
+            sizeof(artifact_error)))
+    {
+        fprintf(stderr, "G1 terrain path error: %s\n", artifact_error);
+        return 2;
+    }
+
+    const char* required_paths[5] = {
+        database_path, feature_path, heightfield_path, mesh_path, manifest_path
+    };
+    for (int path = 0; path < 5; ++path)
+    {
+        if (!g1_probe_required_file(
+                required_paths[path],
+                artifact_error,
+                static_cast<int>(sizeof(artifact_error))))
+        {
+            fprintf(stderr, "G1 terrain artifact error: %s\n", artifact_error);
+            return 2;
+        }
+    }
+    if (!g1_manifest_validate(
+            manifest_path,
+            artifact_error,
+            static_cast<int>(sizeof(artifact_error))))
+    {
+        fprintf(stderr, "G1 manifest error: %s\n", artifact_error);
+        return 2;
+    }
+
+    float feature_weight_foot_position = 0.75f;
+    float feature_weight_foot_velocity = 1.0f;
+    float feature_weight_hip_velocity = 1.0f;
+    float feature_weight_trajectory_positions = 1.0f;
+    float feature_weight_trajectory_directions = 1.5f;
+    float feature_weight_terrain = 0.0f;
+    int test_frame_limit = 0;
+    if (!g1_parse_terrain_weight(
+            feature_weight_terrain,
+            artifact_error,
+            static_cast<int>(sizeof(artifact_error))) ||
+        !g1_parse_test_frames(
+            test_frame_limit,
+            artifact_error,
+            static_cast<int>(sizeof(artifact_error))))
+    {
+        fprintf(stderr, "G1 terrain option error: %s\n", artifact_error);
+        return 2;
+    }
+
+    terrain_feature_set terrain_rows;
+    heightfield runtime_terrain;
+    if (!terrain_features_load(
+            terrain_rows,
+            feature_path,
+            artifact_error,
+            static_cast<int>(sizeof(artifact_error))) ||
+        !heightfield_load(
+            runtime_terrain,
+            heightfield_path,
+            artifact_error,
+            static_cast<int>(sizeof(artifact_error))))
+    {
+        fprintf(stderr, "G1 terrain artifact error: %s\n", artifact_error);
+        return 2;
+    }
+
+    database db;
+    database_load(db, database_path);
+    if (!g1_database_validate(
+            db, artifact_error, static_cast<int>(sizeof(artifact_error))))
+    {
+        fprintf(stderr, "G1 database error: %s\n", artifact_error);
+        return 2;
+    }
+    if (terrain_rows.values.rows != db.nframes())
+    {
+        fprintf(
+            stderr,
+            "G1 terrain frame mismatch: database=%d sidecar=%d\n",
+            db.nframes(),
+            terrain_rows.values.rows);
+        return 2;
+    }
+    db.terrain_features = terrain_rows.values;
+    if (!g1_skeleton_validate(
+            db, artifact_error, static_cast<int>(sizeof(artifact_error))))
+    {
+        fprintf(stderr, "G1 skeleton error: %s\n", artifact_error);
+        return 2;
+    }
+
+    database_build_matching_features(
+        db,
+        feature_weight_foot_position,
+        feature_weight_foot_velocity,
+        feature_weight_hip_velocity,
+        feature_weight_trajectory_positions,
+        feature_weight_trajectory_directions,
+        G1_LeftAnkle,
+        G1_RightAnkle,
+        G1_Hips,
+        feature_weight_terrain);
+    if (!g1_matching_features_validate(
+            db, artifact_error, static_cast<int>(sizeof(artifact_error))))
+    {
+        fprintf(stderr, "G1 feature error: %s\n", artifact_error);
+        return 2;
+    }
+
+    // Open the graphics window only after every artifact and feature gate has
+    // passed, so startup errors stay useful on headless systems.
+    SetConfigFlags(FLAG_VSYNC_HINT | FLAG_MSAA_4X_HINT);
+    InitWindow(
+        screen_width,
+        screen_height,
+        "G1 terrain motion matching - Holden runtime");
+    if (!IsWindowReady())
+    {
+        fprintf(stderr, "G1 terrain visualizer could not open a window\n");
+        return 2;
+    }
+    SetTargetFPS(25);
+
+    Model terrain_model = LoadModel(mesh_path);
+    if (!IsModelReady(terrain_model) || terrain_model.meshCount <= 0)
+    {
+        fprintf(stderr, "G1 terrain mesh failed to load: %s\n", mesh_path);
+        CloseWindow();
+        return 2;
+    }
     
     // Camera
 
@@ -1308,42 +1821,11 @@ int main(void)
     obstacles_scales(1) = vec3(4.0f, 1.0f, 4.0f);
     obstacles_scales(2) = vec3(2.0f, 1.0f, 2.0f);
     
-    // Ground Plane
-    
-    Shader ground_plane_shader = LoadShader("./resources/checkerboard.vs", "./resources/checkerboard.fs");
-    Mesh ground_plane_mesh = GenMeshPlane(20.0f, 20.0f, 10, 10);
-    Model ground_plane_model = LoadModelFromMesh(ground_plane_mesh);
-    ground_plane_model.materials[0].shader = ground_plane_shader;
-    
     // Character
     
     // G1: no character.bin skinned mesh — the skeleton is drawn directly from
     // bone transforms in the render loop, so mesh/shader loading is skipped.
 
-    // Load Animation Data and build Matching Database
-    
-    database db;
-    database_load(db, "./resources/database.bin");
-    
-    float feature_weight_foot_position = 0.75f;
-    float feature_weight_foot_velocity = 1.0f;
-    float feature_weight_hip_velocity = 1.0f;
-    float feature_weight_trajectory_positions = 1.0f;
-    float feature_weight_trajectory_directions = 1.5f;
-    
-    database_build_matching_features(
-        db,
-        feature_weight_foot_position,
-        feature_weight_foot_velocity,
-        feature_weight_hip_velocity,
-        feature_weight_trajectory_positions,
-        feature_weight_trajectory_directions,
-        G1_LeftAnkle,
-        G1_RightAnkle,
-        G1_Hips);
-        
-    database_save_matching_features(db, "./resources/features.bin");
-   
     // Pose & Inertializer Data
     
     int frame_index = db.range_starts(0);
@@ -1487,7 +1969,7 @@ int main(void)
     
     // IK
     
-    bool ik_enabled = true;
+    const bool ik_enabled = false;
     float ik_max_length_buffer = 0.015f;
     float ik_foot_height = 0.02f;
     float ik_toe_length = 0.15f;
@@ -1547,17 +2029,12 @@ int main(void)
     
     // Learned Motion Matching
     
-    bool lmm_enabled = false;
+    const bool lmm_enabled = false;
     
-    nnet decompressor, stepper, projector;    
-    nnet_load(decompressor, "./resources/decompressor.bin");
-    nnet_load(stepper, "./resources/stepper.bin");
-    nnet_load(projector, "./resources/projector.bin");
-
+    // These objects keep Holden's dormant learned path type-correct, but the
+    // incompatible LAFAN networks are deliberately not loaded for G1.
+    nnet decompressor, stepper, projector;
     nnet_evaluation decompressor_evaluation, stepper_evaluation, projector_evaluation;
-    decompressor_evaluation.resize(decompressor);
-    stepper_evaluation.resize(stepper);
-    projector_evaluation.resize(projector);
 
     array1d<float> features_proj = db.features(frame_index);
     array1d<float> features_curr = db.features(frame_index);
@@ -1566,7 +2043,8 @@ int main(void)
     
     // Go
 
-    float dt = 1.0f / 60.0f;
+    const float dt = 1.0f / 25.0f;
+    const float trajectory_sample_time = 1.0f / 3.0f;
 
 #ifdef MM_DISCRETE
     // Optional env overrides so we can sweep halflife without recompiling.
@@ -1580,6 +2058,10 @@ int main(void)
     fprintf(g_log, "# inertialize_blending_halflife=%.3f sim_rot_halflife=%.3f strafe=%d\n",
         inertialize_blending_halflife, simulation_rotation_halflife, (int)g_force_strafe);
 #endif
+
+    int rendered_frames = 0;
+    bool controller_exit_requested = false;
+    int controller_exit_code = 0;
 
     auto update_func = [&]()
     {
@@ -1689,7 +2171,7 @@ int main(void)
           gamepadstick_left,
           gamepadstick_right,
           desired_strafe,
-          20.0f * dt);
+          trajectory_sample_time);
         
         trajectory_rotations_predict(
             trajectory_rotations,
@@ -1698,7 +2180,7 @@ int main(void)
             simulation_angular_velocity,
             trajectory_desired_rotations,
             simulation_rotation_halflife,
-            20.0f * dt);
+            trajectory_sample_time);
         
         trajectory_desired_velocities_predict(
           trajectory_desired_velocities,
@@ -1711,7 +2193,7 @@ int main(void)
           simulation_fwrd_speed,
           simulation_side_speed,
           simulation_back_speed,
-          20.0f * dt);
+          trajectory_sample_time);
         
         trajectory_positions_predict(
             trajectory_positions,
@@ -1722,7 +2204,7 @@ int main(void)
             simulation_acceleration,
             trajectory_desired_velocities,
             simulation_velocity_halflife,
-            20.0f * dt,
+            trajectory_sample_time,
             obstacles_positions,
             obstacles_scales);
            
@@ -1744,7 +2226,19 @@ int main(void)
         query_copy_denormalized_feature(query, offset, 3, query_features, db.features_offset, db.features_scale); // Hip Velocity
         query_compute_trajectory_position_feature(query, offset, bone_positions(0), bone_rotations(0), trajectory_positions);
         query_compute_trajectory_direction_feature(query, offset, bone_rotations(0), trajectory_rotations);
-        
+
+        float terrain_query[4] = {};
+        terrain_centerline_query(
+            terrain_query,
+            runtime_terrain,
+            bone_positions(0),
+            trajectory_positions,
+            trajectory_rotations);
+        for (int terrain_feature = 0; terrain_feature < 4; ++terrain_feature)
+        {
+            query(offset++) = terrain_query[terrain_feature];
+        }
+
         assert(offset == db.nfeatures());
 
         // Check if we reached the end of the current anim
@@ -1916,7 +2410,7 @@ int main(void)
         else
         {
             // Tick frame
-            frame_index++; // Assumes dt is fixed to 60fps
+            frame_index++; // The database and controller both advance at 25 Hz.
             
             // Look-up Next Pose
             curr_bone_positions = db.bone_positions(frame_index);
@@ -2288,13 +2782,26 @@ int main(void)
             desired_strafe,
             dt);
 
+        const int active_range = g1_active_range(db, frame_index);
+
         // Render
         
         BeginDrawing();
         ClearBackground(RAYWHITE);
         
         BeginMode3D(camera);
-        
+
+        DrawModel(
+            terrain_model,
+            (Vector3){ 0.0f, 0.0f, 0.0f },
+            1.0f,
+            (Color){ 205, 199, 184, 255 });
+        DrawModelWires(
+            terrain_model,
+            (Vector3){ 0.0f, 0.0f, 0.0f },
+            1.0f,
+            DARKGRAY);
+
         // Draw Simulation Object
         
         DrawCylinderWires(to_Vector3(simulation_position), 0.6f, 0.6f, 0.001f, 17, ORANGE);
@@ -2371,12 +2878,20 @@ int main(void)
         DrawLine3D(to_Vector3(bone_positions(0)), to_Vector3(
             bone_positions(0) + 0.6f * quat_mul_vec3(bone_rotations(0), vec3(0.0f, 0.0f, 1.0f))), MAROON);
         
-        // Draw Ground Plane
-        
-        DrawModel(ground_plane_model, (Vector3){0.0f, -0.01f, 0.0f}, 1.0f, WHITE);
-        DrawGrid(20, 1.0f);
         draw_axis(vec3(), quat());
-        
+
+        for (int terrain_sample = 0; terrain_sample < 4; ++terrain_sample)
+        {
+            vec3 point = terrain_centerline_point_at_arc(
+                bone_positions(0),
+                trajectory_positions,
+                trajectory_rotations,
+                0.25f * static_cast<float>(terrain_sample + 1));
+            point.y =
+                heightfield_sample(runtime_terrain, point.x, point.z) + 0.10f;
+            DrawSphereWires(to_Vector3(point), 0.04f, 4, 8, PURPLE);
+        }
+
         EndMode3D();
 
         // UI
@@ -2452,30 +2967,28 @@ int main(void)
         float ui_lmm_hei = 330;
         
         GuiGroupBox((Rectangle){ 970, ui_lmm_hei, 290, 40 }, "learned motion matching");
-        
-        GuiCheckBox(
-            (Rectangle){ 1000, ui_lmm_hei + 10, 20, 20 }, 
-            "enabled",
-            &lmm_enabled);
+
+        GuiLabel(
+            (Rectangle){ 990, ui_lmm_hei + 10, 250, 20 },
+            "disabled: G1 network integration later");
         
         //---------
         
         float ui_ctrl_hei = 380;
         
-        GuiGroupBox((Rectangle){ 1010, ui_ctrl_hei, 250, 140 }, "controls");
-        
-        GuiLabel((Rectangle){ 1030, ui_ctrl_hei +  10, 200, 20 }, "Left Trigger - Strafe");
-        GuiLabel((Rectangle){ 1030, ui_ctrl_hei +  30, 200, 20 }, "Left Stick - Move");
-        GuiLabel((Rectangle){ 1030, ui_ctrl_hei +  50, 200, 20 }, "Right Stick - Camera / Facing (Stafe)");
-        GuiLabel((Rectangle){ 1030, ui_ctrl_hei +  70, 200, 20 }, "Left Shoulder - Zoom In");
-        GuiLabel((Rectangle){ 1030, ui_ctrl_hei +  90, 200, 20 }, "Right Shoulder - Zoom Out");
-        GuiLabel((Rectangle){ 1030, ui_ctrl_hei + 110, 200, 20 }, "A Button - Walk");
+        GuiGroupBox((Rectangle){ 970, ui_ctrl_hei, 290, 160 }, "controls");
+
+        GuiLabel((Rectangle){ 990, ui_ctrl_hei +  10, 250, 20 }, "WASD / left stick - move");
+        GuiLabel((Rectangle){ 990, ui_ctrl_hei +  35, 250, 20 }, "Arrows / right stick - camera");
+        GuiLabel((Rectangle){ 990, ui_ctrl_hei +  60, 250, 20 }, "Left trigger - strafe");
+        GuiLabel((Rectangle){ 990, ui_ctrl_hei +  85, 250, 20 }, "Shoulders - zoom");
+        GuiLabel((Rectangle){ 990, ui_ctrl_hei + 110, 250, 20 }, "A button - walk");
         
 
         
         //---------
         
-        GuiGroupBox((Rectangle){ 20, 20, 290, 190 }, "feature weights");
+        GuiGroupBox((Rectangle){ 20, 20, 290, 260 }, "feature weights / terrain diagnostics");
         
         GuiSliderBar(
             (Rectangle){ 150, 30, 120, 20 }, 
@@ -2506,8 +3019,14 @@ int main(void)
             "trajectory directions", 
             TextFormat("%5.3f", feature_weight_trajectory_directions), 
             &feature_weight_trajectory_directions, 0.001f, 3.0f);
-            
-        if (GuiButton((Rectangle){ 150, 180, 120, 20 }, "rebuild database"))
+
+        GuiSliderBar(
+            (Rectangle){ 150, 180, 120, 20 },
+            "terrain",
+            TextFormat("%5.3f", feature_weight_terrain),
+            &feature_weight_terrain, 0.0f, 10.0f);
+
+        if (GuiButton((Rectangle){ 150, 210, 120, 20 }, "rebuild database"))
         {
             database_build_matching_features(
                 db,
@@ -2518,12 +3037,34 @@ int main(void)
                 feature_weight_trajectory_directions,
                 G1_LeftAnkle,
                 G1_RightAnkle,
-                G1_Hips);
+                G1_Hips,
+                feature_weight_terrain);
+            if (!g1_matching_features_validate(
+                    db,
+                    artifact_error,
+                    static_cast<int>(sizeof(artifact_error))))
+            {
+                fprintf(stderr, "G1 feature rebuild error: %s\n", artifact_error);
+                controller_exit_code = 2;
+                controller_exit_requested = true;
+            }
         }
+
+        GuiLabel(
+            (Rectangle){ 40, 235, 250, 20 },
+            TextFormat("frame %d  range %d", frame_index, active_range));
+        GuiLabel(
+            (Rectangle){ 40, 255, 250, 20 },
+            TextFormat(
+                "terrain %.2f %.2f %.2f %.2f",
+                terrain_query[0],
+                terrain_query[1],
+                terrain_query[2],
+                terrain_query[3]));
         
         //---------
         
-        float ui_sync_hei = 220;
+        float ui_sync_hei = 290;
         
         GuiGroupBox((Rectangle){ 20, ui_sync_hei, 290, 70 }, "synchronization");
 
@@ -2540,7 +3081,7 @@ int main(void)
 
         //---------
         
-        float ui_adj_hei = 300;
+        float ui_adj_hei = 370;
         
         GuiGroupBox((Rectangle){ 20, ui_adj_hei, 290, 130 }, "adjustment");
         
@@ -2568,7 +3109,7 @@ int main(void)
         
         //---------
         
-        float ui_clamp_hei = 440;
+        float ui_clamp_hei = 510;
         
         GuiGroupBox((Rectangle){ 20, ui_clamp_hei, 290, 100 }, "clamping");
         
@@ -2591,69 +3132,22 @@ int main(void)
         
         //---------
         
-        float ui_ik_hei = 550;
-        
-        GuiGroupBox((Rectangle){ 20, ui_ik_hei, 290, 100 }, "inverse kinematics");
-        
-        bool ik_enabled_prev = ik_enabled;
-        
-        GuiCheckBox(
-            (Rectangle){ 50, ui_ik_hei + 10, 20, 20 }, 
-            "enabled",
-            &ik_enabled);      
-        
-        // Foot locking needs resetting when IK is toggled
-        if (ik_enabled && !ik_enabled_prev)
-        {
-            for (int i = 0; i < contact_bones.size; i++)
-            {
-                vec3 bone_position;
-                vec3 bone_velocity;
-                quat bone_rotation;
-                vec3 bone_angular_velocity;
-                
-                forward_kinematics_velocity(
-                    bone_position,
-                    bone_velocity,
-                    bone_rotation,
-                    bone_angular_velocity,
-                    bone_positions,
-                    bone_velocities,
-                    bone_rotations,
-                    bone_angular_velocities,
-                    db.bone_parents,
-                    contact_bones(i));
-                
-                contact_reset(
-                    contact_states(i),
-                    contact_locks(i),
-                    contact_positions(i),  
-                    contact_velocities(i),
-                    contact_points(i),
-                    contact_targets(i),
-                    contact_offset_positions(i),
-                    contact_offset_velocities(i),
-                    bone_position,
-                    bone_velocity,
-                    false);
-            }
-        }
-        
-        GuiSliderBar(
-            (Rectangle){ 150, ui_ik_hei + 40, 120, 20 }, 
-            "blending halflife", 
-            TextFormat("%5.3f", ik_blending_halflife), 
-            &ik_blending_halflife, 0.0f, 1.0f);
-        
-        GuiSliderBar(
-            (Rectangle){ 150, ui_ik_hei + 70, 120, 20 }, 
-            "unlock radius", 
-            TextFormat("%5.3f", ik_unlock_radius), 
-            &ik_unlock_radius, 0.0f, 0.5f);
+        float ui_ik_hei = 620;
+
+        GuiGroupBox((Rectangle){ 20, ui_ik_hei, 290, 40 }, "inverse kinematics");
+        GuiLabel(
+            (Rectangle){ 40, ui_ik_hei + 10, 250, 20 },
+            "disabled: G1 terrain IK comes later");
         
         //---------
 
         EndDrawing();
+
+        ++rendered_frames;
+        if (test_frame_limit > 0 && rendered_frames >= test_frame_limit)
+        {
+            controller_exit_requested = true;
+        }
 
     };
 
@@ -2661,17 +3155,15 @@ int main(void)
     std::function<void()> u{update_func};
     emscripten_set_main_loop_arg(update_callback, &u, 0, 1);
 #else
-    while (!WindowShouldClose())
+    while (!WindowShouldClose() && !controller_exit_requested)
     {
         update_func();
     }
 #endif
 
-    // Unload stuff and finish (G1: no character mesh/shader to unload)
-    UnloadModel(ground_plane_model);
-    UnloadShader(ground_plane_shader);
+    UnloadModel(terrain_model);
 
     CloseWindow();
 
-    return 0;
+    return controller_exit_code;
 }
