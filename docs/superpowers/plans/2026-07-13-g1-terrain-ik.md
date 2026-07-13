@@ -19,6 +19,7 @@
 - Clamp targets to the reachable leg shell and clamp per-frame IK corrections.
 - IK-off output must remain identical to the accepted terrain runtime.
 - Keep IK false by default until every unit and deterministic acceptance test passes.
+- Use the runtime's fixed 25 Hz timestep for contact springs and every IK acceptance run.
 
 ---
 
@@ -184,7 +185,7 @@ Append to tests/cpp/test_g1_ik.cpp:
                   pos, vec3(), false);
     contact_update(state, lock, pos, vel, point, target, offp, offv,
                    vec3(0,0.31f,0), true, 0.29f,
-                   0.2f, 0.02f, 0.1f, 1.0f/60.0f);
+                   0.2f, 0.02f, 0.1f, 1.0f/25.0f);
     assert(lock);
     assert(fabsf(point.y - 0.31f) < 1e-6f);
 ~~~
@@ -561,11 +562,11 @@ Run:
 ~~~bash
 DISPLAY=:1 G1_TERRAIN_DIR=resources/g1_terrain \
   MM_TEST_MODE=terrain MM_TERRAIN_WEIGHT=4 MM_IK=0 \
-  MM_TEST_FRAMES=900 MM_LOG=/tmp/g1_terrain_ik_off.csv \
+  MM_TEST_FRAMES=375 MM_LOG=/tmp/g1_terrain_ik_off.csv \
   ./controller_g1_terrain
 DISPLAY=:1 G1_TERRAIN_DIR=resources/g1_terrain \
   MM_TEST_MODE=terrain MM_TERRAIN_WEIGHT=4 MM_IK=1 \
-  MM_TEST_FRAMES=900 MM_LOG=/tmp/g1_terrain_ik_on.csv \
+  MM_TEST_FRAMES=375 MM_LOG=/tmp/g1_terrain_ik_on.csv \
   ./controller_g1_terrain
 ~~~
 

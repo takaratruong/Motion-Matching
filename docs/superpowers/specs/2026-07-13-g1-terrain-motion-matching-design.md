@@ -110,11 +110,16 @@ The conversion operates directly on G1 transforms. BVH may remain a debug export
 but it is not required as an intermediate production format. This avoids Euler
 round-tripping and makes the GRAIL path identical to the Takara path.
 
-Both sources are resampled to Holden's fixed 60 Hz runtime rate. Translation uses
-time-based interpolation. Rotation uses shortest-arc quaternion interpolation,
+Both sources use a fixed 25 Hz runtime rate: GRAIL remains at its native rate and
+Takara is downsampled from 50 Hz. Translation uses time-based interpolation.
+Rotation uses shortest-arc quaternion interpolation,
 followed by normalization and unrolling. Velocities and angular velocities use
 the resampled timestamps and central differences. Clip edges are handled within
 each clip and never borrow samples from an adjacent clip.
+
+The C++ runtime also advances at a fixed 25 Hz. Its three trajectory feature
+horizons use database offsets 8, 17, and 25 frames (approximately one-third,
+two-thirds, and one second); live prediction uses exact one-third-second steps.
 
 The simulation bone keeps the G1 conventions already established by the current
 generator: planar position derived from the torso reference and heading derived
@@ -277,7 +282,7 @@ Implementation advances only after the current gate passes.
   body within 1 mm maximum positional error.
 - Every quaternion is finite and within `1e-4` of unit length.
 - Bone-local offsets remain constant within 1 mm.
-- Resampled duration differs from source duration by no more than one 60 Hz frame.
+- Resampled duration differs from source duration by no more than one 25 Hz frame.
 - Frame counts, source maps, and range boundaries agree across every artifact.
 - Terrain samples agree with direct GRAIL mesh queries within the exported
   heightfield resolution.

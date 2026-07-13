@@ -21,6 +21,7 @@
 - Runtime terrain features use distances 0.25, 0.50, 0.75, and 1.00 m along the geometric predicted-facing centerline.
 - Fail with a nonzero exit and an actionable stderr message for every artifact mismatch.
 - Preserve the user's existing controller.cpp, database.h, and spring.h changes unless a planned edit explicitly overlaps them.
+- Run the controller and artifacts at a fixed 25 Hz. Use database trajectory offsets 8, 17, and 25 frames and exact one-third-second live prediction steps.
 
 ---
 
@@ -404,6 +405,7 @@ git commit -m "refactor: name the G1 runtime skeleton"
 - database_build_matching_features gains terrain weight and named bone indices.
 - Produces: database_frame_cost(db, frame, query) -> float.
 - Produces 31 normalized features in the existing 27+4 order.
+- Retimes Holden's trajectory database horizons from 20/40/60 at 60 Hz to 8/17/25 at 25 Hz.
 
 - [ ] **Step 1: Write the feature-layout and zero-weight tests**
 
@@ -433,6 +435,10 @@ int main()
     array1d<float> query(31); query.zero();
     query(30) = 2.0f;
     assert(database_frame_cost(db, 0, query) == 4.0f);
+
+    int horizons[3];
+    database_trajectory_horizons(horizons);
+    assert(horizons[0] == 8 && horizons[1] == 17 && horizons[2] == 25);
 }
 ~~~
 
@@ -512,6 +518,16 @@ static inline float database_raw_terrain_error(
 Change nfeatures from 27 to 31, accept feature_weight_terrain, and call
 compute_terrain_feature after trajectory directions. Preserve every existing
 native feature offset.
+
+Add database_trajectory_horizons and use it in both trajectory position and
+direction feature builders:
+
+~~~cpp
+static inline void database_trajectory_horizons(int out[3])
+{
+    out[0] = 8; out[1] = 17; out[2] = 25;
+}
+~~~
 
 - [ ] **Step 5: Compile and run all C++ unit tests**
 
@@ -651,6 +667,7 @@ git commit -m "feat: query terrain along Holden trajectory"
 - Loads database.bin, terrain_features.bin, terrain.bin, and terrain.obj.
 - UI exposes terrain weight and rebuilds all 31 features.
 - IK starts false; learned matching starts false.
+- Controller target rate and fixed dt are 25 Hz; predicted trajectory samples are one-third second apart.
 
 - [ ] **Step 1: Add fail-fast artifact startup**
 
@@ -698,6 +715,11 @@ if (!g1_skeleton_validate(db, artifact_error, sizeof(artifact_error))) {
     return 2;
 }
 ~~~
+
+Set `SetTargetFPS(25)` and `dt = 1.0f / 25.0f`. Replace every `20.0f * dt`
+argument used to build the four live trajectory samples with the explicit
+constant `trajectory_sample_time = 1.0f / 3.0f`; this preserves real-time
+horizons rather than inheriting Holden's old 60 Hz frame count.
 
 - [ ] **Step 2: Make safe phase-one defaults explicit**
 
@@ -879,7 +901,7 @@ def check_rows(rows):
     return {"frames": len(rows), "transitions": sum(int(r["transitioned"]) for r in rows)}
 
 
-def check_substride(rows, minimum_period=30):
+def check_substride(rows, minimum_period=13):
     values = [int(row["database_frame"]) for row in rows]
     transitions = [int(row["transitioned"]) for row in rows]
     for period in range(1, minimum_period):
@@ -1065,13 +1087,13 @@ Run:
 
 ~~~bash
 DISPLAY=:1 G1_TERRAIN_DIR=resources/g1_terrain \
-  MM_TEST_MODE=sequential MM_TEST_FRAMES=600 MM_LOG=/tmp/g1_sequential.csv \
+  MM_TEST_MODE=sequential MM_TEST_FRAMES=250 MM_LOG=/tmp/g1_sequential.csv \
   ./controller_g1_terrain
 /home/ubuntu/miniconda3/envs/diffsim/bin/python \
   resources/check_g1_runtime_log.py /tmp/g1_sequential.csv
 ~~~
 
-Expected: 600 frames, zero transitions, sequential database indices, and exit 0.
+Expected: 250 frames, zero transitions, sequential database indices, and exit 0.
 Visually inspect the Raylib skeleton during the run for source-faithful legs with
 IK disabled.
 
@@ -1081,14 +1103,14 @@ Run:
 
 ~~~bash
 DISPLAY=:1 G1_TERRAIN_DIR=resources/g1_terrain \
-  MM_TEST_MODE=flat MM_TEST_FRAMES=900 MM_LOG=/tmp/g1_flat.csv \
+  MM_TEST_MODE=flat MM_TEST_FRAMES=375 MM_LOG=/tmp/g1_flat.csv \
   ./controller_g1_terrain
 /home/ubuntu/miniconda3/envs/diffsim/bin/python \
   resources/check_g1_runtime_log.py /tmp/g1_flat.csv
 ~~~
 
-Expected: 900 valid rows; every transition beats its incumbent; no nontransition
-index reset; no repeated sub-stride cycle shorter than 30 frames.
+Expected: 375 valid rows; every transition beats its incumbent; no nontransition
+index reset; no repeated sub-stride cycle shorter than 13 frames (about 0.5 s).
 
 - [ ] **Step 4: Verify sub-stride detection with synthetic tests**
 
@@ -1124,7 +1146,7 @@ Run:
 ~~~bash
 DISPLAY=:1 G1_TERRAIN_DIR=resources/g1_terrain \
   MM_TEST_MODE=terrain MM_TERRAIN_WEIGHT=4 \
-  MM_TEST_FRAMES=900 MM_LOG=/tmp/g1_terrain.csv \
+  MM_TEST_FRAMES=375 MM_LOG=/tmp/g1_terrain.csv \
   ./controller_g1_terrain
 /home/ubuntu/miniconda3/envs/diffsim/bin/python \
   resources/check_g1_runtime_log.py /tmp/g1_terrain.csv
@@ -1202,33 +1224,33 @@ mkdir -p resources/g1_terrain/evidence
 
 ~~~bash
 DISPLAY=:1 ffmpeg -y -loglevel error -f x11grab \
-  -video_size 1280x720 -framerate 60 -i :1.0+0,0 -t 15 \
+  -video_size 1280x720 -framerate 25 -i :1.0+0,0 -t 15 \
   resources/g1_terrain/evidence/terrain_off.mp4 &
 CAPTURE_PID=$!
 DISPLAY=:1 G1_TERRAIN_DIR=resources/g1_terrain \
-  MM_TEST_MODE=terrain MM_TERRAIN_WEIGHT=0 MM_TEST_FRAMES=900 \
+  MM_TEST_MODE=terrain MM_TERRAIN_WEIGHT=0 MM_TEST_FRAMES=375 \
   MM_LOG=resources/g1_terrain/evidence/terrain_off.csv \
   ./controller_g1_terrain
 wait "$CAPTURE_PID"
 ~~~
 
-Expected: controller and ffmpeg both exit 0 and the CSV has 900 rows.
+Expected: controller and ffmpeg both exit 0 and the CSV has 375 rows.
 
 - [ ] **Step 3: Record the terrain-aware treatment**
 
 ~~~bash
 DISPLAY=:1 ffmpeg -y -loglevel error -f x11grab \
-  -video_size 1280x720 -framerate 60 -i :1.0+0,0 -t 15 \
+  -video_size 1280x720 -framerate 25 -i :1.0+0,0 -t 15 \
   resources/g1_terrain/evidence/terrain_on.mp4 &
 CAPTURE_PID=$!
 DISPLAY=:1 G1_TERRAIN_DIR=resources/g1_terrain \
-  MM_TEST_MODE=terrain MM_TERRAIN_WEIGHT=4 MM_TEST_FRAMES=900 \
+  MM_TEST_MODE=terrain MM_TERRAIN_WEIGHT=4 MM_TEST_FRAMES=375 \
   MM_LOG=resources/g1_terrain/evidence/terrain_on.csv \
   ./controller_g1_terrain
 wait "$CAPTURE_PID"
 ~~~
 
-Expected: controller and ffmpeg both exit 0 and the CSV has 900 rows.
+Expected: controller and ffmpeg both exit 0 and the CSV has 375 rows.
 
 - [ ] **Step 4: Verify the A/B logs**
 

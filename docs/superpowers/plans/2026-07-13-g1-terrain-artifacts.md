@@ -4,7 +4,7 @@
 
 **Goal:** Build validated, versioned Holden animation and terrain artifacts directly from native Takara and GRAIL G1 motion.
 
-**Architecture:** A focused Python package loads source-specific G1 qpos, converts MuJoCo Z-up transforms into Holden Y-up local bones, resamples each clip independently to 60 Hz, derives contacts and terrain features, and atomically publishes a Holden database plus sidecars. Source adapters, kinematics, terrain sampling, serialization, and validation remain separate modules.
+**Architecture:** A focused Python package loads source-specific G1 qpos, converts MuJoCo Z-up transforms into Holden Y-up local bones, converts each clip independently to the canonical 25 Hz runtime rate, derives contacts and terrain features, and atomically publishes a Holden database plus sidecars. Source adapters, kinematics, terrain sampling, serialization, and validation remain separate modules.
 
 **Tech Stack:** Python 3.11 from /home/ubuntu/miniconda3/envs/diffsim/bin/python; NumPy 2.4; SciPy 1.17; MuJoCo 3.9; joblib 1.5; USD pxr; standard-library unittest; Holden resources/quat.py.
 
@@ -13,7 +13,7 @@
 - Run Python commands with /home/ubuntu/miniconda3/envs/diffsim/bin/python.
 - Add no Python dependency; use standard-library unittest rather than pytest.
 - Input G1 motion is Z-up; output is right-handed Y-up with canonical simulation forward +Z.
-- Output rate is exactly 60 Hz; clips are resampled independently.
+- Output rate is exactly 25 Hz; GRAIL stays native and Takara is downsampled independently from 50 Hz.
 - Process all 1,769 locally available GRAIL curb clips by default; a limit is diagnostic-only.
 - Preserve explicit clip ranges and source-frame mappings.
 - Emit four terrain values at geometric centerline distances 0.25, 0.50, 0.75, and 1.00 m.
@@ -403,6 +403,8 @@ git commit -m "feat: load native Takara and GRAIL G1 motion"
 - Produces: G1Kinematics.world_from_qpos(qpos) -> tuple[ndarray, ndarray].
 - Produces: change_basis_zup_to_yup(positions, rotations) -> tuple[ndarray, ndarray].
 - Produces: world_to_local(positions, rotations, parents) -> tuple[ndarray, ndarray].
+- Produces: forward_local_hierarchy(positions, rotations, parents) -> tuple[ndarray, ndarray].
+- Produces: heading_quaternions(forward) -> ndarray, including the antiparallel case.
 - Produces: convert_source_clip(source, kinematics) -> tuple[HoldenClip, SkeletonSpec, dict].
 
 - [ ] **Step 1: Write the resampling and FK round-trip tests**
@@ -418,7 +420,7 @@ from resources.g1_terrain_builder.resample import (
 
 class ResampleTests(unittest.TestCase):
     def test_duration_is_preserved(self):
-        self.assertEqual(output_frame_count(250, 25.0, 60.0), 599)
+        self.assertEqual(output_frame_count(250, 25.0, 25.0), 250)
 
     def test_linear_translation(self):
         src = np.array([[0, 0, 0], [1, 0, 0]], np.float64)
@@ -431,12 +433,37 @@ class ResampleTests(unittest.TestCase):
         np.testing.assert_allclose(np.linalg.norm(out, axis=1), 1.0, atol=1e-7)
         self.assertGreater(out[1, 0], 0.9)
 
+    def test_native_25hz_samples_are_not_time_warped(self):
+        src = np.arange(250, dtype=np.float64)[:, None]
+        out = resample_vectors(src, 25.0, 25.0)
+        np.testing.assert_array_equal(out, src)
+
+    def test_slerp_unrolls_each_bone_independently(self):
+        src = np.array([
+            [[1,0,0,0], [1,0,0,0]],
+            [[-1,0,0,0], [-.70710678,0,-.70710678,0]],
+        ], np.float64)
+        out = resample_quaternions_wxyz(src, 1.0, 2.0)
+        self.assertEqual(out.shape, (3,2,4))
+        np.testing.assert_allclose(np.linalg.norm(out, axis=-1), 1.0, atol=1e-7)
+        self.assertGreater(out[1,0,0], 0.999)
+        self.assertGreater(out[1,1,0], 0.9)
+
+    def test_invalid_resampling_inputs_are_rejected(self):
+        with self.assertRaises(ValueError):
+            resample_vectors(np.empty((0, 3)), 25.0, 25.0)
+        with self.assertRaises(ValueError):
+            resample_vectors(np.zeros((2, 3)), 0.0, 25.0)
+        with self.assertRaises(ValueError):
+            resample_quaternions_wxyz(np.zeros((2, 4)), 25.0, 25.0)
+
 
 # tests/python/test_kinematics.py
 import unittest
 import numpy as np
 from resources.g1_terrain_builder.kinematics import (
-    G1Kinematics, change_basis_zup_to_yup, convert_source_clip, world_to_local,
+    G1Kinematics, change_basis_zup_to_yup, convert_source_clip,
+    forward_local_hierarchy, heading_quaternions, world_to_local,
 )
 from resources.g1_terrain_builder.schema import SourceClip
 
@@ -451,6 +478,25 @@ class KinematicsTests(unittest.TestCase):
         np.testing.assert_allclose(py[0, 0], [0, 1, 0], atol=1e-7)
         np.testing.assert_allclose(np.linalg.norm(qy, axis=-1), 1, atol=1e-7)
 
+    def test_change_of_basis_conjugates_nontrivial_rotation(self):
+        c = 2**-0.5
+        p = np.zeros((1,1,3))
+        qz = np.array([[[c,0,0,c]]], np.float64)
+        _, qy = change_basis_zup_to_yup(p, qz)
+        expected = np.array([c,0,c,0])
+        self.assertLess(
+            min(np.linalg.norm(qy[0,0]-expected),
+                np.linalg.norm(qy[0,0]+expected)), 1e-7)
+
+    def test_heading_handles_antiparallel_forward(self):
+        forward = np.array([[0,0,1], [0,0,-1], [1,0,0]], np.float64)
+        q = heading_quaternions(forward)
+        self.assertTrue(np.all(np.isfinite(q)))
+        np.testing.assert_allclose(np.linalg.norm(q, axis=-1), 1, atol=1e-7)
+        c = 2**-0.5
+        np.testing.assert_allclose(
+            q, [[1,0,0,0], [0,0,1,0], [c,0,c,0]], atol=1e-7)
+
     def test_world_local_round_trip_is_submillimeter(self):
         kin = G1Kinematics(G1_XML)
         qpos = kin.keyframe_or_zero_qpos()
@@ -462,14 +508,29 @@ class KinematicsTests(unittest.TestCase):
     def test_convert_source_clip_prepends_simulation_bone(self):
         kin = G1Kinematics(G1_XML)
         qpos = np.tile(kin.keyframe_or_zero_qpos(), (5, 1))
+        qpos[:, 0] = np.arange(5) * 0.01
+        qpos[:, 7] = np.linspace(0.0, 0.1, 5)
         source = SourceClip(
             "synthetic", 25.0, qpos, np.arange(5), "flat")
         clip, skeleton, report = convert_source_clip(source, kin)
-        self.assertEqual(clip.positions.shape, (11, 31, 3))
+        self.assertEqual(clip.positions.shape, (5, 31, 3))
         self.assertEqual(skeleton.names[0], "Simulation")
         self.assertEqual(skeleton.parents[0], -1)
         self.assertLessEqual(report["fk_max_error_m"], 0.001)
-        self.assertLessEqual(report["duration_error_s"], 1.0/60.0)
+        self.assertLessEqual(report["duration_error_s"], 1.0/25.0)
+        np.testing.assert_array_equal(clip.source_frames, np.arange(5))
+        np.testing.assert_allclose(
+            np.linalg.norm(clip.rotations, axis=-1), 1.0, atol=1e-4)
+        self.assertTrue(np.all(
+            np.sum(clip.rotations[1:] * clip.rotations[:-1], axis=-1)
+            >= -1e-7))
+        expected_gp, expected_gq = kin.world_from_qpos(qpos)
+        expected_gp, _ = change_basis_zup_to_yup(expected_gp, expected_gq)
+        exported_gp, _ = forward_local_hierarchy(
+            clip.positions.astype(np.float64),
+            clip.rotations.astype(np.float64), skeleton.parents)
+        self.assertLess(np.max(np.linalg.norm(
+            exported_gp[:, 1:] - expected_gp, axis=-1)), 0.001)
 
 
 if __name__ == "__main__":
@@ -495,8 +556,10 @@ import numpy as np
 
 
 def output_frame_count(frames: int, source_fps: float, target_fps: float) -> int:
+    if frames < 1 or source_fps <= 0 or target_fps <= 0:
+        raise ValueError("frames and sample rates must be positive")
     duration = (frames - 1) / source_fps
-    return int(round(duration * target_fps)) + 1
+    return int(np.floor(duration * target_fps + 1e-9)) + 1
 
 
 def _times(frames: int, fps: float) -> np.ndarray:
@@ -505,9 +568,12 @@ def _times(frames: int, fps: float) -> np.ndarray:
 
 def resample_vectors(values: np.ndarray, source_fps: float, target_fps: float) -> np.ndarray:
     values = np.asarray(values, np.float64)
+    output_frame_count(len(values), source_fps, target_fps)
+    if not np.all(np.isfinite(values)):
+        raise ValueError("vector samples must be finite")
     src_t = _times(len(values), source_fps)
     count = output_frame_count(len(values), source_fps, target_fps)
-    dst_t = np.linspace(0.0, src_t[-1], count)
+    dst_t = _times(count, target_fps)
     flat = values.reshape(len(values), -1)
     out = np.stack([np.interp(dst_t, src_t, flat[:, i]) for i in range(flat.shape[1])], axis=1)
     return out.reshape((count,) + values.shape[1:])
@@ -515,14 +581,18 @@ def resample_vectors(values: np.ndarray, source_fps: float, target_fps: float) -
 
 def resample_quaternions_wxyz(values: np.ndarray, source_fps: float, target_fps: float) -> np.ndarray:
     q = np.asarray(values, np.float64).copy()
-    q /= np.linalg.norm(q, axis=-1, keepdims=True)
+    output_frame_count(len(q), source_fps, target_fps)
+    norms = np.linalg.norm(q, axis=-1, keepdims=True)
+    if not np.all(np.isfinite(q)) or np.any(norms < 1e-12):
+        raise ValueError("quaternion samples must be finite and nonzero")
+    q /= norms
     flat = q.reshape(len(q), -1, 4)
     for t in range(1, len(flat)):
         signs = np.sum(flat[t - 1] * flat[t], axis=-1) < 0
         flat[t, signs] *= -1
     src_t = _times(len(q), source_fps)
     count = output_frame_count(len(q), source_fps, target_fps)
-    dst_t = np.linspace(0.0, src_t[-1], count)
+    dst_t = _times(count, target_fps)
     out = np.empty((count, flat.shape[1], 4), np.float64)
     for j in range(flat.shape[1]):
         for k, t in enumerate(dst_t):
@@ -627,15 +697,22 @@ class G1Kinematics:
         return gp, gq
 
     def forward_local(self, lp: np.ndarray, lq: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        gp = np.empty_like(lp)
-        gq = np.empty_like(lq)
-        for i, parent in enumerate(self.parents):
-            if parent < 0:
-                gp[:, i], gq[:, i] = lp[:, i], lq[:, i]
-            else:
-                gq[:, i] = holden_quat.mul(gq[:, parent], lq[:, i])
-                gp[:, i] = gp[:, parent] + holden_quat.mul_vec(gq[:, parent], lp[:, i])
-        return gp, gq
+        return forward_local_hierarchy(lp, lq, self.parents)
+
+
+def forward_local_hierarchy(
+    lp: np.ndarray, lq: np.ndarray, parents: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    gp = np.empty_like(lp)
+    gq = np.empty_like(lq)
+    for i, parent in enumerate(parents):
+        if parent < 0:
+            gp[:, i], gq[:, i] = lp[:, i], lq[:, i]
+        else:
+            gq[:, i] = holden_quat.mul(gq[:, parent], lq[:, i])
+            gp[:, i] = gp[:, parent] + holden_quat.mul_vec(
+                gq[:, parent], lp[:, i])
+    return gp, gq
 
 
 def change_basis_zup_to_yup(gp: np.ndarray, gq: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -655,6 +732,16 @@ def world_to_local(gp: np.ndarray, gq: np.ndarray, parents: np.ndarray) -> tuple
             lp[:, i] = holden_quat.mul_vec(inv, gp[:, i] - gp[:, parent])
             lq[:, i] = holden_quat.mul(inv, gq[:, i])
     return lp, lq
+
+
+def heading_quaternions(forward: np.ndarray) -> np.ndarray:
+    forward = np.asarray(forward, np.float64)
+    yaw = np.arctan2(forward[:, 0], forward[:, 2])
+    q = np.stack([
+        np.cos(0.5*yaw), np.zeros_like(yaw),
+        np.sin(0.5*yaw), np.zeros_like(yaw),
+    ], axis=-1)
+    return holden_quat.unroll(q)
 ~~~
 
 Add these functions after the primitives:
@@ -668,7 +755,7 @@ def _prepend_simulation(
     torso = names.index("Spine2")
     sim_position = gp[:, torso].copy()
     sim_position[:, 1] = 0.0
-    pos_window = min(31, len(sim_position) if len(sim_position)%2 else len(sim_position)-1)
+    pos_window = min(13, len(sim_position) if len(sim_position)%2 else len(sim_position)-1)
     if pos_window >= 5:
         sim_position = signal.savgol_filter(
             sim_position, pos_window, min(3, pos_window-2),
@@ -680,14 +767,13 @@ def _prepend_simulation(
     if np.any(lengths < 1e-6):
         raise ValueError("G1 pelvis forward projects to zero")
     forward /= lengths
-    dir_window = min(61, len(forward) if len(forward)%2 else len(forward)-1)
+    dir_window = min(25, len(forward) if len(forward)%2 else len(forward)-1)
     if dir_window >= 5:
         forward = signal.savgol_filter(
             forward, dir_window, min(3, dir_window-2),
             axis=0, mode="interp")
         forward /= np.linalg.norm(forward, axis=1, keepdims=True)
-    sim_rotation = holden_quat.normalize(
-        holden_quat.between(np.array([0.0, 0.0, 1.0]), forward))
+    sim_rotation = heading_quaternions(forward)
     lp, lq = world_to_local(gp, gq, parents)
     lp[:, hips] = holden_quat.mul_vec(
         holden_quat.inv(sim_rotation), gp[:, hips] - sim_position)
@@ -695,6 +781,7 @@ def _prepend_simulation(
         holden_quat.inv(sim_rotation), gq[:, hips])
     positions = np.concatenate([sim_position[:, None], lp], axis=1)
     rotations = np.concatenate([sim_rotation[:, None], lq], axis=1)
+    rotations = holden_quat.unroll(holden_quat.normalize(rotations))
     skeleton = SkeletonSpec(
         ("Simulation",) + names,
         np.concatenate([np.array([-1], np.int32), parents + 1]),
@@ -703,27 +790,40 @@ def _prepend_simulation(
 
 
 def convert_source_clip(
-    source: SourceClip, kinematics: G1Kinematics, target_fps: float = 60.0,
+    source: SourceClip, kinematics: G1Kinematics, target_fps: float = 25.0,
 ) -> tuple[HoldenClip, SkeletonSpec, dict]:
     source.validate()
     gp_z, gq_z = kinematics.world_from_qpos(source.qpos)
     gp_y, gq_y = change_basis_zup_to_yup(gp_z, gq_z)
-    lp_check, lq_check = world_to_local(gp_y, gq_y, kinematics.parents)
-    gp_check, _ = kinematics.forward_local(lp_check, lq_check)
-    fk_error = float(np.max(np.linalg.norm(gp_check - gp_y, axis=-1)))
     gp = resample_vectors(gp_y, source.fps, target_fps)
     gq = resample_quaternions_wxyz(gq_y, source.fps, target_fps)
     positions, rotations, skeleton = _prepend_simulation(
         gp, gq, kinematics.names, kinematics.parents)
     source_t = np.arange(len(source.qpos)) / source.fps
-    output_t = np.linspace(source_t[0], source_t[-1], len(positions))
+    output_t = np.arange(len(positions), dtype=np.float64) / target_fps
     output_frames = np.rint(output_t * source.fps).astype(np.int64)
     output_frames = np.clip(output_frames, 0, len(source.qpos) - 1)
+    positions = positions.astype(np.float32)
+    rotations = rotations.astype(np.float32)
+    if not np.all(np.isfinite(positions)) or not np.all(np.isfinite(rotations)):
+        raise ValueError(f"{source.name}: non-finite exported transform")
+    quaternion_error = float(np.max(np.abs(
+        np.linalg.norm(rotations, axis=-1) - 1.0)))
+    if quaternion_error > 1e-4:
+        raise ValueError(
+            f"{source.name}: exported quaternion norm error {quaternion_error}")
+    exported_gp, _ = forward_local_hierarchy(
+        positions.astype(np.float64), rotations.astype(np.float64),
+        skeleton.parents)
+    fk_error = float(np.max(np.linalg.norm(
+        exported_gp[:, 1:] - gp, axis=-1)))
+    if fk_error > 0.001:
+        raise ValueError(f"{source.name}: exported FK error {fk_error} m")
     clip = HoldenClip(
         source.name,
-        positions.astype(np.float32),
+        positions,
         np.zeros_like(positions, np.float32),
-        rotations.astype(np.float32),
+        rotations,
         np.zeros_like(positions, np.float32),
         np.zeros((len(positions), 2), np.uint8),
         np.zeros((len(positions), 4), np.float32),
@@ -732,9 +832,13 @@ def convert_source_clip(
     )
     source_duration = (len(source.qpos)-1) / source.fps
     output_duration = (len(positions)-1) / target_fps
+    duration_error = abs(output_duration-source_duration)
+    if duration_error > 1.0 / target_fps + 1e-12:
+        raise ValueError(f"{source.name}: duration error {duration_error} s")
     return clip, skeleton, {
         "fk_max_error_m": fk_error,
-        "duration_error_s": abs(output_duration-source_duration),
+        "duration_error_s": duration_error,
+        "quaternion_norm_max_error": quaternion_error,
     }
 ~~~
 
@@ -747,7 +851,7 @@ Run:
   tests.python.test_resample tests.python.test_kinematics -v
 ~~~
 
-Expected: 5 tests, OK.
+Expected: all focused resampling and kinematics tests pass.
 
 - [ ] **Step 6: Commit the kinematic conversion**
 
@@ -951,7 +1055,7 @@ git commit -m "feat: sample aligned GRAIL terrain"
 - Create: tests/python/test_database_builder.py
 
 **Interfaces:**
-- Consumes: converted 60 Hz HoldenClip skeleton motion and a terrain provider.
+- Consumes: converted 25 Hz HoldenClip skeleton motion and a terrain provider.
 - Produces: derive_velocities(positions, rotations, fps) -> tuple[ndarray, ndarray].
 - Produces: derive_contacts(global_positions, terrain, left, right, fps, config) -> ndarray.
 - Produces: combine_clips(clips, skeleton) -> ArtifactSet.
@@ -1134,7 +1238,7 @@ def derive_contacts(global_positions, terrain, left, right, fps):
     contacts = (speed < 0.15) & (relative_height < 0.06)
     for side in range(2):
         contacts[:, side] = ndimage.median_filter(
-            contacts[:, side], size=6, mode="nearest")
+        contacts[:, side], size=3, mode="nearest")
     return contacts.astype(np.uint8)
 
 
@@ -1409,17 +1513,17 @@ Use this finalization function:
 
 ~~~python
 def finalize_clip(source, terrain, kin):
-    clip, skeleton, report = convert_source_clip(source, kin, 60.0)
+    clip, skeleton, report = convert_source_clip(source, kin, 25.0)
     gp, gq = forward_kinematics_arrays(
         clip.positions, clip.rotations, skeleton.parents)
     clip.velocities, clip.angular_velocities = derive_velocities(
-        clip.positions, clip.rotations, 60.0)
+        clip.positions, clip.rotations, 25.0)
     clip.contacts = derive_contacts(
         gp, terrain,
         skeleton.names.index("LeftToe"),
-        skeleton.names.index("RightToe"), 60.0)
+        skeleton.names.index("RightToe"), 25.0)
     for frame in range(len(clip.positions)):
-        stop = min(frame + 121, len(clip.positions))
+        stop = min(frame + 51, len(clip.positions))
         path = gp[frame:stop, 0][:, [0, 2]]
         headings3 = holden_quat.mul_vec(
             gq[frame:stop, 0],
@@ -1472,7 +1576,7 @@ size and a 2 m flat border around its transformed footprint.
 Normal mode must abort on the first skipped clip. The --grail-limit option slices
 the sorted input list and writes diagnostic_mode=true to the manifest. The
 manifest must contain source and output frame counts, range/source mapping,
-skeleton names/parents/signature, 60 Hz output rate, contact thresholds, terrain
+skeleton names/parents/signature, 25 Hz output rate, contact thresholds, terrain
 distances, coordinate mapping, and per-clip FK error.
 
 - [ ] **Step 4: Implement the independent validator**
@@ -1482,7 +1586,7 @@ It checks:
 
 ~~~python
 assert manifest["schema"] == "g1-terrain-artifacts/v1"
-assert manifest["output_fps"] == 60.0
+assert manifest["output_fps"] == 25.0
 assert manifest["feature_dimensions"] == 31
 assert manifest["terrain_dimensions"] == 4
 assert len(database.positions) == len(terrain_features)
