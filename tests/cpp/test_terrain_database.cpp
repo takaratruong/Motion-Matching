@@ -308,6 +308,75 @@ static void test_builder_rejects_bad_terrain_before_mutation()
     }
 }
 
+static void test_builder_rejects_every_nonfinite_weight_before_mutation()
+{
+    const float invalid_weights[3] = {
+        float_from_bits(UINT32_C(0x7fc12345)),
+        float_from_bits(UINT32_C(0x7f800000)),
+        float_from_bits(UINT32_C(0xff800000))
+    };
+
+    for (int weight_index = 0; weight_index < 6; ++weight_index) {
+        for (int value_index = 0; value_index < 3; ++value_index) {
+            database db;
+            fill_source_database(db, 30);
+            seed_matching_outputs(db);
+            float weights[6] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+            weights[weight_index] = invalid_weights[value_index];
+            database_build_matching_features(
+                db,
+                weights[0],
+                weights[1],
+                weights[2],
+                weights[3],
+                weights[4],
+                G1_LeftAnkle,
+                G1_RightAnkle,
+                G1_Hips,
+                weights[5]);
+            check_matching_outputs_unchanged(db);
+        }
+    }
+}
+
+static void test_positive_weight_flat_terrain_is_release_safe()
+{
+#ifdef NDEBUG
+    database db;
+    fill_source_database(db, 30);
+    db.terrain_features.set(2.5f);
+    build_features(db, 1.0f);
+
+    CHECK(db.features.rows == db.nframes());
+    CHECK(db.features.cols == 31);
+    for (int dimension = 27; dimension < 31; ++dimension) {
+        CHECK(finite_bits(db.features_offset(dimension)));
+        CHECK(close_enough(db.features_offset(dimension), 2.5f, 1e-5f));
+        CHECK(float_bits(db.features_scale(dimension)) == float_bits(FLT_MAX));
+        for (int frame = 0; frame < db.nframes(); ++frame) {
+            CHECK(float_bits(db.features(frame, dimension)) == UINT32_C(0));
+        }
+    }
+
+    array1d<float> query(31);
+    for (int dimension = 0; dimension < 31; ++dimension) {
+        query(dimension) = db.features_offset(dimension);
+    }
+    query(27) = float_from_bits(UINT32_C(0x7fc12345));
+    query(28) = float_from_bits(UINT32_C(0x7f800000));
+    query(29) = float_from_bits(UINT32_C(0xff800000));
+    query(30) = FLT_MAX;
+
+    const float frame_cost = database_frame_cost(db, 0, query);
+    CHECK(finite_bits(frame_cost));
+    int best_index = 0;
+    float best_cost = FLT_MAX;
+    database_search(best_index, best_cost, db, query, 0.0f, 0, 1);
+    CHECK(best_index >= 0 && best_index < db.nframes());
+    CHECK(finite_bits(best_cost));
+#endif
+}
+
 static void test_all_disabled_constant_builder()
 {
     database db;
@@ -426,6 +495,8 @@ int main()
     test_zero_weight_is_exact_and_safe();
     test_builder_layout_and_real_horizons();
     test_builder_rejects_bad_terrain_before_mutation();
+    test_builder_rejects_every_nonfinite_weight_before_mutation();
+    test_positive_weight_flat_terrain_is_release_safe();
     test_all_disabled_constant_builder();
     test_cost_and_incumbent_search_semantics();
     return 0;

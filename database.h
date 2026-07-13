@@ -9,6 +9,8 @@
 #include <float.h>
 #include <stdio.h>
 #include <math.h>
+#include <stdint.h>
+#include <string.h>
 
 //--------------------------------------
 
@@ -98,6 +100,60 @@ int database_trajectory_index_clamp(database& db, int frame, int offset)
 
 //--------------------------------------
 
+static inline uint32_t feature_float_bits(const float value)
+{
+    uint32_t bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static inline bool feature_float_is_finite(const float value)
+{
+    return (feature_float_bits(value) & UINT32_C(0x7f800000)) !=
+           UINT32_C(0x7f800000);
+}
+
+static inline bool feature_float_is_positive_finite(const float value)
+{
+    const uint32_t bits = feature_float_bits(value);
+    return (bits & UINT32_C(0x80000000)) == 0 &&
+           (bits & UINT32_C(0x7fffffff)) != 0 &&
+           (bits & UINT32_C(0x7f800000)) != UINT32_C(0x7f800000);
+}
+
+static inline bool feature_weight_is_valid(const float weight)
+{
+    const uint32_t bits = feature_float_bits(weight);
+    return (bits & UINT32_C(0x7f800000)) != UINT32_C(0x7f800000) &&
+           ((bits & UINT32_C(0x80000000)) == 0 ||
+            (bits & UINT32_C(0x7fffffff)) == 0);
+}
+
+static inline void disable_feature_group(
+    slice2d<float> features,
+    slice1d<float> features_offset,
+    slice1d<float> features_scale,
+    const int offset,
+    const int size)
+{
+    for (int j = 0; j < size; ++j)
+    {
+        if (!feature_float_is_finite(features_offset(offset + j)))
+        {
+            features_offset(offset + j) = 0.0f;
+        }
+        features_scale(offset + j) = FLT_MAX;
+    }
+
+    for (int i = 0; i < features.rows; ++i)
+    {
+        for (int j = 0; j < size; ++j)
+        {
+            features(i, offset + j) = 0.0f;
+        }
+    }
+}
+
 void normalize_feature(
     slice2d<float> features,
     slice1d<float> features_offset,
@@ -106,10 +162,24 @@ void normalize_feature(
     const int size, 
     const float weight = 1.0f)
 {
-    assert(weight >= 0.0f);
-    if (weight < 0.0f)
+    assert(feature_weight_is_valid(weight));
+    if (!feature_weight_is_valid(weight))
     {
         return;
+    }
+
+    bool has_variation = false;
+    for (int j = 0; j < size && !has_variation; ++j)
+    {
+        const uint32_t first = feature_float_bits(features(0, offset + j));
+        for (int i = 1; i < features.rows; ++i)
+        {
+            if (feature_float_bits(features(i, offset + j)) != first)
+            {
+                has_variation = true;
+                break;
+            }
+        }
     }
 
     // First compute what is essentially the mean 
@@ -131,18 +201,16 @@ void normalize_feature(
     // denormalization, but do not evaluate variance or any FLT_MAX arithmetic.
     if (weight == 0.0f)
     {
-        for (int j = 0; j < size; j++)
-        {
-            features_scale(offset + j) = FLT_MAX;
-        }
+        disable_feature_group(
+            features, features_offset, features_scale, offset, size);
+        return;
+    }
 
-        for (int i = 0; i < features.rows; i++)
-        {
-            for (int j = 0; j < size; j++)
-            {
-                features(i, offset + j) = 0.0f;
-            }
-        }
+    assert(has_variation);
+    if (!has_variation)
+    {
+        disable_feature_group(
+            features, features_offset, features_scale, offset, size);
         return;
     }
 
@@ -168,16 +236,30 @@ void normalize_feature(
     
     // Features with no variation can have zero std which is
     // almost always a bug.
-    assert(std > 0.0f);
-    if (!(std > 0.0f))
+    assert(feature_float_is_positive_finite(std));
+    if (!feature_float_is_positive_finite(std))
     {
+        disable_feature_group(
+            features, features_offset, features_scale, offset, size);
+        return;
+    }
+
+    const float scale = std / weight;
+    const bool scale_valid =
+        feature_float_is_positive_finite(scale) &&
+        feature_float_bits(scale) != feature_float_bits(FLT_MAX);
+    assert(scale_valid);
+    if (!scale_valid)
+    {
+        disable_feature_group(
+            features, features_offset, features_scale, offset, size);
         return;
     }
     
     // The scale of a feature is just the std divided by the weight
     for (int j = 0; j < size; j++)
     {
-        features_scale(offset + j) = std / weight;
+        features_scale(offset + j) = scale;
     }
     
     // Using the offset and scale we can then normalize the features
@@ -192,7 +274,7 @@ void normalize_feature(
 
 static inline bool feature_scale_is_disabled(const float scale)
 {
-    return scale == FLT_MAX;
+    return feature_float_bits(scale) == feature_float_bits(FLT_MAX);
 }
 
 static inline float normalize_query_feature(
@@ -656,14 +738,20 @@ void database_build_matching_features(
         return;
     }
 
-    if (feature_weight_foot_position < 0.0f ||
-        feature_weight_foot_velocity < 0.0f ||
-        feature_weight_hip_velocity < 0.0f ||
-        feature_weight_trajectory_positions < 0.0f ||
-        feature_weight_trajectory_directions < 0.0f ||
-        feature_weight_terrain < 0.0f)
+    const float feature_weights[6] = {
+        feature_weight_foot_position,
+        feature_weight_foot_velocity,
+        feature_weight_hip_velocity,
+        feature_weight_trajectory_positions,
+        feature_weight_trajectory_directions,
+        feature_weight_terrain
+    };
+    for (int i = 0; i < 6; ++i)
     {
-        return;
+        if (!feature_weight_is_valid(feature_weights[i]))
+        {
+            return;
+        }
     }
 
     if (db.terrain_features.rows != db.nframes() ||
