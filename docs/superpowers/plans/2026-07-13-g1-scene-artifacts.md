@@ -17,9 +17,16 @@
 - Load one immutable motion pack and select independent scene packs; never duplicate `database.bin`, `terrain_features.bin`, or `terrain_support.bin` inside a scene.
 - Use one surface for motion features, contacts, support rows, runtime queries, clearance, IK targets, and visible terrain; remove the current `0.14 m` maximum-point dilation.
 - New scenes use G1HF/v2 with the fixed diagonal from the minimum-X/minimum-Z node to the maximum-X/maximum-Z node; G1HF/v1 remains readable only for migration.
+- To remain deterministic under the production `-ffast-math` build, G1HF/v2
+  header values, heights, and derived binary32 node coordinates must be finite
+  normal-or-zero values; `cell_size` must be positive normal. V2 subnormals are
+  rejected transactionally, and cross-language query parity covers only
+  normal-or-zero binary32 coordinates. The historical v1 path is unchanged.
 - G1SP/v1 is little-endian, has a 16-byte header, dimension 3, and columns `source_root_height_m`, `source_left_toe_height_m`, and `source_right_toe_height_m`.
 - G1WM/v1 is little-endian, has a 16-byte header, matches the scene heightfield's `nx` and `nz`, and stores one row-major `uint8` per cell: `0=blocked`, `1=certified`, `2=stress`.
-- Scene heightfield cell size is exactly `0.02 m`; terrain-feature distances are exactly `[0.25, 0.50, 0.75, 1.00]`.
+- Scene heightfield cell size is nominally `0.02 m`; the authoritative serialized
+  value is binary32 `0.019999999552965164` (`0x3ca3d70a`). Terrain-feature
+  distances are exactly `[0.25, 0.50, 0.75, 1.00]`.
 - A positive `landing_hold_seconds` requires at least four route waypoints;
   waypoint index `2` is the exact landing-hold point and a later waypoint
   resumes motion. Zero-hold routes have no special waypoint.
@@ -85,6 +92,10 @@ G1HF/v2: <4sIII4f> = magic, version=2, nx, nz, origin_x, origin_z,
            cell_size, exterior_height; float32[nz][nx]
 G1WM/v1: <4sIII> = magic, version=1, nx, nz; uint8[nz][nx]
 ~~~
+
+For G1HF/v2, “finite float32” below always means normal-or-zero binary32;
+positive `cell_size` additionally excludes both signed zero and subnormals.
+This is a versioned v2 rule, not a retroactive v1 parser change.
 
 The motion manifest schema is `g1-terrain-artifacts/v2`, the scene-index schema
 is `g1-terrain-scene-index/v1`, each scene uses `g1-terrain-scene/v1`, and
@@ -1733,7 +1744,6 @@ and replace the three densification/radius-constructor tests with:
 from resources.g1_terrain_builder.terrain import (
     FlatTerrain,
     GrailTerrain,
-    HeightGrid,
     StepTerrain,
     VerticalTriangleSurface,
     build_facing_centerline,
@@ -1793,6 +1803,14 @@ from resources.g1_terrain_builder.terrain import (
                 "holden-y-up-right-handed-forward-plus-z",
             "source_query": "vertical-triangle-top",
             "polygon_triangulation": "fan-from-first-index",
+            "overlap_height_policy": "maximum-y",
+            "projected_boundary_policy": "closed",
+            "triangle_winding_policy": "orientation-independent",
+            "degenerate_projected_triangle_policy": "ignore",
+            "projected_area_measure": "absolute-two-times-area",
+            "bbox_tolerance_m": 1e-12,
+            "projected_area_epsilon_m2": 1e-12,
+            "barycentric_tolerance": 1e-10,
             "heightfield_schema": "G1HF/v2",
             "heightfield_interpolation": "fixed-diagonal-triangles",
             "heightfield_diagonal":
@@ -1820,6 +1838,13 @@ self.assertEqual(terrain.xz_bounds(), (
 ))
 ~~~
 
+Also restore negative and `index == len(vertices)` topology regressions and add
+tests that reject float topology and `uint64` values outside int32 before any
+cast. Lock both windings, closed edge/vertex ownership, projected-degenerate
+rejection, maximum-height overlap selection, and defensive copies: mutating
+caller arrays must not change queries, bounds, footprints, or diagnostic OBJ
+bytes, and all retained geometry/topology arrays must be read-only.
+
 - [ ] **Step 2: Run the focused tests and verify the old provider fails**
 
 Run:
@@ -1837,17 +1862,31 @@ the surface-semantics functions do not exist.
 - [ ] **Step 3: Implement deterministic triangulation and exact vertical top queries**
 
 Remove `scipy.spatial.cKDTree`, `_densify_faces`, `_points`, `_tree`, and
-`_radius` from `terrain.py`. Add:
+`_radius` from `terrain.py`. Use `_checked_int32_topology` in the USD loader as
+well as every public topology boundary so validation always precedes casting.
+Add:
 
 ~~~python
 import hashlib
 import json
+
+BBOX_TOLERANCE_M = 1e-12
+PROJECTED_AREA_EPSILON_M2 = 1e-12
+BARYCENTRIC_TOLERANCE = 1e-10
 
 SURFACE_SEMANTICS = {
     "schema": "g1-terrain-surface/v1",
     "coordinate_signature": "holden-y-up-right-handed-forward-plus-z",
     "source_query": "vertical-triangle-top",
     "polygon_triangulation": "fan-from-first-index",
+    "overlap_height_policy": "maximum-y",
+    "projected_boundary_policy": "closed",
+    "triangle_winding_policy": "orientation-independent",
+    "degenerate_projected_triangle_policy": "ignore",
+    "projected_area_measure": "absolute-two-times-area",
+    "bbox_tolerance_m": BBOX_TOLERANCE_M,
+    "projected_area_epsilon_m2": PROJECTED_AREA_EPSILON_M2,
+    "barycentric_tolerance": BARYCENTRIC_TOLERANCE,
     "heightfield_schema": "G1HF/v2",
     "heightfield_interpolation": "fixed-diagonal-triangles",
     "heightfield_diagonal": "min-x-min-z_to_max-x-max-z",
@@ -1868,14 +1907,25 @@ def surface_semantics_signature() -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _checked_int32_topology(values, name: str) -> np.ndarray:
+    array = np.asarray(values)
+    if not np.issubdtype(array.dtype, np.integer):
+        raise ValueError(f"{name} must use an integer dtype")
+    if array.size:
+        limits = np.iinfo(np.int32)
+        if int(array.min()) < limits.min or int(array.max()) > limits.max:
+            raise ValueError(f"{name} must fit int32")
+    return np.array(array, np.int32, copy=True)
+
+
 def triangulate_faces(
     vertices: np.ndarray,
     face_counts: np.ndarray,
     face_indices: np.ndarray,
 ) -> np.ndarray:
     vertices = np.asarray(vertices, np.float64)
-    counts = np.asarray(face_counts, np.int32)
-    indices = np.asarray(face_indices, np.int32)
+    counts = _checked_int32_topology(face_counts, "face counts")
+    indices = _checked_int32_topology(face_indices, "face indices")
     _validate_mesh_topology(vertices, counts, indices)
     triangles = []
     cursor = 0
@@ -1896,8 +1946,9 @@ class VerticalTriangleSurface:
         triangles: np.ndarray,
         exterior_height: float = 0.0,
     ):
-        self.vertices = np.asarray(vertices, np.float64)
-        self.triangles = np.asarray(triangles, np.int32)
+        self.vertices = np.array(vertices, np.float64, copy=True)
+        self.triangles = _checked_int32_topology(
+            triangles, "surface triangle indices")
         if self.vertices.ndim != 2 or self.vertices.shape[1:] != (3,) \
                 or not len(self.vertices):
             raise ValueError("surface vertices must have non-empty shape (N, 3)")
@@ -1913,16 +1964,21 @@ class VerticalTriangleSurface:
         projected = self._triangle_vertices[:, :, (0, 2)]
         self._minimum_xz = projected.min(axis=1)
         self._maximum_xz = projected.max(axis=1)
+        for array in (
+            self.vertices, self.triangles, self._triangle_vertices,
+            self._minimum_xz, self._maximum_xz,
+        ):
+            array.setflags(write=False)
 
     def height(self, x: float, z: float) -> float:
         x, z = float(x), float(z)
         if not np.isfinite(x) or not np.isfinite(z):
             raise ValueError("terrain query coordinates must be finite")
         candidates = np.flatnonzero(
-            (self._minimum_xz[:, 0] - 1e-12 <= x)
-            & (x <= self._maximum_xz[:, 0] + 1e-12)
-            & (self._minimum_xz[:, 1] - 1e-12 <= z)
-            & (z <= self._maximum_xz[:, 1] + 1e-12)
+            (self._minimum_xz[:, 0] - BBOX_TOLERANCE_M <= x)
+            & (x <= self._maximum_xz[:, 0] + BBOX_TOLERANCE_M)
+            & (self._minimum_xz[:, 1] - BBOX_TOLERANCE_M <= z)
+            & (z <= self._maximum_xz[:, 1] + BBOX_TOLERANCE_M)
         )
         if not len(candidates):
             return self.exterior_height
@@ -1934,7 +1990,7 @@ class VerticalTriangleSurface:
         v1x, v1z = c[:, 0] - a[:, 0], c[:, 2] - a[:, 2]
         px, pz = x - a[:, 0], z - a[:, 2]
         determinant = v0x * v1z - v0z * v1x
-        projected = np.abs(determinant) > 1e-12
+        projected = np.abs(determinant) > PROJECTED_AREA_EPSILON_M2
         u = np.zeros_like(determinant)
         v = np.zeros_like(determinant)
         u[projected] = (
@@ -1946,7 +2002,10 @@ class VerticalTriangleSurface:
             - v0z[projected] * px[projected]
         ) / determinant[projected]
         w = 1.0 - u - v
-        inside = projected & (u >= -1e-10) & (v >= -1e-10) & (w >= -1e-10)
+        inside = projected \
+            & (u >= -BARYCENTRIC_TOLERANCE) \
+            & (v >= -BARYCENTRIC_TOLERANCE) \
+            & (w >= -BARYCENTRIC_TOLERANCE)
         if not np.any(inside):
             return self.exterior_height
         heights = w[inside] * a[inside, 1] \
@@ -1960,9 +2019,11 @@ Replace `GrailTerrain` with a thin exact-source wrapper:
 ~~~python
 class GrailTerrain(VerticalTriangleSurface):
     def __init__(self, render_vertices, face_counts, face_indices):
-        self._vertices = np.asarray(render_vertices, np.float64)
-        self._face_counts = np.asarray(face_counts, np.int32)
-        self._face_indices = np.asarray(face_indices, np.int32)
+        self._vertices = np.array(render_vertices, np.float64, copy=True)
+        self._face_counts = _checked_int32_topology(
+            face_counts, "face counts")
+        self._face_indices = _checked_int32_topology(
+            face_indices, "face indices")
         _validate_mesh_topology(
             self._vertices, self._face_counts, self._face_indices)
         super().__init__(
@@ -1972,6 +2033,9 @@ class GrailTerrain(VerticalTriangleSurface):
             exterior_height=0.0,
         )
         self._max_height = float(self._vertices[:, 1].max())
+        self._vertices.setflags(write=False)
+        self._face_counts.setflags(write=False)
+        self._face_indices.setflags(write=False)
 
     @classmethod
     def from_base(cls, base: str) -> "GrailTerrain":
@@ -2008,379 +2072,472 @@ Run:
 ~~~bash
 /home/ubuntu/miniconda3/envs/diffsim/bin/python -m unittest \
   tests.python.test_terrain -v
+/home/ubuntu/miniconda3/envs/diffsim/bin/python - <<'PY'
+import glob
+import os
+import numpy as np
+
+from resources.g1_terrain_builder.terrain import (
+    GrailTerrain, PROJECTED_AREA_EPSILON_M2, USD_DIR,
+)
+
+paths = sorted(glob.glob(os.path.join(USD_DIR, "*.usd")))
+triangles = nondegenerate = degenerate = 0
+for path in paths:
+    terrain = GrailTerrain.from_base(os.path.splitext(os.path.basename(path))[0])
+    values = terrain._triangle_vertices
+    determinant = (
+        (values[:, 1, 0] - values[:, 0, 0])
+        * (values[:, 2, 2] - values[:, 0, 2])
+        - (values[:, 1, 2] - values[:, 0, 2])
+        * (values[:, 2, 0] - values[:, 0, 0])
+    )
+    triangles += len(values)
+    for triangle, area in zip(values, np.abs(determinant)):
+        if area <= PROJECTED_AREA_EPSILON_M2:
+            degenerate += 1
+            continue
+        centroid = triangle.mean(axis=0)
+        sampled = terrain.height(float(centroid[0]), float(centroid[2]))
+        # Near-vertical projected faces amplify centroid arithmetic; the
+        # provider must still resolve their plane within one micrometre.
+        assert np.isfinite(sampled) and sampled >= float(centroid[1]) - 1e-6
+        nondegenerate += 1
+assert (len(paths), triangles, nondegenerate, degenerate) \
+    == (1769, 71724, 71648, 76)
+print("VALID strict-grail-surfaces=1769 triangles=71724")
+PY
 ~~~
 
 Expected: all terrain tests pass; the real default curb's top remains between
 `0.1 m` and `0.5 m`, while an XZ query `0.001 m` outside a synthetic top returns
-the exterior height rather than the old dilated maximum.
+the exterior height rather than the old dilated maximum. The hardened suite is
+22 tests, and an independent full-corpus scan must load all 1,769 meshes under
+the strict topology rules and print exactly
+`VALID strict-grail-surfaces=1769 triangles=71724`.
 
-- [ ] **Step 5: Commit the source-surface semantic change**
+- [ ] **Step 5: Hold the source-surface change for the v2 grid boundary**
 
 ~~~bash
-git add resources/g1_terrain_builder/terrain.py tests/python/test_terrain.py
-git diff --cached --check
-git commit -m "fix: query exact GRAIL terrain triangles"
+git diff --check -- \
+  resources/g1_terrain_builder/terrain.py tests/python/test_terrain.py
 ~~~
 
-### Task 4: Emit G1HF/v2 and derive the visible OBJ from the same grid
+Expected: the two-file change is review-clean but remains uncommitted. Its
+locked surface semantics already name the G1HF/v2 scene contract. Task 4 adds
+that v2 grid capability while retaining the old top-level v1 exporter for
+migration safety; both exact-source and v2-grid halves are committed together.
+
+### Task 4: Add an authoritative G1HF/v2 grid and grid-derived OBJ
 
 **Files:**
-- Modify: `resources/g1_terrain_builder/terrain.py:1-344`
-- Modify: `tests/python/test_terrain.py:85-374`
+- Modify: `resources/g1_terrain_builder/terrain.py`
+- Modify: `tests/python/test_terrain.py`
 
-**Interfaces:**
-- Produces: `HeightGrid.height(x, z) -> float` and `HeightGrid.normal(x, z) -> ndarray shape (3,)` from the same fixed diagonal.
-- Produces: `HeightGrid.g1hf_bytes() -> bytes` and `HeightGrid.obj_bytes() -> bytes`.
+**Migration boundary:**
+- Produces: `HeightGrid.height(x, z) -> float` and
+  `HeightGrid.normal(x, z) -> ndarray shape (3,)` from one fixed diagonal.
+- Produces: `HeightGrid.g1hf_bytes() -> bytes`,
+  `HeightGrid.obj_bytes() -> bytes`, and `HeightGrid.metadata() -> dict`.
 - Produces: `rasterize_heightfield(terrain, bounds, cell_size=0.02) -> HeightGrid`.
-- Preserves: `export_heightfield(terrain, bounds, cell_size, path) -> dict`, now writing version 2.
-- Produces: `export_heightfield_obj(grid, path) -> None`; runtime scene code must not call `GrailTerrain.export_obj`.
+- Produces: `export_heightfield_obj(grid, path) -> None`.
+- Preserves the existing `export_heightfield(...)` G1HF/v1 writer, its old
+  six-key metadata, the v1 builder/validator, and the published pack until
+  Task 11 atomically replaces the top-level terrain with v2 scene directories.
+- Keeps `GrailTerrain.export_obj` only as a diagnostic source-mesh export.
+  Runtime v2 scene code uses `HeightGrid.obj_bytes()` exclusively.
 
-- [ ] **Step 1: Write failing fixed-diagonal binary/query/OBJ parity tests**
+- [ ] **Step 1: Write the failing v2 precision, ownership, and byte tests**
 
-Replace `test_heightfield_binary_contract` and add the following tests in
-`tests/python/test_terrain.py`:
+Import `HeightGrid`, `rasterize_heightfield`, and
+`export_heightfield_obj` in `tests/python/test_terrain.py`. Add tests that lock
+all of these contracts before production code:
 
-~~~python
-    def test_heightfield_v2_uses_fixed_diagonal_triangle_interpolation(self):
-        grid = HeightGrid(
-            heights=np.array([[0.0, 0.0], [0.0, 1.0]], np.float32),
-            origin_x=0.0, origin_z=0.0, cell_size=1.0,
-            exterior_height=0.0,
-        )
-        self.assertAlmostEqual(grid.height(0.75, 0.25), 0.25, places=7)
-        self.assertAlmostEqual(grid.height(0.25, 0.75), 0.25, places=7)
-        self.assertAlmostEqual(grid.height(0.5, 0.5), 0.5, places=7)
-        np.testing.assert_allclose(
-            grid.normal(0.75, 0.25),
-            np.array([0.0, 1.0, -1.0]) / np.sqrt(2.0), atol=1e-7)
+1. A `2 x 2` asymmetric grid checks both fixed-diagonal interpolation branches,
+   `tx == tz` ownership, both upward normals, and exterior height/normal.
+2. A multi-cell grid checks every physical node at
+   `origin + index * cell`, an interior X/Z grid-line tie, the final node, and
+   all four inclusive world-space edges.
+3. For each edge, `np.nextafter` immediately inward remains inside and
+   immediately outward is exterior. Use awkward, non-float32-exact origins and
+   cell sizes so normalized-coordinate rounding cannot hide an upper-edge bug.
+4. Decode `g1hf_bytes()` with `<4sIII4f` and require the grid properties,
+   metadata, query coordinates, and OBJ coordinates to derive from those exact
+   decoded float32 header values. The payload is exact C-order little-endian
+   float32 with no trailing bytes.
+5. Mutating the caller's height array after construction cannot change query,
+   binary, OBJ, or metadata bytes. `grid.heights` is owned, C-contiguous,
+   little-endian, and read-only; an attempted write raises.
+6. An asymmetric `3 x 2` or `2 x 3` OBJ locks Z-major/X-minor vertex order,
+   two upward-wound faces per cell (`p00 p11 p10`, then `p00 p01 p11`),
+   cell order, `.9g` formatting, and the final newline. Generate an independent
+   expected OBJ from the decoded G1HF header to prove both files describe the
+   same serialized nodes. Parse awkward real-grid X/Z tokens back to binary32
+   and require bit equality with an explicit binary32 round of each promoted-
+   double node; decimal closeness is insufficient.
+7. Reject non-2D/smaller-than-`2 x 2` grids, non-finite/float32-overflowing
+   samples or metadata, complex samples before any lossy cast, cell sizes that
+   encode to float32 zero, dimensions or sample counts above the C++ consumer's
+   `INT_MAX` limit, and X/Z node sequences that collapse or become non-finite
+   after binary32 runtime rounding. Reject subnormal header/payload/node values
+   and negative-zero serialization; preserve positive zero and a minimum-normal
+   cell when its nodes remain distinguishable. Rasterization must reject
+   impossible/collapsed sizes before allocation or any terrain query.
+8. Rasterization rounds each minimum origin toward negative infinity in
+   float32 when needed, uses the encoded positive float32 cell, and ceil-covers
+   each requested maximum. Test both requested minima and maxima are covered.
+9. `export_heightfield_obj` validates/serializes before opening the target and
+   emits exactly `grid.obj_bytes()`.
+10. Rename the existing binary contract test to state explicitly that the
+    legacy `export_heightfield` remains G1HF/v1 until Task 11; do not change its
+    bytes or metadata in this task.
+11. Lock the complete `surface_semantics()` object, including source-node,
+    runtime-query, cross-language parity-domain, runtime-node-distinguishability,
+    and OBJ-coordinate-quantization policy strings; require its signature to
+    change with those fields.
+12. Prove the O(1) axis helper with the interior-collapse and crossing-zero
+    near-cancellation regressions, a huge mocked dimension with a constant call
+    count, and seeded small-fixture property tests. Brute-force every rounded
+    node for each helper-accepted small fixture and require normal-or-positive-
+    zero, finite, strictly increasing output; conservative rejection is allowed,
+    false acceptance is not.
 
-    def test_heightfield_v2_binary_contract_is_exact_little_endian(self):
-        grid = HeightGrid(
-            np.array([[0.0, 1.0], [2.0, 3.0]], np.float32),
-            -1.0, 2.0, 0.02, -4.0,
-        )
-        payload = grid.g1hf_bytes()
-        header = struct.unpack("<4sIII4f", payload[:32])
-        self.assertEqual(header[:4], (b"G1HF", 2, 2, 2))
-        np.testing.assert_allclose(header[4:], [-1.0, 2.0, 0.02, -4.0])
-        self.assertEqual(
-            payload[32:], grid.heights.astype("<f4").tobytes(order="C"))
+- [ ] **Step 2: Capture the legacy green baseline, then the missing-grid red state**
 
-    def test_grid_obj_uses_same_nodes_and_minimum_corner_diagonal(self):
-        grid = HeightGrid(
-            np.array([[0.0, 1.0], [2.0, 3.0]], np.float32),
-            10.0, 20.0, 0.5, 0.0,
-        )
-        lines = grid.obj_bytes().decode("utf-8").splitlines()
-        self.assertEqual(lines[:4], [
-            "v 10 0 20", "v 10.5 1 20",
-            "v 10 2 20.5", "v 10.5 3 20.5",
-        ])
-        self.assertEqual(lines[4:], ["f 1 4 2", "f 1 3 4"])
-
-    def test_grid_nodes_and_deterministic_obj_probes_have_surface_parity(self):
-        grid = HeightGrid(
-            np.array([[0.0, 0.2], [0.4, 0.8]], np.float32),
-            0.0, 0.0, 1.0, 0.0,
-        )
-        for iz in range(grid.nz):
-            for ix in range(grid.nx):
-                self.assertLessEqual(abs(
-                    grid.height(ix, iz) - grid.heights[iz, ix]), 1e-6)
-        expected = {
-            (0.2, 0.1): 0.10,
-            (0.8, 0.1): 0.22,
-            (0.1, 0.8): 0.36,
-            (0.8, 0.8): 0.64,
-        }
-        for point, height in expected.items():
-            self.assertAlmostEqual(grid.height(*point), height, places=6)
-
-    def test_export_heightfield_writes_v2_and_grid_metadata(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            path = os.path.join(temporary, "terrain.bin")
-            metadata = export_heightfield(
-                StepTerrain(0.5, 0.29),
-                (0.0, 1.0, 0.0, 1.0), 0.5, path)
-            payload = open(path, "rb").read()
-        self.assertEqual(struct.unpack("<4sI", payload[:8]), (b"G1HF", 2))
-        self.assertEqual(metadata["schema"], "G1HF/v2")
-        self.assertEqual(
-            metadata["diagonal"], "min-x-min-z_to_max-x-max-z")
-        self.assertEqual(metadata["interpolation"], "fixed-diagonal-triangles")
-~~~
-
-- [ ] **Step 2: Run the v2 tests and verify the missing grid failure**
-
-Run:
+Before adding the new module-level imports, rename and run only:
 
 ~~~bash
 /home/ubuntu/miniconda3/envs/diffsim/bin/python -m unittest \
-  tests.python.test_terrain.TerrainTests.test_heightfield_v2_uses_fixed_diagonal_triangle_interpolation \
-  tests.python.test_terrain.TerrainTests.test_grid_obj_uses_same_nodes_and_minimum_corner_diagonal \
-  tests.python.test_terrain.TerrainTests.test_export_heightfield_writes_v2_and_grid_metadata -v
+  tests.python.test_terrain.TerrainTests.test_legacy_export_heightfield_remains_g1hf_v1 -v
 ~~~
 
-Expected: `ERROR` because `HeightGrid` is not defined, or `FAIL` because the old
-export still writes G1HF/v1.
+Expected: `OK`. Then add the imports/tests and run:
 
-- [ ] **Step 3: Implement the authoritative grid, triangle query, normal, and bytes**
+~~~bash
+/home/ubuntu/miniconda3/envs/diffsim/bin/python -m unittest \
+  tests.python.test_terrain.TerrainTests.test_height_grid_uses_one_fixed_diagonal_for_height_and_normal \
+  tests.python.test_terrain.TerrainTests.test_height_grid_binary_header_is_float32_coordinate_authority \
+  tests.python.test_terrain.TerrainTests.test_height_grid_owns_read_only_little_endian_height_bytes -v
+~~~
 
-Add to `terrain.py`:
+Expected: module import fails because `HeightGrid` and the v2 helpers do not yet
+exist. The separately captured legacy-v1 baseline remains the migration oracle.
+
+- [ ] **Step 3: Implement one immutable, serialized-float32 authority**
+
+Add shared constants before `SURFACE_SEMANTICS` and reuse them everywhere:
 
 ~~~python
 HEIGHTFIELD_HEADER = struct.Struct("<4sIII4f")
 HEIGHTFIELD_VERSION = 2
 HEIGHTFIELD_DIAGONAL = "min-x-min-z_to_max-x-max-z"
 HEIGHTFIELD_INTERPOLATION = "fixed-diagonal-triangles"
-
-
-@dataclass(frozen=True)
-class HeightGrid:
-    heights: np.ndarray
-    origin_x: float
-    origin_z: float
-    cell_size: float
-    exterior_height: float
-    version: int = HEIGHTFIELD_VERSION
-
-    def __post_init__(self):
-        values = np.ascontiguousarray(self.heights, dtype="<f4")
-        numbers = [
-            self.origin_x, self.origin_z, self.cell_size,
-            self.exterior_height,
-        ]
-        if values.ndim != 2 or min(values.shape) < 2:
-            raise ValueError("height grid must have shape (nz>=2, nx>=2)")
-        if not np.isfinite(values).all() or not np.isfinite(numbers).all():
-            raise ValueError("height grid values and metadata must be finite")
-        if self.cell_size <= 0.0 or self.version != 2:
-            raise ValueError("height grid requires positive cell size and version 2")
-        object.__setattr__(self, "heights", values)
-        object.__setattr__(self, "origin_x", float(self.origin_x))
-        object.__setattr__(self, "origin_z", float(self.origin_z))
-        object.__setattr__(self, "cell_size", float(self.cell_size))
-        object.__setattr__(self, "exterior_height", float(self.exterior_height))
-
-    @property
-    def nz(self):
-        return self.heights.shape[0]
-
-    @property
-    def nx(self):
-        return self.heights.shape[1]
-
-    def _cell(self, x, z):
-        x, z = float(x), float(z)
-        if not np.isfinite(x) or not np.isfinite(z):
-            raise ValueError("height-grid query coordinates must be finite")
-        gx = (x - self.origin_x) / self.cell_size
-        gz = (z - self.origin_z) / self.cell_size
-        if gx < 0.0 or gz < 0.0 or gx > self.nx - 1 or gz > self.nz - 1:
-            return None
-        ix = min(int(np.floor(gx)), self.nx - 2)
-        iz = min(int(np.floor(gz)), self.nz - 2)
-        return ix, iz, gx - ix, gz - iz
-
-    def height(self, x, z):
-        cell = self._cell(x, z)
-        if cell is None:
-            return self.exterior_height
-        ix, iz, tx, tz = cell
-        h00 = float(self.heights[iz, ix])
-        h10 = float(self.heights[iz, ix + 1])
-        h01 = float(self.heights[iz + 1, ix])
-        h11 = float(self.heights[iz + 1, ix + 1])
-        if tx >= tz:
-            return h00 + tx * (h10 - h00) + tz * (h11 - h10)
-        return h00 + tx * (h11 - h01) + tz * (h01 - h00)
-
-    def normal(self, x, z):
-        cell = self._cell(x, z)
-        if cell is None:
-            return np.array([0.0, 1.0, 0.0])
-        ix, iz, tx, tz = cell
-        x0 = self.origin_x + ix * self.cell_size
-        z0 = self.origin_z + iz * self.cell_size
-        p00 = np.array([x0, self.heights[iz, ix], z0], np.float64)
-        p10 = np.array([
-            x0 + self.cell_size, self.heights[iz, ix + 1], z0])
-        p01 = np.array([
-            x0, self.heights[iz + 1, ix], z0 + self.cell_size])
-        p11 = np.array([
-            x0 + self.cell_size, self.heights[iz + 1, ix + 1],
-            z0 + self.cell_size])
-        normal = (
-            np.cross(p11 - p00, p10 - p00)
-            if tx >= tz else np.cross(p01 - p00, p11 - p00)
-        )
-        return normal / np.linalg.norm(normal)
-
-    def g1hf_bytes(self):
-        return HEIGHTFIELD_HEADER.pack(
-            b"G1HF", self.version, self.nx, self.nz,
-            self.origin_x, self.origin_z,
-            self.cell_size, self.exterior_height,
-        ) + self.heights.tobytes(order="C")
-
-    def obj_bytes(self):
-        lines = []
-        for iz in range(self.nz):
-            z = self.origin_z + iz * self.cell_size
-            for ix in range(self.nx):
-                x = self.origin_x + ix * self.cell_size
-                lines.append(f"v {x:.9g} {float(self.heights[iz, ix]):.9g} {z:.9g}")
-        for iz in range(self.nz - 1):
-            for ix in range(self.nx - 1):
-                p00 = iz * self.nx + ix + 1
-                p10 = p00 + 1
-                p01 = p00 + self.nx
-                p11 = p01 + 1
-                lines.append(f"f {p00} {p11} {p10}")
-                lines.append(f"f {p00} {p01} {p11}")
-        return ("\n".join(lines) + "\n").encode("utf-8")
-
-    def metadata(self):
-        return {
-            "schema": "G1HF/v2",
-            "version": 2,
-            "nx": self.nx,
-            "nz": self.nz,
-            "origin_x": self.origin_x,
-            "origin_z": self.origin_z,
-            "cell_size_m": self.cell_size,
-            "exterior_height_m": self.exterior_height,
-            "interpolation": HEIGHTFIELD_INTERPOLATION,
-            "diagonal": HEIGHTFIELD_DIAGONAL,
-        }
+HEIGHTFIELD_SCALAR_ENCODING = "ieee754-binary32-little-endian"
+HEIGHTFIELD_DOMAIN_POLICY = "inclusive-authoritative-node-rectangle"
+HEIGHTFIELD_GRID_LINE_POLICY = "positive-index-cell-except-maximum-edge"
+HEIGHTFIELD_DIAGONAL_TIE_POLICY = "tx-greater-or-equal-tz-uses-p00-p10-p11"
+HEIGHTFIELD_SOURCE_NODE_ENCODING = \
+    "binary32-header-values-promoted-to-binary64-arithmetic"
+HEIGHTFIELD_RUNTIME_QUERY_ENCODING = \
+    "normal-or-zero-binary32-canonicalized-positive-and-promoted-to-binary64"
+HEIGHTFIELD_SCALAR_DOMAIN = "normal-or-zero-binary32"
+HEIGHTFIELD_CELL_DOMAIN = "positive-normal-binary32"
+HEIGHTFIELD_RUNTIME_NODE_DOMAIN = "normal-or-zero-binary32"
+HEIGHTFIELD_RUNTIME_QUERY_DOMAIN = "normal-or-zero-binary32-coordinates"
+HEIGHTFIELD_RUNTIME_PARITY_DOMAIN = "normal-or-zero-binary32-coordinates"
+HEIGHTFIELD_DENORMAL_POLICY = "reject-nonzero-binary32-subnormals"
+HEIGHTFIELD_EVALUATION_PRECISION = \
+    "binary64-from-binary32-samples-and-promoted-node-weights"
+HEIGHTFIELD_RUNTIME_HEIGHT_OUTPUT = \
+    "finite-binary64-interpolation-rounded-to-binary32"
+HEIGHTFIELD_NORMAL_EVALUATION = \
+    "selected-triangle-binary64-gradient-scale-safe-unit-normalization"
+HEIGHTFIELD_RUNTIME_NORMAL_OUTPUT = \
+    "unit-normal-components-rounded-to-binary32"
+HEIGHTFIELD_RUNTIME_OUTPUT_FTZ_POLICY = \
+    "binary32-subnormals-and-signed-zero-canonicalized-to-positive-zero"
+HEIGHTFIELD_ZERO_ENCODING = "canonical-positive-zero"
+HEIGHTFIELD_RUNTIME_NODE_DISTINGUISHABILITY_POLICY = \
+    "normal-or-positive-zero-strictly-increasing-proven-by-endpoints-" \
+    "near-zero-candidates-max-binary32-spacing-and-aligned-equality"
+HEIGHTFIELD_OBJ_COORDINATE_QUANTIZATION = \
+    "binary32-round-of-promoted-origin-plus-index-times-cell"
+HEIGHTFIELD_RASTER_BOUNDS_POLICY = \
+    "float32-minimum-rounded-down-and-maximum-ceil-covered"
+HEIGHTFIELD_OBJ_VERTEX_ORDER = "z-major-x-minor"
+HEIGHTFIELD_OBJ_FACE_ORDER = "p00-p11-p10_then_p00-p01-p11"
+HEIGHTFIELD_OBJ_FLOAT_FORMAT = ".9g-final-newline"
+HEIGHTFIELD_EXTERIOR_NORMAL = (0.0, 1.0, 0.0)
+HEIGHTFIELD_MAX_SAMPLES = np.iinfo(np.int32).max
+HEIGHTFIELD_MIN_NORMAL = float(np.finfo(np.float32).tiny)
 ~~~
 
-Replace `export_heightfield` with these functions:
+Extend `SURFACE_SEMANTICS` with those precision, inclusive-domain,
+grid-line, diagonal-tie, exterior-normal, raster-bounds, and OBJ byte policies.
+The signature must change in the same commit and the exact semantics test must
+lock every new field. `cell_size_m: 0.02` remains the nominal scene setting;
+each grid's metadata records the authoritative decoded float32 cell.
+
+The exact added semantic keys and values are:
 
 ~~~python
-def rasterize_heightfield(terrain, bounds, cell_size=0.02):
-    xmin, xmax, zmin, zmax = (float(value) for value in bounds)
-    if not np.isfinite([xmin, xmax, zmin, zmax, cell_size]).all():
-        raise ValueError("heightfield bounds and cell size must be finite")
-    if xmax <= xmin:
-        raise ValueError("heightfield xmax must be greater than xmin")
-    if zmax <= zmin:
-        raise ValueError("heightfield zmax must be greater than zmin")
-    if cell_size <= 0.0:
-        raise ValueError("heightfield cell size must be positive")
-    nx = int(np.ceil((xmax - xmin) / cell_size)) + 1
-    nz = int(np.ceil((zmax - zmin) / cell_size)) + 1
-    heights = np.empty((nz, nx), np.float32)
-    for iz in range(nz):
-        for ix in range(nx):
-            heights[iz, ix] = terrain.height(
-                xmin + ix * cell_size, zmin + iz * cell_size)
-    return HeightGrid(heights, xmin, zmin, cell_size, 0.0)
-
-
-def export_heightfield(terrain, bounds, cell_size, path):
-    grid = rasterize_heightfield(terrain, bounds, cell_size)
-    with open(path, "wb") as stream:
-        stream.write(grid.g1hf_bytes())
-    return grid.metadata()
-
-
-def export_heightfield_obj(grid, path):
-    if not isinstance(grid, HeightGrid):
-        raise TypeError("heightfield OBJ export requires a HeightGrid")
-    with open(path, "wb") as stream:
-        stream.write(grid.obj_bytes())
+"heightfield_version": 2,
+"heightfield_scalar_encoding": HEIGHTFIELD_SCALAR_ENCODING,
+"heightfield_domain_policy": HEIGHTFIELD_DOMAIN_POLICY,
+"heightfield_grid_line_policy": HEIGHTFIELD_GRID_LINE_POLICY,
+"heightfield_diagonal_tie_policy": HEIGHTFIELD_DIAGONAL_TIE_POLICY,
+"heightfield_exterior_normal": HEIGHTFIELD_EXTERIOR_NORMAL,
+"heightfield_source_node_encoding": HEIGHTFIELD_SOURCE_NODE_ENCODING,
+"heightfield_runtime_query_encoding": HEIGHTFIELD_RUNTIME_QUERY_ENCODING,
+"heightfield_scalar_domain": HEIGHTFIELD_SCALAR_DOMAIN,
+"heightfield_cell_domain": HEIGHTFIELD_CELL_DOMAIN,
+"heightfield_runtime_node_domain": HEIGHTFIELD_RUNTIME_NODE_DOMAIN,
+"heightfield_runtime_query_domain": HEIGHTFIELD_RUNTIME_QUERY_DOMAIN,
+"heightfield_runtime_parity_domain": HEIGHTFIELD_RUNTIME_PARITY_DOMAIN,
+"heightfield_denormal_policy": HEIGHTFIELD_DENORMAL_POLICY,
+"heightfield_evaluation_precision": HEIGHTFIELD_EVALUATION_PRECISION,
+"heightfield_runtime_height_output": HEIGHTFIELD_RUNTIME_HEIGHT_OUTPUT,
+"heightfield_normal_evaluation": HEIGHTFIELD_NORMAL_EVALUATION,
+"heightfield_runtime_normal_output": HEIGHTFIELD_RUNTIME_NORMAL_OUTPUT,
+"heightfield_runtime_output_ftz_policy":
+    HEIGHTFIELD_RUNTIME_OUTPUT_FTZ_POLICY,
+"heightfield_zero_encoding": HEIGHTFIELD_ZERO_ENCODING,
+"heightfield_runtime_node_distinguishability_policy":
+    HEIGHTFIELD_RUNTIME_NODE_DISTINGUISHABILITY_POLICY,
+"heightfield_obj_coordinate_quantization":
+    HEIGHTFIELD_OBJ_COORDINATE_QUANTIZATION,
+"heightfield_raster_bounds_policy": HEIGHTFIELD_RASTER_BOUNDS_POLICY,
+"heightfield_obj_vertex_order": HEIGHTFIELD_OBJ_VERTEX_ORDER,
+"heightfield_obj_face_order": HEIGHTFIELD_OBJ_FACE_ORDER,
+"heightfield_obj_float_format": HEIGHTFIELD_OBJ_FLOAT_FORMAT,
 ~~~
 
-- [ ] **Step 4: Run the complete Python terrain suite**
+Implement `HeightGrid` as a frozen dataclass with `version` fixed internally to
+integer `2` (not an init argument). In `__post_init__`, inspect the source
+array's shape and enforce the dimension/sample-count limits before any owned
+copy or allocation. Then:
+
+- convert header scalars to float32 and classify their raw bits; reject
+  overflow/non-finite/subnormal values, require a positive-normal cell, and
+  canonicalize every accepted signed zero positive before storing decoded
+  Python floats;
+- before copying heights, use the named constant-time axis proof to require
+  every X/Z node coordinate to round to normal-or-positive-zero binary32 and
+  remain strictly increasing. Check endpoints, first/final adjacent pairs,
+  clamped candidates nearest zero, maximum inward binary32 spacing, and the
+  aligned-equality exception. Reject a collapsed/non-domain endpoint or
+  interior step even if promoted-double endpoint coordinates are distinct;
+- make an unconditional owned C-order `<f4` copy of heights, validate it, and
+  reject non-finite/subnormal samples, canonicalize signed zeros positive, and
+  mark it read-only;
+- require `nx`, `nz`, and `nx * nz` to fit `INT_MAX` before byte production;
+- expose `nx`, `nz`, `max_x`, and `max_z` from authoritative values.
+
+The named O(1) proof is `_validate_runtime_axis(origin, count, cell, axis)` and
+must be ported literally in Task 5:
+
+1. Compute promoted-double and explicitly rounded/canonicalized binary32
+   coordinates only at indices `0`, `1`, `count-2`, and `count-1`. Require all
+   eight values finite, both adjacent source/runtime pairs strictly increasing,
+   and all four runtime values normal-or-positive-zero.
+2. If the promoted interval strictly crosses zero, compute
+   `base = floor(-origin / cell)` and inspect the clamped indices in
+   `[base-1, base+2]`; every rounded value must be normal-or-positive-zero.
+3. For either binary64 source endpoints or binary32 runtime endpoints, define
+   maximum inward spacing as `last - prev(last)` when `first >= 0`,
+   `next(first) - first` when `last <= 0`, and the maximum of those two gaps
+   when the interval crosses zero. Let `maximum_spacing` be the maximum of the
+   source and runtime results.
+4. Counts at most three are already completely covered by the adjacent checks.
+   Otherwise accept only when `cell > maximum_spacing`, or when
+   `cell == maximum_spacing` and the finite quotient `origin / cell` is an
+   exact integer. Reject all other cases.
+
+This is deliberately conservative: it may reject an unusual valid grid but may
+never accept a collapsed or out-of-domain node sequence. No loop bound may
+depend on `count`; the seeded property oracle brute-forces only small accepted
+fixtures to prove zero false acceptance.
+
+`_cell(x, z)` first rejects non-finite inputs, then compares against explicit
+inclusive world-space `[origin, max]` bounds. Only accepted values are
+normalized and clamped. Exact interior node coordinates belong to the
+positive-index cell; the maximum edge belongs to the final cell. The diagonal
+uses `tx >= tz` for the `p00/p10/p11` triangle. `normal` uses the identical
+branch and returns exactly `[0, 1, 0]` outside.
+
+`g1hf_bytes()` packs only already-validated authoritative values. `obj_bytes()`
+computes every X/Z node with promoted authoritative header arithmetic, rounds
+the result explicitly to binary32, then formats that rounded value with `.9g`.
+Parsed OBJ X/Z coordinates must therefore have the identical binary32 bits as
+the runtime/render node. It emits read-only float32 heights and uses the locked
+order/format/winding. `metadata()` has exactly:
+
+~~~text
+schema, version, nx, nz, origin_x, origin_z, cell_size_m,
+exterior_height_m, interpolation, diagonal
+~~~
+
+- [ ] **Step 4: Implement ceil-cover rasterization and safe OBJ writing**
+
+`rasterize_heightfield` validates finite strict bounds and the float32-encoded
+positive-normal cell. Quantize each requested minimum to float32 and, if round-to-
+nearest moved it above the request, take one float32 `nextafter` toward negative
+infinity. Compute dimensions from those authoritative values so the final node
+ceil-covers the requested maximum; reject consumer-invalid dimensions/sample
+counts and runtime-collapsed/non-domain binary32 node coordinates before
+allocating or querying the source. Query the source at the exact promoted-
+double authoritative grid nodes and let `HeightGrid` reject non-finite results.
+
+Python grid queries accept finite binary64 coordinates over the exact promoted-
+double node rectangle. C++ parity is intentionally defined only for normal-or-
+zero binary32 query coordinates: canonicalize signed zero positive and promote
+those values to binary64 before applying the same bounds, grid-line, and
+diagonal policies; a subnormal runtime query is exterior/up. An exact Python
+maximum with no accepted binary32 representation has no C++ query counterpart;
+an accepted inward neighbor is inside and an outward neighbor beyond the exact
+rectangle is exterior.
+
+`export_heightfield_obj` requires a `HeightGrid`, computes `payload =
+grid.obj_bytes()` before opening the path, then writes that payload once. Do not
+modify the legacy v1 `export_heightfield`, the builder, validator, or published
+resource directory in this task.
+
+- [ ] **Step 5: Run focused, terrain, and full-repository gates**
 
 Run:
 
 ~~~bash
 /home/ubuntu/miniconda3/envs/diffsim/bin/python -m unittest \
   tests.python.test_terrain -v
+/home/ubuntu/miniconda3/envs/diffsim/bin/python -m unittest discover \
+  -s tests/python -v
+/home/ubuntu/miniconda3/envs/diffsim/bin/python -m py_compile \
+  resources/g1_terrain_builder/terrain.py tests/python/test_terrain.py
+git diff --check -- \
+  resources/g1_terrain_builder/terrain.py tests/python/test_terrain.py
 ~~~
 
-Expected: all tests pass; the binary header is G1HF/v2 and every OBJ face uses
-the fixed node-0-to-node-3 diagonal.
+Expected: every terrain and repository test passes; the old builder still
+publishes/validates G1HF/v1, while the new in-memory v2 binary and its OBJ are
+byte-deterministic and share authoritative serialized coordinates.
 
-- [ ] **Step 5: Commit the Python heightfield/render contract**
+- [ ] **Step 6: Commit the exact-source and v2-grid capability together**
 
 ~~~bash
 git add resources/g1_terrain_builder/terrain.py tests/python/test_terrain.py
 git diff --cached --check
-git commit -m "feat: emit fixed-diagonal G1 heightfields"
+git commit -m "feat: add exact G1 terrain grids"
 ~~~
+
+Expected: this is the first committed revision whose signed v2 surface
+semantics are fully implemented. It deliberately does not claim the currently
+published/top-level terrain is v2; Task 11 performs that atomic migration.
 
 ### Task 5: Add migration-safe C++ G1HF/v1-v2 query and normal parity
 
 **Files:**
-- Modify: `terrain_runtime.h:20-35,282-471,625-639`
-- Modify: `tests/cpp/test_terrain_runtime.cpp:20-474,886-960`
+- Modify: `terrain_runtime.h`
+- Modify: `tests/cpp/test_terrain_runtime.cpp`
 
 **Interfaces:**
-- `heightfield` gains `uint32_t version`; successful loads set it to 1 or 2 and failed loads preserve it.
+- `heightfield` gains `uint32_t version`; successful loads set it to 1 or 2
+  and every failed load preserves the complete destination, including version.
 - Preserves: `heightfield_load(heightfield&, const char*, char*, int) -> bool`.
-- Preserves: `heightfield_sample(const heightfield&, float x, float z) -> float`; v1 is bilinear migration behavior and v2 is authoritative fixed-diagonal behavior.
-- Produces: `heightfield_normal(const heightfield&, float x, float z) -> vec3`, using the exact sampled v2 triangle.
+- Preserves byte-for-byte arithmetic and results of the current float/bilinear
+  G1HF/v1 `heightfield_sample`; v1 must not share the new locator.
+- Adds authoritative G1HF/v2 fixed-triangle sampling with float32-decoded
+  normal-or-positive-zero metadata promoted to double, double local weights,
+  and finite binary32 output rounded from the binary64 interpolation.
+- Produces: `heightfield_normal(...) -> vec3` for v2 using the identical
+  triangle and scale-safe double normalization. V1, exterior, non-finite, and
+  structurally invalid inputs return exactly `(0, 1, 0)`.
+- Cross-language parity is defined for normal-or-zero binary32 query X/Z
+  values; query signed zero is canonicalized positive and subnormal queries
+  return exterior/up. C++ promotes accepted exact values to double and compares
+  them against the same double node rectangle as Python. An exact Python
+  maximum that is not binary32-representable has no C++ query counterpart; the
+  adjacent accepted inward float is inside and an outward-rounded float beyond
+  the rectangle is exterior.
 
-- [ ] **Step 1: Write failing v1/v2 distinction, normal, and transactional tests**
+- [ ] **Step 1: Lock legacy v1 and write failing v2/parser/parity tests**
 
-Update `initialize_heightfield` in `tests/cpp/test_terrain_runtime.cpp` to set
-`field.version = 2`. Add:
+Keep existing manual fixtures v1 by default; change `initialize_heightfield` to
+take an explicit version argument only where a v2 fixture is intended. Before
+production edits, compile/run the existing suite and retain its output as the
+v1 baseline.
 
-~~~cpp
-static void test_heightfield_v1_migrates_but_v2_uses_fixed_diagonal()
-{
-    const std::vector<float> heights = {0.0f, 0.0f, 0.0f, 1.0f};
-    const char* v1_path = "/tmp/test_g1hf_v1_migration.bin";
-    const char* v2_path = "/tmp/test_g1hf_v2_triangle.bin";
-    write_payload(v1_path, make_heightfield(
-        1, 2, 2, 0, 0, 1, 0, heights));
-    write_payload(v2_path, make_heightfield(
-        2, 2, 2, 0, 0, 1, 0, heights));
-    char error[256] = {};
-    heightfield v1, v2;
-    assert(heightfield_load(v1, v1_path, error, sizeof(error)));
-    assert(heightfield_load(v2, v2_path, error, sizeof(error)));
-    assert(v1.version == 1 && v2.version == 2);
-    check_close(heightfield_sample(v1, 0.75f, 0.25f), 0.1875f,
-                "v1 bilinear migration sample");
-    check_close(heightfield_sample(v2, 0.75f, 0.25f), 0.25f,
-                "v2 fixed-diagonal sample");
-    const vec3 normal = heightfield_normal(v2, 0.75f, 0.25f);
-    check_close(normal.x, 0.0f, "v2 triangle normal x");
-    check_close(normal.y, 0.70710678f, "v2 triangle normal y");
-    check_close(normal.z, -0.70710678f, "v2 triangle normal z");
-}
+Convert every runtime `assert(...)` in the test harness to the existing
+always-on `check(...)` mechanism, including fixture I/O, loader calls, error
+checks, transactions, and samples. Retain `static_assert` only. Add these tests:
 
-static void test_heightfield_rejects_unknown_version_transactionally()
-{
-    const char* path = "/tmp/test_g1hf_v3.bin";
-    write_payload(path, make_heightfield(
-        3, 2, 2, 0, 0, 1, 0, {0, 0, 0, 0}));
-    heightfield destination;
-    destination.version = 77;
-    destination.nx = 2;
-    destination.nz = 2;
-    destination.heights.resize(4);
-    destination.heights.set(9.0f);
-    char error[256] = {};
-    assert(!heightfield_load(destination, path, error, sizeof(error)));
-    assert(strstr(error, "version") != NULL);
-    assert(destination.version == 77);
-    assert(destination.heights(0) == 9.0f);
-}
+1. Load otherwise-identical v1 and v2 asymmetric `2 x 2` grids. V1 remains
+   bilinear (`0.1875`); v2 returns the fixed-triangle value (`0.25`).
+2. A v1 coordinate-arithmetic regression uses:
+
+~~~text
+origin=-36257.83203125f, cell=0.04736527055501938f,
+x=-32593.607421875f
 ~~~
 
-Also assert the generated-artifact probe receives `field.version == 2`; replace
-the hard-coded `459682` feature-row assertion with `features.values.rows > 0`
-so the same byte loader can probe diagnostic and full packs. Remove hard-coded
-default-scene grid dimensions, because exact mesh bounds may change, and instead
-require `nx,nz >= 2`, exact payload size, and finite samples. Python manifest
-validation remains responsible for each pack's exact frame count.
+   and requires the current v1 result/float bits. This prevents routing v1
+   through the double v2 locator.
+3. Generate one asymmetric awkward-metadata `HeightGrid.g1hf_bytes()` oracle
+   with Python, paste its exact bytes into a C++ fixture, and compare the entire
+   independent C++ byte construction before loading it. Lock decoded header and
+   payload bits, nodes, both triangle branches, diagonal equality, normals, and
+   exterior results against the Python oracle.
+4. A diagonal downcast regression uses:
 
-- [ ] **Step 2: Compile and verify G1HF/v2 is rejected and the normal is missing**
+~~~text
+ox=7.857595920562744f, oz=-0.7662742137908936f,
+cell=21.012887954711914f,
+x=22.33635711669922f, z=13.71248722076416f
+~~~
+
+   where double `tx < tz` but float downcast ties; v2 must select the second
+   triangle.
+5. Test all exact representable edges, `nextafterf` inward/outward probes,
+   awkward outward-rounded maxima, interior X/Z grid-line ownership, maximum-
+   edge final-cell ownership, and `tx == tz` first-triangle ownership.
+6. Require a flat v2 normal to be bit-exact `(0,1,0)` and cover both sloped
+   triangles. Add extreme normal heights (`-FLT_MAX`/`+FLT_MAX`), minimum-normal
+   and very large positive cells whose node coordinates remain runtime-distinct,
+   proving samples/normals stay finite. Reject v2 subnormal header scalars,
+   payload heights, rounded nodes, and query coordinates; subnormal queries
+   return exterior/up without indexing. Reject serialized negative zero. Add
+   collapsed-coordinate v2 headers (large origin with too-small cell, an
+   overflowing final node, and first/final-adjacent-distinct but interior
+   collapse) transactionally. Matching legacy-v1 fixtures retain their exact
+   historical behavior.
+7. Run every truncation, trailing-byte, dimension-overflow, metadata, and
+   non-finite-payload rejection for both versions. Unknown version 3 is rejected
+   transactionally. `expect_heightfield_rejected` and the no-mutation test
+   include a sentinel version.
+8. Structurally invalid or unknown-version in-memory fields return exterior/up
+   without indexing storage.
+9. Port the exact Python O(1) axis vectors to C++, including the alignment-
+   equality acceptance. A deterministic small-grid property test brute-forces
+   every rounded node for each helper-accepted fixture and proves finite,
+   normal-or-zero, strictly increasing nodes with zero false acceptance. The
+   validator call count is constant and never loops over header dimensions.
+10. For the independent Python oracle, cast query X/Z to binary32 before the
+    Python call, then round Python height/normal results to binary32 and
+    canonicalize any subnormal or signed zero to positive zero. Compare C++
+    height and every normal component bit-for-bit with that runtime oracle.
+
+Change the generated-artifact probe CLI from two path arguments to three exact
+arguments: `G1TF_PATH G1HF_PATH EXPECTED_G1HF_VERSION`. Accept only decimal
+version text `1` or `2`, pass that value into the probe, and require
+`field.version == expected_version`. The currently published top-level artifact
+is intentionally v1 until Task 11, so Task 5 passes `1`; Task 13 passes `2` for
+each scene. In both cases require non-empty feature rows, `nx,nz >= 2`, exact
+storage size, and finite samples; remove hard-coded full-pack frame/grid sizes.
+The always-on main contract is `argc == 1 || argc == 4`; in the latter case use
+exact `strcmp(argv[3], "1")` / `strcmp(argv[3], "2")` branches (no permissive
+`atoi` prefix parsing), then call
+`probe_generated_artifacts(argv[1], argv[2], expected_version)`.
+
+- [ ] **Step 2: Compile and capture the real v2 red state**
 
 Run:
 
@@ -2393,7 +2550,7 @@ Expected: compilation fails because `heightfield_normal` and
 `heightfield.version` do not exist. If those declarations are added alone, the
 new v2 load assertion still fails because the current loader accepts only v1.
 
-- [ ] **Step 3: Extend the strict loader without weakening any size check**
+- [ ] **Step 3: Extend the strict transactional loader**
 
 Add the version field:
 
@@ -2424,129 +2581,142 @@ if (version != 1 && version != 2) {
 ~~~
 
 Keep the existing dimensions, overflow, exact-length, metadata-finite, payload
-read, payload-finite, and `terrain_finish_read` branches byte-for-byte. Insert
-the version assignment immediately after the existing `heightfield loaded;`
-line:
+read, payload-finite, and `terrain_finish_read` branches for both versions. In
+the v2 branch only, classify raw float bits: header/payload values and derived
+rounded nodes must be normal or positive zero, while cell must be positive
+normal; reject subnormals and negative-zero encodings transactionally. Run the
+complete common corruption matrix for both versions plus the v2-only domain
+matrix. Assign `loaded.version = version` only in the temporary object and swap
+it with the other fields after all reads and validation succeed.
 
 ~~~cpp
 loaded.version = version;
 ~~~
 
-Insert this swap immediately before the existing `out.nx` swap; the remaining
-metadata and height-array swaps stay in their current order:
+For version 2 only, validate before payload allocation that the promoted-double
+first/final X/Z nodes are finite and that every rounded node is normal-or-zero
+and remains strictly increasing. Port Python's named O(1) helper and its exact
+maximum-inward-spacing/aligned-equality rule literally; never loop over
+dimensions supplied by an untrusted header. Version 1 must not gain this
+rejection, because its parser/arithmetic contract remains historical.
 
-~~~cpp
-std::swap(out.version, loaded.version);
-~~~
+Production `-ffast-math` flushes a hardware double-to-float subnormal result,
+so the v2 port must classify each promoted-double node *before* casting. For
+`magnitude = abs(source_node)`, IEEE round-to-nearest-even produces positive
+zero when `magnitude <= 0x1p-150`, a forbidden nonzero binary32 subnormal when
+`0x1p-150 < magnitude < (0x1p-126 - 0x1p-150)`, and a normal value at or above
+the upper tie (which rounds to minimum normal). Canonicalize the first case to
+`+0.0f`, reject the middle interval, and only then cast the normal case. Add
+exact lower/upper-tie and `nextafter` tests under the release flags; an ordinary
+unchecked `static_cast<float>` is not an acceptable domain check.
 
 Update `terrain_heightfield_is_queryable` to require `version == 1 ||
-version == 2` in addition to its current checks.
+version == 2` in addition to its current checks. Never use standard
+`isfinite` as a fast-math safety guard; retain the existing bitwise finite
+predicate for float inputs and decoded metadata.
 
-- [ ] **Step 4: Implement exact v1/v2 sampling and normals**
+- [ ] **Step 4: Preserve v1 literally and implement robust v2 sampling/normals**
 
-Replace `heightfield_sample` and add `heightfield_normal`:
+Move the current v1 `heightfield_sample` body into a dedicated legacy helper
+without changing its float operations, comparison order, or edge degeneracy.
+The public function dispatches version 1 to that helper, version 2 to the new
+path, and every other/invalid structure to exterior.
 
 ~~~cpp
 struct heightfield_cell
 {
     int x0, z0;
-    float tx, tz;
+    double tx, tz;
 };
-
-static inline bool heightfield_locate(
-    heightfield_cell& out, const heightfield& field, float x, float z)
-{
-    if (!terrain_float_is_finite(x) || !terrain_float_is_finite(z) ||
-        field.nx < 2 || field.nz < 2 || field.cell_size <= 0.0f) return false;
-    const double gx = (static_cast<double>(x) - field.origin_x) /
-        static_cast<double>(field.cell_size);
-    const double gz = (static_cast<double>(z) - field.origin_z) /
-        static_cast<double>(field.cell_size);
-    if (!isfinite(gx) || !isfinite(gz) || gx < 0.0 || gz < 0.0 ||
-        gx > static_cast<double>(field.nx - 1) ||
-        gz > static_cast<double>(field.nz - 1)) return false;
-    out.x0 = static_cast<int>(floor(gx));
-    out.z0 = static_cast<int>(floor(gz));
-    if (out.x0 == field.nx - 1) out.x0 = field.nx - 2;
-    if (out.z0 == field.nz - 1) out.z0 = field.nz - 2;
-    if (out.x0 < 0 || out.z0 < 0 ||
-        out.x0 + 1 >= field.nx || out.z0 + 1 >= field.nz) return false;
-    out.tx = static_cast<float>(gx - out.x0);
-    out.tz = static_cast<float>(gz - out.z0);
-    return terrain_float_is_finite(out.tx) && terrain_float_is_finite(out.tz);
-}
-
-static inline float heightfield_sample(
-    const heightfield& field, float x, float z)
-{
-    heightfield_cell cell;
-    if (!heightfield_locate(cell, field, x, z)) return field.exterior_height;
-    const int i00 = cell.z0 * field.nx + cell.x0;
-    const float h00 = field.heights(i00);
-    const float h10 = field.heights(i00 + 1);
-    const float h01 = field.heights(i00 + field.nx);
-    const float h11 = field.heights(i00 + field.nx + 1);
-    if (field.version == 1) {
-        return lerpf(
-            lerpf(h00, h10, cell.tx),
-            lerpf(h01, h11, cell.tx), cell.tz);
-    }
-    if (cell.tx >= cell.tz) {
-        return h00 + cell.tx * (h10 - h00) + cell.tz * (h11 - h10);
-    }
-    return h00 + cell.tx * (h11 - h01) + cell.tz * (h01 - h00);
-}
-
-static inline vec3 heightfield_normal(
-    const heightfield& field, float x, float z)
-{
-    heightfield_cell cell;
-    if (!heightfield_locate(cell, field, x, z)) return vec3(0, 1, 0);
-    const int i00 = cell.z0 * field.nx + cell.x0;
-    const float h00 = field.heights(i00);
-    const float h10 = field.heights(i00 + 1);
-    const float h01 = field.heights(i00 + field.nx);
-    const float h11 = field.heights(i00 + field.nx + 1);
-    if (field.version == 1) {
-        const float dx = lerpf(h10 - h00, h11 - h01, cell.tz) /
-            field.cell_size;
-        const float dz = lerpf(h01 - h00, h11 - h10, cell.tx) /
-            field.cell_size;
-        return normalize(vec3(-dx, 1.0f, -dz));
-    }
-    const float c = field.cell_size;
-    const vec3 p00(0, h00, 0), p10(c, h10, 0);
-    const vec3 p01(0, h01, c), p11(c, h11, c);
-    const vec3 n = cell.tx >= cell.tz
-        ? cross(p11 - p00, p10 - p00)
-        : cross(p01 - p00, p11 - p00);
-    return length(n) > 1e-12f ? normalize(n) : vec3(0, 1, 0);
-}
 ~~~
 
-- [ ] **Step 5: Run standard, strict, fast-math, and sanitizer parity gates**
+The v2 locator first bitwise-rejects non-finite or subnormal query inputs and
+canonicalizes either signed zero to positive zero, then promotes accepted float
+metadata/query values to double. It computes explicit double minima/maxima first
+and rejects outside queries before normalization. For each accepted axis, clamp
+the normalized coordinate, then mirror Python's boundary comparisons so an exactly
+representable interior node owns the positive-index cell and the maximum owns
+the final cell with fraction 1. Keep both fractions double through `tx >= tz`.
+As with interpolation, use named volatile-double products/sums/differences for
+node bounds, normalized coordinates, and local fractions so `-ffast-math`
+cannot fuse or reassociate the signed Python operation sequence.
+
+Convert all four finite heights to double before subtraction. Evaluate the
+fixed-triangle convex formulas in double, cast the finite result to float, and
+canonicalize a subnormal or signed-zero result positive. Compare the exact
+output bits with the same FTZ-canonicalized Python oracle in every build
+configuration. Because production uses `-ffast-math`, materialize each
+subtraction, multiplication, and ordered addition in a separately named
+`volatile double` intermediate; do not permit contraction or reassociation to
+change the signed evaluation order.
+For normals, compute the chosen triangle's double gradients, then perform
+scale-safe explicit normalization (scale by the largest absolute component
+before squaring, and materialize the three ordered squares/additions and square
+root input with the same volatile-double discipline), round each component to float, and canonicalize zero
+or subnormal components positive. Do not call Holden `normalize`, which divides by
+`length + 1e-8` and changes a flat nominal-cell normal.
+
+- [ ] **Step 5: Run standard, strict, production-release, and sanitizer gates**
 
 Run:
 
 ~~~bash
+! rg -n '(^|[^_[:alnum:]])assert[[:space:]]*\(' \
+  tests/cpp/test_terrain_runtime.cpp
 g++ -std=c++17 -I. tests/cpp/test_terrain_runtime.cpp \
-  -o /tmp/test_terrain_runtime && /tmp/test_terrain_runtime
+  -o /tmp/test_terrain_runtime
+/tmp/test_terrain_runtime \
+  resources/g1_terrain/terrain_features.bin resources/g1_terrain/terrain.bin 1
 g++ -std=c++17 -Wall -Wextra -Werror -pedantic -I. \
   tests/cpp/test_terrain_runtime.cpp \
-  -o /tmp/test_terrain_runtime_strict && /tmp/test_terrain_runtime_strict
-g++ -std=c++17 -O3 -ffast-math -DNDEBUG -I. \
+  -o /tmp/test_terrain_runtime_strict
+/tmp/test_terrain_runtime_strict \
+  resources/g1_terrain/terrain_features.bin resources/g1_terrain/terrain.bin 1
+g++ -std=c++17 -O3 -ffast-math -march=native -DNDEBUG -I. \
   tests/cpp/test_terrain_runtime.cpp \
-  -o /tmp/test_terrain_runtime_fast && /tmp/test_terrain_runtime_fast
+  -o /tmp/test_terrain_runtime_release
+/tmp/test_terrain_runtime_release \
+  resources/g1_terrain/terrain_features.bin resources/g1_terrain/terrain.bin 1
 g++ -std=c++17 -O1 -g -fsanitize=address,undefined \
   -fno-omit-frame-pointer -I. tests/cpp/test_terrain_runtime.cpp \
-  -o /tmp/test_terrain_runtime_san && /tmp/test_terrain_runtime_san
+  -o /tmp/test_terrain_runtime_san
+ASAN_OPTIONS=halt_on_error=1:detect_leaks=1 \
+UBSAN_OPTIONS=halt_on_error=1 \
+  /tmp/test_terrain_runtime_san \
+  resources/g1_terrain/terrain_features.bin resources/g1_terrain/terrain.bin 1
 ~~~
 
 Expected: all four binaries exit 0 with no output, compiler warning, sanitizer
-report, or v1 regression; v1 returns `0.1875` and v2 returns `0.25` at the
-distinguishing probe.
+report, compiled-away check, or v1 regression. The live published pack loads as
+v1; the in-memory oracle loads as v2.
 
-- [ ] **Step 6: Commit the shared runtime surface primitive**
+- [ ] **Step 6: Compile the real controller and prove Gate A v1 byte stability**
+
+Build with the exact production flags and run the frozen v1 pack:
+
+~~~bash
+g++ -O3 -ffast-math -march=native -DNDEBUG -D_DEFAULT_SOURCE \
+  -DPLATFORM_DESKTOP -I. -I /home/ubuntu/apps/raylib/src \
+  -I /home/ubuntu/apps/raygui/src controller.cpp \
+  -o /tmp/controller_g1_task5 \
+  -L /home/ubuntu/apps/raylib/src -lraylib -lGL -lm -lpthread -ldl -lrt -lX11
+sha256sum --check /tmp/g1_gate_a_before.sha256
+test ! -e /tmp/g1_gate_a_task5.csv
+DISPLAY=:1 G1_TERRAIN_DIR=resources/g1_terrain \
+  MM_TEST_MODE=terrain MM_TERRAIN_WEIGHT=4 MM_TEST_FRAMES=375 \
+  MM_LOG=/tmp/g1_gate_a_task5.csv /tmp/controller_g1_task5
+test "$(wc -l < /tmp/g1_gate_a_task5.csv)" -eq 376
+cmp -s /tmp/g1_gate_a_before.csv /tmp/g1_gate_a_task5.csv
+/home/ubuntu/miniconda3/envs/diffsim/bin/python \
+  resources/check_g1_runtime_log.py /tmp/g1_gate_a_task5.csv --gate-a
+sha256sum --check /tmp/g1_gate_a_before.sha256
+~~~
+
+Expected: production compilation and both checks succeed; the new v1 log is
+byte-identical to frozen Gate A, proving loader migration did not change the
+currently running behavior or artifact bytes.
+
+- [ ] **Step 7: Commit the shared runtime surface primitive**
 
 ~~~bash
 git add terrain_runtime.h tests/cpp/test_terrain_runtime.cpp
@@ -3108,6 +3278,7 @@ Create `tests/python/test_scenes.py`:
 ~~~python
 import hashlib
 import json
+import struct
 import unittest
 
 import numpy as np
@@ -3196,6 +3367,31 @@ class SceneSchemaTests(unittest.TestCase):
         self.assertEqual(
             metadata["walkability"]["sha256"],
             hashlib.sha256(scene.walkability_bin).hexdigest())
+        _, _, nx, nz, ox, oz, cell, _ = struct.unpack_from(
+            "<4sIII4f", scene.terrain_bin)
+        heightfield_min = [float(ox), 0.0, float(oz)]
+        heightfield_max = [
+            float(ox) + (nx - 1) * float(cell), 0.0,
+            float(oz) + (nz - 1) * float(cell),
+        ]
+        vertex_lines = scene.terrain_obj.decode("ascii").splitlines()[:nx * nz]
+        first = vertex_lines[0].split()
+        last = vertex_lines[-1].split()
+        mesh_min = [
+            float(np.float32(first[1])), 0.0,
+            float(np.float32(first[3])),
+        ]
+        mesh_max = [
+            float(np.float32(last[1])), 0.0,
+            float(np.float32(last[3])),
+        ]
+        self.assertEqual(metadata["bounds"]["heightfield_min_xyz"],
+                         heightfield_min)
+        self.assertEqual(metadata["bounds"]["heightfield_max_xyz"],
+                         heightfield_max)
+        self.assertEqual(metadata["bounds"]["mesh_min_xyz"], mesh_min)
+        self.assertEqual(metadata["bounds"]["mesh_max_xyz"], mesh_max)
+        self.assertNotEqual(mesh_max, heightfield_max)
         self.assertEqual(metadata["routes"], [{
             "id": "forward",
             "waypoints_xz": [
@@ -3461,10 +3657,20 @@ def build_scene(definition):
     walkability_bin = walkability_bytes(classes)
     minimum_y = float(grid.heights.min())
     maximum_y = float(grid.heights.max())
-    xmin = grid.origin_x
-    xmax = xmin + (grid.nx - 1) * grid.cell_size
-    zmin = grid.origin_z
-    zmax = zmin + (grid.nz - 1) * grid.cell_size
+    heightfield_xmin = grid.origin_x
+    heightfield_xmax = \
+        heightfield_xmin + (grid.nx - 1) * grid.cell_size
+    heightfield_zmin = grid.origin_z
+    heightfield_zmax = \
+        heightfield_zmin + (grid.nz - 1) * grid.cell_size
+    def obj_coordinate(value):
+        encoded = float(np.float32(value))
+        return 0.0 if encoded == 0.0 else encoded
+
+    mesh_xmin = obj_coordinate(heightfield_xmin)
+    mesh_xmax = obj_coordinate(heightfield_xmax)
+    mesh_zmin = obj_coordinate(heightfield_zmin)
+    mesh_zmax = obj_coordinate(heightfield_zmax)
     metadata = {
         "schema": "g1-terrain-scene/v1",
         "id": definition.scene_id,
@@ -3494,10 +3700,12 @@ def build_scene(definition):
             "sha256": sha256_hex(walkability_bin),
         },
         "bounds": {
-            "mesh_min_xyz": [xmin, minimum_y, zmin],
-            "mesh_max_xyz": [xmax, maximum_y, zmax],
-            "heightfield_min_xyz": [xmin, minimum_y, zmin],
-            "heightfield_max_xyz": [xmax, maximum_y, zmax],
+            "mesh_min_xyz": [mesh_xmin, minimum_y, mesh_zmin],
+            "mesh_max_xyz": [mesh_xmax, maximum_y, mesh_zmax],
+            "heightfield_min_xyz": [
+                heightfield_xmin, minimum_y, heightfield_zmin],
+            "heightfield_max_xyz": [
+                heightfield_xmax, maximum_y, heightfield_zmax],
             "playable_min_xz": [
                 definition.playable_bounds_xz[0],
                 definition.playable_bounds_xz[2]],
@@ -3542,6 +3750,11 @@ def build_scene_pack(definitions):
     }
     return ScenePack(index, scenes)
 ~~~
+
+The heightfield bounds above are the exact promoted-double node rectangle used
+for queries. OBJ X/Z vertices are explicitly binary32-quantized, so the mesh
+bounds record the actual first/last serialized vertex coordinates separately;
+do not assume the two maxima are numerically identical.
 
 - [ ] **Step 5: Run the scene-schema tests**
 
@@ -4175,12 +4388,15 @@ Run:
 /home/ubuntu/miniconda3/envs/diffsim/bin/python -m unittest \
   tests.python.test_scenes -v
 /home/ubuntu/miniconda3/envs/diffsim/bin/python - <<'PY'
+import numpy as np
+
 from resources.g1_terrain_builder.scenes import (
     build_scene, procedural_scene_definitions,
 )
 for definition in procedural_scene_definitions():
     scene = build_scene(definition)
-    assert scene.metadata["heightfield"]["cell_size_m"] == 0.02
+    assert scene.metadata["heightfield"]["cell_size_m"] \
+        == float(np.float32(0.02))
     assert scene.metadata["heightfield"]["sha256"]
     assert scene.metadata["walkability"]["sha256"]
 print("VALID procedural-scenes=10")
@@ -4534,16 +4750,23 @@ Import `grail_surface_parity` and `rasterize_heightfield` in
         vertices = np.array([
             [float(value) for value in line.split()[1:]]
             for line in vertex_lines
-        ])
+        ], dtype=np.float32)
+        def runtime_coordinate(value):
+            encoded = np.float32(value)
+            return np.float32(0.0) if encoded == 0.0 else encoded
         expected = []
         for iz in range(grid.nz):
             for ix in range(grid.nx):
                 expected.append([
-                    grid.origin_x + ix * grid.cell_size,
+                    runtime_coordinate(
+                        grid.origin_x + ix * grid.cell_size),
                     grid.heights[iz, ix],
-                    grid.origin_z + iz * grid.cell_size,
+                    runtime_coordinate(
+                        grid.origin_z + iz * grid.cell_size),
                 ])
-        np.testing.assert_allclose(vertices, expected, atol=1e-6, rtol=0.0)
+        expected = np.asarray(expected, dtype=np.float32)
+        np.testing.assert_array_equal(
+            vertices.view(np.uint32), expected.view(np.uint32))
         expected_faces = []
         for iz in range(grid.nz - 1):
             for ix in range(grid.nx - 1):
@@ -4727,9 +4950,43 @@ The new objects are exact:
       "coordinate_signature": "holden-y-up-right-handed-forward-plus-z",
       "source_query": "vertical-triangle-top",
       "polygon_triangulation": "fan-from-first-index",
+      "overlap_height_policy": "maximum-y",
+      "projected_boundary_policy": "closed",
+      "triangle_winding_policy": "orientation-independent",
+      "degenerate_projected_triangle_policy": "ignore",
+      "projected_area_measure": "absolute-two-times-area",
+      "bbox_tolerance_m": 1e-12,
+      "projected_area_epsilon_m2": 1e-12,
+      "barycentric_tolerance": 1e-10,
       "heightfield_schema": "G1HF/v2",
+      "heightfield_version": 2,
       "heightfield_interpolation": "fixed-diagonal-triangles",
       "heightfield_diagonal": "min-x-min-z_to_max-x-max-z",
+      "heightfield_scalar_encoding": "ieee754-binary32-little-endian",
+      "heightfield_domain_policy": "inclusive-authoritative-node-rectangle",
+      "heightfield_grid_line_policy": "positive-index-cell-except-maximum-edge",
+      "heightfield_diagonal_tie_policy": "tx-greater-or-equal-tz-uses-p00-p10-p11",
+      "heightfield_exterior_normal": [0.0, 1.0, 0.0],
+      "heightfield_source_node_encoding": "binary32-header-values-promoted-to-binary64-arithmetic",
+      "heightfield_runtime_query_encoding": "normal-or-zero-binary32-canonicalized-positive-and-promoted-to-binary64",
+      "heightfield_scalar_domain": "normal-or-zero-binary32",
+      "heightfield_cell_domain": "positive-normal-binary32",
+      "heightfield_runtime_node_domain": "normal-or-zero-binary32",
+      "heightfield_runtime_query_domain": "normal-or-zero-binary32-coordinates",
+      "heightfield_runtime_parity_domain": "normal-or-zero-binary32-coordinates",
+      "heightfield_denormal_policy": "reject-nonzero-binary32-subnormals",
+      "heightfield_evaluation_precision": "binary64-from-binary32-samples-and-promoted-node-weights",
+      "heightfield_runtime_height_output": "finite-binary64-interpolation-rounded-to-binary32",
+      "heightfield_normal_evaluation": "selected-triangle-binary64-gradient-scale-safe-unit-normalization",
+      "heightfield_runtime_normal_output": "unit-normal-components-rounded-to-binary32",
+      "heightfield_runtime_output_ftz_policy": "binary32-subnormals-and-signed-zero-canonicalized-to-positive-zero",
+      "heightfield_zero_encoding": "canonical-positive-zero",
+      "heightfield_runtime_node_distinguishability_policy": "normal-or-positive-zero-strictly-increasing-proven-by-endpoints-near-zero-candidates-max-binary32-spacing-and-aligned-equality",
+      "heightfield_obj_coordinate_quantization": "binary32-round-of-promoted-origin-plus-index-times-cell",
+      "heightfield_raster_bounds_policy": "float32-minimum-rounded-down-and-maximum-ceil-covered",
+      "heightfield_obj_vertex_order": "z-major-x-minor",
+      "heightfield_obj_face_order": "p00-p11-p10_then_p00-p01-p11",
+      "heightfield_obj_float_format": ".9g-final-newline",
       "cell_size_m": 0.02,
       "exterior_height_m": 0.0
     },
@@ -5994,6 +6251,21 @@ _require(ordered_names[1:] == sorted(ordered_names[1:]),
 Replace the v1 `_parse_heightfield`, `_parse_obj`, and coverage functions with:
 
 ~~~python
+def _v2_normal_or_positive_zero(values):
+    encoded = np.asarray(values, dtype="<f4")
+    bits = encoded.view("<u4")
+    exponent = bits & np.uint32(0x7f800000)
+    return (bits == 0) | (
+        (exponent != 0) & (exponent != np.uint32(0x7f800000)))
+
+
+def _v2_positive_normal(value):
+    bits = struct.unpack("<I", struct.pack("<f", value))[0]
+    exponent = bits & 0x7f800000
+    return (bits & 0x80000000) == 0 \
+        and exponent != 0 and exponent != 0x7f800000
+
+
 def _parse_heightfield(path, metadata):
     payload = open(path, "rb").read()
     _require(len(payload) >= _HEIGHTFIELD_HEADER.size,
@@ -6008,10 +6280,13 @@ def _parse_heightfield(path, metadata):
     expected = 32 + nx * nz * 4
     _require(len(payload) == expected,
              f"{path}: truncated or trailing G1HF payload")
-    _require(np.isfinite([ox, oz, cell, exterior]).all() and cell > 0.0,
-             f"{path}: invalid G1HF header values")
+    _require(_v2_normal_or_positive_zero([ox, oz, exterior]).all()
+             and _v2_positive_normal(cell),
+             f"{path}: G1HF/v2 header must be normal-or-positive-zero "
+             "with positive-normal cell")
     heights = np.frombuffer(payload, "<f4", nx * nz, 32).reshape(nz, nx).copy()
-    _require(np.isfinite(heights).all(), f"{path}: non-finite G1HF height")
+    _require(_v2_normal_or_positive_zero(heights).all(),
+             f"{path}: G1HF/v2 heights must be normal-or-positive-zero")
     expected_keys = {
         "path", "schema", "version", "nx", "nz", "origin_x", "origin_z",
         "cell_size_m", "exterior_height_m", "interpolation", "diagonal",
@@ -6031,9 +6306,11 @@ def _parse_heightfield(path, metadata):
         ("cell_size_m", cell), ("exterior_height_m", exterior),
     ):
         expected_value = _finite_number(metadata[key], f"heightfield {key}")
-        _require(np.isclose(expected_value, actual, rtol=0.0, atol=1e-6),
+        _require(expected_value == actual
+                 and struct.pack("<f", expected_value)
+                 == struct.pack("<f", actual),
                  f"scene heightfield {key} mismatch")
-    _require(metadata["cell_size_m"] == 0.02
+    _require(metadata["cell_size_m"] == float(np.float32(0.02))
              and cell == float(np.float32(0.02)),
              "scene heightfield cell size must be 0.02")
     _require(metadata["exterior_height_m"] == 0.0 and exterior == 0.0,
@@ -6221,22 +6498,39 @@ def _validate_scene(root, scene_id, manifest_surface_signature):
         bounds, "playable_min_xz", "playable_max_xz", 2, "playable")
     lookahead_min, lookahead_max = _bounds_pair(
         bounds, "lookahead_min_xz", "lookahead_max_xz", 2, "lookahead")
-    derived_min = np.array([
+    heightfield_derived_min = np.array([
         grid.origin_x, float(grid.heights.min()), grid.origin_z])
-    derived_max = np.array([
+    heightfield_derived_max = np.array([
         grid.origin_x + (grid.nx - 1) * grid.cell_size,
         float(grid.heights.max()),
         grid.origin_z + (grid.nz - 1) * grid.cell_size])
-    for label, actual in (
-        ("mesh minimum", mesh_min), ("heightfield minimum", height_min)):
-        _require(np.allclose(actual, derived_min, rtol=0.0, atol=1e-6),
-                 f"{scene_id}: {label} mismatch")
-    for label, actual in (
-        ("mesh maximum", mesh_max), ("heightfield maximum", height_max)):
-        _require(np.allclose(actual, derived_max, rtol=0.0, atol=1e-6),
+    def obj_coordinate(value):
+        encoded = float(np.float32(value))
+        return 0.0 if encoded == 0.0 else encoded
+
+    mesh_derived_min = np.array([
+        obj_coordinate(heightfield_derived_min[0]),
+        heightfield_derived_min[1],
+        obj_coordinate(heightfield_derived_min[2]),
+    ])
+    mesh_derived_max = np.array([
+        obj_coordinate(heightfield_derived_max[0]),
+        heightfield_derived_max[1],
+        obj_coordinate(heightfield_derived_max[2]),
+    ])
+    for label, actual, expected in (
+        ("mesh minimum", mesh_min, mesh_derived_min),
+        ("mesh maximum", mesh_max, mesh_derived_max),
+        ("heightfield minimum", height_min, heightfield_derived_min),
+        ("heightfield maximum", height_max, heightfield_derived_max),
+    ):
+        _require(np.array_equal(
+            np.asarray(actual, np.float64).view(np.uint64),
+            np.asarray(expected, np.float64).view(np.uint64)),
                  f"{scene_id}: {label} mismatch")
     grid_bounds = (
-        derived_min[0], derived_max[0], derived_min[2], derived_max[2])
+        heightfield_derived_min[0], heightfield_derived_max[0],
+        heightfield_derived_min[2], heightfield_derived_max[2])
     playable = (
         playable_min[0], playable_max[0], playable_min[1], playable_max[1])
     lookahead = (
@@ -6530,6 +6824,101 @@ subtest:
                     stream.write(canonical_json_bytes(scene))
 
             rejection("diagonal", "heightfield diagonal mismatch", corrupt_diagonal)
+
+            def corrupt_exact_origin_metadata(preserve):
+                path = preserve(scene_relative)
+                with open(path) as stream:
+                    scene = json.load(stream)
+                scene["heightfield"]["origin_x"] = float(np.nextafter(
+                    np.float32(scene["heightfield"]["origin_x"]),
+                    np.float32(np.inf)))
+                with open(path, "wb") as stream:
+                    stream.write(canonical_json_bytes(scene))
+
+            rejection(
+                "exact_origin_metadata", "heightfield origin_x mismatch",
+                corrupt_exact_origin_metadata)
+
+            def corrupt_distinct_bounds(preserve):
+                path = preserve(scene_relative)
+                with open(path) as stream:
+                    scene = json.load(stream)
+                # These maxima intentionally have different authorities: the
+                # heightfield uses promoted-double nodes; OBJ uses binary32.
+                scene["bounds"]["mesh_max_xyz"] = \
+                    list(scene["bounds"]["heightfield_max_xyz"])
+                with open(path, "wb") as stream:
+                    stream.write(canonical_json_bytes(scene))
+
+            rejection(
+                "distinct_mesh_bounds", "mesh maximum mismatch",
+                corrupt_distinct_bounds)
+
+            def corrupt_subnormal_header(preserve):
+                relative = os.path.join(
+                    "scenes", "stairs-shallow", "terrain.bin")
+                terrain_path = preserve(relative)
+                with open(terrain_path, "rb") as stream:
+                    payload = bytearray(stream.read())
+                struct.pack_into("<I", payload, 28, 1)  # exterior = +min subnormal
+                with open(terrain_path, "wb") as stream:
+                    stream.write(payload)
+                scene_path = preserve(scene_relative)
+                with open(scene_path) as stream:
+                    scene = json.load(stream)
+                scene["heightfield"]["exterior_height_m"] = \
+                    float(np.frombuffer(struct.pack("<I", 1), "<f4")[0])
+                scene["heightfield"]["sha256"] = \
+                    hashlib.sha256(payload).hexdigest()
+                with open(scene_path, "wb") as stream:
+                    stream.write(canonical_json_bytes(scene))
+
+            rejection(
+                "coordinated_subnormal_header", "normal-or-positive-zero",
+                corrupt_subnormal_header)
+
+            def corrupt_negative_zero_header(preserve):
+                relative = os.path.join(
+                    "scenes", "stairs-shallow", "terrain.bin")
+                terrain_path = preserve(relative)
+                with open(terrain_path, "rb") as stream:
+                    payload = bytearray(stream.read())
+                struct.pack_into("<I", payload, 28, 0x80000000)
+                with open(terrain_path, "wb") as stream:
+                    stream.write(payload)
+                scene_path = preserve(scene_relative)
+                with open(scene_path) as stream:
+                    scene = json.load(stream)
+                scene["heightfield"]["exterior_height_m"] = -0.0
+                scene["heightfield"]["sha256"] = \
+                    hashlib.sha256(payload).hexdigest()
+                with open(scene_path, "wb") as stream:
+                    stream.write(canonical_json_bytes(scene))
+
+            rejection(
+                "coordinated_negative_zero_header", "positive-zero",
+                corrupt_negative_zero_header)
+
+            def corrupt_subnormal_payload(preserve):
+                relative = os.path.join(
+                    "scenes", "stairs-shallow", "terrain.bin")
+                terrain_path = preserve(relative)
+                with open(terrain_path, "rb") as stream:
+                    payload = bytearray(stream.read())
+                struct.pack_into("<I", payload, 32, 1)  # first height sample
+                with open(terrain_path, "wb") as stream:
+                    stream.write(payload)
+                scene_path = preserve(scene_relative)
+                with open(scene_path) as stream:
+                    scene = json.load(stream)
+                scene["heightfield"]["sha256"] = \
+                    hashlib.sha256(payload).hexdigest()
+                with open(scene_path, "wb") as stream:
+                    stream.write(canonical_json_bytes(scene))
+
+            rejection(
+                "coordinated_subnormal_payload", "normal-or-positive-zero",
+                corrupt_subnormal_payload)
 
             def corrupt_route(preserve):
                 path = preserve(scene_relative)
@@ -6861,6 +7250,8 @@ Run the four configurations independently so one failure cannot be hidden by a
 later command:
 
 ~~~bash
+! rg -n '(^|[^_[:alnum:]])assert[[:space:]]*\(' \
+  tests/cpp/test_terrain_runtime.cpp
 g++ -std=c++17 -O0 -g -I. tests/cpp/test_terrain_runtime.cpp \
   -o /tmp/test_terrain_runtime_debug
 /tmp/test_terrain_runtime_debug
@@ -6868,14 +7259,15 @@ g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
   tests/cpp/test_terrain_runtime.cpp \
   -o /tmp/test_terrain_runtime_strict
 /tmp/test_terrain_runtime_strict
-g++ -std=c++17 -O3 -ffast-math -DNDEBUG -I. \
+g++ -std=c++17 -O3 -ffast-math -march=native -DNDEBUG -I. \
   tests/cpp/test_terrain_runtime.cpp \
   -o /tmp/test_terrain_runtime_release
 /tmp/test_terrain_runtime_release
 g++ -std=c++17 -O1 -g -fsanitize=address,undefined \
   -fno-omit-frame-pointer -I. tests/cpp/test_terrain_runtime.cpp \
   -o /tmp/test_terrain_runtime_san
-ASAN_OPTIONS=detect_leaks=1 /tmp/test_terrain_runtime_san
+ASAN_OPTIONS=halt_on_error=1:detect_leaks=1 \
+UBSAN_OPTIONS=halt_on_error=1 /tmp/test_terrain_runtime_san
 ~~~
 
 Expected: every compile and executable exits 0, strict compilation emits no
@@ -6903,10 +7295,10 @@ summary: `support_dims=3 scenes=14 source_rows=0`. The builder has scanned all
 1,769 candidate meshes for stable GRAIL selection even though it converted only
 one GRAIL motion into the diagnostic database.
 
-- [ ] **Step 5: Probe Python/C++ bytes for every diagnostic G1HF/v2 scene**
+- [ ] **Step 5: Probe every diagnostic G1HF/v2 scene through the C++ consumer**
 
-The artifact-owned C++ test binary accepts a G1TF path and one G1HF path after
-its self-tests. Run it once per ordered scene:
+The artifact-owned C++ test binary accepts a G1TF path, one G1HF path, and the
+exact expected G1HF version after its self-tests. Run it once per ordered scene:
 
 ~~~bash
 /home/ubuntu/miniconda3/envs/diffsim/bin/python - <<'PY' \
@@ -6921,12 +7313,14 @@ while IFS= read -r scene_id
 do
   /tmp/test_terrain_runtime_strict \
     /tmp/g1_terrain_scene_diagnostic/terrain_features.bin \
-    "/tmp/g1_terrain_scene_diagnostic/scenes/${scene_id}/terrain.bin"
+    "/tmp/g1_terrain_scene_diagnostic/scenes/${scene_id}/terrain.bin" 2
 done < /tmp/g1_scene_ids.txt
 ~~~
 
 Expected: 14 exit-0 probes, with G1TF rows equal to the diagnostic database
-frame count and every terrain reporting G1HF/v2. When the sibling runtime plan
+frame count and every terrain reporting G1HF/v2. Exact independent Python/C++
+byte parity is already locked by Task 5's awkward-metadata oracle; this loop
+checks every produced scene through the real loader/sampler. When the sibling runtime plan
 has added G1SP/G1WM arguments to this same probe, use its extended exact CLI as
 well; that extension must not replace this G1HF parity loop.
 
@@ -7070,7 +7464,8 @@ for scene_id in expected_ids:
     assert header[0:2] == (b"G1HF", 2)
     assert scene["heightfield"]["diagonal"] \
         == "min-x-min-z_to_max-x-max-z"
-    assert scene["heightfield"]["cell_size_m"] == 0.02
+    assert scene["heightfield"]["cell_size_m"] == header[6]
+    assert abs(header[6] - 0.02) < 1e-8
     for descriptor, filename in (
         (scene["heightfield"], "terrain.bin"),
         (scene["mesh"], "terrain.obj"),
@@ -7104,7 +7499,7 @@ while IFS= read -r scene_id
 do
   /tmp/test_terrain_runtime_strict \
     resources/g1_terrain/terrain_features.bin \
-    "resources/g1_terrain/scenes/${scene_id}/terrain.bin"
+    "resources/g1_terrain/scenes/${scene_id}/terrain.bin" 2
 done < /tmp/g1_published_scene_ids.txt
 ~~~
 
