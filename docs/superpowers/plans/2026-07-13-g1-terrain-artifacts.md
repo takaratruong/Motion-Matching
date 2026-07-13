@@ -871,6 +871,7 @@ git commit -m "feat: convert native G1 motion to Holden bones"
 **Interfaces:**
 - Produces: FlatTerrain.height(x: float, z: float) -> float.
 - Produces: GrailTerrain.from_base(base: str) -> GrailTerrain.
+- Produces: GrailTerrain.export_obj(path: str) -> None from the same transformed source mesh.
 - Produces: build_facing_centerline(root_xz, headings_xz, path_xz) -> ndarray.
 - Produces: sample_terrain_features(terrain, centerline) -> ndarray shape (4,).
 - Produces: export_heightfield(terrain, bounds, cell_size, path) -> dict.
@@ -881,9 +882,12 @@ git commit -m "feat: convert native G1 motion to Holden bones"
 # tests/python/test_terrain.py
 import tempfile
 import unittest
+import os
+import struct
 import numpy as np
 from resources.g1_terrain_builder.terrain import (
-    StepTerrain, build_facing_centerline, sample_terrain_features,
+    StepTerrain, build_facing_centerline, export_heightfield,
+    sample_terrain_features,
 )
 
 
@@ -900,6 +904,23 @@ class TerrainTests(unittest.TestCase):
         line = np.array([[0, 0], [.25, 0], [.5, 0], [.75, 0], [1, 0]])
         f = sample_terrain_features(terrain, line)
         np.testing.assert_allclose(f, [0.0, 0.29, 0.29, 0.29], atol=1e-6)
+
+    def test_heightfield_binary_contract(self):
+        terrain = StepTerrain(edge_x=0.5, height=0.29)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "terrain.bin")
+            meta = export_heightfield(
+                terrain, (0.0, 1.0, 0.0, 1.0), 0.5, path)
+            with open(path, "rb") as stream:
+                header = stream.read(struct.calcsize("<4sIII4f"))
+                magic, version, nx, nz, ox, oz, cell, exterior = \
+                    struct.unpack("<4sIII4f", header)
+                values = np.frombuffer(stream.read(), dtype="<f4")
+        self.assertEqual((magic, version, nx, nz), (b"G1HF", 1, 3, 3))
+        self.assertEqual(meta["nx"], 3)
+        np.testing.assert_allclose([ox, oz, cell, exterior], [0,0,.5,0])
+        np.testing.assert_allclose(
+            values.reshape(nz, nx)[0], [0.0, 0.29, 0.29], atol=1e-6)
 
 
 if __name__ == "__main__":
@@ -991,9 +1012,10 @@ def sample_terrain_features(terrain, centerline: np.ndarray) -> np.ndarray:
 
 Move the validated USD mesh loading, quad densification, reconstruction transform,
 and KD-tree height lookup from /home/ubuntu/projects/g1_mm/terrain.py into the
-same file as GrailTerrain. Convert MuJoCo (x, y, z) points to Holden terrain
-coordinates (x, z, -y) before constructing the XZ KD-tree, and return Holden Y
-as height.
+same file as GrailTerrain. Replace its random triangle-fan samples with a fixed
+barycentric lattice so identical inputs produce byte-identical artifacts.
+Convert MuJoCo (x, y, z) points to Holden terrain coordinates (x, z, -y) before
+constructing the XZ KD-tree, and return Holden Y as height.
 
 Add heightfield export with the runtime plan's exact binary contract:
 
@@ -1017,7 +1039,9 @@ def export_heightfield(terrain, bounds, cell_size: float, path: str) -> dict:
 
 Export terrain.obj from the same transformed vertices and face indices. Write
 v x y z lines in Holden coordinates and one-based f indices. Do not use the
-densified query points as render vertices.
+densified query points as render vertices. Implement this as
+`GrailTerrain.export_obj(path)` and preserve the USD face winding under the
+right-handed coordinate change.
 
 - [ ] **Step 4: Add a real GRAIL alignment assertion**
 
@@ -1031,6 +1055,19 @@ from resources.g1_terrain_builder.terrain import GrailTerrain
         footprint = terrain.footprint()
         self.assertGreater(footprint["height"], 0.1)
         self.assertLess(footprint["height"], 0.5)
+        cx = 0.5 * (footprint["x"][0] + footprint["x"][1])
+        cz = 0.5 * (footprint["z"][0] + footprint["z"][1])
+        self.assertAlmostEqual(terrain.height(cx, cz), footprint["height"], places=2)
+        with tempfile.TemporaryDirectory() as tmp:
+            first = os.path.join(tmp, "first.obj")
+            second = os.path.join(tmp, "second.obj")
+            terrain.export_obj(first)
+            terrain.export_obj(second)
+            with open(first, "rb") as a, open(second, "rb") as b:
+                self.assertEqual(a.read(), b.read())
+            text = open(first, encoding="utf-8").read()
+        self.assertIn("\nv ", "\n" + text)
+        self.assertIn("\nf ", "\n" + text)
 ~~~
 
 Run:
@@ -1039,7 +1076,7 @@ Run:
 /home/ubuntu/miniconda3/envs/diffsim/bin/python -m unittest tests.python.test_terrain -v
 ~~~
 
-Expected: 3 tests, OK.
+Expected: 4 tests, OK.
 
 - [ ] **Step 5: Commit terrain sampling**
 
