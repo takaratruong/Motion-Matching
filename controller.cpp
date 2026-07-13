@@ -15,6 +15,7 @@
 #include "database.h"
 #include "g1_skeleton.h"
 #include "terrain_runtime.h"
+#include "motion_match_log.h"
 #include "nnet.h"
 #include "lmm.h"
 
@@ -131,6 +132,85 @@ static bool g1_parse_test_frames(
     }
     frame_limit = static_cast<int>(parsed);
     return true;
+}
+
+enum g1_test_mode { G1_TestLive, G1_TestSequential, G1_TestFlat, G1_TestTerrain };
+
+struct g1_test_config
+{
+    g1_test_mode mode = G1_TestLive;
+    const char* name = "live";
+    const char* route = "manual";
+    int frame_limit = 0;
+};
+
+static bool g1_parse_test_config(
+    g1_test_config& out, char* error, const int error_capacity)
+{
+    const char* mode = getenv("MM_TEST_MODE");
+    if (mode != NULL) {
+        if (strcmp(mode, "sequential") == 0) {
+            out.mode = G1_TestSequential; out.name = mode;
+            out.route = "curb-forward";
+        } else if (strcmp(mode, "flat") == 0) {
+            out.mode = G1_TestFlat; out.name = mode;
+            out.route = "curb-forward";
+        } else if (strcmp(mode, "terrain") == 0) {
+            out.mode = G1_TestTerrain; out.name = mode;
+            out.route = "curb-forward";
+        } else {
+            return g1_error(error, error_capacity,
+                "MM_TEST_MODE must be sequential, flat, or terrain, got '%s'",
+                mode);
+        }
+    }
+    if (!g1_parse_test_frames(out.frame_limit, error, error_capacity)) {
+        return false;
+    }
+    if (out.mode != G1_TestLive && out.frame_limit <= 0) {
+        return g1_error(
+            error, error_capacity,
+            "MM_TEST_FRAMES must be set to a positive integer for %s mode",
+            out.name);
+    }
+    return true;
+}
+
+static motion_match_pose_diagnostic g1_pose_diagnostic(
+    const slice1d<vec3> local_positions,
+    const slice1d<quat> local_rotations,
+    const slice1d<int> parents,
+    const heightfield& terrain)
+{
+    array1d<vec3> positions(local_positions.size);
+    array1d<quat> rotations(local_rotations.size);
+    forward_kinematics_full(
+        positions, rotations, local_positions, local_rotations, parents);
+    motion_match_pose_diagnostic out;
+    out.hips_y = positions(G1_Hips).y;
+    out.hips_clearance = positions(G1_Hips).y - heightfield_sample(
+        terrain, positions(G1_Hips).x, positions(G1_Hips).z);
+    out.left_toe_clearance = positions(G1_LeftToe).y - heightfield_sample(
+        terrain, positions(G1_LeftToe).x, positions(G1_LeftToe).z);
+    out.right_toe_clearance = positions(G1_RightToe).y - heightfield_sample(
+        terrain, positions(G1_RightToe).x, positions(G1_RightToe).z);
+    out.minimum_clearance = out.hips_clearance;
+    const int probes[] = {
+        G1_LeftKnee, G1_RightKnee, G1_LeftAnkle, G1_RightAnkle,
+        G1_LeftToe, G1_RightToe
+    };
+    for (int i = 0; i < 6; ++i) {
+        const vec3 p = positions(probes[i]);
+        out.minimum_clearance = minf(
+            out.minimum_clearance,
+            p.y - heightfield_sample(terrain, p.x, p.z));
+    }
+    return out;
+}
+
+static float g1_xz_length(const vec3 value)
+{
+    return sqrtf(value.x * value.x + value.z * value.z);
 }
 
 template<typename T>
@@ -1623,19 +1703,52 @@ int main(void)
     float feature_weight_trajectory_positions = 1.0f;
     float feature_weight_trajectory_directions = 1.5f;
     float feature_weight_terrain = 0.0f;
-    int test_frame_limit = 0;
+    g1_test_config test_config;
     if (!g1_parse_terrain_weight(
             feature_weight_terrain,
             artifact_error,
             static_cast<int>(sizeof(artifact_error))) ||
-        !g1_parse_test_frames(
-            test_frame_limit,
+        !g1_parse_test_config(
+            test_config,
             artifact_error,
             static_cast<int>(sizeof(artifact_error))))
     {
         fprintf(stderr, "G1 terrain option error: %s\n", artifact_error);
         return 2;
     }
+#if defined(PLATFORM_WEB)
+    // Deterministic controller tests require a bounded desktop update loop.
+    if (test_config.mode != G1_TestLive || test_config.frame_limit > 0) {
+        fprintf(stderr,
+            "G1 terrain option error: bounded MM_TEST_MODE/MM_TEST_FRAMES "
+            "runs are desktop-only\n");
+        return 2;
+    }
+#if !defined(MM_DISCRETE)
+    // Deterministic CSV cleanup cannot run after the Emscripten main loop.
+    if (getenv("MM_LOG") != NULL) {
+        fprintf(stderr,
+            "G1 runtime log error: deterministic CSV MM_LOG is "
+            "desktop-only\n");
+        return 2;
+    }
+#endif
+#endif
+    if (test_config.mode == G1_TestFlat ||
+        test_config.mode == G1_TestSequential) {
+        feature_weight_terrain = 0.0f;
+    } else if (test_config.mode == G1_TestTerrain &&
+               getenv("MM_TERRAIN_WEIGHT") == NULL) {
+        feature_weight_terrain = 4.0f;
+    }
+#ifdef MM_DISCRETE
+    if (test_config.mode != G1_TestLive) {
+        fprintf(stderr,
+            "G1 terrain option error: MM_TEST_MODE is unavailable in "
+            "MM_DISCRETE builds\n");
+        return 2;
+    }
+#endif
 
     terrain_feature_set terrain_rows;
     heightfield runtime_terrain;
@@ -1678,6 +1791,17 @@ int main(void)
         fprintf(stderr, "G1 skeleton error: %s\n", artifact_error);
         return 2;
     }
+    if (test_config.mode == G1_TestSequential) {
+        const int sequential_frames =
+            db.range_stops(0) - db.range_starts(0) - 1;
+        if (test_config.frame_limit > sequential_frames) {
+            fprintf(stderr,
+                "G1 sequential test overrun: MM_TEST_FRAMES=%d exceeds "
+                "the initial range capacity %d\n",
+                test_config.frame_limit, sequential_frames);
+            return 2;
+        }
+    }
 
     database_build_matching_features(
         db,
@@ -1696,6 +1820,7 @@ int main(void)
         fprintf(stderr, "G1 feature error: %s\n", artifact_error);
         return 2;
     }
+    float applied_feature_weight_terrain = feature_weight_terrain;
 
     // Open the graphics window only after every artifact and feature gate has
     // passed, so startup errors stay useful on headless systems.
@@ -1974,10 +2099,36 @@ int main(void)
     bool controller_exit_requested = false;
     int controller_exit_code = 0;
 
+    motion_match_log deterministic_log;
+#ifndef MM_DISCRETE
+    const char* deterministic_log_path = getenv("MM_LOG");
+#else
+    // MM_DISCRETE owns MM_LOG for its legacy text diagnostics.
+    const char* deterministic_log_path = NULL;
+#endif
+    if (deterministic_log_path != NULL && lmm_enabled) {
+        fprintf(stderr,
+            "G1 runtime log error: database-frame logging is unavailable "
+            "with learned motion matching\n");
+        UnloadModel(terrain_model);
+        CloseWindow();
+        return 2;
+    }
+    if (!deterministic_log.open(
+            deterministic_log_path,
+            artifact_error, (int)sizeof(artifact_error))) {
+        fprintf(stderr, "G1 runtime log error: %s\n", artifact_error);
+        UnloadModel(terrain_model);
+        CloseWindow();
+        return 2;
+    }
+    const bool logging_enabled = deterministic_log.file != NULL;
+
     auto update_func = [&]()
     {
 
 #ifdef MM_DISCRETE
+        if (test_config.mode == G1_TestLive) {
         // Camera-azimuth scripting. MM_MODE selects the pattern:
         //   0 (default): a few big 90-deg snaps (arrow taps)
         //   1: rapid alternating +/-90 snaps every N frames (arrow mashing)
@@ -2006,23 +2157,36 @@ int main(void)
             // alternating 180-deg azimuth snaps -> antipodal desired_rotation
             if (g_frame >= 60 && (g_frame % snapN) == 0) camera_azimuth += PIf;
         }
+        }
 #endif
 
         // Get gamepad stick states
         vec3 gamepadstick_left = gamepad_get_stick(GAMEPAD_STICK_LEFT);
         vec3 gamepadstick_right = gamepad_get_stick(GAMEPAD_STICK_RIGHT);
+        if (test_config.mode != G1_TestLive) {
+            gamepadstick_left = vec3(0.0f, 0.0f, 0.9f);
+            gamepadstick_right = vec3();
+        }
 
         // Get if strafe is desired
         bool desired_strafe = desired_strafe_update();
 #ifdef MM_DISCRETE
         desired_strafe = g_force_strafe;
 #endif
+        if (test_config.mode != G1_TestLive) {
+            desired_strafe = false;
+        }
         
         // Get the desired gait (walk / run)
-        desired_gait_update(
-            desired_gait,
-            desired_gait_velocity,
-            dt);
+        if (test_config.mode != G1_TestLive) {
+            desired_gait = 0.0f;
+            desired_gait_velocity = 0.0f;
+        } else {
+            desired_gait_update(
+                desired_gait,
+                desired_gait_velocity,
+                dt);
+        }
         
         // Get the desired simulation speeds based on the gait
         float simulation_fwrd_speed = lerpf(simulation_run_fwrd_speed, simulation_walk_fwrd_speed, desired_gait);
@@ -2051,6 +2215,9 @@ int main(void)
         desired_velocity_change_prev = desired_velocity_change_curr;
         desired_velocity_change_curr =  (desired_velocity_curr - desired_velocity) / dt;
         desired_velocity = desired_velocity_curr;
+        if (rendered_frames == 0) {
+            trajectory_desired_velocities.set(desired_velocity);
+        }
         
         desired_rotation_change_prev = desired_rotation_change_curr;
         desired_rotation_change_curr = quat_to_scaled_angle_axis(quat_abs(quat_mul_inv(desired_rotation_curr, desired_rotation))) / dt;
@@ -2136,9 +2303,19 @@ int main(void)
         query_compute_trajectory_position_feature(query, offset, bone_positions(0), bone_rotations(0), trajectory_positions);
         query_compute_trajectory_direction_feature(query, offset, bone_rotations(0), trajectory_rotations);
 
-        const int terrain_query_frame = frame_index;
-        const int terrain_query_range =
-            g1_active_range(db, terrain_query_frame);
+        const int query_database_frame = frame_index;
+        const int query_range = g1_active_range(db, query_database_frame);
+        if (!terrain_heightfield_is_queryable(runtime_terrain) ||
+            !terrain_centerline_inputs_are_valid(
+                bone_positions(0),
+                trajectory_positions,
+                trajectory_rotations)) {
+            fprintf(stderr,
+                "G1 runtime query error: terrain centerline inputs are invalid\n");
+            controller_exit_code = 2;
+            controller_exit_requested = true;
+            return;
+        }
         terrain_centerline_snapshot terrain_query_snapshot = {};
         terrain_centerline_snapshot_compute(
             terrain_query_snapshot,
@@ -2146,26 +2323,72 @@ int main(void)
             bone_positions(0),
             trajectory_positions,
             trajectory_rotations);
+        for (int terrain_feature = 0; terrain_feature < 4; ++terrain_feature) {
+            const vec3 point = terrain_query_snapshot.points[terrain_feature];
+            if (!terrain_float_is_finite(
+                    terrain_query_snapshot.values[terrain_feature]) ||
+                !terrain_float_is_finite(point.x) ||
+                !terrain_float_is_finite(point.y) ||
+                !terrain_float_is_finite(point.z)) {
+                fprintf(stderr,
+                    "G1 runtime query error: terrain snapshot %d is invalid\n",
+                    terrain_feature);
+                controller_exit_code = 2;
+                controller_exit_requested = true;
+                return;
+            }
+        }
         for (int terrain_feature = 0; terrain_feature < 4; ++terrain_feature)
         {
             query(offset++) = terrain_query_snapshot.values[terrain_feature];
         }
 
         assert(offset == db.nfeatures());
+        if (!motion_match_query_is_finite_31d(query)) {
+            fprintf(stderr,
+                "G1 runtime query error: expected 31 finite query values\n");
+            controller_exit_code = 2;
+            controller_exit_requested = true;
+            return;
+        }
 
         // Check if we reached the end of the current anim
         bool end_of_anim = database_trajectory_index_clamp(db, frame_index, 1) == frame_index;
+        if (test_config.mode == G1_TestSequential && end_of_anim) {
+            fprintf(stderr,
+                "G1 sequential test overrun at database frame %d before "
+                "MM_TEST_FRAMES=%d\n",
+                frame_index, test_config.frame_limit);
+            controller_exit_code = 2;
+            controller_exit_requested = true;
+            return;
+        }
+        const bool matching_enabled = test_config.mode != G1_TestSequential;
+        const bool search_requested = matching_enabled &&
+            (force_search || search_timer <= 0.0f || end_of_anim);
+        float incumbent_cost = 0.0f;
+        float selected_cost = 0.0f;
+        float selected_terrain_error = 0.0f;
+        if (logging_enabled) {
+            incumbent_cost = end_of_anim
+                ? FLT_MAX : database_frame_cost(db, frame_index, query);
+            selected_cost = incumbent_cost;
+            selected_terrain_error = database_raw_terrain_error(
+                db, frame_index, query);
+        }
+        int selected_database_frame = query_database_frame;
+        bool transitioned = false;
         
         // Do we need to search?
 #ifdef MM_DISCRETE
         int   dbg_best_index = frame_index;   // -1 == no search this frame
-        bool  dbg_did_search = (force_search || search_timer <= 0.0f || end_of_anim);
+        bool  dbg_did_search = search_requested;
         bool  dbg_did_transition = false;
         quat  dbg_root_before = bone_rotations(0);
         quat  dbg_off_before  = bone_offset_rotations(0);
         quat  dbg_trns_dst_rot = trns_bone_rotations(0);
 #endif
-        if (force_search || search_timer <= 0.0f || end_of_anim)
+        if (search_requested)
         {
             if (lmm_enabled)
             {
@@ -2244,11 +2467,18 @@ int main(void)
                     best_cost,
                     db,
                     query);
+                selected_database_frame = best_index;
+                if (logging_enabled) {
+                    selected_cost = best_cost;
+                    selected_terrain_error = database_raw_terrain_error(
+                        db, best_index, query);
+                }
                 
                 // Transition if better frame found
                 
                 if (best_index != frame_index)
                 {
+                    transitioned = true;
                     trns_bone_positions = db.bone_positions(best_index);
                     trns_bone_velocities = db.bone_velocities(best_index);
                     trns_bone_rotations = db.bone_rotations(best_index);
@@ -2322,7 +2552,8 @@ int main(void)
         else
         {
             // Tick frame
-            frame_index++; // The database and controller both advance at 25 Hz.
+            frame_index = database_trajectory_index_clamp(
+                db, frame_index, 1);
             
             // Look-up Next Pose
             curr_bone_positions = db.bone_positions(frame_index);
@@ -2353,6 +2584,23 @@ int main(void)
             transition_dst_rotation,
             inertialize_blending_halflife,
             dt);
+
+        motion_match_pose_diagnostic raw_selected_diagnostic;
+        motion_match_pose_diagnostic inertialized_diagnostic;
+        vec3 root_before_adjustment;
+        if (logging_enabled) {
+            array1d<vec3> raw_selected_positions(curr_bone_positions);
+            array1d<quat> raw_selected_rotations(curr_bone_rotations);
+            raw_selected_positions(0) = bone_positions(0);
+            raw_selected_rotations(0) = bone_rotations(0);
+            raw_selected_diagnostic = g1_pose_diagnostic(
+                raw_selected_positions, raw_selected_rotations,
+                db.bone_parents, runtime_terrain);
+            inertialized_diagnostic = g1_pose_diagnostic(
+                bone_positions, bone_rotations,
+                db.bone_parents, runtime_terrain);
+            root_before_adjustment = bone_positions(0);
+        }
         
         // Update Simulation
         
@@ -2451,6 +2699,11 @@ int main(void)
                 adjusted_position,
                 adjusted_rotation);
         }
+
+        vec3 root_after_adjustment;
+        if (logging_enabled) {
+            root_after_adjustment = bone_positions(0);
+        }
         
         // Clamping
         
@@ -2479,6 +2732,85 @@ int main(void)
                 bone_rotations(0),
                 adjusted_position,
                 adjusted_rotation);
+        }
+
+        if (logging_enabled) {
+            const vec3 root_after_clamp = bone_positions(0);
+            const motion_match_pose_diagnostic rendered_diagnostic =
+                g1_pose_diagnostic(
+                bone_positions, bone_rotations,
+                db.bone_parents, runtime_terrain);
+            array1d<vec3> rendered_global(db.nbones());
+            array1d<quat> rendered_global_rotations(db.nbones());
+            forward_kinematics_full(
+                rendered_global, rendered_global_rotations,
+                bone_positions, bone_rotations, db.bone_parents);
+            char query_bits_hex[31 * 8 + 1] = {};
+            if (!motion_match_query_bits_hex(
+                    query_bits_hex, sizeof(query_bits_hex), query)) {
+                fprintf(stderr,
+                    "G1 runtime query error: cannot serialize finite query\n");
+                controller_exit_code = 2;
+                controller_exit_requested = true;
+                return;
+            }
+            motion_match_log_row log_row;
+            log_row.frame = rendered_frames;
+            log_row.fixed_dt = dt;
+            log_row.mode = test_config.name;
+            log_row.route = test_config.route;
+            log_row.query_bits_hex = query_bits_hex;
+            log_row.query_database_frame = query_database_frame;
+            log_row.query_range = query_range;
+            log_row.selected_database_frame = selected_database_frame;
+            log_row.database_frame = frame_index;
+            log_row.range = g1_active_range(db, frame_index);
+            log_row.source_range = g1_active_range(
+                db, selected_database_frame);
+            log_row.searched = search_requested;
+            log_row.transitioned = transitioned;
+            log_row.incumbent_cost = incumbent_cost;
+            log_row.selected_cost = selected_cost;
+            log_row.selected_terrain_error = selected_terrain_error;
+            log_row.effective_terrain_weight =
+                applied_feature_weight_terrain;
+            for (int i = 0; i < 4; ++i) {
+                log_row.terrain[i] = terrain_query_snapshot.values[i];
+                log_row.terrain_points[i] = terrain_query_snapshot.points[i];
+            }
+            log_row.raw_selected = raw_selected_diagnostic;
+            log_row.inertialized = inertialized_diagnostic;
+            log_row.rendered = rendered_diagnostic;
+            log_row.hips_inertial_offset_y =
+                inertialized_diagnostic.hips_y -
+                raw_selected_diagnostic.hips_y;
+            log_row.runtime_root_surface_height = heightfield_sample(
+                runtime_terrain, bone_positions(0).x, bone_positions(0).z);
+            log_row.runtime_left_toe_surface_height = heightfield_sample(
+                runtime_terrain, rendered_global(G1_LeftToe).x,
+                rendered_global(G1_LeftToe).z);
+            log_row.runtime_right_toe_surface_height = heightfield_sample(
+                runtime_terrain, rendered_global(G1_RightToe).x,
+                rendered_global(G1_RightToe).z);
+            const vec3 adjustment_delta =
+                root_after_adjustment - root_before_adjustment;
+            const vec3 clamp_delta = root_after_clamp - root_after_adjustment;
+            log_row.adjustment_xz = g1_xz_length(adjustment_delta);
+            log_row.adjustment_y = adjustment_delta.y;
+            log_row.clamp_xz = g1_xz_length(clamp_delta);
+            log_row.clamp_y = clamp_delta.y;
+            log_row.matching_enabled = matching_enabled;
+            log_row.adjustment_enabled = adjustment_enabled;
+            log_row.clamping_enabled = clamping_enabled;
+            log_row.support_retargeting_enabled = false;
+            log_row.ik_enabled = ik_enabled;
+            if (!deterministic_log.write(
+                    log_row, artifact_error, (int)sizeof(artifact_error))) {
+                fprintf(stderr, "G1 runtime log error: %s\n", artifact_error);
+                controller_exit_code = 2;
+                controller_exit_requested = true;
+                return;
+            }
         }
         
 #ifdef MM_DISCRETE
@@ -2788,6 +3120,10 @@ int main(void)
         // UI
         
         //---------
+
+        if (test_config.mode != G1_TestLive) {
+            GuiDisable();
+        }
         
         float ui_sim_hei = 20;
         
@@ -2939,14 +3275,18 @@ int main(void)
                 controller_exit_code = 2;
                 controller_exit_requested = true;
             }
+            else
+            {
+                applied_feature_weight_terrain = feature_weight_terrain;
+            }
         }
 
         GuiLabel(
             (Rectangle){ 40, 235, 250, 20 },
             TextFormat(
                 "query frame %d  range %d",
-                terrain_query_frame,
-                terrain_query_range));
+                query_database_frame,
+                query_range));
         GuiLabel(
             (Rectangle){ 40, 255, 250, 20 },
             TextFormat(
@@ -3035,10 +3375,15 @@ int main(void)
         
         //---------
 
+        if (test_config.mode != G1_TestLive) {
+            GuiEnable();
+        }
+
         EndDrawing();
 
         ++rendered_frames;
-        if (test_frame_limit > 0 && rendered_frames >= test_frame_limit)
+        if (test_config.frame_limit > 0 &&
+            rendered_frames >= test_config.frame_limit)
         {
             controller_exit_requested = true;
         }
@@ -3053,8 +3398,22 @@ int main(void)
     {
         update_func();
     }
+    if (test_config.mode != G1_TestLive &&
+        !controller_exit_requested &&
+        rendered_frames < test_config.frame_limit)
+    {
+        fprintf(stderr,
+            "G1 deterministic test window closed after %d of %d frames\n",
+            rendered_frames, test_config.frame_limit);
+        controller_exit_code = 2;
+    }
 #endif
 
+    if (!deterministic_log.close(
+            artifact_error, (int)sizeof(artifact_error))) {
+        fprintf(stderr, "G1 runtime log error: %s\n", artifact_error);
+        controller_exit_code = 2;
+    }
     UnloadModel(terrain_model);
 
     CloseWindow();
