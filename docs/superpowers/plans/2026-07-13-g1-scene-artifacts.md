@@ -6417,6 +6417,44 @@ git commit -m "feat: build exact GRAIL curb scenes"
 
 ### Task 11: Assemble the v2 manifest and atomically publish the complete tree
 
+> **Execution correction (2026-07-13; authoritative over the original steps
+> below):** Do not execute this task as one builder/publisher commit. The
+> original ordering calls the v2 validator API before normal v2 validation
+> exists (Task 12 Step 6), and a full build calls source-row validation before
+> that implementation exists (Task 12 Step 9). It also uses a two-rename
+> output/backup sequence that can leave the output absent after a hard crash,
+> permits concurrent publishers to cross-rollback, and fails to revalidate a
+> candidate after the external validator returns.
+>
+> Execute the boundary in this order:
+>
+> 1. **Task 11A — publisher core.** Modify only
+>    `resources/g1_terrain_builder/artifacts.py` and
+>    `tests/python/test_artifacts.py`. Keep the v1 four-argument publisher path
+>    temporarily compatible so the existing builder remains usable. The new
+>    five-argument v2 path must authenticate the exact 14-scene cached pack,
+>    reject any extra directory, symlink, or non-regular node, run the external
+>    candidate validator and then repeat full internal byte/tree validation,
+>    fsync the candidate, serialize commit with a parent-directory `flock`, and
+>    use Linux `renameat2(RENAME_EXCHANGE)` when replacing an existing output.
+>    If exchange is unavailable, fail before changing the prior output. All
+>    tests publish only below `TemporaryDirectory`; do not publish into
+>    `resources/g1_terrain/`.
+> 2. **Task 12A — normal independent v2 validation.** Complete Task 12 through
+>    Step 6 using direct temporary fixtures, without wiring the production
+>    builder.
+> 3. **Task 12B — full-source validation.** Complete the source-row validator
+>    through Task 12 Step 9. It must stream the 1,769 GRAIL sources and retain
+>    only the selected route clips rather than retaining every converted clip.
+> 4. **Task 11B — builder migration.** Only after both validator modes exist,
+>    modify `resources/build_g1_terrain_database.py` and its CLI tests to build
+>    all 14 scenes and call the completed validator. Remove the temporary v1
+>    publisher compatibility path at that point.
+>
+> The original Steps 1--10 below remain useful as schema/test reference, but
+> their commit boundary and the backup-based implementation in Step 4 are
+> superseded by this correction.
+
 **Files:**
 - Modify: `resources/g1_terrain_builder/artifacts.py`
 - Modify: `resources/build_g1_terrain_database.py`
