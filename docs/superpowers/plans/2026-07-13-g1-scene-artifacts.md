@@ -3055,6 +3055,15 @@ git commit -m "feat: derive G1 source support rows"
 - Produces: `walkability_bytes(values) -> bytes`.
 - Produces: `write_walkability(path, values) -> None` and `read_walkability(path) -> ndarray[uint8]`.
 - G1SP columns are locked as `SUPPORT_COLUMNS = ("source_root_height_m", "source_left_toe_height_m", "source_right_toe_height_m")`.
+- The float-matrix writers accept real floating input only. Finite `float64`
+  input may round normally to `float32`, but bool, integer, object, string, and
+  complex input is rejected; a finite source value that becomes non-finite in
+  `float32` is also rejected.
+- Every writer must finish serialization and validation before opening its
+  destination. Invalid input must leave an existing file byte-for-byte intact.
+- Readers inspect and validate the fixed-size header and checked payload size
+  before reading or allocating the payload. Header products that exceed the
+  platform index range are rejected deterministically.
 
 - [ ] **Step 1: Write exact-byte and corruption tests for both formats**
 
@@ -3168,9 +3177,17 @@ SUPPORT_COLUMNS = (
 
 def _float_matrix_bytes(values, magic, dimensions, label):
     try:
-        matrix = np.ascontiguousarray(values, dtype="<f4")
-    except (TypeError, ValueError) as error:
+        source = np.asarray(values)
+    except (TypeError, ValueError, OverflowError) as error:
         raise ValueError(f"{label} must be finite float values") from error
+    if not np.issubdtype(source.dtype, np.floating) \
+            or not np.isfinite(source).all():
+        raise ValueError(f"{label} must be finite float values")
+    with np.errstate(over="ignore", invalid="ignore"):
+        try:
+            matrix = np.ascontiguousarray(source, dtype="<f4")
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(f"{label} must be finite float values") from error
     if matrix.ndim != 2 or len(matrix) < 1 \
             or matrix.shape[1] != dimensions \
             or len(matrix) > UINT32_MAX or not np.isfinite(matrix).all():
@@ -3208,8 +3225,9 @@ def support_sidecar_bytes(values):
 
 
 def write_support_sidecar(path, values):
+    payload = support_sidecar_bytes(values)
     with open(path, "wb") as stream:
-        stream.write(support_sidecar_bytes(values))
+        stream.write(payload)
 
 
 def read_support_sidecar(path):
@@ -3223,8 +3241,9 @@ def terrain_sidecar_bytes(values):
 
 
 def write_terrain_sidecar(path, values):
+    payload = terrain_sidecar_bytes(values)
     with open(path, "wb") as stream:
-        stream.write(terrain_sidecar_bytes(values))
+        stream.write(payload)
 
 
 def read_terrain_sidecar(path):
@@ -3258,8 +3277,9 @@ def walkability_bytes(values):
 
 
 def write_walkability(path, values):
+    payload = walkability_bytes(values)
     with open(path, "wb") as stream:
-        stream.write(walkability_bytes(values))
+        stream.write(payload)
 
 
 def read_walkability(path):
@@ -3290,7 +3310,9 @@ Write `terrain_support.bin` beside `terrain_features.bin` in
 `publish_artifacts`, load it in `_validate_staged_artifacts`, assign it to
 `loaded.terrain_support`, and include `("terrain_support", "<f4")` in the exact
 array comparisons. Update the existing publication test's expected file set to
-include `terrain_support.bin`.
+include `terrain_support.bin`. Give `terrain_support` nonzero sentinel values,
+assert its exact readback, and add `terrain_support.bin` to the staged corruption
+matrix so the database reader's default zero support cannot mask missing wiring.
 
 ~~~python
 write_support_sidecar(
@@ -3298,6 +3320,15 @@ write_support_sidecar(
     artifacts.terrain_support,
 )
 ~~~
+
+Before the complete suite, add the full reader/writer boundary matrix:
+
+- all three writers preserve a pre-existing sentinel file on invalid input;
+- G1TF/G1SP reject bool, integer, object/string, complex, source non-finite,
+  and finite-to-`float32` overflow inputs without leaking conversion warnings;
+- G1SP rejects zero frames and reports little-endian `float32` on readback;
+- G1WM rejects truncated header/payload, bad magic/version, dimensions below
+  two, oversized header products, trailing bytes, and classes outside 0/1/2.
 
 - [ ] **Step 6: Run the complete artifact suite**
 
