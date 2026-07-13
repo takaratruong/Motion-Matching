@@ -2,8 +2,10 @@ import numpy as np
 
 
 def output_frame_count(frames: int, source_fps: float, target_fps: float) -> int:
+    if frames < 1 or source_fps <= 0 or target_fps <= 0:
+        raise ValueError("frames and sample rates must be positive")
     duration = (frames - 1) / source_fps
-    return int(round(duration * target_fps)) + 1
+    return int(np.floor(duration * target_fps + 1e-9)) + 1
 
 
 def _times(frames: int, fps: float) -> np.ndarray:
@@ -14,9 +16,12 @@ def resample_vectors(
     values: np.ndarray, source_fps: float, target_fps: float,
 ) -> np.ndarray:
     values = np.asarray(values, np.float64)
+    output_frame_count(len(values), source_fps, target_fps)
+    if not np.all(np.isfinite(values)):
+        raise ValueError("vector samples must be finite")
     src_t = _times(len(values), source_fps)
     count = output_frame_count(len(values), source_fps, target_fps)
-    dst_t = np.linspace(0.0, src_t[-1], count)
+    dst_t = _times(count, target_fps)
     flat = values.reshape(len(values), -1)
     out = np.stack([
         np.interp(dst_t, src_t, flat[:, i])
@@ -29,14 +34,18 @@ def resample_quaternions_wxyz(
     values: np.ndarray, source_fps: float, target_fps: float,
 ) -> np.ndarray:
     q = np.asarray(values, np.float64).copy()
-    q /= np.linalg.norm(q, axis=-1, keepdims=True)
+    output_frame_count(len(q), source_fps, target_fps)
+    norms = np.linalg.norm(q, axis=-1, keepdims=True)
+    if not np.all(np.isfinite(q)) or np.any(norms < 1e-12):
+        raise ValueError("quaternion samples must be finite and nonzero")
+    q /= norms
     flat = q.reshape(len(q), -1, 4)
     for t in range(1, len(flat)):
         signs = np.sum(flat[t - 1] * flat[t], axis=-1) < 0
         flat[t, signs] *= -1
     src_t = _times(len(q), source_fps)
     count = output_frame_count(len(q), source_fps, target_fps)
-    dst_t = np.linspace(0.0, src_t[-1], count)
+    dst_t = _times(count, target_fps)
     out = np.empty((count, flat.shape[1], 4), np.float64)
     for j in range(flat.shape[1]):
         for k, t in enumerate(dst_t):

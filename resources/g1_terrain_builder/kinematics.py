@@ -86,18 +86,22 @@ class G1Kinematics:
     def forward_local(
         self, lp: np.ndarray, lq: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
-        gp = np.empty_like(lp)
-        gq = np.empty_like(lq)
-        for i, parent in enumerate(self.parents):
-            if parent < 0:
-                gp[:, i], gq[:, i] = lp[:, i], lq[:, i]
-            else:
-                gq[:, i] = holden_quat.mul(gq[:, parent], lq[:, i])
-                gp[:, i] = (
-                    gp[:, parent]
-                    + holden_quat.mul_vec(gq[:, parent], lp[:, i])
-                )
-        return gp, gq
+        return forward_local_hierarchy(lp, lq, self.parents)
+
+
+def forward_local_hierarchy(
+    lp: np.ndarray, lq: np.ndarray, parents: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    gp = np.empty_like(lp)
+    gq = np.empty_like(lq)
+    for i, parent in enumerate(parents):
+        if parent < 0:
+            gp[:, i], gq[:, i] = lp[:, i], lq[:, i]
+        else:
+            gq[:, i] = holden_quat.mul(gq[:, parent], lq[:, i])
+            gp[:, i] = gp[:, parent] + holden_quat.mul_vec(
+                gq[:, parent], lp[:, i])
+    return gp, gq
 
 
 def change_basis_zup_to_yup(
@@ -127,6 +131,18 @@ def world_to_local(
     return lp, lq
 
 
+def heading_quaternions(forward: np.ndarray) -> np.ndarray:
+    forward = np.asarray(forward, np.float64)
+    yaw = np.arctan2(forward[:, 0], forward[:, 2])
+    q = np.stack([
+        np.cos(0.5 * yaw),
+        np.zeros_like(yaw),
+        np.sin(0.5 * yaw),
+        np.zeros_like(yaw),
+    ], axis=-1)
+    return holden_quat.unroll(q)
+
+
 def _prepend_simulation(
     gp: np.ndarray, gq: np.ndarray, names: tuple[str, ...],
     parents: np.ndarray,
@@ -136,7 +152,7 @@ def _prepend_simulation(
     sim_position = gp[:, torso].copy()
     sim_position[:, 1] = 0.0
     pos_window = min(
-        31, len(sim_position) if len(sim_position) % 2
+        13, len(sim_position) if len(sim_position) % 2
         else len(sim_position) - 1)
     if pos_window >= 5:
         sim_position = signal.savgol_filter(
@@ -150,14 +166,13 @@ def _prepend_simulation(
         raise ValueError("G1 pelvis forward projects to zero")
     forward /= lengths
     dir_window = min(
-        61, len(forward) if len(forward) % 2 else len(forward) - 1)
+        25, len(forward) if len(forward) % 2 else len(forward) - 1)
     if dir_window >= 5:
         forward = signal.savgol_filter(
             forward, dir_window, min(3, dir_window - 2),
             axis=0, mode="interp")
         forward /= np.linalg.norm(forward, axis=1, keepdims=True)
-    sim_rotation = holden_quat.normalize(
-        holden_quat.between(np.array([0.0, 0.0, 1.0]), forward))
+    sim_rotation = heading_quaternions(forward)
     lp, lq = world_to_local(gp, gq, parents)
     lp[:, hips] = holden_quat.mul_vec(
         holden_quat.inv(sim_rotation), gp[:, hips] - sim_position)
@@ -165,6 +180,7 @@ def _prepend_simulation(
         holden_quat.inv(sim_rotation), gq[:, hips])
     positions = np.concatenate([sim_position[:, None], lp], axis=1)
     rotations = np.concatenate([sim_rotation[:, None], lq], axis=1)
+    rotations = holden_quat.unroll(holden_quat.normalize(rotations))
     skeleton = SkeletonSpec(
         ("Simulation",) + names,
         np.concatenate([np.array([-1], np.int32), parents + 1]),
@@ -173,28 +189,40 @@ def _prepend_simulation(
 
 
 def convert_source_clip(
-    source: SourceClip, kinematics: G1Kinematics, target_fps: float = 60.0,
+    source: SourceClip, kinematics: G1Kinematics, target_fps: float = 25.0,
 ) -> tuple[HoldenClip, SkeletonSpec, dict]:
     source.validate()
     gp_z, gq_z = kinematics.world_from_qpos(source.qpos)
     gp_y, gq_y = change_basis_zup_to_yup(gp_z, gq_z)
-    lp_check, lq_check = world_to_local(
-        gp_y, gq_y, kinematics.parents)
-    gp_check, _ = kinematics.forward_local(lp_check, lq_check)
-    fk_error = float(np.max(np.linalg.norm(gp_check - gp_y, axis=-1)))
     gp = resample_vectors(gp_y, source.fps, target_fps)
     gq = resample_quaternions_wxyz(gq_y, source.fps, target_fps)
     positions, rotations, skeleton = _prepend_simulation(
         gp, gq, kinematics.names, kinematics.parents)
-    source_t = np.arange(len(source.qpos)) / source.fps
-    output_t = np.linspace(source_t[0], source_t[-1], len(positions))
+    output_t = np.arange(len(positions), dtype=np.float64) / target_fps
     output_frames = np.rint(output_t * source.fps).astype(np.int64)
     output_frames = np.clip(output_frames, 0, len(source.qpos) - 1)
+    positions = positions.astype(np.float32)
+    rotations = rotations.astype(np.float32)
+    if not np.all(np.isfinite(positions)) or not np.all(np.isfinite(rotations)):
+        raise ValueError(f"{source.name}: non-finite exported transform")
+    quaternion_error = float(np.max(np.abs(
+        np.linalg.norm(rotations, axis=-1) - 1.0)))
+    if quaternion_error > 1e-4:
+        raise ValueError(
+            f"{source.name}: exported quaternion norm error "
+            f"{quaternion_error}")
+    exported_gp, _ = forward_local_hierarchy(
+        positions.astype(np.float64), rotations.astype(np.float64),
+        skeleton.parents)
+    fk_error = float(np.max(np.linalg.norm(
+        exported_gp[:, 1:] - gp, axis=-1)))
+    if fk_error > 0.001:
+        raise ValueError(f"{source.name}: exported FK error {fk_error} m")
     clip = HoldenClip(
         source.name,
-        positions.astype(np.float32),
+        positions,
         np.zeros_like(positions, np.float32),
-        rotations.astype(np.float32),
+        rotations,
         np.zeros_like(positions, np.float32),
         np.zeros((len(positions), 2), np.uint8),
         np.zeros((len(positions), 4), np.float32),
@@ -203,7 +231,11 @@ def convert_source_clip(
     )
     source_duration = (len(source.qpos) - 1) / source.fps
     output_duration = (len(positions) - 1) / target_fps
+    duration_error = abs(output_duration - source_duration)
+    if duration_error > 1.0 / target_fps + 1e-12:
+        raise ValueError(f"{source.name}: duration error {duration_error} s")
     return clip, skeleton, {
         "fk_max_error_m": fk_error,
-        "duration_error_s": abs(output_duration - source_duration),
+        "duration_error_s": duration_error,
+        "quaternion_norm_max_error": quaternion_error,
     }
