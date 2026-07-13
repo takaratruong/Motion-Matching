@@ -1735,7 +1735,7 @@ git commit -m "feat: publish versioned G1 terrain artifacts"
 - Create: tests/python/test_build_cli.py
 
 **Interfaces:**
-- build CLI: --output, --grail-glob, --grail-limit, --g1-xml, --takara, --remap.
+- build CLI: --output, --grail-glob, --grail-limit, --g1-xml, --takara, --remap, --runtime-terrain.
 - validate CLI: one positional artifact directory; exit 0 only on full validation.
 - Produces manifest schema g1-terrain-artifacts/v1.
 
@@ -1745,9 +1745,13 @@ git commit -m "feat: publish versioned G1 terrain artifacts"
 # tests/python/test_build_cli.py
 import json
 import os
+import struct
 import subprocess
 import tempfile
 import unittest
+
+from resources.g1_terrain_builder.artifacts import read_terrain_sidecar
+from resources.g1_terrain_builder.database import read_holden_database
 
 PYTHON = "/home/ubuntu/miniconda3/envs/diffsim/bin/python"
 
@@ -1755,20 +1759,71 @@ PYTHON = "/home/ubuntu/miniconda3/envs/diffsim/bin/python"
 class BuildCliTests(unittest.TestCase):
     def test_one_grail_clip_builds_and_validates(self):
         with tempfile.TemporaryDirectory() as td:
+            output = os.path.join(td, "g1_terrain")
             subprocess.run([
                 PYTHON, "resources/build_g1_terrain_database.py",
-                "--output", os.path.join(td, "g1_terrain"),
+                "--output", output,
                 "--grail-limit", "1",
             ], check=True)
-            subprocess.run([
+            validated = subprocess.run([
                 PYTHON, "resources/validate_g1_terrain_database.py",
-                os.path.join(td, "g1_terrain"),
-            ], check=True)
-            manifest = json.load(open(os.path.join(td, "g1_terrain", "manifest.json")))
+                output,
+            ], check=True, text=True, capture_output=True)
+            manifest_path = os.path.join(output, "manifest.json")
+            manifest = json.load(open(manifest_path))
+            database = read_holden_database(os.path.join(output, "database.bin"))
+            terrain_features = read_terrain_sidecar(os.path.join(
+                output, "terrain_features.bin"))
+            with open(os.path.join(output, "terrain.bin"), "rb") as stream:
+                terrain_header = struct.unpack("<4sIII4f", stream.read(32))
+            corruption_results = []
+            corruptions = (
+                ("output_fps", lambda m: m.__setitem__("output_fps", 60.0),
+                 "output_fps"),
+                ("source_map", lambda m: m["sources"][0]["source_frame_map"].pop(),
+                 "source frame map"),
+            )
+            for name, corrupt, message in corruptions:
+                changed = json.loads(json.dumps(manifest))
+                corrupt(changed)
+                with open(manifest_path, "w") as stream:
+                    json.dump(changed, stream)
+                result = subprocess.run([
+                    PYTHON, "resources/validate_g1_terrain_database.py", output,
+                ], text=True, capture_output=True)
+                corruption_results.append((name, message, result))
+            with open(manifest_path, "w") as stream:
+                json.dump(manifest, stream)
         self.assertEqual(manifest["schema"], "g1-terrain-artifacts/v1")
+        self.assertEqual(manifest["output_fps"], 25.0)
         self.assertEqual(manifest["feature_dimensions"], 31)
         self.assertEqual(manifest["terrain_dimensions"], 4)
         self.assertEqual(manifest["grail_clips"], 1)
+        self.assertEqual(manifest["total_clips"], 2)
+        self.assertEqual(manifest["skipped_clips"], 0)
+        self.assertTrue(manifest["diagnostic_mode"])
+        self.assertEqual(len(manifest["skeleton"]["names"]), 31)
+        self.assertEqual(database.positions.shape[1], 31)
+        self.assertEqual(len(database.positions), len(terrain_features))
+        self.assertEqual(terrain_header[:2], (b"G1HF", 1))
+        self.assertGreaterEqual(terrain_header[2], 2)
+        self.assertGreaterEqual(terrain_header[3], 2)
+        self.assertIn("VALID g1-terrain-artifacts/v1", validated.stdout)
+        cursor = 0
+        for source in manifest["sources"]:
+            self.assertEqual(source["range_start"], cursor)
+            self.assertEqual(
+                source["range_stop"] - source["range_start"],
+                source["output_frames"])
+            self.assertEqual(
+                len(source["source_frame_map"]), source["output_frames"])
+            self.assertEqual(source["range_stop"], cursor + source["output_frames"])
+            cursor = source["range_stop"]
+        self.assertEqual(cursor, len(database.positions))
+        for name, message, result in corruption_results:
+            with self.subTest(name=name):
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
 
 
 if __name__ == "__main__":
@@ -1797,6 +1852,7 @@ DEFAULTS = {
     "g1_xml": "/home/ubuntu/projects/mjx-diffphysics/env/g1/assets/g1_29dof.xml",
     "takara": "/home/ubuntu/Downloads/takara_walk_50hz.npz_v0/motion.npz",
     "remap": "/home/ubuntu/projects/g1_mm/isaac_to_mj.npy",
+    "runtime_terrain": "terrain_curbs__curb_000__000",
 }
 ~~~
 
@@ -1841,6 +1897,7 @@ if args.grail_limit is not None:
 sources.extend(load_grail(path) for path in grail_paths)
 clips, reports, source_manifest = [], [], []
 expected_skeleton = None
+range_cursor = 0
 for source in sources:
     terrain = FlatTerrain() if source.terrain_id == "flat" \
         else GrailTerrain.from_base(source.terrain_id)
@@ -1853,9 +1910,13 @@ for source in sources:
     reports.append(report)
     source_manifest.append({
         "name":source.name, "terrain_id":source.terrain_id,
+        "source_fps":source.fps,
         "source_frames":len(source.qpos), "output_frames":len(clip.positions),
+        "range_start":range_cursor,
+        "range_stop":range_cursor + len(clip.positions),
         "source_frame_map":clip.source_frames.tolist(),
     })
+    range_cursor += len(clip.positions)
 artifacts = combine_clips(clips, expected_skeleton)
 ~~~
 
@@ -1863,12 +1924,52 @@ Build the manifest from these values and call publish_artifacts. The terrain_wri
 exports the base selected by --runtime-terrain, default
 terrain_curbs__curb_000__000, to terrain.bin and terrain.obj with a 0.02 m cell
 size and a 2 m flat border around its transformed footprint.
+Compute the runtime bounds and expected heightfield metadata before constructing
+the manifest. The terrain_writer must compare `export_heightfield`'s returned
+metadata with that precomputed object before writing the OBJ, so publication
+cannot describe different grid dimensions than it emits.
 
 Normal mode must abort on the first skipped clip. The --grail-limit option slices
 the sorted input list and writes diagnostic_mode=true to the manifest. The
-manifest must contain source and output frame counts, range/source mapping,
-skeleton names/parents/signature, 25 Hz output rate, contact thresholds, terrain
-distances, coordinate mapping, and per-clip FK error.
+manifest must contain source and output frame counts, global range/source
+mapping, skeleton names/parents/signature, 25 Hz output rate, contact thresholds,
+terrain distances, coordinate mapping, runtime terrain metadata, and per-clip
+FK/duration/quaternion error. It must also contain `total_clips`, `grail_clips`,
+`skipped_clips=0`, `database_frames`, and `diagnostic_mode`.
+
+Reject a negative `--grail-limit`, an empty GRAIL glob when a positive/full
+GRAIL build was requested, missing inputs, duplicate source names, skeleton
+changes, or any skipped clip. Build the manifest before publication; do not
+derive validation fields by re-reading the just-written manifest.
+
+Use stable manifest subobjects:
+
+~~~python
+"skeleton": {
+    "names": list(expected_skeleton.names),
+    "parents": expected_skeleton.parents.tolist(),
+    "signature": expected_skeleton.signature(),
+},
+"contact": {
+    "speed_threshold": contact_config.speed_threshold,
+    "height_threshold": contact_config.height_threshold,
+    "median_filter_frames": contact_config.median_filter_frames,
+},
+"terrain": {
+    "distances_m": [0.25, 0.50, 0.75, 1.00],
+    "coordinate_mapping": "mujoco_xyz_to_holden_x_z_neg_y",
+    "runtime_base": args.runtime_terrain,
+    "cell_size_m": 0.02,
+    "border_m": 2.0,
+    "heightfield": heightfield_metadata,
+},
+"validation": {
+    "fk_max_error_m": [r["fk_max_error_m"] for r in reports],
+    "duration_error_s": [r["duration_error_s"] for r in reports],
+    "quaternion_norm_max_error": [
+        r["quaternion_norm_max_error"] for r in reports],
+},
+~~~
 
 - [ ] **Step 4: Implement the independent validator**
 
@@ -1887,8 +1988,13 @@ assert np.max(np.abs(np.linalg.norm(database.rotations, axis=-1) - 1.0)) <= 1e-4
 ~~~
 
 It also calls ArtifactSet.validate(), verifies every source range and source-frame
-mapping length, checks terrain.bin and terrain.obj exist, and prints a single
-summary line:
+mapping length/content, checks manifest parents/signature against the database,
+and independently parses the complete G1HF header/payload. Require G1HF v1,
+`nx,nz >= 2`, positive finite cell size, finite heights, exact payload length,
+and metadata matching the manifest. Parse terrain.obj enough to require finite
+vertices, valid one-based faces, and no trailing malformed records. Errors print
+an actionable `INVALID <path>: <contract>` line to stderr and return nonzero.
+On success print a single summary line:
 
     VALID g1-terrain-artifacts/v1 frames=<N> clips=<C> bones=31 terrain_dims=4
 
