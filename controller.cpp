@@ -13,6 +13,7 @@
 #include "array.h"
 #include "character.h"
 #include "database.h"
+#include "g1_skeleton.h"
 #include "nnet.h"
 #include "lmm.h"
 
@@ -1336,7 +1337,10 @@ int main(void)
         feature_weight_foot_velocity,
         feature_weight_hip_velocity,
         feature_weight_trajectory_positions,
-        feature_weight_trajectory_directions);
+        feature_weight_trajectory_directions,
+        G1_LeftAnkle,
+        G1_RightAnkle,
+        G1_Hips);
         
     database_save_matching_features(db, "./resources/features.bin");
    
@@ -1492,10 +1496,9 @@ int main(void)
     
     // Contact and Foot Locking data
     
-    // G1 31-bone database: LeftToe=7, RightToe=13 (index 0 = Simulation bone)
     array1d<int> contact_bones(2);
-    contact_bones(0) = 7;   // G1 LeftToe (was Bone_LeftToe=5 for LAFAN)
-    contact_bones(1) = 13;  // G1 RightToe (was Bone_RightToe=9 for LAFAN)
+    contact_bones(0) = G1_LeftToe;
+    contact_bones(1) = G1_RightToe;
     
     array1d<bool> contact_states(contact_bones.size);
     array1d<bool> contact_locks(contact_bones.size);
@@ -2512,7 +2515,10 @@ int main(void)
                 feature_weight_foot_velocity,
                 feature_weight_hip_velocity,
                 feature_weight_trajectory_positions,
-                feature_weight_trajectory_directions);
+                feature_weight_trajectory_directions,
+                G1_LeftAnkle,
+                G1_RightAnkle,
+                G1_Hips);
         }
         
         //---------

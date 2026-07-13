@@ -532,8 +532,18 @@ void database_build_matching_features(
     const float feature_weight_foot_velocity,
     const float feature_weight_hip_velocity,
     const float feature_weight_trajectory_positions,
-    const float feature_weight_trajectory_directions)
+    const float feature_weight_trajectory_directions,
+    const int left_foot_bone,
+    const int right_foot_bone,
+    const int hip_bone)
 {
+    if (left_foot_bone < 0 || left_foot_bone >= db.nbones() ||
+        right_foot_bone < 0 || right_foot_bone >= db.nbones() ||
+        hip_bone < 0 || hip_bone >= db.nbones())
+    {
+        return;
+    }
+
     int nfeatures = 
         3 + // Left Foot Position
         3 + // Right Foot Position 
@@ -547,17 +557,12 @@ void database_build_matching_features(
     db.features_offset.resize(nfeatures);
     db.features_scale.resize(nfeatures);
     
-    // G1 31-bone skeleton indices (index 0 = Simulation bone):
-    //   Hips=1, LeftAnkle=6, LeftToe=7, RightAnkle=12, RightToe=13.
-    // Holden's Bone_LeftFoot(4)/Bone_RightFoot(8) map to HIP joints on the G1,
-    // so match on the G1 foot (ankle) bones instead.
-    const int G1_LeftFoot = 6, G1_RightFoot = 12, G1_Hips = 1;
     int offset = 0;
-    compute_bone_position_feature(db, offset, G1_LeftFoot, feature_weight_foot_position);
-    compute_bone_position_feature(db, offset, G1_RightFoot, feature_weight_foot_position);
-    compute_bone_velocity_feature(db, offset, G1_LeftFoot, feature_weight_foot_velocity);
-    compute_bone_velocity_feature(db, offset, G1_RightFoot, feature_weight_foot_velocity);
-    compute_bone_velocity_feature(db, offset, G1_Hips, feature_weight_hip_velocity);
+    compute_bone_position_feature(db, offset, left_foot_bone, feature_weight_foot_position);
+    compute_bone_position_feature(db, offset, right_foot_bone, feature_weight_foot_position);
+    compute_bone_velocity_feature(db, offset, left_foot_bone, feature_weight_foot_velocity);
+    compute_bone_velocity_feature(db, offset, right_foot_bone, feature_weight_foot_velocity);
+    compute_bone_velocity_feature(db, offset, hip_bone, feature_weight_hip_velocity);
     compute_trajectory_position_feature(db, offset, feature_weight_trajectory_positions);
     compute_trajectory_direction_feature(db, offset, feature_weight_trajectory_directions);
     
@@ -588,6 +593,11 @@ void motion_matching_search(
     const int ignore_range_end,
     const int ignore_surrounding)
 {
+    // Keep strict header builds warning-clean while these legacy public API
+    // parameters remain unused by the normalized-distance implementation.
+    (void)features_offset;
+    (void)features_scale;
+
     int nfeatures = query_normalized.size;
     int nranges = range_starts.size;
     
