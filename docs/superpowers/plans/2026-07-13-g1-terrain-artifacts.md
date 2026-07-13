@@ -241,7 +241,7 @@ Run:
 /home/ubuntu/miniconda3/envs/diffsim/bin/python -m unittest tests.python.test_schema -v
 ~~~
 
-Expected: 4 tests, OK.
+Expected: all focused terrain tests pass.
 
 - [ ] **Step 5: Commit the schema boundary**
 
@@ -1093,23 +1093,29 @@ git commit -m "feat: sample aligned GRAIL terrain"
 
 **Interfaces:**
 - Consumes: converted 25 Hz HoldenClip skeleton motion and a terrain provider.
+- Produces: ContactConfig with explicit speed, height, and median-filter thresholds.
 - Produces: derive_velocities(positions, rotations, fps) -> tuple[ndarray, ndarray].
 - Produces: derive_contacts(global_positions, terrain, left, right, fps, config) -> ndarray.
+- Produces: forward_kinematics_arrays(positions, rotations, parents) -> tuple[ndarray, ndarray].
 - Produces: combine_clips(clips, skeleton) -> ArtifactSet.
 - Produces: write_holden_database(path, artifacts) -> None.
+- Produces: read_holden_database(path) -> ArtifactSet for independent round-trip validation.
 
 - [ ] **Step 1: Write tests for range isolation and binary round-trip**
 
 ~~~python
 # tests/python/test_database_builder.py
 import os
+import struct
 import tempfile
 import unittest
 import numpy as np
 from resources.g1_terrain_builder.database import (
-    combine_clips, read_holden_database, write_holden_database,
+    ContactConfig, combine_clips, derive_contacts, derive_velocities,
+    forward_kinematics_arrays, read_holden_database, write_holden_database,
 )
 from resources.g1_terrain_builder.schema import HoldenClip, SkeletonSpec
+from resources.g1_terrain_builder.terrain import FlatTerrain, StepTerrain
 
 
 class DatabaseBuilderTests(unittest.TestCase):
@@ -1121,15 +1127,108 @@ class DatabaseBuilderTests(unittest.TestCase):
         np.testing.assert_array_equal(artifacts.range_starts, [0, 3])
         np.testing.assert_array_equal(artifacts.range_stops, [3, 8])
 
+    def test_derivatives_are_physical_and_isolated_per_clip(self):
+        fps = 25.0
+        positions = np.zeros((5, 1, 3), np.float64)
+        positions[:, 0, 0] = np.arange(5) / fps
+        angle = np.arange(5) * 0.1
+        rotations = np.zeros((5, 1, 4), np.float64)
+        rotations[:, 0, 0] = np.cos(angle / 2)
+        rotations[:, 0, 2] = np.sin(angle / 2)
+        velocity, angular = derive_velocities(positions, rotations, fps)
+        np.testing.assert_allclose(velocity[:, 0, 0], 1.0, atol=1e-6)
+        np.testing.assert_allclose(angular[:, 0, 1], 2.5, atol=1e-5)
+
+        shifted = positions.copy()
+        shifted[:, 0, 0] += 100.0
+        shifted_velocity, _ = derive_velocities(shifted, rotations, fps)
+        clip_a, clip_b = HoldenClip.empty(5, 1), HoldenClip.empty(5, 1)
+        clip_a.positions, clip_a.velocities = positions, velocity
+        clip_b.positions, clip_b.velocities = shifted, shifted_velocity
+        artifacts = combine_clips(
+            [clip_a, clip_b],
+            SkeletonSpec(("Simulation",), np.array([-1], np.int32)))
+        self.assertAlmostEqual(artifacts.velocities[4, 0, 0], 1.0)
+        self.assertAlmostEqual(artifacts.velocities[5, 0, 0], 1.0)
+
+    def test_contacts_use_terrain_relative_height_and_speed(self):
+        feet = np.zeros((5, 2, 3), np.float64)
+        feet[:, 0] = [0.75, 0.31, 0.0]
+        feet[:, 1, 0] = np.arange(5) * 0.02
+        feet[:, 1, 1] = 0.02
+        contacts = derive_contacts(
+            feet, StepTerrain(0.5, 0.29), 0, 1, 25.0, ContactConfig())
+        np.testing.assert_array_equal(contacts[:, 0], np.ones(5, np.uint8))
+        np.testing.assert_array_equal(contacts[:, 1], np.zeros(5, np.uint8))
+        feet[:, 0, 1] = 0.0
+        penetrated = derive_contacts(
+            feet, StepTerrain(0.5, 0.29), 0, 1, 25.0, ContactConfig())
+        np.testing.assert_array_equal(
+            penetrated[:, 0], np.zeros(5, np.uint8))
+
+    def test_invalid_derivative_and_contact_inputs_are_rejected(self):
+        rotations = np.tile([1.0, 0.0, 0.0, 0.0], (2, 1, 1))
+        with self.assertRaisesRegex(ValueError, "three"):
+            derive_velocities(np.zeros((2, 1, 3)), rotations, 25.0)
+        feet = np.zeros((5, 2, 3))
+        with self.assertRaisesRegex(ValueError, "foot indices"):
+            derive_contacts(feet, FlatTerrain(), 0, 2, 25.0)
+        with self.assertRaisesRegex(ValueError, "filter"):
+            derive_contacts(
+                feet, FlatTerrain(), 0, 1, 25.0,
+                ContactConfig(median_filter_frames=2))
+
+    def test_forward_kinematics_uses_parent_rotation(self):
+        positions = np.zeros((1, 2, 3), np.float64)
+        positions[:, 1, 0] = 1.0
+        rotations = np.zeros((1, 2, 4), np.float64)
+        rotations[:, :, 0] = 1.0
+        c = 2**-0.5
+        rotations[:, 0] = [c, 0, c, 0]
+        gp, gq = forward_kinematics_arrays(
+            positions, rotations, np.array([-1, 0], np.int32))
+        np.testing.assert_allclose(gp[0, 1], [0, 0, -1], atol=1e-7)
+        np.testing.assert_allclose(gq[0, 1], rotations[0, 0], atol=1e-7)
+
     def test_holden_binary_round_trip(self):
         skeleton = SkeletonSpec(("Simulation", "Hips"), np.array([-1, 0], np.int32))
         artifacts = combine_clips([HoldenClip.empty(4, 2)], skeleton)
+        artifacts.positions[:] = np.arange(
+            artifacts.positions.size, dtype=np.float32).reshape(
+                artifacts.positions.shape) / 10.0
+        artifacts.velocities[:] = -artifacts.positions
+        artifacts.contacts[:, 0] = [0, 1, 0, 1]
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "database.bin")
             write_holden_database(path, artifacts)
             loaded = read_holden_database(path)
-        np.testing.assert_array_equal(loaded.parents, artifacts.parents)
-        np.testing.assert_allclose(loaded.positions, artifacts.positions)
+            with open(path, "rb") as stream:
+                self.assertEqual(struct.unpack("<II", stream.read(8)), (4, 2))
+        for name in (
+            "positions", "velocities", "rotations", "angular_velocities",
+            "parents", "range_starts", "range_stops", "contacts",
+        ):
+            np.testing.assert_array_equal(getattr(loaded, name), getattr(artifacts, name))
+        self.assertEqual(loaded.positions.dtype, np.dtype("<f4"))
+        self.assertEqual(loaded.parents.dtype, np.dtype("<i4"))
+
+    def test_holden_reader_rejects_truncation_and_trailing_bytes(self):
+        skeleton = SkeletonSpec(("Simulation",), np.array([-1], np.int32))
+        artifacts = combine_clips([HoldenClip.empty(4, 1)], skeleton)
+        with tempfile.TemporaryDirectory() as td:
+            valid = os.path.join(td, "valid.bin")
+            write_holden_database(valid, artifacts)
+            payload = open(valid, "rb").read()
+            for name, corrupt in (
+                ("truncated.bin", payload[:-1]),
+                ("trailing.bin", payload + b"x"),
+            ):
+                path = os.path.join(td, name)
+                with open(path, "wb") as stream:
+                    stream.write(corrupt)
+                with self.subTest(name=name):
+                    with self.assertRaisesRegex(ValueError, "truncated|trailing"):
+                        read_holden_database(path)
 
 
 if __name__ == "__main__":
@@ -1153,26 +1252,44 @@ The binary writer must match database_load in database.h:
 
 ~~~python
 # resources/g1_terrain_builder/database.py
+from dataclasses import dataclass
 import struct
+import sys
 import numpy as np
+from scipy import ndimage
+
+sys.path.insert(0, "/home/ubuntu/projects/motion-matching/resources")
+import quat as holden_quat
+
 from .schema import ArtifactSet, HoldenClip, SkeletonSpec
 
 
-def _write_array2(f, a: np.ndarray) -> None:
-    a = np.ascontiguousarray(a)
+@dataclass(frozen=True)
+class ContactConfig:
+    speed_threshold: float = 0.15
+    height_threshold: float = 0.06
+    median_filter_frames: int = 3
+
+
+def _write_array2(f, a: np.ndarray, dtype) -> None:
+    a = np.ascontiguousarray(a, dtype=np.dtype(dtype))
     f.write(struct.pack("<II", a.shape[0], a.shape[1]))
     f.write(a.tobytes())
 
 
-def _write_array1(f, a: np.ndarray) -> None:
-    a = np.ascontiguousarray(a)
+def _write_array1(f, a: np.ndarray, dtype) -> None:
+    a = np.ascontiguousarray(a, dtype=np.dtype(dtype))
     f.write(struct.pack("<I", len(a)))
     f.write(a.tobytes())
 
 
 def combine_clips(clips: list[HoldenClip], skeleton: SkeletonSpec) -> ArtifactSet:
+    if not clips:
+        raise ValueError("at least one clip is required")
     for clip in clips:
         clip.validate()
+        if clip.positions.shape[1] != len(skeleton.parents):
+            raise ValueError(f"{clip.name}: bone count does not match skeleton")
     lengths = np.array([len(c.positions) for c in clips], np.int32)
     stops = np.cumsum(lengths, dtype=np.int32)
     starts = np.concatenate([np.array([0], np.int32), stops[:-1]])
@@ -1193,14 +1310,14 @@ def combine_clips(clips: list[HoldenClip], skeleton: SkeletonSpec) -> ArtifactSe
 def write_holden_database(path: str, a: ArtifactSet) -> None:
     a.validate()
     with open(path, "wb") as f:
-        _write_array2(f, a.positions)
-        _write_array2(f, a.velocities)
-        _write_array2(f, a.rotations)
-        _write_array2(f, a.angular_velocities)
-        _write_array1(f, a.parents)
-        _write_array1(f, a.range_starts)
-        _write_array1(f, a.range_stops)
-        _write_array2(f, a.contacts)
+        _write_array2(f, a.positions, "<f4")
+        _write_array2(f, a.velocities, "<f4")
+        _write_array2(f, a.rotations, "<f4")
+        _write_array2(f, a.angular_velocities, "<f4")
+        _write_array1(f, a.parents, "<i4")
+        _write_array1(f, a.range_starts, "<i4")
+        _write_array1(f, a.range_stops, "<i4")
+        _write_array2(f, a.contacts, "u1")
 ~~~
 
 Add these exact readers and derivations:
@@ -1234,24 +1351,34 @@ def _read_array2(stream, dtype, components=()):
 
 def read_holden_database(path: str) -> ArtifactSet:
     with open(path, "rb") as stream:
-        positions = _read_array2(stream, np.float32, (3,))
-        velocities = _read_array2(stream, np.float32, (3,))
-        rotations = _read_array2(stream, np.float32, (4,))
-        angular = _read_array2(stream, np.float32, (3,))
-        parents = _read_array1(stream, np.int32)
-        starts = _read_array1(stream, np.int32)
-        stops = _read_array1(stream, np.int32)
-        contacts = _read_array2(stream, np.uint8)
+        positions = _read_array2(stream, "<f4", (3,))
+        velocities = _read_array2(stream, "<f4", (3,))
+        rotations = _read_array2(stream, "<f4", (4,))
+        angular = _read_array2(stream, "<f4", (3,))
+        parents = _read_array1(stream, "<i4")
+        starts = _read_array1(stream, "<i4")
+        stops = _read_array1(stream, "<i4")
+        contacts = _read_array2(stream, "u1")
         if stream.read(1):
             raise ValueError("trailing database bytes")
-    return ArtifactSet(
+    out = ArtifactSet(
         positions, velocities, rotations, angular, parents,
         starts, stops, contacts,
         np.zeros((len(positions), 4), np.float32),
     )
+    out.validate()
+    return out
 
 
 def derive_velocities(positions, rotations, fps):
+    positions = np.asarray(positions, np.float64)
+    rotations = np.asarray(rotations, np.float64)
+    if len(positions) < 3 or positions.shape[:2] != rotations.shape[:2] or \
+            rotations.shape[-1] != 4 or positions.shape[-1] != 3:
+        raise ValueError("derivatives require at least three aligned bone frames")
+    if fps <= 0 or not np.isfinite(fps) or not np.all(np.isfinite(positions)) \
+            or not np.all(np.isfinite(rotations)):
+        raise ValueError("derivative inputs and fps must be finite and valid")
     velocity = np.gradient(positions, axis=0, edge_order=2) * fps
     angular = np.zeros(positions.shape, np.float64)
     forward = holden_quat.to_scaled_angle_axis(holden_quat.abs(
@@ -1262,7 +1389,24 @@ def derive_velocities(positions, rotations, fps):
     return velocity.astype(np.float32), angular.astype(np.float32)
 
 
-def derive_contacts(global_positions, terrain, left, right, fps):
+def derive_contacts(
+    global_positions, terrain, left, right, fps,
+    config: ContactConfig = ContactConfig(),
+):
+    global_positions = np.asarray(global_positions, np.float64)
+    if len(global_positions) < 3 or global_positions.ndim != 3 or \
+            global_positions.shape[-1] != 3:
+        raise ValueError("contacts require at least three global-position frames")
+    if fps <= 0 or not np.isfinite(fps) or not np.all(np.isfinite(global_positions)):
+        raise ValueError("contact positions and fps must be finite and valid")
+    if left < 0 or right < 0 or left >= global_positions.shape[1] or \
+            right >= global_positions.shape[1]:
+        raise ValueError("contact foot indices are out of range")
+    if not np.all(np.isfinite([
+            config.speed_threshold, config.height_threshold])) or \
+            config.speed_threshold <= 0 or config.height_threshold <= 0 or \
+            config.median_filter_frames < 1 or config.median_filter_frames % 2 == 0:
+        raise ValueError("contact thresholds must be positive and filter size odd")
     feet = global_positions[:, [left, right]]
     velocity = np.gradient(feet, axis=0, edge_order=2) * fps
     speed = np.linalg.norm(velocity, axis=-1)
@@ -1271,11 +1415,14 @@ def derive_contacts(global_positions, terrain, left, right, fps):
         for side in range(2):
             ground[t, side] = terrain.height(
                 feet[t, side, 0], feet[t, side, 2])
+    if not np.all(np.isfinite(ground)):
+        raise ValueError("terrain returned non-finite contact height")
     relative_height = feet[:, :, 1] - ground
-    contacts = (speed < 0.15) & (relative_height < 0.06)
+    contacts = (speed < config.speed_threshold) & \
+               (np.abs(relative_height) < config.height_threshold)
     for side in range(2):
         contacts[:, side] = ndimage.median_filter(
-        contacts[:, side], size=3, mode="nearest")
+            contacts[:, side], size=config.median_filter_frames, mode="nearest")
     return contacts.astype(np.uint8)
 
 
@@ -1294,7 +1441,6 @@ def forward_kinematics_arrays(positions, rotations, parents):
     return gp, gq
 ~~~
 
-Import resources.quat as holden_quat and scipy.ndimage as ndimage at the top.
 Call derive_velocities and derive_contacts separately for every clip before
 combine_clips, so np.gradient never crosses a source boundary.
 
@@ -1307,7 +1453,7 @@ Run:
   tests.python.test_database_builder -v
 ~~~
 
-Expected: 2 tests, OK.
+Expected: all focused database-builder tests pass.
 
 - [ ] **Step 5: Commit database derivation**
 
