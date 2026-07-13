@@ -230,6 +230,480 @@ class ScenePack:
         return json.loads(self.index_json)
 
 
+COURSE_HALF_WIDTH = 0.60
+FLAT_SPAWN_LENGTH = 2.0
+LOOKAHEAD_MARGIN = 1.0
+
+
+def _runtime_f32_upper_ceiling(value, label):
+    target = _finite_real(value, label)
+    result = _runtime_f32(target, label)
+    if result < target:
+        result = _runtime_f32(
+            np.nextafter(np.float32(result), np.float32(np.inf)),
+            f"{label} upper ceiling")
+    return result
+
+
+def _walkability_classification_bounds(bounds):
+    # The JSON playable/region bounds remain center bounds. Only the promoted
+    # source-node G1WM callback receives this exact binary32 footprint halo.
+    values = tuple(
+        _runtime_f32(value, f"walkability center bound {index}")
+        for index, value in enumerate(bounds)
+    )
+    halo = _runtime_f32(
+        WALKABILITY_CLASSIFICATION_HALO,
+        "walkability classification halo")
+    return (
+        _f32_sub(values[0], halo, "walkability classification xmin"),
+        _f32_add(values[1], halo, "walkability classification xmax"),
+        _f32_sub(values[2], halo, "walkability classification zmin"),
+        _f32_add(values[3], halo, "walkability classification zmax"),
+    )
+
+
+@dataclass(frozen=True)
+class LongitudinalProfileSurface:
+    profile: Callable[[float], float]
+    half_width: float = COURSE_HALF_WIDTH
+    exterior_height: float = 0.0
+
+    def height(self, x, z):
+        x, z = float(x), float(z)
+        if not np.isfinite([x, z]).all():
+            raise ValueError("profile query must be finite")
+        if abs(x) > self.half_width:
+            return self.exterior_height
+        value = float(self.profile(z))
+        if not np.isfinite(value):
+            raise ValueError("profile height must be finite")
+        return value
+
+
+@dataclass(frozen=True)
+class CrossSlopeSurface:
+    angle_degrees: float
+    grade_start_z: float
+    grade_length: float = 4.0
+    transition_length: float = 0.5
+    half_width: float = COURSE_HALF_WIDTH
+
+    def height(self, x, z):
+        x, z = float(x), float(z)
+        if not np.isfinite([x, z]).all():
+            raise ValueError("cross-slope query must be finite")
+        if abs(x) > self.half_width:
+            return 0.0
+        phase = z - self.grade_start_z
+        if phase <= 0.0 or phase >= self.grade_length:
+            return 0.0
+        factor = min(
+            1.0,
+            phase / self.transition_length,
+            (self.grade_length - phase) / self.transition_length,
+        )
+        return float(
+            x * np.tan(np.deg2rad(self.angle_degrees)) * factor)
+
+
+@dataclass(frozen=True)
+class BlockedCourseSurface:
+    wall_center_x: float = -0.8
+    ramp_center_x: float = 0.8
+    lane_half_width: float = 0.6
+    obstacle_start_z: float = FLAT_SPAWN_LENGTH
+    wall_height: float = 0.45
+    wall_top_length: float = 0.50
+    ramp_rise: float = 0.36
+    ramp_angle_degrees: float = 25.0
+    ramp_top_length: float = 0.50
+
+    @property
+    def ramp_run(self):
+        return float(
+            self.ramp_rise /
+            np.tan(np.deg2rad(self.ramp_angle_degrees)))
+
+    def height(self, x, z):
+        x, z = float(x), float(z)
+        if not np.isfinite([x, z]).all():
+            raise ValueError("blocked-course query must be finite")
+        wall_min_x = self.wall_center_x - self.lane_half_width
+        wall_max_x = self.wall_center_x + self.lane_half_width
+        ramp_min_x = self.ramp_center_x - self.lane_half_width
+        ramp_max_x = self.ramp_center_x + self.lane_half_width
+        wall_end_z = self.obstacle_start_z + self.wall_top_length
+        ramp_ascent_end_z = self.obstacle_start_z + self.ramp_run
+        ramp_end_z = ramp_ascent_end_z + self.ramp_top_length
+        if wall_min_x <= x <= wall_max_x:
+            if self.obstacle_start_z <= z \
+                    <= wall_end_z:
+                return self.wall_height
+        if ramp_min_x <= x <= ramp_max_x:
+            if self.obstacle_start_z <= z < ramp_ascent_end_z:
+                phase = z - self.obstacle_start_z
+                return float(
+                    phase *
+                    np.tan(np.deg2rad(self.ramp_angle_degrees)))
+            if ramp_ascent_end_z <= z <= ramp_end_z:
+                return self.ramp_rise
+        return 0.0
+
+
+def _region(region_id, bounds):
+    return {"id": region_id, "bounds_xz": [float(v) for v in bounds]}
+
+
+def _corridor_definition(
+    scene_id, label, surface, course_end_z, parameters, route,
+    walkability_class,
+):
+    heightfield_end_z = _runtime_f32_upper_ceiling(
+        course_end_z + LOOKAHEAD_MARGIN, "heightfield zmax")
+    playable = (-COURSE_HALF_WIDTH, COURSE_HALF_WIDTH, 0.0, course_end_z)
+    classification = _walkability_classification_bounds(playable)
+    bounds = (
+        -COURSE_HALF_WIDTH - LOOKAHEAD_MARGIN,
+        COURSE_HALF_WIDTH + LOOKAHEAD_MARGIN,
+        -LOOKAHEAD_MARGIN,
+        heightfield_end_z,
+    )
+    region_name = "certified" if walkability_class == 1 else "stress"
+    regions = {"certified": (), "stress": (), "blocked": ()}
+    regions[region_name] = (_region("course", playable),)
+    return SceneDefinition(
+        scene_id=scene_id,
+        label=label,
+        provenance={
+            "kind": "procedural", "source_ids": [],
+            "parameters": parameters,
+        },
+        surface=surface,
+        heightfield_bounds_xz=bounds,
+        playable_bounds_xz=playable,
+        lookahead_bounds_xz=bounds,
+        spawn_position=(0.0, 0.0, 0.0),
+        spawn_yaw_radians=0.0,
+        regions=regions,
+        routes=(route,),
+        walkability=lambda x, z, c=walkability_class, b=classification: (
+            c if _bounds_contains(b, x, z) else 0),
+    )
+
+
+def _stair_profile(rises, runs, landing_length=2.0):
+    rises = tuple(rises)
+    runs = tuple(runs)
+    pairs = tuple(zip(rises, runs))
+    ascent_ends = tuple(
+        FLAT_SPAWN_LENGTH + sum(runs[:index + 1])
+        for index in range(len(runs))
+    )
+    ascent_end = ascent_ends[-1]
+    descent_start = ascent_end + landing_length
+    reversed_pairs = tuple(reversed(pairs))
+    reversed_runs = tuple(run for _, run in reversed_pairs)
+    descent_ends = tuple(
+        descent_start + sum(reversed_runs[:index + 1])
+        for index in range(len(reversed_runs))
+    )
+    course_end = descent_ends[-1] + 1.0
+
+    def profile(z):
+        if z < FLAT_SPAWN_LENGTH:
+            return 0.0
+        height = 0.0
+        for (rise, _), end in zip(pairs, ascent_ends):
+            height += rise
+            if z < end:
+                return height
+        if z < descent_start:
+            return height
+        for (rise, _), end in zip(reversed_pairs, descent_ends):
+            if z < end:
+                return height
+            height -= rise
+        return 0.0
+
+    return profile, ascent_end, descent_start, course_end
+
+
+def _stair_definition(scene_id, label, rises, runs, unseen):
+    profile, ascent_end, descent_start, course_end = _stair_profile(rises, runs)
+    course_end = _runtime_f32(course_end, f"{scene_id} course end z")
+    parameters = {
+        "primitive": "stairs-up-landing-down",
+        "rises_m": list(rises),
+        "runs_m": list(runs),
+        "width_m": 1.2,
+        "landing_length_m": 2.0,
+        "flat_spawn_length_m": FLAT_SPAWN_LENGTH,
+        "flat_exit_length_m": 1.0,
+        "unseen_geometry": unseen,
+        "ascent_end_z_m": ascent_end,
+        "descent_start_z_m": descent_start,
+        "course_end_z_m": course_end,
+    }
+    route = SceneRoute(
+        "ascent-landing-descent",
+        ((0.0, 0.0), (0.0, 1.75),
+         (0.0, ascent_end + 1.0),
+         (0.0, descent_start + sum(runs) + 0.25),
+         (0.0, course_end)),
+        "traverse", 1, 2.0,
+    )
+    return _corridor_definition(
+        scene_id, label, LongitudinalProfileSurface(profile),
+        course_end, parameters, route, 1)
+
+
+def _ramp_profile(angle_degrees):
+    rise = 0.36
+    run = float(rise / np.tan(np.deg2rad(angle_degrees)))
+    ascent_end = FLAT_SPAWN_LENGTH + run
+    descent_start = ascent_end + 2.0
+    course_end = descent_start + run + 1.0
+
+    def profile(z):
+        if z < FLAT_SPAWN_LENGTH:
+            return 0.0
+        if z < ascent_end:
+            return (z - FLAT_SPAWN_LENGTH) * rise / run
+        if z < descent_start:
+            return rise
+        if z < descent_start + run:
+            return rise - (z - descent_start) * rise / run
+        return 0.0
+
+    return profile, run, ascent_end, descent_start, course_end
+
+
+def _ramp_definition(scene_id, label, angle_degrees, stress):
+    profile, run, ascent_end, descent_start, course_end = _ramp_profile(
+        angle_degrees)
+    course_end = _runtime_f32(course_end, f"{scene_id} course end z")
+    walkability_class = 2 if stress else 1
+    expected_outcome = "traverse-or-safe-stop" if stress else "traverse"
+    parameters = {
+        "primitive": "ramp-up-landing-down",
+        "angle_degrees": float(angle_degrees),
+        "rise_m": 0.36,
+        "run_m": run,
+        "width_m": 1.2,
+        "landing_length_m": 2.0,
+        "flat_spawn_length_m": FLAT_SPAWN_LENGTH,
+        "flat_exit_length_m": 1.0,
+        "ascent_end_z_m": ascent_end,
+        "descent_start_z_m": descent_start,
+        "course_end_z_m": course_end,
+    }
+    route = SceneRoute(
+        "up-landing-down",
+        ((0.0, 0.0), (0.0, 1.75),
+         (0.0, ascent_end + 1.0),
+         (0.0, descent_start + run + 0.25),
+         (0.0, course_end)),
+        expected_outcome, walkability_class, 2.0,
+    )
+    return _corridor_definition(
+        scene_id, label, LongitudinalProfileSurface(profile),
+        course_end, parameters, route, walkability_class)
+
+
+def _cross_slope_definition(angle_degrees):
+    flat_entry_length = 1.0
+    grade_start = FLAT_SPAWN_LENGTH + flat_entry_length
+    course_end = grade_start + 4.0 + 1.0
+    scene_id = f"cross-slope-{angle_degrees:02d}"
+    course_end = _runtime_f32(course_end, f"{scene_id} course end z")
+    parameters = {
+        "primitive": "cross-slope",
+        "angle_degrees": float(angle_degrees),
+        "width_m": 1.2,
+        "grade_length_m": 4.0,
+        "transition_length_m": 0.5,
+        "flat_spawn_length_m": FLAT_SPAWN_LENGTH,
+        "flat_entry_length_m": flat_entry_length,
+        "flat_exit_length_m": 1.0,
+        "course_end_z_m": course_end,
+    }
+    route = SceneRoute(
+        "forward-cross-slope",
+        ((0.0, 0.0), (0.0, 2.75), (0.0, 5.0),
+         (0.0, 7.25), (0.0, course_end)),
+        "traverse", 1, 0.0,
+    )
+    return _corridor_definition(
+        scene_id, f"Cross Slope {angle_degrees} Degrees",
+        CrossSlopeSurface(float(angle_degrees), grade_start), course_end,
+        parameters, route, 1)
+
+
+def _mixed_definition():
+    stair_runs = (0.30, 0.30, 0.30, 0.30)
+    stair_rises = (0.08, 0.08, 0.08, 0.08)
+    stair_ascent_ends = tuple(
+        FLAT_SPAWN_LENGTH + sum(stair_runs[:index + 1])
+        for index in range(len(stair_runs))
+    )
+    ascent_end = stair_ascent_ends[-1]
+    elevated_end = ascent_end + 3.0
+    changes = (0.08, -0.12, 0.04)
+    block_starts = tuple(elevated_end + 0.60 * i for i in range(3))
+    ramp_start = elevated_end + 3 * 0.60
+    block_ends = block_starts[1:] + (ramp_start,)
+    ramp_run = float(
+        sum(stair_rises) / np.tan(np.deg2rad(10.0)))
+    course_end = ramp_start + ramp_run + 1.0
+    course_end = _runtime_f32(course_end, "mixed-multilevel course end z")
+
+    def profile(z):
+        if z < FLAT_SPAWN_LENGTH:
+            return 0.0
+        height = 0.0
+        for rise, end in zip(stair_rises, stair_ascent_ends):
+            height += rise
+            if z < end:
+                return height
+        if z < elevated_end:
+            return height
+        for change, end in zip(changes, block_ends):
+            height += change
+            if z < end:
+                return height
+        if z < ramp_start + ramp_run:
+            return height * (1.0 - (z - ramp_start) / ramp_run)
+        return 0.0
+
+    parameters = {
+        "primitive": "mixed-multilevel",
+        "stair_rises_m": list(stair_rises),
+        "stair_runs_m": list(stair_runs),
+        "width_m": 1.2,
+        "elevated_walk_length_m": 3.0,
+        "block_height_changes_m": list(changes),
+        "block_top_length_m": 0.60,
+        "block_starts_z_m": list(block_starts),
+        "return_ramp_angle_degrees": 10.0,
+        "return_ramp_run_m": ramp_run,
+        "flat_spawn_length_m": FLAT_SPAWN_LENGTH,
+        "flat_exit_length_m": 1.0,
+        "course_end_z_m": course_end,
+    }
+    route_points = [
+        (0.0, 0.0), (0.0, 1.75), (0.0, ascent_end + 1.5),
+    ]
+    route_points.extend((0.0, start + 0.30) for start in block_starts)
+    route_points.extend(((0.0, ramp_start + ramp_run), (0.0, course_end)))
+    return _corridor_definition(
+        "mixed-multilevel", "Mixed Multilevel Course",
+        LongitudinalProfileSurface(profile), course_end, parameters,
+        SceneRoute(
+            "full-course", tuple(route_points), "traverse", 1, 2.0),
+        1)
+
+
+def _blocked_definition():
+    surface = BlockedCourseSurface()
+    obstacle_start = surface.obstacle_start_z
+    ramp_run = surface.ramp_run
+    ramp_ascent_end = obstacle_start + ramp_run
+    ramp_end = ramp_ascent_end + surface.ramp_top_length
+    course_end = _runtime_f32(
+        ramp_end + 1.0, "blocked-course course end z")
+    heightfield_end_z = _runtime_f32_upper_ceiling(
+        course_end + LOOKAHEAD_MARGIN,
+        "blocked-course heightfield zmax")
+    playable = (-1.4, 1.4, 0.0, course_end)
+    classification = _walkability_classification_bounds(playable)
+    bounds = (-2.4, 2.4, -1.0, heightfield_end_z)
+
+    def walkability(x, z):
+        if not _bounds_contains(classification, x, z):
+            return 0
+        # Expand only the outer course bounds. This obstacle threshold is the
+        # published safety boundary and deliberately receives no halo.
+        return 1 if z <= obstacle_start - SCENE_CELL_SIZE else 0
+
+    parameters = {
+        "primitive": "blocked-course",
+        "lane_width_m": 1.2,
+        "wall_center_x_m": surface.wall_center_x,
+        "wall_height_m": surface.wall_height,
+        "wall_top_length_m": surface.wall_top_length,
+        "ramp_center_x_m": surface.ramp_center_x,
+        "ramp_rise_m": surface.ramp_rise,
+        "ramp_angle_degrees": surface.ramp_angle_degrees,
+        "ramp_run_m": ramp_run,
+        "ramp_top_length_m": surface.ramp_top_length,
+        "flat_spawn_length_m": FLAT_SPAWN_LENGTH,
+        "course_end_z_m": course_end,
+    }
+    return SceneDefinition(
+        scene_id="blocked-course",
+        label="Blocked Wall And Ramp Course",
+        provenance={
+            "kind": "procedural", "source_ids": [],
+            "parameters": parameters,
+        },
+        surface=surface,
+        heightfield_bounds_xz=bounds,
+        playable_bounds_xz=playable,
+        lookahead_bounds_xz=bounds,
+        spawn_position=(0.0, 0.0, 0.0),
+        spawn_yaw_radians=0.0,
+        regions={
+            "certified": (_region(
+                "approach", (-1.4, 1.4, 0.0,
+                             obstacle_start - SCENE_CELL_SIZE)),),
+            "stress": (),
+            "blocked": (
+                _region("wall", (-1.4, -0.2, obstacle_start, course_end)),
+                _region("ramp", (0.2, 1.4, obstacle_start, course_end)),
+            ),
+        },
+        routes=(
+            SceneRoute(
+                "wall-safe-stop",
+                ((0.0, 0.0), (-0.8, 1.5), (-0.8, 2.25)),
+                "safe-stop", 0, 0.0),
+            SceneRoute(
+                "ramp-safe-stop",
+                ((0.0, 0.0), (0.8, 1.5),
+                 (0.8, obstacle_start + ramp_run / 2.0)),
+                "safe-stop", 0, 0.0),
+        ),
+        walkability=walkability,
+    )
+
+
+def procedural_scene_definitions():
+    return (
+        _stair_definition(
+            "stairs-shallow", "Shallow Stairs",
+            (0.08, 0.08, 0.08, 0.08),
+            (0.30, 0.30, 0.30, 0.30), False),
+        _stair_definition(
+            "stairs-standard", "Standard Stairs",
+            (0.12, 0.12, 0.12), (0.32, 0.32, 0.32), False),
+        _stair_definition(
+            "stairs-unseen-variable", "Unseen Variable Stairs",
+            (0.06, 0.10, 0.08, 0.12),
+            (0.24, 0.34, 0.28, 0.38), True),
+        _ramp_definition(
+            "ramp-05-up-down", "Ramp 5 Degrees Up And Down", 5, False),
+        _ramp_definition(
+            "ramp-10-up-down", "Ramp 10 Degrees Up And Down", 10, False),
+        _ramp_definition(
+            "ramp-15-stress", "Ramp 15 Degree Stress Case", 15, True),
+        _cross_slope_definition(5),
+        _cross_slope_definition(10),
+        _mixed_definition(),
+        _blocked_definition(),
+    )
+
+
 def _bounds_contains(bounds, x, z):
     xmin, xmax, zmin, zmax = bounds
     return xmin <= x <= xmax and zmin <= z <= zmax
