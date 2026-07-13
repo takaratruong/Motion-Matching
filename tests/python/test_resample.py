@@ -33,14 +33,20 @@ class ResampleTests(unittest.TestCase):
     def test_slerp_unrolls_each_bone_independently(self):
         src = np.array([
             [[1, 0, 0, 0], [1, 0, 0, 0]],
-            [[-1, 0, 0, 0], [-.70710678, 0, -.70710678, 0]],
+            [[-1, 0, 0, 0], [.70710678, 0, .70710678, 0]],
         ], np.float64)
+        self.assertLess(np.dot(src[0, 0], src[1, 0]), 0.0)
+        self.assertGreater(np.dot(src[0, 1], src[1, 1]), 0.0)
         out = resample_quaternions_wxyz(src, 1.0, 2.0)
         self.assertEqual(out.shape, (3, 2, 4))
-        np.testing.assert_allclose(
-            np.linalg.norm(out, axis=-1), 1.0, atol=1e-7)
-        self.assertGreater(out[1, 0, 0], 0.999)
-        self.assertGreater(out[1, 1, 0], 0.9)
+        c22, s22 = np.cos(np.pi / 8.0), np.sin(np.pi / 8.0)
+        c45 = 2**-0.5
+        expected = np.array([
+            [[1, 0, 0, 0], [1, 0, 0, 0]],
+            [[1, 0, 0, 0], [c22, 0, s22, 0]],
+            [[1, 0, 0, 0], [c45, 0, c45, 0]],
+        ], np.float64)
+        np.testing.assert_allclose(out, expected, atol=1e-7)
 
     def test_invalid_resampling_inputs_are_rejected(self):
         with self.assertRaises(ValueError):
