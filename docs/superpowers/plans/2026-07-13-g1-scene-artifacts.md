@@ -7497,6 +7497,52 @@ git commit -m "feat: atomically publish complete G1 scene packs"
 
 ### Task 12: Independently validate motion, scenes, routes, hashes, and source rows
 
+> **Execution correction (2026-07-13; authoritative over the original steps
+> below):** Split this task into a direct-fixture normal validator and a
+> streaming full-source validator. Do not invoke or expect a v2 production
+> builder in Task 12; that integration belongs to Task 11B after both validator
+> modes are complete.
+>
+> **Task 12A — normal v2 validation** owns
+> `resources/validate_g1_terrain_database.py` and a direct-fixture
+> `tests/python/test_validator.py`. Its temporary fixture must contain the full
+> canonical 14-scene pack without calling the production builder. Validation
+> must enforce canonical JSON with type-exact scalars and nested key sets, safe
+> regular relative paths, the exact file/directory tree, every hash link,
+> G1HF/v2 and G1WM/v1 bounds, and exact regenerated OBJ bytes. Static JSON
+> subtrees must be compared by canonical bytes or a recursive type-exact
+> comparator; Python `==` is insufficient because it equates integers, floats,
+> and booleans in several cases.
+>
+> Region and route validation must independently reproduce the already-locked
+> runtime contracts: inclusive float32 nearest-node region Cartesian covers;
+> every adjacent half-cell route segment's at-most-2x2 cell supercover; a
+> certified prefix, exactly one mixed `{0,1}` cover, and blocked suffix for
+> safe-stop routes; and the exact 0.20 m endpoint-footprint oracle with its
+> binary32 squared-radius allowance. For GRAIL scenes, validate the locked
+> scene/base/class/provenance/parameter mapping and reconstruct the complete
+> G1WM classifier over every grid node from playable bounds plus the exact
+> `0.25f` halo. Source-derived route/spawn/yaw equality remains a full-source
+> responsibility.
+>
+> **Task 12B — full-source validation** must expose small unit-testable seams
+> for per-clip reconstruction and encoded row comparison. Compare float32 rows
+> bit-exactly (including signed zero), contacts as exact `uint8`, both skeleton
+> names and parents, source name and terrain identity, all three support
+> columns, source maps, and validation reports under an explicitly named
+> tolerance. Premeasure all 1,769 source-specific GRAIL surfaces to lock the
+> four selected bases, then stream Takara and each GRAIL source one at a time;
+> retain only the four selected converted route clips. Full mode must visit all
+> 1,770 ranges and return exactly 459,682 reconstructed frame records. GRAIL
+> pickle/joblib inputs are trusted local data, and surfaces remain pinned to
+> the canonical USD/reconstruction directories.
+>
+> The builder-driven acceptance and CLI corruption matrix in the original
+> Steps 1, 6, and 7 are deferred to Task 11B. The parsing/schema material below
+> remains reference, but its node-center region loop, point-only route oracle,
+> missing endpoint-footprint gate, and retain-all-clips Step 9 algorithm are
+> superseded by this correction.
+
 **Files:**
 - Modify: `resources/validate_g1_terrain_database.py`
 - Modify: `tests/python/test_build_cli.py`
