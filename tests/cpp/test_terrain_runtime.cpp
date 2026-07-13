@@ -1,4 +1,5 @@
 #include "terrain_runtime.h"
+#include "quat.h"
 
 #include <assert.h>
 #include <float.h>
@@ -12,6 +13,48 @@
 #include <vector>
 
 typedef std::vector<unsigned char> byte_buffer;
+
+static void check(bool condition, const char* message)
+{
+    if (!condition) {
+        fprintf(stderr, "terrain runtime test failed: %s\n", message);
+        abort();
+    }
+}
+
+static void check_close(float actual, float expected, const char* message)
+{
+    check(terrain_float_is_finite(actual), message);
+    check(fabsf(actual - expected) < 1e-5f, message);
+}
+
+static quat heading_positive_x()
+{
+    return quat_from_angle_axis(0.5f * PIf, vec3(0.0f, 1.0f, 0.0f));
+}
+
+static quat heading_vertical()
+{
+    return quat_from_angle_axis(0.5f * PIf, vec3(1.0f, 0.0f, 0.0f));
+}
+
+static void initialize_heightfield(
+    heightfield& field,
+    int nx,
+    int nz,
+    float origin_x,
+    float origin_z,
+    float cell_size,
+    float exterior_height)
+{
+    field.nx = nx;
+    field.nz = nz;
+    field.origin_x = origin_x;
+    field.origin_z = origin_z;
+    field.cell_size = cell_size;
+    field.exterior_height = exterior_height;
+    field.heights.resize(nx * nz);
+}
 
 static void append_bytes(byte_buffer& out, const void* data, size_t size)
 {
@@ -432,6 +475,336 @@ static void test_heightfield_rejects_float_rounded_upper_grid_index()
     assert(inward_sample == 0.0f);
 }
 
+static void test_stationary_centerline_extends_current_heading()
+{
+    heightfield field;
+    initialize_heightfield(field, 2, 5, 0.0f, 0.0f, 0.25f, -9.0f);
+    for (int z = 0; z < field.nz; ++z) {
+        for (int x = 0; x < field.nx; ++x) {
+            field.heights(z * field.nx + x) = 0.25f * z;
+        }
+    }
+
+    array1d<vec3> positions(4);
+    array1d<quat> rotations(4);
+    for (int i = 0; i < positions.size; ++i) {
+        positions(i) = vec3(0.0f, 10.0f * i, 0.0f);
+        rotations(i) = quat();
+    }
+
+    const vec3 endpoint = terrain_centerline_point_at_arc(
+        vec3(0.0f, 3.0f, 0.0f), positions, rotations, 1.0f);
+    check_close(endpoint.x, 0.0f, "stationary endpoint x");
+    check_close(endpoint.y, 0.0f, "stationary endpoint ignores y");
+    check_close(endpoint.z, 1.0f, "stationary endpoint heading extension");
+
+    float query[4] = {};
+    terrain_centerline_query(
+        query, field, vec3(0.0f, 3.0f, 0.0f), positions, rotations);
+    const float expected[4] = {0.25f, 0.50f, 0.75f, 1.00f};
+    for (int i = 0; i < 4; ++i) {
+        check_close(query[i], expected[i], "stationary terrain query");
+    }
+}
+
+static void test_straight_step_query_is_ground_relative_on_elevated_base()
+{
+    heightfield field;
+    initialize_heightfield(field, 5, 2, 0.0f, 0.0f, 0.25f, 1.0f);
+    for (int z = 0; z < field.nz; ++z) {
+        for (int x = 0; x < field.nx; ++x) {
+            field.heights(z * field.nx + x) =
+                1.0f + (x >= 2 ? 0.29f : 0.0f);
+        }
+    }
+
+    array1d<vec3> positions(2);
+    positions(0) = vec3(0.0f, 0.0f, 0.0f);
+    positions(1) = vec3(1.0f, 100.0f, 0.0f);
+    array1d<quat> rotations(2);
+    rotations(0) = heading_positive_x();
+    rotations(1) = heading_positive_x();
+
+    float query[4] = {};
+    terrain_centerline_query(
+        query, field, vec3(0.0f, 1.0f, 0.0f), positions, rotations);
+    const float expected[4] = {0.0f, 0.29f, 0.29f, 0.29f};
+    for (int i = 0; i < 4; ++i) {
+        check_close(query[i], expected[i], "elevated step terrain query");
+    }
+}
+
+static void test_curved_query_matches_python_geometric_arc_fixture()
+{
+    heightfield field;
+    initialize_heightfield(field, 5, 5, 0.0f, 0.0f, 0.25f, -99.0f);
+    for (int z = 0; z < field.nz; ++z) {
+        for (int x = 0; x < field.nx; ++x) {
+            const float world_x = 0.25f * x;
+            const float world_z = 0.25f * z;
+            field.heights(z * field.nx + x) = world_x + 10.0f * world_z;
+        }
+    }
+
+    array1d<vec3> positions(3);
+    positions(0) = vec3(0.0f, 0.0f, 0.0f);
+    positions(1) = vec3(0.5f, 20.0f, 0.0f);
+    positions(2) = vec3(0.5f, -20.0f, 0.5f);
+    array1d<quat> rotations(3);
+    rotations(0) = heading_positive_x();
+    rotations(1) = heading_positive_x();
+    rotations(2) = quat();
+
+    float query[4] = {};
+    terrain_centerline_query(
+        query, field, vec3(0.0f, 0.0f, 0.0f), positions, rotations);
+    const float expected[4] = {0.25f, 0.50f, 3.0f, 5.5f};
+    for (int i = 0; i < 4; ++i) {
+        check_close(query[i], expected[i], "curved Python parity query");
+    }
+}
+
+static void test_centerline_uses_root_skips_flat_repeats_and_latest_heading()
+{
+    const vec3 root(1.0f, 7.0f, 1.0f);
+    array1d<vec3> positions(5);
+    positions(0) = vec3(99.0f, 99.0f, 99.0f);
+    positions(1) = vec3(1.0f, 70.0f, 1.0f);
+    positions(2) = vec3(1.0f, -70.0f, 1.0f);
+    positions(3) = vec3(1.5f, 500.0f, 1.0f);
+    positions(4) = vec3(1.5f, -500.0f, 1.0f);
+    array1d<quat> rotations(5);
+    rotations(0) = heading_positive_x();
+    rotations(1) = heading_positive_x();
+    rotations(2) = heading_vertical();
+    rotations(3) = heading_vertical();
+    rotations(4) = heading_vertical();
+
+    vec3 point = terrain_centerline_point_at_arc(
+        root, positions, rotations, 0.25f);
+    check_close(point.x, 1.25f, "root-authoritative centerline x");
+    check_close(point.z, 1.0f, "root-authoritative centerline z");
+
+    point = terrain_centerline_point_at_arc(root, positions, rotations, 0.75f);
+    check_close(point.x, 1.75f, "degenerate heading inherits prior x");
+    check_close(point.z, 1.0f, "degenerate heading inherits prior z");
+
+    rotations(4) = quat(0.0f, 0.0f, 0.0f, 0.0f);
+    point = terrain_centerline_point_at_arc(root, positions, rotations, 0.75f);
+    check_close(point.x, 1.75f, "zero quaternion inherits prior x");
+    check_close(point.z, 1.0f, "zero quaternion inherits prior z");
+
+    rotations(4) = quat();
+    point = terrain_centerline_point_at_arc(root, positions, rotations, 0.75f);
+    check_close(point.x, 1.5f, "latest heading extension x");
+    check_close(point.z, 1.25f, "latest heading extension z");
+
+    positions(1) = root;
+    positions(2) = root;
+    positions(3) = root;
+    positions(4) = root;
+    for (int i = 0; i < rotations.size; ++i) {
+        rotations(i) = quat(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    point = terrain_centerline_point_at_arc(root, positions, rotations, 1.0f);
+    check_close(point.x, 1.0f, "all-degenerate heading fallback x");
+    check_close(point.z, 2.0f, "all-degenerate heading fallback +Z");
+}
+
+static void test_centerline_query_uses_heightfield_exterior_at_boundary()
+{
+    heightfield field;
+    initialize_heightfield(field, 5, 2, 0.0f, 0.0f, 0.25f, -3.0f);
+    field.heights.set(2.0f);
+
+    array1d<vec3> positions(2);
+    positions(0) = vec3(0.75f, 0.0f, 0.0f);
+    positions(1) = vec3(0.75f, 0.0f, 0.0f);
+    array1d<quat> rotations(2);
+    rotations(0) = heading_positive_x();
+    rotations(1) = heading_positive_x();
+
+    float query[4] = {};
+    terrain_centerline_query(
+        query, field, vec3(0.75f, 0.0f, 0.0f), positions, rotations);
+    const float expected[4] = {0.0f, -5.0f, -5.0f, -5.0f};
+    for (int i = 0; i < 4; ++i) {
+        check_close(query[i], expected[i], "boundary exterior terrain query");
+    }
+}
+
+static void check_zero_query(const float query[4], const char* message)
+{
+    for (int i = 0; i < 4; ++i) {
+        check(terrain_float_is_finite(query[i]), message);
+        check(query[i] == 0.0f, message);
+    }
+}
+
+static void test_centerline_invalid_shapes_are_release_safe()
+{
+    heightfield field;
+    initialize_heightfield(field, 2, 2, 0.0f, 0.0f, 1.0f, -1.0f);
+    field.heights.zero();
+    array1d<vec3> positions(2);
+    array1d<quat> rotations(2);
+    positions(0) = vec3();
+    positions(1) = vec3();
+    rotations(0) = quat();
+    rotations(1) = quat();
+
+    float query[4] = {9.0f, 9.0f, 9.0f, 9.0f};
+    terrain_centerline_query(
+        query, field, vec3(), slice1d<vec3>(0, NULL), rotations);
+    check_zero_query(query, "empty positions query");
+
+    for (int i = 0; i < 4; ++i) query[i] = 9.0f;
+    terrain_centerline_query(
+        query, field, vec3(), positions, slice1d<quat>(0, NULL));
+    check_zero_query(query, "empty rotations query");
+
+    for (int i = 0; i < 4; ++i) query[i] = 9.0f;
+    terrain_centerline_query(
+        query, field, vec3(), positions, slice1d<quat>(1, rotations.data));
+    check_zero_query(query, "mismatched trajectory query");
+
+    for (int i = 0; i < 4; ++i) query[i] = 9.0f;
+    terrain_centerline_query(
+        query, field, vec3(), slice1d<vec3>(1, NULL),
+        slice1d<quat>(1, NULL));
+    check_zero_query(query, "null trajectory storage query");
+
+    terrain_centerline_query(
+        NULL, field, vec3(), positions, rotations);
+}
+
+static void test_centerline_nonfinite_inputs_are_release_safe_under_fast_math()
+{
+    heightfield field;
+    initialize_heightfield(field, 2, 2, 0.0f, 0.0f, 1.0f, -1.0f);
+    field.heights(0) = 0.0f;
+    field.heights(1) = 0.0f;
+    field.heights(2) = 1.0f;
+    field.heights(3) = 1.0f;
+    array1d<vec3> positions(2);
+    array1d<quat> rotations(2);
+    positions(0) = vec3();
+    positions(1) = vec3(0.0f, 0.0f, 1.0f);
+    rotations(0) = quat();
+    rotations(1) = quat();
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float infinity = std::numeric_limits<float>::infinity();
+
+    float query[4] = {9.0f, 9.0f, 9.0f, 9.0f};
+    terrain_centerline_query(
+        query, field, vec3(nan, 0.0f, 0.0f), positions, rotations);
+    check_zero_query(query, "nonfinite root query");
+
+    for (int i = 0; i < 4; ++i) query[i] = 9.0f;
+    terrain_centerline_query(
+        query, field, vec3(0.0f, nan, 0.0f), positions, rotations);
+    check_zero_query(query, "nonfinite root vertical component query");
+
+    positions(1).z = infinity;
+    for (int i = 0; i < 4; ++i) query[i] = 9.0f;
+    terrain_centerline_query(query, field, vec3(), positions, rotations);
+    check_zero_query(query, "nonfinite position query");
+    positions(1).z = 1.0f;
+
+    positions(1).y = -infinity;
+    for (int i = 0; i < 4; ++i) query[i] = 9.0f;
+    terrain_centerline_query(query, field, vec3(), positions, rotations);
+    check_zero_query(query, "nonfinite position vertical component query");
+    positions(1).y = 0.0f;
+
+    rotations(1).w = nan;
+    for (int i = 0; i < 4; ++i) query[i] = 9.0f;
+    terrain_centerline_query(query, field, vec3(), positions, rotations);
+    check_zero_query(query, "nonfinite rotation query");
+    rotations(1) = quat();
+
+    const vec3 nan_point = terrain_centerline_point_at_arc(
+        vec3(2.0f, 8.0f, 3.0f), positions, rotations, nan);
+    check_close(nan_point.x, 2.0f, "nonfinite distance fallback x");
+    check_close(nan_point.y, 0.0f, "nonfinite distance fallback y");
+    check_close(nan_point.z, 3.0f, "nonfinite distance fallback z");
+    const vec3 negative_point = terrain_centerline_point_at_arc(
+        vec3(2.0f, 8.0f, 3.0f), positions, rotations, -1.0f);
+    check_close(negative_point.x, 2.0f, "negative distance fallback x");
+    check_close(negative_point.z, 3.0f, "negative distance fallback z");
+    const vec3 positive_infinite_point = terrain_centerline_point_at_arc(
+        vec3(2.0f, 8.0f, 3.0f), positions, rotations, infinity);
+    check_close(
+        positive_infinite_point.x, 2.0f,
+        "positive infinite distance fallback x");
+    check_close(
+        positive_infinite_point.z, 3.0f,
+        "positive infinite distance fallback z");
+    const vec3 negative_infinite_point = terrain_centerline_point_at_arc(
+        vec3(2.0f, 8.0f, 3.0f), positions, rotations, -infinity);
+    check_close(
+        negative_infinite_point.x, 2.0f,
+        "negative infinite distance fallback x");
+    check_close(
+        negative_infinite_point.z, 3.0f,
+        "negative infinite distance fallback z");
+}
+
+static void test_centerline_query_does_not_mutate_inputs()
+{
+    heightfield field;
+    initialize_heightfield(field, 3, 3, -1.0f, -1.0f, 1.0f, -5.0f);
+    for (int i = 0; i < field.heights.size; ++i) {
+        field.heights(i) = static_cast<float>(i);
+    }
+    array1d<vec3> positions(3);
+    positions(0) = vec3(10.0f, 11.0f, 12.0f);
+    positions(1) = vec3(0.25f, 13.0f, 0.0f);
+    positions(2) = vec3(0.50f, 14.0f, 0.0f);
+    array1d<quat> rotations(3);
+    rotations(0) = heading_positive_x();
+    rotations(1) = heading_positive_x();
+    rotations(2) = quat();
+    const array1d<float> original_heights(field.heights);
+    const array1d<vec3> original_positions(positions);
+    const array1d<quat> original_rotations(rotations);
+    const int original_nx = field.nx;
+    const int original_nz = field.nz;
+    const float original_origin_x = field.origin_x;
+    const float original_origin_z = field.origin_z;
+    const float original_cell_size = field.cell_size;
+    const float original_exterior = field.exterior_height;
+
+    float query[4] = {};
+    terrain_centerline_query(
+        query, field, vec3(0.0f, 0.0f, 0.0f), positions, rotations);
+    (void)terrain_centerline_point_at_arc(
+        vec3(0.0f, 0.0f, 0.0f), positions, rotations, 0.75f);
+
+    check(field.nx == original_nx && field.nz == original_nz,
+          "heightfield dimensions mutated");
+    check(field.origin_x == original_origin_x &&
+          field.origin_z == original_origin_z &&
+          field.cell_size == original_cell_size &&
+          field.exterior_height == original_exterior,
+          "heightfield metadata mutated");
+    for (int i = 0; i < field.heights.size; ++i) {
+        check(field.heights(i) == original_heights(i),
+              "heightfield values mutated");
+    }
+    for (int i = 0; i < positions.size; ++i) {
+        check(positions(i).x == original_positions(i).x &&
+              positions(i).y == original_positions(i).y &&
+              positions(i).z == original_positions(i).z,
+              "trajectory positions mutated");
+        check(rotations(i).w == original_rotations(i).w &&
+              rotations(i).x == original_rotations(i).x &&
+              rotations(i).y == original_rotations(i).y &&
+              rotations(i).z == original_rotations(i).z,
+              "trajectory rotations mutated");
+    }
+}
+
 static void probe_generated_artifacts(
     const char* sidecar_path, const char* heightfield_path)
 {
@@ -479,6 +852,14 @@ int main(int argc, char** argv)
     test_heightfield_rejects_nonfinite_metadata_and_heights();
     test_heightfield_open_failure_is_actionable_and_transactional();
     test_heightfield_rejects_float_rounded_upper_grid_index();
+    test_stationary_centerline_extends_current_heading();
+    test_straight_step_query_is_ground_relative_on_elevated_base();
+    test_curved_query_matches_python_geometric_arc_fixture();
+    test_centerline_uses_root_skips_flat_repeats_and_latest_heading();
+    test_centerline_query_uses_heightfield_exterior_at_boundary();
+    test_centerline_invalid_shapes_are_release_safe();
+    test_centerline_nonfinite_inputs_are_release_safe_under_fast_math();
+    test_centerline_query_does_not_mutate_inputs();
     if (argc == 3) {
         probe_generated_artifacts(argv[1], argv[2]);
     }

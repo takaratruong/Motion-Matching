@@ -3,9 +3,10 @@
 #include <stdlib.h>
 
 #include "array.h"
-#include "vec.h"
+#include "quat.h"
 
 #include <errno.h>
+#include <float.h>
 #include <limits.h>
 #include <math.h>
 #include <stdarg.h>
@@ -467,4 +468,214 @@ static inline float heightfield_sample(
         field.heights(z1 * field.nx + x0),
         field.heights(z1 * field.nx + x1), tx);
     return lerpf(row0, row1, tz);
+}
+
+static inline bool terrain_centerline_inputs_are_valid(
+    vec3 root,
+    const slice1d<vec3> trajectory_positions,
+    const slice1d<quat> trajectory_rotations)
+{
+    if (!terrain_float_is_finite(root.x) ||
+        !terrain_float_is_finite(root.y) ||
+        !terrain_float_is_finite(root.z) ||
+        trajectory_positions.size <= 0 ||
+        trajectory_positions.size != trajectory_rotations.size ||
+        trajectory_positions.data == NULL ||
+        trajectory_rotations.data == NULL) {
+        return false;
+    }
+
+    for (int i = 0; i < trajectory_positions.size; ++i) {
+        const vec3 position = trajectory_positions.data[i];
+        const quat rotation = trajectory_rotations.data[i];
+        if (!terrain_float_is_finite(position.x) ||
+            !terrain_float_is_finite(position.y) ||
+            !terrain_float_is_finite(position.z) ||
+            !terrain_float_is_finite(rotation.w) ||
+            !terrain_float_is_finite(rotation.x) ||
+            !terrain_float_is_finite(rotation.y) ||
+            !terrain_float_is_finite(rotation.z)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static inline vec3 terrain_centerline_flattened_heading(
+    quat rotation, vec3 fallback)
+{
+    if (!terrain_float_is_finite(rotation.w) ||
+        !terrain_float_is_finite(rotation.x) ||
+        !terrain_float_is_finite(rotation.y) ||
+        !terrain_float_is_finite(rotation.z)) {
+        return fallback;
+    }
+    const float rotation_maximum = maxf(
+        maxf(fabsf(rotation.w), fabsf(rotation.x)),
+        maxf(fabsf(rotation.y), fabsf(rotation.z)));
+    if (rotation_maximum < 1e-8f) {
+        return fallback;
+    }
+    double w = static_cast<double>(rotation.w) / rotation_maximum;
+    double x = static_cast<double>(rotation.x) / rotation_maximum;
+    double y = static_cast<double>(rotation.y) / rotation_maximum;
+    double z = static_cast<double>(rotation.z) / rotation_maximum;
+    const double rotation_length = sqrt(w * w + x * x + y * y + z * z);
+    if (rotation_length < 1e-8) {
+        return fallback;
+    }
+    w /= rotation_length;
+    x /= rotation_length;
+    y /= rotation_length;
+    z /= rotation_length;
+
+    const double forward_x = 2.0 * (x * z + w * y);
+    const double forward_z = 1.0 - 2.0 * (x * x + y * y);
+    const double maximum = fmax(fabs(forward_x), fabs(forward_z));
+    if (maximum < 1e-8) {
+        return fallback;
+    }
+    const double scaled_x = forward_x / maximum;
+    const double scaled_z = forward_z / maximum;
+    const double scaled_length = sqrt(
+        scaled_x * scaled_x + scaled_z * scaled_z);
+    if (scaled_length < 1e-8) {
+        return fallback;
+    }
+    return vec3(
+        static_cast<float>(scaled_x / scaled_length),
+        0.0f,
+        static_cast<float>(scaled_z / scaled_length));
+}
+
+static inline vec3 terrain_centerline_safe_point(
+    double x, double z, vec3 fallback)
+{
+    if (x < -static_cast<double>(FLT_MAX) ||
+        x > static_cast<double>(FLT_MAX) ||
+        z < -static_cast<double>(FLT_MAX) ||
+        z > static_cast<double>(FLT_MAX)) {
+        return fallback;
+    }
+    const vec3 point(static_cast<float>(x), 0.0f, static_cast<float>(z));
+    if (!terrain_float_is_finite(point.x) ||
+        !terrain_float_is_finite(point.z)) {
+        return fallback;
+    }
+    return point;
+}
+
+static inline vec3 terrain_centerline_point_at_arc(
+    vec3 root,
+    const slice1d<vec3> trajectory_positions,
+    const slice1d<quat> trajectory_rotations,
+    float distance)
+{
+    const vec3 safe_root(
+        terrain_float_is_finite(root.x) ? root.x : 0.0f,
+        0.0f,
+        terrain_float_is_finite(root.z) ? root.z : 0.0f);
+    if (!terrain_float_is_finite(distance) || distance <= 0.0f ||
+        !terrain_centerline_inputs_are_valid(
+            root, trajectory_positions, trajectory_rotations)) {
+        return safe_root;
+    }
+
+    vec3 latest_heading = terrain_centerline_flattened_heading(
+        trajectory_rotations.data[0], vec3(0.0f, 0.0f, 1.0f));
+    double previous_x = static_cast<double>(root.x);
+    double previous_z = static_cast<double>(root.z);
+    double remaining = static_cast<double>(distance);
+
+    for (int i = 1; i < trajectory_positions.size; ++i) {
+        const double next_x =
+            static_cast<double>(trajectory_positions.data[i].x);
+        const double next_z =
+            static_cast<double>(trajectory_positions.data[i].z);
+        const double delta_x = next_x - previous_x;
+        const double delta_z = next_z - previous_z;
+        const double segment_length = sqrt(
+            delta_x * delta_x + delta_z * delta_z);
+
+        if (segment_length > 1e-6) {
+            if (remaining <= segment_length) {
+                const double alpha = remaining / segment_length;
+                return terrain_centerline_safe_point(
+                    previous_x + delta_x * alpha,
+                    previous_z + delta_z * alpha,
+                    safe_root);
+            }
+            remaining -= segment_length;
+            previous_x = next_x;
+            previous_z = next_z;
+        }
+
+        latest_heading = terrain_centerline_flattened_heading(
+            trajectory_rotations.data[i], latest_heading);
+    }
+
+    const vec3 last_point = terrain_centerline_safe_point(
+        previous_x, previous_z, safe_root);
+    return terrain_centerline_safe_point(
+        previous_x + static_cast<double>(latest_heading.x) * remaining,
+        previous_z + static_cast<double>(latest_heading.z) * remaining,
+        last_point);
+}
+
+static inline bool terrain_heightfield_is_queryable(const heightfield& field)
+{
+    if (field.nx < 2 || field.nz < 2 ||
+        field.heights.data == NULL ||
+        !terrain_float_is_finite(field.origin_x) ||
+        !terrain_float_is_finite(field.origin_z) ||
+        !terrain_float_is_finite(field.cell_size) ||
+        field.cell_size <= 0.0f ||
+        !terrain_float_is_finite(field.exterior_height)) {
+        return false;
+    }
+    const int64_t expected_size =
+        static_cast<int64_t>(field.nx) * static_cast<int64_t>(field.nz);
+    return expected_size == static_cast<int64_t>(field.heights.size);
+}
+
+static inline void terrain_centerline_query(
+    float out[4],
+    const heightfield& field,
+    vec3 root,
+    const slice1d<vec3> trajectory_positions,
+    const slice1d<quat> trajectory_rotations)
+{
+    if (out == NULL) {
+        return;
+    }
+    for (int i = 0; i < 4; ++i) {
+        out[i] = 0.0f;
+    }
+    if (!terrain_heightfield_is_queryable(field) ||
+        !terrain_centerline_inputs_are_valid(
+            root, trajectory_positions, trajectory_rotations)) {
+        return;
+    }
+
+    const float base_height = heightfield_sample(field, root.x, root.z);
+    if (!terrain_float_is_finite(base_height)) {
+        return;
+    }
+
+    static const float distances[4] = {
+        0.25f, 0.50f, 0.75f, 1.00f};
+    for (int i = 0; i < 4; ++i) {
+        const vec3 point = terrain_centerline_point_at_arc(
+            root, trajectory_positions, trajectory_rotations, distances[i]);
+        const float sample_height =
+            heightfield_sample(field, point.x, point.z);
+        const double difference =
+            static_cast<double>(sample_height) -
+            static_cast<double>(base_height);
+        if (terrain_float_is_finite(sample_height) &&
+            difference >= -static_cast<double>(FLT_MAX) &&
+            difference <= static_cast<double>(FLT_MAX)) {
+            out[i] = static_cast<float>(difference);
+        }
+    }
 }
