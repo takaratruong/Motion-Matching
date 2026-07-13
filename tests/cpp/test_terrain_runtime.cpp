@@ -810,37 +810,52 @@ static void probe_generated_artifacts(
 {
     char error[512] = {};
     terrain_feature_set features;
-    assert(terrain_features_load(
-        features, sidecar_path, error, static_cast<int>(sizeof(error))));
-    assert(features.values.rows == 459682);
-    assert(features.values.cols == 4);
+    const bool features_loaded = terrain_features_load(
+        features, sidecar_path, error, static_cast<int>(sizeof(error)));
+    check(features_loaded,
+          error[0] != '\0' ? error : "generated terrain sidecar load");
+    check(features.values.rows == 459682,
+          "generated terrain sidecar frame count");
+    check(features.values.cols == 4,
+          "generated terrain sidecar dimension count");
 
     heightfield field;
-    assert(heightfield_load(
-        field, heightfield_path, error, static_cast<int>(sizeof(error))));
-    assert(field.nx == 261);
-    assert(field.nz == 228);
-    assert(field.heights.size == field.nx * field.nz);
+    error[0] = '\0';
+    const bool heightfield_loaded = heightfield_load(
+        field, heightfield_path, error, static_cast<int>(sizeof(error)));
+    check(heightfield_loaded,
+          error[0] != '\0' ? error : "generated terrain heightfield load");
+    check(field.nx == 261, "generated terrain heightfield nx");
+    check(field.nz == 228, "generated terrain heightfield nz");
+    check(field.heights.size == field.nx * field.nz,
+          "generated terrain heightfield value count");
 
     const float center_x = field.origin_x +
         field.cell_size * static_cast<float>(field.nx - 1) * 0.5f;
     const float center_z = field.origin_z +
         field.cell_size * static_cast<float>(field.nz - 1) * 0.5f;
-    assert(isfinite(heightfield_sample(field, center_x, center_z)));
-    assert(isfinite(heightfield_sample(
-        field, field.origin_x, field.origin_z)));
-    assert(heightfield_sample(
-        field, field.origin_x - field.cell_size, center_z) ==
-        field.exterior_height);
-    assert(heightfield_sample(
-        field, center_x,
-        field.origin_z + field.cell_size * static_cast<float>(field.nz)) ==
-        field.exterior_height);
+    check(terrain_float_is_finite(
+              heightfield_sample(field, center_x, center_z)),
+          "generated terrain center sample finite");
+    check(terrain_float_is_finite(heightfield_sample(
+              field, field.origin_x, field.origin_z)),
+          "generated terrain origin sample finite");
+    check(heightfield_sample(
+              field, field.origin_x - field.cell_size, center_z) ==
+              field.exterior_height,
+          "generated terrain negative-x exterior sample");
+    check(heightfield_sample(
+              field, center_x,
+              field.origin_z +
+                  field.cell_size * static_cast<float>(field.nz)) ==
+              field.exterior_height,
+          "generated terrain positive-z exterior sample");
 }
 
 int main(int argc, char** argv)
 {
-    assert(argc == 1 || argc == 3);
+    check(argc == 1 || argc == 3,
+          "expected zero or two artifact path arguments");
     test_sidecar_loads_valid_file();
     test_sidecar_rejects_every_truncation();
     test_sidecar_rejects_invalid_schema_sizes_and_values();
