@@ -1,5 +1,9 @@
 # Holden G1 Terrain Runtime Implementation Plan
 
+> **Superseded:** Do not execute this v1-era draft. The authoritative runtime
+> continuation is `2026-07-13-g1-multiscene-support-runtime.md`, after
+> `2026-07-13-g1-scene-artifacts.md` completes the exact G1HF/v2 scene pack.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (- [ ]) syntax for tracking.
 
 **Goal:** Extend Holden's C++ matcher from 27 to 31 features, consume validated G1 terrain artifacts, and pass sequential, flat-matching, and terrain-selection gates with IK disabled.

@@ -11,7 +11,13 @@
 ## Global Constraints
 
 - Do not start Task 1 until every task and final gate in `docs/superpowers/plans/2026-07-13-g1-scene-artifacts.md` and `docs/superpowers/plans/2026-07-13-g1-multiscene-support-runtime.md` passes with IK disabled. Preserve their accepted IK-off CSVs under `/tmp/g1-multiscene-runtime/` as the Gate C/D/F baselines.
-- Consume, do not duplicate or replace, the sibling plans' `heightfield_sample`, `heightfield_normal`, `terrain_support_set`, `walkability_grid`, `scene_pack`, `scene_route`, `support_frame_state`, `support_pose_apply`, controller reset, deterministic route, logger/checker, traversability, scene-switch, and controlled-cleanup implementations.
+- Consume, do not duplicate or replace, the sibling plans' checked
+  `heightfield_sample_v2`, `heightfield_normal`, `terrain_support_set`,
+  `walkability_grid`, `scene_pack`, `scene_route`, `support_frame_state`,
+  `support_pose_apply`, controller reset, deterministic route, logger/checker,
+  traversability, scene-switch, and controlled-cleanup implementations. The
+  unqualified `heightfield_sample` is frozen G1HF/v1 migration code and is
+  forbidden on active G1HF/v2 scenes in this plan.
 - Consume only published G1HF/v2 scene surfaces, G1SP/v1 support rows, and G1WM/v1 walkability. Do not rebuild or modify generated motion/scene artifacts in this plan.
 - Keep Daniel Holden's matcher, 31-dimensional `27 + 4` feature contract, feature normalization, search, selected frame/range, transition decision, continuation/incumbent/selected/terrain costs, full-pose inertialization, and fixed `25 Hz` timing authoritative.
 - Treat `state.adjusted_bone_positions` and `state.adjusted_bone_rotations` from the completed support runtime as immutable per-frame IK inputs. Preserve every position byte, especially support-retargeted `G1_Simulation.y`; IK writes only dedicated `state.ik_bone_rotations` and derived IK FK buffers.
@@ -50,12 +56,14 @@ Before implementation, compare the completed sibling code with this block. The p
 ```cpp
 // terrain_runtime.h and scene_runtime.h, produced by sibling plans
 struct heightfield {
-    uint32_t version;
     int nx, nz;
     float origin_x, origin_z, cell_size, exterior_height;
     array1d<float> heights;
+    uint32_t version; // appended to preserve legacy v1 member offsets
 };
-float heightfield_sample(const heightfield&, float x, float z);
+float heightfield_sample(const heightfield&, float x, float z); // v1 only
+float heightfield_sample_v2(const heightfield&, float x, float z);
+float heightfield_sample_versioned(const heightfield&, float x, float z);
 vec3 heightfield_normal(const heightfield&, float x, float z);
 
 struct scene_pack {
@@ -369,7 +377,10 @@ git commit -m "test: lock explicit G1 terrain IK geometry"
 - Modify: `tests/cpp/test_g1_ik.cpp`
 
 **Interfaces:**
-- Consumes: sibling-owned `heightfield_sample(const heightfield&,float,float)` and `heightfield_normal(const heightfield&,float,float)` on a validated G1HF/v2 scene.
+- Consumes: sibling-owned checked
+  `heightfield_sample_v2(const heightfield&,float,float)` and
+  `heightfield_normal(const heightfield&,float,float)` on a validated G1HF/v2
+  scene.
 - Produces: `G1SurfaceTarget`, `G1FootLockState`, `g1_foot_lock_reset`, and transactional `g1_foot_lock_update`.
 - A recorded contact rising edge freezes the support-retargeted sole-center XZ, samples height and normal at that exact point, and drives a `0.10 s` critically damped target at `1/25 s`; release returns to the animation target without changing the input pose.
 - Observation runs in IK-off and IK-on modes so the paired logs use identical contact edges and lock anchors. Only a subsequent apply call may alter rotations.
@@ -531,7 +542,7 @@ static inline bool g1_surface_target_sample(
             error, error_capacity,
             "G1 IK surface query is non-finite or not G1HF/v2");
     }
-    const float height = heightfield_sample(field, x, z);
+    const float height = heightfield_sample_v2(field, x, z);
     const vec3 normal = heightfield_normal(field, x, z);
     if (!terrain_float_is_finite(height) || !g1_vec3_is_finite(normal) ||
         normal.y <= 0.0f || std::fabs(length(normal) - 1.0f) > 1e-4f) {
@@ -1615,7 +1626,8 @@ static inline bool g1_clearance_consider(
 {
     if (!g1_vec3_is_finite(body_point))
         return g1_ik_error(error, error_capacity, "G1 clearance body point is non-finite");
-    const float surface_y = heightfield_sample(field, body_point.x, body_point.z);
+    const float surface_y = heightfield_sample_v2(
+        field, body_point.x, body_point.z);
     const float clearance = body_point.y - surface_y;
     if (!terrain_float_is_finite(surface_y) || !terrain_float_is_finite(clearance))
         return g1_ik_error(error, error_capacity, "G1 clearance surface sample is non-finite");

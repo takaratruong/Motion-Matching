@@ -16,6 +16,11 @@
 - Keep Daniel Holden's database matcher, full-pose inertialization, and fixed `25 Hz` runtime authoritative. Keep `dt = 1.0f / 25.0f`, database horizons `8`, `17`, and `25`, and live prediction intervals `1.0f / 3.0f`.
 - Preserve the exact `27 + 4 = 31` feature order and normalization. `terrain_support.bin` is placement metadata only and must never enter features, bounds, costs, or search selection.
 - Load `database.bin`, `terrain_features.bin`, and `terrain_support.bin` exactly once. Scene changes may replace only scene metadata, G1HF/v2 heightfield, G1WM/v1 walkability, and the Raylib terrain model.
+- `heightfield_sample` is the frozen migration-only G1HF/v1 bilinear entry.
+  Every active-scene height query, route/support/clearance query, and terrain
+  centerline in this plan must use checked `heightfield_sample_v2` (or a
+  v2-specific centerline wrapper built from it); silently calling the legacy
+  name on a v2 scene is a correctness failure.
 - Keep learned motion matching disabled. Keep inverse kinematics compile-time disabled throughout this plan; no task may add `MM_IK`, contact locking, foot orientation, swing clearance, or any other downstream IK correction.
 - Consequently, contact-lock/target-normal/IK-correction and capsule-clearance
   CSV columns belong to the later Gate E plan. That plan may append after this
@@ -73,18 +78,27 @@ Before Task 1, compare the completed scene-artifact plan and implementation agai
 ```cpp
 // terrain_runtime.h, produced by the scene-artifact plan
 struct heightfield {
-    uint32_t version;            // 1 for migration, 2 for published scenes
     int nx, nz;
     float origin_x, origin_z, cell_size, exterior_height;
     array1d<float> heights;
+    uint32_t version;            // appended; 1 migration, 2 published scenes
 };
 bool heightfield_load(
     heightfield& out, const char* path, char* error, int error_capacity);
-float heightfield_sample(const heightfield& field, float x, float z);
+float heightfield_sample(const heightfield& field, float x, float z); // v1 only
+float heightfield_sample_v2(const heightfield& field, float x, float z);
+float heightfield_sample_versioned(
+    const heightfield& field, float x, float z);
 vec3 heightfield_normal(const heightfield& field, float x, float z);
 ```
 
 The published-scene loader must expose G1HF version so `scene_runtime.h` can require `version == 2`; legacy v1 remains readable only by direct migration tests. The inherited `motion_match_log.h` and checker must already reproduce Gate A without changing support behavior. If names differ in the completed prerequisite plan, update this plan document first so all later interfaces use the producer's exact names; do not create adapters with duplicate surface semantics.
+
+`heightfield_sample_v2` and `heightfield_sample_versioned` are checked public
+entries; only an explicitly named internal prevalidated helper may assume
+validated storage. Before controller migration, Task 1 adds v2-specific
+centerline snapshot/query wrappers that preserve the historical v1 wrappers
+unchanged and sample exclusively through `heightfield_sample_v2`.
 
 ---
 
@@ -100,11 +114,35 @@ The published-scene loader must expose G1HF version so `scene_runtime.h` can req
 - Produces: `bool terrain_support_load(terrain_support_set&, const char*, int expected_frames, char*, int)` for exact `G1SP`, version `1`, dimension `3`, and database-frame parity.
 - Produces: `walkability_grid { int nx, nz; array1d<uint8_t> cells; }`.
 - Produces: `bool walkability_load(walkability_grid&, const char*, const heightfield&, char*, int)` for exact `G1WM`, version `1`, grid parity, and values `0`, `1`, or `2` only.
+- Produces checked `terrain_centerline_snapshot_compute_v2` and
+  `terrain_centerline_query_v2` wrappers for validated active scenes; inherited
+  v1 centerline functions and arithmetic remain unchanged.
 - Failure is transactional: a rejected file leaves every destination field and payload byte unchanged.
+- Add one malloc-compatible, allocation-failure-injectable checked payload
+  allocation path for G1TF/G1HF/G1SP/G1WM. Apply it to the inherited G1TF/G1HF
+  loaders while adding the new loaders so `-DNDEBUG` never follows a null
+  allocation with `fread`. Retain the committed `INT_MAX` sample schema limit;
+  do not invent a smaller format cap in this runtime task.
 
 - [ ] **Step 1: Append failing G1SP/G1WM tests**
 
 Add these fixtures and tests before `main` in `tests/cpp/test_terrain_runtime.cpp`, then call both test functions from `main` immediately after the inherited G1HF loader tests:
+
+First add allocation-failure injection tests for all four binary payload
+loaders and an asymmetric v2 centerline test that differs from bilinear v1.
+Require the new v2 centerline values/points to match direct
+`heightfield_sample_v2` calls while the inherited v1 centerline fixture remains
+bit-identical. Capture their RED state before adding the checked allocator and
+v2 wrappers.
+
+For allocation injection, move the test's terrain-runtime include behind a
+malloc-compatible test hook: include `<stddef.h>`/`<stdlib.h>`, define a
+`test_terrain_payload_allocate(size_t)` that returns `NULL` once when a flag is
+armed and otherwise calls `malloc`, define
+`TERRAIN_RUNTIME_PAYLOAD_ALLOCATE(bytes)` to that function, include
+`terrain_runtime.h`, then undefine the macro. For each G1TF/G1HF/G1SP/G1WM
+fixture, arm the flag, require an actionable allocation error, and compare the
+entire sentinel destination before/after.
 
 ```cpp
 static byte_buffer make_support(
@@ -241,11 +279,87 @@ g++ -std=c++17 -O0 -g -Wall -Wextra -Werror -pedantic -I. \
   tests/cpp/test_terrain_runtime.cpp -o /tmp/test_terrain_runtime
 ```
 
-Expected: compilation fails with undeclared `terrain_support_set`, `terrain_support_load`, `walkability_grid`, and `walkability_load`.
+Expected: compilation fails with undeclared `terrain_support_set`,
+`terrain_support_load`, `walkability_grid`, `walkability_load`, and v2
+centerline wrappers. If declarations are stubbed, each armed allocation test
+still fails because the inherited/new loaders have no checked hook yet.
 
 - [ ] **Step 3: Implement the exact transactional loaders**
 
-Add to `terrain_runtime.h` after `heightfield_load`:
+First add one test-only-overridable allocation hook and checked empty-array
+helpers near the existing size helpers. Production defaults to `malloc`; the
+test translation unit defines `TERRAIN_RUNTIME_PAYLOAD_ALLOCATE(bytes)` before
+including this header so it can fail the next allocation deterministically.
+The returned storage remains malloc-compatible because the existing array
+destructors release it with `free`.
+
+```cpp
+#ifndef TERRAIN_RUNTIME_PAYLOAD_ALLOCATE
+#define TERRAIN_RUNTIME_PAYLOAD_ALLOCATE(bytes) malloc(bytes)
+#define TERRAIN_RUNTIME_DEFAULT_PAYLOAD_ALLOCATE
+#endif
+
+template<typename T>
+static inline bool terrain_payload_allocate_empty(
+    array1d<T>& out, int count, const char* path, const char* label,
+    char* error, int capacity)
+{
+    size_t bytes = 0;
+    if (count <= 0 || out.size != 0 || out.data != NULL ||
+        !terrain_size_multiply(
+            static_cast<size_t>(count), sizeof(T), bytes)) {
+        return terrain_error(error, capacity,
+            "%s: invalid %s allocation size", path, label);
+    }
+    T* data = static_cast<T*>(TERRAIN_RUNTIME_PAYLOAD_ALLOCATE(bytes));
+    if (data == NULL) {
+        return terrain_error(error, capacity,
+            "%s: cannot allocate %s payload", path, label);
+    }
+    out.size = count;
+    out.data = data;
+    return true;
+}
+
+template<typename T>
+static inline bool terrain_payload_allocate_empty(
+    array2d<T>& out, int rows, int cols, const char* path, const char* label,
+    char* error, int capacity)
+{
+    if (rows <= 0 || cols <= 0 || rows > INT_MAX / cols ||
+        out.rows != 0 || out.cols != 0 || out.data != NULL) {
+        return terrain_error(error, capacity,
+            "%s: invalid %s allocation shape", path, label);
+    }
+    size_t bytes = 0;
+    if (!terrain_size_multiply(
+            static_cast<size_t>(rows) * static_cast<size_t>(cols),
+            sizeof(T), bytes)) {
+        return terrain_error(error, capacity,
+            "%s: invalid %s allocation size", path, label);
+    }
+    T* data = static_cast<T*>(TERRAIN_RUNTIME_PAYLOAD_ALLOCATE(bytes));
+    if (data == NULL) {
+        return terrain_error(error, capacity,
+            "%s: cannot allocate %s payload", path, label);
+    }
+    out.rows = rows;
+    out.cols = cols;
+    out.data = data;
+    return true;
+}
+```
+
+After the last header function, undefine
+`TERRAIN_RUNTIME_PAYLOAD_ALLOCATE` only when
+`TERRAIN_RUNTIME_DEFAULT_PAYLOAD_ALLOCATE` was set, then undefine that marker.
+The test-owned macro is explicitly undefined by the test immediately after the
+include.
+
+Replace the inherited G1TF `loaded.values.resize(...)` and G1HF
+`loaded.heights.resize(...)` calls with these checked helpers, close the file
+and return `false` on failure, then use the same helpers in the new loaders
+below. Add to `terrain_runtime.h` after `heightfield_load`:
 
 ```cpp
 struct terrain_support_set
@@ -313,6 +427,7 @@ static inline bool terrain_support_load(
 
     size_t count = 0, bytes = 0, expected_size = 0;
     if (!terrain_size_multiply(static_cast<size_t>(frames), 3u, count) ||
+        count > static_cast<size_t>(INT_MAX) ||
         !terrain_size_multiply(count, sizeof(float), bytes) ||
         !terrain_size_add(sizeof(header), bytes, expected_size)) {
         fclose(file);
@@ -327,7 +442,12 @@ static inline bool terrain_support_load(
     }
 
     terrain_support_set loaded;
-    loaded.values.resize(expected_frames, 3);
+    if (!terrain_payload_allocate_empty(
+            loaded.values, expected_frames, 3, path, "G1SP",
+            error, error_capacity)) {
+        fclose(file);
+        return false;
+    }
     if (!terrain_read_exact(file, loaded.values.data, bytes)) {
         fclose(file);
         return terrain_error(error, error_capacity, "%s: truncated G1SP values", path);
@@ -411,7 +531,12 @@ static inline bool walkability_load(
     walkability_grid loaded;
     loaded.nx = static_cast<int>(nx);
     loaded.nz = static_cast<int>(nz);
-    loaded.cells.resize(static_cast<int>(count));
+    if (!terrain_payload_allocate_empty(
+            loaded.cells, static_cast<int>(count), path, "G1WM",
+            error, error_capacity)) {
+        fclose(file);
+        return false;
+    }
     if (!terrain_read_exact(file, loaded.cells.data, count)) {
         fclose(file);
         return terrain_error(error, error_capacity, "%s: truncated G1WM cells", path);
@@ -432,6 +557,15 @@ static inline bool walkability_load(
     return true;
 }
 ```
+
+Then add `terrain_centerline_snapshot_compute_v2` and
+`terrain_centerline_query_v2` beside the inherited wrappers. Copy the inherited
+input validation, point-at-arc, output initialization, finite-difference, and
+marker behavior without refactoring or changing it; require `field.version ==
+2`, and replace only its two legacy sample sites (root/base and each marker)
+with checked `heightfield_sample_v2`. The query wrapper calls only the new v2
+snapshot companion. This deliberate duplication keeps frozen v1 optimizer
+codegen isolated until the multiscene controller migrates.
 
 - [ ] **Step 4: Run debug, strict, release/fast-math, and sanitizer GREEN**
 
@@ -458,22 +592,27 @@ Expected: every compile exits `0`; every binary exits `0` with no stdout/stderr 
 - [ ] **Step 5: Probe the published support and every walkability file**
 
 Extend the inherited optional real-artifact probe in
-`test_terrain_runtime.cpp` from `argc == 1 || argc == 3` to the exact
-`argc == 1 || argc == 5` contract
-`TERRAIN_FEATURES TERRAIN_SUPPORT HEIGHTFIELD WALKABILITY`. Keep its existing
-G1TF/G1HF checks, and append the G1SP/G1WM checks:
+`test_terrain_runtime.cpp` from its exact `argc == 1 || argc == 4` contract to
+the exact `argc == 1 || argc == 6` contract
+`G1TF_PATH G1HF_PATH EXPECTED_G1HF_VERSION G1SP_PATH G1WM_PATH`. Preserve the
+first three argument meanings and the exact `"1"` / `"2"` parser; every scene
+invocation passes `2`. Keep the existing G1TF/G1HF checks and append the
+G1SP/G1WM checks. Change `probe_generated_artifacts` from `void` to `int` and
+return its already-validated `features.values.rows`; this is the authoritative
+expected support-row count for both diagnostic and full packs:
 
 ```cpp
 static void probe_support_and_scene(
     const char* support_path,
     const char* terrain_path,
-    const char* walkability_path)
+    const char* walkability_path,
+    int expected_frames)
 {
     char error[512] = {};
     terrain_support_set support;
-    check(terrain_support_load(support, support_path, 459682,
+    check(terrain_support_load(support, support_path, expected_frames,
           error, sizeof(error)), error);
-    check(support.values.rows == 459682 && support.values.cols == 3,
+    check(support.values.rows == expected_frames && support.values.cols == 3,
           "published G1SP dimensions");
     heightfield field;
     check(heightfield_load(field, terrain_path, error, sizeof(error)), error);
@@ -499,18 +638,28 @@ PY
 while read -r terrain walkability; do
   /tmp/test_terrain_runtime_strict \
     resources/g1_terrain/terrain_features.bin \
-    resources/g1_terrain/terrain_support.bin \
     "$terrain" \
+    2 \
+    resources/g1_terrain/terrain_support.bin \
     "$walkability"
 done < /tmp/g1_scene_pairs.txt
 ```
 
 Expected: one exit-`0` probe per ordered scene, `459682x4` G1TF rows and
 `459682x3` G1SP rows in every invocation, G1HF/v2 for every published terrain,
-and exact G1WM/G1HF grid parity. The implementation calls the inherited
-`probe_generated_artifacts(argv[1], argv[3])` and then
-`probe_support_and_scene(argv[2], argv[3], argv[4])`; do not retain ambiguous
-positional variants.
+and exact G1WM/G1HF grid parity. After parsing `argv[3]`, the implementation
+uses:
+
+```cpp
+const int expected_frames = probe_generated_artifacts(
+    argv[1], argv[2], expected_version);
+probe_support_and_scene(argv[4], argv[2], argv[5], expected_frames);
+```
+
+Do not retain ambiguous positional variants, hard-code the full-pack frame
+count inside the helper, or discard the expected-version argument. The same
+extended CLI therefore also accepts the two-clip diagnostic pack when the
+sibling artifact plan runs after this task.
 
 - [ ] **Step 6: Commit the support and walkability loaders**
 
@@ -1163,7 +1312,7 @@ git commit -m "feat: validate runtime JSON and artifact hashes"
 - Create: `tests/cpp/test_support_runtime.cpp`
 
 **Interfaces:**
-- Consumes: `terrain_support_set`, `heightfield_sample`, `G1SP` columns `0=root`, `1=left toe`, `2=right toe`, recorded database contacts, and pre-support FK root/toe XZ.
+- Consumes: `terrain_support_set`, checked `heightfield_sample_v2`, `G1SP` columns `0=root`, `1=left toe`, `2=right toe`, recorded database contacts, and pre-support FK root/toe XZ.
 - Produces: `bool support_observation_build(support_observation&, const terrain_support_set&, int, const heightfield&, vec3, vec3, vec3, bool, bool, char*, int)`.
 - Produces: `support_frame_reset`, `support_frame_rebase`, and `support_frame_update` with exact two-frame no-contact hold and `0.10 s` critically damped root fallback/rebase at `25 Hz`.
 - Produces: `support_pose_apply`, which copies the inertialized local pose and changes only `G1_Simulation.y`.
@@ -1482,7 +1631,7 @@ static inline bool support_observation_build(
                 "support FK points must contain only finite values");
         candidate.source_height[i] = support.values(frame, i);
         candidate.runtime_height[i] =
-            heightfield_sample(terrain, points[i].x, points[i].z);
+            heightfield_sample_v2(terrain, points[i].x, points[i].z);
         candidate.delta[i] =
             candidate.runtime_height[i] - candidate.source_height[i];
     }
@@ -2293,7 +2442,7 @@ static inline bool g1_controller_state_reset(g1_controller_state& out,const data
     s.simulation_position=vec3(spawn.x,0,spawn.z);s.simulation_rotation=s.transition_dst_rotation;s.desired_rotation=s.simulation_rotation;
     s.trajectory_desired_velocities.resize(4);s.trajectory_desired_velocities.zero();s.trajectory_positions.resize(4);s.trajectory_positions.set(s.simulation_position);s.trajectory_velocities.resize(4);s.trajectory_velocities.zero();s.trajectory_accelerations.resize(4);s.trajectory_accelerations.zero();s.trajectory_angular_velocities.resize(4);s.trajectory_angular_velocities.zero();s.trajectory_desired_rotations.resize(4);s.trajectory_desired_rotations.set(s.simulation_rotation);s.trajectory_rotations.resize(4);s.trajectory_rotations.set(s.simulation_rotation);
     s.contact_bones.resize(2);s.contact_bones(0)=G1_LeftToe;s.contact_bones(1)=G1_RightToe;s.contact_states.resize(2);s.contact_states.zero();s.contact_locks.resize(2);s.contact_locks.zero();s.contact_positions.resize(2);s.contact_positions.zero();s.contact_velocities.resize(2);s.contact_velocities.zero();s.contact_points.resize(2);s.contact_points.zero();s.contact_targets.resize(2);s.contact_targets.zero();s.contact_offset_positions.resize(2);s.contact_offset_positions.zero();s.contact_offset_velocities.resize(2);s.contact_offset_velocities.zero();
-    const float runtime=heightfield_sample(scene.terrain,spawn.x,spawn.z);const float initial=runtime-support.values(s.frame_index,0);
+    const float runtime=heightfield_sample_v2(scene.terrain,spawn.x,spawn.z);const float initial=runtime-support.values(s.frame_index,0);
     if(!terrain_float_is_finite(initial))return scene_error(error,capacity,"controller reset: non-finite initial support for scene '%s'",scene.metadata.id.c_str());
     support_frame_reset(s.support,initial);support_pose_apply(s.adjusted_bone_positions,s.bone_positions,s.support.height);s.search_timer=s.search_time;s.force_search_timer=s.search_time;s.camera_azimuth=scene.metadata.spawn_yaw;s.blocked_distance=FLT_MAX;
     g1_controller_state_swap(out,s);return true;
@@ -2341,6 +2490,12 @@ unreadable, or hash-mismatched motion artifact produces a controlled error
 instead of reaching the inherited assertion-based reader. After `InitWindow`, load
 `active_scene.mesh_path.c_str()` instead of a root OBJ, and use
 `active_scene.terrain` for the existing Gate A terrain query and diagnostics.
+At this migration boundary replace every active-scene direct height query with
+checked `heightfield_sample_v2`, and replace the controller's inherited
+centerline call with `terrain_centerline_query_v2` / its v2 snapshot companion
+from Task 1. The literal `heightfield_sample` and inherited centerline wrappers
+remain migration-only v1 code and must have zero active-scene call sites. Add a
+source/test gate that fails if controller v2 terrain paths use the legacy name.
 No selection UI or switching is added in this task.
 
 Then replace each moved local with the matching `state.` member. For example,
@@ -2356,9 +2511,10 @@ query_compute_trajectory_direction_feature(query,offset,state.bone_rotations(0),
 Keep `feature_weight_*`, tuning values, `terrain_model`, log, catalog,
 `rendered_frames`, and exit flags as existing locals. At this step, call reset
 only at startup and keep support-retargeting disabled; the rendered result must
-still reproduce the prerequisite Gate A log.
+still satisfy the prerequisite Gate A checker invariants on the authoritative
+v2 scene without claiming byte identity to the frozen v1 log.
 
-- [ ] **Step 6: Run reset tests and the unchanged Gate A reproduction**
+- [ ] **Step 6: Run reset tests and the first authoritative-v2 Gate A check**
 
 Run:
 
@@ -2378,7 +2534,14 @@ DISPLAY=:1 G1_TERRAIN_DIR=resources/g1_terrain MM_TERRAIN_SCENE=grail-curb-defau
   /tmp/g1-multiscene-runtime/gate-a-reset-refactor.csv --gate-a
 ```
 
-Expected: reset test exits `0`; controller exits normally after 375 frames; checker prints `VALID gate-a`; support remains disabled and all pre-support diagnosis columns match a fresh prerequisite Gate A run except the output filename.
+Expected: reset test exits `0`; controller exits normally after 375 frames;
+checker prints `VALID gate-a`; support remains disabled, the controller source
+gate proves that every active-scene terrain/centerline query uses the checked
+v2 API, and the log satisfies the Gate A sequential/transition/finite
+invariants. This is the first controller run after v2 migration and reset
+refactoring, so no separate pre-refactor v2 CSV exists. Do not claim a byte
+comparison to the frozen G1HF/v1 compiler-stability CSV from scene-artifact
+Task 5. Gate C later creates the paired support-off/support-on v2 baselines.
 
 - [ ] **Step 7: Commit the reset boundary**
 
@@ -2971,7 +3134,7 @@ static inline bool deterministic_route_command(deterministic_route_sample& out,c
 static inline int deterministic_route_motion_frames(const scene_route& route,float dt=0.04f,float speed=0.50f)
 {int total=0;for(size_t i=0;i+1<route.waypoints_xz.size();++i){const float dx=route.waypoints_xz[i+1].first-route.waypoints_xz[i].first;const float dz=route.waypoints_xz[i+1].second-route.waypoints_xz[i].second;total+=static_cast<int>(std::ceil(std::sqrt(dx*dx+dz*dz)/(speed*dt)));if(i+1==2&&route.landing_hold_seconds>0)total+=static_cast<int>(std::ceil(route.landing_hold_seconds/dt));}return total;}
 static inline float deterministic_route_target_height(const scene_route& route,const heightfield& terrain)
-{struct bin{int key=0,count=0;float sum=0;};std::vector<bin> bins;const float base=heightfield_sample(terrain,route.waypoints_xz.front().first,route.waypoints_xz.front().second);for(size_t i=0;i+1<route.waypoints_xz.size();++i){const float dx=route.waypoints_xz[i+1].first-route.waypoints_xz[i].first;const float dz=route.waypoints_xz[i+1].second-route.waypoints_xz[i].second;const float length=std::sqrt(dx*dx+dz*dz);int steps=static_cast<int>(std::ceil(length/(0.5f*terrain.cell_size)));if(steps<1)steps=1;for(int step=0;step<=steps;++step){const float t=static_cast<float>(step)/steps;const float height=heightfield_sample(terrain,route.waypoints_xz[i].first+dx*t,route.waypoints_xz[i].second+dz*t);if(std::fabs(height-base)<=0.02f)continue;const int key=static_cast<int>(std::lround(height*100.0f));size_t found=0;while(found<bins.size()&&bins[found].key!=key)++found;if(found==bins.size()){bin value;value.key=key;bins.push_back(value);}++bins[found].count;bins[found].sum+=height;}}if(bins.empty())return base;size_t best=0;for(size_t i=1;i<bins.size();++i)if(bins[i].count>bins[best].count||(bins[i].count==bins[best].count&&bins[i].key>bins[best].key))best=i;return bins[best].sum/bins[best].count;}
+{struct bin{int key=0,count=0;float sum=0;};std::vector<bin> bins;const float base=heightfield_sample_v2(terrain,route.waypoints_xz.front().first,route.waypoints_xz.front().second);for(size_t i=0;i+1<route.waypoints_xz.size();++i){const float dx=route.waypoints_xz[i+1].first-route.waypoints_xz[i].first;const float dz=route.waypoints_xz[i+1].second-route.waypoints_xz[i].second;const float length=std::sqrt(dx*dx+dz*dz);int steps=static_cast<int>(std::ceil(length/(0.5f*terrain.cell_size)));if(steps<1)steps=1;for(int step=0;step<=steps;++step){const float t=static_cast<float>(step)/steps;const float height=heightfield_sample_v2(terrain,route.waypoints_xz[i].first+dx*t,route.waypoints_xz[i].second+dz*t);if(std::fabs(height-base)<=0.02f)continue;const int key=static_cast<int>(std::lround(height*100.0f));size_t found=0;while(found<bins.size()&&bins[found].key!=key)++found;if(found==bins.size()){bin value;value.key=key;bins.push_back(value);}++bins[found].count;bins[found].sum+=height;}}if(bins.empty())return base;size_t best=0;for(size_t i=1;i<bins.size();++i)if(bins[i].count>bins[best].count||(bins[i].count==bins[best].count&&bins[i].key>bins[best].key))best=i;return bins[best].sum/bins[best].count;}
 ```
 
 The target is diagnostic only; it never feeds trajectory, matcher, support, or

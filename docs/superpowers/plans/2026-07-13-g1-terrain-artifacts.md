@@ -1,5 +1,10 @@
 # G1 Terrain Artifact Pipeline Implementation Plan
 
+> **Superseded:** Do not execute this single-terrain publication draft. The
+> authoritative artifact pipeline is
+> `2026-07-13-g1-scene-artifacts.md`, which publishes exact-surface multiscene
+> G1HF/v2 packs and preserves the migration-only v1 artifacts.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (- [ ]) syntax for tracking.
 
 **Goal:** Build validated, versioned Holden animation and terrain artifacts directly from native Takara and GRAIL G1 motion.

@@ -2440,11 +2440,16 @@ published/top-level terrain is v2; Task 11 performs that atomic migration.
 - Modify: `tests/cpp/test_terrain_runtime.cpp`
 
 **Interfaces:**
-- `heightfield` gains `uint32_t version`; successful loads set it to 1 or 2
-  and every failed load preserves the complete destination, including version.
+- `heightfield` gains an appended `uint32_t version` after `heights`, preserving
+  every historical v1 member offset; successful loads set it to 1 or 2 and
+  every failed load preserves the complete destination, including version.
 - Preserves: `heightfield_load(heightfield&, const char*, char*, int) -> bool`.
-- Preserves byte-for-byte arithmetic and results of the current float/bilinear
-  G1HF/v1 `heightfield_sample`; v1 must not share the new locator.
+- Preserves `heightfield_sample(...)` as the literal historical float/bilinear
+  G1HF/v1 body. It deliberately does not dispatch or validate; v1 must not
+  share the new locator because doing so changes production fast-math codegen.
+- Adds checked `heightfield_sample_v2(...)` and checked
+  `heightfield_sample_versioned(...)`. Their internal prevalidated v2 helper is
+  explicitly named as such and is not a downstream public contract.
 - Adds authoritative G1HF/v2 fixed-triangle sampling with float32-decoded
   normal-or-positive-zero metadata promoted to double, double local weights,
   and finite binary32 output rounded from the binary64 interpolation.
@@ -2557,7 +2562,6 @@ Add the version field:
 ~~~cpp
 struct heightfield
 {
-    uint32_t version = 0;
     int nx = 0;
     int nz = 0;
     float origin_x = 0.0f;
@@ -2565,6 +2569,8 @@ struct heightfield
     float cell_size = 0.0f;
     float exterior_height = 0.0f;
     array1d<float> heights;
+    // Append only: legacy v1 optimizer-visible member offsets are immutable.
+    uint32_t version = 0;
 };
 ~~~
 
@@ -2615,12 +2621,23 @@ version == 2` in addition to its current checks. Never use standard
 `isfinite` as a fast-math safety guard; retain the existing bitwise finite
 predicate for float inputs and decoded metadata.
 
-- [ ] **Step 4: Preserve v1 literally and implement robust v2 sampling/normals**
+- [ ] **Step 4: Preserve the public v1 body literally and add checked v2 APIs**
 
-Move the current v1 `heightfield_sample` body into a dedicated legacy helper
-without changing its float operations, comparison order, or edge degeneracy.
-The public function dispatches version 1 to that helper, version 2 to the new
-path, and every other/invalid structure to exterior.
+Keep the current public `heightfield_sample` body at its existing call sites
+without changing its float operations, comparison order, edge degeneracy, or
+adding a version/validity branch. A unified dispatcher was empirically proven
+to alter GCC 13.3 `-O3 -ffast-math` inlining/FMA decisions and the Gate A CSV.
+If a legacy helper name is useful, it may be a trivial wrapper around that
+literal public body; the controller and centerline remain on the literal v1
+entry until the later multiscene plan switches them explicitly.
+
+Add a checked `heightfield_sample_v2` that requires version 2 and a queryable
+structure before delegating to an explicitly named prevalidated internal
+helper. Add `heightfield_sample_versioned` as the checked artifact/test entry:
+it validates once, routes version 1 to the literal legacy sampler, routes
+version 2 to the prevalidated v2 helper, and returns exterior for every
+unknown/malformed field. Direct malformed-structure tests must cover both
+checked public entries and prove neither indexes invalid storage.
 
 ~~~cpp
 struct heightfield_cell
@@ -2714,7 +2731,9 @@ sha256sum --check /tmp/g1_gate_a_before.sha256
 
 Expected: production compilation and both checks succeed; the new v1 log is
 byte-identical to frozen Gate A, proving loader migration did not change the
-currently running behavior or artifact bytes.
+currently running behavior or artifact bytes. The frozen controller and its
+centerline must still call only literal legacy `heightfield_sample`; this gate
+does not authorize using that name for a future G1HF/v2 scene.
 
 - [ ] **Step 7: Commit the shared runtime surface primitive**
 

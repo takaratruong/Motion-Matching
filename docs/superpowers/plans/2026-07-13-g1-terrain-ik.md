@@ -1,5 +1,9 @@
 # G1 Terrain IK Implementation Plan
 
+> **Superseded:** Do not execute this draft. The authoritative downstream plan
+> is `2026-07-13-g1-terrain-ik-clearance.md`, which consumes the checked
+> G1HF/v2 sampler and includes clearance, invariance, and final visual gates.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (- [ ]) syntax for tracking.
 
 **Goal:** Replace Holden's LAFAN/flat-ground IK assumptions with a bounded, reversible G1 foot-lock stage that samples the runtime terrain.
