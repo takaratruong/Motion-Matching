@@ -4,6 +4,7 @@ import tempfile
 import unittest
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from resources.g1_terrain_builder.database import (
     ContactConfig,
@@ -20,6 +21,11 @@ from resources.g1_terrain_builder.schema import (
     SkeletonSpec,
 )
 from resources.g1_terrain_builder.terrain import FlatTerrain, StepTerrain
+
+
+def _wxyz(rotation: Rotation) -> np.ndarray:
+    xyzw = rotation.as_quat()
+    return xyzw[..., [3, 0, 1, 2]]
 
 
 def _expected_database_bytes(artifacts: ArtifactSet) -> bytes:
@@ -82,6 +88,22 @@ class DatabaseBuilderTests(unittest.TestCase):
         )
         self.assertAlmostEqual(artifacts.velocities[4, 0, 0], 1.0)
         self.assertAlmostEqual(artifacts.velocities[5, 0, 0], 1.0)
+
+    def test_angular_velocity_uses_world_space_increment_order(self):
+        fps = 25.0
+        increment_angle = 0.04
+        increment = Rotation.from_rotvec([0.0, increment_angle, 0.0])
+        orientations = [Rotation.from_euler("x", 70.0, degrees=True)]
+        for _ in range(4):
+            orientations.append(increment * orientations[-1])
+        rotations = np.stack([_wxyz(q) for q in orientations])[:, None]
+
+        _, angular = derive_velocities(
+            np.zeros((5, 1, 3), np.float64), rotations, fps)
+
+        expected = np.tile(
+            [0.0, increment_angle * fps, 0.0], (5, 1))
+        np.testing.assert_allclose(angular[:, 0], expected, atol=1e-6)
 
     def test_derivatives_reject_bad_shapes_fps_and_quaternions(self):
         rotations = np.tile([1.0, 0.0, 0.0, 0.0], (3, 1, 1))
@@ -153,6 +175,49 @@ class DatabaseBuilderTests(unittest.TestCase):
             derive_contacts(
                 np.zeros((5, 2, 3)), BadTerrain(), 0, 1, 25.0)
 
+    def test_contact_median_filter_fills_a_one_frame_gap(self):
+        positions = np.zeros((5, 2, 3), np.float64)
+        positions[:, 0, 1] = [0.0, 0.0, 0.2, 0.0, 0.0]
+        positions[:, 1, 1] = 0.2
+        config = ContactConfig(
+            speed_threshold=1e6,
+            height_threshold=0.06,
+            median_filter_frames=3,
+        )
+
+        contacts = derive_contacts(
+            positions, FlatTerrain(), 0, 1, 25.0, config)
+
+        np.testing.assert_array_equal(contacts[:, 0], np.ones(5, np.uint8))
+        np.testing.assert_array_equal(contacts[:, 1], np.zeros(5, np.uint8))
+
+    def test_contact_filtering_is_isolated_at_clip_boundaries(self):
+        clip_a = np.zeros((3, 2, 3), np.float64)
+        clip_b = np.zeros((3, 2, 3), np.float64)
+        clip_a[:, 0, 1] = [0.0, 0.0, 0.2]
+        clip_b[:, 0, 1] = [0.0, 0.2, 0.2]
+        clip_a[:, 1, 1] = 0.2
+        clip_b[:, 1, 1] = 0.2
+        config = ContactConfig(
+            speed_threshold=1e6,
+            height_threshold=0.06,
+            median_filter_frames=3,
+        )
+
+        separate = np.concatenate([
+            derive_contacts(clip_a, FlatTerrain(), 0, 1, 25.0, config),
+            derive_contacts(clip_b, FlatTerrain(), 0, 1, 25.0, config),
+        ])
+        incorrectly_joined = derive_contacts(
+            np.concatenate([clip_a, clip_b]),
+            FlatTerrain(), 0, 1, 25.0, config,
+        )
+
+        np.testing.assert_array_equal(separate[:, 0], [1, 1, 0, 1, 0, 0])
+        np.testing.assert_array_equal(
+            incorrectly_joined[:, 0], [1, 1, 1, 0, 0, 0])
+        np.testing.assert_array_equal(separate[2:4, 0], [0, 1])
+
     def test_forward_kinematics_uses_parent_rotation(self):
         positions = np.zeros((1, 2, 3), np.float64)
         positions[:, 1, 0] = 1.0
@@ -164,6 +229,51 @@ class DatabaseBuilderTests(unittest.TestCase):
             positions, rotations, np.array([-1, 0], np.int32))
         np.testing.assert_allclose(gp[0, 1], [0, 0, -1], atol=1e-7)
         np.testing.assert_allclose(gq[0, 1], rotations[0, 0], atol=1e-7)
+
+    def test_forward_kinematics_composes_a_noncommuting_three_bone_chain(self):
+        local_positions = np.array([[
+            [0.5, -0.25, 0.75],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.5, 0.25],
+        ]], np.float64)
+        local_rotation_objects = (
+            Rotation.from_euler("z", 50.0, degrees=True),
+            Rotation.from_euler("x", 65.0, degrees=True),
+            Rotation.from_euler("y", -40.0, degrees=True),
+        )
+        local_rotations = np.stack([
+            _wxyz(rotation) for rotation in local_rotation_objects
+        ])[None]
+        parents = np.array([-1, 0, 1], np.int32)
+
+        global_positions, global_rotations = forward_kinematics_arrays(
+            local_positions, local_rotations, parents)
+
+        expected_rotation_objects = (
+            local_rotation_objects[0],
+            local_rotation_objects[0] * local_rotation_objects[1],
+            local_rotation_objects[0] * local_rotation_objects[1]
+            * local_rotation_objects[2],
+        )
+        expected_rotations = np.stack([
+            _wxyz(rotation) for rotation in expected_rotation_objects
+        ])
+        expected_positions = np.empty((3, 3), np.float64)
+        expected_positions[0] = local_positions[0, 0]
+        expected_positions[1] = (
+            expected_positions[0]
+            + expected_rotation_objects[0].apply(local_positions[0, 1])
+        )
+        expected_positions[2] = (
+            expected_positions[1]
+            + expected_rotation_objects[1].apply(local_positions[0, 2])
+        )
+
+        np.testing.assert_allclose(
+            global_positions[0], expected_positions, atol=1e-7)
+        orientation_alignment = np.abs(np.sum(
+            global_rotations[0] * expected_rotations, axis=-1))
+        np.testing.assert_allclose(orientation_alignment, 1.0, atol=1e-7)
 
     def test_forward_kinematics_rejects_malformed_hierarchies(self):
         positions = np.zeros((1, 2, 3), np.float64)
