@@ -1,4 +1,5 @@
 import copy
+import glob
 import hashlib
 import json
 import os
@@ -10,6 +11,7 @@ import numpy as np
 
 from resources.g1_terrain_builder.artifacts import read_walkability
 from resources.g1_terrain_builder.scenes import (
+    GRAIL_DEFAULT_BASE,
     REQUIRED_SCENE_IDS,
     SCENE_CELL_SIZE,
     WALKABILITY_CLASSIFICATION_HALO,
@@ -19,17 +21,27 @@ from resources.g1_terrain_builder.scenes import (
     build_scene,
     build_scene_pack,
     canonical_json_bytes,
+    grail_scene_definition,
+    grail_scene_definitions,
+    all_scene_definitions,
     procedural_scene_definitions,
+    select_grail_scene_bases,
     sha256_hex,
     _region_cell_indices,
+    _root_route_and_yaw,
     _route_samples,
     _route_cell_covers,
     _validate_region_classes,
     _validate_route_classes,
     _walkability_at,
 )
-from resources.g1_terrain_builder.terrain import FlatTerrain, HeightGrid, \
-    surface_semantics_signature
+from resources.g1_terrain_builder.schema import HoldenClip
+from resources.g1_terrain_builder.terrain import (
+    FlatTerrain,
+    GrailTerrain,
+    HeightGrid,
+    surface_semantics_signature,
+)
 
 
 def flat_definition(scene_id="grail-curb-default"):
@@ -649,6 +661,254 @@ def assert_native_json_value(test, value, label="provenance"):
             assert_native_json_value(test, child, f"{label}[{index}]")
         return
     test.assertIn(type(value), (str, int, float, bool, type(None)), label)
+
+
+GRAIL_ROBOT_DIR = "/home/ubuntu/datasets/GRAIL/data/curb/robot"
+LOCKED_GRAIL_BASES = {
+    "grail-curb-default": GRAIL_DEFAULT_BASE,
+    "grail-curb-low": "terrain_curbs__curb_186__004",
+    "grail-curb-medium": "terrain_curbs__curb_022__001",
+    "grail-curb-high": "terrain_curbs__curb_165__006",
+}
+LOCKED_GRAIL_HEIGHTS = {
+    GRAIL_DEFAULT_BASE: 0.2921024334377573,
+    "terrain_curbs__curb_186__004": 0.12238701526200782,
+    "terrain_curbs__curb_022__001": 0.24007104328948528,
+    "terrain_curbs__curb_165__006": 0.3599740964554129,
+}
+
+
+def fake_grail_clip(base):
+    clip = HoldenClip.empty(frames=5, bones=31)
+    clip.name = base + "-clip"
+    clip.terrain_id = base
+    clip.positions[:, 0, 0] = np.array([0.0, 0.1, 0.2, 0.3, 0.4])
+    clip.positions[:, 0, 2] = np.array([0.0, 0.4, 0.8, 1.2, 1.6])
+    return clip
+
+
+class GrailSceneTests(unittest.TestCase):
+    def test_nearest_height_selection_uses_lexical_tie_break(self):
+        measured = {
+            GRAIL_DEFAULT_BASE: 0.29,
+            "a-low-tie": 0.13,
+            "z-low-tie": 0.13,
+            "medium": 0.241,
+            "high": 0.358,
+        }
+        selected = select_grail_scene_bases(measured)
+        self.assertEqual(selected, {
+            "grail-curb-default": GRAIL_DEFAULT_BASE,
+            "grail-curb-low": "a-low-tie",
+            "grail-curb-medium": "medium",
+            "grail-curb-high": "high",
+        })
+
+    def test_selection_rejects_nonexact_or_empty_base_names(self):
+        class BaseName(str):
+            pass
+
+        for base in (BaseName(GRAIL_DEFAULT_BASE), "", 7):
+            with self.subTest(base=repr(base)):
+                with self.assertRaisesRegex(
+                        ValueError,
+                        "^GRAIL base names must be non-empty strings$"):
+                    select_grail_scene_bases({base: 0.29})
+
+    def test_selection_rejects_bool_and_non_scalar_heights(self):
+        for invalid in (True, "0.12", [0.12], np.array(0.12)):
+            measured = {
+                GRAIL_DEFAULT_BASE: 0.29,
+                "invalid": invalid,
+            }
+            with self.subTest(invalid=repr(invalid)):
+                with self.assertRaisesRegex(TypeError, "real scalar"):
+                    select_grail_scene_bases(measured)
+
+    def test_grail_scene_uses_matching_converted_root_path_and_facing(self):
+        base = GRAIL_DEFAULT_BASE
+        clip = fake_grail_clip(base)
+        scene = grail_scene_definition(
+            "grail-curb-default", base, clip, None)
+        self.assertEqual(scene.spawn_position, (0.0, 0.0, 0.0))
+        self.assertAlmostEqual(scene.spawn_yaw_radians, 0.0)
+        self.assertEqual(scene.routes[0].route_id, "curb-forward")
+        expected_first = tuple(
+            float(value) for value in clip.positions[0, 0, (0, 2)])
+        expected_last = tuple(
+            float(value) for value in clip.positions[-1, 0, (0, 2)])
+        self.assertEqual(scene.routes[0].waypoints_xz[0], expected_first)
+        self.assertEqual(
+            scene.routes[0].waypoints_xz[-1], expected_last)
+        self.assertEqual(scene.provenance["source_ids"], [base, clip.name])
+        wrong = fake_grail_clip("different-base")
+        with self.assertRaisesRegex(ValueError, "matching converted clip"):
+            grail_scene_definition(
+                "grail-curb-default", base, wrong, None)
+
+    def test_root_route_rejects_bad_rotation_shape_and_quaternion_norm(self):
+        bad_shape = fake_grail_clip(GRAIL_DEFAULT_BASE)
+        bad_shape.rotations = np.zeros(
+            bad_shape.positions.shape[:2], np.float32)
+        with self.subTest(case="rotation-shape"):
+            with self.assertRaisesRegex(ValueError, "root rotations"):
+                _root_route_and_yaw(bad_shape)
+
+        zero = fake_grail_clip(GRAIL_DEFAULT_BASE)
+        zero.rotations[0, 0] = 0.0
+        with self.subTest(case="zero-quaternion"):
+            with self.assertRaisesRegex(ValueError, "root quaternion"):
+                _root_route_and_yaw(zero)
+
+        nonunit = fake_grail_clip(GRAIL_DEFAULT_BASE)
+        nonunit.rotations[0, 0] = np.array([2.0, 0.0, 0.0, 0.0])
+        with self.subTest(case="materially-nonunit-quaternion"):
+            with self.assertRaisesRegex(ValueError, "root quaternion"):
+                _root_route_and_yaw(nonunit)
+
+        near_boundary = fake_grail_clip(GRAIL_DEFAULT_BASE)
+        near_boundary.rotations[0, 0] *= np.float32(1.0002)
+        with self.subTest(case="near-boundary-nonunit-quaternion"):
+            with self.assertRaisesRegex(ValueError, "root quaternion"):
+                _root_route_and_yaw(near_boundary)
+
+        roundoff = fake_grail_clip(GRAIL_DEFAULT_BASE)
+        yaw = 0.6
+        unit = np.array([
+            np.cos(0.5 * yaw), 0.0, np.sin(0.5 * yaw), 0.0,
+        ], np.float32)
+        roundoff.rotations[0, 0] = unit * np.float32(1.00005)
+        _, _, _, observed_yaw = _root_route_and_yaw(roundoff)
+        self.assertAlmostEqual(observed_yaw, yaw, places=5)
+
+    def test_real_corpus_selection_is_stable(self):
+        paths = sorted(glob.glob(os.path.join(GRAIL_ROBOT_DIR, "*.pkl")))
+        self.assertEqual(len(paths), 1769)
+        measured = {}
+        for path in paths:
+            base = os.path.splitext(os.path.basename(path))[0]
+            measured[base] = GrailTerrain.from_base(base).footprint()["height"]
+        for base, expected in LOCKED_GRAIL_HEIGHTS.items():
+            self.assertAlmostEqual(measured[base], expected, delta=1e-12)
+        self.assertEqual(
+            select_grail_scene_bases(measured), LOCKED_GRAIL_BASES)
+
+    def test_full_definition_catalog_has_locked_order_and_classes(self):
+        clips = {
+            base: fake_grail_clip(base)
+            for base in LOCKED_GRAIL_BASES.values()
+        }
+        definitions = all_scene_definitions(LOCKED_GRAIL_HEIGHTS, clips)
+        self.assertEqual(
+            tuple(scene.scene_id for scene in definitions), REQUIRED_SCENE_IDS)
+        grail = definitions[:4]
+        self.assertEqual(
+            [(scene.routes[0].expected_outcome,
+              scene.routes[0].walkability_class) for scene in grail],
+            [("traverse-or-safe-stop", 2), ("traverse", 1),
+             ("traverse-or-safe-stop", 2),
+             ("traverse-or-safe-stop", 2)])
+
+    def test_grail_g1wm_regions_routes_and_endpoint_footprints_are_class_pure(
+            self):
+        clips = {
+            base: fake_grail_clip(base)
+            for base in LOCKED_GRAIL_BASES.values()
+        }
+        definitions = grail_scene_definitions(
+            LOCKED_GRAIL_HEIGHTS, clips)
+        self.assertEqual(
+            tuple(scene.scene_id for scene in definitions),
+            REQUIRED_SCENE_IDS[:4])
+        expected_classes = {"blocked": 0, "certified": 1, "stress": 2}
+        for definition in definitions:
+            expected = definition.routes[0].walkability_class
+            halo = np.float32(WALKABILITY_CLASSIFICATION_HALO)
+            xmin, xmax, zmin, zmax = (
+                np.float32(value)
+                for value in definition.playable_bounds_xz
+            )
+            expanded = tuple(float(value) for value in (
+                np.float32(xmin - halo), np.float32(xmax + halo),
+                np.float32(zmin - halo), np.float32(zmax + halo),
+            ))
+            center_x = float(np.float32(
+                np.float32(xmin + xmax) / np.float32(2.0)))
+            center_z = float(np.float32(
+                np.float32(zmin + zmax) / np.float32(2.0)))
+            edge_queries = (
+                (expanded[0], center_z, 0, -np.inf),
+                (expanded[1], center_z, 0, np.inf),
+                (center_x, expanded[2], 1, -np.inf),
+                (center_x, expanded[3], 1, np.inf),
+            )
+            for x, z, axis, outward in edge_queries:
+                with self.subTest(
+                        scene=definition.scene_id, halo_edge=(x, z)):
+                    self.assertEqual(definition.walkability(x, z), expected)
+                    outside = [x, z]
+                    outside[axis] = np.nextafter(outside[axis], outward)
+                    self.assertEqual(
+                        definition.walkability(*outside), 0)
+
+            built = build_scene(definition)
+            grid, walkability = decoded_scene_grid_and_walkability(built)
+            metadata = built.metadata
+            normalized_playable = tuple(
+                float(np.float32(value))
+                for value in definition.playable_bounds_xz
+            )
+            published_playable = (
+                metadata["bounds"]["playable_min_xz"][0],
+                metadata["bounds"]["playable_max_xz"][0],
+                metadata["bounds"]["playable_min_xz"][1],
+                metadata["bounds"]["playable_max_xz"][1],
+            )
+            self.assertEqual(published_playable, normalized_playable)
+            region_class = "certified" if expected == 1 else "stress"
+            self.assertEqual(len(metadata["regions"][region_class]), 1)
+            self.assertEqual(
+                tuple(metadata["regions"][region_class][0]["bounds_xz"]),
+                normalized_playable)
+            self.assertEqual(metadata["regions"]["blocked"], [])
+            self.assertEqual(
+                metadata["regions"][
+                    "stress" if region_class == "certified" else "certified"],
+                [])
+            with self.subTest(scene=definition.scene_id, contract="source"):
+                self.assertEqual(
+                    metadata["provenance"]["source_ids"][0],
+                    LOCKED_GRAIL_BASES[definition.scene_id])
+            for class_name, regions in metadata["regions"].items():
+                for region in regions:
+                    with self.subTest(
+                            scene=definition.scene_id,
+                            region=region["id"]):
+                        cells = _region_cell_indices(
+                            grid, region["bounds_xz"])
+                        self.assertTrue(cells)
+                        self.assertEqual(
+                            {int(walkability[iz, ix]) for iz, ix in cells},
+                            {expected_classes[class_name]})
+            for route in metadata["routes"]:
+                points = tuple(
+                    tuple(point) for point in route["waypoints_xz"])
+                expected = route["walkability_class"]
+                covers = _route_cell_covers(grid, points)
+                self.assertTrue(covers)
+                with self.subTest(
+                        scene=definition.scene_id, route=route["id"]):
+                    self.assertTrue(all(
+                        {int(walkability[iz, ix]) for iz, ix in cover}
+                        == {expected}
+                        for cover in covers))
+                for endpoint in (points[0], points[-1]):
+                    with self.subTest(
+                            scene=definition.scene_id, endpoint=endpoint):
+                        self.assertEqual(
+                            set(decoded_footprint_classes(
+                                grid, walkability, *endpoint)),
+                            {expected})
 
 
 class ProceduralSceneTests(unittest.TestCase):

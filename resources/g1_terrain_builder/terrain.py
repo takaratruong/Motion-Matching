@@ -818,6 +818,89 @@ def rasterize_heightfield(
     return HeightGrid(heights, origin_x, origin_z, encoded_cell, 0.0)
 
 
+def _fixed_triangle_height(grid, ix, iz, tx, tz):
+    h00 = float(grid.heights[iz, ix])
+    h10 = float(grid.heights[iz, ix + 1])
+    h01 = float(grid.heights[iz + 1, ix])
+    h11 = float(grid.heights[iz + 1, ix + 1])
+    if tx >= tz:
+        return h00 + tx * (h10 - h00) + tz * (h11 - h10)
+    return h00 + tx * (h11 - h01) + tz * (h01 - h00)
+
+
+def grail_surface_parity(terrain, grid):
+    if not isinstance(terrain, GrailTerrain) or not isinstance(grid, HeightGrid):
+        raise TypeError("GRAIL parity requires GrailTerrain and HeightGrid")
+    source_nodes = np.empty_like(grid.heights, dtype=np.float64)
+    for iz in range(grid.nz):
+        z = grid.origin_z + iz * grid.cell_size
+        for ix in range(grid.nx):
+            x = grid.origin_x + ix * grid.cell_size
+            source_nodes[iz, ix] = terrain.height(x, z)
+    node_error = float(np.max(np.abs(
+        source_nodes - grid.heights.astype(np.float64))))
+
+    cell_count = (grid.nx - 1) * (grid.nz - 1)
+    sample_count = min(cell_count, 4096)
+    linear_cells = np.unique(np.linspace(
+        0, cell_count - 1, sample_count, dtype=np.int64))
+    local_probes = ((0.25, 0.125), (0.75, 0.25),
+                    (0.25, 0.75), (0.75, 0.875))
+    within_cell_error = 0.0
+    source_away_error = 0.0
+    away_edge_probe_count = 0
+    for linear in linear_cells:
+        iz, ix = divmod(int(linear), grid.nx - 1)
+        corner_heights = [
+            float(grid.heights[iz, ix]),
+            float(grid.heights[iz, ix + 1]),
+            float(grid.heights[iz + 1, ix]),
+            float(grid.heights[iz + 1, ix + 1]),
+        ]
+        probes = []
+        for tx, tz in local_probes:
+            x = grid.origin_x + (ix + tx) * grid.cell_size
+            z = grid.origin_z + (iz + tz) * grid.cell_size
+            queried = grid.height(x, z)
+            explicit = _fixed_triangle_height(grid, ix, iz, tx, tz)
+            within_cell_error = max(
+                within_cell_error, abs(queried - explicit))
+            probes.append((queried, terrain.height(x, z)))
+        local_source = corner_heights + [source for _, source in probes]
+        if max(local_source) - min(local_source) <= 0.005:
+            for queried, source in probes:
+                source_away_error = max(
+                    source_away_error, abs(queried - source))
+                away_edge_probe_count += 1
+
+    footprint = terrain.footprint()
+    threshold = footprint["height"] - 0.02
+    top_iz, top_ix = np.nonzero(grid.heights >= threshold)
+    if not len(top_ix):
+        raise ValueError("GRAIL grid contains no measured top nodes")
+    grid_top_bounds = (
+        grid.origin_x + int(top_ix.min()) * grid.cell_size,
+        grid.origin_x + int(top_ix.max()) * grid.cell_size,
+        grid.origin_z + int(top_iz.min()) * grid.cell_size,
+        grid.origin_z + int(top_iz.max()) * grid.cell_size,
+    )
+    source_top_bounds = (
+        footprint["x"][0], footprint["x"][1],
+        footprint["z"][0], footprint["z"][1],
+    )
+    edge_movement = max(
+        abs(float(actual) - float(expected))
+        for actual, expected in zip(grid_top_bounds, source_top_bounds)
+    )
+    return {
+        "node_error_m": node_error,
+        "within_cell_error_m": float(within_cell_error),
+        "source_away_edge_error_m": float(source_away_error),
+        "top_edge_movement_m": float(edge_movement),
+        "away_edge_probe_count": away_edge_probe_count,
+    }
+
+
 def export_heightfield_obj(grid: HeightGrid, path: str) -> None:
     if not isinstance(grid, HeightGrid):
         raise TypeError("heightfield OBJ export requires a HeightGrid")

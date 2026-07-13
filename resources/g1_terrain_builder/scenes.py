@@ -7,8 +7,11 @@ from typing import Callable
 
 import numpy as np
 
+from resources import quat as holden_quat
+
 from .artifacts import walkability_bytes
 from .terrain import (
+    GrailTerrain,
     HEIGHTFIELD_DIAGONAL,
     HEIGHTFIELD_INTERPOLATION,
     HeightGrid,
@@ -233,6 +236,12 @@ class ScenePack:
 COURSE_HALF_WIDTH = 0.60
 FLAT_SPAWN_LENGTH = 2.0
 LOOKAHEAD_MARGIN = 1.0
+GRAIL_DEFAULT_BASE = "terrain_curbs__curb_000__000"
+GRAIL_TARGETS = (
+    ("grail-curb-low", 0.12),
+    ("grail-curb-medium", 0.24),
+    ("grail-curb-high", 0.36),
+)
 
 
 def _runtime_f32_upper_ceiling(value, label):
@@ -724,6 +733,158 @@ def _strict_bounds(values, label):
 def _bounds_contains_bounds(outer, inner):
     return outer[0] <= inner[0] <= inner[1] <= outer[1] \
         and outer[2] <= inner[2] <= inner[3] <= outer[3]
+
+
+def select_grail_scene_bases(measured_max_heights):
+    if not isinstance(measured_max_heights, dict) or not measured_max_heights:
+        raise ValueError("GRAIL measurements must be a non-empty mapping")
+    measured = {}
+    for base, height in measured_max_heights.items():
+        if type(base) is not str or not base:
+            raise ValueError("GRAIL base names must be non-empty strings")
+        measured[base] = _finite_real(
+            height, f"GRAIL measured height for {base}")
+    if GRAIL_DEFAULT_BASE not in measured:
+        raise ValueError(f"missing default GRAIL base {GRAIL_DEFAULT_BASE}")
+    result = {"grail-curb-default": GRAIL_DEFAULT_BASE}
+    for scene_id, target in GRAIL_TARGETS:
+        result[scene_id] = min(
+            measured,
+            key=lambda base: (abs(measured[base] - target), base),
+        )
+    return result
+
+
+def _root_route_and_yaw(clip):
+    positions = np.asarray(clip.positions, np.float64)
+    rotations = np.asarray(clip.rotations, np.float64)
+    if positions.ndim != 3 or positions.shape[0] < 2 \
+            or positions.shape[1] < 1 or positions.shape[2] != 3:
+        raise ValueError("converted GRAIL clip has invalid root positions")
+    if rotations.ndim != 3 \
+            or rotations.shape != positions.shape[:2] + (4,):
+        raise ValueError("converted GRAIL clip has invalid root rotations")
+    if not np.isfinite(positions).all() \
+            or not np.isfinite(rotations).all():
+        raise ValueError("converted GRAIL root transform is invalid")
+    indices = sorted(set(
+        int(round(value))
+        for value in np.linspace(0, len(positions) - 1, 5)
+    ))
+    if len(indices) < 2:
+        raise ValueError("converted GRAIL route needs two distinct frames")
+    path = positions[:, 0][:, (0, 2)]
+    route = tuple(
+        (float(path[index, 0]), float(path[index, 1]))
+        for index in indices
+    )
+    root_rotation = rotations[0, 0]
+    root_norm = float(np.linalg.norm(root_rotation))
+    if root_norm < 1e-8 or abs(root_norm - 1.0) > 1e-4:
+        raise ValueError(
+            "converted GRAIL root quaternion is not unit length")
+    root_rotation = root_rotation / root_norm
+    facing = holden_quat.mul_vec(
+        root_rotation, np.array([0.0, 0.0, 1.0], np.float64))
+    horizontal = np.array([facing[0], facing[2]], np.float64)
+    if not np.isfinite(horizontal).all() or np.linalg.norm(horizontal) < 1e-8:
+        raise ValueError("converted GRAIL root facing is invalid")
+    yaw = float(np.arctan2(horizontal[0], horizontal[1]))
+    spawn = tuple(float(value) for value in positions[0, 0])
+    return path, route, spawn, yaw
+
+
+def grail_scene_definition(
+    scene_id, base, clip, target_height_m,
+):
+    if scene_id not in REQUIRED_SCENE_IDS[:4]:
+        raise ValueError(f"unknown GRAIL scene ID {scene_id}")
+    if clip.terrain_id != base:
+        raise ValueError("GRAIL scene requires its matching converted clip")
+    terrain = GrailTerrain.from_base(base)
+    maximum_height = float(terrain.footprint()["height"])
+    path, route_points, spawn, yaw = _root_route_and_yaw(clip)
+    mesh_xmin, mesh_xmax, mesh_zmin, mesh_zmax = terrain.xz_bounds()
+    path_xmin, path_zmin = path.min(axis=0)
+    path_xmax, path_zmax = path.max(axis=0)
+    playable = (
+        float(path_xmin - COURSE_HALF_WIDTH),
+        float(path_xmax + COURSE_HALF_WIDTH),
+        float(path_zmin - COURSE_HALF_WIDTH),
+        float(path_zmax + COURSE_HALF_WIDTH),
+    )
+    classification = _walkability_classification_bounds(playable)
+    bounds = (
+        float(min(mesh_xmin, playable[0]) - LOOKAHEAD_MARGIN),
+        float(max(mesh_xmax, playable[1]) + LOOKAHEAD_MARGIN),
+        float(min(mesh_zmin, playable[2]) - LOOKAHEAD_MARGIN),
+        float(max(mesh_zmax, playable[3]) + LOOKAHEAD_MARGIN),
+    )
+    certified = maximum_height <= 0.16
+    walkability_class = 1 if certified else 2
+    expected_outcome = "traverse" if certified else "traverse-or-safe-stop"
+    region_name = "certified" if certified else "stress"
+    regions = {"certified": (), "stress": (), "blocked": ()}
+    regions[region_name] = (_region("curb-route", playable),)
+    labels = {
+        "grail-curb-default": "GRAIL Default Curb",
+        "grail-curb-low": "GRAIL Low Curb",
+        "grail-curb-medium": "GRAIL Medium Curb",
+        "grail-curb-high": "GRAIL High Curb",
+    }
+    return SceneDefinition(
+        scene_id=scene_id,
+        label=labels[scene_id],
+        provenance={
+            "kind": "grail",
+            "source_ids": [base, clip.name],
+            "parameters": {
+                "selection_rule": (
+                    "fixed-default" if target_height_m is None
+                    else "nearest-measured-maximum-then-lexical"),
+                "target_height_m": (
+                    None if target_height_m is None
+                    else float(target_height_m)),
+                "measured_maximum_height_m": maximum_height,
+                "route_source": "converted-holden-root-path",
+            },
+        },
+        surface=terrain,
+        heightfield_bounds_xz=bounds,
+        playable_bounds_xz=playable,
+        lookahead_bounds_xz=bounds,
+        spawn_position=spawn,
+        spawn_yaw_radians=yaw,
+        regions=regions,
+        routes=(SceneRoute(
+            "curb-forward", route_points, expected_outcome,
+            walkability_class, 0.0),),
+        walkability=lambda x, z, c=walkability_class, b=classification: (
+            c if _bounds_contains(b, x, z) else 0),
+    )
+
+
+def grail_scene_definitions(measured_max_heights, clips_by_terrain):
+    selected = select_grail_scene_bases(measured_max_heights)
+    targets = {scene_id: target for scene_id, target in GRAIL_TARGETS}
+    targets["grail-curb-default"] = None
+    definitions = []
+    for scene_id in REQUIRED_SCENE_IDS[:4]:
+        base = selected[scene_id]
+        if base not in clips_by_terrain:
+            raise ValueError(f"missing converted scene clip for {base}")
+        definitions.append(grail_scene_definition(
+            scene_id, base, clips_by_terrain[base], targets[scene_id]))
+    return tuple(definitions)
+
+
+def all_scene_definitions(measured_max_heights, clips_by_terrain):
+    definitions = grail_scene_definitions(
+        measured_max_heights, clips_by_terrain) \
+        + procedural_scene_definitions()
+    if tuple(scene.scene_id for scene in definitions) != REQUIRED_SCENE_IDS:
+        raise ValueError("complete scene definition order changed")
+    return definitions
 
 
 def _classify_grid(scene_id, walkability, grid):

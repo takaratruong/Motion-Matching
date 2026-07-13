@@ -18,6 +18,7 @@ from resources.g1_terrain_builder.kinematics import (
     convert_source_clip,
 )
 from resources.g1_terrain_builder.sources import load_grail
+from resources.g1_terrain_builder.scenes import GRAIL_DEFAULT_BASE
 from resources.g1_terrain_builder.terrain import (
     FlatTerrain,
     GrailTerrain,
@@ -27,6 +28,7 @@ from resources.g1_terrain_builder.terrain import (
     build_facing_centerline,
     export_heightfield,
     export_heightfield_obj,
+    grail_surface_parity,
     rasterize_heightfield,
     sample_terrain_features,
     surface_semantics,
@@ -38,9 +40,72 @@ from resources.g1_terrain_builder.terrain import (
 GRAIL_USD_DIR = "/home/ubuntu/datasets/GRAIL/data/curb/object_usd"
 GRAIL_RECON_DIR = "/home/ubuntu/datasets/GRAIL/data/curb/recon"
 GRAIL_ROBOT_DIR = "/home/ubuntu/datasets/GRAIL/data/curb/robot"
+GRAIL_PARITY_BASES = (
+    GRAIL_DEFAULT_BASE,
+    "terrain_curbs__curb_186__004",
+    "terrain_curbs__curb_022__001",
+    "terrain_curbs__curb_165__006",
+)
 
 
 class TerrainTests(unittest.TestCase):
+    def test_selected_grail_grids_meet_all_surface_parity_tolerances(self):
+        for base in GRAIL_PARITY_BASES:
+            with self.subTest(base=base):
+                terrain = GrailTerrain.from_base(base)
+                xmin, xmax, zmin, zmax = terrain.xz_bounds()
+                grid = rasterize_heightfield(
+                    terrain, (xmin - 1.0, xmax + 1.0,
+                              zmin - 1.0, zmax + 1.0), 0.02)
+                report = grail_surface_parity(terrain, grid)
+                self.assertLessEqual(report["node_error_m"], 1e-6)
+                self.assertLessEqual(report["within_cell_error_m"], 1e-4)
+                self.assertLessEqual(
+                    report["source_away_edge_error_m"], 0.005)
+                self.assertLessEqual(
+                    report["top_edge_movement_m"], 0.02 + 1e-9)
+                self.assertGreater(report["away_edge_probe_count"], 0)
+
+    def test_real_grail_obj_vertices_and_faces_are_the_grid(self):
+        terrain = GrailTerrain.from_base(GRAIL_DEFAULT_BASE)
+        xmin, xmax, zmin, zmax = terrain.xz_bounds()
+        grid = rasterize_heightfield(
+            terrain, (xmin - 0.04, xmax + 0.04,
+                      zmin - 0.04, zmax + 0.04), 0.02)
+        lines = grid.obj_bytes().decode("utf-8").splitlines()
+        vertex_lines = lines[:grid.nx * grid.nz]
+        face_lines = lines[grid.nx * grid.nz:]
+        vertices = np.array([
+            [float(value) for value in line.split()[1:]]
+            for line in vertex_lines
+        ], dtype=np.float32)
+
+        def runtime_coordinate(value):
+            encoded = np.float32(value)
+            return np.float32(0.0) if encoded == 0.0 else encoded
+
+        expected = []
+        for iz in range(grid.nz):
+            for ix in range(grid.nx):
+                expected.append([
+                    runtime_coordinate(
+                        grid.origin_x + ix * grid.cell_size),
+                    grid.heights[iz, ix],
+                    runtime_coordinate(
+                        grid.origin_z + iz * grid.cell_size),
+                ])
+        expected = np.asarray(expected, dtype=np.float32)
+        np.testing.assert_array_equal(
+            vertices.view(np.uint32), expected.view(np.uint32))
+        expected_faces = []
+        for iz in range(grid.nz - 1):
+            for ix in range(grid.nx - 1):
+                p00 = iz * grid.nx + ix + 1
+                p10, p01, p11 = p00 + 1, p00 + grid.nx, p00 + grid.nx + 1
+                expected_faces.extend(
+                    [f"f {p00} {p11} {p10}", f"f {p00} {p01} {p11}"])
+        self.assertEqual(face_lines, expected_faces)
+
     def test_stationary_centerline_extends_current_heading(self):
         root = np.array([0.0, 0.0])
         headings = np.array([[1.0, 0.0], [1.0, 0.0]])
