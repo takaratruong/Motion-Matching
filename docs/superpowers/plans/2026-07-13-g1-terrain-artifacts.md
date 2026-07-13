@@ -1472,7 +1472,7 @@ git commit -m "feat: serialize validated Holden G1 clips"
 **Interfaces:**
 - Produces: write_terrain_sidecar(path, features) -> None.
 - Produces: read_terrain_sidecar(path) -> ndarray.
-- Produces: publish_artifacts(output_dir, artifacts, skeleton, manifest) -> None.
+- Produces: publish_artifacts(output_dir, artifacts, manifest, terrain_writer) -> None.
 - Sidecar header: magic bytes G1TF, uint32 version 1, uint32 frames, uint32 dims 4.
 
 - [ ] **Step 1: Write corruption and atomic-publish tests**
@@ -1481,12 +1481,15 @@ git commit -m "feat: serialize validated Holden G1 clips"
 # tests/python/test_artifacts.py
 import json
 import os
+import struct
 import tempfile
 import unittest
+from unittest import mock
 import numpy as np
 from resources.g1_terrain_builder.artifacts import (
-    read_terrain_sidecar, write_terrain_sidecar,
+    publish_artifacts, read_terrain_sidecar, write_terrain_sidecar,
 )
+from resources.g1_terrain_builder.schema import ArtifactSet
 
 
 class ArtifactTests(unittest.TestCase):
@@ -1496,7 +1499,10 @@ class ArtifactTests(unittest.TestCase):
             path = os.path.join(td, "terrain_features.bin")
             write_terrain_sidecar(path, f)
             out = read_terrain_sidecar(path)
+            payload = open(path, "rb").read()
         np.testing.assert_array_equal(out, f)
+        self.assertEqual(payload[:16], struct.pack("<4sIII", b"G1TF", 1, 5, 4))
+        self.assertEqual(payload[16:], f.astype("<f4").tobytes())
 
     def test_terrain_sidecar_rejects_truncation(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1505,6 +1511,96 @@ class ArtifactTests(unittest.TestCase):
                 stream.write(b"G1TF" + (1).to_bytes(4, "little"))
             with self.assertRaisesRegex(ValueError, "truncated"):
                 read_terrain_sidecar(path)
+
+    def test_sidecar_rejects_corruption_and_invalid_values(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "terrain_features.bin")
+            with self.assertRaisesRegex(ValueError, "finite"):
+                write_terrain_sidecar(path, np.full((2, 4), np.nan))
+            valid = struct.pack("<4sIII", b"G1TF", 1, 2, 4) + \
+                np.zeros((2, 4), "<f4").tobytes()
+            for name, payload, message in (
+                ("magic", b"BAD!" + valid[4:], "schema"),
+                ("trailing", valid + b"x", "trailing"),
+                ("payload", valid[:-1], "truncated"),
+            ):
+                corrupt = os.path.join(td, name + ".bin")
+                with open(corrupt, "wb") as stream:
+                    stream.write(payload)
+                with self.subTest(name=name):
+                    with self.assertRaisesRegex(ValueError, message):
+                        read_terrain_sidecar(corrupt)
+
+    @staticmethod
+    def _terrain_writer(staging):
+        open(os.path.join(staging, "terrain.bin"), "wb").write(b"terrain")
+        open(os.path.join(staging, "terrain.obj"), "w").write("v 0 0 0\n")
+
+    def test_publish_replaces_directory_with_complete_validated_set(self):
+        artifacts = ArtifactSet.empty(4, 2)
+        manifest = {"schema":"test", "validation":{"ok":True}}
+        with tempfile.TemporaryDirectory() as td:
+            output = os.path.join(td, "published")
+            os.mkdir(output)
+            open(os.path.join(output, "old"), "w").write("sentinel")
+            publish_artifacts(output, artifacts, manifest, self._terrain_writer)
+            self.assertEqual(
+                set(os.listdir(output)),
+                {"database.bin", "terrain_features.bin", "terrain.bin",
+                 "terrain.obj", "manifest.json", "validation.json"})
+            self.assertFalse(os.path.exists(output + ".previous"))
+            self.assertFalse(any(name.startswith(".g1_terrain-")
+                                 for name in os.listdir(td)))
+            self.assertEqual(json.load(open(os.path.join(
+                output, "manifest.json"))), manifest)
+
+    def test_publish_failure_preserves_previous_directory(self):
+        artifacts = ArtifactSet.empty(4, 2)
+        manifest = {"schema":"test", "validation":{"ok":True}}
+        with tempfile.TemporaryDirectory() as td:
+            output = os.path.join(td, "published")
+            os.mkdir(output)
+            sentinel = os.path.join(output, "old")
+            open(sentinel, "w").write("sentinel")
+
+            def failed_writer(staging):
+                open(os.path.join(staging, "partial"), "w").write("partial")
+                raise RuntimeError("terrain export failed")
+
+            with self.assertRaisesRegex(RuntimeError, "terrain export"):
+                publish_artifacts(output, artifacts, manifest, failed_writer)
+            self.assertEqual(open(sentinel).read(), "sentinel")
+            self.assertEqual(os.listdir(output), ["old"])
+            self.assertFalse(os.path.exists(output + ".previous"))
+
+    def test_publish_rename_failure_rolls_back_previous_directory(self):
+        artifacts = ArtifactSet.empty(4, 2)
+        manifest = {"schema":"test", "validation":{"ok":True}}
+        with tempfile.TemporaryDirectory() as td:
+            output = os.path.join(td, "published")
+            os.mkdir(output)
+            sentinel = os.path.join(output, "old")
+            open(sentinel, "w").write("sentinel")
+            real_replace = os.replace
+            failed_once = False
+
+            def fail_staging_replace(source, destination):
+                nonlocal failed_once
+                if destination == output and ".g1_terrain-" in source and not failed_once:
+                    failed_once = True
+                    raise OSError("injected publish rename failure")
+                return real_replace(source, destination)
+
+            with mock.patch(
+                "resources.g1_terrain_builder.artifacts.os.replace",
+                side_effect=fail_staging_replace,
+            ):
+                with self.assertRaisesRegex(OSError, "injected"):
+                    publish_artifacts(
+                        output, artifacts, manifest, self._terrain_writer)
+            self.assertEqual(open(sentinel).read(), "sentinel")
+            self.assertEqual(os.listdir(output), ["old"])
+            self.assertFalse(os.path.exists(output + ".previous"))
 
 
 if __name__ == "__main__":
@@ -1539,8 +1635,8 @@ DIMS = 4
 
 
 def write_terrain_sidecar(path: str, features: np.ndarray) -> None:
-    f = np.ascontiguousarray(features, np.float32)
-    if f.ndim != 2 or f.shape[1] != DIMS or not np.isfinite(f).all():
+    f = np.ascontiguousarray(features, dtype="<f4")
+    if f.ndim != 2 or len(f) < 1 or f.shape[1] != DIMS or not np.isfinite(f).all():
         raise ValueError(f"terrain features must be finite (N, 4), got {f.shape}")
     with open(path, "wb") as stream:
         stream.write(struct.pack("<4sIII", MAGIC, VERSION, len(f), DIMS))
@@ -1557,13 +1653,20 @@ def read_terrain_sidecar(path: str) -> np.ndarray:
     expected = 16 + frames * dims * 4
     if len(data) != expected:
         raise ValueError(f"{path}: truncated or trailing terrain data")
-    return np.frombuffer(data, np.float32, offset=16).reshape(frames, dims).copy()
+    values = np.frombuffer(data, dtype="<f4", offset=16).reshape(frames, dims).copy()
+    if frames < 1 or not np.isfinite(values).all():
+        raise ValueError(f"{path}: invalid terrain sidecar values")
+    return values
 ~~~
 
 Add:
 
 ~~~python
 def publish_artifacts(output_dir, artifacts, manifest, terrain_writer):
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("validation"), dict):
+        raise ValueError("manifest must contain a validation object")
+    if not callable(terrain_writer):
+        raise TypeError("terrain_writer must be callable")
     parent = os.path.dirname(os.path.abspath(output_dir))
     os.makedirs(parent, exist_ok=True)
     staging = tempfile.mkdtemp(prefix=".g1_terrain-", dir=parent)
@@ -1574,10 +1677,15 @@ def publish_artifacts(output_dir, artifacts, manifest, terrain_writer):
             os.path.join(staging, "terrain_features.bin"),
             artifacts.terrain_features)
         with open(os.path.join(staging, "manifest.json"), "w") as stream:
-            json.dump(manifest, stream, indent=2, sort_keys=True)
+            json.dump(manifest, stream, indent=2, sort_keys=True, allow_nan=False)
         with open(os.path.join(staging, "validation.json"), "w") as stream:
-            json.dump(manifest["validation"], stream, indent=2, sort_keys=True)
+            json.dump(
+                manifest["validation"], stream, indent=2,
+                sort_keys=True, allow_nan=False)
         terrain_writer(staging)
+        for required in ("terrain.bin", "terrain.obj"):
+            if not os.path.isfile(os.path.join(staging, required)):
+                raise ValueError(f"terrain writer did not create {required}")
         loaded = read_holden_database(os.path.join(staging, "database.bin"))
         loaded.terrain_features = read_terrain_sidecar(
             os.path.join(staging, "terrain_features.bin"))
@@ -1610,7 +1718,7 @@ Run:
   tests.python.test_artifacts -v
 ~~~
 
-Expected: 2 tests, OK.
+Expected: all focused artifact-publication tests pass.
 
 - [ ] **Step 5: Commit artifact publication**
 
