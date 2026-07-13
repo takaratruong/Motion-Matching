@@ -8,6 +8,13 @@ import warnings
 import numpy as np
 from pxr import Usd, UsdGeom
 
+from resources import build_g1_terrain_database as builder
+from resources import quat as holden_quat
+from resources.g1_terrain_builder.kinematics import (
+    G1Kinematics,
+    convert_source_clip,
+)
+from resources.g1_terrain_builder.sources import load_grail
 from resources.g1_terrain_builder.terrain import (
     FlatTerrain,
     GrailTerrain,
@@ -21,6 +28,7 @@ from resources.g1_terrain_builder.terrain import (
 
 GRAIL_USD_DIR = "/home/ubuntu/datasets/GRAIL/data/curb/object_usd"
 GRAIL_RECON_DIR = "/home/ubuntu/datasets/GRAIL/data/curb/recon"
+GRAIL_ROBOT_DIR = "/home/ubuntu/datasets/GRAIL/data/curb/robot"
 
 
 class TerrainTests(unittest.TestCase):
@@ -155,6 +163,90 @@ class TerrainTests(unittest.TestCase):
                 ):
                     GrailTerrain(vertices, counts, indices, vertices)
 
+    def test_full_xz_bounds_include_lower_curb_and_preserve_top_footprint(self):
+        vertices = np.array([
+            [-1.0, 0.10, 0.0],
+            [1.0, 0.10, 0.0],
+            [1.0, 0.10, 1.0],
+            [-1.0, 0.10, 1.0],
+            [-0.5, 0.30, 3.0],
+            [0.5, 0.30, 3.0],
+            [0.5, 0.30, 4.0],
+            [-0.5, 0.30, 4.0],
+        ])
+        counts = np.array([4, 4], np.int32)
+        indices = np.arange(8, dtype=np.int32)
+        query_points = np.concatenate((
+            vertices,
+            np.array([[-1.25, 0.10, -0.25], [1.25, 0.10, 1.25]]),
+        ))
+        terrain = GrailTerrain(
+            vertices, counts, indices, query_points, radius=0.2)
+
+        first = terrain.xz_bounds()
+        second = terrain.xz_bounds()
+        footprint = terrain.footprint()
+        contract, _ = builder._heightfield_contract(terrain)
+
+        self.assertEqual(first, second)
+        self.assertTrue(np.all(np.isfinite(first)))
+        self.assertEqual(first, (-1.25, 1.25, -0.25, 4.0))
+        self.assertEqual(footprint["x"], (-0.5, 0.5))
+        self.assertEqual(footprint["z"], (3.0, 4.0))
+        self.assertEqual(footprint["height"], 0.3)
+        self.assertEqual(contract, (-3.25, 3.25, -2.25, 6.0))
+
+    def test_grail_terrain_rejects_empty_or_malformed_geometry(self):
+        triangle = np.array([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+        nonfinite_vertices = triangle.copy()
+        nonfinite_vertices[0, 0] = np.nan
+        nonfinite_points = triangle.copy()
+        nonfinite_points[0, 2] = np.inf
+        cases = (
+            (
+                np.empty((0, 3)), np.empty(0, np.int32),
+                np.empty(0, np.int32), triangle,
+                "vertices must have non-empty shape",
+            ),
+            (
+                triangle.ravel(), np.array([3], np.int32),
+                np.array([0, 1, 2], np.int32), triangle,
+                "vertices must have non-empty shape",
+            ),
+            (
+                triangle, np.empty(0, np.int32), np.empty(0, np.int32),
+                triangle, "faces must be non-empty",
+            ),
+            (
+                triangle, np.array([3], np.int32),
+                np.array([0, 1, 2], np.int32), np.empty((0, 3)),
+                "query points must have non-empty shape",
+            ),
+            (
+                triangle, np.array([3], np.int32),
+                np.array([0, 1, 2], np.int32), np.ones((3, 2)),
+                "query points must have non-empty shape",
+            ),
+            (
+                nonfinite_vertices, np.array([3], np.int32),
+                np.array([0, 1, 2], np.int32), triangle,
+                "points must be finite",
+            ),
+            (
+                triangle, np.array([3], np.int32),
+                np.array([0, 1, 2], np.int32), nonfinite_points,
+                "points must be finite",
+            ),
+        )
+        for vertices, counts, indices, points, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    GrailTerrain(vertices, counts, indices, points)
+
     def test_real_grail_curb_has_expected_height_and_stable_obj(self):
         base = "terrain_curbs__curb_000__000"
         terrain = GrailTerrain.from_base(base)
@@ -219,6 +311,63 @@ class TerrainTests(unittest.TestCase):
         ]
         self.assertEqual(actual_faces, expected_faces)
         self.assertAlmostEqual(actual_vertices[:, 1].max(), footprint["height"], places=6)
+
+    def test_runtime_heightfield_covers_obj_and_motion_lookahead(self):
+        base = builder.DEFAULTS["runtime_terrain"]
+        terrain = GrailTerrain.from_base(base)
+        requested, metadata = builder._heightfield_contract(terrain)
+        domain = (
+            metadata["origin_x"],
+            metadata["origin_x"]
+            + (metadata["nx"] - 1) * metadata["cell_size"],
+            metadata["origin_z"],
+            metadata["origin_z"]
+            + (metadata["nz"] - 1) * metadata["cell_size"],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            obj_path = os.path.join(tmp, "terrain.obj")
+            terrain.export_obj(obj_path)
+            with open(obj_path, encoding="utf-8") as stream:
+                vertices = np.array([
+                    [float(value) for value in line.split()[1:]]
+                    for line in stream
+                    if line.startswith("v ")
+                ])
+
+        target = (
+            vertices[:, 0].min() - builder.HEIGHTFIELD_BORDER,
+            vertices[:, 0].max() + builder.HEIGHTFIELD_BORDER,
+            vertices[:, 2].min() - builder.HEIGHTFIELD_BORDER,
+            vertices[:, 2].max() + builder.HEIGHTFIELD_BORDER,
+        )
+        self.assertAlmostEqual(requested[0], target[0], places=7)
+        self.assertAlmostEqual(requested[1], target[1], places=7)
+        self.assertAlmostEqual(requested[2], target[2], places=7)
+        self.assertAlmostEqual(requested[3], target[3], places=7)
+        obj_rounding = 1e-7
+        self.assertLessEqual(domain[0], target[0] + obj_rounding)
+        self.assertGreaterEqual(domain[1], target[1] - obj_rounding)
+        self.assertLessEqual(domain[2], target[2] + obj_rounding)
+        self.assertGreaterEqual(domain[3], target[3] - obj_rounding)
+        self.assertLess(
+            domain[1] - target[1], metadata["cell_size"] + obj_rounding)
+        self.assertLess(
+            domain[3] - target[3], metadata["cell_size"] + obj_rounding)
+
+        source = load_grail(os.path.join(GRAIL_ROBOT_DIR, base + ".pkl"))
+        kinematics = G1Kinematics(builder.DEFAULTS["g1_xml"])
+        clip, _, _ = convert_source_clip(source, kinematics, builder.OUTPUT_FPS)
+        roots = clip.positions[:, 0][:, [0, 2]].astype(np.float64)
+        headings = holden_quat.mul_vec(
+            clip.rotations[:, 0].astype(np.float64),
+            np.array([0.0, 0.0, 1.0]),
+        )[:, [0, 2]]
+        runtime_queries = np.concatenate((roots, roots + headings), axis=0)
+        self.assertTrue(np.all(runtime_queries[:, 0] >= domain[0]))
+        self.assertTrue(np.all(runtime_queries[:, 0] <= domain[1]))
+        self.assertTrue(np.all(runtime_queries[:, 1] >= domain[2]))
+        self.assertTrue(np.all(runtime_queries[:, 1] <= domain[3]))
 
 
 if __name__ == "__main__":

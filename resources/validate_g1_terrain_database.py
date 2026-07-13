@@ -328,7 +328,7 @@ def _validate_parameters(manifest: dict, clip_count: int) -> dict:
 
 def _parse_heightfield(
     path: str, metadata: dict, schema_cell_size: float,
-) -> None:
+) -> tuple[float, float, float, float]:
     try:
         with open(path, "rb") as stream:
             payload = stream.read()
@@ -398,9 +398,15 @@ def _parse_heightfield(
         metadata["exterior_height"] == 0.0 and exterior == 0.0,
         "terrain heightfield exterior height must be 0.0",
     )
+    return (
+        float(origin_x),
+        float(origin_x + (nx - 1) * cell_size),
+        float(origin_z),
+        float(origin_z + (nz - 1) * cell_size),
+    )
 
 
-def _parse_obj(path: str) -> None:
+def _parse_obj(path: str) -> tuple[float, float, float, float]:
     try:
         with open(path, encoding="utf-8") as stream:
             lines = stream.read().splitlines()
@@ -454,6 +460,37 @@ def _parse_obj(path: str) -> None:
             max(face) <= len(vertices),
             f"terrain.obj line {number}: face index exceeds vertex count",
         )
+    positions = np.asarray(vertices, np.float64)
+    return (
+        float(positions[:, 0].min()),
+        float(positions[:, 0].max()),
+        float(positions[:, 2].min()),
+        float(positions[:, 2].max()),
+    )
+
+
+def _validate_terrain_coverage(
+    heightfield_bounds: tuple[float, float, float, float],
+    obj_bounds: tuple[float, float, float, float],
+    border: float,
+) -> None:
+    scale = max(
+        1.0,
+        abs(border),
+        *(abs(value) for value in heightfield_bounds),
+        *(abs(value) for value in obj_bounds),
+    )
+    tolerance = 8.0 * float(np.finfo(np.float32).eps) * scale
+    hxmin, hxmax, hzmin, hzmax = heightfield_bounds
+    oxmin, oxmax, ozmin, ozmax = obj_bounds
+    _require(
+        hxmin <= oxmin - border + tolerance
+        and hxmax >= oxmax + border - tolerance
+        and hzmin <= ozmin - border + tolerance
+        and hzmax >= ozmax + border - tolerance,
+        "terrain.bin domain does not cover terrain.obj XZ bounds plus "
+        "terrain.border_m",
+    )
 
 
 def validate_artifact_directory(artifact_dir: str) -> dict:
@@ -507,12 +544,14 @@ def validate_artifact_directory(artifact_dir: str) -> dict:
         quaternion_error <= 1e-4,
         f"database.bin quaternion norm error {quaternion_error} exceeds 0.0001",
     )
-    _parse_heightfield(
+    heightfield_bounds = _parse_heightfield(
         os.path.join(artifact_dir, "terrain.bin"),
         terrain.get("heightfield"),
         float(terrain["cell_size_m"]),
     )
-    _parse_obj(os.path.join(artifact_dir, "terrain.obj"))
+    obj_bounds = _parse_obj(os.path.join(artifact_dir, "terrain.obj"))
+    _validate_terrain_coverage(
+        heightfield_bounds, obj_bounds, float(terrain["border_m"]))
     return {
         "frames": len(database.positions),
         "clips": len(sources),

@@ -148,8 +148,12 @@ def _validate_mesh_topology(
     face_counts: np.ndarray,
     face_indices: np.ndarray,
 ) -> None:
+    if vertices.ndim != 2 or vertices.shape[1:] != (3,) or not len(vertices):
+        raise ValueError("terrain vertices must have non-empty shape (N, 3)")
     if face_counts.ndim != 1 or face_indices.ndim != 1:
         raise ValueError("face counts and indices must be one-dimensional")
+    if not len(face_counts):
+        raise ValueError("terrain faces must be non-empty")
     if np.any(face_counts < 3):
         raise ValueError("terrain faces must have at least three vertices")
     if int(face_counts.sum()) != len(face_indices):
@@ -222,10 +226,21 @@ class GrailTerrain:
         self._points = np.asarray(query_points, np.float64)
         _validate_mesh_topology(
             self._vertices, self._face_counts, self._face_indices)
-        if not np.all(np.isfinite(self._vertices)) or not np.all(np.isfinite(self._points)):
+        if (
+            self._points.ndim != 2
+            or self._points.shape[1:] != (3,)
+            or not len(self._points)
+        ):
+            raise ValueError(
+                "GRAIL terrain query points must have non-empty shape (N, 3)")
+        if (
+            not np.all(np.isfinite(self._vertices))
+            or not np.all(np.isfinite(self._points))
+        ):
             raise ValueError("GRAIL terrain points must be finite")
-        if len(self._points) == 0 or radius <= 0.0:
-            raise ValueError("GRAIL terrain requires points and a positive query radius")
+        if radius <= 0.0:
+            raise ValueError(
+                "GRAIL terrain requires points and a positive query radius")
         self._radius = float(radius)
         self._tree = cKDTree(self._points[:, (0, 2)])
         self._max_height = float(self._points[:, 1].max())
@@ -259,6 +274,15 @@ class GrailTerrain:
             "z": (float(top[:, 2].min()), float(top[:, 2].max())),
             "height": self._max_height,
         }
+
+    def xz_bounds(self) -> tuple[float, float, float, float]:
+        """Return complete render/query bounds as xmin, xmax, zmin, zmax."""
+        return (
+            float(min(self._vertices[:, 0].min(), self._points[:, 0].min())),
+            float(max(self._vertices[:, 0].max(), self._points[:, 0].max())),
+            float(min(self._vertices[:, 2].min(), self._points[:, 2].min())),
+            float(max(self._vertices[:, 2].max(), self._points[:, 2].max())),
+        )
 
     def export_obj(self, path: str) -> None:
         with open(path, "w", encoding="utf-8", newline="\n") as stream:

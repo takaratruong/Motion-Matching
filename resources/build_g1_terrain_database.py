@@ -85,9 +85,7 @@ def _require_file(path: str, description: str) -> None:
 
 
 def _heightfield_contract(terrain: GrailTerrain) -> tuple[tuple[float, ...], dict]:
-    footprint = terrain.footprint()
-    xmin, xmax = footprint["x"]
-    zmin, zmax = footprint["z"]
+    xmin, xmax, zmin, zmax = terrain.xz_bounds()
     bounds = (
         float(xmin) - HEIGHTFIELD_BORDER,
         float(xmax) + HEIGHTFIELD_BORDER,
@@ -95,7 +93,7 @@ def _heightfield_contract(terrain: GrailTerrain) -> tuple[tuple[float, ...], dic
         float(zmax) + HEIGHTFIELD_BORDER,
     )
     if not np.all(np.isfinite(bounds)):
-        raise ValueError("runtime terrain footprint must be finite")
+        raise ValueError("runtime terrain XZ bounds must be finite")
     nx = int(np.ceil((bounds[1] - bounds[0]) / HEIGHTFIELD_CELL_SIZE)) + 1
     nz = int(np.ceil((bounds[3] - bounds[2]) / HEIGHTFIELD_CELL_SIZE)) + 1
     metadata = {

@@ -110,6 +110,24 @@ class BuildCliTests(unittest.TestCase):
                     PYTHON, "resources/validate_g1_terrain_database.py", output,
                 ], text=True, capture_output=True)
                 corruption_results.append((name, message, result))
+            shifted_manifest = json.loads(json.dumps(manifest))
+            shifted_payload = bytearray(terrain_payload)
+            shifted_origin_x = terrain_header[4] + 4.0
+            shifted_manifest["terrain"]["heightfield"][
+                "origin_x"] = shifted_origin_x
+            struct.pack_into("<f", shifted_payload, 16, shifted_origin_x)
+            with open(manifest_path, "w", encoding="utf-8") as stream:
+                json.dump(shifted_manifest, stream)
+            with open(terrain_path, "wb") as stream:
+                stream.write(shifted_payload)
+            result = subprocess.run([
+                PYTHON, "resources/validate_g1_terrain_database.py", output,
+            ], text=True, capture_output=True)
+            corruption_results.append((
+                "heightfield_obj_coverage",
+                "terrain.bin domain does not cover terrain.obj XZ bounds",
+                result,
+            ))
             with open(manifest_path, "w", encoding="utf-8") as stream:
                 json.dump(manifest, stream)
             with open(terrain_path, "wb") as stream:
