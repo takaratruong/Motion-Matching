@@ -13,55 +13,208 @@ from .schema import ArtifactSet
 MAGIC = b"G1TF"
 VERSION = 1
 DIMS = 4
+SUPPORT_MAGIC = b"G1SP"
+SUPPORT_DIMS = 3
+SUPPORT_COLUMNS = (
+    "source_root_height_m",
+    "source_left_toe_height_m",
+    "source_right_toe_height_m",
+)
+WALKABILITY_MAGIC = b"G1WM"
 _HEADER = struct.Struct("<4sIII")
 _UINT32_MAX = (1 << 32) - 1
+_FLOAT32_BYTES = np.dtype("<f4").itemsize
+
+
+def _float_matrix_bytes(
+    values: np.ndarray, *, magic: bytes, dims: int, label: str
+) -> bytes:
+    error_message = (
+        f"{label} must be a finite real floating matrix shaped (N, {dims}) "
+        "with float32 or float64 dtype"
+    )
+    try:
+        source = np.asarray(values)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(error_message) from error
+    if (
+        source.ndim != 2
+        or source.shape[0] < 1
+        or source.shape[1] != dims
+        or source.shape[0] > _UINT32_MAX
+    ):
+        raise ValueError(error_message)
+    if source.dtype.kind != "f" or source.dtype.itemsize not in (4, 8):
+        raise ValueError(error_message)
+    if not np.isfinite(source).all():
+        raise ValueError(error_message)
+    try:
+        with np.errstate(over="ignore", invalid="ignore"):
+            encoded = np.ascontiguousarray(source, dtype="<f4")
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(error_message) from error
+    if not np.isfinite(encoded).all():
+        raise ValueError(
+            f"{label} must remain finite when encoded as float32"
+        )
+    return _HEADER.pack(magic, VERSION, len(encoded), dims) + encoded.tobytes(
+        order="C"
+    )
+
+
+def _read_float_matrix(
+    path: os.PathLike | str, *, magic: bytes, dims: int, label: str
+) -> np.ndarray:
+    with open(path, "rb") as stream:
+        header = stream.read(_HEADER.size)
+        if len(header) < _HEADER.size:
+            raise ValueError(f"{path}: truncated {label} header")
+        actual_magic, version, frames, actual_dims = _HEADER.unpack(header)
+        if (
+            actual_magic != magic
+            or version != VERSION
+            or actual_dims != dims
+        ):
+            raise ValueError(f"{path}: unsupported {label} schema")
+        if frames < 1:
+            raise ValueError(f"{path}: invalid {label} frame count")
+
+        payload_size = frames * dims * _FLOAT32_BYTES
+        if payload_size > np.iinfo(np.intp).max:
+            raise ValueError(
+                f"{path}: {label} payload exceeds platform index limit"
+            )
+        expected_size = _HEADER.size + payload_size
+        actual_size = os.fstat(stream.fileno()).st_size
+        if actual_size < expected_size:
+            raise ValueError(f"{path}: truncated {label} payload")
+        if actual_size > expected_size:
+            raise ValueError(f"{path}: trailing {label} bytes")
+        payload = stream.read(payload_size)
+        if len(payload) != payload_size:
+            raise ValueError(f"{path}: truncated {label} payload")
+
+    matrix = np.frombuffer(payload, dtype="<f4").reshape(frames, dims).copy()
+    if not np.isfinite(matrix).all():
+        raise ValueError(f"{path}: {label} values must be finite")
+    return matrix
+
+
+def terrain_sidecar_bytes(features: np.ndarray) -> bytes:
+    return _float_matrix_bytes(
+        features, magic=MAGIC, dims=DIMS, label="terrain sidecar"
+    )
 
 
 def write_terrain_sidecar(
     path: os.PathLike | str, features: np.ndarray
 ) -> None:
-    try:
-        values = np.ascontiguousarray(features, dtype="<f4")
-    except (TypeError, ValueError) as error:
-        raise ValueError(
-            "terrain features must be finite (N, 4) float values"
-        ) from error
-    if (
-        values.ndim != 2
-        or len(values) < 1
-        or values.shape[1] != DIMS
-        or len(values) > _UINT32_MAX
-        or not np.isfinite(values).all()
-    ):
-        raise ValueError(
-            f"terrain features must be finite (N, 4), got {values.shape}"
-        )
+    payload = terrain_sidecar_bytes(features)
     with open(path, "wb") as stream:
-        stream.write(_HEADER.pack(MAGIC, VERSION, len(values), DIMS))
-        stream.write(values.tobytes())
+        stream.write(payload)
 
 
 def read_terrain_sidecar(path: os.PathLike | str) -> np.ndarray:
+    return _read_float_matrix(
+        path, magic=MAGIC, dims=DIMS, label="terrain sidecar"
+    )
+
+
+def support_sidecar_bytes(support: np.ndarray) -> bytes:
+    return _float_matrix_bytes(
+        support,
+        magic=SUPPORT_MAGIC,
+        dims=SUPPORT_DIMS,
+        label="support sidecar",
+    )
+
+
+def write_support_sidecar(
+    path: os.PathLike | str, support: np.ndarray
+) -> None:
+    payload = support_sidecar_bytes(support)
+    with open(path, "wb") as stream:
+        stream.write(payload)
+
+
+def read_support_sidecar(path: os.PathLike | str) -> np.ndarray:
+    return _read_float_matrix(
+        path,
+        magic=SUPPORT_MAGIC,
+        dims=SUPPORT_DIMS,
+        label="support sidecar",
+    )
+
+
+def walkability_bytes(walkability: np.ndarray) -> bytes:
+    error_message = (
+        "walkability must be a 2-D integer grid containing classes 0, 1, or 2"
+    )
+    try:
+        source = np.asarray(walkability)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(error_message) from error
+    if source.ndim != 2:
+        raise ValueError(error_message)
+    nz, nx = source.shape
+    if nx < 2 or nz < 2:
+        raise ValueError("walkability dimensions must be at least 2x2")
+    if nx > _UINT32_MAX or nz > _UINT32_MAX:
+        raise ValueError("walkability dimensions exceed the G1WM v1 limit")
+    payload_size = nx * nz
+    if payload_size > np.iinfo(np.intp).max:
+        raise ValueError("walkability payload exceeds platform index limit")
+    if source.dtype.kind not in "iu":
+        raise ValueError(error_message)
+    if np.any(source < 0) or np.any(source > 2):
+        raise ValueError(error_message)
+    encoded = np.ascontiguousarray(source, dtype=np.uint8)
+    return _HEADER.pack(
+        WALKABILITY_MAGIC, VERSION, nx, nz
+    ) + encoded.tobytes(order="C")
+
+
+def write_walkability(
+    path: os.PathLike | str, walkability: np.ndarray
+) -> None:
+    payload = walkability_bytes(walkability)
+    with open(path, "wb") as stream:
+        stream.write(payload)
+
+
+def read_walkability(path: os.PathLike | str) -> np.ndarray:
+    label = "walkability sidecar"
     with open(path, "rb") as stream:
-        data = stream.read()
-    if len(data) < _HEADER.size:
-        raise ValueError(f"{path}: truncated terrain sidecar header")
-    magic, version, frames, dims = _HEADER.unpack_from(data)
-    if magic != MAGIC or version != VERSION or dims != DIMS:
-        raise ValueError(f"{path}: unsupported terrain sidecar schema")
-    expected = _HEADER.size + frames * dims * np.dtype("<f4").itemsize
-    if len(data) < expected:
-        raise ValueError(f"{path}: truncated terrain sidecar payload")
-    if len(data) > expected:
-        raise ValueError(f"{path}: trailing terrain sidecar bytes")
-    if frames < 1:
-        raise ValueError(f"{path}: invalid terrain sidecar frame count")
-    values = np.frombuffer(
-        data, dtype="<f4", count=frames * dims, offset=_HEADER.size
-    ).reshape(frames, dims).copy()
-    if not np.isfinite(values).all():
-        raise ValueError(f"{path}: terrain sidecar values must be finite")
-    return values
+        header = stream.read(_HEADER.size)
+        if len(header) < _HEADER.size:
+            raise ValueError(f"{path}: truncated {label} header")
+        magic, version, nx, nz = _HEADER.unpack(header)
+        if magic != WALKABILITY_MAGIC or version != VERSION:
+            raise ValueError(f"{path}: unsupported {label} schema")
+        if nx < 2 or nz < 2:
+            raise ValueError(f"{path}: invalid walkability dimensions")
+
+        payload_size = nx * nz
+        if payload_size > np.iinfo(np.intp).max:
+            raise ValueError(
+                f"{path}: walkability payload exceeds platform index limit"
+            )
+        expected_size = _HEADER.size + payload_size
+        actual_size = os.fstat(stream.fileno()).st_size
+        if actual_size < expected_size:
+            raise ValueError(f"{path}: truncated {label} payload")
+        if actual_size > expected_size:
+            raise ValueError(f"{path}: trailing {label} bytes")
+        payload = stream.read(payload_size)
+        if len(payload) != payload_size:
+            raise ValueError(f"{path}: truncated {label} payload")
+
+    grid = np.frombuffer(payload, dtype=np.uint8).reshape(nz, nx).copy()
+    if np.any(grid > 2):
+        raise ValueError(
+            f"{path}: walkability values must contain classes 0, 1, or 2"
+        )
+    return grid
 
 
 def _normalized_manifest(manifest: dict) -> dict:
@@ -104,6 +257,9 @@ def _validate_staged_artifacts(
     loaded.terrain_features = read_terrain_sidecar(
         os.path.join(staging, "terrain_features.bin")
     )
+    loaded.terrain_support = read_support_sidecar(
+        os.path.join(staging, "terrain_support.bin")
+    )
     loaded.validate()
 
     expected_arrays = (
@@ -116,6 +272,7 @@ def _validate_staged_artifacts(
         ("range_stops", "<i4"),
         ("contacts", "u1"),
         ("terrain_features", "<f4"),
+        ("terrain_support", "<f4"),
     )
     for name, dtype in expected_arrays:
         expected = np.ascontiguousarray(getattr(artifacts, name), dtype=dtype)
@@ -162,6 +319,10 @@ def publish_artifacts(
         write_terrain_sidecar(
             os.path.join(staging, "terrain_features.bin"),
             artifacts.terrain_features,
+        )
+        write_support_sidecar(
+            os.path.join(staging, "terrain_support.bin"),
+            artifacts.terrain_support,
         )
         with open(
             os.path.join(staging, "manifest.json"), "w", encoding="utf-8"
