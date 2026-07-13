@@ -3027,6 +3027,7 @@ def test_gate_e_rejects_any_matching_or_support_root_change(self):
     for column, changed in (
         ("query_bits_hex", "00000001" + "00000000" * 30),
         ("query_database_frame", "19"),
+        ("selected_database_frame", "21"),
         ("terrain_point2_y", "0.12500001"),
         ("database_frame", "41"),
         ("range", "3"),
@@ -3158,7 +3159,9 @@ Add `motion_match_ik_diagnostic ik;` as the final `motion_match_log_row` member.
 
 - [ ] **Step 4: Fill the suffix only from immutable observations and post-IK FK**
 
-In `controller.cpp`, immediately before the sibling `deterministic_log.write(log_row)`, fill the final diagnostic. Compute lock drift from the pose actually selected for rendering:
+In `controller.cpp`, immediately before the sibling final
+`deterministic_log.write(...)` call, fill the final diagnostic. Compute lock
+drift from the pose actually selected for rendering:
 
 ```cpp
 static float g1_horizontal_lock_drift(
@@ -3263,7 +3266,8 @@ In `resources/check_g1_runtime_log.py`, add these exact invariance groups:
 IK_MATCHING_INVARIANTS = (
     "frame", "fixed_dt", "scene_id", "mode", "route",
     "query_bits_hex",
-    "query_database_frame", "query_range", "database_frame", "range",
+    "query_database_frame", "query_range", "selected_database_frame",
+    "database_frame", "range",
     "source_range", "searched", "transitioned", "incumbent_cost",
     "selected_cost", "selected_terrain_error", "effective_terrain_weight",
     "terrain0", "terrain1", "terrain2", "terrain3",
@@ -3277,7 +3281,9 @@ IK_MATCHING_INVARIANTS = (
 
 IK_SUPPORT_ROOT_INVARIANTS = (
     "raw_selected_hips_y", "inertialized_hips_y",
-    "rendered_hips_y", "hips_inertial_offset_y", "runtime_root_height",
+    "rendered_hips_y", "hips_inertial_offset_y",
+    "runtime_root_surface_height", "runtime_left_toe_surface_height",
+    "runtime_right_toe_surface_height",
     "adjustment_xz", "adjustment_y", "clamp_xz", "clamp_y",
     "matching_enabled", "adjustment_enabled", "clamping_enabled",
     "support_retargeting_enabled",

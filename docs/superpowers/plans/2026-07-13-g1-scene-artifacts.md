@@ -37,6 +37,8 @@
 - `motion_match_log.h`: Runtime Task 6-compatible deterministic CSV writer and the immutable Gate A row schema.
 - `resources/check_g1_runtime_log.py`: CSV parsing, transition/sequential invariants, first-positive-query diagnosis, and raw-versus-blended penetration classification.
 - `tests/python/test_runtime_log.py`: synthetic logger/checker contract tests.
+- `tests/cpp/test_motion_match_log.cpp`: strict standalone writer and
+  open/write/close fault-injection regression.
 - `controller.cpp`: deterministic `MM_TEST_MODE`, `MM_TEST_FRAMES`, `MM_LOG`, and pre-behavior-change stage snapshots only.
 - `resources/g1_terrain_builder/schema.py`: `HoldenClip` and `ArtifactSet` gain aligned `(frames, 3)` source-support rows.
 - `resources/g1_terrain_builder/terrain.py`: exact transformed source triangles, vertical top intersection, G1HF/v2 grids, fixed-diagonal queries/normals, and grid-derived OBJ export.
@@ -97,15 +99,37 @@ field and signature input; runtime work must consume those names verbatim.
 - Create: `motion_match_log.h`
 - Create: `resources/check_g1_runtime_log.py`
 - Create: `tests/python/test_runtime_log.py`
+- Create: `tests/cpp/test_motion_match_log.cpp`
 - Modify: `controller.cpp:1-140,1578-1660,1940-1980,1990-2520,3038-3063`
 
 **Interfaces:**
 - Preserves Runtime Task 6 environment names: `MM_LOG`, `MM_TEST_MODE`, `MM_TEST_FRAMES`, and `MM_TERRAIN_WEIGHT`.
 - `MM_TEST_MODE` accepts exactly `sequential`, `flat`, or `terrain`; `terrain` uses weight 4 unless `MM_TERRAIN_WEIGHT` is present.
 - Produces: `motion_match_log::open(const char*, char*, int) -> bool`.
-- Produces: `motion_match_log::write(const motion_match_log_row&) -> void`.
-- Produces: `check_rows(rows) -> dict`, `compare_control(treatment, control) -> tuple[float,float]`, and `diagnose_gate_a(rows) -> dict`.
+- Produces: `motion_match_log::write(const motion_match_log_row&, char*, int) -> bool`.
+- Produces: `motion_match_log::close(char*, int) -> bool`.
+- Produces: `check_rows(rows) -> dict`,
+  `compare_control(treatment, control) -> tuple[float,float]`,
+  `check_gate_a_contract(rows, expected_frames=375) -> dict`, and
+  `diagnose_gate_a(rows) -> dict`.
 - The CSV keeps every Runtime Task 6 column and adds immutable query points, stage heights/clearances, and adjustment/clamp displacement. Later runtime plans append columns; they do not rename these.
+- Row timing is immutable: `query_database_frame/query_range` identify the
+  pre-search incumbent; `selected_database_frame/source_range` identify the
+  search decision whose selected cost/error are logged; and
+  `database_frame/range` identify the range-safe post-advance pose used by the
+  raw, inertialized, and rendered diagnostics.
+- Bounded test modes and deterministic CSV logging are desktop-only. A
+  `PLATFORM_WEB` build rejects every positive frame limit, every non-live test
+  mode, and (outside the legacy `MM_DISCRETE` stream) `MM_LOG`, because the
+  Emscripten main loop cannot reach this task's synchronous close/cleanup path.
+- Costs and raw terrain error are non-negative sums of squares. Search
+  materializes normalized float32 query values independently from the logged
+  incumbent calculation, so a searched near-tie may differ by at most four
+  float32 ULPs; unsearched selected/incumbent costs remain exactly equal.
+- Treatment and weight-zero control runs keep identical scripted metadata but
+  may follow different root trajectories. Each run therefore computes its own
+  active-terrain aggregate using `max(abs(terrain0..3)) > 0.05`; both active
+  sets must be non-empty, rather than reusing treatment row indices in control.
 
 - [ ] **Step 1: Write failing checker tests for invariants and penetration classification**
 
@@ -113,10 +137,12 @@ Create `tests/python/test_runtime_log.py`:
 
 ~~~python
 import tempfile
+import struct
 import unittest
 
 from resources.check_g1_runtime_log import (
     CSV_COLUMNS,
+    check_gate_a_contract,
     check_rows,
     compare_control,
     diagnose_gate_a,
@@ -134,6 +160,7 @@ def row(frame, database_frame, **changes):
         "query_bits_hex": "00000000" * 31,
         "query_database_frame": str(database_frame),
         "query_range": "0",
+        "selected_database_frame": str(database_frame),
         "database_frame": str(database_frame),
         "range": "0",
         "source_range": "0",
@@ -152,9 +179,9 @@ def row(frame, database_frame, **changes):
         "inertialized_hips_y": "0.8",
         "rendered_hips_y": "0.8",
         "hips_inertial_offset_y": "0.0",
-        "runtime_root_height": "0.0",
-        "runtime_left_toe_height": "0.0",
-        "runtime_right_toe_height": "0.0",
+        "runtime_root_surface_height": "0.0",
+        "runtime_left_toe_surface_height": "0.0",
+        "runtime_right_toe_surface_height": "0.0",
         "adjustment_xz": "0.0", "adjustment_y": "0.0",
         "clamp_xz": "0.0", "clamp_y": "0.0",
         "matching_enabled": "1", "adjustment_enabled": "1",
@@ -168,19 +195,29 @@ def row(frame, database_frame, **changes):
         for joint in ("hips", "left_toe", "right_toe"):
             values[f"{stage}_{joint}_clearance"] = "0.03"
     values.update({key: str(value) for key, value in changes.items()})
+    if "query_bits_hex" not in changes:
+        values["query_bits_hex"] = "00000000" * 27 + "".join(
+            struct.pack(">f", float(values[f"terrain{sample}"])).hex()
+            for sample in range(4))
     return values
 
 
 class RuntimeLogTests(unittest.TestCase):
     def test_rejects_nonsequential_advance_without_transition(self):
-        rows = [row(0, 10), row(1, 4)]
+        rows = [
+            row(0, 10),
+            row(
+                1, 10, query_database_frame=10,
+                selected_database_frame=10),
+        ]
         with self.assertRaisesRegex(ValueError, "nonsequential"):
             check_rows(rows)
 
     def test_rejects_transition_that_does_not_beat_incumbent(self):
         rows = [row(
-            0, 20, transitioned=1, searched=1,
-            incumbent_cost=1.0, selected_cost=1.0,
+            0, 20, query_database_frame=10, selected_database_frame=20,
+            transitioned=1, searched=1,
+            incumbent_cost=1.0, selected_cost=1.5,
         )]
         with self.assertRaisesRegex(ValueError, "beat incumbent"):
             check_rows(rows)
@@ -189,11 +226,23 @@ class RuntimeLogTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "31 float bit patterns"):
             check_rows([row(0, 10, query_bits_hex="0" * 247)])
 
+    def test_rejects_nonfinite_or_terrain_inconsistent_query_bits(self):
+        with self.assertRaisesRegex(ValueError, "non-finite query"):
+            check_rows([row(
+                0, 10,
+                query_bits_hex="00000000" * 27 + "7fc00000" +
+                "00000000" * 3)])
+        with self.assertRaisesRegex(ValueError, "terrain query bits"):
+            check_rows([row(
+                0, 10, terrain0=0.25,
+                query_bits_hex="00000000" * 31)])
+
     def test_gate_a_classifies_only_blended_pose_penetration(self):
         rows = [
             row(0, 10),
             row(
-                1, 11, terrain0=0.12,
+                1, 11, query_database_frame=10,
+                selected_database_frame=10, terrain0=0.12,
                 raw_selected_min_clearance=0.02,
                 inertialized_min_clearance=-0.01,
                 rendered_min_clearance=-0.02,
@@ -216,6 +265,41 @@ class RuntimeLogTests(unittest.TestCase):
         self.assertEqual(
             diagnose_gate_a(rows)["penetration_class"], "raw-selected")
 
+    def test_gate_a_uses_earliest_penetration_with_raw_same_frame_priority(self):
+        rows = [
+            row(0, 10, terrain0=.1, rendered_min_clearance=-.001),
+            row(
+                1, 11, query_database_frame=10,
+                selected_database_frame=10,
+                raw_selected_min_clearance=-.002),
+        ]
+        report = diagnose_gate_a(rows)
+        self.assertEqual(report["first_penetration_frame"], 0)
+        self.assertEqual(report["penetration_class"], "blended-rendered")
+        rows[0]["raw_selected_min_clearance"] = "-.003"
+        self.assertEqual(
+            diagnose_gate_a(rows)["penetration_class"], "raw-selected")
+
+    def test_gate_a_enforces_the_exact_run_contract(self):
+        valid = row(0, 10, terrain0=.1)
+        self.assertEqual(check_gate_a_contract(
+            [valid], expected_frames=1)["frames"], 1)
+        for name, bad in (
+            ("scene_id", "other"), ("mode", "live"),
+            ("route", "manual"), ("effective_terrain_weight", "0"),
+            ("matching_enabled", "0"), ("adjustment_enabled", "0"),
+            ("clamping_enabled", "0"),
+            ("support_retargeting_enabled", "1"), ("ik_enabled", "1"),
+            ("fixed_dt", "0.041"),
+        ):
+            changed = dict(valid)
+            changed[name] = bad
+            with self.subTest(name=name), self.assertRaisesRegex(
+                    ValueError, "Gate A"):
+                check_gate_a_contract([changed], expected_frames=1)
+        with self.assertRaisesRegex(ValueError, "exactly 2"):
+            check_gate_a_contract([valid], expected_frames=2)
+
     def test_terrain_treatment_must_improve_raw_terrain_error(self):
         treatment = [row(0, 10, terrain0=0.1, selected_terrain_error=0.5)]
         control = [row(
@@ -223,6 +307,71 @@ class RuntimeLogTests(unittest.TestCase):
             selected_terrain_error=2.0,
         )]
         self.assertEqual(compare_control(treatment, control), (0.5, 2.0))
+
+    def test_control_uses_its_own_active_terrain_rows(self):
+        treatment = [
+            row(0, 10, terrain0=-.1, selected_terrain_error=.5),
+            row(1, 11, query_database_frame=10,
+                selected_database_frame=10, selected_terrain_error=9),
+        ]
+        control = [
+            row(0, 10, effective_terrain_weight=0,
+                selected_terrain_error=.25),
+            row(1, 11, query_database_frame=10,
+                selected_database_frame=10, terrain1=.1,
+                effective_terrain_weight=0, selected_terrain_error=2),
+        ]
+        self.assertEqual(compare_control(treatment, control), (.5, 2))
+
+    def test_control_comparison_rejects_wrong_weight_or_script(self):
+        treatment = [row(0, 10, terrain0=.1, selected_terrain_error=.5)]
+        control = [row(
+            0, 10, terrain0=.1, effective_terrain_weight=0,
+            selected_terrain_error=2.0)]
+        control[0]["route"] = "unrelated"
+        with self.assertRaisesRegex(ValueError, "scripted input"):
+            compare_control(treatment, control)
+        control[0]["route"] = treatment[0]["route"]
+        control[0]["effective_terrain_weight"] = "1"
+        with self.assertRaisesRegex(ValueError, "weight"):
+            compare_control(treatment, control)
+
+    def test_range_change_requires_transition(self):
+        rows = [
+            row(0, 10, range=0, source_range=0, query_range=0),
+            row(
+                1, 11, query_database_frame=10,
+                selected_database_frame=10,
+                range=1, source_range=1, query_range=0),
+        ]
+        with self.assertRaisesRegex(ValueError, "range change"):
+            check_rows(rows)
+
+    def test_query_frame_must_continue_the_prior_rendered_pose(self):
+        rows = [
+            row(0, 10, query_database_frame=9, selected_database_frame=9),
+            row(1, 8, query_database_frame=7, selected_database_frame=7),
+        ]
+        with self.assertRaisesRegex(ValueError, "query frame"):
+            check_rows(rows)
+
+    def test_detects_eight_frame_snapback_even_at_transitions(self):
+        rows = []
+        for frame in range(24):
+            current = 10 + frame % 8
+            restarting = frame > 0 and frame % 8 == 0
+            query_frame = 17 if restarting else current - 1
+            selected_frame = 9 if restarting else query_frame
+            rows.append(row(
+                frame, current,
+                query_database_frame=query_frame,
+                selected_database_frame=selected_frame,
+                searched=int(restarting), transitioned=int(restarting),
+                incumbent_cost=2.0 if restarting else 1.0,
+                selected_cost=1.0,
+            ))
+        with self.assertRaisesRegex(ValueError, "sub-stride period 8"):
+            check_rows(rows)
 
     def test_read_rows_rejects_duplicate_csv_columns(self):
         with tempfile.NamedTemporaryFile("w+", suffix=".csv") as stream:
@@ -245,6 +394,15 @@ if __name__ == "__main__":
     unittest.main()
 ~~~
 
+Also cover both searched and unsearched no-transition rows, accepted four-ULP
+searched near-ties and rejected five-ULP drift, transitioned near-ties, negative
+cost/error fields, non-positive `fixed_dt`, invalid negative database/range
+indices, terrain weights outside `[0,10]`, negative XZ displacement magnitudes,
+rows wider than their CSV header, and the requirement that both treatment and
+control have an independently active terrain set. Every integer field must fit
+the writer's signed C++ `int`, and every non-integer numeric field must be
+finite and representable as the writer's float32 type.
+
 - [ ] **Step 2: Run the tests and verify the missing checker failure**
 
 Run:
@@ -265,13 +423,15 @@ Create `resources/check_g1_runtime_log.py`:
 import argparse
 import csv
 import math
+import struct
 
 
 CSV_COLUMNS = (
     "frame", "fixed_dt", "scene_id", "mode", "route",
     "query_bits_hex",
-    "query_database_frame", "query_range", "database_frame", "range",
-    "source_range", "searched", "transitioned", "incumbent_cost",
+    "query_database_frame", "query_range", "selected_database_frame",
+    "database_frame", "range", "source_range", "searched", "transitioned",
+    "incumbent_cost",
     "selected_cost", "selected_terrain_error", "effective_terrain_weight",
     "terrain0", "terrain1", "terrain2", "terrain3",
     "terrain_point0_x", "terrain_point0_y", "terrain_point0_z",
@@ -279,8 +439,8 @@ CSV_COLUMNS = (
     "terrain_point2_x", "terrain_point2_y", "terrain_point2_z",
     "terrain_point3_x", "terrain_point3_y", "terrain_point3_z",
     "raw_selected_hips_y", "inertialized_hips_y", "rendered_hips_y",
-    "hips_inertial_offset_y", "runtime_root_height",
-    "runtime_left_toe_height", "runtime_right_toe_height",
+    "hips_inertial_offset_y", "runtime_root_surface_height",
+    "runtime_left_toe_surface_height", "runtime_right_toe_surface_height",
     "raw_selected_hips_clearance", "raw_selected_left_toe_clearance",
     "raw_selected_right_toe_clearance", "raw_selected_min_clearance",
     "inertialized_hips_clearance", "inertialized_left_toe_clearance",
@@ -294,8 +454,8 @@ CSV_COLUMNS = (
 REQUIRED_COLUMNS = set(CSV_COLUMNS)
 TEXT_COLUMNS = {"scene_id", "mode", "route", "query_bits_hex"}
 INTEGER_COLUMNS = {
-    "frame", "query_database_frame", "query_range", "database_frame",
-    "range", "source_range", "searched", "transitioned",
+    "frame", "query_database_frame", "query_range", "selected_database_frame",
+    "database_frame", "range", "source_range", "searched", "transitioned",
     "matching_enabled", "adjustment_enabled", "clamping_enabled",
     "support_retargeting_enabled", "ik_enabled",
 }
@@ -316,7 +476,12 @@ def read_rows(path):
         missing = sorted(REQUIRED_COLUMNS - set(fields))
         if missing:
             raise ValueError(f"missing CSV columns: {missing}")
-        return list(reader)
+        rows = []
+        for index, row in enumerate(reader):
+            if None in row:
+                raise ValueError(f"row {index}: CSV data is wider than header")
+            rows.append(row)
+        return rows
 
 
 def _finite(row, name, index):
@@ -333,18 +498,56 @@ def _integer(row, name, index):
     value = _finite(row, name, index)
     if value != int(value):
         raise ValueError(f"row {index}: non-integer {name}")
-    return int(value)
+    integer = int(value)
+    if integer < -(2 ** 31) or integer > 2 ** 31 - 1:
+        raise ValueError(f"row {index}: {name} is outside signed int32")
+    return integer
+
+
+def _float32_bits(value, index, label):
+    try:
+        return int.from_bytes(struct.pack(">f", value), "big")
+    except (OverflowError, struct.error) as error:
+        raise ValueError(f"row {index}: {label} is not float32") from error
+
+
+def _float32(row, name, index):
+    value = _finite(row, name, index)
+    _float32_bits(value, index, name)
+    return value
+
+
+def _float32_ulp_distance(left, right, index):
+    left_bits = _float32_bits(left, index, "cost")
+    right_bits = _float32_bits(right, index, "cost")
+    return abs(left_bits - right_bits)
+
+
+def _check_query_snapshot(row, index):
+    snapshot = row["query_bits_hex"]
+    values = []
+    for dimension in range(31):
+        bits = snapshot[dimension * 8:(dimension + 1) * 8]
+        value = struct.unpack(">f", bytes.fromhex(bits))[0]
+        if not math.isfinite(value):
+            raise ValueError(
+                f"row {index}: non-finite query dimension {dimension}")
+        values.append(value)
+    for sample in range(4):
+        terrain = _float32(row, f"terrain{sample}", index)
+        terrain_bits = struct.pack(">f", terrain).hex()
+        query_bits = snapshot[(27 + sample) * 8:(28 + sample) * 8]
+        if query_bits != terrain_bits:
+            raise ValueError(
+                f"row {index}: terrain query bits disagree at sample {sample}")
+    return values
 
 
 def check_substride(rows, minimum_period=13):
     values = [_integer(row, "database_frame", i) for i, row in enumerate(rows)]
-    transitions = [
-        _integer(row, "transitioned", i) for i, row in enumerate(rows)]
     for period in range(1, minimum_period):
         width = 3 * period
         for start in range(0, len(values) - width + 1):
-            if any(transitions[start + 1:start + width]):
-                continue
             a = values[start:start + period]
             if a == values[start + period:start + 2 * period] == \
                     values[start + 2 * period:start + 3 * period]:
@@ -356,22 +559,96 @@ def check_rows(rows):
     if not rows:
         raise ValueError("runtime log is empty")
     previous = None
+    previous_range = None
     for index, row in enumerate(rows):
         frame = _integer(row, "frame", index)
+        query_frame = _integer(row, "query_database_frame", index)
+        query_range = _integer(row, "query_range", index)
+        selected_frame = _integer(row, "selected_database_frame", index)
         current = _integer(row, "database_frame", index)
+        current_range = _integer(row, "range", index)
+        source_range = _integer(row, "source_range", index)
         transitioned = _integer(row, "transitioned", index)
         searched = _integer(row, "searched", index)
+        for name, value in (
+                ("query_database_frame", query_frame),
+                ("selected_database_frame", selected_frame),
+                ("database_frame", current),
+                ("query_range", query_range),
+                ("range", current_range),
+                ("source_range", source_range)):
+            if value < 0:
+                raise ValueError(f"row {index}: {name} must be nonnegative")
+        fixed_dt = _float32(row, "fixed_dt", index)
+        if fixed_dt <= 0.0:
+            raise ValueError(f"row {index}: fixed_dt must be positive")
+        terrain_weight = _float32(
+            row, "effective_terrain_weight", index)
+        if not 0.0 <= terrain_weight <= 10.0:
+            raise ValueError(
+                f"row {index}: effective_terrain_weight must be in [0, 10]")
+        for name in ("adjustment_xz", "clamp_xz"):
+            if _float32(row, name, index) < 0.0:
+                raise ValueError(f"row {index}: {name} must be nonnegative")
         if frame != index:
             raise ValueError(f"row {index}: frame sequence is {frame}")
         if transitioned not in (0, 1) or searched not in (0, 1):
             raise ValueError(f"row {index}: flags must be 0 or 1")
+        if previous is not None and query_frame != previous:
+            raise ValueError(
+                f"row {index}: query frame {query_frame} does not match "
+                f"prior pose frame {previous}")
+        if previous_range is not None and query_range != previous_range:
+            raise ValueError(
+                f"row {index}: query range {query_range} does not match "
+                f"prior pose range {previous_range}")
         if transitioned and not searched:
             raise ValueError(f"row {index}: transition without search")
+        if transitioned and selected_frame == query_frame:
+            raise ValueError(
+                f"row {index}: transitioned with unchanged selected frame")
+        if not transitioned and selected_frame != query_frame:
+            raise ValueError(
+                f"row {index}: selected frame changed without transition")
+        if current not in (selected_frame, selected_frame + 1):
+            raise ValueError(
+                f"row {index}: post-advance frame is inconsistent with selected frame")
+        if current_range != source_range:
+            raise ValueError(
+                f"row {index}: pose range differs from selected source range")
+        if not transitioned and query_range != source_range:
+            raise ValueError(
+                f"row {index}: source range changed without transition")
         incumbent = _finite(row, "incumbent_cost", index)
         selected = _finite(row, "selected_cost", index)
+        selected_terrain_error = _finite(
+            row, "selected_terrain_error", index)
+        for value in (incumbent, selected, selected_terrain_error):
+            _float32_bits(value, index, "cost")
+        for name, value in (
+                ("incumbent_cost", incumbent),
+                ("selected_cost", selected),
+                ("selected_terrain_error", selected_terrain_error)):
+            if value < 0.0:
+                raise ValueError(f"row {index}: negative {name}")
+        # Search and incumbent costs are independently normalized and
+        # materialized as float32, so near-ties can round a few ULPs apart.
         if transitioned and not selected < incumbent:
+            cost_ulps = _float32_ulp_distance(selected, incumbent, index)
+            if cost_ulps > 4:
+                raise ValueError(
+                    f"row {index}: transition did not beat incumbent cost "
+                    f"and differs by {cost_ulps} float32 ULPs")
+        if not transitioned and not searched and selected != incumbent:
             raise ValueError(
-                f"row {index}: transition did not beat incumbent cost")
+                f"row {index}: unsearched no-transition selected cost "
+                "differs from incumbent cost")
+        if not transitioned and searched:
+            cost_ulps = _float32_ulp_distance(selected, incumbent, index)
+            if cost_ulps > 4:
+                raise ValueError(
+                    f"row {index}: searched no-transition selected cost "
+                    f"differs by {cost_ulps} float32 ULPs")
         for name in CSV_COLUMNS:
             if name in TEXT_COLUMNS:
                 if not row.get(name):
@@ -385,14 +662,20 @@ def check_rows(rows):
             elif name in INTEGER_COLUMNS:
                 _integer(row, name, index)
             else:
-                _finite(row, name, index)
+                _float32(row, name, index)
         for name in FLAG_COLUMNS:
             if _integer(row, name, index) not in (0, 1):
                 raise ValueError(f"row {index}: {name} must be 0 or 1")
+        _check_query_snapshot(row, index)
         if previous is not None and not transitioned and current != previous + 1:
             raise ValueError(
                 f"row {index}: nonsequential advance {previous}->{current}")
+        if (previous_range is not None and not transitioned and
+                current_range != previous_range):
+            raise ValueError(
+                f"row {index}: range change without transition")
         previous = current
+        previous_range = current_range
     check_substride(rows)
     return {
         "frames": len(rows),
@@ -401,25 +684,76 @@ def check_rows(rows):
 
 
 def compare_control(treatment, control):
+    check_rows(treatment)
+    check_rows(control)
     if len(treatment) != len(control):
         raise ValueError("control and treatment lengths differ")
-    active = [
-        index for index, row in enumerate(treatment)
-        if max(float(row[f"terrain{sample}"]) for sample in range(4)) > 0.05
-    ]
-    if not active:
-        raise ValueError("terrain query never became active")
-    treatment_error = sum(
-        float(treatment[index]["selected_terrain_error"])
-        for index in active) / len(active)
-    control_error = sum(
-        float(control[index]["selected_terrain_error"])
-        for index in active) / len(active)
+    metadata = ("frame", "fixed_dt", "scene_id", "mode", "route")
+    for index, (treatment_row, control_row) in enumerate(
+            zip(treatment, control)):
+        if any(treatment_row[name] != control_row[name] for name in metadata):
+            raise ValueError(
+                f"row {index}: control and treatment script metadata differ")
+        if _finite(treatment_row, "effective_terrain_weight", index) != 4.0:
+            raise ValueError(f"row {index}: treatment weight must be 4")
+        if _finite(control_row, "effective_terrain_weight", index) != 0.0:
+            raise ValueError(f"row {index}: control weight must be 0")
+
+    def active_errors(rows, label):
+        errors = [
+            _finite(row, "selected_terrain_error", index)
+            for index, row in enumerate(rows)
+            if max(abs(_finite(row, f"terrain{sample}", index))
+                   for sample in range(4)) > 0.05
+        ]
+        if not errors:
+            raise ValueError(f"{label} terrain query never became active")
+        return errors
+
+    treatment_errors = active_errors(treatment, "treatment")
+    control_errors = active_errors(control, "control")
+    treatment_error = sum(treatment_errors) / len(treatment_errors)
+    control_error = sum(control_errors) / len(control_errors)
     if not treatment_error < control_error:
         raise ValueError(
             "terrain treatment did not improve error: "
             f"{treatment_error} >= {control_error}")
     return treatment_error, control_error
+
+
+def check_gate_a_contract(rows, expected_frames=375):
+    summary = check_rows(rows)
+    if len(rows) != expected_frames:
+        raise ValueError(
+            f"Gate A requires exactly {expected_frames} rows, got {len(rows)}")
+    expected_dt = struct.pack(">f", 0.04)
+    expected_text = {
+        "scene_id": "grail-curb-default",
+        "mode": "terrain",
+        "route": "curb-forward",
+    }
+    expected_flags = {
+        "matching_enabled": (1, "matching"),
+        "adjustment_enabled": (1, "adjustment"),
+        "clamping_enabled": (1, "clamping"),
+        "support_retargeting_enabled": (0, "support retargeting"),
+        "ik_enabled": (0, "IK"),
+    }
+    for index, row in enumerate(rows):
+        fixed_dt = _finite(row, "fixed_dt", index)
+        if struct.pack(">f", fixed_dt) != expected_dt:
+            raise ValueError(f"row {index}: Gate A fixed_dt must be float32 0.04")
+        for name, expected in expected_text.items():
+            if row[name] != expected:
+                raise ValueError(
+                    f"row {index}: Gate A {name.replace('_id', '')} must be {expected}")
+        if _finite(row, "effective_terrain_weight", index) != 4.0:
+            raise ValueError(f"row {index}: Gate A weight must be 4")
+        for name, (expected, label) in expected_flags.items():
+            if _integer(row, name, index) != expected:
+                raise ValueError(
+                    f"row {index}: Gate A {label} must be {expected}")
+    return summary
 
 
 def diagnose_gate_a(rows):
@@ -430,24 +764,17 @@ def diagnose_gate_a(rows):
     ), None)
     if positive is None:
         raise ValueError("terrain query never became positive")
-    raw = next((
-        index for index, row in enumerate(rows)
-        if float(row["raw_selected_min_clearance"]) < 0.0
-    ), None)
-    blended = next((
-        index for index, row in enumerate(rows)
-        if float(row["inertialized_min_clearance"]) < 0.0
-        or float(row["rendered_min_clearance"]) < 0.0
-    ), None)
-    if raw is not None:
-        classification = "raw-selected"
-        first_penetration = raw
-    elif blended is not None:
-        classification = "blended-rendered"
-        first_penetration = blended
-    else:
-        classification = "no-penetration"
-        first_penetration = None
+    first_penetration = None
+    classification = "no-penetration"
+    for index, row in enumerate(rows):
+        raw = float(row["raw_selected_min_clearance"]) < 0.0
+        blended = (
+            float(row["inertialized_min_clearance"]) < 0.0
+            or float(row["rendered_min_clearance"]) < 0.0)
+        if raw or blended:
+            first_penetration = index
+            classification = "raw-selected" if raw else "blended-rendered"
+            break
     diagnostic = rows[first_penetration if first_penetration is not None else positive]
     return {
         "first_positive_query_frame": int(rows[positive]["frame"]),
@@ -479,6 +806,7 @@ def main(argv=None):
             "VALID terrain-comparison "
             f"treatment={treatment:.9g} control={control:.9g}")
     if args.gate_a:
+        check_gate_a_contract(rows)
         report = diagnose_gate_a(rows)
         print(
             "VALID gate-a "
@@ -508,7 +836,7 @@ Run:
   tests.python.test_runtime_log -v
 ~~~
 
-Expected: `Ran 8 tests` and `OK`.
+Expected: all logger/checker contract tests pass and report `OK`.
 
 - [ ] **Step 5: Add the exact CSV row and writer contract**
 
@@ -517,6 +845,7 @@ Create `motion_match_log.h`:
 ~~~cpp
 #pragma once
 
+#include <stdlib.h>
 #include "array.h"
 #include "vec.h"
 #include <errno.h>
@@ -524,10 +853,24 @@ Create `motion_match_log.h`:
 #include <stdint.h>
 #include <string.h>
 
+static inline bool motion_match_query_is_finite_31d(
+    const slice1d<float> query)
+{
+    if (query.size != 31) return false;
+    for (int i = 0; i < 31; ++i) {
+        uint32_t bits = 0;
+        memcpy(&bits, &query(i), sizeof(bits));
+        if ((bits & UINT32_C(0x7f800000)) == UINT32_C(0x7f800000))
+            return false;
+    }
+    return true;
+}
+
 static inline bool motion_match_query_bits_hex(
     char* output, int capacity, const slice1d<float> query)
 {
-    if (output == NULL || capacity < 31 * 8 + 1 || query.size != 31)
+    if (output == NULL || capacity < 31 * 8 + 1 ||
+        !motion_match_query_is_finite_31d(query))
         return false;
     for (int i = 0; i < 31; ++i) {
         uint32_t bits = 0;
@@ -544,6 +887,7 @@ struct motion_match_pose_diagnostic
     float hips_clearance = 0.0f;
     float left_toe_clearance = 0.0f;
     float right_toe_clearance = 0.0f;
+    // Minimum over Hips plus both knees, ankles, and toes (seven probes).
     float minimum_clearance = 0.0f;
 };
 
@@ -557,6 +901,7 @@ struct motion_match_log_row
     const char* query_bits_hex = "";
     int query_database_frame = 0;
     int query_range = 0;
+    int selected_database_frame = 0;
     int database_frame = 0;
     int range = 0;
     int source_range = 0;
@@ -572,9 +917,9 @@ struct motion_match_log_row
     motion_match_pose_diagnostic inertialized;
     motion_match_pose_diagnostic rendered;
     float hips_inertial_offset_y = 0.0f;
-    float runtime_root_height = 0.0f;
-    float runtime_left_toe_height = 0.0f;
-    float runtime_right_toe_height = 0.0f;
+    float runtime_root_surface_height = 0.0f;
+    float runtime_left_toe_surface_height = 0.0f;
+    float runtime_right_toe_surface_height = 0.0f;
     float adjustment_xz = 0.0f;
     float adjustment_y = 0.0f;
     float clamp_xz = 0.0f;
@@ -589,20 +934,33 @@ struct motion_match_log_row
 struct motion_match_log
 {
     FILE* file = NULL;
+    const char* path = NULL;
 
-    bool open(const char* path, char* error, int error_capacity)
+    bool io_error(
+        char* error, int error_capacity,
+        const char* action, const int saved_errno) const
     {
-        if (path == NULL) return true;
+        if (error != NULL && error_capacity > 0) {
+            snprintf(
+                error, (size_t)error_capacity, "%s: cannot %s motion log (%s)",
+                path != NULL ? path : "<disabled>", action,
+                strerror(saved_errno != 0 ? saved_errno : EIO));
+        }
+        return false;
+    }
+
+    bool open(const char* log_path, char* error, int error_capacity)
+    {
+        if (log_path == NULL) return true;
+        path = log_path;
         file = fopen(path, "w");
         if (file == NULL) {
-            snprintf(error, (size_t)error_capacity,
-                     "%s: cannot open motion log (%s)", path, strerror(errno));
-            return false;
+            return io_error(error, error_capacity, "open", errno);
         }
-        fprintf(file,
+        const bool header_ok = fprintf(file,
             "frame,fixed_dt,scene_id,mode,route,query_bits_hex,"
-            "query_database_frame,"
-            "query_range,database_frame,range,source_range,searched,transitioned,"
+            "query_database_frame,query_range,selected_database_frame,"
+            "database_frame,range,source_range,searched,transitioned,"
             "incumbent_cost,selected_cost,selected_terrain_error,"
             "effective_terrain_weight,terrain0,terrain1,terrain2,terrain3,"
             "terrain_point0_x,terrain_point0_y,terrain_point0_z,"
@@ -610,8 +968,9 @@ struct motion_match_log
             "terrain_point2_x,terrain_point2_y,terrain_point2_z,"
             "terrain_point3_x,terrain_point3_y,terrain_point3_z,"
             "raw_selected_hips_y,inertialized_hips_y,rendered_hips_y,"
-            "hips_inertial_offset_y,runtime_root_height,"
-            "runtime_left_toe_height,runtime_right_toe_height,"
+            "hips_inertial_offset_y,runtime_root_surface_height,"
+            "runtime_left_toe_surface_height,"
+            "runtime_right_toe_surface_height,"
             "raw_selected_hips_clearance,raw_selected_left_toe_clearance,"
             "raw_selected_right_toe_clearance,raw_selected_min_clearance,"
             "inertialized_hips_clearance,inertialized_left_toe_clearance,"
@@ -620,38 +979,48 @@ struct motion_match_log
             "rendered_right_toe_clearance,rendered_min_clearance,"
             "adjustment_xz,adjustment_y,clamp_xz,clamp_y,matching_enabled,"
             "adjustment_enabled,clamping_enabled,support_retargeting_enabled,"
-            "ik_enabled\n");
+            "ik_enabled\n") >= 0;
+        if (!header_ok || fflush(file) != 0) {
+            const int saved_errno = errno;
+            fclose(file);
+            file = NULL;
+            return io_error(error, error_capacity, "initialize", saved_errno);
+        }
         return true;
     }
 
-    void write(const motion_match_log_row& r)
+    bool write(
+        const motion_match_log_row& r,
+        char* error, const int error_capacity)
     {
-        if (file == NULL) return;
-        fprintf(file,
-            "%d,%.9g,%s,%s,%s,%s,%d,%d,%d,%d,%d,%d,%d,"
+        if (file == NULL) return true;
+        bool ok = fprintf(file,
+            "%d,%.9g,%s,%s,%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,"
             "%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g",
             r.frame, r.fixed_dt, r.scene_id, r.mode, r.route,
             r.query_bits_hex,
-            r.query_database_frame, r.query_range, r.database_frame,
-            r.range, r.source_range, (int)r.searched, (int)r.transitioned,
+            r.query_database_frame, r.query_range, r.selected_database_frame,
+            r.database_frame, r.range, r.source_range,
+            (int)r.searched, (int)r.transitioned,
             r.incumbent_cost, r.selected_cost, r.selected_terrain_error,
             r.effective_terrain_weight,
-            r.terrain[0], r.terrain[1], r.terrain[2], r.terrain[3]);
-        for (int i = 0; i < 4; ++i) {
-            fprintf(file, ",%.9g,%.9g,%.9g",
+            r.terrain[0], r.terrain[1], r.terrain[2], r.terrain[3]) >= 0;
+        for (int i = 0; ok && i < 4; ++i) {
+            ok = fprintf(file, ",%.9g,%.9g,%.9g",
                     r.terrain_points[i].x,
                     r.terrain_points[i].y,
-                    r.terrain_points[i].z);
+                    r.terrain_points[i].z) >= 0;
         }
-        fprintf(file,
+        if (ok) ok = fprintf(file,
             ",%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,"
             "%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,"
             "%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,"
             "%d,%d,%d,%d,%d\n",
             r.raw_selected.hips_y, r.inertialized.hips_y,
             r.rendered.hips_y, r.hips_inertial_offset_y,
-            r.runtime_root_height, r.runtime_left_toe_height,
-            r.runtime_right_toe_height,
+            r.runtime_root_surface_height,
+            r.runtime_left_toe_surface_height,
+            r.runtime_right_toe_surface_height,
             r.raw_selected.hips_clearance,
             r.raw_selected.left_toe_clearance,
             r.raw_selected.right_toe_clearance,
@@ -667,20 +1036,45 @@ struct motion_match_log
             r.adjustment_xz, r.adjustment_y, r.clamp_xz, r.clamp_y,
             (int)r.matching_enabled, (int)r.adjustment_enabled,
             (int)r.clamping_enabled, (int)r.support_retargeting_enabled,
-            (int)r.ik_enabled);
-        fflush(file);
+            (int)r.ik_enabled) >= 0;
+        if (ok) ok = fflush(file) == 0;
+        return ok ? true : io_error(error, error_capacity, "write", errno);
     }
 
-    void close()
+    bool close(char* error, const int error_capacity)
     {
-        if (file != NULL) {
-            fflush(file);
-            fclose(file);
-            file = NULL;
+        if (file == NULL) return true;
+        int saved_errno = 0;
+        if (fflush(file) != 0) saved_errno = errno;
+        if (fclose(file) != 0 && saved_errno == 0) saved_errno = errno;
+        file = NULL;
+        if (saved_errno != 0) {
+            const bool result = io_error(
+                error, error_capacity, "close", saved_errno);
+            path = NULL;
+            return result;
         }
+        path = NULL;
+        return true;
     }
 };
 ~~~
+
+Also create `tests/cpp/test_motion_match_log.cpp` with
+`#include "motion_match_log.h"` deliberately first. The test must use temporary
+files plus `/dev/full`/`freopen` fault injection to prove four cases: header
+initialization failure makes `open` return false, a row flush failure makes
+`write` return false, a buffered final flush makes `close` return false, and a
+normal open/write/close succeeds. Every failure diagnostic names its operation,
+every path leaves `log.file == NULL` after close, and every temporary file is
+removed. When given one output-path argument, retain a semantically valid
+one-row success CSV so the Python checker can exercise the native
+writer-to-reader boundary.
+The native test must construct finite, positive-infinity, and NaN values by
+copying exact uint32 bit patterns and exercise both the cheap 31D predicate and
+hex serializer. Compile/run this test once under strict flags and again under
+the production `-O3 -ffast-math` flags; standard-library finiteness predicates
+are not a valid implementation under that build.
 
 - [ ] **Step 6: Add deterministic modes and non-mutating pose snapshots to the controller**
 
@@ -717,7 +1111,12 @@ static bool g1_parse_test_config(
                 mode);
         }
     }
-    return g1_parse_test_frames(out.frame_limit, error, error_capacity);
+    if (!g1_parse_test_frames(out.frame_limit, error, error_capacity))
+        return false;
+    if (out.mode != G1_TestLive && out.frame_limit <= 0)
+        return g1_error(error, error_capacity,
+            "MM_TEST_FRAMES must be positive in deterministic test mode");
+    return true;
 }
 
 static motion_match_pose_diagnostic g1_pose_diagnostic(
@@ -758,6 +1157,11 @@ static float g1_xz_length(const vec3 value)
 }
 ~~~
 
+The immutable `*_min_clearance` fields are explicitly a seven-joint Gate A
+probe diagnostic: hips plus left/right knee, ankle, and toe. They are not a
+claim of full-body or link-envelope clearance; the later IK/clearance plan adds
+the authoritative collision envelope.
+
 Replace the independent test-frame parsing in `main` with:
 
 ~~~cpp
@@ -776,6 +1180,16 @@ if (test_config.mode == G1_TestFlat ||
 }
 ~~~
 
+Under `PLATFORM_WEB`, reject `test_config.frame_limit > 0` or any non-live
+mode before opening a window. Outside `MM_DISCRETE`, also reject a non-null
+`MM_LOG`. These paths require the bounded desktop loop to observe
+`controller_exit_requested` and reach synchronous writer cleanup.
+
+In an `MM_DISCRETE` build, reject every non-live test mode with a controlled
+option error before opening a window. This preserves that build's legacy
+`MM_LOG` text stream and `_Exit` behavior rather than opening the deterministic
+CSV writer on the same path.
+
 After the two stick reads, make only test-mode input deterministic:
 
 ~~~cpp
@@ -785,19 +1199,58 @@ if (test_config.mode != G1_TestLive) {
 }
 ~~~
 
-After `desired_strafe_update()`, force `desired_strafe = false` only when
-`test_config.mode != G1_TestLive`. Open the log before entering the main loop:
+After `desired_strafe_update()`, force `desired_strafe = false`,
+`desired_gait = 0`, and `desired_gait_velocity = 0.0f` only when
+`test_config.mode != G1_TestLive`. Disable every behavior-mutating Raygui
+control while deterministic test mode is active, restoring GUI state after the
+control block; visualization may continue, but the mouse must not be able to
+change weights, synchronization, adjustment, or clamping. Open the log before
+entering the main loop. If learned motion matching is ever enabled, reject a
+non-null deterministic log path: its generated poses have no truthful database
+frame selection, and this CSV contract is deliberately database-frame-only.
+Track `applied_feature_weight_terrain` separately from the GUI slider:
+initialize it only after the initial feature build validates, update it only
+after a GUI rebuild validates, and log that applied value as
+`effective_terrain_weight`. Moving a live slider without rebuilding must never
+relabel the active matcher.
+
+The first prediction update must also initialize the malloc-backed prior-state
+array before `trajectory_desired_rotations_predict` reads it. Immediately after
+the first `desired_velocity = desired_velocity_curr`, while
+`rendered_frames == 0`, call
+`trajectory_desired_velocities.set(desired_velocity)`. This removes the existing
+read-before-write without changing later prediction order: rotations continue
+to use the preceding update's desired-velocity trajectory, and update zero uses
+the current desired velocity as its only valid predecessor. This initialization
+is deliberately unconditional: it corrects pre-existing undefined behavior in
+live mode as well as deterministic tests; all later prediction ordering and
+defined live matching behavior remain unchanged.
 
 ~~~cpp
 motion_match_log deterministic_log;
+#ifndef MM_DISCRETE
+const char* deterministic_log_path = getenv("MM_LOG");
+#else
+const char* deterministic_log_path = NULL;
+#endif
 if (!deterministic_log.open(
-        getenv("MM_LOG"), artifact_error, (int)sizeof(artifact_error))) {
+        deterministic_log_path,
+        artifact_error, (int)sizeof(artifact_error))) {
     fprintf(stderr, "G1 runtime log error: %s\n", artifact_error);
     UnloadModel(terrain_model);
     CloseWindow();
     return 2;
 }
+const bool logging_enabled = deterministic_log.file != NULL;
 ~~~
+
+Before terrain snapshot/query construction, reject a non-queryable heightfield,
+invalid/non-finite trajectory input, or non-finite snapshot with a controlled
+runtime error and normal cleanup. Never let
+`terrain_centerline_snapshot_compute` turn invalid state into four apparently
+valid zero samples. Run `motion_match_query_is_finite_31d(query)` in every mode
+before search. Only call the `snprintf`-based hex serializer when
+`logging_enabled` is true.
 
 At query construction, preserve the pre-search frame/range and initialize the
 Runtime Task 6 cost fields:
@@ -805,19 +1258,26 @@ Runtime Task 6 cost fields:
 ~~~cpp
 const int query_database_frame = frame_index;
 const int query_range = g1_active_range(db, query_database_frame);
+int selected_database_frame = query_database_frame;
 const bool matching_enabled = test_config.mode != G1_TestSequential;
 const bool search_requested = matching_enabled &&
     (force_search || search_timer <= 0.0f || end_of_anim);
-float incumbent_cost = end_of_anim
-    ? FLT_MAX : database_frame_cost(db, frame_index, query);
-float selected_cost = incumbent_cost;
-float selected_terrain_error = database_raw_terrain_error(
-    db, frame_index, query);
+float incumbent_cost = 0.0f;
+float selected_cost = 0.0f;
+float selected_terrain_error = 0.0f;
+if (logging_enabled) {
+    incumbent_cost = end_of_anim
+        ? FLT_MAX : database_frame_cost(db, frame_index, query);
+    selected_cost = incumbent_cost;
+    selected_terrain_error = database_raw_terrain_error(
+        db, frame_index, query);
+}
 bool transitioned = false;
 ~~~
 
 Guard the existing search block with `if (search_requested)`. Immediately after
-`database_search`, assign `selected_cost = best_cost` and
+`database_search`, assign `selected_database_frame = best_index`,
+and, only when logging, assign `selected_cost = best_cost` and
 `selected_terrain_error = database_raw_terrain_error(db, best_index, query)`;
 set `transitioned = true` only inside the existing `best_index != frame_index`
 branch. Replace raw `frame_index++` with the range-safe advance:
@@ -826,8 +1286,13 @@ branch. Replace raw `frame_index++` with the range-safe advance:
 frame_index = database_trajectory_index_clamp(db, frame_index, 1);
 ~~~
 
+Before entering deterministic sequential mode, prove that its requested update
+count fits strictly before the initial animation range's terminal clamp. Reject
+an overrun with exit code `2`; a repeated terminal frame must never be emitted
+as a successful sequential test.
+
 Immediately after `inertialize_pose_update`, capture the two pre-adjustment
-stages without mutating the live pose:
+stages without mutating the live pose, but only inside `if (logging_enabled)`:
 
 ~~~cpp
 array1d<vec3> raw_selected_positions(curr_bone_positions);
@@ -845,7 +1310,9 @@ const vec3 root_before_adjustment = bone_positions(0);
 ~~~
 
 After the adjustment block and before clamping, capture
-`root_after_adjustment = bone_positions(0)`. After clamping, write one row:
+`root_after_adjustment = bone_positions(0)` only when logging. After clamping,
+perform the rendered diagnostic/FK and write one row inside the same logging
+guard:
 
 ~~~cpp
 const vec3 root_after_clamp = bone_positions(0);
@@ -859,7 +1326,12 @@ forward_kinematics_full(
 char query_bits_hex[31 * 8 + 1] = {};
 const bool query_bits_ok = motion_match_query_bits_hex(
     query_bits_hex, sizeof(query_bits_hex), query);
-assert(query_bits_ok); // startup already rejected any non-31D G1 database
+if (!query_bits_ok) {
+    fprintf(stderr, "G1 runtime query error: non-finite or non-31D query\n");
+    controller_exit_code = 2;
+    controller_exit_requested = true;
+    return;
+}
 
 motion_match_log_row log_row;
 log_row.frame = rendered_frames;
@@ -869,15 +1341,16 @@ log_row.route = test_config.route;
 log_row.query_bits_hex = query_bits_hex;
 log_row.query_database_frame = query_database_frame;
 log_row.query_range = query_range;
+log_row.selected_database_frame = selected_database_frame;
 log_row.database_frame = frame_index;
 log_row.range = g1_active_range(db, frame_index);
-log_row.source_range = log_row.range;
+log_row.source_range = g1_active_range(db, selected_database_frame);
 log_row.searched = search_requested;
 log_row.transitioned = transitioned;
 log_row.incumbent_cost = incumbent_cost;
 log_row.selected_cost = selected_cost;
 log_row.selected_terrain_error = selected_terrain_error;
-log_row.effective_terrain_weight = feature_weight_terrain;
+log_row.effective_terrain_weight = applied_feature_weight_terrain;
 for (int i = 0; i < 4; ++i) {
     log_row.terrain[i] = terrain_query_snapshot.values[i];
     log_row.terrain_points[i] = terrain_query_snapshot.points[i];
@@ -887,12 +1360,12 @@ log_row.inertialized = inertialized_diagnostic;
 log_row.rendered = rendered_diagnostic;
 log_row.hips_inertial_offset_y =
     inertialized_diagnostic.hips_y - raw_selected_diagnostic.hips_y;
-log_row.runtime_root_height = heightfield_sample(
+log_row.runtime_root_surface_height = heightfield_sample(
     runtime_terrain, bone_positions(0).x, bone_positions(0).z);
-log_row.runtime_left_toe_height = heightfield_sample(
+log_row.runtime_left_toe_surface_height = heightfield_sample(
     runtime_terrain, rendered_global(G1_LeftToe).x,
     rendered_global(G1_LeftToe).z);
-log_row.runtime_right_toe_height = heightfield_sample(
+log_row.runtime_right_toe_surface_height = heightfield_sample(
     runtime_terrain, rendered_global(G1_RightToe).x,
     rendered_global(G1_RightToe).z);
 const vec3 adjustment_delta = root_after_adjustment - root_before_adjustment;
@@ -906,42 +1379,176 @@ log_row.adjustment_enabled = adjustment_enabled;
 log_row.clamping_enabled = clamping_enabled;
 log_row.support_retargeting_enabled = false;
 log_row.ik_enabled = ik_enabled;
-deterministic_log.write(log_row);
+if (!deterministic_log.write(
+        log_row, artifact_error, (int)sizeof(artifact_error))) {
+    fprintf(stderr, "G1 runtime log error: %s\n", artifact_error);
+    controller_exit_code = 2;
+    controller_exit_requested = true;
+    return;
+}
 ~~~
 
-Use `test_config.frame_limit` for normal-loop termination and call
-`deterministic_log.close()` immediately before `UnloadModel`. The live path
-(`MM_TEST_MODE` unset) retains keyboard input, search, 3D adjustment, clamping,
-IK-off, and every matching decision unchanged.
+The invalid-query branch emits no row. A failed write invalidates the evidence,
+emits no subsequent rows, and routes immediately through the same post-window
+cleanup path with exit code `2`.
+
+Use `test_config.frame_limit` for normal-loop termination. If
+`WindowShouldClose()` ends a deterministic run before exactly that many updates,
+report a controlled error and exit `2`. Call
+`deterministic_log.close(
+    artifact_error, (int)sizeof(artifact_error))` exactly once
+on the common cleanup path; a flush or close failure also reports the logger
+error and changes an otherwise-successful exit to `2`. With `MM_LOG` unset,
+query hex serialization, pose diagnostics, their array allocations/FK passes,
+and row construction do not run. The live path (`MM_TEST_MODE` unset) retains
+keyboard input, search, 3D adjustment, clamping, and IK-off; the sole intentional
+matching-path correction is the update-zero desired-velocity initialization
+that removes the pre-existing read-before-write described above.
 
 - [ ] **Step 7: Build and run the logger/checker test cycle**
 
 Run:
 
 ~~~bash
+set -euo pipefail
 /home/ubuntu/miniconda3/envs/diffsim/bin/python -m unittest \
   tests.python.test_runtime_log -v
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
+  tests/cpp/test_motion_match_log.cpp -o /tmp/test_motion_match_log_strict
+rm -f /tmp/g1_writer_strict.csv
+/tmp/test_motion_match_log_strict /tmp/g1_writer_strict.csv
+/home/ubuntu/miniconda3/envs/diffsim/bin/python \
+  resources/check_g1_runtime_log.py /tmp/g1_writer_strict.csv
+g++ -std=c++17 -O3 -ffast-math -march=native -DNDEBUG -I. \
+  tests/cpp/test_motion_match_log.cpp -o /tmp/test_motion_match_log_fast
+rm -f /tmp/g1_writer_fast.csv
+/tmp/test_motion_match_log_fast /tmp/g1_writer_fast.csv
+/home/ubuntu/miniconda3/envs/diffsim/bin/python \
+  resources/check_g1_runtime_log.py /tmp/g1_writer_fast.csv
+cmp /tmp/g1_writer_strict.csv /tmp/g1_writer_fast.csv
 g++ -std=c++17 -Wall -Wextra -Werror -pedantic \
+  -Wno-error=sign-compare -Wno-error=pedantic \
+  -Wno-error=unused-parameter \
+  -Wno-error=missing-field-initializers \
+  -D_DEFAULT_SOURCE -DPLATFORM_DESKTOP \
+  -I. -isystem /home/ubuntu/apps/raylib/src \
+  -isystem /home/ubuntu/apps/raygui/src \
+  controller.cpp -o /tmp/controller_g1_gate_a_warning \
+  -L /home/ubuntu/apps/raylib/src \
+  -lraylib -lGL -lm -lpthread -ldl -lrt -lX11 \
+  2> /tmp/g1_task1_controller_warnings.txt
+/home/ubuntu/miniconda3/envs/diffsim/bin/python - <<'PY'
+import re
+from pathlib import Path
+text = Path("/tmp/g1_task1_controller_warnings.txt").read_text()
+categories = set(re.findall(r"\[-W([^]]+)\]", text))
+expected = {
+    "sign-compare", "pedantic", "unused-parameter",
+    "missing-field-initializers",
+}
+assert categories == expected, (sorted(expected - categories),
+                                sorted(categories - expected))
+assert "motion_match_log.h:" not in text
+print("VALID controller warning baseline", sorted(categories))
+PY
+
+g++ -O3 -ffast-math -march=native -DNDEBUG \
   -D_DEFAULT_SOURCE -DPLATFORM_DESKTOP \
   -I. -I /home/ubuntu/apps/raylib/src -I /home/ubuntu/apps/raygui/src \
   controller.cpp -o /tmp/controller_g1_gate_a \
   -L /home/ubuntu/apps/raylib/src \
   -lraylib -lGL -lm -lpthread -ldl -lrt -lX11
+
+rm -f /tmp/g1_task1_smoke_a.csv /tmp/g1_task1_smoke_b.csv
+for output in /tmp/g1_task1_smoke_a.csv /tmp/g1_task1_smoke_b.csv; do
+  DISPLAY=:1 G1_TERRAIN_DIR=resources/g1_terrain \
+    MM_TEST_MODE=terrain MM_TERRAIN_WEIGHT=4 MM_TEST_FRAMES=25 \
+    MM_LOG="$output" /tmp/controller_g1_gate_a
+  test "$(wc -l < "$output")" -eq 26
+  /home/ubuntu/miniconda3/envs/diffsim/bin/python \
+    resources/check_g1_runtime_log.py "$output"
+done
+cmp /tmp/g1_task1_smoke_a.csv /tmp/g1_task1_smoke_b.csv
+
+DISPLAY=:1 G1_TERRAIN_DIR=resources/g1_terrain \
+  MM_TEST_MODE=terrain MM_TERRAIN_WEIGHT=4 MM_TEST_FRAMES=2 \
+  /tmp/controller_g1_gate_a
+
+set +e
+DISPLAY=:1 G1_TERRAIN_DIR=resources/g1_terrain \
+  MM_TEST_MODE=terrain MM_TERRAIN_WEIGHT=4 MM_TEST_FRAMES=2 \
+  MM_LOG=/dev/full /tmp/controller_g1_gate_a \
+  >/tmp/g1_task1_dev_full.stdout 2>/tmp/g1_task1_dev_full.stderr
+status=$?
+set -e
+test "$status" -eq 2
+grep -q 'G1 runtime log error:' /tmp/g1_task1_dev_full.stderr
+
+set +e
+env -u MM_TEST_FRAMES DISPLAY=:1 G1_TERRAIN_DIR=resources/g1_terrain \
+  MM_TEST_MODE=terrain /tmp/controller_g1_gate_a \
+  >/tmp/g1_task1_missing_limit.stdout \
+  2>/tmp/g1_task1_missing_limit.stderr
+missing_limit_status=$?
+DISPLAY=:1 G1_TERRAIN_DIR=resources/g1_terrain \
+  MM_TEST_MODE=sequential MM_TEST_FRAMES=1000000000 \
+  /tmp/controller_g1_gate_a \
+  >/tmp/g1_task1_overrun.stdout 2>/tmp/g1_task1_overrun.stderr
+overrun_status=$?
+set -e
+test "$missing_limit_status" -eq 2
+test "$overrun_status" -eq 2
+grep -q 'MM_TEST_FRAMES must be set to a positive integer' \
+  /tmp/g1_task1_missing_limit.stderr
+grep -q 'G1 sequential test overrun' /tmp/g1_task1_overrun.stderr
+
+g++ -O3 -ffast-math -march=native -DNDEBUG -DMM_DISCRETE \
+  -D_DEFAULT_SOURCE -DPLATFORM_DESKTOP \
+  -I. -I /home/ubuntu/apps/raylib/src -I /home/ubuntu/apps/raygui/src \
+  controller.cpp -o /tmp/controller_g1_gate_a_discrete \
+  -L /home/ubuntu/apps/raylib/src \
+  -lraylib -lGL -lm -lpthread -ldl -lrt -lX11
+rm -f /tmp/g1_task1_discrete_conflict.log
+set +e
+DISPLAY=:1 G1_TERRAIN_DIR=resources/g1_terrain \
+  MM_TEST_MODE=terrain MM_TEST_FRAMES=2 \
+  MM_LOG=/tmp/g1_task1_discrete_conflict.log \
+  /tmp/controller_g1_gate_a_discrete \
+  >/tmp/g1_task1_discrete.stdout 2>/tmp/g1_task1_discrete.stderr
+discrete_status=$?
+set -e
+test "$discrete_status" -eq 2
+test ! -e /tmp/g1_task1_discrete_conflict.log
+grep -q 'MM_TEST_MODE is unavailable in MM_DISCRETE builds' \
+  /tmp/g1_task1_discrete.stderr
 ~~~
 
-Expected: all 8 Python tests pass and the strict C++ build exits 0 with no
-warnings. Do not run a terrain-sampling rebuild in this task.
+Expected: all Python tests pass; both standalone-writer builds produce a
+checker-valid, byte-identical row; and the strict writer is warning-clean under
+`-Werror -pedantic` while the production-flags writer still rejects Inf/NaN.
+The controller warning-audit build exits `0` with
+only Holden's pre-existing `sign-compare`, GNU compound-literal `pedantic`,
+unused-parameter, and aggregate-initializer categories; no diagnostic names the
+new logger header. The exact production command also builds and is the binary
+used for all runtime evidence. Then both 25-update controller runs exit 0,
+contain exactly 26 lines, pass the base checker, and are byte-identical; a
+two-update no-log run exits normally; and `/dev/full` exits 2 through normal
+cleanup with one logger diagnostic. Missing limits, sequential overrun, and a
+non-live `MM_DISCRETE` conflict each fail closed with exit 2 before creating a
+conflicting log. Do not run a terrain-sampling rebuild in this task and do not
+stop or replace any pre-existing live visualizer process.
 
 - [ ] **Step 8: Commit only the baseline diagnostic boundary**
 
 ~~~bash
 git add motion_match_log.h resources/check_g1_runtime_log.py \
-  tests/python/test_runtime_log.py controller.cpp
+  tests/python/test_runtime_log.py tests/cpp/test_motion_match_log.cpp \
+  controller.cpp
 git diff --cached --check
 git commit -m "test: capture G1 terrain penetration stages"
 ~~~
 
-Expected: the commit contains only the four named files; existing modified
+Expected: the commit contains only the five named files; existing modified
 `resources/database.bin`, `resources/features.bin`, executables, logs, and media
 remain unstaged.
 
@@ -949,11 +1556,13 @@ remain unstaged.
 
 **Files:**
 - Generated, never committed: `/tmp/g1_gate_a_before.csv`
+- Generated, never committed: `/tmp/g1_gate_a_csv.sha256`
 - Generated, never committed: `/tmp/g1_gate_a_before.sha256`
 - Generated, never committed: `/tmp/g1_gate_a_commit.txt`
 - Generated, never committed: `/tmp/g1_gate_a_report.txt`
 - Generated, never committed: `/tmp/g1_gate_a_status_before.txt`
 - Generated, never committed: `/tmp/g1_gate_a_status_after.txt`
+- Generated, never committed: `/tmp/g1_gate_a_evidence.sha256`
 
 **Interfaces:**
 - Consumes the pre-existing G1HF/v1 `resources/g1_terrain/` pack and the exact Task 1 controller.
@@ -964,15 +1573,26 @@ remain unstaged.
 Run:
 
 ~~~bash
+set -euo pipefail
 for path in /tmp/g1_gate_a_before.csv /tmp/g1_gate_a_before.sha256 \
+  /tmp/g1_gate_a_csv.sha256 \
   /tmp/g1_gate_a_commit.txt /tmp/g1_gate_a_report.txt \
-  /tmp/g1_gate_a_status_before.txt /tmp/g1_gate_a_status_after.txt
+  /tmp/g1_gate_a_status_before.txt /tmp/g1_gate_a_status_after.txt \
+  /tmp/g1_gate_a_evidence.sha256
 do
   test ! -e "$path"
 done
-git status --short > /tmp/g1_gate_a_status_before.txt
 git rev-parse HEAD > /tmp/g1_gate_a_commit.txt
-sha256sum resources/g1_terrain/database.bin \
+{
+  printf 'HEAD '
+  cat /tmp/g1_gate_a_commit.txt
+  printf 'STATUS\n'
+  git status --short
+  printf 'TRACKED_DIFF_SHA256 '
+  git diff --binary --no-ext-diff HEAD | sha256sum
+} > /tmp/g1_gate_a_status_before.txt
+sha256sum /tmp/controller_g1_gate_a \
+  resources/g1_terrain/database.bin \
   resources/g1_terrain/terrain_features.bin \
   resources/g1_terrain/terrain.bin \
   resources/g1_terrain/terrain.obj \
@@ -982,19 +1602,26 @@ sha256sum resources/g1_terrain/database.bin \
 ~~~
 
 Expected: every evidence path was absent, all commands exit 0, and the exact
-pre-task dirty status is saved before any run. Refuse to overwrite prior
-evidence; choose a separately reviewed evidence basename if a rerun is needed.
+pre-task HEAD, dirty-status shape, tracked binary diff hash, producer-executable
+hash, and six input-artifact hashes are saved before any run. Refuse to
+overwrite prior evidence; choose a separately reviewed evidence basename if a
+rerun is needed.
 
 - [ ] **Step 2: Run the deterministic terrain-weight-four curb approach**
 
 Run:
 
 ~~~bash
+set -euo pipefail
 DISPLAY=:1 G1_TERRAIN_DIR=resources/g1_terrain \
   MM_TEST_MODE=terrain MM_TERRAIN_WEIGHT=4 MM_TEST_FRAMES=375 \
   MM_LOG=/tmp/g1_gate_a_before.csv \
   /tmp/controller_g1_gate_a
 test "$(wc -l < /tmp/g1_gate_a_before.csv)" -eq 376
+sha256sum --check /tmp/g1_gate_a_before.sha256
+sha256sum /tmp/g1_gate_a_before.csv > /tmp/g1_gate_a_csv.sha256
+chmod a-w /tmp/g1_gate_a_before.csv /tmp/g1_gate_a_csv.sha256
+sha256sum --check /tmp/g1_gate_a_csv.sha256
 ~~~
 
 Expected: normal cleanup and exit 0 after exactly 375 updates; the CSV contains
@@ -1006,12 +1633,15 @@ unchanged from `/tmp/g1_gate_a_before.sha256`.
 Run:
 
 ~~~bash
+set -euo pipefail
+sha256sum --check /tmp/g1_gate_a_csv.sha256
 /home/ubuntu/miniconda3/envs/diffsim/bin/python \
   resources/check_g1_runtime_log.py /tmp/g1_gate_a_before.csv --gate-a \
   | tee /tmp/g1_gate_a_report.txt
 test "$(grep -c '^VALID gate-a ' /tmp/g1_gate_a_report.txt)" -eq 1
 grep -Eq 'classification=(raw-selected|blended-rendered|no-penetration)' \
   /tmp/g1_gate_a_report.txt
+sha256sum --check /tmp/g1_gate_a_csv.sha256
 ~~~
 
 Expected: exit 0 with a `VALID gate-a` line containing a finite
@@ -1026,15 +1656,61 @@ the artifact work must not begin.
 Run:
 
 ~~~bash
+set -euo pipefail
 sha256sum --check /tmp/g1_gate_a_before.sha256
-git status --short > /tmp/g1_gate_a_status_after.txt
+test "$(git rev-parse HEAD)" = "$(cat /tmp/g1_gate_a_commit.txt)"
+{
+  printf 'HEAD '
+  git rev-parse HEAD
+  printf 'STATUS\n'
+  git status --short
+  printf 'TRACKED_DIFF_SHA256 '
+  git diff --binary --no-ext-diff HEAD | sha256sum
+} > /tmp/g1_gate_a_status_after.txt
 diff -u /tmp/g1_gate_a_status_before.txt /tmp/g1_gate_a_status_after.txt
+sha256sum /tmp/controller_g1_gate_a \
+  /tmp/g1_gate_a_before.csv \
+  /tmp/g1_gate_a_before.sha256 \
+  /tmp/g1_gate_a_csv.sha256 \
+  /tmp/g1_gate_a_commit.txt \
+  /tmp/g1_gate_a_report.txt \
+  /tmp/g1_gate_a_status_before.txt \
+  /tmp/g1_gate_a_status_after.txt \
+  > /tmp/g1_gate_a_evidence.sha256
+sha256sum --check /tmp/g1_gate_a_evidence.sha256
+chmod a-w /tmp/controller_g1_gate_a \
+  /tmp/g1_gate_a_before.csv \
+  /tmp/g1_gate_a_before.sha256 \
+  /tmp/g1_gate_a_csv.sha256 \
+  /tmp/g1_gate_a_commit.txt \
+  /tmp/g1_gate_a_report.txt \
+  /tmp/g1_gate_a_status_before.txt \
+  /tmp/g1_gate_a_status_after.txt \
+  /tmp/g1_gate_a_evidence.sha256
+for path in /tmp/controller_g1_gate_a \
+  /tmp/g1_gate_a_before.csv \
+  /tmp/g1_gate_a_before.sha256 \
+  /tmp/g1_gate_a_csv.sha256 \
+  /tmp/g1_gate_a_commit.txt \
+  /tmp/g1_gate_a_report.txt \
+  /tmp/g1_gate_a_status_before.txt \
+  /tmp/g1_gate_a_status_after.txt \
+  /tmp/g1_gate_a_evidence.sha256
+do
+  case "$(stat -c '%A' "$path")" in
+    *w*) exit 1 ;;
+  esac
+done
+sha256sum --check /tmp/g1_gate_a_evidence.sha256
 ~~~
 
 Expected: every checksum reports `OK`; repository status contains only the
-exact saved pre-task changes and no Gate A output. The report persistently
-records the measured classification, and there is no commit for this
-evidence-only task.
+exact saved pre-task changes and no Gate A output; HEAD and the byte content of
+every tracked dirty path are unchanged. The final manifest binds the producer
+executable, CSV, report, commit record, input-hash record, and before/after
+repository-state records, and every evidence file is made read-only. The report
+persistently records the measured classification, and there is no commit for
+this evidence-only task.
 
 ### Task 3: Replace radius dilation with exact vertical-triangle GRAIL queries
 

@@ -3586,7 +3586,10 @@ succeeds, route every error through the loop's `controller_exit_requested` and
 then this one tail, in this exact order:
 
 ```cpp
-deterministic_log.close();const bool log_closed=true;
+const bool log_evidence_ok=deterministic_log.close(
+    artifact_error,(int)sizeof(artifact_error));
+const bool log_closed=true;
+if(!log_evidence_ok){std::fprintf(stderr,"G1 runtime log error: %s\n",artifact_error);if(controller_exit_code==0)controller_exit_code=2;}
 model_unloader(terrain_model);
 CloseWindow();const bool window_closed=true;
 cleanup_report cleanup;cleanup.exit_code=controller_exit_code;cleanup.motion_pack_load_count=motion_pack_load_count;cleanup.model_load_count=model_load_count;cleanup.model_unload_count=model_unload_count;cleanup.log_closed=log_closed;cleanup.window_closed=window_closed;
