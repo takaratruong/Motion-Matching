@@ -31,6 +31,8 @@ struct heightfield
     float cell_size = 0.0f;
     float exterior_height = 0.0f;
     array1d<float> heights;
+    // Appended so every historical v1 member keeps its original offset.
+    uint32_t version = 0;
 };
 
 static inline bool terrain_error(
@@ -73,6 +75,258 @@ static inline bool terrain_float_is_finite(float value)
     uint32_t bits = 0;
     memcpy(&bits, &value, sizeof(bits));
     return (bits & UINT32_C(0x7f800000)) != UINT32_C(0x7f800000);
+}
+
+static inline bool terrain_double_is_finite(double value)
+{
+    uint64_t bits = 0;
+    static_assert(sizeof(value) == sizeof(bits),
+                  "terrain runtime requires 64-bit doubles");
+    memcpy(&bits, &value, sizeof(bits));
+    return (bits & UINT64_C(0x7ff0000000000000)) !=
+           UINT64_C(0x7ff0000000000000);
+}
+
+static inline uint32_t terrain_float_bits(float value)
+{
+    uint32_t bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static inline bool terrain_float_is_normal_or_positive_zero(float value)
+{
+    const uint32_t bits = terrain_float_bits(value);
+    const uint32_t exponent = bits & UINT32_C(0x7f800000);
+    return bits == 0 ||
+           (exponent != 0 && exponent != UINT32_C(0x7f800000));
+}
+
+static inline bool terrain_float_is_positive_normal(float value)
+{
+    const uint32_t bits = terrain_float_bits(value);
+    const uint32_t exponent = bits & UINT32_C(0x7f800000);
+    return (bits & UINT32_C(0x80000000)) == 0 &&
+           exponent != 0 && exponent != UINT32_C(0x7f800000);
+}
+
+static inline bool terrain_float_is_normal_or_zero_query(float value)
+{
+    const uint32_t magnitude =
+        terrain_float_bits(value) & UINT32_C(0x7fffffff);
+    const uint32_t exponent = magnitude & UINT32_C(0x7f800000);
+    return magnitude == 0 ||
+           (exponent != 0 && exponent != UINT32_C(0x7f800000));
+}
+
+static inline float terrain_runtime_canonicalize_output(float value)
+{
+    const uint32_t bits = terrain_float_bits(value);
+    if ((bits & UINT32_C(0x7f800000)) == 0) {
+        return 0.0f;
+    }
+    return value;
+}
+
+static inline bool terrain_v2_runtime_node_from_double(
+    double source, float& runtime)
+{
+    if (!terrain_double_is_finite(source)) {
+        return false;
+    }
+
+    uint64_t source_bits = 0;
+    memcpy(&source_bits, &source, sizeof(source_bits));
+    const bool negative =
+        (source_bits & UINT64_C(0x8000000000000000)) != 0;
+    const uint64_t magnitude_bits =
+        source_bits & UINT64_C(0x7fffffffffffffff);
+    double magnitude = 0.0;
+    memcpy(&magnitude, &magnitude_bits, sizeof(magnitude));
+
+    // These are the exact round-to-nearest-even ties around the binary32
+    // subnormal interval.  Classify in binary64 before a production
+    // -ffast-math conversion can flush a derived subnormal.
+    const double zero_tie = 0x1p-150;
+    const double minimum_normal_tie = 0x1p-126 - 0x1p-150;
+    if (magnitude <= zero_tie) {
+        runtime = 0.0f;
+        return true;
+    }
+    if (magnitude < minimum_normal_tie) {
+        return false;
+    }
+    if (magnitude < 0x1p-126) {
+        uint32_t rounded_bits = UINT32_C(0x00800000);
+        // Avoid all binary64-to-binary32 arithmetic in this interval: the
+        // exact IEEE result is minimum normal, while FTZ hardware conversion
+        // may first produce and then flush a subnormal.
+        if (negative) {
+            rounded_bits |= UINT32_C(0x80000000);
+        }
+        memcpy(&runtime, &rounded_bits, sizeof(runtime));
+        return true;
+    }
+
+    const volatile double materialized_source = source;
+    const volatile float rounded =
+        static_cast<float>(materialized_source);
+    runtime = rounded;
+    return terrain_float_is_normal_or_positive_zero(runtime);
+}
+
+static inline bool terrain_v2_axis_node(
+    float origin,
+    uint32_t index,
+    float cell_size,
+    double& source,
+    float& runtime)
+{
+    const volatile double product =
+        static_cast<double>(index) * static_cast<double>(cell_size);
+    const volatile double coordinate =
+        static_cast<double>(origin) + product;
+    source = coordinate;
+    return terrain_v2_runtime_node_from_double(source, runtime);
+}
+
+static inline double terrain_v2_source_maximum_inward_spacing(
+    double first, double last)
+{
+    if (first >= 0.0) {
+        const volatile double previous = nextafter(last, -INFINITY);
+        const volatile double spacing = last - previous;
+        return spacing;
+    }
+    if (last <= 0.0) {
+        const volatile double next = nextafter(first, INFINITY);
+        const volatile double spacing = next - first;
+        return spacing;
+    }
+    const volatile double next = nextafter(first, INFINITY);
+    const volatile double previous = nextafter(last, -INFINITY);
+    const volatile double first_spacing = next - first;
+    const volatile double last_spacing = last - previous;
+    return first_spacing > last_spacing ? first_spacing : last_spacing;
+}
+
+static inline double terrain_v2_float_inward_spacing(float endpoint)
+{
+    const uint32_t magnitude =
+        terrain_float_bits(endpoint) & UINT32_C(0x7fffffff);
+    const int encoded_exponent =
+        static_cast<int>((magnitude >> 23) & UINT32_C(0xff));
+    const uint32_t significand = magnitude & UINT32_C(0x007fffff);
+    if (significand == 0) {
+        if (encoded_exponent == 1) {
+            return ldexp(1.0, -149);
+        }
+        return ldexp(1.0, encoded_exponent - 127 - 24);
+    }
+    return ldexp(1.0, encoded_exponent - 127 - 23);
+}
+
+static inline double terrain_v2_runtime_maximum_inward_spacing(
+    float first, float last)
+{
+    if (first >= 0.0f) {
+        return terrain_v2_float_inward_spacing(last);
+    }
+    if (last <= 0.0f) {
+        return terrain_v2_float_inward_spacing(first);
+    }
+    const double first_spacing = terrain_v2_float_inward_spacing(first);
+    const double last_spacing = terrain_v2_float_inward_spacing(last);
+    return first_spacing > last_spacing ? first_spacing : last_spacing;
+}
+
+static inline bool terrain_v2_runtime_axis_is_valid(
+    float origin, uint32_t count, float cell_size)
+{
+    if (count < 2 ||
+        !terrain_float_is_normal_or_positive_zero(origin) ||
+        !terrain_float_is_positive_normal(cell_size)) {
+        return false;
+    }
+
+    double first_source = 0.0;
+    double second_source = 0.0;
+    double penultimate_source = 0.0;
+    double last_source = 0.0;
+    float first_runtime = 0.0f;
+    float second_runtime = 0.0f;
+    float penultimate_runtime = 0.0f;
+    float last_runtime = 0.0f;
+    if (!terrain_v2_axis_node(
+            origin, 0, cell_size, first_source, first_runtime) ||
+        !terrain_v2_axis_node(
+            origin, 1, cell_size, second_source, second_runtime) ||
+        !terrain_v2_axis_node(
+            origin, count - 2, cell_size,
+            penultimate_source, penultimate_runtime) ||
+        !terrain_v2_axis_node(
+            origin, count - 1, cell_size, last_source, last_runtime) ||
+        second_source <= first_source ||
+        second_runtime <= first_runtime ||
+        last_source <= penultimate_source ||
+        last_runtime <= penultimate_runtime) {
+        return false;
+    }
+
+    if (first_source < 0.0 && last_source > 0.0) {
+        const volatile double negated_origin =
+            -static_cast<double>(origin);
+        const volatile double zero_index =
+            negated_origin / static_cast<double>(cell_size);
+        if (!terrain_double_is_finite(zero_index)) {
+            return false;
+        }
+        const double base_value = floor(zero_index);
+        if (base_value < 0.0 ||
+            base_value > static_cast<double>(count - 1)) {
+            return false;
+        }
+        const int64_t base = static_cast<int64_t>(base_value);
+        for (int offset = -1; offset <= 2; ++offset) {
+            const int64_t candidate = base + offset;
+            if (candidate < 0 ||
+                candidate >= static_cast<int64_t>(count)) {
+                continue;
+            }
+            double source = 0.0;
+            float runtime = 0.0f;
+            if (!terrain_v2_axis_node(
+                    origin, static_cast<uint32_t>(candidate), cell_size,
+                    source, runtime)) {
+                return false;
+            }
+        }
+    }
+
+    if (count <= 3) {
+        return true;
+    }
+
+    const double source_spacing =
+        terrain_v2_source_maximum_inward_spacing(
+            first_source, last_source);
+    const double runtime_spacing =
+        terrain_v2_runtime_maximum_inward_spacing(
+            first_runtime, last_runtime);
+    const double maximum_spacing =
+        source_spacing > runtime_spacing ? source_spacing : runtime_spacing;
+    const double promoted_cell_size = static_cast<double>(cell_size);
+    if (promoted_cell_size > maximum_spacing) {
+        return true;
+    }
+    if (promoted_cell_size < maximum_spacing) {
+        return false;
+    }
+
+    const volatile double quotient =
+        static_cast<double>(origin) / promoted_cell_size;
+    return terrain_double_is_finite(quotient) &&
+           quotient == floor(quotient);
 }
 
 static inline bool terrain_host_is_little_endian()
@@ -335,11 +589,11 @@ static inline bool heightfield_load(
     const float cell_size = terrain_decode_float_le(header + 24);
     const float exterior_height = terrain_decode_float_le(header + 28);
 
-    if (version != 1) {
+    if (version != 1 && version != 2) {
         fclose(file);
         return terrain_error(
             error, error_capacity,
-            "%s: unsupported G1HF version %u (expected 1)",
+            "%s: unsupported G1HF version %u (expected 1 or 2)",
             path, static_cast<unsigned>(version));
     }
     if (nx < 2 || nz < 2 ||
@@ -367,6 +621,38 @@ static inline bool heightfield_load(
         return terrain_error(
             error, error_capacity,
             "%s: G1HF exterior height must be finite", path);
+    }
+    if (version == 2) {
+        if (!terrain_float_is_normal_or_positive_zero(origin_x) ||
+            !terrain_float_is_normal_or_positive_zero(origin_z) ||
+            !terrain_float_is_normal_or_positive_zero(exterior_height)) {
+            fclose(file);
+            return terrain_error(
+                error, error_capacity,
+                "%s: G1HF v2 origin and exterior height must be "
+                "normal-or-positive-zero binary32", path);
+        }
+        if (!terrain_float_is_positive_normal(cell_size)) {
+            fclose(file);
+            return terrain_error(
+                error, error_capacity,
+                "%s: G1HF v2 cell size must encode as positive normal "
+                "binary32", path);
+        }
+        if (!terrain_v2_runtime_axis_is_valid(origin_x, nx, cell_size)) {
+            fclose(file);
+            return terrain_error(
+                error, error_capacity,
+                "%s: G1HF v2 X nodes must be normal-or-zero runtime nodes "
+                "and runtime-distinguishable", path);
+        }
+        if (!terrain_v2_runtime_axis_is_valid(origin_z, nz, cell_size)) {
+            fclose(file);
+            return terrain_error(
+                error, error_capacity,
+                "%s: G1HF v2 Z nodes must be normal-or-zero runtime nodes "
+                "and runtime-distinguishable", path);
+        }
     }
 
     size_t height_count = 0;
@@ -398,6 +684,7 @@ static inline bool heightfield_load(
     }
 
     heightfield loaded;
+    loaded.version = version;
     loaded.nx = static_cast<int>(nx);
     loaded.nz = static_cast<int>(nz);
     loaded.origin_x = origin_x;
@@ -418,12 +705,22 @@ static inline bool heightfield_load(
                 error, error_capacity,
                 "%s: G1HF heights must all be finite (index %zu)", path, i);
         }
+        if (version == 2 &&
+            !terrain_float_is_normal_or_positive_zero(
+                loaded.heights.data[i])) {
+            fclose(file);
+            return terrain_error(
+                error, error_capacity,
+                "%s: G1HF v2 heights must all be "
+                "normal-or-positive-zero binary32 (index %zu)", path, i);
+        }
     }
 
     if (!terrain_finish_read(file, path, error, error_capacity)) {
         return false;
     }
 
+    std::swap(out.version, loaded.version);
     std::swap(out.nx, loaded.nx);
     std::swap(out.nz, loaded.nz);
     std::swap(out.origin_x, loaded.origin_x);
@@ -434,6 +731,8 @@ static inline bool heightfield_load(
     std::swap(out.heights.data, loaded.heights.data);
     return true;
 }
+
+static inline bool terrain_heightfield_is_queryable(const heightfield& field);
 
 static inline float heightfield_sample(
     const heightfield& field, float x, float z)
@@ -468,6 +767,337 @@ static inline float heightfield_sample(
         field.heights(z1 * field.nx + x0),
         field.heights(z1 * field.nx + x1), tx);
     return lerpf(row0, row1, tz);
+}
+
+static inline float heightfield_sample_v1_legacy(
+    const heightfield& field, float x, float z)
+{
+    return heightfield_sample(field, x, z);
+}
+
+struct heightfield_cell
+{
+    int x0;
+    int z0;
+    double tx;
+    double tz;
+};
+
+static inline bool terrain_v2_query_coordinate(
+    float input, float& canonical)
+{
+    if (!terrain_float_is_normal_or_zero_query(input)) {
+        return false;
+    }
+    canonical = (terrain_float_bits(input) & UINT32_C(0x7fffffff)) == 0
+        ? 0.0f
+        : input;
+    return true;
+}
+
+static inline bool terrain_v2_axis_cell(
+    double value,
+    float origin,
+    int count,
+    float cell_size,
+    int& index,
+    double& fraction)
+{
+    const volatile double difference =
+        value - static_cast<double>(origin);
+    const volatile double coordinate =
+        difference / static_cast<double>(cell_size);
+    if (!terrain_double_is_finite(coordinate)) {
+        return false;
+    }
+
+    const double floored = floor(coordinate);
+    if (floored <= 0.0) {
+        index = 0;
+    } else if (floored >= static_cast<double>(count - 2)) {
+        index = count - 2;
+    } else {
+        index = static_cast<int>(floored);
+    }
+
+    while (index > 0) {
+        const volatile double product =
+            static_cast<double>(index) * static_cast<double>(cell_size);
+        const volatile double node =
+            static_cast<double>(origin) + product;
+        if (!(value < node)) {
+            break;
+        }
+        --index;
+    }
+    while (index < count - 2) {
+        const volatile double product =
+            static_cast<double>(index + 1) *
+            static_cast<double>(cell_size);
+        const volatile double next_node =
+            static_cast<double>(origin) + product;
+        if (!(value >= next_node)) {
+            break;
+        }
+        ++index;
+    }
+
+    const volatile double product =
+        static_cast<double>(index) * static_cast<double>(cell_size);
+    const volatile double node =
+        static_cast<double>(origin) + product;
+    const volatile double local_difference = value - node;
+    const volatile double local_fraction =
+        local_difference / static_cast<double>(cell_size);
+    if (!terrain_double_is_finite(local_fraction)) {
+        return false;
+    }
+    if (local_fraction <= 0.0) {
+        fraction = 0.0;
+    } else if (local_fraction >= 1.0) {
+        fraction = 1.0;
+    } else {
+        fraction = local_fraction;
+    }
+    return true;
+}
+
+static inline bool terrain_v2_locate_cell(
+    const heightfield& field,
+    float input_x,
+    float input_z,
+    heightfield_cell& cell)
+{
+    float canonical_x = 0.0f;
+    float canonical_z = 0.0f;
+    if (!terrain_v2_query_coordinate(input_x, canonical_x) ||
+        !terrain_v2_query_coordinate(input_z, canonical_z)) {
+        return false;
+    }
+
+    const double x = static_cast<double>(canonical_x);
+    const double z = static_cast<double>(canonical_z);
+    const volatile double maximum_x_product =
+        static_cast<double>(field.nx - 1) *
+        static_cast<double>(field.cell_size);
+    const volatile double maximum_z_product =
+        static_cast<double>(field.nz - 1) *
+        static_cast<double>(field.cell_size);
+    const volatile double maximum_x =
+        static_cast<double>(field.origin_x) + maximum_x_product;
+    const volatile double maximum_z =
+        static_cast<double>(field.origin_z) + maximum_z_product;
+    if (!terrain_double_is_finite(maximum_x) ||
+        !terrain_double_is_finite(maximum_z) ||
+        x < static_cast<double>(field.origin_x) || x > maximum_x ||
+        z < static_cast<double>(field.origin_z) || z > maximum_z) {
+        return false;
+    }
+
+    return terrain_v2_axis_cell(
+               x, field.origin_x, field.nx, field.cell_size,
+               cell.x0, cell.tx) &&
+           terrain_v2_axis_cell(
+               z, field.origin_z, field.nz, field.cell_size,
+               cell.z0, cell.tz);
+}
+
+static inline bool terrain_v2_cell_heights(
+    const heightfield& field,
+    const heightfield_cell& cell,
+    double& h00,
+    double& h10,
+    double& h01,
+    double& h11)
+{
+    const int offset = cell.z0 * field.nx + cell.x0;
+    const float value00 = field.heights(offset);
+    const float value10 = field.heights(offset + 1);
+    const float value01 = field.heights(offset + field.nx);
+    const float value11 = field.heights(offset + field.nx + 1);
+    if (!terrain_float_is_normal_or_positive_zero(value00) ||
+        !terrain_float_is_normal_or_positive_zero(value10) ||
+        !terrain_float_is_normal_or_positive_zero(value01) ||
+        !terrain_float_is_normal_or_positive_zero(value11)) {
+        return false;
+    }
+    h00 = static_cast<double>(value00);
+    h10 = static_cast<double>(value10);
+    h01 = static_cast<double>(value01);
+    h11 = static_cast<double>(value11);
+    return true;
+}
+
+static inline bool terrain_v2_round_output(double value, float& output)
+{
+    if (!terrain_double_is_finite(value)) {
+        return false;
+    }
+    const volatile double materialized = value;
+    const volatile float rounded = static_cast<float>(materialized);
+    if (!terrain_float_is_finite(rounded)) {
+        return false;
+    }
+    output = terrain_runtime_canonicalize_output(rounded);
+    return true;
+}
+
+// Internal hot path. The caller must already have established that `field`
+// is a structurally valid G1HF/v2 heightfield.
+static inline float terrain_heightfield_sample_v2_prevalidated(
+    const heightfield& field, float x, float z)
+{
+    heightfield_cell cell = {};
+    if (!terrain_v2_locate_cell(field, x, z, cell)) {
+        return field.exterior_height;
+    }
+
+    double h00 = 0.0;
+    double h10 = 0.0;
+    double h01 = 0.0;
+    double h11 = 0.0;
+    if (!terrain_v2_cell_heights(
+            field, cell, h00, h10, h01, h11)) {
+        return field.exterior_height;
+    }
+
+    double value = 0.0;
+    if (cell.tx >= cell.tz) {
+        const volatile double difference_x = h10 - h00;
+        const volatile double x_term = cell.tx * difference_x;
+        const volatile double first_sum = h00 + x_term;
+        const volatile double difference_z = h11 - h10;
+        const volatile double z_term = cell.tz * difference_z;
+        const volatile double final_sum = first_sum + z_term;
+        value = final_sum;
+    } else {
+        const volatile double difference_x = h11 - h01;
+        const volatile double x_term = cell.tx * difference_x;
+        const volatile double first_sum = h00 + x_term;
+        const volatile double difference_z = h01 - h00;
+        const volatile double z_term = cell.tz * difference_z;
+        const volatile double final_sum = first_sum + z_term;
+        value = final_sum;
+    }
+
+    float output = field.exterior_height;
+    return terrain_v2_round_output(value, output)
+        ? output
+        : field.exterior_height;
+}
+
+static inline float heightfield_sample_v2(
+    const heightfield& field, float x, float z)
+{
+    if (field.version != 2 || !terrain_heightfield_is_queryable(field)) {
+        return field.exterior_height;
+    }
+    return terrain_heightfield_sample_v2_prevalidated(field, x, z);
+}
+
+static inline float heightfield_sample_versioned(
+    const heightfield& field, float x, float z)
+{
+    if (!terrain_heightfield_is_queryable(field)) {
+        return field.exterior_height;
+    }
+    if (field.version == 1) {
+        return heightfield_sample_v1_legacy(field, x, z);
+    }
+    if (field.version == 2) {
+        return terrain_heightfield_sample_v2_prevalidated(field, x, z);
+    }
+    return field.exterior_height;
+}
+
+static inline vec3 heightfield_normal(
+    const heightfield& field, float x, float z)
+{
+    const vec3 up(0.0f, 1.0f, 0.0f);
+    if (!terrain_heightfield_is_queryable(field) || field.version != 2) {
+        return up;
+    }
+
+    heightfield_cell cell = {};
+    if (!terrain_v2_locate_cell(field, x, z, cell)) {
+        return up;
+    }
+    double h00 = 0.0;
+    double h10 = 0.0;
+    double h01 = 0.0;
+    double h11 = 0.0;
+    if (!terrain_v2_cell_heights(
+            field, cell, h00, h10, h01, h11)) {
+        return up;
+    }
+
+    double slope_x = 0.0;
+    double slope_z = 0.0;
+    if (cell.tx >= cell.tz) {
+        const volatile double difference_x = h10 - h00;
+        const volatile double difference_z = h11 - h10;
+        const volatile double divided_x =
+            difference_x / static_cast<double>(field.cell_size);
+        const volatile double divided_z =
+            difference_z / static_cast<double>(field.cell_size);
+        slope_x = divided_x;
+        slope_z = divided_z;
+    } else {
+        const volatile double difference_x = h11 - h01;
+        const volatile double difference_z = h01 - h00;
+        const volatile double divided_x =
+            difference_x / static_cast<double>(field.cell_size);
+        const volatile double divided_z =
+            difference_z / static_cast<double>(field.cell_size);
+        slope_x = divided_x;
+        slope_z = divided_z;
+    }
+    if (!terrain_double_is_finite(slope_x) ||
+        !terrain_double_is_finite(slope_z)) {
+        return up;
+    }
+
+    const volatile double normal_x = -slope_x;
+    const volatile double normal_y = 1.0;
+    const volatile double normal_z = -slope_z;
+    const double absolute_x = fabs(normal_x);
+    const double absolute_y = fabs(normal_y);
+    const double absolute_z = fabs(normal_z);
+    const double maximum_xy =
+        absolute_x > absolute_y ? absolute_x : absolute_y;
+    const double maximum =
+        maximum_xy > absolute_z ? maximum_xy : absolute_z;
+    if (!terrain_double_is_finite(maximum) || maximum <= 0.0) {
+        return up;
+    }
+
+    const volatile double scaled_x = normal_x / maximum;
+    const volatile double scaled_y = normal_y / maximum;
+    const volatile double scaled_z = normal_z / maximum;
+    const volatile double square_x = scaled_x * scaled_x;
+    const volatile double square_y = scaled_y * scaled_y;
+    const volatile double square_z = scaled_z * scaled_z;
+    const volatile double first_sum = square_x + square_y;
+    const volatile double square_sum = first_sum + square_z;
+    if (!terrain_double_is_finite(square_sum) || square_sum <= 0.0) {
+        return up;
+    }
+    const volatile double length = sqrt(square_sum);
+    if (!terrain_double_is_finite(length) || length <= 0.0) {
+        return up;
+    }
+    const volatile double unit_x = scaled_x / length;
+    const volatile double unit_y = scaled_y / length;
+    const volatile double unit_z = scaled_z / length;
+    float output_x = 0.0f;
+    float output_y = 0.0f;
+    float output_z = 0.0f;
+    if (!terrain_v2_round_output(unit_x, output_x) ||
+        !terrain_v2_round_output(unit_y, output_y) ||
+        !terrain_v2_round_output(unit_z, output_z)) {
+        return up;
+    }
+    return vec3(output_x, output_y, output_z);
 }
 
 static inline bool terrain_centerline_inputs_are_valid(
@@ -624,7 +1254,8 @@ static inline vec3 terrain_centerline_point_at_arc(
 
 static inline bool terrain_heightfield_is_queryable(const heightfield& field)
 {
-    if (field.nx < 2 || field.nz < 2 ||
+    if ((field.version != 1 && field.version != 2) ||
+        field.nx < 2 || field.nz < 2 ||
         field.heights.data == NULL ||
         !terrain_float_is_finite(field.origin_x) ||
         !terrain_float_is_finite(field.origin_z) ||
@@ -635,7 +1266,23 @@ static inline bool terrain_heightfield_is_queryable(const heightfield& field)
     }
     const int64_t expected_size =
         static_cast<int64_t>(field.nx) * static_cast<int64_t>(field.nz);
-    return expected_size == static_cast<int64_t>(field.heights.size);
+    if (expected_size != static_cast<int64_t>(field.heights.size)) {
+        return false;
+    }
+    if (field.version == 2 &&
+        (!terrain_float_is_normal_or_positive_zero(field.origin_x) ||
+         !terrain_float_is_normal_or_positive_zero(field.origin_z) ||
+         !terrain_float_is_positive_normal(field.cell_size) ||
+         !terrain_float_is_normal_or_positive_zero(field.exterior_height) ||
+         !terrain_v2_runtime_axis_is_valid(
+             field.origin_x, static_cast<uint32_t>(field.nx),
+             field.cell_size) ||
+         !terrain_v2_runtime_axis_is_valid(
+             field.origin_z, static_cast<uint32_t>(field.nz),
+             field.cell_size))) {
+        return false;
+    }
+    return true;
 }
 
 struct terrain_centerline_snapshot

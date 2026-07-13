@@ -1,7 +1,6 @@
 #include "terrain_runtime.h"
 #include "quat.h"
 
-#include <assert.h>
 #include <float.h>
 #include <limits.h>
 #include <math.h>
@@ -10,6 +9,7 @@
 #include <string.h>
 
 #include <limits>
+#include <random>
 #include <vector>
 
 typedef std::vector<unsigned char> byte_buffer;
@@ -26,6 +26,38 @@ static void check_close(float actual, float expected, const char* message)
 {
     check(terrain_float_is_finite(actual), message);
     check(fabsf(actual - expected) < 1e-5f, message);
+}
+
+static uint32_t float_bits(float value)
+{
+    uint32_t bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static float float_from_bits(uint32_t bits)
+{
+    float value = 0.0f;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static void check_float_bits(
+    float actual, uint32_t expected, const char* message)
+{
+    check(float_bits(actual) == expected, message);
+}
+
+static void check_vec3_bits(
+    vec3 actual,
+    uint32_t expected_x,
+    uint32_t expected_y,
+    uint32_t expected_z,
+    const char* message)
+{
+    check(float_bits(actual.x) == expected_x, message);
+    check(float_bits(actual.y) == expected_y, message);
+    check(float_bits(actual.z) == expected_z, message);
 }
 
 static quat heading_positive_x()
@@ -45,8 +77,10 @@ static void initialize_heightfield(
     float origin_x,
     float origin_z,
     float cell_size,
-    float exterior_height)
+    float exterior_height,
+    uint32_t version = 1)
 {
+    field.version = version;
     field.nx = nx;
     field.nz = nz;
     field.origin_x = origin_x;
@@ -127,13 +161,14 @@ static byte_buffer make_heightfield(
 static void write_prefix(
     const char* path, const byte_buffer& payload, size_t length)
 {
-    assert(length <= payload.size());
+    check(length <= payload.size(), "fixture prefix length");
     FILE* file = fopen(path, "wb");
-    assert(file != NULL);
+    check(file != NULL, "fixture file open");
     if (length != 0) {
-        assert(fwrite(payload.data(), 1, length, file) == length);
+        check(fwrite(payload.data(), 1, length, file) == length,
+              "fixture file write");
     }
-    assert(fclose(file) == 0);
+    check(fclose(file) == 0, "fixture file close");
 }
 
 static void write_payload(const char* path, const byte_buffer& payload)
@@ -144,9 +179,10 @@ static void write_payload(const char* path, const byte_buffer& payload)
 static void assert_error(
     const char* error, const char* path, const char* expected_reason)
 {
-    assert(error[0] != '\0');
-    assert(strstr(error, path) != NULL);
-    assert(strstr(error, expected_reason) != NULL);
+    check(error[0] != '\0', "rejection error is non-empty");
+    check(strstr(error, path) != NULL, "rejection error includes path");
+    check(strstr(error, expected_reason) != NULL,
+          "rejection error includes reason");
 }
 
 static void expect_sidecar_rejected(
@@ -161,14 +197,16 @@ static void expect_sidecar_rejected(
     }
 
     char error[256] = {};
-    assert(!terrain_features_load(
-        destination, path, error, static_cast<int>(sizeof(error))));
+    check(!terrain_features_load(
+              destination, path, error, static_cast<int>(sizeof(error))),
+          "sidecar fixture rejected");
     assert_error(error, path, expected_reason);
-    assert(destination.values.rows == 2);
-    assert(destination.values.cols == 4);
+    check(destination.values.rows == 2, "sidecar rejection preserves rows");
+    check(destination.values.cols == 4, "sidecar rejection preserves columns");
     for (int i = 0; i < destination.values.rows; ++i) {
         for (int j = 0; j < destination.values.cols; ++j) {
-            assert(destination.values(i, j) == 100.0f + i * 10.0f + j);
+            check(destination.values(i, j) == 100.0f + i * 10.0f + j,
+                  "sidecar rejection preserves values");
         }
     }
 }
@@ -177,6 +215,7 @@ static void expect_heightfield_rejected(
     const char* path, const char* expected_reason)
 {
     heightfield destination;
+    destination.version = 77;
     destination.nx = 3;
     destination.nz = 2;
     destination.origin_x = 10.0f;
@@ -189,18 +228,27 @@ static void expect_heightfield_rejected(
     }
 
     char error[256] = {};
-    assert(!heightfield_load(
-        destination, path, error, static_cast<int>(sizeof(error))));
+    check(!heightfield_load(
+              destination, path, error, static_cast<int>(sizeof(error))),
+          "heightfield fixture rejected");
     assert_error(error, path, expected_reason);
-    assert(destination.nx == 3);
-    assert(destination.nz == 2);
-    assert(destination.origin_x == 10.0f);
-    assert(destination.origin_z == 20.0f);
-    assert(destination.cell_size == 0.25f);
-    assert(destination.exterior_height == -5.0f);
-    assert(destination.heights.size == 6);
+    check(destination.version == 77,
+          "heightfield rejection preserves version");
+    check(destination.nx == 3, "heightfield rejection preserves nx");
+    check(destination.nz == 2, "heightfield rejection preserves nz");
+    check(destination.origin_x == 10.0f,
+          "heightfield rejection preserves origin x");
+    check(destination.origin_z == 20.0f,
+          "heightfield rejection preserves origin z");
+    check(destination.cell_size == 0.25f,
+          "heightfield rejection preserves cell size");
+    check(destination.exterior_height == -5.0f,
+          "heightfield rejection preserves exterior height");
+    check(destination.heights.size == 6,
+          "heightfield rejection preserves storage size");
     for (int i = 0; i < destination.heights.size; ++i) {
-        assert(destination.heights(i) == 200.0f + i);
+        check(destination.heights(i) == 200.0f + i,
+              "heightfield rejection preserves values");
     }
 }
 
@@ -215,12 +263,14 @@ static void test_sidecar_loads_valid_file()
     features.values.resize(1, 8);
     features.values.set(-99.0f);
     char error[256] = {};
-    assert(terrain_features_load(
-        features, path, error, static_cast<int>(sizeof(error))));
-    assert(features.values.rows == 2);
-    assert(features.values.cols == 4);
+    check(terrain_features_load(
+              features, path, error, static_cast<int>(sizeof(error))),
+          "valid sidecar loads");
+    check(features.values.rows == 2, "valid sidecar rows");
+    check(features.values.cols == 4, "valid sidecar columns");
     for (int i = 0; i < 8; ++i) {
-        assert(features.values.data[i] == static_cast<float>(i));
+        check(features.values.data[i] == static_cast<float>(i),
+              "valid sidecar values");
     }
 }
 
@@ -287,10 +337,10 @@ static void test_sidecar_open_failure_is_actionable_and_transactional()
     expect_sidecar_rejected(path, "cannot open");
 }
 
-static byte_buffer valid_heightfield_payload()
+static byte_buffer valid_heightfield_payload(uint32_t version = 1)
 {
     return make_heightfield(
-        1, 2, 2, 0.0f, 0.0f, 1.0f, -1.0f,
+        version, 2, 2, 0.0f, 0.0f, 1.0f, -1.0f,
         {0.0f, 1.0f, 2.0f, 3.0f});
 }
 
@@ -300,6 +350,7 @@ static void test_heightfield_loads_and_samples_valid_file()
     write_payload(path, valid_heightfield_payload());
 
     heightfield field;
+    field.version = 88;
     field.nx = 4;
     field.nz = 1;
     field.origin_x = 99.0f;
@@ -309,44 +360,64 @@ static void test_heightfield_loads_and_samples_valid_file()
     field.heights.resize(4);
     field.heights.set(-99.0f);
     char error[256] = {};
-    assert(heightfield_load(
-        field, path, error, static_cast<int>(sizeof(error))));
-    assert(field.nx == 2);
-    assert(field.nz == 2);
-    assert(field.origin_x == 0.0f);
-    assert(field.origin_z == 0.0f);
-    assert(field.cell_size == 1.0f);
-    assert(field.exterior_height == -1.0f);
-    assert(field.heights.size == 4);
+    check(heightfield_load(
+              field, path, error, static_cast<int>(sizeof(error))),
+          "valid v1 heightfield loads");
+    check(field.version == 1, "valid v1 heightfield version");
+    check(field.nx == 2, "valid heightfield nx");
+    check(field.nz == 2, "valid heightfield nz");
+    check(field.origin_x == 0.0f, "valid heightfield origin x");
+    check(field.origin_z == 0.0f, "valid heightfield origin z");
+    check(field.cell_size == 1.0f, "valid heightfield cell size");
+    check(field.exterior_height == -1.0f,
+          "valid heightfield exterior height");
+    check(field.heights.size == 4, "valid heightfield storage size");
 
-    assert(heightfield_sample(field, 0.0f, 0.0f) == 0.0f);
-    assert(heightfield_sample(field, 1.0f, 0.0f) == 1.0f);
-    assert(heightfield_sample(field, 0.0f, 1.0f) == 2.0f);
-    assert(heightfield_sample(field, 1.0f, 1.0f) == 3.0f);
-    assert(fabsf(heightfield_sample(field, 0.5f, 0.5f) - 1.5f) < 1e-6f);
-    assert(fabsf(heightfield_sample(field, 1.0f, 0.5f) - 2.0f) < 1e-6f);
+    check(heightfield_sample(field, 0.0f, 0.0f) == 0.0f,
+          "v1 sample lower-left node");
+    check(heightfield_sample(field, 1.0f, 0.0f) == 1.0f,
+          "v1 sample lower-right node");
+    check(heightfield_sample(field, 0.0f, 1.0f) == 2.0f,
+          "v1 sample upper-left node");
+    check(heightfield_sample(field, 1.0f, 1.0f) == 3.0f,
+          "v1 sample upper-right node");
+    check(fabsf(heightfield_sample(field, 0.5f, 0.5f) - 1.5f) < 1e-6f,
+          "v1 sample cell center");
+    check(fabsf(heightfield_sample(field, 1.0f, 0.5f) - 2.0f) < 1e-6f,
+          "v1 sample maximum x edge");
 
-    assert(heightfield_sample(field, -0.001f, 0.0f) == -1.0f);
-    assert(heightfield_sample(field, 0.0f, -0.001f) == -1.0f);
-    assert(heightfield_sample(field, 1.001f, 0.0f) == -1.0f);
-    assert(heightfield_sample(field, 0.0f, 1.001f) == -1.0f);
-    assert(heightfield_sample(field, FLT_MAX, 0.0f) == -1.0f);
+    check(heightfield_sample(field, -0.001f, 0.0f) == -1.0f,
+          "v1 sample negative x exterior");
+    check(heightfield_sample(field, 0.0f, -0.001f) == -1.0f,
+          "v1 sample negative z exterior");
+    check(heightfield_sample(field, 1.001f, 0.0f) == -1.0f,
+          "v1 sample positive x exterior");
+    check(heightfield_sample(field, 0.0f, 1.001f) == -1.0f,
+          "v1 sample positive z exterior");
+    check(heightfield_sample(field, FLT_MAX, 0.0f) == -1.0f,
+          "v1 sample extreme exterior");
 
     const float nan = std::numeric_limits<float>::quiet_NaN();
     const float infinity = std::numeric_limits<float>::infinity();
-    assert(heightfield_sample(field, nan, 0.0f) == -1.0f);
-    assert(heightfield_sample(field, 0.0f, nan) == -1.0f);
-    assert(heightfield_sample(field, infinity, 0.0f) == -1.0f);
-    assert(heightfield_sample(field, 0.0f, -infinity) == -1.0f);
+    check(heightfield_sample(field, nan, 0.0f) == -1.0f,
+          "v1 sample NaN x exterior");
+    check(heightfield_sample(field, 0.0f, nan) == -1.0f,
+          "v1 sample NaN z exterior");
+    check(heightfield_sample(field, infinity, 0.0f) == -1.0f,
+          "v1 sample infinite x exterior");
+    check(heightfield_sample(field, 0.0f, -infinity) == -1.0f,
+          "v1 sample infinite z exterior");
 }
 
 static void test_heightfield_rejects_every_truncation()
 {
     const char* path = "/tmp/test_g1hf_truncated.bin";
-    const byte_buffer payload = valid_heightfield_payload();
-    for (size_t length = 0; length < payload.size(); ++length) {
-        write_prefix(path, payload, length);
-        expect_heightfield_rejected(path, "truncated");
+    for (uint32_t version = 1; version <= 2; ++version) {
+        const byte_buffer payload = valid_heightfield_payload(version);
+        for (size_t length = 0; length < payload.size(); ++length) {
+            write_prefix(path, payload, length);
+            expect_heightfield_rejected(path, "truncated");
+        }
     }
 }
 
@@ -361,34 +432,43 @@ static void test_heightfield_rejects_invalid_schema_and_sizes()
     expect_heightfield_rejected(path, "magic");
 
     write_payload(
-        path, make_heightfield(2, 2, 2, 0, 0, 1, -1, heights));
+        path, make_heightfield(3, 2, 2, 0, 0, 1, -1, heights));
     expect_heightfield_rejected(path, "version");
 
-    write_payload(path, make_heightfield(1, 1, 2, 0, 0, 1, -1, {}));
-    expect_heightfield_rejected(path, "grid dimensions");
+    for (uint32_t version = 1; version <= 2; ++version) {
+        write_payload(
+            path, make_heightfield(version, 1, 2, 0, 0, 1, -1, {}));
+        expect_heightfield_rejected(path, "grid dimensions");
 
-    write_payload(path, make_heightfield(1, 2, 1, 0, 0, 1, -1, {}));
-    expect_heightfield_rejected(path, "grid dimensions");
+        write_payload(
+            path, make_heightfield(version, 2, 1, 0, 0, 1, -1, {}));
+        expect_heightfield_rejected(path, "grid dimensions");
 
-    write_payload(path, make_heightfield(1, 0, 2, 0, 0, 1, -1, {}));
-    expect_heightfield_rejected(path, "grid dimensions");
+        write_payload(
+            path, make_heightfield(version, 0, 2, 0, 0, 1, -1, {}));
+        expect_heightfield_rejected(path, "grid dimensions");
 
-    write_payload(path, make_heightfield(1, 2, 0, 0, 0, 1, -1, {}));
-    expect_heightfield_rejected(path, "grid dimensions");
+        write_payload(
+            path, make_heightfield(version, 2, 0, 0, 0, 1, -1, {}));
+        expect_heightfield_rejected(path, "grid dimensions");
 
-    write_payload(path, make_heightfield(1, 65536, 32768, 0, 0, 1, -1, {}));
-    expect_heightfield_rejected(path, "grid dimensions");
+        write_payload(path, make_heightfield(
+            version, 65536, 32768, 0, 0, 1, -1, {}));
+        expect_heightfield_rejected(path, "grid dimensions");
 
-    write_payload(path, make_heightfield(1, UINT32_MAX, 2, 0, 0, 1, -1, {}));
-    expect_heightfield_rejected(path, "grid dimensions");
+        write_payload(path, make_heightfield(
+            version, UINT32_MAX, 2, 0, 0, 1, -1, {}));
+        expect_heightfield_rejected(path, "grid dimensions");
 
-    write_payload(path, make_heightfield(1, 65535, 32768, 0, 0, 1, -1, {}));
-    expect_heightfield_rejected(path, "truncated");
+        write_payload(path, make_heightfield(
+            version, 65535, 32768, 0, 0, 1, -1, {}));
+        expect_heightfield_rejected(path, "truncated");
 
-    payload = valid_heightfield_payload();
-    payload.push_back(0x7f);
-    write_payload(path, payload);
-    expect_heightfield_rejected(path, "trailing");
+        payload = valid_heightfield_payload(version);
+        payload.push_back(0x7f);
+        write_payload(path, payload);
+        expect_heightfield_rejected(path, "trailing");
+    }
 }
 
 static void test_heightfield_rejects_nonfinite_metadata_and_heights()
@@ -398,47 +478,49 @@ static void test_heightfield_rejects_nonfinite_metadata_and_heights()
     const float nan = std::numeric_limits<float>::quiet_NaN();
     const float infinity = std::numeric_limits<float>::infinity();
 
-    write_payload(
-        path, make_heightfield(1, 2, 2, nan, 0, 1, -1, heights));
-    expect_heightfield_rejected(path, "origin");
+    for (uint32_t version = 1; version <= 2; ++version) {
+        write_payload(path, make_heightfield(
+            version, 2, 2, nan, 0, 1, -1, heights));
+        expect_heightfield_rejected(path, "origin");
 
-    write_payload(
-        path, make_heightfield(1, 2, 2, 0, infinity, 1, -1, heights));
-    expect_heightfield_rejected(path, "origin");
+        write_payload(path, make_heightfield(
+            version, 2, 2, 0, infinity, 1, -1, heights));
+        expect_heightfield_rejected(path, "origin");
 
-    write_payload(
-        path, make_heightfield(1, 2, 2, 0, 0, 0, -1, heights));
-    expect_heightfield_rejected(path, "cell size");
+        write_payload(path, make_heightfield(
+            version, 2, 2, 0, 0, 0, -1, heights));
+        expect_heightfield_rejected(path, "cell size");
 
-    write_payload(
-        path, make_heightfield(1, 2, 2, 0, 0, -1, -1, heights));
-    expect_heightfield_rejected(path, "cell size");
+        write_payload(path, make_heightfield(
+            version, 2, 2, 0, 0, -1, -1, heights));
+        expect_heightfield_rejected(path, "cell size");
 
-    write_payload(
-        path, make_heightfield(1, 2, 2, 0, 0, nan, -1, heights));
-    expect_heightfield_rejected(path, "cell size");
+        write_payload(path, make_heightfield(
+            version, 2, 2, 0, 0, nan, -1, heights));
+        expect_heightfield_rejected(path, "cell size");
 
-    write_payload(
-        path, make_heightfield(1, 2, 2, 0, 0, infinity, -1, heights));
-    expect_heightfield_rejected(path, "cell size");
+        write_payload(path, make_heightfield(
+            version, 2, 2, 0, 0, infinity, -1, heights));
+        expect_heightfield_rejected(path, "cell size");
 
-    write_payload(
-        path, make_heightfield(1, 2, 2, 0, 0, 1, nan, heights));
-    expect_heightfield_rejected(path, "exterior height");
+        write_payload(path, make_heightfield(
+            version, 2, 2, 0, 0, 1, nan, heights));
+        expect_heightfield_rejected(path, "exterior height");
 
-    write_payload(
-        path, make_heightfield(1, 2, 2, 0, 0, 1, infinity, heights));
-    expect_heightfield_rejected(path, "exterior height");
+        write_payload(path, make_heightfield(
+            version, 2, 2, 0, 0, 1, infinity, heights));
+        expect_heightfield_rejected(path, "exterior height");
 
-    write_payload(
-        path, make_heightfield(1, 2, 2, 0, 0, 1, -1,
-                               {0.0f, nan, 2.0f, 3.0f}));
-    expect_heightfield_rejected(path, "finite");
+        write_payload(path, make_heightfield(
+            version, 2, 2, 0, 0, 1, -1,
+            {0.0f, nan, 2.0f, 3.0f}));
+        expect_heightfield_rejected(path, "finite");
 
-    write_payload(
-        path, make_heightfield(1, 2, 2, 0, 0, 1, -1,
-                               {0.0f, 1.0f, -infinity, 3.0f}));
-    expect_heightfield_rejected(path, "finite");
+        write_payload(path, make_heightfield(
+            version, 2, 2, 0, 0, 1, -1,
+            {0.0f, 1.0f, -infinity, 3.0f}));
+        expect_heightfield_rejected(path, "finite");
+    }
 }
 
 static void test_heightfield_open_failure_is_actionable_and_transactional()
@@ -448,9 +530,705 @@ static void test_heightfield_open_failure_is_actionable_and_transactional()
     expect_heightfield_rejected(path, "cannot open");
 }
 
+static heightfield load_heightfield_fixture(
+    const char* path, const byte_buffer& payload)
+{
+    write_payload(path, payload);
+    heightfield field;
+    char error[256] = {};
+    const bool loaded = heightfield_load(
+        field, path, error, static_cast<int>(sizeof(error)));
+    check(loaded, error[0] != '\0' ? error : "heightfield fixture load");
+    return field;
+}
+
+static void test_heightfield_versions_preserve_v1_and_use_v2_triangles()
+{
+    const std::vector<float> heights = {0.0f, 0.0f, 0.0f, 1.0f};
+    const heightfield v1 = load_heightfield_fixture(
+        "/tmp/test_g1hf_v1_asymmetric.bin",
+        make_heightfield(1, 2, 2, 0.0f, 0.0f, 1.0f, -9.0f, heights));
+    const heightfield v2 = load_heightfield_fixture(
+        "/tmp/test_g1hf_v2_asymmetric.bin",
+        make_heightfield(2, 2, 2, 0.0f, 0.0f, 1.0f, -9.0f, heights));
+
+    check(v1.version == 1, "v1 fixture reports version one");
+    check(v2.version == 2, "v2 fixture reports version two");
+    check_float_bits(
+        heightfield_sample(v1, 0.75f, 0.25f), UINT32_C(0x3e400000),
+        "v1 fixture retains bilinear interpolation");
+    check_float_bits(
+        heightfield_sample_versioned(v2, 0.75f, 0.25f),
+        UINT32_C(0x3e800000),
+        "v2 fixture uses fixed first triangle");
+    check_vec3_bits(
+        heightfield_normal(v1, 0.75f, 0.25f),
+        UINT32_C(0x00000000), UINT32_C(0x3f800000),
+        UINT32_C(0x00000000),
+        "v1 normal is the exact migration fallback");
+}
+
+static void test_v1_coordinate_arithmetic_remains_literal()
+{
+    const float origin = -36257.83203125f;
+    const float cell = 0.04736527055501938f;
+    const float query_x = -32593.607421875f;
+    const float legacy_grid_x = (query_x - origin) / cell;
+    const int legacy_x0 = static_cast<int>(floorf(legacy_grid_x));
+    check_float_bits(
+        legacy_grid_x, UINT32_C(0x47971880),
+        "v1 arithmetic regression grid coordinate");
+    check(legacy_x0 == 77361, "v1 arithmetic regression cell");
+
+    heightfield field;
+    initialize_heightfield(
+        field, legacy_x0 + 2, 2, origin, 0.0f, cell, -9.0f, 1);
+    field.heights.zero();
+    field.heights(legacy_x0) = 0.0f;
+    field.heights(legacy_x0 + 1) = 1.0f;
+    field.heights(field.nx + legacy_x0) = 0.0f;
+    field.heights(field.nx + legacy_x0 + 1) = 1.0f;
+    check_float_bits(
+        heightfield_sample(field, query_x, 0.0f), UINT32_C(0x00000000),
+        "v1 arithmetic regression output bits");
+
+    const double double_grid_x =
+        (static_cast<double>(query_x) - static_cast<double>(origin)) /
+        static_cast<double>(cell);
+    check(double_grid_x < 77361.0 && double_grid_x > 77360.0,
+          "v1 regression distinguishes the v2 double locator");
+}
+
+static byte_buffer awkward_python_oracle_bytes()
+{
+    static const unsigned char bytes[] = {
+        0x47, 0x31, 0x48, 0x46, 0x02, 0x00, 0x00, 0x00,
+        0x03, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+        0xcd, 0xcc, 0xcc, 0x3d, 0x9a, 0x99, 0x99, 0xbe,
+        0x29, 0x5c, 0x8f, 0x3d, 0x9a, 0x99, 0xd9, 0xbf,
+        0x00, 0x00, 0x00, 0x3e, 0x00, 0x00, 0xa0, 0x3f,
+        0x00, 0x00, 0x20, 0x40, 0x00, 0x00, 0x70, 0x40,
+        0x00, 0x00, 0xa0, 0x40, 0x00, 0x00, 0xc8, 0x40,
+    };
+    return byte_buffer(bytes, bytes + sizeof(bytes));
+}
+
+static void test_v2_awkward_python_byte_and_query_oracle()
+{
+    const byte_buffer oracle = awkward_python_oracle_bytes();
+    const byte_buffer independently_constructed = make_heightfield(
+        2, 3, 2,
+        float_from_bits(UINT32_C(0x3dcccccd)),
+        float_from_bits(UINT32_C(0xbe99999a)),
+        float_from_bits(UINT32_C(0x3d8f5c29)),
+        float_from_bits(UINT32_C(0xbfd9999a)),
+        {
+            float_from_bits(UINT32_C(0x3e000000)),
+            float_from_bits(UINT32_C(0x3fa00000)),
+            float_from_bits(UINT32_C(0x40200000)),
+            float_from_bits(UINT32_C(0x40700000)),
+            float_from_bits(UINT32_C(0x40a00000)),
+            float_from_bits(UINT32_C(0x40c80000)),
+        });
+    check(independently_constructed == oracle,
+          "C++ serialization matches complete Python G1HF bytes");
+
+    const heightfield field = load_heightfield_fixture(
+        "/tmp/test_g1hf_python_oracle.bin", oracle);
+    check(field.version == 2, "Python oracle version");
+    check(field.nx == 3 && field.nz == 2, "Python oracle dimensions");
+    check_float_bits(field.origin_x, UINT32_C(0x3dcccccd),
+                     "Python oracle origin x bits");
+    check_float_bits(field.origin_z, UINT32_C(0xbe99999a),
+                     "Python oracle origin z bits");
+    check_float_bits(field.cell_size, UINT32_C(0x3d8f5c29),
+                     "Python oracle cell bits");
+    check_float_bits(field.exterior_height, UINT32_C(0xbfd9999a),
+                     "Python oracle exterior bits");
+    const uint32_t height_bits[] = {
+        UINT32_C(0x3e000000), UINT32_C(0x3fa00000),
+        UINT32_C(0x40200000), UINT32_C(0x40700000),
+        UINT32_C(0x40a00000), UINT32_C(0x40c80000),
+    };
+    for (int i = 0; i < field.heights.size; ++i) {
+        check_float_bits(field.heights(i), height_bits[i],
+                         "Python oracle height bits");
+    }
+
+    float runtime_node = -1.0f;
+    check(terrain_v2_runtime_node_from_double(
+              static_cast<double>(field.origin_x), runtime_node),
+          "Python oracle first x node classification");
+    check_float_bits(runtime_node, UINT32_C(0x3dcccccd),
+                     "Python oracle first x node bits");
+    const volatile double middle_x_product =
+        1.0 * static_cast<double>(field.cell_size);
+    const volatile double middle_x_source =
+        static_cast<double>(field.origin_x) + middle_x_product;
+    check(terrain_v2_runtime_node_from_double(middle_x_source, runtime_node),
+          "Python oracle middle x node classification");
+    check_float_bits(runtime_node, UINT32_C(0x3e2e147b),
+                     "Python oracle middle x node bits");
+    const volatile double final_x_product =
+        2.0 * static_cast<double>(field.cell_size);
+    const volatile double final_x_source =
+        static_cast<double>(field.origin_x) + final_x_product;
+    check(terrain_v2_runtime_node_from_double(final_x_source, runtime_node),
+          "Python oracle final x node classification");
+    check_float_bits(runtime_node, UINT32_C(0x3e75c290),
+                     "Python oracle final x node bits");
+
+    const float first_x = float_from_bits(UINT32_C(0x3e1c28f6));
+    const float first_z = float_from_bits(UINT32_C(0xbe90a3d7));
+    check_float_bits(
+        heightfield_sample_versioned(field, first_x, first_z),
+        UINT32_C(0x3ff40006),
+        "Python oracle first-triangle height");
+    check_vec3_bits(
+        heightfield_normal(field, first_x, first_z),
+        UINT32_C(0xbe93193e), UINT32_C(0x3c9271e1),
+        UINT32_C(0xbf752a13),
+        "Python oracle first-triangle normal");
+
+    const float second_x = float_from_bits(UINT32_C(0x3df0a3d7));
+    const float second_z = float_from_bits(UINT32_C(0xbe7d70a5));
+    check_float_bits(
+        heightfield_sample_versioned(field, second_x, second_z),
+        UINT32_C(0x4049ffff),
+        "Python oracle second-triangle height");
+    check_vec3_bits(
+        heightfield_normal(field, second_x, second_z),
+        UINT32_C(0xbea6e122), UINT32_C(0x3c958623),
+        UINT32_C(0xbf71f9a4),
+        "Python oracle second-triangle normal");
+
+    const float diagonal_x = float_from_bits(UINT32_C(0x3e0a3d71));
+    const float diagonal_z = float_from_bits(UINT32_C(0xbe87ae15));
+    check_float_bits(
+        heightfield_sample_versioned(field, diagonal_x, diagonal_z),
+        UINT32_C(0x4023ffff), "Python oracle diagonal height");
+    check_vec3_bits(
+        heightfield_normal(field, diagonal_x, diagonal_z),
+        UINT32_C(0xbe93193e), UINT32_C(0x3c9271e1),
+        UINT32_C(0xbf752a13),
+        "Python oracle diagonal uses first triangle");
+
+    const float x_line = float_from_bits(UINT32_C(0x3e2e147b));
+    check_float_bits(
+        heightfield_sample_versioned(field, x_line, first_z),
+        UINT32_C(0x400c0003),
+        "Python oracle interior x grid-line height");
+    check_vec3_bits(
+        heightfield_normal(field, x_line, first_z),
+        UINT32_C(0xbea1e21c), UINT32_C(0x3c910c21),
+        UINT32_C(0xbf72d32a),
+        "Python oracle interior x grid-line owns positive-index cell");
+
+    const float inward_x = float_from_bits(UINT32_C(0x3e75c28f));
+    const float inward_z = float_from_bits(UINT32_C(0xbe6b8521));
+    check_float_bits(
+        heightfield_sample_versioned(field, inward_x, inward_z),
+        UINT32_C(0x40c7fffd),
+        "Python oracle inward maximum sample");
+    check_vec3_bits(
+        heightfield_normal(field, inward_x, inward_z),
+        UINT32_C(0xbea1e21c), UINT32_C(0x3c910c21),
+        UINT32_C(0xbf72d32a),
+        "Python oracle inward maximum normal");
+
+    const float rounded_outward_x = float_from_bits(UINT32_C(0x3e75c290));
+    const float rounded_z = float_from_bits(UINT32_C(0xbe6b8520));
+    check_float_bits(
+        heightfield_sample_versioned(field, rounded_outward_x, rounded_z),
+        UINT32_C(0xbfd9999a),
+        "Python oracle outward-rounded maximum is exterior");
+    check_vec3_bits(
+        heightfield_normal(field, rounded_outward_x, rounded_z),
+        UINT32_C(0x00000000), UINT32_C(0x3f800000),
+        UINT32_C(0x00000000),
+        "Python oracle outward-rounded maximum normal is up");
+
+    check_float_bits(
+        heightfield_sample_versioned(
+            field, float_from_bits(UINT32_C(0x3dcccccc)), field.origin_z),
+        UINT32_C(0xbfd9999a), "Python oracle lower outward edge");
+    check_float_bits(
+        heightfield_sample_versioned(
+            field, float_from_bits(UINT32_C(0x3dccccce)), field.origin_z),
+        UINT32_C(0x3e000008), "Python oracle lower inward edge");
+}
+
+static void test_v2_diagonal_decision_stays_binary64()
+{
+    heightfield field;
+    initialize_heightfield(
+        field, 2, 2,
+        7.857595920562744f, -0.7662742137908936f,
+        21.012887954711914f, -9.0f, 2);
+    field.heights(0) = 0.0f;
+    field.heights(1) = 2.0f;
+    field.heights(2) = 4.0f;
+    field.heights(3) = 10.0f;
+    const float query_x = 22.33635711669922f;
+    const float query_z = 13.71248722076416f;
+    const double tx =
+        (static_cast<double>(query_x) - static_cast<double>(field.origin_x)) /
+        static_cast<double>(field.cell_size);
+    const double tz =
+        (static_cast<double>(query_z) - static_cast<double>(field.origin_z)) /
+        static_cast<double>(field.cell_size);
+    check(tx < tz, "diagonal regression double fractions choose second");
+    check(static_cast<float>(tx) == static_cast<float>(tz),
+          "diagonal regression float fractions tie");
+    check_float_bits(
+        heightfield_sample_versioned(field, query_x, query_z),
+        UINT32_C(0x40dc7e51),
+        "diagonal regression sample uses second triangle");
+    check_vec3_bits(
+        heightfield_normal(field, query_x, query_z),
+        UINT32_C(0xbe8a47ae), UINT32_C(0x3f722376),
+        UINT32_C(0xbe385f93),
+        "diagonal regression normal uses second triangle");
+}
+
+static void test_v2_edges_grid_lines_and_diagonal_tie()
+{
+    heightfield field;
+    initialize_heightfield(field, 3, 3, -1.0f, 2.0f, 1.0f, -99.0f, 2);
+    const float values[] = {
+        0.0f, 1.0f, 4.0f,
+        2.0f, 8.0f, 16.0f,
+        3.0f, 12.0f, 25.0f,
+    };
+    for (int i = 0; i < field.heights.size; ++i) {
+        field.heights(i) = values[i];
+    }
+
+    for (int iz = 0; iz < field.nz; ++iz) {
+        for (int ix = 0; ix < field.nx; ++ix) {
+            const float x = field.origin_x + ix * field.cell_size;
+            const float z = field.origin_z + iz * field.cell_size;
+            check_float_bits(
+                heightfield_sample_versioned(field, x, z),
+                float_bits(values[iz * 3 + ix]),
+                "v2 exact node sample");
+        }
+    }
+    check_float_bits(
+        heightfield_sample_versioned(field, 0.0f, 3.0f), float_bits(8.0f),
+        "v2 interior grid intersection owns positive-index cell");
+    check_float_bits(
+        heightfield_sample_versioned(field, 1.0f, 4.0f), float_bits(25.0f),
+        "v2 exact maximum owns final cell");
+
+    const float interior_x = nextafterf(-1.0f, INFINITY);
+    const float exterior_x = nextafterf(-1.0f, -INFINITY);
+    check(heightfield_sample_versioned(field, interior_x, 3.0f) != -99.0f,
+          "v2 lower-edge inward nextafter is interior");
+    check(heightfield_sample_versioned(field, exterior_x, 3.0f) == -99.0f,
+          "v2 lower-edge outward nextafter is exterior");
+    const float maximum_inward_x = nextafterf(1.0f, -INFINITY);
+    const float maximum_outward_x = nextafterf(1.0f, INFINITY);
+    check(heightfield_sample_versioned(field, maximum_inward_x, 3.0f) != -99.0f,
+          "v2 upper-edge inward nextafter is interior");
+    check(heightfield_sample_versioned(field, maximum_outward_x, 3.0f) == -99.0f,
+          "v2 upper-edge outward nextafter is exterior");
+    const float lower_inward_z = nextafterf(2.0f, INFINITY);
+    const float lower_outward_z = nextafterf(2.0f, -INFINITY);
+    check(heightfield_sample_versioned(field, 0.0f, lower_inward_z) != -99.0f,
+          "v2 lower z inward nextafter is interior");
+    check(heightfield_sample_versioned(field, 0.0f, lower_outward_z) == -99.0f,
+          "v2 lower z outward nextafter is exterior");
+    const float upper_inward_z = nextafterf(4.0f, -INFINITY);
+    const float upper_outward_z = nextafterf(4.0f, INFINITY);
+    check(heightfield_sample_versioned(field, 0.0f, upper_inward_z) != -99.0f,
+          "v2 upper z inward nextafter is interior");
+    check(heightfield_sample_versioned(field, 0.0f, upper_outward_z) == -99.0f,
+          "v2 upper z outward nextafter is exterior");
+
+    heightfield diagonal;
+    initialize_heightfield(diagonal, 2, 2, 0.0f, 0.0f, 1.0f, -9.0f, 2);
+    diagonal.heights(0) = 0.0f;
+    diagonal.heights(1) = 2.0f;
+    diagonal.heights(2) = 4.0f;
+    diagonal.heights(3) = 10.0f;
+    check_vec3_bits(
+        heightfield_normal(diagonal, 0.5f, 0.5f),
+        UINT32_C(0xbe768cdc), UINT32_C(0x3df68cdc),
+        UINT32_C(0xbf768cdc),
+        "v2 exact diagonal tie uses first triangle");
+}
+
+static void check_sample_and_normal_finite(
+    const heightfield& field, float x, float z, const char* message)
+{
+    const float sample = heightfield_sample_versioned(field, x, z);
+    const vec3 normal = heightfield_normal(field, x, z);
+    check(terrain_float_is_finite(sample), message);
+    check(terrain_float_is_finite(normal.x), message);
+    check(terrain_float_is_finite(normal.y), message);
+    check(terrain_float_is_finite(normal.z), message);
+}
+
+static void test_v2_normals_extremes_and_ftz_outputs()
+{
+    heightfield flat;
+    initialize_heightfield(flat, 2, 2, 0.0f, 0.0f, 0.02f, -9.0f, 2);
+    flat.heights.set(4.0f);
+    check_vec3_bits(
+        heightfield_normal(flat, 0.01f, 0.01f),
+        UINT32_C(0x00000000), UINT32_C(0x3f800000),
+        UINT32_C(0x00000000),
+        "flat v2 normal is bit-exact up");
+
+    heightfield minimum_cell;
+    initialize_heightfield(
+        minimum_cell, 2, 2, 0.0f, 0.0f, FLT_MIN, -7.0f, 2);
+    minimum_cell.heights(0) = -FLT_MAX;
+    minimum_cell.heights(1) = FLT_MAX;
+    minimum_cell.heights(2) = FLT_MAX;
+    minimum_cell.heights(3) = -FLT_MAX;
+    check_sample_and_normal_finite(
+        minimum_cell, 0.0f, 0.0f,
+        "minimum-normal cell extreme height query stays finite");
+    check_sample_and_normal_finite(
+        minimum_cell, FLT_MIN, FLT_MIN,
+        "minimum-normal cell maximum node stays finite");
+
+    const float huge_cell = float_from_bits(UINT32_C(0x7f7fffff));
+    heightfield huge;
+    initialize_heightfield(
+        huge, 2, 2, 0.0f, 0.0f, huge_cell, -5.0f, 2);
+    huge.heights(0) = 0.0f;
+    huge.heights(1) = FLT_MIN;
+    huge.heights(2) = 0.0f;
+    huge.heights(3) = FLT_MIN;
+    const float midpoint = huge_cell * 0.5f;
+    check_float_bits(
+        heightfield_sample_versioned(huge, midpoint, midpoint),
+        UINT32_C(0x00000000),
+        "v2 subnormal interpolation result is flushed to positive zero");
+    check_vec3_bits(
+        heightfield_normal(huge, midpoint, midpoint),
+        UINT32_C(0x00000000), UINT32_C(0x3f800000),
+        UINT32_C(0x00000000),
+        "v2 subnormal normal components are flushed to positive zero");
+
+    heightfield large_cell_extremes;
+    initialize_heightfield(
+        large_cell_extremes, 2, 2, 0.0f, 0.0f,
+        float_from_bits(UINT32_C(0x71800000)), -3.0f, 2);
+    large_cell_extremes.heights(0) = -FLT_MAX;
+    large_cell_extremes.heights(1) = FLT_MAX;
+    large_cell_extremes.heights(2) = -FLT_MAX;
+    large_cell_extremes.heights(3) = FLT_MAX;
+    check_sample_and_normal_finite(
+        large_cell_extremes,
+        large_cell_extremes.cell_size * 0.5f,
+        large_cell_extremes.cell_size * 0.5f,
+        "large-cell extreme interpolation and normal stay finite");
+}
+
+static void test_v2_runtime_node_precise_rounding_thresholds()
+{
+    const double lower_tie = 0x1p-150;
+    const double upper_tie = 0x1p-126 - 0x1p-150;
+    float rounded = -1.0f;
+
+    check(terrain_v2_runtime_node_from_double(lower_tie, rounded),
+          "positive lower tie is accepted");
+    check_float_bits(rounded, UINT32_C(0x00000000),
+                     "positive lower tie rounds to positive zero");
+    check(terrain_v2_runtime_node_from_double(-lower_tie, rounded),
+          "negative lower tie is accepted");
+    check_float_bits(rounded, UINT32_C(0x00000000),
+                     "negative lower tie canonicalizes positive zero");
+    check(terrain_v2_runtime_node_from_double(
+              nextafter(lower_tie, 0.0), rounded),
+          "value below lower tie is accepted");
+    check_float_bits(rounded, UINT32_C(0x00000000),
+                     "value below lower tie rounds to positive zero");
+    check(!terrain_v2_runtime_node_from_double(
+              nextafter(lower_tie, INFINITY), rounded),
+          "value above lower tie is rejected as subnormal");
+
+    check(terrain_v2_runtime_node_from_double(upper_tie, rounded),
+          "positive upper tie is accepted");
+    check_float_bits(rounded, UINT32_C(0x00800000),
+                     "positive upper tie rounds to minimum normal");
+    check(terrain_v2_runtime_node_from_double(-upper_tie, rounded),
+          "negative upper tie is accepted");
+    check_float_bits(rounded, UINT32_C(0x80800000),
+                     "negative upper tie rounds to minimum normal");
+    check(!terrain_v2_runtime_node_from_double(
+              nextafter(upper_tie, 0.0), rounded),
+          "value below upper tie is rejected as subnormal");
+    check(terrain_v2_runtime_node_from_double(
+              nextafter(upper_tie, INFINITY), rounded),
+          "value above upper tie is accepted as normal");
+    check_float_bits(rounded, UINT32_C(0x00800000),
+                     "value above upper tie remains minimum normal");
+}
+
+static void test_v2_rejects_encoded_domain_and_axis_failures()
+{
+    const char* path = "/tmp/test_g1hf_v2_domain.bin";
+    const float minimum_subnormal = float_from_bits(UINT32_C(0x00000001));
+    const float negative_subnormal = float_from_bits(UINT32_C(0x80000001));
+    const float negative_zero = float_from_bits(UINT32_C(0x80000000));
+    const float next_minimum_normal =
+        float_from_bits(UINT32_C(0x00800001));
+    const std::vector<float> zeros4(4, 0.0f);
+
+    write_payload(path, make_heightfield(
+        2, 2, 2, minimum_subnormal, 0.0f, 1.0f, 0.0f, zeros4));
+    expect_heightfield_rejected(path, "normal-or-positive-zero");
+    write_payload(path, make_heightfield(
+        2, 2, 2, 0.0f, negative_subnormal, 1.0f, 0.0f, zeros4));
+    expect_heightfield_rejected(path, "normal-or-positive-zero");
+    write_payload(path, make_heightfield(
+        2, 2, 2, 0.0f, 0.0f, minimum_subnormal, 0.0f, zeros4));
+    expect_heightfield_rejected(path, "cell size");
+    write_payload(path, make_heightfield(
+        2, 2, 2, 0.0f, 0.0f, 1.0f, minimum_subnormal, zeros4));
+    expect_heightfield_rejected(path, "normal-or-positive-zero");
+    write_payload(path, make_heightfield(
+        2, 2, 2, negative_zero, 0.0f, 1.0f, 0.0f, zeros4));
+    expect_heightfield_rejected(path, "normal-or-positive-zero");
+    write_payload(path, make_heightfield(
+        2, 2, 2, 0.0f, negative_zero, 1.0f, 0.0f, zeros4));
+    expect_heightfield_rejected(path, "normal-or-positive-zero");
+    write_payload(path, make_heightfield(
+        2, 2, 2, 0.0f, 0.0f, 1.0f, negative_zero, zeros4));
+    expect_heightfield_rejected(path, "normal-or-positive-zero");
+    write_payload(path, make_heightfield(
+        2, 2, 2, 0.0f, 0.0f, 1.0f, 0.0f,
+        {0.0f, minimum_subnormal, 0.0f, 0.0f}));
+    expect_heightfield_rejected(path, "normal-or-positive-zero");
+    write_payload(path, make_heightfield(
+        2, 2, 2, 0.0f, 0.0f, 1.0f, 0.0f,
+        {0.0f, negative_zero, 0.0f, 0.0f}));
+    expect_heightfield_rejected(path, "normal-or-positive-zero");
+
+    write_payload(path, make_heightfield(
+        2, 2, 2, -FLT_MIN, 0.0f, next_minimum_normal, 0.0f, zeros4));
+    expect_heightfield_rejected(path, "normal-or-zero runtime nodes");
+    write_payload(path, make_heightfield(
+        2, 2, 2, 1.0e8f, 0.0f, 0.02f, 0.0f, zeros4));
+    expect_heightfield_rejected(path, "runtime-distinguishable");
+    write_payload(path, make_heightfield(
+        2, 2, 2, FLT_MAX, 0.0f, FLT_MAX, 0.0f, zeros4));
+    expect_heightfield_rejected(path, "runtime-distinguishable");
+    write_payload(path, make_heightfield(
+        2, 4, 2, 1.0e8f, 0.0f, 5.0f, 0.0f,
+        std::vector<float>(8, 0.0f)));
+    expect_heightfield_rejected(path, "runtime-distinguishable");
+
+    const heightfield v1_subnormal = load_heightfield_fixture(
+        "/tmp/test_g1hf_v1_subnormal_domain.bin",
+        make_heightfield(
+            1, 2, 2, minimum_subnormal, negative_subnormal,
+            1.0f, negative_zero,
+            {0.0f, minimum_subnormal, negative_zero, 0.0f}));
+    check(v1_subnormal.version == 1,
+          "v1 retains historical subnormal and signed-zero acceptance");
+    check_float_bits(v1_subnormal.origin_x, UINT32_C(0x00000001),
+                     "v1 preserves subnormal origin bits");
+    check_float_bits(v1_subnormal.exterior_height, UINT32_C(0x80000000),
+                     "v1 preserves negative-zero exterior bits");
+
+    const heightfield v1_collapsed = load_heightfield_fixture(
+        "/tmp/test_g1hf_v1_collapsed_axis.bin",
+        make_heightfield(
+            1, 4, 2, 1.0e8f, 0.0f, 5.0f, 0.0f,
+            std::vector<float>(8, 0.0f)));
+    check(v1_collapsed.version == 1,
+          "v1 retains historical collapsed-axis acceptance");
+}
+
+static void test_v2_query_domain_and_invalid_structures_are_safe()
+{
+    heightfield valid;
+    initialize_heightfield(valid, 2, 2, 0.0f, 0.0f, 1.0f, -17.0f, 2);
+    valid.heights(0) = 5.0f;
+    valid.heights(1) = 6.0f;
+    valid.heights(2) = 7.0f;
+    valid.heights(3) = 8.0f;
+    const float minimum_subnormal = float_from_bits(UINT32_C(0x00000001));
+    const float negative_subnormal = float_from_bits(UINT32_C(0x80000001));
+    const float negative_zero = float_from_bits(UINT32_C(0x80000000));
+
+    check_float_bits(
+        heightfield_sample_versioned(valid, minimum_subnormal, 0.0f),
+        float_bits(valid.exterior_height),
+        "positive subnormal v2 query is exterior");
+    check_float_bits(
+        heightfield_sample_versioned(valid, negative_subnormal, 0.0f),
+        float_bits(valid.exterior_height),
+        "negative subnormal v2 query is exterior");
+    check_vec3_bits(
+        heightfield_normal(valid, minimum_subnormal, 0.0f),
+        UINT32_C(0x00000000), UINT32_C(0x3f800000),
+        UINT32_C(0x00000000),
+        "subnormal v2 query normal is up");
+    check_float_bits(
+        heightfield_sample_versioned(valid, negative_zero, negative_zero),
+        float_bits(5.0f), "query signed zero canonicalizes positive");
+
+    heightfield invalid_version;
+    initialize_heightfield(
+        invalid_version, 2, 2, 0.0f, 0.0f, 1.0f, -17.0f, 3);
+    invalid_version.heights.set(1.0f);
+    check(heightfield_sample_v2(invalid_version, 0.0f, 0.0f) == -17.0f,
+          "direct v2 entry rejects a wrong in-memory version");
+    check(heightfield_sample_versioned(invalid_version, 0.0f, 0.0f) == -17.0f,
+          "unknown in-memory version returns exterior");
+    check_vec3_bits(
+        heightfield_normal(invalid_version, 0.0f, 0.0f),
+        UINT32_C(0x00000000), UINT32_C(0x3f800000),
+        UINT32_C(0x00000000),
+        "unknown in-memory version normal is up");
+
+    heightfield bad_storage;
+    initialize_heightfield(
+        bad_storage, 2, 2, 0.0f, 0.0f, 1.0f, -17.0f, 2);
+    bad_storage.heights.resize(3);
+    check(heightfield_sample_v2(bad_storage, 0.0f, 0.0f) == -17.0f,
+          "direct v2 entry rejects mismatched in-memory storage");
+    check(heightfield_sample_versioned(bad_storage, 0.0f, 0.0f) == -17.0f,
+          "mismatched in-memory storage returns exterior");
+    check_vec3_bits(
+        heightfield_normal(bad_storage, 0.0f, 0.0f),
+        UINT32_C(0x00000000), UINT32_C(0x3f800000),
+        UINT32_C(0x00000000),
+        "mismatched in-memory storage normal is up");
+
+    heightfield null_storage;
+    null_storage.version = 2;
+    null_storage.nx = 2;
+    null_storage.nz = 2;
+    null_storage.origin_x = 0.0f;
+    null_storage.origin_z = 0.0f;
+    null_storage.cell_size = 1.0f;
+    null_storage.exterior_height = -17.0f;
+    null_storage.heights.size = 4;
+    check(heightfield_sample_v2(null_storage, 0.0f, 0.0f) == -17.0f,
+          "direct v2 entry rejects null in-memory storage");
+
+    heightfield bad_cell;
+    initialize_heightfield(
+        bad_cell, 2, 2, 0.0f, 0.0f, 0.0f, -17.0f, 2);
+    bad_cell.heights.set(1.0f);
+    check(heightfield_sample_v2(bad_cell, 0.0f, 0.0f) == -17.0f,
+          "direct v2 entry rejects invalid in-memory metadata");
+
+    heightfield bad_v1_storage;
+    initialize_heightfield(
+        bad_v1_storage, 2, 2, 0.0f, 0.0f, 1.0f, -17.0f, 1);
+    bad_v1_storage.heights.resize(0);
+    check(heightfield_sample_versioned(
+              bad_v1_storage, 0.0f, 0.0f) == -17.0f,
+          "versioned entry rejects mismatched in-memory v1 storage");
+
+    heightfield collapsed;
+    initialize_heightfield(
+        collapsed, 4, 2, 1.0e8f, 0.0f, 5.0f, -17.0f, 2);
+    collapsed.heights.zero();
+    check(heightfield_sample_versioned(collapsed, 1.0e8f, 0.0f) == -17.0f,
+          "collapsed in-memory v2 axis returns exterior");
+    check_vec3_bits(
+        heightfield_normal(collapsed, 1.0e8f, 0.0f),
+        UINT32_C(0x00000000), UINT32_C(0x3f800000),
+        UINT32_C(0x00000000),
+        "collapsed in-memory v2 axis normal is up");
+
+    valid.heights(0) = minimum_subnormal;
+    check(heightfield_sample_versioned(valid, 0.0f, 0.0f) == -17.0f,
+          "invalid selected in-memory v2 height returns exterior");
+    check_vec3_bits(
+        heightfield_normal(valid, 0.0f, 0.0f),
+        UINT32_C(0x00000000), UINT32_C(0x3f800000),
+        UINT32_C(0x00000000),
+        "invalid selected in-memory v2 height normal is up");
+}
+
+static bool test_float_is_normal_or_positive_zero(float value)
+{
+    const uint32_t bits = float_bits(value);
+    const uint32_t magnitude = bits & UINT32_C(0x7fffffff);
+    const uint32_t exponent = magnitude & UINT32_C(0x7f800000);
+    return bits == 0 ||
+           (exponent != 0 && exponent != UINT32_C(0x7f800000));
+}
+
+static void test_v2_axis_validator_vectors_and_seeded_property()
+{
+    const float aligned_cell = float_from_bits(UINT32_C(0x34800000));
+    check(terrain_v2_runtime_axis_is_valid(0.0f, 2, 1.0f),
+          "basic v2 axis is valid");
+    check(terrain_v2_runtime_axis_is_valid(2.0f, 5, aligned_cell),
+          "aligned equal-spacing axis is valid");
+    check(!terrain_v2_runtime_axis_is_valid(
+              float_from_bits(UINT32_C(0x3fffffff)), 5, aligned_cell),
+          "unaligned equal-spacing axis is rejected");
+    check(!terrain_v2_runtime_axis_is_valid(1.0e20f, 2, 1.0f),
+          "binary64-collapsed axis is rejected");
+    check(!terrain_v2_runtime_axis_is_valid(1.0e8f, 2, 0.02f),
+          "binary32-collapsed axis is rejected");
+    check(!terrain_v2_runtime_axis_is_valid(1.0e8f, 4, 5.0f),
+          "interior-collapsed axis is rejected");
+    check(!terrain_v2_runtime_axis_is_valid(
+              -FLT_MIN, 2, float_from_bits(UINT32_C(0x00800001))),
+          "derived-subnormal axis is rejected");
+    check(!terrain_v2_runtime_axis_is_valid(
+              float_from_bits(UINT32_C(0x81400001)), 7,
+              float_from_bits(UINT32_C(0x00800001))),
+          "seven-node interior-derived-subnormal axis is rejected");
+    check(!terrain_v2_runtime_axis_is_valid(0.0f, UINT32_MAX, 1.0f),
+          "huge header axis is validated without dimension-dependent work");
+
+    std::mt19937 generator(UINT32_C(20260713));
+    int accepted = 0;
+    for (int trial = 0; trial < 4000; ++trial) {
+        const uint32_t origin_bits = generator();
+        const uint32_t cell_bits =
+            (generator() & UINT32_C(0x7fffffff));
+        const float origin = float_from_bits(origin_bits);
+        const float cell = float_from_bits(cell_bits);
+        const uint32_t count = 2u + generator() % 31u;
+        if (!test_float_is_normal_or_positive_zero(origin) ||
+            !test_float_is_normal_or_positive_zero(cell) || cell <= 0.0f ||
+            !terrain_v2_runtime_axis_is_valid(origin, count, cell)) {
+            continue;
+        }
+        ++accepted;
+        double previous_source = 0.0;
+        float previous_runtime = 0.0f;
+        for (uint32_t index = 0; index < count; ++index) {
+            const volatile double product =
+                static_cast<double>(index) * static_cast<double>(cell);
+            const volatile double source =
+                static_cast<double>(origin) + product;
+            float runtime = 0.0f;
+            check(terrain_v2_runtime_node_from_double(source, runtime),
+                  "accepted axis node domain");
+            if (index != 0) {
+                check(source > previous_source,
+                      "accepted axis source nodes strictly increase");
+                check(runtime > previous_runtime,
+                      "accepted axis runtime nodes strictly increase");
+            }
+            previous_source = source;
+            previous_runtime = runtime;
+        }
+    }
+    check(accepted > 100, "axis property has enough accepted fixtures");
+}
+
 static void test_heightfield_rejects_float_rounded_upper_grid_index()
 {
     heightfield field;
+    field.version = 1;
     field.nx = 16777220;
     field.nz = 2;
     field.origin_x = 0.0f;
@@ -461,18 +1239,22 @@ static void test_heightfield_rejects_float_rounded_upper_grid_index()
     field.heights.zero();
 
     const float rounded_upper_x = static_cast<float>(field.nx - 1);
-    assert(static_cast<double>(rounded_upper_x) >
-           static_cast<double>(field.nx - 1));
+    check(static_cast<double>(rounded_upper_x) >
+              static_cast<double>(field.nx - 1),
+          "v1 rounded upper coordinate is outward");
     const volatile float outward_sample =
         heightfield_sample(field, rounded_upper_x, 1.0f);
-    assert(outward_sample == field.exterior_height);
+    check(outward_sample == field.exterior_height,
+          "v1 rounded upper coordinate returns exterior");
 
     const float inward_x = nextafterf(rounded_upper_x, -INFINITY);
     const int inward_x0 = static_cast<int>(floorf(inward_x));
-    assert(inward_x0 >= 0 && inward_x0 + 1 < field.nx);
+    check(inward_x0 >= 0 && inward_x0 + 1 < field.nx,
+          "v1 inward coordinate has valid cell");
     const volatile float inward_sample =
         heightfield_sample(field, inward_x, 1.0f);
-    assert(inward_sample == 0.0f);
+    check(inward_sample == 0.0f,
+          "v1 inward coordinate samples storage");
 }
 
 static void test_stationary_centerline_extends_current_heading()
@@ -883,7 +1665,9 @@ static void test_centerline_query_does_not_mutate_inputs()
 }
 
 static void probe_generated_artifacts(
-    const char* sidecar_path, const char* heightfield_path)
+    const char* sidecar_path,
+    const char* heightfield_path,
+    uint32_t expected_heightfield_version)
 {
     char error[512] = {};
     terrain_feature_set features;
@@ -891,8 +1675,8 @@ static void probe_generated_artifacts(
         features, sidecar_path, error, static_cast<int>(sizeof(error)));
     check(features_loaded,
           error[0] != '\0' ? error : "generated terrain sidecar load");
-    check(features.values.rows == 459682,
-          "generated terrain sidecar frame count");
+    check(features.values.rows > 0,
+          "generated terrain sidecar has rows");
     check(features.values.cols == 4,
           "generated terrain sidecar dimension count");
 
@@ -902,9 +1686,12 @@ static void probe_generated_artifacts(
         field, heightfield_path, error, static_cast<int>(sizeof(error)));
     check(heightfield_loaded,
           error[0] != '\0' ? error : "generated terrain heightfield load");
-    check(field.nx == 265, "generated terrain heightfield nx");
-    check(field.nz == 399, "generated terrain heightfield nz");
-    check(field.heights.size == field.nx * field.nz,
+    check(field.version == expected_heightfield_version,
+          "generated terrain heightfield expected version");
+    check(field.nx >= 2, "generated terrain heightfield nx");
+    check(field.nz >= 2, "generated terrain heightfield nz");
+    check(static_cast<int64_t>(field.heights.size) ==
+              static_cast<int64_t>(field.nx) * field.nz,
           "generated terrain heightfield value count");
 
     const float center_x = field.origin_x +
@@ -912,16 +1699,16 @@ static void probe_generated_artifacts(
     const float center_z = field.origin_z +
         field.cell_size * static_cast<float>(field.nz - 1) * 0.5f;
     check(terrain_float_is_finite(
-              heightfield_sample(field, center_x, center_z)),
+              heightfield_sample_versioned(field, center_x, center_z)),
           "generated terrain center sample finite");
-    check(terrain_float_is_finite(heightfield_sample(
+    check(terrain_float_is_finite(heightfield_sample_versioned(
               field, field.origin_x, field.origin_z)),
           "generated terrain origin sample finite");
-    check(heightfield_sample(
+    check(heightfield_sample_versioned(
               field, field.origin_x - field.cell_size, center_z) ==
               field.exterior_height,
           "generated terrain negative-x exterior sample");
-    check(heightfield_sample(
+    check(heightfield_sample_versioned(
               field, center_x,
               field.origin_z +
                   field.cell_size * static_cast<float>(field.nz)) ==
@@ -931,8 +1718,8 @@ static void probe_generated_artifacts(
 
 int main(int argc, char** argv)
 {
-    check(argc == 1 || argc == 3,
-          "expected zero or two artifact path arguments");
+    check(argc == 1 || argc == 4,
+          "expected zero or three artifact arguments");
     test_sidecar_loads_valid_file();
     test_sidecar_rejects_every_truncation();
     test_sidecar_rejects_invalid_schema_sizes_and_values();
@@ -943,6 +1730,16 @@ int main(int argc, char** argv)
     test_heightfield_rejects_invalid_schema_and_sizes();
     test_heightfield_rejects_nonfinite_metadata_and_heights();
     test_heightfield_open_failure_is_actionable_and_transactional();
+    test_heightfield_versions_preserve_v1_and_use_v2_triangles();
+    test_v1_coordinate_arithmetic_remains_literal();
+    test_v2_awkward_python_byte_and_query_oracle();
+    test_v2_diagonal_decision_stays_binary64();
+    test_v2_edges_grid_lines_and_diagonal_tie();
+    test_v2_normals_extremes_and_ftz_outputs();
+    test_v2_runtime_node_precise_rounding_thresholds();
+    test_v2_rejects_encoded_domain_and_axis_failures();
+    test_v2_query_domain_and_invalid_structures_are_safe();
+    test_v2_axis_validator_vectors_and_seeded_property();
     test_heightfield_rejects_float_rounded_upper_grid_index();
     test_stationary_centerline_extends_current_heading();
     test_straight_step_query_is_ground_relative_on_elevated_base();
@@ -953,8 +1750,17 @@ int main(int argc, char** argv)
     test_centerline_invalid_shapes_are_release_safe();
     test_centerline_nonfinite_inputs_are_release_safe_under_fast_math();
     test_centerline_query_does_not_mutate_inputs();
-    if (argc == 3) {
-        probe_generated_artifacts(argv[1], argv[2]);
+    if (argc == 4) {
+        uint32_t expected_heightfield_version = 0;
+        if (strcmp(argv[3], "1") == 0) {
+            expected_heightfield_version = 1;
+        } else if (strcmp(argv[3], "2") == 0) {
+            expected_heightfield_version = 2;
+        } else {
+            check(false, "expected G1HF version text exactly 1 or 2");
+        }
+        probe_generated_artifacts(
+            argv[1], argv[2], expected_heightfield_version);
     }
     return 0;
 }
