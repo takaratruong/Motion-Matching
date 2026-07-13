@@ -929,7 +929,7 @@ g++ -std=c++17 -Wall -Wextra -Werror -pedantic \
   -lraylib -lGL -lm -lpthread -ldl -lrt -lX11
 ~~~
 
-Expected: all 7 Python tests pass and the strict C++ build exits 0 with no
+Expected: all 8 Python tests pass and the strict C++ build exits 0 with no
 warnings. Do not run a terrain-sampling rebuild in this task.
 
 - [ ] **Step 8: Commit only the baseline diagnostic boundary**
