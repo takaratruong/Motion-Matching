@@ -2748,9 +2748,11 @@ git commit -m "feat: sample G1HF v2 fixed triangles"
 **Files:**
 - Modify: `resources/g1_terrain_builder/schema.py:32-120`
 - Modify: `resources/g1_terrain_builder/database.py:104-329,383-454`
+- Modify: `resources/g1_terrain_builder/kinematics.py:221-231`
 - Modify: `resources/build_g1_terrain_database.py:55-83`
 - Modify: `tests/python/test_schema.py:23-37`
 - Modify: `tests/python/test_database_builder.py:53-398`
+- Modify: `tests/python/test_kinematics.py:55-88`
 
 **Interfaces:**
 - `HoldenClip.terrain_support: ndarray[float32]` has shape `(frames, 3)`.
@@ -2797,6 +2799,8 @@ add:
     def test_combination_preserves_support_rows_at_clip_boundaries(self):
         first = HoldenClip.empty(3, 1)
         second = HoldenClip.empty(2, 1)
+        first.terrain_features[:] = [10.0, 11.0, 12.0, 13.0]
+        second.terrain_features[:] = [20.0, 21.0, 22.0, 23.0]
         first.terrain_support[:] = [1.0, 2.0, 3.0]
         second.terrain_support[:] = [4.0, 5.0, 6.0]
         artifacts = combine_clips(
@@ -2806,11 +2810,20 @@ add:
             [1, 2, 3], [1, 2, 3], [1, 2, 3],
             [4, 5, 6], [4, 5, 6],
         ])
+        np.testing.assert_array_equal(artifacts.terrain_features, [
+            [10, 11, 12, 13], [10, 11, 12, 13], [10, 11, 12, 13],
+            [20, 21, 22, 23], [20, 21, 22, 23],
+        ])
 
     def test_support_rejects_bad_indices_and_nonfinite_heights(self):
         positions = np.zeros((2, 3, 3), np.float64)
         with self.assertRaisesRegex(ValueError, "support bone indices"):
             sample_terrain_support(positions, FlatTerrain(), 0, 1, 3)
+        for boolean in (True, np.bool_(False)):
+            with self.subTest(boolean=boolean):
+                with self.assertRaisesRegex(ValueError, "support bone indices"):
+                    sample_terrain_support(
+                        positions, FlatTerrain(), boolean, 1, 2)
 
         class BadTerrain:
             def height(self, x, z):
@@ -2818,6 +2831,23 @@ add:
 
         with self.assertRaisesRegex(ValueError, "finite"):
             sample_terrain_support(positions, BadTerrain(), 0, 1, 2)
+
+        class Float32OverflowTerrain:
+            def height(self, x, z):
+                return 1e300
+
+        with self.assertRaisesRegex(ValueError, "float32|finite"):
+            sample_terrain_support(
+                positions, Float32OverflowTerrain(), 0, 1, 2)
+~~~
+
+In the existing `test_convert_source_clip_prepends_simulation_bone`, require
+the direct constructor path to initialize sidecar rows before finalization:
+
+~~~python
+        self.assertEqual(clip.terrain_support.dtype, np.float32)
+        np.testing.assert_array_equal(
+            clip.terrain_support, np.zeros((5, 3), np.float32))
 ~~~
 
 - [ ] **Step 2: Run the focused tests and verify the schema/API failures**
@@ -2828,7 +2858,8 @@ Run:
 /home/ubuntu/miniconda3/envs/diffsim/bin/python -m unittest \
   tests.python.test_schema \
   tests.python.test_database_builder.DatabaseBuilderTests.test_source_support_samples_root_and_named_toes_in_column_order \
-  tests.python.test_database_builder.DatabaseBuilderTests.test_combination_preserves_support_rows_at_clip_boundaries -v
+  tests.python.test_database_builder.DatabaseBuilderTests.test_combination_preserves_support_rows_at_clip_boundaries \
+  tests.python.test_kinematics.KinematicsTests.test_convert_source_clip_prepends_simulation_bone -v
 ~~~
 
 Expected: import failure for `sample_terrain_support` and constructor/attribute
@@ -2919,6 +2950,11 @@ Because support is a sidecar, keep `write_holden_database` byte-for-byte
 unchanged. Initialize `terrain_support` to zeros in `read_holden_database`; the
 sidecar loader overwrites it after database loading.
 
+`convert_source_clip` also constructs `HoldenClip` directly. Insert
+`np.zeros((len(positions), 3), np.float32)` immediately after its four-column
+terrain-feature zeros; do not add a dataclass default that could hide another
+positional constructor mismatch.
+
 - [ ] **Step 4: Implement exact root/left/right support sampling**
 
 Add to `resources/g1_terrain_builder/database.py` before `derive_contacts`:
@@ -2938,7 +2974,8 @@ def sample_terrain_support(
         raise ValueError("support positions must be finite")
     indices = (root, left_toe, right_toe)
     if any(
-        not isinstance(index, Integral) or index < 0
+        not isinstance(index, Integral)
+        or isinstance(index, (bool, np.bool_)) or index < 0
         or index >= positions.shape[1] for index in indices
     ) or len(set(indices)) != 3:
         raise ValueError("support bone indices must be distinct and in range")
@@ -2950,9 +2987,12 @@ def sample_terrain_support(
             value = float(terrain.height(
                 float(positions[frame, bone, 0]),
                 float(positions[frame, bone, 2])))
-            if not np.isfinite(value):
-                raise ValueError("support terrain heights must be finite")
-            support[frame, column] = value
+            with np.errstate(over="ignore", invalid="ignore"):
+                encoded = np.float32(value)
+            if not np.isfinite(value) or not np.isfinite(encoded):
+                raise ValueError(
+                    "support terrain heights must be finite float32")
+            support[frame, column] = encoded
     return support
 ~~~
 
@@ -2980,7 +3020,8 @@ Run:
 
 ~~~bash
 /home/ubuntu/miniconda3/envs/diffsim/bin/python -m unittest \
-  tests.python.test_schema tests.python.test_database_builder -v
+  tests.python.test_schema tests.python.test_database_builder \
+  tests.python.test_kinematics -v
 ~~~
 
 Expected: all tests pass, including the existing exact `database.bin`
@@ -2992,8 +3033,10 @@ Holden database format.
 ~~~bash
 git add resources/g1_terrain_builder/schema.py \
   resources/g1_terrain_builder/database.py \
+  resources/g1_terrain_builder/kinematics.py \
   resources/build_g1_terrain_database.py \
-  tests/python/test_schema.py tests/python/test_database_builder.py
+  tests/python/test_schema.py tests/python/test_database_builder.py \
+  tests/python/test_kinematics.py
 git diff --cached --check
 git commit -m "feat: derive G1 source support rows"
 ~~~
