@@ -126,6 +126,7 @@ def _validate_artifacts(artifacts: ArtifactSet) -> None:
         "angular_velocities": (frames, bones, 3),
         "contacts": (frames, 2),
         "terrain_features": (frames, 4),
+        "terrain_support": (frames, 3),
     }
     for name, shape in expected.items():
         actual = np.asarray(getattr(artifacts, name)).shape
@@ -134,7 +135,7 @@ def _validate_artifacts(artifacts: ArtifactSet) -> None:
 
     for name in (
         "positions", "velocities", "rotations", "angular_velocities",
-        "terrain_features",
+        "terrain_features", "terrain_support",
     ):
         array = np.asarray(getattr(artifacts, name))
         if not np.issubdtype(array.dtype, np.number):
@@ -197,6 +198,8 @@ def combine_clips(
         np.concatenate([clip.contacts for clip in clips]).astype(
             np.uint8, copy=False),
         np.concatenate([clip.terrain_features for clip in clips]).astype(
+            np.float32, copy=False),
+        np.concatenate([clip.terrain_support for clip in clips]).astype(
             np.float32, copy=False),
     )
     _validate_artifacts(artifacts)
@@ -293,6 +296,7 @@ def read_holden_database(path: os.PathLike | str) -> ArtifactSet:
         range_stops,
         contacts,
         np.zeros((len(positions), 4), np.float32),
+        np.zeros((len(positions), 3), np.float32),
     )
     _validate_artifacts(artifacts)
     return artifacts
@@ -349,6 +353,43 @@ def derive_velocities(
         velocity.astype(np.float32),
         angular_velocity.astype(np.float32),
     )
+
+
+def sample_terrain_support(
+    global_positions: np.ndarray,
+    terrain,
+    root: int,
+    left_toe: int,
+    right_toe: int,
+) -> np.ndarray:
+    positions = np.asarray(global_positions, np.float64)
+    if positions.ndim != 3 or positions.shape[-1] != 3 or not len(positions):
+        raise ValueError("support positions must have shape (frames, bones, 3)")
+    if not np.isfinite(positions).all():
+        raise ValueError("support positions must be finite")
+    indices = (root, left_toe, right_toe)
+    if any(
+        not isinstance(index, Integral)
+        or isinstance(index, (bool, np.bool_)) or index < 0
+        or index >= positions.shape[1] for index in indices
+    ) or len(set(indices)) != 3:
+        raise ValueError("support bone indices must be distinct and in range")
+    if not callable(getattr(terrain, "height", None)):
+        raise TypeError("support terrain must provide height(x, z)")
+    support = np.empty((len(positions), 3), np.float32)
+    for frame in range(len(positions)):
+        for column, bone in enumerate(indices):
+            value = float(terrain.height(
+                float(positions[frame, bone, 0]),
+                float(positions[frame, bone, 2])))
+            if not np.isfinite(value):
+                raise ValueError("support terrain heights must be finite")
+            with np.errstate(over="ignore", invalid="ignore"):
+                encoded = np.float32(value)
+            if not np.isfinite(encoded):
+                raise ValueError("support terrain heights must be finite float32")
+            support[frame, column] = encoded
+    return support
 
 
 def derive_contacts(

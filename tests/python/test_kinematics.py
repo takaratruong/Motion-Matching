@@ -66,6 +66,9 @@ class KinematicsTests(unittest.TestCase):
         self.assertLessEqual(report["fk_max_error_m"], 0.001)
         self.assertLessEqual(report["duration_error_s"], 1.0/25.0)
         np.testing.assert_array_equal(clip.source_frames, np.arange(5))
+        self.assertEqual(clip.terrain_support.dtype, np.dtype(np.float32))
+        np.testing.assert_array_equal(
+            clip.terrain_support, np.zeros((5, 3), np.float32))
         np.testing.assert_allclose(
             np.linalg.norm(clip.rotations, axis=-1), 1.0, atol=1e-4)
         self.assertTrue(np.all(

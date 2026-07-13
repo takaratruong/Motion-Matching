@@ -21,6 +21,7 @@ from resources.g1_terrain_builder.database import (
     derive_contacts,
     derive_velocities,
     forward_kinematics_arrays,
+    sample_terrain_support,
 )
 from resources.g1_terrain_builder.kinematics import (
     G1Kinematics,
@@ -65,6 +66,13 @@ def finalize_clip(source, terrain, kin):
         gp, terrain,
         skeleton.names.index("LeftToe"),
         skeleton.names.index("RightToe"), OUTPUT_FPS)
+    clip.terrain_support = sample_terrain_support(
+        gp,
+        terrain,
+        skeleton.names.index("Simulation"),
+        skeleton.names.index("LeftToe"),
+        skeleton.names.index("RightToe"),
+    )
     for frame in range(len(clip.positions)):
         stop = min(frame + 51, len(clip.positions))
         path = gp[frame:stop, 0][:, [0, 2]]

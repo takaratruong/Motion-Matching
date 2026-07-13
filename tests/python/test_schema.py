@@ -26,6 +26,24 @@ class SchemaTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "terrain feature shape"):
             clip.validate()
 
+    def test_holden_clip_requires_three_finite_support_columns(self):
+        clip = HoldenClip.empty(frames=3, bones=2)
+        clip.terrain_support = np.zeros((3, 2), np.float32)
+        with self.assertRaisesRegex(ValueError, "support shape"):
+            clip.validate()
+        clip.terrain_support = np.full((3, 3), np.nan, np.float32)
+        with self.assertRaisesRegex(ValueError, "non-finite"):
+            clip.validate()
+
+    def test_artifact_set_requires_three_finite_support_columns(self):
+        artifacts = ArtifactSet.empty(frames=3, bones=2)
+        artifacts.terrain_support = np.zeros((3, 2), np.float32)
+        with self.assertRaisesRegex(ValueError, "support shape"):
+            artifacts.validate()
+        artifacts.terrain_support = np.full((3, 3), np.nan, np.float32)
+        with self.assertRaisesRegex(ValueError, "finite"):
+            artifacts.validate()
+
     def test_artifact_set_rejects_range_overlap(self):
         artifacts = ArtifactSet.empty(frames=4, bones=2)
         artifacts.range_starts = np.array([0, 2], np.int32)

@@ -45,6 +45,7 @@ class HoldenClip:
     angular_velocities: np.ndarray
     contacts: np.ndarray
     terrain_features: np.ndarray
+    terrain_support: np.ndarray
     source_frames: np.ndarray
     terrain_id: str
 
@@ -58,6 +59,7 @@ class HoldenClip:
             np.zeros((frames, bones, 3), np.float32),
             np.zeros((frames, 2), np.uint8),
             np.zeros((frames, 4), np.float32),
+            np.zeros((frames, 3), np.float32),
             np.arange(frames),
             "flat",
         )
@@ -74,9 +76,12 @@ class HoldenClip:
             raise ValueError("contact shape mismatch")
         if self.terrain_features.shape != (frames, 4):
             raise ValueError("terrain feature shape must be (T, 4)")
+        if self.terrain_support.shape != (frames, 3):
+            raise ValueError("terrain support shape must be (T, 3)")
         arrays = (
             self.positions, self.velocities, self.rotations,
             self.angular_velocities, self.terrain_features,
+            self.terrain_support,
         )
         if not all(np.isfinite(a).all() for a in arrays):
             raise ValueError("converted clip contains non-finite values")
@@ -93,6 +98,7 @@ class ArtifactSet:
     range_stops: np.ndarray
     contacts: np.ndarray
     terrain_features: np.ndarray
+    terrain_support: np.ndarray
 
     @classmethod
     def empty(cls, frames: int, bones: int) -> "ArtifactSet":
@@ -101,7 +107,7 @@ class ArtifactSet:
             clip.positions, clip.velocities, clip.rotations,
             clip.angular_velocities, np.arange(-1, bones - 1, dtype=np.int32),
             np.array([0], np.int32), np.array([frames], np.int32),
-            clip.contacts, clip.terrain_features,
+            clip.contacts, clip.terrain_features, clip.terrain_support,
         )
 
     def validate(self) -> None:
@@ -118,3 +124,7 @@ class ArtifactSet:
             raise ValueError("empty animation range")
         if self.terrain_features.shape != (frames, 4):
             raise ValueError("terrain feature shape must be (N, 4)")
+        if self.terrain_support.shape != (frames, 3):
+            raise ValueError("terrain support shape must be (N, 3)")
+        if not np.isfinite(self.terrain_support).all():
+            raise ValueError("terrain support must contain only finite values")

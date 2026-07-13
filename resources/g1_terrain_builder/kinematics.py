@@ -226,6 +226,7 @@ def convert_source_clip(
         np.zeros_like(positions, np.float32),
         np.zeros((len(positions), 2), np.uint8),
         np.zeros((len(positions), 4), np.float32),
+        np.zeros((len(positions), 3), np.float32),
         source.source_frames[output_frames],
         source.terrain_id,
     )
