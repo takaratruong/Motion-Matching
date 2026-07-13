@@ -326,7 +326,9 @@ def _validate_parameters(manifest: dict, clip_count: int) -> dict:
     return terrain
 
 
-def _parse_heightfield(path: str, metadata: dict) -> None:
+def _parse_heightfield(
+    path: str, metadata: dict, schema_cell_size: float,
+) -> None:
     try:
         with open(path, "rb") as stream:
             payload = stream.read()
@@ -387,6 +389,15 @@ def _parse_heightfield(path: str, metadata: dict) -> None:
             np.isclose(expected, value, rtol=1e-6, atol=1e-6),
             f"terrain heightfield {key} mismatch",
         )
+    _require(
+        metadata["cell_size"] == schema_cell_size
+        and cell_size == float(np.float32(schema_cell_size)),
+        "terrain heightfield cell size must match terrain cell_size_m",
+    )
+    _require(
+        metadata["exterior_height"] == 0.0 and exterior == 0.0,
+        "terrain heightfield exterior height must be 0.0",
+    )
 
 
 def _parse_obj(path: str) -> None:
@@ -499,6 +510,7 @@ def validate_artifact_directory(artifact_dir: str) -> dict:
     _parse_heightfield(
         os.path.join(artifact_dir, "terrain.bin"),
         terrain.get("heightfield"),
+        float(terrain["cell_size_m"]),
     )
     _parse_obj(os.path.join(artifact_dir, "terrain.obj"))
     return {
