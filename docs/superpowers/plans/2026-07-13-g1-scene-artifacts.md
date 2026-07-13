@@ -3055,10 +3055,10 @@ git commit -m "feat: derive G1 source support rows"
 - Produces: `walkability_bytes(values) -> bytes`.
 - Produces: `write_walkability(path, values) -> None` and `read_walkability(path) -> ndarray[uint8]`.
 - G1SP columns are locked as `SUPPORT_COLUMNS = ("source_root_height_m", "source_left_toe_height_m", "source_right_toe_height_m")`.
-- The float-matrix writers accept real floating input only. Finite `float64`
-  input may round normally to `float32`, but bool, integer, object, string, and
-  complex input is rejected; a finite source value that becomes non-finite in
-  `float32` is also rejected.
+- The float-matrix writers accept arrays with dtype exactly `float32` or
+  `float64` only. Finite `float64` input may round normally to `float32`, but
+  `float16`, bool, integer, object, string, and complex input is rejected; a
+  finite source value that becomes non-finite in `float32` is also rejected.
 - Every writer must finish serialization and validation before opening its
   destination. Invalid input must leave an existing file byte-for-byte intact.
 - Readers inspect and validate the fixed-size header and checked payload size
@@ -3180,7 +3180,7 @@ def _float_matrix_bytes(values, magic, dimensions, label):
         source = np.asarray(values)
     except (TypeError, ValueError, OverflowError) as error:
         raise ValueError(f"{label} must be finite float values") from error
-    if not np.issubdtype(source.dtype, np.floating) \
+    if source.dtype not in (np.dtype(np.float32), np.dtype(np.float64)) \
             or not np.isfinite(source).all():
         raise ValueError(f"{label} must be finite float values")
     with np.errstate(over="ignore", invalid="ignore"):
@@ -3324,8 +3324,9 @@ write_support_sidecar(
 Before the complete suite, add the full reader/writer boundary matrix:
 
 - all three writers preserve a pre-existing sentinel file on invalid input;
-- G1TF/G1SP reject bool, integer, object/string, complex, source non-finite,
-  and finite-to-`float32` overflow inputs without leaking conversion warnings;
+- G1TF/G1SP reject float16, bool, integer, object/string, complex, source
+  non-finite, and finite-to-`float32` overflow inputs without leaking
+  conversion warnings;
 - G1SP rejects zero frames and reports little-endian `float32` on readback;
 - G1WM rejects truncated header/payload, bad magic/version, dimensions below
   two, oversized header products, trailing bytes, and classes outside 0/1/2.
@@ -3361,17 +3362,35 @@ git commit -m "feat: serialize G1 support and walkability"
 - Produces: `SceneRoute`, `SceneDefinition`, `BuiltScene`, and `ScenePack`.
 - Produces: `build_scene(definition) -> BuiltScene` and `build_scene_pack(definitions) -> ScenePack`.
 - Produces: `canonical_json_bytes(value) -> bytes` and `sha256_hex(payload) -> str`; every JSON SHA is over the exact indented, sorted, newline-terminated bytes written to disk.
+- `BuiltScene.scene_json` and `ScenePack.index_json` are authoritative cached
+  byte fields, not properties that reserialize mutable dictionaries. Their
+  `metadata` and `index` accessors return fresh deep-normalized JSON values.
+- The index has exactly six keys: `schema`, `default_scene_id`, `scene_ids`,
+  `scenes`, `coordinate_signature`, and `surface_signature`. Its ordered
+  `scenes` array has one exact `{id, path, sha256}` descriptor per ordered ID;
+  each path is root-relative `scenes/<id>/scene.json`, and each SHA-256 covers
+  the corresponding cached `BuiltScene.scene_json` bytes.
 - Locks the 14 `REQUIRED_SCENE_IDS` in index order.
 - Locks every `scene.json` key, nested key, route outcome, relative path, and hash field consumed by later runtime plans.
+- Matches Task 7's scalar contract: G1TF/G1SP accept only float32 or float64
+  arrays (finite float64 may round finitely to float32); float16, bool, integer,
+  object/string, complex, source non-finite, and finite-to-float32 overflow are
+  rejected. G1WM remains a strict two-dimensional integer class grid. Scene
+  runtime scalars are separately quantized to finite normal-or-positive-zero
+  float32 and promoted to JSON numbers; authoritative heightfield extrema use
+  binary64 arithmetic from decoded float32 G1HF values.
 
 - [ ] **Step 1: Write failing schema, hash, route, and ordered-index tests**
 
 Create `tests/python/test_scenes.py`:
 
 ~~~python
+import copy
 import hashlib
 import json
+import os
 import struct
+import tempfile
 import unittest
 
 import numpy as np
@@ -3385,8 +3404,11 @@ from resources.g1_terrain_builder.scenes import (
     build_scene,
     build_scene_pack,
     canonical_json_bytes,
+    sha256_hex,
+    _route_samples,
+    _walkability_at,
 )
-from resources.g1_terrain_builder.terrain import FlatTerrain, \
+from resources.g1_terrain_builder.terrain import FlatTerrain, HeightGrid, \
     surface_semantics_signature
 
 
@@ -3423,12 +3445,17 @@ def flat_definition(scene_id="grail-curb-default"):
 
 class SceneSchemaTests(unittest.TestCase):
     def test_canonical_json_hash_is_over_exact_written_bytes(self):
-        value = {"z": 1, "a": [2, 3]}
+        value = {"z": 1, "a": [2, 3], "zero": -0.0}
         payload = canonical_json_bytes(value)
-        self.assertEqual(payload, b'{\n  "a": [\n    2,\n    3\n  ],\n  "z": 1\n}\n')
         self.assertEqual(
-            hashlib.sha256(payload).hexdigest(),
+            payload,
+            b'{\n  "a": [\n    2,\n    3\n  ],\n'
+            b'  "z": 1,\n  "zero": 0.0\n}\n')
+        self.assertEqual(
+            sha256_hex(payload),
             hashlib.sha256(canonical_json_bytes(value)).hexdigest())
+        self.assertEqual(struct.pack("<d", json.loads(payload)["zero"]),
+                         struct.pack("<d", 0.0))
 
     def test_built_scene_has_locked_keys_paths_schemas_and_hashes(self):
         scene = build_scene(flat_definition())
@@ -3460,8 +3487,28 @@ class SceneSchemaTests(unittest.TestCase):
         self.assertEqual(
             metadata["walkability"]["sha256"],
             hashlib.sha256(scene.walkability_bin).hexdigest())
-        _, _, nx, nz, ox, oz, cell, _ = struct.unpack_from(
+        magic, version, nx, nz, ox, oz, cell, _ = struct.unpack_from(
             "<4sIII4f", scene.terrain_bin)
+        self.assertEqual((magic, version), (b"G1HF", 2))
+        self.assertGreaterEqual(nx, 2)
+        self.assertGreaterEqual(nz, 2)
+        self.assertEqual(
+            (metadata["heightfield"]["nx"], metadata["heightfield"]["nz"]),
+            (nx, nz))
+        with tempfile.TemporaryDirectory() as temporary:
+            path = os.path.join(temporary, "walkability.bin")
+            with open(path, "wb") as stream:
+                stream.write(scene.walkability_bin)
+            decoded = read_walkability(path)
+        self.assertEqual(decoded.shape, (nz, nx))
+        expected_classes = np.empty((nz, nx), np.uint8)
+        for iz in range(nz):
+            z = float(oz) + iz * float(cell)
+            for ix in range(nx):
+                x = float(ox) + ix * float(cell)
+                expected_classes[iz, ix] = \
+                    1 if -0.5 <= x <= 0.5 and 0.0 <= z <= 2.0 else 0
+        np.testing.assert_array_equal(decoded, expected_classes)
         heightfield_min = [float(ox), 0.0, float(oz)]
         heightfield_max = [
             float(ox) + (nx - 1) * float(cell), 0.0,
@@ -3513,25 +3560,199 @@ class SceneSchemaTests(unittest.TestCase):
                 "bad-hold", ((0, 0), (0, 1), (0, 2)),
                 "traverse", 1, 2.0).validate()
 
+    def test_runtime_json_scalars_match_float32_and_positive_zero(self):
+        definition = flat_definition()
+        definition.spawn_position = (-0.0, 0.0, -0.0)
+        definition.routes = (SceneRoute(
+            "forward", ((-0.0, -0.0), (0.0, 0.1), (0.0, 1.0)),
+            "traverse", 1, 0.0),)
+        scene = build_scene(definition)
+        metadata = scene.metadata
+        expected = struct.unpack("<f", struct.pack("<f", 0.1))[0]
+        self.assertEqual(metadata["routes"][0]["waypoints_xz"][1][1], expected)
+        for value in (
+            metadata["spawn"]["position"][0],
+            metadata["spawn"]["position"][2],
+            metadata["routes"][0]["waypoints_xz"][0][0],
+            metadata["routes"][0]["waypoints_xz"][0][1],
+        ):
+            self.assertEqual(struct.pack("<f", value), struct.pack("<I", 0))
+
+    def test_walkability_lookup_locks_floorf_half_cell_nextafter_behavior(self):
+        grid = HeightGrid(
+            heights=np.zeros((2, 3), np.float32),
+            origin_x=0.0, origin_z=0.0, cell_size=1.0,
+            exterior_height=0.0,
+        )
+        classes = np.array([[0, 1, 2], [0, 1, 2]], np.uint8)
+        half = np.float32(0.5)
+        one_below = np.nextafter(
+            half, np.float32(-np.inf), dtype=np.float32)
+        two_below = np.nextafter(
+            one_below, np.float32(-np.inf), dtype=np.float32)
+        one_above = np.nextafter(
+            half, np.float32(np.inf), dtype=np.float32)
+        # floorf(f32(x + 0.5f)) rounds one ULP below the mathematical tie
+        # back to 1.0f; two ULPs below remains below the boundary.
+        self.assertEqual(_walkability_at(grid, classes, two_below, 0.0), 0)
+        self.assertEqual(_walkability_at(grid, classes, one_below, 0.0), 1)
+        self.assertEqual(_walkability_at(grid, classes, half, 0.0), 1)
+        self.assertEqual(_walkability_at(grid, classes, one_above, 0.0), 1)
+        samples = _route_samples(
+            ((0.0, 0.0), (float(one_above), 0.0)), np.float32(0.25))
+        one_third = np.float32(np.float32(1.0) / np.float32(3.0))
+        two_thirds = np.float32(np.float32(2.0) / np.float32(3.0))
+        self.assertEqual(
+            [struct.pack("<f", point[0]) for point in samples],
+            [struct.pack("<f", value) for value in (
+                0.0, np.float32(one_third * one_above),
+                np.float32(two_thirds * one_above), one_above,
+            )])
+
     def test_scene_pack_requires_exact_order_and_stable_index_fields(self):
         definitions = [flat_definition(scene_id) for scene_id in REQUIRED_SCENE_IDS]
         pack = build_scene_pack(definitions)
+        descriptors = [{
+            "id": scene.scene_id,
+            "path": f"scenes/{scene.scene_id}/scene.json",
+            "sha256": hashlib.sha256(scene.scene_json).hexdigest(),
+        } for scene in pack.scenes]
         self.assertEqual(pack.index, {
             "schema": "g1-terrain-scene-index/v1",
             "default_scene_id": "grail-curb-default",
             "scene_ids": list(REQUIRED_SCENE_IDS),
+            "scenes": descriptors,
             "coordinate_signature":
                 "holden-y-up-right-handed-forward-plus-z",
             "surface_signature": surface_semantics_signature(),
         })
+        self.assertEqual(pack.index_json, canonical_json_bytes(pack.index))
         with self.assertRaisesRegex(ValueError, "required scene order"):
             build_scene_pack(list(reversed(definitions)))
 
-    def test_scene_builder_rejects_route_or_spawn_outside_contract(self):
+    def test_pack_materializes_generator_once_and_caches_deep_normalized_bytes(self):
+        yielded = []
+        source_definitions = [
+            flat_definition(scene_id) for scene_id in REQUIRED_SCENE_IDS]
+
+        def definitions():
+            for definition in source_definitions:
+                yielded.append(definition.scene_id)
+                yield definition
+
+        pack = build_scene_pack(definitions())
+        self.assertEqual(yielded, list(REQUIRED_SCENE_IDS))
+        first_scene_json = pack.scenes[0].scene_json
+        first_index_json = pack.index_json
+        first_assets = (
+            pack.scenes[0].terrain_bin, pack.scenes[0].terrain_obj,
+            pack.scenes[0].walkability_bin,
+        )
+        source_definitions[0].provenance["parameters"]["fixture"] = False
+        source_definitions[0].regions["certified"][0]["bounds_xz"][0] = -0.25
+        leaked_metadata = pack.scenes[0].metadata
+        leaked_metadata["label"] = "mutated caller copy"
+        leaked_index = pack.index
+        leaked_index["scene_ids"].reverse()
+        self.assertEqual(pack.scenes[0].scene_json, first_scene_json)
+        self.assertEqual(pack.index_json, first_index_json)
+        self.assertEqual((
+            pack.scenes[0].terrain_bin, pack.scenes[0].terrain_obj,
+            pack.scenes[0].walkability_bin,
+        ), first_assets)
+        self.assertEqual(
+            pack.index["scenes"][0]["sha256"],
+            hashlib.sha256(first_scene_json).hexdigest())
+        self.assertNotEqual(
+            pack.index["scenes"][0]["sha256"],
+            hashlib.sha256(first_scene_json + b"mutated").hexdigest())
+        rebuilt = build_scene_pack(
+            flat_definition(scene_id) for scene_id in REQUIRED_SCENE_IDS)
+        self.assertEqual(rebuilt.index_json, pack.index_json)
+        self.assertEqual(
+            tuple(scene.scene_json for scene in rebuilt.scenes),
+            tuple(scene.scene_json for scene in pack.scenes))
+        self.assertEqual(
+            tuple((scene.terrain_bin, scene.terrain_obj, scene.walkability_bin)
+                  for scene in rebuilt.scenes),
+            tuple((scene.terrain_bin, scene.terrain_obj, scene.walkability_bin)
+                  for scene in pack.scenes))
+
+    def test_scene_builder_rejects_strict_bounds_regions_routes_and_classes(self):
+        cases = []
+
         definition = flat_definition()
-        definition.spawn_position = (5.0, 0.0, 0.0)
-        with self.assertRaisesRegex(ValueError, "spawn.*playable"):
-            build_scene(definition)
+        definition.spawn_position = (True, 0.0, 0.0)
+        cases.append((definition, "spawn.*real scalar"))
+
+        definition = flat_definition()
+        definition.playable_bounds_xz = (-0.5, -0.5, 0.0, 2.0)
+        cases.append((definition, "playable.*strict"))
+
+        definition = flat_definition()
+        definition.lookahead_bounds_xz = (-2.0, 1.0, -1.0, 3.0)
+        cases.append((definition, "lookahead.*heightfield"))
+
+        definition = flat_definition()
+        definition.scene_id = 7
+        cases.append((definition, "scene ID"))
+
+        definition = flat_definition()
+        definition.label = False
+        cases.append((definition, "scene label"))
+
+        definition = flat_definition()
+        definition.regions["stress"] = ({
+            "id": "route", "bounds_xz": [-0.2, 0.2, 0.2, 0.4],
+        },)
+        cases.append((definition, "duplicate region ID"))
+
+        definition = flat_definition()
+        definition.routes = (SceneRoute(
+            "forward", ((0.0, 0.25), (0.0, 1.0)),
+            "traverse", 1, 0.0),)
+        cases.append((definition, "route.*start.*spawn"))
+
+        definition = flat_definition()
+        definition.routes = (SceneRoute(
+            "forward", ((0.0, 0.0), (0.0, 4.0)),
+            "traverse", 1, 0.0),)
+        cases.append((definition, "route leaves lookahead"))
+
+        definition = flat_definition()
+        definition.routes = (SceneRoute(
+            "forward", ((0.0, 0.0), (0.0, 0.0), (0.0, 1.0)),
+            "traverse", 1, 0.0),)
+        cases.append((definition, "nonzero segment"))
+
+        definition = flat_definition()
+        definition.walkability = lambda x, z: 1 if z < 0.5 else 0
+        definition.regions["certified"] = ({
+            "id": "approach", "bounds_xz": [-0.5, 0.5, 0.0, 0.4],
+        },)
+        cases.append((definition, "wrong walkability class"))
+
+        definition = flat_definition()
+        definition.walkability = lambda x, z: True
+        cases.append((definition, "walkability.*integer class"))
+
+        for bad_value in ("0.25", 0.25 + 0.0j):
+            definition = flat_definition()
+            definition.routes = (SceneRoute(
+                "forward", ((0.0, 0.0), (0.0, bad_value)),
+                "traverse", 1, 0.0),)
+            cases.append((definition, "real scalar"))
+
+        definition = flat_definition()
+        definition.routes = (SceneRoute(
+            "forward", ((0.0, 0.0), (0.0, 1.0)),
+            "traverse", True, 0.0),)
+        cases.append((definition, "walkability class.*not bool"))
+
+        for definition, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex((TypeError, ValueError), message):
+                    build_scene(copy.deepcopy(definition))
 
 
 if __name__ == "__main__":
@@ -3558,6 +3779,8 @@ Create `resources/g1_terrain_builder/scenes.py` with:
 from dataclasses import dataclass
 import hashlib
 import json
+import re
+import struct
 from typing import Callable
 
 import numpy as np
@@ -3589,8 +3812,9 @@ REQUIRED_SCENE_IDS = (
     "blocked-course",
 )
 COORDINATE_SIGNATURE = "holden-y-up-right-handed-forward-plus-z"
-TERRAIN_DISTANCES = [0.25, 0.50, 0.75, 1.00]
+TERRAIN_DISTANCES = (0.25, 0.50, 0.75, 1.00)
 SCENE_CELL_SIZE = 0.02
+SCENE_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
 OUTCOME_CLASS = {
     "traverse": 1,
     "safe-stop": 0,
@@ -3598,14 +3822,93 @@ OUTCOME_CLASS = {
 }
 
 
+def _deep_normalize_json(value, label="JSON"):
+    if isinstance(value, dict):
+        if any(type(key) is not str for key in value):
+            raise TypeError(f"{label} object keys must be strings")
+        return {
+            key: _deep_normalize_json(child, f"{label}.{key}")
+            for key, child in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _deep_normalize_json(child, f"{label}[{index}]")
+            for index, child in enumerate(value)
+        ]
+    if type(value) is float:
+        if not np.isfinite(value):
+            raise ValueError(f"{label} must be finite")
+        return 0.0 if value == 0.0 else value
+    if type(value) is int or type(value) in (str, bool) or value is None:
+        return value
+    raise TypeError(f"{label} contains non-JSON scalar {type(value).__name__}")
+
+
 def canonical_json_bytes(value) -> bytes:
+    normalized = _deep_normalize_json(value)
     return (json.dumps(
-        value, indent=2, sort_keys=True, allow_nan=False,
+        normalized, indent=2, sort_keys=True, allow_nan=False,
     ) + "\n").encode("utf-8")
 
 
 def sha256_hex(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def _finite_real(value, label):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+            value, (int, float, np.integer, np.floating)):
+        raise TypeError(f"{label} must be a real scalar, not bool")
+    result = float(value)
+    if not np.isfinite(result):
+        raise ValueError(f"{label} must be finite")
+    return 0.0 if result == 0.0 else result
+
+
+def _runtime_f32(value, label):
+    source = _finite_real(value, label)
+    try:
+        bits = struct.unpack("<I", struct.pack("<f", source))[0]
+    except (OverflowError, struct.error) as error:
+        raise ValueError(f"{label} overflows float32") from error
+    exponent = bits & 0x7f800000
+    magnitude = bits & 0x7fffffff
+    if exponent == 0x7f800000:
+        raise ValueError(f"{label} overflows float32")
+    if magnitude != 0 and exponent == 0:
+        raise ValueError(f"{label} becomes a float32 subnormal")
+    decoded = struct.unpack("<f", struct.pack("<I", bits))[0]
+    return 0.0 if decoded == 0.0 else float(decoded)
+
+
+def _f32_add(left, right, label):
+    with np.errstate(over="ignore", invalid="ignore"):
+        value = np.float32(np.float32(left) + np.float32(right))
+    return _runtime_f32(value, label)
+
+
+def _f32_sub(left, right, label):
+    with np.errstate(over="ignore", invalid="ignore"):
+        value = np.float32(np.float32(left) - np.float32(right))
+    return _runtime_f32(value, label)
+
+
+def _f32_mul(left, right, label):
+    with np.errstate(over="ignore", invalid="ignore"):
+        value = np.float32(np.float32(left) * np.float32(right))
+    return _runtime_f32(value, label)
+
+
+def _f32_div(left, right, label):
+    with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+        value = np.float32(np.float32(left) / np.float32(right))
+    return _runtime_f32(value, label)
+
+
+def _f32_sqrt(value, label):
+    with np.errstate(invalid="ignore"):
+        result = np.float32(np.sqrt(np.float32(value)))
+    return _runtime_f32(result, label)
 
 
 @dataclass(frozen=True)
@@ -3616,31 +3919,52 @@ class SceneRoute:
     walkability_class: int
     landing_hold_seconds: float
 
-    def validate(self):
-        if not self.route_id or len(self.waypoints_xz) < 2:
+    def normalized_points(self):
+        if not isinstance(self.waypoints_xz, (tuple, list)) \
+                or len(self.waypoints_xz) < 2:
             raise ValueError("scene route needs an ID and at least two waypoints")
-        points = np.asarray(self.waypoints_xz, np.float64)
-        if points.shape != (len(self.waypoints_xz), 2) \
-                or not np.isfinite(points).all():
-            raise ValueError("scene route waypoints must be finite XZ pairs")
+        points = []
+        for index, point in enumerate(self.waypoints_xz):
+            if not isinstance(point, (tuple, list)) or len(point) != 2:
+                raise ValueError("scene route waypoints must be finite XZ pairs")
+            points.append((
+                _runtime_f32(point[0], f"route waypoint {index} x"),
+                _runtime_f32(point[1], f"route waypoint {index} z"),
+            ))
+        for start, stop in zip(points, points[1:]):
+            if start == stop:
+                raise ValueError("scene route requires every nonzero segment")
+        return tuple(points)
+
+    def validate(self):
+        if type(self.route_id) is not str \
+                or not SCENE_ID_PATTERN.fullmatch(self.route_id):
+            raise ValueError("scene route needs a safe non-empty ID")
+        points = self.normalized_points()
+        if type(self.expected_outcome) is not str:
+            raise TypeError("scene route outcome must be a string")
         expected = OUTCOME_CLASS.get(self.expected_outcome)
+        if type(self.walkability_class) is not int:
+            raise TypeError("walkability class must be an integer, not bool")
         if expected != self.walkability_class:
             raise ValueError("scene route outcome and walkability class disagree")
-        if not np.isfinite(self.landing_hold_seconds) \
-                or self.landing_hold_seconds < 0.0:
+        hold = _runtime_f32(
+            self.landing_hold_seconds, "landing hold seconds")
+        if hold < 0.0:
             raise ValueError("landing hold seconds must be finite and nonnegative")
-        if self.landing_hold_seconds > 0.0 and len(self.waypoints_xz) < 4:
+        if hold > 0.0 and len(points) < 4:
             raise ValueError(
                 "landing hold requires published waypoint 2 and a later exit")
+        return points, hold
 
     def to_json(self):
-        self.validate()
+        points, hold = self.validate()
         return {
             "id": self.route_id,
-            "waypoints_xz": [[float(x), float(z)] for x, z in self.waypoints_xz],
+            "waypoints_xz": [[x, z] for x, z in points],
             "expected_outcome": self.expected_outcome,
             "walkability_class": self.walkability_class,
-            "landing_hold_seconds": float(self.landing_hold_seconds),
+            "landing_hold_seconds": hold,
         }
 
 
@@ -3663,24 +3987,24 @@ class SceneDefinition:
 @dataclass(frozen=True)
 class BuiltScene:
     scene_id: str
-    metadata: dict
+    scene_json: bytes
     terrain_bin: bytes
     terrain_obj: bytes
     walkability_bin: bytes
 
     @property
-    def scene_json(self):
-        return canonical_json_bytes(self.metadata)
+    def metadata(self):
+        return json.loads(self.scene_json)
 
 
 @dataclass(frozen=True)
 class ScenePack:
-    index: dict
+    index_json: bytes
     scenes: tuple[BuiltScene, ...]
 
     @property
-    def index_json(self):
-        return canonical_json_bytes(self.index)
+    def index(self):
+        return json.loads(self.index_json)
 ~~~
 
 - [ ] **Step 4: Build exact assets, hashes, bounds, and metadata from one grid**
@@ -3693,6 +4017,23 @@ def _bounds_contains(bounds, x, z):
     return xmin <= x <= xmax and zmin <= z <= zmax
 
 
+def _strict_bounds(values, label):
+    if not isinstance(values, (tuple, list)) or len(values) != 4:
+        raise ValueError(f"{label} bounds must contain xmin,xmax,zmin,zmax")
+    bounds = tuple(
+        _runtime_f32(value, f"{label} bounds[{index}]")
+        for index, value in enumerate(values)
+    )
+    if not (bounds[0] < bounds[1] and bounds[2] < bounds[3]):
+        raise ValueError(f"{label} bounds must be strict and nondegenerate")
+    return bounds
+
+
+def _bounds_contains_bounds(outer, inner):
+    return outer[0] <= inner[0] <= inner[1] <= outer[1] \
+        and outer[2] <= inner[2] <= inner[3] <= outer[3]
+
+
 def _classify_grid(definition, grid):
     values = np.empty((grid.nz, grid.nx), np.uint8)
     for iz in range(grid.nz):
@@ -3700,65 +4041,234 @@ def _classify_grid(definition, grid):
         for ix in range(grid.nx):
             x = grid.origin_x + ix * grid.cell_size
             value = definition.walkability(x, z)
-            if value not in (0, 1, 2):
+            if isinstance(value, (bool, np.bool_)) \
+                    or not isinstance(value, (int, np.integer)):
+                raise TypeError(
+                    f"{definition.scene_id}: walkability must return an "
+                    "integer class, not bool")
+            if int(value) not in (0, 1, 2):
                 raise ValueError(
                     f"{definition.scene_id}: invalid walkability class {value}")
-            values[iz, ix] = value
+            values[iz, ix] = int(value)
     return values
 
 
+def _walkability_at(grid, values, x, z):
+    x = _runtime_f32(x, "route sample x")
+    z = _runtime_f32(z, "route sample z")
+    gx = _f32_div(
+        _f32_sub(x, grid.origin_x, "walkability gx numerator"),
+        grid.cell_size, "walkability gx")
+    gz = _f32_div(
+        _f32_sub(z, grid.origin_z, "walkability gz numerator"),
+        grid.cell_size, "walkability gz")
+    if not (0.0 <= gx <= grid.nx - 1 and 0.0 <= gz <= grid.nz - 1):
+        raise ValueError("route sample is outside walkability grid")
+    ix = min(int(np.floor(np.float32(
+        _f32_add(gx, 0.5, "walkability gx tie offset")))), grid.nx - 1)
+    iz = min(int(np.floor(np.float32(
+        _f32_add(gz, 0.5, "walkability gz tie offset")))), grid.nz - 1)
+    return int(values[iz, ix])
+
+
+def _route_samples(points, maximum_step):
+    output = [points[0]]
+    step = _runtime_f32(maximum_step, "route maximum sample step")
+    if step <= 0.0:
+        raise ValueError("route maximum sample step must be positive")
+    for start, stop in zip(points, points[1:]):
+        dx = _f32_sub(stop[0], start[0], "route segment dx")
+        dz = _f32_sub(stop[1], start[1], "route segment dz")
+        squared = _f32_add(
+            _f32_mul(dx, dx, "route segment dx squared"),
+            _f32_mul(dz, dz, "route segment dz squared"),
+            "route segment squared length")
+        distance = _f32_sqrt(squared, "route segment length")
+        ratio = _f32_div(distance, step, "route segment sample ratio")
+        count = max(1, int(np.ceil(np.float32(ratio))))
+        for index in range(1, count + 1):
+            if index == count:
+                output.append(stop)
+                continue
+            alpha = _f32_div(index, count, "route sample alpha")
+            output.append((
+                _f32_add(
+                    start[0], _f32_mul(alpha, dx, "route sample dx"),
+                    "route sample x"),
+                _f32_add(
+                    start[1], _f32_mul(alpha, dz, "route sample dz"),
+                    "route sample z"),
+            ))
+    return tuple(output)
+
+
+def _validate_route_classes(routes, grid, classes, lookahead):
+    for route in routes:
+        points = tuple(tuple(point) for point in route["waypoints_xz"])
+        samples = _route_samples(
+            points, _f32_div(
+                grid.cell_size, 2.0, "route half-cell sample step"))
+        for x, z in samples:
+            if not _bounds_contains(lookahead, x, z):
+                raise ValueError("scene route leaves lookahead bounds")
+        sampled_classes = tuple(
+            _walkability_at(grid, classes, x, z) for x, z in samples)
+        expected = route["walkability_class"]
+        if expected in (1, 2):
+            if any(value != expected for value in sampled_classes):
+                raise ValueError("expected route enters wrong walkability class")
+        else:
+            if sampled_classes[0] != 1 or sampled_classes[-1] != 0:
+                raise ValueError(
+                    "safe-stop route must approach from certified into blocked")
+            first_blocked = sampled_classes.index(0)
+            if any(value != 1 for value in sampled_classes[:first_blocked]) \
+                    or any(value != 0 for value in sampled_classes[first_blocked:]):
+                raise ValueError("safe-stop route re-enters traversable cells")
+
+
+def _validate_region_classes(regions, grid, classes):
+    expected_classes = {"blocked": 0, "certified": 1, "stress": 2}
+    for class_name, entries in regions.items():
+        for entry in entries:
+            xmin, xmax, zmin, zmax = entry["bounds_xz"]
+            observed = []
+            for iz in range(grid.nz):
+                z = float(grid.origin_z) + iz * float(grid.cell_size)
+                if not zmin <= z <= zmax:
+                    continue
+                for ix in range(grid.nx):
+                    x = float(grid.origin_x) + ix * float(grid.cell_size)
+                    if xmin <= x <= xmax:
+                        observed.append(int(classes[iz, ix]))
+            if not observed or any(
+                    value != expected_classes[class_name] for value in observed):
+                raise ValueError(
+                    f"{class_name} region disagrees with G1WM classes")
+
+
 def _validate_definition(definition):
-    if not definition.scene_id or not definition.label:
-        raise ValueError("scene ID and label must be non-empty")
-    if set(definition.provenance) != {"kind", "source_ids", "parameters"}:
+    if type(definition.scene_id) is not str \
+            or not SCENE_ID_PATTERN.fullmatch(definition.scene_id):
+        raise ValueError("scene ID must be a safe non-empty ID")
+    if type(definition.label) is not str or not definition.label:
+        raise ValueError("scene label must be a non-empty string")
+    if type(definition.provenance) is not dict \
+            or set(definition.provenance) != {
+                "kind", "source_ids", "parameters"}:
         raise ValueError("scene provenance fields are not locked")
     if definition.provenance["kind"] not in ("grail", "procedural"):
         raise ValueError("scene provenance kind must be grail or procedural")
-    numbers = (
-        *definition.heightfield_bounds_xz,
-        *definition.playable_bounds_xz,
-        *definition.lookahead_bounds_xz,
-        *definition.spawn_position,
-        definition.spawn_yaw_radians,
+    source_ids = definition.provenance["source_ids"]
+    parameters = definition.provenance["parameters"]
+    if not isinstance(source_ids, (tuple, list)) \
+            or any(type(value) is not str or not value for value in source_ids) \
+            or type(parameters) is not dict:
+        raise ValueError("scene provenance values are invalid")
+    if (definition.provenance["kind"] == "procedural" and source_ids) \
+            or (definition.provenance["kind"] == "grail"
+                and len(source_ids) != 2):
+        raise ValueError("scene provenance source IDs do not match kind")
+    provenance = json.loads(canonical_json_bytes(definition.provenance))
+
+    heightfield = _strict_bounds(
+        definition.heightfield_bounds_xz, "heightfield")
+    playable = _strict_bounds(definition.playable_bounds_xz, "playable")
+    lookahead = _strict_bounds(definition.lookahead_bounds_xz, "lookahead")
+    if not _bounds_contains_bounds(heightfield, lookahead):
+        raise ValueError("scene lookahead bounds must lie inside heightfield")
+    if not _bounds_contains_bounds(lookahead, playable):
+        raise ValueError("scene playable bounds must lie inside lookahead")
+    if not isinstance(definition.spawn_position, (tuple, list)) \
+            or len(definition.spawn_position) != 3:
+        raise ValueError("scene spawn position must contain XYZ")
+    spawn = tuple(
+        _runtime_f32(value, f"spawn position[{index}]")
+        for index, value in enumerate(definition.spawn_position)
     )
-    if not np.isfinite(numbers).all():
-        raise ValueError("scene bounds and spawn must be finite")
-    sx, _, sz = definition.spawn_position
-    if not _bounds_contains(definition.playable_bounds_xz, sx, sz):
+    yaw = _runtime_f32(definition.spawn_yaw_radians, "spawn yaw")
+    sx, _, sz = spawn
+    if not _bounds_contains(playable, sx, sz):
         raise ValueError("scene spawn must lie inside playable bounds")
-    if set(definition.regions) != {"certified", "stress", "blocked"}:
+    if type(definition.regions) is not dict \
+            or set(definition.regions) != {"certified", "stress", "blocked"}:
         raise ValueError("scene regions must define certified, stress, blocked")
-    if not definition.routes:
+    region_ids = set()
+    regions = {"certified": [], "stress": [], "blocked": []}
+    for class_name in ("certified", "stress", "blocked"):
+        entries = definition.regions[class_name]
+        if not isinstance(entries, (tuple, list)):
+            raise TypeError(f"{class_name} regions must be a sequence")
+        for entry in entries:
+            if type(entry) is not dict or set(entry) != {"id", "bounds_xz"} \
+                    or type(entry["id"]) is not str \
+                    or not SCENE_ID_PATTERN.fullmatch(entry["id"]):
+                raise ValueError(f"invalid {class_name} region")
+            if entry["id"] in region_ids:
+                raise ValueError(f"duplicate region ID {entry['id']}")
+            region_ids.add(entry["id"])
+            bounds = _strict_bounds(
+                entry["bounds_xz"], f"{class_name} region {entry['id']}")
+            if not _bounds_contains_bounds(lookahead, bounds):
+                raise ValueError(f"{class_name} region leaves lookahead bounds")
+            regions[class_name].append({
+                "id": entry["id"], "bounds_xz": list(bounds),
+            })
+
+    if not isinstance(definition.routes, (tuple, list)) \
+            or not definition.routes:
         raise ValueError("scene must define at least one route")
+    route_ids = set()
+    routes = []
     for route in definition.routes:
-        route.validate()
-        for x, z in route.waypoints_xz:
-            if not _bounds_contains(definition.lookahead_bounds_xz, x, z):
+        if not isinstance(route, SceneRoute):
+            raise TypeError("scene routes must be SceneRoute values")
+        route_json = route.to_json()
+        if route_json["id"] in route_ids:
+            raise ValueError(f"duplicate route ID {route_json['id']}")
+        route_ids.add(route_json["id"])
+        if tuple(route_json["waypoints_xz"][0]) != (spawn[0], spawn[2]):
+            raise ValueError("scene route must start at scene spawn")
+        for x, z in route_json["waypoints_xz"]:
+            if not _bounds_contains(lookahead, x, z):
                 raise ValueError("scene route leaves lookahead bounds")
+        routes.append(route_json)
+    return {
+        "provenance": provenance,
+        "heightfield_bounds": heightfield,
+        "playable_bounds": playable,
+        "lookahead_bounds": lookahead,
+        "spawn": spawn,
+        "yaw": yaw,
+        "regions": regions,
+        "routes": routes,
+    }
 
 
 def build_scene(definition):
-    _validate_definition(definition)
+    normalized = _validate_definition(definition)
     grid = rasterize_heightfield(
         definition.surface,
-        definition.heightfield_bounds_xz,
+        normalized["heightfield_bounds"],
         SCENE_CELL_SIZE,
     )
     classes = _classify_grid(definition, grid)
     terrain_bin = grid.g1hf_bytes()
     terrain_obj = grid.obj_bytes()
     walkability_bin = walkability_bytes(classes)
-    minimum_y = float(grid.heights.min())
-    maximum_y = float(grid.heights.max())
-    heightfield_xmin = grid.origin_x
+    _, _, nx, nz, origin_x, origin_z, cell_size, exterior = \
+        struct.unpack_from("<4sIII4f", terrain_bin)
+    decoded_heights = np.frombuffer(terrain_bin, "<f4", nx * nz, 32)
+    minimum_y = float(decoded_heights.min())
+    maximum_y = float(decoded_heights.max())
+    heightfield_xmin = float(origin_x)
     heightfield_xmax = \
-        heightfield_xmin + (grid.nx - 1) * grid.cell_size
-    heightfield_zmin = grid.origin_z
+        heightfield_xmin + (nx - 1) * float(cell_size)
+    heightfield_zmin = float(origin_z)
     heightfield_zmax = \
-        heightfield_zmin + (grid.nz - 1) * grid.cell_size
+        heightfield_zmin + (nz - 1) * float(cell_size)
     def obj_coordinate(value):
-        encoded = float(np.float32(value))
-        return 0.0 if encoded == 0.0 else encoded
+        return _runtime_f32(value, "OBJ coordinate")
 
     mesh_xmin = obj_coordinate(heightfield_xmin)
     mesh_xmax = obj_coordinate(heightfield_xmax)
@@ -3768,16 +4278,16 @@ def build_scene(definition):
         "schema": "g1-terrain-scene/v1",
         "id": definition.scene_id,
         "label": definition.label,
-        "provenance": definition.provenance,
+        "provenance": normalized["provenance"],
         "coordinate_signature": COORDINATE_SIGNATURE,
         "surface_signature": surface_semantics_signature(),
-        "terrain_feature_distances_m": TERRAIN_DISTANCES,
+        "terrain_feature_distances_m": list(TERRAIN_DISTANCES),
         "heightfield": {
             "path": "terrain.bin", "schema": "G1HF/v2", "version": 2,
-            "nx": grid.nx, "nz": grid.nz,
-            "origin_x": grid.origin_x, "origin_z": grid.origin_z,
-            "cell_size_m": grid.cell_size,
-            "exterior_height_m": grid.exterior_height,
+            "nx": nx, "nz": nz,
+            "origin_x": float(origin_x), "origin_z": float(origin_z),
+            "cell_size_m": float(cell_size),
+            "exterior_height_m": float(exterior),
             "interpolation": HEIGHTFIELD_INTERPOLATION,
             "diagonal": HEIGHTFIELD_DIAGONAL,
             "sha256": sha256_hex(terrain_bin),
@@ -3788,7 +4298,7 @@ def build_scene(definition):
         },
         "walkability": {
             "path": "walkability.bin", "schema": "G1WM/v1", "version": 1,
-            "nx": grid.nx, "nz": grid.nz,
+            "nx": nx, "nz": nz,
             "classes": {"blocked": 0, "certified": 1, "stress": 2},
             "sha256": sha256_hex(walkability_bin),
         },
@@ -3800,35 +4310,39 @@ def build_scene(definition):
             "heightfield_max_xyz": [
                 heightfield_xmax, maximum_y, heightfield_zmax],
             "playable_min_xz": [
-                definition.playable_bounds_xz[0],
-                definition.playable_bounds_xz[2]],
+                normalized["playable_bounds"][0],
+                normalized["playable_bounds"][2]],
             "playable_max_xz": [
-                definition.playable_bounds_xz[1],
-                definition.playable_bounds_xz[3]],
+                normalized["playable_bounds"][1],
+                normalized["playable_bounds"][3]],
             "lookahead_min_xz": [
-                definition.lookahead_bounds_xz[0],
-                definition.lookahead_bounds_xz[2]],
+                normalized["lookahead_bounds"][0],
+                normalized["lookahead_bounds"][2]],
             "lookahead_max_xz": [
-                definition.lookahead_bounds_xz[1],
-                definition.lookahead_bounds_xz[3]],
+                normalized["lookahead_bounds"][1],
+                normalized["lookahead_bounds"][3]],
         },
         "spawn": {
-            "position": [float(v) for v in definition.spawn_position],
-            "yaw_radians": float(definition.spawn_yaw_radians),
+            "position": list(normalized["spawn"]),
+            "yaw_radians": normalized["yaw"],
         },
-        "regions": {
-            name: [dict(region) for region in definition.regions[name]]
-            for name in ("certified", "stress", "blocked")
-        },
-        "routes": [route.to_json() for route in definition.routes],
+        "regions": normalized["regions"],
+        "routes": normalized["routes"],
     }
-    canonical_json_bytes(metadata)  # rejects non-finite/non-JSON provenance
+    _validate_region_classes(normalized["regions"], grid, classes)
+    _validate_route_classes(
+        normalized["routes"], grid, classes, normalized["lookahead_bounds"])
+    scene_json = canonical_json_bytes(metadata)
+    # One parse/write round trip proves the cached bytes contain a deep,
+    # JSON-native normalization and are the only publication authority.
+    scene_json = canonical_json_bytes(json.loads(scene_json))
     return BuiltScene(
-        definition.scene_id, metadata,
+        definition.scene_id, scene_json,
         terrain_bin, terrain_obj, walkability_bin)
 
 
 def build_scene_pack(definitions):
+    definitions = tuple(definitions)  # materialize a generator exactly once
     ids = tuple(definition.scene_id for definition in definitions)
     if ids != REQUIRED_SCENE_IDS:
         raise ValueError(
@@ -3838,16 +4352,38 @@ def build_scene_pack(definitions):
         "schema": "g1-terrain-scene-index/v1",
         "default_scene_id": "grail-curb-default",
         "scene_ids": list(REQUIRED_SCENE_IDS),
+        "scenes": [{
+            "id": scene.scene_id,
+            "path": f"scenes/{scene.scene_id}/scene.json",
+            "sha256": sha256_hex(scene.scene_json),
+        } for scene in scenes],
         "coordinate_signature": COORDINATE_SIGNATURE,
         "surface_signature": surface_semantics_signature(),
     }
-    return ScenePack(index, scenes)
+    index_json = canonical_json_bytes(index)
+    index_json = canonical_json_bytes(json.loads(index_json))
+    return ScenePack(index_json, scenes)
 ~~~
 
-The heightfield bounds above are the exact promoted-double node rectangle used
-for queries. OBJ X/Z vertices are explicitly binary32-quantized, so the mesh
-bounds record the actual first/last serialized vertex coordinates separately;
-do not assume the two maxima are numerically identical.
+The G1HF header and height samples are first serialized exactly as Task 7
+requires and then decoded from those cached bytes. Header scalars and runtime
+control values (spawn, route points/hold, playable/lookahead/region bounds) are
+normal-or-positive-zero float32 promoted to JSON numbers. Heightfield X/Z
+extrema are the exact binary64 node rectangle computed from those promoted
+float32 header values; height extrema are promoted decoded float32 samples.
+OBJ X/Z vertices are separately binary32-quantized, so mesh bounds record the
+actual first/last serialized vertex coordinates; do not assume the two maxima
+are numerically identical. G1WM is decoded as uint8 and must match G1HF `nx`/
+`nz`; it is never described as a float sidecar.
+
+The sibling C++ scene-catalog consumer must reproduce `_f32_add`, `_f32_sub`,
+`_f32_mul`, `_f32_div`, and `_f32_sqrt` with exactly one binary32 rounding per
+named operation. Route interpolation deliberately performs separate multiply
+then add; FMA contraction is forbidden even under `-ffast-math`. Its strict and
+release tests must use the same half-cell `nextafterf` and three-sample oracle
+above before it consumes these routes. This is a cross-plan handoff requirement;
+do not weaken the independent Python oracle here to accommodate a wider C++
+evaluation path.
 
 - [ ] **Step 5: Run the scene-schema tests**
 
@@ -3858,8 +4394,10 @@ Run:
   tests.python.test_scenes -v
 ~~~
 
-Expected: 5 tests pass; every serialized artifact hash matches the exact bytes
-held by `BuiltScene`, and reversing the catalog is rejected.
+Expected: 8 tests pass; every serialized artifact hash matches the exact cached
+bytes held by `BuiltScene`, one-shot generators are consumed once, repeat builds
+are byte-identical, caller mutation cannot alter cached bytes, decoded G1WM
+classes match route/region semantics, and reversing the catalog is rejected.
 
 - [ ] **Step 6: Commit the scene pack boundary**
 
@@ -5019,6 +5557,10 @@ git commit -m "feat: build exact GRAIL curb scenes"
   or the published scene catalog.
 - Removes obsolete top-level `terrain.bin` and `terrain.obj`; terrain is always
   selected through `scenes/index.json` and a scene directory.
+- The manifest authenticates the exact cached `scenes/index.json`; that index
+  in turn authenticates every exact cached `scenes/<id>/scene.json` through its
+  ordered `{id,path,sha256}` descriptors. The publisher validates both links
+  before writing and again against staged bytes before rename.
 - Publication writes only a unique sibling staging directory and unique sibling
   backup, validates and fsyncs staging before rename, restores the prior output
   on a rename failure, and removes only scratch paths it created itself.
@@ -5160,7 +5702,7 @@ def tiny_scene_pack():
                 "stress": (), "blocked": (),
             },
             routes=(SceneRoute(
-                "fixture", ((0.0, -0.01), (0.0, 0.01)),
+                "fixture", ((0.0, 0.0), (0.0, 0.01)),
                 "traverse", 1, 0.0),),
             walkability=lambda x, z: 1,
         ))
@@ -5256,6 +5798,23 @@ Add the publication tests:
             self.assertEqual(
                 manifest["scene_index"]["sha256"],
                 file_sha256(os.path.join(output, "scenes", "index.json")))
+            with open(os.path.join(output, "scenes", "index.json"), "rb") \
+                    as stream:
+                self.assertEqual(stream.read(), pack.index_json)
+            index = pack.index
+            self.assertEqual(set(index), {
+                "schema", "default_scene_id", "scene_ids", "scenes",
+                "coordinate_signature", "surface_signature",
+            })
+            self.assertEqual(
+                [descriptor["id"] for descriptor in index["scenes"]],
+                list(REQUIRED_SCENE_IDS))
+            for descriptor, scene in zip(index["scenes"], pack.scenes):
+                self.assertEqual(descriptor, {
+                    "id": scene.scene_id,
+                    "path": f"scenes/{scene.scene_id}/scene.json",
+                    "sha256": hashlib.sha256(scene.scene_json).hexdigest(),
+                })
             self.assertEqual(
                 manifest["validation_file"]["sha256"],
                 file_sha256(os.path.join(output, "validation.json")))
@@ -5344,6 +5903,23 @@ Add the publication tests:
                         lambda path: None,
                     )
             self.assertEqual(open(sentinel, "rb").read(), b"last-good")
+
+    def test_publish_rejects_scene_json_not_authenticated_by_index(self):
+        artifacts = ArtifactSet.empty(4, 2)
+        pack = tiny_scene_pack()
+        first = pack.scenes[0]
+        changed = BuiltScene(
+            first.scene_id, first.scene_json + b" ", first.terrain_bin,
+            first.terrain_obj, first.walkability_bin)
+        bad_pack = ScenePack(pack.index_json, (changed, *pack.scenes[1:]))
+        with tempfile.TemporaryDirectory() as temporary:
+            output = os.path.join(temporary, "published")
+            with self.assertRaisesRegex(ValueError, "scene descriptor SHA-256"):
+                publish_artifacts(
+                    output, artifacts, tiny_manifest_base(artifacts), bad_pack,
+                    lambda path: None,
+                )
+            self.assertFalse(os.path.lexists(output))
 ~~~
 
 Import the module itself as
@@ -5386,9 +5962,32 @@ MANIFEST_BASE_KEYS = MOTION_MANIFEST_KEYS - {
 SCENE_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
 
 
+def _deep_normalize_json(value, label="JSON"):
+    if isinstance(value, dict):
+        if any(type(key) is not str for key in value):
+            raise TypeError(f"{label} object keys must be strings")
+        return {
+            key: _deep_normalize_json(child, f"{label}.{key}")
+            for key, child in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _deep_normalize_json(child, f"{label}[{index}]")
+            for index, child in enumerate(value)
+        ]
+    if type(value) is float:
+        if not np.isfinite(value):
+            raise ValueError(f"{label} must be finite")
+        return 0.0 if value == 0.0 else value
+    if type(value) is int or type(value) in (str, bool) or value is None:
+        return value
+    raise TypeError(f"{label} contains non-JSON scalar {type(value).__name__}")
+
+
 def canonical_json_bytes(value):
     return (json.dumps(
-        value, indent=2, sort_keys=True, allow_nan=False,
+        _deep_normalize_json(value),
+        indent=2, sort_keys=True, allow_nan=False,
     ) + "\n").encode("utf-8")
 
 
@@ -5448,10 +6047,39 @@ def _normalized_manifest_base(manifest):
 def _write_scene_pack(staging, scene_pack):
     scenes_root = os.path.join(staging, "scenes")
     os.mkdir(scenes_root)
-    index_ids = tuple(scene_pack.index.get("scene_ids", ()))
+    if canonical_json_bytes(scene_pack.index) != scene_pack.index_json:
+        raise ValueError("cached scene index is not canonical or stable")
+    index = scene_pack.index
+    if not isinstance(index, dict) or set(index) != {
+        "schema", "default_scene_id", "scene_ids", "scenes",
+        "coordinate_signature", "surface_signature",
+    } or index["schema"] != "g1-terrain-scene-index/v1" \
+            or index["default_scene_id"] != "grail-curb-default" \
+            or index["coordinate_signature"] \
+            != "holden-y-up-right-handed-forward-plus-z" \
+            or not isinstance(index["surface_signature"], str) \
+            or not re.fullmatch(r"[0-9a-f]{64}", index["surface_signature"]):
+        raise ValueError("scene index keys or schema changed")
+    index_ids = tuple(index["scene_ids"])
     scene_ids = tuple(scene.scene_id for scene in scene_pack.scenes)
     if index_ids != scene_ids or len(scene_ids) != len(set(scene_ids)):
         raise ValueError("scene index and scene bytes have different IDs")
+    descriptors = index["scenes"]
+    if not isinstance(descriptors, list) \
+            or len(descriptors) != len(scene_pack.scenes):
+        raise ValueError("scene index descriptor count changed")
+    for descriptor, scene in zip(descriptors, scene_pack.scenes):
+        if canonical_json_bytes(scene.metadata) != scene.scene_json:
+            raise ValueError(
+                f"{scene.scene_id}: cached scene JSON is not canonical")
+        expected = {
+            "id": scene.scene_id,
+            "path": f"scenes/{scene.scene_id}/scene.json",
+            "sha256": hashlib.sha256(scene.scene_json).hexdigest(),
+        }
+        if descriptor != expected:
+            raise ValueError(
+                f"{scene.scene_id}: scene descriptor SHA-256/path mismatch")
     _write_bytes_fsync(
         os.path.join(scenes_root, "index.json"), scene_pack.index_json)
     for scene in scene_pack.scenes:
@@ -5561,8 +6189,15 @@ def _validate_staged_artifacts(
     if open(os.path.join(staging, "scenes", "index.json"), "rb").read() \
             != scene_pack.index_json:
         raise ValueError("staged scene index bytes changed")
-    for scene in scene_pack.scenes:
+    for descriptor, scene in zip(
+            scene_pack.index["scenes"], scene_pack.scenes):
         scene_dir = os.path.join(staging, "scenes", scene.scene_id)
+        staged_scene_json = open(
+            os.path.join(scene_dir, "scene.json"), "rb").read()
+        if hashlib.sha256(staged_scene_json).hexdigest() \
+                != descriptor["sha256"]:
+            raise ValueError(
+                f"{scene.scene_id}: staged scene JSON digest is not trusted")
         expected_payloads = {
             "scene.json": scene.scene_json,
             "terrain.bin": scene.terrain_bin,
@@ -5681,9 +6316,10 @@ Run:
   tests.python.test_artifacts -v
 ~~~
 
-Expected: all binary-codec and publication tests pass. Injected candidate,
-scene-byte, and rename failures leave the sentinel as the only prior-output
-file, and successful publication leaves no sibling scratch path.
+Expected: all binary-codec and publication tests pass. Cached/staged scene JSON
+must chain through the ordered index descriptors; injected candidate,
+scene-byte, unauthenticated-scene, and rename failures preserve the prior
+output, and successful publication leaves no sibling scratch path.
 
 - [ ] **Step 6: Refactor the builder to measure all candidates and build all scenes**
 
@@ -5787,7 +6423,7 @@ manifest_base = {
     "feature_dimensions": 31,
     "terrain_dimensions": 4,
     "support_dimensions": 3,
-    "terrain_feature_distances_m": TERRAIN_DISTANCES,
+    "terrain_feature_distances_m": list(TERRAIN_DISTANCES),
     "total_clips": len(sources),
     "grail_clips": len(grail_paths),
     "skipped_clips": 0,
@@ -5998,6 +6634,11 @@ the invalid-argument and mocked builder tests from Task 11:
                 output, "scenes", "grail-curb-default", "terrain.bin")
             with open(default_terrain, "rb") as stream:
                 terrain_header = struct.unpack("<4sIII4f", stream.read(32))
+            scene_json_hashes = {
+                scene_id: file_sha256(os.path.join(
+                    output, "scenes", scene_id, "scene.json"))
+                for scene_id in REQUIRED_SCENE_IDS
+            }
 
         self.assertEqual(manifest["schema"], "g1-terrain-artifacts/v2")
         self.assertIn(
@@ -6010,6 +6651,15 @@ the invalid-argument and mocked builder tests from Task 11:
         self.assertTrue(manifest["diagnostic_mode"])
         self.assertEqual(manifest["support_dimensions"], 3)
         self.assertEqual(index["scene_ids"], list(REQUIRED_SCENE_IDS))
+        self.assertEqual(set(index), {
+            "schema", "default_scene_id", "scene_ids", "scenes",
+            "coordinate_signature", "surface_signature",
+        })
+        self.assertEqual(index["scenes"], [{
+            "id": scene_id,
+            "path": f"scenes/{scene_id}/scene.json",
+            "sha256": scene_json_hashes[scene_id],
+        } for scene_id in REQUIRED_SCENE_IDS])
         self.assertEqual(terrain_header[:2], (b"G1HF", 2))
         self.assertEqual(len(database.positions), len(terrain_features))
         self.assertEqual(len(database.positions), len(terrain_support))
@@ -6132,15 +6782,73 @@ DEFAULT_SOURCE_OPTIONS = {
 }
 _HEIGHTFIELD_HEADER = struct.Struct("<4sIII4f")
 _WALKABILITY_HEADER = struct.Struct("<4sIII")
+SCENE_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
 ~~~
 
 Replace `_read_json` with a byte-preserving canonical reader:
 
 ~~~python
 def _canonical_json_bytes(value):
+    def normalize(child, label="JSON"):
+        if isinstance(child, dict):
+            _require(all(type(key) is str for key in child),
+                     f"{label} object keys must be strings")
+            return {
+                key: normalize(item, f"{label}.{key}")
+                for key, item in child.items()
+            }
+        if isinstance(child, (list, tuple)):
+            return [
+                normalize(item, f"{label}[{index}]")
+                for index, item in enumerate(child)
+            ]
+        if type(child) is float:
+            _require(np.isfinite(child), f"{label} must be finite")
+            return 0.0 if child == 0.0 else child
+        if type(child) is int or type(child) in (str, bool) or child is None:
+            return child
+        raise ValueError(
+            f"{label} contains non-JSON scalar {type(child).__name__}")
+
     return (json.dumps(
-        value, indent=2, sort_keys=True, allow_nan=False,
+        normalize(value), indent=2, sort_keys=True, allow_nan=False,
     ) + "\n").encode("utf-8")
+
+
+def _json_int(value, label, minimum=None):
+    _require(type(value) is int, f"{label} must be an integer, not bool")
+    if minimum is not None:
+        _require(value >= minimum, f"{label} must be at least {minimum}")
+    return value
+
+
+def _json_float(value, label):
+    _require(type(value) is float and np.isfinite(value),
+             f"{label} must be a finite JSON float")
+    _require(value != 0.0 or struct.pack("<d", value) == struct.pack("<d", 0.0),
+             f"{label} must encode positive zero")
+    return value
+
+
+def _json_f32(value, label, positive=False):
+    value = _json_float(value, label)
+    try:
+        encoded = struct.pack("<f", value)
+    except (OverflowError, struct.error) as error:
+        raise ValueError(f"{label} is outside float32") from error
+    bits = struct.unpack("<I", encoded)[0]
+    exponent = bits & 0x7f800000
+    magnitude = bits & 0x7fffffff
+    _require(exponent != 0x7f800000 and not (
+        magnitude != 0 and exponent == 0),
+        f"{label} must be normal-or-positive-zero float32")
+    decoded = struct.unpack("<f", encoded)[0]
+    _require(float(decoded) == value,
+             f"{label} is not an exact promoted float32")
+    if positive:
+        _require(bits & 0x80000000 == 0 and exponent not in (0, 0x7f800000),
+                 f"{label} must be positive-normal float32")
+    return value
 
 
 def _read_json(path):
@@ -6221,7 +6929,7 @@ def _validate_manifest_header(manifest):
              "terrain_dimensions must be 4")
     _require(manifest["support_dimensions"] == SUPPORT_DIMENSIONS,
              "support_dimensions must be 3")
-    _require(manifest["terrain_feature_distances_m"] == TERRAIN_DISTANCES,
+    _require(manifest["terrain_feature_distances_m"] == list(TERRAIN_DISTANCES),
              "terrain feature distances changed")
     _require(isinstance(manifest["diagnostic_mode"], bool),
              "diagnostic_mode must be boolean")
@@ -6387,6 +7095,9 @@ def _parse_heightfield(path, metadata):
     }
     _require(isinstance(metadata, dict) and set(metadata) == expected_keys,
              "scene heightfield metadata keys are invalid")
+    _json_int(metadata["version"], "heightfield version", 1)
+    _json_int(metadata["nx"], "heightfield nx", 2)
+    _json_int(metadata["nz"], "heightfield nz", 2)
     fixed = {
         "path": "terrain.bin", "schema": "G1HF/v2", "version": 2,
         "nx": nx, "nz": nz, "interpolation": HEIGHTFIELD_INTERPOLATION,
@@ -6398,7 +7109,9 @@ def _parse_heightfield(path, metadata):
         ("origin_x", ox), ("origin_z", oz),
         ("cell_size_m", cell), ("exterior_height_m", exterior),
     ):
-        expected_value = _finite_number(metadata[key], f"heightfield {key}")
+        expected_value = _json_f32(
+            metadata[key], f"heightfield {key}",
+            positive=key == "cell_size_m")
         _require(expected_value == actual
                  and struct.pack("<f", expected_value)
                  == struct.pack("<f", actual),
@@ -6408,6 +7121,9 @@ def _parse_heightfield(path, metadata):
              "scene heightfield cell size must be 0.02")
     _require(metadata["exterior_height_m"] == 0.0 and exterior == 0.0,
              "scene heightfield exterior height must be zero")
+    _require(type(metadata["sha256"]) is str
+             and re.fullmatch(r"[0-9a-f]{64}", metadata["sha256"]),
+             "scene heightfield SHA-256 is invalid")
     _require(_sha256_file(path) == metadata["sha256"],
              "scene heightfield SHA-256 mismatch")
     return HeightGrid(
@@ -6419,20 +7135,50 @@ def _parse_heightfield(path, metadata):
 
 
 def _parse_walkability(path, metadata, grid):
-    values = read_walkability(path)
-    _require(values.shape == (grid.nz, grid.nx),
+    payload = open(path, "rb").read()
+    _require(len(payload) >= _WALKABILITY_HEADER.size,
+             f"{path}: truncated G1WM header")
+    magic, version, nx, nz = _WALKABILITY_HEADER.unpack_from(payload)
+    _require(magic == b"G1WM" and version == 1,
+             f"{path}: walkability must be G1WM/v1")
+    _require(nx >= 2 and nz >= 2, f"{path}: invalid G1WM dimensions")
+    _require(nx <= (len(payload) - 16),
+             f"{path}: overflowing G1WM dimensions")
+    expected_size = 16 + nx * nz
+    _require(len(payload) == expected_size,
+             f"{path}: truncated or trailing G1WM payload")
+    values = np.frombuffer(payload, np.uint8, nx * nz, 16).reshape(nz, nx).copy()
+    _require(np.isin(values, np.array([0, 1, 2], np.uint8)).all(),
+             f"{path}: invalid G1WM class")
+    _require((nx, nz) == (grid.nx, grid.nz),
              "walkability dimensions differ from heightfield")
+    # Exercise Task 7's public reader but retain the validator's independent
+    # header/size/class parse as the authority.
+    _require(np.array_equal(read_walkability(path), values),
+             f"{path}: public G1WM reader differs from independent parse")
     expected_keys = {
         "path", "schema", "version", "nx", "nz", "classes", "sha256",
     }
     _require(isinstance(metadata, dict) and set(metadata) == expected_keys,
              "walkability metadata keys are invalid")
+    _json_int(metadata["version"], "walkability version", 1)
+    _json_int(metadata["nx"], "walkability nx", 2)
+    _json_int(metadata["nz"], "walkability nz", 2)
+    _require(type(metadata["classes"]) is dict
+             and set(metadata["classes"]) == {
+                 "blocked", "certified", "stress"}
+             and all(type(value) is int
+                     for value in metadata["classes"].values()),
+             "walkability classes must be exact integers, not bool")
     _require(metadata == {
         "path": "walkability.bin", "schema": "G1WM/v1", "version": 1,
         "nx": grid.nx, "nz": grid.nz,
         "classes": {"blocked": 0, "certified": 1, "stress": 2},
         "sha256": metadata["sha256"],
     }, "walkability metadata values are invalid")
+    _require(type(metadata["sha256"]) is str
+             and re.fullmatch(r"[0-9a-f]{64}", metadata["sha256"]),
+             "walkability SHA-256 is invalid")
     _require(_sha256_file(path) == metadata["sha256"],
              "walkability SHA-256 mismatch")
     return values
@@ -6445,6 +7191,9 @@ def _validate_obj(path, metadata, grid):
     _require(metadata["path"] == "terrain.obj"
              and metadata["schema"] == "obj/v1",
              "mesh path or schema mismatch")
+    _require(type(metadata["sha256"]) is str
+             and re.fullmatch(r"[0-9a-f]{64}", metadata["sha256"]),
+             "mesh SHA-256 is invalid")
     payload = open(path, "rb").read()
     _require(hashlib.sha256(payload).hexdigest() == metadata["sha256"],
              "mesh SHA-256 mismatch")
@@ -6458,24 +7207,87 @@ def _xz_inside(bounds, x, z, tolerance=1e-9):
 
 
 def _walkability_at(grid, values, x, z):
-    gx = (x - grid.origin_x) / grid.cell_size
-    gz = (z - grid.origin_z) / grid.cell_size
+    gx = _f32_div(
+        _f32_sub(x, grid.origin_x, "walkability gx numerator"),
+        grid.cell_size, "walkability gx")
+    gz = _f32_div(
+        _f32_sub(z, grid.origin_z, "walkability gz numerator"),
+        grid.cell_size, "walkability gz")
     _require(0.0 <= gx <= grid.nx - 1 and 0.0 <= gz <= grid.nz - 1,
              "route sample is outside walkability grid")
-    ix = min(int(np.floor(gx + 0.5)), grid.nx - 1)
-    iz = min(int(np.floor(gz + 0.5)), grid.nz - 1)
+    ix = min(int(np.floor(np.float32(
+        _f32_add(gx, 0.5, "walkability gx tie offset")))), grid.nx - 1)
+    iz = min(int(np.floor(np.float32(
+        _f32_add(gz, 0.5, "walkability gz tie offset")))), grid.nz - 1)
     return int(values[iz, ix])
+
+
+def _f32_round(value, label):
+    try:
+        bits = struct.unpack("<I", struct.pack("<f", float(value)))[0]
+    except (TypeError, ValueError, OverflowError, struct.error) as error:
+        raise ValueError(f"{label} is outside float32") from error
+    exponent = bits & 0x7f800000
+    magnitude = bits & 0x7fffffff
+    _require(exponent != 0x7f800000 and not (
+        magnitude != 0 and exponent == 0),
+        f"{label} must be normal-or-positive-zero float32")
+    decoded = struct.unpack("<f", struct.pack("<I", bits))[0]
+    return 0.0 if decoded == 0.0 else float(decoded)
+
+
+def _f32_add(left, right, label):
+    return _f32_round(
+        np.float32(np.float32(left) + np.float32(right)), label)
+
+
+def _f32_sub(left, right, label):
+    return _f32_round(
+        np.float32(np.float32(left) - np.float32(right)), label)
+
+
+def _f32_mul(left, right, label):
+    return _f32_round(
+        np.float32(np.float32(left) * np.float32(right)), label)
+
+
+def _f32_div(left, right, label):
+    return _f32_round(
+        np.float32(np.float32(left) / np.float32(right)), label)
+
+
+def _f32_sqrt(value, label):
+    return _f32_round(np.float32(np.sqrt(np.float32(value))), label)
 
 
 def _route_samples(points, maximum_step):
     output = [points[0]]
+    step = _f32_round(maximum_step, "route maximum sample step")
+    _require(step > 0.0, "route maximum sample step must be positive")
     for start, stop in zip(points, points[1:]):
-        distance = float(np.linalg.norm(np.asarray(stop) - np.asarray(start)))
-        count = max(1, int(np.ceil(distance / maximum_step)))
-        output.extend(tuple(
-            (1.0 - alpha) * np.asarray(start) + alpha * np.asarray(stop)
-        ) for alpha in np.linspace(1.0 / count, 1.0, count))
-    return output
+        dx = _f32_sub(stop[0], start[0], "route segment dx")
+        dz = _f32_sub(stop[1], start[1], "route segment dz")
+        squared = _f32_add(
+            _f32_mul(dx, dx, "route segment dx squared"),
+            _f32_mul(dz, dz, "route segment dz squared"),
+            "route segment squared length")
+        distance = _f32_sqrt(squared, "route segment length")
+        ratio = _f32_div(distance, step, "route segment sample ratio")
+        count = max(1, int(np.ceil(np.float32(ratio))))
+        for index in range(1, count + 1):
+            if index == count:
+                output.append(stop)
+                continue
+            alpha = _f32_div(index, count, "route sample alpha")
+            output.append((
+                _f32_add(
+                    start[0], _f32_mul(alpha, dx, "route sample dx"),
+                    "route sample x"),
+                _f32_add(
+                    start[1], _f32_mul(alpha, dz, "route sample dz"),
+                    "route sample z"),
+            ))
+    return tuple(output)
 
 
 def _validate_route(route, grid, walkability, lookahead_bounds):
@@ -6483,21 +7295,38 @@ def _validate_route(route, grid, walkability, lookahead_bounds):
         "id", "waypoints_xz", "expected_outcome", "walkability_class",
         "landing_hold_seconds",
     }, "scene route keys are invalid")
-    _require(isinstance(route["id"], str) and route["id"],
+    _require(type(route["id"]) is str
+             and SCENE_ID_PATTERN.fullmatch(route["id"]),
              "scene route ID is invalid")
-    points = np.asarray(route["waypoints_xz"], np.float64)
-    _require(points.ndim == 2 and points.shape[0] >= 2 and points.shape[1] == 2
-             and np.isfinite(points).all(), "scene route points are invalid")
-    hold = _finite_number(route["landing_hold_seconds"], "landing hold")
+    raw_points = route["waypoints_xz"]
+    _require(type(raw_points) is list and len(raw_points) >= 2,
+             "scene route points are invalid")
+    points = []
+    for index, point in enumerate(raw_points):
+        _require(type(point) is list and len(point) == 2,
+                 "scene route points are invalid")
+        points.append((
+            _json_f32(point[0], f"route waypoint {index} x"),
+            _json_f32(point[1], f"route waypoint {index} z"),
+        ))
+    points = tuple(points)
+    _require(all(start != stop for start, stop in zip(points, points[1:])),
+             "scene route requires every nonzero segment")
+    hold = _json_f32(route["landing_hold_seconds"], "landing hold")
     _require(hold >= 0.0, "landing hold must be nonnegative")
-    _require(hold == 0.0 or points.shape[0] >= 4,
+    _require(hold == 0.0 or len(points) >= 4,
              "landing hold requires waypoint 2 and a later exit")
+    _require(type(route["expected_outcome"]) is str,
+             "scene route outcome must be a string")
+    walkability_class = _json_int(
+        route["walkability_class"], "route walkability class")
     expected_class = {
         "traverse": 1, "safe-stop": 0, "traverse-or-safe-stop": 2,
     }.get(route["expected_outcome"])
-    _require(expected_class == route["walkability_class"],
+    _require(expected_class == walkability_class,
              "scene route outcome/class mismatch")
-    samples = _route_samples(points, grid.cell_size / 2.0)
+    samples = _route_samples(points, _f32_div(
+        grid.cell_size, 2.0, "route half-cell sample step"))
     for x, z in samples:
         _require(_xz_inside(lookahead_bounds, float(x), float(z)),
                  "scene route leaves lookahead bounds")
@@ -6515,6 +7344,7 @@ def _validate_route(route, grid, walkability, lookahead_bounds):
         _require(all(value == 1 for value in classes[:first_blocked])
                  and all(value == 0 for value in classes[first_blocked:]),
                  "safe-stop route re-enters traversable cells")
+    return points
 ~~~
 
 - [ ] **Step 5: Validate exact scene/index schemas, bounds, procedural bytes, and GRAIL parity**
@@ -6522,22 +7352,38 @@ def _validate_route(route, grid, walkability, lookahead_bounds):
 Add:
 
 ~~~python
-def _bounds_pair(metadata, minimum_key, maximum_key, dimensions, label):
-    minimum = np.asarray(metadata[minimum_key], np.float64)
-    maximum = np.asarray(metadata[maximum_key], np.float64)
-    _require(minimum.shape == (dimensions,) and maximum.shape == (dimensions,)
-             and np.isfinite(minimum).all() and np.isfinite(maximum).all()
-             and np.all(minimum <= maximum), f"{label} bounds are invalid")
+def _bounds_pair(
+    metadata, minimum_key, maximum_key, dimensions, label, f32,
+):
+    raw_minimum = metadata[minimum_key]
+    raw_maximum = metadata[maximum_key]
+    _require(type(raw_minimum) is list and type(raw_maximum) is list
+             and len(raw_minimum) == dimensions
+             and len(raw_maximum) == dimensions,
+             f"{label} bounds are invalid")
+    scalar = _json_f32 if f32 else _json_float
+    minimum = np.array([
+        scalar(value, f"{label} minimum[{index}]")
+        for index, value in enumerate(raw_minimum)
+    ], np.float64)
+    maximum = np.array([
+        scalar(value, f"{label} maximum[{index}]")
+        for index, value in enumerate(raw_maximum)
+    ], np.float64)
+    strict_axes = (0, 1) if dimensions == 2 else (0, 2)
+    _require(all(minimum[index] < maximum[index] for index in strict_axes)
+             and all(minimum[index] <= maximum[index]
+                     for index in range(dimensions)),
+             f"{label} bounds must be strict in X/Z")
     return minimum, maximum
 
 
-def _validate_scene(root, scene_id, manifest_surface_signature):
+def _validate_scene(
+    root, scene_id, scene_path, manifest_surface_signature,
+):
     scene_root = os.path.join(root, "scenes", scene_id)
     _require(os.path.isdir(scene_root) and not os.path.islink(scene_root),
              f"missing scene directory {scene_id}")
-    scene_path = _regular_relative_file(
-        root, os.path.join("scenes", scene_id, "scene.json"),
-        f"{scene_id} metadata")
     scene = _read_json(scene_path)
     _require(isinstance(scene, dict) and set(scene) == {
         "schema", "id", "label", "provenance", "coordinate_signature",
@@ -6547,21 +7393,34 @@ def _validate_scene(root, scene_id, manifest_surface_signature):
     _require(scene["schema"] == "g1-terrain-scene/v1"
              and scene["id"] == scene_id,
              f"{scene_id}: scene schema or ID mismatch")
-    _require(isinstance(scene["label"], str) and scene["label"],
+    _require(type(scene["label"]) is str and scene["label"],
              f"{scene_id}: label is invalid")
     _require(scene["coordinate_signature"] == COORDINATE_SIGNATURE,
              f"{scene_id}: coordinate signature mismatch")
     _require(scene["surface_signature"] == manifest_surface_signature,
              f"{scene_id}: surface signature mismatch")
-    _require(scene["terrain_feature_distances_m"] == TERRAIN_DISTANCES,
+    _require(type(scene["terrain_feature_distances_m"]) is list
+             and scene["terrain_feature_distances_m"]
+             == list(TERRAIN_DISTANCES),
              f"{scene_id}: terrain distances mismatch")
     provenance = scene["provenance"]
     _require(isinstance(provenance, dict) and set(provenance) == {
         "kind", "source_ids", "parameters",
-    } and provenance["kind"] in ("grail", "procedural")
-             and isinstance(provenance["source_ids"], list)
-             and isinstance(provenance["parameters"], dict),
+    } and type(provenance["kind"]) is str
+             and provenance["kind"] in ("grail", "procedural")
+             and type(provenance["source_ids"]) is list
+             and all(type(value) is str and value
+                     for value in provenance["source_ids"])
+             and type(provenance["parameters"]) is dict
+             and ((provenance["kind"] == "procedural"
+                   and not provenance["source_ids"])
+                  or (provenance["kind"] == "grail"
+                      and len(provenance["source_ids"]) == 2)),
              f"{scene_id}: provenance is invalid")
+
+    for key in ("heightfield", "mesh", "walkability"):
+        _require(type(scene[key]) is dict,
+                 f"{scene_id}: {key} descriptor must be an object")
 
     terrain_path = _regular_relative_file(
         scene_root, scene["heightfield"].get("path"),
@@ -6583,14 +7442,14 @@ def _validate_scene(root, scene_id, manifest_surface_signature):
         "lookahead_min_xz", "lookahead_max_xz",
     }, f"{scene_id}: bounds keys are invalid")
     mesh_min, mesh_max = _bounds_pair(
-        bounds, "mesh_min_xyz", "mesh_max_xyz", 3, "mesh")
+        bounds, "mesh_min_xyz", "mesh_max_xyz", 3, "mesh", True)
     height_min, height_max = _bounds_pair(
         bounds, "heightfield_min_xyz", "heightfield_max_xyz", 3,
-        "heightfield")
+        "heightfield", False)
     playable_min, playable_max = _bounds_pair(
-        bounds, "playable_min_xz", "playable_max_xz", 2, "playable")
+        bounds, "playable_min_xz", "playable_max_xz", 2, "playable", True)
     lookahead_min, lookahead_max = _bounds_pair(
-        bounds, "lookahead_min_xz", "lookahead_max_xz", 2, "lookahead")
+        bounds, "lookahead_min_xz", "lookahead_max_xz", 2, "lookahead", True)
     heightfield_derived_min = np.array([
         grid.origin_x, float(grid.heights.min()), grid.origin_z])
     heightfield_derived_max = np.array([
@@ -6629,51 +7488,82 @@ def _validate_scene(root, scene_id, manifest_surface_signature):
     lookahead = (
         lookahead_min[0], lookahead_max[0],
         lookahead_min[1], lookahead_max[1])
-    for x, z in (
-        (playable[0], playable[2]), (playable[1], playable[3]),
-        (lookahead[0], lookahead[2]), (lookahead[1], lookahead[3]),
-    ):
-        _require(_xz_inside(grid_bounds, x, z),
-                 f"{scene_id}: playable/lookahead bounds leave heightfield")
+    _require(
+        grid_bounds[0] <= lookahead[0] < lookahead[1] <= grid_bounds[1]
+        and grid_bounds[2] <= lookahead[2] < lookahead[3] <= grid_bounds[3],
+        f"{scene_id}: lookahead bounds leave heightfield")
+    _require(
+        lookahead[0] <= playable[0] < playable[1] <= lookahead[1]
+        and lookahead[2] <= playable[2] < playable[3] <= lookahead[3],
+        f"{scene_id}: playable bounds leave lookahead")
     spawn = scene["spawn"]
     _require(isinstance(spawn, dict) and set(spawn) == {
         "position", "yaw_radians",
     }, f"{scene_id}: spawn keys are invalid")
-    position = np.asarray(spawn["position"], np.float64)
-    yaw = _finite_number(spawn["yaw_radians"], "spawn yaw")
-    _require(position.shape == (3,) and np.isfinite(position).all()
-             and np.isfinite(yaw)
-             and _xz_inside(playable, position[0], position[2]),
+    _require(type(spawn["position"]) is list
+             and len(spawn["position"]) == 3,
+             f"{scene_id}: spawn position is invalid")
+    position = tuple(
+        _json_f32(value, f"spawn position[{index}]")
+        for index, value in enumerate(spawn["position"])
+    )
+    _json_f32(spawn["yaw_radians"], "spawn yaw")
+    _require(_xz_inside(playable, position[0], position[2]),
              f"{scene_id}: spawn is invalid or outside playable bounds")
     regions = scene["regions"]
     _require(isinstance(regions, dict) and set(regions) == {
         "certified", "stress", "blocked",
     }, f"{scene_id}: region keys are invalid")
-    for class_name, entries in regions.items():
-        _require(isinstance(entries, list),
+    region_ids = set()
+    expected_region_class = {"blocked": 0, "certified": 1, "stress": 2}
+    for class_name in ("certified", "stress", "blocked"):
+        entries = regions[class_name]
+        _require(type(entries) is list,
                  f"{scene_id}: {class_name} regions must be a list")
         for entry in entries:
             _require(isinstance(entry, dict) and set(entry) == {
                 "id", "bounds_xz",
-            } and isinstance(entry["id"], str) and entry["id"],
+            } and type(entry["id"]) is str
+                     and SCENE_ID_PATTERN.fullmatch(entry["id"]),
                      f"{scene_id}: invalid {class_name} region")
-            region = np.asarray(entry["bounds_xz"], np.float64)
-            _require(region.shape == (4,) and np.isfinite(region).all()
-                     and region[0] <= region[1] and region[2] <= region[3],
+            _require(entry["id"] not in region_ids,
+                     f"{scene_id}: duplicate region ID")
+            region_ids.add(entry["id"])
+            _require(type(entry["bounds_xz"]) is list
+                     and len(entry["bounds_xz"]) == 4,
                      f"{scene_id}: invalid {class_name} region bounds")
+            region = tuple(
+                _json_f32(value, f"{class_name} region bounds[{index}]")
+                for index, value in enumerate(entry["bounds_xz"])
+            )
+            _require(region[0] < region[1] and region[2] < region[3]
+                     and lookahead[0] <= region[0] < region[1] <= lookahead[1]
+                     and lookahead[2] <= region[2] < region[3] <= lookahead[3],
+                     f"{scene_id}: invalid {class_name} region bounds")
+            observed = []
+            for iz in range(grid.nz):
+                z = float(grid.origin_z) + iz * float(grid.cell_size)
+                if not region[2] <= z <= region[3]:
+                    continue
+                for ix in range(grid.nx):
+                    x = float(grid.origin_x) + ix * float(grid.cell_size)
+                    if region[0] <= x <= region[1]:
+                        observed.append(int(walkability[iz, ix]))
+            _require(observed and all(
+                value == expected_region_class[class_name]
+                for value in observed),
+                f"{scene_id}: {class_name} region disagrees with G1WM")
     _require(isinstance(scene["routes"], list) and scene["routes"],
              f"{scene_id}: routes must be non-empty")
     route_ids = []
     for route in scene["routes"]:
-        _validate_route(route, grid, walkability, lookahead)
+        points = _validate_route(route, grid, walkability, lookahead)
         route_ids.append(route["id"])
-        _require(np.allclose(
-            np.asarray(route["waypoints_xz"][0], np.float64),
-            position[[0, 2]], rtol=0.0, atol=1e-9),
+        _require(points[0] == (position[0], position[2]),
             f"{scene_id}: route does not start at scene spawn")
         if provenance["kind"] == "procedural" \
                 and route["expected_outcome"] == "traverse":
-            for x, z in route["waypoints_xz"]:
+            for x, z in points:
                 _require(
                     x - grid_bounds[0] >= 1.0 - 1e-9
                     and grid_bounds[1] - x >= 1.0 - 1e-9
@@ -6687,20 +7577,41 @@ def _validate_scene(root, scene_id, manifest_surface_signature):
     return scene, grid, walkability
 
 
-def _validate_scene_catalog(root, manifest):
-    index_path = os.path.join(root, "scenes", "index.json")
+def _validate_scene_catalog(root, manifest, index_path):
     index = _read_json(index_path)
-    _require(index == {
-        "schema": "g1-terrain-scene-index/v1",
-        "default_scene_id": "grail-curb-default",
-        "scene_ids": list(REQUIRED_SCENE_IDS),
-        "coordinate_signature": COORDINATE_SIGNATURE,
-        "surface_signature": surface_semantics_signature(),
-    }, "scene index contract changed")
+    _require(type(index) is dict and set(index) == {
+        "schema", "default_scene_id", "scene_ids", "scenes",
+        "coordinate_signature", "surface_signature",
+    }, "scene index key set changed")
+    _require(index["schema"] == "g1-terrain-scene-index/v1"
+             and index["default_scene_id"] == "grail-curb-default"
+             and type(index["scene_ids"]) is list
+             and index["scene_ids"] == list(REQUIRED_SCENE_IDS)
+             and index["coordinate_signature"] == COORDINATE_SIGNATURE
+             and index["surface_signature"] == surface_semantics_signature(),
+             "scene index contract changed")
+    descriptors = index["scenes"]
+    _require(type(descriptors) is list
+             and len(descriptors) == len(REQUIRED_SCENE_IDS),
+             "scene index descriptor count changed")
     scenes = {}
-    for scene_id in REQUIRED_SCENE_IDS:
+    for scene_id, descriptor in zip(REQUIRED_SCENE_IDS, descriptors):
+        _require(type(descriptor) is dict and set(descriptor) == {
+            "id", "path", "sha256",
+        }, f"{scene_id}: scene index descriptor keys changed")
+        _require(descriptor["id"] == scene_id
+                 and descriptor["path"]
+                 == f"scenes/{scene_id}/scene.json",
+                 f"{scene_id}: scene index descriptor ID/path mismatch")
+        _require(type(descriptor["sha256"]) is str
+                 and re.fullmatch(r"[0-9a-f]{64}", descriptor["sha256"]),
+                 f"{scene_id}: scene descriptor SHA-256 is invalid")
+        scene_path = _regular_relative_file(
+            root, descriptor["path"], f"{scene_id} metadata")
+        _require(_sha256_file(scene_path) == descriptor["sha256"],
+                 f"{scene_id}: scene descriptor SHA-256 mismatch")
         scenes[scene_id] = _validate_scene(
-            root, scene_id, manifest["surface"]["signature"])
+            root, scene_id, scene_path, manifest["surface"]["signature"])
 
     expected_procedural = {
         definition.scene_id: build_scene(definition)
@@ -6794,7 +7705,7 @@ def validate_artifact_directory(
              "artifact directory does not exist or is a symlink")
     manifest = _read_json(os.path.join(root, "manifest.json"))
     _validate_manifest_header(manifest)
-    database_path, features_path, support_path, _, validation_path = \
+    database_path, features_path, support_path, index_path, validation_path = \
         _validate_motion_descriptors(root, manifest)
     validation_file = _read_json(validation_path)
     _require(validation_file == manifest["validation"],
@@ -6816,7 +7727,7 @@ def validate_artifact_directory(
         np.linalg.norm(database.rotations, axis=-1) - 1.0)))
     _require(quaternion_error <= 1e-4,
              "database quaternion norm error exceeds 0.0001")
-    scenes = _validate_scene_catalog(root, manifest)
+    scenes = _validate_scene_catalog(root, manifest, index_path)
     _validate_exact_file_tree(root)
     source_rows = 0
     if full_source_validation:
@@ -6875,6 +7786,25 @@ subtest:
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn(expected_message, result.stderr)
 
+            def resign_scene(preserve, relative):
+                scene_path = os.path.join(output, relative)
+                index_relative = os.path.join("scenes", "index.json")
+                index_path = preserve(index_relative)
+                with open(index_path) as stream:
+                    index = json.load(stream)
+                descriptor = next(
+                    value for value in index["scenes"]
+                    if value["path"] == relative.replace(os.sep, "/"))
+                descriptor["sha256"] = file_sha256(scene_path)
+                with open(index_path, "wb") as stream:
+                    stream.write(canonical_json_bytes(index))
+                manifest_path = preserve("manifest.json")
+                with open(manifest_path) as stream:
+                    manifest = json.load(stream)
+                manifest["scene_index"]["sha256"] = file_sha256(index_path)
+                with open(manifest_path, "wb") as stream:
+                    stream.write(canonical_json_bytes(manifest))
+
             def duplicate_manifest_key(preserve):
                 with open(preserve("manifest.json"), "wb") as stream:
                     stream.write(b'{"schema":"x","schema":"y"}\n')
@@ -6908,6 +7838,36 @@ subtest:
             scene_relative = os.path.join(
                 "scenes", "stairs-shallow", "scene.json")
 
+            def corrupt_untrusted_scene_json(preserve):
+                path = preserve(scene_relative)
+                with open(path) as stream:
+                    scene = json.load(stream)
+                scene["label"] = "tampered without index update"
+                with open(path, "wb") as stream:
+                    stream.write(canonical_json_bytes(scene))
+
+            rejection(
+                "scene_trust_root", "scene descriptor SHA-256 mismatch",
+                corrupt_untrusted_scene_json)
+
+            def corrupt_index_without_manifest_update(preserve):
+                path = preserve(scene_relative)
+                with open(path) as stream:
+                    scene = json.load(stream)
+                scene["label"] = "tampered with descriptor only"
+                with open(path, "wb") as stream:
+                    stream.write(canonical_json_bytes(scene))
+                index_path = preserve(os.path.join("scenes", "index.json"))
+                with open(index_path) as stream:
+                    index = json.load(stream)
+                index["scenes"][4]["sha256"] = file_sha256(path)
+                with open(index_path, "wb") as stream:
+                    stream.write(canonical_json_bytes(index))
+
+            rejection(
+                "index_trust_root", "scene index SHA-256 mismatch",
+                corrupt_index_without_manifest_update)
+
             def corrupt_diagonal(preserve):
                 path = preserve(scene_relative)
                 with open(path) as stream:
@@ -6915,6 +7875,7 @@ subtest:
                 scene["heightfield"]["diagonal"] = "opposite-diagonal"
                 with open(path, "wb") as stream:
                     stream.write(canonical_json_bytes(scene))
+                resign_scene(preserve, scene_relative)
 
             rejection("diagonal", "heightfield diagonal mismatch", corrupt_diagonal)
 
@@ -6927,6 +7888,7 @@ subtest:
                     np.float32(np.inf)))
                 with open(path, "wb") as stream:
                     stream.write(canonical_json_bytes(scene))
+                resign_scene(preserve, scene_relative)
 
             rejection(
                 "exact_origin_metadata", "heightfield origin_x mismatch",
@@ -6942,6 +7904,7 @@ subtest:
                     list(scene["bounds"]["heightfield_max_xyz"])
                 with open(path, "wb") as stream:
                     stream.write(canonical_json_bytes(scene))
+                resign_scene(preserve, scene_relative)
 
             rejection(
                 "distinct_mesh_bounds", "mesh maximum mismatch",
@@ -6965,6 +7928,7 @@ subtest:
                     hashlib.sha256(payload).hexdigest()
                 with open(scene_path, "wb") as stream:
                     stream.write(canonical_json_bytes(scene))
+                resign_scene(preserve, scene_relative)
 
             rejection(
                 "coordinated_subnormal_header", "normal-or-positive-zero",
@@ -6987,6 +7951,7 @@ subtest:
                     hashlib.sha256(payload).hexdigest()
                 with open(scene_path, "wb") as stream:
                     stream.write(canonical_json_bytes(scene))
+                resign_scene(preserve, scene_relative)
 
             rejection(
                 "coordinated_negative_zero_header", "positive-zero",
@@ -7008,6 +7973,7 @@ subtest:
                     hashlib.sha256(payload).hexdigest()
                 with open(scene_path, "wb") as stream:
                     stream.write(canonical_json_bytes(scene))
+                resign_scene(preserve, scene_relative)
 
             rejection(
                 "coordinated_subnormal_payload", "normal-or-positive-zero",
@@ -7020,8 +7986,154 @@ subtest:
                 scene["routes"][0]["waypoints_xz"][1] = [999.0, 999.0]
                 with open(path, "wb") as stream:
                     stream.write(canonical_json_bytes(scene))
+                resign_scene(preserve, scene_relative)
 
             rejection("route", "route leaves lookahead", corrupt_route)
+
+            def corrupt_degenerate_playable_bounds(preserve):
+                path = preserve(scene_relative)
+                with open(path) as stream:
+                    scene = json.load(stream)
+                scene["bounds"]["playable_max_xz"][0] = \
+                    scene["bounds"]["playable_min_xz"][0]
+                with open(path, "wb") as stream:
+                    stream.write(canonical_json_bytes(scene))
+                resign_scene(preserve, scene_relative)
+
+            rejection(
+                "strict_playable_bounds", "strict in X/Z",
+                corrupt_degenerate_playable_bounds)
+
+            def corrupt_duplicate_region_id(preserve):
+                path = preserve(scene_relative)
+                with open(path) as stream:
+                    scene = json.load(stream)
+                scene["regions"]["stress"].append({
+                    "id": scene["regions"]["certified"][0]["id"],
+                    "bounds_xz": [-0.2, 0.2, 0.2, 0.4],
+                })
+                with open(path, "wb") as stream:
+                    stream.write(canonical_json_bytes(scene))
+                resign_scene(preserve, scene_relative)
+
+            rejection(
+                "duplicate_region_id", "duplicate region ID",
+                corrupt_duplicate_region_id)
+
+            def corrupt_region_outside_lookahead(preserve):
+                path = preserve(scene_relative)
+                with open(path) as stream:
+                    scene = json.load(stream)
+                scene["regions"]["certified"][0]["bounds_xz"][0] = -999.0
+                with open(path, "wb") as stream:
+                    stream.write(canonical_json_bytes(scene))
+                resign_scene(preserve, scene_relative)
+
+            rejection(
+                "region_containment", "invalid certified region bounds",
+                corrupt_region_outside_lookahead)
+
+            def corrupt_route_start(preserve):
+                path = preserve(scene_relative)
+                with open(path) as stream:
+                    scene = json.load(stream)
+                cell = np.float32(scene["heightfield"]["cell_size_m"])
+                point = scene["routes"][0]["waypoints_xz"][0]
+                point[0] = float(np.float32(np.float32(point[0]) + cell))
+                with open(path, "wb") as stream:
+                    stream.write(canonical_json_bytes(scene))
+                resign_scene(preserve, scene_relative)
+
+            rejection(
+                "route_start", "route does not start at scene spawn",
+                corrupt_route_start)
+
+            def corrupt_zero_route_segment(preserve):
+                path = preserve(scene_relative)
+                with open(path) as stream:
+                    scene = json.load(stream)
+                scene["routes"][0]["waypoints_xz"][1] = \
+                    list(scene["routes"][0]["waypoints_xz"][0])
+                with open(path, "wb") as stream:
+                    stream.write(canonical_json_bytes(scene))
+                resign_scene(preserve, scene_relative)
+
+            rejection(
+                "zero_route_segment", "nonzero segment",
+                corrupt_zero_route_segment)
+
+            def corrupt_route_class_segment(preserve):
+                path = preserve(scene_relative)
+                with open(path) as stream:
+                    scene = json.load(stream)
+                playable_x = scene["bounds"]["playable_max_xz"][0]
+                scene["routes"][0]["waypoints_xz"][1][0] = float(np.float32(
+                    np.float32(playable_x) + np.float32(0.5)))
+                with open(path, "wb") as stream:
+                    stream.write(canonical_json_bytes(scene))
+                resign_scene(preserve, scene_relative)
+
+            rejection(
+                "route_class_segment", "wrong walkability class",
+                corrupt_route_class_segment)
+
+            def corrupt_bool_route_class(preserve):
+                path = preserve(scene_relative)
+                with open(path) as stream:
+                    scene = json.load(stream)
+                scene["routes"][0]["walkability_class"] = True
+                with open(path, "wb") as stream:
+                    stream.write(canonical_json_bytes(scene))
+                resign_scene(preserve, scene_relative)
+
+            rejection(
+                "bool_route_class", "integer, not bool",
+                corrupt_bool_route_class)
+
+            def corrupt_unquantized_runtime_float(preserve):
+                path = preserve(scene_relative)
+                with open(path) as stream:
+                    scene = json.load(stream)
+                scene["spawn"]["yaw_radians"] = 0.1
+                with open(path, "wb") as stream:
+                    stream.write(canonical_json_bytes(scene))
+                resign_scene(preserve, scene_relative)
+
+            rejection(
+                "unquantized_runtime_float", "exact promoted float32",
+                corrupt_unquantized_runtime_float)
+
+            def corrupt_negative_zero_json(preserve):
+                path = preserve(scene_relative)
+                payload = open(path, "rb").read()
+                needle = b'"yaw_radians": 0.0'
+                self.assertIn(needle, payload)
+                with open(path, "wb") as stream:
+                    stream.write(payload.replace(
+                        needle, b'"yaw_radians": -0.0', 1))
+                resign_scene(preserve, scene_relative)
+
+            rejection(
+                "negative_zero_json", "not canonical",
+                corrupt_negative_zero_json)
+
+            def corrupt_g1wm_trailing_byte(preserve):
+                relative = os.path.join(
+                    "scenes", "stairs-shallow", "walkability.bin")
+                path = preserve(relative)
+                with open(path, "ab") as stream:
+                    stream.write(b"\x00")
+                scene_path = preserve(scene_relative)
+                with open(scene_path) as stream:
+                    scene = json.load(stream)
+                scene["walkability"]["sha256"] = file_sha256(path)
+                with open(scene_path, "wb") as stream:
+                    stream.write(canonical_json_bytes(scene))
+                resign_scene(preserve, scene_relative)
+
+            rejection(
+                "coordinated_g1wm_trailing", "truncated or trailing G1WM",
+                corrupt_g1wm_trailing_byte)
 
             def corrupt_walkability(preserve):
                 low_scene_relative = os.path.join(
@@ -7050,9 +8162,10 @@ subtest:
                     hashlib.sha256(payload).hexdigest()
                 with open(scene_path, "wb") as stream:
                     stream.write(canonical_json_bytes(scene))
+                resign_scene(preserve, low_scene_relative)
 
             rejection(
-                "coordinated_walkability", "wrong walkability class",
+                "coordinated_walkability", "region disagrees with G1WM",
                 corrupt_walkability)
 
             def corrupt_obj(preserve):
@@ -7069,13 +8182,15 @@ subtest:
                 scene["mesh"]["sha256"] = hashlib.sha256(payload).hexdigest()
                 with open(scene_path, "wb") as stream:
                     stream.write(canonical_json_bytes(scene))
+                resign_scene(preserve, scene_relative)
 
             rejection("coordinated_obj", "exact fixed-diagonal", corrupt_obj)
 ~~~
 
 Define `canonical_json_bytes` and `file_sha256` in the test file exactly like
-the production canonical writer and chunked SHA helper. Add `hashlib` to
-imports.
+the production canonical writer and chunked SHA helper. In particular, the
+test writer must recursively canonicalize either signed zero to positive zero;
+a plain `json.dumps` wrapper is not equivalent. Add `hashlib` to imports.
 
 - [ ] **Step 8: Run corruption tests and close every semantic escape**
 
@@ -7302,6 +8417,10 @@ git commit -m "test: validate complete G1 scene artifacts"
   recomputes all 459,682 rows.
 - Passing this task establishes artifact/surface Gate B only. Runtime Gates
   C--F remain owned by the support/runtime and IK plans.
+- Every diagnostic/full audit follows the complete trust chain: manifest
+  `scene_index.sha256` authenticates exact `scenes/index.json` bytes, whose
+  ordered six-key catalog authenticates every exact `scene.json` before any
+  scene-owned terrain/mesh/G1WM descriptor is trusted.
 
 - [ ] **Step 1: Snapshot user state and immutable legacy artifact hashes**
 
@@ -7397,9 +8516,20 @@ exact expected G1HF version after its self-tests. Run it once per ordered scene:
 /home/ubuntu/miniconda3/envs/diffsim/bin/python - <<'PY' \
   > /tmp/g1_scene_ids.txt
 import json
+import hashlib
+import os
 with open("/tmp/g1_terrain_scene_diagnostic/scenes/index.json") as stream:
     index = json.load(stream)
-for scene_id in index["scene_ids"]:
+assert set(index) == {
+    "schema", "default_scene_id", "scene_ids", "scenes",
+    "coordinate_signature", "surface_signature",
+}
+assert [value["id"] for value in index["scenes"]] == index["scene_ids"]
+for scene_id, descriptor in zip(index["scene_ids"], index["scenes"]):
+    assert descriptor["path"] == f"scenes/{scene_id}/scene.json"
+    path = os.path.join("/tmp/g1_terrain_scene_diagnostic", descriptor["path"])
+    assert hashlib.sha256(open(path, "rb").read()).hexdigest() \
+        == descriptor["sha256"]
     print(scene_id)
 PY
 while IFS= read -r scene_id
@@ -7519,7 +8649,14 @@ assert manifest["sidecars"]["terrain_support"]["columns"] == [
     "source_root_height_m", "source_left_toe_height_m",
     "source_right_toe_height_m",
 ]
+assert set(index) == {
+    "schema", "default_scene_id", "scene_ids", "scenes",
+    "coordinate_signature", "surface_signature",
+}
+assert index["schema"] == "g1-terrain-scene-index/v1"
+assert index["default_scene_id"] == "grail-curb-default"
 assert index["scene_ids"] == expected_ids
+assert len(index["scenes"]) == len(expected_ids)
 assert set(os.listdir(root)) == {
     "database.bin", "terrain_features.bin", "terrain_support.bin",
     "manifest.json", "validation.json", "scenes",
@@ -7545,7 +8682,15 @@ expected_grail = {
     "grail-curb-medium": "terrain_curbs__curb_022__001",
     "grail-curb-high": "terrain_curbs__curb_165__006",
 }
-for scene_id in expected_ids:
+for scene_id, index_descriptor in zip(expected_ids, index["scenes"]):
+    assert index_descriptor == {
+        "id": scene_id,
+        "path": f"scenes/{scene_id}/scene.json",
+        "sha256": index_descriptor["sha256"],
+    }
+    assert len(index_descriptor["sha256"]) == 64
+    int(index_descriptor["sha256"], 16)
+    assert digest(index_descriptor["path"]) == index_descriptor["sha256"]
     scene_root = os.path.join(root, "scenes", scene_id)
     assert set(os.listdir(scene_root)) == {
         "scene.json", "terrain.bin", "terrain.obj", "walkability.bin",
@@ -7554,7 +8699,20 @@ for scene_id in expected_ids:
         scene = json.load(stream)
     with open(os.path.join(scene_root, "terrain.bin"), "rb") as stream:
         header = struct.unpack("<4sIII4f", stream.read(32))
+    with open(os.path.join(scene_root, "walkability.bin"), "rb") as stream:
+        walkability_payload = stream.read()
+    walkability_header = struct.unpack_from("<4sIII", walkability_payload)
     assert header[0:2] == (b"G1HF", 2)
+    assert walkability_header[0:2] == (b"G1WM", 1)
+    assert walkability_header[2:4] == header[2:4]
+    assert len(walkability_payload) \
+        == 16 + walkability_header[2] * walkability_header[3]
+    assert set(walkability_payload[16:]) <= {0, 1, 2}
+    assert scene["walkability"]["nx"] == walkability_header[2]
+    assert scene["walkability"]["nz"] == walkability_header[3]
+    assert scene["walkability"]["classes"] == {
+        "blocked": 0, "certified": 1, "stress": 2,
+    }
     assert scene["heightfield"]["diagonal"] \
         == "min-x-min-z_to_max-x-max-z"
     assert scene["heightfield"]["cell_size_m"] == header[6]
@@ -7568,6 +8726,44 @@ for scene_id in expected_ids:
         with open(os.path.join(scene_root, filename), "rb") as stream:
             value.update(stream.read())
         assert value.hexdigest() == descriptor["sha256"]
+    bounds = scene["bounds"]
+    height_min, height_max = (
+        bounds["heightfield_min_xyz"], bounds["heightfield_max_xyz"])
+    playable_min, playable_max = (
+        bounds["playable_min_xz"], bounds["playable_max_xz"])
+    lookahead_min, lookahead_max = (
+        bounds["lookahead_min_xz"], bounds["lookahead_max_xz"])
+    assert height_min[0] < height_max[0] and height_min[2] < height_max[2]
+    assert lookahead_min[0] < lookahead_max[0] \
+        and lookahead_min[1] < lookahead_max[1]
+    assert playable_min[0] < playable_max[0] \
+        and playable_min[1] < playable_max[1]
+    assert height_min[0] <= lookahead_min[0] < lookahead_max[0] \
+        <= height_max[0]
+    assert height_min[2] <= lookahead_min[1] < lookahead_max[1] \
+        <= height_max[2]
+    assert lookahead_min[0] <= playable_min[0] < playable_max[0] \
+        <= lookahead_max[0]
+    assert lookahead_min[1] <= playable_min[1] < playable_max[1] \
+        <= lookahead_max[1]
+    region_ids = []
+    for entries in scene["regions"].values():
+        for region in entries:
+            region_ids.append(region["id"])
+            xmin, xmax, zmin, zmax = region["bounds_xz"]
+            assert xmin < xmax and zmin < zmax
+            assert lookahead_min[0] <= xmin < xmax <= lookahead_max[0]
+            assert lookahead_min[1] <= zmin < zmax <= lookahead_max[1]
+    assert len(region_ids) == len(set(region_ids))
+    spawn_xz = [scene["spawn"]["position"][0],
+                scene["spawn"]["position"][2]]
+    route_ids = []
+    for route in scene["routes"]:
+        route_ids.append(route["id"])
+        assert route["waypoints_xz"][0] == spawn_xz
+        assert all(a != b for a, b in zip(
+            route["waypoints_xz"], route["waypoints_xz"][1:]))
+    assert len(route_ids) == len(set(route_ids))
     if scene_id in expected_grail:
         assert scene["provenance"]["source_ids"][0] == expected_grail[scene_id]
 print("VALID full-pack-audit frames=459682 clips=1770 scenes=14")
@@ -7584,9 +8780,22 @@ Regenerate the ordered ID list from the final index and run:
 /home/ubuntu/miniconda3/envs/diffsim/bin/python - <<'PY' \
   > /tmp/g1_published_scene_ids.txt
 import json
+import hashlib
+import os
 with open("resources/g1_terrain/scenes/index.json") as stream:
-    for scene_id in json.load(stream)["scene_ids"]:
-        print(scene_id)
+    index = json.load(stream)
+assert set(index) == {
+    "schema", "default_scene_id", "scene_ids", "scenes",
+    "coordinate_signature", "surface_signature",
+}
+assert [descriptor["id"] for descriptor in index["scenes"]] \
+    == index["scene_ids"]
+for scene_id, descriptor in zip(index["scene_ids"], index["scenes"]):
+    assert descriptor["path"] == f"scenes/{scene_id}/scene.json"
+    payload = open(os.path.join(
+        "resources/g1_terrain", descriptor["path"]), "rb").read()
+    assert hashlib.sha256(payload).hexdigest() == descriptor["sha256"]
+    print(scene_id)
 PY
 while IFS= read -r scene_id
 do

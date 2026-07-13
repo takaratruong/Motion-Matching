@@ -12,6 +12,12 @@
 
 - This plan starts only after every task in `docs/superpowers/plans/2026-07-13-g1-scene-artifacts.md` passes, including its Gate A baseline logger/checker, G1HF/v2 fixed-diagonal loader and sampling parity, full 1,770-clip motion-pack rebuild, support sidecar, required scene publication, hashes, routes, and surface-parity gates.
 - Consume, do not regenerate, `resources/g1_terrain/{database.bin,terrain_features.bin,terrain_support.bin,manifest.json,validation.json}` and `resources/g1_terrain/scenes/{index.json,<scene-id>/{scene.json,terrain.bin,terrain.obj,walkability.bin}}`.
+- Preserve the published trust chain exactly: `manifest.json` hashes the exact
+  `scenes/index.json` bytes; the verified six-key index supplies each ordered
+  root-relative `scenes/<id>/scene.json` path and SHA-256; only after those
+  scene JSON bytes pass that descriptor hash may they be parsed, and the
+  verified scene JSON then supplies the hashes for `terrain.bin`,
+  `terrain.obj`, and `walkability.bin`.
 - Preserve the original `resources/database.bin`, `resources/features.bin`, every generated/user-owned resource, and the existing dirty worktree. Never stage or commit generated artifacts, logs, videos, controller binaries, or unrelated user changes.
 - Keep Daniel Holden's database matcher, full-pose inertialization, and fixed `25 Hz` runtime authoritative. Keep `dt = 1.0f / 25.0f`, database horizons `8`, `17`, and `25`, and live prediction intervals `1.0f / 3.0f`.
 - Preserve the exact `27 + 4 = 31` feature order and normalization. `terrain_support.bin` is placement metadata only and must never enter features, bounds, costs, or search selection.
@@ -114,6 +120,15 @@ unchanged and sample exclusively through `heightfield_sample_v2`.
 - Produces: `bool terrain_support_load(terrain_support_set&, const char*, int expected_frames, char*, int)` for exact `G1SP`, version `1`, dimension `3`, and database-frame parity.
 - Produces: `walkability_grid { int nx, nz; array1d<uint8_t> cells; }`.
 - Produces: `bool walkability_load(walkability_grid&, const char*, const heightfield&, char*, int)` for exact `G1WM`, version `1`, grid parity, and values `0`, `1`, or `2` only.
+- Produces noinline one-round helpers `terrain_f32_add`, `terrain_f32_sub`,
+  `terrain_f32_mul`, `terrain_f32_div`, and `terrain_f32_sqrt`, matching the
+  producer's `_f32_*` operations even under `-O3 -ffast-math`; a multiply and
+  following add are separate calls/materializations and may never contract to
+  FMA.
+- Produces `walkability_nearest_axis` and `walkability_class_at` using the
+  exact producer sequence `f32(f32(query-origin)/cell)`, then
+  `floor(f32(g + 0.5))`, so Task 4 can validate routes before Task 7 adds
+  footprint sweeps.
 - Produces checked `terrain_centerline_snapshot_compute_v2` and
   `terrain_centerline_query_v2` wrappers for validated active scenes; inherited
   v1 centerline functions and arithmetic remain unchanged.
@@ -268,7 +283,40 @@ static void test_walkability_loader_is_strict_transactional_and_grid_exact()
     check(!walkability_load(grid, path, field, error, sizeof(error)),
           "G1WM trailing rejection");
 }
+
+static void test_walkability_binary32_half_cell_parity()
+{
+    heightfield field;
+    field.version = 2;
+    initialize_heightfield(field, 3, 2, -0.02f, 0.0f, 0.02f, 0.0f);
+    field.heights.zero();
+    walkability_grid grid;
+    grid.nx = 3; grid.nz = 2; grid.cells.resize(6);
+    const uint8_t values[6] = {1, 2, 1, 1, 2, 1};
+    for (int i = 0; i < 6; ++i) grid.cells(i) = values[i];
+    const float tie = -0.01f;
+    check(walkability_class_at(
+          grid, field, nextafterf(tie, -INFINITY), 0.0f) == 1,
+          "binary32 predecessor stays below half-cell");
+    check(walkability_class_at(grid, field, tie, 0.0f) == 2,
+          "binary32 half-cell tie chooses positive index");
+    check(walkability_class_at(
+          grid, field, nextafterf(tie, INFINITY), 0.0f) == 2,
+          "binary32 successor stays above half-cell");
+
+    heightfield rounded;
+    rounded.version = 2;
+    initialize_heightfield(rounded, 3, 2, -1.0f, 0.0f, 0.02f, 0.0f);
+    rounded.heights.zero();
+    check(walkability_class_at(
+          grid, rounded, -0.9900000095367432f, 0.0f) == 1,
+          "rounded mathematical midpoint follows one-round producer ops");
+}
 ```
+
+Call `test_walkability_binary32_half_cell_parity()` from `main` immediately
+after the G1WM loader test. The strict and release/fast-math commands in Step 4
+must run this identical `nextafterf` matrix.
 
 - [ ] **Step 2: Run the focused test to verify RED**
 
@@ -280,8 +328,8 @@ g++ -std=c++17 -O0 -g -Wall -Wextra -Werror -pedantic -I. \
 ```
 
 Expected: compilation fails with undeclared `terrain_support_set`,
-`terrain_support_load`, `walkability_grid`, `walkability_load`, and v2
-centerline wrappers. If declarations are stubbed, each armed allocation test
+`terrain_support_load`, `walkability_grid`, `walkability_load`, the `_f32_*`
+parity helpers, lookup helpers, and v2 centerline wrappers. If declarations are stubbed, each armed allocation test
 still fails because the inherited/new loaders have no checked hook yet.
 
 - [ ] **Step 3: Implement the exact transactional loaders**
@@ -558,6 +606,48 @@ static inline bool walkability_load(
 }
 ```
 
+Immediately after `walkability_load`, add the shared binary32 arithmetic and
+lookup boundary. Each arithmetic helper is a noinline function containing one
+operation and one volatile result materialization. Calls such as route
+`mul`-then-`add` therefore cannot become an FMA under the required
+release/fast-math build:
+
+```cpp
+#if defined(__GNUC__) || defined(__clang__)
+#define TERRAIN_F32_NOINLINE __attribute__((noinline))
+#else
+#define TERRAIN_F32_NOINLINE
+#endif
+
+static inline bool terrain_f32_accept(float& out,float value)
+{if(!terrain_float_is_normal_or_zero_query(value))return false;out=value==0.0f?0.0f:value;return true;}
+
+static inline TERRAIN_F32_NOINLINE bool terrain_f32_add(float& out,float left,float right)
+{const volatile float a=left,b=right;const volatile float rounded=a+b;return terrain_f32_accept(out,rounded);}
+static inline TERRAIN_F32_NOINLINE bool terrain_f32_sub(float& out,float left,float right)
+{const volatile float a=left,b=right;const volatile float rounded=a-b;return terrain_f32_accept(out,rounded);}
+static inline TERRAIN_F32_NOINLINE bool terrain_f32_mul(float& out,float left,float right)
+{const volatile float a=left,b=right;const volatile float rounded=a*b;return terrain_f32_accept(out,rounded);}
+static inline TERRAIN_F32_NOINLINE bool terrain_f32_div(float& out,float left,float right)
+{const volatile float a=left,b=right;const volatile float rounded=a/b;return terrain_f32_accept(out,rounded);}
+static inline TERRAIN_F32_NOINLINE bool terrain_f32_sqrt(float& out,float value)
+{const volatile float input=value;const volatile float rounded=sqrtf(input);return terrain_f32_accept(out,rounded);}
+
+#undef TERRAIN_F32_NOINLINE
+
+static inline bool terrain_f32_lerp(float& out,float start,float stop,int step,int steps)
+{if(step<0||steps<1||step>steps)return false;float delta=0,alpha=0,scaled=0;const volatile float numerator=static_cast<float>(step),denominator=static_cast<float>(steps);return terrain_f32_sub(delta,stop,start)&&terrain_f32_div(alpha,numerator,denominator)&&terrain_f32_mul(scaled,alpha,delta)&&terrain_f32_add(out,start,scaled);}
+
+static inline bool walkability_grid_matches_heightfield(const walkability_grid& grid,const heightfield& field)
+{size_t count=0;return grid.nx==field.nx&&grid.nz==field.nz&&grid.nx>=2&&grid.nz>=2&&terrain_float_is_normal_or_positive_zero(field.origin_x)&&terrain_float_is_normal_or_positive_zero(field.origin_z)&&terrain_float_is_positive_normal(field.cell_size)&&terrain_size_multiply(static_cast<size_t>(grid.nx),static_cast<size_t>(grid.nz),count)&&count<=static_cast<size_t>(INT_MAX)&&grid.cells.size==static_cast<int>(count);}
+
+static inline bool walkability_nearest_axis(int& index,float input,float origin,float cell_size,int count)
+{float canonical=0,numerator=0,normalized=0,shifted=0;if(count<2||!terrain_v2_query_coordinate(input,canonical)||!terrain_f32_sub(numerator,canonical,origin)||!terrain_f32_div(normalized,numerator,cell_size)||static_cast<double>(normalized)<0.0||static_cast<double>(normalized)>static_cast<double>(count-1)||!terrain_f32_add(shifted,normalized,0.5f))return false;const int rounded=static_cast<int>(floorf(shifted));index=rounded<count?rounded:count-1;return index>=0&&index<count;}
+
+static inline int walkability_class_at(const walkability_grid& grid,const heightfield& field,float x,float z)
+{if(!walkability_grid_matches_heightfield(grid,field))return 0;int ix=0,iz=0;if(!walkability_nearest_axis(ix,x,field.origin_x,field.cell_size,grid.nx)||!walkability_nearest_axis(iz,z,field.origin_z,field.cell_size,grid.nz))return 0;const int value=grid.cells(iz*grid.nx+ix);return value<=2?value:0;}
+```
+
 Then add `terrain_centerline_snapshot_compute_v2` and
 `terrain_centerline_query_v2` beside the inherited wrappers. Copy the inherited
 input validation, point-at-arc, output initialization, finite-difference, and
@@ -585,9 +675,33 @@ g++ -std=c++17 -O1 -g -fsanitize=address,undefined \
   -fno-omit-frame-pointer -I. tests/cpp/test_terrain_runtime.cpp \
   -o /tmp/test_terrain_runtime_san
 ASAN_OPTIONS=detect_leaks=1 /tmp/test_terrain_runtime_san
+
+sha256sum --check /tmp/g1_gate_a_before.sha256
+sha256sum --check /tmp/g1_gate_a_csv.sha256
+g++ -O3 -ffast-math -march=native -DNDEBUG \
+  -D_DEFAULT_SOURCE -DPLATFORM_DESKTOP \
+  -I. -I /home/ubuntu/apps/raylib/src -I /home/ubuntu/apps/raygui/src \
+  controller.cpp -o /tmp/controller_g1_runtime_task1_gate_a \
+  -L /home/ubuntu/apps/raylib/src \
+  -lraylib -lGL -lm -lpthread -ldl -lrt -lX11
+rm -f /tmp/g1_runtime_task1_gate_a.csv
+DISPLAY=:1 G1_TERRAIN_DIR=resources/g1_terrain \
+  MM_TEST_MODE=terrain MM_TERRAIN_WEIGHT=4 MM_TEST_FRAMES=375 \
+  MM_LOG=/tmp/g1_runtime_task1_gate_a.csv \
+  /tmp/controller_g1_runtime_task1_gate_a
+test "$(wc -l < /tmp/g1_runtime_task1_gate_a.csv)" -eq 376
+cmp -s /tmp/g1_gate_a_before.csv /tmp/g1_runtime_task1_gate_a.csv
+test "$(sha256sum /tmp/g1_runtime_task1_gate_a.csv | cut -d' ' -f1)" = \
+     "$(cut -d' ' -f1 /tmp/g1_gate_a_csv.sha256)"
+sha256sum --check /tmp/g1_gate_a_csv.sha256
+sha256sum --check /tmp/g1_gate_a_before.sha256
 ```
 
-Expected: every compile exits `0`; every binary exits `0` with no stdout/stderr and no sanitizer report.
+Expected: every test compile exits `0`; every test binary exits `0` with no
+stdout/stderr and no sanitizer report. The frozen 375-frame legacy-v1 Gate A
+replay is byte-identical and SHA-identical before Task 1 can commit, proving
+that adding noinline `_f32_*` helpers to `terrain_runtime.h` did not perturb
+the existing fast-math controller codegen or evidence.
 
 - [ ] **Step 5: Probe the published support and every walkability file**
 
@@ -1837,11 +1951,12 @@ git commit -m "feat: retarget G1 motion through a support frame"
   sidecars,scene_index,validation_file,validation
   ```
 
-- `surface` is exactly `{semantics,signature}`. `semantics` has keys
-  `schema`, `coordinate_signature`, `source_query`, `polygon_triangulation`,
-  `heightfield_schema`, `heightfield_interpolation`, `heightfield_diagonal`,
-  `cell_size_m`, and `exterior_height_m`. The signature is the lowercase
-  SHA-256 of canonical sorted compact JSON for `semantics` alone.
+- `surface` is exactly `{semantics,signature}`. `semantics` has keys and values
+  exactly equal to the committed 43-key `surface_semantics()` object from
+  `resources/g1_terrain_builder/terrain.py`; no projected-surface, binary32-
+  domain, interpolation, normal, raster, or OBJ policy key may be omitted.
+  The signature is the lowercase SHA-256 of the producer's exact UTF-8
+  canonical sorted compact JSON bytes for `semantics` alone.
 - `database={path:"database.bin",schema:"holden-database/v1",sha256}`.
   `sidecars.terrain_features={path:"terrain_features.bin",schema:"G1TF/v1",
   version:1,dimensions:4,sha256}` and
@@ -1860,19 +1975,35 @@ git commit -m "feat: retarget G1 motion through a support frame"
   has `height_threshold,median_filter_frames,speed_threshold`. Source records
   are contiguous, cover `[0,database_frames)`, and retain `name`, `terrain_id`,
   `range_start`, and `range_stop` for runtime diagnostics.
-- The index is exactly `{schema,default_scene_id,scene_ids,
-  coordinate_signature,surface_signature}` and uses the locked 14 IDs in order.
+- The index has exactly six keys: `{schema,default_scene_id,scene_ids,
+  coordinate_signature,surface_signature,scenes}`. It uses the locked 14 IDs
+  in order, and `scenes` is an equally ordered array of exact descriptors
+  `{id,path,sha256}` whose path is exactly root-relative
+  `scenes/<id>/scene.json`. At every position, descriptor `id` equals the
+  parallel `scene_ids` entry; IDs, paths, and hashes are unique where
+  applicable and no synthesized path substitutes for the published path.
 - Each scene is exactly `{schema,id,label,provenance,coordinate_signature,
   surface_signature,terrain_feature_distances_m,heightfield,mesh,walkability,
   bounds,spawn,regions,routes}`. The nested shapes and route outcome/class
   mapping are the exact ones in the prerequisite plan; no legacy `artifacts`,
   nested-bounds, `classification`, `outcome`, `speed_mps`, or
   `landing_height_m` aliases are accepted.
+- Published spawn coordinates, route waypoints, playable/lookahead/region XZ
+  values, and grid-classification coordinates are normal-or-zero binary32
+  values serialized through JSON as their exact promoted binary64 values.
+  Runtime parsing must recover those exact binary32 bits before containment,
+  route sampling, or nearest-node classification. In contrast,
+  `bounds.mesh_*_xyz` and `bounds.heightfield_*_xyz` remain finite binary64
+  metadata so a promoted G1HF node maximum and its explicitly rounded
+  binary32 OBJ vertex maximum remain distinguishable.
 - Produces transactional `motion_manifest_load_and_verify`,
   `motion_manifest_validate_database`, `motion_source_for_frame`,
   `scene_catalog_load`, `scene_catalog_find`, `scene_route_find`,
-  `scene_inside`, `scene_pack_load`, and `scene_pack_swap`. `scene_pack_load`
-  receives the already-loaded manifest and never reopens motion-pack files.
+  `scene_json_load_verified`, `scene_inside`, `scene_pack_load`, and
+  `scene_pack_swap`. `scene_json_load_verified` hashes and parses the same
+  bounded byte buffer, with the digest comparison completed before the parser
+  sees any byte. `scene_pack_load` receives the already-loaded manifest and
+  never reopens motion-pack files.
 
 - [ ] **Step 1: Add published-contract and transactional failure tests**
 
@@ -1905,6 +2036,33 @@ static const char* expected_route_ids[][2] = {
     {"full-course",NULL},{"wall-safe-stop","ramp-safe-stop"},
 };
 
+static void test_scene_numeric_precision_helpers()
+{
+    char error[512] = {};
+    json_value promoted_max, mesh_max, encoded_coordinate, unrounded_coordinate;
+    promoted_max.kind = mesh_max.kind = encoded_coordinate.kind =
+        unrounded_coordinate.kind = json_number;
+    promoted_max.number_value = -0.9800000004470348;
+    mesh_max.number_value = -0.9800000190734863;
+    encoded_coordinate.number_value =
+        static_cast<double>(static_cast<float>(0.02));
+    unrounded_coordinate.number_value = 0.02;
+    double heightfield_x = 0.0, mesh_x = 0.0;
+    float coordinate = 0.0f;
+    check(scene_number_double(heightfield_x, promoted_max,
+          "heightfield maximum", error, sizeof(error)), error);
+    check(scene_number_double(mesh_x, mesh_max,
+          "mesh maximum", error, sizeof(error)), error);
+    check(heightfield_x != mesh_x &&
+          static_cast<float>(heightfield_x) == static_cast<float>(mesh_x),
+          "binary64 bounds preserve promoted-vs-OBJ maximum");
+    check(scene_number_binary32(coordinate, encoded_coordinate,
+          "published coordinate", error, sizeof(error)), error);
+    check(!scene_number_binary32(coordinate, unrounded_coordinate,
+          "published coordinate", error, sizeof(error)),
+          "unrounded coordinate is not binary32-authoritative");
+}
+
 static void test_published_scene_contract(const char* root)
 {
     char error[1024] = {};
@@ -1918,6 +2076,9 @@ static void test_published_scene_contract(const char* root)
     check(manifest.total_clips == 1770 && manifest.grail_clips == 1769 &&
           manifest.skipped_clips == 0 && !manifest.diagnostic_mode,
           "complete motion pack");
+    check(manifest.surface.signature ==
+          "f151c2b1c7f0498880f76c37f48a47c46c48bcf58c1285863fabc9a09fd7993a",
+          "complete 43-key surface signature");
     check(manifest.sources.size() == 1770 &&
           manifest.sources.front().range_start == 0 &&
           manifest.sources.back().range_stop == manifest.database_frames,
@@ -1927,10 +2088,19 @@ static void test_published_scene_contract(const char* root)
     check(scene_catalog_load(
         catalog, root, manifest, error, sizeof(error)), error);
     check(catalog.default_scene_id == "grail-curb-default" &&
-          catalog.ids.size() == 14, "catalog size/default");
-    for (int i = 0; i < 14; ++i)
+          catalog.ids.size() == 14 && catalog.scenes.size() == 14,
+          "catalog size/default");
+    for (int i = 0; i < 14; ++i) {
         check(catalog.ids[static_cast<size_t>(i)] == expected_scene_ids[i],
               "catalog order");
+        const scene_descriptor& descriptor =
+            catalog.scenes[static_cast<size_t>(i)];
+        check(descriptor.id == expected_scene_ids[i] &&
+              descriptor.path == std::string("scenes/") +
+                  expected_scene_ids[i] + "/scene.json" &&
+              scene_sha_is_valid(descriptor.sha256),
+              "catalog descriptor order/path/hash");
+    }
 
     scene_pack active;
     for (int i = 0; i < 14; ++i) {
@@ -1973,6 +2143,35 @@ static void test_published_scene_contract(const char* root)
 }
 ```
 
+Add `test_scene_descriptor_hash_precedes_json_parse`: create a temporary
+`scenes/fixture/scene.json` containing syntactically invalid JSON, a one-entry
+catalog whose exact descriptor points to that root-relative path but contains
+a wrong lowercase digest, and a sentinel active pack. `scene_pack_load` must
+fail with a `SHA-256` diagnostic (not a JSON diagnostic) and preserve every
+sentinel field. Then set the descriptor to the invalid file's real digest and
+require a JSON diagnostic, again without mutation. Add catalog fixture cases
+that delete `scenes`, add a seventh index key, reorder descriptors independently
+of `scene_ids`, duplicate a descriptor path, substitute
+`scenes/../fixture/scene.json`, or use a non-lowercase/non-64-hex descriptor
+digest; all fail without changing the prior catalog. A syntactically valid but
+incorrect digest passes index shape validation and then fails the scene-byte
+check before parsing. Call `test_scene_numeric_precision_helpers` and
+the new descriptor/tamper tests from no-argument `main` before the optional
+real-pack test.
+
+Also add a table-driven manifest fixture over all 43 committed surface keys:
+the exact object and signature above pass; deleting each key in turn, adding
+one key, changing each string/policy, changing any numeric value or JSON type,
+or supplying the former nine-key subset fails transactionally. Add the full
+three-level tamper chain: (1) change index bytes without changing the manifest
+digest and require an index SHA failure before index parsing; (2) change
+`scene.json` bytes without changing its verified-index descriptor and require a
+scene SHA failure before scene parsing; (3) after a valid scene JSON parse,
+change each of `terrain.bin`, `terrain.obj`, and `walkability.bin` without
+changing the scene-owned digest and require the corresponding binary SHA
+failure. Every case compares the complete prior manifest/catalog/active-pack
+sentinels after rejection.
+
 In `main`, require `argc == 1 || (argc == 3 &&
 std::strcmp(argv[1],"--real") == 0)`; run Task 2 tests in both modes and call
 `test_published_scene_contract(argv[2])` only in real mode. The test consumes
@@ -2003,12 +2202,15 @@ JSON-owned metadata; binary grids retain the Holden arrays:
 #include "terrain_runtime.h"
 #include <cfloat>
 #include <cstdarg>
+#include <cstdint>
+#include <cstring>
 #include <string>
 #include <utility>
 #include <vector>
 
 struct bounds2 { float min_x=0,min_z=0,max_x=0,max_z=0; };
-struct bounds3 { vec3 minimum,maximum; };
+struct point3d { double x=0,y=0,z=0; };
+struct bounds3d { point3d minimum,maximum; };
 struct motion_source_record {
     std::string name,terrain_id;
     int range_start=0,range_stop=0;
@@ -2034,6 +2236,9 @@ struct motion_pack_manifest {
     artifact_reference scene_index,validation_file;
 };
 struct scene_region { std::string id; bounds2 bounds; };
+struct scene_descriptor {
+    std::string id,path,sha256;
+};
 struct scene_route {
     std::string id,expected_outcome;
     int walkability_class=0;
@@ -2048,7 +2253,7 @@ struct scene_metadata {
     int heightfield_nx=0,heightfield_nz=0,walkability_nx=0,walkability_nz=0;
     float heightfield_origin_x=0,heightfield_origin_z=0;
     float heightfield_cell_size=0,heightfield_exterior_height=0;
-    bounds3 mesh_bounds,heightfield_bounds;
+    bounds3d mesh_bounds,heightfield_bounds;
     bounds2 playable_bounds,lookahead_bounds;
     vec3 spawn_position; float spawn_yaw=0;
     std::vector<scene_region> certified_regions,stress_regions,blocked_regions;
@@ -2057,6 +2262,7 @@ struct scene_metadata {
 struct scene_catalog {
     std::string default_scene_id,coordinate_signature,surface_signature;
     std::vector<std::string> ids;
+    std::vector<scene_descriptor> scenes;
 };
 struct scene_pack {
     scene_metadata metadata; heightfield terrain; walkability_grid walkability;
@@ -2073,9 +2279,40 @@ static const char* const G1_RuntimeSceneIds[14] = {
 ```
 
 Add `scene_error`, `scene_required`, `scene_exact_keys`, `json_equal`,
-`scene_number_float`, `scene_number_int`, `scene_float_array`,
-`scene_sha_is_valid`, and `scene_verify_sha`. `scene_exact_keys` sorts the
-actual and expected strings before comparison. Add these path rules verbatim:
+`scene_number_double`, `scene_number_float`, `scene_number_binary32`,
+`scene_number_int`, `scene_double_array`, `scene_float_array`,
+`scene_binary32_array`, `scene_sha_is_valid`, and `scene_verify_sha`.
+`scene_number_double` accepts only a finite JSON number and preserves the
+parser's binary64 value; `scene_double_array` uses it for mesh/heightfield XYZ
+bounds. `scene_number_binary32` accepts only a finite normal-or-zero value for
+which `static_cast<double>(static_cast<float>(value)) == value`, canonicalizes
+signed zero positive, and returns that exact `float`; the corresponding array
+helper is mandatory for spawn, route, playable/lookahead, and region
+coordinates. General non-coordinate finite scalars may use
+`scene_number_float`. `scene_exact_keys` sorts the actual and expected strings
+before comparison. Implement the precision boundary explicitly rather than
+casting all JSON numbers through `float`:
+
+```cpp
+static inline bool scene_number_double(double& out,const json_value& value,const char* label,char* error,int capacity)
+{if(value.kind!=json_number||!terrain_double_is_finite(value.number_value))return scene_error(error,capacity,"%s must be a finite binary64 number",label);out=value.number_value;return true;}
+
+static inline bool scene_number_binary32(float& out,const json_value& value,const char* label,char* error,int capacity)
+{double parsed=0;if(!scene_number_double(parsed,value,label,error,capacity))return false;const float encoded=static_cast<float>(parsed);uint32_t bits=0;std::memcpy(&bits,&encoded,sizeof(bits));if(!terrain_float_is_finite(encoded)||((bits&0x7f800000u)==0u&&(bits&0x007fffffu)!=0u)||static_cast<double>(encoded)!=parsed)return scene_error(error,capacity,"%s must be an exact normal-or-zero binary32 value",label);out=encoded==0.0f?0.0f:encoded;return true;}
+
+static inline bool scene_binary32_lerp(float& out,float start,float stop,int step,int steps)
+{if(step<0||steps<1||step>steps)return false;if(step==0){out=start;return true;}if(step==steps){out=stop;return true;}return terrain_f32_lerp(out,start,stop,step,steps);}
+
+static inline bool scene_route_segment(float& dx,float& dz,float& length,const std::pair<float,float>& start,const std::pair<float,float>& stop)
+{float dx2=0,dz2=0,sum=0;return terrain_f32_sub(dx,stop.first,start.first)&&terrain_f32_sub(dz,stop.second,start.second)&&terrain_f32_mul(dx2,dx,dx)&&terrain_f32_mul(dz2,dz,dz)&&terrain_f32_add(sum,dx2,dz2)&&terrain_f32_sqrt(length,sum)&&length>0.0f;}
+
+static inline bool scene_route_sample_count(int& count,const std::pair<float,float>& start,const std::pair<float,float>& stop,float maximum_step)
+{float dx=0,dz=0,length=0,ratio=0;if(!terrain_float_is_positive_normal(maximum_step)||!scene_route_segment(dx,dz,length,start,stop)||!terrain_f32_div(ratio,length,maximum_step))return false;const float rounded=ceilf(ratio);if(!terrain_float_is_finite(rounded)||rounded>static_cast<float>(INT_MAX))return false;count=rounded<1.0f?1:static_cast<int>(rounded);return true;}
+```
+
+`scene_double_array` and `scene_binary32_array` require the exact requested
+length and call the corresponding scalar helper for every element. Add these
+path rules verbatim:
 
 ```cpp
 static inline bool scene_id_is_safe(const std::string& id)
@@ -2091,6 +2328,16 @@ static inline bool scene_inside(const bounds2& bounds,float x,float z)
 {return terrain_float_is_finite(x)&&terrain_float_is_finite(z)&&x>=bounds.min_x&&x<=bounds.max_x&&z>=bounds.min_z&&z<=bounds.max_z;}
 ```
 
+Implement `scene_json_load_verified` as one read/verify/parse transaction. It
+uses the same `16 MiB` cap and exact read/error rules as `json_document_load`,
+but retains the bytes in one local `std::string`, hashes that buffer through
+`sha256_state`/`sha256_update`/`sha256_finish`, rejects a digest mismatch, and
+only then constructs `json_parser` over that same string. It parses into a
+local `json_value` and moves it into `out` only after the entire document and
+trailing-whitespace check succeed. It must not call `scene_verify_sha` and then
+reopen the path through `json_document_load`, because that would permit
+different bytes to be verified and parsed.
+
 - [ ] **Step 4: Implement the exact manifest and index validators**
 
 Implement `motion_manifest_load_and_verify` as a local-candidate transaction.
@@ -2104,20 +2351,24 @@ It enforces this complete matrix before assigning `out`:
 | skeleton | exact `names`/`parents` lengths `31`, names equal the G1 bone names, parents equal the G1 parent table, signature `G1_SkeletonSignature` |
 | contact | exact `speed_threshold,height_threshold,median_filter_frames`; finite nonnegative thresholds and positive odd integral filter width |
 | sources | exact v1 source keys/types, unique nonempty names, first start `0`, adjacent stop/start equality, final stop `database_frames`, and `source_frame_map` length equals `output_frames` |
-| surface.semantics | exact nine-key set and exact producer values, including `0.02` cell and `0.0` exterior |
+| surface.semantics | exact 43-key committed `surface_semantics()` set and exact producer values/types; reject every missing, extra, renamed, or changed projected-surface, binary32-domain, fixed-triangle, normal, raster, or OBJ-policy member |
 | references | exact paths/schemas/versions/dimensions/columns shown above; lowercase 64-hex digests |
 | validation | exact four-key embedded object; exact DOM equality with separately parsed, hashed `validation.json` |
 
 Hash `database.bin`, both sidecars, `scenes/index.json`, and
 `validation.json` over exact bytes. Recompute the surface signature by hashing
-this exact canonical compact byte string after validating each semantic value:
+this exact UTF-8 canonical producer byte string after validating all 43 keys,
+their JSON types, and their exact values:
 
 ```text
-{"cell_size_m":0.02,"coordinate_signature":"holden-y-up-right-handed-forward-plus-z","exterior_height_m":0.0,"heightfield_diagonal":"min-x-min-z_to_max-x-max-z","heightfield_interpolation":"fixed-diagonal-triangles","heightfield_schema":"G1HF/v2","polygon_triangulation":"fan-from-first-index","schema":"g1-terrain-surface/v1","source_query":"vertical-triangle-top"}
+{"barycentric_tolerance":1e-10,"bbox_tolerance_m":1e-12,"cell_size_m":0.02,"coordinate_signature":"holden-y-up-right-handed-forward-plus-z","degenerate_projected_triangle_policy":"ignore","exterior_height_m":0.0,"heightfield_cell_domain":"positive-normal-binary32","heightfield_denormal_policy":"reject-nonzero-binary32-subnormals","heightfield_diagonal":"min-x-min-z_to_max-x-max-z","heightfield_diagonal_tie_policy":"tx-greater-or-equal-tz-uses-p00-p10-p11","heightfield_domain_policy":"inclusive-authoritative-node-rectangle","heightfield_evaluation_precision":"binary64-from-binary32-samples-and-promoted-node-weights","heightfield_exterior_normal":[0.0,1.0,0.0],"heightfield_grid_line_policy":"positive-index-cell-except-maximum-edge","heightfield_interpolation":"fixed-diagonal-triangles","heightfield_normal_evaluation":"selected-triangle-binary64-gradient-scale-safe-unit-normalization","heightfield_obj_coordinate_quantization":"binary32-round-of-promoted-origin-plus-index-times-cell","heightfield_obj_face_order":"p00-p11-p10_then_p00-p01-p11","heightfield_obj_float_format":".9g-final-newline","heightfield_obj_vertex_order":"z-major-x-minor","heightfield_raster_bounds_policy":"float32-minimum-rounded-down-and-maximum-ceil-covered","heightfield_runtime_height_output":"finite-binary64-interpolation-rounded-to-binary32","heightfield_runtime_node_distinguishability_policy":"normal-or-positive-zero-strictly-increasing-proven-by-endpoints-near-zero-candidates-max-binary32-spacing-and-aligned-equality","heightfield_runtime_node_domain":"normal-or-zero-binary32","heightfield_runtime_normal_output":"unit-normal-components-rounded-to-binary32","heightfield_runtime_output_ftz_policy":"binary32-subnormals-and-signed-zero-canonicalized-to-positive-zero","heightfield_runtime_parity_domain":"normal-or-zero-binary32-coordinates","heightfield_runtime_query_domain":"normal-or-zero-binary32-coordinates","heightfield_runtime_query_encoding":"normal-or-zero-binary32-canonicalized-positive-and-promoted-to-binary64","heightfield_scalar_domain":"normal-or-zero-binary32","heightfield_scalar_encoding":"ieee754-binary32-little-endian","heightfield_schema":"G1HF/v2","heightfield_source_node_encoding":"binary32-header-values-promoted-to-binary64-arithmetic","heightfield_version":2,"heightfield_zero_encoding":"canonical-positive-zero","overlap_height_policy":"maximum-y","polygon_triangulation":"fan-from-first-index","projected_area_epsilon_m2":1e-12,"projected_area_measure":"absolute-two-times-area","projected_boundary_policy":"closed","schema":"g1-terrain-surface/v1","source_query":"vertical-triangle-top","triangle_winding_policy":"orientation-independent"}
 ```
 
-Do not serialize parsed doubles to recompute it. Implement source lookup by
-range containment:
+These bytes are the canonical output of the committed Python producer, not a
+C++ reserialization of parsed doubles. Their expected digest is
+`f151c2b1c7f0498880f76c37f48a47c46c48bcf58c1285863fabc9a09fd7993a`;
+require the manifest signature to equal both that digest and the index/scene
+`surface_signature`. Implement source lookup by range containment:
 
 ```cpp
 static inline int motion_source_for_frame(const motion_pack_manifest& manifest,const int frame)
@@ -2127,9 +2378,16 @@ static inline int motion_source_for_frame(const motion_pack_manifest& manifest,c
 `motion_manifest_validate_database` requires `db.nframes() ==
 manifest.database_frames`, `db.nbones() == 31`, exact G1 parents, `31` feature
 columns, `4` terrain columns, and database ranges equal every source range in
-order. `scene_catalog_load` hashes/opens the existing index reference, requires
-the exact five-key shape, exact coordinate/surface signatures, default
-`grail-curb-default`, and exact ordered 14 IDs. Commit only after all checks.
+order. `scene_catalog_load` calls `scene_json_load_verified` so it first
+verifies the exact `scenes/index.json` bytes against the already parsed
+manifest `scene_index.sha256`, then parses that same buffer. It
+requires the exact six-key shape, exact coordinate/surface signatures, default
+`grail-curb-default`, exact ordered 14 IDs, and exactly 14 ordered
+`{id,path,sha256}` descriptors. For descriptor `i`, require `id ==
+scene_ids[i]`, `path == "scenes/" + id + "/scene.json"`, a valid lowercase
+digest, and no duplicate ID/path. Build a complete local candidate and commit
+only after all checks; a manifest/index hash failure or any descriptor failure
+must leave the prior catalog byte-for-byte unchanged.
 
 - [ ] **Step 5: Parse exact scene metadata and validate the binary candidate**
 
@@ -2138,14 +2396,14 @@ Implement nested validators with these exact key sets and constraints:
 | Object | Exact keys / checks |
 |---|---|
 | provenance | `kind,source_ids,parameters`; kind `grail` or `procedural`, string source IDs, parameters object |
-| heightfield | `path,schema,version,nx,nz,origin_x,origin_z,cell_size_m,exterior_height_m,interpolation,diagonal,sha256`; exact basename/schema/version/surface values |
+| heightfield | `path,schema,version,nx,nz,origin_x,origin_z,cell_size_m,exterior_height_m,interpolation,diagonal,sha256`; exact basename/schema/version/surface values; the four header scalars must be exact promoted normal-or-zero binary32 values (cell positive-normal) |
 | mesh | `path,schema,sha256`; `terrain.obj`, `obj/v1` |
 | walkability | `path,schema,version,nx,nz,classes,sha256`; exact G1WM values and classes `{blocked:0,certified:1,stress:2}` |
-| bounds | eight flat arrays `mesh_min_xyz,mesh_max_xyz,heightfield_min_xyz,heightfield_max_xyz,playable_min_xz,playable_max_xz,lookahead_min_xz,lookahead_max_xz` |
-| spawn | exact keys `position,yaw_radians`; three finite coordinates and finite yaw |
+| bounds | eight flat arrays `mesh_min_xyz,mesh_max_xyz,heightfield_min_xyz,heightfield_max_xyz,playable_min_xz,playable_max_xz,lookahead_min_xz,lookahead_max_xz`; parse the four XYZ arrays with `scene_double_array`, and the four XZ arrays with `scene_binary32_array` |
+| spawn | exact keys `position,yaw_radians`; three exact normal-or-zero binary32 coordinates and one exact normal-or-zero binary32 yaw |
 | regions | exact keys `certified,stress,blocked`; each value is an array of region objects |
-| region | `id,bounds_xz`; unique nonempty ID and producer order `[min_x,max_x,min_z,max_z]`, converted to strict `bounds2` |
-| route | `id,waypoints_xz,expected_outcome,walkability_class,landing_hold_seconds`; exact pairs `traverse/1`, `safe-stop/0`, `traverse-or-safe-stop/2` |
+| region | `id,bounds_xz`; unique nonempty ID and exact binary32 producer order `[min_x,max_x,min_z,max_z]`, converted to strict `bounds2` |
+| route | `id,waypoints_xz,expected_outcome,walkability_class,landing_hold_seconds`; every waypoint component and hold duration is exact normal-or-zero binary32, and outcome/class pairs are exactly `traverse/1`, `safe-stop/0`, `traverse-or-safe-stop/2` |
 
 Require finite bounds with strict X/Z extent and `min_y <= max_y` (flat scenes
 legitimately have equal Y bounds), playable/lookahead within heightfield bounds,
@@ -2153,6 +2411,16 @@ spawn inside playable, every region/waypoint inside lookahead, at least two
 route points, nonnegative finite landing hold, unique region/route IDs, and at
 least one route. A positive hold additionally requires at least four points
 and uses waypoint index `2` as the landing hold with a later exit waypoint.
+After loading G1HF, derive the heightfield X/Z extrema in binary64 as
+`double(origin) + double(index) * double(cell_size)` and require exact equality
+with the binary64 heightfield metadata. Derive mesh X/Z extrema by explicitly
+rounding those promoted endpoints to binary32 and promoting them back to
+binary64; require exact equality with mesh metadata. Derive both Y ranges from
+the loaded binary32 samples promoted to binary64. Never narrow the metadata
+bounds before these comparisons: fixtures with `origin_x=-1.0f`,
+`cell_size=0.02f`, and `nx=2` must retain heightfield maximum
+`-0.9800000004470348` separately from OBJ maximum
+`-0.9800000190734863`.
 Require the exact route count/ID order matrix from Step 1 for each exact scene
 ID; aliases, missing/extra routes, and the two blocked routes in reversed order
 are invalid even if their generic outcome/class pair is otherwise valid. Add
@@ -2160,21 +2428,35 @@ candidate fixtures that rename one route, reverse the blocked pair, and append
 an extra route; each must fail transactionally with the active scene unchanged.
 Hash all three scene artifacts, load G1HF/G1WM, and require
 every declared grid/origin/cell/exterior field to equal the decoded binary.
-Sample every route segment at spacing no larger than half a cell using the
-same strict-domain nearest-node convention as `walkability_class_at`:
-`traverse` stays class `1`; `traverse-or-safe-stop` stays class `2` in its
-published stress course; and `safe-stop` begins class `1`, crosses exactly once
-to class `0`, and never re-enters class `1`. No route may leave the grid.
+Compute the maximum sample step once with `terrain_f32_div(cell_size, 2.0f)`,
+derive every segment count with `scene_route_sample_count`, and compute each
+sample with `scene_binary32_lerp`. That helper copies the authoritative start
+and stop bits at the two endpoints, exactly like `_route_samples`, and uses
+the one-round arithmetic only for interior samples. These helpers reproduce the producer's
+separate binary32 subtract, multiply, add, square-root, divide, multiply, and
+add materializations; neither strict nor fast-math builds may fuse a route
+multiply/add. Classify with
+the same shared strict-domain nearest-node helper as
+`walkability_class_at`. That helper performs separate one-round binary32
+subtract, divide, and `+0.5` calls before `floorf`; an exact half-cell tie
+belongs to the positive index, and immediately adjacent binary32 neighbors
+must match the producer oracle in strict and `-O3 -ffast-math` builds.
+`traverse` stays class `1`; `traverse-or-safe-stop` stays class `2` in
+its published stress course; and `safe-stop` begins class `1`, crosses exactly
+once to class `0`, and never re-enters class `1`. No route may leave the grid.
 
 Use this exact transaction boundary and the already-loaded manifest:
 
 ```cpp
 static inline bool scene_pack_load(scene_pack& out,const char* root,const motion_pack_manifest& manifest,const scene_catalog& catalog,int index,char* error,int capacity)
 {
- if(index<0||index>=static_cast<int>(catalog.ids.size()))return scene_error(error,capacity,"scene index %d is out of range",index);
- const std::string& id=catalog.ids[static_cast<size_t>(index)];const std::string prefix="scenes/"+id+"/";scene_pack candidate;
- if(!scene_join(candidate.scene_path,root,prefix+"scene.json",error,capacity))return false;json_value document;
- if(!json_document_load(document,candidate.scene_path.c_str(),error,capacity)||!scene_metadata_parse(candidate.metadata,document,id.c_str(),manifest,candidate.scene_path.c_str(),error,capacity))return false;
+ if(index<0||index>=static_cast<int>(catalog.ids.size())||catalog.scenes.size()!=catalog.ids.size())return scene_error(error,capacity,"scene index %d is out of range",index);
+ const scene_descriptor& descriptor=catalog.scenes[static_cast<size_t>(index)];
+ const std::string& id=catalog.ids[static_cast<size_t>(index)];scene_pack candidate;
+ if(descriptor.id!=id||!scene_join(candidate.scene_path,root,descriptor.path,error,capacity))return false;
+ json_value document;
+ if(!scene_json_load_verified(document,candidate.scene_path.c_str(),descriptor.sha256,error,capacity)||!scene_metadata_parse(candidate.metadata,document,descriptor.id.c_str(),manifest,candidate.scene_path.c_str(),error,capacity))return false;
+ const std::string prefix="scenes/"+descriptor.id+"/";
  if(!scene_join(candidate.terrain_path,root,prefix+candidate.metadata.heightfield.path,error,capacity)||!scene_join(candidate.mesh_path,root,prefix+candidate.metadata.mesh.path,error,capacity)||!scene_join(candidate.walkability_path,root,prefix+candidate.metadata.walkability.path,error,capacity)||!scene_verify_sha(candidate.terrain_path,candidate.metadata.heightfield.sha256,error,capacity)||!scene_verify_sha(candidate.mesh_path,candidate.metadata.mesh.sha256,error,capacity)||!scene_verify_sha(candidate.walkability_path,candidate.metadata.walkability.sha256,error,capacity)||!heightfield_load(candidate.terrain,candidate.terrain_path.c_str(),error,capacity))return false;
  if(candidate.terrain.version!=2)return scene_error(error,capacity,"%s: published scene '%s' requires G1HF version 2, got %u",candidate.terrain_path.c_str(),id.c_str(),static_cast<unsigned>(candidate.terrain.version));
  if(!walkability_load(candidate.walkability,candidate.walkability_path.c_str(),candidate.terrain,error,capacity)||!scene_candidate_validate(candidate,error,capacity))return false;
@@ -2236,6 +2518,9 @@ git commit -m "feat: validate G1 multiscene runtime packs"
 - Reset covers selected/current/transition pose arrays, all inertial offsets, trajectory/simulation/input state, recorded contacts and dormant contact-fixup buffers, support state, traversal state, search timers, deterministic route cursor, camera orbit, per-scene diagnostics, and adjusted/global FK buffers.
 - Configuration that intentionally persists across a scene reset stays outside the struct: feature weights, inertialization/adjustment/clamp tuning, window/model, catalog, log file, total log row number, and exit status.
 - Reset maps the first database range to scene spawn XZ/yaw, initializes support from `runtime_height(spawn_xz) - source_root_height(frame)`, leaves the planar simulation Y at zero, and applies support only to the render-pose `G1_Simulation.y`.
+- Reset copies the already validated binary32 spawn X/Z/yaw bits directly
+  from `scene_metadata`; it never reparses JSON, recomputes spawn from bounds,
+  or carries an unrounded binary64 coordinate into height/walkability queries.
 
 - [ ] **Step 1: Write a poison-and-reset test**
 
@@ -2714,7 +2999,8 @@ git commit -m "feat: switch G1 terrain scenes transactionally"
 - Modify: `controller.cpp` fixed-update input and simulation stages
 
 **Interfaces:**
-- Produces: `int walkability_class_at(const walkability_grid&, const heightfield&, float, float)`; out-of-grid/non-finite samples are blocked (`0`).
+- Consumes Task 1's one-round-per-operation `walkability_nearest_axis` and
+  `walkability_class_at`; out-of-grid/non-finite samples are blocked (`0`).
 - Produces `walkability_sweep_result` and `walkability_sweep` as defined in
   Step 3 for a circular `0.20 m` footprint, with centerline spacing at most
   half a cell and conservative node contact.
@@ -2741,6 +3027,14 @@ static void test_walkability_sweep_and_safe_stop()
  grid.cells(2*11+4)=2;
  check(walkability_class_at(grid,field,0.4f,0.2f)==2,"stress lookup");
  check(walkability_class_at(grid,field,-0.01f,0.2f)==0,"exterior blocked");
+ heightfield parity_field;parity_field.version=2;initialize_heightfield(parity_field,3,2,-0.02f,0,0.02f,0);parity_field.heights.zero();
+ walkability_grid parity_grid;parity_grid.nx=3;parity_grid.nz=2;parity_grid.cells.resize(6);parity_grid.cells(0)=1;parity_grid.cells(1)=2;parity_grid.cells(2)=1;parity_grid.cells(3)=1;parity_grid.cells(4)=2;parity_grid.cells(5)=1;
+ const float exact_half=-0.01f;const float below_half=nextafterf(exact_half,-INFINITY);const float above_half=nextafterf(exact_half,INFINITY);
+ check(walkability_class_at(parity_grid,parity_field,below_half,0)==1,"binary32 below half-cell");
+ check(walkability_class_at(parity_grid,parity_field,exact_half,0)==2,"exact half-cell chooses positive index");
+ check(walkability_class_at(parity_grid,parity_field,above_half,0)==2,"binary32 above half-cell");
+ heightfield rounded_field;rounded_field.version=2;initialize_heightfield(rounded_field,3,2,-1.0f,0,0.02f,0);rounded_field.heights.zero();
+ check(walkability_class_at(parity_grid,rounded_field,-0.9900000095367432f,0)==1,"rounded mathematical midpoint remains below authoritative half-cell");
  walkability_sweep_result sweep=walkability_sweep(grid,field,vec3(0.1f,8,0.2f),vec3(0.9f,-8,0.2f),0.20f);
  check(sweep.blocked&&sweep.reason==walkability_blocked_cell,"blocked sweep");
  check(sweep.safe_fraction>=0&&sweep.safe_fraction<1&&sweep.point.y==0,"safe fraction and planar point");
@@ -2787,9 +3081,9 @@ g++ -std=c++17 -O0 -g -Wall -Wextra -Werror -pedantic -I. tests/cpp/test_terrain
 
 Expected: compilation fails for undefined `walkability_sweep_result` and traversal functions.
 
-- [ ] **Step 3: Implement conservative lookup and sweep**
+- [ ] **Step 3: Implement the conservative footprint sweep**
 
-Add to `terrain_runtime.h` after `walkability_load`:
+Add to `terrain_runtime.h` after Task 1's lookup helpers:
 
 ```cpp
 enum walkability_reason{walkability_clear,walkability_blocked_cell,walkability_out_of_bounds,walkability_nonfinite};
@@ -2800,18 +3094,6 @@ static inline const char* walkability_reason_name(walkability_reason reason)
 
 static inline float walkability_xz_length(const vec3 value)
 {return sqrtf(value.x*value.x+value.z*value.z);}
-
-static inline bool walkability_grid_matches_heightfield(const walkability_grid& grid,const heightfield& field)
-{size_t count=0;return grid.nx==field.nx&&grid.nz==field.nz&&grid.nx>=2&&grid.nz>=2&&terrain_float_is_finite(field.origin_x)&&terrain_float_is_finite(field.origin_z)&&terrain_float_is_finite(field.cell_size)&&field.cell_size>0&&terrain_size_multiply(static_cast<size_t>(grid.nx),static_cast<size_t>(grid.nz),count)&&count<=static_cast<size_t>(INT_MAX)&&grid.cells.size==static_cast<int>(count);}
-
-static inline int walkability_class_at(const walkability_grid& grid,const heightfield& field,float x,float z)
-{
- if(!terrain_float_is_finite(x)||!terrain_float_is_finite(z)||!walkability_grid_matches_heightfield(grid,field))return 0;
- const float gx=(x-field.origin_x)/field.cell_size,gz=(z-field.origin_z)/field.cell_size;
- if(!terrain_float_is_finite(gx)||!terrain_float_is_finite(gz)||gx<0||gz<0||gx>grid.nx-1||gz>grid.nz-1)return 0;
- const int ix=static_cast<int>(floorf(gx+0.5f)),iz=static_cast<int>(floorf(gz+0.5f));
- if(ix<0||ix>=grid.nx||iz<0||iz>=grid.nz)return 0;const int value=grid.cells(iz*grid.nx+ix);return value<=2?value:0;
-}
 
 static inline int walkability_footprint_class(const walkability_grid& grid,const heightfield& field,float x,float z,float radius,walkability_reason& reason)
 {
@@ -3036,6 +3318,10 @@ git commit -m "feat: preserve G1 motion matching across world levels"
   exactly `0.50 m/s` and `dt=0.04`. It never depends on selected motion,
   simulation position, wall contact, wall-clock time, or terrain weight; A/B
   runs therefore receive bit-identical commands.
+- Route waypoints are the exact binary32 values admitted by Task 4. Route
+  height/classification samples use `scene_binary32_lerp`; no binary64-only
+  JSON coordinate or fused, unrounded interpolation result may reach
+  `heightfield_sample_v2` or walkability lookup.
 - For every route with `landing_hold_seconds > 0`, published metadata must have
   at least four waypoints and waypoint index `2` is the locked landing-hold
   waypoint. The driver inserts exactly
@@ -3071,6 +3357,7 @@ int main()
  check(deterministic_route_command(a,route,200,0.04f,0.50f,error,sizeof(error)),error);check(a.complete&&a.command.x==0&&a.command.z==0,"route complete");
  check(deterministic_route_motion_frames(route)==200,"motion count includes hold");
  for(int frame=0;frame<225;++frame){check(deterministic_route_command(a,route,frame,0.04f,0.50f,error,sizeof(error)),error);check(deterministic_route_command(b,route,frame,0.04f,0.50f,error,sizeof(error)),error);check(bits(a.command.x)==bits(b.command.x)&&bits(a.command.z)==bits(b.command.z)&&a.waypoint==b.waypoint&&a.complete==b.complete,"repeatable route input");}
+ float rounded_sample=0;check(scene_binary32_lerp(rounded_sample,-4.821664810180664f,0.22549442946910858f,13,23),"awkward route interpolation");check(bits(rounded_sample)==UINT32_C(0xbffc05aa),"route mul then add rounds separately without FMA");
  route.waypoints_xz[1]=route.waypoints_xz[0];check(!deterministic_route_command(a,route,0,0.04f,0.50f,error,sizeof(error)),"zero segment rejected");return 0;
 }
 ```
@@ -3125,16 +3412,20 @@ Create `route_runtime.h`:
 #include <cfloat>
 #include <cmath>
 struct deterministic_route_sample{vec3 command;int waypoint=0;bool complete=false;};
+static inline bool deterministic_route_segment_frames(int& frames,const std::pair<float,float>& start,const std::pair<float,float>& stop,float dt,float speed)
+{float maximum_step=0;return terrain_f32_mul(maximum_step,speed,dt)&&scene_route_sample_count(frames,start,stop,maximum_step);}
+static inline bool deterministic_route_hold_frames(int& frames,float seconds,float dt)
+{float ratio=0;if(!terrain_f32_div(ratio,seconds,dt))return false;const float rounded=ceilf(ratio);if(!terrain_float_is_finite(rounded)||rounded<0.0f||rounded>static_cast<float>(INT_MAX))return false;frames=static_cast<int>(rounded);return true;}
 static inline bool deterministic_route_command(deterministic_route_sample& out,const scene_route& route,int frame,float dt,float speed,char* error,int capacity)
 {
  if(frame<0||!terrain_float_is_finite(dt)||dt<=0||!terrain_float_is_finite(speed)||speed<=0||route.waypoints_xz.size()<2||!terrain_float_is_finite(route.landing_hold_seconds)||route.landing_hold_seconds<0|| (route.landing_hold_seconds>0&&route.waypoints_xz.size()<4))return scene_error(error,capacity,"route '%s': invalid frame, dt, speed, hold, or waypoint count",route.id.c_str());
- int cursor=0;for(size_t i=0;i+1<route.waypoints_xz.size();++i){const float dx=route.waypoints_xz[i+1].first-route.waypoints_xz[i].first;const float dz=route.waypoints_xz[i+1].second-route.waypoints_xz[i].second;const float length=std::sqrt(dx*dx+dz*dz);if(!terrain_float_is_finite(length)||length<=1e-6f)return scene_error(error,capacity,"route '%s': segment %zu has zero or non-finite length",route.id.c_str(),i);const int frames=static_cast<int>(std::ceil(length/(speed*dt)));if(frame<cursor+frames){deterministic_route_sample sample;sample.command=vec3(speed*dx/length,0,speed*dz/length);sample.waypoint=static_cast<int>(i)+1;out=sample;return true;}cursor+=frames;if(i+1==2&&route.landing_hold_seconds>0){const int hold=static_cast<int>(std::ceil(route.landing_hold_seconds/dt));if(frame<cursor+hold){deterministic_route_sample sample;sample.waypoint=2;out=sample;return true;}cursor+=hold;}}
+ int cursor=0;for(size_t i=0;i+1<route.waypoints_xz.size();++i){float dx=0,dz=0,length=0,unit_x=0,unit_z=0,command_x=0,command_z=0;int frames=0;if(!scene_route_segment(dx,dz,length,route.waypoints_xz[i],route.waypoints_xz[i+1])||length<=1e-6f||!deterministic_route_segment_frames(frames,route.waypoints_xz[i],route.waypoints_xz[i+1],dt,speed))return scene_error(error,capacity,"route '%s': segment %zu has invalid binary32 timing",route.id.c_str(),i);if(frame<cursor+frames){if(!terrain_f32_div(unit_x,dx,length)||!terrain_f32_div(unit_z,dz,length)||!terrain_f32_mul(command_x,speed,unit_x)||!terrain_f32_mul(command_z,speed,unit_z))return scene_error(error,capacity,"route '%s': segment %zu command overflow",route.id.c_str(),i);deterministic_route_sample sample;sample.command=vec3(command_x,0,command_z);sample.waypoint=static_cast<int>(i)+1;out=sample;return true;}cursor+=frames;if(i+1==2&&route.landing_hold_seconds>0){int hold=0;if(!deterministic_route_hold_frames(hold,route.landing_hold_seconds,dt))return scene_error(error,capacity,"route '%s': invalid landing hold",route.id.c_str());if(frame<cursor+hold){deterministic_route_sample sample;sample.waypoint=2;out=sample;return true;}cursor+=hold;}}
  deterministic_route_sample sample;sample.waypoint=static_cast<int>(route.waypoints_xz.size())-1;sample.complete=true;out=sample;return true;
 }
 static inline int deterministic_route_motion_frames(const scene_route& route,float dt=0.04f,float speed=0.50f)
-{int total=0;for(size_t i=0;i+1<route.waypoints_xz.size();++i){const float dx=route.waypoints_xz[i+1].first-route.waypoints_xz[i].first;const float dz=route.waypoints_xz[i+1].second-route.waypoints_xz[i].second;total+=static_cast<int>(std::ceil(std::sqrt(dx*dx+dz*dz)/(speed*dt)));if(i+1==2&&route.landing_hold_seconds>0)total+=static_cast<int>(std::ceil(route.landing_hold_seconds/dt));}return total;}
+{int total=0;for(size_t i=0;i+1<route.waypoints_xz.size();++i){int frames=0;if(!deterministic_route_segment_frames(frames,route.waypoints_xz[i],route.waypoints_xz[i+1],dt,speed))return -1;total+=frames;if(i+1==2&&route.landing_hold_seconds>0){int hold=0;if(!deterministic_route_hold_frames(hold,route.landing_hold_seconds,dt))return -1;total+=hold;}}return total;}
 static inline float deterministic_route_target_height(const scene_route& route,const heightfield& terrain)
-{struct bin{int key=0,count=0;float sum=0;};std::vector<bin> bins;const float base=heightfield_sample_v2(terrain,route.waypoints_xz.front().first,route.waypoints_xz.front().second);for(size_t i=0;i+1<route.waypoints_xz.size();++i){const float dx=route.waypoints_xz[i+1].first-route.waypoints_xz[i].first;const float dz=route.waypoints_xz[i+1].second-route.waypoints_xz[i].second;const float length=std::sqrt(dx*dx+dz*dz);int steps=static_cast<int>(std::ceil(length/(0.5f*terrain.cell_size)));if(steps<1)steps=1;for(int step=0;step<=steps;++step){const float t=static_cast<float>(step)/steps;const float height=heightfield_sample_v2(terrain,route.waypoints_xz[i].first+dx*t,route.waypoints_xz[i].second+dz*t);if(std::fabs(height-base)<=0.02f)continue;const int key=static_cast<int>(std::lround(height*100.0f));size_t found=0;while(found<bins.size()&&bins[found].key!=key)++found;if(found==bins.size()){bin value;value.key=key;bins.push_back(value);}++bins[found].count;bins[found].sum+=height;}}if(bins.empty())return base;size_t best=0;for(size_t i=1;i<bins.size();++i)if(bins[i].count>bins[best].count||(bins[i].count==bins[best].count&&bins[i].key>bins[best].key))best=i;return bins[best].sum/bins[best].count;}
+{struct bin{int key=0,count=0;float sum=0;};std::vector<bin> bins;const float base=heightfield_sample_v2(terrain,route.waypoints_xz.front().first,route.waypoints_xz.front().second);float half_cell=0;if(!terrain_f32_div(half_cell,terrain.cell_size,2.0f))return NAN;for(size_t i=0;i+1<route.waypoints_xz.size();++i){int steps=0;if(!scene_route_sample_count(steps,route.waypoints_xz[i],route.waypoints_xz[i+1],half_cell))return NAN;for(int step=0;step<=steps;++step){float x=0,z=0;if(!scene_binary32_lerp(x,route.waypoints_xz[i].first,route.waypoints_xz[i+1].first,step,steps)||!scene_binary32_lerp(z,route.waypoints_xz[i].second,route.waypoints_xz[i+1].second,step,steps))return NAN;const float height=heightfield_sample_v2(terrain,x,z);if(std::fabs(height-base)<=0.02f)continue;const int key=static_cast<int>(std::lround(height*100.0f));size_t found=0;while(found<bins.size()&&bins[found].key!=key)++found;if(found==bins.size()){bin value;value.key=key;bins.push_back(value);}++bins[found].count;bins[found].sum+=height;}}if(bins.empty())return base;size_t best=0;for(size_t i=1;i<bins.size();++i)if(bins[i].count>bins[best].count||(bins[i].count==bins[best].count&&bins[i].key>bins[best].key))best=i;return bins[best].sum/bins[best].count;}
 ```
 
 The target is diagnostic only; it never feeds trajectory, matcher, support, or
@@ -3224,8 +3515,11 @@ Run:
 
 ```bash
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
-  tests/cpp/test_route_runtime.cpp -o /tmp/test_route_runtime
-/tmp/test_route_runtime
+  tests/cpp/test_route_runtime.cpp -o /tmp/test_route_runtime_strict
+/tmp/test_route_runtime_strict
+g++ -std=c++17 -O3 -ffast-math -DNDEBUG -I. \
+  tests/cpp/test_route_runtime.cpp -o /tmp/test_route_runtime_release
+/tmp/test_route_runtime_release
 /home/ubuntu/miniconda3/envs/diffsim/bin/python -m unittest \
   tests.python.test_runtime_log -v
 g++ -std=c++17 -O3 -ffast-math -DNDEBUG -D_DEFAULT_SOURCE \
@@ -3239,7 +3533,9 @@ test "$?" -eq 2
 grep -F 'MM_TEST_ROUTE is required for route mode' /tmp/missing-route.err
 ```
 
-Expected: native/Python tests pass; strict controller build is warning-free;
+Expected: strict and release route commands, frame counts, target sampling,
+and binary32 bit assertions are identical; Python tests pass; the controller
+build is warning-free;
 missing route fails before Raylib; no Gate A column or mode changes.
 
 - [ ] **Step 8: Commit deterministic diagnostics**
