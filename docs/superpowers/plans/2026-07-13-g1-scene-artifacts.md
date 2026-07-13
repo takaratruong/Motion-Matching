@@ -5751,7 +5751,9 @@ git commit -m "feat: generate deterministic G1 terrain courses"
   order.
 - Produces: `grail_scene_definition(scene_id, base, clip,
   target_height_m) -> SceneDefinition` using the matching converted Holden root
-  path and root facing.
+  path and normalized root facing. Published playable/region bounds remain
+  unexpanded, while only the G1WM classifier receives the exact binary32
+  `0.25 m` halo used by the procedural scenes.
 - Produces: `grail_scene_definitions(measured_max_heights,
   clips_by_terrain) -> tuple[SceneDefinition, ...]` and
   `all_scene_definitions(measured_max_heights, clips_by_terrain)
@@ -5767,11 +5769,26 @@ git commit -m "feat: generate deterministic G1 terrain courses"
 - [ ] **Step 1: Write failing lexical-selection and converted-route tests**
 
 Extend imports in `tests/python/test_scenes.py` with `glob`, `os`,
-`select_grail_scene_bases`, `grail_scene_definition`,
-`grail_scene_definitions`, and `all_scene_definitions`. Add:
+`GRAIL_DEFAULT_BASE`, `select_grail_scene_bases`,
+`grail_scene_definition`, `grail_scene_definitions`,
+`all_scene_definitions`, and `_root_route_and_yaw`. Reuse Task 9's decoded
+G1HF/G1WM, conservative region/route coverage, and `0.20 m` footprint helpers.
+Add:
 
 ~~~python
 GRAIL_ROBOT_DIR = "/home/ubuntu/datasets/GRAIL/data/curb/robot"
+LOCKED_GRAIL_BASES = {
+    "grail-curb-default": GRAIL_DEFAULT_BASE,
+    "grail-curb-low": "terrain_curbs__curb_186__004",
+    "grail-curb-medium": "terrain_curbs__curb_022__001",
+    "grail-curb-high": "terrain_curbs__curb_165__006",
+}
+LOCKED_GRAIL_HEIGHTS = {
+    GRAIL_DEFAULT_BASE: 0.2921024334377573,
+    "terrain_curbs__curb_186__004": 0.12238701526200782,
+    "terrain_curbs__curb_022__001": 0.24007104328948528,
+    "terrain_curbs__curb_165__006": 0.3599740964554129,
+}
 
 
 def fake_grail_clip(base):
@@ -5786,7 +5803,7 @@ def fake_grail_clip(base):
 class GrailSceneTests(unittest.TestCase):
     def test_nearest_height_selection_uses_lexical_tie_break(self):
         measured = {
-            "terrain_curbs__curb_000__000": 0.29,
+            GRAIL_DEFAULT_BASE: 0.29,
             "a-low-tie": 0.13,
             "z-low-tie": 0.13,
             "medium": 0.241,
@@ -5794,27 +5811,67 @@ class GrailSceneTests(unittest.TestCase):
         }
         selected = select_grail_scene_bases(measured)
         self.assertEqual(selected, {
-            "grail-curb-default": "terrain_curbs__curb_000__000",
+            "grail-curb-default": GRAIL_DEFAULT_BASE,
             "grail-curb-low": "a-low-tie",
             "grail-curb-medium": "medium",
             "grail-curb-high": "high",
         })
 
+    def test_selection_rejects_bool_and_non_scalar_heights(self):
+        for invalid in (True, "0.12", [0.12], np.array(0.12)):
+            measured = {
+                GRAIL_DEFAULT_BASE: 0.29,
+                "invalid": invalid,
+            }
+            with self.subTest(invalid=repr(invalid)):
+                with self.assertRaisesRegex(TypeError, "real scalar"):
+                    select_grail_scene_bases(measured)
+
     def test_grail_scene_uses_matching_converted_root_path_and_facing(self):
-        base = "terrain_curbs__curb_000__000"
+        base = GRAIL_DEFAULT_BASE
         clip = fake_grail_clip(base)
         scene = grail_scene_definition(
             "grail-curb-default", base, clip, None)
         self.assertEqual(scene.spawn_position, (0.0, 0.0, 0.0))
         self.assertAlmostEqual(scene.spawn_yaw_radians, 0.0)
         self.assertEqual(scene.routes[0].route_id, "curb-forward")
-        self.assertEqual(scene.routes[0].waypoints_xz[0], (0.0, 0.0))
-        self.assertEqual(scene.routes[0].waypoints_xz[-1], (0.4, 1.6))
+        expected_first = tuple(
+            float(value) for value in clip.positions[0, 0, (0, 2)])
+        expected_last = tuple(
+            float(value) for value in clip.positions[-1, 0, (0, 2)])
+        self.assertEqual(scene.routes[0].waypoints_xz[0], expected_first)
+        self.assertEqual(scene.routes[0].waypoints_xz[-1], expected_last)
         self.assertEqual(scene.provenance["source_ids"], [base, clip.name])
         wrong = fake_grail_clip("different-base")
         with self.assertRaisesRegex(ValueError, "matching converted clip"):
             grail_scene_definition(
                 "grail-curb-default", base, wrong, None)
+
+    def test_root_route_rejects_bad_rotation_shape_and_quaternion_norm(self):
+        bad_shape = fake_grail_clip(GRAIL_DEFAULT_BASE)
+        bad_shape.rotations = np.zeros(
+            bad_shape.positions.shape[:2], np.float32)
+        with self.assertRaisesRegex(ValueError, "root rotations"):
+            _root_route_and_yaw(bad_shape)
+
+        zero = fake_grail_clip(GRAIL_DEFAULT_BASE)
+        zero.rotations[0, 0] = 0.0
+        with self.assertRaisesRegex(ValueError, "root quaternion"):
+            _root_route_and_yaw(zero)
+
+        nonunit = fake_grail_clip(GRAIL_DEFAULT_BASE)
+        nonunit.rotations[0, 0] = np.array([2.0, 0.0, 0.0, 0.0])
+        with self.assertRaisesRegex(ValueError, "root quaternion"):
+            _root_route_and_yaw(nonunit)
+
+        roundoff = fake_grail_clip(GRAIL_DEFAULT_BASE)
+        yaw = 0.6
+        unit = np.array([
+            np.cos(0.5 * yaw), 0.0, np.sin(0.5 * yaw), 0.0,
+        ], np.float32)
+        roundoff.rotations[0, 0] = unit * np.float32(1.00005)
+        _, _, _, observed_yaw = _root_route_and_yaw(roundoff)
+        self.assertAlmostEqual(observed_yaw, yaw, places=5)
 
     def test_real_corpus_selection_is_stable(self):
         paths = sorted(glob.glob(os.path.join(GRAIL_ROBOT_DIR, "*.pkl")))
@@ -5823,30 +5880,15 @@ class GrailSceneTests(unittest.TestCase):
         for path in paths:
             base = os.path.splitext(os.path.basename(path))[0]
             measured[base] = GrailTerrain.from_base(base).footprint()["height"]
-        self.assertEqual(select_grail_scene_bases(measured), {
-            "grail-curb-default": "terrain_curbs__curb_000__000",
-            "grail-curb-low": "terrain_curbs__curb_186__004",
-            "grail-curb-medium": "terrain_curbs__curb_022__001",
-            "grail-curb-high": "terrain_curbs__curb_165__006",
-        })
+        self.assertEqual(
+            select_grail_scene_bases(measured), LOCKED_GRAIL_BASES)
 
     def test_full_definition_catalog_has_locked_order_and_classes(self):
-        selected = {
-            "grail-curb-default": "terrain_curbs__curb_000__000",
-            "grail-curb-low": "terrain_curbs__curb_186__004",
-            "grail-curb-medium": "terrain_curbs__curb_022__001",
-            "grail-curb-high": "terrain_curbs__curb_165__006",
-        }
-        measured = {
-            selected["grail-curb-default"]: 0.292,
-            selected["grail-curb-low"]: 0.122,
-            selected["grail-curb-medium"]: 0.240,
-            selected["grail-curb-high"]: 0.360,
-        }
         clips = {
-            base: fake_grail_clip(base) for base in selected.values()
+            base: fake_grail_clip(base)
+            for base in LOCKED_GRAIL_BASES.values()
         }
-        definitions = all_scene_definitions(measured, clips)
+        definitions = all_scene_definitions(LOCKED_GRAIL_HEIGHTS, clips)
         self.assertEqual(
             tuple(scene.scene_id for scene in definitions), REQUIRED_SCENE_IDS)
         grail = definitions[:4]
@@ -5856,6 +5898,81 @@ class GrailSceneTests(unittest.TestCase):
             [("traverse-or-safe-stop", 2), ("traverse", 1),
              ("traverse-or-safe-stop", 2),
              ("traverse-or-safe-stop", 2)])
+
+    def test_grail_g1wm_regions_routes_and_endpoint_footprints_are_class_pure(self):
+        clips = {
+            base: fake_grail_clip(base)
+            for base in LOCKED_GRAIL_BASES.values()
+        }
+        definitions = grail_scene_definitions(
+            LOCKED_GRAIL_HEIGHTS, clips)
+        self.assertEqual(
+            tuple(scene.scene_id for scene in definitions),
+            REQUIRED_SCENE_IDS[:4])
+        halo = np.float32(WALKABILITY_CLASSIFICATION_HALO)
+        for definition in definitions:
+            with self.subTest(scene=definition.scene_id):
+                built = build_scene(definition)
+                grid, walkability = decoded_scene_grid_and_walkability(built)
+                metadata = built.metadata
+                route = metadata["routes"][0]
+                expected = route["walkability_class"]
+                points = tuple(
+                    tuple(point) for point in route["waypoints_xz"])
+                observed = tuple(
+                    frozenset(
+                        int(walkability[iz, ix])
+                        for iz, ix in cover)
+                    for cover in _route_cell_covers(grid, points)
+                )
+                self.assertTrue(all(
+                    values == {expected} for values in observed))
+                for endpoint in (points[0], points[-1]):
+                    self.assertEqual(
+                        set(decoded_footprint_classes(
+                            grid, walkability, *endpoint)),
+                        {expected})
+
+                region_name = "certified" if expected == 1 else "stress"
+                self.assertEqual(
+                    len(metadata["regions"][region_name]), 1)
+                region = metadata["regions"][region_name][0]
+                cells = _region_cell_indices(grid, region["bounds_xz"])
+                self.assertTrue(cells)
+                self.assertEqual(
+                    {int(walkability[iz, ix]) for iz, ix in cells},
+                    {expected})
+                playable = (
+                    metadata["bounds"]["playable_min_xz"][0],
+                    metadata["bounds"]["playable_max_xz"][0],
+                    metadata["bounds"]["playable_min_xz"][1],
+                    metadata["bounds"]["playable_max_xz"][1],
+                )
+                self.assertEqual(region["bounds_xz"], list(playable))
+                xmin, xmax, zmin, zmax = (
+                    np.float32(value) for value in playable)
+                expanded = tuple(float(value) for value in (
+                    np.float32(xmin - halo), np.float32(xmax + halo),
+                    np.float32(zmin - halo), np.float32(zmax + halo),
+                ))
+                sx, _, sz = definition.spawn_position
+                exmin, exmax, ezmin, ezmax = expanded
+                self.assertEqual(definition.walkability(exmin, sz), expected)
+                self.assertEqual(definition.walkability(exmax, sz), expected)
+                self.assertEqual(definition.walkability(sx, ezmin), expected)
+                self.assertEqual(definition.walkability(sx, ezmax), expected)
+                self.assertEqual(
+                    definition.walkability(
+                        np.nextafter(exmin, -np.inf), sz), 0)
+                self.assertEqual(
+                    definition.walkability(
+                        np.nextafter(exmax, np.inf), sz), 0)
+                self.assertEqual(
+                    definition.walkability(
+                        sx, np.nextafter(ezmin, -np.inf)), 0)
+                self.assertEqual(
+                    definition.walkability(
+                        sx, np.nextafter(ezmax, np.inf)), 0)
 ~~~
 
 Also add these imports at the top of the test file:
@@ -5872,19 +5989,31 @@ Run:
 ~~~bash
 /home/ubuntu/miniconda3/envs/diffsim/bin/python -m unittest \
   tests.python.test_scenes.GrailSceneTests.test_nearest_height_selection_uses_lexical_tie_break \
-  tests.python.test_scenes.GrailSceneTests.test_grail_scene_uses_matching_converted_root_path_and_facing -v
+  tests.python.test_scenes.GrailSceneTests.test_selection_rejects_bool_and_non_scalar_heights \
+  tests.python.test_scenes.GrailSceneTests.test_grail_scene_uses_matching_converted_root_path_and_facing \
+  tests.python.test_scenes.GrailSceneTests.test_root_route_rejects_bad_rotation_shape_and_quaternion_norm -v
 ~~~
 
-Expected: import errors for `select_grail_scene_bases` and
-`grail_scene_definition`. Do not run the 1,769-mesh integration test until the
-small RED/GREEN cycle passes.
+Expected: import errors for `select_grail_scene_bases`,
+`grail_scene_definition`, and `_root_route_and_yaw`. Do not run the 1,769-mesh
+integration test or four-scene builds until the small RED/GREEN cycle passes.
 
 - [ ] **Step 3: Implement stable GRAIL selection and converted-clip routes**
 
-Import Holden quaternion helpers in `scenes.py`:
+Add `GrailTerrain` to the existing terrain import in `scenes.py`, and import
+Holden quaternion helpers:
 
 ~~~python
 from resources import quat as holden_quat
+
+from .terrain import (
+    HEIGHTFIELD_DIAGONAL,
+    HEIGHTFIELD_INTERPOLATION,
+    GrailTerrain,
+    HeightGrid,
+    rasterize_heightfield,
+    surface_semantics_signature,
+)
 ~~~
 
 Then add:
@@ -5903,9 +6032,10 @@ def select_grail_scene_bases(measured_max_heights):
         raise ValueError("GRAIL measurements must be a non-empty mapping")
     measured = {}
     for base, height in measured_max_heights.items():
-        if not isinstance(base, str) or not base or not np.isfinite(height):
-            raise ValueError("GRAIL base names and measured heights are invalid")
-        measured[base] = float(height)
+        if type(base) is not str or not base:
+            raise ValueError("GRAIL base names must be non-empty strings")
+        measured[base] = _finite_real(
+            height, f"GRAIL measured height for {base}")
     if GRAIL_DEFAULT_BASE not in measured:
         raise ValueError(f"missing default GRAIL base {GRAIL_DEFAULT_BASE}")
     result = {"grail-curb-default": GRAIL_DEFAULT_BASE}
@@ -5923,9 +6053,10 @@ def _root_route_and_yaw(clip):
     if positions.ndim != 3 or positions.shape[0] < 2 \
             or positions.shape[1] < 1 or positions.shape[2] != 3:
         raise ValueError("converted GRAIL clip has invalid root positions")
-    if rotations.shape[:2] != positions.shape[:2] \
-            or rotations.shape[2] != 4 \
-            or not np.isfinite(positions).all() \
+    if rotations.ndim != 3 \
+            or rotations.shape != positions.shape[:2] + (4,):
+        raise ValueError("converted GRAIL clip has invalid root rotations")
+    if not np.isfinite(positions).all() \
             or not np.isfinite(rotations).all():
         raise ValueError("converted GRAIL root transform is invalid")
     indices = sorted(set(
@@ -5939,8 +6070,13 @@ def _root_route_and_yaw(clip):
         (float(path[index, 0]), float(path[index, 1]))
         for index in indices
     )
+    root_rotation = rotations[0, 0]
+    root_norm = float(np.linalg.norm(root_rotation))
+    if root_norm < 1e-8 or abs(root_norm - 1.0) > 1e-4:
+        raise ValueError("converted GRAIL root quaternion is not unit length")
+    root_rotation = root_rotation / root_norm
     facing = holden_quat.mul_vec(
-        rotations[0, 0], np.array([0.0, 0.0, 1.0], np.float64))
+        root_rotation, np.array([0.0, 0.0, 1.0], np.float64))
     horizontal = np.array([facing[0], facing[2]], np.float64)
     if not np.isfinite(horizontal).all() or np.linalg.norm(horizontal) < 1e-8:
         raise ValueError("converted GRAIL root facing is invalid")
@@ -5968,6 +6104,7 @@ def grail_scene_definition(
         float(path_zmin - COURSE_HALF_WIDTH),
         float(path_zmax + COURSE_HALF_WIDTH),
     )
+    classification = _walkability_classification_bounds(playable)
     bounds = (
         float(min(mesh_xmin, playable[0]) - LOOKAHEAD_MARGIN),
         float(max(mesh_xmax, playable[1]) + LOOKAHEAD_MARGIN),
@@ -6013,7 +6150,7 @@ def grail_scene_definition(
         routes=(SceneRoute(
             "curb-forward", route_points, expected_outcome,
             walkability_class, 0.0),),
-        walkability=lambda x, z, c=walkability_class, b=playable: (
+        walkability=lambda x, z, c=walkability_class, b=classification: (
             c if _bounds_contains(b, x, z) else 0),
     )
 
@@ -6041,27 +6178,71 @@ def all_scene_definitions(measured_max_heights, clips_by_terrain):
     return definitions
 ~~~
 
+The `classification` tuple is the only expanded GRAIL rectangle. `playable`
+continues to supply the published playable and region metadata unchanged.
+Normalizing the accepted initial root quaternion removes permissible float32
+norm drift before deriving yaw; zero or materially nonunit quaternions remain
+hard errors.
+
+Run the small selection/root tests plus the four exact G1WM builds:
+
+~~~bash
+/home/ubuntu/miniconda3/envs/diffsim/bin/python -m unittest \
+  tests.python.test_scenes.GrailSceneTests.test_nearest_height_selection_uses_lexical_tie_break \
+  tests.python.test_scenes.GrailSceneTests.test_selection_rejects_bool_and_non_scalar_heights \
+  tests.python.test_scenes.GrailSceneTests.test_grail_scene_uses_matching_converted_root_path_and_facing \
+  tests.python.test_scenes.GrailSceneTests.test_root_route_rejects_bad_rotation_shape_and_quaternion_norm \
+  tests.python.test_scenes.GrailSceneTests.test_full_definition_catalog_has_locked_order_and_classes \
+  tests.python.test_scenes.GrailSceneTests.test_grail_g1wm_regions_routes_and_endpoint_footprints_are_class_pure -v
+~~~
+
+Expected: all six tests pass. All four GRAIL definitions build; their published
+regions remain unexpanded, their exact `0.25f` classifier halos have the locked
+nextafter boundary, and every conservative region, route cover, and both
+`0.20 m` endpoint footprints contain only the declared G1WM class.
+
 - [ ] **Step 4: Write failing real-surface parity tests**
 
-Import `grail_surface_parity` and `rasterize_heightfield` in
-`tests/python/test_terrain.py`, then add:
+Import `GRAIL_DEFAULT_BASE` from `scenes.py` and `grail_surface_parity` in the
+existing terrain import in `tests/python/test_terrain.py`. Keep its existing
+`rasterize_heightfield` import. Then add:
 
 ~~~python
-    def test_default_grail_grid_meets_all_surface_parity_tolerances(self):
-        terrain = GrailTerrain.from_base(builder.DEFAULTS["runtime_terrain"])
-        xmin, xmax, zmin, zmax = terrain.xz_bounds()
-        grid = rasterize_heightfield(
-            terrain, (xmin - 1.0, xmax + 1.0,
-                      zmin - 1.0, zmax + 1.0), 0.02)
-        report = grail_surface_parity(terrain, grid)
-        self.assertLessEqual(report["node_error_m"], 1e-6)
-        self.assertLessEqual(report["within_cell_error_m"], 1e-4)
-        self.assertLessEqual(report["source_away_edge_error_m"], 0.005)
-        self.assertLessEqual(report["top_edge_movement_m"], 0.02 + 1e-9)
-        self.assertGreater(report["away_edge_probe_count"], 0)
+from resources.g1_terrain_builder.scenes import GRAIL_DEFAULT_BASE
+from resources.g1_terrain_builder.terrain import grail_surface_parity
+
+
+GRAIL_PARITY_BASES = (
+    GRAIL_DEFAULT_BASE,
+    "terrain_curbs__curb_186__004",
+    "terrain_curbs__curb_022__001",
+    "terrain_curbs__curb_165__006",
+)
+~~~
+
+Inside `TerrainTests`, add the parameterized parity test and retain the OBJ
+topology test as a default-base-only check:
+
+~~~python
+    def test_selected_grail_grids_meet_all_surface_parity_tolerances(self):
+        for base in GRAIL_PARITY_BASES:
+            with self.subTest(base=base):
+                terrain = GrailTerrain.from_base(base)
+                xmin, xmax, zmin, zmax = terrain.xz_bounds()
+                grid = rasterize_heightfield(
+                    terrain, (xmin - 1.0, xmax + 1.0,
+                              zmin - 1.0, zmax + 1.0), 0.02)
+                report = grail_surface_parity(terrain, grid)
+                self.assertLessEqual(report["node_error_m"], 1e-6)
+                self.assertLessEqual(report["within_cell_error_m"], 1e-4)
+                self.assertLessEqual(
+                    report["source_away_edge_error_m"], 0.005)
+                self.assertLessEqual(
+                    report["top_edge_movement_m"], 0.02 + 1e-9)
+                self.assertGreater(report["away_edge_probe_count"], 0)
 
     def test_real_grail_obj_vertices_and_faces_are_the_grid(self):
-        terrain = GrailTerrain.from_base(builder.DEFAULTS["runtime_terrain"])
+        terrain = GrailTerrain.from_base(GRAIL_DEFAULT_BASE)
         xmin, xmax, zmin, zmax = terrain.xz_bounds()
         grid = rasterize_heightfield(
             terrain, (xmin - 0.04, xmax + 0.04,
@@ -6105,12 +6286,14 @@ Run:
 
 ~~~bash
 /home/ubuntu/miniconda3/envs/diffsim/bin/python -m unittest \
-  tests.python.test_terrain.TerrainTests.test_default_grail_grid_meets_all_surface_parity_tolerances \
+  tests.python.test_terrain.TerrainTests.test_selected_grail_grids_meet_all_surface_parity_tolerances \
   tests.python.test_terrain.TerrainTests.test_real_grail_obj_vertices_and_faces_are_the_grid -v
 ~~~
 
-Expected: import error for `grail_surface_parity`; the OBJ test may already
-pass because Task 4 established the common grid.
+Expected: import error for `grail_surface_parity`; the default-only OBJ test may
+already pass because Task 4 established the common grid. The parity test is
+locked to all four selected bases rather than the removable legacy
+`builder.DEFAULTS["runtime_terrain"]` key.
 
 - [ ] **Step 6: Implement deterministic node, triangle, source, and edge metrics**
 
@@ -6214,9 +6397,13 @@ Run:
   tests.python.test_terrain tests.python.test_scenes -v
 ~~~
 
-Expected: all tests pass, including the scan of exactly 1,769 GRAIL candidates;
-the four measured base names match the locked choices and every parity metric
-meets its independent tolerance.
+Expected: all tests pass, including the scan of exactly 1,769 GRAIL candidates.
+The four measured base names match the locked choices; all four exact GRAIL
+definitions build with class-pure regions, route supercovers, and both endpoint
+footprints; their classification-only halos have the exact binary32 boundary;
+and every parity category meets its independent tolerance on all four selected
+surfaces. The default scene alone retains the exact OBJ vertex/face topology
+check.
 
 - [ ] **Step 8: Commit exact GRAIL scene selection and parity**
 
