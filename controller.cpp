@@ -986,42 +986,6 @@ void query_compute_trajectory_direction_feature(
 
 //--------------------------------------
 
-// Collide against the obscales which are
-// essentially bounding boxes of a given size
-vec3 simulation_collide_obstacles(
-    const vec3 prev_pos,
-    const vec3 next_pos,
-    const slice1d<vec3> obstacles_positions,
-    const slice1d<vec3> obstacles_scales,
-    const float radius = 0.6f)
-{
-    vec3 dx = next_pos - prev_pos;
-    vec3 proj_pos = prev_pos;
-    
-    // Substep because I'm too lazy to implement CCD
-    int substeps = 1 + (int)(length(dx) * 5.0f);
-    
-    for (int j = 0; j < substeps; j++)
-    {
-        proj_pos = proj_pos + dx / substeps;
-        
-        for (int i = 0; i < obstacles_positions.size; i++)
-        {
-            // Find nearest point inside obscale and push out
-            vec3 nearest = clamp(proj_pos, 
-              obstacles_positions(i) - 0.5f * obstacles_scales(i),
-              obstacles_positions(i) + 0.5f * obstacles_scales(i));
-
-            if (length(nearest - proj_pos) < radius)
-            {
-                proj_pos = radius * normalize(proj_pos - nearest) + nearest;
-            }
-        }
-    } 
-    
-    return proj_pos;
-}
-
 // Taken from https://theorangeduck.com/page/spring-roll-call#controllers
 void simulation_positions_update(
     vec3& position, 
@@ -1029,9 +993,7 @@ void simulation_positions_update(
     vec3& acceleration, 
     const vec3 desired_velocity, 
     const float halflife, 
-    const float dt,
-    const slice1d<vec3> obstacles_positions,
-    const slice1d<vec3> obstacles_scales)
+    const float dt)
 {
     float y = halflife_to_damping(halflife) / 2.0f; 
     vec3 j0 = velocity - desired_velocity;
@@ -1045,11 +1007,6 @@ void simulation_positions_update(
     velocity = eydt*(j0 + j1*dt) + desired_velocity;
     acceleration = eydt*(acceleration - j1*y*dt);
     
-    position = simulation_collide_obstacles(
-        position_prev, 
-        position,
-        obstacles_positions,
-        obstacles_scales);
 }
 
 void simulation_rotations_update(
@@ -1108,9 +1065,7 @@ void trajectory_positions_predict(
     const vec3 acceleration, 
     const slice1d<vec3> desired_velocities, 
     const float halflife,
-    const float dt,
-    const slice1d<vec3> obstacles_positions,
-    const slice1d<vec3> obstacles_scales)
+    const float dt)
 {
     positions(0) = position;
     velocities(0) = velocity;
@@ -1128,9 +1083,7 @@ void trajectory_positions_predict(
             accelerations(i), 
             desired_velocities(i), 
             halflife, 
-            dt, 
-            obstacles_positions, 
-            obstacles_scales);
+            dt);
     }
 }
 
@@ -1425,35 +1378,6 @@ void draw_trajectory(
         DrawLine3D(to_Vector3(trajectory_positions(i-1)), to_Vector3(trajectory_positions(i)), color);
     }
 }
-
-void draw_obstacles(
-    const slice1d<vec3> obstacles_positions,
-    const slice1d<vec3> obstacles_scales)
-{
-    for (int i = 0; i < obstacles_positions.size; i++)
-    {
-        vec3 position = vec3(
-            obstacles_positions(i).x, 
-            obstacles_positions(i).y + 0.5f * obstacles_scales(i).y + 0.01f, 
-            obstacles_positions(i).z);
-      
-        DrawCube(
-            to_Vector3(position),
-            obstacles_scales(i).x, 
-            obstacles_scales(i).y, 
-            obstacles_scales(i).z,
-            LIGHTGRAY);
-            
-        DrawCubeWires(
-            to_Vector3(position),
-            obstacles_scales(i).x, 
-            obstacles_scales(i).y, 
-            obstacles_scales(i).z,
-            GRAY);
-    }
-}
-
-//--------------------------------------
 
 vec3 adjust_character_position(
     const vec3 character_position,
@@ -1807,19 +1731,6 @@ int main(void)
     float camera_azimuth = 0.0f;
     float camera_altitude = 0.4f;
     float camera_distance = 4.0f;
-    
-    // Scene Obstacles
-    
-    array1d<vec3> obstacles_positions(3);
-    array1d<vec3> obstacles_scales(3);
-    
-    obstacles_positions(0) = vec3(5.0f, 0.0f, 6.0f);
-    obstacles_positions(1) = vec3(-3.0f, 0.0f, -5.0f);
-    obstacles_positions(2) = vec3(-8.0f, 0.0f, 3.0f);
-    
-    obstacles_scales(0) = vec3(2.0f, 1.0f, 5.0f);
-    obstacles_scales(1) = vec3(4.0f, 1.0f, 4.0f);
-    obstacles_scales(2) = vec3(2.0f, 1.0f, 2.0f);
     
     // Character
     
@@ -2204,9 +2115,7 @@ int main(void)
             simulation_acceleration,
             trajectory_desired_velocities,
             simulation_velocity_halflife,
-            trajectory_sample_time,
-            obstacles_positions,
-            obstacles_scales);
+            trajectory_sample_time);
            
         // Make query vector for search.
         // In theory this only needs to be done when a search is 
@@ -2227,16 +2136,19 @@ int main(void)
         query_compute_trajectory_position_feature(query, offset, bone_positions(0), bone_rotations(0), trajectory_positions);
         query_compute_trajectory_direction_feature(query, offset, bone_rotations(0), trajectory_rotations);
 
-        float terrain_query[4] = {};
-        terrain_centerline_query(
-            terrain_query,
+        const int terrain_query_frame = frame_index;
+        const int terrain_query_range =
+            g1_active_range(db, terrain_query_frame);
+        terrain_centerline_snapshot terrain_query_snapshot = {};
+        terrain_centerline_snapshot_compute(
+            terrain_query_snapshot,
             runtime_terrain,
             bone_positions(0),
             trajectory_positions,
             trajectory_rotations);
         for (int terrain_feature = 0; terrain_feature < 4; ++terrain_feature)
         {
-            query(offset++) = terrain_query[terrain_feature];
+            query(offset++) = terrain_query_snapshot.values[terrain_feature];
         }
 
         assert(offset == db.nfeatures());
@@ -2444,17 +2356,13 @@ int main(void)
         
         // Update Simulation
         
-        vec3 simulation_position_prev = simulation_position;
-        
         simulation_positions_update(
             simulation_position, 
             simulation_velocity, 
             simulation_acceleration,
             desired_velocity,
             simulation_velocity_halflife,
-            dt,
-            obstacles_positions,
-            obstacles_scales);
+            dt);
             
         simulation_rotations_update(
             simulation_rotation, 
@@ -2477,12 +2385,6 @@ int main(void)
                 bone_rotations(0), 
                 synchronization_data_factor);
           
-            synchronized_position = simulation_collide_obstacles(
-                simulation_position_prev,
-                synchronized_position,
-                obstacles_positions,
-                obstacles_scales);
-            
             simulation_position = synchronized_position;
             simulation_rotation = synchronized_rotation;
             
@@ -2782,8 +2684,6 @@ int main(void)
             desired_strafe,
             dt);
 
-        const int active_range = g1_active_range(db, frame_index);
-
         // Render
         
         BeginDrawing();
@@ -2847,10 +2747,6 @@ int main(void)
             trajectory_rotations,
             ORANGE);
         
-        draw_obstacles(
-            obstacles_positions,
-            obstacles_scales);
-        
         // G1: no skinned mesh — draw the skeleton directly from bone transforms.
         // Sphere at each joint, capsule (cylinder) from each bone to its parent.
         for (int bi = 1; bi < db.nbones(); bi++)
@@ -2882,13 +2778,8 @@ int main(void)
 
         for (int terrain_sample = 0; terrain_sample < 4; ++terrain_sample)
         {
-            vec3 point = terrain_centerline_point_at_arc(
-                bone_positions(0),
-                trajectory_positions,
-                trajectory_rotations,
-                0.25f * static_cast<float>(terrain_sample + 1));
-            point.y =
-                heightfield_sample(runtime_terrain, point.x, point.z) + 0.10f;
+            vec3 point = terrain_query_snapshot.points[terrain_sample];
+            point.y += 0.10f;
             DrawSphereWires(to_Vector3(point), 0.04f, 4, 8, PURPLE);
         }
 
@@ -3052,15 +2943,18 @@ int main(void)
 
         GuiLabel(
             (Rectangle){ 40, 235, 250, 20 },
-            TextFormat("frame %d  range %d", frame_index, active_range));
+            TextFormat(
+                "query frame %d  range %d",
+                terrain_query_frame,
+                terrain_query_range));
         GuiLabel(
             (Rectangle){ 40, 255, 250, 20 },
             TextFormat(
                 "terrain %.2f %.2f %.2f %.2f",
-                terrain_query[0],
-                terrain_query[1],
-                terrain_query[2],
-                terrain_query[3]));
+                terrain_query_snapshot.values[0],
+                terrain_query_snapshot.values[1],
+                terrain_query_snapshot.values[2],
+                terrain_query_snapshot.values[3]));
         
         //---------
         

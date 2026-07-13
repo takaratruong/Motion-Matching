@@ -638,18 +638,26 @@ static inline bool terrain_heightfield_is_queryable(const heightfield& field)
     return expected_size == static_cast<int64_t>(field.heights.size);
 }
 
-static inline void terrain_centerline_query(
-    float out[4],
+struct terrain_centerline_snapshot
+{
+    float values[4];
+    vec3 points[4];
+};
+
+static inline void terrain_centerline_snapshot_compute(
+    terrain_centerline_snapshot& out,
     const heightfield& field,
     vec3 root,
     const slice1d<vec3> trajectory_positions,
     const slice1d<quat> trajectory_rotations)
 {
-    if (out == NULL) {
-        return;
-    }
+    const vec3 safe_root(
+        terrain_float_is_finite(root.x) ? root.x : 0.0f,
+        0.0f,
+        terrain_float_is_finite(root.z) ? root.z : 0.0f);
     for (int i = 0; i < 4; ++i) {
-        out[i] = 0.0f;
+        out.values[i] = 0.0f;
+        out.points[i] = safe_root;
     }
     if (!terrain_heightfield_is_queryable(field) ||
         !terrain_centerline_inputs_are_valid(
@@ -669,13 +677,38 @@ static inline void terrain_centerline_query(
             root, trajectory_positions, trajectory_rotations, distances[i]);
         const float sample_height =
             heightfield_sample(field, point.x, point.z);
+        if (!terrain_float_is_finite(sample_height)) {
+            continue;
+        }
+        out.points[i] = vec3(point.x, sample_height, point.z);
         const double difference =
             static_cast<double>(sample_height) -
             static_cast<double>(base_height);
-        if (terrain_float_is_finite(sample_height) &&
-            difference >= -static_cast<double>(FLT_MAX) &&
+        if (difference >= -static_cast<double>(FLT_MAX) &&
             difference <= static_cast<double>(FLT_MAX)) {
-            out[i] = static_cast<float>(difference);
+            out.values[i] = static_cast<float>(difference);
         }
+    }
+}
+
+static inline void terrain_centerline_query(
+    float out[4],
+    const heightfield& field,
+    vec3 root,
+    const slice1d<vec3> trajectory_positions,
+    const slice1d<quat> trajectory_rotations)
+{
+    if (out == NULL) {
+        return;
+    }
+    terrain_centerline_snapshot snapshot = {};
+    terrain_centerline_snapshot_compute(
+        snapshot,
+        field,
+        root,
+        trajectory_positions,
+        trajectory_rotations);
+    for (int i = 0; i < 4; ++i) {
+        out[i] = snapshot.values[i];
     }
 }

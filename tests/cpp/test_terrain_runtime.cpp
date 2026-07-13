@@ -564,6 +564,83 @@ static void test_curved_query_matches_python_geometric_arc_fixture()
     }
 }
 
+static void test_centerline_snapshot_keeps_query_and_markers_in_one_state()
+{
+    heightfield field;
+    initialize_heightfield(field, 9, 9, 0.0f, 0.0f, 0.25f, -99.0f);
+    for (int z = 0; z < field.nz; ++z) {
+        for (int x = 0; x < field.nx; ++x) {
+            field.heights(z * field.nx + x) =
+                0.25f * static_cast<float>(x) +
+                2.0f * 0.25f * static_cast<float>(z);
+        }
+    }
+
+    vec3 root(0.25f, 3.0f, 0.25f);
+    array1d<vec3> positions(3);
+    positions(0) = root;
+    positions(1) = vec3(0.75f, 20.0f, 0.25f);
+    positions(2) = vec3(1.25f, -20.0f, 0.25f);
+    array1d<quat> rotations(3);
+    rotations(0) = heading_positive_x();
+    rotations(1) = heading_positive_x();
+    rotations(2) = heading_positive_x();
+
+    terrain_centerline_snapshot snapshot = {};
+    terrain_centerline_snapshot_compute(
+        snapshot, field, root, positions, rotations);
+    const terrain_centerline_snapshot original = snapshot;
+    const float original_base = heightfield_sample(field, root.x, root.z);
+    for (int i = 0; i < 4; ++i) {
+        const float marker_height = heightfield_sample(
+            field, snapshot.points[i].x, snapshot.points[i].z);
+        check_close(
+            snapshot.points[i].y,
+            marker_height,
+            "snapshot marker surface height");
+        check_close(
+            snapshot.values[i],
+            marker_height - original_base,
+            "snapshot query uses marker geometry");
+    }
+
+    // Simulate the controller advancing to a different pose/frame after the
+    // search query was built. The prior diagnostic snapshot must stay intact.
+    root = vec3(1.0f, 7.0f, 1.0f);
+    positions(0) = root;
+    positions(1) = vec3(1.0f, 0.0f, 1.5f);
+    positions(2) = vec3(1.0f, 0.0f, 2.0f);
+    rotations(0) = quat();
+    rotations(1) = quat();
+    rotations(2) = quat();
+    terrain_centerline_snapshot advanced = {};
+    terrain_centerline_snapshot_compute(
+        advanced, field, root, positions, rotations);
+
+    check(
+        advanced.points[0].x != snapshot.points[0].x ||
+        advanced.points[0].z != snapshot.points[0].z,
+        "advanced state must differ from query snapshot");
+    for (int i = 0; i < 4; ++i) {
+        check_close(
+            snapshot.values[i],
+            original.values[i],
+            "query snapshot value changed after live advance");
+        check_close(
+            snapshot.points[i].x,
+            original.points[i].x,
+            "query snapshot marker x changed after live advance");
+        check_close(
+            snapshot.points[i].y,
+            original.points[i].y,
+            "query snapshot marker y changed after live advance");
+        check_close(
+            snapshot.points[i].z,
+            original.points[i].z,
+            "query snapshot marker z changed after live advance");
+    }
+}
+
 static void test_centerline_uses_root_skips_flat_repeats_and_latest_heading()
 {
     const vec3 root(1.0f, 7.0f, 1.0f);
@@ -870,6 +947,7 @@ int main(int argc, char** argv)
     test_stationary_centerline_extends_current_heading();
     test_straight_step_query_is_ground_relative_on_elevated_base();
     test_curved_query_matches_python_geometric_arc_fixture();
+    test_centerline_snapshot_keeps_query_and_markers_in_one_state();
     test_centerline_uses_root_skips_flat_repeats_and_latest_heading();
     test_centerline_query_uses_heightfield_exterior_at_boundary();
     test_centerline_invalid_shapes_are_release_safe();
