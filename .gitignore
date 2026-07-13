@@ -8,3 +8,4 @@ controller.wasm
 *.bvh
 *.log
 resources/runs*
+/resources/g1_terrain/
