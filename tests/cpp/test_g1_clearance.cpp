@@ -1560,6 +1560,167 @@ static void test_point_float_output_guards()
           "flat-16 aliased diagnostic preserves output bytes");
 }
 
+static void task34_make_smooth_plane_field(heightfield& field)
+{
+    const float cell = float_from_bits(UINT32_C(0x3ca3d70a));
+    const float delta = float_from_bits(UINT32_C(0x3d0de3b8));
+    point_make_field(field, 9, 9, 0.0f, 0.0f, cell);
+    for (int z = 0; z < field.nz; ++z) {
+        for (int x = 0; x < field.nx; ++x) {
+            const volatile float height =
+                static_cast<float>(x) * delta;
+            check(static_cast<double>(height) ==
+                      static_cast<double>(x) *
+                          static_cast<double>(delta),
+                  "smooth-plane fixture stores exact column products");
+            field.heights(x + z * field.nx) = height;
+        }
+    }
+}
+
+static void test_task34_smooth_plane_sphere_false_clear()
+{
+    heightfield field;
+    task34_make_smooth_plane_field(field);
+    const float cell = field.cell_size;
+    const float radius = float_from_bits(UINT32_C(0x3ca3d70a));
+    const float center_x = 4.0f * cell;
+    const float center_z = 4.0f * cell;
+    const float surface = field.heights(4);
+    const volatile float center_y = surface + 0.039f;
+    const vec3 center(center_x, center_y, center_z);
+
+    const long double slope =
+        static_cast<long double>(field.heights(1)) /
+        static_cast<long double>(cell);
+    const long double oracle =
+        static_cast<long double>(center.y) -
+        static_cast<long double>(surface) -
+        static_cast<long double>(radius) *
+            std::sqrt(1.0L + slope * slope);
+    check(oracle < 0.0L &&
+              std::fabs(oracle + 0.001L) < 2.0e-6L,
+          "smooth-plane sphere fixture has the intended negative oracle");
+
+    G1ClearanceResult output = seeded_result(131.0);
+    char error[256] = {};
+    const G1ClearanceStatus status = g1_sphere_clearance(
+        output, g1_pose_clearance_budget(), field,
+        center, radius, error, static_cast<int>(sizeof(error)));
+    check(status == G1ClearanceOk,
+          "smooth-plane sphere must produce a certificate");
+    check(static_cast<long double>(output.lower_bound_m) <= oracle &&
+              oracle <=
+                  static_cast<long double>(output.witness_upper_m) &&
+              output.witness_upper_m - output.lower_bound_m <=
+                  G1ClearanceMaximumCertificateWidthM,
+          "smooth-plane sphere certificate encloses the analytic oracle");
+    check(output.witness_upper_m < 0.0,
+          "smooth-plane sphere detects the false-clear collision");
+}
+
+static void test_task34_finite_capsule_plane_and_reversal()
+{
+    heightfield field;
+    point_make_field(field, 9, 9, 0.0f, 0.0f, 0.25f);
+    const double slope_x = 0.5;
+    const double slope_z = -0.25;
+    const double intercept = 0.125;
+    for (int z = 0; z < field.nz; ++z) {
+        for (int x = 0; x < field.nx; ++x) {
+            const double px = static_cast<double>(x) * 0.25;
+            const double pz = static_cast<double>(z) * 0.25;
+            field.heights(x + z * field.nx) = static_cast<float>(
+                slope_x * px + slope_z * pz + intercept);
+        }
+    }
+
+    const vec3 endpoint_a(0.5f, 1.0f, 0.5f);
+    const vec3 endpoint_b(1.5f, 0.75f, 1.25f);
+    const float radius = 0.125f;
+    const double plane_a =
+        static_cast<double>(endpoint_a.y) -
+        slope_x * static_cast<double>(endpoint_a.x) -
+        slope_z * static_cast<double>(endpoint_a.z) - intercept;
+    const double plane_b =
+        static_cast<double>(endpoint_b.y) -
+        slope_x * static_cast<double>(endpoint_b.x) -
+        slope_z * static_cast<double>(endpoint_b.z) - intercept;
+    const double oracle = std::fmin(plane_a, plane_b) -
+        static_cast<double>(radius) *
+            std::sqrt(1.0 + slope_x * slope_x + slope_z * slope_z);
+
+    G1ClearanceResult forward = seeded_result(137.0);
+    G1ClearanceResult reverse = seeded_result(139.0);
+    char forward_error[256] = {};
+    char reverse_error[256] = {};
+    const G1ClearanceStatus forward_status = g1_capsule_clearance(
+        forward, g1_pose_clearance_budget(), field,
+        endpoint_a, endpoint_b, radius,
+        forward_error, static_cast<int>(sizeof(forward_error)));
+    const G1ClearanceStatus reverse_status = g1_capsule_clearance(
+        reverse, g1_pose_clearance_budget(), field,
+        endpoint_b, endpoint_a, radius,
+        reverse_error, static_cast<int>(sizeof(reverse_error)));
+    check(forward_status == G1ClearanceOk &&
+              reverse_status == G1ClearanceOk,
+          "finite planar capsule and its reversal must certify");
+    check(forward.lower_bound_m <= oracle &&
+              oracle <= forward.witness_upper_m &&
+              forward.witness_upper_m - forward.lower_bound_m <=
+                  G1ClearanceMaximumCertificateWidthM,
+          "finite planar capsule certificate encloses its oracle");
+    check(clearance_result_same(forward, reverse),
+          "capsule endpoint reversal is bit-identical");
+}
+
+static void test_task34_footprint_domain_budget_and_transaction()
+{
+    heightfield field;
+    point_make_field(field, 5, 5, 0.0f, 0.0f, 0.25f);
+    const float radius = 0.25f;
+    const vec3 minimum_tangent(0.25f, 1.0f, 0.25f);
+    const vec3 maximum_tangent(0.75f, 1.0f, 0.75f);
+
+    G1ClearanceResult minimum_output = seeded_result(149.0);
+    G1ClearanceResult maximum_output = seeded_result(151.0);
+    check(g1_sphere_clearance(
+              minimum_output, g1_pose_clearance_budget(), field,
+              minimum_tangent, radius, NULL, 0) == G1ClearanceOk,
+          "sphere footprint exactly tangent to minimum XZ certifies");
+    check(g1_sphere_clearance(
+              maximum_output, g1_pose_clearance_budget(), field,
+              maximum_tangent, radius, NULL, 0) == G1ClearanceOk,
+          "sphere footprint exactly tangent to maximum XZ certifies");
+
+    const vec3 outside(
+        std::nextafter(minimum_tangent.x, 0.0f),
+        minimum_tangent.y,
+        minimum_tangent.z);
+    G1ClearanceResult outside_output = seeded_result(157.0);
+    const ByteSnapshot<G1ClearanceResult> outside_before(outside_output);
+    check(g1_sphere_clearance(
+              outside_output, g1_pose_clearance_budget(), field,
+              outside, radius, NULL, 0) == G1ClearanceOutsideDomain,
+          "one-ULP footprint excursion is outside-domain");
+    check(outside_before.same(outside_output),
+          "outside-domain sphere failure is transactional");
+
+    heightfield poisoned = field;
+    poisoned.heights.set(std::numeric_limits<float>::quiet_NaN());
+    G1ClearanceBudget no_cells = g1_pose_clearance_budget();
+    no_cells.maximum_cells = 0;
+    G1ClearanceResult budget_output = seeded_result(163.0);
+    const ByteSnapshot<G1ClearanceResult> budget_before(budget_output);
+    check(g1_sphere_clearance(
+              budget_output, no_cells, poisoned,
+              vec3(0.5f, 1.0f, 0.5f), radius,
+              NULL, 0) == G1ClearanceBudgetExceeded,
+          "sphere work budget is rejected before the first height load");
+    check(budget_before.same(budget_output),
+          "budget-exceeded sphere failure is transactional");
+}
+
 class RoundingModeGuard
 {
 public:
@@ -1987,6 +2148,21 @@ int main(int argc, char** argv)
     if (argc == 2 && std::strcmp(argv[1], "--query-parity") == 0) {
         return run_query_parity_mode();
     }
+    if (argc == 2 &&
+        std::strcmp(argv[1], "--task34-sphere") == 0) {
+        test_task34_smooth_plane_sphere_false_clear();
+        return 0;
+    }
+    if (argc == 2 &&
+        std::strcmp(argv[1], "--task34-capsule") == 0) {
+        test_task34_finite_capsule_plane_and_reversal();
+        return 0;
+    }
+    if (argc == 2 &&
+        std::strcmp(argv[1], "--task34-domain-budget") == 0) {
+        test_task34_footprint_domain_budget_and_transaction();
+        return 0;
+    }
     test_normal_arithmetic_environment();
     test_status_and_factory_contract();
     test_budget_contract();
@@ -2000,6 +2176,9 @@ int main(int argc, char** argv)
     test_point_exterior_height_independence();
     test_point_budget_preflight_and_aliases();
     test_point_float_output_guards();
+    test_task34_smooth_plane_sphere_false_clear();
+    test_task34_finite_capsule_plane_and_reversal();
+    test_task34_footprint_domain_budget_and_transaction();
     test_arithmetic_environment_rejection_and_restoration();
     return 0;
 }
