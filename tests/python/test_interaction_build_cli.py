@@ -1,10 +1,14 @@
 import contextlib
+import copy
 import dataclasses
 import hashlib
 import io
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -17,12 +21,16 @@ from resources import build_g1_interaction_database as build_cli
 from resources import fetch_grail_pickup_table as fetch_cli
 from resources import validate_g1_interaction_database as validate_cli
 from resources.g1_interaction_builder import build as build_module
-from resources.g1_interaction_builder.artifacts import read_artifact_set
+from resources.g1_interaction_builder.artifacts import (
+    read_artifact_set,
+    write_artifact_set,
+)
 from resources.g1_interaction_builder.schema import (
     ConversionValidationError,
     EvaluationSplit,
     G1_SKELETON,
     InteractionValidationError,
+    PhaseConfig,
     SourceValidationError,
 )
 from tests.python.interaction_fixture import (
@@ -46,6 +54,15 @@ def artifact_snapshot(output: Path) -> dict[str, bytes]:
         for path in sorted(output.iterdir())
         if path.is_file()
     }
+
+
+def rewrite_json(path: Path, update) -> None:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    update(value)
+    path.write_text(
+        json.dumps(value, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def write_sources(
@@ -105,6 +122,217 @@ def build_argv(
         str(output),
         *extra,
     ]
+
+
+def manifest_metadata_corruptions(artifact) -> tuple:
+    active_hand = int(artifact.active_hands[0])
+
+    def mutate_parent_value(manifest: dict) -> None:
+        manifest["skeleton_parents"][0] = 0
+
+    def mutate_parent_type(manifest: dict) -> None:
+        manifest["skeleton_parents"][1] = float(
+            manifest["skeleton_parents"][1]
+        )
+
+    def mutate_feature_name(manifest: dict) -> None:
+        manifest["feature_names"][0] = "wrong_feature"
+
+    def truncate_feature_names(manifest: dict) -> None:
+        manifest["feature_names"].pop()
+
+    def mutate_feature_group(manifest: dict) -> None:
+        manifest["feature_groups"][0]["name"] = "wrong_group"
+
+    def mutate_feature_group_type(manifest: dict) -> None:
+        manifest["feature_groups"][0]["start"] = 0.0
+
+    def mutate_phase_config(manifest: dict) -> None:
+        manifest["phase_config"]["stable_source_samples"] = 4
+
+    def mutate_split_seed(manifest: dict) -> None:
+        manifest["split"]["seed"] += 1
+
+    def mutate_database_count(manifest: dict) -> None:
+        manifest["split"]["database_object_count"] += 1
+
+    def mutate_heldout_count(manifest: dict) -> None:
+        manifest["split"]["heldout_object_count"] += 1
+
+    def mutate_dependency_keys(manifest: dict) -> None:
+        manifest["dependency_versions"].pop(
+            sorted(manifest["dependency_versions"])[0]
+        )
+
+    def mutate_dependency_value(manifest: dict) -> None:
+        first = sorted(manifest["dependency_versions"])[0]
+        manifest["dependency_versions"][first] = ""
+
+    return (
+        (
+            "database magic",
+            lambda value: value.__setitem__("database_magic", "BADDB"),
+            r"manifest database_magic.*G1INTDB1",
+        ),
+        (
+            "feature magic",
+            lambda value: value.__setitem__("feature_magic", "BADFT"),
+            r"manifest feature_magic.*G1INTFT1",
+        ),
+        (
+            "skeleton names",
+            lambda value: value["skeleton_names"].__setitem__(
+                0, "WrongRoot"
+            ),
+            r"manifest skeleton_names.*exact G1 skeleton",
+        ),
+        (
+            "skeleton parent value",
+            mutate_parent_value,
+            r"manifest skeleton_parents.*exact G1 skeleton",
+        ),
+        (
+            "skeleton parent integer type",
+            mutate_parent_type,
+            r"manifest skeleton_parents.*integers",
+        ),
+        (
+            "skeleton signature",
+            lambda value: value.__setitem__(
+                "skeleton_signature", "wrong"
+            ),
+            r"manifest skeleton_signature.*exact G1 skeleton",
+        ),
+        (
+            "clip active hand integer type",
+            lambda value: value["clips"][0].__setitem__(
+                "active_hand", True
+            ),
+            r"manifest clip 0 active_hand.*integer 0 or 1",
+        ),
+        (
+            "clip active hand binary mismatch",
+            lambda value: value["clips"][0].__setitem__(
+                "active_hand", 1 - active_hand
+            ),
+            r"manifest clip 0 active_hand.*database active_hands",
+        ),
+        (
+            "empty source root",
+            lambda value: value.__setitem__("source_root", ""),
+            r"manifest source_root.*nonempty absolute path string",
+        ),
+        (
+            "relative source root",
+            lambda value: value.__setitem__(
+                "source_root", "relative/source"
+            ),
+            r"manifest source_root.*nonempty absolute path string",
+        ),
+        (
+            "dataset id",
+            lambda value: value.__setitem__("dataset_id", "other/dataset"),
+            r"manifest dataset_id.*nvidia/PhysicalAI-Robotics-Locomanipulation-GRAIL",
+        ),
+        (
+            "phase config",
+            mutate_phase_config,
+            r"manifest phase_config.*exact schema-v1 PhaseConfig",
+        ),
+        (
+            "feature name",
+            mutate_feature_name,
+            r"manifest feature_names.*exact 71 schema-v1 names",
+        ),
+        (
+            "feature name count",
+            truncate_feature_names,
+            r"manifest feature_names.*exact 71 schema-v1 names",
+        ),
+        (
+            "feature group",
+            mutate_feature_group,
+            r"manifest feature_groups.*exact schema-v1 groups",
+        ),
+        (
+            "feature group integer type",
+            mutate_feature_group_type,
+            r"manifest feature_groups.*integer start and stop",
+        ),
+        (
+            "split seed",
+            mutate_split_seed,
+            r"manifest split seed.*evaluation split seed",
+        ),
+        (
+            "split database count",
+            mutate_database_count,
+            r"manifest split database_object_count.*evaluation split",
+        ),
+        (
+            "split heldout count",
+            mutate_heldout_count,
+            r"manifest split heldout_object_count.*evaluation split",
+        ),
+        (
+            "dependency key set",
+            mutate_dependency_keys,
+            r"manifest dependency_versions keys.*exactly",
+        ),
+        (
+            "empty dependency version",
+            mutate_dependency_value,
+            r"manifest dependency_versions.*nonempty string",
+        ),
+        (
+            "git commit syntax",
+            lambda value: value.__setitem__("git_commit", "ABCDEF1"),
+            r"manifest git_commit.*lowercase hexadecimal.*7.*64",
+        ),
+        (
+            "diagnostic limit bool",
+            lambda value: value.__setitem__("diagnostic_limit", True),
+            r"manifest diagnostic_limit.*null or a positive integer",
+        ),
+        (
+            "diagnostic limit zero",
+            lambda value: value.__setitem__("diagnostic_limit", 0),
+            r"manifest diagnostic_limit.*null or a positive integer",
+        ),
+        (
+            "source date epoch bool",
+            lambda value: value.__setitem__("source_date_epoch", False),
+            r"manifest source_date_epoch.*null or an integer",
+        ),
+        (
+            "source date epoch string",
+            lambda value: value.__setitem__(
+                "source_date_epoch", "1720950000"
+            ),
+            r"manifest source_date_epoch.*null or an integer",
+        ),
+    )
+
+
+def publish_fast_valid_pack(
+    test: unittest.TestCase,
+    root: Path,
+    output: Path,
+) -> None:
+    write_sources(
+        root,
+        [
+            ("pickup_table__alpha__001", "alpha"),
+            ("pickup_table__beta__001", "beta"),
+        ],
+    )
+    with fast_build_patches(), contextlib.redirect_stdout(io.StringIO()):
+        test.assertEqual(
+            build_cli.main(
+                build_argv(root, output, "--heldout-count", "1")
+            ),
+            0,
+        )
 
 
 class InteractionBuildUnitTests(unittest.TestCase):
@@ -654,11 +882,29 @@ class InteractionBuildCliTests(unittest.TestCase):
             self.assertEqual(manifest["split"]["seed"], 20260714)
             self.assertEqual(manifest["split"]["heldout_object_count"], 1)
             self.assertEqual(manifest["split"]["database_object_count"], 2)
-            self.assertEqual(manifest["phase_config"]["stable_source_samples"], 3)
+            self.assertEqual(
+                manifest["phase_config"], dataclasses.asdict(PhaseConfig())
+            )
             self.assertEqual(manifest["diagnostic_limit"], None)
             self.assertIsNone(manifest["source_date_epoch"])
             self.assertRegex(manifest["git_commit"], r"^[0-9a-f]{40}$")
-            self.assertTrue(manifest["dependency_versions"])
+            self.assertEqual(
+                set(manifest["dependency_versions"]),
+                {
+                    "huggingface-hub",
+                    "joblib",
+                    "mujoco",
+                    "numpy",
+                    "scipy",
+                    "usd-core",
+                },
+            )
+            self.assertTrue(
+                all(
+                    isinstance(version, str) and version
+                    for version in manifest["dependency_versions"].values()
+                )
+            )
             sequence_ids = [clip["sequence_id"] for clip in manifest["clips"]]
             self.assertEqual(sequence_ids, sorted(sequence_ids))
             self.assertEqual(len(sequence_ids), len(set(sequence_ids)))
@@ -798,6 +1044,57 @@ class InteractionBuildCliTests(unittest.TestCase):
             read_artifact_set(output)
 
 
+class InteractionManifestMetadataTests(unittest.TestCase):
+    def test_writer_rejects_every_corrupted_required_metadata_family(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "source"
+            baseline = Path(tmp) / "baseline"
+            publish_fast_valid_pack(self, root, baseline)
+            artifact, features, manifest, split_value, report = (
+                read_artifact_set(baseline)
+            )
+            split = EvaluationSplit(
+                seed=split_value["seed"],
+                database_objects=tuple(split_value["database_objects"]),
+                heldout_objects=tuple(split_value["heldout_objects"]),
+            )
+
+            for index, (label, mutation, message) in enumerate(
+                manifest_metadata_corruptions(artifact)
+            ):
+                with self.subTest(label=label):
+                    invalid = copy.deepcopy(manifest)
+                    mutation(invalid)
+                    output = Path(tmp) / f"writer-corrupt-{index}"
+                    with self.assertRaisesRegex(ValueError, message):
+                        write_artifact_set(
+                            output,
+                            artifact,
+                            features,
+                            split,
+                            invalid,
+                            report,
+                        )
+                    self.assertFalse(output.exists())
+
+    def test_standalone_validator_rejects_every_corrupted_metadata_family(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "source"
+            baseline = Path(tmp) / "baseline"
+            publish_fast_valid_pack(self, root, baseline)
+            artifact, _, _, _, _ = read_artifact_set(baseline)
+
+            for index, (label, mutation, message) in enumerate(
+                manifest_metadata_corruptions(artifact)
+            ):
+                with self.subTest(label=label):
+                    corrupt = Path(tmp) / f"reader-corrupt-{index}"
+                    shutil.copytree(baseline, corrupt)
+                    rewrite_json(corrupt / "manifest.json", mutation)
+                    with self.assertRaisesRegex(ValueError, message):
+                        validate_cli.validate(corrupt)
+
+
 class InteractionValidatorTests(unittest.TestCase):
     def test_validator_rereads_all_files_hashes_binaries_and_prints_one_line(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -855,28 +1152,66 @@ class InteractionFetchTests(unittest.TestCase):
             ],
         )
 
-    def test_dry_run_never_downloads_or_prints_token(self):
+    def test_dry_run_subprocess_needs_no_client_network_or_output_path(self):
         secret = "hf_super_secret_token"
-        stdout = io.StringIO()
-        with patch.dict(os.environ, {"HF_TOKEN": secret}), patch.object(
-            fetch_cli, "snapshot_download"
-        ) as download, contextlib.redirect_stdout(stdout):
-            self.assertEqual(
-                fetch_cli.main(["--output", "/tmp/grail", "--dry-run"]),
-                0,
+        guard = """
+import builtins
+import runpy
+import socket
+import sys
+
+real_import = builtins.__import__
+
+def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == "huggingface_hub" or name.startswith("huggingface_hub."):
+        raise ModuleNotFoundError("huggingface_hub deliberately unavailable")
+    return real_import(name, globals, locals, fromlist, level)
+
+def reject_network(*args, **kwargs):
+    raise AssertionError("network access attempted during dry-run")
+
+builtins.__import__ = guarded_import
+socket.create_connection = reject_network
+socket.socket.connect = reject_network
+sys.argv = [
+    "resources.fetch_grail_pickup_table",
+    "--output",
+    sys.argv[1],
+    "--dry-run",
+]
+runpy.run_module("resources.fetch_grail_pickup_table", run_name="__main__")
+"""
+        expected = "\n".join(
+            [
+                f"dataset={fetch_cli.DATASET_ID}",
+                *(f"allow_pattern={item}" for item in fetch_cli.ALLOW_PATTERNS),
+            ]
+        ) + "\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "grail-dry-run"
+            environment = os.environ.copy()
+            environment["HF_TOKEN"] = secret
+            result = subprocess.run(
+                [sys.executable, "-c", guard, str(output)],
+                cwd=Path(__file__).resolve().parents[2],
+                env=environment,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
             )
-        download.assert_not_called()
-        output = stdout.getvalue()
-        self.assertIn(fetch_cli.DATASET_ID, output)
-        for pattern in fetch_cli.ALLOW_PATTERNS:
-            self.assertIn(pattern, output)
-        self.assertNotIn(secret, output)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, expected)
+            self.assertEqual(result.stderr, "")
+            self.assertFalse(output.exists())
+            self.assertNotIn(secret, result.stdout + result.stderr)
 
     def test_mocked_download_uses_only_exact_arguments_and_keeps_token_secret(self):
         secret = "hf_explicit_secret"
         stdout = io.StringIO()
         with patch.object(
-            fetch_cli, "snapshot_download"
+            fetch_cli, "_snapshot_download"
         ) as download, contextlib.redirect_stdout(stdout):
             self.assertEqual(
                 fetch_cli.main(

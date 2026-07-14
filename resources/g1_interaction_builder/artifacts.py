@@ -4,6 +4,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import struct
 from typing import BinaryIO
@@ -12,7 +13,13 @@ import numpy as np
 
 from resources.g1_terrain_builder.schema import SkeletonSpec
 
-from .features import FEATURE_GROUPS, build_features
+from .features import (
+    FEATURE_GROUPS,
+    FEATURE_NAMES,
+    build_features,
+    serialized_feature_groups,
+)
+from .metadata import DEPENDENCY_VERSION_KEYS, GRAIL_DATASET_ID
 from .schema import (
     EvaluationSplit,
     FeatureSet,
@@ -20,6 +27,7 @@ from .schema import (
     InteractionArtifact,
     InteractionValidationError,
     LabeledInteractionClip,
+    PhaseConfig,
 )
 from .splits import partition_clips
 
@@ -681,6 +689,22 @@ def _is_integer(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _strict_json_equal(value: object, expected: object) -> bool:
+    if type(value) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return set(value) == set(expected) and all(
+            _strict_json_equal(value[key], expected[key])
+            for key in expected
+        )
+    if isinstance(expected, list):
+        return len(value) == len(expected) and all(
+            _strict_json_equal(item, expected_item)
+            for item, expected_item in zip(value, expected, strict=True)
+        )
+    return value == expected
+
+
 def _require_version(value: dict, label: str) -> None:
     version = value.get("schema_version")
     if not _is_integer(version) or version != VERSION:
@@ -719,12 +743,132 @@ def _validate_clip_counts(
     return counts
 
 
+def _validate_frozen_manifest_metadata(manifest: dict) -> None:
+    database_magic = DB_MAGIC.decode("ascii")
+    if manifest.get("database_magic") != database_magic:
+        raise ValueError(
+            "manifest database_magic must be exactly "
+            f"{database_magic!r}"
+        )
+    feature_magic = FEATURE_MAGIC.decode("ascii")
+    if manifest.get("feature_magic") != feature_magic:
+        raise ValueError(
+            "manifest feature_magic must be exactly "
+            f"{feature_magic!r}"
+        )
+
+    skeleton_names = manifest.get("skeleton_names")
+    if skeleton_names != list(G1_SKELETON.names):
+        raise ValueError(
+            "manifest skeleton_names must match the exact G1 skeleton"
+        )
+    skeleton_parents = manifest.get("skeleton_parents")
+    if not isinstance(skeleton_parents, list) or not all(
+        _is_integer(parent) for parent in skeleton_parents
+    ):
+        raise ValueError(
+            "manifest skeleton_parents must contain only integers"
+        )
+    if skeleton_parents != G1_SKELETON.parents.astype(int).tolist():
+        raise ValueError(
+            "manifest skeleton_parents must match the exact G1 skeleton"
+        )
+
+    source_root = manifest.get("source_root")
+    if (
+        not isinstance(source_root, str)
+        or not source_root
+        or not Path(source_root).is_absolute()
+    ):
+        raise ValueError(
+            "manifest source_root must be a nonempty absolute path string"
+        )
+    if manifest.get("dataset_id") != GRAIL_DATASET_ID:
+        raise ValueError(
+            "manifest dataset_id must be exactly "
+            f"{GRAIL_DATASET_ID!r}"
+        )
+
+    expected_phase_config = dataclasses.asdict(PhaseConfig())
+    if not _strict_json_equal(
+        manifest.get("phase_config"), expected_phase_config
+    ):
+        raise ValueError(
+            "manifest phase_config must match the exact schema-v1 "
+            "PhaseConfig"
+        )
+    if not _strict_json_equal(
+        manifest.get("feature_names"), list(FEATURE_NAMES)
+    ):
+        raise ValueError(
+            "manifest feature_names must match the exact 71 schema-v1 "
+            "names"
+        )
+    feature_groups = manifest.get("feature_groups")
+    if isinstance(feature_groups, list):
+        for group in feature_groups:
+            if not isinstance(group, dict):
+                continue
+            for bound in ("start", "stop"):
+                if bound in group and not _is_integer(group[bound]):
+                    raise ValueError(
+                        "manifest feature_groups must use integer start "
+                        "and stop values"
+                    )
+    if not _strict_json_equal(
+        feature_groups, serialized_feature_groups()
+    ):
+        raise ValueError(
+            "manifest feature_groups must match the exact schema-v1 groups"
+        )
+
+    dependency_versions = manifest.get("dependency_versions")
+    required_dependencies = set(DEPENDENCY_VERSION_KEYS)
+    if (
+        not isinstance(dependency_versions, dict)
+        or set(dependency_versions) != required_dependencies
+    ):
+        raise ValueError(
+            "manifest dependency_versions keys must be exactly "
+            f"{sorted(required_dependencies)!r}"
+        )
+    for dependency in DEPENDENCY_VERSION_KEYS:
+        version = dependency_versions[dependency]
+        if not isinstance(version, str) or not version:
+            raise ValueError(
+                "manifest dependency_versions "
+                f"{dependency!r} must be a nonempty string"
+            )
+
+    git_commit = manifest.get("git_commit")
+    if not isinstance(git_commit, str) or re.fullmatch(
+        r"[0-9a-f]{7,64}", git_commit
+    ) is None:
+        raise ValueError(
+            "manifest git_commit must be lowercase hexadecimal with "
+            "length 7 through 64"
+        )
+    diagnostic_limit = manifest.get("diagnostic_limit")
+    if diagnostic_limit is not None and (
+        not _is_integer(diagnostic_limit) or diagnostic_limit <= 0
+    ):
+        raise ValueError(
+            "manifest diagnostic_limit must be null or a positive integer"
+        )
+    source_date_epoch = manifest.get("source_date_epoch")
+    if source_date_epoch is not None and not _is_integer(source_date_epoch):
+        raise ValueError(
+            "manifest source_date_epoch must be null or an integer"
+        )
+
+
 def _validate_manifest(
     manifest: dict,
     artifact: InteractionArtifact,
 ) -> None:
     _require_version(manifest, "manifest")
     counts = _validate_clip_counts(manifest, "manifest")
+    _validate_frozen_manifest_metadata(manifest)
     target_fps = manifest.get("target_fps")
     if (
         isinstance(target_fps, bool)
@@ -770,6 +914,18 @@ def _validate_manifest(
             )
         sequence_ids.add(clip["sequence_id"])
         ordered_sequence_ids.append(clip["sequence_id"])
+        active_hand = clip.get("active_hand")
+        if not _is_integer(active_hand) or active_hand not in (0, 1):
+            raise ValueError(
+                f"manifest clip {index} active_hand must be integer 0 or 1"
+            )
+        expected_active_hand = int(artifact.active_hands[index])
+        if active_hand != expected_active_hand:
+            raise ValueError(
+                f"manifest clip {index} active_hand must match database "
+                f"active_hands[{index}]: {active_hand} != "
+                f"{expected_active_hand}"
+            )
         start = clip.get("range_start")
         stop = clip.get("range_stop")
         if not _is_integer(start) or not _is_integer(stop):
@@ -799,6 +955,27 @@ def _validate_split(split: dict, manifest: dict) -> None:
         raise ValueError(
             f"evaluation split seed must be a nonnegative integer, got {seed!r}"
         )
+    summary = manifest.get("split")
+    summary_fields = {
+        "seed",
+        "database_object_count",
+        "heldout_object_count",
+    }
+    if not isinstance(summary, dict) or set(summary) != summary_fields:
+        raise ValueError(
+            "manifest split fields must be exactly seed, "
+            "database_object_count, heldout_object_count"
+        )
+    for name in summary_fields:
+        if not _is_integer(summary[name]) or summary[name] < 0:
+            raise ValueError(
+                f"manifest split {name} must be a nonnegative integer"
+            )
+    if summary["seed"] != seed:
+        raise ValueError(
+            "manifest split seed must match evaluation split seed: "
+            f"{summary['seed']} != {seed}"
+        )
     partitions = {}
     for name in ("database_objects", "heldout_objects"):
         values = split.get(name)
@@ -815,6 +992,20 @@ def _validate_split(split: dict, manifest: dict) -> None:
                 f"evaluation split {name} must not contain duplicates"
             )
         partitions[name] = set(values)
+    database_count = len(partitions["database_objects"])
+    if summary["database_object_count"] != database_count:
+        raise ValueError(
+            "manifest split database_object_count must match evaluation "
+            f"split database_objects: {summary['database_object_count']} "
+            f"!= {database_count}"
+        )
+    heldout_count = len(partitions["heldout_objects"])
+    if summary["heldout_object_count"] != heldout_count:
+        raise ValueError(
+            "manifest split heldout_object_count must match evaluation "
+            f"split heldout_objects: {summary['heldout_object_count']} "
+            f"!= {heldout_count}"
+        )
     overlap = partitions["database_objects"] & partitions["heldout_objects"]
     if overlap:
         raise ValueError(

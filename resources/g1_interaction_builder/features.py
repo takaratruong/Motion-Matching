@@ -28,6 +28,74 @@ POSE_BONES = (7, 13, 1, 16)
 FUTURE_OFFSETS = (8, 17, 25)
 
 
+def _build_feature_names() -> tuple[str, ...]:
+    names = []
+    pose_bones = (
+        "left_toe",
+        "right_toe",
+        "hips",
+        "spine2",
+        "active_hand",
+    )
+    for quantity in ("position", "velocity"):
+        for bone in pose_bones:
+            for axis in "xyz":
+                names.append(f"pose_{bone}_{quantity}_{axis}")
+    names.extend(
+        ("root_velocity_x", "root_velocity_z", "root_yaw_velocity")
+    )
+    for offset in FUTURE_OFFSETS:
+        for axis in "xz":
+            names.append(f"trajectory_root_delta_{offset}_{axis}")
+    for offset in FUTURE_OFFSETS:
+        for axis in "xz":
+            names.append(f"trajectory_root_facing_{offset}_{axis}")
+    for quantity in (
+        "hand_position_error",
+        "hand_orientation_error",
+        "hand_velocity_error",
+        "hand_angular_velocity_error",
+    ):
+        for axis in "xyz":
+            names.append(f"grasp_{quantity}_{axis}")
+    names.extend(
+        f"root_target_position_{axis}" for axis in "xyz"
+    )
+    names.extend(("root_target_facing_x", "root_target_facing_z"))
+    names.extend(
+        f"root_target_velocity_{axis}" for axis in "xyz"
+    )
+    names.extend(
+        (
+            "context_grasp_height_above_table",
+            "context_approach_direction_object_x",
+            "context_approach_direction_object_z",
+            "context_object_dimension_x",
+            "context_object_dimension_y",
+            "context_object_dimension_z",
+        )
+    )
+    return tuple(names)
+
+
+FEATURE_NAMES = _build_feature_names()
+if len(FEATURE_NAMES) != 71:
+    raise AssertionError(
+        f"expected 71 feature names, got {len(FEATURE_NAMES)}"
+    )
+
+
+def serialized_feature_groups() -> list[dict[str, str | int]]:
+    return [
+        {
+            "name": group.name,
+            "start": group.start,
+            "stop": group.stop,
+        }
+        for group in FEATURE_GROUPS
+    ]
+
+
 def _validate_feature_groups(
     groups: tuple[FeatureGroup, ...],
     feature_count: int,

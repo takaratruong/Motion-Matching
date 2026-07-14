@@ -3,10 +3,10 @@ from collections.abc import Sequence
 import os
 from pathlib import Path
 
-from huggingface_hub import snapshot_download
+from .g1_interaction_builder.metadata import GRAIL_DATASET_ID
 
 
-DATASET_ID = "nvidia/PhysicalAI-Robotics-Locomanipulation-GRAIL"
+DATASET_ID = GRAIL_DATASET_ID
 ALLOW_PATTERNS = (
     "data/pickup_table/robot/*.pkl",
     "data/pickup_table/objects/*.pkl",
@@ -14,6 +14,12 @@ ALLOW_PATTERNS = (
     "data/pickup_table/object_usd/*.usd",
     "data/pickup_table/object_usd/textures/*",
 )
+
+
+def _snapshot_download(**kwargs):
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(**kwargs)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -32,7 +38,7 @@ def run(args: argparse.Namespace) -> int:
         for pattern in ALLOW_PATTERNS:
             print(f"allow_pattern={pattern}")
         return 0
-    snapshot_download(
+    _snapshot_download(
         repo_id=DATASET_ID,
         repo_type="dataset",
         local_dir=args.output,

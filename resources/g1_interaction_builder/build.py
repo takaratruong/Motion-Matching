@@ -18,7 +18,8 @@ from .artifacts import (
     prepare_artifacts,
 )
 from .conversion import convert_interaction
-from .features import FEATURE_GROUPS
+from .features import FEATURE_NAMES, serialized_feature_groups
+from .metadata import DEPENDENCY_VERSION_KEYS, GRAIL_DATASET_ID
 from .object_geometry import read_usd_dimensions
 from .phases import derive_interaction_labels
 from .schema import (
@@ -36,8 +37,6 @@ from .schema import (
 from .sources import load_raw_interaction
 from .splits import split_objects
 
-
-GRAIL_DATASET_ID = "nvidia/PhysicalAI-Robotics-Locomanipulation-GRAIL"
 
 EXPECTED_CLIP_ERRORS = (
     SourceValidationError,
@@ -190,69 +189,10 @@ def build_validation_report(
     }
 
 
-def _feature_names() -> list[str]:
-    names = []
-    pose_bones = (
-        "left_toe",
-        "right_toe",
-        "hips",
-        "spine2",
-        "active_hand",
-    )
-    for quantity in ("position", "velocity"):
-        for bone in pose_bones:
-            for axis in "xyz":
-                names.append(f"pose_{bone}_{quantity}_{axis}")
-    names.extend(
-        ("root_velocity_x", "root_velocity_z", "root_yaw_velocity")
-    )
-    for offset in (8, 17, 25):
-        for axis in "xz":
-            names.append(f"trajectory_root_delta_{offset}_{axis}")
-    for offset in (8, 17, 25):
-        for axis in "xz":
-            names.append(f"trajectory_root_facing_{offset}_{axis}")
-    for quantity in (
-        "hand_position_error",
-        "hand_orientation_error",
-        "hand_velocity_error",
-        "hand_angular_velocity_error",
-    ):
-        for axis in "xyz":
-            names.append(f"grasp_{quantity}_{axis}")
-    names.extend(
-        f"root_target_position_{axis}" for axis in "xyz"
-    )
-    names.extend(("root_target_facing_x", "root_target_facing_z"))
-    names.extend(
-        f"root_target_velocity_{axis}" for axis in "xyz"
-    )
-    names.extend(
-        (
-            "context_grasp_height_above_table",
-            "context_approach_direction_object_x",
-            "context_approach_direction_object_z",
-            "context_object_dimension_x",
-            "context_object_dimension_y",
-            "context_object_dimension_z",
-        )
-    )
-    if len(names) != 71:
-        raise AssertionError(f"expected 71 feature names, got {len(names)}")
-    return names
-
-
 def _dependency_versions() -> dict[str, str]:
-    distributions = (
-        "huggingface-hub",
-        "joblib",
-        "mujoco",
-        "numpy",
-        "scipy",
-        "usd-core",
-    )
     return {
-        name: importlib.metadata.version(name) for name in distributions
+        name: importlib.metadata.version(name)
+        for name in DEPENDENCY_VERSION_KEYS
     }
 
 
@@ -324,10 +264,8 @@ def build_manifest(
         "target_fps": float(target_fps),
         "clips": clips,
         "phase_config": dataclasses.asdict(PhaseConfig()),
-        "feature_names": _feature_names(),
-        "feature_groups": [
-            dataclasses.asdict(group) for group in FEATURE_GROUPS
-        ],
+        "feature_names": list(FEATURE_NAMES),
+        "feature_groups": serialized_feature_groups(),
         "split": {
             "seed": int(split.seed),
             "database_object_count": len(split.database_objects),

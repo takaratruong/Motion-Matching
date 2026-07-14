@@ -16,6 +16,8 @@ import numpy as np
 
 from resources.g1_interaction_builder import artifacts as artifact_io
 from resources.g1_interaction_builder.artifacts import (
+    DB_MAGIC,
+    FEATURE_MAGIC,
     _read_database,
     _read_features,
     _write_array,
@@ -27,7 +29,13 @@ from resources.g1_interaction_builder.artifacts import (
 )
 from resources.g1_interaction_builder.features import (
     FEATURE_GROUPS,
+    FEATURE_NAMES,
     build_features,
+    serialized_feature_groups,
+)
+from resources.g1_interaction_builder.metadata import (
+    DEPENDENCY_VERSION_KEYS,
+    GRAIL_DATASET_ID,
 )
 from resources.g1_interaction_builder.schema import (
     EvaluationSplit,
@@ -37,6 +45,7 @@ from resources.g1_interaction_builder.schema import (
     InteractionArtifact,
     InteractionPhase,
     InteractionValidationError,
+    PhaseConfig,
 )
 from resources.g1_terrain_builder.schema import SkeletonSpec
 from tests.python.interaction_fixture import labeled_clips_for_objects
@@ -44,6 +53,31 @@ from tests.python.interaction_fixture import labeled_clips_for_objects
 
 LITERAL_DB_HEADER_BYTES = 40
 LITERAL_FEATURE_HEADER_BYTES = 28
+
+
+def required_manifest_metadata(split: EvaluationSplit) -> dict:
+    return {
+        "database_magic": DB_MAGIC.decode("ascii"),
+        "feature_magic": FEATURE_MAGIC.decode("ascii"),
+        "skeleton_names": list(G1_SKELETON.names),
+        "skeleton_parents": G1_SKELETON.parents.astype(int).tolist(),
+        "source_root": "/synthetic/grail/data/pickup_table",
+        "dataset_id": GRAIL_DATASET_ID,
+        "phase_config": dataclasses.asdict(PhaseConfig()),
+        "feature_names": list(FEATURE_NAMES),
+        "feature_groups": serialized_feature_groups(),
+        "split": {
+            "seed": split.seed,
+            "database_object_count": len(split.database_objects),
+            "heldout_object_count": len(split.heldout_objects),
+        },
+        "dependency_versions": {
+            name: "test-version" for name in DEPENDENCY_VERSION_KEYS
+        },
+        "git_commit": "0" * 40,
+        "diagnostic_limit": None,
+        "source_date_epoch": None,
+    }
 
 
 def artifact_fixture():
@@ -60,6 +94,7 @@ def artifact_fixture():
     )
     labeled = ordered[0]
     manifest = {
+        **required_manifest_metadata(split),
         "schema_version": 1,
         "source_clips": 2,
         "included_clips": 2,
@@ -70,6 +105,7 @@ def artifact_fixture():
             {
                 "sequence_id": labeled.motion.sequence_id,
                 "object_id": labeled.motion.object_id,
+                "active_hand": int(labeled.active_hand),
                 "range_start": 0,
                 "range_stop": len(labeled.motion.positions),
             }
@@ -383,12 +419,14 @@ def multi_artifact_fixture():
             {
                 "sequence_id": clip.motion.sequence_id,
                 "object_id": clip.motion.object_id,
+                "active_hand": int(clip.active_hand),
                 "range_start": start,
                 "range_stop": stop,
             }
         )
         start = stop
     manifest = {
+        **required_manifest_metadata(split),
         "schema_version": 1,
         "source_clips": 3,
         "included_clips": 3,
@@ -1291,6 +1329,12 @@ class InteractionArtifactSerializationTests(unittest.TestCase):
                 lambda value: value.__setitem__(
                     "database_objects",
                     ["a_database", "unrepresented", "z_database"],
+                ),
+            )
+            rewrite_json(
+                output / "manifest.json",
+                lambda value: value["split"].__setitem__(
+                    "database_object_count", 3
                 ),
             )
             with self.assertRaisesRegex(
