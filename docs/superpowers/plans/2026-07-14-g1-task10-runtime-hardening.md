@@ -174,6 +174,8 @@ git commit -m "fix: mask inaccessible terrain queries"
 **Files:**
 
 - Modify: `tests/cpp/test_support_runtime.cpp`
+- Modify: `tests/cpp/test_support_matching.cpp` (only the existing controller
+  call/order regression for the renamed walkability-aware builder)
 - Modify: `support_runtime.h`
 - Modify: `controller.cpp`
 
@@ -188,7 +190,9 @@ git commit -m "fix: mask inaccessible terrain queries"
 
 - [ ] Add a controller source regression proving the walkability wrapper uses
   `active_scene.walkability` and feeds `support_frame_update` before support is
-  applied once to the final pose.
+  applied once to the final pose. Update the existing exact-call count in
+  `test_support_matching.cpp` so it recognizes the approved wrapper without
+  weakening its single-build and stage-order checks.
 
 - [ ] Implement the wrapper without changing raw support heights/deltas or
   `support_frame_update`. Use the filtered observation in the controller so
@@ -198,7 +202,8 @@ git commit -m "fix: mask inaccessible terrain queries"
   configurations, plus strict controller build. Review and commit:
 
 ```bash
-git add support_runtime.h controller.cpp tests/cpp/test_support_runtime.cpp
+git add support_runtime.h controller.cpp tests/cpp/test_support_runtime.cpp \
+  tests/cpp/test_support_matching.cpp
 git diff --cached --check
 git commit -m "fix: reject inaccessible toe support"
 ```
