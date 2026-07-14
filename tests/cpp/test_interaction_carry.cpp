@@ -707,6 +707,55 @@ void test_layered_anchor_and_nonidentity_grasp_move_with_root() {
     assert(near(controller.object_world(), desired_object, 2.0e-4F));
 }
 
+void test_rejected_layered_ik_preserves_last_safe_pose_and_anchor() {
+    using namespace interaction;
+    const RuntimeFixture fixture = make_runtime_fixture();
+    const GraspAffordance affordance = fixture_affordance(fixture);
+    const Pose hold = final_hold_pose(fixture);
+    LocomotionSnapshot locomotion = fixture.locomotion;
+    locomotion.pose = hold;
+    const Transform initial_object = object_world_from_hold_pose(
+        hold, Hand::Right, affordance);
+
+    IKConfig bounded{};
+    bounded.maximum_request_position_m = 0.05F;
+    bounded.accepted_position_m = 0.01F;
+    CarryController controller(
+        fixture.database,
+        fixture.features,
+        no_recorded_ranges(),
+        CarryConfig{},
+        bounded);
+    controller.start(
+        hold, Hand::Right, affordance, initial_object);
+    const Pose safe_pose = controller.update(locomotion, 0.0F);
+    const Transform safe_object = controller.object_world();
+    assert(!controller.recorded());
+
+    LocomotionSnapshot infeasible = locomotion;
+    infeasible.pose = safe_pose;
+    infeasible.pose.positions[g1_skeleton::Simulation].x += 0.25F;
+    infeasible.pose.positions[g1_skeleton::RightShoulderPitch].x += 0.50F;
+    const Transform desired_object = compose(
+        root_world(infeasible.pose),
+        compose(inverse(root_world(safe_pose)), safe_object));
+    const Transform unsolved_publication = compose(
+        hand_world(infeasible.pose, Hand::Right),
+        inverse(affordance.hand_in_object));
+    assert(length(
+        compose(desired_object, affordance.hand_in_object).position -
+        hand_world(infeasible.pose, Hand::Right).position) >
+        bounded.maximum_request_position_m);
+    assert(!near(unsolved_publication, safe_object, 0.10F));
+
+    const Pose rejected = controller.update(infeasible, 1.0F / 60.0F);
+
+    assert(!controller.recorded());
+    assert(exact(rejected, safe_pose));
+    assert(exact(controller.object_world(), safe_object));
+    assert(!near(controller.object_world(), unsolved_publication, 0.10F));
+}
+
 void test_lifecycle_and_invalid_inputs_are_defensive() {
     using namespace interaction;
     const RuntimeFixture fixture = make_runtime_fixture();
@@ -1383,6 +1432,7 @@ int main() {
     test_fallback_preserves_locomotion_and_grasp();
     test_fallback_rotation_masks_are_layered();
     test_layered_anchor_and_nonidentity_grasp_move_with_root();
+    test_rejected_layered_ik_preserves_last_safe_pose_and_anchor();
     test_lifecycle_and_invalid_inputs_are_defensive();
     test_recorded_search_uses_pose_trajectory_and_aligns_object();
     test_recorded_cursor_cadence_remainder_and_tie_continuation();

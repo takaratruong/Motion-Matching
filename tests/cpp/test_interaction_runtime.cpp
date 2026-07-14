@@ -723,6 +723,71 @@ void test_carry_reset_preserves_a_newer_authoritative_generation() {
     assert(fixture.registry.find(newer) != nullptr);
 }
 
+void test_carry_update_preserves_a_newer_authoritative_generation() {
+    using namespace interaction;
+    RuntimeFixture fixture = make_runtime_fixture();
+    InteractionRuntime runtime(
+        fixture.database,
+        fixture.features,
+        fixture.registry,
+        RuntimeConfig{});
+    RuntimeOutput output = enter_align(runtime, fixture);
+    output = advance_until(
+        runtime,
+        fixture.locomotion,
+        RuntimeState::PickupReplay,
+        RuntimeState::Align);
+    output = advance_until(
+        runtime,
+        fixture.locomotion,
+        RuntimeState::Hold,
+        RuntimeState::PickupReplay);
+    output = advance_until(
+        runtime,
+        fixture.locomotion,
+        RuntimeState::Carry,
+        RuntimeState::Hold);
+    assert(output.diagnostics.attached);
+    const InteractionTarget* held = fixture.registry.find(
+        fixture.request.target);
+    assert(held != nullptr);
+    assert(held->state == ObjectState::Held);
+    assert(held->owner_request == fixture.request.request_id);
+
+    Transform authoritative = fixture.original_object_world;
+    authoritative.position.x -= 0.35F;
+    authoritative.position.z += 0.25F;
+    const TargetHandle newer = fixture.registry.replace_pose(
+        fixture.request.target.id, authoritative);
+    assert(newer.generation == fixture.request.target.generation + 1U);
+    LocomotionSnapshot current = fixture.locomotion;
+    current.pose.positions[g1_skeleton::Hips].x += 0.17F;
+
+    output = advance(runtime, current);
+
+    assert(output.diagnostics.state == RuntimeState::Locomotion);
+    assert(output.diagnostics.result == ResultCode::Failed);
+    assert(output.diagnostics.reason == Reason::TargetChanged);
+    assert(output.diagnostics.target == newer);
+    assert(output.diagnostics.object_state == ObjectState::Free);
+    assert(!output.diagnostics.attached);
+    assert(!output.diagnostics.recorded_carry);
+    assert(!output.owns_pose && !output.suppress_steering);
+    assert(exact(output.pose, current.pose));
+    assert(exact(output.object_world, authoritative));
+
+    const InteractionTarget* preserved = fixture.registry.find(newer);
+    assert(preserved != nullptr);
+    assert(preserved->state == ObjectState::Free);
+    assert(preserved->owner_request == 0U);
+    assert(exact(preserved->object_world, authoritative));
+
+    const RuntimeOutput idle = advance(runtime, current);
+    assert(idle.diagnostics.target == newer);
+    assert(exact(idle.object_world, authoritative));
+    assert(fixture.registry.find(newer) != nullptr);
+}
+
 void test_align_cancel_releases_reservation() {
     using namespace interaction;
     RuntimeFixture fixture = make_runtime_fixture();
@@ -1476,6 +1541,7 @@ int main() {
     test_interact_without_explicit_request_is_rejected_after_preflight();
     test_success_order_carry_and_reset();
     test_carry_reset_preserves_a_newer_authoritative_generation();
+    test_carry_update_preserves_a_newer_authoritative_generation();
     test_align_cancel_releases_reservation();
     test_entry_blends_the_whole_pose_for_quarter_second();
     test_entry_blend_continues_after_early_commit();

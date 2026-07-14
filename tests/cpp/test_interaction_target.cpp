@@ -1,6 +1,8 @@
 #include "interaction_target.h"
 
+#include <array>
 #include <cassert>
+#include <cmath>
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
@@ -31,10 +33,62 @@ bool throws_overflow_error(Function&& function) {
     return false;
 }
 
+void require(bool condition, const char* message) {
+    if (!condition) throw std::runtime_error(message);
+}
+
 bool same_position(const interaction::Transform& transform, vec3 position) {
     return transform.position.x == position.x &&
            transform.position.y == position.y &&
            transform.position.z == position.z;
+}
+
+bool exact(vec3 left, vec3 right) {
+    return left.x == right.x && left.y == right.y && left.z == right.z;
+}
+
+bool exact(quat left, quat right) {
+    return left.w == right.w && left.x == right.x &&
+           left.y == right.y && left.z == right.z;
+}
+
+bool exact(
+    const interaction::Transform& left,
+    const interaction::Transform& right) {
+    return exact(left.position, right.position) &&
+           exact(left.rotation, right.rotation);
+}
+
+bool exact(
+    const interaction::GraspAffordance& left,
+    const interaction::GraspAffordance& right) {
+    return left.id == right.id && left.hand == right.hand &&
+           exact(left.hand_in_object, right.hand_in_object) &&
+           exact(
+               left.approach_direction_object,
+               right.approach_direction_object) &&
+           left.clearance_radius == right.clearance_radius;
+}
+
+bool exact(
+    const interaction::InteractionTarget& left,
+    const interaction::InteractionTarget& right) {
+    if (left.handle != right.handle ||
+        !exact(left.object_world, right.object_world) ||
+        !exact(left.object_dimensions, right.object_dimensions) ||
+        !exact(left.table_world, right.table_world) ||
+        !exact(left.table_size, right.table_size) ||
+        left.state != right.state ||
+        left.owner_request != right.owner_request ||
+        left.affordances.size() != right.affordances.size()) {
+        return false;
+    }
+    for (size_t index = 0; index < left.affordances.size(); ++index) {
+        if (!exact(left.affordances[index], right.affordances[index])) {
+            return false;
+        }
+    }
+    return true;
 }
 
 interaction::InteractionTarget make_target_with_affordance_ids(
@@ -208,6 +262,231 @@ void test_upsert_validation_and_replacement() {
     assert(stored->owner_request == 0);
 }
 
+void test_registry_mutation_validation_is_strict_and_transactional() {
+    using namespace interaction;
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float infinity = std::numeric_limits<float>::infinity();
+    struct InvalidTargetCase {
+        void (*mutate)(InteractionTarget&);
+    };
+    const InvalidTargetCase invalid_targets[] = {
+        {+[](InteractionTarget& target) {
+            target.object_world.position.x =
+                std::numeric_limits<float>::quiet_NaN();
+        }},
+        {+[](InteractionTarget& target) {
+            target.object_world.rotation = quat(0.0F, 0.0F, 0.0F, 0.0F);
+        }},
+        {+[](InteractionTarget& target) {
+            target.object_world.rotation = quat(2.0F, 0.0F, 0.0F, 0.0F);
+        }},
+        {+[](InteractionTarget& target) {
+            target.object_world.rotation.x =
+                std::numeric_limits<float>::quiet_NaN();
+        }},
+        {+[](InteractionTarget& target) {
+            target.object_dimensions.y =
+                std::numeric_limits<float>::quiet_NaN();
+        }},
+        {+[](InteractionTarget& target) {
+            target.object_dimensions.z = 0.0F;
+        }},
+        {+[](InteractionTarget& target) {
+            target.table_world.position.z =
+                std::numeric_limits<float>::infinity();
+        }},
+        {+[](InteractionTarget& target) {
+            target.table_world.rotation = quat(0.0F, 0.0F, 0.0F, 0.0F);
+        }},
+        {+[](InteractionTarget& target) {
+            target.table_world.rotation = quat(0.5F, 0.0F, 0.0F, 0.0F);
+        }},
+        {+[](InteractionTarget& target) {
+            target.table_world.rotation.z =
+                std::numeric_limits<float>::quiet_NaN();
+        }},
+        {+[](InteractionTarget& target) {
+            target.table_size.x =
+                std::numeric_limits<float>::infinity();
+        }},
+        {+[](InteractionTarget& target) {
+            target.table_size.y = -0.01F;
+        }},
+        {+[](InteractionTarget& target) {
+            target.state = static_cast<ObjectState>(255U);
+        }},
+        {+[](InteractionTarget& target) {
+            target.state = ObjectState::Free;
+            target.owner_request = 1U;
+        }},
+        {+[](InteractionTarget& target) {
+            target.state = ObjectState::Targeted;
+            target.owner_request = 0U;
+        }},
+        {+[](InteractionTarget& target) {
+            target.affordances.front().id = 0U;
+        }},
+        {+[](InteractionTarget& target) {
+            target.affordances.push_back(target.affordances.front());
+        }},
+        {+[](InteractionTarget& target) {
+            target.affordances.front().hand = static_cast<Hand>(2U);
+        }},
+        {+[](InteractionTarget& target) {
+            target.affordances.front().hand_in_object.position.y =
+                std::numeric_limits<float>::quiet_NaN();
+        }},
+        {+[](InteractionTarget& target) {
+            target.affordances.front().hand_in_object.rotation =
+                quat(0.0F, 0.0F, 0.0F, 0.0F);
+        }},
+        {+[](InteractionTarget& target) {
+            target.affordances.front().hand_in_object.rotation =
+                quat(1.5F, 0.0F, 0.0F, 0.0F);
+        }},
+        {+[](InteractionTarget& target) {
+            target.affordances.front().hand_in_object.rotation.w =
+                std::numeric_limits<float>::quiet_NaN();
+        }},
+        {+[](InteractionTarget& target) {
+            target.affordances.front().approach_direction_object.x =
+                std::numeric_limits<float>::quiet_NaN();
+        }},
+        {+[](InteractionTarget& target) {
+            target.affordances.front().approach_direction_object = vec3();
+        }},
+        {+[](InteractionTarget& target) {
+            target.affordances.front().clearance_radius =
+                std::numeric_limits<float>::quiet_NaN();
+        }},
+        {+[](InteractionTarget& target) {
+            target.affordances.front().clearance_radius = -0.001F;
+        }},
+    };
+
+    for (const InvalidTargetCase& invalid : invalid_targets) {
+        TargetRegistry registry;
+        const TargetHandle original = registry.upsert(make_target(90, 6));
+        assert(registry.reserve(original, 700));
+        const InteractionTarget snapshot = *registry.find(original);
+        InteractionTarget malformed = make_target(90, 999);
+        invalid.mutate(malformed);
+
+        assert(throws_invalid_argument([&] {
+            (void)registry.upsert(malformed);
+        }));
+        const InteractionTarget* preserved = registry.find(original);
+        assert(preserved != nullptr);
+        assert(exact(*preserved, snapshot));
+        assert(registry.validate(original, 700));
+    }
+
+    const std::array<Transform, 4> invalid_replacements = {{
+        {vec3(nan, 1.0F, 2.0F), quat()},
+        {vec3(1.0F, 2.0F, 3.0F), quat(0.0F, 0.0F, 0.0F, 0.0F)},
+        {vec3(1.0F, 2.0F, 3.0F), quat(2.0F, 0.0F, 0.0F, 0.0F)},
+        {vec3(1.0F, 2.0F, 3.0F), quat(1.0F, infinity, 0.0F, 0.0F)},
+    }};
+    for (size_t index = 0; index < invalid_replacements.size(); ++index) {
+        TargetRegistry registry;
+        const TargetHandle original = registry.upsert(make_target(91, 8));
+        assert(registry.reserve(original, 701));
+        const InteractionTarget snapshot = *registry.find(original);
+
+        assert(throws_invalid_argument([&] {
+            if (index % 2U == 0U) {
+                (void)registry.replace_pose(
+                    original.id, invalid_replacements[index]);
+            } else {
+                (void)registry.reset(
+                    original.id, invalid_replacements[index]);
+            }
+        }));
+        const InteractionTarget* preserved = registry.find(original);
+        assert(preserved != nullptr);
+        assert(exact(*preserved, snapshot));
+        assert(registry.validate(original, 701));
+    }
+}
+
+void test_nonfinite_mutations_reject_with_assertions_disabled() {
+    using namespace interaction;
+    struct NonfiniteTargetCase {
+        void (*mutate)(InteractionTarget&);
+    };
+    const NonfiniteTargetCase invalid_targets[] = {
+        {+[](InteractionTarget& target) {
+            target.object_world.position.x =
+                std::numeric_limits<float>::quiet_NaN();
+        }},
+        {+[](InteractionTarget& target) {
+            target.table_size.z = std::numeric_limits<float>::infinity();
+        }},
+        {+[](InteractionTarget& target) {
+            target.affordances.front().clearance_radius =
+                std::numeric_limits<float>::quiet_NaN();
+        }},
+    };
+    for (const NonfiniteTargetCase& invalid : invalid_targets) {
+        TargetRegistry registry;
+        const TargetHandle original = registry.upsert(make_target(92, 9));
+        require(
+            registry.reserve(original, 702),
+            "nonfinite target setup reservation failed");
+        const InteractionTarget snapshot = *registry.find(original);
+        InteractionTarget malformed = make_target(92, 999);
+        invalid.mutate(malformed);
+
+        const bool rejected = throws_invalid_argument([&] {
+            (void)registry.upsert(malformed);
+        });
+        require(rejected, "nonfinite target mutation was accepted");
+        const InteractionTarget* preserved = registry.find(original);
+        require(preserved != nullptr, "nonfinite target changed generation");
+        require(
+            exact(*preserved, snapshot),
+            "nonfinite target changed registry contents");
+        require(
+            registry.validate(original, 702),
+            "nonfinite target changed registry ownership");
+    }
+
+    const std::array<Transform, 2> invalid_replacements = {{
+        {vec3(
+             std::numeric_limits<float>::quiet_NaN(),
+             1.0F,
+             2.0F),
+         quat()},
+        {vec3(1.0F, 2.0F, 3.0F),
+         quat(
+             1.0F,
+             std::numeric_limits<float>::infinity(),
+             0.0F,
+             0.0F)},
+    }};
+    for (Transform invalid : invalid_replacements) {
+        TargetRegistry registry;
+        const TargetHandle original = registry.upsert(make_target(93, 10));
+        require(
+            registry.reserve(original, 703),
+            "nonfinite replacement setup reservation failed");
+        const InteractionTarget snapshot = *registry.find(original);
+
+        const bool rejected = throws_invalid_argument([&] {
+            (void)registry.replace_pose(original.id, invalid);
+        });
+        require(rejected, "nonfinite replacement was accepted");
+        const InteractionTarget* preserved = registry.find(original);
+        require(preserved != nullptr, "nonfinite replacement changed generation");
+        require(
+            exact(*preserved, snapshot),
+            "nonfinite replacement changed registry contents");
+        require(
+            registry.validate(original, 703),
+            "nonfinite replacement changed registry ownership");
+    }
+}
+
 void test_planar_resolution_and_free_filtering() {
     using namespace interaction;
 
@@ -329,6 +608,8 @@ int main() {
     test_direct_id_lookup_ignores_generation_and_target_count();
     test_required_boundaries();
     test_upsert_validation_and_replacement();
+    test_registry_mutation_validation_is_strict_and_transactional();
+    test_nonfinite_mutations_reject_with_assertions_disabled();
     test_planar_resolution_and_free_filtering();
     test_reservation_state_machine();
     test_pose_replacement_reset_and_affordance_lookup();

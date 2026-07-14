@@ -62,6 +62,7 @@ private:
     Transform object_world_{};
     Hand hand_ = Hand::Right;
     bool recorded_ = false;
+    Pose last_safe_pose_{};
     float search_seconds_ = 0.0F;
     bool started_ = false;
     bool search_pending_ = true;

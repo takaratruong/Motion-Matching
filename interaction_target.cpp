@@ -1,12 +1,105 @@
 #include "interaction_target.h"
 
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace interaction {
 namespace {
+
+constexpr float kMinimumRotationNorm = 1.0e-6F;
+constexpr float kRotationNormTolerance = 1.0e-3F;
+
+bool finite(float value) {
+    uint32_t bits = 0U;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    return (bits & 0x7f800000U) != 0x7f800000U;
+}
+
+bool finite(vec3 value) {
+    return finite(value.x) && finite(value.y) && finite(value.z);
+}
+
+bool finite(quat value) {
+    return finite(value.w) && finite(value.x) && finite(value.y) &&
+           finite(value.z);
+}
+
+bool valid_rotation(quat value) {
+    if (!finite(value)) return false;
+    const float norm = quat_length(value);
+    return finite(norm) && norm > kMinimumRotationNorm &&
+           std::abs(norm - 1.0F) <= kRotationNormTolerance;
+}
+
+void validate_transform(const Transform& transform, const char* label) {
+    if (!finite(transform.position) || !valid_rotation(transform.rotation)) {
+        throw std::invalid_argument(
+            std::string("interaction target invalid ") + label);
+    }
+}
+
+void validate_positive_size(vec3 value, const char* label) {
+    if (!finite(value) || !(value.x > 0.0F) || !(value.y > 0.0F) ||
+        !(value.z > 0.0F)) {
+        throw std::invalid_argument(
+            std::string("interaction target invalid ") + label);
+    }
+}
+
+bool valid_hand(Hand hand) {
+    return static_cast<uint8_t>(hand) <= static_cast<uint8_t>(Hand::Right);
+}
+
+void validate_owner(const InteractionTarget& target) {
+    switch (target.state) {
+        case ObjectState::Free:
+            if (target.owner_request != 0U) {
+                throw std::invalid_argument(
+                    "interaction target free state cannot have an owner");
+            }
+            return;
+        case ObjectState::Targeted:
+        case ObjectState::Attached:
+        case ObjectState::Held:
+            if (target.owner_request == 0U) {
+                throw std::invalid_argument(
+                    "interaction target owned state requires an owner");
+            }
+            return;
+    }
+    throw std::invalid_argument("interaction target state is invalid");
+}
+
+void validate_affordance(const GraspAffordance& affordance) {
+    if (affordance.id == 0U) {
+        throw std::invalid_argument(
+            "interaction target affordance ID must be nonzero");
+    }
+    if (!valid_hand(affordance.hand)) {
+        throw std::invalid_argument(
+            "interaction target affordance hand is invalid");
+    }
+    validate_transform(affordance.hand_in_object, "grasp transform");
+    const float approach_length = length(
+        affordance.approach_direction_object);
+    if (!finite(affordance.approach_direction_object) ||
+        !finite(approach_length) ||
+        !(approach_length > kMinimumRotationNorm)) {
+        throw std::invalid_argument(
+            "interaction target approach direction must be finite and nonzero");
+    }
+    if (!finite(affordance.clearance_radius) ||
+        affordance.clearance_radius < 0.0F) {
+        throw std::invalid_argument(
+            "interaction target clearance must be finite and nonnegative");
+    }
+}
 
 void validate_target(const InteractionTarget& target) {
     if (target.handle.id == 0) {
@@ -16,17 +109,17 @@ void validate_target(const InteractionTarget& target) {
         throw std::invalid_argument(
             "interaction target generation must be nonzero");
     }
-    if (!(target.object_dimensions.x > 0.0F) ||
-        !(target.object_dimensions.y > 0.0F) ||
-        !(target.object_dimensions.z > 0.0F)) {
-        throw std::invalid_argument(
-            "interaction target dimensions must be positive");
-    }
+    validate_transform(target.object_world, "object transform");
+    validate_positive_size(target.object_dimensions, "object dimensions");
+    validate_transform(target.table_world, "table transform");
+    validate_positive_size(target.table_size, "table size");
+    validate_owner(target);
     if (target.affordances.empty()) {
         throw std::invalid_argument(
             "interaction target must have an affordance");
     }
     for (size_t left = 0; left < target.affordances.size(); ++left) {
+        validate_affordance(target.affordances[left]);
         for (size_t right = left + 1U;
              right < target.affordances.size();
              ++right) {
@@ -185,6 +278,7 @@ bool TargetRegistry::release(TargetHandle handle, uint64_t request_id) {
 TargetHandle TargetRegistry::replace_pose(
     uint64_t id,
     Transform object_world) {
+    validate_transform(object_world, "replacement object transform");
     InteractionTarget& target = target_with_id(targets_, id);
     const TargetHandle replacement = incremented(target.handle);
     target.handle = replacement;

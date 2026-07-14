@@ -1292,14 +1292,47 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
             affordance_.reset();
             request_.reset();
         } else {
-            pose_ = carry_->update(input.locomotion, input.dt);
-            object_world_ = carry_->object_world();
-            diagnostics_.state = RuntimeState::Carry;
-            diagnostics_.result = ResultCode::Succeeded;
-            diagnostics_.reason = Reason::None;
-            diagnostics_.object_state = ObjectState::Held;
-            diagnostics_.attached = true;
-            diagnostics_.recorded_carry = carry_->recorded();
+            const InteractionTarget* authoritative = registry_->find_by_id(
+                request_->target.id);
+            const bool still_owns_held_target = owns_reservation_ &&
+                authoritative != nullptr &&
+                authoritative->handle == request_->target &&
+                registry_->validate(
+                    request_->target, request_->request_id) &&
+                authoritative->state == ObjectState::Held;
+            if (!still_owns_held_target) {
+                if (authoritative != nullptr) {
+                    object_world_ = authoritative->object_world;
+                    diagnostics_.target = authoritative->handle;
+                    diagnostics_.object_state = authoritative->state;
+                } else {
+                    diagnostics_.object_state = ObjectState::Free;
+                }
+                owns_reservation_ = false;
+                state_ = RuntimeState::Locomotion;
+                diagnostics_.state = state_;
+                diagnostics_.result = ResultCode::Failed;
+                diagnostics_.reason = Reason::TargetChanged;
+                diagnostics_.attached = false;
+                diagnostics_.recorded_carry = false;
+                carry_.reset();
+                player_.reset();
+                event_player_.reset();
+                attachment_.reset();
+                candidate_.reset();
+                target_.reset();
+                affordance_.reset();
+                request_.reset();
+            } else {
+                pose_ = carry_->update(input.locomotion, input.dt);
+                object_world_ = carry_->object_world();
+                diagnostics_.state = RuntimeState::Carry;
+                diagnostics_.result = ResultCode::Succeeded;
+                diagnostics_.reason = Reason::None;
+                diagnostics_.object_state = ObjectState::Held;
+                diagnostics_.attached = true;
+                diagnostics_.recorded_carry = carry_->recorded();
+            }
         }
     }
 

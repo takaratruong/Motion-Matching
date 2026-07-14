@@ -894,6 +894,7 @@ void CarryController::start(
     object_world_ = object_world;
     object_in_root_ = object_in_root;
     recorded_ = false;
+    last_safe_pose_ = final_hold_pose;
     search_seconds_ = 0.0F;
     started_ = true;
     search_pending_ = true;
@@ -1088,6 +1089,7 @@ Pose CarryController::update(
                     object_world_ = published;
                     object_in_root_ = published_in_root;
                     recorded_ = true;
+                    last_safe_pose_ = solved;
                     transaction.commit();
                     return solved;
                 }
@@ -1122,11 +1124,16 @@ Pose CarryController::update(
     }
 
     Pose solved = output;
-    (void)solve_hand_ik(
+    const IKResult ik = solve_hand_ik(
         solved,
         hand_,
         compose(desired_object, affordance_.hand_in_object),
         ik_config_);
+    if (!ik.accepted) {
+        recorded_ = false;
+        transaction.commit();
+        return last_safe_pose_;
+    }
     const Transform published = compose(
         hand_transform(solved, hand_),
         inverse(affordance_.hand_in_object));
@@ -1140,6 +1147,7 @@ Pose CarryController::update(
     object_world_ = published;
     object_in_root_ = published_in_root;
     recorded_ = false;
+    last_safe_pose_ = solved;
     transaction.commit();
     return solved;
 }
