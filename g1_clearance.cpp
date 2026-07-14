@@ -6,6 +6,8 @@
 #include "g1_clearance.h"
 #undef G1_CLEARANCE_IMPLEMENTATION_TU
 
+#include "g1_surface_query.h"
+
 #include <cfenv>
 #include <cfloat>
 #include <cmath>
