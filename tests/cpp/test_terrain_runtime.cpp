@@ -1,4 +1,21 @@
+#include <stddef.h>
+#include <stdlib.h>
+
+static bool test_terrain_payload_allocation_failure_armed = false;
+
+static void* test_terrain_payload_allocate(size_t bytes)
+{
+    if (test_terrain_payload_allocation_failure_armed) {
+        test_terrain_payload_allocation_failure_armed = false;
+        return NULL;
+    }
+    return malloc(bytes);
+}
+
+#define TERRAIN_RUNTIME_PAYLOAD_ALLOCATE(bytes) \
+    test_terrain_payload_allocate(bytes)
 #include "terrain_runtime.h"
+#undef TERRAIN_RUNTIME_PAYLOAD_ALLOCATE
 #include "quat.h"
 
 #include <float.h>
@@ -158,6 +175,36 @@ static byte_buffer make_heightfield(
     return out;
 }
 
+static byte_buffer make_support(
+    uint32_t version,
+    uint32_t frames,
+    uint32_t dimensions,
+    const std::vector<float>& values)
+{
+    byte_buffer out;
+    append_bytes(out, "G1SP", 4);
+    append_u32_le(out, version);
+    append_u32_le(out, frames);
+    append_u32_le(out, dimensions);
+    for (size_t i = 0; i < values.size(); ++i) append_float_le(out, values[i]);
+    return out;
+}
+
+static byte_buffer make_walkability(
+    uint32_t version,
+    uint32_t nx,
+    uint32_t nz,
+    const std::vector<uint8_t>& cells)
+{
+    byte_buffer out;
+    append_bytes(out, "G1WM", 4);
+    append_u32_le(out, version);
+    append_u32_le(out, nx);
+    append_u32_le(out, nz);
+    if (!cells.empty()) append_bytes(out, cells.data(), cells.size());
+    return out;
+}
+
 static void write_prefix(
     const char* path, const byte_buffer& payload, size_t length)
 {
@@ -250,6 +297,311 @@ static void expect_heightfield_rejected(
         check(destination.heights(i) == 200.0f + i,
               "heightfield rejection preserves values");
     }
+}
+
+static void test_payload_allocation_failures_are_actionable_and_transactional()
+{
+    {
+        const char* path = "/tmp/test_g1tf_allocation.bin";
+        write_payload(path, make_sidecar(
+            1, 2, 4,
+            {0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f}));
+        terrain_feature_set destination;
+        destination.values.resize(2, 4);
+        for (int i = 0; i < 8; ++i)
+            destination.values.data[i] = 101.0f + static_cast<float>(i);
+        const int rows = destination.values.rows;
+        const int cols = destination.values.cols;
+        float* const data = destination.values.data;
+        const std::vector<float> values(data, data + rows * cols);
+        char error[256] = {};
+        test_terrain_payload_allocation_failure_armed = true;
+        check(!terrain_features_load(
+                  destination, path, error, static_cast<int>(sizeof(error))),
+              "G1TF allocation failure rejection");
+        check(!test_terrain_payload_allocation_failure_armed,
+              "G1TF allocation hook consumed");
+        assert_error(error, path, "allocate");
+        check(destination.values.rows == rows &&
+                  destination.values.cols == cols &&
+                  destination.values.data == data,
+              "G1TF allocation failure preserves destination fields");
+        for (int i = 0; i < rows * cols; ++i)
+            check(destination.values.data[i] == values[static_cast<size_t>(i)],
+                  "G1TF allocation failure preserves destination payload");
+    }
+
+    {
+        const char* path = "/tmp/test_g1hf_allocation.bin";
+        write_payload(path, make_heightfield(
+            2, 2, 2, 0.0f, 0.0f, 1.0f, -1.0f,
+            {0.0f, 1.0f, 2.0f, 3.0f}));
+        heightfield destination;
+        destination.version = 77;
+        destination.nx = 3;
+        destination.nz = 2;
+        destination.origin_x = 10.0f;
+        destination.origin_z = 20.0f;
+        destination.cell_size = 0.25f;
+        destination.exterior_height = -5.0f;
+        destination.heights.resize(6);
+        for (int i = 0; i < destination.heights.size; ++i)
+            destination.heights(i) = 201.0f + static_cast<float>(i);
+        const uint32_t version = destination.version;
+        const int nx = destination.nx;
+        const int nz = destination.nz;
+        const float origin_x = destination.origin_x;
+        const float origin_z = destination.origin_z;
+        const float cell_size = destination.cell_size;
+        const float exterior_height = destination.exterior_height;
+        const int count = destination.heights.size;
+        float* const data = destination.heights.data;
+        const std::vector<float> values(data, data + count);
+        char error[256] = {};
+        test_terrain_payload_allocation_failure_armed = true;
+        check(!heightfield_load(
+                  destination, path, error, static_cast<int>(sizeof(error))),
+              "G1HF allocation failure rejection");
+        check(!test_terrain_payload_allocation_failure_armed,
+              "G1HF allocation hook consumed");
+        assert_error(error, path, "allocate");
+        check(destination.version == version &&
+                  destination.nx == nx && destination.nz == nz &&
+                  destination.origin_x == origin_x &&
+                  destination.origin_z == origin_z &&
+                  destination.cell_size == cell_size &&
+                  destination.exterior_height == exterior_height &&
+                  destination.heights.size == count &&
+                  destination.heights.data == data,
+              "G1HF allocation failure preserves destination fields");
+        for (int i = 0; i < count; ++i)
+            check(destination.heights(i) == values[static_cast<size_t>(i)],
+                  "G1HF allocation failure preserves destination payload");
+    }
+
+    {
+        const char* path = "/tmp/test_g1sp_allocation.bin";
+        write_payload(path, make_support(
+            1, 2, 3, {0.0f, 0.1f, 0.2f, 1.0f, 1.1f, 1.2f}));
+        terrain_support_set destination;
+        destination.values.resize(2, 3);
+        for (int i = 0; i < 6; ++i)
+            destination.values.data[i] = 301.0f + static_cast<float>(i);
+        const int rows = destination.values.rows;
+        const int cols = destination.values.cols;
+        float* const data = destination.values.data;
+        const std::vector<float> values(data, data + rows * cols);
+        char error[256] = {};
+        test_terrain_payload_allocation_failure_armed = true;
+        check(!terrain_support_load(
+                  destination, path, 2, error,
+                  static_cast<int>(sizeof(error))),
+              "G1SP allocation failure rejection");
+        check(!test_terrain_payload_allocation_failure_armed,
+              "G1SP allocation hook consumed");
+        assert_error(error, path, "allocate");
+        check(destination.values.rows == rows &&
+                  destination.values.cols == cols &&
+                  destination.values.data == data,
+              "G1SP allocation failure preserves destination fields");
+        for (int i = 0; i < rows * cols; ++i)
+            check(destination.values.data[i] == values[static_cast<size_t>(i)],
+                  "G1SP allocation failure preserves destination payload");
+    }
+
+    {
+        const char* path = "/tmp/test_g1wm_allocation.bin";
+        write_payload(path, make_walkability(1, 3, 2, {0, 1, 2, 2, 1, 0}));
+        heightfield field;
+        initialize_heightfield(
+            field, 3, 2, -1.0f, 2.0f, 0.02f, -3.0f, 2);
+        field.heights.zero();
+        walkability_grid destination;
+        destination.nx = 3;
+        destination.nz = 2;
+        destination.cells.resize(6);
+        for (int i = 0; i < destination.cells.size; ++i)
+            destination.cells(i) = static_cast<uint8_t>(2 - i % 3);
+        const int nx = destination.nx;
+        const int nz = destination.nz;
+        const int count = destination.cells.size;
+        uint8_t* const data = destination.cells.data;
+        const std::vector<uint8_t> values(data, data + count);
+        char error[256] = {};
+        test_terrain_payload_allocation_failure_armed = true;
+        check(!walkability_load(
+                  destination, path, field, error,
+                  static_cast<int>(sizeof(error))),
+              "G1WM allocation failure rejection");
+        check(!test_terrain_payload_allocation_failure_armed,
+              "G1WM allocation hook consumed");
+        assert_error(error, path, "allocate");
+        check(destination.nx == nx && destination.nz == nz &&
+                  destination.cells.size == count &&
+                  destination.cells.data == data,
+              "G1WM allocation failure preserves destination fields");
+        for (int i = 0; i < count; ++i)
+            check(destination.cells(i) == values[static_cast<size_t>(i)],
+                  "G1WM allocation failure preserves destination payload");
+    }
+}
+
+static void test_support_loader_is_strict_transactional_and_frame_exact()
+{
+    const char* path = "/tmp/test_g1sp.bin";
+    const std::vector<float> values = {
+        0.0f, 0.1f, 0.2f,
+        1.0f, 1.1f, 1.2f,
+    };
+    write_payload(path, make_support(1, 2, 3, values));
+    terrain_support_set support;
+    char error[256] = {};
+    check(terrain_support_load(support, path, 2, error, sizeof(error)), error);
+    check(support.values.rows == 2 && support.values.cols == 3,
+          "G1SP shape");
+    check_close(support.values(1, 2), 1.2f, "G1SP payload");
+
+    support.values.set(9.0f);
+    write_payload(path, make_support(2, 2, 3, values));
+    check(!terrain_support_load(support, path, 2, error, sizeof(error)),
+          "G1SP version rejection");
+    check(strstr(error, path) && strstr(error, "version"),
+          "G1SP version diagnostic");
+    check(support.values(0, 0) == 9.0f, "G1SP transaction");
+
+    write_payload(path, make_support(1, 2, 4, values));
+    check(!terrain_support_load(support, path, 2, error, sizeof(error)),
+          "G1SP dimensions rejection");
+    write_payload(path, make_support(1, 2, 3, values));
+    check(!terrain_support_load(support, path, 3, error, sizeof(error)),
+          "G1SP frame parity rejection");
+
+    std::vector<float> nonfinite = values;
+    nonfinite[4] = std::numeric_limits<float>::quiet_NaN();
+    write_payload(path, make_support(1, 2, 3, nonfinite));
+    check(!terrain_support_load(support, path, 2, error, sizeof(error)),
+          "G1SP finite rejection");
+
+    const byte_buffer valid = make_support(1, 2, 3, values);
+    for (size_t size = 0; size < valid.size(); ++size) {
+        write_prefix(path, valid, size);
+        check(!terrain_support_load(support, path, 2, error, sizeof(error)),
+              "G1SP truncation rejection");
+    }
+    byte_buffer trailing = valid;
+    trailing.push_back(0x7f);
+    write_payload(path, trailing);
+    check(!terrain_support_load(support, path, 2, error, sizeof(error)),
+          "G1SP trailing rejection");
+}
+
+static void test_walkability_loader_is_strict_transactional_and_grid_exact()
+{
+    const char* path = "/tmp/test_g1wm.bin";
+    heightfield field;
+    field.version = 2;
+    initialize_heightfield(field, 3, 2, -1.0f, 2.0f, 0.02f, -3.0f);
+    field.heights.zero();
+    const std::vector<uint8_t> cells = {0, 1, 2, 2, 1, 0};
+    write_payload(path, make_walkability(1, 3, 2, cells));
+
+    walkability_grid grid;
+    char error[256] = {};
+    check(walkability_load(grid, path, field, error, sizeof(error)), error);
+    check(grid.nx == 3 && grid.nz == 2 && grid.cells.size == 6,
+          "G1WM shape");
+    for (int i = 0; i < grid.cells.size; ++i)
+        check(grid.cells(i) == cells[static_cast<size_t>(i)], "G1WM payload");
+
+    grid.cells.set(2);
+    write_payload(path, make_walkability(2, 3, 2, cells));
+    check(!walkability_load(grid, path, field, error, sizeof(error)),
+          "G1WM version rejection");
+    check(grid.nx == 3 && grid.nz == 2 && grid.cells(0) == 2,
+          "G1WM transaction");
+
+    write_payload(path, make_walkability(1, 2, 2, {0, 1, 2, 0}));
+    check(!walkability_load(grid, path, field, error, sizeof(error)),
+          "G1WM grid mismatch rejection");
+    write_payload(path, make_walkability(1, 3, 2, {0, 1, 3, 2, 1, 0}));
+    check(!walkability_load(grid, path, field, error, sizeof(error)),
+          "G1WM class rejection");
+
+    const byte_buffer valid = make_walkability(1, 3, 2, cells);
+    for (size_t size = 0; size < valid.size(); ++size) {
+        write_prefix(path, valid, size);
+        check(!walkability_load(grid, path, field, error, sizeof(error)),
+              "G1WM truncation rejection");
+    }
+    byte_buffer trailing = valid;
+    trailing.push_back(1);
+    write_payload(path, trailing);
+    check(!walkability_load(grid, path, field, error, sizeof(error)),
+          "G1WM trailing rejection");
+}
+
+static void test_walkability_binary32_half_cell_parity()
+{
+    heightfield field;
+    field.version = 2;
+    initialize_heightfield(field, 3, 2, -0.02f, 0.0f, 0.02f, 0.0f);
+    field.heights.zero();
+    walkability_grid grid;
+    grid.nx = 3; grid.nz = 2; grid.cells.resize(6);
+    const uint8_t values[6] = {1, 2, 1, 1, 2, 1};
+    for (int i = 0; i < 6; ++i) grid.cells(i) = values[i];
+    const float tie = -0.01f;
+    check(walkability_class_at(
+          grid, field, nextafterf(tie, -INFINITY), 0.0f) == 1,
+          "binary32 predecessor stays below half-cell");
+    check(walkability_class_at(grid, field, tie, 0.0f) == 2,
+          "binary32 half-cell tie chooses positive index");
+    check(walkability_class_at(
+          grid, field, nextafterf(tie, INFINITY), 0.0f) == 2,
+          "binary32 successor stays above half-cell");
+
+    heightfield rounded;
+    rounded.version = 2;
+    initialize_heightfield(rounded, 3, 2, -1.0f, 0.0f, 0.02f, 0.0f);
+    rounded.heights.zero();
+    check(walkability_class_at(
+          grid, rounded, -0.9900000095367432f, 0.0f) == 1,
+          "rounded mathematical midpoint follows one-round producer ops");
+}
+
+static void test_f32_helpers_match_one_round_producer_operations()
+{
+    float value = -7.0f;
+    check(terrain_f32_add(value, 0.1f, 0.2f), "binary32 add accepted");
+    check_float_bits(value, UINT32_C(0x3e99999a), "binary32 add result");
+    check(terrain_f32_sub(value, 1.0f, 0.1f), "binary32 subtract accepted");
+    check_float_bits(value, UINT32_C(0x3f666666), "binary32 subtract result");
+    check(terrain_f32_div(value, 1.0f, 3.0f), "binary32 divide accepted");
+    check_float_bits(value, UINT32_C(0x3eaaaaab), "binary32 divide result");
+    check(terrain_f32_sqrt(value, 2.0f), "binary32 square root accepted");
+    check_float_bits(value, UINT32_C(0x3fb504f3),
+                     "binary32 square root result");
+
+    float product = -1.0f;
+    check(terrain_f32_mul(
+              product,
+              float_from_bits(UINT32_C(0x4f800001)),
+              float_from_bits(UINT32_C(0x4f7ffffe))),
+          "binary32 multiply accepted");
+    check_float_bits(product, UINT32_C(0x5f800000),
+                     "binary32 multiply materializes before add");
+    float sum = -1.0f;
+    check(terrain_f32_add(
+              sum, product, float_from_bits(UINT32_C(0xdf800000))),
+          "binary32 post-multiply add accepted");
+    check_float_bits(sum, UINT32_C(0x00000000),
+                     "binary32 multiply and add do not contract");
+
+    value = 17.0f;
+    check(!terrain_f32_div(value, 1.0f, 0.0f),
+          "binary32 divide rejects infinity");
+    check_float_bits(value, UINT32_C(0x41880000),
+                     "binary32 rejection preserves destination");
 }
 
 static void test_sidecar_loads_valid_file()
@@ -1423,6 +1775,98 @@ static void test_centerline_snapshot_keeps_query_and_markers_in_one_state()
     }
 }
 
+static void test_v2_centerline_uses_checked_triangular_height_samples()
+{
+    heightfield legacy;
+    initialize_heightfield(
+        legacy, 2, 2, 0.0f, 0.0f, 1.0f, -9.0f, 1);
+    legacy.heights(0) = 0.0f;
+    legacy.heights(1) = 0.0f;
+    legacy.heights(2) = 0.0f;
+    legacy.heights(3) = 1.0f;
+
+    heightfield field;
+    initialize_heightfield(
+        field, 2, 2, 0.0f, 0.0f, 1.0f, -9.0f, 2);
+    field.heights(0) = 0.0f;
+    field.heights(1) = 0.0f;
+    field.heights(2) = 0.0f;
+    field.heights(3) = 1.0f;
+
+    const vec3 root(0.0f, 4.0f, 0.25f);
+    array1d<vec3> positions(2);
+    positions(0) = root;
+    positions(1) = vec3(1.0f, -8.0f, 0.25f);
+    array1d<quat> rotations(2);
+    rotations(0) = heading_positive_x();
+    rotations(1) = heading_positive_x();
+
+    terrain_centerline_snapshot legacy_snapshot = {};
+    terrain_centerline_snapshot_compute(
+        legacy_snapshot, legacy, root, positions, rotations);
+    static const uint32_t point_x_bits[4] = {
+        UINT32_C(0x3e800000), UINT32_C(0x3f000000),
+        UINT32_C(0x3f400000), UINT32_C(0x3f800000),
+    };
+    static const uint32_t legacy_height_bits[4] = {
+        UINT32_C(0x3d800000), UINT32_C(0x3e000000),
+        UINT32_C(0x3e400000), UINT32_C(0x3e800000),
+    };
+    for (int i = 0; i < 4; ++i) {
+        check_float_bits(
+            legacy_snapshot.values[i], legacy_height_bits[i],
+            "legacy v1 centerline query stays bit-identical");
+        check_vec3_bits(
+            legacy_snapshot.points[i], point_x_bits[i],
+            legacy_height_bits[i], UINT32_C(0x3e800000),
+            "legacy v1 centerline marker stays bit-identical");
+    }
+
+    terrain_centerline_snapshot snapshot = {};
+    terrain_centerline_snapshot_compute_v2(
+        snapshot, field, root, positions, rotations);
+    float query[4] = {};
+    terrain_centerline_query_v2(
+        query, field, root, positions, rotations);
+    const float base = heightfield_sample_v2(field, root.x, root.z);
+    check_float_bits(base, UINT32_C(0x00000000),
+                     "v2 centerline direct base sample");
+    for (int i = 0; i < 4; ++i) {
+        check_float_bits(snapshot.points[i].x, point_x_bits[i],
+                         "v2 centerline marker x");
+        check_float_bits(snapshot.points[i].z, UINT32_C(0x3e800000),
+                         "v2 centerline marker z");
+        const float direct = heightfield_sample_v2(
+            field, snapshot.points[i].x, snapshot.points[i].z);
+        const float direct_difference = static_cast<float>(
+            static_cast<double>(direct) - static_cast<double>(base));
+        check_float_bits(snapshot.points[i].y, float_bits(direct),
+                         "v2 centerline marker matches direct sample");
+        check_float_bits(snapshot.values[i], float_bits(direct_difference),
+                         "v2 centerline value matches direct sample");
+        check_float_bits(query[i], float_bits(direct_difference),
+                         "v2 centerline query matches snapshot");
+        check_float_bits(snapshot.values[i], UINT32_C(0x3e800000),
+                         "v2 centerline uses triangular interpolation");
+    }
+    check(float_bits(snapshot.values[0]) !=
+              float_bits(legacy_snapshot.values[0]),
+          "v2 centerline fixture differs from bilinear v1");
+
+    terrain_centerline_snapshot rejected = {};
+    for (int i = 0; i < 4; ++i) rejected.values[i] = 9.0f;
+    terrain_centerline_snapshot_compute_v2(
+        rejected, legacy, root, positions, rotations);
+    for (int i = 0; i < 4; ++i) {
+        check_float_bits(rejected.values[i], UINT32_C(0x00000000),
+                         "v2 centerline rejects legacy field version");
+        check_vec3_bits(
+            rejected.points[i], UINT32_C(0x00000000),
+            UINT32_C(0x00000000), UINT32_C(0x3e800000),
+            "v2 centerline rejection uses safe root marker");
+    }
+}
+
 static void test_centerline_uses_root_skips_flat_repeats_and_latest_heading()
 {
     const vec3 root(1.0f, 7.0f, 1.0f);
@@ -1664,7 +2108,7 @@ static void test_centerline_query_does_not_mutate_inputs()
     }
 }
 
-static void probe_generated_artifacts(
+static int probe_generated_artifacts(
     const char* sidecar_path,
     const char* heightfield_path,
     uint32_t expected_heightfield_version)
@@ -1714,12 +2158,33 @@ static void probe_generated_artifacts(
                   field.cell_size * static_cast<float>(field.nz)) ==
               field.exterior_height,
           "generated terrain positive-z exterior sample");
+    return features.values.rows;
+}
+
+static void probe_support_and_scene(
+    const char* support_path,
+    const char* terrain_path,
+    const char* walkability_path,
+    int expected_frames)
+{
+    char error[512] = {};
+    terrain_support_set support;
+    check(terrain_support_load(support, support_path, expected_frames,
+          error, sizeof(error)), error);
+    check(support.values.rows == expected_frames && support.values.cols == 3,
+          "published G1SP dimensions");
+    heightfield field;
+    check(heightfield_load(field, terrain_path, error, sizeof(error)), error);
+    check(field.version == 2, "published scenes require G1HF/v2");
+    walkability_grid grid;
+    check(walkability_load(grid, walkability_path, field,
+          error, sizeof(error)), error);
 }
 
 int main(int argc, char** argv)
 {
-    check(argc == 1 || argc == 4,
-          "expected zero or three artifact arguments");
+    check(argc == 1 || argc == 6,
+          "expected zero or five artifact arguments");
     test_sidecar_loads_valid_file();
     test_sidecar_rejects_every_truncation();
     test_sidecar_rejects_invalid_schema_sizes_and_values();
@@ -1730,6 +2195,11 @@ int main(int argc, char** argv)
     test_heightfield_rejects_invalid_schema_and_sizes();
     test_heightfield_rejects_nonfinite_metadata_and_heights();
     test_heightfield_open_failure_is_actionable_and_transactional();
+    test_support_loader_is_strict_transactional_and_frame_exact();
+    test_walkability_loader_is_strict_transactional_and_grid_exact();
+    test_walkability_binary32_half_cell_parity();
+    test_payload_allocation_failures_are_actionable_and_transactional();
+    test_f32_helpers_match_one_round_producer_operations();
     test_heightfield_versions_preserve_v1_and_use_v2_triangles();
     test_v1_coordinate_arithmetic_remains_literal();
     test_v2_awkward_python_byte_and_query_oracle();
@@ -1745,12 +2215,13 @@ int main(int argc, char** argv)
     test_straight_step_query_is_ground_relative_on_elevated_base();
     test_curved_query_matches_python_geometric_arc_fixture();
     test_centerline_snapshot_keeps_query_and_markers_in_one_state();
+    test_v2_centerline_uses_checked_triangular_height_samples();
     test_centerline_uses_root_skips_flat_repeats_and_latest_heading();
     test_centerline_query_uses_heightfield_exterior_at_boundary();
     test_centerline_invalid_shapes_are_release_safe();
     test_centerline_nonfinite_inputs_are_release_safe_under_fast_math();
     test_centerline_query_does_not_mutate_inputs();
-    if (argc == 4) {
+    if (argc == 6) {
         uint32_t expected_heightfield_version = 0;
         if (strcmp(argv[3], "1") == 0) {
             expected_heightfield_version = 1;
@@ -1759,8 +2230,10 @@ int main(int argc, char** argv)
         } else {
             check(false, "expected G1HF version text exactly 1 or 2");
         }
-        probe_generated_artifacts(
+        const int expected_frames = probe_generated_artifacts(
             argv[1], argv[2], expected_heightfield_version);
+        probe_support_and_scene(
+            argv[4], argv[2], argv[5], expected_frames);
     }
     return 0;
 }

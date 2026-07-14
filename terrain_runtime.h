@@ -372,6 +372,61 @@ static inline bool terrain_size_add(size_t left, size_t right, size_t& result)
     return true;
 }
 
+#ifndef TERRAIN_RUNTIME_PAYLOAD_ALLOCATE
+#define TERRAIN_RUNTIME_PAYLOAD_ALLOCATE(bytes) malloc(bytes)
+#define TERRAIN_RUNTIME_DEFAULT_PAYLOAD_ALLOCATE
+#endif
+
+template<typename T>
+static inline bool terrain_payload_allocate_empty(
+    array1d<T>& out, int count, const char* path, const char* label,
+    char* error, int capacity)
+{
+    size_t bytes = 0;
+    if (count <= 0 || out.size != 0 || out.data != NULL ||
+        !terrain_size_multiply(
+            static_cast<size_t>(count), sizeof(T), bytes)) {
+        return terrain_error(error, capacity,
+            "%s: invalid %s allocation size", path, label);
+    }
+    T* data = static_cast<T*>(TERRAIN_RUNTIME_PAYLOAD_ALLOCATE(bytes));
+    if (data == NULL) {
+        return terrain_error(error, capacity,
+            "%s: cannot allocate %s payload", path, label);
+    }
+    out.size = count;
+    out.data = data;
+    return true;
+}
+
+template<typename T>
+static inline bool terrain_payload_allocate_empty(
+    array2d<T>& out, int rows, int cols, const char* path, const char* label,
+    char* error, int capacity)
+{
+    if (rows <= 0 || cols <= 0 || rows > INT_MAX / cols ||
+        out.rows != 0 || out.cols != 0 || out.data != NULL) {
+        return terrain_error(error, capacity,
+            "%s: invalid %s allocation shape", path, label);
+    }
+    size_t bytes = 0;
+    if (!terrain_size_multiply(
+            static_cast<size_t>(rows) * static_cast<size_t>(cols),
+            sizeof(T), bytes)) {
+        return terrain_error(error, capacity,
+            "%s: invalid %s allocation size", path, label);
+    }
+    T* data = static_cast<T*>(TERRAIN_RUNTIME_PAYLOAD_ALLOCATE(bytes));
+    if (data == NULL) {
+        return terrain_error(error, capacity,
+            "%s: cannot allocate %s payload", path, label);
+    }
+    out.rows = rows;
+    out.cols = cols;
+    out.data = data;
+    return true;
+}
+
 static inline bool terrain_file_size(FILE* file, size_t& size)
 {
     if (fseek(file, 0, SEEK_END) != 0) {
@@ -506,8 +561,17 @@ static inline bool terrain_features_load(
     }
 
     terrain_feature_set loaded;
-    loaded.values.resize(
-        static_cast<int>(frames), static_cast<int>(dimensions));
+    if (!terrain_payload_allocate_empty(
+            loaded.values,
+            static_cast<int>(frames),
+            static_cast<int>(dimensions),
+            path,
+            "G1TF",
+            error,
+            error_capacity)) {
+        fclose(file);
+        return false;
+    }
     if (!terrain_read_exact(file, loaded.values.data, payload_size)) {
         fclose(file);
         return terrain_error(
@@ -691,7 +755,16 @@ static inline bool heightfield_load(
     loaded.origin_z = origin_z;
     loaded.cell_size = cell_size;
     loaded.exterior_height = exterior_height;
-    loaded.heights.resize(static_cast<int>(height_count));
+    if (!terrain_payload_allocate_empty(
+            loaded.heights,
+            static_cast<int>(height_count),
+            path,
+            "G1HF",
+            error,
+            error_capacity)) {
+        fclose(file);
+        return false;
+    }
     if (!terrain_read_exact(file, loaded.heights.data, payload_size)) {
         fclose(file);
         return terrain_error(
@@ -730,6 +803,341 @@ static inline bool heightfield_load(
     std::swap(out.heights.size, loaded.heights.size);
     std::swap(out.heights.data, loaded.heights.data);
     return true;
+}
+
+struct terrain_support_set
+{
+    array2d<float> values;
+};
+
+struct walkability_grid
+{
+    int nx = 0;
+    int nz = 0;
+    array1d<uint8_t> cells;
+};
+
+static inline bool terrain_support_load(
+    terrain_support_set& out,
+    const char* path,
+    const int expected_frames,
+    char* error,
+    const int error_capacity)
+{
+    const char* shown = path != NULL ? path : "<null>";
+    if (path == NULL || path[0] == '\0' || expected_frames <= 0) {
+        return terrain_error(error, error_capacity,
+            "%s: invalid G1SP path or expected frame count %d",
+            shown, expected_frames);
+    }
+    FILE* file = fopen(path, "rb");
+    if (file == NULL)
+        return terrain_error(error, error_capacity,
+            "%s: cannot open (%s)", path, strerror(errno));
+
+    size_t actual_size = 0;
+    unsigned char header[16] = {};
+    if (!terrain_file_size(file, actual_size) || actual_size < sizeof(header) ||
+        !terrain_read_exact(file, header, sizeof(header))) {
+        fclose(file);
+        return terrain_error(error, error_capacity,
+            "%s: truncated G1SP header", path);
+    }
+    if (memcmp(header, "G1SP", 4) != 0) {
+        fclose(file);
+        return terrain_error(error, error_capacity,
+            "%s: invalid G1SP magic", path);
+    }
+    const uint32_t version = terrain_decode_u32_le(header + 4);
+    const uint32_t frames = terrain_decode_u32_le(header + 8);
+    const uint32_t dimensions = terrain_decode_u32_le(header + 12);
+    if (version != 1) {
+        fclose(file);
+        return terrain_error(error, error_capacity,
+            "%s: unsupported G1SP version %u (expected 1)", path,
+            static_cast<unsigned>(version));
+    }
+    if (dimensions != 3) {
+        fclose(file);
+        return terrain_error(error, error_capacity,
+            "%s: invalid G1SP dimension %u (expected 3)", path,
+            static_cast<unsigned>(dimensions));
+    }
+    if (frames != static_cast<uint32_t>(expected_frames)) {
+        fclose(file);
+        return terrain_error(error, error_capacity,
+            "%s: G1SP frame mismatch: database=%d support=%u", path,
+            expected_frames, static_cast<unsigned>(frames));
+    }
+
+    size_t count = 0;
+    size_t bytes = 0;
+    size_t expected_size = 0;
+    if (!terrain_size_multiply(static_cast<size_t>(frames), 3u, count) ||
+        count > static_cast<size_t>(INT_MAX) ||
+        !terrain_size_multiply(count, sizeof(float), bytes) ||
+        !terrain_size_add(sizeof(header), bytes, expected_size)) {
+        fclose(file);
+        return terrain_error(error, error_capacity,
+            "%s: G1SP size overflow", path);
+    }
+    if (actual_size != expected_size) {
+        fclose(file);
+        return terrain_error(error, error_capacity,
+            "%s: %s G1SP payload (expected %zu bytes, got %zu)", path,
+            actual_size < expected_size ? "truncated" : "trailing",
+            expected_size, actual_size);
+    }
+
+    terrain_support_set loaded;
+    if (!terrain_payload_allocate_empty(
+            loaded.values, expected_frames, 3, path, "G1SP",
+            error, error_capacity)) {
+        fclose(file);
+        return false;
+    }
+    if (!terrain_read_exact(file, loaded.values.data, bytes)) {
+        fclose(file);
+        return terrain_error(error, error_capacity,
+            "%s: truncated G1SP values", path);
+    }
+    terrain_decode_float_array_le(loaded.values.data, count);
+    for (size_t i = 0; i < count; ++i) {
+        if (!terrain_float_is_finite(loaded.values.data[i])) {
+            fclose(file);
+            return terrain_error(error, error_capacity,
+                "%s: G1SP values must be finite (index %zu)", path, i);
+        }
+    }
+    if (!terrain_finish_read(file, path, error, error_capacity)) return false;
+    std::swap(out.values.rows, loaded.values.rows);
+    std::swap(out.values.cols, loaded.values.cols);
+    std::swap(out.values.data, loaded.values.data);
+    return true;
+}
+
+static inline bool walkability_load(
+    walkability_grid& out,
+    const char* path,
+    const heightfield& field,
+    char* error,
+    const int error_capacity)
+{
+    const char* shown = path != NULL ? path : "<null>";
+    if (path == NULL || path[0] == '\0' || field.nx < 2 || field.nz < 2) {
+        return terrain_error(error, error_capacity,
+            "%s: invalid G1WM path or reference heightfield", shown);
+    }
+    FILE* file = fopen(path, "rb");
+    if (file == NULL)
+        return terrain_error(error, error_capacity,
+            "%s: cannot open (%s)", path, strerror(errno));
+
+    size_t actual_size = 0;
+    unsigned char header[16] = {};
+    if (!terrain_file_size(file, actual_size) || actual_size < sizeof(header) ||
+        !terrain_read_exact(file, header, sizeof(header))) {
+        fclose(file);
+        return terrain_error(error, error_capacity,
+            "%s: truncated G1WM header", path);
+    }
+    if (memcmp(header, "G1WM", 4) != 0) {
+        fclose(file);
+        return terrain_error(error, error_capacity,
+            "%s: invalid G1WM magic", path);
+    }
+    const uint32_t version = terrain_decode_u32_le(header + 4);
+    const uint32_t nx = terrain_decode_u32_le(header + 8);
+    const uint32_t nz = terrain_decode_u32_le(header + 12);
+    if (version != 1) {
+        fclose(file);
+        return terrain_error(error, error_capacity,
+            "%s: unsupported G1WM version %u (expected 1)", path,
+            static_cast<unsigned>(version));
+    }
+    if (nx != static_cast<uint32_t>(field.nx) ||
+        nz != static_cast<uint32_t>(field.nz)) {
+        fclose(file);
+        return terrain_error(error, error_capacity,
+            "%s: G1WM grid %ux%u does not match G1HF %dx%d", path,
+            static_cast<unsigned>(nx), static_cast<unsigned>(nz),
+            field.nx, field.nz);
+    }
+    size_t count = 0;
+    size_t expected_size = 0;
+    if (!terrain_size_multiply(static_cast<size_t>(nx),
+                               static_cast<size_t>(nz), count) ||
+        count > static_cast<size_t>(INT_MAX) ||
+        !terrain_size_add(sizeof(header), count, expected_size)) {
+        fclose(file);
+        return terrain_error(error, error_capacity,
+            "%s: G1WM size overflow", path);
+    }
+    if (actual_size != expected_size) {
+        fclose(file);
+        return terrain_error(error, error_capacity,
+            "%s: %s G1WM payload (expected %zu bytes, got %zu)", path,
+            actual_size < expected_size ? "truncated" : "trailing",
+            expected_size, actual_size);
+    }
+
+    walkability_grid loaded;
+    loaded.nx = static_cast<int>(nx);
+    loaded.nz = static_cast<int>(nz);
+    if (!terrain_payload_allocate_empty(
+            loaded.cells, static_cast<int>(count), path, "G1WM",
+            error, error_capacity)) {
+        fclose(file);
+        return false;
+    }
+    if (!terrain_read_exact(file, loaded.cells.data, count)) {
+        fclose(file);
+        return terrain_error(error, error_capacity,
+            "%s: truncated G1WM cells", path);
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (loaded.cells.data[i] > 2) {
+            fclose(file);
+            return terrain_error(error, error_capacity,
+                "%s: invalid G1WM class %u at cell %zu", path,
+                static_cast<unsigned>(loaded.cells.data[i]), i);
+        }
+    }
+    if (!terrain_finish_read(file, path, error, error_capacity)) return false;
+    std::swap(out.nx, loaded.nx);
+    std::swap(out.nz, loaded.nz);
+    std::swap(out.cells.size, loaded.cells.size);
+    std::swap(out.cells.data, loaded.cells.data);
+    return true;
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+#define TERRAIN_F32_NOINLINE __attribute__((noinline))
+#else
+#define TERRAIN_F32_NOINLINE
+#endif
+
+static inline bool terrain_f32_accept(float& out, float value)
+{
+    if (!terrain_float_is_normal_or_zero_query(value)) return false;
+    out = value == 0.0f ? 0.0f : value;
+    return true;
+}
+
+static inline TERRAIN_F32_NOINLINE bool terrain_f32_add(
+    float& out, float left, float right)
+{
+    const volatile float a = left, b = right;
+    const volatile float rounded = a + b;
+    return terrain_f32_accept(out, rounded);
+}
+
+static inline TERRAIN_F32_NOINLINE bool terrain_f32_sub(
+    float& out, float left, float right)
+{
+    const volatile float a = left, b = right;
+    const volatile float rounded = a - b;
+    return terrain_f32_accept(out, rounded);
+}
+
+static inline TERRAIN_F32_NOINLINE bool terrain_f32_mul(
+    float& out, float left, float right)
+{
+    const volatile float a = left, b = right;
+    const volatile float rounded = a * b;
+    return terrain_f32_accept(out, rounded);
+}
+
+static inline TERRAIN_F32_NOINLINE bool terrain_f32_div(
+    float& out, float left, float right)
+{
+    const volatile float a = left, b = right;
+    const volatile float rounded = a / b;
+    return terrain_f32_accept(out, rounded);
+}
+
+static inline TERRAIN_F32_NOINLINE bool terrain_f32_sqrt(
+    float& out, float value)
+{
+    const volatile float input = value;
+    const volatile float rounded = sqrtf(input);
+    return terrain_f32_accept(out, rounded);
+}
+
+#undef TERRAIN_F32_NOINLINE
+
+static inline bool terrain_f32_lerp(
+    float& out, float start, float stop, int step, int steps)
+{
+    if (step < 0 || steps < 1 || step > steps) return false;
+    float delta = 0.0f;
+    float alpha = 0.0f;
+    float scaled = 0.0f;
+    const volatile float numerator = static_cast<float>(step);
+    const volatile float denominator = static_cast<float>(steps);
+    return terrain_f32_sub(delta, stop, start) &&
+           terrain_f32_div(alpha, numerator, denominator) &&
+           terrain_f32_mul(scaled, alpha, delta) &&
+           terrain_f32_add(out, start, scaled);
+}
+
+static inline bool walkability_grid_matches_heightfield(
+    const walkability_grid& grid, const heightfield& field)
+{
+    size_t count = 0;
+    return grid.nx == field.nx && grid.nz == field.nz &&
+           grid.nx >= 2 && grid.nz >= 2 &&
+           terrain_float_is_normal_or_positive_zero(field.origin_x) &&
+           terrain_float_is_normal_or_positive_zero(field.origin_z) &&
+           terrain_float_is_positive_normal(field.cell_size) &&
+           terrain_size_multiply(
+               static_cast<size_t>(grid.nx),
+               static_cast<size_t>(grid.nz), count) &&
+           count <= static_cast<size_t>(INT_MAX) &&
+           grid.cells.size == static_cast<int>(count);
+}
+
+static inline bool terrain_v2_query_coordinate(
+    float input, float& canonical);
+
+static inline bool walkability_nearest_axis(
+    int& index, float input, float origin, float cell_size, int count)
+{
+    float canonical = 0.0f;
+    float numerator = 0.0f;
+    float normalized = 0.0f;
+    float shifted = 0.0f;
+    if (count < 2 ||
+        !terrain_v2_query_coordinate(input, canonical) ||
+        !terrain_f32_sub(numerator, canonical, origin) ||
+        !terrain_f32_div(normalized, numerator, cell_size) ||
+        static_cast<double>(normalized) < 0.0 ||
+        static_cast<double>(normalized) > static_cast<double>(count - 1) ||
+        !terrain_f32_add(shifted, normalized, 0.5f)) {
+        return false;
+    }
+    const int rounded = static_cast<int>(floorf(shifted));
+    index = rounded < count ? rounded : count - 1;
+    return index >= 0 && index < count;
+}
+
+static inline int walkability_class_at(
+    const walkability_grid& grid,
+    const heightfield& field,
+    float x,
+    float z)
+{
+    if (!walkability_grid_matches_heightfield(grid, field)) return 0;
+    int ix = 0;
+    int iz = 0;
+    if (!walkability_nearest_axis(
+            ix, x, field.origin_x, field.cell_size, grid.nx) ||
+        !walkability_nearest_axis(
+            iz, z, field.origin_z, field.cell_size, grid.nz)) {
+        return 0;
+    }
+    const int value = grid.cells(iz * grid.nx + ix);
+    return value <= 2 ? value : 0;
 }
 
 static inline bool terrain_heightfield_is_queryable(const heightfield& field);
@@ -1359,3 +1767,78 @@ static inline void terrain_centerline_query(
         out[i] = snapshot.values[i];
     }
 }
+
+static inline void terrain_centerline_snapshot_compute_v2(
+    terrain_centerline_snapshot& out,
+    const heightfield& field,
+    vec3 root,
+    const slice1d<vec3> trajectory_positions,
+    const slice1d<quat> trajectory_rotations)
+{
+    const vec3 safe_root(
+        terrain_float_is_finite(root.x) ? root.x : 0.0f,
+        0.0f,
+        terrain_float_is_finite(root.z) ? root.z : 0.0f);
+    for (int i = 0; i < 4; ++i) {
+        out.values[i] = 0.0f;
+        out.points[i] = safe_root;
+    }
+    if (field.version != 2 ||
+        !terrain_heightfield_is_queryable(field) ||
+        !terrain_centerline_inputs_are_valid(
+            root, trajectory_positions, trajectory_rotations)) {
+        return;
+    }
+
+    const float base_height = heightfield_sample_v2(field, root.x, root.z);
+    if (!terrain_float_is_finite(base_height)) {
+        return;
+    }
+
+    static const float distances[4] = {
+        0.25f, 0.50f, 0.75f, 1.00f};
+    for (int i = 0; i < 4; ++i) {
+        const vec3 point = terrain_centerline_point_at_arc(
+            root, trajectory_positions, trajectory_rotations, distances[i]);
+        const float sample_height =
+            heightfield_sample_v2(field, point.x, point.z);
+        if (!terrain_float_is_finite(sample_height)) {
+            continue;
+        }
+        out.points[i] = vec3(point.x, sample_height, point.z);
+        const double difference =
+            static_cast<double>(sample_height) -
+            static_cast<double>(base_height);
+        if (difference >= -static_cast<double>(FLT_MAX) &&
+            difference <= static_cast<double>(FLT_MAX)) {
+            out.values[i] = static_cast<float>(difference);
+        }
+    }
+}
+
+static inline void terrain_centerline_query_v2(
+    float out[4],
+    const heightfield& field,
+    vec3 root,
+    const slice1d<vec3> trajectory_positions,
+    const slice1d<quat> trajectory_rotations)
+{
+    if (out == NULL) {
+        return;
+    }
+    terrain_centerline_snapshot snapshot = {};
+    terrain_centerline_snapshot_compute_v2(
+        snapshot,
+        field,
+        root,
+        trajectory_positions,
+        trajectory_rotations);
+    for (int i = 0; i < 4; ++i) {
+        out[i] = snapshot.values[i];
+    }
+}
+
+#ifdef TERRAIN_RUNTIME_DEFAULT_PAYLOAD_ALLOCATE
+#undef TERRAIN_RUNTIME_PAYLOAD_ALLOCATE
+#undef TERRAIN_RUNTIME_DEFAULT_PAYLOAD_ALLOCATE
+#endif
