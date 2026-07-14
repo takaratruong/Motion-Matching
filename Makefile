@@ -55,7 +55,7 @@ $(CPP_TEST_DIR)/test_interaction_database: tests/cpp/test_interaction_database.c
 interaction_probe: interaction_probe.cpp interaction_database.h g1_skeleton.h
 	$(CXX) $(CPP_TEST_FLAGS) $< -o $@
 
-test-python:
+test-python: interaction_probe
 	python -m unittest discover -s tests/python -t . -v
 
 test-cpp: $(CPP_TEST_BINS)
