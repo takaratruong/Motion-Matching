@@ -46,6 +46,16 @@ LOCKED_GRAIL_HEIGHTS = {
     "terrain_curbs__curb_022__001": 0.24007104328948528,
     "terrain_curbs__curb_165__006": 0.3599740964554129,
 }
+LOCKED_GRAIL_ROOT_PATH_X_BOUNDS = {
+    GRAIL_DEFAULT_BASE: (
+        -0.16539472341537476, -0.009255850687623024),
+    "terrain_curbs__curb_186__004": (
+        -0.28973305225372314, -0.02736859768629074),
+    "terrain_curbs__curb_022__001": (
+        -0.39980870485305786, -0.06907640397548676),
+    "terrain_curbs__curb_165__006": (
+        -0.29937341809272766, -0.030186962336301804),
+}
 SMALL_FULL_GRAIL_BASES = tuple(sorted(LOCKED_GRAIL_HEIGHTS))
 SMALL_EXTRA_GRAIL_BASES = (
     "terrain_curbs__curb_199__006",
@@ -59,8 +69,8 @@ def _fake_grail_clip(base):
     clip = HoldenClip.empty(frames=5, bones=31)
     clip.name = base
     clip.terrain_id = base
-    clip.positions[:, 0, 0] = np.array(
-        [0.0, 0.1, 0.2, 0.3, 0.4], np.float32)
+    clip.positions[:, 0, 0] = np.linspace(
+        *LOCKED_GRAIL_ROOT_PATH_X_BOUNDS[base], 5, dtype=np.float32)
     clip.positions[:, 0, 2] = np.array(
         [0.0, 0.4, 0.8, 1.2, 1.6], np.float32)
     return clip
@@ -1158,6 +1168,59 @@ class ValidatorTests(unittest.TestCase):
             def __iter__(self):
                 raise AssertionError("normal mode inspected source_options")
 
+        expected_region_ids = {
+            "grail-curb-default": {
+                "certified": ("left-apron", "right-apron"),
+                "stress": ("curb-route",), "blocked": (),
+            },
+            "grail-curb-low": {
+                "certified": ("curb-route",),
+                "stress": (), "blocked": (),
+            },
+            "grail-curb-medium": {
+                "certified": ("left-apron", "right-apron"),
+                "stress": ("curb-route",), "blocked": (),
+            },
+            "grail-curb-high": {
+                "certified": ("left-apron", "right-apron"),
+                "stress": ("curb-route",), "blocked": (),
+            },
+            "ramp-15-stress": {
+                "certified": ("left-apron", "right-apron"),
+                "stress": ("course",), "blocked": (),
+            },
+            "blocked-course": {
+                "certified": (
+                    "approach", "left-bypass", "right-bypass"),
+                "stress": (), "blocked": ("wall", "gap", "ramp"),
+            },
+        }
+        for scene_id, expected in expected_region_ids.items():
+            scene = _load_json(self._path(
+                f"scenes/{scene_id}/scene.json"))
+            observed = {
+                class_name: tuple(
+                    region["id"] for region in scene["regions"][class_name])
+                for class_name in ("certified", "stress", "blocked")
+            }
+            with self.subTest(scene=scene_id):
+                self.assertEqual(observed, expected)
+
+        maximum_grid_cells = max(
+            np.prod(struct.unpack_from("<II", built.terrain_bin, 8))
+            for built in _canonical_scene_pack().scenes
+        )
+        self.assertEqual(maximum_grid_cells, 306726)
+        self.assertEqual(
+            validator_module._MAX_GRID_CELLS, maximum_grid_cells)
+        maximum_obj_bytes = max(
+            len(built.terrain_obj)
+            for built in _canonical_scene_pack().scenes
+        )
+        self.assertEqual(maximum_obj_bytes, 21762970)
+        self.assertEqual(
+            validator_module._MAX_OBJ_BYTES, maximum_obj_bytes)
+
         self.assertEqual(
             validate_artifact_directory(
                 self.output,
@@ -1499,8 +1562,11 @@ class ValidatorTests(unittest.TestCase):
             relative = f"scenes/{scene_id}/scene.json"
 
             def mutate(scene):
+                playable_xmax = np.float32(
+                    scene["bounds"]["playable_max_xz"][0])
                 scene["regions"]["certified"][0]["bounds_xz"][1] = \
-                    float(np.float32(0.851))
+                    float(np.float32(
+                        playable_xmax + np.float32(0.251)))
 
             self._rewrite_json(preserve, relative, mutate)
             self._resign_scene(preserve, scene_id)

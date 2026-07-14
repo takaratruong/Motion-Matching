@@ -110,6 +110,16 @@ GRAIL_EXPECTED_HEIGHTS = {
     "grail-curb-medium": 0.24007104328948528,
     "grail-curb-high": 0.3599740964554129,
 }
+GRAIL_EXPECTED_ROOT_PATH_X_BOUNDS = {
+    "grail-curb-default": (
+        -0.16539472341537476, -0.009255850687623024),
+    "grail-curb-low": (
+        -0.28973305225372314, -0.02736859768629074),
+    "grail-curb-medium": (
+        -0.39980870485305786, -0.06907640397548676),
+    "grail-curb-high": (
+        -0.29937341809272766, -0.030186962336301804),
+}
 GRAIL_EXPECTED_CLASSES = {
     "grail-curb-default": 2,
     "grail-curb-low": 1,
@@ -207,8 +217,8 @@ _MAX_FRAMES = 459682
 _MAX_SOURCE_FRAMES = 50_000
 _CANONICAL_SOURCE_FPS = (25.0, 50.0)
 _MAX_GRID_AXIS = 2048
-_MAX_GRID_CELLS = 200_000
-_MAX_OBJ_BYTES = 16 * 1024 * 1024
+_MAX_GRID_CELLS = 306_726
+_MAX_OBJ_BYTES = 21_762_970
 _MAX_DATABASE_BYTES = 176 + 8 * _MAX_CLIPS + 1614 * _MAX_FRAMES
 _MAX_FEATURE_BYTES = 16 + 16 * _MAX_FRAMES
 _MAX_SUPPORT_BYTES = 16 + 12 * _MAX_FRAMES
@@ -831,6 +841,26 @@ def _f32_round(value, label):
         f"{label} must be normal-or-positive-zero float32")
     decoded = struct.unpack("<f", struct.pack("<I", bits))[0]
     return 0.0 if decoded == 0.0 else float(decoded)
+
+
+def _f32_lower_floor(value, label):
+    target = float(value)
+    result = _f32_round(target, label)
+    if result > target:
+        result = _f32_round(
+            np.nextafter(np.float32(result), np.float32(-np.inf)),
+            f"{label} lower floor")
+    return result
+
+
+def _f32_upper_ceiling(value, label):
+    target = float(value)
+    result = _f32_round(target, label)
+    if result < target:
+        result = _f32_round(
+            np.nextafter(np.float32(result), np.float32(np.inf)),
+            f"{label} upper ceiling")
+    return result
 
 
 def _f32_add(left, right, label):
@@ -1784,7 +1814,87 @@ def _validate_regions(scene_id, regions, grid, walkability, lookahead):
                      f"{scene_id}: {class_name} region disagrees with G1WM")
 
 
-def _validate_grail_scene(scene_id, scene, grid, walkability):
+def _grid_x_partition(grid, core_minimum, core_maximum, label):
+    origin = float(grid.origin_x)
+    cell = float(grid.cell_size)
+    grid_maximum = origin + (grid.nx - 1) * cell
+    _require(core_minimum < core_maximum
+             and origin < core_minimum
+             and core_maximum < grid_maximum,
+             f"{label}: core X interval needs an outer grid node")
+
+    def source(index):
+        return origin + index * cell
+
+    first_core = int(np.ceil((core_minimum - origin) / cell))
+    while source(first_core) < core_minimum:
+        first_core += 1
+    while first_core > 0 and source(first_core - 1) >= core_minimum:
+        first_core -= 1
+    last_core = int(np.floor((core_maximum - origin) / cell))
+    while source(last_core) > core_maximum:
+        last_core -= 1
+    while last_core + 1 < grid.nx \
+            and source(last_core + 1) <= core_maximum:
+        last_core += 1
+    _require(1 <= first_core <= last_core < grid.nx - 1,
+             f"{label}: core has no bounded grid partition")
+    indices = (first_core - 1, first_core, last_core, last_core + 1)
+    values = tuple(
+        _f32_round(source(index), f"{label} grid partition[{index}]")
+        for index in indices
+    )
+    _require(all(left < right for left, right in zip(values, values[1:])),
+             f"{label}: grid partition is not increasing")
+    return values
+
+
+def _expected_grail_regions(scene_id, playable, grid, terrain):
+    playable = tuple(float(value) for value in playable)
+    route_class = GRAIL_EXPECTED_CLASSES[scene_id]
+    expected = {"certified": [], "stress": [], "blocked": []}
+    if route_class == 1:
+        expected["certified"] = [{
+            "id": "curb-route",
+            "bounds_xz": list(playable),
+        }]
+        return expected, None
+
+    mesh_xmin, mesh_xmax, _, _ = terrain.xz_bounds()
+    path_xmin, path_xmax = GRAIL_EXPECTED_ROOT_PATH_X_BOUNDS[scene_id]
+    core_xmin = float(path_xmin - 0.60)
+    core_xmax = float(path_xmax + 0.60)
+    central_xmin = _f32_lower_floor(
+        max(playable[0], min(mesh_xmin, core_xmin)),
+        f"{scene_id} retained core xmin")
+    central_xmax = _f32_upper_ceiling(
+        min(playable[1], max(mesh_xmax, core_xmax)),
+        f"{scene_id} retained core xmax")
+    left_end, stress_xmin, stress_xmax, right_start = \
+        _grid_x_partition(
+            grid, central_xmin, central_xmax,
+            f"{scene_id} retained stress")
+    expected["certified"] = [
+        {
+            "id": "left-apron",
+            "bounds_xz": [
+                playable[0], left_end, playable[2], playable[3]],
+        },
+        {
+            "id": "right-apron",
+            "bounds_xz": [
+                right_start, playable[1], playable[2], playable[3]],
+        },
+    ]
+    expected["stress"] = [{
+        "id": "curb-route",
+        "bounds_xz": [
+            stress_xmin, stress_xmax, playable[2], playable[3]],
+    }]
+    return expected, (central_xmin, central_xmax)
+
+
+def _validate_grail_scene(scene_id, scene, grid, walkability, playable):
     base = GRAIL_EXPECTED_BASES[scene_id]
     _require(scene["label"] == GRAIL_LABELS[scene_id],
              f"{scene_id}: GRAIL label changed")
@@ -1809,29 +1919,14 @@ def _validate_grail_scene(scene_id, scene, grid, walkability):
              and _json_exact(provenance["parameters"], expected_parameters),
              f"{scene_id}: GRAIL provenance or parameters changed")
     route_class = GRAIL_EXPECTED_CLASSES[scene_id]
-    class_name = "certified" if route_class == 1 else "stress"
-    expected_regions = {"certified": [], "stress": [], "blocked": []}
-    expected_regions[class_name] = [{
-        "id": "curb-route",
-        "bounds_xz": [
-            scene["bounds"]["playable_min_xz"][0],
-            scene["bounds"]["playable_max_xz"][0],
-            scene["bounds"]["playable_min_xz"][1],
-            scene["bounds"]["playable_max_xz"][1],
-        ],
-    }]
+    expected_regions, central_x = _expected_grail_regions(
+        scene_id, playable, grid, terrain)
     _require(_json_exact(scene["regions"], expected_regions),
              f"{scene_id}: GRAIL route region changed")
     _require(len(scene["routes"]) == 1
              and len(scene["routes"][0]["waypoints_xz"]) == 5
              and scene["routes"][0]["walkability_class"] == route_class,
              f"{scene_id}: GRAIL route class or cardinality changed")
-    playable = (
-        scene["bounds"]["playable_min_xz"][0],
-        scene["bounds"]["playable_max_xz"][0],
-        scene["bounds"]["playable_min_xz"][1],
-        scene["bounds"]["playable_max_xz"][1],
-    )
     classifier = (
         _f32_sub(playable[0], WALKABILITY_HALO, "GRAIL classifier xmin"),
         _f32_add(playable[1], WALKABILITY_HALO, "GRAIL classifier xmax"),
@@ -1846,7 +1941,11 @@ def _validate_grail_scene(scene_id, scene, grid, walkability):
         for ix in range(grid.nx):
             x = float(grid.origin_x) + ix * float(grid.cell_size)
             if classifier[0] <= x <= classifier[1]:
-                expected[iz, ix] = route_class
+                expected[iz, ix] = (
+                    route_class
+                    if central_x is None
+                    or central_x[0] <= x <= central_x[1]
+                    else 1)
     _require(np.array_equal(walkability, expected),
              f"{scene_id}: complete GRAIL classifier differs from playable halo")
     report = _independent_grail_surface_parity(terrain, grid)
@@ -2067,10 +2166,6 @@ def _validate_scene(
              and all(type(entries) is list
                      for entries in region_container.values()),
              f"{scene_id}: region container is invalid")
-    expected_region_count = 3 if scene_id == "blocked-course" else 1
-    _require(sum(len(entries) for entries in region_container.values())
-             == expected_region_count,
-             f"{scene_id}: deterministic region count changed")
     _validate_regions(scene_id, region_container, grid, walkability, lookahead)
     routes = scene["routes"]
     _require(type(routes) is list and routes,
@@ -2104,10 +2199,14 @@ def _validate_scene(
     _require(tuple(route_ids) == EXPECTED_ROUTE_IDS[scene_id],
              f"{scene_id}: deterministic route IDs changed")
     if scene_id in GRAIL_EXPECTED_BASES:
-        _validate_grail_scene(scene_id, scene, grid, walkability)
+        _validate_grail_scene(
+            scene_id, scene, grid, walkability, playable)
     else:
         _require(provenance["kind"] == "procedural",
                  f"{scene_id}: procedural provenance kind changed")
+        expected_regions = _expected_procedural_regions()[scene_id]
+        _require(_json_exact(region_container, expected_regions),
+                 f"{scene_id}: deterministic procedural regions changed")
     return scene, grid, walkability
 
 
@@ -2188,6 +2287,14 @@ def _expected_procedural_scenes():
         (definition.scene_id, build_scene(definition))
         for definition in procedural_scene_definitions()
     )
+
+
+@lru_cache(maxsize=1)
+def _expected_procedural_regions():
+    return {
+        scene_id: json.loads(built.scene_json)["regions"]
+        for scene_id, built in _expected_procedural_scenes()
+    }
 
 
 def validate_artifact_directory(

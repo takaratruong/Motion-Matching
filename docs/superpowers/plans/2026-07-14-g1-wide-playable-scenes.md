@@ -166,10 +166,12 @@ Expected: the commit contains only the scene builder and scene tests.
 **Files:**
 - Modify: `resources/g1_terrain_builder/scenes.py:355-690,797-866`
 - Modify: `tests/python/test_scenes.py:812-914,1020-1185`
+- Modify: `resources/validate_g1_terrain_database.py`
+- Modify: `tests/python/test_validator.py`
 
 **Interfaces:**
 - Consumes: Task 1 wide bounds, `_walkability_classification_bounds`, `_region`, and each scene's existing core/source X envelope.
-- Produces: class-1 flat aprons, central stress retention, and class-1 blocked-course bypass lanes while keeping both direct safe-stop routes class `0` at their endpoints.
+- Produces: class-1 flat aprons, central stress retention, class-1 blocked-course bypass lanes, and an exact validator oracle for the expanded deterministic region model while keeping both direct safe-stop routes class `0` at their endpoints.
 
 - [ ] **Step 1: Add failing class and region tests**
 
@@ -214,24 +216,9 @@ Expected: stress-scene aprons still return `2`, and the blocked course still mar
 
 - [ ] **Step 3: Implement explicit core/apron classifiers**
 
-For `_corridor_definition`, classify the outer halo first. Class-1 scenes return `1` throughout it. For the 15-degree stress scene, return `2` only when `-COURSE_HALF_WIDTH <= x <= COURSE_HALF_WIDTH`; return `1` on the proven-flat sides. Publish a central stress rectangle and two certified side rectangles whose inner bounds use adjacent binary32 values so no G1WM node is assigned two different classes.
+For `_corridor_definition`, classify the outer halo first. Class-1 scenes return `1` throughout it. For the 15-degree stress scene, return `2` only when `-COURSE_HALF_WIDTH <= x <= COURSE_HALF_WIDTH`; return `1` on the proven-flat sides. Publish a central stress rectangle and two certified side rectangles.
 
-Use these helpers for class-boundary region endpoints:
-
-```python
-def _runtime_f32_predecessor(value, label):
-    source = np.nextafter(
-        np.float32(_runtime_f32(value, label)), np.float32(-np.inf))
-    return _runtime_f32(source, f"{label} predecessor")
-
-
-def _runtime_f32_successor(value, label):
-    source = np.nextafter(
-        np.float32(_runtime_f32(value, label)), np.float32(np.inf))
-    return _runtime_f32(source, f"{label} successor")
-```
-
-The left certified rectangle ends at the predecessor of the inclusive core minimum; the right certified rectangle begins at the successor of the inclusive core maximum. The core rectangle owns both exact boundary values.
+Region bounds are interpreted by `_region_cell_indices` through nearest-node mapping. A mere binary32 predecessor/successor of a class threshold can still map to the same G1WM node, so derive the last apron node, first core node, last core node, and first opposite-apron node from the authoritative heightfield origin and `SCENE_CELL_SIZE`. Publish those four runtime binary32 node coordinates and test that the three region covers are class-pure, disjoint, and adjacent by cell index.
 
 For `_blocked_definition`, retain the exact obstacle Z threshold and use:
 
@@ -252,6 +239,8 @@ def walkability(x, z):
 Publish the full-width approach plus left/right certified bypass regions. Keep `wall`, `ramp`, and the narrow central gap represented as blocked regions. Do not change either safe-stop route.
 
 For `grail_scene_definition`, retain `core_playable`, `mesh_xmin`, and `mesh_xmax`. The old playable rectangle and the source-mesh X envelope use the old scene class; newly added X cells strictly outside both use class `1`. Certified GRAIL scenes may publish one full-width certified region. Stress GRAIL scenes publish a central stress rectangle and class-1 left/right exterior rectangles.
+
+Update the independent validator's deterministic region oracle at the same time. It must require the exact approved IDs/classes/adjacent grid partitions; accepting an arbitrary region count is not allowed. This compatibility update is required before candidate packs using the new scene model can validate.
 
 - [ ] **Step 4: Run all scene tests GREEN**
 
@@ -278,12 +267,14 @@ Expected: all tests pass; the authenticated schemas and atomic artifact behavior
 
 ```bash
 git diff --check
-git add resources/g1_terrain_builder/scenes.py tests/python/test_scenes.py
+git add resources/g1_terrain_builder/scenes.py tests/python/test_scenes.py \
+  resources/validate_g1_terrain_database.py tests/python/test_validator.py \
+  docs/superpowers/plans/2026-07-14-g1-wide-playable-scenes.md
 git diff --cached --check
 git commit -m "feat: certify wide G1 scene aprons"
 ```
 
-Expected: only the scene builder and scene tests are committed.
+Expected: only the scene builder/tests, exact validator oracle/tests, and this execution-plan correction are committed.
 
 ---
 
