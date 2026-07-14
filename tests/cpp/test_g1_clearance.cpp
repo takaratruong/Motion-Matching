@@ -888,13 +888,114 @@ static void test_point_fixed_diagonal_and_determinism()
                   expected_weights[index][1] &&
               first.witness.terrain_weight_2 ==
                   expected_weights[index][2],
-              "point witness has deterministic triangle barycentrics");
+              "point witness has deterministic weight diagnostics");
         const G1ClearanceWork expected_work = {
             1, 1, 1, 0, 0, 0
         };
         check(clearance_work_same(first.work, expected_work),
               "point query charges one query, cell, and triangle pair");
     }
+}
+
+static void require_point_oracle_enclosure(
+    const heightfield& field,
+    vec3 point,
+    long double exact_surface,
+    const char* message)
+{
+    const G1ClearanceResult first = require_point_ok(field, point);
+    const G1ClearanceResult second = require_point_ok(field, point);
+    const long double exact_clearance =
+        static_cast<long double>(point.y) - exact_surface;
+    check(clearance_result_same(first, second),
+          "point-special proof is deterministic");
+    check(static_cast<long double>(first.lower_bound_m) <=
+              exact_clearance &&
+          exact_clearance <=
+              static_cast<long double>(first.witness_upper_m) &&
+          first.witness_upper_m - first.lower_bound_m <=
+              G1ClearanceMaximumCertificateWidthM,
+          message);
+    check(double_bits(first.witness.body_x) ==
+              double_bits(static_cast<double>(point.x)) &&
+          double_bits(first.witness.body_z) ==
+              double_bits(static_cast<double>(point.z)) &&
+          double_bits(first.witness.surface_x) ==
+              double_bits(static_cast<double>(point.x)) &&
+          double_bits(first.witness.surface_z) ==
+              double_bits(static_cast<double>(point.z)) &&
+          first.witness.candidate_kind == 3 &&
+          first.witness.segment_parameter == 0.0,
+          "point-special diagnostics retain canonical input XZ and t=0");
+
+    G1SurfaceSample producer = {};
+    check(g1_surface_query_v2(
+              producer, field, point.x, point.z) ==
+              G1SurfaceQueryValid,
+          "point-special oracle fixture has a valid producer sample");
+    const volatile double producer_clearance =
+        static_cast<double>(point.y) -
+        static_cast<double>(producer.height);
+    check(first.lower_bound_m <= producer_clearance,
+          "point-special lower bound preserves the producer inequality");
+
+    G1ClearanceBudget insufficient = g1_pose_clearance_budget();
+    insufficient.maximum_point_queries = 0;
+    G1ClearanceResult failed_output = seeded_result(74.0);
+    const ByteSnapshot<G1ClearanceResult> output_before(failed_output);
+    const ByteSnapshot<G1ClearanceBudget> limits_before(insufficient);
+    char error[128] = {};
+    check(g1_point_clearance(
+              failed_output, insufficient, field, point,
+              error, static_cast<int>(sizeof(error))) ==
+              G1ClearanceBudgetExceeded,
+          "point-special fixture preflights its point-query budget");
+    check(output_before.same(failed_output) &&
+          limits_before.same(insufficient),
+          "point-special failure is transactional");
+}
+
+static void test_point_special_exact_bit_regression()
+{
+    heightfield field;
+    const float cell_size =
+        float_from_bits(UINT32_C(0x3a83126f));
+    const float coordinate =
+        float_from_bits(UINT32_C(0x3727c5ac));
+    point_make_field(
+        field, 2, 2, 0.0f, 0.0f, cell_size);
+    field.heights(0) = 0.0f;
+    field.heights(1) =
+        float_from_bits(UINT32_C(0x3e800000));
+    field.heights(2) =
+        float_from_bits(UINT32_C(0x3f000000));
+    field.heights(3) =
+        float_from_bits(UINT32_C(0x3f400000));
+    const vec3 point(coordinate, 1.0f, coordinate);
+
+    heightfield_cell producer_cell = {};
+    check(terrain_v2_locate_cell(
+              field, point.x, point.z, producer_cell),
+          "exact-bit point fixture has a producer cell");
+    const volatile double diagnostic_weight_0 =
+        1.0 - producer_cell.tx;
+    const volatile double diagnostic_weight_1 =
+        producer_cell.tx - producer_cell.tz;
+    const volatile double diagnostic_weight_2 = producer_cell.tz;
+    const long double diagnostic_exact_sum =
+        static_cast<long double>(diagnostic_weight_0) +
+        static_cast<long double>(diagnostic_weight_1) +
+        static_cast<long double>(diagnostic_weight_2);
+    check(diagnostic_exact_sum != 1.0L,
+          "exact-bit fixture exposes rounded weights that are diagnostics only");
+
+    const long double exact_surface =
+        static_cast<long double>(field.heights(3)) *
+        static_cast<long double>(coordinate) /
+        static_cast<long double>(cell_size);
+    require_point_oracle_enclosure(
+        field, point, exact_surface,
+        "point-special bounds enclose the exact-bit point-plane oracle");
 }
 
 static void test_point_domain_boundaries()
@@ -1737,6 +1838,7 @@ int main(int argc, char** argv)
     test_budget_contract();
     test_swing_lift_materializer();
     test_point_fixed_diagonal_and_determinism();
+    test_point_special_exact_bit_regression();
     test_point_domain_boundaries();
     test_point_input_and_field_rejection();
     test_point_exterior_height_independence();

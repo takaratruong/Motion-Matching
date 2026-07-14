@@ -547,37 +547,43 @@ static bool g1_clearance_point_triangle(
     return true;
 }
 
-static bool g1_clearance_point_weights(
+// Candidate kind 3 has a point-special proof source.  Its canonical promoted
+// input XZ, t=0, checked closed triangle, and outward plane-height enclosure
+// are authoritative.  These rounded producer-cell weights are deterministic
+// public diagnostics only; capsule-patch homogeneous weights retain the
+// separate exact-real normalization/feasibility contract.
+static bool g1_clearance_point_weight_diagnostics(
     const heightfield_cell& cell,
     uint32_t triangle_index,
-    double weights[3])
+    double diagnostics[3])
 {
     if (triangle_index == 0) {
         const volatile double first = 1.0 - cell.tx;
         const volatile double second = cell.tx - cell.tz;
-        weights[0] = first;
-        weights[1] = second;
-        weights[2] = cell.tz;
+        diagnostics[0] = first;
+        diagnostics[1] = second;
+        diagnostics[2] = cell.tz;
     } else if (triangle_index == 1) {
         const volatile double first = 1.0 - cell.tz;
         const volatile double third = cell.tz - cell.tx;
-        weights[0] = first;
-        weights[1] = cell.tx;
-        weights[2] = third;
+        diagnostics[0] = first;
+        diagnostics[1] = cell.tx;
+        diagnostics[2] = third;
     } else {
         return false;
     }
     for (int index = 0; index < 3; ++index) {
-        if (!terrain_double_is_finite(weights[index]) ||
-            weights[index] < 0.0 || weights[index] > 1.0) {
+        if (!terrain_double_is_finite(diagnostics[index]) ||
+            diagnostics[index] < 0.0 || diagnostics[index] > 1.0) {
             return false;
         }
-        if (weights[index] == 0.0) {
-            weights[index] = 0.0;
+        if (diagnostics[index] == 0.0) {
+            diagnostics[index] = 0.0;
         }
     }
-    const volatile double first_sum = weights[0] + weights[1];
-    const volatile double sum = first_sum + weights[2];
+    const volatile double first_sum =
+        diagnostics[0] + diagnostics[1];
+    const volatile double sum = first_sum + diagnostics[2];
     return terrain_double_is_finite(sum) && sum > 0.0;
 }
 
@@ -960,16 +966,14 @@ G1ClearanceStatus g1_point_clearance(
     }
 
     G1PointTriangle triangle = {};
-    double weights[3] = {};
-    double central_height = 0.0;
+    double weight_diagnostics[3] = {};
+    double surface_height_diagnostic = 0.0;
     G1ClearanceInterval height_enclosure = {};
     if (!g1_clearance_point_triangle(
             field, cell, h00, h10, h01, h11, triangle) ||
-        !g1_clearance_point_weights(
-            cell, triangle.index, weights) ||
         !g1_clearance_point_height(
             field, point, cell, h00, h10, h01, h11,
-            central_height, height_enclosure)) {
+            surface_height_diagnostic, height_enclosure)) {
         return g1_clearance_error(
             G1ClearanceArithmeticFailure,
             diagnostic.output, diagnostic.capacity,
@@ -1054,6 +1058,18 @@ G1ClearanceStatus g1_point_clearance(
             "G1 point certificate exceeds the required width");
     }
 
+    if (!g1_clearance_point_weight_diagnostics(
+            cell, triangle.index, weight_diagnostics)) {
+        return g1_clearance_error(
+            G1ClearanceArithmeticFailure,
+            diagnostic.output, diagnostic.capacity,
+            "G1 point weight diagnostics could not be materialized");
+    }
+
+    // The point-special proof is the canonical point XZ and the strict
+    // selected-triangle height enclosure above.  The XYZ and weight members
+    // below expose deterministic diagnostics; they are not read back as the
+    // feasibility source for candidate_kind=3.
     G1ClearanceResult candidate = {};
     candidate.lower_bound_m = guarded_lower;
     candidate.witness_upper_m = clearance.upper;
@@ -1061,12 +1077,12 @@ G1ClearanceStatus g1_point_clearance(
     candidate.witness.body_y = static_cast<double>(point.y);
     candidate.witness.body_z = static_cast<double>(point.z);
     candidate.witness.surface_x = static_cast<double>(point.x);
-    candidate.witness.surface_y = central_height;
+    candidate.witness.surface_y = surface_height_diagnostic;
     candidate.witness.surface_z = static_cast<double>(point.z);
     candidate.witness.segment_parameter = 0.0;
-    candidate.witness.terrain_weight_0 = weights[0];
-    candidate.witness.terrain_weight_1 = weights[1];
-    candidate.witness.terrain_weight_2 = weights[2];
+    candidate.witness.terrain_weight_0 = weight_diagnostics[0];
+    candidate.witness.terrain_weight_1 = weight_diagnostics[1];
+    candidate.witness.terrain_weight_2 = weight_diagnostics[2];
     candidate.witness.primitive_index = 0;
     candidate.witness.cell_x = cell.x0;
     candidate.witness.cell_z = cell.z0;
