@@ -12,6 +12,67 @@ I've included a basic `Makefile` which you can use if you are using raylib on Wi
 
 If you are on Linux or another platform you will probably have to hack this `Makefile` a bit.
 
+# G1 tabletop interaction data replay
+
+Gate 1 converts the complete GRAIL pickup-table corpus to the frozen 25 Hz G1 interaction schema, validates the published pack in Python, and replays the same binary artifacts through the headless C++ probe. Set up an isolated Python environment and fetch the source modalities with:
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements-interaction.txt
+python -m resources.fetch_grail_pickup_table --output /path/to/GRAIL
+```
+
+Run the reproducible full-corpus gate with explicit local paths:
+
+```bash
+make gate1-interaction \
+  GRAIL_PICKUP_ROOT=/path/to/GRAIL/data/pickup_table \
+  G1_XML=/path/to/g1_29dof.xml \
+  G1_INTERACTION_DIR=resources/g1_interaction
+```
+
+The target first runs the explicit safe interaction test suite, then builds with reviewed rejections enabled, validates the pack, applies the full-corpus Gate 1 assertions, and runs the C++ replay digest. Unknown rejection codes and unexpected exceptions abort publication.
+
+The output directory contains exactly five reproducible files:
+
+- `interaction_database.bin`: canonical 31-bone poses, interaction labels, object state, and clip ranges.
+- `interaction_features.bin`: the database-only 71-D feature rows and normalization values.
+- `manifest.json`: schema, skeleton, feature, provenance, clip, and count metadata.
+- `evaluation_split.json`: deterministic object-disjoint database and held-out identities.
+- `validation_report.json`: included/rejected clip totals, frames, numeric bounds, and exact rejection records.
+
+`resources/g1_interaction/` is ignored generated output. Rebuild it with the command above rather than committing it. A different `G1_INTERACTION_DIR` is also treated as operator-owned generated output.
+
+The first authorized full-corpus run must replace the pending cells below with the exact published values; no result has been inferred from the unit fixtures or diagnostic subset.
+
+| Measurement | Source | Full-corpus result |
+| --- | --- | --- |
+| Source clips | `validation_report.json: source_clips` | Pending full-corpus run |
+| Included clips | `validation_report.json: included_clips` | Pending full-corpus run |
+| Rejected clips | `validation_report.json: rejected_clips` | Pending full-corpus run |
+| Included frames | `validation_report.json: included_frames` | Pending full-corpus run |
+| Database objects | length of `evaluation_split.json: database_objects` | Pending full-corpus run |
+| Held-out objects | length of `evaluation_split.json: heldout_objects` | Pending full-corpus run |
+
+Inspect the exact rejection code, stage, sequence, and message without modifying the pack:
+
+```bash
+python - <<'PY'
+import json
+from pathlib import Path
+
+report = json.loads(
+    Path("resources/g1_interaction/validation_report.json").read_text()
+)
+print(json.dumps(report["rejections_by_code"], indent=2, sort_keys=True))
+for rejection in report["rejections"]:
+    print(rejection)
+PY
+```
+
+Gate 1 replays data only; it does not yet make the character pick up an object.
+
 # Playable G1 Tabletop Pickup
 
 The desktop controller now combines the existing flat locomotion controller with one authored G1 tabletop pickup. Ordinary locomotion, rendering, and the ownership handoff run at a fixed 60 Hz. The interaction runtime advances through the deterministic integer scheduler at exactly 25 updates per second; it is not driven by wall-clock frame time.

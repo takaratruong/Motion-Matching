@@ -44,6 +44,66 @@ EXPECTED_CLIP_ERRORS = (
     InteractionValidationError,
 )
 
+_SCHEMA_V1_REJECTION_CODES_BY_ERROR = {
+    SourceValidationError: frozenset(
+        {
+            "fps_mismatch",
+            "frame_count_mismatch",
+            "invalid_contact",
+            "invalid_dimensions",
+            "invalid_fps",
+            "invalid_quaternion",
+            "invalid_shape",
+            "invalid_source_frames",
+            "invalid_source_record",
+            "missing_field",
+            "non_finite",
+            "object_identity_mismatch",
+        }
+    ),
+    ConversionValidationError: frozenset(
+        {
+            "duration_error",
+            "fk_error",
+            "fk_rotation_error",
+            "fps_mismatch",
+            "frame_count_mismatch",
+            "invalid_contact",
+            "invalid_dimensions",
+            "invalid_fps",
+            "invalid_quaternion",
+            "invalid_shape",
+            "invalid_source_frames",
+            "joint_limit_violation",
+            "non_finite",
+            "skeleton_mismatch",
+        }
+    ),
+    InteractionValidationError: frozenset(
+        {
+            "ambiguous_active_hand",
+            "contact_lost_before_hold",
+            "invalid_approach",
+            "invalid_grasp",
+            "no_five_centimeter_lift",
+            "no_stable_contact",
+            "no_stable_hold",
+        }
+    ),
+}
+_SCHEMA_V1_REJECTION_CODES = frozenset().union(
+    *_SCHEMA_V1_REJECTION_CODES_BY_ERROR.values()
+)
+_SCHEMA_V1_REJECTION_ERROR_BY_STAGE = {
+    "source": SourceValidationError,
+    "conversion": ConversionValidationError,
+    "interaction": InteractionValidationError,
+}
+_SCHEMA_V1_REJECTION_STAGE_BY_ERROR = {
+    error_type: stage
+    for stage, error_type in _SCHEMA_V1_REJECTION_ERROR_BY_STAGE.items()
+}
+
 NUMERIC_BOUND_NAMES = (
     ("fk_max_error_m", "fk_max_error_m"),
     (
@@ -62,6 +122,21 @@ class Rejection:
     stage: str
     code: str
     message: str
+
+
+def all_schema_v1_rejection_codes() -> tuple[str, ...]:
+    """Return the reviewed clip-level exclusions allowed in schema v1."""
+    return tuple(sorted(_SCHEMA_V1_REJECTION_CODES))
+
+
+def is_schema_v1_rejection(stage: str, code: str) -> bool:
+    """Return whether a stage/code pair is a reviewed schema-v1 exclusion."""
+    if not isinstance(stage, str) or not isinstance(code, str):
+        return False
+    error_type = _SCHEMA_V1_REJECTION_ERROR_BY_STAGE.get(stage)
+    if error_type is None:
+        return False
+    return code in _SCHEMA_V1_REJECTION_CODES_BY_ERROR[error_type]
 
 
 def build_object_dimensions(
@@ -113,13 +188,11 @@ def build_labeled_clips(
             included.append(derive_interaction_labels(canonical))
             numeric_reports.append(numeric)
         except EXPECTED_CLIP_ERRORS as error:
-            stage = (
-                "source"
-                if isinstance(error, SourceValidationError)
-                else "conversion"
-                if isinstance(error, ConversionValidationError)
-                else "interaction"
-            )
+            stage = _SCHEMA_V1_REJECTION_STAGE_BY_ERROR.get(type(error))
+            if stage is None or not is_schema_v1_rejection(
+                stage, error.code
+            ):
+                raise
             rejected.append(
                 Rejection(
                     source.sequence_id,

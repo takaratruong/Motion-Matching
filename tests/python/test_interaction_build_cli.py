@@ -48,6 +48,52 @@ NUMERIC_REPORT = {
 }
 
 
+KNOWN_REJECTION_CODES_BY_STAGE = {
+    "source": {
+        "fps_mismatch",
+        "frame_count_mismatch",
+        "invalid_contact",
+        "invalid_dimensions",
+        "invalid_fps",
+        "invalid_quaternion",
+        "invalid_shape",
+        "invalid_source_frames",
+        "invalid_source_record",
+        "missing_field",
+        "non_finite",
+        "object_identity_mismatch",
+    },
+    "conversion": {
+        "duration_error",
+        "fk_error",
+        "fk_rotation_error",
+        "fps_mismatch",
+        "frame_count_mismatch",
+        "invalid_contact",
+        "invalid_dimensions",
+        "invalid_fps",
+        "invalid_quaternion",
+        "invalid_shape",
+        "invalid_source_frames",
+        "joint_limit_violation",
+        "non_finite",
+        "skeleton_mismatch",
+    },
+    "interaction": {
+        "ambiguous_active_hand",
+        "contact_lost_before_hold",
+        "invalid_approach",
+        "invalid_grasp",
+        "no_five_centimeter_lift",
+        "no_stable_contact",
+        "no_stable_hold",
+    },
+}
+KNOWN_REJECTION_CODES = set().union(
+    *KNOWN_REJECTION_CODES_BY_STAGE.values()
+)
+
+
 def artifact_snapshot(output: Path) -> dict[str, bytes]:
     return {
         path.name: path.read_bytes()
@@ -336,6 +382,123 @@ def publish_fast_valid_pack(
 
 
 class InteractionBuildUnitTests(unittest.TestCase):
+    def test_rejection_code_schema_is_closed(self):
+        self.assertEqual(
+            set(build_module.all_schema_v1_rejection_codes()),
+            KNOWN_REJECTION_CODES,
+        )
+
+    def test_rejection_stage_predicate_matches_the_frozen_table(self):
+        for stage, reviewed in KNOWN_REJECTION_CODES_BY_STAGE.items():
+            for code in KNOWN_REJECTION_CODES:
+                with self.subTest(stage=stage, code=code):
+                    self.assertEqual(
+                        build_module.is_schema_v1_rejection(stage, code),
+                        code in reviewed,
+                    )
+        self.assertFalse(
+            build_module.is_schema_v1_rejection(
+                "unknown_stage", "frame_count_mismatch"
+            )
+        )
+        self.assertFalse(
+            build_module.is_schema_v1_rejection(
+                "source", "unknown_code"
+            )
+        )
+
+    def test_every_rejection_code_is_emitted_at_a_reviewed_stage(self):
+        source = SimpleNamespace(sequence_id="a", object_id="object")
+        dimensions = {"object": np.ones(3, np.float32)}
+        error_types = {
+            "source": SourceValidationError,
+            "conversion": ConversionValidationError,
+            "interaction": InteractionValidationError,
+        }
+        for stage, codes in KNOWN_REJECTION_CODES_BY_STAGE.items():
+            for code in sorted(codes):
+                with self.subTest(
+                    stage=stage, code=code
+                ), contextlib.ExitStack() as stack:
+                    error = error_types[stage](code, "reviewed exclusion")
+                    if stage == "source":
+                        stack.enter_context(
+                            patch.object(
+                                build_module,
+                                "load_raw_interaction",
+                                side_effect=error,
+                            )
+                        )
+                    else:
+                        stack.enter_context(
+                            patch.object(
+                                build_module,
+                                "load_raw_interaction",
+                                return_value=source,
+                            )
+                        )
+                    if stage == "conversion":
+                        stack.enter_context(
+                            patch.object(
+                                build_module,
+                                "convert_interaction",
+                                side_effect=error,
+                            )
+                        )
+                    elif stage == "interaction":
+                        stack.enter_context(
+                            patch.object(
+                                build_module,
+                                "convert_interaction",
+                                return_value=(source, G1_SKELETON, {}),
+                            )
+                        )
+                        stack.enter_context(
+                            patch.object(
+                                build_module,
+                                "derive_interaction_labels",
+                                side_effect=error,
+                            )
+                        )
+
+                    included, rejected, reports = (
+                        build_module.build_labeled_clips(
+                            [source], dimensions, SimpleNamespace()
+                        )
+                    )
+                    self.assertEqual(included, [])
+                    self.assertEqual(reports, [])
+                    self.assertEqual(
+                        [(item.stage, item.code) for item in rejected],
+                        [(stage, code)],
+                    )
+
+    def test_known_code_at_an_unreviewed_stage_propagates(self):
+        source = SimpleNamespace(sequence_id="a", object_id="object")
+        dimensions = {"object": np.ones(3, np.float32)}
+        error = SourceValidationError(
+            "fk_error", "conversion code at source stage"
+        )
+        with patch.object(
+            build_module, "load_raw_interaction", side_effect=error
+        ), self.assertRaisesRegex(SourceValidationError, "fk_error"):
+            build_module.build_labeled_clips(
+                [source], dimensions, SimpleNamespace()
+            )
+
+    def test_unknown_typed_rejection_code_propagates(self):
+        source = SimpleNamespace(sequence_id="a", object_id="object")
+        dimensions = {"object": np.ones(3, np.float32)}
+        error = SourceValidationError(
+            "unreviewed_code", "must abort publication"
+        )
+        with patch.object(
+            build_module, "load_raw_interaction", side_effect=error
+        ), self.assertRaisesRegex(SourceValidationError, "unreviewed_code"):
+            build_module.build_labeled_clips(
+                [source], dimensions, SimpleNamespace()
+            )
+
     def test_rejection_is_frozen_with_the_exact_field_order(self):
         self.assertTrue(
             build_module.Rejection.__dataclass_params__.frozen

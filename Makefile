@@ -12,6 +12,8 @@ ifeq ($(PLATFORM),PLATFORM_DESKTOP)
         RAYGUI_DIR ?= .deps/raygui
         INCLUDE_DIR = -I ./ -I $(RAYLIB_DIR)/src -I $(RAYGUI_DIR)/src
         LIBRARY_DIR =
+        LINUX_CONTROLLER_DEPS := $(RAYLIB_DIR)/src/libraylib.a \
+          $(RAYGUI_DIR)/src/raygui.h
     endif
 else
     RAYLIB_DIR = C:/raylib
@@ -58,10 +60,17 @@ HEADER = $(wildcard *.h)
 
 all: controller
 
+ifeq ($(strip $(LINUX_CONTROLLER_DEPS)),)
 bootstrap-raylib:
 	./scripts/bootstrap_raylib.sh
+else
+bootstrap-raylib: $(LINUX_CONTROLLER_DEPS)
 
-controller: $(SOURCE) $(HEADER)
+$(LINUX_CONTROLLER_DEPS) &: scripts/bootstrap_raylib.sh
+	./scripts/bootstrap_raylib.sh
+endif
+
+controller: $(SOURCE) $(HEADER) $(LINUX_CONTROLLER_DEPS)
 	$(CC) $(CONTROLLER_CXXFLAGS) -o $@$(EXT) $(SOURCE) $(CFLAGS) $(LIBS)
 
 clean:
@@ -72,8 +81,10 @@ CPP_TEST_FLAGS ?= -std=c++17 -Wall -Wextra -Werror -pedantic -I.
 CPP_TEST_DIR := build/tests
 TASK12_BUILD_DIR := build/task12
 override SAFE_INTERACTION_QUERY_PROBE := build/task12/interaction_query_probe_safe
-GRAIL_ROOT ?= /home/ubuntu/datasets/GRAIL/data/pickup_table
+GRAIL_PICKUP_ROOT ?= /home/ubuntu/datasets/GRAIL/data/pickup_table
+GRAIL_ROOT ?= $(GRAIL_PICKUP_ROOT)
 G1_XML ?= /home/ubuntu/projects/mjx-diffphysics/env/g1/assets/g1_29dof.xml
+G1_INTERACTION_DIR ?= resources/g1_interaction
 DEMO_INTERACTION_LIMIT ?= 5
 INTERACTION_DEMO_PACK ?= resources/g1_interaction
 PLAYABLE_EVIDENCE_DIR ?= playable-evidence
@@ -102,6 +113,7 @@ INTERACTION_RUNTIME_SOURCES += interaction_pose.cpp interaction_target.cpp
 .PHONY: test-python test-cpp test-interaction
 .PHONY: test-python-interaction-safe test-interaction-safe
 .PHONY: demo-interaction-pack gate-playable-interaction
+.PHONY: gate1-interaction
 
 $(CPP_TEST_DIR):
 	mkdir -p $@
@@ -170,9 +182,23 @@ test-interaction: test-python test-cpp
 test-python-interaction-safe: interaction_probe $(SAFE_INTERACTION_QUERY_PROBE)
 	MM_INTERACTION_QUERY_PROBE="$(abspath $(SAFE_INTERACTION_QUERY_PROBE))" \
 	  G1_XML="$(G1_XML)" \
+	  G1_INTERACTION_DIR="" \
 	  python -m unittest discover -s tests/python -t . -v
 
 test-interaction-safe: test-python-interaction-safe test-cpp
+
+gate1-interaction: test-interaction-safe interaction_probe
+	python -m resources.build_g1_interaction_database \
+	  --source-root "$(GRAIL_PICKUP_ROOT)" \
+	  --g1-xml "$(G1_XML)" \
+	  --output "$(G1_INTERACTION_DIR)" \
+	  --target-fps 25 \
+	  --allow-rejections
+	python -m resources.validate_g1_interaction_database \
+	  --input "$(G1_INTERACTION_DIR)"
+	G1_INTERACTION_DIR="$(G1_INTERACTION_DIR)" python -m unittest \
+	  tests.python.test_interaction_gate1 -v
+	./interaction_probe "$(G1_INTERACTION_DIR)" --json
 
 demo-interaction-pack:
 	python -m resources.build_g1_interaction_database \
