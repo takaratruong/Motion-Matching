@@ -1,16 +1,45 @@
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+#pragma GCC diagnostic ignored "-Wenum-compare"
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wunused-result"
+#endif
+
 #define RAYGUI_IMPLEMENTATION
 #include "raygui.h"
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
 #if defined(PLATFORM_WEB)
 #include <emscripten/emscripten.h>
 #endif
 
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+#endif
 #include "raylib.h"
 #include "raymath.h"
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
 #include "common.h"
 #include "vec.h"
 #include "quat.h"
 #include "spring.h"
+
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-result"
+#endif
 #include "array.h"
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
 #include "character.h"
 #include "scene_runtime.h"
 #include "route_runtime.h"
@@ -20,7 +49,17 @@
 #include "scene_switch.h"
 #include "motion_match_log.h"
 #include "cleanup_runtime.h"
+
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wsign-compare"
+#pragma GCC diagnostic ignored "-Wunused-result"
+#endif
 #include "nnet.h"
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
 #include "lmm.h"
 
 #include <errno.h>
@@ -34,7 +73,7 @@
 
 static inline Vector3 to_Vector3(vec3 v)
 {
-    return (Vector3){ v.x, v.y, v.z };
+    return Vector3{ v.x, v.y, v.z };
 }
 
 static bool g1_parse_terrain_weight(
@@ -534,6 +573,8 @@ void deform_character_mesh(
   const slice1d<quat> bone_anim_rotations,
   const slice1d<int> bone_parents)
 {
+    (void)bone_parents;
+
     linear_blend_skinning_positions(
         slice1d<vec3>(mesh.vertexCount, (vec3*)mesh.vertices),
         c.positions,
@@ -558,7 +599,7 @@ void deform_character_mesh(
 
 Mesh make_character_mesh(character& c)
 {
-    Mesh mesh = { 0 };
+    Mesh mesh{};
     
     mesh.vertexCount = c.positions.size;
     mesh.triangleCount = c.triangles.size / 3;
@@ -720,8 +761,8 @@ void orbit_camera_update(
     
     vec3 eye = target + quat_mul_vec3(rotation_altitude, position);
 
-    cam.target = (Vector3){ target.x, target.y, target.z };
-    cam.position = (Vector3){ eye.x, eye.y, eye.z };
+    cam.target = Vector3{ target.x, target.y, target.z };
+    cam.position = Vector3{ eye.x, eye.y, eye.z };
 }
 
 //--------------------------------------
@@ -1278,6 +1319,8 @@ void contact_reset(
     const vec3 input_contact_velocity,
     const bool input_contact_state)
 {
+    (void)input_contact_state;
+
     contact_state = false;
     contact_lock = false;
     contact_position = input_contact_position;
@@ -1973,10 +2016,10 @@ int main(void)
     
     // Camera
 
-    Camera3D camera = { 0 };
-    camera.position = (Vector3){ 0.0f, 10.0f, 10.0f };
-    camera.target = (Vector3){ 0.0f, 0.0f, 0.0f };
-    camera.up = (Vector3){ 0.0f, 1.0f, 0.0f };
+    Camera3D camera{};
+    camera.position = Vector3{ 0.0f, 10.0f, 10.0f };
+    camera.target = Vector3{ 0.0f, 0.0f, 0.0f };
+    camera.up = Vector3{ 0.0f, 1.0f, 0.0f };
     camera.fovy = 45.0f;
     camera.projection = CAMERA_PERSPECTIVE;
 
@@ -3329,12 +3372,12 @@ int main(void)
 
         DrawModel(
             terrain_model,
-            (Vector3){ 0.0f, 0.0f, 0.0f },
+            Vector3{ 0.0f, 0.0f, 0.0f },
             1.0f,
-            (Color){ 205, 199, 184, 255 });
+            Color{ 205, 199, 184, 255 });
         DrawModelWires(
             terrain_model,
-            (Vector3){ 0.0f, 0.0f, 0.0f },
+            Vector3{ 0.0f, 0.0f, 0.0f },
             1.0f,
             DARKGRAY);
 
@@ -3437,45 +3480,45 @@ int main(void)
             GuiDisable();
         }
 
-        GuiGroupBox((Rectangle){ 330, 20, 610, 170 }, "terrain scene / runtime");
+        GuiGroupBox(Rectangle{ 330, 20, 610, 170 }, "terrain scene / runtime");
         GuiLabel(
-            (Rectangle){ 350, 30, 310, 20 },
+            Rectangle{ 350, 30, 310, 20 },
             TextFormat(
                 "%s (%d/%d)",
                 active_scene.metadata.id.c_str(),
                 active_scene_index + 1,
                 static_cast<int>(catalog.ids.size())));
-        if (GuiButton((Rectangle){ 670, 30, 80, 20 }, "previous"))
+        if (GuiButton(Rectangle{ 670, 30, 80, 20 }, "previous"))
         {
             pending_scene_index =
                 (active_scene_index + scene_count - 1) % scene_count;
         }
-        if (GuiButton((Rectangle){ 760, 30, 80, 20 }, "next"))
+        if (GuiButton(Rectangle{ 760, 30, 80, 20 }, "next"))
         {
             pending_scene_index = (active_scene_index + 1) % scene_count;
         }
-        if (GuiButton((Rectangle){ 850, 30, 70, 20 }, "reset"))
+        if (GuiButton(Rectangle{ 850, 30, 70, 20 }, "reset"))
         {
             pending_reset = true;
         }
         if (runtime_snapshot_ready)
         {
             GuiLabel(
-                (Rectangle){ 350, 55, 570, 20 },
+                Rectangle{ 350, 55, 570, 20 },
                 TextFormat(
                     "weight requested %.3f effective %.3f | CSV %s",
                     requested_terrain_weight,
                     effective_terrain_weight,
                     logging_enabled ? "enabled" : "disabled"));
             GuiLabel(
-                (Rectangle){ 350, 75, 570, 20 },
+                Rectangle{ 350, 75, 570, 20 },
                 TextFormat(
                     "source %d %s terrain=%s",
                     runtime_snapshot.source_index,
                     runtime_snapshot.source_name,
                     runtime_snapshot.source_terrain));
             GuiLabel(
-                (Rectangle){ 350, 95, 570, 20 },
+                Rectangle{ 350, 95, 570, 20 },
                 TextFormat(
                     "support h=%.3f v=%.3f source=%s contacts=%d/%d",
                     runtime_snapshot.support_height,
@@ -3484,7 +3527,7 @@ int main(void)
                     static_cast<int>(runtime_snapshot.left_contact),
                     static_cast<int>(runtime_snapshot.right_contact)));
             GuiLabel(
-                (Rectangle){ 350, 115, 570, 20 },
+                Rectangle{ 350, 115, 570, 20 },
                 TextFormat(
                     "walkability class=%d blocked=%d reason=%s distance=%.3g",
                     runtime_snapshot.walkability_class,
@@ -3492,7 +3535,7 @@ int main(void)
                     runtime_snapshot.blocked_reason,
                     runtime_snapshot.blocked_distance));
             GuiLabel(
-                (Rectangle){ 350, 135, 570, 20 },
+                Rectangle{ 350, 135, 570, 20 },
                 TextFormat(
                     "generation=%d frame=%d resets=%d switch_failed=%d",
                     runtime_snapshot.scene_generation,
@@ -3500,7 +3543,7 @@ int main(void)
                     runtime_snapshot.scene_reset_count,
                     static_cast<int>(runtime_snapshot.scene_switch_failed)));
             GuiLabel(
-                (Rectangle){ 350, 155, 570, 20 },
+                Rectangle{ 350, 155, 570, 20 },
                 TextFormat(
                     "route waypoint=%d complete=%d target=%.3f models=%d",
                     runtime_snapshot.route_waypoint,
@@ -3511,52 +3554,52 @@ int main(void)
         
         float ui_sim_hei = 20;
         
-        GuiGroupBox((Rectangle){ 970, ui_sim_hei, 290, 250 }, "simulation object");
+        GuiGroupBox(Rectangle{ 970, ui_sim_hei, 290, 250 }, "simulation object");
 
         GuiSliderBar(
-            (Rectangle){ 1100, ui_sim_hei + 10, 120, 20 }, 
+            Rectangle{ 1100, ui_sim_hei + 10, 120, 20 },
             "velocity halflife", 
             TextFormat("%5.3f", simulation_velocity_halflife), 
             &simulation_velocity_halflife, 0.0f, 0.5f);
             
         GuiSliderBar(
-            (Rectangle){ 1100, ui_sim_hei + 40, 120, 20 }, 
+            Rectangle{ 1100, ui_sim_hei + 40, 120, 20 },
             "rotation halflife", 
             TextFormat("%5.3f", simulation_rotation_halflife), 
             &simulation_rotation_halflife, 0.0f, 0.5f);
             
         GuiSliderBar(
-            (Rectangle){ 1100, ui_sim_hei + 70, 120, 20 }, 
+            Rectangle{ 1100, ui_sim_hei + 70, 120, 20 },
             "run forward speed", 
             TextFormat("%5.3f", simulation_run_fwrd_speed), 
             &simulation_run_fwrd_speed, 0.0f, 10.0f);
         
         GuiSliderBar(
-            (Rectangle){ 1100, ui_sim_hei + 100, 120, 20 }, 
+            Rectangle{ 1100, ui_sim_hei + 100, 120, 20 },
             "run sideways speed", 
             TextFormat("%5.3f", simulation_run_side_speed), 
             &simulation_run_side_speed, 0.0f, 10.0f);
         
         GuiSliderBar(
-            (Rectangle){ 1100, ui_sim_hei + 130, 120, 20 }, 
+            Rectangle{ 1100, ui_sim_hei + 130, 120, 20 },
             "run backwards speed", 
             TextFormat("%5.3f", simulation_run_back_speed), 
             &simulation_run_back_speed, 0.0f, 10.0f);
         
         GuiSliderBar(
-            (Rectangle){ 1100, ui_sim_hei + 160, 120, 20 }, 
+            Rectangle{ 1100, ui_sim_hei + 160, 120, 20 },
             "walk forward speed", 
             TextFormat("%5.3f", simulation_walk_fwrd_speed), 
             &simulation_walk_fwrd_speed, 0.0f, 5.0f);
         
         GuiSliderBar(
-            (Rectangle){ 1100, ui_sim_hei + 190, 120, 20 }, 
+            Rectangle{ 1100, ui_sim_hei + 190, 120, 20 },
             "walk sideways speed", 
             TextFormat("%5.3f", simulation_walk_side_speed), 
             &simulation_walk_side_speed, 0.0f, 5.0f);
         
         GuiSliderBar(
-            (Rectangle){ 1100, ui_sim_hei + 220, 120, 20 }, 
+            Rectangle{ 1100, ui_sim_hei + 220, 120, 20 },
             "walk backwards speed", 
             TextFormat("%5.3f", simulation_walk_back_speed), 
             &simulation_walk_back_speed, 0.0f, 5.0f);
@@ -3565,10 +3608,10 @@ int main(void)
         
         float ui_inert_hei = 280;
         
-        GuiGroupBox((Rectangle){ 970, ui_inert_hei, 290, 40 }, "inertiaization blending");
+        GuiGroupBox(Rectangle{ 970, ui_inert_hei, 290, 40 }, "inertiaization blending");
         
         GuiSliderBar(
-            (Rectangle){ 1100, ui_inert_hei + 10, 120, 20 }, 
+            Rectangle{ 1100, ui_inert_hei + 10, 120, 20 },
             "halflife", 
             TextFormat("%5.3f", inertialize_blending_halflife), 
             &inertialize_blending_halflife, 0.0f, 0.3f);
@@ -3577,68 +3620,68 @@ int main(void)
         
         float ui_lmm_hei = 330;
         
-        GuiGroupBox((Rectangle){ 970, ui_lmm_hei, 290, 40 }, "learned motion matching");
+        GuiGroupBox(Rectangle{ 970, ui_lmm_hei, 290, 40 }, "learned motion matching");
 
         GuiLabel(
-            (Rectangle){ 990, ui_lmm_hei + 10, 250, 20 },
+            Rectangle{ 990, ui_lmm_hei + 10, 250, 20 },
             "disabled: G1 network integration later");
         
         //---------
         
         float ui_ctrl_hei = 380;
         
-        GuiGroupBox((Rectangle){ 970, ui_ctrl_hei, 290, 160 }, "controls");
+        GuiGroupBox(Rectangle{ 970, ui_ctrl_hei, 290, 160 }, "controls");
 
-        GuiLabel((Rectangle){ 990, ui_ctrl_hei +  10, 250, 20 }, "WASD / left stick - move");
-        GuiLabel((Rectangle){ 990, ui_ctrl_hei +  35, 250, 20 }, "Arrows / right stick - camera");
-        GuiLabel((Rectangle){ 990, ui_ctrl_hei +  60, 250, 20 }, "Left trigger - strafe");
-        GuiLabel((Rectangle){ 990, ui_ctrl_hei +  85, 250, 20 }, "Shoulders - zoom");
-        GuiLabel((Rectangle){ 990, ui_ctrl_hei + 110, 250, 20 }, "A button - walk");
+        GuiLabel(Rectangle{ 990, ui_ctrl_hei +  10, 250, 20 }, "WASD / left stick - move");
+        GuiLabel(Rectangle{ 990, ui_ctrl_hei +  35, 250, 20 }, "Arrows / right stick - camera");
+        GuiLabel(Rectangle{ 990, ui_ctrl_hei +  60, 250, 20 }, "Left trigger - strafe");
+        GuiLabel(Rectangle{ 990, ui_ctrl_hei +  85, 250, 20 }, "Shoulders - zoom");
+        GuiLabel(Rectangle{ 990, ui_ctrl_hei + 110, 250, 20 }, "A button - walk");
         
 
         
         //---------
         
-        GuiGroupBox((Rectangle){ 20, 20, 290, 280 }, "feature weights / terrain diagnostics");
+        GuiGroupBox(Rectangle{ 20, 20, 290, 280 }, "feature weights / terrain diagnostics");
         
         GuiSliderBar(
-            (Rectangle){ 150, 30, 120, 20 }, 
+            Rectangle{ 150, 30, 120, 20 },
             "foot position", 
             TextFormat("%5.3f", feature_weight_foot_position), 
             &feature_weight_foot_position, 0.001f, 3.0f);
             
         GuiSliderBar(
-            (Rectangle){ 150, 60, 120, 20 }, 
+            Rectangle{ 150, 60, 120, 20 },
             "foot velocity", 
             TextFormat("%5.3f", feature_weight_foot_velocity), 
             &feature_weight_foot_velocity, 0.001f, 3.0f);
         
         GuiSliderBar(
-            (Rectangle){ 150, 90, 120, 20 }, 
+            Rectangle{ 150, 90, 120, 20 },
             "hip velocity", 
             TextFormat("%5.3f", feature_weight_hip_velocity), 
             &feature_weight_hip_velocity, 0.001f, 3.0f);
         
         GuiSliderBar(
-            (Rectangle){ 150, 120, 120, 20 }, 
+            Rectangle{ 150, 120, 120, 20 },
             "trajectory positions", 
             TextFormat("%5.3f", feature_weight_trajectory_positions), 
             &feature_weight_trajectory_positions, 0.001f, 3.0f);
         
         GuiSliderBar(
-            (Rectangle){ 150, 150, 120, 20 }, 
+            Rectangle{ 150, 150, 120, 20 },
             "trajectory directions", 
             TextFormat("%5.3f", feature_weight_trajectory_directions), 
             &feature_weight_trajectory_directions, 0.001f, 3.0f);
 
         GuiSliderBar(
-            (Rectangle){ 150, 180, 120, 20 },
+            Rectangle{ 150, 180, 120, 20 },
             "terrain",
             TextFormat("%5.3f", requested_terrain_weight),
             &requested_terrain_weight, 0.0f, 10.0f);
 
         GuiLabel(
-            (Rectangle){ 40, 205, 250, 20 },
+            Rectangle{ 40, 205, 250, 20 },
             requested_terrain_weight == effective_terrain_weight
                 ? TextFormat(
                     "effective terrain %.3f", effective_terrain_weight)
@@ -3647,7 +3690,7 @@ int main(void)
                     requested_terrain_weight,
                     effective_terrain_weight));
 
-        if (GuiButton((Rectangle){ 150, 230, 120, 20 }, "apply / rebuild"))
+        if (GuiButton(Rectangle{ 150, 230, 120, 20 }, "apply / rebuild"))
         {
             database_build_matching_features(
                 db,
@@ -3674,13 +3717,13 @@ int main(void)
         }
 
         GuiLabel(
-            (Rectangle){ 40, 255, 250, 20 },
+            Rectangle{ 40, 255, 250, 20 },
             TextFormat(
                 "query frame %d  range %d",
                 query_database_frame,
                 query_range));
         GuiLabel(
-            (Rectangle){ 40, 275, 250, 20 },
+            Rectangle{ 40, 275, 250, 20 },
             TextFormat(
                 "terrain %.2f %.2f %.2f %.2f",
                 terrain_query_snapshot.values[0],
@@ -3692,15 +3735,15 @@ int main(void)
         
         float ui_sync_hei = 310;
         
-        GuiGroupBox((Rectangle){ 20, ui_sync_hei, 290, 70 }, "synchronization");
+        GuiGroupBox(Rectangle{ 20, ui_sync_hei, 290, 70 }, "synchronization");
 
         GuiCheckBox(
-            (Rectangle){ 50, ui_sync_hei + 10, 20, 20 }, 
+            Rectangle{ 50, ui_sync_hei + 10, 20, 20 },
             "enabled",
             &synchronization_enabled);
 
         GuiSliderBar(
-            (Rectangle){ 150, ui_sync_hei + 40, 120, 20 }, 
+            Rectangle{ 150, ui_sync_hei + 40, 120, 20 },
             "data-driven amount", 
             TextFormat("%5.3f", synchronization_data_factor), 
             &synchronization_data_factor, 0.0f, 1.0f);
@@ -3709,26 +3752,26 @@ int main(void)
         
         float ui_adj_hei = 390;
         
-        GuiGroupBox((Rectangle){ 20, ui_adj_hei, 290, 130 }, "adjustment");
+        GuiGroupBox(Rectangle{ 20, ui_adj_hei, 290, 130 }, "adjustment");
         
         GuiCheckBox(
-            (Rectangle){ 50, ui_adj_hei + 10, 20, 20 }, 
+            Rectangle{ 50, ui_adj_hei + 10, 20, 20 },
             "enabled",
             &adjustment_enabled);    
         
         GuiCheckBox(
-            (Rectangle){ 50, ui_adj_hei + 40, 20, 20 }, 
+            Rectangle{ 50, ui_adj_hei + 40, 20, 20 },
             "clamp to max velocity",
             &adjustment_by_velocity_enabled);    
         
         GuiSliderBar(
-            (Rectangle){ 150, ui_adj_hei + 70, 120, 20 }, 
+            Rectangle{ 150, ui_adj_hei + 70, 120, 20 },
             "position halflife", 
             TextFormat("%5.3f", adjustment_position_halflife), 
             &adjustment_position_halflife, 0.0f, 0.5f);
         
         GuiSliderBar(
-            (Rectangle){ 150, ui_adj_hei + 100, 120, 20 }, 
+            Rectangle{ 150, ui_adj_hei + 100, 120, 20 },
             "rotation halflife", 
             TextFormat("%5.3f", adjustment_rotation_halflife), 
             &adjustment_rotation_halflife, 0.0f, 0.5f);
@@ -3737,21 +3780,21 @@ int main(void)
         
         float ui_clamp_hei = 530;
         
-        GuiGroupBox((Rectangle){ 20, ui_clamp_hei, 290, 100 }, "clamping");
+        GuiGroupBox(Rectangle{ 20, ui_clamp_hei, 290, 100 }, "clamping");
         
         GuiCheckBox(
-            (Rectangle){ 50, ui_clamp_hei + 10, 20, 20 }, 
+            Rectangle{ 50, ui_clamp_hei + 10, 20, 20 },
             "enabled",
             &clamping_enabled);      
         
         GuiSliderBar(
-            (Rectangle){ 150, ui_clamp_hei + 40, 120, 20 }, 
+            Rectangle{ 150, ui_clamp_hei + 40, 120, 20 },
             "distance", 
             TextFormat("%5.3f", clamping_max_distance), 
             &clamping_max_distance, 0.0f, 0.5f);
         
         GuiSliderBar(
-            (Rectangle){ 150, ui_clamp_hei + 70, 120, 20 }, 
+            Rectangle{ 150, ui_clamp_hei + 70, 120, 20 },
             "angle", 
             TextFormat("%5.3f", clamping_max_angle), 
             &clamping_max_angle, 0.0f, PIf);
@@ -3760,9 +3803,9 @@ int main(void)
         
         float ui_ik_hei = 640;
 
-        GuiGroupBox((Rectangle){ 20, ui_ik_hei, 290, 40 }, "inverse kinematics");
+        GuiGroupBox(Rectangle{ 20, ui_ik_hei, 290, 40 }, "inverse kinematics");
         GuiLabel(
-            (Rectangle){ 40, ui_ik_hei + 10, 250, 20 },
+            Rectangle{ 40, ui_ik_hei + 10, 250, 20 },
             "world-Y support enabled; IK disabled");
         
         //---------
