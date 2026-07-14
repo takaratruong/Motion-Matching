@@ -1388,6 +1388,8 @@ git commit -m "feat: align G1 feet to terrain normals"
 ### Task 5: Add Swept Swing Clearance and Toe/Foot/Shin/Leg Diagnostics
 
 **Files:**
+- Create: `g1_surface_query.h`
+- Modify: `g1_ik.h`
 - Create: `g1_clearance.h`
 - Create: `g1_clearance.cpp`
 - Create: `tests/cpp/test_g1_clearance.cpp`
@@ -1395,6 +1397,11 @@ git commit -m "feat: align G1 feet to terrain normals"
 - Later Task 6 owns the specified integration tests in: `tests/cpp/test_g1_ik.cpp`
 
 **Interfaces:**
+- Moves exactly the six existing surface-query definitions named below from
+  `g1_ik.h` into one lightweight `g1_surface_query.h` definition source,
+  without changing code, math, status, layout, signature, or API.
+- `g1_ik.h` includes `g1_surface_query.h` for existing callers; the strict
+  kernel includes it directly. `g1_clearance.h` remains unchanged by this move.
 - Produces: non-inline strict-FP `g1_point_clearance`, `g1_foot_clearance`, and conservative deterministic `g1_capsule_clearance` against the continuous fixed-diagonal G1HF/v2 surface.
 - Produces: `G1LegClearance` and `G1PoseClearance` with signed Hips, knee, ankle, toe, four-point sole, thigh-capsule, and shin-capsule clearances against the exact G1HF/v2 surface.
 - Produces: `G1SwingHistory`, checked reset/commit, strict `g1_apply_swing_lift_y`, actual-center `g1_swing_clearance_validate`, and the immutable staged-candidate selection contract consumed by Task 6.
@@ -1411,6 +1418,9 @@ and verify unchanged outputs for every non-`Ok` result. In particular:
 
 - lock exact continuous fixed-diagonal point, sphere, capsule, foot, swept-foot,
   and pose certificates; no test may accept a spatial sample count as proof;
+- lock valid, outside-domain, and invalid-field surface-query fixtures across
+  strict and fast callers, comparing exact status plus raw height/normal bits
+  or unchanged seeded output bits byte-for-byte;
 - call `g1_swing_clearance_validate` with named prior and **actual current**
   four-sphere center bits and compare the target-subtracted capsule result to the
   high-precision endpoint-bit oracle;
@@ -1464,6 +1474,40 @@ this RED pass with inline sampling helpers.
 
 Create `g1_clearance.h` and non-inline `g1_clearance.cpp` exactly from Sections
 3--8 and reviewed design Tasks 1--6. This is the only active geometry path:
+
+Before any geometry implementation, complete the reviewed ownership-only
+prerequisite:
+
+- create `g1_surface_query.h` and **move, never copy**, exactly these six
+  existing definitions out of `g1_ik.h`: `G1SurfaceQueryStatus`,
+  `G1SurfaceSample`, `g1_ik_float_is_runtime_value`,
+  `g1_ik_vec3_is_runtime_value`, `g1_ik_surface_normal_is_valid`, and
+  `g1_surface_query_v2`;
+- preserve every name, enum value, struct layout, signature, function body,
+  status mapping, and arithmetic expression exactly;
+- make `g1_surface_query.h` their sole definition source. It includes only
+  `terrain_runtime.h` plus required standard math declarations and does not
+  include `g1_ik.h`, `g1_skeleton.h`, or `database.h`;
+- have `g1_ik.h` include the lightweight header so existing callers continue
+  through the same public include. Have strict `g1_clearance.cpp` include it
+  directly after its implementation-TU include, without including `g1_ik.h`;
+  `g1_clearance.h` remains unchanged;
+- do not move `g1_ik_dt_is_exact_25_hz` or
+  `g1_foot_runtime_config_validate`. Their exact-dt/config ownership is
+  explicitly deferred to later certified Task 5/Task 6 integration work.
+
+This prerequisite changes no code, math, status, layout, or API. Run the
+existing IK and Task 1 clearance tests and the exact one-owner,
+include/dependency, `nm`, and strict-versus-fast query-parity guards in Step 6,
+then commit it separately before adding geometry:
+
+```bash
+git add g1_surface_query.h g1_ik.h g1_clearance.cpp \
+  tests/cpp/test_g1_clearance.cpp
+git commit -m "refactor: isolate G1 surface query"
+```
+
+Then implement the certified geometry:
 
 - public point, sphere, capsule, foot, swept-foot, leg, and pose functions
   return `G1ClearanceStatus` and assign result/history outputs only on their
@@ -1665,6 +1709,62 @@ fi
 rg -n "fast math" \
   /tmp/g1-ik-clearance/native/forbidden-fast-kernel.err
 
+python - <<'PY'
+import re
+from pathlib import Path
+
+source_paths = sorted(
+    path
+    for suffix in ("*.h", "*.hpp", "*.c", "*.cc", "*.cpp", "*.cxx")
+    for path in Path(".").rglob(suffix)
+    if ".git" not in path.parts
+)
+sources = {
+    path.as_posix(): path.read_text(encoding="utf-8")
+    for path in source_paths
+}
+definitions = {
+    "G1SurfaceQueryStatus": r"\benum\s+G1SurfaceQueryStatus\s*\{",
+    "G1SurfaceSample": r"\bstruct\s+G1SurfaceSample\s*\{",
+    "g1_ik_float_is_runtime_value":
+        r"\bstatic\s+inline\s+bool\s+g1_ik_float_is_runtime_value\s*\(",
+    "g1_ik_vec3_is_runtime_value":
+        r"\bstatic\s+inline\s+bool\s+g1_ik_vec3_is_runtime_value\s*\(",
+    "g1_ik_surface_normal_is_valid":
+        r"\bstatic\s+inline\s+bool\s+g1_ik_surface_normal_is_valid\s*\(",
+    "g1_surface_query_v2":
+        r"\bstatic\s+inline\s+G1SurfaceQueryStatus\s+g1_surface_query_v2\s*\(",
+}
+for symbol, pattern in definitions.items():
+    owners = [
+        (path, len(re.findall(pattern, text)))
+        for path, text in sources.items()
+        if re.search(pattern, text)
+    ]
+    assert owners == [("g1_surface_query.h", 1)], (symbol, owners)
+print("VALID one G1 surface-query definition source")
+PY
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic \
+  -fno-fast-math -ffp-contract=off -frounding-math -I. \
+  -H -c g1_clearance.cpp \
+  -o /tmp/g1-ik-clearance/native/g1-clearance-include-guard.o \
+  2>/tmp/g1-ik-clearance/native/g1-clearance-include-guard.txt
+rg 'g1_surface_query\.h' \
+  /tmp/g1-ik-clearance/native/g1-clearance-include-guard.txt
+! rg '(g1_ik|g1_skeleton|database)\.h' \
+  /tmp/g1-ik-clearance/native/g1-clearance-include-guard.txt
+nm -C -g --defined-only \
+  /tmp/g1-ik-clearance/native/g1-clearance-include-guard.o \
+  > /tmp/g1-ik-clearance/native/g1-clearance-symbols.txt
+! rg 'database_|forward_kinematics|motion_matching_search|compute_(bone|trajectory)|normalize_feature|denormalize_features' \
+  /tmp/g1-ik-clearance/native/g1-clearance-symbols.txt
+/tmp/g1-ik-clearance/native/test-clearance-strict --query-parity \
+  > /tmp/g1-ik-clearance/native/g1-surface-query-strict.txt
+/tmp/g1-ik-clearance/native/test-clearance-release --query-parity \
+  > /tmp/g1-ik-clearance/native/g1-surface-query-fast.txt
+cmp /tmp/g1-ik-clearance/native/g1-surface-query-strict.txt \
+  /tmp/g1-ik-clearance/native/g1-surface-query-fast.txt
+
 ! rg -n 'ceil\(|radial_steps|segment_steps|half.*cell.*sample' \
   g1_clearance.cpp g1_clearance.h
 ! rg -n 'ordered.*lift|sphere.*\+.*lift|required_lift_m' \
@@ -1672,10 +1772,15 @@ rg -n "fast math" \
 git diff --check
 ```
 
-Expected: strict, release-caller, and sanitizer executables exit zero; the fast
-kernel compile fails at its guard; identical endpoint-bit parity records match
-byte-for-byte; all environment mutations are restored; and no sampled or
-predicted-lift production path remains.
+The query-parity mode emits, for each locked valid/outside/invalid fixture, the
+exact status plus raw height/normal bits or unchanged seeded output bits.
+Expected: all six query definitions have exactly one source owner; the strict
+kernel includes `g1_surface_query.h` but not `g1_ik.h`, `g1_skeleton.h`, or
+`database.h`, and exports no database/FK/search/feature symbols; strict and fast
+query records match byte-for-byte; strict, release-caller, and sanitizer
+executables exit zero; the fast kernel compile fails at its guard; identical
+endpoint-bit parity records match byte-for-byte; all environment mutations are
+restored; and no sampled or predicted-lift production path remains.
 
 After Task 6 creates the runtime, compile `tests/cpp/test_g1_ik.cpp` with
 `-DG1_IK_ENABLE_TEST_SEAMS` once as a strict caller and once as a fast-math
@@ -1687,6 +1792,11 @@ without the macro that names the seam must fail, and production `nm -C` output
 must not contain the seam symbol.
 
 - [ ] **Step 7: Commit certified clearance and physical diagnostics**
+
+Task 5 owns two ordered commits. The move-only query-ownership commit from
+Step 3 already owns `g1_surface_query.h`, `g1_ik.h`, and its initial parity-test
+changes and must not be amended, folded, or repeated here. Stage only the
+subsequent certified geometry and diagnostic changes for the second commit:
 
 ```bash
 git add g1_clearance.h g1_clearance.cpp tests/cpp/test_g1_clearance.cpp
