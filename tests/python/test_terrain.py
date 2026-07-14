@@ -18,7 +18,11 @@ from resources.g1_terrain_builder.kinematics import (
     convert_source_clip,
 )
 from resources.g1_terrain_builder.sources import load_grail
-from resources.g1_terrain_builder.scenes import GRAIL_DEFAULT_BASE
+from resources.g1_terrain_builder.scenes import (
+    GRAIL_DEFAULT_BASE,
+    build_scene,
+    grail_scene_definition,
+)
 from resources.g1_terrain_builder.terrain import (
     FlatTerrain,
     GrailTerrain,
@@ -1176,7 +1180,6 @@ class TerrainTests(unittest.TestCase):
         first = terrain.xz_bounds()
         second = terrain.xz_bounds()
         footprint = terrain.footprint()
-        contract, _ = builder._heightfield_contract(terrain)
 
         self.assertEqual(first, second)
         self.assertTrue(np.all(np.isfinite(first)))
@@ -1187,7 +1190,8 @@ class TerrainTests(unittest.TestCase):
         self.assertEqual(footprint["x"], (-0.5, 0.5))
         self.assertEqual(footprint["z"], (3.0, 4.0))
         self.assertEqual(footprint["height"], 0.3)
-        self.assertEqual(contract, (-3.0, 3.0, -2.0, 6.0))
+        self.assertAlmostEqual(terrain.height(0.0, 0.5), 0.1)
+        self.assertAlmostEqual(terrain.height(0.0, 3.5), 0.3)
 
     def test_grail_terrain_copies_and_freezes_caller_mesh(self):
         vertices = np.array([
@@ -1325,62 +1329,67 @@ class TerrainTests(unittest.TestCase):
         self.assertEqual(actual_faces, expected_faces)
         self.assertAlmostEqual(actual_vertices[:, 1].max(), footprint["height"], places=6)
 
-    def test_runtime_heightfield_covers_obj_and_motion_lookahead(self):
-        base = builder.DEFAULTS["runtime_terrain"]
-        terrain = GrailTerrain.from_base(base)
-        requested, metadata = builder._heightfield_contract(terrain)
-        domain = (
-            metadata["origin_x"],
-            metadata["origin_x"]
-            + (metadata["nx"] - 1) * metadata["cell_size"],
-            metadata["origin_z"],
-            metadata["origin_z"]
-            + (metadata["nz"] - 1) * metadata["cell_size"],
-        )
-
-        with tempfile.TemporaryDirectory() as tmp:
-            obj_path = os.path.join(tmp, "terrain.obj")
-            terrain.export_obj(obj_path)
-            with open(obj_path, encoding="utf-8") as stream:
-                vertices = np.array([
-                    [float(value) for value in line.split()[1:]]
-                    for line in stream
-                    if line.startswith("v ")
-                ])
-
-        target = (
-            vertices[:, 0].min() - builder.HEIGHTFIELD_BORDER,
-            vertices[:, 0].max() + builder.HEIGHTFIELD_BORDER,
-            vertices[:, 2].min() - builder.HEIGHTFIELD_BORDER,
-            vertices[:, 2].max() + builder.HEIGHTFIELD_BORDER,
-        )
-        self.assertAlmostEqual(requested[0], target[0], places=7)
-        self.assertAlmostEqual(requested[1], target[1], places=7)
-        self.assertAlmostEqual(requested[2], target[2], places=7)
-        self.assertAlmostEqual(requested[3], target[3], places=7)
-        obj_rounding = 1e-7
-        self.assertLessEqual(domain[0], target[0] + obj_rounding)
-        self.assertGreaterEqual(domain[1], target[1] - obj_rounding)
-        self.assertLessEqual(domain[2], target[2] + obj_rounding)
-        self.assertGreaterEqual(domain[3], target[3] - obj_rounding)
-        self.assertLess(
-            domain[1] - target[1], metadata["cell_size"] + obj_rounding)
-        self.assertLess(
-            domain[3] - target[3], metadata["cell_size"] + obj_rounding)
-
+    def test_selected_grail_scene_heightfield_covers_mesh_and_motion_lookahead(
+            self):
+        base = GRAIL_DEFAULT_BASE
         source = load_grail(os.path.join(GRAIL_ROBOT_DIR, base + ".pkl"))
         kinematics = G1Kinematics(builder.DEFAULTS["g1_xml"])
-        clip, _, _ = convert_source_clip(source, kinematics, builder.OUTPUT_FPS)
+        clip, _, _ = convert_source_clip(
+            source, kinematics, builder.OUTPUT_FPS)
+        definition = grail_scene_definition(
+            "grail-curb-default", base, clip, None)
+        built = build_scene(definition)
+        metadata = built.metadata
+
+        magic, version, nx, nz, origin_x, origin_z, cell_size, exterior = \
+            struct.unpack_from("<4sIII4f", built.terrain_bin)
+        self.assertEqual((magic, version), (b"G1HF", 2))
+        self.assertEqual(len(built.terrain_bin), 32 + nx * nz * 4)
+        heights = np.frombuffer(
+            built.terrain_bin, "<f4", nx * nz, 32).reshape(nz, nx)
+        grid = HeightGrid(
+            heights, origin_x, origin_z, cell_size, exterior)
+        for key, value in grid.metadata().items():
+            self.assertEqual(metadata["heightfield"][key], value)
+
+        domain = (
+            grid.origin_x, grid.max_x, grid.origin_z, grid.max_z,
+        )
+        bounds = metadata["bounds"]
+        lookahead = (
+            bounds["lookahead_min_xz"][0],
+            bounds["lookahead_max_xz"][0],
+            bounds["lookahead_min_xz"][1],
+            bounds["lookahead_max_xz"][1],
+        )
+        self.assertLessEqual(domain[0], lookahead[0])
+        self.assertGreaterEqual(domain[1], lookahead[1])
+        self.assertLessEqual(domain[2], lookahead[2])
+        self.assertGreaterEqual(domain[3], lookahead[3])
+
+        mesh_bounds = definition.surface.xz_bounds()
+        self.assertLessEqual(domain[0], mesh_bounds[0])
+        self.assertGreaterEqual(domain[1], mesh_bounds[1])
+        self.assertLessEqual(domain[2], mesh_bounds[2])
+        self.assertGreaterEqual(domain[3], mesh_bounds[3])
+
         roots = clip.positions[:, 0][:, [0, 2]].astype(np.float64)
         headings = holden_quat.mul_vec(
             clip.rotations[:, 0].astype(np.float64),
             np.array([0.0, 0.0, 1.0]),
         )[:, [0, 2]]
-        runtime_queries = np.concatenate((roots, roots + headings), axis=0)
-        self.assertTrue(np.all(runtime_queries[:, 0] >= domain[0]))
-        self.assertTrue(np.all(runtime_queries[:, 0] <= domain[1]))
-        self.assertTrue(np.all(runtime_queries[:, 1] >= domain[2]))
-        self.assertTrue(np.all(runtime_queries[:, 1] <= domain[3]))
+        maximum_lookahead = max(metadata["terrain_feature_distances_m"])
+        runtime_queries = np.concatenate(
+            (roots, roots + maximum_lookahead * headings), axis=0)
+        route_points = np.concatenate([
+            np.asarray(route["waypoints_xz"], np.float64)
+            for route in metadata["routes"]
+        ])
+        covered_queries = np.concatenate((runtime_queries, route_points))
+        self.assertTrue(np.all(covered_queries[:, 0] >= lookahead[0]))
+        self.assertTrue(np.all(covered_queries[:, 0] <= lookahead[1]))
+        self.assertTrue(np.all(covered_queries[:, 1] >= lookahead[2]))
+        self.assertTrue(np.all(covered_queries[:, 1] <= lookahead[3]))
 
 
 if __name__ == "__main__":

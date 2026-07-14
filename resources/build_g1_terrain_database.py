@@ -4,6 +4,7 @@
 import argparse
 import glob
 import os
+import subprocess
 import sys
 
 import numpy as np
@@ -27,13 +28,20 @@ from resources.g1_terrain_builder.kinematics import (
     G1Kinematics,
     convert_source_clip,
 )
+from resources.g1_terrain_builder.scenes import (
+    REQUIRED_SCENE_IDS,
+    all_scene_definitions,
+    build_scene_pack,
+    select_grail_scene_bases,
+)
 from resources.g1_terrain_builder.sources import load_grail, load_takara
 from resources.g1_terrain_builder.terrain import (
     FlatTerrain,
     GrailTerrain,
     build_facing_centerline,
-    export_heightfield,
     sample_terrain_features,
+    surface_semantics,
+    surface_semantics_signature,
 )
 
 
@@ -43,14 +51,11 @@ DEFAULTS = {
     "g1_xml": "/home/ubuntu/projects/mjx-diffphysics/env/g1/assets/g1_29dof.xml",
     "takara": "/home/ubuntu/Downloads/takara_walk_50hz.npz_v0/motion.npz",
     "remap": "/home/ubuntu/projects/g1_mm/isaac_to_mj.npy",
-    "runtime_terrain": "terrain_curbs__curb_000__000",
 }
 
-SCHEMA = "g1-terrain-artifacts/v1"
+SCHEMA = "g1-terrain-artifacts/v2"
 OUTPUT_FPS = 25.0
 TERRAIN_DISTANCES = [0.25, 0.50, 0.75, 1.00]
-HEIGHTFIELD_CELL_SIZE = 0.02
-HEIGHTFIELD_BORDER = 2.0
 
 
 def finalize_clip(source, terrain, kin):
@@ -92,27 +97,73 @@ def _require_file(path: str, description: str) -> None:
         raise FileNotFoundError(f"missing {description}: {path}")
 
 
-def _heightfield_contract(terrain: GrailTerrain) -> tuple[tuple[float, ...], dict]:
-    xmin, xmax, zmin, zmax = terrain.xz_bounds()
-    bounds = (
-        float(xmin) - HEIGHTFIELD_BORDER,
-        float(xmax) + HEIGHTFIELD_BORDER,
-        float(zmin) - HEIGHTFIELD_BORDER,
-        float(zmax) + HEIGHTFIELD_BORDER,
+def _require_loaded_grail_source(source, base):
+    if source.name != base or source.terrain_id != base:
+        raise ValueError(
+            f"{base}: loaded source name/terrain identity changed")
+
+
+def _run_candidate_validator(staging, args):
+    validator = os.path.join(
+        REPOSITORY_ROOT, "resources", "validate_g1_terrain_database.py")
+    argv = [sys.executable, validator, staging]
+    if args.grail_limit is None:
+        argv.extend([
+            "--full-source-validation",
+            "--grail-glob", args.grail_glob,
+            "--g1-xml", args.g1_xml,
+            "--takara", args.takara,
+            "--remap", args.remap,
+        ])
+    try:
+        subprocess.run(argv, check=True)
+    except subprocess.CalledProcessError as error:
+        raise ValueError(
+            "candidate validator failed with exit status "
+            f"{error.returncode}") from error
+
+
+def _candidate_validation_policy(args):
+    def validate_candidate(staging):
+        return _run_candidate_validator(staging, args)
+
+    return validate_candidate
+
+
+def _inspect_grail_corpus(args):
+    all_paths = tuple(sorted(glob.glob(args.grail_glob)))
+    if not all_paths:
+        raise FileNotFoundError(
+            f"GRAIL glob matched no clips: {args.grail_glob}")
+    for path in all_paths:
+        _require_file(path, "GRAIL clip")
+
+    path_by_base = {}
+    for path in all_paths:
+        base = os.path.splitext(os.path.basename(path))[0]
+        if not base or base in path_by_base:
+            raise ValueError("duplicate GRAIL terrain base name")
+        path_by_base[base] = path
+
+    measured_max_heights = {}
+    for base in path_by_base:
+        terrain = GrailTerrain.from_base(base)
+        measured_max_heights[base] = float(terrain.footprint()["height"])
+        del terrain
+    selected_scene_bases = select_grail_scene_bases(measured_max_heights)
+    expected_scene_ids = tuple(REQUIRED_SCENE_IDS[:4])
+    if tuple(selected_scene_bases) != expected_scene_ids \
+            or len(set(selected_scene_bases.values())) != 4 \
+            or not set(selected_scene_bases.values()) <= set(path_by_base):
+        raise ValueError("GRAIL scene selection must contain four exact bases")
+
+    motion_paths = all_paths
+    if args.grail_limit is not None:
+        motion_paths = all_paths[:args.grail_limit]
+    return (
+        all_paths, motion_paths, path_by_base,
+        measured_max_heights, selected_scene_bases,
     )
-    if not np.all(np.isfinite(bounds)):
-        raise ValueError("runtime terrain XZ bounds must be finite")
-    nx = int(np.ceil((bounds[1] - bounds[0]) / HEIGHTFIELD_CELL_SIZE)) + 1
-    nz = int(np.ceil((bounds[3] - bounds[2]) / HEIGHTFIELD_CELL_SIZE)) + 1
-    metadata = {
-        "nx": nx,
-        "nz": nz,
-        "origin_x": bounds[0],
-        "origin_z": bounds[2],
-        "cell_size": HEIGHTFIELD_CELL_SIZE,
-        "exterior_height": 0.0,
-    }
-    return bounds, metadata
 
 
 def _source_manifest_entry(source, clip, range_start: int) -> dict:
@@ -129,54 +180,63 @@ def _source_manifest_entry(source, clip, range_start: int) -> dict:
     }
 
 
-def build_artifacts(args: argparse.Namespace) -> dict:
+def _assemble_candidate(args):
     if args.grail_limit is not None and args.grail_limit < 0:
         raise ValueError("--grail-limit must be non-negative")
     _require_file(args.g1_xml, "G1 XML")
     _require_file(args.takara, "Takara motion")
     _require_file(args.remap, "Takara joint remap")
+    (
+        _all_grail_paths, grail_paths, path_by_base,
+        measured_max_heights, selected_scene_bases,
+    ) = _inspect_grail_corpus(args)
+    if "takara_walk_50hz" in path_by_base:
+        raise ValueError("duplicate source names: ['takara_walk_50hz']")
 
-    grail_paths = sorted(glob.glob(args.grail_glob))
-    if args.grail_limit != 0 and not grail_paths:
-        raise FileNotFoundError(
-            f"GRAIL glob matched no clips: {args.grail_glob}")
-    if args.grail_limit is not None:
-        grail_paths = grail_paths[:args.grail_limit]
-    for path in grail_paths:
-        _require_file(path, "GRAIL clip")
-
-    kin = G1Kinematics(args.g1_xml)
-    sources = [load_takara(args.takara, args.remap)]
-    sources.extend(load_grail(path) for path in grail_paths)
-    seen_names = set()
-    duplicate_names = set()
-    for source in sources:
-        if source.name in seen_names:
-            duplicate_names.add(source.name)
-        seen_names.add(source.name)
-    if duplicate_names:
-        raise ValueError(f"duplicate source names: {sorted(duplicate_names)}")
-
+    kinematics = G1Kinematics(args.g1_xml)
     clips = []
     reports = []
     source_manifest = []
+    clips_by_terrain = {}
     expected_skeleton = None
     range_cursor = 0
-    for source in sources:
-        terrain = (
-            FlatTerrain() if source.terrain_id == "flat"
-            else GrailTerrain.from_base(source.terrain_id)
-        )
-        clip, skeleton, report = finalize_clip(source, terrain, kin)
+
+    def append_motion_source(source, terrain, expected_name, expected_terrain):
+        nonlocal expected_skeleton, range_cursor
+        if source.name != expected_name or source.terrain_id != expected_terrain:
+            raise ValueError(
+                f"{expected_name}: loaded source name/terrain identity changed")
+        clip, skeleton, report = finalize_clip(source, terrain, kinematics)
         if expected_skeleton is None:
             expected_skeleton = skeleton
         elif skeleton.signature() != expected_skeleton.signature():
             raise ValueError(f"{source.name}: skeleton signature changed")
         clips.append(clip)
-        reports.append(report)
+        reports.append({
+            "fk_max_error_m": float(report["fk_max_error_m"]),
+            "duration_error_s": float(report["duration_error_s"]),
+            "quaternion_norm_max_error": float(
+                report["quaternion_norm_max_error"]),
+        })
         source_manifest.append(
             _source_manifest_entry(source, clip, range_cursor))
         range_cursor += len(clip.positions)
+        if source.terrain_id in selected_scene_bases.values():
+            clips_by_terrain[source.terrain_id] = clip
+
+    source = load_takara(args.takara, args.remap)
+    terrain = FlatTerrain()
+    append_motion_source(
+        source, terrain, "takara_walk_50hz", "flat")
+    del source, terrain
+
+    for path in grail_paths:
+        base = os.path.splitext(os.path.basename(path))[0]
+        source = load_grail(path)
+        _require_loaded_grail_source(source, base)
+        terrain = GrailTerrain.from_base(base)
+        append_motion_source(source, terrain, base, base)
+        del source, terrain
 
     if expected_skeleton is None:
         raise ValueError("no source clips were built")
@@ -185,18 +245,36 @@ def build_artifacts(args: argparse.Namespace) -> dict:
             f"G1 skeleton must contain 31 bones, got "
             f"{len(expected_skeleton.names)}")
     artifacts = combine_clips(clips, expected_skeleton)
+    del clips
     if range_cursor != len(artifacts.positions):
         raise ValueError("source ranges do not cover the combined database")
 
-    runtime_terrain = GrailTerrain.from_base(args.runtime_terrain)
-    runtime_bounds, heightfield_metadata = _heightfield_contract(runtime_terrain)
+    for base in selected_scene_bases.values():
+        if base in clips_by_terrain:
+            continue
+        route_source = load_grail(path_by_base[base])
+        _require_loaded_grail_source(route_source, base)
+        route_clip, route_skeleton, _route_report = convert_source_clip(
+            route_source, kinematics, OUTPUT_FPS)
+        if route_skeleton.signature() != expected_skeleton.signature():
+            raise ValueError(
+                f"{base}: scene-route skeleton signature changed")
+        clips_by_terrain[base] = route_clip
+        del route_source, route_clip, route_skeleton, _route_report
+
+    scene_pack = build_scene_pack(all_scene_definitions(
+        measured_max_heights, clips_by_terrain))
+    del clips_by_terrain
+
     contact_config = ContactConfig()
-    manifest = {
+    manifest_base = {
         "schema": SCHEMA,
         "output_fps": OUTPUT_FPS,
         "feature_dimensions": 31,
         "terrain_dimensions": 4,
-        "total_clips": len(sources),
+        "support_dimensions": 3,
+        "terrain_feature_distances_m": list(TERRAIN_DISTANCES),
+        "total_clips": len(source_manifest),
         "grail_clips": len(grail_paths),
         "skipped_clips": 0,
         "database_frames": len(artifacts.positions),
@@ -212,41 +290,29 @@ def build_artifacts(args: argparse.Namespace) -> dict:
             "height_threshold": contact_config.height_threshold,
             "median_filter_frames": contact_config.median_filter_frames,
         },
-        "terrain": {
-            "distances_m": TERRAIN_DISTANCES,
-            "coordinate_mapping": "mujoco_xyz_to_holden_x_z_neg_y",
-            "runtime_base": args.runtime_terrain,
-            "cell_size_m": HEIGHTFIELD_CELL_SIZE,
-            "border_m": HEIGHTFIELD_BORDER,
-            "heightfield": heightfield_metadata,
+        "surface": {
+            "semantics": surface_semantics(),
+            "signature": surface_semantics_signature(),
         },
         "validation": {
+            "schema": "g1-terrain-validation/v1",
             "fk_max_error_m": [
-                float(report["fk_max_error_m"]) for report in reports],
+                report["fk_max_error_m"] for report in reports],
             "duration_error_s": [
-                float(report["duration_error_s"]) for report in reports],
+                report["duration_error_s"] for report in reports],
             "quaternion_norm_max_error": [
-                float(report["quaternion_norm_max_error"])
-                for report in reports
-            ],
+                report["quaternion_norm_max_error"] for report in reports],
         },
     }
+    return artifacts, manifest_base, scene_pack
 
-    def terrain_writer(staging: str) -> None:
-        emitted = export_heightfield(
-            runtime_terrain,
-            runtime_bounds,
-            HEIGHTFIELD_CELL_SIZE,
-            os.path.join(staging, "terrain.bin"),
-        )
-        if emitted != heightfield_metadata:
-            raise ValueError(
-                "runtime heightfield metadata changed during publication: "
-                f"expected {heightfield_metadata}, got {emitted}")
-        runtime_terrain.export_obj(os.path.join(staging, "terrain.obj"))
 
-    publish_artifacts(args.output, artifacts, manifest, terrain_writer)
-    return manifest
+def build_artifacts(args: argparse.Namespace) -> dict:
+    artifacts, manifest_base, scene_pack = _assemble_candidate(args)
+    validate_candidate = _candidate_validation_policy(args)
+    return publish_artifacts(
+        args.output, artifacts, manifest_base, scene_pack,
+        validate_candidate)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -258,8 +324,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--g1-xml", default=DEFAULTS["g1_xml"])
     parser.add_argument("--takara", default=DEFAULTS["takara"])
     parser.add_argument("--remap", default=DEFAULTS["remap"])
-    parser.add_argument(
-        "--runtime-terrain", default=DEFAULTS["runtime_terrain"])
     return parser
 
 
@@ -272,7 +336,8 @@ def main(argv=None) -> int:
         return 1
     print(
         f"BUILT {manifest['schema']} frames={manifest['database_frames']} "
-        f"clips={manifest['total_clips']} output={args.output}")
+        f"clips={manifest['total_clips']} scenes={len(REQUIRED_SCENE_IDS)} "
+        f"output={args.output}")
     return 0
 
 
