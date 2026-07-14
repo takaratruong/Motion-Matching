@@ -172,11 +172,12 @@ static inline bool support_frame_update(
         return support_error(error, error_capacity,
             "support target must be finite");
     const bool source_changed = source_frame_changed || source != next.source;
-    const float target_velocity = source == support_held || source_changed
-        ? 0.0f
-        : (target - next.nominal_height) / dt;
+    const float target_delta = target - next.nominal_height;
     const bool discontinuity = source_changed ||
-        std::fabs(target - next.nominal_height) > 0.02f;
+        std::fabs(target_delta) > 0.02f;
+    const float target_velocity = source == support_held || discontinuity
+        ? 0.0f
+        : target_delta / dt;
     if (discontinuity)
         support_frame_rebase(next, target, target_velocity);
     else {

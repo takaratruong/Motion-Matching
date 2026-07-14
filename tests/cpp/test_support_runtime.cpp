@@ -332,9 +332,8 @@ static void test_update_rebases_only_above_nominal_discontinuity_boundary()
     support_frame_state discontinuous;
     support_frame_reset(discontinuous, 0.0f);
     discontinuous.source = support_left;
-    const float target_velocity = above / dt;
     float expected_offset_height = -above;
-    float expected_offset_velocity = -target_velocity;
+    float expected_offset_velocity = 0.0f;
     decay_spring_damper_exact(
         expected_offset_height, expected_offset_velocity, 0.10f, dt);
 
@@ -343,19 +342,50 @@ static void test_update_rebases_only_above_nominal_discontinuity_boundary()
           dt, error, sizeof(error)), error);
     close(discontinuous.nominal_height, above, 0.0f,
           "above-boundary discontinuity nominal target");
-    close(discontinuous.nominal_velocity, target_velocity, 1e-7f,
-          "above-boundary discontinuity nominal velocity");
+    check(float_bits(discontinuous.nominal_velocity) == float_bits(0.0f),
+          "above-boundary discontinuity zeroes nominal velocity");
     close(discontinuous.offset_height, expected_offset_height, 1e-7f,
           "above-boundary discontinuity rebases height before decay");
     close(discontinuous.offset_velocity, expected_offset_velocity, 1e-7f,
           "above-boundary discontinuity rebases velocity before decay");
     close(discontinuous.height, above + expected_offset_height, 1e-7f,
           "above-boundary discontinuity decays from prior height");
-    close(discontinuous.velocity,
-          target_velocity + expected_offset_velocity, 1e-7f,
+    close(discontinuous.velocity, expected_offset_velocity, 1e-7f,
           "above-boundary discontinuity decays from prior velocity");
     check(float_bits(discontinuous.height) != float_bits(above),
           "above-boundary discontinuity avoids a target snap");
+}
+
+static void test_same_source_airborne_discontinuities_do_not_create_velocity()
+{
+    const float dt = 1.0f / 25.0f;
+    const float targets[] = {-0.0885f, 0.1600f};
+    char error[256] = {};
+    support_frame_state state;
+    support_frame_reset(state, 0.0f);
+    state.source = support_airborne_root;
+    state.airborne_frames = 2;
+
+    float previous_height = state.height;
+    for (const float target : targets) {
+        check(support_frame_update(state,
+              observation(target, 0.0f, 0.0f, false, false), false,
+              dt, error, sizeof(error)), error);
+        check(state.source == support_airborne_root,
+              "observed discontinuity remains same-source airborne root");
+        check(float_bits(state.nominal_velocity) == float_bits(0.0f),
+              "same-source discontinuity zeroes nominal velocity");
+        check(terrain_float_is_finite(state.height) &&
+              terrain_float_is_finite(state.velocity),
+              "same-source discontinuity output remains finite");
+        const float lower = std::fmin(previous_height, target) - 1e-6f;
+        const float upper = std::fmax(previous_height, target) + 1e-6f;
+        check(state.height >= lower && state.height <= upper,
+              "same-source discontinuity first frame remains bounded");
+        check(std::fabs(state.velocity) < 1.0f,
+              "same-source discontinuity avoids artificial velocity spike");
+        previous_height = state.height;
+    }
 }
 
 static void test_elevated_landing_ramp_and_descent_do_not_decay_to_zero()
@@ -455,6 +485,7 @@ int main()
     test_update_rebases_source_frame_transition();
     test_update_rebases_contact_source_transition();
     test_update_rebases_only_above_nominal_discontinuity_boundary();
+    test_same_source_airborne_discontinuities_do_not_create_velocity();
     test_elevated_landing_ramp_and_descent_do_not_decay_to_zero();
     test_nonfinite_update_is_transactional();
     test_pose_and_root_helpers_are_horizontal_only();
