@@ -9,6 +9,7 @@
 #include <cfenv>
 #include <cfloat>
 #include <cmath>
+#include <cstddef>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -45,6 +46,72 @@ static_assert(
 #else
 #define G1_CLEARANCE_NOINLINE
 #endif
+
+struct G1ClearanceProtectedRange
+{
+    const void* data;
+    size_t size;
+};
+
+struct G1ClearanceDiagnostic
+{
+    char* output;
+    int capacity;
+};
+
+static bool g1_clearance_address_range(
+    const void* data,
+    size_t size,
+    uintptr_t& begin,
+    uintptr_t& end)
+{
+    begin = reinterpret_cast<uintptr_t>(data);
+    if (size > UINTPTR_MAX - begin) {
+        return false;
+    }
+    end = begin + size;
+    return true;
+}
+
+static G1ClearanceDiagnostic g1_clearance_prepare_diagnostic(
+    char* output,
+    int capacity,
+    const G1ClearanceProtectedRange* protected_ranges,
+    size_t protected_range_count)
+{
+    G1ClearanceDiagnostic diagnostic = {output, capacity};
+    if (output == NULL || capacity <= 0) {
+        return diagnostic;
+    }
+
+    uintptr_t diagnostic_begin = 0;
+    uintptr_t diagnostic_end = 0;
+    if (!g1_clearance_address_range(
+            output, static_cast<size_t>(capacity),
+            diagnostic_begin, diagnostic_end)) {
+        return {NULL, 0};
+    }
+
+    for (size_t index = 0; index < protected_range_count; ++index) {
+        const G1ClearanceProtectedRange& protected_range =
+            protected_ranges[index];
+        if (protected_range.data == NULL || protected_range.size == 0) {
+            continue;
+        }
+        uintptr_t protected_begin = 0;
+        uintptr_t protected_end = 0;
+        if (!g1_clearance_address_range(
+                protected_range.data, protected_range.size,
+                protected_begin, protected_end)) {
+            return {NULL, 0};
+        }
+        if (diagnostic_begin < protected_end &&
+            protected_begin < diagnostic_end) {
+            return {NULL, 0};
+        }
+    }
+    return diagnostic;
+}
 
 static G1ClearanceStatus g1_clearance_error(
     G1ClearanceStatus status,
@@ -199,15 +266,28 @@ static bool g1_clearance_budget_within(
 }
 
 static G1ClearanceStatus g1_clearance_contract_stub(
+    void* public_output,
+    size_t public_output_size,
     const G1ClearanceBudget& limits,
+    const void* additional_protected_input,
+    size_t additional_protected_input_size,
     bool swing_family,
     char* error,
     int error_capacity)
 {
+    const G1ClearanceProtectedRange protected_ranges[] = {
+        {public_output, public_output_size},
+        {&limits, sizeof(limits)},
+        {additional_protected_input, additional_protected_input_size}
+    };
+    const G1ClearanceDiagnostic diagnostic =
+        g1_clearance_prepare_diagnostic(
+            error, error_capacity, protected_ranges,
+            sizeof(protected_ranges) / sizeof(protected_ranges[0]));
     if (!g1_clearance_arithmetic_environment_is_supported()) {
         return g1_clearance_error(
             G1ClearanceArithmeticFailure,
-            error, error_capacity,
+            diagnostic.output, diagnostic.capacity,
             "G1 clearance arithmetic environment is unsupported");
     }
     const G1ClearanceBudget ceiling = swing_family
@@ -216,12 +296,12 @@ static G1ClearanceStatus g1_clearance_contract_stub(
     if (!g1_clearance_budget_within(limits, ceiling)) {
         return g1_clearance_error(
             G1ClearanceInvalidInput,
-            error, error_capacity,
+            diagnostic.output, diagnostic.capacity,
             "G1 clearance budget exceeds its immutable factory ceiling");
     }
     return g1_clearance_error(
         G1ClearanceUncertified,
-        error, error_capacity,
+        diagnostic.output, diagnostic.capacity,
         "G1 certified geometry is not implemented by contract Task 1");
 }
 
@@ -232,16 +312,23 @@ G1ClearanceStatus g1_apply_swing_lift_y(
     char* error,
     int error_capacity)
 {
+    const G1ClearanceProtectedRange protected_ranges[] = {
+        {&output_y, sizeof(output_y)}
+    };
+    const G1ClearanceDiagnostic diagnostic =
+        g1_clearance_prepare_diagnostic(
+            error, error_capacity, protected_ranges,
+            sizeof(protected_ranges) / sizeof(protected_ranges[0]));
     if (!g1_clearance_arithmetic_environment_is_supported()) {
         return g1_clearance_error(
             G1ClearanceArithmeticFailure,
-            error, error_capacity,
+            diagnostic.output, diagnostic.capacity,
             "G1 clearance arithmetic environment is unsupported");
     }
     if (!terrain_float_is_normal_or_zero_query(input_y)) {
         return g1_clearance_error(
             G1ClearanceInvalidInput,
-            error, error_capacity,
+            diagnostic.output, diagnostic.capacity,
             "G1 swing sole input Y is invalid");
     }
     const uint32_t lift_bits = terrain_float_bits(lift_m);
@@ -257,7 +344,7 @@ G1ClearanceStatus g1_apply_swing_lift_y(
     if (!lift_is_finite || lift_is_negative || lift_m > 0.08f) {
         return g1_clearance_error(
             G1ClearanceInvalidInput,
-            error, error_capacity,
+            diagnostic.output, diagnostic.capacity,
             "G1 swing lift must be finite and in [0, 0.08] m");
     }
 
@@ -272,7 +359,7 @@ G1ClearanceStatus g1_apply_swing_lift_y(
     if (!terrain_double_is_finite(sum)) {
         return g1_clearance_error(
             G1ClearanceArithmeticFailure,
-            error, error_capacity,
+            diagnostic.output, diagnostic.capacity,
             "G1 swing sole command overflowed binary64");
     }
     const volatile float rounded = static_cast<float>(sum);
@@ -285,7 +372,7 @@ G1ClearanceStatus g1_apply_swing_lift_y(
         (rounded_magnitude != 0 && rounded_exponent == 0)) {
         return g1_clearance_error(
             G1ClearanceArithmeticFailure,
-            error, error_capacity,
+            diagnostic.output, diagnostic.capacity,
             "G1 swing sole command is nonfinite or subnormal");
     }
     const float candidate = rounded_magnitude == 0 ? 0.0f : rounded;
@@ -294,7 +381,7 @@ G1ClearanceStatus g1_apply_swing_lift_y(
 }
 
 G1ClearanceStatus g1_point_clearance(
-    G1ClearanceResult&,
+    G1ClearanceResult& output,
     const G1ClearanceBudget& limits,
     const heightfield&,
     vec3,
@@ -302,11 +389,12 @@ G1ClearanceStatus g1_point_clearance(
     int error_capacity)
 {
     return g1_clearance_contract_stub(
-        limits, false, error, error_capacity);
+        &output, sizeof(output), limits, NULL, 0,
+        false, error, error_capacity);
 }
 
 G1ClearanceStatus g1_sphere_clearance(
-    G1ClearanceResult&,
+    G1ClearanceResult& output,
     const G1ClearanceBudget& limits,
     const heightfield&,
     vec3,
@@ -315,11 +403,12 @@ G1ClearanceStatus g1_sphere_clearance(
     int error_capacity)
 {
     return g1_clearance_contract_stub(
-        limits, false, error, error_capacity);
+        &output, sizeof(output), limits, NULL, 0,
+        false, error, error_capacity);
 }
 
 G1ClearanceStatus g1_capsule_clearance(
-    G1ClearanceResult&,
+    G1ClearanceResult& output,
     const G1ClearanceBudget& limits,
     const heightfield&,
     vec3,
@@ -329,11 +418,12 @@ G1ClearanceStatus g1_capsule_clearance(
     int error_capacity)
 {
     return g1_clearance_contract_stub(
-        limits, false, error, error_capacity);
+        &output, sizeof(output), limits, NULL, 0,
+        false, error, error_capacity);
 }
 
 G1ClearanceStatus g1_foot_clearance(
-    G1ClearanceResult&,
+    G1ClearanceResult& output,
     const G1ClearanceBudget& limits,
     const heightfield&,
     const vec3[4],
@@ -342,11 +432,12 @@ G1ClearanceStatus g1_foot_clearance(
     int error_capacity)
 {
     return g1_clearance_contract_stub(
-        limits, false, error, error_capacity);
+        &output, sizeof(output), limits, NULL, 0,
+        false, error, error_capacity);
 }
 
 G1ClearanceStatus g1_swept_foot_clearance(
-    G1ClearanceResult&,
+    G1ClearanceResult& output,
     const G1ClearanceBudget& limits,
     const heightfield&,
     const vec3[4],
@@ -356,11 +447,12 @@ G1ClearanceStatus g1_swept_foot_clearance(
     int error_capacity)
 {
     return g1_clearance_contract_stub(
-        limits, true, error, error_capacity);
+        &output, sizeof(output), limits, NULL, 0,
+        true, error, error_capacity);
 }
 
 G1ClearanceStatus g1_measure_leg_clearance(
-    G1LegClearance&,
+    G1LegClearance& output,
     const G1ClearanceBudget& limits,
     const heightfield&,
     const slice1d<vec3>,
@@ -370,11 +462,12 @@ G1ClearanceStatus g1_measure_leg_clearance(
     int error_capacity)
 {
     return g1_clearance_contract_stub(
-        limits, false, error, error_capacity);
+        &output, sizeof(output), limits, NULL, 0,
+        false, error, error_capacity);
 }
 
 G1ClearanceStatus g1_measure_pose_clearance(
-    G1PoseClearance&,
+    G1PoseClearance& output,
     const G1ClearanceBudget& limits,
     const heightfield&,
     const slice1d<vec3>,
@@ -383,13 +476,14 @@ G1ClearanceStatus g1_measure_pose_clearance(
     int error_capacity)
 {
     return g1_clearance_contract_stub(
-        limits, false, error, error_capacity);
+        &output, sizeof(output), limits, NULL, 0,
+        false, error, error_capacity);
 }
 
 G1ClearanceStatus g1_swing_clearance_validate(
-    G1SwingClearanceValidation&,
+    G1SwingClearanceValidation& output,
     const G1ClearanceBudget& limits,
-    const G1SwingHistory&,
+    const G1SwingHistory& history,
     const heightfield&,
     const G1LegConfig&,
     const vec3[4],
@@ -399,5 +493,6 @@ G1ClearanceStatus g1_swing_clearance_validate(
     int error_capacity)
 {
     return g1_clearance_contract_stub(
-        limits, true, error, error_capacity);
+        &output, sizeof(output), limits, &history, sizeof(history),
+        true, error, error_capacity);
 }

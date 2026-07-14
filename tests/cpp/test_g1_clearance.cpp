@@ -2,6 +2,7 @@
 
 #include <cfenv>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -307,6 +308,63 @@ static G1ClearanceStatus invoke_public_status_entry(
     }
 }
 
+struct PublicProtectedSpan
+{
+    char* data;
+    int size;
+};
+
+static PublicProtectedSpan public_output_span(
+    PublicStatusEntry entry,
+    PublicOutputs& outputs)
+{
+    switch (entry) {
+    case PublicLift:
+        return {
+            reinterpret_cast<char*>(&outputs.output_y),
+            static_cast<int>(sizeof(outputs.output_y))
+        };
+    case PublicPoint:
+    case PublicSphere:
+    case PublicCapsule:
+    case PublicFoot:
+    case PublicSweptFoot:
+        return {
+            reinterpret_cast<char*>(&outputs.result),
+            static_cast<int>(sizeof(outputs.result))
+        };
+    case PublicMeasureLeg:
+        return {
+            reinterpret_cast<char*>(&outputs.leg),
+            static_cast<int>(sizeof(outputs.leg))
+        };
+    case PublicMeasurePose:
+        return {
+            reinterpret_cast<char*>(&outputs.pose),
+            static_cast<int>(sizeof(outputs.pose))
+        };
+    case PublicSwingValidate:
+        return {
+            reinterpret_cast<char*>(&outputs.swing),
+            static_cast<int>(sizeof(outputs.swing))
+        };
+    default:
+        return {NULL, 0};
+    }
+}
+
+static bool public_entry_uses_swing_budget(PublicStatusEntry entry)
+{
+    return entry == PublicSweptFoot || entry == PublicSwingValidate;
+}
+
+static G1ClearanceBudget public_entry_budget(PublicStatusEntry entry)
+{
+    return public_entry_uses_swing_budget(entry)
+        ? g1_swing_foot_clearance_budget()
+        : g1_pose_clearance_budget();
+}
+
 static void test_status_and_factory_contract()
 {
     const char* const expected_names[] = {
@@ -546,6 +604,263 @@ private:
 };
 #endif
 
+static void require_disjoint_diagnostic(
+    const char* diagnostic,
+    size_t capacity)
+{
+    check(capacity > 1 && diagnostic[0] != 'x' &&
+          std::memchr(diagnostic, '\0', capacity) != NULL,
+          "disjoint diagnostic is written and terminated");
+}
+
+struct ArithmeticEnvironmentSnapshot
+{
+    int rounding_mode;
+#if defined(__SSE__) || defined(_M_X64) || defined(_M_IX86_FP)
+    uint32_t mxcsr;
+#endif
+
+    ArithmeticEnvironmentSnapshot()
+        : rounding_mode(std::fegetround())
+#if defined(__SSE__) || defined(_M_X64) || defined(_M_IX86_FP)
+        , mxcsr(_mm_getcsr())
+#endif
+    {
+    }
+
+    bool same() const
+    {
+        if (std::fegetround() != rounding_mode) {
+            return false;
+        }
+#if defined(__SSE__) || defined(_M_X64) || defined(_M_IX86_FP)
+        if (_mm_getcsr() != mxcsr) {
+            return false;
+        }
+#endif
+        return true;
+    }
+};
+
+static void test_output_diagnostic_aliases_in_current_environment()
+{
+    for (int raw_entry = PublicLift;
+         raw_entry < PublicStatusEntryCount;
+         ++raw_entry) {
+        const PublicStatusEntry entry =
+            static_cast<PublicStatusEntry>(raw_entry);
+        const G1ClearanceBudget limits = public_entry_budget(entry);
+
+        PublicOutputs baseline_outputs = seeded_public_outputs();
+        char diagnostic[64];
+        std::memset(diagnostic, 'x', sizeof(diagnostic));
+        const G1ClearanceStatus baseline_status =
+            invoke_public_status_entry(
+                entry, baseline_outputs, limits,
+                diagnostic, static_cast<int>(sizeof(diagnostic)));
+        check(baseline_status != G1ClearanceOk,
+              "alias fixture reaches a diagnostic status");
+        require_disjoint_diagnostic(diagnostic, sizeof(diagnostic));
+
+        for (int overlap_kind = 0; overlap_kind < 2;
+             ++overlap_kind) {
+            PublicOutputs outputs = seeded_public_outputs();
+            const ByteSnapshot<PublicOutputs> before(outputs);
+            const PublicProtectedSpan span =
+                public_output_span(entry, outputs);
+            check(span.data != NULL && span.size > 2,
+                  "public output exposes a nonempty protected span");
+            char* const aliased_error = overlap_kind == 0
+                ? span.data
+                : span.data + 1;
+            const int aliased_capacity = overlap_kind == 0
+                ? span.size
+                : 2;
+            const ArithmeticEnvironmentSnapshot environment_before;
+            const G1ClearanceStatus status =
+                invoke_public_status_entry(
+                    entry, outputs, limits,
+                    aliased_error, aliased_capacity);
+            check(environment_before.same(),
+                  "output alias preserves arithmetic environment exactly");
+            check(status == baseline_status,
+                  "output alias preserves semantic status");
+            check(before.same(outputs),
+                  "exact or partial diagnostic overlap preserves output");
+        }
+    }
+}
+
+static void test_limit_diagnostic_aliases_in_current_environment(
+    bool exceed_factory)
+{
+    for (int raw_entry = PublicPoint;
+         raw_entry < PublicStatusEntryCount;
+         ++raw_entry) {
+        const PublicStatusEntry entry =
+            static_cast<PublicStatusEntry>(raw_entry);
+        G1ClearanceBudget fixture = public_entry_budget(entry);
+        if (exceed_factory) {
+            ++fixture.maximum_cells;
+        }
+
+        PublicOutputs baseline_outputs = seeded_public_outputs();
+        G1ClearanceBudget baseline_limits = fixture;
+        char diagnostic[64];
+        std::memset(diagnostic, 'x', sizeof(diagnostic));
+        const G1ClearanceStatus baseline_status =
+            invoke_public_status_entry(
+                entry, baseline_outputs, baseline_limits,
+                diagnostic, static_cast<int>(sizeof(diagnostic)));
+        check(baseline_status != G1ClearanceOk,
+              "limit alias fixture reaches a diagnostic status");
+        require_disjoint_diagnostic(diagnostic, sizeof(diagnostic));
+
+        for (int overlap_kind = 0; overlap_kind < 2;
+             ++overlap_kind) {
+            PublicOutputs outputs = seeded_public_outputs();
+            G1ClearanceBudget limits = fixture;
+            const ByteSnapshot<PublicOutputs> output_before(outputs);
+            const ByteSnapshot<G1ClearanceBudget> limits_before(limits);
+            char* const limits_bytes =
+                reinterpret_cast<char*>(&limits);
+            char* const aliased_error = overlap_kind == 0
+                ? limits_bytes
+                : limits_bytes + 1;
+            const int aliased_capacity = overlap_kind == 0
+                ? static_cast<int>(sizeof(limits))
+                : 2;
+            const ArithmeticEnvironmentSnapshot environment_before;
+            const G1ClearanceStatus status =
+                invoke_public_status_entry(
+                    entry, outputs, limits,
+                    aliased_error, aliased_capacity);
+            check(environment_before.same(),
+                  "limit alias preserves arithmetic environment exactly");
+            check(status == baseline_status,
+                  "limit alias preserves semantic status");
+            check(output_before.same(outputs),
+                  "limit alias never changes the public output");
+            check(limits_before.same(limits),
+                  "exact or partial diagnostic overlap preserves limits");
+        }
+    }
+}
+
+static G1SwingHistory seeded_swing_history()
+{
+    G1SwingHistory history = {};
+    history.initialized = true;
+    for (int index = 0; index < 4; ++index) {
+        history.previous_sphere_centers[index] = vec3(
+            0.1f * static_cast<float>(index + 1),
+            0.2f * static_cast<float>(index + 1),
+            0.3f * static_cast<float>(index + 1));
+    }
+    return history;
+}
+
+static G1ClearanceStatus invoke_swing_with_history(
+    PublicOutputs& outputs,
+    const G1ClearanceBudget& limits,
+    const G1SwingHistory& history,
+    char* error,
+    int error_capacity)
+{
+    heightfield field;
+    const G1LegConfig config = g1_left_leg_config();
+    const vec3 final_centers[4] = {
+        vec3(0.1f, 0.2f, 0.3f),
+        vec3(0.2f, 0.3f, 0.4f),
+        vec3(0.3f, 0.4f, 0.5f),
+        vec3(0.4f, 0.5f, 0.6f)
+    };
+    return g1_swing_clearance_validate(
+        outputs.swing, limits, history, field, config,
+        final_centers, false, 0.04f, error, error_capacity);
+}
+
+static void test_history_diagnostic_aliases_in_current_environment()
+{
+    const G1ClearanceBudget limits =
+        g1_swing_foot_clearance_budget();
+    PublicOutputs baseline_outputs = seeded_public_outputs();
+    const G1SwingHistory baseline_history = seeded_swing_history();
+    char diagnostic[64];
+    std::memset(diagnostic, 'x', sizeof(diagnostic));
+    const G1ClearanceStatus baseline_status =
+        invoke_swing_with_history(
+            baseline_outputs, limits, baseline_history,
+            diagnostic, static_cast<int>(sizeof(diagnostic)));
+    check(baseline_status != G1ClearanceOk,
+          "history alias fixture reaches a diagnostic status");
+    require_disjoint_diagnostic(diagnostic, sizeof(diagnostic));
+
+    for (int overlap_kind = 0; overlap_kind < 2;
+         ++overlap_kind) {
+        PublicOutputs outputs = seeded_public_outputs();
+        G1SwingHistory history = seeded_swing_history();
+        const ByteSnapshot<PublicOutputs> output_before(outputs);
+        const ByteSnapshot<G1SwingHistory> history_before(history);
+        char* const history_bytes = reinterpret_cast<char*>(&history);
+        char* const aliased_error = overlap_kind == 0
+            ? history_bytes
+            : history_bytes + 1;
+        const int aliased_capacity = overlap_kind == 0
+            ? static_cast<int>(sizeof(history))
+            : 2;
+        const ArithmeticEnvironmentSnapshot environment_before;
+        const G1ClearanceStatus status = invoke_swing_with_history(
+            outputs, limits, history,
+            aliased_error, aliased_capacity);
+        check(environment_before.same(),
+              "history alias preserves arithmetic environment exactly");
+        check(status == baseline_status,
+              "history alias preserves semantic status");
+        check(output_before.same(outputs),
+              "history alias never changes swing output");
+        check(history_before.same(history),
+              "exact or partial diagnostic overlap preserves history");
+    }
+}
+
+struct ScalarPrefixEnvelope
+{
+    unsigned char prefix[sizeof(float)];
+    float output;
+    unsigned char suffix[2];
+};
+
+static_assert(
+    offsetof(ScalarPrefixEnvelope, output) == sizeof(float),
+    "scalar overlap envelope has adjacent prefix storage");
+
+static void test_diagnostic_range_crossing_into_output()
+{
+    ScalarPrefixEnvelope envelope = {};
+    std::memset(envelope.prefix, 0xa5, sizeof(envelope.prefix));
+    envelope.output = float_from_bits(UINT32_C(0x41234567));
+    std::memset(envelope.suffix, 0x5a, sizeof(envelope.suffix));
+    const ByteSnapshot<ScalarPrefixEnvelope> before(envelope);
+    char disjoint[64] = {};
+    float baseline_output = envelope.output;
+    const float hostile = float_from_bits(UINT32_C(0x7fc00001));
+    const G1ClearanceStatus baseline_status = g1_apply_swing_lift_y(
+        baseline_output, hostile, hostile,
+        disjoint, static_cast<int>(sizeof(disjoint)));
+    char* const crossing_error =
+        reinterpret_cast<char*>(&envelope.output) - 1;
+    const ArithmeticEnvironmentSnapshot environment_before;
+    const G1ClearanceStatus status = g1_apply_swing_lift_y(
+        envelope.output, hostile, hostile, crossing_error, 2);
+    check(environment_before.same(),
+          "crossing diagnostic preserves arithmetic environment exactly");
+    check(status == baseline_status,
+          "crossing diagnostic range preserves semantic status");
+    check(before.same(envelope),
+          "diagnostic beginning in prefix storage cannot cross into output");
+}
+
 static void test_normal_arithmetic_environment()
 {
     const int rounding_before = std::fegetround();
@@ -565,6 +880,10 @@ static void test_normal_arithmetic_environment()
     check(_mm_getcsr() == mxcsr_before,
           "portable probe preserves caller MXCSR exactly");
 #endif
+    test_output_diagnostic_aliases_in_current_environment();
+    test_limit_diagnostic_aliases_in_current_environment(true);
+    test_history_diagnostic_aliases_in_current_environment();
+    test_diagnostic_range_crossing_into_output();
 }
 
 static void test_rounding_mode_rejection(int requested_mode)
@@ -598,6 +917,9 @@ static void test_rounding_mode_rejection(int requested_mode)
                 mode_unchanged = mode_unchanged &&
                     std::fegetround() == requested_mode;
             }
+            test_output_diagnostic_aliases_in_current_environment();
+            test_limit_diagnostic_aliases_in_current_environment(false);
+            test_history_diagnostic_aliases_in_current_environment();
         }
     }
     check(std::fegetround() == original,
@@ -641,6 +963,9 @@ static void test_mxcsr_rejection(uint32_t mask)
             mode_unchanged = mode_unchanged &&
                 _mm_getcsr() == hostile_word;
         }
+        test_output_diagnostic_aliases_in_current_environment();
+        test_limit_diagnostic_aliases_in_current_environment(false);
+        test_history_diagnostic_aliases_in_current_environment();
     }
     check(_mm_getcsr() == original,
           "MXCSR guard restores the exact caller word");
