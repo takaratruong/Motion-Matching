@@ -99,8 +99,8 @@ static inline vec2 lerp(vec2 v, vec2 w, float alpha)
 
 struct vec3
 {
-    vec3() : x(0.0f), y(0.0f), z(0.0f) {}
-    vec3(float _x, float _y, float _z) : x(_x), y(_y), z(_z) {}
+    constexpr vec3() : x(0.0f), y(0.0f), z(0.0f) {}
+    constexpr vec3(float _x, float _y, float _z) : x(_x), y(_y), z(_z) {}
     
     float x, y, z;
 };

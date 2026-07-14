@@ -890,6 +890,8 @@ git commit -m "feat: replay pickup clips at 25 Hz"
 - Create: `interaction_ik.cpp`
 - Create: `tests/cpp/test_interaction_ik.cpp`
 - Create: `tests/python/test_g1_arm_joint_metadata.py`
+- Modify: `vec.h`
+- Modify: `quat.h`
 - Modify: `Makefile`
 
 **Interfaces:**
@@ -971,6 +973,11 @@ inline constexpr std::array<HingeJoint, 7> kRightArm = {{
 }};
 ```
 
+Because these frozen arrays are `constexpr` and contain the existing `vec3`
+and `quat` types, their default and value constructors must also be `constexpr`
+under C++17. This is an ABI- and runtime-behavior-preserving qualifier change;
+no math operators or functions become part of the compile-time contract.
+
 Expose the solve result and function exactly as:
 
 ```cpp
@@ -1009,7 +1016,7 @@ Expected: Python parity passes; C++ IK test exits 0.
 ```bash
 git add g1_arm_joint_metadata.h resources/generate_g1_arm_joint_metadata.py \
   interaction_ik.h interaction_ik.cpp tests/cpp/test_interaction_ik.cpp \
-  tests/python/test_g1_arm_joint_metadata.py Makefile
+  tests/python/test_g1_arm_joint_metadata.py Makefile vec.h quat.h
 git commit -m "feat: add bounded G1 hand IK"
 ```
 
