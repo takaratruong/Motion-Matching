@@ -2559,12 +2559,17 @@ int main(void)
                 const int prior_index = state.frame_index;
                 int best_index = end_of_anim ? -1 : prior_index;
                 float best_cost = FLT_MAX;
+                const float transition_cost =
+                    g1_idle_match_transition_cost(
+                        traversal.commanded_speed,
+                        walkability_xz_length(state.simulation_velocity));
                 
                 database_search(
                     best_index,
                     best_cost,
                     db,
-                    query);
+                    query,
+                    transition_cost);
                 selected_database_frame = best_index;
                 if (best_index != prior_index) {
                     state.selected_cost = best_cost;

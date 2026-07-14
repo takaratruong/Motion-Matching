@@ -1,5 +1,14 @@
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-result"
+#endif
+
 #include "database.h"
 #include "g1_skeleton.h"
+
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
 #include <cfloat>
 #include <cmath>
@@ -490,6 +499,74 @@ static void test_cost_and_incumbent_search_semantics()
     CHECK(finite_bits(raw_error));
 }
 
+static void fill_transition_cost_database(database& db)
+{
+    const int frames = 24;
+    db.bone_positions.resize(frames, 1);
+    db.features.resize(frames, 31);
+    db.features_offset.resize(31);
+    db.features_scale.resize(31);
+    db.range_starts.resize(1);
+    db.range_stops.resize(1);
+    db.features.zero();
+    db.features_offset.zero();
+    db.features_scale.set(FLT_MAX);
+    db.features_scale(0) = 1.0f;
+    for (int frame = 0; frame < frames; ++frame) {
+        db.features(frame, 0) = 10.0f;
+    }
+    db.features(0, 0) = 3.0f;
+    db.features(1, 0) = 2.0f;
+    db.features(2, 0) = 0.0f;
+    db.features(3, 0) = 4.0f;
+    db.range_starts(0) = 0;
+    db.range_stops(0) = frames;
+    database_build_bounds(db);
+}
+
+static void test_transition_cost_hysteresis_semantics()
+{
+    database db;
+    fill_transition_cost_database(db);
+    array1d<float> query(31);
+    query.zero();
+
+    int default_index = -1;
+    float default_cost = FLT_MAX;
+    database_search(default_index, default_cost, db, query);
+    int explicit_zero_index = -1;
+    float explicit_zero_cost = FLT_MAX;
+    database_search(
+        explicit_zero_index, explicit_zero_cost, db, query, 0.0f);
+    CHECK(default_index == explicit_zero_index);
+    CHECK(float_bits(default_cost) == float_bits(explicit_zero_cost));
+
+    query(0) = 2.4f;
+    int unpenalized_index = 0;
+    float unpenalized_cost = FLT_MAX;
+    database_search(
+        unpenalized_index, unpenalized_cost, db, query, 0.0f, 0, 1);
+    CHECK(unpenalized_index == 1);
+
+    int weak_index = 0;
+    float weak_cost = FLT_MAX;
+    database_search(weak_index, weak_cost, db, query, 1.0f, 0, 1);
+    CHECK(weak_index == 0);
+
+    query.zero();
+    int strong_index = 0;
+    float strong_cost = FLT_MAX;
+    database_search(strong_index, strong_cost, db, query, 1.0f, 0, 1);
+    CHECK(strong_index == 2);
+    CHECK(float_bits(strong_cost) == float_bits(1.0f));
+
+    int end_index = -1;
+    float end_cost = FLT_MAX;
+    database_search(end_index, end_cost, db, query, 1.0f);
+    CHECK(end_index == 2);
+    CHECK(float_bits(end_cost) == float_bits(1.0f));
+}
+
 int main()
 {
     test_zero_weight_is_exact_and_safe();
@@ -499,5 +576,6 @@ int main()
     test_positive_weight_flat_terrain_is_release_safe();
     test_all_disabled_constant_builder();
     test_cost_and_incumbent_search_semantics();
+    test_transition_cost_hysteresis_semantics();
     return 0;
 }

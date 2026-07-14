@@ -109,6 +109,18 @@ struct g1_controller_state
     float clamp_y = 0.0f;
 };
 
+static inline float g1_idle_match_transition_cost(
+    const float command_speed,
+    const float planar_simulation_speed)
+{
+    return command_speed >= 0.0f &&
+           planar_simulation_speed >= 0.0f &&
+           command_speed <= 1.0e-4f &&
+           planar_simulation_speed <= 0.05f
+        ? 1.0f
+        : 0.0f;
+}
+
 static inline void g1_controller_state_seed_first_frame_desired_velocity(
     g1_controller_state& state)
 {

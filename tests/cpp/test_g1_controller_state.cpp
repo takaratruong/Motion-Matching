@@ -1,4 +1,5 @@
 #include "g1_controller_state.h"
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -55,6 +56,48 @@ static std::string read_source(const char* path, const char* description)
     return source;
 }
 
+static std::string source_call_text(
+    const std::string& source,
+    const char* function_name,
+    const std::size_t start,
+    const char* description)
+{
+    const std::size_t name = source.find(function_name, start);
+    check(name != std::string::npos, description);
+    const std::size_t open = source.find('(', name);
+    check(open != std::string::npos, description);
+    int depth = 0;
+    for (std::size_t i = open; i < source.size(); ++i) {
+        if (source[i] == '(') {
+            ++depth;
+        } else if (source[i] == ')' && --depth == 0) {
+            return source.substr(name, i - name + 1);
+        }
+    }
+    check(false, description);
+    return std::string();
+}
+
+static int source_call_argument_count(const std::string& call)
+{
+    const std::size_t open = call.find('(');
+    check(open != std::string::npos, "source call has an argument list");
+    int depth = 0;
+    int arguments = 1;
+    for (std::size_t i = open + 1; i < call.size(); ++i) {
+        if (call[i] == '(') {
+            ++depth;
+        } else if (call[i] == ')') {
+            if (depth == 0) return arguments;
+            --depth;
+        } else if (call[i] == ',' && depth == 0) {
+            ++arguments;
+        }
+    }
+    check(false, "source call argument list closes");
+    return 0;
+}
+
 static void check_source_uses_checked_v2_queries(
     const std::string& source,
     const bool requires_centerline)
@@ -98,6 +141,43 @@ static void test_active_scene_sources_use_checked_v2_queries()
     check_source_uses_checked_v2_queries(state_source, false);
 }
 
+static void test_controller_wires_idle_match_transition_cost()
+{
+    const std::string source = read_controller_source();
+    const std::size_t prior = source.find(
+        "const int prior_index = state.frame_index;");
+    check(prior != std::string::npos,
+          "ordinary matcher captures the incumbent frame");
+    const std::size_t policy = source.find(
+        "const float transition_cost =", prior);
+    check(policy != std::string::npos,
+          "ordinary matcher computes a transition cost");
+    const std::string policy_call = source_call_text(
+        source,
+        "g1_idle_match_transition_cost",
+        policy,
+        "ordinary matcher calls the idle transition-cost policy");
+    check(source_call_argument_count(policy_call) == 2 &&
+              policy_call.find("traversal.commanded_speed") !=
+                  std::string::npos &&
+              policy_call.find(
+                  "walkability_xz_length(state.simulation_velocity)") !=
+                  std::string::npos,
+          "idle policy consumes raw command and planar simulation speeds");
+
+    const std::size_t search = source.find("database_search(", policy);
+    check(search != std::string::npos && policy < search,
+          "idle transition cost is computed immediately before search");
+    const std::string search_call = source_call_text(
+        source,
+        "database_search",
+        policy,
+        "ordinary database search follows idle policy");
+    check(source_call_argument_count(search_call) == 5 &&
+              search_call.find("transition_cost") != std::string::npos,
+          "idle transition cost is the fifth database_search argument");
+}
+
 static void test_failed_model_load_releases_allocated_model()
 {
     const std::string source = read_controller_source();
@@ -139,6 +219,55 @@ static bool same_quat(const quat& first, const quat& second)
 static bool same_float_bits(const float first, const float second)
 {
     return terrain_float_bits(first) == terrain_float_bits(second);
+}
+
+static void check_idle_match_transition_cost(
+    const float command_speed,
+    const float planar_simulation_speed,
+    const float expected,
+    const char* message)
+{
+    check(same_float_bits(
+              g1_idle_match_transition_cost(
+                  command_speed, planar_simulation_speed),
+              expected),
+          message);
+}
+
+static void test_idle_match_transition_cost_policy()
+{
+    const float infinity = std::numeric_limits<float>::infinity();
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float command_above = std::nextafter(1.0e-4f, infinity);
+    const float simulation_above = std::nextafter(0.05f, infinity);
+
+    check_idle_match_transition_cost(
+        0.0f, 0.0f, 1.0f, "zero speeds use exact idle transition cost");
+    check_idle_match_transition_cost(
+        1.0e-4f, 0.05f, 1.0f,
+        "inclusive idle boundaries use exact transition cost");
+    check_idle_match_transition_cost(
+        command_above, 0.0f, 0.0f,
+        "command just above idle boundary preserves active matching");
+    check_idle_match_transition_cost(
+        0.0f, simulation_above, 0.0f,
+        "simulation just above settled boundary preserves active matching");
+    check_idle_match_transition_cost(
+        0.25f, 0.0f, 0.0f,
+        "active command with stopped simulation has no transition cost");
+    check_idle_match_transition_cost(
+        0.0f, 0.25f, 0.0f,
+        "idle command with moving simulation has no transition cost");
+
+    const float invalid[] = {-1.0f, nan, infinity};
+    for (const float value : invalid) {
+        check_idle_match_transition_cost(
+            value, 0.0f, 0.0f,
+            "invalid command speed has no transition cost");
+        check_idle_match_transition_cost(
+            0.0f, value, 0.0f,
+            "invalid simulation speed has no transition cost");
+    }
 }
 
 static void test_scene_first_frame_seeds_desired_trajectory()
@@ -712,7 +841,9 @@ static void test_failed_reset_preserves_prior_state()
 int main()
 {
     test_active_scene_sources_use_checked_v2_queries();
+    test_controller_wires_idle_match_transition_cost();
     test_failed_model_load_releases_allocated_model();
+    test_idle_match_transition_cost_policy();
     test_scene_first_frame_seeds_desired_trajectory();
     test_reset_clears_every_dynamic_subsystem();
     test_failed_reset_preserves_prior_state();
