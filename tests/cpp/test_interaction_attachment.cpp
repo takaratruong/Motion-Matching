@@ -1,0 +1,868 @@
+#include "interaction_attachment.h"
+
+#include <cassert>
+#include <cmath>
+#include <cstdint>
+#include <initializer_list>
+#include <limits>
+#include <stdexcept>
+#include <type_traits>
+
+namespace {
+
+constexpr float kTolerance = 1.0e-5F;
+
+bool near(float left, float right, float tolerance = kTolerance) {
+    return std::abs(left - right) <= tolerance;
+}
+
+bool near(vec3 left, vec3 right, float tolerance = kTolerance) {
+    return near(left.x, right.x, tolerance) &&
+           near(left.y, right.y, tolerance) &&
+           near(left.z, right.z, tolerance);
+}
+
+bool near(quat left, quat right, float tolerance = kTolerance) {
+    return quat_angle_between(left, right) <= tolerance;
+}
+
+bool near(
+    const interaction::Transform& left,
+    const interaction::Transform& right,
+    float tolerance = kTolerance) {
+    return near(left.position, right.position, tolerance) &&
+           near(left.rotation, right.rotation, tolerance);
+}
+
+bool exact(
+    const interaction::Transform& left,
+    const interaction::Transform& right) {
+    return left.position.x == right.position.x &&
+           left.position.y == right.position.y &&
+           left.position.z == right.position.z &&
+           left.rotation.w == right.rotation.w &&
+           left.rotation.x == right.rotation.x &&
+           left.rotation.y == right.rotation.y &&
+           left.rotation.z == right.rotation.z;
+}
+
+struct AttachmentFixture {
+    interaction::TargetRegistry registry;
+    interaction::InteractionTarget target;
+    interaction::PickRequest request;
+    interaction::GraspAffordance affordance;
+};
+
+AttachmentFixture make_fixture() {
+    using namespace interaction;
+
+    AttachmentFixture fixture{};
+    InteractionTarget target{};
+    target.handle = {31, 4};
+    target.object_world = {
+        vec3(0.35F, 0.72F, -0.45F),
+        quat_from_angle_axis(0.31F, vec3(0.0F, 1.0F, 0.0F)),
+    };
+    target.object_dimensions = vec3(0.08F, 0.20F, 0.12F);
+    target.table_world = {
+        vec3(0.0F, 0.65F, -0.30F),
+        quat_from_angle_axis(-0.13F, vec3(0.0F, 1.0F, 0.0F)),
+    };
+    target.table_size = vec3(1.2F, 0.10F, 0.8F);
+    GraspAffordance affordance{};
+    affordance.id = 9;
+    affordance.hand = Hand::Right;
+    affordance.hand_in_object = {
+        vec3(0.025F, 0.085F, -0.015F),
+        quat_from_angle_axis(-0.22F, vec3(1.0F, 0.0F, 0.0F)),
+    };
+    affordance.approach_direction_object = vec3(0.0F, 0.0F, 1.0F);
+    affordance.clearance_radius = 0.04F;
+    target.affordances = {affordance};
+
+    const TargetHandle handle = fixture.registry.upsert(target);
+    fixture.request = {handle, affordance.id, 7001};
+    assert(fixture.registry.reserve(handle, fixture.request.request_id));
+    fixture.target = *fixture.registry.find(handle);
+    fixture.affordance = *fixture.registry.find_affordance(
+        handle, affordance.id);
+    return fixture;
+}
+
+interaction::ContactMeasurement valid_measurement(
+    const AttachmentFixture& fixture) {
+    using namespace interaction;
+    ContactMeasurement measurement{};
+    measurement.target = fixture.request.target;
+    measurement.hand = fixture.affordance.hand;
+    measurement.hand_world = compose(
+        fixture.target.object_world, fixture.affordance.hand_in_object);
+    measurement.position_error_m = 0.0F;
+    measurement.orientation_error_radians = 0.0F;
+    measurement.stable_contact_event = true;
+    measurement.hand_contact = true;
+    measurement.joints_valid = true;
+    measurement.clearance_valid = true;
+    return measurement;
+}
+
+interaction::ContactMeasurement measurement_for_object(
+    const AttachmentFixture& fixture,
+    const interaction::Transform& object_world) {
+    interaction::ContactMeasurement measurement = valid_measurement(fixture);
+    measurement.hand_world = interaction::compose(
+        object_world, fixture.affordance.hand_in_object);
+    return measurement;
+}
+
+template<class Function>
+bool throws_invalid_argument(Function&& function) {
+    try {
+        function();
+    } catch (const std::invalid_argument&) {
+        return true;
+    } catch (...) {
+    }
+    return false;
+}
+
+template<class Mutate>
+void expect_contact_gate_failure(
+    Mutate&& mutate,
+    interaction::Reason expected_reason) {
+    using namespace interaction;
+    AttachmentFixture fixture = make_fixture();
+    AttachmentController attachment(fixture.registry, AttachmentConfig{});
+    assert(attachment.begin(
+        fixture.target,
+        fixture.request,
+        fixture.affordance,
+        fixture.target.object_world.position.y));
+    const Transform original = attachment.object_world();
+    ContactMeasurement measurement = valid_measurement(fixture);
+    measurement.hand_world = {
+        vec3(8.0F, 9.0F, -7.0F),
+        quat_from_angle_axis(1.2F, vec3(0.0F, 0.0F, 1.0F)),
+    };
+    mutate(fixture, measurement);
+
+    assert(!attachment.try_contact(measurement));
+    assert(near(attachment.object_world(), original));
+    assert(attachment.state() != ObjectState::Attached);
+    assert(attachment.state() != ObjectState::Held);
+    assert(attachment.result() == ResultCode::Failed);
+    assert(attachment.reason() == expected_reason);
+    assert(near(attachment.held_seconds(), 0.0F));
+}
+
+void test_frozen_public_contract_and_defaults() {
+    using namespace interaction;
+
+    static_assert(std::is_same_v<std::underlying_type_t<ResultCode>, uint8_t>);
+    static_assert(static_cast<uint8_t>(ResultCode::None) == 0U);
+    static_assert(static_cast<uint8_t>(ResultCode::Accepted) == 1U);
+    static_assert(static_cast<uint8_t>(ResultCode::Succeeded) == 2U);
+    static_assert(static_cast<uint8_t>(ResultCode::Rejected) == 3U);
+    static_assert(static_cast<uint8_t>(ResultCode::Cancelled) == 4U);
+    static_assert(static_cast<uint8_t>(ResultCode::Failed) == 5U);
+    static_assert(static_cast<uint8_t>(ResultCode::Reset) == 6U);
+    static_assert(std::is_same_v<
+        decltype(ContactMeasurement{}.target), TargetHandle>);
+    static_assert(std::is_same_v<decltype(ContactMeasurement{}.hand), Hand>);
+    static_assert(std::is_same_v<
+        decltype(ContactMeasurement{}.hand_world), Transform>);
+    static_assert(std::is_same_v<
+        decltype(ContactMeasurement{}.position_error_m), float>);
+    static_assert(std::is_same_v<
+        decltype(ContactMeasurement{}.orientation_error_radians), float>);
+    static_assert(std::is_same_v<
+        decltype(ContactMeasurement{}.stable_contact_event), bool>);
+    static_assert(std::is_same_v<
+        decltype(ContactMeasurement{}.hand_contact), bool>);
+    static_assert(std::is_same_v<
+        decltype(ContactMeasurement{}.joints_valid), bool>);
+    static_assert(std::is_same_v<
+        decltype(ContactMeasurement{}.clearance_valid), bool>);
+    static_assert(std::is_constructible_v<
+        AttachmentController, TargetRegistry&>);
+    static_assert(std::is_constructible_v<
+        AttachmentController, TargetRegistry&, AttachmentConfig>);
+    static_assert(std::is_same_v<
+        decltype(&AttachmentController::begin),
+        bool (AttachmentController::*)(
+            const InteractionTarget&,
+            const PickRequest&,
+            const GraspAffordance&,
+            float)>);
+    static_assert(std::is_same_v<
+        decltype(&AttachmentController::try_contact),
+        bool (AttachmentController::*)(const ContactMeasurement&)>);
+    static_assert(std::is_same_v<
+        decltype(&AttachmentController::update),
+        void (AttachmentController::*)(const ContactMeasurement&, float)>);
+    static_assert(std::is_same_v<
+        decltype(&AttachmentController::reset),
+        TargetHandle (AttachmentController::*)(Transform)>);
+    static_assert(std::is_same_v<
+        decltype(&AttachmentController::object_world),
+        Transform (AttachmentController::*)() const>);
+    static_assert(std::is_same_v<
+        decltype(&AttachmentController::state),
+        ObjectState (AttachmentController::*)() const>);
+    static_assert(std::is_same_v<
+        decltype(&AttachmentController::result),
+        ResultCode (AttachmentController::*)() const>);
+    static_assert(std::is_same_v<
+        decltype(&AttachmentController::reason),
+        Reason (AttachmentController::*)() const>);
+    static_assert(std::is_same_v<
+        decltype(&AttachmentController::held_seconds),
+        float (AttachmentController::*)() const>);
+
+    const AttachmentConfig config{};
+    assert(config.maximum_position_error_m == 0.04F);
+    assert(config.maximum_orientation_error_radians == 0.261799388F);
+    assert(config.required_lift_m == 0.15F);
+    assert(config.required_hold_seconds == 1.00F);
+
+    TargetRegistry registry;
+    const AttachmentController unstarted(registry);
+    assert(unstarted.state() == ObjectState::Free);
+    assert(unstarted.result() == ResultCode::None);
+    assert(unstarted.reason() == Reason::None);
+    assert(near(unstarted.held_seconds(), 0.0F));
+    assert(near(unstarted.object_world(), Transform{}));
+}
+
+void test_every_contact_gate_rejects_without_teleporting() {
+    using namespace interaction;
+
+    expect_contact_gate_failure(
+        [](AttachmentFixture&, ContactMeasurement& measurement) {
+            measurement.stable_contact_event = false;
+        },
+        Reason::LostContact);
+    expect_contact_gate_failure(
+        [](AttachmentFixture&, ContactMeasurement& measurement) {
+            ++measurement.target.generation;
+        },
+        Reason::TargetChanged);
+    expect_contact_gate_failure(
+        [](AttachmentFixture& fixture, ContactMeasurement&) {
+            assert(fixture.registry.release(
+                fixture.request.target, fixture.request.request_id));
+        },
+        Reason::TargetChanged);
+    expect_contact_gate_failure(
+        [](AttachmentFixture&, ContactMeasurement& measurement) {
+            measurement.hand = Hand::Left;
+        },
+        Reason::LostContact);
+    expect_contact_gate_failure(
+        [](AttachmentFixture&, ContactMeasurement& measurement) {
+            measurement.hand_contact = false;
+        },
+        Reason::LostContact);
+    expect_contact_gate_failure(
+        [](AttachmentFixture&, ContactMeasurement& measurement) {
+            measurement.position_error_m = 0.040001F;
+        },
+        Reason::ContactPosition);
+    expect_contact_gate_failure(
+        [](AttachmentFixture&, ContactMeasurement& measurement) {
+            measurement.orientation_error_radians = 0.261800F;
+        },
+        Reason::ContactOrientation);
+    expect_contact_gate_failure(
+        [](AttachmentFixture&, ContactMeasurement& measurement) {
+            measurement.joints_valid = false;
+        },
+        Reason::JointLimit);
+    expect_contact_gate_failure(
+        [](AttachmentFixture&, ContactMeasurement& measurement) {
+            measurement.clearance_valid = false;
+        },
+        Reason::BlockedPath);
+}
+
+void test_valid_contact_attaches_at_inclusive_boundaries() {
+    using namespace interaction;
+
+    AttachmentFixture fixture = make_fixture();
+    AttachmentController attachment(fixture.registry);
+    assert(attachment.begin(
+        fixture.target,
+        fixture.request,
+        fixture.affordance,
+        fixture.target.object_world.position.y));
+    assert(attachment.state() == ObjectState::Targeted);
+    assert(attachment.result() == ResultCode::Accepted);
+    assert(attachment.reason() == Reason::None);
+    assert(near(attachment.object_world(), fixture.target.object_world));
+
+    ContactMeasurement contact = valid_measurement(fixture);
+    contact.position_error_m = 0.04F;
+    contact.orientation_error_radians = 0.261799388F;
+    assert(attachment.try_contact(contact));
+
+    assert(attachment.state() == ObjectState::Attached);
+    assert(fixture.registry.find(fixture.request.target)->state ==
+           ObjectState::Attached);
+    assert(attachment.result() == ResultCode::Accepted);
+    assert(attachment.reason() == Reason::None);
+    assert(near(attachment.object_world(), fixture.target.object_world));
+    assert(near(
+        attachment.object_world(),
+        compose(contact.hand_world, inverse(fixture.affordance.hand_in_object))));
+    assert(near(attachment.held_seconds(), 0.0F));
+}
+
+void test_failed_contact_can_be_remeasured_without_teleporting() {
+    using namespace interaction;
+
+    AttachmentFixture fixture = make_fixture();
+    AttachmentController attachment(fixture.registry);
+    assert(attachment.begin(
+        fixture.target,
+        fixture.request,
+        fixture.affordance,
+        fixture.target.object_world.position.y));
+    const Transform original = attachment.object_world();
+    ContactMeasurement rejected = valid_measurement(fixture);
+    rejected.position_error_m = 0.041F;
+    rejected.hand_world.position =
+        rejected.hand_world.position + vec3(2.0F, 3.0F, -4.0F);
+
+    assert(!attachment.try_contact(rejected));
+    assert(attachment.reason() == Reason::ContactPosition);
+    assert(attachment.result() == ResultCode::Failed);
+    assert(attachment.state() == ObjectState::Targeted);
+    assert(near(attachment.object_world(), original));
+    assert(fixture.registry.validate(
+        fixture.request.target, fixture.request.request_id));
+
+    assert(attachment.try_contact(valid_measurement(fixture)));
+    assert(attachment.state() == ObjectState::Attached);
+    assert(attachment.result() == ResultCode::Accepted);
+    assert(attachment.reason() == Reason::None);
+    assert(near(attachment.object_world(), original));
+}
+
+void test_object_follows_grasp_and_hold_requires_continuous_lift() {
+    using namespace interaction;
+
+    AttachmentFixture fixture = make_fixture();
+    AttachmentController attachment(fixture.registry);
+    const float pre_lift_height = fixture.target.object_world.position.y;
+    assert(attachment.begin(
+        fixture.target,
+        fixture.request,
+        fixture.affordance,
+        pre_lift_height));
+    assert(attachment.try_contact(valid_measurement(fixture)));
+
+    Transform lifted = fixture.target.object_world;
+    lifted.position = vec3(-0.20F, pre_lift_height + 0.15F, 0.55F);
+    lifted.rotation = quat_from_angle_axis(
+        -0.47F, vec3(0.0F, 1.0F, 0.0F));
+    ContactMeasurement lifted_measurement = measurement_for_object(
+        fixture, lifted);
+    attachment.update(lifted_measurement, 0.25F);
+    assert(attachment.state() == ObjectState::Attached);
+    assert(near(attachment.object_world(), lifted));
+    assert(near(attachment.held_seconds(), 0.25F));
+
+    Transform below = lifted;
+    below.position.y = pre_lift_height + 0.149F;
+    attachment.update(measurement_for_object(fixture, below), 0.50F);
+    assert(attachment.state() == ObjectState::Attached);
+    assert(near(attachment.object_world(), below));
+    assert(near(attachment.held_seconds(), 0.0F));
+
+    Transform raised = lifted;
+    raised.position = vec3(0.65F, pre_lift_height + 0.18F, -0.10F);
+    raised.rotation = quat_normalize(quat_mul(
+        quat_from_angle_axis(0.36F, vec3(1.0F, 0.0F, 0.0F)),
+        quat_from_angle_axis(-0.29F, vec3(0.0F, 1.0F, 0.0F))));
+    ContactMeasurement raised_measurement = measurement_for_object(
+        fixture, raised);
+    for (int update = 0; update < 3; ++update) {
+        attachment.update(raised_measurement, 0.25F);
+        assert(attachment.state() == ObjectState::Attached);
+        assert(near(
+            attachment.held_seconds(),
+            0.25F * static_cast<float>(update + 1)));
+    }
+    attachment.update(raised_measurement, 0.25F);
+
+    assert(attachment.state() == ObjectState::Held);
+    assert(fixture.registry.find(fixture.request.target)->state ==
+           ObjectState::Held);
+    assert(attachment.result() == ResultCode::Succeeded);
+    assert(attachment.reason() == Reason::None);
+    assert(near(attachment.held_seconds(), 1.0F));
+    assert(near(attachment.object_world(), raised));
+    assert(near(
+        attachment.object_world(),
+        compose(
+            raised_measurement.hand_world,
+            inverse(fixture.affordance.hand_in_object))));
+
+    Transform carried = raised;
+    carried.position.x += 0.25F;
+    carried.position.y += 0.05F;
+    ContactMeasurement carried_measurement = measurement_for_object(
+        fixture, carried);
+    attachment.update(carried_measurement, 0.40F);
+    assert(attachment.state() == ObjectState::Held);
+    assert(attachment.result() == ResultCode::Succeeded);
+    assert(attachment.held_seconds() >= 1.0F);
+    assert(near(attachment.object_world(), carried));
+}
+
+void test_post_attach_updates_require_contact_but_not_a_second_event() {
+    using namespace interaction;
+
+    AttachmentFixture fixture = make_fixture();
+    AttachmentController attachment(fixture.registry);
+    assert(attachment.begin(
+        fixture.target,
+        fixture.request,
+        fixture.affordance,
+        fixture.target.object_world.position.y));
+    assert(attachment.try_contact(valid_measurement(fixture)));
+
+    Transform moved = fixture.target.object_world;
+    moved.position = moved.position + vec3(0.20F, 0.16F, -0.15F);
+    ContactMeasurement continuing = measurement_for_object(fixture, moved);
+    continuing.stable_contact_event = false;
+    attachment.update(continuing, 0.30F);
+    assert(attachment.state() == ObjectState::Attached);
+    assert(attachment.reason() == Reason::None);
+    assert(near(attachment.object_world(), moved));
+    assert(near(attachment.held_seconds(), 0.30F));
+
+    const Transform last_valid = attachment.object_world();
+    ContactMeasurement lost = continuing;
+    lost.hand_contact = false;
+    lost.hand_world.position =
+        lost.hand_world.position + vec3(4.0F, 4.0F, 4.0F);
+    attachment.update(lost, 0.70F);
+    assert(attachment.state() != ObjectState::Held);
+    assert(attachment.result() == ResultCode::Failed);
+    assert(attachment.reason() == Reason::LostContact);
+    assert(near(attachment.object_world(), last_valid));
+    assert(near(attachment.held_seconds(), 0.0F));
+    assert(fixture.registry.find(fixture.request.target)->state !=
+           ObjectState::Held);
+}
+
+void test_generation_change_fails_without_attaching_replacement() {
+    using namespace interaction;
+
+    AttachmentFixture fixture = make_fixture();
+    AttachmentController attachment(fixture.registry);
+    assert(attachment.begin(
+        fixture.target,
+        fixture.request,
+        fixture.affordance,
+        fixture.target.object_world.position.y));
+    assert(attachment.try_contact(valid_measurement(fixture)));
+    const Transform last_valid = attachment.object_world();
+    const Transform replacement_world{
+        vec3(-1.0F, 1.25F, 2.5F),
+        quat_from_angle_axis(0.73F, vec3(0.0F, 1.0F, 0.0F)),
+    };
+    const TargetHandle replacement = fixture.registry.replace_pose(
+        fixture.request.target.id, replacement_world);
+    assert(replacement.id == fixture.request.target.id);
+    assert(replacement.generation == fixture.request.target.generation + 1U);
+
+    ContactMeasurement stale = valid_measurement(fixture);
+    stale.hand_world.position =
+        stale.hand_world.position + vec3(3.0F, 3.0F, 3.0F);
+    attachment.update(stale, 0.50F);
+
+    assert(attachment.result() == ResultCode::Failed);
+    assert(attachment.reason() == Reason::TargetChanged);
+    assert(near(attachment.object_world(), last_valid));
+    assert(fixture.registry.find(fixture.request.target) == nullptr);
+    const InteractionTarget* replacement_target =
+        fixture.registry.find(replacement);
+    assert(replacement_target != nullptr);
+    assert(replacement_target->state == ObjectState::Free);
+    assert(replacement_target->owner_request == 0);
+    assert(exact(replacement_target->object_world, replacement_world));
+}
+
+void test_reset_restores_exact_pose_and_increments_generation() {
+    using namespace interaction;
+
+    AttachmentFixture fixture = make_fixture();
+    AttachmentController attachment(fixture.registry);
+    assert(attachment.begin(
+        fixture.target,
+        fixture.request,
+        fixture.affordance,
+        fixture.target.object_world.position.y));
+    assert(attachment.try_contact(valid_measurement(fixture)));
+    Transform lifted = fixture.target.object_world;
+    lifted.position.y += 0.20F;
+    attachment.update(measurement_for_object(fixture, lifted), 0.40F);
+    assert(near(attachment.held_seconds(), 0.40F));
+
+    const Transform restored{
+        vec3(-0.375F, 0.8125F, 1.0625F),
+        quat_from_angle_axis(-0.625F, vec3(0.0F, 1.0F, 0.0F)),
+    };
+    const TargetHandle reset = attachment.reset(restored);
+
+    assert(reset.id == fixture.request.target.id);
+    assert(reset.generation == fixture.request.target.generation + 1U);
+    assert(fixture.registry.find(fixture.request.target) == nullptr);
+    const InteractionTarget* target = fixture.registry.find(reset);
+    assert(target != nullptr);
+    assert(target->state == ObjectState::Free);
+    assert(target->owner_request == 0);
+    assert(exact(target->object_world, restored));
+    assert(exact(attachment.object_world(), restored));
+    assert(attachment.state() == ObjectState::Free);
+    assert(attachment.result() == ResultCode::Reset);
+    assert(attachment.reason() == Reason::Reset);
+    assert(near(attachment.held_seconds(), 0.0F));
+    assert(!fixture.registry.validate(
+        fixture.request.target, fixture.request.request_id));
+}
+
+void test_repeated_contact_is_rejected_and_reset_can_rebegin() {
+    using namespace interaction;
+
+    AttachmentFixture fixture = make_fixture();
+    AttachmentController attachment(fixture.registry);
+    assert(attachment.begin(
+        fixture.target,
+        fixture.request,
+        fixture.affordance,
+        fixture.target.object_world.position.y));
+    assert(attachment.try_contact(valid_measurement(fixture)));
+    const Transform attached_pose = attachment.object_world();
+    ContactMeasurement duplicate = valid_measurement(fixture);
+    duplicate.hand_world.position =
+        duplicate.hand_world.position + vec3(3.0F, 4.0F, 5.0F);
+
+    assert(!attachment.try_contact(duplicate));
+    assert(attachment.state() == ObjectState::Attached);
+    assert(attachment.result() == ResultCode::Accepted);
+    assert(attachment.reason() == Reason::None);
+    assert(near(attachment.object_world(), attached_pose));
+    assert(fixture.registry.find(fixture.request.target)->state ==
+           ObjectState::Attached);
+
+    Transform held_pose = attached_pose;
+    held_pose.position.y += 0.20F;
+    ContactMeasurement held_measurement = measurement_for_object(
+        fixture, held_pose);
+    attachment.update(held_measurement, 1.0F);
+    assert(attachment.state() == ObjectState::Held);
+    assert(attachment.result() == ResultCode::Succeeded);
+    const float held_seconds = attachment.held_seconds();
+    duplicate = held_measurement;
+    duplicate.stable_contact_event = true;
+    duplicate.hand_world.position =
+        duplicate.hand_world.position + vec3(-2.0F, 3.0F, 4.0F);
+    assert(!attachment.try_contact(duplicate));
+    assert(attachment.state() == ObjectState::Held);
+    assert(attachment.result() == ResultCode::Succeeded);
+    assert(attachment.reason() == Reason::None);
+    assert(near(attachment.object_world(), held_pose));
+    assert(near(attachment.held_seconds(), held_seconds));
+    assert(fixture.registry.find(fixture.request.target)->state ==
+           ObjectState::Held);
+
+    const Transform restored{
+        vec3(0.125F, 0.75F, -0.25F),
+        quat_from_angle_axis(0.25F, vec3(0.0F, 1.0F, 0.0F)),
+    };
+    const TargetHandle reset = attachment.reset(restored);
+    constexpr uint64_t second_request_id = 7002;
+    assert(fixture.registry.reserve(reset, second_request_id));
+    const InteractionTarget* second_target = fixture.registry.find(reset);
+    const GraspAffordance* second_affordance =
+        fixture.registry.find_affordance(reset, fixture.affordance.id);
+    assert(second_target != nullptr && second_affordance != nullptr);
+    const PickRequest second_request{
+        reset, second_affordance->id, second_request_id};
+
+    assert(attachment.begin(
+        *second_target,
+        second_request,
+        *second_affordance,
+        restored.position.y));
+    assert(attachment.state() == ObjectState::Targeted);
+    assert(attachment.result() == ResultCode::Accepted);
+    assert(attachment.reason() == Reason::None);
+    assert(exact(attachment.object_world(), restored));
+    ContactMeasurement second_contact{};
+    second_contact.target = reset;
+    second_contact.hand = second_affordance->hand;
+    second_contact.hand_world = compose(
+        restored, second_affordance->hand_in_object);
+    second_contact.stable_contact_event = true;
+    second_contact.hand_contact = true;
+    second_contact.joints_valid = true;
+    second_contact.clearance_valid = true;
+    assert(attachment.try_contact(second_contact));
+    assert(attachment.state() == ObjectState::Attached);
+}
+
+void assert_begin_rejected(
+    AttachmentFixture& fixture,
+    interaction::InteractionTarget target,
+    interaction::PickRequest request,
+    interaction::GraspAffordance affordance,
+    interaction::Reason expected_reason) {
+    using namespace interaction;
+
+    AttachmentController attachment(fixture.registry);
+    assert(!attachment.begin(
+        target, request, affordance, target.object_world.position.y));
+    assert(attachment.state() == ObjectState::Free);
+    assert(attachment.result() == ResultCode::Rejected);
+    assert(attachment.reason() == expected_reason);
+    assert(near(attachment.held_seconds(), 0.0F));
+}
+
+void test_begin_rejects_incoherent_or_unreserved_inputs() {
+    using namespace interaction;
+
+    {
+        AttachmentFixture fixture = make_fixture();
+        InteractionTarget stale = fixture.target;
+        ++stale.handle.generation;
+        assert_begin_rejected(
+            fixture,
+            stale,
+            fixture.request,
+            fixture.affordance,
+            Reason::TargetChanged);
+    }
+    {
+        AttachmentFixture fixture = make_fixture();
+        PickRequest stale = fixture.request;
+        ++stale.target.generation;
+        assert_begin_rejected(
+            fixture,
+            fixture.target,
+            stale,
+            fixture.affordance,
+            Reason::TargetChanged);
+    }
+    {
+        AttachmentFixture fixture = make_fixture();
+        PickRequest wrong_owner = fixture.request;
+        ++wrong_owner.request_id;
+        assert_begin_rejected(
+            fixture,
+            fixture.target,
+            wrong_owner,
+            fixture.affordance,
+            Reason::TargetChanged);
+    }
+    {
+        AttachmentFixture fixture = make_fixture();
+        PickRequest missing_affordance = fixture.request;
+        ++missing_affordance.affordance_id;
+        assert_begin_rejected(
+            fixture,
+            fixture.target,
+            missing_affordance,
+            fixture.affordance,
+            Reason::TargetUnavailable);
+    }
+    {
+        AttachmentFixture fixture = make_fixture();
+        GraspAffordance unauthored = fixture.affordance;
+        ++unauthored.id;
+        assert_begin_rejected(
+            fixture,
+            fixture.target,
+            fixture.request,
+            unauthored,
+            Reason::TargetUnavailable);
+    }
+    {
+        AttachmentFixture fixture = make_fixture();
+        assert(fixture.registry.release(
+            fixture.request.target, fixture.request.request_id));
+        assert_begin_rejected(
+            fixture,
+            fixture.target,
+            fixture.request,
+            fixture.affordance,
+            Reason::TargetChanged);
+    }
+}
+
+void test_invalid_configuration_and_nonfinite_prelift_are_rejected() {
+    using namespace interaction;
+
+    auto rejected_config = [](AttachmentConfig config) {
+        TargetRegistry registry;
+        return throws_invalid_argument([&] {
+            AttachmentController attachment(registry, config);
+            (void)attachment;
+        });
+    };
+
+    AttachmentConfig config{};
+    config.maximum_position_error_m = -0.001F;
+    assert(rejected_config(config));
+    config = AttachmentConfig{};
+    config.maximum_orientation_error_radians =
+        std::numeric_limits<float>::infinity();
+    assert(rejected_config(config));
+    config = AttachmentConfig{};
+    config.required_lift_m = -0.001F;
+    assert(rejected_config(config));
+    config = AttachmentConfig{};
+    config.required_hold_seconds =
+        std::numeric_limits<float>::quiet_NaN();
+    assert(rejected_config(config));
+
+    AttachmentFixture fixture = make_fixture();
+    AttachmentController attachment(fixture.registry);
+    assert(throws_invalid_argument([&] {
+        (void)attachment.begin(
+            fixture.target,
+            fixture.request,
+            fixture.affordance,
+            std::numeric_limits<float>::quiet_NaN());
+    }));
+    assert(attachment.state() == ObjectState::Free);
+    assert(attachment.result() == ResultCode::None);
+    assert(attachment.reason() == Reason::None);
+    assert(fixture.registry.validate(
+        fixture.request.target, fixture.request.request_id));
+}
+
+void test_invalid_contact_scalars_and_transforms_do_not_attach() {
+    using namespace interaction;
+
+    expect_contact_gate_failure(
+        [](AttachmentFixture&, ContactMeasurement& measurement) {
+            measurement.position_error_m = -0.001F;
+        },
+        Reason::ContactPosition);
+    expect_contact_gate_failure(
+        [](AttachmentFixture&, ContactMeasurement& measurement) {
+            measurement.position_error_m =
+                std::numeric_limits<float>::quiet_NaN();
+        },
+        Reason::ContactPosition);
+    expect_contact_gate_failure(
+        [](AttachmentFixture&, ContactMeasurement& measurement) {
+            measurement.orientation_error_radians = -0.001F;
+        },
+        Reason::ContactOrientation);
+    expect_contact_gate_failure(
+        [](AttachmentFixture&, ContactMeasurement& measurement) {
+            measurement.orientation_error_radians =
+                std::numeric_limits<float>::infinity();
+        },
+        Reason::ContactOrientation);
+    expect_contact_gate_failure(
+        [](AttachmentFixture&, ContactMeasurement& measurement) {
+            measurement.hand_world.position.x =
+                std::numeric_limits<float>::quiet_NaN();
+        },
+        Reason::ContactPosition);
+    expect_contact_gate_failure(
+        [](AttachmentFixture&, ContactMeasurement& measurement) {
+            measurement.hand_world.rotation = quat(0.0F, 0.0F, 0.0F, 0.0F);
+        },
+        Reason::ContactOrientation);
+}
+
+void test_overflowing_derived_pose_does_not_attach_or_mutate() {
+    using namespace interaction;
+
+    AttachmentFixture fixture = make_fixture();
+    AttachmentController attachment(fixture.registry);
+    assert(attachment.begin(
+        fixture.target,
+        fixture.request,
+        fixture.affordance,
+        fixture.target.object_world.position.y));
+    const Transform original = attachment.object_world();
+    ContactMeasurement overflow = valid_measurement(fixture);
+    const float maximum = std::numeric_limits<float>::max();
+    overflow.hand_world.rotation = quat(maximum, maximum, maximum, maximum);
+
+    assert(!attachment.try_contact(overflow));
+    assert(attachment.state() == ObjectState::Targeted);
+    assert(attachment.result() == ResultCode::Failed);
+    assert(attachment.reason() == Reason::ContactOrientation);
+    assert(near(attachment.object_world(), original));
+    const InteractionTarget* target =
+        fixture.registry.find(fixture.request.target);
+    assert(target != nullptr);
+    assert(target->state == ObjectState::Targeted);
+    assert(target->owner_request == fixture.request.request_id);
+}
+
+void test_update_rejects_invalid_dt_without_mutating_state() {
+    using namespace interaction;
+
+    AttachmentFixture fixture = make_fixture();
+    AttachmentController attachment(fixture.registry);
+    assert(attachment.begin(
+        fixture.target,
+        fixture.request,
+        fixture.affordance,
+        fixture.target.object_world.position.y));
+    assert(attachment.try_contact(valid_measurement(fixture)));
+    Transform lifted = fixture.target.object_world;
+    lifted.position.y += 0.20F;
+    const ContactMeasurement measurement = measurement_for_object(
+        fixture, lifted);
+    const Transform before = attachment.object_world();
+
+    for (const float invalid_dt : {
+             -0.001F,
+             std::numeric_limits<float>::quiet_NaN(),
+             std::numeric_limits<float>::infinity(),
+         }) {
+        assert(throws_invalid_argument([&] {
+            attachment.update(measurement, invalid_dt);
+        }));
+        assert(attachment.state() == ObjectState::Attached);
+        assert(attachment.result() == ResultCode::Accepted);
+        assert(attachment.reason() == Reason::None);
+        assert(near(attachment.object_world(), before));
+        assert(near(attachment.held_seconds(), 0.0F));
+    }
+
+    attachment.update(measurement, 0.0F);
+    assert(attachment.state() == ObjectState::Attached);
+    assert(near(attachment.object_world(), lifted));
+    assert(near(attachment.held_seconds(), 0.0F));
+}
+
+}  // namespace
+
+int main() {
+    test_frozen_public_contract_and_defaults();
+    test_every_contact_gate_rejects_without_teleporting();
+    test_valid_contact_attaches_at_inclusive_boundaries();
+    test_failed_contact_can_be_remeasured_without_teleporting();
+    test_object_follows_grasp_and_hold_requires_continuous_lift();
+    test_post_attach_updates_require_contact_but_not_a_second_event();
+    test_generation_change_fails_without_attaching_replacement();
+    test_reset_restores_exact_pose_and_increments_generation();
+    test_repeated_contact_is_rejected_and_reset_can_rebegin();
+    test_begin_rejects_incoherent_or_unreserved_inputs();
+    test_invalid_configuration_and_nonfinite_prelift_are_rejected();
+    test_invalid_contact_scalars_and_transforms_do_not_attach();
+    test_overflowing_derived_pose_does_not_attach_or_mutate();
+    test_update_rejects_invalid_dt_without_mutating_state();
+}
