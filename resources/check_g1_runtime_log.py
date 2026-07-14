@@ -5,7 +5,7 @@ import math
 import struct
 
 
-CSV_COLUMNS = (
+GATE_A_COLUMNS = (
     "frame", "fixed_dt", "scene_id", "mode", "route",
     "query_bits_hex",
     "query_database_frame", "query_range", "selected_database_frame",
@@ -30,6 +30,27 @@ CSV_COLUMNS = (
     "matching_enabled", "adjustment_enabled", "clamping_enabled",
     "support_retargeting_enabled", "ik_enabled",
 )
+RUNTIME_SUFFIX = (
+    "source_name", "source_terrain", "source_index", "continuation_cost",
+    "source_root_height", "source_left_toe_height", "source_right_toe_height",
+    "runtime_support_root_height", "runtime_support_left_toe_height",
+    "runtime_support_right_toe_height", "support_root_delta",
+    "support_left_toe_delta", "support_right_toe_delta", "support_height",
+    "support_velocity", "support_source", "airborne_frames", "left_contact",
+    "right_contact", "support_retargeted_hips_y", "ik_adjusted_hips_y",
+    "simulation_x", "simulation_z", "walkability_class", "blocked",
+    "blocked_reason", "blocked_distance", "blocked_point_x",
+    "blocked_point_z", "commanded_speed", "applied_speed", "route_waypoint",
+    "route_complete", "route_target_height", "scene_generation",
+    "scene_frame", "scene_reset_count", "scene_switch_failed",
+    "motion_pack_load_count", "model_load_count", "model_unload_count",
+    "live_model_count",
+)
+RUNTIME_COLUMNS = list(GATE_A_COLUMNS) + list(RUNTIME_SUFFIX)
+
+# Gate A callers keep their historical name and exact immutable tuple. Runtime
+# readers accept the append-only suffix without weakening that prerequisite.
+CSV_COLUMNS = GATE_A_COLUMNS
 REQUIRED_COLUMNS = set(CSV_COLUMNS)
 TEXT_COLUMNS = {"scene_id", "mode", "route", "query_bits_hex"}
 INTEGER_COLUMNS = {

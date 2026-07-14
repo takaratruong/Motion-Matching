@@ -84,6 +84,48 @@ struct motion_match_log_row
     bool clamping_enabled = true;
     bool support_retargeting_enabled = false;
     bool ik_enabled = false;
+    const char* source_name = "";
+    const char* source_terrain = "";
+    int source_index = 0;
+    float continuation_cost = 0.0f;
+    float source_root_height = 0.0f;
+    float source_left_toe_height = 0.0f;
+    float source_right_toe_height = 0.0f;
+    float runtime_support_root_height = 0.0f;
+    float runtime_support_left_toe_height = 0.0f;
+    float runtime_support_right_toe_height = 0.0f;
+    float support_root_delta = 0.0f;
+    float support_left_toe_delta = 0.0f;
+    float support_right_toe_delta = 0.0f;
+    float support_height = 0.0f;
+    float support_velocity = 0.0f;
+    const char* support_source = "";
+    int airborne_frames = 0;
+    bool left_contact = false;
+    bool right_contact = false;
+    float support_retargeted_hips_y = 0.0f;
+    float ik_adjusted_hips_y = 0.0f;
+    float simulation_x = 0.0f;
+    float simulation_z = 0.0f;
+    int walkability_class = 1;
+    bool blocked = false;
+    const char* blocked_reason = "";
+    float blocked_distance = 0.0f;
+    float blocked_point_x = 0.0f;
+    float blocked_point_z = 0.0f;
+    float commanded_speed = 0.0f;
+    float applied_speed = 0.0f;
+    int route_waypoint = 0;
+    bool route_complete = false;
+    float route_target_height = 0.0f;
+    int scene_generation = 0;
+    int scene_frame = 0;
+    int scene_reset_count = 0;
+    bool scene_switch_failed = false;
+    int motion_pack_load_count = 0;
+    int model_load_count = 0;
+    int model_unload_count = 0;
+    int live_model_count = 0;
 };
 
 struct motion_match_log
@@ -133,7 +175,20 @@ struct motion_match_log
             "rendered_right_toe_clearance,rendered_min_clearance,"
             "adjustment_xz,adjustment_y,clamp_xz,clamp_y,matching_enabled,"
             "adjustment_enabled,clamping_enabled,support_retargeting_enabled,"
-            "ik_enabled\n") >= 0;
+            "ik_enabled"
+            ",source_name,source_terrain,source_index,continuation_cost,"
+            "source_root_height,source_left_toe_height,source_right_toe_height,"
+            "runtime_support_root_height,runtime_support_left_toe_height,"
+            "runtime_support_right_toe_height,support_root_delta,"
+            "support_left_toe_delta,support_right_toe_delta,support_height,"
+            "support_velocity,support_source,airborne_frames,left_contact,"
+            "right_contact,support_retargeted_hips_y,ik_adjusted_hips_y,"
+            "simulation_x,simulation_z,walkability_class,blocked,"
+            "blocked_reason,blocked_distance,blocked_point_x,blocked_point_z,"
+            "commanded_speed,applied_speed,route_waypoint,route_complete,"
+            "route_target_height,scene_generation,scene_frame,"
+            "scene_reset_count,scene_switch_failed,motion_pack_load_count,"
+            "model_load_count,model_unload_count,live_model_count\n") >= 0;
         if (!header_ok || fflush(file) != 0) {
             const int saved_errno = errno;
             fclose(file);
@@ -169,7 +224,7 @@ struct motion_match_log
             ",%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,"
             "%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,"
             "%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,"
-            "%d,%d,%d,%d,%d\n",
+            "%d,%d,%d,%d,%d",
             r.raw_selected.hips_y, r.inertialized.hips_y,
             r.rendered.hips_y, r.hips_inertial_offset_y,
             r.runtime_root_surface_height,
@@ -191,6 +246,31 @@ struct motion_match_log
             (int)r.matching_enabled, (int)r.adjustment_enabled,
             (int)r.clamping_enabled, (int)r.support_retargeting_enabled,
             (int)r.ik_enabled) >= 0;
+        if (ok) ok = fprintf(file,
+            ",%s,%s,%d,%.9g,"
+            "%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,"
+            "%s,%d,%d,%d,%.9g,%.9g,%.9g,%.9g,%d,%d,%s,"
+            "%.9g,%.9g,%.9g,%.9g,%.9g,%d,%d,%.9g,%d,%d,%d,%d,%d,%d,%d,%d\n",
+            r.source_name, r.source_terrain, r.source_index,
+            r.continuation_cost,
+            r.source_root_height, r.source_left_toe_height,
+            r.source_right_toe_height,
+            r.runtime_support_root_height,
+            r.runtime_support_left_toe_height,
+            r.runtime_support_right_toe_height,
+            r.support_root_delta, r.support_left_toe_delta,
+            r.support_right_toe_delta, r.support_height, r.support_velocity,
+            r.support_source, r.airborne_frames,
+            (int)r.left_contact, (int)r.right_contact,
+            r.support_retargeted_hips_y, r.ik_adjusted_hips_y,
+            r.simulation_x, r.simulation_z,
+            r.walkability_class, (int)r.blocked, r.blocked_reason,
+            r.blocked_distance, r.blocked_point_x, r.blocked_point_z,
+            r.commanded_speed, r.applied_speed,
+            r.route_waypoint, (int)r.route_complete, r.route_target_height,
+            r.scene_generation, r.scene_frame, r.scene_reset_count,
+            (int)r.scene_switch_failed, r.motion_pack_load_count,
+            r.model_load_count, r.model_unload_count, r.live_model_count) >= 0;
         if (ok) ok = fflush(file) == 0;
         return ok ? true : io_error(error, error_capacity, "write", errno);
     }

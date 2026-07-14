@@ -89,6 +89,7 @@ struct g1_controller_state
     float blocked_distance = FLT_MAX;
     vec3 blocked_point;
 
+    // Open-loop route cursor; route_frames advances only after its row writes.
     int route_index = 0;
     int route_waypoint = 1;
     int route_frames = 0;

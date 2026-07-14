@@ -13,8 +13,10 @@
 #include "array.h"
 #include "character.h"
 #include "scene_runtime.h"
+#include "route_runtime.h"
 #include "support_runtime.h"
 #include "g1_controller_state.h"
+#include "g1_runtime_diagnostics.h"
 #include "scene_switch.h"
 #include "motion_match_log.h"
 #include "nnet.h"
@@ -78,7 +80,15 @@ static bool g1_parse_test_frames(
     return true;
 }
 
-enum g1_test_mode { G1_TestLive, G1_TestSequential, G1_TestFlat, G1_TestTerrain };
+enum g1_test_mode
+{
+    G1_TestLive,
+    G1_TestSequential,
+    G1_TestFlat,
+    G1_TestTerrain,
+    G1_TestRoute,
+    G1_TestSceneCycle,
+};
 
 struct g1_test_config
 {
@@ -86,12 +96,37 @@ struct g1_test_config
     const char* name = "live";
     const char* route = "manual";
     int frame_limit = 0;
+    int scene_dwell_frames = 25;
 };
+
+static bool g1_parse_scene_dwell_frames(
+    int& dwell_frames, char* error, const int error_capacity)
+{
+    const char* text = getenv("MM_SCENE_DWELL_FRAMES");
+    if (text == NULL) return true;
+
+    errno = 0;
+    char* end = NULL;
+    const long parsed = strtol(text, &end, 10);
+    if (text[0] == '\0' || end == text || *end != '\0' || errno == ERANGE ||
+        parsed < 1 || parsed > 10000)
+    {
+        return g1_error(
+            error,
+            error_capacity,
+            "MM_SCENE_DWELL_FRAMES must be an integer in [1,10000], got '%s'",
+            text);
+    }
+    dwell_frames = static_cast<int>(parsed);
+    return true;
+}
 
 static bool g1_parse_test_config(
     g1_test_config& out, char* error, const int error_capacity)
 {
     const char* mode = getenv("MM_TEST_MODE");
+    const char* route = getenv("MM_TEST_ROUTE");
+    const char* dwell = getenv("MM_SCENE_DWELL_FRAMES");
     if (mode != NULL) {
         if (strcmp(mode, "sequential") == 0) {
             out.mode = G1_TestSequential; out.name = mode;
@@ -102,10 +137,62 @@ static bool g1_parse_test_config(
         } else if (strcmp(mode, "terrain") == 0) {
             out.mode = G1_TestTerrain; out.name = mode;
             out.route = "curb-forward";
+        } else if (strcmp(mode, "route") == 0) {
+            out.mode = G1_TestRoute; out.name = mode;
+            if (route == NULL || route[0] == '\0') {
+                return g1_error(
+                    error, error_capacity,
+                    "MM_TEST_ROUTE is required for route mode");
+            }
+            if (dwell != NULL) {
+                return g1_error(
+                    error, error_capacity,
+                    "MM_SCENE_DWELL_FRAMES is invalid for route mode");
+            }
+            out.route = route;
+        } else if (strcmp(mode, "scene-cycle") == 0) {
+            out.mode = G1_TestSceneCycle; out.name = mode;
+            out.route = "";
+            if (route != NULL) {
+                return g1_error(
+                    error, error_capacity,
+                    "MM_TEST_ROUTE is invalid for scene-cycle mode");
+            }
+            if (!g1_parse_scene_dwell_frames(
+                    out.scene_dwell_frames, error, error_capacity))
+            {
+                return false;
+            }
         } else {
             return g1_error(error, error_capacity,
-                "MM_TEST_MODE must be sequential, flat, or terrain, got '%s'",
+                "MM_TEST_MODE must be sequential, flat, terrain, route, or "
+                "scene-cycle, got '%s'",
                 mode);
+        }
+        if (out.mode != G1_TestRoute &&
+            out.mode != G1_TestSceneCycle && route != NULL)
+        {
+            return g1_error(
+                error, error_capacity,
+                "MM_TEST_ROUTE is valid only for route mode");
+        }
+        if (out.mode != G1_TestSceneCycle &&
+            out.mode != G1_TestRoute && dwell != NULL)
+        {
+            return g1_error(
+                error, error_capacity,
+                "MM_SCENE_DWELL_FRAMES is valid only for scene-cycle mode");
+        }
+    } else {
+        if (route != NULL) {
+            return g1_error(
+                error, error_capacity,
+                "MM_TEST_ROUTE requires MM_TEST_MODE=route");
+        }
+        if (dwell != NULL) {
+            return g1_error(
+                error, error_capacity,
+                "MM_SCENE_DWELL_FRAMES requires MM_TEST_MODE=scene-cycle");
         }
     }
     if (!g1_parse_test_frames(out.frame_limit, error, error_capacity)) {
@@ -116,6 +203,15 @@ static bool g1_parse_test_config(
             error, error_capacity,
             "MM_TEST_FRAMES must be set to a positive integer for %s mode",
             out.name);
+    }
+    if (out.mode == G1_TestSceneCycle &&
+        out.frame_limit < 14 * out.scene_dwell_frames)
+    {
+        return g1_error(
+            error, error_capacity,
+            "MM_TEST_FRAMES must be at least 14*MM_SCENE_DWELL_FRAMES "
+            "(%d) for scene-cycle mode",
+            14 * out.scene_dwell_frames);
     }
     return true;
 }
@@ -150,6 +246,16 @@ static motion_match_pose_diagnostic g1_pose_diagnostic(
             p.y - heightfield_sample_v2(terrain, p.x, p.z));
     }
     return out;
+}
+
+static bool g1_pose_diagnostic_is_finite(
+    const motion_match_pose_diagnostic& diagnostic)
+{
+    return terrain_float_is_finite(diagnostic.hips_y) &&
+           terrain_float_is_finite(diagnostic.hips_clearance) &&
+           terrain_float_is_finite(diagnostic.left_toe_clearance) &&
+           terrain_float_is_finite(diagnostic.right_toe_clearance) &&
+           terrain_float_is_finite(diagnostic.minimum_clearance);
 }
 
 template<typename T>
@@ -1710,6 +1816,36 @@ int main(void)
         return 2;
     }
 
+    int configured_route_index = -1;
+    float configured_route_target_height = 0.0f;
+    if (test_config.mode == G1_TestRoute) {
+        const scene_route* configured_route = scene_route_find(
+            active_scene.metadata, test_config.route);
+        if (configured_route == NULL) {
+            fprintf(
+                stderr,
+                "G1 route selection error: scene '%s' has no route '%s'\n",
+                active_scene.metadata.id.c_str(),
+                test_config.route);
+            return 2;
+        }
+        configured_route_index = static_cast<int>(
+            configured_route - active_scene.metadata.routes.data());
+        configured_route_target_height = deterministic_route_target_height(
+            *configured_route, active_scene.terrain);
+        if (deterministic_route_motion_frames(*configured_route) < 0 ||
+            !terrain_float_is_finite(configured_route_target_height))
+        {
+            fprintf(
+                stderr,
+                "G1 route selection error: scene '%s' route '%s' has invalid "
+                "binary32 runtime metadata\n",
+                active_scene.metadata.id.c_str(),
+                test_config.route);
+            return 2;
+        }
+    }
+
     terrain_support_set support_rows;
     if (!terrain_support_load(
             support_rows,
@@ -1734,6 +1870,7 @@ int main(void)
         fprintf(stderr, "G1 reset error: %s\n", artifact_error);
         return 2;
     }
+    state.route_index = configured_route_index;
 
     if (test_config.mode == G1_TestSequential) {
         const int sequential_frames =
@@ -1783,6 +1920,13 @@ int main(void)
         return 2;
     }
 
+    int scene_generation = 0;
+    int scene_reset_count = 1;
+    int motion_pack_load_count = 1;
+    int model_load_count = 1;
+    int model_unload_count = 0;
+    bool scene_switch_failed = false;
+
     auto scene_loader = [&](scene_pack& candidate, int index,
                             char* error, int capacity)
     {
@@ -1800,6 +1944,7 @@ int main(void)
     {
         model = LoadModel(path);
         const bool allocated = model_has_allocation(model);
+        if (allocated) ++model_load_count;
         const bool ready = IsModelReady(model) && model.meshCount > 0;
         if (!ready)
         {
@@ -1812,11 +1957,13 @@ int main(void)
         if (model_has_allocation(model))
         {
             UnloadModel(model);
+            ++model_unload_count;
         }
         model = Model{};
     };
     int pending_scene_index = -1;
     bool pending_reset = false;
+    const int scene_count = static_cast<int>(catalog.ids.size());
     
     // Camera
 
@@ -1927,6 +2074,20 @@ int main(void)
     int rendered_frames = 0;
     bool controller_exit_requested = false;
     int controller_exit_code = 0;
+    g1_runtime_diagnostic_snapshot runtime_snapshot;
+    bool runtime_snapshot_ready = false;
+
+    auto controlled_runtime_error = [&](const char* message)
+    {
+        fprintf(
+            stderr,
+            "G1 controlled runtime error scene=%s frame=%d: %s\n",
+            active_scene.metadata.id.c_str(),
+            state.scene_frame,
+            message != NULL ? message : "unknown runtime failure");
+        controller_exit_code = 2;
+        controller_exit_requested = true;
+    };
 
     motion_match_log deterministic_log;
 #ifndef MM_DISCRETE
@@ -1939,7 +2100,7 @@ int main(void)
         fprintf(stderr,
             "G1 runtime log error: database-frame logging is unavailable "
             "with learned motion matching\n");
-        UnloadModel(terrain_model);
+        model_unloader(terrain_model);
         CloseWindow();
         return 2;
     }
@@ -1947,7 +2108,7 @@ int main(void)
             deterministic_log_path,
             artifact_error, (int)sizeof(artifact_error))) {
         fprintf(stderr, "G1 runtime log error: %s\n", artifact_error);
-        UnloadModel(terrain_model);
+        model_unloader(terrain_model);
         CloseWindow();
         return 2;
     }
@@ -1965,15 +2126,16 @@ int main(void)
                     artifact_error,
                     static_cast<int>(sizeof(artifact_error))))
             {
-                controller_exit_code = 2;
-                controller_exit_requested = true;
-                fprintf(
-                    stderr,
-                    "G1 scene reset error [%s]: %s\n",
-                    active_scene.metadata.id.c_str(),
-                    artifact_error);
+                controlled_runtime_error(artifact_error);
+            }
+            else
+            {
+                ++scene_generation;
+                ++scene_reset_count;
+                state.route_index = configured_route_index;
             }
             pending_reset = false;
+            if (controller_exit_requested) return;
         }
         if (pending_scene_index >= 0 && !controller_exit_requested)
         {
@@ -1993,12 +2155,18 @@ int main(void)
                     artifact_error,
                     static_cast<int>(sizeof(artifact_error))))
             {
+                scene_switch_failed = true;
                 fprintf(
                     stderr,
                     "G1 scene switch preserved '%s'; candidate '%s' failed: %s\n",
                     active_scene.metadata.id.c_str(),
                     catalog.ids[static_cast<size_t>(target)].c_str(),
                     artifact_error);
+            }
+            else
+            {
+                ++scene_generation;
+                ++scene_reset_count;
             }
         }
 
@@ -2041,6 +2209,9 @@ int main(void)
         }
 #endif
 
+        deterministic_route_sample route_sample;
+        route_sample.waypoint = state.route_waypoint;
+
         // Get gamepad stick states
         vec3 gamepadstick_left = gamepad_get_stick(GAMEPAD_STICK_LEFT);
         vec3 gamepadstick_right = gamepad_get_stick(GAMEPAD_STICK_RIGHT);
@@ -2082,6 +2253,32 @@ int main(void)
             simulation_fwrd_speed,
             simulation_side_speed,
             simulation_back_speed);
+        if (test_config.mode == G1_TestRoute) {
+            if (state.route_index < 0 ||
+                state.route_index >=
+                    static_cast<int>(active_scene.metadata.routes.size()) ||
+                !deterministic_route_command(
+                    route_sample,
+                    active_scene.metadata.routes[
+                        static_cast<size_t>(state.route_index)],
+                    state.route_frames,
+                    dt,
+                    0.50f,
+                    artifact_error,
+                    static_cast<int>(sizeof(artifact_error))))
+            {
+                controlled_runtime_error(
+                    state.route_index < 0 ||
+                    state.route_index >=
+                        static_cast<int>(active_scene.metadata.routes.size())
+                        ? "resolved route index is out of range"
+                        : artifact_error);
+                return;
+            }
+            desired_velocity_curr = route_sample.command;
+            desired_strafe = false;
+            state.route_waypoint = route_sample.waypoint;
+        }
         const vec3 commanded_velocity = desired_velocity_curr;
         traversability_diagnostics traversal = {};
         desired_velocity_curr = traversability_limit_command(
@@ -2093,6 +2290,15 @@ int main(void)
             state.simulation_position,
             commanded_velocity,
             dt);
+        if (!g1_runtime_traversal_is_finite(traversal) ||
+            !terrain_float_is_finite(desired_velocity_curr.x) ||
+            !terrain_float_is_finite(desired_velocity_curr.y) ||
+            !terrain_float_is_finite(desired_velocity_curr.z))
+        {
+            controlled_runtime_error(
+                "command traversal produced non-finite diagnostics");
+            return;
+        }
         state.blocked = traversal.blocked;
         state.walkability_class = traversal.walkability_class;
         state.blocked_distance = traversal.distance;
@@ -2205,10 +2411,8 @@ int main(void)
                 state.bone_positions(0),
                 state.trajectory_positions,
                 state.trajectory_rotations)) {
-            fprintf(stderr,
-                "G1 runtime query error: terrain centerline inputs are invalid\n");
-            controller_exit_code = 2;
-            controller_exit_requested = true;
+            controlled_runtime_error(
+                "terrain centerline inputs are invalid");
             return;
         }
         terrain_centerline_snapshot terrain_query_snapshot = {};
@@ -2225,11 +2429,12 @@ int main(void)
                 !terrain_float_is_finite(point.x) ||
                 !terrain_float_is_finite(point.y) ||
                 !terrain_float_is_finite(point.z)) {
-                fprintf(stderr,
-                    "G1 runtime query error: terrain snapshot %d is invalid\n",
+                snprintf(
+                    artifact_error,
+                    sizeof(artifact_error),
+                    "terrain query snapshot %d is invalid",
                     terrain_feature);
-                controller_exit_code = 2;
-                controller_exit_requested = true;
+                controlled_runtime_error(artifact_error);
                 return;
             }
         }
@@ -2240,22 +2445,22 @@ int main(void)
 
         assert(offset == db.nfeatures());
         if (!motion_match_query_is_finite_31d(query)) {
-            fprintf(stderr,
-                "G1 runtime query error: expected 31 finite query values\n");
-            controller_exit_code = 2;
-            controller_exit_requested = true;
+            controlled_runtime_error(
+                "expected exactly 31 finite query values");
             return;
         }
 
         // Check if we reached the end of the current anim
         bool end_of_anim = database_trajectory_index_clamp(db, state.frame_index, 1) == state.frame_index;
         if (test_config.mode == G1_TestSequential && end_of_anim) {
-            fprintf(stderr,
-                "G1 sequential test overrun at database frame %d before "
-                "MM_TEST_FRAMES=%d\n",
-                state.frame_index, test_config.frame_limit);
-            controller_exit_code = 2;
-            controller_exit_requested = true;
+            snprintf(
+                artifact_error,
+                sizeof(artifact_error),
+                "sequential test overrun at database frame %d before "
+                "MM_TEST_FRAMES=%d",
+                state.frame_index,
+                test_config.frame_limit);
+            controlled_runtime_error(artifact_error);
             return;
         }
         const bool matching_enabled = test_config.mode != G1_TestSequential;
@@ -2264,13 +2469,11 @@ int main(void)
         state.incumbent_cost = 0.0f;
         state.selected_cost = 0.0f;
         state.selected_terrain_error = 0.0f;
-        if (logging_enabled) {
-            state.incumbent_cost = end_of_anim
-                ? FLT_MAX : database_frame_cost(db, state.frame_index, query);
-            state.selected_cost = state.incumbent_cost;
-            state.selected_terrain_error = database_raw_terrain_error(
-                db, state.frame_index, query);
-        }
+        state.incumbent_cost = end_of_anim
+            ? FLT_MAX : database_frame_cost(db, state.frame_index, query);
+        state.selected_cost = state.incumbent_cost;
+        state.selected_terrain_error = database_raw_terrain_error(
+            db, state.frame_index, query);
         int selected_database_frame = query_database_frame;
         
         // Do we need to search?
@@ -2363,7 +2566,7 @@ int main(void)
                     db,
                     query);
                 selected_database_frame = best_index;
-                if (logging_enabled && best_index != prior_index) {
+                if (best_index != prior_index) {
                     state.selected_cost = best_cost;
                     state.selected_terrain_error = database_raw_terrain_error(
                         db, best_index, query);
@@ -2482,17 +2685,25 @@ int main(void)
 
         motion_match_pose_diagnostic raw_selected_diagnostic;
         motion_match_pose_diagnostic inertialized_diagnostic;
-        if (logging_enabled) {
-            array1d<vec3> raw_selected_positions(state.curr_bone_positions);
-            array1d<quat> raw_selected_rotations(state.curr_bone_rotations);
-            raw_selected_positions(0) = state.bone_positions(0);
-            raw_selected_rotations(0) = state.bone_rotations(0);
-            raw_selected_diagnostic = g1_pose_diagnostic(
-                raw_selected_positions, raw_selected_rotations,
-                db.bone_parents, active_scene.terrain);
-            inertialized_diagnostic = g1_pose_diagnostic(
-                state.bone_positions, state.bone_rotations,
-                db.bone_parents, active_scene.terrain);
+        array1d<vec3> raw_selected_positions(state.curr_bone_positions);
+        array1d<quat> raw_selected_rotations(state.curr_bone_rotations);
+        raw_selected_positions(0) = state.bone_positions(0);
+        raw_selected_rotations(0) = state.bone_rotations(0);
+        raw_selected_diagnostic = g1_pose_diagnostic(
+            raw_selected_positions, raw_selected_rotations,
+            db.bone_parents, active_scene.terrain);
+        inertialized_diagnostic = g1_pose_diagnostic(
+            state.bone_positions, state.bone_rotations,
+            db.bone_parents, active_scene.terrain);
+        if (!g1_pose_diagnostic_is_finite(raw_selected_diagnostic) ||
+            !g1_pose_diagnostic_is_finite(inertialized_diagnostic) ||
+            !terrain_float_is_finite(state.incumbent_cost) ||
+            !terrain_float_is_finite(state.selected_cost) ||
+            !terrain_float_is_finite(state.selected_terrain_error))
+        {
+            controlled_runtime_error(
+                "motion costs or pose diagnostics are non-finite");
+            return;
         }
         
         // Update Simulation
@@ -2534,6 +2745,16 @@ int main(void)
         state.blocked_distance = traversal.distance;
         state.blocked_point = traversal.point;
         state.walkability_class = current_walkability_class;
+        if (!g1_runtime_traversal_is_finite(traversal) ||
+            state.walkability_class < 0 || state.walkability_class > 2 ||
+            !terrain_float_is_finite(state.simulation_position.x) ||
+            !terrain_float_is_finite(state.simulation_position.y) ||
+            !terrain_float_is_finite(state.simulation_position.z))
+        {
+            controlled_runtime_error(
+                "integrated traversal or simulation state is invalid");
+            return;
+        }
             
         simulation_rotations_update(
             state.simulation_rotation,
@@ -2571,14 +2792,14 @@ int main(void)
                 artifact_error,
                 static_cast<int>(sizeof(artifact_error))))
         {
-            std::fprintf(
-                stderr,
-                "G1 support runtime error scene=%s frame=%d: %s\n",
-                active_scene.metadata.id.c_str(),
-                state.frame_index,
-                artifact_error);
-            controller_exit_code = 2;
-            controller_exit_requested = true;
+            controlled_runtime_error(artifact_error);
+            return;
+        }
+        if (!support_observation_is_finite(state.support_observation_now) ||
+            !g1_runtime_support_state_is_finite(state.support))
+        {
+            controlled_runtime_error(
+                "support observation or state is non-finite");
             return;
         }
         
@@ -2703,9 +2924,7 @@ int main(void)
 
         if (state.adjustment_y != 0.0f || state.clamp_y != 0.0f)
         {
-            std::fprintf(stderr, "G1 horizontal-root invariant failed\n");
-            controller_exit_code = 2;
-            controller_exit_requested = true;
+            controlled_runtime_error("horizontal-root invariant failed");
             return;
         }
 
@@ -2721,79 +2940,168 @@ int main(void)
             state.adjusted_bone_rotations,
             db.bone_parents);
 
-        if (logging_enabled) {
-            const motion_match_pose_diagnostic rendered_diagnostic =
-                g1_pose_diagnostic(
+        const motion_match_pose_diagnostic rendered_diagnostic =
+            g1_pose_diagnostic(
                 state.adjusted_bone_positions,
                 state.adjusted_bone_rotations,
-                db.bone_parents, active_scene.terrain);
-            char query_bits_hex[31 * 8 + 1] = {};
-            if (!motion_match_query_bits_hex(
-                    query_bits_hex, sizeof(query_bits_hex), query)) {
-                fprintf(stderr,
-                    "G1 runtime query error: cannot serialize finite query\n");
-                controller_exit_code = 2;
-                controller_exit_requested = true;
-                return;
-            }
-            motion_match_log_row log_row;
-            log_row.frame = rendered_frames;
-            log_row.fixed_dt = dt;
-            log_row.mode = test_config.name;
-            log_row.route = test_config.route;
-            log_row.query_bits_hex = query_bits_hex;
-            log_row.query_database_frame = query_database_frame;
-            log_row.query_range = query_range;
-            log_row.selected_database_frame = selected_database_frame;
-            log_row.database_frame = state.frame_index;
-            log_row.range = g1_active_range(db, state.frame_index);
-            log_row.source_range = g1_active_range(
-                db, selected_database_frame);
-            log_row.searched = state.searched;
-            log_row.transitioned = state.transitioned;
-            log_row.incumbent_cost = state.incumbent_cost;
-            log_row.selected_cost = state.selected_cost;
-            log_row.selected_terrain_error = state.selected_terrain_error;
-            log_row.effective_terrain_weight =
+                db.bone_parents,
+                active_scene.terrain);
+        if (!g1_pose_diagnostic_is_finite(rendered_diagnostic)) {
+            controlled_runtime_error(
+                "final support-retargeted pose diagnostic is non-finite");
+            return;
+        }
+
+        g1_runtime_diagnostic_snapshot snapshot_candidate;
+        if (!g1_runtime_diagnostics_build(
+                snapshot_candidate,
+                motion_manifest,
+                state,
+                traversal,
+                route_sample,
+                configured_route_target_height,
+                scene_generation,
+                scene_reset_count,
+                scene_switch_failed,
+                motion_pack_load_count,
+                model_load_count,
+                model_unload_count,
+                artifact_error,
+                static_cast<int>(sizeof(artifact_error))))
+        {
+            controlled_runtime_error(artifact_error);
+            return;
+        }
+        runtime_snapshot = snapshot_candidate;
+        runtime_snapshot_ready = true;
+
+        char query_bits_hex[31 * 8 + 1] = {};
+        if (!motion_match_query_bits_hex(
+                query_bits_hex, sizeof(query_bits_hex), query)) {
+            controlled_runtime_error("cannot serialize the finite 31D query");
+            return;
+        }
+        motion_match_log_row log_row;
+        log_row.frame = rendered_frames;
+        log_row.fixed_dt = dt;
+        log_row.scene_id = active_scene.metadata.id.c_str();
+        log_row.mode = test_config.name;
+        log_row.route = test_config.route;
+        log_row.query_bits_hex = query_bits_hex;
+        log_row.query_database_frame = query_database_frame;
+        log_row.query_range = query_range;
+        log_row.selected_database_frame = selected_database_frame;
+        log_row.database_frame = state.frame_index;
+        log_row.range = g1_active_range(db, state.frame_index);
+        log_row.source_range = g1_active_range(db, selected_database_frame);
+        log_row.searched = state.searched;
+        log_row.transitioned = state.transitioned;
+        log_row.incumbent_cost = state.incumbent_cost;
+        log_row.selected_cost = state.selected_cost;
+        log_row.selected_terrain_error = state.selected_terrain_error;
+        log_row.effective_terrain_weight =
                 effective_terrain_weight;
-            for (int i = 0; i < 4; ++i) {
-                log_row.terrain[i] = terrain_query_snapshot.values[i];
-                log_row.terrain_points[i] = terrain_query_snapshot.points[i];
-            }
-            log_row.raw_selected = raw_selected_diagnostic;
-            log_row.inertialized = inertialized_diagnostic;
-            log_row.rendered = rendered_diagnostic;
-            log_row.hips_inertial_offset_y =
-                inertialized_diagnostic.hips_y -
-                raw_selected_diagnostic.hips_y;
-            log_row.runtime_root_surface_height = heightfield_sample_v2(
-                active_scene.terrain,
-                state.bone_positions(0).x,
-                state.bone_positions(0).z);
-            log_row.runtime_left_toe_surface_height = heightfield_sample_v2(
-                active_scene.terrain,
-                state.global_bone_positions(G1_LeftToe).x,
-                state.global_bone_positions(G1_LeftToe).z);
-            log_row.runtime_right_toe_surface_height = heightfield_sample_v2(
-                active_scene.terrain,
-                state.global_bone_positions(G1_RightToe).x,
-                state.global_bone_positions(G1_RightToe).z);
-            log_row.adjustment_xz = state.adjustment_xz;
-            log_row.adjustment_y = state.adjustment_y;
-            log_row.clamp_xz = state.clamp_xz;
-            log_row.clamp_y = state.clamp_y;
-            log_row.matching_enabled = matching_enabled;
-            log_row.adjustment_enabled = adjustment_enabled;
-            log_row.clamping_enabled = clamping_enabled;
-            log_row.support_retargeting_enabled = true;
-            log_row.ik_enabled = ik_enabled;
-            if (!deterministic_log.write(
-                    log_row, artifact_error, (int)sizeof(artifact_error))) {
-                fprintf(stderr, "G1 runtime log error: %s\n", artifact_error);
-                controller_exit_code = 2;
-                controller_exit_requested = true;
+        for (int i = 0; i < 4; ++i) {
+            log_row.terrain[i] = terrain_query_snapshot.values[i];
+            log_row.terrain_points[i] = terrain_query_snapshot.points[i];
+        }
+        log_row.raw_selected = raw_selected_diagnostic;
+        log_row.inertialized = inertialized_diagnostic;
+        log_row.rendered = rendered_diagnostic;
+        log_row.hips_inertial_offset_y =
+            inertialized_diagnostic.hips_y - raw_selected_diagnostic.hips_y;
+        log_row.runtime_root_surface_height = heightfield_sample_v2(
+            active_scene.terrain,
+            state.bone_positions(0).x,
+            state.bone_positions(0).z);
+        log_row.runtime_left_toe_surface_height = heightfield_sample_v2(
+            active_scene.terrain,
+            state.global_bone_positions(G1_LeftToe).x,
+            state.global_bone_positions(G1_LeftToe).z);
+        log_row.runtime_right_toe_surface_height = heightfield_sample_v2(
+            active_scene.terrain,
+            state.global_bone_positions(G1_RightToe).x,
+            state.global_bone_positions(G1_RightToe).z);
+        log_row.adjustment_xz = state.adjustment_xz;
+        log_row.adjustment_y = state.adjustment_y;
+        log_row.clamp_xz = state.clamp_xz;
+        log_row.clamp_y = state.clamp_y;
+        log_row.matching_enabled = matching_enabled;
+        log_row.adjustment_enabled = adjustment_enabled;
+        log_row.clamping_enabled = clamping_enabled;
+        log_row.support_retargeting_enabled = true;
+        log_row.ik_enabled = ik_enabled;
+        log_row.source_name = runtime_snapshot.source_name;
+        log_row.source_terrain = runtime_snapshot.source_terrain;
+        log_row.source_index = runtime_snapshot.source_index;
+        log_row.continuation_cost = runtime_snapshot.continuation_cost;
+        log_row.source_root_height = runtime_snapshot.source_root_height;
+        log_row.source_left_toe_height =
+            runtime_snapshot.source_left_toe_height;
+        log_row.source_right_toe_height =
+            runtime_snapshot.source_right_toe_height;
+        log_row.runtime_support_root_height =
+            runtime_snapshot.runtime_support_root_height;
+        log_row.runtime_support_left_toe_height =
+            runtime_snapshot.runtime_support_left_toe_height;
+        log_row.runtime_support_right_toe_height =
+            runtime_snapshot.runtime_support_right_toe_height;
+        log_row.support_root_delta = runtime_snapshot.support_root_delta;
+        log_row.support_left_toe_delta =
+            runtime_snapshot.support_left_toe_delta;
+        log_row.support_right_toe_delta =
+            runtime_snapshot.support_right_toe_delta;
+        log_row.support_height = runtime_snapshot.support_height;
+        log_row.support_velocity = runtime_snapshot.support_velocity;
+        log_row.support_source = runtime_snapshot.support_source;
+        log_row.airborne_frames = runtime_snapshot.airborne_frames;
+        log_row.left_contact = runtime_snapshot.left_contact;
+        log_row.right_contact = runtime_snapshot.right_contact;
+        log_row.support_retargeted_hips_y =
+            runtime_snapshot.support_retargeted_hips_y;
+        log_row.ik_adjusted_hips_y = runtime_snapshot.ik_adjusted_hips_y;
+        log_row.simulation_x = runtime_snapshot.simulation_x;
+        log_row.simulation_z = runtime_snapshot.simulation_z;
+        log_row.walkability_class = runtime_snapshot.walkability_class;
+        log_row.blocked = runtime_snapshot.blocked;
+        log_row.blocked_reason = runtime_snapshot.blocked_reason;
+        log_row.blocked_distance = runtime_snapshot.blocked_distance;
+        log_row.blocked_point_x = runtime_snapshot.blocked_point_x;
+        log_row.blocked_point_z = runtime_snapshot.blocked_point_z;
+        log_row.commanded_speed = runtime_snapshot.commanded_speed;
+        log_row.applied_speed = runtime_snapshot.applied_speed;
+        log_row.route_waypoint = runtime_snapshot.route_waypoint;
+        log_row.route_complete = runtime_snapshot.route_complete;
+        log_row.route_target_height = runtime_snapshot.route_target_height;
+        log_row.scene_generation = runtime_snapshot.scene_generation;
+        log_row.scene_frame = runtime_snapshot.scene_frame;
+        log_row.scene_reset_count = runtime_snapshot.scene_reset_count;
+        log_row.scene_switch_failed = runtime_snapshot.scene_switch_failed;
+        log_row.motion_pack_load_count =
+            runtime_snapshot.motion_pack_load_count;
+        log_row.model_load_count = runtime_snapshot.model_load_count;
+        log_row.model_unload_count = runtime_snapshot.model_unload_count;
+        log_row.live_model_count = runtime_snapshot.live_model_count;
+        if (!deterministic_log.write(
+                log_row, artifact_error, static_cast<int>(sizeof(artifact_error))))
+        {
+            controlled_runtime_error(artifact_error);
+            return;
+        }
+        scene_switch_failed = false;
+
+        if (test_config.mode == G1_TestRoute) {
+            if (state.route_frames == INT_MAX) {
+                controlled_runtime_error("route frame counter overflow");
                 return;
             }
+            ++state.route_frames;
+        }
+        if (test_config.mode == G1_TestSceneCycle &&
+            (runtime_snapshot.scene_frame + 1) %
+                    test_config.scene_dwell_frames == 0)
+        {
+            pending_scene_index = (active_scene_index + 1) % scene_count;
         }
         
 #ifdef MM_DISCRETE
@@ -3083,6 +3391,14 @@ int main(void)
             point.y += 0.10f;
             DrawSphereWires(to_Vector3(point), 0.04f, 4, 8, PURPLE);
         }
+        if (runtime_snapshot_ready && runtime_snapshot.blocked)
+        {
+            const vec3 blocked_marker(
+                runtime_snapshot.blocked_point_x,
+                0.10f,
+                runtime_snapshot.blocked_point_z);
+            DrawSphereWires(to_Vector3(blocked_marker), 0.08f, 6, 12, RED);
+        }
 
         EndMode3D();
 
@@ -3094,7 +3410,7 @@ int main(void)
             GuiDisable();
         }
 
-        GuiGroupBox((Rectangle){ 330, 20, 610, 60 }, "terrain scene");
+        GuiGroupBox((Rectangle){ 330, 20, 610, 170 }, "terrain scene / runtime");
         GuiLabel(
             (Rectangle){ 350, 30, 310, 20 },
             TextFormat(
@@ -3102,7 +3418,6 @@ int main(void)
                 active_scene.metadata.id.c_str(),
                 active_scene_index + 1,
                 static_cast<int>(catalog.ids.size())));
-        const int scene_count = static_cast<int>(catalog.ids.size());
         if (GuiButton((Rectangle){ 670, 30, 80, 20 }, "previous"))
         {
             pending_scene_index =
@@ -3115,6 +3430,56 @@ int main(void)
         if (GuiButton((Rectangle){ 850, 30, 70, 20 }, "reset"))
         {
             pending_reset = true;
+        }
+        if (runtime_snapshot_ready)
+        {
+            GuiLabel(
+                (Rectangle){ 350, 55, 570, 20 },
+                TextFormat(
+                    "weight requested %.3f effective %.3f | CSV %s",
+                    requested_terrain_weight,
+                    effective_terrain_weight,
+                    logging_enabled ? "enabled" : "disabled"));
+            GuiLabel(
+                (Rectangle){ 350, 75, 570, 20 },
+                TextFormat(
+                    "source %d %s terrain=%s",
+                    runtime_snapshot.source_index,
+                    runtime_snapshot.source_name,
+                    runtime_snapshot.source_terrain));
+            GuiLabel(
+                (Rectangle){ 350, 95, 570, 20 },
+                TextFormat(
+                    "support h=%.3f v=%.3f source=%s contacts=%d/%d",
+                    runtime_snapshot.support_height,
+                    runtime_snapshot.support_velocity,
+                    runtime_snapshot.support_source,
+                    static_cast<int>(runtime_snapshot.left_contact),
+                    static_cast<int>(runtime_snapshot.right_contact)));
+            GuiLabel(
+                (Rectangle){ 350, 115, 570, 20 },
+                TextFormat(
+                    "walkability class=%d blocked=%d reason=%s distance=%.3g",
+                    runtime_snapshot.walkability_class,
+                    static_cast<int>(runtime_snapshot.blocked),
+                    runtime_snapshot.blocked_reason,
+                    runtime_snapshot.blocked_distance));
+            GuiLabel(
+                (Rectangle){ 350, 135, 570, 20 },
+                TextFormat(
+                    "generation=%d frame=%d resets=%d switch_failed=%d",
+                    runtime_snapshot.scene_generation,
+                    runtime_snapshot.scene_frame,
+                    runtime_snapshot.scene_reset_count,
+                    static_cast<int>(runtime_snapshot.scene_switch_failed)));
+            GuiLabel(
+                (Rectangle){ 350, 155, 570, 20 },
+                TextFormat(
+                    "route waypoint=%d complete=%d target=%.3f models=%d",
+                    runtime_snapshot.route_waypoint,
+                    static_cast<int>(runtime_snapshot.route_complete),
+                    runtime_snapshot.route_target_height,
+                    runtime_snapshot.live_model_count));
         }
         
         float ui_sim_hei = 20;
@@ -3273,9 +3638,7 @@ int main(void)
                     artifact_error,
                     static_cast<int>(sizeof(artifact_error))))
             {
-                fprintf(stderr, "G1 feature rebuild error: %s\n", artifact_error);
-                controller_exit_code = 2;
-                controller_exit_requested = true;
+                controlled_runtime_error(artifact_error);
             }
             else
             {
@@ -3417,7 +3780,7 @@ int main(void)
         fprintf(stderr, "G1 runtime log error: %s\n", artifact_error);
         controller_exit_code = 2;
     }
-    UnloadModel(terrain_model);
+    model_unloader(terrain_model);
 
     CloseWindow();
 

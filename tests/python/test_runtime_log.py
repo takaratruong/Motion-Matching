@@ -5,10 +5,30 @@ import unittest
 from resources import check_g1_runtime_log as runtime_log
 from resources.check_g1_runtime_log import (
     CSV_COLUMNS,
+    GATE_A_COLUMNS,
+    RUNTIME_COLUMNS,
     check_rows,
     compare_control,
     diagnose_gate_a,
     read_rows,
+)
+
+
+RUNTIME_SUFFIX = (
+    "source_name", "source_terrain", "source_index", "continuation_cost",
+    "source_root_height", "source_left_toe_height", "source_right_toe_height",
+    "runtime_support_root_height", "runtime_support_left_toe_height",
+    "runtime_support_right_toe_height", "support_root_delta",
+    "support_left_toe_delta", "support_right_toe_delta", "support_height",
+    "support_velocity", "support_source", "airborne_frames", "left_contact",
+    "right_contact", "support_retargeted_hips_y", "ik_adjusted_hips_y",
+    "simulation_x", "simulation_z", "walkability_class", "blocked",
+    "blocked_reason", "blocked_distance", "blocked_point_x",
+    "blocked_point_z", "commanded_speed", "applied_speed", "route_waypoint",
+    "route_complete", "route_target_height", "scene_generation",
+    "scene_frame", "scene_reset_count", "scene_switch_failed",
+    "motion_pack_load_count", "model_load_count", "model_unload_count",
+    "live_model_count",
 )
 
 
@@ -84,6 +104,12 @@ def float32_offset(value, ulps):
 
 
 class RuntimeLogTests(unittest.TestCase):
+    def test_runtime_columns_append_after_gate_a(self):
+        self.assertEqual(
+            tuple(RUNTIME_COLUMNS[-len(RUNTIME_SUFFIX):]), RUNTIME_SUFFIX)
+        self.assertEqual(
+            tuple(RUNTIME_COLUMNS[:-len(RUNTIME_SUFFIX)]), GATE_A_COLUMNS)
+
     def test_surface_height_names_are_frozen_before_runtime_schema(self):
         for name in (
                 "runtime_root_surface_height",
