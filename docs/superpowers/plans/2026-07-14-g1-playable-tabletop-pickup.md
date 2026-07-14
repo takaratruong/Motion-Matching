@@ -202,7 +202,6 @@ struct InteractionTarget {
 
 struct PickRequest {
     TargetHandle target{};
-    ObjectState object_state = ObjectState::Free;
     uint32_t affordance_id = 0;
     uint64_t request_id = 0;
 };
@@ -221,6 +220,7 @@ struct RuntimeDiagnostics {
     ResultCode result = ResultCode::None;
     Reason reason = Reason::None;
     TargetHandle target{};
+    ObjectState object_state = ObjectState::Free;
     uint32_t affordance_id = 0;
     int32_t clip = -1;
     int32_t frame = -1;
