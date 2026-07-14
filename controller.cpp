@@ -1639,7 +1639,7 @@ int main(void)
         return 2;
     }
 #if !defined(MM_DISCRETE)
-    // Deterministic CSV cleanup cannot run after the Emscripten main loop.
+    // Deterministic CSV gate evidence remains a desktop-only contract.
     if (getenv("MM_LOG") != NULL) {
         fprintf(stderr,
             "G1 runtime log error: deterministic CSV MM_LOG is "
@@ -3783,9 +3783,76 @@ int main(void)
 
     };
 
+    bool cleanup_complete = false;
+    auto normal_cleanup = [&]()
+    {
+        if (cleanup_complete) return;
+        cleanup_complete = true;
+
+#ifdef MM_DISCRETE
+        if (g_log != NULL && g_log != stderr)
+        {
+            bool discrete_log_ok = fflush(g_log) == 0;
+            if (fclose(g_log) != 0) discrete_log_ok = false;
+            g_log = NULL;
+            if (!discrete_log_ok)
+            {
+                fprintf(
+                    stderr,
+                    "G1 discrete log error during normal cleanup\n");
+                if (controller_exit_code == 0) controller_exit_code = 2;
+            }
+        }
+#endif
+
+        const bool log_evidence_ok = deterministic_log.close(
+            artifact_error, (int)sizeof(artifact_error));
+        const bool log_closed = true;
+        if (!log_evidence_ok) {
+            fprintf(stderr, "G1 runtime log error: %s\n", artifact_error);
+            if (controller_exit_code == 0) controller_exit_code = 2;
+        }
+        model_unloader(terrain_model);
+
+        CloseWindow();
+        const bool window_closed = true;
+
+        cleanup_report cleanup;
+        cleanup.exit_code = controller_exit_code;
+        cleanup.motion_pack_load_count = motion_pack_load_count;
+        cleanup.model_load_count = model_load_count;
+        cleanup.model_unload_count = model_unload_count;
+        cleanup.log_closed = log_closed;
+        cleanup.window_closed = window_closed;
+        if (!cleanup_report_write(
+                getenv("MM_CLEANUP_LOG"),
+                cleanup,
+                artifact_error,
+                static_cast<int>(sizeof(artifact_error))))
+        {
+            fprintf(stderr, "G1 cleanup report error: %s\n", artifact_error);
+            if (controller_exit_code == 0) controller_exit_code = 2;
+        }
+    };
+
 #if defined(PLATFORM_WEB)
-    std::function<void()> u{update_func};
+    std::function<void()> u{[&]()
+    {
+        const bool window_close_requested = WindowShouldClose();
+        if (!controller_exit_requested && !window_close_requested)
+        {
+            update_func();
+        }
+        if (controller_exit_requested || window_close_requested)
+        {
+            normal_cleanup();
+            emscripten_cancel_main_loop();
+        }
+    }};
     emscripten_set_main_loop_arg(update_callback, &u, 0, 1);
+    // simulate_infinite_loop normally does not return; clean up defensively if
+    // a platform implementation does.
+    normal_cleanup();
 #else
     while (!WindowShouldClose() && !controller_exit_requested)
     {
@@ -3800,50 +3867,8 @@ int main(void)
             rendered_frames, test_config.frame_limit);
         controller_exit_code = 2;
     }
+    normal_cleanup();
 #endif
-
-#ifdef MM_DISCRETE
-    if (g_log != NULL && g_log != stderr)
-    {
-        bool discrete_log_ok = fflush(g_log) == 0;
-        if (fclose(g_log) != 0) discrete_log_ok = false;
-        g_log = NULL;
-        if (!discrete_log_ok)
-        {
-            fprintf(stderr, "G1 discrete log error during normal cleanup\n");
-            if (controller_exit_code == 0) controller_exit_code = 2;
-        }
-    }
-#endif
-
-    const bool log_evidence_ok = deterministic_log.close(
-        artifact_error, (int)sizeof(artifact_error));
-    const bool log_closed = true;
-    if (!log_evidence_ok) {
-        fprintf(stderr, "G1 runtime log error: %s\n", artifact_error);
-        if (controller_exit_code == 0) controller_exit_code = 2;
-    }
-    model_unloader(terrain_model);
-
-    CloseWindow();
-    const bool window_closed = true;
-
-    cleanup_report cleanup;
-    cleanup.exit_code = controller_exit_code;
-    cleanup.motion_pack_load_count = motion_pack_load_count;
-    cleanup.model_load_count = model_load_count;
-    cleanup.model_unload_count = model_unload_count;
-    cleanup.log_closed = log_closed;
-    cleanup.window_closed = window_closed;
-    if (!cleanup_report_write(
-            getenv("MM_CLEANUP_LOG"),
-            cleanup,
-            artifact_error,
-            static_cast<int>(sizeof(artifact_error))))
-    {
-        fprintf(stderr, "G1 cleanup report error: %s\n", artifact_error);
-        if (controller_exit_code == 0) controller_exit_code = 2;
-    }
 
     return controller_exit_code;
 }

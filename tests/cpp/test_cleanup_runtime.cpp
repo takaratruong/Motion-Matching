@@ -468,6 +468,40 @@ static void test_controller_has_one_post_window_cleanup_path(
         check(post_window.find(field, close_window) != std::string::npos,
               "cleanup report consumes final controller state");
     }
+
+    const std::size_t cleanup_lambda = find_required(
+        post_window, "auto normal_cleanup =", 0,
+        "controller defines one shared normal cleanup operation");
+    const std::size_t platform_loop = find_required(
+        post_window, "#if defined(PLATFORM_WEB)", cleanup_lambda,
+        "shared cleanup is defined before the platform update loop");
+    const std::size_t platform_else = find_required(
+        post_window, "#else", platform_loop,
+        "web and desktop update loops remain explicit");
+    const std::string web_loop = post_window.substr(
+        platform_loop, platform_else - platform_loop);
+    check(web_loop.find(
+              "const bool window_close_requested = WindowShouldClose();") !=
+              std::string::npos &&
+              web_loop.find(
+                  "if (!controller_exit_requested && "
+                  "!window_close_requested)") != std::string::npos,
+          "web loop skips updates after a post-window startup failure");
+    const std::size_t web_cleanup = find_required(
+        web_loop, "normal_cleanup();", 0,
+        "web callback invokes shared cleanup");
+    const std::size_t web_cancel = find_required(
+        web_loop, "emscripten_cancel_main_loop();", web_cleanup,
+        "web callback cancels only after cleanup");
+    check(web_cleanup < web_cancel,
+          "web callback cleans resources before main-loop cancellation");
+    check(count_occurrences(post_window, "normal_cleanup();") == 3,
+          "web callback, web fallback, and desktop tail share cleanup");
+    check(post_window.find("if (cleanup_complete) return;", cleanup_lambda) !=
+              std::string::npos &&
+              post_window.find("cleanup_complete = true;", cleanup_lambda) !=
+                  std::string::npos,
+          "shared cleanup is idempotent");
 }
 
 int main(int argc, char** argv)
@@ -479,11 +513,13 @@ int main(int argc, char** argv)
     test_open_failure_preserves_existing_state();
     test_write_failure_removes_temporary_and_preserves_final();
     test_rename_failure_removes_temporary_and_preserves_destination();
+    const char* controller_path = "controller.cpp";
     if (argc == 3 && std::strcmp(argv[1], "--controller") == 0) {
-        test_controller_has_one_post_window_cleanup_path(argv[2]);
+        controller_path = argv[2];
     } else {
         check(argc == 1,
               "usage: test_cleanup_runtime [--controller controller.cpp]");
     }
+    test_controller_has_one_post_window_cleanup_path(controller_path);
     return 0;
 }
