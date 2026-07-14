@@ -12,9 +12,9 @@
 #include "spring.h"
 #include "array.h"
 #include "character.h"
-#include "database.h"
-#include "g1_skeleton.h"
-#include "terrain_runtime.h"
+#include "scene_runtime.h"
+#include "support_runtime.h"
+#include "g1_controller_state.h"
 #include "motion_match_log.h"
 #include "nnet.h"
 #include "lmm.h"
@@ -30,64 +30,6 @@
 static inline Vector3 to_Vector3(vec3 v)
 {
     return (Vector3){ v.x, v.y, v.z };
-}
-
-static bool g1_artifact_path(
-    char* output,
-    const size_t capacity,
-    const char* directory,
-    const char* filename,
-    char* error,
-    const int error_capacity)
-{
-    if (directory == NULL || directory[0] == '\0')
-    {
-        return g1_error(
-            error, error_capacity, "G1_TERRAIN_DIR must not be empty");
-    }
-
-    const int length = snprintf(output, capacity, "%s/%s", directory, filename);
-    if (length < 0 || static_cast<size_t>(length) >= capacity)
-    {
-        return g1_error(
-            error,
-            error_capacity,
-            "G1 terrain path is too long for %s",
-            filename);
-    }
-    return true;
-}
-
-static bool g1_probe_required_file(
-    const char* path, char* error, const int error_capacity)
-{
-    FILE* file = fopen(path, "rb");
-    if (file == NULL)
-    {
-        return g1_error(
-            error,
-            error_capacity,
-            "%s: cannot open required G1 terrain artifact (%s)",
-            path,
-            strerror(errno));
-    }
-    if (fseek(file, 0, SEEK_END) != 0)
-    {
-        fclose(file);
-        return g1_error(
-            error, error_capacity, "%s: cannot size required artifact", path);
-    }
-    const long size = ftell(file);
-    const bool close_failed = fclose(file) != 0;
-    if (size <= 0 || close_failed)
-    {
-        return g1_error(
-            error,
-            error_capacity,
-            "%s: required artifact is empty or unreadable",
-            path);
-    }
-    return true;
 }
 
 static bool g1_parse_terrain_weight(
@@ -188,11 +130,11 @@ static motion_match_pose_diagnostic g1_pose_diagnostic(
         positions, rotations, local_positions, local_rotations, parents);
     motion_match_pose_diagnostic out;
     out.hips_y = positions(G1_Hips).y;
-    out.hips_clearance = positions(G1_Hips).y - heightfield_sample(
+    out.hips_clearance = positions(G1_Hips).y - heightfield_sample_v2(
         terrain, positions(G1_Hips).x, positions(G1_Hips).z);
-    out.left_toe_clearance = positions(G1_LeftToe).y - heightfield_sample(
+    out.left_toe_clearance = positions(G1_LeftToe).y - heightfield_sample_v2(
         terrain, positions(G1_LeftToe).x, positions(G1_LeftToe).z);
-    out.right_toe_clearance = positions(G1_RightToe).y - heightfield_sample(
+    out.right_toe_clearance = positions(G1_RightToe).y - heightfield_sample_v2(
         terrain, positions(G1_RightToe).x, positions(G1_RightToe).z);
     out.minimum_clearance = out.hips_clearance;
     const int probes[] = {
@@ -203,7 +145,7 @@ static motion_match_pose_diagnostic g1_pose_diagnostic(
         const vec3 p = positions(probes[i]);
         out.minimum_clearance = minf(
             out.minimum_clearance,
-            p.y - heightfield_sample(terrain, p.x, p.z));
+            p.y - heightfield_sample_v2(terrain, p.x, p.z));
     }
     return out;
 }
@@ -1628,74 +1570,7 @@ int main(void)
     {
         terrain_directory = "./resources/g1_terrain";
     }
-    char database_path[1024] = {};
-    char feature_path[1024] = {};
-    char heightfield_path[1024] = {};
-    char mesh_path[1024] = {};
-    char manifest_path[1024] = {};
     char artifact_error[512] = {};
-    if (!g1_artifact_path(
-            database_path,
-            sizeof(database_path),
-            terrain_directory,
-            "database.bin",
-            artifact_error,
-            sizeof(artifact_error)) ||
-        !g1_artifact_path(
-            feature_path,
-            sizeof(feature_path),
-            terrain_directory,
-            "terrain_features.bin",
-            artifact_error,
-            sizeof(artifact_error)) ||
-        !g1_artifact_path(
-            heightfield_path,
-            sizeof(heightfield_path),
-            terrain_directory,
-            "terrain.bin",
-            artifact_error,
-            sizeof(artifact_error)) ||
-        !g1_artifact_path(
-            mesh_path,
-            sizeof(mesh_path),
-            terrain_directory,
-            "terrain.obj",
-            artifact_error,
-            sizeof(artifact_error)) ||
-        !g1_artifact_path(
-            manifest_path,
-            sizeof(manifest_path),
-            terrain_directory,
-            "manifest.json",
-            artifact_error,
-            sizeof(artifact_error)))
-    {
-        fprintf(stderr, "G1 terrain path error: %s\n", artifact_error);
-        return 2;
-    }
-
-    const char* required_paths[5] = {
-        database_path, feature_path, heightfield_path, mesh_path, manifest_path
-    };
-    for (int path = 0; path < 5; ++path)
-    {
-        if (!g1_probe_required_file(
-                required_paths[path],
-                artifact_error,
-                static_cast<int>(sizeof(artifact_error))))
-        {
-            fprintf(stderr, "G1 terrain artifact error: %s\n", artifact_error);
-            return 2;
-        }
-    }
-    if (!g1_manifest_validate(
-            manifest_path,
-            artifact_error,
-            static_cast<int>(sizeof(artifact_error))))
-    {
-        fprintf(stderr, "G1 manifest error: %s\n", artifact_error);
-        return 2;
-    }
 
     float feature_weight_foot_position = 0.75f;
     float feature_weight_foot_velocity = 1.0f;
@@ -1750,38 +1625,72 @@ int main(void)
     }
 #endif
 
-    terrain_feature_set terrain_rows;
-    heightfield runtime_terrain;
-    if (!terrain_features_load(
-            terrain_rows,
-            feature_path,
-            artifact_error,
-            static_cast<int>(sizeof(artifact_error))) ||
-        !heightfield_load(
-            runtime_terrain,
-            heightfield_path,
+    motion_pack_manifest motion_manifest;
+    if (!motion_manifest_load_and_verify(
+            motion_manifest,
+            terrain_directory,
             artifact_error,
             static_cast<int>(sizeof(artifact_error))))
     {
-        fprintf(stderr, "G1 terrain artifact error: %s\n", artifact_error);
+        fprintf(stderr, "G1 motion manifest error: %s\n", artifact_error);
+        return 2;
+    }
+
+    std::string database_path;
+    std::string feature_path;
+    std::string support_path;
+    if (!scene_join(
+            database_path,
+            terrain_directory,
+            motion_manifest.database.path,
+            artifact_error,
+            static_cast<int>(sizeof(artifact_error))) ||
+        !scene_join(
+            feature_path,
+            terrain_directory,
+            motion_manifest.terrain_features.path,
+            artifact_error,
+            static_cast<int>(sizeof(artifact_error))) ||
+        !scene_join(
+            support_path,
+            terrain_directory,
+            motion_manifest.terrain_support.path,
+            artifact_error,
+            static_cast<int>(sizeof(artifact_error))))
+    {
+        fprintf(stderr, "G1 motion path error: %s\n", artifact_error);
+        return 2;
+    }
+
+    terrain_feature_set terrain_rows;
+    if (!terrain_features_load(
+            terrain_rows,
+            feature_path.c_str(),
+            artifact_error,
+            static_cast<int>(sizeof(artifact_error))))
+    {
+        fprintf(stderr, "G1 terrain feature error: %s\n", artifact_error);
         return 2;
     }
 
     database db;
-    database_load(db, database_path);
+    database_load(db, database_path.c_str());
     if (!g1_database_validate(
             db, artifact_error, static_cast<int>(sizeof(artifact_error))))
     {
         fprintf(stderr, "G1 database error: %s\n", artifact_error);
         return 2;
     }
-    if (terrain_rows.values.rows != db.nframes())
+    if (terrain_rows.values.rows != db.nframes() ||
+        terrain_rows.values.cols != 4)
     {
         fprintf(
             stderr,
-            "G1 terrain frame mismatch: database=%d sidecar=%d\n",
+            "G1 database/G1TF shape error: database=%d terrain=%dx%d "
+            "expected_columns=4\n",
             db.nframes(),
-            terrain_rows.values.rows);
+            terrain_rows.values.rows,
+            terrain_rows.values.cols);
         return 2;
     }
     db.terrain_features = terrain_rows.values;
@@ -1791,18 +1700,6 @@ int main(void)
         fprintf(stderr, "G1 skeleton error: %s\n", artifact_error);
         return 2;
     }
-    if (test_config.mode == G1_TestSequential) {
-        const int sequential_frames =
-            db.range_stops(0) - db.range_starts(0) - 1;
-        if (test_config.frame_limit > sequential_frames) {
-            fprintf(stderr,
-                "G1 sequential test overrun: MM_TEST_FRAMES=%d exceeds "
-                "the initial range capacity %d\n",
-                test_config.frame_limit, sequential_frames);
-            return 2;
-        }
-    }
-
     database_build_matching_features(
         db,
         feature_weight_foot_position,
@@ -1820,6 +1717,97 @@ int main(void)
         fprintf(stderr, "G1 feature error: %s\n", artifact_error);
         return 2;
     }
+
+    if (!motion_manifest_validate_database(
+            motion_manifest,
+            db,
+            artifact_error,
+            static_cast<int>(sizeof(artifact_error))))
+    {
+        fprintf(
+            stderr,
+            "G1 motion/database contract error: %s\n",
+            artifact_error);
+        return 2;
+    }
+
+    scene_catalog catalog;
+    if (!scene_catalog_load(
+            catalog,
+            terrain_directory,
+            motion_manifest,
+            artifact_error,
+            static_cast<int>(sizeof(artifact_error))))
+    {
+        fprintf(stderr, "G1 scene index error: %s\n", artifact_error);
+        return 2;
+    }
+    const int active_scene_index =
+        scene_catalog_find(catalog, catalog.default_scene_id.c_str());
+    if (active_scene_index < 0)
+    {
+        fprintf(
+            stderr,
+            "G1 default scene is absent: %s\n",
+            catalog.default_scene_id.c_str());
+        return 2;
+    }
+
+    scene_pack active_scene;
+    if (!scene_pack_load(
+            active_scene,
+            terrain_directory,
+            motion_manifest,
+            catalog,
+            active_scene_index,
+            artifact_error,
+            static_cast<int>(sizeof(artifact_error))))
+    {
+        fprintf(
+            stderr,
+            "G1 scene error [%s]: %s\n",
+            catalog.default_scene_id.c_str(),
+            artifact_error);
+        return 2;
+    }
+
+    terrain_support_set support_rows;
+    if (!terrain_support_load(
+            support_rows,
+            support_path.c_str(),
+            db.nframes(),
+            artifact_error,
+            static_cast<int>(sizeof(artifact_error))))
+    {
+        fprintf(stderr, "G1 support error: %s\n", artifact_error);
+        return 2;
+    }
+
+    g1_controller_state state;
+    if (!g1_controller_state_reset(
+            state,
+            db,
+            support_rows,
+            active_scene,
+            artifact_error,
+            static_cast<int>(sizeof(artifact_error))))
+    {
+        fprintf(stderr, "G1 reset error: %s\n", artifact_error);
+        return 2;
+    }
+
+    if (test_config.mode == G1_TestSequential) {
+        const int sequential_frames =
+            db.range_stops(0) - db.range_starts(0) - 1;
+        if (test_config.frame_limit > sequential_frames) {
+            fprintf(stderr,
+                "G1 sequential test overrun: MM_TEST_FRAMES=%d exceeds "
+                "the initial range capacity %d\n",
+                test_config.frame_limit, sequential_frames);
+            return 2;
+        }
+    }
+
     float applied_feature_weight_terrain = feature_weight_terrain;
 
     // Open the graphics window only after every artifact and feature gate has
@@ -1836,10 +1824,13 @@ int main(void)
     }
     SetTargetFPS(25);
 
-    Model terrain_model = LoadModel(mesh_path);
+    Model terrain_model = LoadModel(active_scene.mesh_path.c_str());
     if (!IsModelReady(terrain_model) || terrain_model.meshCount <= 0)
     {
-        fprintf(stderr, "G1 terrain mesh failed to load: %s\n", mesh_path);
+        fprintf(
+            stderr,
+            "G1 terrain mesh failed to load: %s\n",
+            active_scene.mesh_path.c_str());
         CloseWindow();
         return 2;
     }
@@ -1853,10 +1844,6 @@ int main(void)
     camera.fovy = 45.0f;
     camera.projection = CAMERA_PERSPECTIVE;
 
-    float camera_azimuth = 0.0f;
-    float camera_altitude = 0.4f;
-    float camera_distance = 4.0f;
-    
     // Character
     
     // G1: no character.bin skinned mesh — the skeleton is drawn directly from
@@ -1864,101 +1851,19 @@ int main(void)
 
     // Pose & Inertializer Data
     
-    int frame_index = db.range_starts(0);
     float inertialize_blending_halflife = 0.10f;
-
-    array1d<vec3> curr_bone_positions = db.bone_positions(frame_index);
-    array1d<vec3> curr_bone_velocities = db.bone_velocities(frame_index);
-    array1d<quat> curr_bone_rotations = db.bone_rotations(frame_index);
-    array1d<vec3> curr_bone_angular_velocities = db.bone_angular_velocities(frame_index);
-    array1d<bool> curr_bone_contacts = db.contact_states(frame_index);
-
-    array1d<vec3> trns_bone_positions = db.bone_positions(frame_index);
-    array1d<vec3> trns_bone_velocities = db.bone_velocities(frame_index);
-    array1d<quat> trns_bone_rotations = db.bone_rotations(frame_index);
-    array1d<vec3> trns_bone_angular_velocities = db.bone_angular_velocities(frame_index);
-    array1d<bool> trns_bone_contacts = db.contact_states(frame_index);
-
-    array1d<vec3> bone_positions = db.bone_positions(frame_index);
-    array1d<vec3> bone_velocities = db.bone_velocities(frame_index);
-    array1d<quat> bone_rotations = db.bone_rotations(frame_index);
-    array1d<vec3> bone_angular_velocities = db.bone_angular_velocities(frame_index);
-    
-    array1d<vec3> bone_offset_positions(db.nbones());
-    array1d<vec3> bone_offset_velocities(db.nbones());
-    array1d<quat> bone_offset_rotations(db.nbones());
-    array1d<vec3> bone_offset_angular_velocities(db.nbones());
-    
-    array1d<vec3> global_bone_positions(db.nbones());
-    array1d<vec3> global_bone_velocities(db.nbones());
-    array1d<quat> global_bone_rotations(db.nbones());
-    array1d<vec3> global_bone_angular_velocities(db.nbones());
-    array1d<bool> global_bone_computed(db.nbones());
-    
-    vec3 transition_src_position;
-    quat transition_src_rotation;
-    vec3 transition_dst_position;
-    quat transition_dst_rotation;
-    
-    inertialize_pose_reset(
-        bone_offset_positions,
-        bone_offset_velocities,
-        bone_offset_rotations,
-        bone_offset_angular_velocities,
-        transition_src_position,
-        transition_src_rotation,
-        transition_dst_position,
-        transition_dst_rotation,
-        bone_positions(0),
-        bone_rotations(0));
-    
-    inertialize_pose_update(
-        bone_positions,
-        bone_velocities,
-        bone_rotations,
-        bone_angular_velocities,
-        bone_offset_positions,
-        bone_offset_velocities,
-        bone_offset_rotations,
-        bone_offset_angular_velocities,
-        db.bone_positions(frame_index),
-        db.bone_velocities(frame_index),
-        db.bone_rotations(frame_index),
-        db.bone_angular_velocities(frame_index),
-        transition_src_position,
-        transition_src_rotation,
-        transition_dst_position,
-        transition_dst_rotation,
-        inertialize_blending_halflife,
-        0.0f);
         
     // Trajectory & Gameplay Data
 
-    float search_time = 0.1f;
 #ifdef MM_DISCRETE
-    if (const char* e = getenv("MM_SEARCHT")) search_time = atof(e);
+    if (const char* e = getenv("MM_SEARCHT")) {
+        state.search_time = atof(e);
+        state.search_timer = state.search_time;
+        state.force_search_timer = state.search_time;
+    }
 #endif
-    float search_timer = search_time;
-    float force_search_timer = search_time;
-    
-    vec3 desired_velocity;
-    vec3 desired_velocity_change_curr;
-    vec3 desired_velocity_change_prev;
     float desired_velocity_change_threshold = 50.0;
-    
-    quat desired_rotation;
-    vec3 desired_rotation_change_curr;
-    vec3 desired_rotation_change_prev;
     float desired_rotation_change_threshold = 50.0;
-    
-    float desired_gait = 0.0f;
-    float desired_gait_velocity = 0.0f;
-    
-    vec3 simulation_position;
-    vec3 simulation_velocity;
-    vec3 simulation_acceleration;
-    quat simulation_rotation;
-    vec3 simulation_angular_velocity;
     
     float simulation_velocity_halflife = 0.27f;
     float simulation_rotation_halflife = 0.27f;
@@ -1974,14 +1879,6 @@ int main(void)
     float simulation_walk_fwrd_speed = 0.5f;
     float simulation_walk_side_speed = 0.4f;
     float simulation_walk_back_speed = 0.4f;
-    
-    array1d<vec3> trajectory_desired_velocities(4);
-    array1d<quat> trajectory_desired_rotations(4);
-    array1d<vec3> trajectory_positions(4);
-    array1d<vec3> trajectory_velocities(4);
-    array1d<vec3> trajectory_accelerations(4);
-    array1d<quat> trajectory_rotations(4);
-    array1d<vec3> trajectory_angular_velocities(4);
     
     // Synchronization
     
@@ -2012,57 +1909,6 @@ int main(void)
     float ik_unlock_radius = 0.2f;
     float ik_blending_halflife = 0.1f;
     
-    // Contact and Foot Locking data
-    
-    array1d<int> contact_bones(2);
-    contact_bones(0) = G1_LeftToe;
-    contact_bones(1) = G1_RightToe;
-    
-    array1d<bool> contact_states(contact_bones.size);
-    array1d<bool> contact_locks(contact_bones.size);
-    array1d<vec3> contact_positions(contact_bones.size);
-    array1d<vec3> contact_velocities(contact_bones.size);
-    array1d<vec3> contact_points(contact_bones.size);
-    array1d<vec3> contact_targets(contact_bones.size);
-    array1d<vec3> contact_offset_positions(contact_bones.size);
-    array1d<vec3> contact_offset_velocities(contact_bones.size);
-    
-    for (int i = 0; i < contact_bones.size; i++)
-    {
-        vec3 bone_position;
-        vec3 bone_velocity;
-        quat bone_rotation;
-        vec3 bone_angular_velocity;
-        
-        forward_kinematics_velocity(
-            bone_position,
-            bone_velocity,
-            bone_rotation,
-            bone_angular_velocity,
-            bone_positions,
-            bone_velocities,
-            bone_rotations,
-            bone_angular_velocities,
-            db.bone_parents,
-            contact_bones(i));
-        
-        contact_reset(
-            contact_states(i),
-            contact_locks(i),
-            contact_positions(i),  
-            contact_velocities(i),
-            contact_points(i),
-            contact_targets(i),
-            contact_offset_positions(i),
-            contact_offset_velocities(i),
-            bone_position,
-            bone_velocity,
-            false);
-    }
-    
-    array1d<vec3> adjusted_bone_positions = bone_positions;
-    array1d<quat> adjusted_bone_rotations = bone_rotations;
-    
     // Learned Motion Matching
     
     const bool lmm_enabled = false;
@@ -2072,8 +1918,8 @@ int main(void)
     nnet decompressor, stepper, projector;
     nnet_evaluation decompressor_evaluation, stepper_evaluation, projector_evaluation;
 
-    array1d<float> features_proj = db.features(frame_index);
-    array1d<float> features_curr = db.features(frame_index);
+    array1d<float> features_proj = db.features(state.frame_index);
+    array1d<float> features_curr = db.features(state.frame_index);
     array1d<float> latent_proj(32); latent_proj.zero();
     array1d<float> latent_curr(32); latent_curr.zero();
     
@@ -2126,6 +1972,10 @@ int main(void)
 
     auto update_func = [&]()
     {
+        state.adjustment_xz = 0.0f;
+        state.adjustment_y = 0.0f;
+        state.clamp_xz = 0.0f;
+        state.clamp_y = 0.0f;
 
 #ifdef MM_DISCRETE
         if (test_config.mode == G1_TestLive) {
@@ -2139,23 +1989,23 @@ int main(void)
                           const char* n=getenv("MM_SNAPN"); if(n) snapN=atoi(n); }
         if (mode == 0)
         {
-            if (g_frame == 120) camera_azimuth += 0.5f * PIf;
-            if (g_frame == 240) camera_azimuth += 0.5f * PIf;
-            if (g_frame == 360) camera_azimuth -= 0.5f * PIf;
+            if (g_frame == 120) state.camera_azimuth += 0.5f * PIf;
+            if (g_frame == 240) state.camera_azimuth += 0.5f * PIf;
+            if (g_frame == 360) state.camera_azimuth -= 0.5f * PIf;
         }
         else if (mode == 1)
         {
             if (g_frame >= 60 && (g_frame % snapN) == 0)
-                camera_azimuth += ((g_frame / snapN) % 2 ? -1.0f : 1.0f) * 0.5f * PIf;
+                state.camera_azimuth += ((g_frame / snapN) % 2 ? -1.0f : 1.0f) * 0.5f * PIf;
         }
         else if (mode == 2)
         {
-            if (g_frame >= 60) camera_azimuth += 2.0f * (1.0f/60.0f); // arrow held
+            if (g_frame >= 60) state.camera_azimuth += 2.0f * (1.0f/60.0f); // arrow held
         }
         else if (mode == 3)
         {
-            // alternating 180-deg azimuth snaps -> antipodal desired_rotation
-            if (g_frame >= 60 && (g_frame % snapN) == 0) camera_azimuth += PIf;
+            // alternating 180-deg azimuth snaps -> antipodal state.desired_rotation
+            if (g_frame >= 60 && (g_frame % snapN) == 0) state.camera_azimuth += PIf;
         }
         }
 #endif
@@ -2179,92 +2029,92 @@ int main(void)
         
         // Get the desired gait (walk / run)
         if (test_config.mode != G1_TestLive) {
-            desired_gait = 0.0f;
-            desired_gait_velocity = 0.0f;
+            state.desired_gait = 0.0f;
+            state.desired_gait_velocity = 0.0f;
         } else {
             desired_gait_update(
-                desired_gait,
-                desired_gait_velocity,
+                state.desired_gait,
+                state.desired_gait_velocity,
                 dt);
         }
         
         // Get the desired simulation speeds based on the gait
-        float simulation_fwrd_speed = lerpf(simulation_run_fwrd_speed, simulation_walk_fwrd_speed, desired_gait);
-        float simulation_side_speed = lerpf(simulation_run_side_speed, simulation_walk_side_speed, desired_gait);
-        float simulation_back_speed = lerpf(simulation_run_back_speed, simulation_walk_back_speed, desired_gait);
+        float simulation_fwrd_speed = lerpf(simulation_run_fwrd_speed, simulation_walk_fwrd_speed, state.desired_gait);
+        float simulation_side_speed = lerpf(simulation_run_side_speed, simulation_walk_side_speed, state.desired_gait);
+        float simulation_back_speed = lerpf(simulation_run_back_speed, simulation_walk_back_speed, state.desired_gait);
         
         // Get the desired velocity
         vec3 desired_velocity_curr = desired_velocity_update(
             gamepadstick_left,
-            camera_azimuth,
-            simulation_rotation,
+            state.camera_azimuth,
+            state.simulation_rotation,
             simulation_fwrd_speed,
             simulation_side_speed,
             simulation_back_speed);
             
         // Get the desired rotation/direction
         quat desired_rotation_curr = desired_rotation_update(
-            desired_rotation,
+            state.desired_rotation,
             gamepadstick_left,
             gamepadstick_right,
-            camera_azimuth,
+            state.camera_azimuth,
             desired_strafe,
             desired_velocity_curr);
         
         // Check if we should force a search because input changed quickly
-        desired_velocity_change_prev = desired_velocity_change_curr;
-        desired_velocity_change_curr =  (desired_velocity_curr - desired_velocity) / dt;
-        desired_velocity = desired_velocity_curr;
+        state.desired_velocity_change_prev = state.desired_velocity_change_curr;
+        state.desired_velocity_change_curr =  (desired_velocity_curr - state.desired_velocity) / dt;
+        state.desired_velocity = desired_velocity_curr;
         if (rendered_frames == 0) {
-            trajectory_desired_velocities.set(desired_velocity);
+            state.trajectory_desired_velocities.set(state.desired_velocity);
         }
         
-        desired_rotation_change_prev = desired_rotation_change_curr;
-        desired_rotation_change_curr = quat_to_scaled_angle_axis(quat_abs(quat_mul_inv(desired_rotation_curr, desired_rotation))) / dt;
-        desired_rotation =  desired_rotation_curr;
+        state.desired_rotation_change_prev = state.desired_rotation_change_curr;
+        state.desired_rotation_change_curr = quat_to_scaled_angle_axis(quat_abs(quat_mul_inv(desired_rotation_curr, state.desired_rotation))) / dt;
+        state.desired_rotation =  desired_rotation_curr;
         
         bool force_search = false;
 
-        if (force_search_timer <= 0.0f && (
-            (length(desired_velocity_change_prev) >= desired_velocity_change_threshold && 
-             length(desired_velocity_change_curr)  < desired_velocity_change_threshold)
-        ||  (length(desired_rotation_change_prev) >= desired_rotation_change_threshold && 
-             length(desired_rotation_change_curr)  < desired_rotation_change_threshold)))
+        if (state.force_search_timer <= 0.0f && (
+            (length(state.desired_velocity_change_prev) >= desired_velocity_change_threshold &&
+             length(state.desired_velocity_change_curr)  < desired_velocity_change_threshold)
+        ||  (length(state.desired_rotation_change_prev) >= desired_rotation_change_threshold &&
+             length(state.desired_rotation_change_curr)  < desired_rotation_change_threshold)))
         {
             force_search = true;
-            force_search_timer = search_time;
+            state.force_search_timer = state.search_time;
         }
-        else if (force_search_timer > 0)
+        else if (state.force_search_timer > 0)
         {
-            force_search_timer -= dt;
+            state.force_search_timer -= dt;
         }
         
         // Predict Future Trajectory
         
         trajectory_desired_rotations_predict(
-          trajectory_desired_rotations,
-          trajectory_desired_velocities,
-          desired_rotation,
-          camera_azimuth,
+          state.trajectory_desired_rotations,
+          state.trajectory_desired_velocities,
+          state.desired_rotation,
+          state.camera_azimuth,
           gamepadstick_left,
           gamepadstick_right,
           desired_strafe,
           trajectory_sample_time);
         
         trajectory_rotations_predict(
-            trajectory_rotations,
-            trajectory_angular_velocities,
-            simulation_rotation,
-            simulation_angular_velocity,
-            trajectory_desired_rotations,
+            state.trajectory_rotations,
+            state.trajectory_angular_velocities,
+            state.simulation_rotation,
+            state.simulation_angular_velocity,
+            state.trajectory_desired_rotations,
             simulation_rotation_halflife,
             trajectory_sample_time);
         
         trajectory_desired_velocities_predict(
-          trajectory_desired_velocities,
-          trajectory_rotations,
-          desired_velocity,
-          camera_azimuth,
+          state.trajectory_desired_velocities,
+          state.trajectory_rotations,
+          state.desired_velocity,
+          state.camera_azimuth,
           gamepadstick_left,
           gamepadstick_right,
           desired_strafe,
@@ -2274,13 +2124,13 @@ int main(void)
           trajectory_sample_time);
         
         trajectory_positions_predict(
-            trajectory_positions,
-            trajectory_velocities,
-            trajectory_accelerations,
-            simulation_position,
-            simulation_velocity,
-            simulation_acceleration,
-            trajectory_desired_velocities,
+            state.trajectory_positions,
+            state.trajectory_velocities,
+            state.trajectory_accelerations,
+            state.simulation_position,
+            state.simulation_velocity,
+            state.simulation_acceleration,
+            state.trajectory_desired_velocities,
             simulation_velocity_halflife,
             trajectory_sample_time);
            
@@ -2292,7 +2142,7 @@ int main(void)
                 
         // Compute the features of the query vector
 
-        slice1d<float> query_features = lmm_enabled ? slice1d<float>(features_curr) : db.features(frame_index);
+        slice1d<float> query_features = lmm_enabled ? slice1d<float>(features_curr) : db.features(state.frame_index);
 
         int offset = 0;
         query_copy_denormalized_feature(query, offset, 3, query_features, db.features_offset, db.features_scale); // Left Foot Position
@@ -2300,16 +2150,17 @@ int main(void)
         query_copy_denormalized_feature(query, offset, 3, query_features, db.features_offset, db.features_scale); // Left Foot Velocity
         query_copy_denormalized_feature(query, offset, 3, query_features, db.features_offset, db.features_scale); // Right Foot Velocity
         query_copy_denormalized_feature(query, offset, 3, query_features, db.features_offset, db.features_scale); // Hip Velocity
-        query_compute_trajectory_position_feature(query, offset, bone_positions(0), bone_rotations(0), trajectory_positions);
-        query_compute_trajectory_direction_feature(query, offset, bone_rotations(0), trajectory_rotations);
+        query_compute_trajectory_position_feature(query, offset, state.bone_positions(0), state.bone_rotations(0), state.trajectory_positions);
+        query_compute_trajectory_direction_feature(query, offset, state.bone_rotations(0), state.trajectory_rotations);
 
-        const int query_database_frame = frame_index;
+        const int query_database_frame = state.frame_index;
         const int query_range = g1_active_range(db, query_database_frame);
-        if (!terrain_heightfield_is_queryable(runtime_terrain) ||
+        if (active_scene.terrain.version != 2 ||
+            !terrain_heightfield_is_queryable(active_scene.terrain) ||
             !terrain_centerline_inputs_are_valid(
-                bone_positions(0),
-                trajectory_positions,
-                trajectory_rotations)) {
+                state.bone_positions(0),
+                state.trajectory_positions,
+                state.trajectory_rotations)) {
             fprintf(stderr,
                 "G1 runtime query error: terrain centerline inputs are invalid\n");
             controller_exit_code = 2;
@@ -2317,12 +2168,12 @@ int main(void)
             return;
         }
         terrain_centerline_snapshot terrain_query_snapshot = {};
-        terrain_centerline_snapshot_compute(
+        terrain_centerline_snapshot_compute_v2(
             terrain_query_snapshot,
-            runtime_terrain,
-            bone_positions(0),
-            trajectory_positions,
-            trajectory_rotations);
+            active_scene.terrain,
+            state.bone_positions(0),
+            state.trajectory_positions,
+            state.trajectory_rotations);
         for (int terrain_feature = 0; terrain_feature < 4; ++terrain_feature) {
             const vec3 point = terrain_query_snapshot.points[terrain_feature];
             if (!terrain_float_is_finite(
@@ -2353,42 +2204,42 @@ int main(void)
         }
 
         // Check if we reached the end of the current anim
-        bool end_of_anim = database_trajectory_index_clamp(db, frame_index, 1) == frame_index;
+        bool end_of_anim = database_trajectory_index_clamp(db, state.frame_index, 1) == state.frame_index;
         if (test_config.mode == G1_TestSequential && end_of_anim) {
             fprintf(stderr,
                 "G1 sequential test overrun at database frame %d before "
                 "MM_TEST_FRAMES=%d\n",
-                frame_index, test_config.frame_limit);
+                state.frame_index, test_config.frame_limit);
             controller_exit_code = 2;
             controller_exit_requested = true;
             return;
         }
         const bool matching_enabled = test_config.mode != G1_TestSequential;
-        const bool search_requested = matching_enabled &&
-            (force_search || search_timer <= 0.0f || end_of_anim);
-        float incumbent_cost = 0.0f;
-        float selected_cost = 0.0f;
-        float selected_terrain_error = 0.0f;
+        state.searched = matching_enabled &&
+            (force_search || state.search_timer <= 0.0f || end_of_anim);
+        state.incumbent_cost = 0.0f;
+        state.selected_cost = 0.0f;
+        state.selected_terrain_error = 0.0f;
         if (logging_enabled) {
-            incumbent_cost = end_of_anim
-                ? FLT_MAX : database_frame_cost(db, frame_index, query);
-            selected_cost = incumbent_cost;
-            selected_terrain_error = database_raw_terrain_error(
-                db, frame_index, query);
+            state.incumbent_cost = end_of_anim
+                ? FLT_MAX : database_frame_cost(db, state.frame_index, query);
+            state.selected_cost = state.incumbent_cost;
+            state.selected_terrain_error = database_raw_terrain_error(
+                db, state.frame_index, query);
         }
         int selected_database_frame = query_database_frame;
-        bool transitioned = false;
+        state.transitioned = false;
         
         // Do we need to search?
 #ifdef MM_DISCRETE
-        int   dbg_best_index = frame_index;   // -1 == no search this frame
-        bool  dbg_did_search = search_requested;
+        int   dbg_best_index = state.frame_index;   // -1 == no search this frame
+        bool  dbg_did_search = state.searched;
         bool  dbg_did_transition = false;
-        quat  dbg_root_before = bone_rotations(0);
-        quat  dbg_off_before  = bone_offset_rotations(0);
-        quat  dbg_trns_dst_rot = trns_bone_rotations(0);
+        quat  dbg_root_before = state.bone_rotations(0);
+        quat  dbg_off_before  = state.bone_offset_rotations(0);
+        quat  dbg_trns_dst_rot = state.trns_bone_rotations(0);
 #endif
-        if (search_requested)
+        if (state.searched)
         {
             if (lmm_enabled)
             {
@@ -2414,41 +2265,41 @@ int main(void)
                 {   
                     // Evaluate pose for projected features
                     decompressor_evaluate(
-                        trns_bone_positions,
-                        trns_bone_velocities,
-                        trns_bone_rotations,
-                        trns_bone_angular_velocities,
-                        trns_bone_contacts,
+                        state.trns_bone_positions,
+                        state.trns_bone_velocities,
+                        state.trns_bone_rotations,
+                        state.trns_bone_angular_velocities,
+                        state.trns_bone_contacts,
                         decompressor_evaluation,
                         features_proj,
                         latent_proj,
-                        curr_bone_positions(0),
-                        curr_bone_rotations(0),
+                        state.curr_bone_positions(0),
+                        state.curr_bone_rotations(0),
                         decompressor,
                         dt);
                     
                     // Transition inertializer to this pose
                     inertialize_pose_transition(
-                        bone_offset_positions,
-                        bone_offset_velocities,
-                        bone_offset_rotations,
-                        bone_offset_angular_velocities,
-                        transition_src_position,
-                        transition_src_rotation,
-                        transition_dst_position,
-                        transition_dst_rotation,
-                        bone_positions(0),
-                        bone_velocities(0),
-                        bone_rotations(0),
-                        bone_angular_velocities(0),
-                        curr_bone_positions,
-                        curr_bone_velocities,
-                        curr_bone_rotations,
-                        curr_bone_angular_velocities,
-                        trns_bone_positions,
-                        trns_bone_velocities,
-                        trns_bone_rotations,
-                        trns_bone_angular_velocities);
+                        state.bone_offset_positions,
+                        state.bone_offset_velocities,
+                        state.bone_offset_rotations,
+                        state.bone_offset_angular_velocities,
+                        state.transition_src_position,
+                        state.transition_src_rotation,
+                        state.transition_dst_position,
+                        state.transition_dst_rotation,
+                        state.bone_positions(0),
+                        state.bone_velocities(0),
+                        state.bone_rotations(0),
+                        state.bone_angular_velocities(0),
+                        state.curr_bone_positions,
+                        state.curr_bone_velocities,
+                        state.curr_bone_rotations,
+                        state.curr_bone_angular_velocities,
+                        state.trns_bone_positions,
+                        state.trns_bone_velocities,
+                        state.trns_bone_rotations,
+                        state.trns_bone_angular_velocities);
                     
                     // Update current features and latents
                     features_curr = features_proj;
@@ -2459,7 +2310,7 @@ int main(void)
             {
                 // Search
                 
-                int best_index = end_of_anim ? -1 : frame_index;
+                int best_index = end_of_anim ? -1 : state.frame_index;
                 float best_cost = FLT_MAX;
                 
                 database_search(
@@ -2468,48 +2319,48 @@ int main(void)
                     db,
                     query);
                 selected_database_frame = best_index;
-                if (logging_enabled) {
-                    selected_cost = best_cost;
-                    selected_terrain_error = database_raw_terrain_error(
+                if (logging_enabled && best_index != state.frame_index) {
+                    state.selected_cost = best_cost;
+                    state.selected_terrain_error = database_raw_terrain_error(
                         db, best_index, query);
                 }
                 
                 // Transition if better frame found
                 
-                if (best_index != frame_index)
+                if (best_index != state.frame_index)
                 {
-                    transitioned = true;
-                    trns_bone_positions = db.bone_positions(best_index);
-                    trns_bone_velocities = db.bone_velocities(best_index);
-                    trns_bone_rotations = db.bone_rotations(best_index);
-                    trns_bone_angular_velocities = db.bone_angular_velocities(best_index);
+                    state.transitioned = true;
+                    state.trns_bone_positions = db.bone_positions(best_index);
+                    state.trns_bone_velocities = db.bone_velocities(best_index);
+                    state.trns_bone_rotations = db.bone_rotations(best_index);
+                    state.trns_bone_angular_velocities = db.bone_angular_velocities(best_index);
                     
                     inertialize_pose_transition(
-                        bone_offset_positions,
-                        bone_offset_velocities,
-                        bone_offset_rotations,
-                        bone_offset_angular_velocities,
-                        transition_src_position,
-                        transition_src_rotation,
-                        transition_dst_position,
-                        transition_dst_rotation,
-                        bone_positions(0),
-                        bone_velocities(0),
-                        bone_rotations(0),
-                        bone_angular_velocities(0),
-                        curr_bone_positions,
-                        curr_bone_velocities,
-                        curr_bone_rotations,
-                        curr_bone_angular_velocities,
-                        trns_bone_positions,
-                        trns_bone_velocities,
-                        trns_bone_rotations,
-                        trns_bone_angular_velocities);
+                        state.bone_offset_positions,
+                        state.bone_offset_velocities,
+                        state.bone_offset_rotations,
+                        state.bone_offset_angular_velocities,
+                        state.transition_src_position,
+                        state.transition_src_rotation,
+                        state.transition_dst_position,
+                        state.transition_dst_rotation,
+                        state.bone_positions(0),
+                        state.bone_velocities(0),
+                        state.bone_rotations(0),
+                        state.bone_angular_velocities(0),
+                        state.curr_bone_positions,
+                        state.curr_bone_velocities,
+                        state.curr_bone_rotations,
+                        state.curr_bone_angular_velocities,
+                        state.trns_bone_positions,
+                        state.trns_bone_velocities,
+                        state.trns_bone_rotations,
+                        state.trns_bone_angular_velocities);
                     
-                    frame_index = best_index;
+                    state.frame_index = best_index;
 #ifdef MM_DISCRETE
                     dbg_did_transition = true;
-                    dbg_trns_dst_rot = trns_bone_rotations(0);
+                    dbg_trns_dst_rot = state.trns_bone_rotations(0);
 #endif
                 }
 #ifdef MM_DISCRETE
@@ -2518,11 +2369,11 @@ int main(void)
             }
 
             // Reset search timer
-            search_timer = search_time;
+            state.search_timer = state.search_time;
         }
         
         // Tick down search timer
-        search_timer -= dt;
+        state.search_timer -= dt;
 
         if (lmm_enabled)
         {
@@ -2536,52 +2387,52 @@ int main(void)
             
             // Decompress next pose
             decompressor_evaluate(
-                curr_bone_positions,
-                curr_bone_velocities,
-                curr_bone_rotations,
-                curr_bone_angular_velocities,
-                curr_bone_contacts,
+                state.curr_bone_positions,
+                state.curr_bone_velocities,
+                state.curr_bone_rotations,
+                state.curr_bone_angular_velocities,
+                state.curr_bone_contacts,
                 decompressor_evaluation,
                 features_curr,
                 latent_curr,
-                curr_bone_positions(0),
-                curr_bone_rotations(0),
+                state.curr_bone_positions(0),
+                state.curr_bone_rotations(0),
                 decompressor,
                 dt);
         }
         else
         {
             // Tick frame
-            frame_index = database_trajectory_index_clamp(
-                db, frame_index, 1);
+            state.frame_index = database_trajectory_index_clamp(
+                db, state.frame_index, 1);
             
             // Look-up Next Pose
-            curr_bone_positions = db.bone_positions(frame_index);
-            curr_bone_velocities = db.bone_velocities(frame_index);
-            curr_bone_rotations = db.bone_rotations(frame_index);
-            curr_bone_angular_velocities = db.bone_angular_velocities(frame_index);
-            curr_bone_contacts = db.contact_states(frame_index);
+            state.curr_bone_positions = db.bone_positions(state.frame_index);
+            state.curr_bone_velocities = db.bone_velocities(state.frame_index);
+            state.curr_bone_rotations = db.bone_rotations(state.frame_index);
+            state.curr_bone_angular_velocities = db.bone_angular_velocities(state.frame_index);
+            state.curr_bone_contacts = db.contact_states(state.frame_index);
         }
         
         // Update inertializer
         
         inertialize_pose_update(
-            bone_positions,
-            bone_velocities,
-            bone_rotations,
-            bone_angular_velocities,
-            bone_offset_positions,
-            bone_offset_velocities,
-            bone_offset_rotations,
-            bone_offset_angular_velocities,
-            curr_bone_positions,
-            curr_bone_velocities,
-            curr_bone_rotations,
-            curr_bone_angular_velocities,
-            transition_src_position,
-            transition_src_rotation,
-            transition_dst_position,
-            transition_dst_rotation,
+            state.bone_positions,
+            state.bone_velocities,
+            state.bone_rotations,
+            state.bone_angular_velocities,
+            state.bone_offset_positions,
+            state.bone_offset_velocities,
+            state.bone_offset_rotations,
+            state.bone_offset_angular_velocities,
+            state.curr_bone_positions,
+            state.curr_bone_velocities,
+            state.curr_bone_rotations,
+            state.curr_bone_angular_velocities,
+            state.transition_src_position,
+            state.transition_src_rotation,
+            state.transition_dst_position,
+            state.transition_dst_rotation,
             inertialize_blending_halflife,
             dt);
 
@@ -2589,33 +2440,33 @@ int main(void)
         motion_match_pose_diagnostic inertialized_diagnostic;
         vec3 root_before_adjustment;
         if (logging_enabled) {
-            array1d<vec3> raw_selected_positions(curr_bone_positions);
-            array1d<quat> raw_selected_rotations(curr_bone_rotations);
-            raw_selected_positions(0) = bone_positions(0);
-            raw_selected_rotations(0) = bone_rotations(0);
+            array1d<vec3> raw_selected_positions(state.curr_bone_positions);
+            array1d<quat> raw_selected_rotations(state.curr_bone_rotations);
+            raw_selected_positions(0) = state.bone_positions(0);
+            raw_selected_rotations(0) = state.bone_rotations(0);
             raw_selected_diagnostic = g1_pose_diagnostic(
                 raw_selected_positions, raw_selected_rotations,
-                db.bone_parents, runtime_terrain);
+                db.bone_parents, active_scene.terrain);
             inertialized_diagnostic = g1_pose_diagnostic(
-                bone_positions, bone_rotations,
-                db.bone_parents, runtime_terrain);
-            root_before_adjustment = bone_positions(0);
+                state.bone_positions, state.bone_rotations,
+                db.bone_parents, active_scene.terrain);
+            root_before_adjustment = state.bone_positions(0);
         }
         
         // Update Simulation
         
         simulation_positions_update(
-            simulation_position, 
-            simulation_velocity, 
-            simulation_acceleration,
-            desired_velocity,
+            state.simulation_position,
+            state.simulation_velocity,
+            state.simulation_acceleration,
+            state.desired_velocity,
             simulation_velocity_halflife,
             dt);
             
         simulation_rotations_update(
-            simulation_rotation, 
-            simulation_angular_velocity, 
-            desired_rotation,
+            state.simulation_rotation,
+            state.simulation_angular_velocity,
+            state.desired_rotation,
             simulation_rotation_halflife,
             dt);
         
@@ -2624,26 +2475,26 @@ int main(void)
         if (synchronization_enabled)
         {
             vec3 synchronized_position = lerp(
-                simulation_position, 
-                bone_positions(0),
+                state.simulation_position,
+                state.bone_positions(0),
                 synchronization_data_factor);
                 
             quat synchronized_rotation = quat_nlerp_shortest(
-                simulation_rotation,
-                bone_rotations(0), 
+                state.simulation_rotation,
+                state.bone_rotations(0),
                 synchronization_data_factor);
           
-            simulation_position = synchronized_position;
-            simulation_rotation = synchronized_rotation;
+            state.simulation_position = synchronized_position;
+            state.simulation_rotation = synchronized_rotation;
             
             inertialize_root_adjust(
-                bone_offset_positions(0),
-                transition_src_position,
-                transition_src_rotation,
-                transition_dst_position,
-                transition_dst_rotation,
-                bone_positions(0),
-                bone_rotations(0),
+                state.bone_offset_positions(0),
+                state.transition_src_position,
+                state.transition_src_rotation,
+                state.transition_dst_position,
+                state.transition_dst_rotation,
+                state.bone_positions(0),
+                state.bone_rotations(0),
                 synchronized_position,
                 synchronized_rotation);
         }
@@ -2652,23 +2503,23 @@ int main(void)
         
         if (!synchronization_enabled && adjustment_enabled)
         {   
-            vec3 adjusted_position = bone_positions(0);
-            quat adjusted_rotation = bone_rotations(0);
+            vec3 adjusted_position = state.bone_positions(0);
+            quat adjusted_rotation = state.bone_rotations(0);
             
             if (adjustment_by_velocity_enabled)
             {
                 adjusted_position = adjust_character_position_by_velocity(
-                    bone_positions(0),
-                    bone_velocities(0),
-                    simulation_position,
+                    state.bone_positions(0),
+                    state.bone_velocities(0),
+                    state.simulation_position,
                     adjustment_position_max_ratio,
                     adjustment_position_halflife,
                     dt);
                 
                 adjusted_rotation = adjust_character_rotation_by_velocity(
-                    bone_rotations(0),
-                    bone_angular_velocities(0),
-                    simulation_rotation,
+                    state.bone_rotations(0),
+                    state.bone_angular_velocities(0),
+                    state.simulation_rotation,
                     adjustment_rotation_max_ratio,
                     adjustment_rotation_halflife,
                     dt);
@@ -2676,75 +2527,84 @@ int main(void)
             else
             {
                 adjusted_position = adjust_character_position(
-                    bone_positions(0),
-                    simulation_position,
+                    state.bone_positions(0),
+                    state.simulation_position,
                     adjustment_position_halflife,
                     dt);
                 
                 adjusted_rotation = adjust_character_rotation(
-                    bone_rotations(0),
-                    simulation_rotation,
+                    state.bone_rotations(0),
+                    state.simulation_rotation,
                     adjustment_rotation_halflife,
                     dt);
             }
       
             inertialize_root_adjust(
-                bone_offset_positions(0),
-                transition_src_position,
-                transition_src_rotation,
-                transition_dst_position,
-                transition_dst_rotation,
-                bone_positions(0),
-                bone_rotations(0),
+                state.bone_offset_positions(0),
+                state.transition_src_position,
+                state.transition_src_rotation,
+                state.transition_dst_position,
+                state.transition_dst_rotation,
+                state.bone_positions(0),
+                state.bone_rotations(0),
                 adjusted_position,
                 adjusted_rotation);
         }
 
         vec3 root_after_adjustment;
         if (logging_enabled) {
-            root_after_adjustment = bone_positions(0);
+            root_after_adjustment = state.bone_positions(0);
         }
         
         // Clamping
         
         if (!synchronization_enabled && clamping_enabled)
         {
-            vec3 adjusted_position = bone_positions(0);
-            quat adjusted_rotation = bone_rotations(0);
+            vec3 adjusted_position = state.bone_positions(0);
+            quat adjusted_rotation = state.bone_rotations(0);
             
             adjusted_position = clamp_character_position(
                 adjusted_position,
-                simulation_position,
+                state.simulation_position,
                 clamping_max_distance);
             
             adjusted_rotation = clamp_character_rotation(
                 adjusted_rotation,
-                simulation_rotation,
+                state.simulation_rotation,
                 clamping_max_angle);
             
             inertialize_root_adjust(
-                bone_offset_positions(0),
-                transition_src_position,
-                transition_src_rotation,
-                transition_dst_position,
-                transition_dst_rotation,
-                bone_positions(0),
-                bone_rotations(0),
+                state.bone_offset_positions(0),
+                state.transition_src_position,
+                state.transition_src_rotation,
+                state.transition_dst_position,
+                state.transition_dst_rotation,
+                state.bone_positions(0),
+                state.bone_rotations(0),
                 adjusted_position,
                 adjusted_rotation);
         }
 
+        state.adjusted_bone_positions = state.bone_positions;
+        state.adjusted_bone_rotations = state.bone_rotations;
+        support_pose_apply(
+            state.adjusted_bone_positions,
+            state.bone_positions,
+            state.support.height);
+
         if (logging_enabled) {
-            const vec3 root_after_clamp = bone_positions(0);
+            const vec3 root_after_clamp = state.bone_positions(0);
             const motion_match_pose_diagnostic rendered_diagnostic =
                 g1_pose_diagnostic(
-                bone_positions, bone_rotations,
-                db.bone_parents, runtime_terrain);
-            array1d<vec3> rendered_global(db.nbones());
-            array1d<quat> rendered_global_rotations(db.nbones());
+                state.adjusted_bone_positions,
+                state.adjusted_bone_rotations,
+                db.bone_parents, active_scene.terrain);
             forward_kinematics_full(
-                rendered_global, rendered_global_rotations,
-                bone_positions, bone_rotations, db.bone_parents);
+                state.global_bone_positions,
+                state.global_bone_rotations,
+                state.adjusted_bone_positions,
+                state.adjusted_bone_rotations,
+                db.bone_parents);
             char query_bits_hex[31 * 8 + 1] = {};
             if (!motion_match_query_bits_hex(
                     query_bits_hex, sizeof(query_bits_hex), query)) {
@@ -2763,15 +2623,15 @@ int main(void)
             log_row.query_database_frame = query_database_frame;
             log_row.query_range = query_range;
             log_row.selected_database_frame = selected_database_frame;
-            log_row.database_frame = frame_index;
-            log_row.range = g1_active_range(db, frame_index);
+            log_row.database_frame = state.frame_index;
+            log_row.range = g1_active_range(db, state.frame_index);
             log_row.source_range = g1_active_range(
                 db, selected_database_frame);
-            log_row.searched = search_requested;
-            log_row.transitioned = transitioned;
-            log_row.incumbent_cost = incumbent_cost;
-            log_row.selected_cost = selected_cost;
-            log_row.selected_terrain_error = selected_terrain_error;
+            log_row.searched = state.searched;
+            log_row.transitioned = state.transitioned;
+            log_row.incumbent_cost = state.incumbent_cost;
+            log_row.selected_cost = state.selected_cost;
+            log_row.selected_terrain_error = state.selected_terrain_error;
             log_row.effective_terrain_weight =
                 applied_feature_weight_terrain;
             for (int i = 0; i < 4; ++i) {
@@ -2784,21 +2644,29 @@ int main(void)
             log_row.hips_inertial_offset_y =
                 inertialized_diagnostic.hips_y -
                 raw_selected_diagnostic.hips_y;
-            log_row.runtime_root_surface_height = heightfield_sample(
-                runtime_terrain, bone_positions(0).x, bone_positions(0).z);
-            log_row.runtime_left_toe_surface_height = heightfield_sample(
-                runtime_terrain, rendered_global(G1_LeftToe).x,
-                rendered_global(G1_LeftToe).z);
-            log_row.runtime_right_toe_surface_height = heightfield_sample(
-                runtime_terrain, rendered_global(G1_RightToe).x,
-                rendered_global(G1_RightToe).z);
+            log_row.runtime_root_surface_height = heightfield_sample_v2(
+                active_scene.terrain,
+                state.bone_positions(0).x,
+                state.bone_positions(0).z);
+            log_row.runtime_left_toe_surface_height = heightfield_sample_v2(
+                active_scene.terrain,
+                state.global_bone_positions(G1_LeftToe).x,
+                state.global_bone_positions(G1_LeftToe).z);
+            log_row.runtime_right_toe_surface_height = heightfield_sample_v2(
+                active_scene.terrain,
+                state.global_bone_positions(G1_RightToe).x,
+                state.global_bone_positions(G1_RightToe).z);
             const vec3 adjustment_delta =
                 root_after_adjustment - root_before_adjustment;
             const vec3 clamp_delta = root_after_clamp - root_after_adjustment;
-            log_row.adjustment_xz = g1_xz_length(adjustment_delta);
-            log_row.adjustment_y = adjustment_delta.y;
-            log_row.clamp_xz = g1_xz_length(clamp_delta);
-            log_row.clamp_y = clamp_delta.y;
+            state.adjustment_xz = g1_xz_length(adjustment_delta);
+            state.adjustment_y = adjustment_delta.y;
+            state.clamp_xz = g1_xz_length(clamp_delta);
+            state.clamp_y = clamp_delta.y;
+            log_row.adjustment_xz = state.adjustment_xz;
+            log_row.adjustment_y = state.adjustment_y;
+            log_row.clamp_xz = state.clamp_xz;
+            log_row.clamp_y = state.clamp_y;
             log_row.matching_enabled = matching_enabled;
             log_row.adjustment_enabled = adjustment_enabled;
             log_row.clamping_enabled = clamping_enabled;
@@ -2816,30 +2684,30 @@ int main(void)
 #ifdef MM_DISCRETE
         {
             // Per-frame instrumentation. All angles in degrees.
-            quat root_q   = bone_rotations(0);          // final rendered root rotation
-            vec3 root_p   = bone_positions(0);
-            quat off_q    = bone_offset_rotations(0);   // inertialize root ROTATION offset
-            vec3 off_av   = bone_offset_angular_velocities(0);
+            quat root_q   = state.bone_rotations(0);          // final rendered root rotation
+            vec3 root_p   = state.bone_positions(0);
+            quat off_q    = state.bone_offset_rotations(0);   // inertialize root ROTATION offset
+            vec3 off_av   = state.bone_offset_angular_velocities(0);
             static float  prev_root_yaw = dbg_yaw_deg(root_q);
             static quat   prev_root_q   = root_q;
             float root_yaw   = dbg_yaw_deg(root_q);
             float jump_deg   = dbg_angle_between_deg(prev_root_q, root_q); // full 3D jump
-            float des_yaw    = dbg_yaw_deg(desired_rotation);
-            float sim_yaw    = dbg_yaw_deg(simulation_rotation);
+            float des_yaw    = dbg_yaw_deg(state.desired_rotation);
+            float sim_yaw    = dbg_yaw_deg(state.simulation_rotation);
             float off_ang    = dbg_quat_angle_deg(off_q);           // magnitude of root offset
-            float dst_yaw    = dbg_yaw_deg(transition_dst_rotation);
-            float src_yaw    = dbg_yaw_deg(transition_src_rotation);
+            float dst_yaw    = dbg_yaw_deg(state.transition_dst_rotation);
+            float src_yaw    = dbg_yaw_deg(state.transition_src_rotation);
 
             fprintf(g_log,
                 "f=%d az=%.1f | rootYaw=%.1f jump3D=%.1f | desYaw=%.1f simYaw=%.1f "
                 "| offAng=%.2f offW=%.3f offAV=%.2f | best=%d srch=%d trns=%d "
                 "| dstYaw=%.1f srcYaw=%.1f | fi=%d\n",
-                g_frame, camera_azimuth * 180.0f / PIf,
+                g_frame, state.camera_azimuth * 180.0f / PIf,
                 root_yaw, jump_deg,
                 des_yaw, sim_yaw,
                 off_ang, off_q.w, length(off_av),
                 dbg_best_index, (int)dbg_did_search, (int)dbg_did_transition,
-                dst_yaw, src_yaw, frame_index);
+                dst_yaw, src_yaw, state.frame_index);
 
             if (jump_deg > 30.0f)
             {
@@ -2860,115 +2728,112 @@ int main(void)
 
         // Contact fixup with foot locking and IK
 
-        adjusted_bone_positions = bone_positions;
-        adjusted_bone_rotations = bone_rotations;
-
         if (ik_enabled)
         {
-            for (int i = 0; i < contact_bones.size; i++)
+            for (int i = 0; i < state.contact_bones.size; i++)
             {
                 // Find all the relevant bone indices
-                int toe_bone = contact_bones(i);
+                int toe_bone = state.contact_bones(i);
                 int heel_bone = db.bone_parents(toe_bone);
                 int knee_bone = db.bone_parents(heel_bone);
                 int hip_bone = db.bone_parents(knee_bone);
                 int root_bone = db.bone_parents(hip_bone);
                 
                 // Compute the world space position for the toe
-                global_bone_computed.zero();
+                state.global_bone_computed.zero();
                 
                 forward_kinematics_partial(
-                    global_bone_positions,
-                    global_bone_rotations,
-                    global_bone_computed,
-                    bone_positions,
-                    bone_rotations,
+                    state.global_bone_positions,
+                    state.global_bone_rotations,
+                    state.global_bone_computed,
+                    state.bone_positions,
+                    state.bone_rotations,
                     db.bone_parents,
                     toe_bone);
                 
                 // Update the contact state
                 contact_update(
-                    contact_states(i),
-                    contact_locks(i),
-                    contact_positions(i),  
-                    contact_velocities(i),
-                    contact_points(i),
-                    contact_targets(i),
-                    contact_offset_positions(i),
-                    contact_offset_velocities(i),
-                    global_bone_positions(toe_bone),
-                    curr_bone_contacts(i),
+                    state.contact_states(i),
+                    state.contact_locks(i),
+                    state.contact_positions(i),
+                    state.contact_velocities(i),
+                    state.contact_points(i),
+                    state.contact_targets(i),
+                    state.contact_offset_positions(i),
+                    state.contact_offset_velocities(i),
+                    state.global_bone_positions(toe_bone),
+                    state.curr_bone_contacts(i),
                     ik_unlock_radius,
                     ik_foot_height,
                     ik_blending_halflife,
                     dt);
                 
                 // Ensure contact position never goes through floor
-                vec3 contact_position_clamp = contact_positions(i);
+                vec3 contact_position_clamp = state.contact_positions(i);
                 contact_position_clamp.y = maxf(contact_position_clamp.y, ik_foot_height);
                 
                 // Re-compute toe, heel, knee, hip, and root bone positions
                 for (int bone : {heel_bone, knee_bone, hip_bone, root_bone})
                 {
                     forward_kinematics_partial(
-                        global_bone_positions,
-                        global_bone_rotations,
-                        global_bone_computed,
-                        bone_positions,
-                        bone_rotations,
+                        state.global_bone_positions,
+                        state.global_bone_rotations,
+                        state.global_bone_computed,
+                        state.bone_positions,
+                        state.bone_rotations,
                         db.bone_parents,
                         bone);
                 }
                 
                 // Perform simple two-joint IK to place heel
                 ik_two_bone(
-                    adjusted_bone_rotations(hip_bone),
-                    adjusted_bone_rotations(knee_bone),
-                    global_bone_positions(hip_bone),
-                    global_bone_positions(knee_bone),
-                    global_bone_positions(heel_bone),
-                    contact_position_clamp + (global_bone_positions(heel_bone) - global_bone_positions(toe_bone)),
-                    quat_mul_vec3(global_bone_rotations(knee_bone), vec3(0.0f, 1.0f, 0.0f)),
-                    global_bone_rotations(hip_bone),
-                    global_bone_rotations(knee_bone),
-                    global_bone_rotations(root_bone),
+                    state.adjusted_bone_rotations(hip_bone),
+                    state.adjusted_bone_rotations(knee_bone),
+                    state.global_bone_positions(hip_bone),
+                    state.global_bone_positions(knee_bone),
+                    state.global_bone_positions(heel_bone),
+                    contact_position_clamp + (state.global_bone_positions(heel_bone) - state.global_bone_positions(toe_bone)),
+                    quat_mul_vec3(state.global_bone_rotations(knee_bone), vec3(0.0f, 1.0f, 0.0f)),
+                    state.global_bone_rotations(hip_bone),
+                    state.global_bone_rotations(knee_bone),
+                    state.global_bone_rotations(root_bone),
                     ik_max_length_buffer);
                 
                 // Re-compute toe, heel, and knee positions 
-                global_bone_computed.zero();
+                state.global_bone_computed.zero();
                 
                 for (int bone : {toe_bone, heel_bone, knee_bone})
                 {
                     forward_kinematics_partial(
-                        global_bone_positions,
-                        global_bone_rotations,
-                        global_bone_computed,
-                        adjusted_bone_positions,
-                        adjusted_bone_rotations,
+                        state.global_bone_positions,
+                        state.global_bone_rotations,
+                        state.global_bone_computed,
+                        state.adjusted_bone_positions,
+                        state.adjusted_bone_rotations,
                         db.bone_parents,
                         bone);
                 }
                 
                 // Rotate heel so toe is facing toward contact point
                 ik_look_at(
-                    adjusted_bone_rotations(heel_bone),
-                    global_bone_rotations(knee_bone),
-                    global_bone_rotations(heel_bone),
-                    global_bone_positions(heel_bone),
-                    global_bone_positions(toe_bone),
+                    state.adjusted_bone_rotations(heel_bone),
+                    state.global_bone_rotations(knee_bone),
+                    state.global_bone_rotations(heel_bone),
+                    state.global_bone_positions(heel_bone),
+                    state.global_bone_positions(toe_bone),
                     contact_position_clamp);
                 
                 // Re-compute toe and heel positions
-                global_bone_computed.zero();
+                state.global_bone_computed.zero();
                 
                 for (int bone : {toe_bone, heel_bone})
                 {
                     forward_kinematics_partial(
-                        global_bone_positions,
-                        global_bone_rotations,
-                        global_bone_computed,
-                        adjusted_bone_positions,
-                        adjusted_bone_rotations,
+                        state.global_bone_positions,
+                        state.global_bone_rotations,
+                        state.global_bone_computed,
+                        state.adjusted_bone_positions,
+                        state.adjusted_bone_rotations,
                         db.bone_parents,
                         bone);
                 }
@@ -2976,17 +2841,17 @@ int main(void)
                 // Rotate toe bone so that the end of the toe 
                 // does not intersect with the ground
                 vec3 toe_end_curr = quat_mul_vec3(
-                    global_bone_rotations(toe_bone), vec3(ik_toe_length, 0.0f, 0.0f)) + 
-                    global_bone_positions(toe_bone);
+                    state.global_bone_rotations(toe_bone), vec3(ik_toe_length, 0.0f, 0.0f)) +
+                    state.global_bone_positions(toe_bone);
                     
                 vec3 toe_end_targ = toe_end_curr;
                 toe_end_targ.y = maxf(toe_end_targ.y, ik_foot_height);
                 
                 ik_look_at(
-                    adjusted_bone_rotations(toe_bone),
-                    global_bone_rotations(heel_bone),
-                    global_bone_rotations(toe_bone),
-                    global_bone_positions(toe_bone),
+                    state.adjusted_bone_rotations(toe_bone),
+                    state.global_bone_rotations(heel_bone),
+                    state.global_bone_rotations(toe_bone),
+                    state.global_bone_positions(toe_bone),
                     toe_end_curr,
                     toe_end_targ);
             }
@@ -2997,21 +2862,21 @@ int main(void)
         // space ready for rendering
         
         forward_kinematics_full(
-            global_bone_positions,
-            global_bone_rotations,
-            adjusted_bone_positions,
-            adjusted_bone_rotations,
+            state.global_bone_positions,
+            state.global_bone_rotations,
+            state.adjusted_bone_positions,
+            state.adjusted_bone_rotations,
             db.bone_parents);
         
         // Update camera
         
         orbit_camera_update(
             camera, 
-            camera_azimuth,
-            camera_altitude,
-            camera_distance,
-            bone_positions(0) + vec3(0, 1, 0),
-            // simulation_position + vec3(0, 1, 0),
+            state.camera_azimuth,
+            state.camera_altitude,
+            state.camera_distance,
+            state.adjusted_bone_positions(0) + vec3(0, 1, 0),
+            // state.simulation_position + vec3(0, 1, 0),
             gamepadstick_right,
             desired_strafe,
             dt);
@@ -3036,75 +2901,75 @@ int main(void)
 
         // Draw Simulation Object
         
-        DrawCylinderWires(to_Vector3(simulation_position), 0.6f, 0.6f, 0.001f, 17, ORANGE);
-        DrawSphereWires(to_Vector3(simulation_position), 0.05f, 4, 10, ORANGE);
-        DrawLine3D(to_Vector3(simulation_position), to_Vector3(
-            simulation_position + 0.6f * quat_mul_vec3(simulation_rotation, vec3(0.0f, 0.0f, 1.0f))), ORANGE);
+        DrawCylinderWires(to_Vector3(state.simulation_position), 0.6f, 0.6f, 0.001f, 17, ORANGE);
+        DrawSphereWires(to_Vector3(state.simulation_position), 0.05f, 4, 10, ORANGE);
+        DrawLine3D(to_Vector3(state.simulation_position), to_Vector3(
+            state.simulation_position + 0.6f * quat_mul_vec3(state.simulation_rotation, vec3(0.0f, 0.0f, 1.0f))), ORANGE);
         
         // Draw Clamping Radius/Angles
         
         if (clamping_enabled)
         {
             DrawCylinderWires(
-                to_Vector3(simulation_position), 
+                to_Vector3(state.simulation_position),
                 clamping_max_distance, 
                 clamping_max_distance, 
                 0.001f, 17, SKYBLUE);
             
-            quat rotation_clamp_0 = quat_mul(quat_from_angle_axis(+clamping_max_angle, vec3(0.0f, 1.0f, 0.0f)), simulation_rotation);
-            quat rotation_clamp_1 = quat_mul(quat_from_angle_axis(-clamping_max_angle, vec3(0.0f, 1.0f, 0.0f)), simulation_rotation);
+            quat rotation_clamp_0 = quat_mul(quat_from_angle_axis(+clamping_max_angle, vec3(0.0f, 1.0f, 0.0f)), state.simulation_rotation);
+            quat rotation_clamp_1 = quat_mul(quat_from_angle_axis(-clamping_max_angle, vec3(0.0f, 1.0f, 0.0f)), state.simulation_rotation);
             
-            vec3 rotation_clamp_0_dir = simulation_position + 0.6f * quat_mul_vec3(rotation_clamp_0, vec3(0.0f, 0.0f, 1.0f));
-            vec3 rotation_clamp_1_dir = simulation_position + 0.6f * quat_mul_vec3(rotation_clamp_1, vec3(0.0f, 0.0f, 1.0f));
+            vec3 rotation_clamp_0_dir = state.simulation_position + 0.6f * quat_mul_vec3(rotation_clamp_0, vec3(0.0f, 0.0f, 1.0f));
+            vec3 rotation_clamp_1_dir = state.simulation_position + 0.6f * quat_mul_vec3(rotation_clamp_1, vec3(0.0f, 0.0f, 1.0f));
 
-            DrawLine3D(to_Vector3(simulation_position), to_Vector3(rotation_clamp_0_dir), SKYBLUE);
-            DrawLine3D(to_Vector3(simulation_position), to_Vector3(rotation_clamp_1_dir), SKYBLUE);
+            DrawLine3D(to_Vector3(state.simulation_position), to_Vector3(rotation_clamp_0_dir), SKYBLUE);
+            DrawLine3D(to_Vector3(state.simulation_position), to_Vector3(rotation_clamp_1_dir), SKYBLUE);
         }
         
         // Draw IK foot lock positions
         
         if (ik_enabled)
         {
-            for (int i = 0; i <  contact_positions.size; i++)
+            for (int i = 0; i <  state.contact_positions.size; i++)
             {
-                if (contact_locks(i))
+                if (state.contact_locks(i))
                 {
-                    DrawSphereWires(to_Vector3(contact_positions(i)), 0.05f, 4, 10, PINK);
+                    DrawSphereWires(to_Vector3(state.contact_positions(i)), 0.05f, 4, 10, PINK);
                 }
             }
         }
         
         draw_trajectory(
-            trajectory_positions,
-            trajectory_rotations,
+            state.trajectory_positions,
+            state.trajectory_rotations,
             ORANGE);
         
         // G1: no skinned mesh — draw the skeleton directly from bone transforms.
         // Sphere at each joint, capsule (cylinder) from each bone to its parent.
         for (int bi = 1; bi < db.nbones(); bi++)
         {
-            vec3 bp = global_bone_positions(bi);
+            vec3 bp = state.global_bone_positions(bi);
             DrawSphereWires(to_Vector3(bp), 0.028f, 4, 8, DARKBLUE);
             int par = db.bone_parents(bi);
             if (par > 0)
             {
-                DrawCylinderEx(to_Vector3(global_bone_positions(par)), to_Vector3(bp),
+                DrawCylinderEx(to_Vector3(state.global_bone_positions(par)), to_Vector3(bp),
                     0.018f, 0.018f, 6, SKYBLUE);
             }
         }
         
         // Draw matched features
         
-        array1d<float> current_features = lmm_enabled ? slice1d<float>(features_curr) : db.features(frame_index);
+        array1d<float> current_features = lmm_enabled ? slice1d<float>(features_curr) : db.features(state.frame_index);
         denormalize_features(current_features, db.features_offset, db.features_scale);        
-        draw_features(current_features, bone_positions(0), bone_rotations(0), MAROON);
+        draw_features(current_features, state.bone_positions(0), state.bone_rotations(0), MAROON);
         
 // (diagnostic MM_LOGROOT block removed)
         // Draw Simuation Bone
 
-        DrawSphereWires(to_Vector3(bone_positions(0)), 0.05f, 4, 10, MAROON);
-        DrawLine3D(to_Vector3(bone_positions(0)), to_Vector3(
-            bone_positions(0) + 0.6f * quat_mul_vec3(bone_rotations(0), vec3(0.0f, 0.0f, 1.0f))), MAROON);
+        DrawSphereWires(to_Vector3(state.bone_positions(0)), 0.05f, 4, 10, MAROON);
+        DrawLine3D(to_Vector3(state.bone_positions(0)), to_Vector3(
+            state.bone_positions(0) + 0.6f * quat_mul_vec3(state.bone_rotations(0), vec3(0.0f, 0.0f, 1.0f))), MAROON);
         
         draw_axis(vec3(), quat());
 
@@ -3381,6 +3246,7 @@ int main(void)
 
         EndDrawing();
 
+        ++state.scene_frame;
         ++rendered_frames;
         if (test_config.frame_limit > 0 &&
             rendered_frames >= test_config.frame_limit)
