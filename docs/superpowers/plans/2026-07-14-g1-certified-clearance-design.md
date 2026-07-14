@@ -6,11 +6,11 @@
 
 **Architecture:** One strict-floating-point translation unit computes signed vertical clearance for a finite capsule centerline against each fixed-diagonal terrain triangle. A sphere is the zero-length capsule case, and each linearly swept foot sphere is the same capsule primitive. The kernel reduces a capsule/triangle pair to eight triangular patches on a Minkowski-difference prism boundary, minimizes each patch analytically with outward-rounded interval guards, and uses bounded deterministic subdivision only for numerically degenerate patches. Swing lift selection belongs to the controller transaction: it stages a finite immutable ladder of actual sole commands, runs the production IK/orientation/FK path for each entry, certifies the resulting world-space sphere endpoints, and commits the first already-evaluated passing pose.
 
-**Tech Stack:** C++17; existing `g1_ik.h`, `terrain_runtime.h`, `vec.h`, and `array.h`; IEEE-754 binary32/binary64; a non-inline `g1_clearance.cpp` compiled with strict FP; standalone strict, fast-math-caller, sanitizer, and parity test executables.
+**Tech Stack:** C++17; existing `g1_ik.h`, `terrain_runtime.h`, `vec.h`, and `array.h`; lightweight shared `g1_surface_query.h`; IEEE-754 binary32/binary64; a non-inline `g1_clearance.cpp` compiled with strict FP; standalone strict, fast-math-caller, sanitizer, and parity test executables.
 
 ## Global Constraints
 
-- Do not edit the active `docs/superpowers/plans/2026-07-13-g1-terrain-ik-clearance.md` on this design branch. Section 15 records the read-only reconciliation with integrated Task 2.
+- The reviewed query-ownership reconciliation is the only authorized cross-plan edit to `docs/superpowers/plans/2026-07-13-g1-terrain-ik-clearance.md`. Section 15 and active Task 5 must stay identical in file ownership, moved symbols, include boundary, guards, and deferrals.
 - Consume the existing G1HF/v2 node, cell, diagonal, query-domain, output-rounding, and exterior semantics. Do not introduce bilinear terrain interpolation or a second heightfield format.
 - The authoritative cell triangles are closed `T0=(p00,p10,p11)` for `tx >= tz` and `T1=(p00,p11,p01)` for `tx < tz`; evaluating both closed triangles on their shared diagonal is permitted because their heights agree there.
 - Never use `heightfield_sample_v2` returning a finite exterior value as proof that a query was in-domain or that the field was valid.
@@ -51,8 +51,14 @@
 
 ## 2. File Map and Ownership
 
+- Create `g1_surface_query.h`: the sole definition source for the existing
+  fail-closed G1HF/v2 query types and static-inline producer. It depends on
+  `terrain_runtime.h`, not `g1_ik.h`, `g1_skeleton.h`, or `database.h`.
+- Modify `g1_ik.h`: include `g1_surface_query.h` and remove the six definitions
+  moved there; callers continue to consume the same names through
+  `g1_ik.h`.
 - Create `g1_clearance.h`: public status, result, witness, budget, point/sphere/capsule/foot/pose, history, command-materializer, and actual-center swing-validation declarations. It contains no certified arithmetic implementation.
-- Create `g1_clearance.cpp`: strict-FP environment validation, sole-command materialization, certified endpoint expansions, terrain enumeration, interval arithmetic, prism-patch solver, bounded fallback, aggregators, and actual-center swing validation. For representable point queries it consumes Task 2's `G1SurfaceQueryStatus`/`g1_surface_query_v2` fail-closed status before reconstructing the continuous triangle certificate.
+- Create `g1_clearance.cpp`: include `g1_surface_query.h` directly while preserving the Task 1 implementation-TU boundary, then implement strict-FP environment validation, sole-command materialization, certified endpoint expansions, terrain enumeration, interval arithmetic, prism-patch solver, bounded fallback, aggregators, and actual-center swing validation. For representable point queries it consumes Task 2's `G1SurfaceQueryStatus`/`g1_surface_query_v2` fail-closed status before reconstructing the continuous triangle certificate. `g1_clearance.h` remains unchanged by the query-ownership move.
 - Create `tests/cpp/test_g1_clearance.cpp`: analytic, adversarial, transaction, budget, strict-FP, and parity tests.
 - Modify later `g1_ik_runtime.h` in Task 7: own the immutable lift ladder and staged controller transaction, consume strict-kernel statuses and binary64 lower bounds, and never reimplement clearance.
 - Modify later controller/test build commands: compile `g1_clearance.cpp` separately without fast math, compile callers with their existing flags, then link the two objects.
@@ -1009,12 +1015,37 @@ Exercise `A==B`, segment parallel to terrain, segment in the terrain plane, vert
 ### Task 2: Add checked v2 domain spans and terrain triangles
 
 **Files:**
+- Create: `g1_surface_query.h`
+- Modify: `g1_ik.h`
 - Modify: `g1_clearance.cpp`
 - Modify: `tests/cpp/test_g1_clearance.cpp`
 
 **Interfaces:**
+- Moves one existing static-inline producer boundary without changing any
+  name, enum value, struct layout, signature, function body, status mapping,
+  arithmetic, or API.
 - Produces internal `g1_clearance_domain_contains`, checked cell-span enumeration, and exact `T0/T1` vertex construction.
 - Produces checked point clearance.
+
+- [ ] Before geometry work, create `g1_surface_query.h` and **move, never copy**,
+  exactly these six existing definitions out of `g1_ik.h`:
+  `G1SurfaceQueryStatus`, `G1SurfaceSample`,
+  `g1_ik_float_is_runtime_value`, `g1_ik_vec3_is_runtime_value`,
+  `g1_ik_surface_normal_is_valid`, and `g1_surface_query_v2`.
+  `g1_surface_query.h` includes only `terrain_runtime.h` plus required standard
+  math declarations. `g1_ik.h` includes the new header for callers and contains
+  none of the six definitions. `g1_clearance.cpp` includes the new header
+  directly after its Task 1 implementation-TU include; it must not include
+  `g1_ik.h`. `g1_clearance.h` is unchanged.
+- [ ] Run the existing IK and Task 1 clearance tests, the include/symbol guards
+  in Section 14, and the strict-versus-fast query parity fixture. Commit this
+  ownership-only refactor separately:
+
+```bash
+git add g1_surface_query.h g1_ik.h g1_clearance.cpp \
+  tests/cpp/test_g1_clearance.cpp
+git commit -m "refactor: isolate G1 surface query"
+```
 
 - [ ] Add RED tests D and K, the noncoplanar point probes from C, malformed visited heights, and unchanged outputs.
 - [ ] Implement structural/query-domain validation using existing bit helpers.
@@ -1022,7 +1053,9 @@ Exercise `A==B`, segment parallel to terrain, segment in the terrain plane, vert
 - [ ] Preflight cell-span products and budgets before loops.
 - [ ] Emit exact fixed-diagonal triangles, mandatory per-triangle output guards, and checked point results satisfying the producer-height inequality.
 - [ ] Run strict, fast-math-caller, and sanitizer tests.
-- [ ] Commit with `feat: enumerate checked G1HF v2 clearance triangles`.
+- [ ] Commit the subsequent geometry/test changes with
+  `feat: enumerate checked G1HF v2 clearance triangles`; do not amend or fold
+  the reviewed ownership-only commit into it.
 
 **Review gate:** Exterior height cannot influence status or in-domain output; exact maximum edges, both triangle halves, upward/FTZ output rounding, binade transitions, and mandatory-guard `Uncertified` behavior must be demonstrated by tests.
 
@@ -1158,6 +1191,57 @@ Run after each relevant task and in full after Task 7:
 Final source/order guards:
 
 ```bash
+python - <<'PY'
+import re
+from pathlib import Path
+
+source_paths = sorted(
+    path
+    for suffix in ("*.h", "*.hpp", "*.c", "*.cc", "*.cpp", "*.cxx")
+    for path in Path(".").rglob(suffix)
+    if ".git" not in path.parts
+)
+sources = {
+    path.as_posix(): path.read_text(encoding="utf-8")
+    for path in source_paths
+}
+definitions = {
+    "G1SurfaceQueryStatus": r"\benum\s+G1SurfaceQueryStatus\s*\{",
+    "G1SurfaceSample": r"\bstruct\s+G1SurfaceSample\s*\{",
+    "g1_ik_float_is_runtime_value":
+        r"\bstatic\s+inline\s+bool\s+g1_ik_float_is_runtime_value\s*\(",
+    "g1_ik_vec3_is_runtime_value":
+        r"\bstatic\s+inline\s+bool\s+g1_ik_vec3_is_runtime_value\s*\(",
+    "g1_ik_surface_normal_is_valid":
+        r"\bstatic\s+inline\s+bool\s+g1_ik_surface_normal_is_valid\s*\(",
+    "g1_surface_query_v2":
+        r"\bstatic\s+inline\s+G1SurfaceQueryStatus\s+g1_surface_query_v2\s*\(",
+}
+for symbol, pattern in definitions.items():
+    owners = [
+        (path, len(re.findall(pattern, text)))
+        for path, text in sources.items()
+        if re.search(pattern, text)
+    ]
+    assert owners == [("g1_surface_query.h", 1)], (symbol, owners)
+print("VALID one G1 surface-query definition source")
+PY
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic \
+  -fno-fast-math -ffp-contract=off -frounding-math -I. \
+  -H -c g1_clearance.cpp -o /tmp/g1_clearance_include_guard.o \
+  2>/tmp/g1_clearance_include_guard.txt
+rg 'g1_surface_query\.h' /tmp/g1_clearance_include_guard.txt
+! rg '(g1_ik|g1_skeleton|database)\.h' \
+  /tmp/g1_clearance_include_guard.txt
+nm -C -g --defined-only /tmp/g1_clearance_include_guard.o \
+  > /tmp/g1_clearance_symbols.txt
+! rg 'database_|forward_kinematics|motion_matching_search|compute_(bone|trajectory)|normalize_feature|denormalize_features' \
+  /tmp/g1_clearance_symbols.txt
+/tmp/test_g1_clearance_strict --query-parity \
+  > /tmp/g1_surface_query_strict.txt
+/tmp/test_g1_clearance_release --query-parity \
+  > /tmp/g1_surface_query_fast.txt
+cmp /tmp/g1_surface_query_strict.txt /tmp/g1_surface_query_fast.txt
 ! rg -n 'ceil\(|radial_steps|segment_steps|half.*cell.*sample' \
   g1_clearance.cpp g1_clearance.h
 rg -n '#error.*fast math|has_denorm|_mm_getcsr|G1CertifiedEndpoint|g1_apply_swing_lift_y|TwoDiff|G1ClearancePatchesPerPair' \
@@ -1169,15 +1253,59 @@ rg -n 'G1SwingLiftCandidateBits|G1SwingCandidateDiagnostic|actual_sphere_center_
 git diff --check
 ```
 
-Expected: no production lattice sample-count or predictive-lift code exists; strict-FP/gradual-underflow, actual-endpoint, mandatory-output-guard, immutable-ladder, and absolute-budget guards are present; every test mode exits zero; identical endpoint-bit kernel parity lines match byte-for-byte; every environment mutation is restored; and the worktree is clean after task-scoped commits.
+The query-parity mode emits, for each locked valid/outside/invalid fixture, the
+exact status plus raw height/normal bits or the unchanged seeded output bits.
+Expected: all six query definitions have one source owner; the strict kernel
+does not include or export database/FK/search/feature code; strict and fast
+producer output is byte-identical; no production lattice sample-count or
+predictive-lift code exists; strict-FP/gradual-underflow, actual-endpoint,
+mandatory-output-guard, immutable-ladder, and absolute-budget guards are
+present; every test mode exits zero; identical endpoint-bit kernel parity lines
+match byte-for-byte; every environment mutation is restored; and the worktree
+is clean after task-scoped commits.
 
 ---
 
-## 15. Reconciliation Gate Before Editing the Active Plan
+## 15. Reviewed Query-Ownership Reconciliation Gate
 
-Read-only reconciliation against integrated Task 2 commit `6287a0e` locks these producer names: `G1SurfaceQueryStatus`, `g1_surface_query_v2`, `g1_ik_vec3_is_runtime_value`, `g1_ik_dt_is_exact_25_hz`, and `g1_foot_runtime_config_validate`. This design consumes those names directly and preserves their fail-closed `Valid`/`Outside`/`Invalid` distinction; it does not add an adapter that restores exterior fallback or tolerant `25 Hz` checks. The active terrain-IK plan remains untouched on this branch. At implementation start, confirm that later integration has not renamed these producers before changing either plan.
+The approved reconciliation against integrated Task 2 commit `6287a0e`
+authorizes one ownership-only refactor in this design and active Task 5. Before
+geometry work, create `g1_surface_query.h` and **move, never copy**, exactly
+these six existing definitions out of `g1_ik.h`:
 
-The same read-only review marks the active plan's pre-IK predictive swing-planner call, direct desired-sole-Y lift increment, and continuous-required-lift checker assertions as superseded contracts. When the approved replacement is applied, remove those snippets and migrate logs/checkers to the selected ladder diagnostic; do not adapt the direct addition or preserve it beside the staged path. Until that replacement gate, the protected active plan remains unchanged.
+1. `G1SurfaceQueryStatus`
+2. `G1SurfaceSample`
+3. `g1_ik_float_is_runtime_value`
+4. `g1_ik_vec3_is_runtime_value`
+5. `g1_ik_surface_normal_is_valid`
+6. `g1_surface_query_v2`
+
+`g1_surface_query.h` is their sole definition source and depends only on
+`terrain_runtime.h` plus required standard math declarations. Preserve every
+name, enum value, struct layout, signature, function body, status mapping, and
+arithmetic expression exactly. `g1_ik.h` includes this lightweight header so
+existing callers keep the same API. The strict `g1_clearance.cpp` kernel
+includes it directly and must not gain `g1_ik.h`, `g1_skeleton.h`, or
+`database.h`; `g1_clearance.h` is unchanged. This move changes no code, math,
+status, layout, or API and adds no adapter, duplicate query, exterior fallback,
+or tolerant comparison.
+
+Ownership of `g1_ik_dt_is_exact_25_hz` and
+`g1_foot_runtime_config_validate` is explicitly deferred to the later
+certified Task 5/Task 6 integration work. They remain at their current owner
+and must not move as part of the query refactor. Acceptance requires the exact
+Section 14 guards: one definition source for all six moved names; a strict
+kernel include graph excluding `g1_ik.h`, `g1_skeleton.h`, and `database.h`;
+an `nm` surface with no database, FK, search, or feature symbols; and
+byte-identical strict-versus-fast status plus height/normal-bit query parity.
+
+The same review marks the active plan's pre-IK predictive swing-planner call,
+direct desired-sole-Y lift increment, and continuous-required-lift checker
+assertions as superseded contracts. When the approved replacement is applied,
+remove those snippets and migrate logs/checkers to the selected ladder
+diagnostic; do not adapt the direct addition or preserve it beside the staged
+path. Apart from the query-ownership reconciliation above, the protected
+active plan remains unchanged until that replacement gate.
 
 Before replacing active Task 5, require two approvals:
 
