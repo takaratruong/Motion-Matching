@@ -1,0 +1,378 @@
+#include "cleanup_runtime.h"
+
+#include <cerrno>
+#include <climits>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+
+#include <sys/stat.h>
+#include <unistd.h>
+
+static void check(bool value, const char* message)
+{
+    if (!value) {
+        std::fprintf(stderr, "cleanup runtime test failed: %s\n", message);
+        std::exit(1);
+    }
+}
+
+static std::string fixture_path(const char* suffix)
+{
+    char path[256] = {};
+    const int written = std::snprintf(
+        path, sizeof(path), "/tmp/test_g1_cleanup_%ld_%s",
+        static_cast<long>(getpid()), suffix);
+    check(written > 0 && static_cast<std::size_t>(written) < sizeof(path),
+          "fixture path fits");
+    return std::string(path);
+}
+
+static void remove_file_if_present(const std::string& path)
+{
+    if (unlink(path.c_str()) != 0) {
+        check(errno == ENOENT, "remove stale fixture file");
+    }
+}
+
+static void remove_directory_if_present(const std::string& path)
+{
+    if (rmdir(path.c_str()) != 0) {
+        check(errno == ENOENT, "remove stale fixture directory");
+    }
+}
+
+static bool path_exists(const std::string& path)
+{
+    struct stat status = {};
+    if (lstat(path.c_str(), &status) == 0) return true;
+    check(errno == ENOENT, "fixture existence check");
+    return false;
+}
+
+static bool path_is_directory(const std::string& path)
+{
+    struct stat status = {};
+    check(lstat(path.c_str(), &status) == 0, "stat fixture directory");
+    return S_ISDIR(status.st_mode);
+}
+
+static void write_text(const std::string& path, const char* text)
+{
+    FILE* file = std::fopen(path.c_str(), "wb");
+    check(file != NULL, "open fixture for writing");
+    const std::size_t length = std::strlen(text);
+    check(std::fwrite(text, 1, length, file) == length,
+          "write fixture text");
+    check(std::fclose(file) == 0, "close fixture text");
+}
+
+static std::string read_text(const std::string& path)
+{
+    FILE* file = std::fopen(path.c_str(), "rb");
+    check(file != NULL, "open fixture for reading");
+    std::string text;
+    char buffer[256] = {};
+    while (true) {
+        const std::size_t count =
+            std::fread(buffer, 1, sizeof(buffer), file);
+        text.append(buffer, count);
+        if (count != sizeof(buffer)) break;
+    }
+    check(std::ferror(file) == 0, "read fixture text");
+    check(std::fclose(file) == 0, "close fixture after reading");
+    return text;
+}
+
+static cleanup_report valid_report()
+{
+    cleanup_report report;
+    report.exit_code = -7;
+    report.motion_pack_load_count = 1;
+    report.model_load_count = 28;
+    report.model_unload_count = 28;
+    report.log_closed = true;
+    report.window_closed = true;
+    return report;
+}
+
+static void check_report_equal(
+    const cleanup_report& actual,
+    const cleanup_report& expected,
+    const char* message)
+{
+    check(actual.exit_code == expected.exit_code &&
+              actual.motion_pack_load_count ==
+                  expected.motion_pack_load_count &&
+              actual.model_load_count == expected.model_load_count &&
+              actual.model_unload_count == expected.model_unload_count &&
+              actual.log_closed == expected.log_closed &&
+              actual.window_closed == expected.window_closed,
+          message);
+}
+
+static void check_contains(
+    const char* text, const std::string& fragment, const char* message)
+{
+    check(text != NULL && std::strstr(text, fragment.c_str()) != NULL,
+          message);
+}
+
+static void test_null_path_is_noop_and_preserves_inputs()
+{
+    cleanup_report report;
+    const cleanup_report prior = report;
+    char error[32] = "unchanged";
+    check(cleanup_report_write(NULL, report, error, sizeof(error)),
+          "NULL cleanup path is disabled");
+    check(std::strcmp(error, "unchanged") == 0,
+          "NULL cleanup path preserves error text");
+    check_report_equal(report, prior, "NULL cleanup path preserves report");
+}
+
+static void test_exact_json_replaces_final_atomically()
+{
+    const std::string path = fixture_path("exact.json");
+    const std::string temporary = path + ".tmp";
+    remove_file_if_present(temporary);
+    remove_file_if_present(path);
+    write_text(path, "old-final\n");
+    write_text(temporary, "stale-temporary\n");
+
+    cleanup_report report = valid_report();
+    const cleanup_report prior = report;
+    char error[256] = "success-sentinel";
+    check(cleanup_report_write(path.c_str(), report, error, sizeof(error)),
+          error);
+    check(read_text(path) ==
+              "{\"exit_code\":-7,\"live_model_count\":0,"
+              "\"log_closed\":true,\"model_load_count\":28,"
+              "\"model_unload_count\":28,"
+              "\"motion_pack_load_count\":1,"
+              "\"window_closed\":true}\n",
+          "cleanup report has exact deterministic JSON");
+    check(!path_exists(temporary),
+          "successful cleanup report leaves no temporary file");
+    check(std::strcmp(error, "success-sentinel") == 0,
+          "successful cleanup report preserves error text");
+    check_report_equal(report, prior, "successful write preserves report");
+
+    report.exit_code = 2;
+    report.model_load_count = 0;
+    report.model_unload_count = 0;
+    const cleanup_report replacement_prior = report;
+    check(cleanup_report_write(path.c_str(), report, error, sizeof(error)),
+          error);
+    check(read_text(path) ==
+              "{\"exit_code\":2,\"live_model_count\":0,"
+              "\"log_closed\":true,\"model_load_count\":0,"
+              "\"model_unload_count\":0,"
+              "\"motion_pack_load_count\":1,"
+              "\"window_closed\":true}\n",
+          "second cleanup report atomically replaces final output");
+    check(!path_exists(temporary),
+          "replacement leaves no temporary file");
+    check_report_equal(
+        report, replacement_prior, "replacement preserves report");
+    remove_file_if_present(path);
+}
+
+static void test_invalid_inputs_are_transactional()
+{
+    static const char* invalid_message =
+        "cleanup report has invalid path or incomplete cleanup";
+    cleanup_report report = valid_report();
+    const cleanup_report empty_prior = report;
+    char error[256] = {};
+    check(!cleanup_report_write("", report, error, sizeof(error)),
+          "empty cleanup path is rejected");
+    check(std::strcmp(error, invalid_message) == 0,
+          "empty cleanup path has exact error");
+    check_report_equal(report, empty_prior, "empty path preserves report");
+
+    const std::string path = fixture_path("invalid.json");
+    const std::string temporary = path + ".tmp";
+    remove_file_if_present(temporary);
+    remove_file_if_present(path);
+    write_text(path, "prior-final\n");
+    write_text(temporary, "prior-temporary\n");
+
+    const auto expect_invalid = [&](const cleanup_report& candidate,
+                                    const char* message) {
+        const cleanup_report prior = candidate;
+        char local_error[256] = {};
+        check(!cleanup_report_write(
+                  path.c_str(), candidate, local_error,
+                  static_cast<int>(sizeof(local_error))),
+              message);
+        check(std::strcmp(local_error, invalid_message) == 0,
+              "invalid report has exact error");
+        check(read_text(path) == "prior-final\n",
+              "invalid report preserves final file");
+        check(read_text(temporary) == "prior-temporary\n",
+              "invalid report preserves preexisting temporary file");
+        check_report_equal(candidate, prior, "invalid write preserves report");
+    };
+
+    report = valid_report();
+    report.motion_pack_load_count = 0;
+    expect_invalid(report, "zero motion-pack loads rejected");
+    report = valid_report();
+    report.motion_pack_load_count = 2;
+    expect_invalid(report, "multiple motion-pack loads rejected");
+    report = valid_report();
+    report.model_load_count = -1;
+    expect_invalid(report, "negative model loads rejected");
+    report = valid_report();
+    report.model_unload_count = -1;
+    expect_invalid(report, "negative model unloads rejected");
+    report = valid_report();
+    report.model_load_count = 2;
+    report.model_unload_count = 1;
+    expect_invalid(report, "live model rejected");
+    report = valid_report();
+    report.model_load_count = 0;
+    report.model_unload_count = INT_MAX;
+    expect_invalid(report, "excess model unloads rejected");
+    report = valid_report();
+    report.log_closed = false;
+    expect_invalid(report, "open log rejected");
+    report = valid_report();
+    report.window_closed = false;
+    expect_invalid(report, "open window rejected");
+
+    remove_file_if_present(temporary);
+    remove_file_if_present(path);
+}
+
+static void test_error_truncation_is_exact_and_bounded()
+{
+    cleanup_report report = valid_report();
+    const cleanup_report prior = report;
+
+    char guarded[10] = {'L', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'R'};
+    check(!cleanup_report_write("", report, guarded + 1, 8),
+          "guarded error call fails");
+    check(guarded[0] == 'L' && guarded[9] == 'R',
+          "truncated error preserves surrounding canaries");
+    check(std::strcmp(guarded + 1, "cleanup") == 0,
+          "truncated error has exact prefix and terminator");
+
+    char one[3] = {'L', 'x', 'R'};
+    check(!cleanup_report_write("", report, one + 1, 1),
+          "one-byte error call fails");
+    check(one[0] == 'L' && one[1] == '\0' && one[2] == 'R',
+          "one-byte error writes only a terminator");
+
+    char zero[8] = "zero";
+    check(!cleanup_report_write("", report, zero, 0),
+          "zero-capacity error call fails");
+    check(std::strcmp(zero, "zero") == 0,
+          "zero-capacity error buffer is untouched");
+
+    char negative[16] = "negative";
+    check(!cleanup_report_write("", report, negative, -4),
+          "negative-capacity error call fails");
+    check(std::strcmp(negative, "negative") == 0,
+          "negative-capacity error buffer is untouched");
+    check(!cleanup_report_write("", report, NULL, 32),
+          "NULL error buffer is safe");
+    check_report_equal(report, prior, "error paths preserve report");
+}
+
+static void test_open_failure_preserves_existing_state()
+{
+    const std::string path = fixture_path("open_failure.json");
+    const std::string temporary = path + ".tmp";
+    remove_file_if_present(path);
+    remove_file_if_present(temporary);
+    remove_directory_if_present(temporary);
+    write_text(path, "prior-final\n");
+    check(mkdir(temporary.c_str(), 0700) == 0,
+          "create temporary-path directory");
+
+    const cleanup_report report = valid_report();
+    const cleanup_report prior = report;
+    char error[256] = {};
+    check(!cleanup_report_write(path.c_str(), report, error, sizeof(error)),
+          "temporary open failure is reported");
+    check_contains(error, temporary, "open failure names temporary path");
+    check_contains(error, "cannot open cleanup report",
+                   "open failure names operation");
+    check(read_text(path) == "prior-final\n",
+          "open failure preserves final output");
+    check(path_is_directory(temporary),
+          "open failure preserves unowned temporary directory");
+    check_report_equal(report, prior, "open failure preserves report");
+
+    remove_directory_if_present(temporary);
+    remove_file_if_present(path);
+}
+
+static void test_write_failure_removes_temporary_and_preserves_final()
+{
+    check(access("/dev/full", F_OK) == 0, "/dev/full is available");
+    const std::string path = fixture_path("write_failure.json");
+    const std::string temporary = path + ".tmp";
+    remove_file_if_present(temporary);
+    remove_file_if_present(path);
+    write_text(path, "prior-final\n");
+    check(symlink("/dev/full", temporary.c_str()) == 0,
+          "create deterministic write-failure symlink");
+
+    const cleanup_report report = valid_report();
+    const cleanup_report prior = report;
+    char error[256] = {};
+    check(!cleanup_report_write(path.c_str(), report, error, sizeof(error)),
+          "write failure is reported");
+    check_contains(error, path, "write failure names final path");
+    check_contains(error, "cannot finish cleanup report",
+                   "write failure names operation");
+    check(read_text(path) == "prior-final\n",
+          "write failure preserves final output");
+    check(!path_exists(temporary),
+          "write failure removes owned temporary symlink");
+    check_report_equal(report, prior, "write failure preserves report");
+
+    remove_file_if_present(path);
+}
+
+static void test_rename_failure_removes_temporary_and_preserves_destination()
+{
+    const std::string path = fixture_path("rename_failure.json");
+    const std::string temporary = path + ".tmp";
+    remove_file_if_present(temporary);
+    remove_file_if_present(path);
+    remove_directory_if_present(path);
+    check(mkdir(path.c_str(), 0700) == 0,
+          "create rename-failure destination directory");
+
+    const cleanup_report report = valid_report();
+    const cleanup_report prior = report;
+    char error[256] = {};
+    check(!cleanup_report_write(path.c_str(), report, error, sizeof(error)),
+          "rename failure is reported");
+    check_contains(error, path, "rename failure names final path");
+    check_contains(error, "cannot finish cleanup report",
+                   "rename failure names operation");
+    check(path_is_directory(path),
+          "rename failure preserves destination directory");
+    check(!path_exists(temporary),
+          "rename failure removes temporary file");
+    check_report_equal(report, prior, "rename failure preserves report");
+
+    remove_directory_if_present(path);
+}
+
+int main()
+{
+    test_null_path_is_noop_and_preserves_inputs();
+    test_exact_json_replaces_final_atomically();
+    test_invalid_inputs_are_transactional();
+    test_error_truncation_is_exact_and_bounded();
+    test_open_failure_preserves_existing_state();
+    test_write_failure_removes_temporary_and_preserves_final();
+    test_rename_failure_removes_temporary_and_preserves_destination();
+    return 0;
+}
