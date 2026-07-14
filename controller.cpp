@@ -2972,9 +2972,6 @@ int main(void)
             controlled_runtime_error(artifact_error);
             return;
         }
-        runtime_snapshot = snapshot_candidate;
-        runtime_snapshot_ready = true;
-
         char query_bits_hex[31 * 8 + 1] = {};
         if (!motion_match_query_bits_hex(
                 query_bits_hex, sizeof(query_bits_hex), query)) {
@@ -3031,63 +3028,65 @@ int main(void)
         log_row.clamping_enabled = clamping_enabled;
         log_row.support_retargeting_enabled = true;
         log_row.ik_enabled = ik_enabled;
-        log_row.source_name = runtime_snapshot.source_name;
-        log_row.source_terrain = runtime_snapshot.source_terrain;
-        log_row.source_index = runtime_snapshot.source_index;
-        log_row.continuation_cost = runtime_snapshot.continuation_cost;
-        log_row.source_root_height = runtime_snapshot.source_root_height;
+        log_row.source_name = snapshot_candidate.source_name;
+        log_row.source_terrain = snapshot_candidate.source_terrain;
+        log_row.source_index = snapshot_candidate.source_index;
+        log_row.continuation_cost = snapshot_candidate.continuation_cost;
+        log_row.source_root_height = snapshot_candidate.source_root_height;
         log_row.source_left_toe_height =
-            runtime_snapshot.source_left_toe_height;
+            snapshot_candidate.source_left_toe_height;
         log_row.source_right_toe_height =
-            runtime_snapshot.source_right_toe_height;
+            snapshot_candidate.source_right_toe_height;
         log_row.runtime_support_root_height =
-            runtime_snapshot.runtime_support_root_height;
+            snapshot_candidate.runtime_support_root_height;
         log_row.runtime_support_left_toe_height =
-            runtime_snapshot.runtime_support_left_toe_height;
+            snapshot_candidate.runtime_support_left_toe_height;
         log_row.runtime_support_right_toe_height =
-            runtime_snapshot.runtime_support_right_toe_height;
-        log_row.support_root_delta = runtime_snapshot.support_root_delta;
+            snapshot_candidate.runtime_support_right_toe_height;
+        log_row.support_root_delta = snapshot_candidate.support_root_delta;
         log_row.support_left_toe_delta =
-            runtime_snapshot.support_left_toe_delta;
+            snapshot_candidate.support_left_toe_delta;
         log_row.support_right_toe_delta =
-            runtime_snapshot.support_right_toe_delta;
-        log_row.support_height = runtime_snapshot.support_height;
-        log_row.support_velocity = runtime_snapshot.support_velocity;
-        log_row.support_source = runtime_snapshot.support_source;
-        log_row.airborne_frames = runtime_snapshot.airborne_frames;
-        log_row.left_contact = runtime_snapshot.left_contact;
-        log_row.right_contact = runtime_snapshot.right_contact;
+            snapshot_candidate.support_right_toe_delta;
+        log_row.support_height = snapshot_candidate.support_height;
+        log_row.support_velocity = snapshot_candidate.support_velocity;
+        log_row.support_source = snapshot_candidate.support_source;
+        log_row.airborne_frames = snapshot_candidate.airborne_frames;
+        log_row.left_contact = snapshot_candidate.left_contact;
+        log_row.right_contact = snapshot_candidate.right_contact;
         log_row.support_retargeted_hips_y =
-            runtime_snapshot.support_retargeted_hips_y;
-        log_row.ik_adjusted_hips_y = runtime_snapshot.ik_adjusted_hips_y;
-        log_row.simulation_x = runtime_snapshot.simulation_x;
-        log_row.simulation_z = runtime_snapshot.simulation_z;
-        log_row.walkability_class = runtime_snapshot.walkability_class;
-        log_row.blocked = runtime_snapshot.blocked;
-        log_row.blocked_reason = runtime_snapshot.blocked_reason;
-        log_row.blocked_distance = runtime_snapshot.blocked_distance;
-        log_row.blocked_point_x = runtime_snapshot.blocked_point_x;
-        log_row.blocked_point_z = runtime_snapshot.blocked_point_z;
-        log_row.commanded_speed = runtime_snapshot.commanded_speed;
-        log_row.applied_speed = runtime_snapshot.applied_speed;
-        log_row.route_waypoint = runtime_snapshot.route_waypoint;
-        log_row.route_complete = runtime_snapshot.route_complete;
-        log_row.route_target_height = runtime_snapshot.route_target_height;
-        log_row.scene_generation = runtime_snapshot.scene_generation;
-        log_row.scene_frame = runtime_snapshot.scene_frame;
-        log_row.scene_reset_count = runtime_snapshot.scene_reset_count;
-        log_row.scene_switch_failed = runtime_snapshot.scene_switch_failed;
+            snapshot_candidate.support_retargeted_hips_y;
+        log_row.ik_adjusted_hips_y = snapshot_candidate.ik_adjusted_hips_y;
+        log_row.simulation_x = snapshot_candidate.simulation_x;
+        log_row.simulation_z = snapshot_candidate.simulation_z;
+        log_row.walkability_class = snapshot_candidate.walkability_class;
+        log_row.blocked = snapshot_candidate.blocked;
+        log_row.blocked_reason = snapshot_candidate.blocked_reason;
+        log_row.blocked_distance = snapshot_candidate.blocked_distance;
+        log_row.blocked_point_x = snapshot_candidate.blocked_point_x;
+        log_row.blocked_point_z = snapshot_candidate.blocked_point_z;
+        log_row.commanded_speed = snapshot_candidate.commanded_speed;
+        log_row.applied_speed = snapshot_candidate.applied_speed;
+        log_row.route_waypoint = snapshot_candidate.route_waypoint;
+        log_row.route_complete = snapshot_candidate.route_complete;
+        log_row.route_target_height = snapshot_candidate.route_target_height;
+        log_row.scene_generation = snapshot_candidate.scene_generation;
+        log_row.scene_frame = snapshot_candidate.scene_frame;
+        log_row.scene_reset_count = snapshot_candidate.scene_reset_count;
+        log_row.scene_switch_failed = snapshot_candidate.scene_switch_failed;
         log_row.motion_pack_load_count =
-            runtime_snapshot.motion_pack_load_count;
-        log_row.model_load_count = runtime_snapshot.model_load_count;
-        log_row.model_unload_count = runtime_snapshot.model_unload_count;
-        log_row.live_model_count = runtime_snapshot.live_model_count;
+            snapshot_candidate.motion_pack_load_count;
+        log_row.model_load_count = snapshot_candidate.model_load_count;
+        log_row.model_unload_count = snapshot_candidate.model_unload_count;
+        log_row.live_model_count = snapshot_candidate.live_model_count;
         if (!deterministic_log.write(
                 log_row, artifact_error, static_cast<int>(sizeof(artifact_error))))
         {
             controlled_runtime_error(artifact_error);
             return;
         }
+        runtime_snapshot = snapshot_candidate;
+        runtime_snapshot_ready = true;
         scene_switch_failed = false;
 
         if (test_config.mode == G1_TestRoute) {

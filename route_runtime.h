@@ -244,7 +244,11 @@ static inline float deterministic_route_target_height(
         {
             return NAN;
         }
-        for (int step = 0; step <= steps; ++step) {
+        for (int64_t sample_index = 0;
+             sample_index <= static_cast<int64_t>(steps);
+             ++sample_index)
+        {
+            const int step = static_cast<int>(sample_index);
             float x = 0.0f;
             float z = 0.0f;
             if (!scene_binary32_lerp(

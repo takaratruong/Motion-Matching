@@ -6,6 +6,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iterator>
+#include <string>
 
 static void check(bool value, const char* message)
 {
@@ -22,8 +25,72 @@ static uint32_t bits(float value)
     return out;
 }
 
-int main()
+static std::string read_source(const char* path)
 {
+    std::ifstream file(path, std::ios::binary);
+    check(file.good(), "open source contract input");
+    return std::string(
+        std::istreambuf_iterator<char>(file),
+        std::istreambuf_iterator<char>());
+}
+
+static void check_snapshot_publication_contract(const char* path)
+{
+    const std::string source = read_source(path);
+    const size_t build = source.find("if (!g1_runtime_diagnostics_build(");
+    const size_t serialize = source.find(
+        "if (!motion_match_query_bits_hex(", build);
+    const size_t suffix = source.find("log_row.source_name =", serialize);
+    const size_t write = source.find(
+        "if (!deterministic_log.write(", suffix);
+    const size_t publish = source.find(
+        "runtime_snapshot = snapshot_candidate;", build);
+    const size_t ready = source.find(
+        "runtime_snapshot_ready = true;", publish);
+    const size_t clear = source.find(
+        "scene_switch_failed = false;", ready);
+    check(build != std::string::npos && serialize != std::string::npos &&
+              suffix != std::string::npos && write != std::string::npos &&
+              publish != std::string::npos && ready != std::string::npos &&
+              clear != std::string::npos,
+          "snapshot publication source markers exist");
+    check(build < serialize && serialize < suffix && suffix < write &&
+              write < publish && publish < ready && ready < clear,
+          "snapshot publishes only after successful serialization and write");
+    const std::string suffix_population = source.substr(suffix, write - suffix);
+    check(suffix_population.find("runtime_snapshot.") == std::string::npos,
+          "runtime suffix population does not read persistent snapshot");
+    check(suffix_population.find("snapshot_candidate.") != std::string::npos,
+          "runtime suffix population reads local snapshot candidate");
+}
+
+static void check_route_sample_cursor_contract(const char* path)
+{
+    const std::string source = read_source(path);
+    check(source.find(
+              "for (int step = 0; step <= steps; ++step)") ==
+              std::string::npos,
+          "route target sampling does not increment INT_MAX int cursor");
+    const size_t loop = source.find("for (int64_t sample_index = 0;");
+    const size_t cast = source.find(
+        "const int step = static_cast<int>(sample_index);", loop);
+    check(loop != std::string::npos && cast != std::string::npos && loop < cast,
+          "route target sampling uses a safe 64-bit cursor");
+}
+
+int main(int argc, char** argv)
+{
+    if (argc == 3 && std::strcmp(argv[1], "--controller") == 0) {
+        check_snapshot_publication_contract(argv[2]);
+        return 0;
+    }
+    if (argc == 3 && std::strcmp(argv[1], "--route-header") == 0) {
+        check_route_sample_cursor_contract(argv[2]);
+        return 0;
+    }
+    check(argc == 1,
+          "usage: test_route_runtime [--controller path|--route-header path]");
+
     scene_route route;
     route.id = "corner";
     route.expected_outcome = "traverse";
