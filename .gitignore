@@ -12,3 +12,5 @@ resources/runs*
 build/tests/
 interaction_probe
 resources/g1_interaction/
+.deps/
+playable-evidence/
