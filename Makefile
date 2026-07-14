@@ -71,6 +71,7 @@ CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_pose
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_target
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_features
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_matcher
+CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_playback
 
 .PHONY: test-python test-cpp test-interaction
 
@@ -94,6 +95,9 @@ $(CPP_TEST_DIR)/test_interaction_features: tests/cpp/test_interaction_features.c
 
 $(CPP_TEST_DIR)/test_interaction_matcher: tests/cpp/test_interaction_matcher.cpp tests/cpp/interaction_runtime_fixture.h interaction_matcher.cpp interaction_matcher.h interaction_features.cpp interaction_features.h interaction_pose.cpp interaction_pose.h interaction_target.cpp interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_matcher.cpp interaction_matcher.cpp interaction_features.cpp interaction_pose.cpp interaction_target.cpp -o $@
+
+$(CPP_TEST_DIR)/test_interaction_playback: tests/cpp/test_interaction_playback.cpp tests/cpp/interaction_runtime_fixture.h interaction_playback.cpp interaction_playback.h interaction_matcher.cpp interaction_matcher.h interaction_features.cpp interaction_features.h interaction_pose.cpp interaction_pose.h interaction_target.cpp interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_playback.cpp interaction_playback.cpp interaction_matcher.cpp interaction_features.cpp interaction_pose.cpp interaction_target.cpp -o $@
 
 interaction_probe: interaction_probe.cpp interaction_database.h g1_skeleton.h
 	$(CXX) $(CPP_TEST_FLAGS) $< -o $@
