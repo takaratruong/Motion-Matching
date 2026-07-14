@@ -75,6 +75,13 @@ CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_playback
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_ik
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_attachment
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_carry
+CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_runtime
+
+INTERACTION_RUNTIME_SOURCES := interaction_runtime.cpp
+INTERACTION_RUNTIME_SOURCES += interaction_carry.cpp interaction_ik.cpp
+INTERACTION_RUNTIME_SOURCES += interaction_attachment.cpp interaction_playback.cpp
+INTERACTION_RUNTIME_SOURCES += interaction_matcher.cpp interaction_features.cpp
+INTERACTION_RUNTIME_SOURCES += interaction_pose.cpp interaction_target.cpp
 
 .PHONY: test-python test-cpp test-interaction
 
@@ -112,11 +119,18 @@ $(CPP_TEST_DIR)/test_interaction_carry: tests/cpp/test_interaction_carry.cpp tes
 	$(CXX) $(CPP_TEST_FLAGS) -c tests/cpp/test_interaction_carry.cpp -o $(CPP_TEST_DIR)/test_interaction_carry.o
 	$(CXX) $(CPP_TEST_FLAGS) $(CPP_TEST_DIR)/test_interaction_carry.o interaction_carry.cpp interaction_ik.cpp interaction_matcher.cpp interaction_features.cpp interaction_pose.cpp interaction_target.cpp -o $@
 
+$(CPP_TEST_DIR)/test_interaction_runtime: tests/cpp/test_interaction_runtime.cpp tests/cpp/interaction_runtime_fixture.h interaction_runtime.h $(INTERACTION_RUNTIME_SOURCES) interaction_carry.h interaction_ik.h g1_arm_joint_metadata.h interaction_attachment.h interaction_playback.h interaction_matcher.h interaction_features.h interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) -c tests/cpp/test_interaction_runtime.cpp -o $(CPP_TEST_DIR)/test_interaction_runtime.o
+	$(CXX) $(CPP_TEST_FLAGS) $(CPP_TEST_DIR)/test_interaction_runtime.o $(INTERACTION_RUNTIME_SOURCES) -o $@
+
 interaction_probe: interaction_probe.cpp interaction_database.h g1_skeleton.h
 	$(CXX) $(CPP_TEST_FLAGS) $< -o $@
 
 interaction_query_probe: interaction_query_probe.cpp interaction_features.cpp interaction_features.h interaction_pose.cpp interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h
 	$(CXX) $(CPP_TEST_FLAGS) interaction_query_probe.cpp interaction_features.cpp interaction_pose.cpp -o $@
+
+interaction_runtime_probe: interaction_runtime_probe.cpp interaction_runtime.h $(INTERACTION_RUNTIME_SOURCES) interaction_carry.h interaction_ik.h g1_arm_joint_metadata.h interaction_attachment.h interaction_playback.h interaction_matcher.h interaction_features.h interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h
+	$(CXX) $(CPP_TEST_FLAGS) interaction_runtime_probe.cpp $(INTERACTION_RUNTIME_SOURCES) -o $@
 
 test-python: interaction_probe interaction_query_probe
 	python -m unittest discover -s tests/python -t . -v
