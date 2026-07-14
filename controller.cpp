@@ -152,11 +152,6 @@ static motion_match_pose_diagnostic g1_pose_diagnostic(
     return out;
 }
 
-static float g1_xz_length(const vec3 value)
-{
-    return sqrtf(value.x * value.x + value.z * value.z);
-}
-
 template<typename T>
 static bool g1_validate_animation_shape(
     const array2d<T>& values,
@@ -1403,25 +1398,6 @@ void draw_trajectory(
     }
 }
 
-vec3 adjust_character_position(
-    const vec3 character_position,
-    const vec3 simulation_position,
-    const float halflife,
-    const float dt)
-{
-    // Find the difference in positioning
-    vec3 difference_position = simulation_position - character_position;
-    
-    // Damp that difference using the given halflife and dt
-    vec3 adjustment_position = damp_adjustment_exact(
-        difference_position,
-        halflife,
-        dt);
-    
-    // Add the damped difference to move the character toward the sim
-    return adjustment_position + character_position;
-}
-
 quat adjust_character_rotation(
     const quat character_rotation,
     const quat simulation_rotation,
@@ -1444,33 +1420,6 @@ quat adjust_character_rotation(
     
     // Apply the damped adjustment to the character
     return quat_mul(adjustment_rotation, character_rotation);
-}
-
-vec3 adjust_character_position_by_velocity(
-    const vec3 character_position,
-    const vec3 character_velocity,
-    const vec3 simulation_position,
-    const float max_adjustment_ratio,
-    const float halflife,
-    const float dt)
-{
-    // Find and damp the desired adjustment
-    vec3 adjustment_position = damp_adjustment_exact(
-        simulation_position - character_position,
-        halflife,
-        dt);
-    
-    // If the length of the adjustment is greater than the character velocity 
-    // multiplied by the ratio then we need to clamp it to that length
-    float max_length = max_adjustment_ratio * length(character_velocity) * dt;
-    
-    if (length(adjustment_position) > max_length)
-    {
-        adjustment_position = max_length * normalize(adjustment_position);
-    }
-    
-    // Apply the adjustment
-    return adjustment_position + character_position;
 }
 
 quat adjust_character_rotation_by_velocity(
@@ -1506,25 +1455,6 @@ quat adjust_character_rotation_by_velocity(
 
 //--------------------------------------
 
-vec3 clamp_character_position(
-    const vec3 character_position,
-    const vec3 simulation_position,
-    const float max_distance)
-{
-    // If the character deviates too far from the simulation 
-    // position we need to clamp it to within the max distance
-    if (length(character_position - simulation_position) > max_distance)
-    {
-        return max_distance * 
-            normalize(character_position - simulation_position) + 
-            simulation_position;
-    }
-    else
-    {
-        return character_position;
-    }
-}
-  
 quat clamp_character_rotation(
     const quat character_rotation,
     const quat simulation_rotation,
@@ -1579,10 +1509,10 @@ int main(void)
     float feature_weight_hip_velocity = 1.0f;
     float feature_weight_trajectory_positions = 1.0f;
     float feature_weight_trajectory_directions = 1.5f;
-    float feature_weight_terrain = 0.0f;
+    float parsed_terrain_weight = 0.0f;
     g1_test_config test_config;
     if (!g1_parse_terrain_weight(
-            feature_weight_terrain,
+            parsed_terrain_weight,
             artifact_error,
             static_cast<int>(sizeof(artifact_error))) ||
         !g1_parse_test_config(
@@ -1613,10 +1543,10 @@ int main(void)
 #endif
     if (test_config.mode == G1_TestFlat ||
         test_config.mode == G1_TestSequential) {
-        feature_weight_terrain = 0.0f;
+        parsed_terrain_weight = 0.0f;
     } else if (test_config.mode == G1_TestTerrain &&
                getenv("MM_TERRAIN_WEIGHT") == NULL) {
-        feature_weight_terrain = 4.0f;
+        parsed_terrain_weight = 4.0f;
     }
 #ifdef MM_DISCRETE
     if (test_config.mode != G1_TestLive) {
@@ -1626,6 +1556,9 @@ int main(void)
         return 2;
     }
 #endif
+
+    float requested_terrain_weight = parsed_terrain_weight;
+    float effective_terrain_weight = requested_terrain_weight;
 
     motion_pack_manifest motion_manifest;
     if (!motion_manifest_load_and_verify(
@@ -1712,7 +1645,7 @@ int main(void)
         G1_LeftAnkle,
         G1_RightAnkle,
         G1_Hips,
-        feature_weight_terrain);
+        effective_terrain_weight);
     if (!g1_matching_features_validate(
             db, artifact_error, static_cast<int>(sizeof(artifact_error))))
     {
@@ -1813,8 +1746,6 @@ int main(void)
             return 2;
         }
     }
-
-    float applied_feature_weight_terrain = feature_weight_terrain;
 
     // Open the graphics window only after every artifact and feature gate has
     // passed, so startup errors stay useful on headless systems.
@@ -1954,7 +1885,7 @@ int main(void)
     
     // IK
     
-    const bool ik_enabled = false;
+    static constexpr bool ik_enabled = false;
     float ik_max_length_buffer = 0.015f;
     float ik_foot_height = 0.02f;
     float ik_toe_length = 0.15f;
@@ -1963,7 +1894,7 @@ int main(void)
     
     // Learned Motion Matching
     
-    const bool lmm_enabled = false;
+    static constexpr bool lmm_enabled = false;
     
     // These objects keep Holden's dormant learned path type-correct, but the
     // incompatible LAFAN networks are deliberately not loaded for G1.
@@ -2071,6 +2002,7 @@ int main(void)
             }
         }
 
+        state.transitioned = false;
         state.adjustment_xz = 0.0f;
         state.adjustment_y = 0.0f;
         state.clamp_xz = 0.0f;
@@ -2340,7 +2272,6 @@ int main(void)
                 db, state.frame_index, query);
         }
         int selected_database_frame = query_database_frame;
-        state.transitioned = false;
         
         // Do we need to search?
 #ifdef MM_DISCRETE
@@ -2422,7 +2353,8 @@ int main(void)
             {
                 // Search
                 
-                int best_index = end_of_anim ? -1 : state.frame_index;
+                const int prior_index = state.frame_index;
+                int best_index = end_of_anim ? -1 : prior_index;
                 float best_cost = FLT_MAX;
                 
                 database_search(
@@ -2431,7 +2363,7 @@ int main(void)
                     db,
                     query);
                 selected_database_frame = best_index;
-                if (logging_enabled && best_index != state.frame_index) {
+                if (logging_enabled && best_index != prior_index) {
                     state.selected_cost = best_cost;
                     state.selected_terrain_error = database_raw_terrain_error(
                         db, best_index, query);
@@ -2439,7 +2371,7 @@ int main(void)
                 
                 // Transition if better frame found
                 
-                if (best_index != state.frame_index)
+                if (best_index != prior_index)
                 {
                     state.transitioned = true;
                     state.trns_bone_positions = db.bone_positions(best_index);
@@ -2550,7 +2482,6 @@ int main(void)
 
         motion_match_pose_diagnostic raw_selected_diagnostic;
         motion_match_pose_diagnostic inertialized_diagnostic;
-        vec3 root_before_adjustment;
         if (logging_enabled) {
             array1d<vec3> raw_selected_positions(state.curr_bone_positions);
             array1d<quat> raw_selected_rotations(state.curr_bone_rotations);
@@ -2562,7 +2493,6 @@ int main(void)
             inertialized_diagnostic = g1_pose_diagnostic(
                 state.bone_positions, state.bone_rotations,
                 db.bone_parents, active_scene.terrain);
-            root_before_adjustment = state.bone_positions(0);
         }
         
         // Update Simulation
@@ -2611,6 +2541,46 @@ int main(void)
             state.desired_rotation,
             simulation_rotation_halflife,
             dt);
+
+        // Observe the active-scene world level from the fully inertialized,
+        // support-local pose. Matching and simulation XZ are complete before
+        // this downstream world-Y transform is updated.
+        forward_kinematics_full(
+            state.global_bone_positions,
+            state.global_bone_rotations,
+            state.bone_positions,
+            state.bone_rotations,
+            db.bone_parents);
+        if (!support_observation_build(
+                state.support_observation_now,
+                support_rows,
+                state.frame_index,
+                active_scene.terrain,
+                state.global_bone_positions(G1_Simulation),
+                state.global_bone_positions(G1_LeftToe),
+                state.global_bone_positions(G1_RightToe),
+                state.curr_bone_contacts(0),
+                state.curr_bone_contacts(1),
+                artifact_error,
+                static_cast<int>(sizeof(artifact_error))) ||
+            !support_frame_update(
+                state.support,
+                state.support_observation_now,
+                state.transitioned,
+                dt,
+                artifact_error,
+                static_cast<int>(sizeof(artifact_error))))
+        {
+            std::fprintf(
+                stderr,
+                "G1 support runtime error scene=%s frame=%d: %s\n",
+                active_scene.metadata.id.c_str(),
+                state.frame_index,
+                artifact_error);
+            controller_exit_code = 2;
+            controller_exit_requested = true;
+            return;
+        }
         
         // Synchronization 
         
@@ -2644,23 +2614,26 @@ int main(void)
         // Adjustment 
         
         if (!synchronization_enabled && adjustment_enabled)
-        {   
-            vec3 adjusted_position = state.bone_positions(0);
-            quat adjusted_rotation = state.bone_rotations(0);
+        {
+            const vec3 before_adjustment =
+                state.bone_positions(G1_Simulation);
+            vec3 adjusted_position;
+            quat adjusted_rotation = state.bone_rotations(G1_Simulation);
             
             if (adjustment_by_velocity_enabled)
             {
-                adjusted_position = adjust_character_position_by_velocity(
-                    state.bone_positions(0),
-                    state.bone_velocities(0),
+                adjusted_position =
+                    horizontal_adjust_character_position_by_velocity(
+                    before_adjustment,
+                    state.bone_velocities(G1_Simulation),
                     state.simulation_position,
                     adjustment_position_max_ratio,
                     adjustment_position_halflife,
                     dt);
                 
                 adjusted_rotation = adjust_character_rotation_by_velocity(
-                    state.bone_rotations(0),
-                    state.bone_angular_velocities(0),
+                    state.bone_rotations(G1_Simulation),
+                    state.bone_angular_velocities(G1_Simulation),
                     state.simulation_rotation,
                     adjustment_rotation_max_ratio,
                     adjustment_rotation_halflife,
@@ -2668,85 +2641,92 @@ int main(void)
             }
             else
             {
-                adjusted_position = adjust_character_position(
-                    state.bone_positions(0),
+                adjusted_position = horizontal_adjust_character_position(
+                    before_adjustment,
                     state.simulation_position,
                     adjustment_position_halflife,
                     dt);
                 
                 adjusted_rotation = adjust_character_rotation(
-                    state.bone_rotations(0),
+                    state.bone_rotations(G1_Simulation),
                     state.simulation_rotation,
                     adjustment_rotation_halflife,
                     dt);
             }
-      
+
+            state.adjustment_xz =
+                horizontal_length(adjusted_position - before_adjustment);
+            state.adjustment_y =
+                adjusted_position.y - before_adjustment.y;
             inertialize_root_adjust(
-                state.bone_offset_positions(0),
+                state.bone_offset_positions(G1_Simulation),
                 state.transition_src_position,
                 state.transition_src_rotation,
                 state.transition_dst_position,
                 state.transition_dst_rotation,
-                state.bone_positions(0),
-                state.bone_rotations(0),
+                state.bone_positions(G1_Simulation),
+                state.bone_rotations(G1_Simulation),
                 adjusted_position,
                 adjusted_rotation);
-        }
-
-        vec3 root_after_adjustment;
-        if (logging_enabled) {
-            root_after_adjustment = state.bone_positions(0);
         }
         
         // Clamping
         
         if (!synchronization_enabled && clamping_enabled)
         {
-            vec3 adjusted_position = state.bone_positions(0);
-            quat adjusted_rotation = state.bone_rotations(0);
-            
-            adjusted_position = clamp_character_position(
-                adjusted_position,
+            const vec3 before_clamp = state.bone_positions(G1_Simulation);
+            vec3 adjusted_position = horizontal_clamp_character_position(
+                before_clamp,
                 state.simulation_position,
                 clamping_max_distance);
+            quat adjusted_rotation = state.bone_rotations(G1_Simulation);
             
             adjusted_rotation = clamp_character_rotation(
                 adjusted_rotation,
                 state.simulation_rotation,
                 clamping_max_angle);
-            
+
+            state.clamp_xz =
+                horizontal_length(adjusted_position - before_clamp);
+            state.clamp_y = adjusted_position.y - before_clamp.y;
             inertialize_root_adjust(
-                state.bone_offset_positions(0),
+                state.bone_offset_positions(G1_Simulation),
                 state.transition_src_position,
                 state.transition_src_rotation,
                 state.transition_dst_position,
                 state.transition_dst_rotation,
-                state.bone_positions(0),
-                state.bone_rotations(0),
+                state.bone_positions(G1_Simulation),
+                state.bone_rotations(G1_Simulation),
                 adjusted_position,
                 adjusted_rotation);
         }
 
-        state.adjusted_bone_positions = state.bone_positions;
+        if (state.adjustment_y != 0.0f || state.clamp_y != 0.0f)
+        {
+            std::fprintf(stderr, "G1 horizontal-root invariant failed\n");
+            controller_exit_code = 2;
+            controller_exit_requested = true;
+            return;
+        }
+
         state.adjusted_bone_rotations = state.bone_rotations;
         support_pose_apply(
             state.adjusted_bone_positions,
             state.bone_positions,
             state.support.height);
+        forward_kinematics_full(
+            state.global_bone_positions,
+            state.global_bone_rotations,
+            state.adjusted_bone_positions,
+            state.adjusted_bone_rotations,
+            db.bone_parents);
 
         if (logging_enabled) {
-            const vec3 root_after_clamp = state.bone_positions(0);
             const motion_match_pose_diagnostic rendered_diagnostic =
                 g1_pose_diagnostic(
                 state.adjusted_bone_positions,
                 state.adjusted_bone_rotations,
                 db.bone_parents, active_scene.terrain);
-            forward_kinematics_full(
-                state.global_bone_positions,
-                state.global_bone_rotations,
-                state.adjusted_bone_positions,
-                state.adjusted_bone_rotations,
-                db.bone_parents);
             char query_bits_hex[31 * 8 + 1] = {};
             if (!motion_match_query_bits_hex(
                     query_bits_hex, sizeof(query_bits_hex), query)) {
@@ -2775,7 +2755,7 @@ int main(void)
             log_row.selected_cost = state.selected_cost;
             log_row.selected_terrain_error = state.selected_terrain_error;
             log_row.effective_terrain_weight =
-                applied_feature_weight_terrain;
+                effective_terrain_weight;
             for (int i = 0; i < 4; ++i) {
                 log_row.terrain[i] = terrain_query_snapshot.values[i];
                 log_row.terrain_points[i] = terrain_query_snapshot.points[i];
@@ -2798,13 +2778,6 @@ int main(void)
                 active_scene.terrain,
                 state.global_bone_positions(G1_RightToe).x,
                 state.global_bone_positions(G1_RightToe).z);
-            const vec3 adjustment_delta =
-                root_after_adjustment - root_before_adjustment;
-            const vec3 clamp_delta = root_after_clamp - root_after_adjustment;
-            state.adjustment_xz = g1_xz_length(adjustment_delta);
-            state.adjustment_y = adjustment_delta.y;
-            state.clamp_xz = g1_xz_length(clamp_delta);
-            state.clamp_y = clamp_delta.y;
             log_row.adjustment_xz = state.adjustment_xz;
             log_row.adjustment_y = state.adjustment_y;
             log_row.clamp_xz = state.clamp_xz;
@@ -2812,7 +2785,7 @@ int main(void)
             log_row.matching_enabled = matching_enabled;
             log_row.adjustment_enabled = adjustment_enabled;
             log_row.clamping_enabled = clamping_enabled;
-            log_row.support_retargeting_enabled = false;
+            log_row.support_retargeting_enabled = true;
             log_row.ik_enabled = ik_enabled;
             if (!deterministic_log.write(
                     log_row, artifact_error, (int)sizeof(artifact_error))) {
@@ -2870,7 +2843,7 @@ int main(void)
 
         // Contact fixup with foot locking and IK
 
-        if (ik_enabled)
+        if constexpr (ik_enabled)
         {
             for (int i = 0; i < state.contact_bones.size; i++)
             {
@@ -2999,17 +2972,6 @@ int main(void)
             }
         }
         
-        // Full pass of forward kinematics to compute 
-        // all bone positions and rotations in the world
-        // space ready for rendering
-        
-        forward_kinematics_full(
-            state.global_bone_positions,
-            state.global_bone_rotations,
-            state.adjusted_bone_positions,
-            state.adjusted_bone_rotations,
-            db.bone_parents);
-        
         // Update camera
         
         orbit_camera_update(
@@ -3070,7 +3032,7 @@ int main(void)
         
         // Draw IK foot lock positions
         
-        if (ik_enabled)
+        if constexpr (ik_enabled)
         {
             for (int i = 0; i <  state.contact_positions.size; i++)
             {
@@ -3245,7 +3207,7 @@ int main(void)
         
         //---------
         
-        GuiGroupBox((Rectangle){ 20, 20, 290, 260 }, "feature weights / terrain diagnostics");
+        GuiGroupBox((Rectangle){ 20, 20, 290, 280 }, "feature weights / terrain diagnostics");
         
         GuiSliderBar(
             (Rectangle){ 150, 30, 120, 20 }, 
@@ -3280,10 +3242,20 @@ int main(void)
         GuiSliderBar(
             (Rectangle){ 150, 180, 120, 20 },
             "terrain",
-            TextFormat("%5.3f", feature_weight_terrain),
-            &feature_weight_terrain, 0.0f, 10.0f);
+            TextFormat("%5.3f", requested_terrain_weight),
+            &requested_terrain_weight, 0.0f, 10.0f);
 
-        if (GuiButton((Rectangle){ 150, 210, 120, 20 }, "rebuild database"))
+        GuiLabel(
+            (Rectangle){ 40, 205, 250, 20 },
+            requested_terrain_weight == effective_terrain_weight
+                ? TextFormat(
+                    "effective terrain %.3f", effective_terrain_weight)
+                : TextFormat(
+                    "requested %.3f (unapplied %.3f)",
+                    requested_terrain_weight,
+                    effective_terrain_weight));
+
+        if (GuiButton((Rectangle){ 150, 230, 120, 20 }, "apply / rebuild"))
         {
             database_build_matching_features(
                 db,
@@ -3295,7 +3267,7 @@ int main(void)
                 G1_LeftAnkle,
                 G1_RightAnkle,
                 G1_Hips,
-                feature_weight_terrain);
+                requested_terrain_weight);
             if (!g1_matching_features_validate(
                     db,
                     artifact_error,
@@ -3307,18 +3279,18 @@ int main(void)
             }
             else
             {
-                applied_feature_weight_terrain = feature_weight_terrain;
+                effective_terrain_weight = requested_terrain_weight;
             }
         }
 
         GuiLabel(
-            (Rectangle){ 40, 235, 250, 20 },
+            (Rectangle){ 40, 255, 250, 20 },
             TextFormat(
                 "query frame %d  range %d",
                 query_database_frame,
                 query_range));
         GuiLabel(
-            (Rectangle){ 40, 255, 250, 20 },
+            (Rectangle){ 40, 275, 250, 20 },
             TextFormat(
                 "terrain %.2f %.2f %.2f %.2f",
                 terrain_query_snapshot.values[0],
@@ -3328,7 +3300,7 @@ int main(void)
         
         //---------
         
-        float ui_sync_hei = 290;
+        float ui_sync_hei = 310;
         
         GuiGroupBox((Rectangle){ 20, ui_sync_hei, 290, 70 }, "synchronization");
 
@@ -3345,7 +3317,7 @@ int main(void)
 
         //---------
         
-        float ui_adj_hei = 370;
+        float ui_adj_hei = 390;
         
         GuiGroupBox((Rectangle){ 20, ui_adj_hei, 290, 130 }, "adjustment");
         
@@ -3373,7 +3345,7 @@ int main(void)
         
         //---------
         
-        float ui_clamp_hei = 510;
+        float ui_clamp_hei = 530;
         
         GuiGroupBox((Rectangle){ 20, ui_clamp_hei, 290, 100 }, "clamping");
         
@@ -3396,12 +3368,12 @@ int main(void)
         
         //---------
         
-        float ui_ik_hei = 620;
+        float ui_ik_hei = 640;
 
         GuiGroupBox((Rectangle){ 20, ui_ik_hei, 290, 40 }, "inverse kinematics");
         GuiLabel(
             (Rectangle){ 40, ui_ik_hei + 10, 250, 20 },
-            "disabled: G1 terrain IK comes later");
+            "world-Y support enabled; IK disabled");
         
         //---------
 
