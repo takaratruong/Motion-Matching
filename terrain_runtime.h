@@ -4,6 +4,7 @@
 
 #include "array.h"
 #include "quat.h"
+#include "spring.h"
 
 #include <errno.h>
 #include <float.h>
@@ -1138,6 +1139,484 @@ static inline int walkability_class_at(
     }
     const int value = grid.cells(iz * grid.nx + ix);
     return value <= 2 ? value : 0;
+}
+
+enum walkability_reason
+{
+    walkability_clear,
+    walkability_blocked_cell,
+    walkability_out_of_bounds,
+    walkability_nonfinite
+};
+
+struct walkability_sweep_result
+{
+    bool blocked = false;
+    int encountered_class = 1;
+    walkability_reason reason = walkability_clear;
+    float safe_fraction = 1.0f;
+    float distance = FLT_MAX;
+    vec3 point;
+};
+
+struct traversability_diagnostics
+{
+    bool blocked = false;
+    int walkability_class = 1;
+    walkability_reason reason = walkability_clear;
+    float distance = FLT_MAX;
+    float commanded_speed = 0.0f;
+    float applied_speed = 0.0f;
+    vec3 point;
+};
+
+static inline const char* walkability_reason_name(
+    walkability_reason reason)
+{
+    switch (reason) {
+    case walkability_clear: return "clear";
+    case walkability_blocked_cell: return "blocked-cell";
+    case walkability_out_of_bounds: return "out-of-bounds";
+    case walkability_nonfinite: return "nonfinite";
+    default: return "nonfinite";
+    }
+}
+
+static inline float walkability_xz_length(const vec3 value)
+{
+    const float abs_x = fabsf(value.x);
+    const float abs_z = fabsf(value.z);
+    if (!terrain_float_is_finite(abs_x) ||
+        !terrain_float_is_finite(abs_z)) {
+        return INFINITY;
+    }
+    const float maximum = maxf(abs_x, abs_z);
+    if (maximum == 0.0f) return 0.0f;
+    const float minimum = minf(abs_x, abs_z);
+    const float ratio = minimum / maximum;
+    return maximum * sqrtf(1.0f + ratio * ratio);
+}
+
+static inline bool walkability_node_coordinate(
+    float& coordinate, float origin, float cell_size, int index)
+{
+    float offset = 0.0f;
+    return index >= 0 &&
+           terrain_f32_mul(
+               offset, cell_size, static_cast<float>(index)) &&
+           terrain_f32_add(coordinate, origin, offset);
+}
+
+static inline int walkability_footprint_class(
+    const walkability_grid& grid,
+    const heightfield& field,
+    float x,
+    float z,
+    float radius,
+    walkability_reason& reason)
+{
+    reason = walkability_nonfinite;
+    if (field.version != 2 ||
+        !terrain_float_is_finite(x) ||
+        !terrain_float_is_finite(z) ||
+        !terrain_float_is_finite(radius) || radius < 0.0f ||
+        !walkability_grid_matches_heightfield(grid, field)) {
+        return 0;
+    }
+
+    float last_x = 0.0f;
+    float last_z = 0.0f;
+    if (!walkability_node_coordinate(
+            last_x, field.origin_x, field.cell_size, grid.nx - 1) ||
+        !walkability_node_coordinate(
+            last_z, field.origin_z, field.cell_size, grid.nz - 1)) {
+        return 0;
+    }
+
+    const double minimum_x = static_cast<double>(x) - radius;
+    const double maximum_x = static_cast<double>(x) + radius;
+    const double minimum_z = static_cast<double>(z) - radius;
+    const double maximum_z = static_cast<double>(z) + radius;
+    if (minimum_x < static_cast<double>(field.origin_x) ||
+        maximum_x > static_cast<double>(last_x) ||
+        minimum_z < static_cast<double>(field.origin_z) ||
+        maximum_z > static_cast<double>(last_z)) {
+        reason = walkability_out_of_bounds;
+        return 0;
+    }
+
+    const double inverse_cell = 1.0 / static_cast<double>(field.cell_size);
+    const double minimum_grid_x =
+        (minimum_x - static_cast<double>(field.origin_x)) * inverse_cell;
+    const double maximum_grid_x =
+        (maximum_x - static_cast<double>(field.origin_x)) * inverse_cell;
+    const double minimum_grid_z =
+        (minimum_z - static_cast<double>(field.origin_z)) * inverse_cell;
+    const double maximum_grid_z =
+        (maximum_z - static_cast<double>(field.origin_z)) * inverse_cell;
+    if (!terrain_double_is_finite(minimum_grid_x) ||
+        !terrain_double_is_finite(maximum_grid_x) ||
+        !terrain_double_is_finite(minimum_grid_z) ||
+        !terrain_double_is_finite(maximum_grid_z)) {
+        return 0;
+    }
+
+    int x0 = static_cast<int>(floor(minimum_grid_x));
+    int x1 = static_cast<int>(ceil(maximum_grid_x));
+    int z0 = static_cast<int>(floor(minimum_grid_z));
+    int z1 = static_cast<int>(ceil(maximum_grid_z));
+    if (x0 > 0) --x0;
+    if (z0 > 0) --z0;
+    if (x1 < grid.nx - 1) ++x1;
+    if (z1 < grid.nz - 1) ++z1;
+    x0 = x0 < 0 ? 0 : x0;
+    z0 = z0 < 0 ? 0 : z0;
+    x1 = x1 >= grid.nx ? grid.nx - 1 : x1;
+    z1 = z1 >= grid.nz ? grid.nz - 1 : z1;
+
+    float radius_squared = 0.0f;
+    float contact_limit = 0.0f;
+    if (!terrain_f32_mul(radius_squared, radius, radius) ||
+        !terrain_f32_add(contact_limit, radius_squared, 1.0e-8f)) {
+        return 0;
+    }
+    int encountered = 1;
+    for (int iz = z0; iz <= z1; ++iz) {
+        float node_z = 0.0f;
+        if (!walkability_node_coordinate(
+                node_z, field.origin_z, field.cell_size, iz)) {
+            return 0;
+        }
+        for (int ix = x0; ix <= x1; ++ix) {
+            float node_x = 0.0f;
+            if (!walkability_node_coordinate(
+                    node_x, field.origin_x, field.cell_size, ix)) {
+                return 0;
+            }
+            float dx = 0.0f;
+            float dz = 0.0f;
+            float dx_squared = 0.0f;
+            float dz_squared = 0.0f;
+            float distance_squared = 0.0f;
+            if (!terrain_f32_sub(dx, node_x, x) ||
+                !terrain_f32_sub(dz, node_z, z) ||
+                !terrain_f32_mul(dx_squared, dx, dx) ||
+                !terrain_f32_mul(dz_squared, dz, dz) ||
+                !terrain_f32_add(
+                    distance_squared, dx_squared, dz_squared)) {
+                return 0;
+            }
+            if (distance_squared <= contact_limit) {
+                const int value = grid.cells(iz * grid.nx + ix);
+                if (value > 2) return 0;
+                if (value == 0) {
+                    reason = walkability_blocked_cell;
+                    return 0;
+                }
+                if (value == 2) encountered = 2;
+            }
+        }
+    }
+    reason = walkability_clear;
+    return encountered;
+}
+
+static inline walkability_sweep_result walkability_sweep(
+    const walkability_grid& grid,
+    const heightfield& field,
+    vec3 start,
+    vec3 stop,
+    float radius)
+{
+    walkability_sweep_result out;
+    out.point = vec3(
+        terrain_float_is_finite(start.x) ? start.x : 0.0f,
+        0.0f,
+        terrain_float_is_finite(start.z) ? start.z : 0.0f);
+    if (field.version != 2 ||
+        !terrain_float_is_finite(start.x) ||
+        !terrain_float_is_finite(start.z) ||
+        !terrain_float_is_finite(stop.x) ||
+        !terrain_float_is_finite(stop.z) ||
+        !terrain_float_is_finite(radius) || radius < 0.0f ||
+        !walkability_grid_matches_heightfield(grid, field)) {
+        out.blocked = true;
+        out.encountered_class = 0;
+        out.reason = walkability_nonfinite;
+        out.safe_fraction = 0.0f;
+        out.distance = 0.0f;
+        return out;
+    }
+
+    walkability_reason start_reason = walkability_clear;
+    const int start_class = walkability_footprint_class(
+        grid, field, start.x, start.z, radius, start_reason);
+    if (start_class == 0) {
+        out.blocked = true;
+        out.encountered_class = 0;
+        out.reason = start_reason;
+        out.safe_fraction = 0.0f;
+        out.distance = 0.0f;
+        return out;
+    }
+    out.encountered_class = start_class;
+
+    float dx = 0.0f;
+    float dz = 0.0f;
+    if (!terrain_f32_sub(dx, stop.x, start.x) ||
+        !terrain_f32_sub(dz, stop.z, start.z)) {
+        out.blocked = true;
+        out.reason = walkability_nonfinite;
+        out.safe_fraction = 0.0f;
+        out.distance = 0.0f;
+        return out;
+    }
+    const float length_xz = walkability_xz_length(vec3(dx, 0.0f, dz));
+    if (!terrain_float_is_finite(length_xz)) {
+        out.blocked = true;
+        out.reason = walkability_nonfinite;
+        out.safe_fraction = 0.0f;
+        out.distance = 0.0f;
+        return out;
+    }
+
+    const double raw_steps = static_cast<double>(length_xz) /
+        (0.5 * static_cast<double>(field.cell_size));
+    // Every integer through 2^24 is exactly representable by binary32.
+    // Beyond that, adjacent loop indices can collapse to the same sample.
+    const double maximum_exact_step_count = 16777216.0;
+    if (!terrain_double_is_finite(raw_steps) ||
+        raw_steps > static_cast<double>(INT_MAX) ||
+        raw_steps > maximum_exact_step_count) {
+        out.blocked = true;
+        out.reason = walkability_nonfinite;
+        out.safe_fraction = 0.0f;
+        out.distance = 0.0f;
+        return out;
+    }
+    int steps = static_cast<int>(ceil(raw_steps));
+    if (steps < 1) steps = 1;
+
+    float previous_fraction = 0.0f;
+    vec3 previous_point(start.x, 0.0f, start.z);
+    for (int step = 1; step <= steps; ++step) {
+        float x = 0.0f;
+        float z = 0.0f;
+        float fraction = 0.0f;
+        const volatile float numerator = static_cast<float>(step);
+        const volatile float denominator = static_cast<float>(steps);
+        if (!terrain_f32_div(fraction, numerator, denominator) ||
+            !terrain_f32_lerp(x, start.x, stop.x, step, steps) ||
+            !terrain_f32_lerp(z, start.z, stop.z, step, steps)) {
+            out.blocked = true;
+            out.reason = walkability_nonfinite;
+            out.safe_fraction = previous_fraction;
+            out.distance = previous_fraction == 0.0f ? 0.0f :
+                terrain_runtime_canonicalize_output(
+                    length_xz * previous_fraction);
+            out.point = previous_point;
+            return out;
+        }
+        walkability_reason reason = walkability_clear;
+        const int classification = walkability_footprint_class(
+            grid, field, x, z, radius, reason);
+        if (classification == 2) out.encountered_class = 2;
+        if (classification == 0) {
+            out.blocked = true;
+            out.reason = reason;
+            out.safe_fraction = previous_fraction;
+            out.distance = previous_fraction == 0.0f ? 0.0f :
+                terrain_runtime_canonicalize_output(
+                    length_xz * previous_fraction);
+            out.point = previous_point;
+            return out;
+        }
+        previous_fraction = fraction;
+        previous_point = vec3(x, 0.0f, z);
+    }
+    out.point = vec3(stop.x, 0.0f, stop.z);
+    return out;
+}
+
+static inline vec3 traversability_invalid_command(
+    float& scale,
+    float& scale_velocity,
+    traversability_diagnostics& diagnostics,
+    vec3 position)
+{
+    scale = 0.0f;
+    scale_velocity = 0.0f;
+    diagnostics = traversability_diagnostics();
+    diagnostics.blocked = true;
+    diagnostics.walkability_class = 0;
+    diagnostics.reason = walkability_nonfinite;
+    diagnostics.distance = 0.0f;
+    diagnostics.point = vec3(
+        terrain_float_is_finite(position.x) ? position.x : 0.0f,
+        0.0f,
+        terrain_float_is_finite(position.z) ? position.z : 0.0f);
+    return vec3();
+}
+
+static inline vec3 traversability_limit_command(
+    float& scale,
+    float& scale_velocity,
+    traversability_diagnostics& diagnostics,
+    const walkability_grid& grid,
+    const heightfield& field,
+    vec3 position,
+    vec3 command,
+    float dt)
+{
+    diagnostics = traversability_diagnostics();
+    if (!terrain_float_is_finite(scale) ||
+        !terrain_float_is_finite(scale_velocity) ||
+        !terrain_float_is_finite(position.x) ||
+        !terrain_float_is_finite(position.y) ||
+        !terrain_float_is_finite(position.z) ||
+        !terrain_float_is_finite(command.x) ||
+        !terrain_float_is_finite(command.y) ||
+        !terrain_float_is_finite(command.z) ||
+        !terrain_float_is_finite(dt) || dt <= 0.0f ||
+        field.version != 2 ||
+        !walkability_grid_matches_heightfield(grid, field)) {
+        return traversability_invalid_command(
+            scale, scale_velocity, diagnostics, position);
+    }
+
+    const float commanded_speed = walkability_xz_length(command);
+    if (!terrain_float_is_finite(commanded_speed)) {
+        return traversability_invalid_command(
+            scale, scale_velocity, diagnostics, position);
+    }
+    diagnostics.commanded_speed = commanded_speed;
+
+    walkability_sweep_result sweep;
+    if (commanded_speed <= 1.0e-8f) {
+        sweep = walkability_sweep(
+            grid, field, position, position, 0.20f);
+    } else {
+        float half_second_distance = 0.0f;
+        float frame_distance = 0.0f;
+        if (!terrain_f32_mul(
+                half_second_distance, commanded_speed, 0.50f) ||
+            !terrain_f32_mul(frame_distance, commanded_speed, dt)) {
+            return traversability_invalid_command(
+                scale, scale_velocity, diagnostics, position);
+        }
+        const float lookahead =
+            maxf(half_second_distance, frame_distance);
+        const float direction_x = command.x / commanded_speed;
+        const float direction_z = command.z / commanded_speed;
+        float offset_x = 0.0f;
+        float offset_z = 0.0f;
+        float stop_x = 0.0f;
+        float stop_z = 0.0f;
+        if (!terrain_f32_mul(offset_x, direction_x, lookahead) ||
+            !terrain_f32_mul(offset_z, direction_z, lookahead) ||
+            !terrain_f32_add(stop_x, position.x, offset_x) ||
+            !terrain_f32_add(stop_z, position.z, offset_z)) {
+            return traversability_invalid_command(
+                scale, scale_velocity, diagnostics, position);
+        }
+        sweep = walkability_sweep(
+            grid, field, position,
+            vec3(stop_x, position.y, stop_z), 0.20f);
+    }
+
+    const float previous_scale = scale;
+    float goal = 1.0f;
+    if (sweep.blocked) {
+        diagnostics.blocked = true;
+        diagnostics.reason = sweep.reason;
+        diagnostics.distance = sweep.distance;
+        diagnostics.point = sweep.point;
+        if (commanded_speed <= 1.0e-8f) {
+            goal = 0.0f;
+        } else {
+            const float braking_distance =
+                maxf(commanded_speed * 0.50f, 1.0e-6f);
+            goal = clampf(
+                (sweep.distance - 0.02f) / braking_distance,
+                0.0f, 1.0f);
+        }
+    }
+    diagnostics.walkability_class = sweep.encountered_class;
+    simple_spring_damper_exact(
+        scale, scale_velocity, goal, 0.08f, dt);
+    if (!terrain_float_is_finite(scale) ||
+        !terrain_float_is_finite(scale_velocity)) {
+        return traversability_invalid_command(
+            scale, scale_velocity, diagnostics, position);
+    }
+    scale = clampf(minf(scale, goal), 0.0f, 1.0f);
+    if (sweep.blocked) {
+        scale = minf(scale, clampf(previous_scale, 0.0f, 1.0f));
+    }
+    const vec3 applied(command.x * scale, 0.0f, command.z * scale);
+    diagnostics.applied_speed = walkability_xz_length(applied);
+    if (!terrain_float_is_finite(diagnostics.applied_speed)) {
+        return traversability_invalid_command(
+            scale, scale_velocity, diagnostics, position);
+    }
+    return applied;
+}
+
+static inline bool traversability_clip_step(
+    vec3 start,
+    vec3& candidate,
+    vec3& velocity,
+    vec3& acceleration,
+    traversability_diagnostics& diagnostics,
+    const walkability_grid& grid,
+    const heightfield& field,
+    float radius)
+{
+    walkability_sweep_result sweep;
+    if (!terrain_float_is_finite(start.x) ||
+        !terrain_float_is_finite(start.y) ||
+        !terrain_float_is_finite(start.z) ||
+        !terrain_float_is_finite(candidate.x) ||
+        !terrain_float_is_finite(candidate.y) ||
+        !terrain_float_is_finite(candidate.z) ||
+        !terrain_float_is_finite(velocity.x) ||
+        !terrain_float_is_finite(velocity.y) ||
+        !terrain_float_is_finite(velocity.z) ||
+        !terrain_float_is_finite(acceleration.x) ||
+        !terrain_float_is_finite(acceleration.y) ||
+        !terrain_float_is_finite(acceleration.z)) {
+        sweep.blocked = true;
+        sweep.encountered_class = 0;
+        sweep.reason = walkability_nonfinite;
+        sweep.safe_fraction = 0.0f;
+        sweep.distance = 0.0f;
+        sweep.point = vec3(
+            terrain_float_is_finite(start.x) ? start.x : 0.0f,
+            0.0f,
+            terrain_float_is_finite(start.z) ? start.z : 0.0f);
+    } else {
+        sweep = walkability_sweep(grid, field, start, candidate, radius);
+    }
+    if (!sweep.blocked) return true;
+
+    if (terrain_float_is_finite(start.x) &&
+        terrain_float_is_finite(start.z)) {
+        candidate.x = sweep.point.x;
+        candidate.z = sweep.point.z;
+    } else {
+        candidate.x = start.x;
+        candidate.z = start.z;
+    }
+    velocity.x = 0.0f;
+    velocity.z = 0.0f;
+    acceleration.x = 0.0f;
+    acceleration.z = 0.0f;
+    diagnostics.blocked = true;
+    diagnostics.reason = sweep.reason;
+    diagnostics.distance = sweep.distance;
+    diagnostics.point = sweep.point;
+    diagnostics.applied_speed = 0.0f;
+    return false;
 }
 
 static inline bool terrain_heightfield_is_queryable(const heightfield& field);

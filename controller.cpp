@@ -2150,6 +2150,21 @@ int main(void)
             simulation_fwrd_speed,
             simulation_side_speed,
             simulation_back_speed);
+        const vec3 commanded_velocity = desired_velocity_curr;
+        traversability_diagnostics traversal = {};
+        desired_velocity_curr = traversability_limit_command(
+            state.traversal_speed_scale,
+            state.traversal_speed_scale_velocity,
+            traversal,
+            active_scene.walkability,
+            active_scene.terrain,
+            state.simulation_position,
+            commanded_velocity,
+            dt);
+        state.blocked = traversal.blocked;
+        state.walkability_class = traversal.walkability_class;
+        state.blocked_distance = traversal.distance;
+        state.blocked_point = traversal.point;
             
         // Get the desired rotation/direction
         quat desired_rotation_curr = desired_rotation_update(
@@ -2215,9 +2230,9 @@ int main(void)
           gamepadstick_left,
           gamepadstick_right,
           desired_strafe,
-          simulation_fwrd_speed,
-          simulation_side_speed,
-          simulation_back_speed,
+          simulation_fwrd_speed * state.traversal_speed_scale,
+          simulation_side_speed * state.traversal_speed_scale,
+          simulation_back_speed * state.traversal_speed_scale,
           trajectory_sample_time);
         
         trajectory_positions_predict(
@@ -2552,6 +2567,7 @@ int main(void)
         
         // Update Simulation
         
+        const vec3 simulation_before = state.simulation_position;
         simulation_positions_update(
             state.simulation_position,
             state.simulation_velocity,
@@ -2559,6 +2575,48 @@ int main(void)
             state.desired_velocity,
             simulation_velocity_halflife,
             dt);
+        const bool integrated_state_is_finite =
+            terrain_float_is_finite(simulation_before.x) &&
+            terrain_float_is_finite(simulation_before.y) &&
+            terrain_float_is_finite(simulation_before.z) &&
+            terrain_float_is_finite(state.simulation_position.x) &&
+            terrain_float_is_finite(state.simulation_position.y) &&
+            terrain_float_is_finite(state.simulation_position.z) &&
+            terrain_float_is_finite(state.simulation_velocity.x) &&
+            terrain_float_is_finite(state.simulation_velocity.y) &&
+            terrain_float_is_finite(state.simulation_velocity.z) &&
+            terrain_float_is_finite(state.simulation_acceleration.x) &&
+            terrain_float_is_finite(state.simulation_acceleration.y) &&
+            terrain_float_is_finite(state.simulation_acceleration.z);
+        const walkability_sweep_result integrated_traversal = walkability_sweep(
+            active_scene.walkability,
+            active_scene.terrain,
+            simulation_before,
+            state.simulation_position,
+            0.20f);
+        if (!integrated_state_is_finite || integrated_traversal.blocked) {
+            traversability_clip_step(
+                simulation_before,
+                state.simulation_position,
+                state.simulation_velocity,
+                state.simulation_acceleration,
+                traversal,
+                active_scene.walkability,
+                active_scene.terrain,
+                0.20f);
+        }
+        walkability_reason current_reason = walkability_clear;
+        const int current_walkability_class = walkability_footprint_class(
+            active_scene.walkability,
+            active_scene.terrain,
+            state.simulation_position.x,
+            state.simulation_position.z,
+            0.20f,
+            current_reason);
+        state.blocked = traversal.blocked;
+        state.blocked_distance = traversal.distance;
+        state.blocked_point = traversal.point;
+        state.walkability_class = current_walkability_class;
             
         simulation_rotations_update(
             state.simulation_rotation,

@@ -27,6 +27,7 @@ static void* test_terrain_payload_allocate(size_t bytes)
 
 #include <limits>
 #include <random>
+#include <string>
 #include <vector>
 
 typedef std::vector<unsigned char> byte_buffer;
@@ -567,6 +568,717 @@ static void test_walkability_binary32_half_cell_parity()
     check(walkability_class_at(
           grid, rounded, -0.9900000095367432f, 0.0f) == 1,
           "rounded mathematical midpoint follows one-round producer ops");
+}
+
+static void initialize_walkability_guard_fixture(
+    heightfield& field, walkability_grid& grid)
+{
+    initialize_heightfield(
+        field, 11, 5, 0.0f, 0.0f, 0.10f, 0.0f, 2);
+    field.heights.zero();
+    grid.nx = 11;
+    grid.nz = 5;
+    grid.cells.resize(55);
+    grid.cells.set(1);
+    for (int z = 0; z < grid.nz; ++z) grid.cells(z * grid.nx + 7) = 0;
+    grid.cells(2 * grid.nx + 4) = 2;
+}
+
+static void test_walkability_reason_names_are_stable()
+{
+    check(strcmp(walkability_reason_name(walkability_clear), "clear") == 0,
+          "clear walkability reason name");
+    check(strcmp(walkability_reason_name(walkability_blocked_cell),
+                 "blocked-cell") == 0,
+          "blocked-cell walkability reason name");
+    check(strcmp(walkability_reason_name(walkability_out_of_bounds),
+                 "out-of-bounds") == 0,
+          "out-of-bounds walkability reason name");
+    check(strcmp(walkability_reason_name(walkability_nonfinite),
+                 "nonfinite") == 0,
+          "nonfinite walkability reason name");
+    check(strcmp(walkability_reason_name(
+                     static_cast<walkability_reason>(INT_MAX)),
+                 "nonfinite") == 0,
+          "unknown walkability reason maps to nonfinite");
+}
+
+static void test_walkability_footprint_is_conservative_and_release_safe()
+{
+    heightfield field;
+    walkability_grid grid;
+    initialize_walkability_guard_fixture(field, grid);
+
+    check(walkability_class_at(grid, field, 0.4f, 0.2f) == 2,
+          "stress lookup remains diagnostic");
+    check(walkability_class_at(grid, field, -0.01f, 0.2f) == 0,
+          "exterior lookup remains blocked");
+
+    walkability_reason reason = walkability_nonfinite;
+    check(walkability_footprint_class(
+              grid, field, 0.4f, 0.2f, 0.0f, reason) == 2 &&
+              reason == walkability_clear,
+          "stress footprint remains traversable");
+    check(walkability_footprint_class(
+              grid, field, 0.3f, 0.2f, 0.1f, reason) == 2 &&
+              reason == walkability_clear,
+          "circle contact records stress node");
+    check(walkability_footprint_class(
+              grid, field, 0.5f, 0.2f, 0.2f, reason) == 0 &&
+              reason == walkability_blocked_cell,
+          "circle boundary contact blocks at node");
+
+    heightfield rounded_contact_field;
+    initialize_heightfield(
+        rounded_contact_field, 11, 11, 0.0f, 0.0f, 0.10f, 0.0f, 2);
+    rounded_contact_field.heights.zero();
+    walkability_grid rounded_contact_grid;
+    rounded_contact_grid.nx = 11;
+    rounded_contact_grid.nz = 11;
+    rounded_contact_grid.cells.resize(121);
+    rounded_contact_grid.cells.set(1);
+    rounded_contact_grid.cells(5 * 11 + 5) = 0;
+    check(walkability_footprint_class(
+              rounded_contact_grid,
+              rounded_contact_field,
+              float_from_bits(UINT32_C(0x3f332c1a)),
+              float_from_bits(UINT32_C(0x3efca135)),
+              0.20f,
+              reason) == 0 && reason == walkability_blocked_cell,
+          "binary32 rounded circle boundary remains conservative");
+    check(walkability_footprint_class(
+              grid, field, 0.2f, 0.2f, 0.2f, reason) == 2 &&
+              reason == walkability_clear,
+          "footprint may touch the grid boundary");
+    check(walkability_footprint_class(
+              grid, field, nextafterf(0.2f, -INFINITY), 0.2f, 0.2f,
+              reason) == 0 && reason == walkability_out_of_bounds,
+          "footprint crossing the grid boundary blocks");
+
+    walkability_grid malformed;
+    malformed.nx = grid.nx;
+    malformed.nz = grid.nz;
+    malformed.cells.resize(1);
+    malformed.cells(0) = 1;
+    check(walkability_footprint_class(
+              malformed, field, 0.2f, 0.2f, 0.2f, reason) == 0 &&
+              reason == walkability_nonfinite,
+          "malformed walkability shape stops safely");
+
+    walkability_grid invalid_cell(grid);
+    invalid_cell.cells(2 * invalid_cell.nx + 4) = 3;
+    check(walkability_footprint_class(
+              invalid_cell, field, 0.4f, 0.2f, 0.0f, reason) == 0 &&
+              reason == walkability_nonfinite,
+          "malformed walkability cell stops safely");
+
+    heightfield wrong_version(field);
+    wrong_version.version = 1;
+    check(walkability_footprint_class(
+              grid, wrong_version, 0.2f, 0.2f, 0.0f, reason) == 0 &&
+              reason == walkability_nonfinite,
+          "walkability guard accepts only v2 terrain");
+    check(walkability_footprint_class(
+              grid, field, 0.2f, 0.2f, -0.1f, reason) == 0 &&
+              reason == walkability_nonfinite,
+          "negative footprint radius stops safely");
+    check(walkability_footprint_class(
+              grid, field, 0.2f, 0.2f,
+              std::numeric_limits<float>::quiet_NaN(), reason) == 0 &&
+              reason == walkability_nonfinite,
+          "nonfinite footprint radius stops safely");
+}
+
+static void test_walkability_sweep_handles_clear_blocked_and_hostile_steps()
+{
+    heightfield field;
+    walkability_grid grid;
+    initialize_walkability_guard_fixture(field, grid);
+
+    const vec3 start(0.2f, 8.0f, 0.2f);
+    const vec3 stop(0.9f, -8.0f, 0.2f);
+    const walkability_sweep_result blocked =
+        walkability_sweep(grid, field, start, stop, 0.20f);
+    check(blocked.blocked &&
+              blocked.reason == walkability_blocked_cell,
+          "blocked sweep reports blocked cell");
+    check(blocked.safe_fraction >= 0.0f && blocked.safe_fraction < 1.0f &&
+              blocked.distance >= 0.0f && blocked.point.y == 0.0f,
+          "blocked sweep reports planar last-safe boundary");
+    check(blocked.point.x >= start.x && blocked.point.x < 0.5f,
+          "blocked sweep stops before circle-node contact");
+    check(blocked.encountered_class == 2,
+          "blocked sweep records traversed stress class");
+
+    const walkability_sweep_result clear = walkability_sweep(
+        grid, field, vec3(0.2f, 3.0f, 0.1f),
+        vec3(0.3f, -4.0f, 0.1f), 0.0f);
+    check(!clear.blocked && clear.reason == walkability_clear &&
+              clear.safe_fraction == 1.0f && clear.distance == FLT_MAX,
+          "clear sweep retains clear defaults");
+    check_vec3_bits(clear.point, float_bits(0.3f), UINT32_C(0),
+                    float_bits(0.1f), "clear sweep returns planar stop");
+
+    const walkability_sweep_result zero = walkability_sweep(
+        grid, field, vec3(0.3f, 2.0f, 0.1f),
+        vec3(0.3f, -2.0f, 0.1f), 0.0f);
+    check(!zero.blocked && zero.safe_fraction == 1.0f &&
+              zero.distance == FLT_MAX,
+          "zero-length clear sweep succeeds");
+    const walkability_sweep_result zero_stress = walkability_sweep(
+        grid, field, vec3(0.4f, 2.0f, 0.2f),
+        vec3(0.4f, -2.0f, 0.2f), 0.0f);
+    check(!zero_stress.blocked && zero_stress.encountered_class == 2,
+          "zero-length stress sweep remains traversable");
+    const walkability_sweep_result zero_blocked = walkability_sweep(
+        grid, field, vec3(0.7f, 2.0f, 0.2f),
+        vec3(0.7f, -2.0f, 0.2f), 0.0f);
+    check(zero_blocked.blocked &&
+              zero_blocked.reason == walkability_blocked_cell &&
+              zero_blocked.safe_fraction == 0.0f &&
+              zero_blocked.distance == 0.0f,
+          "zero-length blocked sweep stops at start");
+
+    const walkability_sweep_result outside = walkability_sweep(
+        grid, field, vec3(-0.01f, 0.0f, 0.2f),
+        vec3(0.3f, 0.0f, 0.2f), 0.0f);
+    check(outside.blocked &&
+              outside.reason == walkability_out_of_bounds &&
+              outside.safe_fraction == 0.0f && outside.distance == 0.0f,
+          "outside sweep start stops safely");
+    const walkability_sweep_result nonfinite_start = walkability_sweep(
+        grid, field,
+        vec3(std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.2f),
+        vec3(0.3f, 0.0f, 0.2f), 0.0f);
+    check(nonfinite_start.blocked &&
+              nonfinite_start.reason == walkability_nonfinite &&
+              nonfinite_start.safe_fraction == 0.0f &&
+              nonfinite_start.distance == 0.0f,
+          "nonfinite sweep start stops safely");
+    const walkability_sweep_result nonfinite_stop = walkability_sweep(
+        grid, field, vec3(0.2f, 0.0f, 0.2f),
+        vec3(std::numeric_limits<float>::infinity(), 0.0f, 0.2f),
+        0.0f);
+    check(nonfinite_stop.blocked &&
+              nonfinite_stop.reason == walkability_nonfinite &&
+              nonfinite_stop.safe_fraction == 0.0f,
+          "nonfinite sweep stop stops safely");
+    const walkability_sweep_result hostile_count = walkability_sweep(
+        grid, field, vec3(0.2f, 0.0f, 0.2f),
+        vec3(1.0e30f, 0.0f, 0.2f), 0.0f);
+    check(hostile_count.blocked &&
+              hostile_count.reason == walkability_nonfinite &&
+              hostile_count.safe_fraction == 0.0f &&
+              hostile_count.distance == 0.0f,
+          "unrepresentable sweep sample count stops without conversion UB");
+    const walkability_sweep_result inexact_float_count = walkability_sweep(
+        grid, field, vec3(0.2f, 0.0f, 0.2f),
+        vec3(1.0e6f, 0.0f, 0.2f), 0.0f);
+    check(inexact_float_count.blocked &&
+              inexact_float_count.reason == walkability_nonfinite &&
+              inexact_float_count.safe_fraction == 0.0f &&
+              inexact_float_count.distance == 0.0f,
+          "inexact binary32 sweep step counter stops safely");
+}
+
+static void check_invalid_traversability_command(
+    const walkability_grid& grid,
+    const heightfield& field,
+    float scale,
+    float scale_velocity,
+    vec3 position,
+    vec3 command,
+    float dt,
+    const char* message)
+{
+    traversability_diagnostics diagnostics = {};
+    const vec3 applied = traversability_limit_command(
+        scale, scale_velocity, diagnostics, grid, field,
+        position, command, dt);
+    check(diagnostics.blocked &&
+              diagnostics.walkability_class == 0 &&
+              diagnostics.reason == walkability_nonfinite &&
+              diagnostics.distance == 0.0f &&
+              applied.x == 0.0f && applied.y == 0.0f &&
+              applied.z == 0.0f && scale == 0.0f &&
+              scale_velocity == 0.0f,
+          message);
+}
+
+static void test_traversability_command_limits_safely_and_recovers()
+{
+    heightfield field;
+    walkability_grid grid;
+    initialize_walkability_guard_fixture(field, grid);
+
+    float horizon_scale = 1.0f;
+    float horizon_scale_velocity = 0.0f;
+    traversability_diagnostics horizon_diagnostics = {};
+    traversability_limit_command(
+        horizon_scale, horizon_scale_velocity, horizon_diagnostics,
+        grid, field, vec3(0.249f, 0.0f, 0.2f),
+        vec3(0.5f, 0.0f, 0.0f), 1.0f / 25.0f);
+    check(!horizon_diagnostics.blocked,
+          "half-second lookahead stays clear just before contact");
+    horizon_scale = 1.0f;
+    horizon_scale_velocity = 0.0f;
+    traversability_limit_command(
+        horizon_scale, horizon_scale_velocity, horizon_diagnostics,
+        grid, field, vec3(0.251f, 0.0f, 0.2f),
+        vec3(0.5f, 0.0f, 0.0f), 1.0f / 25.0f);
+    check(horizon_diagnostics.blocked &&
+              horizon_diagnostics.reason == walkability_blocked_cell,
+          "half-second lookahead reaches contact just across horizon");
+
+    float scale = 1.0f;
+    float scale_velocity = 0.0f;
+    traversability_diagnostics diagnostics = {};
+    const vec3 first = traversability_limit_command(
+        scale, scale_velocity, diagnostics, grid, field,
+        vec3(0.3f, 0.0f, 0.2f), vec3(0.5f, 0.0f, 0.0f),
+        1.0f / 25.0f);
+    check(diagnostics.blocked &&
+              diagnostics.reason == walkability_blocked_cell &&
+              diagnostics.walkability_class == 2 &&
+              diagnostics.commanded_speed == 0.5f &&
+              diagnostics.applied_speed > 0.0f &&
+              diagnostics.applied_speed < diagnostics.commanded_speed &&
+              scale > 0.0f && scale < 1.0f &&
+              first.x == diagnostics.applied_speed && first.y == 0.0f &&
+              first.z == 0.0f,
+          "lookahead smoothly limits command before a block");
+    const float first_scale = scale;
+    traversability_limit_command(
+        scale, scale_velocity, diagnostics, grid, field,
+        vec3(0.3f, 0.0f, 0.2f), vec3(0.5f, 0.0f, 0.0f),
+        1.0f / 25.0f);
+    check(scale <= first_scale,
+          "repeated blocked lookahead does not increase speed scale");
+
+    walkability_grid clear_grid(grid);
+    clear_grid.cells.set(1);
+    float reference_scale = 0.5f;
+    float reference_scale_velocity = 0.0f;
+    traversability_diagnostics reference_diagnostics = {};
+    const vec3 reference_applied = traversability_limit_command(
+        reference_scale, reference_scale_velocity, reference_diagnostics,
+        clear_grid, field, vec3(0.5f, 0.0f, 0.2f),
+        vec3(0.5f, 0.0f, 0.0f), 1.0f / 25.0f);
+    check(!reference_diagnostics.blocked &&
+              float_bits(reference_scale) == UINT32_C(0x3f13be8f) &&
+              float_bits(reference_scale_velocity) == UINT32_C(0x403ff497) &&
+              float_bits(reference_applied.x) == UINT32_C(0x3e93be8f),
+          "0.08-second half-life reference step is exact");
+    const float reduced_scale = scale;
+    for (int frame = 0; frame < 100; ++frame) {
+        traversability_limit_command(
+            scale, scale_velocity, diagnostics, clear_grid, field,
+            vec3(0.5f, 0.0f, 0.2f), vec3(0.5f, 0.0f, 0.0f),
+            1.0f / 25.0f);
+        check(!diagnostics.blocked &&
+                  diagnostics.reason == walkability_clear &&
+                  diagnostics.walkability_class == 1,
+              "clear command reports clear current path");
+    }
+    check(scale > reduced_scale && scale > 0.99f,
+          "speed scale recovers on clear terrain");
+
+    scale = 0.25f;
+    scale_velocity = 0.0f;
+    const vec3 stopped = traversability_limit_command(
+        scale, scale_velocity, diagnostics, grid, field,
+        vec3(0.7f, 0.0f, 0.2f), vec3(), 1.0f / 25.0f);
+    check(diagnostics.blocked &&
+              diagnostics.reason == walkability_blocked_cell &&
+              diagnostics.commanded_speed == 0.0f &&
+              diagnostics.applied_speed == 0.0f && scale == 0.0f &&
+              stopped.x == 0.0f && stopped.y == 0.0f &&
+              stopped.z == 0.0f,
+          "zero command on a blocked footprint stays stopped");
+
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    check_invalid_traversability_command(
+        grid, field, nan, 0.0f, vec3(0.3f, 0.0f, 0.2f),
+        vec3(0.5f, 0.0f, 0.0f), 1.0f / 25.0f,
+        "nonfinite scale stops safely");
+    check_invalid_traversability_command(
+        grid, field, 1.0f, inf, vec3(0.3f, 0.0f, 0.2f),
+        vec3(0.5f, 0.0f, 0.0f), 1.0f / 25.0f,
+        "nonfinite scale velocity stops safely");
+    check_invalid_traversability_command(
+        grid, field, 1.0f, 0.0f, vec3(nan, 0.0f, 0.2f),
+        vec3(0.5f, 0.0f, 0.0f), 1.0f / 25.0f,
+        "nonfinite position x stops safely");
+    check_invalid_traversability_command(
+        grid, field, 1.0f, 0.0f, vec3(0.3f, inf, 0.2f),
+        vec3(0.5f, 0.0f, 0.0f), 1.0f / 25.0f,
+        "nonfinite position y stops safely");
+    check_invalid_traversability_command(
+        grid, field, 1.0f, 0.0f, vec3(0.3f, 0.0f, 0.2f),
+        vec3(nan, 0.0f, 0.0f), 1.0f / 25.0f,
+        "nonfinite command x stops safely");
+    check_invalid_traversability_command(
+        grid, field, 1.0f, 0.0f, vec3(0.3f, 0.0f, 0.2f),
+        vec3(0.5f, nan, 0.0f), 1.0f / 25.0f,
+        "nonfinite command y stops safely");
+    check_invalid_traversability_command(
+        grid, field, 1.0f, 0.0f, vec3(0.3f, 0.0f, 0.2f),
+        vec3(0.5f, 0.0f, 0.0f), 0.0f,
+        "zero command timestep stops safely");
+    check_invalid_traversability_command(
+        grid, field, 1.0f, 0.0f, vec3(0.3f, 0.0f, 0.2f),
+        vec3(0.5f, 0.0f, 0.0f), nan,
+        "nonfinite command timestep stops safely");
+
+    walkability_grid malformed;
+    malformed.nx = grid.nx;
+    malformed.nz = grid.nz;
+    malformed.cells.resize(1);
+    malformed.cells(0) = 1;
+    check_invalid_traversability_command(
+        malformed, field, 1.0f, 0.0f, vec3(0.3f, 0.0f, 0.2f),
+        vec3(0.5f, 0.0f, 0.0f), 1.0f / 25.0f,
+        "malformed command terrain stops safely");
+}
+
+static void test_traversability_clip_is_planar_and_bit_preserving()
+{
+    heightfield field;
+    walkability_grid grid;
+    initialize_walkability_guard_fixture(field, grid);
+
+    const vec3 start(0.3f, float_from_bits(UINT32_C(0x3f000001)), 0.2f);
+    vec3 candidate(0.9f, float_from_bits(UINT32_C(0x80000000)), 0.2f);
+    vec3 velocity(0.5f, float_from_bits(UINT32_C(0x3f800001)), -0.25f);
+    vec3 acceleration(0.75f, float_from_bits(UINT32_C(0x80000000)), 0.5f);
+    float support = float_from_bits(UINT32_C(0x7fc54321));
+    const uint32_t candidate_y = float_bits(candidate.y);
+    const uint32_t velocity_y = float_bits(velocity.y);
+    const uint32_t acceleration_y = float_bits(acceleration.y);
+    const uint32_t support_bits = float_bits(support);
+    const walkability_sweep_result expected =
+        walkability_sweep(grid, field, start, candidate, 0.20f);
+    traversability_diagnostics diagnostics = {};
+    check(!traversability_clip_step(
+              start, candidate, velocity, acceleration, diagnostics,
+              grid, field, 0.20f),
+          "blocked integration step hard clips");
+    check_float_bits(candidate.y, candidate_y,
+                     "hard clip preserves candidate y bits");
+    check_float_bits(velocity.y, velocity_y,
+                     "hard clip preserves velocity y bits");
+    check_float_bits(acceleration.y, acceleration_y,
+                     "hard clip preserves acceleration y bits");
+    check_float_bits(support, support_bits,
+                     "hard clip leaves support bits untouched");
+    check(candidate.x == expected.point.x &&
+              candidate.z == expected.point.z &&
+              velocity.x == 0.0f && velocity.z == 0.0f &&
+              acceleration.x == 0.0f && acceleration.z == 0.0f,
+          "hard clip applies the last safe XZ fraction only");
+    check(diagnostics.blocked &&
+              diagnostics.reason == walkability_blocked_cell &&
+              diagnostics.distance == expected.distance &&
+              diagnostics.point.x == expected.point.x &&
+              diagnostics.point.z == expected.point.z &&
+              diagnostics.applied_speed == 0.0f,
+          "hard clip updates prospective diagnostics");
+    walkability_reason current_reason = walkability_nonfinite;
+    check(walkability_footprint_class(
+              grid, field, candidate.x, candidate.z, 0.20f,
+              current_reason) != 0 && current_reason == walkability_clear,
+          "hard-clipped footprint is accepted");
+
+    vec3 clear_candidate(0.35f, float_from_bits(UINT32_C(0x80000000)),
+                         0.2f);
+    vec3 clear_velocity(0.25f, 7.0f, -0.5f);
+    vec3 clear_acceleration(-0.5f, -8.0f, 0.25f);
+    const vec3 clear_candidate_before = clear_candidate;
+    const vec3 clear_velocity_before = clear_velocity;
+    const vec3 clear_acceleration_before = clear_acceleration;
+    diagnostics = traversability_diagnostics();
+    check(traversability_clip_step(
+              start, clear_candidate, clear_velocity, clear_acceleration,
+              diagnostics, grid, field, 0.20f),
+          "clear integration step is accepted");
+    check_vec3_bits(clear_candidate,
+                    float_bits(clear_candidate_before.x),
+                    float_bits(clear_candidate_before.y),
+                    float_bits(clear_candidate_before.z),
+                    "clear clip preserves candidate");
+    check_vec3_bits(clear_velocity,
+                    float_bits(clear_velocity_before.x),
+                    float_bits(clear_velocity_before.y),
+                    float_bits(clear_velocity_before.z),
+                    "clear clip preserves velocity");
+    check_vec3_bits(clear_acceleration,
+                    float_bits(clear_acceleration_before.x),
+                    float_bits(clear_acceleration_before.y),
+                    float_bits(clear_acceleration_before.z),
+                    "clear clip preserves acceleration");
+
+    vec3 invalid_candidate(
+        std::numeric_limits<float>::quiet_NaN(),
+        float_from_bits(UINT32_C(0x7fc23456)), 0.2f);
+    velocity = vec3(0.25f, 4.0f, 0.5f);
+    acceleration = vec3(0.5f, 5.0f, 0.75f);
+    const uint32_t invalid_y = float_bits(invalid_candidate.y);
+    diagnostics = traversability_diagnostics();
+    check(!traversability_clip_step(
+              start, invalid_candidate, velocity, acceleration,
+              diagnostics, grid, field, 0.20f) &&
+              diagnostics.reason == walkability_nonfinite,
+          "nonfinite candidate hard stops");
+    check(invalid_candidate.x == start.x &&
+              invalid_candidate.z == start.z &&
+              velocity.x == 0.0f && velocity.z == 0.0f &&
+              acceleration.x == 0.0f && acceleration.z == 0.0f,
+          "nonfinite candidate cannot leak through zero fraction");
+    check_float_bits(invalid_candidate.y, invalid_y,
+                     "nonfinite hard stop preserves candidate y bits");
+
+    vec3 finite_candidate(0.35f, -3.0f, 0.2f);
+    velocity = vec3(std::numeric_limits<float>::infinity(), 4.0f, 0.5f);
+    acceleration = vec3(0.5f, 5.0f, 0.75f);
+    diagnostics = traversability_diagnostics();
+    check(!traversability_clip_step(
+              start, finite_candidate, velocity, acceleration,
+              diagnostics, grid, field, 0.20f) &&
+              diagnostics.reason == walkability_nonfinite &&
+              finite_candidate.x == start.x &&
+              finite_candidate.z == start.z,
+          "nonfinite planar simulation state hard stops");
+
+    vec3 vertical_candidate(
+        0.35f, float_from_bits(UINT32_C(0x7fc34567)), 0.2f);
+    velocity = vec3(0.25f, 4.0f, 0.5f);
+    acceleration = vec3(0.5f, 5.0f, 0.75f);
+    const uint32_t vertical_candidate_y = float_bits(vertical_candidate.y);
+    diagnostics = traversability_diagnostics();
+    check(!traversability_clip_step(
+              start, vertical_candidate, velocity, acceleration,
+              diagnostics, grid, field, 0.20f) &&
+              diagnostics.reason == walkability_nonfinite &&
+              vertical_candidate.x == start.x &&
+              vertical_candidate.z == start.z,
+          "nonfinite candidate y hard stops planar motion");
+    check_float_bits(vertical_candidate.y, vertical_candidate_y,
+                     "nonfinite hard stop preserves candidate y payload");
+
+    vertical_candidate = vec3(0.35f, -3.0f, 0.2f);
+    velocity = vec3(
+        0.25f, std::numeric_limits<float>::infinity(), 0.5f);
+    acceleration = vec3(0.5f, 5.0f, 0.75f);
+    diagnostics = traversability_diagnostics();
+    check(!traversability_clip_step(
+              start, vertical_candidate, velocity, acceleration,
+              diagnostics, grid, field, 0.20f) &&
+              diagnostics.reason == walkability_nonfinite &&
+              velocity.y == std::numeric_limits<float>::infinity(),
+          "nonfinite velocity y hard stops without rewriting y");
+
+    vertical_candidate = vec3(0.35f, -3.0f, 0.2f);
+    velocity = vec3(0.25f, 4.0f, 0.5f);
+    acceleration = vec3(
+        0.5f, float_from_bits(UINT32_C(0x7fc45678)), 0.75f);
+    const uint32_t vertical_acceleration_y = float_bits(acceleration.y);
+    diagnostics = traversability_diagnostics();
+    check(!traversability_clip_step(
+              start, vertical_candidate, velocity, acceleration,
+              diagnostics, grid, field, 0.20f) &&
+              diagnostics.reason == walkability_nonfinite,
+          "nonfinite acceleration y hard stops planar motion");
+    check_float_bits(acceleration.y, vertical_acceleration_y,
+                     "nonfinite hard stop preserves acceleration y payload");
+}
+
+static void test_walkability_guard_reaches_safe_stop()
+{
+    heightfield field;
+    walkability_grid grid;
+    initialize_walkability_guard_fixture(field, grid);
+    float scale = 1.0f;
+    float scale_velocity = 0.0f;
+    vec3 position(0.2f, 0.0f, 0.2f);
+    vec3 velocity(0.5f, 11.0f, 0.0f);
+    vec3 acceleration(0.0f, -12.0f, 0.0f);
+    float previous_speed = 0.5f;
+    bool saw_block = false;
+    for (int frame = 0; frame < 100; ++frame) {
+        traversability_diagnostics diagnostics = {};
+        const vec3 applied = traversability_limit_command(
+            scale, scale_velocity, diagnostics, grid, field, position,
+            vec3(0.5f, 0.0f, 0.0f), 1.0f / 25.0f);
+        check(walkability_xz_length(applied) <= previous_speed + 1e-6f ||
+                  !diagnostics.blocked,
+              "speed reduces near block");
+        previous_speed = walkability_xz_length(applied);
+        vec3 candidate = position + applied * (1.0f / 25.0f);
+        if (!traversability_clip_step(
+                position, candidate, velocity, acceleration,
+                diagnostics, grid, field, 0.20f)) {
+            saw_block = true;
+        }
+        position = candidate;
+        check(walkability_class_at(grid, field, position.x, position.z) != 0,
+              "guard center never enters blocked node");
+    }
+    check(saw_block || previous_speed < 0.01f,
+          "guard reaches a safe stop");
+    check(position.x < 0.50f,
+          "guard stops footprint before blocked x=0.7 node");
+}
+
+static std::vector<char> read_controller_source()
+{
+    std::string adjacent_path = __FILE__;
+    const std::string test_suffix =
+        "tests/cpp/test_terrain_runtime.cpp";
+    const size_t suffix_position = adjacent_path.rfind(test_suffix);
+    if (suffix_position != std::string::npos) {
+        adjacent_path.erase(suffix_position);
+        adjacent_path += "controller.cpp";
+    }
+    const char* paths[] = {
+        "controller.cpp",
+        "../../controller.cpp",
+        adjacent_path.c_str()
+    };
+    FILE* file = NULL;
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
+        file = fopen(paths[i], "rb");
+        if (file != NULL) break;
+    }
+    if (file == NULL) {
+        check(false, "controller source is available to data-flow regression");
+        return std::vector<char>(1, '\0');
+    }
+    check(fseek(file, 0, SEEK_END) == 0,
+          "controller source size seek");
+    const long size = ftell(file);
+    check(size >= 0, "controller source size");
+    check(fseek(file, 0, SEEK_SET) == 0,
+          "controller source rewind");
+    std::vector<char> source(static_cast<size_t>(size) + 1u, '\0');
+    check(size == 0 ||
+              fread(source.data(), 1, static_cast<size_t>(size), file) ==
+                  static_cast<size_t>(size),
+          "controller source read");
+    check(fclose(file) == 0, "controller source close");
+    return source;
+}
+
+static const char* require_source_token(
+    const char* begin, const char* token, const char* message)
+{
+    const char* found = strstr(begin, token);
+    check(found != NULL, message);
+    return found;
+}
+
+static void test_controller_traversability_guard_data_flow()
+{
+    const std::vector<char> source = read_controller_source();
+    const char* desired = require_source_token(
+        source.data(), "vec3 desired_velocity_curr = desired_velocity_update(",
+        "controller computes unguarded desired velocity");
+    const char* commanded = require_source_token(
+        desired, "const vec3 commanded_velocity = desired_velocity_curr;",
+        "controller preserves commanded velocity");
+    const char* limit = require_source_token(
+        commanded, "traversability_limit_command(",
+        "controller limits desired velocity");
+    const char* desired_state = require_source_token(
+        limit, "state.desired_velocity = desired_velocity_curr;",
+        "controller stores limited desired velocity");
+    const char* trajectory = require_source_token(
+        desired_state, "trajectory_desired_velocities_predict(",
+        "controller predicts trajectory from limited velocity");
+    const char* future_forward = require_source_token(
+        trajectory,
+        "simulation_fwrd_speed * state.traversal_speed_scale,",
+        "controller limits future forward trajectory speed");
+    const char* future_side = require_source_token(
+        future_forward,
+        "simulation_side_speed * state.traversal_speed_scale,",
+        "controller limits future side trajectory speed");
+    const char* future_back = require_source_token(
+        future_side,
+        "simulation_back_speed * state.traversal_speed_scale,",
+        "controller limits future back trajectory speed");
+    const char* matcher = require_source_token(
+        future_back, "const int query_database_frame = state.frame_index;",
+        "controller matching follows limited trajectory prediction");
+    check(commanded < limit && limit < desired_state &&
+              desired_state < trajectory && trajectory < future_forward &&
+              future_forward < future_side && future_side < future_back &&
+              future_back < matcher,
+          "limiting precedes trajectory prediction and matching");
+
+    const char* update = require_source_token(
+        matcher, "// Update Simulation",
+        "controller simulation update site");
+    const char* before = require_source_token(
+        update, "const vec3 simulation_before = state.simulation_position;",
+        "controller captures pre-integration simulation position");
+    const char* integrate = require_source_token(
+        before, "simulation_positions_update(",
+        "controller integrates simulation position");
+    const char* state_check = require_source_token(
+        integrate, "const bool integrated_state_is_finite =",
+        "controller checks all integrated state before clear fast path");
+    const char* preflight = require_source_token(
+        state_check,
+        "const walkability_sweep_result integrated_traversal = "
+        "walkability_sweep(",
+        "controller preflights the integrated traversal");
+    const char* conditional = require_source_token(
+        preflight,
+        "if (!integrated_state_is_finite || "
+        "integrated_traversal.blocked) {",
+        "controller enters hard clip on blocked or nonfinite integration");
+    const char* clip = require_source_token(
+        conditional, "traversability_clip_step(",
+        "controller clips immediately after integration");
+    const char* current = require_source_token(
+        clip, "walkability_footprint_class(",
+        "controller samples current footprint after clipping");
+    const char* rotate = require_source_token(
+        clip, "simulation_rotations_update(",
+        "controller rotation update follows planar clipping");
+    check(before < integrate && integrate < state_check &&
+              state_check < preflight && preflight < conditional &&
+              conditional < clip && clip < current && current < rotate,
+          "integration is immediately surrounded by capture and clip");
+    require_source_token(
+        current, "active_scene.walkability",
+        "current footprint uses active walkability grid");
+    require_source_token(
+        current, "active_scene.terrain",
+        "current footprint uses active v2 terrain");
+    require_source_token(
+        current, "state.simulation_position.x",
+        "current footprint samples clipped simulation x");
+    require_source_token(
+        current, "state.simulation_position.z",
+        "current footprint samples clipped simulation z");
+
+    const char* current_state = require_source_token(
+        current, "state.walkability_class = current_walkability_class;",
+        "controller stores current accepted footprint class");
+    const char* blocked_state = require_source_token(
+        clip, "state.blocked = traversal.blocked;",
+        "controller refreshes blocked state after clipping");
+    const char* distance_state = require_source_token(
+        clip, "state.blocked_distance = traversal.distance;",
+        "controller refreshes blocked distance after clipping");
+    const char* point_state = require_source_token(
+        clip, "state.blocked_point = traversal.point;",
+        "controller refreshes blocked point after clipping");
+    check(clip < current_state && clip < blocked_state &&
+              clip < distance_state && clip < point_state,
+          "post-clip traversal and current-footprint diagnostics are active");
 }
 
 static void test_f32_helpers_match_one_round_producer_operations()
@@ -2198,6 +2910,13 @@ int main(int argc, char** argv)
     test_support_loader_is_strict_transactional_and_frame_exact();
     test_walkability_loader_is_strict_transactional_and_grid_exact();
     test_walkability_binary32_half_cell_parity();
+    test_walkability_reason_names_are_stable();
+    test_walkability_footprint_is_conservative_and_release_safe();
+    test_walkability_sweep_handles_clear_blocked_and_hostile_steps();
+    test_traversability_command_limits_safely_and_recovers();
+    test_traversability_clip_is_planar_and_bit_preserving();
+    test_walkability_guard_reaches_safe_stop();
+    test_controller_traversability_guard_data_flow();
     test_payload_allocation_failures_are_actionable_and_transactional();
     test_f32_helpers_match_one_round_producer_operations();
     test_heightfield_versions_preserve_v1_and_use_v2_triangles();
