@@ -2606,6 +2606,737 @@ static void test_named_contact_residual_contract()
           "later residual failure rolls back complete pose and result");
 }
 
+static G1FootOrientationResult g1_test_orientation_result_sentinel()
+{
+    G1FootOrientationResult result = {};
+    result.applied = true;
+    result.correction_limited = true;
+    result.safe_stop_requested = true;
+    result.target_global_rotation = quat(0.5f, 0.5f, 0.5f, 0.5f);
+    result.requested_correction_radians = 7.0f;
+    result.correction_radians = 8.0f;
+    return result;
+}
+
+static bool g1_test_orientation_result_same(
+    const G1FootOrientationResult& left,
+    const G1FootOrientationResult& right)
+{
+    return left.applied == right.applied &&
+           left.correction_limited == right.correction_limited &&
+           left.safe_stop_requested == right.safe_stop_requested &&
+           g1_test_quat_bits_same(
+               left.target_global_rotation,
+               right.target_global_rotation) &&
+           g1_test_float_same(
+               left.requested_correction_radians,
+               right.requested_correction_radians) &&
+           g1_test_float_same(
+               left.correction_radians,
+               right.correction_radians);
+}
+
+static void g1_test_checked_global_pose(
+    array1d<vec3>& positions,
+    array1d<quat>& rotations,
+    const database& db,
+    const array1d<quat>& local_rotations,
+    char* error,
+    int error_capacity)
+{
+    positions.resize(G1_BoneCount);
+    rotations.resize(G1_BoneCount);
+    check(g1_ik_checked_forward_kinematics(
+              positions, rotations,
+              db.bone_positions(0), local_rotations,
+              db.bone_parents, error, error_capacity),
+          error);
+}
+
+static vec3 g1_test_projected_heading(
+    quat current_global_rotation,
+    const G1LegConfig& config,
+    vec3 surface_normal)
+{
+    vec3 current_heading;
+    double heading_dot = 0.0;
+    vec3 normal_component;
+    vec3 projected;
+    vec3 normalized;
+    check(ik_checked_quat_rotate(
+              current_heading,
+              current_global_rotation,
+              config.foot_forward_local) &&
+          ik_checked_dot(
+              heading_dot, current_heading, surface_normal) &&
+          ik_checked_vec3_scale(
+              normal_component, surface_normal, heading_dot) &&
+          ik_checked_vec3_subtract(
+              projected, current_heading, normal_component) &&
+          ik_checked_normalize(normalized, projected),
+          "test heading projection remains checked");
+    return normalized;
+}
+
+static void test_surface_aligned_named_foot_orientation()
+{
+    database db;
+    make_g1_database(db);
+    const G1LegConfig left = g1_left_leg_config();
+    const G1LegConfig right = g1_right_leg_config();
+    char error[256] = {};
+
+    array1d<quat> output = db.bone_rotations(0);
+    const array1d<quat> flat_before = output;
+    G1FootOrientationResult result = {};
+    check(g1_apply_named_foot_orientation(
+              output, db.bone_positions(0), db.bone_rotations(0),
+              db.bone_parents, left, vec3(0.0f, 1.0f, 0.0f),
+              result, error, static_cast<int>(sizeof(error))),
+          error);
+    check(result.applied && !result.correction_limited &&
+          !result.safe_stop_requested &&
+          result.requested_correction_radians == 0.0f &&
+          result.correction_radians == 0.0f,
+          "flat identity orientation is an exact no-op");
+    check(g1_test_pose_bytes_same(output, flat_before),
+          "flat identity preserves every pose byte");
+
+    const float angle = 10.0f * PIf / 180.0f;
+    const vec3 ramp_normal(
+        -std::sin(angle), std::cos(angle), 0.0f);
+    output = db.bone_rotations(0);
+    check(g1_apply_named_foot_orientation(
+              output, db.bone_positions(0), db.bone_rotations(0),
+              db.bone_parents, left, ramp_normal,
+              result, error, static_cast<int>(sizeof(error))),
+          error);
+    array1d<vec3> global_positions;
+    array1d<quat> global_rotations;
+    g1_test_checked_global_pose(
+        global_positions, global_rotations, db, output,
+        error, static_cast<int>(sizeof(error)));
+    vec3 ramp_up;
+    vec3 ramp_forward;
+    check(ik_checked_quat_rotate(
+              ramp_up, global_rotations(left.contact),
+              left.sole_normal_local) &&
+          ik_checked_quat_rotate(
+              ramp_forward, global_rotations(left.contact),
+              left.foot_forward_local),
+          "ramp foot axes remain checked");
+    check(dot(ramp_up, ramp_normal) > 0.9999f,
+          "left foot aligns to longitudinal ramp normal");
+    check(dot(
+              ramp_forward,
+              vec3(std::cos(angle), std::sin(angle), 0.0f)) > 0.9999f &&
+          std::fabs(dot(ramp_forward, ramp_normal)) < 1.0e-5f,
+          "longitudinal ramp preserves tangent heading");
+
+    const vec3 cross_normal(
+        0.0f, std::cos(angle), -std::sin(angle));
+    output = db.bone_rotations(0);
+    check(g1_apply_named_foot_orientation(
+              output, db.bone_positions(0), db.bone_rotations(0),
+              db.bone_parents, left, cross_normal,
+              result, error, static_cast<int>(sizeof(error))),
+          error);
+    g1_test_checked_global_pose(
+        global_positions, global_rotations, db, output,
+        error, static_cast<int>(sizeof(error)));
+    vec3 cross_up;
+    vec3 cross_forward;
+    check(ik_checked_quat_rotate(
+              cross_up, global_rotations(left.contact),
+              left.sole_normal_local) &&
+          ik_checked_quat_rotate(
+              cross_forward, global_rotations(left.contact),
+              left.foot_forward_local),
+          "cross-slope foot axes remain checked");
+    check(dot(cross_up, cross_normal) > 0.9999f,
+          "left foot aligns to cross-slope normal");
+    check(cross_forward.x > 0.999f &&
+          std::fabs(dot(cross_forward, cross_normal)) < 1.0e-5f,
+          "cross-slope preserves tangent heading");
+
+    const vec3 mirrored_cross_normal(
+        0.0f, std::cos(angle), std::sin(angle));
+    output = db.bone_rotations(0);
+    check(g1_apply_named_foot_orientation(
+              output, db.bone_positions(0), db.bone_rotations(0),
+              db.bone_parents, right, mirrored_cross_normal,
+              result, error, static_cast<int>(sizeof(error))),
+          error);
+    g1_test_checked_global_pose(
+        global_positions, global_rotations, db, output,
+        error, static_cast<int>(sizeof(error)));
+    vec3 right_up;
+    check(ik_checked_quat_rotate(
+              right_up, global_rotations(right.contact),
+              right.sole_normal_local),
+          "right-foot normal remains checked");
+    check(dot(right_up, mirrored_cross_normal) > 0.9999f &&
+          result.applied && !result.safe_stop_requested,
+          "mirrored right foot aligns without a limit");
+}
+
+static void test_surface_orientation_staged_pose_and_fallback()
+{
+    database db;
+    make_g1_database(db);
+    const G1LegConfig left = g1_left_leg_config();
+    const G1LegConfig right = g1_right_leg_config();
+    char error[256] = {};
+
+    array1d<quat> working = db.bone_rotations(0);
+    working(G1_Hips) = quat_from_angle_axis(
+        0.08f, vec3(0.0f, 1.0f, 0.0f));
+    working(left.hip) = quat_from_angle_axis(
+        0.03f, vec3(0.0f, 0.0f, 1.0f));
+    working(left.knee) = quat_from_angle_axis(
+        -0.02f, vec3(0.0f, 0.0f, 1.0f));
+    working(left.contact) = quat_from_angle_axis(
+        0.12f, vec3(0.0f, 1.0f, 0.0f));
+    working(right.hip) = quat_from_angle_axis(
+        0.06f, vec3(1.0f, 0.0f, 0.0f));
+    working(right.knee) = quat_from_angle_axis(
+        -0.04f, vec3(0.0f, 0.0f, 1.0f));
+    const array1d<quat> before = working;
+
+    array1d<vec3> before_global_positions;
+    array1d<quat> before_global_rotations;
+    g1_test_checked_global_pose(
+        before_global_positions, before_global_rotations,
+        db, working, error, static_cast<int>(sizeof(error)));
+    const float angle = 6.0f * PIf / 180.0f;
+    const vec3 surface_normal(
+        0.0f, std::cos(angle), -std::sin(angle));
+    const vec3 expected_heading = g1_test_projected_heading(
+        before_global_rotations(left.contact), left, surface_normal);
+
+    G1FootOrientationResult result = {};
+    check(g1_apply_named_foot_orientation(
+              working, db.bone_positions(0), db.bone_rotations(0),
+              db.bone_parents, left, surface_normal,
+              result, error, static_cast<int>(sizeof(error))),
+          error);
+    for (int bone = 0; bone < G1_BoneCount; ++bone) {
+        if (bone != left.contact) {
+            check(g1_test_quat_bits_same(working(bone), before(bone)),
+                  "orientation changes only the named contact bone");
+        }
+    }
+    check(g1_test_quat_bits_same(
+              working(right.hip), before(right.hip)) &&
+          g1_test_quat_bits_same(
+              working(right.knee), before(right.knee)),
+          "orientation preserves a staged second leg");
+
+    array1d<vec3> after_global_positions;
+    array1d<quat> after_global_rotations;
+    g1_test_checked_global_pose(
+        after_global_positions, after_global_rotations,
+        db, working, error, static_cast<int>(sizeof(error)));
+    vec3 actual_up;
+    vec3 actual_forward;
+    check(ik_checked_quat_rotate(
+              actual_up, after_global_rotations(left.contact),
+              left.sole_normal_local) &&
+          ik_checked_quat_rotate(
+              actual_forward, after_global_rotations(left.contact),
+              left.foot_forward_local),
+          "staged-pose output axes remain checked");
+    check(dot(actual_up, surface_normal) > 0.9999f &&
+          dot(actual_forward, expected_heading) > 0.9999f,
+          "arbitrary parent/current heading is aligned and preserved");
+
+    working = db.bone_rotations(0);
+    working(left.contact) = quat_from_angle_axis(
+        0.5f * PIf - 5.0e-7f, vec3(0.0f, 0.0f, 1.0f));
+    check(g1_apply_named_foot_orientation(
+              working, db.bone_positions(0), db.bone_rotations(0),
+              db.bone_parents, left, vec3(0.0f, 1.0f, 0.0f),
+              result, error, static_cast<int>(sizeof(error))),
+          error);
+    vec3 fallback_forward;
+    vec3 fallback_up;
+    check(ik_checked_quat_rotate(
+              fallback_forward, result.target_global_rotation,
+              left.foot_forward_local) &&
+          ik_checked_quat_rotate(
+              fallback_up, result.target_global_rotation,
+              left.sole_normal_local),
+          "fallback target axes remain checked");
+    check(fallback_forward.x > 0.9999f &&
+          dot(fallback_up, vec3(0.0f, 1.0f, 0.0f)) > 0.9999f,
+          "near-degenerate projected heading uses deterministic tangent fallback");
+
+    const quat vertical_heading = quat_from_angle_axis(
+        0.5f * PIf, vec3(0.0f, 0.0f, 1.0f));
+    vec3 exact_direction;
+    vec3 exact_normal;
+    check(ik_checked_quat_rotate(
+              exact_direction, vertical_heading,
+              left.foot_forward_local) &&
+          ik_checked_normalize(exact_normal, exact_direction),
+          "exact-degenerate fixture remains checked");
+    quat exact_target = quat(0.5f, 0.5f, 0.5f, 0.5f);
+    check(g1_surface_aligned_foot_rotation(
+              exact_target, vertical_heading, left, exact_normal,
+              error, static_cast<int>(sizeof(error))),
+          error);
+    vec3 exact_target_up;
+    check(ik_checked_quat_rotate(
+              exact_target_up, exact_target,
+              left.sole_normal_local),
+          "exact-degenerate fallback target remains checked");
+    check(dot(exact_target_up, exact_normal) > 0.9999f,
+          "exact-degenerate heading also uses a valid deterministic fallback");
+}
+
+static void test_surface_orientation_limit_semantics()
+{
+    database db;
+    make_g1_database(db);
+    const G1LegConfig leg = g1_left_leg_config();
+    char error[256] = {};
+    array1d<quat> output = db.bone_rotations(0);
+    G1FootOrientationResult result = {};
+
+    float boundary_angle = leg.max_correction_radians;
+    for (int step = 0; step < 64; ++step) {
+        const vec3 normal(
+            -std::sin(boundary_angle),
+            std::cos(boundary_angle), 0.0f);
+        g1_test_copy_g1_pose(output, db.bone_rotations(0));
+        check(g1_apply_named_foot_orientation(
+                  output, db.bone_positions(0), db.bone_rotations(0),
+                  db.bone_parents, leg, normal,
+                  result, error, static_cast<int>(sizeof(error))),
+              error);
+        if (!result.correction_limited) break;
+        boundary_angle = std::nextafter(boundary_angle, 0.0f);
+    }
+    check(!result.correction_limited && !result.safe_stop_requested &&
+          result.requested_correction_radians <=
+              leg.max_correction_radians &&
+          result.correction_radians <= leg.max_correction_radians,
+          "largest discovered boundary correction remains unlimited");
+
+    float over_angle = std::nextafter(
+        boundary_angle, std::numeric_limits<float>::infinity());
+    for (int step = 0; step < 64; ++step) {
+        const vec3 normal(
+            -std::sin(over_angle), std::cos(over_angle), 0.0f);
+        g1_test_copy_g1_pose(output, db.bone_rotations(0));
+        check(g1_apply_named_foot_orientation(
+                  output, db.bone_positions(0), db.bone_rotations(0),
+                  db.bone_parents, leg, normal,
+                  result, error, static_cast<int>(sizeof(error))),
+              error);
+        if (result.correction_limited) break;
+        over_angle = std::nextafter(
+            over_angle, std::numeric_limits<float>::infinity());
+    }
+    check(result.correction_limited && result.safe_stop_requested &&
+          result.requested_correction_radians >
+              leg.max_correction_radians &&
+          result.correction_radians <= leg.max_correction_radians,
+          "first discovered over-limit correction clamps and safe-stops");
+    IKClampResult independent = {};
+    check(ik_clamp_local_delta(
+              independent,
+              db.bone_rotations(0, leg.contact),
+              result.target_global_rotation,
+              leg.max_correction_radians),
+          "orientation result remains independently clampable");
+    check(g1_test_quat_bits_same(
+              output(leg.contact), independent.value) &&
+          g1_test_float_same(
+              result.requested_correction_radians,
+              independent.requested_radians) &&
+          g1_test_float_same(
+              result.correction_radians,
+              independent.actual_radians) &&
+          result.correction_limited == independent.limited,
+          "orientation reports exact generic-clamp semantics");
+
+    const float steep = 45.0f * PIf / 180.0f;
+    output = db.bone_rotations(0);
+    const array1d<quat> steep_before = output;
+    check(g1_apply_named_foot_orientation(
+              output, db.bone_positions(0), db.bone_rotations(0),
+              db.bone_parents, leg,
+              vec3(-std::sin(steep), std::cos(steep), 0.0f),
+              result, error, static_cast<int>(sizeof(error))),
+          error);
+    check(result.correction_limited && result.safe_stop_requested &&
+          result.correction_radians <= leg.max_correction_radians,
+          "steep correction remains bounded and requests safe stop");
+    for (int bone = 0; bone < G1_BoneCount; ++bone) {
+        if (bone != leg.contact) {
+            check(g1_test_quat_bits_same(
+                      output(bone), steep_before(bone)),
+                  "limited orientation changes only named contact");
+        }
+    }
+}
+
+static void test_surface_orientation_hostile_rollback()
+{
+    database db;
+    make_g1_database(db);
+    const G1LegConfig leg = g1_left_leg_config();
+    char error[256] = {};
+    const float nan = g1_test_float_from_bits(UINT32_C(0x7fc00001));
+    const float subnormal = g1_test_float_from_bits(UINT32_C(0x00000001));
+
+    quat aliased_direct = quat(0.5f, 0.5f, 0.5f, 0.5f);
+    const quat aliased_direct_before = aliased_direct;
+    char* const direct_error_alias =
+        reinterpret_cast<char*>(&aliased_direct) + 3;
+    check(!g1_surface_aligned_foot_rotation(
+              aliased_direct, quat(), leg, vec3(),
+              direct_error_alias, 1),
+          "direct diagnostic aliasing quaternion is rejected");
+    check(g1_test_quat_bits_same(
+              aliased_direct, aliased_direct_before),
+          "direct diagnostic alias preserves quaternion bytes");
+
+    const vec3 invalid_normals[] = {
+        vec3(),
+        vec3(1.0f, 0.0f, 0.0f),
+        vec3(0.0f, -1.0f, 0.0f),
+        vec3(0.0f, 2.0f, 0.0f),
+        vec3(0.0f, 1.001f, 0.0f),
+        vec3(subnormal, 1.0f, 0.0f),
+        vec3(nan, 1.0f, 0.0f),
+        vec3(std::numeric_limits<float>::infinity(), 1.0f, 0.0f)
+    };
+    for (size_t index = 0;
+         index < sizeof(invalid_normals) / sizeof(invalid_normals[0]);
+         ++index) {
+        quat direct = quat(0.5f, 0.5f, 0.5f, 0.5f);
+        const quat direct_before = direct;
+        check(!g1_surface_aligned_foot_rotation(
+                  direct, quat(), leg, invalid_normals[index],
+                  error, static_cast<int>(sizeof(error))),
+              "invalid surface normal is rejected");
+        check(g1_test_quat_bits_same(direct, direct_before),
+              "direct normal failure preserves quaternion output");
+
+        array1d<quat> pose = db.bone_rotations(0);
+        const array1d<quat> pose_before = pose;
+        G1FootOrientationResult result =
+            g1_test_orientation_result_sentinel();
+        const G1FootOrientationResult result_before = result;
+        check(!g1_apply_named_foot_orientation(
+                  pose, db.bone_positions(0), db.bone_rotations(0),
+                  db.bone_parents, leg, invalid_normals[index],
+                  result, error, static_cast<int>(sizeof(error))),
+              "invalid normal fails named orientation");
+        check(g1_test_pose_bytes_same(pose, pose_before) &&
+              g1_test_orientation_result_same(result, result_before),
+              "invalid normal rolls back pose and result");
+    }
+
+    const quat invalid_quaternions[] = {
+        quat(0.0f, 0.0f, 0.0f, 0.0f),
+        quat(2.0f, 0.0f, 0.0f, 0.0f),
+        quat(1.0f, subnormal, 0.0f, 0.0f),
+        quat(nan, 0.0f, 0.0f, 0.0f),
+        quat(std::numeric_limits<float>::infinity(), 0.0f, 0.0f, 0.0f)
+    };
+    for (size_t index = 0;
+         index < sizeof(invalid_quaternions) /
+             sizeof(invalid_quaternions[0]);
+         ++index) {
+        quat direct = quat(0.5f, 0.5f, 0.5f, 0.5f);
+        const quat direct_before = direct;
+        check(!g1_surface_aligned_foot_rotation(
+                  direct, invalid_quaternions[index], leg,
+                  vec3(0.0f, 1.0f, 0.0f),
+                  error, static_cast<int>(sizeof(error))),
+              "invalid current quaternion is rejected");
+        check(g1_test_quat_bits_same(direct, direct_before),
+              "invalid current quaternion preserves direct output");
+    }
+
+    G1LegConfig bad_config = leg;
+    bad_config.contact = G1_BoneCount;
+    array1d<quat> pose = db.bone_rotations(0);
+    const array1d<quat> pose_before = pose;
+    G1FootOrientationResult result =
+        g1_test_orientation_result_sentinel();
+    const G1FootOrientationResult result_before = result;
+    check(!g1_apply_named_foot_orientation(
+              pose, db.bone_positions(0), db.bone_rotations(0),
+              db.bone_parents, bad_config,
+              vec3(0.0f, 1.0f, 0.0f), result,
+              error, static_cast<int>(sizeof(error))),
+          "out-of-range contact config is rejected before indexing");
+    check(g1_test_pose_bytes_same(pose, pose_before) &&
+          g1_test_orientation_result_same(result, result_before),
+          "invalid config rolls back complete outputs");
+
+    bad_config = leg;
+    bad_config.foot_forward_local = vec3(0.0f, 2.0f, 0.0f);
+    quat direct = quat(0.5f, 0.5f, 0.5f, 0.5f);
+    const quat direct_before = direct;
+    check(!g1_surface_aligned_foot_rotation(
+              direct, quat(), bad_config,
+              vec3(0.0f, 1.0f, 0.0f),
+              error, static_cast<int>(sizeof(error))) &&
+          g1_test_quat_bits_same(direct, direct_before),
+          "malformed configured axes fail direct orientation transactionally");
+
+    bad_config = leg;
+    bad_config.name = NULL;
+    pose = db.bone_rotations(0);
+    result = result_before;
+    check(!g1_apply_named_foot_orientation(
+              pose, db.bone_positions(0), db.bone_rotations(0),
+              db.bone_parents, bad_config,
+              vec3(0.0f, 1.0f, 0.0f), result,
+              error, static_cast<int>(sizeof(error))),
+          "null config name is rejected before indexing");
+    check(g1_test_pose_bytes_same(pose, pose_before) &&
+          g1_test_orientation_result_same(result, result_before),
+          "null config name preserves outputs");
+
+    const struct {
+        int output_size;
+        quat* output_data;
+        int position_size;
+        vec3* position_data;
+        int baseline_size;
+        quat* baseline_data;
+        int parent_size;
+        int* parent_data;
+    } invalid_slices[] = {
+        {G1_BoneCount, NULL, G1_BoneCount, db.bone_positions(0).data,
+         G1_BoneCount, db.bone_rotations(0).data,
+         G1_BoneCount, db.bone_parents.data},
+        {G1_BoneCount - 1, pose.data,
+         G1_BoneCount, db.bone_positions(0).data,
+         G1_BoneCount, db.bone_rotations(0).data,
+         G1_BoneCount, db.bone_parents.data},
+        {G1_BoneCount, pose.data, G1_BoneCount, NULL,
+         G1_BoneCount, db.bone_rotations(0).data,
+         G1_BoneCount, db.bone_parents.data},
+        {G1_BoneCount, pose.data,
+         G1_BoneCount - 1, db.bone_positions(0).data,
+         G1_BoneCount, db.bone_rotations(0).data,
+         G1_BoneCount, db.bone_parents.data},
+        {G1_BoneCount, pose.data,
+         G1_BoneCount, db.bone_positions(0).data,
+         G1_BoneCount, NULL,
+         G1_BoneCount, db.bone_parents.data},
+        {G1_BoneCount, pose.data,
+         G1_BoneCount, db.bone_positions(0).data,
+         G1_BoneCount - 1, db.bone_rotations(0).data,
+         G1_BoneCount, db.bone_parents.data},
+        {G1_BoneCount, pose.data,
+         G1_BoneCount, db.bone_positions(0).data,
+         G1_BoneCount, db.bone_rotations(0).data,
+         G1_BoneCount, NULL},
+        {G1_BoneCount, pose.data,
+         G1_BoneCount, db.bone_positions(0).data,
+         G1_BoneCount, db.bone_rotations(0).data,
+         G1_BoneCount - 1, db.bone_parents.data}
+    };
+    for (size_t index = 0;
+         index < sizeof(invalid_slices) / sizeof(invalid_slices[0]);
+         ++index) {
+        pose = db.bone_rotations(0);
+        const array1d<quat> before = pose;
+        result = result_before;
+        check(!g1_apply_named_foot_orientation(
+                  slice1d<quat>(
+                      invalid_slices[index].output_size,
+                      invalid_slices[index].output_data),
+                  slice1d<vec3>(
+                      invalid_slices[index].position_size,
+                      invalid_slices[index].position_data),
+                  slice1d<quat>(
+                      invalid_slices[index].baseline_size,
+                      invalid_slices[index].baseline_data),
+                  slice1d<int>(
+                      invalid_slices[index].parent_size,
+                      invalid_slices[index].parent_data),
+                  leg, vec3(0.0f, 1.0f, 0.0f),
+                  result, error, static_cast<int>(sizeof(error))),
+              "null or short orientation slice is rejected");
+        check(g1_test_pose_bytes_same(pose, before) &&
+              g1_test_orientation_result_same(result, result_before),
+              "slice preflight failure preserves outputs");
+    }
+
+    array1d<quat> overlap_storage(G1_BoneCount + 1);
+    overlap_storage.set(quat());
+    result = result_before;
+    check(!g1_apply_named_foot_orientation(
+              slice1d<quat>(G1_BoneCount, overlap_storage.data + 1),
+              db.bone_positions(0),
+              slice1d<quat>(G1_BoneCount, overlap_storage.data),
+              db.bone_parents, leg, vec3(0.0f, 1.0f, 0.0f),
+              result, error, static_cast<int>(sizeof(error))),
+          "partial working/baseline alias is rejected");
+    check(g1_test_orientation_result_same(result, result_before),
+          "partial alias preserves result output");
+
+    result = result_before;
+    check(!g1_apply_named_foot_orientation(
+              slice1d<quat>(
+                  G1_BoneCount,
+                  reinterpret_cast<quat*>(db.bone_positions(0).data)),
+              db.bone_positions(0), db.bone_rotations(0),
+              db.bone_parents, leg, vec3(0.0f, 1.0f, 0.0f),
+              result, error, static_cast<int>(sizeof(error))),
+          "working pose aliasing local positions is rejected before reads");
+    check(g1_test_orientation_result_same(result, result_before),
+          "cross-type position alias preserves result");
+
+    result = result_before;
+    check(!g1_apply_named_foot_orientation(
+              slice1d<quat>(
+                  G1_BoneCount,
+                  reinterpret_cast<quat*>(db.bone_parents.data)),
+              db.bone_positions(0), db.bone_rotations(0),
+              db.bone_parents, leg, vec3(0.0f, 1.0f, 0.0f),
+              result, error, static_cast<int>(sizeof(error))),
+          "working pose aliasing parents is rejected before reads");
+    check(g1_test_orientation_result_same(result, result_before),
+          "cross-type parent alias preserves result");
+
+    G1LegConfig aliased_config = leg;
+    unsigned char aliased_config_before[sizeof(G1LegConfig)] = {};
+    std::memcpy(
+        aliased_config_before, &aliased_config,
+        sizeof(aliased_config));
+    result = result_before;
+    check(!g1_apply_named_foot_orientation(
+              slice1d<quat>(
+                  G1_BoneCount,
+                  reinterpret_cast<quat*>(&aliased_config)),
+              db.bone_positions(0), db.bone_rotations(0),
+              db.bone_parents, aliased_config,
+              vec3(0.0f, 1.0f, 0.0f),
+              result, error, static_cast<int>(sizeof(error))),
+          "working pose aliasing immutable config is rejected before reads");
+    check(std::memcmp(
+              &aliased_config, aliased_config_before,
+              sizeof(aliased_config)) == 0 &&
+          g1_test_orientation_result_same(result, result_before),
+          "config alias preserves immutable config and result bytes");
+
+    pose = db.bone_rotations(0);
+    pose(G1_Spine) = quat(2.0f, 0.0f, 0.0f, 0.0f);
+    const array1d<quat> invalid_working_before = pose;
+    result = result_before;
+    check(!g1_apply_named_foot_orientation(
+              pose, db.bone_positions(0), db.bone_rotations(0),
+              db.bone_parents, leg, vec3(0.0f, 1.0f, 0.0f),
+              result, error, static_cast<int>(sizeof(error))),
+          "invalid staged quaternion is rejected");
+    check(g1_test_pose_bytes_same(pose, invalid_working_before) &&
+          g1_test_orientation_result_same(result, result_before),
+          "invalid staged quaternion rolls back outputs");
+
+    array1d<quat> invalid_baseline = db.bone_rotations(0);
+    invalid_baseline(leg.contact) = quat(0.0f, 0.0f, 0.0f, 0.0f);
+    pose = db.bone_rotations(0);
+    const array1d<quat> invalid_baseline_pose_before = pose;
+    result = result_before;
+    check(!g1_apply_named_foot_orientation(
+              pose, db.bone_positions(0), invalid_baseline,
+              db.bone_parents, leg, vec3(0.0f, 1.0f, 0.0f),
+              result, error, static_cast<int>(sizeof(error))),
+          "invalid immutable baseline quaternion is rejected");
+    check(g1_test_pose_bytes_same(pose, invalid_baseline_pose_before) &&
+          g1_test_orientation_result_same(result, result_before),
+          "invalid baseline quaternion rolls back outputs");
+
+    array1d<quat> tolerated_baseline = db.bone_rotations(0);
+    tolerated_baseline(leg.contact) =
+        quat(0.99999f, 0.0f, 0.0f, 0.0f);
+    pose = tolerated_baseline;
+    result = {};
+    check(g1_apply_named_foot_orientation(
+              pose, db.bone_positions(0), tolerated_baseline,
+              db.bone_parents, leg, vec3(0.0f, 1.0f, 0.0f),
+              result, error, static_cast<int>(sizeof(error))),
+          error);
+    check(result.applied &&
+          result.requested_correction_radians == 0.0f &&
+          result.correction_radians == 0.0f &&
+          g1_test_quat_bits_same(pose(leg.contact), quat()),
+          "admitted quaternion tolerance is normalized without false correction");
+
+    database bad_parent;
+    make_g1_database(bad_parent);
+    bad_parent.bone_parents(G1_LeftToe) = G1_LeftKnee;
+    pose = db.bone_rotations(0);
+    const array1d<quat> bad_parent_before = pose;
+    result = result_before;
+    check(!g1_apply_named_foot_orientation(
+              pose, db.bone_positions(0), db.bone_rotations(0),
+              bad_parent.bone_parents, leg,
+              vec3(0.0f, 1.0f, 0.0f),
+              result, error, static_cast<int>(sizeof(error))),
+          "invalid parent topology is rejected");
+    check(g1_test_pose_bytes_same(pose, bad_parent_before) &&
+          g1_test_orientation_result_same(result, result_before),
+          "parent failure rolls back complete outputs");
+
+    database extreme;
+    make_g1_database(extreme);
+    extreme.bone_positions(0, G1_Hips) =
+        vec3(3.0e38f, 3.0e38f, 3.0e38f);
+    extreme.bone_positions(0, G1_Spine) =
+        vec3(3.0e38f, 3.0e38f, 3.0e38f);
+    pose = db.bone_rotations(0);
+    const array1d<quat> extreme_before = pose;
+    result = result_before;
+    check(!g1_apply_named_foot_orientation(
+              pose, extreme.bone_positions(0), db.bone_rotations(0),
+              db.bone_parents, leg, vec3(0.0f, 1.0f, 0.0f),
+              result, error, static_cast<int>(sizeof(error))),
+          "unsafe checked-FK intermediate is rejected");
+    check(g1_test_pose_bytes_same(pose, extreme_before) &&
+          g1_test_orientation_result_same(result, result_before),
+          "late checked-FK failure remains transactional");
+
+    char one_byte[1] = {'x'};
+    pose = db.bone_rotations(0);
+    result = result_before;
+    check(!g1_apply_named_foot_orientation(
+              pose, db.bone_positions(0), db.bone_rotations(0),
+              db.bone_parents, bad_config,
+              vec3(0.0f, 1.0f, 0.0f),
+              result, one_byte, 1),
+          "short diagnostic buffer is safe");
+    check(one_byte[0] == '\0' &&
+          g1_test_pose_bytes_same(pose, pose_before) &&
+          g1_test_orientation_result_same(result, result_before),
+          "short diagnostic preserves transactional outputs");
+
+    pose = db.bone_rotations(0);
+    const array1d<quat> aliased_error_before = pose;
+    result = result_before;
+    char* const aliased_error =
+        reinterpret_cast<char*>(pose.data) + 2;
+    check(!g1_apply_named_foot_orientation(
+              slice1d<quat>(G1_BoneCount - 1, pose.data),
+              db.bone_positions(0), db.bone_rotations(0),
+              db.bone_parents, leg, vec3(0.0f, 1.0f, 0.0f),
+              result, aliased_error, 1),
+          "shape diagnostic aliasing pose is rejected without writing");
+    check(g1_test_pose_bytes_same(pose, aliased_error_before) &&
+          g1_test_orientation_result_same(result, result_before),
+          "aliased shape diagnostic preserves pose and result bytes");
+}
+
 int main()
 {
     test_explicit_leg_geometry();
@@ -2620,5 +3351,9 @@ int main()
     test_named_solver_success_and_bend_mapping();
     test_named_solver_preflight_and_rollback();
     test_named_contact_residual_contract();
+    test_surface_aligned_named_foot_orientation();
+    test_surface_orientation_staged_pose_and_fallback();
+    test_surface_orientation_limit_semantics();
+    test_surface_orientation_hostile_rollback();
     return 0;
 }

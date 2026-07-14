@@ -1850,3 +1850,452 @@ static inline bool g1_apply_named_contact_position_ik(
     output = aggregate;
     return true;
 }
+
+struct G1FootOrientationResult
+{
+    bool applied = false;
+    bool correction_limited = false;
+    bool safe_stop_requested = false;
+    quat target_global_rotation;
+    float requested_correction_radians = 0.0f;
+    float correction_radians = 0.0f;
+};
+
+static inline bool g1_ik_checked_quat_from_xy(
+    quat& output, vec3 forward, vec3 up)
+{
+    if (!ik_vec3_is_unit(forward) || !ik_vec3_is_unit(up)) {
+        return false;
+    }
+    double forward_up = 0.0;
+    vec3 side;
+    vec3 corrected_forward;
+    if (!ik_checked_dot(forward_up, forward, up) ||
+        fabs(forward_up) > 2.0e-5 ||
+        !ik_checked_cross(side, forward, up) ||
+        !ik_checked_normalize(side, side) ||
+        !ik_checked_cross(corrected_forward, up, side) ||
+        !ik_checked_normalize(corrected_forward, corrected_forward)) {
+        return false;
+    }
+
+    const double c0x = static_cast<double>(corrected_forward.x);
+    const double c0y = static_cast<double>(corrected_forward.y);
+    const double c0z = static_cast<double>(corrected_forward.z);
+    const double c1x = static_cast<double>(up.x);
+    const double c1y = static_cast<double>(up.y);
+    const double c1z = static_cast<double>(up.z);
+    const double c2x = static_cast<double>(side.x);
+    const double c2y = static_cast<double>(side.y);
+    const double c2z = static_cast<double>(side.z);
+    quat candidate;
+    if (c2z < 0.0) {
+        if (c0x > c1y) {
+            if (!ik_checked_quat_from_double(
+                    candidate,
+                    c1z - c2y,
+                    1.0 + c0x - c1y - c2z,
+                    c0y + c1x,
+                    c2x + c0z)) {
+                return false;
+            }
+        } else if (!ik_checked_quat_from_double(
+                       candidate,
+                       c2x - c0z,
+                       c0y + c1x,
+                       1.0 - c0x + c1y - c2z,
+                       c1z + c2y)) {
+            return false;
+        }
+    } else if (c0x < -c1y) {
+        if (!ik_checked_quat_from_double(
+                candidate,
+                c0y - c1x,
+                c2x + c0z,
+                c1z + c2y,
+                1.0 - c0x - c1y + c2z)) {
+            return false;
+        }
+    } else if (!ik_checked_quat_from_double(
+                   candidate,
+                   1.0 + c0x + c1y + c2z,
+                   c1z - c2y,
+                   c2x - c0z,
+                   c0y - c1x)) {
+        return false;
+    }
+
+    vec3 mapped_forward;
+    vec3 mapped_up;
+    double forward_alignment = 0.0;
+    double up_alignment = 0.0;
+    if (!ik_checked_quat_rotate(
+            mapped_forward, candidate, vec3(1.0f, 0.0f, 0.0f)) ||
+        !ik_checked_quat_rotate(
+            mapped_up, candidate, vec3(0.0f, 1.0f, 0.0f)) ||
+        !ik_checked_dot(
+            forward_alignment, mapped_forward, corrected_forward) ||
+        !ik_checked_dot(up_alignment, mapped_up, up) ||
+        forward_alignment < 0.99999 || up_alignment < 0.99999) {
+        return false;
+    }
+    output = candidate;
+    return true;
+}
+
+static inline bool g1_surface_aligned_foot_rotation(
+    quat& output,
+    quat current_global_rotation,
+    const G1LegConfig& config,
+    vec3 surface_normal,
+    char* error,
+    int error_capacity)
+{
+    const bool error_alias = error != NULL && error_capacity > 0 &&
+        (g1_ik_memory_ranges_overlap(
+             error, static_cast<size_t>(error_capacity),
+             &output, sizeof(output)) ||
+         g1_ik_memory_ranges_overlap(
+             error, static_cast<size_t>(error_capacity),
+             &config, sizeof(config)));
+    if (error_alias) {
+        return false;
+    }
+    if (g1_ik_memory_ranges_overlap(
+            &output, sizeof(output), &config, sizeof(config))) {
+        return g1_ik_error(
+            error, error_capacity,
+            "G1 foot orientation output must not alias its config");
+    }
+    if (!g1_foot_runtime_config_validate(
+            config, error, error_capacity)) {
+        return false;
+    }
+    if (!ik_quat_is_unit(current_global_rotation)) {
+        return g1_ik_error(
+            error, error_capacity,
+            "%s foot orientation received a non-finite/non-unit rotation",
+            config.name);
+    }
+    if (!g1_ik_surface_normal_is_valid(surface_normal)) {
+        return g1_ik_error(
+            error, error_capacity,
+            "%s foot orientation requires an upward unit surface normal",
+            config.name);
+    }
+
+    vec3 up;
+    vec3 current_forward;
+    double projection_dot = 0.0;
+    vec3 normal_component;
+    vec3 projected_forward;
+    double projected_length = 0.0;
+    float rounded_projected_length = 0.0f;
+    if (!ik_checked_normalize(up, surface_normal) ||
+        !ik_checked_quat_rotate(
+            current_forward,
+            current_global_rotation,
+            config.foot_forward_local) ||
+        !ik_checked_dot(projection_dot, current_forward, up) ||
+        !ik_checked_vec3_scale(
+            normal_component, up, projection_dot) ||
+        !ik_checked_vec3_subtract(
+            projected_forward, current_forward, normal_component) ||
+        !ik_checked_vec3_norm(
+            projected_length,
+            rounded_projected_length,
+            projected_forward)) {
+        return g1_ik_error(
+            error, error_capacity,
+            "%s foot orientation heading projection overflowed",
+            config.name);
+    }
+    vec3 forward;
+    if (projected_length < 1.0e-6) {
+        const vec3 fallback_axis =
+            fabs(static_cast<double>(up.x)) < 0.75
+                ? vec3(1.0f, 0.0f, 0.0f)
+                : vec3(0.0f, 0.0f, 1.0f);
+        double fallback_dot = 0.0;
+        vec3 fallback_normal_component;
+        vec3 fallback_projected;
+        if (!ik_checked_dot(fallback_dot, fallback_axis, up) ||
+            !ik_checked_vec3_scale(
+                fallback_normal_component, up, fallback_dot) ||
+            !ik_checked_vec3_subtract(
+                fallback_projected,
+                fallback_axis,
+                fallback_normal_component) ||
+            !ik_checked_normalize(forward, fallback_projected)) {
+            return g1_ik_error(
+                error, error_capacity,
+                "%s foot orientation fallback heading is invalid",
+                config.name);
+        }
+    } else if (!ik_checked_normalize(forward, projected_forward)) {
+        return g1_ik_error(
+            error, error_capacity,
+            "%s foot orientation could not normalize its heading",
+            config.name);
+    }
+
+    quat candidate;
+    if (!g1_ik_checked_quat_from_xy(candidate, forward, up)) {
+        return g1_ik_error(
+            error, error_capacity,
+            "%s foot orientation produced an invalid target frame",
+            config.name);
+    }
+    output = candidate;
+    return true;
+}
+
+static inline bool g1_ik_orientation_aliases_inputs(
+    const slice1d<quat> output_rotations,
+    const slice1d<vec3> local_positions,
+    const slice1d<quat> baseline_rotations,
+    const slice1d<int> parents,
+    G1FootOrientationResult& output,
+    const G1LegConfig& config,
+    char* error,
+    int error_capacity)
+{
+    const size_t rotation_bytes =
+        static_cast<size_t>(G1_BoneCount) * sizeof(quat);
+    const size_t position_bytes =
+        static_cast<size_t>(G1_BoneCount) * sizeof(vec3);
+    const size_t parent_bytes =
+        static_cast<size_t>(G1_BoneCount) * sizeof(int);
+    const bool pose_alias =
+        g1_ik_memory_ranges_overlap(
+            output_rotations.data, rotation_bytes,
+            baseline_rotations.data, rotation_bytes) ||
+        g1_ik_memory_ranges_overlap(
+            output_rotations.data, rotation_bytes,
+            local_positions.data, position_bytes) ||
+        g1_ik_memory_ranges_overlap(
+            output_rotations.data, rotation_bytes,
+            parents.data, parent_bytes) ||
+        g1_ik_memory_ranges_overlap(
+            output_rotations.data, rotation_bytes,
+            &config, sizeof(config));
+    const bool result_alias =
+        g1_ik_memory_ranges_overlap(
+            &output, sizeof(output),
+            output_rotations.data, rotation_bytes) ||
+        g1_ik_memory_ranges_overlap(
+            &output, sizeof(output),
+            baseline_rotations.data, rotation_bytes) ||
+        g1_ik_memory_ranges_overlap(
+            &output, sizeof(output),
+            local_positions.data, position_bytes) ||
+        g1_ik_memory_ranges_overlap(
+            &output, sizeof(output),
+            parents.data, parent_bytes) ||
+        g1_ik_memory_ranges_overlap(
+            &output, sizeof(output), &config, sizeof(config));
+    bool error_alias = false;
+    if (error != NULL && error_capacity > 0) {
+        const size_t error_bytes = static_cast<size_t>(error_capacity);
+        error_alias =
+            g1_ik_memory_ranges_overlap(
+                error, error_bytes,
+                output_rotations.data, rotation_bytes) ||
+            g1_ik_memory_ranges_overlap(
+                error, error_bytes,
+                baseline_rotations.data, rotation_bytes) ||
+            g1_ik_memory_ranges_overlap(
+                error, error_bytes,
+                local_positions.data, position_bytes) ||
+            g1_ik_memory_ranges_overlap(
+                error, error_bytes,
+                parents.data, parent_bytes) ||
+            g1_ik_memory_ranges_overlap(
+                error, error_bytes, &output, sizeof(output)) ||
+            g1_ik_memory_ranges_overlap(
+                error, error_bytes, &config, sizeof(config));
+    }
+    if (error_alias) {
+        return true;
+    }
+    if (pose_alias || result_alias) {
+        g1_ik_error(
+            error, error_capacity,
+            "G1 foot orientation mutable outputs must not alias inputs");
+        return true;
+    }
+    return false;
+}
+
+static inline bool g1_ik_orientation_error_aliases_memory(
+    const slice1d<quat> output_rotations,
+    const slice1d<vec3> local_positions,
+    const slice1d<quat> baseline_rotations,
+    const slice1d<int> parents,
+    G1FootOrientationResult& output,
+    const G1LegConfig& config,
+    char* error,
+    int error_capacity)
+{
+    if (error == NULL || error_capacity <= 0) {
+        return false;
+    }
+    const size_t error_bytes = static_cast<size_t>(error_capacity);
+    const size_t output_bytes = output_rotations.size > 0
+        ? static_cast<size_t>(output_rotations.size) * sizeof(quat)
+        : 0;
+    const size_t position_bytes = local_positions.size > 0
+        ? static_cast<size_t>(local_positions.size) * sizeof(vec3)
+        : 0;
+    const size_t baseline_bytes = baseline_rotations.size > 0
+        ? static_cast<size_t>(baseline_rotations.size) * sizeof(quat)
+        : 0;
+    const size_t parent_bytes = parents.size > 0
+        ? static_cast<size_t>(parents.size) * sizeof(int)
+        : 0;
+    return g1_ik_memory_ranges_overlap(
+               error, error_bytes,
+               output_rotations.data, output_bytes) ||
+           g1_ik_memory_ranges_overlap(
+               error, error_bytes,
+               local_positions.data, position_bytes) ||
+           g1_ik_memory_ranges_overlap(
+               error, error_bytes,
+               baseline_rotations.data, baseline_bytes) ||
+           g1_ik_memory_ranges_overlap(
+               error, error_bytes, parents.data, parent_bytes) ||
+           g1_ik_memory_ranges_overlap(
+               error, error_bytes, &output, sizeof(output)) ||
+           g1_ik_memory_ranges_overlap(
+               error, error_bytes, &config, sizeof(config));
+}
+
+static inline bool g1_apply_named_foot_orientation(
+    slice1d<quat> output_rotations,
+    const slice1d<vec3> local_positions,
+    const slice1d<quat> baseline_rotations,
+    const slice1d<int> parents,
+    const G1LegConfig& config,
+    vec3 surface_normal,
+    G1FootOrientationResult& output,
+    char* error,
+    int error_capacity)
+{
+    if (g1_ik_orientation_error_aliases_memory(
+            output_rotations, local_positions, baseline_rotations,
+            parents, output, config, error, error_capacity)) {
+        return false;
+    }
+    if (output_rotations.size != G1_BoneCount ||
+        output_rotations.data == NULL ||
+        local_positions.size != G1_BoneCount ||
+        local_positions.data == NULL ||
+        baseline_rotations.size != G1_BoneCount ||
+        baseline_rotations.data == NULL ||
+        parents.size != G1_BoneCount ||
+        parents.data == NULL) {
+        return g1_ik_error(
+            error, error_capacity,
+            "G1 foot orientation requires non-null exact 31-bone slices");
+    }
+    if (g1_ik_orientation_aliases_inputs(
+            output_rotations, local_positions, baseline_rotations,
+            parents, output, config, error, error_capacity)) {
+        return false;
+    }
+    if (!g1_ik_pose_inputs_validate(
+            output_rotations, local_positions, baseline_rotations,
+            parents, config, error, error_capacity)) {
+        return false;
+    }
+    if (!g1_ik_surface_normal_is_valid(surface_normal)) {
+        return g1_ik_error(
+            error, error_capacity,
+            "%s foot orientation requires an upward unit surface normal",
+            config.name);
+    }
+
+    array1d<quat> candidate_pose(output_rotations);
+    array1d<vec3> current_global_positions(G1_BoneCount);
+    array1d<quat> current_global_rotations(G1_BoneCount);
+    if (!g1_ik_checked_forward_kinematics(
+            current_global_positions, current_global_rotations,
+            local_positions, candidate_pose, parents,
+            error, error_capacity)) {
+        return false;
+    }
+
+    quat target_global;
+    if (!g1_surface_aligned_foot_rotation(
+            target_global,
+            current_global_rotations(config.contact),
+            config, surface_normal,
+            error, error_capacity)) {
+        return false;
+    }
+    const int parent = parents.data[config.contact];
+    if (parent < 0 || parent >= G1_BoneCount) {
+        return g1_ik_error(
+            error, error_capacity,
+            "%s foot orientation contact has an invalid parent",
+            config.name);
+    }
+    quat desired_local;
+    if (!ik_checked_quat_inverse_multiply(
+            desired_local,
+            current_global_rotations(parent),
+            target_global)) {
+        return g1_ik_error(
+            error, error_capacity,
+            "%s foot orientation could not materialize a local target",
+            config.name);
+    }
+    IKClampResult bounded = {};
+    if (!ik_clamp_local_delta(
+            bounded,
+            baseline_rotations.data[config.contact],
+            desired_local,
+            config.max_correction_radians)) {
+        return g1_ik_error(
+            error, error_capacity,
+            "%s foot orientation could not bound its local correction",
+            config.name);
+    }
+    candidate_pose(config.contact) = bounded.value;
+
+    array1d<vec3> verified_global_positions(G1_BoneCount);
+    array1d<quat> verified_global_rotations(G1_BoneCount);
+    if (!g1_ik_checked_forward_kinematics(
+            verified_global_positions, verified_global_rotations,
+            local_positions, candidate_pose, parents,
+            error, error_capacity)) {
+        return false;
+    }
+
+    G1FootOrientationResult candidate = {};
+    candidate.applied = true;
+    candidate.correction_limited = bounded.limited;
+    candidate.safe_stop_requested = bounded.limited;
+    candidate.target_global_rotation = target_global;
+    candidate.requested_correction_radians = bounded.requested_radians;
+    candidate.correction_radians = bounded.actual_radians;
+    if (!ik_quat_is_unit(candidate.target_global_rotation) ||
+        !g1_ik_float_is_runtime_value(
+            candidate.requested_correction_radians) ||
+        candidate.requested_correction_radians < 0.0f ||
+        !g1_ik_float_is_runtime_value(candidate.correction_radians) ||
+        candidate.correction_radians < 0.0f ||
+        candidate.correction_radians > config.max_correction_radians ||
+        candidate.safe_stop_requested != candidate.correction_limited) {
+        return g1_ik_error(
+            error, error_capacity,
+            "%s foot orientation produced an invalid bounded result",
+            config.name);
+    }
+
+    std::memcpy(
+        output_rotations.data, candidate_pose.data,
+        static_cast<size_t>(G1_BoneCount) * sizeof(quat));
+    output = candidate;
+    return true;
+}
