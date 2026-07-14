@@ -1825,12 +1825,22 @@ int main(void)
     SetTargetFPS(25);
 
     Model terrain_model = LoadModel(active_scene.mesh_path.c_str());
+    const bool terrain_model_allocated =
+        terrain_model.meshes != NULL ||
+        terrain_model.materials != NULL ||
+        terrain_model.meshMaterial != NULL ||
+        terrain_model.bones != NULL ||
+        terrain_model.bindPose != NULL;
     if (!IsModelReady(terrain_model) || terrain_model.meshCount <= 0)
     {
         fprintf(
             stderr,
             "G1 terrain mesh failed to load: %s\n",
             active_scene.mesh_path.c_str());
+        if (terrain_model_allocated)
+        {
+            UnloadModel(terrain_model);
+        }
         CloseWindow();
         return 2;
     }
@@ -2065,9 +2075,7 @@ int main(void)
         state.desired_velocity_change_prev = state.desired_velocity_change_curr;
         state.desired_velocity_change_curr =  (desired_velocity_curr - state.desired_velocity) / dt;
         state.desired_velocity = desired_velocity_curr;
-        if (rendered_frames == 0) {
-            state.trajectory_desired_velocities.set(state.desired_velocity);
-        }
+        g1_controller_state_seed_first_frame_desired_velocity(state);
         
         state.desired_rotation_change_prev = state.desired_rotation_change_curr;
         state.desired_rotation_change_curr = quat_to_scaled_angle_axis(quat_abs(quat_mul_inv(desired_rotation_curr, state.desired_rotation))) / dt;

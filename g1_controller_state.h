@@ -108,6 +108,15 @@ struct g1_controller_state
     float clamp_y = 0.0f;
 };
 
+static inline void g1_controller_state_seed_first_frame_desired_velocity(
+    g1_controller_state& state)
+{
+    if (state.scene_frame == 0)
+    {
+        state.trajectory_desired_velocities.set(state.desired_velocity);
+    }
+}
+
 template<typename T>
 static inline void g1_swap(array1d<T>& first, array1d<T>& second)
 {
