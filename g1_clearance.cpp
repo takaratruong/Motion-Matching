@@ -281,6 +281,30 @@ struct G1PointTriangle
     uint32_t index;
 };
 
+struct G1PointFraction
+{
+    double central;
+    G1ClearanceInterval enclosure;
+};
+
+struct G1PointGeometry
+{
+    double x0;
+    double x1;
+    double z0;
+    double z1;
+    G1PointFraction x;
+    G1PointFraction z;
+    uint32_t triangle_index;
+};
+
+enum G1PointGeometryStatus
+{
+    G1PointGeometryValid,
+    G1PointGeometryUncertified,
+    G1PointGeometryArithmeticFailure
+};
+
 enum G1ClearanceDomainStatus
 {
     G1ClearanceDomainInside,
@@ -458,91 +482,149 @@ static bool g1_clearance_point_node(
 
 static bool g1_clearance_point_fraction_enclosure(
     double coordinate,
-    float origin,
-    int cell_index,
-    float cell_size,
-    double central_fraction,
-    G1ClearanceInterval& output)
+    double first_node,
+    double second_node,
+    G1PointFraction& output)
 {
-    double node = 0.0;
     if (!terrain_double_is_finite(coordinate) ||
-        !terrain_double_is_finite(central_fraction) ||
-        !g1_clearance_point_node(
-            origin, cell_index, cell_size, node)) {
+        !terrain_double_is_finite(first_node) ||
+        !terrain_double_is_finite(second_node)) {
         return false;
     }
 
-    G1ClearanceInterval difference = {};
+    const volatile double central_numerator =
+        coordinate - first_node;
+    const volatile double central_span =
+        second_node - first_node;
+    if (!terrain_double_is_finite(central_numerator) ||
+        !terrain_double_is_finite(central_span) ||
+        central_span <= 0.0) {
+        return false;
+    }
+    const volatile double central_fraction =
+        central_numerator / central_span;
+    if (!terrain_double_is_finite(central_fraction) ||
+        central_fraction < 0.0 || central_fraction > 1.0) {
+        return false;
+    }
+
+    G1ClearanceInterval numerator = {};
+    G1ClearanceInterval span = {};
+    G1ClearanceInterval fraction = {};
     if (!g1_clearance_interval_subtract(
-            {coordinate, coordinate}, {node, node}, difference) ||
+            {coordinate, coordinate},
+            {first_node, first_node}, numerator) ||
+        !g1_clearance_interval_subtract(
+            {second_node, second_node},
+            {first_node, first_node}, span) ||
+        span.lower <= 0.0 ||
         !g1_clearance_interval_divide(
-            difference,
-            {static_cast<double>(cell_size),
-             static_cast<double>(cell_size)},
-            output)) {
+            numerator, span, fraction)) {
         return false;
     }
 
-    if (output.upper < 0.0 || output.lower > 1.0) {
+    if (fraction.upper < 0.0 || fraction.lower > 1.0) {
         return false;
     }
-    output.lower = output.lower < 0.0 ? 0.0 : output.lower;
-    output.upper = output.upper > 1.0 ? 1.0 : output.upper;
-    return output.lower <= output.upper &&
-           central_fraction >= output.lower &&
-           central_fraction <= output.upper;
+    fraction.lower = fraction.lower < 0.0 ? 0.0 : fraction.lower;
+    fraction.upper = fraction.upper > 1.0 ? 1.0 : fraction.upper;
+    if (fraction.lower > fraction.upper ||
+        central_fraction < fraction.lower ||
+        central_fraction > fraction.upper) {
+        return false;
+    }
+
+    G1PointFraction candidate = {};
+    candidate.central = central_fraction;
+    candidate.enclosure = fraction;
+    output = candidate;
+    return true;
+}
+
+static G1PointGeometryStatus g1_clearance_point_geometry(
+    const heightfield& field,
+    const heightfield_cell& cell,
+    vec3 point,
+    G1PointGeometry& output)
+{
+    G1PointGeometry candidate = {};
+    if (!g1_clearance_point_node(
+            field.origin_x, cell.x0,
+            field.cell_size, candidate.x0) ||
+        !g1_clearance_point_node(
+            field.origin_x, cell.x0 + 1,
+            field.cell_size, candidate.x1) ||
+        !g1_clearance_point_node(
+            field.origin_z, cell.z0,
+            field.cell_size, candidate.z0) ||
+        !g1_clearance_point_node(
+            field.origin_z, cell.z0 + 1,
+            field.cell_size, candidate.z1) ||
+        !g1_clearance_point_fraction_enclosure(
+            static_cast<double>(point.x),
+            candidate.x0, candidate.x1, candidate.x) ||
+        !g1_clearance_point_fraction_enclosure(
+            static_cast<double>(point.z),
+            candidate.z0, candidate.z1, candidate.z)) {
+        return G1PointGeometryArithmeticFailure;
+    }
+
+    const bool exact_materialized_tie =
+        std::memcmp(
+            &point.x, &point.z, sizeof(point.x)) == 0 &&
+        std::memcmp(
+            &candidate.x0, &candidate.z0,
+            sizeof(candidate.x0)) == 0 &&
+        std::memcmp(
+            &candidate.x1, &candidate.z1,
+            sizeof(candidate.x1)) == 0;
+    if (exact_materialized_tie ||
+        candidate.x.enclosure.lower >=
+            candidate.z.enclosure.upper) {
+        candidate.triangle_index = 0;
+    } else if (candidate.x.enclosure.upper <
+               candidate.z.enclosure.lower) {
+        candidate.triangle_index = 1;
+    } else {
+        return G1PointGeometryUncertified;
+    }
+
+    output = candidate;
+    return G1PointGeometryValid;
 }
 
 static bool g1_clearance_point_triangle(
-    const heightfield& field,
-    const heightfield_cell& cell,
+    const G1PointGeometry& geometry,
     double h00,
     double h10,
     double h01,
     double h11,
     G1PointTriangle& output)
 {
-    double x0 = 0.0;
-    double x1 = 0.0;
-    double z0 = 0.0;
-    double z1 = 0.0;
-    if (!g1_clearance_point_node(
-            field.origin_x, cell.x0,
-            field.cell_size, x0) ||
-        !g1_clearance_point_node(
-            field.origin_x, cell.x0 + 1,
-            field.cell_size, x1) ||
-        !g1_clearance_point_node(
-            field.origin_z, cell.z0,
-            field.cell_size, z0) ||
-        !g1_clearance_point_node(
-            field.origin_z, cell.z0 + 1,
-            field.cell_size, z1)) {
-        return false;
-    }
-
-    if (cell.tx >= cell.tz) {
-        output.x[0] = x0;
-        output.z[0] = z0;
+    if (geometry.triangle_index == 0) {
+        output.x[0] = geometry.x0;
+        output.z[0] = geometry.z0;
         output.height[0] = h00;
-        output.x[1] = x1;
-        output.z[1] = z0;
+        output.x[1] = geometry.x1;
+        output.z[1] = geometry.z0;
         output.height[1] = h10;
-        output.x[2] = x1;
-        output.z[2] = z1;
+        output.x[2] = geometry.x1;
+        output.z[2] = geometry.z1;
         output.height[2] = h11;
         output.index = 0;
-    } else {
-        output.x[0] = x0;
-        output.z[0] = z0;
+    } else if (geometry.triangle_index == 1) {
+        output.x[0] = geometry.x0;
+        output.z[0] = geometry.z0;
         output.height[0] = h00;
-        output.x[1] = x1;
-        output.z[1] = z1;
+        output.x[1] = geometry.x1;
+        output.z[1] = geometry.z1;
         output.height[1] = h11;
-        output.x[2] = x0;
-        output.z[2] = z1;
+        output.x[2] = geometry.x0;
+        output.z[2] = geometry.z1;
         output.height[2] = h01;
         output.index = 1;
+    } else {
+        return false;
     }
     return true;
 }
@@ -553,21 +635,23 @@ static bool g1_clearance_point_triangle(
 // public diagnostics only; capsule-patch homogeneous weights retain the
 // separate exact-real normalization/feasibility contract.
 static bool g1_clearance_point_weight_diagnostics(
-    const heightfield_cell& cell,
+    const G1PointGeometry& geometry,
     uint32_t triangle_index,
     double diagnostics[3])
 {
     if (triangle_index == 0) {
-        const volatile double first = 1.0 - cell.tx;
-        const volatile double second = cell.tx - cell.tz;
+        const volatile double first = 1.0 - geometry.x.central;
+        const volatile double second =
+            geometry.x.central - geometry.z.central;
         diagnostics[0] = first;
         diagnostics[1] = second;
-        diagnostics[2] = cell.tz;
+        diagnostics[2] = geometry.z.central;
     } else if (triangle_index == 1) {
-        const volatile double first = 1.0 - cell.tz;
-        const volatile double third = cell.tz - cell.tx;
+        const volatile double first = 1.0 - geometry.z.central;
+        const volatile double third =
+            geometry.z.central - geometry.x.central;
         diagnostics[0] = first;
-        diagnostics[1] = cell.tx;
+        diagnostics[1] = geometry.x.central;
         diagnostics[2] = third;
     } else {
         return false;
@@ -588,9 +672,7 @@ static bool g1_clearance_point_weight_diagnostics(
 }
 
 static bool g1_clearance_point_height(
-    const heightfield& field,
-    vec3 point,
-    const heightfield_cell& cell,
+    const G1PointGeometry& geometry,
     double h00,
     double h10,
     double h01,
@@ -598,31 +680,23 @@ static bool g1_clearance_point_height(
     double& central,
     G1ClearanceInterval& enclosure)
 {
-    G1ClearanceInterval tx = {};
-    G1ClearanceInterval tz = {};
-    if (!g1_clearance_point_fraction_enclosure(
-            static_cast<double>(point.x), field.origin_x,
-            cell.x0, field.cell_size, cell.tx, tx) ||
-        !g1_clearance_point_fraction_enclosure(
-            static_cast<double>(point.z), field.origin_z,
-            cell.z0, field.cell_size, cell.tz, tz)) {
-        return false;
-    }
+    const G1ClearanceInterval tx = geometry.x.enclosure;
+    const G1ClearanceInterval tz = geometry.z.enclosure;
     G1ClearanceInterval difference_x = {};
     G1ClearanceInterval x_term = {};
     G1ClearanceInterval first_sum = {};
     G1ClearanceInterval difference_z = {};
     G1ClearanceInterval z_term = {};
     const G1ClearanceInterval height00 = {h00, h00};
-    if (cell.tx >= cell.tz) {
+    if (geometry.triangle_index == 0) {
         const volatile double central_difference_x = h10 - h00;
         const volatile double central_x_term =
-            cell.tx * central_difference_x;
+            geometry.x.central * central_difference_x;
         const volatile double central_first_sum =
             h00 + central_x_term;
         const volatile double central_difference_z = h11 - h10;
         const volatile double central_z_term =
-            cell.tz * central_difference_z;
+            geometry.z.central * central_difference_z;
         const volatile double central_final_sum =
             central_first_sum + central_z_term;
         central = central_final_sum;
@@ -643,13 +717,16 @@ static bool g1_clearance_point_height(
                central <= enclosure.upper;
     }
 
+    if (geometry.triangle_index != 1) {
+        return false;
+    }
     const volatile double central_difference_x = h11 - h01;
     const volatile double central_x_term =
-        cell.tx * central_difference_x;
+        geometry.x.central * central_difference_x;
     const volatile double central_first_sum = h00 + central_x_term;
     const volatile double central_difference_z = h01 - h00;
     const volatile double central_z_term =
-        cell.tz * central_difference_z;
+        geometry.z.central * central_difference_z;
     const volatile double central_final_sum =
         central_first_sum + central_z_term;
     central = central_final_sum;
@@ -965,14 +1042,30 @@ G1ClearanceStatus g1_point_clearance(
             "G1 point clearance encountered invalid visited heights");
     }
 
+    G1PointGeometry geometry = {};
+    const G1PointGeometryStatus geometry_status =
+        g1_clearance_point_geometry(field, cell, point, geometry);
+    if (geometry_status == G1PointGeometryUncertified) {
+        return g1_clearance_error(
+            G1ClearanceUncertified,
+            diagnostic.output, diagnostic.capacity,
+            "G1 point materialized diagonal could not be certified");
+    }
+    if (geometry_status != G1PointGeometryValid) {
+        return g1_clearance_error(
+            G1ClearanceArithmeticFailure,
+            diagnostic.output, diagnostic.capacity,
+            "G1 point materialized coordinates could not be enclosed");
+    }
+
     G1PointTriangle triangle = {};
     double weight_diagnostics[3] = {};
     double surface_height_diagnostic = 0.0;
     G1ClearanceInterval height_enclosure = {};
     if (!g1_clearance_point_triangle(
-            field, cell, h00, h10, h01, h11, triangle) ||
+            geometry, h00, h10, h01, h11, triangle) ||
         !g1_clearance_point_height(
-            field, point, cell, h00, h10, h01, h11,
+            geometry, h00, h10, h01, h11,
             surface_height_diagnostic, height_enclosure)) {
         return g1_clearance_error(
             G1ClearanceArithmeticFailure,
@@ -1059,7 +1152,7 @@ G1ClearanceStatus g1_point_clearance(
     }
 
     if (!g1_clearance_point_weight_diagnostics(
-            cell, triangle.index, weight_diagnostics)) {
+            geometry, triangle.index, weight_diagnostics)) {
         return g1_clearance_error(
             G1ClearanceArithmeticFailure,
             diagnostic.output, diagnostic.capacity,

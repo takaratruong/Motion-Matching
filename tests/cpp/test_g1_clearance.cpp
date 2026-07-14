@@ -998,6 +998,160 @@ static void test_point_special_exact_bit_regression()
         "point-special bounds enclose the exact-bit point-plane oracle");
 }
 
+static void test_point_rejects_unproved_materialized_diagonal()
+{
+    heightfield field;
+    const float origin =
+        float_from_bits(UINT32_C(0x1645c2b2));
+    const float cell_size =
+        float_from_bits(UINT32_C(0x278eecba));
+    point_make_field(
+        field, 5, 4, origin, origin, cell_size);
+    const vec3 point(
+        float_from_bits(UINT32_C(0x287a1e46)),
+        1.0f,
+        float_from_bits(UINT32_C(0x2832a7e9)));
+
+    check(terrain_heightfield_is_queryable(field),
+          "unequal-span point fixture is a queryable G1HF/v2 field");
+    heightfield_cell cell = {};
+    check(terrain_v2_locate_cell(
+              field, point.x, point.z, cell) &&
+          cell.x0 == 3 && cell.z0 == 2,
+          "unequal-span point fixture selects its exact cell");
+    check(double_bits(cell.tx) == UINT64_C(0x3fe00000394b96ce) &&
+          double_bits(cell.tz) == UINT64_C(0x3fe00000394b96ce) &&
+          cell.tx >= cell.tz,
+          "producer fractions tie exactly and select T0");
+
+    const volatile double x0_product =
+        static_cast<double>(cell.x0) *
+        static_cast<double>(field.cell_size);
+    const volatile double x0 =
+        static_cast<double>(field.origin_x) + x0_product;
+    const volatile double x1_product =
+        static_cast<double>(cell.x0 + 1) *
+        static_cast<double>(field.cell_size);
+    const volatile double x1 =
+        static_cast<double>(field.origin_x) + x1_product;
+    const volatile double z0_product =
+        static_cast<double>(cell.z0) *
+        static_cast<double>(field.cell_size);
+    const volatile double z0 =
+        static_cast<double>(field.origin_z) + z0_product;
+    const volatile double z1_product =
+        static_cast<double>(cell.z0 + 1) *
+        static_cast<double>(field.cell_size);
+    const volatile double z1 =
+        static_cast<double>(field.origin_z) + z1_product;
+    const volatile double span_x = x1 - x0;
+    const volatile double span_z = z1 - z0;
+    const volatile double numerator_x =
+        static_cast<double>(point.x) - x0;
+    const volatile double numerator_z =
+        static_cast<double>(point.z) - z0;
+    check(double_bits(span_x) == UINT64_C(0x3cf1dd9740000002) &&
+          double_bits(span_z) == UINT64_C(0x3cf1dd9740000000) &&
+          span_x > span_z,
+          "authoritative materialized axis spans are unequal");
+    check(double_bits(numerator_x) ==
+              UINT64_C(0x3ce1dd977ff9d1ec) &&
+          double_bits(numerator_z) ==
+              UINT64_C(0x3ce1dd977ff9d1ec) &&
+          numerator_x > 0.0,
+          "authoritative point numerators are the same positive dyadic");
+    // The identical positive numerator divided by the strictly larger X
+    // span proves exact-real tx < tz, so the materialized triangle is T1.
+    // The rounded producer fractions above instead tie and choose T0.
+
+    const int offset = cell.z0 * field.nx + cell.x0;
+    field.heights(offset) = -8.0f;
+    field.heights(offset + 1) = 8.0f;
+    field.heights(offset + field.nx) = 8.0f;
+    field.heights(offset + field.nx + 1) = -8.0f;
+
+    G1ClearanceResult output = seeded_result(72.0);
+    const ByteSnapshot<G1ClearanceResult> output_before(output);
+    const G1ClearanceBudget limits = g1_pose_clearance_budget();
+    char error[128] = {};
+    check(g1_point_clearance(
+              output, limits, field, point,
+              error, static_cast<int>(sizeof(error))) ==
+              G1ClearanceUncertified,
+          "point fails closed when the authoritative diagonal is unproved");
+    check(output_before.same(output),
+          "unproved materialized diagonal preserves point output");
+}
+
+static void test_point_rejects_false_rounded_diagonal_tie()
+{
+    heightfield field;
+    point_make_field(
+        field, 2, 2,
+        float_from_bits(UINT32_C(0x3dcccccd)),
+        float_from_bits(UINT32_C(0x3d4ccccd)),
+        float_from_bits(UINT32_C(0x5921729f)));
+    const float coordinate =
+        float_from_bits(UINT32_C(0x58a1729f));
+    const vec3 point(coordinate, 1.0f, coordinate);
+    field.heights(0) = -8.0f;
+    field.heights(1) = 8.0f;
+    field.heights(2) = 8.0f;
+    field.heights(3) = -8.0f;
+
+    check(terrain_heightfield_is_queryable(field),
+          "false-rounded-tie fixture is a queryable G1HF/v2 field");
+    heightfield_cell cell = {};
+    check(terrain_v2_locate_cell(
+              field, point.x, point.z, cell) &&
+          double_bits(cell.tx) == UINT64_C(0x3fe0000000000000) &&
+          double_bits(cell.tz) == UINT64_C(0x3fe0000000000000),
+          "false-rounded-tie producer fractions tie at one half");
+
+    const volatile double x1_product =
+        static_cast<double>(field.cell_size);
+    const volatile double x1 =
+        static_cast<double>(field.origin_x) + x1_product;
+    const volatile double z1_product =
+        static_cast<double>(field.cell_size);
+    const volatile double z1 =
+        static_cast<double>(field.origin_z) + z1_product;
+    const double x0 = static_cast<double>(field.origin_x);
+    const double z0 = static_cast<double>(field.origin_z);
+    const volatile double numerator_x =
+        static_cast<double>(point.x) - x0;
+    const volatile double numerator_z =
+        static_cast<double>(point.z) - z0;
+    const volatile double span_x = x1 - x0;
+    const volatile double span_z = z1 - z0;
+    check(x0 > z0 && double_bits(x1) == double_bits(z1) &&
+          double_bits(static_cast<double>(point.x)) ==
+              double_bits(static_cast<double>(point.z)),
+          "false-rounded-tie source operands are distinct on X and Z");
+    check(double_bits(numerator_x) ==
+              UINT64_C(0x43142e53e0000000) &&
+          double_bits(numerator_z) ==
+              UINT64_C(0x43142e53e0000000) &&
+          double_bits(span_x) == UINT64_C(0x43242e53e0000000) &&
+          double_bits(span_z) == UINT64_C(0x43242e53e0000000),
+          "distinct exact ratios have identical rounded differences");
+    // With a shared point p and upper node n, 0 < z0 < x0 < p < n,
+    // (p-o)/(n-o) is strictly decreasing in o.  Therefore exact-real
+    // tx < tz even though all four rounded differences above are equal.
+
+    G1ClearanceResult output = seeded_result(76.0);
+    const ByteSnapshot<G1ClearanceResult> output_before(output);
+    const G1ClearanceBudget limits = g1_pose_clearance_budget();
+    char error[128] = {};
+    check(g1_point_clearance(
+              output, limits, field, point,
+              error, static_cast<int>(sizeof(error))) ==
+              G1ClearanceUncertified,
+          "rounded difference equality cannot certify a diagonal tie");
+    check(output_before.same(output),
+          "false rounded diagonal tie preserves point output");
+}
+
 static void test_point_domain_boundaries()
 {
     heightfield exact_field;
@@ -1839,6 +1993,8 @@ int main(int argc, char** argv)
     test_swing_lift_materializer();
     test_point_fixed_diagonal_and_determinism();
     test_point_special_exact_bit_regression();
+    test_point_rejects_unproved_materialized_diagonal();
+    test_point_rejects_false_rounded_diagonal_tie();
     test_point_domain_boundaries();
     test_point_input_and_field_rejection();
     test_point_exterior_height_independence();
