@@ -1082,24 +1082,57 @@ static inline bool terrain_f32_lerp(
            terrain_f32_add(out, start, scaled);
 }
 
+static inline bool terrain_heightfield_is_queryable(const heightfield& field);
+
 static inline bool walkability_grid_matches_heightfield(
     const walkability_grid& grid, const heightfield& field)
 {
     size_t count = 0;
-    return grid.nx == field.nx && grid.nz == field.nz &&
+    return terrain_heightfield_is_queryable(field) &&
+           grid.nx == field.nx && grid.nz == field.nz &&
            grid.nx >= 2 && grid.nz >= 2 &&
-           terrain_float_is_normal_or_positive_zero(field.origin_x) &&
-           terrain_float_is_normal_or_positive_zero(field.origin_z) &&
-           terrain_float_is_positive_normal(field.cell_size) &&
            terrain_size_multiply(
                static_cast<size_t>(grid.nx),
                static_cast<size_t>(grid.nz), count) &&
            count <= static_cast<size_t>(INT_MAX) &&
-           grid.cells.size == static_cast<int>(count);
+           grid.cells.size == static_cast<int>(count) &&
+           grid.cells.data != NULL;
 }
 
 static inline bool terrain_v2_query_coordinate(
     float input, float& canonical);
+
+static inline bool walkability_checked_floor_to_int(
+    int& out, double value, int minimum, int maximum)
+{
+    if (minimum > maximum || !terrain_double_is_finite(value)) {
+        return false;
+    }
+    const double rounded = floor(value);
+    if (!terrain_double_is_finite(rounded) ||
+        rounded < static_cast<double>(minimum) ||
+        rounded > static_cast<double>(maximum)) {
+        return false;
+    }
+    out = static_cast<int>(rounded);
+    return true;
+}
+
+static inline bool walkability_checked_ceil_to_int(
+    int& out, double value, int minimum, int maximum)
+{
+    if (minimum > maximum || !terrain_double_is_finite(value)) {
+        return false;
+    }
+    const double rounded = ceil(value);
+    if (!terrain_double_is_finite(rounded) ||
+        rounded < static_cast<double>(minimum) ||
+        rounded > static_cast<double>(maximum)) {
+        return false;
+    }
+    out = static_cast<int>(rounded);
+    return true;
+}
 
 static inline bool walkability_nearest_axis(
     int& index, float input, float origin, float cell_size, int count)
@@ -1117,9 +1150,28 @@ static inline bool walkability_nearest_axis(
         !terrain_f32_add(shifted, normalized, 0.5f)) {
         return false;
     }
-    const int rounded = static_cast<int>(floorf(shifted));
-    index = rounded < count ? rounded : count - 1;
-    return index >= 0 && index < count;
+    return walkability_checked_floor_to_int(
+        index, static_cast<double>(shifted), 0, count - 1);
+}
+
+static inline bool walkability_cell_value(
+    int& value, const walkability_grid& grid, int ix, int iz)
+{
+    if (ix < 0 || iz < 0 || ix >= grid.nx || iz >= grid.nz ||
+        grid.cells.data == NULL || grid.cells.size < 0) {
+        return false;
+    }
+    size_t row = 0;
+    size_t index = 0;
+    if (!terrain_size_multiply(
+            static_cast<size_t>(iz), static_cast<size_t>(grid.nx), row) ||
+        !terrain_size_add(row, static_cast<size_t>(ix), index) ||
+        index >= static_cast<size_t>(grid.cells.size) ||
+        index > static_cast<size_t>(INT_MAX)) {
+        return false;
+    }
+    value = grid.cells(static_cast<int>(index));
+    return value >= 0 && value <= 2;
 }
 
 static inline int walkability_class_at(
@@ -1137,8 +1189,8 @@ static inline int walkability_class_at(
             iz, z, field.origin_z, field.cell_size, grid.nz)) {
         return 0;
     }
-    const int value = grid.cells(iz * grid.nx + ix);
-    return value <= 2 ? value : 0;
+    int value = 0;
+    return walkability_cell_value(value, grid, ix, iz) ? value : 0;
 }
 
 enum walkability_reason
@@ -1207,6 +1259,8 @@ static inline bool walkability_node_coordinate(
            terrain_f32_add(coordinate, origin, offset);
 }
 
+static const size_t walkability_maximum_footprint_node_count = 1048576u;
+
 static inline int walkability_footprint_class(
     const walkability_grid& grid,
     const heightfield& field,
@@ -1261,18 +1315,41 @@ static inline int walkability_footprint_class(
         return 0;
     }
 
-    int x0 = static_cast<int>(floor(minimum_grid_x));
-    int x1 = static_cast<int>(ceil(maximum_grid_x));
-    int z0 = static_cast<int>(floor(minimum_grid_z));
-    int z1 = static_cast<int>(ceil(maximum_grid_z));
+    int x0 = 0;
+    int x1 = 0;
+    int z0 = 0;
+    int z1 = 0;
+    if (!walkability_checked_floor_to_int(
+            x0, minimum_grid_x, 0, grid.nx) ||
+        !walkability_checked_ceil_to_int(
+            x1, maximum_grid_x, 0, grid.nx) ||
+        !walkability_checked_floor_to_int(
+            z0, minimum_grid_z, 0, grid.nz) ||
+        !walkability_checked_ceil_to_int(
+            z1, maximum_grid_z, 0, grid.nz)) {
+        return 0;
+    }
+    const int last_x_index = grid.nx - 1;
+    const int last_z_index = grid.nz - 1;
+    if (x0 > last_x_index) x0 = last_x_index;
+    if (z0 > last_z_index) z0 = last_z_index;
+    if (x1 > last_x_index) x1 = last_x_index;
+    if (z1 > last_z_index) z1 = last_z_index;
     if (x0 > 0) --x0;
     if (z0 > 0) --z0;
-    if (x1 < grid.nx - 1) ++x1;
-    if (z1 < grid.nz - 1) ++z1;
-    x0 = x0 < 0 ? 0 : x0;
-    z0 = z0 < 0 ? 0 : z0;
-    x1 = x1 >= grid.nx ? grid.nx - 1 : x1;
-    z1 = z1 >= grid.nz ? grid.nz - 1 : z1;
+    if (x1 < last_x_index) ++x1;
+    if (z1 < last_z_index) ++z1;
+    if (x0 > x1 || z0 > z1) return 0;
+
+    const size_t width =
+        static_cast<size_t>(x1) - static_cast<size_t>(x0) + 1u;
+    const size_t depth =
+        static_cast<size_t>(z1) - static_cast<size_t>(z0) + 1u;
+    size_t window_node_count = 0;
+    if (!terrain_size_multiply(width, depth, window_node_count) ||
+        window_node_count > walkability_maximum_footprint_node_count) {
+        return 0;
+    }
 
     float radius_squared = 0.0f;
     float contact_limit = 0.0f;
@@ -1281,13 +1358,13 @@ static inline int walkability_footprint_class(
         return 0;
     }
     int encountered = 1;
-    for (int iz = z0; iz <= z1; ++iz) {
+    for (int iz = z0;;) {
         float node_z = 0.0f;
         if (!walkability_node_coordinate(
                 node_z, field.origin_z, field.cell_size, iz)) {
             return 0;
         }
-        for (int ix = x0; ix <= x1; ++ix) {
+        for (int ix = x0;;) {
             float node_x = 0.0f;
             if (!walkability_node_coordinate(
                     node_x, field.origin_x, field.cell_size, ix)) {
@@ -1307,18 +1384,133 @@ static inline int walkability_footprint_class(
                 return 0;
             }
             if (distance_squared <= contact_limit) {
-                const int value = grid.cells(iz * grid.nx + ix);
-                if (value > 2) return 0;
+                int value = 0;
+                if (!walkability_cell_value(value, grid, ix, iz)) return 0;
                 if (value == 0) {
                     reason = walkability_blocked_cell;
                     return 0;
                 }
                 if (value == 2) encountered = 2;
             }
+            if (ix == x1) break;
+            ++ix;
         }
+        if (iz == z1) break;
+        ++iz;
     }
     reason = walkability_clear;
     return encountered;
+}
+
+static const int walkability_maximum_exact_sweep_steps = 16777216;
+
+static inline bool walkability_sweep_sample_spacing_is_valid(
+    vec3 start, vec3 stop, float cell_size, int steps)
+{
+    if (steps < 1 ||
+        steps > walkability_maximum_exact_sweep_steps ||
+        !terrain_float_is_positive_normal(cell_size)) {
+        return false;
+    }
+    const volatile double half_cell =
+        0.5 * static_cast<double>(cell_size);
+    const volatile double half_cell_squared = half_cell * half_cell;
+    if (!terrain_double_is_finite(half_cell_squared) ||
+        half_cell_squared <= 0.0) {
+        return false;
+    }
+
+    float previous_x = start.x;
+    float previous_z = start.z;
+    for (int step = 1;;) {
+        float x = 0.0f;
+        float z = 0.0f;
+        if (!terrain_f32_lerp(x, start.x, stop.x, step, steps) ||
+            !terrain_f32_lerp(z, start.z, stop.z, step, steps)) {
+            return false;
+        }
+        const volatile double dx =
+            static_cast<double>(x) - static_cast<double>(previous_x);
+        const volatile double dz =
+            static_cast<double>(z) - static_cast<double>(previous_z);
+        const volatile double dx_squared = dx * dx;
+        const volatile double dz_squared = dz * dz;
+        const volatile double gap_squared = dx_squared + dz_squared;
+        if (!terrain_double_is_finite(gap_squared) ||
+            gap_squared > half_cell_squared) {
+            return false;
+        }
+        if (step == steps) break;
+        ++step;
+        previous_x = x;
+        previous_z = z;
+    }
+    return true;
+}
+
+static inline bool walkability_sweep_step_count(
+    int& steps, vec3 start, vec3 stop, float cell_size)
+{
+    steps = 0;
+    if (!terrain_float_is_finite(start.x) ||
+        !terrain_float_is_finite(start.z) ||
+        !terrain_float_is_finite(stop.x) ||
+        !terrain_float_is_finite(stop.z) ||
+        !terrain_float_is_positive_normal(cell_size)) {
+        return false;
+    }
+
+    float rounded_dx = 0.0f;
+    float rounded_dz = 0.0f;
+    if (!terrain_f32_sub(rounded_dx, stop.x, start.x) ||
+        !terrain_f32_sub(rounded_dz, stop.z, start.z)) {
+        return false;
+    }
+    const volatile double dx = static_cast<double>(rounded_dx);
+    const volatile double dz = static_cast<double>(rounded_dz);
+    const volatile double dx_squared = dx * dx;
+    const volatile double dz_squared = dz * dz;
+    const volatile double length_squared = dx_squared + dz_squared;
+    if (!terrain_double_is_finite(length_squared) ||
+        length_squared < 0.0) {
+        return false;
+    }
+    const volatile double length = sqrt(length_squared);
+    const volatile double half_cell =
+        0.5 * static_cast<double>(cell_size);
+    const volatile double raw_steps = length / half_cell;
+    if (!terrain_double_is_finite(raw_steps) || raw_steps < 0.0) {
+        return false;
+    }
+
+    // Bias one binary64 unit upward so an exact boundary cannot be
+    // undercounted by the derived division. The actual rounded samples are
+    // still verified below before the count is accepted.
+    const double guarded_raw_steps = nextafter(raw_steps, INFINITY);
+    int candidate = 0;
+    if (!walkability_checked_ceil_to_int(
+            candidate, guarded_raw_steps, 0,
+            walkability_maximum_exact_sweep_steps)) {
+        return false;
+    }
+    if (candidate < 1) candidate = 1;
+    if (!walkability_sweep_sample_spacing_is_valid(
+            start, stop, cell_size, candidate)) {
+        // A one-round binary32 interpolation can make one adjacent gap
+        // slightly wider than the ideal binary64 quotient. Add one sample
+        // and verify again; if the rounded lattice still cannot satisfy the
+        // bound, fail closed instead of iterating an unbounded refinement.
+        if (candidate >= walkability_maximum_exact_sweep_steps) {
+            return false;
+        }
+        ++candidate;
+        if (!walkability_sweep_sample_spacing_is_valid(
+                start, stop, cell_size, candidate)) {
+            return false;
+        }
+    }
+    steps = candidate;
+    return true;
 }
 
 static inline walkability_sweep_result walkability_sweep(
@@ -1380,26 +1572,19 @@ static inline walkability_sweep_result walkability_sweep(
         return out;
     }
 
-    const double raw_steps = static_cast<double>(length_xz) /
-        (0.5 * static_cast<double>(field.cell_size));
-    // Every integer through 2^24 is exactly representable by binary32.
-    // Beyond that, adjacent loop indices can collapse to the same sample.
-    const double maximum_exact_step_count = 16777216.0;
-    if (!terrain_double_is_finite(raw_steps) ||
-        raw_steps > static_cast<double>(INT_MAX) ||
-        raw_steps > maximum_exact_step_count) {
+    int steps = 0;
+    if (!walkability_sweep_step_count(
+            steps, start, stop, field.cell_size)) {
         out.blocked = true;
         out.reason = walkability_nonfinite;
         out.safe_fraction = 0.0f;
         out.distance = 0.0f;
         return out;
     }
-    int steps = static_cast<int>(ceil(raw_steps));
-    if (steps < 1) steps = 1;
 
     float previous_fraction = 0.0f;
     vec3 previous_point(start.x, 0.0f, start.z);
-    for (int step = 1; step <= steps; ++step) {
+    for (int step = 1;;) {
         float x = 0.0f;
         float z = 0.0f;
         float fraction = 0.0f;
@@ -1433,6 +1618,8 @@ static inline walkability_sweep_result walkability_sweep(
         }
         previous_fraction = fraction;
         previous_point = vec3(x, 0.0f, z);
+        if (step == steps) break;
+        ++step;
     }
     out.point = vec3(stop.x, 0.0f, stop.z);
     return out;
@@ -1562,12 +1749,11 @@ static inline vec3 traversability_limit_command(
     return applied;
 }
 
-static inline bool traversability_clip_step(
+static inline walkability_sweep_result traversability_preflight_step(
     vec3 start,
-    vec3& candidate,
-    vec3& velocity,
-    vec3& acceleration,
-    traversability_diagnostics& diagnostics,
+    vec3 candidate,
+    vec3 velocity,
+    vec3 acceleration,
     const walkability_grid& grid,
     const heightfield& field,
     float radius)
@@ -1597,6 +1783,17 @@ static inline bool traversability_clip_step(
     } else {
         sweep = walkability_sweep(grid, field, start, candidate, radius);
     }
+    return sweep;
+}
+
+static inline bool traversability_apply_sweep_result(
+    vec3 start,
+    vec3& candidate,
+    vec3& velocity,
+    vec3& acceleration,
+    traversability_diagnostics& diagnostics,
+    const walkability_sweep_result& sweep)
+{
     if (!sweep.blocked) return true;
 
     if (terrain_float_is_finite(start.x) &&
@@ -1612,6 +1809,7 @@ static inline bool traversability_clip_step(
     acceleration.x = 0.0f;
     acceleration.z = 0.0f;
     diagnostics.blocked = true;
+    diagnostics.walkability_class = sweep.encountered_class;
     diagnostics.reason = sweep.reason;
     diagnostics.distance = sweep.distance;
     diagnostics.point = sweep.point;
@@ -1619,7 +1817,22 @@ static inline bool traversability_clip_step(
     return false;
 }
 
-static inline bool terrain_heightfield_is_queryable(const heightfield& field);
+static inline bool traversability_clip_step(
+    vec3 start,
+    vec3& candidate,
+    vec3& velocity,
+    vec3& acceleration,
+    traversability_diagnostics& diagnostics,
+    const walkability_grid& grid,
+    const heightfield& field,
+    float radius)
+{
+    const walkability_sweep_result sweep = traversability_preflight_step(
+        start, candidate, velocity, acceleration,
+        grid, field, radius);
+    return traversability_apply_sweep_result(
+        start, candidate, velocity, acceleration, diagnostics, sweep);
+}
 
 static inline float heightfield_sample(
     const heightfield& field, float x, float z)

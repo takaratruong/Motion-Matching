@@ -603,6 +603,100 @@ static void test_walkability_reason_names_are_stable()
           "unknown walkability reason maps to nonfinite");
 }
 
+static void test_walkability_structural_gate_fails_closed()
+{
+    heightfield field;
+    walkability_grid grid;
+    initialize_walkability_guard_fixture(field, grid);
+
+    heightfield undersized_heights(field);
+    undersized_heights.heights.resize(1);
+    walkability_reason reason = walkability_clear;
+    check(!walkability_grid_matches_heightfield(grid, undersized_heights) &&
+              walkability_class_at(
+                  grid, undersized_heights, 0.4f, 0.2f) == 0 &&
+              walkability_footprint_class(
+                  grid, undersized_heights, 0.4f, 0.2f, 0.0f,
+                  reason) == 0 && reason == walkability_nonfinite,
+          "undersized height storage fails closed");
+
+    heightfield null_heights;
+    null_heights.nx = field.nx;
+    null_heights.nz = field.nz;
+    null_heights.origin_x = field.origin_x;
+    null_heights.origin_z = field.origin_z;
+    null_heights.cell_size = field.cell_size;
+    null_heights.exterior_height = field.exterior_height;
+    null_heights.version = field.version;
+    null_heights.heights.size = field.heights.size;
+    null_heights.heights.data = NULL;
+    reason = walkability_clear;
+    const walkability_sweep_result null_height_sweep = walkability_sweep(
+        grid, null_heights, vec3(0.4f, 0.0f, 0.2f),
+        vec3(0.5f, 0.0f, 0.2f), 0.0f);
+    check(!walkability_grid_matches_heightfield(grid, null_heights) &&
+              walkability_footprint_class(
+                  grid, null_heights, 0.4f, 0.2f, 0.0f,
+                  reason) == 0 && reason == walkability_nonfinite &&
+              null_height_sweep.blocked &&
+              null_height_sweep.encountered_class == 0 &&
+              null_height_sweep.reason == walkability_nonfinite,
+          "null height storage fails closed");
+
+    heightfield invalid_axis(field);
+    invalid_axis.origin_x = 1.0e20f;
+    reason = walkability_clear;
+    check(!walkability_grid_matches_heightfield(grid, invalid_axis) &&
+              walkability_footprint_class(
+                  grid, invalid_axis, invalid_axis.origin_x, 0.2f,
+                  0.0f, reason) == 0 &&
+              reason == walkability_nonfinite,
+          "invalid v2 runtime axis fails closed");
+
+    walkability_grid null_cells;
+    null_cells.nx = grid.nx;
+    null_cells.nz = grid.nz;
+    null_cells.cells.size = grid.cells.size;
+    null_cells.cells.data = NULL;
+    reason = walkability_clear;
+    check(!walkability_grid_matches_heightfield(null_cells, field) &&
+              walkability_class_at(
+                  null_cells, field, 0.4f, 0.2f) == 0 &&
+              walkability_footprint_class(
+                  null_cells, field, 0.4f, 0.2f, 0.0f,
+                  reason) == 0 && reason == walkability_nonfinite,
+          "null walkability storage fails closed");
+
+    heightfield hostile_axis;
+    hostile_axis.version = 2;
+    hostile_axis.nx = 1073741823;
+    hostile_axis.nz = 2;
+    hostile_axis.origin_x = float_from_bits(UINT32_C(0x71800001));
+    hostile_axis.origin_z = 0.0f;
+    hostile_axis.cell_size = float_from_bits(UINT32_C(0x56800000));
+    hostile_axis.exterior_height = 0.0f;
+    walkability_grid hostile_grid;
+    hostile_grid.nx = hostile_axis.nx;
+    hostile_grid.nz = hostile_axis.nz;
+    hostile_grid.cells.size = 2147483646;
+    hostile_grid.cells.data =
+        static_cast<uint8_t*>(malloc(sizeof(uint8_t)));
+    check(hostile_grid.cells.data != NULL,
+          "hostile walkability probe allocation");
+    hostile_grid.cells.data[0] = 1;
+    float hostile_x = 0.0f;
+    check(walkability_node_coordinate(
+              hostile_x, hostile_axis.origin_x, hostile_axis.cell_size,
+              hostile_axis.nx - 1) &&
+              float_bits(hostile_x) == UINT32_C(0x71800002),
+          "hostile walkability endpoint reproduces rounded coordinate");
+    reason = walkability_clear;
+    check(walkability_footprint_class(
+              hostile_grid, hostile_axis, hostile_x, 0.0f, 0.0f,
+              reason) == 0 && reason == walkability_nonfinite,
+          "hostile walkability dimension fails before integer conversion");
+}
+
 static void test_walkability_footprint_is_conservative_and_release_safe()
 {
     heightfield field;
@@ -687,6 +781,25 @@ static void test_walkability_footprint_is_conservative_and_release_safe()
               std::numeric_limits<float>::quiet_NaN(), reason) == 0 &&
               reason == walkability_nonfinite,
           "nonfinite footprint radius stops safely");
+}
+
+static void test_walkability_footprint_caps_conservative_window()
+{
+    heightfield field;
+    initialize_heightfield(
+        field, 1025, 1025, 0.0f, 0.0f, 0.001f, 0.0f, 2);
+    field.heights.zero();
+    walkability_grid grid;
+    grid.nx = field.nx;
+    grid.nz = field.nz;
+    grid.cells.resize(field.nx * field.nz);
+    grid.cells.set(1);
+
+    walkability_reason reason = walkability_clear;
+    check(walkability_footprint_class(
+              grid, field, 0.512f, 0.512f, 0.512f, reason) == 0 &&
+              reason == walkability_nonfinite,
+          "oversized conservative footprint window fails closed");
 }
 
 static void test_walkability_sweep_handles_clear_blocked_and_hostile_steps()
@@ -779,6 +892,70 @@ static void test_walkability_sweep_handles_clear_blocked_and_hostile_steps()
               inexact_float_count.safe_fraction == 0.0f &&
               inexact_float_count.distance == 0.0f,
           "inexact binary32 sweep step counter stops safely");
+}
+
+static double walkability_test_maximum_sample_gap(
+    vec3 start, vec3 stop, int steps)
+{
+    double maximum = 0.0;
+    float previous_x = start.x;
+    float previous_z = start.z;
+    for (int step = 1; step <= steps; ++step) {
+        float x = 0.0f;
+        float z = 0.0f;
+        check(terrain_f32_lerp(x, start.x, stop.x, step, steps) &&
+                  terrain_f32_lerp(z, start.z, stop.z, step, steps),
+              "exact spacing probe interpolation");
+        const double dx =
+            static_cast<double>(x) - static_cast<double>(previous_x);
+        const double dz =
+            static_cast<double>(z) - static_cast<double>(previous_z);
+        const double gap = sqrt(dx * dx + dz * dz);
+        if (gap > maximum) maximum = gap;
+        previous_x = x;
+        previous_z = z;
+    }
+    return maximum;
+}
+
+static void test_walkability_checked_conversion_and_exact_sample_spacing()
+{
+    int converted = 123;
+    check(!walkability_checked_floor_to_int(
+              converted, 2147483648.0, 0, INT_MAX),
+          "out-of-range floor conversion fails without undefined behavior");
+
+    heightfield field;
+    initialize_heightfield(
+        field, 210, 210, -0.25f, -0.25f,
+        float_from_bits(UINT32_C(0x3b1efa48)), 0.0f, 2);
+    field.heights.zero();
+    walkability_grid grid;
+    grid.nx = field.nx;
+    grid.nz = field.nz;
+    grid.cells.resize(field.nx * field.nz);
+    grid.cells.set(1);
+    const vec3 start(0.0f, 0.0f, 0.0f);
+    const vec3 stop(
+        float_from_bits(UINT32_C(0x3b6e7765)), 0.0f,
+        float_from_bits(UINT32_C(0x36723088)));
+    const double half_cell = 0.5 * static_cast<double>(field.cell_size);
+    const double old_maximum_gap =
+        walkability_test_maximum_sample_gap(start, stop, 3);
+    check(old_maximum_gap > half_cell,
+          "exact spacing vector reproduces former three-step gap");
+
+    int steps = 0;
+    check(walkability_sweep_step_count(
+              steps, start, stop, field.cell_size) && steps >= 4,
+          "exact spacing vector derives a conservative step count");
+    check(walkability_test_maximum_sample_gap(start, stop, steps) <=
+              half_cell,
+          "actual rounded sweep samples stay within half a cell");
+    const walkability_sweep_result sweep =
+        walkability_sweep(grid, field, start, stop, 0.20f);
+    check(!sweep.blocked && sweep.reason == walkability_clear,
+          "exact spacing vector remains traversable");
 }
 
 static void check_invalid_traversability_command(
@@ -957,9 +1134,28 @@ static void test_traversability_clip_is_planar_and_bit_preserving()
     const uint32_t velocity_y = float_bits(velocity.y);
     const uint32_t acceleration_y = float_bits(acceleration.y);
     const uint32_t support_bits = float_bits(support);
-    const walkability_sweep_result expected =
-        walkability_sweep(grid, field, start, candidate, 0.20f);
+    const walkability_sweep_result expected = traversability_preflight_step(
+        start, candidate, velocity, acceleration,
+        grid, field, 0.20f);
+    vec3 applied_candidate = candidate;
+    vec3 applied_velocity = velocity;
+    vec3 applied_acceleration = acceleration;
+    traversability_diagnostics applied_diagnostics = {};
+    applied_diagnostics.walkability_class = 1;
+    check(!traversability_apply_sweep_result(
+              start, applied_candidate, applied_velocity,
+              applied_acceleration, applied_diagnostics, expected) &&
+              applied_candidate.x == expected.point.x &&
+              applied_candidate.z == expected.point.z &&
+              applied_velocity.x == 0.0f &&
+              applied_velocity.z == 0.0f &&
+              applied_acceleration.x == 0.0f &&
+              applied_acceleration.z == 0.0f &&
+              applied_diagnostics.walkability_class ==
+                  expected.encountered_class,
+          "preflight result applies without a second sweep");
     traversability_diagnostics diagnostics = {};
+    diagnostics.walkability_class = 1;
     check(!traversability_clip_step(
               start, candidate, velocity, acceleration, diagnostics,
               grid, field, 0.20f),
@@ -979,6 +1175,7 @@ static void test_traversability_clip_is_planar_and_bit_preserving()
           "hard clip applies the last safe XZ fraction only");
     check(diagnostics.blocked &&
               diagnostics.reason == walkability_blocked_cell &&
+              diagnostics.walkability_class == expected.encountered_class &&
               diagnostics.distance == expected.distance &&
               diagnostics.point.x == expected.point.x &&
               diagnostics.point.z == expected.point.z &&
@@ -1025,10 +1222,12 @@ static void test_traversability_clip_is_planar_and_bit_preserving()
     acceleration = vec3(0.5f, 5.0f, 0.75f);
     const uint32_t invalid_y = float_bits(invalid_candidate.y);
     diagnostics = traversability_diagnostics();
+    diagnostics.walkability_class = 2;
     check(!traversability_clip_step(
               start, invalid_candidate, velocity, acceleration,
               diagnostics, grid, field, 0.20f) &&
-              diagnostics.reason == walkability_nonfinite,
+              diagnostics.reason == walkability_nonfinite &&
+              diagnostics.walkability_class == 0,
           "nonfinite candidate hard stops");
     check(invalid_candidate.x == start.x &&
               invalid_candidate.z == start.z &&
@@ -1071,11 +1270,12 @@ static void test_traversability_clip_is_planar_and_bit_preserving()
         0.25f, std::numeric_limits<float>::infinity(), 0.5f);
     acceleration = vec3(0.5f, 5.0f, 0.75f);
     diagnostics = traversability_diagnostics();
+    const uint32_t vertical_velocity_y = float_bits(velocity.y);
     check(!traversability_clip_step(
               start, vertical_candidate, velocity, acceleration,
               diagnostics, grid, field, 0.20f) &&
               diagnostics.reason == walkability_nonfinite &&
-              velocity.y == std::numeric_limits<float>::infinity(),
+              float_bits(velocity.y) == vertical_velocity_y,
           "nonfinite velocity y hard stops without rewriting y");
 
     vertical_candidate = vec3(0.35f, -3.0f, 0.2f);
@@ -1225,30 +1425,26 @@ static void test_controller_traversability_guard_data_flow()
     const char* integrate = require_source_token(
         before, "simulation_positions_update(",
         "controller integrates simulation position");
-    const char* state_check = require_source_token(
-        integrate, "const bool integrated_state_is_finite =",
-        "controller checks all integrated state before clear fast path");
     const char* preflight = require_source_token(
-        state_check,
+        integrate,
         "const walkability_sweep_result integrated_traversal = "
-        "walkability_sweep(",
-        "controller preflights the integrated traversal");
+        "traversability_preflight_step(",
+        "controller preflights integrated state and traversal once");
     const char* conditional = require_source_token(
         preflight,
-        "if (!integrated_state_is_finite || "
-        "integrated_traversal.blocked) {",
-        "controller enters hard clip on blocked or nonfinite integration");
+        "if (integrated_traversal.blocked) {",
+        "controller enters hard clip on a blocked preflight");
     const char* clip = require_source_token(
-        conditional, "traversability_clip_step(",
-        "controller clips immediately after integration");
+        conditional, "traversability_apply_sweep_result(",
+        "controller applies the preflight result without a second sweep");
     const char* current = require_source_token(
         clip, "walkability_footprint_class(",
         "controller samples current footprint after clipping");
     const char* rotate = require_source_token(
         clip, "simulation_rotations_update(",
         "controller rotation update follows planar clipping");
-    check(before < integrate && integrate < state_check &&
-              state_check < preflight && preflight < conditional &&
+    check(before < integrate && integrate < preflight &&
+              preflight < conditional &&
               conditional < clip && clip < current && current < rotate,
           "integration is immediately surrounded by capture and clip");
     require_source_token(
@@ -2911,8 +3107,11 @@ int main(int argc, char** argv)
     test_walkability_loader_is_strict_transactional_and_grid_exact();
     test_walkability_binary32_half_cell_parity();
     test_walkability_reason_names_are_stable();
+    test_walkability_structural_gate_fails_closed();
     test_walkability_footprint_is_conservative_and_release_safe();
+    test_walkability_footprint_caps_conservative_window();
     test_walkability_sweep_handles_clear_blocked_and_hostile_steps();
+    test_walkability_checked_conversion_and_exact_sample_spacing();
     test_traversability_command_limits_safely_and_recovers();
     test_traversability_clip_is_planar_and_bit_preserving();
     test_walkability_guard_reaches_safe_stop();

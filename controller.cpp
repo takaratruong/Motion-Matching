@@ -2575,35 +2575,22 @@ int main(void)
             state.desired_velocity,
             simulation_velocity_halflife,
             dt);
-        const bool integrated_state_is_finite =
-            terrain_float_is_finite(simulation_before.x) &&
-            terrain_float_is_finite(simulation_before.y) &&
-            terrain_float_is_finite(simulation_before.z) &&
-            terrain_float_is_finite(state.simulation_position.x) &&
-            terrain_float_is_finite(state.simulation_position.y) &&
-            terrain_float_is_finite(state.simulation_position.z) &&
-            terrain_float_is_finite(state.simulation_velocity.x) &&
-            terrain_float_is_finite(state.simulation_velocity.y) &&
-            terrain_float_is_finite(state.simulation_velocity.z) &&
-            terrain_float_is_finite(state.simulation_acceleration.x) &&
-            terrain_float_is_finite(state.simulation_acceleration.y) &&
-            terrain_float_is_finite(state.simulation_acceleration.z);
-        const walkability_sweep_result integrated_traversal = walkability_sweep(
-            active_scene.walkability,
-            active_scene.terrain,
+        const walkability_sweep_result integrated_traversal = traversability_preflight_step(
             simulation_before,
             state.simulation_position,
+            state.simulation_velocity,
+            state.simulation_acceleration,
+            active_scene.walkability,
+            active_scene.terrain,
             0.20f);
-        if (!integrated_state_is_finite || integrated_traversal.blocked) {
-            traversability_clip_step(
+        if (integrated_traversal.blocked) {
+            traversability_apply_sweep_result(
                 simulation_before,
                 state.simulation_position,
                 state.simulation_velocity,
                 state.simulation_acceleration,
                 traversal,
-                active_scene.walkability,
-                active_scene.terrain,
-                0.20f);
+                integrated_traversal);
         }
         walkability_reason current_reason = walkability_clear;
         const int current_walkability_class = walkability_footprint_class(
