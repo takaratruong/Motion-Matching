@@ -368,6 +368,25 @@ void test_clearance_applies_entry_translation_to_root_and_hand_path() {
     assert(select_whole_clip(hand_input, {}).reason == Reason::BlockedPath);
 }
 
+void test_root_clearance_tolerates_only_subcentimeter_proxy_penetration() {
+    using namespace interaction;
+
+    const auto input_with_proxy_penetration = [](float penetration_m) {
+        constexpr float kRootToTableCenterM = 1.0F;
+        constexpr float kNominalRootClearanceM = 0.25F;
+        MatchInput input = valid_input();
+        input.target.table_size.z = 2.0F * (
+            kRootToTableCenterM - kNominalRootClearanceM + penetration_m);
+        return input;
+    };
+
+    const MatchInput shallow = input_with_proxy_penetration(0.009F);
+    assert(select_whole_clip(shallow, {}).accepted);
+
+    const MatchInput deep = input_with_proxy_penetration(0.011F);
+    assert(select_whole_clip(deep, {}).reason == Reason::BlockedPath);
+}
+
 void test_clearance_applies_entry_yaw_to_hand_path() {
     using namespace interaction;
     MatchInput control = valid_input();
@@ -405,6 +424,7 @@ int main() {
     test_reads_serialized_groups_and_configured_weights();
     test_clearance_uses_segments_and_exempts_only_final_contact();
     test_clearance_applies_entry_translation_to_root_and_hand_path();
+    test_root_clearance_tolerates_only_subcentimeter_proxy_penetration();
     test_clearance_applies_entry_yaw_to_hand_path();
     test_failure_precedence_is_deterministic();
     return 0;

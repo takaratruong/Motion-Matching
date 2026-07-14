@@ -14,6 +14,7 @@ namespace interaction {
 namespace {
 
 constexpr float kRootClearanceRadius = 0.25F;
+constexpr float kRootClearanceProxyTolerance = 0.01F;
 constexpr float kSlabEpsilon = 1.0e-7F;
 
 struct ClipFrames {
@@ -259,8 +260,11 @@ bool root_intersects_table(
         -yaw, vec3(0.0F, 1.0F, 0.0F));
     const vec3 local = quat_mul_vec3(
         inverse_yaw, root_world - table.position);
-    return std::abs(local.x) <= 0.5F * table_size.x + kRootClearanceRadius &&
-           std::abs(local.z) <= 0.5F * table_size.z + kRootClearanceRadius;
+    const float half_x = 0.5F * table_size.x +
+        kRootClearanceRadius - kRootClearanceProxyTolerance;
+    const float half_z = 0.5F * table_size.z +
+        kRootClearanceRadius - kRootClearanceProxyTolerance;
+    return std::abs(local.x) <= half_x && std::abs(local.z) <= half_z;
 }
 
 float entry_correction_weight(
