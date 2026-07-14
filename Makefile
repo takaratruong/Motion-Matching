@@ -70,6 +70,16 @@ clean:
 CXX ?= g++
 CPP_TEST_FLAGS ?= -std=c++17 -Wall -Wextra -Werror -pedantic -I.
 CPP_TEST_DIR := build/tests
+TASK12_BUILD_DIR := build/task12
+override SAFE_INTERACTION_QUERY_PROBE := build/task12/interaction_query_probe_safe
+GRAIL_ROOT ?= /home/ubuntu/datasets/GRAIL/data/pickup_table
+G1_XML ?= /home/ubuntu/projects/mjx-diffphysics/env/g1/assets/g1_29dof.xml
+DEMO_INTERACTION_LIMIT ?= 5
+INTERACTION_DEMO_PACK ?= resources/g1_interaction
+PLAYABLE_EVIDENCE_DIR ?= playable-evidence
+PLAYABLE_LOG_PATH ?= $(PLAYABLE_EVIDENCE_DIR)/pickup.jsonl
+PLAYABLE_SCREENSHOT_PATH ?= $(PLAYABLE_EVIDENCE_DIR)/pickup.png
+PLAYABLE_FEATURES_OUTPUT ?= $(PLAYABLE_EVIDENCE_DIR)/locomotion-features.bin
 CPP_TEST_BINS := $(CPP_TEST_DIR)/test_g1_skeleton
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_database
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_pose
@@ -90,8 +100,13 @@ INTERACTION_RUNTIME_SOURCES += interaction_matcher.cpp interaction_features.cpp
 INTERACTION_RUNTIME_SOURCES += interaction_pose.cpp interaction_target.cpp
 
 .PHONY: test-python test-cpp test-interaction
+.PHONY: test-python-interaction-safe test-interaction-safe
+.PHONY: demo-interaction-pack gate-playable-interaction
 
 $(CPP_TEST_DIR):
+	mkdir -p $@
+
+$(TASK12_BUILD_DIR):
 	mkdir -p $@
 
 $(CPP_TEST_DIR)/test_g1_skeleton: tests/cpp/test_g1_skeleton.cpp g1_skeleton.h | $(CPP_TEST_DIR)
@@ -138,6 +153,9 @@ interaction_probe: interaction_probe.cpp interaction_database.h g1_skeleton.h
 interaction_query_probe: interaction_query_probe.cpp interaction_features.cpp interaction_features.h interaction_pose.cpp interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h
 	$(CXX) $(CPP_TEST_FLAGS) interaction_query_probe.cpp interaction_features.cpp interaction_pose.cpp -o $@
 
+$(SAFE_INTERACTION_QUERY_PROBE): interaction_query_probe.cpp interaction_features.cpp interaction_features.h interaction_pose.cpp interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(TASK12_BUILD_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) interaction_query_probe.cpp interaction_features.cpp interaction_pose.cpp -o $@
+
 interaction_runtime_probe: interaction_runtime_probe.cpp interaction_runtime.h $(INTERACTION_RUNTIME_SOURCES) interaction_carry.h interaction_ik.h g1_arm_joint_metadata.h interaction_attachment.h interaction_playback.h interaction_matcher.h interaction_features.h interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h
 	$(CXX) $(CPP_TEST_FLAGS) interaction_runtime_probe.cpp $(INTERACTION_RUNTIME_SOURCES) -o $@
 
@@ -148,3 +166,55 @@ test-cpp: $(CPP_TEST_BINS)
 	@for test_bin in $(CPP_TEST_BINS); do $$test_bin || exit 1; done
 
 test-interaction: test-python test-cpp
+
+test-python-interaction-safe: interaction_probe $(SAFE_INTERACTION_QUERY_PROBE)
+	MM_INTERACTION_QUERY_PROBE="$(abspath $(SAFE_INTERACTION_QUERY_PROBE))" \
+	  G1_XML="$(G1_XML)" \
+	  python -m unittest discover -s tests/python -t . -v
+
+test-interaction-safe: test-python-interaction-safe test-cpp
+
+demo-interaction-pack:
+	python -m resources.build_g1_interaction_database \
+	  --source-root "$(GRAIL_ROOT)" \
+	  --g1-xml "$(G1_XML)" \
+	  --output "$(INTERACTION_DEMO_PACK)" \
+	  --target-fps 25 \
+	  --limit "$(DEMO_INTERACTION_LIMIT)" \
+	  --heldout-count 1
+	python -m resources.validate_g1_interaction_database \
+	  --input "$(INTERACTION_DEMO_PACK)"
+
+gate-playable-interaction: test-interaction-safe demo-interaction-pack \
+  interaction_probe interaction_runtime_probe
+	$(MAKE) bootstrap-raylib
+	$(MAKE) controller
+	mkdir -p "$(PLAYABLE_EVIDENCE_DIR)"
+	@display="$${DISPLAY:-:1}"; \
+	  timeout --signal=TERM --kill-after=1s 5s \
+	    xdpyinfo -display "$$display" >/dev/null
+	./interaction_probe "$(INTERACTION_DEMO_PACK)" --json
+	./interaction_runtime_probe "$(INTERACTION_DEMO_PACK)" --json
+	@features_before="$$(sha256sum resources/features.bin)" || exit 1; \
+	  display="$${DISPLAY:-:1}"; \
+	  DISPLAY="$$display" \
+	  MM_INTERACTION_AUTODEMO=1 \
+	  MM_INTERACTION_PACK="$(INTERACTION_DEMO_PACK)" \
+	  MM_FEATURES_OUTPUT="$(PLAYABLE_FEATURES_OUTPUT)" \
+	  MM_INTERACTION_LOG="$(PLAYABLE_LOG_PATH)" \
+	  MM_INTERACTION_SCREENSHOT="$(PLAYABLE_SCREENSHOT_PATH)" \
+	  timeout --signal=TERM --kill-after=5s 45s ./controller; \
+	  controller_status=$$?; \
+	  features_after="$$(sha256sum resources/features.bin)" || exit 1; \
+	  if test "$$features_before" != "$$features_after"; then \
+	    echo "ERROR resources/features.bin changed during playable gate" >&2; \
+	    exit 1; \
+	  fi; \
+	  if test "$$controller_status" -ne 0; then \
+	    echo "ERROR playable autodemo exited $$controller_status" >&2; \
+	    exit "$$controller_status"; \
+	  fi
+	PLAYABLE_LOG="$(PLAYABLE_LOG_PATH)" \
+	PLAYABLE_SCREENSHOT="$(PLAYABLE_SCREENSHOT_PATH)" \
+	  python -m unittest \
+	    tests.python.test_playable_interaction_evidence -v

@@ -1,10 +1,13 @@
 #include "interaction_controller_adapter.h"
 #include "tests/cpp/interaction_runtime_fixture.h"
 
+#include <array>
 #include <cassert>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -22,6 +25,7 @@ using interaction::ControllerInteractionSceneState;
 using interaction::ControllerInteractionScheduler;
 using interaction::Database;
 using interaction::Features;
+using interaction::FlatControllerPose;
 using interaction::GraspAffordance;
 using interaction::Hand;
 using interaction::InteractionTarget;
@@ -37,6 +41,14 @@ using interaction::RuntimeOutput;
 using interaction::RuntimeState;
 using interaction::TargetHandle;
 using interaction::Transform;
+
+struct FlatWorldPose {
+    std::array<vec3, interaction::kFlatControllerBoneCount> positions{};
+    std::array<vec3, interaction::kFlatControllerBoneCount> velocities{};
+    std::array<quat, interaction::kFlatControllerBoneCount> rotations{};
+    std::array<vec3, interaction::kFlatControllerBoneCount>
+        angular_velocities{};
+};
 
 bool float_bits_equal(float left, float right) {
     return std::memcmp(&left, &right, sizeof(float)) == 0;
@@ -71,6 +83,22 @@ bool pose_bits_equal(const Pose& left, const Pose& right) {
             !float_bits_equal(
                 left.hand_dof_velocities[joint],
                 right.hand_dof_velocities[joint])) {
+            return false;
+        }
+    }
+    return left.foot_contacts == right.foot_contacts;
+}
+
+bool flat_pose_bits_equal(
+    const FlatControllerPose& left,
+    const FlatControllerPose& right) {
+    for (size_t bone = 0; bone < left.positions.size(); ++bone) {
+        if (!vec_bits_equal(left.positions[bone], right.positions[bone]) ||
+            !vec_bits_equal(left.velocities[bone], right.velocities[bone]) ||
+            !quat_bits_equal(left.rotations[bone], right.rotations[bone]) ||
+            !vec_bits_equal(
+                left.angular_velocities[bone],
+                right.angular_velocities[bone])) {
             return false;
         }
     }
@@ -175,6 +203,107 @@ Pose make_pose(float base, bool opposite_quaternion_sign = false) {
     return pose;
 }
 
+FlatControllerPose make_flat_pose(bool opposite_quaternion_sign = false) {
+    FlatControllerPose pose;
+    for (size_t bone = 0; bone < pose.positions.size(); ++bone) {
+        const float value = static_cast<float>(bone + 1U);
+        pose.positions[bone] = bone == 0U
+            ? vec3(1.25F, 0.2F, -0.75F)
+            : vec3(
+                  0.015F * value,
+                  0.04F + 0.006F * value,
+                  -0.011F * value);
+        pose.velocities[bone] = vec3(
+            0.03F * value,
+            -0.012F * value,
+            0.017F * value);
+        const vec3 axis = normalize(vec3(
+            0.7F + 0.01F * value,
+            0.4F + 0.02F * value,
+            0.5F));
+        quat rotation = quat_from_angle_axis(0.015F * value, axis);
+        pose.rotations[bone] =
+            opposite_quaternion_sign ? -rotation : rotation;
+        pose.angular_velocities[bone] = vec3(
+            -0.007F * value,
+            0.009F * value,
+            0.011F * value);
+    }
+    pose.foot_contacts = {1U, 0U};
+    return pose;
+}
+
+FlatWorldPose flat_world_pose(const FlatControllerPose& pose) {
+    FlatWorldPose world;
+    for (size_t bone = 0; bone < interaction::kFlatControllerBoneCount;
+         ++bone) {
+        const int32_t parent = interaction::kFlatControllerParents[bone];
+        if (parent < 0) {
+            world.positions[bone] = pose.positions[bone];
+            world.velocities[bone] = pose.velocities[bone];
+            world.rotations[bone] = pose.rotations[bone];
+            world.angular_velocities[bone] = pose.angular_velocities[bone];
+            continue;
+        }
+        const size_t parent_bone = static_cast<size_t>(parent);
+        const vec3 offset = quat_mul_vec3(
+            world.rotations[parent_bone], pose.positions[bone]);
+        world.positions[bone] = world.positions[parent_bone] + offset;
+        world.rotations[bone] = quat_normalize(quat_mul(
+            world.rotations[parent_bone], pose.rotations[bone]));
+        world.velocities[bone] =
+            world.velocities[parent_bone] +
+            cross(world.angular_velocities[parent_bone], offset) +
+            quat_mul_vec3(
+                world.rotations[parent_bone], pose.velocities[bone]);
+        world.angular_velocities[bone] =
+            world.angular_velocities[parent_bone] +
+            quat_mul_vec3(
+                world.rotations[parent_bone],
+                pose.angular_velocities[bone]);
+    }
+    return world;
+}
+
+void assert_flat_pose_near(
+    const FlatControllerPose& actual,
+    const FlatControllerPose& expected,
+    float tolerance = 2.0e-4F) {
+    for (size_t bone = 0; bone < actual.positions.size(); ++bone) {
+        assert_vec_near(actual.positions[bone], expected.positions[bone], tolerance);
+        assert_vec_near(actual.velocities[bone], expected.velocities[bone], tolerance);
+        assert_same_rotation(
+            actual.rotations[bone], expected.rotations[bone], tolerance);
+        assert_vec_near(
+            actual.angular_velocities[bone],
+            expected.angular_velocities[bone],
+            tolerance);
+    }
+    assert(actual.foot_contacts == expected.foot_contacts);
+}
+
+void assert_pose_is_finite_and_unit(const Pose& pose) {
+    for (size_t bone = 0; bone < pose.positions.size(); ++bone) {
+        for (float value : {
+                 pose.positions[bone].x,
+                 pose.positions[bone].y,
+                 pose.positions[bone].z,
+                 pose.velocities[bone].x,
+                 pose.velocities[bone].y,
+                 pose.velocities[bone].z,
+                 pose.rotations[bone].w,
+                 pose.rotations[bone].x,
+                 pose.rotations[bone].y,
+                 pose.rotations[bone].z,
+                 pose.angular_velocities[bone].x,
+                 pose.angular_velocities[bone].y,
+                 pose.angular_velocities[bone].z}) {
+            assert(std::isfinite(value));
+        }
+        assert(near(quat_length(pose.rotations[bone]), 1.0F, 2.0e-5F));
+    }
+}
+
 LocomotionSnapshot make_snapshot(float base) {
     LocomotionSnapshot snapshot;
     snapshot.pose = make_pose(base);
@@ -238,6 +367,244 @@ void test_exact_constants() {
     static_assert(
         interaction::kInteractionRuntimeStepSeconds == 1.0F / 25.0F,
         "runtime step must be exact binary32 1/25");
+}
+
+void test_flat_bridge_exact_parent_tree_anchor_map_and_unmapped_head() {
+    static_assert(interaction::kFlatControllerBoneCount == 23U);
+    static_assert(
+        std::tuple_size<decltype(FlatControllerPose::positions)>::value == 23U);
+    static_assert(
+        std::tuple_size<decltype(FlatControllerPose::velocities)>::value == 23U);
+    static_assert(
+        std::tuple_size<decltype(FlatControllerPose::rotations)>::value == 23U);
+    static_assert(
+        std::tuple_size<
+            decltype(FlatControllerPose::angular_velocities)>::value == 23U);
+
+    constexpr std::array<int32_t, 23> expected_parents = {
+        -1, 0, 1, 2, 3, 4, 1, 6, 7, 8, 1, 10,
+        11, 12, 13, 12, 15, 16, 17, 12, 19, 20, 21};
+    assert(interaction::kFlatControllerParents == expected_parents);
+
+    constexpr std::array<size_t, 21> expected_flat = {
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+        11, 12, 15, 16, 17, 18, 19, 20, 21, 22};
+    constexpr std::array<size_t, 21> expected_g1 = {
+        0, 1, 2, 5, 6, 7, 8, 11, 12, 13, 14,
+        15, 16, 17, 19, 20, 23, 24, 26, 27, 30};
+    static_assert(interaction::kFlatControllerAnchors.size() == 21U);
+    std::array<bool, interaction::kFlatControllerBoneCount> mapped_flat{};
+    for (size_t index = 0; index < expected_flat.size(); ++index) {
+        const interaction::FlatControllerAnchor anchor =
+            interaction::kFlatControllerAnchors[index];
+        assert(anchor.flat_bone == expected_flat[index]);
+        assert(anchor.g1_bone == expected_g1[index]);
+        assert(!mapped_flat[anchor.flat_bone]);
+        mapped_flat[anchor.flat_bone] = true;
+    }
+    for (size_t bone = 0; bone < mapped_flat.size(); ++bone) {
+        assert(mapped_flat[bone] == (bone != 13U && bone != 14U));
+    }
+    static_assert(interaction::kFlatControllerLeftToe == 5U);
+    static_assert(interaction::kFlatControllerRightToe == 9U);
+}
+
+void test_flat_bridge_expansion_matches_every_world_anchor_and_retains_reference() {
+    const FlatControllerPose flat = make_flat_pose();
+    const Pose reference = make_pose(0.25F);
+    const Pose expanded =
+        interaction::expand_flat_controller_pose(flat, reference);
+    assert_pose_is_finite_and_unit(expanded);
+
+    const FlatWorldPose desired = flat_world_pose(flat);
+    const interaction::WorldPose actual = interaction::world_pose(expanded);
+    std::array<bool, g1_skeleton::BoneCount> mapped_g1{};
+    for (const interaction::FlatControllerAnchor anchor :
+         interaction::kFlatControllerAnchors) {
+        mapped_g1[anchor.g1_bone] = true;
+        assert_vec_near(
+            actual.positions[anchor.g1_bone],
+            desired.positions[anchor.flat_bone],
+            3.0e-4F);
+        assert_vec_near(
+            actual.velocities[anchor.g1_bone],
+            desired.velocities[anchor.flat_bone],
+            3.0e-4F);
+        assert_same_rotation(
+            actual.rotations[anchor.g1_bone],
+            desired.rotations[anchor.flat_bone],
+            3.0e-4F);
+        assert_vec_near(
+            actual.angular_velocities[anchor.g1_bone],
+            desired.angular_velocities[anchor.flat_bone],
+            3.0e-4F);
+    }
+
+    for (size_t bone = 0; bone < mapped_g1.size(); ++bone) {
+        if (mapped_g1[bone]) {
+            continue;
+        }
+        assert(vec_bits_equal(expanded.positions[bone], reference.positions[bone]));
+        assert(vec_bits_equal(expanded.velocities[bone], reference.velocities[bone]));
+        assert(quat_bits_equal(expanded.rotations[bone], reference.rotations[bone]));
+        assert(vec_bits_equal(
+            expanded.angular_velocities[bone],
+            reference.angular_velocities[bone]));
+    }
+    assert(expanded.hand_dof == reference.hand_dof);
+    assert(expanded.hand_dof_velocities == reference.hand_dof_velocities);
+    assert(expanded.foot_contacts == flat.foot_contacts);
+}
+
+void test_flat_bridge_collapse_round_trips_all_channels_and_contacts() {
+    const FlatControllerPose original = make_flat_pose();
+    const Pose reference = make_pose(0.5F);
+    const Pose expanded =
+        interaction::expand_flat_controller_pose(original, reference);
+    const FlatControllerPose collapsed =
+        interaction::collapse_interaction_pose(expanded, original);
+    assert_flat_pose_near(collapsed, original);
+
+    for (size_t bone : {13U, 14U}) {
+        assert(vec_bits_equal(
+            collapsed.positions[bone], original.positions[bone]));
+        assert(vec_bits_equal(
+            collapsed.velocities[bone], original.velocities[bone]));
+        assert(quat_bits_equal(
+            collapsed.rotations[bone], original.rotations[bone]));
+        assert(vec_bits_equal(
+            collapsed.angular_velocities[bone],
+            original.angular_velocities[bone]));
+    }
+}
+
+void test_flat_bridge_accepts_antipodal_equivalent_rotations() {
+    const FlatControllerPose positive = make_flat_pose(false);
+    const FlatControllerPose antipodal = make_flat_pose(true);
+    const Pose reference = make_pose(0.75F, true);
+    const Pose positive_expanded =
+        interaction::expand_flat_controller_pose(positive, reference);
+    const Pose antipodal_expanded =
+        interaction::expand_flat_controller_pose(antipodal, reference);
+    const FlatWorldPose positive_world = flat_world_pose(positive);
+    const FlatWorldPose antipodal_world = flat_world_pose(antipodal);
+    const interaction::WorldPose positive_g1 =
+        interaction::world_pose(positive_expanded);
+    const interaction::WorldPose antipodal_g1 =
+        interaction::world_pose(antipodal_expanded);
+
+    for (const interaction::FlatControllerAnchor anchor :
+         interaction::kFlatControllerAnchors) {
+        assert_same_rotation(
+            positive_world.rotations[anchor.flat_bone],
+            antipodal_world.rotations[anchor.flat_bone],
+            3.0e-4F);
+        assert_same_rotation(
+            positive_g1.rotations[anchor.g1_bone],
+            antipodal_g1.rotations[anchor.g1_bone],
+            3.0e-4F);
+    }
+    assert_flat_pose_near(
+        interaction::collapse_interaction_pose(
+            antipodal_expanded, antipodal),
+        antipodal);
+}
+
+void test_flat_bridge_rejects_invalid_input_without_mutation() {
+    const auto expect_format_error = [](const auto& operation) {
+        bool threw = false;
+        try {
+            operation();
+        } catch (const interaction::FormatError&) {
+            threw = true;
+        }
+        assert(threw);
+    };
+
+    FlatControllerPose invalid_flat = make_flat_pose();
+    Pose reference = make_pose(1.0F);
+    invalid_flat.positions[4].x =
+        std::numeric_limits<float>::quiet_NaN();
+    const FlatControllerPose invalid_flat_before = invalid_flat;
+    const Pose reference_before = reference;
+    expect_format_error([&] {
+        (void)interaction::expand_flat_controller_pose(
+            invalid_flat, reference);
+    });
+    assert(flat_pose_bits_equal(invalid_flat, invalid_flat_before));
+    assert(pose_bits_equal(reference, reference_before));
+
+    invalid_flat = make_flat_pose();
+    invalid_flat.rotations[7] = quat(0.0F, 0.0F, 0.0F, 0.0F);
+    const FlatControllerPose zero_rotation_before = invalid_flat;
+    expect_format_error([&] {
+        (void)interaction::expand_flat_controller_pose(
+            invalid_flat, reference);
+    });
+    assert(flat_pose_bits_equal(invalid_flat, zero_rotation_before));
+
+    const FlatControllerPose valid_flat = make_flat_pose();
+    reference = make_pose(1.25F);
+    reference.angular_velocities[29].z =
+        std::numeric_limits<float>::infinity();
+    const Pose invalid_reference_before = reference;
+    expect_format_error([&] {
+        (void)interaction::expand_flat_controller_pose(valid_flat, reference);
+    });
+    assert(pose_bits_equal(reference, invalid_reference_before));
+
+    Pose invalid_interaction = make_pose(1.5F);
+    invalid_interaction.rotations[12] = quat(0.0F, 0.0F, 0.0F, 0.0F);
+    FlatControllerPose fallback = make_flat_pose();
+    const Pose invalid_interaction_before = invalid_interaction;
+    const FlatControllerPose fallback_before = fallback;
+    expect_format_error([&] {
+        (void)interaction::collapse_interaction_pose(
+            invalid_interaction, fallback);
+    });
+    assert(pose_bits_equal(invalid_interaction, invalid_interaction_before));
+    assert(flat_pose_bits_equal(fallback, fallback_before));
+
+    invalid_interaction = make_pose(1.75F);
+    fallback.velocities[18].y =
+        std::numeric_limits<float>::quiet_NaN();
+    const FlatControllerPose invalid_fallback_before = fallback;
+    expect_format_error([&] {
+        (void)interaction::collapse_interaction_pose(
+            invalid_interaction, fallback);
+    });
+    assert(flat_pose_bits_equal(fallback, invalid_fallback_before));
+}
+
+void test_flat_bridge_canaries_prove_exact_23_element_bounds() {
+    struct GuardedFlatPose {
+        std::array<uint64_t, 4> before{};
+        FlatControllerPose pose{};
+        std::array<uint64_t, 4> after{};
+    };
+    constexpr std::array<uint64_t, 4> kBefore = {
+        0x0123456789abcdefULL,
+        0xfedcba9876543210ULL,
+        0xaaaaaaaa55555555ULL,
+        0x13579bdf2468ace0ULL};
+    constexpr std::array<uint64_t, 4> kAfter = {
+        0x0f0e0d0c0b0a0908ULL,
+        0x1020304050607080ULL,
+        0xcafebabedeadbeefULL,
+        0x55aa55aa33cc33ccULL};
+
+    GuardedFlatPose input{kBefore, make_flat_pose(), kAfter};
+    GuardedFlatPose output{kBefore, {}, kAfter};
+    const Pose reference = make_pose(2.0F);
+    const Pose expanded = interaction::expand_flat_controller_pose(
+        input.pose, reference);
+    output.pose = interaction::collapse_interaction_pose(
+        expanded, input.pose);
+    assert(input.before == kBefore);
+    assert(input.after == kAfter);
+    assert(output.before == kBefore);
+    assert(output.after == kAfter);
+    assert_flat_pose_near(output.pose, input.pose);
 }
 
 void test_scheduler_cadence_and_cache() {
@@ -917,6 +1284,12 @@ void test_controller_and_make_clock_policy() {
 
 int main() {
     test_exact_constants();
+    test_flat_bridge_exact_parent_tree_anchor_map_and_unmapped_head();
+    test_flat_bridge_expansion_matches_every_world_anchor_and_retains_reference();
+    test_flat_bridge_collapse_round_trips_all_channels_and_contacts();
+    test_flat_bridge_accepts_antipodal_equivalent_rotations();
+    test_flat_bridge_rejects_invalid_input_without_mutation();
+    test_flat_bridge_canaries_prove_exact_23_element_bounds();
     test_scheduler_cadence_and_cache();
     test_edges_latch_coalesce_and_clear_after_delivery();
     test_cache_changes_only_after_successful_due_delivery();

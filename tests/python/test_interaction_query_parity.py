@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -13,6 +14,9 @@ from tests.python.test_interaction_artifacts import artifact_fixture
 
 class InteractionQueryParityTests(unittest.TestCase):
     def test_probe_reconstructs_first_reach_query_for_every_clip(self):
+        query_probe = Path(
+            os.environ.get("MM_INTERACTION_QUERY_PROBE", "./interaction_query_probe")
+        )
         artifact, features, split, manifest, report = artifact_fixture()
         with tempfile.TemporaryDirectory() as tmp:
             pack = Path(tmp) / "pack"
@@ -33,7 +37,7 @@ class InteractionQueryParityTests(unittest.TestCase):
                 with self.subTest(clip=clip, frame=frame):
                     completed = subprocess.run(
                         [
-                            "./interaction_query_probe",
+                            str(query_probe),
                             str(pack),
                             str(clip),
                             str(frame),

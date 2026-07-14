@@ -1,7 +1,12 @@
 #include "interaction_controller_adapter.h"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <string>
 
 namespace interaction {
 namespace {
@@ -9,6 +14,217 @@ namespace {
 constexpr int kControllerRate = 60;
 constexpr int kInteractionRuntimeRate = 25;
 constexpr float kOwnershipBlendSeconds = 0.25F;
+constexpr float kUnitRotationTolerance = 1.0e-3F;
+
+constexpr std::array<int32_t, g1_skeleton::BoneCount> kG1ToFlatBone = {
+    0, 1, 2, -1, -1, 3, 4, 5, 6, -1, -1, 7, 8, 9, 10, 11,
+    12, 15, -1, 16, 17, -1, -1, 18, 19, -1, 20, 21, -1, -1, 22};
+constexpr std::array<int32_t, kFlatControllerBoneCount> kFlatToG1Bone = {
+    0, 1, 2, 5, 6, 7, 8, 11, 12, 13, 14, 15,
+    16, -1, -1, 17, 19, 20, 23, 24, 26, 27, 30};
+
+struct FlatWorldPose {
+    std::array<vec3, kFlatControllerBoneCount> positions{};
+    std::array<vec3, kFlatControllerBoneCount> velocities{};
+    std::array<quat, kFlatControllerBoneCount> rotations{};
+    std::array<vec3, kFlatControllerBoneCount> angular_velocities{};
+};
+
+bool finite(float value) {
+    uint32_t bits = 0U;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    return (bits & 0x7f800000U) != 0x7f800000U;
+}
+
+bool finite(vec3 value) {
+    return finite(value.x) && finite(value.y) && finite(value.z);
+}
+
+bool finite(quat value) {
+    return finite(value.w) && finite(value.x) && finite(value.y) &&
+           finite(value.z);
+}
+
+void validate_rotation(quat rotation, const std::string& label) {
+    if (!finite(rotation)) {
+        throw FormatError(label + " rotation is non-finite");
+    }
+    const float magnitude = quat_length(rotation);
+    if (!finite(magnitude) ||
+        std::fabs(magnitude - 1.0F) > kUnitRotationTolerance) {
+        throw FormatError(label + " rotation is not unit length");
+    }
+}
+
+void validate_flat_pose(const FlatControllerPose& pose) {
+    for (size_t bone = 0; bone < kFlatControllerBoneCount; ++bone) {
+        const std::string label =
+            "flat controller bone " + std::to_string(bone);
+        if (!finite(pose.positions[bone]) ||
+            !finite(pose.velocities[bone]) ||
+            !finite(pose.angular_velocities[bone])) {
+            throw FormatError(label + " has non-finite vector data");
+        }
+        validate_rotation(pose.rotations[bone], label);
+    }
+    for (uint8_t contact : pose.foot_contacts) {
+        if (contact > 1U) {
+            throw FormatError("flat controller foot contact is not boolean");
+        }
+    }
+}
+
+void validate_interaction_pose(const Pose& pose) {
+    for (size_t bone = 0; bone < g1_skeleton::BoneCount; ++bone) {
+        const std::string label =
+            "G1 interaction bone " + std::to_string(bone);
+        if (!finite(pose.positions[bone]) ||
+            !finite(pose.velocities[bone]) ||
+            !finite(pose.angular_velocities[bone])) {
+            throw FormatError(label + " has non-finite vector data");
+        }
+        validate_rotation(pose.rotations[bone], label);
+    }
+    for (float value : pose.hand_dof) {
+        if (!finite(value)) {
+            throw FormatError("G1 interaction hand DOF is non-finite");
+        }
+    }
+    for (float value : pose.hand_dof_velocities) {
+        if (!finite(value)) {
+            throw FormatError("G1 interaction hand DOF velocity is non-finite");
+        }
+    }
+    for (uint8_t contact : pose.foot_contacts) {
+        if (contact > 1U) {
+            throw FormatError("G1 interaction foot contact is not boolean");
+        }
+    }
+}
+
+quat normalized_rotation(quat rotation) {
+    const float magnitude = quat_length(rotation);
+    return rotation / magnitude;
+}
+
+FlatWorldPose flat_world_pose(const FlatControllerPose& pose) {
+    FlatWorldPose world;
+    for (size_t bone = 0; bone < kFlatControllerBoneCount; ++bone) {
+        const int32_t parent = kFlatControllerParents[bone];
+        if (parent < 0) {
+            world.positions[bone] = pose.positions[bone];
+            world.velocities[bone] = pose.velocities[bone];
+            world.rotations[bone] = normalized_rotation(pose.rotations[bone]);
+            world.angular_velocities[bone] = pose.angular_velocities[bone];
+            continue;
+        }
+
+        const size_t parent_bone = static_cast<size_t>(parent);
+        const vec3 offset = quat_mul_vec3(
+            world.rotations[parent_bone], pose.positions[bone]);
+        world.positions[bone] = world.positions[parent_bone] + offset;
+        world.rotations[bone] = normalized_rotation(quat_mul(
+            world.rotations[parent_bone], pose.rotations[bone]));
+        world.velocities[bone] =
+            world.velocities[parent_bone] +
+            cross(world.angular_velocities[parent_bone], offset) +
+            quat_mul_vec3(
+                world.rotations[parent_bone], pose.velocities[bone]);
+        world.angular_velocities[bone] =
+            world.angular_velocities[parent_bone] +
+            quat_mul_vec3(
+                world.rotations[parent_bone],
+                pose.angular_velocities[bone]);
+    }
+    return world;
+}
+
+void solve_local_channel(
+    vec3& local_position,
+    vec3& local_velocity,
+    quat& local_rotation,
+    vec3& local_angular_velocity,
+    vec3 desired_position,
+    vec3 desired_velocity,
+    quat desired_rotation,
+    vec3 desired_angular_velocity,
+    vec3 parent_position,
+    vec3 parent_velocity,
+    quat parent_rotation,
+    vec3 parent_angular_velocity) {
+    const vec3 world_offset = desired_position - parent_position;
+    local_position = quat_inv_mul_vec3(parent_rotation, world_offset);
+    local_rotation = normalized_rotation(
+        quat_inv_mul(parent_rotation, desired_rotation));
+    local_velocity = quat_inv_mul_vec3(
+        parent_rotation,
+        desired_velocity - parent_velocity -
+            cross(parent_angular_velocity, world_offset));
+    local_angular_velocity = quat_inv_mul_vec3(
+        parent_rotation,
+        desired_angular_velocity - parent_angular_velocity);
+}
+
+void update_g1_world_bone(
+    WorldPose& world,
+    const Pose& pose,
+    size_t bone) {
+    const int32_t parent = g1_skeleton::kParents[bone];
+    if (parent < 0) {
+        world.positions[bone] = pose.positions[bone];
+        world.velocities[bone] = pose.velocities[bone];
+        world.rotations[bone] = normalized_rotation(pose.rotations[bone]);
+        world.angular_velocities[bone] = pose.angular_velocities[bone];
+        return;
+    }
+    const size_t parent_bone = static_cast<size_t>(parent);
+    const vec3 offset = quat_mul_vec3(
+        world.rotations[parent_bone], pose.positions[bone]);
+    world.positions[bone] = world.positions[parent_bone] + offset;
+    world.rotations[bone] = normalized_rotation(quat_mul(
+        world.rotations[parent_bone], pose.rotations[bone]));
+    world.velocities[bone] =
+        world.velocities[parent_bone] +
+        cross(world.angular_velocities[parent_bone], offset) +
+        quat_mul_vec3(
+            world.rotations[parent_bone], pose.velocities[bone]);
+    world.angular_velocities[bone] =
+        world.angular_velocities[parent_bone] +
+        quat_mul_vec3(
+            world.rotations[parent_bone],
+            pose.angular_velocities[bone]);
+}
+
+void update_flat_world_bone(
+    FlatWorldPose& world,
+    const FlatControllerPose& pose,
+    size_t bone) {
+    const int32_t parent = kFlatControllerParents[bone];
+    if (parent < 0) {
+        world.positions[bone] = pose.positions[bone];
+        world.velocities[bone] = pose.velocities[bone];
+        world.rotations[bone] = normalized_rotation(pose.rotations[bone]);
+        world.angular_velocities[bone] = pose.angular_velocities[bone];
+        return;
+    }
+    const size_t parent_bone = static_cast<size_t>(parent);
+    const vec3 offset = quat_mul_vec3(
+        world.rotations[parent_bone], pose.positions[bone]);
+    world.positions[bone] = world.positions[parent_bone] + offset;
+    world.rotations[bone] = normalized_rotation(quat_mul(
+        world.rotations[parent_bone], pose.rotations[bone]));
+    world.velocities[bone] =
+        world.velocities[parent_bone] +
+        cross(world.angular_velocities[parent_bone], offset) +
+        quat_mul_vec3(
+            world.rotations[parent_bone], pose.velocities[bone]);
+    world.angular_velocities[bone] =
+        world.angular_velocities[parent_bone] +
+        quat_mul_vec3(
+            world.rotations[parent_bone],
+            pose.angular_velocities[bone]);
+}
 
 Transform frame_transform(
     const std::vector<float>& positions,
@@ -68,6 +284,105 @@ Pose blend_pose(const Pose& source, const Pose& target, float alpha) {
 }
 
 }  // namespace
+
+Pose expand_flat_controller_pose(
+    const FlatControllerPose& flat_pose,
+    const Pose& interaction_reference) {
+    validate_flat_pose(flat_pose);
+    validate_interaction_pose(interaction_reference);
+
+    const FlatWorldPose flat_world = flat_world_pose(flat_pose);
+    Pose expanded = interaction_reference;
+    WorldPose expanded_world{};
+    for (size_t g1_bone = 0; g1_bone < g1_skeleton::BoneCount; ++g1_bone) {
+        const int32_t flat_bone_value = kG1ToFlatBone[g1_bone];
+        if (flat_bone_value >= 0) {
+            const size_t flat_bone =
+                static_cast<size_t>(flat_bone_value);
+            const int32_t parent = g1_skeleton::kParents[g1_bone];
+            if (parent < 0) {
+                expanded.positions[g1_bone] = flat_world.positions[flat_bone];
+                expanded.velocities[g1_bone] =
+                    flat_world.velocities[flat_bone];
+                expanded.rotations[g1_bone] = normalized_rotation(
+                    flat_world.rotations[flat_bone]);
+                expanded.angular_velocities[g1_bone] =
+                    flat_world.angular_velocities[flat_bone];
+            } else {
+                const size_t parent_bone = static_cast<size_t>(parent);
+                solve_local_channel(
+                    expanded.positions[g1_bone],
+                    expanded.velocities[g1_bone],
+                    expanded.rotations[g1_bone],
+                    expanded.angular_velocities[g1_bone],
+                    flat_world.positions[flat_bone],
+                    flat_world.velocities[flat_bone],
+                    flat_world.rotations[flat_bone],
+                    flat_world.angular_velocities[flat_bone],
+                    expanded_world.positions[parent_bone],
+                    expanded_world.velocities[parent_bone],
+                    expanded_world.rotations[parent_bone],
+                    expanded_world.angular_velocities[parent_bone]);
+            }
+        }
+        update_g1_world_bone(expanded_world, expanded, g1_bone);
+    }
+    expanded.foot_contacts = flat_pose.foot_contacts;
+    validate_interaction_pose(expanded);
+    return expanded;
+}
+
+FlatControllerPose collapse_interaction_pose(
+    const Pose& interaction_pose,
+    const FlatControllerPose& flat_fallback) {
+    validate_interaction_pose(interaction_pose);
+    validate_flat_pose(flat_fallback);
+
+    WorldPose interaction_world{};
+    for (size_t bone = 0; bone < g1_skeleton::BoneCount; ++bone) {
+        update_g1_world_bone(interaction_world, interaction_pose, bone);
+    }
+
+    FlatControllerPose collapsed = flat_fallback;
+    FlatWorldPose collapsed_world{};
+    for (size_t flat_bone = 0; flat_bone < kFlatControllerBoneCount;
+         ++flat_bone) {
+        const int32_t g1_bone_value = kFlatToG1Bone[flat_bone];
+        if (g1_bone_value >= 0) {
+            const size_t g1_bone = static_cast<size_t>(g1_bone_value);
+            const int32_t parent = kFlatControllerParents[flat_bone];
+            if (parent < 0) {
+                collapsed.positions[flat_bone] =
+                    interaction_world.positions[g1_bone];
+                collapsed.velocities[flat_bone] =
+                    interaction_world.velocities[g1_bone];
+                collapsed.rotations[flat_bone] = normalized_rotation(
+                    interaction_world.rotations[g1_bone]);
+                collapsed.angular_velocities[flat_bone] =
+                    interaction_world.angular_velocities[g1_bone];
+            } else {
+                const size_t parent_bone = static_cast<size_t>(parent);
+                solve_local_channel(
+                    collapsed.positions[flat_bone],
+                    collapsed.velocities[flat_bone],
+                    collapsed.rotations[flat_bone],
+                    collapsed.angular_velocities[flat_bone],
+                    interaction_world.positions[g1_bone],
+                    interaction_world.velocities[g1_bone],
+                    interaction_world.rotations[g1_bone],
+                    interaction_world.angular_velocities[g1_bone],
+                    collapsed_world.positions[parent_bone],
+                    collapsed_world.velocities[parent_bone],
+                    collapsed_world.rotations[parent_bone],
+                    collapsed_world.angular_velocities[parent_bone]);
+            }
+        }
+        update_flat_world_bone(collapsed_world, collapsed, flat_bone);
+    }
+    collapsed.foot_contacts = interaction_pose.foot_contacts;
+    validate_flat_pose(collapsed);
+    return collapsed;
+}
 
 const RuntimeOutput& ControllerInteractionScheduler::tick(
     ControllerInteractionEdges edges,

@@ -19,13 +19,25 @@
 #include "interaction_debug_draw.h"
 #include "interaction_runtime.h"
 
+#include <algorithm>
 #include <array>
+#include <csignal>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
-#include <initializer_list>
+#include <fstream>
 #include <functional>
+#include <iomanip>
+#include <initializer_list>
+#include <locale>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <system_error>
+#include <vector>
 
 //--------------------------------------
 
@@ -1272,6 +1284,713 @@ quat clamp_character_rotation(
 
 //--------------------------------------
 
+namespace {
+
+bool autodemo_is_finite(float value)
+{
+    uint32_t bits = 0U;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    return (bits & 0x7f800000U) != 0x7f800000U;
+}
+
+void save_matching_features_checked(
+    const database& db,
+    const std::filesystem::path& path)
+{
+    if (db.features.rows < 0 || db.features.cols < 0 ||
+        db.features_offset.size < 0 || db.features_scale.size < 0)
+    {
+        throw std::runtime_error(
+            "matching features contain invalid dimensions");
+    }
+
+    const std::string filename = path.string();
+    FILE* output = std::fopen(filename.c_str(), "wb");
+    if (output == nullptr)
+    {
+        throw std::runtime_error(
+            "cannot open matching features output " + filename);
+    }
+
+    const size_t feature_value_count =
+        static_cast<size_t>(db.features.rows) *
+        static_cast<size_t>(db.features.cols);
+    bool write_succeeded = true;
+    const auto write_exact =
+        [&](const void* values, size_t element_size, size_t count)
+        {
+            if (std::fwrite(values, element_size, count, output) != count)
+            {
+                write_succeeded = false;
+            }
+        };
+    write_exact(&db.features.rows, sizeof(int), 1U);
+    write_exact(&db.features.cols, sizeof(int), 1U);
+    write_exact(
+        db.features.data,
+        sizeof(float),
+        feature_value_count);
+    write_exact(&db.features_offset.size, sizeof(int), 1U);
+    write_exact(
+        db.features_offset.data,
+        sizeof(float),
+        static_cast<size_t>(db.features_offset.size));
+    write_exact(&db.features_scale.size, sizeof(int), 1U);
+    write_exact(
+        db.features_scale.data,
+        sizeof(float),
+        static_cast<size_t>(db.features_scale.size));
+
+    const int flush_result = std::fflush(output);
+    const int close_result = std::fclose(output);
+    if (!write_succeeded || flush_result != 0 || close_result != 0)
+    {
+        throw std::runtime_error(
+            "cannot write matching features output " + filename);
+    }
+}
+
+struct AutodemoConfiguration
+{
+    std::filesystem::path log_final;
+    std::filesystem::path log_temporary;
+    std::filesystem::path log_backup;
+    std::filesystem::path screenshot_final;
+    std::filesystem::path screenshot_temporary;
+    std::filesystem::path screenshot_backup;
+    bool preserve_backups_after_rollback_failure = false;
+};
+
+std::filesystem::path autodemo_normalized_path(
+    const std::filesystem::path& path)
+{
+    return std::filesystem::absolute(path).lexically_normal();
+}
+
+void autodemo_require_parent_directory(
+    const std::filesystem::path& path,
+    const char* label)
+{
+    const std::filesystem::path parent = path.parent_path().empty()
+        ? std::filesystem::path(".")
+        : path.parent_path();
+    std::error_code error;
+    const bool directory = std::filesystem::is_directory(parent, error);
+    if (error || !directory)
+    {
+        throw std::runtime_error(
+            std::string(label) + " parent directory does not exist");
+    }
+}
+
+std::optional<AutodemoConfiguration> parse_autodemo_environment()
+{
+    const char* autodemo_value = std::getenv("MM_INTERACTION_AUTODEMO");
+    if (autodemo_value == nullptr)
+    {
+        return std::nullopt;
+    }
+    if (std::string(autodemo_value) != "1")
+    {
+        throw std::runtime_error("MM_INTERACTION_AUTODEMO must equal 1");
+    }
+
+    const char* log_value = std::getenv("MM_INTERACTION_LOG");
+    const char* screenshot_value =
+        std::getenv("MM_INTERACTION_SCREENSHOT");
+    if (log_value == nullptr || log_value[0] == '\0')
+    {
+        throw std::runtime_error("MM_INTERACTION_LOG must be nonempty");
+    }
+    if (screenshot_value == nullptr || screenshot_value[0] == '\0')
+    {
+        throw std::runtime_error(
+            "MM_INTERACTION_SCREENSHOT must be nonempty");
+    }
+
+    AutodemoConfiguration configuration;
+    configuration.log_final = std::filesystem::path(log_value);
+    configuration.screenshot_final =
+        std::filesystem::path(screenshot_value);
+    autodemo_require_parent_directory(configuration.log_final, "log");
+    autodemo_require_parent_directory(
+        configuration.screenshot_final, "screenshot");
+    if (autodemo_normalized_path(configuration.log_final) ==
+        autodemo_normalized_path(configuration.screenshot_final))
+    {
+        throw std::runtime_error(
+            "MM_INTERACTION_LOG and MM_INTERACTION_SCREENSHOT must differ");
+    }
+
+    configuration.log_temporary = std::filesystem::path(
+        configuration.log_final.string() + ".tmp");
+    configuration.log_backup = std::filesystem::path(
+        configuration.log_final.string() + ".autodemo-previous");
+    configuration.screenshot_temporary =
+        configuration.screenshot_final.parent_path() /
+        (configuration.screenshot_final.filename().string() + ".tmp.png");
+    configuration.screenshot_backup = std::filesystem::path(
+        configuration.screenshot_final.string() + ".autodemo-previous");
+
+    const std::array<std::filesystem::path, 6> paths = {
+        configuration.log_final,
+        configuration.log_temporary,
+        configuration.log_backup,
+        configuration.screenshot_final,
+        configuration.screenshot_temporary,
+        configuration.screenshot_backup};
+    for (size_t left = 0; left < paths.size(); ++left)
+    {
+        for (size_t right = left + 1; right < paths.size(); ++right)
+        {
+            if (autodemo_normalized_path(paths[left]) ==
+                autodemo_normalized_path(paths[right]))
+            {
+                throw std::runtime_error(
+                    "autodemo final and temporary paths must be distinct");
+            }
+        }
+    }
+    return configuration;
+}
+
+void autodemo_remove_checked(const std::filesystem::path& path)
+{
+    std::error_code error;
+    (void)std::filesystem::remove(path, error);
+    if (error)
+    {
+        throw std::runtime_error(
+            "cannot remove autodemo temporary " + path.string());
+    }
+}
+
+void prepare_autodemo_temporaries(
+    const AutodemoConfiguration& configuration)
+{
+    autodemo_remove_checked(configuration.log_temporary);
+    autodemo_remove_checked(configuration.log_backup);
+    autodemo_remove_checked(configuration.screenshot_temporary);
+    autodemo_remove_checked(configuration.screenshot_backup);
+}
+
+void cleanup_autodemo_backups_best_effort(
+    const AutodemoConfiguration& configuration) noexcept
+{
+    const std::array<const std::filesystem::path*, 2> backup_paths = {
+        &configuration.log_backup,
+        &configuration.screenshot_backup};
+    for (const std::filesystem::path* path : backup_paths)
+    {
+        std::error_code ignored;
+        (void)std::filesystem::remove(*path, ignored);
+    }
+}
+
+void cleanup_autodemo_temporaries(
+    const AutodemoConfiguration& configuration) noexcept
+{
+    const std::array<std::filesystem::path, 2> temporary_paths = {
+        configuration.log_temporary,
+        configuration.screenshot_temporary};
+    for (const std::filesystem::path& path : temporary_paths)
+    {
+        std::error_code ignored;
+        (void)std::filesystem::remove(path, ignored);
+    }
+    if (!configuration.preserve_backups_after_rollback_failure)
+    {
+        cleanup_autodemo_backups_best_effort(configuration);
+    }
+}
+
+void cleanup_autodemo_temporaries_checked(
+    const AutodemoConfiguration& configuration)
+{
+    autodemo_remove_checked(configuration.log_temporary);
+    autodemo_remove_checked(configuration.screenshot_temporary);
+}
+
+struct AutodemoPublicationSlot
+{
+    std::filesystem::path temporary;
+    std::filesystem::path final;
+    std::filesystem::path backup;
+    bool final_existed = false;
+    bool published = false;
+};
+
+void prepare_autodemo_backup(AutodemoPublicationSlot& slot)
+{
+    std::error_code error;
+    slot.final_existed = std::filesystem::exists(slot.final, error);
+    if (error)
+    {
+        throw std::runtime_error(
+            "cannot inspect prior autodemo evidence " +
+            slot.final.string());
+    }
+    if (!slot.final_existed)
+    {
+        return;
+    }
+    const bool copied = std::filesystem::copy_file(
+        slot.final,
+        slot.backup,
+        std::filesystem::copy_options::overwrite_existing,
+        error);
+    if (error || !copied)
+    {
+        throw std::runtime_error(
+            "cannot preserve prior autodemo evidence " +
+            slot.final.string());
+    }
+}
+
+void publish_autodemo_slot(AutodemoPublicationSlot& slot)
+{
+    std::error_code error;
+    std::filesystem::rename(slot.temporary, slot.final, error);
+    if (error)
+    {
+        throw std::runtime_error(
+            "cannot publish autodemo evidence " + slot.final.string());
+    }
+    slot.published = true;
+}
+
+bool rollback_autodemo_slot(AutodemoPublicationSlot& slot) noexcept
+{
+    if (!slot.published)
+    {
+        return true;
+    }
+    std::error_code error;
+    if (slot.final_existed)
+    {
+        std::filesystem::rename(slot.backup, slot.final, error);
+    }
+    else
+    {
+        (void)std::filesystem::remove(slot.final, error);
+    }
+    slot.published = false;
+    return !error;
+}
+
+void publish_autodemo_evidence(
+    AutodemoConfiguration& configuration)
+{
+    AutodemoPublicationSlot screenshot{
+        configuration.screenshot_temporary,
+        configuration.screenshot_final,
+        configuration.screenshot_backup};
+    AutodemoPublicationSlot log{
+        configuration.log_temporary,
+        configuration.log_final,
+        configuration.log_backup};
+    try
+    {
+        prepare_autodemo_backup(screenshot);
+        prepare_autodemo_backup(log);
+        publish_autodemo_slot(screenshot);
+        publish_autodemo_slot(log);
+    }
+    catch (...)
+    {
+        const bool log_restored = rollback_autodemo_slot(log);
+        const bool screenshot_restored = rollback_autodemo_slot(screenshot);
+        if (!log_restored || !screenshot_restored)
+        {
+            configuration.preserve_backups_after_rollback_failure = true;
+            throw std::runtime_error(
+                "autodemo publication failed and rollback was incomplete");
+        }
+        cleanup_autodemo_temporaries(configuration);
+        throw;
+    }
+    cleanup_autodemo_temporaries_checked(configuration);
+    cleanup_autodemo_backups_best_effort(configuration);
+}
+
+vec3 autodemo_read_vec3(
+    const std::vector<float>& values,
+    size_t index)
+{
+    const size_t offset = index * 3U;
+    return vec3(
+        values.at(offset),
+        values.at(offset + 1U),
+        values.at(offset + 2U));
+}
+
+quat autodemo_read_quat(
+    const std::vector<float>& values,
+    size_t index)
+{
+    const size_t offset = index * 4U;
+    return quat(
+        values.at(offset),
+        values.at(offset + 1U),
+        values.at(offset + 2U),
+        values.at(offset + 3U));
+}
+
+float autodemo_yaw_radians(quat rotation)
+{
+    const vec3 facing =
+        quat_mul_vec3(rotation, vec3(0.0F, 0.0F, 1.0F));
+    return std::atan2(facing.x, facing.z);
+}
+
+float autodemo_shortest_angle(float angle)
+{
+    return std::atan2(std::sin(angle), std::cos(angle));
+}
+
+interaction::Transform autodemo_scene_alignment(
+    const interaction::Transform& source_object,
+    const interaction::Transform& target_object)
+{
+    const float yaw = autodemo_shortest_angle(
+        autodemo_yaw_radians(target_object.rotation) -
+        autodemo_yaw_radians(source_object.rotation));
+    const quat rotation =
+        quat_from_angle_axis(yaw, vec3(0.0F, 1.0F, 0.0F));
+    const vec3 rotated_source =
+        quat_mul_vec3(rotation, source_object.position);
+    return {
+        vec3(
+            target_object.position.x - rotated_source.x,
+            0.0F,
+            target_object.position.z - rotated_source.z),
+        rotation};
+}
+
+interaction::Pose autodemo_mapped_pose(
+    const interaction::Database& database,
+    int32_t frame,
+    const interaction::Transform& scene_from_source)
+{
+    interaction::Pose pose = interaction::pose_at_frame(database, frame);
+    constexpr size_t root = g1_skeleton::Simulation;
+    const interaction::Transform mapped_root = interaction::compose(
+        scene_from_source,
+        {pose.positions[root], pose.rotations[root]});
+    pose.positions[root] = mapped_root.position;
+    pose.rotations[root] = mapped_root.rotation;
+    pose.velocities[root] = quat_mul_vec3(
+        scene_from_source.rotation, pose.velocities[root]);
+    pose.angular_velocities[root] = quat_mul_vec3(
+        scene_from_source.rotation, pose.angular_velocities[root]);
+    return pose;
+}
+
+struct AutodemoCanonicalEntry
+{
+    interaction::LocomotionSnapshot snapshot{};
+    std::array<vec3, 3> future_root_velocities{};
+    std::array<vec3, 3> future_root_angular_velocities{};
+};
+
+AutodemoCanonicalEntry make_autodemo_canonical_entry(
+    const interaction::Database& database,
+    const interaction::Features& features,
+    const interaction::InteractionTarget& target)
+{
+    if (database.clip_count == 0U || database.range_starts.empty() ||
+        database.range_stops.empty())
+    {
+        throw std::runtime_error("autodemo pack has no clip 0");
+    }
+    if (target.affordances.size() != 1U)
+    {
+        throw std::runtime_error(
+            "autodemo target must have exactly one affordance");
+    }
+
+    const int32_t start = database.range_starts.at(0U);
+    const int32_t stop = database.range_stops.at(0U);
+    if (start < 0 || stop <= start ||
+        stop > static_cast<int32_t>(database.frame_count))
+    {
+        throw std::runtime_error("autodemo clip 0 range is invalid");
+    }
+
+    int32_t reach = -1;
+    int32_t contact = -1;
+    for (int32_t frame = start; frame < stop; ++frame)
+    {
+        const uint8_t phase =
+            database.phases.at(static_cast<size_t>(frame));
+        if (reach < 0 &&
+            phase == static_cast<uint8_t>(interaction::Phase::Reach))
+        {
+            reach = frame;
+        }
+        if (contact < 0 &&
+            phase == static_cast<uint8_t>(interaction::Phase::Contact))
+        {
+            contact = frame;
+        }
+    }
+    if (reach < start || contact <= reach || contact - 1 < start)
+    {
+        throw std::runtime_error(
+            "autodemo clip 0 is missing ordered Reach/Contact phases");
+    }
+
+    const interaction::Transform source_object{
+        autodemo_read_vec3(
+            database.object_positions,
+            static_cast<size_t>(contact - 1)),
+        autodemo_read_quat(
+            database.object_rotations,
+            static_cast<size_t>(contact - 1))};
+    const interaction::Transform scene_from_source =
+        autodemo_scene_alignment(source_object, target.object_world);
+
+    AutodemoCanonicalEntry entry;
+    entry.snapshot.pose =
+        autodemo_mapped_pose(database, reach, scene_from_source);
+    constexpr std::array<int32_t, 3> future_offsets = {8, 17, 25};
+    for (size_t index = 0; index < future_offsets.size(); ++index)
+    {
+        const int32_t future_frame =
+            std::min(reach + future_offsets[index], stop - 1);
+        const interaction::Pose future =
+            autodemo_mapped_pose(database, future_frame, scene_from_source);
+        constexpr size_t root = g1_skeleton::Simulation;
+        entry.snapshot.future_root_positions[index] =
+            future.positions[root];
+        entry.snapshot.future_root_rotations[index] =
+            future.rotations[root];
+        entry.future_root_velocities[index] = future.velocities[root];
+        entry.future_root_angular_velocities[index] =
+            future.angular_velocities[root];
+    }
+
+    const interaction::GraspAffordance& affordance =
+        target.affordances.front();
+    interaction::QueryInput query_input{};
+    query_input.locomotion = entry.snapshot;
+    query_input.grasp_world =
+        interaction::compose(target.object_world, affordance.hand_in_object);
+    query_input.table_world = target.table_world;
+    query_input.table_size = target.table_size;
+    query_input.approach_direction_object =
+        affordance.approach_direction_object;
+    query_input.object_dimensions = target.object_dimensions;
+    query_input.hand = affordance.hand;
+    const interaction::NormalizedQuery query = interaction::normalize_query(
+        interaction::build_raw_query(query_input), features);
+    if (features.dimension != interaction::kFeatureDimension ||
+        features.feature_count != interaction::kFeatureDimension ||
+        features.frame_count <= static_cast<uint32_t>(reach) ||
+        features.values.size() <
+            static_cast<size_t>(features.frame_count) * features.dimension)
+    {
+        throw std::runtime_error(
+            "autodemo interaction feature row is unavailable");
+    }
+    float maximum_error = 0.0F;
+    constexpr size_t kAutodemoLocomotionFeatureStop = 45U;
+    for (size_t dimension = 0;
+         dimension < kAutodemoLocomotionFeatureStop;
+         ++dimension)
+    {
+        const float expected = features.values.at(
+            static_cast<size_t>(reach) * features.dimension + dimension);
+        if (!autodemo_is_finite(query[dimension]) ||
+            !autodemo_is_finite(expected))
+        {
+            throw std::runtime_error(
+                "autodemo canonical locomotion query is non-finite");
+        }
+        maximum_error = std::max(
+            maximum_error, std::abs(query[dimension] - expected));
+    }
+    if (maximum_error > 2.0e-4F)
+    {
+        throw std::runtime_error(
+            "autodemo canonical locomotion query differs from clip-0 Reach row");
+    }
+    return entry;
+}
+
+enum class AutodemoAction
+{
+    None,
+    Interact,
+    Forward,
+    Reset,
+};
+
+volatile std::sig_atomic_t autodemo_sigterm_requested = 0;
+
+void autodemo_sigterm_handler(int) noexcept
+{
+    autodemo_sigterm_requested = 1;
+}
+
+const char* autodemo_action_name(AutodemoAction action)
+{
+    switch (action)
+    {
+    case AutodemoAction::None: return "none";
+    case AutodemoAction::Interact: return "interact";
+    case AutodemoAction::Forward: return "forward";
+    case AutodemoAction::Reset: return "reset";
+    }
+    return "none";
+}
+
+struct ControllerAutodemoState
+{
+    std::ofstream log;
+    uint64_t render_frame = 0U;
+    uint64_t runtime_tick = 0U;
+    uint32_t warmup_render_ticks = 0U;
+    int carry_command_count = 0;
+    bool evidence_started = false;
+    bool interact_pulsed = false;
+    bool canonical_move_applied = false;
+    bool candidate_verified = false;
+    bool carry_origin_captured = false;
+    bool reset_pending = false;
+    bool screenshot_captured = false;
+    bool complete = false;
+    bool exit_requested = false;
+    vec3 carry_origin{};
+    float last_carry_displacement_m = 0.0F;
+    std::vector<interaction::RuntimeState> collapsed_states;
+    std::string failure;
+};
+
+bool autodemo_render_is_due(int phase_before)
+{
+    return phase_before + 25 >= 60;
+}
+
+bool autodemo_next_render_is_due(int phase_before)
+{
+    int phase_after = phase_before + 25;
+    if (phase_after >= 60)
+    {
+        phase_after -= 60;
+    }
+    return phase_after + 25 >= 60;
+}
+
+float autodemo_planar_distance(vec3 left, vec3 right)
+{
+    return std::hypot(left.x - right.x, left.z - right.z);
+}
+
+void validate_autodemo_state_progression(
+    ControllerAutodemoState& state,
+    interaction::RuntimeState runtime_state)
+{
+    if (!state.collapsed_states.empty() &&
+        state.collapsed_states.back() == runtime_state)
+    {
+        return;
+    }
+    constexpr std::array<interaction::RuntimeState, 7> expected = {
+        interaction::RuntimeState::Locomotion,
+        interaction::RuntimeState::Preflight,
+        interaction::RuntimeState::Align,
+        interaction::RuntimeState::PickupReplay,
+        interaction::RuntimeState::Hold,
+        interaction::RuntimeState::Carry,
+        interaction::RuntimeState::Locomotion};
+    const size_t next = state.collapsed_states.size();
+    if (next >= expected.size() || expected[next] != runtime_state)
+    {
+        throw std::runtime_error("autodemo runtime state regression");
+    }
+    state.collapsed_states.push_back(runtime_state);
+}
+
+void write_autodemo_record(
+    std::ostream& output,
+    uint64_t render_frame,
+    uint64_t runtime_tick,
+    int scheduler_phase,
+    const interaction::RuntimeOutput& runtime_output,
+    int carry_command_frame,
+    vec3 root_position,
+    vec3 object_position,
+    float root_displacement_m,
+    AutodemoAction action)
+{
+    if (scheduler_phase < 0 || scheduler_phase >= 60 ||
+        !autodemo_is_finite(root_position.x) ||
+        !autodemo_is_finite(root_position.y) ||
+        !autodemo_is_finite(root_position.z) ||
+        !autodemo_is_finite(object_position.x) ||
+        !autodemo_is_finite(object_position.y) ||
+        !autodemo_is_finite(object_position.z) ||
+        !autodemo_is_finite(root_displacement_m))
+    {
+        throw std::runtime_error("autodemo evidence contains invalid values");
+    }
+
+    output << std::fixed << std::setprecision(6)
+        << "{\"render_frame\":" << render_frame
+        << ",\"runtime_tick\":" << runtime_tick
+        << ",\"scheduler_phase\":" << scheduler_phase
+        << ",\"state\":\""
+        << interaction::debug_draw::state_name(
+            runtime_output.diagnostics.state)
+        << "\",\"result\":\""
+        << interaction::debug_draw::result_name(
+            runtime_output.diagnostics.result)
+        << "\",\"reason\":\""
+        << interaction::debug_draw::reason_name(
+            runtime_output.diagnostics.reason)
+        << "\",\"object_state\":\""
+        << interaction::debug_draw::object_state_name(
+            runtime_output.diagnostics.object_state)
+        << "\",\"attached\":"
+        << (runtime_output.diagnostics.attached ? "true" : "false")
+        << ",\"owns_pose\":"
+        << (runtime_output.owns_pose ? "true" : "false")
+        << ",\"carry_mode\":\""
+        << interaction::controller_carry_mode_label(runtime_output)
+        << "\",\"carry_command_frame\":" << carry_command_frame
+        << ",\"root_position\":["
+        << root_position.x << ',' << root_position.y << ',' << root_position.z
+        << "],\"object_position\":["
+        << object_position.x << ',' << object_position.y << ','
+        << object_position.z
+        << "],\"root_displacement_m\":" << root_displacement_m
+        << ",\"action\":\"" << autodemo_action_name(action)
+        << "\"}\n";
+    if (!output)
+    {
+        throw std::runtime_error("cannot write autodemo JSONL");
+    }
+}
+
+void validate_autodemo_screenshot(
+    const AutodemoConfiguration& configuration)
+{
+    std::error_code error;
+    const uintmax_t size = std::filesystem::file_size(
+        configuration.screenshot_temporary, error);
+    if (error || size <= 10000U)
+    {
+        throw std::runtime_error(
+            "autodemo screenshot is missing or too small");
+    }
+}
+
+}  // namespace
+
+//--------------------------------------
+
 void update_callback(void* args)
 {
     ((std::function<void()>*)args)->operator()();
@@ -1279,6 +1998,66 @@ void update_callback(void* args)
 
 int main(void)
 {
+    std::optional<AutodemoConfiguration> autodemo_configuration;
+    std::filesystem::path matching_features_output =
+        "./resources/features.bin";
+    try
+    {
+        autodemo_configuration = parse_autodemo_environment();
+#if !defined(PLATFORM_WEB)
+        if (autodemo_configuration.has_value())
+        {
+            autodemo_sigterm_requested = 0;
+            if (std::signal(SIGTERM, autodemo_sigterm_handler) == SIG_ERR)
+            {
+                throw std::runtime_error(
+                    "cannot install autodemo SIGTERM handler");
+            }
+        }
+#endif
+        const char* features_output_environment =
+            std::getenv("MM_FEATURES_OUTPUT");
+        if (features_output_environment != nullptr &&
+            features_output_environment[0] != '\0')
+        {
+            matching_features_output =
+                std::filesystem::path(features_output_environment);
+        }
+        autodemo_require_parent_directory(
+            matching_features_output, "matching features");
+        if (autodemo_configuration.has_value())
+        {
+            const std::filesystem::path normalized_features =
+                autodemo_normalized_path(matching_features_output);
+            const std::array<std::filesystem::path, 6> evidence_paths = {
+                autodemo_configuration->log_final,
+                autodemo_configuration->log_temporary,
+                autodemo_configuration->log_backup,
+                autodemo_configuration->screenshot_final,
+                autodemo_configuration->screenshot_temporary,
+                autodemo_configuration->screenshot_backup};
+            for (const std::filesystem::path& evidence_path : evidence_paths)
+            {
+                if (normalized_features ==
+                    autodemo_normalized_path(evidence_path))
+                {
+                    throw std::runtime_error(
+                        "MM_FEATURES_OUTPUT must differ from evidence paths");
+                }
+            }
+            prepare_autodemo_temporaries(*autodemo_configuration);
+        }
+    }
+    catch (const std::exception& error)
+    {
+        if (autodemo_configuration.has_value())
+        {
+            cleanup_autodemo_temporaries(*autodemo_configuration);
+        }
+        std::fprintf(stderr, "controller: %s\n", error.what());
+        return 1;
+    }
+
     // Init Window
     
     const int screen_width = 1280;
@@ -1288,6 +2067,13 @@ int main(void)
     SetConfigFlags(FLAG_MSAA_4X_HINT);
     InitWindow(screen_width, screen_height, "raylib [data vs code driven displacement]");
     SetTargetFPS(60);
+    if (autodemo_configuration.has_value() && !IsWindowReady())
+    {
+        cleanup_autodemo_temporaries(*autodemo_configuration);
+        std::fprintf(stderr, "controller: autodemo window initialization failed\n");
+        CloseWindow();
+        return 1;
+    }
     
     // Camera
 
@@ -1331,6 +2117,51 @@ int main(void)
     
     database db;
     database_load(db, "./resources/database.bin");
+    if (db.nbones() !=
+        static_cast<int>(interaction::kFlatControllerBoneCount))
+    {
+        if (autodemo_configuration.has_value())
+        {
+            cleanup_autodemo_temporaries(*autodemo_configuration);
+        }
+        std::fprintf(
+            stderr,
+            "controller: ordinary database must contain exactly %zu bones\n",
+            interaction::kFlatControllerBoneCount);
+        UnloadModel(ground_plane_model);
+        UnloadShader(ground_plane_shader);
+        CloseWindow();
+        return 1;
+    }
+    bool flat_parent_tree_matches =
+        db.bone_parents.size ==
+        static_cast<int>(interaction::kFlatControllerBoneCount);
+    for (size_t bone = 0;
+         flat_parent_tree_matches &&
+             bone < interaction::kFlatControllerBoneCount;
+         ++bone)
+    {
+        if (db.bone_parents(static_cast<int>(bone)) !=
+                interaction::kFlatControllerParents[bone])
+        {
+            flat_parent_tree_matches = false;
+            break;
+        }
+    }
+    if (!flat_parent_tree_matches)
+    {
+        if (autodemo_configuration.has_value())
+        {
+            cleanup_autodemo_temporaries(*autodemo_configuration);
+        }
+        std::fprintf(
+            stderr,
+            "controller: ordinary database parent tree does not match flat controller\n");
+        UnloadModel(ground_plane_model);
+        UnloadShader(ground_plane_shader);
+        CloseWindow();
+        return 1;
+    }
     
     float feature_weight_foot_position = 0.75f;
     float feature_weight_foot_velocity = 1.0f;
@@ -1346,7 +2177,22 @@ int main(void)
         feature_weight_trajectory_positions,
         feature_weight_trajectory_directions);
         
-    database_save_matching_features(db, "./resources/features.bin");
+    try
+    {
+        save_matching_features_checked(db, matching_features_output);
+    }
+    catch (const std::exception& error)
+    {
+        if (autodemo_configuration.has_value())
+        {
+            cleanup_autodemo_temporaries(*autodemo_configuration);
+        }
+        std::fprintf(stderr, "controller: %s\n", error.what());
+        UnloadModel(ground_plane_model);
+        UnloadShader(ground_plane_shader);
+        CloseWindow();
+        return 1;
+    }
 
     // Interaction data is a separate fixed-25 pack. Keep these values alive
     // for the full controller lifetime because InteractionRuntime stores
@@ -1400,7 +2246,84 @@ int main(void)
             return interaction::InteractionRuntime::disabled(
                 interaction::Reason::PackUnavailable);
         }
+        catch (const std::exception& error)
+        {
+            if (!autodemo_configuration.has_value())
+            {
+                throw;
+            }
+            interaction_pack_diagnostic = error.what();
+            interaction_pack_loaded = false;
+            return interaction::InteractionRuntime::disabled(
+                interaction::Reason::PackUnavailable);
+        }
+        catch (...)
+        {
+            if (!autodemo_configuration.has_value())
+            {
+                throw;
+            }
+            interaction_pack_diagnostic =
+                "unknown interaction pack initialization failure";
+            interaction_pack_loaded = false;
+            return interaction::InteractionRuntime::disabled(
+                interaction::Reason::PackUnavailable);
+        }
     }();
+
+    std::optional<AutodemoCanonicalEntry> autodemo_canonical_entry;
+    ControllerAutodemoState autodemo_state;
+    if (autodemo_configuration.has_value())
+    {
+        try
+        {
+            if (!interaction_pack_loaded || !interaction_database.has_value() ||
+                !interaction_features.has_value())
+            {
+                throw std::runtime_error(
+                    interaction_pack_diagnostic.empty()
+                        ? "autodemo requires a valid interaction pack"
+                        : interaction_pack_diagnostic);
+            }
+            autodemo_canonical_entry = make_autodemo_canonical_entry(
+                *interaction_database,
+                *interaction_features,
+                interaction_authored_target);
+        }
+        catch (const std::exception& error)
+        {
+            if (autodemo_state.log.is_open())
+            {
+                autodemo_state.log.close();
+            }
+            cleanup_autodemo_temporaries(*autodemo_configuration);
+            std::fprintf(stderr, "controller: %s\n", error.what());
+            UnloadModel(ground_plane_model);
+            UnloadShader(ground_plane_shader);
+            CloseWindow();
+            return 1;
+        }
+    }
+
+    // The flat controller has no local channels for G1's intermediate hip,
+    // shoulder, wrist, or hand links. Seed those links from a valid pack pose
+    // when available; disabled interaction uses the identity-rotation neutral
+    // Pose default instead. Dynamic channels are deliberately neutral here.
+    interaction::Pose interaction_reference_pose{};
+    if (interaction_pack_loaded && interaction_database.has_value())
+    {
+        const int32_t reference_frame =
+            interaction_database->range_starts.at(0);
+        interaction_reference_pose = interaction::pose_at_frame(
+            *interaction_database, reference_frame);
+        interaction_reference_pose.velocities.fill(vec3());
+        interaction_reference_pose.angular_velocities.fill(vec3());
+        interaction_reference_pose.hand_dof =
+            interaction::kFlatControllerRestHandDof;
+        interaction_reference_pose.hand_dof_velocities =
+            interaction::kFlatControllerRestHandDofVelocities;
+        interaction_reference_pose.foot_contacts = {};
+    }
    
     // Pose & Inertializer Data
     
@@ -1554,10 +2477,12 @@ int main(void)
     
     // Contact and Foot Locking data
     
-    // G1 31-bone database: LeftToe=7, RightToe=13 (index 0 = Simulation bone)
+    // The ordinary flat/LAFAN controller database uses toe indices 5 and 9.
     array1d<int> contact_bones(2);
-    contact_bones(0) = 7;   // G1 LeftToe (was Bone_LeftToe=5 for LAFAN)
-    contact_bones(1) = 13;  // G1 RightToe (was Bone_RightToe=9 for LAFAN)
+    contact_bones(0) =
+        static_cast<int>(interaction::kFlatControllerLeftToe);
+    contact_bones(1) =
+        static_cast<int>(interaction::kFlatControllerRightToe);
     
     array1d<bool> contact_states(contact_bones.size);
     array1d<bool> contact_locks(contact_bones.size);
@@ -1600,6 +2525,40 @@ int main(void)
             bone_velocity,
             false);
     }
+
+    auto reset_controller_contacts = [&]()
+    {
+        for (int i = 0; i < contact_bones.size; ++i)
+        {
+            vec3 bone_position;
+            vec3 bone_velocity;
+            quat bone_rotation;
+            vec3 bone_angular_velocity;
+            forward_kinematics_velocity(
+                bone_position,
+                bone_velocity,
+                bone_rotation,
+                bone_angular_velocity,
+                bone_positions,
+                bone_velocities,
+                bone_rotations,
+                bone_angular_velocities,
+                db.bone_parents,
+                contact_bones(i));
+            contact_reset(
+                contact_states(i),
+                contact_locks(i),
+                contact_positions(i),
+                contact_velocities(i),
+                contact_points(i),
+                contact_targets(i),
+                contact_offset_positions(i),
+                contact_offset_velocities(i),
+                bone_position,
+                bone_velocity,
+                false);
+        }
+    };
     
     array1d<vec3> adjusted_bone_positions = bone_positions;
     array1d<quat> adjusted_bone_rotations = bone_rotations;
@@ -1631,21 +2590,22 @@ int main(void)
     interaction::ControllerInteractionSceneHandoff interaction_scene_handoff;
     uint64_t interaction_next_request_id = 1U;
     interaction::ControllerInteractionFrameState interaction_frame_state{};
+    std::optional<interaction::Pose> latest_owned_interaction_pose;
 
-    auto make_interaction_locomotion_pose = [&]()
+    auto make_flat_controller_pose = [&]()
     {
-        interaction::Pose pose;
-        for (int bone = 0; bone < g1_skeleton::BoneCount; ++bone)
+        interaction::FlatControllerPose pose;
+        for (size_t bone = 0;
+             bone < interaction::kFlatControllerBoneCount;
+             ++bone)
         {
-            pose.positions[static_cast<size_t>(bone)] = bone_positions(bone);
-            pose.velocities[static_cast<size_t>(bone)] = bone_velocities(bone);
-            pose.rotations[static_cast<size_t>(bone)] = bone_rotations(bone);
-            pose.angular_velocities[static_cast<size_t>(bone)] =
-                bone_angular_velocities(bone);
+            const int index = static_cast<int>(bone);
+            pose.positions[bone] = bone_positions(index);
+            pose.velocities[bone] = bone_velocities(index);
+            pose.rotations[bone] = bone_rotations(index);
+            pose.angular_velocities[bone] =
+                bone_angular_velocities(index);
         }
-        pose.hand_dof = interaction::kFlatControllerRestHandDof;
-        pose.hand_dof_velocities =
-            interaction::kFlatControllerRestHandDofVelocities;
         pose.foot_contacts[0] = curr_bone_contacts(0) ? 1U : 0U;
         pose.foot_contacts[1] = curr_bone_contacts(1) ? 1U : 0U;
         return pose;
@@ -1664,8 +2624,30 @@ int main(void)
         inertialize_blending_halflife, simulation_rotation_halflife, (int)g_force_strafe);
 #endif
 
+    if (autodemo_configuration.has_value())
+    {
+        autodemo_state.log.imbue(std::locale::classic());
+        autodemo_state.log.open(
+            autodemo_configuration->log_temporary,
+            std::ios::out | std::ios::binary | std::ios::trunc);
+        if (!autodemo_state.log)
+        {
+            cleanup_autodemo_temporaries(*autodemo_configuration);
+            std::fprintf(
+                stderr, "controller: cannot open autodemo temporary JSONL\n");
+            UnloadModel(ground_plane_model);
+            UnloadShader(ground_plane_shader);
+            CloseWindow();
+            return 1;
+        }
+    }
+
     auto update_func = [&]()
     {
+        const int interaction_scheduler_phase_before =
+            interaction_scheduler.phase();
+        AutodemoAction autodemo_action = AutodemoAction::None;
+        int autodemo_carry_command_frame = -1;
 
 #ifdef MM_DISCRETE
         // Camera-azimuth scripting. MM_MODE selects the pattern:
@@ -1705,7 +2687,7 @@ int main(void)
         // Press edges are sampled at 60 Hz and latched by the scheduler until
         // the next fixed-25 runtime tick. Camera input remains live while
         // cached interaction output suppresses movement steering.
-        const interaction::ControllerInteractionEdges interaction_edges{
+        interaction::ControllerInteractionEdges interaction_edges{
             IsKeyPressed(KEY_F) || IsGamepadButtonPressed(
                 GAMEPAD_PLAYER, GAMEPAD_BUTTON_RIGHT_FACE_LEFT),
             IsKeyPressed(KEY_X) || IsGamepadButtonPressed(
@@ -1715,6 +2697,50 @@ int main(void)
         if (interaction_scheduler.cached_output().suppress_steering)
         {
             gamepadstick_left = vec3();
+        }
+        if (autodemo_configuration.has_value())
+        {
+            // Auto evidence is deterministic in the absence of external
+            // input. It drives only the ordinary left-stick seam and the
+            // existing scheduler edge seam.
+            gamepadstick_left = vec3();
+            if (autodemo_state.evidence_started)
+            {
+                if (autodemo_state.render_frame == 30U &&
+                    !autodemo_state.interact_pulsed)
+                {
+                    interaction_edges.interact_pressed = true;
+                    autodemo_state.interact_pulsed = true;
+                    autodemo_action = AutodemoAction::Interact;
+                }
+                else if (autodemo_state.reset_pending)
+                {
+                    if (!autodemo_render_is_due(
+                            interaction_scheduler_phase_before))
+                    {
+                        throw std::runtime_error(
+                            "autodemo reset render is not scheduler-due");
+                    }
+                    interaction_edges.reset_pressed = true;
+                    autodemo_action = AutodemoAction::Reset;
+                }
+                else if (autodemo_state.carry_origin_captured &&
+                         autodemo_state.carry_command_count < 150)
+                {
+                    const bool issue_forward =
+                        autodemo_state.carry_command_count < 149 ||
+                        (autodemo_state.carry_command_count == 149 &&
+                         autodemo_next_render_is_due(
+                             interaction_scheduler_phase_before));
+                    if (issue_forward)
+                    {
+                        gamepadstick_left = vec3(0.0F, 0.0F, -1.0F);
+                        autodemo_carry_command_frame =
+                            autodemo_state.carry_command_count;
+                        autodemo_action = AutodemoAction::Forward;
+                    }
+                }
+            }
         }
 
         // Get if strafe is desired
@@ -2183,16 +3209,111 @@ int main(void)
                 adjusted_rotation);
         }
 
+        const interaction::RuntimeState cached_interaction_state =
+            interaction_scheduler.cached_output().diagnostics.state;
+        const bool use_autodemo_canonical_snapshot =
+            autodemo_configuration.has_value() &&
+            autodemo_canonical_entry.has_value() &&
+            autodemo_state.interact_pulsed &&
+            (cached_interaction_state ==
+                 interaction::RuntimeState::Locomotion ||
+             cached_interaction_state ==
+                 interaction::RuntimeState::Preflight);
+        if (use_autodemo_canonical_snapshot &&
+            !autodemo_state.canonical_move_applied)
+        {
+            const interaction::Pose& canonical_pose =
+                autodemo_canonical_entry->snapshot.pose;
+            constexpr size_t root = g1_skeleton::Simulation;
+
+            // This is deliberately after ordinary locomotion adjustment and
+            // clamping. Place only the controller root; the full canonical
+            // snapshot remains private to the scheduler provider.
+            inertialize_root_adjust(
+                bone_offset_positions(0),
+                transition_src_position,
+                transition_src_rotation,
+                transition_dst_position,
+                transition_dst_rotation,
+                bone_positions(0),
+                bone_rotations(0),
+                canonical_pose.positions[root],
+                canonical_pose.rotations[root]);
+            bone_velocities(0) = canonical_pose.velocities[root];
+            bone_angular_velocities(0) =
+                canonical_pose.angular_velocities[root];
+
+            simulation_position = canonical_pose.positions[root];
+            simulation_velocity = canonical_pose.velocities[root];
+            simulation_acceleration = vec3();
+            simulation_rotation = canonical_pose.rotations[root];
+            simulation_angular_velocity =
+                canonical_pose.angular_velocities[root];
+            desired_velocity = simulation_velocity;
+            desired_rotation = simulation_rotation;
+            desired_velocity_change_curr = vec3();
+            desired_velocity_change_prev = vec3();
+            desired_rotation_change_curr = vec3();
+            desired_rotation_change_prev = vec3();
+
+            trajectory_positions(0) = simulation_position;
+            trajectory_velocities(0) = simulation_velocity;
+            trajectory_accelerations(0) = vec3();
+            trajectory_rotations(0) = simulation_rotation;
+            trajectory_angular_velocities(0) =
+                simulation_angular_velocity;
+            trajectory_desired_velocities(0) = simulation_velocity;
+            trajectory_desired_rotations(0) = simulation_rotation;
+            for (size_t index = 0;
+                 index < autodemo_canonical_entry->snapshot
+                     .future_root_positions.size();
+                 ++index)
+            {
+                const int trajectory_index = static_cast<int>(index) + 1;
+                trajectory_positions(trajectory_index) =
+                    autodemo_canonical_entry->snapshot
+                        .future_root_positions[index];
+                trajectory_rotations(trajectory_index) =
+                    autodemo_canonical_entry->snapshot
+                        .future_root_rotations[index];
+                trajectory_velocities(trajectory_index) =
+                    autodemo_canonical_entry
+                        ->future_root_velocities[index];
+                trajectory_angular_velocities(trajectory_index) =
+                    autodemo_canonical_entry
+                        ->future_root_angular_velocities[index];
+                trajectory_accelerations(trajectory_index) = vec3();
+                trajectory_desired_velocities(trajectory_index) =
+                    trajectory_velocities(trajectory_index);
+                    trajectory_desired_rotations(trajectory_index) =
+                        trajectory_rotations(trajectory_index);
+            }
+
+            reset_controller_contacts();
+            autodemo_state.canonical_move_applied = true;
+        }
+
         // Advance the interaction runtime at exactly 25 of every 60
         // controller ticks. The provider and resolver are invoked only by a
         // due tick; the complete RuntimeOutput is otherwise held unchanged.
-        const interaction::Pose locomotion_pose =
-            make_interaction_locomotion_pose();
+        const interaction::FlatControllerPose flat_locomotion_pose =
+            make_flat_controller_pose();
+        const interaction::Pose& locomotion_reference =
+            latest_owned_interaction_pose.has_value()
+                ? *latest_owned_interaction_pose
+                : interaction_reference_pose;
+        interaction::Pose locomotion_pose =
+            interaction::expand_flat_controller_pose(
+                flat_locomotion_pose, locomotion_reference);
         const interaction::RuntimeOutput& interaction_output =
             interaction_scheduler.tick(
                 interaction_edges,
                 [&]()
                 {
+                    if (use_autodemo_canonical_snapshot)
+                    {
+                        return autodemo_canonical_entry->snapshot;
+                    }
                     interaction::LocomotionSnapshot snapshot;
                     snapshot.pose = locomotion_pose;
                     for (size_t index = 0;
@@ -2238,6 +3359,11 @@ int main(void)
                 {
                     return interaction_runtime.update(input);
                 });
+        if (autodemo_configuration.has_value() &&
+            autodemo_render_is_due(interaction_scheduler_phase_before))
+        {
+            ++autodemo_state.runtime_tick;
+        }
 
         interaction_frame_state = interaction_frame_handoff.apply(
             locomotion_pose,
@@ -2245,22 +3371,30 @@ int main(void)
             interaction::kControllerStepSeconds);
         if (interaction_frame_state.owns_pose)
         {
-            for (int bone = 0; bone < g1_skeleton::BoneCount; ++bone)
+            const interaction::FlatControllerPose owned_flat_pose =
+                interaction::collapse_interaction_pose(
+                    interaction_frame_state.pose,
+                    flat_locomotion_pose);
+            for (size_t bone = 0;
+                 bone < interaction::kFlatControllerBoneCount;
+                 ++bone)
             {
-                const size_t index = static_cast<size_t>(bone);
-                bone_positions(bone) =
-                    interaction_frame_state.pose.positions[index];
-                bone_velocities(bone) =
-                    interaction_frame_state.pose.velocities[index];
-                bone_rotations(bone) =
-                    interaction_frame_state.pose.rotations[index];
-                bone_angular_velocities(bone) =
-                    interaction_frame_state.pose.angular_velocities[index];
+                const int index = static_cast<int>(bone);
+                bone_positions(index) = owned_flat_pose.positions[bone];
+                bone_velocities(index) = owned_flat_pose.velocities[bone];
+                bone_rotations(index) = owned_flat_pose.rotations[bone];
+                bone_angular_velocities(index) =
+                    owned_flat_pose.angular_velocities[bone];
             }
             curr_bone_contacts(0) =
-                interaction_frame_state.pose.foot_contacts[0] != 0U;
+                owned_flat_pose.foot_contacts[0] != 0U;
             curr_bone_contacts(1) =
-                interaction_frame_state.pose.foot_contacts[1] != 0U;
+                owned_flat_pose.foot_contacts[1] != 0U;
+            latest_owned_interaction_pose = interaction_frame_state.pose;
+        }
+        else
+        {
+            latest_owned_interaction_pose.reset();
         }
         if (interaction_frame_state.synchronize_simulation_root)
         {
@@ -2890,17 +4024,278 @@ int main(void)
 
         EndDrawing();
 
+        if (autodemo_configuration.has_value())
+        {
+            ++autodemo_state.warmup_render_ticks;
+            if (!autodemo_state.evidence_started)
+            {
+                if (interaction_output.diagnostics.state ==
+                    interaction::RuntimeState::Locomotion)
+                {
+                    if (!autodemo_render_is_due(
+                            interaction_scheduler_phase_before) ||
+                        autodemo_state.runtime_tick == 0U)
+                    {
+                        throw std::runtime_error(
+                            "autodemo did not warm on a scheduled tick");
+                    }
+                    autodemo_state.evidence_started = true;
+                }
+                else if (interaction_output.diagnostics.state !=
+                         interaction::RuntimeState::Disabled)
+                {
+                    throw std::runtime_error(
+                        "autodemo warmup produced an unexpected state");
+                }
+                else if (autodemo_state.warmup_render_ticks >= 120U)
+                {
+                    throw std::runtime_error(
+                        "autodemo warmup exceeded 120 render ticks");
+                }
+            }
+
+            if (autodemo_state.evidence_started)
+            {
+                const interaction::RuntimeState runtime_state =
+                    interaction_output.diagnostics.state;
+                validate_autodemo_state_progression(
+                    autodemo_state, runtime_state);
+
+                if (autodemo_state.interact_pulsed)
+                {
+                    const interaction::ResultCode result =
+                        interaction_output.diagnostics.result;
+                    if (runtime_state == interaction::RuntimeState::Disabled ||
+                        result == interaction::ResultCode::Rejected ||
+                        result == interaction::ResultCode::Cancelled ||
+                        result == interaction::ResultCode::Failed)
+                    {
+                        throw std::runtime_error(
+                            "autodemo interaction failed after Interact");
+                    }
+                }
+                const bool candidate_state =
+                    runtime_state == interaction::RuntimeState::Align ||
+                    runtime_state ==
+                        interaction::RuntimeState::PickupReplay ||
+                    runtime_state == interaction::RuntimeState::Hold ||
+                    runtime_state == interaction::RuntimeState::Carry;
+                if (candidate_state &&
+                    interaction_output.diagnostics.clip != 0)
+                {
+                    throw std::runtime_error(
+                        "autodemo accepted a non-clip-0 candidate");
+                }
+                if (runtime_state == interaction::RuntimeState::Align)
+                {
+                    autodemo_state.candidate_verified = true;
+                }
+
+                const vec3 displayed_root = bone_positions(0);
+                if (runtime_state == interaction::RuntimeState::Carry &&
+                    !autodemo_state.carry_origin_captured)
+                {
+                    autodemo_state.carry_origin = displayed_root;
+                    autodemo_state.carry_origin_captured = true;
+                }
+                const float root_displacement_m =
+                    autodemo_state.carry_origin_captured
+                    ? autodemo_planar_distance(
+                          displayed_root, autodemo_state.carry_origin)
+                    : 0.0F;
+                if (runtime_state == interaction::RuntimeState::Carry)
+                {
+                    if (!interaction_output.diagnostics.attached)
+                    {
+                        throw std::runtime_error(
+                            "autodemo Carry lost attachment");
+                    }
+                    const std::string carry_mode =
+                        interaction::controller_carry_mode_label(
+                            interaction_output);
+                    if (carry_mode != "recorded" &&
+                        carry_mode != "layered")
+                    {
+                        throw std::runtime_error(
+                            "autodemo Carry has no valid carry mode");
+                    }
+                    autodemo_state.last_carry_displacement_m =
+                        root_displacement_m;
+                }
+
+                if (autodemo_action == AutodemoAction::Forward)
+                {
+                    if (runtime_state != interaction::RuntimeState::Carry ||
+                        autodemo_carry_command_frame !=
+                            autodemo_state.carry_command_count ||
+                        autodemo_carry_command_frame < 0 ||
+                        autodemo_carry_command_frame >= 150)
+                    {
+                        throw std::runtime_error(
+                            "autodemo forward command escaped Carry");
+                    }
+                    ++autodemo_state.carry_command_count;
+                    if (autodemo_state.carry_command_count == 150)
+                    {
+                        if (autodemo_carry_command_frame != 149 ||
+                            !autodemo_next_render_is_due(
+                                interaction_scheduler_phase_before))
+                        {
+                            throw std::runtime_error(
+                                "autodemo final Carry command is misaligned");
+                        }
+                        const std::string screenshot_temporary =
+                            autodemo_configuration->screenshot_temporary
+                                .string();
+                        TakeScreenshot(screenshot_temporary.c_str());
+                        validate_autodemo_screenshot(
+                            *autodemo_configuration);
+                        autodemo_state.screenshot_captured = true;
+                        autodemo_state.reset_pending = true;
+                    }
+                }
+                else if (autodemo_carry_command_frame != -1)
+                {
+                    throw std::runtime_error(
+                        "autodemo command frame has no forward action");
+                }
+
+                if (autodemo_action == AutodemoAction::Reset)
+                {
+                    if (runtime_state !=
+                            interaction::RuntimeState::Locomotion ||
+                        interaction_output.diagnostics.result !=
+                            interaction::ResultCode::Reset ||
+                        interaction_output.diagnostics.reason !=
+                            interaction::Reason::Reset)
+                    {
+                        throw std::runtime_error(
+                            "autodemo scheduler Reset did not complete");
+                    }
+                }
+
+                write_autodemo_record(
+                    autodemo_state.log,
+                    autodemo_state.render_frame,
+                    autodemo_state.runtime_tick,
+                    interaction_scheduler.phase(),
+                    interaction_output,
+                    autodemo_carry_command_frame,
+                    displayed_root,
+                    interaction_scene_state.object_world.position,
+                    root_displacement_m,
+                    autodemo_action);
+
+                if (!autodemo_state.carry_origin_captured &&
+                    autodemo_state.render_frame >= 900U)
+                {
+                    throw std::runtime_error(
+                        "autodemo did not reach Carry by evidence frame 900");
+                }
+
+                if (autodemo_action == AutodemoAction::Reset)
+                {
+                    if (autodemo_state.collapsed_states.size() != 7U ||
+                        !autodemo_state.candidate_verified ||
+                        autodemo_state.carry_command_count != 150 ||
+                        !autodemo_state.screenshot_captured ||
+                        !(autodemo_state.last_carry_displacement_m > 0.20F))
+                    {
+                        throw std::runtime_error(
+                            "autodemo final evidence contract was not met");
+                    }
+                    autodemo_state.log.flush();
+                    if (!autodemo_state.log)
+                    {
+                        throw std::runtime_error(
+                            "cannot flush autodemo JSONL");
+                    }
+                    autodemo_state.log.close();
+                    if (autodemo_state.log.fail())
+                    {
+                        throw std::runtime_error(
+                            "cannot close autodemo JSONL");
+                    }
+                    publish_autodemo_evidence(*autodemo_configuration);
+                    autodemo_state.complete = true;
+                    autodemo_state.exit_requested = true;
+                }
+                else
+                {
+                    ++autodemo_state.render_frame;
+                    if (autodemo_state.render_frame >= 1200U)
+                    {
+                        throw std::runtime_error(
+                            "autodemo evidence exceeded 1200 renders");
+                    }
+                }
+            }
+        }
+
     };
 
 #if defined(PLATFORM_WEB)
     std::function<void()> u{update_func};
     emscripten_set_main_loop_arg(update_callback, &u, 60, 1);
 #else
-    while (!WindowShouldClose())
+    while (!autodemo_state.exit_requested)
     {
-        update_func();
+        if (autodemo_configuration.has_value() &&
+            autodemo_sigterm_requested != 0)
+        {
+            autodemo_state.failure = "autodemo received SIGTERM";
+            autodemo_state.exit_requested = true;
+            break;
+        }
+        if (WindowShouldClose())
+        {
+            if (autodemo_configuration.has_value() &&
+                !autodemo_state.complete)
+            {
+                autodemo_state.failure =
+                    "autodemo window closed before successful Reset";
+            }
+            break;
+        }
+        if (!autodemo_configuration.has_value())
+        {
+            update_func();
+            continue;
+        }
+        try
+        {
+            update_func();
+        }
+        catch (const std::exception& error)
+        {
+            autodemo_state.failure = error.what();
+            autodemo_state.exit_requested = true;
+        }
+        catch (...)
+        {
+            autodemo_state.failure = "autodemo failed with unknown exception";
+            autodemo_state.exit_requested = true;
+        }
     }
 #endif
+
+    int exit_code = 0;
+    if (autodemo_configuration.has_value() && !autodemo_state.complete)
+    {
+        if (autodemo_state.failure.empty())
+        {
+            autodemo_state.failure =
+                "autodemo exited before successful Reset";
+        }
+        if (autodemo_state.log.is_open())
+        {
+            autodemo_state.log.close();
+        }
+        cleanup_autodemo_temporaries(*autodemo_configuration);
+        std::fprintf(
+            stderr, "controller: %s\n", autodemo_state.failure.c_str());
+        exit_code = 1;
+    }
 
     // Unload stuff and finish (G1: no character mesh/shader to unload)
     UnloadModel(ground_plane_model);
@@ -2908,5 +4303,5 @@ int main(void)
 
     CloseWindow();
 
-    return 0;
+    return exit_code;
 }

@@ -10,6 +10,7 @@ controller.wasm
 resources/runs*
 .venv/
 build/tests/
+build/task12/
 interaction_probe
 resources/g1_interaction/
 .deps/
