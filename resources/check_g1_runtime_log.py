@@ -48,6 +48,22 @@ RUNTIME_SUFFIX = (
     "live_model_count",
 )
 RUNTIME_COLUMNS = list(GATE_A_COLUMNS) + list(RUNTIME_SUFFIX)
+LOCKED_SCENE_IDS = (
+    "grail-curb-default",
+    "grail-curb-low",
+    "grail-curb-medium",
+    "grail-curb-high",
+    "stairs-shallow",
+    "stairs-standard",
+    "stairs-unseen-variable",
+    "ramp-05-up-down",
+    "ramp-10-up-down",
+    "ramp-15-stress",
+    "cross-slope-05",
+    "cross-slope-10",
+    "mixed-multilevel",
+    "blocked-course",
+)
 
 # Gate A callers keep their historical name and exact immutable tuple. Runtime
 # readers accept the append-only suffix without weakening that prerequisite.
@@ -737,6 +753,190 @@ def check_gate_d(rows):
     }
 
 
+def _check_model_counters(rows):
+    previous_loads = None
+    previous_unloads = None
+    for index, row in enumerate(rows):
+        loads = _integer(row, "model_load_count", index)
+        unloads = _integer(row, "model_unload_count", index)
+        live = _integer(row, "live_model_count", index)
+        if live != loads - unloads:
+            raise ValueError(
+                f"row {index}: live model count mismatch: "
+                "live_model_count must equal "
+                "model_load_count minus model_unload_count")
+        if previous_loads is not None and loads < previous_loads:
+            raise ValueError(
+                f"row {index}: model_load_count must be nondecreasing")
+        if previous_unloads is not None and unloads < previous_unloads:
+            raise ValueError(
+                f"row {index}: model_unload_count must be nondecreasing")
+        previous_loads = loads
+        previous_unloads = unloads
+
+
+def check_gate_f(rows, expected_scene_ids):
+    summary = check_rows(rows)
+    _require_runtime_header(rows)
+    _check_model_counters(rows)
+
+    if isinstance(expected_scene_ids, (str, bytes)):
+        raise ValueError("Gate F expected scene ID list must be nonempty")
+    try:
+        expected = tuple(expected_scene_ids)
+    except TypeError as error:
+        raise ValueError(
+            "Gate F expected scene ID list must be nonempty") from error
+    if not expected or any(
+            not isinstance(scene_id, str) or not scene_id
+            for scene_id in expected):
+        raise ValueError("Gate F expected scene IDs must be nonempty")
+    if len(expected) != len(set(expected)):
+        raise ValueError("Gate F expected scene IDs must be unique")
+    if any(row["mode"] != "scene-cycle" for row in rows):
+        raise ValueError("Gate F requires scene-cycle mode throughout")
+    if any(_integer(row, "scene_switch_failed", index) != 0
+           for index, row in enumerate(rows)):
+        raise ValueError("Gate F forbids any switch-failure pulse")
+
+    groups = _generation_groups(rows)
+    dwell = len(groups[0])
+    if dwell <= 0 or any(len(group) != dwell for group in groups):
+        raise ValueError("Gate F generations must have one positive dwell")
+
+    observed = []
+    start = 0
+    for generation, group in enumerate(groups):
+        first = group[0]
+        if _integer(first, "scene_generation", start) != generation:
+            raise ValueError(
+                "Gate F generations must start at generation 0 and be contiguous")
+        if _integer(first, "scene_frame", start) != 0:
+            raise ValueError(
+                f"Gate F generation {generation} must start at scene_frame 0")
+        scene_id = first["scene_id"]
+        if any(row["scene_id"] != scene_id for row in group):
+            raise ValueError(
+                f"Gate F generation {generation} must contain one constant scene")
+        observed.append(scene_id)
+        first_row_requirements = (
+            ("scene_reset_count", generation + 1),
+            ("live_model_count", 1),
+            ("route_waypoint", 0),
+            ("blocked", 0),
+        )
+        for name, required in first_row_requirements:
+            if _integer(first, name, start) != required:
+                raise ValueError(
+                    f"Gate F generation {generation} first-row {name} "
+                    f"must be {required}")
+        if _integer(first, "airborne_frames", start) > 1:
+            raise ValueError(
+                f"Gate F generation {generation} first-row "
+                "airborne_frames must be at most 1")
+        for offset, row in enumerate(group):
+            index = start + offset
+            for name, required in (
+                    ("model_load_count", generation + 1),
+                    ("model_unload_count", generation)):
+                if _integer(row, name, index) != required:
+                    raise ValueError(
+                        f"Gate F generation {generation} row {index} "
+                        f"{name} must remain {required}")
+        start += len(group)
+
+    if len(groups) % len(expected) != 0:
+        raise ValueError("Gate F requires complete ordered cycles")
+    complete_cycles = len(groups) // len(expected)
+    if complete_cycles < 2:
+        raise ValueError("Gate F requires at least two complete cycles")
+    if tuple(observed) != expected * complete_cycles:
+        raise ValueError(
+            "Gate F generation scene IDs must form complete ordered cycles")
+
+    final_index = len(rows) - 1
+    return {
+        "frames": summary["frames"],
+        "generations": len(groups),
+        "complete_cycles": complete_cycles,
+        "motion_pack_loads": _integer(
+            rows[0], "motion_pack_load_count", 0),
+        "model_loads": _integer(
+            rows[-1], "model_load_count", final_index),
+        "model_unloads_before_final_cleanup": _integer(
+            rows[-1], "model_unload_count", final_index),
+    }
+
+
+def check_failed_switch(rows):
+    _require_runtime_header(rows)
+    if not rows:
+        check_rows(rows)
+    _check_model_counters(rows)
+    pulses = [
+        index for index, row in enumerate(rows)
+        if _integer(row, "scene_switch_failed", index) == 1
+    ]
+    if not pulses:
+        check_rows(rows)
+        raise ValueError("switch-failure checker requires a failure pulse")
+
+    for index in pulses:
+        if index == 0:
+            raise ValueError(
+                "switch-failure pulse requires a preceding row")
+        row = rows[index]
+        previous = rows[index - 1]
+        if row["scene_id"] != previous["scene_id"]:
+            raise ValueError(
+                f"row {index}: failed switch must preserve scene")
+        generation = _integer(row, "scene_generation", index)
+        if generation != _integer(
+                previous, "scene_generation", index - 1):
+            raise ValueError(
+                f"row {index}: failed switch must preserve generation")
+        if _integer(row, "scene_frame", index) != _integer(
+                previous, "scene_frame", index - 1) + 1:
+            raise ValueError(
+                f"row {index}: failed switch must continue scene frame")
+        if _integer(row, "scene_reset_count", index) != _integer(
+                previous, "scene_reset_count", index - 1):
+            raise ValueError(
+                f"row {index}: failed switch must preserve reset count")
+        if _integer(row, "motion_pack_load_count", index) != 1:
+            raise ValueError(
+                f"row {index}: failed switch must preserve one motion pack")
+        if _integer(row, "live_model_count", index) != 1:
+            raise ValueError(
+                f"row {index}: failed switch must preserve one live model")
+
+        preserved_rows = 0
+        successful_generation_began = False
+        for later_index in range(index + 1, min(len(rows), index + 11)):
+            later = rows[later_index]
+            if _integer(later, "scene_generation", later_index) != generation:
+                successful_generation_began = True
+                break
+            if later["scene_id"] != row["scene_id"]:
+                raise ValueError(
+                    f"row {later_index}: ten-row preservation window "
+                    "must preserve scene")
+            preserved_rows += 1
+        if preserved_rows < 10 and not successful_generation_began:
+            raise ValueError(
+                f"row {index}: failed switch requires ten subsequent "
+                "preserved rows or a later successful generation")
+
+    check_rows(rows)
+    first = pulses[0]
+    return {
+        "switch_failures": len(pulses),
+        "preserved_scene": rows[first]["scene_id"],
+        "preserved_generation": _integer(
+            rows[first], "scene_generation", first),
+    }
+
+
 def compare_control(treatment, control):
     treatment_runtime = _runtime_schema(treatment)
     control_runtime = _runtime_schema(control)
@@ -877,7 +1077,24 @@ def main(argv=None):
     runtime_gate = parser.add_mutually_exclusive_group()
     runtime_gate.add_argument("--gate-c", action="store_true")
     runtime_gate.add_argument("--gate-d", action="store_true")
+    runtime_gate.add_argument("--gate-f", action="store_true")
+    parser.add_argument("--expected-scenes")
+    parser.add_argument("--expect-switch-failure", action="store_true")
     args = parser.parse_args(argv)
+    if args.expect_switch_failure and any((
+            args.gate_a, args.gate_c, args.gate_d, args.gate_f)):
+        parser.error(
+            "--expect-switch-failure may not combine with Gate A/C/D/F flags")
+    expected_scene_ids = None
+    if args.gate_f:
+        if args.expected_scenes is None:
+            parser.error("--gate-f requires --expected-scenes")
+        expected_scene_ids = tuple(args.expected_scenes.split(","))
+        if expected_scene_ids != LOCKED_SCENE_IDS:
+            parser.error(
+                "--expected-scenes must match the locked 14-scene catalog")
+    elif args.expected_scenes is not None:
+        parser.error("--expected-scenes requires --gate-f")
     rows = read_rows(args.log)
     summary = check_rows(rows)
     if args.compare_control:
@@ -902,6 +1119,11 @@ def main(argv=None):
         _print_gate_report("gate-c", check_gate_c(rows))
     if args.gate_d:
         _print_gate_report("gate-d", check_gate_d(rows))
+    if args.gate_f:
+        _print_gate_report(
+            "gate-f", check_gate_f(rows, expected_scene_ids))
+    if args.expect_switch_failure:
+        _print_gate_report("switch-failure", check_failed_switch(rows))
     print(
         f"VALID runtime-log frames={summary['frames']} "
         f"transitions={summary['transitions']}")

@@ -1,5 +1,7 @@
-import tempfile
+import contextlib
+import io
 import struct
+import tempfile
 import unittest
 
 from resources import check_g1_runtime_log as runtime_log
@@ -29,6 +31,23 @@ RUNTIME_SUFFIX = (
     "scene_frame", "scene_reset_count", "scene_switch_failed",
     "motion_pack_load_count", "model_load_count", "model_unload_count",
     "live_model_count",
+)
+
+TASK11_SCENE_IDS = (
+    "grail-curb-default",
+    "grail-curb-low",
+    "grail-curb-medium",
+    "grail-curb-high",
+    "stairs-shallow",
+    "stairs-standard",
+    "stairs-unseen-variable",
+    "ramp-05-up-down",
+    "ramp-10-up-down",
+    "ramp-15-stress",
+    "cross-slope-05",
+    "cross-slope-10",
+    "mixed-multilevel",
+    "blocked-course",
 )
 
 
@@ -250,6 +269,35 @@ def gate_d_rows():
     return rows
 
 
+def scene_segment_rows(segments):
+    rows = []
+    frame = 0
+    for generation, (scene_id, dwell) in enumerate(segments):
+        for scene_frame in range(dwell):
+            rows.append(runtime_row(
+                frame, scene_id=scene_id, mode="scene-cycle", route="",
+                scene_generation=generation, scene_frame=scene_frame,
+                scene_reset_count=generation + 1,
+                model_load_count=generation + 1,
+                model_unload_count=generation, live_model_count=1,
+                route_waypoint=0, commanded_speed=0, applied_speed=0))
+            frame += 1
+    return rows
+
+
+def scene_cycle_rows(ids, dwell=2, cycles=2):
+    return scene_segment_rows([
+        (scene_id, dwell) for scene_id in ids * cycles
+    ])
+
+
+def write_runtime_rows(stream, rows):
+    stream.write(",".join(RUNTIME_COLUMNS) + "\n")
+    for item in rows:
+        stream.write(",".join(item[name] for name in RUNTIME_COLUMNS) + "\n")
+    stream.flush()
+
+
 def set_terrain(values, sample, value):
     values[f"terrain{sample}"] = str(value)
     query_values = [0.0] * 27 + [
@@ -409,6 +457,332 @@ class RuntimeLogTests(unittest.TestCase):
             item["blocked_reason"] = "clear"
         self.assertGreaterEqual(
             runtime_log.check_gate_d(rows)["stopped_frames"], 25)
+
+    def test_gate_f_accepts_two_ordered_cycles_and_one_motion_load(self):
+        ids = ["one", "two", "three"]
+        self.assertEqual(
+            runtime_log.check_gate_f(scene_cycle_rows(ids), ids), {
+                "frames": 12,
+                "generations": 6,
+                "complete_cycles": 2,
+                "motion_pack_loads": 1,
+                "model_loads": 6,
+                "model_unloads_before_final_cleanup": 5,
+            })
+
+    def test_gate_f_rejects_invalid_expected_scene_ids(self):
+        rows = scene_cycle_rows(["one", "two"])
+        for expected, diagnostic in (
+                ([], "nonempty"),
+                (["one", "one"], "unique"),
+                (["one", "wrong"], "ordered"),
+                (["one", ""], "nonempty")):
+            with self.subTest(expected=expected):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    runtime_log.check_gate_f(rows, expected)
+
+    def test_gate_f_rejects_generation_dwell_identity_and_order_drift(self):
+        cases = []
+
+        rows = scene_cycle_rows(["one", "two"])
+        for item in rows:
+            item["scene_generation"] = str(
+                int(item["scene_generation"]) + 1)
+            item["scene_reset_count"] = str(
+                int(item["scene_reset_count"]) + 1)
+        cases.append((rows, "generation 0"))
+
+        rows = scene_cycle_rows(["one", "two"])
+        for item in rows[2:]:
+            item["scene_generation"] = str(
+                int(item["scene_generation"]) + 1)
+            item["scene_reset_count"] = str(
+                int(item["scene_reset_count"]) + 1)
+        cases.append((rows, "scene_generation"))
+
+        rows = scene_segment_rows([
+            ("one", 1), ("two", 2), ("one", 1), ("two", 2),
+        ])
+        cases.append((rows, "dwell"))
+
+        rows = scene_cycle_rows(["one", "two"])
+        rows[1]["scene_id"] = "different"
+        cases.append((rows, "constant scene"))
+
+        rows = scene_cycle_rows(["one", "two"])
+        for item in rows[2:4]:
+            item["scene_id"] = "one"
+        cases.append((rows, "ordered"))
+
+        for rows, diagnostic in cases:
+            with self.subTest(diagnostic=diagnostic):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    runtime_log.check_gate_f(rows, ["one", "two"])
+
+    def test_gate_f_requires_two_complete_cycles(self):
+        with self.assertRaisesRegex(ValueError, "at least two"):
+            runtime_log.check_gate_f(
+                scene_cycle_rows(["one", "two"], cycles=1),
+                ["one", "two"])
+
+        rows = scene_segment_rows([
+            ("one", 2), ("two", 2), ("one", 2), ("two", 2),
+            ("one", 2),
+        ])
+        with self.assertRaisesRegex(ValueError, "complete ordered cycles"):
+            runtime_log.check_gate_f(rows, ["one", "two"])
+
+    def test_gate_f_rejects_reset_and_model_counter_drift(self):
+        cases = []
+
+        rows = scene_cycle_rows(["one", "two"])
+        for item in rows:
+            item["scene_reset_count"] = str(
+                int(item["scene_reset_count"]) + 1)
+        cases.append((rows, "scene_reset_count"))
+
+        rows = scene_cycle_rows(["one", "two"])
+        rows[0]["model_load_count"] = "2"
+        cases.append((rows, "model_load_count"))
+
+        rows = scene_cycle_rows(["one", "two"])
+        rows[0]["model_unload_count"] = "1"
+        cases.append((rows, "model_unload_count"))
+
+        for rows, diagnostic in cases:
+            with self.subTest(diagnostic=diagnostic):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    runtime_log.check_gate_f(rows, ["one", "two"])
+
+    def test_gate_f_rejects_interior_model_counter_spike(self):
+        rows = scene_cycle_rows(["one", "two"])
+        rows[1].update({
+            "model_load_count": "2",
+            "model_unload_count": "1",
+            "live_model_count": "1",
+        })
+        with self.assertRaisesRegex(ValueError, "generation 0.*model_load_count"):
+            runtime_log.check_gate_f(rows, ["one", "two"])
+
+    def test_gate_f_rejects_model_counter_decrease(self):
+        rows = scene_cycle_rows(["one", "two"])
+        rows[3].update({
+            "model_load_count": "1",
+            "model_unload_count": "0",
+            "live_model_count": "1",
+        })
+        with self.assertRaisesRegex(ValueError, "nondecreasing"):
+            runtime_log.check_gate_f(rows, ["one", "two"])
+
+    def test_gate_f_rejects_final_row_model_counter_corruption(self):
+        rows = scene_cycle_rows(["one", "two"])
+        rows[-1].update({
+            "model_load_count": "5",
+            "model_unload_count": "4",
+            "live_model_count": "1",
+        })
+        with self.assertRaisesRegex(ValueError, "generation 3.*model_load_count"):
+            runtime_log.check_gate_f(rows, ["one", "two"])
+
+    def test_gate_f_rejects_live_model_count_difference_mismatch(self):
+        rows = scene_cycle_rows(["one", "two"])
+        rows[1].update({
+            "model_load_count": "2",
+            "model_unload_count": "0",
+            "live_model_count": "1",
+        })
+        with self.assertRaisesRegex(
+                ValueError,
+                "live_model_count.*model_load_count.*model_unload_count"):
+            runtime_log.check_gate_f(rows, ["one", "two"])
+
+    def test_gate_f_rejects_first_row_and_activation_contract_drift(self):
+        for name, value, diagnostic in (
+                ("route_waypoint", 1, "route_waypoint"),
+                ("blocked", 1, "blocked"),
+                ("airborne_frames", 2, "airborne_frames"),
+                ("mode", "terrain", "scene-cycle mode"),
+                ("scene_switch_failed", 1, "switch-failure")):
+            rows = scene_cycle_rows(["one", "two"])
+            rows[0][name] = str(value)
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    runtime_log.check_gate_f(rows, ["one", "two"])
+
+    def test_gate_f_preserves_schema_25hz_and_ik_off_contracts(self):
+        rows = scene_cycle_rows(["one", "two"])
+        rows[0]["unexpected"] = "1"
+        with self.assertRaisesRegex(ValueError, "exact runtime header"):
+            runtime_log.check_gate_f(rows, ["one", "two"])
+
+        for name, value, diagnostic in (
+                ("fixed_dt", ".05", "fixed_dt"),
+                ("ik_enabled", "1", "IK must be disabled"),
+                ("adjustment_y", ".01", "adjustment_y must be zero"),
+                ("support_height", "nan", "non-finite support_height")):
+            rows = scene_cycle_rows(["one", "two"])
+            rows[0][name] = value
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    runtime_log.check_gate_f(rows, ["one", "two"])
+
+    def test_failed_switch_requires_preserved_identity_generation_and_model(self):
+        rows = scene_cycle_rows(["one", "two"], dwell=3, cycles=2)
+        rows[4]["scene_switch_failed"] = "1"
+        self.assertEqual(runtime_log.check_failed_switch(rows), {
+            "switch_failures": 1,
+            "preserved_scene": "two",
+            "preserved_generation": 1,
+        })
+
+        for name, value, diagnostic in (
+                ("scene_id", "one", "preserve scene"),
+                ("scene_generation", "9", "preserve generation"),
+                ("scene_frame", "0", "continue scene frame"),
+                ("scene_reset_count", "9", "preserve reset count"),
+                ("motion_pack_load_count", "2", "motion pack"),
+                ("live_model_count", "0", "live model")):
+            changed = [dict(item) for item in rows]
+            changed[4][name] = value
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    runtime_log.check_failed_switch(changed)
+
+    def test_failed_switch_rejects_missing_and_first_row_pulses(self):
+        with self.assertRaisesRegex(ValueError, "failure pulse"):
+            runtime_log.check_failed_switch(
+                scene_cycle_rows(["one"], dwell=3, cycles=1))
+
+        rows = scene_cycle_rows(["one"], dwell=3, cycles=1)
+        rows[0]["scene_switch_failed"] = "1"
+        with self.assertRaisesRegex(ValueError, "preceding row"):
+            runtime_log.check_failed_switch(rows)
+
+    def test_failed_switch_validates_model_counters_on_every_row(self):
+        rows = scene_cycle_rows(["one", "two"], dwell=3, cycles=2)
+        rows[4]["scene_switch_failed"] = "1"
+        rows[5].update({
+            "model_load_count": "3",
+            "model_unload_count": "1",
+            "live_model_count": "1",
+        })
+        with self.assertRaisesRegex(ValueError, "live_model_count"):
+            runtime_log.check_failed_switch(rows)
+
+        rows = scene_cycle_rows(["one", "two"], dwell=3, cycles=2)
+        rows[4]["scene_switch_failed"] = "1"
+        rows[5].update({
+            "model_load_count": "1",
+            "model_unload_count": "0",
+            "live_model_count": "1",
+        })
+        with self.assertRaisesRegex(ValueError, "nondecreasing"):
+            runtime_log.check_failed_switch(rows)
+
+    def test_failed_switch_rejects_end_and_short_truncated_tails(self):
+        rows = scene_cycle_rows(["one"], dwell=3, cycles=1)
+        rows[-1]["scene_switch_failed"] = "1"
+        with self.assertRaisesRegex(ValueError, "ten subsequent"):
+            runtime_log.check_failed_switch(rows)
+
+        rows = scene_cycle_rows(["one"], dwell=5, cycles=1)
+        rows[1]["scene_switch_failed"] = "1"
+        with self.assertRaisesRegex(ValueError, "ten subsequent"):
+            runtime_log.check_failed_switch(rows)
+
+    def test_failed_switch_checks_all_pulses(self):
+        rows = scene_cycle_rows(["one", "two"], dwell=15, cycles=1)
+        rows[2]["scene_switch_failed"] = "1"
+        rows[17]["scene_switch_failed"] = "1"
+        report = runtime_log.check_failed_switch(rows)
+        self.assertEqual(report["switch_failures"], 2)
+        self.assertEqual(report["preserved_scene"], "one")
+        self.assertEqual(report["preserved_generation"], 0)
+
+        rows[20]["scene_id"] = "different"
+        with self.assertRaisesRegex(ValueError, "preserve scene"):
+            runtime_log.check_failed_switch(rows)
+
+    def test_failed_switch_enforces_ten_row_preservation_window(self):
+        rows = scene_cycle_rows(["one"], dwell=13, cycles=1)
+        rows[1]["scene_switch_failed"] = "1"
+        rows[11]["scene_id"] = "different"
+        with self.assertRaisesRegex(ValueError, "ten-row.*scene"):
+            runtime_log.check_failed_switch(rows)
+
+        rows = scene_cycle_rows(["one"], dwell=13, cycles=1)
+        rows[1]["scene_switch_failed"] = "1"
+        rows[11]["support_height"] = "nan"
+        with self.assertRaisesRegex(ValueError, "non-finite support_height"):
+            runtime_log.check_failed_switch(rows)
+
+    def test_failed_switch_allows_later_successful_generation(self):
+        rows = scene_cycle_rows(["one", "two"], dwell=5, cycles=1)
+        rows[1]["scene_switch_failed"] = "1"
+        self.assertEqual(
+            runtime_log.check_failed_switch(rows)["switch_failures"], 1)
+
+    def test_gate_f_cli_locks_catalog_and_prints_sorted_report(self):
+        self.assertEqual(runtime_log.LOCKED_SCENE_IDS, TASK11_SCENE_IDS)
+        rows = scene_cycle_rows(list(TASK11_SCENE_IDS))
+        with tempfile.NamedTemporaryFile("w+", suffix=".csv") as stream:
+            write_runtime_rows(stream, rows)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(runtime_log.main([
+                    stream.name,
+                    "--gate-f",
+                    "--expected-scenes", ",".join(TASK11_SCENE_IDS),
+                ]), 0)
+        self.assertEqual(output.getvalue().splitlines()[0],
+            "VALID gate-f complete_cycles=2 frames=56 generations=28 "
+            "model_loads=28 model_unloads_before_final_cleanup=27 "
+            "motion_pack_loads=1")
+
+    def test_failed_switch_cli_prints_sorted_report(self):
+        rows = scene_cycle_rows(["one", "two"], dwell=3, cycles=1)
+        rows[1]["scene_switch_failed"] = "1"
+        with tempfile.NamedTemporaryFile("w+", suffix=".csv") as stream:
+            write_runtime_rows(stream, rows)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(runtime_log.main([
+                    stream.name, "--expect-switch-failure",
+                ]), 0)
+        self.assertEqual(output.getvalue().splitlines()[0],
+            "VALID switch-failure preserved_generation=0 "
+            "preserved_scene=one switch_failures=1")
+
+    def test_gate_f_cli_rejects_invalid_catalog_and_flag_combinations(self):
+        catalog = list(TASK11_SCENE_IDS)
+        duplicate = catalog[:-1] + [catalog[0]]
+        wrong = catalog[:-1] + ["wrong"]
+        reordered = catalog[:]
+        reordered[0], reordered[1] = reordered[1], reordered[0]
+        cases = (
+            (["--gate-f"], "expected-scenes"),
+            (["--expected-scenes", ",".join(catalog)], "requires --gate-f"),
+            (["--gate-f", "--expected-scenes", ""], "locked 14-scene"),
+            (["--gate-f", "--expected-scenes", ",".join(duplicate)],
+             "locked 14-scene"),
+            (["--gate-f", "--expected-scenes", ",".join(wrong)],
+             "locked 14-scene"),
+            (["--gate-f", "--expected-scenes", ",".join(reordered)],
+             "locked 14-scene"),
+            (["--expect-switch-failure", "--gate-a"], "may not combine"),
+            (["--expect-switch-failure", "--gate-c"], "may not combine"),
+            (["--expect-switch-failure", "--gate-d"], "may not combine"),
+            (["--expect-switch-failure", "--gate-f", "--expected-scenes",
+              ",".join(catalog)], "may not combine"),
+        )
+        for extra, diagnostic in cases:
+            stderr = io.StringIO()
+            with self.subTest(extra=extra):
+                with contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as raised:
+                        runtime_log.main(["unused.csv", *extra])
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn(diagnostic, stderr.getvalue())
 
     def test_ab_requires_identical_script(self):
         treatment = gate_c_rows()
