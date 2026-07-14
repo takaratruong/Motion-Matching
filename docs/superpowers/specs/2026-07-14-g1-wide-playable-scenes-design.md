@@ -107,10 +107,11 @@ The apron is meant to be usable, not merely visible.
 - Internal class boundaries receive no classification halo. The existing
   outer playable-boundary halo remains exact.
 
-Published region rectangles must describe these classes without overlap or
-unclassified playable holes. Existing route outcome and landing-hold metadata
-remain unchanged, and every existing route must continue to validate against
-the same class sequence as before.
+Published region rectangles must describe these classes without disagreeing
+with any covered G1WM node or leaving an unclassified playable G1WM node.
+Existing route outcome and landing-hold metadata remain unchanged, and every
+existing route must continue to validate against the same class sequence as
+before.
 
 ## Builder Structure
 
