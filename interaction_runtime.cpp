@@ -244,6 +244,17 @@ IKResult apply_reach_ik(
         pose, affordance.hand, corrected_hand, config);
 }
 
+Pose apply_entry_blend(
+    const Pose& source,
+    const Pose& sampled,
+    float elapsed_seconds,
+    float blend_seconds) {
+    const float alpha = blend_seconds <= 0.0F
+        ? 1.0F
+        : std::clamp(elapsed_seconds / blend_seconds, 0.0F, 1.0F);
+    return interpolate_pose(source, sampled, alpha);
+}
+
 struct EventPose {
     Pose pose{};
     bool joints_valid = true;
@@ -276,14 +287,11 @@ EventPose event_pose(
         result.hand_orientation_error_radians =
             ik.orientation_error_radians;
     }
-    const float blend_alpha = entry_blend_seconds <= 0.0F
-        ? 1.0F
-        : std::clamp(
-              player.elapsed_seconds() / entry_blend_seconds,
-              0.0F,
-              1.0F);
-    result.pose = interpolate_pose(
-        entry_blend_source, result.pose, blend_alpha);
+    result.pose = apply_entry_blend(
+        entry_blend_source,
+        result.pose,
+        player.elapsed_seconds(),
+        entry_blend_seconds);
     return result;
 }
 
@@ -700,6 +708,11 @@ void InteractionRuntime::drain_playback_events(
                         source_rate;
                     terminal_pose = mapped_pose_at_frame(
                         *database_, *candidate_, candidate_->hold_frame);
+                    terminal_pose = apply_entry_blend(
+                        entry_blend_source_,
+                        terminal_pose,
+                        terminal_elapsed_seconds,
+                        config_.playback.entry_blend_seconds);
                     terminal_frame = candidate_->hold_frame;
                     terminal_phase = Phase::Hold;
                     ContactMeasurement terminal_measurement =
@@ -939,11 +952,14 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
                                             *affordance_,
                                             false);
                                         entry_blend_elapsed_seconds_ = 0.0F;
-                                        commit_seconds_ = std::min({
-                                            config_.playback.commit_horizon_seconds,
+                                        const float wall_time_to_contact =
                                             database_->time_to_contact.at(
                                                 static_cast<size_t>(
-                                                    candidate_->entry_frame)),
+                                                    candidate_->entry_frame)) /
+                                            config_.playback.speed;
+                                        commit_seconds_ = std::min({
+                                            config_.playback.commit_horizon_seconds,
+                                            wall_time_to_contact,
                                             config_.playback.maximum_alignment_seconds,
                                         });
                                         contact_evaluated_ = false;
@@ -1067,16 +1083,11 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
                     diagnostics_.hand_orientation_error_radians =
                         ik.orientation_error_radians;
                 }
-                const float blend_alpha =
-                    config_.playback.entry_blend_seconds <= 0.0F
-                    ? 1.0F
-                    : std::clamp(
-                          entry_blend_elapsed_seconds_ /
-                              config_.playback.entry_blend_seconds,
-                          0.0F,
-                          1.0F);
-                pose_ = interpolate_pose(
-                    entry_blend_source_, sampled, blend_alpha);
+                pose_ = apply_entry_blend(
+                    entry_blend_source_,
+                    sampled,
+                    entry_blend_elapsed_seconds_,
+                    config_.playback.entry_blend_seconds);
                 diagnostics_.frame = player_->frame();
                 diagnostics_.phase = player_->phase();
                 diagnostics_.applied_root_correction_m = length(
@@ -1125,6 +1136,7 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
     } else if (state_ == RuntimeState::PickupReplay) {
         const float published_elapsed_seconds = player_->elapsed_seconds();
         if (!player_->finished()) player_->advance(input.dt);
+        entry_blend_elapsed_seconds_ += input.dt;
         Pose sampled = player_->sample();
         if (!post_commit_failure_ &&
             player_->frame() <= candidate_->contact_frame) {
@@ -1140,7 +1152,11 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
             diagnostics_.hand_orientation_error_radians =
                 ik.orientation_error_radians;
         }
-        pose_ = sampled;
+        pose_ = apply_entry_blend(
+            entry_blend_source_,
+            sampled,
+            entry_blend_elapsed_seconds_,
+            config_.playback.entry_blend_seconds);
         diagnostics_.frame = player_->frame();
         diagnostics_.phase = player_->phase();
         diagnostics_.applied_root_correction_m = length(
@@ -1169,11 +1185,16 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
         if (carry_ready_) {
             begin_carry();
         } else {
+            entry_blend_elapsed_seconds_ += input.dt;
             const float published_elapsed_seconds =
                 player_->elapsed_seconds();
             const bool extending_final_pose = player_->finished();
             if (!extending_final_pose) player_->advance(input.dt);
-            pose_ = player_->sample();
+            pose_ = apply_entry_blend(
+                entry_blend_source_,
+                player_->sample(),
+                entry_blend_elapsed_seconds_,
+                config_.playback.entry_blend_seconds);
             diagnostics_.frame = player_->frame();
             diagnostics_.phase = player_->phase();
             diagnostics_.applied_root_correction_m = length(
@@ -1230,16 +1251,33 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
         }
     } else if (state_ == RuntimeState::Carry) {
         if (input.reset_pressed) {
-            const TargetHandle reset = attachment_->reset(
-                original_object_world_);
+            const InteractionTarget* authoritative =
+                registry_->find(request_->target);
+            const bool may_restore = owns_reservation_ &&
+                authoritative != nullptr &&
+                registry_->validate(
+                    request_->target, request_->request_id) &&
+                authoritative->state == ObjectState::Held;
+            TargetHandle reset{};
+            if (may_restore) {
+                reset = attachment_->reset(original_object_world_);
+                object_world_ = original_object_world_;
+            }
             owns_reservation_ = false;
-            object_world_ = original_object_world_;
             state_ = RuntimeState::Locomotion;
             diagnostics_.state = state_;
-            diagnostics_.result = ResultCode::Reset;
-            diagnostics_.reason = Reason::Reset;
-            diagnostics_.target = reset;
-            diagnostics_.object_state = ObjectState::Free;
+            diagnostics_.result = may_restore
+                ? ResultCode::Reset
+                : ResultCode::Failed;
+            diagnostics_.reason = may_restore
+                ? Reason::Reset
+                : Reason::TargetChanged;
+            if (may_restore) diagnostics_.target = reset;
+            diagnostics_.object_state = may_restore
+                ? ObjectState::Free
+                : (authoritative == nullptr
+                       ? ObjectState::Free
+                       : authoritative->state);
             diagnostics_.attached = false;
             diagnostics_.recorded_carry = false;
             carry_.reset();

@@ -669,6 +669,58 @@ void test_success_order_carry_and_reset() {
     assert(output.diagnostics.result == ResultCode::Reset);
 }
 
+void test_carry_reset_preserves_a_newer_authoritative_generation() {
+    using namespace interaction;
+    RuntimeFixture fixture = make_runtime_fixture();
+    InteractionRuntime runtime(
+        fixture.database,
+        fixture.features,
+        fixture.registry,
+        RuntimeConfig{});
+    RuntimeOutput output = enter_align(runtime, fixture);
+    output = advance_until(
+        runtime,
+        fixture.locomotion,
+        RuntimeState::PickupReplay,
+        RuntimeState::Align);
+    output = advance_until(
+        runtime,
+        fixture.locomotion,
+        RuntimeState::Hold,
+        RuntimeState::PickupReplay);
+    output = advance_until(
+        runtime,
+        fixture.locomotion,
+        RuntimeState::Carry,
+        RuntimeState::Hold);
+    assert(output.diagnostics.attached);
+
+    Transform authoritative = fixture.original_object_world;
+    authoritative.position.x += 0.45F;
+    authoritative.position.z -= 0.20F;
+    const TargetHandle newer = fixture.registry.replace_pose(
+        fixture.request.target.id, authoritative);
+    assert(newer.generation == fixture.request.target.generation + 1U);
+
+    output = runtime.update(reset_input(fixture.locomotion));
+    assert(output.diagnostics.state == RuntimeState::Locomotion);
+    assert(output.diagnostics.result == ResultCode::Failed);
+    assert(output.diagnostics.reason == Reason::TargetChanged);
+    assert(!output.diagnostics.attached);
+    assert(!output.owns_pose && !output.suppress_steering);
+
+    const InteractionTarget* preserved = fixture.registry.find(newer);
+    assert(preserved != nullptr);
+    assert(preserved->state == ObjectState::Free);
+    assert(preserved->owner_request == 0U);
+    assert(exact(preserved->object_world, authoritative));
+
+    const RuntimeOutput idle = advance(runtime, fixture.locomotion);
+    assert(idle.diagnostics.result == ResultCode::Failed);
+    assert(idle.diagnostics.reason == Reason::TargetChanged);
+    assert(fixture.registry.find(newer) != nullptr);
+}
+
 void test_align_cancel_releases_reservation() {
     using namespace interaction;
     RuntimeFixture fixture = make_runtime_fixture();
@@ -721,6 +773,45 @@ void test_entry_blends_the_whole_pose_for_quarter_second() {
     }
     assert(std::abs(
         output.pose.positions[g1_skeleton::Hips].x) < 1.0e-6F);
+}
+
+void test_entry_blend_continues_after_early_commit() {
+    using namespace interaction;
+    RuntimeFixture early_fixture = make_runtime_fixture();
+    RuntimeFixture align_fixture = make_runtime_fixture();
+    early_fixture.locomotion.pose.positions[g1_skeleton::Hips].x += 0.30F;
+    align_fixture.locomotion = early_fixture.locomotion;
+
+    RuntimeConfig early_config{};
+    early_config.playback.entry_blend_seconds = 0.50F;
+    early_config.playback.commit_horizon_seconds = kDt;
+    RuntimeConfig align_config = early_config;
+    align_config.playback.commit_horizon_seconds = 0.50F;
+
+    InteractionRuntime early(
+        early_fixture.database,
+        early_fixture.features,
+        early_fixture.registry,
+        early_config);
+    InteractionRuntime align(
+        align_fixture.database,
+        align_fixture.features,
+        align_fixture.registry,
+        align_config);
+    RuntimeOutput early_output = enter_align(early, early_fixture);
+    RuntimeOutput align_output = enter_align(align, align_fixture);
+
+    early_output = advance(early, early_fixture.locomotion);
+    align_output = advance(align, align_fixture.locomotion);
+    assert(early_output.diagnostics.state == RuntimeState::PickupReplay);
+    assert(align_output.diagnostics.state == RuntimeState::Align);
+    assert(exact(early_output.pose, align_output.pose));
+
+    early_output = advance(early, early_fixture.locomotion);
+    align_output = advance(align, align_fixture.locomotion);
+    assert(early_output.diagnostics.state == RuntimeState::PickupReplay);
+    assert(align_output.diagnostics.state == RuntimeState::Align);
+    assert(exact(early_output.pose, align_output.pose));
 }
 
 void test_cancel_is_ignored_after_commit_and_source_frame_is_monotonic() {
@@ -791,6 +882,32 @@ void test_commit_at_contact_preserves_the_one_shot_crossing() {
         RuntimeState::Carry,
         RuntimeState::Hold);
     assert(output.diagnostics.result == ResultCode::Succeeded);
+}
+
+void test_nonunit_playback_speed_commits_by_source_contact() {
+    using namespace interaction;
+    RuntimeFixture fixture = make_runtime_fixture();
+    RuntimeConfig config{};
+    config.playback.speed = 1.10F;
+    config.playback.commit_horizon_seconds = 1.0F;
+    config.playback.maximum_alignment_seconds = 1.0F;
+    InteractionRuntime runtime(
+        fixture.database, fixture.features, fixture.registry, config);
+    RuntimeOutput output = enter_align(runtime, fixture);
+
+    constexpr int32_t kContactFrame =
+        runtime_fixture_detail::kFramesPerClip +
+        runtime_fixture_detail::kContactLocalFrame;
+    for (int update = 0; update < 13; ++update) {
+        output = advance(runtime, fixture.locomotion);
+        assert(output.diagnostics.state == RuntimeState::Align);
+        assert(output.diagnostics.frame < kContactFrame);
+    }
+
+    output = advance(runtime, fixture.locomotion);
+    assert(output.diagnostics.state == RuntimeState::PickupReplay);
+    assert(output.diagnostics.frame == kContactFrame);
+    assert(output.diagnostics.playback_speed == config.playback.speed);
 }
 
 void test_canonical_updates_gate_the_exact_contact_pose() {
@@ -1356,10 +1473,13 @@ int main() {
     test_noncanonical_dt_cannot_mutate_owned_runtime_state();
     test_interact_without_explicit_request_is_rejected_after_preflight();
     test_success_order_carry_and_reset();
+    test_carry_reset_preserves_a_newer_authoritative_generation();
     test_align_cancel_releases_reservation();
     test_entry_blends_the_whole_pose_for_quarter_second();
+    test_entry_blend_continues_after_early_commit();
     test_cancel_is_ignored_after_commit_and_source_frame_is_monotonic();
     test_commit_at_contact_preserves_the_one_shot_crossing();
+    test_nonunit_playback_speed_commits_by_source_contact();
     test_canonical_updates_gate_the_exact_contact_pose();
     test_canonical_updates_cannot_skip_post_attach_contact_loss();
     test_pickup_success_precedes_later_canonical_contact_loss();
