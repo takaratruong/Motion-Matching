@@ -846,6 +846,7 @@ class GrailSceneTests(unittest.TestCase):
         expected_classes = {"blocked": 0, "certified": 1, "stress": 2}
         for definition in definitions:
             expected = definition.routes[0].walkability_class
+            mesh_xmin, mesh_xmax, _, _ = definition.surface.xz_bounds()
             halo = np.float32(WALKABILITY_CLASSIFICATION_HALO)
             xmin, xmax, zmin, zmax = (
                 np.float32(value)
@@ -860,19 +861,38 @@ class GrailSceneTests(unittest.TestCase):
             center_z = float(np.float32(
                 np.float32(zmin + zmax) / np.float32(2.0)))
             edge_queries = (
-                (expanded[0], center_z, 0, -np.inf),
-                (expanded[1], center_z, 0, np.inf),
-                (center_x, expanded[2], 1, -np.inf),
-                (center_x, expanded[3], 1, np.inf),
+                (expanded[0], center_z, 0, -np.inf, 1),
+                (expanded[1], center_z, 0, np.inf, 1),
+                (center_x, expanded[2], 1, -np.inf, expected),
+                (center_x, expanded[3], 1, np.inf, expected),
             )
-            for x, z, axis, outward in edge_queries:
+            for x, z, axis, outward, edge_class in edge_queries:
                 with self.subTest(
                         scene=definition.scene_id, halo_edge=(x, z)):
-                    self.assertEqual(definition.walkability(x, z), expected)
+                    self.assertEqual(
+                        definition.walkability(x, z), edge_class)
                     outside = [x, z]
                     outside[axis] = np.nextafter(outside[axis], outward)
                     self.assertEqual(
                         definition.walkability(*outside), 0)
+
+            route = definition.routes[0]
+            for point in route.waypoints_xz:
+                with self.subTest(
+                        scene=definition.scene_id, route_point=point):
+                    self.assertEqual(
+                        definition.walkability(*point),
+                        route.walkability_class)
+            apron_probes = (
+                float(np.float32(xmin + halo)),
+                float(np.float32(xmax - halo)),
+            )
+            for x in apron_probes:
+                with self.subTest(
+                        scene=definition.scene_id, apron_probe=x):
+                    self.assertTrue(x < mesh_xmin or x > mesh_xmax)
+                    self.assertEqual(
+                        definition.walkability(x, center_z), 1)
 
             built = build_scene(definition)
             grid, walkability = decoded_scene_grid_and_walkability(built)
@@ -888,16 +908,42 @@ class GrailSceneTests(unittest.TestCase):
                 metadata["bounds"]["playable_max_xz"][1],
             )
             self.assertEqual(published_playable, normalized_playable)
-            region_class = "certified" if expected == 1 else "stress"
-            self.assertEqual(len(metadata["regions"][region_class]), 1)
-            self.assertEqual(
-                tuple(metadata["regions"][region_class][0]["bounds_xz"]),
-                normalized_playable)
             self.assertEqual(metadata["regions"]["blocked"], [])
-            self.assertEqual(
-                metadata["regions"][
-                    "stress" if region_class == "certified" else "certified"],
-                [])
+            if expected == 1:
+                self.assertEqual(len(metadata["regions"]["certified"]), 1)
+                self.assertEqual(
+                    tuple(metadata["regions"]["certified"][0]["bounds_xz"]),
+                    normalized_playable)
+                self.assertEqual(metadata["regions"]["stress"], [])
+            else:
+                certified = sorted(
+                    metadata["regions"]["certified"],
+                    key=lambda region: region["bounds_xz"][0])
+                stress = metadata["regions"]["stress"]
+                self.assertEqual(len(certified), 2)
+                self.assertEqual(len(stress), 1)
+                left = certified[0]["bounds_xz"]
+                core = stress[0]["bounds_xz"]
+                right = certified[1]["bounds_xz"]
+                self.assertEqual(left[0], normalized_playable[0])
+                self.assertEqual(right[1], normalized_playable[1])
+                self.assertEqual(
+                    (left[2], left[3]), normalized_playable[2:])
+                self.assertEqual(
+                    (core[2], core[3]), normalized_playable[2:])
+                self.assertEqual(
+                    (right[2], right[3]), normalized_playable[2:])
+                left_ix = {
+                    ix for _, ix in _region_cell_indices(grid, left)
+                }
+                core_ix = {
+                    ix for _, ix in _region_cell_indices(grid, core)
+                }
+                right_ix = {
+                    ix for _, ix in _region_cell_indices(grid, right)
+                }
+                self.assertEqual(max(left_ix) + 1, min(core_ix))
+                self.assertEqual(max(core_ix) + 1, min(right_ix))
             with self.subTest(scene=definition.scene_id, contract="source"):
                 self.assertEqual(
                     metadata["provenance"]["source_ids"][0],
@@ -1127,6 +1173,56 @@ class ProceduralSceneTests(unittest.TestCase):
         self.assertAlmostEqual(scene.surface.height(-0.8, 2.25), 0.45)
         self.assertGreater(scene.surface.height(0.8, 2.25), 0.0)
 
+    def test_procedural_side_aprons_are_certified(self):
+        for scene_id, scene in self.definitions.items():
+            z = min(2.25, scene.playable_bounds_xz[3] - 0.25)
+            for x in (-2.5, 2.5):
+                with self.subTest(scene=scene_id, x=x):
+                    self.assertEqual(scene.surface.height(x, z), 0.0)
+                    self.assertEqual(scene.walkability(x, z), 1)
+        stress = self.definitions["ramp-15-stress"]
+        self.assertEqual(stress.walkability(0.0, 2.25), 2)
+        self.assertEqual(stress.walkability(-2.5, 2.25), 1)
+        self.assertEqual(stress.walkability(+2.5, 2.25), 1)
+
+        built = self.built["ramp-15-stress"]
+        grid, _ = decoded_scene_grid_and_walkability(built)
+        regions = {
+            region["id"]: region["bounds_xz"]
+            for entries in built.metadata["regions"].values()
+            for region in entries
+        }
+        partitions = [
+            {ix for _, ix in _region_cell_indices(grid, regions[name])}
+            for name in ("left-apron", "course", "right-apron")
+        ]
+        self.assertEqual(max(partitions[0]) + 1, min(partitions[1]))
+        self.assertEqual(max(partitions[1]) + 1, min(partitions[2]))
+
+    def test_blocked_course_has_two_certified_outer_bypasses(self):
+        scene = self.definitions["blocked-course"]
+        for z in (1.0, 2.25, scene.playable_bounds_xz[3] - 0.25):
+            self.assertEqual(scene.walkability(-2.5, z), 1)
+            self.assertEqual(scene.walkability(+2.5, z), 1)
+        self.assertEqual(scene.walkability(-0.8, 2.25), 0)
+        self.assertEqual(scene.walkability(+0.8, 2.25), 0)
+        self.assertEqual(scene.walkability(0.0, 2.25), 0)
+
+        built = self.built["blocked-course"]
+        grid, _ = decoded_scene_grid_and_walkability(built)
+        regions = {
+            region["id"]: region["bounds_xz"]
+            for entries in built.metadata["regions"].values()
+            for region in entries
+        }
+        partitions = [
+            {ix for _, ix in _region_cell_indices(grid, regions[name])}
+            for name in (
+                "left-bypass", "wall", "gap", "ramp", "right-bypass")
+        ]
+        for left, right in zip(partitions, partitions[1:]):
+            self.assertEqual(max(left) + 1, min(right))
+
     def test_binary32_halo_expands_only_classification_outer_bounds(self):
         halo = np.float32(WALKABILITY_CLASSIFICATION_HALO)
 
@@ -1142,8 +1238,8 @@ class ProceduralSceneTests(unittest.TestCase):
                 continue
             expected = scene.routes[0].walkability_class
             xmin, xmax, zmin, zmax = expanded(scene.playable_bounds_xz)
-            self.assertEqual(scene.walkability(xmin, 0.0), expected)
-            self.assertEqual(scene.walkability(xmax, 0.0), expected)
+            self.assertEqual(scene.walkability(xmin, 0.0), 1)
+            self.assertEqual(scene.walkability(xmax, 0.0), 1)
             self.assertEqual(scene.walkability(0.0, zmin), expected)
             self.assertEqual(scene.walkability(0.0, zmax), expected)
             self.assertEqual(

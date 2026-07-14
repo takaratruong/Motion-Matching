@@ -289,6 +289,45 @@ def _wide_heightfield_bounds(core_bounds, playable_bounds):
     return xmin, xmax, core[2], core[3]
 
 
+def _runtime_grid_x_partition(
+    heightfield_bounds, core_minimum, core_maximum, label,
+):
+    bounds = _strict_bounds(heightfield_bounds, f"{label} heightfield")
+    minimum = _finite_real(core_minimum, f"{label} core minimum")
+    maximum = _finite_real(core_maximum, f"{label} core maximum")
+    if maximum <= minimum:
+        raise ValueError(f"{label} core X interval must be increasing")
+    if minimum <= bounds[0] or maximum >= bounds[1]:
+        raise ValueError(f"{label} core X interval needs an outer grid node")
+    origin = _runtime_f32_lower_floor(bounds[0], f"{label} grid origin")
+    cell = _runtime_f32(SCENE_CELL_SIZE, f"{label} grid cell")
+
+    def source(index):
+        return origin + index * cell
+
+    first_core = int(np.ceil((minimum - origin) / cell))
+    while source(first_core) < minimum:
+        first_core += 1
+    while first_core > 0 and source(first_core - 1) >= minimum:
+        first_core -= 1
+    last_core = int(np.floor((maximum - origin) / cell))
+    while source(last_core) > maximum:
+        last_core -= 1
+    while source(last_core + 1) <= maximum:
+        last_core += 1
+    if first_core < 1 or last_core < first_core:
+        raise ValueError(f"{label} core has no bounded grid partition")
+
+    indices = (first_core - 1, first_core, last_core, last_core + 1)
+    values = tuple(
+        _runtime_f32(source(index), f"{label} grid partition[{index}]")
+        for index in indices
+    )
+    if any(left >= right for left, right in zip(values, values[1:])):
+        raise ValueError(f"{label} grid partition is not increasing")
+    return values
+
+
 def _walkability_classification_bounds(bounds):
     # The JSON playable/region bounds remain center bounds. Only the promoted
     # source-node G1WM callback receives this exact binary32 footprint halo.
@@ -420,9 +459,32 @@ def _corridor_definition(
         heightfield_end_z,
     )
     bounds = _wide_heightfield_bounds(core_bounds, playable)
-    region_name = "certified" if walkability_class == 1 else "stress"
     regions = {"certified": (), "stress": (), "blocked": ()}
-    regions[region_name] = (_region("course", playable),)
+    if walkability_class == 1:
+        regions["certified"] = (_region("course", playable),)
+    else:
+        left_apron_end, left_core, right_core, right_apron_start = \
+            _runtime_grid_x_partition(
+                bounds, core_playable[0], core_playable[1],
+                "corridor stress")
+        regions["certified"] = (
+            _region("left-apron", (
+                playable[0], left_apron_end,
+                playable[2], playable[3])),
+            _region("right-apron", (
+                right_apron_start, playable[1],
+                playable[2], playable[3])),
+        )
+        regions["stress"] = (_region("course", (
+            left_core, right_core, playable[2], playable[3])),)
+
+    def walkability(x, z):
+        if not _bounds_contains(classification, x, z):
+            return 0
+        if walkability_class == 1:
+            return 1
+        return 2 if core_playable[0] <= x <= core_playable[1] else 1
+
     return SceneDefinition(
         scene_id=scene_id,
         label=label,
@@ -438,8 +500,7 @@ def _corridor_definition(
         spawn_yaw_radians=0.0,
         regions=regions,
         routes=(route,),
-        walkability=lambda x, z, c=walkability_class, b=classification: (
-            c if _bounds_contains(b, x, z) else 0),
+        walkability=walkability,
     )
 
 
@@ -675,13 +736,39 @@ def _blocked_definition():
     classification = _walkability_classification_bounds(playable)
     core_bounds = (-2.4, 2.4, -1.0, heightfield_end_z)
     bounds = _wide_heightfield_bounds(core_bounds, playable)
+    wall_min_x = _runtime_f32(
+        surface.wall_center_x - surface.lane_half_width,
+        "blocked wall xmin")
+    wall_max_x = _runtime_f32(
+        surface.wall_center_x + surface.lane_half_width,
+        "blocked wall xmax")
+    ramp_min_x = _runtime_f32(
+        surface.ramp_center_x - surface.lane_half_width,
+        "blocked ramp xmin")
+    ramp_max_x = _runtime_f32(
+        surface.ramp_center_x + surface.lane_half_width,
+        "blocked ramp xmax")
+    left_bypass_end, blocked_min_x, blocked_max_x, right_bypass_start = \
+        _runtime_grid_x_partition(
+            bounds, wall_min_x, ramp_max_x, "blocked obstacle")
+    _, wall_region_min, wall_region_max, gap_min_x = \
+        _runtime_grid_x_partition(
+            bounds, wall_min_x, wall_max_x, "blocked wall")
+    gap_max_x, ramp_region_min, ramp_region_max, _ = \
+        _runtime_grid_x_partition(
+            bounds, ramp_min_x, ramp_max_x, "blocked ramp")
+    if wall_region_min != blocked_min_x or \
+            ramp_region_max != blocked_max_x:
+        raise ValueError("blocked obstacle grid partitions disagree")
 
     def walkability(x, z):
         if not _bounds_contains(classification, x, z):
             return 0
         # Expand only the outer course bounds. This obstacle threshold is the
         # published safety boundary and deliberately receives no halo.
-        return 1 if z <= obstacle_start - SCENE_CELL_SIZE else 0
+        if z <= obstacle_start - SCENE_CELL_SIZE:
+            return 1
+        return 1 if x < wall_min_x or x > ramp_max_x else 0
 
     parameters = {
         "primitive": "blocked-course",
@@ -711,13 +798,28 @@ def _blocked_definition():
         spawn_position=(0.0, 0.0, 0.0),
         spawn_yaw_radians=0.0,
         regions={
-            "certified": (_region(
-                "approach", (-1.4, 1.4, 0.0,
-                             obstacle_start - SCENE_CELL_SIZE)),),
+            "certified": (
+                _region("approach", (
+                    playable[0], playable[1], 0.0,
+                    obstacle_start - SCENE_CELL_SIZE)),
+                _region("left-bypass", (
+                    playable[0], left_bypass_end,
+                    obstacle_start, course_end)),
+                _region("right-bypass", (
+                    right_bypass_start, playable[1],
+                    obstacle_start, course_end)),
+            ),
             "stress": (),
             "blocked": (
-                _region("wall", (-1.4, -0.2, obstacle_start, course_end)),
-                _region("ramp", (0.2, 1.4, obstacle_start, course_end)),
+                _region("wall", (
+                    wall_region_min, wall_region_max,
+                    obstacle_start, course_end)),
+                _region("gap", (
+                    gap_min_x, gap_max_x,
+                    obstacle_start, course_end)),
+                _region("ramp", (
+                    ramp_region_min, ramp_region_max,
+                    obstacle_start, course_end)),
             ),
         },
         routes=(
@@ -877,9 +979,39 @@ def grail_scene_definition(
     certified = maximum_height <= 0.16
     walkability_class = 1 if certified else 2
     expected_outcome = "traverse" if certified else "traverse-or-safe-stop"
-    region_name = "certified" if certified else "stress"
     regions = {"certified": (), "stress": (), "blocked": ()}
-    regions[region_name] = (_region("curb-route", playable),)
+    central_xmin = _runtime_f32_lower_floor(
+        max(playable[0], min(mesh_xmin, core_playable[0])),
+        "GRAIL retained core xmin")
+    central_xmax = _runtime_f32_upper_ceiling(
+        min(playable[1], max(mesh_xmax, core_playable[1])),
+        "GRAIL retained core xmax")
+    if certified:
+        regions["certified"] = (_region("curb-route", playable),)
+    else:
+        left_apron_end, stress_xmin, stress_xmax, right_apron_start = \
+            _runtime_grid_x_partition(
+                bounds, central_xmin, central_xmax,
+                "GRAIL retained stress")
+        regions["certified"] = (
+            _region("left-apron", (
+                playable[0], left_apron_end,
+                playable[2], playable[3])),
+            _region("right-apron", (
+                right_apron_start, playable[1],
+                playable[2], playable[3])),
+        )
+        regions["stress"] = (_region("curb-route", (
+            stress_xmin, stress_xmax,
+            playable[2], playable[3])),)
+
+    def walkability(x, z):
+        if not _bounds_contains(classification, x, z):
+            return 0
+        if certified:
+            return 1
+        return 2 if central_xmin <= x <= central_xmax else 1
+
     labels = {
         "grail-curb-default": "GRAIL Default Curb",
         "grail-curb-low": "GRAIL Low Curb",
@@ -913,8 +1045,7 @@ def grail_scene_definition(
         routes=(SceneRoute(
             "curb-forward", route_points, expected_outcome,
             walkability_class, 0.0),),
-        walkability=lambda x, z, c=walkability_class, b=classification: (
-            c if _bounds_contains(b, x, z) else 0),
+        walkability=walkability,
     )
 
 
