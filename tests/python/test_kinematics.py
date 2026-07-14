@@ -74,6 +74,7 @@ class KinematicsTests(unittest.TestCase):
         self.assertEqual(skeleton.names[0], "Simulation")
         self.assertEqual(skeleton.parents[0], -1)
         self.assertLessEqual(report["fk_max_error_m"], 0.001)
+        self.assertLessEqual(report["fk_rotation_max_error_degrees"], 0.1)
         self.assertLessEqual(report["duration_error_s"], 1.0/25.0)
         np.testing.assert_array_equal(clip.source_frames, np.arange(5))
         np.testing.assert_allclose(

@@ -10,6 +10,22 @@ from .schema import HoldenClip, SkeletonSpec, SourceClip
 Q_ZUP_TO_YUP = np.array([2**-0.5, -2**-0.5, 0, 0], np.float64)
 
 
+def vectors_zup_to_yup(values: np.ndarray) -> np.ndarray:
+    q = np.broadcast_to(
+        Q_ZUP_TO_YUP, np.asarray(values).shape[:-1] + (4,)
+    )
+    return holden_quat.mul_vec(q, np.asarray(values))
+
+
+def quaternions_zup_to_yup(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values)
+    q = np.broadcast_to(Q_ZUP_TO_YUP, values.shape)
+    qi = np.broadcast_to(holden_quat.inv(Q_ZUP_TO_YUP), values.shape)
+    return holden_quat.normalize(
+        holden_quat.mul(holden_quat.mul(q, values), qi)
+    )
+
+
 class G1Kinematics:
     def __init__(self, xml_path: str):
         self.model = mujoco.MjModel.from_xml_path(xml_path)
@@ -208,13 +224,24 @@ def convert_source_clip(
         raise ValueError(
             f"{source.name}: exported quaternion norm error "
             f"{quaternion_error}")
-    exported_gp, _ = forward_local_hierarchy(
+    exported_gp, exported_gq = forward_local_hierarchy(
         positions.astype(np.float64), rotations.astype(np.float64),
         skeleton.parents)
     fk_error = float(np.max(np.linalg.norm(
         exported_gp[:, 1:] - gp, axis=-1)))
+    dots = np.clip(
+        np.abs(np.sum(exported_gq[:, 1:] * gq, axis=-1)), 0.0, 1.0
+    )
+    fk_rotation_error_degrees = float(
+        np.degrees(np.max(2.0 * np.arccos(dots)))
+    )
     if fk_error > 0.001:
         raise ValueError(f"{source.name}: exported FK error {fk_error} m")
+    if fk_rotation_error_degrees > 0.1:
+        raise ValueError(
+            f"{source.name}: exported rotational FK error "
+            f"{fk_rotation_error_degrees} degrees"
+        )
     clip = HoldenClip(
         source.name,
         positions,
@@ -233,6 +260,7 @@ def convert_source_clip(
         raise ValueError(f"{source.name}: duration error {duration_error} s")
     return clip, skeleton, {
         "fk_max_error_m": fk_error,
+        "fk_rotation_max_error_degrees": fk_rotation_error_degrees,
         "duration_error_s": duration_error,
         "quaternion_norm_max_error": quaternion_error,
     }
