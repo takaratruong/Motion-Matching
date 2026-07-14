@@ -43,7 +43,7 @@
 - `controller.cpp`: parse/toggle IK, run observation in both modes, apply IK only after support FK, forward safe-stop/error outcomes, fill diagnostics, and render either the IK or exact IK-off pose.
 - `motion_match_log.h`: append an IK-only suffix to the completed sibling logger; do not rename or reorder any existing column.
 - `resources/check_g1_runtime_log.py`: compose existing Gate C/D/F checks with exact-string IK invariance and Gate E bounds.
-- `tests/cpp/test_g1_ik.cpp`: explicit geometry, locks, normals, named solve, orientation, correction, reset, reversibility, and error-path tests.
+- `tests/cpp/test_g1_ik.cpp`: explicit geometry, v2 local-basis provenance, locks, normals, named solve, orientation, correction, reset, reversibility, and error-path tests.
 - `tests/cpp/test_g1_clearance.cpp`: point/sole/capsule/sweep diagnostics and safe-stop threshold tests on synthetic G1HF/v2 surfaces.
 - `tests/cpp/test_g1_controller_state.cpp`: scene reset/swap coverage for all IK state and pose buffers.
 - `tests/python/test_runtime_log.py`: synthetic IK schema, invariance, drift, penetration, safe-stop, route-matrix, and controlled-error checker regressions.
@@ -116,7 +116,8 @@ The sibling checker entry points are `check_rows`, `check_gate_c`, `check_gate_d
 - Consumes: `G1Bone`, the exact 31-bone parent array, `database`, `vec3`, and finite helpers from `terrain_runtime.h`.
 - Produces: `G1LegConfig g1_left_leg_config()` and `G1LegConfig g1_right_leg_config()`.
 - Produces: `bool g1_leg_configs_validate(const database&, char*, int)`; a bad skeleton/config is a startup error before Raylib.
-- Locks the MuJoCo-to-Holden local basis `(x,y,z) -> (x,z,-y)`, including four sole probes and thigh/shin capsules. It does not load or parse XML at runtime.
+- Locks the authoritative `g1-terrain-artifacts/v2` MuJoCo-to-Holden local basis `(x,y,z) -> (x,z,-y)`, including four sole probes and thigh/shin capsules. The v2 builder rotates world positions, conjugates world rotations, and then re-expresses child-local offsets; the legacy/root-only `resources/database.bin` layout is incompatible. Runtime validation does not load or parse XML.
+- Scans all database rows for finite, fixed mapped `Left/RightKnee`, `Left/RightAnkle`, and `Left/RightToe` child offsets within `1e-6 m`. This provenance gate prevents pairing the mapped IK geometry with a legacy local-basis database that has the same 31-bone shape.
 - Wires the validator immediately after `g1_skeleton_validate` and before feature construction or `InitWindow`; a source-order regression locks that startup gate.
 
 - [ ] **Step 1: Write the failing named-geometry test**
@@ -151,6 +152,18 @@ static void make_g1_database(database& db)
     db.bone_positions.set(vec3());
     db.bone_rotations.set(quat());
     for (int i = 0; i < G1_BoneCount; ++i) db.bone_parents(i) = parents[i];
+    db.bone_positions(0, G1_LeftKnee) =
+        vec3(-0.078273f, -0.17734f, -0.0021489f);
+    db.bone_positions(0, G1_LeftAnkle) =
+        vec3(0.0f, -0.30001f, +0.000094445f);
+    db.bone_positions(0, G1_LeftToe) =
+        vec3(0.0f, -0.017558f, 0.0f);
+    db.bone_positions(0, G1_RightKnee) =
+        vec3(-0.078273f, -0.17734f, +0.0021489f);
+    db.bone_positions(0, G1_RightAnkle) =
+        vec3(0.0f, -0.30001f, -0.000094445f);
+    db.bone_positions(0, G1_RightToe) =
+        vec3(0.0f, -0.017558f, 0.0f);
 }
 
 static void test_explicit_leg_geometry()
@@ -215,7 +228,11 @@ non-orthogonal, or incorrectly mapped local axes; degenerate capsules; and
 inconsistent, duplicate, or non-planar sole probes. Exercise both left and
 right configurations. The validator checks named leg chains before the full
 `g1_skeleton_validate` call so corrupt `LeftHipYaw` and `LeftKnee` links still
-receive their named diagnostics.
+receive their named diagnostics. Also create a database-shaped legacy fixture
+with the unmapped XML-local knee/ankle/toe offsets and require a `local basis`
+diagnostic containing the failing frame and named bone. Put a legacy offset in
+row 1 of a two-row otherwise-valid fixture to prove every row is scanned, and
+cover a non-finite selected offset so NaN cannot bypass the tolerance checks.
 
 - [ ] **Step 2: Compile to verify RED**
 
@@ -401,6 +418,55 @@ static inline bool g1_leg_database_shape_validate(
             error_capacity,
             "G1 IK parent shape mismatch: expected %d entries",
             G1_BoneCount);
+    }
+    return true;
+}
+
+static inline bool g1_leg_database_local_basis_validate(
+    const database& db, char* error, int error_capacity)
+{
+    const int bones[] = {
+        G1_LeftKnee,
+        G1_LeftAnkle,
+        G1_LeftToe,
+        G1_RightKnee,
+        G1_RightAnkle,
+        G1_RightToe
+    };
+    const char* const names[] = {
+        "LeftKnee",
+        "LeftAnkle",
+        "LeftToe",
+        "RightKnee",
+        "RightAnkle",
+        "RightToe"
+    };
+    const vec3 expected_offsets[] = {
+        vec3(-0.078273f, -0.17734f, -0.0021489f),
+        vec3(0.0f, -0.30001f, +0.000094445f),
+        vec3(0.0f, -0.017558f, 0.0f),
+        vec3(-0.078273f, -0.17734f, +0.0021489f),
+        vec3(0.0f, -0.30001f, -0.000094445f),
+        vec3(0.0f, -0.017558f, 0.0f)
+    };
+    const float tolerance_m = 1.0e-6f;
+    const int count = static_cast<int>(sizeof(bones) / sizeof(bones[0]));
+    for (int frame = 0; frame < db.bone_positions.rows; ++frame) {
+        for (int index = 0; index < count; ++index) {
+            const vec3 actual = db.bone_positions(frame, bones[index]);
+            const vec3 expected = expected_offsets[index];
+            if (!g1_leg_vec3_is_finite(actual) ||
+                std::fabs(actual.x - expected.x) > tolerance_m ||
+                std::fabs(actual.y - expected.y) > tolerance_m ||
+                std::fabs(actual.z - expected.z) > tolerance_m) {
+                return g1_ik_error(
+                    error,
+                    error_capacity,
+                    "G1 IK local basis mismatch at frame %d bone %s",
+                    frame,
+                    names[index]);
+            }
+        }
     }
     return true;
 }
@@ -688,6 +754,10 @@ static inline bool g1_leg_configs_validate(
     if (!g1_leg_database_shape_validate(db, error, error_capacity)) {
         return false;
     }
+    if (!g1_leg_database_local_basis_validate(
+            db, error, error_capacity)) {
+        return false;
+    }
     if (!g1_leg_config_validate(
             db, g1_left_leg_config(), error, error_capacity) ||
         !g1_leg_config_validate(
@@ -705,7 +775,15 @@ bottom/support point rather than falsely treating the sphere center as the
 sole. The two capsule definitions use their XML centerlines and retain their
 radii. All values come from
 `/home/ubuntu/projects/mjx-diffphysics/env/g1/assets/g1_29dof.xml`, mapped from
-MuJoCo Z-up to Holden Y-up with `(x,y,z) -> (x,z,-y)`.
+MuJoCo Z-up to Holden Y-up with `(x,y,z) -> (x,z,-y)`. The authoritative v2
+builder applies that basis to every world position, conjugates every world
+rotation, and then runs `world_to_local`, so its stored child offsets and this
+geometry are both mapped. The legacy `resources/database.bin` used a
+root-only/unmapped child-local convention and must never be paired with this
+IK contract even though it has the same bone count and parent topology. The
+six-offset all-row startup scan is the explicit provenance guard; `1e-6 m`
+accepts float32 and observed roundoff while rejecting the legacy offsets by
+centimeters.
 `LeftAnkle/RightAnkle` map to the ankle-pitch bodies; `LeftToe/RightToe` map to
 the ankle-roll bodies. `knee_hinge_axis_local` is the exact mapped MuJoCo
 hinge axis, not a two-bone pole or bend vector. Task 3 derives its bend

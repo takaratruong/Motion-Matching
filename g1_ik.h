@@ -170,6 +170,55 @@ static inline bool g1_leg_database_shape_validate(
     return true;
 }
 
+static inline bool g1_leg_database_local_basis_validate(
+    const database& db, char* error, int error_capacity)
+{
+    const int bones[] = {
+        G1_LeftKnee,
+        G1_LeftAnkle,
+        G1_LeftToe,
+        G1_RightKnee,
+        G1_RightAnkle,
+        G1_RightToe
+    };
+    const char* const names[] = {
+        "LeftKnee",
+        "LeftAnkle",
+        "LeftToe",
+        "RightKnee",
+        "RightAnkle",
+        "RightToe"
+    };
+    const vec3 expected_offsets[] = {
+        vec3(-0.078273f, -0.17734f, -0.0021489f),
+        vec3(0.0f, -0.30001f, +0.000094445f),
+        vec3(0.0f, -0.017558f, 0.0f),
+        vec3(-0.078273f, -0.17734f, +0.0021489f),
+        vec3(0.0f, -0.30001f, -0.000094445f),
+        vec3(0.0f, -0.017558f, 0.0f)
+    };
+    const float tolerance_m = 1.0e-6f;
+    const int count = static_cast<int>(sizeof(bones) / sizeof(bones[0]));
+    for (int frame = 0; frame < db.bone_positions.rows; ++frame) {
+        for (int index = 0; index < count; ++index) {
+            const vec3 actual = db.bone_positions(frame, bones[index]);
+            const vec3 expected = expected_offsets[index];
+            if (!g1_leg_vec3_is_finite(actual) ||
+                std::fabs(actual.x - expected.x) > tolerance_m ||
+                std::fabs(actual.y - expected.y) > tolerance_m ||
+                std::fabs(actual.z - expected.z) > tolerance_m) {
+                return g1_ik_error(
+                    error,
+                    error_capacity,
+                    "G1 IK local basis mismatch at frame %d bone %s",
+                    frame,
+                    names[index]);
+            }
+        }
+    }
+    return true;
+}
+
 static inline bool g1_leg_measured_geometry_matches(
     const G1LegConfig& value, const G1LegConfig& expected)
 {
@@ -451,6 +500,10 @@ static inline bool g1_leg_configs_validate(
     const database& db, char* error, int error_capacity)
 {
     if (!g1_leg_database_shape_validate(db, error, error_capacity)) {
+        return false;
+    }
+    if (!g1_leg_database_local_basis_validate(
+            db, error, error_capacity)) {
         return false;
     }
     if (!g1_leg_config_validate(

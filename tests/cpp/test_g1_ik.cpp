@@ -14,20 +14,55 @@ static void check(bool condition, const char* message)
     }
 }
 
-static void make_g1_database(database& db)
+static void set_mapped_leg_offsets(database& db)
+{
+    for (int frame = 0; frame < db.bone_positions.rows; ++frame) {
+        db.bone_positions(frame, G1_LeftKnee) =
+            vec3(-0.078273f, -0.17734f, -0.0021489f);
+        db.bone_positions(frame, G1_LeftAnkle) =
+            vec3(0.0f, -0.30001f, +0.000094445f);
+        db.bone_positions(frame, G1_LeftToe) =
+            vec3(0.0f, -0.017558f, 0.0f);
+        db.bone_positions(frame, G1_RightKnee) =
+            vec3(-0.078273f, -0.17734f, +0.0021489f);
+        db.bone_positions(frame, G1_RightAnkle) =
+            vec3(0.0f, -0.30001f, -0.000094445f);
+        db.bone_positions(frame, G1_RightToe) =
+            vec3(0.0f, -0.017558f, 0.0f);
+    }
+}
+
+static void set_legacy_xml_leg_offsets(database& db, int frame)
+{
+    db.bone_positions(frame, G1_LeftKnee) =
+        vec3(-0.078273f, +0.0021489f, -0.17734f);
+    db.bone_positions(frame, G1_LeftAnkle) =
+        vec3(0.0f, -0.000094445f, -0.30001f);
+    db.bone_positions(frame, G1_LeftToe) =
+        vec3(0.0f, 0.0f, -0.017558f);
+    db.bone_positions(frame, G1_RightKnee) =
+        vec3(-0.078273f, -0.0021489f, -0.17734f);
+    db.bone_positions(frame, G1_RightAnkle) =
+        vec3(0.0f, +0.000094445f, -0.30001f);
+    db.bone_positions(frame, G1_RightToe) =
+        vec3(0.0f, 0.0f, -0.017558f);
+}
+
+static void make_g1_database(database& db, int frames = 1)
 {
     static const int parents[G1_BoneCount] = {
         -1, 0, 1, 2, 3, 4, 5, 6, 1, 8, 9, 10, 11, 12, 1, 14,
         15, 16, 17, 18, 19, 20, 21, 22, 16, 24, 25, 26, 27, 28, 29
     };
-    db.bone_positions.resize(1, G1_BoneCount);
-    db.bone_rotations.resize(1, G1_BoneCount);
+    db.bone_positions.resize(frames, G1_BoneCount);
+    db.bone_rotations.resize(frames, G1_BoneCount);
     db.bone_parents.resize(G1_BoneCount);
     db.bone_positions.set(vec3());
     db.bone_rotations.set(quat());
     for (int i = 0; i < G1_BoneCount; ++i) {
         db.bone_parents(i) = parents[i];
     }
+    set_mapped_leg_offsets(db);
 }
 
 static void check_vec3(vec3 actual, vec3 expected, const char* message)
@@ -280,6 +315,48 @@ static void test_database_shape_and_chain_validation()
     check_error_contains(error, "parent", "null parent diagnostic");
 }
 
+static void test_database_local_basis_validation()
+{
+    char error[256] = {};
+
+    database mapped;
+    make_g1_database(mapped, 2);
+    check(g1_leg_configs_validate(
+              mapped, error, static_cast<int>(sizeof(error))),
+          "mapped v2 local basis accepted");
+
+    database legacy;
+    make_g1_database(legacy);
+    set_legacy_xml_leg_offsets(legacy, 0);
+    check(!g1_leg_configs_validate(
+              legacy, error, static_cast<int>(sizeof(error))),
+          "legacy XML-local basis rejected");
+    check_error_contains(error, "local basis", "legacy basis diagnostic");
+    check_error_contains(error, "frame 0", "legacy frame diagnostic");
+    check_error_contains(error, "LeftKnee", "legacy bone diagnostic");
+
+    database later_frame;
+    make_g1_database(later_frame, 2);
+    later_frame.bone_positions(1, G1_RightToe) =
+        vec3(0.0f, 0.0f, -0.017558f);
+    check(!g1_leg_configs_validate(
+              later_frame, error, static_cast<int>(sizeof(error))),
+          "legacy basis in a later frame rejected");
+    check_error_contains(error, "local basis", "later basis diagnostic");
+    check_error_contains(error, "frame 1", "later frame diagnostic");
+    check_error_contains(error, "RightToe", "later bone diagnostic");
+
+    database nonfinite;
+    make_g1_database(nonfinite);
+    nonfinite.bone_positions(0, G1_LeftAnkle).x =
+        std::numeric_limits<float>::quiet_NaN();
+    check(!g1_leg_configs_validate(
+              nonfinite, error, static_cast<int>(sizeof(error))),
+          "non-finite local basis rejected");
+    check_error_contains(error, "local basis", "non-finite basis diagnostic");
+    check_error_contains(error, "LeftAnkle", "non-finite bone diagnostic");
+}
+
 static void test_hostile_config_validation()
 {
     database db;
@@ -460,6 +537,7 @@ int main()
 {
     test_explicit_leg_geometry();
     test_database_shape_and_chain_validation();
+    test_database_local_basis_validation();
     test_hostile_config_validation();
     test_null_and_short_error_buffers();
     return 0;
