@@ -199,6 +199,91 @@ struct ByteSnapshot
     }
 };
 
+static void query_parity_make_field(heightfield& field)
+{
+    field.version = 2;
+    field.nx = 2;
+    field.nz = 2;
+    field.origin_x = 0.0f;
+    field.origin_z = 0.0f;
+    field.cell_size = 1.0f;
+    field.exterior_height = -10.0f;
+    field.heights.resize(4);
+    field.heights(0) = 0.0f;
+    field.heights(1) = 2.0f;
+    field.heights(2) = 4.0f;
+    field.heights(3) = 10.0f;
+}
+
+static void query_parity_emit(
+    const char* name,
+    const heightfield& field,
+    float x,
+    float z,
+    G1SurfaceQueryStatus expected_status,
+    uint32_t expected_height_bits)
+{
+    G1SurfaceSample sample = {
+        float_from_bits(UINT32_C(0x41234567)),
+        vec3(
+            float_from_bits(UINT32_C(0x3f123456)),
+            float_from_bits(UINT32_C(0x3f234567)),
+            float_from_bits(UINT32_C(0x3f345678)))
+    };
+    const ByteSnapshot<G1SurfaceSample> before(sample);
+    const G1SurfaceQueryStatus status =
+        g1_surface_query_v2(sample, field, x, z);
+    check(status == expected_status,
+          "query parity fixture has its locked semantic status");
+    if (status == G1SurfaceQueryValid) {
+        check(float_bits(sample.height) == expected_height_bits,
+              "query parity fixture has its locked height bits");
+    } else {
+        check(before.same(sample),
+              "failed query parity fixture preserves seeded output bytes");
+    }
+    std::printf(
+        "query=%s status=%u height=%08x normal=%08x,%08x,%08x\n",
+        name, static_cast<unsigned int>(status),
+        float_bits(sample.height),
+        float_bits(sample.normal.x),
+        float_bits(sample.normal.y),
+        float_bits(sample.normal.z));
+}
+
+static int run_query_parity_mode()
+{
+    heightfield field;
+    query_parity_make_field(field);
+    query_parity_emit(
+        "t0", field, 0.75f, 0.25f,
+        G1SurfaceQueryValid, UINT32_C(0x40600000));
+    query_parity_emit(
+        "t1", field, 0.25f, 0.75f,
+        G1SurfaceQueryValid, UINT32_C(0x40900000));
+    query_parity_emit(
+        "tie", field, 0.50f, 0.50f,
+        G1SurfaceQueryValid, UINT32_C(0x40a00000));
+    query_parity_emit(
+        "maximum-edge", field, 1.0f, 1.0f,
+        G1SurfaceQueryValid, UINT32_C(0x41200000));
+    query_parity_emit(
+        "outside", field,
+        float_from_bits(UINT32_C(0x3f800001)), 0.5f,
+        G1SurfaceQueryOutside, 0);
+
+    field.version = 1;
+    query_parity_emit(
+        "invalid-field", field, 0.5f, 0.5f,
+        G1SurfaceQueryInvalid, 0);
+    field.version = 2;
+    field.heights(3) = float_from_bits(UINT32_C(0x7fc00001));
+    query_parity_emit(
+        "invalid-height", field, 0.75f, 0.25f,
+        G1SurfaceQueryInvalid, 0);
+    return 0;
+}
+
 static G1ClearanceResult seeded_result(double key)
 {
     G1ClearanceResult output = {};
@@ -1002,8 +1087,11 @@ static void test_arithmetic_environment_rejection_and_restoration()
           "valid call succeeds after every environment restoration");
 }
 
-int main()
+int main(int argc, char** argv)
 {
+    if (argc == 2 && std::strcmp(argv[1], "--query-parity") == 0) {
+        return run_query_parity_mode();
+    }
     test_normal_arithmetic_environment();
     test_status_and_factory_contract();
     test_budget_contract();
