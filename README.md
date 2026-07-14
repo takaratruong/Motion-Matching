@@ -44,16 +44,48 @@ The output directory contains exactly five reproducible files:
 
 `resources/g1_interaction/` is ignored generated output. Rebuild it with the command above rather than committing it. A different `G1_INTERACTION_DIR` is also treated as operator-owned generated output.
 
-The first authorized full-corpus run must replace the pending cells below with the exact published values; no result has been inferred from the unit fixtures or diagnostic subset.
+The completed full-corpus run produced the following measured values. Database
+clips and frames exclude the 63 valid held-out clips.
 
 | Measurement | Source | Full-corpus result |
 | --- | --- | --- |
-| Source clips | `validation_report.json: source_clips` | Pending full-corpus run |
-| Included clips | `validation_report.json: included_clips` | Pending full-corpus run |
-| Rejected clips | `validation_report.json: rejected_clips` | Pending full-corpus run |
-| Included frames | `validation_report.json: included_frames` | Pending full-corpus run |
-| Database objects | length of `evaluation_split.json: database_objects` | Pending full-corpus run |
-| Held-out objects | length of `evaluation_split.json: heldout_objects` | Pending full-corpus run |
+| Source clips | `validation_report.json: source_clips` | 2,991 |
+| Included valid clips | `validation_report.json: included_clips` | 2,108 |
+| Rejected clips | `validation_report.json: rejected_clips` | 883 |
+| Database clips | `manifest.json: clips` | 2,045 |
+| Held-out valid clips | included minus database clips | 63 |
+| Database frames | `validation_report.json: included_frames` | 511,250 |
+| Database objects | length of `evaluation_split.json: database_objects` | 633 |
+| Held-out objects | length of `evaluation_split.json: heldout_objects` | 20 |
+| Target rate | `manifest.json: target_fps` | 25 Hz |
+| Diagnostic limit | `manifest.json: diagnostic_limit` | `null` |
+| Bone count | `manifest.json: skeleton_names` | 31 |
+| Feature count | `manifest.json: feature_names` | 71 |
+
+The observed rejection histogram was:
+
+| Rejection code | Clips |
+| --- | ---: |
+| `ambiguous_active_hand` | 138 |
+| `contact_lost_before_hold` | 365 |
+| `fk_rotation_error` | 2 |
+| `joint_limit_violation` | 47 |
+| `no_distinct_lift_phase` | 331 |
+
+The validator recorded these maximum numeric errors:
+
+| Numeric bound | Maximum |
+| --- | ---: |
+| `duration_max_error_s` | `0.0` |
+| `fk_max_error_m` | `2.941830996664629e-7` |
+| `fk_rotation_max_error_degrees` | `0.09968437552361127` |
+| `quaternion_norm_max_error` | `1.1920928955078125e-7` |
+
+The manifest records code provenance
+`b4f7fad9d26bd4268d10316e97a154291cfda77b`. The database SHA-256 is
+`4d3b65f73e9a207988aaaebded36b988f811ec068988c7e829732701d9d2da1b`, and
+the feature SHA-256 is
+`3b492ca7e5ed12aade5750ff925c689f4acf56f28edc31a4a5f341e434adf145`.
 
 Inspect the exact rejection code, stage, sequence, and message without modifying the pack:
 

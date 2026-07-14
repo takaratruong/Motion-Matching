@@ -2506,3 +2506,87 @@ struct InteractionResult {
 ```
 
 That boundary is what lets a player script or future VLM say “pick this,” “place here,” or “open this” while the motion system answers only whether and how the embodied primitive can be executed.
+
+## Amendment — 2026-07-14 observed full-corpus rejection contract
+
+This amendment records the schema-v1 contract accepted after replaying all
+2,991 source clips. It does not rewrite the original Task 9 proposal above.
+The proposed 19-code snippet included the unused `record_count` name and did
+not enumerate the precise typed source and conversion errors emitted by the
+frozen validators. For Task 9 closure, the following stage-specific sets from
+`resources/g1_interaction_builder/build.py` at
+`b4f7fad9d26bd4268d10316e97a154291cfda77b` supersede that proposed snippet.
+
+`SourceValidationError` at the `source` stage:
+
+```text
+fps_mismatch
+frame_count_mismatch
+invalid_contact
+invalid_dimensions
+invalid_fps
+invalid_quaternion
+invalid_shape
+invalid_source_frames
+invalid_source_record
+missing_field
+non_finite
+object_identity_mismatch
+```
+
+`ConversionValidationError` at the `conversion` stage:
+
+```text
+duration_error
+fk_error
+fk_rotation_error
+fps_mismatch
+frame_count_mismatch
+invalid_contact
+invalid_dimensions
+invalid_fps
+invalid_quaternion
+invalid_shape
+invalid_source_frames
+joint_limit_violation
+non_finite
+skeleton_mismatch
+```
+
+`InteractionValidationError` at the `interaction` stage:
+
+```text
+ambiguous_active_hand
+contact_lost_before_hold
+invalid_approach
+invalid_grasp
+no_distinct_lift_phase
+no_five_centimeter_lift
+no_stable_contact
+no_stable_hold
+```
+
+`no_distinct_lift_phase` was added after three of the first 25 clips, and 331
+clips in the full corpus, proved that `lift_frame == hold_frame`. Mapping those
+clips to `no_stable_hold` would be false: each clip had a stable hold, but no
+separate frame interval for the Lift phase.
+
+With `--allow-rejections`, publication still catches only the exact expected
+error types, checks the exact stage/code pair, and records reviewed semantic
+exclusions. Missing source modalities, unknown codes, codes at the wrong
+stage, unexpected subclasses or programming errors, and artifact invariant
+failures propagate and abort publication.
+
+Only five reviewed codes were observed in the full-corpus replay:
+
+```text
+ambiguous_active_hand       138
+contact_lost_before_hold    365
+fk_rotation_error             2
+joint_limit_violation        47
+no_distinct_lift_phase      331
+```
+
+The reviewed codes absent from this histogram remain frozen schema-v1
+possibilities. Their presence in the contract is not evidence that those
+exclusions occurred in the observed corpus.

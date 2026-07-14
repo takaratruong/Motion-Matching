@@ -64,10 +64,14 @@ ifeq ($(strip $(LINUX_CONTROLLER_DEPS)),)
 bootstrap-raylib:
 	./scripts/bootstrap_raylib.sh
 else
-bootstrap-raylib: $(LINUX_CONTROLLER_DEPS)
+.PHONY: verify-raylib
 
-$(LINUX_CONTROLLER_DEPS) &: scripts/bootstrap_raylib.sh
+bootstrap-raylib: verify-raylib
+
+verify-raylib:
 	./scripts/bootstrap_raylib.sh
+
+$(LINUX_CONTROLLER_DEPS): verify-raylib
 endif
 
 controller: $(SOURCE) $(HEADER) $(LINUX_CONTROLLER_DEPS)
@@ -103,6 +107,8 @@ CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_attachment
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_carry
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_runtime
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_controller_adapter
+RELEASE_FAST_MATH_TARGET_TEST := \
+  $(CPP_TEST_DIR)/test_interaction_target_release_fast_math
 
 INTERACTION_RUNTIME_SOURCES := interaction_runtime.cpp
 INTERACTION_RUNTIME_SOURCES += interaction_carry.cpp interaction_ik.cpp
@@ -112,6 +118,7 @@ INTERACTION_RUNTIME_SOURCES += interaction_pose.cpp interaction_target.cpp
 
 .PHONY: test-python test-cpp test-interaction
 .PHONY: test-python-interaction-safe test-interaction-safe
+.PHONY: test-interaction-target-release-fast-math
 .PHONY: demo-interaction-pack gate-playable-interaction
 .PHONY: gate1-interaction
 
@@ -132,6 +139,9 @@ $(CPP_TEST_DIR)/test_interaction_pose: tests/cpp/test_interaction_pose.cpp inter
 
 $(CPP_TEST_DIR)/test_interaction_target: tests/cpp/test_interaction_target.cpp interaction_target.cpp interaction_target.h interaction_pose.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_target.cpp interaction_target.cpp -o $@
+
+$(RELEASE_FAST_MATH_TARGET_TEST): tests/cpp/test_interaction_target.cpp interaction_target.cpp interaction_target.h interaction_pose.h vec.h quat.h | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) -O3 -DNDEBUG -ffast-math tests/cpp/test_interaction_target.cpp interaction_target.cpp -o $@
 
 $(CPP_TEST_DIR)/test_interaction_features: tests/cpp/test_interaction_features.cpp interaction_features.cpp interaction_features.h interaction_pose.cpp interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_features.cpp interaction_features.cpp interaction_pose.cpp -o $@
@@ -177,6 +187,9 @@ test-python: interaction_probe interaction_query_probe
 test-cpp: $(CPP_TEST_BINS)
 	@for test_bin in $(CPP_TEST_BINS); do $$test_bin || exit 1; done
 
+test-interaction-target-release-fast-math: $(RELEASE_FAST_MATH_TARGET_TEST)
+	$(RELEASE_FAST_MATH_TARGET_TEST)
+
 test-interaction: test-python test-cpp
 
 test-python-interaction-safe: interaction_probe $(SAFE_INTERACTION_QUERY_PROBE)
@@ -185,7 +198,8 @@ test-python-interaction-safe: interaction_probe $(SAFE_INTERACTION_QUERY_PROBE)
 	  G1_INTERACTION_DIR="" \
 	  python -m unittest discover -s tests/python -t . -v
 
-test-interaction-safe: test-python-interaction-safe test-cpp
+test-interaction-safe: test-python-interaction-safe test-cpp \
+  test-interaction-target-release-fast-math
 
 gate1-interaction: test-interaction-safe interaction_probe
 	python -m resources.build_g1_interaction_database \
