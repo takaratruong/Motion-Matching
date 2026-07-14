@@ -690,7 +690,6 @@ MatchInput blocked_table_input();
 MatchInput high_cost_input();
 RuntimeFixture high_cost_fixture();
 RuntimeFixture contact_failure_fixture();
-RuntimeFixture short_clip_fixture();
 ```
 
 - [ ] **Step 1: Write failing selection and rejection tests**
@@ -817,7 +816,13 @@ git commit -m "feat: select bounded pickup clips"
 
 - [ ] **Step 1: Write failing 25 Hz, interpolation, correction, and range tests**
 
-Advance a synthetic player at 60 Hz and assert source time equals elapsed time, frame interpolation is continuous, contact order is unchanged, entry correction begins at its full value and reaches zero at contact, and the player never reads `range_stop`.
+Advance a synthetic player at 60 Hz and assert source time equals elapsed time,
+frame interpolation is continuous, contact order is unchanged, entry correction
+begins at its full value and reaches zero at contact, and the player never reads
+`range_stop`. `Reason::ClipEnded` remains a defensive runtime reason and is
+covered here at the `SequentialPlayer` boundary/range tests; an immutable pack
+that passed whole-clip preflight is not truncated later to manufacture this path
+in coordinator tests.
 
 ```cpp
 SequentialPlayer player(database);
@@ -1300,8 +1305,6 @@ assert(run_rejected(high_cost_fixture()).reason == Reason::PoorMatch);
 assert(run_post_commit_failure(contact_failure_fixture()).reason ==
        Reason::ContactPosition);
 assert(!run_post_commit_failure(contact_failure_fixture()).attached);
-assert(run_post_commit_failure(short_clip_fixture()).reason ==
-       Reason::ClipEnded);
 
 const uint32_t generation_before_reset =
     runtime.diagnostics().target.generation;
@@ -1316,9 +1319,9 @@ assert(!output.owns_pose);
 `high_cost_fixture()` adds `10.0F` to every serialized normalized candidate
 dimension while leaving the runtime query unchanged;
 `contact_failure_fixture()` offsets the corrected hand by `0.05 m` only at the
-stable-contact frame; `short_clip_fixture()` removes every frame after the first
-LIFT frame. `run_post_commit_failure` must first advance beyond commitment and
-then assert the source frame reaches `range_stop - 1` before Locomotion returns.
+stable-contact frame. `run_post_commit_failure` must first advance beyond
+commitment and then assert the source frame reaches `range_stop - 1` before
+Locomotion returns.
 
 - [ ] **Step 2: Run and verify RED**
 

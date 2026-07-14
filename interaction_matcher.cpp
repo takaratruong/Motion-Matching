@@ -1,0 +1,623 @@
+#include "interaction_matcher.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <optional>
+#include <stdexcept>
+#include <vector>
+
+namespace interaction {
+namespace {
+
+constexpr float kRootClearanceRadius = 0.25F;
+constexpr float kSlabEpsilon = 1.0e-7F;
+
+struct ClipFrames {
+    int32_t clip = -1;
+    int32_t start = -1;
+    int32_t stop = -1;
+    int32_t reach = -1;
+    int32_t contact = -1;
+    int32_t lift = -1;
+    int32_t hold = -1;
+    Hand hand = Hand::Right;
+};
+
+struct FailureSet {
+    bool out_of_range = false;
+    bool correction_limit = false;
+    bool blocked_path = false;
+    bool poor_match = false;
+};
+
+enum class CandidateStatus {
+    Accepted,
+    OutOfRange,
+    CorrectionLimit,
+    BlockedPath,
+    PoorMatch,
+};
+
+struct CandidateEvaluation {
+    CandidateStatus status = CandidateStatus::OutOfRange;
+    MatchCandidate candidate{};
+};
+
+MatchResult reject(Reason reason) {
+    MatchResult result{};
+    result.reason = reason;
+    return result;
+}
+
+bool finite(float value) {
+    return std::isfinite(value);
+}
+
+bool finite(vec3 value) {
+    return finite(value.x) && finite(value.y) && finite(value.z);
+}
+
+bool finite(quat value) {
+    return finite(value.w) && finite(value.x) &&
+           finite(value.y) && finite(value.z);
+}
+
+bool positive_dimensions(vec3 value) {
+    return finite(value) && value.x > 0.0F &&
+           value.y > 0.0F && value.z > 0.0F;
+}
+
+bool same_vec3(vec3 left, vec3 right) {
+    return left.x == right.x && left.y == right.y && left.z == right.z;
+}
+
+bool same_quat(quat left, quat right) {
+    return left.w == right.w && left.x == right.x &&
+           left.y == right.y && left.z == right.z;
+}
+
+bool same_affordance(
+    const GraspAffordance& left,
+    const GraspAffordance& right) {
+    return left.id == right.id && left.hand == right.hand &&
+           same_vec3(
+               left.hand_in_object.position,
+               right.hand_in_object.position) &&
+           same_quat(
+               left.hand_in_object.rotation,
+               right.hand_in_object.rotation) &&
+           same_vec3(
+               left.approach_direction_object,
+               right.approach_direction_object) &&
+           left.clearance_radius == right.clearance_radius;
+}
+
+const GraspAffordance* exact_target_affordance(const MatchInput& input) {
+    for (const GraspAffordance& affordance : input.target.affordances) {
+        if (affordance.id == input.request.affordance_id) return &affordance;
+    }
+    return nullptr;
+}
+
+std::optional<Reason> validate_request(const MatchInput& input) {
+    if (input.request.target.id == 0U ||
+        input.request.target.generation == 0U ||
+        input.target.handle.id == 0U ||
+        input.target.handle.generation == 0U ||
+        input.request.request_id == 0U) {
+        return Reason::TargetUnavailable;
+    }
+    if (input.request.target != input.target.handle) {
+        return Reason::TargetChanged;
+    }
+    if (input.request.affordance_id != input.affordance.id) {
+        return Reason::TargetUnavailable;
+    }
+    const GraspAffordance* authored = exact_target_affordance(input);
+    if (authored == nullptr || !same_affordance(*authored, input.affordance)) {
+        return Reason::TargetUnavailable;
+    }
+    if (input.target.state == ObjectState::Attached ||
+        input.target.state == ObjectState::Held) {
+        return Reason::TargetUnavailable;
+    }
+    if (input.target.state == ObjectState::Targeted &&
+        input.target.owner_request != input.request.request_id) {
+        return Reason::TargetChanged;
+    }
+    if (!finite(input.target.object_world.position) ||
+        !finite(input.target.object_world.rotation) ||
+        !positive_dimensions(input.target.object_dimensions) ||
+        !finite(input.target.table_world.position) ||
+        !finite(input.target.table_world.rotation) ||
+        !positive_dimensions(input.target.table_size) ||
+        !finite(input.affordance.hand_in_object.position) ||
+        !finite(input.affordance.hand_in_object.rotation) ||
+        !finite(input.affordance.clearance_radius) ||
+        input.affordance.clearance_radius < 0.0F) {
+        return Reason::TargetUnavailable;
+    }
+    return std::nullopt;
+}
+
+vec3 read_vec3(const std::vector<float>& values, size_t index) {
+    const size_t offset = index * 3U;
+    return vec3(
+        values.at(offset), values.at(offset + 1U), values.at(offset + 2U));
+}
+
+quat read_quat(const std::vector<float>& values, size_t index) {
+    const size_t offset = index * 4U;
+    return quat(
+        values.at(offset),
+        values.at(offset + 1U),
+        values.at(offset + 2U),
+        values.at(offset + 3U));
+}
+
+float yaw_radians(quat rotation) {
+    const vec3 facing = quat_mul_vec3(rotation, vec3(0.0F, 0.0F, 1.0F));
+    return std::atan2(facing.x, facing.z);
+}
+
+float shortest_angle(float angle) {
+    return std::atan2(std::sin(angle), std::cos(angle));
+}
+
+Transform source_object_transform(
+    const Database& database,
+    int32_t frame) {
+    return {
+        read_vec3(database.object_positions, static_cast<size_t>(frame)),
+        read_quat(database.object_rotations, static_cast<size_t>(frame)),
+    };
+}
+
+Transform scene_alignment(
+    const Transform& source_object,
+    const Transform& target_object) {
+    const float yaw = shortest_angle(
+        yaw_radians(target_object.rotation) -
+        yaw_radians(source_object.rotation));
+    const quat rotation = quat_from_angle_axis(
+        yaw, vec3(0.0F, 1.0F, 0.0F));
+    const vec3 rotated_source =
+        quat_mul_vec3(rotation, source_object.position);
+    return {
+        vec3(
+            target_object.position.x - rotated_source.x,
+            0.0F,
+            target_object.position.z - rotated_source.z),
+        rotation,
+    };
+}
+
+Transform root_transform(const WorldPose& pose) {
+    return {
+        pose.positions[g1_skeleton::Simulation],
+        pose.rotations[g1_skeleton::Simulation],
+    };
+}
+
+Transform hand_transform(const WorldPose& pose, Hand hand) {
+    const size_t bone = hand == Hand::Left ? kLeftHandBone : kRightHandBone;
+    return {pose.positions[bone], pose.rotations[bone]};
+}
+
+float planar_distance(vec3 left, vec3 right) {
+    return std::hypot(left.x - right.x, left.z - right.z);
+}
+
+vec3 box_local_point(Transform box, vec3 point) {
+    return quat_mul_vec3(
+        quat_inv(box.rotation), point - box.position);
+}
+
+bool segment_intersects_expanded_box(
+    vec3 start_world,
+    vec3 stop_world,
+    Transform box,
+    vec3 box_size,
+    float expansion) {
+    const vec3 start = box_local_point(box, start_world);
+    const vec3 stop = box_local_point(box, stop_world);
+    const vec3 delta = stop - start;
+    const vec3 half = 0.5F * box_size + expansion;
+    const std::array<float, 3> starts = {start.x, start.y, start.z};
+    const std::array<float, 3> deltas = {delta.x, delta.y, delta.z};
+    const std::array<float, 3> halves = {half.x, half.y, half.z};
+    float minimum = 0.0F;
+    float maximum = 1.0F;
+    for (size_t axis = 0; axis < starts.size(); ++axis) {
+        if (std::abs(deltas[axis]) <= kSlabEpsilon) {
+            if (starts[axis] < -halves[axis] ||
+                starts[axis] > halves[axis]) {
+                return false;
+            }
+            continue;
+        }
+        float first = (-halves[axis] - starts[axis]) / deltas[axis];
+        float second = (halves[axis] - starts[axis]) / deltas[axis];
+        if (first > second) std::swap(first, second);
+        minimum = std::max(minimum, first);
+        maximum = std::min(maximum, second);
+        if (minimum > maximum) return false;
+    }
+    return true;
+}
+
+bool root_intersects_table(
+    vec3 root_world,
+    Transform table,
+    vec3 table_size) {
+    const float yaw = yaw_radians(table.rotation);
+    const quat inverse_yaw = quat_from_angle_axis(
+        -yaw, vec3(0.0F, 1.0F, 0.0F));
+    const vec3 local = quat_mul_vec3(
+        inverse_yaw, root_world - table.position);
+    return std::abs(local.x) <= 0.5F * table_size.x + kRootClearanceRadius &&
+           std::abs(local.z) <= 0.5F * table_size.z + kRootClearanceRadius;
+}
+
+bool path_is_clear(
+    const MatchInput& input,
+    const ClipFrames& frames,
+    const Transform& scene_from_source,
+    int32_t entry_frame) {
+    const Database& database = *input.database;
+    for (int32_t frame = entry_frame; frame < frames.stop; ++frame) {
+        const Transform root = compose(
+            scene_from_source,
+            root_transform(world_pose(pose_at_frame(database, frame))));
+        if (root_intersects_table(
+                root.position,
+                input.target.table_world,
+                input.target.table_size)) {
+            return false;
+        }
+    }
+
+    Transform previous = compose(
+        scene_from_source,
+        hand_transform(
+            world_pose(pose_at_frame(database, entry_frame)), frames.hand));
+    for (int32_t frame = entry_frame + 1;
+         frame < frames.stop;
+         ++frame) {
+        const Transform current = compose(
+            scene_from_source,
+            hand_transform(world_pose(pose_at_frame(database, frame)), frames.hand));
+        if (segment_intersects_expanded_box(
+                previous.position,
+                current.position,
+                input.target.table_world,
+                input.target.table_size,
+                input.affordance.clearance_radius)) {
+            return false;
+        }
+        if (frame < frames.contact && segment_intersects_expanded_box(
+                previous.position,
+                current.position,
+                input.target.object_world,
+                input.target.object_dimensions,
+                input.affordance.clearance_radius)) {
+            return false;
+        }
+        previous = current;
+    }
+    return true;
+}
+
+std::optional<ClipFrames> inspect_clip(
+    const Database& database,
+    int32_t clip,
+    Hand requested_hand,
+    FailureSet& failures) {
+    try {
+        const uint8_t hand_value = database.active_hands.at(
+            static_cast<size_t>(clip));
+        if (hand_value > 1U) {
+            failures.out_of_range = true;
+            return std::nullopt;
+        }
+        const Hand hand = hand_value == 0U ? Hand::Left : Hand::Right;
+        if (hand != requested_hand) return std::nullopt;
+
+        ClipFrames frames{};
+        frames.clip = clip;
+        frames.start = database.range_starts.at(static_cast<size_t>(clip));
+        frames.stop = database.range_stops.at(static_cast<size_t>(clip));
+        frames.hand = hand;
+        if (frames.start < 0 || frames.stop <= frames.start ||
+            frames.stop > static_cast<int32_t>(database.frame_count)) {
+            failures.out_of_range = true;
+            return std::nullopt;
+        }
+
+        uint8_t previous_phase = 0U;
+        bool first = true;
+        for (int32_t frame = frames.start; frame < frames.stop; ++frame) {
+            const uint8_t phase = database.phases.at(
+                static_cast<size_t>(frame));
+            if (phase > static_cast<uint8_t>(Phase::Hold) ||
+                (!first && phase < previous_phase)) {
+                failures.out_of_range = true;
+                return std::nullopt;
+            }
+            first = false;
+            previous_phase = phase;
+            if (phase == static_cast<uint8_t>(Phase::Reach) &&
+                frames.reach < 0) {
+                frames.reach = frame;
+            } else if (phase == static_cast<uint8_t>(Phase::Contact) &&
+                       frames.contact < 0) {
+                frames.contact = frame;
+            } else if (phase == static_cast<uint8_t>(Phase::Lift) &&
+                       frames.lift < 0) {
+                frames.lift = frame;
+            } else if (phase == static_cast<uint8_t>(Phase::Hold) &&
+                       frames.hold < 0) {
+                frames.hold = frame;
+            }
+        }
+        if (!(frames.start <= frames.reach &&
+              frames.reach < frames.contact &&
+              frames.contact < frames.lift &&
+              frames.lift < frames.hold &&
+              frames.hold < frames.stop)) {
+            failures.out_of_range = true;
+            return std::nullopt;
+        }
+        return frames;
+    } catch (const std::out_of_range&) {
+        failures.out_of_range = true;
+        return std::nullopt;
+    }
+}
+
+std::optional<std::array<float, 5>> group_costs(
+    const MatchInput& input,
+    int32_t entry_frame) {
+    const Features& features = *input.features;
+    if (features.dimension != kFeatureDimension ||
+        features.feature_count != kFeatureDimension ||
+        features.group_count != 5U ||
+        features.frame_count <= static_cast<uint32_t>(entry_frame) ||
+        features.group_starts.size() != 5U ||
+        features.group_stops.size() != 5U) {
+        return std::nullopt;
+    }
+    std::array<float, 5> costs{};
+    for (size_t group = 0; group < costs.size(); ++group) {
+        const size_t start = features.group_starts.at(group);
+        const size_t stop = features.group_stops.at(group);
+        if (stop <= start || stop > kFeatureDimension) return std::nullopt;
+        float squared_sum = 0.0F;
+        for (size_t dimension = start; dimension < stop; ++dimension) {
+            const size_t index =
+                static_cast<size_t>(entry_frame) * features.dimension +
+                dimension;
+            const float difference =
+                features.values.at(index) - input.query.at(dimension);
+            squared_sum += difference * difference;
+        }
+        costs[group] = squared_sum / static_cast<float>(stop - start);
+    }
+    return costs;
+}
+
+std::optional<float> total_cost(
+    const std::array<float, 5>& costs,
+    const MatchConfig& config) {
+    float weighted = 0.0F;
+    float weight_sum = 0.0F;
+    for (size_t group = 0; group < costs.size(); ++group) {
+        const float weight = config.group_weights[group];
+        if (!finite(weight) || weight < 0.0F) return std::nullopt;
+        weighted += weight * costs[group];
+        weight_sum += weight;
+    }
+    if (!(weight_sum > 0.0F) || !finite(weighted)) return std::nullopt;
+    return weighted / weight_sum;
+}
+
+CandidateEvaluation evaluate_candidate(
+    const MatchInput& input,
+    const MatchConfig& config,
+    const ClipFrames& frames,
+    int32_t entry_frame,
+    const Transform& current_root) {
+    try {
+        const Database& database = *input.database;
+        const Transform source_object = source_object_transform(
+            database, frames.contact - 1);
+        const Transform scene_from_source = scene_alignment(
+            source_object, input.target.object_world);
+        const WorldPose entry_pose = world_pose(
+            pose_at_frame(database, entry_frame));
+        const Transform mapped_root = compose(
+            scene_from_source, root_transform(entry_pose));
+        const vec3 root_offset(
+            current_root.position.x - mapped_root.position.x,
+            0.0F,
+            current_root.position.z - mapped_root.position.z);
+        const float yaw_offset = shortest_angle(
+            yaw_radians(current_root.rotation) -
+            yaw_radians(mapped_root.rotation));
+        if (std::hypot(root_offset.x, root_offset.z) >
+                config.maximum_root_correction_m ||
+            std::abs(yaw_offset) >
+                config.maximum_yaw_correction_radians) {
+            return {CandidateStatus::CorrectionLimit, {}};
+        }
+
+        const Transform mapped_hand = compose(
+            scene_from_source,
+            hand_transform(
+                world_pose(pose_at_frame(database, frames.contact)),
+                frames.hand));
+        const Transform target_hand = compose(
+            input.target.object_world,
+            input.affordance.hand_in_object);
+        if (length(mapped_hand.position - target_hand.position) >
+                config.maximum_hand_correction_m ||
+            quat_angle_between(mapped_hand.rotation, target_hand.rotation) >
+                config.maximum_hand_orientation_radians) {
+            return {CandidateStatus::CorrectionLimit, {}};
+        }
+
+        if (!path_is_clear(
+                input, frames, scene_from_source, entry_frame)) {
+            return {CandidateStatus::BlockedPath, {}};
+        }
+
+        const std::optional<std::array<float, 5>> costs =
+            group_costs(input, entry_frame);
+        if (!costs.has_value()) {
+            return {CandidateStatus::OutOfRange, {}};
+        }
+        const std::optional<float> cost = total_cost(*costs, config);
+        if (!cost.has_value() || !finite(config.maximum_cost) ||
+            *cost > config.maximum_cost) {
+            return {CandidateStatus::PoorMatch, {}};
+        }
+
+        MatchCandidate candidate{};
+        candidate.clip = frames.clip;
+        candidate.entry_frame = entry_frame;
+        candidate.contact_frame = frames.contact;
+        candidate.lift_frame = frames.lift;
+        candidate.hold_frame = frames.hold;
+        candidate.scene_from_source = scene_from_source;
+        candidate.entry_root_offset = root_offset;
+        candidate.entry_yaw_offset = yaw_offset;
+        candidate.total_cost = *cost;
+        candidate.group_costs = *costs;
+        return {CandidateStatus::Accepted, candidate};
+    } catch (const std::out_of_range&) {
+        return {CandidateStatus::OutOfRange, {}};
+    }
+}
+
+void remember_failure(FailureSet& failures, CandidateStatus status) {
+    switch (status) {
+    case CandidateStatus::Accepted:
+        return;
+    case CandidateStatus::OutOfRange:
+        failures.out_of_range = true;
+        return;
+    case CandidateStatus::CorrectionLimit:
+        failures.correction_limit = true;
+        return;
+    case CandidateStatus::BlockedPath:
+        failures.blocked_path = true;
+        return;
+    case CandidateStatus::PoorMatch:
+        failures.poor_match = true;
+        return;
+    }
+}
+
+bool better_candidate(
+    const MatchCandidate& candidate,
+    const MatchCandidate& best) {
+    if (candidate.total_cost != best.total_cost) {
+        return candidate.total_cost < best.total_cost;
+    }
+    if (candidate.clip != best.clip) return candidate.clip < best.clip;
+    return candidate.entry_frame < best.entry_frame;
+}
+
+void consider(
+    const CandidateEvaluation& evaluation,
+    std::optional<MatchCandidate>& best,
+    FailureSet& failures) {
+    if (evaluation.status != CandidateStatus::Accepted) {
+        remember_failure(failures, evaluation.status);
+        return;
+    }
+    if (!best.has_value() || better_candidate(evaluation.candidate, *best)) {
+        best = evaluation.candidate;
+    }
+}
+
+Reason aggregate_reason(const FailureSet& failures) {
+    if (failures.out_of_range) return Reason::OutOfRange;
+    if (failures.correction_limit) return Reason::CorrectionLimit;
+    if (failures.blocked_path) return Reason::BlockedPath;
+    if (failures.poor_match) return Reason::PoorMatch;
+    return Reason::NoCandidate;
+}
+
+}  // namespace
+
+MatchResult select_whole_clip(
+    const MatchInput& input,
+    const MatchConfig& config) {
+    if (input.database == nullptr || input.features == nullptr) {
+        return reject(Reason::PackUnavailable);
+    }
+    if (const std::optional<Reason> invalid = validate_request(input)) {
+        return reject(*invalid);
+    }
+
+    const WorldPose current_pose = world_pose(input.locomotion.pose);
+    const Transform current_root = root_transform(current_pose);
+    if (!finite(current_root.position) || !finite(current_root.rotation) ||
+        !finite(config.maximum_approach_m) ||
+        planar_distance(
+            current_root.position,
+            input.target.object_world.position) > config.maximum_approach_m) {
+        return reject(Reason::OutOfRange);
+    }
+
+    const Database& database = *input.database;
+    FailureSet failures{};
+    std::vector<ClipFrames> clips;
+    for (uint32_t clip = 0; clip < database.clip_count; ++clip) {
+        const std::optional<ClipFrames> frames = inspect_clip(
+            database,
+            static_cast<int32_t>(clip),
+            input.affordance.hand,
+            failures);
+        if (frames.has_value()) clips.push_back(*frames);
+    }
+
+    std::optional<MatchCandidate> best;
+    for (const ClipFrames& frames : clips) {
+        consider(
+            evaluate_candidate(
+                input, config, frames, frames.reach, current_root),
+            best,
+            failures);
+    }
+    if (best.has_value()) {
+        return {true, *best, Reason::None};
+    }
+
+    for (const ClipFrames& frames : clips) {
+        for (int32_t frame = frames.reach - 1;
+             frame >= frames.start;
+             --frame) {
+            if (database.phases.at(static_cast<size_t>(frame)) !=
+                static_cast<uint8_t>(Phase::Approach)) {
+                continue;
+            }
+            consider(
+                evaluate_candidate(
+                    input, config, frames, frame, current_root),
+                best,
+                failures);
+        }
+    }
+    if (best.has_value()) {
+        return {true, *best, Reason::None};
+    }
+    return reject(aggregate_reason(failures));
+}
+
+}  // namespace interaction
