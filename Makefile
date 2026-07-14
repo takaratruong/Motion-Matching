@@ -46,7 +46,12 @@ ifeq ($(PLATFORM),PLATFORM_WEB)
     CFLAGS ?= $(DEFINES) $(RAYLIB_DIR)/raylib/src/libraylib.bc -ffast-math -D NDEBUG -O3 -s USE_GLFW=3 -s FORCE_FILESYSTEM=1 -s MAX_WEBGL_VERSION=2 -s ALLOW_MEMORY_GROWTH=1 --preload-file $(dir $<)resources@resources --shell-file ./shell.html $(INCLUDE_DIR) $(LIBRARY_DIR)
 endif
 
-SOURCE = controller.cpp
+CONTROLLER_CXXFLAGS := -std=c++17
+INTERACTION_SOURCES := interaction_pose.cpp interaction_target.cpp \
+  interaction_features.cpp interaction_matcher.cpp interaction_playback.cpp \
+  interaction_ik.cpp interaction_attachment.cpp interaction_carry.cpp \
+  interaction_runtime.cpp interaction_controller_adapter.cpp
+SOURCE := controller.cpp $(INTERACTION_SOURCES)
 HEADER = $(wildcard *.h)
 
 .PHONY: all bootstrap-raylib controller
@@ -57,7 +62,7 @@ bootstrap-raylib:
 	./scripts/bootstrap_raylib.sh
 
 controller: $(SOURCE) $(HEADER)
-	$(CC) -o $@$(EXT) $(SOURCE) $(CFLAGS) $(LIBS) 
+	$(CC) $(CONTROLLER_CXXFLAGS) -o $@$(EXT) $(SOURCE) $(CFLAGS) $(LIBS)
 
 clean:
 	rm controller$(EXT)
@@ -76,6 +81,7 @@ CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_ik
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_attachment
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_carry
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_runtime
+CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_controller_adapter
 
 INTERACTION_RUNTIME_SOURCES := interaction_runtime.cpp
 INTERACTION_RUNTIME_SOURCES += interaction_carry.cpp interaction_ik.cpp
@@ -122,6 +128,9 @@ $(CPP_TEST_DIR)/test_interaction_carry: tests/cpp/test_interaction_carry.cpp tes
 $(CPP_TEST_DIR)/test_interaction_runtime: tests/cpp/test_interaction_runtime.cpp tests/cpp/interaction_runtime_fixture.h interaction_runtime.h $(INTERACTION_RUNTIME_SOURCES) interaction_carry.h interaction_ik.h g1_arm_joint_metadata.h interaction_attachment.h interaction_playback.h interaction_matcher.h interaction_features.h interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) -c tests/cpp/test_interaction_runtime.cpp -o $(CPP_TEST_DIR)/test_interaction_runtime.o
 	$(CXX) $(CPP_TEST_FLAGS) $(CPP_TEST_DIR)/test_interaction_runtime.o $(INTERACTION_RUNTIME_SOURCES) -o $@
+
+$(CPP_TEST_DIR)/test_interaction_controller_adapter: tests/cpp/test_interaction_controller_adapter.cpp tests/cpp/interaction_runtime_fixture.h interaction_controller_adapter.cpp interaction_controller_adapter.h interaction_runtime.h $(INTERACTION_RUNTIME_SOURCES) interaction_carry.h interaction_ik.h g1_arm_joint_metadata.h interaction_attachment.h interaction_playback.h interaction_matcher.h interaction_features.h interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_controller_adapter.cpp interaction_controller_adapter.cpp $(INTERACTION_RUNTIME_SOURCES) -o $@
 
 interaction_probe: interaction_probe.cpp interaction_database.h g1_skeleton.h
 	$(CXX) $(CPP_TEST_FLAGS) $< -o $@

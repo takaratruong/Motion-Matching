@@ -15,9 +15,17 @@
 #include "database.h"
 #include "nnet.h"
 #include "lmm.h"
+#include "interaction_controller_adapter.h"
+#include "interaction_debug_draw.h"
+#include "interaction_runtime.h"
 
+#include <array>
+#include <cstdlib>
+#include <filesystem>
 #include <initializer_list>
 #include <functional>
+#include <optional>
+#include <string>
 
 //--------------------------------------
 
@@ -1339,6 +1347,60 @@ int main(void)
         feature_weight_trajectory_directions);
         
     database_save_matching_features(db, "./resources/features.bin");
+
+    // Interaction data is a separate fixed-25 pack. Keep these values alive
+    // for the full controller lifetime because InteractionRuntime stores
+    // pointers to the loaded database and features.
+    std::optional<interaction::Database> interaction_database;
+    std::optional<interaction::Features> interaction_features;
+    interaction::TargetRegistry interaction_registry;
+    interaction::RuntimeConfig interaction_config{};
+    interaction::TargetHandle interaction_scene_target_handle{};
+    interaction::InteractionTarget interaction_authored_target{};
+    bool interaction_pack_loaded = false;
+    std::string interaction_pack_diagnostic;
+
+    const char* interaction_pack_environment = std::getenv("MM_INTERACTION_PACK");
+    const std::filesystem::path interaction_pack_path =
+        interaction_pack_environment != nullptr &&
+            interaction_pack_environment[0] != '\0'
+        ? std::filesystem::path(interaction_pack_environment)
+        : std::filesystem::path("./resources/g1_interaction");
+
+    interaction::InteractionRuntime interaction_runtime = [&]()
+        -> interaction::InteractionRuntime {
+        try
+        {
+            interaction_database.emplace(interaction::load_database(
+                interaction_pack_path / "interaction_database.bin"));
+            interaction_features.emplace(interaction::load_features(
+                interaction_pack_path / "interaction_features.bin"));
+            interaction::validate_controller_interaction_pack(
+                *interaction_database, *interaction_features);
+
+            interaction::InteractionTarget demo_target =
+                interaction::make_controller_demo_target(*interaction_database);
+            interaction_scene_target_handle =
+                interaction_registry.upsert(std::move(demo_target));
+            const interaction::InteractionTarget* registered_target =
+                interaction_registry.find(interaction_scene_target_handle);
+            assert(registered_target != nullptr);
+            interaction_authored_target = *registered_target;
+            interaction_pack_loaded = true;
+            return interaction::InteractionRuntime(
+                *interaction_database,
+                *interaction_features,
+                interaction_registry,
+                interaction_config);
+        }
+        catch (const interaction::FormatError& error)
+        {
+            interaction_pack_diagnostic = error.what();
+            interaction_pack_loaded = false;
+            return interaction::InteractionRuntime::disabled(
+                interaction::Reason::PackUnavailable);
+        }
+    }();
    
     // Pose & Inertializer Data
     
@@ -1563,7 +1625,31 @@ int main(void)
     
     // Go
 
-    float dt = 1.0f / 60.0f;
+    const float dt = interaction::kControllerStepSeconds;
+    interaction::ControllerInteractionScheduler interaction_scheduler;
+    interaction::ControllerInteractionFrameHandoff interaction_frame_handoff;
+    interaction::ControllerInteractionSceneHandoff interaction_scene_handoff;
+    uint64_t interaction_next_request_id = 1U;
+    interaction::ControllerInteractionFrameState interaction_frame_state{};
+
+    auto make_interaction_locomotion_pose = [&]()
+    {
+        interaction::Pose pose;
+        for (int bone = 0; bone < g1_skeleton::BoneCount; ++bone)
+        {
+            pose.positions[static_cast<size_t>(bone)] = bone_positions(bone);
+            pose.velocities[static_cast<size_t>(bone)] = bone_velocities(bone);
+            pose.rotations[static_cast<size_t>(bone)] = bone_rotations(bone);
+            pose.angular_velocities[static_cast<size_t>(bone)] =
+                bone_angular_velocities(bone);
+        }
+        pose.hand_dof = interaction::kFlatControllerRestHandDof;
+        pose.hand_dof_velocities =
+            interaction::kFlatControllerRestHandDofVelocities;
+        pose.foot_contacts[0] = curr_bone_contacts(0) ? 1U : 0U;
+        pose.foot_contacts[1] = curr_bone_contacts(1) ? 1U : 0U;
+        return pose;
+    };
 
 #ifdef MM_DISCRETE
     // Optional env overrides so we can sweep halflife without recompiling.
@@ -1615,6 +1701,21 @@ int main(void)
         // Get gamepad stick states
         vec3 gamepadstick_left = gamepad_get_stick(GAMEPAD_STICK_LEFT);
         vec3 gamepadstick_right = gamepad_get_stick(GAMEPAD_STICK_RIGHT);
+
+        // Press edges are sampled at 60 Hz and latched by the scheduler until
+        // the next fixed-25 runtime tick. Camera input remains live while
+        // cached interaction output suppresses movement steering.
+        const interaction::ControllerInteractionEdges interaction_edges{
+            IsKeyPressed(KEY_F) || IsGamepadButtonPressed(
+                GAMEPAD_PLAYER, GAMEPAD_BUTTON_RIGHT_FACE_LEFT),
+            IsKeyPressed(KEY_X) || IsGamepadButtonPressed(
+                GAMEPAD_PLAYER, GAMEPAD_BUTTON_RIGHT_FACE_UP),
+            IsKeyPressed(KEY_R) || IsGamepadButtonPressed(
+                GAMEPAD_PLAYER, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT)};
+        if (interaction_scheduler.cached_output().suppress_steering)
+        {
+            gamepadstick_left = vec3();
+        }
 
         // Get if strafe is desired
         bool desired_strafe = desired_strafe_update();
@@ -2081,6 +2182,127 @@ int main(void)
                 adjusted_position,
                 adjusted_rotation);
         }
+
+        // Advance the interaction runtime at exactly 25 of every 60
+        // controller ticks. The provider and resolver are invoked only by a
+        // due tick; the complete RuntimeOutput is otherwise held unchanged.
+        const interaction::Pose locomotion_pose =
+            make_interaction_locomotion_pose();
+        const interaction::RuntimeOutput& interaction_output =
+            interaction_scheduler.tick(
+                interaction_edges,
+                [&]()
+                {
+                    interaction::LocomotionSnapshot snapshot;
+                    snapshot.pose = locomotion_pose;
+                    for (size_t index = 0;
+                         index < snapshot.future_root_positions.size();
+                         ++index)
+                    {
+                        const int trajectory_index =
+                            static_cast<int>(index) + 1;
+                        snapshot.future_root_positions[index] =
+                            trajectory_positions(trajectory_index);
+                        snapshot.future_root_rotations[index] =
+                            trajectory_rotations(trajectory_index);
+                    }
+                    return snapshot;
+                },
+                [&](const interaction::LocomotionSnapshot& snapshot)
+                    -> std::optional<interaction::PickRequest>
+                {
+                    if (!interaction_pack_loaded)
+                    {
+                        return std::nullopt;
+                    }
+                    const std::optional<interaction::TargetHandle> target_handle =
+                        interaction_registry.resolve_single_target(
+                            snapshot.pose.positions[0],
+                            interaction_config.matcher.maximum_approach_m);
+                    if (!target_handle.has_value())
+                    {
+                        return std::nullopt;
+                    }
+                    const interaction::InteractionTarget* target =
+                        interaction_registry.find(*target_handle);
+                    if (target == nullptr || target->affordances.size() != 1U)
+                    {
+                        return std::nullopt;
+                    }
+                    return interaction::PickRequest{
+                        *target_handle,
+                        target->affordances.front().id,
+                        interaction_next_request_id++};
+                },
+                [&](const interaction::RuntimeInput& input)
+                {
+                    return interaction_runtime.update(input);
+                });
+
+        interaction_frame_state = interaction_frame_handoff.apply(
+            locomotion_pose,
+            interaction_output,
+            interaction::kControllerStepSeconds);
+        if (interaction_frame_state.owns_pose)
+        {
+            for (int bone = 0; bone < g1_skeleton::BoneCount; ++bone)
+            {
+                const size_t index = static_cast<size_t>(bone);
+                bone_positions(bone) =
+                    interaction_frame_state.pose.positions[index];
+                bone_velocities(bone) =
+                    interaction_frame_state.pose.velocities[index];
+                bone_rotations(bone) =
+                    interaction_frame_state.pose.rotations[index];
+                bone_angular_velocities(bone) =
+                    interaction_frame_state.pose.angular_velocities[index];
+            }
+            curr_bone_contacts(0) =
+                interaction_frame_state.pose.foot_contacts[0] != 0U;
+            curr_bone_contacts(1) =
+                interaction_frame_state.pose.foot_contacts[1] != 0U;
+        }
+        if (interaction_frame_state.synchronize_simulation_root)
+        {
+            simulation_position =
+                interaction_frame_state.simulation_root_position;
+            simulation_rotation =
+                interaction_frame_state.simulation_root_rotation;
+        }
+
+        // Reset may replace the registry entry with a newer generation.
+        // Prefer a published diagnostic handle, then refresh by stable ID so
+        // sparse or repeated generation changes cannot strand scene drawing.
+        if (interaction_output.diagnostics.target.id ==
+                interaction_scene_target_handle.id &&
+            interaction_registry.find(interaction_output.diagnostics.target) !=
+                nullptr)
+        {
+            interaction_scene_target_handle =
+                interaction_output.diagnostics.target;
+        }
+        if (interaction_scene_target_handle.id != 0U)
+        {
+            const interaction::InteractionTarget* current_target =
+                interaction_registry.find_by_id(
+                    interaction_scene_target_handle.id);
+            if (current_target != nullptr)
+            {
+                interaction_scene_target_handle = current_target->handle;
+            }
+        }
+
+        const interaction::InteractionTarget* interaction_scene_target =
+            interaction_registry.find(interaction_scene_target_handle);
+        if (interaction_scene_target == nullptr && interaction_pack_loaded)
+        {
+            interaction_scene_target = &interaction_authored_target;
+        }
+        const interaction::ControllerInteractionSceneState
+            interaction_scene_state = interaction_scene_handoff.apply(
+                interaction_scene_target,
+                interaction_output,
+                interaction_authored_target.object_world);
         
 #ifdef MM_DISCRETE
         {
@@ -2340,6 +2562,19 @@ int main(void)
         draw_obstacles(
             obstacles_positions,
             obstacles_scales);
+
+        const std::array<vec3, 3> interaction_predicted_roots = {
+            trajectory_positions(1),
+            trajectory_positions(2),
+            trajectory_positions(3)};
+        interaction::debug_draw::draw_interaction_scene(
+            interaction_scene_target,
+            interaction_scene_state.object_world,
+            interaction_output,
+            interaction_predicted_roots,
+            interaction_frame_state.pose,
+            locomotion_pose,
+            interaction_config.matcher.maximum_approach_m);
         
         // G1: no skinned mesh — draw the skeleton directly from bone transforms.
         // Sphere at each joint, capsule (cylinder) from each bone to its parent.
@@ -2375,6 +2610,12 @@ int main(void)
         draw_axis(vec3(), quat());
         
         EndMode3D();
+
+        interaction::debug_draw::draw_interaction_text(
+            interaction_output,
+            interaction_pack_diagnostic.c_str(),
+            340,
+            20);
 
         // UI
         
@@ -2653,7 +2894,7 @@ int main(void)
 
 #if defined(PLATFORM_WEB)
     std::function<void()> u{update_func};
-    emscripten_set_main_loop_arg(update_callback, &u, 0, 1);
+    emscripten_set_main_loop_arg(update_callback, &u, 60, 1);
 #else
     while (!WindowShouldClose())
     {
