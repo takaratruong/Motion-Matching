@@ -78,6 +78,26 @@ static void check_vec3_bits(
     check(float_bits(actual.z) == expected_z, message);
 }
 
+static void check_centerline_snapshot_bits_equal(
+    const terrain_centerline_snapshot& actual,
+    const terrain_centerline_snapshot& expected,
+    const char* message)
+{
+    for (int i = 0; i < 4; ++i) {
+        check(float_bits(actual.values[i]) == float_bits(expected.values[i]),
+              message);
+        check(float_bits(actual.points[i].x) ==
+                  float_bits(expected.points[i].x),
+              message);
+        check(float_bits(actual.points[i].y) ==
+                  float_bits(expected.points[i].y),
+              message);
+        check(float_bits(actual.points[i].z) ==
+                  float_bits(expected.points[i].z),
+              message);
+    }
+}
+
 static quat heading_positive_x()
 {
     return quat_from_angle_axis(0.5f * PIf, vec3(0.0f, 1.0f, 0.0f));
@@ -1613,6 +1633,44 @@ static void test_controller_traversability_guard_data_flow()
     check(clip < current_state && clip < blocked_state &&
               clip < distance_state && clip < point_state,
           "post-clip traversal and current-footprint diagnostics are active");
+
+    const char* raw_snapshot = require_source_token(
+        matcher, "terrain_centerline_snapshot_compute_v2(",
+        "controller computes the ordinary v2 terrain snapshot");
+    const char* walkability_snapshot = require_source_token(
+        raw_snapshot,
+        "terrain_centerline_snapshot_apply_walkability_v2(",
+        "controller masks inaccessible terrain snapshot samples");
+    const char* walkability_grid = require_source_token(
+        walkability_snapshot, "active_scene.walkability,",
+        "terrain snapshot mask uses active walkability");
+    const char* animation_root = require_source_token(
+        walkability_grid, "state.bone_positions(0),",
+        "terrain snapshot mask uses animation root as feature base");
+    const char* footprint_origin = require_source_token(
+        animation_root, "state.simulation_position,",
+        "terrain snapshot mask uses authoritative simulation footprint");
+    const char* footprint_radius = require_source_token(
+        footprint_origin, "0.20f))",
+        "terrain snapshot mask uses the runtime footprint radius");
+    const char* finite_snapshot = require_source_token(
+        footprint_radius,
+        "for (int terrain_feature = 0; terrain_feature < 4; "
+        "++terrain_feature) {",
+        "controller validates the final terrain snapshot");
+    const char* query_copy = require_source_token(
+        finite_snapshot,
+        "query(offset++) = terrain_query_snapshot.values[terrain_feature];",
+        "controller copies the final terrain snapshot into the 31D query");
+    check(raw_snapshot < walkability_snapshot &&
+              walkability_snapshot < walkability_grid &&
+              walkability_grid < animation_root &&
+              animation_root < footprint_origin &&
+              footprint_origin < footprint_radius &&
+              footprint_radius < finite_snapshot &&
+              finite_snapshot < query_copy,
+          "raw snapshot, walkability mask, validation, and query copy are "
+          "ordered");
 }
 
 static void test_f32_helpers_match_one_round_producer_operations()
@@ -2821,6 +2879,232 @@ static void test_centerline_snapshot_keeps_query_and_markers_in_one_state()
     }
 }
 
+static void initialize_centerline_walkability_fixture(
+    heightfield& field,
+    walkability_grid& grid,
+    bool rising_ramp)
+{
+    initialize_heightfield(
+        field, 136, 31, -1.20f, 0.0f, 0.02f, 0.0f, 2);
+    grid.nx = field.nx;
+    grid.nz = field.nz;
+    grid.cells.resize(field.nx * field.nz);
+    grid.cells.set(1);
+    for (int z = 0; z < field.nz; ++z) {
+        for (int x = 0; x < field.nx; ++x) {
+            const float world_x =
+                field.origin_x + field.cell_size * static_cast<float>(x);
+            float height = 0.0f;
+            if (rising_ramp) {
+                height = world_x > 0.50f ?
+                    minf(0.35f, (world_x - 0.50f) * 0.70f) : 0.0f;
+            } else if (world_x >= 0.60f && world_x <= 1.00f) {
+                height = 0.45f;
+            }
+            field.heights(z * field.nx + x) = height;
+            if (world_x >= 0.70f &&
+                (rising_ramp || world_x <= 1.00f)) {
+                grid.cells(z * grid.nx + x) = 0;
+            }
+        }
+    }
+}
+
+static void compute_stationary_centerline_snapshot(
+    terrain_centerline_snapshot& snapshot,
+    const heightfield& field,
+    vec3 root,
+    quat heading)
+{
+    array1d<vec3> positions(2);
+    array1d<quat> rotations(2);
+    positions(0) = root;
+    positions(1) = root;
+    rotations(0) = heading;
+    rotations(1) = heading;
+    terrain_centerline_snapshot_compute_v2(
+        snapshot, field, root, positions, rotations);
+}
+
+static void check_centerline_walkability_latch(bool rising_ramp)
+{
+    heightfield field;
+    walkability_grid grid;
+    initialize_centerline_walkability_fixture(field, grid, rising_ramp);
+    const vec3 query_root(0.20f, 3.0f, 0.30f);
+    const vec3 footprint_origin(0.20f, -4.0f, 0.30f);
+    terrain_centerline_snapshot raw = {};
+    compute_stationary_centerline_snapshot(
+        raw, field, query_root, heading_positive_x());
+    check(raw.points[1].y > raw.points[0].y,
+          "blocked terrain fixture rises at the second sample");
+    if (!rising_ramp) {
+        check(raw.points[3].y == 0.0f,
+              "wall fixture exposes flat raw terrain beyond the barrier");
+    }
+
+    terrain_centerline_snapshot filtered = raw;
+    check(terrain_centerline_snapshot_apply_walkability_v2(
+              filtered, field, grid, query_root, footprint_origin, 0.20f),
+          "walkability centerline filtering succeeds");
+    check(float_bits(filtered.values[0]) == float_bits(raw.values[0]),
+          "clear centerline value remains bit-identical");
+    check_vec3_bits(
+        filtered.points[0],
+        float_bits(raw.points[0].x),
+        float_bits(raw.points[0].y),
+        float_bits(raw.points[0].z),
+        "clear centerline point remains bit-identical");
+    check(filtered.points[1].x < raw.points[1].x,
+          "first blocked centerline sample moves to the last safe point");
+    const float safe_height = heightfield_sample_v2(
+        field, filtered.points[1].x, filtered.points[1].z);
+    const float base_height = heightfield_sample_v2(
+        field, query_root.x, query_root.z);
+    check_float_bits(
+        filtered.points[1].y, float_bits(safe_height),
+        "latched marker uses a direct v2 surface sample");
+    check_close(
+        filtered.values[1], safe_height - base_height,
+        "latched feature stays relative to the animation query root");
+    for (int i = 2; i < 4; ++i) {
+        check_float_bits(
+            filtered.values[i], float_bits(filtered.values[1]),
+            "later blocked centerline values repeat the latch");
+        check_vec3_bits(
+            filtered.points[i],
+            float_bits(filtered.points[1].x),
+            float_bits(filtered.points[1].y),
+            float_bits(filtered.points[1].z),
+            "later blocked centerline points repeat the latch");
+    }
+}
+
+static void test_centerline_walkability_latches_wall_and_ramp()
+{
+    check_centerline_walkability_latch(false);
+    check_centerline_walkability_latch(true);
+}
+
+static void test_centerline_walkability_preserves_clear_classes_and_recovers()
+{
+    heightfield field;
+    walkability_grid grid;
+    initialize_centerline_walkability_fixture(field, grid, false);
+    const vec3 root(0.20f, 3.0f, 0.30f);
+    terrain_centerline_snapshot raw = {};
+    compute_stationary_centerline_snapshot(
+        raw, field, root, heading_positive_x());
+
+    grid.cells.set(1);
+    terrain_centerline_snapshot class_one = raw;
+    check(terrain_centerline_snapshot_apply_walkability_v2(
+              class_one, field, grid, root, root, 0.20f),
+          "class-one centerline filtering succeeds");
+    check_centerline_snapshot_bits_equal(
+        class_one, raw, "class-one centerline remains bit-identical");
+
+    grid.cells.set(2);
+    terrain_centerline_snapshot class_two = raw;
+    check(terrain_centerline_snapshot_apply_walkability_v2(
+              class_two, field, grid, root, root, 0.20f),
+          "class-two centerline filtering succeeds");
+    check_centerline_snapshot_bits_equal(
+        class_two, raw, "class-two centerline remains bit-identical");
+
+    initialize_centerline_walkability_fixture(field, grid, false);
+    terrain_centerline_snapshot forward = raw;
+    check(terrain_centerline_snapshot_apply_walkability_v2(
+              forward, field, grid, root, root, 0.20f),
+          "stationary forward centerline filtering succeeds");
+    check(float_bits(forward.values[1]) != float_bits(raw.values[1]) ||
+              float_bits(forward.points[1].x) != float_bits(raw.points[1].x),
+          "stationary forward centerline remains filtered");
+
+    terrain_centerline_snapshot away_raw = {};
+    const quat away_heading = quat_from_angle_axis(
+        -0.5f * PIf, vec3(0.0f, 1.0f, 0.0f));
+    compute_stationary_centerline_snapshot(
+        away_raw, field, root, away_heading);
+    terrain_centerline_snapshot away_filtered = away_raw;
+    check(terrain_centerline_snapshot_apply_walkability_v2(
+              away_filtered, field, grid, root, root, 0.20f),
+          "fresh away-facing centerline filtering succeeds");
+    check_centerline_snapshot_bits_equal(
+        away_filtered, away_raw,
+        "fresh away-facing centerline recovers without a persistent latch");
+}
+
+static void test_centerline_walkability_invalid_inputs_are_transactional()
+{
+    heightfield field;
+    walkability_grid grid;
+    initialize_centerline_walkability_fixture(field, grid, false);
+    const vec3 root(0.20f, 3.0f, 0.30f);
+    terrain_centerline_snapshot raw = {};
+    compute_stationary_centerline_snapshot(
+        raw, field, root, heading_positive_x());
+
+    const auto expect_failure = [&field](
+        const terrain_centerline_snapshot& seed,
+        const walkability_grid& candidate_grid,
+        vec3 query_root,
+        vec3 footprint_origin,
+        float radius,
+        const char* message) {
+        terrain_centerline_snapshot actual = seed;
+        const terrain_centerline_snapshot expected = actual;
+        check(!terrain_centerline_snapshot_apply_walkability_v2(
+                  actual, field, candidate_grid, query_root,
+                  footprint_origin, radius),
+              message);
+        check_centerline_snapshot_bits_equal(actual, expected, message);
+    };
+
+    walkability_grid mismatch(grid);
+    mismatch.nx -= 1;
+    expect_failure(raw, mismatch, root, root, 0.20f,
+                   "mismatched centerline grid is transactional");
+    expect_failure(
+        raw, grid,
+        vec3(float_from_bits(UINT32_C(0x7fc23456)), root.y, root.z),
+        root, 0.20f,
+        "nonfinite animation query root is transactional");
+    expect_failure(
+        raw, grid, root,
+        vec3(root.x, std::numeric_limits<float>::infinity(), root.z),
+        0.20f,
+        "nonfinite footprint origin is transactional");
+    expect_failure(raw, grid, root, root, -0.20f,
+                   "negative centerline radius is transactional");
+    expect_failure(
+        raw, grid, root, root,
+        float_from_bits(UINT32_C(0x7fc34567)),
+        "nonfinite centerline radius is transactional");
+
+    terrain_centerline_snapshot malformed = raw;
+    malformed.values[2] = float_from_bits(UINT32_C(0x7fc45678));
+    malformed.points[3].z = std::numeric_limits<float>::infinity();
+    expect_failure(malformed, grid, root, root, 0.20f,
+                   "malformed centerline snapshot is transactional");
+
+    terrain_centerline_snapshot blocked_start = raw;
+    check(terrain_centerline_snapshot_apply_walkability_v2(
+              blocked_start, field, grid, root,
+              vec3(0.80f, -7.0f, 0.30f), 0.20f),
+          "blocked starting footprint produces a safe root hold");
+    const float root_height = heightfield_sample_v2(field, root.x, root.z);
+    for (int i = 0; i < 4; ++i) {
+        check_float_bits(
+            blocked_start.values[i], UINT32_C(0x00000000),
+            "blocked start repeats zero root-relative terrain");
+        check_vec3_bits(
+            blocked_start.points[i], float_bits(root.x),
+            float_bits(root_height), float_bits(root.z),
+            "blocked start repeats the query-root surface point");
+    }
+}
+
 static void test_v2_centerline_uses_checked_triangular_height_samples()
 {
     heightfield legacy;
@@ -3273,6 +3557,9 @@ int main(int argc, char** argv)
     test_straight_step_query_is_ground_relative_on_elevated_base();
     test_curved_query_matches_python_geometric_arc_fixture();
     test_centerline_snapshot_keeps_query_and_markers_in_one_state();
+    test_centerline_walkability_latches_wall_and_ramp();
+    test_centerline_walkability_preserves_clear_classes_and_recovers();
+    test_centerline_walkability_invalid_inputs_are_transactional();
     test_v2_centerline_uses_checked_triangular_height_samples();
     test_centerline_uses_root_skips_flat_repeats_and_latest_heading();
     test_centerline_query_uses_heightfield_exterior_at_boundary();

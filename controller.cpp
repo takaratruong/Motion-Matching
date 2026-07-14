@@ -2426,6 +2426,17 @@ int main(void)
             state.bone_positions(0),
             state.trajectory_positions,
             state.trajectory_rotations);
+        if (!terrain_centerline_snapshot_apply_walkability_v2(
+                terrain_query_snapshot,
+                active_scene.terrain,
+                active_scene.walkability,
+                state.bone_positions(0),
+                state.simulation_position,
+                0.20f)) {
+            controlled_runtime_error(
+                "terrain centerline walkability mask is invalid");
+            return;
+        }
         for (int terrain_feature = 0; terrain_feature < 4; ++terrain_feature) {
             const vec3 point = terrain_query_snapshot.points[terrain_feature];
             if (!terrain_float_is_finite(

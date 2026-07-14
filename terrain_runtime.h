@@ -2532,6 +2532,104 @@ static inline void terrain_centerline_snapshot_compute_v2(
     }
 }
 
+static inline bool terrain_centerline_snapshot_apply_walkability_v2(
+    terrain_centerline_snapshot& snapshot,
+    const heightfield& field,
+    const walkability_grid& grid,
+    vec3 query_root,
+    vec3 footprint_origin,
+    float footprint_radius)
+{
+    if (field.version != 2 ||
+        !walkability_grid_matches_heightfield(grid, field) ||
+        !terrain_float_is_finite(query_root.x) ||
+        !terrain_float_is_finite(query_root.y) ||
+        !terrain_float_is_finite(query_root.z) ||
+        !terrain_float_is_finite(footprint_origin.x) ||
+        !terrain_float_is_finite(footprint_origin.y) ||
+        !terrain_float_is_finite(footprint_origin.z) ||
+        !terrain_float_is_finite(footprint_radius) ||
+        footprint_radius < 0.0f) {
+        return false;
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (!terrain_float_is_finite(snapshot.values[i]) ||
+            !terrain_float_is_finite(snapshot.points[i].x) ||
+            !terrain_float_is_finite(snapshot.points[i].y) ||
+            !terrain_float_is_finite(snapshot.points[i].z)) {
+            return false;
+        }
+    }
+
+    const float base_height = heightfield_sample_v2(
+        field, query_root.x, query_root.z);
+    if (!terrain_float_is_finite(base_height)) {
+        return false;
+    }
+
+    walkability_reason initial_reason = walkability_clear;
+    const int initial_class = walkability_footprint_class(
+        grid, field, footprint_origin.x, footprint_origin.z,
+        footprint_radius, initial_reason);
+    if (initial_class == 0) {
+        if (initial_reason == walkability_nonfinite) {
+            return false;
+        }
+        terrain_centerline_snapshot candidate = snapshot;
+        const vec3 root_surface(
+            query_root.x, base_height, query_root.z);
+        for (int i = 0; i < 4; ++i) {
+            candidate.values[i] = 0.0f;
+            candidate.points[i] = root_surface;
+        }
+        snapshot = candidate;
+        return true;
+    }
+
+    terrain_centerline_snapshot candidate = snapshot;
+    vec3 segment_start = footprint_origin;
+    for (int i = 0; i < 4; ++i) {
+        const walkability_sweep_result sweep = walkability_sweep(
+            grid, field, segment_start, candidate.points[i],
+            footprint_radius);
+        if (sweep.reason == walkability_nonfinite) {
+            return false;
+        }
+        if (sweep.blocked) {
+            if (sweep.reason != walkability_blocked_cell &&
+                sweep.reason != walkability_out_of_bounds) {
+                return false;
+            }
+            const float safe_height = heightfield_sample_v2(
+                field, sweep.point.x, sweep.point.z);
+            if (!terrain_float_is_finite(safe_height)) {
+                return false;
+            }
+            const double difference =
+                static_cast<double>(safe_height) -
+                static_cast<double>(base_height);
+            if (difference < -static_cast<double>(FLT_MAX) ||
+                difference > static_cast<double>(FLT_MAX)) {
+                return false;
+            }
+            const float safe_value = static_cast<float>(difference);
+            if (!terrain_float_is_finite(safe_value)) {
+                return false;
+            }
+            const vec3 safe_point(
+                sweep.point.x, safe_height, sweep.point.z);
+            for (int repeated = i; repeated < 4; ++repeated) {
+                candidate.values[repeated] = safe_value;
+                candidate.points[repeated] = safe_point;
+            }
+            snapshot = candidate;
+            return true;
+        }
+        segment_start = candidate.points[i];
+    }
+    return true;
+}
+
 static inline void terrain_centerline_query_v2(
     float out[4],
     const heightfield& field,
