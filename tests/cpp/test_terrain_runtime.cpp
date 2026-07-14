@@ -570,6 +570,44 @@ static void test_walkability_binary32_half_cell_parity()
           "rounded mathematical midpoint follows one-round producer ops");
 }
 
+static void test_walkability_nearest_axis_preserves_large_endpoint()
+{
+    const int count = 8388610;
+    const float origin = 0.0f;
+    const float cell_size = 1.0f;
+    const float last_node = 8388609.0f;
+    check(terrain_v2_runtime_axis_is_valid(
+              origin, static_cast<uint32_t>(count), cell_size),
+          "large endpoint probe uses a valid v2 axis");
+
+    int index = -17;
+    check(walkability_nearest_axis(
+              index, last_node, origin, cell_size, count) &&
+              index == count - 1,
+          "large valid endpoint clamps shifted rounding to last index");
+
+    index = -19;
+    check(walkability_nearest_axis(
+              index, nextafterf(last_node, -INFINITY),
+              origin, cell_size, count) &&
+              index == count - 2,
+          "large endpoint predecessor retains its adjacent index");
+
+    index = 23;
+    check(!walkability_nearest_axis(
+              index, nextafterf(last_node, INFINITY),
+              origin, cell_size, count) &&
+              index == 23,
+          "large endpoint successor is exterior and leaves output unchanged");
+
+    index = 29;
+    check(!walkability_nearest_axis(
+              index, float_from_bits(UINT32_C(0x4f000000)),
+              0.0f, 1.0f, INT_MAX) &&
+              index == 29,
+          "hostile count rejects float-cast overflow transactionally");
+}
+
 static void initialize_walkability_guard_fixture(
     heightfield& field, walkability_grid& grid)
 {
@@ -3106,6 +3144,7 @@ int main(int argc, char** argv)
     test_support_loader_is_strict_transactional_and_frame_exact();
     test_walkability_loader_is_strict_transactional_and_grid_exact();
     test_walkability_binary32_half_cell_parity();
+    test_walkability_nearest_axis_preserves_large_endpoint();
     test_walkability_reason_names_are_stable();
     test_walkability_structural_gate_fails_closed();
     test_walkability_footprint_is_conservative_and_release_safe();

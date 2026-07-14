@@ -1150,8 +1150,13 @@ static inline bool walkability_nearest_axis(
         !terrain_f32_add(shifted, normalized, 0.5f)) {
         return false;
     }
-    return walkability_checked_floor_to_int(
-        index, static_cast<double>(shifted), 0, count - 1);
+    int rounded = 0;
+    if (!walkability_checked_floor_to_int(
+            rounded, static_cast<double>(shifted), 0, count)) {
+        return false;
+    }
+    index = rounded < count ? rounded : count - 1;
+    return true;
 }
 
 static inline bool walkability_cell_value(
