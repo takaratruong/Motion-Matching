@@ -13,7 +13,7 @@ constexpr double kCanonicalFps = 25.0;
 constexpr float kMinimumSpeed = 0.85F;
 constexpr float kMaximumSpeed = 1.15F;
 constexpr float kContinuityTolerance = 1.0e-4F;
-constexpr double kFrameSnapTolerance = 1.0e-5;
+constexpr double kFrameReadTolerance = 1.0e-5;
 
 bool finite(float value) {
     return std::isfinite(value);
@@ -141,9 +141,9 @@ float entry_correction_weight(
     return static_cast<float>(1.0 - smoothstep);
 }
 
-double snap_frame(double source_frame) {
+double stable_read_frame(double source_frame) {
     const double nearest = std::round(source_frame);
-    return std::abs(source_frame - nearest) <= kFrameSnapTolerance
+    return std::abs(source_frame - nearest) <= kFrameReadTolerance
         ? nearest
         : source_frame;
 }
@@ -259,8 +259,7 @@ void SequentialPlayer::advance(float dt) {
     if (advance_frames >= remaining) {
         source_frame_exact_ = static_cast<double>(final_frame_);
     } else {
-        source_frame_exact_ = snap_frame(
-            source_frame_exact_ + advance_frames);
+        source_frame_exact_ += advance_frames;
     }
     elapsed_exact_ = next_elapsed;
     source_frame_ = static_cast<float>(source_frame_exact_);
@@ -271,10 +270,11 @@ Pose SequentialPlayer::sample() const {
     if (!started_) {
         throw std::logic_error("interaction playback has not started");
     }
-    const int32_t left = frame();
+    const double source_frame = stable_read_frame(source_frame_exact_);
+    const int32_t left = static_cast<int32_t>(std::floor(source_frame));
     const int32_t right = std::min(left + 1, final_frame_);
     const float alpha = static_cast<float>(
-        source_frame_exact_ - static_cast<double>(left));
+        source_frame - static_cast<double>(left));
     Pose pose = interpolate_pose(
         pose_at_frame(*database_, left),
         pose_at_frame(*database_, right),
@@ -285,7 +285,7 @@ Pose SequentialPlayer::sample() const {
         candidate_.scene_from_source,
         Transform{pose.positions[root], pose.rotations[root]});
     const float weight = entry_correction_weight(
-        candidate_, source_frame_exact_);
+        candidate_, source_frame);
     const quat yaw = quat_from_angle_axis(
         weight * candidate_.entry_yaw_offset,
         vec3(0.0F, 1.0F, 0.0F));
@@ -306,7 +306,8 @@ Phase SequentialPlayer::phase() const {
 
 int32_t SequentialPlayer::frame() const {
     if (!started_) return -1;
-    return static_cast<int32_t>(std::floor(source_frame_exact_));
+    return static_cast<int32_t>(
+        std::floor(stable_read_frame(source_frame_exact_)));
 }
 
 bool SequentialPlayer::at_contact() const {
@@ -318,7 +319,8 @@ bool SequentialPlayer::at_hold() const {
 }
 
 bool SequentialPlayer::finished() const {
-    return !started_ || source_frame_exact_ >= final_frame_;
+    return !started_ ||
+        stable_read_frame(source_frame_exact_) >= final_frame_;
 }
 
 float SequentialPlayer::elapsed_seconds() const {
@@ -327,7 +329,8 @@ float SequentialPlayer::elapsed_seconds() const {
 
 vec3 SequentialPlayer::entry_root_correction() const {
     if (!started_) return vec3();
-    return entry_correction_weight(candidate_, source_frame_exact_) *
+    return entry_correction_weight(
+               candidate_, stable_read_frame(source_frame_exact_)) *
         candidate_.entry_root_offset;
 }
 

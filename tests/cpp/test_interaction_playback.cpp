@@ -235,6 +235,70 @@ void test_canonical_clock_and_fractional_interpolation() {
         one_step_pose.positions[g1_skeleton::Simulation]));
 }
 
+void test_positive_tiny_updates_accumulate_without_quantization() {
+    using namespace interaction;
+    PlaybackCase value = make_playback_case();
+    SequentialPlayer partitioned(value.fixture.database);
+    SequentialPlayer summed(value.fixture.database);
+    partitioned.start(value.candidate, value.current);
+    summed.start(value.candidate, value.current);
+
+    constexpr int kUpdates = 1000;
+    constexpr float kTinyDt = 1.0e-7F;
+    for (int update = 0; update < kUpdates; ++update) {
+        partitioned.advance(kTinyDt);
+    }
+    summed.advance(kTinyDt * static_cast<float>(kUpdates));
+
+    assert(near(
+        partitioned.elapsed_seconds(),
+        summed.elapsed_seconds(),
+        1.0e-6F));
+    assert(near(
+        partitioned.sample().positions[kRightHandBone],
+        summed.sample().positions[kRightHandBone],
+        1.0e-6F));
+}
+
+void test_clock_is_equivalent_across_update_partitions_and_speeds() {
+    using namespace interaction;
+    PlaybackCase value = make_playback_case();
+    constexpr float kDuration = 0.37F;
+    constexpr std::array<int, 3> kUpdateCounts = {30, 60, 120};
+    constexpr std::array<float, 3> kSpeeds = {0.85F, 1.0F, 1.15F};
+
+    for (float speed : kSpeeds) {
+        SequentialPlayer reference(value.fixture.database);
+        reference.start(value.candidate, value.current, speed);
+        reference.advance(kDuration);
+        const Pose expected = reference.sample();
+
+        for (int update_count : kUpdateCounts) {
+            SequentialPlayer partitioned(value.fixture.database);
+            partitioned.start(value.candidate, value.current, speed);
+            const float dt =
+                kDuration / static_cast<float>(update_count);
+            for (int update = 0; update < update_count; ++update) {
+                partitioned.advance(dt);
+            }
+            assert(partitioned.frame() == reference.frame());
+            assert(near(
+                partitioned.elapsed_seconds(),
+                reference.elapsed_seconds(),
+                1.0e-5F));
+            const Pose actual = partitioned.sample();
+            assert(near(
+                actual.positions[g1_skeleton::Simulation],
+                expected.positions[g1_skeleton::Simulation],
+                1.0e-5F));
+            assert(near(
+                actual.positions[kRightHandBone],
+                expected.positions[kRightHandBone],
+                1.0e-5F));
+        }
+    }
+}
+
 void test_speed_endpoints_and_rejection() {
     using namespace interaction;
     PlaybackCase value = make_playback_case();
@@ -498,6 +562,8 @@ void test_rejects_invalid_candidates_ranges_current_and_dt() {
 int main() {
     test_frozen_public_interface_and_unstarted_state();
     test_canonical_clock_and_fractional_interpolation();
+    test_positive_tiny_updates_accumulate_without_quantization();
+    test_clock_is_equivalent_across_update_partitions_and_speeds();
     test_speed_endpoints_and_rejection();
     test_scene_mapping_and_decaying_entry_correction();
     test_phase_and_event_predicates_preserve_order();
