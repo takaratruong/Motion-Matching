@@ -219,10 +219,13 @@ coordinate, ordering, FK, and resampling adapter rather than a cross-embodiment
 solve. Keeping the stage explicit allows future human or non-G1 sources to target
 the same canonical contract.
 
-Data is converted to the repository's established runtime coordinates and
-resampled from 25 Hz to the controller's 60 Hz rate. Translation uses time-based
-interpolation; rotations use normalized shortest-arc quaternion interpolation.
-Velocities use resampled timestamps and never cross clip boundaries.
+Data is converted to the repository's established runtime coordinates and kept
+at the locomotion database and matcher's fixed 25 Hz rate. GRAIL therefore stays
+at its native sampling rate; future non-25-Hz sources use time-based translation
+interpolation and normalized shortest-arc quaternion interpolation. Velocities
+use canonical timestamps and never cross clip boundaries. Rendering may
+interpolate canonical poses at the display rate, but that does not change motion
+database indices, contact timing, or feature horizons.
 
 ### 5. Clip validation and phase derivation
 
@@ -461,7 +464,7 @@ motion without attaching the object and returns to locomotion-ready state.
 
 - Source-to-canonical and canonical-to-runtime FK agree on sampled frames for
   every G1 body within 1 mm positional error and 0.1 degree rotational error.
-- Resampling preserves source duration within one 60 Hz frame and does not cross
+- Resampling preserves source duration within one 25 Hz frame and does not cross
   clip boundaries.
 - Contact, phase, time-to-contact, and demonstrated grasp derivation pass fixed
   synthetic fixtures and representative GRAIL clips.
@@ -527,7 +530,7 @@ remain represented. Every condition uses the same trials and correction settings
   and a one-second stable hold.
 - No successful trial exceeds the correction envelope or attachment tolerances.
 - Runtime remains real-time, with 95th-percentile matching and correction below
-  one 60 Hz frame on the evaluation machine.
+  one 25 Hz motion-update frame on the evaluation machine.
 - The playable demo supports normal walking, explicit Interact, at most one or two
   local alignment steps, pickup, stable hold, and a locomotion-ready handoff.
 - Results and failures are reproducible from logged inputs and artifact versions.
