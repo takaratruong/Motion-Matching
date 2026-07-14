@@ -60,12 +60,12 @@ Introduce a playable half-width of exactly `3.0 m`, separate from the existing
   outer-boundary rule. It does not move an obstacle or an internal class
   boundary.
 
-The builder must expand on the existing `0.02 m` G1HF/v2 lattice. It may not
-shift the old terrain laterally. New padding is expressed as whole lattice
-cells, and the runtime binary32 coordinate at the first retained core column
-must equal the old origin bit-for-bit. The retained core height values are
-copied or regenerated identically. If exact lattice embedding cannot be
-proved, scene construction fails instead of accepting a shifted course.
+The builder directly expands the existing X bounds and rasterizes the same
+surface at the existing `0.02 m` G1HF/v2 resolution. It does not introduce a
+second grid format or a custom padding subsystem. Because changing a
+binary32 heightfield origin can move internal sample coordinates by rounding,
+the locked runtime center-surface probes must agree with the narrow reference
+to within `1e-6 m`; analytic feature parameters and boundaries remain exact.
 
 ## Surface Contract
 
@@ -119,8 +119,9 @@ Keep the change isolated in the scene-artifact layer:
 
 1. Define named constants for the `3.0 m` playable half-width and existing
    `0.60 m` feature half-width.
-2. Add one checked helper that expands an existing X lattice to cover a target
-   playable/lookahead interval using whole cells and verifies core alignment.
+2. Add one checked helper that expands existing X bounds to cover the target
+   playable/lookahead interval while retaining the same Z bounds and cell
+   size.
 3. Let scene definitions describe core geometry and the expanded playable
    interval separately.
 4. Classify core terrain and added flat aprons explicitly; do not infer
@@ -137,7 +138,8 @@ Scene construction fails before publishing output when:
 
 - a requested expansion is nonfinite, smaller than the retained core, or not
   representable on the runtime lattice;
-- old core coordinates or height bits would move;
+- a locked center-surface probe differs from the narrow reference by more than
+  `1e-6 m`;
 - playable/lookahead/heightfield containment fails;
 - an apron cell is not proven flat before being marked certified;
 - a route changes class or leaves lookahead coverage;
@@ -156,8 +158,8 @@ Add RED/GREEN coverage for:
 - GRAIL bounds containing both the old playable interval and
   `[spawn_x - 3.0, spawn_x + 3.0]`;
 - one metre of lookahead beyond both playable X edges;
-- identical core origin recovery, core node coordinates, height bits, feature
-  dimensions, route JSON, spawn JSON, and central walkability classes;
+- identical analytic feature dimensions, route JSON, spawn JSON, and central
+  walkability classes, plus runtime center-height agreement within `1e-6 m`;
 - flat, zero-slope certified probes in both side aprons;
 - central stress remaining stress while adjacent flat apron cells are
   certified;
