@@ -38,6 +38,7 @@ def finite_difference_vectors(values: np.ndarray, fps: float) -> np.ndarray:
 def finite_difference_quaternions(
     values: np.ndarray, fps: float
 ) -> np.ndarray:
+    """Differentiate rotations in their containing (spatial) frame."""
     q = holden_quat.unroll(
         holden_quat.normalize(np.asarray(values, np.float64))
     )
@@ -45,13 +46,13 @@ def finite_difference_quaternions(
     with np.errstate(divide="ignore", invalid="ignore"):
         if len(q) > 1:
             out[0] = holden_quat.to_scaled_angle_axis(
-                holden_quat.mul(holden_quat.inv(q[0]), q[1])
+                holden_quat.mul(q[1], holden_quat.inv(q[0]))
             ) * fps
             out[-1] = holden_quat.to_scaled_angle_axis(
-                holden_quat.mul(holden_quat.inv(q[-2]), q[-1])
+                holden_quat.mul(q[-1], holden_quat.inv(q[-2]))
             ) * fps
         if len(q) > 2:
-            delta = holden_quat.mul(holden_quat.inv(q[:-2]), q[2:])
+            delta = holden_quat.mul(q[2:], holden_quat.inv(q[:-2]))
             out[1:-1] = holden_quat.to_scaled_angle_axis(delta) * (
                 0.5 * fps
             )
@@ -161,12 +162,9 @@ def convert_interaction(
     object_velocities = finite_difference_vectors(
         object_positions, target_fps
     )
-    object_angular_local = finite_difference_quaternions(
+    object_angular_velocities = finite_difference_quaternions(
         object_rotations, target_fps
     )
-    object_angular_velocities = holden_quat.mul_vec(
-        object_rotations, object_angular_local
-    ).astype(np.float32)
     toe_positions = world_positions[:, [7, 13]]
     toe_speeds = np.linalg.norm(
         finite_difference_vectors(toe_positions, target_fps), axis=-1

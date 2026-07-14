@@ -783,13 +783,14 @@ def finite_difference_vectors(values: np.ndarray, fps: float) -> np.ndarray:
     return out.astype(np.float32)
 
 def finite_difference_quaternions(values: np.ndarray, fps: float) -> np.ndarray:
+    """Differentiate rotations in their containing (spatial) frame."""
     q = holden_quat.unroll(holden_quat.normalize(np.asarray(values, np.float64)))
     out = np.zeros(q.shape[:-1] + (3,), np.float64)
     if len(q) > 1:
-        out[0] = holden_quat.to_scaled_angle_axis(holden_quat.mul(holden_quat.inv(q[0]), q[1])) * fps
-        out[-1] = holden_quat.to_scaled_angle_axis(holden_quat.mul(holden_quat.inv(q[-2]), q[-1])) * fps
+        out[0] = holden_quat.to_scaled_angle_axis(holden_quat.mul(q[1], holden_quat.inv(q[0]))) * fps
+        out[-1] = holden_quat.to_scaled_angle_axis(holden_quat.mul(q[-1], holden_quat.inv(q[-2]))) * fps
     if len(q) > 2:
-        delta = holden_quat.mul(holden_quat.inv(q[:-2]), q[2:])
+        delta = holden_quat.mul(q[2:], holden_quat.inv(q[:-2]))
         out[1:-1] = holden_quat.to_scaled_angle_axis(delta) * (0.5 * fps)
     return out.astype(np.float32)
 
@@ -819,7 +820,9 @@ def size_zup_to_yup(size: np.ndarray) -> np.ndarray:
 3. Convert object/table position and rotation from Z-up to Y-up before resampling.
 4. Resample `hand_dof`, object position, and object rotation by time; sample discrete contacts with `motion.source_frames`.
 5. Convert dimension axis order with `size_zup_to_yup([x,y,z]) -> [x,z,y]` for table dimensions. Keep object-local dimensions in USD local axis order.
-6. Compute local pose derivatives with only this clip's frames.
+6. Compute pose derivatives with only this clip's frames. Quaternion derivatives
+   are expressed in each rotation's containing frame: the parent frame for local
+   bones and world space for world object orientations.
 7. Mark each foot in contact when its world speed is below `0.15 m/s` and world Y height is below `0.06 m` above the minimum toe height in this clip.
 8. Store world hand transforms, call `CanonicalInteractionClip.validate()`, and return the inherited FK/duration report plus `target_fps=25.0` and contact counts.
 
@@ -895,10 +898,8 @@ def convert_interaction(
     hand_dof_velocities = finite_difference_vectors(hand_dof, target_fps)
     object_velocities = finite_difference_vectors(
         object_positions, target_fps)
-    object_angular_local = finite_difference_quaternions(
+    object_angular_velocities = finite_difference_quaternions(
         object_rotations, target_fps)
-    object_angular_velocities = holden_quat.mul_vec(
-        object_rotations, object_angular_local).astype(np.float32)
     toe_positions = world_positions[:, [7, 13]]
     toe_speeds = np.linalg.norm(
         finite_difference_vectors(toe_positions, target_fps), axis=-1)
@@ -974,7 +975,7 @@ git commit -m "feat: convert tabletop motion to canonical 25 Hz G1"
 
 - [ ] **Step 1: Write failing synthetic semantic tests**
 
-Extend the fixture with `canonical_pickup_fixture(active_hand=InteractionHand.RIGHT)`. It produces 75 frames at 25 Hz, holds the object at Y=`0.75` through frame 37, raises it linearly to Y=`0.90` by frame 49, then holds it; right-hand contact is true from frame 38 onward, and source frame numbers are `arange(75)`. The active wrist stays at a fixed `[0.02, 0.00, -0.03]` transform in object space during contact. Populate hand-DOF velocity with zeros and object linear/angular velocity with the same `finite_difference_vectors` / world-rotated `finite_difference_quaternions` functions used by conversion.
+Extend the fixture with `canonical_pickup_fixture(active_hand=InteractionHand.RIGHT)`. It produces 75 frames at 25 Hz, holds the object at Y=`0.75` through frame 37, raises it linearly to Y=`0.90` by frame 49, then holds it; right-hand contact is true from frame 38 onward, and source frame numbers are `arange(75)`. The active wrist stays at a fixed `[0.02, 0.00, -0.03]` transform in object space during contact. Populate hand-DOF velocity with zeros and object linear/angular velocity with the same `finite_difference_vectors` / containing-frame `finite_difference_quaternions` functions used by conversion. Because object orientations are world transforms, store that quaternion derivative directly without rotating it again.
 
 Add these reusable fixture transformations so later tests exercise exact world
 invariance and object identity rather than hand-built feature rows:
