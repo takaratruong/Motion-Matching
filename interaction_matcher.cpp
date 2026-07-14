@@ -263,45 +263,103 @@ bool root_intersects_table(
            std::abs(local.z) <= 0.5F * table_size.z + kRootClearanceRadius;
 }
 
+float entry_correction_weight(
+    int32_t entry_frame,
+    int32_t contact_frame,
+    int32_t frame) {
+    if (frame <= entry_frame) return 1.0F;
+    if (frame >= contact_frame) return 0.0F;
+    const float alpha = static_cast<float>(frame - entry_frame) /
+        static_cast<float>(contact_frame - entry_frame);
+    const float smoothstep = alpha * alpha * (3.0F - 2.0F * alpha);
+    return 1.0F - smoothstep;
+}
+
+vec3 corrected_root_position(
+    vec3 mapped_root,
+    vec3 entry_root_offset,
+    float weight) {
+    return mapped_root + weight * entry_root_offset;
+}
+
+vec3 corrected_hand_position(
+    vec3 mapped_hand,
+    vec3 mapped_root,
+    vec3 entry_root_offset,
+    float entry_yaw_offset,
+    float weight) {
+    const quat yaw_correction = quat_from_angle_axis(
+        weight * entry_yaw_offset, vec3(0.0F, 1.0F, 0.0F));
+    return corrected_root_position(mapped_root, entry_root_offset, weight) +
+        quat_mul_vec3(yaw_correction, mapped_hand - mapped_root);
+}
+
 bool path_is_clear(
     const MatchInput& input,
     const ClipFrames& frames,
     const Transform& scene_from_source,
-    int32_t entry_frame) {
+    int32_t entry_frame,
+    vec3 entry_root_offset,
+    float entry_yaw_offset) {
     const Database& database = *input.database;
     for (int32_t frame = entry_frame; frame < frames.stop; ++frame) {
-        const Transform root = compose(
+        const Transform mapped_root = compose(
             scene_from_source,
             root_transform(world_pose(pose_at_frame(database, frame))));
+        const float weight = entry_correction_weight(
+            entry_frame, frames.contact, frame);
+        const vec3 root = corrected_root_position(
+            mapped_root.position, entry_root_offset, weight);
         if (root_intersects_table(
-                root.position,
+                root,
                 input.target.table_world,
                 input.target.table_size)) {
             return false;
         }
     }
 
-    Transform previous = compose(
+    const WorldPose entry_pose = world_pose(
+        pose_at_frame(database, entry_frame));
+    const Transform entry_mapped_root = compose(
+        scene_from_source, root_transform(entry_pose));
+    const Transform entry_mapped_hand = compose(
         scene_from_source,
-        hand_transform(
-            world_pose(pose_at_frame(database, entry_frame)), frames.hand));
+        hand_transform(entry_pose, frames.hand));
+    vec3 previous = corrected_hand_position(
+        entry_mapped_hand.position,
+        entry_mapped_root.position,
+        entry_root_offset,
+        entry_yaw_offset,
+        1.0F);
     for (int32_t frame = entry_frame + 1;
          frame < frames.stop;
          ++frame) {
-        const Transform current = compose(
+        const WorldPose source_pose = world_pose(
+            pose_at_frame(database, frame));
+        const Transform mapped_root = compose(
+            scene_from_source, root_transform(source_pose));
+        const Transform mapped_hand = compose(
             scene_from_source,
-            hand_transform(world_pose(pose_at_frame(database, frame)), frames.hand));
+            hand_transform(source_pose, frames.hand));
+        const float weight = entry_correction_weight(
+            entry_frame, frames.contact, frame);
+        const vec3 current = corrected_hand_position(
+            mapped_hand.position,
+            mapped_root.position,
+            entry_root_offset,
+            entry_yaw_offset,
+            weight);
         if (segment_intersects_expanded_box(
-                previous.position,
-                current.position,
+                previous,
+                current,
                 input.target.table_world,
                 input.target.table_size,
                 input.affordance.clearance_radius)) {
             return false;
         }
         if (frame < frames.contact && segment_intersects_expanded_box(
-                previous.position,
-                current.position,
+                previous,
+                current,
                 input.target.object_world,
                 input.target.object_dimensions,
                 input.affordance.clearance_radius)) {
@@ -471,7 +529,12 @@ CandidateEvaluation evaluate_candidate(
         }
 
         if (!path_is_clear(
-                input, frames, scene_from_source, entry_frame)) {
+                input,
+                frames,
+                scene_from_source,
+                entry_frame,
+                root_offset,
+                yaw_offset)) {
             return {CandidateStatus::BlockedPath, {}};
         }
 

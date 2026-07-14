@@ -346,6 +346,41 @@ void test_clearance_uses_segments_and_exempts_only_final_contact() {
     assert(select_whole_clip(input, {}).reason == Reason::BlockedPath);
 }
 
+void test_clearance_applies_entry_translation_to_root_and_hand_path() {
+    using namespace interaction;
+    MatchInput root_control = valid_input();
+    root_control.target.table_size.z = 1.04F;
+    assert(select_whole_clip(root_control, {}).accepted);
+
+    MatchInput root_input = valid_input();
+    root_input.locomotion.pose.positions[g1_skeleton::Simulation].z += 0.24F;
+    root_input.target.table_size.z = 1.04F;
+    assert(select_whole_clip(root_input, {}).reason == Reason::BlockedPath);
+
+    MatchInput hand_control = valid_input();
+    hand_control.target.table_world.position = vec3(0.20F, 0.36F, 2.50F);
+    hand_control.target.table_size = vec3(0.04F, 0.72F, 0.04F);
+    assert(select_whole_clip(hand_control, {}).accepted);
+
+    MatchInput hand_input = hand_control;
+    hand_input.locomotion.pose.positions[g1_skeleton::Simulation].x += 0.20F;
+    hand_input.locomotion.pose.positions[g1_skeleton::Simulation].z += 0.10F;
+    assert(select_whole_clip(hand_input, {}).reason == Reason::BlockedPath);
+}
+
+void test_clearance_applies_entry_yaw_to_hand_path() {
+    using namespace interaction;
+    MatchInput control = valid_input();
+    control.target.table_world.position = vec3(0.08F, 0.36F, 2.39F);
+    control.target.table_size = vec3(0.04F, 0.72F, 0.04F);
+    assert(select_whole_clip(control, {}).accepted);
+
+    MatchInput input = control;
+    input.locomotion.pose.rotations[g1_skeleton::Simulation] =
+        quat_from_angle_axis(0.20F, vec3(0.0F, 1.0F, 0.0F));
+    assert(select_whole_clip(input, {}).reason == Reason::BlockedPath);
+}
+
 void test_failure_precedence_is_deterministic() {
     using namespace interaction;
     RuntimeFixture fixture = high_cost_fixture();
@@ -369,6 +404,8 @@ int main() {
     test_ties_choose_lowest_clip_then_earliest_entry();
     test_reads_serialized_groups_and_configured_weights();
     test_clearance_uses_segments_and_exempts_only_final_contact();
+    test_clearance_applies_entry_translation_to_root_and_hand_path();
+    test_clearance_applies_entry_yaw_to_hand_path();
     test_failure_precedence_is_deterministic();
     return 0;
 }
