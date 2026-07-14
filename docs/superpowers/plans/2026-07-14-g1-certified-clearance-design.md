@@ -4,7 +4,7 @@
 
 **Goal:** Replace sampled G1 sphere, capsule, and swept-foot clearance with a deterministic, mathematically conservative G1HF/v2 certificate that fails closed at the terrain boundary and under bounded-work exhaustion.
 
-**Architecture:** One strict-floating-point translation unit computes signed vertical clearance for a finite capsule centerline against each fixed-diagonal terrain triangle. A sphere is the zero-length capsule case, and each linearly swept foot sphere is the same capsule primitive. The kernel reduces a capsule/triangle pair to eight triangular patches on a Minkowski-difference prism boundary, minimizes each patch analytically with outward-rounded interval guards, and uses bounded deterministic subdivision only for numerically degenerate patches.
+**Architecture:** One strict-floating-point translation unit computes signed vertical clearance for a finite capsule centerline against each fixed-diagonal terrain triangle. A sphere is the zero-length capsule case, and each linearly swept foot sphere is the same capsule primitive. The kernel reduces a capsule/triangle pair to eight triangular patches on a Minkowski-difference prism boundary, minimizes each patch analytically with outward-rounded interval guards, and uses bounded deterministic subdivision only for numerically degenerate patches. Swing lift selection belongs to the controller transaction: it stages a finite immutable ladder of actual sole commands, runs the production IK/orientation/FK path for each entry, certifies the resulting world-space sphere endpoints, and commits the first already-evaluated passing pose.
 
 **Tech Stack:** C++17; existing `g1_ik.h`, `terrain_runtime.h`, `vec.h`, and `array.h`; IEEE-754 binary32/binary64; a non-inline `g1_clearance.cpp` compiled with strict FP; standalone strict, fast-math-caller, sanitizer, and parity test executables.
 
@@ -16,11 +16,11 @@
 - Never use `heightfield_sample_v2` returning a finite exterior value as proof that a query was in-domain or that the field was valid.
 - Full projected sphere/capsule footprint containment in the inclusive authoritative node rectangle is required. Exact tangency is in-domain; any proven excursion or unresolved boundary comparison fails closed.
 - Store safety bounds as binary64. Do not round a safety decision through binary32.
-- The certified arithmetic and ordered-lift search must not be compiled under `-ffast-math`, reassociation, contraction, or LTO into a fast-math caller.
+- The certified arithmetic and sole-command materializer must not be compiled under `-ffast-math`, reassociation, contraction, or LTO into a fast-math caller.
 - The strict TU requires round-to-nearest **and gradual underflow** for binary32/binary64. An inherited x86 FTZ/DAZ mode or a portable volatile denormal probe failure is `ArithmeticFailure`, never an implicit arithmetic variant.
-- For each binary32 lift key, materialize the controller-applied endpoint once as canonical round-to-nearest binary32 in the strict TU, then preserve target subtraction as an exact binary64 expansion. The planner may not certify the surrogate exact-real sum `B+L` that the binary32 controller cannot realize.
+- A lift certificate may use only the actual four world-space sphere centers produced by the staged production controller path. No clearance planner may predict those centers as `sphere_y+lift`, infer them from the sole command, or rely on monotonicity across lift candidates.
 - Exactly `dt = 1.0f / 25.0f` remains the swing-history timing contract. Call the Task 2 producer helper `g1_ik_dt_is_exact_25_hz`; do not add a second tolerant comparison.
-- `0.08f` is the exact maximum swing-only endpoint lift. Failure to certify the corrected sweep at exactly that value requests safe stop.
+- The immutable swing ladder is the 41 canonical binary32 values `RN32(i/500 m)` for `i=0..40`; its exact endpoints are `+0.0f` and `0.08f`. If no staged entry certifies, request safe stop without estimating an unrepresented required lift.
 - A returned error or finite rejected candidate cannot mutate swing history, accepted pose arrays, accepted clearance, support state, matcher state, or simulation state.
 - Do not allocate or iterate in proportion to unchecked field dimensions, radius, segment length, or float-derived sample counts.
 
@@ -34,14 +34,14 @@
 - Certified signed vertical clearance of a sphere and a finite capsule segment.
 - Continuous linear sweep of each of the four configured G1 foot collision spheres.
 - Four-sphere foot aggregation, thigh/shin capsule aggregation, and pose-level minimum diagnostics.
-- Endpoint lift planning against a clearance target that interpolates from planted to swing clearance.
+- Finite staged-controller lift selection against a clearance target that interpolates from planted to swing clearance.
 - Explicit `OutsideDomain`, bounded-work, numerical-certification, invalid-input, and invalid-field outcomes.
 - Deterministic witness selection, diagnostic work counters, strict/release parity, and transactional state ownership.
 
 ### Non-goals
 
 - Euclidean separation distance. This plan preserves the existing signed **vertical** clearance definition: lower body height minus authoritative terrain height at the same XZ coordinate.
-- Arbitrary curved center trajectories. The fixed-update contract is a linear path between prior accepted and current candidate sphere centers.
+- Arbitrary curved center trajectories. The fixed-update contract is a linear path between prior accepted and actual staged/FK current sphere centers.
 - Inferring rigid-foot interpolation from quaternions between updates. The four configured sphere-center paths are the owned sweep geometry.
 - Rebuilding G1HF/G1WM artifacts, changing terrain rendering, changing the matcher, changing support retargeting, or changing the controller root.
 - Treating the published exterior height as physical terrain outside the authoritative rectangle.
@@ -51,24 +51,29 @@
 
 ## 2. File Map and Ownership
 
-- Create `g1_clearance.h`: public status, result, witness, budget, point/sphere/capsule/foot/pose, history, and swing-plan declarations. It contains no certified arithmetic implementation.
-- Create `g1_clearance.cpp`: strict-FP environment validation, certified endpoint expansions, terrain enumeration, interval arithmetic, prism-patch solver, bounded fallback, aggregators, and ordered-float lift search. For representable point queries it consumes Task 2's `G1SurfaceQueryStatus`/`g1_surface_query_v2` fail-closed status before reconstructing the continuous triangle certificate.
+- Create `g1_clearance.h`: public status, result, witness, budget, point/sphere/capsule/foot/pose, history, command-materializer, and actual-center swing-validation declarations. It contains no certified arithmetic implementation.
+- Create `g1_clearance.cpp`: strict-FP environment validation, sole-command materialization, certified endpoint expansions, terrain enumeration, interval arithmetic, prism-patch solver, bounded fallback, aggregators, and actual-center swing validation. For representable point queries it consumes Task 2's `G1SurfaceQueryStatus`/`g1_surface_query_v2` fail-closed status before reconstructing the continuous triangle certificate.
 - Create `tests/cpp/test_g1_clearance.cpp`: analytic, adversarial, transaction, budget, strict-FP, and parity tests.
-- Modify the later Task 6 `g1_ik_runtime.h`: consume statuses and binary64 lower bounds; do not reimplement clearance.
+- Modify later `g1_ik_runtime.h` in Task 7: own the immutable lift ladder and staged controller transaction, consume strict-kernel statuses and binary64 lower bounds, and never reimplement clearance.
 - Modify later controller/test build commands: compile `g1_clearance.cpp` separately without fast math, compile callers with their existing flags, then link the two objects.
 - Modify later stop-reason/checker work only if it needs to distinguish `outside-domain`, `budget-exceeded`, or `uncertified-clearance`; do not launder these outcomes into a successful clearance.
 
 Ownership is one-way:
 
 ```text
-validated scene terrain + immutable candidate geometry
+baseline controller state + immutable lift-bit ladder
+                    |
+                    v
+ staged production sole command + IK/orientation/FK
+                    |
+        actual world-space sphere-center bits
                     |
                     v
        strict g1_clearance.cpp transaction
                     |
-          status + candidate result
+      certified status + actual-center margin
                     |
-       Task 6/7 accept or reject candidate
+ first passing staged pose or rollback/safe-stop
                     |
        accepted-only swing-history commit
 ```
@@ -128,7 +133,6 @@ struct G1ClearanceWork
     uint32_t face_patches = 0;
     uint32_t candidate_tests = 0;
     uint32_t subdivision_nodes = 0;
-    uint32_t lift_evaluations = 0;
 };
 
 struct G1ClearanceResult
@@ -151,7 +155,6 @@ struct G1ClearanceBudget
     uint32_t maximum_face_patches;
     uint32_t maximum_candidate_tests;
     uint32_t maximum_subdivision_nodes;
-    uint32_t maximum_lift_evaluations;
 };
 
 constexpr uint32_t G1ClearanceMaximumPointQueriesPerPose = 16;
@@ -163,7 +166,6 @@ constexpr uint32_t G1ClearanceMaximumPairsPerPose = 4096;
 constexpr uint32_t G1ClearanceMaximumPairsPerSwingFoot = 512;
 constexpr uint32_t G1ClearancePatchesPerPair = 8;
 constexpr uint32_t G1ClearanceCandidatesPerPair = 32;
-constexpr uint32_t G1ClearanceMaximumLiftEvaluations = 32;
 constexpr uint32_t G1ClearanceMaximumSubdivisionNodes = 8192;
 constexpr double G1ClearanceMaximumCertificateWidthM = 1.0e-6;
 
@@ -224,22 +226,9 @@ G1ClearanceStatus g1_swept_foot_clearance(
     int error_capacity);
 ```
 
-Later pose and swing structs use `double` for every clearance or margin involved in a safety decision. Lift values remain binary32 because they are applied to the existing binary32 pose:
+Later pose and swing structs use `double` for every clearance or margin involved in a safety decision. The clearance layer validates actual endpoints and does not own a predicted-lift plan:
 
 ```cpp
-struct G1SwingClearancePlan
-{
-    double baseline_lower_margin_m = 0.0;
-    double corrected_lower_margin_m = 0.0;
-    double corrected_witness_upper_margin_m = 0.0;
-    float required_lift_m = 0.0f;
-    float applied_lift_m = 0.0f;
-    bool sweep_evaluated = false;
-    bool required_lift_certified = false;
-    bool safe_stop_requested = false;
-    G1ClearanceWork work;
-};
-
 struct G1SwingClearanceValidation
 {
     double lower_margin_m = 0.0;
@@ -291,17 +280,17 @@ G1ClearanceStatus g1_measure_pose_clearance(
 
 | Status | Meaning | Task 6/7 action |
 |---|---|---|
-| `Ok` | Bounds and witness are valid and within certification width | Compare `lower_bound_m` with the required threshold |
-| `OutsideDomain` | The complete projected body/sweep is not proven inside the inclusive rectangle | Reject finite candidate, request safe stop, preserve history/output |
-| `BudgetExceeded` | A preflight or shared work budget would be exceeded | Reject finite candidate, request safe stop, preserve history/output |
-| `Uncertified` | Finite geometry could not reach the `1e-6 m` certificate-width bound | Reject finite candidate, request safe stop, preserve history/output |
+| `Ok` | Bounds and witness are valid and within certification width | A staged swing candidate passes clearance only when `lower_bound_m >= 0` |
+| `OutsideDomain` | The complete projected body/sweep is not proven inside the inclusive rectangle | Reject this finite stage and continue the fixed ladder; safe-stop if none passes |
+| `BudgetExceeded` | A preflight or shared work budget would be exceeded | Reject this finite stage and continue the fixed ladder; safe-stop if none passes |
+| `Uncertified` | Finite geometry could not reach the `1e-6 m` certificate-width bound | Reject this finite stage and continue the fixed ladder; safe-stop if none passes |
 | `InvalidInput` | Nonfinite/invalid body, radius, configuration, exact-dt, history, or over-factory budget input | Controlled diagnostic and normal cleanup |
 | `InvalidField` | Not a structurally valid G1HF/v2 field or a visited cell has invalid heights | Controlled diagnostic and normal cleanup |
 | `ArithmeticFailure` | The rounding/gradual-underflow environment is unsupported or a checked strict-FP operation could not produce a finite enclosure | Controlled diagnostic and normal cleanup |
 
 The result output is transactional: construct a local candidate and assign it only for `G1ClearanceOk`. `G1ClearanceBudget` is an immutable set of caller-selected limits, not a mutable ledger; each top-level call owns a private ledger and returns consumed work only through a successful result. Composite calls pass that private ledger through internal `_with_ledger` helpers, so a late failure cannot mutate either the public output or the caller's limits. Error text is diagnostic only and is not used to infer status.
 
-The two budget factories initialize every field explicitly. The pose factory permits 16 point queries, 2048 total cell visits, 4096 pairs, 32768 face patches, 131072 analytic candidate tests, 8192 subdivision nodes, and zero lift evaluations. The swing-foot factory permits zero point queries, 256 cached cell visits, 512 cached pairs, 131072 face-patch evaluations, 524288 analytic candidate tests, 8192 subdivision nodes, and 32 distinct lift evaluations. These are absolute ceilings, not suggestions. A caller-provided `limits` value may tighten any field but may not exceed the factory value for that entry-point family. Standalone point/sphere/capsule/foot and leg/pose measurement use the pose ceiling; swept-foot, swing-plan, and swing-validation use the swing ceiling.
+The two budget factories initialize every field explicitly. The pose factory permits 16 point queries, 2048 total cell visits, 4096 pairs, 32768 face patches, 131072 analytic candidate tests, and 8192 subdivision nodes. The swing-foot factory covers one actual four-sphere sweep and permits zero point queries, 256 cell visits, 512 pairs, 4096 face-patch evaluations, 16384 analytic candidate tests, and 8192 subdivision nodes. These are absolute per-call ceilings, not suggestions. A caller-provided `limits` value may tighten any field but may not exceed the factory value for that entry-point family. Standalone point/sphere/capsule/foot and leg/pose measurement use the pose ceiling; swept-foot and actual-center swing validation use the swing ceiling. The runtime ladder's separate fixed 41-stage bound is specified in Section 9 and is not a caller-enlargeable clearance-budget field.
 
 Validate every limit field with ordinary bounded comparisons before checked-work products or ledger creation. If any requested field exceeds its family factory—including `UINT32_MAX`—return `G1ClearanceInvalidInput` transactionally; do not clamp, wrap, or accept an enlarged budget. Zero and other smaller values are valid tightening requests and can subsequently produce `BudgetExceeded`/`Uncertified`. Fixed per-primitive caps are enforced independently and cannot be raised through either factory. Tests compare factory structs field-by-field so an implementation cannot silently inflate a factory to legitimize a hostile request.
 
@@ -336,16 +325,14 @@ struct G1CertifiedEndpoint
     double z;                   // exact promotion of canonical binary32 Z
     G1ExactY y;
     G1EndpointSourceKey source_key;
-    uint32_t lift_bits;         // +0 for public/prior; canonical L for current
-    uint32_t materialized_y_bits; // original Y, or canonical RN32(B.y + L)
 };
 ```
 
-`g1_capsule_clearance` validates/canonicalizes its public binary32 endpoints, promotes XZ exactly, creates a one-term exact Y expansion, derives the outward enclosure, and calls an internal `g1_capsule_clearance_certified`. For endpoint reversal parity, transform each canonical float bit pattern to IEEE total-order form (`negative ? ~bits : bits ^ 0x80000000`), sort by the `(x,y,z)` ordered-bit tuple, then assign public semantic ordinals `0,1`. Public and prior endpoints store `lift_bits=+0` and `materialized_y_bits=source_key.original_y_bits`. No proof code converts a `G1CertifiedEndpoint` back to `vec3`.
+`g1_capsule_clearance` validates/canonicalizes its public binary32 endpoints, promotes XZ exactly, creates a one-term exact Y expansion, derives the outward enclosure, and calls an internal `g1_capsule_clearance_certified`. For endpoint reversal parity, transform each canonical float bit pattern to IEEE total-order form (`negative ? ~bits : bits ^ 0x80000000`), sort by the `(x,y,z)` ordered-bit tuple, then assign public semantic ordinals `0,1`. No proof code converts a `G1CertifiedEndpoint` back to `vec3`.
 
-Swing construction uses source kind 1, the sphere primitive index, semantic ordinal `0=prior`/`1=current`, and the original canonical center bits. Form prior adjusted Y with error-free `TwoDiff(double(A.y),double(P))`. For current Y, first call the same private strict materializer used by `g1_apply_swing_lift_y`: compute the exact binary64 sum of promoted binary32 `B.y` and `L`, round it once to canonical round-to-nearest binary32 `B_lifted.y`, and reject a non-runtime result. Then form the adjusted Y only as error-free `TwoDiff(double(B_lifted.y),double(W))`. Preserve the original canonical `B.y` bits in `source_key`, and preserve the `L` and materialized `B_lifted.y` bits in the endpoint provenance fields. The source key itself is independent of both lift and materialized Y, so endpoint and fallback ordering remain stable across materialization plateaus. Sum the adjusted expansion outward to obtain `y.enclosure`; never cast the adjusted difference to binary32. Canonicalize the two certified endpoints by `source_key` before patch construction, so patch order and witness keys never depend on adjusted-Y rounding. The exact expansion defines the real segment used by witnesses; its interval drives conservative lower arithmetic.
+Actual-center swing validation uses source kind 1, the sphere primitive index, semantic ordinal `0=prior`/`1=current`, and the canonical bits of the prior accepted and staged-FK centers. Form adjusted Y only with error-free `TwoDiff(double(A.y),double(P))` and `TwoDiff(double(B.y),double(W))`. Here `B` is already the controller-produced world-space sphere center; the clearance layer receives no lift key and performs no endpoint prediction. Sum each adjusted expansion outward to obtain `y.enclosure`; never cast either adjusted difference to binary32. Canonicalize the two certified endpoints by `source_key` before patch construction, so patch order and witness keys depend only on actual endpoint bits. The exact expansion defines the real segment used by witnesses; its interval drives conservative lower arithmetic.
 
-`g1_apply_swing_lift_y` is a non-inline transactional wrapper around that private materializer. It performs the Section 6 arithmetic-environment check; validates/canonicalizes runtime `input_y`; requires finite, nonnegative `lift_m <= 0.08f` and canonicalizes either zero sign to `+0.0f`; materializes with one strict binary64-to-binary32 round; canonicalizes a zero result to `+0.0f`; and rejects a nonzero subnormal or nonfinite result. Positive subnormal lift keys are valid and retain their bits—the gradual-underflow precondition exists in part so every ordered key from `+0.0f` through `0.08f` can be evaluated without silently flushing the lift. Invalid arguments return `InvalidInput`, while an unrepresentable materialized result returns `ArithmeticFailure`; either leaves `output_y` unchanged. Planning and controller integration may not spell the addition independently. Each proof or controller call therefore uses its exact supplied canonical input and lift bits under the same rounding mode, signed-zero rule, and output validation.
+`g1_apply_swing_lift_y` is a separate non-inline transactional sole-command helper, not an endpoint-proof constructor. It performs the Section 6 arithmetic-environment check; validates/canonicalizes runtime `input_y`; requires finite, nonnegative `lift_m <= 0.08f` and canonicalizes either zero sign to `+0.0f`; materializes `RN32(double(input_y)+double(lift_m))` with one strict binary64-to-binary32 round; canonicalizes a zero result to `+0.0f`; and rejects a nonzero subnormal or nonfinite result. Positive subnormal lift inputs retain their bits during the operation, but the helper does **not** promise that every positive lift succeeds: for example, `input_y=+0.0f` plus `denorm_min` materializes a forbidden nonzero-subnormal command and returns `ArithmeticFailure` with `output_y` unchanged. Production ladder entries above zero are normal. Invalid arguments return `InvalidInput`, while an unrepresentable materialized result returns `ArithmeticFailure`; either leaves `output_y` unchanged. The staged controller must call this helper for the actual desired sole command and record its output bits before IK.
 
 ### Bound and witness tie-breaking
 
@@ -617,31 +604,30 @@ The public budget is an immutable tightening request under an absolute factory c
 | Checked point queries per pose | 16 |
 | Broad-phase cells per primitive | 512 |
 | Broad-phase cell visits per complete pose | 2048 |
-| Cached broad-phase cell visits per swing foot | 256 |
+| Broad-phase cell visits per actual swing-foot validation | 256 |
 | Primitive/terrain-triangle pairs per primitive | 1024 |
 | Primitive/terrain-triangle pairs per complete pose | 4096 |
 | Primitive/terrain-triangle pairs across four spheres of one swing foot | 512 |
 | Prism patches per pair | 8 |
 | Analytic candidate tests per pair | 32 |
-| Ordered-float lift evaluations | 32 |
 | Subdivision nodes per top-level call | 8192 |
 
 Hard analytic work bounds are:
 
 ```text
 complete pose: 4096 * 32 = 131072 candidate tests
-one lift-searched swing foot: 512 * 32 * 32 = 524288 candidate tests
-fallback: at most 8192 additional subdivision nodes
+one actual four-sphere sweep: 512 * 32 = 16384 candidate tests
+all 41 staged ladder entries for one foot: at most 41 * 16384 = 671744 candidate tests
+fallback: at most 8192 additional subdivision nodes per strict validation
 ```
 
 Counter units are exact:
 
-- One `cell` charge means one unique `(primitive,cell_z,cell_x)` broad-phase entry inserted into the call-local cache. Reusing that entry at another lift does not charge it again; a different primitive crossing the same terrain cell is a separate visit. Terrain heights may be physically deduplicated behind that accounting.
-- One `primitive_triangle_pair` charge means one cached primitive/closed-triangle pair; both fixed-diagonal triangles are separate pairs.
-- One `face_patch` charge means one of the eight top-level prism-boundary triangles evaluated for one pair at one lift.
+- One `cell` charge means one unique `(primitive,cell_z,cell_x)` broad-phase entry inserted into one actual-center validation's call-local cache. A different primitive crossing the same terrain cell is a separate visit. Terrain heights may be physically deduplicated behind that accounting.
+- One `primitive_triangle_pair` charge means one primitive/closed-triangle pair; both fixed-diagonal triangles are separate pairs.
+- One `face_patch` charge means one of the eight top-level prism-boundary triangles evaluated for one pair.
 - One `candidate_test` charge means one analytic solver unit: the face stationary classification or one complete edge minimization. An edge unit includes its stationary value and two clipped endpoints, so there are at most four units per patch and exactly 32 preflightable units per pair.
 - One `subdivision_node` charge covers one fallback child node, including its constant-size coarse bound, closest-feasible-point witness attempt, and deterministic split. Fallback work is not charged again as analytic candidate work.
-- One `lift_evaluation` charge means one distinct binary32 lift key. Results are memoized; looking up an already evaluated endpoint is not a new evaluation.
 
 The pose and swing factories set immutable shared ceilings from Section 3; effective limits are exactly the validated caller values, never `max(caller,factory)`. Fixed per-primitive limits of 512 cells and 1024 pairs are checked before those shared limits. Preflight the complete rectangular cell count, its two-triangle pair count, eight patches per pair, and four analytic units per patch with checked `uint64_t` arithmetic before the first terrain load or ledger mutation. Subdivision is charged incrementally because it is data-dependent; reaching its cap without the required width returns `Uncertified`, while a caller-supplied cap too small for already preflightable fixed work returns `BudgetExceeded`.
 
@@ -650,17 +636,17 @@ At the published `0.02 m` cell size, expected broad-phase counts are:
 - stationary `r=0.02` sphere: approximately 8 to 18 terrain-triangle pairs;
 - ordinary four-sphere fixed-update sweep: approximately 80 to 160 pairs;
 - complete thigh/shin/foot pose: commonly 500 to 1500 pairs;
-- clear swing accepted at zero lift: approximately 2500 to 5000 candidate tests;
-- lift-needed swing: commonly 65000 to 165000 candidate tests;
+- one ordinary staged swing candidate: approximately 2500 to 5000 candidate tests;
+- a lift-needed selection through ladder index `i`: approximately `(i+1)*2500` to `(i+1)*5000` candidate tests;
 - pose diagnostics: commonly 16000 to 50000 candidate tests.
 
-Before ordered-lift search, cache a bounded list of `(primitive,cell,triangle)` references and their exact terrain vertices. Lift changes only endpoint Y, so no XZ span or terrain enumeration is repeated. The cache cannot contain more than 512 pairs and is discarded with the local planning transaction.
+Each ladder entry has separately staged IK/FK endpoints, including potentially different XZ bits, so terrain spans and pairs are recomputed for that entry. Never reuse the old assumption that lift changes only endpoint Y. The runtime sums successful per-candidate `G1ClearanceWork` fields with checked `uint64_t` intermediates for diagnostics; the immutable 41-entry ladder and per-call factory caps bound total work even when every candidate fails.
 
-Do not cache across scene generations. Do not allocate a field-sized acceleration structure in Task 5.
+Do not cache across candidates or scene generations. Do not allocate a field-sized acceleration structure in Task 5.
 
 ---
 
-## 9. Certified Swing Lift and History
+## 9. Actual-Center Swing Certification and Staged Lift Ladder
 
 Add checked history operations:
 
@@ -683,18 +669,6 @@ bool g1_swing_history_commit(
     char* error,
     int error_capacity);
 
-G1ClearanceStatus g1_swing_clearance_plan(
-    G1SwingClearancePlan& output,
-    const G1ClearanceBudget& limits,
-    const G1SwingHistory& history,
-    const heightfield& field,
-    const G1LegConfig& config,
-    const vec3 current_sphere_centers[4],
-    bool recorded_contact,
-    float dt,
-    char* error,
-    int error_capacity);
-
 G1ClearanceStatus g1_swing_clearance_validate(
     G1SwingClearanceValidation& output,
     const G1ClearanceBudget& limits,
@@ -708,55 +682,112 @@ G1ClearanceStatus g1_swing_clearance_validate(
     int error_capacity);
 ```
 
-Both functions validate all four centers into a local candidate before assignment. Commit requires initialized history. A failed call leaves every prior component unchanged.
+Validation canonicalizes all four actual centers into a local candidate before assignment. Commit requires initialized history. A failed call leaves every prior component unchanged.
 
-For one sphere, let `A` be its prior accepted center, `B` its current candidate center, `P` planted clearance, `W` swing clearance, and `L` endpoint lift. Target clearance and lift both interpolate linearly, so subtract the target from centerline Y:
+For one sphere, let `A` be its prior accepted center, `B` its actual staged-FK center, `P` planted clearance, and `W` swing clearance. The target interpolates linearly, so subtract its endpoints from the actual centerline endpoints:
 
 ```text
 A_adjusted.xz = exact_promote(A.xz)
 A_adjusted.y  = exact_expansion(TwoDiff(double(A.y), double(P)))
-B_lifted.y    = strict_canonical_rn32(double(B.y) + double(L))
 B_adjusted.xz = exact_promote(B.xz)
-B_adjusted.y  = exact_expansion(TwoDiff(double(B_lifted.y), double(W)))
+B_adjusted.y  = exact_expansion(TwoDiff(double(B.y), double(W)))
 ```
 
-The strict materializer is intentional binary32 geometry, not a loss inside the proof: it is exactly the one-round operation the controller applies. Only the subsequent `B_lifted.y-W` target subtraction remains an exact-real expansion and must never pass through `vec3`. The certified capsule clearance of `[A_adjusted,B_adjusted]` against zero is therefore exactly the continuous target-subtracted margin for the controller-materialized planned endpoint. Aggregate all four adjusted certified capsules. `applied_lift_m` is the binary32 key supplied to the same public helper during controller integration. The mandatory post-solve call then certifies the actual final sphere centers produced by IK; it does not add `L` again because those centers already contain the applied controller correction.
+Only the target subtraction is represented as an exact-real expansion; it must never pass through a binary32 adjusted-Y temporary. The certified capsule clearance of `[A_adjusted,B_adjusted]` against zero is exactly the continuous target-subtracted margin for the actual staged controller endpoint. Aggregate all four adjusted certified capsules. `g1_swing_clearance_validate` has no lift argument: every staged candidate and the defensive final check use `L=+0` because `B` already contains all controller and IK effects. Require initialized history, runtime prior/current centers, valid configuration, and `g1_ik_dt_is_exact_25_hz(dt)` before the contact shortcut. Recorded contact returns `Ok` with `sweep_evaluated=false`; otherwise a nonnegative `lower_margin_m` is the only clearance pass.
 
-All three binary64 fields in `G1SwingClearancePlan` are target-subtracted margins, not raw sole clearances: `baseline_lower_margin_m` is the `L=0` lower bound, and the two corrected fields are the lower/witness bounds at `applied_lift_m`. On the contact shortcut they are canonical `+0.0` and ignored because `sweep_evaluated=false`. `work` is the total private-ledger work over distinct cached lift evaluations.
+The controller policy in `g1_ik_runtime.h` is an immutable 2 mm ladder represented by checked-in bits, never by fast-math multiplication:
 
-Lift search operates on positive finite binary32 bit keys:
+```cpp
+constexpr uint32_t G1SwingLiftCandidateCount = 41;
+constexpr uint32_t G1SwingNoCandidate = UINT32_MAX;
+constexpr uint32_t G1SwingLiftCandidateBits[G1SwingLiftCandidateCount] = {
+    0x00000000u, 0x3b03126fu, 0x3b83126fu, 0x3bc49ba6u,
+    0x3c03126fu, 0x3c23d70au, 0x3c449ba6u, 0x3c656042u,
+    0x3c83126fu, 0x3c9374bcu, 0x3ca3d70au, 0x3cb43958u,
+    0x3cc49ba6u, 0x3cd4fdf4u, 0x3ce56042u, 0x3cf5c28fu,
+    0x3d03126fu, 0x3d0b4396u, 0x3d1374bcu, 0x3d1ba5e3u,
+    0x3d23d70au, 0x3d2c0831u, 0x3d343958u, 0x3d3c6a7fu,
+    0x3d449ba6u, 0x3d4ccccdu, 0x3d54fdf4u, 0x3d5d2f1bu,
+    0x3d656042u, 0x3d6d9168u, 0x3d75c28fu, 0x3d7df3b6u,
+    0x3d83126fu, 0x3d872b02u, 0x3d8b4396u, 0x3d8f5c29u,
+    0x3d9374bcu, 0x3d978d50u, 0x3d9ba5e3u, 0x3d9fbe77u,
+    0x3da3d70au,
+};
 
-1. Require history initialized, all prior/current centers to pass `g1_ik_vec3_is_runtime_value`, `g1_foot_runtime_config_validate` to accept the configuration, and `g1_ik_dt_is_exact_25_hz(dt)` before checking contact state.
-2. If recorded contact is true, return `Ok` with a zero-lift plan, `sweep_evaluated=false`, and `required_lift_certified=true`; post-solve validation still validates every input, including exact dt, before the same marked shortcut.
-3. Evaluate `L=0.0f`. Propagate any non-`Ok` evaluator status without assigning output. If its lower margin is nonnegative, return a certified zero lift.
-4. Evaluate `L=config.max_swing_lift_m`, whose bits must equal exact `0.08f`. Propagate a non-`Ok` evaluator status. If its valid lower margin is negative, return `Ok` with both lift fields equal to the tested cap, `required_lift_certified=false`, and `safe_stop_requested=true`. This means "the cap did not certify," not that an unrepresented larger requirement was measured.
-5. Otherwise maintain a not-certified low key and a directly certified-safe high key. Bisect the integer bit keys; evaluate and memoize each new midpoint. A midpoint with `lower_margin_m >= 0` becomes high, and any other valid midpoint becomes low. A non-`Ok` midpoint propagates transactionally rather than being treated as unsafe.
-6. The inclusive range from `+0.0f` to `0.08f` needs at most 30 midpoint halvings, so the two endpoint evaluations plus those midpoints fit exactly in the 32-distinct-key cap. At adjacency, return the cached high key with `required_lift_certified=true`; its cached predecessor is the low key and did not certify. Do not spend two hidden 33rd/34th re-evaluations. If adjacency was not reached within the cap, return `Uncertified`.
-7. Post-solve validation is a separate top-level call with a fresh swing budget. It uses prior accepted centers and actual final centers, subtracts planted/swing endpoint targets in the same way but uses `L=+0` because the final centers already embody the controller-applied lift, and requires a nonnegative lower margin.
+struct G1SwingCandidateDiagnostic
+{
+    uint32_t candidate_index = G1SwingNoCandidate;
+    uint32_t lift_bits = 0;
+    uint32_t materialized_command_y_bits = 0;
+    uint32_t actual_sphere_center_bits[4][3] = {}; // [sphere][x,y,z], raw FK call-boundary bits
+    G1ClearanceStatus clearance_status = G1ClearanceInvalidInput;
+    bool controller_constraints_passed = false;
+    bool clearance_certified = false;
+    double lower_margin_m = 0.0;
+    double witness_upper_margin_m = 0.0;
+    G1ClearanceWork clearance_work;
+};
 
-For fixed binary32 `B.y`, `B_lifted.y=canonical_rn32(double(B.y)+double(L))` is nondecreasing over nonnegative ordered-float lift keys and generally contains plateaus. Every sweep parameter therefore receives a nonnegative, nondecreasing **materialized** endpoint displacement. A directly nonnegative lower bound certifies that key's controller-realizable planned geometry and every larger valid key's nonlower materialized geometry. The numerical evaluator may conservatively fail to certify a safe midpoint; in that case the search can over-lift by an unresolved certification band, not necessarily only one ULP. It can never return an under-lift in the planned geometry: the selected high key itself has a cached nonnegative lower bound for its materialized endpoint. The controller must apply that key through `g1_apply_swing_lift_y`, and the downstream pose is accepted only after separate actual-center validation. Tests claim only that the predecessor did not certify, not that it was proven to penetrate.
+struct G1SwingSelectionDiagnostic
+{
+    uint32_t candidates_evaluated = 0;
+    uint32_t selected_index = G1SwingNoCandidate;
+    G1SwingCandidateDiagnostic selected;
+    G1ClearanceWork total_clearance_work;
+};
+
+#if defined(G1_IK_ENABLE_TEST_SEAMS)
+bool g1_ik_stage_swing_candidate_for_test(
+    G1SwingCandidateDiagnostic& output,
+    const G1IkState& state,
+    const slice1d<vec3> baseline_positions,
+    const slice1d<quat> scratch_rotations,
+    const slice1d<int> parents,
+    const heightfield& field,
+    uint32_t foot_index,
+    uint32_t candidate_index,
+    float dt,
+    char* error,
+    int error_capacity);
+#endif
+```
+
+Entry `i` is exactly `RN32(i/500 m)`, so entries `0` and `40` are exact `+0.0f` and `0.08f`. The checked-in table is the production source of truth; an independent exact-rational test oracle verifies all 41 bits and strict increase. Two millimetres is below the existing 5 mm end-effector residual scale and keeps the worst case to 41 actual controller stages, close to the prior bounded work envelope. This is only a command-resolution and work-budget choice. The design claims no continuous minimum, no monotonic post-IK response, and no guarantee that a pass between ladder entries will be represented; absence of a passing listed entry fails closed.
+
+Recorded contact does not enter the ladder: it leaves `candidates_evaluated=0` and `selected_index=G1SwingNoCandidate`, with the recorded-contact flag distinguishing that shortcut from an all-41-fail safe stop. The sole production engine for one swing entry is the private `g1_ik_stage_swing_candidate`; both the full selector and the test-only wrapper call it. For each non-contact foot, the runtime selection transaction does the following:
+
+1. `static_assert` the table count, endpoint bits, and strict unsigned-bit order. Validate state, shapes, field, exact dt, and `g1_foot_runtime_config_validate(config)`, including that `config.max_swing_lift_m` bits equal table entry 40, before mutating any caller-owned value. Snapshot one immutable per-foot scratch input. Failed ladder entries never feed rotations, targets, normals, or state into later entries.
+2. Visit indices `0..40` in that exact order. Reconstruct the listed lift by bits and call `g1_apply_swing_lift_y` on the **actual** `desired_sole_center.y`; record the lift and materialized command bits. No fast-math caller spells the addition.
+3. Starting from a fresh copy of the same scratch input, run the identical production branch logic, invoking the bounded position-IK and orientation functions in the identical order whenever their production predicates are true, with the identical reach, correction, residual, and invariance checks. There is no proxy solve or clearance-only pose.
+4. Run forward kinematics on that staged pose, compute the four configured world-space foot-sphere centers, record all twelve raw bits at the validation call boundary, then call `g1_swing_clearance_validate` on those same values with a fresh per-call swing budget. The strict public-input contract canonicalizes signed zero internally; the diagnostic does not rewrite what FK produced.
+5. A candidate passes only when every controller constraint passes, clearance status is `Ok`, and its binary64 lower margin is nonnegative. A finite controller rejection, negative `Ok` margin, `OutsideDomain`, `BudgetExceeded`, or `Uncertified` rejects only that candidate and advances to the next index. `InvalidInput`, `InvalidField`, or `ArithmeticFailure` aborts the frame transaction unchanged.
+6. Select the first passing candidate, move its already-evaluated staged rotations/result into the outer scratch pose, and copy its public diagnostic. Do not rerun IK to apply the selection. If all 41 candidates are finitely rejected, assign a safe-stop frame result with `candidates_evaluated=41`, `selected_index=G1SwingNoCandidate`, default ignored selected fields, and no accepted pose/history/state mutation. Do not fabricate a continuous required-lift field.
+
+The two feet compose sequentially only in the outer scratch pose; each foot's failed stages remain isolated. After both feet are staged, recompute final FK once, require every selected foot's four center bit triples to match its stored staged endpoints, and run a mandatory fresh `g1_swing_clearance_validate` with `L=+0` for each foot. Any mismatch or failed defensive certificate rolls back the entire frame. This recheck is a defensive invariant for future cross-foot changes, not the first proof of a predicted endpoint.
+
+`G1FootFrameResult::swing_selection` lets separate-object integration tests observe selected index, candidate lift bits, actual materialized sole-command bits, and actual staged/FK endpoint bits without exposing `G1CertifiedEndpoint` or solver records. If the existing `applied_swing_lift_m` log field is retained during schema migration, it is reconstructed by bit copy from `swing_selection.selected.lift_bits`, is diagnostic only, and must never apply a second correction or rerun the solve. Under `G1_IK_ENABLE_TEST_SEAMS` only, `g1_ik_stage_swing_candidate_for_test` takes the normal frame inputs plus `foot_index` and `candidate_index`, calls `g1_ik_stage_swing_candidate`, discards the private staged rotations, and returns only `G1SwingCandidateDiagnostic`. A finite candidate rejection returns `true` with its diagnostic; a global input/field/arithmetic error returns `false` with `output` unchanged. Tests probe all indices with that wrapper, derive the first passing index from real staged outcomes, and compare the full selector's public diagnostic. Release builds contain neither the wrapper declaration nor symbol; no private geometry or mutable controller state crosses the seam.
 
 ---
 
 ## 10. Transaction and Safe-Stop Semantics
 
 - Geometry functions take no history or controller state.
-- `g1_apply_swing_lift_y` changes only its scalar output and only on `Ok`; its private materialization operation is also the sole operation used to build planned current endpoints.
-- Swing planning accepts `const G1SwingHistory&` and writes only a local `G1SwingClearancePlan` before success assignment.
-- Task 6 may advance its explicitly owned lock observer according to its existing policy, but it cannot commit swing history.
-- Task 7 commits final rendered sphere centers only after the candidate pose, post-solve certified margin, planted thresholds, pose-capsule thresholds, and all other IK bounds are accepted.
-- `OutsideDomain`, `BudgetExceeded`, or `Uncertified` leave the plan output unchanged; Task 6/7 maps the status itself to finite rejection and safe stop. A valid `Ok` plan whose tested `0.08f` cap has a negative lower margin is assigned with `required_lift_certified=false` and `safe_stop_requested=true`.
+- `g1_apply_swing_lift_y` changes only its scalar output and only on `Ok`; the controller uses it solely to materialize each staged desired-sole command.
+- `g1_swing_clearance_validate` accepts `const G1SwingHistory&`, receives only actual FK sphere centers, and assigns only a local `G1SwingClearanceValidation` on `Ok`.
+- The lock observer may advance only in the outer scratch transaction according to its existing policy. Every ladder stage copies that same scratch input; a rejected stage cannot advance locks, swing history, or the next stage's pose.
+- The first passing stage is moved into the outer scratch pose without rerunning IK. Task 7 commits final rendered rotations and sphere centers only after endpoint-bit equality, the defensive actual-center certificate, planted thresholds, pose-capsule thresholds, and all other IK bounds are accepted.
+- Candidate-local `OutsideDomain`, `BudgetExceeded`, or `Uncertified` leaves that validation output unchanged and rejects that stage. Exhausting the finite ladder assigns only a safe-stop frame diagnostic; it does not assign an accepted pose or infer an unrepresented lift.
 - `InvalidInput`, `InvalidField`, or `ArithmeticFailure` return through controlled diagnostic and normal cleanup.
-- On finite rejection, accepted local/global pose arrays, accepted clearance, and both histories remain bit-identical to the prior accepted state. Only an assigned `Ok` cap-failure plan is loggable through the public plan; a non-`Ok` scratch result is not exposed as if certified.
+- On finite rejection, accepted local/global pose arrays, accepted clearance, and both histories remain bit-identical to the prior accepted state. Public diagnostics identify only the selected stage or the all-fail sentinel; private rejected poses are never exposed as if accepted.
 - On a returned controlled error, public outputs and the complete `G1IkState` argument remain unchanged.
 
-Add a distinct stop reason for unresolved certified clearance if later checker evidence cannot represent `OutsideDomain` or `BudgetExceeded`. Do not report `swing-lift` with fabricated `required_lift_m > 0.08f` evidence.
+Add a distinct stop reason for unresolved certified clearance if later checker evidence cannot represent `OutsideDomain` or `BudgetExceeded`. Do not report a fabricated continuous lift requirement; log the selected ladder index/lift bits or `G1SwingNoCandidate`.
 
 ---
 
 ## 11. Strict-FP Build and Link Contract
 
-`g1_clearance.cpp` and the ordered-lift implementation are non-inline and compiled separately. The release caller may retain `-ffast-math`; the kernel may not.
+`g1_clearance.cpp`, including the sole-command materializer, is non-inline and compiled separately. The release controller and staged IK caller may retain `-ffast-math`; the kernel may not. The immutable ladder is reconstructed only by the existing `memcpy`-based bit helper, never arithmetic or type-punning, and all lift addition occurs inside the strict helper.
 
 ### Strict unit test
 
@@ -786,6 +817,8 @@ g++ /tmp/test_g1_clearance_release.o \
 ```
 
 The final link command intentionally has no `-ffast-math`. Preserve that separation in build scripts: fast math is a compile-only caller flag, because some GCC-family drivers link a startup object that enables FTZ/DAZ when the flag reaches the link step. The release executable's first clearance test records MXCSR where available and runs the portable gradual-underflow probe before comparing parity output.
+
+Separate-object runtime tests compile `tests/cpp/test_g1_ik.cpp` with `-DG1_IK_ENABLE_TEST_SEAMS`, compile `g1_clearance.cpp` with the same strict kernel flags above, and link the two objects with a strict link driver. Repeat with a fast-math test caller. The macro exposes only the diagnostic wrapper in Section 9; the production controller build omits it, and a negative compile that names the wrapper without the macro must fail. Tests never include `g1_clearance.cpp` directly or inspect private endpoint/solver types.
 
 ### Sanitizer caller and kernel
 
@@ -876,31 +909,32 @@ Require the interval to contain the corresponding analytic value. A bilinear sur
 - v1, wrong shape, null storage, and an invalid selected height return `InvalidField`.
 - Two fields differing only in exterior height produce bit-identical in-domain results and identical outside statuses.
 
-### E. Continuous swept lift
+### E. Actual staged swing ladder
 
-Reuse the near-`sqrt(3)` exactly coplanar fixture. Construct previous/current binary32 center Ys near clearances `+0.005 m` and `-0.001 m` at the same XZ. With binary32 planted/swing targets near `0.005` and `0.015`, compute the required materialized endpoint threshold from promoted input bits, then derive the oracle as the smallest ordered binary32 `L` whose strict `canonical_rn32(B.y+L)` reaches that endpoint; require the oracle key's value to be within `2e-6` of `0.016 m`. Require:
+Reuse the near-`sqrt(3)` exactly coplanar terrain, but do not construct a lifted-sphere oracle. For the strict-kernel test, pass named prior and **actual current** four-sphere center bits directly to `g1_swing_clearance_validate`; compare the target-subtracted sweep with a high-precision oracle based on those endpoint bits. Repeat with only one sphere obstructed and require the public witness primitive index to identify it.
 
-- returned lift at least that materialized-endpoint oracle key;
-- corrected lower margin nonnegative;
-- predecessor float not certified;
-- the old approximate `0.010641016 m` lift rejected.
+For the controller integration fixture, use `G1_IK_ENABLE_TEST_SEAMS` to run the real staging function for indices `0..40` from the same immutable input. Require at least one finite rejection before a pass, record the first candidate whose controller constraints and actual-center lower margin pass, then run the full selector and require:
 
-Repeat with only one of four spheres obstructed and require provenance for that sphere.
+- indices were attempted contiguously from zero through the selected index;
+- `candidates_evaluated == selected_index+1`;
+- selected lift bits, all twelve actual sphere-center bits, binary64 margins, and work match that probed stage, while materialized command-Y bits also match an independent public-helper call on the fixture's actual unlifted desired sole Y and selected lift bits;
+- rebuilding the four `vec3` values from the diagnostic endpoint bits and calling the separate strict validation API reproduces the selected clearance status and margin bits;
+- final output rotations produce those same sphere-center bits without another IK call;
+- the mandatory fresh `L=+0` defensive validation passes.
 
-Add a materialized-endpoint/adjusted-downcast trap on a flat field. Use current center Y `B=0x3d0f5c28`, lift key `L=0x31000001`, `W=0x3c75c28f` (`0.015f`), `r=0x3ca3d70a` (`0.02f`), and every terrain height `h=0x30000000` (`2^-31`). Make the prior adjusted endpoint safely higher so the current endpoint controls. The strict helper must produce:
+Use a valid wall fixture for which all 41 real stages finitely reject. Require exact order through index 40, `G1SwingNoCandidate`, safe-stop, and bit-identical accepted rotations, state, histories, support, matcher, and simulation values. This fixture makes no claim about a continuous lift above or between ladder entries.
+
+Keep the prior rounding trap as two explicitly separate public regressions. First, call the actual sole-command helper with input-Y bits `B=0x3d0f5c28` and non-ladder test lift `L=0x31000001`; require materialized command bits `0x3d0f5c29`, while `L=0x31000000` materializes back to `B`. This proves command rounding only and is not a selection oracle. Second, feed actual current sphere-center Y bits `C=0x3d0f5c29`, `W=0x3c75c28f`, `r=0x3ca3d70a`, and flat terrain `h=0x30000000` directly to actual-center validation. Make the prior endpoint safely higher and require the exact endpoint margin:
 
 ```text
-B_lifted = canonical_rn32(double(B) + double(L))
-         = 0x3d0f5c29
-
-double(B_lifted) - double(W) - double(r) - double(h)
+double(C) - double(W) - double(r) - double(h)
          = +4.656612873077392578125e-10
 
-double(float(B_lifted - W)) - double(r) - double(h)
+double(float(C - W)) - double(r) - double(h)
          = -4.656612873077392578125e-10
 ```
 
-The predecessor key `0x31000000` materializes back to `B` and remains negative. Require the fixture's computed full mandatory terrain guard to be strictly smaller than the positive `2^-31` margin at `0x31000001`; subject to that conservative guard, the certified ordered search must select exactly `0x31000001`, its predecessor must not certify, and `g1_apply_swing_lift_y` must return materialized bits `0x3d0f5c29`. Assert the original-B bits in the stable source key, the separate lift/materialized-Y provenance fields, and the exact positive/forbidden-negative margins. A surrogate exact-real `B+L` planner, a float-adjusted `B_lifted-W`, or an independently spelled controller addition must fail this RED.
+Require the fixture's complete terrain/output guard to remain below the positive margin and the public validation lower bound to stay nonnegative. No test reads private `G1CertifiedEndpoint`, source-key, expansion, or solver fields. The paired tests fail an independently rounded controller addition or a binary32 adjusted target subtraction without pretending that the command-Y bits predict post-IK sphere-center bits.
 
 ### F. Rank and projection degeneracies
 
@@ -921,12 +955,13 @@ Exercise `A==B`, segment parallel to terrain, segment in the terrain plane, vert
 
 - `1.0f/25.0f` succeeds.
 - Both adjacent `nextafter` values fail transactionally.
-- Keep the configuration maximum at exact `0.08f`. Construct materialized-endpoint thresholds immediately below/at the cap and require success, then one ordered float above the cap and require the assigned cap-failure safe-stop plan even though the deficit is below `1e-6`.
-- Exactly `0.08f` is evaluated; no `+1e-6` acceptance hole is allowed.
+- Independently derive `RN32(i/500)` for all 41 indices: assert index 0 is exact positive zero; for indices `1..40`, decode each table value and its adjacent binary32 values as integer-mantissa/power-of-two rationals, cross-multiply their distances to `i/500` with checked `uint64_t`, and apply ties-to-even. Require the checked-in table to match bit-for-bit, increase strictly in index order, and end at exact `0x3da3d70a` (`0.08f`).
+- Require the validated configuration maximum bits to equal entry 40. Reject an out-of-range index transactionally. The production selector evaluates no unlisted float and always includes index 40 before declaring all-fail; there is no `+1e-6` cap hole or hidden candidate 41.
 
 ### I. Build and parity
 
 - Construct parity inputs from named `uint32_t` float bits rather than fast-math-compiled decimal/square-root expressions. The strict and fast-math-caller executables emit a compact line containing status, bound bits, witness bits/key, and all work counters; compare the lines byte-for-byte.
+- For runtime ladder tests, require deterministic candidate order and repeated-run diagnostics within each build. Strict and release controller math may produce different actual IK endpoint bits; each build must expose and certify its own endpoints, while identical endpoint-bit inputs to the strict kernel remain byte-identical across callers.
 - A direct `-ffast-math -c g1_clearance.cpp` command must fail and mention the certified-kernel guard.
 - Strict, release-caller, ASan/UBSan, and repeated-run hashes all pass.
 
@@ -935,6 +970,7 @@ Exercise `A==B`, segment parallel to terrain, segment in the terrain plane, vert
 - Seed the lift helper's scalar output and every geometry/swing status output plus surrounding history with distinct bits. Under an RAII guard that snapshots `fegetround`, set `FE_UPWARD` and `FE_DOWNWARD` in turn; table-drive every public `G1ClearanceStatus` entry and require `ArithmeticFailure`, no ledger/field access, and no output/history mutation. Restore the original mode before ordinary numeric assertions and prove one subsequent valid call succeeds.
 - On x86/SSE, use a second RAII guard that snapshots the exact MXCSR word. Set FTZ bit 15, DAZ bit 6, and both bits in separate cases; require the same transactional `ArithmeticFailure` from a geometry call and a swing call. Restore the original MXCSR word on every scope exit, including failed checks, and verify it bit-for-bit before continuing. Other targets skip only direct MXCSR mutation, never the portable baseline probe.
 - Exercise the portable volatile multiply/add probes in the normal environment and require their four expected subnormal bit encodings. Tests must never leave the process rounding mode or denormal mode changed for later parity executables.
+- With the normal gradual-underflow environment, pass `input_y=+0.0f` and positive `lift_m=denorm_min` to `g1_apply_swing_lift_y`; require transactional `ArithmeticFailure` because the materialized command is a forbidden nonzero subnormal. Separately require the `0x31000001` normal-result command fixture from E to succeed. Positive subnormal input is preserved during evaluation, not promised to yield a valid command.
 
 ### K. Mandatory float-output guard
 
@@ -958,7 +994,7 @@ Exercise `A==B`, segment parallel to terrain, segment in the terrain plane, vert
 - Produces the exact enums, structs, constants, and declarations from Section 3.
 - Produces a strict-TU compile guard and stub status-name helper.
 
-- [ ] Write compile-time tests for enum values, binary64 bound types, exact factory constants, endpoint provenance fields, the `g1_apply_swing_lift_y` signature, `has_denorm==denorm_present` for both types, and non-copying const-history signatures.
+- [ ] Write compile-time tests for enum values, binary64 bound types, exact factory constants, the `g1_apply_swing_lift_y` signature, `has_denorm==denorm_present` for both types, and non-copying const-history signatures.
 - [ ] Compile the test before creating the files; require a missing-header RED.
 - [ ] Add RED fixture J for `FE_UPWARD`, `FE_DOWNWARD`, FTZ, DAZ, portable denormal bits, environment restoration, and transactional outputs.
 - [ ] Add over-factory and `UINT32_MAX` REDs for every pose/swing budget field.
@@ -999,9 +1035,9 @@ Exercise `A==B`, segment parallel to terrain, segment in the terrain plane, vert
 **Interfaces:**
 - Produces strict interval operations, `G1ExactY`/`G1CertifiedEndpoint`, projected face coefficients, interior stationary solver, disk-clipped 3D edge solver, feasible witness reconstruction, and stable source/candidate keys.
 
-- [ ] Add RED tests for exact Y expansions, public endpoint reversal, source-key order, analytic face interior, each edge clamp branch, circle tangency, vertical projection, membership uncertainty, and witness feasibility.
+- [ ] Add RED tests for public exact-Y behavior, endpoint reversal, analytic face interior, each edge clamp branch, circle tangency, vertical projection, membership uncertainty, witness feasibility, and stable public witness keys. Do not reach into private endpoint/source records from the separately compiled test.
 - [ ] Implement outward interval primitives with nonfinite/zero-denominator rejection.
-- [ ] Implement `TwoSum`/`TwoDiff` expansion canonicalization, endpoint wrappers, and source-key ordering with original/lift/materialized bit provenance and no adjusted-Y downcasts.
+- [ ] Implement `TwoSum`/`TwoDiff` expansion canonicalization, endpoint wrappers, and source-key ordering from canonical actual endpoint bits with no adjusted-Y downcasts.
 - [ ] Implement face stationary formulas and interval barycentric classification.
 - [ ] Implement the edge formulas and vertical-edge case.
 - [ ] Implement lower/witness aggregation with the Section 3 key order.
@@ -1040,7 +1076,7 @@ Exercise `A==B`, segment parallel to terrain, segment in the terrain plane, vert
 **Interfaces:**
 - Produces four-sphere foot clearance and binary64 `G1LegClearance`/`G1PoseClearance` diagnostics.
 
-- [ ] Add RED tests for one-worst-sphere provenance, both legs, every diagnostic member, tightened shared-pair exhaustion, over-factory/`UINT32_MAX` rejection, and transactional pose failure.
+- [ ] Add RED tests for the one-worst-sphere public witness primitive index, both legs, every diagnostic member, tightened shared-pair exhaustion, over-factory/`UINT32_MAX` rejection, and transactional pose failure.
 - [ ] Aggregate lower and witness values independently as specified.
 - [ ] Thread one checked budget through every point/sphere/capsule primitive.
 - [ ] Preserve exact G1 local geometry and Y-up world transforms from `g1_ik.h`.
@@ -1049,7 +1085,7 @@ Exercise `A==B`, segment parallel to terrain, segment in the terrain plane, vert
 
 **Review gate:** Every logged threshold source must be a binary64 lower bound, no caller limit may exceed the family factory, and a late right-leg error must leave the entire caller output unchanged.
 
-### Task 6: Add continuous swept-foot lift planning
+### Task 6: Add actual-center swept-foot certification
 
 **Files:**
 - Modify: `g1_clearance.h`
@@ -1057,20 +1093,19 @@ Exercise `A==B`, segment parallel to terrain, segment in the terrain plane, vert
 - Modify: `tests/cpp/test_g1_clearance.cpp`
 
 **Interfaces:**
-- Produces checked swing history, four-capsule sweep, ordered-float endpoint lift, and actual post-solve validation.
+- Produces checked swing history, strict sole-command materialization, four-capsule validation of actual world-space endpoints, and defensive `L=+0` revalidation.
 
-- [ ] Add RED fixtures E (including the exact `0x31000001` materialization/adjusted-downcast trap), G, H, contact-shortcut validation, failed reset/commit, and rejected-history snapshots.
-- [ ] Cache bounded XZ terrain pairs once per four-sphere plan.
-- [ ] Implement the private strict one-round lift materializer and transactional `g1_apply_swing_lift_y`; build current `G1CertifiedEndpoint` Y as `TwoDiff(materialized_y,W)`, never call the public `vec3` capsule wrapper, and never round the adjusted difference.
+- [ ] Add the strict-kernel portions of RED fixture E, including the separate `0x31000001` command-materialization and actual-endpoint adjusted-downcast traps, plus G, exact-dt/contact-shortcut validation, failed reset/commit, subnormal-command rejection, and rejected-history snapshots.
+- [ ] Implement transactional `g1_apply_swing_lift_y` as the one strict round of the actual sole command; document and test that a positive subnormal lift input can still yield rejected non-runtime output.
+- [ ] Build prior/current `G1CertifiedEndpoint` Y only as `TwoDiff(actual_y,target_y)`, never call the public `vec3` capsule wrapper internally, and never round the adjusted difference.
 - [ ] Implement exact-dt validation before contact branching.
-- [ ] Implement the 0/max/ordered-bit lift search and predecessor verification.
-- [ ] Implement post-solve validation with actual final centers.
+- [ ] Implement `g1_swing_clearance_validate` for four actual final centers with a fresh one-sweep budget and no lift argument or prediction.
 - [ ] Run all focused modes and compare strict/release result lines byte-for-byte.
-- [ ] Commit with `feat: plan certified G1 swing clearance`.
+- [ ] Commit with `feat: certify actual G1 swing endpoints`.
 
-**Review gate:** The wall/cap rejection must leave history exact, the sqrt(3) fixture must require approximately `0.016 m`, and the named near-threshold fixture must materialize `0x3d0f5c29` and select lift key `0x31000001`; a surrogate exact `B+L`, float-adjusted endpoint, or independently rounded controller application is an automatic rejection.
+**Review gate:** Tests observe only public results. The command helper must materialize `0x3d0f5c29` for the named non-ladder input, actual endpoint subtraction must retain the positive exact margin, and no strict-kernel API may accept a lift key as a proxy for post-IK sphere endpoints.
 
-### Task 7: Integrate separate-object builds and downstream status handling
+### Task 7: Stage and select actual controller candidates
 
 **Files:**
 - Modify later: `g1_ik_runtime.h`
@@ -1080,18 +1115,23 @@ Exercise `A==B`, segment parallel to terrain, segment in the terrain plane, vert
 - Test: `tests/cpp/test_g1_clearance.cpp`
 
 **Interfaces:**
-- Consumes all prior Task 5 APIs.
-- Produces controller rejection/cleanup behavior without changing matching, support, or accepted history ownership.
+- Consumes Task 6's strict materializer, actual-center validator, and history APIs.
+- Produces the immutable 41-entry ladder, diagnostic-only test seam, first-passing staged pose selection, defensive recheck, and controller rejection/cleanup without changing matching, support, or accepted history ownership.
 
-- [ ] Add integration RED tests for every status mapping and accepted/rejected snapshots.
+- [ ] Add integration RED tests for the exact 41-entry bit table/endpoints/order, out-of-range index, materialized command bits, actual sphere endpoint bits, every status mapping, and accepted/rejected snapshots.
+- [ ] Under `G1_IK_ENABLE_TEST_SEAMS`, probe every real staged candidate in a shallow-obstacle fixture; require the full selector to choose the first passing probe with identical diagnostic bits and `candidates_evaluated=selected_index+1`.
+- [ ] Add an all-41-fail wall fixture requiring `G1SwingNoCandidate`, safe-stop, and bit-identical accepted pose/state/history. Require selected output rotations and endpoint bits to equal the probed first-passing stage; inspect the call graph to prove selected IK is not rerun.
 - [ ] Replace header-only calls with the public non-inline API.
-- [ ] Apply `plan.applied_lift_m` to the scratch sole-target Y only through `g1_apply_swing_lift_y`; compare the helper's materialized bits with the planner fixture and never spell `target_y + lift` in the fast-math caller.
+- [ ] Implement the one private production function `g1_ik_stage_swing_candidate`: copy the same scratch input, bit-load the indexed lift, call `g1_apply_swing_lift_y` on the actual desired sole target, run the existing bounded IK/orientation/FK path, record actual endpoint bits, and validate those endpoints. The test seam must forward to this function rather than reproduce it.
+- [ ] Iterate indices `0..40`, move the first passing staged pose into outer scratch without rerunning IK, and never spell `target_y + lift` in the fast-math caller. Do not use binary search, predecessor inference, or a continuous required-lift field.
+- [ ] After both feet compose, require stored/final endpoint-bit equality and rerun the mandatory fresh actual-center `L=+0` certificate before any accepted commit.
+- [ ] Add selected-index/lift/command/endpoint diagnostics to `G1FootFrameResult`; update later logs/checkers to consume those fields instead of treating a continuous lift requirement as measured evidence.
 - [ ] Update strict, release, sanitizer, and controller link commands exactly as Section 11.
 - [ ] Add the negative fast-math-kernel build guard and arithmetic-environment matrix to verification; link without a fast-math startup object.
 - [ ] Run the complete verification matrix below.
 - [ ] Commit only integration-owned files with `build: link certified G1 clearance kernel`.
 
-**Review gate:** Inspect the final link command, object flags, and entry MXCSR/environment evidence from build logs. Passing numerical tests does not compensate for fast kernel flags or inherited FTZ/DAZ.
+**Review gate:** Inspect the staged-function call graph, selected-pose move, final endpoint-bit check, link command, object flags, and entry MXCSR/environment evidence. A predicted `sphere_y+lift`, private-field test assertion, rerun-to-apply path, noncontiguous ladder visit, fast kernel flag, or inherited FTZ/DAZ is an automatic rejection.
 
 ---
 
@@ -1102,14 +1142,15 @@ Run after each relevant task and in full after Task 7:
 | Mode | Caller flags | Kernel flags | Required evidence |
 |---|---|---|---|
 | Strict | `-O2 -Wall -Wextra -Werror -pedantic` | same plus `-fno-fast-math -ffp-contract=off -frounding-math` | Exit 0, no warnings; nearest/gradual probes pass |
-| Release caller | `-O3 -ffast-math -DNDEBUG` | `-O3 -fno-fast-math -ffp-contract=off -frounding-math -DNDEBUG` | Strict link driver; entry MXCSR gradual; result line byte-equal to strict |
+| Release caller | `-O3 -ffast-math -DNDEBUG` | `-O3 -fno-fast-math -ffp-contract=off -frounding-math -DNDEBUG` | Strict link driver; entry MXCSR gradual; identical endpoint-bit kernel fixtures byte-equal to strict |
 | Sanitizer | `-O1 -g`, ASan/UBSan with halt-on-error | strict FP plus same sanitizers | Exit 0, no report |
 | Negative build | any | `-ffast-math` | Compile fails at `__FAST_MATH__` guard |
 | FP environment | strict and release objects | strict kernel | `FE_UPWARD`, `FE_DOWNWARD`, FTZ, and DAZ each return transactional `ArithmeticFailure`; RAII restores exact environment |
-| Determinism | repeat release caller 20 times | strict kernel | Identical status/bound/witness/work hash |
-| Transaction | strict and release | strict kernel | Seeded outputs/history exact after all non-`Ok` paths |
+| Determinism | repeat each controller build 20 times | strict kernel | Identical per-build ladder order, selected diagnostic, status/bound/witness/work hash |
+| Transaction | strict and release | strict kernel | Seeded accepted pose/state/history exact after each rejected stage, all-41 fail, and all non-`Ok` paths |
 | Budget | strict and sanitizer | strict kernel | Exact/tightened limits accepted; every factory+1 and `UINT32_MAX` field is transactional `InvalidInput` before work |
-| Endpoint precision | strict and release | strict kernel | `L=0x31000001` materializes Y `0x3d0f5c29`, exact adjusted margin is positive while float-adjusted is negative, search selects that key, and source/reversal keys match |
+| Endpoint precision | strict and release | strict kernel | Non-ladder `L=0x31000001` materializes command Y `0x3d0f5c29`; separately supplied actual endpoint Y has positive exact adjusted margin while float-adjusted is negative; public reversal output matches |
+| Staged ladder | strict and release controller builds | strict kernel | All 41 exact bits/order pass; selector equals first real staged pass; selected command/endpoint bits match; all-fail rolls back and safe-stops |
 | Output rounding | strict and sanitizer | strict kernel | Upward, zero/subnormal, and binade probes obey producer-height lower inequality; guard `>1e-6` is unchanged-output `Uncertified` |
 | Spacing ridge | strict and release | strict kernel | Local removed lattice `>+0.00019`; certified tent witness `<-0.00079` |
 | Geometry | all successful modes | strict kernel | Analytic oracle enclosed; width `<=1e-6` |
@@ -1119,12 +1160,16 @@ Final source/order guards:
 ```bash
 ! rg -n 'ceil\(|radial_steps|segment_steps|half.*cell.*sample' \
   g1_clearance.cpp g1_clearance.h
-rg -n '#error.*fast math|has_denorm|_mm_getcsr|G1CertifiedEndpoint|materialized_y_bits|g1_apply_swing_lift_y|TwoDiff|G1ClearancePatchesPerPair|G1ClearanceMaximumLiftEvaluations' \
+rg -n '#error.*fast math|has_denorm|_mm_getcsr|G1CertifiedEndpoint|g1_apply_swing_lift_y|TwoDiff|G1ClearancePatchesPerPair' \
   g1_clearance.cpp g1_clearance.h
+rg -n 'G1SwingLiftCandidateBits|G1SwingCandidateDiagnostic|actual_sphere_center_bits|g1_ik_stage_swing_candidate_for_test' \
+  g1_ik_runtime.h tests/cpp/test_g1_ik.cpp
+! rg -n 'ordered.*lift|sphere.*\+.*lift|required_lift_m' \
+  g1_clearance.cpp g1_clearance.h g1_ik_runtime.h
 git diff --check
 ```
 
-Expected: no production lattice sample-count code exists, strict-FP/gradual-underflow, exact-endpoint, mandatory-output-guard, and absolute-budget guards are present, every test mode exits zero, parity lines match byte-for-byte, every environment mutation is restored, and the worktree is clean after task-scoped commits.
+Expected: no production lattice sample-count or predictive-lift code exists; strict-FP/gradual-underflow, actual-endpoint, mandatory-output-guard, immutable-ladder, and absolute-budget guards are present; every test mode exits zero; identical endpoint-bit kernel parity lines match byte-for-byte; every environment mutation is restored; and the worktree is clean after task-scoped commits.
 
 ---
 
@@ -1132,9 +1177,11 @@ Expected: no production lattice sample-count code exists, strict-FP/gradual-unde
 
 Read-only reconciliation against integrated Task 2 commit `6287a0e` locks these producer names: `G1SurfaceQueryStatus`, `g1_surface_query_v2`, `g1_ik_vec3_is_runtime_value`, `g1_ik_dt_is_exact_25_hz`, and `g1_foot_runtime_config_validate`. This design consumes those names directly and preserves their fail-closed `Valid`/`Outside`/`Invalid` distinction; it does not add an adapter that restores exterior fallback or tolerant `25 Hz` checks. The active terrain-IK plan remains untouched on this branch. At implementation start, confirm that later integration has not renamed these producers before changing either plan.
 
+The same read-only review marks the active plan's pre-IK predictive swing-planner call, direct desired-sole-Y lift increment, and continuous-required-lift checker assertions as superseded contracts. When the approved replacement is applied, remove those snippets and migrate logs/checkers to the selected ladder diagnostic; do not adapt the direct addition or preserve it beside the staged path. Until that replacement gate, the protected active plan remains unchanged.
+
 Before replacing active Task 5, require two approvals:
 
 1. **Geometry review:** prism proof, eight-patch construction, analytic stationary/edge formulas, degeneracy fallback, and sqrt(3) RED are accepted.
-2. **Runtime review:** separate strict-FP object with nearest/gradual environment checks, exact internal endpoints, absolute budget ceilings, mandatory output guards, status mapping, accepted-only history commit, and controller build implications are accepted.
+2. **Runtime review:** separate strict-FP object with nearest/gradual environment checks, finite staged controller ladder, actual FK endpoint diagnostics/certificates, absolute budget ceilings, mandatory output guards, status mapping, selected-stage reuse, accepted-only history commit, and controller build implications are accepted.
 
 Only then replace the sampled Task 5 text and update all downstream one-command build invocations.
