@@ -267,6 +267,18 @@ class InteractionPhaseTests(unittest.TestCase):
 
         self.assert_validation_code("no_stable_hold", clip)
 
+    def test_rejects_hold_that_starts_at_lift_threshold(self):
+        clip = canonical_pickup_fixture()
+        clip.object_positions[38:, 1] = 0.75 + 0.002 * np.arange(
+            len(clip.object_positions) - 38
+        )
+        clip.object_velocities = finite_difference_vectors(
+            clip.object_positions, clip.fps
+        )
+        follow_object_with_active_hand(clip)
+
+        self.assert_validation_code("no_distinct_lift_phase", clip)
+
     def test_rejects_near_zero_horizontal_approach(self):
         clip = canonical_pickup_fixture()
         clip.hand_positions[13, 1] = clip.hand_positions[38, 1]

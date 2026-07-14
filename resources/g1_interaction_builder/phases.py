@@ -141,6 +141,10 @@ def derive_interaction_labels(
             else "no_stable_hold"
         )
         raise InteractionValidationError(code, clip.sequence_id)
+    if hold_frame == lift_frame:
+        raise InteractionValidationError(
+            "no_distinct_lift_phase", clip.sequence_id
+        )
     if not np.all(
         active_contact[contact_frame:hold_frame + hold_samples]
     ):

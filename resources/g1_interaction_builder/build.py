@@ -85,6 +85,7 @@ _SCHEMA_V1_REJECTION_CODES_BY_ERROR = {
             "contact_lost_before_hold",
             "invalid_approach",
             "invalid_grasp",
+            "no_distinct_lift_phase",
             "no_five_centimeter_lift",
             "no_stable_contact",
             "no_stable_hold",

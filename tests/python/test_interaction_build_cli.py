@@ -85,6 +85,7 @@ KNOWN_REJECTION_CODES_BY_STAGE = {
         "invalid_approach",
         "invalid_grasp",
         "no_five_centimeter_lift",
+        "no_distinct_lift_phase",
         "no_stable_contact",
         "no_stable_hold",
     },
