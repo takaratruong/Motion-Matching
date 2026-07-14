@@ -2382,9 +2382,24 @@ correction, and drift fixtures. Add these migrations:
   match on a non-rejected certified row, while a rejected row preserves the
   last-safe accepted values.
 
-Keep duplicate/missing columns, row-count/frame alignment, raw-string invariance,
-unit/upward normals, reachability, continuation-cost, and strict planted-drift
-reduction REDs.
+Add explicit REDs for duplicate/missing columns, row-count/frame alignment,
+raw-string invariance, unit/upward normals, reachability, and
+continuation-cost. Restore the route-level acceptance REDs as well:
+
+- mutate either member of a pair so any row has a scene or route other than the
+  exact requested value;
+- remove every certified `route_complete=1` row, introduce a blocked or
+  safe-stop terminal tail, provide only nine planted samples, and make
+  corrected planted drift equal to or greater than baseline drift;
+- try an unlisted stress scene/route and mutate either member's scene/route;
+- label a stress traversal despite one stop request or without a
+  `route_complete=1` row;
+- require a class-2 traversal with equal/worse planted drift to remain accepted,
+  proving that branch's intentional drift exemption; and
+- set the first stress safe-stop request row's `ik_candidate_rejected` to `0`.
+
+Run the full- and exact-legacy-baseline variants wherever the baseline schema
+changes which columns supply a predicate.
 
 - [ ] **Step 2: Run the focused checker RED**
 
@@ -2775,8 +2790,69 @@ For every certified Gate E row require:
 - candidate `Ok` lower bounds equal the accepted lower bounds on a committed
   row;
 - locked toe/foot lower bounds at least `-0.005` and every accepted
-  Hips/knee/ankle/toe/foot/thigh/shin/minimum lower bound at least `-0.01`;
-- strictly lower aggregate planted horizontal drift with IK on.
+  Hips/knee/ankle/toe/foot/thigh/shin/minimum lower bound at least `-0.01`.
+
+`check_gate_e_pair` applies these pair-level predicates after baseline-schema
+dispatch:
+
+1. Require every baseline row to be IK-off and every primary row to be IK-on.
+   Require every row in **both** inputs to have
+   `scene_id == expected_scene` and `route == expected_route`; checking only a
+   first row or the set of values is insufficient.
+2. Run `check_gate_e_rows(on_rows)` and compare all base invariants for either
+   schema. For a full baseline, also compare all observation invariants over the
+   full pair. For an exact legacy baseline, omit only comparisons for columns
+   that do not exist in the locked prefix.
+3. Require at least one `route_complete == "1"` row and forbid a terminal
+   blocked or safe-stop tail. `check_gate_e_rows` additionally keeps the
+   pre-migration certified rule that no primary row may have
+   `ik_safe_stop_requested == "1"`, a stop reason other than `none`, or
+   `ik_candidate_rejected == "1"`.
+4. Collect planted samples for each side only where that primary row's exact
+   `*_locked` value is `"1"`. A full baseline uses the paired baseline and
+   primary `*_lock_drift` values, exactly as the pre-migration Gate E contract.
+   An exact legacy baseline has no IK suffix, so its semantically identical
+   baseline value is the primary row's immutable pre-solve
+   `*_observed_lock_drift`, while the corrected value remains that row's
+   `*_lock_drift`. Require at least ten planted samples total before computing
+   either mean, then require `mean(on_drift) < mean(off_drift)` with no rounding
+   tolerance. This legacy adapter preserves the same support-retargeted
+   baseline-versus-corrected measurement; it does not waive drift reduction.
+
+On success print `VALID gate-e` followed by the exact scene ID, route ID,
+planted count, off mean, and on mean as named `key=value` fields.
+
+Define the stress allowlist exactly:
+
+```python
+GATE_E_STRESS_ROUTES = {
+    ("grail-curb-default", "curb-forward"),
+    ("grail-curb-medium", "curb-forward"),
+    ("grail-curb-high", "curb-forward"),
+    ("ramp-15-stress", "up-landing-down"),
+}
+```
+
+`check_gate_e_stress_pair` rejects unless
+`(expected_scene, expected_route)` is in that set and every row in both inputs
+has exactly those requested values. Both branches require finite validated
+rows, an IK-off baseline, an IK-on primary, and the schema-dependent raw
+comparison already defined above: full baselines compare base plus observation
+groups, while exact legacy baselines compare the shared base group only.
+
+It accepts exactly one of these branches:
+
+1. **Traverse:** no primary row requests an IK stop and at least one primary
+   row has `route_complete == "1"`. Run `check_gate_e_rows(on_rows)` and compare
+   the complete pair. Do **not** impose certified-route aggregate planted-drift
+   reduction on a class-2 traversal; bounded binary64 clearance, residual,
+   orientation, correction, status, and ladder/mask behavior remain mandatory.
+2. **Safe stop:** locate the first primary row with
+   `ik_safe_stop_requested == "1"`. It must precede the first route-complete
+   row if the open-loop driver later emits one, and that exact request row must
+   have `ik_candidate_rejected == "1"`. Compare only the inclusive prefix
+   through that row, then apply the reason/status/mask evidence and stopped-tail
+   predicates below. Divergence after the request remains intentional.
 
 The stress safe-stop evidence for `swing-lift` is no longer “required lift above
 0.08” or a predicted margin. It is exact all-ladder exhaustion on at least one
@@ -2809,6 +2885,10 @@ the ordinary `-0.01` physical lower bounds and locked `-0.005` toe/foot lower
 bounds. Candidate-local `OutsideDomain`/`BudgetExceeded`/`Uncertified` remain
 named evidence; global statuses are controlled errors, not a Gate E safe-stop
 success. A later open-loop `route_complete=1` is allowed.
+
+On success print `VALID gate-e-stress` with `branch=traverse` or
+`branch=safe-stop`, the exact scene/route, and the stop frame/reason plus named
+clearance, speed, displacement, and support-rise measurements when applicable.
 
 Print/check binary64 values from their raw CSV text; never round them to a
 binary32 surrogate before threshold comparison.
