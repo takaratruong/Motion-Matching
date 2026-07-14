@@ -10,6 +10,7 @@
 #endif
 
 #include "g1_skeleton.h"
+#include "ik.h"
 #include "terrain_runtime.h"
 
 #include <cstdarg>
@@ -1317,5 +1318,535 @@ static inline bool g1_foot_lock_update(
     }
     state = next;
     output = candidate;
+    return true;
+}
+
+struct G1LegSolveResult
+{
+    bool applied = false;
+    bool reachable = false;
+    bool correction_limited = false;
+    bool safe_stop_requested = false;
+    int iterations = 0;
+    vec3 requested_ankle_target;
+    vec3 clamped_ankle_target;
+    vec3 hinge_axis_world;
+    vec3 bend_direction;
+    bool bend_used_current_projection = false;
+    bool bend_used_hinge_fallback = false;
+    bool bend_used_safe_perpendicular = false;
+    bool bend_sign_flipped = false;
+    float raw_distance_m = 0.0f;
+    float clamped_distance_m = 0.0f;
+    float max_correction_radians = 0.0f;
+    float contact_residual_m = FLT_MAX;
+};
+
+static inline bool g1_ik_memory_ranges_overlap(
+    const void* left,
+    size_t left_bytes,
+    const void* right,
+    size_t right_bytes)
+{
+    if (left == NULL || right == NULL ||
+        left_bytes == 0 || right_bytes == 0) {
+        return false;
+    }
+    const uintptr_t left_begin = reinterpret_cast<uintptr_t>(left);
+    const uintptr_t right_begin = reinterpret_cast<uintptr_t>(right);
+    if (left_begin > UINTPTR_MAX - left_bytes ||
+        right_begin > UINTPTR_MAX - right_bytes) {
+        return true;
+    }
+    const uintptr_t left_end = left_begin + left_bytes;
+    const uintptr_t right_end = right_begin + right_bytes;
+    return left_begin < right_end && right_begin < left_end;
+}
+
+static inline bool g1_ik_parent_topology_validate(
+    const slice1d<int> parents,
+    char* error,
+    int error_capacity)
+{
+    static const int expected[G1_BoneCount] = {
+        -1, 0, 1, 2, 3, 4, 5, 6, 1, 8, 9, 10, 11, 12, 1, 14,
+        15, 16, 17, 18, 19, 20, 21, 22, 16, 24, 25, 26, 27, 28, 29
+    };
+    if (parents.size != G1_BoneCount || parents.data == NULL) {
+        return g1_ik_error(
+            error, error_capacity,
+            "G1 named IK requires exactly 31 non-null parents");
+    }
+    for (int bone = 0; bone < G1_BoneCount; ++bone) {
+        if (parents.data[bone] != expected[bone]) {
+            return g1_ik_error(
+                error, error_capacity,
+                "G1 named IK parent topology mismatch at bone %d",
+                bone);
+        }
+    }
+    return true;
+}
+
+static inline bool g1_ik_pose_inputs_validate(
+    const slice1d<quat> output_rotations,
+    const slice1d<vec3> local_positions,
+    const slice1d<quat> baseline_rotations,
+    const slice1d<int> parents,
+    const G1LegConfig& config,
+    char* error,
+    int error_capacity)
+{
+    if (output_rotations.size != G1_BoneCount ||
+        output_rotations.data == NULL ||
+        local_positions.size != G1_BoneCount ||
+        local_positions.data == NULL ||
+        baseline_rotations.size != G1_BoneCount ||
+        baseline_rotations.data == NULL) {
+        return g1_ik_error(
+            error, error_capacity,
+            "G1 named IK requires non-null exact 31-bone pose slices");
+    }
+    const size_t rotation_bytes =
+        static_cast<size_t>(G1_BoneCount) * sizeof(quat);
+    if (g1_ik_memory_ranges_overlap(
+            output_rotations.data, rotation_bytes,
+            baseline_rotations.data, rotation_bytes)) {
+        return g1_ik_error(
+            error, error_capacity,
+            "G1 named IK working and baseline rotations must not alias");
+    }
+    if (!g1_ik_parent_topology_validate(
+            parents, error, error_capacity) ||
+        !g1_foot_runtime_config_validate(
+            config, error, error_capacity)) {
+        return false;
+    }
+    for (int bone = 0; bone < G1_BoneCount; ++bone) {
+        if (!g1_ik_vec3_is_runtime_value(local_positions.data[bone])) {
+            return g1_ik_error(
+                error, error_capacity,
+                "G1 named IK local position is invalid at bone %d",
+                bone);
+        }
+        if (!ik_quat_is_unit(baseline_rotations.data[bone])) {
+            return g1_ik_error(
+                error, error_capacity,
+                "G1 named IK baseline quaternion is not finite/unit at bone %d",
+                bone);
+        }
+        if (!ik_quat_is_unit(output_rotations.data[bone])) {
+            return g1_ik_error(
+                error, error_capacity,
+                "G1 named IK working quaternion is not finite/unit at bone %d",
+                bone);
+        }
+    }
+    return true;
+}
+
+static inline bool g1_ik_checked_forward_kinematics(
+    const slice1d<vec3> output_positions,
+    const slice1d<quat> output_rotations,
+    const slice1d<vec3> local_positions,
+    const slice1d<quat> local_rotations,
+    const slice1d<int> parents,
+    char* error,
+    int error_capacity)
+{
+    if (output_positions.size != G1_BoneCount ||
+        output_positions.data == NULL ||
+        output_rotations.size != G1_BoneCount ||
+        output_rotations.data == NULL ||
+        local_positions.size != G1_BoneCount ||
+        local_positions.data == NULL ||
+        local_rotations.size != G1_BoneCount ||
+        local_rotations.data == NULL ||
+        !g1_ik_parent_topology_validate(
+            parents, error, error_capacity)) {
+        return g1_ik_error(
+            error, error_capacity,
+            "G1 checked FK requires complete non-null 31-bone slices");
+    }
+    const size_t position_bytes =
+        static_cast<size_t>(G1_BoneCount) * sizeof(vec3);
+    const size_t rotation_bytes =
+        static_cast<size_t>(G1_BoneCount) * sizeof(quat);
+    const size_t parent_bytes =
+        static_cast<size_t>(G1_BoneCount) * sizeof(int);
+    if (g1_ik_memory_ranges_overlap(
+            output_positions.data, position_bytes,
+            output_rotations.data, rotation_bytes)) {
+        return g1_ik_error(
+            error, error_capacity,
+            "G1 checked FK output ranges must not overlap");
+    }
+    if (g1_ik_memory_ranges_overlap(
+            output_positions.data, position_bytes,
+            local_positions.data, position_bytes) ||
+        g1_ik_memory_ranges_overlap(
+            output_positions.data, position_bytes,
+            local_rotations.data, rotation_bytes) ||
+        g1_ik_memory_ranges_overlap(
+            output_positions.data, position_bytes,
+            parents.data, parent_bytes) ||
+        g1_ik_memory_ranges_overlap(
+            output_rotations.data, rotation_bytes,
+            local_positions.data, position_bytes) ||
+        g1_ik_memory_ranges_overlap(
+            output_rotations.data, rotation_bytes,
+            local_rotations.data, rotation_bytes) ||
+        g1_ik_memory_ranges_overlap(
+            output_rotations.data, rotation_bytes,
+            parents.data, parent_bytes)) {
+        return g1_ik_error(
+            error, error_capacity,
+            "G1 checked FK outputs must not alias const inputs");
+    }
+    for (int bone = 0; bone < G1_BoneCount; ++bone) {
+        if (!g1_ik_vec3_is_runtime_value(local_positions.data[bone]) ||
+            !ik_quat_is_unit(local_rotations.data[bone])) {
+            return g1_ik_error(
+                error, error_capacity,
+                "G1 checked FK has invalid local pose at bone %d",
+                bone);
+        }
+    }
+
+    array1d<vec3> candidate_positions(G1_BoneCount);
+    array1d<quat> candidate_rotations(G1_BoneCount);
+    for (int bone = 0; bone < G1_BoneCount; ++bone) {
+        const int parent = parents.data[bone];
+        if (parent == -1) {
+            candidate_positions(bone) = local_positions.data[bone];
+            candidate_rotations(bone) = local_rotations.data[bone];
+        } else {
+            vec3 rotated_local;
+            if (!ik_checked_quat_rotate(
+                    rotated_local,
+                    candidate_rotations(parent),
+                    local_positions.data[bone]) ||
+                !ik_checked_vec3_add(
+                    candidate_positions(bone),
+                    candidate_positions(parent), rotated_local) ||
+                !ik_checked_quat_multiply(
+                    candidate_rotations(bone),
+                    candidate_rotations(parent),
+                    local_rotations.data[bone])) {
+                return g1_ik_error(
+                    error, error_capacity,
+                    "G1 checked FK overflowed at bone %d", bone);
+            }
+        }
+        if (!g1_ik_vec3_is_runtime_value(candidate_positions(bone)) ||
+            !ik_quat_is_unit(candidate_rotations(bone))) {
+            return g1_ik_error(
+                error, error_capacity,
+                "G1 checked FK produced invalid global at bone %d",
+                bone);
+        }
+    }
+    std::memcpy(
+        output_positions.data, candidate_positions.data,
+        position_bytes);
+    std::memcpy(
+        output_rotations.data, candidate_rotations.data,
+        rotation_bytes);
+    return true;
+}
+
+static inline bool g1_ik_leg_result_is_valid(
+    const G1LegSolveResult& result)
+{
+    return result.applied && result.iterations >= 1 &&
+           result.iterations <= 4 &&
+           g1_ik_vec3_is_runtime_value(result.requested_ankle_target) &&
+           g1_ik_vec3_is_runtime_value(result.clamped_ankle_target) &&
+           ik_vec3_is_unit(result.hinge_axis_world) &&
+           ik_vec3_is_unit(result.bend_direction) &&
+           g1_ik_float_is_runtime_value(result.raw_distance_m) &&
+           result.raw_distance_m >= 0.0f &&
+           g1_ik_float_is_runtime_value(result.clamped_distance_m) &&
+           result.clamped_distance_m >= 0.0f &&
+           g1_ik_float_is_runtime_value(result.max_correction_radians) &&
+           result.max_correction_radians >= 0.0f &&
+           g1_ik_float_is_runtime_value(result.contact_residual_m) &&
+           result.contact_residual_m >= 0.0f;
+}
+
+static inline bool g1_apply_named_position_ik(
+    slice1d<quat> output_rotations,
+    const slice1d<vec3> local_positions,
+    const slice1d<quat> baseline_rotations,
+    const slice1d<int> parents,
+    const G1LegConfig& config,
+    vec3 requested_ankle_target,
+    G1LegSolveResult& output,
+    char* error,
+    int error_capacity)
+{
+    if (!g1_ik_pose_inputs_validate(
+            output_rotations, local_positions,
+            baseline_rotations, parents, config,
+            error, error_capacity)) {
+        return false;
+    }
+    if (!g1_ik_vec3_is_runtime_value(requested_ankle_target)) {
+        return g1_ik_error(
+            error, error_capacity,
+            "G1 named leg IK target is invalid");
+    }
+
+    array1d<vec3> global_positions(G1_BoneCount);
+    array1d<quat> global_rotations(G1_BoneCount);
+    if (!g1_ik_checked_forward_kinematics(
+            global_positions, global_rotations,
+            local_positions, baseline_rotations, parents,
+            error, error_capacity)) {
+        return false;
+    }
+
+    const int hip_parent = parents.data[config.hip];
+    vec3 hinge_axis_world;
+    if (hip_parent < 0 || hip_parent >= G1_BoneCount ||
+        !ik_checked_quat_rotate(
+            hinge_axis_world,
+            global_rotations(config.knee),
+            config.knee_hinge_axis_local) ||
+        !ik_vec3_is_unit(hinge_axis_world)) {
+        return g1_ik_error(
+            error, error_capacity,
+            "G1 named leg IK could not map the knee hinge");
+    }
+
+    IKTwoBoneResult solve = {};
+    if (!ik_two_bone_bounded(
+            solve,
+            baseline_rotations(config.hip),
+            baseline_rotations(config.knee),
+            global_positions(config.hip),
+            global_positions(config.knee),
+            global_positions(config.ankle),
+            requested_ankle_target,
+            hinge_axis_world,
+            global_rotations(config.hip),
+            global_rotations(config.knee),
+            global_rotations(hip_parent),
+            config.reach_buffer_m,
+            config.max_correction_radians)) {
+        return g1_ik_error(
+            error, error_capacity,
+            "G1 named leg IK rejected checked two-bone math");
+    }
+
+    array1d<quat> candidate_pose(output_rotations);
+    candidate_pose(config.hip) = solve.root_local;
+    candidate_pose(config.knee) = solve.middle_local;
+    for (int bone = 0; bone < G1_BoneCount; ++bone) {
+        if (!ik_quat_is_unit(candidate_pose(bone))) {
+            return g1_ik_error(
+                error, error_capacity,
+                "G1 named leg IK produced invalid local rotation");
+        }
+    }
+    array1d<vec3> candidate_global_positions(G1_BoneCount);
+    array1d<quat> candidate_global_rotations(G1_BoneCount);
+    if (!g1_ik_checked_forward_kinematics(
+            candidate_global_positions, candidate_global_rotations,
+            local_positions, candidate_pose, parents,
+            error, error_capacity)) {
+        return false;
+    }
+
+    G1LegSolveResult candidate = {};
+    candidate.applied = true;
+    candidate.reachable = solve.reachable;
+    candidate.correction_limited = solve.correction_limited;
+    candidate.safe_stop_requested =
+        !solve.reachable || solve.correction_limited;
+    candidate.iterations = 1;
+    candidate.requested_ankle_target = requested_ankle_target;
+    candidate.clamped_ankle_target = solve.target.clamped_target;
+    candidate.hinge_axis_world = hinge_axis_world;
+    candidate.bend_direction = solve.bend.direction;
+    candidate.bend_used_current_projection =
+        solve.bend.used_current_projection;
+    candidate.bend_used_hinge_fallback =
+        solve.bend.used_hinge_fallback;
+    candidate.bend_used_safe_perpendicular =
+        solve.bend.used_safe_perpendicular;
+    candidate.bend_sign_flipped = solve.bend.sign_flipped;
+    candidate.raw_distance_m = solve.target.raw_distance_m;
+    candidate.clamped_distance_m = solve.target.clamped_distance_m;
+    candidate.max_correction_radians =
+        solve.root_correction_radians > solve.middle_correction_radians
+            ? solve.root_correction_radians
+            : solve.middle_correction_radians;
+    candidate.contact_residual_m = FLT_MAX;
+    if (!g1_ik_leg_result_is_valid(candidate) ||
+        candidate.max_correction_radians >
+            config.max_correction_radians) {
+        return g1_ik_error(
+            error, error_capacity,
+            "G1 named leg IK produced invalid result");
+    }
+
+    std::memcpy(
+        output_rotations.data, candidate_pose.data,
+        static_cast<size_t>(G1_BoneCount) * sizeof(quat));
+    output = candidate;
+    return true;
+}
+
+static inline bool g1_ik_contact_residual_is_converged_precise(
+    double residual_m)
+{
+    return terrain_double_is_finite(residual_m) &&
+           residual_m >= 0.0 &&
+           residual_m <= static_cast<double>(0.005f);
+}
+
+static inline bool g1_ik_contact_residual_is_converged(float residual_m)
+{
+    return g1_ik_float_is_runtime_value(residual_m) &&
+           g1_ik_contact_residual_is_converged_precise(
+               static_cast<double>(residual_m));
+}
+
+static inline bool g1_apply_named_contact_position_ik(
+    slice1d<quat> output_rotations,
+    const slice1d<vec3> local_positions,
+    const slice1d<quat> baseline_rotations,
+    const slice1d<int> parents,
+    const G1LegConfig& config,
+    vec3 desired_contact,
+    G1LegSolveResult& output,
+    char* error,
+    int error_capacity)
+{
+    if (!g1_ik_pose_inputs_validate(
+            output_rotations, local_positions,
+            baseline_rotations, parents, config,
+            error, error_capacity)) {
+        return false;
+    }
+    if (!g1_ik_vec3_is_runtime_value(desired_contact)) {
+        return g1_ik_error(
+            error, error_capacity,
+            "G1 contact residual target is invalid");
+    }
+
+    array1d<vec3> baseline_global_positions(G1_BoneCount);
+    array1d<quat> baseline_global_rotations(G1_BoneCount);
+    if (!g1_ik_checked_forward_kinematics(
+            baseline_global_positions, baseline_global_rotations,
+            local_positions, baseline_rotations, parents,
+            error, error_capacity)) {
+        return false;
+    }
+    vec3 contact_offset;
+    vec3 ankle_target;
+    if (!ik_checked_vec3_subtract(
+            contact_offset,
+            baseline_global_positions(config.contact),
+            baseline_global_positions(config.ankle)) ||
+        !ik_checked_vec3_subtract(
+            ankle_target, desired_contact, contact_offset)) {
+        return g1_ik_error(
+            error, error_capacity,
+            "G1 contact residual initial target overflowed");
+    }
+
+    array1d<quat> candidate_pose(output_rotations);
+    array1d<vec3> candidate_global_positions(G1_BoneCount);
+    array1d<quat> candidate_global_rotations(G1_BoneCount);
+    G1LegSolveResult aggregate = {};
+    bool all_reachable = true;
+    bool any_limited = false;
+    float maximum_correction = 0.0f;
+    double residual_precise_m = DBL_MAX;
+    float residual_m = FLT_MAX;
+    for (int iteration = 0; iteration < 4; ++iteration) {
+        G1LegSolveResult solve = {};
+        if (!g1_apply_named_position_ik(
+                candidate_pose, local_positions, baseline_rotations,
+                parents, config, ankle_target,
+                solve, error, error_capacity)) {
+            return false;
+        }
+        all_reachable = all_reachable && solve.reachable;
+        any_limited = any_limited || solve.correction_limited;
+        maximum_correction =
+            solve.max_correction_radians > maximum_correction
+                ? solve.max_correction_radians
+                : maximum_correction;
+        aggregate = solve;
+        aggregate.iterations = iteration + 1;
+        if (!g1_ik_checked_forward_kinematics(
+                candidate_global_positions,
+                candidate_global_rotations,
+                local_positions, candidate_pose, parents,
+                error, error_capacity) ||
+            !ik_checked_distance_precise(
+                residual_precise_m, residual_m,
+                candidate_global_positions(config.contact),
+                desired_contact)) {
+            return g1_ik_error(
+                error, error_capacity,
+                "G1 contact residual FK/math became invalid");
+        }
+        aggregate.contact_residual_m = residual_m;
+        if (g1_ik_contact_residual_is_converged_precise(
+                residual_precise_m)) {
+            break;
+        }
+        if (iteration < 3) {
+            vec3 residual;
+            vec3 next_ankle_target;
+            if (!ik_checked_vec3_subtract(
+                    residual, desired_contact,
+                    candidate_global_positions(config.contact)) ||
+                !ik_checked_vec3_add(
+                    next_ankle_target, ankle_target, residual)) {
+                return g1_ik_error(
+                    error, error_capacity,
+                    "G1 contact residual update overflowed");
+            }
+            ankle_target = next_ankle_target;
+        }
+    }
+
+    if (!g1_ik_checked_forward_kinematics(
+            candidate_global_positions, candidate_global_rotations,
+            local_positions, candidate_pose, parents,
+            error, error_capacity) ||
+        !ik_checked_distance_precise(
+            residual_precise_m, residual_m,
+            candidate_global_positions(config.contact),
+            desired_contact)) {
+        return g1_ik_error(
+            error, error_capacity,
+            "G1 contact final residual could not be verified");
+    }
+    aggregate.reachable = all_reachable;
+    aggregate.correction_limited = any_limited;
+    aggregate.max_correction_radians = maximum_correction;
+    aggregate.contact_residual_m = residual_m;
+    aggregate.safe_stop_requested =
+        aggregate.safe_stop_requested || !all_reachable || any_limited ||
+        !g1_ik_contact_residual_is_converged_precise(
+            residual_precise_m);
+    if (!g1_ik_leg_result_is_valid(aggregate) ||
+        aggregate.max_correction_radians >
+            config.max_correction_radians) {
+        return g1_ik_error(
+            error, error_capacity,
+            "G1 contact residual produced invalid result");
+    }
+
+    std::memcpy(
+        output_rotations.data, candidate_pose.data,
+        static_cast<size_t>(G1_BoneCount) * sizeof(quat));
+    output = aggregate;
     return true;
 }
