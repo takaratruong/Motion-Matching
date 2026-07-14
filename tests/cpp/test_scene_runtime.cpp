@@ -35,6 +35,19 @@ static const char* expected_route_ids[][2] = {
     {"forward-cross-slope",NULL},{"forward-cross-slope",NULL},
     {"full-course",NULL},{"wall-safe-stop","ramp-safe-stop"},
 };
+static const char* expected_route_outcomes[][2] = {
+    {"traverse-or-safe-stop",NULL},{"traverse",NULL},
+    {"traverse-or-safe-stop",NULL},{"traverse-or-safe-stop",NULL},
+    {"traverse",NULL},{"traverse",NULL},{"traverse",NULL},
+    {"traverse",NULL},{"traverse",NULL},
+    {"traverse-or-safe-stop",NULL},
+    {"traverse",NULL},{"traverse",NULL},{"traverse",NULL},
+    {"safe-stop","safe-stop"},
+};
+static const int expected_route_classes[][2] = {
+    {2,-1},{1,-1},{2,-1},{2,-1},{1,-1},{1,-1},{1,-1},
+    {1,-1},{1,-1},{2,-1},{1,-1},{1,-1},{1,-1},{0,0},
+};
 
 static const char* const expected_surface_semantics_json = R"json({"barycentric_tolerance":1e-10,"bbox_tolerance_m":1e-12,"cell_size_m":0.02,"coordinate_signature":"holden-y-up-right-handed-forward-plus-z","degenerate_projected_triangle_policy":"ignore","exterior_height_m":0.0,"heightfield_cell_domain":"positive-normal-binary32","heightfield_denormal_policy":"reject-nonzero-binary32-subnormals","heightfield_diagonal":"min-x-min-z_to_max-x-max-z","heightfield_diagonal_tie_policy":"tx-greater-or-equal-tz-uses-p00-p10-p11","heightfield_domain_policy":"inclusive-authoritative-node-rectangle","heightfield_evaluation_precision":"binary64-from-binary32-samples-and-promoted-node-weights","heightfield_exterior_normal":[0.0,1.0,0.0],"heightfield_grid_line_policy":"positive-index-cell-except-maximum-edge","heightfield_interpolation":"fixed-diagonal-triangles","heightfield_normal_evaluation":"selected-triangle-binary64-gradient-scale-safe-unit-normalization","heightfield_obj_coordinate_quantization":"binary32-round-of-promoted-origin-plus-index-times-cell","heightfield_obj_face_order":"p00-p11-p10_then_p00-p01-p11","heightfield_obj_float_format":".9g-final-newline","heightfield_obj_vertex_order":"z-major-x-minor","heightfield_raster_bounds_policy":"float32-minimum-rounded-down-and-maximum-ceil-covered","heightfield_runtime_height_output":"finite-binary64-interpolation-rounded-to-binary32","heightfield_runtime_node_distinguishability_policy":"normal-or-positive-zero-strictly-increasing-proven-by-endpoints-near-zero-candidates-max-binary32-spacing-and-aligned-equality","heightfield_runtime_node_domain":"normal-or-zero-binary32","heightfield_runtime_normal_output":"unit-normal-components-rounded-to-binary32","heightfield_runtime_output_ftz_policy":"binary32-subnormals-and-signed-zero-canonicalized-to-positive-zero","heightfield_runtime_parity_domain":"normal-or-zero-binary32-coordinates","heightfield_runtime_query_domain":"normal-or-zero-binary32-coordinates","heightfield_runtime_query_encoding":"normal-or-zero-binary32-canonicalized-positive-and-promoted-to-binary64","heightfield_scalar_domain":"normal-or-zero-binary32","heightfield_scalar_encoding":"ieee754-binary32-little-endian","heightfield_schema":"G1HF/v2","heightfield_source_node_encoding":"binary32-header-values-promoted-to-binary64-arithmetic","heightfield_version":2,"heightfield_zero_encoding":"canonical-positive-zero","overlap_height_policy":"maximum-y","polygon_triangulation":"fan-from-first-index","projected_area_epsilon_m2":1e-12,"projected_area_measure":"absolute-two-times-area","projected_boundary_policy":"closed","schema":"g1-terrain-surface/v1","source_query":"vertical-triangle-top","triangle_winding_policy":"orientation-independent"})json";
 
@@ -648,6 +661,14 @@ static void test_scene_numeric_precision_helpers()
           "array rejects a later non-authoritative coordinate");
     check(array_output[0] == 7.0f && array_output[1] == 8.0f,
           "failed binary32 array parse is transactional");
+
+    int sample_count = 123456789;
+    check(!scene_route_sample_count(
+              sample_count, std::make_pair(0.0f, 0.0f),
+              std::make_pair(1.0f, 0.0f), 0x1p-31f),
+          "route sample count rejects a rounded value above INT_MAX");
+    check(sample_count == 123456789,
+          "route sample count overflow rejection preserves prior output");
 }
 
 struct manifest_fixture_hashes
@@ -1074,43 +1095,80 @@ static std::vector<unsigned char> fixture_walkability_bytes(
     return out;
 }
 
+static std::vector<unsigned char> fixture_walkability_uniform_bytes(
+    const unsigned char classification)
+{
+    std::vector<unsigned char> out;
+    out.insert(out.end(), {'G','1','W','M'});
+    append_u32(out, 1);
+    append_u32(out, 2);
+    append_u32(out, 2);
+    out.insert(out.end(), 4, classification);
+    return out;
+}
+
 struct scene_asset_hashes
 {
     std::string terrain, mesh, walkability;
 };
 
+static int fixture_scene_index(const std::string& id)
+{
+    for (int i = 0; i < 14; ++i)
+        if (id == expected_scene_ids[i]) return i;
+    return -1;
+}
+
+static std::string fixture_route_json(
+    const std::string& id, const char* outcome, const int classification)
+{
+    std::ostringstream out;
+    out << "{\"id\":" << dump_json_string(id)
+        << ",\"waypoints_xz\":[[-1.0,-1.0],"
+        << "[-1.0,-0.9800000190734863]],"
+        << "\"expected_outcome\":" << dump_json_string(outcome)
+        << ",\"walkability_class\":" << classification
+        << ",\"landing_hold_seconds\":0.0}";
+    return out.str();
+}
+
 static std::string fixture_routes_json(
     const std::string& id, const std::string& mutation)
 {
-    if (id == "blocked-course") {
-        const std::string wall =
-            "{\"id\":\"wall-safe-stop\",\"waypoints_xz\":"
-            "[[-1.0,-1.0],[-1.0,-0.9800000190734863]],"
-            "\"expected_outcome\":\"safe-stop\","
-            "\"walkability_class\":0,\"landing_hold_seconds\":0.0}";
-        const std::string ramp =
-            "{\"id\":\"ramp-safe-stop\",\"waypoints_xz\":"
-            "[[-1.0,-1.0],[-1.0,-0.9800000190734863]],"
-            "\"expected_outcome\":\"safe-stop\","
-            "\"walkability_class\":0,\"landing_hold_seconds\":0.0}";
-        return mutation == "reverse" ? "[" + ramp + "," + wall + "]" :
-                                        "[" + wall + "," + ramp + "]";
+    const int scene = fixture_scene_index(id);
+    check(scene >= 0, "fixture route scene is in the locked catalog");
+    std::vector<std::string> routes;
+    for (int route = 0; route < expected_route_counts[scene]; ++route) {
+        std::string route_id = expected_route_ids[scene][route];
+        const char* outcome = expected_route_outcomes[scene][route];
+        int classification = expected_route_classes[scene][route];
+        if (mutation == "rename" && route == 0) route_id = "renamed-route";
+        if (mutation == "pair") {
+            if (classification == 1) {
+                outcome = "traverse-or-safe-stop";
+                classification = 2;
+            } else {
+                outcome = "traverse";
+                classification = 1;
+            }
+        }
+        routes.push_back(fixture_route_json(
+            route_id, outcome, classification));
     }
-    const std::string route_id =
-        mutation == "rename" ? "renamed-route" : "curb-forward";
-    const std::string route =
-        "{\"id\":" + dump_json_string(route_id) +
-        ",\"waypoints_xz\":[[-1.0,-1.0],"
-        "[-1.0,-0.9800000190734863]],"
-        "\"expected_outcome\":\"traverse-or-safe-stop\","
-        "\"walkability_class\":2,\"landing_hold_seconds\":0.0}";
     const std::string extra =
         "{\"id\":\"extra-route\",\"waypoints_xz\":"
         "[[-1.0,-1.0],[-1.0,-0.9800000190734863]],"
         "\"expected_outcome\":\"traverse-or-safe-stop\","
         "\"walkability_class\":2,\"landing_hold_seconds\":0.0}";
-    return mutation == "extra" ? "[" + route + "," + extra + "]" :
-                                  "[" + route + "]";
+    if (mutation == "extra") routes.push_back(extra);
+    std::string out = "[";
+    for (size_t i = 0; i < routes.size(); ++i) {
+        const size_t index = mutation == "reverse" ? routes.size() - 1 - i : i;
+        if (i != 0) out.push_back(',');
+        out += routes[index];
+    }
+    out.push_back(']');
+    return out;
 }
 
 static std::string fixture_scene_json(
@@ -1171,7 +1229,7 @@ static std::string fixture_scene_json(
 static scene_asset_hashes prepare_scene_assets(
     const std::filesystem::path& root,
     const std::string& id,
-    const bool blocked)
+    const std::vector<unsigned char>& walkability)
 {
     namespace fs = std::filesystem;
     const fs::path directory = root / "scenes" / id;
@@ -1180,12 +1238,21 @@ static scene_asset_hashes prepare_scene_assets(
                 fixture_heightfield_bytes());
     write_text((directory / "terrain.obj").c_str(), "fixture mesh\n");
     write_bytes((directory / "walkability.bin").string(),
-                fixture_walkability_bytes(blocked));
+                walkability);
     scene_asset_hashes hashes;
     hashes.terrain = file_sha((directory / "terrain.bin").string());
     hashes.mesh = file_sha((directory / "terrain.obj").string());
     hashes.walkability = file_sha((directory / "walkability.bin").string());
     return hashes;
+}
+
+static scene_asset_hashes prepare_scene_assets(
+    const std::filesystem::path& root,
+    const std::string& id,
+    const bool blocked)
+{
+    return prepare_scene_assets(
+        root, id, fixture_walkability_bytes(blocked));
 }
 
 static scene_catalog one_scene_catalog(
@@ -1284,6 +1351,43 @@ static scene_pack pack_sentinel()
     return pack;
 }
 
+static void test_scene_candidate_hostile_dimensions_are_transactional()
+{
+    const int hostile_dimensions[][2] = {
+        {1, 2},
+        {std::numeric_limits<int>::max(),
+         std::numeric_limits<int>::max()},
+    };
+    for (size_t i = 0;
+         i < sizeof(hostile_dimensions) / sizeof(hostile_dimensions[0]); ++i) {
+        scene_pack candidate = pack_sentinel();
+        const int nx = hostile_dimensions[i][0];
+        const int nz = hostile_dimensions[i][1];
+        candidate.metadata.heightfield_nx = nx;
+        candidate.metadata.heightfield_nz = nz;
+        candidate.metadata.walkability_nx = nx;
+        candidate.metadata.walkability_nz = nz;
+        candidate.metadata.heightfield_origin_x = candidate.terrain.origin_x;
+        candidate.metadata.heightfield_origin_z = candidate.terrain.origin_z;
+        candidate.metadata.heightfield_cell_size = candidate.terrain.cell_size;
+        candidate.metadata.heightfield_exterior_height =
+            candidate.terrain.exterior_height;
+        candidate.terrain.version = 2;
+        candidate.terrain.nx = nx;
+        candidate.terrain.nz = nz;
+        candidate.walkability.nx = nx;
+        candidate.walkability.nz = nz;
+        const scene_pack prior = candidate;
+        char error[512] = {};
+        check(!scene_candidate_validate(candidate, error, sizeof(error)),
+              "hostile scene grid dimensions are rejected");
+        check(std::strstr(error, "dimension") != NULL,
+              "hostile scene grid dimensions have a stable diagnostic");
+        check(pack_equal(candidate, prior),
+              "hostile dimension rejection preserves the complete candidate");
+    }
+}
+
 static void test_scene_descriptor_hash_precedes_json_parse()
 {
     namespace fs = std::filesystem;
@@ -1336,6 +1440,35 @@ static void expect_pack_failure_preserves(
           "scene load failure preserves complete active pack");
 }
 
+static void test_scene_route_semantic_matrix_is_exact_and_transactional()
+{
+    namespace fs = std::filesystem;
+    const fs::path root = "/tmp/test_scene_route_semantics";
+    fs::remove_all(root);
+    const motion_pack_manifest manifest = scene_fixture_manifest();
+    for (int scene = 0; scene < 14; ++scene) {
+        const std::string id = expected_scene_ids[scene];
+        const unsigned char mutated_class =
+            expected_route_classes[scene][0] == 1 ? 2 : 1;
+        const scene_asset_hashes hashes = prepare_scene_assets(
+            root, id, fixture_walkability_uniform_bytes(mutated_class));
+        const fs::path descriptor = root / "scenes" / id / "scene.json";
+        write_text(descriptor.c_str(), fixture_scene_json(id, "pair", hashes));
+        const scene_catalog catalog =
+            one_scene_catalog(id, file_sha(descriptor.string()));
+        scene_pack active = pack_sentinel();
+        const scene_pack prior = active;
+        char error[1024] = {};
+        check(!scene_pack_load(active, root.c_str(), manifest, catalog, 0,
+              error, sizeof(error)),
+              "scene-specific route outcome/class mutation is rejected");
+        check(std::strstr(error, "outcome/class") != NULL,
+              "scene-specific route tuple diagnostic");
+        check(pack_equal(active, prior),
+              "route tuple rejection preserves the complete active pack");
+    }
+}
+
 static void test_scene_pack_tamper_chain_routes_and_transactionality()
 {
     namespace fs = std::filesystem;
@@ -1365,9 +1498,29 @@ static void test_scene_pack_tamper_chain_routes_and_transactionality()
           "route lookup is exact and null-safe");
     const scene_pack grail_prior = active;
 
-    write_text(grail_scene.c_str(), "{");
-    expect_pack_failure_preserves(active, grail_prior, root, manifest, catalog,
-        "changed scene bytes rejected", "SHA-256");
+    const std::string syntactically_valid_semantic_change =
+        fixture_scene_json(grail, "rename", grail_hashes);
+    write_text(grail_scene.c_str(), syntactically_valid_semantic_change);
+    error[0] = '\0';
+    check(!scene_pack_load(active, root.c_str(), manifest, catalog, 0,
+          error, sizeof(error)),
+          "stale descriptor digest rejects valid changed scene JSON");
+    check(std::strstr(error, "SHA-256") != NULL &&
+          std::strstr(error, "route") == NULL,
+          "scene SHA diagnostic precedes semantic parsing");
+    check(pack_equal(active, grail_prior),
+          "stale descriptor digest preserves complete active pack");
+    const scene_catalog authenticated_semantic_change = one_scene_catalog(
+        grail, file_sha(grail_scene.string()));
+    error[0] = '\0';
+    check(!scene_pack_load(active, root.c_str(), manifest,
+          authenticated_semantic_change, 0, error, sizeof(error)),
+          "authenticated semantic scene mutation is rejected");
+    check(std::strstr(error, "route") != NULL &&
+          std::strstr(error, "SHA-256") == NULL,
+          "updated descriptor digest exposes semantic diagnostic");
+    check(pack_equal(active, grail_prior),
+          "authenticated semantic failure preserves complete active pack");
     write_text(grail_scene.c_str(), valid_scene);
 
     const fs::path artifact_paths[] = {
@@ -1520,9 +1673,17 @@ static void test_published_scene_contract(const char* root)
         check(active.metadata.routes.size() ==
               static_cast<size_t>(expected_route_counts[i]),
               "scene route count");
-        for (int route = 0; route < expected_route_counts[i]; ++route)
-            check(active.metadata.routes[static_cast<size_t>(route)].id ==
-                  expected_route_ids[i][route], "scene route ID/order");
+        for (int route = 0; route < expected_route_counts[i]; ++route) {
+            const scene_route& loaded_route =
+                active.metadata.routes[static_cast<size_t>(route)];
+            check(loaded_route.id == expected_route_ids[i][route],
+                  "scene route ID/order");
+            check(loaded_route.expected_outcome ==
+                      expected_route_outcomes[i][route] &&
+                  loaded_route.walkability_class ==
+                      expected_route_classes[i][route],
+                  "scene route outcome/class tuple");
+        }
     }
 
     const std::string prior_id = active.metadata.id;
@@ -1564,7 +1725,9 @@ int main(int argc, char** argv)
     test_scene_numeric_precision_helpers();
     test_manifest_surface_contract_is_exact_and_transactional();
     test_catalog_contract_paths_and_tamper_order();
+    test_scene_candidate_hostile_dimensions_are_transactional();
     test_scene_descriptor_hash_precedes_json_parse();
+    test_scene_route_semantic_matrix_is_exact_and_transactional();
     test_scene_pack_tamper_chain_routes_and_transactionality();
     test_motion_database_contract();
     if (argc == 3) test_published_scene_contract(argv[2]);

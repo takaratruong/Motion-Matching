@@ -360,7 +360,7 @@ static inline bool scene_route_segment(float& dx,float& dz,float& length,const s
 {float dx2=0,dz2=0,sum=0;return terrain_f32_sub(dx,stop.first,start.first)&&terrain_f32_sub(dz,stop.second,start.second)&&terrain_f32_mul(dx2,dx,dx)&&terrain_f32_mul(dz2,dz,dz)&&terrain_f32_add(sum,dx2,dz2)&&terrain_f32_sqrt(length,sum)&&length>0.0f;}
 
 static inline bool scene_route_sample_count(int& count,const std::pair<float,float>& start,const std::pair<float,float>& stop,float maximum_step)
-{float dx=0,dz=0,length=0,ratio=0;if(!terrain_float_is_positive_normal(maximum_step)||!scene_route_segment(dx,dz,length,start,stop)||!terrain_f32_div(ratio,length,maximum_step))return false;const float rounded=ceilf(ratio);if(!terrain_float_is_finite(rounded)||rounded>static_cast<float>(INT_MAX))return false;count=rounded<1.0f?1:static_cast<int>(rounded);return true;}
+{float dx=0,dz=0,length=0,ratio=0;if(!terrain_float_is_positive_normal(maximum_step)||!scene_route_segment(dx,dz,length,start,stop)||!terrain_f32_div(ratio,length,maximum_step))return false;const float rounded=ceilf(ratio);if(!terrain_float_is_finite(rounded)||static_cast<double>(rounded)>static_cast<double>(INT_MAX))return false;const int candidate=rounded<1.0f?1:static_cast<int>(rounded);count=candidate;return true;}
 
 static inline bool scene_json_load_verified(
     json_value& out, const char* path, const std::string& expected,
@@ -1484,25 +1484,43 @@ static inline bool scene_metadata_parse(
     }
     static const int route_counts[14] = {
         1,1,1,1,1,1,1,1,1,1,1,1,1,2};
-    static const char* const route_ids_expected[14][2] = {
-        {"curb-forward",NULL},{"curb-forward",NULL},
-        {"curb-forward",NULL},{"curb-forward",NULL},
-        {"ascent-landing-descent",NULL},
-        {"ascent-landing-descent",NULL},
-        {"ascent-landing-descent",NULL},
-        {"up-landing-down",NULL},{"up-landing-down",NULL},
-        {"up-landing-down",NULL},
-        {"forward-cross-slope",NULL},{"forward-cross-slope",NULL},
-        {"full-course",NULL},{"wall-safe-stop","ramp-safe-stop"}};
+    struct route_contract {
+        const char* id;
+        const char* outcome;
+        int classification;
+    };
+    static const route_contract expected_routes[14][2] = {
+        {{"curb-forward","traverse-or-safe-stop",2},{NULL,NULL,-1}},
+        {{"curb-forward","traverse",1},{NULL,NULL,-1}},
+        {{"curb-forward","traverse-or-safe-stop",2},{NULL,NULL,-1}},
+        {{"curb-forward","traverse-or-safe-stop",2},{NULL,NULL,-1}},
+        {{"ascent-landing-descent","traverse",1},{NULL,NULL,-1}},
+        {{"ascent-landing-descent","traverse",1},{NULL,NULL,-1}},
+        {{"ascent-landing-descent","traverse",1},{NULL,NULL,-1}},
+        {{"up-landing-down","traverse",1},{NULL,NULL,-1}},
+        {{"up-landing-down","traverse",1},{NULL,NULL,-1}},
+        {{"up-landing-down","traverse-or-safe-stop",2},{NULL,NULL,-1}},
+        {{"forward-cross-slope","traverse",1},{NULL,NULL,-1}},
+        {{"forward-cross-slope","traverse",1},{NULL,NULL,-1}},
+        {{"full-course","traverse",1},{NULL,NULL,-1}},
+        {{"wall-safe-stop","safe-stop",0},
+         {"ramp-safe-stop","safe-stop",0}},
+    };
     if (candidate.routes.size() !=
         static_cast<size_t>(route_counts[scene_position]))
         return scene_error(error, capacity,
             "%s: scene route count changed", shown);
-    for (int i = 0; i < route_counts[scene_position]; ++i)
-        if (candidate.routes[static_cast<size_t>(i)].id !=
-            route_ids_expected[scene_position][i])
+    for (int i = 0; i < route_counts[scene_position]; ++i) {
+        const scene_route& route = candidate.routes[static_cast<size_t>(i)];
+        const route_contract& expected = expected_routes[scene_position][i];
+        if (route.id != expected.id)
             return scene_error(error, capacity,
                 "%s: scene route ID/order changed", shown);
+        if (route.expected_outcome != expected.outcome ||
+            route.walkability_class != expected.classification)
+            return scene_error(error, capacity,
+                "%s: scene route outcome/class changed", shown);
+    }
     out = std::move(candidate);
     return true;
 }
@@ -1527,6 +1545,17 @@ static inline bool scene_candidate_validate(
     const scene_metadata& metadata = candidate.metadata;
     const heightfield& field = candidate.terrain;
     const walkability_grid& grid = candidate.walkability;
+    size_t field_count = 0;
+    size_t grid_count = 0;
+    if (field.nx < 2 || field.nz < 2 || grid.nx < 2 || grid.nz < 2 ||
+        !terrain_size_multiply(static_cast<size_t>(field.nx),
+                               static_cast<size_t>(field.nz), field_count) ||
+        field_count > static_cast<size_t>(INT_MAX) ||
+        !terrain_size_multiply(static_cast<size_t>(grid.nx),
+                               static_cast<size_t>(grid.nz), grid_count) ||
+        grid_count > static_cast<size_t>(INT_MAX))
+        return scene_error(error, capacity,
+            "scene grid dimensions are invalid or exceed runtime capacity");
     if (field.version != 2 || field.nx != metadata.heightfield_nx ||
         field.nz != metadata.heightfield_nz ||
         field.origin_x != metadata.heightfield_origin_x ||
@@ -1542,8 +1571,9 @@ static inline bool scene_candidate_validate(
         return scene_error(error, capacity,
             "%s: G1WM grid does not equal scene metadata/G1HF",
             candidate.walkability_path.c_str());
-    if (field.heights.size != field.nx * field.nz ||
-        field.heights.data == NULL || grid.cells.size != grid.nx * grid.nz ||
+    if (field.heights.size != static_cast<int>(field_count) ||
+        field.heights.data == NULL ||
+        grid.cells.size != static_cast<int>(grid_count) ||
         grid.cells.data == NULL)
         return scene_error(error, capacity,
             "scene binary grids are incomplete");
