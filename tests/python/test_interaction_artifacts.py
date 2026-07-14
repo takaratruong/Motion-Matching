@@ -1,12 +1,14 @@
 import copy
 from collections import Counter
 import dataclasses
+import hashlib
 import io
 import json
 import os
 from pathlib import Path
 import shutil
 import struct
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -1818,6 +1820,104 @@ class InteractionArtifactSerializationTests(unittest.TestCase):
             self.assertEqual(before, snapshot(output))
             self.assertEqual(private_publish_paths(output), [])
             read_artifact_set(output)
+
+
+class CrossLanguageProbeTests(unittest.TestCase):
+    def test_probe_replays_the_published_python_artifacts(self):
+        artifact, features, split, manifest, report = artifact_fixture()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "pack"
+            write_artifact_set(
+                output, artifact, features, split, manifest, report
+            )
+
+            completed = subprocess.run(
+                ["./interaction_probe", str(output), "--json"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            actual = json.loads(completed.stdout)
+
+            database_path = output / "interaction_database.bin"
+            feature_path = output / "interaction_features.bin"
+            quaternion_arrays = (
+                artifact.rotations,
+                artifact.object_rotations,
+                artifact.table_rotations,
+                artifact.grasp_rotations_object,
+            )
+            expected_quaternion_error = max(
+                float(
+                    np.max(
+                        np.abs(
+                            np.linalg.norm(
+                                values.astype(np.float64), axis=-1
+                            )
+                            - 1.0
+                        )
+                    )
+                )
+                for values in quaternion_arrays
+            )
+            expected = {
+                "bone_count": artifact.positions.shape[1],
+                "clip_count": len(artifact.range_starts),
+                "database_sha256": hashlib.sha256(
+                    database_path.read_bytes()
+                ).hexdigest(),
+                "feature_count": features.values.shape[1],
+                "feature_sha256": hashlib.sha256(
+                    feature_path.read_bytes()
+                ).hexdigest(),
+                "first_source_frame": int(artifact.source_frames[0]),
+                "frame_count": len(artifact.positions),
+                "last_source_frame": int(artifact.source_frames[-1]),
+                "phase_counts": [
+                    int(np.count_nonzero(artifact.phases == phase))
+                    for phase in range(5)
+                ],
+            }
+
+            self.assertEqual(list(actual), sorted(actual))
+            self.assertTrue(completed.stdout.endswith("\n"))
+            self.assertNotIn(" ", completed.stdout.rstrip("\n"))
+            self.assertEqual(completed.stderr, "")
+            actual_quaternion_error = actual.pop(
+                "max_quaternion_norm_error"
+            )
+            self.assertEqual(actual, expected)
+            self.assertAlmostEqual(
+                actual_quaternion_error,
+                expected_quaternion_error,
+                places=8,
+            )
+
+    def test_probe_requires_all_three_json_artifacts(self):
+        artifact, features, split, manifest, report = artifact_fixture()
+        for filename in (
+            "manifest.json",
+            "evaluation_split.json",
+            "validation_report.json",
+        ):
+            with self.subTest(
+                filename=filename
+            ), tempfile.TemporaryDirectory() as tmp:
+                output = Path(tmp) / "pack"
+                write_artifact_set(
+                    output, artifact, features, split, manifest, report
+                )
+                (output / filename).unlink()
+
+                completed = subprocess.run(
+                    ["./interaction_probe", str(output), "--json"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(filename, completed.stderr)
 
 
 if __name__ == "__main__":

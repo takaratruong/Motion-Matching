@@ -22,7 +22,7 @@ ifeq ($(PLATFORM),PLATFORM_WEB)
     CFLAGS ?= $(DEFINES) $(RAYLIB_DIR)/raylib/src/libraylib.bc -ffast-math -D NDEBUG -O3 -s USE_GLFW=3 -s FORCE_FILESYSTEM=1 -s MAX_WEBGL_VERSION=2 -s ALLOW_MEMORY_GROWTH=1 --preload-file $(dir $<)resources@resources --shell-file ./shell.html $(INCLUDE_DIR) $(LIBRARY_DIR)
 endif
 
-SOURCE = $(wildcard *.cpp)
+SOURCE = controller.cpp
 HEADER = $(wildcard *.h)
 
 .PHONY: all
@@ -39,6 +39,7 @@ CXX ?= g++
 CPP_TEST_FLAGS ?= -std=c++17 -Wall -Wextra -Werror -pedantic -I.
 CPP_TEST_DIR := build/tests
 CPP_TEST_BINS := $(CPP_TEST_DIR)/test_g1_skeleton
+CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_database
 
 .PHONY: test-python test-cpp test-interaction
 
@@ -46,6 +47,12 @@ $(CPP_TEST_DIR):
 	mkdir -p $@
 
 $(CPP_TEST_DIR)/test_g1_skeleton: tests/cpp/test_g1_skeleton.cpp g1_skeleton.h | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) $< -o $@
+
+$(CPP_TEST_DIR)/test_interaction_database: tests/cpp/test_interaction_database.cpp interaction_database.h g1_skeleton.h | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) $< -o $@
+
+interaction_probe: interaction_probe.cpp interaction_database.h g1_skeleton.h
 	$(CXX) $(CPP_TEST_FLAGS) $< -o $@
 
 test-python:
