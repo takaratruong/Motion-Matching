@@ -103,6 +103,163 @@ def float32_offset(value, ulps):
     return struct.unpack(">f", (bits + ulps).to_bytes(4, "big"))[0]
 
 
+def runtime_row(frame, **changes):
+    database_frame = 100 + frame
+    query_frame = database_frame if frame == 0 else database_frame - 1
+    values = row(
+        frame, database_frame,
+        query_database_frame=query_frame,
+        selected_database_frame=query_frame,
+    )
+    values.update({
+        "source_name": "terrain_curbs__fixture", "source_terrain": "fixture",
+        "source_index": "1", "continuation_cost": "2.0",
+        "source_root_height": "0", "source_left_toe_height": "0",
+        "source_right_toe_height": "0", "runtime_support_root_height": "0",
+        "runtime_support_left_toe_height": "0",
+        "runtime_support_right_toe_height": "0", "support_root_delta": "0",
+        "support_left_toe_delta": "0", "support_right_toe_delta": "0",
+        "support_height": "0", "support_velocity": "0",
+        "support_source": "both", "airborne_frames": "0",
+        "left_contact": "1", "right_contact": "1",
+        "support_retargeted_hips_y": "0.8", "ik_adjusted_hips_y": "0.8",
+        "simulation_x": "0", "simulation_z": str(frame * .02),
+        "walkability_class": "1", "blocked": "0",
+        "blocked_reason": "clear", "blocked_distance": "3.4e38",
+        "blocked_point_x": "0", "blocked_point_z": "0",
+        "commanded_speed": ".5", "applied_speed": ".5",
+        "route_waypoint": "1", "route_complete": "0",
+        "route_target_height": ".36", "scene_generation": "0",
+        "scene_frame": str(frame), "scene_reset_count": "1",
+        "scene_switch_failed": "0", "motion_pack_load_count": "1",
+        "model_load_count": "1", "model_unload_count": "0",
+        "live_model_count": "1", "matching_enabled": "1",
+        "support_retargeting_enabled": "1", "ik_enabled": "0",
+        "adjustment_y": "0", "clamp_y": "0", "fixed_dt": ".04",
+        "mode": "route", "route": "fixture-route", "scene_id": "fixture",
+    })
+    values.update({key: str(value) for key, value in changes.items()})
+    if "query_bits_hex" not in changes:
+        query_values = [0.0] * 27 + [
+            float(values[f"terrain{sample}"]) for sample in range(4)]
+        values["query_bits_hex"] = "".join(
+            struct.pack(">f", value).hex() for value in query_values)
+    return {name: values[name] for name in RUNTIME_COLUMNS}
+
+
+def gate_c_rows():
+    rows = []
+    for frame in range(170):
+        if frame < 20:
+            height = 0.0
+        elif frame < 56:
+            height = min(.36, (frame - 20) * .01)
+        elif frame < 110:
+            height = .36
+        elif frame < 146:
+            height = max(0.0, .36 - (frame - 110) * .01)
+        else:
+            height = 0.0
+        rows.append(runtime_row(
+            frame, terrain0=(.12 if frame >= 10 else 0),
+            runtime_support_root_height=height,
+            runtime_support_left_toe_height=height,
+            runtime_support_right_toe_height=height,
+            support_root_delta=height, support_left_toe_delta=height,
+            support_right_toe_delta=height, support_height=height,
+            support_retargeted_hips_y=.8 + height,
+            ik_adjusted_hips_y=.8 + height, rendered_hips_y=.8 + height,
+            route_complete=int(frame >= 146)))
+    return rows
+
+
+def mixed_multilevel_rows():
+    rows = []
+    for frame in range(271):
+        z = frame * .04
+        if z < 3.20:
+            height = z * .10
+        elif z < 6.20:
+            height = .32
+        elif z < 6.80:
+            height = .40
+        elif z < 7.40:
+            height = .28
+        elif z < 8.00:
+            height = .32
+        elif z <= 9.8148:
+            height = max(0.0, .32 * (9.8148 - z) / 1.8148)
+        else:
+            height = 0.0
+        continued = 90 <= frame < 140
+        rows.append(runtime_row(
+            frame, scene_id="mixed-multilevel", route="full-course",
+            simulation_z=z, terrain0=(.12 if frame >= 5 else 0),
+            source_index=(1 if continued else 0),
+            source_terrain=("fixture" if continued else "flat"),
+            runtime_support_root_height=height,
+            runtime_support_left_toe_height=height,
+            runtime_support_right_toe_height=height,
+            support_root_delta=height, support_left_toe_delta=height,
+            support_right_toe_delta=height, support_height=height,
+            raw_selected_hips_y=.8 + height,
+            inertialized_hips_y=.8 + height,
+            support_retargeted_hips_y=.8 + height,
+            ik_adjusted_hips_y=.8 + height, rendered_hips_y=.8 + height,
+            route_target_height=.32, route_complete=int(z > 9.8148)))
+    return rows
+
+
+def mutate_mixed_region(rows, region, offset, field, value):
+    bounds = {
+        "elevated": (3.20, 6.20),
+        "block-2": (6.85, 7.35),
+        "ramp": (8.00, 9.8148),
+        "base": (9.8148, float("inf")),
+    }
+    lower, upper = bounds[region]
+    candidates = [
+        item for item in rows
+        if lower <= float(item["simulation_z"]) <= upper
+    ]
+    targets = candidates if region == "block-2" else [candidates[offset]]
+    for item in targets:
+        item[field] = str(value)
+
+
+def mixed_support_span_rows(start_z):
+    rows = mixed_multilevel_rows()
+    rows[79]["runtime_support_root_height"] = "0"
+    rows[80]["simulation_z"] = str(start_z)
+    rows[154]["simulation_z"] = "6.15"
+    return rows
+
+
+def gate_d_rows():
+    rows = []
+    for frame in range(100):
+        blocked = frame >= 20
+        speed = max(0.0, .5 - max(0, frame - 20) * .05)
+        rows.append(runtime_row(
+            frame, scene_id="blocked-course", route="wall-safe-stop",
+            blocked=int(blocked),
+            blocked_reason=("blocked-cell" if blocked else "clear"),
+            blocked_distance=(.03 if blocked else 3.4e38),
+            applied_speed=speed, simulation_z=min(frame * .02, .58),
+            route_complete=int(frame >= 60)))
+    return rows
+
+
+def set_terrain(values, sample, value):
+    values[f"terrain{sample}"] = str(value)
+    query_values = [0.0] * 27 + [
+        float(values[f"terrain{query_sample}"])
+        for query_sample in range(4)
+    ]
+    values["query_bits_hex"] = "".join(
+        struct.pack(">f", query_value).hex() for query_value in query_values)
+
+
 class RuntimeLogTests(unittest.TestCase):
     def test_runtime_columns_append_after_gate_a(self):
         self.assertEqual(
@@ -121,6 +278,326 @@ class RuntimeLogTests(unittest.TestCase):
                 "runtime_left_toe_height",
                 "runtime_right_toe_height"):
             self.assertNotIn(old_name, CSV_COLUMNS)
+
+    def test_gate_c_accepts_persistent_landing_and_descent(self):
+        self.assertGreaterEqual(
+            runtime_log.check_gate_c(gate_c_rows())["landing_frames"], 50)
+
+    def test_gate_c_accepts_raw_source_jump_with_smooth_final_hips(self):
+        rows = gate_c_rows()
+        rows[80]["raw_selected_hips_y"] = "1.3"
+        report = runtime_log.check_gate_c(rows)
+        self.assertLessEqual(report["maximum_rendered_hips_step"], 0.05)
+
+    def test_gate_c_rejects_rendered_hips_step_over_limit(self):
+        rows = gate_c_rows()
+        for name in (
+                "support_retargeted_hips_y", "ik_adjusted_hips_y",
+                "rendered_hips_y"):
+            rows[80][name] = "1.3"
+        with self.assertRaisesRegex(ValueError, "rendered Hips"):
+            runtime_log.check_gate_c(rows)
+
+    def test_gate_c_accepts_exactly_fifty_combined_landing_rows(self):
+        rows = gate_c_rows()
+        for item in rows[54:62]:
+            item["runtime_support_left_toe_height"] = ".50"
+        self.assertEqual(runtime_log.check_gate_c(rows)["landing_frames"], 50)
+
+    def test_gate_c_rejects_forty_nine_or_split_landing_rows(self):
+        cases = []
+        rows = gate_c_rows()
+        for item in rows[54:63]:
+            item["runtime_support_left_toe_height"] = ".50"
+        cases.append(rows)
+        rows = gate_c_rows()
+        rows[80]["runtime_support_left_toe_height"] = ".50"
+        cases.append(rows)
+        for rows in cases:
+            with self.subTest():
+                with self.assertRaisesRegex(ValueError, "landing block"):
+                    runtime_log.check_gate_c(rows)
+
+    def test_mixed_checker_requires_elevated_blocks_and_return_ramp(self):
+        report = runtime_log.check_mixed_multilevel(mixed_multilevel_rows())
+        self.assertGreaterEqual(report["elevated_matching_frames"], 50)
+        for mutation, diagnostic in (
+                (("elevated", 25, "matching_enabled", "0"),
+                 "elevated matching"),
+                (("elevated", 25, "runtime_support_left_toe_height", ".50"),
+                 "elevated matching"),
+                (("block-2", 4, "runtime_support_root_height", ".40"),
+                 "block plateaus"),
+                (("ramp", 8, "runtime_support_root_height", ".40"),
+                 "return ramp"),
+                (("base", 2, "runtime_support_root_height", ".08"),
+                 "returned to base")):
+            rows = mixed_multilevel_rows()
+            mutate_mixed_region(rows, *mutation)
+            with self.subTest(diagnostic=diagnostic):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    runtime_log.check_mixed_multilevel(rows)
+
+    def test_mixed_checker_accepts_flat_elevated_source_metadata(self):
+        rows = mixed_multilevel_rows()
+        for item in rows:
+            if 3.20 <= float(item["simulation_z"]) <= 6.20:
+                item["source_index"] = "0"
+                item["source_terrain"] = "flat"
+        self.assertGreaterEqual(
+            runtime_log.check_mixed_multilevel(rows)["elevated_matching_frames"],
+            50)
+
+    def test_mixed_checker_accepts_exactly_fifty_elevated_rows(self):
+        rows = mixed_multilevel_rows()
+        for item in rows[80:105]:
+            item["matching_enabled"] = "0"
+        self.assertEqual(
+            runtime_log.check_mixed_multilevel(rows)["elevated_matching_frames"],
+            50)
+
+    def test_mixed_checker_rejects_forty_nine_elevated_rows(self):
+        rows = mixed_multilevel_rows()
+        for item in rows[80:106]:
+            item["matching_enabled"] = "0"
+        with self.assertRaisesRegex(ValueError, "elevated matching"):
+            runtime_log.check_mixed_multilevel(rows)
+
+    def test_mixed_checker_decouples_endpoint_crossing_from_support_span(self):
+        rows = mixed_multilevel_rows()
+        rows[154]["runtime_support_root_height"] = ".40"
+        report = runtime_log.check_mixed_multilevel(rows)
+        self.assertGreaterEqual(report["elevated_span_m"], 2.95)
+
+    def test_mixed_checker_enforces_exact_support_span_boundary(self):
+        report = runtime_log.check_mixed_multilevel(
+            mixed_support_span_rows(3.20))
+        self.assertAlmostEqual(report["elevated_span_m"], 2.95, places=12)
+        with self.assertRaisesRegex(ValueError, "support span"):
+            runtime_log.check_mixed_multilevel(mixed_support_span_rows(3.21))
+
+    def test_gate_d_accepts_safe_stop_and_rejects_blocked_footprint(self):
+        self.assertGreaterEqual(
+            runtime_log.check_gate_d(gate_d_rows())["stopped_frames"], 25)
+        rows = gate_d_rows()
+        rows[50]["walkability_class"] = "0"
+        with self.assertRaisesRegex(ValueError, "entered blocked"):
+            runtime_log.check_gate_d(rows)
+
+    def test_gate_d_requires_twenty_pre_block_baseline_rows(self):
+        self.assertGreaterEqual(
+            runtime_log.check_gate_d(gate_d_rows())["stopped_frames"], 25)
+
+        rows = gate_d_rows()
+        rows[19]["blocked"] = "1"
+        rows[19]["blocked_reason"] = "blocked-cell"
+        rows[19]["blocked_distance"] = ".03"
+        with self.assertRaisesRegex(ValueError, "20 pre-block"):
+            runtime_log.check_gate_d(rows)
+
+    def test_gate_d_binds_stop_hold_to_initial_stopped_blocked_event(self):
+        rows = gate_d_rows()
+        for item in rows[35:60]:
+            item["applied_speed"] = ".1"
+        with self.assertRaisesRegex(ValueError, "25 consecutive"):
+            runtime_log.check_gate_d(rows)
+
+    def test_gate_d_accepts_block_clear_during_uninterrupted_stop(self):
+        rows = gate_d_rows()
+        for item in rows[31:]:
+            item["blocked"] = "0"
+            item["blocked_reason"] = "clear"
+        self.assertGreaterEqual(
+            runtime_log.check_gate_d(rows)["stopped_frames"], 25)
+
+    def test_ab_requires_identical_script(self):
+        treatment = gate_c_rows()
+        control = gate_c_rows()
+        for treatment_row, control_row in zip(treatment, control):
+            treatment_row["selected_terrain_error"] = ".1"
+            treatment_row["effective_terrain_weight"] = "4"
+            control_row["selected_terrain_error"] = ".4"
+            control_row["effective_terrain_weight"] = "0"
+        treatment[20]["route_waypoint"] = "9"
+        with self.assertRaisesRegex(ValueError, "scripted input"):
+            compare_control(treatment, control)
+
+    def test_runtime_suffix_validation_is_exact_and_reset_aware(self):
+        rows = [runtime_row(frame) for frame in range(24)]
+        for frame in range(8, 24):
+            generation = (frame - 8) // 8 + 1
+            scene_frame = (frame - 8) % 8
+            current = 200 + scene_frame
+            query = current if scene_frame == 0 else current - 1
+            rows[frame].update({
+                "scene_generation": str(generation),
+                "scene_frame": str(scene_frame),
+                "scene_reset_count": str(generation + 1),
+                "database_frame": str(current),
+                "query_database_frame": str(query),
+                "selected_database_frame": str(query),
+            })
+        self.assertEqual(check_rows(rows)["frames"], 24)
+
+        cases = (
+            ("fixed_dt", 4, ".05", "fixed_dt"),
+            ("support_height", 4, "nan", "non-finite support_height"),
+            ("left_contact", 4, "2", "left_contact must be 0 or 1"),
+            ("source_name", 4, "", "empty source_name"),
+            ("ik_enabled", 4, "1", "IK must be disabled"),
+            ("adjustment_y", 4, ".01", "adjustment_y must be zero"),
+            ("scene_frame", 4, "9", "scene_frame"),
+            ("scene_generation", 8, "3", "scene_generation"),
+            ("scene_frame", 8, "1", "scene_frame"),
+            ("scene_reset_count", 8, "9", "scene_reset_count"),
+            ("motion_pack_load_count", 4, "2", "motion pack"),
+            ("live_model_count", 4, "0", "live model"),
+        )
+        for name, index, value, diagnostic in cases:
+            changed = [dict(item) for item in rows]
+            changed[index][name] = value
+            with self.subTest(name=name, index=index):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    check_rows(changed)
+
+    def test_runtime_gate_requires_exact_header(self):
+        rows = gate_c_rows()
+        rows[0].pop("source_name")
+        with self.assertRaisesRegex(ValueError, "exact runtime header"):
+            runtime_log.check_gate_c(rows)
+        rows = gate_c_rows()
+        rows[0]["unexpected"] = "1"
+        with self.assertRaisesRegex(ValueError, "exact runtime header"):
+            runtime_log.check_gate_c(rows)
+
+    def test_gate_c_rejects_contract_activation_and_source_failures(self):
+        cases = []
+        rows = gate_c_rows()
+        rows[0]["mode"] = "terrain"
+        cases.append((rows, "route mode"))
+        rows = gate_c_rows()
+        rows[50]["scene_id"] = "other"
+        cases.append((rows, "one scene and route"))
+        rows = gate_c_rows()
+        rows[50]["matching_enabled"] = "0"
+        cases.append((rows, "matching"))
+        rows = gate_c_rows()
+        rows[50]["support_retargeting_enabled"] = "0"
+        cases.append((rows, "support retargeting"))
+        rows = gate_c_rows()
+        for item in rows[:30]:
+            set_terrain(item, 0, 0)
+        cases.append((rows, "terrain activation"))
+        rows = gate_c_rows()
+        for item in rows:
+            item["source_index"] = "0"
+            item["source_terrain"] = "flat"
+        cases.append((rows, "terrain source"))
+        for rows, diagnostic in cases:
+            with self.subTest(diagnostic=diagnostic):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    runtime_log.check_gate_c(rows)
+
+    def test_gate_c_rejects_landing_alignment_and_return_failures(self):
+        cases = []
+        rows = gate_c_rows()
+        rows[80]["runtime_support_root_height"] = ".30"
+        cases.append((rows, "landing block"))
+        rows = gate_c_rows()
+        for item in rows[113:]:
+            item["runtime_support_root_height"] = ".10"
+        cases.append((rows, "return to baseline"))
+        rows = gate_c_rows()
+        rows[80]["rendered_hips_y"] = "1.17"
+        cases.append((rows, "Hips stage agreement"))
+        for rows, diagnostic in cases:
+            with self.subTest(diagnostic=diagnostic):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    runtime_log.check_gate_c(rows)
+
+    def test_mixed_checker_rejects_span_order_and_nonfinite_geometry(self):
+        cases = []
+        rows = mixed_multilevel_rows()
+        for item in rows:
+            if abs(float(item["simulation_z"]) - 6.20) <= 0.05:
+                item["simulation_x"] = ".10"
+        cases.append((rows, "endpoint crossing"))
+        rows = mixed_multilevel_rows()
+        for item in rows:
+            z = float(item["simulation_z"])
+            if 6.85 <= z <= 7.35:
+                item["runtime_support_root_height"] = ".40"
+            elif 6.25 <= z <= 6.75:
+                item["runtime_support_root_height"] = ".28"
+        cases.append((rows, "block plateaus"))
+        rows = mixed_multilevel_rows()
+        rows[210]["simulation_z"] = "nan"
+        cases.append((rows, "non-finite"))
+        for rows, diagnostic in cases:
+            with self.subTest(diagnostic=diagnostic):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    runtime_log.check_mixed_multilevel(rows)
+
+    def test_gate_d_rejects_missing_stop_clearance_and_support_rise(self):
+        rows = gate_d_rows()
+        for item in rows[31:]:
+            item["blocked"] = "0"
+            item["blocked_reason"] = "clear"
+        self.assertGreaterEqual(
+            runtime_log.check_gate_d(rows)["stopped_frames"], 25)
+
+        cases = []
+        rows = gate_d_rows()
+        for item in rows:
+            item["blocked"] = "0"
+            item["blocked_reason"] = "clear"
+        cases.append((rows, "never reported blocked"))
+        rows = gate_d_rows()
+        for item in rows:
+            item["applied_speed"] = ".5"
+        cases.append((rows, "never stopped"))
+        rows = gate_d_rows()
+        rows[50]["blocked_distance"] = ".019"
+        cases.append((rows, "clearance"))
+        rows = gate_d_rows()
+        for item in rows[30:76]:
+            item["applied_speed"] = ".1"
+        cases.append((rows, "25 consecutive"))
+        rows = gate_d_rows()
+        rows[50]["source_root_height"] = ".03"
+        rows[50]["blocked"] = "0"
+        rows[50]["blocked_reason"] = "clear"
+        cases.append((rows, "blocked support rise"))
+        for rows, diagnostic in cases:
+            with self.subTest(diagnostic=diagnostic):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    runtime_log.check_gate_d(rows)
+
+    def test_ab_requires_every_exact_runtime_script_field(self):
+        fields = (
+            "scene_id", "mode", "route", "scene_generation", "scene_frame",
+            "route_waypoint", "route_complete", "commanded_speed",
+        )
+        for field in fields:
+            treatment = gate_c_rows()
+            control = gate_c_rows()
+            for treatment_row, control_row in zip(treatment, control):
+                treatment_row["selected_terrain_error"] = ".1"
+                control_row["selected_terrain_error"] = ".4"
+                control_row["effective_terrain_weight"] = "0"
+            if field in ("scene_generation", "scene_frame"):
+                for index, treatment_row in enumerate(treatment[40:], 40):
+                    treatment_row["scene_generation"] = "1"
+                    treatment_row["scene_frame"] = str(index - 40)
+                    treatment_row["scene_reset_count"] = "2"
+            elif field in ("route_waypoint", "route_complete"):
+                treatment[40][field] = "9" if field == "route_waypoint" else "1"
+            else:
+                treatment[40][field] = (
+                    ".50" if field == "commanded_speed" else "different")
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, "scripted input"):
+                    compare_control(treatment, control)
 
     def test_rejects_selected_frame_inconsistent_with_transition(self):
         with self.assertRaisesRegex(ValueError, "selected frame"):
