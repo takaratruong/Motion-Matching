@@ -448,13 +448,108 @@ void test_post_attach_updates_require_contact_but_not_a_second_event() {
     lost.hand_world.position =
         lost.hand_world.position + vec3(4.0F, 4.0F, 4.0F);
     attachment.update(lost, 0.70F);
-    assert(attachment.state() != ObjectState::Held);
+    assert(attachment.state() == ObjectState::Attached);
     assert(attachment.result() == ResultCode::Failed);
     assert(attachment.reason() == Reason::LostContact);
     assert(near(attachment.object_world(), last_valid));
     assert(near(attachment.held_seconds(), 0.0F));
-    assert(fixture.registry.find(fixture.request.target)->state !=
-           ObjectState::Held);
+    const InteractionTarget* registry_after_failure =
+        fixture.registry.find(fixture.request.target);
+    assert(registry_after_failure != nullptr);
+    const InteractionTarget after_failure = *registry_after_failure;
+    assert(after_failure.state == ObjectState::Attached);
+    assert(after_failure.owner_request == fixture.request.request_id);
+
+    Transform later_object = moved;
+    later_object.position =
+        later_object.position + vec3(-0.30F, 0.10F, 0.25F);
+    ContactMeasurement later_valid = measurement_for_object(
+        fixture, later_object);
+    later_valid.stable_contact_event = false;
+    attachment.update(later_valid, 0.70F);
+
+    assert(attachment.state() == ObjectState::Attached);
+    assert(attachment.result() == ResultCode::Failed);
+    assert(attachment.reason() == Reason::LostContact);
+    assert(near(attachment.object_world(), last_valid));
+    assert(near(attachment.held_seconds(), 0.0F));
+    const InteractionTarget* after_retry =
+        fixture.registry.find(fixture.request.target);
+    assert(after_retry != nullptr);
+    assert(after_retry->handle == after_failure.handle);
+    assert(after_retry->state == after_failure.state);
+    assert(after_retry->owner_request == after_failure.owner_request);
+    assert(exact(after_retry->object_world, after_failure.object_world));
+}
+
+void test_held_contact_loss_is_terminal_and_freezes_last_valid_state() {
+    using namespace interaction;
+
+    AttachmentFixture fixture = make_fixture();
+    AttachmentController attachment(fixture.registry);
+    assert(attachment.begin(
+        fixture.target,
+        fixture.request,
+        fixture.affordance,
+        fixture.target.object_world.position.y));
+    assert(attachment.try_contact(valid_measurement(fixture)));
+    Transform held_object = fixture.target.object_world;
+    held_object.position =
+        held_object.position + vec3(0.25F, 0.20F, -0.15F);
+    held_object.rotation = quat_from_angle_axis(
+        -0.42F, vec3(0.0F, 1.0F, 0.0F));
+    ContactMeasurement held_measurement = measurement_for_object(
+        fixture, held_object);
+    attachment.update(held_measurement, 1.0F);
+    assert(attachment.state() == ObjectState::Held);
+    assert(attachment.result() == ResultCode::Succeeded);
+    const Transform last_valid = attachment.object_world();
+    const float held_seconds = attachment.held_seconds();
+    const InteractionTarget* registry_before_failure =
+        fixture.registry.find(fixture.request.target);
+    assert(registry_before_failure != nullptr);
+    const InteractionTarget registry_held = *registry_before_failure;
+    assert(registry_held.state == ObjectState::Held);
+
+    ContactMeasurement lost = held_measurement;
+    lost.hand_contact = false;
+    lost.hand_world.position =
+        lost.hand_world.position + vec3(5.0F, -3.0F, 4.0F);
+    attachment.update(lost, 0.25F);
+
+    assert(attachment.state() == ObjectState::Held);
+    assert(attachment.result() == ResultCode::Failed);
+    assert(attachment.reason() == Reason::LostContact);
+    assert(near(attachment.object_world(), last_valid));
+    assert(near(attachment.held_seconds(), held_seconds));
+    const InteractionTarget* after_failure =
+        fixture.registry.find(fixture.request.target);
+    assert(after_failure != nullptr);
+    assert(after_failure->handle == registry_held.handle);
+    assert(after_failure->state == ObjectState::Held);
+    assert(after_failure->owner_request == registry_held.owner_request);
+    assert(exact(after_failure->object_world, registry_held.object_world));
+
+    Transform later_object = held_object;
+    later_object.position =
+        later_object.position + vec3(-0.60F, 0.30F, 0.45F);
+    ContactMeasurement later_valid = measurement_for_object(
+        fixture, later_object);
+    later_valid.stable_contact_event = false;
+    attachment.update(later_valid, 0.50F);
+
+    assert(attachment.state() == ObjectState::Held);
+    assert(attachment.result() == ResultCode::Failed);
+    assert(attachment.reason() == Reason::LostContact);
+    assert(near(attachment.object_world(), last_valid));
+    assert(near(attachment.held_seconds(), held_seconds));
+    const InteractionTarget* after_retry =
+        fixture.registry.find(fixture.request.target);
+    assert(after_retry != nullptr);
+    assert(after_retry->handle == registry_held.handle);
+    assert(after_retry->state == ObjectState::Held);
+    assert(after_retry->owner_request == registry_held.owner_request);
+    assert(exact(after_retry->object_world, registry_held.object_world));
 }
 
 void test_generation_change_fails_without_attaching_replacement() {
@@ -857,6 +952,7 @@ int main() {
     test_failed_contact_can_be_remeasured_without_teleporting();
     test_object_follows_grasp_and_hold_requires_continuous_lift();
     test_post_attach_updates_require_contact_but_not_a_second_event();
+    test_held_contact_loss_is_terminal_and_freezes_last_valid_state();
     test_generation_change_fails_without_attaching_replacement();
     test_reset_restores_exact_pose_and_increments_generation();
     test_repeated_contact_is_rejected_and_reset_can_rebegin();
