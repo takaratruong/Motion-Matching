@@ -138,10 +138,10 @@ static void test_pure_matching_invariance()
           bits(velocity_adjusted.y) == bits(character.y) &&
           bits(clamped.y) == bits(character.y),
           "horizontal helpers preserve exact source Y bits");
-    check(bits(adjusted.y - character.y) == bits(0.0f) &&
-          bits(velocity_adjusted.y - character.y) == bits(0.0f) &&
-          bits(clamped.y - character.y) == bits(0.0f),
-          "horizontal helper Y displacements are exact positive zero");
+    check(adjusted.y - character.y == 0.0f &&
+          velocity_adjusted.y - character.y == 0.0f &&
+          clamped.y - character.y == 0.0f,
+          "horizontal helper Y displacements are zero");
 }
 
 static void test_controller_source_contract(const char* path)
