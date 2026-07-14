@@ -1389,170 +1389,61 @@ git commit -m "feat: align G1 feet to terrain normals"
 
 **Files:**
 - Create: `g1_clearance.h`
+- Create: `g1_clearance.cpp`
 - Create: `tests/cpp/test_g1_clearance.cpp`
+- Later Task 6 owns the specified integration in: `g1_ik_runtime.h`
+- Later Task 6 owns the specified integration tests in: `tests/cpp/test_g1_ik.cpp`
 
 **Interfaces:**
-- Produces: `g1_point_clearance`, `g1_sole_points_world`, `g1_foot_clearance`, and conservative deterministic `g1_capsule_clearance`.
+- Produces: non-inline strict-FP `g1_point_clearance`, `g1_foot_clearance`, and conservative deterministic `g1_capsule_clearance` against the continuous fixed-diagonal G1HF/v2 surface.
 - Produces: `G1LegClearance` and `G1PoseClearance` with signed Hips, knee, ankle, toe, four-point sole, thigh-capsule, and shin-capsule clearances against the exact G1HF/v2 surface.
-- Produces: `G1SwingHistory`, `G1SwingClearancePlan`, `g1_swing_history_reset`, and `g1_swing_clearance_plan`.
-- Swing observation sweeps each IK-off sole probe from the prior 25 Hz support-retargeted pose to the current one at no more than half a terrain cell per sample. It requests only the missing vertical clearance, caps swing-only lift at `0.08 m`, and requests safe stop if that cap is insufficient.
+- Produces: `G1SwingHistory`, checked reset/commit, strict `g1_apply_swing_lift_y`, actual-center `g1_swing_clearance_validate`, and the immutable staged-candidate selection contract consumed by Task 6.
+- Swing selection evaluates only real post-IK/FK sphere endpoints at exact 25 Hz. It never translates predicted baseline spheres, estimates a continuous required lift, or samples a guessed lifted segment.
 
-- [ ] **Step 1: Write failing point, sole, capsule, sweep, and wall tests**
+> **Authoritative supersession (reviewed commit `66836d8`, independently CLEAN):** Sections 3, 6, 9, 10, 11, 12E/H/I/J, and 14 of `docs/superpowers/plans/2026-07-14-g1-certified-clearance-design.md` replace the former sampled/predicted swing planner. Step 4 below is the active integration contract. Any later snippet in Tasks 6--9 that calls `g1_swing_clearance_plan`, adds `applied_swing_lift_m` directly to `desired_sole_center.y`, logs `required_lift_m`, or treats `corrected_margin_m` from translated spheres as evidence is superseded and must be migrated to the selected ladder diagnostic while implementing that task. No old and new path may coexist.
 
-Create `tests/cpp/test_g1_clearance.cpp`:
+- [ ] **Step 1: Write failing certified-geometry and real-staging tests**
 
-```cpp
-#include "g1_clearance.h"
+Create `tests/cpp/test_g1_clearance.cpp` from the exact RED fixtures in
+Sections 12A--K of the reviewed certified-clearance design. Tests use `check`,
+not `assert`, seed every failure-path output/history owner with distinct bits,
+and verify unchanged outputs for every non-`Ok` result. In particular:
 
-#include <cmath>
-#include <cstdio>
-#include <cstdlib>
+- lock exact continuous fixed-diagonal point, sphere, capsule, foot, swept-foot,
+  and pose certificates; no test may accept a spatial sample count as proof;
+- call `g1_swing_clearance_validate` with named prior and **actual current**
+  four-sphere center bits and compare the target-subtracted capsule result to the
+  high-precision endpoint-bit oracle;
+- independently derive every ladder entry as `RN32(i/500 m)` for `i=0..40`,
+  require exact positive-zero and `0.08f` endpoints, and compare all 41 bits;
+- lock round-to-nearest/gradual-underflow rejection, nonfinite and nonzero
+  subnormal input behavior, the subnormal-command failure, exact 25 Hz, and
+  transactional history reset/commit.
 
-static void check(bool condition, const char* message)
-{
-    if (!condition) {
-        std::fprintf(stderr, "G1 clearance test failed: %s\n", message);
-        std::exit(1);
-    }
-}
+When Task 6 creates `g1_ik_runtime.h`, add the Section 12E integration fixture
+to `tests/cpp/test_g1_ik.cpp` under `G1_IK_ENABLE_TEST_SEAMS`. It must call the
+one real production staging function for indices `0..40` from the same immutable
+input, derive the first finite passing stage, and compare it with the full
+selector. Lock all of these outcomes:
 
-static heightfield make_step(float height)
-{
-    heightfield field;
-    field.version = 2;
-    field.nx = 4;
-    field.nz = 2;
-    field.origin_x = 0.0f;
-    field.origin_z = 0.0f;
-    field.cell_size = 0.10f;
-    field.exterior_height = -10.0f;
-    field.heights.resize(8);
-    for (int z = 0; z < 2; ++z) {
-        field.heights(z * 4 + 0) = 0.0f;
-        field.heights(z * 4 + 1) = 0.0f;
-        field.heights(z * 4 + 2) = height;
-        field.heights(z * 4 + 3) = height;
-    }
-    return field;
-}
+- at least one real finite rejection precedes the selected stage;
+- calls are contiguous from zero, `candidates_evaluated == selected_index + 1`,
+  and the selected lift, materialized command, twelve actual sphere-center bits,
+  binary64 margin, and work match the probed stage;
+- final rotations reproduce those endpoint bits and the selected staged result
+  is reused with no additional position-IK/orientation solve;
+- a real wall fixture makes exactly 41 real calls, returns
+  `G1SwingNoCandidate`, requests safe stop, and leaves accepted pose, state,
+  histories, support, matcher, and simulation bit-identical;
+- strict and fast-math callers certify identical supplied endpoint bits
+  byte-for-byte. Per-build IK endpoints may differ, but each build must expose
+  and deterministically certify its own first actual pass.
 
-static void set_foot_centers(vec3 points[4], float x, float center_y)
-{
-    points[0] = vec3(x - 0.05f, center_y, 0.035f);
-    points[1] = vec3(x - 0.05f, center_y, 0.065f);
-    points[2] = vec3(x + 0.12f, center_y, 0.030f);
-    points[3] = vec3(x + 0.12f, center_y, 0.070f);
-}
+A negative compile names `g1_ik_stage_swing_candidate_for_test` without
+`G1_IK_ENABLE_TEST_SEAMS` and must fail. A production object must contain no
+declaration or symbol for the seam.
 
-static void test_point_sole_and_capsule_clearance()
-{
-    const heightfield flat = make_step(0.0f);
-    char error[256] = {};
-    float clearance = 0.0f;
-    check(g1_point_clearance(
-              clearance, flat, vec3(0.05f, 0.03f, 0.05f),
-              error, sizeof(error)), error);
-    check(std::fabs(clearance - 0.03f) < 1e-6f, "point clearance");
-
-    vec3 sphere_centers[4];
-    for (int i = 0; i < 4; ++i)
-        sphere_centers[i] = vec3(0.05f, 0.025f, 0.05f);
-    G1MinimumClearance foot = {};
-    check(g1_foot_clearance(
-              foot, flat, sphere_centers, 0.02f,
-              error, sizeof(error)), error);
-    check(std::fabs(foot.minimum_m - 0.005f) < 1e-6f,
-          "four-sphere foot envelope clearance");
-
-    const heightfield edge = make_step(0.20f);
-    for (int i = 0; i < 4; ++i)
-        sphere_centers[i] = vec3(0.095f, 0.025f, 0.05f);
-    check(g1_point_clearance(
-              clearance, edge, vec3(0.095f, 0.005f, 0.05f),
-              error, sizeof(error)), error);
-    check(clearance > 0.0049f, "sphere bottom-center probe is clear");
-    check(g1_foot_clearance(
-              foot, edge, sphere_centers, 0.02f,
-              error, sizeof(error)), error);
-    check(foot.minimum_m < 0.0f,
-          "sphere lower envelope catches adjacent stair edge");
-
-    G1MinimumClearance capsule = {};
-    check(g1_capsule_clearance(
-              capsule, flat,
-              vec3(0.05f, 0.20f, 0.05f),
-              vec3(0.05f, 0.40f, 0.05f), 0.04f,
-              error, sizeof(error)), error);
-    check(capsule.minimum_m > 0.159f && capsule.minimum_m < 0.161f,
-          "capsule lower envelope clearance");
-    check(capsule.samples > 8, "capsule uses bounded spatial samples");
-}
-
-static void test_swept_clearance_and_safe_stop()
-{
-    const G1LegConfig leg = g1_left_leg_config();
-    char error[256] = {};
-    vec3 previous[4];
-    vec3 current[4];
-    set_foot_centers(previous, 0.02f, 0.04f);
-    set_foot_centers(current, 0.25f, 0.04f);
-
-    G1SwingHistory history = {};
-    g1_swing_history_reset(history, previous);
-    G1SwingClearancePlan plan = {};
-    const heightfield shallow = make_step(0.04f);
-    check(g1_swing_clearance_plan(
-              history, plan, shallow, leg, current, false,
-              1.0f / 25.0f, error, sizeof(error)), error);
-    check(plan.samples >= 5, "sweep samples at half-cell spacing");
-    check(plan.required_lift_m > 0.0f &&
-          plan.required_lift_m <= leg.max_swing_lift_m,
-          "shallow step requests bounded lift");
-    check(!plan.safe_stop_requested, "bounded shallow lift remains traversable");
-    check(plan.corrected_margin_m >= -1e-5f,
-          "corrected sphere sweep is actually clear");
-    vec3 lifted[4];
-    for (int i = 0; i < 4; ++i) {
-        lifted[i] = current[i];
-        lifted[i].y += plan.applied_lift_m;
-    }
-    check(g1_swing_clearance_validate(
-              plan.actual_corrected_margin_m, history, shallow, leg,
-              lifted, false, error, sizeof(error)), error);
-    check(plan.actual_corrected_margin_m >= -1e-5f,
-          "actual corrected endpoint sweep is clear");
-
-    g1_swing_history_reset(history, previous);
-    const heightfield wall = make_step(0.45f);
-    check(g1_swing_clearance_plan(
-              history, plan, wall, leg, current, false,
-              1.0f / 25.0f, error, sizeof(error)), error);
-    check(plan.required_lift_m > leg.max_swing_lift_m,
-          "wall exceeds swing-only lift");
-    check(std::fabs(plan.applied_lift_m - leg.max_swing_lift_m) < 1e-7f,
-          "wall lift remains capped");
-    check(plan.safe_stop_requested, "wall requests traversability safe stop");
-
-    g1_swing_history_reset(history, current);
-    check(g1_swing_clearance_plan(
-              history, plan, shallow, leg, current, true,
-              1.0f / 25.0f, error, sizeof(error)), error);
-    check(plan.applied_lift_m == 0.0f && plan.samples == 0,
-          "planted foot does not receive swing lift");
-    g1_swing_history_commit(history, current);
-    check(history.previous_sphere_centers[0].x == current[0].x,
-          "only accepted rendered output commits sweep history");
-}
-
-int main()
-{
-    test_point_sole_and_capsule_clearance();
-    test_swept_clearance_and_safe_stop();
-    return 0;
-}
-```
-
-- [ ] **Step 2: Compile to verify clearance RED**
+- [ ] **Step 2: Run the certified-clearance RED**
 
 Run:
 
@@ -1561,481 +1452,220 @@ g++ -std=c++17 -O0 -g -Wall -Wextra -Werror -pedantic -I. \
   tests/cpp/test_g1_clearance.cpp -o /tmp/test_g1_clearance
 ```
 
-Expected: compilation fails with `fatal error: g1_clearance.h: No such file or directory`.
+Expected before implementation: compilation fails because the reviewed public
+status/result API or `g1_clearance.cpp` implementation is absent. Do not make
+this RED pass with inline sampling helpers.
 
-- [ ] **Step 3: Implement exact-surface point, foot, and capsule diagnostics**
+- [ ] **Step 3: Implement the strict certified geometry and diagnostics**
 
-Create `g1_clearance.h`:
+Create `g1_clearance.h` and non-inline `g1_clearance.cpp` exactly from Sections
+3--8 and reviewed design Tasks 1--6. This is the only active geometry path:
 
-```cpp
-#pragma once
+- public point, sphere, capsule, foot, swept-foot, leg, and pose functions
+  return `G1ClearanceStatus` and assign result/history outputs only on their
+  documented success path;
+- safety bounds, witnesses, pose minima, and swing margins remain binary64;
+- sphere/capsule clearance minimizes continuously against the authoritative
+  fixed-diagonal G1HF/v2 triangles with outward intervals, exact footprint
+  containment, fixed absolute budgets, and the mandatory producer-output guard;
+- point lattices, radial lattices, `segment_steps`, `ceil`-derived work, rounded
+  terrain-sample minima, and header-only proof arithmetic are forbidden;
+- `OutsideDomain`, `BudgetExceeded`, and `Uncertified` are distinct fail-closed
+  outcomes. `InvalidInput`, `InvalidField`, and `ArithmeticFailure` retain their
+  reviewed transactional meanings;
+- `g1_clearance.cpp` rejects `__FAST_MATH__`, validates round-to-nearest plus
+  gradual binary32/binary64 underflow before input-dependent arithmetic, and is
+  compiled with `-fno-fast-math -ffp-contract=off -frounding-math`.
 
-#include "g1_ik.h"
+Implement checked `G1SwingHistory` reset/commit,
+`g1_apply_swing_lift_y`, and actual-center `g1_swing_clearance_validate` in
+this strict boundary. The validator receives no lift value: its current sphere
+centers already contain the actual controller/IK/FK result.
 
-#include <cfloat>
-#include <cmath>
+- [ ] **Step 4: Implement certified staged swing lift selection**
 
-struct G1MinimumClearance
-{
-    float minimum_m = FLT_MAX;
-    vec3 body_point;
-    vec3 surface_point;
-    int samples = 0;
-};
+This step supersedes every former sampled/predicted lift search. Task 5 supplies
+the strict materializer and actual-center certificate; Task 6 owns the runtime
+staging transaction described here.
 
-static inline bool g1_clearance_consider(
-    G1MinimumClearance& result,
-    const heightfield& field,
-    vec3 body_point,
-    char* error,
-    int error_capacity)
-{
-    if (!g1_ik_vec3_is_runtime_value(body_point))
-        return g1_ik_error(error, error_capacity, "G1 clearance body point is non-finite");
-    G1SurfaceSample surface = {};
-    const G1SurfaceQueryStatus status = g1_surface_query_v2(
-        surface, field, body_point.x, body_point.z);
-    if (status == G1SurfaceQueryOutside)
-        return g1_ik_error(error, error_capacity, "G1 clearance query is outside terrain");
-    if (status != G1SurfaceQueryValid)
-        return g1_ik_error(error, error_capacity, "G1 clearance surface sample is invalid");
-    const volatile double promoted_clearance =
-        static_cast<double>(body_point.y) -
-        static_cast<double>(surface.height);
-    float clearance = 0.0f;
-    if (!terrain_v2_round_output(promoted_clearance, clearance))
-        return g1_ik_error(error, error_capacity, "G1 clearance difference overflowed");
-    ++result.samples;
-    if (clearance < result.minimum_m) {
-        result.minimum_m = clearance;
-        result.body_point = body_point;
-        result.surface_point = vec3(
-            terrain_runtime_canonicalize_output(body_point.x),
-            surface.height,
-            terrain_runtime_canonicalize_output(body_point.z));
-    }
-    return true;
-}
-
-static inline bool g1_point_clearance(
-    float& output,
-    const heightfield& field,
-    vec3 point,
-    char* error,
-    int error_capacity)
-{
-    G1MinimumClearance result = {};
-    if (!g1_clearance_consider(result, field, point, error, error_capacity))
-        return false;
-    output = result.minimum_m;
-    return true;
-}
-
-static inline void g1_sole_points_world(
-    vec3 output[4],
-    vec3 contact_position,
-    quat contact_rotation,
-    const G1LegConfig& config)
-{
-    for (int i = 0; i < 4; ++i)
-        output[i] = contact_position + quat_mul_vec3(
-            contact_rotation, config.sole_points_local[i]);
-}
-
-static inline void g1_foot_sphere_centers_world(
-    vec3 output[4],
-    vec3 contact_position,
-    quat contact_rotation,
-    const G1LegConfig& config)
-{
-    for (int i = 0; i < 4; ++i)
-        output[i] = contact_position + quat_mul_vec3(
-            contact_rotation, config.foot_sphere_centers_local[i]);
-}
-
-static inline vec3 g1_sole_center_world(const vec3 points[4])
-{
-    return 0.25f * (points[0] + points[1] + points[2] + points[3]);
-}
-
-static inline bool g1_capsule_clearance(
-    G1MinimumClearance& output,
-    const heightfield& field,
-    vec3 endpoint_a,
-    vec3 endpoint_b,
-    float radius_m,
-    char* error,
-    int error_capacity)
-{
-    if (field.version != 2 ||
-        !g1_ik_vec3_is_runtime_value(endpoint_a) ||
-        !g1_ik_vec3_is_runtime_value(endpoint_b) ||
-        !terrain_float_is_finite(radius_m) || radius_m <= 0.0f ||
-        !terrain_float_is_finite(field.cell_size) || field.cell_size <= 0.0f) {
-        return g1_ik_error(error, error_capacity, "G1 capsule clearance input is invalid");
-    }
-    const float spacing = minf(0.01f, 0.5f * field.cell_size);
-    const int segment_steps = static_cast<int>(maxf(
-        1.0f, std::ceil(length(endpoint_b - endpoint_a) / spacing)));
-    const int radial_steps = static_cast<int>(std::ceil(radius_m / spacing));
-    G1MinimumClearance result = {};
-    for (int along = 0; along <= segment_steps; ++along) {
-        const float alpha = static_cast<float>(along) / segment_steps;
-        const vec3 center = lerp(endpoint_a, endpoint_b, alpha);
-        for (int ix = -radial_steps; ix <= radial_steps; ++ix) {
-            for (int iz = -radial_steps; iz <= radial_steps; ++iz) {
-                const float dx = ix * spacing;
-                const float dz = iz * spacing;
-                const float horizontal_sq = dx * dx + dz * dz;
-                if (horizontal_sq > radius_m * radius_m + 1e-8f) continue;
-                const float lower = center.y - std::sqrt(maxf(
-                    radius_m * radius_m - horizontal_sq, 0.0f));
-                if (!g1_clearance_consider(
-                        result, field, vec3(center.x + dx, lower, center.z + dz),
-                        error, error_capacity)) return false;
-            }
-        }
-    }
-    output = result;
-    return true;
-}
-
-static inline bool g1_foot_clearance(
-    G1MinimumClearance& output,
-    const heightfield& field,
-    const vec3 sphere_centers[4],
-    float sphere_radius_m,
-    char* error,
-    int error_capacity)
-{
-    G1MinimumClearance result = {};
-    for (int sphere = 0; sphere < 4; ++sphere) {
-        G1MinimumClearance current = {};
-        if (!g1_capsule_clearance(
-                current, field, sphere_centers[sphere],
-                sphere_centers[sphere], sphere_radius_m,
-                error, error_capacity)) return false;
-        result.samples += current.samples;
-        if (current.minimum_m < result.minimum_m) {
-            result.minimum_m = current.minimum_m;
-            result.body_point = current.body_point;
-            result.surface_point = current.surface_point;
-        }
-    }
-    output = result;
-    return true;
-}
-```
-
-- [ ] **Step 4: Implement swept swing history and bounded lift planning**
-
-Append to `g1_clearance.h`:
+The immutable production ladder in `g1_ik_runtime.h` is:
 
 ```cpp
-struct G1SwingHistory
-{
-    bool initialized = false;
-    vec3 previous_sphere_centers[4];
+constexpr uint32_t G1SwingLiftCandidateCount = 41;
+constexpr uint32_t G1SwingNoCandidate = UINT32_MAX;
+constexpr uint32_t G1SwingLiftCandidateBits[41] = {
+    0x00000000u, 0x3b03126fu, 0x3b83126fu, 0x3bc49ba6u,
+    0x3c03126fu, 0x3c23d70au, 0x3c449ba6u, 0x3c656042u,
+    0x3c83126fu, 0x3c9374bcu, 0x3ca3d70au, 0x3cb43958u,
+    0x3cc49ba6u, 0x3cd4fdf4u, 0x3ce56042u, 0x3cf5c28fu,
+    0x3d03126fu, 0x3d0b4396u, 0x3d1374bcu, 0x3d1ba5e3u,
+    0x3d23d70au, 0x3d2c0831u, 0x3d343958u, 0x3d3c6a7fu,
+    0x3d449ba6u, 0x3d4ccccdu, 0x3d54fdf4u, 0x3d5d2f1bu,
+    0x3d656042u, 0x3d6d9168u, 0x3d75c28fu, 0x3d7df3b6u,
+    0x3d83126fu, 0x3d872b02u, 0x3d8b4396u, 0x3d8f5c29u,
+    0x3d9374bcu, 0x3d978d50u, 0x3d9ba5e3u, 0x3d9fbe77u,
+    0x3da3d70au,
 };
-
-struct G1SwingClearancePlan
-{
-    float baseline_minimum_m = FLT_MAX;
-    float corrected_minimum_m = FLT_MAX;
-    float corrected_margin_m = FLT_MAX;
-    float actual_corrected_margin_m = FLT_MAX;
-    float required_lift_m = 0.0f;
-    float applied_lift_m = 0.0f;
-    bool safe_stop_requested = false;
-    vec3 worst_body_point;
-    vec3 worst_surface_point;
-    int samples = 0;
-};
-
-static inline void g1_swing_history_reset(
-    G1SwingHistory& history, const vec3 sphere_centers[4])
-{
-    history = G1SwingHistory();
-    history.initialized = true;
-    for (int i = 0; i < 4; ++i)
-        history.previous_sphere_centers[i] = sphere_centers[i];
-}
-
-static inline void g1_swing_history_commit(
-    G1SwingHistory& history, const vec3 accepted_sphere_centers[4])
-{
-    for (int i = 0; i < 4; ++i)
-        history.previous_sphere_centers[i] = accepted_sphere_centers[i];
-}
-
-static inline bool g1_swing_clearance_plan(
-    const G1SwingHistory& history,
-    G1SwingClearancePlan& output,
-    const heightfield& field,
-    const G1LegConfig& config,
-    const vec3 current_sphere_centers[4],
-    bool recorded_contact,
-    float dt,
-    char* error,
-    int error_capacity)
-{
-    if (!history.initialized || field.version != 2 ||
-        !g1_ik_dt_is_exact_25_hz(dt)) {
-        return g1_ik_error(
-            error, error_capacity,
-            "G1 swing sweep requires initialized G1HF/v2 state at 25 Hz");
-    }
-    for (int i = 0; i < 4; ++i)
-        if (!g1_ik_vec3_is_runtime_value(current_sphere_centers[i]))
-            return g1_ik_error(error, error_capacity, "G1 swing sphere center is non-finite");
-
-    G1SwingClearancePlan result = {};
-    if (!recorded_contact) {
-        const float spacing = minf(0.01f, 0.5f * field.cell_size);
-        float maximum_travel = 0.0f;
-        for (int i = 0; i < 4; ++i)
-            maximum_travel = maxf(
-                maximum_travel,
-                length(current_sphere_centers[i] -
-                       history.previous_sphere_centers[i]));
-        const int steps = static_cast<int>(maxf(
-            1.0f, std::ceil(maximum_travel / spacing)));
-        for (int step = 1; step <= steps; ++step) {
-            const float alpha = static_cast<float>(step) / steps;
-            vec3 centers[4];
-            for (int sphere = 0; sphere < 4; ++sphere) {
-                centers[sphere] = lerp(
-                    history.previous_sphere_centers[sphere],
-                    current_sphere_centers[sphere], alpha);
-            }
-            G1MinimumClearance sample = {};
-            if (!g1_foot_clearance(
-                    sample, field, centers, config.foot_sphere_radius_m,
-                    error, error_capacity)) return false;
-            const float target_clearance = lerpf(
-                config.planted_clearance_m,
-                config.swing_clearance_m, alpha);
-            result.required_lift_m = maxf(
-                result.required_lift_m,
-                maxf(target_clearance - sample.minimum_m, 0.0f) / alpha);
-            if (sample.minimum_m < result.baseline_minimum_m) {
-                result.baseline_minimum_m = sample.minimum_m;
-                result.worst_body_point = sample.body_point;
-                result.worst_surface_point = sample.surface_point;
-            }
-            result.samples += sample.samples;
-        }
-        result.applied_lift_m = minf(
-            result.required_lift_m, config.max_swing_lift_m);
-        for (int step = 1; step <= steps; ++step) {
-            const float alpha = static_cast<float>(step) / steps;
-            vec3 centers[4];
-            for (int sphere = 0; sphere < 4; ++sphere) {
-                centers[sphere] = lerp(
-                    history.previous_sphere_centers[sphere],
-                    current_sphere_centers[sphere], alpha);
-                centers[sphere].y += alpha * result.applied_lift_m;
-            }
-            G1MinimumClearance corrected = {};
-            if (!g1_foot_clearance(
-                    corrected, field, centers, config.foot_sphere_radius_m,
-                    error, error_capacity)) return false;
-            const float target_clearance = lerpf(
-                config.planted_clearance_m,
-                config.swing_clearance_m, alpha);
-            result.corrected_minimum_m = minf(
-                result.corrected_minimum_m, corrected.minimum_m);
-            result.corrected_margin_m = minf(
-                result.corrected_margin_m,
-                corrected.minimum_m - target_clearance);
-            result.samples += corrected.samples;
-        }
-        result.safe_stop_requested =
-            result.required_lift_m > config.max_swing_lift_m + 1e-6f ||
-            result.corrected_margin_m < -1e-5f;
-    }
-    output = result;
-    return true;
-}
-
-static inline bool g1_swing_clearance_validate(
-    float& output_margin,
-    const G1SwingHistory& history,
-    const heightfield& field,
-    const G1LegConfig& config,
-    const vec3 final_sphere_centers[4],
-    bool recorded_contact,
-    char* error,
-    int error_capacity)
-{
-    if (recorded_contact) {
-        output_margin = FLT_MAX;
-        return true;
-    }
-    const float spacing = minf(0.01f, 0.5f * field.cell_size);
-    float maximum_travel = 0.0f;
-    for (int sphere = 0; sphere < 4; ++sphere)
-        maximum_travel = maxf(
-            maximum_travel,
-            length(final_sphere_centers[sphere] -
-                   history.previous_sphere_centers[sphere]));
-    const int steps = static_cast<int>(maxf(
-        1.0f, std::ceil(maximum_travel / spacing)));
-    float margin = FLT_MAX;
-    for (int step = 1; step <= steps; ++step) {
-        const float alpha = static_cast<float>(step) / steps;
-        vec3 centers[4];
-        for (int sphere = 0; sphere < 4; ++sphere)
-            centers[sphere] = lerp(
-                history.previous_sphere_centers[sphere],
-                final_sphere_centers[sphere], alpha);
-        G1MinimumClearance sample = {};
-        if (!g1_foot_clearance(
-                sample, field, centers, config.foot_sphere_radius_m,
-                error, error_capacity)) return false;
-        const float target_clearance = lerpf(
-            config.planted_clearance_m,
-            config.swing_clearance_m, alpha);
-        margin = minf(margin, sample.minimum_m - target_clearance);
-    }
-    output_margin = margin;
-    return true;
-}
 ```
 
-Planning derives endpoint lift as `deficit / alpha` for every full-sphere sweep
-sample, because only `alpha * endpoint_lift` exists at an intermediate point.
-It then re-sweeps the corrected linear candidate and exposes the actual margin.
-The planning function never advances history. Task 7 commits only the final
-accepted rendered sphere centers; a rejected/rolled-back candidate leaves the
-previous safe history exact.
+Entry `i` is canonical binary32 `RN32(i/500 m)`: immutable 2 mm
+increments from `+0.00 m` through `0.08 m` inclusive. Load checked-in bits with
+the existing `memcpy` helper. Never generate entries by float arithmetic, use a
+binary search/non-ladder float iteration, infer a pass between entries, or
+invent candidate 41.
 
-- [ ] **Step 5: Add complete post-IK leg/pose diagnostic aggregation**
+For each frame:
 
-Append to `g1_clearance.h`:
+1. Before caller-owned mutation, validate exact 25 Hz, shapes, state, G1HF/v2,
+   leg configuration, `max_swing_lift_m` bits equal entry 40, and the strict
+   arithmetic environment. Snapshot one immutable per-foot baseline. Recorded
+   contact bypasses the ladder with `candidates_evaluated=0` and
+   `selected_index=G1SwingNoCandidate`; the contact flag distinguishes this
+   success from all-fail safe stop.
+2. For each non-contact foot, visit indices `0..40` in exact order. Every
+   candidate starts from a fresh copy of the same baseline. Call non-inline
+   strict `g1_apply_swing_lift_y` on the **actual**
+   `desired_sole_center.y`, then run the real named bounded position IK, foot
+   orientation, controller checks, and checked FK in their production order.
+3. Compute the four configured world-space foot-sphere centers from that staged
+   FK, record all twelve raw binary32 bits at the certificate boundary, and call
+   `g1_swing_clearance_validate` on those exact values with a fresh per-call
+   swing budget. For each sphere, certify the target-subtracted prior/current
+   centerline as a continuous capsule against exact G1HF/v2. Form adjusted Y
+   with binary64 `TwoDiff`; never round it through binary32 or predict
+   `baseline_sphere_y + lift`.
+4. A candidate passes only when every controller constraint passes, clearance
+   status is `G1ClearanceOk`, and binary64 `lower_margin_m >= 0.0`. A finite
+   controller rejection, negative `Ok` margin, `OutsideDomain`,
+   `BudgetExceeded`, or `Uncertified` rejects only that candidate and advances
+   to the next index. `InvalidInput`, `InvalidField`, or `ArithmeticFailure`
+   aborts the frame transaction unchanged.
+5. Select the first passing candidate and move its already-staged pose/result
+   into the outer scratch pose. Reuse its certificate and endpoint bits; do not
+   rerun IK to apply it. After both feet compose, run checked FK once, require
+   selected endpoint-bit equality, and perform the mandatory fresh actual-center
+   certificate. Any mismatch or failed defensive certificate rolls back the
+   entire frame.
+6. If all 41 candidates finitely reject, report exactly
+   `candidates_evaluated=41`, `selected_index=G1SwingNoCandidate`, default
+   ignored selected fields, and safe stop. Roll back accepted pose, clearance,
+   histories, state, support, matcher, and simulation. Never report a fabricated
+   continuous `required_lift_m`.
 
-```cpp
-struct G1LegClearance
-{
-    float knee_m = FLT_MAX;
-    float ankle_m = FLT_MAX;
-    float toe_m = FLT_MAX;
-    float foot_m = FLT_MAX;
-    float thigh_m = FLT_MAX;
-    float shin_m = FLT_MAX;
-    float minimum_m = FLT_MAX;
-};
+Expose candidate probing only inside
+`#if defined(G1_IK_ENABLE_TEST_SEAMS)`. The wrapper calls the same private
+production stage and returns diagnostics only; it cannot duplicate geometry or
+expose a mutable staged pose. Builds without the macro contain neither its
+declaration nor its symbol.
 
-struct G1PoseClearance
-{
-    float hips_m = FLT_MAX;
-    G1LegClearance left;
-    G1LegClearance right;
-    float minimum_m = FLT_MAX;
-};
+Finite/subnormal semantics are exact: every public status entry checks
+round-to-nearest and gradual underflow before input-dependent arithmetic; FTZ,
+DAZ, or failed volatile binary32/binary64 denormal probes return transactional
+`ArithmeticFailure`. `g1_apply_swing_lift_y` requires runtime `input_y`
+(finite, signed zero canonicalized, nonzero subnormal rejected as
+`InvalidInput`) and finite nonnegative `lift_m <= 0.08f`; either lift-zero sign
+becomes `+0.0f`. It performs exactly
+`RN32(double(input_y)+double(lift_m))`, canonicalizes a zero result, and rejects
+a nonfinite or nonzero-subnormal materialized command as `ArithmeticFailure`
+with output unchanged. Positive subnormal test lifts retain their input bits but
+are not guaranteed to materialize: `+0.0f + denorm_min` must fail unchanged.
+Production ladder entries above zero are normal. Geometry canonicalizes signed
+zero and rejects every nonzero binary32 subnormal coordinate as `InvalidInput`.
 
-static inline vec3 g1_local_point_world(
-    vec3 bone_position, quat bone_rotation, vec3 local_point)
-{
-    return bone_position + quat_mul_vec3(bone_rotation, local_point);
-}
+- [ ] **Step 5: Add exact post-IK leg/pose aggregation**
 
-static inline bool g1_measure_leg_clearance(
-    G1LegClearance& output,
-    const heightfield& field,
-    const slice1d<vec3> global_positions,
-    const slice1d<quat> global_rotations,
-    const G1LegConfig& config,
-    char* error,
-    int error_capacity)
-{
-    G1LegClearance result = {};
-    if (!g1_point_clearance(result.knee_m, field, global_positions(config.knee), error, error_capacity) ||
-        !g1_point_clearance(result.ankle_m, field, global_positions(config.ankle), error, error_capacity) ||
-        !g1_point_clearance(result.toe_m, field, global_positions(config.contact), error, error_capacity))
-        return false;
-    vec3 sphere_centers[4];
-    g1_foot_sphere_centers_world(
-        sphere_centers, global_positions(config.contact),
-        global_rotations(config.contact), config);
-    G1MinimumClearance foot = {};
-    G1MinimumClearance thigh = {};
-    G1MinimumClearance shin = {};
-    if (!g1_foot_clearance(
-            foot, field, sphere_centers, config.foot_sphere_radius_m,
-            error, error_capacity) ||
-        !g1_capsule_clearance(
-            thigh, field,
-            g1_local_point_world(global_positions(config.hip), global_rotations(config.hip), config.thigh_start_local),
-            g1_local_point_world(global_positions(config.hip), global_rotations(config.hip), config.thigh_end_local),
-            config.thigh_radius_m, error, error_capacity) ||
-        !g1_capsule_clearance(
-            shin, field,
-            g1_local_point_world(global_positions(config.knee), global_rotations(config.knee), config.shin_start_local),
-            g1_local_point_world(global_positions(config.knee), global_rotations(config.knee), config.shin_end_local),
-            config.shin_radius_m, error, error_capacity)) return false;
-    result.foot_m = foot.minimum_m;
-    result.thigh_m = thigh.minimum_m;
-    result.shin_m = shin.minimum_m;
-    result.minimum_m = minf(
-        minf(minf(result.knee_m, result.ankle_m), minf(result.toe_m, result.foot_m)),
-        minf(result.thigh_m, result.shin_m));
-    output = result;
-    return true;
-}
+Implement `G1LegClearance` and `G1PoseClearance` from reviewed design Section 3
+and Task 5. Preserve the named Hips, knee, ankle, toe, four-sphere foot, thigh
+capsule, and shin capsule diagnostics, but store `G1ClearanceResult` values and
+use binary64 lower bounds for every safety decision. Share one validated
+absolute pose budget through the complete aggregation; a late failure assigns
+no public result. No float minimum or sampled `G1MinimumClearance` API remains.
 
-static inline bool g1_measure_pose_clearance(
-    G1PoseClearance& output,
-    const heightfield& field,
-    const slice1d<vec3> global_positions,
-    const slice1d<quat> global_rotations,
-    char* error,
-    int error_capacity)
-{
-    if (global_positions.size != G1_BoneCount ||
-        global_rotations.size != G1_BoneCount)
-        return g1_ik_error(error, error_capacity, "G1 clearance pose shape mismatch");
-    G1PoseClearance result = {};
-    if (!g1_point_clearance(
-            result.hips_m, field, global_positions(G1_Hips),
-            error, error_capacity) ||
-        !g1_measure_leg_clearance(
-            result.left, field, global_positions, global_rotations,
-            g1_left_leg_config(), error, error_capacity) ||
-        !g1_measure_leg_clearance(
-            result.right, field, global_positions, global_rotations,
-            g1_right_leg_config(), error, error_capacity)) return false;
-    result.minimum_m = minf(
-        result.hips_m, minf(result.left.minimum_m, result.right.minimum_m));
-    output = result;
-    return true;
-}
-```
+- [ ] **Step 6: Run strict, release-caller, sanitizer, and staging verification**
 
-- [ ] **Step 6: Run clearance GREEN in strict, release, and sanitizer modes**
-
-Run:
+Build the kernel separately and never pass `-ffast-math` to the final link:
 
 ```bash
+mkdir -p /tmp/g1-ik-clearance/native
+
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic \
+  -fno-fast-math -ffp-contract=off -frounding-math -I. \
+  -c g1_clearance.cpp \
+  -o /tmp/g1-ik-clearance/native/g1-clearance-strict.o
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
-  tests/cpp/test_g1_clearance.cpp -o /tmp/test_g1_clearance_strict
-/tmp/test_g1_clearance_strict
+  -c tests/cpp/test_g1_clearance.cpp \
+  -o /tmp/g1-ik-clearance/native/test-clearance-strict.o
+g++ /tmp/g1-ik-clearance/native/test-clearance-strict.o \
+  /tmp/g1-ik-clearance/native/g1-clearance-strict.o \
+  -o /tmp/g1-ik-clearance/native/test-clearance-strict
+/tmp/g1-ik-clearance/native/test-clearance-strict
+
 g++ -std=c++17 -O3 -ffast-math -DNDEBUG -I. \
-  tests/cpp/test_g1_clearance.cpp -o /tmp/test_g1_clearance_release
-/tmp/test_g1_clearance_release
-g++ -std=c++17 -O1 -g -fsanitize=address,undefined \
-  -fno-omit-frame-pointer -I. tests/cpp/test_g1_clearance.cpp \
-  -o /tmp/test_g1_clearance_san
-ASAN_OPTIONS=detect_leaks=1 /tmp/test_g1_clearance_san
+  -c tests/cpp/test_g1_clearance.cpp \
+  -o /tmp/g1-ik-clearance/native/test-clearance-release-caller.o
+g++ -std=c++17 -O3 -fno-fast-math -ffp-contract=off \
+  -frounding-math -DNDEBUG -I. -c g1_clearance.cpp \
+  -o /tmp/g1-ik-clearance/native/g1-clearance-release-kernel.o
+g++ /tmp/g1-ik-clearance/native/test-clearance-release-caller.o \
+  /tmp/g1-ik-clearance/native/g1-clearance-release-kernel.o \
+  -o /tmp/g1-ik-clearance/native/test-clearance-release
+/tmp/g1-ik-clearance/native/test-clearance-release
+
+g++ -std=c++17 -O1 -g -fno-fast-math -ffp-contract=off \
+  -frounding-math \
+  -fsanitize=address,undefined,float-cast-overflow,float-divide-by-zero \
+  -fno-sanitize-recover=all -fno-omit-frame-pointer -I. \
+  -c g1_clearance.cpp \
+  -o /tmp/g1-ik-clearance/native/g1-clearance-san.o
+g++ -std=c++17 -O1 -g -fno-fast-math \
+  -fsanitize=address,undefined,float-cast-overflow,float-divide-by-zero \
+  -fno-sanitize-recover=all -fno-omit-frame-pointer -I. \
+  -c tests/cpp/test_g1_clearance.cpp \
+  -o /tmp/g1-ik-clearance/native/test-clearance-san.o
+g++ -fsanitize=address,undefined,float-cast-overflow,float-divide-by-zero \
+  -fno-sanitize-recover=all \
+  /tmp/g1-ik-clearance/native/test-clearance-san.o \
+  /tmp/g1-ik-clearance/native/g1-clearance-san.o \
+  -o /tmp/g1-ik-clearance/native/test-clearance-san
+ASAN_OPTIONS=detect_leaks=1 \
+UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+  /tmp/g1-ik-clearance/native/test-clearance-san
+
+if g++ -std=c++17 -O3 -ffast-math -I. -c g1_clearance.cpp \
+    -o /tmp/g1-ik-clearance/native/forbidden-fast-kernel.o \
+    2>/tmp/g1-ik-clearance/native/forbidden-fast-kernel.err; then
+  echo "certified kernel unexpectedly accepted fast math" >&2
+  exit 1
+fi
+rg -n "fast math" \
+  /tmp/g1-ik-clearance/native/forbidden-fast-kernel.err
+
+! rg -n 'ceil\(|radial_steps|segment_steps|half.*cell.*sample' \
+  g1_clearance.cpp g1_clearance.h
+! rg -n 'ordered.*lift|sphere.*\+.*lift|required_lift_m' \
+  g1_clearance.cpp g1_clearance.h g1_ik_runtime.h
+git diff --check
 ```
 
-Expected: all three executables exit `0`; shallow sweep produces a bounded lift, the `0.45 m` wall produces a safe-stop request, and no sanitizer finding appears.
+Expected: strict, release-caller, and sanitizer executables exit zero; the fast
+kernel compile fails at its guard; identical endpoint-bit parity records match
+byte-for-byte; all environment mutations are restored; and no sampled or
+predicted-lift production path remains.
 
-- [ ] **Step 7: Commit swept clearance and physical diagnostics**
+After Task 6 creates the runtime, compile `tests/cpp/test_g1_ik.cpp` with
+`-DG1_IK_ENABLE_TEST_SEAMS` once as a strict caller and once as a fast-math
+caller, link both to a separately compiled strict `g1_clearance.cpp` object, and
+run the staged fixture in both builds. Require real contiguous calls, first-pass
+selection, selected-pose reuse with no extra solve, exactly 41 calls on all-fail,
+rollback/safe-stop, and deterministic repeated-run diagnostics. A compile
+without the macro that names the seam must fail, and production `nm -C` output
+must not contain the seam symbol.
+
+- [ ] **Step 7: Commit certified clearance and physical diagnostics**
 
 ```bash
-git add g1_clearance.h tests/cpp/test_g1_clearance.cpp
-git commit -m "feat: measure and clear G1 legs over terrain"
+git add g1_clearance.h g1_clearance.cpp tests/cpp/test_g1_clearance.cpp
+git commit -m "feat: certify G1 leg clearance over terrain"
 ```
 
 ### Task 6: Compose a Reversible Per-Frame IK Observe/Apply Transaction
