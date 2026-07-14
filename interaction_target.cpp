@@ -85,6 +85,13 @@ const InteractionTarget* TargetRegistry::find(TargetHandle handle) const {
     return nullptr;
 }
 
+const InteractionTarget* TargetRegistry::find_by_id(uint64_t id) const {
+    for (const InteractionTarget& target : targets_) {
+        if (target.handle.id == id) return &target;
+    }
+    return nullptr;
+}
+
 InteractionTarget* TargetRegistry::find(TargetHandle handle) {
     for (InteractionTarget& target : targets_) {
         if (target.handle == handle) {

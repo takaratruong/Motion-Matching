@@ -115,6 +115,33 @@ void test_registry_and_resolver() {
     assert(!registry.resolve_single_target(vec3(), 1.0F).has_value());
 }
 
+void test_direct_id_lookup_ignores_generation_and_target_count() {
+    using namespace interaction;
+
+    TargetRegistry registry;
+    assert(registry.find_by_id(80) == nullptr);
+
+    constexpr uint32_t kSparseGeneration = 4'000'000'000U;
+    const TargetHandle sparse = registry.upsert(make_target_at(
+        80, kSparseGeneration, vec3(1.0F, 2.0F, 3.0F)));
+    registry.upsert(make_target_at(81, 9, vec3(4.0F, 5.0F, 6.0F)));
+
+    const TargetRegistry& read_only = registry;
+    const InteractionTarget* current = read_only.find_by_id(sparse.id);
+    assert(current != nullptr);
+    assert(current->handle == sparse);
+    assert(same_position(current->object_world, vec3(1.0F, 2.0F, 3.0F)));
+    assert(read_only.find_by_id(81) != nullptr);
+    assert(read_only.find_by_id(999) == nullptr);
+
+    const TargetHandle replaced = registry.replace_pose(
+        sparse.id, Transform{vec3(7.0F, 8.0F, 9.0F), quat()});
+    current = read_only.find_by_id(sparse.id);
+    assert(current != nullptr);
+    assert(current->handle == replaced);
+    assert(same_position(current->object_world, vec3(7.0F, 8.0F, 9.0F)));
+}
+
 void test_required_boundaries() {
     using namespace interaction;
 
@@ -299,6 +326,7 @@ void test_generation_overflow_is_rejected() {
 int main() {
     test_public_records();
     test_registry_and_resolver();
+    test_direct_id_lookup_ignores_generation_and_target_count();
     test_required_boundaries();
     test_upsert_validation_and_replacement();
     test_planar_resolution_and_free_filtering();

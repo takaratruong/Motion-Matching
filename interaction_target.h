@@ -50,6 +50,7 @@ struct PickRequest {
 class TargetRegistry {
 public:
     TargetHandle upsert(InteractionTarget target);
+    const InteractionTarget* find_by_id(uint64_t id) const;
     const InteractionTarget* find(TargetHandle handle) const;
     InteractionTarget* find(TargetHandle handle);
     std::optional<TargetHandle> resolve_single_target(

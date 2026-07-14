@@ -708,6 +708,7 @@ void test_carry_reset_preserves_a_newer_authoritative_generation() {
     assert(output.diagnostics.reason == Reason::TargetChanged);
     assert(!output.diagnostics.attached);
     assert(!output.owns_pose && !output.suppress_steering);
+    assert(exact(output.object_world, authoritative));
 
     const InteractionTarget* preserved = fixture.registry.find(newer);
     assert(preserved != nullptr);
@@ -718,6 +719,7 @@ void test_carry_reset_preserves_a_newer_authoritative_generation() {
     const RuntimeOutput idle = advance(runtime, fixture.locomotion);
     assert(idle.diagnostics.result == ResultCode::Failed);
     assert(idle.diagnostics.reason == Reason::TargetChanged);
+    assert(exact(idle.object_world, authoritative));
     assert(fixture.registry.find(newer) != nullptr);
 }
 

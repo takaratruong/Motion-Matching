@@ -1252,9 +1252,10 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
     } else if (state_ == RuntimeState::Carry) {
         if (input.reset_pressed) {
             const InteractionTarget* authoritative =
-                registry_->find(request_->target);
+                registry_->find_by_id(request_->target.id);
             const bool may_restore = owns_reservation_ &&
                 authoritative != nullptr &&
+                authoritative->handle == request_->target &&
                 registry_->validate(
                     request_->target, request_->request_id) &&
                 authoritative->state == ObjectState::Held;
@@ -1262,6 +1263,8 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
             if (may_restore) {
                 reset = attachment_->reset(original_object_world_);
                 object_world_ = original_object_world_;
+            } else if (authoritative != nullptr) {
+                object_world_ = authoritative->object_world;
             }
             owns_reservation_ = false;
             state_ = RuntimeState::Locomotion;
