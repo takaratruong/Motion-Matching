@@ -15,6 +15,7 @@
 #include "scene_runtime.h"
 #include "support_runtime.h"
 #include "g1_controller_state.h"
+#include "scene_switch.h"
 #include "motion_match_log.h"
 #include "nnet.h"
 #include "lmm.h"
@@ -22,6 +23,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdlib.h>
+#include <cstdlib>
 #include <initializer_list>
 #include <functional>
 
@@ -1742,14 +1744,18 @@ int main(void)
         fprintf(stderr, "G1 scene index error: %s\n", artifact_error);
         return 2;
     }
-    const int active_scene_index =
-        scene_catalog_find(catalog, catalog.default_scene_id.c_str());
+    const char* requested_scene = std::getenv("MM_TERRAIN_SCENE");
+    if (requested_scene == NULL)
+    {
+        requested_scene = catalog.default_scene_id.c_str();
+    }
+    int active_scene_index = scene_catalog_find(catalog, requested_scene);
     if (active_scene_index < 0)
     {
         fprintf(
             stderr,
-            "G1 default scene is absent: %s\n",
-            catalog.default_scene_id.c_str());
+            "G1 scene selection error: unknown MM_TERRAIN_SCENE '%s'\n",
+            requested_scene);
         return 2;
     }
 
@@ -1766,7 +1772,7 @@ int main(void)
         fprintf(
             stderr,
             "G1 scene error [%s]: %s\n",
-            catalog.default_scene_id.c_str(),
+            requested_scene,
             artifact_error);
         return 2;
     }
@@ -1825,12 +1831,13 @@ int main(void)
     SetTargetFPS(25);
 
     Model terrain_model = LoadModel(active_scene.mesh_path.c_str());
-    const bool terrain_model_allocated =
-        terrain_model.meshes != NULL ||
-        terrain_model.materials != NULL ||
-        terrain_model.meshMaterial != NULL ||
-        terrain_model.bones != NULL ||
-        terrain_model.bindPose != NULL;
+    auto model_has_allocation = [](const Model& model)
+    {
+        return model.meshes != NULL || model.materials != NULL ||
+               model.meshMaterial != NULL || model.bones != NULL ||
+               model.bindPose != NULL;
+    };
+    const bool terrain_model_allocated = model_has_allocation(terrain_model);
     if (!IsModelReady(terrain_model) || terrain_model.meshCount <= 0)
     {
         fprintf(
@@ -1844,6 +1851,41 @@ int main(void)
         CloseWindow();
         return 2;
     }
+
+    auto scene_loader = [&](scene_pack& candidate, int index,
+                            char* error, int capacity)
+    {
+        return scene_pack_load(
+            candidate,
+            terrain_directory,
+            motion_manifest,
+            catalog,
+            index,
+            error,
+            capacity);
+    };
+    auto model_loader = [&](Model& model, const char* path,
+                            char* error, int capacity)
+    {
+        model = LoadModel(path);
+        const bool allocated = model_has_allocation(model);
+        const bool ready = IsModelReady(model) && model.meshCount > 0;
+        if (!ready)
+        {
+            scene_error(error, capacity, "%s: Raylib model is not ready", path);
+        }
+        return scene_model_load_result{allocated, ready};
+    };
+    auto model_unloader = [&](Model& model)
+    {
+        if (model_has_allocation(model))
+        {
+            UnloadModel(model);
+        }
+        model = Model{};
+    };
+    int pending_scene_index = -1;
+    bool pending_reset = false;
     
     // Camera
 
@@ -1982,6 +2024,53 @@ int main(void)
 
     auto update_func = [&]()
     {
+        if (pending_reset)
+        {
+            if (!scene_reset_current(
+                    state,
+                    db,
+                    support_rows,
+                    active_scene,
+                    artifact_error,
+                    static_cast<int>(sizeof(artifact_error))))
+            {
+                controller_exit_code = 2;
+                controller_exit_requested = true;
+                fprintf(
+                    stderr,
+                    "G1 scene reset error [%s]: %s\n",
+                    active_scene.metadata.id.c_str(),
+                    artifact_error);
+            }
+            pending_reset = false;
+        }
+        if (pending_scene_index >= 0 && !controller_exit_requested)
+        {
+            const int target = pending_scene_index;
+            pending_scene_index = -1;
+            if (!scene_switch_transaction(
+                    active_scene,
+                    state,
+                    terrain_model,
+                    active_scene_index,
+                    target,
+                    db,
+                    support_rows,
+                    scene_loader,
+                    model_loader,
+                    model_unloader,
+                    artifact_error,
+                    static_cast<int>(sizeof(artifact_error))))
+            {
+                fprintf(
+                    stderr,
+                    "G1 scene switch preserved '%s'; candidate '%s' failed: %s\n",
+                    active_scene.metadata.id.c_str(),
+                    catalog.ids[static_cast<size_t>(target)].c_str(),
+                    artifact_error);
+            }
+        }
+
         state.adjustment_xz = 0.0f;
         state.adjustment_y = 0.0f;
         state.clamp_xz = 0.0f;
@@ -2996,6 +3085,29 @@ int main(void)
 
         if (test_config.mode != G1_TestLive) {
             GuiDisable();
+        }
+
+        GuiGroupBox((Rectangle){ 330, 20, 610, 60 }, "terrain scene");
+        GuiLabel(
+            (Rectangle){ 350, 30, 310, 20 },
+            TextFormat(
+                "%s (%d/%d)",
+                active_scene.metadata.id.c_str(),
+                active_scene_index + 1,
+                static_cast<int>(catalog.ids.size())));
+        const int scene_count = static_cast<int>(catalog.ids.size());
+        if (GuiButton((Rectangle){ 670, 30, 80, 20 }, "previous"))
+        {
+            pending_scene_index =
+                (active_scene_index + scene_count - 1) % scene_count;
+        }
+        if (GuiButton((Rectangle){ 760, 30, 80, 20 }, "next"))
+        {
+            pending_scene_index = (active_scene_index + 1) % scene_count;
+        }
+        if (GuiButton((Rectangle){ 850, 30, 70, 20 }, "reset"))
+        {
+            pending_reset = true;
         }
         
         float ui_sim_hei = 20;
