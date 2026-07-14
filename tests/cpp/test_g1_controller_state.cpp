@@ -190,6 +190,33 @@ static void test_controller_wires_idle_match_transition_cost()
           "idle transition cost is the fifth database_search argument");
 }
 
+static void test_controller_validates_ik_geometry_before_window()
+{
+    const std::string source = read_controller_source();
+    check(source.find("#include \"g1_ik.h\"") != std::string::npos,
+          "controller includes the explicit G1 IK contract");
+    const std::size_t skeleton = source.find("if (!g1_skeleton_validate(");
+    const std::size_t ik = source.find(
+        "if (!g1_leg_configs_validate(", skeleton);
+    const std::size_t features = source.find(
+        "database_build_matching_features(", skeleton);
+    const std::size_t window = source.find("InitWindow(", skeleton);
+    check(skeleton != std::string::npos && ik != std::string::npos &&
+              features != std::string::npos && window != std::string::npos &&
+              skeleton < ik && ik < features && features < window,
+          "IK geometry validation follows skeleton validation and precedes "
+          "features and Raylib startup");
+    const std::string call = source_call_text(
+        source,
+        "g1_leg_configs_validate",
+        skeleton,
+        "controller calls the explicit G1 IK validator");
+    check(source_call_argument_count(call) == 3 &&
+              call.find("db") != std::string::npos &&
+              call.find("artifact_error") != std::string::npos,
+          "startup validator consumes the loaded database and error buffer");
+}
+
 static void test_failed_model_load_reaches_counted_shared_cleanup()
 {
     const std::string source = read_controller_source();
@@ -893,6 +920,7 @@ int main()
 {
     test_active_scene_sources_use_checked_v2_queries();
     test_controller_wires_idle_match_transition_cost();
+    test_controller_validates_ik_geometry_before_window();
     test_failed_model_load_reaches_counted_shared_cleanup();
     test_controller_marks_no_route_cursor_inactive_after_resets();
     test_idle_match_transition_cost_policy();

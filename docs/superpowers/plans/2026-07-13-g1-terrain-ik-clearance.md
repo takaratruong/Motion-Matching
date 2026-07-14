@@ -109,12 +109,15 @@ The sibling checker entry points are `check_rows`, `check_gate_c`, `check_gate_d
 **Files:**
 - Create: `g1_ik.h`
 - Create: `tests/cpp/test_g1_ik.cpp`
+- Modify: `controller.cpp`
+- Modify: `tests/cpp/test_g1_controller_state.cpp`
 
 **Interfaces:**
 - Consumes: `G1Bone`, the exact 31-bone parent array, `database`, `vec3`, and finite helpers from `terrain_runtime.h`.
 - Produces: `G1LegConfig g1_left_leg_config()` and `G1LegConfig g1_right_leg_config()`.
 - Produces: `bool g1_leg_configs_validate(const database&, char*, int)`; a bad skeleton/config is a startup error before Raylib.
 - Locks the MuJoCo-to-Holden local basis `(x,y,z) -> (x,z,-y)`, including four sole probes and thigh/shin capsules. It does not load or parse XML at runtime.
+- Wires the validator immediately after `g1_skeleton_validate` and before feature construction or `InitWindow`; a source-order regression locks that startup gate.
 
 - [ ] **Step 1: Write the failing named-geometry test**
 
@@ -136,20 +139,18 @@ static void check(bool condition, const char* message)
     }
 }
 
-static database make_g1_database()
+static void make_g1_database(database& db)
 {
     static const int parents[G1_BoneCount] = {
         -1,0,1,2,3,4,5,6,1,8,9,10,11,12,1,14,
         15,16,17,18,19,20,21,22,16,24,25,26,27,28,29
     };
-    database db;
     db.bone_positions.resize(1, G1_BoneCount);
     db.bone_rotations.resize(1, G1_BoneCount);
     db.bone_parents.resize(G1_BoneCount);
-    db.bone_positions.zero();
+    db.bone_positions.set(vec3());
     db.bone_rotations.set(quat());
     for (int i = 0; i < G1_BoneCount; ++i) db.bone_parents(i) = parents[i];
-    return db;
 }
 
 static void test_explicit_leg_geometry()
@@ -164,12 +165,15 @@ static void test_explicit_leg_geometry()
           "right hip/knee names");
     check(right.ankle == G1_RightAnkle && right.contact == G1_RightToe,
           "right ankle/contact names");
-    check(left.knee_pole_local.z == -1.0f && right.knee_pole_local.z == -1.0f,
-          "MuJoCo +Y knee pole maps to Holden -Z");
+    check(left.knee_hinge_axis_local.z == -1.0f &&
+          right.knee_hinge_axis_local.z == -1.0f,
+          "MuJoCo +Y knee hinge maps to Holden -Z");
     check(left.foot_forward_local.x == 1.0f && left.sole_normal_local.y == 1.0f,
           "foot axes");
     check(left.sole_points_local[0].x == -0.05f &&
-          left.sole_points_local[0].y == -0.05f &&
+          left.sole_points_local[0].y ==
+              left.foot_sphere_centers_local[0].y -
+              left.foot_sphere_radius_m &&
           left.sole_points_local[3].x == 0.12f,
           "sphere-bottom sole probes");
     check(left.foot_sphere_centers_local[0].y == -0.03f,
@@ -183,7 +187,8 @@ static void test_explicit_leg_geometry()
           left.max_correction_radians == 0.35f,
           "IK bounds");
 
-    database db = make_g1_database();
+    database db;
+    make_g1_database(db);
     char error[256] = {};
     check(g1_leg_configs_validate(db, error, sizeof(error)), error);
     db.bone_parents(G1_LeftKnee) = G1_LeftHipRoll;
@@ -199,6 +204,18 @@ int main()
     return 0;
 }
 ```
+
+Before compiling RED, extend this focused test with hostile cases for null and
+short error buffers; null position/rotation/parent data pointers (restored
+before destruction); mismatched nonempty pose rows/columns; out-of-range and
+wrong-side named indices; wrong named hip/knee/ankle/contact chains and
+unrelated parent corruption; null/malformed names; non-finite/non-positive
+geometry; non-unit,
+non-orthogonal, or incorrectly mapped local axes; degenerate capsules; and
+inconsistent, duplicate, or non-planar sole probes. Exercise both left and
+right configurations. The validator checks named leg chains before the full
+`g1_skeleton_validate` call so corrupt `LeftHipYaw` and `LeftKnee` links still
+receive their named diagnostics.
 
 - [ ] **Step 2: Compile to verify RED**
 
@@ -218,13 +235,23 @@ Create `g1_ik.h`:
 ```cpp
 #pragma once
 
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-result"
+#endif
 #include "database.h"
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+
 #include "g1_skeleton.h"
 #include "terrain_runtime.h"
 
 #include <cstdarg>
 #include <cfloat>
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 
 struct G1LegConfig
 {
@@ -233,7 +260,7 @@ struct G1LegConfig
     int knee;
     int ankle;
     int contact;
-    vec3 knee_pole_local;
+    vec3 knee_hinge_axis_local;
     vec3 foot_forward_local;
     vec3 sole_normal_local;
     vec3 foot_sphere_centers_local[4];
@@ -252,12 +279,14 @@ struct G1LegConfig
     float max_correction_radians;
 };
 
-static inline bool g1_ik_error(char* output, int capacity, const char* format, ...)
+static inline bool g1_ik_error(
+    char* output, int capacity, const char* format, ...)
 {
     if (output != NULL && capacity > 0) {
         va_list arguments;
         va_start(arguments, format);
-        std::vsnprintf(output, static_cast<size_t>(capacity), format, arguments);
+        std::vsnprintf(
+            output, static_cast<size_t>(capacity), format, arguments);
         va_end(arguments);
     }
     return false;
@@ -272,18 +301,23 @@ static inline G1LegConfig g1_leg_config(
     config.knee = knee;
     config.ankle = ankle;
     config.contact = contact;
-    config.knee_pole_local = vec3(0.0f, 0.0f, -1.0f);
+    config.knee_hinge_axis_local = vec3(0.0f, 0.0f, -1.0f);
     config.foot_forward_local = vec3(1.0f, 0.0f, 0.0f);
     config.sole_normal_local = vec3(0.0f, 1.0f, 0.0f);
     config.foot_sphere_radius_m = 0.02f;
-    config.foot_sphere_centers_local[0] = vec3(-0.05f, -0.03f, -0.025f);
-    config.foot_sphere_centers_local[1] = vec3(-0.05f, -0.03f, +0.025f);
-    config.foot_sphere_centers_local[2] = vec3(+0.12f, -0.03f, -0.030f);
-    config.foot_sphere_centers_local[3] = vec3(+0.12f, -0.03f, +0.030f);
-    for (int i = 0; i < 4; ++i)
+    config.foot_sphere_centers_local[0] =
+        vec3(-0.05f, -0.03f, -0.025f);
+    config.foot_sphere_centers_local[1] =
+        vec3(-0.05f, -0.03f, +0.025f);
+    config.foot_sphere_centers_local[2] =
+        vec3(+0.12f, -0.03f, -0.030f);
+    config.foot_sphere_centers_local[3] =
+        vec3(+0.12f, -0.03f, +0.030f);
+    for (int i = 0; i < 4; ++i) {
         config.sole_points_local[i] =
             config.foot_sphere_centers_local[i] -
             config.sole_normal_local * config.foot_sphere_radius_m;
+    }
     config.thigh_start_local = vec3(0.0f, -0.02f, 0.0f);
     config.thigh_end_local = vec3(-0.078f, -0.17f, 0.0f);
     config.thigh_radius_m = 0.05f;
@@ -310,33 +344,357 @@ static inline G1LegConfig g1_right_leg_config()
         "right", G1_RightHipYaw, G1_RightKnee, G1_RightAnkle, G1_RightToe);
 }
 
-static inline bool g1_leg_config_validate(
-    const database& db, const G1LegConfig& config,
-    char* error, int error_capacity)
+static inline bool g1_leg_vec3_is_finite(const vec3 value)
 {
-    if (db.bone_parents.size != G1_BoneCount ||
-        config.hip < 0 || config.hip >= G1_BoneCount ||
-        config.knee < 0 || config.knee >= G1_BoneCount ||
-        config.ankle < 0 || config.ankle >= G1_BoneCount ||
-        config.contact < 0 || config.contact >= G1_BoneCount) {
-        return g1_ik_error(error, error_capacity, "%s leg: invalid bone contract", config.name);
-    }
-    if (db.bone_parents(config.knee) != config.hip)
+    return terrain_float_is_finite(value.x) &&
+           terrain_float_is_finite(value.y) &&
+           terrain_float_is_finite(value.z);
+}
+
+static inline bool g1_leg_vec3_is_exact(
+    const vec3 value, const vec3 expected)
+{
+    return value.x == expected.x &&
+           value.y == expected.y &&
+           value.z == expected.z;
+}
+
+static inline float g1_leg_length_squared(const vec3 value)
+{
+    return dot(value, value);
+}
+
+static inline bool g1_leg_axis_is_unit(const vec3 value)
+{
+    const float squared = g1_leg_length_squared(value);
+    return terrain_float_is_finite(squared) &&
+           std::fabs(squared - 1.0f) <= 1.0e-5f;
+}
+
+static inline bool g1_leg_database_shape_validate(
+    const database& db, char* error, int error_capacity)
+{
+    if (db.bone_positions.rows <= 0 ||
+        db.bone_positions.cols != G1_BoneCount ||
+        db.bone_positions.data == NULL) {
         return g1_ik_error(
-            error, error_capacity, "%s %s parent mismatch", config.name,
-            config.knee == G1_LeftKnee ? "LeftKnee" : "RightKnee");
-    if (db.bone_parents(config.ankle) != config.knee)
-        return g1_ik_error(error, error_capacity, "%s ankle parent mismatch", config.name);
-    if (db.bone_parents(config.contact) != config.ankle)
-        return g1_ik_error(error, error_capacity, "%s contact parent mismatch", config.name);
+            error,
+            error_capacity,
+            "G1 IK position pose shape mismatch: expected rows>0 cols=%d",
+            G1_BoneCount);
+    }
+    if (db.bone_rotations.rows != db.bone_positions.rows ||
+        db.bone_rotations.rows <= 0 ||
+        db.bone_rotations.cols != G1_BoneCount ||
+        db.bone_rotations.data == NULL) {
+        return g1_ik_error(
+            error,
+            error_capacity,
+            "G1 IK rotation pose shape mismatch: expected %dx%d",
+            db.bone_positions.rows,
+            G1_BoneCount);
+    }
+    if (db.bone_parents.size != G1_BoneCount ||
+        db.bone_parents.data == NULL) {
+        return g1_ik_error(
+            error,
+            error_capacity,
+            "G1 IK parent shape mismatch: expected %d entries",
+            G1_BoneCount);
+    }
+    return true;
+}
+
+static inline bool g1_leg_measured_geometry_matches(
+    const G1LegConfig& value, const G1LegConfig& expected)
+{
+    if (!g1_leg_vec3_is_exact(
+            value.knee_hinge_axis_local,
+            expected.knee_hinge_axis_local) ||
+        !g1_leg_vec3_is_exact(
+            value.foot_forward_local,
+            expected.foot_forward_local) ||
+        !g1_leg_vec3_is_exact(
+            value.sole_normal_local,
+            expected.sole_normal_local) ||
+        value.foot_sphere_radius_m != expected.foot_sphere_radius_m ||
+        !g1_leg_vec3_is_exact(
+            value.thigh_start_local, expected.thigh_start_local) ||
+        !g1_leg_vec3_is_exact(
+            value.thigh_end_local, expected.thigh_end_local) ||
+        value.thigh_radius_m != expected.thigh_radius_m ||
+        !g1_leg_vec3_is_exact(
+            value.shin_start_local, expected.shin_start_local) ||
+        !g1_leg_vec3_is_exact(
+            value.shin_end_local, expected.shin_end_local) ||
+        value.shin_radius_m != expected.shin_radius_m ||
+        value.reach_buffer_m != expected.reach_buffer_m ||
+        value.planted_clearance_m != expected.planted_clearance_m ||
+        value.swing_clearance_m != expected.swing_clearance_m ||
+        value.max_swing_lift_m != expected.max_swing_lift_m ||
+        value.max_correction_radians != expected.max_correction_radians) {
+        return false;
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (!g1_leg_vec3_is_exact(
+                value.foot_sphere_centers_local[i],
+                expected.foot_sphere_centers_local[i]) ||
+            !g1_leg_vec3_is_exact(
+                value.sole_points_local[i],
+                expected.sole_points_local[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static inline bool g1_leg_geometry_validate(
+    const G1LegConfig& config,
+    const G1LegConfig& expected,
+    char* error,
+    int error_capacity)
+{
+    const vec3 vectors[] = {
+        config.knee_hinge_axis_local,
+        config.foot_forward_local,
+        config.sole_normal_local,
+        config.foot_sphere_centers_local[0],
+        config.foot_sphere_centers_local[1],
+        config.foot_sphere_centers_local[2],
+        config.foot_sphere_centers_local[3],
+        config.sole_points_local[0],
+        config.sole_points_local[1],
+        config.sole_points_local[2],
+        config.sole_points_local[3],
+        config.thigh_start_local,
+        config.thigh_end_local,
+        config.shin_start_local,
+        config.shin_end_local
+    };
+    for (const vec3 value : vectors) {
+        if (!g1_leg_vec3_is_finite(value)) {
+            return g1_ik_error(
+                error,
+                error_capacity,
+                "%s leg: non-finite geometry",
+                config.name);
+        }
+    }
+    const float scalars[] = {
+        config.foot_sphere_radius_m,
+        config.thigh_radius_m,
+        config.shin_radius_m,
+        config.reach_buffer_m,
+        config.planted_clearance_m,
+        config.swing_clearance_m,
+        config.max_swing_lift_m,
+        config.max_correction_radians
+    };
+    for (const float value : scalars) {
+        if (!terrain_float_is_finite(value)) {
+            return g1_ik_error(
+                error,
+                error_capacity,
+                "%s leg: non-finite geometry bound",
+                config.name);
+        }
+        if (value <= 0.0f) {
+            return g1_ik_error(
+                error,
+                error_capacity,
+                "%s leg: geometry bounds must be positive",
+                config.name);
+        }
+    }
+    if (!g1_leg_axis_is_unit(config.knee_hinge_axis_local) ||
+        !g1_leg_axis_is_unit(config.foot_forward_local) ||
+        !g1_leg_axis_is_unit(config.sole_normal_local)) {
+        return g1_ik_error(
+            error,
+            error_capacity,
+            "%s leg: local axes must be unit length",
+            config.name);
+    }
+    const float orthogonal_tolerance = 1.0e-5f;
+    if (std::fabs(dot(
+            config.knee_hinge_axis_local,
+            config.foot_forward_local)) > orthogonal_tolerance ||
+        std::fabs(dot(
+            config.knee_hinge_axis_local,
+            config.sole_normal_local)) > orthogonal_tolerance ||
+        std::fabs(dot(
+            config.foot_forward_local,
+            config.sole_normal_local)) > orthogonal_tolerance) {
+        return g1_ik_error(
+            error,
+            error_capacity,
+            "%s leg: local axes must be orthogonal",
+            config.name);
+    }
+    if (!g1_leg_vec3_is_exact(
+            config.knee_hinge_axis_local,
+            vec3(0.0f, 0.0f, -1.0f)) ||
+        !g1_leg_vec3_is_exact(
+            config.foot_forward_local,
+            vec3(1.0f, 0.0f, 0.0f)) ||
+        !g1_leg_vec3_is_exact(
+            config.sole_normal_local,
+            vec3(0.0f, 1.0f, 0.0f))) {
+        return g1_ik_error(
+            error,
+            error_capacity,
+            "%s leg: local basis does not match the mapped XML basis",
+            config.name);
+    }
+
+    const float thigh_length_squared = g1_leg_length_squared(
+        config.thigh_end_local - config.thigh_start_local);
+    const float shin_length_squared = g1_leg_length_squared(
+        config.shin_end_local - config.shin_start_local);
+    if (thigh_length_squared <= 1.0e-12f ||
+        shin_length_squared <= 1.0e-12f ||
+        config.thigh_radius_m * config.thigh_radius_m >=
+            thigh_length_squared ||
+        config.shin_radius_m * config.shin_radius_m >=
+            shin_length_squared) {
+        return g1_ik_error(
+            error,
+            error_capacity,
+            "%s leg: capsule geometry is degenerate or out of bounds",
+            config.name);
+    }
+
+    const float sole_tolerance_squared = 1.0e-12f;
+    for (int i = 0; i < 4; ++i) {
+        const vec3 expected_point =
+            config.foot_sphere_centers_local[i] -
+            config.sole_normal_local * config.foot_sphere_radius_m;
+        if (g1_leg_length_squared(
+                config.sole_points_local[i] - expected_point) >
+            sole_tolerance_squared ||
+            std::fabs(dot(
+                config.sole_points_local[i] - config.sole_points_local[0],
+                config.sole_normal_local)) > 1.0e-6f) {
+            return g1_ik_error(
+                error,
+                error_capacity,
+                "%s leg: invalid sole probe relationship",
+                config.name);
+        }
+        for (int j = 0; j < i; ++j) {
+            if (g1_leg_length_squared(
+                    config.foot_sphere_centers_local[i] -
+                    config.foot_sphere_centers_local[j]) <=
+                    sole_tolerance_squared ||
+                g1_leg_length_squared(
+                    config.sole_points_local[i] -
+                    config.sole_points_local[j]) <=
+                    sole_tolerance_squared) {
+                return g1_ik_error(
+                    error,
+                    error_capacity,
+                    "%s leg: duplicate sole probe relationship",
+                    config.name);
+            }
+        }
+    }
+
+    if (!g1_leg_measured_geometry_matches(config, expected)) {
+        return g1_ik_error(
+            error,
+            error_capacity,
+            "%s leg: measured geometry contract mismatch",
+            config.name);
+    }
+    return true;
+}
+
+static inline bool g1_leg_config_validate(
+    const database& db,
+    const G1LegConfig& config,
+    char* error,
+    int error_capacity)
+{
+    if (!g1_leg_database_shape_validate(db, error, error_capacity)) {
+        return false;
+    }
+    if (config.name == NULL || config.name[0] == '\0') {
+        return g1_ik_error(
+            error, error_capacity, "G1 leg config has an invalid name");
+    }
+    const bool is_left = std::strcmp(config.name, "left") == 0;
+    const bool is_right = std::strcmp(config.name, "right") == 0;
+    if (!is_left && !is_right) {
+        return g1_ik_error(
+            error,
+            error_capacity,
+            "G1 leg config has malformed name '%s'",
+            config.name);
+    }
+    const G1LegConfig expected =
+        is_left ? g1_left_leg_config() : g1_right_leg_config();
+    if (config.hip != expected.hip ||
+        config.knee != expected.knee ||
+        config.ankle != expected.ankle ||
+        config.contact != expected.contact) {
+        return g1_ik_error(
+            error,
+            error_capacity,
+            "%s leg: invalid named bone contract",
+            config.name);
+    }
+    if (!g1_leg_geometry_validate(
+            config, expected, error, error_capacity)) {
+        return false;
+    }
+    const int expected_hip_parent =
+        is_left ? G1_LeftHipRoll : G1_RightHipRoll;
+    if (db.bone_parents(config.hip) != expected_hip_parent) {
+        return g1_ik_error(
+            error,
+            error_capacity,
+            "%s %s parent mismatch",
+            config.name,
+            is_left ? "LeftHipYaw" : "RightHipYaw");
+    }
+    if (db.bone_parents(config.knee) != config.hip) {
+        return g1_ik_error(
+            error,
+            error_capacity,
+            "%s %s parent mismatch",
+            config.name,
+            is_left ? "LeftKnee" : "RightKnee");
+    }
+    if (db.bone_parents(config.ankle) != config.knee) {
+        return g1_ik_error(
+            error,
+            error_capacity,
+            "%s ankle parent mismatch",
+            config.name);
+    }
+    if (db.bone_parents(config.contact) != config.ankle) {
+        return g1_ik_error(
+            error,
+            error_capacity,
+            "%s contact parent mismatch",
+            config.name);
+    }
     return true;
 }
 
 static inline bool g1_leg_configs_validate(
     const database& db, char* error, int error_capacity)
 {
-    return g1_leg_config_validate(db, g1_left_leg_config(), error, error_capacity) &&
-           g1_leg_config_validate(db, g1_right_leg_config(), error, error_capacity);
+    if (!g1_leg_database_shape_validate(db, error, error_capacity)) {
+        return false;
+    }
+    if (!g1_leg_config_validate(
+            db, g1_left_leg_config(), error, error_capacity) ||
+        !g1_leg_config_validate(
+            db, g1_right_leg_config(), error, error_capacity)) {
+        return false;
+    }
+    return g1_skeleton_validate(db, error, error_capacity);
 }
 ```
 
@@ -349,9 +707,32 @@ radii. All values come from
 `/home/ubuntu/projects/mjx-diffphysics/env/g1/assets/g1_29dof.xml`, mapped from
 MuJoCo Z-up to Holden Y-up with `(x,y,z) -> (x,z,-y)`.
 `LeftAnkle/RightAnkle` map to the ankle-pitch bodies; `LeftToe/RightToe` map to
-the ankle-roll bodies. Do not add an XML parser to the runtime.
+the ankle-roll bodies. `knee_hinge_axis_local` is the exact mapped MuJoCo
+hinge axis, not a two-bone pole or bend vector. Task 3 derives its bend
+direction from the current pose and uses this axis only for a deterministic
+straight-leg fallback. Do not add an XML parser to the runtime.
 
-- [ ] **Step 4: Run the named-geometry GREEN test**
+- [ ] **Step 4: Wire validation into startup and lock source ordering**
+
+Include `g1_ik.h` from `controller.cpp`. Immediately after the existing
+successful `g1_skeleton_validate` block and before
+`database_build_matching_features` or `InitWindow`, add:
+
+```cpp
+if (!g1_leg_configs_validate(
+        db, artifact_error, static_cast<int>(sizeof(artifact_error))))
+{
+    fprintf(stderr, "G1 IK geometry error: %s\n", artifact_error);
+    return 2;
+}
+```
+
+Add a source-order regression to `tests/cpp/test_g1_controller_state.cpp`
+that requires the `g1_ik.h` include and proves
+`g1_skeleton_validate < g1_leg_configs_validate <
+database_build_matching_features < InitWindow`.
+
+- [ ] **Step 5: Run the named-geometry GREEN tests**
 
 Run:
 
@@ -359,14 +740,19 @@ Run:
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
   tests/cpp/test_g1_ik.cpp -o /tmp/test_g1_ik
 /tmp/test_g1_ik
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
+  tests/cpp/test_g1_controller_state.cpp -o /tmp/test_g1_controller_state
+/tmp/test_g1_controller_state
 ```
 
-Expected: compilation succeeds and the test exits `0` with no output.
+Expected: both compilations succeed and both tests exit `0` with no output.
 
-- [ ] **Step 5: Commit the explicit geometry contract**
+- [ ] **Step 6: Commit the explicit geometry contract**
 
 ```bash
-git add g1_ik.h tests/cpp/test_g1_ik.cpp
+git add g1_ik.h controller.cpp tests/cpp/test_g1_ik.cpp \
+  tests/cpp/test_g1_controller_state.cpp \
+  docs/superpowers/plans/2026-07-13-g1-terrain-ik-clearance.md
 git commit -m "test: lock explicit G1 terrain IK geometry"
 ```
 
@@ -691,10 +1077,23 @@ git commit -m "feat: lock planted G1 feet to exact terrain"
   caller-provided copy and performs at most four bounded FK-residual iterations
   until contact-position error is at most `0.005 m`.
 - An outside-shell or correction-limited target returns a finite closest bounded pose with `safe_stop_requested=true`. Invalid math returns `false` and no output mutation for controlled diagnostic exit.
+- `knee_hinge_axis_local` remains a hinge axis, never a stored pole. The solve
+  uses the current projected hip-to-knee direction first. A nearly straight
+  pose falls back to `normalize(cross(hinge_axis_world, target_direction))`,
+  flips that fallback to agree with any sign-bearing current projection, and
+  uses `ik_safe_perpendicular` only when the hinge and target are degenerate.
+  Primary and sign-continuity epsilons remain separate.
 
 - [ ] **Step 1: Add failing reachable, outside-shell, untouched-bone, and non-finite tests**
 
 Add these functions before `main` in `tests/cpp/test_g1_ik.cpp`, then call `test_named_bounded_two_bone_solve()` from `main`:
+
+Also add RED cases for current-projection priority, sign continuity near the
+straight threshold, the deterministic
+`cross((0,0,-1),(0,-1,0)) == (-1,0,0)` fallback, a hinge parallel to the
+target using only the safe-perpendicular fallback, and rejection of a
+non-finite, zero-length, or non-unit hinge. Use baseline knee global rotation
+when mapping the configured local hinge.
 
 ```cpp
 static bool same_quat(quat left, quat right)
@@ -705,7 +1104,8 @@ static bool same_quat(quat left, quat right)
 
 static void test_named_bounded_two_bone_solve()
 {
-    database db = make_g1_database();
+    database db;
+    make_g1_database(db);
     db.bone_positions(0, G1_LeftKnee) = vec3(0.0f, -0.40f, 0.0f);
     db.bone_positions(0, G1_LeftAnkle) = vec3(0.0f, -0.40f, 0.0f);
     const G1LegConfig leg = g1_left_leg_config();
@@ -919,7 +1319,7 @@ static inline bool ik_two_bone_bounded(
     vec3 middle,
     vec3 end,
     vec3 requested_target,
-    vec3 pole_world,
+    vec3 hinge_axis_world,
     quat root_global,
     quat middle_global,
     quat root_parent_global,
@@ -929,7 +1329,8 @@ static inline bool ik_two_bone_bounded(
     IKTargetProjection projection = {};
     if (!ik_project_target(
             projection, root, middle, end, requested_target, reach_buffer_m) ||
-        !ik_vec_is_finite(pole_world) || !ik_quat_is_finite(root_global) ||
+        !ik_vec_is_finite(hinge_axis_world) ||
+        !ik_quat_is_finite(root_global) ||
         !ik_quat_is_finite(middle_global) ||
         !ik_quat_is_finite(root_parent_global) ||
         !terrain_float_is_finite(maximum_correction_radians) ||
@@ -939,15 +1340,33 @@ static inline bool ik_two_bone_bounded(
     const float lower = length(end - middle);
     const float target_distance = projection.clamped_distance_m;
     const vec3 target_direction = normalize(projection.clamped_target - root);
-    vec3 bend_direction = pole_world -
-        target_direction * dot(pole_world, target_direction);
-    if (length(bend_direction) < 1e-6f) {
-        bend_direction = (middle - root) -
-            target_direction * dot(middle - root, target_direction);
+    const float hinge_length = length(hinge_axis_world);
+    if (!terrain_float_is_finite(hinge_length) ||
+        std::fabs(hinge_length - 1.0f) > 1e-4f) return false;
+
+    const vec3 current_upper = middle - root;
+    const vec3 current_projection = current_upper -
+        target_direction * dot(current_upper, target_direction);
+    const float current_projection_length = length(current_projection);
+    if (!terrain_float_is_finite(current_projection_length)) return false;
+    const float primary_epsilon = 1e-6f;
+    const float sign_epsilon = 1e-8f;
+    vec3 bend_direction;
+    if (current_projection_length >= primary_epsilon) {
+        bend_direction = current_projection / current_projection_length;
+    } else {
+        const vec3 hinge_fallback = cross(
+            hinge_axis_world, target_direction);
+        const float hinge_fallback_length = length(hinge_fallback);
+        if (!terrain_float_is_finite(hinge_fallback_length)) return false;
+        bend_direction = hinge_fallback_length >= primary_epsilon
+            ? hinge_fallback / hinge_fallback_length
+            : ik_safe_perpendicular(target_direction);
+        if (current_projection_length > sign_epsilon &&
+            dot(bend_direction, current_projection) < 0.0f) {
+            bend_direction = -bend_direction;
+        }
     }
-    if (length(bend_direction) < 1e-6f)
-        bend_direction = ik_safe_perpendicular(target_direction);
-    bend_direction = normalize(bend_direction);
 
     const float knee_along =
         (upper * upper + target_distance * target_distance - lower * lower) /
@@ -1066,7 +1485,8 @@ static inline bool g1_apply_named_position_ik(
             global_positions(config.ankle),
             requested_ankle_target,
             quat_mul_vec3(
-                global_rotations(config.knee), config.knee_pole_local),
+                global_rotations(config.knee),
+                config.knee_hinge_axis_local),
             global_rotations(config.hip),
             global_rotations(config.knee),
             global_rotations(hip_parent),
@@ -1206,7 +1626,8 @@ Append this test before `main` in `tests/cpp/test_g1_ik.cpp`, then call it from 
 ```cpp
 static void test_surface_aligned_named_foot_orientation()
 {
-    database db = make_g1_database();
+    database db;
+    make_g1_database(db);
     const G1LegConfig leg = g1_left_leg_config();
     char error[256] = {};
     G1FootOrientationResult result = {};
@@ -2095,9 +2516,9 @@ static heightfield make_ik_frame_surface()
     return field;
 }
 
-static database make_frame_database()
+static void make_frame_database(database& db)
 {
-    database db = make_g1_database();
+    make_g1_database(db);
     db.bone_positions(0, G1_Simulation) = vec3(0.0f, 1.0f, 0.0f);
     db.bone_positions(0, G1_LeftKnee) = vec3(0.0f, -0.40f, 0.0f);
     db.bone_positions(0, G1_LeftAnkle) = vec3(0.0f, -0.40f, 0.0f);
@@ -2106,12 +2527,12 @@ static database make_frame_database()
     db.contact_states.resize(1, 2);
     db.contact_states(0, 0) = true;
     db.contact_states(0, 1) = true;
-    return db;
 }
 
 static void test_frame_transaction_is_reversible_and_downstream()
 {
-    database db = make_frame_database();
+    database db;
+    make_frame_database(db);
     const heightfield field = make_ik_frame_surface();
     array1d<vec3> baseline_global_positions(G1_BoneCount);
     array1d<quat> baseline_global_rotations(G1_BoneCount);

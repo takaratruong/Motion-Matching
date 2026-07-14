@@ -45,6 +45,7 @@
 #include "route_runtime.h"
 #include "support_runtime.h"
 #include "g1_controller_state.h"
+#include "g1_ik.h"
 #include "g1_runtime_diagnostics.h"
 #include "scene_switch.h"
 #include "motion_match_log.h"
@@ -1783,6 +1784,12 @@ int main(void)
             db, artifact_error, static_cast<int>(sizeof(artifact_error))))
     {
         fprintf(stderr, "G1 skeleton error: %s\n", artifact_error);
+        return 2;
+    }
+    if (!g1_leg_configs_validate(
+            db, artifact_error, static_cast<int>(sizeof(artifact_error))))
+    {
+        fprintf(stderr, "G1 IK geometry error: %s\n", artifact_error);
         return 2;
     }
     database_build_matching_features(
