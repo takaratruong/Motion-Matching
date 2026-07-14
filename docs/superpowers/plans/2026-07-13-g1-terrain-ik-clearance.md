@@ -934,550 +934,224 @@ git add g1_ik.h tests/cpp/test_g1_ik.cpp \
 git commit -m "feat: lock planted G1 feet to checked terrain"
 ```
 
-### Task 3: Add a Finite, Reach-Shell-Bounded Named Two-Bone Solve
+### Task 3: Add a Checked, Dynamic-Reach-Shell Named Two-Bone Solve
 
 **Files:**
 - Create: `ik.h`
 - Modify: `g1_ik.h`
 - Modify: `tests/cpp/test_g1_ik.cpp`
+- Modify: `docs/superpowers/plans/2026-07-13-g1-terrain-ik-clearance.md`
 
-**Interfaces:**
-- Produces: `IKTargetProjection`, `IKTwoBoneResult`, `ik_project_target`, `ik_two_bone_bounded`, and `ik_clamp_local_delta` in renderer-independent `ik.h`.
-- Produces: `G1LegSolveResult`, `g1_apply_named_position_ik`, and the
-  offset-aware `g1_apply_named_contact_position_ik` in `g1_ik.h`.
-- The G1 adapter uses only `config.hip`, `config.knee`, `config.ankle`, and the
-  direct contact child offset. It changes only hip/knee local rotations in a
-  caller-provided copy and performs at most four bounded FK-residual iterations
-  until contact-position error is at most `0.005 m`.
-- An outside-shell or correction-limited target returns a finite closest bounded pose with `safe_stop_requested=true`. Invalid math returns `false` and no output mutation for controlled diagnostic exit.
-- `knee_hinge_axis_local` remains a hinge axis, never a stored pole. The solve
-  uses the current projected hip-to-knee direction first. A nearly straight
-  pose falls back to `normalize(cross(hinge_axis_world, target_direction))`,
-  flips that fallback to agree with any sign-bearing current projection, and
-  uses `ik_safe_perpendicular` only when the hinge and target are degenerate.
-  Primary and sign-continuity epsilons remain separate.
+**Final interfaces and invariants:**
+- `ik.h` owns renderer-independent checked arithmetic plus
+  `IKTargetProjection`, `IKClampResult`, `IKBendSelection`,
+  `IKTwoBoneResult`, `ik_project_target`, `ik_clamp_local_delta`,
+  `ik_select_bend_direction`, and `ik_two_bone_bounded`.
+- `g1_ik.h` owns `G1LegSolveResult`,
+  `g1_ik_checked_forward_kinematics`,
+  `g1_apply_named_position_ik`, and
+  `g1_apply_named_contact_position_ik`.
+- Every public path validates complete non-null 31-bone slices, the exact
+  parent topology, the exact named G1 leg configuration and chain, normal-or-
+  zero local positions, and finite unit local quaternions before indexing.
+  Working and immutable baseline rotation ranges may not overlap, and the two
+  checked-FK output ranges may not overlap exactly or partially. Each checked-
+  FK output is also disjoint from every const local-position, local-rotation,
+  and parent input range, so the semantic const-input contract is explicit.
+- Baseline and post-solve FK use staged checked outputs. Every produced global
+  position is normal-or-zero and every global quaternion is finite/unit before
+  any caller output is committed. These checks remain active under
+  `NDEBUG`.
+- Generic results, the caller pose, and `G1LegSolveResult` are transactional.
+  A named solve stages the caller's current working pose, replaces only the
+  target hip/knee from the immutable baseline solve, and preserves every
+  non-target rotation byte. A second-leg solve therefore preserves the first
+  staged leg.
+- Norm, dot, cross, quaternion, shell, law-of-cosines, and residual arithmetic
+  is promoted and checked before binary32 commit. Subnormal, non-finite,
+  overflowed, and unrepresentable intermediates fail without output mutation;
+  a nonzero promoted value may not silently round or flush to binary32 zero.
+- Quaternion inputs admitted by the unit tolerance are normalized before
+  shortest-arc measurement. `limited` is true iff the precise requested
+  angle is strictly greater than the configured maximum, with no epsilon.
+  A bounded slerp refinement guarantees both the retained promoted correction
+  and its binary32 report are never greater than the maximum.
+- Bend selection first uses the current hip-to-knee projection when its
+  pre-materialization promoted length is at least `1e-6`. Otherwise it uses
+  `cross(hinge_axis_world, target_direction)` when that cross's promoted
+  length is at least `1e-6`, flips only when the raw promoted projection is
+  strictly greater than `1e-8` and disagrees, and reserves a checked safe
+  perpendicular for a degenerate/parallel hinge fallback.
+  The named adapter maps the exact configured local `-Z` through the
+  immutable baseline knee global rotation.
+- The contact adapter recomputes checked FK from a staged working pose for at
+  most four iterations against the same immutable baseline. Convergence owns
+  the exact promoted predicate `residual <= double(0.005f)`; the binary32 value
+  is reporting only and cannot turn an over-limit residual into convergence.
+  A finite residual above that threshold commits the bounded safe-stop pose;
+  invalid later math rolls back the entire pose and result. The reported
+  residual equals a fresh checked FK of the committed pose.
 
-- [ ] **Step 1: Add failing reachable, outside-shell, untouched-bone, and non-finite tests**
+**Dynamic reach-shell correction:**
 
-Add these functions before `main` in `tests/cpp/test_g1_ik.cpp`, then call `test_named_bounded_two_bone_solve()` from `main`:
+A fixed buffered shell is unsafe for natural G1 walk frames near extension.
+For example, the nominal maximum is `upper + lower - 0.015 m`; asking for
+the already-current endpoint can therefore project a valid current leg inward
+and immediately apply the full `0.35 rad` cap.
 
-Also add RED cases for current-projection priority, sign continuity near the
-straight threshold, the deterministic
-`cross((0,0,-1),(0,-1,0)) == (-1,0,0)` fallback, a hinge parallel to the
-target using only the safe-perpendicular fallback, and rejection of a
-non-finite, zero-length, or non-unit hinge. Use baseline knee global rotation
-when mapping the configured local hinge.
+The checked projection now defines:
 
-```cpp
-static bool same_quat(quat left, quat right)
-{
-    return left.w == right.w && left.x == right.x &&
-           left.y == right.y && left.z == right.z;
-}
-
-static void test_named_bounded_two_bone_solve()
-{
-    database db;
-    make_g1_database(db);
-    db.bone_positions(0, G1_LeftKnee) = vec3(0.0f, -0.40f, 0.0f);
-    db.bone_positions(0, G1_LeftAnkle) = vec3(0.0f, -0.40f, 0.0f);
-    const G1LegConfig leg = g1_left_leg_config();
-    array1d<quat> output = db.bone_rotations(0);
-    char error[256] = {};
-    G1LegSolveResult result = {};
-    check(g1_apply_named_position_ik(
-              output, db.bone_positions(0), db.bone_rotations(0),
-              db.bone_parents, leg, vec3(0.20f, -0.70f, 0.0f),
-              result, error, sizeof(error)), error);
-    check(result.applied && result.reachable,
-          "reachable target applies");
-    check(result.safe_stop_requested == result.correction_limited,
-          "reachable target stops only when correction is limited");
-    check(result.max_correction_radians <= 0.350001f,
-          "reachable solve correction bound");
-    for (int bone = 0; bone < G1_BoneCount; ++bone) {
-        if (bone != leg.hip && bone != leg.knee)
-            check(same_quat(output(bone), db.bone_rotations(0, bone)),
-                  "non-solver local rotation is byte-identical");
-    }
-
-    db.bone_positions(0, G1_LeftToe) = vec3(0.0f, -0.017558f, 0.0f);
-    output = db.bone_rotations(0);
-    const vec3 desired_contact(0.16f, -0.71f, 0.02f);
-    check(g1_apply_named_contact_position_ik(
-              output, db.bone_positions(0), db.bone_rotations(0),
-              db.bone_parents, leg, desired_contact,
-              result, error, sizeof(error)), error);
-    array1d<vec3> contact_global_positions(G1_BoneCount);
-    array1d<quat> contact_global_rotations(G1_BoneCount);
-    forward_kinematics_full(
-        contact_global_positions, contact_global_rotations,
-        db.bone_positions(0), output, db.bone_parents);
-    check(length(contact_global_positions(leg.contact) - desired_contact) <=
-          0.005f + 1e-6f,
-          "nonzero ankle-to-contact offset is solved by FK residual");
-    check(result.contact_residual_m <= 0.005f + 1e-6f,
-          "contact residual is explicit");
-
-    output = db.bone_rotations(0);
-    check(g1_apply_named_position_ik(
-              output, db.bone_positions(0), db.bone_rotations(0),
-              db.bone_parents, leg, vec3(3.0f, 0.0f, 0.0f),
-              result, error, sizeof(error)), error);
-    check(result.applied && !result.reachable && result.safe_stop_requested,
-          "outside-shell target uses bounded safe-stop result");
-    check(std::fabs(result.clamped_distance_m - 0.785f) < 1e-5f,
-          "outer shell is two links minus 15 mm");
-    check(result.max_correction_radians <= 0.350001f,
-          "unreachable solve correction bound");
-
-    output = db.bone_rotations(0);
-    const array1d<quat> before = output;
-    const float nan = std::numeric_limits<float>::quiet_NaN();
-    check(!g1_apply_named_position_ik(
-              output, db.bone_positions(0), db.bone_rotations(0),
-              db.bone_parents, leg, vec3(nan, 0.0f, 0.0f),
-              result, error, sizeof(error)),
-          "non-finite solve rejected");
-    for (int bone = 0; bone < G1_BoneCount; ++bone)
-        check(same_quat(output(bone), before(bone)),
-              "failed solve leaves output unchanged");
-    check(std::strstr(error, "non-finite") != NULL,
-          "non-finite solve diagnostic");
-
-    IKTargetProjection folded = {};
-    check(ik_project_target(
-              folded, vec3(), vec3(0.0f, -0.40f, 0.0f), vec3(),
-              vec3(), 0.015f),
-          "folded zero-direction target uses deterministic fallback");
-    check(!folded.reachable &&
-          g1_ik_vec3_is_runtime_value(folded.clamped_target) &&
-          std::fabs(folded.clamped_distance_m - 0.015f) < 1e-6f,
-          "folded target projection remains finite at inner shell");
-}
+```text
+nominal_min = abs(upper - lower) + reach_buffer
+nominal_max = upper + lower - reach_buffer
+current     = length(end - root)
+effective_min = min(nominal_min, current)
+effective_max = max(nominal_max, current)
 ```
 
-- [ ] **Step 2: Compile to verify bounded-solver RED**
+The effective shell always contains the current endpoint. If the current pose
+is beyond the nominal outer side, a target farther outward clamps at
+`current`; if it is inside the nominal inner side, a target farther inward
+clamps at `current`. Movement back toward the nonsingular nominal interior
+remains allowed. Thus the exception never permits moving farther toward the
+singularity.
 
-Run:
+Reachability and shell-side decisions use the promoted distances. A reachable
+target is preserved exactly. A clamped boundary target is materialized and
+independently remeasured; binary32 rounding is iteratively biased toward the
+shell interior until its actual radius is within the precise effective shell,
+or the operation fails transactionally. The remeasured promoted radius, not
+the rounded report, drives the law of cosines.
+
+When the promoted projected motion is within `double(1e-6f)` of the current
+endpoint, the solver preserves the target hip/knee baseline quaternions
+exactly and reports zero correction. A requested target within the same
+tolerance is treated as a reachable no-op; a farther target projected back to
+the current singular side remains unreachable and requests safe stop. This
+makes the lock rising edge a fixed point while one-millimeter inward/outward
+updates remain smooth and directionally bounded. A legitimate exact-folded
+chain has a zero endpoint radius and is also a valid named ankle/contact fixed
+point.
+
+- [x] **Step 1: Expand RED coverage before implementation**
+
+The expanded test surface covers:
+
+- exact clamp boundary/neighbor classification, antipodal equivalence,
+  admitted scaled-unit normalization, a 4,608-case bounded clamp sweep,
+  invalid quaternions, and complete generic-result rollback;
+- ordinary, folded, 128 current-end shell invariants, rotated expanded-boundary
+  behavior, a fixed-bit materialized outer-shell counterexample, a promoted
+  just-over-no-op folded target, zero/subnormal links, opposite `FLT_MAX`
+  inputs, and finite `1e20` rejection;
+- exact bend thresholds and neighbors, fixed-bit pre-materialization midpoint
+  cases for primary projection, hinge cross, and sign continuity,
+  `cross(-Z,-Y) == -X`, parallel fallback, and invalid hinges;
+- named success, current-endpoint fixed points, one-millimeter updates,
+  exact-folded named ankle/contact fixed points, mirrored legs, immutable
+  baseline hinge mapping, non-target byte preservation, and staged second-leg
+  preservation;
+- null and short working/local/baseline/parent slices, partial aliasing, every
+  parent corruption, exact/partial checked-FK output overlap, all checked-FK
+  output/input type combinations including parents, malformed named
+  configurations, invalid baseline and working quaternions, source and derived
+  subnormals, baseline-FK overflow, candidate-only post-solve FK overflow, and
+  target failure rollback;
+- exact promoted `0.005 m` residual threshold ownership including a value that
+  reports as `0.005f` but is precisely greater, fresh-FK result equality,
+  four-iteration safe stop, and late residual-overflow rollback.
+
+Targeted REDs were observed for the initially undefined interfaces, the
+candidate-only post-FK overflow, the padding-sensitive release rollback
+oracle, scaled-equivalent clamp normalization, clamp-bound overshoot, the
+fixed nominal shell, materialized shell overshoot, premature rounded no-op,
+pre-materialization bend predicate changes, const-input alias mutation,
+derived-subnormal flushing, exact-folded result rejection, rounded residual
+misclassification, and current ankle/contact fixed-point behavior.
+
+- [x] **Step 2: Implement checked generic math and named adapters**
+
+Implementation is in `ik.h` and `g1_ik.h`. It does not modify
+`controller.cpp` or any protected resource binary. The old dormant
+controller math remains untouched until the later atomic integration task.
+
+- [x] **Step 3: Verify strict, release, sanitizer, and controller probes**
 
 ```bash
 g++ -std=c++17 -O0 -g -Wall -Wextra -Werror -pedantic -I. \
-  tests/cpp/test_g1_ik.cpp -o /tmp/test_g1_ik
-```
+  tests/cpp/test_g1_ik.cpp -o /tmp/test_g1_ik_task3_debug
+/tmp/test_g1_ik_task3_debug
 
-Expected: compilation fails because `G1LegSolveResult` and `g1_apply_named_position_ik` are undefined.
-
-- [ ] **Step 3: Implement robust generic two-bone math**
-
-Create `ik.h`:
-
-```cpp
-#pragma once
-
-#include "quat.h"
-#include "terrain_runtime.h"
-
-#include <cmath>
-
-struct IKTargetProjection
-{
-    bool reachable = false;
-    vec3 clamped_target;
-    float raw_distance_m = 0.0f;
-    float clamped_distance_m = 0.0f;
-    float minimum_distance_m = 0.0f;
-    float maximum_distance_m = 0.0f;
-};
-
-struct IKTwoBoneResult
-{
-    bool applied = false;
-    bool reachable = false;
-    bool correction_limited = false;
-    quat root_local;
-    quat middle_local;
-    float root_correction_radians = 0.0f;
-    float middle_correction_radians = 0.0f;
-    IKTargetProjection target;
-};
-
-static inline bool ik_quat_is_finite(quat value)
-{
-    return terrain_float_is_finite(value.w) &&
-           terrain_float_is_finite(value.x) &&
-           terrain_float_is_finite(value.y) &&
-           terrain_float_is_finite(value.z);
-}
-
-static inline bool ik_vec_is_finite(vec3 value)
-{
-    return terrain_float_is_finite(value.x) &&
-           terrain_float_is_finite(value.y) &&
-           terrain_float_is_finite(value.z);
-}
-
-static inline quat ik_clamp_local_delta(
-    quat baseline, quat desired, float maximum_radians,
-    float& requested_radians)
-{
-    requested_radians = quat_angle_between(baseline, desired);
-    if (requested_radians <= maximum_radians) return quat_normalize(desired);
-    return quat_slerp_shortest(
-        baseline, desired, maximum_radians / requested_radians);
-}
-
-static inline bool ik_project_target(
-    IKTargetProjection& output,
-    vec3 root,
-    vec3 middle,
-    vec3 end,
-    vec3 requested,
-    float reach_buffer_m)
-{
-    if (!ik_vec_is_finite(root) || !ik_vec_is_finite(middle) ||
-        !ik_vec_is_finite(end) || !ik_vec_is_finite(requested) ||
-        !terrain_float_is_finite(reach_buffer_m) || reach_buffer_m < 0.0f)
-        return false;
-    const float upper = length(middle - root);
-    const float lower = length(end - middle);
-    if (upper <= reach_buffer_m || lower <= reach_buffer_m) return false;
-    const float minimum = std::fabs(upper - lower) + reach_buffer_m;
-    const float maximum = upper + lower - reach_buffer_m;
-    if (!(minimum <= maximum)) return false;
-    const vec3 delta = requested - root;
-    const float distance = length(delta);
-    vec3 direction = vec3(0.0f, -1.0f, 0.0f);
-    if (distance > 1e-7f) {
-        direction = delta / distance;
-    } else {
-        const vec3 current = end - root;
-        const float current_distance = length(current);
-        if (current_distance > 1e-7f) direction = current / current_distance;
-    }
-    if (!terrain_float_is_finite(distance) ||
-        !ik_vec_is_finite(direction)) return false;
-    IKTargetProjection candidate = {};
-    candidate.raw_distance_m = distance;
-    candidate.minimum_distance_m = minimum;
-    candidate.maximum_distance_m = maximum;
-    candidate.clamped_distance_m = clampf(distance, minimum, maximum);
-    candidate.clamped_target = root + direction * candidate.clamped_distance_m;
-    candidate.reachable = distance >= minimum && distance <= maximum;
-    output = candidate;
-    return true;
-}
-
-static inline vec3 ik_safe_perpendicular(vec3 direction)
-{
-    const vec3 axis = std::fabs(direction.x) < 0.75f
-        ? vec3(1.0f, 0.0f, 0.0f) : vec3(0.0f, 0.0f, 1.0f);
-    return normalize(cross(direction, axis));
-}
-
-static inline quat ik_between_unit(vec3 from, vec3 to)
-{
-    const float cosine = clampf(dot(from, to), -1.0f, 1.0f);
-    if (cosine < -0.99999f)
-        return quat_from_angle_axis(PIf, ik_safe_perpendicular(from));
-    if (cosine > 0.99999f) return quat();
-    return quat_between(from, to);
-}
-
-static inline bool ik_two_bone_bounded(
-    IKTwoBoneResult& output,
-    quat root_local_before,
-    quat middle_local_before,
-    vec3 root,
-    vec3 middle,
-    vec3 end,
-    vec3 requested_target,
-    vec3 hinge_axis_world,
-    quat root_global,
-    quat middle_global,
-    quat root_parent_global,
-    float reach_buffer_m,
-    float maximum_correction_radians)
-{
-    IKTargetProjection projection = {};
-    if (!ik_project_target(
-            projection, root, middle, end, requested_target, reach_buffer_m) ||
-        !ik_vec_is_finite(hinge_axis_world) ||
-        !ik_quat_is_finite(root_global) ||
-        !ik_quat_is_finite(middle_global) ||
-        !ik_quat_is_finite(root_parent_global) ||
-        !terrain_float_is_finite(maximum_correction_radians) ||
-        maximum_correction_radians <= 0.0f) return false;
-
-    const float upper = length(middle - root);
-    const float lower = length(end - middle);
-    const float target_distance = projection.clamped_distance_m;
-    const vec3 target_direction = normalize(projection.clamped_target - root);
-    const float hinge_length = length(hinge_axis_world);
-    if (!terrain_float_is_finite(hinge_length) ||
-        std::fabs(hinge_length - 1.0f) > 1e-4f) return false;
-
-    const vec3 current_upper = middle - root;
-    const vec3 current_projection = current_upper -
-        target_direction * dot(current_upper, target_direction);
-    const float current_projection_length = length(current_projection);
-    if (!terrain_float_is_finite(current_projection_length)) return false;
-    const float primary_epsilon = 1e-6f;
-    const float sign_epsilon = 1e-8f;
-    vec3 bend_direction;
-    if (current_projection_length >= primary_epsilon) {
-        bend_direction = current_projection / current_projection_length;
-    } else {
-        const vec3 hinge_fallback = cross(
-            hinge_axis_world, target_direction);
-        const float hinge_fallback_length = length(hinge_fallback);
-        if (!terrain_float_is_finite(hinge_fallback_length)) return false;
-        bend_direction = hinge_fallback_length >= primary_epsilon
-            ? hinge_fallback / hinge_fallback_length
-            : ik_safe_perpendicular(target_direction);
-        if (current_projection_length > sign_epsilon &&
-            dot(bend_direction, current_projection) < 0.0f) {
-            bend_direction = -bend_direction;
-        }
-    }
-
-    const float knee_along =
-        (upper * upper + target_distance * target_distance - lower * lower) /
-        (2.0f * target_distance);
-    const float knee_height = std::sqrt(maxf(
-        upper * upper - knee_along * knee_along, 0.0f));
-    const vec3 desired_knee = root +
-        target_direction * knee_along + bend_direction * knee_height;
-    const vec3 desired_lower = projection.clamped_target - desired_knee;
-    if (length(desired_knee - root) < 1e-7f ||
-        length(desired_lower) < 1e-7f) return false;
-
-    const quat root_delta = ik_between_unit(
-        normalize(middle - root), normalize(desired_knee - root));
-    const quat desired_root_global = quat_mul(root_delta, root_global);
-    const vec3 root_rotated_lower =
-        quat_mul_vec3(root_delta, end - middle);
-    const quat middle_delta = ik_between_unit(
-        normalize(root_rotated_lower), normalize(desired_lower));
-    const quat desired_middle_global = quat_mul(
-        middle_delta, quat_mul(root_delta, middle_global));
-    const quat desired_root = quat_inv_mul(
-        root_parent_global, desired_root_global);
-    const quat desired_middle = quat_inv_mul(
-        desired_root_global, desired_middle_global);
-
-    float root_requested = 0.0f;
-    float middle_requested = 0.0f;
-    const quat bounded_root = ik_clamp_local_delta(
-        root_local_before, desired_root,
-        maximum_correction_radians, root_requested);
-    const quat bounded_middle = ik_clamp_local_delta(
-        middle_local_before, desired_middle,
-        maximum_correction_radians, middle_requested);
-    if (!ik_quat_is_finite(bounded_root) || !ik_quat_is_finite(bounded_middle))
-        return false;
-
-    IKTwoBoneResult candidate = {};
-    candidate.applied = true;
-    candidate.reachable = projection.reachable;
-    candidate.correction_limited =
-        root_requested > maximum_correction_radians + 1e-6f ||
-        middle_requested > maximum_correction_radians + 1e-6f;
-    candidate.root_local = bounded_root;
-    candidate.middle_local = bounded_middle;
-    candidate.root_correction_radians =
-        quat_angle_between(root_local_before, bounded_root);
-    candidate.middle_correction_radians =
-        quat_angle_between(middle_local_before, bounded_middle);
-    candidate.target = projection;
-    output = candidate;
-    return true;
-}
-
-```
-
-This replaces the dormant controller math rather than adding another active solver. Keep the controller definitions untouched until Task 7 switches the call site atomically.
-
-- [ ] **Step 4: Add the named G1 adapter without pose side effects**
-
-Include `ik.h` from `g1_ik.h`, then append:
-
-```cpp
-struct G1LegSolveResult
-{
-    bool applied = false;
-    bool reachable = false;
-    bool correction_limited = false;
-    bool safe_stop_requested = false;
-    vec3 requested_ankle_target;
-    vec3 clamped_ankle_target;
-    float raw_distance_m = 0.0f;
-    float clamped_distance_m = 0.0f;
-    float max_correction_radians = 0.0f;
-    float contact_residual_m = FLT_MAX;
-};
-
-static inline bool g1_apply_named_position_ik(
-    slice1d<quat> output_rotations,
-    const slice1d<vec3> local_positions,
-    const slice1d<quat> baseline_rotations,
-    const slice1d<int> parents,
-    const G1LegConfig& config,
-    vec3 requested_ankle_target,
-    G1LegSolveResult& output,
-    char* error,
-    int error_capacity)
-{
-    if (output_rotations.size != G1_BoneCount ||
-        local_positions.size != G1_BoneCount ||
-        baseline_rotations.size != G1_BoneCount ||
-        parents.size != G1_BoneCount ||
-        !g1_ik_vec3_is_runtime_value(requested_ankle_target)) {
-        return g1_ik_error(
-            error, error_capacity,
-            "%s leg IK received non-finite target or wrong pose shape",
-            config.name);
-    }
-    array1d<vec3> global_positions(G1_BoneCount);
-    array1d<quat> global_rotations(G1_BoneCount);
-    forward_kinematics_full(
-        global_positions, global_rotations,
-        local_positions, baseline_rotations, parents);
-    const int hip_parent = parents(config.hip);
-    if (hip_parent < 0) {
-        return g1_ik_error(
-            error, error_capacity, "%s leg IK hip has no parent", config.name);
-    }
-    IKTwoBoneResult solve = {};
-    if (!ik_two_bone_bounded(
-            solve,
-            baseline_rotations(config.hip),
-            baseline_rotations(config.knee),
-            global_positions(config.hip),
-            global_positions(config.knee),
-            global_positions(config.ankle),
-            requested_ankle_target,
-            quat_mul_vec3(
-                global_rotations(config.knee),
-                config.knee_hinge_axis_local),
-            global_rotations(config.hip),
-            global_rotations(config.knee),
-            global_rotations(hip_parent),
-            config.reach_buffer_m,
-            config.max_correction_radians)) {
-        return g1_ik_error(
-            error, error_capacity,
-            "%s leg IK produced non-finite two-bone math", config.name);
-    }
-
-    output_rotations(config.hip) = solve.root_local;
-    output_rotations(config.knee) = solve.middle_local;
-    G1LegSolveResult candidate = {};
-    candidate.applied = true;
-    candidate.reachable = solve.reachable;
-    candidate.correction_limited = solve.correction_limited;
-    candidate.safe_stop_requested =
-        !solve.reachable || solve.correction_limited;
-    candidate.requested_ankle_target = requested_ankle_target;
-    candidate.clamped_ankle_target = solve.target.clamped_target;
-    candidate.raw_distance_m = solve.target.raw_distance_m;
-    candidate.clamped_distance_m = solve.target.clamped_distance_m;
-    candidate.max_correction_radians = maxf(
-        solve.root_correction_radians,
-        solve.middle_correction_radians);
-    output = candidate;
-    return true;
-}
-
-static inline bool g1_apply_named_contact_position_ik(
-    slice1d<quat> output_rotations,
-    const slice1d<vec3> local_positions,
-    const slice1d<quat> baseline_rotations,
-    const slice1d<int> parents,
-    const G1LegConfig& config,
-    vec3 desired_contact,
-    G1LegSolveResult& output,
-    char* error,
-    int error_capacity)
-{
-    if (parents(config.contact) != config.ankle ||
-        !g1_ik_vec3_is_runtime_value(desired_contact))
-        return g1_ik_error(
-            error, error_capacity,
-            "%s contact residual solver received invalid chain/target",
-            config.name);
-    array1d<quat> candidate = output_rotations;
-    array1d<vec3> global_positions(G1_BoneCount);
-    array1d<quat> global_rotations(G1_BoneCount);
-    forward_kinematics_full(
-        global_positions, global_rotations,
-        local_positions, baseline_rotations, parents);
-    vec3 ankle_target = desired_contact -
-        (global_positions(config.contact) - global_positions(config.ankle));
-    G1LegSolveResult aggregate = {};
-    bool all_reachable = true;
-    bool any_limited = false;
-    float maximum_correction = 0.0f;
-    for (int iteration = 0; iteration < 4; ++iteration) {
-        G1LegSolveResult solve = {};
-        if (!g1_apply_named_position_ik(
-                candidate, local_positions, baseline_rotations, parents,
-                config, ankle_target, solve, error, error_capacity))
-            return false;
-        aggregate = solve;
-        all_reachable = all_reachable && solve.reachable;
-        any_limited = any_limited || solve.correction_limited;
-        maximum_correction = maxf(
-            maximum_correction, solve.max_correction_radians);
-        forward_kinematics_full(
-            global_positions, global_rotations,
-            local_positions, candidate, parents);
-        const vec3 residual =
-            desired_contact - global_positions(config.contact);
-        aggregate.contact_residual_m = length(residual);
-        if (!terrain_float_is_finite(aggregate.contact_residual_m))
-            return g1_ik_error(
-                error, error_capacity,
-                "%s contact residual became non-finite", config.name);
-        if (aggregate.contact_residual_m <= 0.001f) break;
-        ankle_target += residual;
-    }
-    aggregate.reachable = all_reachable;
-    aggregate.correction_limited = any_limited;
-    aggregate.max_correction_radians = maximum_correction;
-    aggregate.safe_stop_requested = aggregate.safe_stop_requested ||
-        !all_reachable || any_limited ||
-        aggregate.contact_residual_m > 0.005f;
-    for (int bone = 0; bone < G1_BoneCount; ++bone)
-        output_rotations(bone) = candidate(bone);
-    output = aggregate;
-    return true;
-}
-```
-
-- [ ] **Step 5: Run bounded-solver GREEN in strict, release, and sanitizer modes**
-
-Run:
-
-```bash
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
-  tests/cpp/test_g1_ik.cpp -o /tmp/test_g1_ik_strict
-/tmp/test_g1_ik_strict
-g++ -std=c++17 -O3 -ffast-math -DNDEBUG -I. \
-  tests/cpp/test_g1_ik.cpp -o /tmp/test_g1_ik_release
-/tmp/test_g1_ik_release
+  tests/cpp/test_g1_ik.cpp -o /tmp/test_g1_ik_task3_strict
+/tmp/test_g1_ik_task3_strict
+
+g++ -std=c++17 -O3 -ffast-math -DNDEBUG -fno-elide-constructors \
+  -Wall -Wextra -Werror -Wno-unused-variable -pedantic -I. \
+  tests/cpp/test_g1_ik.cpp -o /tmp/test_g1_ik_task3_release
+/tmp/test_g1_ik_task3_release
+
 g++ -std=c++17 -O1 -g -fsanitize=address,undefined \
-  -fno-omit-frame-pointer -I. tests/cpp/test_g1_ik.cpp \
-  -o /tmp/test_g1_ik_san
-ASAN_OPTIONS=detect_leaks=1 /tmp/test_g1_ik_san
+  -fno-omit-frame-pointer -Wall -Wextra -Werror -pedantic -I. \
+  tests/cpp/test_g1_ik.cpp -o /tmp/test_g1_ik_task3_san
+ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
+UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+  /tmp/test_g1_ik_task3_san
+
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
+  tests/cpp/test_g1_controller_state.cpp \
+  -o /tmp/test_g1_controller_state_task3
+/tmp/test_g1_controller_state_task3
+
+g++ -std=c++17 -O3 -ffast-math -DNDEBUG -fno-elide-constructors \
+  -Wall -Wextra -Werror -Wno-unused-variable -pedantic -I. \
+  tests/cpp/test_g1_controller_state.cpp \
+  -o /tmp/test_g1_controller_state_task3_fast
+/tmp/test_g1_controller_state_task3_fast
+
+g++ -O3 -ffast-math -march=native -DNDEBUG -D_DEFAULT_SOURCE \
+  -DPLATFORM_DESKTOP -I. -I /home/ubuntu/apps/raylib/src \
+  -I /home/ubuntu/apps/raygui/src controller.cpp \
+  -o /tmp/controller_g1_task3 -L /home/ubuntu/apps/raylib/src \
+  -lraylib -lGL -lm -lpthread -ldl -lrt -lX11
 ```
 
-Expected: all executables exit `0`; no sanitizer finding; reachable and unreachable cases remain finite and within `0.35` radians.
+All executables exit zero. ASAN/UBSAN/leak detection emits no finding.
+`-Wno-unused-variable` suppresses only existing `array.h` template
+variables whose uses are assertions removed by `NDEBUG`. Clang is not
+installed in this environment (no `clang++` or versioned alternative), so
+the requested Clang probe is recorded as unavailable and nonblocking; no
+system package was installed.
 
-- [ ] **Step 6: Commit the bounded named solver**
+- [x] **Step 4: Probe certified v2 runtime frames without a test dependency**
+
+A temporary, uncommitted probe loaded the absolute certified pack:
+
+```text
+/home/ubuntu/projects/motion-matching/resources/g1_terrain/database.bin
+SHA256 1849ecbc3775fda0a7cb2fb1bfe9ed15d0f457bd86d977d60bbe6de8b0a0fed6
+```
+
+It sampled frames `0`, `114920`, `229841`, `344761`, and `459681`
+for both named legs. Strict and
+`-O3 -ffast-math -DNDEBUG -fno-elide-constructors` builds both passed:
+
+- checked-FK versus controller-FK maximum position delta was
+  `2.95e-7 m` strict and `4.92e-7 m` fast;
+- every baseline ankle target and baseline contact target preserved all 31
+  local quaternion bit patterns, reported exactly `0` correction and
+  `0` checked residual, and remained reachable/unlimited/no-safe-stop;
+- maximum controller-FK residuals of those committed no-op poses were only
+  `1.19e-7 m` strict and `2.68e-7 m` fast.
+
+The temporary probe source was removed before staging, so committed tests do
+not depend on the 708 MB external artifact.
+
+- [x] **Step 5: Commit the bounded named solver**
 
 ```bash
-git add ik.h g1_ik.h tests/cpp/test_g1_ik.cpp
+git add ik.h g1_ik.h tests/cpp/test_g1_ik.cpp \
+  docs/superpowers/plans/2026-07-13-g1-terrain-ik-clearance.md
 git commit -m "feat: solve named G1 legs within bounded reach"
 ```
 
@@ -1603,7 +1277,7 @@ static inline bool g1_surface_aligned_foot_rotation(
     char* error,
     int error_capacity)
 {
-    if (!ik_quat_is_finite(current_global_rotation) ||
+    if (!ik_quat_is_unit(current_global_rotation) ||
         !g1_ik_vec3_is_runtime_value(surface_normal) ||
         surface_normal.y <= 0.0f ||
         std::fabs(length(surface_normal) - 1.0f) > 1e-4f) {
@@ -1622,7 +1296,7 @@ static inline bool g1_surface_aligned_foot_rotation(
     }
     forward = normalize(forward);
     const quat target = quat_from_xform_xy(forward, surface_normal);
-    if (!ik_quat_is_finite(target)) {
+    if (!ik_quat_is_unit(target)) {
         return g1_ik_error(
             error, error_capacity,
             "%s foot orientation produced non-finite target", config.name);
@@ -1666,25 +1340,22 @@ static inline bool g1_apply_named_foot_orientation(
     }
     const quat desired_local = quat_inv_mul(
         global_rotations(parent), target_global);
-    float requested = 0.0f;
-    const quat bounded = ik_clamp_local_delta(
-        baseline_rotations(config.contact), desired_local,
-        config.max_correction_radians, requested);
-    if (!ik_quat_is_finite(bounded)) {
+    IKClampResult bounded = {};
+    if (!ik_clamp_local_delta(
+            bounded, baseline_rotations(config.contact), desired_local,
+            config.max_correction_radians)) {
         return g1_ik_error(
             error, error_capacity,
             "%s foot orientation produced non-finite correction", config.name);
     }
-    output_rotations(config.contact) = bounded;
+    output_rotations(config.contact) = bounded.value;
     G1FootOrientationResult candidate = {};
     candidate.applied = true;
-    candidate.correction_limited =
-        requested > config.max_correction_radians + 1e-6f;
+    candidate.correction_limited = bounded.limited;
     candidate.safe_stop_requested = candidate.correction_limited;
     candidate.target_global_rotation = target_global;
-    candidate.requested_correction_radians = requested;
-    candidate.correction_radians = quat_angle_between(
-        baseline_rotations(config.contact), bounded);
+    candidate.requested_correction_radians = bounded.requested_radians;
+    candidate.correction_radians = bounded.actual_radians;
     output = candidate;
     return true;
 }
@@ -2710,7 +2381,9 @@ static inline bool g1_ik_frame_evaluate(
             g1_ik_request_stop(frame, G1IkStopReachShell);
         if (result.position.correction_limited)
             g1_ik_request_stop(frame, G1IkStopCorrectionBound);
-        if (result.position.contact_residual_m > 0.005f)
+        if (result.position.safe_stop_requested &&
+            result.position.reachable &&
+            !result.position.correction_limited)
             g1_ik_request_stop(frame, G1IkStopEndEffectorResidual);
 
         if (result.target.locked) {
