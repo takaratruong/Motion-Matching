@@ -1435,6 +1435,10 @@ selector. Lock all of these outcomes:
 - a real wall fixture makes exactly 41 real calls, returns
   `G1SwingNoCandidate`, requests safe stop, and leaves accepted pose, state,
   histories, support, matcher, and simulation bit-identical;
+- independently OR the three candidate-local rejection bits from the probed
+  real stages and require the selector aggregate to match through first-pass
+  selection and all-41 failure. Mix all three statuses, repeat statuses, and
+  prove negative-`Ok`/controller-only rejection adds no bit;
 - strict and fast-math callers certify identical supplied endpoint bits
   byte-for-byte. Per-build IK endpoints may differ, but each build must expose
   and deterministically certify its own first actual pass.
@@ -1506,6 +1510,14 @@ constexpr uint32_t G1SwingLiftCandidateBits[41] = {
     0x3d9374bcu, 0x3d978d50u, 0x3d9ba5e3u, 0x3d9fbe77u,
     0x3da3d70au,
 };
+
+constexpr uint32_t G1SwingRejectOutsideDomainBit = 1u << 0;
+constexpr uint32_t G1SwingRejectBudgetExceededBit = 1u << 1;
+constexpr uint32_t G1SwingRejectUncertifiedBit = 1u << 2;
+constexpr uint32_t G1SwingRejectKnownMask =
+    G1SwingRejectOutsideDomainBit |
+    G1SwingRejectBudgetExceededBit |
+    G1SwingRejectUncertifiedBit;
 ```
 
 Entry `i` is canonical binary32 `RN32(i/500 m)`: immutable 2 mm
@@ -1514,14 +1526,20 @@ the existing `memcpy` helper. Never generate entries by float arithmetic, use a
 binary search/non-ladder float iteration, infer a pass between entries, or
 invent candidate 41.
 
+Add `uint32_t clearance_rejection_status_mask = 0;` to
+`G1SwingSelectionDiagnostic`. This is the only aggregate evidence retained from
+rejected candidates. It exposes no rejected pose, endpoint, margin, witness, or
+work record. Bit 0 means at least one real stage returned `OutsideDomain`, bit
+1 means `BudgetExceeded`, and bit 2 means `Uncertified`; no other bit is valid.
+
 For each frame:
 
 1. Before caller-owned mutation, validate exact 25 Hz, shapes, state, G1HF/v2,
    leg configuration, `max_swing_lift_m` bits equal entry 40, and the strict
    arithmetic environment. Snapshot one immutable per-foot baseline. Recorded
    contact bypasses the ladder with `candidates_evaluated=0` and
-   `selected_index=G1SwingNoCandidate`; the contact flag distinguishes this
-   success from all-fail safe stop.
+   `selected_index=G1SwingNoCandidate` and mask zero; the contact flag
+   distinguishes this success from all-fail safe stop.
 2. For each non-contact foot, visit indices `0..40` in exact order. Every
    candidate starts from a fresh copy of the same baseline. Call non-inline
    strict `g1_apply_swing_lift_y` on the **actual**
@@ -1539,16 +1557,23 @@ For each frame:
    controller rejection, negative `Ok` margin, `OutsideDomain`,
    `BudgetExceeded`, or `Uncertified` rejects only that candidate and advances
    to the next index. `InvalidInput`, `InvalidField`, or `ArithmeticFailure`
-   aborts the frame transaction unchanged.
+   aborts the frame transaction unchanged. Before continuing, OR exactly the
+   corresponding bit for `OutsideDomain`/`BudgetExceeded`/`Uncertified` into a
+   local aggregate; `Ok` with a negative margin and controller-only rejection
+   add no bit.
 5. Select the first passing candidate and move its already-staged pose/result
    into the outer scratch pose. Reuse its certificate and endpoint bits; do not
-   rerun IK to apply it. After both feet compose, run checked FK once, require
+   rerun IK to apply it. Copy the aggregate mask accumulated only from earlier
+   rejected real stages. After both feet compose, run checked FK once, require
    selected endpoint-bit equality, and perform the mandatory fresh actual-center
    certificate. Any mismatch or failed defensive certificate rolls back the
    entire frame.
 6. If all 41 candidates finitely reject, report exactly
    `candidates_evaluated=41`, `selected_index=G1SwingNoCandidate`, default
-   ignored selected fields, and safe stop. Roll back accepted pose, clearance,
+   ignored selected fields, the exact aggregate mask, and safe stop. A zero
+   all-fail mask is valid when all stages failed only controller constraints or
+   negative `Ok` margins; any claim that unresolved certification caused the
+   exhaustion requires the relevant nonzero bit. Roll back accepted pose, clearance,
    histories, state, support, matcher, and simulation. Never report a fabricated
    continuous `required_lift_m`.
 
@@ -1679,7 +1704,9 @@ git commit -m "feat: certify G1 leg clearance over terrain"
   `g1_ik_state_reset`, and `g1_ik_frame_evaluate`.
 - `G1FootFrameResult` owns `G1SwingSelectionDiagnostic swing_selection` plus
   the real position/orientation results; it has no legacy planner struct,
-  continuous required-lift field, or predicted margin.
+  continuous required-lift field, or predicted margin. Its aggregate rejection
+  mask is the sole retained evidence about candidate-local certification
+  statuses from discarded stages.
 - `g1_ik_frame_evaluate` stages from an immutable baseline, evaluates the Task 5
   ladder through one private real stage function, and mutates only its
   caller-provided scratch `G1IkState` after every selected endpoint bit,
@@ -1705,7 +1732,8 @@ reach, correction, orientation, and IK-off byte-equality fixtures from Tasks
 - require the full selector to stop at the first real pass, copy the exact
   selected lift/command/endpoint/margin/work bits, and perform no second IK solve;
 - require a wall to execute exactly 41 stages, safe-stop with
-  `G1SwingNoCandidate`, and preserve the input pose/state/histories;
+  `G1SwingNoCandidate`, preserve the exact aggregate status mask, and preserve
+  the input pose/state/histories;
 - table-drive `Ok`, `OutsideDomain`, `BudgetExceeded`, `Uncertified`,
   `InvalidInput`, `InvalidField`, and `ArithmeticFailure`. Only the three finite
   candidate-local statuses continue; the last three abort transactionally;
@@ -1812,8 +1840,15 @@ case G1ClearanceOk:
         validation.lower_margin_m >= 0.0;
     break;
 case G1ClearanceOutsideDomain:
+    clearance_rejection_status_mask |= G1SwingRejectOutsideDomainBit;
+    candidate_passes = false;
+    break;
 case G1ClearanceBudgetExceeded:
+    clearance_rejection_status_mask |= G1SwingRejectBudgetExceededBit;
+    candidate_passes = false;
+    break;
 case G1ClearanceUncertified:
+    clearance_rejection_status_mask |= G1SwingRejectUncertifiedBit;
     candidate_passes = false;
     break;
 case G1ClearanceInvalidInput:
@@ -1826,11 +1861,25 @@ case G1ClearanceArithmeticFailure:
 }
 ```
 
+Validate after every OR that no bit outside `G1SwingRejectKnownMask` is set.
+Assign `selection.clearance_rejection_status_mask` only with the otherwise
+transactional public selection diagnostic: selected and all-41-fail results
+retain the aggregate, recorded-contact remains zero, and a global abort leaves
+the caller's prior diagnostic unchanged. The guarded per-candidate seam exposes
+only that candidate's existing status; tests derive the aggregate externally
+and compare it with the full selector, so no rejected pose or margin is added
+to the seam.
+
 Move the first passing staged pose into outer scratch without rerunning IK.
-All-41 finite rejection sets only the swing safe-stop diagnostic. After both
-feet compose, run checked FK once, compare selected endpoint bits, and call the
-strict validator again with a fresh immutable swing budget. Require explicit
-`status == G1ClearanceOk` and `lower_margin_m >= 0.0`.
+Run both foot selectors so their real diagnostics are complete. If either foot
+has all-41 finite rejection, return success with the immutable baseline pose,
+unchanged scratch state/histories, and the completed frame safe-stop diagnostic
+including both masks; this is a diagnostic transaction, not a controlled
+error. Only when both feet select or bypass for recorded contact does the
+runtime compose their staged poses, run checked FK once, compare selected
+endpoint bits, and call the strict validator again with a fresh immutable swing
+budget. Require explicit `status == G1ClearanceOk` and
+`lower_margin_m >= 0.0`.
 
 Only after all final checks pass, call checked history commit into the local
 next state:
@@ -1844,15 +1893,17 @@ if (!g1_swing_history_commit(
 ```
 
 Then assign output pose, scratch state, and frame result together. Any returned
-error or finite rejected frame leaves caller-owned outputs unchanged. The outer
-controller may discard this successful scratch transaction if its complete
-pose-capsule thresholds reject it.
+error leaves every caller-owned output unchanged. A successful finite safe-stop
+assigns only its completed frame diagnostic while preserving baseline pose and
+accepted state/history as described above. The outer controller may discard a
+successful staged pose transaction if its complete pose-capsule thresholds
+reject it.
 
 After creating the runtime, run the source contract scan here—not in Task 5:
 
 ```bash
 test -f g1_ik_runtime.h
-rg -n 'G1SwingLiftCandidateBits|G1SwingSelectionDiagnostic|actual_sphere_center_bits|g1_ik_stage_swing_candidate_for_test' \
+rg -n 'G1SwingLiftCandidateBits|G1SwingSelectionDiagnostic|clearance_rejection_status_mask|actual_sphere_center_bits|g1_ik_stage_swing_candidate_for_test' \
   g1_ik_runtime.h tests/cpp/test_g1_ik.cpp
 ! rg -n 'g1_swing_clearance_plan|required_lift_m|corrected_margin_m|actual_corrected_margin_m|sphere.*\+.*lift' \
   g1_ik_runtime.h tests/cpp/test_g1_ik.cpp
@@ -2270,9 +2321,11 @@ left_target_normal_x,left_target_normal_y,left_target_normal_z,
 right_target_normal_x,right_target_normal_y,right_target_normal_z,
 left_swing_candidates_evaluated,left_swing_selected_index,
 left_swing_selected_lift_bits,left_swing_materialized_command_y_bits,
+left_swing_clearance_rejection_status_mask,
 left_swing_lower_margin,left_swing_witness_upper_margin,
 right_swing_candidates_evaluated,right_swing_selected_index,
 right_swing_selected_lift_bits,right_swing_materialized_command_y_bits,
+right_swing_clearance_rejection_status_mask,
 right_swing_lower_margin,right_swing_witness_upper_margin,
 left_reachable,right_reachable,left_knee_clearance,left_ankle_clearance,
 left_toe_clearance,left_foot_clearance,left_shin_clearance,
@@ -2291,7 +2344,8 @@ right_thigh_clearance,ik_hips_clearance,ik_minimum_clearance
   statuses take controlled cleanup and do not produce a successful row.
 - Swing diagnostics describe the immutable ladder, not a continuous lift:
   evaluated count, selected index, raw lift bits, strict materialized command-Y
-  bits, and binary64 actual-center certificate bounds. No
+  bits, aggregate candidate-local rejection-status mask, and binary64
+  actual-center certificate bounds. No
   `required_lift_m`/planned translated-sphere margin is logged.
 - Ordinary physical fields always describe the last accepted/rendered pose.
   Candidate fields preserve the scratch `Ok` lower bounds only when such a pose
@@ -2312,9 +2366,13 @@ correction, and drift fixtures. Add these migrations:
   `1 <= candidates_evaluated <= 41`,
   `selected_index != G1SwingNoCandidate`,
   `candidates_evaluated == selected_index + 1`, exact selected ladder bits, and
-  `lower_margin >= 0.0`;
+  `lower_margin >= 0.0`; their mask may contain any subset of the three known
+  bits from earlier real rejects;
 - recorded-contact rows require zero evaluated candidates and the no-candidate
-  sentinel; all-41-fail rows require exactly 41, the sentinel, and safe stop;
+  sentinel with mask zero; all-41-fail rows require exactly 41, the sentinel,
+  and safe stop. Unresolved-certification evidence requires a nonzero mask,
+  while negative-`Ok`/controller-only exhaustion may have mask zero;
+- reject unknown mask bits and mutate each known bit plus every mixed subset;
 - mutate every pose status and require only exact `Ok` on accepted certified
   rows;
 - use values adjacent to `-0.005`, `-0.01`, and zero whose binary64 decisions
@@ -2361,6 +2419,7 @@ struct motion_match_ik_leg_diagnostic
     uint32_t swing_selected_index = UINT32_MAX;
     uint32_t swing_selected_lift_bits = 0;
     uint32_t swing_materialized_command_y_bits = 0;
+    uint32_t swing_clearance_rejection_status_mask = 0;
     double swing_lower_margin = 0.0;
     double swing_witness_upper_margin = 0.0;
     double knee_clearance = 0.0;
@@ -2403,6 +2462,22 @@ Before `deterministic_log.write`, map left/right explicitly. Candidate and
 accepted clearance use lower bounds directly:
 
 ```cpp
+const G1LegConfig ik_configs[2] = {
+    g1_left_leg_config(), g1_right_leg_config()
+};
+motion_match_ik_leg_diagnostic* ik_log_feet[2] = {
+    &log_row.ik.left, &log_row.ik.right
+};
+const G1LegClearance* ik_clearance_feet[2] = {
+    &state.ik_clearance.left, &state.ik_clearance.right
+};
+log_row.ik.applied = state.ik_frame.applied;
+log_row.ik.safe_stop_requested = state.ik_frame.safe_stop_requested;
+log_row.ik.stop_reason = g1_ik_stop_reason_name(state.ik_frame.stop_reason);
+log_row.ik.max_correction = state.ik_frame.max_correction_radians;
+log_row.ik.actual_simulation_speed = g1_xz_length(
+    state.simulation_velocity);
+log_row.ik.candidate_rejected = state.ik_candidate_rejected;
 log_row.ik.candidate_clearance_status = static_cast<uint32_t>(
     state.ik_candidate_clearance_status);
 if (state.ik_candidate_clearance_status == G1ClearanceOk) {
@@ -2424,8 +2499,24 @@ for (int foot = 0; foot < 2; ++foot) {
     const G1LegClearance& clearance = *ik_clearance_feet[foot];
     const G1SwingSelectionDiagnostic& selection = src.swing_selection;
 
+    dst.recorded_contact = src.recorded_contact;
+    dst.locked = src.target.locked;
+    dst.reachable = !src.position.applied || src.position.reachable;
+    dst.observed_lock_drift = src.target.horizontal_drift_m;
+    dst.lock_drift = g1_horizontal_lock_drift(
+        ik_configs[foot], state.ik.feet[foot].lock,
+        state.ik_global_bone_positions, state.ik_global_bone_rotations);
+    dst.sole_normal_alignment = g1_sole_normal_alignment(
+        ik_configs[foot], src.target.surface.normal,
+        state.ik_global_bone_rotations);
+    dst.contact_residual = src.position.applied
+        ? src.position.contact_residual_m : 0.0f;
+    dst.target_height = src.target.surface.point.y;
+    dst.target_normal = src.target.surface.normal;
     dst.swing_candidates_evaluated = selection.candidates_evaluated;
     dst.swing_selected_index = selection.selected_index;
+    dst.swing_clearance_rejection_status_mask =
+        selection.clearance_rejection_status_mask;
     if (selection.selected_index != G1SwingNoCandidate) {
         dst.swing_selected_lift_bits = selection.selected.lift_bits;
         dst.swing_materialized_command_y_bits =
@@ -2446,17 +2537,228 @@ log_row.ik.hips_clearance = state.ik_clearance.hips.lower_bound_m;
 log_row.ik.minimum_clearance = state.ik_clearance.minimum.lower_bound_m;
 ```
 
-Map existing contact/lock/target/reach/residual/orientation fields from the same
-immutable sources as before. Do not reconstruct a float lift from
-`selected.lift_bits` for safety or add a second correction. Store the exact
-candidate pose status in controller state in Task 7; do not infer it from
-`candidate_rejected` or error text.
+Keep `g1_horizontal_lock_drift` and `g1_sole_normal_alignment` as the two pure
+helpers defined by the locked pre-IK logging contract: the former measures the
+accepted post-FK sole center against `lock.lock_point` in XZ and returns zero
+when unlocked; the latter dots the accepted post-FK configured sole normal
+with `src.target.surface.normal`. The sibling row is filled first from its
+pre-IK sources. Do not reconstruct a float lift from `selected.lift_bits` for
+safety, add a second correction, or rebind a sibling field to post-IK data.
+Store the exact candidate pose status in controller state in Task 7; do not
+infer it from `candidate_rejected` or error text.
 
 - [ ] **Step 5: Migrate Gate E and stress evidence to statuses and ladder facts**
 
-Retain the existing raw-string matching/support/observation invariance groups and
-CSV reader/CLI contracts. The shared validator finite-parses all binary64 text
-without reformatting it and validates integer fields as exact unsigned decimal.
+Implement these exact raw-string groups; none exists before this task:
+
+```python
+IK_MATCHING_INVARIANTS = (
+    "frame", "fixed_dt", "scene_id", "mode", "route",
+    "query_bits_hex", "query_database_frame", "query_range",
+    "selected_database_frame", "database_frame", "range",
+    "source_range", "searched", "transitioned", "incumbent_cost",
+    "selected_cost", "selected_terrain_error", "effective_terrain_weight",
+    "terrain0", "terrain1", "terrain2", "terrain3",
+    "terrain_point0_x", "terrain_point0_y", "terrain_point0_z",
+    "terrain_point1_x", "terrain_point1_y", "terrain_point1_z",
+    "terrain_point2_x", "terrain_point2_y", "terrain_point2_z",
+    "terrain_point3_x", "terrain_point3_y", "terrain_point3_z",
+    "source_name", "source_terrain", "source_index", "continuation_cost",
+)
+
+IK_SUPPORT_SIMULATION_INVARIANTS = (
+    "raw_selected_hips_y", "inertialized_hips_y", "rendered_hips_y",
+    "hips_inertial_offset_y", "runtime_root_surface_height",
+    "runtime_left_toe_surface_height", "runtime_right_toe_surface_height",
+    "adjustment_xz", "adjustment_y", "clamp_xz", "clamp_y",
+    "matching_enabled", "adjustment_enabled", "clamping_enabled",
+    "support_retargeting_enabled", "source_root_height",
+    "runtime_support_root_height", "source_left_toe_height",
+    "source_right_toe_height", "runtime_support_left_toe_height",
+    "runtime_support_right_toe_height", "support_root_delta",
+    "support_left_toe_delta", "support_right_toe_delta", "support_height",
+    "support_velocity", "support_source", "airborne_frames",
+    "left_contact", "right_contact", "support_retargeted_hips_y",
+    "ik_adjusted_hips_y", "simulation_x", "simulation_z",
+    "walkability_class", "blocked", "blocked_reason", "blocked_distance",
+    "blocked_point_x", "blocked_point_z", "commanded_speed", "applied_speed",
+    "route_waypoint", "route_complete", "route_target_height",
+    "scene_generation", "scene_frame", "scene_reset_count",
+    "scene_switch_failed", "motion_pack_load_count", "model_load_count",
+    "model_unload_count", "live_model_count",
+)
+
+IK_BASE_INVARIANTS = (
+    IK_MATCHING_INVARIANTS + IK_SUPPORT_SIMULATION_INVARIANTS
+)
+
+IK_PAIR_OBSERVATION_INVARIANTS = (
+    "actual_simulation_speed",
+    "left_recorded_contact", "right_recorded_contact",
+    "left_locked", "right_locked",
+    "left_observed_lock_drift", "right_observed_lock_drift",
+    "left_target_height", "right_target_height",
+    "left_target_normal_x", "left_target_normal_y", "left_target_normal_z",
+    "right_target_normal_x", "right_target_normal_y", "right_target_normal_z",
+)
+```
+
+Define the exact mask values used by the checker, then freeze the sibling
+header before appending this task's suffix:
+
+```python
+G1_SWING_REJECT_OUTSIDE_DOMAIN_BIT = 1 << 0
+G1_SWING_REJECT_BUDGET_EXCEEDED_BIT = 1 << 1
+G1_SWING_REJECT_UNCERTIFIED_BIT = 1 << 2
+G1_SWING_REJECT_KNOWN_MASK = (
+    G1_SWING_REJECT_OUTSIDE_DOMAIN_BIT |
+    G1_SWING_REJECT_BUDGET_EXCEEDED_BIT |
+    G1_SWING_REJECT_UNCERTIFIED_BIT
+)
+G1_SWING_REJECT_NAMES = (
+    (G1_SWING_REJECT_OUTSIDE_DOMAIN_BIT, "OutsideDomain"),
+    (G1_SWING_REJECT_BUDGET_EXCEEDED_BIT, "BudgetExceeded"),
+    (G1_SWING_REJECT_UNCERTIFIED_BIT, "Uncertified"),
+)
+
+LEGACY_RUNTIME_COLUMNS = tuple(RUNTIME_COLUMNS)
+FULL_RUNTIME_COLUMNS = LEGACY_RUNTIME_COLUMNS + IK_SUFFIX
+```
+
+Refactor the existing duplicate-header reader into
+`_read_rows_exact(path, expected_columns)`. It requires a nonempty CSV whose
+header tuple is **exactly** `expected_columns`: same order, no duplicate,
+missing, extra, or partially appended suffix column. Define it and its wrappers
+with raw `csv.reader` strings:
+
+```python
+def _peek_header(path):
+    with open(path, newline="", encoding="utf-8") as stream:
+        return tuple(next(csv.reader(stream), ()))
+
+def _read_rows_exact(path, expected_columns):
+    if expected_columns == FULL_RUNTIME_COLUMNS:
+        schema_name = "FULL_RUNTIME_COLUMNS"
+    elif expected_columns == LEGACY_RUNTIME_COLUMNS:
+        schema_name = "LEGACY_RUNTIME_COLUMNS"
+    else:
+        raise AssertionError("unknown exact runtime schema")
+    header = _peek_header(path)
+    if not header:
+        raise ValueError(f"{path}: CSV header is empty")
+    if header != expected_columns:
+        raise ValueError(
+            f"{path}: actual header {header!r} is not exact "
+            f"{schema_name} {expected_columns!r}")
+    rows = []
+    with open(path, newline="", encoding="utf-8") as stream:
+        reader = csv.reader(stream)
+        next(reader)
+        for csv_row, values in enumerate(reader, 2):
+            if len(values) != len(expected_columns):
+                raise ValueError(
+                    f"{path}: CSV row {csv_row} has {len(values)} values; "
+                    f"exact {schema_name} requires {len(expected_columns)}")
+            rows.append(dict(zip(expected_columns, values)))
+    if not rows:
+        raise ValueError(f"{path}: exact {schema_name} CSV has no data rows")
+    return rows
+
+def read_rows(path):
+    return _read_rows_exact(path, FULL_RUNTIME_COLUMNS)
+
+def read_legacy_runtime_rows(path):
+    return _read_rows_exact(path, LEGACY_RUNTIME_COLUMNS)
+
+def read_ik_baseline(path):
+    header = _peek_header(path)
+    if header == FULL_RUNTIME_COLUMNS:
+        return "full", read_rows(path)
+    if header == LEGACY_RUNTIME_COLUMNS:
+        return "legacy", read_legacy_runtime_rows(path)
+    raise ValueError(
+        f"{path}: IK baseline header is neither exact full schema nor "
+        "exact locked pre-IK prefix")
+```
+
+`read_rows` is the only full new-schema reader. `read_legacy_runtime_rows` is
+the only legacy-prefix reader and accepts no suffix column. The existing
+`--compare-control` and `--ik-off-reference` inputs use the legacy reader.
+`--ik-baseline` uses `read_ik_baseline`: a newly generated IK-off baseline is
+full schema; an accepted pre-Task8 baseline may be exactly the locked legacy
+prefix. After either dispatch, require every baseline row to have raw
+`ik_enabled == "0"`; otherwise fail with
+`--ik-baseline must contain only ik_enabled=0`. Never accept an arbitrary
+intersection or silently drop columns.
+
+`compare_ik_invariance` requires equal nonzero row counts and compares every
+`IK_BASE_INVARIANTS` value with ordinary string equality. Its error names the
+zero-based row, logged frame, column, baseline raw text, and IK raw text.
+`compare_ik_observations` has the same contract for
+`IK_PAIR_OBSERVATION_INVARIANTS`, but is called only when both sides use the
+full schema. A legacy baseline compares shared base strings only; it can never
+stand in for missing post-support observations.
+
+Change shared full-row validation only enough to accept `ik_enabled` exactly
+`0` or `1`. Keep explicit `ik_enabled == 0` requirements in
+`diagnose_gate_a`, `check_gate_c`, `check_gate_d`, `check_gate_f`,
+`check_failed_switch`, `compare_control`, the `--ik-off-reference` path, and
+every legacy-prefix validation path. `compare_control` requires both treatment
+and control to be IK-off. Gate E and Gate E stress alone require IK-on rows.
+Thus adding full-schema parsing cannot weaken any sibling gate or comparison.
+
+Add exact CLI composition:
+
+- `--gate-e` and `--gate-e-stress` are mutually exclusive and each requires
+  `--ik-baseline PATH`, `--expected-scene ID`, and `--expected-route ID`;
+- missing inputs fail with respectively
+  `--gate-e requires --ik-baseline/--expected-scene/--expected-route` or the
+  same string beginning `--gate-e-stress`;
+- `--ik-off-reference PATH` is independent of Gate E, requires the primary
+  full log to contain only `ik_enabled=0`, reads the reference with the exact
+  legacy reader, compares `IK_BASE_INVARIANTS`, and prints
+  `VALID ik-off-reference frames=<n>`; an IK-on primary fails with
+  `--ik-off-reference requires an IK-off primary log`;
+- `--compare-control PATH` reads the accepted control with the exact legacy
+  reader, requires both logs to be IK-off, and otherwise preserves its existing
+  comparison errors and `VALID terrain-comparison` summary; an IK-on primary
+  fails with `--compare-control requires an IK-off primary log`;
+- neither Gate E flag may combine with `--gate-a`, `--gate-c`, `--gate-d`,
+  `--gate-f`, or `--expect-switch-failure`; fail with
+  `--gate-e/--gate-e-stress may not combine with sibling gate flags`.
+  Conversely, any of `--ik-baseline`, `--expected-scene`, or
+  `--expected-route` without one Gate E flag fails with
+  `--ik-baseline/--expected-scene/--expected-route requires --gate-e or
+  --gate-e-stress`;
+- preserve the sibling positional `log`, optional `--compare-control PATH`,
+  `--gate-a`, mutually exclusive `--gate-c`/`--gate-d`/`--gate-f`, optional
+  `--expected-scenes CSV`, and `--expect-switch-failure` flags. Preserve the
+  exact custom errors `--expect-switch-failure may not combine with Gate
+  A/C/D/F flags`, `--gate-f requires --expected-scenes`, `--expected-scenes
+  must match the locked 14-scene catalog`, and `--expected-scenes requires
+  --gate-f`, plus their existing `VALID` summaries. Gate E flags do not change
+  those combinations or diagnostics.
+
+For a full `--ik-baseline`, Gate E compares base and observation groups over
+the complete pair. For a legacy baseline it compares only the shared base
+group. The Gate E stress traverse branch does the same over the complete pair.
+The safe-stop branch finds the first request at index `stop`, then compares
+only `off_rows[:stop+1]` and `on_rows[:stop+1]`; it must not require any
+post-stop row, simulation, support, or observation equality because command
+handoff intentionally diverges on the next update.
+
+Add REDs for exact full/legacy headers, every hybrid/partial/duplicate header,
+full and legacy `--ik-baseline`, legacy `--ik-off-reference`, all exact CLI
+missing-argument diagnostics, sibling-gate IK-on rejection, accepted post-stop
+divergence, and rejection of a mutation at the inclusive request row.
+
+The shared validator finite-parses all binary64 text without reformatting it.
+Its uint32 parser accepts only canonical raw decimal text matching
+`0|[1-9][0-9]*` whose value is at most `4294967295`; it rejects signs,
+whitespace, leading zeroes, overflow, and non-digits. Use it for every count,
+index, raw-bit word, pose status, and rejection mask. On every full-schema row,
+reject `mask & ~G1_SWING_REJECT_KNOWN_MASK != 0` for either foot before any
+Gate E branch logic; any recorded-contact foot additionally requires mask zero.
 
 For every certified Gate E row require:
 
@@ -2464,9 +2766,12 @@ For every certified Gate E row require:
   correction/residual, reachable legs, exact contact/lock/target observations,
   and locked sole alignment at least `0.999`;
 - for a recorded-contact foot: evaluated count zero and no-candidate sentinel;
+  its rejection mask must be zero;
   for a swing foot: evaluated count in `[1,41]`, selected index exactly one less
   than the count, selected lift bits equal canonical table entry at that index,
-  and binary64 lower margin nonnegative with witness upper margin no smaller;
+  binary64 lower margin nonnegative with witness upper margin no smaller, and
+  rejection mask containing only `G1SwingRejectKnownMask` bits. A selected
+  candidate may retain bits from earlier rejected stages;
 - candidate `Ok` lower bounds equal the accepted lower bounds on a committed
   row;
 - locked toe/foot lower bounds at least `-0.005` and every accepted
@@ -2477,12 +2782,33 @@ The stress safe-stop evidence for `swing-lift` is no longer “required lift abo
 0.08” or a predicted margin. It is exact all-ladder exhaustion on at least one
 non-contact foot:
 `candidates_evaluated == 41` and
-`selected_index == G1SwingNoCandidate`. Preserve the prior exact evidence for
-reach shell, correction bound, lock drift, residual, pose-clearance rejection,
-next-frame zero planar motion, tail displacement/support rise, and accepted-pose
-physical bounds. Candidate-local `OutsideDomain`/`BudgetExceeded`/
-`Uncertified` must remain named evidence; global statuses are controlled errors,
-not a Gate E safe-stop success.
+`selected_index == G1SwingNoCandidate`. If unresolved certification is named as
+the cause, its mask must be nonzero and the checker prints the exact decoded
+set (`OutsideDomain`, `BudgetExceeded`, `Uncertified`, including mixtures).
+Mask zero remains valid only when every real rejection was controller-only or a
+negative `Ok` margin; print that zero-mask cause as
+`controller-or-negative-ok`, not as a certification status. The other stop
+reasons retain these exact evidence
+predicates on the request row: `reach-shell` requires either reachable flag to
+be false; `correction-bound` requires `max_ik_correction >= 0.35 - 1e-5`;
+`lock-drift` requires either observed lock drift to exceed `0.20`;
+`end-effector-residual` requires either contact residual to exceed `0.005`;
+and `post-solve-clearance` requires either a non-`Ok` candidate-local pose
+status or an `Ok` candidate lower bound below `-0.005` for a locked toe/foot or
+below `-0.01` for the candidate minimum. Reject a reason whose predicate is
+false, `none`, and unknown reasons. Candidate lower bounds are examined only
+for `Ok`; a non-`Ok` pose is proved by its exact status, never fabricated
+numbers.
+
+For every safe-stop branch, require the first stop request before the first
+`route_complete=1` row if one exists. The immediately following row and every
+tail row require `actual_simulation_speed <= 1e-4`; from that first stopped row
+through the end, total XZ displacement and support-height rise are each at most
+`0.02 m`. Every accepted/rendered row, including the complete tail, retains
+the ordinary `-0.01` physical lower bounds and locked `-0.005` toe/foot lower
+bounds. Candidate-local `OutsideDomain`/`BudgetExceeded`/`Uncertified` remain
+named evidence; global statuses are controlled errors, not a Gate E safe-stop
+success. A later open-loop `route_complete=1` is allowed.
 
 Print/check binary64 values from their raw CSV text; never round them to a
 binary32 surrogate before threshold comparison.
@@ -2547,6 +2873,25 @@ The three class-2 GRAIL curb routes (`grail-curb-default`,
 `traverse-or-safe-stop` runs. Each must take one of the two exact branches
 checked by `--gate-e-stress`; none is relabeled certified. The blocked-course
 safe-stop routes remain sibling Gate D, never Gate E.
+
+Schema routing is part of this verification, not an implicit compatibility
+mode:
+
+- every CSV produced by `/tmp/controller_g1_ik` in this task has exactly
+  `FULL_RUNTIME_COLUMNS` and is always the positional primary log;
+- every preserved weight-zero control and accepted Gate C/D/F reference under
+  `/tmp/g1-multiscene-runtime/` has exactly `LEGACY_RUNTIME_COLUMNS`.
+  `--compare-control` and `--ik-off-reference` load those paths only with
+  `read_legacy_runtime_rows`; no legacy file is passed to `read_rows` or used as
+  the positional primary;
+- every newly generated matched Gate E/stress `off` log is full schema.
+  `--ik-baseline` must dispatch it as `"full"`, compare all base and observation
+  invariants, and reject a partially appended or hybrid header. The exact
+  legacy baseline branch is exercised in Task 8 unit tests only; it compares
+  base invariants because the observation suffix does not exist there;
+- Gate C, Gate D, Gate F, failed-switch, `--compare-control`, and
+  `--ik-off-reference` still require every primary row to have
+  `ik_enabled == "0"`. Only Gate E and Gate E stress accept IK-on primaries.
 
 - [ ] **Step 1: Run the complete Python suite and independent published-pack validator**
 
