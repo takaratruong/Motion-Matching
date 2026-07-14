@@ -172,7 +172,9 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    args.output.write_text(generate_header(args.g1_xml), encoding="utf-8")
+    args.output.write_text(
+        generate_header(args.g1_xml), encoding="utf-8", newline="\n"
+    )
 
 
 if __name__ == "__main__":

@@ -3,8 +3,9 @@ from pathlib import Path
 import re
 import tempfile
 import unittest
+from unittest import mock
 
-from resources.generate_g1_arm_joint_metadata import generate_header
+from resources.generate_g1_arm_joint_metadata import generate_header, main
 
 
 G1_XML = Path(os.environ["G1_XML"])
@@ -70,6 +71,25 @@ class G1ArmJointMetadataTests(unittest.TestCase):
     def test_generator_matches_the_tracked_header_byte_for_byte(self):
         generated = generate_header(G1_XML).encode("utf-8")
         self.assertEqual(generated, TRACKED_HEADER.read_bytes())
+
+    def test_cli_requests_canonical_lf_newlines(self):
+        output = Path("generated-arm-metadata.h")
+        argv = [
+            "generate_g1_arm_joint_metadata",
+            "--g1-xml", str(G1_XML),
+            "--output", str(output),
+        ]
+        with mock.patch("sys.argv", argv), mock.patch.object(
+            Path, "write_text", autospec=True
+        ) as write_text:
+            main()
+
+        write_text.assert_called_once()
+        call = write_text.call_args
+        self.assertEqual(call.args[0], output)
+        self.assertEqual(call.args[1], generate_header(G1_XML))
+        self.assertEqual(call.kwargs.get("encoding"), "utf-8")
+        self.assertEqual(call.kwargs.get("newline"), "\n")
 
     def test_exact_fourteen_descriptors_and_ranges(self):
         actual = descriptors(generate_header(G1_XML))
