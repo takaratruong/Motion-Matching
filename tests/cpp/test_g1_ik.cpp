@@ -2892,6 +2892,41 @@ static void test_surface_orientation_staged_pose_and_fallback()
           "exact-degenerate fallback target remains checked");
     check(dot(exact_target_up, exact_normal) > 0.9999f,
           "exact-degenerate heading also uses a valid deterministic fallback");
+
+    const quat nonidentity = quat_from_angle_axis(
+        1.1f, vec3(0.0f, 1.0f, 0.0f));
+    const quat scaled_nonidentity = nonidentity * 0.99999f;
+    check(ik_quat_is_unit(scaled_nonidentity),
+          "scaled non-identity fixture is inside unit tolerance");
+    quat normalized_nonidentity;
+    check(ik_checked_quat_normalize(
+              normalized_nonidentity, scaled_nonidentity),
+          "scaled non-identity fixture has a checked normalized equivalent");
+    const vec3 comparison_normal(
+        0.0f, std::cos(angle), -std::sin(angle));
+    quat scaled_target;
+    quat normalized_target;
+    check(g1_surface_aligned_foot_rotation(
+              scaled_target, scaled_nonidentity, left,
+              comparison_normal, error,
+              static_cast<int>(sizeof(error))) &&
+          g1_surface_aligned_foot_rotation(
+              normalized_target, normalized_nonidentity, left,
+              comparison_normal, error,
+              static_cast<int>(sizeof(error))),
+          error);
+    vec3 scaled_heading;
+    vec3 normalized_heading;
+    check(ik_checked_quat_rotate(
+              scaled_heading, scaled_target,
+              left.foot_forward_local) &&
+          ik_checked_quat_rotate(
+              normalized_heading, normalized_target,
+              left.foot_forward_local),
+          "scaled and normalized targets expose checked headings");
+    check(g1_test_quat_bits_same(scaled_target, normalized_target) &&
+          g1_test_vec3_same(scaled_heading, normalized_heading),
+          "admitted scaled rotation matches its normalized target and heading");
 }
 
 static void test_surface_orientation_limit_semantics()

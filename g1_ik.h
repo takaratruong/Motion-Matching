@@ -1984,6 +1984,15 @@ static inline bool g1_surface_aligned_foot_rotation(
             config.name);
     }
 
+    quat normalized_current_global_rotation;
+    if (!ik_checked_quat_normalize(
+            normalized_current_global_rotation,
+            current_global_rotation)) {
+        return g1_ik_error(
+            error, error_capacity,
+            "%s foot orientation could not normalize its rotation",
+            config.name);
+    }
     vec3 up;
     vec3 current_forward;
     double projection_dot = 0.0;
@@ -1994,7 +2003,7 @@ static inline bool g1_surface_aligned_foot_rotation(
     if (!ik_checked_normalize(up, surface_normal) ||
         !ik_checked_quat_rotate(
             current_forward,
-            current_global_rotation,
+            normalized_current_global_rotation,
             config.foot_forward_local) ||
         !ik_checked_dot(projection_dot, current_forward, up) ||
         !ik_checked_vec3_scale(
