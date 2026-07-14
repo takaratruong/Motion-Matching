@@ -194,8 +194,8 @@ static void test_controller_source_contract(const char* path)
         update, "forward_kinematics_full(", simulation_xz,
         "preliminary support-local FK exists");
     const size_t observation = find_required(
-        update, "support_observation_build(", preliminary_fk,
-        "support observation exists");
+        update, "support_observation_build_walkable(", preliminary_fk,
+        "walkability-filtered support observation exists");
     const size_t support_update = find_required(
         update, "support_frame_update(", observation,
         "support update exists");
@@ -222,16 +222,19 @@ static void test_controller_source_contract(const char* path)
           support_update < adjustment && adjustment < clamp &&
           clamp < support_apply && support_apply < final_fk,
           "fixed update stage order preserves matching and rebases support");
-    check(count_occurrences(update, "support_observation_build(") == 1 &&
+    check(count_occurrences(
+              update, "support_observation_build_walkable(") == 1 &&
           count_occurrences(update, "support_frame_update(") == 1 &&
           count_occurrences(update, "support_pose_apply(") == 1 &&
           count_occurrences(update, "forward_kinematics_full(") == 2,
           "support is observed, updated, and applied exactly once");
     const std::string observation_call = call_text(
-        update, "support_observation_build", preliminary_fk);
+        update, "support_observation_build_walkable", preliminary_fk);
     check(observation_call.find("support_rows") != std::string::npos &&
           observation_call.find("state.frame_index") != std::string::npos &&
           observation_call.find("active_scene.terrain") !=
+              std::string::npos &&
+          observation_call.find("active_scene.walkability") !=
               std::string::npos &&
           observation_call.find(
               "state.global_bone_positions(G1_Simulation)") !=

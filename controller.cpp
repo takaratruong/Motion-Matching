@@ -2792,11 +2792,12 @@ int main(void)
             state.bone_positions,
             state.bone_rotations,
             db.bone_parents);
-        if (!support_observation_build(
+        if (!support_observation_build_walkable(
                 state.support_observation_now,
                 support_rows,
                 state.frame_index,
                 active_scene.terrain,
+                active_scene.walkability,
                 state.global_bone_positions(G1_Simulation),
                 state.global_bone_positions(G1_LeftToe),
                 state.global_bone_positions(G1_RightToe),

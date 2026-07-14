@@ -109,6 +109,45 @@ static inline bool support_observation_build(
     return true;
 }
 
+static inline bool support_observation_build_walkable(
+    support_observation& out,
+    const terrain_support_set& support,
+    const int frame,
+    const heightfield& terrain,
+    const walkability_grid& walkability,
+    const vec3 root,
+    const vec3 left_toe,
+    const vec3 right_toe,
+    const bool left_contact,
+    const bool right_contact,
+    char* error,
+    const int error_capacity)
+{
+    if (terrain.version != 2 ||
+        !walkability_grid_matches_heightfield(walkability, terrain)) {
+        return support_error(
+            error, error_capacity,
+            "support walkability grid must match v2 terrain");
+    }
+
+    support_observation candidate = {};
+    if (!support_observation_build(
+            candidate, support, frame, terrain,
+            root, left_toe, right_toe,
+            left_contact, right_contact,
+            error, error_capacity)) {
+        return false;
+    }
+    candidate.contact[0] = candidate.contact[0] &&
+        walkability_class_at(
+            walkability, terrain, left_toe.x, left_toe.z) != 0;
+    candidate.contact[1] = candidate.contact[1] &&
+        walkability_class_at(
+            walkability, terrain, right_toe.x, right_toe.z) != 0;
+    out = candidate;
+    return true;
+}
+
 static inline void support_frame_reset(
     support_frame_state& state, const float initial_height)
 {

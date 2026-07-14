@@ -62,6 +62,206 @@ static void check_observation_bits_equal(
     check(equal, message);
 }
 
+static void initialize_walkable_support_fixture(
+    terrain_support_set& support,
+    heightfield& terrain,
+    walkability_grid& walkability)
+{
+    support.values.resize(1, 3);
+    support.values(0, 0) = 0.125f;
+    support.values(0, 1) = -0.25f;
+    support.values(0, 2) = 0.375f;
+
+    terrain.version = 2;
+    terrain.nx = 5;
+    terrain.nz = 5;
+    terrain.origin_x = 0.0f;
+    terrain.origin_z = 0.0f;
+    terrain.cell_size = 0.25f;
+    terrain.exterior_height = 0.0f;
+    terrain.heights.resize(terrain.nx * terrain.nz);
+    for (int z = 0; z < terrain.nz; ++z) {
+        for (int x = 0; x < terrain.nx; ++x) {
+            terrain.heights(z * terrain.nx + x) =
+                0.10f + 0.01f * static_cast<float>(x) +
+                0.02f * static_cast<float>(z);
+        }
+    }
+
+    walkability.nx = terrain.nx;
+    walkability.nz = terrain.nz;
+    walkability.cells.resize(terrain.nx * terrain.nz);
+    walkability.cells.set(1);
+}
+
+static void test_walkable_observation_filters_only_class_zero_contacts()
+{
+    terrain_support_set support;
+    heightfield terrain;
+    walkability_grid walkability;
+    initialize_walkable_support_fixture(support, terrain, walkability);
+    const vec3 root(0.25f, 7.0f, 0.25f);
+    const vec3 left_toe(0.50f, -3.0f, 0.50f);
+    const vec3 right_toe(0.75f, 11.0f, 0.50f);
+    const int left_cell = 2 * walkability.nx + 2;
+    const int right_cell = 2 * walkability.nx + 3;
+    char error[256] = {};
+
+    support_observation ordinary = {};
+    check(support_observation_build(
+              ordinary, support, 0, terrain, root, left_toe, right_toe,
+              true, true, error, sizeof(error)),
+          error);
+
+    walkability.cells(left_cell) = 2;
+    support_observation filtered = {};
+    check(support_observation_build_walkable(
+              filtered, support, 0, terrain, walkability,
+              root, left_toe, right_toe, true, true,
+              error, sizeof(error)),
+          error);
+    check_observation_bits_equal(
+        filtered, ordinary,
+        "class-one and class-two contacts remain bit-identical");
+
+    walkability.cells.set(1);
+    walkability.cells(left_cell) = 0;
+    check(support_observation_build_walkable(
+              filtered, support, 0, terrain, walkability,
+              root, left_toe, right_toe, true, true,
+              error, sizeof(error)),
+          error);
+    support_observation expected = ordinary;
+    expected.contact[0] = false;
+    check_observation_bits_equal(
+        filtered, expected,
+        "class-zero left toe clears only its contact and preserves samples");
+
+    walkability.cells.set(1);
+    walkability.cells(right_cell) = 0;
+    check(support_observation_build_walkable(
+              filtered, support, 0, terrain, walkability,
+              root, left_toe, right_toe, true, true,
+              error, sizeof(error)),
+          error);
+    expected = ordinary;
+    expected.contact[1] = false;
+    check_observation_bits_equal(
+        filtered, expected,
+        "class-zero right toe clears only its contact and preserves samples");
+
+    support_frame_state one_valid_state;
+    support_frame_reset(one_valid_state, ordinary.delta[0]);
+    check(support_frame_update(
+              one_valid_state, filtered, false, 1.0f / 25.0f,
+              error, sizeof(error)),
+          error);
+    check(one_valid_state.source == support_left,
+          "support update selects the other walkable toe");
+
+    walkability.cells(left_cell) = 0;
+    check(support_observation_build_walkable(
+              filtered, support, 0, terrain, walkability,
+              root, left_toe, right_toe, true, true,
+              error, sizeof(error)),
+          error);
+    expected = ordinary;
+    expected.contact[0] = false;
+    expected.contact[1] = false;
+    check_observation_bits_equal(
+        filtered, expected,
+        "two class-zero toes clear both contacts and preserve samples");
+
+    support_frame_state no_valid_state;
+    support_frame_reset(no_valid_state, ordinary.delta[0]);
+    for (int frame = 0; frame < 3; ++frame) {
+        check(support_frame_update(
+                  no_valid_state, filtered, false, 1.0f / 25.0f,
+                  error, sizeof(error)),
+              error);
+        check(no_valid_state.source ==
+                  (frame < 2 ? support_held : support_airborne_root),
+              "two invalid toes retain hold then root fallback");
+    }
+
+    walkability.cells.set(1);
+    support_observation recorded_false = {};
+    check(support_observation_build_walkable(
+              recorded_false, support, 0, terrain, walkability,
+              root, left_toe, right_toe, false, true,
+              error, sizeof(error)),
+          error);
+    support_observation ordinary_recorded_false = {};
+    check(support_observation_build(
+              ordinary_recorded_false, support, 0, terrain,
+              root, left_toe, right_toe, false, true,
+              error, sizeof(error)),
+          error);
+    check_observation_bits_equal(
+        recorded_false, ordinary_recorded_false,
+        "walkability filtering never invents a recorded contact");
+}
+
+static void test_walkable_observation_failures_are_transactional()
+{
+    terrain_support_set support;
+    heightfield terrain;
+    walkability_grid walkability;
+    initialize_walkable_support_fixture(support, terrain, walkability);
+    const vec3 root(0.25f, 7.0f, 0.25f);
+    const vec3 left_toe(0.50f, -3.0f, 0.50f);
+    const vec3 right_toe(0.75f, 11.0f, 0.50f);
+    const support_observation sentinel =
+        observation(0.17f, -0.23f, 0.41f, true, false);
+    char error[256] = {};
+
+    walkability_grid mismatch(walkability);
+    mismatch.nx -= 1;
+    support_observation actual = sentinel;
+    check(!support_observation_build_walkable(
+              actual, support, 0, terrain, mismatch,
+              root, left_toe, right_toe, true, true,
+              error, sizeof(error)),
+          "mismatched support walkability grid fails");
+    check_observation_bits_equal(
+        actual, sentinel,
+        "mismatched support walkability grid is transactional");
+
+    heightfield wrong_version(terrain);
+    wrong_version.version = 1;
+    actual = sentinel;
+    check(!support_observation_build_walkable(
+              actual, support, 0, wrong_version, walkability,
+              root, left_toe, right_toe, true, true,
+              error, sizeof(error)),
+          "walkable support rejects non-v2 terrain");
+    check_observation_bits_equal(
+        actual, sentinel,
+        "walkable support version rejection is transactional");
+
+    actual = sentinel;
+    check(!support_observation_build_walkable(
+              actual, support, support.values.rows, terrain, walkability,
+              root, left_toe, right_toe, true, true,
+              error, sizeof(error)),
+          "walkable support keeps base-builder frame rejection");
+    check_observation_bits_equal(
+        actual, sentinel,
+        "walkable support frame rejection is transactional");
+
+    actual = sentinel;
+    check(!support_observation_build_walkable(
+              actual, support, 0, terrain, walkability,
+              root,
+              vec3(std::numeric_limits<float>::quiet_NaN(),
+                   left_toe.y, left_toe.z),
+              right_toe, true, true, error, sizeof(error)),
+          "walkable support keeps base-builder finite-point rejection");
+    check_observation_bits_equal(
+        actual, sentinel,
+        "walkable support finite-point rejection is transactional");
+}
+
 static void test_observation_build_maps_g1_support_and_checked_v2_sampling()
 {
     terrain_support_set support;
@@ -479,6 +679,8 @@ static void test_pose_and_root_helpers_are_horizontal_only()
 
 int main()
 {
+    test_walkable_observation_filters_only_class_zero_contacts();
+    test_walkable_observation_failures_are_transactional();
     test_observation_build_maps_g1_support_and_checked_v2_sampling();
     test_contact_choice_airborne_hold_and_root_fallback();
     test_rebase_preserves_height_and_vertical_velocity();
