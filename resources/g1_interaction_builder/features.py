@@ -6,6 +6,7 @@ from resources import quat as holden_quat
 from resources.g1_terrain_builder.schema import SkeletonSpec
 
 from .schema import (
+    EvaluationSplit,
     FeatureGroup,
     FeatureSet,
     G1_SKELETON,
@@ -13,6 +14,7 @@ from .schema import (
     InteractionValidationError,
     LabeledInteractionClip,
 )
+from .splits import partition_clips
 
 
 FEATURE_GROUPS = (
@@ -26,6 +28,68 @@ POSE_BONES = (7, 13, 1, 16)
 FUTURE_OFFSETS = (8, 17, 25)
 
 
+def _validate_feature_groups(
+    groups: tuple[FeatureGroup, ...],
+    feature_count: int,
+) -> None:
+    if not groups:
+        raise InteractionValidationError(
+            "feature_groups", "at least one feature group is required"
+        )
+
+    names: set[str] = set()
+    cursor = 0
+    for group in groups:
+        if group.name in names:
+            raise InteractionValidationError(
+                "feature_groups",
+                f"duplicate feature group name {group.name!r}",
+            )
+        names.add(group.name)
+        interval = f"[{group.start}, {group.stop})"
+        if group.start < 0 or group.stop < 0:
+            raise InteractionValidationError(
+                "feature_groups",
+                f"negative range for group {group.name!r}: {interval}",
+            )
+        if group.stop < group.start:
+            raise InteractionValidationError(
+                "feature_groups",
+                f"reversed range for group {group.name!r}: {interval}",
+            )
+        if group.stop == group.start:
+            raise InteractionValidationError(
+                "feature_groups",
+                f"empty range for group {group.name!r}: {interval}",
+            )
+        if group.start >= feature_count or group.stop > feature_count:
+            raise InteractionValidationError(
+                "feature_groups",
+                f"out-of-range group {group.name!r} {interval} for "
+                f"{feature_count} columns",
+            )
+        if group.start < cursor:
+            raise InteractionValidationError(
+                "feature_groups",
+                f"overlap at group {group.name!r}: starts at "
+                f"{group.start}, expected {cursor}",
+            )
+        if group.start > cursor:
+            raise InteractionValidationError(
+                "feature_groups",
+                f"gap before group {group.name!r}: starts at "
+                f"{group.start}, expected {cursor}",
+            )
+        cursor = group.stop
+
+    if cursor != feature_count:
+        raise InteractionValidationError(
+            "feature_groups",
+            f"trailing gap from column {cursor} across "
+            f"{feature_count} columns",
+        )
+
+
 def normalize_feature_groups(
     raw: np.ndarray,
     groups: Sequence[FeatureGroup],
@@ -36,6 +100,7 @@ def normalize_feature_groups(
             "feature_shape", f"expected a matrix, got shape {raw.shape}"
         )
     groups = tuple(groups)
+    _validate_feature_groups(groups, raw.shape[1])
     values = raw.astype(np.float32, copy=True)
     offsets = np.zeros(raw.shape[1], np.float32)
     scales = np.ones(raw.shape[1], np.float32)
@@ -158,7 +223,9 @@ def _raw_clip_features(labeled: LabeledInteractionClip) -> np.ndarray:
         )
         with np.errstate(divide="ignore", invalid="ignore"):
             orientation_error = holden_quat.to_scaled_angle_axis(
-                holden_quat.mul(inverse_grasp, hand_rotation)
+                holden_quat.abs(
+                    holden_quat.mul(inverse_grasp, hand_rotation)
+                )
             )
         values.extend(orientation_error)
         values.extend(
@@ -228,3 +295,12 @@ def build_features(
         [_raw_clip_features(clip) for clip in clips], axis=0
     )
     return normalize_feature_groups(raw, FEATURE_GROUPS)
+
+
+def build_database_features(
+    clips: Sequence[LabeledInteractionClip],
+    split: EvaluationSplit,
+    skeleton: SkeletonSpec,
+) -> FeatureSet:
+    database_clips, _ = partition_clips(clips, split)
+    return build_features(database_clips, skeleton)

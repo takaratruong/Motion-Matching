@@ -1258,10 +1258,17 @@ git commit -m "feat: derive pickup contact phases and grasp frames"
 - Create: `tests/python/test_interaction_splits.py`
 
 **Interfaces:**
-- Consumes: ordered `Sequence[LabeledInteractionClip]` and `SkeletonSpec`.
-- Produces: `build_features(clips, skeleton) -> FeatureSet`, `normalize_feature_groups(raw, groups) -> FeatureSet`, and `split_objects(clips, heldout_count: int = 20, seed: int = 20260714) -> EvaluationSplit`.
+- Consumes: ordered `Sequence[LabeledInteractionClip]`, a fully validated
+  `EvaluationSplit`, and `SkeletonSpec`.
+- Produces: production
+  `build_database_features(all_clips, split, skeleton) -> FeatureSet`,
+  `partition_clips(all_clips, split) -> (database_clips, heldout_clips)`,
+  low-level database-only `build_features(clips, skeleton) -> FeatureSet`,
+  `normalize_feature_groups(raw, groups) -> FeatureSet`, and
+  `split_objects(clips, heldout_count: int = 20, seed: int = 20260714) -> EvaluationSplit`.
 
-- [ ] **Step 1: Write failing dimension, invariance, normalization, and leakage tests**
+- [ ] **Step 1: Write failing dimension, sign-invariance, normalization,
+  split-validation, and production-boundary leakage tests**
 
 ```python
 class InteractionFeatureTests(unittest.TestCase):
@@ -1401,7 +1408,8 @@ def _raw_clip_features(labeled: LabeledInteractionClip) -> np.ndarray:
         values.extend(holden_quat.mul_vec(
             inverse_grasp, hand_position - grasp_position))
         values.extend(holden_quat.to_scaled_angle_axis(
-            holden_quat.mul(inverse_grasp, hand_rotation)))
+            holden_quat.abs(
+                holden_quat.mul(inverse_grasp, hand_rotation))))
         values.extend(holden_quat.mul_vec(
             inverse_grasp, world_vel[frame, hand_bone] - grasp_velocity))
         values.extend(holden_quat.mul_vec(
@@ -1441,7 +1449,20 @@ def build_features(
         raise InteractionValidationError("empty_database", "no database clips")
     raw = np.concatenate([_raw_clip_features(clip) for clip in clips], axis=0)
     return normalize_feature_groups(raw, FEATURE_GROUPS)
+
+def build_database_features(
+    clips: Sequence[LabeledInteractionClip],
+    split: EvaluationSplit,
+    skeleton: SkeletonSpec,
+) -> FeatureSet:
+    database, _ = partition_clips(clips, split)
+    return build_features(database, skeleton)
 ```
+
+`build_features` remains a low-level primitive for already-partitioned unit
+tests and artifact internals. Corpus builders and validation gates must call
+`build_database_features` with all labeled clips so held-out rows cannot enter
+normalization by caller convention.
 
 - [ ] **Step 3: Implement Holden-style group normalization**
 
@@ -1457,9 +1478,15 @@ values[:, start:stop] = (raw[:, start:stop] - offsets[start:stop]) / group_scale
 
 This stores unit group weights. Dynamic runtime weights belong to the later selector and must not be baked into artifacts. Reject a group containing non-finite values or a final non-finite normalized matrix.
 
+Before slicing, require unique group names and an exact, ordered partition of
+every input column. Reject an empty group list, zero-width or reversed ranges,
+negative or out-of-range endpoints, overlaps, leading/interior/trailing gaps,
+and any other non-contiguous layout with the offending group/range in the
+error.
+
 - [ ] **Step 4: Implement deterministic object-held-out splitting**
 
-`split_objects` sorts unique object IDs, checks `0 < heldout_count < unique_count`, uses `np.random.default_rng(seed).permutation`, sorts the chosen held-out IDs for serialization, and defines database IDs as the sorted complement. Add `validate_split(clips, split)` that verifies every clip belongs to exactly one partition and no object crosses it.
+`split_objects` sorts unique object IDs, checks `0 < heldout_count < unique_count`, uses `np.random.default_rng(seed).permutation`, sorts the chosen held-out IDs for serialization, and defines database IDs as the sorted complement. Add `validate_split(clips, split)` that preserves and validates the exact serialized tuples before set comparison: both partitions must be nonempty and sorted, contain no duplicate IDs, have no overlap, and name every source object exactly once with no missing or unknown ID. Every error names the category and offending IDs. Add `partition_clips(clips, split)` as the only production partition helper; it validates the full split and returns database and held-out tuples in stable input order.
 
 ```python
 def split_objects(
@@ -1468,9 +1495,13 @@ def split_objects(
     seed: int = 20260714,
 ) -> EvaluationSplit:
     objects = sorted({clip.motion.object_id for clip in clips})
-    if not 0 < heldout_count < len(objects):
+    if heldout_count <= 0:
         raise ValueError(
-            f"need at least {heldout_count + 1} unique objects, got {len(objects)}")
+            f"heldout_count must be positive, got {heldout_count}")
+    if heldout_count >= len(objects):
+        raise ValueError(
+            f"heldout_count {heldout_count} must leave at least one "
+            f"database object; got {len(objects)} unique objects")
     permutation = np.random.default_rng(seed).permutation(len(objects))
     heldout = tuple(sorted(objects[index] for index in permutation[:heldout_count]))
     database = tuple(sorted(set(objects) - set(heldout)))
@@ -1481,13 +1512,49 @@ def split_objects(
 def validate_split(
     clips: Sequence[LabeledInteractionClip], split: EvaluationSplit,
 ) -> None:
+    for category, object_ids in (
+        ("database", split.database_objects),
+        ("heldout", split.heldout_objects),
+    ):
+        if not object_ids:
+            raise ValueError(f"{category} partition is empty")
+        duplicates = sorted({item for item in object_ids
+                             if object_ids.count(item) > 1})
+        if duplicates:
+            raise ValueError(
+                f"duplicate {category} object IDs: {duplicates!r}")
+        if tuple(object_ids) != tuple(sorted(object_ids)):
+            raise ValueError(
+                f"{category} object IDs must be sorted; "
+                f"got {tuple(object_ids)!r}")
     database = set(split.database_objects)
     heldout = set(split.heldout_objects)
-    if database & heldout:
-        raise ValueError("object identity leak between database and heldout split")
+    overlap = sorted(database & heldout)
+    if overlap:
+        raise ValueError(
+            "overlapping object IDs in database and heldout partitions: "
+            f"{overlap!r}")
     expected = {clip.motion.object_id for clip in clips}
-    if database | heldout != expected:
-        raise ValueError("split does not cover every source object exactly once")
+    actual = database | heldout
+    missing = sorted(expected - actual)
+    if missing:
+        raise ValueError(f"missing source object IDs from split: {missing!r}")
+    unknown = sorted(actual - expected)
+    if unknown:
+        raise ValueError(
+            f"unknown split object IDs not present in clips: {unknown!r}")
+
+def partition_clips(
+    clips: Sequence[LabeledInteractionClip], split: EvaluationSplit,
+) -> tuple[tuple[LabeledInteractionClip, ...],
+           tuple[LabeledInteractionClip, ...]]:
+    validate_split(clips, split)
+    database_ids = set(split.database_objects)
+    database = tuple(
+        clip for clip in clips if clip.motion.object_id in database_ids)
+    heldout = tuple(
+        clip for clip in clips if clip.motion.object_id not in database_ids)
+    return database, heldout
 ```
 
 - [ ] **Step 5: Run feature and split tests**
@@ -1497,7 +1564,10 @@ python -m unittest tests.python.test_interaction_features \
   tests.python.test_interaction_splits -v
 ```
 
-Expected: all tests report `ok`; translation/yaw invariance is within `2e-4`; no held-out object leaks.
+Expected: all tests report `ok`; translation/yaw and quaternion-sign invariance
+are within tolerance; malformed splits/groups fail actionably; the production
+boundary has exact database-row coverage; and no held-out object affects raw
+rows, offsets, scales, or normalized values.
 
 - [ ] **Step 6: Commit features and split**
 
@@ -1560,14 +1630,17 @@ class:
 
 ```python
 def artifact_fixture():
-    labeled = derive_interaction_labels(canonical_pickup_fixture())
-    artifact = assemble_database([labeled], G1_SKELETON)
-    features = build_features([labeled], G1_SKELETON)
+    clips = labeled_clips_for_objects(
+        ["database_fixture_object", "heldout_fixture_object"])
     split = EvaluationSplit(
         seed=20260714,
-        database_objects=(labeled.motion.object_id,),
+        database_objects=("database_fixture_object",),
         heldout_objects=("heldout_fixture_object",),
     )
+    database, _ = partition_clips(clips, split)
+    labeled = database[0]
+    artifact = assemble_database(database, G1_SKELETON)
+    features = build_database_features(clips, split, G1_SKELETON)
     manifest = {
         "schema_version": 1,
         "target_fps": 25.0,
@@ -1581,8 +1654,8 @@ def artifact_fixture():
     }
     report = {
         "schema_version": 1,
-        "source_clips": 1,
-        "included_clips": 1,
+        "source_clips": 2,
+        "included_clips": 2,
         "rejected_clips": 0,
         "included_frames": len(labeled.motion.positions),
         "rejections_by_code": {},
@@ -1916,22 +1989,25 @@ def build_labeled_clips(
     rejected.sort(key=lambda item: (item.sequence_id, item.stage, item.code))
     return included, rejected, numeric_reports
 
-def partition_database(
-    clips: Sequence[LabeledInteractionClip], heldout_count: int, seed: int,
-) -> tuple[list[LabeledInteractionClip], EvaluationSplit]:
+def prepare_database(
+    clips: Sequence[LabeledInteractionClip],
+    heldout_count: int,
+    seed: int,
+    skeleton: SkeletonSpec,
+) -> tuple[tuple[LabeledInteractionClip, ...], FeatureSet, EvaluationSplit]:
     split = split_objects(clips, heldout_count=heldout_count, seed=seed)
-    database_ids = set(split.database_objects)
-    database = [
-        clip for clip in clips if clip.motion.object_id in database_ids]
-    if any(clip.motion.object_id in split.heldout_objects for clip in database):
-        raise ValueError("heldout object leaked into interaction database")
-    return database, split
+    database, _ = partition_clips(clips, split)
+    features = build_database_features(clips, split, skeleton)
+    return database, features, split
 ```
 
 The caller derives labels for every valid source first, creates the object split,
-then calls `build_features` and `assemble_database` only on `database`. Held-out
-clips contribute identities and later evaluation inputs but never feature
-normalization statistics or database frames.
+then passes the complete labeled sequence and validated split to
+`build_database_features`; it calls `assemble_database` only on the database
+tuple returned by `partition_clips`. Direct calls to low-level `build_features`
+are forbidden in this corpus path. Held-out clips contribute identities and
+later evaluation inputs but never feature normalization statistics or database
+frames.
 
 The report contains exact keys:
 
@@ -2183,6 +2259,11 @@ git commit -m "feat: replay interaction artifacts in headless C++"
 - Consumes: complete Tasks 1-8 and all 2,991 local pickup-table sequences.
 - Produces: reproducible `make gate1-interaction`, a complete validation report, a representative C++ replay digest, and operator documentation.
 
+Gate 1 must exercise Task 7's `prepare_database` path, whose feature build is
+`build_database_features(all_labeled_clips, split, G1_SKELETON)`. It must not
+call low-level `build_features` or recreate database filtering with a list
+comprehension.
+
 - [ ] **Step 1: Add a failing Gate 1 smoke assertion**
 
 Add `tests/python/test_interaction_gate1.py` with a `Gate1PackTests` class that accepts `G1_INTERACTION_DIR`. When set, it reads the pack and asserts:
@@ -2194,6 +2275,7 @@ self.assertEqual(manifest["diagnostic_limit"], None)
 self.assertEqual(manifest["target_fps"], 25.0)
 self.assertEqual(manifest["skeleton_signature"], G1_SKELETON.signature())
 self.assertEqual(features.values.shape[1], 71)
+self.assertEqual(features.values.shape[0], artifact.positions.shape[0])
 self.assertEqual(len(split["heldout_objects"]), 20)
 self.assertFalse(set(split["heldout_objects"]) & set(split["database_objects"]))
 self.assertEqual(report["included_clips"] + report["rejected_clips"], 2991)
@@ -2278,6 +2360,10 @@ unit-tested schema-v1 rejection codes. Gate 1 passes only when:
 - feature/database frame counts agree;
 - maximum FK error is at most `0.001 m`, rotation error at most `0.1 degree`, and duration error at most one 25 Hz frame;
 - no generated artifact overwrote ordinary locomotion resources.
+
+The full-corpus build must retain a regression proving that mutating any
+held-out clip leaves serialized feature values, offsets, and scales unchanged;
+this is enforced through `build_database_features`, not caller-side filtering.
 
 - [ ] **Step 5: Document exact setup and results**
 
