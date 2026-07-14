@@ -68,6 +68,7 @@ CPP_TEST_DIR := build/tests
 CPP_TEST_BINS := $(CPP_TEST_DIR)/test_g1_skeleton
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_database
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_pose
+CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_target
 
 .PHONY: test-python test-cpp test-interaction
 
@@ -82,6 +83,9 @@ $(CPP_TEST_DIR)/test_interaction_database: tests/cpp/test_interaction_database.c
 
 $(CPP_TEST_DIR)/test_interaction_pose: tests/cpp/test_interaction_pose.cpp interaction_pose.cpp interaction_pose.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_pose.cpp interaction_pose.cpp -o $@
+
+$(CPP_TEST_DIR)/test_interaction_target: tests/cpp/test_interaction_target.cpp interaction_target.cpp interaction_target.h interaction_pose.h vec.h quat.h | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_target.cpp interaction_target.cpp -o $@
 
 interaction_probe: interaction_probe.cpp interaction_database.h g1_skeleton.h
 	$(CXX) $(CPP_TEST_FLAGS) $< -o $@
