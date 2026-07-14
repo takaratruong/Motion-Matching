@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <string>
 
 #include <sys/stat.h>
@@ -365,7 +367,110 @@ static void test_rename_failure_removes_temporary_and_preserves_destination()
     remove_directory_if_present(path);
 }
 
-int main()
+static std::size_t count_occurrences(
+    const std::string& text, const char* needle)
+{
+    std::size_t count = 0;
+    std::size_t position = 0;
+    while ((position = text.find(needle, position)) != std::string::npos) {
+        ++count;
+        position += std::strlen(needle);
+    }
+    return count;
+}
+
+static std::size_t find_required(
+    const std::string& text,
+    const char* needle,
+    std::size_t start,
+    const char* message)
+{
+    const std::size_t position = text.find(needle, start);
+    check(position != std::string::npos, message);
+    return position;
+}
+
+static void test_controller_has_one_post_window_cleanup_path(
+    const char* controller_path)
+{
+    std::ifstream input(controller_path);
+    check(input.good(), "controller source opens");
+    const std::string source(
+        (std::istreambuf_iterator<char>(input)),
+        std::istreambuf_iterator<char>());
+    check(source.find("#include \"cleanup_runtime.h\"") !=
+              std::string::npos,
+          "controller includes cleanup report interface");
+
+    const std::size_t window = find_required(
+        source, "SetTargetFPS(25);", 0,
+        "controller enters the post-window-success lifetime");
+    const std::string post_window = source.substr(window);
+    check(count_occurrences(post_window, "CloseWindow();") == 1,
+          "post-window controller has exactly one window close");
+    check(count_occurrences(
+              post_window, "model_unloader(terrain_model);") == 1,
+          "post-window controller unloads the active model once at the tail");
+    check(post_window.find("UnloadModel(terrain_model)") ==
+              std::string::npos,
+          "post-window controller never bypasses the counted model unloader");
+    check(post_window.find("return 2;") == std::string::npos,
+          "post-window failures do not return before cleanup");
+    check(post_window.find("_Exit(") == std::string::npos &&
+              post_window.find("std::exit(") == std::string::npos,
+          "post-window controller has no process-terminating shortcut");
+
+    const std::size_t close_log = find_required(
+        post_window, "deterministic_log.close(", 0,
+        "normal tail closes deterministic log");
+    const std::size_t unload_model = find_required(
+        post_window, "model_unloader(terrain_model);", close_log,
+        "normal tail unloads terrain model after log close");
+    const std::size_t close_window = find_required(
+        post_window, "CloseWindow();", unload_model,
+        "normal tail closes window after model unload");
+    const std::size_t write_cleanup = find_required(
+        post_window, "cleanup_report_write(", close_window,
+        "normal tail writes cleanup report after window close");
+    const std::size_t final_return = find_required(
+        post_window, "return controller_exit_code;", write_cleanup,
+        "normal tail returns only after cleanup reporting");
+    check(close_log < unload_model && unload_model < close_window &&
+              close_window < write_cleanup && write_cleanup < final_return,
+          "normal cleanup stage order is fixed");
+    check(post_window.find("return ", final_return + 1) ==
+              std::string::npos,
+          "normal cleanup return is the final controller return");
+
+    const std::size_t counter = find_required(
+        post_window, "int model_load_count = 0;", 0,
+        "model load counter starts before initial model allocation");
+    const std::size_t load = find_required(
+        post_window, "LoadModel(active_scene.mesh_path.c_str())", counter,
+        "initial terrain model loads after counter initialization");
+    const std::size_t allocated = find_required(
+        post_window, "terrain_model_allocated", load,
+        "initial terrain allocation is measured");
+    const std::size_t count_load = find_required(
+        post_window, "++model_load_count;", allocated,
+        "initial allocated model increments the load counter");
+    check(counter < load && load < allocated && allocated < count_load,
+          "initial model load is counted transactionally");
+
+    for (const char* field : {
+             "cleanup.exit_code = controller_exit_code;",
+             "cleanup.motion_pack_load_count = motion_pack_load_count;",
+             "cleanup.model_load_count = model_load_count;",
+             "cleanup.model_unload_count = model_unload_count;",
+             "cleanup.log_closed = log_closed;",
+             "cleanup.window_closed = window_closed;",
+             "getenv(\"MM_CLEANUP_LOG\")"}) {
+        check(post_window.find(field, close_window) != std::string::npos,
+              "cleanup report consumes final controller state");
+    }
+}
+
+int main(int argc, char** argv)
 {
     test_null_path_is_noop_and_preserves_inputs();
     test_exact_json_replaces_final_atomically();
@@ -374,5 +479,11 @@ int main()
     test_open_failure_preserves_existing_state();
     test_write_failure_removes_temporary_and_preserves_final();
     test_rename_failure_removes_temporary_and_preserves_destination();
+    if (argc == 3 && std::strcmp(argv[1], "--controller") == 0) {
+        test_controller_has_one_post_window_cleanup_path(argv[2]);
+    } else {
+        check(argc == 1,
+              "usage: test_cleanup_runtime [--controller controller.cpp]");
+    }
     return 0;
 }

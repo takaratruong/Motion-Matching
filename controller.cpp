@@ -19,6 +19,7 @@
 #include "g1_runtime_diagnostics.h"
 #include "scene_switch.h"
 #include "motion_match_log.h"
+#include "cleanup_runtime.h"
 #include "nnet.h"
 #include "lmm.h"
 
@@ -1898,6 +1899,15 @@ int main(void)
     }
     SetTargetFPS(25);
 
+    int scene_generation = 0;
+    int scene_reset_count = 1;
+    int motion_pack_load_count = 1;
+    int model_load_count = 0;
+    int model_unload_count = 0;
+    bool scene_switch_failed = false;
+    bool controller_exit_requested = false;
+    int controller_exit_code = 0;
+
     Model terrain_model = LoadModel(active_scene.mesh_path.c_str());
     auto model_has_allocation = [](const Model& model)
     {
@@ -1906,26 +1916,16 @@ int main(void)
                model.bindPose != NULL;
     };
     const bool terrain_model_allocated = model_has_allocation(terrain_model);
+    if (terrain_model_allocated) ++model_load_count;
     if (!IsModelReady(terrain_model) || terrain_model.meshCount <= 0)
     {
         fprintf(
             stderr,
             "G1 terrain mesh failed to load: %s\n",
             active_scene.mesh_path.c_str());
-        if (terrain_model_allocated)
-        {
-            UnloadModel(terrain_model);
-        }
-        CloseWindow();
-        return 2;
+        controller_exit_code = 2;
+        controller_exit_requested = true;
     }
-
-    int scene_generation = 0;
-    int scene_reset_count = 1;
-    int motion_pack_load_count = 1;
-    int model_load_count = 1;
-    int model_unload_count = 0;
-    bool scene_switch_failed = false;
 
     auto scene_loader = [&](scene_pack& candidate, int index,
                             char* error, int capacity)
@@ -2072,8 +2072,6 @@ int main(void)
 #endif
 
     int rendered_frames = 0;
-    bool controller_exit_requested = false;
-    int controller_exit_code = 0;
     g1_runtime_diagnostic_snapshot runtime_snapshot;
     bool runtime_snapshot_ready = false;
 
@@ -2096,21 +2094,20 @@ int main(void)
     // MM_DISCRETE owns MM_LOG for its legacy text diagnostics.
     const char* deterministic_log_path = NULL;
 #endif
-    if (deterministic_log_path != NULL && lmm_enabled) {
+    if (!controller_exit_requested &&
+        deterministic_log_path != NULL && lmm_enabled) {
         fprintf(stderr,
             "G1 runtime log error: database-frame logging is unavailable "
             "with learned motion matching\n");
-        model_unloader(terrain_model);
-        CloseWindow();
-        return 2;
+        controller_exit_code = 2;
+        controller_exit_requested = true;
     }
-    if (!deterministic_log.open(
+    if (!controller_exit_requested && !deterministic_log.open(
             deterministic_log_path,
             artifact_error, (int)sizeof(artifact_error))) {
         fprintf(stderr, "G1 runtime log error: %s\n", artifact_error);
-        model_unloader(terrain_model);
-        CloseWindow();
-        return 2;
+        controller_exit_code = 2;
+        controller_exit_requested = true;
     }
     const bool logging_enabled = deterministic_log.file != NULL;
 
@@ -3165,7 +3162,10 @@ int main(void)
             prev_root_yaw = root_yaw;
             prev_root_q   = root_q;
             g_frame++;
-            if (g_frame >= 400) { fflush(g_log); fclose(g_log); _Exit(0); }
+            if (g_frame >= 400) {
+                controller_exit_requested = true;
+                return;
+            }
         }
 #endif
 
@@ -3795,14 +3795,48 @@ int main(void)
     }
 #endif
 
-    if (!deterministic_log.close(
-            artifact_error, (int)sizeof(artifact_error))) {
+#ifdef MM_DISCRETE
+    if (g_log != NULL && g_log != stderr)
+    {
+        bool discrete_log_ok = fflush(g_log) == 0;
+        if (fclose(g_log) != 0) discrete_log_ok = false;
+        g_log = NULL;
+        if (!discrete_log_ok)
+        {
+            fprintf(stderr, "G1 discrete log error during normal cleanup\n");
+            if (controller_exit_code == 0) controller_exit_code = 2;
+        }
+    }
+#endif
+
+    const bool log_evidence_ok = deterministic_log.close(
+        artifact_error, (int)sizeof(artifact_error));
+    const bool log_closed = true;
+    if (!log_evidence_ok) {
         fprintf(stderr, "G1 runtime log error: %s\n", artifact_error);
-        controller_exit_code = 2;
+        if (controller_exit_code == 0) controller_exit_code = 2;
     }
     model_unloader(terrain_model);
 
     CloseWindow();
+    const bool window_closed = true;
+
+    cleanup_report cleanup;
+    cleanup.exit_code = controller_exit_code;
+    cleanup.motion_pack_load_count = motion_pack_load_count;
+    cleanup.model_load_count = model_load_count;
+    cleanup.model_unload_count = model_unload_count;
+    cleanup.log_closed = log_closed;
+    cleanup.window_closed = window_closed;
+    if (!cleanup_report_write(
+            getenv("MM_CLEANUP_LOG"),
+            cleanup,
+            artifact_error,
+            static_cast<int>(sizeof(artifact_error))))
+    {
+        fprintf(stderr, "G1 cleanup report error: %s\n", artifact_error);
+        if (controller_exit_code == 0) controller_exit_code = 2;
+    }
 
     return controller_exit_code;
 }

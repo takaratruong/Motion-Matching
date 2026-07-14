@@ -178,7 +178,7 @@ static void test_controller_wires_idle_match_transition_cost()
           "idle transition cost is the fifth database_search argument");
 }
 
-static void test_failed_model_load_releases_allocated_model()
+static void test_failed_model_load_reaches_counted_shared_cleanup()
 {
     const std::string source = read_controller_source();
     const std::size_t load =
@@ -192,17 +192,32 @@ static void test_failed_model_load_releases_allocated_model()
     const std::size_t readiness = startup.find("IsModelReady(terrain_model)");
     const std::size_t allocation_guard =
         startup.find("if (terrain_model_allocated)");
-    const std::size_t unload = startup.find("UnloadModel(terrain_model)");
-    const std::size_t close = startup.find("CloseWindow()");
+    const std::size_t load_count = startup.find("++model_load_count;");
     check(allocation != std::string::npos &&
               readiness != std::string::npos && allocation < readiness,
           "model allocation is recorded before readiness validation");
     check(allocation_guard != std::string::npos &&
-              unload != std::string::npos && close != std::string::npos &&
-              allocation_guard < unload && unload < close &&
-              startup.find("UnloadModel(terrain_model)", unload + 1) ==
+              load_count != std::string::npos &&
+              allocation_guard < load_count && load_count < readiness,
+          "allocated startup model is counted before readiness validation");
+    check(startup.find("UnloadModel(terrain_model)") == std::string::npos &&
+              startup.find("CloseWindow()") == std::string::npos &&
+              startup.find("return 2;") == std::string::npos &&
+              startup.find("controller_exit_code = 2;") !=
+                  std::string::npos &&
+              startup.find("controller_exit_requested = true;") !=
                   std::string::npos,
-          "failed model startup unloads before closing the window");
+          "failed model startup requests the shared cleanup path");
+
+    const std::size_t log_close = source.find("deterministic_log.close(");
+    const std::size_t unload = source.find(
+        "model_unloader(terrain_model);", log_close);
+    const std::size_t close = source.find("CloseWindow();", unload);
+    const std::size_t cleanup = source.find("cleanup_report_write(", close);
+    check(log_close != std::string::npos && unload != std::string::npos &&
+              close != std::string::npos && cleanup != std::string::npos &&
+              log_close < unload && unload < close && close < cleanup,
+          "failed startup reaches counted unload, window close, and report");
 }
 
 static bool same_vec3(const vec3& first, const vec3& second)
@@ -842,7 +857,7 @@ int main()
 {
     test_active_scene_sources_use_checked_v2_queries();
     test_controller_wires_idle_match_transition_cost();
-    test_failed_model_load_releases_allocated_model();
+    test_failed_model_load_reaches_counted_shared_cleanup();
     test_idle_match_transition_cost_policy();
     test_scene_first_frame_seeds_desired_trajectory();
     test_reset_clears_every_dynamic_subsystem();
