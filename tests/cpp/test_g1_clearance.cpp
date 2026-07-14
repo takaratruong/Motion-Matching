@@ -183,6 +183,66 @@ static uint32_t float_bits(float value)
     return bits;
 }
 
+static uint64_t double_bits(double value)
+{
+    uint64_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static bool clearance_work_same(
+    const G1ClearanceWork& left,
+    const G1ClearanceWork& right)
+{
+    return left.point_queries == right.point_queries &&
+           left.cells_visited == right.cells_visited &&
+           left.primitive_triangle_pairs ==
+               right.primitive_triangle_pairs &&
+           left.face_patches == right.face_patches &&
+           left.candidate_tests == right.candidate_tests &&
+           left.subdivision_nodes == right.subdivision_nodes;
+}
+
+static bool clearance_witness_same(
+    const G1ClearanceWitness& left,
+    const G1ClearanceWitness& right)
+{
+    return double_bits(left.body_x) == double_bits(right.body_x) &&
+           double_bits(left.body_y) == double_bits(right.body_y) &&
+           double_bits(left.body_z) == double_bits(right.body_z) &&
+           double_bits(left.surface_x) == double_bits(right.surface_x) &&
+           double_bits(left.surface_y) == double_bits(right.surface_y) &&
+           double_bits(left.surface_z) == double_bits(right.surface_z) &&
+           double_bits(left.segment_parameter) ==
+               double_bits(right.segment_parameter) &&
+           double_bits(left.terrain_weight_0) ==
+               double_bits(right.terrain_weight_0) &&
+           double_bits(left.terrain_weight_1) ==
+               double_bits(right.terrain_weight_1) &&
+           double_bits(left.terrain_weight_2) ==
+               double_bits(right.terrain_weight_2) &&
+           left.primitive_index == right.primitive_index &&
+           left.cell_x == right.cell_x &&
+           left.cell_z == right.cell_z &&
+           left.terrain_triangle_index ==
+               right.terrain_triangle_index &&
+           left.patch_index == right.patch_index &&
+           left.candidate_kind == right.candidate_kind &&
+           left.candidate_subindex == right.candidate_subindex;
+}
+
+static bool clearance_result_same(
+    const G1ClearanceResult& left,
+    const G1ClearanceResult& right)
+{
+    return double_bits(left.lower_bound_m) ==
+               double_bits(right.lower_bound_m) &&
+           double_bits(left.witness_upper_m) ==
+               double_bits(right.witness_upper_m) &&
+           clearance_witness_same(left.witness, right.witness) &&
+           clearance_work_same(left.work, right.work);
+}
+
 template<typename T>
 struct ByteSnapshot
 {
@@ -509,8 +569,9 @@ static G1ClearanceStatus invoke_budget_stub(
             output, limits, field, NULL, NULL, 0.02f,
             error, error_capacity);
     }
-    return g1_point_clearance(
-        output, limits, field, vec3(), error, error_capacity);
+    return g1_sphere_clearance(
+        output, limits, field, vec3(), 0.02f,
+        error, error_capacity);
 }
 
 static void require_budget_status(
@@ -663,6 +724,840 @@ static void test_swing_lift_materializer()
           "zero-capacity diagnostic remains safe");
     check(untouched == 'q',
           "zero-capacity diagnostic is untouched");
+}
+
+static void point_make_field(
+    heightfield& field,
+    int nx = 2,
+    int nz = 2,
+    float origin_x = 0.0f,
+    float origin_z = 0.0f,
+    float cell_size = 1.0f,
+    float exterior_height = -10.0f)
+{
+    field.version = 2;
+    field.nx = nx;
+    field.nz = nz;
+    field.origin_x = origin_x;
+    field.origin_z = origin_z;
+    field.cell_size = cell_size;
+    field.exterior_height = exterior_height;
+    field.heights.resize(nx * nz);
+    field.heights.set(0.0f);
+}
+
+static G1ClearanceResult require_point_ok(
+    const heightfield& field,
+    vec3 point,
+    const G1ClearanceBudget& limits)
+{
+    G1ClearanceResult output = seeded_result(71.0);
+    char error[256] = {};
+    const G1ClearanceStatus status = g1_point_clearance(
+        output, limits, field, point,
+        error, static_cast<int>(sizeof(error)));
+    check(status == G1ClearanceOk,
+          error[0] == '\0' ? "point clearance must certify" : error);
+    check(output.lower_bound_m <= output.witness_upper_m &&
+          output.witness_upper_m - output.lower_bound_m <=
+              G1ClearanceMaximumCertificateWidthM,
+          "point result has a binary64 certificate width");
+
+    G1SurfaceSample producer = {};
+    check(g1_surface_query_v2(
+              producer, field, point.x, point.z) ==
+              G1SurfaceQueryValid,
+          "point fixture is accepted by the semantic producer");
+    const volatile double producer_clearance =
+        static_cast<double>(point.y) -
+        static_cast<double>(producer.height);
+    check(output.lower_bound_m <= producer_clearance,
+          "point lower bound never exceeds producer clearance");
+    return output;
+}
+
+static G1ClearanceResult require_point_ok(
+    const heightfield& field,
+    vec3 point)
+{
+    const G1ClearanceBudget limits = g1_pose_clearance_budget();
+    return require_point_ok(field, point, limits);
+}
+
+static void require_point_failure(
+    const heightfield& field,
+    vec3 point,
+    const G1ClearanceBudget& limits,
+    G1ClearanceStatus expected,
+    const char* message)
+{
+    G1ClearanceResult output = seeded_result(73.0);
+    const ByteSnapshot<G1ClearanceResult> output_before(output);
+    const ByteSnapshot<G1ClearanceBudget> limits_before(limits);
+    char error[128] = {};
+    const G1ClearanceStatus status = g1_point_clearance(
+        output, limits, field, point,
+        error, static_cast<int>(sizeof(error)));
+    check(status == expected, message);
+    check(output_before.same(output),
+          "failed point query preserves every output byte");
+    check(limits_before.same(limits),
+          "failed point query preserves immutable limits");
+}
+
+static void require_point_failure(
+    const heightfield& field,
+    vec3 point,
+    G1ClearanceStatus expected,
+    const char* message)
+{
+    const G1ClearanceBudget limits = g1_pose_clearance_budget();
+    require_point_failure(field, point, limits, expected, message);
+}
+
+static void test_point_fixed_diagonal_and_determinism()
+{
+    heightfield field;
+    point_make_field(field);
+    field.heights(0) = 0.0f;
+    field.heights(1) = 2.0f;
+    field.heights(2) = 4.0f;
+    field.heights(3) = 10.0f;
+
+    const vec3 points[] = {
+        vec3(0.75f, 20.0f, 0.25f),
+        vec3(0.25f, 20.0f, 0.75f),
+        vec3(0.50f, 20.0f, 0.50f)
+    };
+    const double expected_heights[] = {3.5, 4.5, 5.0};
+    const uint32_t expected_triangles[] = {0, 1, 0};
+    const double expected_weights[][3] = {
+        {0.25, 0.50, 0.25},
+        {0.25, 0.25, 0.50},
+        {0.50, 0.00, 0.50}
+    };
+    const double mandatory_ulp =
+        static_cast<double>(
+            float_from_bits(float_bits(10.0f) + 1)) - 10.0;
+
+    for (size_t index = 0;
+         index < sizeof(points) / sizeof(points[0]);
+         ++index) {
+        const G1ClearanceResult first =
+            require_point_ok(field, points[index]);
+        const G1ClearanceResult second =
+            require_point_ok(field, points[index]);
+        check(clearance_result_same(first, second),
+              "point result, witness, and work are deterministic");
+
+        const double expected_clearance =
+            static_cast<double>(points[index].y) -
+            expected_heights[index];
+        check(first.witness_upper_m >= expected_clearance &&
+              first.witness_upper_m - expected_clearance <= 1.0e-12,
+              "point witness encloses the fixed-diagonal plane value");
+        check(first.witness_upper_m - first.lower_bound_m >=
+                  mandatory_ulp,
+              "point lower bound includes the mandatory full float ULP");
+        check(double_bits(first.witness.body_x) ==
+                  double_bits(static_cast<double>(points[index].x)) &&
+              double_bits(first.witness.body_y) ==
+                  double_bits(static_cast<double>(points[index].y)) &&
+              double_bits(first.witness.body_z) ==
+                  double_bits(static_cast<double>(points[index].z)) &&
+              double_bits(first.witness.surface_x) ==
+                  double_bits(static_cast<double>(points[index].x)) &&
+              double_bits(first.witness.surface_y) ==
+                  double_bits(expected_heights[index]) &&
+              double_bits(first.witness.surface_z) ==
+                  double_bits(static_cast<double>(points[index].z)),
+              "point witness exposes promoted body and surface geometry");
+        check(first.witness.terrain_triangle_index ==
+                  expected_triangles[index] &&
+              first.witness.primitive_index == 0 &&
+              first.witness.cell_x == 0 &&
+              first.witness.cell_z == 0 &&
+              first.witness.candidate_kind == 3 &&
+              first.witness.candidate_subindex == 0 &&
+              first.witness.patch_index == 0 &&
+              first.witness.segment_parameter == 0.0,
+              "point witness identifies the selected fixed triangle");
+        check(first.witness.terrain_weight_0 ==
+                  expected_weights[index][0] &&
+              first.witness.terrain_weight_1 ==
+                  expected_weights[index][1] &&
+              first.witness.terrain_weight_2 ==
+                  expected_weights[index][2],
+              "point witness has deterministic weight diagnostics");
+        const G1ClearanceWork expected_work = {
+            1, 1, 1, 0, 0, 0
+        };
+        check(clearance_work_same(first.work, expected_work),
+              "point query charges one query, cell, and triangle pair");
+    }
+}
+
+static void require_point_oracle_enclosure(
+    const heightfield& field,
+    vec3 point,
+    long double exact_surface,
+    const char* message)
+{
+    const G1ClearanceResult first = require_point_ok(field, point);
+    const G1ClearanceResult second = require_point_ok(field, point);
+    const long double exact_clearance =
+        static_cast<long double>(point.y) - exact_surface;
+    check(clearance_result_same(first, second),
+          "point-special proof is deterministic");
+    check(static_cast<long double>(first.lower_bound_m) <=
+              exact_clearance &&
+          exact_clearance <=
+              static_cast<long double>(first.witness_upper_m) &&
+          first.witness_upper_m - first.lower_bound_m <=
+              G1ClearanceMaximumCertificateWidthM,
+          message);
+    check(double_bits(first.witness.body_x) ==
+              double_bits(static_cast<double>(point.x)) &&
+          double_bits(first.witness.body_z) ==
+              double_bits(static_cast<double>(point.z)) &&
+          double_bits(first.witness.surface_x) ==
+              double_bits(static_cast<double>(point.x)) &&
+          double_bits(first.witness.surface_z) ==
+              double_bits(static_cast<double>(point.z)) &&
+          first.witness.candidate_kind == 3 &&
+          first.witness.segment_parameter == 0.0,
+          "point-special diagnostics retain canonical input XZ and t=0");
+
+    G1SurfaceSample producer = {};
+    check(g1_surface_query_v2(
+              producer, field, point.x, point.z) ==
+              G1SurfaceQueryValid,
+          "point-special oracle fixture has a valid producer sample");
+    const volatile double producer_clearance =
+        static_cast<double>(point.y) -
+        static_cast<double>(producer.height);
+    check(first.lower_bound_m <= producer_clearance,
+          "point-special lower bound preserves the producer inequality");
+
+    G1ClearanceBudget insufficient = g1_pose_clearance_budget();
+    insufficient.maximum_point_queries = 0;
+    G1ClearanceResult failed_output = seeded_result(74.0);
+    const ByteSnapshot<G1ClearanceResult> output_before(failed_output);
+    const ByteSnapshot<G1ClearanceBudget> limits_before(insufficient);
+    char error[128] = {};
+    check(g1_point_clearance(
+              failed_output, insufficient, field, point,
+              error, static_cast<int>(sizeof(error))) ==
+              G1ClearanceBudgetExceeded,
+          "point-special fixture preflights its point-query budget");
+    check(output_before.same(failed_output) &&
+          limits_before.same(insufficient),
+          "point-special failure is transactional");
+}
+
+static void test_point_special_exact_bit_regression()
+{
+    heightfield field;
+    const float cell_size =
+        float_from_bits(UINT32_C(0x3a83126f));
+    const float coordinate =
+        float_from_bits(UINT32_C(0x3727c5ac));
+    point_make_field(
+        field, 2, 2, 0.0f, 0.0f, cell_size);
+    field.heights(0) = 0.0f;
+    field.heights(1) =
+        float_from_bits(UINT32_C(0x3e800000));
+    field.heights(2) =
+        float_from_bits(UINT32_C(0x3f000000));
+    field.heights(3) =
+        float_from_bits(UINT32_C(0x3f400000));
+    const vec3 point(coordinate, 1.0f, coordinate);
+
+    heightfield_cell producer_cell = {};
+    check(terrain_v2_locate_cell(
+              field, point.x, point.z, producer_cell),
+          "exact-bit point fixture has a producer cell");
+    const volatile double diagnostic_weight_0 =
+        1.0 - producer_cell.tx;
+    const volatile double diagnostic_weight_1 =
+        producer_cell.tx - producer_cell.tz;
+    const volatile double diagnostic_weight_2 = producer_cell.tz;
+    const long double diagnostic_exact_sum =
+        static_cast<long double>(diagnostic_weight_0) +
+        static_cast<long double>(diagnostic_weight_1) +
+        static_cast<long double>(diagnostic_weight_2);
+    check(diagnostic_exact_sum != 1.0L,
+          "exact-bit fixture exposes rounded weights that are diagnostics only");
+
+    const long double exact_surface =
+        static_cast<long double>(field.heights(3)) *
+        static_cast<long double>(coordinate) /
+        static_cast<long double>(cell_size);
+    require_point_oracle_enclosure(
+        field, point, exact_surface,
+        "point-special bounds enclose the exact-bit point-plane oracle");
+}
+
+static void test_point_rejects_unproved_materialized_diagonal()
+{
+    heightfield field;
+    const float origin =
+        float_from_bits(UINT32_C(0x1645c2b2));
+    const float cell_size =
+        float_from_bits(UINT32_C(0x278eecba));
+    point_make_field(
+        field, 5, 4, origin, origin, cell_size);
+    const vec3 point(
+        float_from_bits(UINT32_C(0x287a1e46)),
+        1.0f,
+        float_from_bits(UINT32_C(0x2832a7e9)));
+
+    check(terrain_heightfield_is_queryable(field),
+          "unequal-span point fixture is a queryable G1HF/v2 field");
+    heightfield_cell cell = {};
+    check(terrain_v2_locate_cell(
+              field, point.x, point.z, cell) &&
+          cell.x0 == 3 && cell.z0 == 2,
+          "unequal-span point fixture selects its exact cell");
+    check(double_bits(cell.tx) == UINT64_C(0x3fe00000394b96ce) &&
+          double_bits(cell.tz) == UINT64_C(0x3fe00000394b96ce) &&
+          cell.tx >= cell.tz,
+          "producer fractions tie exactly and select T0");
+
+    const volatile double x0_product =
+        static_cast<double>(cell.x0) *
+        static_cast<double>(field.cell_size);
+    const volatile double x0 =
+        static_cast<double>(field.origin_x) + x0_product;
+    const volatile double x1_product =
+        static_cast<double>(cell.x0 + 1) *
+        static_cast<double>(field.cell_size);
+    const volatile double x1 =
+        static_cast<double>(field.origin_x) + x1_product;
+    const volatile double z0_product =
+        static_cast<double>(cell.z0) *
+        static_cast<double>(field.cell_size);
+    const volatile double z0 =
+        static_cast<double>(field.origin_z) + z0_product;
+    const volatile double z1_product =
+        static_cast<double>(cell.z0 + 1) *
+        static_cast<double>(field.cell_size);
+    const volatile double z1 =
+        static_cast<double>(field.origin_z) + z1_product;
+    const volatile double span_x = x1 - x0;
+    const volatile double span_z = z1 - z0;
+    const volatile double numerator_x =
+        static_cast<double>(point.x) - x0;
+    const volatile double numerator_z =
+        static_cast<double>(point.z) - z0;
+    check(double_bits(span_x) == UINT64_C(0x3cf1dd9740000002) &&
+          double_bits(span_z) == UINT64_C(0x3cf1dd9740000000) &&
+          span_x > span_z,
+          "authoritative materialized axis spans are unequal");
+    check(double_bits(numerator_x) ==
+              UINT64_C(0x3ce1dd977ff9d1ec) &&
+          double_bits(numerator_z) ==
+              UINT64_C(0x3ce1dd977ff9d1ec) &&
+          numerator_x > 0.0,
+          "authoritative point numerators are the same positive dyadic");
+    // The identical positive numerator divided by the strictly larger X
+    // span proves exact-real tx < tz, so the materialized triangle is T1.
+    // The rounded producer fractions above instead tie and choose T0.
+
+    const int offset = cell.z0 * field.nx + cell.x0;
+    field.heights(offset) = -8.0f;
+    field.heights(offset + 1) = 8.0f;
+    field.heights(offset + field.nx) = 8.0f;
+    field.heights(offset + field.nx + 1) = -8.0f;
+
+    G1ClearanceResult output = seeded_result(72.0);
+    const ByteSnapshot<G1ClearanceResult> output_before(output);
+    const G1ClearanceBudget limits = g1_pose_clearance_budget();
+    char error[128] = {};
+    check(g1_point_clearance(
+              output, limits, field, point,
+              error, static_cast<int>(sizeof(error))) ==
+              G1ClearanceUncertified,
+          "point fails closed when the authoritative diagonal is unproved");
+    check(output_before.same(output),
+          "unproved materialized diagonal preserves point output");
+}
+
+static void test_point_rejects_false_rounded_diagonal_tie()
+{
+    heightfield field;
+    point_make_field(
+        field, 2, 2,
+        float_from_bits(UINT32_C(0x3dcccccd)),
+        float_from_bits(UINT32_C(0x3d4ccccd)),
+        float_from_bits(UINT32_C(0x5921729f)));
+    const float coordinate =
+        float_from_bits(UINT32_C(0x58a1729f));
+    const vec3 point(coordinate, 1.0f, coordinate);
+    field.heights(0) = -8.0f;
+    field.heights(1) = 8.0f;
+    field.heights(2) = 8.0f;
+    field.heights(3) = -8.0f;
+
+    check(terrain_heightfield_is_queryable(field),
+          "false-rounded-tie fixture is a queryable G1HF/v2 field");
+    heightfield_cell cell = {};
+    check(terrain_v2_locate_cell(
+              field, point.x, point.z, cell) &&
+          double_bits(cell.tx) == UINT64_C(0x3fe0000000000000) &&
+          double_bits(cell.tz) == UINT64_C(0x3fe0000000000000),
+          "false-rounded-tie producer fractions tie at one half");
+
+    const volatile double x1_product =
+        static_cast<double>(field.cell_size);
+    const volatile double x1 =
+        static_cast<double>(field.origin_x) + x1_product;
+    const volatile double z1_product =
+        static_cast<double>(field.cell_size);
+    const volatile double z1 =
+        static_cast<double>(field.origin_z) + z1_product;
+    const double x0 = static_cast<double>(field.origin_x);
+    const double z0 = static_cast<double>(field.origin_z);
+    const volatile double numerator_x =
+        static_cast<double>(point.x) - x0;
+    const volatile double numerator_z =
+        static_cast<double>(point.z) - z0;
+    const volatile double span_x = x1 - x0;
+    const volatile double span_z = z1 - z0;
+    check(x0 > z0 && double_bits(x1) == double_bits(z1) &&
+          double_bits(static_cast<double>(point.x)) ==
+              double_bits(static_cast<double>(point.z)),
+          "false-rounded-tie source operands are distinct on X and Z");
+    check(double_bits(numerator_x) ==
+              UINT64_C(0x43142e53e0000000) &&
+          double_bits(numerator_z) ==
+              UINT64_C(0x43142e53e0000000) &&
+          double_bits(span_x) == UINT64_C(0x43242e53e0000000) &&
+          double_bits(span_z) == UINT64_C(0x43242e53e0000000),
+          "distinct exact ratios have identical rounded differences");
+    // With a shared point p and upper node n, 0 < z0 < x0 < p < n,
+    // (p-o)/(n-o) is strictly decreasing in o.  Therefore exact-real
+    // tx < tz even though all four rounded differences above are equal.
+
+    G1ClearanceResult output = seeded_result(76.0);
+    const ByteSnapshot<G1ClearanceResult> output_before(output);
+    const G1ClearanceBudget limits = g1_pose_clearance_budget();
+    char error[128] = {};
+    check(g1_point_clearance(
+              output, limits, field, point,
+              error, static_cast<int>(sizeof(error))) ==
+              G1ClearanceUncertified,
+          "rounded difference equality cannot certify a diagonal tie");
+    check(output_before.same(output),
+          "false rounded diagonal tie preserves point output");
+}
+
+static void test_point_domain_boundaries()
+{
+    heightfield exact_field;
+    point_make_field(exact_field, 2, 2, 0.5f, 0.5f, 1.0f);
+    require_point_ok(exact_field, vec3(0.5f, 1.0f, 0.5f));
+    require_point_ok(exact_field, vec3(1.5f, 1.0f, 1.5f));
+
+    const float below_minimum =
+        float_from_bits(float_bits(0.5f) - 1);
+    const float above_maximum =
+        float_from_bits(float_bits(1.5f) + 1);
+    require_point_failure(
+        exact_field, vec3(below_minimum, 1.0f, 1.0f),
+        G1ClearanceOutsideDomain,
+        "one-ULP excursion below minimum X is outside");
+    require_point_failure(
+        exact_field, vec3(1.0f, 1.0f, below_minimum),
+        G1ClearanceOutsideDomain,
+        "one-ULP excursion below minimum Z is outside");
+    require_point_failure(
+        exact_field, vec3(above_maximum, 1.0f, 1.0f),
+        G1ClearanceOutsideDomain,
+        "one-ULP excursion above maximum X is outside");
+    require_point_failure(
+        exact_field, vec3(1.0f, 1.0f, above_maximum),
+        G1ClearanceOutsideDomain,
+        "one-ULP excursion above maximum Z is outside");
+
+    heightfield nonrepresentable_maximum;
+    point_make_field(
+        nonrepresentable_maximum, 3, 2,
+        float_from_bits(UINT32_C(0x3dcccccd)),
+        float_from_bits(UINT32_C(0x3dcccccd)),
+        float_from_bits(UINT32_C(0x3e4ccccd)));
+    check(terrain_heightfield_is_queryable(nonrepresentable_maximum),
+          "non-binary32 maximum fixture is structurally valid");
+    const volatile double maximum_product =
+        2.0 * static_cast<double>(nonrepresentable_maximum.cell_size);
+    const volatile double maximum_x =
+        static_cast<double>(nonrepresentable_maximum.origin_x) +
+        maximum_product;
+    check(maximum_x != static_cast<double>(0.5f),
+          "authoritative maximum node is not binary32 representable");
+    const vec3 inward(0.5f, 1.0f,
+                      nonrepresentable_maximum.origin_z);
+    require_point_ok(nonrepresentable_maximum, inward);
+    require_point_failure(
+        nonrepresentable_maximum,
+        vec3(float_from_bits(UINT32_C(0x3f000001)),
+             1.0f, nonrepresentable_maximum.origin_z),
+        G1ClearanceOutsideDomain,
+        "next binary32 value beyond nonrepresentable maximum is outside");
+
+    heightfield zero_origin;
+    point_make_field(zero_origin);
+    const G1ClearanceResult canonical = require_point_ok(
+        zero_origin, vec3(-0.0f, 1.0f, -0.0f));
+    check(double_bits(canonical.witness.body_x) == 0 &&
+          double_bits(canonical.witness.body_z) == 0 &&
+          double_bits(canonical.witness.surface_x) == 0 &&
+          double_bits(canonical.witness.surface_z) == 0,
+          "point query canonicalizes signed-zero XZ to positive zero");
+}
+
+static void test_point_input_and_field_rejection()
+{
+    heightfield field;
+    point_make_field(field);
+    const float hostile_values[] = {
+        float_from_bits(UINT32_C(0x00000001)),
+        float_from_bits(UINT32_C(0x80000001)),
+        float_from_bits(UINT32_C(0x7fc00001)),
+        std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity()
+    };
+    for (size_t value_index = 0;
+         value_index < sizeof(hostile_values) / sizeof(hostile_values[0]);
+         ++value_index) {
+        for (int component = 0; component < 3; ++component) {
+            vec3 point(0.5f, 1.0f, 0.5f);
+            if (component == 0) point.x = hostile_values[value_index];
+            if (component == 1) point.y = hostile_values[value_index];
+            if (component == 2) point.z = hostile_values[value_index];
+            require_point_failure(
+                field, point, G1ClearanceInvalidInput,
+                "non-runtime XYZ component is invalid point input");
+        }
+    }
+
+    field.version = 1;
+    require_point_failure(
+        field, vec3(0.5f, 1.0f, 0.5f),
+        G1ClearanceInvalidField,
+        "G1HF/v1 is invalid for certified point clearance");
+    field.version = 2;
+
+    const int saved_size = field.heights.size;
+    field.heights.size = saved_size - 1;
+    require_point_failure(
+        field, vec3(0.5f, 1.0f, 0.5f),
+        G1ClearanceInvalidField,
+        "wrong height storage shape is invalid");
+    field.heights.size = saved_size;
+
+    float* const saved_data = field.heights.data;
+    field.heights.data = NULL;
+    require_point_failure(
+        field, vec3(0.5f, 1.0f, 0.5f),
+        G1ClearanceInvalidField,
+        "null height storage is invalid");
+    field.heights.data = saved_data;
+
+    const uint32_t invalid_height_bits[] = {
+        UINT32_C(0x7fc00001),
+        UINT32_C(0x7f800000),
+        UINT32_C(0x00000001),
+        UINT32_C(0x80000000)
+    };
+    const char* const invalid_height_messages[] = {
+        "NaN visited triangle height fails closed",
+        "infinite visited triangle height fails closed",
+        "subnormal visited triangle height fails closed",
+        "negative-zero visited triangle height fails closed"
+    };
+    for (size_t index = 0;
+         index < sizeof(invalid_height_bits) /
+                     sizeof(invalid_height_bits[0]);
+         ++index) {
+        field.heights.set(0.0f);
+        std::memcpy(
+            &field.heights(3), &invalid_height_bits[index],
+            sizeof(invalid_height_bits[index]));
+        check(float_bits(field.heights(3)) ==
+                  invalid_height_bits[index],
+              "hostile height fixture preserves object representation");
+        require_point_failure(
+            field, vec3(0.75f, 1.0f, 0.25f),
+            G1ClearanceInvalidField,
+            invalid_height_messages[index]);
+    }
+}
+
+static void test_point_exterior_height_independence()
+{
+    heightfield first;
+    heightfield second;
+    point_make_field(first, 2, 2, 0.0f, 0.0f, 1.0f, -10.0f);
+    point_make_field(second, 2, 2, 0.0f, 0.0f, 1.0f, 25.0f);
+    const float heights[4] = {0.0f, 2.0f, 4.0f, 10.0f};
+    for (int index = 0; index < 4; ++index) {
+        first.heights(index) = heights[index];
+        second.heights(index) = heights[index];
+    }
+    const vec3 inside(0.25f, 20.0f, 0.75f);
+    const G1ClearanceResult first_result = require_point_ok(first, inside);
+    const G1ClearanceResult second_result = require_point_ok(second, inside);
+    check(clearance_result_same(first_result, second_result),
+          "in-domain point result ignores exterior height bits");
+
+    const vec3 outside(
+        float_from_bits(float_bits(1.0f) + 1), 20.0f, 0.5f);
+    G1ClearanceResult first_output = seeded_result(75.0);
+    G1ClearanceResult second_output = first_output;
+    const ByteSnapshot<G1ClearanceResult> first_before(first_output);
+    const ByteSnapshot<G1ClearanceResult> second_before(second_output);
+    const G1ClearanceBudget limits = g1_pose_clearance_budget();
+    char first_error[128] = {};
+    char second_error[128] = {};
+    const G1ClearanceStatus first_status = g1_point_clearance(
+        first_output, limits, first, outside,
+        first_error, static_cast<int>(sizeof(first_error)));
+    const G1ClearanceStatus second_status = g1_point_clearance(
+        second_output, limits, second, outside,
+        second_error, static_cast<int>(sizeof(second_error)));
+    check(first_status == G1ClearanceOutsideDomain &&
+          second_status == G1ClearanceOutsideDomain,
+          "outside status is independent of exterior height");
+    check(first_before.same(first_output) &&
+          second_before.same(second_output),
+          "outside result remains transactional for both exteriors");
+}
+
+static void test_point_budget_preflight_and_aliases()
+{
+    heightfield field;
+    point_make_field(field);
+    const vec3 point(0.5f, 1.0f, 0.5f);
+
+    G1ClearanceBudget minimum = {};
+    minimum.maximum_point_queries = 1;
+    minimum.maximum_cells = 1;
+    minimum.maximum_primitive_triangle_pairs = 1;
+    const G1ClearanceResult minimum_result =
+        require_point_ok(field, point, minimum);
+    const G1ClearanceWork expected_work = {1, 1, 1, 0, 0, 0};
+    check(clearance_work_same(minimum_result.work, expected_work),
+          "tight point budget reports exact deterministic work");
+
+    const BudgetMember required_fields[] = {
+        &G1ClearanceBudget::maximum_point_queries,
+        &G1ClearanceBudget::maximum_cells,
+        &G1ClearanceBudget::maximum_primitive_triangle_pairs
+    };
+    for (size_t index = 0;
+         index < sizeof(required_fields) / sizeof(required_fields[0]);
+         ++index) {
+        G1ClearanceBudget insufficient = minimum;
+        insufficient.*required_fields[index] = 0;
+        require_point_failure(
+            field, point, insufficient,
+            G1ClearanceBudgetExceeded,
+            "point preflight rejects a tightened required work unit");
+    }
+
+    heightfield poisoned;
+    point_make_field(poisoned);
+    poisoned.heights(3) =
+        float_from_bits(UINT32_C(0x7fc00001));
+    G1ClearanceBudget no_cells = minimum;
+    no_cells.maximum_cells = 0;
+    require_point_failure(
+        poisoned, point, no_cells,
+        G1ClearanceBudgetExceeded,
+        "point work preflight occurs before the first terrain height load");
+
+    G1ClearanceBudget aliased_limits = minimum;
+    aliased_limits.maximum_point_queries = 0;
+    G1ClearanceResult output = seeded_result(77.0);
+    const ByteSnapshot<G1ClearanceResult> output_before(output);
+    const ByteSnapshot<G1ClearanceBudget> limits_before(aliased_limits);
+    const G1ClearanceStatus limit_alias_status = g1_point_clearance(
+        output, aliased_limits, field, point,
+        reinterpret_cast<char*>(&aliased_limits),
+        static_cast<int>(sizeof(aliased_limits)));
+    check(limit_alias_status == G1ClearanceBudgetExceeded,
+          "aliased limit diagnostic preserves budget status");
+    check(output_before.same(output) &&
+          limits_before.same(aliased_limits),
+          "budget failure preserves output and aliased limits");
+
+    G1ClearanceBudget insufficient = minimum;
+    insufficient.maximum_point_queries = 0;
+    output = seeded_result(79.0);
+    const ByteSnapshot<G1ClearanceResult> aliased_output_before(output);
+    const G1ClearanceStatus output_alias_status = g1_point_clearance(
+        output, insufficient, field, point,
+        reinterpret_cast<char*>(&output),
+        static_cast<int>(sizeof(output)));
+    check(output_alias_status == G1ClearanceBudgetExceeded,
+          "aliased output diagnostic preserves budget status");
+    check(aliased_output_before.same(output),
+          "budget failure preserves aliased point output");
+}
+
+static void require_point_guard_width(
+    const heightfield& field,
+    vec3 point,
+    double minimum_guard,
+    const char* message)
+{
+    const G1ClearanceResult result = require_point_ok(field, point);
+    check(result.witness_upper_m - result.lower_bound_m >=
+              minimum_guard,
+          message);
+}
+
+static void test_point_float_output_guards()
+{
+    heightfield upward;
+    point_make_field(upward);
+    const float one_up =
+        float_from_bits(float_bits(1.0f) + 1);
+    upward.heights(0) = 1.0f;
+    upward.heights(1) = one_up;
+    upward.heights(2) = 1.0f;
+    upward.heights(3) = one_up;
+    const vec3 upward_point(0.75f, 2.0f, 0.0f);
+    G1SurfaceSample upward_sample = {};
+    check(g1_surface_query_v2(
+              upward_sample, upward,
+              upward_point.x, upward_point.z) ==
+              G1SurfaceQueryValid &&
+          float_bits(upward_sample.height) == float_bits(one_up),
+          "producer fixture forces upward binary32 height rounding");
+    const double one_ulp =
+        static_cast<double>(one_up) - 1.0;
+    const G1ClearanceResult upward_result =
+        require_point_ok(upward, upward_point);
+    const double upward_continuous_height =
+        1.0 + 0.75 * one_ulp;
+    check(upward_result.witness.surface_y >=
+              upward_continuous_height - 1.0e-15 &&
+          upward_result.witness.surface_y <=
+              upward_continuous_height + 1.0e-15,
+          "point witness remains on the continuous affine triangle");
+    check(upward_result.witness_upper_m -
+              upward_result.lower_bound_m >= one_ulp,
+          "upward-rounded sample retains a full binary32 ULP guard");
+
+    const float minimum_normal =
+        std::numeric_limits<float>::min();
+    heightfield negative_zero_band;
+    point_make_field(negative_zero_band);
+    negative_zero_band.heights(0) = -minimum_normal;
+    negative_zero_band.heights(1) = 0.0f;
+    negative_zero_band.heights(2) = -minimum_normal;
+    negative_zero_band.heights(3) = 0.0f;
+    const vec3 zero_band_point(0.5f, 0.0f, 0.0f);
+    G1SurfaceSample negative_sample = {};
+    check(g1_surface_query_v2(
+              negative_sample, negative_zero_band,
+              zero_band_point.x, zero_band_point.z) ==
+              G1SurfaceQueryValid &&
+          float_bits(negative_sample.height) == 0,
+          "negative subnormal producer result canonicalizes to +zero");
+    require_point_guard_width(
+        negative_zero_band, zero_band_point,
+        static_cast<double>(minimum_normal),
+        "negative zero-band result uses at least FLT_MIN guard");
+
+    heightfield positive_zero_band;
+    point_make_field(positive_zero_band);
+    positive_zero_band.heights(0) = minimum_normal;
+    positive_zero_band.heights(1) = 0.0f;
+    positive_zero_band.heights(2) = minimum_normal;
+    positive_zero_band.heights(3) = 0.0f;
+    G1SurfaceSample positive_sample = {};
+    check(g1_surface_query_v2(
+              positive_sample, positive_zero_band,
+              zero_band_point.x, zero_band_point.z) ==
+              G1SurfaceQueryValid &&
+          float_bits(positive_sample.height) == 0,
+          "positive subnormal producer result canonicalizes to +zero");
+    require_point_guard_width(
+        positive_zero_band, zero_band_point,
+        static_cast<double>(minimum_normal),
+        "positive zero-band result uses at least FLT_MIN guard");
+
+    const float binades[] = {1.0f, 2.0f};
+    const vec3 side_points[] = {
+        vec3(0.75f, 4.0f, 0.25f),
+        vec3(0.25f, 4.0f, 0.75f)
+    };
+    for (size_t binade_index = 0;
+         binade_index < sizeof(binades) / sizeof(binades[0]);
+         ++binade_index) {
+        const float boundary = binades[binade_index];
+        const float below =
+            float_from_bits(float_bits(boundary) - 1);
+        const float above =
+            float_from_bits(float_bits(boundary) + 1);
+        const double larger_ulp =
+            static_cast<double>(above) -
+            static_cast<double>(boundary);
+        heightfield crossing;
+        point_make_field(crossing);
+        crossing.heights(0) = below;
+        crossing.heights(1) = boundary;
+        crossing.heights(2) = boundary;
+        crossing.heights(3) = boundary;
+        for (size_t side = 0;
+             side < sizeof(side_points) / sizeof(side_points[0]);
+             ++side) {
+            require_point_guard_width(
+                crossing, side_points[side], larger_ulp,
+                "both fixed triangles use larger adjacent binade ULP");
+        }
+    }
+
+    heightfield flat_sixteen;
+    point_make_field(flat_sixteen);
+    flat_sixteen.heights.set(16.0f);
+    const vec3 flat_point(0.5f, 20.0f, 0.5f);
+    G1SurfaceSample flat_sample = {};
+    check(g1_surface_query_v2(
+              flat_sample, flat_sixteen,
+              flat_point.x, flat_point.z) ==
+              G1SurfaceQueryValid,
+          "flat-16 producer fixture is valid");
+    const double flat_ulp =
+        static_cast<double>(
+            float_from_bits(float_bits(16.0f) + 1)) - 16.0;
+    check(flat_ulp > G1ClearanceMaximumCertificateWidthM,
+          "flat-16 full float ULP exceeds certificate cap");
+    G1ClearanceResult output = seeded_result(81.0);
+    const ByteSnapshot<G1ClearanceResult> output_before(output);
+    const G1ClearanceBudget limits = g1_pose_clearance_budget();
+    char error[128] = {};
+    check(g1_point_clearance(
+              output, limits, flat_sixteen, flat_point,
+              error, static_cast<int>(sizeof(error))) ==
+              G1ClearanceUncertified,
+          "flat-16 point fails closed on mandatory guard width");
+    check(output_before.same(output),
+          "flat-16 uncertified point preserves output");
+
+    output = seeded_result(83.0);
+    const ByteSnapshot<G1ClearanceResult> aliased_before(output);
+    check(g1_point_clearance(
+              output, limits, flat_sixteen, flat_point,
+              reinterpret_cast<char*>(&output),
+              static_cast<int>(sizeof(output))) ==
+              G1ClearanceUncertified,
+          "flat-16 aliased diagnostic preserves semantic status");
+    check(aliased_before.same(output),
+          "flat-16 aliased diagnostic preserves output bytes");
 }
 
 class RoundingModeGuard
@@ -1096,6 +1991,15 @@ int main(int argc, char** argv)
     test_status_and_factory_contract();
     test_budget_contract();
     test_swing_lift_materializer();
+    test_point_fixed_diagonal_and_determinism();
+    test_point_special_exact_bit_regression();
+    test_point_rejects_unproved_materialized_diagonal();
+    test_point_rejects_false_rounded_diagonal_tie();
+    test_point_domain_boundaries();
+    test_point_input_and_field_rejection();
+    test_point_exterior_height_independence();
+    test_point_budget_preflight_and_aliases();
+    test_point_float_output_guards();
     test_arithmetic_environment_rejection_and_restoration();
     return 0;
 }

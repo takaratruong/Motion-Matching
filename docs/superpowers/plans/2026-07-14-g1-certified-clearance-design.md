@@ -359,7 +359,9 @@ The global lower bound and witness are deliberately independent:
 
 Candidate kinds are fixed: `0=face-interior`, `1=edge`, `2=fallback-node`, `3=point`. For kind 1, `candidate_subindex=3*edge_index+local`, where local `0=stationary`, `1=lower endpoint`, and `2=upper endpoint`. For kind 2 it is the deterministic subdivision-node preorder index; for kind 0 or 3 it is zero. These numeric values are part of parity output and must not depend on pointer order.
 
-The internal witness proof record's `segment_parameter`, canonical endpoint source keys, and three nonnegative terrain weights are the authoritative feasibility data. The weights are binary64 values interpreted as exact reals; normalize them by their positive exact-real sum, which defines barycentrics that sum to one without relying on a rounded `1-w0-w1`. Require `t in [0,1]` and a positive finite weight sum before accepting a witness. Reconstruct centerline Y from the two `G1ExactY` expansions at that exact parameter and enclose it outward; reconstruct XZ from the promoted exact coordinates. Then require the horizontal disk inequality by an outward upper enclosure, choose a downward-enclosed square-root magnitude so the sphere offset is inside the closed ball, and upward-enclose the resulting vertical value. The public parameter/XYZ members are deterministic binary64 diagnostics reconstructed from the same internal source record; they are never used to re-prove or tighten the bound. Point calls use `t=0` and the selected triangle weights. Primitive indices are assigned before traversal: a standalone primitive is zero and a standalone foot uses spheres `0..3`; a standalone leg uses knee `0`, ankle `1`, toe `2`, foot spheres `3..6`, thigh `7`, shin `8`; a pose uses Hips `0`, left knee/ankle/toe `1..3`, left foot spheres `4..7`, left thigh/shin `8..9`, right knee/ankle/toe `10..12`, right foot spheres `13..16`, and right thigh/shin `17..18`.
+For solver candidates `0..2`, the internal witness proof record's `segment_parameter`, canonical endpoint source keys, and three nonnegative terrain weights are the authoritative feasibility data. The weights are binary64 values interpreted as exact homogeneous reals; normalize them by their positive exact-real sum, which defines barycentrics that sum to one without relying on a rounded `1-w0-w1`. Require `t in [0,1]` and a positive finite weight sum before accepting one of these witnesses. Reconstruct centerline Y from the two `G1ExactY` expansions at that exact parameter and enclose it outward; reconstruct XZ from the promoted exact coordinates. Then require the horizontal disk inequality by an outward upper enclosure, choose a downward-enclosed square-root magnitude so the sphere offset is inside the closed ball, and upward-enclose the resulting vertical value. The public parameter/XYZ members are deterministic binary64 diagnostics reconstructed from the same internal source record; they are never used to re-prove or tighten the bound.
+
+Candidate kind `3` is a point-special proof source and is intentionally not a degenerate capsule-patch record. Its authoritative feasibility data is the canonical promoted input XZ, `t=0`, the strictly selected closed `T0`/`T1`, and the outward enclosure of that triangle's continuous plane height at the input XZ. Point fractions divide by the actual adjacent materialized source-node spans `x1-x0` and `z1-z0`, not nominal `cell_size`. Select a side only when the outward fraction intervals are separated, except that bit-identical canonical point operands and bit-identical materialized source-node endpoints prove the exact diagonal tie and select `T0`; any other interval overlap returns transactional `Uncertified`. Its public point XYZ and terrain-weight members are deterministic diagnostics only; neither the rounded producer fractions nor three separately rounded public doubles are used to establish feasibility or tighten either bound. Separately rounded fractions can already have an exact-real sum different from one on the supplied equal-span fixture; unequal materialized axis spans are the stronger general case in which exact point barycentrics need not admit a suitable three-binary64 representation. The producer fractions remain compatibility diagnostics and its rounded height only caps the lower bound; neither selects the certified triangle or plane. This point-special source handles both without weakening the exact homogeneous-weight normalization required for solver candidates `0..2`. Primitive indices are assigned before traversal: a standalone primitive is zero and a standalone foot uses spheres `0..3`; a standalone leg uses knee `0`, ankle `1`, toe `2`, foot spheres `3..6`, thigh `7`, shin `8`; a pose uses Hips `0`, left knee/ankle/toe `1..3`, left foot spheres `4..7`, left thigh/shin `8..9`, right knee/ankle/toe `10..12`, right foot spheres `13..16`, and right thigh/shin `17..18`.
 
 ### Float output semantics
 
@@ -569,7 +571,7 @@ If the interval remains wider, return `Uncertified`; never replace the lower bou
 
 ## 7. Exact G1HF/v2 Bounds and Triangle Enumeration
 
-At every public status entry, first run the Section 6 arithmetic-environment check. Every entry that accepts a budget then validates the entire caller limit struct against its family factory before field access or ledger creation; `g1_apply_swing_lift_y` instead performs the scalar validation specified in Section 3 and never creates a ledger. After those preconditions, geometry entries:
+At every public status entry, first run the Section 6 arithmetic-environment check. Every entry that accepts a budget then validates the entire caller limit struct against its family factory before field access or ledger creation; `g1_apply_swing_lift_y` instead performs the scalar validation specified in Section 3 and never creates a ledger. The continuous-primitive steps below are implemented atomically by Tasks 3 and 4; Task 2 does not expose partial sphere/capsule domain, load, budget, or tangency statuses before the solver exists. After those preconditions, completed sphere/capsule geometry entries:
 
 1. Require `field.version==2` and `terrain_heightfield_is_queryable(field)`.
 2. Require every body coordinate to pass Task 2's `g1_ik_vec3_is_runtime_value`; canonicalize signed zero. Nonzero binary32 subnormals are `InvalidInput`, including Y.
@@ -595,7 +597,7 @@ T0 = (p00, p10, p11)
 T1 = (p00, p11, p01)
 ```
 
-Point clearance first calls `g1_surface_query_v2` after separately validating input and field. Map `G1SurfaceQueryOutside` to `G1ClearanceOutsideDomain`; after those prechecks, map `G1SurfaceQueryInvalid` to `InvalidField` unless the strict reconstruction identifies an arithmetic failure. On `G1SurfaceQueryValid`, use the same checked locate/cell-height sequence to compute the selected continuous triangle plane in the strict kernel. Apply the height-output guard to its lower bound and use the unguarded continuous value as its feasible upper witness. A test at every representable fixture probe compares this continuous value with the producer sample within the declared output-rounding guard. Neither path consults `exterior_height` as geometry.
+Point clearance first calls `g1_surface_query_v2` after separately validating input and field. Map `G1SurfaceQueryOutside` to `G1ClearanceOutsideDomain`; after those prechecks, map `G1SurfaceQueryInvalid` to `InvalidField` unless the strict reconstruction identifies an arithmetic failure. On `G1SurfaceQueryValid`, use the checked single-cell locate/height sequence and the actual adjacent materialized source-node spans to form outward point-fraction intervals. Select one closed `T0`/`T1` only when those intervals prove the side, or select `T0` on an exact operand-identity tie; any other overlap is transactional `Uncertified`. Outwardly enclose the selected triangle's continuous plane height at the canonical promoted input XZ. That input XZ plus the selected triangle, `t=0`, and plane enclosure is candidate kind `3`'s point-special proof source. Apply the height-output guard to its lower bound and use the plane enclosure for its feasible upper witness. Public point XYZ and weights remain deterministic diagnostics and are never substituted for that proof source. The producer fractions and rounded height remain compatibility diagnostics, with only the rounded height allowed to cap the lower bound. A test at every representable fixture probe compares this continuous value with the producer sample within the declared output-rounding guard. Neither path consults `exterior_height` as geometry.
 
 The clearance tests must build two otherwise identical fields with different exterior heights and require bit-identical in-domain results plus identical `OutsideDomain` statuses.
 
@@ -1012,7 +1014,7 @@ Exercise `A==B`, segment parallel to terrain, segment in the terrain plane, vert
 
 **Review gate:** No implementation is accepted while a public safety field is `float`, a non-`Ok` result can partially assign output, a caller can enlarge a factory cap, FTZ/DAZ can enter certified arithmetic, or the strict kernel can inline into the caller.
 
-### Task 2: Add checked v2 domain spans and terrain triangles
+### Task 2: Add checked point clearance on one v2 triangle
 
 **Files:**
 - Create: `g1_surface_query.h`
@@ -1024,8 +1026,10 @@ Exercise `A==B`, segment parallel to terrain, segment in the terrain plane, vert
 - Moves one existing static-inline producer boundary without changing any
   name, enum value, struct layout, signature, function body, status mapping,
   arithmetic, or API.
-- Produces internal `g1_clearance_domain_contains`, checked cell-span enumeration, and exact `T0/T1` vertex construction.
-- Produces checked point clearance.
+- Produces internal point-domain checking and exact selected-cell `T0/T1`
+  vertex construction.
+- Produces checked point clearance with the candidate-kind-3 point-special
+  proof source. It does not change public sphere/capsule stub behavior.
 
 - [ ] Before geometry work, create `g1_surface_query.h` and **move, never copy**,
   exactly these six existing definitions out of `g1_ik.h`:
@@ -1047,17 +1051,25 @@ git add g1_surface_query.h g1_ik.h g1_clearance.cpp \
 git commit -m "refactor: isolate G1 surface query"
 ```
 
-- [ ] Add RED tests D and K, the noncoplanar point probes from C, malformed visited heights, and unchanged outputs.
+- [ ] Add the point-only portions of RED tests C, D, and K, malformed visited
+  heights, the supplied non-dyadic exact-bit point, and unchanged outputs.
 - [ ] Implement structural/query-domain validation using existing bit helpers.
-- [ ] Implement outward footprint/domain comparison with exact tangency handling.
-- [ ] Preflight cell-span products and budgets before loops.
-- [ ] Emit exact fixed-diagonal triangles, mandatory per-triangle output guards, and checked point results satisfying the producer-height inequality.
+- [ ] Preflight the fixed one-query/one-cell/one-triangle point work before the
+  first height load.
+- [ ] Form point fractions from adjacent materialized source-node spans;
+  require separated outward intervals or exact operand identity for the
+  diagonal tie, and return transactional `Uncertified` on any other overlap.
+- [ ] Emit the exact selected fixed-diagonal triangle, mandatory output guard,
+  and checked point result satisfying the producer-height inequality. Keep
+  producer fractions/height as compatibility diagnostics/lower cap only, and
+  keep candidate-kind-3 proof ownership visibly independent of public
+  weight/XYZ diagnostics.
 - [ ] Run strict, fast-math-caller, and sanitizer tests.
 - [ ] Commit the subsequent geometry/test changes with
   `feat: enumerate checked G1HF v2 clearance triangles`; do not amend or fold
   the reviewed ownership-only commit into it.
 
-**Review gate:** Exterior height cannot influence status or in-domain output; exact maximum edges, both triangle halves, upward/FTZ output rounding, binade transitions, and mandatory-guard `Uncertified` behavior must be demonstrated by tests.
+**Review gate:** Exterior height cannot influence point status or in-domain output; exact maximum edges, both triangle halves, the supplied non-dyadic point oracle, upward/FTZ output rounding, binade transitions, and mandatory-guard `Uncertified` behavior must be demonstrated by tests. Sphere/capsule preprocessing and certification are explicitly outside this gate.
 
 ### Task 3: Implement outward intervals and analytic patch solver
 
@@ -1067,6 +1079,9 @@ git commit -m "refactor: isolate G1 surface query"
 
 **Interfaces:**
 - Produces strict interval operations, `G1ExactY`/`G1CertifiedEndpoint`, projected face coefficients, interior stationary solver, disk-clipped 3D edge solver, feasible witness reconstruction, and stable source/candidate keys.
+- Produces the `TwoSum`/`TwoDiff` expansions required by the full primitive
+  footprint proof, but exposes no new public sphere/capsule status before
+  Task 4 completes.
 
 - [ ] Add RED tests for public exact-Y behavior, endpoint reversal, analytic face interior, each edge clamp branch, circle tangency, vertical projection, membership uncertainty, witness feasibility, and stable public witness keys. Do not reach into private endpoint/source records from the separately compiled test.
 - [ ] Implement outward interval primitives with nonfinite/zero-denominator rejection.
@@ -1077,7 +1092,7 @@ git commit -m "refactor: isolate G1 surface query"
 - [ ] Verify every `Ok` result encloses a high-precision fixture oracle within `1e-6`.
 - [ ] Commit with `feat: certify projected capsule patch minima`.
 
-**Review gate:** The reviewer must derive the stationary and edge formulas independently, verify that no circle-only candidate is missing, and trace every patch/witness Y back to an exact endpoint expansion and stable source key.
+**Review checkpoint:** The reviewer must derive the stationary and edge formulas independently, verify that no circle-only candidate is missing, and trace every patch/witness Y back to an exact endpoint expansion and stable source key. Task 3 is an internal checkpoint, not a standalone certification gate; Tasks 3 and 4 are accepted or rejected together after the public kernel is composed.
 
 ### Task 4: Compose the eight-patch capsule kernel and bounded fallback
 
@@ -1088,7 +1103,13 @@ git commit -m "refactor: isolate G1 surface query"
 **Interfaces:**
 - Produces `g1_capsule_clearance` and `g1_sphere_clearance` with exact prism-boundary coverage.
 
-- [ ] Add RED fixtures A, B, F, the explicit G tent/old-lattice sign reversal, K sphere/capsule cases, and endpoint-reversal parity.
+- [ ] Add RED fixtures A, B, the full sphere/capsule D boundary matrix, F,
+  the explicit G tent/old-lattice sign reversal and span/count preflights,
+  K sphere/capsule cases, and endpoint-reversal parity.
+- [ ] Implement the full projected-footprint `TwoSum`/`TwoDiff` expansion
+  comparisons, exact-tangency domain proof, checked cell-span enumeration,
+  rectangular cells/pairs/patches/candidates preflight, and deterministic
+  `z/x`, `T0/T1` emission before the first height load.
 - [ ] Construct the two caps and six side triangles in the fixed patch order.
 - [ ] Evaluate all patches without outward-normal classification.
 - [ ] Implement the coarse patch lower bound and deterministic longest-edge subdivision.
@@ -1097,7 +1118,7 @@ git commit -m "refactor: isolate G1 surface query"
 - [ ] Run strict/release/sanitizer tests and repeated hash parity.
 - [ ] Commit with `feat: certify G1 sphere and capsule clearance`.
 
-**Review gate:** The reviewer must check the rank-three boundary argument and rank-deficient fiber argument. The named tent must be old-lattice positive and certified-witness negative; sampled radial or centerline production code is an automatic rejection.
+**Combined Task 3+4 certification gate:** The reviewer must check the exact footprint/domain and count-preflight proofs, the rank-three boundary argument, and the rank-deficient fiber argument. Exact tangency must be admitted only when the complete solver returns a certificate; the named tent must be old-lattice positive and certified-witness negative. Partial public preprocessing statuses, sampled radial code, or sampled centerline production code are automatic rejection.
 
 ### Task 5: Add foot and pose aggregation under shared budgets
 
