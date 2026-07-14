@@ -270,7 +270,7 @@ Pose SequentialPlayer::sample() const {
     if (!started_) {
         throw std::logic_error("interaction playback has not started");
     }
-    const double source_frame = stable_read_frame(source_frame_exact_);
+    const double source_frame = source_frame_exact_;
     const int32_t left = static_cast<int32_t>(std::floor(source_frame));
     const int32_t right = std::min(left + 1, final_frame_);
     const float alpha = static_cast<float>(
@@ -329,8 +329,7 @@ float SequentialPlayer::elapsed_seconds() const {
 
 vec3 SequentialPlayer::entry_root_correction() const {
     if (!started_) return vec3();
-    return entry_correction_weight(
-               candidate_, stable_read_frame(source_frame_exact_)) *
+    return entry_correction_weight(candidate_, source_frame_exact_) *
         candidate_.entry_root_offset;
 }
 

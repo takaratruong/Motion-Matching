@@ -260,6 +260,19 @@ void test_positive_tiny_updates_accumulate_without_quantization() {
         1.0e-6F));
 }
 
+void test_single_positive_tiny_update_changes_continuous_sample() {
+    using namespace interaction;
+    PlaybackCase value = make_playback_case();
+    SequentialPlayer player(value.fixture.database);
+    player.start(value.candidate, value.current);
+    const float before = player.sample().positions[kRightHandBone].z;
+
+    player.advance(2.0e-7F);
+
+    const float after = player.sample().positions[kRightHandBone].z;
+    assert(after > before);
+}
+
 void test_clock_is_equivalent_across_update_partitions_and_speeds() {
     using namespace interaction;
     PlaybackCase value = make_playback_case();
@@ -563,6 +576,7 @@ int main() {
     test_frozen_public_interface_and_unstarted_state();
     test_canonical_clock_and_fractional_interpolation();
     test_positive_tiny_updates_accumulate_without_quantization();
+    test_single_positive_tiny_update_changes_continuous_sample();
     test_clock_is_equivalent_across_update_partitions_and_speeds();
     test_speed_endpoints_and_rejection();
     test_scene_mapping_and_decaying_entry_correction();
