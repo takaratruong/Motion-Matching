@@ -337,6 +337,292 @@ class InteractionArtifact:
     approach_directions_object: np.ndarray
     source_frames: np.ndarray
 
+    def validate(self) -> None:
+        if isinstance(self.fps, bool) or self.fps != 25:
+            raise InteractionValidationError(
+                "artifact_fps", f"artifact fps must be exactly 25, got {self.fps!r}"
+            )
+
+        positions = np.asarray(self.positions)
+        if positions.ndim != 3 or positions.shape[1:] != (31, 3):
+            raise InteractionValidationError(
+                "artifact_shape",
+                "positions shape must be (N, 31, 3), "
+                f"got {positions.shape}",
+            )
+        frame_count = positions.shape[0]
+        if frame_count == 0:
+            raise InteractionValidationError(
+                "artifact_shape", "positions must contain at least one frame"
+            )
+
+        starts = np.asarray(self.range_starts)
+        if starts.ndim != 1 or len(starts) == 0:
+            raise InteractionValidationError(
+                "artifact_shape",
+                "range_starts shape must be a nonempty (C,) vector, "
+                f"got {starts.shape}",
+            )
+        clip_count = len(starts)
+
+        arrays = (
+            ("parents", self.parents, (31,), np.int32),
+            ("range_starts", starts, (clip_count,), np.int32),
+            (
+                "range_stops",
+                self.range_stops,
+                (clip_count,),
+                np.int32,
+            ),
+            ("positions", positions, (frame_count, 31, 3), np.float32),
+            (
+                "velocities",
+                self.velocities,
+                (frame_count, 31, 3),
+                np.float32,
+            ),
+            (
+                "rotations",
+                self.rotations,
+                (frame_count, 31, 4),
+                np.float32,
+            ),
+            (
+                "angular_velocities",
+                self.angular_velocities,
+                (frame_count, 31, 3),
+                np.float32,
+            ),
+            (
+                "foot_contacts",
+                self.foot_contacts,
+                (frame_count, 2),
+                np.uint8,
+            ),
+            (
+                "hand_contacts",
+                self.hand_contacts,
+                (frame_count, 2),
+                np.uint8,
+            ),
+            (
+                "hand_dof",
+                self.hand_dof,
+                (frame_count, 14),
+                np.float32,
+            ),
+            (
+                "hand_dof_velocities",
+                self.hand_dof_velocities,
+                (frame_count, 14),
+                np.float32,
+            ),
+            ("phases", self.phases, (frame_count,), np.uint8),
+            (
+                "active_hands",
+                self.active_hands,
+                (clip_count,),
+                np.uint8,
+            ),
+            (
+                "time_to_contact",
+                self.time_to_contact,
+                (frame_count,),
+                np.float32,
+            ),
+            (
+                "object_positions",
+                self.object_positions,
+                (frame_count, 3),
+                np.float32,
+            ),
+            (
+                "object_rotations",
+                self.object_rotations,
+                (frame_count, 4),
+                np.float32,
+            ),
+            (
+                "object_velocities",
+                self.object_velocities,
+                (frame_count, 3),
+                np.float32,
+            ),
+            (
+                "object_angular_velocities",
+                self.object_angular_velocities,
+                (frame_count, 3),
+                np.float32,
+            ),
+            (
+                "table_positions",
+                self.table_positions,
+                (clip_count, 3),
+                np.float32,
+            ),
+            (
+                "table_rotations",
+                self.table_rotations,
+                (clip_count, 4),
+                np.float32,
+            ),
+            (
+                "table_sizes",
+                self.table_sizes,
+                (clip_count, 3),
+                np.float32,
+            ),
+            (
+                "object_dimensions",
+                self.object_dimensions,
+                (clip_count, 3),
+                np.float32,
+            ),
+            (
+                "grasp_positions_object",
+                self.grasp_positions_object,
+                (clip_count, 3),
+                np.float32,
+            ),
+            (
+                "grasp_rotations_object",
+                self.grasp_rotations_object,
+                (clip_count, 4),
+                np.float32,
+            ),
+            (
+                "approach_directions_object",
+                self.approach_directions_object,
+                (clip_count, 3),
+                np.float32,
+            ),
+            (
+                "source_frames",
+                self.source_frames,
+                (frame_count,),
+                np.int32,
+            ),
+        )
+        validated = {}
+        for name, value, shape, dtype in arrays:
+            array = np.asarray(value)
+            if array.shape != shape:
+                raise InteractionValidationError(
+                    "artifact_shape",
+                    f"{name} shape must be {shape}, got {array.shape}",
+                )
+            expected_dtype = np.dtype(dtype)
+            if array.dtype != expected_dtype:
+                raise InteractionValidationError(
+                    "artifact_dtype",
+                    f"{name} dtype must be {expected_dtype.name}, "
+                    f"got {array.dtype}",
+                )
+            validated[name] = array
+
+        if not np.array_equal(validated["parents"], G1_SKELETON.parents):
+            raise InteractionValidationError(
+                "artifact_parents",
+                "parents must match the exact G1 parent array",
+            )
+
+        stops = validated["range_stops"]
+        if starts[0] != 0:
+            raise InteractionValidationError(
+                "artifact_ranges", "range coverage must start at 0"
+            )
+        for index, (start, stop) in enumerate(zip(starts, stops)):
+            if stop <= start:
+                raise InteractionValidationError(
+                    "artifact_ranges",
+                    f"empty range {index}: [{int(start)}, {int(stop)})",
+                )
+            if index:
+                previous_stop = stops[index - 1]
+                if start > previous_stop:
+                    raise InteractionValidationError(
+                        "artifact_ranges",
+                        f"range coverage has gap before range {index}",
+                    )
+                if start < previous_stop:
+                    raise InteractionValidationError(
+                        "artifact_ranges",
+                        f"range coverage has overlap before range {index}",
+                    )
+        if stops[-1] != frame_count:
+            raise InteractionValidationError(
+                "artifact_ranges",
+                "range coverage must end at frame count "
+                f"{frame_count}, got {int(stops[-1])}",
+            )
+
+        for name, array in validated.items():
+            if array.dtype.kind == "f" and not np.isfinite(array).all():
+                raise InteractionValidationError(
+                    "artifact_non_finite",
+                    f"{name} contains non-finite values",
+                )
+
+        for name in ("foot_contacts", "hand_contacts", "active_hands"):
+            if not np.isin(validated[name], (0, 1)).all():
+                raise InteractionValidationError(
+                    "artifact_enum",
+                    f"{name} must contain only 0 or 1",
+                )
+
+        phases = validated["phases"]
+        if not np.isin(phases, tuple(int(value) for value in InteractionPhase)).all():
+            raise InteractionValidationError(
+                "artifact_phases", "phases must contain values from 0 through 4"
+            )
+        required_phases = (
+            (InteractionPhase.CONTACT, "contact"),
+            (InteractionPhase.LIFT, "lift"),
+            (InteractionPhase.HOLD, "hold"),
+        )
+        source_frames = validated["source_frames"]
+        for index, (start, stop) in enumerate(zip(starts, stops)):
+            clip_phases = phases[start:stop]
+            if np.any(np.diff(clip_phases.astype(np.int16)) < 0):
+                raise InteractionValidationError(
+                    "artifact_phases",
+                    f"phases must be monotonic within range {index}",
+                )
+            for phase, label in required_phases:
+                if not np.any(clip_phases == int(phase)):
+                    raise InteractionValidationError(
+                        "artifact_phases",
+                        f"range {index} is missing the {label} phase",
+                    )
+            clip_source_frames = source_frames[start:stop]
+            if np.any(clip_source_frames < 0) or np.any(
+                np.diff(clip_source_frames) < 0
+            ):
+                raise InteractionValidationError(
+                    "artifact_source_frames",
+                    "source_frames must be nonnegative and nondecreasing "
+                    f"within range {index}",
+                )
+
+        for name in (
+            "rotations",
+            "object_rotations",
+            "table_rotations",
+            "grasp_rotations_object",
+        ):
+            norms = np.linalg.norm(validated[name].astype(np.float64), axis=-1)
+            if not np.all(np.abs(norms - 1.0) <= 1e-4):
+                raise InteractionValidationError(
+                    "artifact_quaternion",
+                    f"{name} must contain unit quaternions",
+                )
+
+        for name in ("table_sizes", "object_dimensions"):
+            if np.any(validated[name] <= 0):
+                raise InteractionValidationError(
+                    "artifact_dimensions", f"{name} must be positive"
+                )
+
 
 def _validation_error(
     error_type: type[InteractionBuildError],
