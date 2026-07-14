@@ -8,3 +8,7 @@ controller.wasm
 *.bvh
 *.log
 resources/runs*
+.venv/
+build/tests/
+interaction_probe
+resources/g1_interaction/

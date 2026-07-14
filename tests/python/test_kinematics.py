@@ -1,15 +1,25 @@
+import os
+from pathlib import Path
 import unittest
 import numpy as np
+import resources.g1_terrain_builder.kinematics as kinematics
 from resources.g1_terrain_builder.kinematics import (
     G1Kinematics, change_basis_zup_to_yup, convert_source_clip,
     forward_local_hierarchy, heading_quaternions, world_to_local,
 )
 from resources.g1_terrain_builder.schema import SourceClip
 
-G1_XML = "/home/ubuntu/projects/mjx-diffphysics/env/g1/assets/g1_29dof.xml"
+G1_XML = os.environ.get(
+    "G1_XML",
+    "/home/ubuntu/projects/mjx-diffphysics/env/g1/assets/g1_29dof.xml",
+)
 
 
 class KinematicsTests(unittest.TestCase):
+    def test_holden_quat_resolves_from_this_worktree(self):
+        expected = Path(__file__).resolve().parents[2] / "resources" / "quat.py"
+        self.assertEqual(Path(kinematics.holden_quat.__file__).resolve(), expected)
+
     def test_change_of_basis_maps_z_to_y(self):
         p = np.array([[[0.0, 0.0, 1.0]]])
         q = np.array([[[1.0, 0.0, 0.0, 0.0]]])

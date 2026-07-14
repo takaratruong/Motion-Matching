@@ -1,11 +1,8 @@
-import sys
-
 import mujoco
 import numpy as np
 from scipy import signal
 
-sys.path.insert(0, "/home/ubuntu/projects/motion-matching/resources")
-import quat as holden_quat
+from resources import quat as holden_quat
 
 from .resample import resample_quaternions_wxyz, resample_vectors
 from .schema import HoldenClip, SkeletonSpec, SourceClip

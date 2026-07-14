@@ -34,3 +34,24 @@ controller: $(SOURCE) $(HEADER)
 
 clean:
 	rm controller$(EXT)
+
+CXX ?= g++
+CPP_TEST_FLAGS ?= -std=c++17 -Wall -Wextra -Werror -pedantic -I.
+CPP_TEST_DIR := build/tests
+CPP_TEST_BINS := $(CPP_TEST_DIR)/test_g1_skeleton
+
+.PHONY: test-python test-cpp test-interaction
+
+$(CPP_TEST_DIR):
+	mkdir -p $@
+
+$(CPP_TEST_DIR)/test_g1_skeleton: tests/cpp/test_g1_skeleton.cpp g1_skeleton.h | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) $< -o $@
+
+test-python:
+	python -m unittest discover -s tests/python -t . -v
+
+test-cpp: $(CPP_TEST_BINS)
+	@for test_bin in $(CPP_TEST_BINS); do $$test_bin || exit 1; done
+
+test-interaction: test-python test-cpp
