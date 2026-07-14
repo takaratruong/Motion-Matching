@@ -98,6 +98,43 @@ static void check_centerline_snapshot_bits_equal(
     }
 }
 
+static float expected_centerline_relative_value(
+    float sample_height, float base_height)
+{
+    const double difference =
+        static_cast<double>(sample_height) -
+        static_cast<double>(base_height);
+    return static_cast<float>(difference);
+}
+
+static void check_centerline_latch_matches_sweep(
+    const terrain_centerline_snapshot& snapshot,
+    const heightfield& field,
+    vec3 query_root,
+    int first_latched,
+    const walkability_sweep_result& expected_sweep,
+    const char* message)
+{
+    const float safe_height = heightfield_sample_v2(
+        field, expected_sweep.point.x, expected_sweep.point.z);
+    const float base_height = heightfield_sample_v2(
+        field, query_root.x, query_root.z);
+    const float expected_value = expected_centerline_relative_value(
+        safe_height, base_height);
+    const vec3 expected_point(
+        expected_sweep.point.x, safe_height, expected_sweep.point.z);
+    for (int i = first_latched; i < 4; ++i) {
+        check_float_bits(
+            snapshot.values[i], float_bits(expected_value), message);
+        check_vec3_bits(
+            snapshot.points[i],
+            float_bits(expected_point.x),
+            float_bits(expected_point.y),
+            float_bits(expected_point.z),
+            message);
+    }
+}
+
 static quat heading_positive_x()
 {
     return quat_from_angle_axis(0.5f * PIf, vec3(0.0f, 1.0f, 0.0f));
@@ -2955,29 +2992,19 @@ static void check_centerline_walkability_latch(bool rising_ramp)
         float_bits(raw.points[0].y),
         float_bits(raw.points[0].z),
         "clear centerline point remains bit-identical");
-    check(filtered.points[1].x < raw.points[1].x,
-          "first blocked centerline sample moves to the last safe point");
-    const float safe_height = heightfield_sample_v2(
-        field, filtered.points[1].x, filtered.points[1].z);
-    const float base_height = heightfield_sample_v2(
-        field, query_root.x, query_root.z);
-    check_float_bits(
-        filtered.points[1].y, float_bits(safe_height),
-        "latched marker uses a direct v2 surface sample");
-    check_close(
-        filtered.values[1], safe_height - base_height,
-        "latched feature stays relative to the animation query root");
-    for (int i = 2; i < 4; ++i) {
-        check_float_bits(
-            filtered.values[i], float_bits(filtered.values[1]),
-            "later blocked centerline values repeat the latch");
-        check_vec3_bits(
-            filtered.points[i],
-            float_bits(filtered.points[1].x),
-            float_bits(filtered.points[1].y),
-            float_bits(filtered.points[1].z),
-            "later blocked centerline points repeat the latch");
-    }
+    const walkability_sweep_result expected_sweep = walkability_sweep(
+        grid, field, raw.points[0], raw.points[1], 0.20f);
+    check(expected_sweep.blocked &&
+              expected_sweep.reason == walkability_blocked_cell,
+          "centerline wall/ramp sweep reaches a blocked cell");
+    check(float_bits(expected_sweep.point.x) !=
+                  float_bits(raw.points[0].x) ||
+              float_bits(expected_sweep.point.z) !=
+                  float_bits(raw.points[0].z),
+          "wall/ramp last-safe point advances beyond the earlier sample");
+    check_centerline_latch_matches_sweep(
+        filtered, field, query_root, 1, expected_sweep,
+        "wall/ramp latch equals the exact direct sweep result");
 }
 
 static void test_centerline_walkability_latches_wall_and_ramp()
@@ -3103,6 +3130,142 @@ static void test_centerline_walkability_invalid_inputs_are_transactional()
             float_bits(root_height), float_bits(root.z),
             "blocked start repeats the query-root surface point");
     }
+}
+
+static void initialize_centerline_planar_contract_fixture(
+    heightfield& field,
+    walkability_grid& grid,
+    int nx)
+{
+    initialize_heightfield(
+        field, nx, 101, -1.0f, -1.0f, 0.02f, -3.0f, 2);
+    grid.nx = field.nx;
+    grid.nz = field.nz;
+    grid.cells.resize(field.nx * field.nz);
+    grid.cells.set(1);
+    for (int z = 0; z < field.nz; ++z) {
+        for (int x = 0; x < field.nx; ++x) {
+            const float world_x =
+                field.origin_x + field.cell_size * static_cast<float>(x);
+            const float world_z =
+                field.origin_z + field.cell_size * static_cast<float>(z);
+            field.heights(z * field.nx + x) =
+                0.60f + 0.40f * world_x + 0.15f * world_z;
+        }
+    }
+}
+
+static void test_centerline_walkability_separates_query_and_footprint_roots()
+{
+    heightfield field;
+    walkability_grid grid;
+    initialize_centerline_planar_contract_fixture(field, grid, 151);
+    for (int z = 0; z < field.nz; ++z) {
+        for (int x = 0; x < field.nx; ++x) {
+            const float world_x =
+                field.origin_x + field.cell_size * static_cast<float>(x);
+            const float world_z =
+                field.origin_z + field.cell_size * static_cast<float>(z);
+            if (world_x >= -0.22f && world_x <= 0.22f &&
+                world_z >= -0.02f && world_z <= 0.02f) {
+                grid.cells(z * grid.nx + x) = 0;
+            }
+        }
+    }
+
+    const vec3 query_root(0.0f, 3.0f, 0.35f);
+    const vec3 footprint_origin(-0.35f, -4.0f, -0.35f);
+    check(float_bits(query_root.x) != float_bits(footprint_origin.x) &&
+              float_bits(query_root.z) != float_bits(footprint_origin.z),
+          "query and footprint roots differ in both planar coordinates");
+    const float query_base = heightfield_sample_v2(
+        field, query_root.x, query_root.z);
+    const float footprint_surface = heightfield_sample_v2(
+        field, footprint_origin.x, footprint_origin.z);
+    check(float_bits(query_base) != float_bits(footprint_surface),
+          "animation-root base is distinguishable from footprint terrain");
+
+    terrain_centerline_snapshot raw = {};
+    compute_stationary_centerline_snapshot(
+        raw, field, query_root, heading_positive_x());
+    const walkability_sweep_result swapped_origin_sweep = walkability_sweep(
+        grid, field, query_root, raw.points[0], 0.20f);
+    check(!swapped_origin_sweep.blocked,
+          "animation-root-to-sample sweep remains clear");
+    const walkability_sweep_result expected_sweep = walkability_sweep(
+        grid, field, footprint_origin, raw.points[0], 0.20f);
+    check(expected_sweep.blocked &&
+              expected_sweep.reason == walkability_blocked_cell,
+          "footprint-origin-to-sample sweep reaches the blocker");
+    const float safe_height = heightfield_sample_v2(
+        field, expected_sweep.point.x, expected_sweep.point.z);
+    const float query_relative = expected_centerline_relative_value(
+        safe_height, query_base);
+    const float footprint_relative = expected_centerline_relative_value(
+        safe_height, footprint_surface);
+    check(float_bits(query_relative) != float_bits(footprint_relative),
+          "latched value distinguishes animation and footprint bases");
+    check(float_bits(expected_sweep.point.x) !=
+                  float_bits(footprint_origin.x) ||
+              float_bits(expected_sweep.point.z) !=
+                  float_bits(footprint_origin.z),
+          "distinct-root sweep advances before reaching the blocker");
+
+    terrain_centerline_snapshot filtered = raw;
+    check(terrain_centerline_snapshot_apply_walkability_v2(
+              filtered, field, grid, query_root, footprint_origin, 0.20f),
+          "distinct-root centerline filtering succeeds");
+    check_centerline_latch_matches_sweep(
+        filtered, field, query_root, 0, expected_sweep,
+        "distinct-root latch uses footprint sweep and animation base");
+}
+
+static void test_centerline_walkability_latches_out_of_bounds_segment()
+{
+    heightfield field;
+    walkability_grid grid;
+    initialize_centerline_planar_contract_fixture(field, grid, 93);
+    const vec3 query_root(0.0f, 2.0f, 0.0f);
+    const vec3 footprint_origin(-0.10f, -2.0f, 0.05f);
+    terrain_centerline_snapshot raw = {};
+    compute_stationary_centerline_snapshot(
+        raw, field, query_root, heading_positive_x());
+
+    const walkability_sweep_result first = walkability_sweep(
+        grid, field, footprint_origin, raw.points[0], 0.20f);
+    const walkability_sweep_result second = walkability_sweep(
+        grid, field, raw.points[0], raw.points[1], 0.20f);
+    const walkability_sweep_result expected_sweep = walkability_sweep(
+        grid, field, raw.points[1], raw.points[2], 0.20f);
+    check(!first.blocked && !second.blocked,
+          "out-of-bounds fixture preserves its first two segments");
+    check(expected_sweep.blocked &&
+              expected_sweep.reason == walkability_out_of_bounds,
+          "third centerline segment exits the grid footprint bounds");
+    check(float_bits(expected_sweep.point.x) !=
+                  float_bits(raw.points[1].x) ||
+              float_bits(expected_sweep.point.z) !=
+                  float_bits(raw.points[1].z),
+          "out-of-bounds last-safe point advances beyond the prior sample");
+
+    terrain_centerline_snapshot filtered = raw;
+    check(terrain_centerline_snapshot_apply_walkability_v2(
+              filtered, field, grid, query_root, footprint_origin, 0.20f),
+          "out-of-bounds centerline filtering succeeds");
+    for (int i = 0; i < 2; ++i) {
+        check_float_bits(
+            filtered.values[i], float_bits(raw.values[i]),
+            "clear pre-boundary value remains bit-identical");
+        check_vec3_bits(
+            filtered.points[i],
+            float_bits(raw.points[i].x),
+            float_bits(raw.points[i].y),
+            float_bits(raw.points[i].z),
+            "clear pre-boundary point remains bit-identical");
+    }
+    check_centerline_latch_matches_sweep(
+        filtered, field, query_root, 2, expected_sweep,
+        "out-of-bounds latch equals the exact direct sweep result");
 }
 
 static void test_v2_centerline_uses_checked_triangular_height_samples()
@@ -3560,6 +3723,8 @@ int main(int argc, char** argv)
     test_centerline_walkability_latches_wall_and_ramp();
     test_centerline_walkability_preserves_clear_classes_and_recovers();
     test_centerline_walkability_invalid_inputs_are_transactional();
+    test_centerline_walkability_separates_query_and_footprint_roots();
+    test_centerline_walkability_latches_out_of_bounds_segment();
     test_v2_centerline_uses_checked_triangular_height_samples();
     test_centerline_uses_root_skips_flat_repeats_and_latest_heading();
     test_centerline_query_uses_heightfield_exterior_at_boundary();
