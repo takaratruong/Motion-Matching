@@ -219,7 +219,6 @@ _ROOT_FILE_LIMITS = {
     "scenes/index.json": _MAX_SCENE_JSON_BYTES,
     "validation.json": _MAX_VALIDATION_BYTES,
 }
-_LEGACY_OBJ_INDEX = re.compile(r"[1-9][0-9]*\Z")
 
 
 def _require(condition, contract):
@@ -2191,378 +2190,19 @@ def _expected_procedural_scenes():
     )
 
 
-def _read_legacy_json(path, maximum_size, label):
-    def object_without_duplicates(pairs):
-        output = {}
-        for key, value in pairs:
-            if key in output:
-                raise ValueError(f"duplicate JSON key {key!r}")
-            output[key] = value
-        return output
-
-    try:
-        payload = _read_regular_bytes(path, maximum_size, label)
-        value = json.loads(
-            payload.decode("utf-8"),
-            object_pairs_hook=object_without_duplicates,
-            parse_constant=lambda token: (_ for _ in ()).throw(
-                ValueError(f"non-finite JSON value {token}")),
-        )
-    except (
-        OSError, UnicodeError, json.JSONDecodeError, ValueError, RecursionError,
-    ) as error:
-        raise ValueError(f"{os.path.basename(path)} is invalid JSON: {error}") \
-            from error
-    _validate_json_complexity(value, label)
-    return value
-
-
-def _peek_manifest_schema(root):
-    try:
-        root_node = os.lstat(root)
-    except OSError as error:
-        raise ValueError("artifact directory does not exist") from error
-    _require(stat.S_ISDIR(root_node.st_mode),
-             "artifact directory does not exist or is a symlink")
-    manifest = _read_legacy_json(
-        os.path.join(root, "manifest.json"), _MAX_MANIFEST_BYTES,
-        "manifest JSON")
-    _require(type(manifest) is dict, "manifest.json root must be an object")
-    schema = manifest.get("schema")
-    _require(type(schema) is str, "manifest schema must be a string")
-    return schema, manifest
-
-
-def _legacy_int(value, label, minimum=0):
-    _require(type(value) is int, f"{label} must be an integer")
-    _require(value >= minimum, f"{label} must be at least {minimum}")
-    return value
-
-
-def _legacy_number(value, label):
-    _require(type(value) in (int, float), f"{label} must be numeric")
-    result = float(value)
-    _require(np.isfinite(result), f"{label} must be finite")
-    return result
-
-
-def _legacy_validate_skeleton(manifest, database):
-    skeleton = manifest.get("skeleton")
-    _require(type(skeleton) is dict, "skeleton must be an object")
-    names = skeleton.get("names")
-    parents = skeleton.get("parents")
-    _require(type(names) is list and len(names) == FEATURE_DIMENSIONS,
-             "skeleton names must contain 31 bones")
-    _require(all(type(name) is str and name for name in names),
-             "skeleton names must be non-empty strings")
-    _require(len(set(names)) == len(names), "skeleton names must be unique")
-    _require(names[0] == "Simulation",
-             "skeleton first bone must be Simulation")
-    _require(type(parents) is list and len(parents) == len(names)
-             and all(type(value) is int for value in parents),
-             "skeleton parents must contain one integer per bone")
-    _require(parents == np.asarray(database.parents, np.int64).tolist(),
-             "skeleton parents do not match database.bin")
-    _require(skeleton.get("signature") == _manifest_signature(names, parents),
-             "skeleton signature does not match names and parents")
-    _require(database.positions.shape[1] == len(names),
-             "database.bin bone count does not match skeleton names")
-    return names
-
-
-def _legacy_validate_sources(manifest, database):
-    sources = manifest.get("sources")
-    _require(type(sources) is list and sources, "sources must be non-empty")
-    total = _legacy_int(manifest.get("total_clips"), "total_clips", 1)
-    grail = _legacy_int(manifest.get("grail_clips"), "grail_clips")
-    skipped = _legacy_int(manifest.get("skipped_clips"), "skipped_clips")
-    frames = _legacy_int(manifest.get("database_frames"), "database_frames", 1)
-    _require(total <= _MAX_CLIPS and frames <= _MAX_FRAMES,
-             "legacy corpus counts exceed canonical bounds")
-    _require(skipped == 0, "skipped_clips must be zero")
-    _require(total == len(sources), "total_clips does not match sources")
-    _require(grail == total - 1,
-             "grail_clips must count every source after Takara")
-    _require(frames == len(database.positions),
-             "database_frames does not match database.bin")
-    _require(type(manifest.get("diagnostic_mode")) is bool,
-             "diagnostic_mode must be boolean")
-    _require(len(database.range_starts) == total,
-             "database.bin range count does not match total_clips")
-    cursor = 0
-    seen = set()
-    for index, source in enumerate(sources):
-        label = f"sources[{index}]"
-        _require(type(source) is dict, f"{label} must be an object")
-        name = source.get("name")
-        terrain_id = source.get("terrain_id")
-        _require(type(name) is str and name, f"{label} name is invalid")
-        _require(name not in seen, f"duplicate source name {name}")
-        seen.add(name)
-        _require(type(terrain_id) is str and terrain_id,
-                 f"{label} terrain_id is invalid")
-        if index == 0:
-            _require(name == "takara_walk_50hz", "first source must be Takara")
-            _require(terrain_id == "flat", "Takara terrain_id must be flat")
-        else:
-            _require(terrain_id == name, f"{label} terrain_id must match name")
-        fps = _legacy_number(source.get("source_fps"), f"{label} source_fps")
-        _require(fps > 0.0, f"{label} source_fps must be positive")
-        source_frames = _legacy_int(
-            source.get("source_frames"), f"{label} source_frames", 1)
-        output_frames = _legacy_int(
-            source.get("output_frames"), f"{label} output_frames", 1)
-        start = _legacy_int(source.get("range_start"), f"{label} range_start")
-        stop = _legacy_int(source.get("range_stop"), f"{label} range_stop", 1)
-        _require(output_frames == _expected_output_frames(source_frames, fps),
-                 f"{label} output_frames violates the 25 Hz duration contract")
-        _require(start == cursor, f"{label} range_start is not contiguous")
-        _require(stop == start + output_frames,
-                 f"{label} range_stop does not match output_frames")
-        _require(int(database.range_starts[index]) == start
-                 and int(database.range_stops[index]) == stop,
-                 f"{label} range does not match database.bin")
-        source_map = source.get("source_frame_map")
-        _require(type(source_map) is list
-                 and len(source_map) == output_frames
-                 and all(type(value) is int for value in source_map),
-                 f"{label} source frame map must contain integer indices")
-        expected = np.rint(
-            np.arange(output_frames, dtype=np.float64) / OUTPUT_FPS * fps,
-        ).astype(np.int64)
-        expected = np.clip(expected, 0, source_frames - 1).tolist()
-        _require(source_map == expected,
-                 f"{label} source frame map content violates 25 Hz provenance")
-        cursor = stop
-    _require(cursor == len(database.positions),
-             "source ranges do not cover database.bin frames")
-    return sources
-
-
-def _legacy_validate_parameters(manifest, clip_count):
-    contact = manifest.get("contact")
-    _require(type(contact) is dict, "contact must be an object")
-    _require(contact.get("speed_threshold") == 0.15,
-             "contact speed_threshold must be 0.15")
-    _require(contact.get("height_threshold") == 0.06,
-             "contact height_threshold must be 0.06")
-    _require(contact.get("median_filter_frames") == 3,
-             "contact median_filter_frames must be 3")
-    terrain = manifest.get("terrain")
-    _require(type(terrain) is dict, "terrain must be an object")
-    _require(terrain.get("distances_m") == [0.25, 0.5, 0.75, 1.0],
-             "terrain distances_m must be [0.25, 0.5, 0.75, 1.0]")
-    _require(terrain.get("coordinate_mapping")
-             == "mujoco_xyz_to_holden_x_z_neg_y",
-             "terrain coordinate_mapping is unsupported")
-    _require(type(terrain.get("runtime_base")) is str
-             and terrain["runtime_base"],
-             "terrain runtime_base must be a non-empty string")
-    _require(terrain.get("cell_size_m") == 0.02,
-             "terrain cell_size_m must be 0.02")
-    _require(terrain.get("border_m") == 2.0,
-             "terrain border_m must be 2.0")
-    validation = manifest.get("validation")
-    _require(type(validation) is dict, "validation must be an object")
-    limits = {
-        "fk_max_error_m": 0.001,
-        "duration_error_s": 1.0 / OUTPUT_FPS + 1e-12,
-        "quaternion_norm_max_error": 1e-4,
-    }
-    for name, limit in limits.items():
-        values = validation.get(name)
-        _require(type(values) is list and len(values) == clip_count,
-                 f"validation {name} must contain one value per clip")
-        numbers = [
-            _legacy_number(value, f"validation {name}[{index}]")
-            for index, value in enumerate(values)
-        ]
-        _require(all(0.0 <= value <= limit for value in numbers),
-                 f"validation {name} exceeds {limit}")
-    return terrain
-
-
-def _legacy_parse_heightfield(path, metadata, schema_cell_size):
-    payload = _read_regular_bytes(
-        path, _HEIGHTFIELD_HEADER.size + 4 * _MAX_GRID_CELLS,
-        "legacy terrain.bin")
-    _require(len(payload) >= _HEIGHTFIELD_HEADER.size,
-             "terrain.bin has a truncated G1HF header")
-    magic, version, nx, nz, ox, oz, cell, exterior = \
-        _HEIGHTFIELD_HEADER.unpack_from(payload)
-    _require(magic == b"G1HF", "terrain.bin magic must be G1HF")
-    _require(version == 1, "terrain.bin G1HF version must be 1")
-    _require(2 <= nx <= _MAX_GRID_AXIS and 2 <= nz <= _MAX_GRID_AXIS,
-             "terrain.bin G1HF dimensions must be >= 2")
-    _require(nx * nz <= _MAX_GRID_CELLS,
-             "terrain.bin G1HF dimensions exceed canonical bounds")
-    _require(np.isfinite([ox, oz, cell, exterior]).all(),
-             "terrain.bin G1HF header values must be finite")
-    _require(cell > 0.0, "terrain.bin G1HF cell size must be positive")
-    _require(len(payload) == _HEIGHTFIELD_HEADER.size + nx * nz * 4,
-             "terrain.bin G1HF payload length does not match nx*nz float32 values")
-    heights = np.frombuffer(payload, "<f4", nx * nz, 32)
-    _require(np.isfinite(heights).all(),
-             "terrain.bin G1HF heights must be finite")
-    expected_keys = {
-        "nx", "nz", "origin_x", "origin_z", "cell_size", "exterior_height",
-    }
-    _require(type(metadata) is dict and set(metadata) == expected_keys,
-             "terrain heightfield metadata fields are incomplete")
-    _require(metadata["nx"] == nx, "terrain heightfield nx mismatch")
-    _require(metadata["nz"] == nz, "terrain heightfield nz mismatch")
-    for key, actual in (
-        ("origin_x", ox), ("origin_z", oz),
-        ("cell_size", cell), ("exterior_height", exterior),
-    ):
-        expected = _legacy_number(metadata[key], f"terrain heightfield {key}")
-        _require(np.isclose(expected, actual, rtol=1e-6, atol=1e-6),
-                 f"terrain heightfield {key} mismatch")
-    _require(metadata["cell_size"] == schema_cell_size
-             and cell == float(np.float32(schema_cell_size)),
-             "terrain heightfield cell size must match terrain cell_size_m")
-    _require(metadata["exterior_height"] == 0.0 and exterior == 0.0,
-             "terrain heightfield exterior height must be 0.0")
-    return (
-        float(ox), float(ox + (nx - 1) * cell),
-        float(oz), float(oz + (nz - 1) * cell),
-    )
-
-
-def _legacy_parse_obj(path):
-    payload = _read_regular_bytes(path, _MAX_OBJ_BYTES, "legacy terrain.obj")
-    try:
-        lines = payload.decode("utf-8").splitlines()
-    except UnicodeError as error:
-        raise ValueError(f"terrain.obj cannot be read: {error}") from error
-    vertices = []
-    faces = []
-    for number, line in enumerate(lines, 1):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        fields = stripped.split()
-        if fields[0] == "v":
-            _require(len(fields) == 4,
-                     f"terrain.obj line {number}: vertex must contain three values")
-            try:
-                vertex = tuple(float(value) for value in fields[1:])
-            except ValueError as error:
-                raise ValueError(
-                    f"terrain.obj line {number}: invalid vertex") from error
-            _require(np.isfinite(vertex).all(),
-                     f"terrain.obj line {number}: vertex must be finite")
-            vertices.append(vertex)
-        elif fields[0] == "f":
-            _require(len(fields) >= 4,
-                     f"terrain.obj line {number}: face needs at least three vertices")
-            _require(all(_LEGACY_OBJ_INDEX.fullmatch(value)
-                         for value in fields[1:]),
-                     f"terrain.obj line {number}: faces require one-based indices")
-            face = tuple(int(value) for value in fields[1:])
-            _require(len(set(face)) >= 3,
-                     f"terrain.obj line {number}: face is degenerate")
-            faces.append((number, face))
-        else:
-            raise ValueError(
-                f"terrain.obj line {number}: malformed record {fields[0]!r}")
-    _require(vertices, "terrain.obj must contain vertices")
-    _require(faces, "terrain.obj must contain faces")
-    for number, face in faces:
-        _require(max(face) <= len(vertices),
-                 f"terrain.obj line {number}: face index exceeds vertex count")
-    positions = np.asarray(vertices, np.float64)
-    return (
-        float(positions[:, 0].min()), float(positions[:, 0].max()),
-        float(positions[:, 2].min()), float(positions[:, 2].max()),
-    )
-
-
-def _legacy_validate_coverage(heightfield, obj, border):
-    scale = max(1.0, abs(border),
-                *(abs(value) for value in heightfield),
-                *(abs(value) for value in obj))
-    tolerance = 8.0 * float(np.finfo(np.float32).eps) * scale
-    hxmin, hxmax, hzmin, hzmax = heightfield
-    oxmin, oxmax, ozmin, ozmax = obj
-    _require(hxmin <= oxmin - border + tolerance
-             and hxmax >= oxmax + border - tolerance
-             and hzmin <= ozmin - border + tolerance
-             and hzmax >= ozmax + border - tolerance,
-             "terrain.bin domain does not cover terrain.obj XZ bounds plus terrain.border_m")
-
-
-def _validate_legacy_v1(root, manifest):
-    required = (
-        "database.bin", "terrain_features.bin", "manifest.json",
-        "validation.json", "terrain.bin", "terrain.obj",
-    )
-    for name in required:
-        path = os.path.join(root, name)
-        try:
-            node = os.lstat(path)
-        except OSError as error:
-            raise ValueError(f"missing {name}") from error
-        _require(stat.S_ISREG(node.st_mode), f"missing {name}")
-    _require(manifest.get("schema") == "g1-terrain-artifacts/v1",
-             "schema must be g1-terrain-artifacts/v1")
-    _require(manifest.get("output_fps") == OUTPUT_FPS,
-             "output_fps must be 25.0")
-    _require(manifest.get("feature_dimensions") == FEATURE_DIMENSIONS,
-             "feature_dimensions must be 31")
-    _require(manifest.get("terrain_dimensions") == TERRAIN_DIMENSIONS,
-             "terrain_dimensions must be 4")
-    validation_file = _read_legacy_json(
-        os.path.join(root, "validation.json"), _MAX_VALIDATION_BYTES,
-        "legacy validation JSON")
-    _require(validation_file == manifest.get("validation"),
-             "validation.json does not match manifest validation")
-    database = _load_database(os.path.join(root, "database.bin"))
-    features = _load_terrain_features(os.path.join(root, "terrain_features.bin"))
-    database.terrain_features = features
-    try:
-        database.validate()
-    except (TypeError, ValueError) as error:
-        raise ValueError(f"ArtifactSet validation failed: {error}") from error
-    _require(len(database.positions) == len(features),
-             "database.bin and terrain_features.bin frame counts differ")
-    names = _legacy_validate_skeleton(manifest, database)
-    sources = _legacy_validate_sources(manifest, database)
-    terrain = _legacy_validate_parameters(manifest, len(sources))
-    quaternion_error = float(np.max(np.abs(
-        np.linalg.norm(database.rotations, axis=-1) - 1.0)))
-    _require(quaternion_error <= 1e-4,
-             f"database.bin quaternion norm error {quaternion_error} exceeds 0.0001")
-    heightfield = _legacy_parse_heightfield(
-        os.path.join(root, "terrain.bin"), terrain.get("heightfield"),
-        float(terrain["cell_size_m"]))
-    obj = _legacy_parse_obj(os.path.join(root, "terrain.obj"))
-    _legacy_validate_coverage(heightfield, obj, float(terrain["border_m"]))
-    return {
-        "frames": len(database.positions),
-        "clips": len(sources),
-        "bones": len(names),
-    }
-
-
-def _validate_dispatched(
+def validate_artifact_directory(
     artifact_dir, full_source_validation=False, source_options=None,
 ):
     _require(type(full_source_validation) is bool,
              "full_source_validation must be an exact boolean")
     root = os.path.abspath(os.fspath(artifact_dir))
-    schema, peeked_manifest = _peek_manifest_schema(root)
-    if schema == "g1-terrain-artifacts/v1":
-        _require(not full_source_validation,
-                 "full source validation requires v2 artifacts")
-        # Temporary compatibility bridge. Task 11B migrates the production
-        # builder to v2 and removes this dispatch with the publisher bridge.
-        return schema, _validate_legacy_v1(root, peeked_manifest)
-    _require(schema == SCHEMA, f"schema must be {SCHEMA}")
     _validate_exact_file_tree(root)
     manifest = _read_json(
         os.path.join(root, "manifest.json"), _MAX_MANIFEST_BYTES,
         "manifest JSON")
+    _require(
+        type(manifest) is dict and manifest.get("schema") == SCHEMA,
+        f"schema must be {SCHEMA}")
     _validate_manifest_header(manifest)
     database_entry, features_entry, support_entry, index_entry, validation_entry = \
         _validate_motion_descriptors(root, manifest)
@@ -2648,20 +2288,13 @@ def _validate_dispatched(
         source_rows = _validate_all_source_rows(
             manifest, database, scenes, source_options,
             progress=_full_source_progress)
-    return schema, {
+    return {
         "frames": frames,
         "clips": len(sources),
         "bones": len(names),
         "scenes": len(scenes),
         "source_rows": source_rows,
     }
-
-
-def validate_artifact_directory(
-    artifact_dir, full_source_validation=False, source_options=None,
-):
-    return _validate_dispatched(
-        artifact_dir, full_source_validation, source_options)[1]
 
 
 def _parser():
@@ -2688,17 +2321,16 @@ def main(argv=None):
         }.items() if value is not None
     }
     try:
-        reported_schema, summary = _validate_dispatched(
+        summary = validate_artifact_directory(
             path, args.full_source_validation, source_options)
     except Exception as error:
         print(f"INVALID {path}: {error}", file=sys.stderr)
         return 1
     print(
-        f"VALID {reported_schema} frames={summary['frames']} clips={summary['clips']} "
+        f"VALID {SCHEMA} frames={summary['frames']} clips={summary['clips']} "
         f"bones={summary['bones']} terrain_dims={TERRAIN_DIMENSIONS}"
-        + (f" support_dims={SUPPORT_DIMENSIONS} scenes={summary['scenes']} "
-           f"source_rows={summary['source_rows']}"
-           if reported_schema == SCHEMA else ""))
+        f" support_dims={SUPPORT_DIMENSIONS} scenes={summary['scenes']} "
+        f"source_rows={summary['source_rows']}")
     return 0
 
 

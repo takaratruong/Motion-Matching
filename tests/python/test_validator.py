@@ -957,13 +957,13 @@ class FullSourceSeamTests(unittest.TestCase):
             "--remap", "/tmp/remap.npy",
         ]
         with mock.patch.object(
-            validator_module, "_validate_dispatched",
-            return_value=(validator_module.SCHEMA, summary),
-        ) as dispatched, redirect_stdout(stdout), redirect_stderr(stderr):
+            validator_module, "validate_artifact_directory",
+            return_value=summary,
+        ) as validate, redirect_stdout(stdout), redirect_stderr(stderr):
             status = validator_module.main(arguments)
 
         self.assertEqual(status, 0)
-        dispatched.assert_called_once_with(
+        validate.assert_called_once_with(
             "/tmp/full-artifact", True, {
                 "grail_glob": "/tmp/grail/*.pkl",
                 "g1_xml": "/tmp/g1.xml",
@@ -1164,6 +1164,18 @@ class ValidatorTests(unittest.TestCase):
                 source_options=UninspectableSourceOptions()),
             self._expected_summary())
 
+    def test_v1_artifact_set_manifest_is_rejected_without_dispatch(self):
+        manifest_path = self._path("manifest.json")
+        manifest = _load_json(manifest_path)
+        manifest["schema"] = "g1-terrain-artifacts/v1"
+        _write_json(manifest_path, manifest)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"^schema must be g1-terrain-artifacts/v2$",
+        ):
+            validate_artifact_directory(self.output)
+
     def test_full_source_runs_after_normal_gates_with_loaded_v2_objects(self):
         options = {"g1_xml": "/tmp/test-g1.xml"}
         observed = {}
@@ -1212,7 +1224,7 @@ class ValidatorTests(unittest.TestCase):
             stderr.getvalue(),
             "FULL-SOURCE recompute 1/1 fixture-source\n")
 
-    def test_v2_cli_reports_the_single_dispatched_schema_and_dimensions(self):
+    def test_v2_cli_reports_the_fixed_schema_and_dimensions(self):
         stdout = io.StringIO()
         stderr = io.StringIO()
         with redirect_stdout(stdout), redirect_stderr(stderr):

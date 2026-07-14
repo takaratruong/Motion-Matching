@@ -35,7 +35,6 @@ _HEX_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _SCENE_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
 _AT_FDCWD = -100
 _RENAME_EXCHANGE = 2
-_LEGACY_DISPATCH = object()
 
 MOTION_MANIFEST_KEYS = {
     "schema", "output_fps", "feature_dimensions", "terrain_dimensions",
@@ -909,74 +908,6 @@ def _remove_owned_scratch(path, expected_identity):
     _remove_path(path)
 
 
-def _normalized_manifest(manifest: dict) -> dict:
-    if not isinstance(manifest, dict):
-        raise ValueError("manifest must be a JSON object")
-    if not isinstance(manifest.get("validation"), dict):
-        raise ValueError("manifest must contain a validation object")
-    try:
-        encoded = json.dumps(
-            manifest, sort_keys=True, allow_nan=False, separators=(",", ":")
-        )
-        normalized = json.loads(encoded)
-    except (TypeError, ValueError) as error:
-        raise ValueError(
-            f"manifest must contain finite valid JSON: {error}"
-        ) from error
-    return normalized
-
-
-def _load_staged_json(path: str, expected: dict) -> None:
-    try:
-        with open(path, encoding="utf-8") as stream:
-            actual = json.load(stream)
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise ValueError(f"invalid staged {os.path.basename(path)}") from error
-    if actual != expected:
-        raise ValueError(
-            f"staged {os.path.basename(path)} does not match requested data"
-        )
-
-
-def _validate_staged_artifacts(
-    staging: str, artifacts: ArtifactSet, manifest: dict
-) -> None:
-    for required in ("terrain.bin", "terrain.obj"):
-        if not os.path.isfile(os.path.join(staging, required)):
-            raise ValueError(f"terrain writer did not create {required}")
-
-    loaded = read_holden_database(os.path.join(staging, "database.bin"))
-    loaded.terrain_features = read_terrain_sidecar(
-        os.path.join(staging, "terrain_features.bin")
-    )
-    loaded.terrain_support = read_support_sidecar(
-        os.path.join(staging, "terrain_support.bin")
-    )
-    loaded.validate()
-
-    expected_arrays = (
-        ("positions", "<f4"),
-        ("velocities", "<f4"),
-        ("rotations", "<f4"),
-        ("angular_velocities", "<f4"),
-        ("parents", "<i4"),
-        ("range_starts", "<i4"),
-        ("range_stops", "<i4"),
-        ("contacts", "u1"),
-        ("terrain_features", "<f4"),
-        ("terrain_support", "<f4"),
-    )
-    for name, dtype in expected_arrays:
-        expected = np.ascontiguousarray(getattr(artifacts, name), dtype=dtype)
-        if not np.array_equal(getattr(loaded, name), expected):
-            raise ValueError(f"staged {name} does not match requested artifacts")
-
-    _load_staged_json(os.path.join(staging, "manifest.json"), manifest)
-    _load_staged_json(
-        os.path.join(staging, "validation.json"), manifest["validation"]
-    )
-
-
 def _remove_path(path: str) -> None:
     if not os.path.lexists(path):
         return
@@ -986,82 +917,7 @@ def _remove_path(path: str) -> None:
         os.unlink(path)
 
 
-def _publish_artifacts_v1(
-    output_dir: os.PathLike | str,
-    artifacts: ArtifactSet,
-    manifest: dict,
-    terrain_writer,
-) -> None:
-    manifest = _normalized_manifest(manifest)
-    if not callable(terrain_writer):
-        raise TypeError("terrain_writer must be callable")
-
-    output_dir = os.path.abspath(os.fspath(output_dir))
-    parent = os.path.dirname(output_dir)
-    os.makedirs(parent, exist_ok=True)
-    backup = output_dir + ".previous"
-    if not os.path.lexists(output_dir) and os.path.lexists(backup):
-        os.replace(backup, output_dir)
-    else:
-        _remove_path(backup)
-    staging = tempfile.mkdtemp(prefix=".g1_terrain-", dir=parent)
-    previous_moved = False
-    try:
-        write_holden_database(os.path.join(staging, "database.bin"), artifacts)
-        write_terrain_sidecar(
-            os.path.join(staging, "terrain_features.bin"),
-            artifacts.terrain_features,
-        )
-        write_support_sidecar(
-            os.path.join(staging, "terrain_support.bin"),
-            artifacts.terrain_support,
-        )
-        with open(
-            os.path.join(staging, "manifest.json"), "w", encoding="utf-8"
-        ) as stream:
-            json.dump(manifest, stream, indent=2, sort_keys=True, allow_nan=False)
-        with open(
-            os.path.join(staging, "validation.json"), "w", encoding="utf-8"
-        ) as stream:
-            json.dump(
-                manifest["validation"],
-                stream,
-                indent=2,
-                sort_keys=True,
-                allow_nan=False,
-            )
-
-        terrain_writer(staging)
-        _validate_staged_artifacts(staging, artifacts, manifest)
-
-        if os.path.lexists(output_dir):
-            os.replace(output_dir, backup)
-            previous_moved = True
-        try:
-            os.replace(staging, output_dir)
-        except Exception:
-            if previous_moved and not os.path.lexists(output_dir):
-                os.replace(backup, output_dir)
-                previous_moved = False
-            raise
-        staging = ""
-        if previous_moved:
-            _remove_path(backup)
-            previous_moved = False
-    except Exception:
-        if (
-            previous_moved
-            and os.path.lexists(backup)
-            and not os.path.lexists(output_dir)
-        ):
-            os.replace(backup, output_dir)
-        raise
-    finally:
-        if staging and os.path.lexists(staging):
-            _remove_path(staging)
-
-
-def _publish_artifacts_v2(
+def publish_artifacts(
     output_dir, artifacts, manifest_base, scene_pack, validate_candidate,
 ):
     manifest_base = _normalized_manifest_base(manifest_base)
@@ -1150,24 +1006,3 @@ def _publish_artifacts_v2(
     finally:
         if not committed and not preserve_staging:
             _remove_owned_scratch(staging, staging_identity)
-
-
-def publish_artifacts(
-    output_dir, artifacts, manifest_base, scene_pack,
-    validate_candidate=_LEGACY_DISPATCH,
-):
-    """Publish v2, with a temporary positional four-value v1 bridge.
-
-    The bridge exists only for the repository's current positional v1 caller.
-    Keyword names intentionally follow the five-argument v2 API and do not
-    preserve the retired ``manifest=``/``terrain_writer=`` names.
-    """
-    if validate_candidate is _LEGACY_DISPATCH:
-        if not callable(scene_pack):
-            raise TypeError(
-                "four-argument legacy publication requires a terrain writer")
-        return _publish_artifacts_v1(
-            output_dir, artifacts, manifest_base, scene_pack)
-    return _publish_artifacts_v2(
-        output_dir, artifacts, manifest_base, scene_pack,
-        validate_candidate)
