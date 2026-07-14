@@ -20,6 +20,10 @@ class InteractionPhase(IntEnum):
     HOLD = 4
 
 
+_ARTIFACT_FLOAT_TOLERANCE = 1e-4
+_ARTIFACT_HOLD_CONTACT_SAMPLES = 5
+
+
 @dataclass(frozen=True)
 class SourcePaths:
     sequence_id: str
@@ -581,6 +585,9 @@ class InteractionArtifact:
             (InteractionPhase.HOLD, "hold"),
         )
         source_frames = validated["source_frames"]
+        time_to_contact = validated["time_to_contact"]
+        hand_contacts = validated["hand_contacts"]
+        approach_directions = validated["approach_directions_object"]
         for index, (start, stop) in enumerate(zip(starts, stops)):
             clip_phases = phases[start:stop]
             if np.any(np.diff(clip_phases.astype(np.int16)) < 0):
@@ -602,6 +609,83 @@ class InteractionArtifact:
                     "artifact_source_frames",
                     "source_frames must be nonnegative and nondecreasing "
                     f"within range {index}",
+                )
+
+            clip_time = time_to_contact[start:stop]
+            if np.any(clip_time < -_ARTIFACT_FLOAT_TOLERANCE):
+                raise InteractionValidationError(
+                    "artifact_time_to_contact",
+                    "time_to_contact must be nonnegative within tolerance "
+                    f"in range {index}",
+                )
+            if np.any(
+                np.diff(clip_time.astype(np.float64))
+                > _ARTIFACT_FLOAT_TOLERANCE
+            ):
+                raise InteractionValidationError(
+                    "artifact_time_to_contact",
+                    "time_to_contact must be nonincreasing within tolerance "
+                    f"in range {index}",
+                )
+            contact_or_later = clip_phases >= int(
+                InteractionPhase.CONTACT
+            )
+            if np.any(
+                np.abs(clip_time[contact_or_later])
+                > _ARTIFACT_FLOAT_TOLERANCE
+            ):
+                raise InteractionValidationError(
+                    "artifact_time_to_contact",
+                    "time_to_contact must be zero from CONTACT onward "
+                    f"within tolerance in range {index}",
+                )
+
+            approach = approach_directions[index].astype(np.float64)
+            if abs(float(approach[1])) > _ARTIFACT_FLOAT_TOLERANCE:
+                raise InteractionValidationError(
+                    "artifact_approach_direction",
+                    "approach direction must be horizontal in range "
+                    f"{index}",
+                )
+            approach_norm = float(np.linalg.norm(approach))
+            if abs(approach_norm - 1.0) > _ARTIFACT_FLOAT_TOLERANCE:
+                raise InteractionValidationError(
+                    "artifact_approach_direction",
+                    "approach direction must be unit length in range "
+                    f"{index}",
+                )
+
+            active_hand = int(validated["active_hands"][index])
+            clip_contacts = hand_contacts[start:stop, active_hand]
+            for phase in (InteractionPhase.CONTACT, InteractionPhase.LIFT):
+                if not np.all(
+                    clip_contacts[clip_phases == int(phase)] == 1
+                ):
+                    raise InteractionValidationError(
+                        "artifact_hand_contacts",
+                        f"{phase.name} phase must have active-hand contact "
+                        f"in range {index}",
+                    )
+            hold_indices = np.flatnonzero(
+                clip_phases == int(InteractionPhase.HOLD)
+            )
+            if len(hold_indices) < _ARTIFACT_HOLD_CONTACT_SAMPLES:
+                raise InteractionValidationError(
+                    "artifact_hand_contacts",
+                    "range "
+                    f"{index} must contain at least "
+                    f"{_ARTIFACT_HOLD_CONTACT_SAMPLES} HOLD samples",
+                )
+            if not np.all(
+                clip_contacts[
+                    hold_indices[:_ARTIFACT_HOLD_CONTACT_SAMPLES]
+                ]
+                == 1
+            ):
+                raise InteractionValidationError(
+                    "artifact_hand_contacts",
+                    "first 5 HOLD samples must have active-hand contact "
+                    f"in range {index}",
                 )
 
         for name in (

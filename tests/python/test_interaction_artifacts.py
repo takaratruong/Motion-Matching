@@ -1,44 +1,49 @@
 import copy
+from collections import Counter
 import dataclasses
 import io
 import json
 import os
 from pathlib import Path
+import shutil
 import struct
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 import numpy as np
 
+from resources.g1_interaction_builder import artifacts as artifact_io
 from resources.g1_interaction_builder.artifacts import (
-    DB_MAGIC,
-    ENDIAN_MARKER,
-    FEATURE_MAGIC,
-    VERSION,
+    _read_database,
+    _read_features,
     _write_array,
+    _write_database,
+    _write_features,
     assemble_database,
     read_artifact_set,
     write_artifact_set,
 )
 from resources.g1_interaction_builder.features import (
     FEATURE_GROUPS,
-    build_database_features,
+    build_features,
 )
 from resources.g1_interaction_builder.schema import (
     EvaluationSplit,
     FeatureGroup,
+    FeatureSet,
     G1_SKELETON,
     InteractionArtifact,
+    InteractionPhase,
     InteractionValidationError,
 )
-from resources.g1_interaction_builder.splits import partition_clips
 from resources.g1_terrain_builder.schema import SkeletonSpec
 from tests.python.interaction_fixture import labeled_clips_for_objects
 
 
-DB_HEADER = struct.Struct("<8s8I")
-FEATURE_HEADER = struct.Struct("<8s5I")
+LITERAL_DB_HEADER_BYTES = 40
+LITERAL_FEATURE_HEADER_BYTES = 28
 
 
 def artifact_fixture():
@@ -50,14 +55,15 @@ def artifact_fixture():
         database_objects=("database_fixture_object",),
         heldout_objects=("heldout_fixture_object",),
     )
-    database, _ = partition_clips(clips, split)
-    labeled = database[0]
-    artifact = assemble_database(database, G1_SKELETON)
-    # This production boundary intentionally receives every labeled clip. It
-    # owns filtering so held-out objects cannot affect persisted statistics.
-    features = build_database_features(clips, split, G1_SKELETON)
+    ordered, artifact, features = artifact_io.prepare_artifacts(
+        clips, split, G1_SKELETON
+    )
+    labeled = ordered[0]
     manifest = {
         "schema_version": 1,
+        "source_clips": 2,
+        "included_clips": 2,
+        "rejected_clips": 0,
         "target_fps": 25.0,
         "skeleton_signature": G1_SKELETON.signature(),
         "clips": [
@@ -150,11 +156,13 @@ def snapshot(output: Path) -> dict[str, bytes]:
 
 
 def private_publish_paths(output: Path) -> list[Path]:
-    return sorted(output.parent.glob(f".{output.name}.*-{os.getpid()}"))
+    return sorted(output.parent.glob(f".{output.name}.tmp-*")) + sorted(
+        output.parent.glob(f".{output.name}.previous-*")
+    )
 
 
 def database_offsets(frame_count: int, clip_count: int) -> dict[str, int]:
-    offset = DB_HEADER.size
+    offset = LITERAL_DB_HEADER_BYTES
     fields = (
         ("parents", 31 * 4),
         ("range_starts", clip_count * 4),
@@ -192,9 +200,233 @@ def database_offsets(frame_count: int, clip_count: int) -> dict[str, int]:
 
 
 def expected_feature_size(frame_count: int) -> int:
-    return FEATURE_HEADER.size + 2 * 5 * 4 + 2 * 71 * 4 + (
+    return LITERAL_FEATURE_HEADER_BYTES + 2 * 5 * 4 + 2 * 71 * 4 + (
         frame_count * 71 * 4
     )
+
+
+def _literal_array_bytes(value: np.ndarray, dtype: str) -> bytes:
+    array = np.asarray(
+        value,
+        dtype=np.dtype(dtype).newbyteorder("<"),
+        order="C",
+    )
+    return array.tobytes(order="C")
+
+
+def literal_database_wire(value: InteractionArtifact) -> bytes:
+    frame_count, bone_count = value.positions.shape[:2]
+    clip_count = len(value.range_starts)
+    pieces = [
+        b"G1INTDB1",
+        struct.pack(
+            "<8I",
+            1,
+            0x01020304,
+            25,
+            1,
+            frame_count,
+            bone_count,
+            clip_count,
+            14,
+        ),
+    ]
+    for array, dtype in (
+        (value.parents, "i4"),
+        (value.range_starts, "i4"),
+        (value.range_stops, "i4"),
+        (value.positions, "f4"),
+        (value.velocities, "f4"),
+        (value.rotations, "f4"),
+        (value.angular_velocities, "f4"),
+        (value.foot_contacts, "u1"),
+        (value.hand_contacts, "u1"),
+        (value.hand_dof, "f4"),
+        (value.hand_dof_velocities, "f4"),
+        (value.phases, "u1"),
+        (value.active_hands, "u1"),
+        (value.time_to_contact, "f4"),
+        (value.object_positions, "f4"),
+        (value.object_rotations, "f4"),
+        (value.object_velocities, "f4"),
+        (value.object_angular_velocities, "f4"),
+        (value.table_positions, "f4"),
+        (value.table_rotations, "f4"),
+        (value.table_sizes, "f4"),
+        (value.object_dimensions, "f4"),
+        (value.grasp_positions_object, "f4"),
+        (value.grasp_rotations_object, "f4"),
+        (value.approach_directions_object, "f4"),
+        (value.source_frames, "i4"),
+    ):
+        pieces.append(_literal_array_bytes(array, dtype))
+    return b"".join(pieces)
+
+
+def literal_feature_wire(value: FeatureSet) -> bytes:
+    pieces = [
+        b"G1INTFT1",
+        struct.pack(
+            "<5I",
+            1,
+            0x01020304,
+            len(value.values),
+            71,
+            5,
+        ),
+        struct.pack("<5I", 0, 33, 45, 57, 65),
+        struct.pack("<5I", 33, 45, 57, 65, 71),
+        _literal_array_bytes(value.offsets, "f4"),
+        _literal_array_bytes(value.scales, "f4"),
+        _literal_array_bytes(value.values, "f4"),
+    ]
+    return b"".join(pieces)
+
+
+def wire_oracle_fixture() -> tuple[InteractionArtifact, FeatureSet]:
+    artifact, _, _, _, _ = artifact_fixture()
+    artifact = copy.deepcopy(artifact)
+    artifact.positions.fill(np.float32(1.25))
+    artifact.velocities.fill(np.float32(2.25))
+    artifact.rotations[:] = np.array([1.0, 0.0, 0.0, 0.0], np.float32)
+    artifact.angular_velocities.fill(np.float32(3.25))
+    artifact.foot_contacts.fill(0)
+    artifact.hand_dof.fill(np.float32(4.25))
+    artifact.hand_dof_velocities.fill(np.float32(5.25))
+    artifact.object_positions.fill(np.float32(6.25))
+    artifact.object_rotations[:] = np.array(
+        [0.0, 1.0, 0.0, 0.0], np.float32
+    )
+    artifact.object_velocities.fill(np.float32(7.25))
+    artifact.object_angular_velocities.fill(np.float32(8.25))
+    artifact.table_positions.fill(np.float32(9.25))
+    artifact.table_rotations[:] = np.array(
+        [0.0, 0.0, 1.0, 0.0], np.float32
+    )
+    artifact.table_sizes.fill(np.float32(10.25))
+    artifact.object_dimensions.fill(np.float32(11.25))
+    artifact.grasp_positions_object.fill(np.float32(12.25))
+    artifact.grasp_rotations_object[:] = np.array(
+        [0.0, 0.0, 0.0, 1.0], np.float32
+    )
+    artifact.approach_directions_object[:] = np.array(
+        [0.6, 0.0, 0.8], np.float32
+    )
+    artifact.source_frames[:] = np.arange(
+        37, 37 + len(artifact.source_frames), dtype=np.int32
+    )
+    artifact.validate()
+
+    groups = (
+        FeatureGroup("pose", 0, 33),
+        FeatureGroup("trajectory", 33, 45),
+        FeatureGroup("grasp", 45, 57),
+        FeatureGroup("root_target", 57, 65),
+        FeatureGroup("context", 65, 71),
+    )
+    offsets = (np.arange(71, dtype=np.float32) + np.float32(20.25))
+    scales = (np.arange(71, dtype=np.float32) + np.float32(100.5))
+    values = (
+        np.arange(3 * 71, dtype=np.float32).reshape(3, 71)
+        + np.float32(1000.75)
+    )
+    return artifact, FeatureSet(values, offsets, scales, groups)
+
+
+class GuardedReadStream(io.BytesIO):
+    def __init__(self, value: bytes):
+        super().__init__(value)
+        self.requests: list[int] = []
+
+    def read(self, count: int = -1) -> bytes:
+        if count >= 0:
+            self.requests.append(count)
+            remaining = len(self.getbuffer()) - self.tell()
+            if count > remaining:
+                raise AssertionError(
+                    f"attempted amplified read {count} with {remaining} remaining"
+                )
+        return super().read(count)
+
+
+class GuardedBinaryPath:
+    def __init__(self, value: bytes):
+        self.value = value
+        self.stream = GuardedReadStream(value)
+
+    def stat(self) -> SimpleNamespace:
+        return SimpleNamespace(st_size=len(self.value))
+
+    def open(self, mode: str) -> GuardedReadStream:
+        if mode != "rb":
+            raise AssertionError(f"unexpected mode {mode}")
+        return self.stream
+
+
+def multi_artifact_fixture():
+    clips = labeled_clips_for_objects(
+        ["z_database", "a_database", "heldout_fixture_object"]
+    )
+    split = EvaluationSplit(
+        seed=20260714,
+        database_objects=("a_database", "z_database"),
+        heldout_objects=("heldout_fixture_object",),
+    )
+    ordered, artifact, features = artifact_io.prepare_artifacts(
+        clips, split, G1_SKELETON
+    )
+    manifest_clips = []
+    start = 0
+    for clip in ordered:
+        stop = start + len(clip.motion.positions)
+        manifest_clips.append(
+            {
+                "sequence_id": clip.motion.sequence_id,
+                "object_id": clip.motion.object_id,
+                "range_start": start,
+                "range_stop": stop,
+            }
+        )
+        start = stop
+    manifest = {
+        "schema_version": 1,
+        "source_clips": 3,
+        "included_clips": 3,
+        "rejected_clips": 0,
+        "target_fps": 25.0,
+        "skeleton_signature": G1_SKELETON.signature(),
+        "clips": manifest_clips,
+    }
+    report = {
+        "schema_version": 1,
+        "source_clips": 3,
+        "included_clips": 3,
+        "rejected_clips": 0,
+        "included_frames": len(artifact.positions),
+        "rejections_by_code": {},
+        "rejections": [],
+        "numeric_bounds": {
+            "fk_max_error_m": 0.0,
+            "fk_rotation_max_error_degrees": 0.0,
+            "duration_max_error_s": 0.0,
+            "quaternion_norm_max_error": 0.0,
+        },
+    }
+    return artifact, features, split, manifest, report
+
+
+def rejection_record(
+    sequence_id: str,
+    code: str,
+    stage: str = "source",
+) -> dict[str, str]:
+    return {
+        "sequence_id": sequence_id,
+        "object_id": "rejected_object",
+        "stage": stage,
+        "code": code,
+        "message": f"{code}: actionable detail",
+    }
 
 
 class InteractionArtifactAssemblyTests(unittest.TestCase):
@@ -282,6 +514,62 @@ class InteractionArtifactAssemblyTests(unittest.TestCase):
             value = getattr(artifact, field.name)
             if isinstance(value, np.ndarray):
                 self.assertTrue(value.flags.c_contiguous, field.name)
+
+    def test_prepare_artifacts_filters_and_aligns_one_sorted_database_tuple(
+        self,
+    ):
+        clips = labeled_clips_for_objects(
+            ["z_database", "heldout", "a_database"]
+        )
+        clips[0].motion.positions[:, 0, 0] = 9.0
+        clips[0].motion.object_dimensions[:] = [0.9, 0.8, 0.7]
+        clips[2].motion.positions[:, 0, 0] = 1.0
+        clips[2].motion.object_dimensions[:] = [0.1, 0.2, 0.3]
+        split = EvaluationSplit(
+            seed=20260714,
+            database_objects=("a_database", "z_database"),
+            heldout_objects=("heldout",),
+        )
+
+        ordered, artifact, features = artifact_io.prepare_artifacts(
+            clips, split, G1_SKELETON
+        )
+
+        self.assertEqual(
+            [clip.motion.sequence_id for clip in ordered],
+            sorted(
+                clip.motion.sequence_id
+                for clip in clips
+                if clip.motion.object_id != "heldout"
+            ),
+        )
+        frames = len(ordered[0].motion.positions)
+        np.testing.assert_array_equal(
+            artifact.positions[:frames], ordered[0].motion.positions
+        )
+        np.testing.assert_array_equal(
+            artifact.positions[frames:], ordered[1].motion.positions
+        )
+        expected_features = build_features(ordered, G1_SKELETON)
+        np.testing.assert_array_equal(features.values, expected_features.values)
+        np.testing.assert_array_equal(
+            features.offsets, expected_features.offsets
+        )
+        np.testing.assert_array_equal(features.scales, expected_features.scales)
+
+    def test_prepare_artifacts_rejects_duplicate_sequence_ids(self):
+        clips = labeled_clips_for_objects(["database_a", "database_b", "heldout"])
+        clips[1].motion.sequence_id = clips[0].motion.sequence_id
+        split = EvaluationSplit(
+            seed=20260714,
+            database_objects=("database_a", "database_b"),
+            heldout_objects=("heldout",),
+        )
+
+        with self.assertRaisesRegex(
+            InteractionValidationError, "duplicate sequence_id"
+        ):
+            artifact_io.prepare_artifacts(clips, split, G1_SKELETON)
 
     def test_assembly_rejects_empty_input_and_wrong_skeleton(self):
         with self.assertRaisesRegex(
@@ -384,6 +672,8 @@ class InteractionArtifactAssemblyTests(unittest.TestCase):
         two_ranges.phases[split] = 2
         two_ranges.phases[split + 1] = 3
         two_ranges.phases[split + 2:] = 4
+        two_ranges.time_to_contact[:] = 0.0
+        two_ranges.hand_contacts[:, int(two_ranges.active_hands[0])] = 1
         two_ranges.validate()
 
         cases = (
@@ -426,6 +716,98 @@ class InteractionArtifactAssemblyTests(unittest.TestCase):
                     InteractionValidationError, message
                 ):
                     invalid.validate()
+
+    def test_validate_rejects_invalid_derived_time_and_approach_semantics(self):
+        artifact, _, _, _, _ = artifact_fixture()
+        contact = int(
+            np.flatnonzero(artifact.phases == InteractionPhase.CONTACT)[0]
+        )
+        cases = (
+            (
+                "negative time",
+                lambda value: value.time_to_contact.__setitem__(0, -0.01),
+                "time_to_contact.*nonnegative.*range 0",
+            ),
+            (
+                "increasing time",
+                lambda value: value.time_to_contact.__setitem__(
+                    1, value.time_to_contact[0] + 0.01
+                ),
+                "time_to_contact.*nonincreasing.*range 0",
+            ),
+            (
+                "nonzero after contact",
+                lambda value: value.time_to_contact.__setitem__(contact, 0.01),
+                "time_to_contact.*zero from CONTACT.*range 0",
+            ),
+            (
+                "nonfinite approach",
+                lambda value: value.approach_directions_object.__setitem__(
+                    (0, 0), np.nan
+                ),
+                "approach_directions_object.*non-finite",
+            ),
+            (
+                "vertical approach",
+                lambda value: value.approach_directions_object.__setitem__(
+                    (0, 1), 0.01
+                ),
+                "approach direction.*horizontal.*range 0",
+            ),
+            (
+                "nonunit approach",
+                lambda value: value.approach_directions_object.__setitem__(
+                    0, value.approach_directions_object[0] * 2.0
+                ),
+                "approach direction.*unit.*range 0",
+            ),
+        )
+        for label, mutation, message in cases:
+            with self.subTest(label=label):
+                invalid = copy.deepcopy(artifact)
+                mutation(invalid)
+                with self.assertRaisesRegex(
+                    InteractionValidationError, message
+                ):
+                    invalid.validate()
+
+    def test_validate_rejects_missing_active_contact_through_hold_window(self):
+        artifact, _, _, _, _ = artifact_fixture()
+        active = int(artifact.active_hands[0])
+        contact = np.flatnonzero(artifact.phases == InteractionPhase.CONTACT)
+        lift = np.flatnonzero(artifact.phases == InteractionPhase.LIFT)
+        hold = np.flatnonzero(artifact.phases == InteractionPhase.HOLD)
+        cases = (
+            ("CONTACT", int(contact[0]), "CONTACT.*active-hand contact.*range 0"),
+            ("LIFT", int(lift[0]), "LIFT.*active-hand contact.*range 0"),
+            (
+                "HOLD",
+                int(hold[4]),
+                "first 5 HOLD samples.*active-hand contact.*range 0",
+            ),
+        )
+        for label, frame, message in cases:
+            with self.subTest(label=label):
+                invalid = copy.deepcopy(artifact)
+                invalid.hand_contacts[frame, active] = 0
+                with self.assertRaisesRegex(
+                    InteractionValidationError, message
+                ):
+                    invalid.validate()
+
+        contact_may_end_later = copy.deepcopy(artifact)
+        contact_may_end_later.hand_contacts[int(hold[5]), active] = 0
+        contact_may_end_later.validate()
+
+    def test_validate_accepts_documented_float_tolerance_noise(self):
+        artifact, _, _, _, _ = artifact_fixture()
+        contact_or_later = artifact.phases >= InteractionPhase.CONTACT
+        artifact.time_to_contact[contact_or_later] = np.float32(5e-5)
+        artifact.approach_directions_object[0] = np.array(
+            [np.sqrt(1.0 - 5e-10), 5e-5, 0.0], np.float32
+        )
+
+        artifact.validate()
 
     def test_validate_rejects_invalid_semantics_and_nonfinite_values(self):
         artifact, _, _, _, _ = artifact_fixture()
@@ -562,63 +944,102 @@ class InteractionArtifactSerializationTests(unittest.TestCase):
             metadata[0]["skeleton_signature"], G1_SKELETON.signature()
         )
 
-    def test_binary_headers_sizes_and_little_endian_bytes_are_exact(self):
-        artifact, features, split, manifest, report = artifact_fixture()
-        frame_count = len(artifact.positions)
-        clip_count = len(artifact.range_starts)
+    def test_writer_matches_independent_literal_wire_oracle(self):
+        artifact, features = wire_oracle_fixture()
         with tempfile.TemporaryDirectory() as tmp:
-            output = Path(tmp) / "pack"
-            write_artifact_set(
-                output, artifact, features, split, manifest, report
-            )
-            database = (output / "interaction_database.bin").read_bytes()
-            feature_bytes = (
-                output / "interaction_features.bin"
-            ).read_bytes()
+            database_path = Path(tmp) / "database.bin"
+            feature_path = Path(tmp) / "features.bin"
+            _write_database(database_path, artifact)
+            _write_features(feature_path, features)
 
-        self.assertEqual(DB_HEADER.size, 40)
-        self.assertEqual(FEATURE_HEADER.size, 28)
+            database = database_path.read_bytes()
+            feature_bytes = feature_path.read_bytes()
+
+        expected_database = literal_database_wire(artifact)
+        expected_features = literal_feature_wire(features)
+        self.assertEqual(LITERAL_DB_HEADER_BYTES, 40)
+        self.assertEqual(LITERAL_FEATURE_HEADER_BYTES, 28)
+        self.assertEqual(database, expected_database)
+        self.assertEqual(feature_bytes, expected_features)
+        offsets = database_offsets(
+            len(artifact.positions), len(artifact.range_starts)
+        )
+        self.assertEqual(offsets["end"], len(expected_database))
         self.assertEqual(
-            DB_HEADER.unpack_from(database),
+            len(expected_features), expected_feature_size(len(features.values))
+        )
+        self.assertEqual(expected_database[:8], b"G1INTDB1")
+        self.assertEqual(expected_features[:8], b"G1INTFT1")
+        self.assertEqual(expected_database[12:16], b"\x04\x03\x02\x01")
+        self.assertEqual(expected_features[12:16], b"\x04\x03\x02\x01")
+
+    def test_reader_accepts_independent_literal_wire_fixture(self):
+        artifact, features = wire_oracle_fixture()
+        with tempfile.TemporaryDirectory() as tmp:
+            database_path = Path(tmp) / "database.bin"
+            feature_path = Path(tmp) / "features.bin"
+            database_path.write_bytes(literal_database_wire(artifact))
+            feature_path.write_bytes(literal_feature_wire(features))
+
+            loaded_artifact = _read_database(database_path)
+            loaded_features = _read_features(feature_path)
+
+        assert_artifact_equal(self, artifact, loaded_artifact)
+        np.testing.assert_array_equal(features.values, loaded_features.values)
+        np.testing.assert_array_equal(
+            features.offsets, loaded_features.offsets
+        )
+        np.testing.assert_array_equal(features.scales, loaded_features.scales)
+        self.assertEqual(features.groups, loaded_features.groups)
+
+    def test_database_hostile_count_never_attempts_amplified_read(self):
+        file_size = 1 << 20
+        frame_count = file_size
+        amplified_request = frame_count * 31 * 3 * 4
+        self.assertEqual(amplified_request, 390_070_272)
+        prefix = b"G1INTDB1" + struct.pack(
+            "<8I",
+            1,
+            0x01020304,
+            25,
+            1,
+            frame_count,
+            31,
+            1,
+            14,
+        )
+        path = GuardedBinaryPath(prefix + bytes(file_size - len(prefix)))
+
+        with self.assertRaisesRegex(ValueError, "truncated positions"):
+            _read_database(path)
+
+        self.assertLessEqual(max(path.stream.requests), 31 * 4)
+        self.assertNotIn(amplified_request, path.stream.requests)
+
+    def test_feature_hostile_count_never_attempts_amplified_read(self):
+        file_size = 1 << 20
+        frame_count = file_size
+        amplified_request = frame_count * 71 * 4
+        self.assertEqual(amplified_request, 297_795_584)
+        prefix = b"".join(
             (
-                DB_MAGIC,
-                VERSION,
-                ENDIAN_MARKER,
-                25,
-                1,
-                frame_count,
-                31,
-                clip_count,
-                14,
-            ),
+                b"G1INTFT1",
+                struct.pack(
+                    "<5I", 1, 0x01020304, frame_count, 71, 5
+                ),
+                struct.pack("<5I", 0, 33, 45, 57, 65),
+                struct.pack("<5I", 33, 45, 57, 65, 71),
+                struct.pack("<71f", *([0.0] * 71)),
+                struct.pack("<71f", *([1.0] * 71)),
+            )
         )
-        self.assertEqual(
-            FEATURE_HEADER.unpack_from(feature_bytes),
-            (
-                FEATURE_MAGIC,
-                VERSION,
-                ENDIAN_MARKER,
-                frame_count,
-                71,
-                5,
-            ),
-        )
-        self.assertEqual(database[12:16], b"\x04\x03\x02\x01")
-        self.assertEqual(feature_bytes[12:16], b"\x04\x03\x02\x01")
-        offsets = database_offsets(frame_count, clip_count)
-        self.assertEqual(len(database), offsets["end"])
-        self.assertEqual(len(feature_bytes), expected_feature_size(frame_count))
-        self.assertEqual(database[DB_HEADER.size:DB_HEADER.size + 4], b"\xff" * 4)
-        self.assertEqual(
-            feature_bytes[FEATURE_HEADER.size:FEATURE_HEADER.size + 20],
-            struct.pack("<5I", 0, 33, 45, 57, 65),
-        )
-        self.assertEqual(
-            feature_bytes[
-                FEATURE_HEADER.size + 20:FEATURE_HEADER.size + 40
-            ],
-            struct.pack("<5I", 33, 45, 57, 65, 71),
-        )
+        path = GuardedBinaryPath(prefix + bytes(file_size - len(prefix)))
+
+        with self.assertRaisesRegex(ValueError, "truncated feature values"):
+            _read_features(path)
+
+        self.assertLessEqual(max(path.stream.requests), 71 * 4)
+        self.assertNotIn(amplified_request, path.stream.requests)
 
     def test_write_array_rejects_noncontiguous_before_endian_conversion(self):
         noncontiguous = np.arange(12, dtype=np.float32).reshape(3, 4)[:, ::2]
@@ -765,7 +1186,7 @@ class InteractionArtifactSerializationTests(unittest.TestCase):
             (
                 "feature nan",
                 "interaction_features.bin",
-                FEATURE_HEADER.size + 40,
+                LITERAL_FEATURE_HEADER_BYTES + 40,
                 struct.pack("<f", np.nan),
                 "feature offsets.*non-finite",
             ),
@@ -816,6 +1237,183 @@ class InteractionArtifactSerializationTests(unittest.TestCase):
                 ValueError, "manifest clip ranges.*database ranges"
             ):
                 read_artifact_set(output)
+
+    def test_manifest_requires_sorted_ids_and_exact_database_objects(self):
+        artifact, features, split, manifest, report = multi_artifact_fixture()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "pack"
+            write_artifact_set(
+                output, artifact, features, split, manifest, report
+            )
+
+            def reverse_sequence_ids(value: dict) -> None:
+                sequence_ids = [
+                    clip["sequence_id"] for clip in value["clips"]
+                ][::-1]
+                for clip, sequence_id in zip(
+                    value["clips"], sequence_ids
+                ):
+                    clip["sequence_id"] = sequence_id
+
+            rewrite_json(
+                output / "manifest.json",
+                reverse_sequence_ids,
+            )
+            with self.assertRaisesRegex(
+                ValueError, "manifest sequence_ids.*lexicographically sorted"
+            ):
+                read_artifact_set(output)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "pack"
+            write_artifact_set(
+                output, artifact, features, split, manifest, report
+            )
+            rewrite_json(
+                output / "evaluation_split.json",
+                lambda value: value.__setitem__(
+                    "database_objects",
+                    ["a_database", "unrepresented", "z_database"],
+                ),
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "manifest database object identities.*exactly match",
+            ):
+                read_artifact_set(output)
+
+    def test_manifest_and_report_counts_are_cross_file_consistent(self):
+        artifact, features, split, manifest, report = artifact_fixture()
+
+        def count_values(source: int, included: int, rejected: int) -> dict:
+            return {
+                "source_clips": source,
+                "included_clips": included,
+                "rejected_clips": rejected,
+            }
+
+        cases = []
+        inconsistent_manifest = copy.deepcopy(manifest)
+        inconsistent_manifest.update(count_values(99, 2, 0))
+        cases.append(
+            (
+                "manifest arithmetic",
+                inconsistent_manifest,
+                report,
+                "manifest source_clips.*included_clips plus rejected_clips",
+            )
+        )
+
+        different_manifest = copy.deepcopy(manifest)
+        different_manifest.update(count_values(2, 1, 1))
+        cases.append(
+            (
+                "cross-file mismatch",
+                different_manifest,
+                report,
+                "manifest/report.*included_clips.*mismatch",
+            )
+        )
+
+        too_few_included_manifest = copy.deepcopy(manifest)
+        too_few_included_report = copy.deepcopy(report)
+        too_few_included_manifest.update(count_values(0, 0, 0))
+        too_few_included_report.update(count_values(0, 0, 0))
+        cases.append(
+            (
+                "artifact clips exceed included",
+                too_few_included_manifest,
+                too_few_included_report,
+                "database artifact clip count.*included_clips",
+            )
+        )
+
+        for label, manifest_value, report_value, message in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                output = Path(tmp) / "pack"
+                with self.assertRaisesRegex(ValueError, message):
+                    write_artifact_set(
+                        output,
+                        artifact,
+                        features,
+                        split,
+                        manifest_value,
+                        report_value,
+                    )
+
+    def test_report_rejections_require_exact_shape_histogram_and_order(self):
+        artifact, features, split, manifest, report = artifact_fixture()
+
+        def values_with(
+            records: list[dict],
+            histogram: dict[str, int],
+            rejected: int,
+        ) -> tuple[dict, dict]:
+            manifest_value = copy.deepcopy(manifest)
+            report_value = copy.deepcopy(report)
+            counts = {
+                "source_clips": 2 + rejected,
+                "included_clips": 2,
+                "rejected_clips": rejected,
+            }
+            manifest_value.update(counts)
+            report_value.update(counts)
+            report_value["rejections"] = records
+            report_value["rejections_by_code"] = histogram
+            return manifest_value, report_value
+
+        one = rejection_record("pickup_table__bad__001", "missing_field")
+        missing_message = dict(one)
+        del missing_message["message"]
+        wrong_type = dict(one)
+        wrong_type["stage"] = 3
+        unsorted = [
+            rejection_record("pickup_table__z__001", "missing_field"),
+            rejection_record("pickup_table__a__001", "non_finite"),
+        ]
+        cases = (
+            (
+                "list length",
+                *values_with([], {"missing_field": 1}, 1),
+                "rejections length.*rejected_clips",
+            ),
+            (
+                "histogram",
+                *values_with([one], {"non_finite": 1}, 1),
+                "rejections_by_code.*exact.*histogram",
+            ),
+            (
+                "shape",
+                *values_with([missing_message], {"missing_field": 1}, 1),
+                "rejection 0 fields.*message",
+            ),
+            (
+                "type",
+                *values_with([wrong_type], {"missing_field": 1}, 1),
+                "rejection 0 stage.*nonempty string",
+            ),
+            (
+                "order",
+                *values_with(
+                    unsorted,
+                    dict(Counter(record["code"] for record in unsorted)),
+                    2,
+                ),
+                "rejections must be sorted.*sequence_id.*stage.*code",
+            ),
+        )
+        for label, manifest_value, report_value, message in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                output = Path(tmp) / "pack"
+                with self.assertRaisesRegex(ValueError, message):
+                    write_artifact_set(
+                        output,
+                        artifact,
+                        features,
+                        split,
+                        manifest_value,
+                        report_value,
+                    )
 
     def test_reader_rejects_malformed_json_schema_skeleton_and_split(self):
         artifact, features, split, manifest, report = artifact_fixture()
@@ -904,7 +1502,7 @@ class InteractionArtifactSerializationTests(unittest.TestCase):
             (
                 "evaluation_split.json",
                 heldout_database_object,
-                "manifest object.*database split",
+                "manifest database object identities.*exactly match",
             ),
             (
                 "validation_report.json",
@@ -981,6 +1579,116 @@ class InteractionArtifactSerializationTests(unittest.TestCase):
 
             self.assertEqual(before, snapshot(output))
             self.assertEqual(private_publish_paths(output), [])
+
+    def test_stale_previous_is_restored_before_invalid_new_inputs(self):
+        artifact, features, split, manifest, report = artifact_fixture()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "pack"
+            write_artifact_set(
+                output, artifact, features, split, manifest, report
+            )
+            before = snapshot(output)
+            previous = output.parent / ".pack.previous-424242"
+            os.replace(output, previous)
+            invalid_features = copy.deepcopy(features)
+            invalid_features.values[0, 0] = np.nan
+
+            with self.assertRaisesRegex(ValueError, "non-finite"):
+                write_artifact_set(
+                    output,
+                    artifact,
+                    invalid_features,
+                    split,
+                    manifest,
+                    report,
+                )
+
+            self.assertEqual(before, snapshot(output))
+            self.assertFalse(previous.exists())
+            read_artifact_set(output)
+
+    def test_valid_previous_replaces_invalid_public_pack_before_input_failure(self):
+        artifact, features, split, manifest, report = artifact_fixture()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "pack"
+            write_artifact_set(
+                output, artifact, features, split, manifest, report
+            )
+            before = snapshot(output)
+            previous = output.parent / ".pack.previous-424243"
+            shutil.copytree(output, previous)
+            mutate_bad_magic(output / "interaction_database.bin")
+            invalid_features = copy.deepcopy(features)
+            invalid_features.values[0, 0] = np.nan
+
+            with self.assertRaisesRegex(ValueError, "non-finite"):
+                write_artifact_set(
+                    output,
+                    artifact,
+                    invalid_features,
+                    split,
+                    manifest,
+                    report,
+                )
+
+            self.assertEqual(before, snapshot(output))
+            self.assertFalse(previous.exists())
+            read_artifact_set(output)
+
+    def test_valid_public_pack_wins_over_stale_previous_before_input_failure(self):
+        artifact, features, split, manifest, report = artifact_fixture()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "pack"
+            write_artifact_set(
+                output, artifact, features, split, manifest, report
+            )
+            before = snapshot(output)
+            previous = output.parent / ".pack.previous-424244"
+            shutil.copytree(output, previous)
+            rewrite_json(
+                previous / "manifest.json",
+                lambda value: value.__setitem__("generation", "older"),
+            )
+            invalid_features = copy.deepcopy(features)
+            invalid_features.values[0, 0] = np.nan
+
+            with self.assertRaisesRegex(ValueError, "non-finite"):
+                write_artifact_set(
+                    output,
+                    artifact,
+                    invalid_features,
+                    split,
+                    manifest,
+                    report,
+                )
+
+            self.assertEqual(before, snapshot(output))
+            self.assertFalse(previous.exists())
+            read_artifact_set(output)
+
+    def test_invalid_sole_previous_is_never_deleted_unvalidated(self):
+        artifact, features, split, manifest, report = artifact_fixture()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "pack"
+            previous = output.parent / f".pack.previous-{os.getpid()}"
+            previous.mkdir()
+            (previous / "only-copy.txt").write_text(
+                "must survive", encoding="utf-8"
+            )
+
+            with self.assertRaisesRegex(
+                ValueError, "cannot recover.*previous artifact"
+            ):
+                write_artifact_set(
+                    output, artifact, features, split, manifest, report
+                )
+
+            self.assertFalse(output.exists())
+            self.assertTrue(previous.is_dir())
+            self.assertEqual(
+                (previous / "only-copy.txt").read_text(encoding="utf-8"),
+                "must survive",
+            )
 
     def test_nonfinite_json_publish_preserves_previous_output(self):
         artifact, features, split, manifest, report = artifact_fixture()

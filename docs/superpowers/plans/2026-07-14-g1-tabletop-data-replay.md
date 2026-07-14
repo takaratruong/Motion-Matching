@@ -1459,10 +1459,11 @@ def build_database_features(
     return build_features(database, skeleton)
 ```
 
-`build_features` remains a low-level primitive for already-partitioned unit
-tests and artifact internals. Corpus builders and validation gates must call
-`build_database_features` with all labeled clips so held-out rows cannot enter
-normalization by caller convention.
+`build_features` remains a low-level stable-order primitive for
+already-partitioned unit tests and artifact internals.
+`build_database_features` retains its Task 5 filtering API and direct leakage
+tests. Task 6 introduces `prepare_artifacts` as the corpus-builder/validation-gate
+boundary so artifact rows and feature rows share one ordered database tuple.
 
 - [ ] **Step 3: Implement Holden-style group normalization**
 
@@ -1586,7 +1587,11 @@ git commit -m "feat: build target-relative pickup features and heldout split"
 
 **Interfaces:**
 - Consumes: labeled database clips, `FeatureSet`, `EvaluationSplit`, `SkeletonSpec`, build configuration, per-clip validation records.
-- Produces: `assemble_database(clips, skeleton) -> InteractionArtifact`, `write_artifact_set(output, artifact, features, split, manifest, report) -> None`, and `read_artifact_set(output) -> tuple[InteractionArtifact, FeatureSet, dict, dict, dict]`.
+- Produces: `assemble_database(clips, skeleton) -> InteractionArtifact`,
+  `prepare_artifacts(all_clips, split, skeleton) -> (ordered_database_clips,
+  InteractionArtifact, FeatureSet)`, `write_artifact_set(output, artifact,
+  features, split, manifest, report) -> None`, and `read_artifact_set(output) ->
+  tuple[InteractionArtifact, FeatureSet, dict, dict, dict]`.
 
 - [ ] **Step 1: Write failing round-trip, corruption, and atomicity tests**
 
@@ -1637,12 +1642,14 @@ def artifact_fixture():
         database_objects=("database_fixture_object",),
         heldout_objects=("heldout_fixture_object",),
     )
-    database, _ = partition_clips(clips, split)
-    labeled = database[0]
-    artifact = assemble_database(database, G1_SKELETON)
-    features = build_database_features(clips, split, G1_SKELETON)
+    ordered, artifact, features = prepare_artifacts(
+        clips, split, G1_SKELETON)
+    labeled = ordered[0]
     manifest = {
         "schema_version": 1,
+        "source_clips": 2,
+        "included_clips": 2,
+        "rejected_clips": 0,
         "target_fps": 25.0,
         "skeleton_signature": G1_SKELETON.signature(),
         "clips": [{
@@ -1760,7 +1767,21 @@ def assemble_database(
     return artifact
 ```
 
-`InteractionArtifact.validate()` enforces the Frozen Binary Layout shapes; exact 31-bone parent array; range coverage `[0, frame_count)` with non-overlap and no empty range; phase monotonicity within each range; contact/lift/hold presence in every range; normalized quaternions; positive dimensions; no non-finite numeric value; and feature/database frame equality.
+`InteractionArtifact.validate()` enforces the Frozen Binary Layout shapes; exact
+31-bone parent array; range coverage `[0, frame_count)` with non-overlap and no
+empty range; phase monotonicity within each range; contact/lift/hold presence in
+every range; nonnegative nonincreasing time-to-contact that is zero from CONTACT
+onward within `1e-4`; finite unit horizontal approach directions within `1e-4`;
+active-hand contact throughout CONTACT and LIFT and for the first five HOLD
+samples; normalized quaternions; positive dimensions; no non-finite numeric
+value; and feature/database frame equality. Contact after the first five HOLD
+samples is not required.
+
+`prepare_artifacts` validates and partitions the complete labeled clip sequence,
+rejects duplicate database `sequence_id` values, sorts the database clips exactly
+once by `sequence_id`, and passes that same ordered tuple to an order-preserving
+artifact assembler and low-level `build_features`. `assemble_database` retains
+its public sorting behavior; Task 5's stable-order feature APIs remain unchanged.
 
 - [ ] **Step 3: Implement exact little-endian writers and readers**
 
@@ -1779,6 +1800,11 @@ def _write_array(stream: BinaryIO, value: np.ndarray, dtype: str) -> None:
     stream.write(array.tobytes(order="C"))
 
 def _read_exact(stream: BinaryIO, count: int, label: str) -> bytes:
+    position = stream.tell()
+    end = stream.seek(0, os.SEEK_END)
+    stream.seek(position, os.SEEK_SET)
+    if count > end - position:
+        raise ValueError(f"truncated {label}")
     value = stream.read(count)
     if len(value) != count:
         raise ValueError(f"truncated {label}")
@@ -1841,7 +1867,16 @@ def _write_features(path: Path, value: FeatureSet) -> None:
 
 - [ ] **Step 4: Implement atomic directory publication**
 
-Write to `output.parent / f".{output.name}.tmp-{os.getpid()}"`, remove only that process-specific temp directory if it exists, reread and validate the entire temporary artifact set, rename an existing output to `.{name}.previous-{pid}`, rename temp to output, then remove the previous directory. On any exception, restore the previous directory if the final rename did not complete and remove the process-specific temp. Never remove or modify source data.
+Write to `output.parent / f".{output.name}.tmp-{os.getpid()}"`, remove only that
+process-specific temp directory if it exists, reread and validate the entire
+temporary artifact set, rename an existing output to `.{name}.previous-{pid}`,
+rename temp to output, then remove the previous directory. Before validating new
+inputs, scan stale `.{name}.previous-*` paths: restore a valid previous pack when
+the public output is absent, preserve a valid public pack when both exist, or
+replace an invalid public pack with a validated previous pack. Never delete an
+unvalidated sole backup. On any synchronous exception, restore the previous
+directory if the final rename did not complete and remove the process-specific
+temp. Never remove or modify source data.
 
 ```python
 def write_artifact_set(
@@ -1852,35 +1887,49 @@ def write_artifact_set(
     manifest: dict,
     report: dict,
 ) -> None:
-    artifact.validate()
-    if len(features.values) != len(artifact.positions):
-        raise ValueError("feature/database frame count mismatch")
     output = Path(output)
     temporary = output.parent / f".{output.name}.tmp-{os.getpid()}"
     previous = output.parent / f".{output.name}.previous-{os.getpid()}"
-    for private_path in (temporary, previous):
-        if private_path.exists():
-            shutil.rmtree(private_path)
+    _recover_interrupted_publish(output, temporary)
+    artifact.validate()
+    _validate_features(features, len(artifact.positions))
+    manifest_text, manifest_value = _canonical_json(manifest, "manifest")
+    split_text, split_value = _canonical_json(
+        dataclasses.asdict(split), "evaluation split")
+    report_text, report_value = _canonical_json(
+        report, "validation report")
+    _validate_manifest(manifest_value, artifact)
+    _validate_split(split_value, manifest_value)
+    _validate_report(report_value, len(artifact.positions), manifest_value)
+    _remove_private_path(temporary)
     temporary.mkdir(parents=True)
     moved_previous = False
+    published = False
     try:
         _write_database(temporary / "interaction_database.bin", artifact)
         _write_features(temporary / "interaction_features.bin", features)
-        _write_json(temporary / "manifest.json", manifest)
-        _write_json(temporary / "evaluation_split.json", dataclasses.asdict(split))
-        _write_json(temporary / "validation_report.json", report)
+        _write_text(temporary / "manifest.json", manifest_text)
+        _write_text(temporary / "evaluation_split.json", split_text)
+        _write_text(temporary / "validation_report.json", report_text)
         read_artifact_set(temporary)
         if output.exists():
             os.replace(output, previous)
             moved_previous = True
         os.replace(temporary, output)
+        published = True
         if moved_previous:
             shutil.rmtree(previous)
     except BaseException:
-        if moved_previous and not output.exists() and previous.exists():
-            os.replace(previous, output)
-        if temporary.exists():
-            shutil.rmtree(temporary)
+        if moved_previous and previous.exists():
+            if published and output.exists():
+                os.replace(output, temporary)
+                published = False
+            if not output.exists():
+                os.replace(previous, output)
+                moved_previous = False
+        _remove_private_path(temporary)
+        if not moved_previous:
+            _remove_private_path(previous)
         raise
 ```
 
@@ -1994,27 +2043,33 @@ def prepare_database(
     heldout_count: int,
     seed: int,
     skeleton: SkeletonSpec,
-) -> tuple[tuple[LabeledInteractionClip, ...], FeatureSet, EvaluationSplit]:
+) -> tuple[
+    tuple[LabeledInteractionClip, ...],
+    InteractionArtifact,
+    FeatureSet,
+    EvaluationSplit,
+]:
     split = split_objects(clips, heldout_count=heldout_count, seed=seed)
-    database, _ = partition_clips(clips, split)
-    features = build_database_features(clips, split, skeleton)
-    return database, features, split
+    database, artifact, features = prepare_artifacts(
+        clips, split, skeleton)
+    return database, artifact, features, split
 ```
 
 The caller derives labels for every valid source first, creates the object split,
 then passes the complete labeled sequence and validated split to
-`build_database_features`; it calls `assemble_database` only on the database
-tuple returned by `partition_clips`. Direct calls to low-level `build_features`
-are forbidden in this corpus path. Held-out clips contribute identities and
-later evaluation inputs but never feature normalization statistics or database
-frames.
+`prepare_artifacts`. That boundary filters and sorts the database clips once and
+builds both the artifact and features from the same tuple. Direct calls to
+`partition_clips`, `assemble_database`, low-level `build_features`, or
+`build_database_features` are forbidden in this corpus path. Held-out clips
+contribute identities and later evaluation inputs but never feature
+normalization statistics or database frames.
 
 The report contains exact keys:
 
 ```json
 {
   "schema_version": 1,
-  "source_clips": 2991,
+  "source_clips": 0,
   "included_clips": 0,
   "rejected_clips": 0,
   "included_frames": 0,
@@ -2030,6 +2085,14 @@ The report contains exact keys:
 ```
 
 Values are populated from the actual build; rejections sort by `(sequence_id, stage, code)`.
+The manifest repeats `source_clips`, `included_clips`, and `rejected_clips` with
+the exact same values. In both files, `source_clips == included_clips +
+rejected_clips`; `included_clips` counts every valid labeled clip, including
+held-out clips, while manifest `clips` contains only database clips in unique
+lexicographic `sequence_id` order. The database artifact/manifest clip count may
+therefore be smaller than `included_clips` but never larger. The rejection array
+length equals `rejected_clips`, every record has exactly the five fields above,
+and `rejections_by_code` is the exact histogram of their codes.
 
 - [ ] **Step 3: Implement the build and validation CLIs**
 
@@ -2259,10 +2322,11 @@ git commit -m "feat: replay interaction artifacts in headless C++"
 - Consumes: complete Tasks 1-8 and all 2,991 local pickup-table sequences.
 - Produces: reproducible `make gate1-interaction`, a complete validation report, a representative C++ replay digest, and operator documentation.
 
-Gate 1 must exercise Task 7's `prepare_database` path, whose feature build is
-`build_database_features(all_labeled_clips, split, G1_SKELETON)`. It must not
-call low-level `build_features` or recreate database filtering with a list
-comprehension.
+Gate 1 must exercise Task 7's `prepare_database` path, which delegates artifact
+and feature construction to `prepare_artifacts(all_labeled_clips, split,
+G1_SKELETON)`. It must not call `partition_clips`, `assemble_database`,
+low-level `build_features`, or `build_database_features`, and it must not
+recreate database filtering with a list comprehension.
 
 - [ ] **Step 1: Add a failing Gate 1 smoke assertion**
 
@@ -2279,6 +2343,9 @@ self.assertEqual(features.values.shape[0], artifact.positions.shape[0])
 self.assertEqual(len(split["heldout_objects"]), 20)
 self.assertFalse(set(split["heldout_objects"]) & set(split["database_objects"]))
 self.assertEqual(report["included_clips"] + report["rejected_clips"], 2991)
+self.assertEqual(manifest["source_clips"], report["source_clips"])
+self.assertEqual(manifest["included_clips"], report["included_clips"])
+self.assertEqual(manifest["rejected_clips"], report["rejected_clips"])
 self.assertGreater(report["included_clips"], 0)
 ```
 
@@ -2363,7 +2430,7 @@ unit-tested schema-v1 rejection codes. Gate 1 passes only when:
 
 The full-corpus build must retain a regression proving that mutating any
 held-out clip leaves serialized feature values, offsets, and scales unchanged;
-this is enforced through `build_database_features`, not caller-side filtering.
+this is enforced through `prepare_artifacts`, not caller-side filtering.
 
 - [ ] **Step 5: Document exact setup and results**
 

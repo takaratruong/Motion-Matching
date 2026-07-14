@@ -12,7 +12,7 @@ import numpy as np
 
 from resources.g1_terrain_builder.schema import SkeletonSpec
 
-from .features import FEATURE_GROUPS
+from .features import FEATURE_GROUPS, build_features
 from .schema import (
     EvaluationSplit,
     FeatureSet,
@@ -21,6 +21,7 @@ from .schema import (
     InteractionValidationError,
     LabeledInteractionClip,
 )
+from .splits import partition_clips
 
 
 DB_MAGIC = b"G1INTDB1"
@@ -40,9 +41,40 @@ def assemble_database(
     clips: Sequence[LabeledInteractionClip],
     skeleton: SkeletonSpec,
 ) -> InteractionArtifact:
-    ordered = sorted(clips, key=lambda clip: clip.motion.sequence_id)
+    ordered = _sort_unique_clips(clips)
+    return _assemble_ordered_database(ordered, skeleton)
+
+
+def _sort_unique_clips(
+    clips: Sequence[LabeledInteractionClip],
+) -> tuple[LabeledInteractionClip, ...]:
+    ordered = tuple(
+        sorted(clips, key=lambda clip: clip.motion.sequence_id)
+    )
     if not ordered:
         raise ValueError("cannot assemble an empty interaction database")
+    duplicates = sorted(
+        {
+            ordered[index].motion.sequence_id
+            for index in range(1, len(ordered))
+            if (
+                ordered[index - 1].motion.sequence_id
+                == ordered[index].motion.sequence_id
+            )
+        }
+    )
+    if duplicates:
+        raise InteractionValidationError(
+            "duplicate_sequence_id",
+            f"duplicate sequence_id values: {duplicates!r}",
+        )
+    return ordered
+
+
+def _assemble_ordered_database(
+    ordered: tuple[LabeledInteractionClip, ...],
+    skeleton: SkeletonSpec,
+) -> InteractionArtifact:
     if skeleton.signature() != G1_SKELETON.signature():
         raise InteractionValidationError(
             "skeleton_mismatch", skeleton.signature()
@@ -108,6 +140,22 @@ def assemble_database(
     return artifact
 
 
+def prepare_artifacts(
+    clips: Sequence[LabeledInteractionClip],
+    split: EvaluationSplit,
+    skeleton: SkeletonSpec,
+) -> tuple[
+    tuple[LabeledInteractionClip, ...],
+    InteractionArtifact,
+    FeatureSet,
+]:
+    database_clips, _ = partition_clips(clips, split)
+    ordered = _sort_unique_clips(database_clips)
+    artifact = _assemble_ordered_database(ordered, skeleton)
+    features = build_features(ordered, skeleton)
+    return ordered, artifact, features
+
+
 def _write_array(
     stream: BinaryIO,
     value: np.ndarray,
@@ -126,6 +174,11 @@ def _write_array(
 def _read_exact(stream: BinaryIO, count: int, label: str) -> bytes:
     if count < 0:
         raise ValueError(f"invalid byte count for {label}: {count}")
+    position = stream.tell()
+    end = stream.seek(0, os.SEEK_END)
+    stream.seek(position, os.SEEK_SET)
+    if count > end - position:
+        raise ValueError(f"truncated {label}")
     value = stream.read(count)
     if len(value) != count:
         raise ValueError(f"truncated {label}")
@@ -628,11 +681,42 @@ def _require_version(value: dict, label: str) -> None:
         )
 
 
+_CLIP_COUNT_FIELDS = (
+    "source_clips",
+    "included_clips",
+    "rejected_clips",
+)
+
+
+def _validate_clip_counts(
+    value: dict,
+    label: str,
+) -> dict[str, int]:
+    counts = {}
+    for name in _CLIP_COUNT_FIELDS:
+        count = value.get(name)
+        if not _is_integer(count) or count < 0:
+            raise ValueError(
+                f"{label} {name} must be a nonnegative integer, "
+                f"got {count!r}"
+            )
+        counts[name] = count
+    if counts["source_clips"] != (
+        counts["included_clips"] + counts["rejected_clips"]
+    ):
+        raise ValueError(
+            f"{label} source_clips must equal included_clips plus "
+            "rejected_clips"
+        )
+    return counts
+
+
 def _validate_manifest(
     manifest: dict,
     artifact: InteractionArtifact,
 ) -> None:
     _require_version(manifest, "manifest")
+    counts = _validate_clip_counts(manifest, "manifest")
     target_fps = manifest.get("target_fps")
     if (
         isinstance(target_fps, bool)
@@ -655,8 +739,14 @@ def _validate_manifest(
         raise ValueError(
             "manifest clip count does not match database clip count"
         )
+    if len(clips) > counts["included_clips"]:
+        raise ValueError(
+            "database artifact clip count must not exceed manifest "
+            f"included_clips: {len(clips)} > {counts['included_clips']}"
+        )
     ranges = []
     sequence_ids = set()
+    ordered_sequence_ids = []
     for index, clip in enumerate(clips):
         if not isinstance(clip, dict):
             raise ValueError(f"manifest clip {index} must be an object")
@@ -671,6 +761,7 @@ def _validate_manifest(
                 f"manifest contains duplicate sequence_id {clip['sequence_id']!r}"
             )
         sequence_ids.add(clip["sequence_id"])
+        ordered_sequence_ids.append(clip["sequence_id"])
         start = clip.get("range_start")
         stop = clip.get("range_stop")
         if not _is_integer(start) or not _is_integer(stop):
@@ -678,6 +769,10 @@ def _validate_manifest(
                 f"manifest clip {index} range must contain integer bounds"
             )
         ranges.append((start, stop))
+    if ordered_sequence_ids != sorted(ordered_sequence_ids):
+        raise ValueError(
+            "manifest sequence_ids must be lexicographically sorted"
+        )
     expected_ranges = list(
         zip(
             artifact.range_starts.astype(int).tolist(),
@@ -719,41 +814,114 @@ def _validate_split(split: dict, manifest: dict) -> None:
             f"{sorted(overlap)!r}"
         )
     manifest_objects = {clip["object_id"] for clip in manifest["clips"]}
-    outside_database = manifest_objects - partitions["database_objects"]
-    if outside_database:
+    database_objects = partitions["database_objects"]
+    if manifest_objects != database_objects:
+        missing = sorted(database_objects - manifest_objects)
+        unexpected = sorted(manifest_objects - database_objects)
         raise ValueError(
-            "manifest object is not in the database split: "
-            f"{sorted(outside_database)!r}"
+            "manifest database object identities must exactly match "
+            "evaluation split database_objects; "
+            f"missing={missing!r}, unexpected={unexpected!r}"
         )
 
 
-def _validate_report(report: dict, frame_count: int) -> None:
+def _validate_report(
+    report: dict,
+    frame_count: int,
+    manifest: dict,
+) -> None:
     _require_version(report, "validation report")
+    report_counts = _validate_clip_counts(report, "validation report")
+    manifest_counts = _validate_clip_counts(manifest, "manifest")
+    for name in _CLIP_COUNT_FIELDS:
+        if report_counts[name] != manifest_counts[name]:
+            raise ValueError(
+                f"manifest/report {name} mismatch: "
+                f"{manifest_counts[name]} != {report_counts[name]}"
+            )
     included_frames = report.get("included_frames")
     if not _is_integer(included_frames) or included_frames != frame_count:
         raise ValueError(
             "validation report included_frames must match database frame "
             f"count {frame_count}, got {included_frames!r}"
         )
-    for name in ("source_clips", "included_clips", "rejected_clips"):
-        value = report.get(name)
-        if not _is_integer(value) or value < 0:
-            raise ValueError(
-                f"validation report {name} must be a nonnegative integer"
-            )
-    if report["source_clips"] != (
-        report["included_clips"] + report["rejected_clips"]
-    ):
-        raise ValueError(
-            "validation report source_clips must equal included_clips plus "
-            "rejected_clips"
-        )
-    if not isinstance(report.get("rejections_by_code"), dict):
+    histogram = report.get("rejections_by_code")
+    if not isinstance(histogram, dict):
         raise ValueError(
             "validation report rejections_by_code must be an object"
         )
-    if not isinstance(report.get("rejections"), list):
+    for code, count in histogram.items():
+        if not isinstance(code, str) or not code:
+            raise ValueError(
+                "validation report rejections_by_code keys must be "
+                "nonempty strings"
+            )
+        if not _is_integer(count) or count <= 0:
+            raise ValueError(
+                "validation report rejections_by_code values must be "
+                "positive integers"
+            )
+    rejections = report.get("rejections")
+    if not isinstance(rejections, list):
         raise ValueError("validation report rejections must be an array")
+    if len(rejections) != report_counts["rejected_clips"]:
+        raise ValueError(
+            "validation report rejections length must equal "
+            f"rejected_clips: {len(rejections)} != "
+            f"{report_counts['rejected_clips']}"
+        )
+    rejection_fields = (
+        "sequence_id",
+        "object_id",
+        "stage",
+        "code",
+        "message",
+    )
+    rejection_field_set = set(rejection_fields)
+    rejection_keys = []
+    codes = []
+    for index, rejection in enumerate(rejections):
+        if not isinstance(rejection, dict):
+            raise ValueError(
+                f"validation report rejection {index} must be an object"
+            )
+        actual_fields = set(rejection)
+        if actual_fields != rejection_field_set:
+            missing = sorted(rejection_field_set - actual_fields)
+            extra = sorted(actual_fields - rejection_field_set)
+            raise ValueError(
+                f"validation report rejection {index} fields must be "
+                "exactly sequence_id, object_id, stage, code, message; "
+                f"missing={missing!r}, extra={extra!r}"
+            )
+        for field in rejection_fields:
+            item = rejection[field]
+            if not isinstance(item, str) or not item:
+                raise ValueError(
+                    f"validation report rejection {index} {field} must be "
+                    "a nonempty string"
+                )
+        key = (
+            rejection["sequence_id"],
+            rejection["stage"],
+            rejection["code"],
+        )
+        rejection_keys.append(key)
+        codes.append(rejection["code"])
+    if rejection_keys != sorted(rejection_keys):
+        raise ValueError(
+            "validation report rejections must be sorted by "
+            "(sequence_id, stage, code)"
+        )
+    expected_histogram = {}
+    for code in codes:
+        expected_histogram[code] = expected_histogram.get(code, 0) + 1
+    if histogram != expected_histogram:
+        raise ValueError(
+            "validation report rejections_by_code must equal the exact "
+            f"rejection histogram: expected {expected_histogram!r}, "
+            f"got {histogram!r}"
+        )
     bounds = report.get("numeric_bounds")
     if not isinstance(bounds, dict):
         raise ValueError("validation report numeric_bounds must be an object")
@@ -795,6 +963,68 @@ def _remove_private_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
+def _artifact_set_validation_error(path: Path) -> Exception | None:
+    try:
+        read_artifact_set(path)
+    except (OSError, TypeError, ValueError) as error:
+        return error
+    return None
+
+
+def _recover_interrupted_publish(
+    output: Path,
+    temporary: Path,
+) -> None:
+    previous_paths = sorted(
+        output.parent.glob(f".{output.name}.previous-*")
+    )
+    if not previous_paths:
+        return
+
+    if output.exists():
+        output_error = _artifact_set_validation_error(output)
+        if output_error is None:
+            for path in previous_paths:
+                _remove_private_path(path)
+            return
+    else:
+        output_error = None
+
+    valid_previous = []
+    previous_errors = []
+    for path in previous_paths:
+        error = _artifact_set_validation_error(path)
+        if error is None:
+            valid_previous.append(path)
+        else:
+            previous_errors.append(f"{path.name}: {error}")
+    if not valid_previous:
+        detail = "; ".join(previous_errors)
+        if output_error is not None:
+            detail = f"public artifact: {output_error}; {detail}"
+        raise ValueError(
+            f"cannot recover a valid previous artifact for {output}: "
+            f"{detail}"
+        )
+
+    recovery = valid_previous[-1]
+    if output.exists():
+        _remove_private_path(temporary)
+        os.replace(output, temporary)
+        try:
+            os.replace(recovery, output)
+        except BaseException:
+            if not output.exists() and temporary.exists():
+                os.replace(temporary, output)
+            raise
+        _remove_private_path(temporary)
+    else:
+        os.replace(recovery, output)
+
+    for path in previous_paths:
+        _remove_private_path(path)
+
+
 def write_artifact_set(
     output: Path,
     artifact: InteractionArtifact,
@@ -803,6 +1033,11 @@ def write_artifact_set(
     manifest: dict,
     report: dict,
 ) -> None:
+    output = Path(output)
+    temporary = output.parent / f".{output.name}.tmp-{os.getpid()}"
+    previous = output.parent / f".{output.name}.previous-{os.getpid()}"
+    _recover_interrupted_publish(output, temporary)
+
     artifact.validate()
     _validate_features(features, len(artifact.positions))
     manifest_text, manifest_value = _canonical_json(manifest, "manifest")
@@ -814,15 +1049,11 @@ def write_artifact_set(
     )
     _validate_manifest(manifest_value, artifact)
     _validate_split(split_value, manifest_value)
-    _validate_report(report_value, len(artifact.positions))
+    _validate_report(report_value, len(artifact.positions), manifest_value)
 
-    output = Path(output)
     if output.exists() and not output.is_dir():
         raise ValueError(f"artifact output is not a directory: {output}")
-    temporary = output.parent / f".{output.name}.tmp-{os.getpid()}"
-    previous = output.parent / f".{output.name}.previous-{os.getpid()}"
-    for private_path in (temporary, previous):
-        _remove_private_path(private_path)
+    _remove_private_path(temporary)
     temporary.mkdir(parents=True)
     moved_previous = False
     published = False
@@ -854,7 +1085,8 @@ def write_artifact_set(
                 os.replace(previous, output)
                 moved_previous = False
         _remove_private_path(temporary)
-        _remove_private_path(previous)
+        if not moved_previous:
+            _remove_private_path(previous)
         raise
 
 
@@ -880,5 +1112,5 @@ def read_artifact_set(
     )
     _validate_manifest(manifest, artifact)
     _validate_split(split, manifest)
-    _validate_report(report, len(artifact.positions))
+    _validate_report(report, len(artifact.positions), manifest)
     return artifact, features, manifest, split, report
