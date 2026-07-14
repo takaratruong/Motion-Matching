@@ -1,12 +1,16 @@
 import copy
+import gc
 import hashlib
 import io
+import inspect
 import json
 import os
 import shutil
 import struct
 import tempfile
+import types
 import unittest
+import weakref
 from functools import lru_cache
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
@@ -42,6 +46,13 @@ LOCKED_GRAIL_HEIGHTS = {
     "terrain_curbs__curb_022__001": 0.24007104328948528,
     "terrain_curbs__curb_165__006": 0.3599740964554129,
 }
+SMALL_FULL_GRAIL_BASES = tuple(sorted(LOCKED_GRAIL_HEIGHTS))
+SMALL_EXTRA_GRAIL_BASES = (
+    "terrain_curbs__curb_199__006",
+    "terrain_curbs__curb_199__007",
+)
+SMALL_STREAM_GRAIL_BASES = tuple(sorted(
+    SMALL_FULL_GRAIL_BASES + SMALL_EXTRA_GRAIL_BASES))
 
 
 def _fake_grail_clip(base):
@@ -53,6 +64,70 @@ def _fake_grail_clip(base):
     clip.positions[:, 0, 2] = np.array(
         [0.0, 0.4, 0.8, 1.2, 1.6], np.float32)
     return clip
+
+
+def _small_full_source_case(grail_bases=SMALL_FULL_GRAIL_BASES):
+    frames_per_clip = 3
+    total_clips = 1 + len(grail_bases)
+    total_frames = total_clips * frames_per_clip
+    database = ArtifactSet.empty(frames=total_frames, bones=31)
+    starts = np.arange(
+        0, total_frames, frames_per_clip, dtype=np.int32)
+    database.range_starts = starts
+    database.range_stops = starts + np.int32(frames_per_clip)
+    sources = [{
+        "name": "takara_walk_50hz",
+        "terrain_id": "flat",
+        "source_fps": 50.0,
+        "source_frames": 5,
+        "output_frames": frames_per_clip,
+        "range_start": 0,
+        "range_stop": frames_per_clip,
+        "source_frame_map": [0, 2, 4],
+    }]
+    for offset, base in enumerate(grail_bases, 1):
+        start = offset * frames_per_clip
+        sources.append({
+            "name": base,
+            "terrain_id": base,
+            "source_fps": 25.0,
+            "source_frames": 3,
+            "output_frames": frames_per_clip,
+            "range_start": start,
+            "range_stop": start + frames_per_clip,
+            "source_frame_map": [0, 1, 2],
+        })
+    manifest = {
+        "diagnostic_mode": False,
+        "total_clips": total_clips,
+        "grail_clips": len(grail_bases),
+        "database_frames": total_frames,
+        "sources": sources,
+        "skeleton": {
+            "names": list(validator_module.G1_SKELETON_NAMES),
+            "parents": list(validator_module.G1_SKELETON_PARENTS),
+        },
+        "validation": {
+            "fk_max_error_m": [0.0] * total_clips,
+            "duration_error_s": [0.0] * total_clips,
+            "quaternion_norm_max_error": [0.0] * total_clips,
+        },
+    }
+    return manifest, database
+
+
+def _small_full_constant_patches(grail_bases=SMALL_FULL_GRAIL_BASES):
+    grail_rows = len(grail_bases) * 3
+    return {
+        "FULL_SOURCE_GRAIL_CLIPS": len(grail_bases),
+        "FULL_SOURCE_TOTAL_CLIPS": 1 + len(grail_bases),
+        "FULL_SOURCE_ROWS": 3 + grail_rows,
+        "FULL_SOURCE_GRAIL_ROWS": grail_rows,
+        "FULL_SOURCE_TAKARA_SOURCE_FRAMES": 5,
+        "FULL_SOURCE_TAKARA_OUTPUT_FRAMES": 3,
+        "FULL_SOURCE_GRAIL_SOURCE_FRAMES": 3,
+        "FULL_SOURCE_GRAIL_OUTPUT_FRAMES": 3,
+    }
 
 
 @lru_cache(maxsize=1)
@@ -241,6 +316,668 @@ def _test_route_covers(grid, points):
     return covers
 
 
+class FullSourceSeamTests(unittest.TestCase):
+    def test_source_options_merge_defaults_and_reject_bad_keys_and_values(self):
+        expected = {
+            "grail_glob": "/home/ubuntu/datasets/GRAIL/data/curb/robot/*.pkl",
+            "g1_xml": (
+                "/home/ubuntu/projects/mjx-diffphysics/env/g1/assets/"
+                "g1_29dof.xml"),
+            "takara": (
+                "/home/ubuntu/Downloads/takara_walk_50hz.npz_v0/"
+                "motion.npz"),
+            "remap": "/home/ubuntu/projects/g1_mm/isaac_to_mj.npy",
+        }
+        self.assertEqual(
+            validator_module._validate_full_source_options(None), expected)
+        replacement = "/tmp/alternate-g1.xml"
+        merged = validator_module._validate_full_source_options({
+            "g1_xml": replacement,
+        })
+        self.assertEqual(
+            merged, {**expected, "g1_xml": replacement})
+
+        bad_options = (
+            [],
+            {"unknown": "value"},
+            {"g1_xml": True},
+            {"g1_xml": 1},
+            {"g1_xml": b"path"},
+            {"g1_xml": None},
+            {"g1_xml": ""},
+        )
+        for value in bad_options:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    (TypeError, ValueError),
+                    "source_options|unknown full-source option|non-empty string",
+                ):
+                    validator_module._validate_full_source_options(value)
+
+    def test_float32_and_uint8_row_comparators_are_encoded_exact(self):
+        published = np.array([[0.0, 1.0], [-2.0, 3.0]], np.float32)
+        validator_module._compare_f32_rows(
+            "positions", published, published.copy())
+
+        signed_zero = published.copy()
+        signed_zero[0, 0] = np.float32(-0.0)
+        with self.assertRaisesRegex(ValueError, "positions.*float32 bits differ"):
+            validator_module._compare_f32_rows(
+                "positions", published, signed_zero)
+
+        one_ulp = published.copy()
+        one_ulp.view(np.uint32)[0, 1] += np.uint32(1)
+        with self.assertRaisesRegex(ValueError, "positions.*float32 bits differ"):
+            validator_module._compare_f32_rows("positions", published, one_ulp)
+
+        with self.assertRaisesRegex(ValueError, "positions.*float32 dtype"):
+            validator_module._compare_f32_rows(
+                "positions", published, published.astype(np.float64))
+        with self.assertRaisesRegex(ValueError, "positions.*shape"):
+            validator_module._compare_f32_rows(
+                "positions", published, published[:1])
+        with self.assertRaisesRegex(ValueError, "positions.*C-contiguous"):
+            validator_module._compare_f32_rows(
+                "positions", published[:, ::-1], published[:, ::-1])
+
+        contacts = np.array([[0, 1], [1, 0]], np.uint8)
+        validator_module._compare_u8_rows(
+            "contacts", contacts, contacts.copy())
+        changed = contacts.copy()
+        changed[1, 1] = 1
+        with self.assertRaisesRegex(ValueError, "contacts.*uint8 rows differ"):
+            validator_module._compare_u8_rows("contacts", contacts, changed)
+        with self.assertRaisesRegex(ValueError, "contacts.*uint8 dtype"):
+            validator_module._compare_u8_rows(
+                "contacts", contacts, contacts.astype(np.int64))
+
+    def test_recompute_clip_rebuilds_every_derived_channel(self):
+        frames = 3
+        bones = 31
+        names = tuple(validator_module.G1_SKELETON_NAMES)
+        parents = np.asarray(
+            validator_module.G1_SKELETON_PARENTS, np.int32)
+        skeleton = SkeletonSpec(names, parents)
+        clip = HoldenClip.empty(frames, bones)
+        report = {
+            "fk_max_error_m": 0.0,
+            "duration_error_s": 0.0,
+            "quaternion_norm_max_error": 0.0,
+        }
+        global_positions = np.zeros((frames, bones, 3), np.float32)
+        global_rotations = np.tile(
+            np.array([1.0, 0.0, 0.0, 0.0], np.float32),
+            (frames, bones, 1))
+        velocities = np.full_like(clip.positions, np.float32(1.25))
+        angular = np.full_like(clip.positions, np.float32(-0.5))
+        contacts = np.array([[1, 0], [1, 1], [0, 1]], np.uint8)
+        support = np.array([
+            [0.0, 0.1, 0.2],
+            [0.3, 0.4, 0.5],
+            [0.6, 0.7, 0.8],
+        ], np.float32)
+        features = [
+            np.full(4, np.float32(frame + 1), np.float32)
+            for frame in range(frames)
+        ]
+        source = types.SimpleNamespace(name="clip")
+        terrain = object()
+        kinematics = object()
+        contact_config = object()
+        convert = mock.Mock(return_value=(clip, skeleton, report))
+        forward = mock.Mock(return_value=(
+            global_positions, global_rotations))
+        derive = mock.Mock(return_value=(velocities, angular))
+        derive_contact = mock.Mock(return_value=contacts)
+        sample_support = mock.Mock(return_value=support)
+        build_centerline = mock.Mock(
+            return_value=np.array([[0.0, 0.0], [0.0, 1.0]]))
+        sample_features = mock.Mock(side_effect=features)
+        mul_vec = mock.Mock(return_value=np.tile(
+            np.array([0.0, 0.0, 1.0]), (frames, 1)))
+
+        with mock.patch.multiple(
+            validator_module,
+            convert_source_clip=convert,
+            forward_kinematics_arrays=forward,
+            derive_velocities=derive,
+            derive_contacts=derive_contact,
+            sample_terrain_support=sample_support,
+            build_facing_centerline=build_centerline,
+            sample_terrain_features=sample_features,
+            ContactConfig=mock.Mock(return_value=contact_config),
+            holden_quat=types.SimpleNamespace(mul_vec=mul_vec),
+            create=True,
+        ):
+            rebuilt, observed_report = validator_module._recompute_clip(
+                source, terrain, kinematics, names, parents)
+
+        self.assertIs(rebuilt, clip)
+        self.assertIs(observed_report, report)
+        np.testing.assert_array_equal(rebuilt.velocities, velocities)
+        np.testing.assert_array_equal(rebuilt.angular_velocities, angular)
+        np.testing.assert_array_equal(rebuilt.contacts, contacts)
+        np.testing.assert_array_equal(rebuilt.terrain_support, support)
+        np.testing.assert_array_equal(
+            rebuilt.terrain_features, np.asarray(features, np.float32))
+        convert.assert_called_once_with(source, kinematics, 25.0)
+        derive_contact.assert_called_once_with(
+            global_positions, terrain, 7, 13, 25.0, contact_config)
+        sample_support.assert_called_once_with(
+            global_positions, terrain, 0, 7, 13)
+        self.assertEqual(sample_features.call_count, frames)
+
+    def test_recompute_clip_checks_skeleton_names_and_parents_independently(self):
+        names = tuple(validator_module.G1_SKELETON_NAMES)
+        parents = np.asarray(
+            validator_module.G1_SKELETON_PARENTS, np.int32)
+        clip = HoldenClip.empty(3, 31)
+        report = {}
+        cases = (
+            (SkeletonSpec(("Wrong",) + names[1:], parents),
+             "skeleton names"),
+            (SkeletonSpec(names, np.arange(-1, 30, dtype=np.int32)),
+             "skeleton parents"),
+        )
+        for skeleton, message in cases:
+            with self.subTest(message=message), mock.patch.object(
+                validator_module, "convert_source_clip",
+                return_value=(clip, skeleton, report), create=True,
+            ):
+                with self.assertRaisesRegex(ValueError, message):
+                    validator_module._recompute_clip(
+                        types.SimpleNamespace(name="clip"),
+                        object(), object(), names, parents)
+
+    def test_validator_has_no_finalize_clip_dependency(self):
+        source = inspect.getsource(validator_module)
+        self.assertNotIn("finalize_clip", source)
+        self.assertNotIn("resources.build_g1_terrain_database", source)
+
+    def test_rebuilt_clip_row_comparison_covers_every_persisted_channel(self):
+        database = ArtifactSet.empty(frames=3, bones=31)
+        clip = HoldenClip.empty(frames=3, bones=31)
+        validator_module._compare_rebuilt_clip_rows(
+            database, 0, 3, clip, "sources[0]")
+
+        float_fields = (
+            "positions", "velocities", "rotations", "angular_velocities",
+            "terrain_features",
+        )
+        for name in float_fields:
+            changed = getattr(clip, name).copy()
+            changed.view(np.uint32).flat[0] += np.uint32(1)
+            original = getattr(clip, name)
+            setattr(clip, name, changed)
+            try:
+                with self.subTest(field=name), self.assertRaisesRegex(
+                    ValueError, f"{name}.*float32 bits differ",
+                ):
+                    validator_module._compare_rebuilt_clip_rows(
+                        database, 0, 3, clip, "sources[0]")
+            finally:
+                setattr(clip, name, original)
+
+        for column in range(3):
+            changed = clip.terrain_support.copy()
+            changed.view(np.uint32)[0, column] += np.uint32(1)
+            original = clip.terrain_support
+            clip.terrain_support = changed
+            try:
+                with self.subTest(support_column=column), \
+                        self.assertRaisesRegex(
+                            ValueError,
+                            "terrain_support.*float32 bits differ"):
+                    validator_module._compare_rebuilt_clip_rows(
+                        database, 0, 3, clip, "sources[0]")
+            finally:
+                clip.terrain_support = original
+
+        clip.contacts[0, 0] = 1
+        with self.assertRaisesRegex(ValueError, "contacts.*uint8 rows differ"):
+            validator_module._compare_rebuilt_clip_rows(
+                database, 0, 3, clip, "sources[0]")
+        clip.contacts[0, 0] = 0
+        original_contacts = clip.contacts
+        clip.contacts = clip.contacts.astype(bool)
+        try:
+            with self.assertRaisesRegex(ValueError, "contacts.*uint8 dtype"):
+                validator_module._compare_rebuilt_clip_rows(
+                    database, 0, 3, clip, "sources[0]")
+        finally:
+            clip.contacts = original_contacts
+
+    def test_rebuilt_clip_metadata_locks_identity_map_and_report_tolerance(self):
+        source = types.SimpleNamespace(
+            name="takara_walk_50hz",
+            terrain_id="flat",
+            fps=50.0,
+            qpos=np.zeros((5, 36), np.float32),
+            source_frames=np.arange(5, dtype=np.int64),
+        )
+        clip = HoldenClip.empty(frames=3, bones=31)
+        clip.name = source.name
+        clip.terrain_id = source.terrain_id
+        clip.source_frames = np.array([0, 2, 4], np.int64)
+        entry = {
+            "name": source.name,
+            "terrain_id": source.terrain_id,
+            "source_fps": 50.0,
+            "source_frames": 5,
+            "output_frames": 3,
+            "range_start": 0,
+            "range_stop": 3,
+            "source_frame_map": [0, 2, 4],
+        }
+        validation = {
+            "fk_max_error_m": [0.0],
+            "duration_error_s": [0.0],
+            "quaternion_norm_max_error": [0.0],
+        }
+        report = {
+            "fk_max_error_m": validator_module.SOURCE_REPORT_ATOL,
+            "duration_error_s": 0.0,
+            "quaternion_norm_max_error": 0.0,
+        }
+        validator_module._validate_rebuilt_clip_metadata(
+            source, clip, entry, report, validation, 0)
+
+        too_large = dict(report)
+        too_large["fk_max_error_m"] = float(np.nextafter(
+            validator_module.SOURCE_REPORT_ATOL, np.inf))
+        with self.assertRaisesRegex(ValueError, "fk_max_error_m.*differs"):
+            validator_module._validate_rebuilt_clip_metadata(
+                source, clip, entry, too_large, validation, 0)
+
+        missing = dict(report)
+        del missing["duration_error_s"]
+        with self.assertRaisesRegex(ValueError, "report keys"):
+            validator_module._validate_rebuilt_clip_metadata(
+                source, clip, entry, missing, validation, 0)
+
+        mutations = (
+            ("source-name", source, "name", "wrong", "source name"),
+            ("source-terrain", source, "terrain_id", "wrong", "terrain"),
+            ("source-fps", source, "fps", 25.0, "source_fps"),
+            ("clip-name", clip, "name", "wrong", "rebuilt clip name"),
+            ("clip-terrain", clip, "terrain_id", "wrong", "rebuilt terrain"),
+            ("source-map", clip, "source_frames",
+             np.array([0, 1, 4], np.int64), "source frame map"),
+        )
+        for case, owner, attribute, value, message in mutations:
+            original = getattr(owner, attribute)
+            setattr(owner, attribute, value)
+            try:
+                with self.subTest(case=case), self.assertRaisesRegex(
+                    ValueError, message,
+                ):
+                    validator_module._validate_rebuilt_clip_metadata(
+                        source, clip, entry, report, validation, 0)
+            finally:
+                setattr(owner, attribute, original)
+
+    def test_full_manifest_contract_and_source_discovery_are_exact(self):
+        manifest, database = _small_full_source_case()
+        with tempfile.TemporaryDirectory() as temporary:
+            for name in ("g1.xml", "takara.npz", "remap.npy"):
+                with open(os.path.join(temporary, name), "wb") as stream:
+                    stream.write(b"x")
+            for base in SMALL_FULL_GRAIL_BASES:
+                with open(
+                    os.path.join(temporary, base + ".pkl"), "wb",
+                ) as stream:
+                    stream.write(b"x")
+            options = {
+                "grail_glob": os.path.join(temporary, "*.pkl"),
+                "g1_xml": os.path.join(temporary, "g1.xml"),
+                "takara": os.path.join(temporary, "takara.npz"),
+                "remap": os.path.join(temporary, "remap.npy"),
+            }
+            with mock.patch.multiple(
+                validator_module, **_small_full_constant_patches(),
+                create=True,
+            ):
+                validator_module._validate_full_source_manifest_contract(
+                    manifest, database)
+                bases, path_by_base = \
+                    validator_module._discover_full_source_corpus(
+                        manifest, options)
+            self.assertEqual(bases, SMALL_FULL_GRAIL_BASES)
+            self.assertEqual(tuple(path_by_base), SMALL_FULL_GRAIL_BASES)
+
+            wrong_order = copy.deepcopy(manifest)
+            wrong_order["sources"][1], wrong_order["sources"][2] = (
+                wrong_order["sources"][2], wrong_order["sources"][1])
+            with mock.patch.multiple(
+                validator_module, **_small_full_constant_patches(),
+                create=True,
+            ), self.assertRaisesRegex(ValueError, "basename.*manifest order"):
+                validator_module._discover_full_source_corpus(
+                    wrong_order, options)
+
+            os.rename(
+                os.path.join(temporary, SMALL_FULL_GRAIL_BASES[-1] + ".pkl"),
+                os.path.join(temporary, "unexpected.pkl"))
+            with mock.patch.multiple(
+                validator_module, **_small_full_constant_patches(),
+                create=True,
+            ), self.assertRaisesRegex(ValueError, "basename.*manifest"):
+                validator_module._discover_full_source_corpus(
+                    manifest, options)
+
+        mutations = (
+            ("diagnostic_mode", True, "non-diagnostic"),
+            ("total_clips", 4, "total clip count"),
+            ("grail_clips", 3, "GRAIL clip count"),
+            ("database_frames", 14, "row count"),
+        )
+        for key, value, message in mutations:
+            changed = copy.deepcopy(manifest)
+            changed[key] = value
+            with self.subTest(key=key), mock.patch.multiple(
+                validator_module, **_small_full_constant_patches(),
+                create=True,
+            ), self.assertRaisesRegex(ValueError, message):
+                validator_module._validate_full_source_manifest_contract(
+                    changed, database)
+
+        changed = copy.deepcopy(manifest)
+        changed["sources"][0]["source_frames"] = 6
+        with mock.patch.multiple(
+            validator_module, **_small_full_constant_patches(), create=True,
+        ), self.assertRaisesRegex(ValueError, "Takara source frame count"):
+            validator_module._validate_full_source_manifest_contract(
+                changed, database)
+        changed = copy.deepcopy(manifest)
+        changed["sources"][1]["output_frames"] = 2
+        with mock.patch.multiple(
+            validator_module, **_small_full_constant_patches(), create=True,
+        ), self.assertRaisesRegex(ValueError, "GRAIL.*frame count"):
+            validator_module._validate_full_source_manifest_contract(
+                changed, database)
+
+    def test_source_discovery_stops_after_one_match_beyond_the_limit(self):
+        manifest, _ = _small_full_source_case()
+        limit = len(SMALL_FULL_GRAIL_BASES)
+
+        class HostileMatches:
+            def __init__(self):
+                self.consumed = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                self.consumed += 1
+                if self.consumed > limit + 1:
+                    raise AssertionError(
+                        "source discovery exhausted a hostile iterator")
+                return f"/virtual/grail_{self.consumed:04d}.pkl"
+
+        matches = HostileMatches()
+        with tempfile.TemporaryDirectory() as temporary:
+            for name in ("g1.xml", "takara.npz", "remap.npy"):
+                with open(os.path.join(temporary, name), "wb") as stream:
+                    stream.write(b"x")
+            options = {
+                "grail_glob": "/virtual/*.pkl",
+                "g1_xml": os.path.join(temporary, "g1.xml"),
+                "takara": os.path.join(temporary, "takara.npz"),
+                "remap": os.path.join(temporary, "remap.npy"),
+            }
+            with mock.patch.multiple(
+                validator_module, **_small_full_constant_patches(),
+                create=True,
+            ), mock.patch.object(
+                validator_module.glob, "iglob", return_value=matches,
+            ), mock.patch.object(
+                validator_module.glob, "glob",
+                side_effect=lambda pattern: list(matches),
+            ), self.assertRaisesRegex(
+                ValueError, "exactly 4 clips",
+            ):
+                validator_module._discover_full_source_corpus(
+                    manifest, options)
+
+        self.assertEqual(matches.consumed, limit + 1)
+
+    def test_grail_surfaces_are_premeasured_and_literal_selection_is_locked(self):
+        events = []
+        heights = dict(LOCKED_GRAIL_HEIGHTS)
+
+        class Terrain:
+            def __init__(self, base):
+                self.base = base
+
+            def footprint(self):
+                events.append(("measure", self.base))
+                return {"height": heights[self.base]}
+
+        with mock.patch.object(
+            validator_module.GrailTerrain, "from_base",
+            side_effect=lambda base: Terrain(base),
+        ):
+            measured, selected = validator_module._premeasure_grail_surfaces(
+                SMALL_FULL_GRAIL_BASES)
+        self.assertEqual(
+            events,
+            [("measure", base) for base in SMALL_FULL_GRAIL_BASES])
+        self.assertEqual(measured, heights)
+        self.assertEqual(selected, validator_module.GRAIL_EXPECTED_BASES)
+
+        heights[GRAIL_DEFAULT_BASE] += 0.001
+        with mock.patch.object(
+            validator_module.GrailTerrain, "from_base",
+            side_effect=lambda base: Terrain(base),
+        ), self.assertRaisesRegex(ValueError, "source height changed"):
+            validator_module._premeasure_grail_surfaces(
+                SMALL_FULL_GRAIL_BASES)
+
+    def test_full_source_streams_in_order_and_retains_only_selected_clips(self):
+        manifest, database = _small_full_source_case(
+            SMALL_STREAM_GRAIL_BASES)
+        events = []
+        source_refs = {}
+        clip_refs = {}
+        heights = {
+            **LOCKED_GRAIL_HEIGHTS,
+            SMALL_EXTRA_GRAIL_BASES[0]: 10.0,
+            SMALL_EXTRA_GRAIL_BASES[1]: 20.0,
+        }
+
+        class Terrain:
+            def __init__(self, base):
+                self.base = base
+                events.append(("terrain", base))
+
+            def footprint(self):
+                events.append(("measure", self.base))
+                return {"height": heights[self.base]}
+
+        class Kinematics:
+            def __init__(self, path):
+                events.append(("kinematics", path))
+
+        class Source:
+            pass
+
+        def make_source(name, terrain_id, fps, source_frames):
+            source = Source()
+            source.name = name
+            source.terrain_id = terrain_id
+            source.fps = float(fps)
+            source.qpos = np.zeros((source_frames, 36), np.float32)
+            source.source_frames = np.arange(
+                source_frames, dtype=np.int64)
+            source_refs[name] = weakref.ref(source)
+            return source
+
+        def load_takara(path, remap):
+            events.append(("load", "takara_walk_50hz"))
+            return make_source("takara_walk_50hz", "flat", 50.0, 5)
+
+        def load_grail(path):
+            base = os.path.splitext(os.path.basename(path))[0]
+            events.append(("load", base))
+            return make_source(base, base, 25.0, 3)
+
+        def recompute(source, terrain, kinematics, names, parents):
+            events.append(("recompute", source.name))
+            self.assertIs(names, manifest["skeleton"]["names"])
+            self.assertIs(parents, manifest["skeleton"]["parents"])
+            clip = HoldenClip.empty(frames=3, bones=31)
+            clip.name = source.name
+            clip.terrain_id = source.terrain_id
+            clip.source_frames = (
+                np.array([0, 2, 4], np.int64)
+                if source.terrain_id == "flat"
+                else np.arange(3, dtype=np.int64))
+            clip_refs[source.name] = weakref.ref(clip)
+            return clip, {
+                "fk_max_error_m": 0.0,
+                "duration_error_s": 0.0,
+                "quaternion_norm_max_error": 0.0,
+            }
+
+        def validate_selected(scenes, selected_clips, selected):
+            gc.collect()
+            events.append(("selected-scenes", tuple(sorted(selected_clips))))
+            self.assertEqual(selected, validator_module.GRAIL_EXPECTED_BASES)
+            self.assertEqual(
+                set(selected_clips),
+                set(validator_module.GRAIL_EXPECTED_BASES.values()))
+            self.assertTrue(all(
+                source_ref() is None for source_ref in source_refs.values()))
+            self.assertTrue(all(
+                clip_refs[base]() is None for base in SMALL_EXTRA_GRAIL_BASES))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            for name in ("g1.xml", "takara.npz", "remap.npy"):
+                with open(os.path.join(temporary, name), "wb") as stream:
+                    stream.write(b"x")
+            for base in SMALL_STREAM_GRAIL_BASES:
+                with open(
+                    os.path.join(temporary, base + ".pkl"), "wb",
+                ) as stream:
+                    stream.write(b"x")
+            options = {
+                "grail_glob": os.path.join(temporary, "*.pkl"),
+                "g1_xml": os.path.join(temporary, "g1.xml"),
+                "takara": os.path.join(temporary, "takara.npz"),
+                "remap": os.path.join(temporary, "remap.npy"),
+            }
+            with mock.patch.multiple(
+                validator_module,
+                **_small_full_constant_patches(SMALL_STREAM_GRAIL_BASES),
+                G1Kinematics=Kinematics,
+                FlatTerrain=lambda: Terrain("flat"),
+                load_takara=load_takara,
+                load_grail=load_grail,
+                _recompute_clip=recompute,
+                _validate_selected_scene_reconstruction=validate_selected,
+                create=True,
+            ), mock.patch.object(
+                validator_module.GrailTerrain, "from_base",
+                side_effect=lambda base: Terrain(base),
+            ):
+                rows = validator_module._validate_all_source_rows(
+                    manifest, database, {}, options,
+                    progress=lambda *values: events.append(values))
+        self.assertEqual(rows, 21)
+        load_names = [
+            value[1] for value in events
+            if len(value) == 2 and value[0] == "load"
+        ]
+        self.assertEqual(
+            load_names, ["takara_walk_50hz", *SMALL_STREAM_GRAIL_BASES])
+        first_load = next(
+            index for index, value in enumerate(events) if value[0] == "load")
+        measured_surface_indices = [
+            index for index, value in enumerate(events)
+            if len(value) == 2 and value[0] == "measure"]
+        self.assertEqual(
+            len(measured_surface_indices), len(SMALL_STREAM_GRAIL_BASES))
+        self.assertLess(max(measured_surface_indices), first_load)
+        progress_measure_indices = [
+            index for index, value in enumerate(events)
+            if len(value) == 4 and value[0] == "measure"]
+        self.assertEqual(
+            len(progress_measure_indices), len(SMALL_STREAM_GRAIL_BASES))
+        self.assertLess(max(progress_measure_indices), first_load)
+        self.assertEqual(
+            sum(value[0] == "kinematics" for value in events), 1)
+
+    def test_takara_support_requires_positive_zero_bits_in_all_columns(self):
+        support = np.zeros((3, 3), np.float32)
+        validator_module._validate_takara_support_zero_bits(support)
+        for column in range(3):
+            changed = support.copy()
+            changed[1, column] = np.float32(-0.0)
+            with self.subTest(column=column), self.assertRaisesRegex(
+                ValueError, "Takara support.*positive-zero",
+            ):
+                validator_module._validate_takara_support_zero_bits(changed)
+
+    def test_selected_scene_reconstruction_is_exact_for_all_four_sources(self):
+        scenes = {
+            built.scene_id: (json.loads(built.scene_json), None, None)
+            for built in _canonical_scene_pack().scenes[:4]
+        }
+        clips = {
+            base: _fake_grail_clip(base) for base in LOCKED_GRAIL_HEIGHTS
+        }
+        validator_module._validate_selected_scene_reconstruction(
+            scenes, clips, validator_module.GRAIL_EXPECTED_BASES)
+
+        changed = copy.deepcopy(scenes)
+        changed["grail-curb-low"][0]["routes"][0]["waypoints_xz"][1][0] = \
+            float(np.float32(9.0))
+        with self.assertRaisesRegex(
+            ValueError, "deterministic converted-source scene changed",
+        ):
+            validator_module._validate_selected_scene_reconstruction(
+                changed, clips, validator_module.GRAIL_EXPECTED_BASES)
+
+    def test_full_source_cli_forwards_paths_and_reports_rebuilt_rows(self):
+        summary = {
+            "frames": 459682,
+            "clips": 1770,
+            "bones": 31,
+            "scenes": 14,
+            "source_rows": 459682,
+        }
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        arguments = [
+            "/tmp/full-artifact",
+            "--full-source-validation",
+            "--grail-glob", "/tmp/grail/*.pkl",
+            "--g1-xml", "/tmp/g1.xml",
+            "--takara", "/tmp/takara.npz",
+            "--remap", "/tmp/remap.npy",
+        ]
+        with mock.patch.object(
+            validator_module, "_validate_dispatched",
+            return_value=(validator_module.SCHEMA, summary),
+        ) as dispatched, redirect_stdout(stdout), redirect_stderr(stderr):
+            status = validator_module.main(arguments)
+
+        self.assertEqual(status, 0)
+        dispatched.assert_called_once_with(
+            "/tmp/full-artifact", True, {
+                "grail_glob": "/tmp/grail/*.pkl",
+                "g1_xml": "/tmp/g1.xml",
+                "takara": "/tmp/takara.npz",
+                "remap": "/tmp/remap.npy",
+            })
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(
+            stdout.getvalue(),
+            "VALID g1-terrain-artifacts/v2 frames=459682 clips=1770 "
+            "bones=31 terrain_dims=4 support_dims=3 scenes=14 "
+            "source_rows=459682\n")
+
+
 class ValidatorTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -417,13 +1154,63 @@ class ValidatorTests(unittest.TestCase):
                     self._expected_summary())
 
     def test_direct_canonical_v2_fixture_validates_normally(self):
-        self.assertEqual(
-            validate_artifact_directory(self.output), self._expected_summary())
+        class UninspectableSourceOptions:
+            def __iter__(self):
+                raise AssertionError("normal mode inspected source_options")
 
-    def test_full_source_true_fails_as_explicitly_unimplemented(self):
-        with self.assertRaisesRegex(ValueError, "not implemented.*Task 12B"):
+        self.assertEqual(
             validate_artifact_directory(
-                self.output, full_source_validation=True)
+                self.output,
+                source_options=UninspectableSourceOptions()),
+            self._expected_summary())
+
+    def test_full_source_runs_after_normal_gates_with_loaded_v2_objects(self):
+        options = {"g1_xml": "/tmp/test-g1.xml"}
+        observed = {}
+
+        def validate_sources(
+            manifest, database, scenes, source_options, progress=None,
+        ):
+            observed["manifest"] = manifest
+            observed["database"] = database
+            observed["scenes"] = scenes
+            observed["source_options"] = source_options
+            self.assertIsNotNone(progress)
+            progress("recompute", 1, 1, "fixture-source")
+            return 3
+
+        stderr = io.StringIO()
+        with mock.patch.object(
+            validator_module, "_validate_all_source_rows",
+            side_effect=validate_sources,
+        ) as full_validator, redirect_stderr(stderr):
+            summary = validate_artifact_directory(
+                self.output, full_source_validation=True,
+                source_options=options)
+
+            unexpected = os.path.join(self.output, "unexpected.bin")
+            with open(unexpected, "wb") as stream:
+                stream.write(b"x")
+            try:
+                with self.assertRaisesRegex(ValueError, "unexpected file"):
+                    validate_artifact_directory(
+                        self.output, full_source_validation=True,
+                        source_options=options)
+            finally:
+                os.unlink(unexpected)
+
+        self.assertEqual(summary, {
+            **self._expected_summary(), "source_rows": 3,
+        })
+        self.assertEqual(full_validator.call_count, 1)
+        self.assertIs(observed["source_options"], options)
+        self.assertEqual(observed["manifest"]["schema"], validator_module.SCHEMA)
+        self.assertEqual(len(observed["database"].positions), 3)
+        self.assertEqual(
+            tuple(observed["scenes"]), validator_module.LOCKED_SCENE_IDS)
+        self.assertEqual(
+            stderr.getvalue(),
+            "FULL-SOURCE recompute 1/1 fixture-source\n")
 
     def test_v2_cli_reports_the_single_dispatched_schema_and_dimensions(self):
         stdout = io.StringIO()
