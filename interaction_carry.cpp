@@ -603,6 +603,93 @@ bool stable_from(
                config.maximum_grasp_drift_radians);
 }
 
+bool continuous_object(
+    const Transform& desired,
+    const Transform& candidate,
+    const CarryConfig& carry_config,
+    const IKConfig& ik_config) {
+    const float maximum_position = std::min(
+        carry_config.maximum_grasp_drift_m,
+        ik_config.maximum_request_position_m);
+    const float maximum_orientation = std::min(
+        carry_config.maximum_grasp_drift_radians,
+        ik_config.maximum_request_orientation_radians);
+    return within_inclusive(
+               length(candidate.position - desired.position),
+               maximum_position) &&
+           within_inclusive(
+               rotation_distance(
+                   candidate.rotation, desired.rotation),
+               maximum_orientation);
+}
+
+class CarryUpdateTransaction {
+public:
+    CarryUpdateTransaction(
+        Transform& object_world,
+        Transform& object_in_root,
+        bool& recorded,
+        float& search_seconds,
+        bool& search_pending,
+        int32_t& recorded_range_index,
+        double& source_frame_exact,
+        double& search_seconds_exact) noexcept
+        : object_world_(object_world),
+          object_in_root_(object_in_root),
+          recorded_(recorded),
+          search_seconds_(search_seconds),
+          search_pending_(search_pending),
+          recorded_range_index_(recorded_range_index),
+          source_frame_exact_(source_frame_exact),
+          search_seconds_exact_(search_seconds_exact),
+          previous_object_world_(object_world),
+          previous_object_in_root_(object_in_root),
+          previous_recorded_(recorded),
+          previous_search_seconds_(search_seconds),
+          previous_search_pending_(search_pending),
+          previous_recorded_range_index_(recorded_range_index),
+          previous_source_frame_exact_(source_frame_exact),
+          previous_search_seconds_exact_(search_seconds_exact) {}
+
+    ~CarryUpdateTransaction() noexcept {
+        if (committed_) return;
+        object_world_ = previous_object_world_;
+        object_in_root_ = previous_object_in_root_;
+        recorded_ = previous_recorded_;
+        search_seconds_ = previous_search_seconds_;
+        search_pending_ = previous_search_pending_;
+        recorded_range_index_ = previous_recorded_range_index_;
+        source_frame_exact_ = previous_source_frame_exact_;
+        search_seconds_exact_ = previous_search_seconds_exact_;
+    }
+
+    CarryUpdateTransaction(const CarryUpdateTransaction&) = delete;
+    CarryUpdateTransaction& operator=(const CarryUpdateTransaction&) = delete;
+
+    void commit() noexcept {
+        committed_ = true;
+    }
+
+private:
+    Transform& object_world_;
+    Transform& object_in_root_;
+    bool& recorded_;
+    float& search_seconds_;
+    bool& search_pending_;
+    int32_t& recorded_range_index_;
+    double& source_frame_exact_;
+    double& search_seconds_exact_;
+    Transform previous_object_world_{};
+    Transform previous_object_in_root_{};
+    bool previous_recorded_ = false;
+    float previous_search_seconds_ = 0.0F;
+    bool previous_search_pending_ = false;
+    int32_t previous_recorded_range_index_ = -1;
+    double previous_source_frame_exact_ = 0.0;
+    double previous_search_seconds_exact_ = 0.0;
+    bool committed_ = false;
+};
+
 vec3 root_position(const Database& database, int32_t frame) {
     const size_t index = static_cast<size_t>(frame) *
         g1_skeleton::BoneCount + g1_skeleton::Simulation;
@@ -825,8 +912,17 @@ Pose CarryController::update(
         throw std::invalid_argument("interaction carry invalid update input");
     }
 
-    const Transform desired_object = compose(
-        root_transform(locomotion.pose), object_in_root_);
+    CarryUpdateTransaction transaction(
+        object_world_,
+        object_in_root_,
+        recorded_,
+        search_seconds_,
+        search_pending_,
+        recorded_range_index_,
+        source_frame_exact_,
+        search_seconds_exact_);
+    const Transform live_root = root_transform(locomotion.pose);
+    const Transform desired_object = compose(live_root, object_in_root_);
     if (!valid_transform(desired_object)) {
         throw std::invalid_argument(
             "interaction carry invalid moving object anchor");
@@ -959,23 +1055,43 @@ Pose CarryController::update(
             throw std::invalid_argument(
                 "interaction carry invalid recorded object mapping");
         }
-        Pose solved = recorded_pose;
-        const IKResult ik = solve_hand_ik(
-            solved,
-            hand_,
-            compose(mapped_object, affordance_.hand_in_object),
-            ik_config_);
-        if (ik.accepted) {
-            const Transform published = compose(
-                hand_transform(solved, hand_),
-                inverse(affordance_.hand_in_object));
-            if (!valid_transform(published)) {
-                throw std::invalid_argument(
-                    "interaction carry invalid recorded solved grasp");
+        if (continuous_object(
+                desired_object,
+                mapped_object,
+                config_,
+                ik_config_)) {
+            Pose solved = recorded_pose;
+            const IKResult ik = solve_hand_ik(
+                solved,
+                hand_,
+                compose(mapped_object, affordance_.hand_in_object),
+                ik_config_);
+            if (ik.accepted) {
+                const Transform published = compose(
+                    hand_transform(solved, hand_),
+                    inverse(affordance_.hand_in_object));
+                if (!valid_transform(published)) {
+                    throw std::invalid_argument(
+                        "interaction carry invalid recorded solved grasp");
+                }
+                if (continuous_object(
+                        desired_object,
+                        published,
+                        config_,
+                        ik_config_)) {
+                    const Transform published_in_root = compose(
+                        inverse(live_root), published);
+                    if (!valid_transform(published_in_root)) {
+                        throw std::invalid_argument(
+                            "interaction carry invalid recorded solved grasp");
+                    }
+                    object_world_ = published;
+                    object_in_root_ = published_in_root;
+                    recorded_ = true;
+                    transaction.commit();
+                    return solved;
+                }
             }
-            object_world_ = published;
-            recorded_ = true;
-            return solved;
         }
     }
 
@@ -1014,12 +1130,17 @@ Pose CarryController::update(
     const Transform published = compose(
         hand_transform(solved, hand_),
         inverse(affordance_.hand_in_object));
-    if (!valid_transform(published)) {
+    const Transform published_in_root = compose(
+        inverse(live_root), published);
+    if (!valid_transform(published) ||
+        !valid_transform(published_in_root)) {
         throw std::invalid_argument(
             "interaction carry invalid layered solved grasp");
     }
     object_world_ = published;
+    object_in_root_ = published_in_root;
     recorded_ = false;
+    transaction.commit();
     return solved;
 }
 

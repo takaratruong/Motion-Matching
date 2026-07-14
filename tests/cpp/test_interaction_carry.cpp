@@ -45,6 +45,40 @@ bool near(
            near(left.rotation, right.rotation, tolerance);
 }
 
+bool exact(vec3 left, vec3 right) {
+    return left.x == right.x && left.y == right.y && left.z == right.z;
+}
+
+bool exact(quat left, quat right) {
+    return left.w == right.w && left.x == right.x &&
+           left.y == right.y && left.z == right.z;
+}
+
+bool exact(
+    interaction::Transform left,
+    interaction::Transform right) {
+    return exact(left.position, right.position) &&
+           exact(left.rotation, right.rotation);
+}
+
+bool exact(
+    const interaction::Pose& left,
+    const interaction::Pose& right) {
+    for (size_t bone = 0; bone < g1_skeleton::BoneCount; ++bone) {
+        if (!exact(left.positions[bone], right.positions[bone]) ||
+            !exact(left.velocities[bone], right.velocities[bone]) ||
+            !exact(left.rotations[bone], right.rotations[bone]) ||
+            !exact(
+                left.angular_velocities[bone],
+                right.angular_velocities[bone])) {
+            return false;
+        }
+    }
+    return left.hand_dof == right.hand_dof &&
+           left.hand_dof_velocities == right.hand_dof_velocities &&
+           left.foot_contacts == right.foot_contacts;
+}
+
 template<class Exception, class Function>
 bool throws_as(Function&& function) {
     try {
@@ -196,6 +230,28 @@ void mark_source_frames(interaction::Database& database) {
     for (uint32_t frame = 0; frame < database.frame_count; ++frame) {
         database.hand_dof.at(static_cast<size_t>(frame) * 14U) =
             static_cast<float>(frame);
+    }
+}
+
+void shift_recorded_hand_and_object(
+    interaction::Database& database,
+    int32_t start_frame,
+    int32_t stop_frame,
+    vec3 offset) {
+    for (int32_t frame = start_frame; frame < stop_frame; ++frame) {
+        vec3 hand = interaction::runtime_fixture_detail::read_bone_position(
+            database, frame, interaction::kRightHandBone);
+        interaction::runtime_fixture_detail::write_bone_position(
+            database,
+            frame,
+            interaction::kRightHandBone,
+            hand + offset);
+        vec3 object = interaction::runtime_fixture_detail::read_vec3(
+            database.object_positions, static_cast<size_t>(frame));
+        interaction::runtime_fixture_detail::write_vec3(
+            database.object_positions,
+            static_cast<size_t>(frame),
+            object + offset);
     }
 }
 
@@ -1033,6 +1089,232 @@ void test_recorded_object_is_published_from_solved_hand() {
     assert(near(controller.object_world(), published, 2.0e-5F));
 }
 
+void test_recorded_solved_object_cannot_exceed_continuity_bounds() {
+    using namespace interaction;
+    RuntimeFixture fixture = make_runtime_fixture();
+    const GraspAffordance affordance = fixture_affordance(fixture);
+    const Pose hold = final_hold_pose(fixture);
+    LocomotionSnapshot locomotion = fixture.locomotion;
+    locomotion.pose = hold;
+    const Transform initial_object = object_world_from_hold_pose(
+        hold, Hand::Right, affordance);
+    const NormalizedQuery query = carry_query(
+        fixture.features,
+        locomotion,
+        Hand::Right,
+        initial_object,
+        affordance);
+    for (int32_t frame = 115; frame < 150; ++frame) {
+        set_pose_trajectory_row(fixture.features, frame, query, 10.0F);
+        vec3 hand = runtime_fixture_detail::read_bone_position(
+            fixture.database, frame, kRightHandBone);
+        hand.x += 0.03F;
+        runtime_fixture_detail::write_bone_position(
+            fixture.database, frame, kRightHandBone, hand);
+    }
+    set_pose_trajectory_row(fixture.features, 115, query, 0.0F);
+
+    const CarryRanges ranges = classify_carry_ranges(fixture.database);
+    assert(ranges.recorded.size() == 1U);
+    CarryController controller(
+        fixture.database, fixture.features, ranges);
+    controller.start(
+        hold, Hand::Right, affordance, initial_object);
+
+    const Pose output = controller.update(locomotion, 0.0F);
+
+    assert(!controller.recorded());
+    assert(near(controller.object_world(), initial_object, 2.0e-5F));
+    assert(near(
+        controller.object_world(),
+        compose(
+            hand_world(output, Hand::Right),
+            inverse(affordance.hand_in_object)),
+        2.0e-5F));
+}
+
+void test_recorded_initial_selection_cannot_teleport_object() {
+    using namespace interaction;
+    RuntimeFixture fixture = make_runtime_fixture();
+    const GraspAffordance affordance = fixture_affordance(fixture);
+    const Pose hold = final_hold_pose(fixture);
+    LocomotionSnapshot locomotion = fixture.locomotion;
+    locomotion.pose = hold;
+    const Transform initial_object = object_world_from_hold_pose(
+        hold, Hand::Right, affordance);
+    const NormalizedQuery query = carry_query(
+        fixture.features,
+        locomotion,
+        Hand::Right,
+        initial_object,
+        affordance);
+    for (int32_t frame = 115; frame < 150; ++frame) {
+        set_pose_trajectory_row(fixture.features, frame, query, 10.0F);
+    }
+    set_pose_trajectory_row(fixture.features, 115, query, 0.0F);
+    shift_recorded_hand_and_object(
+        fixture.database, 115, 116, vec3(0.0F, 0.0F, 1.0F));
+
+    const CarryRanges ranges = classify_carry_ranges(fixture.database);
+    assert(ranges.recorded.size() == 1U);
+    IKConfig strict{};
+    strict.maximum_request_position_m = 0.01F;
+    strict.accepted_position_m = 0.005F;
+    CarryController controller(
+        fixture.database,
+        fixture.features,
+        ranges,
+        CarryConfig{},
+        strict);
+    controller.start(
+        hold, Hand::Right, affordance, initial_object);
+
+    const Pose output = controller.update(locomotion, 0.0F);
+
+    assert(!controller.recorded());
+    assert(near(controller.object_world(), initial_object, 2.0e-5F));
+    assert(near(
+        controller.object_world(),
+        compose(
+            hand_world(output, Hand::Right),
+            inverse(affordance.hand_in_object)),
+        2.0e-5F));
+}
+
+void test_recorded_research_fallback_preserves_last_published_anchor() {
+    using namespace interaction;
+    RuntimeFixture fixture = make_runtime_fixture();
+    mark_source_frames(fixture.database);
+    const GraspAffordance affordance = fixture_affordance(fixture);
+    const Pose hold = final_hold_pose(fixture);
+    LocomotionSnapshot locomotion = fixture.locomotion;
+    locomotion.pose = hold;
+    const Transform initial_object = object_world_from_hold_pose(
+        hold, Hand::Right, affordance);
+    const NormalizedQuery initial_query = carry_query(
+        fixture.features,
+        locomotion,
+        Hand::Right,
+        initial_object,
+        affordance);
+    for (int32_t frame = 115; frame < 150; ++frame) {
+        set_pose_trajectory_row(
+            fixture.features, frame, initial_query, 10.0F);
+    }
+    set_pose_trajectory_row(
+        fixture.features, 115, initial_query, 0.0F);
+    shift_recorded_hand_and_object(
+        fixture.database, 115, 116, vec3(0.0F, 0.0F, 0.08F));
+    shift_recorded_hand_and_object(
+        fixture.database, 120, 150, vec3(0.0F, 0.0F, 1.0F));
+
+    CarryConfig continuity{};
+    continuity.maximum_grasp_drift_m = 0.10F;
+    IKConfig bounded{};
+    bounded.maximum_request_position_m = 0.10F;
+    bounded.accepted_position_m = 0.001F;
+    CarryController controller(
+        fixture.database,
+        fixture.features,
+        classify_carry_ranges(fixture.database, continuity),
+        continuity,
+        bounded);
+    controller.start(
+        hold, Hand::Right, affordance, initial_object);
+
+    const Pose first_output = controller.update(locomotion, 0.0F);
+    const Transform first_object = controller.object_world();
+    assert(controller.recorded());
+    assert(length(first_object.position - initial_object.position) > 0.07F);
+    locomotion.pose = first_output;
+    const NormalizedQuery later_query = carry_query(
+        fixture.features,
+        locomotion,
+        Hand::Right,
+        first_object,
+        affordance);
+    for (int32_t frame = 115; frame < 150; ++frame) {
+        set_pose_trajectory_row(
+            fixture.features, frame, later_query, 10.0F);
+    }
+    set_pose_trajectory_row(
+        fixture.features, 120, later_query, 0.0F);
+
+    const Pose fallback_output = controller.update(
+        locomotion, continuity.search_interval_seconds);
+
+    assert(!controller.recorded());
+    assert(near(controller.object_world(), first_object, 2.0e-4F));
+    assert(near(
+        controller.object_world(),
+        compose(
+            hand_world(fallback_output, Hand::Right),
+            inverse(affordance.hand_in_object)),
+        2.0e-5F));
+}
+
+void test_update_exception_rolls_back_search_playback_and_anchor_state() {
+    using namespace interaction;
+    RuntimeFixture fixture = make_runtime_fixture();
+    mark_source_frames(fixture.database);
+    const GraspAffordance affordance = fixture_affordance(fixture);
+    const Pose hold = final_hold_pose(fixture);
+    LocomotionSnapshot locomotion = fixture.locomotion;
+    locomotion.pose = hold;
+    const Transform object = object_world_from_hold_pose(
+        hold, Hand::Right, affordance);
+    const NormalizedQuery query = carry_query(
+        fixture.features, locomotion, Hand::Right, object, affordance);
+    for (int32_t frame = 115; frame < 125; ++frame) {
+        set_pose_trajectory_row(fixture.features, frame, query, 10.0F);
+    }
+    set_pose_trajectory_row(fixture.features, 115, query, 0.0F);
+
+    CarryRanges range{};
+    range.recorded.push_back({1, 115, 125, Hand::Right});
+    const CarryConfig config = short_range_config();
+    CarryController recovered(
+        fixture.database, fixture.features, range, config);
+    CarryController fresh(
+        fixture.database, fixture.features, range, config);
+    recovered.start(hold, Hand::Right, affordance, object);
+    fresh.start(hold, Hand::Right, affordance, object);
+
+    LocomotionSnapshot extreme = locomotion;
+    const float finite_max = std::numeric_limits<float>::max();
+    extreme.pose.positions[g1_skeleton::Simulation].x = finite_max;
+    extreme.future_root_positions[0].x = -finite_max;
+    assert(std::isfinite(
+        extreme.pose.positions[g1_skeleton::Simulation].x));
+    assert(std::isfinite(extreme.future_root_positions[0].x));
+    assert(throws_as<std::invalid_argument>([&] {
+        (void)recovered.update(extreme, 0.06F);
+    }));
+
+    const Pose recovered_zero = recovered.update(locomotion, 0.0F);
+    const Pose fresh_zero = fresh.update(locomotion, 0.0F);
+    assert(recovered.recorded());
+    assert(recovered.recorded() == fresh.recorded());
+    assert(exact(recovered_zero, fresh_zero));
+    assert(exact(recovered.object_world(), fresh.object_world()));
+
+    for (int32_t frame = 115; frame < 125; ++frame) {
+        set_pose_trajectory_row(fixture.features, frame, query, 10.0F);
+    }
+    set_pose_trajectory_row(fixture.features, 120, query, 0.0F);
+    const Pose recovered_before = recovered.update(locomotion, 0.099F);
+    const Pose fresh_before = fresh.update(locomotion, 0.099F);
+    assert(exact(recovered_before, fresh_before));
+    assert(exact(recovered.object_world(), fresh.object_world()));
+    assert(recovered_before.hand_dof[0] < 120.0F);
+
+    const Pose recovered_crossing = recovered.update(locomotion, 0.002F);
+    const Pose fresh_crossing = fresh.update(locomotion, 0.002F);
+    assert(exact(recovered_crossing, fresh_crossing));
+    assert(exact(recovered.object_world(), fresh.object_world()));
+    assert(recovered_crossing.hand_dof[0] >= 120.0F);
+}
+
 void test_repeated_start_resets_recorded_cursor_and_cadence() {
     using namespace interaction;
     RuntimeFixture fixture = make_runtime_fixture();
@@ -1108,6 +1390,10 @@ int main() {
     test_recorded_requires_compatible_canonical_grasp();
     test_rejected_recorded_ik_uses_layered_fallback();
     test_recorded_object_is_published_from_solved_hand();
+    test_recorded_solved_object_cannot_exceed_continuity_bounds();
+    test_recorded_initial_selection_cannot_teleport_object();
+    test_recorded_research_fallback_preserves_last_published_anchor();
+    test_update_exception_rolls_back_search_playback_and_anchor_state();
     test_repeated_start_resets_recorded_cursor_and_cadence();
     test_wrong_hand_uses_fallback();
     return 0;
