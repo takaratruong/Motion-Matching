@@ -18,6 +18,7 @@
 - Store safety bounds as binary64. Do not round a safety decision through binary32.
 - The certified arithmetic and ordered-lift search must not be compiled under `-ffast-math`, reassociation, contraction, or LTO into a fast-math caller.
 - The strict TU requires round-to-nearest **and gradual underflow** for binary32/binary64. An inherited x86 FTZ/DAZ mode or a portable volatile denormal probe failure is `ArithmeticFailure`, never an implicit arithmetic variant.
+- For each binary32 lift key, materialize the controller-applied endpoint once as canonical round-to-nearest binary32 in the strict TU, then preserve target subtraction as an exact binary64 expansion. The planner may not certify the surrogate exact-real sum `B+L` that the binary32 controller cannot realize.
 - Exactly `dt = 1.0f / 25.0f` remains the swing-history timing contract. Call the Task 2 producer helper `g1_ik_dt_is_exact_25_hz`; do not add a second tolerant comparison.
 - `0.08f` is the exact maximum swing-only endpoint lift. Failure to certify the corrected sweep at exactly that value requests safe stop.
 - A returned error or finite rejected candidate cannot mutate swing history, accepted pose arrays, accepted clearance, support state, matcher state, or simulation state.
@@ -168,6 +169,13 @@ constexpr double G1ClearanceMaximumCertificateWidthM = 1.0e-6;
 
 G1ClearanceBudget g1_pose_clearance_budget();
 G1ClearanceBudget g1_swing_foot_clearance_budget();
+
+G1ClearanceStatus g1_apply_swing_lift_y(
+    float& output_y,
+    float input_y,
+    float lift_m,
+    char* error,
+    int error_capacity);
 
 G1ClearanceStatus g1_point_clearance(
     G1ClearanceResult& output,
@@ -328,12 +336,16 @@ struct G1CertifiedEndpoint
     double z;                   // exact promotion of canonical binary32 Z
     G1ExactY y;
     G1EndpointSourceKey source_key;
+    uint32_t lift_bits;         // +0 for public/prior; canonical L for current
+    uint32_t materialized_y_bits; // original Y, or canonical RN32(B.y + L)
 };
 ```
 
-`g1_capsule_clearance` validates/canonicalizes its public binary32 endpoints, promotes XZ exactly, creates a one-term exact Y expansion, derives the outward enclosure, and calls an internal `g1_capsule_clearance_certified`. For endpoint reversal parity, transform each canonical float bit pattern to IEEE total-order form (`negative ? ~bits : bits ^ 0x80000000`), sort by the `(x,y,z)` ordered-bit tuple, then assign public semantic ordinals `0,1`. No proof code converts a `G1CertifiedEndpoint` back to `vec3`.
+`g1_capsule_clearance` validates/canonicalizes its public binary32 endpoints, promotes XZ exactly, creates a one-term exact Y expansion, derives the outward enclosure, and calls an internal `g1_capsule_clearance_certified`. For endpoint reversal parity, transform each canonical float bit pattern to IEEE total-order form (`negative ? ~bits : bits ^ 0x80000000`), sort by the `(x,y,z)` ordered-bit tuple, then assign public semantic ordinals `0,1`. Public and prior endpoints store `lift_bits=+0` and `materialized_y_bits=source_key.original_y_bits`. No proof code converts a `G1CertifiedEndpoint` back to `vec3`.
 
-Swing construction uses source kind 1, the sphere primitive index, semantic ordinal `0=prior`/`1=current`, and the original center bits. Form prior adjusted Y with error-free `TwoDiff(double(A.y),double(P))`. Form current adjusted Y by inserting the error-free `TwoSum(double(B.y),double(L))` expansion and subtracting `double(W)` into a canonical expansion. Sum the expansion outward to obtain `y.enclosure`; do not cast either adjusted value to binary32. Canonicalize the two certified endpoints by `source_key` before patch construction, so patch order and witness keys never depend on rounded adjusted Y. The exact expansion defines the real segment used by witnesses; its interval drives conservative lower arithmetic.
+Swing construction uses source kind 1, the sphere primitive index, semantic ordinal `0=prior`/`1=current`, and the original canonical center bits. Form prior adjusted Y with error-free `TwoDiff(double(A.y),double(P))`. For current Y, first call the same private strict materializer used by `g1_apply_swing_lift_y`: compute the exact binary64 sum of promoted binary32 `B.y` and `L`, round it once to canonical round-to-nearest binary32 `B_lifted.y`, and reject a non-runtime result. Then form the adjusted Y only as error-free `TwoDiff(double(B_lifted.y),double(W))`. Preserve the original canonical `B.y` bits in `source_key`, and preserve the `L` and materialized `B_lifted.y` bits in the endpoint provenance fields. The source key itself is independent of both lift and materialized Y, so endpoint and fallback ordering remain stable across materialization plateaus. Sum the adjusted expansion outward to obtain `y.enclosure`; never cast the adjusted difference to binary32. Canonicalize the two certified endpoints by `source_key` before patch construction, so patch order and witness keys never depend on adjusted-Y rounding. The exact expansion defines the real segment used by witnesses; its interval drives conservative lower arithmetic.
+
+`g1_apply_swing_lift_y` is a non-inline transactional wrapper around that private materializer. It performs the Section 6 arithmetic-environment check; validates/canonicalizes runtime `input_y`; requires finite, nonnegative `lift_m <= 0.08f` and canonicalizes either zero sign to `+0.0f`; materializes with one strict binary64-to-binary32 round; canonicalizes a zero result to `+0.0f`; and rejects a nonzero subnormal or nonfinite result. Positive subnormal lift keys are valid and retain their bits—the gradual-underflow precondition exists in part so every ordered key from `+0.0f` through `0.08f` can be evaluated without silently flushing the lift. Invalid arguments return `InvalidInput`, while an unrepresentable materialized result returns `ArithmeticFailure`; either leaves `output_y` unchanged. Planning and controller integration may not spell the addition independently. Each proof or controller call therefore uses its exact supplied canonical input and lift bits under the same rounding mode, signed-zero rule, and output validation.
 
 ### Bound and witness tie-breaking
 
@@ -564,7 +576,7 @@ If the interval remains wider, return `Uncertified`; never replace the lower bou
 
 ## 7. Exact G1HF/v2 Bounds and Triangle Enumeration
 
-At every public status entry, first run the Section 6 arithmetic-environment check, then validate the entire caller limit struct against its family factory. Either failure returns before field access or ledger creation. After those preconditions:
+At every public status entry, first run the Section 6 arithmetic-environment check. Every entry that accepts a budget then validates the entire caller limit struct against its family factory before field access or ledger creation; `g1_apply_swing_lift_y` instead performs the scalar validation specified in Section 3 and never creates a ledger. After those preconditions, geometry entries:
 
 1. Require `field.version==2` and `terrain_heightfield_is_queryable(field)`.
 2. Require every body coordinate to pass Task 2's `g1_ik_vec3_is_runtime_value`; canonicalize signed zero. Nonzero binary32 subnormals are `InvalidInput`, including Y.
@@ -703,11 +715,12 @@ For one sphere, let `A` be its prior accepted center, `B` its current candidate 
 ```text
 A_adjusted.xz = exact_promote(A.xz)
 A_adjusted.y  = exact_expansion(TwoDiff(double(A.y), double(P)))
+B_lifted.y    = strict_canonical_rn32(double(B.y) + double(L))
 B_adjusted.xz = exact_promote(B.xz)
-B_adjusted.y  = exact_expansion(double(B.y) + double(L) - double(W))
+B_adjusted.y  = exact_expansion(TwoDiff(double(B_lifted.y), double(W)))
 ```
 
-Construct the second expression with `TwoSum(B.y,L)` followed by expansion subtraction of `W`, as specified in Section 3; the pseudocode denotes an exact-real expansion, not ordinary left-associated binary64 and never a binary32 temporary. The certified capsule clearance of `[A_adjusted,B_adjusted]` against zero is exactly the continuous target-subtracted margin. Aggregate all four adjusted certified capsules. `applied_lift_m` remains binary32 because it is the downstream control value; planning keeps its promoted exact contribution, while the mandatory post-solve call certifies the actual final binary32 pose produced by the controller.
+The strict materializer is intentional binary32 geometry, not a loss inside the proof: it is exactly the one-round operation the controller applies. Only the subsequent `B_lifted.y-W` target subtraction remains an exact-real expansion and must never pass through `vec3`. The certified capsule clearance of `[A_adjusted,B_adjusted]` against zero is therefore exactly the continuous target-subtracted margin for the controller-materialized planned endpoint. Aggregate all four adjusted certified capsules. `applied_lift_m` is the binary32 key supplied to the same public helper during controller integration. The mandatory post-solve call then certifies the actual final sphere centers produced by IK; it does not add `L` again because those centers already contain the applied controller correction.
 
 All three binary64 fields in `G1SwingClearancePlan` are target-subtracted margins, not raw sole clearances: `baseline_lower_margin_m` is the `L=0` lower bound, and the two corrected fields are the lower/witness bounds at `applied_lift_m`. On the contact shortcut they are canonical `+0.0` and ignored because `sweep_evaluated=false`. `work` is the total private-ledger work over distinct cached lift evaluations.
 
@@ -719,15 +732,16 @@ Lift search operates on positive finite binary32 bit keys:
 4. Evaluate `L=config.max_swing_lift_m`, whose bits must equal exact `0.08f`. Propagate a non-`Ok` evaluator status. If its valid lower margin is negative, return `Ok` with both lift fields equal to the tested cap, `required_lift_certified=false`, and `safe_stop_requested=true`. This means "the cap did not certify," not that an unrepresented larger requirement was measured.
 5. Otherwise maintain a not-certified low key and a directly certified-safe high key. Bisect the integer bit keys; evaluate and memoize each new midpoint. A midpoint with `lower_margin_m >= 0` becomes high, and any other valid midpoint becomes low. A non-`Ok` midpoint propagates transactionally rather than being treated as unsafe.
 6. The inclusive range from `+0.0f` to `0.08f` needs at most 30 midpoint halvings, so the two endpoint evaluations plus those midpoints fit exactly in the 32-distinct-key cap. At adjacency, return the cached high key with `required_lift_certified=true`; its cached predecessor is the low key and did not certify. Do not spend two hidden 33rd/34th re-evaluations. If adjacency was not reached within the cap, return `Uncertified`.
-7. Post-solve validation is a separate top-level call with a fresh swing budget. It uses prior accepted centers and actual final centers, subtracts planted/swing endpoint targets in the same way, and requires a nonnegative lower margin.
+7. Post-solve validation is a separate top-level call with a fresh swing budget. It uses prior accepted centers and actual final centers, subtracts planted/swing endpoint targets in the same way but uses `L=+0` because the final centers already embody the controller-applied lift, and requires a nonnegative lower margin.
 
-The exact promoted contribution is nondecreasing in positive ordered-float `L`; every sweep parameter therefore receives a nonnegative, nondecreasing endpoint displacement. A directly nonnegative lower bound certifies that key and the true planned geometry at every larger key. The numerical evaluator may conservatively fail to certify a safe midpoint; in that case the search can over-lift by an unresolved certification band, not necessarily only one ULP. It can never return an under-lift in the planned geometry: the selected high key itself has a cached nonnegative lower bound. The downstream pose is accepted only after the separate actual-center validation. Tests claim only that the predecessor did not certify, not that it was proven to penetrate.
+For fixed binary32 `B.y`, `B_lifted.y=canonical_rn32(double(B.y)+double(L))` is nondecreasing over nonnegative ordered-float lift keys and generally contains plateaus. Every sweep parameter therefore receives a nonnegative, nondecreasing **materialized** endpoint displacement. A directly nonnegative lower bound certifies that key's controller-realizable planned geometry and every larger valid key's nonlower materialized geometry. The numerical evaluator may conservatively fail to certify a safe midpoint; in that case the search can over-lift by an unresolved certification band, not necessarily only one ULP. It can never return an under-lift in the planned geometry: the selected high key itself has a cached nonnegative lower bound for its materialized endpoint. The controller must apply that key through `g1_apply_swing_lift_y`, and the downstream pose is accepted only after separate actual-center validation. Tests claim only that the predecessor did not certify, not that it was proven to penetrate.
 
 ---
 
 ## 10. Transaction and Safe-Stop Semantics
 
 - Geometry functions take no history or controller state.
+- `g1_apply_swing_lift_y` changes only its scalar output and only on `Ok`; its private materialization operation is also the sole operation used to build planned current endpoints.
 - Swing planning accepts `const G1SwingHistory&` and writes only a local `G1SwingClearancePlan` before success assignment.
 - Task 6 may advance its explicitly owned lock observer according to its existing policy, but it cannot commit swing history.
 - Task 7 commits final rendered sphere centers only after the candidate pose, post-solve certified margin, planted thresholds, pose-capsule thresholds, and all other IK bounds are accepted.
@@ -864,23 +878,29 @@ Require the interval to contain the corresponding analytic value. A bilinear sur
 
 ### E. Continuous swept lift
 
-Reuse the near-`sqrt(3)` exactly coplanar fixture. Construct previous/current binary32 center Ys near clearances `+0.005 m` and `-0.001 m` at the same XZ. With binary32 planted/swing targets near `0.005` and `0.015`, compute the exact-real endpoint threshold `R` from the promoted input bits; require it to be within `2e-6` of `0.016 m`. Require:
+Reuse the near-`sqrt(3)` exactly coplanar fixture. Construct previous/current binary32 center Ys near clearances `+0.005 m` and `-0.001 m` at the same XZ. With binary32 planted/swing targets near `0.005` and `0.015`, compute the required materialized endpoint threshold from promoted input bits, then derive the oracle as the smallest ordered binary32 `L` whose strict `canonical_rn32(B.y+L)` reaches that endpoint; require the oracle key's value to be within `2e-6` of `0.016 m`. Require:
 
-- returned lift at least the smallest certified float at or above the promoted-bit oracle `R`;
+- returned lift at least that materialized-endpoint oracle key;
 - corrected lower margin nonnegative;
 - predecessor float not certified;
 - the old approximate `0.010641016 m` lift rejected.
 
 Repeat with only one of four spheres obstructed and require provenance for that sphere.
 
-Add a downcast trap on a flat field. Use `W=0x3c75c28f` (`0.015f`), `r=0x3ca3d70a` (`0.02f`), current center Y `B=0x3d0f5c28`, and every terrain height `0xb0c00000` (`-3*2^-31`). Make the prior adjusted endpoint safely higher so the current endpoint controls. The exact promoted threshold is:
+Add a materialized-endpoint/adjusted-downcast trap on a flat field. Use current center Y `B=0x3d0f5c28`, lift key `L=0x31000001`, `W=0x3c75c28f` (`0.015f`), `r=0x3ca3d70a` (`0.02f`), and every terrain height `h=0x30000000` (`2^-31`). Make the prior adjusted endpoint safely higher so the current endpoint controls. The strict helper must produce:
 
 ```text
-R = double(W) + double(r) + double(height) - double(B)
-  = 1.3969838619232177734375e-9  // binary32 bits 0x30c00000
+B_lifted = canonical_rn32(double(B) + double(L))
+         = 0x3d0f5c29
+
+double(B_lifted) - double(W) - double(r) - double(h)
+         = +4.656612873077392578125e-10
+
+double(float(B_lifted - W)) - double(r) - double(h)
+         = -4.656612873077392578125e-10
 ```
 
-The certified search must return a safe key strictly above `R` but below `0x31000000` (`2^-29`). At `L=0x31000000`, exact expansion arithmetic gives current margin `+4.656612873077392578125e-10`, while the forbidden `float(float(B+L)-W)` path leaves `B+L` rounded to `B` and reports `-1.3969838619232177734375e-9`. Assert the exact-expansion result and returned-key range so a binary32 adjusted-Y downcast cannot pass.
+The predecessor key `0x31000000` materializes back to `B` and remains negative. Require the fixture's computed full mandatory terrain guard to be strictly smaller than the positive `2^-31` margin at `0x31000001`; subject to that conservative guard, the certified ordered search must select exactly `0x31000001`, its predecessor must not certify, and `g1_apply_swing_lift_y` must return materialized bits `0x3d0f5c29`. Assert the original-B bits in the stable source key, the separate lift/materialized-Y provenance fields, and the exact positive/forbidden-negative margins. A surrogate exact-real `B+L` planner, a float-adjusted `B_lifted-W`, or an independently spelled controller addition must fail this RED.
 
 ### F. Rank and projection degeneracies
 
@@ -901,7 +921,7 @@ Exercise `A==B`, segment parallel to terrain, segment in the terrain plane, vert
 
 - `1.0f/25.0f` succeeds.
 - Both adjacent `nextafter` values fail transactionally.
-- Keep the configuration maximum at exact `0.08f`. Construct promoted-bit endpoint thresholds immediately below/at the cap and require success, then one ordered float above the cap and require the assigned cap-failure safe-stop plan even though the deficit is below `1e-6`.
+- Keep the configuration maximum at exact `0.08f`. Construct materialized-endpoint thresholds immediately below/at the cap and require success, then one ordered float above the cap and require the assigned cap-failure safe-stop plan even though the deficit is below `1e-6`.
 - Exactly `0.08f` is evaluated; no `+1e-6` acceptance hole is allowed.
 
 ### I. Build and parity
@@ -912,7 +932,7 @@ Exercise `A==B`, segment parallel to terrain, segment in the terrain plane, vert
 
 ### J. Arithmetic-environment rejection and restoration
 
-- Seed every geometry/swing status output and its surrounding history with distinct bits. Under an RAII guard that snapshots `fegetround`, set `FE_UPWARD` and `FE_DOWNWARD` in turn; table-drive every public `G1ClearanceStatus` entry and require `ArithmeticFailure`, no ledger/field access, and no output/history mutation. Restore the original mode before ordinary numeric assertions and prove one subsequent valid call succeeds.
+- Seed the lift helper's scalar output and every geometry/swing status output plus surrounding history with distinct bits. Under an RAII guard that snapshots `fegetround`, set `FE_UPWARD` and `FE_DOWNWARD` in turn; table-drive every public `G1ClearanceStatus` entry and require `ArithmeticFailure`, no ledger/field access, and no output/history mutation. Restore the original mode before ordinary numeric assertions and prove one subsequent valid call succeeds.
 - On x86/SSE, use a second RAII guard that snapshots the exact MXCSR word. Set FTZ bit 15, DAZ bit 6, and both bits in separate cases; require the same transactional `ArithmeticFailure` from a geometry call and a swing call. Restore the original MXCSR word on every scope exit, including failed checks, and verify it bit-for-bit before continuing. Other targets skip only direct MXCSR mutation, never the portable baseline probe.
 - Exercise the portable volatile multiply/add probes in the normal environment and require their four expected subnormal bit encodings. Tests must never leave the process rounding mode or denormal mode changed for later parity executables.
 
@@ -938,7 +958,7 @@ Exercise `A==B`, segment parallel to terrain, segment in the terrain plane, vert
 - Produces the exact enums, structs, constants, and declarations from Section 3.
 - Produces a strict-TU compile guard and stub status-name helper.
 
-- [ ] Write compile-time tests for enum values, binary64 bound types, exact factory constants, `has_denorm==denorm_present` for both types, and non-copying const-history signatures.
+- [ ] Write compile-time tests for enum values, binary64 bound types, exact factory constants, endpoint provenance fields, the `g1_apply_swing_lift_y` signature, `has_denorm==denorm_present` for both types, and non-copying const-history signatures.
 - [ ] Compile the test before creating the files; require a missing-header RED.
 - [ ] Add RED fixture J for `FE_UPWARD`, `FE_DOWNWARD`, FTZ, DAZ, portable denormal bits, environment restoration, and transactional outputs.
 - [ ] Add over-factory and `UINT32_MAX` REDs for every pose/swing budget field.
@@ -981,7 +1001,7 @@ Exercise `A==B`, segment parallel to terrain, segment in the terrain plane, vert
 
 - [ ] Add RED tests for exact Y expansions, public endpoint reversal, source-key order, analytic face interior, each edge clamp branch, circle tangency, vertical projection, membership uncertainty, and witness feasibility.
 - [ ] Implement outward interval primitives with nonfinite/zero-denominator rejection.
-- [ ] Implement `TwoSum`/`TwoDiff` expansion canonicalization, endpoint wrappers, and source-key ordering without adjusted-Y downcasts.
+- [ ] Implement `TwoSum`/`TwoDiff` expansion canonicalization, endpoint wrappers, and source-key ordering with original/lift/materialized bit provenance and no adjusted-Y downcasts.
 - [ ] Implement face stationary formulas and interval barycentric classification.
 - [ ] Implement the edge formulas and vertical-edge case.
 - [ ] Implement lower/witness aggregation with the Section 3 key order.
@@ -1039,16 +1059,16 @@ Exercise `A==B`, segment parallel to terrain, segment in the terrain plane, vert
 **Interfaces:**
 - Produces checked swing history, four-capsule sweep, ordered-float endpoint lift, and actual post-solve validation.
 
-- [ ] Add RED fixtures E (including the exact `0x30c00000` downcast trap), G, H, contact-shortcut validation, failed reset/commit, and rejected-history snapshots.
+- [ ] Add RED fixtures E (including the exact `0x31000001` materialization/adjusted-downcast trap), G, H, contact-shortcut validation, failed reset/commit, and rejected-history snapshots.
 - [ ] Cache bounded XZ terrain pairs once per four-sphere plan.
-- [ ] Implement adjusted target geometry directly as `G1CertifiedEndpoint` expansions; never call the public `vec3` capsule wrapper or round adjusted Y.
+- [ ] Implement the private strict one-round lift materializer and transactional `g1_apply_swing_lift_y`; build current `G1CertifiedEndpoint` Y as `TwoDiff(materialized_y,W)`, never call the public `vec3` capsule wrapper, and never round the adjusted difference.
 - [ ] Implement exact-dt validation before contact branching.
 - [ ] Implement the 0/max/ordered-bit lift search and predecessor verification.
 - [ ] Implement post-solve validation with actual final centers.
 - [ ] Run all focused modes and compare strict/release result lines byte-for-byte.
 - [ ] Commit with `feat: plan certified G1 swing clearance`.
 
-**Review gate:** The wall/cap rejection must leave history exact, the sqrt(3) fixture must require approximately `0.016 m`, and the named near-threshold fixture must return below `0x31000000`; a float-adjusted endpoint is an automatic rejection.
+**Review gate:** The wall/cap rejection must leave history exact, the sqrt(3) fixture must require approximately `0.016 m`, and the named near-threshold fixture must materialize `0x3d0f5c29` and select lift key `0x31000001`; a surrogate exact `B+L`, float-adjusted endpoint, or independently rounded controller application is an automatic rejection.
 
 ### Task 7: Integrate separate-object builds and downstream status handling
 
@@ -1065,6 +1085,7 @@ Exercise `A==B`, segment parallel to terrain, segment in the terrain plane, vert
 
 - [ ] Add integration RED tests for every status mapping and accepted/rejected snapshots.
 - [ ] Replace header-only calls with the public non-inline API.
+- [ ] Apply `plan.applied_lift_m` to the scratch sole-target Y only through `g1_apply_swing_lift_y`; compare the helper's materialized bits with the planner fixture and never spell `target_y + lift` in the fast-math caller.
 - [ ] Update strict, release, sanitizer, and controller link commands exactly as Section 11.
 - [ ] Add the negative fast-math-kernel build guard and arithmetic-environment matrix to verification; link without a fast-math startup object.
 - [ ] Run the complete verification matrix below.
@@ -1088,7 +1109,7 @@ Run after each relevant task and in full after Task 7:
 | Determinism | repeat release caller 20 times | strict kernel | Identical status/bound/witness/work hash |
 | Transaction | strict and release | strict kernel | Seeded outputs/history exact after all non-`Ok` paths |
 | Budget | strict and sanitizer | strict kernel | Exact/tightened limits accepted; every factory+1 and `UINT32_MAX` field is transactional `InvalidInput` before work |
-| Endpoint precision | strict and release | strict kernel | Exact-expansion downcast trap returns below `0x31000000`; source/reversal keys match |
+| Endpoint precision | strict and release | strict kernel | `L=0x31000001` materializes Y `0x3d0f5c29`, exact adjusted margin is positive while float-adjusted is negative, search selects that key, and source/reversal keys match |
 | Output rounding | strict and sanitizer | strict kernel | Upward, zero/subnormal, and binade probes obey producer-height lower inequality; guard `>1e-6` is unchanged-output `Uncertified` |
 | Spacing ridge | strict and release | strict kernel | Local removed lattice `>+0.00019`; certified tent witness `<-0.00079` |
 | Geometry | all successful modes | strict kernel | Analytic oracle enclosed; width `<=1e-6` |
@@ -1098,7 +1119,7 @@ Final source/order guards:
 ```bash
 ! rg -n 'ceil\(|radial_steps|segment_steps|half.*cell.*sample' \
   g1_clearance.cpp g1_clearance.h
-rg -n '#error.*fast math|has_denorm|_mm_getcsr|G1CertifiedEndpoint|TwoDiff|G1ClearancePatchesPerPair|G1ClearanceMaximumLiftEvaluations' \
+rg -n '#error.*fast math|has_denorm|_mm_getcsr|G1CertifiedEndpoint|materialized_y_bits|g1_apply_swing_lift_y|TwoDiff|G1ClearancePatchesPerPair|G1ClearanceMaximumLiftEvaluations' \
   g1_clearance.cpp g1_clearance.h
 git diff --check
 ```
