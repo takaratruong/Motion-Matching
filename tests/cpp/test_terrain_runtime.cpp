@@ -1052,6 +1052,14 @@ static void test_traversability_command_limits_safely_and_recovers()
         scale, scale_velocity, diagnostics, grid, field,
         vec3(0.3f, 0.0f, 0.2f), vec3(0.5f, 0.0f, 0.0f),
         1.0f / 25.0f);
+    check_float_bits(
+        traversability_blocked_reserve,
+        float_bits(0.04f),
+        "blocked command reserve is exactly four centimeters");
+    const float expected_first_scale = clampf(
+        (diagnostics.distance - traversability_blocked_reserve) /
+            (diagnostics.commanded_speed * 0.50f),
+        0.0f, 1.0f);
     check(diagnostics.blocked &&
               diagnostics.reason == walkability_blocked_cell &&
               diagnostics.walkability_class == 2 &&
@@ -1059,6 +1067,7 @@ static void test_traversability_command_limits_safely_and_recovers()
               diagnostics.applied_speed > 0.0f &&
               diagnostics.applied_speed < diagnostics.commanded_speed &&
               scale > 0.0f && scale < 1.0f &&
+              float_bits(scale) == float_bits(expected_first_scale) &&
               first.x == diagnostics.applied_speed && first.y == 0.0f &&
               first.z == 0.0f,
           "lookahead smoothly limits command before a block");
@@ -1155,6 +1164,93 @@ static void test_traversability_command_limits_safely_and_recovers()
         malformed, field, 1.0f, 0.0f, vec3(0.3f, 0.0f, 0.2f),
         vec3(0.5f, 0.0f, 0.0f), 1.0f / 25.0f,
         "malformed command terrain stops safely");
+}
+
+static void test_blocked_planar_stop_preserves_vertical_bits()
+{
+    traversability_diagnostics stopped = {};
+    stopped.blocked = true;
+    stopped.applied_speed = 1.0e-4f;
+    vec3 velocity(
+        float_from_bits(UINT32_C(0x3f800001)),
+        float_from_bits(UINT32_C(0x7fc23456)),
+        float_from_bits(UINT32_C(0xbf000001)));
+    vec3 acceleration(
+        float_from_bits(UINT32_C(0x40000001)),
+        float_from_bits(UINT32_C(0x80000000)),
+        float_from_bits(UINT32_C(0xc0400001)));
+    const uint32_t velocity_y = float_bits(velocity.y);
+    const uint32_t acceleration_y = float_bits(acceleration.y);
+
+    traversability_stop_blocked_planar_dynamics(
+        stopped, velocity, acceleration);
+    check_vec3_bits(
+        velocity, UINT32_C(0x00000000), velocity_y, UINT32_C(0x00000000),
+        "blocked stopped velocity writes positive-zero XZ only");
+    check_vec3_bits(
+        acceleration, UINT32_C(0x00000000), acceleration_y,
+        UINT32_C(0x00000000),
+        "blocked stopped acceleration writes positive-zero XZ only");
+
+    const vec3 original_velocity(
+        float_from_bits(UINT32_C(0x3f123456)),
+        float_from_bits(UINT32_C(0xffc34567)),
+        float_from_bits(UINT32_C(0xbf234567)));
+    const vec3 original_acceleration(
+        float_from_bits(UINT32_C(0x40123456)),
+        float_from_bits(UINT32_C(0x00000001)),
+        float_from_bits(UINT32_C(0xc0123456)));
+
+    traversability_diagnostics clear = {};
+    clear.blocked = false;
+    clear.applied_speed = 0.0f;
+    velocity = original_velocity;
+    acceleration = original_acceleration;
+    traversability_stop_blocked_planar_dynamics(
+        clear, velocity, acceleration);
+    check_vec3_bits(
+        velocity, float_bits(original_velocity.x),
+        float_bits(original_velocity.y), float_bits(original_velocity.z),
+        "clear diagnostics preserve every velocity bit");
+    check_vec3_bits(
+        acceleration, float_bits(original_acceleration.x),
+        float_bits(original_acceleration.y),
+        float_bits(original_acceleration.z),
+        "clear diagnostics preserve every acceleration bit");
+
+    traversability_diagnostics moving = {};
+    moving.blocked = true;
+    moving.applied_speed = nextafterf(1.0e-4f, INFINITY);
+    velocity = original_velocity;
+    acceleration = original_acceleration;
+    traversability_stop_blocked_planar_dynamics(
+        moving, velocity, acceleration);
+    check_vec3_bits(
+        velocity, float_bits(original_velocity.x),
+        float_bits(original_velocity.y), float_bits(original_velocity.z),
+        "above-threshold blocked diagnostics preserve velocity bits");
+    check_vec3_bits(
+        acceleration, float_bits(original_acceleration.x),
+        float_bits(original_acceleration.y),
+        float_bits(original_acceleration.z),
+        "above-threshold blocked diagnostics preserve acceleration bits");
+
+    traversability_diagnostics invalid = {};
+    invalid.blocked = true;
+    invalid.applied_speed = float_from_bits(UINT32_C(0x7fc23456));
+    velocity = original_velocity;
+    acceleration = original_acceleration;
+    traversability_stop_blocked_planar_dynamics(
+        invalid, velocity, acceleration);
+    check_vec3_bits(
+        velocity, float_bits(original_velocity.x),
+        float_bits(original_velocity.y), float_bits(original_velocity.z),
+        "nonfinite blocked diagnostics preserve velocity bits");
+    check_vec3_bits(
+        acceleration, float_bits(original_acceleration.x),
+        float_bits(original_acceleration.y),
+        float_bits(original_acceleration.z),
+        "nonfinite blocked diagnostics preserve acceleration bits");
 }
 
 static void test_traversability_clip_is_planar_and_bit_preserving()
@@ -1427,8 +1523,11 @@ static void test_controller_traversability_guard_data_flow()
     const char* limit = require_source_token(
         commanded, "traversability_limit_command(",
         "controller limits desired velocity");
+    const char* planar_stop = require_source_token(
+        limit, "traversability_stop_blocked_planar_dynamics(",
+        "controller stops blocked planar dynamics");
     const char* desired_state = require_source_token(
-        limit, "state.desired_velocity = desired_velocity_curr;",
+        planar_stop, "state.desired_velocity = desired_velocity_curr;",
         "controller stores limited desired velocity");
     const char* trajectory = require_source_token(
         desired_state, "trajectory_desired_velocities_predict(",
@@ -1448,7 +1547,8 @@ static void test_controller_traversability_guard_data_flow()
     const char* matcher = require_source_token(
         future_back, "const int query_database_frame = state.frame_index;",
         "controller matching follows limited trajectory prediction");
-    check(commanded < limit && limit < desired_state &&
+    check(commanded < limit && limit < planar_stop &&
+              planar_stop < desired_state &&
               desired_state < trajectory && trajectory < future_forward &&
               future_forward < future_side && future_side < future_back &&
               future_back < matcher,
@@ -3152,6 +3252,7 @@ int main(int argc, char** argv)
     test_walkability_sweep_handles_clear_blocked_and_hostile_steps();
     test_walkability_checked_conversion_and_exact_sample_spacing();
     test_traversability_command_limits_safely_and_recovers();
+    test_blocked_planar_stop_preserves_vertical_bits();
     test_traversability_clip_is_planar_and_bit_preserving();
     test_walkability_guard_reaches_safe_stop();
     test_controller_traversability_guard_data_flow();

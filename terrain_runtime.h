@@ -1227,6 +1227,8 @@ struct traversability_diagnostics
     vec3 point;
 };
 
+static constexpr float traversability_blocked_reserve = 0.04f;
+
 static inline const char* walkability_reason_name(
     walkability_reason reason)
 {
@@ -1729,7 +1731,8 @@ static inline vec3 traversability_limit_command(
             const float braking_distance =
                 maxf(commanded_speed * 0.50f, 1.0e-6f);
             goal = clampf(
-                (sweep.distance - 0.02f) / braking_distance,
+                (sweep.distance - traversability_blocked_reserve) /
+                    braking_distance,
                 0.0f, 1.0f);
         }
     }
@@ -1752,6 +1755,22 @@ static inline vec3 traversability_limit_command(
             scale, scale_velocity, diagnostics, position);
     }
     return applied;
+}
+
+static inline void traversability_stop_blocked_planar_dynamics(
+    const traversability_diagnostics& diagnostics,
+    vec3& velocity,
+    vec3& acceleration)
+{
+    if (!(diagnostics.blocked &&
+          terrain_float_is_finite(diagnostics.applied_speed) &&
+          diagnostics.applied_speed <= 1.0e-4f)) {
+        return;
+    }
+    velocity.x = 0.0f;
+    velocity.z = 0.0f;
+    acceleration.x = 0.0f;
+    acceleration.z = 0.0f;
 }
 
 static inline walkability_sweep_result traversability_preflight_step(

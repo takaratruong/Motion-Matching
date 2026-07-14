@@ -2299,6 +2299,10 @@ int main(void)
                 "command traversal produced non-finite diagnostics");
             return;
         }
+        traversability_stop_blocked_planar_dynamics(
+            traversal,
+            state.simulation_velocity,
+            state.simulation_acceleration);
         state.blocked = traversal.blocked;
         state.walkability_class = traversal.walkability_class;
         state.blocked_distance = traversal.distance;
