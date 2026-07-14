@@ -234,6 +234,7 @@ class ScenePack:
 
 
 COURSE_HALF_WIDTH = 0.60
+PLAYABLE_HALF_WIDTH = 3.0
 FLAT_SPAWN_LENGTH = 2.0
 LOOKAHEAD_MARGIN = 1.0
 GRAIL_DEFAULT_BASE = "terrain_curbs__curb_000__000"
@@ -244,6 +245,16 @@ GRAIL_TARGETS = (
 )
 
 
+def _runtime_f32_lower_floor(value, label):
+    target = _finite_real(value, label)
+    result = _runtime_f32(target, label)
+    if result > target:
+        result = _runtime_f32(
+            np.nextafter(np.float32(result), np.float32(-np.inf)),
+            f"{label} lower floor")
+    return result
+
+
 def _runtime_f32_upper_ceiling(value, label):
     target = _finite_real(value, label)
     result = _runtime_f32(target, label)
@@ -252,6 +263,30 @@ def _runtime_f32_upper_ceiling(value, label):
             np.nextafter(np.float32(result), np.float32(np.inf)),
             f"{label} upper ceiling")
     return result
+
+
+def _wide_playable_x_bounds(core_bounds, spawn_x):
+    core = _strict_bounds(core_bounds, "core playable")
+    spawn = _runtime_f32(spawn_x, "wide playable spawn x")
+    lower = _runtime_f32_lower_floor(
+        min(core[0], spawn - PLAYABLE_HALF_WIDTH),
+        "wide playable xmin")
+    upper = _runtime_f32_upper_ceiling(
+        max(core[1], spawn + PLAYABLE_HALF_WIDTH),
+        "wide playable xmax")
+    return lower, upper
+
+
+def _wide_heightfield_bounds(core_bounds, playable_bounds):
+    core = _strict_bounds(core_bounds, "core heightfield")
+    playable = _strict_bounds(playable_bounds, "wide playable")
+    xmin = _runtime_f32_lower_floor(
+        min(core[0], playable[0] - LOOKAHEAD_MARGIN),
+        "wide heightfield xmin")
+    xmax = _runtime_f32_upper_ceiling(
+        max(core[1], playable[1] + LOOKAHEAD_MARGIN),
+        "wide heightfield xmax")
+    return xmin, xmax, core[2], core[3]
 
 
 def _walkability_classification_bounds(bounds):
@@ -370,14 +405,21 @@ def _corridor_definition(
 ):
     heightfield_end_z = _runtime_f32_upper_ceiling(
         course_end_z + LOOKAHEAD_MARGIN, "heightfield zmax")
-    playable = (-COURSE_HALF_WIDTH, COURSE_HALF_WIDTH, 0.0, course_end_z)
+    core_playable = (
+        -COURSE_HALF_WIDTH, COURSE_HALF_WIDTH, 0.0, course_end_z)
+    playable_x = _wide_playable_x_bounds(core_playable, 0.0)
+    playable = (
+        playable_x[0], playable_x[1],
+        core_playable[2], core_playable[3],
+    )
     classification = _walkability_classification_bounds(playable)
-    bounds = (
+    core_bounds = (
         -COURSE_HALF_WIDTH - LOOKAHEAD_MARGIN,
         COURSE_HALF_WIDTH + LOOKAHEAD_MARGIN,
         -LOOKAHEAD_MARGIN,
         heightfield_end_z,
     )
+    bounds = _wide_heightfield_bounds(core_bounds, playable)
     region_name = "certified" if walkability_class == 1 else "stress"
     regions = {"certified": (), "stress": (), "blocked": ()}
     regions[region_name] = (_region("course", playable),)
@@ -624,9 +666,15 @@ def _blocked_definition():
     heightfield_end_z = _runtime_f32_upper_ceiling(
         course_end + LOOKAHEAD_MARGIN,
         "blocked-course heightfield zmax")
-    playable = (-1.4, 1.4, 0.0, course_end)
+    core_playable = (-1.4, 1.4, 0.0, course_end)
+    playable_x = _wide_playable_x_bounds(core_playable, 0.0)
+    playable = (
+        playable_x[0], playable_x[1],
+        core_playable[2], core_playable[3],
+    )
     classification = _walkability_classification_bounds(playable)
-    bounds = (-2.4, 2.4, -1.0, heightfield_end_z)
+    core_bounds = (-2.4, 2.4, -1.0, heightfield_end_z)
+    bounds = _wide_heightfield_bounds(core_bounds, playable)
 
     def walkability(x, z):
         if not _bounds_contains(classification, x, z):
@@ -807,19 +855,25 @@ def grail_scene_definition(
     mesh_xmin, mesh_xmax, mesh_zmin, mesh_zmax = terrain.xz_bounds()
     path_xmin, path_zmin = path.min(axis=0)
     path_xmax, path_zmax = path.max(axis=0)
-    playable = (
+    core_playable = (
         float(path_xmin - COURSE_HALF_WIDTH),
         float(path_xmax + COURSE_HALF_WIDTH),
         float(path_zmin - COURSE_HALF_WIDTH),
         float(path_zmax + COURSE_HALF_WIDTH),
     )
-    classification = _walkability_classification_bounds(playable)
-    bounds = (
-        float(min(mesh_xmin, playable[0]) - LOOKAHEAD_MARGIN),
-        float(max(mesh_xmax, playable[1]) + LOOKAHEAD_MARGIN),
-        float(min(mesh_zmin, playable[2]) - LOOKAHEAD_MARGIN),
-        float(max(mesh_zmax, playable[3]) + LOOKAHEAD_MARGIN),
+    playable_x = _wide_playable_x_bounds(core_playable, spawn[0])
+    playable = (
+        playable_x[0], playable_x[1],
+        core_playable[2], core_playable[3],
     )
+    classification = _walkability_classification_bounds(playable)
+    core_bounds = (
+        float(min(mesh_xmin, core_playable[0]) - LOOKAHEAD_MARGIN),
+        float(max(mesh_xmax, core_playable[1]) + LOOKAHEAD_MARGIN),
+        float(min(mesh_zmin, core_playable[2]) - LOOKAHEAD_MARGIN),
+        float(max(mesh_zmax, core_playable[3]) + LOOKAHEAD_MARGIN),
+    )
+    bounds = _wide_heightfield_bounds(core_bounds, playable)
     certified = maximum_height <= 0.16
     walkability_class = 1 if certified else 2
     expected_outcome = "traverse" if certified else "traverse-or-safe-stop"

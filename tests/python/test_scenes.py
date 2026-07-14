@@ -12,6 +12,8 @@ import numpy as np
 from resources.g1_terrain_builder.artifacts import read_walkability
 from resources.g1_terrain_builder.scenes import (
     GRAIL_DEFAULT_BASE,
+    LOOKAHEAD_MARGIN,
+    PLAYABLE_HALF_WIDTH,
     REQUIRED_SCENE_IDS,
     SCENE_CELL_SIZE,
     WALKABILITY_CLASSIFICATION_HALO,
@@ -40,6 +42,7 @@ from resources.g1_terrain_builder.terrain import (
     FlatTerrain,
     GrailTerrain,
     HeightGrid,
+    rasterize_heightfield,
     surface_semantics_signature,
 )
 
@@ -663,6 +666,16 @@ def assert_native_json_value(test, value, label="provenance"):
     test.assertIn(type(value), (str, int, float, bool, type(None)), label)
 
 
+def assert_wide_x_contract(test, scene):
+    px0, px1, _, _ = scene.playable_bounds_xz
+    hx0, hx1, _, _ = scene.heightfield_bounds_xz
+    test.assertGreaterEqual(px1 - px0, 2.0 * PLAYABLE_HALF_WIDTH)
+    test.assertLessEqual(px0, scene.spawn_position[0] - PLAYABLE_HALF_WIDTH)
+    test.assertGreaterEqual(px1, scene.spawn_position[0] + PLAYABLE_HALF_WIDTH)
+    test.assertGreaterEqual(px0 - hx0, LOOKAHEAD_MARGIN)
+    test.assertGreaterEqual(hx1 - px1, LOOKAHEAD_MARGIN)
+
+
 GRAIL_ROBOT_DIR = "/home/ubuntu/datasets/GRAIL/data/curb/robot"
 LOCKED_GRAIL_BASES = {
     "grail-curb-default": GRAIL_DEFAULT_BASE,
@@ -688,6 +701,16 @@ def fake_grail_clip(base):
 
 
 class GrailSceneTests(unittest.TestCase):
+    def test_grail_scenes_union_old_route_envelope_with_six_metre_floor(self):
+        clip = fake_grail_clip(GRAIL_DEFAULT_BASE)
+        scene = grail_scene_definition(
+            "grail-curb-default", GRAIL_DEFAULT_BASE, clip, None)
+        assert_wide_x_contract(self, scene)
+        route_x = [point[0] for point in scene.routes[0].waypoints_xz]
+        self.assertLessEqual(scene.playable_bounds_xz[0], min(route_x) - 0.6)
+        self.assertGreaterEqual(
+            scene.playable_bounds_xz[1], max(route_x) + 0.6)
+
     def test_nearest_height_selection_uses_lexical_tie_break(self):
         measured = {
             GRAIL_DEFAULT_BASE: 0.29,
@@ -952,6 +975,60 @@ class ProceduralSceneTests(unittest.TestCase):
              for route in blocked],
             [("wall-safe-stop", "safe-stop", 0),
              ("ramp-safe-stop", "safe-stop", 0)])
+
+    def test_all_procedural_scenes_have_six_metre_playable_floor(self):
+        for scene_id, scene in self.definitions.items():
+            with self.subTest(scene=scene.scene_id):
+                assert_wide_x_contract(self, scene)
+                self.assertEqual(scene.playable_bounds_xz[:2], (-3.0, 3.0))
+                width_key = (
+                    "lane_width_m" if scene_id == "blocked-course"
+                    else "width_m")
+                self.assertEqual(
+                    scene.provenance["parameters"][width_key], 1.2)
+                z = 0.5 * (
+                    scene.playable_bounds_xz[2] +
+                    scene.playable_bounds_xz[3])
+                self.assertEqual(scene.surface.height(-2.0, z), 0.0)
+                self.assertEqual(scene.surface.height(+2.0, z), 0.0)
+
+    def test_wide_raster_preserves_central_runtime_heights(self):
+        for scene_id, scene in self.definitions.items():
+            narrow_x = (
+                (-2.4, 2.4) if scene_id == "blocked-course"
+                else (-1.6, 1.6))
+            narrow_bounds = (
+                narrow_x[0], narrow_x[1],
+                scene.heightfield_bounds_xz[2],
+                scene.heightfield_bounds_xz[3],
+            )
+            narrow = rasterize_heightfield(
+                scene.surface, narrow_bounds, SCENE_CELL_SIZE)
+            wide = rasterize_heightfield(
+                scene.surface, scene.heightfield_bounds_xz, SCENE_CELL_SIZE)
+            probes = [
+                point
+                for route in scene.routes
+                for point in route.waypoints_xz
+            ]
+            parameters = scene.provenance["parameters"]
+            if scene_id == "stairs-standard":
+                probes.append((0.0, parameters["flat_spawn_length_m"]))
+            elif scene_id == "ramp-10-up-down":
+                probes.append((0.0, parameters["ascent_end_z_m"]))
+            elif scene_id == "cross-slope-10":
+                start = (
+                    parameters["flat_spawn_length_m"] +
+                    parameters["flat_entry_length_m"])
+                probes.append((
+                    0.6, start + parameters["transition_length_m"]))
+            elif scene_id == "mixed-multilevel":
+                probes.append((0.0, parameters["block_starts_z_m"][0]))
+            for x, z in probes:
+                with self.subTest(scene=scene_id, probe=(x, z)):
+                    self.assertLessEqual(
+                        abs(wide.height(x, z) - narrow.height(x, z)),
+                        1e-6)
 
     def test_stair_dimensions_landings_and_return_to_base_are_exact(self):
         expected = {
