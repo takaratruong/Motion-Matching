@@ -1389,170 +1389,65 @@ git commit -m "feat: align G1 feet to terrain normals"
 
 **Files:**
 - Create: `g1_clearance.h`
+- Create: `g1_clearance.cpp`
 - Create: `tests/cpp/test_g1_clearance.cpp`
+- Later Task 6 owns the specified integration in: `g1_ik_runtime.h`
+- Later Task 6 owns the specified integration tests in: `tests/cpp/test_g1_ik.cpp`
 
 **Interfaces:**
-- Produces: `g1_point_clearance`, `g1_sole_points_world`, `g1_foot_clearance`, and conservative deterministic `g1_capsule_clearance`.
+- Produces: non-inline strict-FP `g1_point_clearance`, `g1_foot_clearance`, and conservative deterministic `g1_capsule_clearance` against the continuous fixed-diagonal G1HF/v2 surface.
 - Produces: `G1LegClearance` and `G1PoseClearance` with signed Hips, knee, ankle, toe, four-point sole, thigh-capsule, and shin-capsule clearances against the exact G1HF/v2 surface.
-- Produces: `G1SwingHistory`, `G1SwingClearancePlan`, `g1_swing_history_reset`, and `g1_swing_clearance_plan`.
-- Swing observation sweeps each IK-off sole probe from the prior 25 Hz support-retargeted pose to the current one at no more than half a terrain cell per sample. It requests only the missing vertical clearance, caps swing-only lift at `0.08 m`, and requests safe stop if that cap is insufficient.
+- Produces: `G1SwingHistory`, checked reset/commit, strict `g1_apply_swing_lift_y`, actual-center `g1_swing_clearance_validate`, and the immutable staged-candidate selection contract consumed by Task 6.
+- Swing selection evaluates only real post-IK/FK sphere endpoints at exact 25 Hz. It never translates predicted baseline spheres, estimates a continuous required lift, or samples a guessed lifted segment.
 
-- [ ] **Step 1: Write failing point, sole, capsule, sweep, and wall tests**
+> **Authoritative supersession (reviewed commit `66836d8`, independently CLEAN):** Sections 3, 6, 9, 10, 11, 12E/H/I/J, and 14 of `docs/superpowers/plans/2026-07-14-g1-certified-clearance-design.md` replace every sampled/predicted clearance, scalar-float safety result, boolean status use, unchecked history operation, and one-command fast-math build in Tasks 5--10. All active downstream snippets must pass immutable budgets, branch on explicit `G1ClearanceStatus`, read `G1ClearanceResult::lower_bound_m` as binary64, log safety values without a float round trip, and compile/link `g1_clearance.cpp` as a separate strict-FP object. Step 4 below and the migrated downstream tasks are the only active contracts; no old and new path may coexist.
 
-Create `tests/cpp/test_g1_clearance.cpp`:
+- [ ] **Step 1: Write failing certified-geometry and real-staging tests**
 
-```cpp
-#include "g1_clearance.h"
+Create `tests/cpp/test_g1_clearance.cpp` from the exact RED fixtures in
+Sections 12A--K of the reviewed certified-clearance design. Tests use `check`,
+not `assert`, seed every failure-path output/history owner with distinct bits,
+and verify unchanged outputs for every non-`Ok` result. In particular:
 
-#include <cmath>
-#include <cstdio>
-#include <cstdlib>
+- lock exact continuous fixed-diagonal point, sphere, capsule, foot, swept-foot,
+  and pose certificates; no test may accept a spatial sample count as proof;
+- call `g1_swing_clearance_validate` with named prior and **actual current**
+  four-sphere center bits and compare the target-subtracted capsule result to the
+  high-precision endpoint-bit oracle;
+- independently derive every ladder entry as `RN32(i/500 m)` for `i=0..40`,
+  require exact positive-zero and `0.08f` endpoints, and compare all 41 bits;
+- lock round-to-nearest/gradual-underflow rejection, nonfinite and nonzero
+  subnormal input behavior, the subnormal-command failure, exact 25 Hz, and
+  transactional history reset/commit.
 
-static void check(bool condition, const char* message)
-{
-    if (!condition) {
-        std::fprintf(stderr, "G1 clearance test failed: %s\n", message);
-        std::exit(1);
-    }
-}
+When Task 6 creates `g1_ik_runtime.h`, add the Section 12E integration fixture
+to `tests/cpp/test_g1_ik.cpp` under `G1_IK_ENABLE_TEST_SEAMS`. It must call the
+one real production staging function for indices `0..40` from the same immutable
+input, derive the first finite passing stage, and compare it with the full
+selector. Lock all of these outcomes:
 
-static heightfield make_step(float height)
-{
-    heightfield field;
-    field.version = 2;
-    field.nx = 4;
-    field.nz = 2;
-    field.origin_x = 0.0f;
-    field.origin_z = 0.0f;
-    field.cell_size = 0.10f;
-    field.exterior_height = -10.0f;
-    field.heights.resize(8);
-    for (int z = 0; z < 2; ++z) {
-        field.heights(z * 4 + 0) = 0.0f;
-        field.heights(z * 4 + 1) = 0.0f;
-        field.heights(z * 4 + 2) = height;
-        field.heights(z * 4 + 3) = height;
-    }
-    return field;
-}
+- at least one real finite rejection precedes the selected stage;
+- calls are contiguous from zero, `candidates_evaluated == selected_index + 1`,
+  and the selected lift, materialized command, twelve actual sphere-center bits,
+  binary64 margin, and work match the probed stage;
+- final rotations reproduce those endpoint bits and the selected staged result
+  is reused with no additional position-IK/orientation solve;
+- a real wall fixture makes exactly 41 real calls, returns
+  `G1SwingNoCandidate`, requests safe stop, and leaves accepted pose, state,
+  histories, support, matcher, and simulation bit-identical;
+- independently OR the three candidate-local rejection bits from the probed
+  real stages and require the selector aggregate to match through first-pass
+  selection and all-41 failure. Mix all three statuses, repeat statuses, and
+  prove negative-`Ok`/controller-only rejection adds no bit;
+- strict and fast-math callers certify identical supplied endpoint bits
+  byte-for-byte. Per-build IK endpoints may differ, but each build must expose
+  and deterministically certify its own first actual pass.
 
-static void set_foot_centers(vec3 points[4], float x, float center_y)
-{
-    points[0] = vec3(x - 0.05f, center_y, 0.035f);
-    points[1] = vec3(x - 0.05f, center_y, 0.065f);
-    points[2] = vec3(x + 0.12f, center_y, 0.030f);
-    points[3] = vec3(x + 0.12f, center_y, 0.070f);
-}
+A negative compile names `g1_ik_stage_swing_candidate_for_test` without
+`G1_IK_ENABLE_TEST_SEAMS` and must fail. A production object must contain no
+declaration or symbol for the seam.
 
-static void test_point_sole_and_capsule_clearance()
-{
-    const heightfield flat = make_step(0.0f);
-    char error[256] = {};
-    float clearance = 0.0f;
-    check(g1_point_clearance(
-              clearance, flat, vec3(0.05f, 0.03f, 0.05f),
-              error, sizeof(error)), error);
-    check(std::fabs(clearance - 0.03f) < 1e-6f, "point clearance");
-
-    vec3 sphere_centers[4];
-    for (int i = 0; i < 4; ++i)
-        sphere_centers[i] = vec3(0.05f, 0.025f, 0.05f);
-    G1MinimumClearance foot = {};
-    check(g1_foot_clearance(
-              foot, flat, sphere_centers, 0.02f,
-              error, sizeof(error)), error);
-    check(std::fabs(foot.minimum_m - 0.005f) < 1e-6f,
-          "four-sphere foot envelope clearance");
-
-    const heightfield edge = make_step(0.20f);
-    for (int i = 0; i < 4; ++i)
-        sphere_centers[i] = vec3(0.095f, 0.025f, 0.05f);
-    check(g1_point_clearance(
-              clearance, edge, vec3(0.095f, 0.005f, 0.05f),
-              error, sizeof(error)), error);
-    check(clearance > 0.0049f, "sphere bottom-center probe is clear");
-    check(g1_foot_clearance(
-              foot, edge, sphere_centers, 0.02f,
-              error, sizeof(error)), error);
-    check(foot.minimum_m < 0.0f,
-          "sphere lower envelope catches adjacent stair edge");
-
-    G1MinimumClearance capsule = {};
-    check(g1_capsule_clearance(
-              capsule, flat,
-              vec3(0.05f, 0.20f, 0.05f),
-              vec3(0.05f, 0.40f, 0.05f), 0.04f,
-              error, sizeof(error)), error);
-    check(capsule.minimum_m > 0.159f && capsule.minimum_m < 0.161f,
-          "capsule lower envelope clearance");
-    check(capsule.samples > 8, "capsule uses bounded spatial samples");
-}
-
-static void test_swept_clearance_and_safe_stop()
-{
-    const G1LegConfig leg = g1_left_leg_config();
-    char error[256] = {};
-    vec3 previous[4];
-    vec3 current[4];
-    set_foot_centers(previous, 0.02f, 0.04f);
-    set_foot_centers(current, 0.25f, 0.04f);
-
-    G1SwingHistory history = {};
-    g1_swing_history_reset(history, previous);
-    G1SwingClearancePlan plan = {};
-    const heightfield shallow = make_step(0.04f);
-    check(g1_swing_clearance_plan(
-              history, plan, shallow, leg, current, false,
-              1.0f / 25.0f, error, sizeof(error)), error);
-    check(plan.samples >= 5, "sweep samples at half-cell spacing");
-    check(plan.required_lift_m > 0.0f &&
-          plan.required_lift_m <= leg.max_swing_lift_m,
-          "shallow step requests bounded lift");
-    check(!plan.safe_stop_requested, "bounded shallow lift remains traversable");
-    check(plan.corrected_margin_m >= -1e-5f,
-          "corrected sphere sweep is actually clear");
-    vec3 lifted[4];
-    for (int i = 0; i < 4; ++i) {
-        lifted[i] = current[i];
-        lifted[i].y += plan.applied_lift_m;
-    }
-    check(g1_swing_clearance_validate(
-              plan.actual_corrected_margin_m, history, shallow, leg,
-              lifted, false, error, sizeof(error)), error);
-    check(plan.actual_corrected_margin_m >= -1e-5f,
-          "actual corrected endpoint sweep is clear");
-
-    g1_swing_history_reset(history, previous);
-    const heightfield wall = make_step(0.45f);
-    check(g1_swing_clearance_plan(
-              history, plan, wall, leg, current, false,
-              1.0f / 25.0f, error, sizeof(error)), error);
-    check(plan.required_lift_m > leg.max_swing_lift_m,
-          "wall exceeds swing-only lift");
-    check(std::fabs(plan.applied_lift_m - leg.max_swing_lift_m) < 1e-7f,
-          "wall lift remains capped");
-    check(plan.safe_stop_requested, "wall requests traversability safe stop");
-
-    g1_swing_history_reset(history, current);
-    check(g1_swing_clearance_plan(
-              history, plan, shallow, leg, current, true,
-              1.0f / 25.0f, error, sizeof(error)), error);
-    check(plan.applied_lift_m == 0.0f && plan.samples == 0,
-          "planted foot does not receive swing lift");
-    g1_swing_history_commit(history, current);
-    check(history.previous_sphere_centers[0].x == current[0].x,
-          "only accepted rendered output commits sweep history");
-}
-
-int main()
-{
-    test_point_sole_and_capsule_clearance();
-    test_swept_clearance_and_safe_stop();
-    return 0;
-}
-```
-
-- [ ] **Step 2: Compile to verify clearance RED**
+- [ ] **Step 2: Run the certified-clearance RED**
 
 Run:
 
@@ -1561,481 +1456,241 @@ g++ -std=c++17 -O0 -g -Wall -Wextra -Werror -pedantic -I. \
   tests/cpp/test_g1_clearance.cpp -o /tmp/test_g1_clearance
 ```
 
-Expected: compilation fails with `fatal error: g1_clearance.h: No such file or directory`.
+Expected before implementation: compilation fails because the reviewed public
+status/result API or `g1_clearance.cpp` implementation is absent. Do not make
+this RED pass with inline sampling helpers.
 
-- [ ] **Step 3: Implement exact-surface point, foot, and capsule diagnostics**
+- [ ] **Step 3: Implement the strict certified geometry and diagnostics**
 
-Create `g1_clearance.h`:
+Create `g1_clearance.h` and non-inline `g1_clearance.cpp` exactly from Sections
+3--8 and reviewed design Tasks 1--6. This is the only active geometry path:
 
-```cpp
-#pragma once
+- public point, sphere, capsule, foot, swept-foot, leg, and pose functions
+  return `G1ClearanceStatus` and assign result/history outputs only on their
+  documented success path;
+- safety bounds, witnesses, pose minima, and swing margins remain binary64;
+- sphere/capsule clearance minimizes continuously against the authoritative
+  fixed-diagonal G1HF/v2 triangles with outward intervals, exact footprint
+  containment, fixed absolute budgets, and the mandatory producer-output guard;
+- point lattices, radial lattices, `segment_steps`, `ceil`-derived work, rounded
+  terrain-sample minima, and header-only proof arithmetic are forbidden;
+- `OutsideDomain`, `BudgetExceeded`, and `Uncertified` are distinct fail-closed
+  outcomes. `InvalidInput`, `InvalidField`, and `ArithmeticFailure` retain their
+  reviewed transactional meanings;
+- `g1_clearance.cpp` rejects `__FAST_MATH__`, validates round-to-nearest plus
+  gradual binary32/binary64 underflow before input-dependent arithmetic, and is
+  compiled with `-fno-fast-math -ffp-contract=off -frounding-math`.
 
-#include "g1_ik.h"
+Implement checked `G1SwingHistory` reset/commit,
+`g1_apply_swing_lift_y`, and actual-center `g1_swing_clearance_validate` in
+this strict boundary. The validator receives no lift value: its current sphere
+centers already contain the actual controller/IK/FK result.
 
-#include <cfloat>
-#include <cmath>
+- [ ] **Step 4: Implement certified staged swing lift selection**
 
-struct G1MinimumClearance
-{
-    float minimum_m = FLT_MAX;
-    vec3 body_point;
-    vec3 surface_point;
-    int samples = 0;
-};
+This step supersedes every former sampled/predicted lift search. Task 5 supplies
+the strict materializer and actual-center certificate; Task 6 owns the runtime
+staging transaction described here.
 
-static inline bool g1_clearance_consider(
-    G1MinimumClearance& result,
-    const heightfield& field,
-    vec3 body_point,
-    char* error,
-    int error_capacity)
-{
-    if (!g1_ik_vec3_is_runtime_value(body_point))
-        return g1_ik_error(error, error_capacity, "G1 clearance body point is non-finite");
-    G1SurfaceSample surface = {};
-    const G1SurfaceQueryStatus status = g1_surface_query_v2(
-        surface, field, body_point.x, body_point.z);
-    if (status == G1SurfaceQueryOutside)
-        return g1_ik_error(error, error_capacity, "G1 clearance query is outside terrain");
-    if (status != G1SurfaceQueryValid)
-        return g1_ik_error(error, error_capacity, "G1 clearance surface sample is invalid");
-    const volatile double promoted_clearance =
-        static_cast<double>(body_point.y) -
-        static_cast<double>(surface.height);
-    float clearance = 0.0f;
-    if (!terrain_v2_round_output(promoted_clearance, clearance))
-        return g1_ik_error(error, error_capacity, "G1 clearance difference overflowed");
-    ++result.samples;
-    if (clearance < result.minimum_m) {
-        result.minimum_m = clearance;
-        result.body_point = body_point;
-        result.surface_point = vec3(
-            terrain_runtime_canonicalize_output(body_point.x),
-            surface.height,
-            terrain_runtime_canonicalize_output(body_point.z));
-    }
-    return true;
-}
-
-static inline bool g1_point_clearance(
-    float& output,
-    const heightfield& field,
-    vec3 point,
-    char* error,
-    int error_capacity)
-{
-    G1MinimumClearance result = {};
-    if (!g1_clearance_consider(result, field, point, error, error_capacity))
-        return false;
-    output = result.minimum_m;
-    return true;
-}
-
-static inline void g1_sole_points_world(
-    vec3 output[4],
-    vec3 contact_position,
-    quat contact_rotation,
-    const G1LegConfig& config)
-{
-    for (int i = 0; i < 4; ++i)
-        output[i] = contact_position + quat_mul_vec3(
-            contact_rotation, config.sole_points_local[i]);
-}
-
-static inline void g1_foot_sphere_centers_world(
-    vec3 output[4],
-    vec3 contact_position,
-    quat contact_rotation,
-    const G1LegConfig& config)
-{
-    for (int i = 0; i < 4; ++i)
-        output[i] = contact_position + quat_mul_vec3(
-            contact_rotation, config.foot_sphere_centers_local[i]);
-}
-
-static inline vec3 g1_sole_center_world(const vec3 points[4])
-{
-    return 0.25f * (points[0] + points[1] + points[2] + points[3]);
-}
-
-static inline bool g1_capsule_clearance(
-    G1MinimumClearance& output,
-    const heightfield& field,
-    vec3 endpoint_a,
-    vec3 endpoint_b,
-    float radius_m,
-    char* error,
-    int error_capacity)
-{
-    if (field.version != 2 ||
-        !g1_ik_vec3_is_runtime_value(endpoint_a) ||
-        !g1_ik_vec3_is_runtime_value(endpoint_b) ||
-        !terrain_float_is_finite(radius_m) || radius_m <= 0.0f ||
-        !terrain_float_is_finite(field.cell_size) || field.cell_size <= 0.0f) {
-        return g1_ik_error(error, error_capacity, "G1 capsule clearance input is invalid");
-    }
-    const float spacing = minf(0.01f, 0.5f * field.cell_size);
-    const int segment_steps = static_cast<int>(maxf(
-        1.0f, std::ceil(length(endpoint_b - endpoint_a) / spacing)));
-    const int radial_steps = static_cast<int>(std::ceil(radius_m / spacing));
-    G1MinimumClearance result = {};
-    for (int along = 0; along <= segment_steps; ++along) {
-        const float alpha = static_cast<float>(along) / segment_steps;
-        const vec3 center = lerp(endpoint_a, endpoint_b, alpha);
-        for (int ix = -radial_steps; ix <= radial_steps; ++ix) {
-            for (int iz = -radial_steps; iz <= radial_steps; ++iz) {
-                const float dx = ix * spacing;
-                const float dz = iz * spacing;
-                const float horizontal_sq = dx * dx + dz * dz;
-                if (horizontal_sq > radius_m * radius_m + 1e-8f) continue;
-                const float lower = center.y - std::sqrt(maxf(
-                    radius_m * radius_m - horizontal_sq, 0.0f));
-                if (!g1_clearance_consider(
-                        result, field, vec3(center.x + dx, lower, center.z + dz),
-                        error, error_capacity)) return false;
-            }
-        }
-    }
-    output = result;
-    return true;
-}
-
-static inline bool g1_foot_clearance(
-    G1MinimumClearance& output,
-    const heightfield& field,
-    const vec3 sphere_centers[4],
-    float sphere_radius_m,
-    char* error,
-    int error_capacity)
-{
-    G1MinimumClearance result = {};
-    for (int sphere = 0; sphere < 4; ++sphere) {
-        G1MinimumClearance current = {};
-        if (!g1_capsule_clearance(
-                current, field, sphere_centers[sphere],
-                sphere_centers[sphere], sphere_radius_m,
-                error, error_capacity)) return false;
-        result.samples += current.samples;
-        if (current.minimum_m < result.minimum_m) {
-            result.minimum_m = current.minimum_m;
-            result.body_point = current.body_point;
-            result.surface_point = current.surface_point;
-        }
-    }
-    output = result;
-    return true;
-}
-```
-
-- [ ] **Step 4: Implement swept swing history and bounded lift planning**
-
-Append to `g1_clearance.h`:
+The immutable production ladder in `g1_ik_runtime.h` is:
 
 ```cpp
-struct G1SwingHistory
-{
-    bool initialized = false;
-    vec3 previous_sphere_centers[4];
+constexpr uint32_t G1SwingLiftCandidateCount = 41;
+constexpr uint32_t G1SwingNoCandidate = UINT32_MAX;
+constexpr uint32_t G1SwingLiftCandidateBits[41] = {
+    0x00000000u, 0x3b03126fu, 0x3b83126fu, 0x3bc49ba6u,
+    0x3c03126fu, 0x3c23d70au, 0x3c449ba6u, 0x3c656042u,
+    0x3c83126fu, 0x3c9374bcu, 0x3ca3d70au, 0x3cb43958u,
+    0x3cc49ba6u, 0x3cd4fdf4u, 0x3ce56042u, 0x3cf5c28fu,
+    0x3d03126fu, 0x3d0b4396u, 0x3d1374bcu, 0x3d1ba5e3u,
+    0x3d23d70au, 0x3d2c0831u, 0x3d343958u, 0x3d3c6a7fu,
+    0x3d449ba6u, 0x3d4ccccdu, 0x3d54fdf4u, 0x3d5d2f1bu,
+    0x3d656042u, 0x3d6d9168u, 0x3d75c28fu, 0x3d7df3b6u,
+    0x3d83126fu, 0x3d872b02u, 0x3d8b4396u, 0x3d8f5c29u,
+    0x3d9374bcu, 0x3d978d50u, 0x3d9ba5e3u, 0x3d9fbe77u,
+    0x3da3d70au,
 };
 
-struct G1SwingClearancePlan
-{
-    float baseline_minimum_m = FLT_MAX;
-    float corrected_minimum_m = FLT_MAX;
-    float corrected_margin_m = FLT_MAX;
-    float actual_corrected_margin_m = FLT_MAX;
-    float required_lift_m = 0.0f;
-    float applied_lift_m = 0.0f;
-    bool safe_stop_requested = false;
-    vec3 worst_body_point;
-    vec3 worst_surface_point;
-    int samples = 0;
-};
-
-static inline void g1_swing_history_reset(
-    G1SwingHistory& history, const vec3 sphere_centers[4])
-{
-    history = G1SwingHistory();
-    history.initialized = true;
-    for (int i = 0; i < 4; ++i)
-        history.previous_sphere_centers[i] = sphere_centers[i];
-}
-
-static inline void g1_swing_history_commit(
-    G1SwingHistory& history, const vec3 accepted_sphere_centers[4])
-{
-    for (int i = 0; i < 4; ++i)
-        history.previous_sphere_centers[i] = accepted_sphere_centers[i];
-}
-
-static inline bool g1_swing_clearance_plan(
-    const G1SwingHistory& history,
-    G1SwingClearancePlan& output,
-    const heightfield& field,
-    const G1LegConfig& config,
-    const vec3 current_sphere_centers[4],
-    bool recorded_contact,
-    float dt,
-    char* error,
-    int error_capacity)
-{
-    if (!history.initialized || field.version != 2 ||
-        !g1_ik_dt_is_exact_25_hz(dt)) {
-        return g1_ik_error(
-            error, error_capacity,
-            "G1 swing sweep requires initialized G1HF/v2 state at 25 Hz");
-    }
-    for (int i = 0; i < 4; ++i)
-        if (!g1_ik_vec3_is_runtime_value(current_sphere_centers[i]))
-            return g1_ik_error(error, error_capacity, "G1 swing sphere center is non-finite");
-
-    G1SwingClearancePlan result = {};
-    if (!recorded_contact) {
-        const float spacing = minf(0.01f, 0.5f * field.cell_size);
-        float maximum_travel = 0.0f;
-        for (int i = 0; i < 4; ++i)
-            maximum_travel = maxf(
-                maximum_travel,
-                length(current_sphere_centers[i] -
-                       history.previous_sphere_centers[i]));
-        const int steps = static_cast<int>(maxf(
-            1.0f, std::ceil(maximum_travel / spacing)));
-        for (int step = 1; step <= steps; ++step) {
-            const float alpha = static_cast<float>(step) / steps;
-            vec3 centers[4];
-            for (int sphere = 0; sphere < 4; ++sphere) {
-                centers[sphere] = lerp(
-                    history.previous_sphere_centers[sphere],
-                    current_sphere_centers[sphere], alpha);
-            }
-            G1MinimumClearance sample = {};
-            if (!g1_foot_clearance(
-                    sample, field, centers, config.foot_sphere_radius_m,
-                    error, error_capacity)) return false;
-            const float target_clearance = lerpf(
-                config.planted_clearance_m,
-                config.swing_clearance_m, alpha);
-            result.required_lift_m = maxf(
-                result.required_lift_m,
-                maxf(target_clearance - sample.minimum_m, 0.0f) / alpha);
-            if (sample.minimum_m < result.baseline_minimum_m) {
-                result.baseline_minimum_m = sample.minimum_m;
-                result.worst_body_point = sample.body_point;
-                result.worst_surface_point = sample.surface_point;
-            }
-            result.samples += sample.samples;
-        }
-        result.applied_lift_m = minf(
-            result.required_lift_m, config.max_swing_lift_m);
-        for (int step = 1; step <= steps; ++step) {
-            const float alpha = static_cast<float>(step) / steps;
-            vec3 centers[4];
-            for (int sphere = 0; sphere < 4; ++sphere) {
-                centers[sphere] = lerp(
-                    history.previous_sphere_centers[sphere],
-                    current_sphere_centers[sphere], alpha);
-                centers[sphere].y += alpha * result.applied_lift_m;
-            }
-            G1MinimumClearance corrected = {};
-            if (!g1_foot_clearance(
-                    corrected, field, centers, config.foot_sphere_radius_m,
-                    error, error_capacity)) return false;
-            const float target_clearance = lerpf(
-                config.planted_clearance_m,
-                config.swing_clearance_m, alpha);
-            result.corrected_minimum_m = minf(
-                result.corrected_minimum_m, corrected.minimum_m);
-            result.corrected_margin_m = minf(
-                result.corrected_margin_m,
-                corrected.minimum_m - target_clearance);
-            result.samples += corrected.samples;
-        }
-        result.safe_stop_requested =
-            result.required_lift_m > config.max_swing_lift_m + 1e-6f ||
-            result.corrected_margin_m < -1e-5f;
-    }
-    output = result;
-    return true;
-}
-
-static inline bool g1_swing_clearance_validate(
-    float& output_margin,
-    const G1SwingHistory& history,
-    const heightfield& field,
-    const G1LegConfig& config,
-    const vec3 final_sphere_centers[4],
-    bool recorded_contact,
-    char* error,
-    int error_capacity)
-{
-    if (recorded_contact) {
-        output_margin = FLT_MAX;
-        return true;
-    }
-    const float spacing = minf(0.01f, 0.5f * field.cell_size);
-    float maximum_travel = 0.0f;
-    for (int sphere = 0; sphere < 4; ++sphere)
-        maximum_travel = maxf(
-            maximum_travel,
-            length(final_sphere_centers[sphere] -
-                   history.previous_sphere_centers[sphere]));
-    const int steps = static_cast<int>(maxf(
-        1.0f, std::ceil(maximum_travel / spacing)));
-    float margin = FLT_MAX;
-    for (int step = 1; step <= steps; ++step) {
-        const float alpha = static_cast<float>(step) / steps;
-        vec3 centers[4];
-        for (int sphere = 0; sphere < 4; ++sphere)
-            centers[sphere] = lerp(
-                history.previous_sphere_centers[sphere],
-                final_sphere_centers[sphere], alpha);
-        G1MinimumClearance sample = {};
-        if (!g1_foot_clearance(
-                sample, field, centers, config.foot_sphere_radius_m,
-                error, error_capacity)) return false;
-        const float target_clearance = lerpf(
-            config.planted_clearance_m,
-            config.swing_clearance_m, alpha);
-        margin = minf(margin, sample.minimum_m - target_clearance);
-    }
-    output_margin = margin;
-    return true;
-}
+constexpr uint32_t G1SwingRejectOutsideDomainBit = 1u << 0;
+constexpr uint32_t G1SwingRejectBudgetExceededBit = 1u << 1;
+constexpr uint32_t G1SwingRejectUncertifiedBit = 1u << 2;
+constexpr uint32_t G1SwingRejectKnownMask =
+    G1SwingRejectOutsideDomainBit |
+    G1SwingRejectBudgetExceededBit |
+    G1SwingRejectUncertifiedBit;
 ```
 
-Planning derives endpoint lift as `deficit / alpha` for every full-sphere sweep
-sample, because only `alpha * endpoint_lift` exists at an intermediate point.
-It then re-sweeps the corrected linear candidate and exposes the actual margin.
-The planning function never advances history. Task 7 commits only the final
-accepted rendered sphere centers; a rejected/rolled-back candidate leaves the
-previous safe history exact.
+Entry `i` is canonical binary32 `RN32(i/500 m)`: immutable 2 mm
+increments from `+0.00 m` through `0.08 m` inclusive. Load checked-in bits with
+the existing `memcpy` helper. Never generate entries by float arithmetic, use a
+binary search/non-ladder float iteration, infer a pass between entries, or
+invent candidate 41.
 
-- [ ] **Step 5: Add complete post-IK leg/pose diagnostic aggregation**
+Add `uint32_t clearance_rejection_status_mask = 0;` to
+`G1SwingSelectionDiagnostic`. This is the only aggregate evidence retained from
+rejected candidates. It exposes no rejected pose, endpoint, margin, witness, or
+work record. Bit 0 means at least one real stage returned `OutsideDomain`, bit
+1 means `BudgetExceeded`, and bit 2 means `Uncertified`; no other bit is valid.
 
-Append to `g1_clearance.h`:
+For each frame:
 
-```cpp
-struct G1LegClearance
-{
-    float knee_m = FLT_MAX;
-    float ankle_m = FLT_MAX;
-    float toe_m = FLT_MAX;
-    float foot_m = FLT_MAX;
-    float thigh_m = FLT_MAX;
-    float shin_m = FLT_MAX;
-    float minimum_m = FLT_MAX;
-};
+1. Before caller-owned mutation, validate exact 25 Hz, shapes, state, G1HF/v2,
+   leg configuration, `max_swing_lift_m` bits equal entry 40, and the strict
+   arithmetic environment. Snapshot one immutable per-foot baseline. Recorded
+   contact bypasses the ladder with `candidates_evaluated=0` and
+   `selected_index=G1SwingNoCandidate` and mask zero; the contact flag
+   distinguishes this success from all-fail safe stop.
+2. For each non-contact foot, visit indices `0..40` in exact order. Every
+   candidate starts from a fresh copy of the same baseline. Call non-inline
+   strict `g1_apply_swing_lift_y` on the **actual**
+   `desired_sole_center.y`, then run the real named bounded position IK, foot
+   orientation, controller checks, and checked FK in their production order.
+3. Compute the four configured world-space foot-sphere centers from that staged
+   FK, record all twelve raw binary32 bits at the certificate boundary, and call
+   `g1_swing_clearance_validate` on those exact values with a fresh per-call
+   swing budget. For each sphere, certify the target-subtracted prior/current
+   centerline as a continuous capsule against exact G1HF/v2. Form adjusted Y
+   with binary64 `TwoDiff`; never round it through binary32 or predict
+   `baseline_sphere_y + lift`.
+4. A candidate passes only when every controller constraint passes, clearance
+   status is `G1ClearanceOk`, and binary64 `lower_margin_m >= 0.0`. A finite
+   controller rejection, negative `Ok` margin, `OutsideDomain`,
+   `BudgetExceeded`, or `Uncertified` rejects only that candidate and advances
+   to the next index. `InvalidInput`, `InvalidField`, or `ArithmeticFailure`
+   aborts the frame transaction unchanged. Before continuing, OR exactly the
+   corresponding bit for `OutsideDomain`/`BudgetExceeded`/`Uncertified` into a
+   local aggregate; `Ok` with a negative margin and controller-only rejection
+   add no bit.
+5. Select the first passing candidate and move its already-staged pose/result
+   into the outer scratch pose. Reuse its certificate and endpoint bits; do not
+   rerun IK to apply it. Copy the aggregate mask accumulated only from earlier
+   rejected real stages. After both feet compose, run checked FK once, require
+   selected endpoint-bit equality, and perform the mandatory fresh actual-center
+   certificate. Any mismatch or failed defensive certificate rolls back the
+   entire frame.
+6. If all 41 candidates finitely reject, report exactly
+   `candidates_evaluated=41`, `selected_index=G1SwingNoCandidate`, default
+   ignored selected fields, the exact aggregate mask, and safe stop. A zero
+   all-fail mask is valid when all stages failed only controller constraints or
+   negative `Ok` margins; any claim that unresolved certification caused the
+   exhaustion requires the relevant nonzero bit. Roll back accepted pose, clearance,
+   histories, state, support, matcher, and simulation. Never report a fabricated
+   continuous `required_lift_m`.
 
-struct G1PoseClearance
-{
-    float hips_m = FLT_MAX;
-    G1LegClearance left;
-    G1LegClearance right;
-    float minimum_m = FLT_MAX;
-};
+Expose candidate probing only inside
+`#if defined(G1_IK_ENABLE_TEST_SEAMS)`. The wrapper calls the same private
+production stage and returns diagnostics only; it cannot duplicate geometry or
+expose a mutable staged pose. Builds without the macro contain neither its
+declaration nor its symbol.
 
-static inline vec3 g1_local_point_world(
-    vec3 bone_position, quat bone_rotation, vec3 local_point)
-{
-    return bone_position + quat_mul_vec3(bone_rotation, local_point);
-}
+Finite/subnormal semantics are exact: every public status entry checks
+round-to-nearest and gradual underflow before input-dependent arithmetic; FTZ,
+DAZ, or failed volatile binary32/binary64 denormal probes return transactional
+`ArithmeticFailure`. `g1_apply_swing_lift_y` requires runtime `input_y`
+(finite, signed zero canonicalized, nonzero subnormal rejected as
+`InvalidInput`) and finite nonnegative `lift_m <= 0.08f`; either lift-zero sign
+becomes `+0.0f`. It performs exactly
+`RN32(double(input_y)+double(lift_m))`, canonicalizes a zero result, and rejects
+a nonfinite or nonzero-subnormal materialized command as `ArithmeticFailure`
+with output unchanged. Positive subnormal test lifts retain their input bits but
+are not guaranteed to materialize: `+0.0f + denorm_min` must fail unchanged.
+Production ladder entries above zero are normal. Geometry canonicalizes signed
+zero and rejects every nonzero binary32 subnormal coordinate as `InvalidInput`.
 
-static inline bool g1_measure_leg_clearance(
-    G1LegClearance& output,
-    const heightfield& field,
-    const slice1d<vec3> global_positions,
-    const slice1d<quat> global_rotations,
-    const G1LegConfig& config,
-    char* error,
-    int error_capacity)
-{
-    G1LegClearance result = {};
-    if (!g1_point_clearance(result.knee_m, field, global_positions(config.knee), error, error_capacity) ||
-        !g1_point_clearance(result.ankle_m, field, global_positions(config.ankle), error, error_capacity) ||
-        !g1_point_clearance(result.toe_m, field, global_positions(config.contact), error, error_capacity))
-        return false;
-    vec3 sphere_centers[4];
-    g1_foot_sphere_centers_world(
-        sphere_centers, global_positions(config.contact),
-        global_rotations(config.contact), config);
-    G1MinimumClearance foot = {};
-    G1MinimumClearance thigh = {};
-    G1MinimumClearance shin = {};
-    if (!g1_foot_clearance(
-            foot, field, sphere_centers, config.foot_sphere_radius_m,
-            error, error_capacity) ||
-        !g1_capsule_clearance(
-            thigh, field,
-            g1_local_point_world(global_positions(config.hip), global_rotations(config.hip), config.thigh_start_local),
-            g1_local_point_world(global_positions(config.hip), global_rotations(config.hip), config.thigh_end_local),
-            config.thigh_radius_m, error, error_capacity) ||
-        !g1_capsule_clearance(
-            shin, field,
-            g1_local_point_world(global_positions(config.knee), global_rotations(config.knee), config.shin_start_local),
-            g1_local_point_world(global_positions(config.knee), global_rotations(config.knee), config.shin_end_local),
-            config.shin_radius_m, error, error_capacity)) return false;
-    result.foot_m = foot.minimum_m;
-    result.thigh_m = thigh.minimum_m;
-    result.shin_m = shin.minimum_m;
-    result.minimum_m = minf(
-        minf(minf(result.knee_m, result.ankle_m), minf(result.toe_m, result.foot_m)),
-        minf(result.thigh_m, result.shin_m));
-    output = result;
-    return true;
-}
+- [ ] **Step 5: Add exact post-IK leg/pose aggregation**
 
-static inline bool g1_measure_pose_clearance(
-    G1PoseClearance& output,
-    const heightfield& field,
-    const slice1d<vec3> global_positions,
-    const slice1d<quat> global_rotations,
-    char* error,
-    int error_capacity)
-{
-    if (global_positions.size != G1_BoneCount ||
-        global_rotations.size != G1_BoneCount)
-        return g1_ik_error(error, error_capacity, "G1 clearance pose shape mismatch");
-    G1PoseClearance result = {};
-    if (!g1_point_clearance(
-            result.hips_m, field, global_positions(G1_Hips),
-            error, error_capacity) ||
-        !g1_measure_leg_clearance(
-            result.left, field, global_positions, global_rotations,
-            g1_left_leg_config(), error, error_capacity) ||
-        !g1_measure_leg_clearance(
-            result.right, field, global_positions, global_rotations,
-            g1_right_leg_config(), error, error_capacity)) return false;
-    result.minimum_m = minf(
-        result.hips_m, minf(result.left.minimum_m, result.right.minimum_m));
-    output = result;
-    return true;
-}
-```
+Implement `G1LegClearance` and `G1PoseClearance` from reviewed design Section 3
+and Task 5. Preserve the named Hips, knee, ankle, toe, four-sphere foot, thigh
+capsule, and shin capsule diagnostics, but store `G1ClearanceResult` values and
+use binary64 lower bounds for every safety decision. Share one validated
+absolute pose budget through the complete aggregation; a late failure assigns
+no public result. No float minimum or sampled `G1MinimumClearance` API remains.
 
-- [ ] **Step 6: Run clearance GREEN in strict, release, and sanitizer modes**
+- [ ] **Step 6: Run strict, release-caller, sanitizer, and staging verification**
 
-Run:
+Build the kernel separately and never pass `-ffast-math` to the final link:
 
 ```bash
+mkdir -p /tmp/g1-ik-clearance/native
+
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic \
+  -fno-fast-math -ffp-contract=off -frounding-math -I. \
+  -c g1_clearance.cpp \
+  -o /tmp/g1-ik-clearance/native/g1-clearance-strict.o
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
-  tests/cpp/test_g1_clearance.cpp -o /tmp/test_g1_clearance_strict
-/tmp/test_g1_clearance_strict
+  -c tests/cpp/test_g1_clearance.cpp \
+  -o /tmp/g1-ik-clearance/native/test-clearance-strict.o
+g++ /tmp/g1-ik-clearance/native/test-clearance-strict.o \
+  /tmp/g1-ik-clearance/native/g1-clearance-strict.o \
+  -o /tmp/g1-ik-clearance/native/test-clearance-strict
+/tmp/g1-ik-clearance/native/test-clearance-strict
+
 g++ -std=c++17 -O3 -ffast-math -DNDEBUG -I. \
-  tests/cpp/test_g1_clearance.cpp -o /tmp/test_g1_clearance_release
-/tmp/test_g1_clearance_release
-g++ -std=c++17 -O1 -g -fsanitize=address,undefined \
-  -fno-omit-frame-pointer -I. tests/cpp/test_g1_clearance.cpp \
-  -o /tmp/test_g1_clearance_san
-ASAN_OPTIONS=detect_leaks=1 /tmp/test_g1_clearance_san
+  -c tests/cpp/test_g1_clearance.cpp \
+  -o /tmp/g1-ik-clearance/native/test-clearance-release-caller.o
+g++ -std=c++17 -O3 -fno-fast-math -ffp-contract=off \
+  -frounding-math -DNDEBUG -I. -c g1_clearance.cpp \
+  -o /tmp/g1-ik-clearance/native/g1-clearance-release-kernel.o
+g++ /tmp/g1-ik-clearance/native/test-clearance-release-caller.o \
+  /tmp/g1-ik-clearance/native/g1-clearance-release-kernel.o \
+  -o /tmp/g1-ik-clearance/native/test-clearance-release
+/tmp/g1-ik-clearance/native/test-clearance-release
+
+g++ -std=c++17 -O1 -g -fno-fast-math -ffp-contract=off \
+  -frounding-math \
+  -fsanitize=address,undefined,float-cast-overflow,float-divide-by-zero \
+  -fno-sanitize-recover=all -fno-omit-frame-pointer -I. \
+  -c g1_clearance.cpp \
+  -o /tmp/g1-ik-clearance/native/g1-clearance-san.o
+g++ -std=c++17 -O1 -g -fno-fast-math \
+  -fsanitize=address,undefined,float-cast-overflow,float-divide-by-zero \
+  -fno-sanitize-recover=all -fno-omit-frame-pointer -I. \
+  -c tests/cpp/test_g1_clearance.cpp \
+  -o /tmp/g1-ik-clearance/native/test-clearance-san.o
+g++ -fsanitize=address,undefined,float-cast-overflow,float-divide-by-zero \
+  -fno-sanitize-recover=all \
+  /tmp/g1-ik-clearance/native/test-clearance-san.o \
+  /tmp/g1-ik-clearance/native/g1-clearance-san.o \
+  -o /tmp/g1-ik-clearance/native/test-clearance-san
+ASAN_OPTIONS=detect_leaks=1 \
+UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+  /tmp/g1-ik-clearance/native/test-clearance-san
+
+if g++ -std=c++17 -O3 -ffast-math -I. -c g1_clearance.cpp \
+    -o /tmp/g1-ik-clearance/native/forbidden-fast-kernel.o \
+    2>/tmp/g1-ik-clearance/native/forbidden-fast-kernel.err; then
+  echo "certified kernel unexpectedly accepted fast math" >&2
+  exit 1
+fi
+rg -n "fast math" \
+  /tmp/g1-ik-clearance/native/forbidden-fast-kernel.err
+
+! rg -n 'ceil\(|radial_steps|segment_steps|half.*cell.*sample' \
+  g1_clearance.cpp g1_clearance.h
+! rg -n 'ordered.*lift|sphere.*\+.*lift|required_lift_m' \
+  g1_clearance.cpp g1_clearance.h
+git diff --check
 ```
 
-Expected: all three executables exit `0`; shallow sweep produces a bounded lift, the `0.45 m` wall produces a safe-stop request, and no sanitizer finding appears.
+Expected: strict, release-caller, and sanitizer executables exit zero; the fast
+kernel compile fails at its guard; identical endpoint-bit parity records match
+byte-for-byte; all environment mutations are restored; and no sampled or
+predicted-lift production path remains.
 
-- [ ] **Step 7: Commit swept clearance and physical diagnostics**
+After Task 6 creates the runtime, compile `tests/cpp/test_g1_ik.cpp` with
+`-DG1_IK_ENABLE_TEST_SEAMS` once as a strict caller and once as a fast-math
+caller, link both to a separately compiled strict `g1_clearance.cpp` object, and
+run the staged fixture in both builds. Require real contiguous calls, first-pass
+selection, selected-pose reuse with no extra solve, exactly 41 calls on all-fail,
+rollback/safe-stop, and deterministic repeated-run diagnostics. A compile
+without the macro that names the seam must fail, and production `nm -C` output
+must not contain the seam symbol.
+
+- [ ] **Step 7: Commit certified clearance and physical diagnostics**
 
 ```bash
-git add g1_clearance.h tests/cpp/test_g1_clearance.cpp
-git commit -m "feat: measure and clear G1 legs over terrain"
+git add g1_clearance.h g1_clearance.cpp tests/cpp/test_g1_clearance.cpp
+git commit -m "feat: certify G1 leg clearance over terrain"
 ```
 
 ### Task 6: Compose a Reversible Per-Frame IK Observe/Apply Transaction
@@ -2045,135 +1700,73 @@ git commit -m "feat: measure and clear G1 legs over terrain"
 - Modify: `tests/cpp/test_g1_ik.cpp`
 
 **Interfaces:**
-- Produces: `G1IkState`, `G1FootFrameResult`, `G1IkFrameResult`, `g1_ik_state_reset`, and `g1_ik_frame_evaluate`.
-- `g1_ik_frame_evaluate` always advances downstream lock/sweep observation from the support-retargeted IK-off pose. With `apply_enabled=false`, its output quaternion array is a byte copy of the input; with `true`, only the configured hip, knee, and contact bones may differ.
-- Produces only `safe_stop_requested` and a reason enum for the sibling traversability layer. It cannot mutate traversal, matching, simulation, support, local positions, or scene state itself.
+- Produces `G1IkState`, `G1FootFrameResult`, `G1IkFrameResult`,
+  `g1_ik_state_reset`, and `g1_ik_frame_evaluate`.
+- `G1FootFrameResult` owns `G1SwingSelectionDiagnostic swing_selection` plus
+  the real position/orientation results; it has no legacy planner struct,
+  continuous required-lift field, or predicted margin. Its aggregate rejection
+  mask is the sole retained evidence about candidate-local certification
+  statuses from discarded stages.
+- `g1_ik_frame_evaluate` stages from an immutable baseline, evaluates the Task 5
+  ladder through one private real stage function, and mutates only its
+  caller-provided scratch `G1IkState` after every selected endpoint bit,
+  defensive certificate, controller bound, and checked history operation passes.
+  The outer controller still decides whether to commit that scratch state.
+- Every clearance call passes an immutable factory-or-tighter
+  `G1ClearanceBudget`, stores the returned `G1ClearanceStatus`, and accepts
+  evidence only when `status == G1ClearanceOk`. Status values are never used as
+  booleans or inferred from error text.
+- With `apply_enabled=false`, output quaternions remain a byte copy of the input;
+  observation diagnostics may advance only in scratch state. Matching, support,
+  traversal, simulation, local positions, and scene state remain outside this
+  API.
 
-- [ ] **Step 1: Add failing IK-off reversibility and IK-on isolation tests**
+- [ ] **Step 1: Write transactional staging and IK-off REDs**
 
-Change the first include in `tests/cpp/test_g1_ik.cpp` to `#include "g1_ik_runtime.h"`. Add these helpers/tests before `main`, then call `test_frame_transaction_is_reversible_and_downstream()` from `main`:
+In `tests/cpp/test_g1_ik.cpp`, retain the named-bone isolation, exact 25 Hz,
+reach, correction, orientation, and IK-off byte-equality fixtures from Tasks
+1--4. Add the guarded real-stage fixtures required by Task 5 Step 1:
 
-```cpp
-static heightfield make_ik_frame_surface()
-{
-    heightfield field;
-    field.version = 2;
-    field.nx = 2;
-    field.nz = 2;
-    field.origin_x = -1.0f;
-    field.origin_z = -1.0f;
-    field.cell_size = 2.0f;
-    field.exterior_height = -10.0f;
-    field.heights.resize(4);
-    field.heights(0) = 0.12f;
-    field.heights(1) = 0.22f;
-    field.heights(2) = 0.12f;
-    field.heights(3) = 0.22f;
-    return field;
-}
+- derive/probe all 41 candidates from one immutable input through
+  `g1_ik_stage_swing_candidate_for_test`;
+- require the full selector to stop at the first real pass, copy the exact
+  selected lift/command/endpoint/margin/work bits, and perform no second IK solve;
+- require a wall to execute exactly 41 stages, safe-stop with
+  `G1SwingNoCandidate`, preserve the exact aggregate status mask, and preserve
+  the input pose/state/histories;
+- table-drive `Ok`, `OutsideDomain`, `BudgetExceeded`, `Uncertified`,
+  `InvalidInput`, `InvalidField`, and `ArithmeticFailure`. Only the three finite
+  candidate-local statuses continue; the last three abort transactionally;
+- seed reset/commit outputs and prove checked `g1_swing_history_reset` and
+  `g1_swing_history_commit` failures leave them unchanged.
 
-static void make_frame_database(database& db)
-{
-    make_g1_database(db);
-    db.bone_positions(0, G1_Simulation) = vec3(0.0f, 1.0f, 0.0f);
-    db.bone_positions(0, G1_LeftKnee) = vec3(0.0f, -0.40f, 0.0f);
-    db.bone_positions(0, G1_LeftAnkle) = vec3(0.0f, -0.40f, 0.0f);
-    db.bone_positions(0, G1_RightKnee) = vec3(0.0f, -0.40f, 0.0f);
-    db.bone_positions(0, G1_RightAnkle) = vec3(0.0f, -0.40f, 0.0f);
-    db.contact_states.resize(1, 2);
-    db.contact_states(0, 0) = true;
-    db.contact_states(0, 1) = true;
-}
+- [ ] **Step 2: Compile the runtime RED without violating the strict boundary**
 
-static void test_frame_transaction_is_reversible_and_downstream()
-{
-    database db;
-    make_frame_database(db);
-    const heightfield field = make_ik_frame_surface();
-    array1d<vec3> baseline_global_positions(G1_BoneCount);
-    array1d<quat> baseline_global_rotations(G1_BoneCount);
-    forward_kinematics_full(
-        baseline_global_positions, baseline_global_rotations,
-        db.bone_positions(0), db.bone_rotations(0), db.bone_parents);
-    G1IkState state = {};
-    char error[256] = {};
-    check(g1_ik_state_reset(
-              state, baseline_global_positions, baseline_global_rotations,
-              error, sizeof(error)), error);
-
-    array1d<quat> output(G1_BoneCount);
-    G1IkFrameResult result = {};
-    const float support_root_y = db.bone_positions(0, G1_Simulation).y;
-    check(g1_ik_frame_evaluate(
-              output, state, db.bone_positions(0), db.bone_rotations(0),
-              db.bone_parents, db.contact_states(0), field, false,
-              1.0f / 25.0f, result, error, sizeof(error)), error);
-    check(!result.applied, "IK-off frame is observation only");
-    for (int bone = 0; bone < G1_BoneCount; ++bone)
-        check(same_quat(output(bone), db.bone_rotations(0, bone)),
-              "IK-off local rotation is byte-identical");
-    check(db.bone_positions(0, G1_Simulation).y == support_root_y,
-          "support-retargeted root input is unchanged");
-
-    check(g1_ik_state_reset(
-              state, baseline_global_positions, baseline_global_rotations,
-              error, sizeof(error)), error);
-    check(g1_ik_frame_evaluate(
-              output, state, db.bone_positions(0), db.bone_rotations(0),
-              db.bone_parents, db.contact_states(0), field, true,
-              1.0f / 25.0f, result, error, sizeof(error)), error);
-    check(result.applied, "IK-on frame applies downstream pose");
-    check(result.max_correction_radians <= 0.350001f,
-          "frame correction bound");
-    const int allowed[] = {
-        G1_LeftHipYaw, G1_LeftKnee, G1_LeftToe,
-        G1_RightHipYaw, G1_RightKnee, G1_RightToe
-    };
-    for (int bone = 0; bone < G1_BoneCount; ++bone) {
-        bool may_change = false;
-        for (int value : allowed) may_change = may_change || bone == value;
-        if (!may_change)
-            check(same_quat(output(bone), db.bone_rotations(0, bone)),
-                  "IK-on changes named rotations only");
-    }
-    check(same_quat(output(G1_Simulation), db.bone_rotations(0, G1_Simulation)),
-          "simulation rotation is immutable");
-    check(db.bone_positions(0, G1_Simulation).y == support_root_y,
-          "IK-on cannot change support root position");
-}
-```
-
-- [ ] **Step 2: Compile to verify frame-transaction RED**
-
-Run:
+Task 5's kernel already exists. Compile it strictly first, then compile the
+missing runtime caller. The caller compile is the expected RED; do not include
+`g1_clearance.cpp` into the caller translation unit:
 
 ```bash
-g++ -std=c++17 -O0 -g -Wall -Wextra -Werror -pedantic -I. \
-  tests/cpp/test_g1_ik.cpp -o /tmp/test_g1_ik
+mkdir -p /tmp/g1-ik-clearance/task6-red
+g++ -std=c++17 -O0 -g -Wall -Wextra -Werror -pedantic \
+  -fno-fast-math -ffp-contract=off -frounding-math -I. \
+  -c g1_clearance.cpp \
+  -o /tmp/g1-ik-clearance/task6-red/g1-clearance.o
+g++ -std=c++17 -O0 -g -Wall -Wextra -Werror -pedantic \
+  -DG1_IK_ENABLE_TEST_SEAMS -I. \
+  -c tests/cpp/test_g1_ik.cpp \
+  -o /tmp/g1-ik-clearance/task6-red/test-g1-ik.o
 ```
 
-Expected: compilation fails with `fatal error: g1_ik_runtime.h: No such file or directory`.
+Expected: the strict kernel object builds; the caller fails because
+`g1_ik_runtime.h` or its staging declarations do not exist.
 
-- [ ] **Step 3: Define fixed-size per-foot state and outcomes**
+- [ ] **Step 3: Define fixed-size state, diagnostics, and checked reset**
 
-Create `g1_ik_runtime.h`:
+Create `g1_ik_runtime.h` including `g1_clearance.h`. Define the existing stop
+reason enum and these ownership changes:
 
 ```cpp
-#pragma once
-
-#include "g1_clearance.h"
-
-enum G1IkStopReason
-{
-    G1IkStopNone = 0,
-    G1IkStopSwingLift = 1,
-    G1IkStopReachShell = 2,
-    G1IkStopCorrectionBound = 3,
-    G1IkStopLockDrift = 4,
-    G1IkStopEndEffectorResidual = 5,
-    G1IkStopPostSolveClearance = 6
-};
-
 struct G1FootIkState
 {
     G1FootLockState lock;
@@ -2190,10 +1783,10 @@ struct G1FootFrameResult
 {
     bool recorded_contact = false;
     G1FootTarget target;
-    G1SwingClearancePlan swing;
+    G1SwingSelectionDiagnostic swing_selection;
+    G1SwingClearanceValidation defensive_swing;
     G1LegSolveResult position;
     G1FootOrientationResult orientation;
-    float applied_swing_lift_m = 0.0f;
 };
 
 struct G1IkFrameResult
@@ -2204,263 +1797,183 @@ struct G1IkFrameResult
     float max_correction_radians = 0.0f;
     G1FootFrameResult feet[2];
 };
-
-static inline const char* g1_ik_stop_reason_name(G1IkStopReason reason)
-{
-    switch (reason) {
-    case G1IkStopNone: return "none";
-    case G1IkStopSwingLift: return "swing-lift";
-    case G1IkStopReachShell: return "reach-shell";
-    case G1IkStopCorrectionBound: return "correction-bound";
-    case G1IkStopLockDrift: return "lock-drift";
-    case G1IkStopEndEffectorResidual: return "end-effector-residual";
-    case G1IkStopPostSolveClearance: return "post-solve-clearance";
-    }
-    return "invalid";
-}
-
-static inline vec3 g1_config_sole_center_local(const G1LegConfig& config)
-{
-    return 0.25f * (
-        config.sole_points_local[0] + config.sole_points_local[1] +
-        config.sole_points_local[2] + config.sole_points_local[3]);
-}
-
-static inline bool g1_ik_state_reset(
-    G1IkState& output,
-    const slice1d<vec3> global_positions,
-    const slice1d<quat> global_rotations,
-    char* error,
-    int error_capacity)
-{
-    if (global_positions.size != G1_BoneCount ||
-        global_rotations.size != G1_BoneCount)
-        return g1_ik_error(error, error_capacity, "G1 IK reset pose shape mismatch");
-    const G1LegConfig configs[2] = {
-        g1_left_leg_config(), g1_right_leg_config()
-    };
-    G1IkState state = {};
-    state.initialized = true;
-    for (int foot = 0; foot < 2; ++foot) {
-        vec3 sole[4];
-        g1_sole_points_world(
-            sole,
-            global_positions(configs[foot].contact),
-            global_rotations(configs[foot].contact),
-            configs[foot]);
-        const vec3 center = g1_sole_center_world(sole);
-        vec3 sphere_centers[4];
-        g1_foot_sphere_centers_world(
-            sphere_centers,
-            global_positions(configs[foot].contact),
-            global_rotations(configs[foot].contact), configs[foot]);
-        if (!g1_ik_vec3_is_runtime_value(center))
-            return g1_ik_error(error, error_capacity, "G1 IK reset sole is non-finite");
-        if (!g1_foot_lock_reset(
-                state.feet[foot].lock, center,
-                error, error_capacity)) return false;
-        g1_swing_history_reset(state.feet[foot].swing, sphere_centers);
-    }
-    output = state;
-    return true;
-}
 ```
 
-- [ ] **Step 4: Implement one downstream observe/apply transaction**
-
-Append to `g1_ik_runtime.h`:
+`g1_ik_state_reset` validates shapes and configurations into a local candidate,
+computes actual FK sphere centers, and calls checked history reset explicitly:
 
 ```cpp
-static inline void g1_ik_request_stop(
-    G1IkFrameResult& frame, G1IkStopReason reason)
-{
-    frame.safe_stop_requested = true;
-    if (frame.stop_reason == G1IkStopNone) frame.stop_reason = reason;
-}
-
-static inline bool g1_ik_frame_evaluate(
-    slice1d<quat> output_rotations,
-    G1IkState& state,
-    const slice1d<vec3> baseline_positions,
-    const slice1d<quat> baseline_rotations,
-    const slice1d<int> parents,
-    const slice1d<bool> recorded_contacts,
-    const heightfield& field,
-    bool apply_enabled,
-    float dt,
-    G1IkFrameResult& output,
-    char* error,
-    int error_capacity)
-{
-    if (!state.initialized || output_rotations.size != G1_BoneCount ||
-        baseline_positions.size != G1_BoneCount ||
-        baseline_rotations.size != G1_BoneCount ||
-        parents.size != G1_BoneCount || recorded_contacts.size != 2 ||
-        field.version != 2 || !g1_ik_dt_is_exact_25_hz(dt)) {
-        return g1_ik_error(
-            error, error_capacity,
-            "G1 IK frame requires initialized 31-bone G1HF/v2 state at 25 Hz");
-    }
-
-    array1d<vec3> baseline_global_positions(G1_BoneCount);
-    array1d<quat> baseline_global_rotations(G1_BoneCount);
-    forward_kinematics_full(
-        baseline_global_positions, baseline_global_rotations,
-        baseline_positions, baseline_rotations, parents);
-    array1d<quat> candidate = baseline_rotations;
-    G1IkState next = state;
-    G1IkFrameResult frame = {};
-    frame.applied = apply_enabled;
-    const G1LegConfig configs[2] = {
-        g1_left_leg_config(), g1_right_leg_config()
-    };
-
-    for (int foot = 0; foot < 2; ++foot) {
-        const G1LegConfig& config = configs[foot];
-        G1FootFrameResult& result = frame.feet[foot];
-        result.recorded_contact = recorded_contacts(foot);
-        vec3 baseline_sole[4];
-        g1_sole_points_world(
-            baseline_sole,
-            baseline_global_positions(config.contact),
-            baseline_global_rotations(config.contact), config);
-        vec3 baseline_centers[4];
-        g1_foot_sphere_centers_world(
-            baseline_centers,
-            baseline_global_positions(config.contact),
-            baseline_global_rotations(config.contact), config);
-        const vec3 baseline_center = g1_sole_center_world(baseline_sole);
-        if (!g1_foot_lock_update(
-                next.feet[foot].lock, result.target,
-                field, config, baseline_center, recorded_contacts(foot),
-                dt, error, error_capacity) ||
-            !g1_swing_clearance_plan(
-                next.feet[foot].swing, result.swing,
-                field, config, baseline_centers, recorded_contacts(foot),
-                dt, error, error_capacity)) return false;
-
-        result.applied_swing_lift_m = result.swing.applied_lift_m;
-        if (result.target.drift_limit_exceeded)
-            g1_ik_request_stop(frame, G1IkStopLockDrift);
-        if (result.swing.safe_stop_requested)
-            g1_ik_request_stop(frame, G1IkStopSwingLift);
-        const bool needs_position =
-            result.target.position_active ||
-            result.applied_swing_lift_m > 0.0f;
-        if (!needs_position) continue;
-
-        vec3 desired_sole_center = result.target.position_active
-            ? result.target.sole_center : baseline_center;
-        desired_sole_center.y += result.applied_swing_lift_m;
-        vec3 target_normal = result.target.surface.normal;
-        if (!result.target.locked) {
-            G1SurfaceTarget swing_surface = {};
-            if (!g1_surface_target_sample(
-                    swing_surface, field,
-                    desired_sole_center.x, desired_sole_center.z,
-                    0.0f, error, error_capacity)) return false;
-            target_normal = swing_surface.normal;
-        }
-
-        quat target_foot_global = baseline_global_rotations(config.contact);
-        if (result.target.locked && !g1_surface_aligned_foot_rotation(
-                target_foot_global,
-                baseline_global_rotations(config.contact),
-                config, target_normal, error, error_capacity)) return false;
-        const vec3 desired_contact = desired_sole_center - quat_mul_vec3(
-            target_foot_global, g1_config_sole_center_local(config));
-
-        if (!g1_apply_named_contact_position_ik(
-                candidate, baseline_positions, baseline_rotations, parents,
-                config, desired_contact, result.position,
-                error, error_capacity)) return false;
-        frame.max_correction_radians = maxf(
-            frame.max_correction_radians,
-            result.position.max_correction_radians);
-        if (!result.position.reachable)
-            g1_ik_request_stop(frame, G1IkStopReachShell);
-        if (result.position.correction_limited)
-            g1_ik_request_stop(frame, G1IkStopCorrectionBound);
-        if (result.position.safe_stop_requested &&
-            result.position.reachable &&
-            !result.position.correction_limited)
-            g1_ik_request_stop(frame, G1IkStopEndEffectorResidual);
-
-        if (result.target.locked) {
-            if (!g1_apply_named_foot_orientation(
-                    candidate, baseline_positions, baseline_rotations, parents,
-                    config, target_normal, result.orientation,
-                    error, error_capacity)) return false;
-            frame.max_correction_radians = maxf(
-                frame.max_correction_radians,
-                result.orientation.correction_radians);
-            if (result.orientation.correction_limited)
-                g1_ik_request_stop(frame, G1IkStopCorrectionBound);
-        }
-    }
-
-    array1d<vec3> candidate_global_positions(G1_BoneCount);
-    array1d<quat> candidate_global_rotations(G1_BoneCount);
-    forward_kinematics_full(
-        candidate_global_positions, candidate_global_rotations,
-        baseline_positions, candidate, parents);
-    for (int foot = 0; foot < 2; ++foot) {
-        vec3 final_centers[4];
-        g1_foot_sphere_centers_world(
-            final_centers,
-            candidate_global_positions(configs[foot].contact),
-            candidate_global_rotations(configs[foot].contact),
-            configs[foot]);
-        if (!g1_swing_clearance_validate(
-                frame.feet[foot].swing.actual_corrected_margin_m,
-                next.feet[foot].swing, field, configs[foot], final_centers,
-                frame.feet[foot].recorded_contact,
-                error, error_capacity)) return false;
-        if (frame.feet[foot].swing.actual_corrected_margin_m < -1e-5f)
-            g1_ik_request_stop(frame, G1IkStopSwingLift);
-    }
-
-    if (!terrain_float_is_finite(frame.max_correction_radians) ||
-        frame.max_correction_radians > 0.35f + 1e-6f) {
-        return g1_ik_error(
-            error, error_capacity,
-            "G1 IK frame produced non-finite or over-bound correction");
-    }
-    for (int bone = 0; bone < G1_BoneCount; ++bone)
-        output_rotations(bone) = apply_enabled
-            ? candidate(bone) : baseline_rotations(bone);
-    state = next;
-    output = frame;
-    return true;
+if (!g1_swing_history_reset(
+        candidate.feet[foot].swing, sphere_centers,
+        error, error_capacity)) {
+    return false;
 }
 ```
 
-The current frame's matching has already completed before this function runs. A safe-stop request is an output only; Task 7 forwards it to the sibling traversability API for subsequent applied motion.
+Assign `output = candidate` only after both feet pass. No unchecked history
+operation or partially initialized state is observable.
 
-- [ ] **Step 5: Run reversible frame GREEN under all native modes**
+- [ ] **Step 4: Implement the one real staged transaction**
 
-Run:
+Implement one private `g1_ik_stage_swing_candidate` and the guarded diagnostic
+wrapper exactly as Task 5 Step 4 and reviewed design Section 9 specify. The full
+selector and wrapper both call that private function; neither duplicates a
+solve or clearance path.
+
+`g1_ik_frame_evaluate` starts with local pose/state/frame candidates. For each
+foot it updates the lock observer, bypasses the ladder only for recorded
+contact, and otherwise evaluates indices `0..40`. Each stage:
+
+1. materializes the actual desired sole command through strict
+   `g1_apply_swing_lift_y`;
+2. runs named bounded position IK, foot orientation, controller constraints, and
+   checked FK in production order;
+3. records actual sphere bits and calls `g1_swing_clearance_validate` with
+   `const G1ClearanceBudget swing_limits = g1_swing_foot_clearance_budget();`;
+4. branches on the explicit status enum:
+
+```cpp
+switch (status) {
+case G1ClearanceOk:
+    candidate_passes =
+        controller_constraints_passed &&
+        validation.lower_margin_m >= 0.0;
+    break;
+case G1ClearanceOutsideDomain:
+    clearance_rejection_status_mask |= G1SwingRejectOutsideDomainBit;
+    candidate_passes = false;
+    break;
+case G1ClearanceBudgetExceeded:
+    clearance_rejection_status_mask |= G1SwingRejectBudgetExceededBit;
+    candidate_passes = false;
+    break;
+case G1ClearanceUncertified:
+    clearance_rejection_status_mask |= G1SwingRejectUncertifiedBit;
+    candidate_passes = false;
+    break;
+case G1ClearanceInvalidInput:
+case G1ClearanceInvalidField:
+case G1ClearanceArithmeticFailure:
+    return g1_ik_error(
+        error, error_capacity,
+        "G1 staged swing clearance failed with status %u",
+        static_cast<unsigned>(status));
+}
+```
+
+Validate after every OR that no bit outside `G1SwingRejectKnownMask` is set.
+Assign `selection.clearance_rejection_status_mask` only with the otherwise
+transactional public selection diagnostic: selected and all-41-fail results
+retain the aggregate, recorded-contact remains zero, and a global abort leaves
+the caller's prior diagnostic unchanged. The guarded per-candidate seam exposes
+only that candidate's existing status; tests derive the aggregate externally
+and compare it with the full selector, so no rejected pose or margin is added
+to the seam.
+
+Move the first passing staged pose into outer scratch without rerunning IK.
+Run both foot selectors so their real diagnostics are complete. If either foot
+has all-41 finite rejection, return success with the immutable baseline pose,
+unchanged scratch state/histories, and the completed frame safe-stop diagnostic
+including both masks; this is a diagnostic transaction, not a controlled
+error. Only when both feet select or bypass for recorded contact does the
+runtime compose their staged poses, run checked FK once, compare selected
+endpoint bits, and call the strict validator again with a fresh immutable swing
+budget. Require explicit `status == G1ClearanceOk` and
+`lower_margin_m >= 0.0`.
+
+Only after all final checks pass, call checked history commit into the local
+next state:
+
+```cpp
+if (!g1_swing_history_commit(
+        next.feet[foot].swing, final_centers,
+        error, error_capacity)) {
+    return false;
+}
+```
+
+Then assign output pose, scratch state, and frame result together. Any returned
+error leaves every caller-owned output unchanged. A successful finite safe-stop
+assigns only its completed frame diagnostic while preserving baseline pose and
+accepted state/history as described above. The outer controller may discard a
+successful staged pose transaction if its complete pose-capsule thresholds
+reject it.
+
+After creating the runtime, run the source contract scan here—not in Task 5:
 
 ```bash
-g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
-  tests/cpp/test_g1_ik.cpp -o /tmp/test_g1_ik_strict
-/tmp/test_g1_ik_strict
-g++ -std=c++17 -O3 -ffast-math -DNDEBUG -I. \
-  tests/cpp/test_g1_ik.cpp -o /tmp/test_g1_ik_release
-/tmp/test_g1_ik_release
-g++ -std=c++17 -O1 -g -fsanitize=address,undefined \
-  -fno-omit-frame-pointer -I. tests/cpp/test_g1_ik.cpp \
-  -o /tmp/test_g1_ik_san
-ASAN_OPTIONS=detect_leaks=1 /tmp/test_g1_ik_san
+test -f g1_ik_runtime.h
+rg -n 'G1SwingLiftCandidateBits|G1SwingSelectionDiagnostic|clearance_rejection_status_mask|actual_sphere_center_bits|g1_ik_stage_swing_candidate_for_test' \
+  g1_ik_runtime.h tests/cpp/test_g1_ik.cpp
+! rg -n 'g1_swing_clearance_plan|required_lift_m|corrected_margin_m|actual_corrected_margin_m|sphere.*\+.*lift' \
+  g1_ik_runtime.h tests/cpp/test_g1_ik.cpp
 ```
 
-Expected: all modes exit `0`; IK-off is byte-identical, IK-on changes only the six named leg rotations, support-root inputs remain unchanged, and no correction exceeds `0.35` radians.
+- [ ] **Step 5: Run strict, release-caller, and sanitizer GREEN**
+
+Every mode compiles `g1_clearance.cpp` separately with strict FP and links with a
+driver command that does not contain `-ffast-math`:
+
+```bash
+mkdir -p /tmp/g1-ik-clearance/task6
+
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic \
+  -fno-fast-math -ffp-contract=off -frounding-math -I. \
+  -c g1_clearance.cpp \
+  -o /tmp/g1-ik-clearance/task6/g1-clearance-strict.o
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic \
+  -DG1_IK_ENABLE_TEST_SEAMS -I. \
+  -c tests/cpp/test_g1_ik.cpp \
+  -o /tmp/g1-ik-clearance/task6/test-g1-ik-strict.o
+g++ /tmp/g1-ik-clearance/task6/test-g1-ik-strict.o \
+  /tmp/g1-ik-clearance/task6/g1-clearance-strict.o \
+  -o /tmp/g1-ik-clearance/task6/test-g1-ik-strict
+/tmp/g1-ik-clearance/task6/test-g1-ik-strict
+
+g++ -std=c++17 -O3 -fno-fast-math -ffp-contract=off \
+  -frounding-math -DNDEBUG -I. -c g1_clearance.cpp \
+  -o /tmp/g1-ik-clearance/task6/g1-clearance-release.o
+g++ -std=c++17 -O3 -ffast-math -DNDEBUG \
+  -DG1_IK_ENABLE_TEST_SEAMS -I. -c tests/cpp/test_g1_ik.cpp \
+  -o /tmp/g1-ik-clearance/task6/test-g1-ik-release.o
+g++ /tmp/g1-ik-clearance/task6/test-g1-ik-release.o \
+  /tmp/g1-ik-clearance/task6/g1-clearance-release.o \
+  -o /tmp/g1-ik-clearance/task6/test-g1-ik-release
+/tmp/g1-ik-clearance/task6/test-g1-ik-release
+
+g++ -std=c++17 -O1 -g -fno-fast-math -ffp-contract=off \
+  -frounding-math \
+  -fsanitize=address,undefined,float-cast-overflow,float-divide-by-zero \
+  -fno-sanitize-recover=all -fno-omit-frame-pointer -I. \
+  -c g1_clearance.cpp \
+  -o /tmp/g1-ik-clearance/task6/g1-clearance-san.o
+g++ -std=c++17 -O1 -g -fno-fast-math \
+  -DG1_IK_ENABLE_TEST_SEAMS \
+  -fsanitize=address,undefined,float-cast-overflow,float-divide-by-zero \
+  -fno-sanitize-recover=all -fno-omit-frame-pointer -I. \
+  -c tests/cpp/test_g1_ik.cpp \
+  -o /tmp/g1-ik-clearance/task6/test-g1-ik-san.o
+g++ -fsanitize=address,undefined,float-cast-overflow,float-divide-by-zero \
+  -fno-sanitize-recover=all \
+  /tmp/g1-ik-clearance/task6/test-g1-ik-san.o \
+  /tmp/g1-ik-clearance/task6/g1-clearance-san.o \
+  -o /tmp/g1-ik-clearance/task6/test-g1-ik-san
+ASAN_OPTIONS=detect_leaks=1 \
+UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+  /tmp/g1-ik-clearance/task6/test-g1-ik-san
+```
+
+Expected: every executable exits zero; strict/release supplied-endpoint parity
+records are byte-identical; each build deterministically selects its own first
+actual pass; the all-fail fixture makes exactly 41 calls and rolls back; no
+sanitizer finding appears. The macro-free negative compile and production
+symbol scan also pass.
 
 - [ ] **Step 6: Commit the reversible frame transaction**
 
 ```bash
 git add g1_ik_runtime.h tests/cpp/test_g1_ik.cpp
-git commit -m "feat: compose reversible G1 terrain IK frames"
+git commit -m "feat: compose certified G1 terrain IK frames"
 ```
 
 ### Task 7: Integrate IK State, Safe-Stop Handoff, and Controlled Cleanup
@@ -2472,250 +1985,136 @@ git commit -m "feat: compose reversible G1 terrain IK frames"
 - Modify: `tests/cpp/test_g1_ik.cpp`
 
 **Interfaces:**
-- Extends sibling-owned `g1_controller_state` with resettable `G1IkState`,
-  separate last-safe output and scratch-candidate local/global pose arrays, the
-  latest `G1IkFrameResult`/accepted and rejected `G1PoseClearance`, and a
-  latched safe-stop request.
-- Consumes sibling-owned support-retargeted `state.adjusted_bone_*`, active `scene_pack.terrain`, recorded `state.curr_bone_contacts`, and the existing traversability command/clip functions.
-- `MM_IK` accepts exactly `0` or `1`, defaults to `0`, and is persistent configuration outside scene-reset state. A live checkbox edge resets only downstream IK observation from the current support-retargeted baseline.
-- Any finite unsafe outcome rejects the candidate pose transactionally, retains
-  the prior measured-safe rendered output, and on the next update zeros the
-  desired XZ command plus planar simulation velocity/acceleration before
-  prediction. A non-finite outcome sets the existing
-  `controller_exit_requested/controller_exit_code` and returns through normal
-  log/model/window cleanup.
+- Extends `g1_controller_state` with resettable accepted `G1IkState`,
+  last-safe local/global pose arrays, `G1IkFrameResult`, accepted and rejected
+  `G1PoseClearance`, exact `G1ClearanceStatus ik_candidate_clearance_status`, a
+  rejection flag, and a latched safe-stop request.
+- A frame evaluates through a local `G1IkState ik_candidate_state`. The
+  controller commits that state only with the accepted pose and binary64 pose
+  certificate; discarding a candidate therefore also discards its locks and
+  checked swing-history commits.
+- Every pose measurement passes
+  `const G1ClearanceBudget pose_limits = g1_pose_clearance_budget();` and stores
+  the exact `G1ClearanceStatus`. `Ok` may be threshold-tested;
+  `OutsideDomain`/`BudgetExceeded`/`Uncertified` are finite candidate
+  rejections; `InvalidInput`/`InvalidField`/`ArithmeticFailure` are controlled
+  errors followed by normal cleanup.
+- Any finite unsafe outcome retains the last-safe rendered pose and accepted
+  clearance, latches safe stop, and cancels XZ command/inertia at the next
+  existing traversability boundary. It never mutates matching, support, terrain,
+  route, or Y simulation state.
+- `MM_IK` accepts exactly `0` or `1` and defaults to `0`.
 
-- [ ] **Step 1: Extend reset tests first**
+- [ ] **Step 1: Extend reset, status, rollback, and option tests first**
 
-In `tests/cpp/test_g1_controller_state.cpp`, poison IK fields before the existing reset call:
+Poison every accepted IK field, pose array, clearance result, rejection flag,
+and latch before the controller-state reset fixture. After reset require:
 
-```cpp
-state.ik.initialized = true;
-state.ik.feet[0].lock.locked = true;
-state.ik_safe_stop_latched = true;
-state.ik_bone_positions.resize(G1_BoneCount);
-state.ik_bone_positions.set(vec3(9.0f, 9.0f, 9.0f));
-state.ik_bone_rotations.resize(G1_BoneCount);
-state.ik_bone_rotations.set(quat(0.0f, 1.0f, 0.0f, 0.0f));
-state.ik_candidate_bone_positions.resize(G1_BoneCount);
-state.ik_candidate_bone_positions.set(vec3(-9.0f, -9.0f, -9.0f));
-state.ik_candidate_rejected = true;
-```
+- accepted/scratch pose arrays equal the support-retargeted baseline;
+- both checked histories are initialized from actual FK centers;
+- `ik_clearance.minimum.lower_bound_m` is finite and at least `-0.01`;
+- accepted state/pose/clearance remain bit-identical when any reset clearance
+  status is non-`Ok`;
+- `MM_IK` exact parsing and the latched XZ handoff behavior remain as previously
+  specified.
 
-After reset, add:
+Add controller transaction fixtures for all seven clearance statuses. Require
+the three finite candidate-local failures to reject and latch without changing
+accepted state, while the three global failures request controlled exit without
+changing it. Seed a successful `G1ClearanceResult` whose lower bound cannot be
+represented upward safely as float and prove the controller compares the
+original binary64 bits.
 
-```cpp
-check(state.ik.initialized, "IK observation initialized");
-check(!state.ik.feet[0].lock.locked && !state.ik.feet[1].lock.locked,
-      "IK locks reset");
-check(!state.ik_safe_stop_latched, "IK safe stop reset");
-check(!state.ik_candidate_rejected, "IK candidate rejection reset");
-for (int bone = 0; bone < G1_BoneCount; ++bone) {
-    check(state.ik_bone_positions(bone).x == state.adjusted_bone_positions(bone).x &&
-          state.ik_bone_positions(bone).y == state.adjusted_bone_positions(bone).y &&
-          state.ik_bone_positions(bone).z == state.adjusted_bone_positions(bone).z,
-          "IK positions reset from support baseline");
-    check(quat_angle_between(
-              state.ik_bone_rotations(bone),
-              state.adjusted_bone_rotations(bone)) < 1e-7f,
-          "IK rotations reset from support baseline");
-    check(state.ik_candidate_bone_positions(bone).x ==
-              state.ik_bone_positions(bone).x &&
-          quat_angle_between(
-              state.ik_candidate_bone_rotations(bone),
-              state.ik_bone_rotations(bone)) < 1e-7f,
-          "IK scratch candidate reset from last-safe output");
-}
-check(state.ik_bone_positions(G1_Simulation).y == state.support.height,
-      "IK reset preserves support-retargeted root Y");
-```
-
-In `tests/cpp/test_g1_ik.cpp`, add and call:
-
-```cpp
-static void test_ik_option_is_exact()
-{
-    bool enabled = true;
-    char error[128] = {};
-    check(g1_parse_ik_enabled(enabled, NULL, error, sizeof(error)) && !enabled,
-          "missing MM_IK defaults off");
-    check(g1_parse_ik_enabled(enabled, "1", error, sizeof(error)) && enabled,
-          "MM_IK=1 enables");
-    check(g1_parse_ik_enabled(enabled, "0", error, sizeof(error)) && !enabled,
-          "MM_IK=0 disables");
-    check(!g1_parse_ik_enabled(enabled, "true", error, sizeof(error)),
-          "non-exact MM_IK rejected");
-    check(std::strstr(error, "0 or 1") != NULL, "MM_IK diagnostic");
-
-    const vec3 command(0.4f, 0.0f, -0.2f);
-    const G1IkStopHandoff allowed =
-        g1_ik_safe_stop_handoff(false, command);
-    const G1IkStopHandoff stopped =
-        g1_ik_safe_stop_handoff(true, command);
-    check(allowed.desired_command.x == command.x &&
-          allowed.desired_command.y == command.y &&
-          allowed.desired_command.z == command.z &&
-          !allowed.cancel_planar_inertia,
-          "unlatched IK command is exact");
-    check(stopped.desired_command.x == 0.0f &&
-          stopped.desired_command.y == 0.0f &&
-          stopped.desired_command.z == 0.0f &&
-          stopped.cancel_planar_inertia,
-          "latched IK handoff cancels command and planar coast");
-}
-```
-
-- [ ] **Step 2: Compile to verify controller-state RED**
-
-Run:
+- [ ] **Step 2: Compile controller-state RED with a separate strict kernel**
 
 ```bash
+mkdir -p /tmp/g1-ik-clearance/task7-red
+g++ -std=c++17 -O0 -g -Wall -Wextra -Werror -pedantic \
+  -fno-fast-math -ffp-contract=off -frounding-math -I. \
+  -c g1_clearance.cpp \
+  -o /tmp/g1-ik-clearance/task7-red/g1-clearance.o
 g++ -std=c++17 -O0 -g -Wall -Wextra -Werror -pedantic -I. \
-  tests/cpp/test_g1_controller_state.cpp -o /tmp/test_g1_controller_state
-g++ -std=c++17 -O0 -g -Wall -Wextra -Werror -pedantic -I. \
-  tests/cpp/test_g1_ik.cpp -o /tmp/test_g1_ik
+  -c tests/cpp/test_g1_controller_state.cpp \
+  -o /tmp/g1-ik-clearance/task7-red/test-controller-state.o
 ```
 
-Expected: compilation fails because the controller state has no IK fields and `g1_parse_ik_enabled` is undefined.
+Expected: the strict kernel builds and the caller fails because the new
+controller-state ownership/status fields are absent. Do not use a one-command
+compile that could absorb the strict implementation into caller flags.
 
-- [ ] **Step 3: Add exact option parsing**
+- [ ] **Step 3: Add exact option parsing and next-update handoff**
 
-Append to `g1_ik_runtime.h`:
+Keep `g1_parse_ik_enabled` and `g1_ik_safe_stop_handoff` from the prior plan.
+The former accepts only null/`0`/`1`. The latter returns an exact zero desired
+command and `cancel_planar_inertia=true` only for a latched stop; it never
+changes Y state.
 
-```cpp
-static inline bool g1_parse_ik_enabled(
-    bool& enabled, const char* text, char* error, int error_capacity)
-{
-    if (text == NULL) {
-        enabled = false;
-        return true;
-    }
-    if (std::strcmp(text, "0") == 0) {
-        enabled = false;
-        return true;
-    }
-    if (std::strcmp(text, "1") == 0) {
-        enabled = true;
-        return true;
-    }
-    return g1_ik_error(
-        error, error_capacity,
-        "MM_IK must be exactly 0 or 1, got '%s'", text);
-}
-```
+- [ ] **Step 4: Replace dormant contact state and reset with explicit status**
 
-Add `#include <cstring>` to `g1_ik_runtime.h`.
+Include `g1_ik_runtime.h` from `g1_controller_state.h`. Replace the dormant
+generic contact arrays with accepted IK state, accepted/scratch local/global
+pose arrays, `G1IkFrameResult`, two `G1PoseClearance` values, rejection, and
+the candidate status/latch fields. Swap each owner transactionally.
 
-Also append the explicit next-update handoff helper used by the test and controller:
+Inside the local reset candidate, build baseline FK with
+`g1_ik_checked_forward_kinematics`, call checked
+`g1_ik_state_reset`, then measure the pose with an immutable budget and explicit
+status:
 
 ```cpp
-struct G1IkStopHandoff
-{
-    vec3 desired_command;
-    bool cancel_planar_inertia = false;
-};
-
-static inline G1IkStopHandoff g1_ik_safe_stop_handoff(
-    bool safe_stop_latched, vec3 desired_command)
-{
-    G1IkStopHandoff result = {};
-    result.desired_command = safe_stop_latched ? vec3() : desired_command;
-    result.cancel_planar_inertia = safe_stop_latched;
-    return result;
-}
-```
-
-- [ ] **Step 4: Replace dormant generic contact state with explicit IK state**
-
-Include `g1_ik_runtime.h` from `g1_controller_state.h`. Replace the sibling plan's dormant `contact_bones`, `contact_states`, `contact_locks`, `contact_positions`, `contact_velocities`, `contact_points`, `contact_targets`, `contact_offset_positions`, and `contact_offset_velocities` members with:
-
-```cpp
-G1IkState ik;
-array1d<vec3> ik_bone_positions;
-array1d<quat> ik_bone_rotations;
-array1d<vec3> ik_global_bone_positions;
-array1d<quat> ik_global_bone_rotations;
-array1d<vec3> ik_candidate_bone_positions;
-array1d<quat> ik_candidate_bone_rotations;
-array1d<vec3> ik_candidate_global_bone_positions;
-array1d<quat> ik_candidate_global_bone_rotations;
-G1IkFrameResult ik_frame;
-G1PoseClearance ik_clearance;
-G1PoseClearance ik_candidate_clearance;
-bool ik_candidate_rejected = false;
-bool ik_safe_stop_latched = false;
-```
-
-In `g1_controller_state_swap`, swap all eight arrays with the existing
-`g1_swap`, then swap `ik`, `ik_frame`, both clearance structs,
-`ik_candidate_rejected`, and `ik_safe_stop_latched` with `std::swap`. Remove
-swaps for the deleted generic contact arrays.
-
-In the local candidate inside `g1_controller_state_reset`, after `support_pose_apply`, initialize the separate output buffers and downstream state:
-
-```cpp
-s.ik_bone_positions = s.adjusted_bone_positions;
-s.ik_bone_rotations = s.adjusted_bone_rotations;
-s.ik_global_bone_positions.resize(bones);
-s.ik_global_bone_rotations.resize(bones);
-forward_kinematics_full(
+const G1ClearanceBudget pose_limits = g1_pose_clearance_budget();
+G1PoseClearance reset_clearance = {};
+const G1ClearanceStatus reset_status = g1_measure_pose_clearance(
+    reset_clearance,
+    pose_limits,
+    scene.terrain,
     s.ik_global_bone_positions,
     s.ik_global_bone_rotations,
-    s.ik_bone_positions,
-    s.ik_bone_rotations,
-    db.bone_parents);
-s.ik_candidate_bone_positions = s.ik_bone_positions;
-s.ik_candidate_bone_rotations = s.ik_bone_rotations;
-s.ik_candidate_global_bone_positions = s.ik_global_bone_positions;
-s.ik_candidate_global_bone_rotations = s.ik_global_bone_rotations;
-if (!g1_ik_state_reset(
-        s.ik,
-        s.ik_global_bone_positions,
-        s.ik_global_bone_rotations,
-        error,
-        capacity)) return false;
-s.ik_frame = G1IkFrameResult();
-s.ik_clearance = G1PoseClearance();
-if (!g1_measure_pose_clearance(
-        s.ik_clearance, scene.terrain,
-        s.ik_global_bone_positions, s.ik_global_bone_rotations,
-        error, capacity) || s.ik_clearance.minimum_m < -0.01f)
+    error,
+    capacity);
+if (reset_status != G1ClearanceOk) {
     return scene_error(
         error, capacity,
-        "controller reset: scene '%s' has no physically safe initial G1 pose",
+        "controller reset: scene '%s' initial G1 clearance status=%u",
+        scene.metadata.id.c_str(),
+        static_cast<unsigned>(reset_status));
+}
+if (reset_clearance.minimum.lower_bound_m < -0.01) {
+    return scene_error(
+        error, capacity,
+        "controller reset: scene '%s' initial G1 pose is unsafe",
         scene.metadata.id.c_str());
-s.ik_candidate_clearance = s.ik_clearance;
+}
+s.ik_clearance = reset_clearance;
+s.ik_candidate_clearance = reset_clearance;
+s.ik_candidate_clearance_status = G1ClearanceOk;
 s.ik_candidate_rejected = false;
 s.ik_safe_stop_latched = false;
 ```
 
-This remains inside the reset candidate, so a failed IK reset cannot mutate the active scene/controller state.
+The reset candidate is assigned only after every step succeeds. No
+`G1ClearanceStatus` is converted to bool, no budget is mutated, and no safety
+bound is rounded to float.
 
-- [ ] **Step 5: Parse IK before opening Raylib and remove the inherited solver block**
+- [ ] **Step 5: Parse IK before Raylib and remove inherited solver code**
 
-In `controller.cpp`, include `g1_ik_runtime.h`. Parse once beside the sibling runtime's other validated options:
+Parse `MM_IK` beside the other validated options before opening a window or log.
+Delete file-scope generic `contact_reset`/`contact_update`/`ik_look_at`/
+`ik_two_bone` and the hard-coded toe-end branch. `g1_ik.h`,
+`g1_ik_runtime.h`, and strict `g1_clearance.cpp` are the only active IK and
+clearance implementation.
 
-```cpp
-bool ik_enabled = false;
-if (!g1_parse_ik_enabled(
-        ik_enabled, std::getenv("MM_IK"),
-        artifact_error, sizeof(artifact_error))) {
-    std::fprintf(stderr, "G1 IK option error: %s\n", artifact_error);
-    return 2;
-}
-```
+- [ ] **Step 6: Stage after support FK and commit pose, state, and clearance together**
 
-Delete the old file-scope `contact_reset`, `contact_update`, `ik_look_at`, and `ik_two_bone` functions and delete the parent-walk/hard-coded toe-end `if (ik_enabled)` block. `ik.h`, `g1_ik.h`, and `g1_ik_runtime.h` become the only active IK implementation.
-
-- [ ] **Step 6: Insert IK only after support retargeting and baseline FK**
-
-At the sibling runtime's fixed-update order, keep matching, inertialization, support update, `support_pose_apply`, horizontal adjustment/clamp, and baseline `forward_kinematics_full` unchanged. Immediately after baseline support FK, add:
+After support retargeting and baseline FK, create scratch state and call the
+runtime:
 
 ```cpp
+G1IkState ik_candidate_state = state.ik;
 state.ik_candidate_bone_positions = state.adjusted_bone_positions;
 if (!g1_ik_frame_evaluate(
         state.ik_candidate_bone_rotations,
-        state.ik,
+        ik_candidate_state,
         state.adjusted_bone_positions,
         state.adjusted_bone_rotations,
         db.bone_parents,
@@ -2726,165 +2125,149 @@ if (!g1_ik_frame_evaluate(
         state.ik_frame,
         artifact_error,
         sizeof(artifact_error))) {
-    std::fprintf(
-        stderr,
-        "G1 IK controlled error scene=%s route=%s frame=%d: %s\n",
-        active_scene.metadata.id.c_str(),
-        active_scene.metadata.routes[static_cast<size_t>(state.route_index)].id.c_str(),
-        state.scene_frame,
-        artifact_error);
     controller_exit_code = 2;
     controller_exit_requested = true;
     return;
 }
-forward_kinematics_full(
+if (!g1_ik_checked_forward_kinematics(
     state.ik_candidate_global_bone_positions,
     state.ik_candidate_global_bone_rotations,
     state.ik_candidate_bone_positions,
     state.ik_candidate_bone_rotations,
-    db.bone_parents);
-if (!g1_measure_pose_clearance(
-        state.ik_candidate_clearance,
-        active_scene.terrain,
-        state.ik_candidate_global_bone_positions,
-        state.ik_candidate_global_bone_rotations,
-        artifact_error,
-        sizeof(artifact_error))) {
-    std::fprintf(
-        stderr,
-        "G1 IK clearance controlled error scene=%s frame=%d: %s\n",
-        active_scene.metadata.id.c_str(), state.scene_frame, artifact_error);
+    db.bone_parents,
+    artifact_error,
+    sizeof(artifact_error))) {
+    controller_exit_code = 2;
+    controller_exit_requested = true;
+    return;
+}
+
+const G1ClearanceBudget pose_limits = g1_pose_clearance_budget();
+G1PoseClearance measured_candidate = {};
+const G1ClearanceStatus pose_status = g1_measure_pose_clearance(
+    measured_candidate,
+    pose_limits,
+    active_scene.terrain,
+    state.ik_candidate_global_bone_positions,
+    state.ik_candidate_global_bone_rotations,
+    artifact_error,
+    sizeof(artifact_error));
+state.ik_candidate_clearance_status = pose_status;
+
+bool finite_clearance_rejection = false;
+switch (pose_status) {
+case G1ClearanceOk:
+    state.ik_candidate_clearance = measured_candidate;
+    break;
+case G1ClearanceOutsideDomain:
+case G1ClearanceBudgetExceeded:
+case G1ClearanceUncertified:
+    finite_clearance_rejection = true;
+    break;
+case G1ClearanceInvalidInput:
+case G1ClearanceInvalidField:
+case G1ClearanceArithmeticFailure:
     controller_exit_code = 2;
     controller_exit_requested = true;
     return;
 }
 
 const bool planted_penetration =
-    (state.ik_frame.feet[0].target.locked &&
-     (state.ik_candidate_clearance.left.toe_m < -0.005f ||
-      state.ik_candidate_clearance.left.foot_m < -0.005f)) ||
-    (state.ik_frame.feet[1].target.locked &&
-     (state.ik_candidate_clearance.right.toe_m < -0.005f ||
-      state.ik_candidate_clearance.right.foot_m < -0.005f));
+    pose_status == G1ClearanceOk &&
+    ((state.ik_frame.feet[0].target.locked &&
+      (measured_candidate.left.toe.lower_bound_m < -0.005 ||
+       measured_candidate.left.foot.lower_bound_m < -0.005)) ||
+     (state.ik_frame.feet[1].target.locked &&
+      (measured_candidate.right.toe.lower_bound_m < -0.005 ||
+       measured_candidate.right.foot.lower_bound_m < -0.005)));
 const bool physical_penetration =
-    state.ik_candidate_clearance.minimum_m < -0.01f;
-if (ik_enabled && (planted_penetration || physical_penetration)) {
+    pose_status == G1ClearanceOk &&
+    measured_candidate.minimum.lower_bound_m < -0.01;
+
+if (ik_enabled &&
+    (finite_clearance_rejection ||
+     planted_penetration ||
+     physical_penetration)) {
     g1_ik_request_stop(state.ik_frame, G1IkStopPostSolveClearance);
 }
 state.ik_candidate_rejected =
     ik_enabled && state.ik_frame.safe_stop_requested;
-if (!state.ik_candidate_rejected) {
+
+if (!state.ik_candidate_rejected && pose_status == G1ClearanceOk) {
+    state.ik = ik_candidate_state;
     state.ik_bone_positions = state.ik_candidate_bone_positions;
     state.ik_bone_rotations = state.ik_candidate_bone_rotations;
     state.ik_global_bone_positions = state.ik_candidate_global_bone_positions;
     state.ik_global_bone_rotations = state.ik_candidate_global_bone_rotations;
-    state.ik_clearance = state.ik_candidate_clearance;
-    const G1LegConfig configs[2] = {
-        g1_left_leg_config(), g1_right_leg_config()
-    };
-    for (int foot = 0; foot < 2; ++foot) {
-        vec3 accepted_centers[4];
-        g1_foot_sphere_centers_world(
-            accepted_centers,
-            state.ik_global_bone_positions(configs[foot].contact),
-            state.ik_global_bone_rotations(configs[foot].contact),
-            configs[foot]);
-        g1_swing_history_commit(
-            state.ik.feet[foot].swing, accepted_centers);
-    }
+    state.ik_clearance = measured_candidate;
 }
 if (state.ik_candidate_rejected) {
     state.ik_safe_stop_latched = true;
 }
 ```
 
-Do not write `state.adjusted_bone_*`, `state.bone_*`, `state.simulation_*`, or
-`state.support` anywhere in this block. Render and accepted post-IK diagnostics
-use only `state.ik_global_bone_*`. Every finite unsafe candidate—including
-reach, correction, lock-drift, residual, corrected-sweep, planted toe/foot, or
-physical capsule failure—leaves those last-safe arrays and their clearance
-unchanged. Candidate diagnostics remain separately loggable as rejection
-evidence. IK-off always commits the byte-identical support-retargeted baseline.
+The runtime's checked history commits exist only inside
+`ik_candidate_state`; there is no second unchecked history loop in the
+controller. Candidate diagnostics remain separate rejection evidence.
+IK-off commits the byte-identical support-retargeted pose and its explicit
+`Ok` certificate.
 
-- [ ] **Step 7: Hand the latched request to the existing stop path**
+- [ ] **Step 7: Hand the latch to the existing traversability boundary**
 
-At the next update's input-to-traversability boundary, before the sibling call to `traversability_limit_command`, add:
+At the next update, call `g1_ik_safe_stop_handoff` before
+`traversability_limit_command`. If `cancel_planar_inertia` is true, set only X/Z
+simulation velocity and acceleration to exact zero before prediction. Keep the
+user/route command for logging, preserve both Y components, and retain the
+sibling hard XZ clip. The latch clears only on scene reset or explicit live IK
+reset.
 
-```cpp
-const vec3 user_or_route_command = desired_velocity_curr;
-const G1IkStopHandoff ik_stop_handoff = g1_ik_safe_stop_handoff(
-    state.ik_safe_stop_latched, desired_velocity_curr);
-if (ik_stop_handoff.cancel_planar_inertia) {
-    state.simulation_velocity.x = 0.0f;
-    state.simulation_velocity.z = 0.0f;
-    state.simulation_acceleration.x = 0.0f;
-    state.simulation_acceleration.z = 0.0f;
-}
-desired_velocity_curr = traversability_limit_command(
-    state.traversal_speed_scale,
-    state.traversal_speed_scale_velocity,
-    traversal,
-    active_scene.walkability,
-    active_scene.terrain,
-    state.simulation_position,
-    ik_stop_handoff.desired_command,
-    dt);
-```
+- [ ] **Step 8: Keep the live toggle reversible**
 
-Retain `user_or_route_command` for the logger's commanded-speed field. The sibling `traversability_clip_step` remains the hard XZ boundary. The IK latch stays set until scene reset or the explicit live IK reset action; it does not invent a Y correction or overwrite G1WM class.
-The only simulation-state write introduced by IK occurs at this existing
-input-to-traversability boundary: a previously latched stop zeros X/Z velocity
-and acceleration before trajectory prediction and simulation integration while
-preserving both Y components exactly. Step 6 itself remains a pose-only
-transaction.
+The existing checkbox edge calls checked `g1_ik_state_reset` from the currently
+accepted `state.ik_global_bone_positions/rotations`, handles failure as a
+controlled exit, and clears the latch only on success. False restores exact
+IK-off output on the next update; true begins with no stale lock/history.
 
-- [ ] **Step 8: Add the live reversible toggle**
+- [ ] **Step 9: Run focused tests and deterministic controller smoke**
 
-In the existing diagnostics UI, add:
-
-```cpp
-const bool ik_was_enabled = ik_enabled;
-GuiCheckBox(
-    (Rectangle){20, 575, 250, 20},
-    "bounded G1 terrain IK",
-    &ik_enabled);
-if (ik_enabled != ik_was_enabled) {
-    if (!g1_ik_state_reset(
-            state.ik,
-            state.global_bone_positions,
-            state.global_bone_rotations,
-            artifact_error,
-            sizeof(artifact_error))) {
-        std::fprintf(stderr, "G1 IK toggle reset error: %s\n", artifact_error);
-        controller_exit_code = 2;
-        controller_exit_requested = true;
-    }
-    state.ik_safe_stop_latched = false;
-}
-```
-
-The false edge restores exact IK-off output on the next fixed update; the true edge starts with no stale lock or sweep history.
-
-- [ ] **Step 9: Run state GREEN, all focused tests, and a deterministic default-scene smoke**
-
-Run:
+Compile every clearance-consuming executable as separate objects. Caller flags
+may differ; kernel and final link remain strict:
 
 ```bash
-g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
-  tests/cpp/test_g1_controller_state.cpp -o /tmp/test_g1_controller_state
-/tmp/test_g1_controller_state
-g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
-  tests/cpp/test_g1_ik.cpp -o /tmp/test_g1_ik
-/tmp/test_g1_ik
-g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
-  tests/cpp/test_g1_clearance.cpp -o /tmp/test_g1_clearance
-/tmp/test_g1_clearance
+mkdir -p /tmp/g1-ik-clearance/task7
+
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic \
+  -fno-fast-math -ffp-contract=off -frounding-math -I. \
+  -c g1_clearance.cpp \
+  -o /tmp/g1-ik-clearance/task7/g1-clearance-test.o
+for name in test_g1_controller_state test_g1_ik test_g1_clearance; do
+  extra=()
+  if test "$name" = test_g1_ik; then
+    extra=(-DG1_IK_ENABLE_TEST_SEAMS)
+  fi
+  g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
+    "${extra[@]}" -c "tests/cpp/${name}.cpp" \
+    -o "/tmp/g1-ik-clearance/task7/${name}.o"
+  g++ "/tmp/g1-ik-clearance/task7/${name}.o" \
+    /tmp/g1-ik-clearance/task7/g1-clearance-test.o \
+    -o "/tmp/g1-ik-clearance/task7/${name}"
+  "/tmp/g1-ik-clearance/task7/${name}"
+done
+
+g++ -std=c++17 -O3 -fno-fast-math -ffp-contract=off \
+  -frounding-math -DNDEBUG -I. -c g1_clearance.cpp \
+  -o /tmp/g1-ik-clearance/task7/g1-clearance-controller.o
 g++ -std=c++17 -O3 -ffast-math -DNDEBUG \
   -D_DEFAULT_SOURCE -DPLATFORM_DESKTOP \
   -I. -I/home/ubuntu/apps/raylib/src -I/home/ubuntu/apps/raygui/src \
-  controller.cpp -o /tmp/controller_g1_ik \
+  -c controller.cpp \
+  -o /tmp/g1-ik-clearance/task7/controller.o
+g++ /tmp/g1-ik-clearance/task7/controller.o \
+  /tmp/g1-ik-clearance/task7/g1-clearance-controller.o \
+  -o /tmp/controller_g1_ik \
   -L/home/ubuntu/apps/raylib/src \
   -lraylib -lGL -lm -lpthread -ldl -lrt -lX11
+
 mkdir -p /tmp/g1-ik-clearance
 DISPLAY=:1 G1_TERRAIN_DIR=resources/g1_terrain \
   MM_TERRAIN_SCENE=grail-curb-low MM_TEST_ROUTE=curb-forward \
@@ -2898,14 +2281,17 @@ DISPLAY=:1 G1_TERRAIN_DIR=resources/g1_terrain \
   /tmp/controller_g1_ik
 ```
 
-Expected: every native test exits `0`; both controller runs close normally after exactly 375 fixed updates; no `controlled error`, non-finite state, or correction above `0.35` appears. Exact log comparison is added in Task 8.
+Expected: tests and both 375-frame runs exit zero; finite clearance rejection
+safe-stops transactionally; global failures take controlled cleanup; no
+correction exceeds `0.35`; accepted safety decisions use binary64 lower bounds.
+The final link command contains no `-ffast-math`.
 
 - [ ] **Step 10: Commit controller integration only**
 
 ```bash
 git add g1_controller_state.h controller.cpp \
   tests/cpp/test_g1_controller_state.cpp tests/cpp/test_g1_ik.cpp
-git commit -m "feat: integrate reversible G1 terrain IK"
+git commit -m "feat: integrate certified G1 terrain IK"
 ```
 
 ### Task 8: Append Gate E Diagnostics and Prove IK Invariance
@@ -2917,11 +2303,11 @@ git commit -m "feat: integrate reversible G1 terrain IK"
 - Modify: `tests/python/test_runtime_log.py`
 
 **Interfaces:**
-- Appends, without renaming or reordering any sibling column, this exact IK suffix:
+- Appends the exact IK suffix below without renaming/reordering sibling columns:
 
 ```text
 ik_applied,ik_safe_stop_requested,ik_stop_reason,max_ik_correction,
-actual_simulation_speed,ik_candidate_rejected,
+actual_simulation_speed,ik_candidate_rejected,ik_candidate_clearance_status,
 left_candidate_toe_clearance,left_candidate_foot_clearance,
 right_candidate_toe_clearance,right_candidate_foot_clearance,
 ik_candidate_minimum_clearance,
@@ -2933,10 +2319,14 @@ left_contact_residual,right_contact_residual,
 left_target_height,right_target_height,
 left_target_normal_x,left_target_normal_y,left_target_normal_z,
 right_target_normal_x,right_target_normal_y,right_target_normal_z,
-left_swing_required_lift,left_swing_applied_lift,
-left_swing_planned_margin,left_swing_actual_margin,
-right_swing_required_lift,right_swing_applied_lift,
-right_swing_planned_margin,right_swing_actual_margin,
+left_swing_candidates_evaluated,left_swing_selected_index,
+left_swing_selected_lift_bits,left_swing_materialized_command_y_bits,
+left_swing_clearance_rejection_status_mask,
+left_swing_lower_margin,left_swing_witness_upper_margin,
+right_swing_candidates_evaluated,right_swing_selected_index,
+right_swing_selected_lift_bits,right_swing_materialized_command_y_bits,
+right_swing_clearance_rejection_status_mask,
+right_swing_lower_margin,right_swing_witness_upper_margin,
 left_reachable,right_reachable,left_knee_clearance,left_ankle_clearance,
 left_toe_clearance,left_foot_clearance,left_shin_clearance,
 left_thigh_clearance,right_knee_clearance,right_ankle_clearance,
@@ -2944,165 +2334,89 @@ right_toe_clearance,right_foot_clearance,right_shin_clearance,
 right_thigh_clearance,ik_hips_clearance,ik_minimum_clearance
 ```
 
-- `left_observed_lock_drift` and `right_observed_lock_drift` are the
-  input-only support-retargeted baseline drifts stored in `G1FootTarget`; they
-  must be exact between paired modes and expose the `0.20 m` safe-stop bound.
-  `left_lock_drift` and `right_lock_drift` are post-output horizontal
-  distances from the current sole center to the frozen lock point. With IK off
-  they therefore measure the support-retargeted baseline; with IK on they
-  measure the actual corrected pose.
-- `left_sole_normal_alignment` and `right_sole_normal_alignment` are the dot
-  products between the post-FK configured sole normal and the exact target
-  surface normal. A locked certified foot must reach at least `0.999`; checking
-  only the target normal is insufficient.
-- Existing source, query, matching, support, and simulation fields keep their sibling meanings. In particular, no pre-IK toe diagnostic is silently rebound to post-IK data; all post-IK physical measurements live in the suffix above.
-- `ik_candidate_rejected` and the five candidate-clearance values preserve the
-  evidence from the scratch pose that caused a safe-stop request. The ordinary
-  clearance fields always describe the last accepted/rendered pose, including
-  every safe-stop tail row.
-- Produces Python entry points `read_invariance_rows(path)`,
-  `check_gate_e_rows(rows)`, `compare_ik_invariance(off_rows, on_rows)`,
-  `compare_ik_observations(off_rows, on_rows)`, and
-  `check_gate_e_pair(off_rows, on_rows, expected_scene, expected_route)`. The
-  CLI composes all existing checks and adds `--gate-e`, required
-  `--ik-baseline PATH`, optional `--ik-off-reference PATH`,
-  `--expected-scene ID`, and `--expected-route ID`.
-- Certified-route Gate E requires `fixed_dt == 1/25`, no safe-stop request,
-  exact paired contact/lock/target observations, finite/upward unit target
-  normals, locked post-FK sole-normal alignment at least `0.999`, reachable
-  targets, observed lock drift no greater than `0.20 m`, applied swing lift in
-  `[0, 0.08]`, correction in `[0, 0.35]`, planted toe/foot clearance at least
-  `-0.005 m`, every Hips/knee/ankle/toe/foot/thigh/shin clearance at least
-  `-0.01 m`, and strictly lower aggregate planted horizontal drift with IK on.
+- Candidate and accepted physical clearances plus swing lower/witness margins are
+  binary64 from `G1ClearanceResult`/`G1SwingClearanceValidation` and are written
+  with `%.17g`. No float member, cast, `%.9g` formatting, or upward float
+  conversion may feed a safety decision or log value.
+- `ik_candidate_clearance_status` is the exact unsigned enum value for the candidate pose
+  measurement. A certified accepted row uses `Ok`. Finite rejected rows retain
+  the exact `OutsideDomain`/`BudgetExceeded`/`Uncertified` evidence; global
+  statuses take controlled cleanup and do not produce a successful row.
+- Swing diagnostics describe the immutable ladder, not a continuous lift:
+  evaluated count, selected index, raw lift bits, strict materialized command-Y
+  bits, aggregate candidate-local rejection-status mask, and binary64
+  actual-center certificate bounds. No
+  `required_lift_m`/planned translated-sphere margin is logged.
+- Ordinary physical fields always describe the last accepted/rendered pose.
+  Candidate fields preserve the scratch `Ok` lower bounds only when such a pose
+  exists; all-fail ladder diagnostics use the no-candidate sentinel instead of
+  fabricating candidate clearance.
+- Existing matching, support, route, simulation, lock-drift, target-normal,
+  residual, reach, and Gate E invariance meanings remain unchanged.
 
-- [ ] **Step 1: Write failing schema, invariance, clearance, and drift tests**
+- [ ] **Step 1: Write failing schema, binary64, ladder, and invariance tests**
 
-In `tests/python/test_runtime_log.py`, extend the sibling test helper so a valid row contains every exact IK suffix column. Add paired fixtures with at least twelve locked samples split across both feet, nonzero IK-off lock drift, smaller IK-on lock drift, and otherwise identical sibling fields. Add these tests:
+Extend the valid-row helper with the exact suffix. Retain the paired matching,
+support-root, contact/lock/target, sole-alignment, physical-clearance, residual,
+correction, and drift fixtures. Add these migrations:
 
-```python
-IK_SUFFIX = (
-    "ik_applied", "ik_safe_stop_requested", "ik_stop_reason",
-    "max_ik_correction", "actual_simulation_speed",
-    "ik_candidate_rejected", "left_candidate_toe_clearance",
-    "left_candidate_foot_clearance", "right_candidate_toe_clearance",
-    "right_candidate_foot_clearance", "ik_candidate_minimum_clearance",
-    "left_recorded_contact",
-    "right_recorded_contact", "left_locked", "right_locked",
-    "left_observed_lock_drift", "right_observed_lock_drift",
-    "left_lock_drift", "right_lock_drift",
-    "left_sole_normal_alignment", "right_sole_normal_alignment",
-    "left_contact_residual", "right_contact_residual",
-    "left_target_height",
-    "right_target_height", "left_target_normal_x",
-    "left_target_normal_y", "left_target_normal_z",
-    "right_target_normal_x", "right_target_normal_y",
-    "right_target_normal_z", "left_swing_required_lift",
-    "left_swing_applied_lift", "left_swing_planned_margin",
-    "left_swing_actual_margin", "right_swing_required_lift",
-    "right_swing_applied_lift", "right_swing_planned_margin",
-    "right_swing_actual_margin", "left_reachable", "right_reachable",
-    "left_knee_clearance", "left_ankle_clearance",
-    "left_toe_clearance", "left_foot_clearance",
-    "left_shin_clearance", "left_thigh_clearance",
-    "right_knee_clearance", "right_ankle_clearance",
-    "right_toe_clearance", "right_foot_clearance",
-    "right_shin_clearance", "right_thigh_clearance",
-    "ik_hips_clearance", "ik_minimum_clearance",
-)
+- reject every removed `*_swing_required_lift`, `*_swing_applied_lift`,
+  `*_swing_planned_margin`, and `*_swing_actual_margin` column;
+- certified non-contact rows require
+  `1 <= candidates_evaluated <= 41`,
+  `selected_index != G1SwingNoCandidate`,
+  `candidates_evaluated == selected_index + 1`, exact selected ladder bits, and
+  `lower_margin >= 0.0`; their mask may contain any subset of the three known
+  bits from earlier real rejects;
+- recorded-contact rows require zero evaluated candidates and the no-candidate
+  sentinel with mask zero; all-41-fail rows require exactly 41, the sentinel,
+  and safe stop. Unresolved-certification evidence requires a nonzero mask,
+  while negative-`Ok`/controller-only exhaustion may have mask zero;
+- reject unknown mask bits and mutate each known bit plus every mixed subset;
+- mutate every pose status and require only exact `Ok` on accepted certified
+  rows;
+- use values adjacent to `-0.005`, `-0.01`, and zero whose binary64 decisions
+  would change after binary32 rounding; verify CSV `%.17g` round-trips the
+  original binary64 value and the checker makes the binary64 decision;
+- require candidate and accepted `G1ClearanceResult::lower_bound_m` values to
+  match on a non-rejected certified row, while a rejected row preserves the
+  last-safe accepted values.
 
-def test_gate_e_accepts_bounded_clear_pair(self):
-    off_rows, on_rows = self.gate_e_pair()
-    check_gate_e_pair(
-        off_rows, on_rows,
-        "stairs-standard", "ascent-landing-descent")
+Add explicit REDs for duplicate/missing columns, row-count/frame alignment,
+raw-string invariance, unit/upward normals, reachability, and
+continuation-cost. Restore the route-level acceptance REDs as well:
 
-def test_gate_e_rejects_any_matching_or_support_root_change(self):
-    for column, changed in (
-        ("query_bits_hex", "00000001" + "00000000" * 30),
-        ("query_database_frame", "19"),
-        ("selected_database_frame", "21"),
-        ("terrain_point2_y", "0.12500001"),
-        ("database_frame", "41"),
-        ("range", "3"),
-        ("transitioned", "1"),
-        ("selected_cost", "9.5"),
-        ("support_height", "0.30000001"),
-        ("support_retargeted_hips_y", "0.81000001"),
-        ("simulation_x", "0.50000001"),
-    ):
-        off_rows, on_rows = self.gate_e_pair()
-        on_rows[5][column] = changed
-        with self.subTest(column=column):
-            with self.assertRaisesRegex(ValueError, column):
-                compare_ik_invariance(off_rows, on_rows)
+- mutate either member of a pair so any row has a scene or route other than the
+  exact requested value;
+- remove every certified `route_complete=1` row, introduce a blocked or
+  safe-stop terminal tail, provide only nine planted samples, and make
+  corrected planted drift equal to or greater than baseline drift;
+- try an unlisted stress scene/route and mutate either member's scene/route;
+- label a stress traversal despite one stop request or without a
+  `route_complete=1` row;
+- require a class-2 traversal with equal/worse planted drift to remain accepted,
+  proving that branch's intentional drift exemption; and
+- set the first stress safe-stop request row's `ik_candidate_rejected` to `0`.
 
-def test_gate_e_rejects_changed_contact_lock_or_target_observation(self):
-    for column, changed in (
-        ("left_recorded_contact", "0"),
-        ("left_locked", "0"),
-        ("left_observed_lock_drift", "0.12500001"),
-        ("left_target_height", "0.12500001"),
-        ("left_target_normal_x", "0.12500001"),
-    ):
-        off_rows, on_rows = self.gate_e_pair()
-        on_rows[5][column] = changed
-        with self.subTest(column=column):
-            with self.assertRaisesRegex(ValueError, column):
-                compare_ik_observations(off_rows, on_rows)
+Run the full- and exact-legacy-baseline variants wherever the baseline schema
+changes which columns supply a predicate.
 
-def test_gate_e_rejects_bounds_and_certified_stop(self):
-    mutations = (
-        ("max_ik_correction", "-0.00001", "correction"),
-        ("max_ik_correction", "0.35001", "correction"),
-        ("actual_simulation_speed", "-0.00001", "speed"),
-        ("ik_candidate_rejected", "1", "rejected"),
-        ("left_candidate_toe_clearance", "0.123", "candidate mismatch"),
-        ("left_sole_normal_alignment", "0.9989", "alignment"),
-        ("left_contact_residual", "0.00501", "residual"),
-        ("left_swing_actual_margin", "-0.00002", "sweep"),
-        ("left_foot_clearance", "-0.00501", "planted"),
-        ("right_toe_clearance", "-0.01001", "physical"),
-        ("left_shin_clearance", "-0.01001", "physical"),
-        ("left_swing_applied_lift", "0.08001", "swing"),
-        ("ik_safe_stop_requested", "1", "certified"),
-        ("ik_stop_reason", "reach-shell", "certified"),
-    )
-    for column, value, diagnostic in mutations:
-        off_rows, on_rows = self.gate_e_pair()
-        on_rows[5][column] = value
-        with self.subTest(column=column):
-            with self.assertRaisesRegex(ValueError, diagnostic):
-                check_gate_e_pair(
-                    off_rows, on_rows,
-                    "stairs-standard", "ascent-landing-descent")
-
-def test_gate_e_requires_strictly_reduced_planted_drift(self):
-    off_rows, on_rows = self.gate_e_pair()
-    for before, after in zip(off_rows, on_rows):
-        after["left_lock_drift"] = before["left_lock_drift"]
-        after["right_lock_drift"] = before["right_lock_drift"]
-    with self.assertRaisesRegex(ValueError, "drift did not decrease"):
-        check_gate_e_pair(
-            off_rows, on_rows,
-            "stairs-standard", "ascent-landing-descent")
-```
-
-Also test duplicate/missing IK columns, unequal row counts, frame misalignment, a non-upward or non-unit target normal, `left_reachable=0`, required lift greater than applied lift on a certified swing, and a changed `continuation_cost`. Reuse the sibling CSV reader and valid Gate C row builder; do not add a second parser.
-
-- [ ] **Step 2: Run the focused checker tests to verify RED**
-
-Run:
+- [ ] **Step 2: Run the focused checker RED**
 
 ```bash
 /home/ubuntu/miniconda3/envs/diffsim/bin/python -m unittest \
   tests.python.test_runtime_log -v
 ```
 
-Expected: existing sibling tests remain green, while the new imports or assertions fail because the Gate E functions and columns do not exist.
+Expected: existing sibling tests remain green; migrated suffix/status/ladder
+tests fail until the logger and checker are updated.
 
-- [ ] **Step 3: Append the exact C++ row schema and writer fields**
+- [ ] **Step 3: Append typed row fields without narrowing safety values**
 
-In `motion_match_log.h`, append these types after the sibling row support fields:
+In `motion_match_log.h` add `<cstdint>` and use `uint32_t` for candidate counts/indices/raw bits,
+`double` for every clearance or swing margin, and retain `float` only for
+non-safety observations such as drift, normal alignment, target height,
+residual, and correction. The relevant shape is:
 
 ```cpp
 struct motion_match_ik_leg_diagnostic
@@ -3116,16 +2430,19 @@ struct motion_match_ik_leg_diagnostic
     float contact_residual = 0.0f;
     float target_height = 0.0f;
     vec3 target_normal = vec3(0.0f, 1.0f, 0.0f);
-    float swing_required_lift = 0.0f;
-    float swing_applied_lift = 0.0f;
-    float swing_planned_margin = 0.0f;
-    float swing_actual_margin = 0.0f;
-    float knee_clearance = 0.0f;
-    float ankle_clearance = 0.0f;
-    float toe_clearance = 0.0f;
-    float foot_clearance = 0.0f;
-    float shin_clearance = 0.0f;
-    float thigh_clearance = 0.0f;
+    uint32_t swing_candidates_evaluated = 0;
+    uint32_t swing_selected_index = UINT32_MAX;
+    uint32_t swing_selected_lift_bits = 0;
+    uint32_t swing_materialized_command_y_bits = 0;
+    uint32_t swing_clearance_rejection_status_mask = 0;
+    double swing_lower_margin = 0.0;
+    double swing_witness_upper_margin = 0.0;
+    double knee_clearance = 0.0;
+    double ankle_clearance = 0.0;
+    double toe_clearance = 0.0;
+    double foot_clearance = 0.0;
+    double shin_clearance = 0.0;
+    double thigh_clearance = 0.0;
 };
 
 struct motion_match_ik_diagnostic
@@ -3136,56 +2453,28 @@ struct motion_match_ik_diagnostic
     float max_correction = 0.0f;
     float actual_simulation_speed = 0.0f;
     bool candidate_rejected = false;
-    float left_candidate_toe_clearance = 0.0f;
-    float left_candidate_foot_clearance = 0.0f;
-    float right_candidate_toe_clearance = 0.0f;
-    float right_candidate_foot_clearance = 0.0f;
-    float candidate_minimum_clearance = 0.0f;
+    uint32_t candidate_clearance_status = UINT32_MAX;
+    double left_candidate_toe_clearance = 0.0;
+    double left_candidate_foot_clearance = 0.0;
+    double right_candidate_toe_clearance = 0.0;
+    double right_candidate_foot_clearance = 0.0;
+    double candidate_minimum_clearance = 0.0;
     motion_match_ik_leg_diagnostic left;
     motion_match_ik_leg_diagnostic right;
-    float hips_clearance = 0.0f;
-    float minimum_clearance = 0.0f;
+    double hips_clearance = 0.0;
+    double minimum_clearance = 0.0;
 };
 ```
 
-Add `motion_match_ik_diagnostic ik;` as the final `motion_match_log_row` member. Append the exact suffix literal from this task to the existing header `fprintf`, then append its values to `write` with `%d` for booleans, `%s` for `stop_reason`, and `%.9g` for every float. Preserve the existing final newline by moving it to the end of the new suffix. Add a writer-level regression in `tests/python/test_runtime_log.py` that opens a controller-produced one-row CSV in Task 7's smoke and asserts `list(row) == sibling_columns + list(IK_SUFFIX)`.
+Append `motion_match_ik_diagnostic ik` to the row. Write enum/raw integer fields
+with exact integer formats, binary64 safety fields with `%.17g`, and other
+floats with the sibling format. Preserve the single final newline. Add a
+writer-level exact-column regression.
 
-- [ ] **Step 4: Fill the suffix only from immutable observations and post-IK FK**
+- [ ] **Step 4: Map only immutable observations and certified result members**
 
-In `controller.cpp`, immediately before the sibling final
-`deterministic_log.write(...)` call, fill the final diagnostic. Compute lock
-drift from the pose actually selected for rendering:
-
-```cpp
-static float g1_horizontal_lock_drift(
-    const G1LegConfig& config,
-    const G1FootLockState& lock,
-    const slice1d<vec3> global_positions,
-    const slice1d<quat> global_rotations)
-{
-    if (!lock.locked) return 0.0f;
-    vec3 sole[4];
-    g1_sole_points_world(
-        sole, global_positions(config.contact),
-        global_rotations(config.contact), config);
-    const vec3 center = g1_sole_center_world(sole);
-    return length(vec3(
-        center.x - lock.lock_point.x, 0.0f,
-        center.z - lock.lock_point.z));
-}
-
-static float g1_sole_normal_alignment(
-    const G1LegConfig& config,
-    vec3 target_normal,
-    const slice1d<quat> global_rotations)
-{
-    const vec3 actual_normal = quat_mul_vec3(
-        global_rotations(config.contact), config.sole_normal_local);
-    return dot(actual_normal, target_normal);
-}
-```
-
-Use one explicit mapper so left/right cannot be crossed:
+Before `deterministic_log.write`, map left/right explicitly. Candidate and
+accepted clearance use lower bounds directly:
 
 ```cpp
 const G1LegConfig ik_configs[2] = {
@@ -3204,20 +2493,27 @@ log_row.ik.max_correction = state.ik_frame.max_correction_radians;
 log_row.ik.actual_simulation_speed = g1_xz_length(
     state.simulation_velocity);
 log_row.ik.candidate_rejected = state.ik_candidate_rejected;
-log_row.ik.left_candidate_toe_clearance =
-    state.ik_candidate_clearance.left.toe_m;
-log_row.ik.left_candidate_foot_clearance =
-    state.ik_candidate_clearance.left.foot_m;
-log_row.ik.right_candidate_toe_clearance =
-    state.ik_candidate_clearance.right.toe_m;
-log_row.ik.right_candidate_foot_clearance =
-    state.ik_candidate_clearance.right.foot_m;
-log_row.ik.candidate_minimum_clearance =
-    state.ik_candidate_clearance.minimum_m;
+log_row.ik.candidate_clearance_status = static_cast<uint32_t>(
+    state.ik_candidate_clearance_status);
+if (state.ik_candidate_clearance_status == G1ClearanceOk) {
+    log_row.ik.left_candidate_toe_clearance =
+        state.ik_candidate_clearance.left.toe.lower_bound_m;
+    log_row.ik.left_candidate_foot_clearance =
+        state.ik_candidate_clearance.left.foot.lower_bound_m;
+    log_row.ik.right_candidate_toe_clearance =
+        state.ik_candidate_clearance.right.toe.lower_bound_m;
+    log_row.ik.right_candidate_foot_clearance =
+        state.ik_candidate_clearance.right.foot.lower_bound_m;
+    log_row.ik.candidate_minimum_clearance =
+        state.ik_candidate_clearance.minimum.lower_bound_m;
+}
+
 for (int foot = 0; foot < 2; ++foot) {
     motion_match_ik_leg_diagnostic& dst = *ik_log_feet[foot];
     const G1FootFrameResult& src = state.ik_frame.feet[foot];
     const G1LegClearance& clearance = *ik_clearance_feet[foot];
+    const G1SwingSelectionDiagnostic& selection = src.swing_selection;
+
     dst.recorded_contact = src.recorded_contact;
     dst.locked = src.target.locked;
     dst.reachable = !src.position.applied || src.position.reachable;
@@ -3232,35 +2528,49 @@ for (int foot = 0; foot < 2; ++foot) {
         ? src.position.contact_residual_m : 0.0f;
     dst.target_height = src.target.surface.point.y;
     dst.target_normal = src.target.surface.normal;
-    dst.swing_required_lift = src.swing.required_lift_m;
-    dst.swing_applied_lift = src.swing.applied_lift_m;
-    dst.swing_planned_margin = src.recorded_contact
-        ? 0.0f : src.swing.corrected_margin_m;
-    dst.swing_actual_margin = src.recorded_contact
-        ? 0.0f : src.swing.actual_corrected_margin_m;
-    dst.knee_clearance = clearance.knee_m;
-    dst.ankle_clearance = clearance.ankle_m;
-    dst.toe_clearance = clearance.toe_m;
-    dst.foot_clearance = clearance.foot_m;
-    dst.shin_clearance = clearance.shin_m;
-    dst.thigh_clearance = clearance.thigh_m;
+    dst.swing_candidates_evaluated = selection.candidates_evaluated;
+    dst.swing_selected_index = selection.selected_index;
+    dst.swing_clearance_rejection_status_mask =
+        selection.clearance_rejection_status_mask;
+    if (selection.selected_index != G1SwingNoCandidate) {
+        dst.swing_selected_lift_bits = selection.selected.lift_bits;
+        dst.swing_materialized_command_y_bits =
+            selection.selected.materialized_command_y_bits;
+        dst.swing_lower_margin = selection.selected.lower_margin_m;
+        dst.swing_witness_upper_margin =
+            selection.selected.witness_upper_margin_m;
+    }
+
+    dst.knee_clearance = clearance.knee.lower_bound_m;
+    dst.ankle_clearance = clearance.ankle.lower_bound_m;
+    dst.toe_clearance = clearance.toe.lower_bound_m;
+    dst.foot_clearance = clearance.foot.lower_bound_m;
+    dst.shin_clearance = clearance.shin.lower_bound_m;
+    dst.thigh_clearance = clearance.thigh.lower_bound_m;
 }
-log_row.ik.hips_clearance = state.ik_clearance.hips_m;
-log_row.ik.minimum_clearance = state.ik_clearance.minimum_m;
+log_row.ik.hips_clearance = state.ik_clearance.hips.lower_bound_m;
+log_row.ik.minimum_clearance = state.ik_clearance.minimum.lower_bound_m;
 ```
 
-Fill the sibling row before this mapper from the same pre-IK values it already used. `state.ik_frame.applied` is exactly `MM_IK`, while contacts, locks, target samples, and sweep observations are updated in both modes.
+Keep `g1_horizontal_lock_drift` and `g1_sole_normal_alignment` as the two pure
+helpers defined by the locked pre-IK logging contract: the former measures the
+accepted post-FK sole center against `lock.lock_point` in XZ and returns zero
+when unlocked; the latter dots the accepted post-FK configured sole normal
+with `src.target.surface.normal`. The sibling row is filled first from its
+pre-IK sources. Do not reconstruct a float lift from `selected.lift_bits` for
+safety, add a second correction, or rebind a sibling field to post-IK data.
+Store the exact candidate pose status in controller state in Task 7; do not
+infer it from `candidate_rejected` or error text.
 
-- [ ] **Step 5: Implement raw-string invariance and Gate E bounds**
+- [ ] **Step 5: Migrate Gate E and stress evidence to statuses and ladder facts**
 
-In `resources/check_g1_runtime_log.py`, add these exact invariance groups:
+Implement these exact raw-string groups; none exists before this task:
 
 ```python
 IK_MATCHING_INVARIANTS = (
     "frame", "fixed_dt", "scene_id", "mode", "route",
-    "query_bits_hex",
-    "query_database_frame", "query_range", "selected_database_frame",
-    "database_frame", "range",
+    "query_bits_hex", "query_database_frame", "query_range",
+    "selected_database_frame", "database_frame", "range",
     "source_range", "searched", "transitioned", "incumbent_cost",
     "selected_cost", "selected_terrain_error", "effective_terrain_weight",
     "terrain0", "terrain1", "terrain2", "terrain3",
@@ -3268,32 +2578,33 @@ IK_MATCHING_INVARIANTS = (
     "terrain_point1_x", "terrain_point1_y", "terrain_point1_z",
     "terrain_point2_x", "terrain_point2_y", "terrain_point2_z",
     "terrain_point3_x", "terrain_point3_y", "terrain_point3_z",
-    "source_name", "source_terrain", "source_index",
-    "continuation_cost",
+    "source_name", "source_terrain", "source_index", "continuation_cost",
 )
 
-IK_SUPPORT_ROOT_INVARIANTS = (
-    "raw_selected_hips_y", "inertialized_hips_y",
-    "rendered_hips_y", "hips_inertial_offset_y",
-    "runtime_root_surface_height", "runtime_left_toe_surface_height",
-    "runtime_right_toe_surface_height",
+IK_SUPPORT_SIMULATION_INVARIANTS = (
+    "raw_selected_hips_y", "inertialized_hips_y", "rendered_hips_y",
+    "hips_inertial_offset_y", "runtime_root_surface_height",
+    "runtime_left_toe_surface_height", "runtime_right_toe_surface_height",
     "adjustment_xz", "adjustment_y", "clamp_xz", "clamp_y",
     "matching_enabled", "adjustment_enabled", "clamping_enabled",
-    "support_retargeting_enabled",
-    "source_root_height", "runtime_support_root_height",
-    "source_left_toe_height", "source_right_toe_height",
-    "runtime_support_left_toe_height", "runtime_support_right_toe_height",
-    "support_root_delta", "support_left_toe_delta", "support_right_toe_delta",
-    "support_height", "support_velocity",
-    "support_source", "airborne_frames", "left_contact", "right_contact",
-    "support_retargeted_hips_y", "ik_adjusted_hips_y",
-    "simulation_x", "simulation_z", "walkability_class", "blocked",
-    "blocked_reason", "blocked_distance", "blocked_point_x",
-    "blocked_point_z", "commanded_speed", "applied_speed",
+    "support_retargeting_enabled", "source_root_height",
+    "runtime_support_root_height", "source_left_toe_height",
+    "source_right_toe_height", "runtime_support_left_toe_height",
+    "runtime_support_right_toe_height", "support_root_delta",
+    "support_left_toe_delta", "support_right_toe_delta", "support_height",
+    "support_velocity", "support_source", "airborne_frames",
+    "left_contact", "right_contact", "support_retargeted_hips_y",
+    "ik_adjusted_hips_y", "simulation_x", "simulation_z",
+    "walkability_class", "blocked", "blocked_reason", "blocked_distance",
+    "blocked_point_x", "blocked_point_z", "commanded_speed", "applied_speed",
     "route_waypoint", "route_complete", "route_target_height",
     "scene_generation", "scene_frame", "scene_reset_count",
     "scene_switch_failed", "motion_pack_load_count", "model_load_count",
     "model_unload_count", "live_model_count",
+)
+
+IK_BASE_INVARIANTS = (
+    IK_MATCHING_INVARIANTS + IK_SUPPORT_SIMULATION_INVARIANTS
 )
 
 IK_PAIR_OBSERVATION_INVARIANTS = (
@@ -3307,135 +2618,211 @@ IK_PAIR_OBSERVATION_INVARIANTS = (
 )
 ```
 
-The sibling `check_rows` currently locks `ik_enabled == 0`. Replace only that
-equality with a boolean `{0,1}` check. Keep explicit `ik_enabled == 0`
-requirements in `diagnose_gate_a`, `check_gate_c`, `check_gate_d`,
-`check_gate_f`, and `check_failed_switch`; Gate E alone requires `1`. This
-preserves all earlier gates while allowing the shared base validator to read an
-IK-on row. Append `ik_applied`, `ik_safe_stop_requested`,
-`ik_candidate_rejected`, the recorded-contact/lock/reachable fields to the
-shared boolean-column set, require `ik_stop_reason` nonempty, and finite-parse
-every remaining numeric suffix field.
-
-Refactor the sibling CSV reader's duplicate-column logic into one private
-`_read_rows(path, required_columns)` helper. Keep `read_rows(path)` calling it
-with the complete current schema, including every IK suffix field. Add
-`read_runtime_rows(path)` using the locked sibling `RUNTIME_COLUMNS`, and make
-the existing `--compare-control` path use it so preserved weight-zero Gate C
-controls do not need new IK columns. Add `read_invariance_rows(path)` calling
-the same helper with only
-`IK_MATCHING_INVARIANTS + IK_SUPPORT_ROOT_INVARIANTS`; this is how the six
-preserved pre-IK Gate C CSVs remain readable without weakening validation of
-new logs. `compare_ik_invariance` first requires equal nonempty lengths, then
-compares each pair's frame identity and every base invariant above with
-ordinary string equality. `compare_ik_observations` requires full current
-rows and exact-compares every `IK_PAIR_OBSERVATION_INVARIANTS` field. Its
-diagnostic names the zero-based row, logged frame, column, baseline raw text,
-and IK raw text. This list contains only observations derived from the common
-support-retargeted input. Do not put solver results, correction, reachability,
-residual, swing lift/margins, or stop output in it: swing history is committed
-from the accepted pose, so those downstream results may legitimately differ
-between modes even while matching and all pre-solve inputs remain invariant.
-`check_gate_e_pair` and the stress traverse branch call both
-comparators over the complete logs. The stress safe-stop branch calls both only
-on the inclusive prefix through the first stop request; after that request the
-next-frame command handoff intentionally changes simulation and downstream
-observations. `--ik-off-reference` calls only the base comparator because the
-accepted sibling logs predate the IK suffix. Do not include post-IK lock drift,
-sole-normal alignment, physical clearance, candidate rejection/clearance, or
-`ik_enabled` in either invariant list.
-
-Implement bounds with finite parsing through the sibling helper. The core checks are:
+Define the exact mask values used by the checker, then freeze the sibling
+header before appending this task's suffix:
 
 ```python
-IK_PHYSICAL_CLEARANCE_COLUMNS = (
-    "left_knee_clearance", "left_ankle_clearance",
-    "left_toe_clearance", "left_foot_clearance",
-    "left_shin_clearance", "left_thigh_clearance",
-    "right_knee_clearance", "right_ankle_clearance",
-    "right_toe_clearance", "right_foot_clearance",
-    "right_shin_clearance", "right_thigh_clearance",
-    "ik_hips_clearance",
+G1_SWING_REJECT_OUTSIDE_DOMAIN_BIT = 1 << 0
+G1_SWING_REJECT_BUDGET_EXCEEDED_BIT = 1 << 1
+G1_SWING_REJECT_UNCERTIFIED_BIT = 1 << 2
+G1_SWING_REJECT_KNOWN_MASK = (
+    G1_SWING_REJECT_OUTSIDE_DOMAIN_BIT |
+    G1_SWING_REJECT_BUDGET_EXCEEDED_BIT |
+    G1_SWING_REJECT_UNCERTIFIED_BIT
+)
+G1_SWING_REJECT_NAMES = (
+    (G1_SWING_REJECT_OUTSIDE_DOMAIN_BIT, "OutsideDomain"),
+    (G1_SWING_REJECT_BUDGET_EXCEEDED_BIT, "BudgetExceeded"),
+    (G1_SWING_REJECT_UNCERTIFIED_BIT, "Uncertified"),
 )
 
-def check_gate_e_rows(rows):
-    check_rows(rows)
-    for index, row in enumerate(rows):
-        value = lambda name: _finite(row, name, index)
-        def require(condition, message):
-            if not condition:
-                raise ValueError(f"row {index}: {message}")
-        require(abs(value("fixed_dt") - 1.0 / 25.0) <= 1e-7,
-                "Gate E fixed_dt is not 25 Hz")
-        require(row["ik_enabled"] == "1" and row["ik_applied"] == "1",
-                "Gate E IK-on row did not apply IK")
-        require(row["ik_safe_stop_requested"] == "0" and
-                row["ik_stop_reason"] == "none",
-                "Gate E certified route requested safe stop")
-        require(0.0 <= value("max_ik_correction") <= 0.35 + 1e-6,
-                "Gate E correction exceeded 0.35")
-        require(value("actual_simulation_speed") >= 0.0,
-                "Gate E actual simulation speed is negative")
-        require(row["ik_candidate_rejected"] == "0",
-                "Gate E certified route rejected an IK candidate")
-        for candidate, accepted in (
-            ("left_candidate_toe_clearance", "left_toe_clearance"),
-            ("left_candidate_foot_clearance", "left_foot_clearance"),
-            ("right_candidate_toe_clearance", "right_toe_clearance"),
-            ("right_candidate_foot_clearance", "right_foot_clearance"),
-            ("ik_candidate_minimum_clearance", "ik_minimum_clearance"),
-        ):
-            require(abs(value(candidate) - value(accepted)) <= 1e-7,
-                    f"Gate E accepted candidate mismatch: {candidate}")
-        for side in ("left", "right"):
-            require(row[f"{side}_reachable"] == "1",
-                    f"Gate E {side} target left reachable shell")
-            require(0.0 <= value(f"{side}_contact_residual") <= 0.005 + 1e-6,
-                    f"Gate E {side} contact residual exceeded 0.005")
-            normal = [value(f"{side}_target_normal_{axis}")
-                      for axis in "xyz"]
-            require(normal[1] > 0.0 and
-                    abs(sum(value * value for value in normal) - 1.0) <= 2e-4,
-                    f"Gate E {side} target normal is invalid")
-            required = value(f"{side}_swing_required_lift")
-            applied = value(f"{side}_swing_applied_lift")
-            require(0.0 <= applied <= 0.08 + 1e-6 and
-                    applied + 1e-6 >= required,
-                    f"Gate E {side} swing lift is not bounded/complete")
-            if row[f"{side}_recorded_contact"] == "0":
-                require(value(f"{side}_swing_planned_margin") >= -1e-5 and
-                        value(f"{side}_swing_actual_margin") >= -1e-5,
-                        f"Gate E {side} corrected swing sweep penetrated")
-            if row[f"{side}_locked"] == "1":
-                require(value(f"{side}_observed_lock_drift") <= 0.20 + 1e-6,
-                        f"Gate E {side} observed lock drift exceeded 0.20")
-                require(value(f"{side}_sole_normal_alignment") >= 0.999,
-                        f"Gate E {side} sole-normal alignment failed")
-                require(value(f"{side}_toe_clearance") >= -0.005 - 1e-6 and
-                        value(f"{side}_foot_clearance") >= -0.005 - 1e-6,
-                        f"Gate E planted {side} toe/foot penetrated")
-        for column in IK_PHYSICAL_CLEARANCE_COLUMNS:
-            require(value(column) >= -0.01 - 1e-6,
-                    f"Gate E physical clearance failed: {column}")
-        require(value("ik_minimum_clearance") >= -0.01 - 1e-6,
-                "Gate E physical minimum clearance failed")
+LEGACY_RUNTIME_COLUMNS = tuple(RUNTIME_COLUMNS)
+FULL_RUNTIME_COLUMNS = LEGACY_RUNTIME_COLUMNS + IK_SUFFIX
 ```
 
-`check_gate_e_pair` requires every off row to have `ik_enabled=0`, calls
-`compare_ik_invariance`, `compare_ik_observations`, and `check_gate_e_rows`,
-requires both logs to contain only the requested exact scene/route, requires a
-`route_complete=1` row and no blocked/safe-stop tail, then collects each side's
-`*_lock_drift` where the exact-compared `*_locked` field is `1`. Require at
-least ten planted samples total and `mean(on_drift) < mean(off_drift)` with no
-rounding tolerance. On CLI success print `VALID gate-e`, followed by the exact
-scene ID, route ID, planted count, off mean, and on mean as named `key=value`
-fields.
+Refactor the existing duplicate-header reader into
+`_read_rows_exact(path, expected_columns)`. It requires a nonempty CSV whose
+header tuple is **exactly** `expected_columns`: same order, no duplicate,
+missing, extra, or partially appended suffix column. Define it and its wrappers
+with raw `csv.reader` strings:
 
-When `--ik-off-reference` is present, require the primary log to have only `ik_enabled=0`, load the older file with `read_invariance_rows`, and run `compare_ik_invariance(reference, rows)` before printing `VALID ik-off-reference frames=<n>`. This option is independent of `--gate-e`; it proves that enabling downstream observation code did not change the accepted support runtime when application remains disabled.
+```python
+def _peek_header(path):
+    with open(path, newline="", encoding="utf-8") as stream:
+        return tuple(next(csv.reader(stream), ()))
 
-Also add `check_gate_e_stress_pair(off_rows, on_rows, expected_scene,
-expected_route)` and `--gate-e-stress`. Reject any pair outside this exact
-class-2 route set:
+def _read_rows_exact(path, expected_columns):
+    if expected_columns == FULL_RUNTIME_COLUMNS:
+        schema_name = "FULL_RUNTIME_COLUMNS"
+    elif expected_columns == LEGACY_RUNTIME_COLUMNS:
+        schema_name = "LEGACY_RUNTIME_COLUMNS"
+    else:
+        raise AssertionError("unknown exact runtime schema")
+    header = _peek_header(path)
+    if not header:
+        raise ValueError(f"{path}: CSV header is empty")
+    if header != expected_columns:
+        raise ValueError(
+            f"{path}: actual header {header!r} is not exact "
+            f"{schema_name} {expected_columns!r}")
+    rows = []
+    with open(path, newline="", encoding="utf-8") as stream:
+        reader = csv.reader(stream)
+        next(reader)
+        for csv_row, values in enumerate(reader, 2):
+            if len(values) != len(expected_columns):
+                raise ValueError(
+                    f"{path}: CSV row {csv_row} has {len(values)} values; "
+                    f"exact {schema_name} requires {len(expected_columns)}")
+            rows.append(dict(zip(expected_columns, values)))
+    if not rows:
+        raise ValueError(f"{path}: exact {schema_name} CSV has no data rows")
+    return rows
+
+def read_rows(path):
+    return _read_rows_exact(path, FULL_RUNTIME_COLUMNS)
+
+def read_legacy_runtime_rows(path):
+    return _read_rows_exact(path, LEGACY_RUNTIME_COLUMNS)
+
+def read_ik_baseline(path):
+    header = _peek_header(path)
+    if header == FULL_RUNTIME_COLUMNS:
+        return "full", read_rows(path)
+    if header == LEGACY_RUNTIME_COLUMNS:
+        return "legacy", read_legacy_runtime_rows(path)
+    raise ValueError(
+        f"{path}: IK baseline header is neither exact full schema nor "
+        "exact locked pre-IK prefix")
+```
+
+`read_rows` is the only full new-schema reader. `read_legacy_runtime_rows` is
+the only legacy-prefix reader and accepts no suffix column. The existing
+`--compare-control` and `--ik-off-reference` inputs use the legacy reader.
+`--ik-baseline` uses `read_ik_baseline`: a newly generated IK-off baseline is
+full schema; an accepted pre-Task8 baseline may be exactly the locked legacy
+prefix. After either dispatch, require every baseline row to have raw
+`ik_enabled == "0"`; otherwise fail with
+`--ik-baseline must contain only ik_enabled=0`. Never accept an arbitrary
+intersection or silently drop columns.
+
+`compare_ik_invariance` requires equal nonzero row counts and compares every
+`IK_BASE_INVARIANTS` value with ordinary string equality. Its error names the
+zero-based row, logged frame, column, baseline raw text, and IK raw text.
+`compare_ik_observations` has the same contract for
+`IK_PAIR_OBSERVATION_INVARIANTS`, but is called only when both sides use the
+full schema. A legacy baseline compares shared base strings only; it can never
+stand in for missing post-support observations.
+
+Change shared full-row validation only enough to accept `ik_enabled` exactly
+`0` or `1`. Keep explicit `ik_enabled == 0` requirements in
+`diagnose_gate_a`, `check_gate_c`, `check_gate_d`, `check_gate_f`,
+`check_failed_switch`, `compare_control`, the `--ik-off-reference` path, and
+every legacy-prefix validation path. `compare_control` requires both treatment
+and control to be IK-off. Gate E and Gate E stress alone require IK-on rows.
+Thus adding full-schema parsing cannot weaken any sibling gate or comparison.
+
+Add exact CLI composition:
+
+- `--gate-e` and `--gate-e-stress` are mutually exclusive and each requires
+  `--ik-baseline PATH`, `--expected-scene ID`, and `--expected-route ID`;
+- missing inputs fail with respectively
+  `--gate-e requires --ik-baseline/--expected-scene/--expected-route` or the
+  same string beginning `--gate-e-stress`;
+- `--ik-off-reference PATH` is independent of Gate E, requires the primary
+  full log to contain only `ik_enabled=0`, reads the reference with the exact
+  legacy reader, compares `IK_BASE_INVARIANTS`, and prints
+  `VALID ik-off-reference frames=<n>`; an IK-on primary fails with
+  `--ik-off-reference requires an IK-off primary log`;
+- `--compare-control PATH` reads the accepted control with the exact legacy
+  reader, requires both logs to be IK-off, and otherwise preserves its existing
+  comparison errors and `VALID terrain-comparison` summary; an IK-on primary
+  fails with `--compare-control requires an IK-off primary log`;
+- neither Gate E flag may combine with `--gate-a`, `--gate-c`, `--gate-d`,
+  `--gate-f`, or `--expect-switch-failure`; fail with
+  `--gate-e/--gate-e-stress may not combine with sibling gate flags`.
+  Conversely, any of `--ik-baseline`, `--expected-scene`, or
+  `--expected-route` without one Gate E flag fails with
+  `--ik-baseline/--expected-scene/--expected-route requires --gate-e or
+  --gate-e-stress`;
+- preserve the sibling positional `log`, optional `--compare-control PATH`,
+  `--gate-a`, mutually exclusive `--gate-c`/`--gate-d`/`--gate-f`, optional
+  `--expected-scenes CSV`, and `--expect-switch-failure` flags. Preserve the
+  exact custom errors `--expect-switch-failure may not combine with Gate
+  A/C/D/F flags`, `--gate-f requires --expected-scenes`, `--expected-scenes
+  must match the locked 14-scene catalog`, and `--expected-scenes requires
+  --gate-f`, plus their existing `VALID` summaries. Gate E flags do not change
+  those combinations or diagnostics.
+
+For a full `--ik-baseline`, Gate E compares base and observation groups over
+the complete pair. For a legacy baseline it compares only the shared base
+group. The Gate E stress traverse branch does the same over the complete pair.
+The safe-stop branch finds the first request at index `stop`, then compares
+only `off_rows[:stop+1]` and `on_rows[:stop+1]`; it must not require any
+post-stop row, simulation, support, or observation equality because command
+handoff intentionally diverges on the next update.
+
+Add REDs for exact full/legacy headers, every hybrid/partial/duplicate header,
+full and legacy `--ik-baseline`, legacy `--ik-off-reference`, all exact CLI
+missing-argument diagnostics, sibling-gate IK-on rejection, accepted post-stop
+divergence, and rejection of a mutation at the inclusive request row.
+
+The shared validator finite-parses all binary64 text without reformatting it.
+Its uint32 parser accepts only canonical raw decimal text matching
+`0|[1-9][0-9]*` whose value is at most `4294967295`; it rejects signs,
+whitespace, leading zeroes, overflow, and non-digits. Use it for every count,
+index, raw-bit word, pose status, and rejection mask. On every full-schema row,
+reject `mask & ~G1_SWING_REJECT_KNOWN_MASK != 0` for either foot before any
+Gate E branch logic; any recorded-contact foot additionally requires mask zero.
+
+For every certified Gate E row require:
+
+- exact 25 Hz, IK applied, no stop/rejection, candidate status `Ok`, bounded
+  correction/residual, reachable legs, exact contact/lock/target observations,
+  and locked sole alignment at least `0.999`;
+- for a recorded-contact foot: evaluated count zero and no-candidate sentinel;
+  its rejection mask must be zero;
+  for a swing foot: evaluated count in `[1,41]`, selected index exactly one less
+  than the count, selected lift bits equal canonical table entry at that index,
+  binary64 lower margin nonnegative with witness upper margin no smaller, and
+  rejection mask containing only `G1SwingRejectKnownMask` bits. A selected
+  candidate may retain bits from earlier rejected stages;
+- candidate `Ok` lower bounds equal the accepted lower bounds on a committed
+  row;
+- locked toe/foot lower bounds at least `-0.005` and every accepted
+  Hips/knee/ankle/toe/foot/thigh/shin/minimum lower bound at least `-0.01`.
+
+`check_gate_e_pair` applies these pair-level predicates after baseline-schema
+dispatch:
+
+1. Require every baseline row to be IK-off and every primary row to be IK-on.
+   Require every row in **both** inputs to have
+   `scene_id == expected_scene` and `route == expected_route`; checking only a
+   first row or the set of values is insufficient.
+2. Run `check_gate_e_rows(on_rows)` and compare all base invariants for either
+   schema. For a full baseline, also compare all observation invariants over the
+   full pair. For an exact legacy baseline, omit only comparisons for columns
+   that do not exist in the locked prefix.
+3. Require at least one `route_complete == "1"` row and forbid a terminal
+   blocked or safe-stop tail. `check_gate_e_rows` additionally keeps the
+   pre-migration certified rule that no primary row may have
+   `ik_safe_stop_requested == "1"`, a stop reason other than `none`, or
+   `ik_candidate_rejected == "1"`.
+4. Collect planted samples for each side only where that primary row's exact
+   `*_locked` value is `"1"`. A full baseline uses the paired baseline and
+   primary `*_lock_drift` values, exactly as the pre-migration Gate E contract.
+   An exact legacy baseline has no IK suffix, so its semantically identical
+   baseline value is the primary row's immutable pre-solve
+   `*_observed_lock_drift`, while the corrected value remains that row's
+   `*_lock_drift`. Require at least ten planted samples total before computing
+   either mean, then require `mean(on_drift) < mean(off_drift)` with no rounding
+   tolerance. This legacy adapter preserves the same support-retargeted
+   baseline-versus-corrected measurement; it does not waive drift reduction.
+
+On success print `VALID gate-e` followed by the exact scene ID, route ID,
+planted count, off mean, and on mean as named `key=value` fields.
+
+Define the stress allowlist exactly:
 
 ```python
 GATE_E_STRESS_ROUTES = {
@@ -3446,51 +2833,69 @@ GATE_E_STRESS_ROUTES = {
 }
 ```
 
-It accepts exactly one of two branches:
+`check_gate_e_stress_pair` rejects unless
+`(expected_scene, expected_route)` is in that set and every row in both inputs
+has exactly those requested values. Both branches require finite validated
+rows, an IK-off baseline, an IK-on primary, and the schema-dependent raw
+comparison already defined above: full baselines compare base plus observation
+groups, while exact legacy baselines compare the shared base group only.
 
-1. **Traverse:** no IK stop occurs and the route completes. Run
-   `check_gate_e_rows(on_rows)` and compare both base invariants and observation
-   invariants over the complete pair. Do not impose the certified-route
-   aggregate drift-reduction condition on a class-2 traversal; bounded
-   clearance, residual, orientation, correction, and swing behavior are still
-   mandatory.
-2. **Safe stop:** locate the first on-row with
-   `ik_safe_stop_requested=1`. It must occur before the first
-   `route_complete=1` row, if the open-loop route driver later emits one, and
-   the request row must have `ik_candidate_rejected=1`. Compare both invariant
-   groups only on the inclusive prefix through that request; divergence after
-   it is intentional because the command changes on the following update.
-   Require the reason/evidence pair to be exact: `reach-shell` with either
-   reachable flag false; `swing-lift` with required lift above `0.08` or actual
-   corrected sweep margin below `-1e-5`; `correction-bound` with correction at
-   least `0.35-1e-5`; `lock-drift` with observed drift above `0.20`; or
-   `end-effector-residual` with residual above `0.005`. Reject `none`, unknown
-   reasons, and `post-solve-clearance`. The request candidate must itself keep
-   minimum clearance at least `-0.01` and, for each locked foot, candidate
-   toe/foot clearance at least `-0.005`; this prevents a hidden earlier reason
-   from laundering a post-solve penetration into a successful stress result.
-   Every accepted/rendered on-row, including the complete tail, must retain
-   the ordinary `-0.01` physical bounds and the planted `-0.005` bounds. On the
-   row immediately after the request, require
-   `actual_simulation_speed <= 1e-4`, then require that bound through the end;
-   `applied_speed` alone is not stop evidence. From that first stopped row to
-   the end, require total horizontal simulation displacement at most `0.02 m`
-   and support-height rise at most `0.02 m`. Do not forbid a later
-   `route_complete=1`: route completion is an open-loop script clock, not proof
-   of physical traversal.
+It accepts exactly one of these branches:
 
-Both branches require finite rows and the exact requested scene/route. Print
-`VALID gate-e-stress` with `branch=traverse` or `branch=safe-stop`, the stop
-frame/reason when applicable, and named clearance, speed, displacement, and
-support-rise measurements. Add focused passing fixtures for both branches and
-negative tests for every reason/evidence mismatch, prefix mutation, accepted
-tail penetration, candidate penetration, request after route completion,
-next-frame residual speed, tail displacement/support rise, and an unlisted
-scene/route.
+1. **Traverse:** no primary row requests an IK stop and at least one primary
+   row has `route_complete == "1"`. Run `check_gate_e_rows(on_rows)` and compare
+   the complete pair. Do **not** impose certified-route aggregate planted-drift
+   reduction on a class-2 traversal; bounded binary64 clearance, residual,
+   orientation, correction, status, and ladder/mask behavior remain mandatory.
+2. **Safe stop:** locate the first primary row with
+   `ik_safe_stop_requested == "1"`. It must precede the first route-complete
+   row if the open-loop driver later emits one, and that exact request row must
+   have `ik_candidate_rejected == "1"`. Compare only the inclusive prefix
+   through that row, then apply the reason/status/mask evidence and stopped-tail
+   predicates below. Divergence after the request remains intentional.
+
+The stress safe-stop evidence for `swing-lift` is no longer “required lift above
+0.08” or a predicted margin. It is exact all-ladder exhaustion on at least one
+non-contact foot:
+`candidates_evaluated == 41` and
+`selected_index == G1SwingNoCandidate`. If unresolved certification is named as
+the cause, its mask must be nonzero and the checker prints the exact decoded
+set (`OutsideDomain`, `BudgetExceeded`, `Uncertified`, including mixtures).
+Mask zero remains valid only when every real rejection was controller-only or a
+negative `Ok` margin; print that zero-mask cause as
+`controller-or-negative-ok`, not as a certification status. The other stop
+reasons retain these exact evidence
+predicates on the request row: `reach-shell` requires either reachable flag to
+be false; `correction-bound` requires `max_ik_correction >= 0.35 - 1e-5`;
+`lock-drift` requires either observed lock drift to exceed `0.20`;
+`end-effector-residual` requires either contact residual to exceed `0.005`;
+and `post-solve-clearance` requires either a non-`Ok` candidate-local pose
+status or an `Ok` candidate lower bound below `-0.005` for a locked toe/foot or
+below `-0.01` for the candidate minimum. Reject a reason whose predicate is
+false, `none`, and unknown reasons. Candidate lower bounds are examined only
+for `Ok`; a non-`Ok` pose is proved by its exact status, never fabricated
+numbers.
+
+For every safe-stop branch, require the first stop request before the first
+`route_complete=1` row if one exists. The immediately following row and every
+tail row require `actual_simulation_speed <= 1e-4`; from that first stopped row
+through the end, total XZ displacement and support-height rise are each at most
+`0.02 m`. Every accepted/rendered row, including the complete tail, retains
+the ordinary `-0.01` physical lower bounds and locked `-0.005` toe/foot lower
+bounds. Candidate-local `OutsideDomain`/`BudgetExceeded`/`Uncertified` remain
+named evidence; global statuses are controlled errors, not a Gate E safe-stop
+success. A later open-loop `route_complete=1` is allowed.
+
+On success print `VALID gate-e-stress` with `branch=traverse` or
+`branch=safe-stop`, the exact scene/route, and the stop frame/reason plus named
+clearance, speed, displacement, and support-rise measurements when applicable.
+
+Print/check binary64 values from their raw CSV text; never round them to a
+binary32 surrogate before threshold comparison.
 
 - [ ] **Step 6: Run checker and paired smoke GREEN**
 
-Run:
+Use the strictly linked `/tmp/controller_g1_ik` built in Task 7:
 
 ```bash
 /home/ubuntu/miniconda3/envs/diffsim/bin/python -m unittest \
@@ -3510,14 +2915,16 @@ DISPLAY=:1 G1_TERRAIN_DIR=resources/g1_terrain \
   --expected-scene grail-curb-low --expected-route curb-forward
 ```
 
-Expected: Python tests pass; both controller runs close normally; the checker prints exactly one `VALID gate-e` summary and exits `0`.
+Expected: tests pass, both runs close normally, raw-string invariants hold, and
+Gate E prints one valid summary using explicit status, ladder, and binary64
+clearance evidence.
 
-- [ ] **Step 7: Commit the diagnostic and acceptance contract**
+- [ ] **Step 7: Commit diagnostics and acceptance contract**
 
 ```bash
 git add motion_match_log.h controller.cpp \
   resources/check_g1_runtime_log.py tests/python/test_runtime_log.py
-git commit -m "test: enforce G1 terrain IK Gate E"
+git commit -m "test: enforce certified G1 terrain IK Gate E"
 ```
 
 ### Task 9: Run Full Verification and Gate E Across Every Certified Terrain Family
@@ -3547,6 +2954,25 @@ The three class-2 GRAIL curb routes (`grail-curb-default`,
 checked by `--gate-e-stress`; none is relabeled certified. The blocked-course
 safe-stop routes remain sibling Gate D, never Gate E.
 
+Schema routing is part of this verification, not an implicit compatibility
+mode:
+
+- every CSV produced by `/tmp/controller_g1_ik` in this task has exactly
+  `FULL_RUNTIME_COLUMNS` and is always the positional primary log;
+- every preserved weight-zero control and accepted Gate C/D/F reference under
+  `/tmp/g1-multiscene-runtime/` has exactly `LEGACY_RUNTIME_COLUMNS`.
+  `--compare-control` and `--ik-off-reference` load those paths only with
+  `read_legacy_runtime_rows`; no legacy file is passed to `read_rows` or used as
+  the positional primary;
+- every newly generated matched Gate E/stress `off` log is full schema.
+  `--ik-baseline` must dispatch it as `"full"`, compare all base and observation
+  invariants, and reject a partially appended or hybrid header. The exact
+  legacy baseline branch is exercised in Task 8 unit tests only; it compares
+  base invariants because the observation suffix does not exist there;
+- Gate C, Gate D, Gate F, failed-switch, `--compare-control`, and
+  `--ik-off-reference` still require every primary row to have
+  `ik_enabled == "0"`. Only Gate E and Gate E stress accept IK-on primaries.
+
 - [ ] **Step 1: Run the complete Python suite and independent published-pack validator**
 
 Run without rebuilding or republishing any artifact:
@@ -3566,6 +2992,19 @@ Run:
 
 ```bash
 mkdir -p /tmp/g1-ik-clearance/native
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic \
+  -fno-fast-math -ffp-contract=off -frounding-math -I. \
+  -c g1_clearance.cpp \
+  -o /tmp/g1-ik-clearance/native/g1-clearance-strict.o
+g++ -std=c++17 -O3 -fno-fast-math -ffp-contract=off \
+  -frounding-math -DNDEBUG -I. -c g1_clearance.cpp \
+  -o /tmp/g1-ik-clearance/native/g1-clearance-release.o
+g++ -std=c++17 -O1 -g -fno-fast-math -ffp-contract=off \
+  -frounding-math \
+  -fsanitize=address,undefined,float-cast-overflow,float-divide-by-zero \
+  -fno-sanitize-recover=all -fno-omit-frame-pointer -I. \
+  -c g1_clearance.cpp \
+  -o /tmp/g1-ik-clearance/native/g1-clearance-san.o
 cpp_tests=(
   test_g1_skeleton test_terrain_database test_terrain_runtime
   test_scene_runtime test_support_runtime test_g1_controller_state
@@ -3575,31 +3014,58 @@ cpp_tests=(
 for name in "${cpp_tests[@]}"; do
   source="tests/cpp/${name}.cpp"
   test -f "$source"
+  extra=()
+  if test "$name" = test_g1_ik; then
+    extra=(-DG1_IK_ENABLE_TEST_SEAMS)
+  fi
   g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
-    "$source" -o "/tmp/g1-ik-clearance/native/${name}-strict"
+    "${extra[@]}" -c "$source" \
+    -o "/tmp/g1-ik-clearance/native/${name}-strict.o"
+  g++ "/tmp/g1-ik-clearance/native/${name}-strict.o" \
+    /tmp/g1-ik-clearance/native/g1-clearance-strict.o \
+    -o "/tmp/g1-ik-clearance/native/${name}-strict"
   "/tmp/g1-ik-clearance/native/${name}-strict"
   g++ -std=c++17 -O3 -ffast-math -DNDEBUG -I. \
-    "$source" -o "/tmp/g1-ik-clearance/native/${name}-release"
+    "${extra[@]}" -c "$source" \
+    -o "/tmp/g1-ik-clearance/native/${name}-release.o"
+  g++ "/tmp/g1-ik-clearance/native/${name}-release.o" \
+    /tmp/g1-ik-clearance/native/g1-clearance-release.o \
+    -o "/tmp/g1-ik-clearance/native/${name}-release"
   "/tmp/g1-ik-clearance/native/${name}-release"
-  g++ -std=c++17 -O1 -g -fsanitize=address,undefined \
-    -fno-omit-frame-pointer -I. "$source" \
+  g++ -std=c++17 -O1 -g -fno-fast-math \
+    -fsanitize=address,undefined,float-cast-overflow,float-divide-by-zero \
+    -fno-sanitize-recover=all -fno-omit-frame-pointer -I. \
+    "${extra[@]}" -c "$source" \
+    -o "/tmp/g1-ik-clearance/native/${name}-san.o"
+  g++ -fsanitize=address,undefined,float-cast-overflow,float-divide-by-zero \
+    -fno-sanitize-recover=all \
+    "/tmp/g1-ik-clearance/native/${name}-san.o" \
+    /tmp/g1-ik-clearance/native/g1-clearance-san.o \
     -o "/tmp/g1-ik-clearance/native/${name}-san"
-  ASAN_OPTIONS=detect_leaks=1 \
+  ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
     "/tmp/g1-ik-clearance/native/${name}-san"
 done
 ```
 
-Expected: all 36 invocations exit `0`; strict builds emit no warning and sanitizers emit no report.
+Expected: all 36 invocations exit `0`; strict builds emit no warning,
+sanitizers emit no report, every kernel object was compiled with strict FP, and
+no final link command contains `-ffast-math`.
 
 - [ ] **Step 3: Build the final non-sanitized controller and run source-order guards**
 
 Run:
 
 ```bash
+g++ -std=c++17 -O3 -fno-fast-math -ffp-contract=off \
+  -frounding-math -DNDEBUG -I. -c g1_clearance.cpp \
+  -o /tmp/g1-ik-clearance/native/g1-clearance-controller.o
 g++ -std=c++17 -O3 -ffast-math -DNDEBUG \
   -D_DEFAULT_SOURCE -DPLATFORM_DESKTOP \
   -I. -I/home/ubuntu/apps/raylib/src -I/home/ubuntu/apps/raygui/src \
-  controller.cpp -o /tmp/controller_g1_ik \
+  -c controller.cpp -o /tmp/g1-ik-clearance/native/controller.o
+g++ /tmp/g1-ik-clearance/native/controller.o \
+  /tmp/g1-ik-clearance/native/g1-clearance-controller.o \
+  -o /tmp/controller_g1_ik \
   -L/home/ubuntu/apps/raylib/src \
   -lraylib -lGL -lm -lpthread -ldl -lrt -lX11
 ! rg -n 'contact_(reset|update)|ik_look_at|static void ik_two_bone' \
@@ -4161,9 +3627,18 @@ Add a templated transactional ownership test using fake integer models and callb
 Run:
 
 ```bash
+mkdir -p /tmp/g1-ik-clearance/visual-red
+g++ -std=c++17 -O0 -g -Wall -Wextra -Werror -pedantic \
+  -fno-fast-math -ffp-contract=off -frounding-math -I. \
+  -c g1_clearance.cpp \
+  -o /tmp/g1-ik-clearance/visual-red/g1-clearance.o
 g++ -std=c++17 -O0 -g -Wall -Wextra -Werror -pedantic \
   -I. -I/home/ubuntu/apps/raylib/src \
-  tests/cpp/test_g1_visual_mesh.cpp -o /tmp/test_g1_visual_mesh \
+  -c tests/cpp/test_g1_visual_mesh.cpp \
+  -o /tmp/g1-ik-clearance/visual-red/test-g1-visual-mesh.o
+g++ /tmp/g1-ik-clearance/visual-red/test-g1-visual-mesh.o \
+  /tmp/g1-ik-clearance/visual-red/g1-clearance.o \
+  -o /tmp/test_g1_visual_mesh \
   -L/home/ubuntu/apps/raylib/src -lraylib -lGL -lm -lpthread -ldl -lrt -lX11
 ```
 
@@ -4255,18 +3730,33 @@ At the one normal post-window cleanup tail: close the deterministic log, call `g
 Run:
 
 ```bash
+mkdir -p /tmp/g1-ik-clearance/visual
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic \
+  -fno-fast-math -ffp-contract=off -frounding-math -I. \
+  -c g1_clearance.cpp \
+  -o /tmp/g1-ik-clearance/visual/g1-clearance-test.o
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic \
   -I. -I/home/ubuntu/apps/raylib/src \
-  tests/cpp/test_g1_visual_mesh.cpp -o /tmp/test_g1_visual_mesh \
+  -c tests/cpp/test_g1_visual_mesh.cpp \
+  -o /tmp/g1-ik-clearance/visual/test-g1-visual-mesh.o
+g++ /tmp/g1-ik-clearance/visual/test-g1-visual-mesh.o \
+  /tmp/g1-ik-clearance/visual/g1-clearance-test.o \
+  -o /tmp/test_g1_visual_mesh \
   -L/home/ubuntu/apps/raylib/src -lraylib -lGL -lm -lpthread -ldl -lrt -lX11
 /tmp/test_g1_visual_mesh
+g++ -std=c++17 -O3 -fno-fast-math -ffp-contract=off \
+  -frounding-math -DNDEBUG -I. -c g1_clearance.cpp \
+  -o /tmp/g1-ik-clearance/visual/g1-clearance-controller.o
 g++ -std=c++17 -O3 -ffast-math -DNDEBUG \
   -D_DEFAULT_SOURCE -DPLATFORM_DESKTOP \
   -I. -I/home/ubuntu/apps/raylib/src -I/home/ubuntu/apps/raygui/src \
-  controller.cpp -o /tmp/controller_g1_mesh \
+  -c controller.cpp \
+  -o /tmp/g1-ik-clearance/visual/controller-mesh.o
+g++ /tmp/g1-ik-clearance/visual/controller-mesh.o \
+  /tmp/g1-ik-clearance/visual/g1-clearance-controller.o \
+  -o /tmp/controller_g1_mesh \
   -L/home/ubuntu/apps/raylib/src \
   -lraylib -lGL -lm -lpthread -ldl -lrt -lX11
-mkdir -p /tmp/g1-ik-clearance/visual
 /usr/bin/time -v -o /tmp/g1-ik-clearance/visual/skeleton.time \
   env DISPLAY=:1 G1_TERRAIN_DIR=resources/g1_terrain \
   MM_TERRAIN_SCENE=mixed-multilevel MM_TEST_MODE=route \
