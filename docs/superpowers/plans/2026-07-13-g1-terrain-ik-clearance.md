@@ -839,304 +839,99 @@ git commit -m "test: lock explicit G1 terrain IK geometry"
 **Files:**
 - Modify: `g1_ik.h`
 - Modify: `tests/cpp/test_g1_ik.cpp`
+- Modify: `docs/superpowers/plans/2026-07-13-g1-terrain-ik-clearance.md`
 
-**Interfaces:**
-- Consumes: sibling-owned checked
-  `heightfield_sample_v2(const heightfield&,float,float)` and
-  `heightfield_normal(const heightfield&,float,float)` on a validated G1HF/v2
-  scene.
-- Produces: `G1SurfaceTarget`, `G1FootLockState`, `g1_foot_lock_reset`, and transactional `g1_foot_lock_update`.
-- A recorded contact rising edge freezes the support-retargeted sole-center XZ, samples height and normal at that exact point, and drives a `0.10 s` critically damped target at `1/25 s`; release returns to the animation target without changing the input pose.
-- Observation runs in IK-off and IK-on modes so the paired logs use identical contact edges and lock anchors. Only a subsequent apply call may alter rotations.
+**Implemented interfaces and contract:**
+- `G1SurfaceQueryStatus { Valid, Outside, Invalid }` and
+  `g1_surface_query_v2` are the reusable fail-closed primitive for this task
+  and Task 5. They validate a complete G1HF/v2 field, canonicalize query
+  coordinates, call `terrain_v2_locate_cell` and
+  `terrain_v2_cell_heights`, and reproduce the authoritative fixed-diagonal
+  height and normal arithmetic exactly. Neither error status returns or
+  accepts `exterior_height`, and the caller's output remains unchanged.
+- `g1_surface_target_sample` is transactional. It reports exterior
+  coordinates as `Outside`, malformed fields/data/math as `Invalid`, and
+  uses checked binary64-to-binary32 addition for height plus clearance.
+- `g1_ik_dt_is_exact_25_hz` accepts only binary32 bits `0x3d23d70a`.
+  Task 5 swing planning and Task 6 frame evaluation must reuse this helper;
+  tolerant comparisons and neighboring `nextafter` values are invalid.
+- `g1_foot_lock_reset` is checked and transactional:
+  `bool g1_foot_lock_reset(state, center, error, error_capacity)`.
+- `G1FootLockState` owns explicit `position_active`, `releasing`, and
+  `release_frames` state. Its invariant is
+  `position_active == (locked || releasing)`; locked implies contact,
+  releasing implies no contact, and inactive states have zero spring offsets.
+- `G1FootTarget` mirrors `locked`, `position_active`, and `releasing`.
+  Task 6 must consume `target.sole_center` whenever `position_active` is
+  true. Surface alignment remains locked-only.
+- Rising, falling, and release-recontact event frames preserve the previous
+  output position bit-for-bit. Stable lock/release frames consume the checked
+  `0.10 s` critical spring. Release deactivates when every position offset is
+  at most `1e-4 m` and every velocity offset is at most `1e-3 m/s` after at
+  least two stable release updates, or after the deterministic 25-frame cap,
+  then snaps exactly to animation.
+- Update validates the complete state, prior output, exact named-leg config,
+  input, and timestep before derived arithmetic. Input velocity, transitions,
+  spring stages, height plus clearance, and horizontal drift use checked
+  rounding. Every failure rolls back both state and output.
+- Every active lock point must bit-match a fresh checked surface target at its
+  frozen XZ and configured clearance before the stable lock spring advances;
+  finite state corruption or changed scene data therefore fails closed.
+- Horizontal drift is measured from the frozen lock point in binary64:
+  exactly `0.20f` is allowed, its next larger binary32 value is exceeded, and
+  active recorded contact never auto-unlocks.
 
-- [ ] **Step 1: Add failing flat, ramp-normal, lock, release, and timestep tests**
+- [x] **Step 1: Add RED coverage for the checked query and lock lifecycle**
 
-Add `#include <limits>` and append these helpers/tests before `main` in `tests/cpp/test_g1_ik.cpp`; call `test_surface_target_and_planted_lock()` from `main`:
+The tests cover flat and ramp surfaces, both non-planar fixed-diagonal
+triangles and the tie rule, all inclusive corners, one-ULP exterior points,
+malformed version/storage, selected NaN/subnormal heights, public-target
+rollback, and checked height-plus-clearance overflow. Lock tests cover
+convergence, exact event-frame continuity, multi-frame and bounded release,
+release recontact, exact drift boundaries, poisoned state/config/output,
+non-finite and finite-extreme inputs, exact timestep neighbors, reset
+rollback, and hostile diagnostic buffers.
 
-```cpp
-static heightfield make_ramp_surface()
-{
-    heightfield field;
-    field.version = 2;
-    field.nx = 2;
-    field.nz = 2;
-    field.origin_x = 0.0f;
-    field.origin_z = 0.0f;
-    field.cell_size = 1.0f;
-    field.exterior_height = -10.0f;
-    field.heights.resize(4);
-    field.heights(0) = 0.0f;
-    field.heights(1) = 0.1f;
-    field.heights(2) = 0.0f;
-    field.heights(3) = 0.1f;
-    return field;
-}
-
-static void test_surface_target_and_planted_lock()
-{
-    const heightfield field = make_ramp_surface();
-    const G1LegConfig leg = g1_left_leg_config();
-    G1SurfaceTarget surface = {};
-    char error[256] = {};
-    check(g1_surface_target_sample(
-              surface, field, 0.25f, 0.50f,
-              leg.planted_clearance_m, error, sizeof(error)), error);
-    check(std::fabs(surface.point.y - 0.030f) < 1e-6f,
-          "surface height plus planted clearance");
-    check(surface.normal.y > 0.99f && surface.normal.x < 0.0f,
-          "upward exact ramp normal");
-
-    G1FootLockState state = {};
-    const vec3 initial(0.25f, 0.030f, 0.50f);
-    g1_foot_lock_reset(state, initial);
-    G1FootTarget target = {};
-    check(g1_foot_lock_update(
-              state, target, field, leg, initial, true,
-              1.0f / 25.0f, error, sizeof(error)), error);
-    check(state.locked && target.locked, "contact rising edge locks");
-    check(std::fabs(state.lock_point.x - 0.25f) < 1e-7f,
-          "lock X is frozen");
-    check(std::fabs(state.lock_point.z - 0.50f) < 1e-7f,
-          "lock Z is frozen");
-
-    for (int frame = 0; frame < 12; ++frame) {
-        const vec3 drifting(0.30f + frame * 0.002f, 0.04f, 0.50f);
-        check(g1_foot_lock_update(
-                  state, target, field, leg, drifting, true,
-                  1.0f / 25.0f, error, sizeof(error)), error);
-    }
-    check(target.locked && std::fabs(target.surface.point.x - 0.25f) < 1e-7f,
-          "planted target remains at lock point");
-    check(target.surface.normal.x < 0.0f && target.surface.normal.y > 0.99f,
-          "lock retains exact normal");
-
-    check(g1_foot_lock_update(
-              state, target, field, leg, vec3(0.46f, 0.04f, 0.50f), true,
-              1.0f / 25.0f, error, sizeof(error)), error);
-    check(state.locked && target.locked && target.drift_limit_exceeded,
-          "active contact never silently unlocks beyond drift bound");
-
-    check(g1_foot_lock_update(
-              state, target, field, leg, vec3(0.32f, 0.04f, 0.50f), false,
-              1.0f / 25.0f, error, sizeof(error)), error);
-    check(!state.locked && !target.locked, "contact falling edge releases");
-
-    const G1FootLockState before = state;
-    check(!g1_foot_lock_update(
-              state, target, field, leg, initial, true,
-              1.0f / 60.0f, error, sizeof(error)),
-          "non-25 Hz contact update rejected");
-    check(std::strstr(error, "25 Hz") != NULL, "timestep diagnostic");
-    check(state.locked == before.locked && state.contact == before.contact,
-          "failed update is transactional");
-
-    const float nan = std::numeric_limits<float>::quiet_NaN();
-    check(!g1_surface_target_sample(
-              surface, field, nan, 0.0f, 0.0f, error, sizeof(error)),
-          "non-finite query rejected");
-    check(std::strstr(error, "non-finite") != NULL,
-          "non-finite query diagnostic");
-}
-```
-
-- [ ] **Step 2: Compile to verify lock/normal RED**
-
-Run:
+- [x] **Step 2: Confirm RED before implementing**
 
 ```bash
 g++ -std=c++17 -O0 -g -Wall -Wextra -Werror -pedantic -I. \
-  tests/cpp/test_g1_ik.cpp -o /tmp/test_g1_ik
+  tests/cpp/test_g1_ik.cpp -o /tmp/test_g1_ik_task2_red
 ```
 
-Expected: compilation fails because `G1SurfaceTarget`, `G1FootLockState`, `G1FootTarget`, and the lock functions are undefined.
+The compile failed on the intentionally undefined checked-query and lock
+interfaces before production code was added.
 
-- [ ] **Step 3: Add transactional exact-surface lock state**
+- [x] **Step 3: Implement the fail-closed surface primitive and transactional lock**
 
-Add `#include "spring.h"` and `<cmath>` to `g1_ik.h`, then append:
+Implementation lives in `g1_ik.h`. It does not touch `controller.cpp` or
+any resource artifact, and does not require or shallow-copy a `database`.
 
-```cpp
-struct G1SurfaceTarget
-{
-    vec3 point;
-    vec3 normal;
-};
-
-struct G1FootLockState
-{
-    bool initialized = false;
-    bool contact = false;
-    bool locked = false;
-    vec3 previous_input;
-    vec3 lock_point;
-    vec3 output_position;
-    vec3 output_velocity;
-    vec3 offset_position;
-    vec3 offset_velocity;
-};
-
-struct G1FootTarget
-{
-    bool locked = false;
-    bool drift_limit_exceeded = false;
-    G1SurfaceTarget surface;
-    vec3 sole_center;
-    float horizontal_drift_m = 0.0f;
-};
-
-static inline bool g1_vec3_is_finite(vec3 value)
-{
-    return terrain_float_is_finite(value.x) &&
-           terrain_float_is_finite(value.y) &&
-           terrain_float_is_finite(value.z);
-}
-
-static inline bool g1_surface_target_sample(
-    G1SurfaceTarget& output,
-    const heightfield& field,
-    float x,
-    float z,
-    float clearance,
-    char* error,
-    int error_capacity)
-{
-    if (field.version != 2 || !terrain_float_is_finite(x) ||
-        !terrain_float_is_finite(z) ||
-        !terrain_float_is_finite(clearance) || clearance < 0.0f) {
-        return g1_ik_error(
-            error, error_capacity,
-            "G1 IK surface query is non-finite or not G1HF/v2");
-    }
-    const float height = heightfield_sample_v2(field, x, z);
-    const vec3 normal = heightfield_normal(field, x, z);
-    if (!terrain_float_is_finite(height) || !g1_vec3_is_finite(normal) ||
-        normal.y <= 0.0f || std::fabs(length(normal) - 1.0f) > 1e-4f) {
-        return g1_ik_error(
-            error, error_capacity,
-            "G1 IK surface query produced a non-finite or non-upward normal");
-    }
-    G1SurfaceTarget candidate = {};
-    candidate.point = vec3(x, height + clearance, z);
-    candidate.normal = normal;
-    output = candidate;
-    return true;
-}
-
-static inline void g1_foot_lock_reset(
-    G1FootLockState& state, vec3 initial_sole_center)
-{
-    state = G1FootLockState();
-    state.initialized = true;
-    state.previous_input = initial_sole_center;
-    state.lock_point = initial_sole_center;
-    state.output_position = initial_sole_center;
-}
-
-static inline bool g1_foot_lock_update(
-    G1FootLockState& state,
-    G1FootTarget& output,
-    const heightfield& field,
-    const G1LegConfig& config,
-    vec3 input_sole_center,
-    bool input_contact,
-    float dt,
-    char* error,
-    int error_capacity)
-{
-    if (!state.initialized || !g1_vec3_is_finite(input_sole_center) ||
-        !terrain_float_is_finite(dt) ||
-        std::fabs(dt - 1.0f / 25.0f) > 1e-7f) {
-        return g1_ik_error(
-            error, error_capacity,
-            "G1 planted-foot update requires finite state at exactly 25 Hz");
-    }
-
-    G1FootLockState next = state;
-    const vec3 input_velocity =
-        (input_sole_center - next.previous_input) / dt;
-    next.previous_input = input_sole_center;
-    G1SurfaceTarget sampled = {};
-
-    if (!next.contact && input_contact) {
-        if (!g1_surface_target_sample(
-                sampled, field, input_sole_center.x, input_sole_center.z,
-                config.planted_clearance_m, error, error_capacity)) return false;
-        next.locked = true;
-        next.lock_point = sampled.point;
-        inertialize_transition(
-            next.offset_position, next.offset_velocity,
-            next.output_position, next.output_velocity,
-            next.lock_point, vec3());
-    } else if (next.locked && !input_contact) {
-        next.locked = false;
-        inertialize_transition(
-            next.offset_position, next.offset_velocity,
-            next.output_position, next.output_velocity,
-            input_sole_center, input_velocity);
-    }
-
-    const vec3 goal = next.locked ? next.lock_point : input_sole_center;
-    const vec3 goal_velocity = next.locked ? vec3() : input_velocity;
-    inertialize_update(
-        next.output_position, next.output_velocity,
-        next.offset_position, next.offset_velocity,
-        goal, goal_velocity, 0.10f, dt);
-    next.contact = input_contact;
-
-    if (!g1_surface_target_sample(
-            sampled, field,
-            next.locked ? next.lock_point.x : input_sole_center.x,
-            next.locked ? next.lock_point.z : input_sole_center.z,
-            config.planted_clearance_m, error, error_capacity)) return false;
-    const vec3 drift(
-        input_sole_center.x - next.lock_point.x,
-        0.0f,
-        input_sole_center.z - next.lock_point.z);
-    G1FootTarget candidate = {};
-    candidate.locked = next.locked;
-    candidate.drift_limit_exceeded =
-        next.locked && length(drift) > 0.20f;
-    candidate.surface = sampled;
-    candidate.sole_center = next.output_position;
-    candidate.horizontal_drift_m = next.locked ? length(drift) : 0.0f;
-    if (!g1_vec3_is_finite(candidate.sole_center) ||
-        !terrain_float_is_finite(candidate.horizontal_drift_m)) {
-        return g1_ik_error(
-            error, error_capacity,
-            "G1 planted-foot update produced non-finite state");
-    }
-    state = next;
-    output = candidate;
-    return true;
-}
-
-```
-
-Do not call these functions from `controller.cpp` in this task. They are pure downstream observation state until controller integration, and their target is a sole-center target rather than a world-Y root correction.
-
-- [ ] **Step 4: Run lock/normal GREEN under strict, release, and sanitizers**
-
-Run:
+- [x] **Step 4: Verify strict, fast-math release, and ASAN/UBSAN builds**
 
 ```bash
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
-  tests/cpp/test_g1_ik.cpp -o /tmp/test_g1_ik_strict
-/tmp/test_g1_ik_strict
+  tests/cpp/test_g1_ik.cpp -o /tmp/test_g1_ik_task2_strict
+/tmp/test_g1_ik_task2_strict
+
 g++ -std=c++17 -O3 -ffast-math -DNDEBUG -I. \
-  tests/cpp/test_g1_ik.cpp -o /tmp/test_g1_ik_release
-/tmp/test_g1_ik_release
+  tests/cpp/test_g1_ik.cpp -o /tmp/test_g1_ik_task2_release
+/tmp/test_g1_ik_task2_release
+
 g++ -std=c++17 -O1 -g -fsanitize=address,undefined \
   -fno-omit-frame-pointer -I. tests/cpp/test_g1_ik.cpp \
-  -o /tmp/test_g1_ik_san
-ASAN_OPTIONS=detect_leaks=1 /tmp/test_g1_ik_san
+  -o /tmp/test_g1_ik_task2_san
+ASAN_OPTIONS=detect_leaks=1 /tmp/test_g1_ik_task2_san
 ```
 
-Expected: all three executables exit `0`; the sanitizer emits no finding.
+All three executables must exit zero; sanitizers must emit no finding.
 
-- [ ] **Step 5: Commit exact-surface planted locking**
+- [x] **Step 5: Commit exact checked-surface planted locking**
 
 ```bash
-git add g1_ik.h tests/cpp/test_g1_ik.cpp
-git commit -m "feat: lock planted G1 feet to exact terrain"
+git add g1_ik.h tests/cpp/test_g1_ik.cpp \
+  docs/superpowers/plans/2026-07-13-g1-terrain-ik-clearance.md
+git commit -m "feat: lock planted G1 feet to checked terrain"
 ```
 
 ### Task 3: Add a Finite, Reach-Shell-Bounded Named Two-Bone Solve
@@ -1256,7 +1051,7 @@ static void test_named_bounded_two_bone_solve()
               vec3(), 0.015f),
           "folded zero-direction target uses deterministic fallback");
     check(!folded.reachable &&
-          g1_vec3_is_finite(folded.clamped_target) &&
+          g1_ik_vec3_is_runtime_value(folded.clamped_target) &&
           std::fabs(folded.clamped_distance_m - 0.015f) < 1e-6f,
           "folded target projection remains finite at inner shell");
 }
@@ -1537,7 +1332,7 @@ static inline bool g1_apply_named_position_ik(
         local_positions.size != G1_BoneCount ||
         baseline_rotations.size != G1_BoneCount ||
         parents.size != G1_BoneCount ||
-        !g1_vec3_is_finite(requested_ankle_target)) {
+        !g1_ik_vec3_is_runtime_value(requested_ankle_target)) {
         return g1_ik_error(
             error, error_capacity,
             "%s leg IK received non-finite target or wrong pose shape",
@@ -1606,7 +1401,7 @@ static inline bool g1_apply_named_contact_position_ik(
     int error_capacity)
 {
     if (parents(config.contact) != config.ankle ||
-        !g1_vec3_is_finite(desired_contact))
+        !g1_ik_vec3_is_runtime_value(desired_contact))
         return g1_ik_error(
             error, error_capacity,
             "%s contact residual solver received invalid chain/target",
@@ -1809,7 +1604,8 @@ static inline bool g1_surface_aligned_foot_rotation(
     int error_capacity)
 {
     if (!ik_quat_is_finite(current_global_rotation) ||
-        !g1_vec3_is_finite(surface_normal) || surface_normal.y <= 0.0f ||
+        !g1_ik_vec3_is_runtime_value(surface_normal) ||
+        surface_normal.y <= 0.0f ||
         std::fabs(length(surface_normal) - 1.0f) > 1e-4f) {
         return g1_ik_error(
             error, error_capacity,
@@ -2123,18 +1919,29 @@ static inline bool g1_clearance_consider(
     char* error,
     int error_capacity)
 {
-    if (!g1_vec3_is_finite(body_point))
+    if (!g1_ik_vec3_is_runtime_value(body_point))
         return g1_ik_error(error, error_capacity, "G1 clearance body point is non-finite");
-    const float surface_y = heightfield_sample_v2(
-        field, body_point.x, body_point.z);
-    const float clearance = body_point.y - surface_y;
-    if (!terrain_float_is_finite(surface_y) || !terrain_float_is_finite(clearance))
-        return g1_ik_error(error, error_capacity, "G1 clearance surface sample is non-finite");
+    G1SurfaceSample surface = {};
+    const G1SurfaceQueryStatus status = g1_surface_query_v2(
+        surface, field, body_point.x, body_point.z);
+    if (status == G1SurfaceQueryOutside)
+        return g1_ik_error(error, error_capacity, "G1 clearance query is outside terrain");
+    if (status != G1SurfaceQueryValid)
+        return g1_ik_error(error, error_capacity, "G1 clearance surface sample is invalid");
+    const volatile double promoted_clearance =
+        static_cast<double>(body_point.y) -
+        static_cast<double>(surface.height);
+    float clearance = 0.0f;
+    if (!terrain_v2_round_output(promoted_clearance, clearance))
+        return g1_ik_error(error, error_capacity, "G1 clearance difference overflowed");
     ++result.samples;
     if (clearance < result.minimum_m) {
         result.minimum_m = clearance;
         result.body_point = body_point;
-        result.surface_point = vec3(body_point.x, surface_y, body_point.z);
+        result.surface_point = vec3(
+            terrain_runtime_canonicalize_output(body_point.x),
+            surface.height,
+            terrain_runtime_canonicalize_output(body_point.z));
     }
     return true;
 }
@@ -2189,8 +1996,9 @@ static inline bool g1_capsule_clearance(
     char* error,
     int error_capacity)
 {
-    if (field.version != 2 || !g1_vec3_is_finite(endpoint_a) ||
-        !g1_vec3_is_finite(endpoint_b) ||
+    if (field.version != 2 ||
+        !g1_ik_vec3_is_runtime_value(endpoint_a) ||
+        !g1_ik_vec3_is_runtime_value(endpoint_b) ||
         !terrain_float_is_finite(radius_m) || radius_m <= 0.0f ||
         !terrain_float_is_finite(field.cell_size) || field.cell_size <= 0.0f) {
         return g1_ik_error(error, error_capacity, "G1 capsule clearance input is invalid");
@@ -2301,14 +2109,13 @@ static inline bool g1_swing_clearance_plan(
     int error_capacity)
 {
     if (!history.initialized || field.version != 2 ||
-        !terrain_float_is_finite(dt) ||
-        std::fabs(dt - 1.0f / 25.0f) > 1e-7f) {
+        !g1_ik_dt_is_exact_25_hz(dt)) {
         return g1_ik_error(
             error, error_capacity,
             "G1 swing sweep requires initialized G1HF/v2 state at 25 Hz");
     }
     for (int i = 0; i < 4; ++i)
-        if (!g1_vec3_is_finite(current_sphere_centers[i]))
+        if (!g1_ik_vec3_is_runtime_value(current_sphere_centers[i]))
             return g1_ik_error(error, error_capacity, "G1 swing sphere center is non-finite");
 
     G1SwingClearancePlan result = {};
@@ -2776,9 +2583,11 @@ static inline bool g1_ik_state_reset(
             sphere_centers,
             global_positions(configs[foot].contact),
             global_rotations(configs[foot].contact), configs[foot]);
-        if (!g1_vec3_is_finite(center))
+        if (!g1_ik_vec3_is_runtime_value(center))
             return g1_ik_error(error, error_capacity, "G1 IK reset sole is non-finite");
-        g1_foot_lock_reset(state.feet[foot].lock, center);
+        if (!g1_foot_lock_reset(
+                state.feet[foot].lock, center,
+                error, error_capacity)) return false;
         g1_swing_history_reset(state.feet[foot].swing, sphere_centers);
     }
     output = state;
@@ -2816,8 +2625,7 @@ static inline bool g1_ik_frame_evaluate(
         baseline_positions.size != G1_BoneCount ||
         baseline_rotations.size != G1_BoneCount ||
         parents.size != G1_BoneCount || recorded_contacts.size != 2 ||
-        field.version != 2 || !terrain_float_is_finite(dt) ||
-        std::fabs(dt - 1.0f / 25.0f) > 1e-7f) {
+        field.version != 2 || !g1_ik_dt_is_exact_25_hz(dt)) {
         return g1_ik_error(
             error, error_capacity,
             "G1 IK frame requires initialized 31-bone G1HF/v2 state at 25 Hz");
@@ -2866,10 +2674,11 @@ static inline bool g1_ik_frame_evaluate(
         if (result.swing.safe_stop_requested)
             g1_ik_request_stop(frame, G1IkStopSwingLift);
         const bool needs_position =
-            result.target.locked || result.applied_swing_lift_m > 0.0f;
+            result.target.position_active ||
+            result.applied_swing_lift_m > 0.0f;
         if (!needs_position) continue;
 
-        vec3 desired_sole_center = result.target.locked
+        vec3 desired_sole_center = result.target.position_active
             ? result.target.sole_center : baseline_center;
         desired_sole_center.y += result.applied_swing_lift_m;
         vec3 target_normal = result.target.surface.normal;
