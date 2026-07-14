@@ -2169,17 +2169,17 @@ The token defaults to `HF_TOKEN` and is never printed. `--dry-run` prints the da
 
 ```bash
 python -m unittest tests.python.test_interaction_build_cli -v
-rm -rf /tmp/g1_interaction_3
+rm -rf /tmp/g1_interaction_5
 python -m resources.build_g1_interaction_database \
   --source-root /home/ubuntu/datasets/GRAIL/data/pickup_table \
   --g1-xml /home/ubuntu/projects/mjx-diffphysics/env/g1/assets/g1_29dof.xml \
-  --output /tmp/g1_interaction_3 --limit 3 --allow-rejections \
+  --output /tmp/g1_interaction_5 --limit 5 --allow-rejections \
   --heldout-count 1
 python -m resources.validate_g1_interaction_database \
-  --input /tmp/g1_interaction_3
+  --input /tmp/g1_interaction_5
 ```
 
-Expected: unit tests report `ok`; the real build publishes five files; validator prints a `VALID schema=1 fps=25 bones=31 features=71` line. If one of the first three real clips is legitimately rejected, increase only `--limit` until at least two object identities remain and retain every rejection in the report.
+Expected: unit tests report `ok`; the real build publishes five files; validator prints a `VALID schema=1 fps=25 bones=31 features=71` line. The first five lexicographic sources are the smallest prefix containing two object identities; retain every rejection in the report.
 
 - [ ] **Step 6: Commit the build tools**
 

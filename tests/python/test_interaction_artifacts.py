@@ -430,6 +430,23 @@ def rejection_record(
 
 
 class InteractionArtifactAssemblyTests(unittest.TestCase):
+    def test_assembly_makes_every_persisted_array_c_contiguous(self):
+        labeled = labeled_clips_for_objects(["database"])[0]
+        labeled.motion.foot_contacts = np.asfortranarray(
+            labeled.motion.foot_contacts
+        )
+        self.assertFalse(labeled.motion.foot_contacts.flags.c_contiguous)
+
+        artifact = assemble_database([labeled], G1_SKELETON)
+
+        for field in dataclasses.fields(InteractionArtifact):
+            value = getattr(artifact, field.name)
+            if isinstance(value, np.ndarray):
+                self.assertTrue(
+                    value.flags.c_contiguous,
+                    msg=f"non-C-contiguous artifact field {field.name}",
+                )
+
     def test_assembly_sorts_clips_and_preserves_every_source_field(self):
         clips = labeled_clips_for_objects(["z_object", "a_object"])
         clips[0].motion.table_position[:] = [9.0, 8.0, 7.0]

@@ -136,6 +136,14 @@ def _assemble_ordered_database(
         ),
         source_frames=frames("source_frames"),
     )
+    for field in dataclasses.fields(artifact):
+        value = getattr(artifact, field.name)
+        if isinstance(value, np.ndarray):
+            setattr(
+                artifact,
+                field.name,
+                np.ascontiguousarray(value),
+            )
     artifact.validate()
     return artifact
 
