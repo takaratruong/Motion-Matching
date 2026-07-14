@@ -1871,7 +1871,13 @@ int main(void)
         fprintf(stderr, "G1 reset error: %s\n", artifact_error);
         return 2;
     }
-    state.route_index = configured_route_index;
+    auto configure_route_cursor = [&](g1_controller_state& current)
+    {
+        current.route_index = configured_route_index;
+        current.route_waypoint = configured_route_index >= 0 ? 1 : 0;
+        current.route_frames = 0;
+    };
+    configure_route_cursor(state);
 
     if (test_config.mode == G1_TestSequential) {
         const int sequential_frames =
@@ -2129,7 +2135,7 @@ int main(void)
             {
                 ++scene_generation;
                 ++scene_reset_count;
-                state.route_index = configured_route_index;
+                configure_route_cursor(state);
             }
             pending_reset = false;
             if (controller_exit_requested) return;
@@ -2162,6 +2168,7 @@ int main(void)
             }
             else
             {
+                configure_route_cursor(state);
                 ++scene_generation;
                 ++scene_reset_count;
             }

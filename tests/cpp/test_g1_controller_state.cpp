@@ -128,6 +128,18 @@ static std::string read_controller_source()
     return read_source(path, "controller source opens and reads");
 }
 
+static std::size_t count_occurrences(
+    const std::string& source, const char* needle)
+{
+    std::size_t count = 0;
+    std::size_t position = 0;
+    while ((position = source.find(needle, position)) != std::string::npos) {
+        ++count;
+        position += std::char_traits<char>::length(needle);
+    }
+    return count;
+}
+
 static void test_active_scene_sources_use_checked_v2_queries()
 {
     const std::string controller_source = read_controller_source();
@@ -218,6 +230,30 @@ static void test_failed_model_load_reaches_counted_shared_cleanup()
               close != std::string::npos && cleanup != std::string::npos &&
               log_close < unload && unload < close && close < cleanup,
           "failed startup reaches counted unload, window close, and report");
+}
+
+static void test_controller_marks_no_route_cursor_inactive_after_resets()
+{
+    const std::string source = read_controller_source();
+    const std::size_t helper = source.find("auto configure_route_cursor");
+    const std::size_t camera = source.find("// Camera", helper);
+    check(helper != std::string::npos && camera != std::string::npos,
+          "controller defines route cursor configuration before runtime");
+    const std::string configuration = source.substr(helper, camera - helper);
+    check(configuration.find(
+              "current.route_index = configured_route_index;") !=
+              std::string::npos &&
+              configuration.find(
+                  "current.route_waypoint = configured_route_index >= 0 ? "
+                  "1 : 0;") !=
+                  std::string::npos &&
+              configuration.find("current.route_frames = 0;") !=
+                  std::string::npos,
+          "inactive modes expose waypoint zero while route mode starts at one");
+    check(
+        count_occurrences(source, "configure_route_cursor(state);") == 3,
+        "startup, current-scene reset, and successful switch configure the "
+        "route cursor");
 }
 
 static bool same_vec3(const vec3& first, const vec3& second)
@@ -858,6 +894,7 @@ int main()
     test_active_scene_sources_use_checked_v2_queries();
     test_controller_wires_idle_match_transition_cost();
     test_failed_model_load_reaches_counted_shared_cleanup();
+    test_controller_marks_no_route_cursor_inactive_after_resets();
     test_idle_match_transition_cost_policy();
     test_scene_first_frame_seeds_desired_trajectory();
     test_reset_clears_every_dynamic_subsystem();
