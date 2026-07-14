@@ -453,18 +453,18 @@ g++ -O3 -ffast-math -march=native -DNDEBUG -D_DEFAULT_SOURCE \
 
 Expected: exit `0` and executable `/tmp/controller_g1_wide`.
 
-- [ ] **Step 3: Load all fourteen scenes through one ordered cycle**
+- [ ] **Step 3: Load all fourteen scenes through two ordered cycles**
 
 ```bash
 DISPLAY=:1 G1_TERRAIN_DIR=resources/g1_terrain \
-  MM_TEST_MODE=scene-cycle MM_SCENE_DWELL_FRAMES=25 MM_TEST_FRAMES=350 \
+  MM_TEST_MODE=scene-cycle MM_SCENE_DWELL_FRAMES=25 MM_TEST_FRAMES=700 \
   MM_TERRAIN_WEIGHT=4 \
   MM_LOG=/tmp/g1-wide-scene-cycle.csv \
   MM_CLEANUP_LOG=/tmp/g1-wide-scene-cycle-cleanup.json \
   /tmp/controller_g1_wide
 ```
 
-Run `resources/check_g1_runtime_log.py --gate-f` with the exact comma-separated `REQUIRED_SCENE_IDS` order. Expected: fourteen generations, one motion-pack load, finite rows, successful cleanup, and every scene loaded/unloaded exactly once.
+Run `resources/check_g1_runtime_log.py --gate-f` with the exact comma-separated `REQUIRED_SCENE_IDS` order. Expected: `complete_cycles=2`, 28 generations, one motion-pack load, finite rows, successful cleanup, and every scene loaded/unloaded exactly twice. Gate F intentionally requires at least two complete ordered cycles; a 350-frame single-cycle run is only a loader smoke and does not satisfy the gate.
 
 - [ ] **Step 4: Perform the 60-second rendered smoke without killing the old visualizer**
 
