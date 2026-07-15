@@ -84,8 +84,11 @@ interaction::InteractionTarget demo_target(
         read_vec3(database.object_positions, frame_index),
         read_quat(database.object_rotations, frame_index),
     };
+    target.object_profile_id = 1U;
     target.object_dimensions = read_vec3(
         database.object_dimensions, clip_index);
+    target.object_bounds = {
+        vec3(), target.object_dimensions * 0.5F};
     target.table_world = {
         read_vec3(database.table_positions, clip_index),
         read_quat(database.table_rotations, clip_index),
@@ -161,6 +164,11 @@ std::string_view reason_name(interaction::Reason reason) {
     case Reason::LostContact: return "LostContact";
     case Reason::ClipEnded: return "ClipEnded";
     case Reason::Reset: return "Reset";
+    case Reason::SurfaceUnavailable: return "SurfaceUnavailable";
+    case Reason::SurfaceChanged: return "SurfaceChanged";
+    case Reason::PlacementOutOfBounds: return "PlacementOutOfBounds";
+    case Reason::ReleasePosition: return "ReleasePosition";
+    case Reason::ReleaseOrientation: return "ReleaseOrientation";
     }
     throw std::logic_error("invalid reason");
 }

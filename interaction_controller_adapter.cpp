@@ -1247,7 +1247,10 @@ InteractionTarget make_controller_demo_target(const Database& database) {
     target.table_world.position.z = 3.0F;
     target.object_world = compose(target.table_world, object_in_table);
     target.table_size = clip_vector(database.table_sizes, 0U);
+    target.object_profile_id = 1U;
     target.object_dimensions = clip_vector(database.object_dimensions, 0U);
+    target.object_bounds = {
+        vec3(), target.object_dimensions * 0.5F};
     target.state = ObjectState::Free;
 
     GraspAffordance affordance;

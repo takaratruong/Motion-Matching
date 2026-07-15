@@ -1529,6 +1529,42 @@ void test_stale_generation_is_rejected() {
     assert_free(fixture.registry, replacement);
 }
 
+void test_align_rejects_profile_or_bounds_snapshot_changes() {
+    using namespace interaction;
+
+    for (int mutation = 0; mutation < 2; ++mutation) {
+        RuntimeFixture fixture = make_runtime_fixture();
+        InteractionRuntime runtime(
+            fixture.database,
+            fixture.features,
+            fixture.registry,
+            RuntimeConfig{});
+        RuntimeOutput output = enter_align(runtime, fixture);
+        assert(output.diagnostics.state == RuntimeState::Align);
+
+        InteractionTarget* authoritative = fixture.registry.find(
+            fixture.request.target);
+        assert(authoritative != nullptr);
+        if (mutation == 0) {
+            ++authoritative->object_profile_id;
+        } else {
+            authoritative->object_bounds.center_object.z += 0.001F;
+        }
+
+        output = advance(runtime, fixture.locomotion);
+        assert(output.diagnostics.state == RuntimeState::Locomotion);
+        assert(output.diagnostics.result == ResultCode::Rejected);
+        assert(output.diagnostics.reason == Reason::TargetChanged);
+        assert(!output.diagnostics.attached);
+        assert(!output.owns_pose && !output.suppress_steering);
+        const InteractionTarget* released = fixture.registry.find(
+            fixture.request.target);
+        assert(released != nullptr);
+        assert(released->state == ObjectState::Free);
+        assert(released->owner_request == 0U);
+    }
+}
+
 void test_failed_reservation_never_releases_an_existing_owner() {
     using namespace interaction;
     RuntimeFixture fixture = make_runtime_fixture();
@@ -1837,6 +1873,7 @@ int main() {
     test_post_ik_precontact_sweep_cannot_cross_the_expanded_object();
     test_canonical_clearance_visits_curved_precontact_samples();
     test_stale_generation_is_rejected();
+    test_align_rejects_profile_or_bounds_snapshot_changes();
     test_failed_reservation_never_releases_an_existing_owner();
     test_runtime_config_is_validated_before_reservation();
     test_exception_after_reservation_rolls_back_and_can_retry();

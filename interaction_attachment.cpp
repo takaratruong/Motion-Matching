@@ -62,6 +62,13 @@ bool exact_target_core(
     const InteractionTarget& right) {
     return left.handle == right.handle &&
            exact(left.object_world, right.object_world) &&
+           left.object_profile_id == right.object_profile_id &&
+           exact(
+               left.object_bounds.center_object,
+               right.object_bounds.center_object) &&
+           exact(
+               left.object_bounds.half_extents_object,
+               right.object_bounds.half_extents_object) &&
            exact(left.object_dimensions, right.object_dimensions) &&
            exact(left.table_world, right.table_world) &&
            exact(left.table_size, right.table_size) &&

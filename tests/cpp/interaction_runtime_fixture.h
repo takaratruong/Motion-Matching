@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -246,7 +247,10 @@ inline InteractionTarget make_target() {
     InteractionTarget target{};
     target.handle = kTargetHandle;
     target.object_world = {vec3(0.0F, 0.75F, 3.0F), quat()};
+    target.object_profile_id = 3001U;
     target.object_dimensions = vec3(0.08F, 0.20F, 0.08F);
+    target.object_bounds = {
+        vec3(), vec3(0.04F, 0.10F, 0.04F)};
     target.table_world = {vec3(0.0F, 0.35F, 3.0F), quat()};
     target.table_size = vec3(1.0F, 0.70F, 1.0F);
     target.affordances = {{
@@ -256,6 +260,16 @@ inline InteractionTarget make_target() {
         vec3(0.0F, 0.0F, -1.0F),
         0.04F,
     }};
+    assert(target.object_profile_id != 0U);
+    assert(target.object_bounds.center_object.x == 0.0F);
+    assert(target.object_bounds.center_object.y == 0.0F);
+    assert(target.object_bounds.center_object.z == 0.0F);
+    assert(target.object_bounds.half_extents_object.x ==
+           target.object_dimensions.x * 0.5F);
+    assert(target.object_bounds.half_extents_object.y ==
+           target.object_dimensions.y * 0.5F);
+    assert(target.object_bounds.half_extents_object.z ==
+           target.object_dimensions.z * 0.5F);
     return target;
 }
 

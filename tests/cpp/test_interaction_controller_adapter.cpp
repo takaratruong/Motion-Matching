@@ -3206,6 +3206,10 @@ void test_scene_handoff_publishes_each_fresh_25_hz_sample_without_lag() {
     ControllerInteractionSceneHandoff handoff;
     InteractionTarget target;
     target.handle = {40, 2};
+    target.object_profile_id = 4001U;
+    target.object_dimensions = vec3(0.08F, 0.20F, 0.08F);
+    target.object_bounds = {
+        vec3(), vec3(0.04F, 0.10F, 0.04F)};
     target.state = ObjectState::Held;
     target.object_world = {
         vec3(-3.0F, 0.5F, 4.0F),
@@ -3277,6 +3281,10 @@ void test_scene_handoff_publishes_fresh_equal_plateau_samples_exactly() {
     ControllerInteractionSceneHandoff handoff;
     InteractionTarget target;
     target.handle = {44, 6};
+    target.object_profile_id = 4001U;
+    target.object_dimensions = vec3(0.08F, 0.20F, 0.08F);
+    target.object_bounds = {
+        vec3(), vec3(0.04F, 0.10F, 0.04F)};
     target.state = ObjectState::Held;
     target.object_world = {
         vec3(-5.0F, 0.5F, 4.0F),
@@ -3329,6 +3337,10 @@ void test_scene_handoff_publishes_fresh_rotation_and_holds_only_explicit_cache()
     ControllerInteractionSceneHandoff handoff;
     InteractionTarget target;
     target.handle = {41, 3};
+    target.object_profile_id = 4001U;
+    target.object_dimensions = vec3(0.08F, 0.20F, 0.08F);
+    target.object_bounds = {
+        vec3(), vec3(0.04F, 0.10F, 0.04F)};
     target.state = ObjectState::Attached;
     target.object_world = Transform{};
     const Transform authored_fallback = target.object_world;
@@ -3392,6 +3404,10 @@ void test_scene_handoff_retains_post_failure_held_pose_until_registry_reclaims_a
     ControllerInteractionSceneHandoff handoff;
     InteractionTarget target;
     target.handle = {41, 3};
+    target.object_profile_id = 4001U;
+    target.object_dimensions = vec3(0.08F, 0.20F, 0.08F);
+    target.object_bounds = {
+        vec3(), vec3(0.04F, 0.10F, 0.04F)};
     target.state = ObjectState::Attached;
     target.object_world = {
         vec3(2.0F, 0.8F, 3.0F),
@@ -3500,6 +3516,10 @@ void test_scene_handoff_rejects_invalid_alpha_atomically() {
     ControllerInteractionSceneHandoff handoff;
     InteractionTarget target;
     target.handle = {55, 7};
+    target.object_profile_id = 4001U;
+    target.object_dimensions = vec3(0.08F, 0.20F, 0.08F);
+    target.object_bounds = {
+        vec3(), vec3(0.04F, 0.10F, 0.04F)};
     target.state = ObjectState::Held;
     target.object_world = {
         vec3(-2.0F, 0.5F, 3.0F),
@@ -3648,6 +3668,11 @@ void test_demo_target_preserves_object_in_table_transform() {
         interaction::make_controller_demo_target(database);
     assert(target.handle.id != 0U);
     assert(target.handle.generation != 0U);
+    assert(target.object_profile_id != 0U);
+    assert_vec_near(target.object_bounds.center_object, vec3());
+    assert_vec_near(
+        target.object_bounds.half_extents_object,
+        target.object_dimensions * 0.5F);
     assert(near(target.table_world.position.x, 0.0F));
     assert(near(target.table_world.position.y, source_table.position.y));
     assert(near(target.table_world.position.z, 3.0F));

@@ -110,6 +110,17 @@ void validate_target(const InteractionTarget& target) {
             "interaction target generation must be nonzero");
     }
     validate_transform(target.object_world, "object transform");
+    if (target.object_profile_id == 0U) {
+        throw std::invalid_argument(
+            "interaction target object profile ID must be nonzero");
+    }
+    if (!finite(target.object_bounds.center_object)) {
+        throw std::invalid_argument(
+            "interaction target invalid object bounds center");
+    }
+    validate_positive_size(
+        target.object_bounds.half_extents_object,
+        "object bounds half extents");
     validate_positive_size(target.object_dimensions, "object dimensions");
     validate_transform(target.table_world, "table transform");
     validate_positive_size(target.table_size, "table size");

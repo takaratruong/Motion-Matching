@@ -100,6 +100,7 @@ CPP_TEST_BINS := $(CPP_TEST_DIR)/test_g1_skeleton
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_database
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_pose
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_target
+CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_place_target
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_features
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_matcher
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_playback
@@ -151,6 +152,9 @@ $(CPP_TEST_DIR)/test_interaction_pose: tests/cpp/test_interaction_pose.cpp inter
 
 $(CPP_TEST_DIR)/test_interaction_target: tests/cpp/test_interaction_target.cpp interaction_target.cpp interaction_target.h interaction_pose.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_target.cpp interaction_target.cpp -o $@
+
+$(CPP_TEST_DIR)/test_interaction_place_target: tests/cpp/test_interaction_place_target.cpp interaction_place_target.cpp interaction_place_target.h interaction_matcher.h interaction_features.h interaction_target.h interaction_pose.cpp interaction_pose.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_place_target.cpp interaction_place_target.cpp interaction_pose.cpp -o $@
 
 $(RELEASE_FAST_MATH_TARGET_TEST): tests/cpp/test_interaction_target.cpp interaction_target.cpp interaction_target.h interaction_pose.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) -O3 -DNDEBUG -ffast-math tests/cpp/test_interaction_target.cpp interaction_target.cpp -o $@

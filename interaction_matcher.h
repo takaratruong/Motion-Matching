@@ -32,6 +32,11 @@ enum class Reason : uint8_t {
     LostContact,
     ClipEnded,
     Reset,
+    SurfaceUnavailable,
+    SurfaceChanged,
+    PlacementOutOfBounds,
+    ReleasePosition,
+    ReleaseOrientation,
 };
 
 struct MatchConfig {

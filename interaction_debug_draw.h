@@ -121,6 +121,11 @@ inline const char* reason_name(Reason reason) {
     case Reason::LostContact: return "LostContact";
     case Reason::ClipEnded: return "ClipEnded";
     case Reason::Reset: return "Reset";
+    case Reason::SurfaceUnavailable: return "SurfaceUnavailable";
+    case Reason::SurfaceChanged: return "SurfaceChanged";
+    case Reason::PlacementOutOfBounds: return "PlacementOutOfBounds";
+    case Reason::ReleasePosition: return "ReleasePosition";
+    case Reason::ReleaseOrientation: return "ReleaseOrientation";
     }
     return "Unknown";
 }

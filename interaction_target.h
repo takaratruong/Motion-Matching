@@ -22,6 +22,11 @@ struct TargetHandle {
     }
 };
 
+struct ObjectLocalBounds {
+    vec3 center_object{};
+    vec3 half_extents_object{};
+};
+
 struct GraspAffordance {
     uint32_t id = 0;
     Hand hand = Hand::Right;
@@ -33,6 +38,8 @@ struct GraspAffordance {
 struct InteractionTarget {
     TargetHandle handle{};
     Transform object_world{};
+    uint64_t object_profile_id = 0;
+    ObjectLocalBounds object_bounds{};
     vec3 object_dimensions{};
     Transform table_world{};
     vec3 table_size{};

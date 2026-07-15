@@ -63,7 +63,10 @@ AttachmentFixture make_fixture() {
         vec3(0.35F, 0.72F, -0.45F),
         quat_from_angle_axis(0.31F, vec3(0.0F, 1.0F, 0.0F)),
     };
+    target.object_profile_id = 2001U;
     target.object_dimensions = vec3(0.08F, 0.20F, 0.12F);
+    target.object_bounds = {
+        vec3(), vec3(0.04F, 0.10F, 0.06F)};
     target.table_world = {
         vec3(0.0F, 0.65F, -0.30F),
         quat_from_angle_axis(-0.13F, vec3(0.0F, 1.0F, 0.0F)),
@@ -81,6 +84,11 @@ AttachmentFixture make_fixture() {
     target.affordances = {affordance};
 
     const TargetHandle handle = fixture.registry.upsert(target);
+    assert(target.object_profile_id != 0U);
+    assert(near(target.object_bounds.center_object, vec3()));
+    assert(near(
+        target.object_bounds.half_extents_object,
+        target.object_dimensions * 0.5F));
     fixture.request = {handle, affordance.id, 7001};
     assert(fixture.registry.reserve(handle, fixture.request.request_id));
     fixture.target = *fixture.registry.find(handle);
@@ -730,6 +738,28 @@ void assert_begin_rejected(
 void test_begin_rejects_incoherent_or_unreserved_inputs() {
     using namespace interaction;
 
+    {
+        AttachmentFixture fixture = make_fixture();
+        InteractionTarget wrong_profile = fixture.target;
+        ++wrong_profile.object_profile_id;
+        assert_begin_rejected(
+            fixture,
+            wrong_profile,
+            fixture.request,
+            fixture.affordance,
+            Reason::TargetChanged);
+    }
+    {
+        AttachmentFixture fixture = make_fixture();
+        InteractionTarget wrong_bounds = fixture.target;
+        wrong_bounds.object_bounds.center_object.x += 0.001F;
+        assert_begin_rejected(
+            fixture,
+            wrong_bounds,
+            fixture.request,
+            fixture.affordance,
+            Reason::TargetChanged);
+    }
     {
         AttachmentFixture fixture = make_fixture();
         InteractionTarget stale = fixture.target;

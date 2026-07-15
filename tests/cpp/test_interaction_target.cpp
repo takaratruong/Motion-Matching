@@ -77,6 +77,13 @@ bool exact(
     const interaction::InteractionTarget& right) {
     if (left.handle != right.handle ||
         !exact(left.object_world, right.object_world) ||
+        left.object_profile_id != right.object_profile_id ||
+        !exact(
+            left.object_bounds.center_object,
+            right.object_bounds.center_object) ||
+        !exact(
+            left.object_bounds.half_extents_object,
+            right.object_bounds.half_extents_object) ||
         !exact(left.object_dimensions, right.object_dimensions) ||
         !exact(left.table_world, right.table_world) ||
         !exact(left.table_size, right.table_size) ||
@@ -102,7 +109,10 @@ interaction::InteractionTarget make_target_with_affordance_ids(
     InteractionTarget target{};
     target.handle = {id, generation};
     target.object_world = {vec3(0.0F, 0.75F, 0.5F), quat()};
+    target.object_profile_id = 1001U;
     target.object_dimensions = vec3(0.08F, 0.20F, 0.08F);
+    target.object_bounds = {
+        vec3(), vec3(0.04F, 0.10F, 0.04F)};
     target.table_world = {vec3(0.0F, 0.70F, 0.5F), quat()};
     target.table_size = vec3(1.0F, 0.1F, 1.0F);
     for (uint32_t affordance_id : affordance_ids) {
@@ -135,6 +145,7 @@ interaction::InteractionTarget make_target_with_dimensions(
     vec3 dimensions) {
     interaction::InteractionTarget target = make_target(id, generation);
     target.object_dimensions = dimensions;
+    target.object_bounds = {vec3(), dimensions * 0.5F};
     return target;
 }
 
@@ -147,12 +158,23 @@ void test_public_records() {
     static_assert(std::is_same_v<decltype(PickRequest{}.target), TargetHandle>);
     static_assert(std::is_same_v<decltype(PickRequest{}.affordance_id), uint32_t>);
     static_assert(std::is_same_v<decltype(PickRequest{}.request_id), uint64_t>);
+    static_assert(std::is_same_v<
+        decltype(InteractionTarget{}.object_profile_id), uint64_t>);
+    static_assert(std::is_same_v<
+        decltype(InteractionTarget{}.object_bounds), ObjectLocalBounds>);
 
     const PickRequest request{TargetHandle{7, 2}, 5, 42};
     TEST_CHECK(request.target == (TargetHandle{7, 2}));
     TEST_CHECK(request.affordance_id == 5);
     TEST_CHECK(request.request_id == 42);
     TEST_CHECK((TargetHandle{7, 2}) != (TargetHandle{7, 3}));
+
+    const InteractionTarget target = make_target(7, 2);
+    TEST_CHECK(target.object_profile_id == 1001U);
+    TEST_CHECK(exact(target.object_bounds.center_object, vec3()));
+    TEST_CHECK(exact(
+        target.object_bounds.half_extents_object,
+        target.object_dimensions * 0.5F));
 }
 
 void test_registry_and_resolver() {
@@ -294,6 +316,31 @@ void test_registry_mutation_validation_is_strict_and_transactional() {
             target.object_dimensions.z = 0.0F;
         }},
         {+[](InteractionTarget& target) {
+            target.object_profile_id = 0U;
+        }},
+        {+[](InteractionTarget& target) {
+            target.object_bounds.center_object.x =
+                std::numeric_limits<float>::quiet_NaN();
+        }},
+        {+[](InteractionTarget& target) {
+            target.object_bounds.center_object.z =
+                std::numeric_limits<float>::infinity();
+        }},
+        {+[](InteractionTarget& target) {
+            target.object_bounds.half_extents_object.x = 0.0F;
+        }},
+        {+[](InteractionTarget& target) {
+            target.object_bounds.half_extents_object.y = -0.01F;
+        }},
+        {+[](InteractionTarget& target) {
+            target.object_bounds.half_extents_object.z =
+                std::numeric_limits<float>::quiet_NaN();
+        }},
+        {+[](InteractionTarget& target) {
+            target.object_bounds.half_extents_object.x =
+                std::numeric_limits<float>::infinity();
+        }},
+        {+[](InteractionTarget& target) {
             target.table_world.position.z =
                 std::numeric_limits<float>::infinity();
         }},
@@ -423,6 +470,14 @@ void test_nonfinite_mutations_reject_with_assertions_disabled() {
         }},
         {+[](InteractionTarget& target) {
             target.table_size.z = std::numeric_limits<float>::infinity();
+        }},
+        {+[](InteractionTarget& target) {
+            target.object_bounds.center_object.y =
+                std::numeric_limits<float>::quiet_NaN();
+        }},
+        {+[](InteractionTarget& target) {
+            target.object_bounds.half_extents_object.x =
+                std::numeric_limits<float>::infinity();
         }},
         {+[](InteractionTarget& target) {
             target.affordances.front().clearance_radius =
