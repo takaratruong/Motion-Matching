@@ -320,6 +320,55 @@ vec3 desired_velocity_update(
     return quat_mul_vec3(simulation_rotation, local_desired_velocity);
 }
 
+vec3 controller_place_staging_stick(
+    const interaction::PlaceStagingPreview& preview,
+    const interaction::Transform& current_root,
+    float camera_azimuth)
+{
+    if (!preview.accepted || preview.ready)
+    {
+        return vec3();
+    }
+
+    vec3 root_error_world =
+        preview.staging_root_world.position - current_root.position;
+    root_error_world.y = 0.0F;
+    vec3 world_command;
+    if (preview.root_error_m > 0.02F && length(root_error_world) > 1.0e-5F)
+    {
+        const float position_weight = clampf(
+            preview.root_error_m / 0.75F, 0.20F, 1.00F);
+        world_command = position_weight * normalize(root_error_world);
+    }
+
+    if (preview.yaw_error_radians > 0.02F)
+    {
+        vec3 staging_facing = quat_mul_vec3(
+            preview.staging_root_world.rotation,
+            vec3(0.0F, 0.0F, 1.0F));
+        staging_facing.y = 0.0F;
+        if (length(staging_facing) > 1.0e-5F)
+        {
+            const float yaw_weight = 0.25F * clampf(
+                preview.yaw_error_radians /
+                    interaction::kPlaceStagingMaximumYawErrorRadians,
+                0.0F,
+                1.0F);
+            world_command = world_command +
+                yaw_weight * normalize(staging_facing);
+        }
+    }
+
+    const float command_length = length(world_command);
+    if (command_length > 1.0F)
+    {
+        world_command = world_command / command_length;
+    }
+    const quat camera_control_basis = quat_from_angle_axis(
+        camera_azimuth, vec3(0.0F, 1.0F, 0.0F));
+    return quat_inv_mul_vec3(camera_control_basis, world_command);
+}
+
 quat desired_rotation_update(
     const quat desired_rotation,
     const vec3 gamepadstick_left,
@@ -2477,9 +2526,14 @@ int main(void)
     std::optional<interaction::Database> interaction_database;
     std::optional<interaction::Features> interaction_features;
     interaction::TargetRegistry interaction_registry;
+    interaction::PlacementSurfaceRegistry interaction_surface_registry;
+    interaction::PlaceMotionLibrary interaction_place_library{};
     interaction::RuntimeConfig interaction_config{};
     interaction::TargetHandle interaction_scene_target_handle{};
+    interaction::SurfaceHandle interaction_destination_surface_handle{};
+    uint32_t interaction_destination_affordance_id = 0U;
     interaction::InteractionTarget interaction_authored_target{};
+    interaction::PlacementSurface interaction_authored_destination_surface{};
     bool interaction_pack_loaded = false;
     std::string interaction_pack_diagnostic;
 
@@ -2509,11 +2563,28 @@ int main(void)
                 interaction_registry.find(interaction_scene_target_handle);
             assert(registered_target != nullptr);
             interaction_authored_target = *registered_target;
+
+            interaction::PlacementSurface destination_surface =
+                interaction::make_controller_demo_destination_surface(
+                    *interaction_database, interaction_authored_target);
+            assert(destination_surface.affordances.size() == 1U);
+            interaction_destination_affordance_id =
+                destination_surface.affordances.front().id;
+            interaction_destination_surface_handle =
+                interaction_surface_registry.upsert(destination_surface);
+            const interaction::PlacementSurface* registered_destination =
+                interaction_surface_registry.find(
+                    interaction_destination_surface_handle);
+            assert(registered_destination != nullptr);
+            interaction_authored_destination_surface =
+                *registered_destination;
             interaction_pack_loaded = true;
             return interaction::InteractionRuntime(
                 *interaction_database,
                 *interaction_features,
                 interaction_registry,
+                interaction_surface_registry,
+                interaction_place_library,
                 interaction_config);
         }
         catch (const interaction::FormatError& error)
@@ -2869,6 +2940,38 @@ int main(void)
     interaction::ControllerInteractionFrameState interaction_frame_state{};
     std::optional<interaction::Pose> latest_owned_interaction_pose;
 
+    auto resolve_manual_place_target =
+        [&](const interaction::LocomotionSnapshot& snapshot)
+            -> std::optional<interaction::ControllerPlaceTarget>
+    {
+        if (!interaction_pack_loaded)
+        {
+            return std::nullopt;
+        }
+        if (autodemo_configuration.has_value())
+        {
+            throw std::logic_error(
+                "autodemo invoked the manual place resolver");
+        }
+        const std::optional<interaction::SurfaceHandle> surface_handle =
+            interaction_surface_registry.resolve_single_surface(
+                snapshot.pose.positions[0], 1.00F);
+        if (!surface_handle.has_value())
+        {
+            return std::nullopt;
+        }
+        const interaction::PlacementSurface* surface =
+            interaction_surface_registry.find(*surface_handle);
+        if (surface == nullptr || surface->affordances.size() != 1U)
+        {
+            return std::nullopt;
+        }
+        return interaction::ControllerPlaceTarget{
+            *surface_handle,
+            surface->affordances.front().id,
+            interaction_next_request_id++};
+    };
+
     auto make_flat_controller_pose = [&]()
     {
         interaction::FlatControllerPose pose;
@@ -3089,6 +3192,17 @@ int main(void)
                     autodemo_action = AutodemoAction::Forward;
                 }
             }
+        }
+        if (!autodemo_configuration.has_value() &&
+            !interaction_edges.cancel_pressed &&
+            !interaction_edges.reset_pressed &&
+            interaction_scheduler.place_preview().has_value())
+        {
+            gamepadstick_left = controller_place_staging_stick(
+                *interaction_scheduler.place_preview(),
+                interaction::Transform{
+                    simulation_position, simulation_rotation},
+                camera_azimuth);
         }
 
         // Get if strafe is desired
@@ -3625,6 +3739,14 @@ int main(void)
                         target->affordances.front().id,
                         interaction_next_request_id++};
                 },
+                resolve_manual_place_target,
+                [&interaction_runtime](
+                    interaction::SurfaceHandle surface,
+                    uint32_t affordance_id)
+                {
+                    return interaction_runtime.preview_place(
+                        surface, affordance_id);
+                },
                 [&](const interaction::RuntimeInput& input)
                 {
                     return interaction_runtime.update(input);
@@ -3662,6 +3784,15 @@ int main(void)
         {
             interaction_scene_target = &interaction_authored_target;
         }
+        const interaction::PlacementSurface* interaction_destination_surface =
+            interaction_surface_registry.find(
+                interaction_destination_surface_handle);
+        if (interaction_destination_surface == nullptr &&
+            interaction_pack_loaded)
+        {
+            interaction_destination_surface =
+                &interaction_authored_destination_surface;
+        }
         const interaction::ControllerInteractionSceneState
             interaction_scene_state = interaction_scene_handoff.apply(
                 interaction_scene_target,
@@ -3681,6 +3812,10 @@ int main(void)
         if (selected_constraint_target != nullptr &&
             interaction_scene_target == selected_constraint_target &&
             selected_affordance != nullptr &&
+            (selected_constraint_target->state ==
+                 interaction::ObjectState::Attached ||
+             selected_constraint_target->state ==
+                 interaction::ObjectState::Held) &&
             selected_affordance->hand == interaction_output.diagnostics.hand)
         {
             interaction::ControllerInteractionHandConstraint constraint;
@@ -4017,6 +4152,9 @@ int main(void)
         interaction::debug_draw::draw_interaction_scene(
             interaction_scene_target,
             interaction_scene_state.object_world,
+            interaction_destination_surface,
+            interaction_destination_affordance_id,
+            interaction_scheduler.place_preview(),
             interaction_output,
             interaction_predicted_roots,
             interaction_debug_pose,
@@ -4060,6 +4198,7 @@ int main(void)
 
         interaction::debug_draw::draw_interaction_text(
             interaction_output,
+            interaction_scheduler.place_preview(),
             interaction_pack_diagnostic.c_str(),
             340,
             20);

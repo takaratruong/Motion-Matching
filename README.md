@@ -149,11 +149,13 @@ make controller
 MM_INTERACTION_PACK=resources/g1_interaction ./controller
 ```
 
-Use WASD or the left gamepad stick to move, the arrow keys or right stick to control the camera/facing, and the existing walk/strafe controls for locomotion. Near the highlighted target, press `F` (gamepad right-face-left) to request pickup. Press `X` (right-face-up) to cancel while cancellation is allowed, and `R` (right-face-right) to reset the held object. Invalid or out-of-range requests leave the object unmoved and report a diagnostic reason.
+Use WASD or the left gamepad stick to move, the arrow keys or right stick to control the camera/facing, and the existing walk/strafe controls for locomotion. Near the highlighted target, press `F` (gamepad right-face-left) to request pickup or placement. The authored destination table copies the source table dimensions and sits exactly 1.20 m farther along world +Z. While carrying, move within the manual 1.00 m surface-selection envelope and press `F`; the controller then stages through the ordinary Carry movement input and submits placement only from a newly ready runtime preview. Press `X` (right-face-up) to clear staging or cancel while cancellation is allowed, and `R` (right-face-right) to reset the held object. Invalid or out-of-range requests leave the object unmoved and report a diagnostic reason.
+
+The manual demo intentionally supplies no recorded place clips, so its successful placement mode is `ReversedPickup`. On release, the object remains at the destination table with that table's support context and is immediately available for a later pickup.
 
 `MM_INTERACTION_PACK` overrides the runtime pack. `MM_FEATURES_OUTPUT` overrides the ordinary locomotion feature output while retaining the existing `resources/features.bin` default. `MM_INTERACTION_AUTODEMO=1` is reserved for deterministic evidence generation and requires both `MM_INTERACTION_LOG` and `MM_INTERACTION_SCREENSHOT`; their values must be nonempty and distinct, and both must have existing parent directories. Malformed paths, unavailable packs, unexpected runtime states, evidence I/O failures, window closure, and internal or external timeouts produce a nonzero exit.
 
-The playable baseline selects one contiguous pickup for one authored tabletop target; staged interaction matching, multi-object selection, placement, shelves, and articulated doors/drawers are follow-on work.
+The playable baseline selects one contiguous pickup for one authored tabletop target and one authored tabletop destination. Multi-object selection, shelves, and articulated doors/drawers are follow-on work.
 
 # Web Demo
 

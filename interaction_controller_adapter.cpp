@@ -762,6 +762,107 @@ const RuntimeOutput& ControllerInteractionScheduler::tick(
     return cached_output_;
 }
 
+const RuntimeOutput& ControllerInteractionScheduler::tick(
+    ControllerInteractionEdges edges,
+    const LocomotionProvider& locomotion_provider,
+    const PickRequestResolver& request_resolver,
+    const PlaceTargetResolver& place_target_resolver,
+    const PlacePreviewResolver& place_preview_resolver,
+    const RuntimeUpdate& runtime_update) {
+    updated_last_tick_ = false;
+    pending_interact_ = pending_interact_ || edges.interact_pressed;
+    pending_cancel_ = pending_cancel_ || edges.cancel_pressed;
+    pending_reset_ = pending_reset_ || edges.reset_pressed;
+
+    phase_ += kInteractionRuntimeRate;
+    if (phase_ < kControllerRate) {
+        return cached_output_;
+    }
+    phase_ -= kControllerRate;
+
+    const std::optional<ControllerPlaceTarget> prior_latched_place =
+        latched_place_;
+    const std::optional<PlaceStagingPreview> prior_place_preview =
+        place_preview_;
+    const bool prior_place_submitted = place_submitted_;
+    try {
+        RuntimeInput input;
+        input.dt = kInteractionRuntimeStepSeconds;
+        input.locomotion = locomotion_provider();
+        input.cancel_pressed = pending_cancel_;
+        input.reset_pressed = pending_reset_;
+
+        if (pending_cancel_ || pending_reset_) {
+            latched_place_.reset();
+            place_preview_.reset();
+            place_submitted_ = false;
+        }
+
+        if (cached_output_.diagnostics.state == RuntimeState::Locomotion &&
+            place_submitted_) {
+            latched_place_.reset();
+            place_preview_.reset();
+            place_submitted_ = false;
+        }
+        if (cached_output_.diagnostics.state == RuntimeState::Carry &&
+            place_submitted_) {
+            latched_place_.reset();
+            place_preview_.reset();
+            place_submitted_ = false;
+        }
+
+        if (!pending_cancel_ && !pending_reset_ && pending_interact_ &&
+            cached_output_.diagnostics.state == RuntimeState::Locomotion) {
+            input.interact_pressed = true;
+            input.pick_request = request_resolver(input.locomotion);
+        } else if (!pending_cancel_ && !pending_reset_ && pending_interact_ &&
+                   cached_output_.diagnostics.state == RuntimeState::Carry) {
+            latched_place_ = place_target_resolver(input.locomotion);
+            place_preview_.reset();
+            place_submitted_ = false;
+        }
+
+        if (!pending_cancel_ && !pending_reset_ &&
+            latched_place_.has_value() &&
+            !place_submitted_ &&
+            cached_output_.diagnostics.state == RuntimeState::Carry) {
+            const PlaceStagingPreview preview = place_preview_resolver(
+                latched_place_->surface,
+                latched_place_->affordance_id);
+            place_preview_ = preview;
+            const bool live_ready = preview.accepted && preview.ready &&
+                preview.root_error_m <= kPlaceStagingMaximumRootErrorM &&
+                preview.yaw_error_radians <=
+                kPlaceStagingMaximumYawErrorRadians &&
+                preview.candidate.selection_id != 0U &&
+                latched_place_->request_id != 0U;
+            if (live_ready) {
+                input.interact_pressed = true;
+                input.place_request = PlaceRequest{
+                    cached_output_.diagnostics.target,
+                    latched_place_->surface,
+                    latched_place_->affordance_id,
+                    latched_place_->request_id,
+                    preview.candidate.selection_id};
+                place_submitted_ = true;
+            }
+        }
+
+        RuntimeOutput next_output = runtime_update(input);
+        cached_output_ = std::move(next_output);
+        updated_last_tick_ = true;
+        pending_interact_ = false;
+        pending_cancel_ = false;
+        pending_reset_ = false;
+        return cached_output_;
+    } catch (...) {
+        latched_place_ = prior_latched_place;
+        place_preview_ = prior_place_preview;
+        place_submitted_ = prior_place_submitted;
+        throw;
+    }
+}
+
 int ControllerInteractionScheduler::phase() const {
     return phase_;
 }
@@ -772,6 +873,16 @@ bool ControllerInteractionScheduler::updated_last_tick() const {
 
 const RuntimeOutput& ControllerInteractionScheduler::cached_output() const {
     return cached_output_;
+}
+
+const std::optional<ControllerPlaceTarget>&
+ControllerInteractionScheduler::latched_place() const {
+    return latched_place_;
+}
+
+const std::optional<PlaceStagingPreview>&
+ControllerInteractionScheduler::place_preview() const {
+    return place_preview_;
 }
 
 ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
@@ -1065,6 +1176,19 @@ ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
             }
         }
 
+        const bool hand_constraint_epoch_ended =
+            ownership_hand_constraint_.has_value() &&
+            (runtime_output.diagnostics.target !=
+                 ownership_hand_constraint_->target ||
+             runtime_output.diagnostics.affordance_id !=
+                 ownership_hand_constraint_->affordance_id ||
+             runtime_output.diagnostics.hand !=
+                 ownership_hand_constraint_->hand);
+        if (hand_constraint_epoch_ended) {
+            target_rig_arm_ik_.reset();
+            ownership_hand_constraint_.reset();
+        }
+
         if (target_rig_arm_ik_.active()) {
             state.hand_constraint_calibration_rotation =
                 target_rig_arm_ik_.calibration_rotation();
@@ -1264,6 +1388,79 @@ InteractionTarget make_controller_demo_target(const Database& database) {
         clip_vector(database.approach_directions_object, 0U);
     target.affordances.push_back(affordance);
     return target;
+}
+
+PlacementSurface make_controller_demo_destination_surface(
+    const Database& database,
+    const InteractionTarget& source_target) {
+    if (database.clip_count == 0U || database.range_starts.empty() ||
+        database.range_stops.empty()) {
+        throw FormatError("interaction database has no clip 0");
+    }
+    const int32_t start = database.range_starts.at(0);
+    const int32_t stop = database.range_stops.at(0);
+    int32_t lift = -1;
+    for (int32_t frame = start; frame < stop; ++frame) {
+        if (database.phases.at(static_cast<size_t>(frame)) ==
+            static_cast<uint8_t>(Phase::Lift)) {
+            lift = frame;
+            break;
+        }
+    }
+    if (lift <= start) {
+        throw FormatError("clip 0 has no stable pre-lift object sample");
+    }
+
+    const Transform source_table = clip_transform(
+        database.table_positions, database.table_rotations, 0U);
+    const vec3 source_table_size = clip_vector(database.table_sizes, 0U);
+    const Transform stable_source_object = frame_transform(
+        database.object_positions,
+        database.object_rotations,
+        static_cast<size_t>(lift - 1));
+    const Transform source_surface_world = compose(
+        source_table,
+        Transform{
+            vec3(0.0F, 0.5F * source_table_size.y, 0.0F), quat()});
+    const vec3 source_table_normal = quat_mul_vec3(
+        source_table.rotation, vec3(0.0F, 1.0F, 0.0F));
+    const float projection_distance = dot(
+        source_surface_world.position - stable_source_object.position,
+        source_table_normal);
+    const vec3 projected_support_world =
+        stable_source_object.position +
+        projection_distance * source_table_normal;
+    const vec3 support_point_object = compose(
+        inverse(stable_source_object),
+        Transform{projected_support_world, quat()}).position;
+    const Transform source_object_in_surface = compose(
+        inverse(source_surface_world), stable_source_object);
+
+    Transform destination_table = source_target.table_world;
+    destination_table.position.z += 1.20F;
+    PlacementSurface destination;
+    destination.handle = {2U, 1U};
+    destination.support_volume_world = destination_table;
+    destination.support_volume_size = source_target.table_size;
+    destination.surface_world = compose(
+        destination_table,
+        Transform{
+            vec3(0.0F, 0.5F * source_target.table_size.y, 0.0F), quat()});
+    destination.half_extent_x_m = 0.5F * source_target.table_size.x;
+    destination.half_extent_z_m = 0.5F * source_target.table_size.z;
+    destination.overhead_clearance_m = 2.00F;
+
+    PlaceAffordance affordance;
+    affordance.id = 1U;
+    affordance.object_in_surface.rotation =
+        source_object_in_surface.rotation;
+    affordance.object_in_surface.position = -quat_mul_vec3(
+        affordance.object_in_surface.rotation, support_point_object);
+    affordance.support_point_object = support_point_object;
+    affordance.approach_direction_surface = vec3(0.0F, 1.0F, 0.0F);
+    affordance.clearance_radius = 0.04F;
+    destination.affordances.push_back(affordance);
+    return destination;
 }
 
 void validate_controller_interaction_pack(

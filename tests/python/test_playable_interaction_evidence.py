@@ -2264,6 +2264,215 @@ class Task12PolicyTests(unittest.TestCase):
             "25 Hz scene publication must not add render interpolation lag",
         )
 
+    def test_controller_authors_one_destination_and_retains_direct_identity(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        adapter = Path("interaction_controller_adapter.cpp").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(
+            controller.count("interaction::PlacementSurface destination_surface"),
+            1,
+            "scene construction must author exactly one destination surface",
+        )
+        for required in (
+            "interaction::make_controller_demo_destination_surface(",
+            "interaction::PlacementSurfaceRegistry interaction_surface_registry;",
+            "interaction::PlaceMotionLibrary interaction_place_library{};",
+            "interaction_destination_surface_handle =\n"
+            "                interaction_surface_registry.upsert(destination_surface);",
+            "interaction_destination_affordance_id =\n"
+            "                destination_surface.affordances.front().id;",
+            "interaction_surface_registry,\n"
+            "                interaction_place_library,",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, controller)
+        self.assertNotIn(
+            "interaction_place_library.recorded.push_back",
+            controller,
+            "manual demo must force the reviewed ReversedPickup fallback",
+        )
+        self.assertIn("destination_table.position.z += 1.20F;", adapter)
+        self.assertIn(
+            "destination.support_volume_world = destination_table;", adapter
+        )
+        self.assertIn(
+            "destination.support_volume_size = source_target.table_size;", adapter
+        )
+        self.assertIn("destination.overhead_clearance_m = 2.00F;", adapter)
+        self.assertIn("projected_support_world", adapter)
+        self.assertIn("inverse(stable_source_object)", adapter)
+        self.assertNotIn("object_bounds", self._cpp_function(
+            adapter,
+            "PlacementSurface make_controller_demo_destination_surface(",
+        ))
+
+    def test_manual_place_resolver_is_the_only_nearby_surface_lookup(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        self.assertEqual(
+            controller.count("resolve_single_surface("),
+            1,
+            "only manual F may invoke the nearby-surface resolver",
+        )
+        resolver = self._source_between(
+            controller,
+            "    auto resolve_manual_place_target =",
+            "    auto make_flat_controller_pose =",
+        )
+        self.assertIn("resolve_single_surface(", resolver)
+        self.assertIn("1.00F", resolver)
+        self.assertIn("ControllerPlaceTarget", resolver)
+        self.assertNotIn(
+            "interaction_destination_surface_handle", resolver,
+            "manual nearby lookup must not replace stable scripted identity",
+        )
+        for required in (
+            "interaction_destination_surface_handle",
+            "interaction_destination_affordance_id",
+        ):
+            with self.subTest(required=required):
+                self.assertGreaterEqual(
+                    controller.count(required),
+                    2,
+                    "scene must retain the exact authored destination pair",
+                )
+
+    def test_place_preview_callback_is_narrow_and_runtime_owned(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        adapter = Path("interaction_controller_adapter.h").read_text(
+            encoding="utf-8"
+        )
+        self.assertRegex(
+            adapter,
+            r"using\s+PlacePreviewResolver\s*=\s*std::function<\s*"
+            r"PlaceStagingPreview\(\s*SurfaceHandle,\s*uint32_t\s*\)\s*>;",
+            "scheduler preview callback must accept only handle and affordance",
+        )
+        callback = re.search(
+            r"\[&interaction_runtime\]\(\s*"
+            r"interaction::SurfaceHandle\s+surface,\s*"
+            r"uint32_t\s+affordance_id\s*\)\s*"
+            r"\{(?P<body>.*?)\n\s*\}",
+            controller,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(
+            callback,
+            "controller must capture only runtime in the narrow preview lambda",
+        )
+        body = callback.group("body") if callback else ""
+        self.assertRegex(
+            body,
+            r"return\s+interaction_runtime\.preview_place\(\s*"
+            r"surface,\s*affordance_id\s*\)\s*;",
+        )
+        for forbidden in (
+            "Pose", "object", "candidate", "library", "timing",
+            "match", "IK", "config", "PlaceMatchInput",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, body)
+        self.assertEqual(controller.count("interaction_runtime.preview_place("), 1)
+        for forbidden in (
+            "preview_place_motion(",
+            "select_place_motion(",
+            "PlaceMatchInput",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, controller)
+
+    def test_scheduler_submits_only_newly_recomputed_ready_place_preview(self):
+        adapter = Path("interaction_controller_adapter.cpp").read_text(
+            encoding="utf-8"
+        )
+        for required in (
+            "cached_output_.diagnostics.state == RuntimeState::Locomotion",
+            "cached_output_.diagnostics.state == RuntimeState::Carry",
+            "place_target_resolver(input.locomotion)",
+            "place_preview_resolver(\n"
+            "                latched_place_->surface,\n"
+            "                latched_place_->affordance_id)",
+            "preview.root_error_m <= kPlaceStagingMaximumRootErrorM",
+            "preview.yaw_error_radians <=\n"
+            "                kPlaceStagingMaximumYawErrorRadians",
+            "preview.candidate.selection_id",
+            "input.place_request = PlaceRequest{",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, adapter)
+        self.assertIn("pending_cancel_", adapter)
+        self.assertIn("latched_place_.reset();", adapter)
+        self.assertNotIn("resolve_single_target(", adapter)
+        self.assertNotIn("resolve_single_surface(", adapter)
+
+    def test_place_staging_uses_camera_left_stick_without_root_writes(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        staging = self._cpp_function(
+            controller, "vec3 controller_place_staging_stick("
+        )
+        for required in (
+            "preview.staging_root_world.position - current_root.position",
+            "preview.root_error_m",
+            "preview.yaw_error_radians",
+            "camera_control_basis",
+            "quat_inv_mul_vec3(camera_control_basis, world_command)",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, staging)
+        for forbidden in (
+            "simulation_position =",
+            "simulation_rotation =",
+            "bone_positions(",
+            "displayed_pose",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, staging)
+
+        stick_assignment = controller.index(
+            "gamepadstick_left = controller_place_staging_stick("
+        )
+        velocity_update = controller.index(
+            "vec3 desired_velocity_curr = desired_velocity_update("
+        )
+        self.assertLess(
+            stick_assignment,
+            velocity_update,
+            "place staging must enter through ordinary Carry input",
+        )
+        self.assertNotRegex(
+            controller,
+            r"(?:simulation_position|bone_positions\(0\))\s*=\s*"
+            r"[^;]*staging_root_world",
+            "staging may never write simulation or displayed root",
+        )
+
+    def test_controller_keeps_pick_and_release_registry_policies_separate(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        self.assertEqual(
+            controller.count("interaction_registry.resolve_single_target("),
+            1,
+            "only the Locomotion pick resolver may select a target",
+        )
+        self.assertNotIn("interaction_registry.reset(", controller)
+        self.assertNotIn("interaction_registry.replace_pose(", controller)
+        self.assertIn("interaction_registry.find_by_id(", controller)
+        self.assertIn(
+            "Interaction: F pick/place  X cancel  R reset",
+            Path("interaction_debug_draw.h").read_text(encoding="utf-8"),
+        )
+
+    def test_readme_documents_manual_destination_and_reversed_pickup(self):
+        readme = Path("README.md").read_text(encoding="utf-8")
+        for required in (
+            "F` (gamepad right-face-left) to request pickup or placement",
+            "1.00 m",
+            "1.20 m",
+            "ReversedPickup",
+            "25 Hz",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, readme)
+
     def test_controller_uses_exact_23_pose_bridge_and_flat_toe_indices(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")
         adapter = Path("interaction_controller_adapter.h").read_text(

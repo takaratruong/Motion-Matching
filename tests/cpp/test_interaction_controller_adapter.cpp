@@ -20,6 +20,7 @@ namespace {
 using interaction::ControllerInteractionEdges;
 using interaction::ControllerInteractionFrameHandoff;
 using interaction::ControllerInteractionHandConstraint;
+using interaction::ControllerPlaceTarget;
 using interaction::ControllerInteractionFrameState;
 using interaction::ControllerInteractionSceneHandoff;
 using interaction::ControllerInteractionSceneState;
@@ -33,6 +34,7 @@ using interaction::InteractionTarget;
 using interaction::LocomotionSnapshot;
 using interaction::ObjectState;
 using interaction::Phase;
+using interaction::PlaceStagingPreview;
 using interaction::PickRequest;
 using interaction::Pose;
 using interaction::Reason;
@@ -40,6 +42,7 @@ using interaction::ResultCode;
 using interaction::RuntimeInput;
 using interaction::RuntimeOutput;
 using interaction::RuntimeState;
+using interaction::SurfaceHandle;
 using interaction::TargetHandle;
 using interaction::Transform;
 
@@ -936,6 +939,250 @@ void test_cache_changes_only_after_successful_due_delivery() {
     assert(scheduler.updated_last_tick());
     assert(!output_fields_equal(scheduler.cached_output(), initial));
     assert(scheduler.phase() == 0);
+}
+
+void test_scheduler_latches_carry_place_and_submits_only_live_ready_preview() {
+    ControllerInteractionScheduler scheduler;
+    const ControllerPlaceTarget destination{
+        SurfaceHandle{901U, 4U}, 77U, 3001U};
+    const TargetHandle held_target{42U, 8U};
+    int pick_resolver_calls = 0;
+    int place_resolver_calls = 0;
+    int preview_calls = 0;
+    std::vector<RuntimeInput> delivered;
+
+    auto snapshot_provider = [] {
+        LocomotionSnapshot snapshot = make_snapshot(2.0F);
+        snapshot.pose.positions[0] = vec3(1.0F, 0.0F, 2.0F);
+        return snapshot;
+    };
+    auto pick_resolver = [&](const LocomotionSnapshot&)
+        -> std::optional<PickRequest> {
+        ++pick_resolver_calls;
+        return std::nullopt;
+    };
+    auto place_resolver = [&](const LocomotionSnapshot& snapshot)
+        -> std::optional<ControllerPlaceTarget> {
+        ++place_resolver_calls;
+        require_vec_near(
+            snapshot.pose.positions[0],
+            vec3(1.0F, 0.0F, 2.0F),
+            "manual place resolver received the wrong live root");
+        return destination;
+    };
+    auto preview_resolver = [&](SurfaceHandle surface, uint32_t affordance_id) {
+        ++preview_calls;
+        require(
+            surface == destination.surface &&
+                affordance_id == destination.affordance_id,
+            "place preview did not receive the exact latched identity");
+        PlaceStagingPreview preview{};
+        preview.accepted = true;
+        preview.ready = preview_calls >= 2;
+        preview.root_error_m = preview.ready ? 0.20F : 0.80F;
+        preview.yaw_error_radians = preview.ready ? 0.20F : 0.60F;
+        preview.candidate.selection_id = preview.ready ? 222U : 111U;
+        preview.staging_root_world = {
+            vec3(1.25F, 0.0F, 2.10F),
+            quat_from_angle_axis(0.20F, vec3(0.0F, 1.0F, 0.0F))};
+        return preview;
+    };
+    auto runtime_update = [&](const RuntimeInput& input) {
+        delivered.push_back(input);
+        RuntimeOutput output;
+        output.owns_pose = true;
+        output.diagnostics.state = delivered.size() >= 3U
+            ? RuntimeState::PlacePreflight
+            : RuntimeState::Carry;
+        output.diagnostics.target = held_target;
+        output.diagnostics.object_state = ObjectState::Held;
+        output.diagnostics.attached = true;
+        return output;
+    };
+
+    (void)scheduler.tick(
+        {}, snapshot_provider, pick_resolver, place_resolver,
+        preview_resolver, runtime_update);
+    require(
+        delivered.size() == 1U &&
+            delivered.back().interact_pressed == false,
+        "Carry setup unexpectedly pulsed Interact");
+
+    (void)scheduler.tick(
+        {true, false, false},
+        snapshot_provider,
+        pick_resolver,
+        place_resolver,
+        preview_resolver,
+        runtime_update);
+    require(place_resolver_calls == 1, "Carry F did not resolve one surface");
+    require(pick_resolver_calls == 0, "Carry F invoked the pick resolver");
+    require(preview_calls == 1, "Carry F did not compute its first preview");
+    require(
+        !delivered.back().interact_pressed &&
+            !delivered.back().place_request.has_value(),
+        "far Carry preview immediately pulsed runtime Place");
+    require(
+        scheduler.latched_place().has_value() &&
+            scheduler.latched_place()->surface == destination.surface &&
+            scheduler.latched_place()->affordance_id ==
+                destination.affordance_id,
+        "Carry F did not retain the exact destination identity");
+    require(
+        scheduler.place_preview().has_value() &&
+            scheduler.place_preview()->accepted &&
+            !scheduler.place_preview()->ready &&
+            scheduler.place_preview()->candidate.selection_id == 111U,
+        "far accepted preview lost its staging candidate");
+
+    (void)scheduler.tick(
+        {}, snapshot_provider, pick_resolver, place_resolver,
+        preview_resolver, runtime_update);
+    require(preview_calls == 2, "latched place was not previewed every tick");
+    require(
+        delivered.back().interact_pressed &&
+            delivered.back().place_request.has_value(),
+        "ready live preview did not pulse runtime Place once");
+    const interaction::PlaceRequest& request =
+        *delivered.back().place_request;
+    require(
+        request.held_target == held_target &&
+            request.surface == destination.surface &&
+            request.affordance_id == destination.affordance_id &&
+            request.request_id == destination.request_id &&
+            request.selection_id == 222U,
+        "Place request did not use the newly recomputed live preview");
+    require(
+        request.selection_id != 111U,
+        "Place request submitted the prior far preview selection");
+}
+
+void test_scheduler_cancel_clears_place_latch_before_another_preview() {
+    ControllerInteractionScheduler scheduler;
+    const ControllerPlaceTarget destination{
+        SurfaceHandle{902U, 5U}, 88U, 4001U};
+    int preview_calls = 0;
+    RuntimeOutput carry;
+    carry.owns_pose = true;
+    carry.diagnostics.state = RuntimeState::Carry;
+    carry.diagnostics.target = {52U, 2U};
+    carry.diagnostics.object_state = ObjectState::Held;
+    carry.diagnostics.attached = true;
+    auto update = [&](const RuntimeInput& input) {
+        if (input.cancel_pressed) {
+            require(
+                !input.interact_pressed &&
+                    !input.place_request.has_value(),
+                "Cancel delivered a Place request");
+        }
+        return carry;
+    };
+    auto no_pick = [](const LocomotionSnapshot&)
+        -> std::optional<PickRequest> { return std::nullopt; };
+    auto resolve_place = [&](const LocomotionSnapshot&)
+        -> std::optional<ControllerPlaceTarget> { return destination; };
+    auto preview = [&](SurfaceHandle, uint32_t) {
+        ++preview_calls;
+        PlaceStagingPreview result{};
+        result.accepted = true;
+        result.root_error_m = 1.0F;
+        result.yaw_error_radians = 1.0F;
+        result.candidate.selection_id = 123U;
+        return result;
+    };
+
+    (void)scheduler.tick(
+        {}, [] { return LocomotionSnapshot{}; }, no_pick,
+        resolve_place, preview, update);
+    (void)scheduler.tick(
+        {true, false, false},
+        [] { return LocomotionSnapshot{}; },
+        no_pick,
+        resolve_place,
+        preview,
+        update);
+    require(
+        scheduler.latched_place().has_value() && preview_calls == 1,
+        "place setup did not latch one preview");
+
+    (void)scheduler.tick(
+        {true, true, false},
+        [] { return LocomotionSnapshot{}; },
+        no_pick,
+        resolve_place,
+        preview,
+        update);
+    require(
+        !scheduler.latched_place().has_value() &&
+            !scheduler.place_preview().has_value(),
+        "X did not clear the latched place target and preview");
+    require(
+        preview_calls == 1,
+        "X recomputed a preview after clearing its latch");
+}
+
+void test_scheduler_reset_clears_place_latch_before_another_preview() {
+    ControllerInteractionScheduler scheduler;
+    const ControllerPlaceTarget destination{
+        SurfaceHandle{903U, 6U}, 89U, 4002U};
+    int preview_calls = 0;
+    RuntimeOutput carry;
+    carry.owns_pose = true;
+    carry.diagnostics.state = RuntimeState::Carry;
+    carry.diagnostics.target = {53U, 3U};
+    carry.diagnostics.object_state = ObjectState::Held;
+    carry.diagnostics.attached = true;
+    auto update = [&](const RuntimeInput& input) {
+        if (input.reset_pressed) {
+            require(
+                !input.interact_pressed &&
+                    !input.place_request.has_value(),
+                "Reset delivered a Place request");
+        }
+        return carry;
+    };
+    auto no_pick = [](const LocomotionSnapshot&)
+        -> std::optional<PickRequest> { return std::nullopt; };
+    auto resolve_place = [&](const LocomotionSnapshot&)
+        -> std::optional<ControllerPlaceTarget> { return destination; };
+    auto preview = [&](SurfaceHandle, uint32_t) {
+        ++preview_calls;
+        PlaceStagingPreview result{};
+        result.accepted = true;
+        result.root_error_m = 1.0F;
+        result.yaw_error_radians = 1.0F;
+        result.candidate.selection_id = 124U;
+        return result;
+    };
+
+    (void)scheduler.tick(
+        {}, [] { return LocomotionSnapshot{}; }, no_pick,
+        resolve_place, preview, update);
+    (void)scheduler.tick(
+        {true, false, false},
+        [] { return LocomotionSnapshot{}; },
+        no_pick,
+        resolve_place,
+        preview,
+        update);
+    require(
+        scheduler.latched_place().has_value() && preview_calls == 1,
+        "place setup did not latch one preview before reset");
+
+    (void)scheduler.tick(
+        {true, false, true},
+        [] { return LocomotionSnapshot{}; },
+        no_pick,
+        resolve_place,
+        preview,
+        update);
+    require(
+        !scheduler.latched_place().has_value() &&
+            !scheduler.place_preview().has_value(),
+        "R did not clear the latched place target and preview");
+    require(
+        preview_calls == 1,
+        "R recomputed a preview after clearing its latch");
 }
 
 void require_flat_pose_near(
@@ -2844,6 +3091,171 @@ void test_frame_handoff_release_is_continuous_and_relinquishes_after_blend() {
     require(relinquished, "release never relinquished visual override");
 }
 
+void test_all_place_states_keep_one_full_body_runtime_ownership_epoch() {
+    const FlatControllerPose locomotion = make_flat_pose();
+    const Pose raw_reference = interaction::expand_flat_controller_pose(
+        locomotion, make_pose(0.625F));
+    RuntimeOutput output = make_owned_output(raw_reference);
+    output.diagnostics.state = RuntimeState::Carry;
+    output.diagnostics.recorded_carry = false;
+    output.diagnostics.target = {80U, 3U};
+    output.diagnostics.object_state = ObjectState::Held;
+    output.diagnostics.attached = true;
+
+    ControllerInteractionFrameHandoff handoff;
+    (void)handoff.apply(
+        locomotion, output, interaction::kControllerStepSeconds);
+
+    FlatControllerPose place_pose = locomotion;
+    place_pose.positions[0] =
+        place_pose.positions[0] + vec3(0.65F, 0.10F, -0.35F);
+    place_pose.rotations[6] = quat_from_angle_axis(
+        0.55F, normalize(vec3(0.2F, 0.8F, 0.3F)));
+    place_pose.rotations[12] = quat_from_angle_axis(
+        0.35F, normalize(vec3(0.4F, 0.5F, 0.7F)));
+
+    const std::array<RuntimeState, 4> place_states = {
+        RuntimeState::PlacePreflight,
+        RuntimeState::PlaceAlign,
+        RuntimeState::PlaceReplay,
+        RuntimeState::PlaceRelease};
+    for (size_t index = 0; index < place_states.size(); ++index) {
+        place_pose.positions[0].x = place_pose.positions[0].x +
+            0.02F * static_cast<float>(index);
+        output.pose = interaction::expand_flat_controller_pose(
+            place_pose, raw_reference);
+        output.diagnostics.state = place_states[index];
+        if (place_states[index] == RuntimeState::PlaceRelease) {
+            output.diagnostics.target = {80U, 4U};
+            output.diagnostics.object_state = ObjectState::Free;
+            output.diagnostics.attached = false;
+        }
+        const ControllerInteractionFrameState frame = handoff.apply(
+            locomotion, output, interaction::kControllerStepSeconds);
+        require(
+            frame.runtime_owns_pose && frame.overrides_locomotion_pose,
+            "place state ended the runtime ownership epoch");
+        require(
+            frame.synchronize_simulation_root,
+            "full-body place state was treated as layered Carry");
+        require_flat_pose_near(
+            frame.pose,
+            place_pose,
+            "place state did not publish its full-body runtime pose");
+        require(
+            !flat_bone_channels_bits_equal(frame.pose, locomotion, 0U) &&
+                !flat_bone_channels_bits_equal(frame.pose, locomotion, 6U),
+            "place state replaced runtime root/legs with locomotion");
+    }
+}
+
+void test_place_release_generation_change_ends_constraint_without_free_object_solve() {
+    const FlatControllerPose locomotion = make_flat_pose();
+    const Pose raw_reference = interaction::expand_flat_controller_pose(
+        locomotion, make_pose(0.75F));
+    RuntimeOutput output = make_owned_output(raw_reference);
+    output.diagnostics.state = RuntimeState::PlaceAlign;
+    output.diagnostics.target = {81U, 6U};
+    output.diagnostics.affordance_id = 12U;
+    output.diagnostics.hand = Hand::Right;
+    output.diagnostics.object_state = ObjectState::Held;
+    output.diagnostics.attached = true;
+    output.diagnostics.hand_constraint_weight = 0.0F;
+    const ControllerInteractionHandConstraint held_constraint =
+        make_hand_constraint(output, locomotion, Hand::Right);
+
+    ControllerInteractionFrameHandoff handoff;
+    (void)handoff.apply(
+        locomotion,
+        output,
+        interaction::kControllerStepSeconds,
+        held_constraint);
+    output.diagnostics.hand_constraint_weight = 1.0F;
+    const ControllerInteractionFrameState held = handoff.apply(
+        locomotion,
+        output,
+        interaction::kControllerStepSeconds,
+        held_constraint);
+    require(
+        held.hand_constraint_result.applied,
+        "held setup did not activate the semantic hand constraint");
+
+    output.diagnostics.state = RuntimeState::PlaceRelease;
+    output.diagnostics.target = {81U, 7U};
+    output.diagnostics.object_state = ObjectState::Free;
+    output.diagnostics.attached = false;
+    ControllerInteractionHandConstraint free_constraint = held_constraint;
+    free_constraint.target = output.diagnostics.target;
+    free_constraint.grasp_world.position =
+        free_constraint.grasp_world.position +
+        vec3(0.30F, 0.10F, -0.20F);
+    const ControllerInteractionFrameState released = handoff.apply(
+        locomotion,
+        output,
+        interaction::kControllerStepSeconds,
+        free_constraint);
+    require(
+        released.runtime_owns_pose,
+        "atomic object release incorrectly ended pose ownership");
+    require(
+        !released.hand_constraint_validated &&
+            !released.hand_constraint_result.applied,
+        "new free target generation received an IK solve");
+
+    output.diagnostics.target = held_constraint.target;
+    output.diagnostics.object_state = ObjectState::Held;
+    output.diagnostics.attached = true;
+    const ControllerInteractionFrameState stale_generation = handoff.apply(
+        locomotion,
+        output,
+        interaction::kControllerStepSeconds,
+        held_constraint);
+    require(
+        !stale_generation.hand_constraint_validated &&
+            !stale_generation.hand_constraint_result.applied,
+        "ended hand-constraint epoch resurrected after generation rollback");
+}
+
+void test_normal_release_starts_at_last_displayed_place_release_pose() {
+    const FlatControllerPose locomotion = make_flat_pose();
+    FlatControllerPose place_release_pose = locomotion;
+    place_release_pose.positions[0] =
+        place_release_pose.positions[0] + vec3(0.45F, 0.20F, -0.30F);
+    place_release_pose.rotations[12] = quat_from_angle_axis(
+        0.70F, normalize(vec3(0.2F, 0.6F, 0.7F)));
+    const Pose raw_reference = interaction::expand_flat_controller_pose(
+        locomotion, make_pose(0.875F));
+    RuntimeOutput output = make_owned_output(raw_reference);
+    output.diagnostics.state = RuntimeState::PlaceRelease;
+    output.diagnostics.target = {82U, 9U};
+    output.diagnostics.object_state = ObjectState::Free;
+
+    ControllerInteractionFrameHandoff handoff;
+    (void)handoff.apply(
+        locomotion, output, interaction::kControllerStepSeconds);
+    output.pose = interaction::expand_flat_controller_pose(
+        place_release_pose, raw_reference);
+    const ControllerInteractionFrameState displayed = handoff.apply(
+        locomotion, output, interaction::kControllerStepSeconds);
+    require_flat_pose_near(
+        displayed.pose,
+        place_release_pose,
+        "PlaceRelease setup did not publish its final pose");
+
+    FlatControllerPose fresh_locomotion = locomotion;
+    fresh_locomotion.positions[0] =
+        fresh_locomotion.positions[0] + vec3(-2.0F, 0.0F, 1.5F);
+    const ControllerInteractionFrameState first_release = handoff.apply(
+        fresh_locomotion,
+        RuntimeOutput{},
+        interaction::kControllerStepSeconds);
+    require(
+        !first_release.runtime_owns_pose &&
+            first_release.overrides_locomotion_pose &&
+            flat_pose_bits_equal(first_release.pose, displayed.pose),
+        "0.25 second release did not start at the last PlaceRelease pose");
+}
+
 void test_frame_handoff_reset_and_reentry_capture_fresh_flat_reference() {
     const FlatControllerPose first_entry = make_flat_pose();
     RuntimeOutput owned = make_owned_output(make_pose(0.5F));
@@ -3512,6 +3924,63 @@ void test_scene_handoff_retains_post_failure_held_pose_until_registry_reclaims_a
         "registry authority reset retained old interpolation history");
 }
 
+void test_first_free_scene_sample_is_bit_exact_final_attached_runtime_pose() {
+    ControllerInteractionSceneHandoff handoff;
+    InteractionTarget attached_target;
+    attached_target.handle = {91U, 10U};
+    attached_target.state = ObjectState::Held;
+    attached_target.object_profile_id = 5001U;
+    attached_target.object_dimensions = vec3(0.08F, 0.20F, 0.08F);
+    attached_target.object_bounds = {
+        vec3(), vec3(0.04F, 0.10F, 0.04F)};
+    attached_target.object_world = {
+        vec3(-4.0F, 0.75F, 2.0F),
+        quat_from_angle_axis(-0.25F, vec3(0.0F, 1.0F, 0.0F))};
+    const Transform authored_fallback = attached_target.object_world;
+
+    RuntimeOutput attached_output;
+    attached_output.diagnostics.target = attached_target.handle;
+    attached_output.diagnostics.object_state = ObjectState::Held;
+    attached_output.diagnostics.attached = true;
+    attached_output.object_world = {
+        vec3(1.125F, 0.8125F, 4.375F),
+        -quat_from_angle_axis(0.625F, vec3(0.0F, 1.0F, 0.0F))};
+    const ControllerInteractionSceneState final_attached = handoff.apply(
+        &attached_target,
+        attached_output,
+        authored_fallback,
+        0.0F,
+        true);
+    require(
+        final_attached.runtime_authority &&
+            transform_bits_equal(
+                final_attached.object_world, attached_output.object_world),
+        "final attached runtime pose was not published exactly");
+
+    InteractionTarget free_target = attached_target;
+    free_target.handle = {91U, 11U};
+    free_target.state = ObjectState::Free;
+    free_target.object_world = attached_output.object_world;
+    free_target.table_world = {
+        vec3(0.0F, 0.35F, 4.20F), quat()};
+    free_target.table_size = vec3(1.0F, 0.70F, 1.0F);
+    RuntimeOutput stale_attached_output = attached_output;
+    const ControllerInteractionSceneState first_free = handoff.apply(
+        &free_target,
+        stale_attached_output,
+        authored_fallback,
+        0.0F,
+        false);
+    require(
+        !first_free.runtime_authority &&
+            transform_bits_equal(
+                first_free.object_world, final_attached.object_world),
+        "first Free registry sample differed bit-for-bit from final attachment");
+    require(
+        transform_bits_equal(first_free.object_world, free_target.object_world),
+        "first Free scene sample did not come directly from the registry");
+}
+
 void test_scene_handoff_rejects_invalid_alpha_atomically() {
     ControllerInteractionSceneHandoff handoff;
     InteractionTarget target;
@@ -3652,7 +4121,7 @@ void test_demo_target_preserves_object_in_table_transform() {
     database.object_positions.resize(12, 0.0F);
     database.object_rotations.resize(16, 0.0F);
     for (size_t frame = 0; frame < 4; ++frame) {
-        const Transform object = frame == 1
+        const Transform object = frame == 1 || frame == 2
             ? source_object
             : Transform{vec3(20.0F + static_cast<float>(frame), 0, 0), quat()};
         database.object_positions[frame * 3] = object.position.x;
@@ -3688,6 +4157,62 @@ void test_demo_target_preserves_object_in_table_transform() {
     const Transform selected_source = transform_from_arrays(
         database.object_positions, database.object_rotations, 1);
     assert_vec_near(selected_source.position, source_object.position);
+
+    const interaction::PlacementSurface destination =
+        interaction::make_controller_demo_destination_surface(
+            database, target);
+    assert(destination.handle.id != 0U);
+    assert(destination.handle.generation != 0U);
+    assert_vec_near(
+        destination.support_volume_world.position,
+        target.table_world.position + vec3(0.0F, 0.0F, 1.20F));
+    assert_same_rotation(
+        destination.support_volume_world.rotation,
+        target.table_world.rotation);
+    assert_vec_near(destination.support_volume_size, target.table_size);
+    const vec3 destination_normal = quat_mul_vec3(
+        destination.support_volume_world.rotation,
+        vec3(0.0F, 1.0F, 0.0F));
+    assert_vec_near(
+        destination.surface_world.position,
+        destination.support_volume_world.position +
+            destination_normal * (0.5F * target.table_size.y));
+    assert_same_rotation(
+        destination.surface_world.rotation,
+        destination.support_volume_world.rotation);
+    assert(near(destination.half_extent_x_m, 0.5F * target.table_size.x));
+    assert(near(destination.half_extent_z_m, 0.5F * target.table_size.z));
+    assert(near(destination.overhead_clearance_m, 2.00F));
+    assert(destination.affordances.size() == 1U);
+
+    const interaction::PlaceAffordance& place =
+        destination.affordances.front();
+    const vec3 source_normal = quat_mul_vec3(
+        source_table.rotation, vec3(0.0F, 1.0F, 0.0F));
+    const vec3 source_top = source_table.position +
+        source_normal * (0.5F * database.table_sizes[1]);
+    const vec3 to_top = source_top - source_object.position;
+    const float along_normal =
+        to_top.x * source_normal.x +
+        to_top.y * source_normal.y +
+        to_top.z * source_normal.z;
+    const vec3 projected_support =
+        source_object.position + along_normal * source_normal;
+    const vec3 expected_support_object = compose(
+        inverse(source_object), Transform{projected_support, quat()}).position;
+    assert_vec_near(place.support_point_object, expected_support_object);
+    const Transform destination_object = interaction::placement_goal_world(
+        destination, place.object_in_surface);
+    const vec3 destination_support = compose(
+        destination_object,
+        Transform{place.support_point_object, quat()}).position;
+    assert_vec_near(
+        destination_support,
+        destination.surface_world.position,
+        2.0e-5F);
+    assert_vec_near(
+        place.approach_direction_surface,
+        vec3(0.0F, 1.0F, 0.0F));
 }
 
 void test_cross_pack_frame_count_validation() {
@@ -3725,6 +4250,19 @@ void test_debug_draw_uses_real_correction_geometry_and_complete_text() {
     assert(debug.find("controller_carry_mode_label(output)") !=
            std::string::npos);
     assert(debug.find("runtime=25Hz controller=25Hz") != std::string::npos);
+    assert(debug.find("destination_surface->support_volume_world") !=
+           std::string::npos);
+    assert(debug.find("target->object_bounds.center_object") !=
+           std::string::npos);
+    assert(debug.find("placement_goal_world(") != std::string::npos);
+    assert(debug.find("approach_direction_surface") != std::string::npos);
+    assert(debug.find("staging_root_world") != std::string::npos);
+    assert(debug.find("root/yaw=%.3f/%.3f ready=%d") !=
+           std::string::npos);
+    assert(debug.find("actual fit=%d gap=%.3f low/high=%.3f/%.3f") !=
+           std::string::npos);
+    assert(debug.find("Interaction: F pick/place  X cancel  R reset") !=
+           std::string::npos);
 }
 
 void test_controller_and_make_clock_policy() {
@@ -3920,6 +4458,9 @@ int main() {
     test_scheduler_cadence_and_cache();
     test_edges_latch_coalesce_and_clear_after_delivery();
     test_cache_changes_only_after_successful_due_delivery();
+    test_scheduler_latches_carry_place_and_submits_only_live_ready_preview();
+    test_scheduler_cancel_clears_place_latch_before_another_preview();
+    test_scheduler_reset_clears_place_latch_before_another_preview();
     test_frame_handoff_first_owned_frame_is_exact_displayed_reference();
     test_frame_handoff_applies_validated_semantic_hand_constraint_and_releases_from_it();
     test_hand_constraint_keeps_layered_carry_lower_body_exact_and_selected_only();
@@ -3940,6 +4481,9 @@ int main() {
     test_inactive_arm_release_bounds_moving_target_and_spine();
     test_inactive_arm_return_to_recorded_target_is_bounded_and_convergent();
     test_frame_handoff_release_is_continuous_and_relinquishes_after_blend();
+    test_all_place_states_keep_one_full_body_runtime_ownership_epoch();
+    test_place_release_generation_change_ends_constraint_without_free_object_solve();
+    test_normal_release_starts_at_last_displayed_place_release_pose();
     test_frame_handoff_reset_and_reentry_capture_fresh_flat_reference();
     test_frame_handoff_preserves_fresh_complete_nonowned_pose_for_25_frames();
     test_frame_handoff_exposes_rendered_flat_root_sync();
@@ -3948,6 +4492,7 @@ int main() {
     test_scene_handoff_publishes_fresh_equal_plateau_samples_exactly();
     test_scene_handoff_publishes_fresh_rotation_and_holds_only_explicit_cache();
     test_scene_handoff_retains_post_failure_held_pose_until_registry_reclaims_authority();
+    test_first_free_scene_sample_is_bit_exact_final_attached_runtime_pose();
     test_scene_handoff_rejects_invalid_alpha_atomically();
     test_carry_label_is_only_specific_during_carry();
     test_demo_target_preserves_object_in_table_transform();

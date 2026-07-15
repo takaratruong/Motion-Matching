@@ -4,6 +4,7 @@
 #include "raylib.h"
 
 #include <array>
+#include <optional>
 
 namespace interaction::debug_draw {
 
@@ -167,6 +168,9 @@ inline const char* place_phase_name(PlacePhase phase) {
 inline void draw_interaction_scene(
     const InteractionTarget* target,
     const Transform& object_world,
+    const PlacementSurface* destination_surface,
+    uint32_t destination_affordance_id,
+    const std::optional<PlaceStagingPreview>& staged_preview,
     const RuntimeOutput& output,
     const std::array<vec3, 3>& predicted_roots,
     const Pose& displayed_pose,
@@ -182,6 +186,85 @@ inline void draw_interaction_scene(
         }
     }
 
+    if (destination_surface != nullptr) {
+        draw_oriented_box(
+            destination_surface->support_volume_world,
+            destination_surface->support_volume_size,
+            Fade(SKYBLUE, 0.20F),
+            BLUE);
+        draw_axes(destination_surface->surface_world, 0.22F);
+        const std::array<vec3, 4> top_local = {
+            vec3(
+                -destination_surface->half_extent_x_m,
+                0.0F,
+                -destination_surface->half_extent_z_m),
+            vec3(
+                +destination_surface->half_extent_x_m,
+                0.0F,
+                -destination_surface->half_extent_z_m),
+            vec3(
+                +destination_surface->half_extent_x_m,
+                0.0F,
+                +destination_surface->half_extent_z_m),
+            vec3(
+                -destination_surface->half_extent_x_m,
+                0.0F,
+                +destination_surface->half_extent_z_m)};
+        for (size_t edge = 0U; edge < top_local.size(); ++edge) {
+            DrawLine3D(
+                ray_vector(world_point(
+                    destination_surface->surface_world,
+                    top_local[edge])),
+                ray_vector(world_point(
+                    destination_surface->surface_world,
+                    top_local[(edge + 1U) % top_local.size()])),
+                BLUE);
+        }
+
+        const PlaceAffordance* destination_affordance = nullptr;
+        for (const PlaceAffordance& affordance :
+             destination_surface->affordances) {
+            if (affordance.id == destination_affordance_id) {
+                destination_affordance = &affordance;
+                break;
+            }
+        }
+        if (destination_affordance != nullptr) {
+            const Transform final_object_world = placement_goal_world(
+                *destination_surface,
+                destination_affordance->object_in_surface);
+            draw_axes(final_object_world, 0.20F);
+            const vec3 approach_world = quat_mul_vec3(
+                destination_surface->surface_world.rotation,
+                destination_affordance->approach_direction_surface);
+            DrawLine3D(
+                ray_vector(final_object_world.position),
+                ray_vector(
+                    final_object_world.position + 0.32F * approach_world),
+                DARKGREEN);
+        }
+    }
+
+    const PlaceStagingPreview* visible_preview = staged_preview.has_value()
+        ? &*staged_preview
+        : (output.diagnostics.place.preview_available
+               ? &output.diagnostics.place.preview
+               : nullptr);
+    if (visible_preview != nullptr && visible_preview->accepted) {
+        draw_axes(visible_preview->staging_root_world, 0.24F);
+        const vec3 displayed_root = displayed_pose.positions[0];
+        DrawLine3D(
+            ray_vector(displayed_root),
+            ray_vector(visible_preview->staging_root_world.position),
+            visible_preview->ready ? GREEN : ORANGE);
+        DrawSphereWires(
+            ray_vector(visible_preview->staging_root_world.position),
+            0.09F,
+            8,
+            12,
+            visible_preview->ready ? GREEN : ORANGE);
+    }
+
     if (target == nullptr) {
         return;
     }
@@ -192,8 +275,10 @@ inline void draw_interaction_scene(
         Fade(LIGHTGRAY, 0.35F),
         GRAY);
     draw_oriented_box(
-        object_world,
-        target->object_dimensions,
+        compose(
+            object_world,
+            Transform{target->object_bounds.center_object, quat()}),
+        target->object_bounds.half_extents_object * 2.0F,
         Fade(output.diagnostics.attached ? GOLD : VIOLET, 0.55F),
         output.diagnostics.attached ? ORANGE : PURPLE);
     draw_axes(target->table_world, 0.24F);
@@ -256,10 +341,16 @@ inline void draw_interaction_scene(
 
 inline void draw_interaction_text(
     const RuntimeOutput& output,
+    const std::optional<PlaceStagingPreview>& staged_preview,
     const char* pack_diagnostic,
     int x,
     int y) {
-    DrawText("Interaction: F pick  X cancel  R reset", x, y, 18, DARKPURPLE);
+    DrawText(
+        "Interaction: F pick/place  X cancel  R reset",
+        x,
+        y,
+        18,
+        DARKPURPLE);
     DrawText(
         TextFormat(
             "state=%s result=%s reason=%s clip=%d frame=%d",
@@ -341,22 +432,50 @@ inline void draw_interaction_text(
         y + 142,
         14,
         DARKGRAY);
+    const PlaceStagingPreview& visible_preview = staged_preview.has_value()
+        ? *staged_preview
+        : output.diagnostics.place.preview;
     DrawText(
         TextFormat(
-            "place IK=%.3f/%.3f fp=%llu source=%.3f",
-            output.diagnostics.place.effective_ik
-                .maximum_request_position_m,
-            output.diagnostics.place.effective_ik
-                .maximum_request_orientation_radians,
-            static_cast<unsigned long long>(
-                output.diagnostics.place.ik_config_fingerprint),
-            output.diagnostics.place.source_frame_exact),
+            "staging root/yaw=%.3f/%.3f ready=%d",
+            visible_preview.root_error_m,
+            visible_preview.yaw_error_radians,
+            visible_preview.ready ? 1 : 0),
         x,
         y + 162,
         14,
         DARKGRAY);
+    const IKConfig& effective_ik = staged_preview.has_value()
+        ? staged_preview->ik
+        : output.diagnostics.place.effective_ik;
+    const uint64_t ik_fingerprint = staged_preview.has_value()
+        ? staged_preview->ik_config_fingerprint
+        : output.diagnostics.place.ik_config_fingerprint;
+    DrawText(
+        TextFormat(
+            "place IK=%.3f/%.3f fp=%llu source=%.3f",
+            effective_ik.maximum_request_position_m,
+            effective_ik.maximum_request_orientation_radians,
+            static_cast<unsigned long long>(
+                ik_fingerprint),
+            output.diagnostics.place.source_frame_exact),
+        x,
+        y + 182,
+        14,
+        DARKGRAY);
+    DrawText(
+        TextFormat(
+            "actual fit=%d gap=%.3f low/high=%.3f/%.3f",
+            output.diagnostics.place.actual_fit.accepted ? 1 : 0,
+            output.diagnostics.place.actual_fit.support_gap_m,
+            output.diagnostics.place.actual_fit.lowest_corner_m,
+            output.diagnostics.place.actual_fit.highest_corner_m),
+        x,
+        y + 202,
+        14,
+        DARKGRAY);
     if (pack_diagnostic != nullptr && pack_diagnostic[0] != '\0') {
-        DrawText(pack_diagnostic, x, y + 182, 14, MAROON);
+        DrawText(pack_diagnostic, x, y + 222, 14, MAROON);
     }
 }
 

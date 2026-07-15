@@ -16,6 +16,8 @@ inline constexpr float kControllerStepSeconds =
     locomotion_timing::kStepSeconds;
 inline constexpr float kInteractionRuntimeStepSeconds =
     locomotion_timing::kStepSeconds;
+inline constexpr float kPlaceStagingMaximumRootErrorM = 0.25F;
+inline constexpr float kPlaceStagingMaximumYawErrorRadians = 0.436332313F;
 inline constexpr std::array<float, 14> kFlatControllerRestHandDof{};
 inline constexpr std::array<float, 14>
     kFlatControllerRestHandDofVelocities{};
@@ -81,11 +83,21 @@ struct ControllerInteractionEdges {
     bool reset_pressed = false;
 };
 
+struct ControllerPlaceTarget {
+    SurfaceHandle surface{};
+    uint32_t affordance_id = 0U;
+    uint64_t request_id = 0U;
+};
+
 class ControllerInteractionScheduler {
 public:
     using LocomotionProvider = std::function<LocomotionSnapshot()>;
     using PickRequestResolver = std::function<
         std::optional<PickRequest>(const LocomotionSnapshot&)>;
+    using PlaceTargetResolver = std::function<
+        std::optional<ControllerPlaceTarget>(const LocomotionSnapshot&)>;
+    using PlacePreviewResolver = std::function<
+        PlaceStagingPreview(SurfaceHandle, uint32_t)>;
     using RuntimeUpdate = std::function<RuntimeOutput(const RuntimeInput&)>;
 
     const RuntimeOutput& tick(
@@ -93,10 +105,19 @@ public:
         const LocomotionProvider& locomotion_provider,
         const PickRequestResolver& request_resolver,
         const RuntimeUpdate& runtime_update);
+    const RuntimeOutput& tick(
+        ControllerInteractionEdges edges,
+        const LocomotionProvider& locomotion_provider,
+        const PickRequestResolver& request_resolver,
+        const PlaceTargetResolver& place_target_resolver,
+        const PlacePreviewResolver& place_preview_resolver,
+        const RuntimeUpdate& runtime_update);
 
     int phase() const;
     bool updated_last_tick() const;
     const RuntimeOutput& cached_output() const;
+    const std::optional<ControllerPlaceTarget>& latched_place() const;
+    const std::optional<PlaceStagingPreview>& place_preview() const;
 
 private:
     int phase_ = 0;
@@ -105,6 +126,9 @@ private:
     bool pending_reset_ = false;
     bool updated_last_tick_ = false;
     RuntimeOutput cached_output_{};
+    std::optional<ControllerPlaceTarget> latched_place_{};
+    std::optional<PlaceStagingPreview> place_preview_{};
+    bool place_submitted_ = false;
 };
 
 struct ControllerInteractionFrameState {
@@ -182,6 +206,9 @@ private:
 const char* controller_carry_mode_label(const RuntimeOutput& output);
 
 InteractionTarget make_controller_demo_target(const Database& database);
+PlacementSurface make_controller_demo_destination_surface(
+    const Database& database,
+    const InteractionTarget& source_target);
 void validate_controller_interaction_pack(
     const Database& database,
     const Features& features);
