@@ -419,22 +419,23 @@ inline void draw_interaction_text(
         y + 122,
         16,
         DARKGRAY);
+    const RuntimePlaceDiagnostics place_debug =
+        controller_place_debug_diagnostics(output, staged_preview);
     DrawText(
         TextFormat(
-            "place=%s/%s preview=%d ready=%d reason=%s cfg=%d",
-            place_mode_name(output.diagnostics.place.mode),
-            place_phase_name(output.diagnostics.place.phase),
-            output.diagnostics.place.preview_available ? 1 : 0,
-            output.diagnostics.place.preview.ready ? 1 : 0,
-            reason_name(output.diagnostics.place.preview.reason),
-            output.diagnostics.place.preflight_config_identity ? 1 : 0),
+            "place=%s/%s preview=%d accepted=%d ready=%d reason=%s cfg=%d",
+            place_mode_name(place_debug.mode),
+            place_phase_name(place_debug.phase),
+            place_debug.preview_available ? 1 : 0,
+            place_debug.preview.accepted ? 1 : 0,
+            place_debug.preview.ready ? 1 : 0,
+            reason_name(place_debug.preview.reason),
+            place_debug.preflight_config_identity ? 1 : 0),
         x,
         y + 142,
         14,
         DARKGRAY);
-    const PlaceStagingPreview& visible_preview = staged_preview.has_value()
-        ? *staged_preview
-        : output.diagnostics.place.preview;
+    const PlaceStagingPreview& visible_preview = place_debug.preview;
     DrawText(
         TextFormat(
             "staging root/yaw=%.3f/%.3f ready=%d",

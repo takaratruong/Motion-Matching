@@ -3196,6 +3196,8 @@ int main(void)
         if (!autodemo_configuration.has_value() &&
             !interaction_edges.cancel_pressed &&
             !interaction_edges.reset_pressed &&
+            interaction_scheduler.cached_output().diagnostics.state ==
+                interaction::RuntimeState::Carry &&
             interaction_scheduler.place_preview().has_value())
         {
             gamepadstick_left = controller_place_staging_stick(

@@ -2439,6 +2439,17 @@ class Task12PolicyTests(unittest.TestCase):
             velocity_update,
             "place staging must enter through ordinary Carry input",
         )
+        steering_gate = self._source_between(
+            controller,
+            "        if (!autodemo_configuration.has_value() &&",
+            "        // Get if strafe is desired",
+        )
+        self.assertIn(
+            "interaction_scheduler.cached_output().diagnostics.state ==\n"
+            "                interaction::RuntimeState::Carry",
+            steering_gate,
+            "stale placement previews must not override Locomotion input",
+        )
         self.assertNotRegex(
             controller,
             r"(?:simulation_position|bone_positions\(0\))\s*=\s*"

@@ -1185,6 +1185,109 @@ void test_scheduler_reset_clears_place_latch_before_another_preview() {
         "R recomputed a preview after clearing its latch");
 }
 
+void test_scheduler_clears_far_place_when_carry_authority_ends() {
+    ControllerInteractionScheduler scheduler;
+    const ControllerPlaceTarget destination{
+        SurfaceHandle{904U, 7U}, 90U, 4003U};
+    int place_resolver_calls = 0;
+    int preview_calls = 0;
+    std::vector<RuntimeInput> delivered;
+
+    RuntimeOutput carry;
+    carry.owns_pose = true;
+    carry.diagnostics.state = RuntimeState::Carry;
+    carry.diagnostics.target = {54U, 4U};
+    carry.diagnostics.object_state = ObjectState::Held;
+    carry.diagnostics.attached = true;
+    RuntimeOutput next_output = carry;
+
+    auto no_pick = [](const LocomotionSnapshot&)
+        -> std::optional<PickRequest> { return std::nullopt; };
+    auto resolve_place = [&](const LocomotionSnapshot&)
+        -> std::optional<ControllerPlaceTarget> {
+        ++place_resolver_calls;
+        return destination;
+    };
+    auto preview = [&](SurfaceHandle surface, uint32_t affordance_id) {
+        ++preview_calls;
+        require(
+            surface == destination.surface &&
+                affordance_id == destination.affordance_id,
+            "stale-place test previewed the wrong destination");
+        PlaceStagingPreview result{};
+        result.accepted = true;
+        result.ready = false;
+        result.root_error_m = 0.80F;
+        result.yaw_error_radians = 0.60F;
+        result.candidate.selection_id = 125U;
+        return result;
+    };
+    auto update = [&](const RuntimeInput& input) {
+        delivered.push_back(input);
+        return next_output;
+    };
+    auto snapshot = [] { return LocomotionSnapshot{}; };
+
+    (void)scheduler.tick(
+        {}, snapshot, no_pick, resolve_place, preview, update);
+    (void)scheduler.tick(
+        {true, false, false},
+        snapshot,
+        no_pick,
+        resolve_place,
+        preview,
+        update);
+    require(
+        scheduler.latched_place().has_value() &&
+            scheduler.place_preview().has_value() &&
+            preview_calls == 1 && place_resolver_calls == 1,
+        "far Carry setup did not retain one manual placement preview");
+
+    RuntimeOutput locomotion;
+    locomotion.diagnostics.state = RuntimeState::Locomotion;
+    locomotion.diagnostics.target = {54U, 5U};
+    locomotion.diagnostics.object_state = ObjectState::Free;
+    next_output = locomotion;
+    (void)scheduler.tick(
+        {}, snapshot, no_pick, resolve_place, preview, update);
+    require(
+        !scheduler.latched_place().has_value() &&
+            !scheduler.place_preview().has_value(),
+        "external Carry authority loss retained far placement staging");
+    require(
+        !delivered.back().interact_pressed &&
+            !delivered.back().place_request.has_value(),
+        "external Carry authority loss submitted the far placement");
+    const int previews_after_authority_loss = preview_calls;
+
+    carry.diagnostics.target = {54U, 6U};
+    next_output = carry;
+    (void)scheduler.tick(
+        {}, snapshot, no_pick, resolve_place, preview, update);
+    (void)scheduler.tick(
+        {}, snapshot, no_pick, resolve_place, preview, update);
+    require(
+        preview_calls == previews_after_authority_loss &&
+            place_resolver_calls == 1,
+        "later Carry previewed the stale destination without a fresh F");
+    require(
+        !delivered.back().interact_pressed &&
+            !delivered.back().place_request.has_value(),
+        "later Carry submitted the stale destination without a fresh F");
+
+    (void)scheduler.tick(
+        {true, false, false},
+        snapshot,
+        no_pick,
+        resolve_place,
+        preview,
+        update);
+    require(
+        place_resolver_calls == 2 &&
+            preview_calls == previews_after_authority_loss + 1,
+        "fresh manual F did not start a new placement staging epoch");
+}
+
 void require_flat_pose_near(
     const FlatControllerPose& actual,
     const FlatControllerPose& expected,
@@ -4061,6 +4164,51 @@ void test_carry_label_is_only_specific_during_carry() {
            "layered");
 }
 
+void test_place_debug_status_prefers_active_controller_preview_values() {
+    RuntimeOutput output;
+    output.diagnostics.place.mode = interaction::PlaceMotionMode::RecordedPlace;
+    output.diagnostics.place.preview_available = false;
+    output.diagnostics.place.preview.accepted = false;
+    output.diagnostics.place.preview.ready = true;
+    output.diagnostics.place.preview.reason = Reason::SurfaceChanged;
+    output.diagnostics.place.preview.root_error_m = 0.10F;
+    output.diagnostics.place.preview.yaw_error_radians = 0.10F;
+
+    PlaceStagingPreview staged;
+    staged.accepted = true;
+    staged.ready = false;
+    staged.reason = Reason::None;
+    staged.candidate.mode = interaction::PlaceMotionMode::ReversedPickup;
+    staged.root_error_m = 0.80F;
+    staged.yaw_error_radians = 0.60F;
+
+    const interaction::RuntimePlaceDiagnostics active =
+        interaction::controller_place_debug_diagnostics(output, staged);
+    require(
+        active.mode == interaction::PlaceMotionMode::ReversedPickup &&
+            active.preview_available &&
+            active.preview.accepted &&
+            !active.preview.ready &&
+            active.preview.reason == Reason::None &&
+            active.preview.root_error_m >
+                interaction::kPlaceStagingMaximumRootErrorM &&
+            active.preview.yaw_error_radians >
+                interaction::kPlaceStagingMaximumYawErrorRadians,
+        "active far ReversedPickup staging did not own debug status values");
+
+    const interaction::RuntimePlaceDiagnostics fallback =
+        interaction::controller_place_debug_diagnostics(output, std::nullopt);
+    require(
+        fallback.mode == interaction::PlaceMotionMode::RecordedPlace &&
+            !fallback.preview_available &&
+            !fallback.preview.accepted &&
+            fallback.preview.ready &&
+            fallback.preview.reason == Reason::SurfaceChanged &&
+            near(fallback.preview.root_error_m, 0.10F) &&
+            near(fallback.preview.yaw_error_radians, 0.10F),
+        "debug status did not fall back to runtime placement diagnostics");
+}
+
 Transform transform_from_arrays(
     const std::vector<float>& positions,
     const std::vector<float>& rotations,
@@ -4258,6 +4406,11 @@ void test_debug_draw_uses_real_correction_geometry_and_complete_text() {
     assert(debug.find("approach_direction_surface") != std::string::npos);
     assert(debug.find("staging_root_world") != std::string::npos);
     assert(debug.find("root/yaw=%.3f/%.3f ready=%d") !=
+           std::string::npos);
+    assert(debug.find(
+               "controller_place_debug_diagnostics(output, staged_preview)") !=
+           std::string::npos);
+    assert(debug.find("preview=%d accepted=%d ready=%d reason=%s") !=
            std::string::npos);
     assert(debug.find("actual fit=%d gap=%.3f low/high=%.3f/%.3f") !=
            std::string::npos);
@@ -4461,6 +4614,7 @@ int main() {
     test_scheduler_latches_carry_place_and_submits_only_live_ready_preview();
     test_scheduler_cancel_clears_place_latch_before_another_preview();
     test_scheduler_reset_clears_place_latch_before_another_preview();
+    test_scheduler_clears_far_place_when_carry_authority_ends();
     test_frame_handoff_first_owned_frame_is_exact_displayed_reference();
     test_frame_handoff_applies_validated_semantic_hand_constraint_and_releases_from_it();
     test_hand_constraint_keeps_layered_carry_lower_body_exact_and_selected_only();
@@ -4495,6 +4649,7 @@ int main() {
     test_first_free_scene_sample_is_bit_exact_final_attached_runtime_pose();
     test_scene_handoff_rejects_invalid_alpha_atomically();
     test_carry_label_is_only_specific_during_carry();
+    test_place_debug_status_prefers_active_controller_preview_values();
     test_demo_target_preserves_object_in_table_transform();
     test_cross_pack_frame_count_validation();
     test_debug_draw_uses_real_correction_geometry_and_complete_text();

@@ -204,6 +204,9 @@ private:
 };
 
 const char* controller_carry_mode_label(const RuntimeOutput& output);
+RuntimePlaceDiagnostics controller_place_debug_diagnostics(
+    const RuntimeOutput& output,
+    const std::optional<PlaceStagingPreview>& staged_preview);
 
 InteractionTarget make_controller_demo_target(const Database& database);
 PlacementSurface make_controller_demo_destination_surface(

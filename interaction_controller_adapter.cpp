@@ -792,19 +792,8 @@ const RuntimeOutput& ControllerInteractionScheduler::tick(
         input.cancel_pressed = pending_cancel_;
         input.reset_pressed = pending_reset_;
 
-        if (pending_cancel_ || pending_reset_) {
-            latched_place_.reset();
-            place_preview_.reset();
-            place_submitted_ = false;
-        }
-
-        if (cached_output_.diagnostics.state == RuntimeState::Locomotion &&
-            place_submitted_) {
-            latched_place_.reset();
-            place_preview_.reset();
-            place_submitted_ = false;
-        }
-        if (cached_output_.diagnostics.state == RuntimeState::Carry &&
+        if (pending_cancel_ || pending_reset_ ||
+            cached_output_.diagnostics.state != RuntimeState::Carry ||
             place_submitted_) {
             latched_place_.reset();
             place_preview_.reset();
@@ -850,6 +839,12 @@ const RuntimeOutput& ControllerInteractionScheduler::tick(
 
         RuntimeOutput next_output = runtime_update(input);
         cached_output_ = std::move(next_output);
+        if (cached_output_.diagnostics.state != RuntimeState::Carry ||
+            place_submitted_) {
+            latched_place_.reset();
+            place_preview_.reset();
+            place_submitted_ = false;
+        }
         updated_last_tick_ = true;
         pending_interact_ = false;
         pending_cancel_ = false;
@@ -1334,6 +1329,18 @@ const char* controller_carry_mode_label(const RuntimeOutput& output) {
         return "none";
     }
     return output.diagnostics.recorded_carry ? "recorded" : "layered";
+}
+
+RuntimePlaceDiagnostics controller_place_debug_diagnostics(
+    const RuntimeOutput& output,
+    const std::optional<PlaceStagingPreview>& staged_preview) {
+    RuntimePlaceDiagnostics diagnostics = output.diagnostics.place;
+    if (staged_preview.has_value()) {
+        diagnostics.mode = staged_preview->candidate.mode;
+        diagnostics.preview_available = true;
+        diagnostics.preview = *staged_preview;
+    }
+    return diagnostics;
 }
 
 InteractionTarget make_controller_demo_target(const Database& database) {
