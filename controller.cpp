@@ -3635,6 +3635,8 @@ int main(void)
         {
             ++autodemo_state.runtime_tick;
         }
+        const float interaction_scene_alpha =
+            static_cast<float>(interaction_scheduler.phase()) / 60.0F;
 
         // Prefer any exact selected target, then refresh its generation by
         // stable ID so resets cannot strand scene drawing.
@@ -3665,7 +3667,8 @@ int main(void)
             interaction_scene_state = interaction_scene_handoff.apply(
                 interaction_scene_target,
                 interaction_output,
-                interaction_authored_target.object_world);
+                interaction_authored_target.object_world,
+                interaction_scene_alpha);
 
         std::optional<interaction::ControllerInteractionHandConstraint>
             interaction_hand_constraint;

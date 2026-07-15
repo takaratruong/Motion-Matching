@@ -112,6 +112,11 @@ bool raw_channels_equal(quat left, quat right) {
            left.z == right.z;
 }
 
+bool raw_transform_channels_equal(Transform left, Transform right) {
+    return raw_channels_equal(left.position, right.position) &&
+        raw_channels_equal(left.rotation, right.rotation);
+}
+
 bool raw_pose_channels_equal(const Pose& left, const Pose& right) {
     for (size_t bone = 0; bone < g1_skeleton::BoneCount; ++bone) {
         if (!raw_channels_equal(left.positions[bone], right.positions[bone]) ||
@@ -636,32 +641,71 @@ void ControllerInteractionFrameHandoff::reset() {
     ownership_hand_constraint_.reset();
 }
 
+void ControllerInteractionSceneHandoff::reset_authority() {
+    has_runtime_pose_ = false;
+    runtime_target_ = {};
+    previous_runtime_object_world_ = {};
+    current_runtime_object_world_ = {};
+}
+
 ControllerInteractionSceneState ControllerInteractionSceneHandoff::apply(
     const InteractionTarget* registry_target,
     const RuntimeOutput& runtime_output,
-    const Transform& authored_fallback) {
+    const Transform& authored_fallback,
+    float alpha) {
+    if (!finite(alpha) || alpha < 0.0F || alpha >= 1.0F) {
+        throw FormatError("scene interpolation alpha must be finite in [0, 1)");
+    }
+
     if (registry_target == nullptr) {
-        has_runtime_pose_ = false;
-        runtime_target_ = {};
+        reset_authority();
         return {authored_fallback, false};
     }
 
     if (registry_target->state == ObjectState::Free ||
         registry_target->state == ObjectState::Targeted) {
-        has_runtime_pose_ = false;
-        runtime_target_ = {};
+        reset_authority();
         return {registry_target->object_world, false};
     }
 
-    if (runtime_output.diagnostics.target == registry_target->handle) {
+    if (runtime_output.diagnostics.target != registry_target->handle) {
+        reset_authority();
+        return {registry_target->object_world, false};
+    }
+
+    if (!has_runtime_pose_ || runtime_target_ != registry_target->handle) {
         has_runtime_pose_ = true;
         runtime_target_ = registry_target->handle;
-        runtime_object_world_ = runtime_output.object_world;
+        previous_runtime_object_world_ = runtime_output.object_world;
+        current_runtime_object_world_ = runtime_output.object_world;
+        return {current_runtime_object_world_, true};
     }
-    if (has_runtime_pose_ && runtime_target_ == registry_target->handle) {
-        return {runtime_object_world_, true};
+
+    if (!raw_transform_channels_equal(
+            runtime_output.object_world, current_runtime_object_world_)) {
+        previous_runtime_object_world_ = current_runtime_object_world_;
+        current_runtime_object_world_ = runtime_output.object_world;
     }
-    return {registry_target->object_world, false};
+
+    if (alpha == 0.0F) {
+        return {previous_runtime_object_world_, true};
+    }
+    if (raw_transform_channels_equal(
+            previous_runtime_object_world_,
+            current_runtime_object_world_)) {
+        return {current_runtime_object_world_, true};
+    }
+
+    return {{
+                lerp(
+                    previous_runtime_object_world_.position,
+                    current_runtime_object_world_.position,
+                    alpha),
+                quat_nlerp_shortest(
+                    previous_runtime_object_world_.rotation,
+                    current_runtime_object_world_.rotation,
+                    alpha)},
+            true};
 }
 
 const char* controller_carry_mode_label(const RuntimeOutput& output) {

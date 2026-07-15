@@ -154,12 +154,16 @@ public:
     ControllerInteractionSceneState apply(
         const InteractionTarget* registry_target,
         const RuntimeOutput& runtime_output,
-        const Transform& authored_fallback);
+        const Transform& authored_fallback,
+        float alpha);
 
 private:
+    void reset_authority();
+
     bool has_runtime_pose_ = false;
     TargetHandle runtime_target_{};
-    Transform runtime_object_world_{};
+    Transform previous_runtime_object_world_{};
+    Transform current_runtime_object_world_{};
 };
 
 const char* controller_carry_mode_label(const RuntimeOutput& output);
