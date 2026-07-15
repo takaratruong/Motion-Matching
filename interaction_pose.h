@@ -5,6 +5,7 @@
 #include "quat.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 
 namespace interaction {
@@ -46,5 +47,6 @@ Pose sample_pose(
     uint32_t clip,
     float seconds_from_entry);
 WorldPose world_pose(const Pose& pose);
+quat raw_world_rotation(const Pose& pose, size_t bone);
 
 }  // namespace interaction

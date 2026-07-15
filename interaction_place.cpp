@@ -1,5 +1,6 @@
 #include "interaction_place.h"
 #include "interaction_place_collision.h"
+#include "interaction_rotation_gate.h"
 
 #include <algorithm>
 #include <array>
@@ -92,23 +93,20 @@ quat normalized(quat value) {
         static_cast<double>(value.x) * value.x +
         static_cast<double>(value.y) * value.y +
         static_cast<double>(value.z) * value.z);
-    if (!(norm > kMinimumNorm) || !std::isfinite(norm)) return quat();
+    if (!(norm > kMinimumNorm) ||
+        !rotation_gate::finite_bits(norm)) {
+        return quat();
+    }
     const float inverse_norm = static_cast<float>(1.0 / norm);
     return value * inverse_norm;
 }
 
 double rotation_error(quat left, quat right) {
-    left = normalized(left);
-    right = normalized(right);
-    const double cosine = std::clamp(
-        std::abs(
-            static_cast<double>(left.w) * right.w +
-            static_cast<double>(left.x) * right.x +
-            static_cast<double>(left.y) * right.y +
-            static_cast<double>(left.z) * right.z),
-        0.0,
-        1.0);
-    return 2.0 * std::acos(cosine);
+    const rotation_gate::Measure measured = rotation_gate::measure(
+        left, right);
+    return measured.valid
+        ? measured.radians
+        : std::numeric_limits<double>::max();
 }
 
 float yaw_radians(quat rotation) {
@@ -139,7 +137,21 @@ size_t hand_bone(Hand hand) {
 Transform pose_hand(const Pose& pose, Hand hand) {
     const WorldPose world = world_pose(pose);
     const size_t bone = hand_bone(hand);
-    return {world.positions[bone], world.rotations[bone]};
+    return {world.positions[bone], normalized(world.rotations[bone])};
+}
+
+quat pose_hand_rotation_raw(const Pose& pose, Hand hand) {
+    return raw_world_rotation(pose, hand_bone(hand));
+}
+
+Transform mapped_pose_hand_for_gate(
+    const Pose& source_pose,
+    Transform scene,
+    Hand hand) {
+    Transform result = compose(scene, pose_hand(source_pose, hand));
+    result.rotation = quat_mul(
+        scene.rotation, pose_hand_rotation_raw(source_pose, hand));
+    return result;
 }
 
 Pose rigidly_mapped_pose(Pose pose, Transform mapping) {
@@ -776,6 +788,7 @@ bool valid_place_ik(const IKConfig& config) {
 struct ValidatedInput {
     const PlaceAffordance* requested_affordance = nullptr;
     Transform goal_object{};
+    quat goal_object_rotation_raw{};
 };
 
 std::optional<Reason> validate_input(
@@ -827,6 +840,10 @@ std::optional<Reason> validate_input(
         validated.goal_object = placement_goal_world(
             input.surface,
             validated.requested_affordance->object_in_surface);
+        validated.goal_object_rotation_raw = quat_mul(
+            input.surface.surface_world.rotation,
+            validated.requested_affordance
+                ->object_in_surface.rotation);
     } catch (const std::exception&) {
         return Reason::SurfaceUnavailable;
     }
@@ -839,8 +856,21 @@ bool within_transform_error(
     float maximum_position,
     float maximum_orientation) {
     return distance(actual.position, expected.position) <= maximum_position &&
-           rotation_error(actual.rotation, expected.rotation) <=
-               maximum_orientation;
+           rotation_gate::within(
+               actual.rotation,
+               expected.rotation,
+               maximum_orientation);
+}
+
+Transform goal_hand_for_gate(
+    const PlaceMatchInput& input,
+    const ValidatedInput& validated) {
+    Transform result = compose(
+        validated.goal_object, input.held_affordance.hand_in_object);
+    result.rotation = quat_mul(
+        validated.goal_object_rotation_raw,
+        input.held_affordance.hand_in_object.rotation);
+    return result;
 }
 
 struct SelectionFailures {
@@ -917,7 +947,8 @@ std::optional<Transform> solve_release_object(
     const PlaceMatchInput& input,
     SelectionFailures& failures) {
     Pose mapped_pose = rigidly_mapped_pose(source_pose, scene);
-    const Transform mapped_hand = pose_hand(mapped_pose, hand);
+    const Transform mapped_hand = mapped_pose_hand_for_gate(
+        source_pose, scene, hand);
     if (!within_transform_error(
             mapped_hand,
             goal_hand,
@@ -962,8 +993,10 @@ bool current_attachment_within_request(
         quat_mul_vec3(
             quat_inv(object_rotation),
             current_hand.position - input.current_object_world.position),
-        normalized(quat_mul(
-            quat_inv(object_rotation), normalized(current_hand.rotation))),
+        quat_mul(
+            quat_inv(input.current_object_world.rotation),
+            pose_hand_rotation_raw(
+                input.current_pose, input.held_affordance.hand)),
     };
     return within_transform_error(
         actual_hand_in_object,
@@ -982,19 +1015,30 @@ struct RecordedRow {
     const PlaceAffordance* source_affordance = nullptr;
 };
 
+bool observable_commit_timing_valid(
+    int32_t source_samples,
+    const PlaceTimingConfig& timing) {
+    if (source_samples <= 0) return false;
+    const double tick_value = std::ceil(
+        static_cast<double>(source_samples) /
+        static_cast<double>(timing.playback_speed));
+    if (!rotation_gate::finite_bits(tick_value) || tick_value < 1.0 ||
+        tick_value > std::numeric_limits<int32_t>::max()) {
+        return false;
+    }
+    const int32_t ticks = static_cast<int32_t>(tick_value);
+    const float elapsed_seconds = static_cast<float>(
+        static_cast<double>(ticks) /
+        static_cast<double>(kCanonicalFps));
+    return elapsed_seconds >= timing.entry_blend_seconds &&
+           elapsed_seconds <= timing.maximum_alignment_seconds;
+}
+
 bool recorded_timing_valid(
     const RecordedPlaceClip& clip,
     const PlaceTimingConfig& timing) {
     const int32_t source_samples = clip.commit_frame - clip.entry_frame;
-    if (source_samples <= 0) return false;
-    const float minimum_source_samples =
-        timing.entry_blend_seconds * kCanonicalFps *
-        timing.playback_speed;
-    const float maximum_source_samples =
-        timing.maximum_alignment_seconds * kCanonicalFps *
-        timing.playback_speed;
-    return static_cast<float>(source_samples) >= minimum_source_samples &&
-           static_cast<float>(source_samples) <= maximum_source_samples;
+    return observable_commit_timing_valid(source_samples, timing);
 }
 
 std::optional<RecordedRow> validate_recorded_row(
@@ -1033,11 +1077,16 @@ std::optional<RecordedRow> validate_recorded_row(
         if (clip.active_hand_contacts[static_cast<size_t>(frame)] != 1U) {
             return std::nullopt;
         }
-        const Transform actual = pose_hand(
+        Transform actual = pose_hand(
             clip.poses[static_cast<size_t>(frame)], clip.hand);
-        const Transform expected = compose(
+        actual.rotation = pose_hand_rotation_raw(
+            clip.poses[static_cast<size_t>(frame)], clip.hand);
+        Transform expected = compose(
             clip.object_poses[static_cast<size_t>(frame)],
             clip.hand_in_object);
+        expected.rotation = quat_mul(
+            clip.object_poses[static_cast<size_t>(frame)].rotation,
+            clip.hand_in_object.rotation);
         if (!within_transform_error(
                 actual,
                 expected,
@@ -1180,7 +1229,7 @@ std::optional<float> aligned_entry_continuity_cost(
     const double object_orientation = rotation_error(
         aligned_object.rotation, mapped_entry_object.rotation);
     cost += object_orientation * object_orientation;
-    if (!std::isfinite(cost) ||
+    if (!rotation_gate::finite_bits(cost) ||
         cost > static_cast<double>(std::numeric_limits<float>::max())) {
         return std::nullopt;
     }
@@ -1203,18 +1252,24 @@ std::optional<PlaceCandidate> recorded_candidate(
             kRecordedOrientationToleranceRadians)) {
         return std::nullopt;
     }
+    if (!within_transform_error(
+            clip.hand_in_object,
+            input.held_affordance.hand_in_object,
+            input.ik.maximum_request_position_m,
+            input.ik.maximum_request_orientation_radians)) {
+        failures.remember(Reason::CorrectionLimit);
+        return std::nullopt;
+    }
 
     const Transform source_release_object =
         clip.object_poses[static_cast<size_t>(clip.release_frame)];
     const Transform scene = planar_alignment(
         source_release_object, validated.goal_object);
-    const Transform mapped_release_hand = compose(
+    const Transform mapped_release_hand = mapped_pose_hand_for_gate(
+        clip.poses[static_cast<size_t>(clip.release_frame)],
         scene,
-        pose_hand(
-            clip.poses[static_cast<size_t>(clip.release_frame)],
-            clip.hand));
-    const Transform goal_hand = compose(
-        validated.goal_object, input.held_affordance.hand_in_object);
+        clip.hand);
+    const Transform goal_hand = goal_hand_for_gate(input, validated);
     if (!within_transform_error(
             mapped_release_hand,
             goal_hand,
@@ -1473,9 +1528,15 @@ Transform database_hand_in_object(
     const Database& database,
     int32_t frame,
     Hand hand) {
-    return compose(
-        inverse(database_object(database, frame)),
-        pose_hand(pose_at_frame(database, frame), hand));
+    const Transform object = database_object(database, frame);
+    Transform normalized_object = object;
+    normalized_object.rotation = normalized(object.rotation);
+    const Pose pose = pose_at_frame(database, frame);
+    Transform result = compose(
+        inverse(normalized_object), pose_hand(pose, hand));
+    result.rotation = quat_mul(
+        quat_inv(object.rotation), pose_hand_rotation_raw(pose, hand));
+    return result;
 }
 
 bool stable_hold_window(
@@ -1616,10 +1677,12 @@ std::optional<PlaceCandidate> select_reverse_tier(
     const Transform source_contact_hand = pose_hand(
         pose_at_frame(*input.pickup_database, pickup.contact_frame),
         input.held_affordance.hand);
-    const Transform goal_hand = compose(
-        validated.goal_object, input.held_affordance.hand_in_object);
+    const Transform goal_hand = goal_hand_for_gate(input, validated);
     const Transform scene = planar_alignment(source_contact_hand, goal_hand);
-    const Transform mapped_contact_hand = compose(scene, source_contact_hand);
+    const Transform mapped_contact_hand = mapped_pose_hand_for_gate(
+        pose_at_frame(*input.pickup_database, pickup.contact_frame),
+        scene,
+        input.held_affordance.hand);
     if (!within_transform_error(
             mapped_contact_hand,
             goal_hand,
@@ -1676,7 +1739,7 @@ std::optional<PlaceCandidate> select_reverse_tier(
     const double offset_value =
         static_cast<double>(input.timing.reversed_commit_seconds) *
         kCanonicalFps * input.timing.playback_speed;
-    if (!std::isfinite(offset_value) ||
+    if (!rotation_gate::finite_bits(offset_value) ||
         offset_value > std::numeric_limits<int32_t>::max()) {
         return std::nullopt;
     }
@@ -1686,14 +1749,7 @@ std::optional<PlaceCandidate> select_reverse_tier(
     if (!(pickup.contact_frame < commit && commit < *reverse_start)) {
         return std::nullopt;
     }
-    const float minimum_source_samples =
-        input.timing.entry_blend_seconds * kCanonicalFps *
-        input.timing.playback_speed;
-    const float maximum_source_samples =
-        input.timing.maximum_alignment_seconds * kCanonicalFps *
-        input.timing.playback_speed;
-    if (static_cast<float>(offset) < minimum_source_samples ||
-        static_cast<float>(offset) > maximum_source_samples) {
+    if (!observable_commit_timing_valid(offset, input.timing)) {
         return std::nullopt;
     }
 
@@ -1816,10 +1872,16 @@ Pose interpolate_source_pose(
     if (candidate.mode == PlaceMotionMode::RecordedPlace) {
         const RecordedPlaceClip& clip =
             input.library->recorded.at(static_cast<size_t>(candidate.clip));
+        if (alpha == 0.0F) {
+            return clip.poses.at(static_cast<size_t>(left));
+        }
         return interpolate_pose(
             clip.poses.at(static_cast<size_t>(left)),
             clip.poses.at(static_cast<size_t>(right)),
             alpha);
+    }
+    if (alpha == 0.0F) {
+        return pose_at_frame(*input.pickup_database, left);
     }
     return interpolate_pose(
         pose_at_frame(*input.pickup_database, left),
@@ -1850,6 +1912,11 @@ Transform recorded_source_object(
     const float alpha = static_cast<float>(source_frame - left);
     const RecordedPlaceClip& clip =
         input.library->recorded.at(static_cast<size_t>(candidate.clip));
+    if (alpha == 0.0F) {
+        return compose(
+            candidate.scene_from_source,
+            clip.object_poses.at(static_cast<size_t>(left)));
+    }
     return compose(
         candidate.scene_from_source,
         interpolate_transform(
@@ -1976,6 +2043,12 @@ void PlacePlayer::start(
             "place player candidate does not match frozen selection");
     }
 
+    start_validated(candidate, input);
+}
+
+void PlacePlayer::start_validated(
+    const PlaceCandidate& candidate,
+    const PlaceMatchInput& input) {
     candidate_ = candidate;
     input_ = input;
     source_frame_ = candidate.entry_frame;

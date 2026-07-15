@@ -257,11 +257,131 @@ void test_actual_boundary_rejection_is_mutation_free() {
     require(near(repeated.object_world, terminal.object_world), "failed recovery is mutation-free");
 }
 
+void test_orientation_request_boundary_is_exact() {
+    constexpr float limit = 0.10F;
+    const auto solve_target = [](float angle) {
+        Pose pose = make_pose(
+            vec3(), Transform{vec3(0.0F, 1.0F, 0.0F), quat()});
+        const Transform current = hand_world(pose);
+        Transform target = current;
+        target.rotation = quat_mul(
+            quat_from_angle_axis(
+                angle, vec3(0.0F, 1.0F, 0.0F)),
+            current.rotation);
+        IKConfig config{};
+        config.maximum_request_position_m = 0.0F;
+        config.maximum_request_orientation_radians = limit;
+        return solve_hand_ik(pose, Hand::Right, target, config);
+    };
+
+    const auto solve_current = [](float angle) {
+        Pose pose = make_pose(
+            vec3(),
+            Transform{
+                vec3(0.0F, 1.0F, 0.0F),
+                quat_from_angle_axis(
+                    angle, vec3(0.0F, 1.0F, 0.0F))});
+        Transform target = hand_world(pose);
+        target.rotation = quat();
+        IKConfig config{};
+        config.maximum_request_position_m = 0.0F;
+        config.maximum_request_orientation_radians = limit;
+        return solve_hand_ik(pose, Hand::Right, target, config);
+    };
+
+    const auto solve_accepted_target = [](float angle) {
+        Pose pose = make_pose(
+            vec3(), Transform{vec3(0.0F, 1.0F, 0.0F), quat()});
+        const Transform current = hand_world(pose);
+        Transform target = current;
+        target.rotation = quat_mul(
+            quat_from_angle_axis(
+                angle, vec3(0.0F, 1.0F, 0.0F)),
+            current.rotation);
+        IKConfig config{};
+        config.maximum_request_position_m = 0.0F;
+        config.maximum_request_orientation_radians = 0.20F;
+        config.accepted_position_m = 0.0F;
+        config.accepted_orientation_radians = limit;
+        config.maximum_iterations = 0;
+        return solve_hand_ik(pose, Hand::Right, target, config);
+    };
+
+    const IKResult exact = solve_target(limit);
+    require(exact.accepted, "exact IK orientation request accepted");
+    const float above_limit = std::nextafter(
+        limit, std::numeric_limits<float>::infinity());
+    const IKResult above = solve_target(above_limit);
+    require(!above.accepted, "next-float IK orientation request rejected");
+    require(
+        above.reason == Reason::CorrectionLimit,
+        "next-float IK orientation uses correction-limit reason");
+
+    const IKResult exact_current = solve_current(limit);
+    require(
+        exact_current.accepted,
+        "exact current-hand IK orientation accepted");
+    const IKResult above_current = solve_current(above_limit);
+    require(
+        !above_current.accepted,
+        "next-float current-hand IK orientation rejected");
+    require(
+        above_current.reason == Reason::CorrectionLimit,
+        "next-float current-hand IK uses correction-limit reason");
+
+    const IKResult accepted_exact = solve_accepted_target(limit);
+    require(
+        accepted_exact.accepted,
+        "exact IK accepted-orientation boundary accepted");
+    const IKResult accepted_above = solve_accepted_target(above_limit);
+    require(
+        !accepted_above.accepted,
+        "next-float IK accepted-orientation boundary rejected");
+    require(
+        accepted_above.orientation_error_radians > limit,
+        "next-float accepted-orientation diagnostic is outside boundary");
+}
+
+PlaceStep release_with_authored_orientation(float angle) {
+    Fixture fixture = make_fixture(1.0F);
+    PlaceBeginInput begin = selected_begin(fixture);
+    PlaceController controller = make_controller(fixture);
+    require(controller.begin(begin).accepted, "orientation release begin");
+    RecordedPlaceClip& clip = fixture.library.recorded.front();
+    clip.poses[static_cast<size_t>(clip.release_frame)]
+        .rotations[kRightHand] = quat_from_angle_axis(
+            angle, vec3(0.0F, 1.0F, 0.0F));
+    return run_to_terminal(controller);
+}
+
+void test_release_orientation_boundary_is_exact() {
+    constexpr float limit = 0.174532925F;
+    const PlaceStep exact = release_with_authored_orientation(limit);
+    require(exact.release_due, "exact release orientation accepted");
+    require(!exact.recover_to_carry, "exact release does not recover");
+    require(
+        exact.hand_orientation_error_radians <= limit,
+        "exact release diagnostic is inside boundary");
+
+    const PlaceStep above = release_with_authored_orientation(std::nextafter(
+        limit, std::numeric_limits<float>::infinity()));
+    require(!above.release_due, "next-float release orientation not emitted");
+    require(above.recover_to_carry, "next-float release recovers attached");
+    require(
+        above.reason == Reason::ReleaseOrientation,
+        "next-float release uses orientation reason");
+    require(
+        above.hand_orientation_error_radians > limit,
+        "next-float release diagnostic is outside boundary");
+}
+
 }  // namespace
 
 int main() {
     test_release_is_one_shot_and_clamped(0.85F);
     test_release_is_one_shot_and_clamped(1.15F);
     test_actual_boundary_rejection_is_mutation_free();
+    test_orientation_request_boundary_is_exact();
+    test_release_orientation_boundary_is_exact();
     return 0;
 }

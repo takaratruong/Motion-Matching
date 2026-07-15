@@ -1,6 +1,7 @@
 #include "interaction_ik.h"
 
 #include "g1_arm_joint_metadata.h"
+#include "interaction_rotation_gate.h"
 
 #include <algorithm>
 #include <array>
@@ -24,6 +25,7 @@ using Matrix6 =
 struct Evaluation {
     vec3 position_residual{};
     vec3 orientation_residual{};
+    rotation_gate::Measure orientation_measure{};
     float position_error = 0.0F;
     float orientation_error = 0.0F;
     double score = 0.0;
@@ -35,7 +37,7 @@ const ArmMetadata& metadata_for(Hand hand) {
 
 quat normalize_exact(quat value) {
     const float norm = quat_length(value);
-    if (!(norm > 1.0e-12F) || !std::isfinite(norm)) {
+    if (!(norm > 1.0e-12F) || !rotation_gate::finite_bits(norm)) {
         return quat();
     }
     return value / norm;
@@ -60,7 +62,7 @@ vec3 orientation_delta(quat target, quat current) {
 Transform hand_world(const Pose& pose, const ArmMetadata& metadata) {
     const WorldPose world = world_pose(pose);
     const size_t bone = static_cast<size_t>(metadata.back().bone);
-    return {world.positions[bone], normalize_exact(world.rotations[bone])};
+    return {world.positions[bone], raw_world_rotation(pose, bone)};
 }
 
 float decompose_angle(const HingeJoint& joint, quat local_rotation) {
@@ -104,8 +106,11 @@ Evaluation evaluate(
     evaluation.position_residual = target.position - current.position;
     evaluation.orientation_residual = orientation_delta(
         target.rotation, current.rotation);
+    evaluation.orientation_measure = rotation_gate::measure(
+        target.rotation, current.rotation);
     evaluation.position_error = length(evaluation.position_residual);
-    evaluation.orientation_error = length(evaluation.orientation_residual);
+    evaluation.orientation_error = rotation_gate::radians(
+        evaluation.orientation_measure);
     const double px = evaluation.position_residual.x;
     const double py = evaluation.position_residual.y;
     const double pz = evaluation.position_residual.z;
@@ -129,25 +134,25 @@ Residual residual(const Evaluation& evaluation, float orientation_scale) {
 }
 
 bool finite_transform(const Transform& value) {
-    return std::isfinite(value.position.x) &&
-           std::isfinite(value.position.y) &&
-           std::isfinite(value.position.z) &&
-           std::isfinite(value.rotation.w) &&
-           std::isfinite(value.rotation.x) &&
-           std::isfinite(value.rotation.y) &&
-           std::isfinite(value.rotation.z) &&
+    return rotation_gate::finite_bits(value.position.x) &&
+           rotation_gate::finite_bits(value.position.y) &&
+           rotation_gate::finite_bits(value.position.z) &&
+           rotation_gate::finite_bits(value.rotation) &&
            quat_length(value.rotation) > 1.0e-12F;
 }
 
 bool valid_config(const IKConfig& config) {
-    return std::isfinite(config.maximum_request_position_m) &&
-           std::isfinite(config.maximum_request_orientation_radians) &&
-           std::isfinite(config.accepted_position_m) &&
-           std::isfinite(config.accepted_orientation_radians) &&
-           std::isfinite(config.damping) &&
-           std::isfinite(config.finite_difference_radians) &&
-           std::isfinite(config.orientation_scale_m_per_radian) &&
-           std::isfinite(config.maximum_step_radians) &&
+    return rotation_gate::finite_bits(config.maximum_request_position_m) &&
+           rotation_gate::finite_bits(
+               config.maximum_request_orientation_radians) &&
+           rotation_gate::finite_bits(config.accepted_position_m) &&
+           rotation_gate::finite_bits(
+               config.accepted_orientation_radians) &&
+           rotation_gate::finite_bits(config.damping) &&
+           rotation_gate::finite_bits(config.finite_difference_radians) &&
+           rotation_gate::finite_bits(
+               config.orientation_scale_m_per_radian) &&
+           rotation_gate::finite_bits(config.maximum_step_radians) &&
            config.maximum_request_position_m >= 0.0F &&
            config.maximum_request_orientation_radians >= 0.0F &&
            config.accepted_position_m >= 0.0F &&
@@ -161,8 +166,9 @@ bool valid_config(const IKConfig& config) {
 
 bool accepted(const Evaluation& evaluation, const IKConfig& config) {
     return evaluation.position_error <= config.accepted_position_m &&
-           evaluation.orientation_error <=
-               config.accepted_orientation_radians;
+           rotation_gate::within(
+               evaluation.orientation_measure,
+               config.accepted_orientation_radians);
 }
 
 Jacobian numerical_jacobian(
@@ -273,12 +279,17 @@ IKResult make_result(
     bool is_accepted,
     Reason reason,
     const Evaluation& evaluation,
-    const JointAngles& angles) {
+    const JointAngles& angles,
+    float orientation_boundary,
+    bool classify_orientation) {
     IKResult result{};
     result.accepted = is_accepted;
     result.reason = reason;
     result.position_error_m = evaluation.position_error;
-    result.orientation_error_radians = evaluation.orientation_error;
+    result.orientation_error_radians = classify_orientation
+        ? rotation_gate::classified_radians(
+              evaluation.orientation_measure, orientation_boundary)
+        : evaluation.orientation_error;
     result.joint_angles = angles;
     return result;
 }
@@ -297,21 +308,30 @@ IKResult solve_hand_ik(
             pose, metadata, target_hand_world,
             config.orientation_scale_m_per_radian);
         return make_result(
-            false, Reason::CorrectionLimit, invalid, requested_angles);
+            false,
+            Reason::CorrectionLimit,
+            invalid,
+            requested_angles,
+            0.0F,
+            false);
     }
-    target_hand_world.rotation = normalize_exact(target_hand_world.rotation);
     const Evaluation requested = evaluate(
         pose, metadata, target_hand_world,
         config.orientation_scale_m_per_radian);
-    if (!std::isfinite(requested.position_error) ||
-        !std::isfinite(requested.orientation_error) ||
+    if (!rotation_gate::finite_bits(requested.position_error) ||
+        !requested.orientation_measure.valid ||
         requested.position_error > config.maximum_request_position_m ||
-        requested.orientation_error >
-            config.maximum_request_orientation_radians) {
+        !rotation_gate::within(
+            requested.orientation_measure,
+            config.maximum_request_orientation_radians)) {
         return make_result(
-            false, Reason::CorrectionLimit, requested, requested_angles);
+            false,
+            Reason::CorrectionLimit,
+            requested,
+            requested_angles,
+            config.maximum_request_orientation_radians,
+            true);
     }
-
     bool hit_joint_limit = false;
     bool requested_angles_bounded = true;
     JointAngles angles = requested_angles;
@@ -325,7 +345,13 @@ IKResult solve_hand_ik(
         }
     }
     if (requested_angles_bounded && accepted(requested, config)) {
-        return make_result(true, Reason::None, requested, requested_angles);
+        return make_result(
+            true,
+            Reason::None,
+            requested,
+            requested_angles,
+            config.accepted_orientation_radians,
+            true);
     }
 
     Pose working_pose = pose;
@@ -367,7 +393,8 @@ IKResult solve_hand_ik(
         const Evaluation trial = evaluate(
             trial_pose, metadata, target_hand_world,
             config.orientation_scale_m_per_radian);
-        if (std::isfinite(trial.score) && trial.score < best.score) {
+        if (rotation_gate::finite_bits(trial.score) &&
+            trial.score < best.score) {
             best = trial;
             best_angles = trial_angles;
             best_pose = trial_pose;
@@ -386,7 +413,9 @@ IKResult solve_hand_ik(
             : (hit_joint_limit ? Reason::JointLimit
                                : Reason::CorrectionLimit),
         best,
-        best_angles);
+        best_angles,
+        config.accepted_orientation_radians,
+        true);
 }
 
 }  // namespace interaction

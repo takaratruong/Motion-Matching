@@ -1,6 +1,7 @@
 #include "interaction_place_controller.h"
 
 #include "interaction_place_collision.h"
+#include "interaction_rotation_gate.h"
 
 #include <algorithm>
 #include <array>
@@ -51,7 +52,10 @@ quat normalized(quat value) {
         static_cast<double>(value.x) * value.x +
         static_cast<double>(value.y) * value.y +
         static_cast<double>(value.z) * value.z);
-    if (!(norm > kMinimumRotationNorm) || !std::isfinite(norm)) return quat();
+    if (!(norm > kMinimumRotationNorm) ||
+        !rotation_gate::finite_bits(norm)) {
+        return quat();
+    }
     return value * static_cast<float>(1.0 / norm);
 }
 
@@ -265,12 +269,16 @@ Transform hand_world(const Pose& pose, Hand hand) {
     return {world.positions[bone], normalized(world.rotations[bone])};
 }
 
+quat hand_world_rotation_raw(const Pose& pose, Hand hand) {
+    return raw_world_rotation(pose, hand_bone(hand));
+}
+
 Transform hand_derived_object(
     const Pose& pose,
     const GraspAffordance& affordance) {
-    return compose(
-        hand_world(pose, affordance.hand),
-        inverse(affordance.hand_in_object));
+    Transform hand = hand_world(pose, affordance.hand);
+    hand.rotation = normalized(hand.rotation);
+    return compose(hand, inverse(affordance.hand_in_object));
 }
 
 double distance(vec3 left, vec3 right) {
@@ -278,20 +286,6 @@ double distance(vec3 left, vec3 right) {
     const double y = static_cast<double>(left.y) - right.y;
     const double z = static_cast<double>(left.z) - right.z;
     return std::sqrt(x * x + y * y + z * z);
-}
-
-double rotation_error(quat left, quat right) {
-    left = normalized(left);
-    right = normalized(right);
-    const double cosine = std::clamp(
-        std::abs(
-            static_cast<double>(left.w) * right.w +
-            static_cast<double>(left.x) * right.x +
-            static_cast<double>(left.y) * right.y +
-            static_cast<double>(left.z) * right.z),
-        0.0,
-        1.0);
-    return 2.0 * std::acos(cosine);
 }
 
 float smoothstep(float value) {
@@ -309,7 +303,10 @@ float source_progress(
         static_cast<double>(candidate.direction) *
         (static_cast<double>(candidate.release_frame) -
          candidate.entry_frame);
-    if (!(denominator > 0.0) || !std::isfinite(source_frame)) return 0.0F;
+    if (!(denominator > 0.0) ||
+        !rotation_gate::finite_bits(source_frame)) {
+        return 0.0F;
+    }
     return std::clamp(
         static_cast<float>(numerator / denominator),
         0.0F,
@@ -336,6 +333,7 @@ Pose corrected_source_pose(
             static_cast<float>(entry_blend_ticks),
         0.0F,
         1.0F);
+    if (blend_progress >= 1.0F) return source;
     return interpolate_pose(
         begin.match_input.current_pose,
         source,
@@ -384,7 +382,12 @@ PlaceController::PlaceController(
 }
 
 PlaceBeginResult PlaceController::begin(const PlaceBeginInput& input) {
-    if (started_) return {false, Reason::TargetChanged};
+    const bool reusable_terminal = started_ &&
+        (recovering_ ||
+         (release_acknowledged_ && player_.finished()));
+    if (started_ && !reusable_terminal) {
+        return {false, Reason::TargetChanged};
+    }
     if (!same_timing(input.match_input.timing, config_.timing) ||
         !same_timing(input.candidate.timing, config_.timing) ||
         !same_match(input.match_input.match, config_.match) ||
@@ -402,7 +405,7 @@ PlaceBeginResult PlaceController::begin(const PlaceBeginInput& input) {
 
     try {
         PlacePlayer player;
-        player.start(input.candidate, input.match_input);
+        player.start_validated(input.candidate, input.match_input);
         PlacePlayer release_probe = player;
         int32_t guard = 0;
         while (!release_probe.release_due() && guard++ < 100000) {
@@ -416,19 +419,32 @@ PlaceBeginResult PlaceController::begin(const PlaceBeginInput& input) {
         const Transform goal_hand = compose(
             goal_object,
             input.match_input.held_affordance.hand_in_object);
+        const quat goal_object_rotation_raw = quat_mul(
+            input.match_input.surface.surface_world.rotation,
+            input.match_input.place_affordance
+                .object_in_surface.rotation);
+        const quat goal_hand_rotation_raw = quat_mul(
+            goal_object_rotation_raw,
+            input.match_input.held_affordance
+                .hand_in_object.rotation);
         const Transform release_hand = hand_world(
+            release_sample.pose,
+            input.match_input.held_affordance.hand);
+        const quat release_hand_rotation_raw = hand_world_rotation_raw(
             release_sample.pose,
             input.match_input.held_affordance.hand);
         const vec3 release_translation =
             goal_hand.position - release_hand.position;
         const quat release_rotation = normalized(quat_mul(
             goal_hand.rotation,
-            quat_inv(release_hand.rotation)));
+            quat_inv(normalized(release_hand.rotation))));
         if (!finite(release_translation) || !valid_rotation(release_rotation) ||
             distance(goal_hand.position, release_hand.position) >
                 ik_config_.maximum_request_position_m ||
-            rotation_error(goal_hand.rotation, release_hand.rotation) >
-                ik_config_.maximum_request_orientation_radians) {
+            !rotation_gate::within(
+                goal_hand_rotation_raw,
+                release_hand_rotation_raw,
+                ik_config_.maximum_request_orientation_radians)) {
             return {false, Reason::CorrectionLimit};
         }
 
@@ -457,6 +473,8 @@ PlaceBeginResult PlaceController::begin(const PlaceBeginInput& input) {
         begin_ = input;
         goal_object_ = goal_object;
         goal_hand_ = goal_hand;
+        goal_object_rotation_raw_ = goal_object_rotation_raw;
+        goal_hand_rotation_raw_ = goal_hand_rotation_raw;
         release_hand_translation_ = release_translation;
         release_hand_rotation_ = release_rotation;
         last_safe_pose_ = input.match_input.current_pose;
@@ -524,6 +542,8 @@ PlaceStep PlaceController::update(float dt) {
         begin_.candidate, trial.source_frame_exact());
     const Transform current_hand = hand_world(
         pose, begin_.match_input.held_affordance.hand);
+    const quat current_hand_rotation_raw = hand_world_rotation_raw(
+        pose, begin_.match_input.held_affordance.hand);
     const Transform target_hand = weighted_hand_target(
         current_hand,
         release_hand_translation_,
@@ -532,8 +552,10 @@ PlaceStep PlaceController::update(float dt) {
     if (trial.release_due() &&
         (distance(goal_hand_.position, current_hand.position) >
              ik_config_.maximum_request_position_m ||
-         rotation_error(goal_hand_.rotation, current_hand.rotation) >
-             ik_config_.maximum_request_orientation_radians)) {
+         !rotation_gate::within(
+             goal_hand_rotation_raw_,
+             current_hand_rotation_raw,
+             ik_config_.maximum_request_orientation_radians))) {
         recovering_ = true;
         last_step_ = recovery_step(
             last_safe_pose_,
@@ -544,11 +566,13 @@ PlaceStep PlaceController::update(float dt) {
     }
     const double requested_position = distance(
         target_hand.position, current_hand.position);
-    const double requested_orientation = rotation_error(
-        target_hand.rotation, current_hand.rotation);
+    const rotation_gate::Measure requested_orientation =
+        rotation_gate::measure(
+            target_hand.rotation, current_hand_rotation_raw);
     if (requested_position > ik_config_.maximum_request_position_m ||
-        requested_orientation >
-            ik_config_.maximum_request_orientation_radians) {
+        !rotation_gate::within(
+            requested_orientation,
+            ik_config_.maximum_request_orientation_radians)) {
         recovering_ = true;
         last_step_ = recovery_step(
             last_safe_pose_,
@@ -591,11 +615,20 @@ PlaceStep PlaceController::update(float dt) {
     if (trial.release_due()) {
         const double position_error = distance(
             object_world.position, goal_object_.position);
-        const double orientation_error = rotation_error(
-            object_world.rotation, goal_object_.rotation);
+        const quat raw_object_rotation = quat_mul(
+            hand_world_rotation_raw(
+                pose, begin_.match_input.held_affordance.hand),
+            quat_inv(
+                begin_.match_input.held_affordance
+                    .hand_in_object.rotation));
+        const rotation_gate::Measure orientation_error =
+            rotation_gate::measure(
+                raw_object_rotation, goal_object_rotation_raw_);
         step.hand_position_error_m = static_cast<float>(position_error);
         step.hand_orientation_error_radians =
-            static_cast<float>(orientation_error);
+            rotation_gate::classified_radians(
+                orientation_error,
+                config_.release_orientation_radians);
         if (position_error > config_.release_position_m) {
             recovering_ = true;
             last_step_ = recovery_step(
@@ -608,7 +641,9 @@ PlaceStep PlaceController::update(float dt) {
                 step.hand_orientation_error_radians;
             return last_step_;
         }
-        if (orientation_error > config_.release_orientation_radians) {
+        if (!rotation_gate::within(
+                orientation_error,
+                config_.release_orientation_radians)) {
             recovering_ = true;
             last_step_ = recovery_step(
                 last_safe_pose_,

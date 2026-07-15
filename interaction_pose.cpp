@@ -158,4 +158,26 @@ WorldPose world_pose(const Pose& pose) {
     return world;
 }
 
+quat raw_world_rotation(const Pose& pose, size_t bone) {
+    if (bone >= g1_skeleton::BoneCount) {
+        throw std::out_of_range("interaction pose bone index out of range");
+    }
+    std::array<size_t, g1_skeleton::BoneCount> chain{};
+    size_t count = 0U;
+    size_t current = bone;
+    while (true) {
+        chain[count++] = current;
+        const int32_t parent = g1_skeleton::kParents[current];
+        if (parent < 0) break;
+        current = static_cast<size_t>(parent);
+    }
+
+    quat rotation = pose.rotations[chain[count - 1U]];
+    while (count > 1U) {
+        --count;
+        rotation = quat_mul(rotation, pose.rotations[chain[count - 1U]]);
+    }
+    return rotation;
+}
+
 }  // namespace interaction

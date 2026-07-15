@@ -1,4 +1,5 @@
 #include "interaction_place_controller.h"
+#include "interaction_rotation_gate.h"
 
 #include <algorithm>
 #include <array>
@@ -96,6 +97,39 @@ bool near(const Pose& left, const Pose& right, float tolerance = 1.0e-5F) {
         }
     }
     return left.foot_contacts == right.foot_contacts;
+}
+
+bool equivalent(const PlaceStep& left, const PlaceStep& right) {
+    return near(left.pose, right.pose) &&
+           near(left.object_world, right.object_world) &&
+           left.phase == right.phase &&
+           left.source_frame == right.source_frame &&
+           left.committed == right.committed &&
+           left.release_due == right.release_due &&
+           left.retract_finished == right.retract_finished &&
+           left.recover_to_carry == right.recover_to_carry &&
+           left.reason == right.reason &&
+           near(
+               left.hand_position_error_m,
+               right.hand_position_error_m) &&
+           near(
+               left.hand_orientation_error_radians,
+               right.hand_orientation_error_radians) &&
+           left.actual_fit.accepted == right.actual_fit.accepted &&
+           left.actual_fit.reason == right.actual_fit.reason &&
+           near(
+               left.actual_fit.support_gap_m,
+               right.actual_fit.support_gap_m) &&
+           near(
+               left.actual_fit.lowest_corner_m,
+               right.actual_fit.lowest_corner_m) &&
+           near(
+               left.actual_fit.highest_corner_m,
+               right.actual_fit.highest_corner_m) &&
+           left.actual_fit.footprint_valid ==
+               right.actual_fit.footprint_valid &&
+           left.actual_fit.overhead_valid == right.actual_fit.overhead_valid &&
+           left.support_sweep_clear == right.support_sweep_clear;
 }
 
 template<class Exception, class Function>
@@ -478,27 +512,11 @@ double transform_distance(vec3 left, vec3 right) {
 }
 
 double transform_rotation_error(quat left, quat right) {
-    const double left_norm_double = std::sqrt(
-        static_cast<double>(left.w) * left.w +
-        static_cast<double>(left.x) * left.x +
-        static_cast<double>(left.y) * left.y +
-        static_cast<double>(left.z) * left.z);
-    const double right_norm_double = std::sqrt(
-        static_cast<double>(right.w) * right.w +
-        static_cast<double>(right.x) * right.x +
-        static_cast<double>(right.y) * right.y +
-        static_cast<double>(right.z) * right.z);
-    left = left * static_cast<float>(1.0 / left_norm_double);
-    right = right * static_cast<float>(1.0 / right_norm_double);
-    const double cosine = std::clamp(
-        std::abs(
-            static_cast<double>(left.w) * right.w +
-             static_cast<double>(left.x) * right.x +
-             static_cast<double>(left.y) * right.y +
-             static_cast<double>(left.z) * right.z),
-        0.0,
-        1.0);
-    return 2.0 * std::acos(cosine);
+    const rotation_gate::Measure measured = rotation_gate::measure(
+        left, right);
+    return measured.valid
+        ? measured.radians
+        : std::numeric_limits<double>::max();
 }
 
 void move_release_hand_to_first_position_above(
@@ -676,6 +694,40 @@ void test_frozen_public_contract() {
     TEST_CHECK(begin_result.reason == Reason::None);
     TEST_CHECK(step.phase == PlacePhase::Align);
     (void)begin;
+}
+
+void test_rotation_gate_is_scale_sign_and_boundary_stable() {
+    constexpr float limit = 0.10F;
+    const quat exact = quat_from_angle_axis(
+        limit, vec3(0.0F, 1.0F, 0.0F));
+    const quat above = quat_from_angle_axis(
+        std::nextafter(limit, std::numeric_limits<float>::infinity()),
+        vec3(0.0F, 1.0F, 0.0F));
+    TEST_CHECK(rotation_gate::within(exact, quat(), limit));
+    TEST_CHECK(!rotation_gate::within(above, quat(), limit));
+    TEST_CHECK(rotation_gate::within(-exact, quat(), limit));
+    TEST_CHECK(rotation_gate::within(4.0F * exact, 2.0F * quat(), limit));
+    TEST_CHECK(!rotation_gate::within(4.0F * above, 2.0F * quat(), limit));
+
+    constexpr float pi = 3.141592654F;
+    const float near_pi = std::nextafter(pi, 0.0F);
+    const quat near_pi_exact = quat_from_angle_axis(
+        near_pi, vec3(1.0F, 0.0F, 0.0F));
+    const quat half_turn = quat_from_angle_axis(
+        pi, vec3(1.0F, 0.0F, 0.0F));
+    TEST_CHECK(rotation_gate::within(near_pi_exact, quat(), near_pi));
+    TEST_CHECK(!rotation_gate::within(half_turn, quat(), near_pi));
+
+    quat invalid = exact;
+    invalid.w = std::numeric_limits<float>::quiet_NaN();
+    TEST_CHECK(!rotation_gate::within(invalid, quat(), limit));
+    const rotation_gate::Measure positive = rotation_gate::measure(
+        exact, quat());
+    const rotation_gate::Measure antipodal = rotation_gate::measure(
+        -exact, quat());
+    TEST_CHECK(positive.valid);
+    TEST_CHECK(antipodal.valid);
+    TEST_CHECK(positive.radians == antipodal.radians);
 }
 
 void test_constructor_validates_every_configuration_family() {
@@ -1095,6 +1147,101 @@ void test_lifecycle_guards_and_acknowledgement_are_atomic() {
     const PlaceStep retract = controller.update(0.04F);
     TEST_CHECK(exactly_equal(retract.object_world, committed));
     TEST_CHECK(!retract.release_due);
+}
+
+void test_begin_reuses_only_terminal_controllers_atomically() {
+    Fixture fixture = make_fixture();
+    const PlaceBeginInput begin = selected_begin(fixture);
+
+    {
+        PlaceController trial = make_controller(fixture);
+        PlaceController control = make_controller(fixture);
+        TEST_CHECK(trial.begin(begin).accepted);
+        TEST_CHECK(control.begin(begin).accepted);
+        TEST_CHECK(!trial.begin(begin).accepted);
+        TEST_CHECK(equivalent(
+            trial.update(0.04F), control.update(0.04F)));
+    }
+
+    {
+        PlaceController trial = make_controller(fixture);
+        PlaceController control = make_controller(fixture);
+        TEST_CHECK(trial.begin(begin).accepted);
+        TEST_CHECK(control.begin(begin).accepted);
+        PlaceStep trial_step{};
+        PlaceStep control_step{};
+        do {
+            trial_step = trial.update(0.04F);
+            control_step = control.update(0.04F);
+            TEST_CHECK(equivalent(trial_step, control_step));
+        } while (!trial_step.committed);
+        TEST_CHECK(!trial.begin(begin).accepted);
+        TEST_CHECK(equivalent(
+            trial.update(0.04F), control.update(0.04F)));
+    }
+
+    {
+        PlaceController trial = make_controller(fixture);
+        PlaceController control = make_controller(fixture);
+        TEST_CHECK(trial.begin(begin).accepted);
+        TEST_CHECK(control.begin(begin).accepted);
+        const PlaceStep trial_release = run_to_terminal_before_ack(trial);
+        const PlaceStep control_release = run_to_terminal_before_ack(control);
+        TEST_CHECK(equivalent(trial_release, control_release));
+        TEST_CHECK(trial_release.release_due);
+        TEST_CHECK(!trial.begin(begin).accepted);
+        TEST_CHECK(equivalent(
+            trial.update(0.04F), control.update(0.04F)));
+    }
+
+    {
+        PlaceController controller = make_controller(fixture);
+        TEST_CHECK(controller.begin(begin).accepted);
+        for (int tick = 0; tick < 4; ++tick) {
+            TEST_CHECK(!controller.update(0.04F).committed);
+        }
+        TEST_CHECK(controller.cancel().recover_to_carry);
+        Fixture retry = make_fixture();
+        ++retry.input.held_target.generation;
+        TEST_CHECK(controller.begin(selected_begin(retry)).accepted);
+    }
+
+    {
+        Fixture failed = make_fixture();
+        failed.input.surface.affordances.front().object_in_surface.position.x =
+            0.35F;
+        failed.input.place_affordance =
+            failed.input.surface.affordances.front();
+        restage_fixture(failed);
+        const PlaceBeginInput failed_begin = selected_begin(failed);
+        PlaceController controller = make_controller(failed);
+        TEST_CHECK(controller.begin(failed_begin).accepted);
+        RecordedPlaceClip& clip = failed.library.recorded.front();
+        clip.poses[static_cast<size_t>(clip.release_frame)]
+            .positions[kRightHand].x += std::nextafter(0.02F, 0.0F);
+        const PlaceStep recovery = run_to_terminal_before_ack(controller);
+        TEST_CHECK(recovery.recover_to_carry);
+        Fixture retry = make_fixture();
+        ++retry.input.held_target.generation;
+        TEST_CHECK(controller.begin(selected_begin(retry)).accepted);
+    }
+
+    {
+        PlaceController controller = make_controller(fixture);
+        TEST_CHECK(controller.begin(begin).accepted);
+        const PlaceStep release = run_to_terminal_before_ack(controller);
+        TEST_CHECK(release.release_due);
+        controller.acknowledge_release(release.object_world);
+        PlaceStep finished{};
+        do {
+            finished = controller.update(0.04F);
+        } while (!finished.retract_finished);
+        Fixture next = make_fixture();
+        ++next.input.held_target.generation;
+        const PlaceBeginInput next_begin = selected_begin(next);
+        TEST_CHECK(controller.begin(next_begin).accepted);
+        TEST_CHECK(!controller.update(0.04F).recover_to_carry);
+    }
 }
 
 void test_root_yaw_warp_uses_release_smoothstep_and_seven_tick_entry_blend() {
@@ -1729,12 +1876,14 @@ void test_commit_time_is_bounded_at_every_playback_speed() {
 
 int main() {
     test_frozen_public_contract();
+    test_rotation_gate_is_scale_sign_and_boundary_stable();
     test_constructor_validates_every_configuration_family();
     test_begin_revalidates_complete_selection_and_is_atomic();
     test_begin_rejects_constructor_ik_identity_mismatch_atomically();
     test_begin_rejects_every_ik_identity_mismatch();
     test_success_is_hand_derived_one_shot_and_frozen_after_ack();
     test_lifecycle_guards_and_acknowledgement_are_atomic();
+    test_begin_reuses_only_terminal_controllers_atomically();
     test_root_yaw_warp_uses_release_smoothstep_and_seven_tick_entry_blend();
     test_fractional_speed_weights_follow_exact_source_position();
     test_authoritative_ik_position_limit_exact_and_nextabove();

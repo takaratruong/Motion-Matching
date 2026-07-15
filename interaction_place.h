@@ -8,6 +8,8 @@
 
 namespace interaction {
 
+class PlaceController;
+
 enum class PlaceMotionMode : uint8_t {
     None,
     RecordedPlace,
@@ -141,6 +143,10 @@ public:
     bool finished() const;
 
 private:
+    friend class PlaceController;
+    void start_validated(
+        const PlaceCandidate& candidate,
+        const PlaceMatchInput& input);
     PlaceCandidate candidate_{};
     PlaceMatchInput input_{};
     double source_frame_ = 0.0;

@@ -1,4 +1,5 @@
 #include "interaction_place.h"
+#include "interaction_rotation_gate.h"
 #include "g1_arm_joint_metadata.h"
 
 #include <algorithm>
@@ -430,6 +431,15 @@ void remove_recorded(PlaceFixture& fixture) {
     refresh_pointers(fixture);
 }
 
+void disable_reverse_tier(PlaceFixture& fixture) {
+    const size_t active = static_cast<size_t>(Hand::Right);
+    for (int32_t frame = kHoldFrame; frame < kFrameCount; ++frame) {
+        fixture.database.hand_contacts[
+            static_cast<size_t>(frame) * 2U + active] = 0U;
+    }
+    refresh_pointers(fixture);
+}
+
 void map_current_rigidly(PlaceMatchInput& input, Transform target_root) {
     const Transform current_root = root_transform(input.current_pose);
     const Transform mapping = compose(target_root, inverse(current_root));
@@ -520,15 +530,11 @@ double production_relative_rotation_error(quat hand, quat object) {
         quat_inv(object_rotation), normalized_for_test(hand)));
     const quat actual = normalized_for_test(relative);
     const quat expected = normalized_for_test(quat());
-    const double cosine = std::clamp(
-        std::abs(
-            static_cast<double>(actual.w) * expected.w +
-            static_cast<double>(actual.x) * expected.x +
-            static_cast<double>(actual.y) * expected.y +
-            static_cast<double>(actual.z) * expected.z),
-        0.0,
-        1.0);
-    return 2.0 * std::acos(cosine);
+    const rotation_gate::Measure measured = rotation_gate::measure(
+        actual, expected);
+    return measured.valid
+        ? measured.radians
+        : std::numeric_limits<double>::max();
 }
 
 void set_current_hand_orientation_boundary(
@@ -2331,9 +2337,54 @@ void test_commit_event_derivation_and_runtime_bounds() {
                    result.candidate.entry_frame);
         TEST_CHECK(result.candidate.commit_frame >
                    result.candidate.release_frame);
-        const float elapsed = static_cast<float>(offset) / (25.0F * speed);
+        const int32_t commit_ticks = static_cast<int32_t>(std::ceil(
+            static_cast<double>(offset) / speed));
+        const float elapsed = static_cast<float>(commit_ticks) / 25.0F;
         TEST_CHECK(elapsed >= fixture.input.timing.entry_blend_seconds);
         TEST_CHECK(elapsed <= fixture.input.timing.maximum_alignment_seconds);
+    }
+
+    for (float speed : {0.85F, 1.0F, 1.15F}) {
+        PlaceFixture recorded = make_fixture();
+        disable_reverse_tier(recorded);
+        recorded.input.timing.playback_speed = speed;
+        recorded.input.timing.reversed_commit_seconds = 0.20F;
+        const int32_t delta =
+            recorded.library.recorded.front().commit_frame -
+            recorded.library.recorded.front().entry_frame;
+        const int32_t commit_ticks = static_cast<int32_t>(std::ceil(
+            static_cast<double>(delta) / speed));
+        const float observable_elapsed =
+            static_cast<float>(commit_ticks) / 25.0F;
+        recorded.input.timing.maximum_alignment_seconds = observable_elapsed;
+        const PlaceResult exact = select_place_motion(recorded.input);
+        TEST_CHECK(exact.accepted);
+        TEST_CHECK(exact.candidate.mode == PlaceMotionMode::RecordedPlace);
+
+        PlaceFixture too_late = copy_fixture(recorded);
+        too_late.input.timing.maximum_alignment_seconds = std::nextafter(
+            observable_elapsed, 0.0F);
+        TEST_CHECK(!select_place_motion(too_late.input).accepted);
+    }
+
+    for (float speed : {0.85F, 1.0F, 1.15F}) {
+        PlaceFixture reversed = make_fixture(false);
+        reversed.input.timing.playback_speed = speed;
+        const int32_t offset = static_cast<int32_t>(std::floor(
+            reversed.input.timing.reversed_commit_seconds * 25.0F * speed));
+        const int32_t commit_ticks = static_cast<int32_t>(std::ceil(
+            static_cast<double>(offset) / speed));
+        const float observable_elapsed =
+            static_cast<float>(commit_ticks) / 25.0F;
+        reversed.input.timing.entry_blend_seconds = observable_elapsed;
+        const PlaceResult exact = select_place_motion(reversed.input);
+        TEST_CHECK(exact.accepted);
+        TEST_CHECK(exact.candidate.mode == PlaceMotionMode::ReversedPickup);
+
+        PlaceFixture too_early = copy_fixture(reversed);
+        too_early.input.timing.entry_blend_seconds = std::nextafter(
+            observable_elapsed, std::numeric_limits<float>::infinity());
+        TEST_CHECK(!select_place_motion(too_early.input).accepted);
     }
 
     PlaceFixture zero_offset = make_fixture(false);
@@ -2368,7 +2419,14 @@ void test_commit_event_derivation_and_runtime_bounds() {
     recorded_too_early.input.timing.entry_blend_seconds = 0.28F;
     const PlaceResult early = select_place_motion(recorded_too_early.input);
     TEST_CHECK(early.accepted);
-    TEST_CHECK(early.candidate.mode == PlaceMotionMode::ReversedPickup);
+    TEST_CHECK(early.candidate.mode == PlaceMotionMode::RecordedPlace);
+
+    PlaceFixture recorded_279_limit = make_fixture();
+    disable_reverse_tier(recorded_279_limit);
+    recorded_279_limit.input.timing.playback_speed = 1.15F;
+    recorded_279_limit.input.timing.reversed_commit_seconds = 0.20F;
+    recorded_279_limit.input.timing.maximum_alignment_seconds = 0.279F;
+    TEST_CHECK(!select_place_motion(recorded_279_limit.input).accepted);
 
     PlaceFixture recorded_too_late = make_fixture();
     recorded_too_late.input.timing.entry_blend_seconds = 0.20F;
@@ -2936,6 +2994,40 @@ void test_fast_math_bit_safe_canary() {
     const PlaceResult pose_result = select_place_motion(invalid_pose.input);
     TEST_CHECK(!pose_result.accepted);
     TEST_CHECK(pose_result.reason == Reason::TargetUnavailable);
+
+    constexpr float orientation_limit = 0.10F;
+    PlaceFixture exact_recorded = make_fixture();
+    set_clip_grasp(
+        exact_recorded.library.recorded.front(),
+        Transform{
+            vec3(),
+            quat_from_angle_axis(
+                orientation_limit, vec3(0.0F, 1.0F, 0.0F))});
+    exact_recorded.input.ik.maximum_request_orientation_radians =
+        orientation_limit;
+    exact_recorded.input.ik.accepted_orientation_radians = orientation_limit;
+    exact_recorded.input.ik.maximum_iterations = 0;
+    const PlaceResult exact_tier = select_place_motion(exact_recorded.input);
+    TEST_CHECK(exact_tier.accepted);
+    TEST_CHECK(exact_tier.candidate.mode == PlaceMotionMode::RecordedPlace);
+
+    PlaceFixture above_recorded = make_fixture();
+    set_clip_grasp(
+        above_recorded.library.recorded.front(),
+        Transform{
+            vec3(),
+            quat_from_angle_axis(
+                std::nextafter(
+                    orientation_limit,
+                    std::numeric_limits<float>::infinity()),
+                vec3(0.0F, 1.0F, 0.0F))});
+    above_recorded.input.ik.maximum_request_orientation_radians =
+        orientation_limit;
+    above_recorded.input.ik.accepted_orientation_radians = orientation_limit;
+    above_recorded.input.ik.maximum_iterations = 0;
+    const PlaceResult above_tier = select_place_motion(above_recorded.input);
+    TEST_CHECK(above_tier.accepted);
+    TEST_CHECK(above_tier.candidate.mode == PlaceMotionMode::ReversedPickup);
 
     PlaceFixture boundary = make_fixture(false);
     boundary.input.timing.entry_blend_seconds = 0.20F;

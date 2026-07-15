@@ -54,6 +54,8 @@ private:
     PlaceBeginInput begin_{};
     Transform goal_object_{};
     Transform goal_hand_{};
+    quat goal_object_rotation_raw_{};
+    quat goal_hand_rotation_raw_{};
     vec3 release_hand_translation_{};
     quat release_hand_rotation_{};
     Pose last_safe_pose_{};
