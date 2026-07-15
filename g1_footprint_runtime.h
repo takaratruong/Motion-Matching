@@ -349,6 +349,48 @@ static inline G1FootprintStatus g1_footprint_surface_query(
     return G1FootprintOk;
 }
 
+static inline G1FootprintStatus g1_footprint_nearest_walkability_axis(
+    int& output,
+    float input,
+    float origin,
+    float cell_size,
+    int count)
+{
+    float canonical = 0.0f;
+    if (count < 2 || !terrain_float_is_normal_or_positive_zero(origin) ||
+        !terrain_float_is_positive_normal(cell_size) ||
+        !terrain_v2_query_coordinate(input, canonical)) {
+        return G1FootprintArithmeticFailure;
+    }
+    const volatile double maximum_product =
+        static_cast<double>(count - 1) * static_cast<double>(cell_size);
+    const volatile double maximum =
+        static_cast<double>(origin) + maximum_product;
+    if (!terrain_double_is_finite(maximum)) {
+        return G1FootprintArithmeticFailure;
+    }
+    const double value = static_cast<double>(canonical);
+    if (value < static_cast<double>(origin) || value > maximum) {
+        return G1FootprintOutsideDomain;
+    }
+    const volatile double difference =
+        value - static_cast<double>(origin);
+    const volatile double normalized =
+        difference / static_cast<double>(cell_size);
+    const volatile double shifted = normalized + 0.5;
+    const double rounded = std::floor(shifted);
+    if (!terrain_double_is_finite(normalized) ||
+        !terrain_double_is_finite(shifted) ||
+        !terrain_double_is_finite(rounded) || rounded < 0.0 ||
+        rounded > static_cast<double>(INT_MAX)) {
+        return G1FootprintArithmeticFailure;
+    }
+    int candidate = static_cast<int>(rounded);
+    if (candidate >= count) candidate = count - 1;
+    output = candidate;
+    return G1FootprintOk;
+}
+
 static inline G1FootprintStatus g1_footprint_walkability_class_at(
     int& output,
     const walkability_grid& grid,
@@ -359,32 +401,14 @@ static inline G1FootprintStatus g1_footprint_walkability_class_at(
     if (!walkability_grid_matches_heightfield(grid, field)) {
         return G1FootprintInvalidField;
     }
-    float x = 0.0f;
-    float z = 0.0f;
-    float last_x = 0.0f;
-    float last_z = 0.0f;
-    if (!terrain_v2_query_coordinate(input_x, x) ||
-        !terrain_v2_query_coordinate(input_z, z) ||
-        !walkability_node_coordinate(
-            last_x, field.origin_x, field.cell_size, grid.nx - 1) ||
-        !walkability_node_coordinate(
-            last_z, field.origin_z, field.cell_size, grid.nz - 1)) {
-        return G1FootprintArithmeticFailure;
-    }
-    if (static_cast<double>(x) < static_cast<double>(field.origin_x) ||
-        static_cast<double>(x) > static_cast<double>(last_x) ||
-        static_cast<double>(z) < static_cast<double>(field.origin_z) ||
-        static_cast<double>(z) > static_cast<double>(last_z)) {
-        return G1FootprintOutsideDomain;
-    }
     int node_x = 0;
     int node_z = 0;
-    if (!walkability_nearest_axis(
-            node_x, x, field.origin_x, field.cell_size, grid.nx) ||
-        !walkability_nearest_axis(
-            node_z, z, field.origin_z, field.cell_size, grid.nz)) {
-        return G1FootprintArithmeticFailure;
-    }
+    G1FootprintStatus status = g1_footprint_nearest_walkability_axis(
+        node_x, input_x, field.origin_x, field.cell_size, grid.nx);
+    if (status != G1FootprintOk) return status;
+    status = g1_footprint_nearest_walkability_axis(
+        node_z, input_z, field.origin_z, field.cell_size, grid.nz);
+    if (status != G1FootprintOk) return status;
     int candidate = 0;
     if (!walkability_cell_value(candidate, grid, node_x, node_z)) {
         return G1FootprintInvalidField;

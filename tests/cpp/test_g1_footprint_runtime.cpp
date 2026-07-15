@@ -927,6 +927,79 @@ static void test_landing_centroid_walkability_distinguishes_malformed()
           "legitimate blocked centroid remains distinct with fixed work");
 }
 
+static void test_landing_centroid_uses_authoritative_large_endpoint_axis()
+{
+    const float origin_x = from_bits(UINT32_C(0x4b7d4b7c));
+    const float cell_size = from_bits(UINT32_C(0x47c13b95));
+    const float endpoint_x = from_bits(UINT32_C(0x4cdc5d9f));
+    check(bits(origin_x) == UINT32_C(0x4b7d4b7c) &&
+              bits(cell_size) == UINT32_C(0x47c13b95) &&
+              bits(endpoint_x) == UINT32_C(0x4cdc5d9f),
+          "large endpoint fixture preserves all exact binary32 inputs");
+    const volatile double maximum_x =
+        static_cast<double>(origin_x) +
+        1000.0 * static_cast<double>(cell_size);
+    const volatile double normalized =
+        (static_cast<double>(endpoint_x) -
+         static_cast<double>(origin_x)) /
+        static_cast<double>(cell_size);
+    check(maximum_x == 115535096.0625 &&
+              maximum_x - static_cast<double>(endpoint_x) == 0.0625 &&
+              maximum_x - static_cast<double>(endpoint_x) >
+                  static_cast<double>(0.02f),
+          "large endpoint fixture has exact authoritative binary64 maximum");
+    check(normalized == 999.9999993682732 &&
+              std::floor(normalized + 0.5) == 1000.0,
+          "large endpoint fixture independently rounds to final node 1000");
+
+    TerrainFixture terrain(1001, 2, origin_x, 0.0f, cell_size);
+    const int expected_node = 1000;
+    check(terrain.grid.cells(expected_node) == 1,
+          "large endpoint final walkability node is class one");
+    G1SurfaceSample authoritative_surface = {};
+    check(g1_surface_query_v2(
+              authoritative_surface,
+              terrain.field,
+              endpoint_x,
+              0.80f) == G1SurfaceQueryValid,
+          "authoritative G1HF/v2 accepts the large endpoint coordinate");
+
+    PoseFixture pose;
+    pose.positions[G1_LeftAnkle] = vec3(endpoint_x, 0.08f, 0.80f);
+    pose.positions[G1_RightAnkle] = vec3(endpoint_x, 0.08f, 1.10f);
+    G1FootprintObservation output;
+    poison(output);
+    const G1FootprintObservation before = output;
+    char error[256] = {};
+    const G1FootprintStatus status = observe(
+        output,
+        g1_footprint_budget(),
+        terrain,
+        stationary_command(endpoint_x, 0.95f),
+        contact_schedule(false, false, true, true),
+        pose,
+        error,
+        static_cast<int>(sizeof(error)));
+    check(status == G1FootprintOk ||
+              (status == G1FootprintArithmeticFailure &&
+               same_bytes(output, before) &&
+               std::strstr(error, "centroid") != NULL &&
+               std::strstr(error, "walkability") != NULL),
+          "large endpoint RED is exact arithmetic failure with poison preserved");
+    check(status == G1FootprintOk,
+          "observer accepts authoritative large endpoint landing centroid");
+    check(!output.blocked && output.feet[0].landing_expected &&
+              output.feet[0].landing_sample == 2U &&
+              bits(output.feet[0].predicted_landing_sole_center.x) ==
+                  UINT32_C(0x4cdc5d9f) &&
+              output.feet[0].predicted_landing_walkability_class == 1 &&
+              output.feet[0].landing_patch_ready &&
+              output.work.sweeps == 24U &&
+              output.work.surface_queries == 34U &&
+              output.work.node_visits == 144U,
+          "large endpoint publishes class-one landing with bounded fixed work");
+}
+
 static void test_failure_budget_alias_and_blocked_matrix()
 {
     TerrainFixture terrain;
@@ -1306,6 +1379,7 @@ int main(int argc, char** argv)
     test_landing_edges_and_discontinuity();
     test_exact_landing_residual_threshold();
     test_landing_centroid_walkability_distinguishes_malformed();
+    test_landing_centroid_uses_authoritative_large_endpoint_axis();
     test_failure_budget_alias_and_blocked_matrix();
     test_public_defaults_and_parity(parity);
     return 0;
