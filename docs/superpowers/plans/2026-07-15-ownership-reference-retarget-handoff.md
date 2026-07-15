@@ -387,6 +387,8 @@
 
   Publish `target` directly for full-body states. Do not compute an ownership-entry `alpha`, do not interpolate each moving target against a fixed `blend_source_`, and do not add a completion snap. Keep `blend_source_`, `blend_seconds_`, and `blend_flat_pose` only for the existing release override.
 
+  Delete the temporary two-argument `collapse_interaction_pose` compatibility declaration and implementation introduced by Task 1. After this step every production collapse call must use the captured raw G1 reference and captured displayed flat reference.
+
 - [ ] **Step 4: Compose layered Carry over fresh 60 Hz locomotion**
 
   Detect layered authority exactly once:
@@ -567,7 +569,19 @@
 
   Parse the fresh JSONL into collapsed state phases and report, for each phase, the maximum adjacent world translation and shortest-arc rotation with exact frame pair, joint index, and corrected joint name. Explicitly report Align and Carry maxima. If the strict validator fails, identify whether the first violation already exists in the pre-foot-IK adapter output or is introduced after final foot IK/FK; make only an evidence-backed correction inside Tasks 1–2 and rerun this entire task.
 
-- [ ] **Step 5: Run final status and diff checks**
+- [ ] **Step 5: Quantify final flat active-hand alignment to the runtime grasp**
+
+  From the same fresh autoplay run, sample after the final foot-IK/FK call and before drawing. For every `PickupReplay`, `Hold`, and `Carry` render frame, record the authoritative flat active-hand world transform (`LeftHand` index `18` or `RightHand` index `22`), the runtime scene object's full world transform, and the selected affordance's `hand_in_object` transform. Compute the runtime grasp as:
+
+  ```cpp
+  const Transform grasp_world = compose(
+      interaction_scene_state.object_world,
+      selected_affordance.hand_in_object);
+  ```
+
+  Report per-state sample count plus mean and maximum hand-to-grasp position error and sign-invariant shortest-arc orientation error. This audit is diagnostic and does not weaken or replace the strict continuity validator. A continuity pass is not sufficient for a `visual-ready` claim when the rendered wrist and grasp visibly separate; report the measured separation and route target-rig arm/end-effector calibration plus final flat hand IK as the next bounded correction.
+
+- [ ] **Step 6: Run final status and diff checks**
 
   Run:
 
