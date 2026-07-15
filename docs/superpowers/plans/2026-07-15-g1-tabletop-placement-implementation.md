@@ -73,8 +73,15 @@ Python `unittest`, GNU Make, fixed 25 Hz runtime.
 Before RED, verify and record the isolated implementation base:
 
 ```bash
+ELBOW_FIX=f64520753bef5737261ef2da8492794724b572ef
+LOWER_HANDOFF_BASE=5b5a12a343960941bd5a57160fb52421c1bdca8e
+LOWER_HANDOFF_REVIEW_FIX=6ccf13335e5283da8446fc00f55a6a9d9f28da8d
+
 git merge-base --is-ancestor \
   38a02137a60bfb0c2c4ac6ca9f4979aaad613f26 HEAD
+git merge-base --is-ancestor "$ELBOW_FIX" HEAD
+git merge-base --is-ancestor "$LOWER_HANDOFF_BASE" HEAD
+git merge-base --is-ancestor "$LOWER_HANDOFF_REVIEW_FIX" HEAD
 test "$(git rev-parse HEAD)" = \
   "$(git rev-parse g1-manipulation-motion-matching)"
 git branch --show-current
@@ -86,6 +93,10 @@ The recorded `HEAD` becomes `PLACEMENT_BASE` for final branch review. Stop if it
 is not the latest reviewed `g1-manipulation-motion-matching` tip containing the
 elbow/lower-handoff fixes; do not repair that mismatch by resetting to the minimum
 docs ancestor.
+
+The lower-handoff review-fix hash must have completed independent review and be
+integrated into the named manipulation branch before running this block or
+creating the placement worktree. Every ancestry command is a hard gate.
 
 **Files:**
 - Create: `interaction_place_target.h`
@@ -463,7 +474,7 @@ hand-derived pose and destination surface snapshot.
 **Interfaces:**
 - Consumes: `Database`, retained pickup `MatchCandidate`, exact held
   `TargetHandle`/`GraspAffordance`, complete current Carry pose/object snapshot,
-  and a requested placement goal.
+  exact `IKConfig`, and a requested placement goal.
 - Produces: `PlaceTimingConfig`, `PlaceMatchConfig`, `PlaceMotionMode`,
   `PlacePhase`, `RecordedPlaceClip`, `PlaceMotionLibrary`, `PlaceCandidate`,
   `select_place_motion`, `PlaceStagingPreview`, `preview_place_motion`, and
@@ -492,8 +503,6 @@ struct PlaceTimingConfig {
 struct PlaceMatchConfig {
     float maximum_entry_root_error_m = 0.25F;
     float maximum_entry_yaw_error_radians = 0.436332313F;
-    float maximum_hand_correction_m = 0.12F;
-    float maximum_hand_orientation_radians = 0.436332313F;
 };
 
 struct RecordedPlaceClip {
@@ -534,6 +543,7 @@ struct PlaceMatchInput {
     vec3 object_dimensions{};
     PlaceTimingConfig timing{};
     PlaceMatchConfig match{};
+    IKConfig ik{};
 };
 ```
 
@@ -549,6 +559,9 @@ const PlaceStagingPreview far_preview = preview_place_motion(far);
 assert(far_preview.accepted);
 assert(!far_preview.ready);
 assert(far_preview.candidate.mode == PlaceMotionMode::RecordedPlace);
+assert(exact_ik_equal(far_preview.ik, far.ik));
+assert(exact_ik_equal(far_preview.candidate.ik, far.ik));
+assert(far_preview.ik_config_fingerprint != 0U);
 
 PlaceMatchInput staged = stage_carry_snapshot(
     far, far_preview.staging_root_world);
@@ -575,7 +588,14 @@ assert(fallback.candidate.entry_frame !=
 Also place root/yaw exactly on each configured default readiness boundary, then
 at `std::nextafter(boundary, +inf)`, and prove ready then not-ready without source
 or tier fallback. Repeat with one valid tighter `PlaceMatchConfig`. Invalid timing
-or match configs reject the whole query before recorded/fallback selection.
+or match configs reject the whole query before recorded/fallback selection. Use
+`IKConfig.maximum_request_position_m` and
+`maximum_request_orientation_radians` for hand-correction boundaries: exact
+configured limits pass, next-float-over fails, and valid tighter values take
+effect. Independently reject NaN and infinity in every floating IK field, negative
+request/accepted-error fields, zero damping/finite-difference/orientation-scale/
+maximum-step fields, and a negative iteration count. No `PlaceMatchConfig` field
+may duplicate the hand limits.
 
 Advance a 1.0x fallback player for five `0.04F` updates and assert source frames
 are exactly `start, start-1, ..., start-5`; pose velocity, angular velocity, and
@@ -610,12 +630,19 @@ For snapshot identity, perturb one value independently in current pose positions
 velocities, rotations, angular velocities, hand DOF, hand-DOF velocities, foot
 contacts, current object position/rotation, held target ID/generation, held
 profile/bounds/grasp/dimensions, every requested-surface and affordance field,
-timing/match configuration, pickup-candidate/source content, every consulted
-recorded row, source events, and mapped corrections. Each perturbation must change
-the nonzero `selection_id`. Pointer-address-only changes with identical canonical
-database/library content must not change it. Quaternion-sign-equivalent and
-negative-zero-equivalent snapshots canonicalize to the same ID. Task 5 uses the
-far/stale IDs as rejected preflight requests.
+timing/match configuration, every `IKConfig` scalar and iteration count, pickup-
+candidate/source content, every consulted recorded row, source events, and mapped
+corrections. Each perturbation must change the nonzero `selection_id`. Pointer-
+address-only changes with identical canonical database/library content must not
+change it. Quaternion-sign-equivalent and negative-zero-equivalent snapshots
+canonicalize to the same ID. Task 5 uses the far/stale IDs as rejected preflight
+requests.
+
+For each independent IK perturbation, also require the preview's nonzero
+`ik_config_fingerprint` to change. Define that fingerprint from the canonical
+serialization of all eight floating fields plus `maximum_iterations`, with the
+same negative-zero normalization used by `selection_id`; it is configuration
+identity only and must not include pose, object, target, or source content.
 
 At 0.85x and 1.15x, advance across the reverse release event and assert the
 published source frame is clamped exactly to `contact_frame`, `release_due` is
@@ -654,6 +681,7 @@ struct PlaceCandidate {
     uint64_t selection_id = 0;
     PlaceTimingConfig timing{};
     PlaceMatchConfig match{};
+    IKConfig ik{};
     int32_t clip = -1;
     int32_t entry_frame = -1;
     int32_t commit_frame = -1;
@@ -686,6 +714,8 @@ struct PlaceStagingPreview {
     bool ready = false;
     Reason reason = Reason::None;
     PlaceCandidate candidate{};
+    IKConfig ik{};
+    uint64_t ik_config_fingerprint = 0;
     Transform staging_root_world{};
     float root_error_m = 0.0F;
     float yaw_error_radians = 0.0F;
@@ -695,9 +725,11 @@ struct PlaceStagingPreview {
 Require finite `PlaceTimingConfig`, exact `canonical_fps == 25.0F`, playback speed
 in `[0.85F, 1.15F]`, positive entry-blend and reversed-commit seconds, and positive
 maximum align time no smaller than either and no greater than `1.00F`. Require
-every `PlaceMatchConfig` threshold to be finite and positive, with entry root/yaw
-and hand position/orientation at most `0.25F` / `0.436332313F` and `0.12F` /
-`0.436332313F`, respectively. Tighter positive values are valid.
+both `PlaceMatchConfig` entry thresholds to be finite and positive and at most
+`0.25F` / `0.436332313F`. Validate every `IKConfig` field with the runtime's exact
+rules, and additionally require placement request limits at most `0.12F` /
+`0.436332313F`. Tighter positive match limits and valid tighter nonnegative IK
+request limits are accepted.
 
 Validate each in-memory recorded row independently as a 25 Hz contiguous
 pose/object/contact sequence with strict
@@ -730,6 +762,11 @@ within-window hand-in-object drift `<=0.02F` / `<=0.174532925F`. Also require
 active contact continuously from the semantic release event through that selected
 sample.
 
+Use `input.ik.maximum_request_position_m` and
+`input.ik.maximum_request_orientation_radians` as the only intrinsic hand-
+correction limits. Run any selection-time IK feasibility with that complete
+`input.ik`; never copy defaults or consult a duplicated match-config threshold.
+
 For true-place candidates, map the source release object pose to the requested
 goal. For fallback candidates, map the source active hand at `contact_frame` to
 `placement_goal_world * held_affordance.hand_in_object`; do not drive the held
@@ -753,19 +790,22 @@ selector result plus planar root/yaw errors against the current Carry root. A fa
 candidate remains `accepted=true` and retains its source/tier/staging root while
 `ready=false`; readiness compares against the inclusive `input.match` entry
 thresholds, capped at `0.25F` / `0.436332313F`, and is not candidate rejection.
+The preview copies the complete validated `input.ik` and reports its canonical
+fingerprint; both must equal the nested candidate IK snapshot.
 
 Compute deterministic nonzero `selection_id` from a canonical serialization of
 the exact held `TargetHandle`; every channel of current `Pose`; current object;
 held profile, bounds, grasp and dimensions; every field of the requested surface
 and affordance snapshot; canonical content fingerprints of the pickup source and
 every recorded row consulted; complete timing/match configs; selected source/
-events; scene mapping, staging root, and every selection-relevant correction.
-Never serialize pointer addresses.
+events; every `IKConfig` field; scene mapping, staging root, and every selection-
+relevant correction. Never serialize pointer addresses.
 Canonicalize normalized quaternion sign and negative zero. Preflight recomputes
 the serialization from its frozen Carry snapshot and requires the same ID. A new
 staged snapshot gets a new ID even when source candidate identity is unchanged.
 
-Copy the validated `PlaceMatchInput::timing` and `match` into the candidate. Expose
+Copy the validated `PlaceMatchInput::timing`, `match`, and `ik` into the candidate.
+Expose
 `PlacePlayer::start(const PlaceCandidate&, const PlaceMatchInput&)`, `advance(float
 dt)`, `PlaceSample sample()`, `source_frame()`, `phase()`, `committed()`,
 `release_due()`, `acknowledge_release()`, and `finished()`. The player takes speed
@@ -776,6 +816,11 @@ advance would cross release, clamp the accumulator to the exact event, discard t
 sub-tick remainder, emit the event once, and refuse to advance until
 acknowledgement. The player stores only validated pointers or copies whose
 lifetime is guaranteed by its owning `PlaceController`.
+
+`interaction_place.h` includes `interaction_ik.h` directly. The focused Make
+rule for `build/tests/test_interaction_place` names that header as a prerequisite
+and links `interaction_ik.cpp` plus its existing FK/matcher dependencies; it may
+not compile only because another target happened to supply the IK symbols.
 
 - [ ] **Step 4: Run focused and safe GREEN**
 
@@ -812,9 +857,8 @@ correct derivative time direction.
 - Modify: `Makefile`
 
 **Interfaces:**
-- Consumes: selected `PlaceCandidate`, current Carry pose/object, held grasp,
-  object-local bounds, surface/support volume/affordance, `IKConfig`, and exact
-  25 Hz updates.
+- Consumes: one complete validated `PlaceMatchInput` and its selected
+  `PlaceCandidate`, plus exact 25 Hz updates.
 - Produces: `PlaceControllerConfig`, `PlaceBeginInput`, `PlaceStep`, and explicit
   `PlaceController(PlaceControllerConfig, IKConfig)` construction.
 
@@ -833,14 +877,30 @@ struct PlaceControllerConfig {
 
 Tests assert exact boundaries are accepted and `std::nextafter(boundary, +inf)`
 is rejected. Construct `PlaceController(valid_place, valid_ik)` successfully.
+Exercise a hand correction exactly at each configured IK request limit and at the
+next float above it; repeat with valid tighter request limits and prove
+`PlaceMatchConfig` changes only entry root/yaw readiness, never the hand limit.
 Independently mutate every timing, match, and release scalar through zero
 where forbidden, NaN, infinity, reversed min/max relation, non-25-Hz rate, and
 boundary-plus-epsilon; mutate every `IKConfig` scalar and iteration count through
 its existing invalid families. Every invalid constructor call must throw
 `std::invalid_argument` before `begin` and without observable state mutation.
+The constructor also rejects either IK request limit above the placement hard
+caps (`0.12 m` / `25 degrees`) and accepts valid tighter nonnegative limits.
 Require finite `release_position_m` in `(0, 0.02F]` and finite
 `release_orientation_radians` in `(0, 0.174532925F]`; valid tighter values remain
 observable through diagnostics.
+
+Build `PlaceBeginInput{validated_match_input, candidate}` and prove `begin`
+accepts only when candidate timing, match, and every IK field exactly equal both
+the match input and constructor values. Independently perturb each IK scalar and
+iteration count in the input, candidate, and constructor; each mismatch rejects
+before player/controller mutation. Null or stale source pointers, a changed held
+target/pose/object/surface snapshot, or a candidate selection ID not produced from
+that complete input also rejects. Holding the original selection ID fixed,
+independently perturb each candidate source/event, mapped transform/correction,
+timing/match/IK field, and commit frame; exact selector-result comparison must
+reject every forged candidate before player mutation.
 On every attached step assert:
 
 ```cpp
@@ -917,18 +977,8 @@ struct PlaceStep {
 };
 
 struct PlaceBeginInput {
-    const Database* pickup_database = nullptr;
-    const PlaceMotionLibrary* library = nullptr;
-    TargetHandle held_target{};
+    PlaceMatchInput match_input{};
     PlaceCandidate candidate{};
-    Pose current_pose{};
-    Transform current_object_world{};
-    uint64_t held_object_profile_id = 0;
-    ObjectLocalBounds held_object_bounds{};
-    GraspAffordance held_affordance{};
-    PlacementSurface surface{};
-    PlaceAffordance place_affordance{};
-    vec3 object_dimensions{};
 };
 
 struct PlaceBeginResult {
@@ -947,8 +997,14 @@ public:
 ```
 
 There is no default constructor. Store validated configuration by value.
-`begin` revalidates that the candidate's timing/match fields and single commit
-event match the constructor configuration before accepting playback.
+`begin` revalidates the complete `match_input`, calls `select_place_motion` once
+on that exact input, and requires the supplied candidate's selection identity,
+source/events, timing, match, every IK field, mapped transforms/corrections, and
+single commit event to equal the resulting candidate and the constructor
+configuration before accepting playback. It does not consult preview readiness.
+It starts the player only as
+`player.start(input.candidate, input.match_input)`; no controller-local source
+bundle or default config may be reconstructed.
 
 The controller applies the mapped planar root/yaw correction that runtime already
 authorized from the frozen snapshot. It does not recompute dynamic readiness,
@@ -956,6 +1012,11 @@ reject on current entry root/yaw, change source tier, or select fallback. Task 5
 `PlacePreflight` is the sole configured entry gate, capped at `0.25 m` /
 `25 degrees`; Task 4 verifies only that the authorized warp is applied continuously
 and remains finite.
+
+Every hand solve uses the constructor's exact validated `ik_config`. A requested
+correction above either of its maximum-request fields recovers while attached
+before solving; no timing, match, release, hard-coded default, or silent clamp can
+replace those two authoritative limits.
 
 Blend entry for `ceil(config.timing.entry_blend_seconds * 25)` output ticks
 (exactly seven at the default), completing no later than the candidate's commit
@@ -1010,7 +1071,9 @@ plus conservative angular inflation, constructor validation is exhaustive and
 mutation-free, and current entry-root/yaw readiness is not re-enforced after
 preflight. Verify the authored/derived commit boundary has no off-by-one
 cancellation ambiguity, release is one-shot at every speed, object ownership has
-one source in each phase, and recovery never detaches.
+one source in each phase, the begin/player source contract is exactly one complete
+match input plus candidate, every IK mismatch is mutation-free, and recovery never
+detaches.
 
 ### Task 5: Integrate Placement into InteractionRuntime
 
@@ -1026,8 +1089,10 @@ one source in each phase, and recovery never detaches.
 - Consumes: placement surface registry, place library/controller, existing pickup
   candidate, selected-motion preview identity bound to the frozen held
   target/pose/object, attachment owner, and `RuntimeInput::place_request`.
-- Produces: appended runtime states, place diagnostics, full place lifecycle, and
-  complete runtime/controller/probe link dependencies in `Makefile`.
+- Produces: read-only `InteractionRuntime::preview_place`, one private pure match-
+  input builder shared with preflight, appended runtime states, place diagnostics,
+  full place lifecycle, and complete runtime/controller/probe link dependencies in
+  `Makefile`.
 
 - [ ] **Step 1: Write failing API and state-machine tests**
 
@@ -1041,7 +1106,20 @@ static_assert(static_cast<uint8_t>(RuntimeState::PlaceReplay) == 9U);
 static_assert(static_cast<uint8_t>(RuntimeState::PlaceRelease) == 10U);
 static_assert(std::is_same_v<
     decltype(RuntimeConfig{}.place), PlaceControllerConfig>);
+static_assert(std::is_same_v<
+    decltype(std::declval<const InteractionRuntime&>().preview_place(
+        SurfaceHandle{}, uint32_t{})),
+    PlaceStagingPreview>);
 ```
+
+Before Carry, after release, and on the legacy constructor without placement
+dependencies, call `preview_place` and require a rejected result with no runtime,
+diagnostic, target, attachment, surface, pose, or object mutation. In valid Carry,
+call it twice for the same exact handle/affordance and require bit-identical
+results, including the complete IK snapshot and canonical IK fingerprint. The
+returned candidate must equal the candidate later recomputed by PlacePreflight
+from that frozen Carry frame; the const preview itself does not write runtime
+diagnostics.
 
 Run pickup to Carry, pulse Interact with one `PlaceRequest`, and assert exact
 collapsed success order:
@@ -1072,6 +1150,22 @@ the target or surface registries. With valid distinct non-default timing, match,
 and release values, assert placement diagnostics, readiness, and commit timing
 reflect that exact config, proving runtime did not silently construct a default
 controller.
+
+Repeat both-constructor rejection for every invalid `RuntimeConfig.ik` family and
+for the next float above each placement request cap. Assert construction leaves
+both registries unchanged. Exact-cap and valid tighter nonnegative request limits
+remain accepted and observable in runtime preview.
+
+Construct otherwise identical Carry runtimes while perturbing one `IKConfig`
+scalar or iteration count at a time within the valid placement domain. Their
+preview selection IDs and IK fingerprints must differ, while otherwise identical
+runtimes must produce the same fingerprint.
+Submitting runtime A's preview ID to runtime B must reject from unchanged
+preflight; no candidate, controller, or player may accept an IK mismatch. Assert
+the preview reports the effective request limits and canonical IK fingerprint.
+Separately prove both runtime constructors accept each request limit at its cap
+and a valid tighter value, and reject the next float above either cap before any
+registry or runtime mutation.
 
 Add independent tests for: missing request, wrong held object, unready staging
 errors, selection ID from the far pre-staging snapshot, any stale snapshot digest,
@@ -1132,6 +1226,10 @@ InteractionRuntime(
     PlacementSurfaceRegistry&,
     const PlaceMotionLibrary&,
     RuntimeConfig);
+
+PlaceStagingPreview preview_place(
+    SurfaceHandle surface,
+    uint32_t affordance_id) const;
 ```
 
 The old constructor leaves placement unavailable but preserves every pickup test.
@@ -1142,20 +1240,70 @@ Add `PlaceControllerConfig place{}` to `RuntimeConfig`; validate it with the sam
 mutation-free exception behavior as matcher/playback/IK/carry configuration. The
 placement-enabled constructor creates its controller only as
 `PlaceController(config.place, config.ik)`, so runtime has one exact config path.
-Every preview and frozen preflight receives `config.place.timing` and
-`config.place.match`; no default or separately authored thresholds are allowed.
+Every preview and frozen preflight receives `config.place.timing`,
+`config.place.match`, and exact `config.ik`; no default or separately authored
+thresholds are allowed. Placement validates the IK request limits against the
+`0.12 m` / `25 degree` hard caps while preserving valid tighter values.
 The legacy constructor retains no surface/library/controller dependencies and an
 attempted Place request rejects unchanged from preflight.
 
+Add one private const helper whose result carries either a complete input or a
+reason:
+
+```cpp
+struct PlaceMatchBuildResult {
+    bool accepted = false;
+    Reason reason = Reason::None;
+    PlaceMatchInput input{};
+};
+
+PlaceMatchBuildResult make_place_match_input(
+    SurfaceHandle surface,
+    uint32_t affordance_id) const;
+```
+
+It performs no writes. It re-fetches the exact Held target generation/owner and
+exact surface generation/affordance, then builds `PlaceMatchInput` from private
+runtime state only: `database_`, `place_library_`, retained pickup `candidate_`,
+current held target/profile/bounds/dimensions, retained grasp, `pose_`, hand-
+derived `object_world_`, the surface/affordance snapshots, `config_.place.timing`,
+`config_.place.match`, and `config_.ik`. It never accepts caller-supplied pose,
+object, target, candidate, library, or config.
+
+The public const `preview_place` first requires valid attached `Carry` and all
+placement dependencies, calls that helper, and passes its exact input to the pure
+`preview_place_motion`. Outside Carry it returns `accepted=false` /
+`Reason::OutOfRange`; missing dependencies or stale handles use the corresponding
+placement reason. It never mutates diagnostics or any owned state.
+
 In Carry, an Interact edge publishes `PlacePreflight` without advancing Carry or
 mutating attachment. Validate on the following update by recomputing the complete
-selected candidate from the frozen held target/pose/object snapshot and requiring
-its canonical `selection_id` to match the request. Enforce staging root/yaw
-against the exact configured limits here and nowhere in intrinsic selection;
-those limits are capped at `0.25 m` / `25 degrees`. Do not apply the manual
-surface-resolver distance. Any failure before `PlaceController::begin` publishes
-unchanged Carry once and retains the original Carry controller. Delegate pose
-generation only after all preflight gates pass.
+selected candidate. First require `request.held_target` to equal the frozen exact
+held handle. Then call the same private helper with the requested surface/
+affordance from the frozen held target/pose/object snapshot and call the pure
+selector only after the build result is accepted. The success path is equivalent
+to:
+
+```cpp
+const PlaceMatchBuildResult built =
+    make_place_match_input(request.surface, request.affordance_id);
+const PlaceStagingPreview built_preview =
+    preview_place_motion(built.input);
+```
+
+Require the rebuilt input's held target, pose/object, retained
+pickup candidate, surface/affordance, timing/match/IK, and the preview's complete
+IK/fingerprint to equal the frozen runtime values; require the rebuilt candidate's
+timing/match/IK to equal that input; and require `request.selection_id` to equal
+the candidate's canonical `selection_id`. Enforce staging root/yaw against the
+exact configured limits here and nowhere in intrinsic selection; those limits are
+capped at `0.25 m` / `25 degrees`. Do not apply the manual surface-resolver
+distance. Any failure before `PlaceController::begin` publishes unchanged Carry
+once and retains the original Carry controller. After all gates pass, call
+`place_controller.begin(PlaceBeginInput{built.input, built_preview.candidate})`,
+where `built_preview` is the selection just recomputed from `built.input`; do not
+reuse a caller-authored candidate or reconstruct a second controller source
+bundle.
 
 At `release_due`, re-fetch the exact surface generation and affordance, recompute
 `evaluate_actual_placement_fit` from `step.object_world`, require the controller's
@@ -1194,8 +1342,10 @@ runtime test, controller-adapter test, and `interaction_runtime_probe`
 prerequisites so compile/link and incremental rebuilds use the same dependency
 closure.
 
-Update debug names exhaustively and retain `ResultCode::Succeeded/Reason::None`
-through successful PlaceRelease and final Locomotion.
+Update debug names exhaustively; expose preview availability/reason, effective IK
+request limits and config fingerprint, and preflight config-identity status.
+Retain `ResultCode::Succeeded/Reason::None` through successful PlaceRelease and
+final Locomotion.
 
 - [ ] **Step 4: Run focused and safe GREEN**
 
@@ -1223,7 +1373,8 @@ Review checkpoint: audit every place transition, failure terminal, output
 ownership flag, attachment mutation, target-generation/support update, exact
 candidate/snapshot preview validation, preflight-unchanged versus post-begin
 reconstruction choice, before/at/after commit cancellation, both frames of every
-Carry continuity case, RuntimeConfig forwarding, and complete Make link closure.
+Carry continuity case, one shared runtime input builder, exact IK identity,
+complete begin input, RuntimeConfig forwarding, and complete Make link closure.
 
 ### Task 6: Wire Manual Pick/Place and the Destination Table
 
@@ -1239,7 +1390,7 @@ Carry continuity case, RuntimeConfig forwarding, and complete Make link closure.
 
 **Interfaces:**
 - Consumes: current runtime state, one placement surface/slot, shared Interact
-  edge, read-only selected-motion preview, runtime placement output, and scene
+  edge, `InteractionRuntime::preview_place`, runtime placement output, and scene
   handoff.
 - Produces: `F` pick/place behavior with ordinary Carry staging, destination-table
   drawing, and continuous release publication.
@@ -1262,9 +1413,14 @@ Add Python static policy tests asserting:
 - scene construction retains the exact returned destination handle/affordance so
   scripted/auto control can select it directly at any distance without calling
   the manual resolver;
-- controller constructs one named `RuntimeConfig`, passes it to runtime, and uses
-  that same value's `place.timing`/`place.match` for every preview rather than
-  separately default-constructing selection thresholds;
+- controller obtains every preview only through
+  `runtime.preview_place(surface, affordance_id)` and never calls the free
+  selector, constructs `PlaceMatchInput`, or reads private candidate/config data;
+- the scheduler's place-preview callback accepts only `SurfaceHandle` and
+  affordance ID, and its controller-owned lambda calls that runtime method
+  directly with those two parameters, capturing only the runtime and never
+  accepting or capturing an external pose, object, candidate, library, timing,
+  match, or IK configuration;
 - staging converts preview root/yaw error through the existing camera/control
   basis into ordinary Carry input and never writes simulation or displayed root;
 - runtime Place is pulsed only when preview is ready and request `selection_id`
@@ -1308,19 +1464,21 @@ object-local bounds center, and half-extents equal to half its measured
 `object_dimensions`. This explicit center is a demo-scene authoring decision, not
 a general inference rule.
 
-Extend the scheduler with a place resolver and preview callback while preserving
-the current pick resolver API. On `F`, resolve exactly one surface within the
-1.00 m manual convenience envelope when the cached state is Carry and latch it.
-This resolver is never called by the frozen auto-demo. Construct one named
-`RuntimeConfig`, pass it into runtime, and capture its exact `place.timing` and
-`place.match` values in the preview callback. Each 25 Hz tick recomputes the
-preview and feeds staging error through the ordinary left-stick/Carry seam.
+Extend the scheduler with a place resolver while preserving the current pick
+resolver API. On `F`, resolve exactly one surface within the 1.00 m manual
+convenience envelope when the cached state is Carry and latch it. This resolver is
+never called by the frozen auto-demo. Each 25 Hz tick calls only
+the narrow place-preview callback; the callback's controller lambda immediately
+calls `runtime.preview_place(surface, affordance_id)` with its supplied latched
+handle and feeds the returned staging error through the ordinary left-stick/Carry
+seam. The callback has no match-input or runtime-snapshot parameter.
 An accepted far preview retains candidate/staging information with `ready=false`.
 `X` clears the latch. When the current preview reports root error `<=0.25 m`, yaw
 error `<=25 degrees`, and ready, submit its newly computed explicit request once.
 Draw the support rectangle/volume, explicit object bounds, final object frame,
-approach axis, staging root/error/readiness, actual release fit, and place mode.
-Change help text to `F pick/place  X cancel  R reset`.
+approach axis, staging root/error/readiness, effective IK request limits and
+fingerprint, actual release fit, and place mode. Change help text to
+`F pick/place  X cancel  R reset`.
 
 During PlacePreflight/Align/Replay keep scene authority on the attached runtime
 object. On atomic release, refresh the object handle by stable ID and let the Free
@@ -1351,7 +1509,8 @@ git commit -m "feat: control tabletop placement in scene"
 Review checkpoint: inspect target/constraint identity across generation change and
 prove manual pickup behavior is unchanged when no place request is active,
 the `1.00 m` surface resolver is manual-only, the authored destination identity is
-stable and directly usable at any distance, staging never writes a root, stale
+stable and directly usable at any distance, controller code cannot construct a
+place match input or invoke the free selector, staging never writes a root, stale
 preview IDs are not submitted, and the released target is immediately selectable
 with destination support context.
 
@@ -1365,8 +1524,8 @@ with destination support context.
 
 **Interfaces:**
 - Consumes: deterministic fixture pack, pickup runtime, Carry, one placement
-  surface with an explicit retained handle, a staged-ready Carry snapshot, and
-  the reversed fallback.
+  surface with an explicit retained handle, an ordinary live-flat provider that
+  drives actual runtime Carry, and the reversed fallback.
 - Produces: `interaction_place_probe <pack> --json` and
   `make gate-place-headless`.
 
@@ -1376,6 +1535,7 @@ Require one compact sorted JSON record:
 
 ```json
 {
+  "actual_carry_staging": true,
   "actual_fit": true,
   "attachment_transitions": 1,
   "destination_selected_directly": true,
@@ -1385,10 +1545,13 @@ Require one compact sorted JSON record:
   "final_object_state": "Free",
   "final_reason": "None",
   "final_result": "Succeeded",
+  "ik_config_bound": true,
+  "ik_config_fingerprint": 12345,
   "mode": "reversed_pickup",
   "release_frame": 139,
   "repick_support_is_destination": true,
   "reverse_start_frame": 181,
+  "runtime_preview_only": true,
   "staged_preview_ready": true,
   "staged_selection_id_changed": true,
   "state_sequence": [
@@ -1398,7 +1561,9 @@ Require one compact sorted JSON record:
 }
 ```
 
-Tests must derive expected contact and stable-window indices from the fixture
+The displayed fingerprint and frame numbers are illustrative; tests require a
+nonzero canonical fingerprint derived from the exact fixture configuration and
+derive expected contact and stable-window indices from the fixture
 rather than assuming the illustrative numbers above. Make the first five-sample
 Hold window unstable and the next one stable, assert the earliest certified
 window wins, and mutate only the clip's last contact to zero while expecting the
@@ -1407,12 +1572,23 @@ After release, require the target's table transform/size to equal the destinatio
 support and submit a fresh ordinary pick preflight for the returned generation;
 assert its query context uses the destination support.
 
-Before submitting Place, require an initial far Carry snapshot whose preview is
-accepted with the expected source/staging root but not ready. Construct a second
-internally consistent Carry snapshot at the returned staging root/yaw, including
-its hand-derived held object, and require preview ready. The ready ID must differ
-from the far ID. Submit only the ready request and assert a request carrying the
-far or otherwise stale ID takes the unchanged-preflight Carry path.
+After actual pickup reaches Carry, call only `runtime.preview_place` for the
+retained destination. Require its initial far result to be accepted with the
+expected source/staging root, exact runtime IK snapshot, and nonzero canonical IK
+fingerprint, but not ready. Drive the live flat-provider and
+actual runtime through consecutive 25 Hz Carry updates toward that returned root;
+do not construct `PlaceMatchInput`, assign runtime pose/object, or fabricate a
+second Carry snapshot. Require a later runtime preview to be ready, with a new ID
+and more than `0.20 m` actual root/object displacement. The far and staged
+previews must report the same nonzero IK fingerprint and complete IK snapshot,
+both exactly equal to the runtime configuration; movement changes selection
+identity, not configuration identity.
+
+In a separate identical runtime fixture, submit the far ID or an IK-mismatched ID
+obtained from another valid runtime-owned preview after actual Carry staging; do
+not fabricate either candidate. Assert the unchanged-preflight two-frame recovery.
+The successful fixture submits only its current ready runtime-preview ID, keeping
+the collapsed success state sequence unpolluted by the negative case.
 
 - [ ] **Step 2: Run RED**
 
@@ -1432,15 +1608,17 @@ the real probe binary.
 The probe loads the existing interaction pack, performs pickup to Carry, and
 constructs one authored destination surface while retaining its exact returned
 handle/affordance. It never uses the manual distance resolver. From Carry it first
-uses the same named `RuntimeConfig.place.timing/match` supplied to runtime to
-prove far accepted/not-ready preview, then constructs a staged/ready Carry
-snapshot and submits exactly one `PlaceRequest` with that snapshot's ID. It
-advances only with `dt=1.0F / 25.0F` and checks every state and attachment
-transition before printing JSON. It exits nonzero on rejection, failure, timeout,
-non-contiguous source frames, unexpected mode, stale-ID acceptance, or
-release-pose mismatch. It also verifies actual-pose support fit, exact destination
-support commit, and one successful re-pick preflight using that destination
-context.
+calls `runtime.preview_place`, proves far accepted/not-ready, and uses a
+deterministic ordinary live-flat provider to advance actual runtime Carry toward
+the returned staging root. It never creates a match input or directly stages a
+pose/object snapshot. Once a fresh runtime preview is ready, it submits exactly
+one `PlaceRequest` with that preview's ID. It advances only with
+`dt=1.0F / 25.0F` and checks every state and attachment transition before printing
+JSON. It exits nonzero on rejection, failure, timeout, non-contiguous source
+frames, unexpected mode, stale-ID acceptance, IK identity mismatch, external-
+snapshot construction, or release-pose mismatch. It also verifies actual-pose
+support fit, exact destination support commit, and one successful re-pick
+preflight using that destination context.
 
 Add:
 
@@ -1474,8 +1652,9 @@ git commit -m "test: gate headless tabletop placement"
 
 Review checkpoint: run the last-frame-contact mutation and verify the probe still
 uses only the earlier certified Hold sample, then verify the released generation
-re-picks against the destination support. Inspect the constructed Carry snapshot
-and prove Place used the ready staged ID, not the far ID or a distance resolver.
+re-picks against the destination support. Prove every preview came from the runtime
+API, actual runtime Carry produced the staged pose/object, and Place used the
+current ready ID, not the far/IK-mismatched ID or a distance resolver.
 
 ### Task 8: Prove Genuine Walk, Pickup, Carry, and Place Graphically
 
@@ -1531,8 +1710,12 @@ The synthetic fixture and validator must reject:
 - any placement-surface resolver call in auto-demo mode, any destination handle/
   affordance different from the retained authored pair, or any destination
   generation change before Place;
+- any external `PlaceMatchInput` construction, free-selector call, preview outside
+  valid Carry, or preview-side runtime/diagnostic mutation;
 - initial Carry preview not accepted, missing staging root, or incorrectly ready
   while outside `0.25 m` / `25 degrees`;
+- missing/zero IK fingerprint, any preview IK field unequal to the runtime
+  configuration, or a changed IK fingerprint between far and staged previews;
 - fewer than 25 or more than 150 consecutive ordinary Carry staging rows;
 - Carry root or object displacement `<=0.20 m`;
 - any direct simulation/displayed-root write during staging, missing selected
@@ -1586,12 +1769,13 @@ auto-demo. Its input sequence is state-driven and bounded:
    bound.
 5. Complete pickup and latch the retained authored destination handle/affordance
    directly regardless of current distance. Do not call `resolve_single_surface`
-   in placement auto-demo mode. Require the first preview to be intrinsically
-   accepted with a staging root and not ready. Recompute exact preview each tick
-   and convert staging-root/yaw error through the existing camera basis to
-   ordinary Carry left-stick input. Run for at least 25 and at most 150 ticks,
-   require root/object displacement above `0.20 m`, and never write either root
-   directly.
+   in placement auto-demo mode. Call only
+   `runtime.preview_place(destination_handle, affordance_id)`. Require the first
+   result to be intrinsically accepted with a staging root and not ready. Call the
+   same runtime method each tick and convert returned staging-root/yaw error
+   through the existing camera basis to ordinary Carry left-stick input. Run for
+   at least 25 and at most 150 ticks, require root/object displacement above
+   `0.20 m`, and never write either root or construct a match snapshot directly.
 6. Let the controller pulse runtime Place once only when the exact live preview
    reports ready with root/yaw error at most `0.25 m` / `25 degrees`; submit the
    current staged-snapshot ID and prove it differs from the initial far ID.
@@ -1606,9 +1790,10 @@ Log the current pickup distance, walking-origin displacement, displayed-root
 speed, approach/settle phase and counter, locomotion-provider kind,
 canonical-snapshot and root-relocation flags, Reach navigation waypoint, latched
 destination handle/generation/affordance, placement-surface-resolver call count,
-far and current selection IDs, candidate certification, staging
-root/error/readiness, direct-root-write flag, place goal/error, requested and
-actual fit/gap/bounds/overhead/sweep,
+runtime-preview/free-selector/external-match-input call counts, far and current
+selection IDs, candidate certification, effective IK request limits/config
+fingerprint, staging root/error/readiness, direct-root-write flag, place goal/
+error, requested and actual fit/gap/bounds/overhead/sweep,
 attachment transition count, destination support committed to the target, place
 source/mode, and the same final-FK joint/grasp data used by the pickup evidence.
 
@@ -1624,9 +1809,10 @@ Add static placement-policy tests proving the placement-mode branch cannot call
 legacy helpers solely behind the existing pickup-only auto-demo mode.
 
 Also prove the placement-mode branch reads only the retained authored
-destination handle/affordance, never calls `resolve_single_surface`, and sends
-only the current ready preview's selection ID. Keep manual `F` behavior and its
-`1.00 m` resolver in the non-auto branch.
+destination handle/affordance, never calls `resolve_single_surface` or
+`preview_place_motion`, never constructs `PlaceMatchInput`, and sends only the
+current ready `runtime.preview_place` selection ID. Keep manual `F` behavior and
+its `1.00 m` resolver in the non-auto branch.
 
 - [ ] **Step 4: Add the isolated graphical gate**
 
@@ -1662,7 +1848,8 @@ settled live-provider rows, then pickup, a direct stable authored-destination
 selection, an accepted/not-ready far preview, ordinary preview-guided Carry
 staging, a new ready selection ID, one `reversed_pickup` place, one release, and a
 final supported object. No row uses a placement-surface resolver, canonical
-snapshot substitution, or root relocation; the placement validator exits 0.
+snapshot substitution, external match-input assembly, free selector, or root
+relocation; the placement validator exits 0.
 
 - [ ] **Step 6: Inspect visual evidence**
 
@@ -1693,9 +1880,10 @@ Review checkpoint: independently inspect the lossless video and JSONL. Require a
 start beyond `2.80 m`, progressing approach rows, the five-row settled band, the
 `live_flat` provider throughout, and false canonical-snapshot/root-relocation
 flags throughout. Require a stable direct destination handle, zero placement-
-surface resolver calls, an accepted/not-ready far preview, and a distinct ready
-live selection ID at Place. A passing synthetic or headless probe cannot
-substitute for genuine ordinary flat walking in the graphical evidence.
+surface resolver calls, runtime-owned preview only, an accepted/not-ready far
+preview, exact IK identity, and a distinct ready live selection ID at Place. A
+passing synthetic or headless probe cannot substitute for genuine ordinary flat
+walking in the graphical evidence.
 
 ## Final Verification and Branch Review
 
