@@ -101,6 +101,7 @@ CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_database
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_pose
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_target
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_place_target
+CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_place
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_features
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_matcher
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_playback
@@ -114,6 +115,8 @@ RELEASE_FAST_MATH_TARGET_TEST := \
   $(CPP_TEST_DIR)/test_interaction_target_release_fast_math
 RELEASE_FAST_MATH_CARRY_TEST := \
   $(CPP_TEST_DIR)/test_interaction_carry_release_fast_math
+PLACE_SELECTION_FAST_MATH_TEST := \
+  $(CPP_TEST_DIR)/test_interaction_place_selection_fast_math
 
 INTERACTION_RUNTIME_SOURCES := interaction_runtime.cpp
 INTERACTION_RUNTIME_SOURCES += interaction_carry.cpp interaction_ik.cpp
@@ -126,6 +129,7 @@ INTERACTION_RUNTIME_SOURCES += interaction_pose.cpp interaction_target.cpp
 .PHONY: test-python-interaction-safe test-interaction-safe
 .PHONY: test-interaction-target-release-fast-math
 .PHONY: test-interaction-carry-release-fast-math
+.PHONY: test-interaction-place-selection-fast-math
 .PHONY: demo-interaction-pack gate-playable-interaction
 .PHONY: gate1-interaction
 
@@ -156,11 +160,17 @@ $(CPP_TEST_DIR)/test_interaction_target: tests/cpp/test_interaction_target.cpp i
 $(CPP_TEST_DIR)/test_interaction_place_target: tests/cpp/test_interaction_place_target.cpp interaction_place_target.cpp interaction_place_target.h interaction_matcher.h interaction_features.h interaction_target.h interaction_pose.cpp interaction_pose.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_place_target.cpp interaction_place_target.cpp interaction_pose.cpp -o $@
 
+$(CPP_TEST_DIR)/test_interaction_place: tests/cpp/test_interaction_place.cpp interaction_place.cpp interaction_place.h interaction_place_target.cpp interaction_place_target.h interaction_ik.cpp interaction_ik.h g1_arm_joint_metadata.h interaction_matcher.cpp interaction_matcher.h interaction_features.cpp interaction_features.h interaction_pose.cpp interaction_pose.h interaction_target.cpp interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_place.cpp interaction_place.cpp interaction_place_target.cpp interaction_ik.cpp interaction_matcher.cpp interaction_features.cpp interaction_pose.cpp interaction_target.cpp -o $@
+
 $(RELEASE_FAST_MATH_TARGET_TEST): tests/cpp/test_interaction_target.cpp interaction_target.cpp interaction_target.h interaction_pose.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) -O3 -DNDEBUG -ffast-math tests/cpp/test_interaction_target.cpp interaction_target.cpp -o $@
 
 $(RELEASE_FAST_MATH_CARRY_TEST): tests/cpp/test_interaction_carry_fast_math.cpp tests/cpp/interaction_runtime_fixture.h interaction_carry.cpp interaction_carry.h interaction_ik.cpp interaction_ik.h g1_arm_joint_metadata.h interaction_matcher.cpp interaction_matcher.h interaction_features.cpp interaction_features.h interaction_pose.cpp interaction_pose.h interaction_target.cpp interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) -O3 -DNDEBUG -ffast-math tests/cpp/test_interaction_carry_fast_math.cpp interaction_carry.cpp interaction_ik.cpp interaction_matcher.cpp interaction_features.cpp interaction_pose.cpp interaction_target.cpp -o $@
+
+$(PLACE_SELECTION_FAST_MATH_TEST): tests/cpp/test_interaction_place.cpp interaction_place.cpp interaction_place.h interaction_place_target.cpp interaction_place_target.h interaction_ik.cpp interaction_ik.h g1_arm_joint_metadata.h interaction_matcher.cpp interaction_matcher.h interaction_features.cpp interaction_features.h interaction_pose.cpp interaction_pose.h interaction_target.cpp interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) -O3 -DNDEBUG -ffast-math tests/cpp/test_interaction_place.cpp interaction_place.cpp interaction_place_target.cpp interaction_ik.cpp interaction_matcher.cpp interaction_features.cpp interaction_pose.cpp interaction_target.cpp -o $@
 
 $(CPP_TEST_DIR)/test_interaction_features: tests/cpp/test_interaction_features.cpp interaction_features.cpp interaction_features.h interaction_pose.cpp interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_features.cpp interaction_features.cpp interaction_pose.cpp -o $@
@@ -215,6 +225,9 @@ test-interaction-target-release-fast-math: $(RELEASE_FAST_MATH_TARGET_TEST)
 test-interaction-carry-release-fast-math: $(RELEASE_FAST_MATH_CARRY_TEST)
 	$(RELEASE_FAST_MATH_CARRY_TEST)
 
+test-interaction-place-selection-fast-math: $(PLACE_SELECTION_FAST_MATH_TEST)
+	$(PLACE_SELECTION_FAST_MATH_TEST) --fast-math-canary
+
 test-interaction: test-python test-cpp
 
 test-python-interaction-safe: interaction_probe $(SAFE_INTERACTION_QUERY_PROBE)
@@ -225,7 +238,8 @@ test-python-interaction-safe: interaction_probe $(SAFE_INTERACTION_QUERY_PROBE)
 
 test-interaction-safe: test-python-interaction-safe test-cpp \
   test-interaction-target-release-fast-math \
-  test-interaction-carry-release-fast-math
+  test-interaction-carry-release-fast-math \
+  test-interaction-place-selection-fast-math
 
 gate1-interaction: test-interaction-safe interaction_probe
 	python -m resources.build_g1_interaction_database \
