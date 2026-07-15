@@ -844,13 +844,15 @@ bool within_transform_error(
 
 struct SelectionFailures {
     bool blocked_path = false;
+    bool placement_out_of_bounds = false;
     bool correction_limit = false;
     bool joint_limit = false;
 
     void remember(Reason reason) {
-        if (reason == Reason::BlockedPath ||
-            reason == Reason::PlacementOutOfBounds) {
+        if (reason == Reason::BlockedPath) {
             blocked_path = true;
+        } else if (reason == Reason::PlacementOutOfBounds) {
+            placement_out_of_bounds = true;
         } else if (reason == Reason::JointLimit) {
             joint_limit = true;
         } else if (reason == Reason::CorrectionLimit) {
@@ -861,6 +863,7 @@ struct SelectionFailures {
     Reason strongest() const {
         if (joint_limit) return Reason::JointLimit;
         if (correction_limit) return Reason::CorrectionLimit;
+        if (placement_out_of_bounds) return Reason::PlacementOutOfBounds;
         if (blocked_path) return Reason::BlockedPath;
         return Reason::NoCandidate;
     }
@@ -1042,23 +1045,22 @@ bool swept_interval_intersects_support(
            minimum.z <= support_half.z && maximum.z >= -support_half.z;
 }
 
-bool mapped_clearance_valid(
+Reason mapped_clearance_failure(
     const std::vector<Transform>& object_samples,
     const PlaceMatchInput& input,
     Transform release_object) {
     if (object_samples.size() < 2U) {
-        return false;
+        return Reason::BlockedPath;
     }
     try {
-        if (!evaluate_actual_placement_fit(
-                 input.surface,
-                 input.place_affordance,
-                 release_object,
-                 input.held_object_bounds).accepted) {
-            return false;
-        }
+        const PlacementFit fit = evaluate_actual_placement_fit(
+            input.surface,
+            input.place_affordance,
+            release_object,
+            input.held_object_bounds);
+        if (!fit.accepted) return fit.reason;
     } catch (const std::exception&) {
-        return false;
+        return Reason::PlacementOutOfBounds;
     }
     const size_t release = object_samples.size() - 1U;
     for (size_t sample = 0; sample < release; ++sample) {
@@ -1066,7 +1068,7 @@ bool mapped_clearance_valid(
                 object_samples[sample],
                 input.held_object_bounds,
                 input.surface)) {
-            return false;
+            return Reason::BlockedPath;
         }
     }
     for (size_t sample = 1U; sample < object_samples.size(); ++sample) {
@@ -1075,10 +1077,10 @@ bool mapped_clearance_valid(
                 object_samples[sample],
                 input.held_object_bounds,
                 input.surface)) {
-            return false;
+            return Reason::BlockedPath;
         }
     }
-    return true;
+    return Reason::None;
 }
 
 std::optional<Transform> solve_release_object(
@@ -1172,7 +1174,8 @@ bool recorded_timing_valid(
 std::optional<RecordedRow> validate_recorded_row(
     const RecordedPlaceClip& clip,
     size_t library_index,
-    const PlaceTimingConfig& timing) {
+    const PlaceTimingConfig& timing,
+    SelectionFailures& failures) {
     if (clip.id == 0U || clip.object_profile_id == 0U ||
         clip.fps_numerator != 25U || clip.fps_denominator != 1U ||
         clip.poses.empty() ||
@@ -1234,7 +1237,10 @@ std::optional<RecordedRow> validate_recorded_row(
             *source_affordance,
             clip.object_poses[static_cast<size_t>(clip.release_frame)],
             clip.object_bounds);
-        if (!fit.accepted) return std::nullopt;
+        if (!fit.accepted) {
+            failures.remember(fit.reason);
+            return std::nullopt;
+        }
     } catch (const std::exception&) {
         return std::nullopt;
     }
@@ -1422,9 +1428,10 @@ std::optional<PlaceCandidate> recorded_candidate(
             scene, clip.object_poses[static_cast<size_t>(frame)]));
     }
     object_samples.push_back(*solved_release_object);
-    if (!mapped_clearance_valid(
-            object_samples, input, *solved_release_object)) {
-        failures.remember(Reason::BlockedPath);
+    const Reason clearance_failure = mapped_clearance_failure(
+        object_samples, input, *solved_release_object);
+    if (clearance_failure != Reason::None) {
+        failures.remember(clearance_failure);
         return std::nullopt;
     }
     const std::optional<float> continuity_cost =
@@ -1497,7 +1504,7 @@ std::optional<PlaceCandidate> select_recorded_tier(
     structurally_valid.reserve(input.library->recorded.size());
     for (size_t index = 0; index < input.library->recorded.size(); ++index) {
         const std::optional<RecordedRow> row = validate_recorded_row(
-            input.library->recorded[index], index, input.timing);
+            input.library->recorded[index], index, input.timing, failures);
         if (row.has_value()) structurally_valid.push_back(*row);
     }
 
@@ -1724,10 +1731,26 @@ bool reverse_prefix_valid(
         return false;
     }
     const size_t active = static_cast<size_t>(input.held_affordance.hand);
+    uint8_t previous_precontact_phase = static_cast<uint8_t>(Phase::Approach);
     for (int32_t frame = candidate.entry_frame;
          frame <= reverse_start;
          ++frame) {
         if (!database_frame_valid(database, frame)) return false;
+        const uint8_t phase = database.phases[static_cast<size_t>(frame)];
+        if (frame < candidate.contact_frame) {
+            if (phase > static_cast<uint8_t>(Phase::Reach) ||
+                (frame > candidate.entry_frame &&
+                 phase < previous_precontact_phase)) {
+                return false;
+            }
+            previous_precontact_phase = phase;
+        } else if (frame < candidate.lift_frame) {
+            if (phase != static_cast<uint8_t>(Phase::Contact)) return false;
+        } else if (frame < candidate.hold_frame) {
+            if (phase != static_cast<uint8_t>(Phase::Lift)) return false;
+        } else if (phase != static_cast<uint8_t>(Phase::Hold)) {
+            return false;
+        }
         if (frame >= candidate.contact_frame &&
             database.hand_contacts[static_cast<size_t>(frame) * 2U + active] !=
                 1U) {
@@ -1817,9 +1840,10 @@ std::optional<PlaceCandidate> select_reverse_tier(
             inverse(input.held_affordance.hand_in_object)));
     }
     object_samples.push_back(*solved_release_object);
-    if (!mapped_clearance_valid(
-            object_samples, input, *solved_release_object)) {
-        failures.remember(Reason::BlockedPath);
+    const Reason clearance_failure = mapped_clearance_failure(
+        object_samples, input, *solved_release_object);
+    if (clearance_failure != Reason::None) {
+        failures.remember(clearance_failure);
         return std::nullopt;
     }
 

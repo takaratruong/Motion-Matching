@@ -1274,6 +1274,16 @@ void test_reverse_certification_rejections() {
                 static_cast<uint8_t>(Phase::Lift);
         },
         [](PlaceFixture& value) {
+            value.database.phases[
+                static_cast<size_t>(kContactFrame - 1)] =
+                static_cast<uint8_t>(Phase::Contact);
+        },
+        [](PlaceFixture& value) {
+            value.database.phases[
+                static_cast<size_t>(kLiftFrame + 1)] =
+                static_cast<uint8_t>(Phase::Contact);
+        },
+        [](PlaceFixture& value) {
             value.database.hand_contacts[
                 static_cast<size_t>(kHoldFrame + 1) * 2U + 1U] = 2U;
         },
@@ -1764,6 +1774,39 @@ void test_selection_runs_real_ik_with_exact_config() {
     TEST_CHECK(relaxed_result.accepted);
     TEST_CHECK(relaxed_result.candidate.mode ==
                PlaceMotionMode::ReversedPickup);
+}
+
+void test_placement_fit_failure_reasons_are_preserved() {
+    PlaceFixture solved_release = make_fixture();
+    set_clip_grasp(
+        solved_release.library.recorded.front(),
+        Transform{vec3(0.020F, 0.0F, 0.0F), quat()});
+    solved_release.input.place_affordance.object_in_surface.position.x =
+        solved_release.input.surface.half_extent_x_m -
+        solved_release.input.held_object_bounds.half_extents_object.x -
+        solved_release.input.place_affordance.clearance_radius;
+    solved_release.input.surface.affordances.front() =
+        solved_release.input.place_affordance;
+    solved_release.input.ik.accepted_position_m = 0.021F;
+    solved_release.input.ik.maximum_iterations = 0;
+    solved_release.input.pickup_candidate.clip = -1;
+    refresh_pointers(solved_release);
+    const PlaceResult solved_release_result = select_place_motion(
+        solved_release.input);
+    TEST_CHECK(!solved_release_result.accepted);
+    TEST_CHECK(solved_release_result.reason ==
+               Reason::PlacementOutOfBounds);
+
+    PlaceFixture source_release = make_fixture();
+    source_release.library.recorded.front()
+        .source_surface.half_extent_x_m = 0.049F;
+    source_release.input.pickup_candidate.clip = -1;
+    refresh_pointers(source_release);
+    const PlaceResult source_release_result = select_place_motion(
+        source_release.input);
+    TEST_CHECK(!source_release_result.accepted);
+    TEST_CHECK(source_release_result.reason ==
+               Reason::PlacementOutOfBounds);
 }
 
 uint64_t accepted_selection_id(PlaceFixture& fixture) {
@@ -2564,8 +2607,14 @@ void test_reverse_player_snaps_fractional_speed_integer_alignment() {
     fixture.input.pickup_candidate.contact_frame = 1;
     fixture.input.pickup_candidate.lift_frame = 12;
     fixture.input.pickup_candidate.hold_frame = 18;
-    fixture.database.phases[1] = static_cast<uint8_t>(Phase::Contact);
-    fixture.database.phases[12] = static_cast<uint8_t>(Phase::Lift);
+    for (int32_t frame = 1; frame < 12; ++frame) {
+        fixture.database.phases[static_cast<size_t>(frame)] =
+            static_cast<uint8_t>(Phase::Contact);
+    }
+    for (int32_t frame = 12; frame < 18; ++frame) {
+        fixture.database.phases[static_cast<size_t>(frame)] =
+            static_cast<uint8_t>(Phase::Lift);
+    }
     for (int32_t frame = 18; frame < kFrameCount; ++frame) {
         fixture.database.phases[static_cast<size_t>(frame)] =
             static_cast<uint8_t>(Phase::Hold);
@@ -2935,6 +2984,7 @@ int main(int argc, char** argv) {
     test_recorded_release_support_boundaries();
     test_selection_certifies_mapped_support_volume_clearance();
     test_selection_runs_real_ik_with_exact_config();
+    test_placement_fit_failure_reasons_are_preserved();
     test_complete_snapshot_identity_and_pointer_independence();
     test_ik_fingerprint_is_complete_and_configuration_only();
     test_canonical_identity_normalizes_negative_zero_and_quaternion_sign();
