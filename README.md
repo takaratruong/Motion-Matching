@@ -105,6 +105,31 @@ PY
 
 Gate 1 replays data only; it does not yet make the character pick up an object.
 
+# Focused headless tabletop placement gate
+
+Build the deterministic diagnostic pack, then run the placement gate without a
+display:
+
+```bash
+make demo-interaction-pack
+make gate-place-headless
+```
+
+`INTERACTION_DEMO_PACK` overrides the pack directory for both commands. The
+gate runs the safe interaction suite, performs a real pickup to Carry, and
+drives native 25 Hz Carry updates with a deterministic flat-ground provider.
+Every far and staged placement candidate comes from `runtime.preview_place`
+for the retained destination handle; the probe submits only the current ready
+ID and never uses the manual distance resolver.
+
+The single compact JSON record verifies the reversed-pickup state sequence,
+the certified stable Hold window, exact IK configuration identity, actual
+release-pose support fit, and the destination support committed to the released
+generation. It also completes a fresh pickup preflight for that generation
+using the destination support context. The Python validator independently
+checks sorted compact output, earliest-window selection, and invariance when
+only the source clip's last contact sample is cleared.
+
 # Playable G1 Tabletop Pickup
 
 The desktop controller now combines the existing flat locomotion controller with one authored G1 tabletop pickup. Locomotion, interaction matching, rendering, scene publication, and the ownership handoff advance synchronously at a fixed 25 Hz; none of them is driven by wall-clock frame time.

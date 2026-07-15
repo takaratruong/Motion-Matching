@@ -156,7 +156,7 @@ INTERACTION_RUNTIME_SOURCES += $(INTERACTION_PLACE_SOURCES)
 .PHONY: test-interaction-carry-release-fast-math
 .PHONY: test-interaction-place-selection-fast-math
 .PHONY: test-interaction-place-release-fast-math
-.PHONY: demo-interaction-pack gate-playable-interaction
+.PHONY: demo-interaction-pack gate-playable-interaction gate-place-headless
 .PHONY: gate1-interaction
 
 $(CPP_TEST_DIR):
@@ -248,6 +248,9 @@ $(SAFE_INTERACTION_QUERY_PROBE): interaction_query_probe.cpp interaction_feature
 interaction_runtime_probe: interaction_runtime_probe.cpp interaction_runtime.h $(INTERACTION_RUNTIME_SOURCES) $(INTERACTION_PLACE_HEADERS) interaction_carry.h interaction_ik.h interaction_rotation_gate.h g1_arm_joint_metadata.h interaction_attachment.h interaction_playback.h interaction_matcher.h interaction_features.h interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h
 	$(CXX) $(CPP_TEST_FLAGS) interaction_runtime_probe.cpp $(INTERACTION_RUNTIME_SOURCES) -o $@
 
+interaction_place_probe: interaction_place_probe.cpp interaction_controller_adapter.cpp interaction_controller_adapter.h interaction_target_rig_ik.cpp interaction_target_rig_ik.h locomotion_timing.h interaction_runtime.h $(INTERACTION_RUNTIME_SOURCES) $(INTERACTION_PLACE_HEADERS) interaction_carry.h interaction_ik.h interaction_rotation_gate.h g1_arm_joint_metadata.h interaction_attachment.h interaction_playback.h interaction_matcher.h interaction_features.h interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h
+	$(CXX) $(CPP_TEST_FLAGS) interaction_place_probe.cpp interaction_controller_adapter.cpp interaction_target_rig_ik.cpp $(INTERACTION_RUNTIME_SOURCES) -o $@
+
 test-python: interaction_probe interaction_query_probe
 	python -m unittest discover -s tests/python -t . -v
 
@@ -304,6 +307,10 @@ demo-interaction-pack:
 	  --allow-rejections
 	python -m resources.validate_g1_interaction_database \
 	  --input "$(INTERACTION_DEMO_PACK)"
+
+gate-place-headless: test-interaction-safe interaction_place_probe
+	./interaction_place_probe "$(INTERACTION_DEMO_PACK)" --json
+	python -m unittest tests.python.test_place_probe -v
 
 gate-playable-interaction: test-interaction-safe demo-interaction-pack \
   interaction_probe interaction_runtime_probe
