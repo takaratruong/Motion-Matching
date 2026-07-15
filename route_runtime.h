@@ -1,6 +1,8 @@
 #pragma once
 
 #include "scene_runtime.h"
+#include "g1_command_runtime.h"
+#include "g1_kinematic_contract.h"
 
 #include <climits>
 #include <cmath>
@@ -14,6 +16,13 @@ struct deterministic_route_sample
     vec3 command;
     int waypoint = 0;
     bool complete = false;
+};
+
+struct deterministic_route_prediction
+{
+    vec3 commands[G1CommandTrajectorySampleCount];
+    int sampled_frames[G1CommandTrajectorySampleCount] = {};
+    bool force_search = false;
 };
 
 static inline bool deterministic_route_segment_frames(
@@ -197,6 +206,143 @@ static inline bool deterministic_route_command(
     sample.waypoint = static_cast<int>(route.waypoints_xz.size()) - 1;
     sample.complete = true;
     out = sample;
+    return true;
+}
+
+static inline bool deterministic_route_prediction_error(
+    deterministic_route_prediction& output,
+    char* error,
+    int capacity,
+    const char* message)
+{
+    if (error != NULL && capacity > 0 &&
+        g1_command_memory_overlaps(
+            &output,
+            sizeof(output),
+            error,
+            static_cast<std::size_t>(capacity))) {
+        return false;
+    }
+    return scene_error(error, capacity, "%s", message);
+}
+
+static inline bool deterministic_route_predict_commands(
+    deterministic_route_prediction& output,
+    const scene_route& route,
+    int current_frame,
+    vec3 current_applied_velocity,
+    float dt,
+    float speed,
+    float trajectory_sample_time,
+    float future_speed_scale,
+    bool safe_stop_latched,
+    char* error,
+    int error_capacity)
+{
+    static_assert(G1CommandTrajectorySampleCount == 4,
+                  "deterministic route prediction requires four horizons");
+    if (error != NULL && error_capacity > 0 &&
+        g1_command_memory_overlaps(
+            &output,
+            sizeof(output),
+            error,
+            static_cast<std::size_t>(error_capacity))) {
+        return false;
+    }
+    int checked_route_frames = 0;
+    if (current_frame < 0 || !g1_dt_is_exact_25_hz(dt) ||
+        !terrain_float_is_positive_normal(speed) ||
+        !terrain_float_is_positive_normal(trajectory_sample_time) ||
+        !terrain_float_is_normal_or_zero_query(future_speed_scale) ||
+        future_speed_scale < 0.0f || future_speed_scale > 1.0f ||
+        !g1_command_vec3_is_finite(current_applied_velocity) ||
+        !deterministic_route_schedule_frames(
+            checked_route_frames, route, dt, speed)) {
+        return deterministic_route_prediction_error(
+            output,
+            error,
+            error_capacity,
+            "invalid deterministic route prediction input");
+    }
+
+    deterministic_route_prediction candidate;
+    candidate.commands[0] =
+        g1_command_vec3_canonicalize(current_applied_velocity);
+    candidate.sampled_frames[0] = current_frame;
+    for (int index = 1; index < G1CommandTrajectorySampleCount; ++index) {
+        float horizon = 0.0f;
+        float frame_ratio = 0.0f;
+        if (!terrain_f32_mul(
+                horizon,
+                static_cast<float>(index),
+                trajectory_sample_time) ||
+            !terrain_f32_div(frame_ratio, horizon, dt)) {
+            return deterministic_route_prediction_error(
+                output,
+                error,
+                error_capacity,
+                "deterministic route horizon arithmetic failed");
+        }
+        const float ceiled = ceilf(frame_ratio);
+        if (!terrain_float_is_finite(ceiled) || ceiled < 1.0f ||
+            static_cast<double>(ceiled) > static_cast<double>(INT_MAX)) {
+            return deterministic_route_prediction_error(
+                output,
+                error,
+                error_capacity,
+                "deterministic route horizon exceeds integer range");
+        }
+        const int offset = static_cast<int>(ceiled);
+        if (current_frame > INT_MAX - offset) {
+            return deterministic_route_prediction_error(
+                output,
+                error,
+                error_capacity,
+                "deterministic route sampled frame overflows");
+        }
+        candidate.sampled_frames[index] = current_frame + offset;
+    }
+
+    if (safe_stop_latched) {
+        for (int index = 0; index < G1CommandTrajectorySampleCount; ++index) {
+            candidate.commands[index] = vec3(0.0f, 0.0f, 0.0f);
+        }
+        candidate.force_search = true;
+        output = candidate;
+        return true;
+    }
+
+    for (int index = 1; index < G1CommandTrajectorySampleCount; ++index) {
+        deterministic_route_sample sample;
+        if (!deterministic_route_command(
+                sample,
+                route,
+                candidate.sampled_frames[index],
+                dt,
+                speed,
+                error,
+                error_capacity)) {
+            return false;
+        }
+        float scaled_x = 0.0f;
+        float scaled_z = 0.0f;
+        if (!g1_command_vec3_is_finite(sample.command) ||
+            !terrain_f32_mul(
+                scaled_x, sample.command.x, future_speed_scale) ||
+            !terrain_f32_mul(
+                scaled_z, sample.command.z, future_speed_scale)) {
+            return deterministic_route_prediction_error(
+                output,
+                error,
+                error_capacity,
+                "deterministic route future speed scaling failed");
+        }
+        candidate.commands[index] = vec3(
+            scaled_x,
+            terrain_runtime_canonicalize_output(sample.command.y),
+            scaled_z);
+    }
+    output = candidate;
     return true;
 }
 

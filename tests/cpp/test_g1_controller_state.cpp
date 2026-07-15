@@ -217,6 +217,118 @@ static void test_controller_validates_ik_geometry_before_window()
           "startup validator consumes the loaded database and error buffer");
 }
 
+static void test_controller_publishes_independent_travel_and_heading()
+{
+    const std::string source = read_controller_source();
+    const std::size_t heading_parse = source.find(
+        "g1_test_heading_override_parse(");
+    const std::size_t heading_mode_guard = source.find(
+        "if (test_heading.active", heading_parse);
+    const std::size_t heading_guard_mode = source.find(
+        "test_config.mode != G1_TestRoute", heading_mode_guard);
+    const std::size_t window = source.find("InitWindow(");
+    check(heading_parse != std::string::npos &&
+              heading_mode_guard != std::string::npos &&
+              heading_guard_mode != std::string::npos &&
+              window != std::string::npos &&
+              heading_parse < heading_mode_guard &&
+              heading_mode_guard < heading_guard_mode &&
+              heading_guard_mode < window,
+          "heading override parses and rejects live use before Raylib startup");
+
+    const std::size_t command = source.find(
+        "const vec3 commanded_velocity = desired_velocity_curr;");
+    const std::size_t heading = source.find(
+        "quat desired_rotation_curr = desired_rotation_update(", command);
+    const std::size_t override_guard = source.find(
+        "if (test_heading.active)", heading);
+    const std::size_t override_assign = source.find(
+        "desired_rotation_curr = test_heading.heading;", override_guard);
+    const std::size_t traversal = source.find(
+        "desired_velocity_curr = traversability_limit_command(",
+        override_assign);
+    check(command != std::string::npos && heading != std::string::npos &&
+              override_guard != std::string::npos &&
+              override_assign != std::string::npos &&
+              traversal != std::string::npos &&
+              command < heading && heading < override_guard &&
+              override_guard < override_assign && override_assign < traversal,
+          "heading selection and override precede terrain velocity limiting");
+    const std::string heading_call = source_call_text(
+        source,
+        "desired_rotation_update",
+        heading,
+        "controller has the current heading-selection call");
+    check(heading_call.find("commanded_velocity") != std::string::npos &&
+              heading_call.find("desired_velocity_curr") == std::string::npos,
+          "heading selection consumes requested travel, not limited travel");
+    const std::string traversal_call = source_call_text(
+        source,
+        "traversability_limit_command",
+        traversal,
+        "controller has the terrain velocity limiter call");
+    check(traversal_call.find("rotation") == std::string::npos &&
+              traversal_call.find("heading") == std::string::npos,
+          "terrain limiter receives no heading reference");
+
+    const std::size_t route_prediction = source.find(
+        "deterministic_route_predict_commands(", traversal);
+    const std::size_t heading_trajectory_override = source.find(
+        "state.trajectory_desired_rotations.set(test_heading.heading);",
+        route_prediction);
+    const std::size_t synthetic_prediction = source.find(
+        "trajectory_desired_velocities_predict(", route_prediction);
+    const std::size_t position_prediction = source.find(
+        "trajectory_positions_predict(", synthetic_prediction);
+    const std::size_t snapshot = source.find(
+        "g1_command_snapshot_build(", position_prediction);
+    const std::size_t query = source.find(
+        "// Make query vector for search.", snapshot);
+    check(route_prediction != std::string::npos &&
+              heading_trajectory_override != std::string::npos &&
+              synthetic_prediction != std::string::npos &&
+              position_prediction != std::string::npos &&
+              snapshot != std::string::npos && query != std::string::npos &&
+              route_prediction < heading_trajectory_override &&
+              heading_trajectory_override < synthetic_prediction &&
+              synthetic_prediction < position_prediction &&
+              position_prediction < snapshot && snapshot < query,
+          "route/heading prediction publishes before the immutable snapshot");
+    const std::string route_call = source_call_text(
+        source,
+        "deterministic_route_predict_commands",
+        route_prediction,
+        "controller has deterministic route prediction call");
+    check(route_call.find("desired_velocity_curr") != std::string::npos &&
+              route_call.find("state.traversal_speed_scale") !=
+                  std::string::npos &&
+              route_call.find("gamepad") == std::string::npos,
+          "route prediction consumes applied travel and no synthetic gamepad");
+    const std::string snapshot_call = source_call_text(
+        source,
+        "g1_command_snapshot_build",
+        snapshot,
+        "controller builds complete command snapshot");
+    check(source_call_argument_count(snapshot_call) == 9 &&
+              snapshot_call.find("state.command") != std::string::npos &&
+              snapshot_call.find("command_intent") != std::string::npos &&
+              snapshot_call.find("desired_velocity_curr") !=
+                  std::string::npos &&
+              snapshot_call.find("state.trajectory_desired_velocities") !=
+                  std::string::npos &&
+              snapshot_call.find("state.trajectory_desired_rotations") !=
+                  std::string::npos,
+          "controller publishes all command snapshot owners transactionally");
+    const std::string frame_path = source.substr(command, query - command);
+    check(frame_path.find(
+              "command_intent.requested_velocity = commanded_velocity;") !=
+              std::string::npos &&
+              frame_path.find(
+                  "command_intent.desired_heading = desired_rotation_curr;") !=
+                  std::string::npos,
+          "immutable intent records requested travel and independent heading");
+}
+
 static void test_failed_model_load_reaches_counted_shared_cleanup()
 {
     const std::string source = read_controller_source();
@@ -297,6 +409,47 @@ static bool same_quat(const quat& first, const quat& second)
 static bool same_float_bits(const float first, const float second)
 {
     return terrain_float_bits(first) == terrain_float_bits(second);
+}
+
+static bool same_vec3_bits(const vec3& first, const vec3& second)
+{
+    return same_float_bits(first.x, second.x) &&
+           same_float_bits(first.y, second.y) &&
+           same_float_bits(first.z, second.z);
+}
+
+static bool same_quat_bits(const quat& first, const quat& second)
+{
+    return same_float_bits(first.w, second.w) &&
+           same_float_bits(first.x, second.x) &&
+           same_float_bits(first.y, second.y) &&
+           same_float_bits(first.z, second.z);
+}
+
+static bool same_command_snapshot_bits(
+    const G1CommandSnapshot& first,
+    const G1CommandSnapshot& second)
+{
+    if (!same_vec3_bits(first.intent.requested_velocity,
+                        second.intent.requested_velocity) ||
+        !same_quat_bits(first.intent.desired_heading,
+                        second.intent.desired_heading) ||
+        !same_vec3_bits(first.applied_velocity, second.applied_velocity)) {
+        return false;
+    }
+    for (int index = 0; index < G1CommandTrajectorySampleCount; ++index) {
+        if (!same_vec3_bits(first.predicted_desired_velocities[index],
+                            second.predicted_desired_velocities[index]) ||
+            !same_vec3_bits(first.predicted_root_positions[index],
+                            second.predicted_root_positions[index]) ||
+            !same_quat_bits(first.predicted_root_rotations[index],
+                            second.predicted_root_rotations[index]) ||
+            !same_quat_bits(first.predicted_desired_headings[index],
+                            second.predicted_desired_headings[index])) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static void check_idle_match_transition_cost(
@@ -541,6 +694,24 @@ static void poison_state(g1_controller_state& state)
     poison_array(state.trajectory_desired_rotations);
     poison_array(state.trajectory_rotations);
 
+    state.command.intent.requested_velocity = vec3(101.0f, 102.0f, 103.0f);
+    state.command.intent.desired_heading =
+        quat(104.0f, 105.0f, 106.0f, 107.0f);
+    state.command.applied_velocity = vec3(108.0f, 109.0f, 110.0f);
+    for (int index = 0; index < G1CommandTrajectorySampleCount; ++index) {
+        const float offset = static_cast<float>(index);
+        state.command.predicted_desired_velocities[index] =
+            vec3(111.0f + offset, 112.0f + offset, 113.0f + offset);
+        state.command.predicted_root_positions[index] =
+            vec3(114.0f + offset, 115.0f + offset, 116.0f + offset);
+        state.command.predicted_root_rotations[index] =
+            quat(117.0f + offset, 118.0f + offset,
+                 119.0f + offset, 120.0f + offset);
+        state.command.predicted_desired_headings[index] =
+            quat(121.0f + offset, 122.0f + offset,
+                 123.0f + offset, 124.0f + offset);
+    }
+
     poison_array(state.contact_bones);
     poison_array(state.contact_states);
     poison_array(state.contact_locks);
@@ -782,6 +953,28 @@ static void test_reset_clears_every_dynamic_subsystem()
     check_quat_array(state.trajectory_rotations, 4, spawn_rotation,
                      "trajectory rotations reset to metadata yaw");
 
+    check(g1_command_snapshot_is_valid(state.command),
+          "reset publishes a valid immutable command snapshot");
+    check(same_vec3_bits(state.command.intent.requested_velocity, vec3()) &&
+              same_quat_bits(
+                  state.command.intent.desired_heading, spawn_rotation) &&
+              same_vec3_bits(state.command.applied_velocity, vec3()),
+          "reset command owns zero requested/applied travel and spawn heading");
+    for (int index = 0; index < G1CommandTrajectorySampleCount; ++index) {
+        check(same_vec3_bits(
+                  state.command.predicted_desired_velocities[index], vec3()) &&
+                  same_vec3_bits(
+                      state.command.predicted_root_positions[index],
+                      vec3(spawn.x, 0.0f, spawn.z)) &&
+                  same_quat_bits(
+                      state.command.predicted_root_rotations[index],
+                      spawn_rotation) &&
+                  same_quat_bits(
+                      state.command.predicted_desired_headings[index],
+                      spawn_rotation),
+              "reset command publishes four spawn trajectory copies");
+    }
+
     check(state.contact_bones.size == 2 &&
               state.contact_bones(0) == G1_LeftToe &&
               state.contact_bones(1) == G1_RightToe,
@@ -891,12 +1084,15 @@ static void test_failed_reset_preserves_prior_state()
     active.simulation_position = vec3(101.0f, 102.0f, 103.0f);
     active.support.height = 104.0f;
     active.bone_positions(G1_Hips) = vec3(105.0f, 106.0f, 107.0f);
+    active.command.intent.requested_velocity =
+        vec3(108.0f, 109.0f, 110.0f);
     const int prior_scene_frame = active.scene_frame;
     const vec3 prior_simulation = active.simulation_position;
     const float prior_support=active.support.height;
     const int prior_bone_count=active.bone_positions.size;
     vec3* const prior_bone_data=active.bone_positions.data;
     const vec3 prior_bone=active.bone_positions(G1_Hips);
+    const G1CommandSnapshot prior_command = active.command;
 
     support.values(0, 0) = std::numeric_limits<float>::quiet_NaN();
     check(!g1_controller_state_reset(
@@ -914,6 +1110,53 @@ static void test_failed_reset_preserves_prior_state()
           "active owning array pointer and size preserved");
     check(same_vec3(active.bone_positions(G1_Hips), prior_bone),
           "active array content preserved after late reset failure");
+    check(same_command_snapshot_bits(active.command, prior_command),
+          "active command snapshot preserved after late reset failure");
+}
+
+static G1CommandSnapshot command_swap_fixture(float base)
+{
+    G1CommandSnapshot value;
+    value.intent.requested_velocity = vec3(base, base + 1.0f, base + 2.0f);
+    value.intent.desired_heading = quat(base + 3.0f, base + 4.0f,
+                                        base + 5.0f, base + 6.0f);
+    value.applied_velocity = vec3(base + 7.0f, base + 8.0f, base + 9.0f);
+    for (int index = 0; index < G1CommandTrajectorySampleCount; ++index) {
+        const float offset = 10.0f * static_cast<float>(index);
+        value.predicted_desired_velocities[index] =
+            vec3(base + 10.0f + offset,
+                 base + 11.0f + offset,
+                 base + 12.0f + offset);
+        value.predicted_root_positions[index] =
+            vec3(base + 13.0f + offset,
+                 base + 14.0f + offset,
+                 base + 15.0f + offset);
+        value.predicted_root_rotations[index] =
+            quat(base + 16.0f + offset,
+                 base + 17.0f + offset,
+                 base + 18.0f + offset,
+                 base + 19.0f + offset);
+        value.predicted_desired_headings[index] =
+            quat(base + 20.0f + offset,
+                 base + 21.0f + offset,
+                 base + 22.0f + offset,
+                 base + 23.0f + offset);
+    }
+    return value;
+}
+
+static void test_swap_owns_complete_command_snapshot()
+{
+    g1_controller_state first;
+    g1_controller_state second;
+    first.command = command_swap_fixture(100.0f);
+    second.command = command_swap_fixture(500.0f);
+    const G1CommandSnapshot first_before = first.command;
+    const G1CommandSnapshot second_before = second.command;
+    g1_controller_state_swap(first, second);
+    check(same_command_snapshot_bits(first.command, second_before) &&
+              same_command_snapshot_bits(second.command, first_before),
+          "state swap exchanges every command snapshot member");
 }
 
 int main()
@@ -921,11 +1164,13 @@ int main()
     test_active_scene_sources_use_checked_v2_queries();
     test_controller_wires_idle_match_transition_cost();
     test_controller_validates_ik_geometry_before_window();
+    test_controller_publishes_independent_travel_and_heading();
     test_failed_model_load_reaches_counted_shared_cleanup();
     test_controller_marks_no_route_cursor_inactive_after_resets();
     test_idle_match_transition_cost_policy();
     test_scene_first_frame_seeds_desired_trajectory();
     test_reset_clears_every_dynamic_subsystem();
     test_failed_reset_preserves_prior_state();
+    test_swap_owns_complete_command_snapshot();
     return 0;
 }

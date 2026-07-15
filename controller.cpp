@@ -1662,6 +1662,7 @@ int main(void)
     float feature_weight_trajectory_directions = 1.5f;
     float parsed_terrain_weight = 0.0f;
     g1_test_config test_config;
+    G1TestHeadingOverride test_heading;
     if (!g1_parse_terrain_weight(
             parsed_terrain_weight,
             artifact_error,
@@ -1669,9 +1670,21 @@ int main(void)
         !g1_parse_test_config(
             test_config,
             artifact_error,
+            static_cast<int>(sizeof(artifact_error))) ||
+        !g1_test_heading_override_parse(
+            test_heading,
+            getenv("MM_TEST_HEADING"),
+            artifact_error,
             static_cast<int>(sizeof(artifact_error))))
     {
         fprintf(stderr, "G1 terrain option error: %s\n", artifact_error);
+        return 2;
+    }
+    if (test_heading.active && test_config.mode != G1_TestRoute) {
+        fprintf(
+            stderr,
+            "G1 terrain option error: MM_TEST_HEADING is valid only for "
+            "route mode\n");
         return 2;
     }
 #if defined(PLATFORM_WEB)
@@ -2334,6 +2347,20 @@ int main(void)
             state.route_waypoint = route_sample.waypoint;
         }
         const vec3 commanded_velocity = desired_velocity_curr;
+
+        // Heading is selected from the requested command before terrain is
+        // allowed to limit travel.  The terrain path never owns this value.
+        quat desired_rotation_curr = desired_rotation_update(
+            state.desired_rotation,
+            gamepadstick_left,
+            gamepadstick_right,
+            state.camera_azimuth,
+            desired_strafe,
+            commanded_velocity);
+        if (test_heading.active) {
+            desired_rotation_curr = test_heading.heading;
+        }
+
         traversability_diagnostics traversal = {};
         desired_velocity_curr = traversability_limit_command(
             state.traversal_speed_scale,
@@ -2361,15 +2388,6 @@ int main(void)
         state.walkability_class = traversal.walkability_class;
         state.blocked_distance = traversal.distance;
         state.blocked_point = traversal.point;
-            
-        // Get the desired rotation/direction
-        quat desired_rotation_curr = desired_rotation_update(
-            state.desired_rotation,
-            gamepadstick_left,
-            gamepadstick_right,
-            state.camera_azimuth,
-            desired_strafe,
-            desired_velocity_curr);
         
         // Check if we should force a search because input changed quickly
         state.desired_velocity_change_prev = state.desired_velocity_change_curr;
@@ -2380,8 +2398,35 @@ int main(void)
         state.desired_rotation_change_prev = state.desired_rotation_change_curr;
         state.desired_rotation_change_curr = quat_to_scaled_angle_axis(quat_abs(quat_mul_inv(desired_rotation_curr, state.desired_rotation))) / dt;
         state.desired_rotation =  desired_rotation_curr;
-        
-        bool force_search = false;
+
+        deterministic_route_prediction route_prediction;
+        if (test_config.mode == G1_TestRoute) {
+            if (!deterministic_route_predict_commands(
+                    route_prediction,
+                    active_scene.metadata.routes[
+                        static_cast<size_t>(state.route_index)],
+                    state.route_frames,
+                    desired_velocity_curr,
+                    dt,
+                    0.50f,
+                    trajectory_sample_time,
+                    state.traversal_speed_scale,
+                    false,
+                    artifact_error,
+                    static_cast<int>(sizeof(artifact_error)))) {
+                controlled_runtime_error(artifact_error);
+                return;
+            }
+            for (int index = 0;
+                 index < G1CommandTrajectorySampleCount;
+                 ++index) {
+                state.trajectory_desired_velocities(index) =
+                    route_prediction.commands[index];
+            }
+        }
+
+        bool force_search =
+            test_config.mode == G1_TestRoute && route_prediction.force_search;
 
         if (state.force_search_timer <= 0.0f && (
             (length(state.desired_velocity_change_prev) >= desired_velocity_change_threshold &&
@@ -2398,16 +2443,20 @@ int main(void)
         }
         
         // Predict Future Trajectory
-        
-        trajectory_desired_rotations_predict(
-          state.trajectory_desired_rotations,
-          state.trajectory_desired_velocities,
-          state.desired_rotation,
-          state.camera_azimuth,
-          gamepadstick_left,
-          gamepadstick_right,
-          desired_strafe,
-          trajectory_sample_time);
+
+        if (test_heading.active) {
+            state.trajectory_desired_rotations.set(test_heading.heading);
+        } else {
+            trajectory_desired_rotations_predict(
+              state.trajectory_desired_rotations,
+              state.trajectory_desired_velocities,
+              state.desired_rotation,
+              state.camera_azimuth,
+              gamepadstick_left,
+              gamepadstick_right,
+              desired_strafe,
+              trajectory_sample_time);
+        }
         
         trajectory_rotations_predict(
             state.trajectory_rotations,
@@ -2418,18 +2467,20 @@ int main(void)
             simulation_rotation_halflife,
             trajectory_sample_time);
         
-        trajectory_desired_velocities_predict(
-          state.trajectory_desired_velocities,
-          state.trajectory_rotations,
-          state.desired_velocity,
-          state.camera_azimuth,
-          gamepadstick_left,
-          gamepadstick_right,
-          desired_strafe,
-          simulation_fwrd_speed * state.traversal_speed_scale,
-          simulation_side_speed * state.traversal_speed_scale,
-          simulation_back_speed * state.traversal_speed_scale,
-          trajectory_sample_time);
+        if (test_config.mode != G1_TestRoute) {
+            trajectory_desired_velocities_predict(
+              state.trajectory_desired_velocities,
+              state.trajectory_rotations,
+              state.desired_velocity,
+              state.camera_azimuth,
+              gamepadstick_left,
+              gamepadstick_right,
+              desired_strafe,
+              simulation_fwrd_speed * state.traversal_speed_scale,
+              simulation_side_speed * state.traversal_speed_scale,
+              simulation_back_speed * state.traversal_speed_scale,
+              trajectory_sample_time);
+        }
         
         trajectory_positions_predict(
             state.trajectory_positions,
@@ -2441,6 +2492,23 @@ int main(void)
             state.trajectory_desired_velocities,
             simulation_velocity_halflife,
             trajectory_sample_time);
+
+        G1CommandIntent command_intent;
+        command_intent.requested_velocity = commanded_velocity;
+        command_intent.desired_heading = desired_rotation_curr;
+        if (!g1_command_snapshot_build(
+                state.command,
+                command_intent,
+                desired_velocity_curr,
+                state.trajectory_desired_velocities,
+                state.trajectory_positions,
+                state.trajectory_rotations,
+                state.trajectory_desired_rotations,
+                artifact_error,
+                static_cast<int>(sizeof(artifact_error)))) {
+            controlled_runtime_error(artifact_error);
+            return;
+        }
            
         // Make query vector for search.
         // In theory this only needs to be done when a search is 

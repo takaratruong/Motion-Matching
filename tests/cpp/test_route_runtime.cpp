@@ -2,6 +2,8 @@
 #include "g1_runtime_diagnostics.h"
 #include "motion_match_log.h"
 
+#include <climits>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -67,6 +69,9 @@ static void check_snapshot_publication_contract(const char* path)
 static void check_route_sample_cursor_contract(const char* path)
 {
     const std::string source = read_source(path);
+    check(source.find("#include \"g1_command_runtime.h\"") !=
+              std::string::npos,
+          "route runtime directly includes the command contract");
     check(source.find(
               "for (int step = 0; step <= steps; ++step)") ==
               std::string::npos,
@@ -76,6 +81,324 @@ static void check_route_sample_cursor_contract(const char* path)
         "const int step = static_cast<int>(sample_index);", loop);
     check(loop != std::string::npos && cast != std::string::npos && loop < cast,
           "route target sampling uses a safe 64-bit cursor");
+}
+
+static deterministic_route_prediction poisoned_prediction()
+{
+    deterministic_route_prediction output;
+    for (int index = 0; index < G1CommandTrajectorySampleCount; ++index) {
+        output.commands[index] = vec3(
+            90.0f + static_cast<float>(index),
+            80.0f + static_cast<float>(index),
+            70.0f + static_cast<float>(index));
+        output.sampled_frames[index] = 60 + index;
+    }
+    output.force_search = true;
+    return output;
+}
+
+static bool same_prediction(
+    const deterministic_route_prediction& first,
+    const deterministic_route_prediction& second)
+{
+    if (first.force_search != second.force_search) return false;
+    for (int index = 0; index < G1CommandTrajectorySampleCount; ++index) {
+        if (bits(first.commands[index].x) != bits(second.commands[index].x) ||
+            bits(first.commands[index].y) != bits(second.commands[index].y) ||
+            bits(first.commands[index].z) != bits(second.commands[index].z) ||
+            first.sampled_frames[index] != second.sampled_frames[index]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void check_prediction_failure(
+    deterministic_route_prediction& output,
+    const deterministic_route_prediction& before,
+    bool result,
+    const char* message)
+{
+    check(!result, message);
+    check(same_prediction(output, before), message);
+}
+
+static scene_route route_fixture(
+    const char* id,
+    std::initializer_list<std::pair<float, float>> waypoints,
+    float hold = 0.0f)
+{
+    scene_route route;
+    route.id = id;
+    route.expected_outcome = "traverse";
+    route.walkability_class = 1;
+    route.landing_hold_seconds = hold;
+    route.waypoints_xz.assign(waypoints.begin(), waypoints.end());
+    return route;
+}
+
+static void check_command_bits(
+    vec3 command,
+    float x,
+    float y,
+    float z,
+    const char* message)
+{
+    check(bits(command.x) == bits(x) &&
+              bits(command.y) == bits(y) &&
+              bits(command.z) == bits(z),
+          message);
+}
+
+static void test_four_horizon_route_predictions()
+{
+    static_assert(G1CommandTrajectorySampleCount == 4,
+                  "route command horizon remains exactly four");
+    const scene_route route = route_fixture(
+        "corner", {{0.0f, 0.0f}, {0.1f, 0.0f}, {0.1f, 1.0f}});
+    deterministic_route_prediction prediction = poisoned_prediction();
+    char error[256] = {};
+    check(deterministic_route_predict_commands(
+              prediction,
+              route,
+              0,
+              vec3(0.125f, -0.0f, -0.25f),
+              0.04f,
+              0.50f,
+              1.0f / 3.0f,
+              1.0f,
+              false,
+              error,
+              sizeof(error)),
+          error);
+    const int expected_frames[] = {0, 9, 17, 25};
+    for (int index = 0; index < G1CommandTrajectorySampleCount; ++index) {
+        check(prediction.sampled_frames[index] == expected_frames[index],
+              "four horizons use checked ceil route-time offsets");
+    }
+    check_command_bits(
+        prediction.commands[0], 0.125f, 0.0f, -0.25f,
+        "sample zero is current terrain-applied velocity");
+    for (int index = 1; index < G1CommandTrajectorySampleCount; ++index) {
+        check_command_bits(
+            prediction.commands[index], 0.0f, 0.0f, 0.50f,
+            "future corner samples follow deterministic route time");
+    }
+    check(!prediction.force_search,
+          "ordinary route prediction does not force a search");
+}
+
+static void test_tangent_level_boundary_exact_schedule()
+{
+    const scene_route route = route_fixture(
+        "tangent-level-boundary",
+        {{0.0f, 0.0f}, {0.62f, 2.0f}, {0.62f, 6.0f}});
+    check(deterministic_route_motion_frames(route) == 305,
+          "tangent-level-boundary has the exact 305-frame schedule");
+
+    char error[256] = {};
+    deterministic_route_sample before_boundary;
+    deterministic_route_sample at_boundary;
+    check(deterministic_route_command(
+              before_boundary, route, 104, 0.04f, 0.50f,
+              error, sizeof(error)),
+          error);
+    check(deterministic_route_command(
+              at_boundary, route, 105, 0.04f, 0.50f,
+              error, sizeof(error)),
+          error);
+    check(before_boundary.waypoint == 1 && at_boundary.waypoint == 2,
+          "tangent route changes segment at exact frame 105");
+
+    deterministic_route_sample current;
+    check(deterministic_route_command(
+              current, route, 100, 0.04f, 0.50f,
+              error, sizeof(error)),
+          error);
+    deterministic_route_prediction prediction = poisoned_prediction();
+    check(deterministic_route_predict_commands(
+              prediction, route, 100, current.command,
+              0.04f, 0.50f, 1.0f / 3.0f, 1.0f, false,
+              error, sizeof(error)),
+          error);
+    const int expected_frames[] = {100, 109, 117, 125};
+    for (int index = 0; index < G1CommandTrajectorySampleCount; ++index) {
+        check(prediction.sampled_frames[index] == expected_frames[index],
+              "tangent route prediction publishes exact sampled frames");
+        deterministic_route_sample oracle;
+        check(deterministic_route_command(
+                  oracle, route, expected_frames[index],
+                  0.04f, 0.50f, error, sizeof(error)),
+              error);
+        check_command_bits(
+            prediction.commands[index],
+            oracle.command.x,
+            oracle.command.y,
+            oracle.command.z,
+            "tangent route prediction is bit-exact at every horizon");
+    }
+}
+
+static void test_hold_completion_and_speed_scales()
+{
+    const scene_route held = route_fixture(
+        "positive-hold",
+        {{0.0f, 0.0f}, {1.0f, 0.0f}, {1.0f, 1.0f}, {2.0f, 1.0f}},
+        0.4f);
+    check(deterministic_route_motion_frames(held) == 160,
+          "positive hold has exact schedule");
+    deterministic_route_prediction prediction = poisoned_prediction();
+    char error[256] = {};
+    check(deterministic_route_predict_commands(
+              prediction, held, 90, vec3(0.0f, 0.0f, 0.50f),
+              0.04f, 0.50f, 1.0f / 3.0f, 1.0f, false,
+              error, sizeof(error)),
+          error);
+    const int hold_frames[] = {90, 99, 107, 115};
+    for (int index = 0; index < G1CommandTrajectorySampleCount; ++index) {
+        check(prediction.sampled_frames[index] == hold_frames[index],
+              "hold fixture uses route-time horizons");
+    }
+    check_command_bits(
+        prediction.commands[0], 0.0f, 0.0f, 0.50f,
+        "current command is moving before hold");
+    check_command_bits(
+        prediction.commands[1], 0.0f, 0.0f, 0.50f,
+        "future command is moving immediately before hold");
+    check_command_bits(
+        prediction.commands[2], 0.0f, 0.0f, 0.0f,
+        "future command is canonical zero inside hold");
+    check_command_bits(
+        prediction.commands[3], 0.50f, 0.0f, 0.0f,
+        "future command resumes after hold");
+
+    check(deterministic_route_predict_commands(
+              prediction, held, 160, vec3(-0.0f, -0.0f, -0.0f),
+              0.04f, 0.50f, 1.0f / 3.0f, 1.0f, false,
+              error, sizeof(error)),
+          error);
+    for (int index = 0; index < G1CommandTrajectorySampleCount; ++index) {
+        check_command_bits(
+            prediction.commands[index], 0.0f, 0.0f, 0.0f,
+            "completed route publishes canonical positive zeros");
+    }
+
+    const scene_route straight = route_fixture(
+        "straight", {{0.0f, 0.0f}, {0.0f, 2.0f}});
+    const float scales[] = {1.0f, 0.5f, 0.0f};
+    const float expected_z[] = {0.50f, 0.25f, 0.0f};
+    for (int scale_index = 0; scale_index < 3; ++scale_index) {
+        check(deterministic_route_predict_commands(
+                  prediction, straight, 0, vec3(0.125f, -0.0f, -0.25f),
+                  0.04f, 0.50f, 1.0f / 3.0f,
+                  scales[scale_index], false, error, sizeof(error)),
+              error);
+        check_command_bits(
+            prediction.commands[0], 0.125f, 0.0f, -0.25f,
+            "future scale never changes sample-zero applied velocity");
+        for (int index = 1; index < G1CommandTrajectorySampleCount; ++index) {
+            check_command_bits(
+                prediction.commands[index], 0.0f, 0.0f,
+                expected_z[scale_index],
+                "future route command has exact checked speed-scale bits");
+        }
+    }
+}
+
+static void test_safe_stop_and_prediction_failures_are_transactional()
+{
+    scene_route route = route_fixture(
+        "safe-stop", {{0.0f, 0.0f}, {1.0f, 0.0f}});
+    deterministic_route_prediction output = poisoned_prediction();
+    char error[256] = {};
+    check(deterministic_route_predict_commands(
+              output, route, 4, vec3(0.5f, 0.0f, -0.25f),
+              0.04f, 0.50f, 1.0f / 3.0f, 1.0f, true,
+              error, sizeof(error)),
+          error);
+    check(output.force_search,
+          "consumed safe-stop latch forces a matcher search");
+    for (int index = 0; index < G1CommandTrajectorySampleCount; ++index) {
+        check_command_bits(
+            output.commands[index], 0.0f, 0.0f, 0.0f,
+            "safe-stop canonicalizes every command to positive zero");
+    }
+
+    const float infinity = std::numeric_limits<float>::infinity();
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float wrong_dt = std::nextafter(0.04f, infinity);
+    struct InvalidInputs
+    {
+        int frame;
+        vec3 current;
+        float dt;
+        float speed;
+        float sample_time;
+        float scale;
+        bool safe_stop;
+        const char* message;
+    } invalid[] = {
+        {-1, vec3(), 0.04f, 0.50f, 1.0f / 3.0f, 1.0f, false,
+         "negative current frame is transactional"},
+        {INT_MAX, vec3(), 0.04f, 0.50f, 1.0f / 3.0f, 1.0f, false,
+         "future frame addition overflow is transactional"},
+        {0, vec3(infinity, 0.0f, 0.0f), 0.04f, 0.50f,
+         1.0f / 3.0f, 1.0f, false,
+         "nonfinite current applied velocity is transactional"},
+        {0, vec3(), wrong_dt, 0.50f, 1.0f / 3.0f, 1.0f, false,
+         "non-exact 25 Hz dt is transactional"},
+        {0, vec3(), 0.04f, 0.0f, 1.0f / 3.0f, 1.0f, false,
+         "zero speed is transactional"},
+        {0, vec3(), 0.04f, infinity, 1.0f / 3.0f, 1.0f, false,
+         "nonfinite speed is transactional"},
+        {0, vec3(), 0.04f, 0.50f, 0.0f, 1.0f, false,
+         "zero trajectory sample time is transactional"},
+        {0, vec3(), 0.04f, 0.50f, infinity, 1.0f, false,
+         "nonfinite trajectory sample time is transactional"},
+        {0, vec3(), 0.04f, 0.50f, 1.0e20f, 1.0f, false,
+         "horizon integer overflow is transactional"},
+        {0, vec3(), 0.04f, 0.50f, 1.0f / 3.0f, -0.01f, false,
+         "negative future speed scale is transactional"},
+        {0, vec3(), 0.04f, 0.50f, 1.0f / 3.0f, 1.01f, false,
+         "future speed scale above one is transactional"},
+        {0, vec3(), 0.04f, 0.50f, 1.0f / 3.0f, nan, false,
+         "nonfinite future speed scale is transactional"},
+        {0, vec3(), wrong_dt, 0.50f, 1.0f / 3.0f, 1.0f, true,
+         "safe-stop still validates exact dt transactionally"},
+    };
+    for (const InvalidInputs& input : invalid) {
+        output = poisoned_prediction();
+        const deterministic_route_prediction before = output;
+        check_prediction_failure(
+            output,
+            before,
+            deterministic_route_predict_commands(
+                output, route, input.frame, input.current, input.dt,
+                input.speed, input.sample_time, input.scale, input.safe_stop,
+                error, sizeof(error)),
+            input.message);
+    }
+
+    route.waypoints_xz[1] = route.waypoints_xz[0];
+    output = poisoned_prediction();
+    const deterministic_route_prediction before = output;
+    check_prediction_failure(
+        output,
+        before,
+        deterministic_route_predict_commands(
+            output, route, 0, vec3(), 0.04f, 0.50f,
+            1.0f / 3.0f, 1.0f, false, error, sizeof(error)),
+        "invalid route is rejected with poisoned output unchanged");
+
+    output = poisoned_prediction();
+    const deterministic_route_prediction safe_stop_before = output;
+    check_prediction_failure(
+        output,
+        safe_stop_before,
+        deterministic_route_predict_commands(
+            output, route, 0, vec3(), 0.04f, 0.50f,
+            1.0f / 3.0f, 1.0f, true, error, sizeof(error)),
+        "safe-stop cannot bypass malformed route validation");
 }
 
 int main(int argc, char** argv)
@@ -90,6 +413,11 @@ int main(int argc, char** argv)
     }
     check(argc == 1,
           "usage: test_route_runtime [--controller path|--route-header path]");
+
+    test_four_horizon_route_predictions();
+    test_tangent_level_boundary_exact_schedule();
+    test_hold_completion_and_speed_scales();
+    test_safe_stop_and_prediction_failures_are_transactional();
 
     scene_route route;
     route.id = "corner";
