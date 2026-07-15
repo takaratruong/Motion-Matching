@@ -612,13 +612,19 @@ static void test_budget_caps_for_family(bool swing_family)
          ++index) {
         G1ClearanceBudget limits = factory;
         require_budget_status(
-            swing_family, limits, G1ClearanceUncertified,
+            swing_family, limits,
+            swing_family
+                ? G1ClearanceUncertified
+                : G1ClearanceInvalidField,
             "factory cap is admitted by its family");
 
         limits = factory;
         limits.*fields[index] = 0;
         require_budget_status(
-            swing_family, limits, G1ClearanceUncertified,
+            swing_family, limits,
+            swing_family
+                ? G1ClearanceUncertified
+                : G1ClearanceInvalidField,
             "zero is an admitted tightened budget");
 
         limits = factory;
@@ -1609,6 +1615,37 @@ static void test_task34_smooth_plane_sphere_false_clear()
               std::fabs(oracle + 0.001L) < 2.0e-6L,
           "smooth-plane sphere fixture has the intended negative oracle");
 
+    const double radial_spacing =
+        0.5 * static_cast<double>(cell);
+    const double promoted_radius = static_cast<double>(radius);
+    const double promoted_center_y = static_cast<double>(center.y);
+    const double promoted_surface = static_cast<double>(surface);
+    const double radial_offsets[][2] = {
+        {0.0, 0.0},
+        {radial_spacing, 0.0},
+        {-radial_spacing, 0.0},
+        {0.0, radial_spacing},
+        {0.0, -radial_spacing}
+    };
+    double rejected_lattice = std::numeric_limits<double>::infinity();
+    for (size_t index = 0;
+         index < sizeof(radial_offsets) / sizeof(radial_offsets[0]);
+         ++index) {
+        const double ox = radial_offsets[index][0];
+        const double oz = radial_offsets[index][1];
+        const double rho_square = ox * ox + oz * oz;
+        const double body_y = promoted_center_y -
+            std::sqrt(promoted_radius * promoted_radius - rho_square);
+        const double terrain_y = promoted_surface + slope * ox;
+        const double sampled = body_y - terrain_y;
+        rejected_lattice = sampled < rejected_lattice
+            ? sampled
+            : rejected_lattice;
+    }
+    check(rejected_lattice > 0.0043 &&
+              rejected_lattice < 0.0045,
+          "rejected half-cell radial lattice falsely clears near +0.00436 m");
+
     G1ClearanceResult output = seeded_result(131.0);
     char error[256] = {};
     const G1ClearanceStatus status = g1_sphere_clearance(
@@ -1681,6 +1718,14 @@ static void test_task34_finite_capsule_plane_and_reversal()
               forward.witness_upper_m - forward.lower_bound_m <=
                   G1ClearanceMaximumCertificateWidthM,
           "finite planar capsule certificate encloses its oracle");
+    check(forward.witness.cell_x == 6 &&
+              forward.witness.cell_z == 4 &&
+              forward.witness.terrain_triangle_index == 1 &&
+              forward.witness.patch_index == 1 &&
+              forward.witness.candidate_kind == 0 &&
+              forward.witness.candidate_subindex == 0 &&
+              forward.work.subdivision_nodes == 0,
+          "finite planar capsule selects the analytic B-cap face key");
     check(clearance_result_same(forward, reverse),
           "capsule endpoint reversal is bit-identical");
 }
@@ -1704,6 +1749,58 @@ static void test_task34_footprint_domain_budget_and_transaction()
               maximum_tangent, radius, NULL, 0) == G1ClearanceOk,
           "sphere footprint exactly tangent to maximum XZ certifies");
 
+    const vec3 axis_tangent_centers[] = {
+        vec3(0.25f, 1.0f, 0.50f),
+        vec3(0.75f, 1.0f, 0.50f),
+        vec3(0.50f, 1.0f, 0.25f),
+        vec3(0.50f, 1.0f, 0.75f)
+    };
+    for (size_t index = 0;
+         index < sizeof(axis_tangent_centers) /
+                     sizeof(axis_tangent_centers[0]);
+         ++index) {
+        G1ClearanceResult axis_output = seeded_result(
+            152.0 + static_cast<double>(index));
+        check(g1_sphere_clearance(
+                  axis_output, g1_pose_clearance_budget(), field,
+                  axis_tangent_centers[index], radius,
+                  NULL, 0) == G1ClearanceOk,
+              "sphere certifies each exact min/max axis tangency");
+    }
+
+    const vec3 capsule_endpoints[][2] = {
+        {vec3(0.25f, 1.0f, 0.25f),
+         vec3(0.25f, 1.0f, 0.75f)},
+        {vec3(0.75f, 1.0f, 0.25f),
+         vec3(0.75f, 1.0f, 0.75f)},
+        {vec3(0.25f, 1.0f, 0.25f),
+         vec3(0.75f, 1.0f, 0.25f)},
+        {vec3(0.25f, 1.0f, 0.75f),
+         vec3(0.75f, 1.0f, 0.75f)}
+    };
+    for (size_t index = 0;
+         index < sizeof(capsule_endpoints) /
+                     sizeof(capsule_endpoints[0]);
+         ++index) {
+        G1ClearanceResult forward = seeded_result(
+            156.0 + static_cast<double>(index));
+        G1ClearanceResult reverse = seeded_result(
+            160.0 + static_cast<double>(index));
+        check(g1_capsule_clearance(
+                  forward, g1_pose_clearance_budget(), field,
+                  capsule_endpoints[index][0],
+                  capsule_endpoints[index][1], radius,
+                  NULL, 0) == G1ClearanceOk &&
+              g1_capsule_clearance(
+                  reverse, g1_pose_clearance_budget(), field,
+                  capsule_endpoints[index][1],
+                  capsule_endpoints[index][0], radius,
+                  NULL, 0) == G1ClearanceOk,
+              "capsule certifies each exact min/max axis tangency");
+        check(clearance_result_same(forward, reverse),
+              "axis-tangent capsule reversal remains bit-identical");
+    }
+
     const vec3 outside(
         std::nextafter(minimum_tangent.x, 0.0f),
         minimum_tangent.y,
@@ -1716,6 +1813,32 @@ static void test_task34_footprint_domain_budget_and_transaction()
           "one-ULP footprint excursion is outside-domain");
     check(outside_before.same(outside_output),
           "outside-domain sphere failure is transactional");
+
+    const vec3 outward_centers[] = {
+        vec3(std::nextafter(0.25f, 0.0f), 1.0f, 0.50f),
+        vec3(std::nextafter(
+                 0.75f, std::numeric_limits<float>::infinity()),
+             1.0f, 0.50f),
+        vec3(0.50f, 1.0f, std::nextafter(0.25f, 0.0f)),
+        vec3(0.50f, 1.0f,
+             std::nextafter(
+                 0.75f, std::numeric_limits<float>::infinity()))
+    };
+    for (size_t index = 0;
+         index < sizeof(outward_centers) /
+                     sizeof(outward_centers[0]);
+         ++index) {
+        G1ClearanceResult rejected = seeded_result(
+            165.0 + static_cast<double>(index));
+        const ByteSnapshot<G1ClearanceResult> before(rejected);
+        check(g1_sphere_clearance(
+                  rejected, g1_pose_clearance_budget(), field,
+                  outward_centers[index], radius,
+                  NULL, 0) == G1ClearanceOutsideDomain,
+              "one-ULP sphere excursion on each axis is outside-domain");
+        check(before.same(rejected),
+              "axis-specific outside-domain rejection is transactional");
+    }
 
     heightfield poisoned = field;
     poisoned.heights.set(std::numeric_limits<float>::quiet_NaN());
@@ -1765,6 +1888,35 @@ static void test_task34_fixed_diagonal_and_rank_cases()
     diagonal.heights(3) = 10.0f;
     const vec3 diagonal_center(0.5f, 20.0f, 0.5f);
     const float diagonal_radius = 0.05f;
+    const vec3 triangle_centers[] = {
+        vec3(0.75f, 20.0f, 0.25f),
+        vec3(0.25f, 20.0f, 0.75f)
+    };
+    const double triangle_oracles[] = {
+        20.0 - 3.5 -
+            static_cast<double>(diagonal_radius) * std::sqrt(69.0),
+        20.0 - 4.5 -
+            static_cast<double>(diagonal_radius) * std::sqrt(53.0)
+    };
+    for (size_t index = 0;
+         index < sizeof(triangle_centers) /
+                     sizeof(triangle_centers[0]);
+         ++index) {
+        G1ClearanceResult triangle_output = seeded_result(
+            169.0 + static_cast<double>(index));
+        check(g1_sphere_clearance(
+                  triangle_output, g1_pose_clearance_budget(), diagonal,
+                  triangle_centers[index], diagonal_radius,
+                  NULL, 0) == G1ClearanceOk,
+              "strict fixed-diagonal triangle-center sphere certifies");
+        check(triangle_output.lower_bound_m <=
+                  triangle_oracles[index] &&
+              triangle_oracles[index] <=
+                  triangle_output.witness_upper_m &&
+              triangle_output.witness.candidate_kind == 0 &&
+              triangle_output.work.subdivision_nodes == 0,
+              "strict T0/T1 sphere encloses its plane oracle");
+    }
     const double diagonal_oracle =
         static_cast<double>(diagonal_center.y) - 5.0 -
         static_cast<double>(diagonal_radius) * std::sqrt(51.0);
@@ -1780,6 +1932,25 @@ static void test_task34_fixed_diagonal_and_rank_cases()
                       diagonal_output.lower_bound_m <=
                   G1ClearanceMaximumCertificateWidthM,
           "fixed-diagonal constrained-edge certificate encloses r*sqrt(51)");
+
+    heightfield clamp;
+    point_make_field(clamp, 3, 3, 0.0f, 0.0f, 1.0f);
+    clamp.heights(1 + clamp.nx) = 1.0f;
+    G1ClearanceResult clamp_output = seeded_result(177.0);
+    check(g1_sphere_clearance(
+              clamp_output, g1_pose_clearance_budget(), clamp,
+              vec3(1.0f, 2.0f, 1.0f), 0.25f,
+              NULL, 0) == G1ClearanceOk,
+          "edge stationary/below/above clamp fixture must certify");
+    check(clamp_output.lower_bound_m <= 0.75 &&
+              0.75 <= clamp_output.witness_upper_m &&
+              clamp_output.witness.cell_x == 0 &&
+              clamp_output.witness.cell_z == 0 &&
+              clamp_output.witness.terrain_triangle_index == 0 &&
+              clamp_output.witness.patch_index == 0 &&
+              clamp_output.witness.candidate_kind == 1 &&
+              clamp_output.witness.candidate_subindex == 5,
+          "edge clamp fixture selects the stable upper-endpoint edge key");
 
     heightfield flat;
     point_make_field(flat, 9, 9, 0.0f, 0.0f, 0.25f);
