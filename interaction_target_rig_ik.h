@@ -44,6 +44,7 @@ private:
     Hand hand_ = Hand::Right;
     quat calibration_rotation_{};
     bool has_previous_pole_ = false;
+    bool pole_stabilized_ = false;
     vec3 previous_pole_spine_{};
 };
 
