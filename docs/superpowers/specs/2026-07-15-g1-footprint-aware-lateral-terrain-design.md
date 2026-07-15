@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-15
 
-**Status:** Approved direction; written specification awaiting user review
+**Status:** Approved
 
 ## Goal
 
@@ -11,6 +11,11 @@ correctly on multilevel terrain. The runtime must observe terrain under the
 whole support and swing-foot footprint, keep planted feet coherent across
 level changes, and use certified clearance and terrain IK without coupling
 travel direction to heading.
+
+The footprint, planting, and clearance path applies to every horizontal travel
+direction: forward, backward, lateral, and diagonal. Forward/backward motion is
+already the strongest current case, but it does not retain a separate legacy
+path and must pass the same geometric contracts.
 
 The immediate work uses the current 1,770-clip G1 motion pack. If the resulting
 system is safe and geometrically coherent but lateral motion still looks poor,
@@ -124,6 +129,11 @@ and desired heading as separate inputs. They are not formed by rotating the
 heading toward the velocity. Current contact points remain authoritative for
 planting; predicted points are lookahead observations only.
 
+The corridor construction is continuous in travel direction and has no
+forward/lateral mode switch. A forward, backward, diagonal, or lateral command
+with the same world-space path therefore observes the same terrain footprint;
+only the named-foot phase and independent desired heading differ.
+
 The observation explicitly records a root/foot surface split. A split cannot be
 silently collapsed into four zero centerline features.
 
@@ -210,14 +220,25 @@ ascent/descent routes must complete; safe-stop passes only for the separate
 0.36 m stress diagnostic when the surface is outside the certified reach
 contract.
 
-### Gate L3: Flat-ground invariance
+### Gate L3: Directional obstacle matrix
+
+Traverse the certified shallow stairs, descent, curb-low, and both certified
+ramps with forward, backward, left-lateral, right-lateral, and two diagonal
+travel vectors. Desired heading is supplied independently for every run. Each
+certified route must complete with valid footprint observations, certified
+clearance, bounded support, and no terrain-induced heading write.
+
+The forward runs must remain at least as capable as the accepted baseline; the
+new footprint layer is not allowed to regress the already-good primary case.
+
+### Gate L4: Flat-ground invariance
 
 Repeat forward, backward, and left/right travel on flat ground with at least two
 fixed headings. The footprint layer and IK-off mode must not change selected
 frames, matcher queries, desired heading, or accepted support behavior relative
 to the certified flat baseline.
 
-### Gate L4: Existing terrain preservation
+### Gate L5: Existing terrain preservation
 
 All accepted stair, descent, ramp, multilevel, blocked-course, switching, and
 25 Hz gates remain required. A tangent/lateral fix may not weaken route
@@ -232,7 +253,7 @@ as `minimum_clearance` is not accepted as skeleton-clearance evidence.
 
 ## Data Decision Gate
 
-After Gates L1--L4 pass with the unmodified 1,770-clip pack, perform a visual and
+After Gates L1--L5 pass with the unmodified 1,770-clip pack, perform a visual and
 logged lateral-quality evaluation.
 
 - If geometry, planting, heading, and support are correct, the geometry phase
