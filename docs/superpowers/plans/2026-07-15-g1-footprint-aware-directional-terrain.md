@@ -1768,8 +1768,8 @@ spanning `{false,false,true,true}`: at least four successive frames across the
 edge accept, route/root XZ advance, no safe-stop latch appears, the swing base
 advances toward the predicted lower landing, and the first committed contact
 target has the exact predicted landing X/Z, lower surface height, and normal.
-Add a real footprint-stage case in which successful `g1_ik_frame_begin`
-returns a terminal safe-stop transaction. Require an immediate checked
+Add a real footprint-stage case in which successful `g1_ik_frame_begin` sets
+`candidate_result.safe_stop_requested`. Require an immediate checked
 footprint/IK rejection at that same checkpoint and prove neither first-foot
 nor second-foot stage is called.
 
@@ -1882,12 +1882,12 @@ It first validates every source scalar and source shape. For the destination it
 validates storage only: exact shapes, stable identities, non-null buffers,
 complete source/destination and cross-array disjointness, and byte-count
 multiplication. It must not validate stale destination scalar/value semantics
-before overwrite. Only after the complete preflight does it copy every array
-with `memcpy` and every scalar/aggregate with assignment, then validate the
-completed destination semantics.
-It performs no `resize`, allocation, I/O, or state-dependent branch after the
-first write. Add every new owner to `g1_controller_state_swap`, copy, reset,
-and the test-only digest in the same commit.
+before overwrite. Only after that complete preflight does it perform the exact,
+unconditional array `memcpy` operations and scalar/aggregate assignments and
+return success. It performs no semantic validation, `resize`, allocation, I/O,
+or state-dependent branch after the first write. Add every new owner to
+`g1_controller_state_swap`, copy, reset, and the test-only digest in the same
+commit.
 
 Do not install either reset state directly from this state-level helper. Step 4
 defines the runtime aggregate and the only pair-aware reset/switch entry
@@ -2216,8 +2216,11 @@ static inline bool g1_ik_frame_rejection_snapshot(
     int error_capacity);
 ```
 
-It assigns only an initialized, terminal-safe-stop transaction with a valid
-non-`None` reason and complete stage-appropriate result. Thus
+It first requires an initialized transaction in exact begin-stage state
+(`next_foot == 0`), `candidate_result.safe_stop_requested == true`, a valid
+non-`None` `candidate_result.stop_reason`, and a complete stage-appropriate
+`candidate_result`;
+only after all checks does it assign the output. Thus
 `attempted_ik_available` becomes true only after that helper validates and
 assigns a complete snapshot. Unavailable values are never logged as evidence.
 
@@ -2457,7 +2460,7 @@ if (!g1_ik_frame_begin(
         error, error_capacity)) {
     return G1FrameStageGlobalError;
 }
-if (scratch.ik_transaction.terminal_safe_stop) {
+if (scratch.ik_transaction.candidate_result.safe_stop_requested) {
     G1IkFrameResult attempted_ik = {};
     if (!g1_ik_frame_rejection_snapshot(
             attempted_ik, scratch.ik_transaction,
