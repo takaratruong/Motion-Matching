@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://motion-matching.local/schemas/run_manifest_v1.schema.json",
+  "title": "Motion Matching to SONIC run manifest",
+  "type": "object",
+  "required": [
+    "schema",
+    "external"
+  ],
+  "properties": {
+    "schema": {
+      "const": "mm-sonic-run-manifest/v1"
+    },
+    "external": {
+      "type": "object",
+      "required": [
+        "gear_checkout",
+        "gear_commit",
+        "gear_dirty",
+        "policy",
+        "observation_config",
+        "encoder",
+        "terrain_dir",
+        "source_mjcf",
+        "hashes"
+      ],
+      "properties": {
+        "gear_checkout": {
+          "type": "string",
+          "minLength": 1
+        },
+        "gear_commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "gear_dirty": {
+          "type": "boolean"
+        },
+        "policy": {
+          "type": "string",
+          "minLength": 1
+        },
+        "observation_config": {
+          "type": "string",
+          "minLength": 1
+        },
+        "encoder": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "terrain_dir": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_mjcf": {
+          "type": "string",
+          "minLength": 1
+        },
+        "hashes": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": true
+}

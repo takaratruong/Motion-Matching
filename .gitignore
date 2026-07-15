@@ -10,3 +10,6 @@ controller.wasm
 resources/runs*
 /resources/g1_terrain/
 /.worktrees/
+/sonic/.venv/
+/sonic/build/
+/sonic/runs/
