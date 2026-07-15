@@ -6,7 +6,9 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import mm_sonic.external as external
 from mm_sonic.external import (
     ExternalInputError,
     ExternalInputs,
@@ -227,6 +229,79 @@ class ExternalPreflightTests(unittest.TestCase):
         )
         self.assertTrue(verified.gear_dirty)
 
+    def test_permutation_is_validated_from_the_bytes_that_were_hashed(self):
+        parameters = self.checkout / LOCK_PATHS["policy_parameters_source"]
+        valid_text = parameters.read_text(encoding="utf-8")
+        invalid_text = valid_text.replace(", 28};", ", 27};")
+        parameters.write_text(invalid_text, encoding="utf-8")
+        self._commit("commit invalid permutation")
+        self._write_lock(self._head())
+
+        real_sha256_file = external._sha256_file
+        swapped = False
+
+        def swap_between_hash_and_validation(path):
+            nonlocal swapped
+            digest = real_sha256_file(path)
+            if path == parameters:
+                parameters.write_text(valid_text, encoding="utf-8")
+                swapped = True
+            elif swapped and path.name == "body_ang_vel.csv":
+                parameters.write_text(invalid_text, encoding="utf-8")
+            return digest
+
+        with mock.patch.object(
+            external,
+            "_sha256_file",
+            side_effect=swap_between_hash_and_validation,
+        ):
+            with self.assertRaisesRegex(ExternalInputError, "permutation"):
+                verify_gear_checkout(self.checkout, self.lock_path)
+
+    def test_dirty_mutation_after_hashing_is_rejected(self):
+        last_reference = self.checkout / KNOWN_GOOD_REFERENCE / "metadata.txt"
+        real_sha256_file = external._sha256_file
+
+        def mutate_after_hash(path):
+            digest = real_sha256_file(path)
+            if path == last_reference:
+                (self.checkout / "late-untracked.txt").write_text(
+                    "concurrent mutation\n",
+                    encoding="utf-8",
+                )
+            return digest
+
+        with mock.patch.object(
+            external,
+            "_sha256_file",
+            side_effect=mutate_after_hash,
+        ):
+            with self.assertRaisesRegex(ExternalInputError, "changed"):
+                verify_gear_checkout(self.checkout, self.lock_path)
+
+    def test_head_change_after_hashing_is_rejected(self):
+        last_reference = self.checkout / KNOWN_GOOD_REFERENCE / "metadata.txt"
+        joint_names = self.checkout / LOCK_PATHS["joint_names_source"]
+        real_sha256_file = external._sha256_file
+
+        def commit_after_hash(path):
+            digest = real_sha256_file(path)
+            if path == last_reference:
+                joint_names.write_text(
+                    "concurrent committed source\n",
+                    encoding="utf-8",
+                )
+                self._commit("concurrent checkout commit")
+            return digest
+
+        with mock.patch.object(
+            external,
+            "_sha256_file",
+            side_effect=commit_after_hash,
+        ):
+            with self.assertRaisesRegex(ExternalInputError, "changed"):
+                verify_gear_checkout(self.checkout, self.lock_path)
+
     def test_output_cannot_duplicate_or_descend_from_an_input_directory(self):
         for output_root in (self.terrain_dir, self.terrain_dir / "nested-runs"):
             with self.subTest(output_root=output_root):
@@ -234,6 +309,48 @@ class ExternalPreflightTests(unittest.TestCase):
                     ExternalInputs.from_cli(
                         self._args(output_root=output_root),
                     )
+
+    def test_terrain_file_added_after_inventory_is_rejected(self):
+        inventoried_file = self.terrain_dir / "scene.bin"
+        real_sha256_file = external._sha256_file
+
+        def add_after_hash(path):
+            digest = real_sha256_file(path)
+            if path == inventoried_file:
+                (self.terrain_dir / "late.bin").write_bytes(b"late terrain\n")
+            return digest
+
+        with mock.patch.object(
+            external,
+            "_sha256_file",
+            side_effect=add_after_hash,
+        ):
+            with self.assertRaisesRegex(
+                ExternalInputError,
+                "directory input changed",
+            ):
+                ExternalInputs.from_cli(self._args())
+
+    def test_terrain_file_removed_after_hashing_is_rejected(self):
+        inventoried_file = self.terrain_dir / "scene.bin"
+        real_sha256_file = external._sha256_file
+
+        def remove_after_hash(path):
+            digest = real_sha256_file(path)
+            if path == inventoried_file:
+                inventoried_file.unlink()
+            return digest
+
+        with mock.patch.object(
+            external,
+            "_sha256_file",
+            side_effect=remove_after_hash,
+        ):
+            with self.assertRaisesRegex(
+                ExternalInputError,
+                "directory input changed",
+            ):
+                ExternalInputs.from_cli(self._args())
 
     def test_missing_checkpoint_is_rejected(self):
         self.policy.unlink()
@@ -293,6 +410,14 @@ class ExternalPreflightTests(unittest.TestCase):
             first.known_good_reference,
             (self.checkout / KNOWN_GOOD_REFERENCE).resolve(),
         )
+
+    def test_encoder_none_is_valid_and_omits_encoder_hash(self):
+        inputs = ExternalInputs.from_cli(self._args(encoder=None))
+
+        verified = verify_external(inputs, self.lock_path)
+
+        self.assertIsNone(verified.inputs.encoder)
+        self.assertNotIn("encoder", verified.hashes)
 
 
 if __name__ == "__main__":

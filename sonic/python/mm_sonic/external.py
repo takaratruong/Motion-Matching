@@ -186,14 +186,14 @@ def verify_gear_checkout(
         raise ExternalInputError("GEAR checkout is dirty for a scored run")
 
     hashes: dict[str, str] = {}
-    official_sources: dict[str, Path] = {}
     for key in SOURCE_PATH_KEYS:
         source = _checkout_path(checkout, lock_data[key], key, directory=False)
-        official_sources[key] = source
-        hashes[f"gear:{key}"] = _sha256_file(source)
-
-    parameters = official_sources["policy_parameters_source"]
-    _verify_permutation(parameters)
+        if key == "policy_parameters_source":
+            contents = _read_file(source)
+            hashes[f"gear:{key}"] = hashlib.sha256(contents).hexdigest()
+            _verify_permutation(source, contents)
+        else:
+            hashes[f"gear:{key}"] = _sha256_file(source)
 
     reference = _checkout_path(
         checkout,
@@ -211,6 +211,17 @@ def verify_gear_checkout(
         hashes[f"gear:known_good_reference/{name}"] = _sha256_file(
             reference_file
         )
+
+    final_commit = _run_git(checkout, "rev-parse", "--verify", "HEAD")
+    final_status = _run_git(
+        checkout,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--ignore-submodules=none",
+    )
+    if final_commit != commit or final_status != status:
+        raise ExternalInputError("GEAR checkout changed during verification")
 
     return VerifiedGearCheckout(
         gear_checkout=checkout,
@@ -424,9 +435,9 @@ def _checkout_path(
     return _resolve_file(resolved, f"official {label}")
 
 
-def _verify_permutation(parameters: Path) -> None:
+def _verify_permutation(parameters: Path, contents: bytes) -> None:
     try:
-        text = _read_file(parameters).decode("utf-8")
+        text = contents.decode("utf-8")
     except UnicodeDecodeError as error:
         raise ExternalInputError(
             f"policy parameters are not UTF-8: {parameters}"
@@ -518,33 +529,66 @@ def _require_unchanged(path: Path, before, after) -> None:
 
 def _sha256_directory(root: Path) -> str:
     directory = _resolve_directory(root, "directory input")
+    initial_snapshot = _directory_snapshot(directory)
     digest = hashlib.sha256()
+    for relative, kind, _identity in initial_snapshot:
+        if not relative:
+            continue
+        relative_bytes = relative.encode("utf-8")
+        digest.update(kind + b"\0" + relative_bytes + b"\0")
+        if kind == b"F":
+            entry = directory.joinpath(*PurePosixPath(relative).parts)
+            digest.update(bytes.fromhex(_sha256_file(entry)))
+
+    if _directory_snapshot(directory) != initial_snapshot:
+        raise ExternalInputError(f"directory input changed while hashing: {directory}")
+    return digest.hexdigest()
+
+
+def _directory_snapshot(directory: Path):
     try:
         entries = sorted(
             directory.rglob("*"),
             key=lambda path: path.relative_to(directory).as_posix(),
         )
+        root_metadata = directory.lstat()
     except OSError as error:
-        raise ExternalInputError(f"cannot enumerate directory input: {directory}") from error
+        raise ExternalInputError(
+            f"cannot enumerate directory input: {directory}"
+        ) from error
 
+    snapshot = [("", b"D", _metadata_identity(root_metadata))]
     for entry in entries:
-        relative = entry.relative_to(directory).as_posix().encode("utf-8")
+        relative = entry.relative_to(directory).as_posix()
         try:
             metadata = entry.lstat()
         except OSError as error:
-            raise ExternalInputError(f"cannot inspect directory input: {entry}") from error
+            raise ExternalInputError(
+                f"cannot inspect directory input: {entry}"
+            ) from error
         if stat.S_ISLNK(metadata.st_mode):
             raise ExternalInputError(f"directory input contains a symlink: {entry}")
         if stat.S_ISDIR(metadata.st_mode):
-            digest.update(b"D\0" + relative + b"\0")
+            kind = b"D"
         elif stat.S_ISREG(metadata.st_mode):
-            digest.update(b"F\0" + relative + b"\0")
-            digest.update(bytes.fromhex(_sha256_file(entry)))
+            kind = b"F"
         else:
             raise ExternalInputError(
                 f"directory input contains a special file: {entry}"
             )
-    return digest.hexdigest()
+        snapshot.append((relative, kind, _metadata_identity(metadata)))
+    return tuple(snapshot)
+
+
+def _metadata_identity(metadata):
+    return (
+        metadata.st_mode,
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
 
 
 __all__ = [
