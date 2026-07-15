@@ -349,6 +349,50 @@ static inline G1FootprintStatus g1_footprint_surface_query(
     return G1FootprintOk;
 }
 
+static inline G1FootprintStatus g1_footprint_walkability_class_at(
+    int& output,
+    const walkability_grid& grid,
+    const heightfield& field,
+    float input_x,
+    float input_z)
+{
+    if (!walkability_grid_matches_heightfield(grid, field)) {
+        return G1FootprintInvalidField;
+    }
+    float x = 0.0f;
+    float z = 0.0f;
+    float last_x = 0.0f;
+    float last_z = 0.0f;
+    if (!terrain_v2_query_coordinate(input_x, x) ||
+        !terrain_v2_query_coordinate(input_z, z) ||
+        !walkability_node_coordinate(
+            last_x, field.origin_x, field.cell_size, grid.nx - 1) ||
+        !walkability_node_coordinate(
+            last_z, field.origin_z, field.cell_size, grid.nz - 1)) {
+        return G1FootprintArithmeticFailure;
+    }
+    if (static_cast<double>(x) < static_cast<double>(field.origin_x) ||
+        static_cast<double>(x) > static_cast<double>(last_x) ||
+        static_cast<double>(z) < static_cast<double>(field.origin_z) ||
+        static_cast<double>(z) > static_cast<double>(last_z)) {
+        return G1FootprintOutsideDomain;
+    }
+    int node_x = 0;
+    int node_z = 0;
+    if (!walkability_nearest_axis(
+            node_x, x, field.origin_x, field.cell_size, grid.nx) ||
+        !walkability_nearest_axis(
+            node_z, z, field.origin_z, field.cell_size, grid.nz)) {
+        return G1FootprintArithmeticFailure;
+    }
+    int candidate = 0;
+    if (!walkability_cell_value(candidate, grid, node_x, node_z)) {
+        return G1FootprintInvalidField;
+    }
+    output = candidate;
+    return G1FootprintOk;
+}
+
 struct G1FootprintNodeWindow
 {
     int x0 = 0;
@@ -954,11 +998,17 @@ static inline G1FootprintStatus g1_footprint_observe_v2(
                 output, status, error, error_capacity,
                 "G1 footprint landing-center surface query failed");
         }
-        foot.predicted_landing_walkability_class = walkability_class_at(
+        status = g1_footprint_walkability_class_at(
+            foot.predicted_landing_walkability_class,
             grid,
             field,
             foot.predicted_landing_sole_center.x,
             foot.predicted_landing_sole_center.z);
+        if (status != G1FootprintOk) {
+            return g1_footprint_observation_failure(
+                output, status, error, error_capacity,
+                "G1 footprint landing centroid walkability lookup failed");
+        }
         if (foot.predicted_landing_walkability_class == 0 &&
             !candidate.blocked) {
             candidate.blocked = true;

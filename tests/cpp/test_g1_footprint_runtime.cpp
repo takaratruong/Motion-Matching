@@ -870,6 +870,63 @@ static void test_exact_landing_residual_threshold()
     }
 }
 
+static void test_landing_centroid_walkability_distinguishes_malformed()
+{
+    TerrainFixture terrain;
+    PoseFixture pose;
+    const G1CommandSnapshot command = stationary_command();
+    const G1FootContactSchedule landing_contacts =
+        contact_schedule(false, false, true, true);
+    const int centroid_x = 42;
+    const int centroid_z = 40;
+    const int centroid_index = centroid_z * terrain.grid.nx + centroid_x;
+
+    terrain.grid.cells(centroid_index) = 3;
+    G1FootprintObservation malformed_output;
+    poison(malformed_output);
+    const G1FootprintObservation malformed_before = malformed_output;
+    char error[256] = {};
+    const G1FootprintStatus malformed_status = observe(
+        malformed_output,
+        g1_footprint_budget(),
+        terrain,
+        command,
+        landing_contacts,
+        pose,
+        error,
+        static_cast<int>(sizeof(error)));
+    check(malformed_status == G1FootprintInvalidField,
+          "centroid-only malformed walkability value is a field failure");
+    check(same_bytes(malformed_output, malformed_before),
+          "centroid-only malformed walkability preserves poisoned output");
+    check(std::strstr(error, "centroid") != NULL &&
+              std::strstr(error, "walkability") != NULL,
+          "centroid-only malformed walkability has a useful diagnostic");
+
+    terrain.grid.cells(centroid_index) = 0;
+    G1FootprintObservation blocked = {};
+    std::memset(error, 0, sizeof(error));
+    check(observe(
+              blocked,
+              g1_footprint_budget(),
+              terrain,
+              command,
+              landing_contacts,
+              pose,
+              error,
+              static_cast<int>(sizeof(error))) == G1FootprintOk,
+          "legitimate class-zero landing centroid remains an Ok observation");
+    check(blocked.blocked &&
+              blocked.blocked_reason == walkability_blocked_cell &&
+              blocked.feet[0].landing_expected &&
+              blocked.feet[0].predicted_landing_walkability_class == 0 &&
+              !blocked.feet[0].landing_patch_ready &&
+              blocked.work.sweeps == 24U &&
+              blocked.work.surface_queries == 34U &&
+              blocked.work.node_visits == 864U,
+          "legitimate blocked centroid remains distinct with fixed work");
+}
+
 static void test_failure_budget_alias_and_blocked_matrix()
 {
     TerrainFixture terrain;
@@ -1248,6 +1305,7 @@ int main(int argc, char** argv)
     test_swept_interior_node_and_reversal_invariance();
     test_landing_edges_and_discontinuity();
     test_exact_landing_residual_threshold();
+    test_landing_centroid_walkability_distinguishes_malformed();
     test_failure_budget_alias_and_blocked_matrix();
     test_public_defaults_and_parity(parity);
     return 0;
