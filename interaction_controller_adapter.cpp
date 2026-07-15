@@ -11,8 +11,9 @@
 namespace interaction {
 namespace {
 
-constexpr int kControllerRate = 60;
-constexpr int kInteractionRuntimeRate = 25;
+constexpr int kControllerRate = locomotion_timing::kRateHz;
+constexpr int kInteractionRuntimeRate = locomotion_timing::kRateHz;
+static_assert(kControllerRate == kInteractionRuntimeRate);
 constexpr float kOwnershipBlendSeconds = 0.25F;
 constexpr float kUnitRotationTolerance = 1.0e-3F;
 
@@ -110,11 +111,6 @@ bool raw_channels_equal(vec3 left, vec3 right) {
 bool raw_channels_equal(quat left, quat right) {
     return left.w == right.w && left.x == right.x && left.y == right.y &&
            left.z == right.z;
-}
-
-bool raw_transform_channels_equal(Transform left, Transform right) {
-    return raw_channels_equal(left.position, right.position) &&
-        raw_channels_equal(left.rotation, right.rotation);
 }
 
 bool raw_pose_channels_equal(const Pose& left, const Pose& right) {
@@ -650,7 +646,6 @@ void ControllerInteractionFrameHandoff::reset() {
 void ControllerInteractionSceneHandoff::reset_authority() {
     has_runtime_pose_ = false;
     runtime_target_ = {};
-    previous_runtime_object_world_ = {};
     current_runtime_object_world_ = {};
 }
 
@@ -683,35 +678,14 @@ ControllerInteractionSceneState ControllerInteractionSceneHandoff::apply(
     if (!has_runtime_pose_ || runtime_target_ != registry_target->handle) {
         has_runtime_pose_ = true;
         runtime_target_ = registry_target->handle;
-        previous_runtime_object_world_ = runtime_output.object_world;
         current_runtime_object_world_ = runtime_output.object_world;
         return {current_runtime_object_world_, true};
     }
 
     if (runtime_sample_updated) {
-        previous_runtime_object_world_ = current_runtime_object_world_;
         current_runtime_object_world_ = runtime_output.object_world;
     }
-
-    if (alpha == 0.0F) {
-        return {previous_runtime_object_world_, true};
-    }
-    if (raw_transform_channels_equal(
-            previous_runtime_object_world_,
-            current_runtime_object_world_)) {
-        return {current_runtime_object_world_, true};
-    }
-
-    return {{
-                lerp(
-                    previous_runtime_object_world_.position,
-                    current_runtime_object_world_.position,
-                    alpha),
-                quat_nlerp_shortest(
-                    previous_runtime_object_world_.rotation,
-                    current_runtime_object_world_.rotation,
-                    alpha)},
-            true};
+    return {current_runtime_object_world_, true};
 }
 
 const char* controller_carry_mode_label(const RuntimeOutput& output) {

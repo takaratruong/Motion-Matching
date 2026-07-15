@@ -4,6 +4,7 @@
 #include "vec.h"
 #include "quat.h"
 #include "array.h"
+#include "locomotion_timing.h"
 
 #include <assert.h>
 #include <float.h>
@@ -440,14 +441,17 @@ void compute_bone_velocity_feature(database& db, int& offset, int bone, float we
     offset += 3;
 }
 
-// Compute the trajectory at 20, 40, and 60 frames in the future
+// Compute the trajectory at the shared 25 Hz query horizons.
 void compute_trajectory_position_feature(database& db, int& offset, float weight = 1.0f)
 {
     for (int i = 0; i < db.nframes(); i++)
     {
-        int t0 = database_trajectory_index_clamp(db, i, 20);
-        int t1 = database_trajectory_index_clamp(db, i, 40);
-        int t2 = database_trajectory_index_clamp(db, i, 60);
+        int t0 = database_trajectory_index_clamp(
+            db, i, locomotion_timing::kTrajectoryFrameOffsets[0]);
+        int t1 = database_trajectory_index_clamp(
+            db, i, locomotion_timing::kTrajectoryFrameOffsets[1]);
+        int t2 = database_trajectory_index_clamp(
+            db, i, locomotion_timing::kTrajectoryFrameOffsets[2]);
         
         vec3 trajectory_pos0 = quat_mul_vec3(quat_inv(db.bone_rotations(i, 0)), db.bone_positions(t0, 0) - db.bone_positions(i, 0));
         vec3 trajectory_pos1 = quat_mul_vec3(quat_inv(db.bone_rotations(i, 0)), db.bone_positions(t1, 0) - db.bone_positions(i, 0));
@@ -471,9 +475,12 @@ void compute_trajectory_direction_feature(database& db, int& offset, float weigh
 {
     for (int i = 0; i < db.nframes(); i++)
     {
-        int t0 = database_trajectory_index_clamp(db, i, 20);
-        int t1 = database_trajectory_index_clamp(db, i, 40);
-        int t2 = database_trajectory_index_clamp(db, i, 60);
+        int t0 = database_trajectory_index_clamp(
+            db, i, locomotion_timing::kTrajectoryFrameOffsets[0]);
+        int t1 = database_trajectory_index_clamp(
+            db, i, locomotion_timing::kTrajectoryFrameOffsets[1]);
+        int t2 = database_trajectory_index_clamp(
+            db, i, locomotion_timing::kTrajectoryFrameOffsets[2]);
         
         vec3 trajectory_dir0 = quat_mul_vec3(quat_inv(db.bone_rotations(i, 0)), quat_mul_vec3(db.bone_rotations(t0, 0), vec3(0, 0, 1)));
         vec3 trajectory_dir1 = quat_mul_vec3(quat_inv(db.bone_rotations(i, 0)), quat_mul_vec3(db.bone_rotations(t1, 0), vec3(0, 0, 1)));

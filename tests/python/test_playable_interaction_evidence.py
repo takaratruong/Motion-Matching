@@ -2269,7 +2269,7 @@ class Task12PolicyTests(unittest.TestCase):
         state = self._source_between(
             controller,
             "struct ControllerAutodemoState",
-            "bool autodemo_render_is_due",
+            "float autodemo_planar_distance",
         )
         self.assertIn(
             "uint32_t reset_presentation_frames_remaining = 0U;",

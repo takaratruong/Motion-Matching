@@ -2,6 +2,7 @@
 
 #include "interaction_runtime.h"
 #include "interaction_target_rig_ik.h"
+#include "locomotion_timing.h"
 
 #include <array>
 #include <cstddef>
@@ -11,8 +12,10 @@
 
 namespace interaction {
 
-inline constexpr float kControllerStepSeconds = 1.0F / 60.0F;
-inline constexpr float kInteractionRuntimeStepSeconds = 1.0F / 25.0F;
+inline constexpr float kControllerStepSeconds =
+    locomotion_timing::kStepSeconds;
+inline constexpr float kInteractionRuntimeStepSeconds =
+    locomotion_timing::kStepSeconds;
 inline constexpr std::array<float, 14> kFlatControllerRestHandDof{};
 inline constexpr std::array<float, 14>
     kFlatControllerRestHandDofVelocities{};
@@ -165,7 +168,6 @@ private:
 
     bool has_runtime_pose_ = false;
     TargetHandle runtime_target_{};
-    Transform previous_runtime_object_world_{};
     Transform current_runtime_object_world_{};
 };
 

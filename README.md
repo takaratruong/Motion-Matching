@@ -107,7 +107,7 @@ Gate 1 replays data only; it does not yet make the character pick up an object.
 
 # Playable G1 Tabletop Pickup
 
-The desktop controller now combines the existing flat locomotion controller with one authored G1 tabletop pickup. Ordinary locomotion, rendering, and the ownership handoff run at a fixed 60 Hz. The interaction runtime advances through the deterministic integer scheduler at exactly 25 updates per second; it is not driven by wall-clock frame time.
+The desktop controller now combines the existing flat locomotion controller with one authored G1 tabletop pickup. Locomotion, interaction matching, rendering, scene publication, and the ownership handoff advance synchronously at a fixed 25 Hz; none of them is driven by wall-clock frame time.
 
 Bootstrap the pinned local Raylib and Raygui dependencies, then build the diagnostic interaction pack from the local GRAIL pickup data:
 

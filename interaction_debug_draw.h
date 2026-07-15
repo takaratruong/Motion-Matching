@@ -245,7 +245,7 @@ inline void draw_interaction_text(
         DARKGRAY);
     DrawText(
         TextFormat(
-            "runtime=25Hz controller=60Hz owns=%d attached=%d speed=%.3f",
+            "runtime=25Hz controller=25Hz owns=%d attached=%d speed=%.3f",
             output.owns_pose ? 1 : 0,
             output.diagnostics.attached ? 1 : 0,
             output.diagnostics.playback_speed),

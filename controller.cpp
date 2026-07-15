@@ -18,6 +18,7 @@
 #include "interaction_controller_adapter.h"
 #include "interaction_debug_draw.h"
 #include "interaction_runtime.h"
+#include "locomotion_timing.h"
 
 #include <algorithm>
 #include <array>
@@ -756,8 +757,7 @@ void trajectory_desired_velocities_predict(
   const bool desired_strafe,
   const float fwrd_speed,
   const float side_speed,
-  const float back_speed,
-  const float dt)
+  const float back_speed)
 {
     desired_velocities(0) = desired_velocity;
     
@@ -766,7 +766,11 @@ void trajectory_desired_velocities_predict(
         desired_velocities(i) = desired_velocity_update(
             gamepadstick_left,
             orbit_camera_update_azimuth(
-                camera_azimuth, gamepadstick_right, desired_strafe, i * dt),
+                camera_azimuth,
+                gamepadstick_right,
+                desired_strafe,
+                locomotion_timing::kTrajectorySampleTimesSeconds[
+                    static_cast<size_t>(i - 1)]),
             trajectory_rotations(i),
             fwrd_speed,
             side_speed,
@@ -783,7 +787,6 @@ void trajectory_positions_predict(
     const vec3 acceleration, 
     const slice1d<vec3> desired_velocities, 
     const float halflife,
-    const float dt,
     const slice1d<vec3> obstacles_positions,
     const slice1d<vec3> obstacles_scales)
 {
@@ -803,7 +806,8 @@ void trajectory_positions_predict(
             accelerations(i), 
             desired_velocities(i), 
             halflife, 
-            dt, 
+            locomotion_timing::kTrajectoryStepSeconds[
+                static_cast<size_t>(i - 1)],
             obstacles_positions, 
             obstacles_scales);
     }
@@ -818,8 +822,7 @@ void trajectory_desired_rotations_predict(
   const float camera_azimuth,
   const vec3 gamepadstick_left,
   const vec3 gamepadstick_right,
-  const bool desired_strafe,
-  const float dt)
+  const bool desired_strafe)
 {
     desired_rotations(0) = desired_rotation;
     
@@ -830,7 +833,11 @@ void trajectory_desired_rotations_predict(
             gamepadstick_left,
             gamepadstick_right,
             orbit_camera_update_azimuth(
-                camera_azimuth, gamepadstick_right, desired_strafe, i * dt),
+                camera_azimuth,
+                gamepadstick_right,
+                desired_strafe,
+                locomotion_timing::kTrajectorySampleTimesSeconds[
+                    static_cast<size_t>(i - 1)]),
             desired_strafe,
             desired_velocities(i));
     }
@@ -842,8 +849,7 @@ void trajectory_rotations_predict(
     const quat rotation, 
     const vec3 angular_velocity, 
     const slice1d<quat> desired_rotations, 
-    const float halflife,
-    const float dt)
+    const float halflife)
 {
     rotations.set(rotation);
     angular_velocities.set(angular_velocity);
@@ -855,7 +861,8 @@ void trajectory_rotations_predict(
             angular_velocities(i), 
             desired_rotations(i), 
             halflife, 
-            i * dt);
+            locomotion_timing::kTrajectorySampleTimesSeconds[
+                static_cast<size_t>(i - 1)]);
     }
 }
 
@@ -1963,7 +1970,26 @@ const char* autodemo_action_name(AutodemoAction action)
     return "none";
 }
 
-constexpr uint32_t kAutodemoResetPresentationFrames = 16U;
+constexpr uint32_t kAutodemoResetPresentationFrames = 7U;
+constexpr uint32_t kAutodemoWarmupFrames = 50U;
+constexpr uint64_t kAutodemoInteractFrame = 13U;
+constexpr int kAutodemoCarryCommandCount = 63;
+constexpr int kAutodemoFinalCarryCommand =
+    kAutodemoCarryCommandCount - 1;
+constexpr uint64_t kAutodemoCarryDeadlineFrames = 375U;
+constexpr uint64_t kAutodemoMaximumEvidenceFrames = 500U;
+static_assert(
+    kAutodemoResetPresentationFrames ==
+        locomotion_timing::ticks_for_milliseconds(250U));
+static_assert(
+    kAutodemoWarmupFrames ==
+        locomotion_timing::ticks_for_milliseconds(2000U));
+static_assert(
+    kAutodemoInteractFrame ==
+        locomotion_timing::ticks_for_milliseconds(500U));
+static_assert(
+    kAutodemoCarryCommandCount == static_cast<int>(
+        locomotion_timing::ticks_for_milliseconds(2500U)));
 
 struct ControllerAutodemoState
 {
@@ -1986,21 +2012,6 @@ struct ControllerAutodemoState
     std::vector<interaction::RuntimeState> collapsed_states;
     std::string failure;
 };
-
-bool autodemo_render_is_due(int phase_before)
-{
-    return phase_before + 25 >= 60;
-}
-
-bool autodemo_next_render_is_due(int phase_before)
-{
-    int phase_after = phase_before + 25;
-    if (phase_after >= 60)
-    {
-        phase_after -= 60;
-    }
-    return phase_after + 25 >= 60;
-}
 
 float autodemo_planar_distance(vec3 left, vec3 right)
 {
@@ -2073,7 +2084,7 @@ void write_autodemo_record(
         runtime_state == interaction::RuntimeState::PickupReplay ||
         runtime_state == interaction::RuntimeState::Hold ||
         runtime_state == interaction::RuntimeState::Carry;
-    if (scheduler_phase < 0 || scheduler_phase >= 60 ||
+    if (scheduler_phase != 0 ||
         !autodemo_is_finite(root_position.x) ||
         !autodemo_is_finite(root_position.y) ||
         !autodemo_is_finite(root_position.z) ||
@@ -2332,7 +2343,7 @@ int main(void)
     SetConfigFlags(FLAG_VSYNC_HINT);
     SetConfigFlags(FLAG_MSAA_4X_HINT);
     InitWindow(screen_width, screen_height, "raylib [data vs code driven displacement]");
-    SetTargetFPS(60);
+    SetTargetFPS(25);
     if (autodemo_configuration.has_value() && !IsWindowReady())
     {
         cleanup_autodemo_temporaries(*autodemo_configuration);
@@ -2831,7 +2842,7 @@ int main(void)
     
     // Learned Motion Matching
     
-    bool lmm_enabled = false;
+    const bool lmm_enabled = false;
     
     nnet decompressor, stepper, projector;    
     nnet_load(decompressor, "./resources/decompressor.bin");
@@ -2966,7 +2977,7 @@ int main(void)
     const char* logpath = getenv("MM_LOG");
     g_log = fopen(logpath ? logpath : "/home/ubuntu/projects/motion-matching/discrete_log.txt", "w");
     if (!g_log) g_log = stderr;
-    fprintf(g_log, "# MM_DISCRETE run: hold-forward + azimuth snaps at f=120,240,360\n");
+    fprintf(g_log, "# MM_DISCRETE run: hold-forward + azimuth snaps at f=50,100,150\n");
     fprintf(g_log, "# inertialize_blending_halflife=%.3f sim_rot_halflife=%.3f strafe=%d\n",
         inertialize_blending_halflife, simulation_rotation_halflife, (int)g_force_strafe);
 #endif
@@ -2991,8 +3002,6 @@ int main(void)
 
     auto update_func = [&]()
     {
-        const int interaction_scheduler_phase_before =
-            interaction_scheduler.phase();
         AutodemoAction autodemo_action = AutodemoAction::None;
         int autodemo_carry_command_frame = -1;
 
@@ -3002,28 +3011,28 @@ int main(void)
         //   1: rapid alternating +/-90 snaps every N frames (arrow mashing)
         //   2: continuous azimuth ramp (arrow held), 2 rad/s like the real cam
         static int mode = -2;
-        static int snapN = 12;
+        static int snapN = 5;
         if (mode == -2) { const char* m=getenv("MM_MODE"); mode=m?atoi(m):0;
                           const char* n=getenv("MM_SNAPN"); if(n) snapN=atoi(n); }
         if (mode == 0)
         {
-            if (g_frame == 120) camera_azimuth += 0.5f * PIf;
-            if (g_frame == 240) camera_azimuth += 0.5f * PIf;
-            if (g_frame == 360) camera_azimuth -= 0.5f * PIf;
+            if (g_frame == 50) camera_azimuth += 0.5f * PIf;
+            if (g_frame == 100) camera_azimuth += 0.5f * PIf;
+            if (g_frame == 150) camera_azimuth -= 0.5f * PIf;
         }
         else if (mode == 1)
         {
-            if (g_frame >= 60 && (g_frame % snapN) == 0)
+            if (g_frame >= 25 && (g_frame % snapN) == 0)
                 camera_azimuth += ((g_frame / snapN) % 2 ? -1.0f : 1.0f) * 0.5f * PIf;
         }
         else if (mode == 2)
         {
-            if (g_frame >= 60) camera_azimuth += 2.0f * (1.0f/60.0f); // arrow held
+            if (g_frame >= 25) camera_azimuth += 2.0f * dt; // arrow held
         }
         else if (mode == 3)
         {
             // alternating 180-deg azimuth snaps -> antipodal desired_rotation
-            if (g_frame >= 60 && (g_frame % snapN) == 0) camera_azimuth += PIf;
+            if (g_frame >= 25 && (g_frame % snapN) == 0) camera_azimuth += PIf;
         }
 #endif
 
@@ -3031,9 +3040,9 @@ int main(void)
         vec3 gamepadstick_left = gamepad_get_stick(GAMEPAD_STICK_LEFT);
         vec3 gamepadstick_right = gamepad_get_stick(GAMEPAD_STICK_RIGHT);
 
-        // Press edges are sampled at 60 Hz and latched by the scheduler until
-        // the next fixed-25 runtime tick. Camera input remains live while
-        // cached interaction output suppresses movement steering.
+        // Press edges and runtime updates share the fixed 25 Hz controller
+        // tick. Camera input remains live while interaction output suppresses
+        // movement steering.
         interaction::ControllerInteractionEdges interaction_edges{
             IsKeyPressed(KEY_F) || IsGamepadButtonPressed(
                 GAMEPAD_PLAYER, GAMEPAD_BUTTON_RIGHT_FACE_LEFT),
@@ -3058,7 +3067,7 @@ int main(void)
             if (autodemo_state.evidence_started &&
                 autodemo_state.reset_presentation_frames_remaining == 0U)
             {
-                if (autodemo_state.render_frame == 30U &&
+                if (autodemo_state.render_frame == kAutodemoInteractFrame &&
                     !autodemo_state.interact_pulsed)
                 {
                     interaction_edges.interact_pressed = true;
@@ -3067,30 +3076,17 @@ int main(void)
                 }
                 else if (autodemo_state.reset_pending)
                 {
-                    if (!autodemo_render_is_due(
-                            interaction_scheduler_phase_before))
-                    {
-                        throw std::runtime_error(
-                            "autodemo reset render is not scheduler-due");
-                    }
                     interaction_edges.reset_pressed = true;
                     autodemo_action = AutodemoAction::Reset;
                 }
                 else if (autodemo_state.carry_origin_captured &&
-                         autodemo_state.carry_command_count < 150)
+                         autodemo_state.carry_command_count <
+                             kAutodemoCarryCommandCount)
                 {
-                    const bool issue_forward =
-                        autodemo_state.carry_command_count < 149 ||
-                        (autodemo_state.carry_command_count == 149 &&
-                         autodemo_next_render_is_due(
-                             interaction_scheduler_phase_before));
-                    if (issue_forward)
-                    {
-                        gamepadstick_left = vec3(0.0F, 0.0F, -1.0F);
-                        autodemo_carry_command_frame =
-                            autodemo_state.carry_command_count;
-                        autodemo_action = AutodemoAction::Forward;
-                    }
+                    gamepadstick_left = vec3(0.0F, 0.0F, -1.0F);
+                    autodemo_carry_command_frame =
+                        autodemo_state.carry_command_count;
+                    autodemo_action = AutodemoAction::Forward;
                 }
             }
         }
@@ -3164,8 +3160,7 @@ int main(void)
           camera_azimuth,
           gamepadstick_left,
           gamepadstick_right,
-          desired_strafe,
-          20.0f * dt);
+          desired_strafe);
         
         trajectory_rotations_predict(
             trajectory_rotations,
@@ -3173,8 +3168,7 @@ int main(void)
             simulation_rotation,
             simulation_angular_velocity,
             trajectory_desired_rotations,
-            simulation_rotation_halflife,
-            20.0f * dt);
+            simulation_rotation_halflife);
         
         trajectory_desired_velocities_predict(
           trajectory_desired_velocities,
@@ -3186,8 +3180,7 @@ int main(void)
           desired_strafe,
           simulation_fwrd_speed,
           simulation_side_speed,
-          simulation_back_speed,
-          20.0f * dt);
+          simulation_back_speed);
         
         trajectory_positions_predict(
             trajectory_positions,
@@ -3198,7 +3191,6 @@ int main(void)
             simulation_acceleration,
             trajectory_desired_velocities,
             simulation_velocity_halflife,
-            20.0f * dt,
             obstacles_positions,
             obstacles_scales);
            
@@ -3392,7 +3384,7 @@ int main(void)
         else
         {
             // Tick frame
-            frame_index++; // Assumes dt is fixed to 60fps
+            frame_index++; // Assumes dt is fixed to 25 Hz.
             
             // Look-up Next Pose
             curr_bone_positions = db.bone_positions(frame_index);
@@ -3572,9 +3564,8 @@ int main(void)
              cached_interaction_state ==
                  interaction::RuntimeState::Preflight);
 
-        // Advance the interaction runtime at exactly 25 of every 60
-        // controller ticks. The provider and resolver are invoked only by a
-        // due tick; the complete RuntimeOutput is otherwise held unchanged.
+        // Advance locomotion and interaction synchronously once per 25 Hz
+        // controller tick.
         const interaction::FlatControllerPose flat_locomotion_pose =
             make_flat_controller_pose();
         const interaction::Pose& locomotion_reference =
@@ -3639,12 +3630,10 @@ int main(void)
                     return interaction_runtime.update(input);
                 });
         if (autodemo_configuration.has_value() &&
-            autodemo_render_is_due(interaction_scheduler_phase_before))
+            interaction_scheduler.updated_last_tick())
         {
             ++autodemo_state.runtime_tick;
         }
-        const float interaction_scene_alpha =
-            static_cast<float>(interaction_scheduler.phase()) / 60.0F;
         const bool interaction_scene_sample_updated =
             interaction_scheduler.updated_last_tick();
 
@@ -3678,7 +3667,7 @@ int main(void)
                 interaction_scene_target,
                 interaction_output,
                 interaction_authored_target.object_world,
-                interaction_scene_alpha,
+                0.0F,
                 interaction_scene_sample_updated);
 
         std::optional<interaction::ControllerInteractionHandConstraint>
@@ -3791,7 +3780,7 @@ int main(void)
             prev_root_yaw = root_yaw;
             prev_root_q   = root_q;
             g_frame++;
-            if (g_frame >= 400) { fflush(g_log); fclose(g_log); _Exit(0); }
+            if (g_frame >= 167) { fflush(g_log); fclose(g_log); _Exit(0); }
         }
 #endif
 
@@ -4149,10 +4138,9 @@ int main(void)
         
         GuiGroupBox((Rectangle){ 970, ui_lmm_hei, 290, 40 }, "learned motion matching");
         
-        GuiCheckBox(
-            (Rectangle){ 1000, ui_lmm_hei + 10, 20, 20 }, 
-            "enabled",
-            &lmm_enabled);
+        GuiLabel(
+            (Rectangle){ 1000, ui_lmm_hei + 10, 220, 20 },
+            "disabled (25 Hz retime pending)");
         
         //---------
         
@@ -4368,12 +4356,10 @@ int main(void)
                 if (interaction_output.diagnostics.state ==
                     interaction::RuntimeState::Locomotion)
                 {
-                    if (!autodemo_render_is_due(
-                            interaction_scheduler_phase_before) ||
-                        autodemo_state.runtime_tick == 0U)
+                    if (autodemo_state.runtime_tick == 0U)
                     {
                         throw std::runtime_error(
-                            "autodemo did not warm on a scheduled tick");
+                            "autodemo did not warm on a 25 Hz tick");
                     }
                     autodemo_state.evidence_started = true;
                 }
@@ -4383,10 +4369,11 @@ int main(void)
                     throw std::runtime_error(
                         "autodemo warmup produced an unexpected state");
                 }
-                else if (autodemo_state.warmup_render_ticks >= 120U)
+                else if (autodemo_state.warmup_render_ticks >=
+                         kAutodemoWarmupFrames)
                 {
                     throw std::runtime_error(
-                        "autodemo warmup exceeded 120 render ticks");
+                        "autodemo warmup exceeded its 25 Hz deadline");
                 }
             }
 
@@ -4465,20 +4452,21 @@ int main(void)
                         autodemo_carry_command_frame !=
                             autodemo_state.carry_command_count ||
                         autodemo_carry_command_frame < 0 ||
-                        autodemo_carry_command_frame >= 150)
+                        autodemo_carry_command_frame >=
+                            kAutodemoCarryCommandCount)
                     {
                         throw std::runtime_error(
                             "autodemo forward command escaped Carry");
                     }
                     ++autodemo_state.carry_command_count;
-                    if (autodemo_state.carry_command_count == 150)
+                    if (autodemo_state.carry_command_count ==
+                        kAutodemoCarryCommandCount)
                     {
-                        if (autodemo_carry_command_frame != 149 ||
-                            !autodemo_next_render_is_due(
-                                interaction_scheduler_phase_before))
+                        if (autodemo_carry_command_frame !=
+                            kAutodemoFinalCarryCommand)
                         {
                             throw std::runtime_error(
-                                "autodemo final Carry command is misaligned");
+                                "autodemo final Carry command is invalid");
                         }
                         const std::string screenshot_temporary =
                             autodemo_configuration->screenshot_temporary
@@ -4523,17 +4511,19 @@ int main(void)
                     autodemo_action);
 
                 if (!autodemo_state.carry_origin_captured &&
-                    autodemo_state.render_frame >= 900U)
+                    autodemo_state.render_frame >=
+                        kAutodemoCarryDeadlineFrames)
                 {
                     throw std::runtime_error(
-                        "autodemo did not reach Carry by evidence frame 900");
+                        "autodemo did not reach Carry by its 25 Hz deadline");
                 }
 
                 if (autodemo_action == AutodemoAction::Reset)
                 {
                     if (autodemo_state.collapsed_states.size() != 7U ||
                         !autodemo_state.candidate_verified ||
-                        autodemo_state.carry_command_count != 150 ||
+                        autodemo_state.carry_command_count !=
+                            kAutodemoCarryCommandCount ||
                         !autodemo_state.screenshot_captured ||
                         !(autodemo_state.last_carry_displacement_m > 0.20F))
                     {
@@ -4559,10 +4549,11 @@ int main(void)
                 else
                 {
                     ++autodemo_state.render_frame;
-                    if (autodemo_state.render_frame >= 1200U)
+                    if (autodemo_state.render_frame >=
+                        kAutodemoMaximumEvidenceFrames)
                     {
                         throw std::runtime_error(
-                            "autodemo evidence exceeded 1200 renders");
+                            "autodemo evidence exceeded its 25 Hz bound");
                     }
                 }
             }
@@ -4572,7 +4563,7 @@ int main(void)
 
 #if defined(PLATFORM_WEB)
     std::function<void()> u{update_func};
-    emscripten_set_main_loop_arg(update_callback, &u, 60, 1);
+    emscripten_set_main_loop_arg(update_callback, &u, 25, 1);
 #else
     while (!autodemo_state.exit_requested)
     {

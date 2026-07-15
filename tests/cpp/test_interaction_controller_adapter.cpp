@@ -427,6 +427,12 @@ void test_exact_constants() {
             locomotion_timing::kTrajectoryStepSeconds[1] == 0.36F &&
             locomotion_timing::kTrajectoryStepSeconds[2] == 0.32F,
         "trajectory position prediction must use nonuniform step durations");
+    static_assert(
+        locomotion_timing::ticks_for_milliseconds(250U) == 7U &&
+            locomotion_timing::ticks_for_milliseconds(500U) == 13U &&
+            locomotion_timing::ticks_for_milliseconds(2000U) == 50U &&
+            locomotion_timing::ticks_for_milliseconds(2500U) == 63U,
+        "time-based controller windows must round up to 25 Hz ticks");
 }
 
 void test_flat_bridge_exact_parent_tree_anchor_map_and_unmapped_head() {
@@ -2505,6 +2511,11 @@ void test_controller_and_make_clock_policy() {
            std::string::npos);
     assert(controller.find("catch (const interaction::FormatError&") !=
            std::string::npos);
+    require(
+        controller.find("const bool lmm_enabled = false;") !=
+                std::string::npos &&
+            controller.find("&lmm_enabled") == std::string::npos,
+        "the unretimed learned matcher can still be enabled at runtime");
 
     const std::string database = read_text("database.h");
     require(
