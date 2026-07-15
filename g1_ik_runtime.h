@@ -83,16 +83,6 @@ struct G1IkFrameTransaction
     uint32_t next_foot = 0;
     G1IkState candidate_state;
     G1IkFrameResult candidate_result;
-
-    // Fixed transaction-private records. They keep split callers reversible
-    // without owning or receiving any command, travel, heading, or matcher
-    // state.
-    bool enabled = false;
-    bool terminal_safe_stop = false;
-    bool recorded_contacts[2] = {};
-    G1FootTarget base_targets[2];
-    vec3 accepted_positions[G1_BoneCount];
-    quat accepted_rotations[G1_BoneCount];
 };
 
 struct G1IkSafeStopHandoff
@@ -119,9 +109,27 @@ static constexpr uint32_t G1SwingLiftCandidateBits[
 
 static_assert(sizeof(float) == sizeof(uint32_t),
               "G1 IK lift ladder requires binary32 storage");
-static_assert(G1SwingLiftCandidateBits[0] == UINT32_C(0x00000000) &&
-              G1SwingLiftCandidateBits[40] == UINT32_C(0x3da3d70a),
-              "G1 IK lift ladder endpoints are immutable");
+
+static constexpr bool g1_ik_runtime_lift_ladder_is_strictly_ordered()
+{
+    if (G1SwingLiftCandidateBits[0] != UINT32_C(0x00000000) ||
+        G1SwingLiftCandidateBits[G1SwingLiftCandidateCount - 1] !=
+            UINT32_C(0x3da3d70a)) {
+        return false;
+    }
+    for (uint32_t candidate = 1;
+         candidate < G1SwingLiftCandidateCount;
+         ++candidate) {
+        if (G1SwingLiftCandidateBits[candidate - 1] >=
+            G1SwingLiftCandidateBits[candidate]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static_assert(g1_ik_runtime_lift_ladder_is_strictly_ordered(),
+              "all 41 G1 IK lift words are immutable and strictly ordered");
 
 static inline bool g1_ik_runtime_fail(
     char* error, int error_capacity, const char* message)
@@ -317,8 +325,7 @@ static inline bool g1_ik_safe_stop_handoff(
             "G1 IK safe-stop handoff requires runtime velocity");
     }
     G1IkSafeStopHandoff candidate = {};
-    candidate.applied_velocity =
-        g1_ik_vec3_canonicalize(requested_velocity);
+    candidate.applied_velocity = requested_velocity;
     if (latched) {
         candidate.applied_velocity.x = 0.0f;
         candidate.applied_velocity.z = 0.0f;
@@ -551,7 +558,6 @@ static inline void g1_ik_runtime_request_safe_stop(
     G1IkFrameTransaction& transaction,
     G1IkStopReason reason)
 {
-    transaction.terminal_safe_stop = true;
     transaction.candidate_result.applied = false;
     transaction.candidate_result.safe_stop_requested = true;
     transaction.candidate_result.stop_reason = reason;
@@ -662,16 +668,19 @@ static inline bool g1_ik_frame_begin(
 
     G1IkFrameTransaction candidate = {};
     candidate.initialized = true;
-    candidate.enabled = enabled;
     candidate.candidate_state = state;
-    std::memcpy(
-        candidate.accepted_positions,
-        baseline_positions.data,
-        sizeof(candidate.accepted_positions));
-    std::memcpy(
-        candidate.accepted_rotations,
-        baseline_rotations.data,
-        sizeof(candidate.accepted_rotations));
+    if (!enabled) {
+        std::memcpy(
+            scratch_positions.data,
+            baseline_positions.data,
+            static_cast<std::size_t>(G1_BoneCount) * sizeof(vec3));
+        std::memcpy(
+            scratch_rotations.data,
+            baseline_rotations.data,
+            static_cast<std::size_t>(G1_BoneCount) * sizeof(quat));
+        transaction = candidate;
+        return true;
+    }
 
     for (int foot_index = 0; foot_index < 2; ++foot_index) {
         G1FootTarget target = {};
@@ -701,9 +710,6 @@ static inline bool g1_ik_frame_begin(
                     "G1 IK established contact lock target is invalid");
             }
         }
-        candidate.recorded_contacts[foot_index] =
-            contacts.data[foot_index];
-        candidate.base_targets[foot_index] = target;
         candidate.candidate_result.feet[foot_index]
             .recorded_contact = contacts.data[foot_index];
         candidate.candidate_result.feet[foot_index].target = target;
@@ -725,13 +731,13 @@ static inline bool g1_ik_frame_begin(
                     G1IkStopLandingPatchUnavailable);
                 break;
             }
-            G1FootTarget target = candidate.base_targets[foot_index];
+            G1FootTarget target = candidate.candidate_result
+                .feet[foot_index].target;
             if (!g1_ik_runtime_materialize_landing_target(
                     target, foot, configs[foot_index],
                     error, error_capacity)) {
                 return false;
             }
-            candidate.base_targets[foot_index] = target;
             candidate.candidate_result.feet[foot_index].target = target;
         }
     }
@@ -739,102 +745,14 @@ static inline bool g1_ik_frame_begin(
     std::memcpy(
         scratch_positions.data,
         baseline_positions.data,
-        sizeof(candidate.accepted_positions));
+        static_cast<std::size_t>(G1_BoneCount) * sizeof(vec3));
     std::memcpy(
         scratch_rotations.data,
         baseline_rotations.data,
-        sizeof(candidate.accepted_rotations));
+        static_cast<std::size_t>(G1_BoneCount) * sizeof(quat));
     transaction = candidate;
     return true;
 }
-
-#if defined(G1_IK_ENABLE_TEST_SEAMS)
-
-enum G1IkTestCandidateRejection
-{
-    G1IkTestRejectNone = 0,
-    G1IkTestRejectReach,
-    G1IkTestRejectCorrection,
-    G1IkTestRejectResidual,
-    G1IkTestRejectInvariance,
-    G1IkTestRejectMalformedController,
-};
-
-struct G1IkTestCandidateDirective
-{
-    bool enabled = false;
-    G1ClearanceStatus clearance_status = G1ClearanceInvalidInput;
-    G1IkTestCandidateRejection local_rejection =
-        G1IkTestRejectNone;
-    bool force_negative_margin = false;
-};
-
-struct G1IkTestCandidateTrace
-{
-    uint32_t calls[2] = {};
-    G1SwingCandidateDiagnostic diagnostics[2]
-        [G1SwingLiftCandidateCount] = {};
-    vec3 base_sole_centers[2][G1SwingLiftCandidateCount] = {};
-};
-
-struct G1IkRuntimeTestSeamState
-{
-    G1IkTestCandidateDirective directives[2]
-        [G1SwingLiftCandidateCount] = {};
-    G1IkTestCandidateTrace trace;
-};
-
-static inline G1IkRuntimeTestSeamState&
-g1_ik_runtime_test_seam_state()
-{
-    static G1IkRuntimeTestSeamState state;
-    return state;
-}
-
-static inline bool g1_ik_runtime_test_status_is_valid(
-    G1ClearanceStatus status)
-{
-    return status == G1ClearanceOk ||
-           status == G1ClearanceOutsideDomain ||
-           status == G1ClearanceBudgetExceeded ||
-           status == G1ClearanceUncertified ||
-           status == G1ClearanceInvalidInput ||
-           status == G1ClearanceInvalidField ||
-           status == G1ClearanceArithmeticFailure;
-}
-
-static inline bool g1_ik_test_candidate_seam_reset()
-{
-    g1_ik_runtime_test_seam_state() = G1IkRuntimeTestSeamState{};
-    return true;
-}
-
-static inline bool g1_ik_test_candidate_directive_set(
-    uint32_t foot_index,
-    uint32_t candidate_index,
-    const G1IkTestCandidateDirective& directive)
-{
-    if (foot_index >= 2 ||
-        candidate_index >= G1SwingLiftCandidateCount ||
-        !g1_ik_runtime_test_status_is_valid(
-            directive.clearance_status) ||
-        directive.local_rejection < G1IkTestRejectNone ||
-        directive.local_rejection >
-            G1IkTestRejectMalformedController) {
-        return false;
-    }
-    g1_ik_runtime_test_seam_state()
-        .directives[foot_index][candidate_index] = directive;
-    return true;
-}
-
-static inline const G1IkTestCandidateTrace&
-g1_ik_test_candidate_trace()
-{
-    return g1_ik_runtime_test_seam_state().trace;
-}
-
-#endif
 
 struct G1IkRuntimeStagedCandidate
 {
@@ -863,6 +781,25 @@ static inline bool g1_ik_runtime_clearance_status_is_fatal(
            status == G1ClearanceArithmeticFailure;
 }
 
+static inline bool g1_ik_runtime_controller_constraints_pass(
+    const G1LegSolveResult& position,
+    const G1FootOrientationResult& orientation,
+    vec3 position_endpoint,
+    vec3 final_endpoint)
+{
+    return position.applied &&
+           position.reachable &&
+           !position.correction_limited &&
+           !position.safe_stop_requested &&
+           g1_ik_contact_residual_is_converged(
+               position.contact_residual_m) &&
+           orientation.applied &&
+           !orientation.correction_limited &&
+           !orientation.safe_stop_requested &&
+           g1_ik_vec3_bits_equal(
+               position_endpoint, final_endpoint);
+}
+
 static inline bool g1_ik_runtime_stage_swing_candidate(
     G1IkRuntimeStagedCandidate& output,
     const slice1d<vec3> local_positions,
@@ -874,9 +811,6 @@ static inline bool g1_ik_runtime_stage_swing_candidate(
     const G1FootTarget& base_target,
     uint32_t candidate_index,
     float dt,
-#if defined(G1_IK_ENABLE_TEST_SEAMS)
-    const G1IkTestCandidateDirective* directive,
-#endif
     char* error,
     int error_capacity)
 {
@@ -998,20 +932,12 @@ static inline bool g1_ik_runtime_stage_swing_candidate(
         return false;
     }
 
-    const bool endpoint_invariant = g1_ik_vec3_bits_equal(
-        position_globals(config.contact),
-        final_globals(config.contact));
     candidate.diagnostic.controller_constraints_passed =
-        candidate.position.applied &&
-        candidate.position.reachable &&
-        !candidate.position.correction_limited &&
-        !candidate.position.safe_stop_requested &&
-        g1_ik_contact_residual_is_converged(
-            candidate.position.contact_residual_m) &&
-        candidate.orientation.applied &&
-        !candidate.orientation.correction_limited &&
-        !candidate.orientation.safe_stop_requested &&
-        endpoint_invariant;
+        g1_ik_runtime_controller_constraints_pass(
+            candidate.position,
+            candidate.orientation,
+            position_globals(config.contact),
+            final_globals(config.contact));
 
     for (int probe = 0; probe < 4; ++probe) {
         candidate.diagnostic.actual_sphere_center_bits[probe][0] =
@@ -1053,31 +979,6 @@ static inline bool g1_ik_runtime_stage_swing_candidate(
         candidate.diagnostic.clearance_work = validation.work;
     }
 
-#if defined(G1_IK_ENABLE_TEST_SEAMS)
-    if (directive != NULL && directive->enabled) {
-        if (directive->local_rejection ==
-            G1IkTestRejectMalformedController) {
-            return g1_ik_runtime_fail(
-                error, error_capacity,
-                "G1 IK test seam injected a malformed controller result");
-        }
-        candidate.diagnostic.clearance_status =
-            directive->clearance_status;
-        if (directive->force_negative_margin) {
-            candidate.diagnostic.lower_margin_m = -1.0;
-        }
-        if (directive->local_rejection != G1IkTestRejectNone) {
-            candidate.diagnostic.controller_constraints_passed = false;
-        }
-        if (g1_ik_runtime_clearance_status_is_fatal(
-                candidate.diagnostic.clearance_status)) {
-            return g1_ik_runtime_fail(
-                error, error_capacity,
-                "G1 IK test seam injected a fatal clearance result");
-        }
-    }
-#endif
-
     candidate.diagnostic.clearance_certified =
         candidate.diagnostic.clearance_status == G1ClearanceOk &&
         candidate.diagnostic.lower_margin_m >= 0.0;
@@ -1092,8 +993,6 @@ static inline bool g1_ik_runtime_stage_swing_candidate(
 
 static inline bool g1_ik_stage_swing_candidate_for_test(
     G1SwingCandidateDiagnostic& diagnostic,
-    array1d<vec3>& output_positions,
-    array1d<quat>& output_rotations,
     const slice1d<vec3> local_positions,
     const slice1d<quat> baseline_rotations,
     const slice1d<int> bone_parents,
@@ -1106,13 +1005,6 @@ static inline bool g1_ik_stage_swing_candidate_for_test(
     char* error,
     int error_capacity)
 {
-    if (!g1_ik_runtime_arrays_are_exact(
-            output_positions, output_rotations) ||
-        !g1_ik_runtime_pose_ranges_are_disjoint(
-            output_positions, output_rotations,
-            local_positions, baseline_rotations, bone_parents)) {
-        return false;
-    }
     G1IkRuntimeStagedCandidate candidate = {};
     if (!g1_ik_runtime_stage_swing_candidate(
             candidate,
@@ -1125,19 +1017,10 @@ static inline bool g1_ik_stage_swing_candidate_for_test(
             target,
             candidate_index,
             dt,
-            NULL,
             error,
             error_capacity)) {
         return false;
     }
-    std::memcpy(
-        output_positions.data,
-        candidate.positions,
-        sizeof(candidate.positions));
-    std::memcpy(
-        output_rotations.data,
-        candidate.rotations,
-        sizeof(candidate.rotations));
     diagnostic = candidate.diagnostic;
     return true;
 }
@@ -1224,6 +1107,9 @@ static inline bool g1_ik_runtime_stage_recorded_contact(
     return true;
 }
 
+static inline bool g1_ik_runtime_is_disabled_noop(
+    const G1IkFrameTransaction& transaction);
+
 static inline bool g1_ik_frame_stage_foot(
     G1IkFrameTransaction& transaction,
     array1d<vec3>& scratch_positions,
@@ -1242,7 +1128,6 @@ static inline bool g1_ik_frame_stage_foot(
         !transaction.initialized ||
         transaction.next_foot >= 2 ||
         foot_index != transaction.next_foot ||
-        enabled != transaction.enabled ||
         !g1_dt_is_exact_25_hz(dt) ||
         field.version != 2 ||
         !terrain_heightfield_is_queryable(field) ||
@@ -1258,8 +1143,6 @@ static inline bool g1_ik_frame_stage_foot(
         !g1_ik_parent_topology_validate(
             bone_parents, error, error_capacity) ||
         contacts.size != 2 || contacts.data == NULL ||
-        contacts.data[0] != transaction.recorded_contacts[0] ||
-        contacts.data[1] != transaction.recorded_contacts[1] ||
         footprint.feet[0].current_contact != contacts.data[0] ||
         footprint.feet[1].current_contact != contacts.data[1] ||
         !g1_ik_runtime_state_is_valid(
@@ -1267,8 +1150,25 @@ static inline bool g1_ik_frame_stage_foot(
         return false;
     }
 
+    const bool disabled_noop =
+        g1_ik_runtime_is_disabled_noop(transaction);
+    if (!enabled) {
+        if (!disabled_noop) return false;
+        G1IkFrameTransaction candidate = transaction;
+        ++candidate.next_foot;
+        transaction = candidate;
+        return true;
+    }
+    if (disabled_noop ||
+        contacts.data[0] != transaction.candidate_result
+            .feet[0].recorded_contact ||
+        contacts.data[1] != transaction.candidate_result
+            .feet[1].recorded_contact) {
+        return false;
+    }
+
     G1IkFrameTransaction candidate = transaction;
-    if (!candidate.enabled || candidate.terminal_safe_stop) {
+    if (candidate.candidate_result.safe_stop_requested) {
         ++candidate.next_foot;
         transaction = candidate;
         return true;
@@ -1294,7 +1194,7 @@ static inline bool g1_ik_frame_stage_foot(
     G1FootFrameResult& foot_result =
         candidate.candidate_result.feet[foot_index];
 
-    if (candidate.recorded_contacts[foot_index]) {
+    if (foot_result.recorded_contact) {
         G1IkRuntimeStagedCandidate planted = {};
         if (!g1_ik_runtime_stage_recorded_contact(
                 planted,
@@ -1302,7 +1202,7 @@ static inline bool g1_ik_frame_stage_foot(
                 snapshot_rotations,
                 bone_parents,
                 config,
-                candidate.base_targets[foot_index],
+                foot_result.target,
                 error,
                 error_capacity)) {
             return false;
@@ -1312,14 +1212,6 @@ static inline bool g1_ik_frame_stage_foot(
         if (!planted.passes) {
             g1_ik_runtime_request_safe_stop(
                 candidate, G1IkStopTargetUnreachable);
-            std::memcpy(
-                scratch_positions.data,
-                candidate.accepted_positions,
-                sizeof(candidate.accepted_positions));
-            std::memcpy(
-                scratch_rotations.data,
-                candidate.accepted_rotations,
-                sizeof(candidate.accepted_rotations));
         } else {
             std::memcpy(
                 scratch_positions.data,
@@ -1342,11 +1234,6 @@ static inline bool g1_ik_frame_stage_foot(
          candidate_index < G1SwingLiftCandidateCount;
          ++candidate_index) {
         G1IkRuntimeStagedCandidate staged = {};
-#if defined(G1_IK_ENABLE_TEST_SEAMS)
-        const G1IkTestCandidateDirective* directive =
-            &g1_ik_runtime_test_seam_state()
-                 .directives[foot_index][candidate_index];
-#endif
         if (!g1_ik_runtime_stage_swing_candidate(
                 staged,
                 snapshot_positions,
@@ -1355,33 +1242,22 @@ static inline bool g1_ik_frame_stage_foot(
                 candidate.candidate_state.feet[foot_index].swing,
                 field,
                 config,
-                candidate.base_targets[foot_index],
+                foot_result.target,
                 candidate_index,
                 dt,
-#if defined(G1_IK_ENABLE_TEST_SEAMS)
-                directive,
-#endif
                 error,
                 error_capacity)) {
             return false;
         }
         ++selection.candidates_evaluated;
-        if (!g1_ik_runtime_work_add(
+        if (staged.diagnostic.clearance_status == G1ClearanceOk &&
+            !g1_ik_runtime_work_add(
                 selection.total_clearance_work,
                 staged.diagnostic.clearance_work)) {
             return g1_ik_runtime_fail(
                 error, error_capacity,
                 "G1 IK swing aggregate work overflowed");
         }
-#if defined(G1_IK_ENABLE_TEST_SEAMS)
-        G1IkTestCandidateTrace& trace =
-            g1_ik_runtime_test_seam_state().trace;
-        ++trace.calls[foot_index];
-        trace.diagnostics[foot_index][candidate_index] =
-            staged.diagnostic;
-        trace.base_sole_centers[foot_index][candidate_index] =
-            candidate.base_targets[foot_index].sole_center;
-#endif
         if (staged.passes) {
             selection.selected_index = candidate_index;
             selection.selected = staged.diagnostic;
@@ -1410,14 +1286,6 @@ static inline bool g1_ik_frame_stage_foot(
     if (!selected) {
         g1_ik_runtime_request_safe_stop(
             candidate, G1IkStopNoSwingCandidate);
-        std::memcpy(
-            scratch_positions.data,
-            candidate.accepted_positions,
-            sizeof(candidate.accepted_positions));
-        std::memcpy(
-            scratch_rotations.data,
-            candidate.accepted_rotations,
-            sizeof(candidate.accepted_rotations));
     }
     ++candidate.next_foot;
     transaction = candidate;
@@ -1431,19 +1299,125 @@ static inline bool g1_ik_runtime_stop_reason_is_valid(
            reason <= G1IkStopPoseClearanceRejected;
 }
 
-static inline void g1_ik_runtime_restore_accepted_pose(
-    const G1IkFrameTransaction& transaction,
-    array1d<vec3>& scratch_positions,
-    array1d<quat>& scratch_rotations)
+static inline bool g1_ik_runtime_is_disabled_noop(
+    const G1IkFrameTransaction& transaction)
 {
-    std::memcpy(
-        scratch_positions.data,
-        transaction.accepted_positions,
-        sizeof(transaction.accepted_positions));
-    std::memcpy(
-        scratch_rotations.data,
-        transaction.accepted_rotations,
-        sizeof(transaction.accepted_rotations));
+    const auto float_is_positive_zero = [](float value) {
+        return g1_ik_runtime_float_bits(value) == 0U;
+    };
+    const auto double_is_positive_zero = [](double value) {
+        uint64_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return bits == 0U;
+    };
+    const auto vec3_is_positive_zero =
+        [&float_is_positive_zero](vec3 value) {
+            return float_is_positive_zero(value.x) &&
+                   float_is_positive_zero(value.y) &&
+                   float_is_positive_zero(value.z);
+        };
+    const auto work_is_zero = [](const G1ClearanceWork& work) {
+        return work.point_queries == 0U &&
+               work.cells_visited == 0U &&
+               work.primitive_triangle_pairs == 0U &&
+               work.face_patches == 0U &&
+               work.candidate_tests == 0U &&
+               work.subdivision_nodes == 0U;
+    };
+    if (transaction.candidate_result.applied ||
+        transaction.candidate_result.safe_stop_requested ||
+        transaction.candidate_result.stop_reason != G1IkStopNone ||
+        !float_is_positive_zero(
+            transaction.candidate_result.max_correction_radians)) {
+        return false;
+    }
+    for (int foot = 0; foot < 2; ++foot) {
+        const G1FootFrameResult& result =
+            transaction.candidate_result.feet[foot];
+        const G1FootTarget& target = result.target;
+        const G1SwingSelectionDiagnostic& selection =
+            result.swing_selection;
+        const G1SwingCandidateDiagnostic& selected =
+            selection.selected;
+        const G1SwingClearanceValidation& defensive =
+            result.defensive_swing;
+        const G1LegSolveResult& position = result.position;
+        const G1FootOrientationResult& orientation =
+            result.orientation;
+        if (result.recorded_contact ||
+            target.locked ||
+            target.position_active ||
+            target.releasing ||
+            target.drift_limit_exceeded ||
+            !vec3_is_positive_zero(target.surface.point) ||
+            !vec3_is_positive_zero(target.surface.normal) ||
+            !vec3_is_positive_zero(target.sole_center) ||
+            !float_is_positive_zero(target.horizontal_drift_m) ||
+            selection.candidates_evaluated != 0U ||
+            result.swing_selection.selected_index != G1SwingNoCandidate ||
+            selected.candidate_index != G1SwingNoCandidate ||
+            selected.lift_bits != 0U ||
+            selected.materialized_command_y_bits != 0U ||
+            selected.clearance_status != G1ClearanceInvalidInput ||
+            selected.controller_constraints_passed ||
+            selected.clearance_certified ||
+            !double_is_positive_zero(selected.lower_margin_m) ||
+            !double_is_positive_zero(
+                selected.witness_upper_margin_m) ||
+            !work_is_zero(selected.clearance_work) ||
+            !work_is_zero(selection.total_clearance_work) ||
+            !double_is_positive_zero(defensive.lower_margin_m) ||
+            !double_is_positive_zero(defensive.witness_upper_m) ||
+            defensive.sweep_evaluated ||
+            !work_is_zero(defensive.work) ||
+            position.applied ||
+            position.reachable ||
+            position.correction_limited ||
+            position.safe_stop_requested ||
+            position.iterations != 0 ||
+            !vec3_is_positive_zero(position.requested_ankle_target) ||
+            !vec3_is_positive_zero(position.clamped_ankle_target) ||
+            !vec3_is_positive_zero(position.hinge_axis_world) ||
+            !vec3_is_positive_zero(position.bend_direction) ||
+            position.bend_used_current_projection ||
+            position.bend_used_hinge_fallback ||
+            position.bend_used_safe_perpendicular ||
+            position.bend_sign_flipped ||
+            !float_is_positive_zero(position.raw_distance_m) ||
+            !float_is_positive_zero(position.clamped_distance_m) ||
+            !float_is_positive_zero(
+                position.max_correction_radians) ||
+            g1_ik_runtime_float_bits(position.contact_residual_m) !=
+                g1_ik_runtime_float_bits(
+                    std::numeric_limits<float>::max()) ||
+            orientation.applied ||
+            orientation.correction_limited ||
+            orientation.safe_stop_requested ||
+            g1_ik_runtime_float_bits(
+                orientation.target_global_rotation.w) !=
+                g1_ik_runtime_float_bits(1.0f) ||
+            !float_is_positive_zero(
+                orientation.target_global_rotation.x) ||
+            !float_is_positive_zero(
+                orientation.target_global_rotation.y) ||
+            !float_is_positive_zero(
+                orientation.target_global_rotation.z) ||
+            !float_is_positive_zero(
+                orientation.requested_correction_radians) ||
+            !float_is_positive_zero(
+                orientation.correction_radians)) {
+            return false;
+        }
+        for (int probe = 0; probe < 4; ++probe) {
+            for (int axis = 0; axis < 3; ++axis) {
+                if (selected.actual_sphere_center_bits[probe][axis] !=
+                    0U) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
 }
 
 static inline bool g1_ik_frame_finish(
@@ -1480,9 +1454,8 @@ static inline bool g1_ik_frame_finish(
     }
 
     G1IkFrameTransaction candidate = transaction;
-    if (!candidate.enabled || candidate.terminal_safe_stop) {
-        g1_ik_runtime_restore_accepted_pose(
-            candidate, scratch_positions, scratch_rotations);
+    if (candidate.candidate_result.safe_stop_requested ||
+        g1_ik_runtime_is_disabled_noop(candidate)) {
         output_result = candidate.candidate_result;
         transaction = candidate;
         return true;
@@ -1522,7 +1495,8 @@ static inline bool g1_ik_frame_finish(
         const G1SwingSelectionDiagnostic& selection =
             candidate.candidate_result.feet[foot_index]
                 .swing_selection;
-        if (!candidate.recorded_contacts[foot_index]) {
+        if (!candidate.candidate_result.feet[foot_index]
+                 .recorded_contact) {
             if (selection.selected_index == G1SwingNoCandidate ||
                 selection.selected.candidate_index !=
                     selection.selected_index) {
@@ -1559,7 +1533,8 @@ static inline bool g1_ik_frame_finish(
                 field,
                 configs[foot_index],
                 final_centers[foot_index],
-                candidate.recorded_contacts[foot_index],
+                candidate.candidate_result.feet[foot_index]
+                    .recorded_contact,
                 dt,
                 error,
                 error_capacity);
@@ -1570,12 +1545,11 @@ static inline bool g1_ik_frame_finish(
             return false;
         }
         if (status != G1ClearanceOk ||
-            (!candidate.recorded_contacts[foot_index] &&
+            (!candidate.candidate_result.feet[foot_index]
+                  .recorded_contact &&
              defensive.lower_margin_m < 0.0)) {
             g1_ik_runtime_request_safe_stop(
                 candidate, G1IkStopPoseClearanceRejected);
-            g1_ik_runtime_restore_accepted_pose(
-                candidate, scratch_positions, scratch_rotations);
             output_result = candidate.candidate_result;
             transaction = candidate;
             return true;
