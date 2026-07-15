@@ -121,6 +121,7 @@ INTERACTION_RUNTIME_SOURCES += interaction_matcher.cpp interaction_features.cpp
 INTERACTION_RUNTIME_SOURCES += interaction_pose.cpp interaction_target.cpp
 
 .PHONY: test-python test-cpp test-interaction
+.PHONY: retime-flat-database test-flat-database-retime
 .PHONY: test-python-interaction-safe test-interaction-safe
 .PHONY: test-interaction-target-release-fast-math
 .PHONY: test-interaction-carry-release-fast-math
@@ -132,6 +133,12 @@ $(CPP_TEST_DIR):
 
 $(TASK12_BUILD_DIR):
 	mkdir -p $@
+
+retime-flat-database:
+	python -m resources.retime_flat_database
+
+test-flat-database-retime:
+	python -m unittest tests.python.test_flat_database_retime -v
 
 $(CPP_TEST_DIR)/test_g1_skeleton: tests/cpp/test_g1_skeleton.cpp g1_skeleton.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) $< -o $@

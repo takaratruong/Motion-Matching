@@ -1,0 +1,60 @@
+{
+  "bone_count": 23,
+  "contact_count": 2,
+  "contact_resampling": "nearest-source-sample-half-up",
+  "maximum_range_duration_error_seconds": 0.013333333333332753,
+  "output_frame_count": 22296,
+  "output_sha256": "5d314ad8c673eef4b7759c5b8428d90069a7f147cfcd90d575eb686097a2a45f",
+  "range_count": 6,
+  "ranges": [
+    {
+      "duration_error_seconds": 0.013333333333332753,
+      "source_duration_seconds": 4.666666666666667,
+      "source_frames": 281,
+      "target_duration_seconds": 4.68,
+      "target_frames": 118
+    },
+    {
+      "duration_error_seconds": 0.013333333333332753,
+      "source_duration_seconds": 4.666666666666667,
+      "source_frames": 281,
+      "target_duration_seconds": 4.68,
+      "target_frames": 118
+    },
+    {
+      "duration_error_seconds": 0.006666666666660603,
+      "source_duration_seconds": 209.83333333333334,
+      "source_frames": 12591,
+      "target_duration_seconds": 209.84,
+      "target_frames": 5247
+    },
+    {
+      "duration_error_seconds": 0.006666666666660603,
+      "source_duration_seconds": 209.83333333333334,
+      "source_frames": 12591,
+      "target_duration_seconds": 209.84,
+      "target_frames": 5247
+    },
+    {
+      "duration_error_seconds": 0.0033333333333303017,
+      "source_duration_seconds": 231.28333333333333,
+      "source_frames": 13878,
+      "target_duration_seconds": 231.28,
+      "target_frames": 5783
+    },
+    {
+      "duration_error_seconds": 0.0033333333333303017,
+      "source_duration_seconds": 231.28333333333333,
+      "source_frames": 13878,
+      "target_duration_seconds": 231.28,
+      "target_frames": 5783
+    }
+  ],
+  "rotation_resampling": "shortest-arc-slerp",
+  "schema": "flat-locomotion-retime-v1",
+  "source_fps": 60.0,
+  "source_frame_count": 53500,
+  "source_sha256": "1212e97aee2c1bdf80caf60d9bf8c151d4c2d4631b285dc88a7ccb756daeb4d8",
+  "target_fps": 25.0,
+  "velocity_units": "per-second-recomputed-at-target-rate"
+}
