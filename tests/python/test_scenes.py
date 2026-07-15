@@ -1022,6 +1022,56 @@ class ProceduralSceneTests(unittest.TestCase):
             [("wall-safe-stop", "safe-stop", 0),
              ("ramp-safe-stop", "safe-stop", 0)])
 
+    def test_directional_certification_routes_lock_order_and_bits(self):
+        expected = {
+            "stairs-shallow": (
+                "ascent-landing-descent", "flat-positive-z",
+                "flat-positive-x"),
+            "stairs-standard": (
+                "ascent-landing-descent", "landing-side-exit-stress"),
+            "mixed-multilevel": (
+                "full-course", "tangent-level-boundary"),
+        }
+        expected_bits = {
+            ("stairs-shallow", "flat-positive-z"): (
+                (0x00000000, 0x00000000),
+                (0x00000000, 0x3f800000)),
+            ("stairs-shallow", "flat-positive-x"): (
+                (0x00000000, 0x00000000),
+                (0x3f800000, 0x00000000)),
+            ("stairs-standard", "landing-side-exit-stress"): (
+                (0x00000000, 0x00000000),
+                (0x00000000, 0x3fe00000),
+                (0x00000000, 0x407d70a4),
+                (0x00000000, 0x40b0f5c3)),
+            ("mixed-multilevel", "tangent-level-boundary"): (
+                (0x00000000, 0x00000000),
+                (0x3f1eb852, 0x40000000),
+                (0x3f1eb852, 0x40c00000)),
+        }
+        for scene_id, expected_ids in expected.items():
+            routes = self.definitions[scene_id].routes
+            self.assertEqual(
+                tuple(route.route_id for route in routes), expected_ids)
+            for route in routes[1:]:
+                key = (scene_id, route.route_id)
+                self.assertEqual(route.expected_outcome, "traverse")
+                self.assertEqual(route.walkability_class, 1)
+                self.assertEqual(
+                    struct.unpack(
+                        "<I", struct.pack("<f", route.landing_hold_seconds)
+                    )[0],
+                    0x00000000,
+                )
+                observed_bits = tuple(
+                    tuple(
+                        struct.unpack("<I", struct.pack("<f", component))[0]
+                        for component in waypoint
+                    )
+                    for waypoint in route.waypoints_xz
+                )
+                self.assertEqual(observed_bits, expected_bits[key])
+
     def test_all_procedural_scenes_have_six_metre_playable_floor(self):
         for scene_id, scene in self.definitions.items():
             with self.subTest(scene=scene.scene_id):
@@ -1318,7 +1368,7 @@ class ProceduralSceneTests(unittest.TestCase):
                             set(decoded_footprint_classes(
                                 grid, walkability, *points[-1])),
                             {0})
-        self.assertEqual(expected_only_routes, 9)
+        self.assertEqual(expected_only_routes, 13)
         self.assertEqual(safe_stop_routes, 2)
 
     def test_decoded_regions_are_nonempty_and_class_pure(self):
