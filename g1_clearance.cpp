@@ -6,6 +6,7 @@
 #include "g1_clearance.h"
 #undef G1_CLEARANCE_IMPLEMENTATION_TU
 
+#include "g1_kinematic_contract.h"
 #include "g1_surface_query.h"
 
 #include <cfenv>
@@ -19,86 +20,6 @@
 #include <limits>
 #include <memory>
 #include <new>
-
-// The strict kernel cannot include g1_ik.h: that fast-caller header also
-// owns non-inline database code.  Keep this definition token-identical to
-// the public G1LegConfig layout and validate every supplied field against
-// the fixed named-leg contract before reading geometry.
-struct G1LegConfig
-{
-    const char* name;
-    int hip;
-    int knee;
-    int ankle;
-    int contact;
-    vec3 knee_hinge_axis_local;
-    vec3 foot_forward_local;
-    vec3 sole_normal_local;
-    vec3 foot_sphere_centers_local[4];
-    vec3 sole_points_local[4];
-    float foot_sphere_radius_m;
-    vec3 thigh_start_local;
-    vec3 thigh_end_local;
-    float thigh_radius_m;
-    vec3 shin_start_local;
-    vec3 shin_end_local;
-    float shin_radius_m;
-    float reach_buffer_m;
-    float planted_clearance_m;
-    float swing_clearance_m;
-    float max_swing_lift_m;
-    float max_correction_radians;
-};
-
-constexpr int G1ClearanceBoneCount = 31;
-constexpr int G1ClearanceHips = 1;
-constexpr int G1ClearanceLeftHip = 4;
-constexpr int G1ClearanceLeftKnee = 5;
-constexpr int G1ClearanceLeftAnkle = 6;
-constexpr int G1ClearanceLeftToe = 7;
-constexpr int G1ClearanceRightHip = 10;
-constexpr int G1ClearanceRightKnee = 11;
-constexpr int G1ClearanceRightAnkle = 12;
-constexpr int G1ClearanceRightToe = 13;
-
-static G1LegConfig g1_clearance_fixed_leg_config(bool left)
-{
-    G1LegConfig config = {};
-    config.name = left ? "left" : "right";
-    config.hip = left ? G1ClearanceLeftHip : G1ClearanceRightHip;
-    config.knee = left ? G1ClearanceLeftKnee : G1ClearanceRightKnee;
-    config.ankle = left ? G1ClearanceLeftAnkle : G1ClearanceRightAnkle;
-    config.contact = left ? G1ClearanceLeftToe : G1ClearanceRightToe;
-    config.knee_hinge_axis_local = vec3(0.0f, 0.0f, -1.0f);
-    config.foot_forward_local = vec3(1.0f, 0.0f, 0.0f);
-    config.sole_normal_local = vec3(0.0f, 1.0f, 0.0f);
-    config.foot_sphere_radius_m = 0.02f;
-    config.foot_sphere_centers_local[0] =
-        vec3(-0.05f, -0.03f, -0.025f);
-    config.foot_sphere_centers_local[1] =
-        vec3(-0.05f, -0.03f, +0.025f);
-    config.foot_sphere_centers_local[2] =
-        vec3(+0.12f, -0.03f, -0.030f);
-    config.foot_sphere_centers_local[3] =
-        vec3(+0.12f, -0.03f, +0.030f);
-    for (int index = 0; index < 4; ++index) {
-        config.sole_points_local[index] =
-            config.foot_sphere_centers_local[index] -
-            config.sole_normal_local * config.foot_sphere_radius_m;
-    }
-    config.thigh_start_local = vec3(0.0f, -0.02f, 0.0f);
-    config.thigh_end_local = vec3(-0.078f, -0.17f, 0.0f);
-    config.thigh_radius_m = 0.05f;
-    config.shin_start_local = vec3(0.0f, -0.05f, 0.0f);
-    config.shin_end_local = vec3(0.0f, -0.28f, 0.0f);
-    config.shin_radius_m = 0.04f;
-    config.reach_buffer_m = 0.015f;
-    config.planted_clearance_m = 0.005f;
-    config.swing_clearance_m = 0.015f;
-    config.max_swing_lift_m = 0.08f;
-    config.max_correction_radians = 0.35f;
-    return config;
-}
 
 static bool g1_clearance_vec3_exact(vec3 left, vec3 right)
 {
@@ -117,8 +38,9 @@ static bool g1_clearance_config_is_fixed(const G1LegConfig& config)
     if (!left && !right) {
         return false;
     }
-    const G1LegConfig expected =
-        g1_clearance_fixed_leg_config(left);
+    const G1LegConfig expected = left
+        ? g1_left_leg_config()
+        : g1_right_leg_config();
     if (config.hip != expected.hip ||
         config.knee != expected.knee ||
         config.ankle != expected.ankle ||
@@ -185,11 +107,6 @@ static bool g1_clearance_quat_is_unit(quat value)
     const volatile double norm = std::sqrt(squared);
     return terrain_double_is_finite(norm) &&
            std::fabs(norm - 1.0) <= 2.0e-5;
-}
-
-static bool g1_clearance_dt_is_exact_25_hz(float dt)
-{
-    return terrain_float_bits(dt) == UINT32_C(0x3d23d70a);
 }
 
 #if defined(__SSE__) || defined(_M_X64) || defined(_M_IX86_FP)
@@ -4197,13 +4114,13 @@ static bool g1_clearance_pose_inputs_are_valid(
     const slice1d<vec3> global_positions,
     const slice1d<quat> global_rotations)
 {
-    if (global_positions.size != G1ClearanceBoneCount ||
-        global_rotations.size != G1ClearanceBoneCount ||
+    if (global_positions.size != G1_BoneCount ||
+        global_rotations.size != G1_BoneCount ||
         global_positions.data == NULL ||
         global_rotations.data == NULL) {
         return false;
     }
-    for (int bone = 0; bone < G1ClearanceBoneCount; ++bone) {
+    for (int bone = 0; bone < G1_BoneCount; ++bone) {
         if (!g1_ik_vec3_is_runtime_value(
                 global_positions.data[bone]) ||
             !g1_clearance_quat_is_unit(
@@ -5059,7 +4976,7 @@ G1ClearanceStatus g1_measure_pose_clearance(
     G1ClearanceResult hips = {};
     status = g1_point_clearance(
         hips, ledger.remaining, field,
-        global_positions(G1ClearanceHips),
+        global_positions(G1_Hips),
         diagnostic.output, diagnostic.capacity);
     if (status != G1ClearanceOk) return status;
     status = g1_clearance_ledger_accept(
@@ -5069,12 +4986,12 @@ G1ClearanceStatus g1_measure_pose_clearance(
     status = g1_clearance_leg_with_ledger(
         candidate.left, ledger, field,
         global_positions, global_rotations,
-        g1_clearance_fixed_leg_config(true), 1, diagnostic);
+        g1_left_leg_config(), 1, diagnostic);
     if (status != G1ClearanceOk) return status;
     status = g1_clearance_leg_with_ledger(
         candidate.right, ledger, field,
         global_positions, global_rotations,
-        g1_clearance_fixed_leg_config(false), 10, diagnostic);
+        g1_right_leg_config(), 10, diagnostic);
     if (status != G1ClearanceOk) return status;
 
     const G1ClearanceResult components[] = {
@@ -5214,9 +5131,15 @@ static bool g1_clearance_make_swing_endpoint(
     if (adjusted_y.low != 0.0) {
         candidate.y.terms[candidate.y.count++] = adjusted_y.low;
     }
-    if (!g1_clearance_expansion_interval(
-            adjusted_y, candidate.y.enclosure)) {
-        return false;
+    if (adjusted_y.low == 0.0) {
+        candidate.y.enclosure = {
+            adjusted_y.high, adjusted_y.high
+        };
+    } else {
+        if (!g1_clearance_expansion_interval(
+                adjusted_y, candidate.y.enclosure)) {
+            return false;
+        }
     }
     candidate.source_key.source_kind = 1;
     candidate.source_key.primitive_index = primitive_index;
@@ -5314,7 +5237,7 @@ G1ClearanceStatus g1_swing_clearance_validate(
             diagnostic.output, diagnostic.capacity,
             "G1 swing validation requires the fixed named-leg configuration");
     }
-    if (!g1_clearance_dt_is_exact_25_hz(dt)) {
+    if (!g1_dt_is_exact_25_hz(dt)) {
         return g1_clearance_error(
             G1ClearanceInvalidInput,
             diagnostic.output, diagnostic.capacity,

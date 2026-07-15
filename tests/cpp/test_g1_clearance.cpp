@@ -3952,6 +3952,108 @@ static G1ClearanceResult task5_direct_swept_foot(
     return task5_aggregate_results(capsules, 4);
 }
 
+struct Task5LockedLegGeometry
+{
+    vec3 foot_centers[4];
+    vec3 thigh_a;
+    vec3 thigh_b;
+    vec3 shin_a;
+    vec3 shin_b;
+};
+
+#ifndef __FAST_MATH__
+static bool task5_vec3_bits_same(vec3 left, vec3 right)
+{
+    return float_bits(left.x) == float_bits(right.x) &&
+           float_bits(left.y) == float_bits(right.y) &&
+           float_bits(left.z) == float_bits(right.z);
+}
+#endif
+
+static Task5LockedLegGeometry task5_locked_leg_geometry()
+{
+    Task5LockedLegGeometry geometry = {};
+    geometry.foot_centers[0] = vec3(
+        float_from_bits(UINT32_C(0xbe4ccccd)),
+        float_from_bits(UINT32_C(0x3f051eb9)),
+        float_from_bits(UINT32_C(0xbccccccd)));
+    geometry.foot_centers[1] = vec3(
+        float_from_bits(UINT32_C(0xbe4ccccd)),
+        float_from_bits(UINT32_C(0x3f051eb9)),
+        float_from_bits(UINT32_C(0xbd99999a)));
+    geometry.foot_centers[2] = vec3(
+        float_from_bits(UINT32_C(0xbebd70a4)),
+        float_from_bits(UINT32_C(0x3f051eb9)),
+        float_from_bits(UINT32_C(0xbca3d70b)));
+    geometry.foot_centers[3] = vec3(
+        float_from_bits(UINT32_C(0xbebd70a4)),
+        float_from_bits(UINT32_C(0x3f051eb9)),
+        float_from_bits(UINT32_C(0xbda3d70a)));
+    geometry.thigh_a = vec3(
+        float_from_bits(UINT32_C(0xbeb33333)),
+        float_from_bits(UINT32_C(0x3f9c28f6)),
+        float_from_bits(UINT32_C(0xbe19999a)));
+    geometry.thigh_b = vec3(
+        float_from_bits(UINT32_C(0xbedb22d1)),
+        float_from_bits(UINT32_C(0x3faf5c29)),
+        float_from_bits(UINT32_C(0xbe19999a)));
+    geometry.shin_a = vec3(
+        float_from_bits(UINT32_C(0xbe99999a)),
+        float_from_bits(UINT32_C(0x3f733333)),
+        float_from_bits(UINT32_C(0xbdcccccd)));
+    geometry.shin_b = vec3(
+        float_from_bits(UINT32_C(0xbe99999a)),
+        float_from_bits(UINT32_C(0x3f970a3d)),
+        float_from_bits(UINT32_C(0xbdcccccd)));
+    return geometry;
+}
+
+static void task5_check_strict_transform_oracle(
+    const slice1d<vec3> global_positions,
+    const slice1d<quat> global_rotations,
+    const G1LegConfig& config,
+    const Task5LockedLegGeometry& locked)
+{
+#ifndef __FAST_MATH__
+    for (int index = 0; index < 4; ++index) {
+        const vec3 transformed =
+            global_positions(config.ankle) +
+            quat_mul_vec3(
+                global_rotations(config.ankle),
+                config.foot_sphere_centers_local[index]);
+        check(task5_vec3_bits_same(
+                  transformed, locked.foot_centers[index]),
+              "Task 5 locked foot transform bits match strict formula");
+    }
+    const vec3 transformed_thigh_a =
+        global_positions(config.hip) +
+        quat_mul_vec3(
+            global_rotations(config.hip), config.thigh_start_local);
+    const vec3 transformed_thigh_b =
+        global_positions(config.hip) +
+        quat_mul_vec3(
+            global_rotations(config.hip), config.thigh_end_local);
+    const vec3 transformed_shin_a =
+        global_positions(config.knee) +
+        quat_mul_vec3(
+            global_rotations(config.knee), config.shin_start_local);
+    const vec3 transformed_shin_b =
+        global_positions(config.knee) +
+        quat_mul_vec3(
+            global_rotations(config.knee), config.shin_end_local);
+    check(task5_vec3_bits_same(transformed_thigh_a, locked.thigh_a) &&
+              task5_vec3_bits_same(transformed_thigh_b, locked.thigh_b) &&
+              task5_vec3_bits_same(transformed_shin_a, locked.shin_a) &&
+              task5_vec3_bits_same(transformed_shin_b, locked.shin_b),
+          "Task 5 locked limb transform bits match strict formulas");
+#else
+    (void)global_positions;
+    (void)global_rotations;
+    (void)config;
+    (void)locked;
+#endif
+}
+
 static G1LegClearance task5_direct_leg(
     const heightfield& field,
     const slice1d<vec3> global_positions,
@@ -3967,44 +4069,22 @@ static G1LegClearance task5_direct_leg(
     output.toe = task5_require_point(
         field, global_positions(config.contact), primitive_base + 2);
 
-    vec3 foot_centers[4] = {};
-    for (int index = 0; index < 4; ++index) {
-        foot_centers[index] =
-            global_positions(config.ankle) +
-            quat_mul_vec3(
-                global_rotations(config.ankle),
-                config.foot_sphere_centers_local[index]);
-    }
+    const Task5LockedLegGeometry geometry =
+        task5_locked_leg_geometry();
+    task5_check_strict_transform_oracle(
+        global_positions, global_rotations, config, geometry);
     output.foot = task5_direct_foot(
-        field, foot_centers, config.foot_sphere_radius_m,
+        field, geometry.foot_centers, config.foot_sphere_radius_m,
         primitive_base + 3);
 
-    const vec3 thigh_a =
-        global_positions(config.hip) +
-        quat_mul_vec3(
-            global_rotations(config.hip),
-            config.thigh_start_local);
-    const vec3 thigh_b =
-        global_positions(config.hip) +
-        quat_mul_vec3(
-            global_rotations(config.hip),
-            config.thigh_end_local);
     output.thigh = task5_require_capsule(
-        field, thigh_a, thigh_b, config.thigh_radius_m,
+        field, geometry.thigh_a, geometry.thigh_b,
+        config.thigh_radius_m,
         primitive_base + 7);
 
-    const vec3 shin_a =
-        global_positions(config.knee) +
-        quat_mul_vec3(
-            global_rotations(config.knee),
-            config.shin_start_local);
-    const vec3 shin_b =
-        global_positions(config.knee) +
-        quat_mul_vec3(
-            global_rotations(config.knee),
-            config.shin_end_local);
     output.shin = task5_require_capsule(
-        field, shin_a, shin_b, config.shin_radius_m,
+        field, geometry.shin_a, geometry.shin_b,
+        config.shin_radius_m,
         primitive_base + 8);
 
     const G1ClearanceResult components[] = {
@@ -4507,25 +4587,75 @@ static void test_task5_checked_history()
           "Task 5 commit assigns the complete canonical candidate");
 }
 
+static void task5_make_asymmetric_swing_field(heightfield& field)
+{
+    field.version = 2;
+    field.nx = 9;
+    field.nz = 9;
+    field.origin_x = float_from_bits(UINT32_C(0x00000000));
+    field.origin_z = float_from_bits(UINT32_C(0x00000000));
+    field.cell_size = float_from_bits(UINT32_C(0x3e000000));
+    field.exterior_height = float_from_bits(UINT32_C(0xbf800000));
+    field.heights.resize(81);
+    for (int z = 0; z < field.nz; ++z) {
+        for (int x = 0; x < field.nx; ++x) {
+            field.heights(z * field.nx + x) =
+                x >= 5 && z >= 5
+                    ? float_from_bits(UINT32_C(0x3b800000))
+                    : float_from_bits(UINT32_C(0x00000000));
+        }
+    }
+}
+
+static void task5_make_exact_swing_centers(
+    vec3 previous[4],
+    vec3 current[4])
+{
+    const float previous_y =
+        float_from_bits(UINT32_C(0x3c23d70a));
+    const float current_y =
+        float_from_bits(UINT32_C(0x3cf5c28f));
+    const vec3 previous_candidate[4] = {
+        vec3(float_from_bits(UINT32_C(0x3e800000)), previous_y,
+             float_from_bits(UINT32_C(0x3e800000))),
+        vec3(float_from_bits(UINT32_C(0x3f000000)), previous_y,
+             float_from_bits(UINT32_C(0x3e800000))),
+        vec3(float_from_bits(UINT32_C(0x3e800000)), previous_y,
+             float_from_bits(UINT32_C(0x3f000000))),
+        vec3(float_from_bits(UINT32_C(0x3f400000)), previous_y,
+             float_from_bits(UINT32_C(0x3f400000)))
+    };
+    const vec3 current_candidate[4] = {
+        vec3(float_from_bits(UINT32_C(0x3e880000)), current_y,
+             float_from_bits(UINT32_C(0x3e880000))),
+        vec3(float_from_bits(UINT32_C(0x3f040000)), current_y,
+             float_from_bits(UINT32_C(0x3e880000))),
+        vec3(float_from_bits(UINT32_C(0x3e880000)), current_y,
+             float_from_bits(UINT32_C(0x3f040000))),
+        vec3(float_from_bits(UINT32_C(0x3f440000)), current_y,
+             float_from_bits(UINT32_C(0x3f440000)))
+    };
+    for (int index = 0; index < 4; ++index) {
+        previous[index] = previous_candidate[index];
+        current[index] = current_candidate[index];
+    }
+}
+
 static void test_task5_actual_center_swing()
 {
     heightfield field;
-    point_make_field(field, 9, 9, 0.0f, 0.0f, 0.25f);
+    task5_make_asymmetric_swing_field(field);
     const G1LegConfig config = g1_left_leg_config();
-    const float previous_y = config.planted_clearance_m * 2.0f;
-    const float current_y = config.swing_clearance_m * 2.0f;
-    const vec3 previous[4] = {
-        vec3(0.30f, previous_y, 0.30f),
-        vec3(0.55f, previous_y, 0.30f),
-        vec3(0.30f, previous_y, 0.55f),
-        vec3(0.55f, previous_y, 0.55f)
-    };
-    const vec3 current[4] = {
-        vec3(0.32f, current_y, 0.32f),
-        vec3(0.57f, current_y, 0.32f),
-        vec3(0.32f, current_y, 0.57f),
-        vec3(0.57f, current_y, 0.57f)
-    };
+    vec3 previous[4] = {};
+    vec3 current[4] = {};
+    task5_make_exact_swing_centers(previous, current);
+    check(static_cast<double>(previous[0].y) -
+                  static_cast<double>(config.planted_clearance_m) ==
+              static_cast<double>(config.planted_clearance_m) &&
+              static_cast<double>(current[0].y) -
+                  static_cast<double>(config.swing_clearance_m) ==
+              static_cast<double>(config.swing_clearance_m),
+          "Task 5 direct swing targets are exactly binary32 representable");
     char error[256] = {};
     G1SwingHistory history = task5_unique_history(UINT32_C(0x33));
     check(g1_swing_history_reset(
@@ -4548,6 +4678,16 @@ static void test_task5_actual_center_swing()
     const G1ClearanceResult direct = task5_direct_swept_foot(
         field, adjusted_previous, adjusted_current,
         config.foot_sphere_radius_m, 0);
+    const G1ClearanceResult first = task5_require_capsule(
+        field, adjusted_previous[0], adjusted_current[0],
+        config.foot_sphere_radius_m, 0,
+        g1_swing_foot_clearance_budget());
+    check(direct.witness.primitive_index == 3 &&
+              (double_bits(direct.lower_bound_m) !=
+                   double_bits(first.lower_bound_m) ||
+               double_bits(direct.witness_upper_m) !=
+                   double_bits(first.witness_upper_m)),
+          "Task 5 asymmetric swing oracle has a later-sphere winner");
     G1SwingClearanceValidation output =
         task5_unique_swing_output(UINT32_C(0x34));
     check(g1_swing_clearance_validate(
@@ -4557,22 +4697,15 @@ static void test_task5_actual_center_swing()
               error, static_cast<int>(sizeof(error))) == G1ClearanceOk,
           error[0] == '\0' ?
               "Task 5 actual-center sweep certifies" : error);
-    const long double flat_oracle =
-        static_cast<long double>(config.planted_clearance_m) -
-        static_cast<long double>(config.foot_sphere_radius_m);
     check(output.sweep_evaluated &&
+              double_bits(output.lower_margin_m) ==
+                  double_bits(direct.lower_bound_m) &&
+              double_bits(output.witness_upper_m) ==
+                  double_bits(direct.witness_upper_m) &&
               clearance_work_same(output.work, direct.work) &&
-              static_cast<long double>(output.lower_margin_m) <=
-                  flat_oracle &&
-              flat_oracle <=
-                  static_cast<long double>(output.witness_upper_m) &&
-              static_cast<long double>(direct.lower_bound_m) <=
-                  flat_oracle &&
-              flat_oracle <=
-                  static_cast<long double>(direct.witness_upper_m) &&
               output.witness_upper_m - output.lower_margin_m <=
                   G1ClearanceMaximumCertificateWidthM,
-          "Task 5 swing matches four direct target-subtracted capsules");
+          "Task 5 swing exactly matches four direct target-subtracted capsules");
 
     G1SwingClearanceValidation contact =
         task5_unique_swing_output(UINT32_C(0x35));
@@ -4798,6 +4931,371 @@ static int run_task5_swing_mode()
     return 0;
 }
 
+static void task5_parity_emit_result(
+    const char* name,
+    G1ClearanceStatus status,
+    const G1ClearanceResult& result,
+    bool unchanged)
+{
+    const G1ClearanceWitness& witness = result.witness;
+    const G1ClearanceWork& work = result.work;
+    std::printf(
+        "task1=%s status=%u unchanged=%u bounds=%016llx,%016llx "
+        "key=%u,%d,%d,%u,%u,%u,%u work=%u,%u,%u,%u,%u,%u\n",
+        name,
+        static_cast<unsigned int>(status),
+        unchanged ? 1U : 0U,
+        static_cast<unsigned long long>(
+            double_bits(result.lower_bound_m)),
+        static_cast<unsigned long long>(
+            double_bits(result.witness_upper_m)),
+        witness.primitive_index,
+        witness.cell_x,
+        witness.cell_z,
+        witness.terrain_triangle_index,
+        witness.patch_index,
+        witness.candidate_kind,
+        witness.candidate_subindex,
+        work.point_queries,
+        work.cells_visited,
+        work.primitive_triangle_pairs,
+        work.face_patches,
+        work.candidate_tests,
+        work.subdivision_nodes);
+}
+
+static void task5_parity_emit_leg(
+    const char* prefix,
+    G1ClearanceStatus status,
+    const G1LegClearance& leg)
+{
+    const G1ClearanceResult* const members[] = {
+        &leg.knee, &leg.ankle, &leg.toe, &leg.foot,
+        &leg.thigh, &leg.shin, &leg.minimum
+    };
+    const char* const suffixes[] = {
+        "knee", "ankle", "toe", "foot",
+        "thigh", "shin", "minimum"
+    };
+    for (size_t index = 0;
+         index < sizeof(members) / sizeof(members[0]);
+         ++index) {
+        char name[64] = {};
+        const int written = std::snprintf(
+            name, sizeof(name), "%s-%s", prefix, suffixes[index]);
+        check(written > 0 &&
+                  written < static_cast<int>(sizeof(name)),
+              "Task 1 parity leg record name fits");
+        task5_parity_emit_result(name, status, *members[index], false);
+    }
+}
+
+static void task5_parity_emit_pose(
+    G1ClearanceStatus status,
+    const G1PoseClearance& pose)
+{
+    task5_parity_emit_result(
+        "pose-hips", status, pose.hips, false);
+    task5_parity_emit_leg("pose-left", status, pose.left);
+    task5_parity_emit_leg("pose-right", status, pose.right);
+    task5_parity_emit_result(
+        "pose-minimum", status, pose.minimum, false);
+}
+
+static void task5_parity_emit_history(
+    const char* name,
+    bool ok,
+    bool unchanged,
+    const G1SwingHistory& history)
+{
+    std::printf(
+        "task1=%s ok=%u unchanged=%u initialized=%u centers=",
+        name, ok ? 1U : 0U, unchanged ? 1U : 0U,
+        history.initialized ? 1U : 0U);
+    for (int index = 0; index < 4; ++index) {
+        std::printf(
+            "%s%08x,%08x,%08x",
+            index == 0 ? "" : "|",
+            float_bits(history.previous_sphere_centers[index].x),
+            float_bits(history.previous_sphere_centers[index].y),
+            float_bits(history.previous_sphere_centers[index].z));
+    }
+    std::printf("\n");
+}
+
+static void task5_parity_emit_swing(
+    const char* name,
+    G1ClearanceStatus status,
+    bool unchanged,
+    const G1SwingClearanceValidation& output)
+{
+    const G1ClearanceWork& work = output.work;
+    std::printf(
+        "task1=%s status=%u unchanged=%u margins=%016llx,%016llx "
+        "evaluated=%u work=%u,%u,%u,%u,%u,%u\n",
+        name,
+        static_cast<unsigned int>(status),
+        unchanged ? 1U : 0U,
+        static_cast<unsigned long long>(
+            double_bits(output.lower_margin_m)),
+        static_cast<unsigned long long>(
+            double_bits(output.witness_upper_m)),
+        output.sweep_evaluated ? 1U : 0U,
+        work.point_queries,
+        work.cells_visited,
+        work.primitive_triangle_pairs,
+        work.face_patches,
+        work.candidate_tests,
+        work.subdivision_nodes);
+}
+
+static void task5_make_parity_field(heightfield& field)
+{
+    field.version = 2;
+    field.nx = 17;
+    field.nz = 17;
+    field.origin_x = float_from_bits(UINT32_C(0xbf800000));
+    field.origin_z = float_from_bits(UINT32_C(0xbf800000));
+    field.cell_size = float_from_bits(UINT32_C(0x3e000000));
+    field.exterior_height = float_from_bits(UINT32_C(0xbf800000));
+    field.heights.resize(17 * 17);
+    field.heights.set(float_from_bits(UINT32_C(0x00000000)));
+}
+
+static int run_task5_parity_mode()
+{
+    test_normal_arithmetic_environment();
+    heightfield field;
+    task5_make_parity_field(field);
+    char error[256] = {};
+
+    const vec3 foot_centers[4] = {
+        vec3(float_from_bits(UINT32_C(0xbee66666)),
+             float_from_bits(UINT32_C(0x3f666666)),
+             float_from_bits(UINT32_C(0xbe4ccccd))),
+        vec3(float_from_bits(UINT32_C(0xbe19999a)),
+             float_from_bits(UINT32_C(0x3f8ccccd)),
+             float_from_bits(UINT32_C(0xbdcccccd))),
+        vec3(float_from_bits(UINT32_C(0x3e19999a)),
+             float_from_bits(UINT32_C(0x3f4ccccd)),
+             float_from_bits(UINT32_C(0x3dcccccd))),
+        vec3(float_from_bits(UINT32_C(0x3ee66666)),
+             float_from_bits(UINT32_C(0x3f4ccccd)),
+             float_from_bits(UINT32_C(0x3e4ccccd)))
+    };
+    G1ClearanceResult foot = seeded_result(901.0);
+    G1ClearanceStatus status = g1_foot_clearance(
+        foot, g1_pose_clearance_budget(), field,
+        foot_centers, float_from_bits(UINT32_C(0x3ca3d70a)),
+        error, static_cast<int>(sizeof(error)));
+    check(status == G1ClearanceOk,
+          "Task 1 parity foot fixture certifies");
+    task5_parity_emit_result("foot-ok", status, foot, false);
+
+    const vec3 previous[4] = {
+        foot_centers[0], foot_centers[1], foot_centers[2], foot_centers[3]
+    };
+    const vec3 current[4] = {
+        vec3(float_from_bits(UINT32_C(0xbed70a3d)),
+             float_from_bits(UINT32_C(0x3f68f5c3)),
+             float_from_bits(UINT32_C(0xbe3851ec))),
+        vec3(float_from_bits(UINT32_C(0xbdf5c28f)),
+             float_from_bits(UINT32_C(0x3f8f5c29)),
+             float_from_bits(UINT32_C(0xbd8f5c29))),
+        vec3(float_from_bits(UINT32_C(0x3e3851ec)),
+             float_from_bits(UINT32_C(0x3f4f5c29)),
+             float_from_bits(UINT32_C(0x3df5c28f))),
+        vec3(float_from_bits(UINT32_C(0x3ef5c28f)),
+             float_from_bits(UINT32_C(0x3f4f5c29)),
+             float_from_bits(UINT32_C(0x3e6147ae)))
+    };
+    G1ClearanceResult swept = seeded_result(903.0);
+    status = g1_swept_foot_clearance(
+        swept, g1_swing_foot_clearance_budget(), field,
+        previous, current, float_from_bits(UINT32_C(0x3ca3d70a)),
+        error, static_cast<int>(sizeof(error)));
+    check(status == G1ClearanceOk,
+          "Task 1 parity swept-foot fixture certifies");
+    task5_parity_emit_result("swept-foot-ok", status, swept, false);
+
+    vec3 positions[G1_BoneCount];
+    quat rotations[G1_BoneCount];
+    task5_make_pose(positions, rotations);
+    const slice1d<vec3> position_slice(G1_BoneCount, positions);
+    const slice1d<quat> rotation_slice(G1_BoneCount, rotations);
+    G1LegClearance leg = task5_seed_leg(905.0);
+    status = g1_measure_leg_clearance(
+        leg, g1_pose_clearance_budget(), field,
+        position_slice, rotation_slice, g1_left_leg_config(),
+        error, static_cast<int>(sizeof(error)));
+    check(status == G1ClearanceOk,
+          "Task 1 parity leg fixture certifies");
+    task5_parity_emit_leg("leg-ok", status, leg);
+
+    G1PoseClearance pose = task5_seed_pose(907.0);
+    status = g1_measure_pose_clearance(
+        pose, g1_pose_clearance_budget(), field,
+        position_slice, rotation_slice,
+        error, static_cast<int>(sizeof(error)));
+    check(status == G1ClearanceOk,
+          "Task 1 parity pose fixture certifies");
+    task5_parity_emit_pose(status, pose);
+
+    heightfield swing_field;
+    task5_make_asymmetric_swing_field(swing_field);
+    vec3 swing_previous[4] = {};
+    vec3 swing_current[4] = {};
+    task5_make_exact_swing_centers(swing_previous, swing_current);
+    G1SwingHistory history = task5_unique_history(UINT32_C(0x61));
+    bool history_ok = g1_swing_history_reset(
+        history, swing_previous,
+        error, static_cast<int>(sizeof(error)));
+    check(history_ok, "Task 1 parity history reset succeeds");
+    task5_parity_emit_history(
+        "history-reset-ok", history_ok, false, history);
+    history_ok = g1_swing_history_commit(
+        history, swing_current,
+        error, static_cast<int>(sizeof(error)));
+    check(history_ok, "Task 1 parity history commit succeeds");
+    task5_parity_emit_history(
+        "history-commit-ok", history_ok, false, history);
+
+    vec3 invalid_history_centers[4] = {
+        swing_current[0], swing_current[1],
+        swing_current[2], swing_current[3]
+    };
+    invalid_history_centers[2].z =
+        float_from_bits(UINT32_C(0x7fc00001));
+    const ByteSnapshot<G1SwingHistory> history_before(history);
+    history_ok = g1_swing_history_reset(
+        history, invalid_history_centers, NULL, 0);
+    check(!history_ok && history_before.same(history),
+          "Task 1 parity history failure is transactional");
+    task5_parity_emit_history(
+        "history-reset-failure", history_ok, true, history);
+
+    float lifted = float_from_bits(UINT32_C(0x41234567));
+    status = g1_apply_swing_lift_y(
+        lifted,
+        float_from_bits(UINT32_C(0x3d0f5c28)),
+        float_from_bits(UINT32_C(0x31000000)),
+        error, static_cast<int>(sizeof(error)));
+    check(status == G1ClearanceOk,
+          "Task 1 parity lift fixture succeeds");
+    std::printf(
+        "task1=lift-ok status=%u unchanged=0 output=%08x\n",
+        static_cast<unsigned int>(status), float_bits(lifted));
+    const float lift_before = lifted;
+    status = g1_apply_swing_lift_y(
+        lifted,
+        float_from_bits(UINT32_C(0x3d0f5c28)),
+        float_from_bits(UINT32_C(0xbf800000)),
+        NULL, 0);
+    check(status == G1ClearanceInvalidInput &&
+              float_bits(lifted) == float_bits(lift_before),
+          "Task 1 parity lift failure is transactional");
+    std::printf(
+        "task1=lift-failure status=%u unchanged=1 output=%08x\n",
+        static_cast<unsigned int>(status), float_bits(lifted));
+
+    check(g1_swing_history_reset(history, swing_previous, NULL, 0),
+          "Task 1 parity actual swing history resets");
+    G1SwingClearanceValidation contact =
+        task5_unique_swing_output(UINT32_C(0x62));
+    heightfield bypass_field;
+    status = g1_swing_clearance_validate(
+        contact, g1_swing_foot_clearance_budget(),
+        history, bypass_field, g1_left_leg_config(), swing_current,
+        true, float_from_bits(UINT32_C(0x3d23d70a)),
+        error, static_cast<int>(sizeof(error)));
+    check(status == G1ClearanceOk && !contact.sweep_evaluated,
+          "Task 1 parity contact bypass succeeds");
+    task5_parity_emit_swing(
+        "contact-bypass-ok", status, false, contact);
+
+    G1SwingClearanceValidation swing =
+        task5_unique_swing_output(UINT32_C(0x63));
+    status = g1_swing_clearance_validate(
+        swing, g1_swing_foot_clearance_budget(),
+        history, swing_field, g1_left_leg_config(), swing_current,
+        false, float_from_bits(UINT32_C(0x3d23d70a)),
+        error, static_cast<int>(sizeof(error)));
+    check(status == G1ClearanceOk && swing.sweep_evaluated,
+          "Task 1 parity actual swing succeeds");
+    task5_parity_emit_swing("actual-swing-ok", status, false, swing);
+
+    heightfield invalid_field = field;
+    invalid_field.version = 1;
+    G1ClearanceResult failed_foot = seeded_result(911.0);
+    const ByteSnapshot<G1ClearanceResult> failed_foot_before(failed_foot);
+    status = g1_foot_clearance(
+        failed_foot, g1_pose_clearance_budget(), invalid_field,
+        foot_centers, float_from_bits(UINT32_C(0x3ca3d70a)), NULL, 0);
+    check(status == G1ClearanceInvalidField &&
+              failed_foot_before.same(failed_foot),
+          "Task 1 parity foot failure is transactional");
+    task5_parity_emit_result(
+        "foot-failure", status, failed_foot, true);
+
+    G1ClearanceBudget no_cells = g1_swing_foot_clearance_budget();
+    no_cells.maximum_cells = 0;
+    G1ClearanceResult failed_swept = seeded_result(913.0);
+    const ByteSnapshot<G1ClearanceResult> failed_swept_before(
+        failed_swept);
+    status = g1_swept_foot_clearance(
+        failed_swept, no_cells, field, previous, current,
+        float_from_bits(UINT32_C(0x3ca3d70a)), NULL, 0);
+    check(status == G1ClearanceBudgetExceeded &&
+              failed_swept_before.same(failed_swept),
+          "Task 1 parity swept failure is transactional");
+    task5_parity_emit_result(
+        "swept-foot-failure", status, failed_swept, true);
+
+    vec3 invalid_positions[G1_BoneCount];
+    quat invalid_rotations[G1_BoneCount];
+    task5_make_pose(invalid_positions, invalid_rotations);
+    invalid_positions[G1_LeftAnkle].x =
+        float_from_bits(UINT32_C(0x7fc00002));
+    G1LegClearance failed_leg = task5_seed_leg(915.0);
+    const ByteSnapshot<G1LegClearance> failed_leg_before(failed_leg);
+    status = g1_measure_leg_clearance(
+        failed_leg, g1_pose_clearance_budget(), field,
+        slice1d<vec3>(G1_BoneCount, invalid_positions),
+        slice1d<quat>(G1_BoneCount, invalid_rotations),
+        g1_left_leg_config(), NULL, 0);
+    check(status == G1ClearanceInvalidInput &&
+              failed_leg_before.same(failed_leg),
+          "Task 1 parity leg failure is transactional");
+    task5_parity_emit_result(
+        "leg-failure", status, failed_leg.minimum, true);
+
+    G1PoseClearance failed_pose = task5_seed_pose(917.0);
+    const ByteSnapshot<G1PoseClearance> failed_pose_before(failed_pose);
+    status = g1_measure_pose_clearance(
+        failed_pose, g1_pose_clearance_budget(), invalid_field,
+        position_slice, rotation_slice, NULL, 0);
+    check(status == G1ClearanceInvalidField &&
+              failed_pose_before.same(failed_pose),
+          "Task 1 parity pose failure is transactional");
+    task5_parity_emit_result(
+        "pose-failure", status, failed_pose.minimum, true);
+
+    G1SwingClearanceValidation failed_swing =
+        task5_unique_swing_output(UINT32_C(0x64));
+    const ByteSnapshot<G1SwingClearanceValidation> failed_swing_before(
+        failed_swing);
+    status = g1_swing_clearance_validate(
+        failed_swing, g1_swing_foot_clearance_budget(),
+        history, swing_field, g1_left_leg_config(), swing_current,
+        false, float_from_bits(UINT32_C(0x3d23d709)), NULL, 0);
+    check(status == G1ClearanceInvalidInput &&
+              failed_swing_before.same(failed_swing),
+          "Task 1 parity swing failure is transactional");
+    task5_parity_emit_swing(
+        "actual-swing-failure", status, true, failed_swing);
+    return 0;
+}
+
 static void task34_parity_emit(
     const char* name,
     const heightfield& field,
@@ -4922,6 +5420,10 @@ int main(int argc, char** argv)
     if (argc == 2 &&
         std::strcmp(argv[1], "--task5-swing") == 0) {
         return run_task5_swing_mode();
+    }
+    if (argc == 2 &&
+        std::strcmp(argv[1], "--task5-parity") == 0) {
+        return run_task5_parity_mode();
     }
     if (argc == 2 && std::strcmp(argv[1], "--query-parity") == 0) {
         return run_task34_combined_parity_mode();

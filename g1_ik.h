@@ -9,6 +9,7 @@
 #pragma GCC diagnostic pop
 #endif
 
+#include "g1_kinematic_contract.h"
 #include "g1_skeleton.h"
 #include "ik.h"
 #include "g1_surface_query.h"
@@ -18,32 +19,6 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-
-struct G1LegConfig
-{
-    const char* name;
-    int hip;
-    int knee;
-    int ankle;
-    int contact;
-    vec3 knee_hinge_axis_local;
-    vec3 foot_forward_local;
-    vec3 sole_normal_local;
-    vec3 foot_sphere_centers_local[4];
-    vec3 sole_points_local[4];
-    float foot_sphere_radius_m;
-    vec3 thigh_start_local;
-    vec3 thigh_end_local;
-    float thigh_radius_m;
-    vec3 shin_start_local;
-    vec3 shin_end_local;
-    float shin_radius_m;
-    float reach_buffer_m;
-    float planted_clearance_m;
-    float swing_clearance_m;
-    float max_swing_lift_m;
-    float max_correction_radians;
-};
 
 static inline bool g1_ik_error(
     char* output, int capacity, const char* format, ...)
@@ -56,58 +31,6 @@ static inline bool g1_ik_error(
         va_end(arguments);
     }
     return false;
-}
-
-static inline G1LegConfig g1_leg_config(
-    const char* name, int hip, int knee, int ankle, int contact)
-{
-    G1LegConfig config = {};
-    config.name = name;
-    config.hip = hip;
-    config.knee = knee;
-    config.ankle = ankle;
-    config.contact = contact;
-    config.knee_hinge_axis_local = vec3(0.0f, 0.0f, -1.0f);
-    config.foot_forward_local = vec3(1.0f, 0.0f, 0.0f);
-    config.sole_normal_local = vec3(0.0f, 1.0f, 0.0f);
-    config.foot_sphere_radius_m = 0.02f;
-    config.foot_sphere_centers_local[0] =
-        vec3(-0.05f, -0.03f, -0.025f);
-    config.foot_sphere_centers_local[1] =
-        vec3(-0.05f, -0.03f, +0.025f);
-    config.foot_sphere_centers_local[2] =
-        vec3(+0.12f, -0.03f, -0.030f);
-    config.foot_sphere_centers_local[3] =
-        vec3(+0.12f, -0.03f, +0.030f);
-    for (int i = 0; i < 4; ++i) {
-        config.sole_points_local[i] =
-            config.foot_sphere_centers_local[i] -
-            config.sole_normal_local * config.foot_sphere_radius_m;
-    }
-    config.thigh_start_local = vec3(0.0f, -0.02f, 0.0f);
-    config.thigh_end_local = vec3(-0.078f, -0.17f, 0.0f);
-    config.thigh_radius_m = 0.05f;
-    config.shin_start_local = vec3(0.0f, -0.05f, 0.0f);
-    config.shin_end_local = vec3(0.0f, -0.28f, 0.0f);
-    config.shin_radius_m = 0.04f;
-    config.reach_buffer_m = 0.015f;
-    config.planted_clearance_m = 0.005f;
-    config.swing_clearance_m = 0.015f;
-    config.max_swing_lift_m = 0.08f;
-    config.max_correction_radians = 0.35f;
-    return config;
-}
-
-static inline G1LegConfig g1_left_leg_config()
-{
-    return g1_leg_config(
-        "left", G1_LeftHipYaw, G1_LeftKnee, G1_LeftAnkle, G1_LeftToe);
-}
-
-static inline G1LegConfig g1_right_leg_config()
-{
-    return g1_leg_config(
-        "right", G1_RightHipYaw, G1_RightKnee, G1_RightAnkle, G1_RightToe);
 }
 
 static inline bool g1_leg_vec3_is_finite(const vec3 value)
@@ -573,12 +496,6 @@ static inline bool g1_ik_vec3_bits_equal(vec3 left, vec3 right)
            terrain_float_bits(left.z) == terrain_float_bits(right.z);
 }
 
-static inline bool g1_ik_dt_is_exact_25_hz(float dt)
-{
-    // Exact binary32 encoding of 1.0f / 25.0f (0.04f).
-    return terrain_float_bits(dt) == UINT32_C(0x3d23d70a);
-}
-
 static inline bool g1_ik_surface_target_is_valid(
     const G1SurfaceTarget& target)
 {
@@ -984,7 +901,7 @@ static inline bool g1_foot_lock_update(
             error, error_capacity,
             "G1 planted-foot update has invalid input center");
     }
-    if (!g1_ik_dt_is_exact_25_hz(dt)) {
+    if (!g1_dt_is_exact_25_hz(dt)) {
         return g1_ik_error(
             error, error_capacity,
             "G1 planted-foot update requires exact binary32 25 Hz dt");
