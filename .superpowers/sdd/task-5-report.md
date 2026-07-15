@@ -163,3 +163,78 @@ link RED. No blocking finding remains.
 The protected repository-root `interaction_query_probe` artifact was never
 accessed; verification used only the safe build output selected by the Make
 target.
+
+## Formal-review follow-up: release-edge cancellation
+
+Formal review found that the runtime updated the Place controller and then
+unconditionally replaced the returned step with `cancel()` when Cancel was
+pulsed. On the release update, that discarded the controller's one-shot
+`release_due` event. Because the controller had already entered its committed,
+release-pending state, later updates correctly did not re-emit the event, which
+left the runtime wedged in Held PlaceReplay.
+
+### Follow-up RED
+
+The regression creates independent trial and control runtimes for both recorded
+and reversed candidates, advances each pair to the update immediately before
+release, and pulses Cancel only on the trial's release update. It compares the
+complete runtime output at release and on every retraction update, and verifies
+the exact Free generation, placed transform, destination support context, and
+final Locomotion result.
+
+```text
+make build/tests/test_interaction_runtime && \
+  build/tests/test_interaction_runtime
+```
+
+Before the fix, the command exited 134 on the recorded-candidate case:
+
+```text
+test_interaction_runtime: tests/cpp/test_interaction_runtime.cpp:2010:
+void {anonymous}::test_cancel_on_release_update_preserves_release_for_both_modes():
+Assertion `exact(trial_output, control_output)' failed.
+```
+
+The success-lifecycle test was also tightened to assert directly that the
+request update publishes PlacePreflight, the immediately following update does
+not, and the complete lifecycle contains exactly one PlacePreflight
+publication.
+
+### Follow-up fix and GREEN
+
+The runtime now evaluates Cancel only when the step returned by
+`PlaceController::update()` is uncommitted. This preserves the release event
+while retaining the controller's one-shot semantics and every pre-commit
+cancellation boundary. No controller code or API changed.
+
+After the fix, the focused RED command exited 0. The following build-closure
+and focused execution command also exited 0:
+
+```text
+make build/tests/test_interaction_runtime \
+  build/tests/test_interaction_controller_adapter \
+  interaction_runtime_probe && \
+  build/tests/test_interaction_runtime && \
+  build/tests/test_interaction_controller_adapter
+```
+
+The final safe-suite command exited 0:
+
+```text
+make test-interaction-safe
+```
+
+It reported 263 Python tests passing with 3 expected environment-dependent
+skips, followed by successful target-release, carry-release, place-selection,
+and place-release fast-math validation binaries.
+
+### Follow-up self-review
+
+The change is limited to the runtime cancellation gate and its runtime
+regressions. Both recorded and reversed trials are required to match their
+controls exactly through the first successful PlaceRelease and every retraction
+update to Locomotion. The assertions prove one Free generation increment, exact
+placed transform and support metadata, stable placed handles after release, and
+exactly one PlacePreflight publication on the success lifecycle. Existing
+before-commit cancellation coverage remains green, and the controller's
+one-shot release behavior is unchanged.

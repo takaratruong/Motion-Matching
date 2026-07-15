@@ -991,9 +991,18 @@ void test_place_preview_and_collapsed_success_lifecycle() {
     assert(exact(output.pose, frozen.pose));
     assert(exact(output.object_world, frozen.object_world));
     assert(exact(output.diagnostics.place.preview, first));
+    assert(output.diagnostics.place.selection_id ==
+           first.candidate.selection_id);
 
-    std::vector<RuntimeState> collapsed{RuntimeState::Carry};
-    RuntimeState previous = RuntimeState::Carry;
+    int place_preflight_publications = 1;
+    output = advance(runtime, fixture.locomotion);
+    assert(output.diagnostics.state != RuntimeState::PlacePreflight);
+
+    std::vector<RuntimeState> collapsed{
+        RuntimeState::Carry,
+        RuntimeState::PlacePreflight,
+    };
+    RuntimeState previous = RuntimeState::PlacePreflight;
     for (int update = 0; update < kMaximumUpdates; ++update) {
         if (output.diagnostics.state != previous) {
             collapsed.push_back(output.diagnostics.state);
@@ -1007,6 +1016,7 @@ void test_place_preview_and_collapsed_success_lifecycle() {
             assert(output.suppress_steering);
         }
         if (output.diagnostics.state == RuntimeState::PlacePreflight) {
+            ++place_preflight_publications;
             assert(output.diagnostics.place.selection_id ==
                    first.candidate.selection_id);
         }
@@ -1046,6 +1056,7 @@ void test_place_preview_and_collapsed_success_lifecycle() {
         RuntimeState::Locomotion,
     };
     assert(collapsed == expected);
+    assert(place_preflight_publications == 1);
     assert(output.diagnostics.result == ResultCode::Succeeded);
     assert(output.diagnostics.reason == Reason::None);
     assert(!output.owns_pose && !output.suppress_steering);
@@ -1917,6 +1928,128 @@ void test_place_cancellation_boundaries_for_recorded_and_reverse() {
                 assert(trial_output.diagnostics.reason == Reason::None);
             }
         }
+    }
+}
+
+void test_cancel_on_release_update_preserves_release_for_both_modes() {
+    using namespace interaction;
+    for (bool reverse : {false, true}) {
+        RuntimeFixture trial_fixture = reverse
+            ? reverse_place_runtime_fixture()
+            : make_runtime_fixture();
+        RuntimeFixture control_fixture = reverse
+            ? reverse_place_runtime_fixture()
+            : make_runtime_fixture();
+        RuntimeConfig runtime_config{};
+        if (reverse) {
+            runtime_config.ik.accepted_position_m =
+                runtime_config.ik.maximum_request_position_m;
+            runtime_config.ik.accepted_orientation_radians =
+                runtime_config.ik.maximum_request_orientation_radians;
+        }
+        InteractionRuntime trial(
+            trial_fixture.database,
+            trial_fixture.features,
+            trial_fixture.registry,
+            trial_fixture.surface_registry,
+            trial_fixture.place_library,
+            runtime_config);
+        InteractionRuntime control(
+            control_fixture.database,
+            control_fixture.features,
+            control_fixture.registry,
+            control_fixture.surface_registry,
+            control_fixture.place_library,
+            runtime_config);
+        enter_carry_before_first_update(trial, trial_fixture);
+        enter_carry_before_first_update(control, control_fixture);
+        const PlaceStagingPreview preview = trial.preview_place(
+            trial_fixture.surface,
+            trial_fixture.place_affordance_id);
+        assert(preview.accepted && preview.ready);
+        assert(preview.candidate.mode ==
+               (reverse
+                    ? PlaceMotionMode::ReversedPickup
+                    : PlaceMotionMode::RecordedPlace));
+        RuntimeOutput trial_output = enter_ready_place_align(
+            trial, trial_fixture, reverse ? 4001U : 4002U);
+        RuntimeOutput control_output = enter_ready_place_align(
+            control, control_fixture, reverse ? 4001U : 4002U);
+        assert(exact(trial_output, control_output));
+
+        const int32_t direction = preview.candidate.direction;
+        const double immediately_before_release =
+            preview.candidate.release_frame - direction;
+        for (int update = 0; update < kMaximumUpdates; ++update) {
+            if (trial_output.diagnostics.place.source_frame_exact ==
+                immediately_before_release) {
+                break;
+            }
+            if (direction > 0) {
+                assert(
+                    trial_output.diagnostics.place.source_frame_exact <
+                    immediately_before_release);
+            } else {
+                assert(
+                    trial_output.diagnostics.place.source_frame_exact >
+                    immediately_before_release);
+            }
+            trial_output = advance(trial, trial_fixture.locomotion);
+            control_output = advance(control, control_fixture.locomotion);
+            assert(exact(trial_output, control_output));
+        }
+        assert(trial_output.diagnostics.state == RuntimeState::PlaceReplay);
+        assert(trial_output.diagnostics.attached);
+        assert(trial_output.diagnostics.place.source_frame_exact ==
+               immediately_before_release);
+
+        const PlacementSurface destination =
+            *trial_fixture.surface_registry.find(trial_fixture.surface);
+        trial_output = trial.update(cancel_input(trial_fixture.locomotion));
+        control_output = advance(control, control_fixture.locomotion);
+        assert(exact(trial_output, control_output));
+        assert(trial_output.diagnostics.state == RuntimeState::PlaceRelease);
+        assert(trial_output.diagnostics.result == ResultCode::Succeeded);
+        assert(trial_output.diagnostics.reason == Reason::None);
+        assert(!trial_output.diagnostics.attached);
+        assert(trial_output.diagnostics.object_state == ObjectState::Free);
+        assert(trial_output.diagnostics.target.id ==
+               trial_fixture.request.target.id);
+        assert(trial_output.diagnostics.target.generation ==
+               trial_fixture.request.target.generation + 1U);
+        const TargetHandle placed_handle = trial_output.diagnostics.target;
+        const InteractionTarget* trial_placed =
+            trial_fixture.registry.find(placed_handle);
+        const InteractionTarget* control_placed =
+            control_fixture.registry.find(placed_handle);
+        assert(trial_placed != nullptr && control_placed != nullptr);
+        assert(exact(*trial_placed, *control_placed));
+        assert(exact(trial_placed->object_world, trial_output.object_world));
+        assert(exact(
+            trial_placed->table_world,
+            destination.support_volume_world));
+        assert(exact(
+            trial_placed->table_size,
+            destination.support_volume_size));
+
+        for (int update = 0; update < kMaximumUpdates; ++update) {
+            if (trial_output.diagnostics.state == RuntimeState::Locomotion) {
+                break;
+            }
+            trial_output = advance(trial, trial_fixture.locomotion);
+            control_output = advance(control, control_fixture.locomotion);
+            assert(exact(trial_output, control_output));
+            assert(trial_fixture.registry.find(placed_handle) != nullptr);
+            assert(control_fixture.registry.find(placed_handle) != nullptr);
+        }
+        assert(trial_output.diagnostics.state == RuntimeState::Locomotion);
+        assert(trial_output.diagnostics.result == ResultCode::Succeeded);
+        assert(trial_output.diagnostics.reason == Reason::None);
+        assert(trial_output.diagnostics.target == placed_handle);
+        assert(trial_fixture.registry.find(placed_handle)->handle ==
+               placed_handle);
+        assert(control_fixture.registry.find(placed_handle)->handle ==
+               placed_handle);
     }
 }
 
@@ -3520,6 +3653,7 @@ int main() {
     test_place_preflight_rejections_preserve_frozen_carry();
     test_post_begin_place_failures_reconstruct_fresh_carry();
     test_place_cancellation_boundaries_for_recorded_and_reverse();
+    test_cancel_on_release_update_preserves_release_for_both_modes();
     test_reset_and_duplicate_edges_are_ignored_in_every_place_state();
     test_recorded_and_reverse_place_diagnostics_are_deterministic();
     test_disabled_is_permanent_pose_passthrough();

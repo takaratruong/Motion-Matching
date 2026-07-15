@@ -1825,7 +1825,7 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
                 failed, failed.reason, ResultCode::Failed);
         } else {
             PlaceStep step = place_controller_->update(input.dt);
-            if (input.cancel_pressed) {
+            if (input.cancel_pressed && !step.committed) {
                 step = place_controller_->cancel();
             }
             place_step_ = step;
