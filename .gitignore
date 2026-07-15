@@ -9,3 +9,4 @@ controller.wasm
 *.log
 resources/runs*
 /resources/g1_terrain/
+/.worktrees/
