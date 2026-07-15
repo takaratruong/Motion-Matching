@@ -80,6 +80,8 @@ bool exact(
            left.hand_constraint_weight == right.hand_constraint_weight &&
            left.attached == right.attached &&
            left.recorded_carry == right.recorded_carry &&
+           left.inactive_arm_tracks_locomotion ==
+               right.inactive_arm_tracks_locomotion &&
            left.pack_available == right.pack_available;
 }
 
@@ -150,6 +152,24 @@ interaction::RuntimeOutput enter_align(
     assert(output.diagnostics.state == RuntimeState::Preflight);
     output = advance(runtime, fixture.locomotion);
     assert(output.diagnostics.state == RuntimeState::Align);
+    return output;
+}
+
+interaction::RuntimeOutput enter_carry_before_first_update(
+    interaction::InteractionRuntime& runtime,
+    const interaction::RuntimeFixture& fixture) {
+    using namespace interaction;
+    RuntimeOutput output = enter_align(runtime, fixture);
+    assert(!output.diagnostics.inactive_arm_tracks_locomotion);
+    for (int update = 0;
+         update < kMaximumUpdates &&
+         output.diagnostics.state != RuntimeState::Carry;
+         ++update) {
+        assert(!output.diagnostics.inactive_arm_tracks_locomotion);
+        output = advance(runtime, fixture.locomotion);
+    }
+    assert(output.diagnostics.state == RuntimeState::Carry);
+    assert(!output.diagnostics.inactive_arm_tracks_locomotion);
     return output;
 }
 
@@ -417,6 +437,8 @@ void test_frozen_public_contract_and_defaults() {
     static_assert(std::is_same_v<
         decltype(RuntimeDiagnostics{}.hand_constraint_weight), float>);
     static_assert(std::is_same_v<
+        decltype(RuntimeDiagnostics{}.inactive_arm_tracks_locomotion), bool>);
+    static_assert(std::is_same_v<
         decltype(&InteractionRuntime::update),
         RuntimeOutput (InteractionRuntime::*)(const RuntimeInput&)>);
 
@@ -442,6 +464,7 @@ void test_frozen_public_contract_and_defaults() {
     assert(diagnostics.clip == -1 && diagnostics.frame == -1);
     assert(diagnostics.hand_constraint_weight == 0.0F);
     assert(!diagnostics.attached && !diagnostics.recorded_carry);
+    assert(!diagnostics.inactive_arm_tracks_locomotion);
     assert(!diagnostics.pack_available);
 
     const RuntimeOutput output{};
@@ -660,6 +683,7 @@ void test_success_order_carry_and_reset() {
     assert(output.diagnostics.result == ResultCode::Reset);
     assert(output.diagnostics.reason == Reason::Reset);
     assert(!output.diagnostics.attached);
+    assert(!output.diagnostics.inactive_arm_tracks_locomotion);
     assert(!output.owns_pose && !output.suppress_steering);
     assert(exact(output.object_world, fixture.original_object_world));
 
@@ -678,6 +702,76 @@ void test_success_order_carry_and_reset() {
         fixture.registry.resolve_single_target(vec3(0.0F, 0.0F, 3.0F), 1.0F);
     assert(after_idle == restored);
     assert(output.diagnostics.result == ResultCode::Reset);
+}
+
+void test_layered_carry_publishes_inactive_arm_authority_transactionally() {
+    using namespace interaction;
+    RuntimeFixture fixture = make_runtime_fixture();
+    RuntimeConfig config{};
+    config.carry.minimum_root_displacement_m = 10.0F;
+    InteractionRuntime runtime(
+        fixture.database, fixture.features, fixture.registry, config);
+
+    RuntimeOutput output = enter_carry_before_first_update(runtime, fixture);
+    LocomotionSnapshot carry_locomotion = fixture.locomotion;
+    carry_locomotion.pose = output.pose;
+    for (int update = 0;
+         update < 32 &&
+         !output.diagnostics.inactive_arm_tracks_locomotion;
+         ++update) {
+        output = advance(runtime, carry_locomotion);
+        if (!output.diagnostics.inactive_arm_tracks_locomotion) {
+            assert(output.diagnostics.state == RuntimeState::Carry);
+            assert(!output.diagnostics.recorded_carry);
+        }
+    }
+    assert(output.diagnostics.state == RuntimeState::Carry);
+    assert(!output.diagnostics.recorded_carry);
+    assert(output.diagnostics.inactive_arm_tracks_locomotion);
+
+    const RuntimeDiagnostics before_failure = runtime.diagnostics();
+    RuntimeInput invalid = idle_input(carry_locomotion);
+    invalid.locomotion.pose.positions[g1_skeleton::Simulation].x =
+        std::numeric_limits<float>::quiet_NaN();
+    bool threw = false;
+    try {
+        (void)runtime.update(invalid);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    assert(threw);
+    assert(exact(runtime.diagnostics(), before_failure));
+
+    output = advance(runtime, carry_locomotion);
+    assert(output.diagnostics.inactive_arm_tracks_locomotion);
+    output = runtime.update(reset_input(carry_locomotion));
+    assert(output.diagnostics.state == RuntimeState::Locomotion);
+    assert(!output.diagnostics.inactive_arm_tracks_locomotion);
+}
+
+void test_recorded_and_weighted_carry_never_publish_inactive_arm_authority() {
+    using namespace interaction;
+    for (bool weighted_layered : {false, true}) {
+        RuntimeFixture fixture = make_runtime_fixture();
+        RuntimeConfig config{};
+        if (weighted_layered) {
+            config.carry.minimum_root_displacement_m = 10.0F;
+            config.carry.inactive_arm_weight = 0.25F;
+        }
+        InteractionRuntime runtime(
+            fixture.database, fixture.features, fixture.registry, config);
+        RuntimeOutput output = enter_carry_before_first_update(runtime, fixture);
+        LocomotionSnapshot carry_locomotion = fixture.locomotion;
+        carry_locomotion.pose = output.pose;
+        bool saw_recorded = false;
+        for (int update = 0; update < 24; ++update) {
+            output = advance(runtime, carry_locomotion);
+            assert(output.diagnostics.state == RuntimeState::Carry);
+            assert(!output.diagnostics.inactive_arm_tracks_locomotion);
+            saw_recorded = saw_recorded || output.diagnostics.recorded_carry;
+        }
+        if (!weighted_layered) assert(saw_recorded);
+    }
 }
 
 void test_hand_constraint_weight_tracks_authored_reach_and_attachment() {
@@ -874,6 +968,7 @@ void test_carry_reset_preserves_a_newer_authoritative_generation() {
     assert(output.diagnostics.result == ResultCode::Failed);
     assert(output.diagnostics.reason == Reason::TargetChanged);
     assert(!output.diagnostics.attached);
+    assert(!output.diagnostics.inactive_arm_tracks_locomotion);
     assert(!output.owns_pose && !output.suppress_steering);
     assert(exact(output.object_world, authoritative));
 
@@ -939,6 +1034,7 @@ void test_carry_update_preserves_a_newer_authoritative_generation() {
     assert(output.diagnostics.object_state == ObjectState::Free);
     assert(!output.diagnostics.attached);
     assert(!output.diagnostics.recorded_carry);
+    assert(!output.diagnostics.inactive_arm_tracks_locomotion);
     assert(!output.owns_pose && !output.suppress_steering);
     assert(exact(output.pose, current.pose));
     assert(exact(output.object_world, authoritative));
@@ -1707,6 +1803,8 @@ int main() {
     test_noncanonical_dt_cannot_mutate_owned_runtime_state();
     test_interact_without_explicit_request_is_rejected_after_preflight();
     test_success_order_carry_and_reset();
+    test_layered_carry_publishes_inactive_arm_authority_transactionally();
+    test_recorded_and_weighted_carry_never_publish_inactive_arm_authority();
     test_hand_constraint_weight_tracks_authored_reach_and_attachment();
     test_hand_constraint_weight_resets_on_cancel_failure_and_reset();
     test_carry_reset_preserves_a_newer_authoritative_generation();

@@ -814,6 +814,7 @@ void InteractionRuntime::begin_carry() {
     diagnostics_.object_state = ObjectState::Held;
     diagnostics_.attached = true;
     diagnostics_.recorded_carry = false;
+    diagnostics_.inactive_arm_tracks_locomotion = false;
 }
 
 RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
@@ -1290,6 +1291,7 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
                        : authoritative->state);
             diagnostics_.attached = false;
             diagnostics_.recorded_carry = false;
+            diagnostics_.inactive_arm_tracks_locomotion = false;
             carry_.reset();
             player_.reset();
             event_player_.reset();
@@ -1322,6 +1324,7 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
                 diagnostics_.reason = Reason::TargetChanged;
                 diagnostics_.attached = false;
                 diagnostics_.recorded_carry = false;
+                diagnostics_.inactive_arm_tracks_locomotion = false;
                 carry_.reset();
                 player_.reset();
                 event_player_.reset();
@@ -1331,14 +1334,22 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
                 affordance_.reset();
                 request_.reset();
             } else {
-                pose_ = carry_->update(input.locomotion, input.dt);
-                object_world_ = carry_->object_world();
+                const Pose next_pose = carry_->update(
+                    input.locomotion, input.dt);
+                const Transform next_object_world = carry_->object_world();
+                const bool next_recorded_carry = carry_->recorded();
+                const bool next_inactive_arm_tracks_locomotion =
+                    carry_->inactive_arm_tracks_locomotion();
+                pose_ = next_pose;
+                object_world_ = next_object_world;
                 diagnostics_.state = RuntimeState::Carry;
                 diagnostics_.result = ResultCode::Succeeded;
                 diagnostics_.reason = Reason::None;
                 diagnostics_.object_state = ObjectState::Held;
                 diagnostics_.attached = true;
-                diagnostics_.recorded_carry = carry_->recorded();
+                diagnostics_.recorded_carry = next_recorded_carry;
+                diagnostics_.inactive_arm_tracks_locomotion =
+                    next_inactive_arm_tracks_locomotion;
             }
         }
     }

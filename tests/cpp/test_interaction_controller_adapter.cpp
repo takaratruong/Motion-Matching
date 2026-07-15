@@ -163,6 +163,8 @@ bool output_fields_equal(const RuntimeOutput& left, const RuntimeOutput& right) 
             right_diagnostics.hand_constraint_weight) ||
         left_diagnostics.attached != right_diagnostics.attached ||
         left_diagnostics.recorded_carry != right_diagnostics.recorded_carry ||
+        left_diagnostics.inactive_arm_tracks_locomotion !=
+            right_diagnostics.inactive_arm_tracks_locomotion ||
         left_diagnostics.pack_available != right_diagnostics.pack_available) {
         return false;
     }
@@ -381,6 +383,8 @@ RuntimeOutput make_complete_output(int serial, RuntimeState state) {
         0.01F * static_cast<float>(serial);
     output.diagnostics.attached = true;
     output.diagnostics.recorded_carry = true;
+    output.diagnostics.inactive_arm_tracks_locomotion =
+        (serial % 2) != 0;
     output.diagnostics.pack_available = true;
     return output;
 }

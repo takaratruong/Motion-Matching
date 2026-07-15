@@ -70,6 +70,7 @@ struct RuntimeDiagnostics {
     float hand_constraint_weight = 0.0F;
     bool attached = false;
     bool recorded_carry = false;
+    bool inactive_arm_tracks_locomotion = false;
     bool pack_available = false;
 };
 
