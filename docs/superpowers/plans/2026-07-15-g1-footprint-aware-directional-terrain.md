@@ -1768,10 +1768,19 @@ spanning `{false,false,true,true}`: at least four successive frames across the
 edge accept, route/root XZ advance, no safe-stop latch appears, the swing base
 advances toward the predicted lower landing, and the first committed contact
 target has the exact predicted landing X/Z, lower surface height, and normal.
-Add a real footprint-stage case in which successful `g1_ik_frame_begin` sets
-`candidate_result.safe_stop_requested`. Require an immediate checked
-footprint/IK rejection at that same checkpoint and prove neither first-foot
-nor second-foot stage is called.
+Add three genuine production-IK safe-stop cases, not coordinator checkpoint
+injections or hand-built transactions. First, make successful
+`g1_ik_frame_begin` request a footprint-blocked or unavailable-landing-patch
+stop and prove neither foot stage runs. Second, let begin continue and make
+foot 0 produce a real target-unreachable or no-swing-candidate stop; prove
+`next_foot == 1` and that foot 1 does not run. Third, let foot 0 complete
+successfully and make foot 1 produce a real stop; prove `next_foot == 2` and
+that finish does not run. At each checkpoint the matching typed rejection
+snapshot must succeed, both other checkpoint values and every poisoned
+stage/completed-foot field must fail without changing the output. The complete
+finite diagnostic stage must respectively be
+`G1FrameStageFootprintObservation`, `G1FrameStageFirstFootIk`, or
+`G1FrameStageSecondFootIk`.
 
 Compile the `G1_CONTROLLER_NO_MAIN` controller object under
 `-Wall -Wextra -Werror`. Its source/preprocessor guard must prove that every
@@ -1792,7 +1801,7 @@ g1_controller_state_copy(working, accepted)
 < g1_ik_checked_forward_kinematics
 < g1_footprint_observe_v2
 < g1_ik_frame_begin
-< checked begin-time terminal-safe-stop inspection
+< checked begin-time safe-stop-result inspection
 < g1_ik_frame_stage_foot(0)
 < g1_ik_frame_stage_foot(1)
 < g1_ik_frame_finish
@@ -2209,18 +2218,45 @@ and leave the value object at its canonical default. Add a checked Task-5
 rejection-result snapshot/validator in `g1_ik_runtime.h`:
 
 ```cpp
+enum G1IkRejectionCheckpoint
+{
+    G1IkRejectionAfterBegin = 0,
+    G1IkRejectionAfterFoot0,
+    G1IkRejectionAfterFoot1,
+};
+
 static inline bool g1_ik_frame_rejection_snapshot(
     G1IkFrameResult& output,
     const G1IkFrameTransaction& transaction,
+    G1IkRejectionCheckpoint expected_checkpoint,
     char* error,
     int error_capacity);
 ```
 
-It first requires an initialized transaction in exact begin-stage state
-(`next_foot == 0`), `candidate_result.safe_stop_requested == true`, a valid
-non-`None` `candidate_result.stop_reason`, and a complete stage-appropriate
-`candidate_result`;
-only after all checks does it assign the output. Thus
+Reject an unknown checkpoint. Every checkpoint requires an initialized
+transaction, `candidate_result.applied == false`,
+`candidate_result.safe_stop_requested == true`, a valid non-`None`
+`candidate_result.stop_reason`, exact `+0.0f`
+`candidate_result.max_correction_radians`, valid begin-produced
+recorded-contact/target fields for both feet, and canonical finish-only fields.
+Then enforce this exact stage table:
+
+| Expected checkpoint | Required cursor and reason | Required foot-stage fields |
+|---|---|---|
+| `G1IkRejectionAfterBegin` | `next_foot == 0`; footprint-blocked or landing-patch-unavailable | Both feet retain their valid begin-produced contact/target and canonical foot-stage-only fields. |
+| `G1IkRejectionAfterFoot0` | `next_foot == 1`; target-unreachable or no-swing-candidate | Foot 0 is a complete reason-coherent rejecting result; foot 1 retains its valid begin-produced contact/target and canonical foot-stage-only fields. |
+| `G1IkRejectionAfterFoot1` | `next_foot == 2`; target-unreachable or no-swing-candidate | Foot 0 is a complete successful staged result and foot 1 is a complete reason-coherent rejecting result. |
+
+A complete successful staged contact foot has valid passing position and
+orientation diagnostics with canonical swing-selection fields. A complete
+successful staged swing foot has a bounded nonzero candidate count, a selected
+index inside that count, matching selected-candidate diagnostics, and valid
+passing position/orientation diagnostics. A target-unreachable rejecting foot
+is recorded contact with complete failing position/orientation diagnostics; a
+no-swing-candidate rejecting foot is non-contact, evaluated all
+`G1SwingLiftCandidateCount` candidates, selected none, and retains canonical
+unselected position/orientation fields. Only after every common and
+checkpoint-specific check does the helper assign the output. Thus
 `attempted_ik_available` becomes true only after that helper validates and
 assigns a complete snapshot. Unavailable values are never logged as evidence.
 
@@ -2464,6 +2500,7 @@ if (scratch.ik_transaction.candidate_result.safe_stop_requested) {
     G1IkFrameResult attempted_ik = {};
     if (!g1_ik_frame_rejection_snapshot(
             attempted_ik, scratch.ik_transaction,
+            G1IkRejectionAfterBegin,
             error, error_capacity)) {
         return G1FrameStageGlobalError;
     }
@@ -2508,13 +2545,41 @@ if (!g1_ik_frame_stage_foot(
     return G1FrameStageGlobalError;
 }
 if (scratch.ik_transaction.candidate_result.safe_stop_requested) {
-    // Use the checked Task-5 rejection snapshot helper, then validate the
-    // complete finite diagnostic before returning.
+    G1IkFrameResult attempted_ik = {};
+    if (!g1_ik_frame_rejection_snapshot(
+            attempted_ik, scratch.ik_transaction,
+            G1IkRejectionAfterFoot0,
+            error, error_capacity)) {
+        return G1FrameStageGlobalError;
+    }
+    // Publish attempted_ik through the checked finite diagnostic.
     return G1FrameStageFiniteReject;
 }
 return G1FrameStageContinue;
 
-// G1FrameStageSecondFootIk: the identical checked block with foot_index 1.
+// G1FrameStageSecondFootIk
+if (!g1_ik_frame_stage_foot(
+        scratch.ik_transaction,
+        state.ik_candidate_bone_positions,
+        state.ik_candidate_bone_rotations,
+        1, external.db->bone_parents, state.curr_bone_contacts,
+        external.scene->terrain, scratch.footprint,
+        external.tuning.ik_enabled, external.tuning.dt,
+        error, error_capacity)) {
+    return G1FrameStageGlobalError;
+}
+if (scratch.ik_transaction.candidate_result.safe_stop_requested) {
+    G1IkFrameResult attempted_ik = {};
+    if (!g1_ik_frame_rejection_snapshot(
+            attempted_ik, scratch.ik_transaction,
+            G1IkRejectionAfterFoot1,
+            error, error_capacity)) {
+        return G1FrameStageGlobalError;
+    }
+    // Publish attempted_ik through the checked finite diagnostic.
+    return G1FrameStageFiniteReject;
+}
+return G1FrameStageContinue;
 
 // G1FrameStageFinalFk
 if (!g1_ik_frame_finish(
