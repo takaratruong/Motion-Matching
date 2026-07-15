@@ -2059,6 +2059,10 @@ int32_t PlacePlayer::source_frame() const {
     return started_ ? discrete_source_frame(source_frame_) : -1;
 }
 
+double PlacePlayer::source_frame_exact() const {
+    return started_ ? source_frame_ : -1.0;
+}
+
 PlacePhase PlacePlayer::phase() const {
     if (!started_) throw std::logic_error("place player is not started");
     if (finished_) return PlacePhase::Finished;

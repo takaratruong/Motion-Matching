@@ -133,6 +133,7 @@ public:
     void advance(float dt);
     PlaceSample sample() const;
     int32_t source_frame() const;
+    double source_frame_exact() const;
     PlacePhase phase() const;
     bool committed() const;
     bool release_due() const;
