@@ -1362,10 +1362,15 @@ struct AutodemoConfiguration
     bool preserve_backups_after_rollback_failure = false;
 };
 
-struct AutodemoRenderedJoints
+struct AutodemoEvidenceCapture
 {
-    std::array<vec3, interaction::kFlatControllerBoneCount> positions{};
-    std::array<quat, interaction::kFlatControllerBoneCount> rotations{};
+    bool grasp_evidence_valid = false;
+    int active_hand_joint = -1;
+    interaction::Transform object_world{};
+    interaction::Transform hand_in_object{};
+    interaction::Transform grasp_world{};
+    std::array<vec3, interaction::kFlatControllerBoneCount> joint_positions{};
+    std::array<quat, interaction::kFlatControllerBoneCount> joint_rotations{};
 };
 
 constexpr std::array<const char*, interaction::kFlatControllerBoneCount>
@@ -1394,9 +1399,12 @@ constexpr std::array<const char*, interaction::kFlatControllerBoneCount>
         "RightForeArm",
         "RightHand"};
 
-AutodemoRenderedJoints capture_autodemo_rendered_joints(
+AutodemoEvidenceCapture capture_autodemo_evidence(
     const slice1d<vec3> global_bone_positions,
-    const slice1d<quat> global_bone_rotations)
+    const slice1d<quat> global_bone_rotations,
+    const interaction::RuntimeOutput& runtime_output,
+    const interaction::InteractionTarget* scene_target,
+    const interaction::Transform& object_world)
 {
     if (global_bone_positions.size !=
             static_cast<int>(interaction::kFlatControllerBoneCount) ||
@@ -1407,17 +1415,48 @@ AutodemoRenderedJoints capture_autodemo_rendered_joints(
             "autodemo rendered joint arrays must contain exactly 23 joints");
     }
 
-    AutodemoRenderedJoints rendered_joints;
+    AutodemoEvidenceCapture capture;
+    capture.object_world = object_world;
     for (size_t joint = 0;
          joint < interaction::kFlatControllerBoneCount;
          ++joint)
     {
         const int index = static_cast<int>(joint);
-        rendered_joints.positions[joint] = global_bone_positions(index);
-        rendered_joints.rotations[joint] =
+        capture.joint_positions[joint] = global_bone_positions(index);
+        capture.joint_rotations[joint] =
             quat_normalize(global_bone_rotations(index));
     }
-    return rendered_joints;
+
+    const interaction::RuntimeState state =
+        runtime_output.diagnostics.state;
+    const bool interaction_owned_state =
+        state == interaction::RuntimeState::PickupReplay ||
+        state == interaction::RuntimeState::Hold ||
+        state == interaction::RuntimeState::Carry;
+    const bool selected_target_agrees =
+        scene_target != nullptr &&
+        runtime_output.diagnostics.target == scene_target->handle;
+    if (!interaction_owned_state || !runtime_output.owns_pose ||
+        !selected_target_agrees)
+    {
+        return capture;
+    }
+
+    for (const interaction::GraspAffordance& affordance :
+         scene_target->affordances)
+    {
+        if (affordance.id == runtime_output.diagnostics.affordance_id &&
+            affordance.hand == runtime_output.diagnostics.hand)
+        {
+            capture.grasp_evidence_valid = true;
+            capture.active_hand_joint =
+                affordance.hand == interaction::Hand::Left ? 18 : 22;
+            capture.hand_in_object = affordance.hand_in_object;
+            capture.grasp_world = interaction::compose(capture.object_world, capture.hand_in_object);
+            break;
+        }
+    }
+    return capture;
 }
 
 std::filesystem::path autodemo_normalized_path(
@@ -1978,19 +2017,44 @@ void write_autodemo_record(
     const interaction::RuntimeOutput& runtime_output,
     int carry_command_frame,
     vec3 root_position,
-    vec3 object_position,
     float root_displacement_m,
-    const AutodemoRenderedJoints& rendered_joints,
+    const AutodemoEvidenceCapture& capture,
     AutodemoAction action)
 {
+    const auto finite_quaternion = [](quat rotation)
+    {
+        return autodemo_is_finite(rotation.w) &&
+            autodemo_is_finite(rotation.x) &&
+            autodemo_is_finite(rotation.y) &&
+            autodemo_is_finite(rotation.z);
+    };
+    const auto finite_transform = [&](const interaction::Transform& transform)
+    {
+        return autodemo_is_finite(transform.position.x) &&
+            autodemo_is_finite(transform.position.y) &&
+            autodemo_is_finite(transform.position.z) &&
+            finite_quaternion(transform.rotation);
+    };
+    const bool active_hand_is_valid =
+        capture.active_hand_joint == 18 || capture.active_hand_joint == 22;
+    const interaction::RuntimeState runtime_state =
+        runtime_output.diagnostics.state;
+    const bool interaction_owned_state =
+        runtime_state == interaction::RuntimeState::PickupReplay ||
+        runtime_state == interaction::RuntimeState::Hold ||
+        runtime_state == interaction::RuntimeState::Carry;
     if (scheduler_phase < 0 || scheduler_phase >= 60 ||
         !autodemo_is_finite(root_position.x) ||
         !autodemo_is_finite(root_position.y) ||
         !autodemo_is_finite(root_position.z) ||
-        !autodemo_is_finite(object_position.x) ||
-        !autodemo_is_finite(object_position.y) ||
-        !autodemo_is_finite(object_position.z) ||
-        !autodemo_is_finite(root_displacement_m))
+        !autodemo_is_finite(root_displacement_m) ||
+        !finite_transform(capture.object_world) ||
+        !finite_transform(capture.hand_in_object) ||
+        !finite_transform(capture.grasp_world) ||
+        capture.grasp_evidence_valid != active_hand_is_valid ||
+        (!capture.grasp_evidence_valid &&
+         capture.active_hand_joint != -1) ||
+        (interaction_owned_state && !capture.grasp_evidence_valid))
     {
         throw std::runtime_error("autodemo evidence contains invalid values");
     }
@@ -2000,8 +2064,8 @@ void write_autodemo_record(
          joint < interaction::kFlatControllerBoneCount;
          ++joint)
     {
-        const vec3 position = rendered_joints.positions[joint];
-        const quat rotation = rendered_joints.rotations[joint];
+        const vec3 position = capture.joint_positions[joint];
+        const quat rotation = capture.joint_rotations[joint];
         if (!autodemo_is_finite(position.x) ||
             !autodemo_is_finite(position.y) ||
             !autodemo_is_finite(position.z) ||
@@ -2054,15 +2118,42 @@ void write_autodemo_record(
         << ",\"root_position\":["
         << root_position.x << ',' << root_position.y << ',' << root_position.z
         << "],\"object_position\":["
-        << object_position.x << ',' << object_position.y << ','
-        << object_position.z
+        << capture.object_world.position.x << ','
+        << capture.object_world.position.y << ','
+        << capture.object_world.position.z
+        << "],\"grasp_evidence_valid\":"
+        << (capture.grasp_evidence_valid ? "true" : "false")
+        << ",\"active_hand_joint\":" << capture.active_hand_joint
+        << ",\"object_world_rotation\":["
+        << capture.object_world.rotation.w << ','
+        << capture.object_world.rotation.x << ','
+        << capture.object_world.rotation.y << ','
+        << capture.object_world.rotation.z
+        << "],\"hand_in_object_position\":["
+        << capture.hand_in_object.position.x << ','
+        << capture.hand_in_object.position.y << ','
+        << capture.hand_in_object.position.z
+        << "],\"hand_in_object_rotation\":["
+        << capture.hand_in_object.rotation.w << ','
+        << capture.hand_in_object.rotation.x << ','
+        << capture.hand_in_object.rotation.y << ','
+        << capture.hand_in_object.rotation.z
+        << "],\"grasp_world_position\":["
+        << capture.grasp_world.position.x << ','
+        << capture.grasp_world.position.y << ','
+        << capture.grasp_world.position.z
+        << "],\"grasp_world_rotation\":["
+        << capture.grasp_world.rotation.w << ','
+        << capture.grasp_world.rotation.x << ','
+        << capture.grasp_world.rotation.y << ','
+        << capture.grasp_world.rotation.z
         << "],\"root_displacement_m\":" << root_displacement_m
         << ",\"joint_world_positions\":[";
     for (size_t joint = 0;
          joint < interaction::kFlatControllerBoneCount;
          ++joint)
     {
-        const vec3 position = rendered_joints.positions[joint];
+        const vec3 position = capture.joint_positions[joint];
         output << (joint == 0U ? "" : ",") << '['
             << position.x << ',' << position.y << ',' << position.z << ']';
     }
@@ -2071,7 +2162,7 @@ void write_autodemo_record(
          joint < interaction::kFlatControllerBoneCount;
          ++joint)
     {
-        const quat rotation = rendered_joints.rotations[joint];
+        const quat rotation = capture.joint_rotations[joint];
         output << (joint == 0U ? "" : ",") << '['
             << rotation.w << ',' << rotation.x << ','
             << rotation.y << ',' << rotation.z << ']';
@@ -3754,12 +3845,15 @@ int main(void)
             adjusted_bone_rotations,
             db.bone_parents);
 
-        std::optional<AutodemoRenderedJoints> autodemo_rendered_joints;
+        std::optional<AutodemoEvidenceCapture> autodemo_evidence_capture;
         if (autodemo_configuration.has_value())
         {
-            autodemo_rendered_joints = capture_autodemo_rendered_joints(
+            autodemo_evidence_capture = capture_autodemo_evidence(
                 global_bone_positions,
-                global_bone_rotations);
+                global_bone_rotations,
+                interaction_output,
+                interaction_scene_target,
+                interaction_scene_state.object_world);
         }
         
         // Update camera
@@ -4316,9 +4410,8 @@ int main(void)
                     interaction_output,
                     autodemo_carry_command_frame,
                     displayed_root,
-                    interaction_scene_state.object_world.position,
                     root_displacement_m,
-                    autodemo_rendered_joints.value(),
+                    autodemo_evidence_capture.value(),
                     autodemo_action);
 
                 if (!autodemo_state.carry_origin_captured &&

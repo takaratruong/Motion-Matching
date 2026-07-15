@@ -25,6 +25,13 @@ EXPECTED_KEYS = (
     "carry_command_frame",
     "root_position",
     "object_position",
+    "grasp_evidence_valid",
+    "active_hand_joint",
+    "object_world_rotation",
+    "hand_in_object_position",
+    "hand_in_object_rotation",
+    "grasp_world_position",
+    "grasp_world_rotation",
     "root_displacement_m",
     "joint_world_positions",
     "joint_world_rotations",
@@ -121,6 +128,8 @@ FLAT_JOINT_NAMES = (
 JOINT_TRANSLATION_LIMIT_M = 0.20
 JOINT_ROTATION_LIMIT_DEGREES = 60.0
 JOINT_QUATERNION_NORM_TOLERANCE = 1.0e-3
+GRASP_COMPOSITION_TOLERANCE = 1.0e-5
+GRASP_EVIDENCE_STATES = ("PickupReplay", "Hold", "Carry")
 
 
 def _error(message: str) -> EvidenceValidationError:
@@ -161,6 +170,64 @@ def _require_position(record: dict, name: str) -> None:
     for component in value:
         if type(component) not in (int, float) or not math.isfinite(component):
             raise _error(f"{name} must contain only finite numbers")
+
+
+def _require_quaternion(record: dict, name: str) -> None:
+    value = record[name]
+    if type(value) is not list or len(value) != 4:
+        raise _error(f"{name} must contain exactly four numbers")
+    if any(
+        type(component) not in (int, float) or not math.isfinite(component)
+        for component in value
+    ):
+        raise _error(f"{name} must contain only finite numbers")
+    norm = math.sqrt(sum(component * component for component in value))
+    norm_error = abs(norm - 1.0)
+    if norm_error > JOINT_QUATERNION_NORM_TOLERANCE:
+        raise _error(
+            f"{name} quaternion norm error {norm_error:.6f} exceeds max "
+            f"{JOINT_QUATERNION_NORM_TOLERANCE:.6f}"
+        )
+
+
+def _quaternion_multiply(left: list[float], right: list[float]) -> list[float]:
+    lw, lx, ly, lz = left
+    rw, rx, ry, rz = right
+    result = [
+        lw * rw - lx * rx - ly * ry - lz * rz,
+        lw * rx + lx * rw + ly * rz - lz * ry,
+        lw * ry - lx * rz + ly * rw + lz * rx,
+        lw * rz + lx * ry - ly * rx + lz * rw,
+    ]
+    norm = math.sqrt(sum(component * component for component in result))
+    return [component / norm for component in result]
+
+
+def _quaternion_rotate(rotation: list[float], value: list[float]) -> list[float]:
+    _, x, y, z = rotation
+    vector = (x, y, z)
+
+    def cross(left, right):
+        return (
+            left[1] * right[2] - left[2] * right[1],
+            left[2] * right[0] - left[0] * right[2],
+            left[0] * right[1] - left[1] * right[0],
+        )
+
+    twice_cross = tuple(2.0 * component for component in cross(vector, value))
+    nested_cross = cross(vector, twice_cross)
+    return [
+        value[index]
+        + rotation[0] * twice_cross[index]
+        + nested_cross[index]
+        for index in range(3)
+    ]
+
+
+def _quaternion_sign_distance(left: list[float], right: list[float]) -> float:
+    same = math.sqrt(sum((a - b) ** 2 for a, b in zip(left, right)))
+    opposite = math.sqrt(sum((a + b) ** 2 for a, b in zip(left, right)))
+    return min(same, opposite)
 
 
 def _require_joint_world_arrays(record: dict) -> None:
@@ -227,6 +294,53 @@ def _validate_record_types(record: dict) -> None:
     _require_integer(record, "carry_command_frame", -1, 149)
     _require_position(record, "root_position")
     _require_position(record, "object_position")
+    if type(record["grasp_evidence_valid"]) is not bool:
+        raise _error("grasp_evidence_valid must be a JSON boolean")
+    active_hand_joint = record["active_hand_joint"]
+    if type(active_hand_joint) is not int or active_hand_joint not in (-1, 18, 22):
+        raise _error("active_hand_joint must be exactly -1, 18, or 22")
+    if record["grasp_evidence_valid"] != (active_hand_joint in (18, 22)):
+        raise _error(
+            "active_hand_joint must be -1 exactly when grasp evidence is invalid"
+        )
+    _require_quaternion(record, "object_world_rotation")
+    _require_position(record, "hand_in_object_position")
+    _require_quaternion(record, "hand_in_object_rotation")
+    _require_position(record, "grasp_world_position")
+    _require_quaternion(record, "grasp_world_rotation")
+    if (
+        record["state"] in GRASP_EVIDENCE_STATES
+        and not record["grasp_evidence_valid"]
+    ):
+        raise _error(
+            f'{record["state"]} requires valid selected-grasp evidence'
+        )
+    if record["grasp_evidence_valid"]:
+        rotated_local = _quaternion_rotate(
+            record["object_world_rotation"],
+            record["hand_in_object_position"],
+        )
+        expected_position = [
+            object_component + local_component
+            for object_component, local_component in zip(
+                record["object_position"], rotated_local
+            )
+        ]
+        expected_rotation = _quaternion_multiply(
+            record["object_world_rotation"],
+            record["hand_in_object_rotation"],
+        )
+        if (
+            math.dist(expected_position, record["grasp_world_position"])
+            > GRASP_COMPOSITION_TOLERANCE
+            or _quaternion_sign_distance(
+                expected_rotation, record["grasp_world_rotation"]
+            )
+            > GRASP_COMPOSITION_TOLERANCE
+        ):
+            raise _error(
+                "grasp_world must equal object_world * hand_in_object"
+            )
     displacement = record["root_displacement_m"]
     if type(displacement) not in (int, float) or not math.isfinite(displacement):
         raise _error("root_displacement_m must be a finite number")
@@ -468,6 +582,66 @@ def validate_evidence(records: list[dict]) -> None:
         raise _error("final evidence record must be successful Reset to Locomotion")
 
 
+def summarize_grasp_alignment(records: list[dict]) -> list[dict]:
+    summaries = []
+    for state in GRASP_EVIDENCE_STATES:
+        state_records = [
+            record
+            for record in records
+            if record["state"] == state and record["grasp_evidence_valid"]
+        ]
+        if not state_records:
+            continue
+
+        active_joints = {record["active_hand_joint"] for record in state_records}
+        if len(active_joints) != 1:
+            raise _error(f"{state} changes active_hand_joint within the state")
+        active_hand_joint = next(iter(active_joints))
+
+        position_errors = []
+        orientation_errors = []
+        for record in state_records:
+            hand_position = record["joint_world_positions"][active_hand_joint]
+            hand_rotation = record["joint_world_rotations"][active_hand_joint]
+            position_errors.append(
+                math.dist(hand_position, record["grasp_world_position"])
+            )
+            orientation_errors.append(
+                _joint_rotation_step_degrees(
+                    hand_rotation, record["grasp_world_rotation"]
+                )
+            )
+
+        position_max_index = max(
+            range(len(position_errors)), key=position_errors.__getitem__
+        )
+        orientation_max_index = max(
+            range(len(orientation_errors)), key=orientation_errors.__getitem__
+        )
+        summaries.append(
+            {
+                "state": state,
+                "count": len(state_records),
+                "position_mean_m": sum(position_errors) / len(position_errors),
+                "position_max_m": position_errors[position_max_index],
+                "position_max_frame": state_records[position_max_index][
+                    "render_frame"
+                ],
+                "orientation_mean_degrees": (
+                    sum(orientation_errors) / len(orientation_errors)
+                ),
+                "orientation_max_degrees": orientation_errors[
+                    orientation_max_index
+                ],
+                "orientation_max_frame": state_records[
+                    orientation_max_index
+                ]["render_frame"],
+                "active_hand_joint_name": FLAT_JOINT_NAMES[active_hand_joint],
+            }
+        )
+    return summaries
+
+
 def validate_screenshot(path: Path) -> None:
     path = Path(path)
     try:
@@ -549,6 +723,13 @@ def _record_line(record: dict) -> str:
         f'"carry_command_frame":{record["carry_command_frame"]},'
         f'"root_position":{position("root_position")},'
         f'"object_position":{position("object_position")},'
+        f'"grasp_evidence_valid":{boolean("grasp_evidence_valid")},'
+        f'"active_hand_joint":{record["active_hand_joint"]},'
+        f'"object_world_rotation":{position("object_world_rotation")},'
+        f'"hand_in_object_position":{position("hand_in_object_position")},'
+        f'"hand_in_object_rotation":{position("hand_in_object_rotation")},'
+        f'"grasp_world_position":{position("grasp_world_position")},'
+        f'"grasp_world_rotation":{position("grasp_world_rotation")},'
         f'"root_displacement_m":{record["root_displacement_m"]:.6f},'
         f'"joint_world_positions":{joint_vectors("joint_world_positions")},'
         f'"joint_world_rotations":{joint_vectors("joint_world_rotations")},'
@@ -620,6 +801,12 @@ def _valid_records() -> list[dict]:
         elif state == "Carry":
             result = "Succeeded"
 
+        object_position = [
+            0.0 if render_frame == len(states) - 1 else root_x,
+            0.75 if render_frame == len(states) - 1 else 0.95,
+            3.0,
+        ]
+        grasp_evidence_valid = state in {"PickupReplay", "Hold", "Carry"}
         record = {
             "render_frame": render_frame,
             "runtime_tick": runtime_tick,
@@ -633,11 +820,17 @@ def _valid_records() -> list[dict]:
             "carry_mode": "layered" if state == "Carry" else "none",
             "carry_command_frame": carry_command_frame,
             "root_position": [root_x, 0.0, 2.0],
-            "object_position": [
-                0.0 if render_frame == len(states) - 1 else root_x,
-                0.75 if render_frame == len(states) - 1 else 0.95,
-                3.0,
-            ],
+            "object_position": object_position,
+            "grasp_evidence_valid": grasp_evidence_valid,
+            "active_hand_joint": 22 if grasp_evidence_valid else -1,
+            "object_world_rotation": [1.0, 0.0, 0.0, 0.0],
+            "hand_in_object_position": [0.0, 0.0, 0.0],
+            "hand_in_object_rotation": [1.0, 0.0, 0.0, 0.0],
+            "grasp_world_position": (
+                copy.deepcopy(object_position)
+                if grasp_evidence_valid else [0.0, 0.0, 0.0]
+            ),
+            "grasp_world_rotation": [1.0, 0.0, 0.0, 0.0],
             "root_displacement_m": root_x,
             "joint_world_positions": [
                 [root_x, 0.05 * joint, 2.0]
@@ -701,6 +894,181 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
         records = load_evidence(self.log)
         validate_evidence(records)
         validate_screenshot(self.screenshot)
+
+    def test_grasp_fields_have_exact_fixed_order(self):
+        self.assertEqual(
+            EXPECTED_KEYS,
+            (
+                "render_frame", "runtime_tick", "scheduler_phase", "state",
+                "result", "reason", "object_state", "attached", "owns_pose",
+                "carry_mode", "carry_command_frame", "root_position",
+                "object_position", "grasp_evidence_valid",
+                "active_hand_joint", "object_world_rotation",
+                "hand_in_object_position", "hand_in_object_rotation",
+                "grasp_world_position", "grasp_world_rotation",
+                "root_displacement_m", "joint_world_positions",
+                "joint_world_rotations", "action",
+            ),
+        )
+
+    def test_active_hand_joint_accepts_only_invalid_left_or_right(self):
+        record = copy.deepcopy(_valid_records()[36])
+        for valid, joint in ((False, -1), (True, 18), (True, 22)):
+            with self.subTest(valid=valid, joint=joint):
+                candidate = copy.deepcopy(record)
+                candidate["grasp_evidence_valid"] = valid
+                candidate["active_hand_joint"] = joint
+                if not valid:
+                    candidate["state"] = "Align"
+                _validate_record_types(candidate)
+
+        for joint in (True, -2, 0, 17, 19, 23):
+            with self.subTest(invalid_joint=joint):
+                candidate = copy.deepcopy(record)
+                candidate["active_hand_joint"] = joint
+                with self.assertRaisesRegex(
+                    EvidenceValidationError, "active_hand_joint"
+                ):
+                    _validate_record_types(candidate)
+
+        for valid, joint in ((False, 22), (True, -1)):
+            with self.subTest(invalid_pair=(valid, joint)):
+                candidate = copy.deepcopy(record)
+                candidate["grasp_evidence_valid"] = valid
+                candidate["active_hand_joint"] = joint
+                with self.assertRaisesRegex(
+                    EvidenceValidationError, "active_hand_joint"
+                ):
+                    _validate_record_types(candidate)
+
+        for invalid_validity in (0, 1):
+            with self.subTest(invalid_validity=invalid_validity):
+                candidate = copy.deepcopy(record)
+                candidate["grasp_evidence_valid"] = invalid_validity
+                with self.assertRaisesRegex(
+                    EvidenceValidationError, "grasp_evidence_valid"
+                ):
+                    _validate_record_types(candidate)
+
+    def test_owned_interaction_states_require_valid_grasp_evidence(self):
+        for state in ("PickupReplay", "Hold", "Carry"):
+            with self.subTest(state=state):
+                record = next(
+                    copy.deepcopy(item)
+                    for item in _valid_records()
+                    if item["state"] == state
+                )
+                record["grasp_evidence_valid"] = False
+                record["active_hand_joint"] = -1
+                with self.assertRaisesRegex(
+                    EvidenceValidationError,
+                    "requires valid selected-grasp evidence",
+                ):
+                    _validate_record_types(record)
+
+    def test_grasp_vectors_are_finite_and_quaternions_are_unit(self):
+        record = copy.deepcopy(_valid_records()[36])
+        for field in (
+            "hand_in_object_position",
+            "grasp_world_position",
+        ):
+            with self.subTest(field=field, failure="nonfinite"):
+                candidate = copy.deepcopy(record)
+                candidate[field][1] = math.inf
+                with self.assertRaisesRegex(EvidenceValidationError, field):
+                    _validate_record_types(candidate)
+
+        for field in (
+            "object_world_rotation",
+            "hand_in_object_rotation",
+            "grasp_world_rotation",
+        ):
+            with self.subTest(field=field, failure="nonfinite"):
+                candidate = copy.deepcopy(record)
+                candidate[field][2] = math.nan
+                with self.assertRaisesRegex(EvidenceValidationError, field):
+                    _validate_record_types(candidate)
+            with self.subTest(field=field, failure="nonunit"):
+                candidate = copy.deepcopy(record)
+                candidate[field] = [0.0, 0.0, 0.0, 0.0]
+                with self.assertRaisesRegex(
+                    EvidenceValidationError, rf"{field}.*quaternion norm"
+                ):
+                    _validate_record_types(candidate)
+
+    def test_grasp_world_is_exact_object_hand_composition_up_to_quaternion_sign(self):
+        record = copy.deepcopy(_valid_records()[36])
+        half_sqrt_two = math.sqrt(0.5)
+        record.update(
+            object_position=[1.0, 2.0, 3.0],
+            object_world_rotation=[half_sqrt_two, 0.0, 0.0, half_sqrt_two],
+            hand_in_object_position=[1.0, 0.0, 0.0],
+            hand_in_object_rotation=[half_sqrt_two, half_sqrt_two, 0.0, 0.0],
+            grasp_world_position=[1.0, 3.0, 3.0],
+            grasp_world_rotation=[-0.5, -0.5, -0.5, -0.5],
+        )
+        _validate_record_types(record)
+
+        for field, component in (
+            ("grasp_world_position", 0),
+            ("grasp_world_rotation", 1),
+        ):
+            with self.subTest(field=field):
+                candidate = copy.deepcopy(record)
+                candidate[field][component] += 0.01
+                if field.endswith("rotation"):
+                    norm = math.sqrt(sum(value * value for value in candidate[field]))
+                    candidate[field] = [value / norm for value in candidate[field]]
+                with self.assertRaisesRegex(
+                    EvidenceValidationError, "object_world.*hand_in_object"
+                ):
+                    _validate_record_types(candidate)
+
+    def test_grasp_alignment_summary_is_deterministic_by_state(self):
+        summary_function = globals().get("summarize_grasp_alignment")
+        self.assertIsNotNone(
+            summary_function,
+            "grasp alignment summary function is missing",
+        )
+        if summary_function is None:
+            return
+
+        records = []
+        angle = math.radians(60.0)
+        for state_index, state in enumerate(("PickupReplay", "Hold", "Carry")):
+            for sample, distance in enumerate((1.0, 3.0)):
+                record = copy.deepcopy(_valid_records()[36])
+                record["render_frame"] = 10 * state_index + sample
+                record["state"] = state
+                record["active_hand_joint"] = 18 if state == "Hold" else 22
+                joint = record["active_hand_joint"]
+                record["grasp_world_position"] = [0.0, 0.0, 0.0]
+                record["joint_world_positions"][joint] = [distance, 0.0, 0.0]
+                record["grasp_world_rotation"] = [1.0, 0.0, 0.0, 0.0]
+                record["joint_world_rotations"][joint] = (
+                    [-1.0, 0.0, 0.0, 0.0]
+                    if sample == 0 else
+                    [math.cos(0.5 * angle), math.sin(0.5 * angle), 0.0, 0.0]
+                )
+                records.append(record)
+
+        summaries = summary_function(records)
+        self.assertEqual(
+            [summary["state"] for summary in summaries],
+            ["PickupReplay", "Hold", "Carry"],
+        )
+        for state_index, summary in enumerate(summaries):
+            self.assertEqual(summary["count"], 2)
+            self.assertAlmostEqual(summary["position_mean_m"], 2.0)
+            self.assertAlmostEqual(summary["position_max_m"], 3.0)
+            self.assertEqual(summary["position_max_frame"], 10 * state_index + 1)
+            self.assertAlmostEqual(summary["orientation_mean_degrees"], 30.0)
+            self.assertAlmostEqual(summary["orientation_max_degrees"], 60.0)
+            self.assertEqual(
+                summary["orientation_max_frame"], 10 * state_index + 1
+            )
+            expected_joint = "LeftHand" if summary["state"] == "Hold" else "RightHand"
+            self.assertEqual(summary["active_hand_joint_name"], expected_joint)
 
     def test_synthetic_fixture_changes_runtime_only_on_due_ticks(self):
         records = _valid_records()
@@ -1044,6 +1412,7 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
                 displacement = 0.20 * (command + 1) / 150.0
                 record["root_position"][0] = displacement
                 record["object_position"][0] = displacement
+                record["grasp_world_position"][0] = displacement
                 record["root_displacement_m"] = displacement
         _write_records(self.log, records)
         with self.assertRaises(EvidenceValidationError):
@@ -1059,6 +1428,9 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
         for record in records:
             if record["state"] == "Carry":
                 record["object_position"] = copy.deepcopy(first_carry_object)
+                record["grasp_world_position"] = copy.deepcopy(
+                    first_carry_object
+                )
         _write_records(self.log, records)
         with self.assertRaisesRegex(
             EvidenceValidationError,
@@ -1436,56 +1808,88 @@ class Task12PolicyTests(unittest.TestCase):
             ),
         )
 
-    def test_autodemo_samples_all_rendered_joints_after_final_fk_before_draw(self):
+    def test_autodemo_captures_selected_grasp_and_rendered_hand_after_final_fk_before_draw(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")
         final_fk = controller.index("        forward_kinematics_full(")
-        capture = controller.index(
-            "capture_autodemo_rendered_joints(", final_fk
-        )
+        capture = controller.index("capture_autodemo_evidence(", final_fk)
         draw = controller.index("        BeginDrawing();", final_fk)
         self.assertLess(
             final_fk,
             capture,
-            "autodemo joints must be sampled after final foot-IK FK",
+            "autodemo evidence must be sampled after final foot-IK FK",
         )
         self.assertLess(
             capture,
             draw,
-            "autodemo joints must be sampled before drawing",
+            "autodemo evidence must be sampled before drawing",
         )
         self.assertEqual(
-            controller[final_fk:draw].count(
-                "capture_autodemo_rendered_joints("
-            ),
+            controller[final_fk:draw].count("capture_autodemo_evidence("),
             1,
-            "autodemo must capture one final rendered-joint sample",
+            "autodemo must capture one immutable final evidence sample",
         )
 
         capture_function = self._cpp_function(
             controller,
-            "AutodemoRenderedJoints capture_autodemo_rendered_joints(",
+            "AutodemoEvidenceCapture capture_autodemo_evidence(",
         )
         self.assertIn("interaction::kFlatControllerBoneCount", capture_function)
         self.assertIn("global_bone_positions.size", capture_function)
         self.assertIn("global_bone_rotations.size", capture_function)
         self.assertIn("quat_normalize(global_bone_rotations", capture_function)
+        self.assertIn(
+            "runtime_output.diagnostics.target == scene_target->handle",
+            capture_function,
+            "grasp capture must agree with the exact selected target handle",
+        )
+        self.assertIn(
+            "affordance.id == runtime_output.diagnostics.affordance_id",
+            capture_function,
+            "grasp capture must resolve the exact selected affordance",
+        )
+        self.assertIn(
+            "affordance.hand == runtime_output.diagnostics.hand",
+            capture_function,
+            "grasp capture must agree with the selected runtime hand",
+        )
+        self.assertIn(
+            "interaction::compose(capture.object_world, capture.hand_in_object)",
+            capture_function,
+            "grasp capture must derive the world transform from scene authority",
+        )
 
         writer = self._cpp_function(controller, "void write_autodemo_record(")
         self.assertIn(
-            "const AutodemoRenderedJoints& rendered_joints,",
+            "const AutodemoEvidenceCapture& capture,",
             writer,
-            "JSON writer must consume the post-final-FK joint capture",
+            "JSON writer must consume the immutable post-final-FK capture",
         )
         self.assertNotIn("global_bone_positions", writer)
         self.assertNotIn("global_bone_rotations", writer)
+        self.assertNotIn("interaction_scene_state", writer)
+        self.assertNotIn("interaction_scene_target", writer)
         self.assertIn(
-            "const vec3 position = rendered_joints.positions[joint];",
+            "const vec3 position = capture.joint_positions[joint];",
             writer,
         )
         self.assertIn(
-            "const quat rotation = rendered_joints.rotations[joint];",
+            "const quat rotation = capture.joint_rotations[joint];",
             writer,
         )
+        for member in (
+            "capture.grasp_evidence_valid",
+            "capture.active_hand_joint",
+            "capture.object_world.rotation",
+            "capture.hand_in_object.position",
+            "capture.hand_in_object.rotation",
+            "capture.grasp_world.position",
+            "capture.grasp_world.rotation",
+        ):
+            self.assertIn(
+                member,
+                writer,
+                f"JSON writer must serialize {member} from the capture",
+            )
         self.assertIn('\\"joint_world_positions\\":[', writer)
         self.assertIn('\\"joint_world_rotations\\":[', writer)
 
@@ -1495,9 +1899,9 @@ class Task12PolicyTests(unittest.TestCase):
             "                if (!autodemo_state.carry_origin_captured",
         )
         self.assertEqual(
-            writer_call.count("autodemo_rendered_joints.value()"),
+            writer_call.count("autodemo_evidence_capture.value()"),
             1,
-            "JSON writer must receive exactly the final rendered-joint value",
+            "JSON writer must receive exactly the immutable final capture",
         )
 
     def test_canonical_world_is_initialized_once_before_log_and_update(self):
