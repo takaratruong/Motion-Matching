@@ -70,6 +70,12 @@ private:
     int32_t recorded_range_index_ = -1;
     double source_frame_exact_ = 0.0;
     double search_seconds_exact_ = 0.0;
+    Pose transition_source_pose_{};
+    float transition_progress_ = 0.0F;
+    int64_t recorded_selection_epoch_ = 0;
+    int64_t published_seam_key_ = -2;
+    int64_t transition_seam_key_ = -2;
+    bool transition_active_ = false;
 };
 
 }  // namespace interaction

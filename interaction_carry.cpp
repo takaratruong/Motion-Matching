@@ -17,8 +17,10 @@ namespace {
 constexpr size_t kVectorComponents = 3U;
 constexpr size_t kQuaternionComponents = 4U;
 constexpr size_t kHandCount = 2U;
-constexpr float kLayeredTransitionSeconds = 0.50F;
-constexpr int32_t kLayeredTransitionAttempts = 8;
+constexpr float kCarrySeamSeconds = 0.50F;
+constexpr int32_t kCarrySeamAttempts = 8;
+constexpr int64_t kLayeredSeamKey = -1;
+constexpr int64_t kUnsetSeamKey = -2;
 bool finite(float value) {
     return std::isfinite(value);
 }
@@ -638,10 +640,12 @@ Pose remap_safe_pose_to_live_root(
     return remapped;
 }
 
-Pose blend_layered_transition(
+Pose blend_carry_transition(
     const Pose& safe,
     const Pose& target,
+    const Pose& active_arm_source,
     Hand active_hand,
+    bool preserve_active_arm,
     float alpha) {
     Pose blended = safe;
     for (size_t bone = 0U; bone < g1_skeleton::BoneCount; ++bone) {
@@ -673,13 +677,23 @@ Pose blend_layered_transition(
             (1.0F - alpha) * safe.hand_dof_velocities[dof] +
             alpha * target.hand_dof_velocities[dof];
     }
-    for (const HingeJoint& joint : arm(active_hand)) {
-        const size_t bone = static_cast<size_t>(joint.bone);
-        blended.rotations[bone] = safe.rotations[bone];
+    if (preserve_active_arm) {
+        for (const HingeJoint& joint : arm(active_hand)) {
+            const size_t bone = static_cast<size_t>(joint.bone);
+            blended.rotations[bone] = active_arm_source.rotations[bone];
+        }
     }
     blended.foot_contacts = target.foot_contacts;
     return blended;
 }
+
+struct CarryCandidate {
+    Pose pose{};
+    Transform object{};
+    bool recorded = false;
+    bool directly_solved = false;
+    int64_t seam_key = kLayeredSeamKey;
+};
 
 class CarryUpdateTransaction {
 public:
@@ -691,7 +705,13 @@ public:
         bool& search_pending,
         int32_t& recorded_range_index,
         double& source_frame_exact,
-        double& search_seconds_exact) noexcept
+        double& search_seconds_exact,
+        Pose& transition_source_pose,
+        float& transition_progress,
+        int64_t& recorded_selection_epoch,
+        int64_t& published_seam_key,
+        int64_t& transition_seam_key,
+        bool& transition_active) noexcept
         : object_world_(object_world),
           object_in_root_(object_in_root),
           recorded_(recorded),
@@ -700,6 +720,12 @@ public:
           recorded_range_index_(recorded_range_index),
           source_frame_exact_(source_frame_exact),
           search_seconds_exact_(search_seconds_exact),
+          transition_source_pose_(transition_source_pose),
+          transition_progress_(transition_progress),
+          recorded_selection_epoch_(recorded_selection_epoch),
+          published_seam_key_(published_seam_key),
+          transition_seam_key_(transition_seam_key),
+          transition_active_(transition_active),
           previous_object_world_(object_world),
           previous_object_in_root_(object_in_root),
           previous_recorded_(recorded),
@@ -707,7 +733,13 @@ public:
           previous_search_pending_(search_pending),
           previous_recorded_range_index_(recorded_range_index),
           previous_source_frame_exact_(source_frame_exact),
-          previous_search_seconds_exact_(search_seconds_exact) {}
+          previous_search_seconds_exact_(search_seconds_exact),
+          previous_transition_source_pose_(transition_source_pose),
+          previous_transition_progress_(transition_progress),
+          previous_recorded_selection_epoch_(recorded_selection_epoch),
+          previous_published_seam_key_(published_seam_key),
+          previous_transition_seam_key_(transition_seam_key),
+          previous_transition_active_(transition_active) {}
 
     ~CarryUpdateTransaction() noexcept {
         if (committed_) return;
@@ -719,6 +751,12 @@ public:
         recorded_range_index_ = previous_recorded_range_index_;
         source_frame_exact_ = previous_source_frame_exact_;
         search_seconds_exact_ = previous_search_seconds_exact_;
+        transition_source_pose_ = previous_transition_source_pose_;
+        transition_progress_ = previous_transition_progress_;
+        recorded_selection_epoch_ = previous_recorded_selection_epoch_;
+        published_seam_key_ = previous_published_seam_key_;
+        transition_seam_key_ = previous_transition_seam_key_;
+        transition_active_ = previous_transition_active_;
     }
 
     CarryUpdateTransaction(const CarryUpdateTransaction&) = delete;
@@ -737,6 +775,12 @@ private:
     int32_t& recorded_range_index_;
     double& source_frame_exact_;
     double& search_seconds_exact_;
+    Pose& transition_source_pose_;
+    float& transition_progress_;
+    int64_t& recorded_selection_epoch_;
+    int64_t& published_seam_key_;
+    int64_t& transition_seam_key_;
+    bool& transition_active_;
     Transform previous_object_world_{};
     Transform previous_object_in_root_{};
     bool previous_recorded_ = false;
@@ -745,6 +789,12 @@ private:
     int32_t previous_recorded_range_index_ = -1;
     double previous_source_frame_exact_ = 0.0;
     double previous_search_seconds_exact_ = 0.0;
+    Pose previous_transition_source_pose_{};
+    float previous_transition_progress_ = 0.0F;
+    int64_t previous_recorded_selection_epoch_ = 0;
+    int64_t previous_published_seam_key_ = kUnsetSeamKey;
+    int64_t previous_transition_seam_key_ = kUnsetSeamKey;
+    bool previous_transition_active_ = false;
     bool committed_ = false;
 };
 
@@ -959,6 +1009,12 @@ void CarryController::start(
     recorded_range_index_ = -1;
     source_frame_exact_ = 0.0;
     search_seconds_exact_ = 0.0;
+    transition_source_pose_ = final_hold_pose;
+    transition_progress_ = 0.0F;
+    recorded_selection_epoch_ = 0;
+    published_seam_key_ = kUnsetSeamKey;
+    transition_seam_key_ = kUnsetSeamKey;
+    transition_active_ = false;
 }
 
 Pose CarryController::update(
@@ -979,7 +1035,13 @@ Pose CarryController::update(
         search_pending_,
         recorded_range_index_,
         source_frame_exact_,
-        search_seconds_exact_);
+        search_seconds_exact_,
+        transition_source_pose_,
+        transition_progress_,
+        recorded_selection_epoch_,
+        published_seam_key_,
+        transition_seam_key_,
+        transition_active_);
     const Transform live_root = root_transform(locomotion.pose);
     const Transform desired_object = compose(live_root, object_in_root_);
     if (!valid_transform(desired_object)) {
@@ -1066,6 +1128,12 @@ Pose CarryController::update(
         if (!continue_current) {
             recorded_range_index_ = best_range;
             if (best_frame >= 0) {
+                if (recorded_selection_epoch_ ==
+                    std::numeric_limits<int64_t>::max()) {
+                    throw std::invalid_argument(
+                        "interaction carry recorded selection overflow");
+                }
+                ++recorded_selection_epoch_;
                 const CarryRange& selected = ranges_.recorded[
                     static_cast<size_t>(best_range)];
                 source_frame_exact_ = terminal_current
@@ -1077,6 +1145,8 @@ Pose CarryController::update(
         }
     }
 
+    CarryCandidate candidate{};
+    bool candidate_ready = false;
     if (recorded_range_index_ >= 0) {
         const CarryRange& range = ranges_.recorded.at(
             static_cast<size_t>(recorded_range_index_));
@@ -1092,19 +1162,14 @@ Pose CarryController::update(
         const Transform source_root = root_transform(recorded_pose);
         const Transform alignment = planar_alignment(
             source_root, root_transform(locomotion.pose));
-        const Transform mapped_root = compose(alignment, source_root);
         recorded_pose.positions[g1_skeleton::Simulation] =
-            mapped_root.position;
+            locomotion.pose.positions[g1_skeleton::Simulation];
         recorded_pose.rotations[g1_skeleton::Simulation] =
-            mapped_root.rotation;
-        recorded_pose.velocities[g1_skeleton::Simulation] = quat_mul_vec3(
-            alignment.rotation,
-            recorded_pose.velocities[g1_skeleton::Simulation]);
+            locomotion.pose.rotations[g1_skeleton::Simulation];
+        recorded_pose.velocities[g1_skeleton::Simulation] =
+            locomotion.pose.velocities[g1_skeleton::Simulation];
         recorded_pose.angular_velocities[g1_skeleton::Simulation] =
-            quat_mul_vec3(
-                alignment.rotation,
-                recorded_pose.angular_velocities[
-                    g1_skeleton::Simulation]);
+            locomotion.pose.angular_velocities[g1_skeleton::Simulation];
 
         const Transform mapped_object = compose(
             alignment,
@@ -1138,128 +1203,215 @@ Pose CarryController::update(
                         published,
                         config_,
                         ik_config_)) {
-                    const Transform published_in_root = compose(
-                        inverse(live_root), published);
-                    if (!valid_transform(published_in_root)) {
-                        throw std::invalid_argument(
-                            "interaction carry invalid recorded solved grasp");
+                    if (recorded_selection_epoch_ <= 0) {
+                        throw std::logic_error(
+                            "interaction carry recorded selection lacks epoch");
                     }
-                    object_world_ = published;
-                    object_in_root_ = published_in_root;
-                    recorded_ = true;
-                    last_safe_pose_ = solved;
-                    transaction.commit();
-                    return solved;
+                    candidate.pose = solved;
+                    candidate.object = published;
+                    candidate.recorded = true;
+                    candidate.directly_solved = true;
+                    candidate.seam_key = recorded_selection_epoch_;
+                    candidate_ready = true;
                 }
             }
         }
     }
 
-    Pose output = locomotion.pose;
-    for (const HingeJoint& joint : arm(hand_)) {
-        const size_t bone = static_cast<size_t>(joint.bone);
-        output.rotations[bone] = final_hold_pose_.rotations[bone];
-    }
-    constexpr std::array<int32_t, 3> kSpine = {
-        g1_skeleton::Spine,
-        g1_skeleton::Spine1,
-        g1_skeleton::Spine2,
-    };
-    for (int32_t bone : kSpine) {
-        output.rotations[static_cast<size_t>(bone)] =
-            quat_nlerp_shortest(
-                locomotion.pose.rotations[static_cast<size_t>(bone)],
-                final_hold_pose_.rotations[static_cast<size_t>(bone)],
-                config_.spine_weight);
-    }
-    const Hand inactive = hand_ == Hand::Left ? Hand::Right : Hand::Left;
-    for (const HingeJoint& joint : arm(inactive)) {
-        const size_t bone = static_cast<size_t>(joint.bone);
-        output.rotations[bone] = quat_nlerp_shortest(
-            locomotion.pose.rotations[bone],
-            final_hold_pose_.rotations[bone],
-            config_.inactive_arm_weight);
+    if (!candidate_ready) {
+        Pose output = locomotion.pose;
+        for (const HingeJoint& joint : arm(hand_)) {
+            const size_t bone = static_cast<size_t>(joint.bone);
+            output.rotations[bone] = final_hold_pose_.rotations[bone];
+        }
+        constexpr std::array<int32_t, 3> kSpine = {
+            g1_skeleton::Spine,
+            g1_skeleton::Spine1,
+            g1_skeleton::Spine2,
+        };
+        for (int32_t bone : kSpine) {
+            output.rotations[static_cast<size_t>(bone)] =
+                quat_nlerp_shortest(
+                    locomotion.pose.rotations[static_cast<size_t>(bone)],
+                    final_hold_pose_.rotations[static_cast<size_t>(bone)],
+                    config_.spine_weight);
+        }
+        const Hand inactive = hand_ == Hand::Left
+            ? Hand::Right
+            : Hand::Left;
+        for (const HingeJoint& joint : arm(inactive)) {
+            const size_t bone = static_cast<size_t>(joint.bone);
+            output.rotations[bone] = quat_nlerp_shortest(
+                locomotion.pose.rotations[bone],
+                final_hold_pose_.rotations[bone],
+                config_.inactive_arm_weight);
+        }
+
+        const auto accept_layered = [&](Pose requested) {
+            Pose solved = requested;
+            const IKResult ik = solve_hand_ik(
+                solved,
+                hand_,
+                compose(desired_object, affordance_.hand_in_object),
+                ik_config_);
+            if (!ik.accepted) return false;
+            const Transform published = compose(
+                hand_transform(solved, hand_),
+                inverse(affordance_.hand_in_object));
+            if (!valid_transform(published)) {
+                throw std::invalid_argument(
+                    "interaction carry invalid layered solved grasp");
+            }
+            if (!continuous_object(
+                    desired_object, published, config_, ik_config_)) {
+                return false;
+            }
+            candidate.pose = solved;
+            candidate.object = published;
+            candidate.recorded = false;
+            candidate.directly_solved = true;
+            candidate.seam_key = kLayeredSeamKey;
+            return true;
+        };
+
+        candidate_ready = accept_layered(output);
+        if (!candidate_ready) {
+            Pose seeded = output;
+            for (const HingeJoint& joint : arm(hand_)) {
+                const size_t bone = static_cast<size_t>(joint.bone);
+                seeded.rotations[bone] = last_safe_pose_.rotations[bone];
+            }
+            candidate_ready = accept_layered(seeded);
+        }
+        if (!candidate_ready) {
+            candidate.pose = output;
+            candidate.object = desired_object;
+            candidate.recorded = false;
+            candidate.directly_solved = false;
+            candidate.seam_key = kLayeredSeamKey;
+            candidate_ready = true;
+        }
     }
 
-    Pose solved = output;
-    const IKResult ik = solve_hand_ik(
-        solved,
-        hand_,
-        compose(desired_object, affordance_.hand_in_object),
-        ik_config_);
-    if (!ik.accepted) {
-        const Pose safe = remap_safe_pose_to_live_root(
-            last_safe_pose_, locomotion.pose);
-        IKConfig transition_ik = ik_config_;
-        transition_ik.accepted_position_m = std::min(
-            transition_ik.accepted_position_m,
-            config_.maximum_grasp_drift_m);
-        transition_ik.accepted_orientation_radians = std::min(
-            transition_ik.accepted_orientation_radians,
-            config_.maximum_grasp_drift_radians);
-        float alpha = std::clamp(
-            dt / kLayeredTransitionSeconds, 0.0F, 1.0F);
-        for (int32_t attempt = 0;
-             attempt < kLayeredTransitionAttempts;
-             ++attempt) {
-            Pose transition = blend_layered_transition(
-                safe, output, hand_, alpha);
+    if (!candidate_ready || !valid_transform(candidate.object)) {
+        throw std::logic_error("interaction carry candidate was not produced");
+    }
+
+    const bool changed_key = transition_active_
+        ? candidate.seam_key != transition_seam_key_
+        : candidate.seam_key != published_seam_key_;
+    if (changed_key ||
+        (!transition_active_ && !candidate.directly_solved)) {
+        transition_source_pose_ = last_safe_pose_;
+        transition_progress_ = 0.0F;
+        transition_seam_key_ = candidate.seam_key;
+        transition_active_ = true;
+    }
+
+    if (!transition_active_) {
+        const Transform published_in_root = compose(
+            inverse(live_root), candidate.object);
+        if (!valid_transform(published_in_root)) {
+            throw std::invalid_argument(
+                "interaction carry invalid direct solved grasp");
+        }
+        object_world_ = candidate.object;
+        object_in_root_ = published_in_root;
+        recorded_ = candidate.recorded;
+        last_safe_pose_ = candidate.pose;
+        transaction.commit();
+        return candidate.pose;
+    }
+
+    const bool completed_before_update = transition_progress_ >= 1.0F;
+    const float requested_progress = std::min(
+        1.0F,
+        transition_progress_ + dt / kCarrySeamSeconds);
+    IKConfig transition_ik = ik_config_;
+    transition_ik.accepted_position_m = std::min(
+        transition_ik.accepted_position_m,
+        config_.maximum_grasp_drift_m);
+    transition_ik.accepted_orientation_radians = std::min(
+        transition_ik.accepted_orientation_radians,
+        config_.maximum_grasp_drift_radians);
+
+    float trial_progress = requested_progress;
+    for (int32_t attempt = 0; attempt < kCarrySeamAttempts; ++attempt) {
+        for (int preserve_index = 0; preserve_index < 2; ++preserve_index) {
+            const bool preserve_active_arm = preserve_index != 0;
+            Pose transition = blend_carry_transition(
+                transition_source_pose_,
+                candidate.pose,
+                last_safe_pose_,
+                hand_,
+                preserve_active_arm,
+                trial_progress);
             const IKResult transition_result = solve_hand_ik(
                 transition,
                 hand_,
-                compose(desired_object, affordance_.hand_in_object),
+                compose(candidate.object, affordance_.hand_in_object),
                 transition_ik);
-            if (transition_result.accepted) {
-                const Transform transition_object = compose(
-                    hand_transform(transition, hand_),
-                    inverse(affordance_.hand_in_object));
-                if (valid_transform(transition_object) &&
-                    continuous_object(
-                        desired_object,
-                        transition_object,
-                        config_,
-                        transition_ik)) {
-                    object_world_ = transition_object;
-                    recorded_ = false;
-                    last_safe_pose_ = transition;
-                    transaction.commit();
-                    return transition;
-                }
+            if (!transition_result.accepted) continue;
+            const Transform transition_object = compose(
+                hand_transform(transition, hand_),
+                inverse(affordance_.hand_in_object));
+            if (!valid_transform(transition_object) ||
+                !continuous_object(
+                    desired_object,
+                    transition_object,
+                    config_,
+                    transition_ik)) {
+                continue;
             }
-            alpha *= 0.5F;
+            const Transform transition_object_in_root = compose(
+                inverse(live_root), transition_object);
+            if (!valid_transform(transition_object_in_root)) {
+                throw std::invalid_argument(
+                    "interaction carry invalid transition solved grasp");
+            }
+            transition_progress_ = trial_progress;
+            object_world_ = transition_object;
+            object_in_root_ = transition_object_in_root;
+            recorded_ = candidate.recorded;
+            last_safe_pose_ = transition;
+            if (completed_before_update &&
+                trial_progress >= 1.0F &&
+                candidate.directly_solved &&
+                !preserve_active_arm) {
+                transition_active_ = false;
+                published_seam_key_ = candidate.seam_key;
+            }
+            transaction.commit();
+            return transition;
         }
+        if (!(trial_progress > transition_progress_)) break;
+        trial_progress = transition_progress_ +
+            0.5F * (trial_progress - transition_progress_);
+    }
 
-        const Transform safe_object = compose(
-            hand_transform(safe, hand_),
-            inverse(affordance_.hand_in_object));
-        if (!valid_transform(safe_object) ||
-            !continuous_object(
-                desired_object, safe_object, config_, transition_ik)) {
-            throw std::invalid_argument(
-                "interaction carry invalid layered safe grasp");
-        }
-        object_world_ = safe_object;
-        recorded_ = false;
-        last_safe_pose_ = safe;
-        transaction.commit();
-        return safe;
-    }
-    const Transform published = compose(
-        hand_transform(solved, hand_),
+    const Pose safe = remap_safe_pose_to_live_root(
+        last_safe_pose_, locomotion.pose);
+    const Transform safe_object = compose(
+        hand_transform(safe, hand_),
         inverse(affordance_.hand_in_object));
-    const Transform published_in_root = compose(
-        inverse(live_root), published);
-    if (!valid_transform(published) ||
-        !valid_transform(published_in_root)) {
+    if (!valid_transform(safe_object) ||
+        !continuous_object(
+            desired_object, safe_object, config_, transition_ik)) {
         throw std::invalid_argument(
-            "interaction carry invalid layered solved grasp");
+            "interaction carry invalid transition safe grasp");
     }
-    object_world_ = published;
-    object_in_root_ = published_in_root;
-    recorded_ = false;
-    last_safe_pose_ = solved;
+    const Transform safe_object_in_root = compose(
+        inverse(live_root), safe_object);
+    if (!valid_transform(safe_object_in_root)) {
+        throw std::invalid_argument(
+            "interaction carry invalid transition safe anchor");
+    }
+    object_world_ = safe_object;
+    object_in_root_ = safe_object_in_root;
+    recorded_ = candidate.recorded;
+    last_safe_pose_ = safe;
     transaction.commit();
-    return solved;
+    return safe;
 }
 
 bool CarryController::recorded() const {
