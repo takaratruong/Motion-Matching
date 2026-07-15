@@ -92,6 +92,7 @@ public:
         const RuntimeUpdate& runtime_update);
 
     int phase() const;
+    bool updated_last_tick() const;
     const RuntimeOutput& cached_output() const;
 
 private:
@@ -99,6 +100,7 @@ private:
     bool pending_interact_ = false;
     bool pending_cancel_ = false;
     bool pending_reset_ = false;
+    bool updated_last_tick_ = false;
     RuntimeOutput cached_output_{};
 };
 
@@ -155,7 +157,8 @@ public:
         const InteractionTarget* registry_target,
         const RuntimeOutput& runtime_output,
         const Transform& authored_fallback,
-        float alpha);
+        float alpha,
+        bool runtime_sample_updated);
 
 private:
     void reset_authority();

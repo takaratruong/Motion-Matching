@@ -474,6 +474,7 @@ const RuntimeOutput& ControllerInteractionScheduler::tick(
     const LocomotionProvider& locomotion_provider,
     const PickRequestResolver& request_resolver,
     const RuntimeUpdate& runtime_update) {
+    updated_last_tick_ = false;
     pending_interact_ = pending_interact_ || edges.interact_pressed;
     pending_cancel_ = pending_cancel_ || edges.cancel_pressed;
     pending_reset_ = pending_reset_ || edges.reset_pressed;
@@ -496,6 +497,7 @@ const RuntimeOutput& ControllerInteractionScheduler::tick(
 
     RuntimeOutput next_output = runtime_update(input);
     cached_output_ = std::move(next_output);
+    updated_last_tick_ = true;
     pending_interact_ = false;
     pending_cancel_ = false;
     pending_reset_ = false;
@@ -504,6 +506,10 @@ const RuntimeOutput& ControllerInteractionScheduler::tick(
 
 int ControllerInteractionScheduler::phase() const {
     return phase_;
+}
+
+bool ControllerInteractionScheduler::updated_last_tick() const {
+    return updated_last_tick_;
 }
 
 const RuntimeOutput& ControllerInteractionScheduler::cached_output() const {
@@ -652,7 +658,8 @@ ControllerInteractionSceneState ControllerInteractionSceneHandoff::apply(
     const InteractionTarget* registry_target,
     const RuntimeOutput& runtime_output,
     const Transform& authored_fallback,
-    float alpha) {
+    float alpha,
+    bool runtime_sample_updated) {
     if (!finite(alpha) || alpha < 0.0F || alpha >= 1.0F) {
         throw FormatError("scene interpolation alpha must be finite in [0, 1)");
     }
@@ -681,8 +688,7 @@ ControllerInteractionSceneState ControllerInteractionSceneHandoff::apply(
         return {current_runtime_object_world_, true};
     }
 
-    if (!raw_transform_channels_equal(
-            runtime_output.object_world, current_runtime_object_world_)) {
+    if (runtime_sample_updated) {
         previous_runtime_object_world_ = current_runtime_object_world_;
         current_runtime_object_world_ = runtime_output.object_world;
     }

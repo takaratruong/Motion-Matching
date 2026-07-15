@@ -710,6 +710,7 @@ void test_flat_bridge_canaries_prove_exact_23_element_bounds() {
 void test_scheduler_cadence_and_cache() {
     ControllerInteractionScheduler scheduler;
     assert(scheduler.phase() == 0);
+    assert(!scheduler.updated_last_tick());
 
     int snapshot_calls = 0;
     int resolver_calls = 0;
@@ -745,6 +746,9 @@ void test_scheduler_cadence_and_cache() {
             });
 
         assert(update_calls - calls_before <= 1);
+        assert(
+            scheduler.updated_last_tick() ==
+            (update_calls != calls_before));
         if (update_calls == calls_before) {
             assert(output_fields_equal(observed, before));
         } else {
@@ -831,6 +835,7 @@ void test_edges_latch_coalesce_and_clear_after_delivery() {
 
 void test_cache_changes_only_after_successful_due_delivery() {
     ControllerInteractionScheduler scheduler;
+    assert(!scheduler.updated_last_tick());
     const auto snapshot_provider = [] { return make_snapshot(2.0F); };
     const auto resolver = [](const LocomotionSnapshot&) {
         return std::optional<PickRequest>{PickRequest{{8, 2}, 5, 99}};
@@ -842,11 +847,13 @@ void test_cache_changes_only_after_successful_due_delivery() {
                        ++calls;
                        return make_complete_output(1, RuntimeState::Locomotion);
                    });
+    assert(!scheduler.updated_last_tick());
     scheduler.tick({}, snapshot_provider, resolver,
                    [&](const RuntimeInput&) {
                        ++calls;
                        return make_complete_output(1, RuntimeState::Locomotion);
                    });
+    assert(!scheduler.updated_last_tick());
     assert(calls == 0);
     const RuntimeOutput initial{};
     assert(output_fields_equal(scheduler.cached_output(), initial));
@@ -864,6 +871,7 @@ void test_cache_changes_only_after_successful_due_delivery() {
     }
     assert(threw);
     assert(calls == 1);
+    assert(!scheduler.updated_last_tick());
     assert(output_fields_equal(scheduler.cached_output(), initial));
 
     scheduler.tick({}, snapshot_provider, resolver,
@@ -871,6 +879,7 @@ void test_cache_changes_only_after_successful_due_delivery() {
                        ++calls;
                        return make_complete_output(2, RuntimeState::Disabled);
                    });
+    assert(!scheduler.updated_last_tick());
     const RuntimeOutput held = scheduler.cached_output();
     scheduler.tick({}, snapshot_provider, resolver,
                    [&](const RuntimeInput& input) {
@@ -879,6 +888,7 @@ void test_cache_changes_only_after_successful_due_delivery() {
                        return make_complete_output(3, RuntimeState::Locomotion);
                    });
     assert(calls == 2);
+    assert(scheduler.updated_last_tick());
     assert(!output_fields_equal(scheduler.cached_output(), held));
 }
 
@@ -1905,7 +1915,11 @@ void test_scene_handoff_interpolates_25_hz_samples_at_render_phase_without_cache
         const float alpha =
             static_cast<float>(scheduler.phase()) / 60.0F;
         const ControllerInteractionSceneState scene = handoff.apply(
-            &target, output, authored_fallback, alpha);
+            &target,
+            output,
+            authored_fallback,
+            alpha,
+            scheduler.updated_last_tick());
 
         require(
             transform_bits_equal(target.object_world, target_before.object_world),
@@ -1963,6 +1977,63 @@ void test_scene_handoff_interpolates_25_hz_samples_at_render_phase_without_cache
     }
 }
 
+void test_scene_handoff_advances_fresh_equal_plateau_without_phase_wrap_rewind() {
+    ControllerInteractionScheduler scheduler;
+    ControllerInteractionSceneHandoff handoff;
+    InteractionTarget target;
+    target.handle = {44, 6};
+    target.state = ObjectState::Held;
+    target.object_world = {
+        vec3(-5.0F, 0.5F, 4.0F),
+        quat_from_angle_axis(-0.2F, vec3(0.0F, 1.0F, 0.0F))};
+    const Transform authored_fallback = target.object_world;
+    int samples = 0;
+    const std::array<float, 3> authoritative_x = {0.0F, 12.0F, 12.0F};
+    const std::array<int, 9> expected_phases = {
+        25, 50, 15, 40, 5, 30, 55, 20, 45};
+    const std::array<bool, 9> expected_fresh = {
+        false, false, true, false, true, false, false, true, false};
+    const std::array<float, 9> expected_x = {
+        -5.0F, -5.0F, 0.0F, 0.0F, 1.0F, 6.0F, 11.0F, 12.0F, 12.0F};
+
+    for (size_t tick = 0; tick < expected_x.size(); ++tick) {
+        const RuntimeOutput& output = scheduler.tick(
+            {},
+            [] { return LocomotionSnapshot{}; },
+            [](const LocomotionSnapshot&) -> std::optional<PickRequest> {
+                return std::nullopt;
+            },
+            [&](const RuntimeInput&) {
+                RuntimeOutput next;
+                next.diagnostics.target = target.handle;
+                next.diagnostics.object_state = ObjectState::Held;
+                next.object_world = {
+                    vec3(authoritative_x.at(static_cast<size_t>(samples++)),
+                         1.0F,
+                         2.0F),
+                    quat_from_angle_axis(
+                        0.4F, vec3(0.0F, 1.0F, 0.0F))};
+                return next;
+            });
+        require(
+            scheduler.phase() == expected_phases[tick],
+            "scheduler phase sequence changed in plateau regression");
+        require(
+            scheduler.updated_last_tick() == expected_fresh[tick],
+            "scheduler fresh-sample signal does not match due ticks");
+        const ControllerInteractionSceneState scene = handoff.apply(
+            &target,
+            output,
+            authored_fallback,
+            static_cast<float>(scheduler.phase()) / 60.0F,
+            scheduler.updated_last_tick());
+        require(
+            near(scene.object_world.position.x, expected_x[tick], 2.0e-5F),
+            "fresh equal plateau sample rewound or replayed old interpolation");
+    }
+    require(samples == 3, "plateau regression did not deliver three samples");
+}
+
 void test_scene_handoff_uses_shortest_rotation_and_does_not_shift_cached_endpoints() {
     ControllerInteractionSceneHandoff handoff;
     InteractionTarget target;
@@ -1979,7 +2050,7 @@ void test_scene_handoff_uses_shortest_rotation_and_does_not_shift_cached_endpoin
             170.0F * 3.14159265358979323846F / 180.0F,
             vec3(0.0F, 1.0F, 0.0F))};
     const ControllerInteractionSceneState initialized = handoff.apply(
-        &target, first, authored_fallback, 0.75F);
+        &target, first, authored_fallback, 0.75F, true);
     require(
         initialized.runtime_authority &&
             transform_bits_equal(initialized.object_world, first.object_world),
@@ -1993,7 +2064,7 @@ void test_scene_handoff_uses_shortest_rotation_and_does_not_shift_cached_endpoin
             vec3(0.0F, 1.0F, 0.0F))};
     const RuntimeOutput second_before = second;
     const ControllerInteractionSceneState quarter = handoff.apply(
-        &target, second, authored_fallback, 0.25F);
+        &target, second, authored_fallback, 0.25F, true);
     require_vec_near(
         quarter.object_world.position,
         vec3(2.5F, 1.0F, 2.0F),
@@ -2006,8 +2077,16 @@ void test_scene_handoff_uses_shortest_rotation_and_does_not_shift_cached_endpoin
             0.25F),
         "scene interpolation took the long quaternion path");
 
+    RuntimeOutput changed_but_not_fresh = second;
+    changed_but_not_fresh.object_world.position.x = 20.0F;
+    changed_but_not_fresh.object_world.rotation = quat_from_angle_axis(
+        -0.4F, vec3(0.0F, 1.0F, 0.0F));
     const ControllerInteractionSceneState cached = handoff.apply(
-        &target, second, authored_fallback, 0.75F);
+        &target,
+        changed_but_not_fresh,
+        authored_fallback,
+        0.75F,
+        false);
     require_vec_near(
         cached.object_world.position,
         vec3(7.5F, 1.0F, 2.0F),
@@ -2041,7 +2120,7 @@ void test_scene_handoff_retains_post_failure_held_pose_until_registry_reclaims_a
         vec3(2.5F, 1.2F, 3.4F),
         quat_from_angle_axis(0.7F, vec3(0.0F, 1.0F, 0.0F))};
     const ControllerInteractionSceneState attached_scene = handoff.apply(
-        &target, attached, authored_fallback, 0.6F);
+        &target, attached, authored_fallback, 0.6F, true);
     assert(attached_scene.runtime_authority);
     assert(transform_bits_equal(
         attached_scene.object_world, attached.object_world));
@@ -2053,7 +2132,7 @@ void test_scene_handoff_retains_post_failure_held_pose_until_registry_reclaims_a
         vec3(2.8F, 1.4F, 3.7F),
         quat_from_angle_axis(0.9F, vec3(0.0F, 1.0F, 0.0F))};
     const ControllerInteractionSceneState held_scene = handoff.apply(
-        &target, post_failure, authored_fallback, 0.25F);
+        &target, post_failure, authored_fallback, 0.25F, true);
     assert(held_scene.runtime_authority);
     require_vec_near(
         held_scene.object_world.position,
@@ -2076,7 +2155,7 @@ void test_scene_handoff_retains_post_failure_held_pose_until_registry_reclaims_a
         vec3(-1.0F, 0.75F, 5.0F),
         quat_from_angle_axis(0.1F, vec3(0.0F, 1.0F, 0.0F))};
     const ControllerInteractionSceneState stale_scene = handoff.apply(
-        &stale_generation, post_failure, authored_fallback, 0.9F);
+        &stale_generation, post_failure, authored_fallback, 0.9F, true);
     require(
         !stale_scene.runtime_authority &&
             transform_bits_equal(
@@ -2093,7 +2172,8 @@ void test_scene_handoff_retains_post_failure_held_pose_until_registry_reclaims_a
             &stale_generation,
             replacement_output,
             authored_fallback,
-            0.9F);
+            0.9F,
+            true);
     require(
         replacement_initialized.runtime_authority &&
             transform_bits_equal(
@@ -2107,7 +2187,7 @@ void test_scene_handoff_retains_post_failure_held_pose_until_registry_reclaims_a
         vec3(-3.0F, 0.9F, 4.0F),
         quat_from_angle_axis(-0.5F, vec3(0.0F, 1.0F, 0.0F))};
     const ControllerInteractionSceneState free_scene = handoff.apply(
-        &replacement, replacement_output, authored_fallback, 0.4F);
+        &replacement, replacement_output, authored_fallback, 0.4F, false);
     assert(!free_scene.runtime_authority);
     assert(transform_bits_equal(
         free_scene.object_world, replacement.object_world));
@@ -2115,13 +2195,13 @@ void test_scene_handoff_retains_post_failure_held_pose_until_registry_reclaims_a
     replacement.state = ObjectState::Targeted;
     replacement.object_world.position.x += 0.25F;
     const ControllerInteractionSceneState targeted_scene = handoff.apply(
-        &replacement, replacement_output, authored_fallback, 0.8F);
+        &replacement, replacement_output, authored_fallback, 0.8F, false);
     assert(!targeted_scene.runtime_authority);
     assert(transform_bits_equal(
         targeted_scene.object_world, replacement.object_world));
 
     const ControllerInteractionSceneState missing_scene = handoff.apply(
-        nullptr, replacement_output, authored_fallback, 0.2F);
+        nullptr, replacement_output, authored_fallback, 0.2F, false);
     require(
         !missing_scene.runtime_authority &&
             transform_bits_equal(missing_scene.object_world, authored_fallback),
@@ -2129,7 +2209,7 @@ void test_scene_handoff_retains_post_failure_held_pose_until_registry_reclaims_a
 
     replacement.state = ObjectState::Held;
     const ControllerInteractionSceneState after_reset = handoff.apply(
-        &replacement, replacement_output, authored_fallback, 0.95F);
+        &replacement, replacement_output, authored_fallback, 0.95F, true);
     require(
         after_reset.runtime_authority &&
             transform_bits_equal(
@@ -2153,12 +2233,12 @@ void test_scene_handoff_rejects_invalid_alpha_atomically() {
     first.object_world = {
         vec3(0.0F, 1.0F, 2.0F),
         quat_from_angle_axis(0.1F, vec3(0.0F, 1.0F, 0.0F))};
-    (void)handoff.apply(&target, first, authored_fallback, 0.0F);
+    (void)handoff.apply(&target, first, authored_fallback, 0.0F, true);
     RuntimeOutput second = first;
     second.object_world = {
         vec3(10.0F, 1.0F, 2.0F),
         quat_from_angle_axis(0.5F, vec3(0.0F, 1.0F, 0.0F))};
-    (void)handoff.apply(&target, second, authored_fallback, 0.5F);
+    (void)handoff.apply(&target, second, authored_fallback, 0.5F, true);
 
     RuntimeOutput rejected = second;
     rejected.object_world = {
@@ -2174,7 +2254,7 @@ void test_scene_handoff_rejects_invalid_alpha_atomically() {
         bool threw = false;
         try {
             (void)handoff.apply(
-                &target, rejected, authored_fallback, alpha);
+                &target, rejected, authored_fallback, alpha, true);
         } catch (const interaction::FormatError&) {
             threw = true;
         }
@@ -2188,7 +2268,7 @@ void test_scene_handoff_rejects_invalid_alpha_atomically() {
     }
 
     const ControllerInteractionSceneState unchanged = handoff.apply(
-        &target, second, authored_fallback, 0.75F);
+        &target, second, authored_fallback, 0.75F, false);
     require_vec_near(
         unchanged.object_world.position,
         vec3(7.5F, 1.0F, 2.0F),
@@ -2377,10 +2457,21 @@ void test_controller_and_make_clock_policy() {
                 scene_handoff_apply &&
             controller.find("/ 60.0F;", scene_alpha) < scene_handoff_apply,
         "controller scene alpha is not the exact post-tick phase over 60");
+    const size_t scene_sample_updated = controller.find(
+        "const bool interaction_scene_sample_updated =");
     require(
-        controller.find("interaction_scene_alpha);", scene_handoff_apply) <
+        scene_sample_updated != std::string::npos &&
+            scene_alpha < scene_sample_updated &&
+            scene_sample_updated < scene_handoff_apply &&
+            controller.find(
+                "interaction_scheduler.updated_last_tick()",
+                scene_sample_updated) < scene_handoff_apply,
+        "controller does not capture the explicit post-tick sample signal");
+    require(
+        controller.find(
+            "interaction_scene_sample_updated);", scene_handoff_apply) <
             frame_handoff_apply,
-        "controller does not pass scheduler render alpha to scene handoff");
+        "controller does not pass scheduler alpha and freshness to scene handoff");
     const size_t exact_affordance =
         controller.find("interaction_registry.find_affordance(");
     require(
@@ -2510,6 +2601,7 @@ int main() {
     test_frame_handoff_exposes_rendered_flat_root_sync();
     test_frame_handoff_keeps_layered_carry_simulation_root_live();
     test_scene_handoff_interpolates_25_hz_samples_at_render_phase_without_cache_endpoint_drift();
+    test_scene_handoff_advances_fresh_equal_plateau_without_phase_wrap_rewind();
     test_scene_handoff_uses_shortest_rotation_and_does_not_shift_cached_endpoints();
     test_scene_handoff_retains_post_failure_held_pose_until_registry_reclaims_authority();
     test_scene_handoff_rejects_invalid_alpha_atomically();
