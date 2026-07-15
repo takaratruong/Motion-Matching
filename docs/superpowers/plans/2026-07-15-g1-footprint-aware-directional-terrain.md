@@ -1674,7 +1674,8 @@ git commit -m "feat: compose footprint-aware G1 terrain IK"
 - A finite rejection leaves every accepted matcher, inertializer, simulation,
   support, contact, route, timer, pose, footprint, IK, and history byte
   unchanged. Only immutable requested intent/heading, rejection diagnostics,
-  and the one-frame latch may publish outside that state.
+  the one-frame latch, and the fresh attempt presentation frame may publish
+  outside that state.
 - The live production stage runner is one named non-capturing function linked
   into both the controller and its production test. Every behavior-relevant
   mode, tuning value, and sampled device input reaches it through one typed,
@@ -1691,6 +1692,12 @@ Extend `tests/cpp/test_g1_controller_state.cpp` to poison and reset:
 - the existing `G1CommandSnapshot` before/after finite rejection, global error,
   successful IK, and scene reset. `MM_IK` is startup-only; there is no live
   toggle claim.
+- publication `presentation_frame` and accepted-diagnostic adjustment,
+  clamping, IK, and effective-terrain-weight values, including nonfinite/range
+  validity mutations and finite/global rollback sentinels.
+- exact `MM_SEARCHT` bits in `search_time`, `search_timer`, and
+  `force_search_timer` for both independently reset states, plus malformed,
+  nonfinite, and out-of-range startup rejection before either state installs.
 
 Create `tests/cpp/test_g1_frame_transaction.cpp`. Give every scalar a distinct
 bit pattern and every array element a distinct digest contribution. Inject a
@@ -1705,12 +1712,20 @@ The only changed values may be:
 publication.requested_intent
 publication.rejection
 publication.ik_safe_stop_latched
+publication.presentation_frame
 ```
 
 Inject a global error at the same stages and require controlled failure with
 the accepted state still identical. Inject success and require the complete
 working state to publish together. A mutation test that omits any scalar or
 array from deep copy/swap must fail at least one sentinel case.
+
+Add a retry whose working-state buffers have the exact required shapes and are
+fully disjoint but whose scalar/value semantics are deliberately poisoned,
+including nonfinite values. The coordinator must accept that destination as
+storage, overwrite it from accepted state, and then produce the same result as
+a clean working destination. A pre-copy rejection caused by dirty working
+semantics fails this test.
 
 The production coordinator in `g1_frame_transaction.h` owns one
 `G1FrameRuntime` privately and exposes only its `working_state` to stage code
@@ -1731,7 +1746,11 @@ Create `tests/cpp/test_g1_frame_transaction_production.cpp` against that exact
 coordinator and the production runner symbol linked from `controller.cpp`
 compiled with `G1_CONTROLLER_NO_MAIN`. Exercise live, sequential, flat,
 terrain, route, and scene-cycle modes with explicit immutable input/tuning
-snapshots. Inject both finite and global failure after every real checkpoint
+snapshots. Authenticate exact lowering for validated `MM_SEARCHT`, the
+existing `MM_HALFLIFE` and `MM_SIMROT_HL` startup values, strafe, scripted
+azimuth, and autodrive inputs;
+none may be reread inside the runner. Inject both finite and global failure
+after every real checkpoint
 and prove the accepted state and accepted diagnostic are byte-identical and
 only the publication whitelist changes. The negative compile fixture has three
 translation-unit modes and each must fail: a runner that adds mutable `void*`,
@@ -1749,6 +1768,18 @@ spanning `{false,false,true,true}`: at least four successive frames across the
 edge accept, route/root XZ advance, no safe-stop latch appears, the swing base
 advances toward the predicted lower landing, and the first committed contact
 target has the exact predicted landing X/Z, lower surface height, and normal.
+Add a real footprint-stage case in which successful `g1_ik_frame_begin`
+returns a terminal safe-stop transaction. Require an immediate checked
+footprint/IK rejection at that same checkpoint and prove neither first-foot
+nor second-foot stage is called.
+
+Compile the `G1_CONTROLLER_NO_MAIN` controller object under
+`-Wall -Wextra -Werror`. Its source/preprocessor guard must prove that every
+file-scope static root not reachable from the runner—including every main-only
+parser, startup validator, render/debug helper, and its main-only helper
+closure—is excluded, while the named runner and every pure dependency it calls
+remain compiled. Any unused static root warning or hiding the runner behind the
+guard fails the production-authenticity test.
 
 Add a controller-order fixture requiring:
 
@@ -1761,6 +1792,7 @@ g1_controller_state_copy(working, accepted)
 < g1_ik_checked_forward_kinematics
 < g1_footprint_observe_v2
 < g1_ik_frame_begin
+< checked begin-time terminal-safe-stop inspection
 < g1_ik_frame_stage_foot(0)
 < g1_ik_frame_stage_foot(1)
 < g1_ik_frame_finish
@@ -1779,7 +1811,10 @@ For reset and every scene-load, state-reset, and model-load failure, require
 both state digests and buffer identities, publication, accepted diagnostic,
 scene, model, index, and route cursors to remain unchanged. On success require
 semantically equal, completely disjoint accepted/working states, identical
-route cursors, and cleared rejection/latch state.
+route cursors, and cleared rejection/latch state. Authenticate the zero-travel
+command, support-retarget baseline, checked FK, `G1FootprintOk`, initialized
+IK, `G1ClearanceOk`, and minimum `>= -0.01` independently for each member of
+the pair; poisoning either candidate gate must preserve the entire live unit.
 
 - [ ] **Step 2: Run the controller-state RED**
 
@@ -1843,10 +1878,13 @@ static inline bool g1_controller_state_copy(
     int error_capacity);
 ```
 
-It first validates every source scalar and all source/destination array
-shapes, requires distinct non-null buffers for every nonempty array, and
-preflights byte-count multiplication. Only after the complete preflight does
-it copy every array with `memcpy` and every scalar/aggregate with assignment.
+It first validates every source scalar and source shape. For the destination it
+validates storage only: exact shapes, stable identities, non-null buffers,
+complete source/destination and cross-array disjointness, and byte-count
+multiplication. It must not validate stale destination scalar/value semantics
+before overwrite. Only after the complete preflight does it copy every array
+with `memcpy` and every scalar/aggregate with assignment, then validate the
+completed destination semantics.
 It performs no `resize`, allocation, I/O, or state-dependent branch after the
 first write. Add every new owner to `g1_controller_state_swap`, copy, reset,
 and the test-only digest in the same commit.
@@ -1895,6 +1933,7 @@ struct G1FramePublication
     G1CommandIntent requested_intent;
     G1FrameRejectionDiagnostic rejection;
     bool ik_safe_stop_latched = false;
+    int presentation_frame = 0;
 };
 
 struct G1FrameAcceptedDiagnostic
@@ -1914,6 +1953,10 @@ struct G1FrameAcceptedDiagnostic
     motion_match_pose_diagnostic support_retargeted;
     motion_match_pose_diagnostic rendered;
     bool matching_enabled = true;
+    bool adjustment_enabled = true;
+    bool clamping_enabled = true;
+    bool ik_enabled = false;
+    float effective_terrain_weight = 0.0f;
 };
 
 struct G1FrameRuntime
@@ -2017,6 +2060,8 @@ struct G1FrameTuning
     float route_speed = 0.50f;
     float future_speed_scale = 1.0f;
     float walkability_radius = 0.20f;
+    float effective_terrain_weight = 0.0f;
+    float initial_search_time = 0.10f;
     float inertialize_blending_halflife = 0.10f;
     float desired_velocity_change_threshold = 50.0f;
     float desired_rotation_change_threshold = 50.0f;
@@ -2108,6 +2153,7 @@ struct G1FrameResetConfig
     bool ik_enabled = false;
     float dt = 1.0f / 25.0f;
     float trajectory_sample_time = 1.0f / 3.0f;
+    float initial_search_time = 0.10f;
 };
 
 static inline bool g1_frame_runtime_reset(
@@ -2144,7 +2190,11 @@ pointer, or array buffer. This exact rejection type is the finite-rejection
 whitelist. The accepted diagnostic is a separate transactional value owner: it
 contains the exact query, terrain snapshot, route/traversal values, selected
 frame identifiers, and pose diagnostics needed by post-coordinator logging and
-render diagnostics, but no pointer or mutable controller owner. The runner
+render diagnostics, plus the accepted adjustment/clamping/IK flags and
+effective terrain weight used by the existing log row, but no pointer or
+mutable controller owner. Its validator requires nonnegative frame/range
+identifiers where ready, finite pose/query/traversal values, and finite
+effective terrain weight in `[0,10]`. The runner
 fills only `scratch.accepted_diagnostic_candidate`; the coordinator publishes
 it only with an accepted state.
 
@@ -2156,7 +2206,18 @@ blocked and unavailable-landing-patch observations, and
 by the controller thresholds. Outside-domain, budget-exceeded, and uncertified
 statuses retain the exact status but set the corresponding availability false
 and leave the value object at its canonical default. Add a checked Task-5
-rejection-result snapshot/validator in `g1_ik_runtime.h`;
+rejection-result snapshot/validator in `g1_ik_runtime.h`:
+
+```cpp
+static inline bool g1_ik_frame_rejection_snapshot(
+    G1IkFrameResult& output,
+    const G1IkFrameTransaction& transaction,
+    char* error,
+    int error_capacity);
+```
+
+It assigns only an initialized, terminal-safe-stop transaction with a valid
+non-`None` reason and complete stage-appropriate result. Thus
 `attempted_ik_available` becomes true only after that helper validates and
 assigns a complete snapshot. Unavailable values are never logged as evidence.
 
@@ -2172,12 +2233,29 @@ per-frame intermediate lives in `G1FrameTransactionScratch`. The currently
 disabled learned-motion path is not represented; enabling it later requires a
 separate typed transactional interface rather than mutable nnet globals.
 
+Parse `MM_SEARCHT` once with full-string conversion and require a finite
+binary32 value in `[0,10]`; null selects exact `0.10f`. Store the result in both
+`G1FrameResetConfig.initial_search_time` and the immutable process/frame
+tuning, require their bits and the accepted state's immutable `search_time`
+bits to agree on every coordinator call, and never call `getenv` from the
+runner. The countdown timers remain ordinary transactional state.
+Retain current `MM_HALFLIFE` and `MM_SIMROT_HL` behavior by lowering their
+existing startup values into the corresponding tuning fields. Retain `MM_STRAFE`,
+scripted camera azimuth, and `MM_AUTODRIVE` by lowering them into the immutable
+input snapshot. Six-mode production tests authenticate all of these mappings.
+
 `g1_frame_runtime_reset` resolves and configures the route cursor entirely in
-local candidates, independently resets accepted and working states, proves
-their semantic equality and complete buffer disjointness, initializes
-publication from the reset command intent with no rejection/latch, resets the
-accepted diagnostic, and swaps the complete candidate runtime only after every
-check passes. Change `scene_reset_current` and `scene_switch_transaction` to
+local candidates and independently resets accepted and working states. Before
+equality/disjointness comparison, each state must independently pass the full
+certified reset gates: zero-travel command with spawn heading, exact initial
+`search_time`, `search_timer`, and `force_search_timer`, support-retargeted
+baseline, checked global FK, `G1FootprintOk`, initialized valid `G1IkState`,
+exact `G1ClearanceOk`, and pose minimum at least `-0.01`. Then prove semantic
+equality and complete buffer disjointness, initialize publication from the
+reset command intent with no rejection/latch and presentation frame zero,
+reset the accepted diagnostic, and swap the complete candidate runtime only
+after every check passes. Change `scene_reset_current` and
+`scene_switch_transaction` to
 accept `G1FrameRuntime&` and `G1FrameResetConfig`. Scene switch completely
 builds the candidate scene, both states, publication, accepted diagnostic,
 route cursors, and model before a non-failing scene/model/runtime/index swap
@@ -2204,9 +2282,14 @@ G1FrameStageRunner forbidden_runner = &runner_with_forbidden_context;
 Each mode must fail at that initialization. The fixture has no cast, adapter,
 overload, template, or alternate typedef that could make the proof vacuous.
 
-`g1_frame_transaction_run` preflights its runner/external inputs, all four
-runtime owners, and accepted/working non-aliasing, then performs the checked
-accepted-to-working copy internally. It initializes
+`g1_frame_transaction_run` preflights the runner/external inputs and the full
+semantics of accepted state, incoming publication, and accepted diagnostic.
+Before overwrite it validates only the working destination's exact array
+shapes, stable buffer identities, non-null storage, byte counts, and complete
+within-state/cross-state/error-buffer disjointness; stale working scalar/value
+semantics are deliberately irrelevant. It then performs the checked
+accepted-to-working copy internally and validates working semantics after the
+copy and again after all stages. It initializes
 `scratch.prior_safe_stop_latched` from the immutable incoming publication
 before any stage; the runner never receives publication or the accepted
 diagnostic itself.
@@ -2222,14 +2305,20 @@ Only after all stages continue does the coordinator validate working state,
 the complete success publication, and the ready accepted-diagnostic candidate.
 It then enters a non-failing publication tail: swap accepted/working exactly
 once, assign the accepted diagnostic and publication, and clear
-rejection/consumed latch. No allocation, formatting, logging, I/O, or operation
+rejection/consumed latch. Both accepted and finite publication candidates copy
+the fresh `external.input.presentation_frame`; global error leaves the incoming
+publication unchanged. No allocation, formatting, logging, I/O, or operation
 that can fail follows the first publication write. The runner and hook never
 receive accepted state, publication, or the accepted diagnostic.
 
 - [ ] **Step 5: Parse startup IK and snapshot typed input before mutation**
 
-Parse `MM_IK` before Raylib; accept only null/`0`/`1`, defaulting to disabled.
-This value is immutable for the process lifetime. Keep one `G1FrameRuntime`.
+Parse `MM_IK` and validated `MM_SEARCHT` before either state reset and before
+Raylib; accept only null/`0`/`1` for IK, defaulting to disabled, and the exact
+finite `[0,10]` search-time contract from Step 4. Both values are immutable for
+the process lifetime. Atomically reset both states with the same search-time
+bits and assert all three initial search timer fields agree. Keep one
+`G1FrameRuntime`.
 Process a pending atomic pair reset/switch first, then sample Raylib/device
 state and copy every current GUI/runtime tuning value into one local
 `G1FrameExternalInputs`. Sampling may read external APIs but may not mutate
@@ -2262,9 +2351,14 @@ It receives its mutable state as the runner's `working_state` argument and
 aliases it locally as `state`. Immediately before traversal, that case consumes
 the prior latch with:
 
-Place that externally linked runner before `main` and guard only the `main`
-definition with `#if !defined(G1_CONTROLLER_NO_MAIN)` so the production test
-links the same controller translation unit without a duplicate entry point.
+Place that externally linked runner and its complete pure dependency closure
+outside `G1_CONTROLLER_NO_MAIN`. Guard `main` **and every file-scope static
+root not reachable from the runner, including parser/startup-validation,
+render/debug, and their main-only helper closures**, with
+`#if !defined(G1_CONTROLLER_NO_MAIN)`. This lets the
+production test link the exact runner translation unit under
+`-Wall -Wextra -Werror` without a duplicate entry point or unused static
+function, while preventing the guard from hiding or cloning runner behavior.
 
 ```cpp
 const bool consume_safe_stop = scratch.prior_safe_stop_latched;
@@ -2363,12 +2457,32 @@ if (!g1_ik_frame_begin(
         error, error_capacity)) {
     return G1FrameStageGlobalError;
 }
+if (scratch.ik_transaction.terminal_safe_stop) {
+    G1IkFrameResult attempted_ik = {};
+    if (!g1_ik_frame_rejection_snapshot(
+            attempted_ik, scratch.ik_transaction,
+            error, error_capacity)) {
+        return G1FrameStageGlobalError;
+    }
+    scratch.rejection.attempted_footprint_available = true;
+    scratch.rejection.footprint_status = G1FootprintOk;
+    scratch.rejection.attempted_footprint = scratch.footprint;
+    scratch.rejection.attempted_ik_available = true;
+    scratch.rejection.ik_frame = attempted_ik;
+    // Complete stage, reason, and canonical unavailable-pose fields, validate
+    // the rejection, then stop before either foot-stage call.
+    return G1FrameStageFiniteReject;
+}
 return G1FrameStageContinue;
 ```
 
 No non-`Ok` footprint status may copy `scratch.footprint` into rejection or
 state. The accepted observation is assigned to `state.footprint` only in the
 fully accepted working-frame path.
+Successful begin is therefore not equivalent to continuation: its transaction
+is inspected immediately, and a landing-patch or other begin-time terminal
+safe stop is published as a checked finite rejection at the footprint-stage
+checkpoint before `g1_ik_frame_stage_foot(0)` can run.
 
 - [ ] **Step 7: Evaluate the whole working frame and publish only on acceptance**
 
@@ -2432,7 +2546,8 @@ copied. Invalid input/field/arithmetic or an unknown status is global error.
 
 Before the pose stage returns `Continue`, update ordinary camera scalar state,
 capture a complete `G1FrameAcceptedDiagnostic` with the pre-increment log row
-labels, then complete every search/force-search timer, route cursor, and
+labels, current adjustment/clamping/IK flags, and effective terrain weight,
+then validate it and complete every search/force-search timer, route cursor, and
 `scene_frame` increment in `working_state`. Suppress `route_frames` advancement
 on an accepted latch-consuming retry. The coordinator alone validates and
 publishes the state, accepted diagnostic, and publication. No timer, route,
@@ -2442,7 +2557,9 @@ The outer loop then constructs one deterministic row only from
 `frame_runtime.accepted_state`, `frame_runtime.accepted_diagnostic`, and
 `frame_runtime.publication`; it never reads working scratch. A finite row uses
 the unchanged accepted locomotion/diagnostic plus the current validated
-requested intent, rejection, and latch. A log failure after an accepted swap
+requested intent, rejection, latch, and fresh publication
+`presentation_frame`. An accepted row requires the accepted diagnostic and
+publication presentation frames to agree. A log failure after an accepted swap
 is an outer fatal I/O failure, not transaction rollback. After successful
 logging, publish the UI snapshot, schedule scene-cycle changes, derive
 `Camera3D` from accepted camera scalars and accepted IK pose, render only
@@ -2850,8 +2967,8 @@ is ignored and cannot justify a stop. Availability true requires exact
 `accepted_state_digest_hex` is a deterministic 64-bit test/log digest over
 every scalar and every byte of every accepted-state array in declared-owner
 order. It is not used for acceptance. On a finite rejection it must equal the
-preceding accepted digest; the requested intent, rejection fields, and latch
-are deliberately outside it.
+preceding accepted digest; the requested intent, rejection fields, latch, and
+fresh attempt presentation frame are deliberately outside it.
 
 - [ ] **Step 5: Correct Gate D's mislabeled clearance**
 
