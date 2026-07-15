@@ -2399,34 +2399,7 @@ int main(void)
         state.desired_rotation_change_curr = quat_to_scaled_angle_axis(quat_abs(quat_mul_inv(desired_rotation_curr, state.desired_rotation))) / dt;
         state.desired_rotation =  desired_rotation_curr;
 
-        deterministic_route_prediction route_prediction;
-        if (test_config.mode == G1_TestRoute) {
-            if (!deterministic_route_predict_commands(
-                    route_prediction,
-                    active_scene.metadata.routes[
-                        static_cast<size_t>(state.route_index)],
-                    state.route_frames,
-                    desired_velocity_curr,
-                    dt,
-                    0.50f,
-                    trajectory_sample_time,
-                    state.traversal_speed_scale,
-                    false,
-                    artifact_error,
-                    static_cast<int>(sizeof(artifact_error)))) {
-                controlled_runtime_error(artifact_error);
-                return;
-            }
-            for (int index = 0;
-                 index < G1CommandTrajectorySampleCount;
-                 ++index) {
-                state.trajectory_desired_velocities(index) =
-                    route_prediction.commands[index];
-            }
-        }
-
-        bool force_search =
-            test_config.mode == G1_TestRoute && route_prediction.force_search;
+        bool force_search = false;
 
         if (state.force_search_timer <= 0.0f && (
             (length(state.desired_velocity_change_prev) >= desired_velocity_change_threshold &&
@@ -2442,73 +2415,160 @@ int main(void)
             state.force_search_timer -= dt;
         }
         
-        // Predict Future Trajectory
-
-        if (test_heading.active) {
-            state.trajectory_desired_rotations.set(test_heading.heading);
-        } else {
-            trajectory_desired_rotations_predict(
-              state.trajectory_desired_rotations,
-              state.trajectory_desired_velocities,
-              state.desired_rotation,
-              state.camera_azimuth,
-              gamepadstick_left,
-              gamepadstick_right,
-              desired_strafe,
-              trajectory_sample_time);
-        }
-        
-        trajectory_rotations_predict(
-            state.trajectory_rotations,
-            state.trajectory_angular_velocities,
-            state.simulation_rotation,
-            state.simulation_angular_velocity,
-            state.trajectory_desired_rotations,
-            simulation_rotation_halflife,
-            trajectory_sample_time);
-        
-        if (test_config.mode != G1_TestRoute) {
-            trajectory_desired_velocities_predict(
-              state.trajectory_desired_velocities,
-              state.trajectory_rotations,
-              state.desired_velocity,
-              state.camera_azimuth,
-              gamepadstick_left,
-              gamepadstick_right,
-              desired_strafe,
-              simulation_fwrd_speed * state.traversal_speed_scale,
-              simulation_side_speed * state.traversal_speed_scale,
-              simulation_back_speed * state.traversal_speed_scale,
-              trajectory_sample_time);
-        }
-        
-        trajectory_positions_predict(
-            state.trajectory_positions,
-            state.trajectory_velocities,
-            state.trajectory_accelerations,
-            state.simulation_position,
-            state.simulation_velocity,
-            state.simulation_acceleration,
-            state.trajectory_desired_velocities,
-            simulation_velocity_halflife,
-            trajectory_sample_time);
-
+        // Predict and publish the complete future trajectory transactionally.
         G1CommandIntent command_intent;
         command_intent.requested_velocity = commanded_velocity;
         command_intent.desired_heading = desired_rotation_curr;
-        if (!g1_command_snapshot_build(
-                state.command,
-                command_intent,
-                desired_velocity_curr,
-                state.trajectory_desired_velocities,
-                state.trajectory_positions,
-                state.trajectory_rotations,
-                state.trajectory_desired_rotations,
+
+        G1CommandFramePrediction frame_seed = {};
+        frame_seed.command = state.command;
+        for (int index = 0;
+             index < G1CommandTrajectorySampleCount;
+             ++index) {
+            frame_seed.command.predicted_desired_velocities[index] =
+                state.trajectory_desired_velocities(index);
+            frame_seed.command.predicted_root_positions[index] =
+                state.trajectory_positions(index);
+            frame_seed.command.predicted_root_rotations[index] =
+                state.trajectory_rotations(index);
+            frame_seed.command.predicted_desired_headings[index] =
+                state.trajectory_desired_rotations(index);
+            frame_seed.predicted_root_velocities[index] =
+                state.trajectory_velocities(index);
+            frame_seed.predicted_root_accelerations[index] =
+                state.trajectory_accelerations(index);
+            frame_seed.predicted_root_angular_velocities[index] =
+                state.trajectory_angular_velocities(index);
+        }
+
+        G1CommandFramePredictionRequest frame_request;
+        frame_request.route_mode = test_config.mode == G1_TestRoute;
+        frame_request.heading_override = test_heading;
+        frame_request.intent = command_intent;
+        frame_request.applied_velocity = desired_velocity_curr;
+
+        G1CommandFramePrediction frame_prediction;
+        if (!g1_command_frame_prediction_build(
+                frame_prediction,
+                frame_seed,
+                frame_request,
+                [&](slice1d<vec3> desired_velocities,
+                    bool& route_force_search,
+                    char* callback_error,
+                    int callback_capacity) {
+                    deterministic_route_prediction prediction;
+                    if (!deterministic_route_predict_commands(
+                            prediction,
+                            active_scene.metadata.routes[
+                                static_cast<size_t>(state.route_index)],
+                            state.route_frames,
+                            desired_velocity_curr,
+                            dt,
+                            0.50f,
+                            trajectory_sample_time,
+                            state.traversal_speed_scale,
+                            false,
+                            callback_error,
+                            callback_capacity)) {
+                        return false;
+                    }
+                    for (int index = 0;
+                         index < G1CommandTrajectorySampleCount;
+                         ++index) {
+                        desired_velocities(index) = prediction.commands[index];
+                    }
+                    route_force_search = prediction.force_search;
+                    return true;
+                },
+                [&](slice1d<quat> desired_rotations,
+                    const slice1d<vec3> desired_velocities,
+                    char*, int) {
+                    trajectory_desired_rotations_predict(
+                        desired_rotations,
+                        desired_velocities,
+                        state.desired_rotation,
+                        state.camera_azimuth,
+                        gamepadstick_left,
+                        gamepadstick_right,
+                        desired_strafe,
+                        trajectory_sample_time);
+                    return true;
+                },
+                [&](slice1d<quat> rotations,
+                    slice1d<vec3> angular_velocities,
+                    const slice1d<quat> desired_rotations,
+                    const slice1d<vec3>,
+                    char*, int) {
+                    trajectory_rotations_predict(
+                        rotations,
+                        angular_velocities,
+                        state.simulation_rotation,
+                        state.simulation_angular_velocity,
+                        desired_rotations,
+                        simulation_rotation_halflife,
+                        trajectory_sample_time);
+                    return true;
+                },
+                [&](slice1d<vec3> desired_velocities,
+                    const slice1d<quat> rotations,
+                    char*, int) {
+                    trajectory_desired_velocities_predict(
+                        desired_velocities,
+                        rotations,
+                        state.desired_velocity,
+                        state.camera_azimuth,
+                        gamepadstick_left,
+                        gamepadstick_right,
+                        desired_strafe,
+                        simulation_fwrd_speed * state.traversal_speed_scale,
+                        simulation_side_speed * state.traversal_speed_scale,
+                        simulation_back_speed * state.traversal_speed_scale,
+                        trajectory_sample_time);
+                    return true;
+                },
+                [&](slice1d<vec3> positions,
+                    slice1d<vec3> velocities,
+                    slice1d<vec3> accelerations,
+                    const slice1d<vec3> desired_velocities,
+                    char*, int) {
+                    trajectory_positions_predict(
+                        positions,
+                        velocities,
+                        accelerations,
+                        state.simulation_position,
+                        state.simulation_velocity,
+                        state.simulation_acceleration,
+                        desired_velocities,
+                        simulation_velocity_halflife,
+                        trajectory_sample_time);
+                    return true;
+                },
                 artifact_error,
                 static_cast<int>(sizeof(artifact_error)))) {
             controlled_runtime_error(artifact_error);
             return;
         }
+
+        state.command = frame_prediction.command;
+        for (int index = 0;
+             index < G1CommandTrajectorySampleCount;
+             ++index) {
+            state.trajectory_desired_velocities(index) =
+                frame_prediction.command.predicted_desired_velocities[index];
+            state.trajectory_positions(index) =
+                frame_prediction.command.predicted_root_positions[index];
+            state.trajectory_rotations(index) =
+                frame_prediction.command.predicted_root_rotations[index];
+            state.trajectory_desired_rotations(index) =
+                frame_prediction.command.predicted_desired_headings[index];
+            state.trajectory_velocities(index) =
+                frame_prediction.predicted_root_velocities[index];
+            state.trajectory_accelerations(index) =
+                frame_prediction.predicted_root_accelerations[index];
+            state.trajectory_angular_velocities(index) =
+                frame_prediction.predicted_root_angular_velocities[index];
+        }
+        force_search = force_search || frame_prediction.force_search;
            
         // Make query vector for search.
         // In theory this only needs to be done when a search is 

@@ -32,6 +32,23 @@ struct G1TestHeadingOverride
     quat heading;
 };
 
+struct G1CommandFramePrediction
+{
+    G1CommandSnapshot command;
+    vec3 predicted_root_velocities[G1CommandTrajectorySampleCount];
+    vec3 predicted_root_accelerations[G1CommandTrajectorySampleCount];
+    vec3 predicted_root_angular_velocities[G1CommandTrajectorySampleCount];
+    bool force_search = false;
+};
+
+struct G1CommandFramePredictionRequest
+{
+    bool route_mode = false;
+    G1TestHeadingOverride heading_override;
+    G1CommandIntent intent;
+    vec3 applied_velocity;
+};
+
 static inline bool g1_command_memory_range(
     uintptr_t& begin,
     uintptr_t& end,
@@ -295,6 +312,247 @@ static inline bool g1_command_snapshot_build(
             error,
             error_capacity,
             "G1 command snapshot candidate failed publication validation");
+    }
+    output = candidate;
+    return true;
+}
+
+static inline bool g1_command_quat_bits_equal(quat first, quat second)
+{
+    return terrain_float_bits(first.w) == terrain_float_bits(second.w) &&
+           terrain_float_bits(first.x) == terrain_float_bits(second.x) &&
+           terrain_float_bits(first.y) == terrain_float_bits(second.y) &&
+           terrain_float_bits(first.z) == terrain_float_bits(second.z);
+}
+
+static inline bool g1_command_vec3_bits_equal(vec3 first, vec3 second)
+{
+    return terrain_float_bits(first.x) == terrain_float_bits(second.x) &&
+           terrain_float_bits(first.y) == terrain_float_bits(second.y) &&
+           terrain_float_bits(first.z) == terrain_float_bits(second.z);
+}
+
+static inline bool g1_command_frame_prediction_is_valid(
+    const G1CommandFramePrediction& value)
+{
+    if (!g1_command_snapshot_is_valid(value.command)) {
+        return false;
+    }
+    for (int index = 0; index < G1CommandTrajectorySampleCount; ++index) {
+        if (!g1_command_vec3_is_canonical(
+                value.predicted_root_velocities[index]) ||
+            !g1_command_vec3_is_canonical(
+                value.predicted_root_accelerations[index]) ||
+            !g1_command_vec3_is_canonical(
+                value.predicted_root_angular_velocities[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+template<typename RoutePredictor,
+         typename HeadingPredictor,
+         typename RotationPredictor,
+         typename LiveVelocityPredictor,
+         typename PositionPredictor>
+static inline bool g1_command_frame_prediction_build(
+    G1CommandFramePrediction& output,
+    const G1CommandFramePrediction& seed,
+    const G1CommandFramePredictionRequest& request,
+    RoutePredictor route_predictor,
+    HeadingPredictor heading_predictor,
+    RotationPredictor rotation_predictor,
+    LiveVelocityPredictor live_velocity_predictor,
+    PositionPredictor position_predictor,
+    char* error,
+    int error_capacity)
+{
+    if (g1_command_memory_overlaps(
+            &output, sizeof(output), &seed, sizeof(seed)) ||
+        (error != NULL && error_capacity > 0 &&
+         g1_command_memory_overlaps(
+             &output,
+             sizeof(output),
+             error,
+             static_cast<std::size_t>(error_capacity)))) {
+        return false;
+    }
+    if (!g1_command_frame_prediction_is_valid(seed)) {
+        return g1_command_failure(
+            &output,
+            sizeof(output),
+            error,
+            error_capacity,
+            "G1 command frame prediction seed is invalid");
+    }
+    if (!g1_command_vec3_is_finite(request.intent.requested_velocity) ||
+        !ik_quat_is_unit(request.intent.desired_heading) ||
+        !g1_command_vec3_is_finite(request.applied_velocity) ||
+        (request.heading_override.active &&
+         (!ik_quat_is_unit(request.heading_override.heading) ||
+          !g1_command_quat_bits_equal(
+              request.heading_override.heading,
+              request.intent.desired_heading)))) {
+        return g1_command_failure(
+            &output,
+            sizeof(output),
+            error,
+            error_capacity,
+            "G1 command frame prediction request is invalid");
+    }
+
+    G1CommandFramePrediction candidate = seed;
+    candidate.force_search = false;
+    vec3 route_velocities[G1CommandTrajectorySampleCount];
+    if (request.route_mode) {
+        if (!route_predictor(
+                slice1d<vec3>(
+                    G1CommandTrajectorySampleCount,
+                    candidate.command.predicted_desired_velocities),
+                candidate.force_search,
+                error,
+                error_capacity)) {
+            return false;
+        }
+        for (int index = 0;
+             index < G1CommandTrajectorySampleCount;
+             ++index) {
+            route_velocities[index] =
+                candidate.command.predicted_desired_velocities[index];
+        }
+    }
+
+    if (request.heading_override.active) {
+        for (int index = 0;
+             index < G1CommandTrajectorySampleCount;
+             ++index) {
+            candidate.command.predicted_desired_headings[index] =
+                request.heading_override.heading;
+        }
+    } else if (!heading_predictor(
+                   slice1d<quat>(
+                       G1CommandTrajectorySampleCount,
+                       candidate.command.predicted_desired_headings),
+                   slice1d<vec3>(
+                       G1CommandTrajectorySampleCount,
+                       candidate.command.predicted_desired_velocities),
+                   error,
+                   error_capacity)) {
+        return false;
+    }
+
+    if (!rotation_predictor(
+            slice1d<quat>(
+                G1CommandTrajectorySampleCount,
+                candidate.command.predicted_root_rotations),
+            slice1d<vec3>(
+                G1CommandTrajectorySampleCount,
+                candidate.predicted_root_angular_velocities),
+            slice1d<quat>(
+                G1CommandTrajectorySampleCount,
+                candidate.command.predicted_desired_headings),
+            slice1d<vec3>(
+                G1CommandTrajectorySampleCount,
+                candidate.command.predicted_desired_velocities),
+            error,
+            error_capacity)) {
+        return false;
+    }
+
+    if (!request.route_mode &&
+        !live_velocity_predictor(
+            slice1d<vec3>(
+                G1CommandTrajectorySampleCount,
+                candidate.command.predicted_desired_velocities),
+            slice1d<quat>(
+                G1CommandTrajectorySampleCount,
+                candidate.command.predicted_root_rotations),
+            error,
+            error_capacity)) {
+        return false;
+    }
+
+    if (!position_predictor(
+            slice1d<vec3>(
+                G1CommandTrajectorySampleCount,
+                candidate.command.predicted_root_positions),
+            slice1d<vec3>(
+                G1CommandTrajectorySampleCount,
+                candidate.predicted_root_velocities),
+            slice1d<vec3>(
+                G1CommandTrajectorySampleCount,
+                candidate.predicted_root_accelerations),
+            slice1d<vec3>(
+                G1CommandTrajectorySampleCount,
+                candidate.command.predicted_desired_velocities),
+            error,
+            error_capacity)) {
+        return false;
+    }
+
+    for (int index = 0; index < G1CommandTrajectorySampleCount; ++index) {
+        if ((request.route_mode &&
+             !g1_command_vec3_bits_equal(
+                 candidate.command.predicted_desired_velocities[index],
+                 route_velocities[index])) ||
+            (request.heading_override.active &&
+             !g1_command_quat_bits_equal(
+                 candidate.command.predicted_desired_headings[index],
+                 request.heading_override.heading)) ||
+            !g1_command_vec3_is_finite(
+                candidate.predicted_root_velocities[index]) ||
+            !g1_command_vec3_is_finite(
+                candidate.predicted_root_accelerations[index]) ||
+            !g1_command_vec3_is_finite(
+                candidate.predicted_root_angular_velocities[index])) {
+            return g1_command_failure(
+                &output,
+                sizeof(output),
+                error,
+                error_capacity,
+                "G1 command frame predictor produced invalid state");
+        }
+        candidate.predicted_root_velocities[index] =
+            g1_command_vec3_canonicalize(
+                candidate.predicted_root_velocities[index]);
+        candidate.predicted_root_accelerations[index] =
+            g1_command_vec3_canonicalize(
+                candidate.predicted_root_accelerations[index]);
+        candidate.predicted_root_angular_velocities[index] =
+            g1_command_vec3_canonicalize(
+                candidate.predicted_root_angular_velocities[index]);
+    }
+
+    G1CommandSnapshot command_candidate;
+    if (!g1_command_snapshot_build(
+            command_candidate,
+            request.intent,
+            request.applied_velocity,
+            slice1d<vec3>(
+                G1CommandTrajectorySampleCount,
+                candidate.command.predicted_desired_velocities),
+            slice1d<vec3>(
+                G1CommandTrajectorySampleCount,
+                candidate.command.predicted_root_positions),
+            slice1d<quat>(
+                G1CommandTrajectorySampleCount,
+                candidate.command.predicted_root_rotations),
+            slice1d<quat>(
+                G1CommandTrajectorySampleCount,
+                candidate.command.predicted_desired_headings),
+            error,
+            error_capacity)) {
+        return false;
+    }
+    candidate.command = command_candidate;
+    if (!g1_command_frame_prediction_is_valid(candidate)) {
+        return g1_command_failure(
+            &output,
+            sizeof(output),
+            error,
+            error_capacity,
+            "G1 command frame prediction failed publication validation");
     }
     output = candidate;
     return true;

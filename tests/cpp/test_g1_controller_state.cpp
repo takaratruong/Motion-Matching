@@ -271,55 +271,86 @@ static void test_controller_publishes_independent_travel_and_heading()
               traversal_call.find("heading") == std::string::npos,
           "terrain limiter receives no heading reference");
 
-    const std::size_t route_prediction = source.find(
-        "deterministic_route_predict_commands(", traversal);
-    const std::size_t heading_trajectory_override = source.find(
-        "state.trajectory_desired_rotations.set(test_heading.heading);",
-        route_prediction);
-    const std::size_t synthetic_prediction = source.find(
-        "trajectory_desired_velocities_predict(", route_prediction);
-    const std::size_t position_prediction = source.find(
-        "trajectory_positions_predict(", synthetic_prediction);
-    const std::size_t snapshot = source.find(
-        "g1_command_snapshot_build(", position_prediction);
+    const std::size_t frame_builder = source.find(
+        "g1_command_frame_prediction_build(", traversal);
+    const std::size_t publication = source.find(
+        "state.command = frame_prediction.command;", frame_builder);
     const std::size_t query = source.find(
-        "// Make query vector for search.", snapshot);
+        "// Make query vector for search.", publication);
+    check(frame_builder != std::string::npos &&
+              publication != std::string::npos &&
+              query != std::string::npos &&
+              frame_builder < publication && publication < query,
+          "controller invokes one frame seam before publishing state");
+    const std::string frame_call = source_call_text(
+        source,
+        "g1_command_frame_prediction_build",
+        frame_builder,
+        "controller has the transactional frame-prediction call");
+    check(source_call_argument_count(frame_call) == 10 &&
+              frame_call.find("frame_prediction") != std::string::npos &&
+              frame_call.find("frame_seed") != std::string::npos &&
+              frame_call.find("frame_request") != std::string::npos &&
+              frame_call.find("artifact_error") != std::string::npos,
+          "controller supplies the complete transactional frame seam");
+
+    const std::size_t route_prediction = frame_call.find(
+        "deterministic_route_predict_commands(");
+    const std::size_t heading_prediction = frame_call.find(
+        "trajectory_desired_rotations_predict(", route_prediction);
+    const std::size_t rotation_prediction = frame_call.find(
+        "trajectory_rotations_predict(", heading_prediction);
+    const std::size_t synthetic_prediction = frame_call.find(
+        "trajectory_desired_velocities_predict(", rotation_prediction);
+    const std::size_t position_prediction = frame_call.find(
+        "trajectory_positions_predict(", synthetic_prediction);
     check(route_prediction != std::string::npos &&
-              heading_trajectory_override != std::string::npos &&
+              heading_prediction != std::string::npos &&
+              rotation_prediction != std::string::npos &&
               synthetic_prediction != std::string::npos &&
               position_prediction != std::string::npos &&
-              snapshot != std::string::npos && query != std::string::npos &&
-              route_prediction < heading_trajectory_override &&
-              heading_trajectory_override < synthetic_prediction &&
-              synthetic_prediction < position_prediction &&
-              position_prediction < snapshot && snapshot < query,
-          "route/heading prediction publishes before the immutable snapshot");
+              route_prediction < heading_prediction &&
+              heading_prediction < rotation_prediction &&
+              rotation_prediction < synthetic_prediction &&
+              synthetic_prediction < position_prediction,
+          "frame seam callbacks wrap all existing predictors in source order");
     const std::string route_call = source_call_text(
-        source,
+        frame_call,
         "deterministic_route_predict_commands",
         route_prediction,
-        "controller has deterministic route prediction call");
+        "controller frame seam wraps deterministic route prediction");
     check(route_call.find("desired_velocity_curr") != std::string::npos &&
               route_call.find("state.traversal_speed_scale") !=
                   std::string::npos &&
               route_call.find("gamepad") == std::string::npos,
-          "route prediction consumes applied travel and no synthetic gamepad");
-    const std::string snapshot_call = source_call_text(
-        source,
-        "g1_command_snapshot_build",
-        snapshot,
-        "controller builds complete command snapshot");
-    check(source_call_argument_count(snapshot_call) == 9 &&
-              snapshot_call.find("state.command") != std::string::npos &&
-              snapshot_call.find("command_intent") != std::string::npos &&
-              snapshot_call.find("desired_velocity_curr") !=
-                  std::string::npos &&
-              snapshot_call.find("state.trajectory_desired_velocities") !=
-                  std::string::npos &&
-              snapshot_call.find("state.trajectory_desired_rotations") !=
-                  std::string::npos,
-          "controller publishes all command snapshot owners transactionally");
+          "route callback consumes applied travel and no synthetic gamepad");
+
     const std::string frame_path = source.substr(command, query - command);
+    check(frame_path.find(
+              "frame_request.route_mode = test_config.mode == G1_TestRoute;") !=
+              std::string::npos &&
+              frame_path.find(
+                  "frame_request.heading_override = test_heading;") !=
+              std::string::npos &&
+              frame_path.find(
+                  "if (test_config.mode != G1_TestRoute)") ==
+              std::string::npos &&
+              frame_path.find(
+                  "state.trajectory_desired_rotations.set("
+                  "test_heading.heading);") == std::string::npos &&
+              frame_path.find("g1_command_snapshot_build(") ==
+                  std::string::npos,
+          "controller delegates route/live, heading, and snapshot policy");
+    check(frame_path.find(
+              "frame_prediction.predicted_root_velocities[index]") !=
+              std::string::npos &&
+              frame_path.find(
+                  "frame_prediction.predicted_root_accelerations[index]") !=
+              std::string::npos &&
+              frame_path.find(
+                  "frame_prediction.predicted_root_angular_velocities[index]") !=
+              std::string::npos,
+          "controller publishes every auxiliary trajectory owner after success");
     check(frame_path.find(
               "command_intent.requested_velocity = commanded_velocity;") !=
               std::string::npos &&
