@@ -2804,8 +2804,10 @@ for flavor in strict fast; do
     -DG1_FRAME_TRANSACTION_ENABLE_TEST_SEAM -I. \
     -c tests/cpp/test_g1_frame_transaction_production.cpp \
     -o "/tmp/g1-frame-transaction/frame-production-${flavor}.o"
-  g++ "${caller_flags[@]}" \
-    "/tmp/g1-frame-transaction/frame-production-${flavor}.o" \
+  # The final link is deliberately neutral: passing -ffast-math here would
+  # pull in crtfastmath and enable FTZ/DAZ process-wide, which the strict
+  # clearance kernel must reject.
+  g++ "/tmp/g1-frame-transaction/frame-production-${flavor}.o" \
     "/tmp/g1-frame-transaction/controller-runner-${flavor}.o" \
     /tmp/g1-frame-transaction/kernel.o "${raylib_link[@]}" \
     -o "/tmp/g1-frame-transaction/frame-production-${flavor}"
