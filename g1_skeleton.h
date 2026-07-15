@@ -1,5 +1,6 @@
 #pragma once
 
+#include "g1_kinematic_contract.h"
 #include "database.h"
 
 #include <errno.h>
@@ -10,45 +11,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-enum G1Bone
-{
-    G1_Simulation = 0,
-    G1_Hips = 1,
-    G1_LeftHipPitch = 2,
-    G1_LeftHipRoll = 3,
-    G1_LeftHipYaw = 4,
-    G1_LeftKnee = 5,
-    G1_LeftAnkle = 6,
-    G1_LeftToe = 7,
-    G1_RightHipPitch = 8,
-    G1_RightHipRoll = 9,
-    G1_RightHipYaw = 10,
-    G1_RightKnee = 11,
-    G1_RightAnkle = 12,
-    G1_RightToe = 13,
-    G1_Spine = 14,
-    G1_Spine1 = 15,
-    G1_Spine2 = 16,
-    G1_LeftShoulderPitch = 17,
-    G1_LeftShoulderRoll = 18,
-    G1_LeftShoulderYaw = 19,
-    G1_LeftElbow = 20,
-    G1_LeftWristRoll = 21,
-    G1_LeftWristPitch = 22,
-    G1_LeftWrist = 23,
-    G1_RightShoulderPitch = 24,
-    G1_RightShoulderRoll = 25,
-    G1_RightShoulderYaw = 26,
-    G1_RightElbow = 27,
-    G1_RightWristRoll = 28,
-    G1_RightWristPitch = 29,
-    G1_RightWrist = 30,
-    G1_BoneCount = 31
-};
-
-inline constexpr char G1_SkeletonSignature[] =
-    "6138d9364b6f4178c25e2c1ac7039f3ce5fedf6b11a0b8375dea712633abd2e7";
 
 static inline bool g1_error(char* output, int capacity, const char* format, ...)
 {

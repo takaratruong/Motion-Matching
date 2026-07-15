@@ -1,11 +1,12 @@
 #ifdef __FAST_MATH__
-#error "g1_clearance.cpp certified kernel must be compiled without fast math"
+#error "g1_clearance.cpp strict certified kernel rejects -ffast-math"
 #endif
 
 #define G1_CLEARANCE_IMPLEMENTATION_TU
 #include "g1_clearance.h"
 #undef G1_CLEARANCE_IMPLEMENTATION_TU
 
+#include "g1_kinematic_contract.h"
 #include "g1_surface_query.h"
 
 #include <cfenv>
@@ -19,6 +20,94 @@
 #include <limits>
 #include <memory>
 #include <new>
+
+static bool g1_clearance_vec3_exact(vec3 left, vec3 right)
+{
+    return left.x == right.x &&
+           left.y == right.y &&
+           left.z == right.z;
+}
+
+static bool g1_clearance_config_is_fixed(const G1LegConfig& config)
+{
+    if (config.name == NULL) {
+        return false;
+    }
+    const bool left = std::strcmp(config.name, "left") == 0;
+    const bool right = std::strcmp(config.name, "right") == 0;
+    if (!left && !right) {
+        return false;
+    }
+    const G1LegConfig expected = left
+        ? g1_left_leg_config()
+        : g1_right_leg_config();
+    if (config.hip != expected.hip ||
+        config.knee != expected.knee ||
+        config.ankle != expected.ankle ||
+        config.contact != expected.contact ||
+        !g1_clearance_vec3_exact(
+            config.knee_hinge_axis_local,
+            expected.knee_hinge_axis_local) ||
+        !g1_clearance_vec3_exact(
+            config.foot_forward_local,
+            expected.foot_forward_local) ||
+        !g1_clearance_vec3_exact(
+            config.sole_normal_local,
+            expected.sole_normal_local) ||
+        config.foot_sphere_radius_m !=
+            expected.foot_sphere_radius_m ||
+        !g1_clearance_vec3_exact(
+            config.thigh_start_local, expected.thigh_start_local) ||
+        !g1_clearance_vec3_exact(
+            config.thigh_end_local, expected.thigh_end_local) ||
+        config.thigh_radius_m != expected.thigh_radius_m ||
+        !g1_clearance_vec3_exact(
+            config.shin_start_local, expected.shin_start_local) ||
+        !g1_clearance_vec3_exact(
+            config.shin_end_local, expected.shin_end_local) ||
+        config.shin_radius_m != expected.shin_radius_m ||
+        config.reach_buffer_m != expected.reach_buffer_m ||
+        config.planted_clearance_m != expected.planted_clearance_m ||
+        config.swing_clearance_m != expected.swing_clearance_m ||
+        config.max_swing_lift_m != expected.max_swing_lift_m ||
+        config.max_correction_radians !=
+            expected.max_correction_radians) {
+        return false;
+    }
+    for (int index = 0; index < 4; ++index) {
+        if (!g1_clearance_vec3_exact(
+                config.foot_sphere_centers_local[index],
+                expected.foot_sphere_centers_local[index]) ||
+            !g1_clearance_vec3_exact(
+                config.sole_points_local[index],
+                expected.sole_points_local[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool g1_clearance_quat_is_unit(quat value)
+{
+    const float components[4] = {
+        value.w, value.x, value.y, value.z
+    };
+    volatile double squared = 0.0;
+    for (const float component : components) {
+        if (!terrain_float_is_normal_or_zero_query(component)) {
+            return false;
+        }
+        const volatile double promoted =
+            static_cast<double>(component);
+        squared = squared + promoted * promoted;
+        if (!terrain_double_is_finite(squared)) {
+            return false;
+        }
+    }
+    const volatile double norm = std::sqrt(squared);
+    return terrain_double_is_finite(norm) &&
+           std::fabs(norm - 1.0) <= 2.0e-5;
+}
 
 #if defined(__SSE__) || defined(_M_X64) || defined(_M_IX86_FP)
 #include <xmmintrin.h>
@@ -3357,53 +3446,35 @@ static G1FallbackStatus g1_clearance_fallback_patch(
     }
 }
 
-static G1ClearanceStatus g1_clearance_contract_stub(
-    void* public_output,
-    size_t public_output_size,
-    const G1ClearanceBudget& limits,
-    const void* additional_protected_input,
-    size_t additional_protected_input_size,
-    bool swing_family,
-    char* error,
-    int error_capacity)
+static bool g1_clearance_certified_endpoint_is_valid(
+    const G1CertifiedEndpoint& endpoint)
 {
-    const G1ClearanceProtectedRange protected_ranges[] = {
-        {public_output, public_output_size},
-        {&limits, sizeof(limits)},
-        {additional_protected_input, additional_protected_input_size}
-    };
-    const G1ClearanceDiagnostic diagnostic =
-        g1_clearance_prepare_diagnostic(
-            error, error_capacity, protected_ranges,
-            sizeof(protected_ranges) / sizeof(protected_ranges[0]));
-    if (!g1_clearance_arithmetic_environment_is_supported()) {
-        return g1_clearance_error(
-            G1ClearanceArithmeticFailure,
-            diagnostic.output, diagnostic.capacity,
-            "G1 clearance arithmetic environment is unsupported");
+    if (!terrain_double_is_finite(endpoint.x) ||
+        !terrain_double_is_finite(endpoint.z) ||
+        endpoint.y.count == 0 || endpoint.y.count > 4 ||
+        !terrain_double_is_finite(endpoint.y.enclosure.lower) ||
+        !terrain_double_is_finite(endpoint.y.enclosure.upper) ||
+        endpoint.y.enclosure.lower > endpoint.y.enclosure.upper) {
+        return false;
     }
-    const G1ClearanceBudget ceiling = swing_family
-        ? g1_swing_foot_clearance_budget()
-        : g1_pose_clearance_budget();
-    if (!g1_clearance_budget_within(limits, ceiling)) {
-        return g1_clearance_error(
-            G1ClearanceInvalidInput,
-            diagnostic.output, diagnostic.capacity,
-            "G1 clearance budget exceeds its immutable factory ceiling");
+    for (uint32_t index = 0; index < endpoint.y.count; ++index) {
+        if (!terrain_double_is_finite(endpoint.y.terms[index])) {
+            return false;
+        }
     }
-    return g1_clearance_error(
-        G1ClearanceUncertified,
-        diagnostic.output, diagnostic.capacity,
-        "G1 certified geometry is not implemented by contract Task 1");
+    double central = 0.0;
+    return g1_clearance_exact_y_sum(endpoint.y, central) &&
+           endpoint.y.enclosure.lower <= central &&
+           central <= endpoint.y.enclosure.upper;
 }
 
-static G1ClearanceStatus g1_clearance_capsule_core(
+static G1ClearanceStatus g1_clearance_capsule_certified_core(
     G1ClearanceResult& output,
     const G1ClearanceBudget& limits,
     const heightfield& field,
-    vec3 endpoint_a,
-    vec3 endpoint_b,
-    float radius_m,
+    const G1CertifiedEndpoint input_endpoints[2],
+    double radius,
+    uint32_t primitive_index,
     const G1ClearanceDiagnostic& diagnostic)
 {
     if (field.version != 2 ||
@@ -3413,34 +3484,24 @@ static G1ClearanceStatus g1_clearance_capsule_core(
             diagnostic.output, diagnostic.capacity,
             "G1 capsule clearance requires a queryable G1HF/v2 field");
     }
-    if (!g1_ik_vec3_is_runtime_value(endpoint_a) ||
-        !g1_ik_vec3_is_runtime_value(endpoint_b) ||
-        !terrain_float_is_normal_or_positive_zero(radius_m) ||
-        radius_m <= 0.0f) {
+    if (input_endpoints == NULL ||
+        !g1_clearance_certified_endpoint_is_valid(input_endpoints[0]) ||
+        !g1_clearance_certified_endpoint_is_valid(input_endpoints[1]) ||
+        !terrain_double_is_finite(radius) || radius <= 0.0) {
         return g1_clearance_error(
             G1ClearanceInvalidInput,
             diagnostic.output, diagnostic.capacity,
-            "G1 capsule requires runtime endpoints and positive-normal radius");
+            "G1 capsule requires certified endpoints and positive radius");
     }
-    endpoint_a = vec3(
-        terrain_runtime_canonicalize_output(endpoint_a.x),
-        terrain_runtime_canonicalize_output(endpoint_a.y),
-        terrain_runtime_canonicalize_output(endpoint_a.z));
-    endpoint_b = vec3(
-        terrain_runtime_canonicalize_output(endpoint_b.x),
-        terrain_runtime_canonicalize_output(endpoint_b.y),
-        terrain_runtime_canonicalize_output(endpoint_b.z));
-    const double radius = static_cast<double>(radius_m);
-    G1CertifiedEndpoint endpoints[2] = {};
-    if (!g1_clearance_make_public_endpoints(
-            endpoint_a, endpoint_b, endpoints) ||
-        g1_clearance_endpoint_key_less(
+    G1CertifiedEndpoint endpoints[2] = {
+        input_endpoints[0], input_endpoints[1]
+    };
+    if (g1_clearance_endpoint_key_less(
             endpoints[1].source_key,
             endpoints[0].source_key)) {
-        return g1_clearance_error(
-            G1ClearanceArithmeticFailure,
-            diagnostic.output, diagnostic.capacity,
-            "G1 capsule endpoints could not be canonicalized");
+        const G1CertifiedEndpoint temporary = endpoints[0];
+        endpoints[0] = endpoints[1];
+        endpoints[1] = temporary;
     }
 
     G1ClearanceCellSpan span = {};
@@ -3572,7 +3633,7 @@ static G1ClearanceStatus g1_clearance_capsule_core(
                             patch_index, patch) ||
                         !g1_clearance_solve_capsule_patch(
                             endpoints, triangle, patch, radius,
-                            0, patch_result)) {
+                            primitive_index, patch_result)) {
                         return g1_clearance_error(
                             G1ClearanceArithmeticFailure,
                             diagnostic.output, diagnostic.capacity,
@@ -3680,7 +3741,7 @@ static G1ClearanceStatus g1_clearance_capsule_core(
             const G1FallbackStatus fallback_status =
                 g1_clearance_fallback_patch(
                     endpoints, record.triangle, record.patch, radius,
-                    0, target_width,
+                    primitive_index, target_width,
                     limits.maximum_subdivision_nodes,
                     subdivision_used,
                     next_creation_ordinal,
@@ -3784,6 +3845,290 @@ static G1ClearanceStatus g1_clearance_capsule_core(
     candidate.work.subdivision_nodes = subdivision_used;
     output = candidate;
     return G1ClearanceOk;
+}
+
+static G1ClearanceStatus g1_clearance_capsule_core(
+    G1ClearanceResult& output,
+    const G1ClearanceBudget& limits,
+    const heightfield& field,
+    vec3 endpoint_a,
+    vec3 endpoint_b,
+    float radius_m,
+    const G1ClearanceDiagnostic& diagnostic)
+{
+    if (field.version != 2 ||
+        !terrain_heightfield_is_queryable(field)) {
+        return g1_clearance_error(
+            G1ClearanceInvalidField,
+            diagnostic.output, diagnostic.capacity,
+            "G1 capsule clearance requires a queryable G1HF/v2 field");
+    }
+    if (!g1_ik_vec3_is_runtime_value(endpoint_a) ||
+        !g1_ik_vec3_is_runtime_value(endpoint_b) ||
+        !terrain_float_is_normal_or_positive_zero(radius_m) ||
+        radius_m <= 0.0f) {
+        return g1_clearance_error(
+            G1ClearanceInvalidInput,
+            diagnostic.output, diagnostic.capacity,
+            "G1 capsule requires runtime endpoints and positive-normal radius");
+    }
+    endpoint_a = vec3(
+        terrain_runtime_canonicalize_output(endpoint_a.x),
+        terrain_runtime_canonicalize_output(endpoint_a.y),
+        terrain_runtime_canonicalize_output(endpoint_a.z));
+    endpoint_b = vec3(
+        terrain_runtime_canonicalize_output(endpoint_b.x),
+        terrain_runtime_canonicalize_output(endpoint_b.y),
+        terrain_runtime_canonicalize_output(endpoint_b.z));
+    G1CertifiedEndpoint endpoints[2] = {};
+    if (!g1_clearance_make_public_endpoints(
+            endpoint_a, endpoint_b, endpoints)) {
+        return g1_clearance_error(
+            G1ClearanceArithmeticFailure,
+            diagnostic.output, diagnostic.capacity,
+            "G1 capsule endpoints could not be canonicalized");
+    }
+    return g1_clearance_capsule_certified_core(
+        output, limits, field, endpoints,
+        static_cast<double>(radius_m), 0, diagnostic);
+}
+
+struct G1ClearanceLedger
+{
+    G1ClearanceBudget remaining;
+    G1ClearanceWork consumed;
+};
+
+static G1ClearanceStatus g1_clearance_validate_public_call(
+    const G1ClearanceBudget& limits,
+    bool swing_family,
+    const G1ClearanceDiagnostic& diagnostic)
+{
+    if (!g1_clearance_arithmetic_environment_is_supported()) {
+        return g1_clearance_error(
+            G1ClearanceArithmeticFailure,
+            diagnostic.output, diagnostic.capacity,
+            "G1 clearance arithmetic environment is unsupported");
+    }
+    const G1ClearanceBudget ceiling = swing_family
+        ? g1_swing_foot_clearance_budget()
+        : g1_pose_clearance_budget();
+    if (!g1_clearance_budget_within(limits, ceiling)) {
+        return g1_clearance_error(
+            G1ClearanceInvalidInput,
+            diagnostic.output, diagnostic.capacity,
+            "G1 aggregate clearance budget exceeds its immutable factory ceiling");
+    }
+    return G1ClearanceOk;
+}
+
+static G1ClearanceStatus g1_clearance_validate_public_field(
+    const heightfield& field,
+    const G1ClearanceDiagnostic& diagnostic)
+{
+    if (field.version != 2 ||
+        !terrain_heightfield_is_queryable(field)) {
+        return g1_clearance_error(
+            G1ClearanceInvalidField,
+            diagnostic.output, diagnostic.capacity,
+            "G1 aggregate clearance requires a queryable G1HF/v2 field");
+    }
+    return G1ClearanceOk;
+}
+
+static bool g1_clearance_checked_add_u32(
+    uint32_t left,
+    uint32_t right,
+    uint32_t& output)
+{
+    if (right > UINT32_MAX - left) {
+        return false;
+    }
+    output = left + right;
+    return true;
+}
+
+static G1ClearanceStatus g1_clearance_preflight_primitive_count(
+    const G1ClearanceBudget& limits,
+    uint32_t point_count,
+    uint32_t capsule_count,
+    const G1ClearanceDiagnostic& diagnostic)
+{
+    uint64_t minimum_pairs = 0;
+    uint64_t capsule_pairs = 0;
+    uint64_t minimum_patches = 0;
+    uint64_t minimum_candidates = 0;
+    if (!g1_clearance_checked_multiply_u64(
+            static_cast<uint64_t>(capsule_count), UINT64_C(2),
+            capsule_pairs) ||
+        static_cast<uint64_t>(point_count) >
+            UINT64_MAX - capsule_pairs ||
+        !g1_clearance_checked_multiply_u64(
+            capsule_pairs,
+            static_cast<uint64_t>(G1ClearancePatchesPerPair),
+            minimum_patches) ||
+        !g1_clearance_checked_multiply_u64(
+            capsule_pairs,
+            static_cast<uint64_t>(G1ClearanceCandidatesPerPair),
+            minimum_candidates)) {
+        return g1_clearance_error(
+            G1ClearanceArithmeticFailure,
+            diagnostic.output, diagnostic.capacity,
+            "G1 aggregate primitive-count preflight overflowed");
+    }
+    minimum_pairs = static_cast<uint64_t>(point_count) +
+                    capsule_pairs;
+    const uint64_t minimum_cells =
+        static_cast<uint64_t>(point_count) +
+        static_cast<uint64_t>(capsule_count);
+    if (point_count > limits.maximum_point_queries ||
+        minimum_cells > limits.maximum_cells ||
+        minimum_pairs > limits.maximum_primitive_triangle_pairs ||
+        minimum_patches > limits.maximum_face_patches ||
+        minimum_candidates > limits.maximum_candidate_tests) {
+        return g1_clearance_error(
+            G1ClearanceBudgetExceeded,
+            diagnostic.output, diagnostic.capacity,
+            "G1 aggregate minimum primitive work exceeds its tightened budget");
+    }
+    return G1ClearanceOk;
+}
+
+static G1ClearanceStatus g1_clearance_ledger_accept(
+    G1ClearanceLedger& ledger,
+    const G1ClearanceResult& result,
+    uint32_t primitive_index,
+    G1ClearanceResult& accepted,
+    const G1ClearanceDiagnostic& diagnostic)
+{
+    uint32_t G1ClearanceWork::* const work_members[] = {
+        &G1ClearanceWork::point_queries,
+        &G1ClearanceWork::cells_visited,
+        &G1ClearanceWork::primitive_triangle_pairs,
+        &G1ClearanceWork::face_patches,
+        &G1ClearanceWork::candidate_tests,
+        &G1ClearanceWork::subdivision_nodes
+    };
+    uint32_t G1ClearanceBudget::* const budget_members[] = {
+        &G1ClearanceBudget::maximum_point_queries,
+        &G1ClearanceBudget::maximum_cells,
+        &G1ClearanceBudget::maximum_primitive_triangle_pairs,
+        &G1ClearanceBudget::maximum_face_patches,
+        &G1ClearanceBudget::maximum_candidate_tests,
+        &G1ClearanceBudget::maximum_subdivision_nodes
+    };
+    G1ClearanceLedger candidate = ledger;
+    for (size_t index = 0;
+         index < sizeof(work_members) / sizeof(work_members[0]);
+         ++index) {
+        const uint32_t amount = result.work.*work_members[index];
+        uint32_t& remaining =
+            candidate.remaining.*budget_members[index];
+        uint32_t& consumed =
+            candidate.consumed.*work_members[index];
+        uint32_t sum = 0;
+        if (amount > remaining ||
+            !g1_clearance_checked_add_u32(consumed, amount, sum)) {
+            return g1_clearance_error(
+                G1ClearanceArithmeticFailure,
+                diagnostic.output, diagnostic.capacity,
+                "G1 aggregate primitive violated its remaining ledger");
+        }
+        remaining -= amount;
+        consumed = sum;
+    }
+    G1ClearanceResult rekeyed = result;
+    rekeyed.witness.primitive_index = primitive_index;
+    ledger = candidate;
+    accepted = rekeyed;
+    return G1ClearanceOk;
+}
+
+static G1ClearanceStatus g1_clearance_combine_results(
+    G1ClearanceResult& output,
+    const G1ClearanceResult* results,
+    size_t count,
+    const G1ClearanceDiagnostic& diagnostic)
+{
+    if (results == NULL || count == 0 ||
+        !terrain_double_is_finite(results[0].lower_bound_m) ||
+        !terrain_double_is_finite(results[0].witness_upper_m)) {
+        return g1_clearance_error(
+            G1ClearanceArithmeticFailure,
+            diagnostic.output, diagnostic.capacity,
+            "G1 aggregate result set is invalid");
+    }
+    const G1ClearanceResult* lower = &results[0];
+    const G1ClearanceResult* witness = &results[0];
+    G1ClearanceWork total = {};
+    uint32_t G1ClearanceWork::* const members[] = {
+        &G1ClearanceWork::point_queries,
+        &G1ClearanceWork::cells_visited,
+        &G1ClearanceWork::primitive_triangle_pairs,
+        &G1ClearanceWork::face_patches,
+        &G1ClearanceWork::candidate_tests,
+        &G1ClearanceWork::subdivision_nodes
+    };
+    for (size_t index = 0; index < count; ++index) {
+        const G1ClearanceResult& result = results[index];
+        if (!terrain_double_is_finite(result.lower_bound_m) ||
+            !terrain_double_is_finite(result.witness_upper_m) ||
+            result.lower_bound_m > result.witness_upper_m) {
+            return g1_clearance_error(
+                G1ClearanceArithmeticFailure,
+                diagnostic.output, diagnostic.capacity,
+                "G1 aggregate member certificate is invalid");
+        }
+        if (result.lower_bound_m < lower->lower_bound_m) {
+            lower = &result;
+        }
+        if (result.witness_upper_m < witness->witness_upper_m ||
+            (g1_clearance_binary64_bits_equal(
+                 result.witness_upper_m,
+                 witness->witness_upper_m) &&
+             g1_clearance_witness_key_less(
+                 result.witness, witness->witness))) {
+            witness = &result;
+        }
+        for (const auto member : members) {
+            uint32_t sum = 0;
+            if (!g1_clearance_checked_add_u32(
+                    total.*member, result.work.*member, sum)) {
+                return g1_clearance_error(
+                    G1ClearanceArithmeticFailure,
+                    diagnostic.output, diagnostic.capacity,
+                    "G1 aggregate result work overflowed");
+            }
+            total.*member = sum;
+        }
+    }
+    G1ClearanceResult candidate = *lower;
+    candidate.witness_upper_m = witness->witness_upper_m;
+    candidate.witness = witness->witness;
+    candidate.work = total;
+    output = candidate;
+    return G1ClearanceOk;
+}
+
+static bool g1_clearance_pose_inputs_are_valid(
+    const slice1d<vec3> global_positions,
+    const slice1d<quat> global_rotations)
+{
+    if (global_positions.size != G1_BoneCount ||
+        global_rotations.size != G1_BoneCount ||
+        global_positions.data == NULL ||
+        global_rotations.data == NULL) {
+        return false;
+    }
+    for (int bone = 0; bone < G1_BoneCount; ++bone) {
+        if (!g1_ik_vec3_is_runtime_value(
+                global_positions.data[bone]) ||
+            !g1_clearance_quat_is_unit(
+                global_rotations.data[bone])) {
+            return false;
+        }
+    }
+    return true;
 }
 
 G1ClearanceStatus g1_apply_swing_lift_y(
@@ -4204,77 +4549,735 @@ G1ClearanceStatus g1_capsule_clearance(
         endpoint_a, endpoint_b, radius_m, diagnostic);
 }
 
+static G1ClearanceStatus g1_clearance_foot_with_ledger(
+    G1ClearanceResult& output,
+    G1ClearanceLedger& ledger,
+    const heightfield& field,
+    const vec3 sphere_centers[4],
+    float radius_m,
+    uint32_t primitive_base,
+    const G1ClearanceDiagnostic& diagnostic)
+{
+    if (sphere_centers == NULL ||
+        !terrain_float_is_normal_or_positive_zero(radius_m) ||
+        radius_m <= 0.0f) {
+        return g1_clearance_error(
+            G1ClearanceInvalidInput,
+            diagnostic.output, diagnostic.capacity,
+            "G1 foot requires four centers and positive-normal radius");
+    }
+    for (int index = 0; index < 4; ++index) {
+        if (!g1_ik_vec3_is_runtime_value(sphere_centers[index])) {
+            return g1_clearance_error(
+                G1ClearanceInvalidInput,
+                diagnostic.output, diagnostic.capacity,
+                "G1 foot requires twelve runtime center components");
+        }
+    }
+
+    G1ClearanceResult spheres[4] = {};
+    for (uint32_t index = 0; index < 4; ++index) {
+        G1ClearanceResult primitive = {};
+        const G1ClearanceStatus status = g1_sphere_clearance(
+            primitive, ledger.remaining, field,
+            sphere_centers[index], radius_m,
+            diagnostic.output, diagnostic.capacity);
+        if (status != G1ClearanceOk) {
+            return status;
+        }
+        const G1ClearanceStatus accept_status =
+            g1_clearance_ledger_accept(
+                ledger, primitive, primitive_base + index,
+                spheres[index], diagnostic);
+        if (accept_status != G1ClearanceOk) {
+            return accept_status;
+        }
+    }
+    return g1_clearance_combine_results(
+        output, spheres, 4, diagnostic);
+}
+
+static G1ClearanceStatus g1_clearance_swept_foot_with_ledger(
+    G1ClearanceResult& output,
+    G1ClearanceLedger& ledger,
+    const heightfield& field,
+    const vec3 previous_centers[4],
+    const vec3 current_centers[4],
+    float radius_m,
+    uint32_t primitive_base,
+    const G1ClearanceDiagnostic& diagnostic)
+{
+    if (previous_centers == NULL || current_centers == NULL ||
+        !terrain_float_is_normal_or_positive_zero(radius_m) ||
+        radius_m <= 0.0f) {
+        return g1_clearance_error(
+            G1ClearanceInvalidInput,
+            diagnostic.output, diagnostic.capacity,
+            "G1 swept foot requires endpoint arrays and positive-normal radius");
+    }
+    for (int index = 0; index < 4; ++index) {
+        if (!g1_ik_vec3_is_runtime_value(previous_centers[index]) ||
+            !g1_ik_vec3_is_runtime_value(current_centers[index])) {
+            return g1_clearance_error(
+                G1ClearanceInvalidInput,
+                diagnostic.output, diagnostic.capacity,
+                "G1 swept foot requires runtime endpoint components");
+        }
+    }
+
+    G1ClearanceResult capsules[4] = {};
+    for (uint32_t index = 0; index < 4; ++index) {
+        G1ClearanceResult primitive = {};
+        const G1ClearanceStatus status = g1_capsule_clearance(
+            primitive, ledger.remaining, field,
+            previous_centers[index], current_centers[index], radius_m,
+            diagnostic.output, diagnostic.capacity);
+        if (status != G1ClearanceOk) {
+            return status;
+        }
+        const G1ClearanceStatus accept_status =
+            g1_clearance_ledger_accept(
+                ledger, primitive, primitive_base + index,
+                capsules[index], diagnostic);
+        if (accept_status != G1ClearanceOk) {
+            return accept_status;
+        }
+    }
+    return g1_clearance_combine_results(
+        output, capsules, 4, diagnostic);
+}
+
+static G1ClearanceStatus g1_clearance_leg_with_ledger(
+    G1LegClearance& output,
+    G1ClearanceLedger& ledger,
+    const heightfield& field,
+    const slice1d<vec3> global_positions,
+    const slice1d<quat> global_rotations,
+    const G1LegConfig& config,
+    uint32_t primitive_base,
+    const G1ClearanceDiagnostic& diagnostic)
+{
+    if (!g1_clearance_config_is_fixed(config)) {
+        return g1_clearance_error(
+            G1ClearanceInvalidInput,
+            diagnostic.output, diagnostic.capacity,
+            "G1 leg clearance requires the fixed named-leg configuration");
+    }
+
+    const vec3 knee = global_positions(config.knee);
+    const vec3 ankle = global_positions(config.ankle);
+    const vec3 toe = global_positions(config.contact);
+    vec3 foot_centers[4] = {};
+    for (int index = 0; index < 4; ++index) {
+        const vec3 sphere_center =
+            global_positions(config.ankle) +
+            quat_mul_vec3(
+                global_rotations(config.ankle),
+                config.foot_sphere_centers_local[index]);
+        foot_centers[index] = sphere_center;
+    }
+    const vec3 thigh_a =
+        global_positions(config.hip) +
+        quat_mul_vec3(
+            global_rotations(config.hip),
+            config.thigh_start_local);
+    const vec3 thigh_b =
+        global_positions(config.hip) +
+        quat_mul_vec3(
+            global_rotations(config.hip),
+            config.thigh_end_local);
+    const vec3 shin_a =
+        global_positions(config.knee) +
+        quat_mul_vec3(
+            global_rotations(config.knee),
+            config.shin_start_local);
+    const vec3 shin_b =
+        global_positions(config.knee) +
+        quat_mul_vec3(
+            global_rotations(config.knee),
+            config.shin_end_local);
+    if (!g1_ik_vec3_is_runtime_value(knee) ||
+        !g1_ik_vec3_is_runtime_value(ankle) ||
+        !g1_ik_vec3_is_runtime_value(toe) ||
+        !g1_ik_vec3_is_runtime_value(thigh_a) ||
+        !g1_ik_vec3_is_runtime_value(thigh_b) ||
+        !g1_ik_vec3_is_runtime_value(shin_a) ||
+        !g1_ik_vec3_is_runtime_value(shin_b)) {
+        return g1_clearance_error(
+            G1ClearanceInvalidInput,
+            diagnostic.output, diagnostic.capacity,
+            "G1 leg transformed geometry is not a runtime value");
+    }
+    for (int index = 0; index < 4; ++index) {
+        if (!g1_ik_vec3_is_runtime_value(foot_centers[index])) {
+            return g1_clearance_error(
+                G1ClearanceInvalidInput,
+                diagnostic.output, diagnostic.capacity,
+                "G1 leg transformed foot center is not a runtime value");
+        }
+    }
+
+    G1LegClearance candidate = {};
+    const vec3 points[3] = {knee, ankle, toe};
+    G1ClearanceResult* const point_outputs[3] = {
+        &candidate.knee, &candidate.ankle, &candidate.toe
+    };
+    for (uint32_t index = 0; index < 3; ++index) {
+        G1ClearanceResult primitive = {};
+        const G1ClearanceStatus status = g1_point_clearance(
+            primitive, ledger.remaining, field, points[index],
+            diagnostic.output, diagnostic.capacity);
+        if (status != G1ClearanceOk) {
+            return status;
+        }
+        const G1ClearanceStatus accept_status =
+            g1_clearance_ledger_accept(
+                ledger, primitive, primitive_base + index,
+                *point_outputs[index], diagnostic);
+        if (accept_status != G1ClearanceOk) {
+            return accept_status;
+        }
+    }
+
+    G1ClearanceStatus status = g1_clearance_foot_with_ledger(
+        candidate.foot, ledger, field, foot_centers,
+        config.foot_sphere_radius_m, primitive_base + 3,
+        diagnostic);
+    if (status != G1ClearanceOk) {
+        return status;
+    }
+
+    G1ClearanceResult thigh = {};
+    status = g1_capsule_clearance(
+        thigh, ledger.remaining, field,
+        thigh_a, thigh_b, config.thigh_radius_m,
+        diagnostic.output, diagnostic.capacity);
+    if (status != G1ClearanceOk) {
+        return status;
+    }
+    status = g1_clearance_ledger_accept(
+        ledger, thigh, primitive_base + 7,
+        candidate.thigh, diagnostic);
+    if (status != G1ClearanceOk) {
+        return status;
+    }
+
+    G1ClearanceResult shin = {};
+    status = g1_capsule_clearance(
+        shin, ledger.remaining, field,
+        shin_a, shin_b, config.shin_radius_m,
+        diagnostic.output, diagnostic.capacity);
+    if (status != G1ClearanceOk) {
+        return status;
+    }
+    status = g1_clearance_ledger_accept(
+        ledger, shin, primitive_base + 8,
+        candidate.shin, diagnostic);
+    if (status != G1ClearanceOk) {
+        return status;
+    }
+
+    const G1ClearanceResult components[] = {
+        candidate.knee,
+        candidate.ankle,
+        candidate.toe,
+        candidate.foot,
+        candidate.thigh,
+        candidate.shin
+    };
+    status = g1_clearance_combine_results(
+        candidate.minimum, components,
+        sizeof(components) / sizeof(components[0]),
+        diagnostic);
+    if (status != G1ClearanceOk) {
+        return status;
+    }
+    output = candidate;
+    return G1ClearanceOk;
+}
+
 G1ClearanceStatus g1_foot_clearance(
     G1ClearanceResult& output,
     const G1ClearanceBudget& limits,
-    const heightfield&,
-    const vec3[4],
-    float,
+    const heightfield& field,
+    const vec3 sphere_centers[4],
+    float radius_m,
     char* error,
     int error_capacity)
 {
-    return g1_clearance_contract_stub(
-        &output, sizeof(output), limits, NULL, 0,
-        false, error, error_capacity);
+    const G1ClearanceProtectedRange protected_ranges[] = {
+        {&output, sizeof(output)},
+        {&limits, sizeof(limits)},
+        {sphere_centers,
+         sphere_centers == NULL ? 0 : sizeof(vec3) * 4}
+    };
+    const G1ClearanceDiagnostic diagnostic =
+        g1_clearance_prepare_diagnostic(
+            error, error_capacity, protected_ranges,
+            sizeof(protected_ranges) / sizeof(protected_ranges[0]));
+    G1ClearanceStatus status = g1_clearance_validate_public_call(
+        limits, false, diagnostic);
+    if (status != G1ClearanceOk) return status;
+    status = g1_clearance_validate_public_field(field, diagnostic);
+    if (status != G1ClearanceOk) return status;
+    status = g1_clearance_preflight_primitive_count(
+        limits, 0, 4, diagnostic);
+    if (status != G1ClearanceOk) return status;
+
+    G1ClearanceLedger ledger = {limits, {}};
+    G1ClearanceResult candidate = {};
+    status = g1_clearance_foot_with_ledger(
+        candidate, ledger, field, sphere_centers, radius_m,
+        0, diagnostic);
+    if (status != G1ClearanceOk) return status;
+    output = candidate;
+    return G1ClearanceOk;
 }
 
 G1ClearanceStatus g1_swept_foot_clearance(
     G1ClearanceResult& output,
     const G1ClearanceBudget& limits,
-    const heightfield&,
-    const vec3[4],
-    const vec3[4],
-    float,
+    const heightfield& field,
+    const vec3 previous_centers[4],
+    const vec3 current_centers[4],
+    float radius_m,
     char* error,
     int error_capacity)
 {
-    return g1_clearance_contract_stub(
-        &output, sizeof(output), limits, NULL, 0,
-        true, error, error_capacity);
+    const G1ClearanceProtectedRange protected_ranges[] = {
+        {&output, sizeof(output)},
+        {&limits, sizeof(limits)},
+        {previous_centers,
+         previous_centers == NULL ? 0 : sizeof(vec3) * 4},
+        {current_centers,
+         current_centers == NULL ? 0 : sizeof(vec3) * 4}
+    };
+    const G1ClearanceDiagnostic diagnostic =
+        g1_clearance_prepare_diagnostic(
+            error, error_capacity, protected_ranges,
+            sizeof(protected_ranges) / sizeof(protected_ranges[0]));
+    G1ClearanceStatus status = g1_clearance_validate_public_call(
+        limits, true, diagnostic);
+    if (status != G1ClearanceOk) return status;
+    status = g1_clearance_validate_public_field(field, diagnostic);
+    if (status != G1ClearanceOk) return status;
+    status = g1_clearance_preflight_primitive_count(
+        limits, 0, 4, diagnostic);
+    if (status != G1ClearanceOk) return status;
+
+    G1ClearanceLedger ledger = {limits, {}};
+    G1ClearanceResult candidate = {};
+    status = g1_clearance_swept_foot_with_ledger(
+        candidate, ledger, field,
+        previous_centers, current_centers, radius_m,
+        0, diagnostic);
+    if (status != G1ClearanceOk) return status;
+    output = candidate;
+    return G1ClearanceOk;
 }
 
 G1ClearanceStatus g1_measure_leg_clearance(
     G1LegClearance& output,
     const G1ClearanceBudget& limits,
-    const heightfield&,
-    const slice1d<vec3>,
-    const slice1d<quat>,
-    const G1LegConfig&,
+    const heightfield& field,
+    const slice1d<vec3> global_positions,
+    const slice1d<quat> global_rotations,
+    const G1LegConfig& config,
     char* error,
     int error_capacity)
 {
-    return g1_clearance_contract_stub(
-        &output, sizeof(output), limits, NULL, 0,
-        false, error, error_capacity);
+    const G1ClearanceProtectedRange protected_ranges[] = {
+        {&output, sizeof(output)},
+        {&limits, sizeof(limits)},
+        {global_positions.data,
+         global_positions.data == NULL || global_positions.size <= 0
+             ? 0
+             : sizeof(vec3) * static_cast<size_t>(global_positions.size)},
+        {global_rotations.data,
+         global_rotations.data == NULL || global_rotations.size <= 0
+             ? 0
+             : sizeof(quat) * static_cast<size_t>(global_rotations.size)},
+        {&config, sizeof(config)}
+    };
+    const G1ClearanceDiagnostic diagnostic =
+        g1_clearance_prepare_diagnostic(
+            error, error_capacity, protected_ranges,
+            sizeof(protected_ranges) / sizeof(protected_ranges[0]));
+    G1ClearanceStatus status = g1_clearance_validate_public_call(
+        limits, false, diagnostic);
+    if (status != G1ClearanceOk) return status;
+    status = g1_clearance_validate_public_field(field, diagnostic);
+    if (status != G1ClearanceOk) return status;
+    if (!g1_clearance_pose_inputs_are_valid(
+            global_positions, global_rotations)) {
+        return g1_clearance_error(
+            G1ClearanceInvalidInput,
+            diagnostic.output, diagnostic.capacity,
+            "G1 leg clearance requires complete runtime transforms");
+    }
+    status = g1_clearance_preflight_primitive_count(
+        limits, 3, 6, diagnostic);
+    if (status != G1ClearanceOk) return status;
+
+    G1ClearanceLedger ledger = {limits, {}};
+    G1LegClearance candidate = {};
+    status = g1_clearance_leg_with_ledger(
+        candidate, ledger, field,
+        global_positions, global_rotations, config,
+        0, diagnostic);
+    if (status != G1ClearanceOk) return status;
+    output = candidate;
+    return G1ClearanceOk;
 }
 
 G1ClearanceStatus g1_measure_pose_clearance(
     G1PoseClearance& output,
     const G1ClearanceBudget& limits,
-    const heightfield&,
-    const slice1d<vec3>,
-    const slice1d<quat>,
+    const heightfield& field,
+    const slice1d<vec3> global_positions,
+    const slice1d<quat> global_rotations,
     char* error,
     int error_capacity)
 {
-    return g1_clearance_contract_stub(
-        &output, sizeof(output), limits, NULL, 0,
-        false, error, error_capacity);
+    const G1ClearanceProtectedRange protected_ranges[] = {
+        {&output, sizeof(output)},
+        {&limits, sizeof(limits)},
+        {global_positions.data,
+         global_positions.data == NULL || global_positions.size <= 0
+             ? 0
+             : sizeof(vec3) * static_cast<size_t>(global_positions.size)},
+        {global_rotations.data,
+         global_rotations.data == NULL || global_rotations.size <= 0
+             ? 0
+             : sizeof(quat) * static_cast<size_t>(global_rotations.size)}
+    };
+    const G1ClearanceDiagnostic diagnostic =
+        g1_clearance_prepare_diagnostic(
+            error, error_capacity, protected_ranges,
+            sizeof(protected_ranges) / sizeof(protected_ranges[0]));
+    G1ClearanceStatus status = g1_clearance_validate_public_call(
+        limits, false, diagnostic);
+    if (status != G1ClearanceOk) return status;
+    status = g1_clearance_validate_public_field(field, diagnostic);
+    if (status != G1ClearanceOk) return status;
+    if (!g1_clearance_pose_inputs_are_valid(
+            global_positions, global_rotations)) {
+        return g1_clearance_error(
+            G1ClearanceInvalidInput,
+            diagnostic.output, diagnostic.capacity,
+            "G1 pose clearance requires complete runtime transforms");
+    }
+    status = g1_clearance_preflight_primitive_count(
+        limits, 7, 12, diagnostic);
+    if (status != G1ClearanceOk) return status;
+
+    G1ClearanceLedger ledger = {limits, {}};
+    G1PoseClearance candidate = {};
+    G1ClearanceResult hips = {};
+    status = g1_point_clearance(
+        hips, ledger.remaining, field,
+        global_positions(G1_Hips),
+        diagnostic.output, diagnostic.capacity);
+    if (status != G1ClearanceOk) return status;
+    status = g1_clearance_ledger_accept(
+        ledger, hips, 0, candidate.hips, diagnostic);
+    if (status != G1ClearanceOk) return status;
+
+    status = g1_clearance_leg_with_ledger(
+        candidate.left, ledger, field,
+        global_positions, global_rotations,
+        g1_left_leg_config(), 1, diagnostic);
+    if (status != G1ClearanceOk) return status;
+    status = g1_clearance_leg_with_ledger(
+        candidate.right, ledger, field,
+        global_positions, global_rotations,
+        g1_right_leg_config(), 10, diagnostic);
+    if (status != G1ClearanceOk) return status;
+
+    const G1ClearanceResult components[] = {
+        candidate.hips,
+        candidate.left.minimum,
+        candidate.right.minimum
+    };
+    status = g1_clearance_combine_results(
+        candidate.minimum, components,
+        sizeof(components) / sizeof(components[0]),
+        diagnostic);
+    if (status != G1ClearanceOk) return status;
+    output = candidate;
+    return G1ClearanceOk;
+}
+
+static bool g1_clearance_history_centers_candidate(
+    G1SwingHistory& candidate,
+    const vec3 centers[4])
+{
+    if (centers == NULL) {
+        return false;
+    }
+    G1SwingHistory local = {};
+    local.initialized = true;
+    for (int index = 0; index < 4; ++index) {
+        if (!g1_ik_vec3_is_runtime_value(centers[index])) {
+            return false;
+        }
+        local.previous_sphere_centers[index] = vec3(
+            terrain_runtime_canonicalize_output(centers[index].x),
+            terrain_runtime_canonicalize_output(centers[index].y),
+            terrain_runtime_canonicalize_output(centers[index].z));
+    }
+    candidate = local;
+    return true;
+}
+
+bool g1_swing_history_reset(
+    G1SwingHistory& output,
+    const vec3 sphere_centers[4],
+    char* error,
+    int error_capacity)
+{
+    const G1ClearanceProtectedRange protected_ranges[] = {
+        {&output, sizeof(output)},
+        {sphere_centers,
+         sphere_centers == NULL ? 0 : sizeof(vec3) * 4}
+    };
+    const G1ClearanceDiagnostic diagnostic =
+        g1_clearance_prepare_diagnostic(
+            error, error_capacity, protected_ranges,
+            sizeof(protected_ranges) / sizeof(protected_ranges[0]));
+    G1SwingHistory candidate = {};
+    if (!g1_clearance_history_centers_candidate(
+            candidate, sphere_centers)) {
+        g1_clearance_error(
+            G1ClearanceInvalidInput,
+            diagnostic.output, diagnostic.capacity,
+            "G1 swing history reset requires twelve runtime components");
+        return false;
+    }
+    output = candidate;
+    return true;
+}
+
+bool g1_swing_history_commit(
+    G1SwingHistory& history,
+    const vec3 accepted_sphere_centers[4],
+    char* error,
+    int error_capacity)
+{
+    const G1ClearanceProtectedRange protected_ranges[] = {
+        {&history, sizeof(history)},
+        {accepted_sphere_centers,
+         accepted_sphere_centers == NULL ? 0 : sizeof(vec3) * 4}
+    };
+    const G1ClearanceDiagnostic diagnostic =
+        g1_clearance_prepare_diagnostic(
+            error, error_capacity, protected_ranges,
+            sizeof(protected_ranges) / sizeof(protected_ranges[0]));
+    if (!history.initialized) {
+        g1_clearance_error(
+            G1ClearanceInvalidInput,
+            diagnostic.output, diagnostic.capacity,
+            "G1 swing history commit requires initialized history");
+        return false;
+    }
+    for (int index = 0; index < 4; ++index) {
+        if (!g1_ik_vec3_is_runtime_value(
+                history.previous_sphere_centers[index])) {
+            g1_clearance_error(
+                G1ClearanceInvalidInput,
+                diagnostic.output, diagnostic.capacity,
+                "G1 swing history commit rejected poisoned prior centers");
+            return false;
+        }
+    }
+    G1SwingHistory candidate = {};
+    if (!g1_clearance_history_centers_candidate(
+            candidate, accepted_sphere_centers)) {
+        g1_clearance_error(
+            G1ClearanceInvalidInput,
+            diagnostic.output, diagnostic.capacity,
+            "G1 swing history commit requires twelve runtime components");
+        return false;
+    }
+    history = candidate;
+    return true;
+}
+
+static bool g1_clearance_make_swing_endpoint(
+    vec3 center,
+    double target_m,
+    uint32_t primitive_index,
+    uint32_t semantic_ordinal,
+    G1CertifiedEndpoint& output)
+{
+    if (!g1_ik_vec3_is_runtime_value(center) ||
+        !terrain_double_is_finite(target_m) || target_m < 0.0) {
+        return false;
+    }
+    center = vec3(
+        terrain_runtime_canonicalize_output(center.x),
+        terrain_runtime_canonicalize_output(center.y),
+        terrain_runtime_canonicalize_output(center.z));
+    G1ClearanceExpansion2 adjusted_y = {};
+    if (!g1_clearance_two_diff(
+            static_cast<double>(center.y), target_m, adjusted_y)) {
+        return false;
+    }
+    G1CertifiedEndpoint candidate = {};
+    candidate.x = static_cast<double>(center.x);
+    candidate.z = static_cast<double>(center.z);
+    candidate.y.terms[0] = adjusted_y.high;
+    candidate.y.count = 1;
+    if (adjusted_y.low != 0.0) {
+        candidate.y.terms[candidate.y.count++] = adjusted_y.low;
+    }
+    if (adjusted_y.low == 0.0) {
+        candidate.y.enclosure = {
+            adjusted_y.high, adjusted_y.high
+        };
+    } else {
+        if (!g1_clearance_expansion_interval(
+                adjusted_y, candidate.y.enclosure)) {
+            return false;
+        }
+    }
+    candidate.source_key.source_kind = 1;
+    candidate.source_key.primitive_index = primitive_index;
+    candidate.source_key.semantic_ordinal = semantic_ordinal;
+    candidate.source_key.original_x_bits = terrain_float_bits(center.x);
+    candidate.source_key.original_y_bits = terrain_float_bits(center.y);
+    candidate.source_key.original_z_bits = terrain_float_bits(center.z);
+    if (!g1_clearance_certified_endpoint_is_valid(candidate)) {
+        return false;
+    }
+    output = candidate;
+    return true;
+}
+
+static G1ClearanceStatus g1_clearance_swing_with_ledger(
+    G1ClearanceResult& output,
+    G1ClearanceLedger& ledger,
+    const G1SwingHistory& history,
+    const heightfield& field,
+    const G1LegConfig& config,
+    const vec3 current_centers[4],
+    const G1ClearanceDiagnostic& diagnostic)
+{
+    G1ClearanceResult capsules[4] = {};
+    for (uint32_t index = 0; index < 4; ++index) {
+        G1CertifiedEndpoint endpoints[2] = {};
+        if (!g1_clearance_make_swing_endpoint(
+                history.previous_sphere_centers[index],
+                static_cast<double>(config.planted_clearance_m),
+                index, 0, endpoints[0]) ||
+            !g1_clearance_make_swing_endpoint(
+                current_centers[index],
+                static_cast<double>(config.swing_clearance_m),
+                index, 1, endpoints[1])) {
+            return g1_clearance_error(
+                G1ClearanceArithmeticFailure,
+                diagnostic.output, diagnostic.capacity,
+                "G1 swing target subtraction could not be certified");
+        }
+        G1ClearanceResult primitive = {};
+        G1ClearanceStatus status =
+            g1_clearance_capsule_certified_core(
+                primitive, ledger.remaining, field, endpoints,
+                static_cast<double>(config.foot_sphere_radius_m),
+                index, diagnostic);
+        if (status != G1ClearanceOk) {
+            return status;
+        }
+        status = g1_clearance_ledger_accept(
+            ledger, primitive, index, capsules[index], diagnostic);
+        if (status != G1ClearanceOk) {
+            return status;
+        }
+    }
+    return g1_clearance_combine_results(
+        output, capsules, 4, diagnostic);
 }
 
 G1ClearanceStatus g1_swing_clearance_validate(
     G1SwingClearanceValidation& output,
     const G1ClearanceBudget& limits,
     const G1SwingHistory& history,
-    const heightfield&,
-    const G1LegConfig&,
-    const vec3[4],
-    bool,
-    float,
+    const heightfield& field,
+    const G1LegConfig& config,
+    const vec3 final_sphere_centers[4],
+    bool recorded_contact,
+    float dt,
     char* error,
     int error_capacity)
 {
-    return g1_clearance_contract_stub(
-        &output, sizeof(output), limits, &history, sizeof(history),
-        true, error, error_capacity);
+    const G1ClearanceProtectedRange protected_ranges[] = {
+        {&output, sizeof(output)},
+        {&limits, sizeof(limits)},
+        {&history, sizeof(history)},
+        {&config, sizeof(config)},
+        {final_sphere_centers,
+         final_sphere_centers == NULL ? 0 : sizeof(vec3) * 4}
+    };
+    const G1ClearanceDiagnostic diagnostic =
+        g1_clearance_prepare_diagnostic(
+            error, error_capacity, protected_ranges,
+            sizeof(protected_ranges) / sizeof(protected_ranges[0]));
+    G1ClearanceStatus status = g1_clearance_validate_public_call(
+        limits, true, diagnostic);
+    if (status != G1ClearanceOk) return status;
+    if (!history.initialized || final_sphere_centers == NULL) {
+        return g1_clearance_error(
+            G1ClearanceInvalidInput,
+            diagnostic.output, diagnostic.capacity,
+            "G1 swing validation requires initialized history and current centers");
+    }
+    if (!g1_clearance_config_is_fixed(config)) {
+        return g1_clearance_error(
+            G1ClearanceInvalidInput,
+            diagnostic.output, diagnostic.capacity,
+            "G1 swing validation requires the fixed named-leg configuration");
+    }
+    if (!g1_dt_is_exact_25_hz(dt)) {
+        return g1_clearance_error(
+            G1ClearanceInvalidInput,
+            diagnostic.output, diagnostic.capacity,
+            "G1 swing validation requires exact 25 Hz dt");
+    }
+    for (int index = 0; index < 4; ++index) {
+        if (!g1_ik_vec3_is_runtime_value(
+                history.previous_sphere_centers[index]) ||
+            !g1_ik_vec3_is_runtime_value(
+                final_sphere_centers[index])) {
+            return g1_clearance_error(
+                G1ClearanceInvalidInput,
+                diagnostic.output, diagnostic.capacity,
+                "G1 swing validation requires runtime prior/current centers");
+        }
+    }
+    if (recorded_contact) {
+        G1SwingClearanceValidation candidate = {};
+        candidate.sweep_evaluated = false;
+        output = candidate;
+        return G1ClearanceOk;
+    }
+    status = g1_clearance_validate_public_field(field, diagnostic);
+    if (status != G1ClearanceOk) return status;
+    status = g1_clearance_preflight_primitive_count(
+        limits, 0, 4, diagnostic);
+    if (status != G1ClearanceOk) return status;
+
+    G1ClearanceLedger ledger = {limits, {}};
+    G1ClearanceResult sweep = {};
+    status = g1_clearance_swing_with_ledger(
+        sweep, ledger, history, field, config,
+        final_sphere_centers, diagnostic);
+    if (status != G1ClearanceOk) return status;
+
+    G1SwingClearanceValidation candidate = {};
+    candidate.lower_margin_m = sweep.lower_bound_m;
+    candidate.witness_upper_m = sweep.witness_upper_m;
+    candidate.sweep_evaluated = true;
+    candidate.work = sweep.work;
+    output = candidate;
+    return G1ClearanceOk;
 }
