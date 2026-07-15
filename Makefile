@@ -52,7 +52,8 @@ CONTROLLER_CXXFLAGS := -std=c++17
 INTERACTION_SOURCES := interaction_pose.cpp interaction_target.cpp \
   interaction_features.cpp interaction_matcher.cpp interaction_playback.cpp \
   interaction_ik.cpp interaction_attachment.cpp interaction_carry.cpp \
-  interaction_runtime.cpp interaction_controller_adapter.cpp
+  interaction_runtime.cpp interaction_controller_adapter.cpp \
+  interaction_target_rig_ik.cpp
 SOURCE := controller.cpp $(INTERACTION_SOURCES)
 HEADER = $(wildcard *.h)
 
@@ -107,6 +108,7 @@ CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_attachment
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_carry
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_runtime
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_controller_adapter
+CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_target_rig_ik
 RELEASE_FAST_MATH_TARGET_TEST := \
   $(CPP_TEST_DIR)/test_interaction_target_release_fast_math
 RELEASE_FAST_MATH_CARRY_TEST := \
@@ -174,6 +176,9 @@ $(CPP_TEST_DIR)/test_interaction_runtime: tests/cpp/test_interaction_runtime.cpp
 
 $(CPP_TEST_DIR)/test_interaction_controller_adapter: tests/cpp/test_interaction_controller_adapter.cpp tests/cpp/interaction_runtime_fixture.h interaction_controller_adapter.cpp interaction_controller_adapter.h interaction_runtime.h $(INTERACTION_RUNTIME_SOURCES) interaction_carry.h interaction_ik.h g1_arm_joint_metadata.h interaction_attachment.h interaction_playback.h interaction_matcher.h interaction_features.h interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_controller_adapter.cpp interaction_controller_adapter.cpp $(INTERACTION_RUNTIME_SOURCES) -o $@
+
+$(CPP_TEST_DIR)/test_interaction_target_rig_ik: tests/cpp/test_interaction_target_rig_ik.cpp interaction_target_rig_ik.cpp interaction_target_rig_ik.h interaction_controller_adapter.h interaction_pose.cpp interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_target_rig_ik.cpp interaction_target_rig_ik.cpp interaction_pose.cpp -o $@
 
 interaction_probe: interaction_probe.cpp interaction_database.h g1_skeleton.h
 	$(CXX) $(CPP_TEST_FLAGS) $< -o $@
