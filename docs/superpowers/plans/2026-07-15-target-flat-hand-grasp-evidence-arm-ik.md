@@ -36,12 +36,14 @@
 1. Add RED tests for both hands:
    - weight-zero bit identity;
    - every local translation and inactive channel bit identity;
+   - clavicle bit identity for targets inside ordinary two-link reach;
+   - minimum-swing clavicle assist for targets outside two-link reach but inside the measured full-chain reach;
    - reachable full-weight position `<= 0.001 m` and calibrated orientation `<= 0.5 deg`;
    - fixed segment lengths;
    - mirrored, straight, folded, unreachable, antiparallel, and degenerate-pole finite behavior;
    - previous-pole branch continuity;
    - quaternion hemisphere continuity and finite angular velocities.
-2. Implement rotation-only epoch calibration, weighted semantic-grasp target, robust analytic two-bone solve, wrist orientation, reach clamp, and diagnostics. Do not copy G1 hinge limits or modify object state.
+2. Implement rotation-only epoch calibration, weighted semantic-grasp target, minimum-swing clavicle reach assist, robust analytic two-bone solve, wrist orientation, reach clamp, and diagnostics. Do not copy G1 hinge limits or modify object state. The current baseline must be classified with the measured `~0.582 m` arm-only and `~0.695 m` full-chain reach; do not label a target unreachable until the clavicle segment is included.
 3. Build/run the focused solver test with strict warnings, then the adapter/runtime focused suites.
 4. Commit as `feat: solve selected flat arm to semantic grasp`; obtain independent review.
 
@@ -51,7 +53,7 @@
 
 1. Add RED tests proving:
    - first ownership frame remains exact at weight zero;
-   - full-body and layered Carry both correct only the selected arm;
+   - full-body and layered Carry both correct only the selected shoulder/arm chain;
    - layered bones `0..9` and contacts remain bit-equal to fresh locomotion;
    - exact selected scene target/affordance supplies the constraint;
    - stale/missing affordance disables IK safely;

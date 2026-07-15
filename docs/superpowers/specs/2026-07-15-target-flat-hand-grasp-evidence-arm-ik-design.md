@@ -52,10 +52,12 @@ The semantic calibrated grip orientation is `R_flat_hand * inverse(C_rot)` and c
 
 Use a dedicated, testable analytic solver on the selected flat chain:
 
-- left: keep `LeftShoulder(15)` fixed, rotate `LeftArm(16)` and `LeftForeArm(17)`, then orient `LeftHand(18)`;
-- right: keep `RightShoulder(19)` fixed, rotate `RightArm(20)` and `RightForeArm(21)`, then orient `RightHand(22)`.
+- left: `LeftShoulder(15) -> LeftArm(16) -> LeftForeArm(17) -> LeftHand(18)`;
+- right: `RightShoulder(19) -> RightArm(20) -> RightForeArm(21) -> RightHand(22)`.
 
-Every local translation, the inactive arm, and bones `0..14` remain bit-identical. Segment lengths therefore cannot change.
+Every local translation, the inactive arm, and bones `0..14` remain bit-identical. Segment lengths therefore cannot change. Keep the shoulder/clavicle rotation `15/19` bit-identical whenever the target is reachable by the ordinary two-link arm. When it is not, apply the minimum clavicle swing that brings the upper-arm root within two-link reach, then solve `16/17` or `20/21`. Do not use clavicle twist as a free correction.
+
+This reach assist is evidence-driven: the baseline two-link reach is about `0.582 m`; 92 of 152 Carry frames exceed it by as much as `0.097683 m`. Including the existing `0.112842 m` clavicle link makes every recorded PickupReplay, Hold, and Carry target reachable, with at least about `0.052 m` spare. Therefore a two-link-only solver cannot close the current Carry, while bone stretching or root warp is unnecessary for this clip.
 
 For the current base hand transform `F_base`, form the weighted end-effector target:
 
@@ -77,7 +79,7 @@ The handoff must store the final IK-corrected flat pose as its last rendered pos
 ## Acceptance
 
 - `weight == 0` returns the input pose bit-for-bit.
-- Only the selected arm rotations/angular velocities may change; all local translations remain bit-identical.
+- Only the selected shoulder/arm rotations and angular velocities may change; the clavicle remains bit-identical when two-link reach is sufficient, and all local translations remain bit-identical.
 - A reachable, full-weight synthetic target is reached within `1 mm`; calibrated orientation within `0.5 deg`.
 - Straight, folded, mirrored, unreachable, and degenerate-pole cases remain finite and preserve the chosen elbow branch.
 - The first release frame preserves the last corrected hand within `1 mm` / `0.5 deg`, then the normal release completes.
