@@ -2369,17 +2369,73 @@ class Task12PolicyTests(unittest.TestCase):
 
     def test_autodemo_reset_drain_is_input_free_and_precedes_logging(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")
-        scripted_input = self._source_between(
+        autodemo_input = self._source_between(
             controller,
             "            // Auto evidence is deterministic in the absence of external",
             "        // Get if strafe is desired",
         )
+        drain_input = re.search(
+            r"if\s*\(autodemo_state\.reset_presentation_frames_remaining\s*"
+            r">\s*0U\)\s*\{(?P<body>.*?)\n\s*\}",
+            autodemo_input,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(
+            drain_input,
+            "autodemo input handling must have an explicit Reset drain branch",
+        )
+        drain_input_body = drain_input.group("body") if drain_input else ""
         self.assertRegex(
-            scripted_input,
+            drain_input_body,
+            r"\binteraction_edges\s*=\s*\{\s*\}\s*;",
+            "Reset drain must clear physical F/X/R edges after sampling",
+        )
+        self.assertNotIn(
+            "gamepadstick_right",
+            drain_input_body,
+            "Reset drain may not disable live camera input",
+        )
+        left_stick_zero = autodemo_input.index("gamepadstick_left = vec3();")
+        drain_guard = autodemo_input.index(
+            "if (autodemo_state.reset_presentation_frames_remaining > 0U)"
+        )
+        scripted_guard = autodemo_input.index(
+            "if (autodemo_state.evidence_started &&"
+        )
+        self.assertLess(
+            left_stick_zero,
+            drain_guard,
+            "autodemo locomotion motion must already be zero before the drain",
+        )
+        self.assertLess(
+            drain_guard,
+            scripted_guard,
+            "physical edges must be cleared before scripted edge selection",
+        )
+        self.assertRegex(
+            autodemo_input,
             r"if\s*\(autodemo_state\.evidence_started\s*&&\s*"
             r"autodemo_state\.reset_presentation_frames_remaining\s*"
             r"==\s*0U\)",
             "drain renders must not issue Interact, Forward, or Reset input",
+        )
+
+        sampled_edges = controller.index(
+            "interaction::ControllerInteractionEdges interaction_edges{"
+        )
+        cleared_edges = controller.index("interaction_edges = {};", sampled_edges)
+        scheduler_tick = controller.index(
+            "interaction_scheduler.tick(", cleared_edges
+        )
+        self.assertLess(
+            sampled_edges,
+            cleared_edges,
+            "Reset drain clear must apply to the already-sampled physical edges",
+        )
+        self.assertLess(
+            cleared_edges,
+            scheduler_tick,
+            "cleared Reset drain edges must reach the fixed-25 scheduler",
         )
 
         end_drawing = controller.index("        EndDrawing();")

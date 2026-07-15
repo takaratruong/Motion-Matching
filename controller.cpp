@@ -3051,6 +3051,10 @@ int main(void)
             // input. It drives only the ordinary left-stick seam and the
             // existing scheduler edge seam.
             gamepadstick_left = vec3();
+            if (autodemo_state.reset_presentation_frames_remaining > 0U)
+            {
+                interaction_edges = {};
+            }
             if (autodemo_state.evidence_started &&
                 autodemo_state.reset_presentation_frames_remaining == 0U)
             {
