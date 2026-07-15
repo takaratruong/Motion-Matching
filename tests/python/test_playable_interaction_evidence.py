@@ -665,6 +665,11 @@ def validate_evidence(records: list[dict]) -> None:
     ):
         raise _error("all Carry records must be Held, attached, and own the pose")
     for record in carry:
+        if record["carry_mode"] not in {"recorded", "layered"}:
+            raise _error(
+                f"Carry frame {record['render_frame']} carry_mode must be "
+                "recorded or layered"
+            )
         if record["carry_mode"] != "layered":
             continue
         if record["active_hand_joint"] == 22:
@@ -683,9 +688,6 @@ def validate_evidence(records: list[dict]) -> None:
                 f"{elevation_m:.6f} m exceeds max "
                 f"{LAYERED_INACTIVE_HAND_ELEVATION_LIMIT_M:.6f} m"
             )
-    if carry[-1]["carry_mode"] not in {"recorded", "layered"}:
-        raise _error("final Carry mode must be recorded or layered")
-
     first_carry_index = records.index(carry[0])
     if first_carry_index > CARRY_DEADLINE_FRAMES:
         raise _error(
@@ -1573,6 +1575,25 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
                 _write_records(self.log, records)
                 with self.assertRaises(EvidenceValidationError):
                     validate_evidence(load_evidence(self.log))
+
+    def test_first_carry_none_cannot_bypass_layered_head_seam_gate(self):
+        records = _valid_records()
+        first_carry = next(
+            index
+            for index, record in enumerate(records)
+            if record["state"] == "Carry"
+        )
+        records[first_carry]["carry_mode"] = "none"
+        records[first_carry]["joint_world_positions"][14] = copy.deepcopy(
+            records[first_carry - 1]["joint_world_positions"][14]
+        )
+        records[first_carry]["joint_world_positions"][14][0] += 0.19
+
+        with self.assertRaisesRegex(
+            EvidenceValidationError,
+            r"Carry frame 24.*carry_mode.*recorded or layered",
+        ):
+            validate_evidence(records)
 
     def test_layered_inactive_hand_elevation_accepts_exact_boundary_only(self):
         for active_hand_joint in (18, 22):

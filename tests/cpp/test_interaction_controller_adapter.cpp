@@ -112,6 +112,42 @@ bool flat_pose_bits_equal(
     return left.foot_contacts == right.foot_contacts;
 }
 
+bool frame_state_bits_equal(
+    const ControllerInteractionFrameState& left,
+    const ControllerInteractionFrameState& right) {
+    const auto& left_result = left.hand_constraint_result;
+    const auto& right_result = right.hand_constraint_result;
+    return flat_pose_bits_equal(left.pose, right.pose) &&
+        left_result.applied == right_result.applied &&
+        left_result.reachable == right_result.reachable &&
+        left_result.used_clavicle == right_result.used_clavicle &&
+        float_bits_equal(
+            left_result.position_error_m,
+            right_result.position_error_m) &&
+        float_bits_equal(
+            left_result.orientation_error_radians,
+            right_result.orientation_error_radians) &&
+        float_bits_equal(
+            left_result.reach_shortfall_m,
+            right_result.reach_shortfall_m) &&
+        left.hand_constraint_validated ==
+            right.hand_constraint_validated &&
+        quat_bits_equal(
+            left.hand_constraint_calibration_rotation,
+            right.hand_constraint_calibration_rotation) &&
+        left.runtime_owns_pose == right.runtime_owns_pose &&
+        left.overrides_locomotion_pose ==
+            right.overrides_locomotion_pose &&
+        left.synchronize_simulation_root ==
+            right.synchronize_simulation_root &&
+        vec_bits_equal(
+            left.simulation_root_position,
+            right.simulation_root_position) &&
+        quat_bits_equal(
+            left.simulation_root_rotation,
+            right.simulation_root_rotation);
+}
+
 bool flat_bone_channels_bits_equal(
     const FlatControllerPose& left,
     const FlatControllerPose& right,
@@ -1156,7 +1192,7 @@ void test_hand_constraint_keeps_layered_carry_lower_body_exact_and_selected_only
     owned.diagnostics.recorded_carry = false;
     owned.diagnostics.inactive_arm_targets_locomotion = true;
     owned.diagnostics.inactive_arm_tracks_locomotion = true;
-    owned.diagnostics.hand_constraint_weight = 1.0F;
+    owned.diagnostics.hand_constraint_weight = 0.0F;
     const ControllerInteractionHandConstraint carry_constraint =
         make_hand_constraint(owned, fresh_locomotion, Hand::Left);
 
@@ -1174,6 +1210,17 @@ void test_hand_constraint_keeps_layered_carry_lower_body_exact_and_selected_only
             interaction::kControllerStepSeconds,
             carry_constraint);
     }
+    owned.diagnostics.hand_constraint_weight = 1.0F;
+    baseline = baseline_handoff.apply(
+        fresh_locomotion,
+        owned,
+        interaction::kControllerStepSeconds,
+        std::nullopt);
+    constrained = constrained_handoff.apply(
+        fresh_locomotion,
+        owned,
+        interaction::kControllerStepSeconds,
+        carry_constraint);
     require(
         constrained.hand_constraint_result.applied &&
             constrained.hand_constraint_result.reachable,
@@ -1230,6 +1277,159 @@ void test_hand_constraint_keeps_layered_carry_lower_body_exact_and_selected_only
             flat_bone_channels_bits_equal(
                 constrained.pose, fresh_locomotion, bone),
             "selected-hand IK changed released inactive-arm locomotion");
+    }
+}
+
+void test_layered_carry_final_composite_guard_is_atomic_for_both_hands() {
+    for (const Hand hand : {Hand::Left, Hand::Right}) {
+        const FlatControllerPose entry = make_flat_pose();
+        const Pose raw_reference = interaction::expand_flat_controller_pose(
+            entry, make_pose(0.375F));
+        RuntimeOutput output = make_owned_output(raw_reference);
+        output.diagnostics.state = RuntimeState::Hold;
+        output.diagnostics.target = {
+            hand == Hand::Left ? 801U : 802U,
+            hand == Hand::Left ? 11U : 12U};
+        output.diagnostics.affordance_id =
+            hand == Hand::Left ? 31U : 32U;
+        output.diagnostics.hand = hand;
+        output.diagnostics.hand_constraint_weight = 0.0F;
+        ControllerInteractionHandConstraint constraint =
+            make_hand_constraint(output, entry, hand);
+        const FlatWorldPose entry_world = flat_world_pose(entry);
+        const size_t selected_upper_arm =
+            hand == Hand::Left ? 16U : 20U;
+        const size_t selected_hand =
+            hand == Hand::Left ? 18U : 22U;
+        constraint.grasp_world = {
+            lerp(
+                entry_world.positions[selected_upper_arm],
+                entry_world.positions[selected_hand],
+                0.98F),
+            entry_world.rotations[selected_hand]};
+
+        ControllerInteractionFrameHandoff actual;
+        ControllerInteractionFrameHandoff oracle;
+        const ControllerInteractionFrameState actual_entry = actual.apply(
+            entry,
+            output,
+            interaction::kControllerStepSeconds,
+            constraint);
+        const ControllerInteractionFrameState oracle_entry = oracle.apply(
+            entry,
+            output,
+            interaction::kControllerStepSeconds,
+            constraint);
+        require(
+            frame_state_bits_equal(actual_entry, oracle_entry),
+            "final-composite guard setup diverged before layered Carry");
+
+        FlatControllerPose locomotion = entry;
+        locomotion.positions[0] =
+            locomotion.positions[0] + vec3(0.12F, 0.0F, -0.04F);
+        locomotion.rotations[1] = quat_from_angle_axis(
+            0.20F, normalize(vec3(0.2F, 0.9F, 0.3F)));
+        const size_t inactive_arm_begin =
+            hand == Hand::Left ? 19U : 15U;
+        for (size_t bone = inactive_arm_begin;
+             bone < inactive_arm_begin + 4U;
+             ++bone) {
+            locomotion.rotations[bone] = quat_from_angle_axis(
+                0.16F + 0.01F * static_cast<float>(bone - inactive_arm_begin),
+                normalize(vec3(0.3F, 0.7F, 0.2F)));
+        }
+        locomotion.foot_contacts = {0U, 1U};
+
+        FlatControllerPose safe_upper = entry;
+        safe_upper.rotations[12] = quat_from_angle_axis(
+            0.12F, normalize(vec3(0.2F, 0.8F, 0.5F)));
+        output.pose = interaction::expand_flat_controller_pose(
+            safe_upper, raw_reference);
+        output.diagnostics.state = RuntimeState::Carry;
+        output.diagnostics.recorded_carry = false;
+        output.diagnostics.inactive_arm_targets_locomotion = true;
+        output.diagnostics.inactive_arm_tracks_locomotion = true;
+        output.diagnostics.hand_constraint_weight = 1.0F;
+
+        const ControllerInteractionFrameState first_actual = actual.apply(
+            locomotion,
+            output,
+            interaction::kControllerStepSeconds,
+            constraint);
+        const ControllerInteractionFrameState first_oracle = oracle.apply(
+            locomotion,
+            output,
+            interaction::kControllerStepSeconds,
+            constraint);
+        require(
+            frame_state_bits_equal(first_actual, first_oracle),
+            "normal lower/upper/IK composite diverged between identical handoffs");
+        require(
+            first_actual.hand_constraint_result.applied &&
+                first_actual.hand_constraint_result.reachable,
+            "normal lower/upper/IK composite did not solve the selected hand");
+
+        const auto require_bounded_final_fk = [](
+            const FlatControllerPose& previous,
+            const FlatControllerPose& current) {
+            const FlatWorldPose previous_world = flat_world_pose(previous);
+            const FlatWorldPose current_world = flat_world_pose(current);
+            for (size_t bone = 0;
+                 bone < interaction::kFlatControllerBoneCount;
+                 ++bone) {
+                require(
+                    length(
+                        current_world.positions[bone] -
+                        previous_world.positions[bone]) <= 0.20F,
+                    "normal final composite exceeded the FK translation bound");
+                require(
+                    rotation_distance(
+                        current_world.rotations[bone],
+                        previous_world.rotations[bone]) <=
+                        60.0F * 3.14159265358979323846F / 180.0F,
+                    "normal final composite exceeded the FK rotation bound");
+            }
+        };
+        require_bounded_final_fk(entry, first_actual.pose);
+
+        RuntimeOutput adversarial = output;
+        FlatControllerPose adversarial_upper = safe_upper;
+        adversarial_upper.rotations[12] = quat_from_angle_axis(
+            2.40F, normalize(vec3(0.2F, 0.8F, 0.5F)));
+        adversarial.pose = interaction::expand_flat_controller_pose(
+            adversarial_upper, raw_reference);
+        const RuntimeOutput adversarial_before = adversarial;
+        bool threw = false;
+        try {
+            (void)actual.apply(
+                locomotion,
+                adversarial,
+                interaction::kControllerStepSeconds,
+                constraint);
+        } catch (const interaction::FormatError&) {
+            threw = true;
+        }
+        require(
+            threw,
+            "final composite guard accepted an adversarial upper-body step");
+        require(
+            output_fields_equal(adversarial, adversarial_before),
+            "rejected final composite mutated its runtime input");
+
+        const ControllerInteractionFrameState expected_retry = oracle.apply(
+            locomotion,
+            output,
+            interaction::kControllerStepSeconds,
+            constraint);
+        const ControllerInteractionFrameState actual_retry = actual.apply(
+            locomotion,
+            output,
+            interaction::kControllerStepSeconds,
+            constraint);
+        require(
+            frame_state_bits_equal(actual_retry, expected_retry),
+            "rejected final composite did not restore handoff state atomically");
+        require_bounded_final_fk(first_actual.pose, actual_retry.pose);
     }
 }
 
@@ -1639,8 +1839,7 @@ void test_layered_carry_lower_body_rebases_moving_target_and_cleans_up() {
         "lower-body rebase stole contacts or simulation-root authority");
     previous = frame;
 
-    bool converged = false;
-    for (int tick = 0; tick < 14 && !converged; ++tick) {
+    for (int tick = 0; tick < 4; ++tick) {
         locomotion.positions[0].z += 0.002F;
         locomotion.foot_contacts = {
             static_cast<uint8_t>((tick + 1) % 2),
@@ -1651,6 +1850,14 @@ void test_layered_carry_lower_body_rebases_moving_target_and_cleans_up() {
         require(
             frame.pose.foot_contacts == locomotion.foot_contacts,
             "rebased lower-body handoff cached stale contacts");
+        previous = frame;
+    }
+
+    bool converged = false;
+    for (int tick = 0; tick < 64 && !converged; ++tick) {
+        frame = handoff.apply(
+            locomotion, output, interaction::kControllerStepSeconds);
+        require_bounded_final_fk();
         converged = true;
         for (size_t bone = 0; bone <= 9U; ++bone) {
             converged = converged && flat_bone_channels_bits_equal(
@@ -1660,7 +1867,7 @@ void test_layered_carry_lower_body_rebases_moving_target_and_cleans_up() {
     }
     require(
         converged,
-        "rebased lower-body handoff did not converge within the 0.50 second contract");
+        "rebased lower-body handoff did not converge after target stabilization");
 
     locomotion.positions[0].x += 0.006F;
     locomotion.rotations[7] = quat_from_angle_axis(
@@ -1678,9 +1885,204 @@ void test_layered_carry_lower_body_rebases_moving_target_and_cleans_up() {
         "completed lower-body handoff retained stale contacts");
 }
 
+void test_layered_carry_deadline_target_change_rebases_without_exact_snap() {
+    const FlatControllerPose entry = make_flat_pose();
+    const Pose raw_reference = interaction::expand_flat_controller_pose(
+        entry, make_pose(0.375F));
+    RuntimeOutput output = make_owned_output(raw_reference);
+    output.diagnostics.state = RuntimeState::Hold;
+
+    ControllerInteractionFrameHandoff handoff;
+    ControllerInteractionFrameState previous = handoff.apply(
+        entry, output, interaction::kControllerStepSeconds);
+
+    FlatControllerPose displaced_hold = entry;
+    displaced_hold.positions[0].x += 0.20F;
+    output.pose = interaction::expand_flat_controller_pose(
+        displaced_hold, raw_reference);
+    previous = handoff.apply(
+        entry, output, interaction::kControllerStepSeconds);
+    require(
+        float_bits_equal(
+            previous.pose.positions[0].x,
+            displaced_hold.positions[0].x),
+        "deadline rebase setup did not publish the displaced Hold root");
+
+    FlatControllerPose locomotion = entry;
+    locomotion.foot_contacts = {0U, 1U};
+    output.diagnostics.state = RuntimeState::Carry;
+    output.diagnostics.recorded_carry = false;
+    previous = handoff.apply(
+        locomotion, output, interaction::kControllerStepSeconds);
+    for (int tick = 0; tick < 12; ++tick) {
+        previous = handoff.apply(
+            locomotion, output, interaction::kControllerStepSeconds);
+    }
+
+    locomotion.positions[0].x += 0.199F;
+    locomotion.foot_contacts = {1U, 0U};
+    const ControllerInteractionFrameState deadline = handoff.apply(
+        locomotion, output, interaction::kControllerStepSeconds);
+    require(
+        !float_bits_equal(
+            deadline.pose.positions[0].x,
+            locomotion.positions[0].x),
+        "0.50 second deadline forced an exact root scalar snap");
+    require(
+        !flat_bone_channels_bits_equal(deadline.pose, locomotion, 0U),
+        "0.50 second deadline forced an exact root pose snap");
+    for (size_t bone = 0; bone <= 9U; ++bone) {
+        require(
+            flat_bone_channels_bits_equal(deadline.pose, previous.pose, bone),
+            "deadline target replan took a broad lower-body trial step "
+            "instead of rebasing");
+    }
+    const FlatWorldPose previous_world = flat_world_pose(previous.pose);
+    const FlatWorldPose deadline_world = flat_world_pose(deadline.pose);
+    for (size_t bone = 0;
+         bone < interaction::kFlatControllerBoneCount;
+         ++bone) {
+        require(
+            length(
+                deadline_world.positions[bone] -
+                previous_world.positions[bone]) <= 0.20F,
+            "deadline target rebase exceeded the final-FK translation bound");
+        require(
+            rotation_distance(
+                deadline_world.rotations[bone],
+                previous_world.rotations[bone]) <=
+                60.0F * 3.14159265358979323846F / 180.0F,
+            "deadline target rebase exceeded the final-FK rotation bound");
+    }
+    require(
+        deadline.pose.foot_contacts == locomotion.foot_contacts &&
+            !deadline.synchronize_simulation_root,
+        "deadline target rebase stole contacts or simulation-root authority");
+
+    bool converged = false;
+    ControllerInteractionFrameState frame = deadline;
+    for (int tick = 0; tick < 64 && !converged; ++tick) {
+        frame = handoff.apply(
+            locomotion, output, interaction::kControllerStepSeconds);
+        converged = true;
+        for (size_t bone = 0; bone <= 9U; ++bone) {
+            converged = converged && flat_bone_channels_bits_equal(
+                frame.pose, locomotion, bone);
+        }
+    }
+    require(
+        converged,
+        "deadline-rebased lower body did not eventually converge bit-exactly");
+}
+
+void test_layered_carry_terminal_requires_velocity_offsets_to_decay() {
+    const FlatControllerPose entry = make_flat_pose();
+    const Pose raw_reference = interaction::expand_flat_controller_pose(
+        entry, make_pose(0.375F));
+    RuntimeOutput output = make_owned_output(raw_reference);
+    output.diagnostics.state = RuntimeState::Hold;
+
+    ControllerInteractionFrameHandoff handoff;
+    (void)handoff.apply(
+        entry, output, interaction::kControllerStepSeconds);
+
+    FlatControllerPose moving_hold = entry;
+    moving_hold.velocities[0].x = 1.45F;
+    moving_hold.angular_velocities[1].y = 8.0F;
+    output.pose = interaction::expand_flat_controller_pose(
+        moving_hold, raw_reference);
+    const ControllerInteractionFrameState held = handoff.apply(
+        entry, output, interaction::kControllerStepSeconds);
+    require(
+        length(held.pose.velocities[0]) > 1.0F &&
+            length(held.pose.angular_velocities[1]) > 5.0F,
+        "velocity-offset setup did not reach the rendered Hold pose");
+
+    FlatControllerPose locomotion = entry;
+    output.diagnostics.state = RuntimeState::Carry;
+    output.diagnostics.recorded_carry = false;
+    (void)handoff.apply(
+        locomotion, output, interaction::kControllerStepSeconds);
+    for (int tick = 0; tick < 12; ++tick) {
+        (void)handoff.apply(
+            locomotion, output, interaction::kControllerStepSeconds);
+    }
+
+    const ControllerInteractionFrameState deadline = handoff.apply(
+        locomotion, output, interaction::kControllerStepSeconds);
+    require(
+        !vec_bits_equal(
+            deadline.pose.velocities[0], locomotion.velocities[0]),
+        "nominal deadline discarded a residual linear-velocity offset");
+    require(
+        !vec_bits_equal(
+            deadline.pose.angular_velocities[1],
+            locomotion.angular_velocities[1]),
+        "nominal deadline discarded a residual angular-velocity offset");
+
+    bool converged = false;
+    ControllerInteractionFrameState frame = deadline;
+    for (int tick = 0; tick < 64 && !converged; ++tick) {
+        frame = handoff.apply(
+            locomotion, output, interaction::kControllerStepSeconds);
+        converged = true;
+        for (size_t bone = 0; bone <= 9U; ++bone) {
+            converged = converged && flat_bone_channels_bits_equal(
+                frame.pose, locomotion, bone);
+        }
+    }
+    require(
+        converged,
+        "velocity-offset handoff did not eventually converge bit-exactly");
+}
+
+void test_layered_carry_terminal_accepts_tightly_bounded_moving_target() {
+    const FlatControllerPose entry = make_flat_pose();
+    const Pose raw_reference = interaction::expand_flat_controller_pose(
+        entry, make_pose(0.375F));
+    RuntimeOutput output = make_owned_output(raw_reference);
+    output.diagnostics.state = RuntimeState::Hold;
+
+    ControllerInteractionFrameHandoff handoff;
+    (void)handoff.apply(
+        entry, output, interaction::kControllerStepSeconds);
+
+    FlatControllerPose locomotion = entry;
+    locomotion.velocities[0].x = 0.50F;
+    output.diagnostics.state = RuntimeState::Carry;
+    output.diagnostics.recorded_carry = false;
+    (void)handoff.apply(
+        locomotion, output, interaction::kControllerStepSeconds);
+    for (int tick = 0; tick < 12; ++tick) {
+        locomotion.positions[0].x += 0.02F;
+        (void)handoff.apply(
+            locomotion, output, interaction::kControllerStepSeconds);
+    }
+
+    locomotion.positions[0].x += 0.02F;
+    ControllerInteractionFrameState frame = handoff.apply(
+        locomotion, output, interaction::kControllerStepSeconds);
+    for (size_t bone = 0; bone <= 9U; ++bone) {
+        require(
+            flat_bone_channels_bits_equal(frame.pose, locomotion, bone),
+            "terminal handoff rejected a tightly bounded moving target");
+    }
+
+    locomotion.positions[0].x += 0.02F;
+    frame = handoff.apply(
+        locomotion, output, interaction::kControllerStepSeconds);
+    for (size_t bone = 0; bone <= 9U; ++bone) {
+        require(
+            flat_bone_channels_bits_equal(frame.pose, locomotion, bone),
+            "moving-target terminal handoff retained stale transition state");
+    }
+}
+
 void test_layered_carry_keeps_fresh_lower_body_and_contacts_bit_exact() {
     FlatControllerPose entry = make_flat_pose();
-    RuntimeOutput output = make_owned_output(make_pose(0.0F));
+    const Pose raw_reference = interaction::expand_flat_controller_pose(
+        entry, make_pose(0.0F));
+    RuntimeOutput output = make_owned_output(raw_reference);
     ControllerInteractionFrameHandoff handoff;
     (void)handoff.apply(entry, output, interaction::kControllerStepSeconds);
 
@@ -1696,11 +2098,14 @@ void test_layered_carry_keeps_fresh_lower_body_and_contacts_bit_exact() {
     locomotion.foot_contacts = {0U, 1U};
     output.diagnostics.state = RuntimeState::Carry;
     output.diagnostics.recorded_carry = false;
+    FlatControllerPose upper_target = entry;
+    upper_target.rotations[12] = quat_from_angle_axis(
+        0.15F, vec3(0.0F, 0.0F, 1.0F));
+    output.pose = interaction::expand_flat_controller_pose(
+        upper_target, raw_reference);
     output.pose.positions[8] = vec3(900.0F, -400.0F, 700.0F);
     output.pose.rotations[8] = quat_from_angle_axis(
         3.08F, vec3(1.0F, 0.0F, 0.0F));
-    output.pose.rotations[16] = quat_from_angle_axis(
-        0.45F, vec3(0.0F, 0.0F, 1.0F));
 
     const auto require_layered_authority = [&](
         const ControllerInteractionFrameState& frame,
@@ -1810,6 +2215,9 @@ void test_layered_carry_released_inactive_arm_uses_fresh_locomotion_authority() 
         }
         output.pose = interaction::expand_flat_controller_pose(
             interaction_target, raw_reference);
+        output.diagnostics.state = RuntimeState::Hold;
+        (void)handoff.apply(
+            entry, output, interaction::kControllerStepSeconds);
         output.diagnostics.state = RuntimeState::Carry;
         output.diagnostics.recorded_carry = false;
         output.diagnostics.inactive_arm_targets_locomotion = false;
@@ -1941,6 +2349,9 @@ void test_inactive_arm_locomotion_intent_does_not_change_other_carry_modes() {
             entry, output, interaction::kControllerStepSeconds);
         output.pose = interaction::expand_flat_controller_pose(
             interaction_target, raw_reference);
+        output.diagnostics.state = RuntimeState::Hold;
+        (void)handoff.apply(
+            entry, output, interaction::kControllerStepSeconds);
         output.diagnostics.state = RuntimeState::Carry;
         output.diagnostics.recorded_carry = recorded_carry;
         output.diagnostics.inactive_arm_targets_locomotion =
@@ -1992,7 +2403,7 @@ void test_inactive_arm_release_bounds_moving_target_and_spine() {
             entry, make_pose(0.375F));
         FlatControllerPose interaction_target = entry;
         interaction_target.rotations[12] = quat_from_angle_axis(
-            0.70F, normalize(vec3(0.2F, 0.8F, 0.3F)));
+            2.80F, normalize(vec3(0.2F, 0.8F, 0.3F)));
         for (size_t bone : active_chain) {
             interaction_target.rotations[bone] = quat_from_angle_axis(
                 0.85F,
@@ -2014,6 +2425,9 @@ void test_inactive_arm_release_bounds_moving_target_and_spine() {
             entry, output, interaction::kControllerStepSeconds);
         output.pose = interaction::expand_flat_controller_pose(
             interaction_target, raw_reference);
+        output.diagnostics.state = RuntimeState::Hold;
+        (void)handoff.apply(
+            entry, output, interaction::kControllerStepSeconds);
         output.diagnostics.state = RuntimeState::Carry;
         output.diagnostics.recorded_carry = false;
         output.diagnostics.inactive_arm_targets_locomotion = false;
@@ -2171,6 +2585,9 @@ void test_inactive_arm_return_to_recorded_target_is_bounded_and_convergent() {
             entry, output, interaction::kControllerStepSeconds);
         output.pose = interaction::expand_flat_controller_pose(
             layered_target, raw_reference);
+        output.diagnostics.state = RuntimeState::Hold;
+        (void)handoff.apply(
+            entry, output, interaction::kControllerStepSeconds);
         output.diagnostics.state = RuntimeState::Carry;
         output.diagnostics.recorded_carry = false;
         output.diagnostics.inactive_arm_targets_locomotion = false;
@@ -2579,7 +2996,15 @@ void test_frame_handoff_keeps_layered_carry_simulation_root_live() {
     ControllerInteractionFrameHandoff layered_handoff;
     (void)layered_handoff.apply(
         locomotion, output, interaction::kControllerStepSeconds);
-    const FlatControllerPose pre_carry_rendered = locomotion;
+    FlatControllerPose hold_target = locomotion;
+    hold_target.rotations[12] = target.rotations[12];
+    output.pose = interaction::expand_flat_controller_pose(
+        hold_target, raw_reference);
+    output.diagnostics.state = RuntimeState::Hold;
+    const FlatControllerPose pre_carry_rendered = layered_handoff.apply(
+        locomotion,
+        output,
+        interaction::kControllerStepSeconds).pose;
     locomotion.positions[0] =
         locomotion.positions[0] + vec3(-1.0F, 0.0F, 0.5F);
     locomotion.rotations[6] = quat_from_angle_axis(
@@ -3373,12 +3798,16 @@ int main() {
     test_frame_handoff_first_owned_frame_is_exact_displayed_reference();
     test_frame_handoff_applies_validated_semantic_hand_constraint_and_releases_from_it();
     test_hand_constraint_keeps_layered_carry_lower_body_exact_and_selected_only();
+    test_layered_carry_final_composite_guard_is_atomic_for_both_hands();
     test_hand_constraint_mismatch_or_invalid_input_disables_atomically();
     test_hand_constraint_reset_and_reentry_recalibrates_selected_hand();
     test_frame_handoff_crosses_179_9_to_180_1_incrementally();
     test_frame_handoff_keeps_captured_neck_and_head_while_owned();
     test_hold_to_layered_carry_first_frame_preserves_rendered_lower_body();
     test_layered_carry_lower_body_rebases_moving_target_and_cleans_up();
+    test_layered_carry_deadline_target_change_rebases_without_exact_snap();
+    test_layered_carry_terminal_requires_velocity_offsets_to_decay();
+    test_layered_carry_terminal_accepts_tightly_bounded_moving_target();
     test_layered_carry_keeps_fresh_lower_body_and_contacts_bit_exact();
     test_layered_carry_released_inactive_arm_uses_fresh_locomotion_authority();
     test_inactive_arm_locomotion_intent_does_not_change_other_carry_modes();

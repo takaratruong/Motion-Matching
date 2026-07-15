@@ -22,7 +22,15 @@ constexpr float kInactiveArmRotationStepLimitRadians = 1.047197551F;
 constexpr int kInactiveArmBackoffIterations = 16;
 constexpr size_t kLayeredCarryLowerBodyBoneCount = 10U;
 constexpr float kLayeredCarryLowerBodyHalfLifeSeconds = 0.10F;
-constexpr float kLayeredCarryLowerBodyMaximumSeconds = 0.50F;
+constexpr float kLayeredCarryLowerBodyNominalSeconds = 0.50F;
+constexpr float kLayeredCarryTerminalPositionM = 0.001F;
+constexpr float kLayeredCarryTerminalVelocityMps = 0.01F;
+constexpr float kLayeredCarryTerminalRotationRadians =
+    0.5F * 3.14159265358979323846F / 180.0F;
+constexpr float kLayeredCarryTerminalAngularVelocityRadiansPerSecond = 0.05F;
+constexpr float kLayeredCarryTerminalStepTranslationM = 0.05F;
+constexpr float kLayeredCarryTerminalStepRotationRadians =
+    15.0F * 3.14159265358979323846F / 180.0F;
 constexpr int kLayeredCarryLowerBodyBackoffIterations = 16;
 constexpr float kUnitRotationTolerance = 1.0e-3F;
 
@@ -273,18 +281,20 @@ bool inactive_arm_step_within_limits(
 
 bool flat_pose_step_within_limits(
     const FlatControllerPose& previous,
-    const FlatControllerPose& candidate) {
+    const FlatControllerPose& candidate,
+    float translation_limit_m,
+    float rotation_limit_radians) {
     const FlatWorldPose previous_world = flat_world_pose(previous);
     const FlatWorldPose candidate_world = flat_world_pose(candidate);
     for (size_t bone = 0; bone < kFlatControllerBoneCount; ++bone) {
         if (length(
                 candidate_world.positions[bone] -
                 previous_world.positions[bone]) >
-                kInactiveArmTranslationStepLimitM ||
+                translation_limit_m ||
             quat_angle_between(
                 previous_world.rotations[bone],
                 candidate_world.rotations[bone]) >
-                kInactiveArmRotationStepLimitRadians) {
+                rotation_limit_radians) {
             return false;
         }
     }
@@ -328,10 +338,36 @@ void copy_lower_body_channels(
 
 bool lower_body_step_within_limits(
     const FlatControllerPose& previous,
-    const FlatControllerPose& candidate) {
+    const FlatControllerPose& candidate,
+    float translation_limit_m = kInactiveArmTranslationStepLimitM,
+    float rotation_limit_radians =
+        kInactiveArmRotationStepLimitRadians) {
     FlatControllerPose baseline = candidate;
     copy_lower_body_channels(baseline, previous);
-    return flat_pose_step_within_limits(baseline, candidate);
+    return flat_pose_step_within_limits(
+        baseline,
+        candidate,
+        translation_limit_m,
+        rotation_limit_radians);
+}
+
+bool lower_body_offsets_are_terminal(
+    const FlatControllerPose& offsets) {
+    for (size_t bone = 0;
+         bone < kLayeredCarryLowerBodyBoneCount;
+         ++bone) {
+        if (length(offsets.positions[bone]) >
+                kLayeredCarryTerminalPositionM ||
+            length(offsets.velocities[bone]) >
+                kLayeredCarryTerminalVelocityMps ||
+            quat_angle_between(offsets.rotations[bone], quat()) >
+                kLayeredCarryTerminalRotationRadians ||
+            length(offsets.angular_velocities[bone]) >
+                kLayeredCarryTerminalAngularVelocityRadiansPerSecond) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void update_lower_body_inertialization(
@@ -743,12 +779,20 @@ ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
     const RuntimeOutput& runtime_output,
     float dt,
     std::optional<ControllerInteractionHandConstraint> hand_constraint) {
-    ControllerInteractionFrameState state;
-    state.runtime_owns_pose = runtime_output.owns_pose;
     const bool layered_carry =
         runtime_output.owns_pose &&
         runtime_output.diagnostics.state == RuntimeState::Carry &&
         !runtime_output.diagnostics.recorded_carry;
+    const bool validate_lower_handoff_final_composite =
+        runtime_owned_last_update_ && layered_carry &&
+        (!layered_carry_last_update_ ||
+         lower_body_inertialization_active_);
+    std::optional<ControllerInteractionFrameHandoff> handoff_before;
+    if (validate_lower_handoff_final_composite) {
+        handoff_before.emplace(*this);
+    }
+    ControllerInteractionFrameState state;
+    state.runtime_owns_pose = runtime_output.owns_pose;
 
     if (runtime_output.owns_pose) {
         if (!runtime_owned_last_update_) {
@@ -815,14 +859,30 @@ ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
                     lower_body_inertialization_seconds_ = 0.0F;
                 } else if (lower_body_inertialization_active_) {
                     const float step_seconds = std::max(dt, 0.0F);
-                    const bool exact_target_due =
+                    const bool nominal_time_elapsed =
                         lower_body_inertialization_seconds_ + step_seconds >=
-                        kLayeredCarryLowerBodyMaximumSeconds;
-                    if (exact_target_due && lower_body_step_within_limits(
-                            last_rendered_pose_, state.pose)) {
+                        kLayeredCarryLowerBodyNominalSeconds;
+                    const bool terminal_offsets =
+                        lower_body_offsets_are_terminal(
+                            lower_body_inertial_offsets_);
+                    const bool terminal_step = lower_body_step_within_limits(
+                        last_rendered_pose_,
+                        state.pose,
+                        kLayeredCarryTerminalStepTranslationM,
+                        kLayeredCarryTerminalStepRotationRadians);
+                    if (nominal_time_elapsed && terminal_offsets &&
+                        terminal_step) {
                         lower_body_inertialization_active_ = false;
                         lower_body_inertialization_seconds_ = 0.0F;
                         lower_body_inertial_offsets_ = {};
+                    } else if (nominal_time_elapsed && !terminal_step) {
+                        begin_lower_body_inertialization(
+                            lower_body_inertial_offsets_,
+                            last_rendered_pose_,
+                            locomotion_pose);
+                        copy_lower_body_channels(
+                            state.pose, last_rendered_pose_);
+                        lower_body_inertialization_seconds_ = 0.0F;
                     } else {
                         FlatControllerPose trial = state.pose;
                         FlatControllerPose trial_offsets =
@@ -837,7 +897,7 @@ ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
                             state.pose = trial;
                             lower_body_inertial_offsets_ = trial_offsets;
                             lower_body_inertialization_seconds_ = std::min(
-                                kLayeredCarryLowerBodyMaximumSeconds,
+                                kLayeredCarryLowerBodyNominalSeconds,
                                 lower_body_inertialization_seconds_ +
                                     step_seconds);
                         } else {
@@ -903,7 +963,7 @@ ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
                             state.pose = accepted;
                             lower_body_inertial_offsets_ = accepted_offsets;
                             lower_body_inertialization_seconds_ = std::min(
-                                kLayeredCarryLowerBodyMaximumSeconds,
+                                kLayeredCarryLowerBodyNominalSeconds,
                                 elapsed_before_backoff + accepted_seconds);
                         }
                     }
@@ -1022,6 +1082,17 @@ ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
                 hand_constraint->grasp_world,
                 runtime_output.diagnostics.hand_constraint_weight,
                 dt);
+        }
+
+        if (validate_lower_handoff_final_composite &&
+            !flat_pose_step_within_limits(
+                handoff_before->last_rendered_pose_,
+                state.pose,
+                kInactiveArmTranslationStepLimitM,
+                kInactiveArmRotationStepLimitRadians)) {
+            *this = *handoff_before;
+            throw FormatError(
+                "layered Carry final composite exceeded step limits");
         }
 
         state.overrides_locomotion_pose = true;
