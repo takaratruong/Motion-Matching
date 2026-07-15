@@ -10,6 +10,10 @@
 
 namespace interaction {
 
+namespace rotation_gate {
+struct Rotation;
+}
+
 struct Transform {
     vec3 position;
     quat rotation;
@@ -47,6 +51,12 @@ Pose sample_pose(
     uint32_t clip,
     float seconds_from_entry);
 WorldPose world_pose(const Pose& pose);
-quat raw_world_rotation(const Pose& pose, size_t bone);
+rotation_gate::Rotation world_rotation_evidence(
+    const Pose& pose,
+    size_t bone);
+rotation_gate::Rotation world_rotation_evidence(
+    const Pose& pose,
+    size_t bone,
+    const rotation_gate::Rotation& root_rotation_evidence);
 
 }  // namespace interaction

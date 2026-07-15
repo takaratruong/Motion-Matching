@@ -7,6 +7,10 @@
 
 namespace interaction {
 
+namespace rotation_gate {
+struct Rotation;
+}
+
 struct IKConfig {
     float maximum_request_position_m = 0.12F;
     float maximum_request_orientation_radians = 0.436332313F;
@@ -31,6 +35,21 @@ IKResult solve_hand_ik(
     Pose& pose,
     Hand hand,
     Transform target_hand_world,
+    const IKConfig& config);
+
+IKResult solve_hand_ik_with_rotation_evidence(
+    Pose& pose,
+    Hand hand,
+    Transform target_hand_world,
+    const rotation_gate::Rotation& target_rotation_evidence,
+    const IKConfig& config);
+
+IKResult solve_hand_ik_with_rotation_evidence(
+    Pose& pose,
+    Hand hand,
+    Transform target_hand_world,
+    const rotation_gate::Rotation& target_rotation_evidence,
+    const rotation_gate::Rotation& root_rotation_evidence,
     const IKConfig& config);
 
 }  // namespace interaction

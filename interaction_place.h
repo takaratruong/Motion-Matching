@@ -147,6 +147,7 @@ private:
     void start_validated(
         const PlaceCandidate& candidate,
         const PlaceMatchInput& input);
+    rotation_gate::Rotation mapped_root_rotation_evidence() const;
     PlaceCandidate candidate_{};
     PlaceMatchInput input_{};
     double source_frame_ = 0.0;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "interaction_place.h"
+#include "interaction_rotation_gate.h"
 
 #include <cstdint>
 
@@ -54,8 +55,8 @@ private:
     PlaceBeginInput begin_{};
     Transform goal_object_{};
     Transform goal_hand_{};
-    quat goal_object_rotation_raw_{};
-    quat goal_hand_rotation_raw_{};
+    rotation_gate::Rotation goal_object_rotation_evidence_{};
+    rotation_gate::Rotation goal_hand_rotation_evidence_{};
     vec3 release_hand_translation_{};
     quat release_hand_rotation_{};
     Pose last_safe_pose_{};

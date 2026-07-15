@@ -515,69 +515,17 @@ void set_current_hand_error(
         input.current_pose.rotations[kRightHand]));
 }
 
-quat normalized_for_test(quat value) {
-    const double norm = std::sqrt(
-        static_cast<double>(value.w) * value.w +
-        static_cast<double>(value.x) * value.x +
-        static_cast<double>(value.y) * value.y +
-        static_cast<double>(value.z) * value.z);
-    return value * static_cast<float>(1.0 / norm);
-}
-
-double production_relative_rotation_error(quat hand, quat object) {
-    const quat object_rotation = normalized_for_test(object);
-    const quat relative = normalized_for_test(quat_mul(
-        quat_inv(object_rotation), normalized_for_test(hand)));
-    const quat actual = normalized_for_test(relative);
-    const quat expected = normalized_for_test(quat());
-    const rotation_gate::Measure measured = rotation_gate::measure(
-        actual, expected);
-    return measured.valid
-        ? measured.radians
-        : std::numeric_limits<double>::max();
-}
-
 void set_current_hand_orientation_boundary(
     PlaceMatchInput& input,
     float limit,
     bool over) {
     set_current_hand_error(input, 0.0F, 0.0F);
     input.current_object_world.rotation = quat();
-    const float half = 0.5F * limit;
-    const float w = std::cos(half);
-    float below_y = std::sin(half);
-    float above_y = below_y;
-    std::optional<quat> best_below;
-    std::optional<quat> best_above;
-    double best_below_error = -1.0;
-    double best_above_error = std::numeric_limits<double>::infinity();
-    for (int step = 0; step < 4096; ++step) {
-        for (float y : {below_y, above_y}) {
-            const quat candidate(w, 0.0F, y, 0.0F);
-            Pose trial_pose = input.current_pose;
-            trial_pose.rotations[kRightHand] = candidate;
-            const double error = production_relative_rotation_error(
-                hand_transform(trial_pose).rotation,
-                input.current_object_world.rotation);
-            if (error <= limit && error > best_below_error) {
-                best_below = candidate;
-                best_below_error = error;
-            }
-            if (error > limit && error < best_above_error) {
-                best_above = candidate;
-                best_above_error = error;
-            }
-        }
-        below_y = std::nextafter(
-            below_y, -std::numeric_limits<float>::infinity());
-        above_y = std::nextafter(
-            above_y, std::numeric_limits<float>::infinity());
-    }
-    const std::optional<quat>& selected = over ? best_above : best_below;
-    if (!selected.has_value()) {
-        throw std::logic_error("test could not encode orientation boundary");
-    }
-    input.current_pose.rotations[kRightHand] = *selected;
+    const float encoded = over
+        ? std::nextafter(limit, std::numeric_limits<float>::infinity())
+        : limit;
+    input.current_pose.rotations[kRightHand] = quat_from_angle_axis(
+        encoded, vec3(0.0F, 1.0F, 0.0F));
 }
 
 void expect_reversed_fallback(PlaceFixture fixture) {
@@ -2339,7 +2287,8 @@ void test_commit_event_derivation_and_runtime_bounds() {
                    result.candidate.release_frame);
         const int32_t commit_ticks = static_cast<int32_t>(std::ceil(
             static_cast<double>(offset) / speed));
-        const float elapsed = static_cast<float>(commit_ticks) / 25.0F;
+        const float elapsed = static_cast<float>(
+            static_cast<double>(commit_ticks) / 25.0);
         TEST_CHECK(elapsed >= fixture.input.timing.entry_blend_seconds);
         TEST_CHECK(elapsed <= fixture.input.timing.maximum_alignment_seconds);
     }
@@ -2354,8 +2303,8 @@ void test_commit_event_derivation_and_runtime_bounds() {
             recorded.library.recorded.front().entry_frame;
         const int32_t commit_ticks = static_cast<int32_t>(std::ceil(
             static_cast<double>(delta) / speed));
-        const float observable_elapsed =
-            static_cast<float>(commit_ticks) / 25.0F;
+        const float observable_elapsed = static_cast<float>(
+            static_cast<double>(commit_ticks) / 25.0);
         recorded.input.timing.maximum_alignment_seconds = observable_elapsed;
         const PlaceResult exact = select_place_motion(recorded.input);
         TEST_CHECK(exact.accepted);
@@ -2374,8 +2323,8 @@ void test_commit_event_derivation_and_runtime_bounds() {
             reversed.input.timing.reversed_commit_seconds * 25.0F * speed));
         const int32_t commit_ticks = static_cast<int32_t>(std::ceil(
             static_cast<double>(offset) / speed));
-        const float observable_elapsed =
-            static_cast<float>(commit_ticks) / 25.0F;
+        const float observable_elapsed = static_cast<float>(
+            static_cast<double>(commit_ticks) / 25.0);
         reversed.input.timing.entry_blend_seconds = observable_elapsed;
         const PlaceResult exact = select_place_motion(reversed.input);
         TEST_CHECK(exact.accepted);

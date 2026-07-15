@@ -10,6 +10,13 @@
 namespace interaction {
 namespace rotation_gate {
 
+struct Rotation {
+    double w = 1.0;
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+};
+
 struct Measure {
     double vector_squared = 0.0;
     double scalar_squared = 0.0;
@@ -37,26 +44,47 @@ inline bool finite_bits(quat value) {
            finite_bits(value.y) && finite_bits(value.z);
 }
 
-inline Measure measure(quat target, quat current) {
+inline bool finite_bits(const Rotation& value) {
+    return finite_bits(value.w) && finite_bits(value.x) &&
+           finite_bits(value.y) && finite_bits(value.z);
+}
+
+inline Rotation from_quat(quat value) {
+    return {value.w, value.x, value.y, value.z};
+}
+
+inline Rotation multiply(Rotation left, Rotation right) {
+    return {
+        right.w * left.w - right.x * left.x -
+            right.y * left.y - right.z * left.z,
+        right.w * left.x + right.x * left.w -
+            right.y * left.z + right.z * left.y,
+        right.w * left.y + right.x * left.z +
+            right.y * left.w - right.z * left.x,
+        right.w * left.z - right.x * left.y +
+            right.y * left.x + right.z * left.w,
+    };
+}
+
+inline Rotation inverse(Rotation value) {
+    return {-value.w, value.x, value.y, value.z};
+}
+
+inline Measure measure(Rotation target, Rotation current) {
     if (!finite_bits(target) || !finite_bits(current)) return {};
 
-    const double tw = target.w;
-    const double tx = target.x;
-    const double ty = target.y;
-    const double tz = target.z;
-    const double cw = current.w;
-    const double cx = current.x;
-    const double cy = current.y;
-    const double cz = current.z;
-
     const double relative_w =
-        tw * cw + tx * cx + ty * cy + tz * cz;
+        target.w * current.w + target.x * current.x +
+        target.y * current.y + target.z * current.z;
     const double relative_x =
-        -tw * cx + tx * cw - ty * cz + tz * cy;
+        -target.w * current.x + target.x * current.w -
+        target.y * current.z + target.z * current.y;
     const double relative_y =
-        -tw * cy + tx * cz + ty * cw - tz * cx;
+        -target.w * current.y + target.x * current.z +
+        target.y * current.w - target.z * current.x;
     const double relative_z =
-        -tw * cz - tx * cy + ty * cx + tz * cw;
+        -target.w * current.z - target.x * current.y +
+        target.y * current.x + target.z * current.w;
     const double vector_squared =
         relative_x * relative_x +
         relative_y * relative_y +
@@ -74,6 +102,10 @@ inline Measure measure(quat target, quat current) {
     return {vector_squared, scalar_squared, radians, true};
 }
 
+inline Measure measure(quat target, quat current) {
+    return measure(from_quat(target), from_quat(current));
+}
+
 inline double half_tangent_squared(const Measure& value) {
     if (!value.valid) return std::numeric_limits<double>::max();
     if (value.scalar_squared == 0.0) {
@@ -85,13 +117,32 @@ inline double half_tangent_squared(const Measure& value) {
         : std::numeric_limits<double>::max();
 }
 
-inline double maximum_half_tangent_squared(float maximum_radians) {
-    const double tangent = std::tan(
-        0.5 * static_cast<double>(maximum_radians));
-    const double result = tangent * tangent;
+inline double encoded_half_tangent_squared(float radians) {
+    const float half = 0.5F * radians;
+    const float sine = std::sin(half);
+    const float cosine = std::cos(half);
+    const double sine_squared =
+        static_cast<double>(sine) * static_cast<double>(sine);
+    const double cosine_squared =
+        static_cast<double>(cosine) * static_cast<double>(cosine);
+    if (cosine_squared == 0.0) {
+        return std::numeric_limits<double>::max();
+    }
+    const double result = sine_squared / cosine_squared;
     return finite_bits(result)
         ? result
         : std::numeric_limits<double>::max();
+}
+
+inline double maximum_half_tangent_squared(float maximum_radians) {
+    const double exact = encoded_half_tangent_squared(maximum_radians);
+    const float next_radians = std::nextafter(
+        maximum_radians, std::numeric_limits<float>::infinity());
+    const double next = encoded_half_tangent_squared(next_radians);
+    if (finite_bits(exact) && finite_bits(next) && next > exact) {
+        return exact + 0.5 * (next - exact);
+    }
+    return exact;
 }
 
 inline bool within(const Measure& value, float maximum_radians) {
@@ -103,6 +154,13 @@ inline bool within(const Measure& value, float maximum_radians) {
     if (maximum_radians >= kPi) return true;
     return half_tangent_squared(value) <=
         maximum_half_tangent_squared(maximum_radians);
+}
+
+inline bool within(
+    const Rotation& target,
+    const Rotation& current,
+    float maximum_radians) {
+    return within(measure(target, current), maximum_radians);
 }
 
 inline bool within(

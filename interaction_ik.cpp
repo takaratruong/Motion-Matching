@@ -13,6 +13,7 @@ namespace {
 
 constexpr size_t kJointCount = 7U;
 constexpr size_t kResidualDimension = 6U;
+constexpr size_t kRootBone = static_cast<size_t>(g1_skeleton::Simulation);
 
 using ArmMetadata = std::array<HingeJoint, kJointCount>;
 using JointAngles = std::array<float, kJointCount>;
@@ -62,7 +63,17 @@ vec3 orientation_delta(quat target, quat current) {
 Transform hand_world(const Pose& pose, const ArmMetadata& metadata) {
     const WorldPose world = world_pose(pose);
     const size_t bone = static_cast<size_t>(metadata.back().bone);
-    return {world.positions[bone], raw_world_rotation(pose, bone)};
+    return {world.positions[bone], normalize_exact(world.rotations[bone])};
+}
+
+rotation_gate::Rotation hand_rotation_evidence(
+    const Pose& pose,
+    const ArmMetadata& metadata,
+    const rotation_gate::Rotation& root_rotation_evidence) {
+    return world_rotation_evidence(
+        pose,
+        static_cast<size_t>(metadata.back().bone),
+        root_rotation_evidence);
 }
 
 float decompose_angle(const HingeJoint& joint, quat local_rotation) {
@@ -100,6 +111,8 @@ Evaluation evaluate(
     const Pose& pose,
     const ArmMetadata& metadata,
     Transform target,
+    const rotation_gate::Rotation& target_rotation_evidence,
+    const rotation_gate::Rotation& root_rotation_evidence,
     float orientation_scale) {
     const Transform current = hand_world(pose, metadata);
     Evaluation evaluation{};
@@ -107,7 +120,9 @@ Evaluation evaluate(
     evaluation.orientation_residual = orientation_delta(
         target.rotation, current.rotation);
     evaluation.orientation_measure = rotation_gate::measure(
-        target.rotation, current.rotation);
+        target_rotation_evidence,
+        hand_rotation_evidence(
+            pose, metadata, root_rotation_evidence));
     evaluation.position_error = length(evaluation.position_residual);
     evaluation.orientation_error = rotation_gate::radians(
         evaluation.orientation_measure);
@@ -301,11 +316,48 @@ IKResult solve_hand_ik(
     Hand hand,
     Transform target_hand_world,
     const IKConfig& config) {
+    return solve_hand_ik_with_rotation_evidence(
+        pose,
+        hand,
+        target_hand_world,
+        rotation_gate::from_quat(target_hand_world.rotation),
+        config);
+}
+
+IKResult solve_hand_ik_with_rotation_evidence(
+    Pose& pose,
+    Hand hand,
+    Transform target_hand_world,
+    const rotation_gate::Rotation& target_rotation_evidence,
+    const IKConfig& config) {
+    return solve_hand_ik_with_rotation_evidence(
+        pose,
+        hand,
+        target_hand_world,
+        target_rotation_evidence,
+        rotation_gate::from_quat(pose.rotations[kRootBone]),
+        config);
+}
+
+IKResult solve_hand_ik_with_rotation_evidence(
+    Pose& pose,
+    Hand hand,
+    Transform target_hand_world,
+    const rotation_gate::Rotation& target_rotation_evidence,
+    const rotation_gate::Rotation& root_rotation_evidence,
+    const IKConfig& config) {
     const ArmMetadata& metadata = metadata_for(hand);
     const JointAngles requested_angles = decompose_angles(pose, metadata);
-    if (!finite_transform(target_hand_world) || !valid_config(config)) {
+    const rotation_gate::Measure target_validity = rotation_gate::measure(
+        target_rotation_evidence, rotation_gate::Rotation{});
+    if (!finite_transform(target_hand_world) || !target_validity.valid ||
+        !valid_config(config)) {
         const Evaluation invalid = evaluate(
-            pose, metadata, target_hand_world,
+            pose,
+            metadata,
+            target_hand_world,
+            target_rotation_evidence,
+            root_rotation_evidence,
             config.orientation_scale_m_per_radian);
         return make_result(
             false,
@@ -316,7 +368,11 @@ IKResult solve_hand_ik(
             false);
     }
     const Evaluation requested = evaluate(
-        pose, metadata, target_hand_world,
+        pose,
+        metadata,
+        target_hand_world,
+        target_rotation_evidence,
+        root_rotation_evidence,
         config.orientation_scale_m_per_radian);
     if (!rotation_gate::finite_bits(requested.position_error) ||
         !requested.orientation_measure.valid ||
@@ -357,7 +413,11 @@ IKResult solve_hand_ik(
     Pose working_pose = pose;
     apply_angles(working_pose, metadata, angles);
     Evaluation working = evaluate(
-        working_pose, metadata, target_hand_world,
+        working_pose,
+        metadata,
+        target_hand_world,
+        target_rotation_evidence,
+        root_rotation_evidence,
         config.orientation_scale_m_per_radian);
     Pose best_pose = working_pose;
     JointAngles best_angles = angles;
@@ -391,7 +451,11 @@ IKResult solve_hand_ik(
         Pose trial_pose = working_pose;
         apply_angles(trial_pose, metadata, trial_angles);
         const Evaluation trial = evaluate(
-            trial_pose, metadata, target_hand_world,
+            trial_pose,
+            metadata,
+            target_hand_world,
+            target_rotation_evidence,
+            root_rotation_evidence,
             config.orientation_scale_m_per_radian);
         if (rotation_gate::finite_bits(trial.score) &&
             trial.score < best.score) {

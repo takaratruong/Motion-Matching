@@ -122,6 +122,20 @@ PLACE_SELECTION_FAST_MATH_TEST := \
 PLACE_RELEASE_FAST_MATH_TEST := \
   $(CPP_TEST_DIR)/test_interaction_place_release_fast_math
 
+INTERACTION_POSE_GATE_DEPENDENTS := \
+  interaction_query_probe \
+  $(CPP_TEST_DIR)/test_interaction_pose \
+  $(CPP_TEST_DIR)/test_interaction_place_target \
+  $(CPP_TEST_DIR)/test_interaction_place_collision \
+  $(CPP_TEST_DIR)/test_interaction_features \
+  $(CPP_TEST_DIR)/test_interaction_matcher \
+  $(CPP_TEST_DIR)/test_interaction_playback \
+  $(CPP_TEST_DIR)/test_interaction_attachment \
+  $(CPP_TEST_DIR)/test_interaction_target_rig_ik \
+  $(SAFE_INTERACTION_QUERY_PROBE)
+
+$(INTERACTION_POSE_GATE_DEPENDENTS): interaction_rotation_gate.h
+
 INTERACTION_RUNTIME_SOURCES := interaction_runtime.cpp
 INTERACTION_RUNTIME_SOURCES += interaction_carry.cpp interaction_ik.cpp
 INTERACTION_RUNTIME_SOURCES += interaction_attachment.cpp interaction_playback.cpp

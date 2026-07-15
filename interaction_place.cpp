@@ -134,24 +134,44 @@ size_t hand_bone(Hand hand) {
         : static_cast<size_t>(g1_skeleton::RightWrist);
 }
 
+struct RotationTransform {
+    Transform value{};
+    rotation_gate::Rotation rotation{};
+};
+
+RotationTransform with_rotation_evidence(Transform value) {
+    return {value, rotation_gate::from_quat(value.rotation)};
+}
+
 Transform pose_hand(const Pose& pose, Hand hand) {
     const WorldPose world = world_pose(pose);
     const size_t bone = hand_bone(hand);
     return {world.positions[bone], normalized(world.rotations[bone])};
 }
 
-quat pose_hand_rotation_raw(const Pose& pose, Hand hand) {
-    return raw_world_rotation(pose, hand_bone(hand));
+rotation_gate::Rotation pose_hand_rotation_evidence(
+    const Pose& pose,
+    Hand hand) {
+    return world_rotation_evidence(pose, hand_bone(hand));
 }
 
-Transform mapped_pose_hand_for_gate(
+RotationTransform pose_hand_for_gate(const Pose& pose, Hand hand) {
+    return {
+        pose_hand(pose, hand),
+        pose_hand_rotation_evidence(pose, hand),
+    };
+}
+
+RotationTransform mapped_pose_hand_for_gate(
     const Pose& source_pose,
     Transform scene,
     Hand hand) {
-    Transform result = compose(scene, pose_hand(source_pose, hand));
-    result.rotation = quat_mul(
-        scene.rotation, pose_hand_rotation_raw(source_pose, hand));
-    return result;
+    return {
+        compose(scene, pose_hand(source_pose, hand)),
+        rotation_gate::multiply(
+            rotation_gate::from_quat(scene.rotation),
+            pose_hand_rotation_evidence(source_pose, hand)),
+    };
 }
 
 Pose rigidly_mapped_pose(Pose pose, Transform mapping) {
@@ -788,7 +808,7 @@ bool valid_place_ik(const IKConfig& config) {
 struct ValidatedInput {
     const PlaceAffordance* requested_affordance = nullptr;
     Transform goal_object{};
-    quat goal_object_rotation_raw{};
+    rotation_gate::Rotation goal_object_rotation_evidence{};
 };
 
 std::optional<Reason> validate_input(
@@ -840,10 +860,12 @@ std::optional<Reason> validate_input(
         validated.goal_object = placement_goal_world(
             input.surface,
             validated.requested_affordance->object_in_surface);
-        validated.goal_object_rotation_raw = quat_mul(
-            input.surface.surface_world.rotation,
-            validated.requested_affordance
-                ->object_in_surface.rotation);
+        validated.goal_object_rotation_evidence = rotation_gate::multiply(
+            rotation_gate::from_quat(
+                input.surface.surface_world.rotation),
+            rotation_gate::from_quat(
+                validated.requested_affordance
+                    ->object_in_surface.rotation));
     } catch (const std::exception&) {
         return Reason::SurfaceUnavailable;
     }
@@ -851,26 +873,43 @@ std::optional<Reason> validate_input(
 }
 
 bool within_transform_error(
-    Transform actual,
-    Transform expected,
+    const RotationTransform& actual,
+    const RotationTransform& expected,
     float maximum_position,
     float maximum_orientation) {
-    return distance(actual.position, expected.position) <= maximum_position &&
+    return distance(
+               actual.value.position,
+               expected.value.position) <= maximum_position &&
            rotation_gate::within(
                actual.rotation,
                expected.rotation,
                maximum_orientation);
 }
 
-Transform goal_hand_for_gate(
+bool within_transform_error(
+    Transform actual,
+    Transform expected,
+    float maximum_position,
+    float maximum_orientation) {
+    return within_transform_error(
+        with_rotation_evidence(actual),
+        with_rotation_evidence(expected),
+        maximum_position,
+        maximum_orientation);
+}
+
+RotationTransform goal_hand_for_gate(
     const PlaceMatchInput& input,
     const ValidatedInput& validated) {
-    Transform result = compose(
-        validated.goal_object, input.held_affordance.hand_in_object);
-    result.rotation = quat_mul(
-        validated.goal_object_rotation_raw,
-        input.held_affordance.hand_in_object.rotation);
-    return result;
+    return {
+        compose(
+            validated.goal_object,
+            input.held_affordance.hand_in_object),
+        rotation_gate::multiply(
+            validated.goal_object_rotation_evidence,
+            rotation_gate::from_quat(
+                input.held_affordance.hand_in_object.rotation)),
+    };
 }
 
 struct SelectionFailures {
@@ -943,11 +982,11 @@ std::optional<Transform> solve_release_object(
     Pose source_pose,
     Transform scene,
     Hand hand,
-    Transform goal_hand,
+    const RotationTransform& goal_hand,
     const PlaceMatchInput& input,
     SelectionFailures& failures) {
     Pose mapped_pose = rigidly_mapped_pose(source_pose, scene);
-    const Transform mapped_hand = mapped_pose_hand_for_gate(
+    const RotationTransform mapped_hand = mapped_pose_hand_for_gate(
         source_pose, scene, hand);
     if (!within_transform_error(
             mapped_hand,
@@ -957,8 +996,16 @@ std::optional<Transform> solve_release_object(
         failures.remember(Reason::CorrectionLimit);
         return std::nullopt;
     }
-    const IKResult result = solve_hand_ik(
-        mapped_pose, hand, goal_hand, input.ik);
+    const IKResult result = solve_hand_ik_with_rotation_evidence(
+        mapped_pose,
+        hand,
+        goal_hand.value,
+        goal_hand.rotation,
+        rotation_gate::multiply(
+            rotation_gate::from_quat(scene.rotation),
+            rotation_gate::from_quat(
+                source_pose.rotations[kRootBone])),
+        input.ik);
     if (!result.accepted) {
         failures.remember(
             result.reason == Reason::JointLimit
@@ -989,18 +1036,23 @@ bool current_attachment_within_request(
         input.current_pose, input.held_affordance.hand);
     const quat object_rotation = normalized(
         input.current_object_world.rotation);
-    const Transform actual_hand_in_object{
-        quat_mul_vec3(
-            quat_inv(object_rotation),
-            current_hand.position - input.current_object_world.position),
-        quat_mul(
-            quat_inv(input.current_object_world.rotation),
-            pose_hand_rotation_raw(
+    const RotationTransform actual_hand_in_object{
+        Transform{
+            quat_mul_vec3(
+                quat_inv(object_rotation),
+                current_hand.position - input.current_object_world.position),
+            quat(),
+        },
+        rotation_gate::multiply(
+            rotation_gate::inverse(rotation_gate::from_quat(
+                input.current_object_world.rotation)),
+            pose_hand_rotation_evidence(
                 input.current_pose, input.held_affordance.hand)),
     };
     return within_transform_error(
         actual_hand_in_object,
-        input.held_affordance.hand_in_object,
+        with_rotation_evidence(
+            input.held_affordance.hand_in_object),
         input.ik.maximum_request_position_m,
         input.ik.maximum_request_orientation_radians);
 }
@@ -1077,16 +1129,18 @@ std::optional<RecordedRow> validate_recorded_row(
         if (clip.active_hand_contacts[static_cast<size_t>(frame)] != 1U) {
             return std::nullopt;
         }
-        Transform actual = pose_hand(
+        const RotationTransform actual = pose_hand_for_gate(
             clip.poses[static_cast<size_t>(frame)], clip.hand);
-        actual.rotation = pose_hand_rotation_raw(
-            clip.poses[static_cast<size_t>(frame)], clip.hand);
-        Transform expected = compose(
-            clip.object_poses[static_cast<size_t>(frame)],
-            clip.hand_in_object);
-        expected.rotation = quat_mul(
-            clip.object_poses[static_cast<size_t>(frame)].rotation,
-            clip.hand_in_object.rotation);
+        const RotationTransform expected{
+            compose(
+                clip.object_poses[static_cast<size_t>(frame)],
+                clip.hand_in_object),
+            rotation_gate::multiply(
+                rotation_gate::from_quat(
+                    clip.object_poses[static_cast<size_t>(frame)].rotation),
+                rotation_gate::from_quat(
+                    clip.hand_in_object.rotation)),
+        };
         if (!within_transform_error(
                 actual,
                 expected,
@@ -1265,11 +1319,11 @@ std::optional<PlaceCandidate> recorded_candidate(
         clip.object_poses[static_cast<size_t>(clip.release_frame)];
     const Transform scene = planar_alignment(
         source_release_object, validated.goal_object);
-    const Transform mapped_release_hand = mapped_pose_hand_for_gate(
+    const RotationTransform mapped_release_hand = mapped_pose_hand_for_gate(
         clip.poses[static_cast<size_t>(clip.release_frame)],
         scene,
         clip.hand);
-    const Transform goal_hand = goal_hand_for_gate(input, validated);
+    const RotationTransform goal_hand = goal_hand_for_gate(input, validated);
     if (!within_transform_error(
             mapped_release_hand,
             goal_hand,
@@ -1351,9 +1405,12 @@ std::optional<PlaceCandidate> recorded_candidate(
         bounds_cost(clip.object_bounds, input.held_object_bounds) +
         *continuity_cost +
         static_cast<float>(
-            distance(mapped_release_hand.position, goal_hand.position) +
+            distance(
+                mapped_release_hand.value.position,
+                goal_hand.value.position) +
             rotation_error(
-                mapped_release_hand.rotation, goal_hand.rotation));
+                mapped_release_hand.value.rotation,
+                goal_hand.value.rotation));
     if (!finite(candidate.total_cost)) return std::nullopt;
     return candidate;
 }
@@ -1524,7 +1581,7 @@ bool database_frame_valid(const Database& database, int32_t frame) {
     return true;
 }
 
-Transform database_hand_in_object(
+RotationTransform database_hand_in_object(
     const Database& database,
     int32_t frame,
     Hand hand) {
@@ -1532,11 +1589,13 @@ Transform database_hand_in_object(
     Transform normalized_object = object;
     normalized_object.rotation = normalized(object.rotation);
     const Pose pose = pose_at_frame(database, frame);
-    Transform result = compose(
-        inverse(normalized_object), pose_hand(pose, hand));
-    result.rotation = quat_mul(
-        quat_inv(object.rotation), pose_hand_rotation_raw(pose, hand));
-    return result;
+    return {
+        compose(inverse(normalized_object), pose_hand(pose, hand)),
+        rotation_gate::multiply(
+            rotation_gate::inverse(
+                rotation_gate::from_quat(object.rotation)),
+            pose_hand_rotation_evidence(pose, hand)),
+    };
 }
 
 bool stable_hold_window(
@@ -1544,7 +1603,7 @@ bool stable_hold_window(
     int32_t window_start,
     Hand hand) {
     const size_t active = static_cast<size_t>(hand);
-    std::array<Transform, kStableHoldSamples> relative{};
+    std::array<RotationTransform, kStableHoldSamples> relative{};
     for (size_t sample = 0; sample < kStableHoldSamples; ++sample) {
         const int32_t frame = window_start + static_cast<int32_t>(sample);
         if (!database_frame_valid(database, frame) ||
@@ -1677,9 +1736,10 @@ std::optional<PlaceCandidate> select_reverse_tier(
     const Transform source_contact_hand = pose_hand(
         pose_at_frame(*input.pickup_database, pickup.contact_frame),
         input.held_affordance.hand);
-    const Transform goal_hand = goal_hand_for_gate(input, validated);
-    const Transform scene = planar_alignment(source_contact_hand, goal_hand);
-    const Transform mapped_contact_hand = mapped_pose_hand_for_gate(
+    const RotationTransform goal_hand = goal_hand_for_gate(input, validated);
+    const Transform scene = planar_alignment(
+        source_contact_hand, goal_hand.value);
+    const RotationTransform mapped_contact_hand = mapped_pose_hand_for_gate(
         pose_at_frame(*input.pickup_database, pickup.contact_frame),
         scene,
         input.held_affordance.hand);
@@ -1776,8 +1836,12 @@ std::optional<PlaceCandidate> select_reverse_tier(
         yaw_radians(current_root.rotation) -
         yaw_radians(staging_root.rotation));
     candidate.total_cost = static_cast<float>(
-        distance(mapped_contact_hand.position, goal_hand.position) +
-        rotation_error(mapped_contact_hand.rotation, goal_hand.rotation));
+        distance(
+            mapped_contact_hand.value.position,
+            goal_hand.value.position) +
+        rotation_error(
+            mapped_contact_hand.value.rotation,
+            goal_hand.value.rotation));
     if (!finite(candidate.total_cost) || candidate.source_id == 0U) {
         return std::nullopt;
     }
@@ -2126,6 +2190,16 @@ PlaceSample PlacePlayer::sample() const {
             inverse(input_.held_affordance.hand_in_object));
     }
     return result;
+}
+
+rotation_gate::Rotation PlacePlayer::mapped_root_rotation_evidence() const {
+    if (!started_) throw std::logic_error("place player is not started");
+    const Pose source = interpolate_source_pose(
+        candidate_, input_, source_frame_);
+    return rotation_gate::multiply(
+        rotation_gate::from_quat(
+            candidate_.scene_from_source.rotation),
+        rotation_gate::from_quat(source.rotations[kRootBone]));
 }
 
 int32_t PlacePlayer::source_frame() const {

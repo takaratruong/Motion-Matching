@@ -1,4 +1,5 @@
 #include "interaction_pose.h"
+#include "interaction_rotation_gate.h"
 
 #include <algorithm>
 #include <cmath>
@@ -158,7 +159,9 @@ WorldPose world_pose(const Pose& pose) {
     return world;
 }
 
-quat raw_world_rotation(const Pose& pose, size_t bone) {
+rotation_gate::Rotation world_rotation_evidence(
+    const Pose& pose,
+    size_t bone) {
     if (bone >= g1_skeleton::BoneCount) {
         throw std::out_of_range("interaction pose bone index out of range");
     }
@@ -172,10 +175,42 @@ quat raw_world_rotation(const Pose& pose, size_t bone) {
         current = static_cast<size_t>(parent);
     }
 
-    quat rotation = pose.rotations[chain[count - 1U]];
+    rotation_gate::Rotation rotation = rotation_gate::from_quat(
+        pose.rotations[chain[count - 1U]]);
     while (count > 1U) {
         --count;
-        rotation = quat_mul(rotation, pose.rotations[chain[count - 1U]]);
+        rotation = rotation_gate::multiply(
+            rotation,
+            rotation_gate::from_quat(
+                pose.rotations[chain[count - 1U]]));
+    }
+    return rotation;
+}
+
+rotation_gate::Rotation world_rotation_evidence(
+    const Pose& pose,
+    size_t bone,
+    const rotation_gate::Rotation& root_rotation_evidence) {
+    if (bone >= g1_skeleton::BoneCount) {
+        throw std::out_of_range("interaction pose bone index out of range");
+    }
+    std::array<size_t, g1_skeleton::BoneCount> chain{};
+    size_t count = 0U;
+    size_t current = bone;
+    while (true) {
+        chain[count++] = current;
+        const int32_t parent = g1_skeleton::kParents[current];
+        if (parent < 0) break;
+        current = static_cast<size_t>(parent);
+    }
+
+    rotation_gate::Rotation rotation = root_rotation_evidence;
+    while (count > 1U) {
+        --count;
+        rotation = rotation_gate::multiply(
+            rotation,
+            rotation_gate::from_quat(
+                pose.rotations[chain[count - 1U]]));
     }
     return rotation;
 }

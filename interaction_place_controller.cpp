@@ -269,8 +269,12 @@ Transform hand_world(const Pose& pose, Hand hand) {
     return {world.positions[bone], normalized(world.rotations[bone])};
 }
 
-quat hand_world_rotation_raw(const Pose& pose, Hand hand) {
-    return raw_world_rotation(pose, hand_bone(hand));
+rotation_gate::Rotation hand_world_rotation_evidence(
+    const Pose& pose,
+    Hand hand,
+    const rotation_gate::Rotation& root_rotation_evidence) {
+    return world_rotation_evidence(
+        pose, hand_bone(hand), root_rotation_evidence);
 }
 
 Transform hand_derived_object(
@@ -340,7 +344,38 @@ Pose corrected_source_pose(
         smoothstep(blend_progress));
 }
 
-Transform weighted_hand_target(
+rotation_gate::Rotation corrected_root_rotation_evidence(
+    const Pose& corrected_pose,
+    const rotation_gate::Rotation& mapped_source_root_evidence,
+    const PlaceBeginInput& begin,
+    double source_frame,
+    int32_t output_tick,
+    int32_t entry_blend_ticks) {
+    const float blend_progress = std::clamp(
+        static_cast<float>(output_tick) /
+            static_cast<float>(entry_blend_ticks),
+        0.0F,
+        1.0F);
+    if (blend_progress < 1.0F) {
+        return rotation_gate::from_quat(
+            corrected_pose.rotations[kRoot]);
+    }
+    const float progress = source_progress(begin.candidate, source_frame);
+    const float root_weight = 1.0F - smoothstep(progress);
+    const quat yaw = quat_from_angle_axis(
+        root_weight * begin.candidate.entry_yaw_offset,
+        vec3(0.0F, 1.0F, 0.0F));
+    return rotation_gate::multiply(
+        rotation_gate::from_quat(yaw),
+        mapped_source_root_evidence);
+}
+
+struct WeightedHandTarget {
+    Transform value{};
+    quat correction{};
+};
+
+WeightedHandTarget weighted_hand_target(
     Transform current,
     vec3 release_translation,
     quat release_rotation,
@@ -349,8 +384,11 @@ Transform weighted_hand_target(
     const quat weighted_rotation = quat_nlerp_shortest(
         quat(), release_rotation, progress);
     return {
-        current.position + progress * release_translation,
-        normalized(quat_mul(weighted_rotation, current.rotation)),
+        Transform{
+            current.position + progress * release_translation,
+            normalized(quat_mul(weighted_rotation, current.rotation)),
+        },
+        weighted_rotation,
     };
 }
 
@@ -419,20 +457,27 @@ PlaceBeginResult PlaceController::begin(const PlaceBeginInput& input) {
         const Transform goal_hand = compose(
             goal_object,
             input.match_input.held_affordance.hand_in_object);
-        const quat goal_object_rotation_raw = quat_mul(
-            input.match_input.surface.surface_world.rotation,
-            input.match_input.place_affordance
-                .object_in_surface.rotation);
-        const quat goal_hand_rotation_raw = quat_mul(
-            goal_object_rotation_raw,
-            input.match_input.held_affordance
-                .hand_in_object.rotation);
+        const rotation_gate::Rotation goal_object_rotation_evidence =
+            rotation_gate::multiply(
+                rotation_gate::from_quat(
+                    input.match_input.surface.surface_world.rotation),
+                rotation_gate::from_quat(
+                    input.match_input.place_affordance
+                        .object_in_surface.rotation));
+        const rotation_gate::Rotation goal_hand_rotation_evidence =
+            rotation_gate::multiply(
+                goal_object_rotation_evidence,
+                rotation_gate::from_quat(
+                    input.match_input.held_affordance
+                        .hand_in_object.rotation));
         const Transform release_hand = hand_world(
             release_sample.pose,
             input.match_input.held_affordance.hand);
-        const quat release_hand_rotation_raw = hand_world_rotation_raw(
-            release_sample.pose,
-            input.match_input.held_affordance.hand);
+        const rotation_gate::Rotation release_hand_rotation_evidence =
+            hand_world_rotation_evidence(
+                release_sample.pose,
+                input.match_input.held_affordance.hand,
+                release_probe.mapped_root_rotation_evidence());
         const vec3 release_translation =
             goal_hand.position - release_hand.position;
         const quat release_rotation = normalized(quat_mul(
@@ -442,8 +487,8 @@ PlaceBeginResult PlaceController::begin(const PlaceBeginInput& input) {
             distance(goal_hand.position, release_hand.position) >
                 ik_config_.maximum_request_position_m ||
             !rotation_gate::within(
-                goal_hand_rotation_raw,
-                release_hand_rotation_raw,
+                goal_hand_rotation_evidence,
+                release_hand_rotation_evidence,
                 ik_config_.maximum_request_orientation_radians)) {
             return {false, Reason::CorrectionLimit};
         }
@@ -473,8 +518,8 @@ PlaceBeginResult PlaceController::begin(const PlaceBeginInput& input) {
         begin_ = input;
         goal_object_ = goal_object;
         goal_hand_ = goal_hand;
-        goal_object_rotation_raw_ = goal_object_rotation_raw;
-        goal_hand_rotation_raw_ = goal_hand_rotation_raw;
+        goal_object_rotation_evidence_ = goal_object_rotation_evidence;
+        goal_hand_rotation_evidence_ = goal_hand_rotation_evidence;
         release_hand_translation_ = release_translation;
         release_hand_rotation_ = release_rotation;
         last_safe_pose_ = input.match_input.current_pose;
@@ -514,6 +559,8 @@ PlaceStep PlaceController::update(float dt) {
     PlacePlayer trial = player_;
     trial.advance(dt);
     const PlaceSample sample = trial.sample();
+    const rotation_gate::Rotation mapped_source_root_evidence =
+        trial.mapped_root_rotation_evidence();
     const int32_t next_output_tick = output_ticks_ + 1;
     Pose pose = corrected_source_pose(
         sample.pose,
@@ -521,6 +568,14 @@ PlaceStep PlaceController::update(float dt) {
         trial.source_frame_exact(),
         next_output_tick,
         entry_blend_ticks_);
+    const rotation_gate::Rotation root_rotation_evidence =
+        corrected_root_rotation_evidence(
+            pose,
+            mapped_source_root_evidence,
+            begin_,
+            trial.source_frame_exact(),
+            next_output_tick,
+            entry_blend_ticks_);
 
     PlaceStep step{};
     step.pose = pose;
@@ -542,9 +597,12 @@ PlaceStep PlaceController::update(float dt) {
         begin_.candidate, trial.source_frame_exact());
     const Transform current_hand = hand_world(
         pose, begin_.match_input.held_affordance.hand);
-    const quat current_hand_rotation_raw = hand_world_rotation_raw(
-        pose, begin_.match_input.held_affordance.hand);
-    const Transform target_hand = weighted_hand_target(
+    const rotation_gate::Rotation current_hand_rotation_evidence =
+        hand_world_rotation_evidence(
+            pose,
+            begin_.match_input.held_affordance.hand,
+            root_rotation_evidence);
+    const WeightedHandTarget target_hand = weighted_hand_target(
         current_hand,
         release_hand_translation_,
         release_hand_rotation_,
@@ -553,8 +611,8 @@ PlaceStep PlaceController::update(float dt) {
         (distance(goal_hand_.position, current_hand.position) >
              ik_config_.maximum_request_position_m ||
          !rotation_gate::within(
-             goal_hand_rotation_raw_,
-             current_hand_rotation_raw,
+             goal_hand_rotation_evidence_,
+             current_hand_rotation_evidence,
              ik_config_.maximum_request_orientation_radians))) {
         recovering_ = true;
         last_step_ = recovery_step(
@@ -565,10 +623,17 @@ PlaceStep PlaceController::update(float dt) {
         return last_step_;
     }
     const double requested_position = distance(
-        target_hand.position, current_hand.position);
+        target_hand.value.position, current_hand.position);
+    const rotation_gate::Rotation target_hand_rotation_evidence =
+        progress >= 1.0F
+            ? goal_hand_rotation_evidence_
+            : rotation_gate::multiply(
+                  rotation_gate::from_quat(target_hand.correction),
+                  current_hand_rotation_evidence);
     const rotation_gate::Measure requested_orientation =
         rotation_gate::measure(
-            target_hand.rotation, current_hand_rotation_raw);
+            target_hand_rotation_evidence,
+            current_hand_rotation_evidence);
     if (requested_position > ik_config_.maximum_request_position_m ||
         !rotation_gate::within(
             requested_orientation,
@@ -582,10 +647,12 @@ PlaceStep PlaceController::update(float dt) {
         return last_step_;
     }
 
-    const IKResult ik = solve_hand_ik(
+    const IKResult ik = solve_hand_ik_with_rotation_evidence(
         pose,
         begin_.match_input.held_affordance.hand,
-        target_hand,
+        target_hand.value,
+        target_hand_rotation_evidence,
+        root_rotation_evidence,
         ik_config_);
     if (!ik.accepted) {
         recovering_ = true;
@@ -615,15 +682,22 @@ PlaceStep PlaceController::update(float dt) {
     if (trial.release_due()) {
         const double position_error = distance(
             object_world.position, goal_object_.position);
-        const quat raw_object_rotation = quat_mul(
-            hand_world_rotation_raw(
-                pose, begin_.match_input.held_affordance.hand),
-            quat_inv(
-                begin_.match_input.held_affordance
-                    .hand_in_object.rotation));
+        const rotation_gate::Rotation object_rotation_evidence =
+            rotation_gate::multiply(
+                hand_world_rotation_evidence(
+                    pose,
+                    begin_.match_input.held_affordance.hand,
+                    root_rotation_evidence),
+                rotation_gate::inverse(rotation_gate::from_quat(
+                    begin_.match_input.held_affordance
+                        .hand_in_object.rotation)));
         const rotation_gate::Measure orientation_error =
             rotation_gate::measure(
-                raw_object_rotation, goal_object_rotation_raw_);
+                object_rotation_evidence,
+                goal_object_rotation_evidence_);
+        const bool orientation_within = rotation_gate::within(
+            orientation_error,
+            config_.release_orientation_radians);
         step.hand_position_error_m = static_cast<float>(position_error);
         step.hand_orientation_error_radians =
             rotation_gate::classified_radians(
@@ -641,9 +715,7 @@ PlaceStep PlaceController::update(float dt) {
                 step.hand_orientation_error_radians;
             return last_step_;
         }
-        if (!rotation_gate::within(
-                orientation_error,
-                config_.release_orientation_radians)) {
+        if (!orientation_within) {
             recovering_ = true;
             last_step_ = recovery_step(
                 last_safe_pose_,
