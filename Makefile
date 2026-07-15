@@ -109,6 +109,8 @@ CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_runtime
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_controller_adapter
 RELEASE_FAST_MATH_TARGET_TEST := \
   $(CPP_TEST_DIR)/test_interaction_target_release_fast_math
+RELEASE_FAST_MATH_CARRY_TEST := \
+  $(CPP_TEST_DIR)/test_interaction_carry_release_fast_math
 
 INTERACTION_RUNTIME_SOURCES := interaction_runtime.cpp
 INTERACTION_RUNTIME_SOURCES += interaction_carry.cpp interaction_ik.cpp
@@ -119,6 +121,7 @@ INTERACTION_RUNTIME_SOURCES += interaction_pose.cpp interaction_target.cpp
 .PHONY: test-python test-cpp test-interaction
 .PHONY: test-python-interaction-safe test-interaction-safe
 .PHONY: test-interaction-target-release-fast-math
+.PHONY: test-interaction-carry-release-fast-math
 .PHONY: demo-interaction-pack gate-playable-interaction
 .PHONY: gate1-interaction
 
@@ -142,6 +145,9 @@ $(CPP_TEST_DIR)/test_interaction_target: tests/cpp/test_interaction_target.cpp i
 
 $(RELEASE_FAST_MATH_TARGET_TEST): tests/cpp/test_interaction_target.cpp interaction_target.cpp interaction_target.h interaction_pose.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) -O3 -DNDEBUG -ffast-math tests/cpp/test_interaction_target.cpp interaction_target.cpp -o $@
+
+$(RELEASE_FAST_MATH_CARRY_TEST): tests/cpp/test_interaction_carry_fast_math.cpp tests/cpp/interaction_runtime_fixture.h interaction_carry.cpp interaction_carry.h interaction_ik.cpp interaction_ik.h g1_arm_joint_metadata.h interaction_matcher.cpp interaction_matcher.h interaction_features.cpp interaction_features.h interaction_pose.cpp interaction_pose.h interaction_target.cpp interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) -O3 -DNDEBUG -ffast-math tests/cpp/test_interaction_carry_fast_math.cpp interaction_carry.cpp interaction_ik.cpp interaction_matcher.cpp interaction_features.cpp interaction_pose.cpp interaction_target.cpp -o $@
 
 $(CPP_TEST_DIR)/test_interaction_features: tests/cpp/test_interaction_features.cpp interaction_features.cpp interaction_features.h interaction_pose.cpp interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_features.cpp interaction_features.cpp interaction_pose.cpp -o $@
@@ -190,6 +196,9 @@ test-cpp: $(CPP_TEST_BINS)
 test-interaction-target-release-fast-math: $(RELEASE_FAST_MATH_TARGET_TEST)
 	$(RELEASE_FAST_MATH_TARGET_TEST)
 
+test-interaction-carry-release-fast-math: $(RELEASE_FAST_MATH_CARRY_TEST)
+	$(RELEASE_FAST_MATH_CARRY_TEST)
+
 test-interaction: test-python test-cpp
 
 test-python-interaction-safe: interaction_probe $(SAFE_INTERACTION_QUERY_PROBE)
@@ -199,7 +208,8 @@ test-python-interaction-safe: interaction_probe $(SAFE_INTERACTION_QUERY_PROBE)
 	  python -m unittest discover -s tests/python -t . -v
 
 test-interaction-safe: test-python-interaction-safe test-cpp \
-  test-interaction-target-release-fast-math
+  test-interaction-target-release-fast-math \
+  test-interaction-carry-release-fast-math
 
 gate1-interaction: test-interaction-safe interaction_probe
 	python -m resources.build_g1_interaction_database \

@@ -284,6 +284,8 @@ class ControllerDependencyMakefileTests(unittest.TestCase):
 class ReleaseFastMathMakefileTests(unittest.TestCase):
     TARGET = "test-interaction-target-release-fast-math"
     BINARY = "build/tests/test_interaction_target_release_fast_math"
+    CARRY_TARGET = "test-interaction-carry-release-fast-math"
+    CARRY_BINARY = "build/tests/test_interaction_carry_release_fast_math"
 
     def _dry_run(self, target: str) -> list[str]:
         repository = Path(__file__).resolve().parents[2]
@@ -313,11 +315,48 @@ class ReleaseFastMathMakefileTests(unittest.TestCase):
         self.assertIn("interaction_target.cpp", compile_line.split())
         self.assertEqual(lines.count(self.BINARY), 1, "\n".join(lines))
 
+    def _assert_carry_compiles_and_runs(self, lines: list[str]):
+        compile_lines = [
+            line
+            for line in lines
+            if "tests/cpp/test_interaction_carry_fast_math.cpp" in line
+            and f"-o {self.CARRY_BINARY}" in line
+        ]
+        self.assertEqual(len(compile_lines), 1, "\n".join(lines))
+        compile_line = compile_lines[0]
+        compile_parts = compile_line.split()
+        for flag in ("-O3", "-DNDEBUG", "-ffast-math", "-I."):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, compile_parts)
+        for source in (
+            "interaction_carry.cpp",
+            "interaction_ik.cpp",
+            "interaction_matcher.cpp",
+            "interaction_features.cpp",
+            "interaction_pose.cpp",
+            "interaction_target.cpp",
+        ):
+            with self.subTest(source=source):
+                self.assertIn(source, compile_parts)
+        self.assertEqual(
+            lines.count(self.CARRY_BINARY), 1, "\n".join(lines)
+        )
+
     def test_release_fast_math_target_compiles_and_runs_target_validation(self):
         self._assert_compiles_and_runs(self._dry_run(self.TARGET))
 
     def test_safe_suite_executes_release_fast_math_target_validation(self):
         self._assert_compiles_and_runs(self._dry_run("test-interaction-safe"))
+
+    def test_carry_release_fast_math_target_compiles_and_runs_validation(self):
+        self._assert_carry_compiles_and_runs(
+            self._dry_run(self.CARRY_TARGET)
+        )
+
+    def test_safe_suite_executes_carry_release_fast_math_validation(self):
+        self._assert_carry_compiles_and_runs(
+            self._dry_run("test-interaction-safe")
+        )
 
 
 @unittest.skipUnless(

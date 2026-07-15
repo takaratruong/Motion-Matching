@@ -6,6 +6,8 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -22,7 +24,18 @@ constexpr int32_t kCarrySeamAttempts = 8;
 constexpr int64_t kLayeredSeamKey = -1;
 constexpr int64_t kUnsetSeamKey = -2;
 bool finite(float value) {
-    return std::isfinite(value);
+    uint32_t bits = 0U;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    return (bits & 0x7f800000U) != 0x7f800000U;
+}
+
+bool finite(double value) {
+    uint64_t bits = 0U;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    return (bits & 0x7ff0000000000000ULL) !=
+        0x7ff0000000000000ULL;
 }
 
 bool finite(vec3 value) {
@@ -1052,7 +1065,7 @@ Pose CarryController::update(
         static_cast<double>(config_.search_interval_seconds);
     const double accumulated =
         search_seconds_exact_ + static_cast<double>(dt);
-    if (!std::isfinite(accumulated)) {
+    if (!finite(accumulated)) {
         throw std::invalid_argument("interaction carry search time overflow");
     }
     const bool interval_due = accumulated >= interval;
@@ -1098,7 +1111,7 @@ Pose CarryController::update(
                  ++frame) {
                 const double cost = pose_trajectory_cost(
                     *features_, query, frame);
-                if (std::isfinite(cost) && cost < best_cost) {
+                if (finite(cost) && cost < best_cost) {
                     best_cost = cost;
                     best_range = static_cast<int32_t>(range_index);
                     best_frame = frame;
@@ -1122,7 +1135,7 @@ Pose CarryController::update(
                 const double cost = pose_trajectory_cost(
                     *features_, query, frame);
                 continue_current =
-                    std::isfinite(cost) && equal_cost(cost, best_cost);
+                    finite(cost) && equal_cost(cost, best_cost);
             }
         }
         if (!continue_current) {
