@@ -359,58 +359,6 @@ Pose expand_flat_controller_pose(
 
 FlatControllerPose collapse_interaction_pose(
     const Pose& interaction_pose,
-    const FlatControllerPose& flat_fallback) {
-    validate_interaction_pose(interaction_pose);
-    validate_flat_pose(flat_fallback);
-
-    WorldPose interaction_world{};
-    for (size_t bone = 0; bone < g1_skeleton::BoneCount; ++bone) {
-        update_g1_world_bone(interaction_world, interaction_pose, bone);
-    }
-
-    FlatControllerPose collapsed = flat_fallback;
-    FlatWorldPose collapsed_world{};
-    for (size_t flat_bone = 0; flat_bone < kFlatControllerBoneCount;
-         ++flat_bone) {
-        const int32_t g1_bone_value = kFlatToG1Bone[flat_bone];
-        if (g1_bone_value >= 0) {
-            const size_t g1_bone = static_cast<size_t>(g1_bone_value);
-            const int32_t parent = kFlatControllerParents[flat_bone];
-            if (parent < 0) {
-                collapsed.positions[flat_bone] =
-                    interaction_world.positions[g1_bone];
-                collapsed.velocities[flat_bone] =
-                    interaction_world.velocities[g1_bone];
-                collapsed.rotations[flat_bone] = normalized_rotation(
-                    interaction_world.rotations[g1_bone]);
-                collapsed.angular_velocities[flat_bone] =
-                    interaction_world.angular_velocities[g1_bone];
-            } else {
-                const size_t parent_bone = static_cast<size_t>(parent);
-                solve_local_channel(
-                    collapsed.positions[flat_bone],
-                    collapsed.velocities[flat_bone],
-                    collapsed.rotations[flat_bone],
-                    collapsed.angular_velocities[flat_bone],
-                    interaction_world.positions[g1_bone],
-                    interaction_world.velocities[g1_bone],
-                    interaction_world.rotations[g1_bone],
-                    interaction_world.angular_velocities[g1_bone],
-                    collapsed_world.positions[parent_bone],
-                    collapsed_world.velocities[parent_bone],
-                    collapsed_world.rotations[parent_bone],
-                    collapsed_world.angular_velocities[parent_bone]);
-            }
-        }
-        update_flat_world_bone(collapsed_world, collapsed, flat_bone);
-    }
-    collapsed.foot_contacts = interaction_pose.foot_contacts;
-    validate_flat_pose(collapsed);
-    return collapsed;
-}
-
-FlatControllerPose collapse_interaction_pose(
-    const Pose& interaction_pose,
     const Pose& interaction_reference,
     const FlatControllerPose& flat_reference) {
     validate_interaction_pose(interaction_pose);
@@ -532,26 +480,54 @@ ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
 
     if (runtime_output.owns_pose) {
         if (!runtime_owned_last_update_) {
-            blend_source_ =
+            ownership_interaction_reference_ = runtime_output.pose;
+            ownership_flat_reference_ =
                 release_active_ ? last_rendered_pose_ : locomotion_pose;
-            ownership_fallback_ = blend_source_;
-            blend_seconds_ = 0.0F;
             release_active_ = false;
+            runtime_owned_last_update_ = true;
+            state.pose = ownership_flat_reference_;
+            state.overrides_locomotion_pose = true;
+            state.synchronize_simulation_root =
+                runtime_output.diagnostics.state != RuntimeState::Carry ||
+                runtime_output.diagnostics.recorded_carry;
+            state.simulation_root_position = state.pose.positions[0];
+            state.simulation_root_rotation = state.pose.rotations[0];
+            last_rendered_pose_ = state.pose;
+            return state;
         }
-        runtime_owned_last_update_ = true;
 
-        const FlatControllerPose target = collapse_interaction_pose(
-            runtime_output.pose, ownership_fallback_);
-        blend_seconds_ += std::max(dt, 0.0F);
-        const float alpha = std::clamp(
-            blend_seconds_ / kOwnershipBlendSeconds, 0.0F, 1.0F);
-        state.pose = alpha >= 1.0F
-            ? target
-            : blend_flat_pose(blend_source_, target, alpha);
+        FlatControllerPose target = collapse_interaction_pose(
+            runtime_output.pose,
+            ownership_interaction_reference_,
+            ownership_flat_reference_);
+        for (size_t bone = 0; bone < target.rotations.size(); ++bone) {
+            if (quat_dot(
+                    last_rendered_pose_.rotations[bone],
+                    target.rotations[bone]) < 0.0F) {
+                target.rotations[bone] = -target.rotations[bone];
+            }
+        }
+
+        const bool layered_carry =
+            runtime_output.diagnostics.state == RuntimeState::Carry &&
+            !runtime_output.diagnostics.recorded_carry;
+        if (layered_carry) {
+            state.pose = locomotion_pose;
+            for (size_t bone = 10U;
+                 bone < kFlatControllerBoneCount;
+                 ++bone) {
+                state.pose.positions[bone] = target.positions[bone];
+                state.pose.velocities[bone] = target.velocities[bone];
+                state.pose.rotations[bone] = target.rotations[bone];
+                state.pose.angular_velocities[bone] =
+                    target.angular_velocities[bone];
+            }
+            state.pose.foot_contacts = locomotion_pose.foot_contacts;
+        } else {
+            state.pose = target;
+        }
         state.overrides_locomotion_pose = true;
-        state.synchronize_simulation_root =
-            runtime_output.diagnostics.state != RuntimeState::Carry ||
-            runtime_output.diagnostics.recorded_carry;
+        state.synchronize_simulation_root = !layered_carry;
         state.simulation_root_position = state.pose.positions[0];
         state.simulation_root_rotation = state.pose.rotations[0];
         last_rendered_pose_ = state.pose;
@@ -591,7 +567,8 @@ void ControllerInteractionFrameHandoff::reset() {
     release_active_ = false;
     blend_seconds_ = 0.0F;
     blend_source_ = {};
-    ownership_fallback_ = {};
+    ownership_interaction_reference_ = {};
+    ownership_flat_reference_ = {};
     last_rendered_pose_ = {};
 }
 

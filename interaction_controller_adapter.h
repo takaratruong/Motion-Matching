@@ -68,9 +68,6 @@ Pose expand_flat_controller_pose(
     const Pose& interaction_reference);
 FlatControllerPose collapse_interaction_pose(
     const Pose& interaction_pose,
-    const FlatControllerPose& flat_fallback);
-FlatControllerPose collapse_interaction_pose(
-    const Pose& interaction_pose,
     const Pose& interaction_reference,
     const FlatControllerPose& flat_reference);
 
@@ -126,7 +123,8 @@ private:
     bool release_active_ = false;
     float blend_seconds_ = 0.0F;
     FlatControllerPose blend_source_{};
-    FlatControllerPose ownership_fallback_{};
+    Pose ownership_interaction_reference_{};
+    FlatControllerPose ownership_flat_reference_{};
     FlatControllerPose last_rendered_pose_{};
 };
 
