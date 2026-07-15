@@ -94,28 +94,28 @@ RUNTIME_CACHED_FIELDS = (
     "carry_mode",
 )
 FLAT_JOINT_NAMES = (
-    "Root",
-    "LeftHip",
-    "LeftKnee",
-    "LeftAnkle",
+    "Entity",
+    "Hips",
+    "LeftUpLeg",
+    "LeftLeg",
     "LeftFoot",
     "LeftToe",
-    "RightHip",
-    "RightKnee",
-    "RightAnkle",
+    "RightUpLeg",
+    "RightLeg",
     "RightFoot",
-    "SpineLower",
-    "SpineMiddle",
-    "SpineUpper",
+    "RightToe",
+    "Spine",
+    "Spine1",
+    "Spine2",
     "Neck",
     "Head",
     "LeftShoulder",
-    "LeftUpperArm",
-    "LeftForearm",
+    "LeftArm",
+    "LeftForeArm",
     "LeftHand",
     "RightShoulder",
-    "RightUpperArm",
-    "RightForearm",
+    "RightArm",
+    "RightForeArm",
     "RightHand",
 )
 JOINT_TRANSLATION_LIMIT_M = 0.20
@@ -1424,6 +1424,18 @@ class Task12PolicyTests(unittest.TestCase):
             "release must clear the prior owned reference",
         )
 
+    def test_flat_joint_names_match_character_h_order(self):
+        self.assertEqual(
+            FLAT_JOINT_NAMES,
+            (
+                "Entity", "Hips", "LeftUpLeg", "LeftLeg", "LeftFoot",
+                "LeftToe", "RightUpLeg", "RightLeg", "RightFoot",
+                "RightToe", "Spine", "Spine1", "Spine2", "Neck", "Head",
+                "LeftShoulder", "LeftArm", "LeftForeArm", "LeftHand",
+                "RightShoulder", "RightArm", "RightForeArm", "RightHand",
+            ),
+        )
+
     def test_autodemo_samples_all_rendered_joints_after_final_fk_before_draw(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")
         final_fk = controller.index("        forward_kinematics_full(")
@@ -1441,6 +1453,13 @@ class Task12PolicyTests(unittest.TestCase):
             draw,
             "autodemo joints must be sampled before drawing",
         )
+        self.assertEqual(
+            controller[final_fk:draw].count(
+                "capture_autodemo_rendered_joints("
+            ),
+            1,
+            "autodemo must capture one final rendered-joint sample",
+        )
 
         capture_function = self._cpp_function(
             controller,
@@ -1452,8 +1471,34 @@ class Task12PolicyTests(unittest.TestCase):
         self.assertIn("quat_normalize(global_bone_rotations", capture_function)
 
         writer = self._cpp_function(controller, "void write_autodemo_record(")
+        self.assertIn(
+            "const AutodemoRenderedJoints& rendered_joints,",
+            writer,
+            "JSON writer must consume the post-final-FK joint capture",
+        )
+        self.assertNotIn("global_bone_positions", writer)
+        self.assertNotIn("global_bone_rotations", writer)
+        self.assertIn(
+            "const vec3 position = rendered_joints.positions[joint];",
+            writer,
+        )
+        self.assertIn(
+            "const quat rotation = rendered_joints.rotations[joint];",
+            writer,
+        )
         self.assertIn('\\"joint_world_positions\\":[', writer)
         self.assertIn('\\"joint_world_rotations\\":[', writer)
+
+        writer_call = self._source_between(
+            controller,
+            "                write_autodemo_record(",
+            "                if (!autodemo_state.carry_origin_captured",
+        )
+        self.assertEqual(
+            writer_call.count("autodemo_rendered_joints.value()"),
+            1,
+            "JSON writer must receive exactly the final rendered-joint value",
+        )
 
     def test_canonical_world_is_initialized_once_before_log_and_update(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")
