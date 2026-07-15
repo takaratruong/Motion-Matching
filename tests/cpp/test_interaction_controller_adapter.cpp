@@ -189,6 +189,8 @@ void require_same_rotation(
         message);
 }
 
+float rotation_distance(quat left, quat right);
+
 void assert_vec_near(vec3 actual, vec3 expected, float tolerance = 1.0e-5F) {
     assert(near(actual.x, expected.x, tolerance));
     assert(near(actual.y, expected.y, tolerance));
@@ -481,26 +483,92 @@ void test_flat_bridge_expansion_matches_every_world_anchor_and_retains_reference
     assert(expanded.foot_contacts == flat.foot_contacts);
 }
 
-void test_flat_bridge_collapse_round_trips_all_channels_and_contacts() {
-    const FlatControllerPose original = make_flat_pose();
-    const Pose reference = make_pose(0.5F);
-    const Pose expanded =
-        interaction::expand_flat_controller_pose(original, reference);
-    const FlatControllerPose collapsed =
-        interaction::collapse_interaction_pose(expanded, original);
-    assert_flat_pose_near(collapsed, original);
+void test_reference_retarget_raw_reference_is_exact_flat_reference() {
+    const Pose raw_reference = make_pose(0.5F);
+    const FlatControllerPose flat_reference = make_flat_pose();
+    const FlatControllerPose result = interaction::collapse_interaction_pose(
+        raw_reference, raw_reference, flat_reference);
+    require(
+        flat_pose_bits_equal(result, flat_reference),
+        "raw ownership reference did not reproduce displayed flat reference");
+}
 
-    for (size_t bone : {13U, 14U}) {
-        assert(vec_bits_equal(
-            collapsed.positions[bone], original.positions[bone]));
-        assert(vec_bits_equal(
-            collapsed.velocities[bone], original.velocities[bone]));
-        assert(quat_bits_equal(
-            collapsed.rotations[bone], original.rotations[bone]));
-        assert(vec_bits_equal(
-            collapsed.angular_velocities[bone],
-            original.angular_velocities[bone]));
+void test_reference_retarget_fixes_nonroot_translations_under_mismatched_source() {
+    const Pose raw_reference = make_pose(0.25F);
+    Pose current = raw_reference;
+    for (size_t bone = 1; bone < g1_skeleton::BoneCount; ++bone) {
+        const float value = static_cast<float>(bone + 1U);
+        current.positions[bone] = vec3(
+            10.0F * value, -7.0F * value, 13.0F * value);
     }
+    const FlatControllerPose flat_reference = make_flat_pose();
+    const FlatControllerPose result = interaction::collapse_interaction_pose(
+        current, raw_reference, flat_reference);
+    for (size_t bone = 1; bone < interaction::kFlatControllerBoneCount;
+         ++bone) {
+        require(
+            vec_bits_equal(
+                result.positions[bone], flat_reference.positions[bone]),
+            "source morphology changed a target non-root translation");
+    }
+}
+
+void test_reference_retarget_transfers_mapped_world_rotation_delta() {
+    constexpr size_t kFlatSpineUpper = 12U;
+    constexpr size_t kG1SpineUpper = 16U;
+    const Pose raw_reference = make_pose(0.75F);
+    Pose current = raw_reference;
+    current.rotations[kG1SpineUpper] = quat_mul(
+        quat_from_angle_axis(
+            0.35F, normalize(vec3(0.2F, 0.9F, 0.3F))),
+        current.rotations[kG1SpineUpper]);
+    const FlatControllerPose flat_reference = make_flat_pose();
+    const FlatControllerPose result = interaction::collapse_interaction_pose(
+        current, raw_reference, flat_reference);
+    const interaction::WorldPose source_reference_world =
+        interaction::world_pose(raw_reference);
+    const interaction::WorldPose source_current_world =
+        interaction::world_pose(current);
+    const FlatWorldPose target_reference_world =
+        flat_world_pose(flat_reference);
+    const FlatWorldPose target_current_world = flat_world_pose(result);
+    const quat source_world_delta = quat_mul(
+        source_current_world.rotations[kG1SpineUpper],
+        quat_inv(source_reference_world.rotations[kG1SpineUpper]));
+    const quat expected = quat_mul(
+        source_world_delta,
+        target_reference_world.rotations[kFlatSpineUpper]);
+    require_same_rotation(
+        target_current_world.rotations[kFlatSpineUpper],
+        expected,
+        "mapped world-rotation delta was not calibrated onto flat reference");
+}
+
+void test_reference_retarget_keeps_neck_and_head_reference_locals() {
+    const Pose raw_reference = make_pose(1.0F);
+    Pose current = raw_reference;
+    current.rotations[16] = quat_mul(
+        quat_from_angle_axis(0.08F, vec3(0.0F, 1.0F, 0.0F)),
+        current.rotations[16]);
+    const FlatControllerPose flat_reference = make_flat_pose();
+    const FlatControllerPose result = interaction::collapse_interaction_pose(
+        current, raw_reference, flat_reference);
+    for (size_t bone : {13U, 14U}) {
+        require(vec_bits_equal(result.positions[bone],
+                               flat_reference.positions[bone]),
+                "Neck/Head local translation left target reference");
+        require(quat_bits_equal(result.rotations[bone],
+                                flat_reference.rotations[bone]),
+                "Neck/Head local rotation left target reference");
+    }
+    const FlatWorldPose before = flat_world_pose(flat_reference);
+    const FlatWorldPose after = flat_world_pose(result);
+    require(rotation_distance(before.rotations[13], after.rotations[13]) <
+                0.10F,
+            "Neck world motion exceeded its continuous parent delta");
+    require(rotation_distance(before.rotations[14], after.rotations[14]) <
+                0.10F,
+            "Head world motion exceeded its continuous parent delta");
 }
 
 void test_flat_bridge_accepts_antipodal_equivalent_rotations() {
@@ -531,7 +599,7 @@ void test_flat_bridge_accepts_antipodal_equivalent_rotations() {
     }
     assert_flat_pose_near(
         interaction::collapse_interaction_pose(
-            antipodal_expanded, antipodal),
+            antipodal_expanded, positive_expanded, antipodal),
         antipodal);
 }
 
@@ -583,9 +651,10 @@ void test_flat_bridge_rejects_invalid_input_without_mutation() {
     FlatControllerPose fallback = make_flat_pose();
     const Pose invalid_interaction_before = invalid_interaction;
     const FlatControllerPose fallback_before = fallback;
+    const Pose collapse_reference = make_pose(1.5F);
     expect_format_error([&] {
         (void)interaction::collapse_interaction_pose(
-            invalid_interaction, fallback);
+            invalid_interaction, collapse_reference, fallback);
     });
     assert(pose_bits_equal(invalid_interaction, invalid_interaction_before));
     assert(flat_pose_bits_equal(fallback, fallback_before));
@@ -596,7 +665,7 @@ void test_flat_bridge_rejects_invalid_input_without_mutation() {
     const FlatControllerPose invalid_fallback_before = fallback;
     expect_format_error([&] {
         (void)interaction::collapse_interaction_pose(
-            invalid_interaction, fallback);
+            invalid_interaction, collapse_reference, fallback);
     });
     assert(flat_pose_bits_equal(fallback, invalid_fallback_before));
 }
@@ -624,7 +693,7 @@ void test_flat_bridge_canaries_prove_exact_23_element_bounds() {
     const Pose expanded = interaction::expand_flat_controller_pose(
         input.pose, reference);
     output.pose = interaction::collapse_interaction_pose(
-        expanded, input.pose);
+        expanded, expanded, input.pose);
     assert(input.before == kBefore);
     assert(input.after == kAfter);
     assert(output.before == kBefore);
@@ -1562,7 +1631,10 @@ int main() {
     test_exact_constants();
     test_flat_bridge_exact_parent_tree_anchor_map_and_unmapped_head();
     test_flat_bridge_expansion_matches_every_world_anchor_and_retains_reference();
-    test_flat_bridge_collapse_round_trips_all_channels_and_contacts();
+    test_reference_retarget_raw_reference_is_exact_flat_reference();
+    test_reference_retarget_fixes_nonroot_translations_under_mismatched_source();
+    test_reference_retarget_transfers_mapped_world_rotation_delta();
+    test_reference_retarget_keeps_neck_and_head_reference_locals();
     test_flat_bridge_accepts_antipodal_equivalent_rotations();
     test_flat_bridge_rejects_invalid_input_without_mutation();
     test_flat_bridge_canaries_prove_exact_23_element_bounds();

@@ -69,6 +69,10 @@ Pose expand_flat_controller_pose(
 FlatControllerPose collapse_interaction_pose(
     const Pose& interaction_pose,
     const FlatControllerPose& flat_fallback);
+FlatControllerPose collapse_interaction_pose(
+    const Pose& interaction_pose,
+    const Pose& interaction_reference,
+    const FlatControllerPose& flat_reference);
 
 struct ControllerInteractionEdges {
     bool interact_pressed = false;

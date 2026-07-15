@@ -103,6 +103,36 @@ void validate_interaction_pose(const Pose& pose) {
     }
 }
 
+bool raw_channels_equal(vec3 left, vec3 right) {
+    return left.x == right.x && left.y == right.y && left.z == right.z;
+}
+
+bool raw_channels_equal(quat left, quat right) {
+    return left.w == right.w && left.x == right.x && left.y == right.y &&
+           left.z == right.z;
+}
+
+bool raw_pose_channels_equal(const Pose& left, const Pose& right) {
+    for (size_t bone = 0; bone < g1_skeleton::BoneCount; ++bone) {
+        if (!raw_channels_equal(left.positions[bone], right.positions[bone]) ||
+            !raw_channels_equal(left.velocities[bone], right.velocities[bone]) ||
+            !raw_channels_equal(left.rotations[bone], right.rotations[bone]) ||
+            !raw_channels_equal(
+                left.angular_velocities[bone],
+                right.angular_velocities[bone])) {
+            return false;
+        }
+    }
+    for (size_t joint = 0; joint < left.hand_dof.size(); ++joint) {
+        if (left.hand_dof[joint] != right.hand_dof[joint] ||
+            left.hand_dof_velocities[joint] !=
+                right.hand_dof_velocities[joint]) {
+            return false;
+        }
+    }
+    return left.foot_contacts == right.foot_contacts;
+}
+
 quat normalized_rotation(quat rotation) {
     const float magnitude = quat_length(rotation);
     return rotation / magnitude;
@@ -377,6 +407,79 @@ FlatControllerPose collapse_interaction_pose(
     collapsed.foot_contacts = interaction_pose.foot_contacts;
     validate_flat_pose(collapsed);
     return collapsed;
+}
+
+FlatControllerPose collapse_interaction_pose(
+    const Pose& interaction_pose,
+    const Pose& interaction_reference,
+    const FlatControllerPose& flat_reference) {
+    validate_interaction_pose(interaction_pose);
+    validate_interaction_pose(interaction_reference);
+    validate_flat_pose(flat_reference);
+
+    if (raw_pose_channels_equal(interaction_pose, interaction_reference)) {
+        return flat_reference;
+    }
+
+    const WorldPose source_world = world_pose(interaction_pose);
+    const WorldPose source_reference_world = world_pose(interaction_reference);
+    const FlatWorldPose flat_reference_world =
+        flat_world_pose(flat_reference);
+    FlatControllerPose retargeted = flat_reference;
+    FlatWorldPose retargeted_world{};
+
+    for (size_t flat_bone = 0; flat_bone < kFlatControllerBoneCount;
+         ++flat_bone) {
+        const int32_t source_value = kFlatToG1Bone[flat_bone];
+        if (source_value >= 0) {
+            const size_t source_bone = static_cast<size_t>(source_value);
+            const quat world_delta = normalized_rotation(quat_mul(
+                source_world.rotations[source_bone],
+                quat_inv(source_reference_world.rotations[source_bone])));
+            const quat desired_world_rotation = normalized_rotation(quat_mul(
+                world_delta,
+                flat_reference_world.rotations[flat_bone]));
+            const vec3 desired_world_angular_velocity =
+                flat_reference_world.angular_velocities[flat_bone] +
+                source_world.angular_velocities[source_bone] -
+                source_reference_world.angular_velocities[source_bone];
+
+            const int32_t parent = kFlatControllerParents[flat_bone];
+            if (parent < 0) {
+                retargeted.positions[flat_bone] =
+                    flat_reference.positions[flat_bone] +
+                    source_world.positions[source_bone] -
+                    source_reference_world.positions[source_bone];
+                retargeted.velocities[flat_bone] =
+                    flat_reference.velocities[flat_bone] +
+                    source_world.velocities[source_bone] -
+                    source_reference_world.velocities[source_bone];
+                retargeted.rotations[flat_bone] = desired_world_rotation;
+                retargeted.angular_velocities[flat_bone] =
+                    desired_world_angular_velocity;
+            } else {
+                const size_t parent_bone = static_cast<size_t>(parent);
+                retargeted.positions[flat_bone] =
+                    flat_reference.positions[flat_bone];
+                retargeted.velocities[flat_bone] =
+                    flat_reference.velocities[flat_bone];
+                retargeted.rotations[flat_bone] = normalized_rotation(
+                    quat_inv_mul(
+                        retargeted_world.rotations[parent_bone],
+                        desired_world_rotation));
+                retargeted.angular_velocities[flat_bone] =
+                    quat_inv_mul_vec3(
+                        retargeted_world.rotations[parent_bone],
+                        desired_world_angular_velocity -
+                            retargeted_world
+                                .angular_velocities[parent_bone]);
+            }
+        }
+        update_flat_world_bone(retargeted_world, retargeted, flat_bone);
+    }
+    retargeted.foot_contacts = interaction_pose.foot_contacts;
+    validate_flat_pose(retargeted);
+    return retargeted;
 }
 
 const RuntimeOutput& ControllerInteractionScheduler::tick(
