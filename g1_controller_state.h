@@ -1,6 +1,7 @@
 #pragma once
 
 #include "scene_runtime.h"
+#include "g1_command_runtime.h"
 #include "support_runtime.h"
 
 #include <cfloat>
@@ -69,6 +70,7 @@ struct g1_controller_state
     array1d<vec3> trajectory_angular_velocities;
     array1d<quat> trajectory_desired_rotations;
     array1d<quat> trajectory_rotations;
+    G1CommandSnapshot command;
 
     array1d<int> contact_bones;
     array1d<bool> contact_states;
@@ -209,6 +211,7 @@ static inline void g1_controller_state_swap(
     swap(first.simulation_acceleration, second.simulation_acceleration);
     swap(first.simulation_rotation, second.simulation_rotation);
     swap(first.simulation_angular_velocity, second.simulation_angular_velocity);
+    swap(first.command, second.command);
     swap(first.support, second.support);
     swap(first.support_observation_now, second.support_observation_now);
     swap(first.traversal_speed_scale, second.traversal_speed_scale);
@@ -324,20 +327,39 @@ static inline bool g1_controller_state_reset(
     candidate.simulation_rotation = candidate.transition_dst_rotation;
     candidate.desired_rotation = candidate.simulation_rotation;
 
-    candidate.trajectory_desired_velocities.resize(4);
+    candidate.trajectory_desired_velocities.resize(
+        G1CommandTrajectorySampleCount);
     candidate.trajectory_desired_velocities.set(vec3());
-    candidate.trajectory_positions.resize(4);
+    candidate.trajectory_positions.resize(G1CommandTrajectorySampleCount);
     candidate.trajectory_positions.set(candidate.simulation_position);
-    candidate.trajectory_velocities.resize(4);
+    candidate.trajectory_velocities.resize(G1CommandTrajectorySampleCount);
     candidate.trajectory_velocities.set(vec3());
-    candidate.trajectory_accelerations.resize(4);
+    candidate.trajectory_accelerations.resize(G1CommandTrajectorySampleCount);
     candidate.trajectory_accelerations.set(vec3());
-    candidate.trajectory_angular_velocities.resize(4);
+    candidate.trajectory_angular_velocities.resize(
+        G1CommandTrajectorySampleCount);
     candidate.trajectory_angular_velocities.set(vec3());
-    candidate.trajectory_desired_rotations.resize(4);
+    candidate.trajectory_desired_rotations.resize(
+        G1CommandTrajectorySampleCount);
     candidate.trajectory_desired_rotations.set(candidate.simulation_rotation);
-    candidate.trajectory_rotations.resize(4);
+    candidate.trajectory_rotations.resize(G1CommandTrajectorySampleCount);
     candidate.trajectory_rotations.set(candidate.simulation_rotation);
+
+    G1CommandIntent command_intent;
+    command_intent.requested_velocity = vec3();
+    command_intent.desired_heading = candidate.simulation_rotation;
+    if (!g1_command_snapshot_build(
+            candidate.command,
+            command_intent,
+            vec3(),
+            candidate.trajectory_desired_velocities,
+            candidate.trajectory_positions,
+            candidate.trajectory_rotations,
+            candidate.trajectory_desired_rotations,
+            error,
+            capacity)) {
+        return false;
+    }
 
     candidate.contact_bones.resize(2);
     candidate.contact_bones(0) = G1_LeftToe;
