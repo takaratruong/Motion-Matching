@@ -137,6 +137,15 @@ bool valid_constraint_hand(Hand hand) {
     return hand == Hand::Left || hand == Hand::Right;
 }
 
+bool valid_constraint_transform(Transform transform) {
+    if (!finite(transform.position) || !finite(transform.rotation)) {
+        return false;
+    }
+    const float magnitude = quat_length(transform.rotation);
+    return finite(magnitude) &&
+        std::fabs(magnitude - 1.0F) <= kUnitRotationTolerance;
+}
+
 bool constraint_identity_matches(
     const ControllerInteractionHandConstraint& constraint,
     const RuntimeDiagnostics& diagnostics) {
@@ -144,6 +153,7 @@ bool constraint_identity_matches(
         constraint.target.generation != 0U &&
         constraint.affordance_id != 0U &&
         valid_constraint_hand(constraint.hand) &&
+        valid_constraint_transform(constraint.grasp_world) &&
         constraint.target == diagnostics.target &&
         constraint.affordance_id == diagnostics.affordance_id &&
         constraint.hand == diagnostics.hand;
@@ -555,12 +565,18 @@ ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
             }
         }
 
+        if (target_rig_arm_ik_.active()) {
+            state.hand_constraint_calibration_rotation =
+                target_rig_arm_ik_.calibration_rotation();
+        }
         if (hand_constraint.has_value() &&
             ownership_hand_constraint_.has_value() &&
+            target_rig_arm_ik_.active() &&
             constraint_identity_matches(
                 *hand_constraint, runtime_output.diagnostics) &&
             constraint_identity_matches(
                 *hand_constraint, *ownership_hand_constraint_)) {
+            state.hand_constraint_validated = true;
             state.hand_constraint_result = target_rig_arm_ik_.solve(
                 state.pose,
                 hand_constraint->grasp_world,

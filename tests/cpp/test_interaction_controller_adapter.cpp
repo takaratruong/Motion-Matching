@@ -971,6 +971,15 @@ void test_frame_handoff_applies_validated_semantic_hand_constraint_and_releases_
         owned,
         interaction::kControllerStepSeconds,
         constraint);
+    interaction::TargetRigArmIK expected_solver;
+    expected_solver.begin_epoch(raw_reference, entry, Hand::Right);
+    require(
+        first.hand_constraint_validated,
+        "matching ownership entry did not validate its exact constraint");
+    require_same_rotation(
+        first.hand_constraint_calibration_rotation,
+        expected_solver.calibration_rotation(),
+        "ownership entry did not expose the active solver calibration");
     require(
         flat_pose_bits_equal(first.pose, entry),
         "zero-weight ownership entry changed the displayed pose");
@@ -989,6 +998,13 @@ void test_frame_handoff_applies_validated_semantic_hand_constraint_and_releases_
         constrained.hand_constraint_result.applied &&
             constrained.hand_constraint_result.reachable,
         "matching full-weight semantic constraint did not solve");
+    require(
+        constrained.hand_constraint_validated,
+        "matching full-weight constraint lost validation");
+    require_same_rotation(
+        constrained.hand_constraint_calibration_rotation,
+        first.hand_constraint_calibration_rotation,
+        "active epoch calibration changed between rendered frames");
     const FlatWorldPose constrained_world = flat_world_pose(constrained.pose);
     require_vec_near(
         constrained_world.positions[22],
@@ -1201,6 +1217,7 @@ void test_hand_constraint_mismatch_or_invalid_input_disables_atomically() {
             invalid);
         require(
             !frame.hand_constraint_result.applied &&
+                !frame.hand_constraint_validated &&
                 flat_pose_bits_equal(frame.pose, entry) &&
                 output_fields_equal(full_weight, input_before),
             "mismatched or invalid constraint partially changed the frame");
@@ -1223,6 +1240,7 @@ void test_hand_constraint_mismatch_or_invalid_input_disables_atomically() {
         matching_switched);
     require(
         !switched_frame.hand_constraint_result.applied &&
+            !switched_frame.hand_constraint_validated &&
             flat_pose_bits_equal(switched_frame.pose, entry),
         "selection changed inside an ownership epoch");
 }

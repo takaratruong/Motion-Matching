@@ -105,6 +105,8 @@ private:
 struct ControllerInteractionFrameState {
     FlatControllerPose pose{};
     TargetRigArmIKResult hand_constraint_result{};
+    bool hand_constraint_validated = false;
+    quat hand_constraint_calibration_rotation{};
     bool runtime_owns_pose = false;
     bool overrides_locomotion_pose = false;
     bool synchronize_simulation_root = false;

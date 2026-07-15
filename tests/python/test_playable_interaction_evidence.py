@@ -27,6 +27,14 @@ EXPECTED_KEYS = (
     "object_position",
     "grasp_evidence_valid",
     "active_hand_joint",
+    "hand_constraint_weight",
+    "hand_constraint_validated",
+    "hand_constraint_applied",
+    "hand_constraint_reachable",
+    "hand_constraint_used_clavicle",
+    "hand_constraint_reach_shortfall_m",
+    "hand_constraint_calibration_rotation",
+    "calibrated_hand_world_rotation",
     "object_world_rotation",
     "hand_in_object_position",
     "hand_in_object_rotation",
@@ -99,6 +107,7 @@ RUNTIME_CACHED_FIELDS = (
     "attached",
     "owns_pose",
     "carry_mode",
+    "hand_constraint_weight",
 )
 FLAT_JOINT_NAMES = (
     "Entity",
@@ -130,6 +139,8 @@ JOINT_ROTATION_LIMIT_DEGREES = 60.0
 JOINT_QUATERNION_NORM_TOLERANCE = 1.0e-3
 GRASP_COMPOSITION_TOLERANCE = 1.0e-5
 GRASP_EVIDENCE_STATES = ("PickupReplay", "Hold", "Carry")
+HAND_POSITION_LIMIT_M = 0.01
+HAND_CALIBRATED_ORIENTATION_LIMIT_DEGREES = 2.0
 
 
 def _error(message: str) -> EvidenceValidationError:
@@ -201,6 +212,16 @@ def _quaternion_multiply(left: list[float], right: list[float]) -> list[float]:
     ]
     norm = math.sqrt(sum(component * component for component in result))
     return [component / norm for component in result]
+
+
+def _quaternion_inverse(rotation: list[float]) -> list[float]:
+    norm_squared = sum(component * component for component in rotation)
+    return [
+        rotation[0] / norm_squared,
+        -rotation[1] / norm_squared,
+        -rotation[2] / norm_squared,
+        -rotation[3] / norm_squared,
+    ]
 
 
 def _quaternion_rotate(rotation: list[float], value: list[float]) -> list[float]:
@@ -303,6 +324,33 @@ def _validate_record_types(record: dict) -> None:
         raise _error(
             "active_hand_joint must be -1 exactly when grasp evidence is invalid"
         )
+    weight = record["hand_constraint_weight"]
+    if (
+        type(weight) not in (int, float)
+        or not math.isfinite(weight)
+        or weight < 0.0
+        or weight > 1.0
+    ):
+        raise _error("hand_constraint_weight must be finite and in [0, 1]")
+    for name in (
+        "hand_constraint_validated",
+        "hand_constraint_applied",
+        "hand_constraint_reachable",
+        "hand_constraint_used_clavicle",
+    ):
+        if type(record[name]) is not bool:
+            raise _error(f"{name} must be a JSON boolean")
+    reach_shortfall = record["hand_constraint_reach_shortfall_m"]
+    if (
+        type(reach_shortfall) not in (int, float)
+        or not math.isfinite(reach_shortfall)
+        or reach_shortfall < 0.0
+    ):
+        raise _error(
+            "hand_constraint_reach_shortfall_m must be finite and nonnegative"
+        )
+    _require_quaternion(record, "hand_constraint_calibration_rotation")
+    _require_quaternion(record, "calibrated_hand_world_rotation")
     _require_quaternion(record, "object_world_rotation")
     _require_position(record, "hand_in_object_position")
     _require_quaternion(record, "hand_in_object_rotation")
@@ -315,6 +363,7 @@ def _validate_record_types(record: dict) -> None:
         raise _error(
             f'{record["state"]} requires valid selected-grasp evidence'
         )
+    _require_joint_world_arrays(record)
     if record["grasp_evidence_valid"]:
         rotated_local = _quaternion_rotate(
             record["object_world_rotation"],
@@ -341,12 +390,72 @@ def _validate_record_types(record: dict) -> None:
             raise _error(
                 "grasp_world must equal object_world * hand_in_object"
             )
+        if record["hand_constraint_validated"]:
+            expected_calibrated_rotation = _quaternion_multiply(
+                record["joint_world_rotations"][active_hand_joint],
+                _quaternion_inverse(
+                    record["hand_constraint_calibration_rotation"]
+                ),
+            )
+            if _quaternion_sign_distance(
+                expected_calibrated_rotation,
+                record["calibrated_hand_world_rotation"],
+            ) > GRASP_COMPOSITION_TOLERANCE:
+                raise _error(
+                    "calibrated_hand_world_rotation must equal the final "
+                    "rendered hand rotation * inverse(epoch calibration)"
+                )
+        if weight > 0.0:
+            for name in (
+                "hand_constraint_validated",
+                "hand_constraint_applied",
+                "hand_constraint_reachable",
+            ):
+                if not record[name]:
+                    raise _error(f"positive-weight grasp requires {name}")
+        if record["attached"] and weight == 1.0:
+            position_error_m = math.dist(
+                record["joint_world_positions"][active_hand_joint],
+                record["grasp_world_position"],
+            )
+            if position_error_m > HAND_POSITION_LIMIT_M:
+                raise _error(
+                    f"attached full-weight hand position {position_error_m:.6f} m "
+                    f"exceeds max {HAND_POSITION_LIMIT_M:.6f} m"
+                )
+            orientation_error_degrees = _joint_rotation_step_degrees(
+                record["calibrated_hand_world_rotation"],
+                record["grasp_world_rotation"],
+            )
+            if (
+                orientation_error_degrees
+                > HAND_CALIBRATED_ORIENTATION_LIMIT_DEGREES
+            ):
+                raise _error(
+                    "attached full-weight calibrated hand orientation "
+                    f"{orientation_error_degrees:.6f} degrees exceeds max "
+                    f"{HAND_CALIBRATED_ORIENTATION_LIMIT_DEGREES:.6f} degrees"
+                )
+    if record["hand_constraint_applied"] and (
+        not record["hand_constraint_validated"] or not weight > 0.0
+    ):
+        raise _error(
+            "hand_constraint_applied requires validated positive weight"
+        )
+    if record["hand_constraint_reachable"] and not record["hand_constraint_applied"]:
+        raise _error("hand_constraint_reachable requires hand_constraint_applied")
+    if (
+        record["hand_constraint_used_clavicle"]
+        and not record["hand_constraint_applied"]
+    ):
+        raise _error(
+            "hand_constraint_used_clavicle requires hand_constraint_applied"
+        )
     displacement = record["root_displacement_m"]
     if type(displacement) not in (int, float) or not math.isfinite(displacement):
         raise _error("root_displacement_m must be a finite number")
     if displacement < 0.0:
         raise _error("root_displacement_m must be nonnegative")
-    _require_joint_world_arrays(record)
     _require_enum(record, "action", ACTIONS)
 
 
@@ -600,6 +709,7 @@ def summarize_grasp_alignment(records: list[dict]) -> list[dict]:
 
         position_errors = []
         orientation_errors = []
+        calibrated_orientation_errors = []
         for record in state_records:
             hand_position = record["joint_world_positions"][active_hand_joint]
             hand_rotation = record["joint_world_rotations"][active_hand_joint]
@@ -611,12 +721,22 @@ def summarize_grasp_alignment(records: list[dict]) -> list[dict]:
                     hand_rotation, record["grasp_world_rotation"]
                 )
             )
+            calibrated_orientation_errors.append(
+                _joint_rotation_step_degrees(
+                    record["calibrated_hand_world_rotation"],
+                    record["grasp_world_rotation"],
+                )
+            )
 
         position_max_index = max(
             range(len(position_errors)), key=position_errors.__getitem__
         )
         orientation_max_index = max(
             range(len(orientation_errors)), key=orientation_errors.__getitem__
+        )
+        calibrated_orientation_max_index = max(
+            range(len(calibrated_orientation_errors)),
+            key=calibrated_orientation_errors.__getitem__,
         )
         summaries.append(
             {
@@ -635,6 +755,18 @@ def summarize_grasp_alignment(records: list[dict]) -> list[dict]:
                 ],
                 "orientation_max_frame": state_records[
                     orientation_max_index
+                ]["render_frame"],
+                "calibrated_orientation_mean_degrees": (
+                    sum(calibrated_orientation_errors)
+                    / len(calibrated_orientation_errors)
+                ),
+                "calibrated_orientation_max_degrees": (
+                    calibrated_orientation_errors[
+                        calibrated_orientation_max_index
+                    ]
+                ),
+                "calibrated_orientation_max_frame": state_records[
+                    calibrated_orientation_max_index
                 ]["render_frame"],
                 "active_hand_joint_name": FLAT_JOINT_NAMES[active_hand_joint],
             }
@@ -725,6 +857,17 @@ def _record_line(record: dict) -> str:
         f'"object_position":{position("object_position")},'
         f'"grasp_evidence_valid":{boolean("grasp_evidence_valid")},'
         f'"active_hand_joint":{record["active_hand_joint"]},'
+        f'"hand_constraint_weight":{record["hand_constraint_weight"]:.6f},'
+        f'"hand_constraint_validated":{boolean("hand_constraint_validated")},'
+        f'"hand_constraint_applied":{boolean("hand_constraint_applied")},'
+        f'"hand_constraint_reachable":{boolean("hand_constraint_reachable")},'
+        f'"hand_constraint_used_clavicle":{boolean("hand_constraint_used_clavicle")},'
+        f'"hand_constraint_reach_shortfall_m":'
+        f'{record["hand_constraint_reach_shortfall_m"]:.6f},'
+        f'"hand_constraint_calibration_rotation":'
+        f'{position("hand_constraint_calibration_rotation")},'
+        f'"calibrated_hand_world_rotation":'
+        f'{position("calibrated_hand_world_rotation")},'
         f'"object_world_rotation":{position("object_world_rotation")},'
         f'"hand_in_object_position":{position("hand_in_object_position")},'
         f'"hand_in_object_rotation":{position("hand_in_object_rotation")},'
@@ -803,8 +946,8 @@ def _valid_records() -> list[dict]:
 
         object_position = [
             0.0 if render_frame == len(states) - 1 else root_x,
-            0.75 if render_frame == len(states) - 1 else 0.95,
-            3.0,
+            0.75 if render_frame == len(states) - 1 else 1.10,
+            3.0 if render_frame == len(states) - 1 else 2.0,
         ]
         grasp_evidence_valid = state in {"PickupReplay", "Hold", "Carry"}
         record = {
@@ -823,6 +966,14 @@ def _valid_records() -> list[dict]:
             "object_position": object_position,
             "grasp_evidence_valid": grasp_evidence_valid,
             "active_hand_joint": 22 if grasp_evidence_valid else -1,
+            "hand_constraint_weight": 1.0 if grasp_evidence_valid else 0.0,
+            "hand_constraint_validated": grasp_evidence_valid,
+            "hand_constraint_applied": grasp_evidence_valid,
+            "hand_constraint_reachable": grasp_evidence_valid,
+            "hand_constraint_used_clavicle": False,
+            "hand_constraint_reach_shortfall_m": 0.0,
+            "hand_constraint_calibration_rotation": [1.0, 0.0, 0.0, 0.0],
+            "calibrated_hand_world_rotation": [1.0, 0.0, 0.0, 0.0],
             "object_world_rotation": [1.0, 0.0, 0.0, 0.0],
             "hand_in_object_position": [0.0, 0.0, 0.0],
             "hand_in_object_rotation": [1.0, 0.0, 0.0, 0.0],
@@ -903,7 +1054,13 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
                 "result", "reason", "object_state", "attached", "owns_pose",
                 "carry_mode", "carry_command_frame", "root_position",
                 "object_position", "grasp_evidence_valid",
-                "active_hand_joint", "object_world_rotation",
+                "active_hand_joint", "hand_constraint_weight",
+                "hand_constraint_validated", "hand_constraint_applied",
+                "hand_constraint_reachable",
+                "hand_constraint_used_clavicle",
+                "hand_constraint_reach_shortfall_m",
+                "hand_constraint_calibration_rotation",
+                "calibrated_hand_world_rotation", "object_world_rotation",
                 "hand_in_object_position", "hand_in_object_rotation",
                 "grasp_world_position", "grasp_world_rotation",
                 "root_displacement_m", "joint_world_positions",
@@ -920,6 +1077,14 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
                 candidate["active_hand_joint"] = joint
                 if not valid:
                     candidate["state"] = "Align"
+                    candidate["hand_constraint_weight"] = 0.0
+                    candidate["hand_constraint_validated"] = False
+                    candidate["hand_constraint_applied"] = False
+                    candidate["hand_constraint_reachable"] = False
+                else:
+                    candidate["joint_world_positions"][joint] = copy.deepcopy(
+                        candidate["grasp_world_position"]
+                    )
                 _validate_record_types(candidate)
 
         for joint in (True, -2, 0, 17, 19, 23):
@@ -982,6 +1147,8 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
             "object_world_rotation",
             "hand_in_object_rotation",
             "grasp_world_rotation",
+            "hand_constraint_calibration_rotation",
+            "calibrated_hand_world_rotation",
         ):
             with self.subTest(field=field, failure="nonfinite"):
                 candidate = copy.deepcopy(record)
@@ -996,8 +1163,152 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
                 ):
                     _validate_record_types(candidate)
 
+    def test_hand_constraint_fields_have_strict_types_and_finite_ranges(self):
+        record = copy.deepcopy(_valid_records()[36])
+        for field in (
+            "hand_constraint_validated",
+            "hand_constraint_applied",
+            "hand_constraint_reachable",
+            "hand_constraint_used_clavicle",
+        ):
+            with self.subTest(field=field):
+                candidate = copy.deepcopy(record)
+                candidate[field] = 1
+                with self.assertRaisesRegex(EvidenceValidationError, field):
+                    _validate_record_types(candidate)
+
+        for invalid_weight in (True, math.nan, math.inf, -0.000001, 1.000001):
+            with self.subTest(invalid_weight=invalid_weight):
+                candidate = copy.deepcopy(record)
+                candidate["hand_constraint_weight"] = invalid_weight
+                with self.assertRaisesRegex(
+                    EvidenceValidationError, "hand_constraint_weight"
+                ):
+                    _validate_record_types(candidate)
+
+        for invalid_shortfall in (True, math.nan, math.inf, -0.000001):
+            with self.subTest(invalid_shortfall=invalid_shortfall):
+                candidate = copy.deepcopy(record)
+                candidate["hand_constraint_reach_shortfall_m"] = invalid_shortfall
+                with self.assertRaisesRegex(
+                    EvidenceValidationError,
+                    "hand_constraint_reach_shortfall_m",
+                ):
+                    _validate_record_types(candidate)
+
+    def test_calibrated_hand_rotation_matches_final_fk_raw_hand_and_epoch_calibration(self):
+        record = copy.deepcopy(_valid_records()[36])
+        record["hand_constraint_weight"] = 0.5
+        half_sqrt_two = math.sqrt(0.5)
+        semantic_angle = math.radians(30.0)
+        semantic_rotation = [
+            math.cos(0.5 * semantic_angle),
+            math.sin(0.5 * semantic_angle),
+            0.0,
+            0.0,
+        ]
+        calibration_rotation = [half_sqrt_two, 0.0, 0.0, half_sqrt_two]
+        raw_hand_rotation = _quaternion_multiply(
+            semantic_rotation, calibration_rotation
+        )
+        joint = record["active_hand_joint"]
+        record["joint_world_rotations"][joint] = raw_hand_rotation
+        record["hand_constraint_calibration_rotation"] = calibration_rotation
+        record["calibrated_hand_world_rotation"] = [-v for v in semantic_rotation]
+        _validate_record_types(record)
+
+        record["calibrated_hand_world_rotation"] = [1.0, 0.0, 0.0, 0.0]
+        with self.assertRaisesRegex(
+            EvidenceValidationError,
+            "calibrated_hand_world_rotation.*final rendered hand",
+        ):
+            _validate_record_types(record)
+
+    def test_positive_weight_grasp_requires_validated_applied_reachable_solution(self):
+        record = copy.deepcopy(_valid_records()[36])
+        record["hand_constraint_weight"] = 0.5
+        for field in (
+            "hand_constraint_validated",
+            "hand_constraint_applied",
+            "hand_constraint_reachable",
+        ):
+            with self.subTest(field=field):
+                candidate = copy.deepcopy(record)
+                candidate[field] = False
+                with self.assertRaisesRegex(EvidenceValidationError, field):
+                    _validate_record_types(candidate)
+
+        zero_weight = copy.deepcopy(record)
+        zero_weight["hand_constraint_weight"] = 0.0
+        zero_weight["hand_constraint_validated"] = False
+        zero_weight["hand_constraint_applied"] = False
+        zero_weight["hand_constraint_reachable"] = False
+        _validate_record_types(zero_weight)
+
+    def test_unreachable_positive_weight_is_an_explicit_gate_failure(self):
+        record = copy.deepcopy(_valid_records()[36])
+        record["hand_constraint_weight"] = 1.0
+        record["hand_constraint_reachable"] = False
+        record["hand_constraint_reach_shortfall_m"] = 0.000001
+        with self.assertRaisesRegex(
+            EvidenceValidationError,
+            "hand_constraint_reachable",
+        ):
+            _validate_record_types(record)
+
+    def test_attached_full_weight_position_limit_accepts_exact_boundary_only(self):
+        record = copy.deepcopy(_valid_records()[36])
+        joint = record["active_hand_joint"]
+        grasp = record["grasp_world_position"]
+        record["joint_world_positions"][joint] = [
+            grasp[0] + HAND_POSITION_LIMIT_M,
+            grasp[1],
+            grasp[2],
+        ]
+        _validate_record_types(record)
+
+        record["joint_world_positions"][joint][0] = (
+            grasp[0] + HAND_POSITION_LIMIT_M + 0.000001
+        )
+        with self.assertRaisesRegex(
+            EvidenceValidationError,
+            r"hand position.*0\.010001.*0\.010000",
+        ):
+            _validate_record_types(record)
+
+    def test_attached_full_weight_calibrated_orientation_limit_accepts_exact_boundary_only(self):
+        record = copy.deepcopy(_valid_records()[36])
+        joint = record["active_hand_joint"]
+
+        def set_error_degrees(error_degrees):
+            angle = math.radians(error_degrees)
+            rotation = [
+                math.cos(0.5 * angle),
+                math.sin(0.5 * angle),
+                0.0,
+                0.0,
+            ]
+            record["joint_world_rotations"][joint] = rotation
+            record["calibrated_hand_world_rotation"] = rotation
+
+        set_error_degrees(HAND_CALIBRATED_ORIENTATION_LIMIT_DEGREES)
+        _validate_record_types(record)
+
+        set_error_degrees(
+            HAND_CALIBRATED_ORIENTATION_LIMIT_DEGREES + 0.000001
+        )
+        with self.assertRaisesRegex(
+            EvidenceValidationError,
+            r"calibrated hand orientation.*2\.000001.*2\.000000",
+        ):
+            _validate_record_types(record)
+
     def test_grasp_world_is_exact_object_hand_composition_up_to_quaternion_sign(self):
         record = copy.deepcopy(_valid_records()[36])
+        record["hand_constraint_weight"] = 0.0
+        record["hand_constraint_validated"] = False
+        record["hand_constraint_applied"] = False
+        record["hand_constraint_reachable"] = False
         half_sqrt_two = math.sqrt(0.5)
         record.update(
             object_position=[1.0, 2.0, 3.0],
@@ -1035,6 +1346,8 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
 
         records = []
         angle = math.radians(60.0)
+        calibration_angle = math.radians(40.0)
+        calibrated_angle = math.radians(20.0)
         for state_index, state in enumerate(("PickupReplay", "Hold", "Carry")):
             for sample, distance in enumerate((1.0, 3.0)):
                 record = copy.deepcopy(_valid_records()[36])
@@ -1049,6 +1362,26 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
                     [-1.0, 0.0, 0.0, 0.0]
                     if sample == 0 else
                     [math.cos(0.5 * angle), math.sin(0.5 * angle), 0.0, 0.0]
+                )
+                record["hand_constraint_calibration_rotation"] = (
+                    [1.0, 0.0, 0.0, 0.0]
+                    if sample == 0 else
+                    [
+                        math.cos(0.5 * calibration_angle),
+                        math.sin(0.5 * calibration_angle),
+                        0.0,
+                        0.0,
+                    ]
+                )
+                record["calibrated_hand_world_rotation"] = (
+                    [-1.0, 0.0, 0.0, 0.0]
+                    if sample == 0 else
+                    [
+                        math.cos(0.5 * calibrated_angle),
+                        math.sin(0.5 * calibrated_angle),
+                        0.0,
+                        0.0,
+                    ]
                 )
                 records.append(record)
 
@@ -1066,6 +1399,16 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
             self.assertAlmostEqual(summary["orientation_max_degrees"], 60.0)
             self.assertEqual(
                 summary["orientation_max_frame"], 10 * state_index + 1
+            )
+            self.assertAlmostEqual(
+                summary["calibrated_orientation_mean_degrees"], 10.0
+            )
+            self.assertAlmostEqual(
+                summary["calibrated_orientation_max_degrees"], 20.0
+            )
+            self.assertEqual(
+                summary["calibrated_orientation_max_frame"],
+                10 * state_index + 1,
             )
             expected_joint = "LeftHand" if summary["state"] == "Hold" else "RightHand"
             self.assertEqual(summary["active_hand_joint_name"], expected_joint)
@@ -1431,6 +1774,12 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
                 record["grasp_world_position"] = copy.deepcopy(
                     first_carry_object
                 )
+                record["joint_world_positions"][
+                    record["active_hand_joint"]
+                ] = copy.deepcopy(first_carry_object)
+        records[-1]["joint_world_positions"][22] = copy.deepcopy(
+            first_carry_object
+        )
         _write_records(self.log, records)
         with self.assertRaisesRegex(
             EvidenceValidationError,
@@ -1828,6 +2177,16 @@ class Task12PolicyTests(unittest.TestCase):
             1,
             "autodemo must capture one immutable final evidence sample",
         )
+        capture_call = self._source_between(
+            controller,
+            "            autodemo_evidence_capture = capture_autodemo_evidence(",
+            "        }\n        \n        // Update camera",
+        )
+        self.assertIn(
+            "interaction_frame_state",
+            capture_call,
+            "post-final-FK capture must receive the validated handoff state",
+        )
 
         capture_function = self._cpp_function(
             controller,
@@ -1837,6 +2196,11 @@ class Task12PolicyTests(unittest.TestCase):
         self.assertIn("global_bone_positions.size", capture_function)
         self.assertIn("global_bone_rotations.size", capture_function)
         self.assertIn("quat_normalize(global_bone_rotations", capture_function)
+        self.assertIn(
+            "const interaction::ControllerInteractionFrameState& frame_state",
+            capture_function,
+            "capture must consume the exact handoff validation and calibration",
+        )
         self.assertIn(
             "runtime_output.diagnostics.target == scene_target->handle",
             capture_function,
@@ -1856,6 +2220,20 @@ class Task12PolicyTests(unittest.TestCase):
             "interaction::compose(capture.object_world, capture.hand_in_object)",
             capture_function,
             "grasp capture must derive the world transform from scene authority",
+        )
+        self.assertRegex(
+            capture_function,
+            r"capture\.calibrated_hand_world_rotation\s*=\s*"
+            r"quat_normalize\(quat_mul\(\s*"
+            r"capture\.joint_rotations\[.*?active_hand_joint.*?\],\s*"
+            r"quat_inv\(capture\.hand_constraint_calibration_rotation\)\s*"
+            r"\)\);",
+            "semantic hand rotation must be derived from post-final-FK raw hand rotation",
+        )
+        self.assertNotIn(
+            "frame_state.pose.rotations",
+            capture_function,
+            "pre-foot-IK handoff rotations must not become calibrated evidence",
         )
 
         writer = self._cpp_function(controller, "void write_autodemo_record(")
@@ -1879,6 +2257,14 @@ class Task12PolicyTests(unittest.TestCase):
         for member in (
             "capture.grasp_evidence_valid",
             "capture.active_hand_joint",
+            "capture.hand_constraint_weight",
+            "capture.hand_constraint_validated",
+            "capture.hand_constraint_result.applied",
+            "capture.hand_constraint_result.reachable",
+            "capture.hand_constraint_result.used_clavicle",
+            "capture.hand_constraint_result.reach_shortfall_m",
+            "capture.hand_constraint_calibration_rotation",
+            "capture.calibrated_hand_world_rotation",
             "capture.object_world.rotation",
             "capture.hand_in_object.position",
             "capture.hand_in_object.rotation",

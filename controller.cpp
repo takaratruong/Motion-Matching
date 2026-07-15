@@ -1366,6 +1366,11 @@ struct AutodemoEvidenceCapture
 {
     bool grasp_evidence_valid = false;
     int active_hand_joint = -1;
+    float hand_constraint_weight = 0.0F;
+    bool hand_constraint_validated = false;
+    interaction::TargetRigArmIKResult hand_constraint_result{};
+    quat hand_constraint_calibration_rotation{};
+    quat calibrated_hand_world_rotation{};
     interaction::Transform object_world{};
     interaction::Transform hand_in_object{};
     interaction::Transform grasp_world{};
@@ -1403,6 +1408,7 @@ AutodemoEvidenceCapture capture_autodemo_evidence(
     const slice1d<vec3> global_bone_positions,
     const slice1d<quat> global_bone_rotations,
     const interaction::RuntimeOutput& runtime_output,
+    const interaction::ControllerInteractionFrameState& frame_state,
     const interaction::InteractionTarget* scene_target,
     const interaction::Transform& object_world)
 {
@@ -1416,6 +1422,13 @@ AutodemoEvidenceCapture capture_autodemo_evidence(
     }
 
     AutodemoEvidenceCapture capture;
+    capture.hand_constraint_weight =
+        runtime_output.diagnostics.hand_constraint_weight;
+    capture.hand_constraint_validated =
+        frame_state.hand_constraint_validated;
+    capture.hand_constraint_result = frame_state.hand_constraint_result;
+    capture.hand_constraint_calibration_rotation = quat_normalize(
+        frame_state.hand_constraint_calibration_rotation);
     capture.object_world = object_world;
     for (size_t joint = 0;
          joint < interaction::kFlatControllerBoneCount;
@@ -1453,6 +1466,13 @@ AutodemoEvidenceCapture capture_autodemo_evidence(
                 affordance.hand == interaction::Hand::Left ? 18 : 22;
             capture.hand_in_object = affordance.hand_in_object;
             capture.grasp_world = interaction::compose(capture.object_world, capture.hand_in_object);
+            if (capture.hand_constraint_validated)
+            {
+                capture.calibrated_hand_world_rotation = quat_normalize(quat_mul(
+                    capture.joint_rotations[static_cast<size_t>(capture.active_hand_joint)],
+                    quat_inv(capture.hand_constraint_calibration_rotation)
+                ));
+            }
             break;
         }
     }
@@ -2035,6 +2055,13 @@ void write_autodemo_record(
             autodemo_is_finite(transform.position.z) &&
             finite_quaternion(transform.rotation);
     };
+    const auto unit_quaternion = [&](quat rotation)
+    {
+        const float magnitude = quat_length(rotation);
+        return finite_quaternion(rotation) &&
+            autodemo_is_finite(magnitude) &&
+            std::fabs(magnitude - 1.0F) <= 1.0e-3F;
+    };
     const bool active_hand_is_valid =
         capture.active_hand_joint == 18 || capture.active_hand_joint == 22;
     const interaction::RuntimeState runtime_state =
@@ -2048,13 +2075,26 @@ void write_autodemo_record(
         !autodemo_is_finite(root_position.y) ||
         !autodemo_is_finite(root_position.z) ||
         !autodemo_is_finite(root_displacement_m) ||
+        !autodemo_is_finite(capture.hand_constraint_weight) ||
+        capture.hand_constraint_weight < 0.0F ||
+        capture.hand_constraint_weight > 1.0F ||
+        !autodemo_is_finite(
+            capture.hand_constraint_result.reach_shortfall_m) ||
+        capture.hand_constraint_result.reach_shortfall_m < 0.0F ||
+        !unit_quaternion(capture.hand_constraint_calibration_rotation) ||
+        !unit_quaternion(capture.calibrated_hand_world_rotation) ||
         !finite_transform(capture.object_world) ||
         !finite_transform(capture.hand_in_object) ||
         !finite_transform(capture.grasp_world) ||
         capture.grasp_evidence_valid != active_hand_is_valid ||
         (!capture.grasp_evidence_valid &&
          capture.active_hand_joint != -1) ||
-        (interaction_owned_state && !capture.grasp_evidence_valid))
+        (interaction_owned_state && !capture.grasp_evidence_valid) ||
+        (capture.grasp_evidence_valid &&
+         capture.hand_constraint_weight > 0.0F &&
+         (!capture.hand_constraint_validated ||
+          !capture.hand_constraint_result.applied ||
+          !capture.hand_constraint_result.reachable)))
     {
         throw std::runtime_error("autodemo evidence contains invalid values");
     }
@@ -2124,7 +2164,29 @@ void write_autodemo_record(
         << "],\"grasp_evidence_valid\":"
         << (capture.grasp_evidence_valid ? "true" : "false")
         << ",\"active_hand_joint\":" << capture.active_hand_joint
-        << ",\"object_world_rotation\":["
+        << ",\"hand_constraint_weight\":"
+        << capture.hand_constraint_weight
+        << ",\"hand_constraint_validated\":"
+        << (capture.hand_constraint_validated ? "true" : "false")
+        << ",\"hand_constraint_applied\":"
+        << (capture.hand_constraint_result.applied ? "true" : "false")
+        << ",\"hand_constraint_reachable\":"
+        << (capture.hand_constraint_result.reachable ? "true" : "false")
+        << ",\"hand_constraint_used_clavicle\":"
+        << (capture.hand_constraint_result.used_clavicle ? "true" : "false")
+        << ",\"hand_constraint_reach_shortfall_m\":"
+        << capture.hand_constraint_result.reach_shortfall_m
+        << ",\"hand_constraint_calibration_rotation\":["
+        << capture.hand_constraint_calibration_rotation.w << ','
+        << capture.hand_constraint_calibration_rotation.x << ','
+        << capture.hand_constraint_calibration_rotation.y << ','
+        << capture.hand_constraint_calibration_rotation.z
+        << "],\"calibrated_hand_world_rotation\":["
+        << capture.calibrated_hand_world_rotation.w << ','
+        << capture.calibrated_hand_world_rotation.x << ','
+        << capture.calibrated_hand_world_rotation.y << ','
+        << capture.calibrated_hand_world_rotation.z
+        << "],\"object_world_rotation\":["
         << capture.object_world.rotation.w << ','
         << capture.object_world.rotation.x << ','
         << capture.object_world.rotation.y << ','
@@ -3871,6 +3933,7 @@ int main(void)
                 global_bone_positions,
                 global_bone_rotations,
                 interaction_output,
+                interaction_frame_state,
                 interaction_scene_target,
                 interaction_scene_state.object_world);
         }
