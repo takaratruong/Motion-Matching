@@ -137,6 +137,10 @@ DISTAL_LOWER_LIMB_JOINT_NAMES = frozenset(
 )
 DISTAL_LOWER_LIMB_TRANSLATION_SPEED_LIMIT_MPS = 12.0
 AUTHORITY_SEAM_TRANSLATION_LIMIT_M = 0.20
+HOLD_TO_LAYERED_CARRY_AXIAL_TRANSLATION_LIMIT_M = 0.05
+HOLD_TO_LAYERED_CARRY_AXIAL_JOINT_NAMES = frozenset(
+    ("Spine2", "Neck", "Head", "LeftShoulder", "RightShoulder")
+)
 JOINT_ROTATION_LIMIT_DEGREES = 60.0
 JOINT_QUATERNION_NORM_TOLERANCE = 1.0e-3
 GRASP_COMPOSITION_TOLERANCE = 1.0e-5
@@ -531,11 +535,28 @@ def validate_evidence(records: list[dict]) -> None:
             or record["owns_pose"] != previous["owns_pose"]
             or record["attached"] != previous["attached"]
         )
+        hold_to_layered_carry = (
+            previous["state"] == "Hold"
+            and record["state"] == "Carry"
+            and record["carry_mode"] == "layered"
+        )
         for joint, joint_name in enumerate(FLAT_JOINT_NAMES):
             translation_step_m = math.dist(
                 previous["joint_world_positions"][joint],
                 record["joint_world_positions"][joint],
             )
+            if (
+                hold_to_layered_carry
+                and joint_name in HOLD_TO_LAYERED_CARRY_AXIAL_JOINT_NAMES
+                and translation_step_m
+                > HOLD_TO_LAYERED_CARRY_AXIAL_TRANSLATION_LIMIT_M
+            ):
+                raise _error(
+                    f"joint {joint} ({joint_name}) frame {index - 1}->{index} "
+                    f"Hold-to-layered Carry translation "
+                    f"{translation_step_m:.6f} m exceeds max "
+                    f"{HOLD_TO_LAYERED_CARRY_AXIAL_TRANSLATION_LIMIT_M:.6f} m"
+                )
             if (
                 authority_seam
                 and translation_step_m > AUTHORITY_SEAM_TRANSLATION_LIMIT_M
@@ -1817,7 +1838,7 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
             )
         )
         for seam, frame, mutations in seams:
-            for joint in (5, 14):
+            for joint in (5, 21):
                 with self.subTest(
                     seam=seam,
                     joint=FLAT_JOINT_NAMES[joint],
@@ -1835,6 +1856,44 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
                         r"0\.200001.*0\.200000",
                     ):
                         validate_evidence(records)
+
+    def test_hold_to_layered_carry_axial_seam_has_tighter_translation_bound(self):
+        template = _valid_records()
+        frame = next(
+            index
+            for index, record in enumerate(template)
+            if record["state"] == "Carry"
+            and record["carry_mode"] == "layered"
+            and template[index - 1]["state"] == "Hold"
+        )
+        for joint in (12, 13, 14, 15, 19):
+            with self.subTest(
+                boundary="exact",
+                joint=FLAT_JOINT_NAMES[joint],
+            ):
+                records = _valid_records()
+                records[frame]["joint_world_positions"][joint] = copy.deepcopy(
+                    records[frame - 1]["joint_world_positions"][joint]
+                )
+                records[frame]["joint_world_positions"][joint][0] += 0.05
+                validate_evidence(records)
+
+            with self.subTest(
+                boundary="epsilon-over",
+                joint=FLAT_JOINT_NAMES[joint],
+            ):
+                records = _valid_records()
+                records[frame]["joint_world_positions"][joint] = copy.deepcopy(
+                    records[frame - 1]["joint_world_positions"][joint]
+                )
+                records[frame]["joint_world_positions"][joint][0] += 0.050001
+                with self.assertRaisesRegex(
+                    EvidenceValidationError,
+                    rf"joint {joint} \({FLAT_JOINT_NAMES[joint]}\).*"
+                    rf"frame {frame - 1}->{frame}.*Hold-to-layered Carry.*"
+                    r"0\.050001.*0\.050000",
+                ):
+                    validate_evidence(records)
 
     def test_60_001_degree_joint_jump_is_rejected_at_reset(self):
         records = _valid_records()

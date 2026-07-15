@@ -1,4 +1,5 @@
 #include "interaction_controller_adapter.h"
+#include "spring.h"
 
 #include <algorithm>
 #include <array>
@@ -19,6 +20,10 @@ constexpr float kInactiveArmBlendSeconds = 0.50F;
 constexpr float kInactiveArmTranslationStepLimitM = 0.20F;
 constexpr float kInactiveArmRotationStepLimitRadians = 1.047197551F;
 constexpr int kInactiveArmBackoffIterations = 16;
+constexpr size_t kLayeredCarryLowerBodyBoneCount = 10U;
+constexpr float kLayeredCarryLowerBodyHalfLifeSeconds = 0.10F;
+constexpr float kLayeredCarryLowerBodyMaximumSeconds = 0.50F;
+constexpr int kLayeredCarryLowerBodyBackoffIterations = 16;
 constexpr float kUnitRotationTolerance = 1.0e-3F;
 
 constexpr std::array<int32_t, g1_skeleton::BoneCount> kG1ToFlatBone = {
@@ -264,6 +269,100 @@ bool inactive_arm_step_within_limits(
         }
     }
     return true;
+}
+
+bool flat_pose_step_within_limits(
+    const FlatControllerPose& previous,
+    const FlatControllerPose& candidate) {
+    const FlatWorldPose previous_world = flat_world_pose(previous);
+    const FlatWorldPose candidate_world = flat_world_pose(candidate);
+    for (size_t bone = 0; bone < kFlatControllerBoneCount; ++bone) {
+        if (length(
+                candidate_world.positions[bone] -
+                previous_world.positions[bone]) >
+                kInactiveArmTranslationStepLimitM ||
+            quat_angle_between(
+                previous_world.rotations[bone],
+                candidate_world.rotations[bone]) >
+                kInactiveArmRotationStepLimitRadians) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void begin_lower_body_inertialization(
+    FlatControllerPose& offsets,
+    const FlatControllerPose& source,
+    const FlatControllerPose& target) {
+    offsets = {};
+    for (size_t bone = 0;
+         bone < kLayeredCarryLowerBodyBoneCount;
+         ++bone) {
+        inertialize_transition(
+            offsets.positions[bone],
+            offsets.velocities[bone],
+            source.positions[bone],
+            source.velocities[bone],
+            target.positions[bone],
+            target.velocities[bone]);
+        inertialize_transition(
+            offsets.rotations[bone],
+            offsets.angular_velocities[bone],
+            source.rotations[bone],
+            source.angular_velocities[bone],
+            target.rotations[bone],
+            target.angular_velocities[bone]);
+    }
+}
+
+void copy_lower_body_channels(
+    FlatControllerPose& destination,
+    const FlatControllerPose& source) {
+    for (size_t bone = 0;
+         bone < kLayeredCarryLowerBodyBoneCount;
+         ++bone) {
+        copy_flat_bone_channels(destination, source, bone);
+    }
+}
+
+bool lower_body_step_within_limits(
+    const FlatControllerPose& previous,
+    const FlatControllerPose& candidate) {
+    FlatControllerPose baseline = candidate;
+    copy_lower_body_channels(baseline, previous);
+    return flat_pose_step_within_limits(baseline, candidate);
+}
+
+void update_lower_body_inertialization(
+    FlatControllerPose& output,
+    FlatControllerPose& offsets,
+    const FlatControllerPose& target,
+    float dt) {
+    for (size_t bone = 0;
+         bone < kLayeredCarryLowerBodyBoneCount;
+         ++bone) {
+        inertialize_update(
+            output.positions[bone],
+            output.velocities[bone],
+            offsets.positions[bone],
+            offsets.velocities[bone],
+            target.positions[bone],
+            target.velocities[bone],
+            kLayeredCarryLowerBodyHalfLifeSeconds,
+            dt);
+        inertialize_update(
+            output.rotations[bone],
+            output.angular_velocities[bone],
+            offsets.rotations[bone],
+            offsets.angular_velocities[bone],
+            target.rotations[bone],
+            target.angular_velocities[bone],
+            kLayeredCarryLowerBodyHalfLifeSeconds,
+            dt);
+        output.rotations[bone] = normalized_rotation(
+            output.rotations[bone]);
+    }
 }
 
 void solve_local_channel(
@@ -646,6 +745,10 @@ ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
     std::optional<ControllerInteractionHandConstraint> hand_constraint) {
     ControllerInteractionFrameState state;
     state.runtime_owns_pose = runtime_output.owns_pose;
+    const bool layered_carry =
+        runtime_output.owns_pose &&
+        runtime_output.diagnostics.state == RuntimeState::Carry &&
+        !runtime_output.diagnostics.recorded_carry;
 
     if (runtime_output.owns_pose) {
         if (!runtime_owned_last_update_) {
@@ -655,6 +758,10 @@ ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
             release_active_ = false;
             runtime_owned_last_update_ = true;
             state.pose = ownership_flat_reference_;
+            layered_carry_last_update_ = layered_carry;
+            lower_body_inertialization_active_ = false;
+            lower_body_inertialization_seconds_ = 0.0F;
+            lower_body_inertial_offsets_ = {};
             target_rig_arm_ik_.reset();
             ownership_hand_constraint_.reset();
             if (hand_constraint.has_value() &&
@@ -679,9 +786,6 @@ ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
                 }
             }
 
-            const bool layered_carry =
-                runtime_output.diagnostics.state == RuntimeState::Carry &&
-                !runtime_output.diagnostics.recorded_carry;
             if (layered_carry) {
                 state.pose = locomotion_pose;
                 for (size_t bone = 10U;
@@ -694,8 +798,121 @@ ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
                         target.angular_velocities[bone];
                 }
                 state.pose.foot_contacts = locomotion_pose.foot_contacts;
+
+                if (!layered_carry_last_update_) {
+                    begin_lower_body_inertialization(
+                        lower_body_inertial_offsets_,
+                        last_rendered_pose_,
+                        locomotion_pose);
+                    copy_lower_body_channels(
+                        state.pose, last_rendered_pose_);
+                    if (!lower_body_step_within_limits(
+                            last_rendered_pose_, state.pose)) {
+                        throw FormatError(
+                            "layered Carry lower-body seam exceeded step limits");
+                    }
+                    lower_body_inertialization_active_ = true;
+                    lower_body_inertialization_seconds_ = 0.0F;
+                } else if (lower_body_inertialization_active_) {
+                    const float step_seconds = std::max(dt, 0.0F);
+                    const bool exact_target_due =
+                        lower_body_inertialization_seconds_ + step_seconds >=
+                        kLayeredCarryLowerBodyMaximumSeconds;
+                    if (exact_target_due && lower_body_step_within_limits(
+                            last_rendered_pose_, state.pose)) {
+                        lower_body_inertialization_active_ = false;
+                        lower_body_inertialization_seconds_ = 0.0F;
+                        lower_body_inertial_offsets_ = {};
+                    } else {
+                        FlatControllerPose trial = state.pose;
+                        FlatControllerPose trial_offsets =
+                            lower_body_inertial_offsets_;
+                        update_lower_body_inertialization(
+                            trial,
+                            trial_offsets,
+                            locomotion_pose,
+                            step_seconds);
+                        if (lower_body_step_within_limits(
+                                last_rendered_pose_, trial)) {
+                            state.pose = trial;
+                            lower_body_inertial_offsets_ = trial_offsets;
+                            lower_body_inertialization_seconds_ = std::min(
+                                kLayeredCarryLowerBodyMaximumSeconds,
+                                lower_body_inertialization_seconds_ +
+                                    step_seconds);
+                        } else {
+                            FlatControllerPose backoff_source_offsets =
+                                lower_body_inertial_offsets_;
+                            FlatControllerPose zero_decay = state.pose;
+                            update_lower_body_inertialization(
+                                zero_decay,
+                                backoff_source_offsets,
+                                locomotion_pose,
+                                0.0F);
+                            float elapsed_before_backoff =
+                                lower_body_inertialization_seconds_;
+                            FlatControllerPose accepted = zero_decay;
+                            if (!lower_body_step_within_limits(
+                                    last_rendered_pose_, zero_decay)) {
+                                begin_lower_body_inertialization(
+                                    backoff_source_offsets,
+                                    last_rendered_pose_,
+                                    locomotion_pose);
+                                accepted = state.pose;
+                                copy_lower_body_channels(
+                                    accepted, last_rendered_pose_);
+                                elapsed_before_backoff = 0.0F;
+                            }
+                            if (!lower_body_step_within_limits(
+                                    last_rendered_pose_, accepted)) {
+                                throw FormatError(
+                                    "layered Carry lower-body rebase exceeded step limits");
+                            }
+
+                            FlatControllerPose accepted_offsets =
+                                backoff_source_offsets;
+                            float accepted_seconds = 0.0F;
+                            float lower = 0.0F;
+                            float upper = step_seconds;
+                            for (int iteration = 0;
+                                 iteration <
+                                     kLayeredCarryLowerBodyBackoffIterations;
+                                 ++iteration) {
+                                const float trial_seconds =
+                                    0.5F * (lower + upper);
+                                FlatControllerPose backoff_trial = state.pose;
+                                FlatControllerPose backoff_trial_offsets =
+                                    backoff_source_offsets;
+                                update_lower_body_inertialization(
+                                    backoff_trial,
+                                    backoff_trial_offsets,
+                                    locomotion_pose,
+                                    trial_seconds);
+                                if (lower_body_step_within_limits(
+                                        last_rendered_pose_,
+                                        backoff_trial)) {
+                                    lower = trial_seconds;
+                                    accepted = backoff_trial;
+                                    accepted_offsets =
+                                        backoff_trial_offsets;
+                                    accepted_seconds = trial_seconds;
+                                } else {
+                                    upper = trial_seconds;
+                                }
+                            }
+                            state.pose = accepted;
+                            lower_body_inertial_offsets_ = accepted_offsets;
+                            lower_body_inertialization_seconds_ = std::min(
+                                kLayeredCarryLowerBodyMaximumSeconds,
+                                elapsed_before_backoff + accepted_seconds);
+                        }
+                    }
+                }
             } else {
                 state.pose = target;
+                lower_body_inertialization_active_ = false;
+                lower_body_inertialization_seconds_ = 0.0F;
+                lower_body_inertial_offsets_ = {};
             }
 
             const bool valid_active_hand =
@@ -807,19 +1024,21 @@ ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
                 dt);
         }
 
-        const bool layered_carry =
-            runtime_output.diagnostics.state == RuntimeState::Carry &&
-            !runtime_output.diagnostics.recorded_carry;
         state.overrides_locomotion_pose = true;
         state.synchronize_simulation_root = !layered_carry;
         state.simulation_root_position = state.pose.positions[0];
         state.simulation_root_rotation = state.pose.rotations[0];
         last_rendered_pose_ = state.pose;
+        layered_carry_last_update_ = layered_carry;
         return state;
     }
 
     if (runtime_owned_last_update_) {
         runtime_owned_last_update_ = false;
+        layered_carry_last_update_ = false;
+        lower_body_inertialization_active_ = false;
+        lower_body_inertialization_seconds_ = 0.0F;
+        lower_body_inertial_offsets_ = {};
         inactive_arm_locomotion_hand_.reset();
         inactive_arm_return_hand_.reset();
         inactive_arm_blend_seconds_ = 0.0F;
@@ -864,6 +1083,10 @@ void ControllerInteractionFrameHandoff::reset() {
     inactive_arm_return_hand_.reset();
     inactive_arm_blend_seconds_ = 0.0F;
     inactive_arm_blend_source_ = {};
+    layered_carry_last_update_ = false;
+    lower_body_inertialization_active_ = false;
+    lower_body_inertialization_seconds_ = 0.0F;
+    lower_body_inertial_offsets_ = {};
 }
 
 void ControllerInteractionSceneHandoff::reset_authority() {

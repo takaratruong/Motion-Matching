@@ -1162,7 +1162,7 @@ void test_hand_constraint_keeps_layered_carry_lower_body_exact_and_selected_only
 
     ControllerInteractionFrameState baseline{};
     ControllerInteractionFrameState constrained{};
-    for (int tick = 0; tick < 14; ++tick) {
+    for (int tick = 0; tick < 32; ++tick) {
         baseline = baseline_handoff.apply(
             fresh_locomotion,
             owned,
@@ -1470,6 +1470,214 @@ float rotation_distance(quat left, quat right) {
     return 2.0F * std::acos(orientation_dot);
 }
 
+void test_hold_to_layered_carry_first_frame_preserves_rendered_lower_body() {
+    FlatControllerPose entry = make_flat_pose();
+    const Pose raw_reference = interaction::expand_flat_controller_pose(
+        entry, make_pose(0.375F));
+    RuntimeOutput output = make_owned_output(raw_reference);
+    output.diagnostics.state = RuntimeState::Hold;
+
+    ControllerInteractionFrameHandoff handoff;
+    (void)handoff.apply(
+        entry, output, interaction::kControllerStepSeconds);
+
+    FlatControllerPose held = entry;
+    held.positions[0] = held.positions[0] + vec3(0.20F, 0.0F, -0.15F);
+    held.rotations[1] = quat_from_angle_axis(
+        0.35F, normalize(vec3(0.2F, 0.9F, 0.3F)));
+    held.rotations[3] = quat_from_angle_axis(
+        -0.45F, normalize(vec3(0.7F, 0.2F, 0.4F)));
+    held.rotations[7] = quat_from_angle_axis(
+        0.30F, normalize(vec3(0.3F, 0.5F, 0.8F)));
+    output.pose = interaction::expand_flat_controller_pose(
+        held, raw_reference);
+    const ControllerInteractionFrameState before_carry = handoff.apply(
+        entry, output, interaction::kControllerStepSeconds);
+    require_flat_pose_near(
+        before_carry.pose,
+        held,
+        "Hold setup did not publish the authored full-body pose");
+
+    FlatControllerPose locomotion = entry;
+    locomotion.positions[0] =
+        locomotion.positions[0] + vec3(-0.30F, 0.0F, 0.25F);
+    locomotion.rotations[1] = quat_from_angle_axis(
+        -0.40F, normalize(vec3(0.4F, 0.8F, 0.1F)));
+    locomotion.rotations[3] = quat_from_angle_axis(
+        0.55F, normalize(vec3(0.6F, 0.3F, 0.7F)));
+    locomotion.rotations[7] = quat_from_angle_axis(
+        -0.35F, normalize(vec3(0.2F, 0.7F, 0.6F)));
+    locomotion.foot_contacts = {0U, 1U};
+    const FlatControllerPose locomotion_before = locomotion;
+    output.diagnostics.state = RuntimeState::Carry;
+    output.diagnostics.recorded_carry = false;
+    const RuntimeOutput output_before = output;
+    const ControllerInteractionFrameState first_carry = handoff.apply(
+        locomotion, output, interaction::kControllerStepSeconds);
+
+    for (size_t bone = 0; bone <= 9U; ++bone) {
+        require(
+            flat_bone_channels_bits_equal(
+                first_carry.pose, before_carry.pose, bone),
+            "first layered Carry frame snapped a rendered lower-body channel");
+    }
+    require(
+        first_carry.pose.foot_contacts == locomotion.foot_contacts,
+        "first layered Carry frame did not publish live locomotion contacts");
+    require(
+        !first_carry.synchronize_simulation_root,
+        "layered lower-body handoff overwrote the live simulation root");
+    require(
+        flat_pose_bits_equal(locomotion, locomotion_before),
+        "layered lower-body handoff mutated the locomotion input");
+    require(
+        output_fields_equal(output, output_before),
+        "layered lower-body handoff mutated the runtime input");
+}
+
+void test_layered_carry_lower_body_rebases_moving_target_and_cleans_up() {
+    FlatControllerPose entry = make_flat_pose();
+    const Pose raw_reference = interaction::expand_flat_controller_pose(
+        entry, make_pose(0.375F));
+    RuntimeOutput output = make_owned_output(raw_reference);
+    output.diagnostics.state = RuntimeState::Hold;
+
+    ControllerInteractionFrameHandoff handoff;
+    (void)handoff.apply(
+        entry, output, interaction::kControllerStepSeconds);
+
+    FlatControllerPose held = entry;
+    held.positions[0] = held.positions[0] + vec3(0.15F, 0.0F, -0.10F);
+    held.rotations[1] = quat_from_angle_axis(
+        0.30F, normalize(vec3(0.1F, 0.9F, 0.2F)));
+    held.rotations[3] = quat_from_angle_axis(
+        -0.35F, normalize(vec3(0.8F, 0.2F, 0.3F)));
+    output.pose = interaction::expand_flat_controller_pose(
+        held, raw_reference);
+    ControllerInteractionFrameState previous = handoff.apply(
+        entry, output, interaction::kControllerStepSeconds);
+
+    FlatControllerPose locomotion = entry;
+    locomotion.positions[0] =
+        locomotion.positions[0] + vec3(-0.25F, 0.0F, 0.20F);
+    locomotion.rotations[1] = quat_from_angle_axis(
+        -0.25F, normalize(vec3(0.2F, 0.8F, 0.3F)));
+    locomotion.rotations[3] = quat_from_angle_axis(
+        0.40F, normalize(vec3(0.7F, 0.3F, 0.5F)));
+    locomotion.foot_contacts = {0U, 1U};
+    output.diagnostics.state = RuntimeState::Carry;
+    output.diagnostics.recorded_carry = false;
+
+    ControllerInteractionFrameState frame = handoff.apply(
+        locomotion, output, interaction::kControllerStepSeconds);
+    for (size_t bone = 0; bone <= 9U; ++bone) {
+        require(
+            flat_bone_channels_bits_equal(
+                frame.pose, previous.pose, bone),
+            "moving-target handoff snapped on its zero-decay frame");
+    }
+
+    const auto require_bounded_final_fk = [&] {
+        const FlatWorldPose previous_world = flat_world_pose(previous.pose);
+        const FlatWorldPose current_world = flat_world_pose(frame.pose);
+        for (size_t bone = 0;
+             bone < interaction::kFlatControllerBoneCount;
+             ++bone) {
+            require(
+                length(
+                    current_world.positions[bone] -
+                    previous_world.positions[bone]) <= 0.20F,
+                "layered lower-body handoff exceeded the final-FK translation bound");
+            require(
+                rotation_distance(
+                    current_world.rotations[bone],
+                    previous_world.rotations[bone]) <=
+                    60.0F * 3.14159265358979323846F / 180.0F,
+                "layered lower-body handoff exceeded the final-FK rotation bound");
+        }
+    };
+    require_bounded_final_fk();
+    previous = frame;
+
+    for (int tick = 1; tick <= 4; ++tick) {
+        locomotion.positions[0].x += 0.008F;
+        locomotion.positions[0].z -= 0.004F;
+        locomotion.rotations[7] = quat_from_angle_axis(
+            0.015F * static_cast<float>(tick),
+            normalize(vec3(0.2F, 0.7F, 0.5F)));
+        locomotion.foot_contacts = {
+            static_cast<uint8_t>(tick % 2),
+            static_cast<uint8_t>((tick + 1) % 2)};
+        const FlatControllerPose locomotion_before = locomotion;
+        const RuntimeOutput output_before = output;
+        frame = handoff.apply(
+            locomotion, output, interaction::kControllerStepSeconds);
+        require_bounded_final_fk();
+        require(
+            frame.pose.foot_contacts == locomotion.foot_contacts,
+            "moving lower-body handoff cached stale contacts");
+        require(
+            flat_pose_bits_equal(locomotion, locomotion_before) &&
+                output_fields_equal(output, output_before),
+            "moving lower-body handoff mutated an input");
+        previous = frame;
+    }
+
+    locomotion.positions[0].x += 1.40F;
+    locomotion.rotations[1] = quat_from_angle_axis(
+        1.20F, normalize(vec3(0.1F, 0.9F, 0.3F)));
+    locomotion.foot_contacts = {1U, 0U};
+    frame = handoff.apply(
+        locomotion, output, interaction::kControllerStepSeconds);
+    require_bounded_final_fk();
+    require(
+        !flat_bone_channels_bits_equal(frame.pose, locomotion, 0U),
+        "large locomotion replan bypassed lower-body inertialization");
+    require(
+        frame.pose.foot_contacts == locomotion.foot_contacts &&
+            !frame.synchronize_simulation_root,
+        "lower-body rebase stole contacts or simulation-root authority");
+    previous = frame;
+
+    bool converged = false;
+    for (int tick = 0; tick < 14 && !converged; ++tick) {
+        locomotion.positions[0].z += 0.002F;
+        locomotion.foot_contacts = {
+            static_cast<uint8_t>((tick + 1) % 2),
+            static_cast<uint8_t>(tick % 2)};
+        frame = handoff.apply(
+            locomotion, output, interaction::kControllerStepSeconds);
+        require_bounded_final_fk();
+        require(
+            frame.pose.foot_contacts == locomotion.foot_contacts,
+            "rebased lower-body handoff cached stale contacts");
+        converged = true;
+        for (size_t bone = 0; bone <= 9U; ++bone) {
+            converged = converged && flat_bone_channels_bits_equal(
+                frame.pose, locomotion, bone);
+        }
+        previous = frame;
+    }
+    require(
+        converged,
+        "rebased lower-body handoff did not converge within the 0.50 second contract");
+
+    locomotion.positions[0].x += 0.006F;
+    locomotion.rotations[7] = quat_from_angle_axis(
+        0.09F, normalize(vec3(0.2F, 0.7F, 0.5F)));
+    locomotion.foot_contacts = {0U, 1U};
+    frame = handoff.apply(
+        locomotion, output, interaction::kControllerStepSeconds);
+    for (size_t bone = 0; bone <= 9U; ++bone) {
+        require(
+            flat_bone_channels_bits_equal(frame.pose, locomotion, bone),
+            "completed lower-body handoff retained stale transition state");
+    }
+    require(
+        frame.pose.foot_contacts == locomotion.foot_contacts,
+        "completed lower-body handoff retained stale contacts");
+}
+
 void test_layered_carry_keeps_fresh_lower_body_and_contacts_bit_exact() {
     FlatControllerPose entry = make_flat_pose();
     RuntimeOutput output = make_owned_output(make_pose(0.0F));
@@ -1525,6 +1733,26 @@ void test_layered_carry_keeps_fresh_lower_body_and_contacts_bit_exact() {
 
     ControllerInteractionFrameState frame = handoff.apply(
         locomotion, output, interaction::kControllerStepSeconds);
+    for (size_t bone = 0; bone <= 9U; ++bone) {
+        require(
+            flat_bone_channels_bits_equal(frame.pose, entry, bone),
+            "first layered Carry frame did not preserve the rendered lower body");
+    }
+    require(
+        frame.pose.foot_contacts == locomotion.foot_contacts,
+        "first layered Carry frame did not publish fresh contacts");
+
+    bool converged = false;
+    for (int tick = 0; tick < 64 && !converged; ++tick) {
+        frame = handoff.apply(
+            locomotion, output, interaction::kControllerStepSeconds);
+        converged = true;
+        for (size_t bone = 0; bone <= 9U; ++bone) {
+            converged = converged && flat_bone_channels_bits_equal(
+                frame.pose, locomotion, bone);
+        }
+    }
+    require(converged, "layered Carry lower-body handoff did not converge");
     require_layered_authority(frame, locomotion);
 
     for (size_t bone = 0; bone <= 9U; ++bone) {
@@ -2351,6 +2579,7 @@ void test_frame_handoff_keeps_layered_carry_simulation_root_live() {
     ControllerInteractionFrameHandoff layered_handoff;
     (void)layered_handoff.apply(
         locomotion, output, interaction::kControllerStepSeconds);
+    const FlatControllerPose pre_carry_rendered = locomotion;
     locomotion.positions[0] =
         locomotion.positions[0] + vec3(-1.0F, 0.0F, 0.5F);
     locomotion.rotations[6] = quat_from_angle_axis(
@@ -2358,7 +2587,7 @@ void test_frame_handoff_keeps_layered_carry_simulation_root_live() {
     output.pose = raw_target;
     output.diagnostics.state = RuntimeState::Carry;
     output.diagnostics.recorded_carry = false;
-    const ControllerInteractionFrameState layered = layered_handoff.apply(
+    ControllerInteractionFrameState layered = layered_handoff.apply(
         locomotion, output, interaction::kControllerStepSeconds);
     require(
         layered.runtime_owns_pose,
@@ -2371,10 +2600,27 @@ void test_frame_handoff_keeps_layered_carry_simulation_root_live() {
         "layered Carry overwrote the live simulation root");
     require(
         vec_bits_equal(
-            layered.pose.positions[0], locomotion.positions[0]) &&
+            layered.pose.positions[0], pre_carry_rendered.positions[0]) &&
             quat_bits_equal(
-                layered.pose.rotations[6], locomotion.rotations[6]),
-        "layered Carry did not preserve the live root/leg base");
+                layered.pose.rotations[6], pre_carry_rendered.rotations[6]),
+        "first layered Carry frame did not preserve the rendered root/leg base");
+
+    bool layered_lower_converged = false;
+    for (int tick = 0; tick < 64 && !layered_lower_converged; ++tick) {
+        layered = layered_handoff.apply(
+            locomotion, output, interaction::kControllerStepSeconds);
+        require(
+            !layered.synchronize_simulation_root,
+            "layered Carry synchronized the simulation root during handoff");
+        layered_lower_converged =
+            vec_bits_equal(
+                layered.pose.positions[0], locomotion.positions[0]) &&
+            quat_bits_equal(
+                layered.pose.rotations[6], locomotion.rotations[6]);
+    }
+    require(
+        layered_lower_converged,
+        "layered Carry did not converge to the live root/leg base");
 
     output = make_owned_output(raw_reference);
     ControllerInteractionFrameHandoff pre_carry_handoff;
@@ -3131,6 +3377,8 @@ int main() {
     test_hand_constraint_reset_and_reentry_recalibrates_selected_hand();
     test_frame_handoff_crosses_179_9_to_180_1_incrementally();
     test_frame_handoff_keeps_captured_neck_and_head_while_owned();
+    test_hold_to_layered_carry_first_frame_preserves_rendered_lower_body();
+    test_layered_carry_lower_body_rebases_moving_target_and_cleans_up();
     test_layered_carry_keeps_fresh_lower_body_and_contacts_bit_exact();
     test_layered_carry_released_inactive_arm_uses_fresh_locomotion_authority();
     test_inactive_arm_locomotion_intent_does_not_change_other_carry_modes();

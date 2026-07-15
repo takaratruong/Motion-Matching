@@ -151,6 +151,10 @@ private:
     std::optional<Hand> inactive_arm_return_hand_{};
     float inactive_arm_blend_seconds_ = 0.0F;
     FlatControllerPose inactive_arm_blend_source_{};
+    bool layered_carry_last_update_ = false;
+    bool lower_body_inertialization_active_ = false;
+    float lower_body_inertialization_seconds_ = 0.0F;
+    FlatControllerPose lower_body_inertial_offsets_{};
 };
 
 struct ControllerInteractionSceneState {
