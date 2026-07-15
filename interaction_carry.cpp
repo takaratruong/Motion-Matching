@@ -608,6 +608,32 @@ float rotation_distance(quat left, quat right) {
     return 2.0F * std::acos(std::clamp(cosine, 0.0F, 1.0F));
 }
 
+float maximum_active_arm_step(const IKConfig& config) {
+    constexpr float kPi = 3.141592654F;
+    return config.maximum_step_radians >= 0.5F * kPi
+        ? kPi
+        : 2.0F * config.maximum_step_radians;
+}
+
+bool continuous_active_arm(
+    const Pose& previous,
+    const Pose& candidate,
+    Hand hand,
+    const IKConfig& config) {
+    const float maximum = maximum_active_arm_step(config);
+    for (const HingeJoint& joint : arm(hand)) {
+        const size_t bone = static_cast<size_t>(joint.bone);
+        if (!within_inclusive(
+                rotation_distance(
+                    previous.rotations[bone],
+                    candidate.rotations[bone]),
+                maximum)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool stable_from(
     const Transform& anchor,
     const Transform& current,
@@ -1310,6 +1336,48 @@ Pose CarryController::update(
         throw std::logic_error("interaction carry candidate was not produced");
     }
 
+    IKConfig publication_ik = ik_config_;
+    publication_ik.accepted_position_m = std::min(
+        publication_ik.accepted_position_m,
+        config_.maximum_grasp_drift_m);
+    publication_ik.accepted_orientation_radians = std::min(
+        publication_ik.accepted_orientation_radians,
+        config_.maximum_grasp_drift_radians);
+
+    if (candidate.directly_solved) {
+        Pose branch_pose = candidate.pose;
+        for (const HingeJoint& joint : arm(hand_)) {
+            const size_t bone = static_cast<size_t>(joint.bone);
+            branch_pose.rotations[bone] = last_safe_pose_.rotations[bone];
+        }
+        const IKResult branch_result = solve_hand_ik(
+            branch_pose,
+            hand_,
+            compose(candidate.object, affordance_.hand_in_object),
+            publication_ik);
+        bool branch_ready = branch_result.accepted &&
+            continuous_active_arm(
+                last_safe_pose_, branch_pose, hand_, ik_config_);
+        Transform branch_object{};
+        if (branch_ready) {
+            branch_object = compose(
+                hand_transform(branch_pose, hand_),
+                inverse(affordance_.hand_in_object));
+            branch_ready = valid_transform(branch_object) &&
+                continuous_object(
+                    desired_object,
+                    branch_object,
+                    config_,
+                    publication_ik);
+        }
+        if (branch_ready) {
+            candidate.pose = branch_pose;
+            candidate.object = branch_object;
+        } else {
+            candidate.directly_solved = false;
+        }
+    }
+
     const bool changed_key = transition_active_
         ? candidate.seam_key != transition_seam_key_
         : candidate.seam_key != published_seam_key_;
@@ -1340,13 +1408,6 @@ Pose CarryController::update(
     const float requested_progress = std::min(
         1.0F,
         transition_progress_ + dt / kCarrySeamSeconds);
-    IKConfig transition_ik = ik_config_;
-    transition_ik.accepted_position_m = std::min(
-        transition_ik.accepted_position_m,
-        config_.maximum_grasp_drift_m);
-    transition_ik.accepted_orientation_radians = std::min(
-        transition_ik.accepted_orientation_radians,
-        config_.maximum_grasp_drift_radians);
 
     float trial_progress = requested_progress;
     for (int32_t attempt = 0; attempt < kCarrySeamAttempts; ++attempt) {
@@ -1363,8 +1424,12 @@ Pose CarryController::update(
                 transition,
                 hand_,
                 compose(candidate.object, affordance_.hand_in_object),
-                transition_ik);
+                publication_ik);
             if (!transition_result.accepted) continue;
+            if (!continuous_active_arm(
+                    last_safe_pose_, transition, hand_, ik_config_)) {
+                continue;
+            }
             const Transform transition_object = compose(
                 hand_transform(transition, hand_),
                 inverse(affordance_.hand_in_object));
@@ -1373,7 +1438,7 @@ Pose CarryController::update(
                     desired_object,
                     transition_object,
                     config_,
-                    transition_ik)) {
+                    publication_ik)) {
                 continue;
             }
             const Transform transition_object_in_root = compose(
@@ -1409,7 +1474,7 @@ Pose CarryController::update(
         inverse(affordance_.hand_in_object));
     if (!valid_transform(safe_object) ||
         !continuous_object(
-            desired_object, safe_object, config_, transition_ik)) {
+            desired_object, safe_object, config_, publication_ik)) {
         throw std::invalid_argument(
             "interaction carry invalid transition safe grasp");
     }

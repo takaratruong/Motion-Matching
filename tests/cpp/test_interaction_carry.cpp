@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 #include <type_traits>
@@ -35,6 +36,30 @@ bool near(quat left, quat right, float tolerance = kTolerance) {
     const float cosine = std::clamp(
         std::abs(quat_dot(left, right)), 0.0F, 1.0F);
     return 2.0F * std::acos(cosine) <= tolerance;
+}
+
+float rotation_distance(quat left, quat right) {
+    left = left / quat_length(left);
+    right = right / quat_length(right);
+    const float cosine = std::clamp(
+        std::abs(quat_dot(left, right)), 0.0F, 1.0F);
+    return 2.0F * std::acos(cosine);
+}
+
+float maximum_right_arm_step(
+    const interaction::Pose& previous,
+    const interaction::Pose& current) {
+    float maximum = 0.0F;
+    for (int32_t bone = g1_skeleton::RightShoulderPitch;
+         bone <= g1_skeleton::RightWrist;
+         ++bone) {
+        maximum = std::max(
+            maximum,
+            rotation_distance(
+                previous.rotations[static_cast<size_t>(bone)],
+                current.rotations[static_cast<size_t>(bone)]));
+    }
+    return maximum;
 }
 
 bool near(
@@ -180,6 +205,17 @@ void write_object_rotation(
     database.object_rotations.at(offset + 1U) = value.x;
     database.object_rotations.at(offset + 2U) = value.y;
     database.object_rotations.at(offset + 3U) = value.z;
+}
+
+void write_object_transform(
+    interaction::Database& database,
+    int32_t frame,
+    interaction::Transform value) {
+    interaction::runtime_fixture_detail::write_vec3(
+        database.object_positions,
+        static_cast<size_t>(frame),
+        value.position);
+    write_object_rotation(database, frame, value.rotation);
 }
 
 interaction::Transform object_at_frame(
@@ -1172,6 +1208,95 @@ void test_initial_recorded_carry_smooths_nonarm_seam() {
         CarryConfig{}.maximum_grasp_drift_m + 1.0e-4F);
 }
 
+void test_recorded_carry_keeps_active_arm_on_one_continuous_ik_branch() {
+    using namespace interaction;
+    RuntimeFixture fixture = make_runtime_fixture();
+    const GraspAffordance affordance = fixture_affordance(fixture);
+    const Pose hold = final_hold_pose(fixture);
+    LocomotionSnapshot locomotion = fixture.locomotion;
+    locomotion.pose = hold;
+    const Transform object = object_world_from_hold_pose(
+        hold, Hand::Right, affordance);
+    const NormalizedQuery query = carry_query(
+        fixture.features, locomotion, Hand::Right, object, affordance);
+    const std::array<quat, 7> alternate_arm = {{
+        {0.706170559F, -0.0991955474F, 0.0976584703F, 0.694223464F},
+        {0.99653852F, 0.0831327066F, 0.0F, 0.0F},
+        {0.891591847F, 0.0F, -0.452839911F, 0.0F},
+        {0.792196512F, 0.0F, 0.0F, -0.610266089F},
+        {0.943883598F, -0.330278367F, 0.0F, 0.0F},
+        {0.997371793F, 0.0F, 0.0F, -0.0724532753F},
+        {0.999991298F, 0.0F, 0.0041709533F, 0.0F},
+    }};
+    constexpr float kRecordedMarker = 42.0F;
+
+    for (int32_t frame = 115; frame < 150; ++frame) {
+        for (size_t bone = 1U; bone < g1_skeleton::BoneCount; ++bone) {
+            write_bone_rotation(
+                fixture.database, frame, bone, hold.rotations[bone]);
+        }
+        for (size_t joint = 0U; joint < alternate_arm.size(); ++joint) {
+            write_bone_rotation(
+                fixture.database,
+                frame,
+                static_cast<size_t>(g1_skeleton::RightShoulderPitch) + joint,
+                alternate_arm[joint]);
+        }
+        fixture.database.hand_dof.at(
+            static_cast<size_t>(frame) * 14U) = kRecordedMarker;
+        const Pose recorded_pose = pose_at_frame(fixture.database, frame);
+        const Transform recorded_object = compose(
+            hand_world(recorded_pose, Hand::Right),
+            inverse(affordance.hand_in_object));
+        write_object_transform(fixture.database, frame, recorded_object);
+        set_pose_trajectory_row(fixture.features, frame, query, 0.0F);
+    }
+
+    const CarryRanges ranges = classify_carry_ranges(fixture.database);
+    assert(ranges.recorded.size() == 1U);
+    assert_range(
+        ranges.recorded.front(), 1, 115, 150, Hand::Right);
+    CarryController controller(fixture.database, fixture.features, ranges);
+    controller.start(hold, Hand::Right, affordance, object);
+
+    Pose previous = hold;
+    float maximum_step = 0.0F;
+    int32_t maximum_tick = -1;
+    for (int32_t tick = 0; tick < 20; ++tick) {
+        const Pose output = controller.update(locomotion, 0.04F);
+        const float step = maximum_right_arm_step(previous, output);
+        if (step > maximum_step) {
+            maximum_step = step;
+            maximum_tick = tick;
+        }
+        assert(controller.recorded());
+        assert(near(
+            root_world(output), root_world(locomotion.pose), 2.0e-5F));
+        assert(hand_error(
+            output,
+            Hand::Right,
+            affordance,
+            controller.object_world()) <= IKConfig{}.accepted_position_m);
+        if (tick >= 12 && tick <= 14) {
+            assert(near(
+                output.hand_dof[0], kRecordedMarker, 2.0e-4F));
+        }
+        previous = output;
+    }
+
+    const float maximum_allowed =
+        2.0F * IKConfig{}.maximum_step_radians;
+    if (maximum_step > maximum_allowed + 2.0e-4F) {
+        std::fprintf(
+            stderr,
+            "active-arm max step=%.9g tick=%d limit=%.9g\n",
+            maximum_step,
+            maximum_tick,
+            maximum_allowed);
+    }
+    assert(maximum_step <= maximum_allowed + 2.0e-4F);
+}
+
 void test_recorded_range_switch_restarts_seam_but_progression_does_not() {
     using namespace interaction;
     RuntimeFixture fixture = make_runtime_fixture();
@@ -1816,6 +1941,7 @@ int main() {
     test_lifecycle_and_invalid_inputs_are_defensive();
     test_recorded_search_uses_pose_trajectory_and_aligns_object();
     test_initial_recorded_carry_smooths_nonarm_seam();
+    test_recorded_carry_keeps_active_arm_on_one_continuous_ik_branch();
     test_recorded_range_switch_restarts_seam_but_progression_does_not();
     test_recorded_cursor_cadence_remainder_and_tie_continuation();
     test_recorded_range_stop_is_half_open_and_clip_safe();
