@@ -133,6 +133,30 @@ bool raw_pose_channels_equal(const Pose& left, const Pose& right) {
     return left.foot_contacts == right.foot_contacts;
 }
 
+bool valid_constraint_hand(Hand hand) {
+    return hand == Hand::Left || hand == Hand::Right;
+}
+
+bool constraint_identity_matches(
+    const ControllerInteractionHandConstraint& constraint,
+    const RuntimeDiagnostics& diagnostics) {
+    return constraint.target.id != 0U &&
+        constraint.target.generation != 0U &&
+        constraint.affordance_id != 0U &&
+        valid_constraint_hand(constraint.hand) &&
+        constraint.target == diagnostics.target &&
+        constraint.affordance_id == diagnostics.affordance_id &&
+        constraint.hand == diagnostics.hand;
+}
+
+bool constraint_identity_matches(
+    const ControllerInteractionHandConstraint& left,
+    const ControllerInteractionHandConstraint& right) {
+    return left.target == right.target &&
+        left.affordance_id == right.affordance_id &&
+        left.hand == right.hand;
+}
+
 quat normalized_rotation(quat rotation) {
     const float magnitude = quat_length(rotation);
     return rotation / magnitude;
@@ -474,7 +498,8 @@ const RuntimeOutput& ControllerInteractionScheduler::cached_output() const {
 ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
     const FlatControllerPose& locomotion_pose,
     const RuntimeOutput& runtime_output,
-    float dt) {
+    float dt,
+    std::optional<ControllerInteractionHandConstraint> hand_constraint) {
     ControllerInteractionFrameState state;
     state.runtime_owns_pose = runtime_output.owns_pose;
 
@@ -486,46 +511,66 @@ ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
             release_active_ = false;
             runtime_owned_last_update_ = true;
             state.pose = ownership_flat_reference_;
-            state.overrides_locomotion_pose = true;
-            state.synchronize_simulation_root =
-                runtime_output.diagnostics.state != RuntimeState::Carry ||
-                runtime_output.diagnostics.recorded_carry;
-            state.simulation_root_position = state.pose.positions[0];
-            state.simulation_root_rotation = state.pose.rotations[0];
-            last_rendered_pose_ = state.pose;
-            return state;
+            target_rig_arm_ik_.reset();
+            ownership_hand_constraint_.reset();
+            if (hand_constraint.has_value() &&
+                constraint_identity_matches(
+                    *hand_constraint, runtime_output.diagnostics)) {
+                ownership_hand_constraint_ = hand_constraint;
+                target_rig_arm_ik_.begin_epoch(
+                    ownership_interaction_reference_,
+                    ownership_flat_reference_,
+                    hand_constraint->hand);
+            }
+        } else {
+            FlatControllerPose target = collapse_interaction_pose(
+                runtime_output.pose,
+                ownership_interaction_reference_,
+                ownership_flat_reference_);
+            for (size_t bone = 0; bone < target.rotations.size(); ++bone) {
+                if (quat_dot(
+                        last_rendered_pose_.rotations[bone],
+                        target.rotations[bone]) < 0.0F) {
+                    target.rotations[bone] = -target.rotations[bone];
+                }
+            }
+
+            const bool layered_carry =
+                runtime_output.diagnostics.state == RuntimeState::Carry &&
+                !runtime_output.diagnostics.recorded_carry;
+            if (layered_carry) {
+                state.pose = locomotion_pose;
+                for (size_t bone = 10U;
+                     bone < kFlatControllerBoneCount;
+                     ++bone) {
+                    state.pose.positions[bone] = target.positions[bone];
+                    state.pose.velocities[bone] = target.velocities[bone];
+                    state.pose.rotations[bone] = target.rotations[bone];
+                    state.pose.angular_velocities[bone] =
+                        target.angular_velocities[bone];
+                }
+                state.pose.foot_contacts = locomotion_pose.foot_contacts;
+            } else {
+                state.pose = target;
+            }
         }
 
-        FlatControllerPose target = collapse_interaction_pose(
-            runtime_output.pose,
-            ownership_interaction_reference_,
-            ownership_flat_reference_);
-        for (size_t bone = 0; bone < target.rotations.size(); ++bone) {
-            if (quat_dot(
-                    last_rendered_pose_.rotations[bone],
-                    target.rotations[bone]) < 0.0F) {
-                target.rotations[bone] = -target.rotations[bone];
-            }
+        if (hand_constraint.has_value() &&
+            ownership_hand_constraint_.has_value() &&
+            constraint_identity_matches(
+                *hand_constraint, runtime_output.diagnostics) &&
+            constraint_identity_matches(
+                *hand_constraint, *ownership_hand_constraint_)) {
+            state.hand_constraint_result = target_rig_arm_ik_.solve(
+                state.pose,
+                hand_constraint->grasp_world,
+                runtime_output.diagnostics.hand_constraint_weight,
+                dt);
         }
 
         const bool layered_carry =
             runtime_output.diagnostics.state == RuntimeState::Carry &&
             !runtime_output.diagnostics.recorded_carry;
-        if (layered_carry) {
-            state.pose = locomotion_pose;
-            for (size_t bone = 10U;
-                 bone < kFlatControllerBoneCount;
-                 ++bone) {
-                state.pose.positions[bone] = target.positions[bone];
-                state.pose.velocities[bone] = target.velocities[bone];
-                state.pose.rotations[bone] = target.rotations[bone];
-                state.pose.angular_velocities[bone] =
-                    target.angular_velocities[bone];
-            }
-            state.pose.foot_contacts = locomotion_pose.foot_contacts;
-        } else {
-            state.pose = target;
-        }
         state.overrides_locomotion_pose = true;
         state.synchronize_simulation_root = !layered_carry;
         state.simulation_root_position = state.pose.positions[0];
@@ -549,8 +594,9 @@ ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
             state.overrides_locomotion_pose = false;
             release_active_ = false;
         } else {
-            state.pose = blend_flat_pose(
-                blend_source_, locomotion_pose, alpha);
+            state.pose = alpha <= 0.0F
+                ? blend_source_
+                : blend_flat_pose(blend_source_, locomotion_pose, alpha);
             state.overrides_locomotion_pose = true;
             last_rendered_pose_ = state.pose;
             blend_seconds_ += std::max(dt, 0.0F);
@@ -570,6 +616,8 @@ void ControllerInteractionFrameHandoff::reset() {
     ownership_interaction_reference_ = {};
     ownership_flat_reference_ = {};
     last_rendered_pose_ = {};
+    target_rig_arm_ik_.reset();
+    ownership_hand_constraint_.reset();
 }
 
 ControllerInteractionSceneState ControllerInteractionSceneHandoff::apply(

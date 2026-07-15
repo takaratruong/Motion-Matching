@@ -1987,7 +1987,7 @@ class Task12PolicyTests(unittest.TestCase):
         seam = self._source_between(
             controller,
             "        interaction::Pose locomotion_pose =",
-            "        if (interaction_frame_state.overrides_locomotion_pose)",
+            "        const interaction::Pose interaction_debug_pose =",
         )
         provider = self._source_between(
             seam,
@@ -2009,6 +2009,40 @@ class Task12PolicyTests(unittest.TestCase):
             r"interaction_frame_handoff\.apply\(\s*flat_locomotion_pose,",
             "frame handoff must receive ordinary flat locomotion pose",
         )
+
+    def test_scene_authoritative_grasp_precedes_final_pose_publication(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        scene_apply = controller.index("interaction_scene_handoff.apply(")
+        affordance_lookup = controller.index(
+            "interaction_registry.find_affordance(", scene_apply
+        )
+        constraint_apply = controller.index(
+            "interaction_frame_handoff.apply(", affordance_lookup
+        )
+        pose_publication = controller.index(
+            "interaction_frame_state.pose.positions[bone]", constraint_apply
+        )
+        self.assertLess(scene_apply, affordance_lookup)
+        self.assertLess(affordance_lookup, constraint_apply)
+        self.assertLess(constraint_apply, pose_publication)
+        constraint_block = controller[affordance_lookup:constraint_apply]
+        self.assertRegex(
+            constraint_block,
+            r"find_affordance\(\s*"
+            r"interaction_output\.diagnostics\.target,\s*"
+            r"interaction_output\.diagnostics\.affordance_id\)",
+            "constraint must use the runtime's exact target and affordance",
+        )
+        self.assertRegex(
+            constraint_block,
+            r"constraint\.grasp_world\s*=\s*interaction::compose\(\s*"
+            r"interaction_scene_state\.object_world,\s*"
+            r"selected_affordance->hand_in_object\)",
+            "constraint must compose the scene-authoritative semantic grasp",
+        )
+        self.assertNotIn("interaction_registry.replace_pose", constraint_block)
+        self.assertNotIn("interaction_registry.reset", constraint_block)
+        self.assertNotIn("interaction_registry.upsert", constraint_block)
 
     def test_canonical_row_invariant_is_limited_to_locomotion_prefix(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "interaction_runtime.h"
+#include "interaction_target_rig_ik.h"
 
 #include <array>
 #include <cstddef>
@@ -103,6 +104,7 @@ private:
 
 struct ControllerInteractionFrameState {
     FlatControllerPose pose{};
+    TargetRigArmIKResult hand_constraint_result{};
     bool runtime_owns_pose = false;
     bool overrides_locomotion_pose = false;
     bool synchronize_simulation_root = false;
@@ -110,12 +112,21 @@ struct ControllerInteractionFrameState {
     quat simulation_root_rotation{};
 };
 
+struct ControllerInteractionHandConstraint {
+    TargetHandle target{};
+    uint32_t affordance_id = 0U;
+    Hand hand = Hand::Right;
+    Transform grasp_world{};
+};
+
 class ControllerInteractionFrameHandoff {
 public:
     ControllerInteractionFrameState apply(
         const FlatControllerPose& locomotion_pose,
         const RuntimeOutput& runtime_output,
-        float dt);
+        float dt,
+        std::optional<ControllerInteractionHandConstraint> hand_constraint =
+            std::nullopt);
     void reset();
 
 private:
@@ -126,6 +137,9 @@ private:
     Pose ownership_interaction_reference_{};
     FlatControllerPose ownership_flat_reference_{};
     FlatControllerPose last_rendered_pose_{};
+    TargetRigArmIK target_rig_arm_ik_{};
+    std::optional<ControllerInteractionHandConstraint>
+        ownership_hand_constraint_{};
 };
 
 struct ControllerInteractionSceneState {

@@ -3574,60 +3574,10 @@ int main(void)
             ++autodemo_state.runtime_tick;
         }
 
-        interaction_frame_state = interaction_frame_handoff.apply(
-            flat_locomotion_pose,
-            interaction_output,
-            interaction::kControllerStepSeconds);
-        if (interaction_frame_state.overrides_locomotion_pose)
-        {
-            for (size_t bone = 0;
-                 bone < interaction::kFlatControllerBoneCount;
-                 ++bone)
-            {
-                const int index = static_cast<int>(bone);
-                bone_positions(index) =
-                    interaction_frame_state.pose.positions[bone];
-                bone_velocities(index) =
-                    interaction_frame_state.pose.velocities[bone];
-                bone_rotations(index) =
-                    interaction_frame_state.pose.rotations[bone];
-                bone_angular_velocities(index) =
-                    interaction_frame_state.pose.angular_velocities[bone];
-            }
-            curr_bone_contacts(0) =
-                interaction_frame_state.pose.foot_contacts[0] != 0U;
-            curr_bone_contacts(1) =
-                interaction_frame_state.pose.foot_contacts[1] != 0U;
-        }
-        if (interaction_frame_state.runtime_owns_pose)
-        {
-            latest_owned_interaction_pose = interaction_output.pose;
-        }
-        else
-        {
-            latest_owned_interaction_pose.reset();
-        }
-        if (interaction_frame_state.synchronize_simulation_root)
-        {
-            simulation_position =
-                interaction_frame_state.simulation_root_position;
-            simulation_rotation =
-                interaction_frame_state.simulation_root_rotation;
-        }
-        const interaction::Pose interaction_debug_pose =
-            interaction::expand_flat_controller_pose(
-                interaction_frame_state.pose,
-                interaction_frame_state.runtime_owns_pose
-                    ? interaction_output.pose
-                    : locomotion_pose);
-
-        // Reset may replace the registry entry with a newer generation.
-        // Prefer a published diagnostic handle, then refresh by stable ID so
-        // sparse or repeated generation changes cannot strand scene drawing.
-        if (interaction_output.diagnostics.target.id ==
-                interaction_scene_target_handle.id &&
-            interaction_registry.find(interaction_output.diagnostics.target) !=
-                nullptr)
+        // Prefer any exact selected target, then refresh its generation by
+        // stable ID so resets cannot strand scene drawing.
+        if (interaction_registry.find(interaction_output.diagnostics.target) !=
+            nullptr)
         {
             interaction_scene_target_handle =
                 interaction_output.diagnostics.target;
@@ -3654,6 +3604,75 @@ int main(void)
                 interaction_scene_target,
                 interaction_output,
                 interaction_authored_target.object_world);
+
+        std::optional<interaction::ControllerInteractionHandConstraint>
+            interaction_hand_constraint;
+        const interaction::InteractionTarget* selected_constraint_target =
+            interaction_registry.find(interaction_output.diagnostics.target);
+        const interaction::GraspAffordance* selected_affordance =
+            interaction_registry.find_affordance(
+                interaction_output.diagnostics.target,
+                interaction_output.diagnostics.affordance_id);
+        if (selected_constraint_target != nullptr &&
+            interaction_scene_target == selected_constraint_target &&
+            selected_affordance != nullptr &&
+            selected_affordance->hand == interaction_output.diagnostics.hand)
+        {
+            interaction::ControllerInteractionHandConstraint constraint;
+            constraint.target = interaction_output.diagnostics.target;
+            constraint.affordance_id =
+                interaction_output.diagnostics.affordance_id;
+            constraint.hand = interaction_output.diagnostics.hand;
+            constraint.grasp_world = interaction::compose(
+                interaction_scene_state.object_world,
+                selected_affordance->hand_in_object);
+            interaction_hand_constraint = constraint;
+        }
+
+        interaction_frame_state = interaction_frame_handoff.apply(
+            flat_locomotion_pose,
+            interaction_output,
+            interaction::kControllerStepSeconds,
+            interaction_hand_constraint);
+        for (size_t bone = 0;
+             bone < interaction::kFlatControllerBoneCount;
+             ++bone)
+        {
+            const int index = static_cast<int>(bone);
+            bone_positions(index) =
+                interaction_frame_state.pose.positions[bone];
+            bone_velocities(index) =
+                interaction_frame_state.pose.velocities[bone];
+            bone_rotations(index) =
+                interaction_frame_state.pose.rotations[bone];
+            bone_angular_velocities(index) =
+                interaction_frame_state.pose.angular_velocities[bone];
+        }
+        curr_bone_contacts(0) =
+            interaction_frame_state.pose.foot_contacts[0] != 0U;
+        curr_bone_contacts(1) =
+            interaction_frame_state.pose.foot_contacts[1] != 0U;
+        if (interaction_frame_state.runtime_owns_pose)
+        {
+            latest_owned_interaction_pose = interaction_output.pose;
+        }
+        else
+        {
+            latest_owned_interaction_pose.reset();
+        }
+        if (interaction_frame_state.synchronize_simulation_root)
+        {
+            simulation_position =
+                interaction_frame_state.simulation_root_position;
+            simulation_rotation =
+                interaction_frame_state.simulation_root_rotation;
+        }
+        const interaction::Pose interaction_debug_pose =
+            interaction::expand_flat_controller_pose(
+                interaction_frame_state.pose,
+                interaction_frame_state.runtime_owns_pose
+                    ? interaction_output.pose
+                    : locomotion_pose);
         
 #ifdef MM_DISCRETE
         {

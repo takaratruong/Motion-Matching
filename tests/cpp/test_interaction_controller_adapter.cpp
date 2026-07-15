@@ -18,6 +18,7 @@ namespace {
 
 using interaction::ControllerInteractionEdges;
 using interaction::ControllerInteractionFrameHandoff;
+using interaction::ControllerInteractionHandConstraint;
 using interaction::ControllerInteractionFrameState;
 using interaction::ControllerInteractionSceneHandoff;
 using interaction::ControllerInteractionSceneState;
@@ -910,6 +911,26 @@ RuntimeOutput make_owned_output(const Pose& raw_pose) {
     return output;
 }
 
+ControllerInteractionHandConstraint make_hand_constraint(
+    const RuntimeOutput& output,
+    const FlatControllerPose& base_pose,
+    Hand hand) {
+    const FlatWorldPose world = flat_world_pose(base_pose);
+    const size_t upper_arm_bone = hand == Hand::Left ? 16U : 20U;
+    const size_t hand_bone = hand == Hand::Left ? 18U : 22U;
+    ControllerInteractionHandConstraint constraint;
+    constraint.target = output.diagnostics.target;
+    constraint.affordance_id = output.diagnostics.affordance_id;
+    constraint.hand = hand;
+    constraint.grasp_world = {
+        lerp(
+            world.positions[upper_arm_bone],
+            world.positions[hand_bone],
+            0.80F) + vec3(0.0F, 0.02F, -0.01F),
+        world.rotations[hand_bone]};
+    return constraint;
+}
+
 float rotation_distance(quat left, quat right);
 
 void test_frame_handoff_first_owned_frame_is_exact_displayed_reference() {
@@ -923,6 +944,376 @@ void test_frame_handoff_first_owned_frame_is_exact_displayed_reference() {
     require(
         flat_pose_bits_equal(frame.pose, entry),
         "first ownership frame did not preserve displayed entry pose");
+}
+
+void test_frame_handoff_applies_validated_semantic_hand_constraint_and_releases_from_it() {
+    const FlatControllerPose entry = make_flat_pose();
+    const Pose raw_reference = interaction::expand_flat_controller_pose(
+        entry, make_pose(0.375F));
+    RuntimeOutput owned = make_owned_output(raw_reference);
+    owned.diagnostics.target = {71U, 4U};
+    owned.diagnostics.affordance_id = 9U;
+    owned.diagnostics.hand = Hand::Right;
+    owned.diagnostics.hand_constraint_weight = 0.0F;
+
+    const FlatWorldPose entry_world = flat_world_pose(entry);
+    ControllerInteractionHandConstraint constraint;
+    constraint.target = owned.diagnostics.target;
+    constraint.affordance_id = owned.diagnostics.affordance_id;
+    constraint.hand = owned.diagnostics.hand;
+    constraint.grasp_world = {
+        entry_world.positions[22] + vec3(0.03F, 0.02F, -0.01F),
+        entry_world.rotations[22]};
+    const ControllerInteractionHandConstraint constraint_before = constraint;
+    ControllerInteractionFrameHandoff handoff;
+    const ControllerInteractionFrameState first = handoff.apply(
+        entry,
+        owned,
+        interaction::kControllerStepSeconds,
+        constraint);
+    require(
+        flat_pose_bits_equal(first.pose, entry),
+        "zero-weight ownership entry changed the displayed pose");
+    require(
+        !first.hand_constraint_result.applied,
+        "zero-weight ownership entry applied the hand constraint");
+
+    owned.diagnostics.hand_constraint_weight = 1.0F;
+    const RuntimeOutput constrained_input_before = owned;
+    const ControllerInteractionFrameState constrained = handoff.apply(
+        entry,
+        owned,
+        interaction::kControllerStepSeconds,
+        constraint);
+    require(
+        constrained.hand_constraint_result.applied &&
+            constrained.hand_constraint_result.reachable,
+        "matching full-weight semantic constraint did not solve");
+    const FlatWorldPose constrained_world = flat_world_pose(constrained.pose);
+    require_vec_near(
+        constrained_world.positions[22],
+        constraint.grasp_world.position,
+        "selected hand did not reach the semantic grasp",
+        3.0e-4F);
+    for (size_t bone = 0; bone < entry.positions.size(); ++bone) {
+        const bool selected_chain =
+            bone == 19U || bone == 20U || bone == 21U || bone == 22U;
+        if (selected_chain) continue;
+        require(
+            vec_bits_equal(
+                constrained.pose.positions[bone], entry.positions[bone]) &&
+                vec_bits_equal(
+                    constrained.pose.velocities[bone], entry.velocities[bone]) &&
+                quat_bits_equal(
+                    constrained.pose.rotations[bone], entry.rotations[bone]) &&
+                vec_bits_equal(
+                    constrained.pose.angular_velocities[bone],
+                    entry.angular_velocities[bone]),
+            "hand constraint modified a bone outside the selected chain");
+    }
+    require(
+        constrained.pose.foot_contacts == entry.foot_contacts,
+        "hand constraint modified foot contacts");
+    require(
+        output_fields_equal(owned, constrained_input_before) &&
+            constraint.target == constraint_before.target &&
+            constraint.affordance_id == constraint_before.affordance_id &&
+            constraint.hand == constraint_before.hand &&
+            transform_bits_equal(
+                constraint.grasp_world, constraint_before.grasp_world),
+        "hand constraint mutated runtime or scene input data");
+
+    RuntimeOutput idle;
+    const ControllerInteractionFrameState first_release = handoff.apply(
+        entry,
+        idle,
+        interaction::kControllerStepSeconds,
+        std::nullopt);
+    require(
+        flat_pose_bits_equal(first_release.pose, constrained.pose),
+        "release did not begin at the last constrained pose");
+
+    for (int release_frame = 1; release_frame < 15; ++release_frame) {
+        const ControllerInteractionFrameState release = handoff.apply(
+            entry,
+            idle,
+            interaction::kControllerStepSeconds,
+            std::nullopt);
+        require(
+            release.overrides_locomotion_pose,
+            "normal 0.25 second release ended early");
+    }
+    const ControllerInteractionFrameState relinquished = handoff.apply(
+        entry,
+        idle,
+        interaction::kControllerStepSeconds,
+        std::nullopt);
+    require(
+        !relinquished.overrides_locomotion_pose &&
+            flat_pose_bits_equal(relinquished.pose, entry),
+        "normal 0.25 second release did not relinquish on time");
+}
+
+void test_hand_constraint_keeps_layered_carry_lower_body_exact_and_selected_only() {
+    const FlatControllerPose entry = make_flat_pose();
+    const Pose raw_reference = interaction::expand_flat_controller_pose(
+        entry, make_pose(0.375F));
+    RuntimeOutput owned = make_owned_output(raw_reference);
+    owned.diagnostics.target = {72U, 5U};
+    owned.diagnostics.affordance_id = 10U;
+    owned.diagnostics.hand = Hand::Left;
+    owned.diagnostics.hand_constraint_weight = 0.0F;
+    const ControllerInteractionHandConstraint constraint =
+        make_hand_constraint(owned, entry, Hand::Left);
+
+    ControllerInteractionFrameHandoff baseline_handoff;
+    ControllerInteractionFrameHandoff constrained_handoff;
+    (void)baseline_handoff.apply(
+        entry, owned, interaction::kControllerStepSeconds, std::nullopt);
+    (void)constrained_handoff.apply(
+        entry, owned, interaction::kControllerStepSeconds, constraint);
+
+    FlatControllerPose fresh_locomotion = entry;
+    for (size_t bone = 0; bone <= 9U; ++bone) {
+        const float value = static_cast<float>(bone + 1U);
+        fresh_locomotion.positions[bone] =
+            fresh_locomotion.positions[bone] +
+            vec3(0.02F * value, -0.01F * value, 0.03F * value);
+        fresh_locomotion.velocities[bone] =
+            fresh_locomotion.velocities[bone] +
+            vec3(-0.04F * value, 0.01F * value, 0.02F * value);
+        fresh_locomotion.rotations[bone] = quat_from_angle_axis(
+            0.01F * value, vec3(0.0F, 1.0F, 0.0F));
+        fresh_locomotion.angular_velocities[bone] =
+            fresh_locomotion.angular_velocities[bone] +
+            vec3(0.03F * value, -0.02F * value, 0.01F * value);
+    }
+    fresh_locomotion.foot_contacts = {0U, 1U};
+    owned.diagnostics.state = RuntimeState::Carry;
+    owned.diagnostics.recorded_carry = false;
+    owned.diagnostics.hand_constraint_weight = 1.0F;
+    const ControllerInteractionHandConstraint carry_constraint =
+        make_hand_constraint(owned, fresh_locomotion, Hand::Left);
+
+    const ControllerInteractionFrameState baseline = baseline_handoff.apply(
+        fresh_locomotion,
+        owned,
+        interaction::kControllerStepSeconds,
+        std::nullopt);
+    const ControllerInteractionFrameState constrained =
+        constrained_handoff.apply(
+            fresh_locomotion,
+            owned,
+            interaction::kControllerStepSeconds,
+            carry_constraint);
+    require(
+        constrained.hand_constraint_result.applied &&
+            constrained.hand_constraint_result.reachable,
+        "layered Carry did not apply the selected hand constraint");
+    bool selected_chain_changed = false;
+    for (size_t bone = 0; bone < constrained.pose.positions.size(); ++bone) {
+        const bool selected_chain = bone >= 15U && bone <= 18U;
+        require(
+            vec_bits_equal(
+                constrained.pose.positions[bone], baseline.pose.positions[bone]) &&
+                vec_bits_equal(
+                    constrained.pose.velocities[bone], baseline.pose.velocities[bone]),
+            "layered hand constraint changed a translation channel");
+        if (selected_chain) {
+            selected_chain_changed = selected_chain_changed ||
+                !quat_bits_equal(
+                    constrained.pose.rotations[bone],
+                    baseline.pose.rotations[bone]) ||
+                !vec_bits_equal(
+                    constrained.pose.angular_velocities[bone],
+                    baseline.pose.angular_velocities[bone]);
+            continue;
+        }
+        require(
+            quat_bits_equal(
+                constrained.pose.rotations[bone], baseline.pose.rotations[bone]) &&
+                vec_bits_equal(
+                    constrained.pose.angular_velocities[bone],
+                    baseline.pose.angular_velocities[bone]),
+            "layered hand constraint changed a non-selected rotation channel");
+    }
+    require(selected_chain_changed, "selected layered arm chain did not change");
+    for (size_t bone = 0; bone <= 9U; ++bone) {
+        require(
+            vec_bits_equal(
+                constrained.pose.positions[bone],
+                fresh_locomotion.positions[bone]) &&
+                vec_bits_equal(
+                    constrained.pose.velocities[bone],
+                    fresh_locomotion.velocities[bone]) &&
+                quat_bits_equal(
+                    constrained.pose.rotations[bone],
+                    fresh_locomotion.rotations[bone]) &&
+                vec_bits_equal(
+                    constrained.pose.angular_velocities[bone],
+                    fresh_locomotion.angular_velocities[bone]),
+            "layered hand constraint changed live locomotion bones 0..9");
+    }
+    require(
+        constrained.pose.foot_contacts == fresh_locomotion.foot_contacts,
+        "layered hand constraint changed live locomotion contacts");
+}
+
+void test_hand_constraint_mismatch_or_invalid_input_disables_atomically() {
+    const FlatControllerPose entry = make_flat_pose();
+    const Pose raw_reference = interaction::expand_flat_controller_pose(
+        entry, make_pose(0.375F));
+    RuntimeOutput owned = make_owned_output(raw_reference);
+    owned.diagnostics.target = {73U, 6U};
+    owned.diagnostics.affordance_id = 11U;
+    owned.diagnostics.hand = Hand::Right;
+    owned.diagnostics.hand_constraint_weight = 0.0F;
+    const ControllerInteractionHandConstraint valid =
+        make_hand_constraint(owned, entry, Hand::Right);
+
+    std::array<std::optional<ControllerInteractionHandConstraint>, 6>
+        invalid_constraints{};
+    invalid_constraints[0] = std::nullopt;
+    invalid_constraints[1] = valid;
+    invalid_constraints[1]->target.generation += 1U;
+    invalid_constraints[2] = valid;
+    invalid_constraints[2]->affordance_id += 1U;
+    invalid_constraints[3] = valid;
+    invalid_constraints[3]->hand = Hand::Left;
+    invalid_constraints[4] = valid;
+    invalid_constraints[4]->grasp_world.position.x =
+        std::numeric_limits<float>::quiet_NaN();
+    invalid_constraints[5] = valid;
+    invalid_constraints[5]->grasp_world.rotation =
+        quat(0.0F, 0.0F, 0.0F, 0.0F);
+
+    for (const auto& invalid : invalid_constraints) {
+        ControllerInteractionFrameHandoff handoff;
+        (void)handoff.apply(
+            entry, owned, interaction::kControllerStepSeconds, valid);
+        RuntimeOutput full_weight = owned;
+        full_weight.diagnostics.hand_constraint_weight = 1.0F;
+        const RuntimeOutput input_before = full_weight;
+        const ControllerInteractionFrameState frame = handoff.apply(
+            entry,
+            full_weight,
+            interaction::kControllerStepSeconds,
+            invalid);
+        require(
+            !frame.hand_constraint_result.applied &&
+                flat_pose_bits_equal(frame.pose, entry) &&
+                output_fields_equal(full_weight, input_before),
+            "mismatched or invalid constraint partially changed the frame");
+    }
+
+    ControllerInteractionFrameHandoff handoff;
+    (void)handoff.apply(
+        entry, owned, interaction::kControllerStepSeconds, valid);
+    RuntimeOutput switched = owned;
+    switched.diagnostics.target = {74U, 1U};
+    switched.diagnostics.affordance_id = 12U;
+    switched.diagnostics.hand = Hand::Left;
+    switched.diagnostics.hand_constraint_weight = 1.0F;
+    ControllerInteractionHandConstraint matching_switched =
+        make_hand_constraint(switched, entry, Hand::Left);
+    const ControllerInteractionFrameState switched_frame = handoff.apply(
+        entry,
+        switched,
+        interaction::kControllerStepSeconds,
+        matching_switched);
+    require(
+        !switched_frame.hand_constraint_result.applied &&
+            flat_pose_bits_equal(switched_frame.pose, entry),
+        "selection changed inside an ownership epoch");
+}
+
+void test_hand_constraint_reset_and_reentry_recalibrates_selected_hand() {
+    const FlatControllerPose first_entry = make_flat_pose();
+    const Pose first_raw_reference = interaction::expand_flat_controller_pose(
+        first_entry, make_pose(0.375F));
+    RuntimeOutput first_owned = make_owned_output(first_raw_reference);
+    first_owned.diagnostics.target = {75U, 1U};
+    first_owned.diagnostics.affordance_id = 13U;
+    first_owned.diagnostics.hand = Hand::Right;
+    first_owned.diagnostics.hand_constraint_weight = 0.0F;
+    const ControllerInteractionHandConstraint first_constraint =
+        make_hand_constraint(first_owned, first_entry, Hand::Right);
+    ControllerInteractionFrameHandoff handoff;
+    (void)handoff.apply(
+        first_entry,
+        first_owned,
+        interaction::kControllerStepSeconds,
+        first_constraint);
+    first_owned.diagnostics.hand_constraint_weight = 1.0F;
+    require(
+        handoff.apply(
+            first_entry,
+            first_owned,
+            interaction::kControllerStepSeconds,
+            first_constraint).hand_constraint_result.applied,
+        "first epoch did not seed the right-hand solver");
+
+    RuntimeOutput idle;
+    bool released = false;
+    for (int frame = 0; frame < 20; ++frame) {
+        const ControllerInteractionFrameState release = handoff.apply(
+            first_entry,
+            idle,
+            interaction::kControllerStepSeconds,
+            std::nullopt);
+        if (!release.overrides_locomotion_pose) {
+            released = true;
+            break;
+        }
+    }
+    require(released, "first epoch release did not complete");
+
+    FlatControllerPose second_entry = first_entry;
+    second_entry.rotations[12] = quat_from_angle_axis(
+        0.45F, normalize(vec3(0.2F, 0.8F, 0.4F)));
+    const Pose second_raw_reference = interaction::expand_flat_controller_pose(
+        second_entry, make_pose(2.5F));
+    RuntimeOutput second_owned = make_owned_output(second_raw_reference);
+    second_owned.diagnostics.target = {76U, 2U};
+    second_owned.diagnostics.affordance_id = 14U;
+    second_owned.diagnostics.hand = Hand::Left;
+    second_owned.diagnostics.hand_constraint_weight = 0.0F;
+    const ControllerInteractionHandConstraint second_constraint =
+        make_hand_constraint(second_owned, second_entry, Hand::Left);
+    const ControllerInteractionFrameState second_first = handoff.apply(
+        second_entry,
+        second_owned,
+        interaction::kControllerStepSeconds,
+        second_constraint);
+    require(
+        flat_pose_bits_equal(second_first.pose, second_entry),
+        "re-entry did not capture a fresh flat calibration reference");
+    second_owned.diagnostics.hand_constraint_weight = 1.0F;
+    const ControllerInteractionFrameState second_solved = handoff.apply(
+        second_entry,
+        second_owned,
+        interaction::kControllerStepSeconds,
+        second_constraint);
+    require(
+        second_solved.hand_constraint_result.applied &&
+            second_solved.hand_constraint_result.reachable,
+        "re-entry did not calibrate the newly selected left hand");
+    const FlatWorldPose second_world = flat_world_pose(second_solved.pose);
+    require_vec_near(
+        second_world.positions[18],
+        second_constraint.grasp_world.position,
+        "re-entered left hand missed the semantic grasp",
+        3.0e-4F);
+    for (size_t bone = 19U; bone <= 22U; ++bone) {
+        require(
+            quat_bits_equal(
+                second_solved.pose.rotations[bone],
+                second_entry.rotations[bone]) &&
+                vec_bits_equal(
+                    second_solved.pose.angular_velocities[bone],
+                    second_entry.angular_velocities[bone]),
+            "re-entry reused the prior right-hand selection");
+    }
 }
 
 void test_frame_handoff_crosses_179_9_to_180_1_incrementally() {
@@ -1668,10 +2059,42 @@ void test_controller_and_make_clock_policy() {
     assert(controller.find("interaction_scheduler.tick(") != std::string::npos);
     assert(controller.find("interaction_frame_handoff.apply(") !=
            std::string::npos);
+    const size_t scene_handoff_apply =
+        controller.find("interaction_scene_handoff.apply(");
+    const size_t frame_handoff_apply =
+        controller.find("interaction_frame_handoff.apply(");
     require(
-        controller.find("interaction_frame_state.overrides_locomotion_pose") !=
+        scene_handoff_apply < frame_handoff_apply,
+        "controller resolves scene authority after pose handoff");
+    const size_t exact_affordance =
+        controller.find("interaction_registry.find_affordance(");
+    require(
+        exact_affordance != std::string::npos &&
+            controller.find(
+                "interaction_output.diagnostics.target",
+                exact_affordance) != std::string::npos &&
+            controller.find(
+                "interaction_output.diagnostics.affordance_id",
+                exact_affordance) != std::string::npos,
+        "controller does not resolve the exact selected affordance");
+    const size_t semantic_constraint = controller.find(
+        "interaction::ControllerInteractionHandConstraint");
+    require(
+        semantic_constraint != std::string::npos &&
+            controller.find(
+                "interaction_scene_state.object_world,\n"
+                "                selected_affordance->hand_in_object",
+                semantic_constraint) != std::string::npos,
+        "controller does not compose the scene-authoritative semantic grasp");
+    require(
+        controller.find(
+            "interaction_hand_constraint);",
+            frame_handoff_apply) != std::string::npos,
+        "controller does not pass the semantic constraint into pose handoff");
+    require(
+        controller.find("interaction_frame_state.pose.positions[bone]") !=
             std::string::npos,
-        "controller does not honor release visual override");
+        "controller does not publish the final handoff pose");
     require(
         controller.find(
             "latest_owned_interaction_pose = interaction_output.pose;") !=
@@ -1689,6 +2112,12 @@ void test_controller_and_make_clock_policy() {
            std::string::npos);
     assert(controller.find("interaction_registry.find_by_id(") !=
            std::string::npos);
+    require(
+        controller.find(
+            "interaction_output.diagnostics.target.id ==\n"
+            "                interaction_scene_target_handle.id") ==
+            std::string::npos,
+        "scene refresh rejects an exact selected target with a different ID");
     assert(controller.find("++next_handle.generation") == std::string::npos);
     assert(controller.find("interaction::kControllerStepSeconds") !=
            std::string::npos);
@@ -1745,6 +2174,10 @@ int main() {
     test_edges_latch_coalesce_and_clear_after_delivery();
     test_cache_changes_only_after_successful_due_delivery();
     test_frame_handoff_first_owned_frame_is_exact_displayed_reference();
+    test_frame_handoff_applies_validated_semantic_hand_constraint_and_releases_from_it();
+    test_hand_constraint_keeps_layered_carry_lower_body_exact_and_selected_only();
+    test_hand_constraint_mismatch_or_invalid_input_disables_atomically();
+    test_hand_constraint_reset_and_reentry_recalibrates_selected_hand();
     test_frame_handoff_crosses_179_9_to_180_1_incrementally();
     test_frame_handoff_keeps_captured_neck_and_head_while_owned();
     test_layered_carry_keeps_fresh_lower_body_and_contacts_bit_exact();
