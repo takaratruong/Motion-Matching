@@ -12,31 +12,43 @@ reversed-pickup fallback, atomic object release, and headless plus graphical 25 
 gates.
 
 **Architecture:** Keep flat locomotion, pickup, Carry, and the existing playable
-gate unchanged. Add a separate placement-surface registry, an atomic Held-to-Free
-commit, and a focused place controller that supplies one contiguous recorded or
-reversed motion to `InteractionRuntime`. Runtime appends four place states; the
-controller resolves one explicit destination slot and publishes the same object
-transform across the attachment-release seam.
+gate unchanged. Add explicit object-local bounds, a separate placement-surface
+registry with physical support context, a read-only selected-motion staging
+preview, an atomic Held-to-Free pose-and-support commit, and a focused place
+controller that supplies one contiguous recorded or reversed motion to
+`InteractionRuntime`. Runtime appends four place states; the controller reaches
+the selected staging root through ordinary Carry locomotion and publishes the
+same object transform across the attachment-release seam.
 
 **Tech Stack:** C++17, existing G1 interaction database and FK/IK code, Raylib,
 Python `unittest`, GNU Make, fixed 25 Hz runtime.
 
 ## Global Constraints
 
-- Start from integrated commit `c2b6ff814eced5fbe394409e22c5c7bd6019be10`.
+- Execute from the reviewed placement-doc branch descended from `3e0ab98` (whose
+  integrated code parent is `c2b6ff814eced5fbe394409e22c5c7bd6019be10`);
+  do not reset implementation back to the code parent or start from terrain.
 - Work only on `g1-tabletop-placement-*` branches/worktrees; do not touch or
   merge the terrain checkout.
 - Do not access, stat, hash, execute, modify, stage, or delete the protected
   repository-root artifact `interaction_query_probe`. Use
   `build/task12/interaction_query_probe_safe` through the existing safe targets.
 - Runtime, flat locomotion, interaction playback, auto-demo, and evidence all
-  advance exactly once per `1/25` second.
+  advance exactly once per `0.04` second.
 - Existing pickup behavior and `gate-playable-interaction` remain green and keep
   their current evidence contract.
 - True recorded placement has hard selection priority. The current demo fallback
   is always labelled `reversed_pickup`.
 - Reverse playback starts at the end of the earliest certified five-sample
   Hold/contact window, never blindly from a clip's final frame.
+- A placement commit atomically replaces both object pose and pickup support
+  context; a released target must be immediately re-pickable from the destination.
+- Requested-goal fit never authorizes release by itself. The exact hand-derived
+  pose must pass support/footprint/bounds/clearance checks at the release event.
+- Assisted staging uses ordinary Carry input and a read-only selected-motion
+  preview; it never writes the character root.
+- Every allowed playback speed clamps to and publishes the exact release sample
+  exactly once before retraction.
 - Terrain, terrain IK, learned control, doors, drawers, and shelf-cavity clearance
   are out of scope.
 - Every implementation task follows RED -> GREEN -> focused regression -> commit.
@@ -49,13 +61,17 @@ Python `unittest`, GNU Make, fixed 25 Hz runtime.
 - Create: `interaction_place_target.h`
 - Create: `interaction_place_target.cpp`
 - Create: `tests/cpp/test_interaction_place_target.cpp`
+- Modify: `interaction_target.h`
+- Modify: `interaction_target.cpp`
+- Modify: `tests/cpp/interaction_runtime_fixture.h`
 - Modify: `interaction_matcher.h`
 - Modify: `Makefile`
 
 **Interfaces:**
-- Produces: `SurfaceHandle`, `PlaceAffordance`, `PlacementSurface`,
-  `PlacementSurfaceRegistry`, `PlaceRequest`, `placement_goal_world`, and
-  `evaluate_placement_fit`.
+- Produces: `ObjectLocalBounds`, target object-profile/bounds metadata,
+  `SurfaceHandle`, `PlaceAffordance`, `PlacementSurface`,
+  `PlacementSurfaceRegistry`, `PlaceRequest`, `placement_goal_world`,
+  `evaluate_placement_fit`, and `evaluate_actual_placement_fit`.
 - Consumes: `Transform`, `vec3`, quaternion helpers, and the existing exception
   conventions from `interaction_target.*`.
 
@@ -68,6 +84,7 @@ static_assert(std::is_same_v<
     decltype(PlaceAffordance{}.object_in_surface), Transform>);
 
 PlacementSurface surface = make_surface();
+const InteractionTarget target = make_target();
 PlacementSurfaceRegistry registry;
 const SurfaceHandle first = registry.upsert(surface);
 assert(first == (SurfaceHandle{41U, 1U}));
@@ -80,40 +97,56 @@ assert(near(goal.position, vec3(0.25F, 0.82F, 3.50F)));
 const PlacementFit exact = evaluate_placement_fit(
     *registry.find(first),
     *registry.find_affordance(first, 7U),
-    vec3(0.20F, 0.30F, 0.20F));
+    ObjectLocalBounds{vec3(0.03F, 0.01F, -0.02F),
+                      vec3(0.10F, 0.15F, 0.10F)});
 assert(exact.accepted);
 assert(exact.support_gap_m == 0.020F);
 
 PlacementSurface outside = surface;
 outside.affordances[0].object_in_surface.position.x += 0.000001F;
 assert(!evaluate_placement_fit(
-    outside, outside.affordances[0], vec3(0.20F, 0.30F, 0.20F)).accepted);
+    outside, outside.affordances[0], target.object_bounds).accepted);
 assert(evaluate_placement_fit(
-    outside, outside.affordances[0], vec3(0.20F, 0.30F, 0.20F)).reason ==
+    outside, outside.affordances[0], target.object_bounds).reason ==
        Reason::PlacementOutOfBounds);
 ```
 
-Cover zero IDs/generations, duplicate affordance IDs, non-finite transforms,
-non-unit quaternions, non-positive extents, negative clearance, non-unit approach
-axis, surface tilt exactly 5 degrees and 5.001 degrees, support gaps exactly
-`-0.005`/`+0.020 m` and one micrometre outside, oriented-footprint boundary and
-boundary-plus-epsilon, stale handles, and generation increment on `upsert`.
+Cover zero object-profile IDs, non-finite bounds centers, non-positive bound
+half-extents, zero surface IDs/generations, duplicate affordance IDs, non-finite
+transforms, non-unit quaternions, non-positive support-volume dimensions,
+non-positive overhead clearance, non-unit approach axis, surface tilt exactly 5
+degrees and 5.001 degrees, support-volume top face offset exactly `0.001 m` and
+one micrometre beyond, support gaps exactly `-0.005`/`+0.020 m` and one
+micrometre outside, nonzero bounds-center footprint boundaries,
+oriented-footprint boundary and boundary-plus-epsilon, lowest-corner penetration,
+highest-corner overhead violation, stale handles, and generation increment on
+`upsert`.
 
 - [ ] **Step 2: Run RED**
 
 Run:
 
 ```bash
-make build/tests/test_interaction_place_target
+mkdir -p build/red
+g++ -std=c++17 -Wall -Wextra -Werror -pedantic -I. \
+  -c tests/cpp/test_interaction_place_target.cpp \
+  -o build/red/test_interaction_place_target.o
 ```
 
-Expected: compilation fails because `interaction_place_target.h` does not exist.
+Expected: the compiler exits nonzero because `interaction_place_target.h` does
+not exist. Do not use a nonexistent Make target as the RED signal; this
+repository has explicit test rules and no generic C++ test pattern.
 
 - [ ] **Step 3: Implement the exact surface API**
 
 Expose:
 
 ```cpp
+struct ObjectLocalBounds {
+    vec3 center_object{};
+    vec3 half_extents_object{};
+};
+
 struct SurfaceHandle {
     uint64_t id = 0;
     uint32_t generation = 0;
@@ -134,6 +167,8 @@ struct PlaceAffordance {
 struct PlacementSurface {
     SurfaceHandle handle{};
     Transform surface_world{};
+    Transform support_volume_world{};
+    vec3 support_volume_size{};
     float half_extent_x_m = 0.0F;
     float half_extent_z_m = 0.0F;
     float overhead_clearance_m = 0.0F;
@@ -144,6 +179,10 @@ struct PlacementFit {
     bool accepted = false;
     Reason reason = Reason::None;
     float support_gap_m = 0.0F;
+    float lowest_corner_m = 0.0F;
+    float highest_corner_m = 0.0F;
+    bool footprint_valid = false;
+    bool overhead_valid = false;
 };
 
 class PlacementSurfaceRegistry {
@@ -162,6 +201,7 @@ struct PlaceRequest {
     SurfaceHandle surface{};
     uint32_t affordance_id = 0;
     uint64_t request_id = 0;
+    uint64_t selection_id = 0;
 };
 
 Transform placement_goal_world(
@@ -169,15 +209,30 @@ Transform placement_goal_world(
 PlacementFit evaluate_placement_fit(
     const PlacementSurface&,
     const PlaceAffordance&,
-    vec3 object_dimensions);
+    ObjectLocalBounds);
+PlacementFit evaluate_actual_placement_fit(
+    const PlacementSurface&,
+    const PlaceAffordance&,
+    Transform actual_object_world,
+    ObjectLocalBounds);
 ```
 
-Use an oriented-box footprint projection into surface X/Z, including
-`clearance_radius`. Define the support gap as the surface-local Y coordinate of
-`compose(affordance.object_in_surface,
-Transform{affordance.support_point_object, quat()})`; accept it inclusively in
-`[-0.005F, 0.020F]`. Require the surface normal angle to world up to be at most
-`0.087266463F` radians.
+Define `ObjectLocalBounds` in `interaction_target.h`. Add nonzero
+`object_profile_id` and validated `ObjectLocalBounds object_bounds` to
+`InteractionTarget`; preserve `object_dimensions` for the existing matcher.
+Update every target fixture with explicit values.
+
+For either requested or actual fit, enumerate the eight points
+`center_object + sign * half_extents_object`, transform them through the tested
+object pose and into surface local space, and compute inclusive X/Z footprint,
+lowest Y, and highest Y. Expand X/Z by `clearance_radius`. Define support gap
+from the transformed authored support point and accept it inclusively in
+`[-0.005F, 0.020F]`; require lowest Y `>=-0.005F` and highest Y
+`<=overhead_clearance_m`. `evaluate_placement_fit` tests
+`surface_world * object_in_surface`; `evaluate_actual_placement_fit` first maps
+the supplied world pose through `inverse(surface_world)`. Require surface normal
+angle at most `0.087266463F` radians and require the support-volume top face to
+coincide with the support plane within `0.001F m` / `0.001745329F rad`.
 
 `resolve_single_surface` measures planar distance to each composed affordance
 goal, ignores invalid or out-of-range surfaces, and returns a handle only when
@@ -207,12 +262,15 @@ existing environment-dependent skips; all C++ and fast-math binaries pass.
 
 ```bash
 git add interaction_place_target.h interaction_place_target.cpp \
+  interaction_target.h interaction_target.cpp \
+  tests/cpp/interaction_runtime_fixture.h \
   tests/cpp/test_interaction_place_target.cpp interaction_matcher.h Makefile
 git commit -m "feat: define deterministic placement surfaces"
 ```
 
-Review checkpoint: validate transform conventions, inclusive numeric boundaries,
-and that no target-selection policy leaked into runtime code.
+Review checkpoint: validate transform conventions, explicit off-center bound
+math, support-volume/plane coincidence, inclusive numeric boundaries, and that no
+target-selection policy leaked into runtime code.
 
 ### Task 2: Atomic Held-to-Free Placement Commit
 
@@ -226,7 +284,8 @@ and that no target-selection policy leaked into runtime code.
 
 **Interfaces:**
 - Produces: `TargetRegistry::place_held` and
-  `AttachmentController::commit_place`.
+  `AttachmentController::commit_place`, both committing destination pickup
+  support with the object pose.
 - Consumes: the exact Held target generation and original pickup owner already
   retained by `AttachmentController`.
 
@@ -236,8 +295,11 @@ Add assertions equivalent to:
 
 ```cpp
 const Transform placed{vec3(1.0F, 0.82F, 4.0F), quat()};
+const PlacedSupportContext destination{
+    Transform{vec3(0.0F, 0.70F, 4.0F), quat()},
+    vec3(2.0F, 0.04F, 0.60F)};
 const TargetHandle old_handle = fixture.request.target;
-const auto next = fixture.attachment.commit_place(placed);
+const auto next = fixture.attachment.commit_place(placed, destination);
 assert(next.has_value());
 assert(next->id == old_handle.id);
 assert(next->generation == old_handle.generation + 1U);
@@ -248,10 +310,13 @@ const InteractionTarget* stored = fixture.registry.find(*next);
 assert(stored != nullptr && stored->state == ObjectState::Free);
 assert(stored->owner_request == 0U);
 assert(exact(stored->object_world, placed));
+assert(exact(stored->table_world, destination.table_world));
+assert(exact(stored->table_size, destination.table_size));
 ```
 
-Also prove wrong owner, stale generation, non-Held state, invalid transform, and
-generation overflow cannot partially mutate pose/state/owner/generation. Call
+Also prove wrong owner, stale generation, non-Held state, invalid object pose,
+invalid destination support transform/size, and generation overflow cannot
+partially mutate object pose, table pose/size, state, owner, or generation. Call
 `commit_place` twice and prove the second call fails without changing the first
 commit.
 
@@ -271,17 +336,22 @@ Add:
 std::optional<TargetHandle> TargetRegistry::place_held(
     TargetHandle held,
     uint64_t owner_request,
-    Transform placed_world);
+    Transform placed_world,
+    PlacedSupportContext destination_support);
 
 std::optional<TargetHandle> AttachmentController::commit_place(
-    Transform placed_world);
+    Transform placed_world,
+    PlacedSupportContext destination_support);
 ```
 
-Validate `placed_world` before locating or mutating the target. Require exact
-`Held` state and owner. On success increment generation, write the supplied pose,
-set `Free`, clear owner, and return the new handle. Do not call `release()` and
-then `replace_pose()`. `AttachmentController` updates its local pose/state/result
-only after the registry transaction succeeds.
+Define `PlacedSupportContext` in `interaction_target.h` with `Transform
+table_world` and `vec3 table_size`. Validate `placed_world` and the finite unit
+support transform/strictly positive support size before locating or mutating the
+target. Require exact `Held` state and owner. On success increment generation,
+write the supplied object pose and destination `table_world/table_size`, set
+`Free`, clear owner, and return the new handle. Do not call `release()` and then
+`replace_pose()`. `AttachmentController` updates its local pose/state/result only
+after the registry transaction succeeds.
 
 - [ ] **Step 4: Run focused, optimized, and safe GREEN**
 
@@ -305,7 +375,8 @@ git commit -m "feat: commit placed objects atomically"
 ```
 
 Review checkpoint: prove every failure path is mutation-free and the successful
-registry/object pose is exactly the supplied hand-derived pose.
+registry object pose and pickup-support context exactly match the supplied
+hand-derived pose and destination surface snapshot.
 
 ### Task 3: Recorded-Priority Place Selection and Certified Reverse Playback
 
@@ -320,7 +391,7 @@ registry/object pose is exactly the supplied hand-derived pose.
   `GraspAffordance`, current Carry pose/object, and a requested placement goal.
 - Produces: `PlaceMotionMode`, `PlacePhase`, `RecordedPlaceClip`,
   `PlaceMotionLibrary`, `PlaceCandidate`, `select_place_motion`, and
-  `PlacePlayer`.
+  `PlaceStagingPreview`, `preview_place_motion`, and `PlacePlayer`.
 
 - [ ] **Step 1: Write failing selector and reverse-player tests**
 
@@ -336,16 +407,21 @@ enum class PlacePhase : uint8_t {
 
 struct RecordedPlaceClip {
     uint64_t id = 0;
+    uint64_t object_profile_id = 0;
     uint32_t fps_numerator = 25;
     uint32_t fps_denominator = 1;
     std::vector<Pose> poses;
     std::vector<Transform> object_poses;
+    std::vector<uint8_t> active_hand_contacts;
     int32_t entry_frame = -1;
     int32_t commit_frame = -1;
     int32_t release_frame = -1;
     int32_t retract_stop_frame = -1;
     Hand hand = Hand::Right;
     Transform hand_in_object{};
+    ObjectLocalBounds object_bounds{};
+    Transform source_support_world{};
+    vec3 source_support_size{};
 };
 
 struct PlaceMotionLibrary {
@@ -358,6 +434,8 @@ struct PlaceMatchInput {
     MatchCandidate pickup_candidate{};
     Pose current_pose{};
     Transform current_object_world{};
+    uint64_t held_object_profile_id = 0;
+    ObjectLocalBounds held_object_bounds{};
     GraspAffordance held_affordance{};
     PlacementSurface surface{};
     PlaceAffordance place_affordance{};
@@ -392,15 +470,30 @@ crosses `entry_frame`. Make the first Hold window fail stability and the second
 pass; assert the second window's last frame is selected. Add rejection fixtures
 for contact loss between `contact_frame` and the selected sample, no stable Hold
 window, 2.0001 cm within-window hand/object drift, 10.001-degree within-window
-drift, malformed events, wrong hand, and correction-limit-plus-epsilon.
+drift, malformed events, malformed or discontinuous active-hand contact through
+release, wrong object-profile ID, bounds-center or half-extent difference above
+`0.001 m`, wrong hand, hand-in-object translation above `0.02 m`, hand-in-object
+rotation above `10 degrees`, invalid source support, and
+correction-limit-plus-epsilon.
+
+At 0.85x and 1.15x, advance across the reverse release event and assert the
+published source frame is clamped exactly to `contact_frame`, `release_due` is
+true exactly once, repeated sampling before acknowledgement does not advance,
+and the first post-acknowledgement update begins retraction from contact. Assert
+reverse derivative channels equal `-speed * source`, and mapped root linear and
+angular velocities are rotated through `scene_from_source`.
 
 - [ ] **Step 2: Run RED**
 
 ```bash
-make build/tests/test_interaction_place
+mkdir -p build/red
+g++ -std=c++17 -Wall -Wextra -Werror -pedantic -I. \
+  -c tests/cpp/test_interaction_place.cpp \
+  -o build/red/test_interaction_place.o
 ```
 
-Expected: compilation fails because `interaction_place.h` does not exist.
+Expected: the compiler exits nonzero because `interaction_place.h` does not
+exist; no missing Make rule is accepted as RED evidence.
 
 - [ ] **Step 3: Implement deterministic two-tier selection**
 
@@ -409,6 +502,8 @@ Expose:
 ```cpp
 struct PlaceCandidate {
     PlaceMotionMode mode = PlaceMotionMode::None;
+    uint64_t source_id = 0;
+    uint64_t selection_id = 0;
     int32_t clip = -1;
     int32_t entry_frame = -1;
     int32_t commit_frame = -1;
@@ -416,6 +511,7 @@ struct PlaceCandidate {
     int32_t stop_frame = -1;
     int32_t direction = 0;
     Transform scene_from_source{};
+    Transform staging_root_world{};
     vec3 entry_root_offset{};
     float entry_yaw_offset = 0.0F;
     float total_cost = 0.0F;
@@ -433,17 +529,33 @@ struct PlaceSample {
     int32_t source_frame = -1;
     PlacePhase phase = PlacePhase::Align;
 };
+
+struct PlaceStagingPreview {
+    bool accepted = false;
+    bool ready = false;
+    Reason reason = Reason::None;
+    PlaceCandidate candidate{};
+    Transform staging_root_world{};
+    float root_error_m = 0.0F;
+    float yaw_error_radians = 0.0F;
+};
 ```
 
-Validate every in-memory recorded clip as a 25 Hz contiguous pose/object sequence
-with `entry <= commit < release < retract_stop`, finite channels, valid
-quaternions, and a compatible active hand. Evaluate all compatible true-place
-rows first. Return the minimum-cost accepted recorded candidate without comparing
-it to fallback cost. Only when that tier is empty or every recorded row fails a
-hard filter, scan five-sample windows wholly inside Hold and select the last frame
-of the earliest window with continuous contact and within-window hand-in-object
-drift `<=0.02F` / `<=0.174532925F`. Also require active contact continuously
-from the semantic release event through that selected sample.
+Validate every in-memory recorded clip as a 25 Hz contiguous pose/object/contact
+sequence with `entry <= commit < release < retract_stop`, finite channels, valid
+quaternions, nonzero object-profile ID, positive explicit bounds and support size,
+and valid source support. Contact values are binary, active-hand contact is true
+from entry through the release sample, and every later retract sample is false.
+Before cost evaluation, require exact object-profile and active-hand identity,
+object-bound center/half-extents within `0.001F` per component, and demonstrated
+versus held hand-in-object error `<=0.02F` / `<=0.174532925F`. Evaluate all
+remaining compatible true-place rows first. Return the minimum-cost accepted
+recorded candidate without comparing it to fallback cost. Only when that tier is
+empty or every recorded row fails a hard filter, scan five-sample windows wholly
+inside Hold and select the last frame of the earliest window with continuous
+contact and within-window hand-in-object drift `<=0.02F` / `<=0.174532925F`.
+Also require active contact continuously from the semantic release event through
+that selected sample.
 
 For true-place candidates, map the source release object pose to the requested
 goal. For fallback candidates, map the source active hand at `contact_frame` to
@@ -451,12 +563,29 @@ goal. For fallback candidates, map the source active hand at `contact_frame` to
 object from the source object trajectory. `PlacePlayer` uses double-precision
 elapsed/source accumulators, exact 25 Hz, shortest-arc pose interpolation,
 direction-aware finish checks, and sign-negated derivative channels for direction
-`-1`. Do not inspect or depend on frames after the certified reverse start.
+`-1`. Multiply derivative channels by playback speed and rotate root-world
+vectors through `scene_from_source`. Do not inspect or depend on frames after the
+certified reverse start.
+
+For either mode, compute `staging_root_world` from the mapped source entry root.
+`preview_place_motion` is pure and returns the exact selector result plus planar
+root/yaw errors against the current Carry root. It reports ready only when
+selection succeeds and those errors are within `0.25F` /
+`0.436332313F`. Compute a deterministic nonzero `selection_id` from a canonical
+serialization of the complete selected source identity, mapped entry/release
+transforms, held target generation, surface generation, affordance ID, and source
+events. Preflight recomputes that serialization from the frozen Carry snapshot
+and requires the same ID. Tests perturb every serialized field and require a
+different ID; the request does not authorize selection from a different live
+snapshot.
 
 Expose `PlacePlayer::start(const PlaceCandidate&, const PlaceMatchInput&, float
 speed)`, `advance(float dt)`, `PlaceSample sample()`, `source_frame()`, `phase()`,
-`release_due()`, and `finished()`. The player stores only validated pointers or
-copies whose lifetime is guaranteed by its owning `PlaceController`.
+`release_due()`, `acknowledge_release()`, and `finished()`. When an advance would
+cross release, clamp the accumulator to the exact event, discard the sub-tick
+remainder, emit the event once, and refuse to advance until acknowledgement. The
+player stores only validated pointers or copies whose lifetime is guaranteed by
+its owning `PlaceController`.
 
 - [ ] **Step 4: Run focused and safe GREEN**
 
@@ -476,8 +605,10 @@ git add interaction_place.h interaction_place.cpp \
 git commit -m "feat: select deterministic place motions"
 ```
 
-Review checkpoint: confirm recorded tier priority is structural, fallback reads no
-late clip frame, and every reverse derivative has correct time direction.
+Review checkpoint: confirm recorded tier priority applies only after profile,
+bounds, hand, grasp, contact, and recorded-support validation; preview and
+preflight select the same complete candidate; fallback reads no late clip frame;
+and every allowed speed clamps release and has correct derivative time direction.
 
 ### Task 4: Bounded Place Controller and Release Gate
 
@@ -485,11 +616,13 @@ late clip frame, and every reverse derivative has correct time direction.
 - Create: `interaction_place_controller.h`
 - Create: `interaction_place_controller.cpp`
 - Create: `tests/cpp/test_interaction_place_controller.cpp`
+- Create: `tests/cpp/test_interaction_place_fast_math.cpp`
 - Modify: `Makefile`
 
 **Interfaces:**
 - Consumes: selected `PlaceCandidate`, current Carry pose/object, held grasp,
-  surface/affordance, `IKConfig`, and exact 25 Hz updates.
+  object-local bounds, surface/support volume/affordance, `IKConfig`, and exact
+  25 Hz updates.
 - Produces: `PlaceControllerConfig`, `PlaceBeginInput`, `PlaceStep`, and
   `PlaceController`.
 
@@ -528,16 +661,36 @@ hand-derived. After acknowledging release, assert every retraction step returns
 the identical fixed object transform. A failed release gate must set
 `recover_to_carry`, retain attachment, and never emit `release_due` later.
 
-Add exact `dt` rejection for `0.0F`, `1/60`, NaN, and the adjacent float around
-`1/25`; only the exact constant passes.
+Construct a requested goal whose footprint is exactly on the surface boundary.
+Shift the hand-derived release pose outward by exactly `0.02 m` while keeping goal
+error legal and assert release is rejected because actual footprint is invalid.
+Repeat for an authored `+0.020 m` support gap shifted upward, a lowest corner
+shifted below `-0.005 m`, a rotated bound exceeding the footprint, and an actual
+bound corner exceeding overhead clearance. Mutate the support volume so the
+conservative pre-release swept envelope crosses it and assert `BlockedPath`;
+include a rotating off-center bound whose endpoint OBBs are disjoint but whose
+angularly inflated envelope intersects. Allow only the release-clamped interval
+whose actual support fit passes.
+
+Advance PlaceAlign for at least four ticks, then cancel. Assert the recovery step
+contains the exact current displayed safe pose/object. Add the same assertion for
+a post-commit release-gate failure. These fixtures feed Task 5's Carry reseed
+tests rather than assuming the previously paused Carry controller is current.
+
+Add exact `dt` rejection for `0.0F`, `1.0F / 60.0F`, NaN, and the adjacent float
+around `0.04F`; only the exact constant passes.
 
 - [ ] **Step 2: Run RED**
 
 ```bash
-make build/tests/test_interaction_place_controller
+mkdir -p build/red
+g++ -std=c++17 -Wall -Wextra -Werror -pedantic -I. \
+  -c tests/cpp/test_interaction_place_controller.cpp \
+  -o build/red/test_interaction_place_controller.o
 ```
 
-Expected: compilation fails because the controller files do not exist.
+Expected: the compiler exits nonzero because `interaction_place_controller.h`
+does not exist; a missing Make rule is not RED evidence.
 
 - [ ] **Step 3: Implement the focused controller**
 
@@ -556,6 +709,8 @@ struct PlaceStep {
     Reason reason = Reason::None;
     float hand_position_error_m = 0.0F;
     float hand_orientation_error_radians = 0.0F;
+    PlacementFit actual_fit{};
+    bool support_sweep_clear = false;
 };
 
 struct PlaceBeginInput {
@@ -564,6 +719,8 @@ struct PlaceBeginInput {
     PlaceCandidate candidate{};
     Pose current_pose{};
     Transform current_object_world{};
+    uint64_t held_object_profile_id = 0;
+    ObjectLocalBounds held_object_bounds{};
     GraspAffordance held_affordance{};
     PlacementSurface surface{};
     PlaceAffordance place_affordance{};
@@ -580,38 +737,59 @@ public:
     PlaceBeginResult begin(const PlaceBeginInput& input);
     PlaceStep update(float dt);
     void acknowledge_release(Transform placed_world);
-    void cancel();
+    PlaceStep cancel();
 };
 ```
 
 Blend entry for exactly seven 25 Hz ticks, distribute planar root/yaw correction
 with smoothstep to zero by release, and ramp bounded hand IK to full release
-weight. Check the object sweep against the destination support volume, exempting
-only the final support contact. Keep `last_safe_pose` and the hand-derived object
-for attached recovery. After `acknowledge_release`, freeze exactly the supplied
-transform while playback retracts.
+weight. At every sample, form the object OBB from the explicit object-local center
+and half-extents. Reject pre-release OBB overlap with the support-volume OBB using
+15-axis SAT. For each interval, transform all previous/current bound corners into
+support local space and form their componentwise envelope. Expand every axis by
+`r_max * (1 - cos(theta / 2))`, using the maximum object-origin-to-corner radius
+and the shortest-arc object rotation `theta`, then slab-test that conservative
+envelope against the support-volume AABB. Exempt only the interval clamped to
+release, and only after `evaluate_actual_placement_fit` accepts that exact pose.
+
+Keep `last_safe_pose` and its hand-derived object for attached recovery. `cancel`
+and every pre-release failure return that pair with `recover_to_carry=true`.
+After `acknowledge_release`, freeze exactly the supplied transform while playback
+retracts. An unacknowledged clamped event remains fixed and cannot emit release a
+second time.
 
 - [ ] **Step 4: Run focused, fast-math, and safe GREEN**
 
 ```bash
 make build/tests/test_interaction_place_controller
 build/tests/test_interaction_place_controller
-make test-interaction-carry-release-fast-math
+make test-interaction-place-release-fast-math
 make test-interaction-safe
 ```
 
 Expected: all commands exit 0.
 
+`test-interaction-place-release-fast-math` must compile
+`tests/cpp/test_interaction_place_fast_math.cpp` and all place-controller
+dependencies with `-O3 -DNDEBUG -ffast-math`. The test uses an explicit
+`require()` helper rather than disabled `assert` calls and covers actual-pose
+boundary rejection, one-shot clamped release at 0.85x/1.15x, and mutation-free
+attached recovery. Add this target to `test-interaction-safe`; the existing Carry
+fast-math binary is not placement coverage.
+
 - [ ] **Step 5: Commit and review**
 
 ```bash
 git add interaction_place_controller.h interaction_place_controller.cpp \
-  tests/cpp/test_interaction_place_controller.cpp Makefile
+  tests/cpp/test_interaction_place_controller.cpp \
+  tests/cpp/test_interaction_place_fast_math.cpp Makefile
 git commit -m "feat: play bounded tabletop placement"
 ```
 
-Review checkpoint: verify correction limits are hard gates, object ownership has
-one source in each phase, and recovery never detaches.
+Review checkpoint: verify correction limits and actual-pose support validity are
+hard gates, swept support math uses explicit off-center bounds plus conservative
+angular inflation, release is one-shot at every speed, object ownership has one
+source in each phase, and recovery never detaches.
 
 ### Task 5: Integrate Placement into InteractionRuntime
 
@@ -624,7 +802,8 @@ one source in each phase, and recovery never detaches.
 
 **Interfaces:**
 - Consumes: placement surface registry, place library/controller, existing pickup
-  candidate, attachment owner, and `RuntimeInput::place_request`.
+  candidate, selected-motion preview identity, attachment owner, and
+  `RuntimeInput::place_request`.
 - Produces: appended runtime states, place diagnostics, and full place lifecycle.
 
 - [ ] **Step 1: Write failing API and state-machine tests**
@@ -657,6 +836,10 @@ Assert `PlacePreflight` occupies one update, all place states own pose and
 suppress steering, attachment remains true through the last PlaceReplay record,
 and the first PlaceRelease record is Free/unattached with a generation increment
 of one. Registry, runtime output, and scene object transforms must compare exact.
+The released registry target's `table_world/table_size` must equal the
+destination surface's `support_volume_world/size`; immediately resolve and
+preflight a new ordinary pick of the returned Free handle and assert its query
+uses that destination support rather than the source table.
 
 Add independent tests for: missing request, stale surface, wrong held object,
 cancel in PlaceAlign, candidate rejection, post-commit release-position failure,
@@ -664,6 +847,13 @@ surface replacement before release, duplicate Place edge, reset during placement
 recorded-mode diagnostics, reversed-mode diagnostics, and deterministic replay.
 Every pre-release failure returns Carry attached; no failure returns Locomotion
 with a silently dropped object.
+
+For cancellation after four PlaceAlign updates and for a post-commit release-gate
+failure, capture the last safe place pose/object. Assert the recovery publication
+equals them exactly, the reconstructed Carry controller starts from that exact
+pair, and the next advanced Carry update remains within the normal visual seam
+limits without restoring the pre-place Carry object transform. Prove the stale
+Carry controller is destroyed rather than resumed.
 
 For every `Place*` state, compare otherwise identical updates with
 `reset_pressed=true` and `reset_pressed=false`; their outputs and subsequent
@@ -697,18 +887,33 @@ InteractionRuntime(
 
 The old constructor leaves placement unavailable but preserves every pickup test.
 Add `std::optional<PlaceRequest> place_request` to `RuntimeInput` and the surface,
-mode, release, goal, and support-error fields to diagnostics.
+mode, selection/staging preview, release, goal, actual-fit, sweep, and
+support-error fields to diagnostics.
 Add `PlaceControllerConfig place{}` to `RuntimeConfig` and validate every field at
 construction with the same mutation-free exception behavior as the current
 matcher/playback/IK/carry configuration.
 
 In Carry, an Interact edge publishes `PlacePreflight` without advancing Carry or
-mutating attachment. Validate on the following update. Delegate pose generation
-to `PlaceController`. At `release_due`, run the final gate and call
-`AttachmentController::commit_place(step.object_world)` once. Pass that same
-transform to `acknowledge_release`, publish the returned target generation, then
-continue retraction. Cancellation or pre-release failure restores Carry without
-restarting its object transform.
+mutating attachment. Validate on the following update by recomputing the complete
+selected candidate from the frozen snapshot and requiring its canonical
+`selection_id` to match the request. The serialized identity includes source
+events, mapped transforms, held generation, surface generation, and affordance
+identity. Delegate pose generation to `PlaceController`.
+
+At `release_due`, re-fetch the exact surface generation and affordance, recompute
+`evaluate_actual_placement_fit` from `step.object_world`, require the controller's
+support sweep to be clear, and call `AttachmentController::commit_place` exactly
+once with that object transform plus
+`PlacedSupportContext{surface.support_volume_world,
+surface.support_volume_size}`. Pass the same object transform to
+`acknowledge_release`, publish the returned target generation, then continue
+retraction.
+
+On cancellation or pre-release failure, destroy the paused Carry controller,
+construct a fresh one, and call `start(last_safe_pose, hand, affordance,
+last_safe_object)`. Publish that exact pair on the recovery update without an
+advance; advance the newly seeded controller on the following update. Do not
+restore the object transform from before PlaceAlign.
 
 Update debug names exhaustively and retain `ResultCode::Succeeded/Reason::None`
 through successful PlaceRelease and final Locomotion.
@@ -733,7 +938,8 @@ git commit -m "feat: coordinate carry to place lifecycle"
 ```
 
 Review checkpoint: audit every place transition, failure terminal, output
-ownership flag, attachment mutation, and target-generation update.
+ownership flag, attachment mutation, target-generation/support update, exact
+candidate preview validation, and both frames of Carry recovery continuity.
 
 ### Task 6: Wire Manual Pick/Place and the Destination Table
 
@@ -749,9 +955,10 @@ ownership flag, attachment mutation, and target-generation update.
 
 **Interfaces:**
 - Consumes: current runtime state, one placement surface/slot, shared Interact
-  edge, runtime placement output, and scene handoff.
-- Produces: `F` pick/place behavior, destination-table drawing, and continuous
-  release publication.
+  edge, read-only selected-motion preview, runtime placement output, and scene
+  handoff.
+- Produces: `F` pick/place behavior with ordinary Carry staging, destination-table
+  drawing, and continuous release publication.
 
 - [ ] **Step 1: Write failing adapter and controller-policy tests**
 
@@ -765,9 +972,16 @@ PlaceRelease pose.
 Add Python static policy tests asserting:
 
 - controller constructs exactly one destination `PlacementSurface`;
-- `F` resolves `PickRequest` only in Locomotion and `PlaceRequest` only in Carry;
+- `F` resolves `PickRequest` only in Locomotion; in Carry it latches one surface
+  and starts preview-guided staging without immediately pulsing runtime Interact;
+- staging converts preview root/yaw error through the existing camera/control
+  basis into ordinary Carry input and never writes simulation or displayed root;
+- runtime Place is pulsed only when preview is ready and request `selection_id`
+  equals the preview candidate;
 - no place state calls `resolve_single_target` to replace the held object;
 - destination goal is composed from `surface_world` and `object_in_surface`;
+- destination support volume exactly becomes the released target's
+  `table_world/table_size`;
 - scene release does not call `reset` or restore the source pose; and
 - `SetTargetFPS(25)` and the synchronous scheduler remain unchanged.
 
@@ -785,23 +999,35 @@ Expected: new assertions fail because controller placement wiring is absent.
 
 Construct a destination table and top-plane surface once from the authored demo
 scene. Copy the source table size/height and translate its center exactly `1.20 m`
-farther along world `+Z`. Give it one top-center affordance whose object transform
-and object-local support point reproduce the source object's known supported
-origin offset. Derive that point from the last stable pre-lift sample by
+farther along world `+Z`. Set `support_volume_world/size` to that physical table,
+set `surface_world` to its top plane, and author `2.00 m` overhead clearance. Give
+it one top-center affordance whose object transform and object-local support point
+reproduce the source object's known supported origin offset. Derive that point
+from the last stable pre-lift sample by
 projecting the source object origin along the source table normal onto the table
 top plane, then transforming the projected point through the inverse source
 object transform; do not infer support from mesh bounds. Pass an empty
 `PlaceMotionLibrary::recorded` so the demo reports `ReversedPickup`.
 
-Extend the scheduler with a place resolver while preserving the current pick
-resolver API. On `F`, resolve exactly one surface within the 1.00 m local envelope
-when the cached state is Carry. Draw the support rectangle, final object frame,
-approach axis, release errors, and place mode. Change help text to
-`F pick/place  X cancel  R reset`.
+Author the one demo target with nonzero object-profile ID, explicit zero
+object-local bounds center, and half-extents equal to half its measured
+`object_dimensions`. This explicit center is a demo-scene authoring decision, not
+a general inference rule.
+
+Extend the scheduler with a place resolver and preview callback while preserving
+the current pick resolver API. On `F`, resolve exactly one surface within the
+1.00 m coarse envelope when the cached state is Carry and latch it. Each 25 Hz
+tick recomputes the preview and feeds staging error through the ordinary left
+stick/Carry seam. `X` clears the latch. When preview reports root error
+`<=0.25 m`, yaw error `<=25 degrees`, and ready, submit its explicit request once.
+Draw the support rectangle/volume, explicit object bounds, final object frame,
+approach axis, staging root/error/readiness, actual release fit, and place mode.
+Change help text to `F pick/place  X cancel  R reset`.
 
 During PlacePreflight/Align/Replay keep scene authority on the attached runtime
 object. On atomic release, refresh the object handle by stable ID and let the Free
-registry pose take authority. Do not interpolate or overwrite that pose.
+registry pose and destination `table_world/table_size` take authority. Do not
+interpolate or overwrite that pose.
 
 - [ ] **Step 4: Run focused build and safe GREEN**
 
@@ -825,7 +1051,9 @@ git commit -m "feat: control tabletop placement in scene"
 ```
 
 Review checkpoint: inspect target/constraint identity across generation change and
-prove manual pickup behavior is unchanged when no place request is active.
+prove manual pickup behavior is unchanged when no place request is active,
+staging never writes a root, and the released target is immediately selectable
+with destination support context.
 
 ### Task 7: Add the Focused Headless Place Gate
 
@@ -853,6 +1081,8 @@ Require one compact sorted JSON record:
   "final_reason": "None",
   "final_result": "Succeeded",
   "mode": "reversed_pickup",
+  "actual_fit": true,
+  "repick_support_is_destination": true,
   "release_frame": 139,
   "reverse_start_frame": 181,
   "state_sequence": [
@@ -867,23 +1097,31 @@ rather than assuming the illustrative numbers above. Make the first five-sample
 Hold window unstable and the next one stable, assert the earliest certified
 window wins, and mutate only the clip's last contact to zero while expecting the
 probe to keep the same certified reverse start.
+After release, require the target's table transform/size to equal the destination
+support and submit a fresh ordinary pick preflight for the returned generation;
+assert its query context uses the destination support.
 
 - [ ] **Step 2: Run RED**
 
 ```bash
-make interaction_place_probe
-python -m unittest tests.python.test_place_probe -v
+mkdir -p build/red
+g++ -std=c++17 -Wall -Wextra -Werror -pedantic -I. \
+  -c interaction_place_probe.cpp -o build/red/interaction_place_probe.o
 ```
 
-Expected: build fails because the probe source is absent.
+Expected: the compiler exits nonzero because `interaction_place_probe.cpp` is
+absent. Do not treat a missing Make rule as the RED result. Run the Python
+fixture-only validator tests after adding them; they must pass independently of
+the real probe binary.
 
 - [ ] **Step 3: Implement the deterministic probe and target**
 
 The probe loads the existing interaction pack, performs pickup to Carry, submits
-one explicit `PlaceRequest`, advances only with `dt=1/25`, and checks every state
-and attachment transition before printing JSON. It exits nonzero on rejection,
+one explicit `PlaceRequest`, advances only with `dt=1.0F / 25.0F`, and checks
+every state and attachment transition before printing JSON. It exits nonzero on rejection,
 failure, timeout, non-contiguous source frames, unexpected mode, or release-pose
-mismatch.
+mismatch. It also verifies actual-pose support fit, exact destination support
+commit, and one successful re-pick preflight using that destination context.
 
 Add:
 
@@ -916,7 +1154,8 @@ git commit -m "test: gate headless tabletop placement"
 ```
 
 Review checkpoint: run the last-frame-contact mutation and verify the probe still
-uses only the earlier certified Hold sample.
+uses only the earlier certified Hold sample, then verify the released generation
+re-picks against the destination support.
 
 ### Task 8: Prove Genuine Walk, Pickup, Carry, and Place Graphically
 
@@ -944,27 +1183,41 @@ EXPECTED_STATES = (
 )
 CONTROL_RATE_HZ = 25
 MIN_WALK_TICKS = 25
-MIN_WALK_DISPLACEMENT_M = 0.50
-INITIAL_PICKUP_DISTANCE_M = 1.25
-INTERACT_DISTANCE_M = 0.80
-CARRY_COMMAND_COUNT = 63
+MIN_WALK_DISPLACEMENT_M = 2.00
+INITIAL_PICKUP_DISTANCE_M = 2.80
+STANDOFF_MIN_M = 0.35
+STANDOFF_MAX_M = 0.45
+SETTLE_TICKS = 5
+SETTLE_MAX_SPEED_MPS = 0.10
+MIN_CARRY_STAGING_TICKS = 25
+MAX_CARRY_STAGING_TICKS = 150
 ```
 
 The synthetic fixture and validator must reject:
 
-- initial pickup distance `<=1.25 m`;
-- fewer than 25 consecutive initial `walk` rows;
+- initial pickup distance `<=2.80 m` (the stricter accepted bound also proves the
+  requested start distance is greater than `1.25 m`);
+- fewer than 25 consecutive initial `approach` rows;
 - any owned pose, attachment, non-Locomotion state, or canonical-snapshot flag in
   the walking prefix;
-- displayed-root walk displacement `<0.50 m`;
-- Interact when pickup distance `>0.80 m`;
+- any root-relocation flag, scheduler provider other than `live_flat`, or
+  simulation/displayed root initialization from the clip-0 Reach row;
+- displayed-root walk displacement `<2.00 m` or no net pickup-distance progress;
+- fewer than five consecutive settled rows with pickup distance in
+  `[0.35 m, 0.45 m]` and displayed-root speed `<=0.10 m/s` immediately before
+  Interact;
+- Interact without the unchanged 1.00 m resolver and live flat pose;
 - skipped/duplicated 25 Hz runtime ticks or nonzero scheduler phase;
-- fewer or more than 63 consecutive Carry movement rows;
+- fewer than 25 or more than 150 consecutive ordinary Carry staging rows;
 - Carry root or object displacement `<=0.20 m`;
+- any direct simulation/displayed-root write during staging, missing selected
+  staging root, preview root error `>0.25 m`, preview yaw error `>25 degrees`, or
+  false readiness on the runtime Place edge;
 - missing/duplicate Place action or any Reset action;
 - release before PlaceRelease or more than one attached-to-free edge;
-- final position error `>0.02 m`, orientation error `>10 degrees`, or support gap
-  outside `[-0.005 m, +0.020 m]`;
+- final position error `>0.02 m`, orientation error `>10 degrees`, actual support
+  gap outside `[-0.005 m, +0.020 m]`, invalid actual footprint/bound corners/
+  overhead clearance, or blocked release sweep;
 - final state other than `Locomotion/Succeeded/None/Free/unattached`;
 - place mode other than `recorded_place` or `reversed_pickup`; and
 - the existing distal-foot 12 m/s, authority-seam 0.20 m, or 60-degree joint
@@ -986,34 +1239,56 @@ because both files are absent.
 Add `MM_INTERACTION_PLACE_AUTODEMO=1`; do not change the existing pickup
 auto-demo. Its input sequence is state-driven and bounded:
 
-1. Record the initial displayed-root-to-object planar distance and require it to
-   exceed `1.25 m`.
-2. Command the ordinary left-stick locomotion seam for at least 25 ticks. During
-   this prefix use the real flat-controller `LocomotionSnapshot`; never call or
-   substitute `make_autodemo_canonical_entry`, and never let the interaction
-   runtime own the pose.
-3. Continue ordinary walking toward world `+Z` until displayed-root displacement
-   is at least `0.50 m` and pickup distance is at most `0.80 m`; only then pulse
-   Interact. Convert the requested world direction through the existing camera
-   basis to ordinary left-stick input; do not write the root directly.
-4. Complete pickup, command exactly 63 ordinary Carry movement ticks toward world
-   `+Z` and the destination table 1.20 m past the source, and require root/object
-   displacement above `0.20 m`.
-5. Pulse Place once when the destination resolver returns its exact slot.
-6. Complete PlaceRelease, drain the normal seven-frame visual handoff without
+1. Keep the controller's default spawn. Record displayed-root-to-object planar
+   distance and require it to exceed `2.80 m`; never call the placement-mode path
+   that initializes the autodemo canonical world.
+2. Replace placement-mode use of `make_autodemo_canonical_entry` with a focused
+   `make_autodemo_reach_waypoint` helper that maps only clip-0's data-derived Reach
+   root into the demo scene. It returns a root transform, not a pose or
+   `LocomotionSnapshot`, and is used only as a navigation waypoint.
+3. Command the ordinary left-stick locomotion seam toward that waypoint for at
+   least 25 ticks and at least `2.00 m` displayed-root displacement. Convert the
+   desired world direction through the existing camera basis; do not assign
+   simulation position, displayed root, flat pose, or interaction pose. Every
+   scheduler provider call returns the current live flat-controller snapshot.
+4. Within the waypoint neighborhood, release movement input and require five
+   consecutive ticks with pickup distance in `[0.35 m, 0.45 m]` and displayed-root
+   speed at most `0.10 m/s`. Reset the settle counter whenever either bound fails.
+   Then resolve with the unchanged 1.00 m target resolver and pulse Interact using
+   that live pose. Preserve the matcher's unchanged `0.25 m` root correction
+   bound.
+5. Complete pickup and latch Place once. Recompute the exact selected-motion
+   preview each tick and convert staging-root/yaw error through the existing
+   camera basis to ordinary Carry left-stick input. Run for at least 25 and at
+   most 150 ticks, require root/object displacement above `0.20 m`, and never
+   write either root directly.
+6. Let the controller pulse runtime Place once only when the exact preview reports
+   ready with root/yaw error at most `0.25 m` / `25 degrees`.
+7. Complete PlaceRelease, drain the normal seven-frame visual handoff without
    input, capture the placed object, publish evidence atomically, and exit.
 
 Bound walking to 250 ticks, pickup-to-Carry to 375 ticks, placement to 250 ticks,
 and total evidence to 900 records. Any timeout, window close, rejected runtime
 result, fallback mode mislabel, or evidence I/O failure exits nonzero.
 
-Log the current pickup distance, walking-origin displacement, canonical-snapshot
-flag, place goal/error/gap, attachment transition count, place source/mode, and
-the same final-FK joint/grasp data used by the pickup evidence.
+Log the current pickup distance, walking-origin displacement, displayed-root
+speed, approach/settle phase and counter, locomotion-provider kind,
+canonical-snapshot and root-relocation flags, Reach navigation waypoint, latched
+destination, selection ID, staging root/error/readiness, direct-root-write flag,
+place goal/error, requested and actual fit/gap/bounds/overhead/sweep,
+attachment transition count, destination support committed to the target, place
+source/mode, and the same final-FK joint/grasp data used by the pickup evidence.
 
 Require the canonical-snapshot flag to remain false on every placement auto-demo
 record, including pickup matching after Interact. The existing pickup-only
 auto-demo retains its current canonical-fixture behavior.
+
+Add static placement-policy tests proving the placement-mode branch cannot call
+`initialize_autodemo_canonical_world`, cannot select
+`use_autodemo_canonical_snapshot`, and cannot return
+`autodemo_canonical_entry->snapshot`. It may read the Reach row only inside
+`make_autodemo_reach_waypoint`, whose return type contains no pose. Retain the
+legacy helpers solely behind the existing pickup-only auto-demo mode.
 
 - [ ] **Step 4: Add the isolated graphical gate**
 
@@ -1043,15 +1318,19 @@ make gate-playable-placement
 ```
 
 Expected: headless gate and safe suite pass; the controller exits 0; evidence
-shows genuine non-owned flat walking before Interact, then pickup, 63 Carry
-commands, one `reversed_pickup` place, one release, and final supported object;
-the placement validator exits 0.
+starts at the unchanged default spawn more than `2.80 m` away, shows at least 25
+progressing `approach` rows and `2.00 m` of genuine non-owned flat walking, five
+settled live-provider rows, then pickup, ordinary preview-guided Carry staging,
+one `reversed_pickup` place, one release, and a final supported object. No row
+uses canonical snapshot substitution or root relocation; the placement validator
+exits 0.
 
 - [ ] **Step 6: Inspect visual evidence**
 
 Capture a native-25-Hz lossless video through the working nested-display method
 used by the pickup gate. Inspect approach, pickup entry/contact, moving Carry,
-PlaceAlign, lowering, release, retraction, and locomotion handoff. Reject the gate
+selected-motion staging, PlaceAlign, lowering, release, retraction, and locomotion
+handoff. Reject the gate
 if the object, root, head/neck, active elbow, inactive arm, or skeleton visibly
 flips even when numeric limits pass.
 
@@ -1059,7 +1338,10 @@ flips even when numeric limits pass.
 
 README must include manual `F pick/place`, exact headless and graphical commands,
 evidence paths, current expected `reversed_pickup` mode, the absence of local true
-place data, and the flat-ground/non-terrain scope.
+place data, the flat-ground/non-terrain scope, and the placement gate's live
+default-spawn approach. Document that its data-derived Reach root is only a
+navigation waypoint and that canonical relocation/snapshot substitution is
+disabled in placement mode.
 
 ```bash
 git add tests/python/test_playable_placement_evidence.py controller.cpp \
@@ -1067,9 +1349,11 @@ git add tests/python/test_playable_placement_evidence.py controller.cpp \
 git commit -m "test: prove walk pick carry and place"
 ```
 
-Review checkpoint: independently inspect the lossless video and JSONL. A passing
-synthetic or headless probe cannot substitute for genuine ordinary flat walking
-in the graphical evidence.
+Review checkpoint: independently inspect the lossless video and JSONL. Require a
+start beyond `2.80 m`, progressing approach rows, the five-row settled band, the
+`live_flat` provider throughout, and false canonical-snapshot/root-relocation
+flags throughout. A passing synthetic or headless probe cannot substitute for
+genuine ordinary flat walking in the graphical evidence.
 
 ## Final Verification and Branch Review
 
@@ -1077,6 +1361,7 @@ in the graphical evidence.
 
 ```bash
 make test-interaction-safe
+make test-interaction-place-release-fast-math
 make gate-place-headless
 PATH=$PWD/.venv/bin:/home/ubuntu/miniconda3/envs/diffsim/bin:$PATH \
 GRAIL_ROOT=/home/ubuntu/datasets/GRAIL/data/pickup_table \
