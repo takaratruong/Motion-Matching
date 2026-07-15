@@ -3366,31 +3366,33 @@ int main(void)
         }
 
         interaction_frame_state = interaction_frame_handoff.apply(
-            locomotion_pose,
+            flat_locomotion_pose,
             interaction_output,
             interaction::kControllerStepSeconds);
-        if (interaction_frame_state.owns_pose)
+        if (interaction_frame_state.overrides_locomotion_pose)
         {
-            const interaction::FlatControllerPose owned_flat_pose =
-                interaction::collapse_interaction_pose(
-                    interaction_frame_state.pose,
-                    flat_locomotion_pose);
             for (size_t bone = 0;
                  bone < interaction::kFlatControllerBoneCount;
                  ++bone)
             {
                 const int index = static_cast<int>(bone);
-                bone_positions(index) = owned_flat_pose.positions[bone];
-                bone_velocities(index) = owned_flat_pose.velocities[bone];
-                bone_rotations(index) = owned_flat_pose.rotations[bone];
+                bone_positions(index) =
+                    interaction_frame_state.pose.positions[bone];
+                bone_velocities(index) =
+                    interaction_frame_state.pose.velocities[bone];
+                bone_rotations(index) =
+                    interaction_frame_state.pose.rotations[bone];
                 bone_angular_velocities(index) =
-                    owned_flat_pose.angular_velocities[bone];
+                    interaction_frame_state.pose.angular_velocities[bone];
             }
             curr_bone_contacts(0) =
-                owned_flat_pose.foot_contacts[0] != 0U;
+                interaction_frame_state.pose.foot_contacts[0] != 0U;
             curr_bone_contacts(1) =
-                owned_flat_pose.foot_contacts[1] != 0U;
-            latest_owned_interaction_pose = interaction_frame_state.pose;
+                interaction_frame_state.pose.foot_contacts[1] != 0U;
+        }
+        if (interaction_frame_state.runtime_owns_pose)
+        {
+            latest_owned_interaction_pose = interaction_output.pose;
         }
         else
         {
@@ -3403,6 +3405,12 @@ int main(void)
             simulation_rotation =
                 interaction_frame_state.simulation_root_rotation;
         }
+        const interaction::Pose interaction_debug_pose =
+            interaction::expand_flat_controller_pose(
+                interaction_frame_state.pose,
+                interaction_frame_state.runtime_owns_pose
+                    ? interaction_output.pose
+                    : locomotion_pose);
 
         // Reset may replace the registry entry with a newer generation.
         // Prefer a published diagnostic handle, then refresh by stable ID so
@@ -3706,7 +3714,7 @@ int main(void)
             interaction_scene_state.object_world,
             interaction_output,
             interaction_predicted_roots,
-            interaction_frame_state.pose,
+            interaction_debug_pose,
             locomotion_pose,
             interaction_config.matcher.maximum_approach_m);
         

@@ -1124,6 +1124,9 @@ class Task12PolicyTests(unittest.TestCase):
         adapter = Path("interaction_controller_adapter.h").read_text(
             encoding="utf-8"
         )
+        adapter_impl = Path("interaction_controller_adapter.cpp").read_text(
+            encoding="utf-8"
+        )
         self.assertIn(
             "struct FlatControllerPose",
             adapter,
@@ -1136,8 +1139,13 @@ class Task12PolicyTests(unittest.TestCase):
         )
         self.assertIn(
             "collapse_interaction_pose(",
+            adapter_impl,
+            "frame handoff must collapse owned G1 poses to flat semantics",
+        )
+        self.assertNotIn(
+            "collapse_interaction_pose(",
             controller,
-            "controller must explicitly collapse owned G1 poses to flat semantics",
+            "controller must consume the already-retargeted flat handoff pose",
         )
         self.assertRegex(
             controller,
@@ -1192,9 +1200,14 @@ class Task12PolicyTests(unittest.TestCase):
             "controller must cache the exact prior owned G1 handoff pose",
         )
         self.assertIn(
-            "latest_owned_interaction_pose = interaction_frame_state.pose;",
+            "latest_owned_interaction_pose = interaction_output.pose;",
             controller,
-            "owned frames must refresh the hidden-link reference",
+            "owned frames must cache the raw G1 runtime reference",
+        )
+        self.assertNotIn(
+            "latest_owned_interaction_pose = interaction_debug_pose;",
+            controller,
+            "reconstructed debug poses must never become runtime authority",
         )
         self.assertIn(
             "latest_owned_interaction_pose.reset();",
@@ -1232,7 +1245,7 @@ class Task12PolicyTests(unittest.TestCase):
         seam = self._source_between(
             controller,
             "        interaction::Pose locomotion_pose =",
-            "        if (interaction_frame_state.owns_pose)",
+            "        if (interaction_frame_state.overrides_locomotion_pose)",
         )
         provider = self._source_between(
             seam,
@@ -1251,8 +1264,8 @@ class Task12PolicyTests(unittest.TestCase):
         )
         self.assertRegex(
             seam,
-            r"interaction_frame_handoff\.apply\(\s*locomotion_pose,",
-            "Task 11 handoff must receive ordinary locomotion_pose",
+            r"interaction_frame_handoff\.apply\(\s*flat_locomotion_pose,",
+            "frame handoff must receive ordinary flat locomotion pose",
         )
 
     def test_canonical_row_invariant_is_limited_to_locomotion_prefix(self):

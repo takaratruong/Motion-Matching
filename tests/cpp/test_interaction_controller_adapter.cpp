@@ -16,7 +16,6 @@
 
 namespace {
 
-using interaction::ControllerInteractionAdapter;
 using interaction::ControllerInteractionEdges;
 using interaction::ControllerInteractionFrameHandoff;
 using interaction::ControllerInteractionFrameState;
@@ -49,6 +48,12 @@ struct FlatWorldPose {
     std::array<vec3, interaction::kFlatControllerBoneCount>
         angular_velocities{};
 };
+
+void require(bool condition, const char* message) {
+    if (!condition) {
+        throw std::runtime_error(message);
+    }
+}
 
 bool float_bits_equal(float left, float right) {
     return std::memcmp(&left, &right, sizeof(float)) == 0;
@@ -162,6 +167,26 @@ bool output_fields_equal(const RuntimeOutput& left, const RuntimeOutput& right) 
 
 bool near(float left, float right, float tolerance = 1.0e-5F) {
     return std::fabs(left - right) <= tolerance;
+}
+
+void require_vec_near(
+    vec3 actual,
+    vec3 expected,
+    const char* message,
+    float tolerance = 1.0e-5F) {
+    require(near(actual.x, expected.x, tolerance), message);
+    require(near(actual.y, expected.y, tolerance), message);
+    require(near(actual.z, expected.z, tolerance), message);
+}
+
+void require_same_rotation(
+    quat actual,
+    quat expected,
+    const char* message,
+    float tolerance = 1.0e-5F) {
+    require(
+        near(std::fabs(quat_dot(actual, expected)), 1.0F, tolerance),
+        message);
 }
 
 void assert_vec_near(vec3 actual, vec3 expected, float tolerance = 1.0e-5F) {
@@ -782,122 +807,286 @@ void test_cache_changes_only_after_successful_due_delivery() {
     assert(!output_fields_equal(scheduler.cached_output(), held));
 }
 
-void test_adapter_blends_every_pose_channel_and_contacts() {
-    ControllerInteractionAdapter adapter;
-    const Pose locomotion = make_pose(-2.0F);
-    RuntimeOutput idle;
-    const Pose idle_output =
-        adapter.apply(locomotion, idle, interaction::kControllerStepSeconds);
-    assert(pose_bits_equal(idle_output, locomotion));
-
-    RuntimeOutput owned;
-    owned.owns_pose = true;
-    owned.pose = make_pose(4.0F);
-    const Pose first =
-        adapter.apply(locomotion, owned, interaction::kControllerStepSeconds);
-    assert(!pose_bits_equal(first, locomotion));
-    assert(!pose_bits_equal(first, owned.pose));
-
-    const float alpha = interaction::kControllerStepSeconds / 0.25F;
-    assert_vec_near(
-        first.positions[5],
-        lerp(locomotion.positions[5], owned.pose.positions[5], alpha));
-    assert_vec_near(
-        first.velocities[6],
-        lerp(locomotion.velocities[6], owned.pose.velocities[6], alpha));
-    assert_same_rotation(
-        first.rotations[7],
-        quat_nlerp_shortest(
-            locomotion.rotations[7], owned.pose.rotations[7], alpha));
-    assert_vec_near(
-        first.angular_velocities[8],
-        lerp(
-            locomotion.angular_velocities[8],
-            owned.pose.angular_velocities[8],
-            alpha));
-    assert(near(
-        first.hand_dof[4],
-        lerpf(locomotion.hand_dof[4], owned.pose.hand_dof[4], alpha)));
-    assert(near(
-        first.hand_dof_velocities[9],
-        lerpf(
-            locomotion.hand_dof_velocities[9],
-            owned.pose.hand_dof_velocities[9],
-            alpha)));
-
-    Pose blended = first;
-    for (int tick = 2; tick <= 7; ++tick) {
-        blended =
-            adapter.apply(locomotion, owned, interaction::kControllerStepSeconds);
-        assert(blended.foot_contacts == locomotion.foot_contacts);
+FlatControllerPose blend_flat_expected(
+    const FlatControllerPose& source,
+    const FlatControllerPose& target,
+    float alpha) {
+    FlatControllerPose blended;
+    for (size_t bone = 0; bone < blended.positions.size(); ++bone) {
+        blended.positions[bone] =
+            lerp(source.positions[bone], target.positions[bone], alpha);
+        blended.velocities[bone] =
+            lerp(source.velocities[bone], target.velocities[bone], alpha);
+        blended.rotations[bone] = quat_nlerp_shortest(
+            source.rotations[bone], target.rotations[bone], alpha);
+        blended.angular_velocities[bone] = lerp(
+            source.angular_velocities[bone],
+            target.angular_velocities[bone],
+            alpha);
     }
-    blended = adapter.apply(
-        locomotion, owned, interaction::kControllerStepSeconds);
-    assert(blended.foot_contacts == owned.pose.foot_contacts);
-
-    for (int tick = 9; tick <= 15; ++tick) {
-        blended =
-            adapter.apply(locomotion, owned, interaction::kControllerStepSeconds);
-    }
-    assert(pose_bits_equal(blended, owned.pose));
-    const Pose after_settlement =
-        adapter.apply(locomotion, owned, interaction::kControllerStepSeconds);
-    assert(pose_bits_equal(after_settlement, owned.pose));
+    blended.foot_contacts =
+        alpha < 0.5F ? source.foot_contacts : target.foot_contacts;
+    return blended;
 }
 
-void test_adapter_shortest_antipodal_rotation() {
-    ControllerInteractionAdapter adapter;
-    Pose source{};
-    Pose target{};
-    const quat positive_target =
-        quat_from_angle_axis(0.75F, vec3(0.0F, 1.0F, 0.0F));
-    target.rotations.fill(-positive_target);
-    RuntimeOutput owned;
-    owned.owns_pose = true;
-    owned.pose = target;
+void require_flat_pose_near(
+    const FlatControllerPose& actual,
+    const FlatControllerPose& expected,
+    const char* message,
+    float tolerance = 3.0e-4F) {
+    for (size_t bone = 0; bone < actual.positions.size(); ++bone) {
+        require_vec_near(
+            actual.positions[bone], expected.positions[bone], message, tolerance);
+        require_vec_near(
+            actual.velocities[bone], expected.velocities[bone], message, tolerance);
+        require_same_rotation(
+            actual.rotations[bone], expected.rotations[bone], message, tolerance);
+        require_vec_near(
+            actual.angular_velocities[bone],
+            expected.angular_velocities[bone],
+            message,
+            tolerance);
+    }
+    require(actual.foot_contacts == expected.foot_contacts, message);
+}
 
-    const Pose first =
-        adapter.apply(source, owned, interaction::kControllerStepSeconds);
-    for (quat rotation : first.rotations) {
-        assert(near(quat_length(rotation), 1.0F, 2.0e-5F));
-        assert(rotation.w > 0.0F);
-        assert(rotation.y > 0.0F);
+RuntimeOutput make_owned_output(const FlatControllerPose& flat_target) {
+    RuntimeOutput output;
+    output.owns_pose = true;
+    output.pose = interaction::expand_flat_controller_pose(
+        flat_target, make_pose(0.375F));
+    output.diagnostics.state = RuntimeState::Align;
+    return output;
+}
+
+void test_frame_handoff_retargets_before_blending_in_flat_topology() {
+    FlatControllerPose entry = make_flat_pose();
+    FlatControllerPose authored_target = entry;
+    for (size_t bone = 0; bone < authored_target.positions.size(); ++bone) {
+        const float offset = 0.02F * static_cast<float>(bone + 1U);
+        authored_target.positions[bone] = authored_target.positions[bone] +
+            vec3(offset, -offset, 0.5F * offset);
+        authored_target.velocities[bone] = authored_target.velocities[bone] +
+            vec3(-offset, offset, offset);
+        authored_target.rotations[bone] = quat_from_angle_axis(
+            0.2F + offset,
+            normalize(vec3(0.7F, 0.3F + offset, 0.2F)));
+        authored_target.angular_velocities[bone] =
+            authored_target.angular_velocities[bone] +
+            vec3(offset, 2.0F * offset, -offset);
+    }
+    authored_target.foot_contacts = {0U, 1U};
+    const RuntimeOutput owned = make_owned_output(authored_target);
+    const FlatControllerPose collapsed_target =
+        interaction::collapse_interaction_pose(owned.pose, entry);
+    const float alpha = interaction::kControllerStepSeconds / 0.25F;
+    const FlatControllerPose expected =
+        blend_flat_expected(entry, collapsed_target, alpha);
+
+    ControllerInteractionFrameHandoff handoff;
+    const ControllerInteractionFrameState frame = handoff.apply(
+        entry, owned, interaction::kControllerStepSeconds);
+
+    require(frame.runtime_owns_pose, "owned frame lost runtime ownership");
+    require(frame.overrides_locomotion_pose, "owned frame lost visual override");
+    require_flat_pose_near(
+        frame.pose,
+        expected,
+        "entry was not retargeted before flat-topology blending");
+}
+
+void test_frame_handoff_keeps_captured_neck_and_head_while_owned() {
+    FlatControllerPose entry = make_flat_pose();
+    FlatControllerPose target = entry;
+    target.rotations[12] = quat_from_angle_axis(
+        0.65F, normalize(vec3(0.2F, 0.8F, 0.3F)));
+    const RuntimeOutput owned = make_owned_output(target);
+
+    ControllerInteractionFrameHandoff handoff;
+    (void)handoff.apply(entry, owned, interaction::kControllerStepSeconds);
+
+    FlatControllerPose fresh_locomotion = entry;
+    for (size_t bone : {13U, 14U}) {
+        fresh_locomotion.positions[bone] = fresh_locomotion.positions[bone] +
+            vec3(50.0F, -30.0F, 70.0F);
+        fresh_locomotion.velocities[bone] = fresh_locomotion.velocities[bone] +
+            vec3(-20.0F, 40.0F, 80.0F);
+        fresh_locomotion.rotations[bone] = quat_from_angle_axis(
+            2.4F, normalize(vec3(1.0F, 2.0F, 3.0F)));
+        fresh_locomotion.angular_velocities[bone] =
+            fresh_locomotion.angular_velocities[bone] +
+            vec3(90.0F, 60.0F, -40.0F);
+    }
+    const ControllerInteractionFrameState frame = handoff.apply(
+        fresh_locomotion, owned, interaction::kControllerStepSeconds);
+
+    for (size_t bone : {13U, 14U}) {
+        require_vec_near(
+            frame.pose.positions[bone],
+            entry.positions[bone],
+            "fresh locomotion moved an owned Neck/Head position");
+        require_vec_near(
+            frame.pose.velocities[bone],
+            entry.velocities[bone],
+            "fresh locomotion moved an owned Neck/Head velocity");
+        require_same_rotation(
+            frame.pose.rotations[bone],
+            entry.rotations[bone],
+            "fresh locomotion moved an owned Neck/Head rotation");
+        require_vec_near(
+            frame.pose.angular_velocities[bone],
+            entry.angular_velocities[bone],
+            "fresh locomotion moved an owned Neck/Head angular velocity");
     }
 }
 
-void test_adapter_exit_reentry_and_reset_capture_fresh_locomotion() {
-    ControllerInteractionAdapter adapter;
-    RuntimeOutput owned;
-    owned.owns_pose = true;
-    owned.pose = make_pose(9.0F);
+float rotation_distance(quat left, quat right) {
+    const float orientation_dot = std::clamp(
+        std::fabs(quat_dot(quat_normalize(left), quat_normalize(right))),
+        0.0F,
+        1.0F);
+    return 2.0F * std::acos(orientation_dot);
+}
 
-    const Pose first_source = make_pose(1.0F);
-    (void)adapter.apply(
-        first_source, owned, interaction::kControllerStepSeconds);
+void test_frame_handoff_hip_uses_shortest_arc_without_overshoot() {
+    constexpr size_t kFlatLeftHip = 2U;
+    FlatControllerPose entry = make_flat_pose();
+    entry.rotations[kFlatLeftHip] = quat_from_angle_axis(
+        170.0F * 3.14159265358979323846F / 180.0F,
+        vec3(0.0F, 1.0F, 0.0F));
+    FlatControllerPose target = entry;
+    target.rotations[kFlatLeftHip] = quat_from_angle_axis(
+        -170.0F * 3.14159265358979323846F / 180.0F,
+        vec3(0.0F, 1.0F, 0.0F));
+    const RuntimeOutput owned = make_owned_output(target);
+    const FlatControllerPose collapsed =
+        interaction::collapse_interaction_pose(owned.pose, entry);
+    const float alpha = interaction::kControllerStepSeconds / 0.25F;
+    const quat expected = quat_nlerp_shortest(
+        entry.rotations[kFlatLeftHip],
+        collapsed.rotations[kFlatLeftHip],
+        alpha);
+
+    ControllerInteractionFrameHandoff handoff;
+    const ControllerInteractionFrameState frame = handoff.apply(
+        entry, owned, interaction::kControllerStepSeconds);
+    const quat actual = frame.pose.rotations[kFlatLeftHip];
+
+    require_same_rotation(
+        actual, expected, "flat hip did not follow shortest-arc interpolation");
+    const float full_distance = rotation_distance(
+        entry.rotations[kFlatLeftHip], collapsed.rotations[kFlatLeftHip]);
+    require(
+        rotation_distance(entry.rotations[kFlatLeftHip], actual) <=
+            full_distance + 1.0e-5F,
+        "flat hip overshot its interaction target");
+    require(
+        rotation_distance(actual, collapsed.rotations[kFlatLeftHip]) <=
+            full_distance + 1.0e-5F,
+        "flat hip left the source-target shortest arc");
+}
+
+void test_frame_handoff_release_is_continuous_and_relinquishes_after_blend() {
+    const FlatControllerPose entry = make_flat_pose();
+    FlatControllerPose target = entry;
+    target.positions[0] = target.positions[0] + vec3(1.0F, 0.5F, -2.0F);
+    target.rotations[2] = quat_from_angle_axis(
+        0.9F, normalize(vec3(0.4F, 0.8F, 0.1F)));
+    const RuntimeOutput owned = make_owned_output(target);
+    ControllerInteractionFrameHandoff handoff;
+    const ControllerInteractionFrameState settled =
+        handoff.apply(entry, owned, 0.25F);
+    require_flat_pose_near(
+        settled.pose, target, "owned setup did not settle on target");
+
+    FlatControllerPose fresh_locomotion = entry;
+    fresh_locomotion.positions[0] =
+        fresh_locomotion.positions[0] + vec3(-3.0F, 0.0F, 4.0F);
+    RuntimeOutput idle;
+    const ControllerInteractionFrameState first_release = handoff.apply(
+        fresh_locomotion, idle, interaction::kControllerStepSeconds);
+    require(!first_release.runtime_owns_pose, "release retained runtime ownership");
+    require(
+        first_release.overrides_locomotion_pose,
+        "release dropped visual override on its first frame");
+    require_flat_pose_near(
+        first_release.pose,
+        settled.pose,
+        "first release frame was discontinuous");
+
+    bool relinquished = false;
+    for (int tick = 0; tick < 30; ++tick) {
+        const ControllerInteractionFrameState frame = handoff.apply(
+            fresh_locomotion, idle, interaction::kControllerStepSeconds);
+        require(!frame.runtime_owns_pose, "release regained runtime ownership");
+        if (!frame.overrides_locomotion_pose) {
+            require(
+                flat_pose_bits_equal(frame.pose, fresh_locomotion),
+                "release relinquished before converging to fresh locomotion");
+            relinquished = true;
+            break;
+        }
+    }
+    require(relinquished, "release never relinquished visual override");
+}
+
+void test_frame_handoff_reset_and_reentry_capture_fresh_flat_reference() {
+    const FlatControllerPose first_entry = make_flat_pose();
+    FlatControllerPose target = first_entry;
+    target.rotations[12] = quat_from_angle_axis(
+        0.5F, normalize(vec3(0.1F, 0.4F, 0.8F)));
+    const RuntimeOutput owned = make_owned_output(target);
+    ControllerInteractionFrameHandoff handoff;
+    (void)handoff.apply(
+        first_entry, owned, interaction::kControllerStepSeconds);
+
+    handoff.reset();
+    FlatControllerPose second_entry = first_entry;
+    for (size_t bone : {13U, 14U}) {
+        second_entry.positions[bone] = second_entry.positions[bone] +
+            vec3(2.0F, 3.0F, -4.0F);
+        second_entry.rotations[bone] = quat_from_angle_axis(
+            0.8F, normalize(vec3(0.5F, 0.2F, 0.7F)));
+    }
+    const ControllerInteractionFrameState after_reset = handoff.apply(
+        second_entry, owned, interaction::kControllerStepSeconds);
+    for (size_t bone : {13U, 14U}) {
+        require_vec_near(
+            after_reset.pose.positions[bone],
+            second_entry.positions[bone],
+            "reset reused a stale ownership fallback");
+        require_same_rotation(
+            after_reset.pose.rotations[bone],
+            second_entry.rotations[bone],
+            "reset reused a stale ownership rotation fallback");
+    }
 
     RuntimeOutput idle;
-    const Pose current_locomotion = make_pose(3.0F);
-    const Pose exited = adapter.apply(
-        current_locomotion, idle, interaction::kControllerStepSeconds);
-    assert(pose_bits_equal(exited, current_locomotion));
+    ControllerInteractionFrameState released{};
+    for (int tick = 0; tick < 30; ++tick) {
+        released = handoff.apply(
+            second_entry, idle, interaction::kControllerStepSeconds);
+        if (!released.overrides_locomotion_pose) {
+            break;
+        }
+    }
+    require(
+        !released.overrides_locomotion_pose,
+        "re-entry setup did not finish release");
 
-    const Pose reentered = adapter.apply(
-        current_locomotion, owned, interaction::kControllerStepSeconds);
-    const float alpha = interaction::kControllerStepSeconds / 0.25F;
-    assert_vec_near(
-        reentered.positions[0],
-        lerp(
-            current_locomotion.positions[0],
-            owned.pose.positions[0],
-            alpha));
-
-    adapter.reset();
-    const Pose reset_source = make_pose(5.0F);
-    const Pose after_reset = adapter.apply(
-        reset_source, owned, interaction::kControllerStepSeconds);
-    assert_vec_near(
-        after_reset.positions[0],
-        lerp(reset_source.positions[0], owned.pose.positions[0], alpha));
+    FlatControllerPose third_entry = second_entry;
+    for (size_t bone : {13U, 14U}) {
+        third_entry.positions[bone] = third_entry.positions[bone] +
+            vec3(-7.0F, 1.0F, 5.0F);
+    }
+    const ControllerInteractionFrameState reentered = handoff.apply(
+        third_entry, owned, interaction::kControllerStepSeconds);
+    for (size_t bone : {13U, 14U}) {
+        require_vec_near(
+            reentered.pose.positions[bone],
+            third_entry.positions[bone],
+            "re-entry reused a stale ownership fallback");
+    }
 }
 
 void test_frame_handoff_preserves_fresh_complete_nonowned_pose_for_60_frames() {
@@ -917,12 +1106,14 @@ void test_frame_handoff_preserves_fresh_complete_nonowned_pose_for_60_frames() {
         interaction::RuntimeConfig{});
     int disabled_runtime_calls = 0;
     int loaded_runtime_calls = 0;
-    Pose previous{};
+    FlatControllerPose previous{};
 
     for (int tick = 1; tick <= 60; ++tick) {
-        const Pose fresh = make_pose(20.0F + static_cast<float>(tick));
+        FlatControllerPose fresh = make_flat_pose();
+        fresh.positions[0].x += static_cast<float>(tick);
+        fresh.velocities[0].z -= static_cast<float>(tick);
         if (tick != 1) {
-            assert(!pose_bits_equal(fresh, previous));
+            assert(!flat_pose_bits_equal(fresh, previous));
         }
         previous = fresh;
 
@@ -962,10 +1153,12 @@ void test_frame_handoff_preserves_fresh_complete_nonowned_pose_for_60_frames() {
                 fresh,
                 loaded_output,
                 interaction::kControllerStepSeconds);
-        assert(pose_bits_equal(disabled_frame.pose, fresh));
-        assert(pose_bits_equal(loaded_frame.pose, fresh));
-        assert(!disabled_frame.owns_pose);
-        assert(!loaded_frame.owns_pose);
+        assert(flat_pose_bits_equal(disabled_frame.pose, fresh));
+        assert(flat_pose_bits_equal(loaded_frame.pose, fresh));
+        assert(!disabled_frame.runtime_owns_pose);
+        assert(!loaded_frame.runtime_owns_pose);
+        assert(!disabled_frame.overrides_locomotion_pose);
+        assert(!loaded_frame.overrides_locomotion_pose);
         assert(!disabled_frame.synchronize_simulation_root);
         assert(!loaded_frame.synchronize_simulation_root);
     }
@@ -976,7 +1169,7 @@ void test_frame_handoff_preserves_fresh_complete_nonowned_pose_for_60_frames() {
     assert(loaded_scheduler.phase() == 0);
 }
 
-void test_frame_handoff_retains_channels_and_exposes_root_sync() {
+void test_frame_handoff_exposes_rendered_flat_root_sync() {
     for (float value : interaction::kFlatControllerRestHandDof) {
         assert(float_bits_equal(value, 0.0F));
     }
@@ -985,30 +1178,34 @@ void test_frame_handoff_retains_channels_and_exposes_root_sync() {
     }
 
     ControllerInteractionFrameHandoff handoff;
-    Pose locomotion = make_pose(-4.0F);
-    locomotion.hand_dof = interaction::kFlatControllerRestHandDof;
-    locomotion.hand_dof_velocities =
-        interaction::kFlatControllerRestHandDofVelocities;
-    RuntimeOutput owned;
-    owned.owns_pose = true;
-    owned.pose = make_pose(8.0F, true);
+    const FlatControllerPose locomotion = make_flat_pose();
+    FlatControllerPose target = locomotion;
+    target.positions[0] = target.positions[0] + vec3(2.0F, 1.0F, -3.0F);
+    target.foot_contacts = {0U, 1U};
+    RuntimeOutput owned = make_owned_output(target);
 
     ControllerInteractionFrameState frame{};
     for (int tick = 1; tick <= 15; ++tick) {
         frame = handoff.apply(
             locomotion, owned, interaction::kControllerStepSeconds);
-        assert(frame.owns_pose);
-        assert(frame.synchronize_simulation_root);
-        assert(vec_bits_equal(
-            frame.simulation_root_position, frame.pose.positions[0]));
-        assert(quat_bits_equal(
-            frame.simulation_root_rotation, frame.pose.rotations[0]));
+        require(frame.runtime_owns_pose, "owned frame lost runtime ownership");
+        require(
+            frame.overrides_locomotion_pose,
+            "owned frame lost visual override");
+        require(
+            frame.synchronize_simulation_root,
+            "pre-Carry frame did not request root synchronization");
+        require(
+            vec_bits_equal(
+                frame.simulation_root_position, frame.pose.positions[0]),
+            "published simulation root position differs from rendered flat root");
+        require(
+            quat_bits_equal(
+                frame.simulation_root_rotation, frame.pose.rotations[0]),
+            "published simulation root rotation differs from rendered flat root");
     }
-    assert(pose_bits_equal(frame.pose, owned.pose));
-    assert(frame.pose.hand_dof == owned.pose.hand_dof);
-    assert(frame.pose.hand_dof_velocities ==
-           owned.pose.hand_dof_velocities);
-    assert(frame.pose.foot_contacts == owned.pose.foot_contacts);
+    assert_flat_pose_near(frame.pose, target);
+    assert(frame.pose.foot_contacts == target.foot_contacts);
 
     vec3 simulation_position(91.0F, 92.0F, 93.0F);
     quat simulation_rotation = quat_from_angle_axis(
@@ -1020,41 +1217,74 @@ void test_frame_handoff_retains_channels_and_exposes_root_sync() {
     assert(vec_bits_equal(simulation_position, frame.pose.positions[0]));
     assert(quat_bits_equal(simulation_rotation, frame.pose.rotations[0]));
 
-    const Pose fresh_nonowned = make_pose(31.0F);
+    FlatControllerPose fresh_nonowned = make_flat_pose();
+    fresh_nonowned.positions[0].x += 31.0F;
     RuntimeOutput nonowned;
     const ControllerInteractionFrameState released = handoff.apply(
         fresh_nonowned, nonowned, interaction::kControllerStepSeconds);
-    assert(pose_bits_equal(released.pose, fresh_nonowned));
-    assert(!released.synchronize_simulation_root);
+    require(
+        released.overrides_locomotion_pose,
+        "release dropped visual override before blending");
+    assert_flat_pose_near(released.pose, frame.pose);
+    require(
+        !released.synchronize_simulation_root,
+        "release incorrectly synchronized the simulation root");
 }
 
 void test_frame_handoff_keeps_layered_carry_simulation_root_live() {
-    const Pose locomotion = make_pose(-4.0F);
-    RuntimeOutput output;
-    output.owns_pose = true;
-    output.pose = make_pose(8.0F, true);
+    const FlatControllerPose locomotion = make_flat_pose();
+    FlatControllerPose target = locomotion;
+    target.positions[0] = target.positions[0] + vec3(4.0F, 0.5F, 2.0F);
+    RuntimeOutput output = make_owned_output(target);
 
     output.diagnostics.state = RuntimeState::Carry;
     output.diagnostics.recorded_carry = false;
     ControllerInteractionFrameHandoff layered_handoff;
     const ControllerInteractionFrameState layered = layered_handoff.apply(
         locomotion, output, interaction::kControllerStepSeconds);
-    assert(layered.owns_pose);
-    assert(!layered.synchronize_simulation_root);
+    require(
+        layered.runtime_owns_pose,
+        "layered Carry lost runtime pose ownership");
+    require(
+        layered.overrides_locomotion_pose,
+        "layered Carry lost visual override");
+    require(
+        !layered.synchronize_simulation_root,
+        "layered Carry overwrote the live simulation root");
 
     output.diagnostics.state = RuntimeState::Align;
     ControllerInteractionFrameHandoff pre_carry_handoff;
     const ControllerInteractionFrameState pre_carry =
         pre_carry_handoff.apply(
             locomotion, output, interaction::kControllerStepSeconds);
-    assert(pre_carry.synchronize_simulation_root);
+    require(
+        pre_carry.synchronize_simulation_root,
+        "pre-Carry ownership did not synchronize the simulation root");
+    require(
+        vec_bits_equal(
+            pre_carry.simulation_root_position, pre_carry.pose.positions[0]),
+        "pre-Carry synchronized the wrong root position");
+    require(
+        quat_bits_equal(
+            pre_carry.simulation_root_rotation, pre_carry.pose.rotations[0]),
+        "pre-Carry synchronized the wrong root rotation");
 
     output.diagnostics.state = RuntimeState::Carry;
     output.diagnostics.recorded_carry = true;
     ControllerInteractionFrameHandoff recorded_handoff;
     const ControllerInteractionFrameState recorded = recorded_handoff.apply(
         locomotion, output, interaction::kControllerStepSeconds);
-    assert(recorded.synchronize_simulation_root);
+    require(
+        recorded.synchronize_simulation_root,
+        "recorded Carry did not synchronize the simulation root");
+    require(
+        vec_bits_equal(
+            recorded.simulation_root_position, recorded.pose.positions[0]),
+        "recorded Carry synchronized the wrong root position");
+    require(
+        quat_bits_equal(
+            recorded.simulation_root_rotation, recorded.pose.rotations[0]),
+        "recorded Carry synchronized the wrong root rotation");
 }
 
 void test_scene_handoff_retains_attached_pose_until_registry_reclaims_authority() {
@@ -1266,6 +1496,23 @@ void test_controller_and_make_clock_policy() {
     assert(controller.find("interaction_scheduler.tick(") != std::string::npos);
     assert(controller.find("interaction_frame_handoff.apply(") !=
            std::string::npos);
+    require(
+        controller.find("interaction_frame_state.overrides_locomotion_pose") !=
+            std::string::npos,
+        "controller does not honor release visual override");
+    require(
+        controller.find(
+            "latest_owned_interaction_pose = interaction_output.pose;") !=
+            std::string::npos,
+        "controller does not cache the raw owned G1 pose");
+    require(
+        controller.find(
+            "latest_owned_interaction_pose = interaction_frame_state.pose;") ==
+            std::string::npos,
+        "controller makes a rendered/reconstructed pose runtime authority");
+    require(
+        controller.find("interaction_debug_pose") != std::string::npos,
+        "controller does not isolate reconstructed G1 debug pose");
     assert(controller.find("interaction_scene_handoff.apply(") !=
            std::string::npos);
     assert(controller.find("interaction_registry.find_by_id(") !=
@@ -1322,11 +1569,13 @@ int main() {
     test_scheduler_cadence_and_cache();
     test_edges_latch_coalesce_and_clear_after_delivery();
     test_cache_changes_only_after_successful_due_delivery();
-    test_adapter_blends_every_pose_channel_and_contacts();
-    test_adapter_shortest_antipodal_rotation();
-    test_adapter_exit_reentry_and_reset_capture_fresh_locomotion();
+    test_frame_handoff_retargets_before_blending_in_flat_topology();
+    test_frame_handoff_keeps_captured_neck_and_head_while_owned();
+    test_frame_handoff_hip_uses_shortest_arc_without_overshoot();
+    test_frame_handoff_release_is_continuous_and_relinquishes_after_blend();
+    test_frame_handoff_reset_and_reentry_capture_fresh_flat_reference();
     test_frame_handoff_preserves_fresh_complete_nonowned_pose_for_60_frames();
-    test_frame_handoff_retains_channels_and_exposes_root_sync();
+    test_frame_handoff_exposes_rendered_flat_root_sync();
     test_frame_handoff_keeps_layered_carry_simulation_root_live();
     test_scene_handoff_retains_attached_pose_until_registry_reclaims_authority();
     test_carry_label_is_only_specific_during_carry();

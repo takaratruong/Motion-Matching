@@ -100,23 +100,10 @@ private:
     RuntimeOutput cached_output_{};
 };
 
-class ControllerInteractionAdapter {
-public:
-    Pose apply(
-        const Pose& locomotion_pose,
-        const RuntimeOutput& runtime_output,
-        float dt);
-    void reset();
-
-private:
-    bool owned_last_update_ = false;
-    float blend_seconds_ = 0.0F;
-    Pose blend_source_{};
-};
-
 struct ControllerInteractionFrameState {
-    Pose pose{};
-    bool owns_pose = false;
+    FlatControllerPose pose{};
+    bool runtime_owns_pose = false;
+    bool overrides_locomotion_pose = false;
     bool synchronize_simulation_root = false;
     vec3 simulation_root_position{};
     quat simulation_root_rotation{};
@@ -125,13 +112,18 @@ struct ControllerInteractionFrameState {
 class ControllerInteractionFrameHandoff {
 public:
     ControllerInteractionFrameState apply(
-        const Pose& locomotion_pose,
+        const FlatControllerPose& locomotion_pose,
         const RuntimeOutput& runtime_output,
         float dt);
     void reset();
 
 private:
-    ControllerInteractionAdapter adapter_{};
+    bool runtime_owned_last_update_ = false;
+    bool release_active_ = false;
+    float blend_seconds_ = 0.0F;
+    FlatControllerPose blend_source_{};
+    FlatControllerPose ownership_fallback_{};
+    FlatControllerPose last_rendered_pose_{};
 };
 
 struct ControllerInteractionSceneState {

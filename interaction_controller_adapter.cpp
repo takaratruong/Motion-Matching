@@ -256,8 +256,11 @@ Transform clip_transform(
     return frame_transform(positions, rotations, clip);
 }
 
-Pose blend_pose(const Pose& source, const Pose& target, float alpha) {
-    Pose blended;
+FlatControllerPose blend_flat_pose(
+    const FlatControllerPose& source,
+    const FlatControllerPose& target,
+    float alpha) {
+    FlatControllerPose blended;
     for (size_t bone = 0; bone < blended.positions.size(); ++bone) {
         blended.positions[bone] =
             lerp(source.positions[bone], target.positions[bone], alpha);
@@ -268,14 +271,6 @@ Pose blend_pose(const Pose& source, const Pose& target, float alpha) {
         blended.angular_velocities[bone] = lerp(
             source.angular_velocities[bone],
             target.angular_velocities[bone],
-            alpha);
-    }
-    for (size_t joint = 0; joint < blended.hand_dof.size(); ++joint) {
-        blended.hand_dof[joint] =
-            lerpf(source.hand_dof[joint], target.hand_dof[joint], alpha);
-        blended.hand_dof_velocities[joint] = lerpf(
-            source.hand_dof_velocities[joint],
-            target.hand_dof_velocities[joint],
             alpha);
     }
     blended.foot_contacts =
@@ -425,55 +420,76 @@ const RuntimeOutput& ControllerInteractionScheduler::cached_output() const {
     return cached_output_;
 }
 
-Pose ControllerInteractionAdapter::apply(
-    const Pose& locomotion_pose,
-    const RuntimeOutput& runtime_output,
-    float dt) {
-    if (!runtime_output.owns_pose) {
-        owned_last_update_ = false;
-        blend_seconds_ = 0.0F;
-        return locomotion_pose;
-    }
-
-    if (!owned_last_update_) {
-        blend_source_ = locomotion_pose;
-        blend_seconds_ = 0.0F;
-        owned_last_update_ = true;
-    }
-
-    blend_seconds_ += std::max(dt, 0.0F);
-    if (blend_seconds_ >= kOwnershipBlendSeconds) {
-        return runtime_output.pose;
-    }
-    const float alpha = std::clamp(
-        blend_seconds_ / kOwnershipBlendSeconds, 0.0F, 1.0F);
-    return blend_pose(blend_source_, runtime_output.pose, alpha);
-}
-
-void ControllerInteractionAdapter::reset() {
-    owned_last_update_ = false;
-    blend_seconds_ = 0.0F;
-    blend_source_ = {};
-}
-
 ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
-    const Pose& locomotion_pose,
+    const FlatControllerPose& locomotion_pose,
     const RuntimeOutput& runtime_output,
     float dt) {
     ControllerInteractionFrameState state;
-    state.pose = adapter_.apply(locomotion_pose, runtime_output, dt);
-    state.owns_pose = runtime_output.owns_pose;
-    state.synchronize_simulation_root =
-        runtime_output.owns_pose &&
-        (runtime_output.diagnostics.state != RuntimeState::Carry ||
-         runtime_output.diagnostics.recorded_carry);
-    state.simulation_root_position = state.pose.positions[0];
-    state.simulation_root_rotation = state.pose.rotations[0];
+    state.runtime_owns_pose = runtime_output.owns_pose;
+
+    if (runtime_output.owns_pose) {
+        if (!runtime_owned_last_update_) {
+            blend_source_ =
+                release_active_ ? last_rendered_pose_ : locomotion_pose;
+            ownership_fallback_ = blend_source_;
+            blend_seconds_ = 0.0F;
+            release_active_ = false;
+        }
+        runtime_owned_last_update_ = true;
+
+        const FlatControllerPose target = collapse_interaction_pose(
+            runtime_output.pose, ownership_fallback_);
+        blend_seconds_ += std::max(dt, 0.0F);
+        const float alpha = std::clamp(
+            blend_seconds_ / kOwnershipBlendSeconds, 0.0F, 1.0F);
+        state.pose = alpha >= 1.0F
+            ? target
+            : blend_flat_pose(blend_source_, target, alpha);
+        state.overrides_locomotion_pose = true;
+        state.synchronize_simulation_root =
+            runtime_output.diagnostics.state != RuntimeState::Carry ||
+            runtime_output.diagnostics.recorded_carry;
+        state.simulation_root_position = state.pose.positions[0];
+        state.simulation_root_rotation = state.pose.rotations[0];
+        last_rendered_pose_ = state.pose;
+        return state;
+    }
+
+    if (runtime_owned_last_update_) {
+        runtime_owned_last_update_ = false;
+        release_active_ = true;
+        blend_source_ = last_rendered_pose_;
+        blend_seconds_ = 0.0F;
+    }
+
+    if (release_active_) {
+        const float alpha = std::clamp(
+            blend_seconds_ / kOwnershipBlendSeconds, 0.0F, 1.0F);
+        if (alpha >= 1.0F) {
+            state.pose = locomotion_pose;
+            state.overrides_locomotion_pose = false;
+            release_active_ = false;
+        } else {
+            state.pose = blend_flat_pose(
+                blend_source_, locomotion_pose, alpha);
+            state.overrides_locomotion_pose = true;
+            last_rendered_pose_ = state.pose;
+            blend_seconds_ += std::max(dt, 0.0F);
+        }
+        return state;
+    }
+
+    state.pose = locomotion_pose;
     return state;
 }
 
 void ControllerInteractionFrameHandoff::reset() {
-    adapter_.reset();
+    runtime_owned_last_update_ = false;
+    release_active_ = false;
+    blend_seconds_ = 0.0F;
+    blend_source_ = {};
+    ownership_fallback_ = {};
+    last_rendered_pose_ = {};
 }
 
 ControllerInteractionSceneState ControllerInteractionSceneHandoff::apply(
