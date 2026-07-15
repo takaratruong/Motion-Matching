@@ -1930,6 +1930,211 @@ static void task34_require_capsule_oracle(
           oracle_message);
 }
 
+enum Task34ExactEdgeClamp
+{
+    Task34ExactEdgeLower,
+    Task34ExactEdgeStationary,
+    Task34ExactEdgeUpper
+};
+
+static Task34ExactEdgeClamp task34_classify_exact_edge_clamp(
+    long double first_x,
+    long double first_y,
+    long double first_z,
+    long double second_x,
+    long double second_y,
+    long double second_z,
+    long double radius)
+{
+    const long double dx = second_x - first_x;
+    const long double dz = second_z - first_z;
+    const long double length = std::sqrt(dx * dx + dz * dz);
+    check(length > 0.0L,
+          "exact edge-clamp classifier requires projected length");
+    const long double direction_x = dx / length;
+    const long double direction_z = dz / length;
+    const long double s0 =
+        first_x * direction_x + first_z * direction_z;
+    const long double s1 = s0 + length;
+    const long double cross = first_x * dz - first_z * dx;
+    const long double q_square =
+        (cross * cross) / (length * length);
+    check(q_square <= radius * radius,
+          "exact edge-clamp fixture intersects the projected disk");
+    const long double line_radius =
+        std::sqrt(radius * radius - q_square);
+    const long double slope = (second_y - first_y) / length;
+    const long double stationary =
+        -slope * line_radius / std::sqrt(1.0L + slope * slope);
+    const long double lower = s0 > -line_radius ? s0 : -line_radius;
+    const long double upper = s1 < line_radius ? s1 : line_radius;
+    check(lower <= upper,
+          "exact edge-clamp fixture has a nonempty clipped interval");
+    if (stationary < lower) {
+        return Task34ExactEdgeLower;
+    }
+    if (stationary > upper) {
+        return Task34ExactEdgeUpper;
+    }
+    return Task34ExactEdgeStationary;
+}
+
+static bool task34_long_double_near(
+    long double left,
+    long double right,
+    long double tolerance)
+{
+    return std::fabs(left - right) <= tolerance;
+}
+
+static void task34_require_public_witness_enclosure(
+    const heightfield& field,
+    vec3 canonical_endpoint_0,
+    vec3 canonical_endpoint_1,
+    float radius,
+    const G1ClearanceResult& result)
+{
+    const G1ClearanceWitness& witness = result.witness;
+    check(witness.cell_x >= 0 && witness.cell_x + 1 < field.nx &&
+              witness.cell_z >= 0 && witness.cell_z + 1 < field.nz &&
+              witness.terrain_triangle_index <= 1,
+          "public witness key selects a valid fixed-diagonal triangle");
+
+    const int x0_index = witness.cell_x;
+    const int x1_index = witness.cell_x + 1;
+    const int z0_index = witness.cell_z;
+    const int z1_index = witness.cell_z + 1;
+    const long double origin_x =
+        static_cast<long double>(field.origin_x);
+    const long double origin_z =
+        static_cast<long double>(field.origin_z);
+    const long double cell =
+        static_cast<long double>(field.cell_size);
+    const long double x0 = origin_x +
+        static_cast<long double>(x0_index) * cell;
+    const long double x1 = origin_x +
+        static_cast<long double>(x1_index) * cell;
+    const long double z0 = origin_z +
+        static_cast<long double>(z0_index) * cell;
+    const long double z1 = origin_z +
+        static_cast<long double>(z1_index) * cell;
+    const long double h00 = static_cast<long double>(
+        field.heights(x0_index + z0_index * field.nx));
+    const long double h10 = static_cast<long double>(
+        field.heights(x1_index + z0_index * field.nx));
+    const long double h01 = static_cast<long double>(
+        field.heights(x0_index + z1_index * field.nx));
+    const long double h11 = static_cast<long double>(
+        field.heights(x1_index + z1_index * field.nx));
+
+    long double triangle_x[3] = {};
+    long double triangle_y[3] = {};
+    long double triangle_z[3] = {};
+    if (witness.terrain_triangle_index == 0) {
+        triangle_x[0] = x0;
+        triangle_y[0] = h00;
+        triangle_z[0] = z0;
+        triangle_x[1] = x1;
+        triangle_y[1] = h10;
+        triangle_z[1] = z0;
+        triangle_x[2] = x1;
+        triangle_y[2] = h11;
+        triangle_z[2] = z1;
+    } else {
+        triangle_x[0] = x0;
+        triangle_y[0] = h00;
+        triangle_z[0] = z0;
+        triangle_x[1] = x1;
+        triangle_y[1] = h11;
+        triangle_z[1] = z1;
+        triangle_x[2] = x0;
+        triangle_y[2] = h01;
+        triangle_z[2] = z1;
+    }
+
+    const long double weights[3] = {
+        static_cast<long double>(witness.terrain_weight_0),
+        static_cast<long double>(witness.terrain_weight_1),
+        static_cast<long double>(witness.terrain_weight_2)
+    };
+    const long double t =
+        static_cast<long double>(witness.segment_parameter);
+    check(t >= 0.0L && t <= 1.0L &&
+              weights[0] >= 0.0L &&
+              weights[1] >= 0.0L &&
+              weights[2] >= 0.0L,
+          "public solver witness diagnostics are parameter-feasible");
+    const long double sum = weights[0] + weights[1] + weights[2];
+    check(task34_long_double_near(sum, 1.0L, 0x1p-48L),
+          "public solver witness weights reconstruct a unit barycentric sum");
+
+    long double surface_x = 0.0L;
+    long double surface_y = 0.0L;
+    long double surface_z = 0.0L;
+    for (int index = 0; index < 3; ++index) {
+        surface_x += weights[index] * triangle_x[index];
+        surface_y += weights[index] * triangle_y[index];
+        surface_z += weights[index] * triangle_z[index];
+    }
+    const long double one_minus_t = 1.0L - t;
+    const long double center_x =
+        one_minus_t * static_cast<long double>(canonical_endpoint_0.x) +
+        t * static_cast<long double>(canonical_endpoint_1.x);
+    const long double center_y =
+        one_minus_t * static_cast<long double>(canonical_endpoint_0.y) +
+        t * static_cast<long double>(canonical_endpoint_1.y);
+    const long double center_z =
+        one_minus_t * static_cast<long double>(canonical_endpoint_0.z) +
+        t * static_cast<long double>(canonical_endpoint_1.z);
+    const long double coordinate_tolerance = 0x1p-46L;
+    check(task34_long_double_near(
+              static_cast<long double>(witness.surface_x),
+              surface_x, coordinate_tolerance) &&
+          task34_long_double_near(
+              static_cast<long double>(witness.surface_y),
+              surface_y, coordinate_tolerance) &&
+          task34_long_double_near(
+              static_cast<long double>(witness.surface_z),
+              surface_z, coordinate_tolerance),
+          "public witness surface reconstructs from its fixed triangle and weights");
+    check(double_bits(witness.body_x) ==
+              double_bits(witness.surface_x) &&
+          double_bits(witness.body_z) ==
+              double_bits(witness.surface_z),
+          "public witness body and surface share identical XZ bits");
+
+    const long double dx = surface_x - center_x;
+    const long double dz = surface_z - center_z;
+    const long double dy =
+        static_cast<long double>(witness.body_y) - center_y;
+    const long double radius_ld = static_cast<long double>(radius);
+    const long double radius_square = radius_ld * radius_ld;
+    const long double rho_square = dx * dx + dz * dz;
+    const long double feasibility_tolerance = 0x1p-46L;
+    check(rho_square <= radius_square + feasibility_tolerance &&
+              rho_square + dy * dy <=
+                  radius_square + feasibility_tolerance,
+          "independent reconstruction places the witness inside the capsule ball");
+    const long double exact_vertical = std::sqrt(
+        radius_square - (rho_square < radius_square
+            ? rho_square
+            : radius_square));
+    const long double reconstructed_objective =
+        center_y - surface_y - exact_vertical;
+    const long double diagnostic_objective =
+        static_cast<long double>(witness.body_y) - surface_y;
+    const long double lower =
+        static_cast<long double>(result.lower_bound_m);
+    const long double upper =
+        static_cast<long double>(result.witness_upper_m);
+    check(lower <= reconstructed_objective + feasibility_tolerance &&
+              reconstructed_objective <= upper + feasibility_tolerance &&
+              diagnostic_objective <= upper + feasibility_tolerance,
+          "independent witness objective lies inside the public certificate");
+    check(upper - diagnostic_objective <= 0x1p-38L,
+          "public witness upper tightly outward-encloses its diagnostic objective");
+}
+
 static void test_task34_fixed_diagonal_and_rank_cases()
 {
     heightfield diagonal;
@@ -1984,6 +2189,14 @@ static void test_task34_fixed_diagonal_and_rank_cases()
                       diagonal_output.lower_bound_m <=
                   G1ClearanceMaximumCertificateWidthM,
           "fixed-diagonal constrained-edge certificate encloses r*sqrt(51)");
+    check(diagonal_output.witness.primitive_index == 0 &&
+              diagonal_output.witness.cell_x == 0 &&
+              diagonal_output.witness.cell_z == 0 &&
+              diagonal_output.witness.terrain_triangle_index == 0 &&
+              diagonal_output.witness.patch_index == 7 &&
+              diagonal_output.witness.candidate_kind == 1 &&
+              diagonal_output.witness.candidate_subindex == 3,
+          "fixed-diagonal fixture pins the public stationary-edge key");
 
     heightfield clamp;
     point_make_field(clamp, 3, 3, 0.0f, 0.0f, 1.0f);
@@ -1994,15 +2207,36 @@ static void test_task34_fixed_diagonal_and_rank_cases()
               vec3(1.0f, 2.0f, 1.0f), 0.25f,
               NULL, 0) == G1ClearanceOk,
           "edge stationary/below/above clamp fixture must certify");
+    const G1ClearanceWork expected_clamp_work = {0, 4, 8, 64, 256, 0};
     check(clamp_output.lower_bound_m <= 0.75 &&
               0.75 <= clamp_output.witness_upper_m &&
+              double_bits(clamp_output.lower_bound_m) ==
+                  UINT64_C(0x3fe7ffffbfffffc5) &&
+              double_bits(clamp_output.witness_upper_m) ==
+                  UINT64_C(0x3fe800000000000b) &&
               clamp_output.witness.cell_x == 0 &&
               clamp_output.witness.cell_z == 0 &&
               clamp_output.witness.terrain_triangle_index == 0 &&
               clamp_output.witness.patch_index == 0 &&
               clamp_output.witness.candidate_kind == 1 &&
-              clamp_output.witness.candidate_subindex == 5,
+              clamp_output.witness.candidate_subindex == 5 &&
+              clearance_work_same(
+                  clamp_output.work, expected_clamp_work),
           "edge clamp fixture selects the stable upper-endpoint edge key");
+    check(task34_classify_exact_edge_clamp(
+              0.0L, 2.0L, 1.0L,
+              0.0L, 1.0L, 0.0L,
+              0.25L) == Task34ExactEdgeUpper,
+          "apex edge 1 independently exercises the upper clamp outcome");
+    check(task34_classify_exact_edge_clamp(
+              0.0L, 1.0L, 0.0L,
+              1.0L, 2.0L, 1.0L,
+              0.25L) == Task34ExactEdgeLower,
+          "apex edge 2 independently exercises the lower clamp outcome");
+    // Both edge outcomes meet at T0 vertex 2.  The public key must name the
+    // earlier upper endpoint (subindex 5), not the tied lower endpoint
+    // (subindex 7); a public local-1 winner is therefore neither expected nor
+    // manufactured by weakening the stable key order.
 
     heightfield flat;
     point_make_field(flat, 9, 9, 0.0f, 0.0f, 0.25f);
@@ -2067,6 +2301,126 @@ static void test_task34_fixed_diagonal_and_rank_cases()
     check(tangent.lower_bound_m <= tangent_oracle &&
               tangent_oracle <= tangent.witness_upper_m,
           "exact disk tangency does not discard the flat-plane minimum");
+}
+
+static void test_task34_membership_uncertainty_and_witness_enclosure()
+{
+    heightfield field;
+    point_make_field(field, 3, 3, 0.0f, 0.0f, 1.0f);
+    const vec3 center(0.5f, 2.0f, 0.5f);
+    const float radius = 0.25f;
+
+    // On flat T0 the stationary terrain point is (0.5,0.5), with exact
+    // barycentrics (0.5,0,0.5).  The zero weight lies on the fixed diagonal,
+    // so membership must retain equality conservatively instead of mapping
+    // the face to outside.
+    G1ClearanceBudget zero_subdivision = g1_pose_clearance_budget();
+    zero_subdivision.maximum_subdivision_nodes = 0;
+    G1ClearanceResult bounded = seeded_result(192.0);
+    check(g1_sphere_clearance(
+              bounded, zero_subdivision, field,
+              center, radius, NULL, 0) == G1ClearanceOk,
+          "membership-straddling face closes conservatively without child work");
+    check(double_bits(bounded.lower_bound_m) ==
+              UINT64_C(0x3ffbfffffffffff5) &&
+          double_bits(bounded.witness_upper_m) ==
+              UINT64_C(0x3ffc00000000000b) &&
+          bounded.witness.primitive_index == 0 &&
+          bounded.witness.cell_x == 0 &&
+          bounded.witness.cell_z == 0 &&
+          bounded.witness.terrain_triangle_index == 0 &&
+          bounded.witness.patch_index == 0 &&
+          bounded.witness.candidate_kind == 0 &&
+          bounded.witness.candidate_subindex == 0,
+          "membership-straddling face pins its conservative certificate and key");
+    const G1ClearanceWork expected_work = {0, 1, 2, 16, 64, 0};
+    check(clearance_work_same(bounded.work, expected_work) &&
+              double_bits(bounded.witness.segment_parameter) ==
+                  UINT64_C(0x0000000000000000) &&
+              double_bits(bounded.witness.terrain_weight_0) ==
+                  UINT64_C(0x3fe0000000000000) &&
+              double_bits(bounded.witness.terrain_weight_1) ==
+                  UINT64_C(0x0000000000000000) &&
+              double_bits(bounded.witness.terrain_weight_2) ==
+                  UINT64_C(0x3fe0000000000000),
+          "membership-straddling face exposes exact public feasibility diagnostics");
+    const long double exact_oracle = 1.75L;
+    check(static_cast<long double>(bounded.lower_bound_m) <= exact_oracle &&
+              exact_oracle <=
+                  static_cast<long double>(bounded.witness_upper_m),
+          "membership-straddling face encloses its independent flat oracle");
+    task34_require_public_witness_enclosure(
+        field, center, center, radius, bounded);
+
+    G1ClearanceResult default_budget = seeded_result(193.0);
+    check(g1_sphere_clearance(
+              default_budget, g1_pose_clearance_budget(), field,
+              center, radius, NULL, 0) == G1ClearanceOk &&
+          clearance_result_same(bounded, default_budget),
+          "membership conservative mapping is bit-identical across node caps");
+
+    // Raising only Y preserves this exact projected membership boundary while
+    // widening its absolute binary64 enclosure.  With no subdivision nodes,
+    // the conservative uncertain-face mapping must reach the bounded fallback
+    // and fail transactionally there.  Incorrectly treating uncertainty as
+    // inside instead reaches the distinct analytic-width failure path.
+    G1ClearanceResult routed = seeded_result(196.0);
+    const ByteSnapshot<G1ClearanceResult> routed_before(routed);
+    char routed_error[128] = {};
+    check(g1_sphere_clearance(
+              routed, zero_subdivision, field,
+              vec3(0.5f,
+                   float_from_bits(UINT32_C(0x4e000000)),
+                   0.5f),
+              radius, routed_error,
+              static_cast<int>(sizeof(routed_error))) ==
+              G1ClearanceUncertified,
+          "membership uncertainty with a wide enclosure fails closed");
+    check(routed_before.same(routed) &&
+              std::strcmp(
+                  routed_error,
+                  "G1 capsule subdivision cap exhausted") == 0,
+          "membership uncertainty publicly routes through bounded fallback");
+}
+
+static void test_task34_exact_zero_objective_tie_characterization()
+{
+    heightfield field;
+    point_make_field(field, 5, 5, 0.0f, 0.0f, 0.25f);
+    const vec3 endpoint_a(0.5f, 0.125f, 0.5f);
+    const vec3 endpoint_b(0.75f, 0.125f, 0.5f);
+    const float radius = 0.125f;
+    G1ClearanceResult forward = seeded_result(194.0);
+    G1ClearanceResult reverse = seeded_result(195.0);
+    check(g1_capsule_clearance(
+              forward, g1_pose_clearance_budget(), field,
+              endpoint_a, endpoint_b, radius, NULL, 0) ==
+              G1ClearanceOk &&
+          g1_capsule_clearance(
+              reverse, g1_pose_clearance_budget(), field,
+              endpoint_b, endpoint_a, radius, NULL, 0) ==
+              G1ClearanceOk &&
+          clearance_result_same(forward, reverse),
+          "exact-zero capsule objective remains bit-identical under reversal");
+    check(double_bits(forward.lower_bound_m) ==
+              UINT64_C(0xbcbe000000000002) &&
+          double_bits(forward.witness_upper_m) ==
+              UINT64_C(0x3ca8000000000001) &&
+          forward.witness.cell_x == 1 &&
+          forward.witness.cell_z == 1 &&
+          forward.witness.terrain_triangle_index == 0 &&
+          forward.witness.patch_index == 0 &&
+          forward.witness.candidate_kind == 0 &&
+          forward.witness.candidate_subindex == 0,
+          "exact-zero objective pins its stable outward value and complete key");
+    check(forward.witness_upper_m > 0.0 &&
+              !std::signbit(forward.witness_upper_m),
+          "reachable exact-zero objective expands to positive nonzero binary64");
+    // This is the focused public signed-zero characterization: outward
+    // witness construction makes the exact-zero objective nonzero before
+    // aggregation, so +0/-0 objective bits are not reached by this canonical
+    // tie fixture.  Tie comparisons still must implement the design's
+    // identical-bit rule rather than relying on numeric equality.
 }
 
 static void task34_set_coordinate(
@@ -2816,6 +3170,36 @@ static void test_task34_sphere_capsule_output_guards()
           "mandatory-guard failures preserve sphere/capsule outputs");
 }
 
+static void task34_make_kind2_winner_fixture(
+    heightfield& field,
+    vec3& endpoint_a,
+    vec3& endpoint_b,
+    float& radius)
+{
+    point_make_field(
+        field, 3, 3, 0.0f, 0.0f,
+        float_from_bits(UINT32_C(0x3e800000)));
+    const uint32_t height_bits[] = {
+        UINT32_C(0x3f200000), UINT32_C(0x3f200000),
+        UINT32_C(0xbf700000), UINT32_C(0xbe000000),
+        UINT32_C(0xbf300000), UINT32_C(0x3f200000),
+        UINT32_C(0x3e400000), UINT32_C(0x3ee00000),
+        UINT32_C(0xbee00000)
+    };
+    for (int index = 0; index < 9; ++index) {
+        field.heights(index) = float_from_bits(height_bits[index]);
+    }
+    endpoint_a = vec3(
+        float_from_bits(UINT32_C(0x3d800000)),
+        float_from_bits(UINT32_C(0x40140000)),
+        float_from_bits(UINT32_C(0x3e200000)));
+    endpoint_b = vec3(
+        float_from_bits(UINT32_C(0x3e800000)),
+        float_from_bits(UINT32_C(0x3ee00000)),
+        float_from_bits(UINT32_C(0x3d800000)));
+    radius = float_from_bits(UINT32_C(0x3d800000));
+}
+
 static void test_task34_exact_dyadic_fallback()
 {
     heightfield field;
@@ -2903,6 +3287,79 @@ static void test_task34_exact_dyadic_fallback()
           "odd cap below the atomic 38-child work fails closed");
     check(short_before.same(short_output),
           "one-child-short fallback cap preserves capsule output");
+}
+
+static void test_task34_public_kind2_winner()
+{
+    heightfield field;
+    vec3 endpoint_a;
+    vec3 endpoint_b;
+    float radius = 0.0f;
+    task34_make_kind2_winner_fixture(
+        field, endpoint_a, endpoint_b, radius);
+
+    G1ClearanceResult forward = seeded_result(261.0);
+    G1ClearanceResult reverse = seeded_result(263.0);
+    check(g1_capsule_clearance(
+              forward, g1_pose_clearance_budget(), field,
+              endpoint_a, endpoint_b, radius,
+              NULL, 0) == G1ClearanceOk &&
+          g1_capsule_clearance(
+              reverse, g1_pose_clearance_budget(), field,
+              endpoint_b, endpoint_a, radius,
+              NULL, 0) == G1ClearanceOk &&
+          clearance_result_same(forward, reverse),
+          "public kind-2 winner is bit-identical under endpoint reversal");
+    check(double_bits(forward.lower_bound_m) ==
+              UINT64_C(0xbfcda82ffb3e5db8) &&
+          double_bits(forward.witness_upper_m) ==
+              UINT64_C(0xbfcda827999fceea) &&
+          forward.witness.primitive_index == 0 &&
+          forward.witness.cell_x == 1 &&
+          forward.witness.cell_z == 0 &&
+          forward.witness.terrain_triangle_index == 1 &&
+          forward.witness.patch_index == 3 &&
+          forward.witness.candidate_kind == 2 &&
+          forward.witness.candidate_subindex == 35,
+          "public kind-2 winner pins bounds and immutable creation ordinal key");
+    const G1ClearanceWork expected_work = {
+        0, 2, 4, 32, 128, 5622
+    };
+    check(clearance_work_same(forward.work, expected_work),
+          "public kind-2 winner pins deterministic fallback work");
+    check(double_bits(forward.witness.body_x) ==
+              UINT64_C(0x3fd2000000000000) &&
+          double_bits(forward.witness.body_y) ==
+              UINT64_C(0x3fd92bec33301888) &&
+          double_bits(forward.witness.body_z) ==
+              UINT64_C(0x3fa0000000000000) &&
+          double_bits(forward.witness.surface_x) ==
+              UINT64_C(0x3fd2000000000000) &&
+          double_bits(forward.witness.surface_y) ==
+              UINT64_C(0x3fe4000000000000) &&
+          double_bits(forward.witness.surface_z) ==
+              UINT64_C(0x3fa0000000000000) &&
+          double_bits(forward.witness.segment_parameter) ==
+              UINT64_C(0x3ff0000000000000) &&
+          double_bits(forward.witness.terrain_weight_0) ==
+              UINT64_C(0x3fec000000000000) &&
+          double_bits(forward.witness.terrain_weight_1) ==
+              UINT64_C(0x3fc0000000000000) &&
+          double_bits(forward.witness.terrain_weight_2) ==
+              UINT64_C(0x0000000000000000),
+          "public kind-2 winner pins complete dyadic witness diagnostics");
+
+    const long double radius_ld = static_cast<long double>(radius);
+    const long double oracle =
+        0.4375L - 0.625L -
+        std::sqrt(radius_ld * radius_ld -
+                  2.0L * 0.03125L * 0.03125L);
+    check(static_cast<long double>(forward.lower_bound_m) <= oracle &&
+              oracle <=
+                  static_cast<long double>(forward.witness_upper_m),
+          "public kind-2 winner encloses its independently reconstructed oracle");
+    task34_require_public_witness_enclosure(
+        field, endpoint_a, endpoint_b, radius, forward);
 }
 
 class RoundingModeGuard
@@ -3429,6 +3886,16 @@ static int run_task34_combined_parity_mode()
              float_from_bits(UINT32_C(0x3fc80000)),
              float_from_bits(UINT32_C(0x3e4e0000))),
         float_from_bits(UINT32_C(0x3dc00000)), true);
+
+    heightfield kind2;
+    vec3 kind2_a;
+    vec3 kind2_b;
+    float kind2_radius = 0.0f;
+    task34_make_kind2_winner_fixture(
+        kind2, kind2_a, kind2_b, kind2_radius);
+    task34_parity_emit(
+        "kind2", kind2,
+        kind2_a, kind2_b, kind2_radius, true);
     return 0;
 }
 
@@ -3455,6 +3922,8 @@ int main(int argc, char** argv)
     if (argc == 2 &&
         std::strcmp(argv[1], "--task34-geometry") == 0) {
         test_task34_fixed_diagonal_and_rank_cases();
+        test_task34_membership_uncertainty_and_witness_enclosure();
+        test_task34_exact_zero_objective_tie_characterization();
         return 0;
     }
     if (argc == 2 &&
@@ -3481,6 +3950,7 @@ int main(int argc, char** argv)
     if (argc == 2 &&
         std::strcmp(argv[1], "--task34-fallback") == 0) {
         test_task34_exact_dyadic_fallback();
+        test_task34_public_kind2_winner();
         return 0;
     }
     test_normal_arithmetic_environment();
@@ -3500,12 +3970,15 @@ int main(int argc, char** argv)
     test_task34_finite_capsule_plane_and_reversal();
     test_task34_footprint_domain_budget_and_transaction();
     test_task34_fixed_diagonal_and_rank_cases();
+    test_task34_membership_uncertainty_and_witness_enclosure();
+    test_task34_exact_zero_objective_tie_characterization();
     test_task34_input_field_and_exterior_matrix();
     test_task34_domain_and_malformed_height_matrix();
     test_task34_rectangular_count_preflights();
     test_task34_named_tent_sign_reversal();
     test_task34_sphere_capsule_output_guards();
     test_task34_exact_dyadic_fallback();
+    test_task34_public_kind2_winner();
     test_arithmetic_environment_rejection_and_restoration();
     return 0;
 }

@@ -1564,6 +1564,17 @@ static bool g1_clearance_witness_key_less(
     return left.candidate_subindex < right.candidate_subindex;
 }
 
+static bool g1_clearance_binary64_bits_equal(
+    double left,
+    double right)
+{
+    uint64_t left_bits = 0;
+    uint64_t right_bits = 0;
+    std::memcpy(&left_bits, &left, sizeof(left_bits));
+    std::memcpy(&right_bits, &right, sizeof(right_bits));
+    return left_bits == right_bits;
+}
+
 static bool g1_clearance_patch_combination(
     const G1CapsulePatch& patch,
     const double homogeneous[3],
@@ -1797,7 +1808,8 @@ static void g1_clearance_patch_update_witness(
 {
     if (!result.has_witness ||
         candidate.upper < result.witness.upper ||
-        (candidate.upper == result.witness.upper &&
+        (g1_clearance_binary64_bits_equal(
+             candidate.upper, result.witness.upper) &&
          g1_clearance_witness_key_less(
              candidate.witness, result.witness.witness))) {
         result.has_witness = true;
@@ -2887,7 +2899,8 @@ static bool g1_clearance_fallback_try_witnesses(
                 radius, primitive_index, 2,
                 node.creation_ordinal, witness) &&
             (!has_witness || witness.upper < best_witness.upper ||
-             (witness.upper == best_witness.upper &&
+             (g1_clearance_binary64_bits_equal(
+                  witness.upper, best_witness.upper) &&
               g1_clearance_witness_key_less(
                   witness.witness, best_witness.witness)))) {
             has_witness = true;
@@ -3603,8 +3616,9 @@ static G1ClearanceStatus g1_clearance_capsule_core(
                         (!has_witness ||
                          patch_result.witness.upper <
                              global_witness.upper ||
-                         (patch_result.witness.upper ==
-                              global_witness.upper &&
+                         (g1_clearance_binary64_bits_equal(
+                              patch_result.witness.upper,
+                              global_witness.upper) &&
                           g1_clearance_witness_key_less(
                               patch_result.witness.witness,
                               global_witness.witness)))) {
@@ -3638,7 +3652,9 @@ static G1ClearanceStatus g1_clearance_capsule_core(
         if (has_witness &&
             (!fallback_seed.has_witness ||
              global_witness.upper < fallback_seed.witness.upper ||
-             (global_witness.upper == fallback_seed.witness.upper &&
+             (g1_clearance_binary64_bits_equal(
+                  global_witness.upper,
+                  fallback_seed.witness.upper) &&
               g1_clearance_witness_key_less(
                   global_witness.witness,
                   fallback_seed.witness.witness)))) {
@@ -3712,7 +3728,9 @@ static G1ClearanceStatus g1_clearance_capsule_core(
         if (patch_result.has_witness &&
             (!has_witness ||
              patch_result.witness.upper < global_witness.upper ||
-             (patch_result.witness.upper == global_witness.upper &&
+             (g1_clearance_binary64_bits_equal(
+                  patch_result.witness.upper,
+                  global_witness.upper) &&
               g1_clearance_witness_key_less(
                   patch_result.witness.witness,
                   global_witness.witness)))) {
