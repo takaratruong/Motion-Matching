@@ -440,8 +440,9 @@ def _region(region_id, bounds):
 
 def _corridor_definition(
     scene_id, label, surface, course_end_z, parameters, route,
-    walkability_class,
+    walkability_class, extra_routes=(),
 ):
+    extra_routes = tuple(extra_routes)
     heightfield_end_z = _runtime_f32_upper_ceiling(
         course_end_z + LOOKAHEAD_MARGIN, "heightfield zmax")
     core_playable = (
@@ -499,7 +500,7 @@ def _corridor_definition(
         spawn_position=(0.0, 0.0, 0.0),
         spawn_yaw_radians=0.0,
         regions=regions,
-        routes=(route,),
+        routes=(route,) + extra_routes,
         walkability=walkability,
     )
 
@@ -565,9 +566,24 @@ def _stair_definition(scene_id, label, rises, runs, unseen):
          (0.0, course_end)),
         "traverse", 1, 2.0,
     )
+    extra_routes = ()
+    if scene_id == "stairs-shallow":
+        extra_routes = (
+            SceneRoute(
+                "flat-positive-z", ((0.0, 0.0), (0.0, 1.0)),
+                "traverse", 1, 0.0),
+            SceneRoute(
+                "flat-positive-x", ((0.0, 0.0), (1.0, 0.0)),
+                "traverse", 1, 0.0),
+        )
+    elif scene_id == "stairs-standard":
+        extra_routes = (SceneRoute(
+            "landing-side-exit-stress",
+            ((0.0, 0.0), (0.0, 1.75), (0.0, 3.96), (0.0, 5.53)),
+            "traverse", 1, 0.0),)
     return _corridor_definition(
         scene_id, label, LongitudinalProfileSurface(profile),
-        course_end, parameters, route, 1)
+        course_end, parameters, route, 1, extra_routes)
 
 
 def _ramp_profile(angle_degrees):
@@ -713,7 +729,12 @@ def _mixed_definition():
         LongitudinalProfileSurface(profile), course_end, parameters,
         SceneRoute(
             "full-course", tuple(route_points), "traverse", 1, 2.0),
-        1)
+        1,
+        (SceneRoute(
+            "tangent-level-boundary",
+            ((0.0, 0.0), (0.62, 2.0), (0.62, 6.0)),
+            "traverse", 1, 0.0,
+        ),))
 
 
 def _blocked_definition():

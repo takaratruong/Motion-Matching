@@ -166,22 +166,43 @@ EXPECTED_ROUTE_IDS = {
     "grail-curb-low": ("curb-forward",),
     "grail-curb-medium": ("curb-forward",),
     "grail-curb-high": ("curb-forward",),
-    "stairs-shallow": ("ascent-landing-descent",),
-    "stairs-standard": ("ascent-landing-descent",),
+    "stairs-shallow": (
+        "ascent-landing-descent", "flat-positive-z", "flat-positive-x"),
+    "stairs-standard": (
+        "ascent-landing-descent", "landing-side-exit-stress"),
     "stairs-unseen-variable": ("ascent-landing-descent",),
     "ramp-05-up-down": ("up-landing-down",),
     "ramp-10-up-down": ("up-landing-down",),
     "ramp-15-stress": ("up-landing-down",),
     "cross-slope-05": ("forward-cross-slope",),
     "cross-slope-10": ("forward-cross-slope",),
-    "mixed-multilevel": ("full-course",),
+    "mixed-multilevel": ("full-course", "tangent-level-boundary"),
     "blocked-course": ("wall-safe-stop", "ramp-safe-stop"),
 }
 EXPECTED_WAYPOINT_COUNTS = {
     scene_id: (5,) for scene_id in LOCKED_SCENE_IDS
 }
-EXPECTED_WAYPOINT_COUNTS["mixed-multilevel"] = (8,)
+EXPECTED_WAYPOINT_COUNTS["stairs-shallow"] = (5, 2, 2)
+EXPECTED_WAYPOINT_COUNTS["stairs-standard"] = (5, 4)
+EXPECTED_WAYPOINT_COUNTS["mixed-multilevel"] = (8, 3)
 EXPECTED_WAYPOINT_COUNTS["blocked-course"] = (3, 3)
+EXPECTED_ADDED_ROUTE_BITS = {
+    ("stairs-shallow", "flat-positive-z"): (
+        (0x00000000, 0x00000000),
+        (0x00000000, 0x3f800000)),
+    ("stairs-shallow", "flat-positive-x"): (
+        (0x00000000, 0x00000000),
+        (0x3f800000, 0x00000000)),
+    ("stairs-standard", "landing-side-exit-stress"): (
+        (0x00000000, 0x00000000),
+        (0x00000000, 0x3fe00000),
+        (0x00000000, 0x407d70a4),
+        (0x00000000, 0x40b0f5c3)),
+    ("mixed-multilevel", "tangent-level-boundary"): (
+        (0x00000000, 0x00000000),
+        (0x3f1eb852, 0x40000000),
+        (0x3f1eb852, 0x40c00000)),
+}
 G1_SKELETON_NAMES = (
     "Simulation", "Hips",
     "LeftHipPitch", "LeftHipRoll", "LeftHipYaw", "LeftKnee",
@@ -2183,6 +2204,20 @@ def _validate_scene(
     for route in routes:
         points = _validate_route(route, grid, walkability, lookahead)
         route_ids.append(route["id"])
+        expected_bits = EXPECTED_ADDED_ROUTE_BITS.get(
+            (scene_id, route["id"]))
+        if expected_bits is not None:
+            observed_bits = tuple(
+                tuple(struct.unpack("<I", struct.pack("<f", component))[0]
+                      for component in point)
+                for point in points
+            )
+            hold_bits = struct.unpack(
+                "<I", struct.pack("<f", route["landing_hold_seconds"]))[0]
+            _require(observed_bits == expected_bits,
+                     f"{scene_id}: added route waypoint bits changed")
+            _require(hold_bits == 0x00000000,
+                     f"{scene_id}: added route hold is not positive zero")
         _require(points[0] == (position[0], position[2]),
                  f"{scene_id}: route does not start at scene spawn")
         if (provenance["kind"] == "procedural"

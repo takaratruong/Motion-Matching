@@ -1483,28 +1483,68 @@ static inline bool scene_metadata_parse(
         candidate.routes.push_back(route);
     }
     static const int route_counts[14] = {
-        1,1,1,1,1,1,1,1,1,1,1,1,1,2};
+        1,1,1,1,3,2,1,1,1,1,1,1,2,2};
+    static const uint32_t flat_positive_z_waypoint_bits[][2] = {
+        {UINT32_C(0x00000000), UINT32_C(0x00000000)},
+        {UINT32_C(0x00000000), UINT32_C(0x3f800000)},
+    };
+    static const uint32_t flat_positive_x_waypoint_bits[][2] = {
+        {UINT32_C(0x00000000), UINT32_C(0x00000000)},
+        {UINT32_C(0x3f800000), UINT32_C(0x00000000)},
+    };
+    static const uint32_t landing_side_exit_stress_waypoint_bits[][2] = {
+        {UINT32_C(0x00000000), UINT32_C(0x00000000)},
+        {UINT32_C(0x00000000), UINT32_C(0x3fe00000)},
+        {UINT32_C(0x00000000), UINT32_C(0x407d70a4)},
+        {UINT32_C(0x00000000), UINT32_C(0x40b0f5c3)},
+    };
+    static const uint32_t tangent_level_boundary_waypoint_bits[][2] = {
+        {UINT32_C(0x00000000), UINT32_C(0x00000000)},
+        {UINT32_C(0x3f1eb852), UINT32_C(0x40000000)},
+        {UINT32_C(0x3f1eb852), UINT32_C(0x40c00000)},
+    };
     struct route_contract {
         const char* id;
         const char* outcome;
         int classification;
+        const uint32_t (*waypoint_bit_contract)[2];
+        size_t waypoint_count;
+        uint32_t landing_hold_bits;
     };
-    static const route_contract expected_routes[14][2] = {
-        {{"curb-forward","traverse-or-safe-stop",2},{NULL,NULL,-1}},
-        {{"curb-forward","traverse",1},{NULL,NULL,-1}},
-        {{"curb-forward","traverse-or-safe-stop",2},{NULL,NULL,-1}},
-        {{"curb-forward","traverse-or-safe-stop",2},{NULL,NULL,-1}},
-        {{"ascent-landing-descent","traverse",1},{NULL,NULL,-1}},
-        {{"ascent-landing-descent","traverse",1},{NULL,NULL,-1}},
-        {{"ascent-landing-descent","traverse",1},{NULL,NULL,-1}},
-        {{"up-landing-down","traverse",1},{NULL,NULL,-1}},
-        {{"up-landing-down","traverse",1},{NULL,NULL,-1}},
-        {{"up-landing-down","traverse-or-safe-stop",2},{NULL,NULL,-1}},
-        {{"forward-cross-slope","traverse",1},{NULL,NULL,-1}},
-        {{"forward-cross-slope","traverse",1},{NULL,NULL,-1}},
-        {{"full-course","traverse",1},{NULL,NULL,-1}},
-        {{"wall-safe-stop","safe-stop",0},
-         {"ramp-safe-stop","safe-stop",0}},
+    static const route_contract expected_routes[14][3] = {
+        {{"curb-forward","traverse-or-safe-stop",2,NULL,0,0}},
+        {{"curb-forward","traverse",1,NULL,0,0}},
+        {{"curb-forward","traverse-or-safe-stop",2,NULL,0,0}},
+        {{"curb-forward","traverse-or-safe-stop",2,NULL,0,0}},
+        {
+            {"ascent-landing-descent","traverse",1,NULL,0,0},
+            {"flat-positive-z","traverse",1,
+             flat_positive_z_waypoint_bits,2,UINT32_C(0x00000000)},
+            {"flat-positive-x","traverse",1,
+             flat_positive_x_waypoint_bits,2,UINT32_C(0x00000000)},
+        },
+        {
+            {"ascent-landing-descent","traverse",1,NULL,0,0},
+            {"landing-side-exit-stress","traverse",1,
+             landing_side_exit_stress_waypoint_bits,4,
+             UINT32_C(0x00000000)},
+        },
+        {{"ascent-landing-descent","traverse",1,NULL,0,0}},
+        {{"up-landing-down","traverse",1,NULL,0,0}},
+        {{"up-landing-down","traverse",1,NULL,0,0}},
+        {{"up-landing-down","traverse-or-safe-stop",2,NULL,0,0}},
+        {{"forward-cross-slope","traverse",1,NULL,0,0}},
+        {{"forward-cross-slope","traverse",1,NULL,0,0}},
+        {
+            {"full-course","traverse",1,NULL,0,0},
+            {"tangent-level-boundary","traverse",1,
+             tangent_level_boundary_waypoint_bits,3,
+             UINT32_C(0x00000000)},
+        },
+        {
+            {"wall-safe-stop","safe-stop",0,NULL,0,0},
+            {"ramp-safe-stop","safe-stop",0,NULL,0,0},
+        },
     };
     if (candidate.routes.size() !=
         static_cast<size_t>(route_counts[scene_position]))
@@ -1520,6 +1560,56 @@ static inline bool scene_metadata_parse(
             route.walkability_class != expected.classification)
             return scene_error(error, capacity,
                 "%s: scene route outcome/class changed", shown);
+        if (expected.waypoint_bit_contract != NULL) {
+            if (route.waypoints_xz.size() != expected.waypoint_count)
+                return scene_error(error, capacity,
+                    "%s: scene route waypoint count changed", shown);
+            const json_value* encoded_waypoints = json_member(
+                routes->array_value[static_cast<size_t>(i)],
+                "waypoints_xz");
+            const json_value* encoded_hold = json_member(
+                routes->array_value[static_cast<size_t>(i)],
+                "landing_hold_seconds");
+            if (encoded_waypoints == NULL ||
+                encoded_waypoints->kind != json_array ||
+                encoded_waypoints->array_value.size() !=
+                    expected.waypoint_count ||
+                encoded_hold == NULL || encoded_hold->kind != json_number)
+                return scene_error(error, capacity,
+                    "%s: scene route bit encoding changed", shown);
+            for (size_t waypoint = 0;
+                 waypoint < expected.waypoint_count; ++waypoint) {
+                const json_value& encoded_point =
+                    encoded_waypoints->array_value[waypoint];
+                if (encoded_point.kind != json_array ||
+                    encoded_point.array_value.size() != 2)
+                    return scene_error(error, capacity,
+                        "%s: scene route waypoint encoding changed", shown);
+                const float parsed[2] = {
+                    route.waypoints_xz[waypoint].first,
+                    route.waypoints_xz[waypoint].second,
+                };
+                for (int axis = 0; axis < 2; ++axis) {
+                    const json_value& encoded_component =
+                        encoded_point.array_value[static_cast<size_t>(axis)];
+                    if (encoded_component.kind != json_number ||
+                        terrain_float_bits(parsed[axis]) !=
+                            expected.waypoint_bit_contract[waypoint][axis] ||
+                        terrain_float_bits(static_cast<float>(
+                            encoded_component.number_value)) !=
+                            expected.waypoint_bit_contract[waypoint][axis])
+                        return scene_error(error, capacity,
+                            "%s: scene route waypoint bits changed", shown);
+                }
+            }
+            if (terrain_float_bits(route.landing_hold_seconds) !=
+                    expected.landing_hold_bits ||
+                terrain_float_bits(static_cast<float>(
+                    encoded_hold->number_value)) !=
+                    expected.landing_hold_bits)
+                return scene_error(error, capacity,
+                    "%s: scene route landing hold bits changed", shown);
+        }
     }
     out = std::move(candidate);
     return true;

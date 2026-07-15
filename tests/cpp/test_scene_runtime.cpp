@@ -3,6 +3,7 @@
 #include "sha256.h"
 
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -22,31 +23,73 @@ static const char* expected_scene_ids[] = {
     "mixed-multilevel", "blocked-course",
 };
 static const int expected_route_counts[] = {
-    1,1,1,1,1,1,1,1,1,1,1,1,1,2,
+    1,1,1,1,3,2,1,1,1,1,1,1,2,2,
 };
-static const char* expected_route_ids[][2] = {
+static const char* expected_route_ids[][3] = {
     {"curb-forward",NULL},{"curb-forward",NULL},
     {"curb-forward",NULL},{"curb-forward",NULL},
-    {"ascent-landing-descent",NULL},
-    {"ascent-landing-descent",NULL},
+    {"ascent-landing-descent","flat-positive-z","flat-positive-x"},
+    {"ascent-landing-descent","landing-side-exit-stress",NULL},
     {"ascent-landing-descent",NULL},
     {"up-landing-down",NULL},{"up-landing-down",NULL},
     {"up-landing-down",NULL},
     {"forward-cross-slope",NULL},{"forward-cross-slope",NULL},
-    {"full-course",NULL},{"wall-safe-stop","ramp-safe-stop"},
+    {"full-course","tangent-level-boundary",NULL},
+    {"wall-safe-stop","ramp-safe-stop",NULL},
 };
-static const char* expected_route_outcomes[][2] = {
+static const char* expected_route_outcomes[][3] = {
     {"traverse-or-safe-stop",NULL},{"traverse",NULL},
     {"traverse-or-safe-stop",NULL},{"traverse-or-safe-stop",NULL},
-    {"traverse",NULL},{"traverse",NULL},{"traverse",NULL},
+    {"traverse","traverse","traverse"},
+    {"traverse","traverse",NULL},{"traverse",NULL},
     {"traverse",NULL},{"traverse",NULL},
     {"traverse-or-safe-stop",NULL},
-    {"traverse",NULL},{"traverse",NULL},{"traverse",NULL},
-    {"safe-stop","safe-stop"},
+    {"traverse",NULL},{"traverse",NULL},
+    {"traverse","traverse",NULL},
+    {"safe-stop","safe-stop",NULL},
 };
-static const int expected_route_classes[][2] = {
-    {2,-1},{1,-1},{2,-1},{2,-1},{1,-1},{1,-1},{1,-1},
-    {1,-1},{1,-1},{2,-1},{1,-1},{1,-1},{1,-1},{0,0},
+static const int expected_route_classes[][3] = {
+    {2,-1,-1},{1,-1,-1},{2,-1,-1},{2,-1,-1},{1,1,1},{1,1,-1},
+    {1,-1,-1},{1,-1,-1},{1,-1,-1},{2,-1,-1},{1,-1,-1},{1,-1,-1},
+    {1,1,-1},{0,0,-1},
+};
+
+static const uint32_t flat_positive_z_waypoint_bits[][2] = {
+    {UINT32_C(0x00000000), UINT32_C(0x00000000)},
+    {UINT32_C(0x00000000), UINT32_C(0x3f800000)},
+};
+static const uint32_t flat_positive_x_waypoint_bits[][2] = {
+    {UINT32_C(0x00000000), UINT32_C(0x00000000)},
+    {UINT32_C(0x3f800000), UINT32_C(0x00000000)},
+};
+static const uint32_t landing_side_exit_stress_waypoint_bits[][2] = {
+    {UINT32_C(0x00000000), UINT32_C(0x00000000)},
+    {UINT32_C(0x00000000), UINT32_C(0x3fe00000)},
+    {UINT32_C(0x00000000), UINT32_C(0x407d70a4)},
+    {UINT32_C(0x00000000), UINT32_C(0x40b0f5c3)},
+};
+static const uint32_t tangent_level_boundary_waypoint_bits[][2] = {
+    {UINT32_C(0x00000000), UINT32_C(0x00000000)},
+    {UINT32_C(0x3f1eb852), UINT32_C(0x40000000)},
+    {UINT32_C(0x3f1eb852), UINT32_C(0x40c00000)},
+};
+
+struct added_route_bit_contract
+{
+    int scene;
+    int route;
+    const uint32_t (*waypoint_bits)[2];
+    size_t waypoint_count;
+    uint32_t landing_hold_bits;
+};
+
+static const added_route_bit_contract expected_added_route_bits[] = {
+    {4, 1, flat_positive_z_waypoint_bits, 2, UINT32_C(0x00000000)},
+    {4, 2, flat_positive_x_waypoint_bits, 2, UINT32_C(0x00000000)},
+    {5, 1, landing_side_exit_stress_waypoint_bits, 4,
+     UINT32_C(0x00000000)},
+    {12, 1, tangent_level_boundary_waypoint_bits, 3,
+     UINT32_C(0x00000000)},
 };
 
 static const char* const expected_surface_semantics_json = R"json({"barycentric_tolerance":1e-10,"bbox_tolerance_m":1e-12,"cell_size_m":0.02,"coordinate_signature":"holden-y-up-right-handed-forward-plus-z","degenerate_projected_triangle_policy":"ignore","exterior_height_m":0.0,"heightfield_cell_domain":"positive-normal-binary32","heightfield_denormal_policy":"reject-nonzero-binary32-subnormals","heightfield_diagonal":"min-x-min-z_to_max-x-max-z","heightfield_diagonal_tie_policy":"tx-greater-or-equal-tz-uses-p00-p10-p11","heightfield_domain_policy":"inclusive-authoritative-node-rectangle","heightfield_evaluation_precision":"binary64-from-binary32-samples-and-promoted-node-weights","heightfield_exterior_normal":[0.0,1.0,0.0],"heightfield_grid_line_policy":"positive-index-cell-except-maximum-edge","heightfield_interpolation":"fixed-diagonal-triangles","heightfield_normal_evaluation":"selected-triangle-binary64-gradient-scale-safe-unit-normalization","heightfield_obj_coordinate_quantization":"binary32-round-of-promoted-origin-plus-index-times-cell","heightfield_obj_face_order":"p00-p11-p10_then_p00-p01-p11","heightfield_obj_float_format":".9g-final-newline","heightfield_obj_vertex_order":"z-major-x-minor","heightfield_raster_bounds_policy":"float32-minimum-rounded-down-and-maximum-ceil-covered","heightfield_runtime_height_output":"finite-binary64-interpolation-rounded-to-binary32","heightfield_runtime_node_distinguishability_policy":"normal-or-positive-zero-strictly-increasing-proven-by-endpoints-near-zero-candidates-max-binary32-spacing-and-aligned-equality","heightfield_runtime_node_domain":"normal-or-zero-binary32","heightfield_runtime_normal_output":"unit-normal-components-rounded-to-binary32","heightfield_runtime_output_ftz_policy":"binary32-subnormals-and-signed-zero-canonicalized-to-positive-zero","heightfield_runtime_parity_domain":"normal-or-zero-binary32-coordinates","heightfield_runtime_query_domain":"normal-or-zero-binary32-coordinates","heightfield_runtime_query_encoding":"normal-or-zero-binary32-canonicalized-positive-and-promoted-to-binary64","heightfield_scalar_domain":"normal-or-zero-binary32","heightfield_scalar_encoding":"ieee754-binary32-little-endian","heightfield_schema":"G1HF/v2","heightfield_source_node_encoding":"binary32-header-values-promoted-to-binary64-arithmetic","heightfield_version":2,"heightfield_zero_encoding":"canonical-positive-zero","overlap_height_policy":"maximum-y","polygon_triangulation":"fan-from-first-index","projected_area_epsilon_m2":1e-12,"projected_area_measure":"absolute-two-times-area","projected_boundary_policy":"closed","schema":"g1-terrain-surface/v1","source_query":"vertical-triangle-top","triangle_winding_policy":"orientation-independent"})json";
@@ -1119,16 +1162,102 @@ static int fixture_scene_index(const std::string& id)
     return -1;
 }
 
-static std::string fixture_route_json(
-    const std::string& id, const char* outcome, const int classification)
+static const added_route_bit_contract* fixture_added_route_contract(
+    const int scene, const int route)
 {
+    for (size_t i = 0;
+         i < sizeof(expected_added_route_bits) /
+                 sizeof(expected_added_route_bits[0]);
+         ++i)
+        if (expected_added_route_bits[i].scene == scene &&
+            expected_added_route_bits[i].route == route)
+            return &expected_added_route_bits[i];
+    return NULL;
+}
+
+static bool fixture_scene_has_added_routes(const int scene)
+{
+    for (size_t i = 0;
+         i < sizeof(expected_added_route_bits) /
+                 sizeof(expected_added_route_bits[0]);
+         ++i)
+        if (expected_added_route_bits[i].scene == scene) return true;
+    return false;
+}
+
+static std::string fixture_json_float_bits(const uint32_t bits)
+{
+    if (bits == UINT32_C(0x00000000)) return "0.0";
+    if (bits == UINT32_C(0x80000000)) return "-0.0";
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
     std::ostringstream out;
-    out << "{\"id\":" << dump_json_string(id)
-        << ",\"waypoints_xz\":[[-1.0,-1.0],"
-        << "[-1.0,-0.9800000190734863]],"
+    out << std::setprecision(std::numeric_limits<double>::max_digits10)
+        << static_cast<double>(value);
+    return out.str();
+}
+
+static std::string fixture_route_json(
+    const int scene, const int route, const std::string& mutation)
+{
+    std::string id = expected_route_ids[scene][route];
+    const char* outcome = expected_route_outcomes[scene][route];
+    int classification = expected_route_classes[scene][route];
+    const std::string suffix =
+        std::to_string(scene) + "-" + std::to_string(route);
+    if (mutation == "directional-id-" + suffix) id += "-mutated";
+    if (mutation == "directional-outcome-" + suffix)
+        outcome = "traverse-or-safe-stop";
+    if (mutation == "directional-class-" + suffix) classification = 2;
+    if (mutation == "rename" && route == 0) id = "renamed-route";
+    if (mutation == "pair") {
+        if (classification == 1) {
+            outcome = "traverse-or-safe-stop";
+            classification = 2;
+        } else {
+            outcome = "traverse";
+            classification = 1;
+        }
+    }
+
+    std::ostringstream out;
+    out << "{\"id\":" << dump_json_string(id) << ",\"waypoints_xz\":[";
+    const added_route_bit_contract* added =
+        fixture_added_route_contract(scene, route);
+    if (added == NULL) {
+        if (fixture_scene_has_added_routes(scene))
+            out << "[0.0,0.0],[0.0,0.5]";
+        else
+            out << "[-1.0,-1.0],[-1.0,-0.9800000190734863]";
+    } else {
+        for (size_t waypoint = 0; waypoint < added->waypoint_count;
+             ++waypoint) {
+            if (waypoint != 0) out << ',';
+            out << '[';
+            for (int axis = 0; axis < 2; ++axis) {
+                if (axis != 0) out << ',';
+                uint32_t bits = added->waypoint_bits[waypoint][axis];
+                const size_t word = waypoint * 2u +
+                    static_cast<size_t>(axis);
+                const std::string word_suffix = suffix + "-" +
+                    std::to_string(word);
+                if (mutation == "directional-word-" + word_suffix)
+                    bits = bits == UINT32_C(0x00000000)
+                        ? UINT32_C(0x80000000) : bits ^ UINT32_C(0x00000001);
+                out << fixture_json_float_bits(bits);
+            }
+            out << ']';
+        }
+    }
+    uint32_t hold_bits = added == NULL
+        ? UINT32_C(0x00000000) : added->landing_hold_bits;
+    if (mutation == "directional-hold-" + suffix)
+        hold_bits = UINT32_C(0x80000000);
+    out << "],"
         << "\"expected_outcome\":" << dump_json_string(outcome)
         << ",\"walkability_class\":" << classification
-        << ",\"landing_hold_seconds\":0.0}";
+        << ",\"landing_hold_seconds\":"
+        << fixture_json_float_bits(hold_bits) << '}';
     return out.str();
 }
 
@@ -1139,21 +1268,7 @@ static std::string fixture_routes_json(
     check(scene >= 0, "fixture route scene is in the locked catalog");
     std::vector<std::string> routes;
     for (int route = 0; route < expected_route_counts[scene]; ++route) {
-        std::string route_id = expected_route_ids[scene][route];
-        const char* outcome = expected_route_outcomes[scene][route];
-        int classification = expected_route_classes[scene][route];
-        if (mutation == "rename" && route == 0) route_id = "renamed-route";
-        if (mutation == "pair") {
-            if (classification == 1) {
-                outcome = "traverse-or-safe-stop";
-                classification = 2;
-            } else {
-                outcome = "traverse";
-                classification = 1;
-            }
-        }
-        routes.push_back(fixture_route_json(
-            route_id, outcome, classification));
+        routes.push_back(fixture_route_json(scene, route, mutation));
     }
     const std::string extra =
         "{\"id\":\"extra-route\",\"waypoints_xz\":"
@@ -1177,6 +1292,15 @@ static std::string fixture_scene_json(
     const scene_asset_hashes& hashes)
 {
     const bool blocked = id == "blocked-course";
+    const int scene = fixture_scene_index(id);
+    const bool directional = fixture_scene_has_added_routes(scene);
+    const char* const mesh_max = directional
+        ? "7.0" : "-0.9800000190734863";
+    const char* const heightfield_max = directional
+        ? "7.0" : "-0.9800000004470348";
+    const char* const playable_max = directional
+        ? "7.0" : "-0.9800000190734863";
+    const char* const spawn_xz = directional ? "0.0" : "-1.0";
     std::ostringstream out;
     out << "{\"schema\":\"g1-terrain-scene/v1\",\"id\":"
         << dump_json_string(id) << ",\"label\":\"Fixture Scene\",";
@@ -1202,14 +1326,19 @@ static std::string fixture_scene_json(
     out << "\"classes\":{\"blocked\":0,\"certified\":1,\"stress\":2},";
     out << "\"sha256\":\"" << hashes.walkability << "\"},";
     out << "\"bounds\":{\"mesh_min_xyz\":[-1.0,0.0,-1.0],";
-    out << "\"mesh_max_xyz\":[-0.9800000190734863,0.0,-0.9800000190734863],";
+    out << "\"mesh_max_xyz\":[" << mesh_max << ",0.0," << mesh_max
+        << "],";
     out << "\"heightfield_min_xyz\":[-1.0,0.0,-1.0],";
-    out << "\"heightfield_max_xyz\":[-0.9800000004470348,0.0,-0.9800000004470348],";
+    out << "\"heightfield_max_xyz\":[" << heightfield_max << ",0.0,"
+        << heightfield_max << "],";
     out << "\"playable_min_xz\":[-1.0,-1.0],";
-    out << "\"playable_max_xz\":[-0.9800000190734863,-0.9800000190734863],";
+    out << "\"playable_max_xz\":[" << playable_max << ',' << playable_max
+        << "],";
     out << "\"lookahead_min_xz\":[-1.0,-1.0],";
-    out << "\"lookahead_max_xz\":[-0.9800000190734863,-0.9800000190734863]},";
-    out << "\"spawn\":{\"position\":[-1.0,0.0,-1.0],";
+    out << "\"lookahead_max_xz\":[" << playable_max << ',' << playable_max
+        << "]},";
+    out << "\"spawn\":{\"position\":[" << spawn_xz << ",0.0,"
+        << spawn_xz << "],";
     out << "\"yaw_radians\":0.0},";
     if (blocked) {
         out << "\"regions\":{\"certified\":[{\"id\":\"approach\",";
@@ -1349,6 +1478,98 @@ static scene_pack pack_sentinel()
     pack.mesh_path = "sentinel-mesh-path";
     pack.walkability_path = "sentinel-walkability-path";
     return pack;
+}
+
+static void test_directional_route_bits_and_hostile_mutations_are_exact()
+{
+    const motion_pack_manifest manifest = scene_fixture_manifest();
+    scene_asset_hashes hashes;
+    hashes.terrain = std::string(64, '0');
+    hashes.mesh = std::string(64, '1');
+    hashes.walkability = std::string(64, '2');
+    const int directional_scenes[] = {4, 5, 12};
+    for (size_t index = 0;
+         index < sizeof(directional_scenes) / sizeof(directional_scenes[0]);
+         ++index) {
+        const int scene = directional_scenes[index];
+        const std::string id = expected_scene_ids[scene];
+        const json_value document = parse_json_text(
+            fixture_scene_json(id, "valid", hashes));
+        scene_metadata loaded;
+        char error[1024] = {};
+        check(scene_metadata_parse(
+            loaded, document, id.c_str(), manifest, "directional fixture",
+            error, sizeof(error)), error);
+        check(loaded.routes.size() ==
+                  static_cast<size_t>(expected_route_counts[scene]),
+              "directional route count is exact");
+        for (int route = 0; route < expected_route_counts[scene]; ++route) {
+            const scene_route& observed =
+                loaded.routes[static_cast<size_t>(route)];
+            check(observed.id == expected_route_ids[scene][route],
+                  "directional route ID/order is exact");
+            check(observed.expected_outcome ==
+                      expected_route_outcomes[scene][route] &&
+                  observed.walkability_class ==
+                      expected_route_classes[scene][route],
+                  "directional route outcome/class is exact");
+            const added_route_bit_contract* expected =
+                fixture_added_route_contract(scene, route);
+            if (expected == NULL) continue;
+            check(observed.waypoints_xz.size() == expected->waypoint_count,
+                  "directional route waypoint count is exact");
+            for (size_t waypoint = 0;
+                 waypoint < expected->waypoint_count; ++waypoint) {
+                check(terrain_float_bits(
+                          observed.waypoints_xz[waypoint].first) ==
+                          expected->waypoint_bits[waypoint][0] &&
+                      terrain_float_bits(
+                          observed.waypoints_xz[waypoint].second) ==
+                          expected->waypoint_bits[waypoint][1],
+                      "directional route waypoint bits are exact");
+            }
+            check(terrain_float_bits(observed.landing_hold_seconds) ==
+                      expected->landing_hold_bits,
+                  "directional route hold is exact positive zero");
+        }
+    }
+
+    const scene_metadata sentinel = pack_sentinel().metadata;
+    const auto reject = [&](const int scene, const std::string& mutation) {
+        const std::string id = expected_scene_ids[scene];
+        const json_value document = parse_json_text(
+            fixture_scene_json(id, mutation, hashes));
+        scene_metadata active = sentinel;
+        char error[1024] = {};
+        check(!scene_metadata_parse(
+            active, document, id.c_str(), manifest, "directional mutation",
+            error, sizeof(error)),
+            "directional route mutation is rejected");
+        check(std::strstr(error, "route") != NULL,
+              "directional route mutation has a route diagnostic");
+        check(metadata_equal(active, sentinel),
+              "directional route rejection preserves destination metadata");
+    };
+    for (size_t index = 0;
+         index < sizeof(directional_scenes) / sizeof(directional_scenes[0]);
+         ++index)
+        reject(directional_scenes[index], "reverse");
+    for (size_t index = 0;
+         index < sizeof(expected_added_route_bits) /
+                     sizeof(expected_added_route_bits[0]);
+         ++index) {
+        const added_route_bit_contract& expected =
+            expected_added_route_bits[index];
+        const std::string suffix = std::to_string(expected.scene) + "-" +
+            std::to_string(expected.route);
+        reject(expected.scene, "directional-id-" + suffix);
+        reject(expected.scene, "directional-hold-" + suffix);
+        reject(expected.scene, "directional-outcome-" + suffix);
+        reject(expected.scene, "directional-class-" + suffix);
+        for (size_t word = 0; word < expected.waypoint_count * 2u; ++word)
+            reject(expected.scene, "directional-word-" + suffix + "-" +
+                std::to_string(word));
+    }
 }
 
 static void test_scene_candidate_hostile_dimensions_are_transactional()
@@ -1725,6 +1946,7 @@ int main(int argc, char** argv)
     test_scene_numeric_precision_helpers();
     test_manifest_surface_contract_is_exact_and_transactional();
     test_catalog_contract_paths_and_tamper_order();
+    test_directional_route_bits_and_hostile_mutations_are_exact();
     test_scene_candidate_hostile_dimensions_are_transactional();
     test_scene_descriptor_hash_precedes_json_parse();
     test_scene_route_semantic_matrix_is_exact_and_transactional();
