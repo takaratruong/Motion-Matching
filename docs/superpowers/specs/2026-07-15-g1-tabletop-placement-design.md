@@ -160,12 +160,15 @@ overhead-clearance, and support-gap tests all pass. Shelf walls, ceilings below
 the authored free height, and arbitrary scene obstacles remain a later
 constrained-clearance extension.
 
-`PlacementSurfaceRegistry` validates nonzero handles, generations, finite unit
-transforms, positive support-volume size, positive extents and overhead
-clearance, top-face/plane coincidence, unique nonzero affordance IDs, nonzero
-normalized approach directions, and exact-generation lookup. Object-bound
-validation requires finite centers and strictly positive half-extents. Replacing
-a surface increments its generation so a stale place request cannot commit.
+`PlacementSurfaceRegistry` validates nonzero handles and generations, finite unit
+transforms, positive support-volume size, positive usable extents and overhead
+clearance, top-face/plane coincidence, and exact-generation lookup. Usable
+half-extents are inclusive but may not exceed half the physical support-volume X
+or Z size. Every affordance has a unique nonzero ID, a finite support point, a
+finite normalized nonzero approach direction, and a finite nonnegative clearance
+radius; zero clearance is valid. Object-bound validation requires finite centers
+and strictly positive half-extents. Replacing a surface increments its generation
+so a stale place request cannot commit.
 
 ### Place request
 
@@ -184,27 +187,50 @@ struct PlaceRequest {
 the same edge resolves a place request. The runtime accepts exactly the held
 target it already owns and never substitutes another object or surface.
 
-Selection policy remains outside `InteractionRuntime`. A read-only
-`preview_place_motion` call runs the same deterministic selector used by
-preflight and returns the selected source identity, mapped entry-root staging
-transform, root/yaw error, correction status, and a nonzero `selection_id`. It
-does not reserve a surface, mutate the held target, advance Carry, or grant pose
-ownership. Preflight recomputes the preview from the same 25 Hz snapshot and
-accepts only an exact `selection_id` match, so alignment cannot silently stage
-for one motion and execute another.
+Selection policy remains outside `InteractionRuntime`, and it has two deliberately
+separate predicates:
 
-The debug controller may resolve exactly one valid nearby slot and use this
-preview for game-style assisted alignment. A future UI, script, or VLM may drive
-ordinary Carry locomotion toward the same staging transform and submit the same
-explicit request contract.
+1. **Intrinsic candidate certification** validates source data, object/grasp/
+   support compatibility, mapped release feasibility, and deterministic ranking.
+   It never rejects or demotes a candidate because the current Carry root is far
+   from its entry root. An intrinsically valid recorded row retains recorded-tier
+   priority regardless of current staging distance.
+2. **Dynamic entry readiness** compares the current Carry root with the already
+   selected motion's mapped staging root. A read-only `preview_place_motion` call
+   returns `accepted=true`, the selected candidate and staging transform at any
+   finite distance, plus current root/yaw error. It reports `ready=false` while
+   either error exceeds the configured entry thresholds, whose defaults and hard
+   caps are `0.25 m` / `25 degrees`; distance does not change the accepted
+   candidate into a fallback.
 
-Coarse surface resolution measures planar distance from the character root to
-each affordance's composed final object position and returns a handle only when
-exactly one valid surface is inside the configured envelope. Coarse resolution
-does not imply placement readiness. Readiness additionally requires the selected
-motion's staging-root translation and yaw to satisfy the `0.25 m` / `25 degree`
-entry-correction bounds. The displayed cue and assisted controller target the
-selected staging root, not the object origin.
+`PlaceMatchInput` includes the exact held `TargetHandle`, complete current `Pose`,
+and current hand-derived object transform. Its nonzero `selection_id` is a
+canonical digest over that target ID/generation, every current-pose channel,
+current object transform, held object/grasp metadata, the complete requested
+surface and affordance snapshot, timing/correction configuration, and canonical
+content fingerprints of every pickup or recorded source row consulted. It also
+binds the selected source/events and all mapped transforms/corrections used by
+selection. The digest never hashes pointer addresses. Quaternion signs and
+negative zero are canonicalized before hashing. Changing any selection-relevant
+snapshot or source-content field produces a different ID.
+
+Preview does not reserve a surface, mutate the held target, advance Carry, or
+grant pose ownership. After staging, the controller recomputes preview from the
+new live Carry snapshot and submits that new ready snapshot's ID; a far preview ID
+is intentionally stale after movement. `PlacePreflight` freezes Carry, recomputes
+the complete selection from that exact frozen 25 Hz snapshot, requires an exact ID
+match, and is the only authority that enforces the inclusive `0.25 m` / `25
+degree` maximum entry bounds (or valid tighter configured values). A stale or
+unready request is rejected without starting place playback.
+
+The debug controller's `1.00 m` `resolve_single_surface` envelope is only a manual
+nearby-slot convenience. It measures planar distance to each affordance goal and
+returns a handle only when exactly one slot is nearby; it is not a selector,
+preview, preflight, or auto-demo range limit. The frozen auto-demo instead retains
+the exact authored destination handle/affordance returned at scene construction,
+even while far away. Both paths use the selected staging root, never the object
+origin, as the assisted Carry target. A future UI, script, or VLM may submit any
+explicit valid handle through the same contract.
 
 ### State machine
 
@@ -231,33 +257,59 @@ Carry
 
 - `PlacePreflight` is observable for exactly one 25 Hz update. The runtime still
   owns the Carry pose and attached object. It validates held-object ownership,
-  the exact surface generation and affordance, range, support fit, clearance,
-  candidate certification, match quality, and correction bounds.
+  dependencies, the exact surface generation and affordance, the frozen snapshot
+  selection ID, support fit, candidate certification, match quality, and the
+  inclusive configured dynamic entry bounds, capped at `0.25 m` / `25 degrees`.
+  It does not apply the controller's manual `1.00 m` surface resolver.
 - `PlaceAlign` begins contiguous playback and entry blending. It owns the pose,
   keeps the object attached, suppresses steering, permits cancellation, and lasts
   no more than 1.00 second.
-- `PlaceReplay` begins at the commit horizon. Steering and arbitrary motion jumps
-  are forbidden. The selected source advances contiguously to its release event.
+- `PlaceReplay` begins on the candidate's single motion-commit event. Steering
+  and arbitrary motion jumps are forbidden. The selected source advances
+  contiguously to its release event.
 - `PlaceRelease` begins on the update that atomically releases the object. The
   object remains fixed while the selected motion retracts the hand. On completion
   the existing 0.25-second controller handoff returns visual ownership to flat
   locomotion.
 
-Cancellation in `PlaceAlign` keeps the same target generation, owner, and
-attachment and begins a bounded recovery from the current displayed place pose
-and hand-derived object transform. A pre-commit rejection before playback begins
-returns to unchanged Carry. A post-commit failure before release keeps the object
-attached and starts from the last safe place pose; it never finishes a hand
-retraction while pretending the object detached.
+Every candidate has exactly one motion-commit frame. A recorded candidate uses
+its authored commit event. A reversed-pickup candidate derives its commit frame
+deterministically from configured reverse-commit time, exact 25 Hz, playback
+speed, reverse direction, and the certified start/release frames. Both forms must
+place commit strictly between entry and release and must reach it within
+`[entry_blend_seconds, maximum_alignment_seconds]`; otherwise that row is
+intrinsically invalid.
+`PlaceAlign` publishes all samples strictly before commit. The exact commit sample
+is the first `PlaceReplay` sample and is irrevocable: cancellation on the last
+pre-commit sample succeeds, while cancellation on the update that publishes
+commit or any later update is ignored. This is motion commitment only; object
+ownership remains attached until the later atomic release. A speed-scaled update
+that would cross commit clamps to it and discards that update's sub-tick remainder,
+so every allowed speed exposes the same unambiguous boundary.
 
-Recovery reconstructs and starts a fresh `CarryController` from that exact safe
-pose, active hand, held affordance, and object transform. The recovery update
-publishes the same pose/object once, then the following 25 Hz update advances the
-new Carry controller normally. Both the transition frame and the first advanced
-Carry frame must satisfy object-transform equality and the visual seam limits;
-the stale controller that was paused when placement began is never resumed. Once
-atomic release succeeds, the object is never reattached or restored by placement
-recovery.
+Failure handling distinguishes whether place playback ever began:
+
+- A `PlacePreflight` rejection leaves the original `CarryController` untouched.
+  Selection-ID mismatch, an unready root/yaw, stale preflight surface, missing
+  placement dependencies, and other preflight failures publish the exact frozen
+  Carry pose/object once; the next 25 Hz update advances that original controller
+  exactly once.
+- Cancellation on a sample strictly before motion commit, or any failure after
+  PlaceAlign began but before atomic release, keeps the same target generation,
+  owner, and attachment and recovers from the current displayed place pose and
+  hand-derived object transform. This includes actual-release-gate failure and a
+  mutation-free atomic commit rejection.
+
+The second class destroys the paused Carry controller, constructs and starts a
+fresh `CarryController` from the exact last-safe pose, active hand, held
+affordance, and object transform, publishes that pair once, then advances the new
+controller on the following 25 Hz update. Both the recovery publication and the
+first advanced Carry frame must satisfy object-transform equality and visual seam
+limits; the stale pre-place controller is never resumed. An atomic commit
+rejection is recoverable only while the registry still proves the exact target is
+Held by the same owner, as guaranteed by the mutation-free transaction fixture.
+Once atomic release succeeds, the object is never reattached or restored by
+placement recovery.
 
 All four place states own the runtime pose and suppress steering. This starts
 only after the explicit place request and prevents background locomotion from
@@ -269,8 +321,10 @@ Add `PlaceMotionMode { None, RecordedPlace, ReversedPickup }` and expose:
 
 - surface handle and affordance ID;
 - requested final object pose;
-- selection ID, staging-root pose, staging translation/yaw error, and readiness;
-- selected source kind, clip, frame, and semantic place phase;
+- selection ID, candidate-certification status, staging-root pose, staging
+  translation/yaw error, and readiness;
+- selected source kind, clip, source frame, motion-commit frame/status, and
+  semantic place phase;
 - time to release and committed/released flags;
 - requested and applied root, yaw, hand-position, and hand-orientation correction;
 - support position/orientation error and support gap;
@@ -288,26 +342,46 @@ that cannot be diagnosed accurately with the pickup vocabulary.
 
 ### True recorded place tier
 
-A true-place candidate defines a contiguous forward range with entry, commit,
-release, and retract-stop events, a nonzero object-profile ID, explicit
-object-local bounds, active hand, demonstrated hand-in-object transform, source
-support-volume transform/size, poses, contacts, and object motion. The
-whole-clip selector first hard-filters for exact object-profile and active-hand
+A true-place candidate has a nonzero clip ID that is unique within its library
+and defines a contiguous forward range with entry, authored commit, release, and
+retract-stop events. It also contains a nonzero object-profile ID, explicit
+object-local bounds, active hand, demonstrated hand-in-object transform, a full
+source `PlacementSurface` plus source affordance ID, poses, contacts, and object
+motion. Validate row structure and physics before checking uniqueness, so a
+malformed row that merely repeats another row's declared ID cannot poison the
+valid row. Among structurally valid rows, reject every member of a duplicate-ID
+group while retaining unrelated unique rows. Zero-ID, duplicate, and every other
+row rejection remain local and can never suppress the certified fallback.
+
+Intrinsic certification first hard-filters exact object-profile and active-hand
 identity, object bounds within `0.001 m` per center/half-extent component, and a
 demonstrated hand-in-object transform within `0.02 m` / `10 degrees` of the held
 grasp. Recorded active-hand contact must be binary and continuous from entry
-through the release sample, then absent throughout retraction. It then maps the
-demonstrated release object to the requested
-`surface_world * object_in_surface`, evaluates current Carry pose/root/hand
-continuity, and applies hard correction and clearance filters.
+through the release sample, then absent throughout retraction. At every attached
+sample through release, full-body FK for the active hand must agree with
+`object_world * hand_in_object` within `0.02 m` / `10 degrees`; one discontinuous
+hand/object sample invalidates that row. The source release object must pass the
+same `evaluate_actual_placement_fit` bounds, footprint, support-point/gap,
+overhead, and physical support-volume contract used at runtime against the
+recorded source surface/affordance.
 
-If one or more compatible true-place candidates pass, the minimum-cost
-true-place candidate wins. A wrong-profile, wrong-bounds, wrong-hand, or
-wrong-grasp row is not a true-place candidate for this request. A reversed
-candidate may not beat an accepted compatible true-place candidate merely with a
-lower numeric cost. This keeps the fallback from silently becoming the primary
-behavior without allowing hard recorded priority to select an unrelated object
-or grasp.
+The selector then maps demonstrated release object to requested
+`surface_world * object_in_surface`, evaluates deterministic continuity cost, and
+applies intrinsic mapped-path, IK, and clearance filters. Entry pose/hand
+and attached-object continuity are evaluated after applying one hypothetical
+rigid transform that aligns the current root to the candidate staging root. Thus
+global staging translation/yaw cannot masquerade as a hand-IK or object-path
+failure. Current entry root/yaw errors are readiness diagnostics and never
+certification filters or ranking terms in this tier.
+
+If one or more intrinsically compatible true-place candidates pass, the
+minimum-cost true-place candidate wins. A wrong-profile, wrong-bounds, wrong-hand,
+wrong-grasp, unsupported-source-release, or attached-trajectory-inconsistent row
+is not a true-place candidate for this request. A reversed candidate may not beat
+an accepted compatible true-place candidate merely because the current root is
+far from recorded entry or because fallback has a lower numeric cost. This keeps
+the fallback from silently becoming primary without selecting unrelated or
+physically invalid recorded data.
 
 ### Certified reversed-pickup tier
 
@@ -333,7 +407,12 @@ fallback is certified only when:
   10-degree relative-transform stability test;
 - the selected interval contains the expected Contact, Lift, and Hold ordering;
 - every source pose and transform is finite and every quaternion is valid; and
-- reversed root, hand, object, and clearance corrections fit the runtime limits.
+- intrinsic mapped hand/object/clearance corrections fit their runtime limits.
+
+Current Carry entry-root translation and yaw are intentionally absent from this
+certification list. Preview reports them as dynamic readiness, and only frozen
+`PlacePreflight` authorizes the configured inclusive entry bounds, capped at
+`0.25 m` / `25 degrees`.
 
 The clip's final frame is irrelevant and is never used as the reverse start. A
 late clip frame may have lost contact or continued carrying; that does not
@@ -362,6 +441,15 @@ actual-pose release gate enters attached recovery and can never emit
 release frame toward retraction. This one-frame event clamp applies at 0.85x,
 1.0x, and 1.15x, so no allowed speed can skip release.
 
+The reversed candidate's single motion-commit event is derived once during
+selection. Convert configured reverse-commit seconds to a positive source-sample
+offset with `floor(seconds * 25 * playback_speed)`, subtract it from the certified
+reverse start, and require the result to remain strictly before the start and
+strictly after release. Its elapsed runtime time and a recorded clip's authored
+entry-to-commit time must each lie within
+`[entry_blend_seconds, maximum_alignment_seconds]`. No controller-local timer
+creates a second commit boundary.
+
 For the fallback, the source hand at `contact_frame` is mapped to the requested
 goal hand `goal_object_world * held_hand_in_object`. While attached, object motion
 is always derived from the corrected active hand and the held `hand_in_object`
@@ -376,16 +464,40 @@ Placement uses the existing hard limits:
 
 | Correction | Maximum |
 | --- | ---: |
-| Interaction-controlled approach | 1.00 m |
+| Manual nearby-surface resolver (controller convenience only) | 1.00 m |
 | Planar root warp | 0.25 m |
 | Root yaw warp | 25 degrees |
 | Hand positional IK request | 0.12 m |
 | Hand orientation IK request | 25 degrees |
 | Uniform playback speed | 0.85x to 1.15x |
 
+`PlaceControllerConfig` owns one `PlaceTimingConfig` and one `PlaceMatchConfig`.
+The latter carries the entry-root/yaw and hand-correction thresholds consumed by
+preview, preflight, selection, and playback; valid values may be tighter but may
+not exceed the table above. A candidate snapshots both configs, and preflight
+requires them to equal the runtime's values before playback.
+
 Entry correction decays smoothly to zero by release. Hand IK ramps to full weight
 at release and may not exceed G1 joint limits. Existing flat foot contact handling
 runs after the interaction handoff. There is no terrain sample or terrain IK.
+
+The controller applies the root/yaw correction already authorized from the frozen
+preflight snapshot. It does not recompute entry readiness, reject a far candidate,
+select a different source, or fall through to reverse; `PlacePreflight` is the
+single authority for the configured current-root gate, capped at `0.25 m` /
+`25 degrees`.
+
+`PlaceController` is constructed explicitly as
+`PlaceController(PlaceControllerConfig, IKConfig)`. Construction validates every
+finite range, exact 25 Hz timing, playback speed, reverse-commit time versus
+maximum alignment, the 1.00-second alignment cap, positive entry blend no longer
+than alignment, correction/release hard caps, and every IK field before the
+controller can begin. `RuntimeConfig.place` is the sole runtime source of
+`PlaceControllerConfig`; each composition root passes one `RuntimeConfig` to the
+runtime and uses that same value's nested timing/match configs for preview. The
+runtime uses them again for preflight and forwards the complete place config
+unchanged with `RuntimeConfig.ik` to the controller. Invalid configuration throws
+before registry, attachment, or controller state can mutate.
 
 Release accepts final object error at or below 0.02 m and 10 degrees, inclusive.
 That tolerance never substitutes for support validity: the exact hand-derived
@@ -443,7 +555,8 @@ Manual control remains game-like:
 
 - ordinary movement controls drive flat locomotion;
 - `F` / right-face-left picks in `Locomotion`; in `Carry` it latches one explicit
-  destination and begins selected-motion staging;
+  destination returned by the manual `1.00 m` nearby-surface resolver and begins
+  selected-motion staging;
 - while staging, the controller converts staging-root error into ordinary Carry
   locomotion input, never a direct root write, and submits Place automatically
   only when the preview is ready;
@@ -455,11 +568,13 @@ While any `Place*` state owns the interaction, `R` has no effect. This prevents 
 debug restore from teleporting an object during lowering or after irrevocable
 release. Pre-commit `X` is the only placement cancellation path.
 
-The scene contains a source table/object and one destination table/slot. For the
-frozen auto-demo, the destination table has the source table's size and height
-and is translated 1.20 m farther along world `+Z`; its slot is centered on the
-top plane. The destination support transform is drawn with its usable bounds,
-final object frame, approach axis, and correction envelope.
+The scene contains a source table/object and one destination table/slot. Surface
+construction retains the exact `SurfaceHandle` and affordance ID returned for
+that authored destination. For the frozen auto-demo, the destination table has
+the source table's size and height and is translated 1.20 m farther along world
+`+Z`; its slot is centered on the top plane. The destination support transform is
+drawn with its usable bounds, final object frame, approach axis, and correction
+envelope.
 
 The demo support point is derived once from the last stable pre-lift source
 sample: project the source object origin along the source table normal onto the
@@ -485,14 +600,18 @@ uses the current live flat-controller snapshot before and after Interact. The
 legacy pickup-only canonical relocation/substitution path may remain for its
 separate gate, but it is disabled and unreachable in placement mode.
 
-After pickup reaches Carry, the demo latches the destination and recomputes the
-selected-motion preview every tick. It commands ordinary Carry locomotion toward
-the preview's staging root for at least 25 and at most 150 consecutive ticks,
-requires more than `0.20 m` root and object displacement, and submits Place only
-when staging translation is at most `0.25 m`, staging yaw is at most `25 degrees`,
-and the exact preview reports ready. It never writes the root, pulses Reset, or
-uses a fixed tick count as a proxy for readiness. The screenshot is taken after
-successful release with the object visible on the destination table.
+After pickup reaches Carry, the frozen auto-demo latches that retained authored
+destination handle/affordance directly, regardless of its current distance; it
+never calls the manual nearby-surface resolver. Its first far preview must remain
+`accepted` with a staging root while reporting `ready=false`. The demo recomputes
+preview every tick and commands ordinary Carry locomotion toward that staging
+root for at least 25 and at most 150 consecutive ticks. It requires more than
+`0.20 m` root and object displacement and submits Place only with the newly
+computed live staged-snapshot selection ID when translation is at most `0.25 m`,
+yaw is at most `25 degrees`, and preview reports ready. It never writes the root,
+pulses Reset, or uses a fixed tick count or the far preview ID as a proxy for
+readiness. The screenshot is taken after successful release with the object
+visible on the destination table.
 
 ## Verification
 
@@ -505,7 +624,14 @@ exactly `0.04` second per update. It proves:
 - `PlacePreflight` is observable for one tick;
 - success collapses to `Carry, PlacePreflight, PlaceAlign, PlaceReplay,
   PlaceRelease, Locomotion`;
-- true recorded place wins whenever a compatible true-place candidate exists;
+- a far intrinsically certified candidate returns `accepted=true`, its staging
+  root, and `ready=false`; after constructing a staged Carry snapshot, the same
+  source tier becomes ready with a new snapshot-bound selection ID;
+- true recorded place wins whenever a compatible true-place candidate exists,
+  even when its initial preview is far, and cannot fall through for entry distance;
+- recorded clip IDs are nonzero/unique, source release passes the same support-fit
+  contract, attached hand/object motion stays consistent, and each malformed row
+  is skipped without suppressing a valid row or reversed fallback;
 - reverse playback starts at the end of the earliest certified five-sample Hold
   window, never the clip's final frame;
 - a fixture with invalid late-frame contact still succeeds when its earlier
@@ -514,6 +640,9 @@ exactly `0.04` second per update. It proves:
   sign;
 - 0.85x and 1.15x updates clamp to the exact release sample, emit one release
   event, and begin retraction only after acknowledgement;
+- recorded authored and reverse-derived commit events both satisfy maximum align
+  time; PlaceAlign/PlaceReplay and cancellation behavior are exact on samples
+  before, at, and after commit;
 - exact correction and release boundaries pass and boundary-plus-epsilon fails;
 - an exact-boundary goal whose allowed release error would put the actual object
   outside the footprint, support-gap, bound-corner, overhead, or sweep contract
@@ -523,9 +652,14 @@ exactly `0.04` second per update. It proves:
   through runtime, registry, and scene handoff;
 - release atomically replaces the target's support with the destination support,
   and an immediate re-pick query observes that destination;
-- cancellation and pre-release failure reseed Carry from the last safe pose and
-  remain continuous on both the recovery publication and first advanced Carry
-  frame; and
+- selection-ID mismatch, stale preflight surface, and missing placement
+  dependencies reject from the frozen snapshot without reconstructing Carry and
+  remain continuous on the rejection publication plus next original-Carry frame;
+- cancellation after playback starts, pre-release failure, and mutation-free
+  atomic commit rejection reconstruct Carry from the last safe pose and remain
+  continuous on both the recovery publication and first fresh-Carry frame;
+- invalid `PlaceControllerConfig`, `IKConfig`, or `RuntimeConfig.place` is rejected
+  before state mutation; and
 - replaying the same inputs produces bit-identical selection and state output.
 
 ### Graphical gate
@@ -542,18 +676,21 @@ The new graphical gate is separate from and does not weaken
    pickup-distance progression before Interact;
 4. five consecutive settled rows in the `[0.35 m, 0.45 m]` stand-off band at no
    more than `0.10 m/s`, followed by Interact from the live pose through the
-   unchanged 1.00 m resolver;
+   unchanged 1.00 m pickup-target resolver;
 5. collapsed states exactly `Locomotion, Preflight, Align, PickupReplay, Hold,
    Carry, PlacePreflight, PlaceAlign, PlaceReplay, PlaceRelease, Locomotion`;
-6. 25 through 150 consecutive ordinary Carry staging commands, more than 0.20 m
-   Carry root and object displacement, and a ready selected-motion preview before
-   Place;
-7. one latched Place action, no Reset action, and one attached-to-free transition;
-8. final object error at most 0.02 m / 10 degrees, with the actual committed pose
+6. the stable authored destination handle/affordance selected directly with zero
+   placement-surface resolver calls in auto-demo mode, plus an accepted far
+   preview that is not ready;
+7. 25 through 150 consecutive ordinary Carry staging commands, more than 0.20 m
+   Carry root and object displacement, and a newly digested ready live preview
+   before Place;
+8. one latched Place action, no Reset action, and one attached-to-free transition;
+9. final object error at most 0.02 m / 10 degrees, with the actual committed pose
    passing footprint, support gap `[-0.005 m, +0.020 m]`, bound-corner,
    overhead-clearance, and support-volume checks;
-9. final `Locomotion`, `Succeeded`, `None`, `Free`, and unattached state; and
-10. synchronous 25 Hz ticks plus the existing visual continuity limits: distal
+10. final `Locomotion`, `Succeeded`, `None`, `Free`, and unattached state; and
+11. synchronous 25 Hz ticks plus the existing visual continuity limits: distal
     feet at most 12 m/s, authority-seam translation at most 0.20 m, and every
     joint rotation step at most 60 degrees.
 
