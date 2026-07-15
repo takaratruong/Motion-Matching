@@ -1840,6 +1840,58 @@ static void test_task34_footprint_domain_budget_and_transaction()
               "axis-specific outside-domain rejection is transactional");
     }
 
+    const vec3 outward_capsules[][2] = {
+        {
+            vec3(std::nextafter(0.25f, 0.0f), 1.0f, 0.25f),
+            vec3(std::nextafter(0.25f, 0.0f), 1.0f, 0.75f)
+        },
+        {
+            vec3(std::nextafter(
+                     0.75f, std::numeric_limits<float>::infinity()),
+                 1.0f, 0.25f),
+            vec3(std::nextafter(
+                     0.75f, std::numeric_limits<float>::infinity()),
+                 1.0f, 0.75f)
+        },
+        {
+            vec3(0.25f, 1.0f, std::nextafter(0.25f, 0.0f)),
+            vec3(0.75f, 1.0f, std::nextafter(0.25f, 0.0f))
+        },
+        {
+            vec3(0.25f, 1.0f,
+                 std::nextafter(
+                     0.75f, std::numeric_limits<float>::infinity())),
+            vec3(0.75f, 1.0f,
+                 std::nextafter(
+                     0.75f, std::numeric_limits<float>::infinity()))
+        }
+    };
+    for (size_t index = 0;
+         index < sizeof(outward_capsules) /
+                     sizeof(outward_capsules[0]);
+         ++index) {
+        G1ClearanceResult forward = seeded_result(
+            170.0 + static_cast<double>(index));
+        G1ClearanceResult reverse = seeded_result(
+            174.0 + static_cast<double>(index));
+        const ByteSnapshot<G1ClearanceResult> forward_before(forward);
+        const ByteSnapshot<G1ClearanceResult> reverse_before(reverse);
+        check(g1_capsule_clearance(
+                  forward, g1_pose_clearance_budget(), field,
+                  outward_capsules[index][0],
+                  outward_capsules[index][1], radius,
+                  NULL, 0) == G1ClearanceOutsideDomain &&
+              g1_capsule_clearance(
+                  reverse, g1_pose_clearance_budget(), field,
+                  outward_capsules[index][1],
+                  outward_capsules[index][0], radius,
+                  NULL, 0) == G1ClearanceOutsideDomain,
+              "one-ULP capsule excursion on each axis is outside-domain");
+        check(forward_before.same(forward) &&
+                  reverse_before.same(reverse),
+              "outside capsule rejection is transactional under reversal");
+    }
+
     heightfield poisoned = field;
     poisoned.heights.set(std::numeric_limits<float>::quiet_NaN());
     G1ClearanceBudget no_cells = g1_pose_clearance_budget();
@@ -2017,6 +2069,253 @@ static void test_task34_fixed_diagonal_and_rank_cases()
           "exact disk tangency does not discard the flat-plane minimum");
 }
 
+static void task34_set_coordinate(
+    vec3& value,
+    int coordinate,
+    float replacement)
+{
+    if (coordinate == 0) {
+        value.x = replacement;
+    } else if (coordinate == 1) {
+        value.y = replacement;
+    } else {
+        value.z = replacement;
+    }
+}
+
+static void task34_require_invalid_field_primitives(
+    const heightfield& field,
+    const char* message)
+{
+    const vec3 endpoint_a(0.375f, 1.0f, 0.375f);
+    const vec3 endpoint_b(0.625f, 1.25f, 0.625f);
+    G1ClearanceResult sphere = seeded_result(192.0);
+    G1ClearanceResult capsule = seeded_result(193.0);
+    const ByteSnapshot<G1ClearanceResult> sphere_before(sphere);
+    const ByteSnapshot<G1ClearanceResult> capsule_before(capsule);
+    check(g1_sphere_clearance(
+              sphere, g1_pose_clearance_budget(), field,
+              endpoint_a, 0.125f, NULL, 0) ==
+              G1ClearanceInvalidField &&
+          g1_capsule_clearance(
+              capsule, g1_pose_clearance_budget(), field,
+              endpoint_a, endpoint_b, 0.125f,
+              NULL, 0) == G1ClearanceInvalidField,
+          message);
+    check(sphere_before.same(sphere) &&
+              capsule_before.same(capsule),
+          "invalid-field sphere/capsule failures are transactional");
+}
+
+static void test_task34_input_field_and_exterior_matrix()
+{
+    heightfield valid;
+    point_make_field(valid, 5, 5, 0.0f, 0.0f, 0.25f);
+    const vec3 endpoint_a(0.375f, 1.0f, 0.375f);
+    const vec3 endpoint_b(0.625f, 1.25f, 0.625f);
+    const float invalid_values[] = {
+        float_from_bits(UINT32_C(0x00000000)),
+        float_from_bits(UINT32_C(0x80000000)),
+        float_from_bits(UINT32_C(0xbe000000)),
+        float_from_bits(UINT32_C(0x00000001)),
+        float_from_bits(UINT32_C(0x80000001)),
+        float_from_bits(UINT32_C(0x7f800000)),
+        float_from_bits(UINT32_C(0xff800000)),
+        float_from_bits(UINT32_C(0x7fc00001))
+    };
+    for (size_t value_index = 0;
+         value_index < sizeof(invalid_values) /
+                           sizeof(invalid_values[0]);
+         ++value_index) {
+        G1ClearanceResult sphere_radius = seeded_result(
+            194.0 + static_cast<double>(value_index));
+        G1ClearanceResult capsule_radius = seeded_result(
+            204.0 + static_cast<double>(value_index));
+        const ByteSnapshot<G1ClearanceResult> sphere_radius_before(
+            sphere_radius);
+        const ByteSnapshot<G1ClearanceResult> capsule_radius_before(
+            capsule_radius);
+        check(g1_sphere_clearance(
+                  sphere_radius, g1_pose_clearance_budget(), valid,
+                  endpoint_a, invalid_values[value_index],
+                  NULL, 0) == G1ClearanceInvalidInput &&
+              g1_capsule_clearance(
+                  capsule_radius, g1_pose_clearance_budget(), valid,
+                  endpoint_a, endpoint_b,
+                  invalid_values[value_index],
+                  NULL, 0) == G1ClearanceInvalidInput,
+              "sphere/capsule reject zero, negative, subnormal, and nonfinite radii");
+        check(sphere_radius_before.same(sphere_radius) &&
+                  capsule_radius_before.same(capsule_radius),
+              "invalid radius failures preserve sphere/capsule outputs");
+
+        if (value_index < 3) {
+            continue;
+        }
+        for (int coordinate = 0; coordinate < 3; ++coordinate) {
+            vec3 invalid_endpoint = endpoint_a;
+            task34_set_coordinate(
+                invalid_endpoint, coordinate,
+                invalid_values[value_index]);
+            G1ClearanceResult sphere = seeded_result(
+                214.0 + static_cast<double>(coordinate));
+            G1ClearanceResult forward = seeded_result(
+                218.0 + static_cast<double>(coordinate));
+            G1ClearanceResult reverse = seeded_result(
+                222.0 + static_cast<double>(coordinate));
+            const ByteSnapshot<G1ClearanceResult> sphere_before(sphere);
+            const ByteSnapshot<G1ClearanceResult> forward_before(forward);
+            const ByteSnapshot<G1ClearanceResult> reverse_before(reverse);
+            check(g1_sphere_clearance(
+                      sphere, g1_pose_clearance_budget(), valid,
+                      invalid_endpoint, 0.125f,
+                      NULL, 0) == G1ClearanceInvalidInput &&
+                  g1_capsule_clearance(
+                      forward, g1_pose_clearance_budget(), valid,
+                      invalid_endpoint, endpoint_b, 0.125f,
+                      NULL, 0) == G1ClearanceInvalidInput &&
+                  g1_capsule_clearance(
+                      reverse, g1_pose_clearance_budget(), valid,
+                      endpoint_b, invalid_endpoint, 0.125f,
+                      NULL, 0) == G1ClearanceInvalidInput,
+                  "sphere/capsule reject subnormal and nonfinite XYZ");
+            check(sphere_before.same(sphere) &&
+                      forward_before.same(forward) &&
+                      reverse_before.same(reverse),
+                  "invalid XYZ failures preserve all primitive outputs");
+        }
+    }
+
+    heightfield version_one = valid;
+    version_one.version = 1;
+    task34_require_invalid_field_primitives(
+        version_one, "sphere/capsule reject legacy v1 fields");
+
+    heightfield wrong_shape = valid;
+    --wrong_shape.heights.size;
+    task34_require_invalid_field_primitives(
+        wrong_shape, "sphere/capsule reject wrong-sized height storage");
+
+    heightfield null_storage = valid;
+    float* const saved_storage = null_storage.heights.data;
+    null_storage.heights.data = NULL;
+    task34_require_invalid_field_primitives(
+        null_storage, "sphere/capsule reject null height storage");
+    null_storage.heights.data = saved_storage;
+
+    heightfield exterior_low = valid;
+    heightfield exterior_high = valid;
+    exterior_low.exterior_height = -10.0f;
+    exterior_high.exterior_height = 10.0f;
+    for (int index = 0; index < exterior_low.heights.size; ++index) {
+        const float height = 0.03125f *
+            static_cast<float>(index % exterior_low.nx);
+        exterior_low.heights(index) = height;
+        exterior_high.heights(index) = height;
+    }
+    G1ClearanceResult low_sphere = seeded_result(228.0);
+    G1ClearanceResult high_sphere = seeded_result(229.0);
+    G1ClearanceResult low_capsule = seeded_result(230.0);
+    G1ClearanceResult high_capsule = seeded_result(231.0);
+    const vec3 exterior_endpoint_b(
+        endpoint_a.x, endpoint_b.y, endpoint_a.z);
+    const G1ClearanceStatus low_sphere_status = g1_sphere_clearance(
+        low_sphere, g1_pose_clearance_budget(), exterior_low,
+        endpoint_a, 0.125f, NULL, 0);
+    const G1ClearanceStatus high_sphere_status = g1_sphere_clearance(
+        high_sphere, g1_pose_clearance_budget(), exterior_high,
+        endpoint_a, 0.125f, NULL, 0);
+    const G1ClearanceStatus low_capsule_status = g1_capsule_clearance(
+        low_capsule, g1_pose_clearance_budget(), exterior_low,
+        endpoint_a, exterior_endpoint_b, 0.125f, NULL, 0);
+    const G1ClearanceStatus high_capsule_status = g1_capsule_clearance(
+        high_capsule, g1_pose_clearance_budget(), exterior_high,
+        exterior_endpoint_b, endpoint_a, 0.125f, NULL, 0);
+    check(low_sphere_status == G1ClearanceOk &&
+              high_sphere_status == G1ClearanceOk &&
+              low_capsule_status == G1ClearanceOk &&
+              high_capsule_status == G1ClearanceOk,
+          "in-domain primitives certify for both exterior sentinels");
+    check(clearance_result_same(low_sphere, high_sphere) &&
+              clearance_result_same(low_capsule, high_capsule),
+          "sphere/capsule output ignores exterior height and reversal");
+
+    const vec3 outside_a(0.0625f, 1.0f, 0.375f);
+    const vec3 outside_b(0.1875f, 1.25f, 0.625f);
+    G1ClearanceResult low_outside = seeded_result(232.0);
+    G1ClearanceResult high_outside = seeded_result(233.0);
+    const ByteSnapshot<G1ClearanceResult> low_outside_before(low_outside);
+    const ByteSnapshot<G1ClearanceResult> high_outside_before(high_outside);
+    check(g1_capsule_clearance(
+              low_outside, g1_pose_clearance_budget(), exterior_low,
+              outside_a, outside_b, 0.125f,
+              NULL, 0) == G1ClearanceOutsideDomain &&
+          g1_capsule_clearance(
+              high_outside, g1_pose_clearance_budget(), exterior_high,
+              outside_b, outside_a, 0.125f,
+              NULL, 0) == G1ClearanceOutsideDomain,
+          "outside capsule status ignores exterior height and reversal");
+    check(low_outside_before.same(low_outside) &&
+              high_outside_before.same(high_outside),
+          "outside capsule remains transactional for both exteriors");
+
+    const float minimum_normal =
+        float_from_bits(UINT32_C(0x00800000));
+    heightfield minimum_cell;
+    point_make_field(
+        minimum_cell, 2, 2,
+        0.0f, 0.0f, minimum_normal);
+    G1ClearanceResult minimum_cell_output = seeded_result(234.0);
+    const ByteSnapshot<G1ClearanceResult> minimum_cell_before(
+        minimum_cell_output);
+    check(g1_sphere_clearance(
+              minimum_cell_output, g1_pose_clearance_budget(),
+              minimum_cell,
+              vec3(minimum_normal, 1.0f, minimum_normal),
+              minimum_normal, NULL, 0) ==
+              G1ClearanceOutsideDomain,
+          "minimum-positive-normal cell rejects an oversized footprint promptly");
+    check(minimum_cell_before.same(minimum_cell_output),
+          "minimum-cell outside rejection preserves primitive output");
+
+    const float maximum_float =
+        float_from_bits(UINT32_C(0x7f7fffff));
+    G1ClearanceResult maximum_radius = seeded_result(235.0);
+    G1ClearanceResult maximum_endpoint = seeded_result(236.0);
+    const ByteSnapshot<G1ClearanceResult> maximum_radius_before(
+        maximum_radius);
+    const ByteSnapshot<G1ClearanceResult> maximum_endpoint_before(
+        maximum_endpoint);
+    check(g1_sphere_clearance(
+              maximum_radius, g1_pose_clearance_budget(), valid,
+              endpoint_a, maximum_float, NULL, 0) ==
+              G1ClearanceOutsideDomain &&
+          g1_capsule_clearance(
+              maximum_endpoint, g1_pose_clearance_budget(), valid,
+              vec3(maximum_float, 1.0f, maximum_float),
+              endpoint_b, 0.125f, NULL, 0) ==
+              G1ClearanceOutsideDomain,
+          "FLT_MAX radius and endpoints reject outside-domain promptly");
+    check(maximum_radius_before.same(maximum_radius) &&
+              maximum_endpoint_before.same(maximum_endpoint),
+          "FLT_MAX outside rejections preserve primitive outputs");
+
+    heightfield wide_axis;
+    point_make_field(
+        wide_axis, 3, 3,
+        -maximum_float, -maximum_float, maximum_float);
+    G1ClearanceResult wide_output = seeded_result(237.0);
+    check(g1_capsule_clearance(
+              wide_output, g1_pose_clearance_budget(), wide_axis,
+              vec3(-0.125f, 1.0f, -0.125f),
+              vec3(0.125f, 1.25f, 0.125f),
+              0.125f, NULL, 0) == G1ClearanceOk,
+          "wide-axis endpoint subtraction is certified without binary32 overflow");
+    check(wide_output.lower_bound_m <= 0.875 &&
+              0.875 <= wide_output.witness_upper_m,
+          "wide-axis capsule encloses its flat-plane endpoint oracle");
+}
+
 static void test_task34_domain_and_malformed_height_matrix()
 {
     heightfield nonrepresentable;
@@ -2059,20 +2358,75 @@ static void test_task34_domain_and_malformed_height_matrix()
     check(outside_before.same(outside_output),
           "non-binary32 outside failure is transactional");
 
-    heightfield malformed;
-    point_make_field(malformed, 5, 5, 0.0f, 0.0f, 0.25f);
-    malformed.heights(2 + 2 * malformed.nx) =
-        std::numeric_limits<float>::quiet_NaN();
-    G1ClearanceResult malformed_output = seeded_result(199.0);
-    const ByteSnapshot<G1ClearanceResult> malformed_before(
-        malformed_output);
+    const float malformed_values[] = {
+        float_from_bits(UINT32_C(0x7fc00001)),
+        float_from_bits(UINT32_C(0x7f800000)),
+        float_from_bits(UINT32_C(0xff800000)),
+        float_from_bits(UINT32_C(0x00000001)),
+        float_from_bits(UINT32_C(0x80000001)),
+        float_from_bits(UINT32_C(0x80000000))
+    };
+    for (size_t malformed_index = 0;
+         malformed_index < sizeof(malformed_values) /
+                               sizeof(malformed_values[0]);
+         ++malformed_index) {
+        heightfield malformed;
+        point_make_field(malformed, 5, 5, 0.0f, 0.0f, 0.25f);
+        malformed.heights(2 + 2 * malformed.nx) =
+            malformed_values[malformed_index];
+        G1ClearanceResult malformed_sphere = seeded_result(199.0);
+        G1ClearanceResult malformed_capsule = seeded_result(201.0);
+        const ByteSnapshot<G1ClearanceResult> sphere_before(
+            malformed_sphere);
+        const ByteSnapshot<G1ClearanceResult> capsule_before(
+            malformed_capsule);
+        check(g1_sphere_clearance(
+                  malformed_sphere, g1_pose_clearance_budget(), malformed,
+                  vec3(0.5f, 1.0f, 0.5f), 0.25f,
+                  NULL, 0) == G1ClearanceInvalidField &&
+              g1_capsule_clearance(
+                  malformed_capsule, g1_pose_clearance_budget(), malformed,
+                  vec3(0.375f, 1.0f, 0.5f),
+                  vec3(0.625f, 1.25f, 0.5f), 0.25f,
+                  NULL, 0) == G1ClearanceInvalidField,
+              "visited malformed terrain height is invalid-field");
+        check(sphere_before.same(malformed_sphere) &&
+                  capsule_before.same(malformed_capsule),
+              "malformed-height failures are transactional");
+    }
+
+    heightfield clean_unvisited;
+    point_make_field(clean_unvisited, 5, 5,
+                     0.0f, 0.0f, 0.25f);
+    heightfield poisoned_unvisited = clean_unvisited;
+    poisoned_unvisited.heights(4 + 4 * poisoned_unvisited.nx) =
+        float_from_bits(UINT32_C(0x7fc00001));
+    const vec3 local_center(0.25f, 1.0f, 0.25f);
+    const vec3 local_upper(0.25f, 1.25f, 0.25f);
+    G1ClearanceResult clean_sphere = seeded_result(203.0);
+    G1ClearanceResult poisoned_sphere = seeded_result(205.0);
+    G1ClearanceResult clean_capsule = seeded_result(207.0);
+    G1ClearanceResult poisoned_capsule = seeded_result(209.0);
     check(g1_sphere_clearance(
-              malformed_output, g1_pose_clearance_budget(), malformed,
-              vec3(0.5f, 1.0f, 0.5f), 0.25f,
-              NULL, 0) == G1ClearanceInvalidField,
-          "visited malformed terrain height is invalid-field");
-    check(malformed_before.same(malformed_output),
-          "malformed-height failure is transactional");
+              clean_sphere, g1_pose_clearance_budget(), clean_unvisited,
+              local_center, 0.1f, NULL, 0) == G1ClearanceOk &&
+          g1_sphere_clearance(
+              poisoned_sphere, g1_pose_clearance_budget(),
+              poisoned_unvisited,
+              local_center, 0.1f, NULL, 0) == G1ClearanceOk &&
+          g1_capsule_clearance(
+              clean_capsule, g1_pose_clearance_budget(), clean_unvisited,
+              local_center, local_upper, 0.1f,
+              NULL, 0) == G1ClearanceOk &&
+          g1_capsule_clearance(
+              poisoned_capsule, g1_pose_clearance_budget(),
+              poisoned_unvisited,
+              local_upper, local_center, 0.1f,
+              NULL, 0) == G1ClearanceOk,
+          "unvisited malformed height does not invalidate a primitive");
+    check(clearance_result_same(clean_sphere, poisoned_sphere) &&
+              clearance_result_same(clean_capsule, poisoned_capsule),
+          "unvisited malformed height cannot influence certified output");
 }
 
 static heightfield task34_make_count_field(int cells_x)
@@ -2156,37 +2510,113 @@ static void test_task34_named_tent_sign_reversal()
     const vec3 stop(
         float_from_bits(UINT32_C(0x3b6e7765)), center_y,
         float_from_bits(UINT32_C(0x36723088)));
-    const vec3 old_samples[] = {
-        start,
-        vec3(float_from_bits(UINT32_C(0x3a9efa44)), center_y,
-             float_from_bits(UINT32_C(0x35a175b0))),
-        vec3(float_from_bits(UINT32_C(0x3b1efa44)), center_y,
-             float_from_bits(UINT32_C(0x362175b0))),
-        stop
-    };
     const volatile float spacing = 0.5f * cell;
     const volatile float dx = stop.x - start.x;
     const volatile float dz = stop.z - start.z;
     const volatile float length = std::sqrt(dx * dx + dz * dz);
     check(static_cast<float>(length / spacing) == 3.0f,
           "named tent reproduces the removed three-step float lattice");
+    const int segment_steps = static_cast<int>(
+        std::ceil(static_cast<float>(length / spacing)));
+    check(segment_steps == 3,
+          "named tent old lattice has exactly four centerline samples");
+    vec3 old_samples[4] = {};
+    const uint32_t expected_sample_bits[4][2] = {
+        {UINT32_C(0x00000000), UINT32_C(0x00000000)},
+        {UINT32_C(0x3a9efa44), UINT32_C(0x35a175b0)},
+        {UINT32_C(0x3b1efa44), UINT32_C(0x362175b0)},
+        {UINT32_C(0x3b6e7765), UINT32_C(0x36723088)}
+    };
+    for (int step = 0; step <= segment_steps; ++step) {
+        const volatile float parameter =
+            static_cast<float>(step) /
+            static_cast<float>(segment_steps);
+        const volatile float sample_x =
+            start.x + parameter * dx;
+        const volatile float sample_z =
+            start.z + parameter * dz;
+        old_samples[step] = vec3(sample_x, center_y, sample_z);
+        check(float_bits(old_samples[step].x) ==
+                  expected_sample_bits[step][0] &&
+              float_bits(old_samples[step].z) ==
+                  expected_sample_bits[step][1],
+              "named tent regenerates each removed float-lattice sample");
+    }
+    const double half_cell =
+        0.5 * static_cast<double>(cell);
+    for (int gap_index = 0; gap_index < 2; ++gap_index) {
+        const double gap_x =
+            static_cast<double>(old_samples[gap_index + 1].x) -
+            static_cast<double>(old_samples[gap_index].x);
+        const double gap_z =
+            static_cast<double>(old_samples[gap_index + 1].z) -
+            static_cast<double>(old_samples[gap_index].z);
+        const double gap = std::sqrt(
+            gap_x * gap_x + gap_z * gap_z);
+        check(gap > half_cell,
+              "named tent first two rounded gaps exceed half a cell");
+    }
+
+    const int radial_steps = static_cast<int>(
+        std::ceil(radius / spacing));
+    int admitted_radial_offsets = 0;
+    for (int radial_z = -radial_steps;
+         radial_z <= radial_steps;
+         ++radial_z) {
+        for (int radial_x = -radial_steps;
+             radial_x <= radial_steps;
+             ++radial_x) {
+            const volatile float offset_x =
+                static_cast<float>(radial_x) * spacing;
+            const volatile float offset_z =
+                static_cast<float>(radial_z) * spacing;
+            const volatile float offset_square =
+                offset_x * offset_x + offset_z * offset_z;
+            if (offset_square <= radius * radius) {
+                ++admitted_radial_offsets;
+            }
+        }
+    }
+    check(admitted_radial_offsets == 1,
+          "named tent radial lattice admits only its center offset");
+
     double old_minimum = std::numeric_limits<double>::infinity();
-    for (size_t index = 0;
-         index < sizeof(old_samples) / sizeof(old_samples[0]);
-         ++index) {
-        G1SurfaceSample sample = {};
-        check(g1_surface_query_v2(
-                  sample, tent,
-                  old_samples[index].x,
-                  old_samples[index].z) == G1SurfaceQueryValid,
-              "named tent old-lattice sample is in-domain");
-        const double clearance =
-            static_cast<double>(center_y) -
-            static_cast<double>(radius) -
-            static_cast<double>(sample.height);
-        old_minimum = clearance < old_minimum
-            ? clearance
-            : old_minimum;
+    for (int step = 0; step <= segment_steps; ++step) {
+        for (int radial_z = -radial_steps;
+             radial_z <= radial_steps;
+             ++radial_z) {
+            for (int radial_x = -radial_steps;
+                 radial_x <= radial_steps;
+                 ++radial_x) {
+                const volatile float offset_x =
+                    static_cast<float>(radial_x) * spacing;
+                const volatile float offset_z =
+                    static_cast<float>(radial_z) * spacing;
+                const volatile float offset_square =
+                    offset_x * offset_x + offset_z * offset_z;
+                const volatile float radius_square = radius * radius;
+                if (offset_square > radius_square) {
+                    continue;
+                }
+                G1SurfaceSample sample = {};
+                check(g1_surface_query_v2(
+                          sample, tent,
+                          old_samples[step].x + offset_x,
+                          old_samples[step].z + offset_z) ==
+                          G1SurfaceQueryValid,
+                      "named tent old-lattice sample is in-domain");
+                const double vertical_radius = std::sqrt(
+                    static_cast<double>(radius_square) -
+                    static_cast<double>(offset_square));
+                const double clearance =
+                    static_cast<double>(center_y) -
+                    vertical_radius -
+                    static_cast<double>(sample.height);
+                old_minimum = clearance < old_minimum
+                    ? clearance
+                    : old_minimum;
+            }
+        }
     }
     check(old_minimum > 0.00019,
           "removed centerline/radial lattice falsely clears the named tent");
@@ -2200,6 +2630,56 @@ static void test_task34_named_tent_sign_reversal()
               output.witness_upper_m - output.lower_bound_m <=
                   G1ClearanceMaximumCertificateWidthM,
           "certified named-tent witness reverses the old positive sign");
+    G1ClearanceResult reverse = seeded_result(224.0);
+    check(g1_capsule_clearance(
+              reverse, g1_pose_clearance_budget(), tent,
+              stop, start, radius, NULL, 0) == G1ClearanceOk &&
+          clearance_result_same(output, reverse),
+          "named-tent certificate is bit-identical under reversal");
+}
+
+static void task34_require_sphere_capsule_guard(
+    const heightfield& field,
+    vec3 center,
+    float radius,
+    double minimum_guard)
+{
+    G1SurfaceSample producer = {};
+    check(g1_surface_query_v2(
+              producer, field, center.x, center.z) ==
+              G1SurfaceQueryValid,
+          "sphere/capsule guard probe has a valid producer sample");
+    const vec3 upper_endpoint(
+        center.x, center.y + 0.25f, center.z);
+    G1ClearanceResult sphere = seeded_result(225.0);
+    G1ClearanceResult capsule = seeded_result(226.0);
+    G1ClearanceResult reverse = seeded_result(227.0);
+    check(g1_sphere_clearance(
+              sphere, g1_pose_clearance_budget(), field,
+              center, radius, NULL, 0) == G1ClearanceOk &&
+          g1_capsule_clearance(
+              capsule, g1_pose_clearance_budget(), field,
+              center, upper_endpoint, radius,
+              NULL, 0) == G1ClearanceOk &&
+          g1_capsule_clearance(
+              reverse, g1_pose_clearance_budget(), field,
+              upper_endpoint, center, radius,
+              NULL, 0) == G1ClearanceOk,
+          "sphere/capsule output-guard fixtures certify");
+    const double producer_clearance =
+        static_cast<double>(center.y) -
+        static_cast<double>(radius) -
+        static_cast<double>(producer.height);
+    check(sphere.lower_bound_m <= producer_clearance &&
+              capsule.lower_bound_m <= producer_clearance,
+          "sphere/capsule lower bounds preserve producer-height safety");
+    check(sphere.witness_upper_m - sphere.lower_bound_m >=
+              minimum_guard &&
+              capsule.witness_upper_m - capsule.lower_bound_m >=
+              minimum_guard,
+          "sphere/capsule certificates retain the mandatory float guard");
+    check(clearance_result_same(capsule, reverse),
+          "guard capsule remains bit-identical under endpoint reversal");
 }
 
 static void test_task34_sphere_capsule_output_guards()
@@ -2231,6 +2711,87 @@ static void test_task34_sphere_capsule_output_guards()
               capsule.lower_bound_m <= producer_clearance,
           "sphere/capsule lower bounds preserve producer-height safety");
 
+    const float one_up =
+        float_from_bits(float_bits(1.0f) + 1);
+    const double one_ulp =
+        static_cast<double>(one_up) - 1.0;
+    heightfield upward;
+    point_make_field(upward);
+    upward.heights(0) = 1.0f;
+    upward.heights(1) = one_up;
+    upward.heights(2) = 1.0f;
+    upward.heights(3) = one_up;
+    const vec3 upward_center(0.75f, 2.0f, 0.25f);
+    G1SurfaceSample upward_sample = {};
+    check(g1_surface_query_v2(
+              upward_sample, upward,
+              upward_center.x, upward_center.z) ==
+              G1SurfaceQueryValid &&
+          float_bits(upward_sample.height) == float_bits(one_up),
+          "sphere/capsule fixture forces upward binary32 rounding");
+    task34_require_sphere_capsule_guard(
+        upward, upward_center, 0.125f, one_ulp);
+
+    const float minimum_normal =
+        std::numeric_limits<float>::min();
+    const float zero_band_signs[] = {
+        -minimum_normal, minimum_normal
+    };
+    for (size_t sign = 0;
+         sign < sizeof(zero_band_signs) /
+                    sizeof(zero_band_signs[0]);
+         ++sign) {
+        heightfield zero_band;
+        point_make_field(zero_band);
+        zero_band.heights(0) = zero_band_signs[sign];
+        zero_band.heights(1) = 0.0f;
+        zero_band.heights(2) = zero_band_signs[sign];
+        zero_band.heights(3) = 0.0f;
+        const vec3 zero_center(0.5f, 1.0f, 0.25f);
+        G1SurfaceSample zero_sample = {};
+        check(g1_surface_query_v2(
+                  zero_sample, zero_band,
+                  zero_center.x, zero_center.z) ==
+                  G1SurfaceQueryValid &&
+              float_bits(zero_sample.height) == 0,
+              "sphere/capsule zero-band producer canonicalizes to +zero");
+        task34_require_sphere_capsule_guard(
+            zero_band, zero_center, 0.125f,
+            static_cast<double>(minimum_normal));
+    }
+
+    const float binades[] = {1.0f, 2.0f};
+    const vec3 side_centers[] = {
+        vec3(0.75f, 4.0f, 0.25f),
+        vec3(0.25f, 4.0f, 0.75f)
+    };
+    for (size_t binade = 0;
+         binade < sizeof(binades) / sizeof(binades[0]);
+         ++binade) {
+        const float boundary = binades[binade];
+        const float below =
+            float_from_bits(float_bits(boundary) - 1);
+        const float above =
+            float_from_bits(float_bits(boundary) + 1);
+        const double larger_ulp =
+            static_cast<double>(above) -
+            static_cast<double>(boundary);
+        heightfield crossing;
+        point_make_field(crossing);
+        crossing.heights(0) = below;
+        crossing.heights(1) = boundary;
+        crossing.heights(2) = boundary;
+        crossing.heights(3) = boundary;
+        for (size_t side = 0;
+             side < sizeof(side_centers) /
+                        sizeof(side_centers[0]);
+             ++side) {
+            task34_require_sphere_capsule_guard(
+                crossing, side_centers[side], 0.125f,
+                larger_ulp);
+        }
+    }
+
     heightfield flat_sixteen;
     point_make_field(flat_sixteen, 5, 5,
                      0.0f, 0.0f, 0.25f);
@@ -2253,6 +2814,95 @@ static void test_task34_sphere_capsule_output_guards()
     check(sphere_before.same(failed_sphere) &&
               capsule_before.same(failed_capsule),
           "mandatory-guard failures preserve sphere/capsule outputs");
+}
+
+static void test_task34_exact_dyadic_fallback()
+{
+    heightfield field;
+    point_make_field(field, 3, 3, 0.0f, 0.0f, 0.25f);
+    const uint32_t height_bits[] = {
+        UINT32_C(0x3ec00000), UINT32_C(0x3e000000),
+        UINT32_C(0x3fe00000), UINT32_C(0x3fa00000),
+        UINT32_C(0x3e800000), UINT32_C(0x3e000000),
+        UINT32_C(0x3fb00000), UINT32_C(0x3f900000),
+        UINT32_C(0x3fe00000)
+    };
+    for (int index = 0; index < 9; ++index) {
+        field.heights(index) = float_from_bits(height_bits[index]);
+    }
+    const vec3 endpoint_a(
+        float_from_bits(UINT32_C(0x3ed00000)),
+        float_from_bits(UINT32_C(0x40100000)),
+        float_from_bits(UINT32_C(0x3e620000)));
+    const vec3 endpoint_b(
+        float_from_bits(UINT32_C(0x3ec60000)),
+        float_from_bits(UINT32_C(0x3fc80000)),
+        float_from_bits(UINT32_C(0x3e4e0000)));
+    const float radius = float_from_bits(UINT32_C(0x3dc00000));
+
+    G1ClearanceResult output = seeded_result(241.0);
+    check(g1_capsule_clearance(
+              output, g1_pose_clearance_budget(), field,
+              endpoint_a, endpoint_b, radius,
+              NULL, 0) == G1ClearanceOk,
+          "adversarial capsule closes through exact-dyadic fallback");
+    check(output.lower_bound_m <= output.witness_upper_m &&
+              output.witness_upper_m - output.lower_bound_m <=
+                  G1ClearanceMaximumCertificateWidthM,
+          "fallback capsule returns the required certified width");
+    const long double oracle =
+        1.5625L -
+        (6.5L * 0.38671875L -
+         6.5L * 0.201171875L - 1.5L) -
+        0.09375L * std::sqrt(85.5L);
+    check(static_cast<long double>(output.lower_bound_m) <= oracle &&
+              oracle <=
+                  static_cast<long double>(output.witness_upper_m),
+          "fallback capsule encloses the independent B-cap plane oracle");
+    check(output.work.subdivision_nodes == 38,
+          "fallback capsule charges its deterministic dyadic child count");
+
+    G1ClearanceResult reverse = seeded_result(247.0);
+    check(g1_capsule_clearance(
+              reverse, g1_pose_clearance_budget(), field,
+              endpoint_b, endpoint_a, radius,
+              NULL, 0) == G1ClearanceOk &&
+          clearance_result_same(output, reverse),
+          "exact-dyadic fallback is bit-identical under endpoint reversal");
+
+    G1ClearanceBudget no_subdivision = g1_pose_clearance_budget();
+    no_subdivision.maximum_subdivision_nodes = 0;
+    G1ClearanceResult failed = seeded_result(251.0);
+    const ByteSnapshot<G1ClearanceResult> failed_before(failed);
+    check(g1_capsule_clearance(
+              failed, no_subdivision, field,
+              endpoint_a, endpoint_b, radius,
+              NULL, 0) == G1ClearanceUncertified,
+          "zero subdivision cap fails closed on an unresolved patch");
+    check(failed_before.same(failed),
+          "exhausted fallback cap preserves capsule output");
+
+    G1ClearanceBudget exact_subdivision = g1_pose_clearance_budget();
+    exact_subdivision.maximum_subdivision_nodes = 38;
+    G1ClearanceResult exact = seeded_result(253.0);
+    check(g1_capsule_clearance(
+              exact, exact_subdivision, field,
+              endpoint_a, endpoint_b, radius,
+              NULL, 0) == G1ClearanceOk &&
+          clearance_result_same(output, exact),
+          "exact 38-child fallback cap reproduces the default result");
+
+    G1ClearanceBudget one_child_short = g1_pose_clearance_budget();
+    one_child_short.maximum_subdivision_nodes = 37;
+    G1ClearanceResult short_output = seeded_result(257.0);
+    const ByteSnapshot<G1ClearanceResult> short_before(short_output);
+    check(g1_capsule_clearance(
+              short_output, one_child_short, field,
+              endpoint_a, endpoint_b, radius,
+              NULL, 0) == G1ClearanceUncertified,
+          "odd cap below the atomic 38-child work fails closed");
+    check(short_before.same(short_output),
+          "one-child-short fallback cap preserves capsule output");
 }
 
 class RoundingModeGuard
@@ -2677,10 +3327,115 @@ static void test_arithmetic_environment_rejection_and_restoration()
           "valid call succeeds after every environment restoration");
 }
 
+static void task34_parity_emit(
+    const char* name,
+    const heightfield& field,
+    vec3 endpoint_a,
+    vec3 endpoint_b,
+    float radius,
+    bool require_subdivision)
+{
+    G1ClearanceResult result = seeded_result(997.0);
+    const G1ClearanceStatus status = g1_capsule_clearance(
+        result, g1_pose_clearance_budget(), field,
+        endpoint_a, endpoint_b, radius, NULL, 0);
+    check(status == G1ClearanceOk &&
+              result.lower_bound_m <= result.witness_upper_m &&
+              result.witness_upper_m - result.lower_bound_m <=
+                  G1ClearanceMaximumCertificateWidthM,
+          "capsule parity fixture returns a certified interval");
+    check((result.work.subdivision_nodes != 0) == require_subdivision,
+          "capsule parity fixture has its locked fallback class");
+    const G1ClearanceWitness& witness = result.witness;
+    const G1ClearanceWork& work = result.work;
+    std::printf(
+        "clearance=%s status=%u bounds=%016llx,%016llx "
+        "witness=%016llx,%016llx,%016llx,%016llx,%016llx,%016llx,"
+        "%016llx,%016llx,%016llx,%016llx "
+        "key=%u,%d,%d,%u,%u,%u,%u "
+        "work=%u,%u,%u,%u,%u,%u\n",
+        name, static_cast<unsigned int>(status),
+        static_cast<unsigned long long>(
+            double_bits(result.lower_bound_m)),
+        static_cast<unsigned long long>(
+            double_bits(result.witness_upper_m)),
+        static_cast<unsigned long long>(double_bits(witness.body_x)),
+        static_cast<unsigned long long>(double_bits(witness.body_y)),
+        static_cast<unsigned long long>(double_bits(witness.body_z)),
+        static_cast<unsigned long long>(double_bits(witness.surface_x)),
+        static_cast<unsigned long long>(double_bits(witness.surface_y)),
+        static_cast<unsigned long long>(double_bits(witness.surface_z)),
+        static_cast<unsigned long long>(
+            double_bits(witness.segment_parameter)),
+        static_cast<unsigned long long>(
+            double_bits(witness.terrain_weight_0)),
+        static_cast<unsigned long long>(
+            double_bits(witness.terrain_weight_1)),
+        static_cast<unsigned long long>(
+            double_bits(witness.terrain_weight_2)),
+        witness.primitive_index,
+        witness.cell_x,
+        witness.cell_z,
+        witness.terrain_triangle_index,
+        witness.patch_index,
+        witness.candidate_kind,
+        witness.candidate_subindex,
+        work.point_queries,
+        work.cells_visited,
+        work.primitive_triangle_pairs,
+        work.face_patches,
+        work.candidate_tests,
+        work.subdivision_nodes);
+}
+
+static int run_task34_combined_parity_mode()
+{
+    test_normal_arithmetic_environment();
+    const int query_status = run_query_parity_mode();
+    if (query_status != 0) {
+        return query_status;
+    }
+
+    heightfield analytic;
+    point_make_field(analytic, 5, 5, 0.0f, 0.0f, 0.25f);
+    task34_parity_emit(
+        "analytic", analytic,
+        vec3(float_from_bits(UINT32_C(0x3f000000)),
+             float_from_bits(UINT32_C(0x3f800000)),
+             float_from_bits(UINT32_C(0x3f000000))),
+        vec3(float_from_bits(UINT32_C(0x3f000000)),
+             float_from_bits(UINT32_C(0x3fa00000)),
+             float_from_bits(UINT32_C(0x3f000000))),
+        float_from_bits(UINT32_C(0x3e000000)), false);
+
+    heightfield fallback;
+    point_make_field(fallback, 3, 3, 0.0f, 0.0f, 0.25f);
+    const uint32_t height_bits[] = {
+        UINT32_C(0x3ec00000), UINT32_C(0x3e000000),
+        UINT32_C(0x3fe00000), UINT32_C(0x3fa00000),
+        UINT32_C(0x3e800000), UINT32_C(0x3e000000),
+        UINT32_C(0x3fb00000), UINT32_C(0x3f900000),
+        UINT32_C(0x3fe00000)
+    };
+    for (int index = 0; index < 9; ++index) {
+        fallback.heights(index) = float_from_bits(height_bits[index]);
+    }
+    task34_parity_emit(
+        "fallback", fallback,
+        vec3(float_from_bits(UINT32_C(0x3ed00000)),
+             float_from_bits(UINT32_C(0x40100000)),
+             float_from_bits(UINT32_C(0x3e620000))),
+        vec3(float_from_bits(UINT32_C(0x3ec60000)),
+             float_from_bits(UINT32_C(0x3fc80000)),
+             float_from_bits(UINT32_C(0x3e4e0000))),
+        float_from_bits(UINT32_C(0x3dc00000)), true);
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     if (argc == 2 && std::strcmp(argv[1], "--query-parity") == 0) {
-        return run_query_parity_mode();
+        return run_task34_combined_parity_mode();
     }
     if (argc == 2 &&
         std::strcmp(argv[1], "--task34-sphere") == 0) {
@@ -2704,6 +3459,7 @@ int main(int argc, char** argv)
     }
     if (argc == 2 &&
         std::strcmp(argv[1], "--task34-domain-field") == 0) {
+        test_task34_input_field_and_exterior_matrix();
         test_task34_domain_and_malformed_height_matrix();
         return 0;
     }
@@ -2720,6 +3476,11 @@ int main(int argc, char** argv)
     if (argc == 2 &&
         std::strcmp(argv[1], "--task34-guards") == 0) {
         test_task34_sphere_capsule_output_guards();
+        return 0;
+    }
+    if (argc == 2 &&
+        std::strcmp(argv[1], "--task34-fallback") == 0) {
+        test_task34_exact_dyadic_fallback();
         return 0;
     }
     test_normal_arithmetic_environment();
@@ -2739,10 +3500,12 @@ int main(int argc, char** argv)
     test_task34_finite_capsule_plane_and_reversal();
     test_task34_footprint_domain_budget_and_transaction();
     test_task34_fixed_diagonal_and_rank_cases();
+    test_task34_input_field_and_exterior_matrix();
     test_task34_domain_and_malformed_height_matrix();
     test_task34_rectangular_count_preflights();
     test_task34_named_tent_sign_reversal();
     test_task34_sphere_capsule_output_guards();
+    test_task34_exact_dyadic_fallback();
     test_arithmetic_environment_rejection_and_restoration();
     return 0;
 }

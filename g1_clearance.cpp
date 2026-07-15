@@ -17,6 +17,8 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <new>
 
 #if defined(__SSE__) || defined(_M_X64) || defined(_M_IX86_FP)
 #include <xmmintrin.h>
@@ -1311,6 +1313,14 @@ struct G1CapsulePatchResult
     bool used_relaxed_lower;
 };
 
+struct G1DeferredCapsulePatch
+{
+    G1CapsuleTriangle triangle;
+    G1CapsulePatch patch;
+    G1CapsulePatchResult analytic;
+    double float_guard;
+};
+
 static bool g1_clearance_interval_minimum(
     const G1ClearanceInterval& left,
     const G1ClearanceInterval& right,
@@ -2218,17 +2228,29 @@ static bool g1_clearance_patch_edge(
             return false;
         }
         g1_clearance_patch_update_lower(result, value.lower);
-        const uint32_t selected = first.y <= second.y
-            ? first_index
-            : second_index;
-        double weights[3] = {};
-        weights[selected] = 1.0;
-        G1CapsuleWitnessCandidate witness = {};
-        if (g1_clearance_patch_witness(
-                endpoints, triangle, patch, weights,
-                radius, primitive_index, 1,
-                3 * edge_index + 1, witness)) {
-            g1_clearance_patch_update_witness(result, witness);
+        const bool try_first =
+            first.y_enclosure.upper <= second.y_enclosure.lower ||
+            !(second.y_enclosure.upper < first.y_enclosure.lower);
+        const bool try_second =
+            second.y_enclosure.upper <= first.y_enclosure.lower ||
+            !(first.y_enclosure.upper < second.y_enclosure.lower);
+        const uint32_t endpoint_indices[2] = {
+            first_index, second_index
+        };
+        const bool attempts[2] = {try_first, try_second};
+        for (uint32_t endpoint = 0; endpoint < 2; ++endpoint) {
+            if (!attempts[endpoint]) {
+                continue;
+            }
+            double weights[3] = {};
+            weights[endpoint_indices[endpoint]] = 1.0;
+            G1CapsuleWitnessCandidate witness = {};
+            if (g1_clearance_patch_witness(
+                    endpoints, triangle, patch, weights,
+                    radius, primitive_index, 1,
+                    3 * edge_index + 1 + endpoint, witness)) {
+                g1_clearance_patch_update_witness(result, witness);
+            }
         }
         if (rho_square.upper > radius_square.lower) {
             result.used_relaxed_lower = true;
@@ -2266,6 +2288,9 @@ static bool g1_clearance_patch_edge(
         line_radius_square.upper < 0.0) {
         return true;
     }
+    const bool line_radicand_uncertain =
+        line_radius_square.lower < 0.0 &&
+        q_square.upper > radius_square.lower;
     line_radius_square.lower = line_radius_square.lower < 0.0
         ? 0.0
         : line_radius_square.lower;
@@ -2358,7 +2383,11 @@ static bool g1_clearance_patch_edge(
             exact_branch = true;
         }
     }
-    if (!exact_branch) {
+    if (line_radicand_uncertain &&
+        unconstrained.lower < selected_lower) {
+        selected_lower = unconstrained.lower;
+    }
+    if (!exact_branch || line_radicand_uncertain) {
         result.used_relaxed_lower = true;
     }
     g1_clearance_patch_update_lower(result, selected_lower);
@@ -2465,6 +2494,854 @@ static bool g1_clearance_solve_capsule_patch(
     }
     output = candidate;
     return true;
+}
+
+struct G1ExactDyadic
+{
+    uint64_t numerator;
+    uint16_t exponent;
+};
+
+struct G1FallbackVertex
+{
+    G1ExactDyadic root_weight[3];
+    double root_weight_double[3];
+    double x;
+    double y;
+    double z;
+    G1ClearanceInterval x_enclosure;
+    G1ClearanceInterval y_enclosure;
+    G1ClearanceInterval z_enclosure;
+};
+
+struct G1FallbackNode
+{
+    G1FallbackVertex vertex[3];
+    double lower;
+    uint32_t creation_ordinal;
+};
+
+enum G1FallbackStatus
+{
+    G1FallbackOk,
+    G1FallbackNoGeometry,
+    G1FallbackUncertified,
+    G1FallbackArithmeticFailure
+};
+
+static G1ExactDyadic g1_clearance_dyadic_canonical(
+    uint64_t numerator,
+    uint16_t exponent)
+{
+    if (numerator == 0) {
+        return {0, 0};
+    }
+    while (exponent > 0 && (numerator & UINT64_C(1)) == 0) {
+        numerator >>= 1;
+        --exponent;
+    }
+    return {numerator, exponent};
+}
+
+static bool g1_clearance_dyadic_same(
+    const G1ExactDyadic& left,
+    const G1ExactDyadic& right)
+{
+    return left.numerator == right.numerator &&
+           left.exponent == right.exponent;
+}
+
+static bool g1_clearance_dyadic_add(
+    const G1ExactDyadic& left,
+    const G1ExactDyadic& right,
+    G1ExactDyadic& output)
+{
+    if (left.numerator == 0) {
+        output = right;
+        return true;
+    }
+    if (right.numerator == 0) {
+        output = left;
+        return true;
+    }
+    const uint16_t exponent = left.exponent > right.exponent
+        ? left.exponent
+        : right.exponent;
+    const uint32_t left_shift =
+        static_cast<uint32_t>(exponent - left.exponent);
+    const uint32_t right_shift =
+        static_cast<uint32_t>(exponent - right.exponent);
+    if (left_shift >= 64 || right_shift >= 64 ||
+        left.numerator > (UINT64_MAX >> left_shift) ||
+        right.numerator > (UINT64_MAX >> right_shift)) {
+        return false;
+    }
+    const uint64_t aligned_left = left.numerator << left_shift;
+    const uint64_t aligned_right = right.numerator << right_shift;
+    if (aligned_right > UINT64_MAX - aligned_left) {
+        return false;
+    }
+    output = g1_clearance_dyadic_canonical(
+        aligned_left + aligned_right, exponent);
+    return true;
+}
+
+static bool g1_clearance_dyadic_midpoint(
+    const G1ExactDyadic& left,
+    const G1ExactDyadic& right,
+    G1ExactDyadic& output)
+{
+    G1ExactDyadic sum = {};
+    if (!g1_clearance_dyadic_add(left, right, sum) ||
+        sum.exponent == UINT16_MAX) {
+        return false;
+    }
+    output = g1_clearance_dyadic_canonical(
+        sum.numerator,
+        static_cast<uint16_t>(sum.exponent + 1));
+    return true;
+}
+
+static bool g1_clearance_dyadic_to_double(
+    const G1ExactDyadic& value,
+    double& output)
+{
+    if (value.numerator == 0) {
+        if (value.exponent != 0) {
+            return false;
+        }
+        output = 0.0;
+        return true;
+    }
+    if ((value.numerator & UINT64_C(1)) == 0 ||
+        value.numerator > (UINT64_C(1) << 53) ||
+        value.exponent > 1074) {
+        return false;
+    }
+    const volatile double materialized = std::ldexp(
+        static_cast<double>(value.numerator),
+        -static_cast<int>(value.exponent));
+    if (!terrain_double_is_finite(materialized) ||
+        materialized == 0.0) {
+        return false;
+    }
+    const volatile double round_trip = std::ldexp(
+        static_cast<double>(materialized),
+        static_cast<int>(value.exponent));
+    if (!terrain_double_is_finite(round_trip) ||
+        round_trip != static_cast<double>(value.numerator)) {
+        return false;
+    }
+    output = materialized;
+    return true;
+}
+
+static bool g1_clearance_dyadic_weights_sum_to_one(
+    const G1ExactDyadic weights[3])
+{
+    G1ExactDyadic partial = {};
+    G1ExactDyadic sum = {};
+    return g1_clearance_dyadic_add(
+               weights[0], weights[1], partial) &&
+           g1_clearance_dyadic_add(
+               partial, weights[2], sum) &&
+           sum.numerator == 1 && sum.exponent == 0;
+}
+
+static bool g1_clearance_fallback_vertex_same(
+    const G1FallbackVertex& left,
+    const G1FallbackVertex& right)
+{
+    for (int index = 0; index < 3; ++index) {
+        if (!g1_clearance_dyadic_same(
+                left.root_weight[index],
+                right.root_weight[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool g1_clearance_fallback_vertex(
+    const G1CapsulePatch& root_patch,
+    const G1ExactDyadic root_weights[3],
+    G1FallbackVertex& output)
+{
+    if (!g1_clearance_dyadic_weights_sum_to_one(root_weights)) {
+        return false;
+    }
+    G1FallbackVertex candidate = {};
+    volatile double x = 0.0;
+    volatile double y = 0.0;
+    volatile double z = 0.0;
+    for (int index = 0; index < 3; ++index) {
+        candidate.root_weight[index] = root_weights[index];
+        if (!g1_clearance_dyadic_to_double(
+                root_weights[index],
+                candidate.root_weight_double[index])) {
+            return false;
+        }
+        x = x + candidate.root_weight_double[index] *
+            root_patch.vertex[index].x;
+        y = y + candidate.root_weight_double[index] *
+            root_patch.vertex[index].y;
+        z = z + candidate.root_weight_double[index] *
+            root_patch.vertex[index].z;
+    }
+    if (!terrain_double_is_finite(x) ||
+        !terrain_double_is_finite(y) ||
+        !terrain_double_is_finite(z)) {
+        return false;
+    }
+    G1ClearanceInterval first_sum = {};
+    G1ClearanceInterval exact_sum = {};
+    if (!g1_clearance_interval_add(
+            {candidate.root_weight_double[0],
+             candidate.root_weight_double[0]},
+            {candidate.root_weight_double[1],
+             candidate.root_weight_double[1]}, first_sum) ||
+        !g1_clearance_interval_add(
+            first_sum,
+            {candidate.root_weight_double[2],
+             candidate.root_weight_double[2]}, exact_sum) ||
+        !g1_clearance_patch_combination(
+            root_patch, candidate.root_weight_double, exact_sum,
+            candidate.x_enclosure,
+            candidate.y_enclosure,
+            candidate.z_enclosure)) {
+        return false;
+    }
+    candidate.x = x == 0.0 ? 0.0 : x;
+    candidate.y = y == 0.0 ? 0.0 : y;
+    candidate.z = z == 0.0 ? 0.0 : z;
+    output = candidate;
+    return true;
+}
+
+static bool g1_clearance_fallback_midpoint(
+    const G1CapsulePatch& root_patch,
+    const G1FallbackVertex& left,
+    const G1FallbackVertex& right,
+    G1FallbackVertex& output)
+{
+    G1ExactDyadic weights[3] = {};
+    for (int index = 0; index < 3; ++index) {
+        if (!g1_clearance_dyadic_midpoint(
+                left.root_weight[index],
+                right.root_weight[index], weights[index])) {
+            return false;
+        }
+    }
+    if (!g1_clearance_fallback_vertex(
+            root_patch, weights, output) ||
+        g1_clearance_fallback_vertex_same(output, left) ||
+        g1_clearance_fallback_vertex_same(output, right)) {
+        return false;
+    }
+    return true;
+}
+
+static bool g1_clearance_downward_square(
+    double value,
+    double& output)
+{
+    if (!terrain_double_is_finite(value) || value < 0.0) {
+        return false;
+    }
+    if (value == 0.0) {
+        output = 0.0;
+        return true;
+    }
+    const volatile double square = value * value;
+    if (!terrain_double_is_finite(square)) {
+        return false;
+    }
+    const volatile double lower = std::nextafter(
+        static_cast<double>(square),
+        -std::numeric_limits<double>::infinity());
+    if (!terrain_double_is_finite(lower)) {
+        return false;
+    }
+    output = lower < 0.0 ? 0.0 : lower;
+    return true;
+}
+
+static bool g1_clearance_fallback_node_bound(
+    const G1FallbackVertex vertices[3],
+    double radius,
+    bool& has_geometry,
+    double& lower)
+{
+    double minimum_x_lower = vertices[0].x_enclosure.lower;
+    double maximum_x_upper = vertices[0].x_enclosure.upper;
+    double minimum_z_lower = vertices[0].z_enclosure.lower;
+    double maximum_z_upper = vertices[0].z_enclosure.upper;
+    double minimum_y_lower = vertices[0].y_enclosure.lower;
+    for (int index = 1; index < 3; ++index) {
+        minimum_x_lower = vertices[index].x_enclosure.lower <
+                                  minimum_x_lower
+            ? vertices[index].x_enclosure.lower
+            : minimum_x_lower;
+        maximum_x_upper = vertices[index].x_enclosure.upper >
+                                  maximum_x_upper
+            ? vertices[index].x_enclosure.upper
+            : maximum_x_upper;
+        minimum_z_lower = vertices[index].z_enclosure.lower <
+                                  minimum_z_lower
+            ? vertices[index].z_enclosure.lower
+            : minimum_z_lower;
+        maximum_z_upper = vertices[index].z_enclosure.upper >
+                                  maximum_z_upper
+            ? vertices[index].z_enclosure.upper
+            : maximum_z_upper;
+        minimum_y_lower = vertices[index].y_enclosure.lower <
+                                  minimum_y_lower
+            ? vertices[index].y_enclosure.lower
+            : minimum_y_lower;
+    }
+    const double distance_x = minimum_x_lower > 0.0
+        ? minimum_x_lower
+        : (maximum_x_upper < 0.0 ? -maximum_x_upper : 0.0);
+    const double distance_z = minimum_z_lower > 0.0
+        ? minimum_z_lower
+        : (maximum_z_upper < 0.0 ? -maximum_z_upper : 0.0);
+    double distance_x_square = 0.0;
+    double distance_z_square = 0.0;
+    if (!g1_clearance_downward_square(
+            distance_x, distance_x_square) ||
+        !g1_clearance_downward_square(
+            distance_z, distance_z_square)) {
+        return false;
+    }
+    const volatile double distance_sum =
+        distance_x_square + distance_z_square;
+    if (!terrain_double_is_finite(distance_sum)) {
+        return false;
+    }
+    double rho_square_lower = distance_sum == 0.0
+        ? 0.0
+        : std::nextafter(
+            static_cast<double>(distance_sum),
+            -std::numeric_limits<double>::infinity());
+    rho_square_lower = rho_square_lower < 0.0
+        ? 0.0
+        : rho_square_lower;
+    G1ClearanceInterval radius_square = {};
+    if (!g1_clearance_interval_square(
+            {radius, radius}, radius_square)) {
+        return false;
+    }
+    if (rho_square_lower > radius_square.upper) {
+        has_geometry = false;
+        lower = 0.0;
+        return true;
+    }
+    const volatile double radicand_value =
+        radius_square.upper - rho_square_lower;
+    double radicand_upper = 0.0;
+    if (!g1_clearance_outward_upper(
+            radicand_value, radicand_upper) ||
+        radicand_upper < 0.0) {
+        return false;
+    }
+    const volatile double root = std::sqrt(radicand_upper);
+    double root_upper = 0.0;
+    if (!g1_clearance_outward_upper(root, root_upper)) {
+        return false;
+    }
+    const volatile double coarse_value =
+        minimum_y_lower - root_upper;
+    if (!g1_clearance_outward_lower(coarse_value, lower)) {
+        return false;
+    }
+    has_geometry = true;
+    return true;
+}
+
+static bool g1_clearance_fallback_try_witnesses(
+    const G1CertifiedEndpoint endpoints[2],
+    const G1CapsuleTriangle& triangle,
+    const G1CapsulePatch& root_patch,
+    const G1FallbackNode& node,
+    double radius,
+    uint32_t primitive_index,
+    bool& has_witness,
+    G1CapsuleWitnessCandidate& best_witness)
+{
+    const auto try_node_weights = [&](const double node_weights[3]) {
+        double weights[3] = {};
+        for (int root = 0; root < 3; ++root) {
+            volatile double value = 0.0;
+            for (int vertex = 0; vertex < 3; ++vertex) {
+                value = value + node_weights[vertex] *
+                    node.vertex[vertex].root_weight_double[root];
+            }
+            if (!terrain_double_is_finite(value) || value < 0.0) {
+                return false;
+            }
+            weights[root] = value == 0.0 ? 0.0 : value;
+        }
+        G1CapsuleWitnessCandidate witness = {};
+        if (g1_clearance_patch_witness(
+                endpoints, triangle, root_patch, weights,
+                radius, primitive_index, 2,
+                node.creation_ordinal, witness) &&
+            (!has_witness || witness.upper < best_witness.upper ||
+             (witness.upper == best_witness.upper &&
+              g1_clearance_witness_key_less(
+                  witness.witness, best_witness.witness)))) {
+            has_witness = true;
+            best_witness = witness;
+        }
+        return true;
+    };
+
+    for (int vertex = 0; vertex < 3; ++vertex) {
+        double node_weights[3] = {};
+        node_weights[vertex] = 1.0;
+        if (!try_node_weights(node_weights)) {
+            return false;
+        }
+    }
+
+    // Certify the origin as the closest point when it lies inside the
+    // projected node triangle.  Uncertain determinant or membership rejects
+    // this attempt; edge/vertex candidates below remain available.
+    G1ClearanceInterval dx1 = {};
+    G1ClearanceInterval dz1 = {};
+    G1ClearanceInterval dx2 = {};
+    G1ClearanceInterval dz2 = {};
+    G1ClearanceInterval first_product = {};
+    G1ClearanceInterval second_product = {};
+    G1ClearanceInterval determinant = {};
+    if (!g1_clearance_interval_subtract(
+            node.vertex[1].x_enclosure,
+            node.vertex[0].x_enclosure, dx1) ||
+        !g1_clearance_interval_subtract(
+            node.vertex[1].z_enclosure,
+            node.vertex[0].z_enclosure, dz1) ||
+        !g1_clearance_interval_subtract(
+            node.vertex[2].x_enclosure,
+            node.vertex[0].x_enclosure, dx2) ||
+        !g1_clearance_interval_subtract(
+            node.vertex[2].z_enclosure,
+            node.vertex[0].z_enclosure, dz2) ||
+        !g1_clearance_interval_multiply(dx1, dz2, first_product) ||
+        !g1_clearance_interval_multiply(dx2, dz1, second_product) ||
+        !g1_clearance_interval_subtract(
+            first_product, second_product, determinant)) {
+        return false;
+    }
+    if (determinant.lower > 0.0 || determinant.upper < 0.0) {
+        G1ClearanceInterval px = {};
+        G1ClearanceInterval pz = {};
+        G1ClearanceInterval w1_numerator = {};
+        G1ClearanceInterval w2_numerator = {};
+        G1ClearanceInterval w1 = {};
+        G1ClearanceInterval w2 = {};
+        G1ClearanceInterval w0_partial = {};
+        G1ClearanceInterval w0 = {};
+        if (!g1_clearance_interval_negate(
+                node.vertex[0].x_enclosure, px) ||
+            !g1_clearance_interval_negate(
+                node.vertex[0].z_enclosure, pz) ||
+            !g1_clearance_interval_multiply(px, dz2, first_product) ||
+            !g1_clearance_interval_multiply(dx2, pz, second_product) ||
+            !g1_clearance_interval_subtract(
+                first_product, second_product, w1_numerator) ||
+            !g1_clearance_interval_multiply(dx1, pz, first_product) ||
+            !g1_clearance_interval_multiply(px, dz1, second_product) ||
+            !g1_clearance_interval_subtract(
+                first_product, second_product, w2_numerator) ||
+            !g1_clearance_interval_divide(
+                w1_numerator, determinant, w1) ||
+            !g1_clearance_interval_divide(
+                w2_numerator, determinant, w2) ||
+            !g1_clearance_interval_subtract(
+                {1.0, 1.0}, w1, w0_partial) ||
+            !g1_clearance_interval_subtract(
+                w0_partial, w2, w0)) {
+            return false;
+        }
+        if (w0.lower >= 0.0 &&
+            w1.lower >= 0.0 && w2.lower >= 0.0) {
+            const volatile double dx1_c =
+                node.vertex[1].x - node.vertex[0].x;
+            const volatile double dz1_c =
+                node.vertex[1].z - node.vertex[0].z;
+            const volatile double dx2_c =
+                node.vertex[2].x - node.vertex[0].x;
+            const volatile double dz2_c =
+                node.vertex[2].z - node.vertex[0].z;
+            const volatile double det_c =
+                dx1_c * dz2_c - dx2_c * dz1_c;
+            if (terrain_double_is_finite(det_c) && det_c != 0.0) {
+                const volatile double px_c = -node.vertex[0].x;
+                const volatile double pz_c = -node.vertex[0].z;
+                const volatile double weight1 =
+                    (px_c * dz2_c - dx2_c * pz_c) / det_c;
+                const volatile double weight2 =
+                    (dx1_c * pz_c - px_c * dz1_c) / det_c;
+                const volatile double weight0 =
+                    1.0 - weight1 - weight2;
+                const double node_weights[3] = {
+                    weight0, weight1, weight2
+                };
+                if (weight0 >= 0.0 && weight1 >= 0.0 &&
+                    weight2 >= 0.0 &&
+                    !try_node_weights(node_weights)) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    // The closest point of an outside projected triangle lies on one of its
+    // three closed edges.  For every edge whose projection/clamp is certified,
+    // attempt that closest point.  The vertices above cover certified endpoint
+    // clamps; inconclusive comparisons are rejected rather than guessed.
+    const uint32_t edges[3][2] = {
+        {0, 1}, {1, 2}, {2, 0}
+    };
+    for (uint32_t edge = 0; edge < 3; ++edge) {
+        const uint32_t first = edges[edge][0];
+        const uint32_t second = edges[edge][1];
+        G1ClearanceInterval dx = {};
+        G1ClearanceInterval dz = {};
+        G1ClearanceInterval dx_square = {};
+        G1ClearanceInterval dz_square = {};
+        G1ClearanceInterval length_square = {};
+        G1ClearanceInterval dot_x = {};
+        G1ClearanceInterval dot_z = {};
+        G1ClearanceInterval dot = {};
+        G1ClearanceInterval negative_dot = {};
+        G1ClearanceInterval parameter = {};
+        if (!g1_clearance_interval_subtract(
+                node.vertex[second].x_enclosure,
+                node.vertex[first].x_enclosure, dx) ||
+            !g1_clearance_interval_subtract(
+                node.vertex[second].z_enclosure,
+                node.vertex[first].z_enclosure, dz) ||
+            !g1_clearance_interval_square(dx, dx_square) ||
+            !g1_clearance_interval_square(dz, dz_square) ||
+            !g1_clearance_interval_add(
+                dx_square, dz_square, length_square) ||
+            length_square.lower <= 0.0) {
+            continue;
+        }
+        if (!g1_clearance_interval_multiply(
+                node.vertex[first].x_enclosure, dx, dot_x) ||
+            !g1_clearance_interval_multiply(
+                node.vertex[first].z_enclosure, dz, dot_z) ||
+            !g1_clearance_interval_add(dot_x, dot_z, dot) ||
+            !g1_clearance_interval_negate(dot, negative_dot) ||
+            !g1_clearance_interval_divide(
+                negative_dot, length_square, parameter)) {
+            return false;
+        }
+        if (parameter.lower < 0.0 || parameter.upper > 1.0) {
+            continue;
+        }
+        const volatile double dx_c =
+            node.vertex[second].x - node.vertex[first].x;
+        const volatile double dz_c =
+            node.vertex[second].z - node.vertex[first].z;
+        const volatile double length_square_c =
+            dx_c * dx_c + dz_c * dz_c;
+        if (!terrain_double_is_finite(length_square_c) ||
+            length_square_c <= 0.0) {
+            continue;
+        }
+        const volatile double parameter_c =
+            -(node.vertex[first].x * dx_c +
+              node.vertex[first].z * dz_c) /
+            length_square_c;
+        if (!terrain_double_is_finite(parameter_c) ||
+            parameter_c < 0.0 || parameter_c > 1.0) {
+            continue;
+        }
+        double node_weights[3] = {};
+        node_weights[first] = 1.0 - parameter_c;
+        node_weights[second] = parameter_c;
+        if (!try_node_weights(node_weights)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool g1_clearance_fallback_edge_upper(
+    const G1FallbackVertex& left,
+    const G1FallbackVertex& right,
+    G1ClearanceInterval& output)
+{
+    G1ClearanceInterval dx = {};
+    G1ClearanceInterval dy = {};
+    G1ClearanceInterval dz = {};
+    G1ClearanceInterval dx_square = {};
+    G1ClearanceInterval dy_square = {};
+    G1ClearanceInterval dz_square = {};
+    G1ClearanceInterval length_square = {};
+    if (!g1_clearance_interval_subtract(
+            right.x_enclosure, left.x_enclosure, dx) ||
+        !g1_clearance_interval_subtract(
+            right.y_enclosure, left.y_enclosure, dy) ||
+        !g1_clearance_interval_subtract(
+            right.z_enclosure, left.z_enclosure, dz) ||
+        !g1_clearance_interval_square(dx, dx_square) ||
+        !g1_clearance_interval_square(dy, dy_square) ||
+        !g1_clearance_interval_square(dz, dz_square) ||
+        !g1_clearance_interval_sum3(
+            dx_square, dy_square, dz_square, length_square) ||
+        !terrain_double_is_finite(length_square.lower) ||
+        !terrain_double_is_finite(length_square.upper) ||
+        length_square.lower < 0.0 ||
+        length_square.lower > length_square.upper) {
+        return false;
+    }
+    output = length_square;
+    return true;
+}
+
+static G1FallbackStatus g1_clearance_fallback_patch(
+    const G1CertifiedEndpoint endpoints[2],
+    const G1CapsuleTriangle& triangle,
+    const G1CapsulePatch& root_patch,
+    double radius,
+    uint32_t primitive_index,
+    double target_width,
+    uint32_t subdivision_limit,
+    uint32_t& subdivision_used,
+    uint32_t& next_creation_ordinal,
+    const G1CapsulePatchResult& analytic,
+    G1CapsulePatchResult& output)
+{
+    if (!terrain_double_is_finite(target_width) ||
+        target_width <= 0.0 ||
+        subdivision_used > subdivision_limit ||
+        subdivision_limit > G1ClearanceMaximumSubdivisionNodes) {
+        return G1FallbackUncertified;
+    }
+    G1FallbackNode* active = new (std::nothrow)
+        G1FallbackNode[G1ClearanceMaximumSubdivisionNodes + 1];
+    if (active == NULL) {
+        return G1FallbackArithmeticFailure;
+    }
+    G1FallbackNode root = {};
+    for (int vertex = 0; vertex < 3; ++vertex) {
+        G1ExactDyadic weights[3] = {};
+        weights[vertex] = {1, 0};
+        if (!g1_clearance_fallback_vertex(
+                root_patch, weights, root.vertex[vertex])) {
+            delete[] active;
+            return G1FallbackArithmeticFailure;
+        }
+    }
+    if (next_creation_ordinal == UINT32_MAX) {
+        delete[] active;
+        return G1FallbackArithmeticFailure;
+    }
+    root.creation_ordinal = next_creation_ordinal++;
+    bool root_has_geometry = false;
+    if (!g1_clearance_fallback_node_bound(
+            root.vertex, radius,
+            root_has_geometry, root.lower)) {
+        delete[] active;
+        return G1FallbackArithmeticFailure;
+    }
+    if (!root_has_geometry) {
+        delete[] active;
+        return G1FallbackNoGeometry;
+    }
+    uint32_t active_count = 1;
+    active[0] = root;
+    bool has_witness = analytic.has_witness;
+    G1CapsuleWitnessCandidate best_witness = analytic.witness;
+    if (!g1_clearance_fallback_try_witnesses(
+            endpoints, triangle, root_patch, root,
+            radius, primitive_index,
+            has_witness, best_witness)) {
+        delete[] active;
+        return G1FallbackArithmeticFailure;
+    }
+
+    for (;;) {
+        if (active_count == 0) {
+            delete[] active;
+            return G1FallbackNoGeometry;
+        }
+        uint32_t selected = 0;
+        for (uint32_t index = 1; index < active_count; ++index) {
+            if (active[index].lower < active[selected].lower ||
+                (active[index].lower == active[selected].lower &&
+                 active[index].creation_ordinal <
+                     active[selected].creation_ordinal)) {
+                selected = index;
+            }
+        }
+        const double minimum_lower = active[selected].lower;
+        if (has_witness) {
+            const volatile double width_value =
+                best_witness.upper - minimum_lower;
+            double width_upper = 0.0;
+            if (!g1_clearance_outward_upper(
+                    width_value, width_upper)) {
+                delete[] active;
+                return G1FallbackArithmeticFailure;
+            }
+            if (width_upper <= target_width) {
+                G1CapsulePatchResult candidate = {};
+                candidate.has_lower = true;
+                candidate.lower = minimum_lower;
+                candidate.has_witness = true;
+                candidate.witness = best_witness;
+                candidate.used_relaxed_lower = false;
+                output = candidate;
+                delete[] active;
+                return G1FallbackOk;
+            }
+        }
+        if (subdivision_used > subdivision_limit ||
+            subdivision_limit - subdivision_used < 2 ||
+            G1ClearanceMaximumSubdivisionNodes - subdivision_used < 2) {
+            delete[] active;
+            return G1FallbackUncertified;
+        }
+
+        const uint32_t edge_vertices[3][2] = {
+            {0, 1}, {1, 2}, {2, 0}
+        };
+        const uint32_t remaining_vertex[3] = {2, 0, 1};
+        G1ClearanceInterval edge_length[3] = {};
+        for (int edge = 0; edge < 3; ++edge) {
+            if (!g1_clearance_fallback_edge_upper(
+                    active[selected].vertex[edge_vertices[edge][0]],
+                    active[selected].vertex[edge_vertices[edge][1]],
+                    edge_length[edge])) {
+                delete[] active;
+                return G1FallbackArithmeticFailure;
+            }
+        }
+        const G1FallbackNode parent = active[selected];
+        G1FallbackNode children[2] = {};
+        bool split_found = false;
+        for (uint32_t edge = 0; edge < 3; ++edge) {
+            bool overlaps_longest = true;
+            for (uint32_t other = 0; other < 3; ++other) {
+                if (edge != other &&
+                    edge_length[other].lower >
+                        edge_length[edge].upper) {
+                    overlaps_longest = false;
+                }
+            }
+            if (!overlaps_longest ||
+                edge_length[edge].upper <= 0.0) {
+                continue;
+            }
+            const uint32_t first = edge_vertices[edge][0];
+            const uint32_t second = edge_vertices[edge][1];
+            const uint32_t remaining = remaining_vertex[edge];
+            G1FallbackVertex midpoint = {};
+            if (!g1_clearance_fallback_midpoint(
+                    root_patch, parent.vertex[first],
+                    parent.vertex[second], midpoint)) {
+                continue;
+            }
+            G1FallbackNode candidate_children[2] = {};
+            candidate_children[0].vertex[0] = parent.vertex[first];
+            candidate_children[0].vertex[1] = midpoint;
+            candidate_children[0].vertex[2] = parent.vertex[remaining];
+            candidate_children[1].vertex[0] = midpoint;
+            candidate_children[1].vertex[1] = parent.vertex[second];
+            candidate_children[1].vertex[2] = parent.vertex[remaining];
+            if (!g1_clearance_fallback_vertex_same(
+                    candidate_children[0].vertex[1],
+                    candidate_children[1].vertex[0]) ||
+                !g1_clearance_fallback_vertex_same(
+                    candidate_children[0].vertex[0],
+                    parent.vertex[first]) ||
+                !g1_clearance_fallback_vertex_same(
+                    candidate_children[1].vertex[1],
+                    parent.vertex[second]) ||
+                !g1_clearance_fallback_vertex_same(
+                    candidate_children[0].vertex[2],
+                    parent.vertex[remaining]) ||
+                !g1_clearance_fallback_vertex_same(
+                    candidate_children[1].vertex[2],
+                    parent.vertex[remaining])) {
+                delete[] active;
+                return G1FallbackArithmeticFailure;
+            }
+            G1ClearanceInterval first_half_length = {};
+            G1ClearanceInterval second_half_length = {};
+            if (!g1_clearance_fallback_edge_upper(
+                    candidate_children[0].vertex[0],
+                    candidate_children[0].vertex[1],
+                    first_half_length) ||
+                !g1_clearance_fallback_edge_upper(
+                    candidate_children[1].vertex[0],
+                    candidate_children[1].vertex[1],
+                    second_half_length)) {
+                delete[] active;
+                return G1FallbackArithmeticFailure;
+            }
+            if (first_half_length.upper >=
+                    edge_length[edge].upper ||
+                second_half_length.upper >=
+                    edge_length[edge].upper) {
+                continue;
+            }
+            children[0] = candidate_children[0];
+            children[1] = candidate_children[1];
+            split_found = true;
+            break;
+        }
+        if (!split_found) {
+            delete[] active;
+            return G1FallbackUncertified;
+        }
+        for (int child = 0; child < 2; ++child) {
+            for (int vertex = 0; vertex < 3; ++vertex) {
+                if (!g1_clearance_dyadic_weights_sum_to_one(
+                        children[child].vertex[vertex].root_weight)) {
+                    delete[] active;
+                    return G1FallbackArithmeticFailure;
+                }
+            }
+        }
+        if (next_creation_ordinal > UINT32_MAX - 2) {
+            delete[] active;
+            return G1FallbackArithmeticFailure;
+        }
+        for (int child = 0; child < 2; ++child) {
+            children[child].creation_ordinal =
+                next_creation_ordinal++;
+        }
+        subdivision_used += 2;
+        active[selected] = active[active_count - 1];
+        --active_count;
+        for (int child = 0; child < 2; ++child) {
+            bool child_has_geometry = false;
+            if (!g1_clearance_fallback_node_bound(
+                    children[child].vertex, radius,
+                    child_has_geometry, children[child].lower) ||
+                !g1_clearance_fallback_try_witnesses(
+                    endpoints, triangle, root_patch,
+                    children[child], radius, primitive_index,
+                    has_witness, best_witness)) {
+                delete[] active;
+                return G1FallbackArithmeticFailure;
+            }
+            if (child_has_geometry) {
+                if (active_count >=
+                    G1ClearanceMaximumSubdivisionNodes + 1) {
+                    delete[] active;
+                    return G1FallbackArithmeticFailure;
+                }
+                active[active_count++] = children[child];
+            }
+        }
+    }
 }
 
 static G1ClearanceStatus g1_clearance_contract_stub(
@@ -2598,11 +3475,24 @@ static G1ClearanceStatus g1_clearance_capsule_core(
             "G1 capsule fixed work exceeds its tightened budget");
     }
 
+    std::unique_ptr<G1DeferredCapsulePatch[]> deferred_patches(
+        new (std::nothrow) G1DeferredCapsulePatch[
+            static_cast<size_t>(patch_count)]);
+    if (!deferred_patches) {
+        return g1_clearance_error(
+            G1ClearanceArithmeticFailure,
+            diagnostic.output, diagnostic.capacity,
+            "G1 capsule could not allocate deferred patch records");
+    }
+    uint32_t deferred_patch_count = 0;
+
     bool has_lower = false;
     double global_lower = 0.0;
     bool has_witness = false;
     G1CapsuleWitnessCandidate global_witness = {};
     bool relaxed_patch_remains = false;
+    uint32_t subdivision_used = 0;
+    uint32_t next_creation_ordinal = 0;
     for (int cell_z = span.minimum_z;
          cell_z <= span.maximum_z;
          ++cell_z) {
@@ -2675,7 +3565,25 @@ static G1ClearanceStatus g1_clearance_capsule_core(
                             diagnostic.output, diagnostic.capacity,
                             "G1 capsule patch arithmetic failed");
                     }
-                    if (patch_result.has_lower) {
+                    const bool deferred =
+                        patch_result.used_relaxed_lower &&
+                        patch_result.has_lower;
+                    if (deferred) {
+                        if (deferred_patch_count >= patch_count) {
+                            return g1_clearance_error(
+                                G1ClearanceArithmeticFailure,
+                                diagnostic.output,
+                                diagnostic.capacity,
+                                "G1 capsule deferred patch count overflowed");
+                        }
+                        G1DeferredCapsulePatch& record =
+                            deferred_patches[deferred_patch_count++];
+                        record.triangle = triangle;
+                        record.patch = patch;
+                        record.analytic = patch_result;
+                        record.float_guard = float_guard;
+                    }
+                    if (!deferred && patch_result.has_lower) {
                         const volatile double guarded_value =
                             patch_result.lower - float_guard;
                         double guarded_lower = 0.0;
@@ -2709,6 +3617,112 @@ static G1ClearanceStatus g1_clearance_capsule_core(
             }
         }
     }
+
+    for (uint32_t index = 0;
+         index < deferred_patch_count;
+         ++index) {
+        const G1DeferredCapsulePatch& record = deferred_patches[index];
+        G1CapsulePatchResult patch_result = record.analytic;
+        const volatile double target_value =
+            G1ClearanceMaximumCertificateWidthM -
+            record.float_guard;
+        double target_width = 0.0;
+        if (!g1_clearance_outward_lower(
+                target_value, target_width)) {
+            return g1_clearance_error(
+                G1ClearanceArithmeticFailure,
+                diagnostic.output, diagnostic.capacity,
+                "G1 capsule fallback target is nonfinite");
+        }
+        G1CapsulePatchResult fallback_seed = patch_result;
+        if (has_witness &&
+            (!fallback_seed.has_witness ||
+             global_witness.upper < fallback_seed.witness.upper ||
+             (global_witness.upper == fallback_seed.witness.upper &&
+              g1_clearance_witness_key_less(
+                  global_witness.witness,
+                  fallback_seed.witness.witness)))) {
+            fallback_seed.has_witness = true;
+            fallback_seed.witness = global_witness;
+        }
+        bool requires_fallback = !fallback_seed.has_witness;
+        if (fallback_seed.has_witness) {
+            const volatile double local_width_value =
+                fallback_seed.witness.upper - patch_result.lower;
+            double local_width_upper = 0.0;
+            if (!g1_clearance_outward_upper(
+                    local_width_value, local_width_upper)) {
+                return g1_clearance_error(
+                    G1ClearanceArithmeticFailure,
+                    diagnostic.output, diagnostic.capacity,
+                    "G1 capsule relaxed patch width is nonfinite");
+            }
+            requires_fallback = local_width_upper > target_width;
+        }
+        if (requires_fallback) {
+            G1CapsulePatchResult fallback_result = {};
+            const G1FallbackStatus fallback_status =
+                g1_clearance_fallback_patch(
+                    endpoints, record.triangle, record.patch, radius,
+                    0, target_width,
+                    limits.maximum_subdivision_nodes,
+                    subdivision_used,
+                    next_creation_ordinal,
+                    fallback_seed, fallback_result);
+            if (fallback_status == G1FallbackUncertified) {
+                return g1_clearance_error(
+                    G1ClearanceUncertified,
+                    diagnostic.output, diagnostic.capacity,
+                    "G1 capsule subdivision cap exhausted");
+            }
+            if (fallback_status == G1FallbackArithmeticFailure) {
+                return g1_clearance_error(
+                    G1ClearanceArithmeticFailure,
+                    diagnostic.output, diagnostic.capacity,
+                    "G1 capsule fallback arithmetic failed");
+            }
+            if (fallback_status == G1FallbackNoGeometry) {
+                if (record.analytic.has_witness) {
+                    return g1_clearance_error(
+                        G1ClearanceArithmeticFailure,
+                        diagnostic.output, diagnostic.capacity,
+                        "G1 capsule fallback contradicted a witness");
+                }
+                patch_result = {};
+            } else {
+                patch_result = fallback_result;
+            }
+        }
+        if (patch_result.has_lower) {
+            const volatile double guarded_value =
+                patch_result.lower - record.float_guard;
+            double guarded_lower = 0.0;
+            if (!g1_clearance_outward_lower(
+                    guarded_value, guarded_lower)) {
+                return g1_clearance_error(
+                    G1ClearanceArithmeticFailure,
+                    diagnostic.output, diagnostic.capacity,
+                    "G1 capsule deferred lower bound is nonfinite");
+            }
+            if (!has_lower || guarded_lower < global_lower) {
+                has_lower = true;
+                global_lower = guarded_lower;
+            }
+        }
+        if (patch_result.has_witness &&
+            (!has_witness ||
+             patch_result.witness.upper < global_witness.upper ||
+             (patch_result.witness.upper == global_witness.upper &&
+              g1_clearance_witness_key_less(
+                  patch_result.witness.witness,
+                  global_witness.witness)))) {
+            has_witness = true;
+            global_witness = patch_result.witness;
+        }
+        relaxed_patch_remains = relaxed_patch_remains ||
+            patch_result.used_relaxed_lower;
+    }
+
     if (!has_lower || !has_witness ||
         !terrain_double_is_finite(global_lower) ||
         !terrain_double_is_finite(global_witness.upper) ||
@@ -2749,6 +3763,7 @@ static G1ClearanceStatus g1_clearance_capsule_core(
         static_cast<uint32_t>(patch_count);
     candidate.work.candidate_tests =
         static_cast<uint32_t>(candidate_count);
+    candidate.work.subdivision_nodes = subdivision_used;
     output = candidate;
     return G1ClearanceOk;
 }
