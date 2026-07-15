@@ -613,18 +613,14 @@ static void test_budget_caps_for_family(bool swing_family)
         G1ClearanceBudget limits = factory;
         require_budget_status(
             swing_family, limits,
-            swing_family
-                ? G1ClearanceUncertified
-                : G1ClearanceInvalidField,
+            G1ClearanceInvalidField,
             "factory cap is admitted by its family");
 
         limits = factory;
         limits.*fields[index] = 0;
         require_budget_status(
             swing_family, limits,
-            swing_family
-                ? G1ClearanceUncertified
-                : G1ClearanceInvalidField,
+            G1ClearanceInvalidField,
             "zero is an admitted tightened budget");
 
         limits = factory;
@@ -3784,6 +3780,1024 @@ static void test_arithmetic_environment_rejection_and_restoration()
           "valid call succeeds after every environment restoration");
 }
 
+static bool task5_witness_key_less(
+    const G1ClearanceWitness& left,
+    const G1ClearanceWitness& right)
+{
+    if (left.primitive_index != right.primitive_index) {
+        return left.primitive_index < right.primitive_index;
+    }
+    if (left.cell_z != right.cell_z) {
+        return left.cell_z < right.cell_z;
+    }
+    if (left.cell_x != right.cell_x) {
+        return left.cell_x < right.cell_x;
+    }
+    if (left.terrain_triangle_index !=
+        right.terrain_triangle_index) {
+        return left.terrain_triangle_index <
+               right.terrain_triangle_index;
+    }
+    if (left.patch_index != right.patch_index) {
+        return left.patch_index < right.patch_index;
+    }
+    if (left.candidate_kind != right.candidate_kind) {
+        return left.candidate_kind < right.candidate_kind;
+    }
+    return left.candidate_subindex < right.candidate_subindex;
+}
+
+static void task5_add_work(
+    G1ClearanceWork& total,
+    const G1ClearanceWork& addend)
+{
+    uint32_t G1ClearanceWork::* const members[] = {
+        &G1ClearanceWork::point_queries,
+        &G1ClearanceWork::cells_visited,
+        &G1ClearanceWork::primitive_triangle_pairs,
+        &G1ClearanceWork::face_patches,
+        &G1ClearanceWork::candidate_tests,
+        &G1ClearanceWork::subdivision_nodes
+    };
+    for (const auto member : members) {
+        const uint64_t sum =
+            static_cast<uint64_t>(total.*member) +
+            static_cast<uint64_t>(addend.*member);
+        check(sum <= UINT32_MAX,
+              "Task 5 independent work sum fits uint32");
+        total.*member = static_cast<uint32_t>(sum);
+    }
+}
+
+static G1ClearanceResult task5_aggregate_results(
+    const G1ClearanceResult* results,
+    int count)
+{
+    check(results != NULL && count > 0,
+          "Task 5 aggregate oracle has members");
+    const G1ClearanceResult* lower = &results[0];
+    const G1ClearanceResult* witness = &results[0];
+    G1ClearanceWork total = {};
+    for (int index = 0; index < count; ++index) {
+        if (results[index].lower_bound_m < lower->lower_bound_m) {
+            lower = &results[index];
+        }
+        if (results[index].witness_upper_m <
+                witness->witness_upper_m ||
+            (double_bits(results[index].witness_upper_m) ==
+                 double_bits(witness->witness_upper_m) &&
+             task5_witness_key_less(
+                 results[index].witness, witness->witness))) {
+            witness = &results[index];
+        }
+        task5_add_work(total, results[index].work);
+    }
+    G1ClearanceResult output = *lower;
+    output.witness_upper_m = witness->witness_upper_m;
+    output.witness = witness->witness;
+    output.work = total;
+    return output;
+}
+
+static G1ClearanceResult task5_rekey_result(
+    G1ClearanceResult result,
+    uint32_t primitive_index)
+{
+    result.witness.primitive_index = primitive_index;
+    return result;
+}
+
+static G1ClearanceResult task5_require_point(
+    const heightfield& field,
+    vec3 point,
+    uint32_t primitive_index)
+{
+    G1ClearanceResult result = seeded_result(301.0 + primitive_index);
+    char error[256] = {};
+    check(g1_point_clearance(
+              result, g1_pose_clearance_budget(), field, point,
+              error, static_cast<int>(sizeof(error))) == G1ClearanceOk,
+          error[0] == '\0' ?
+              "Task 5 direct point certifies" : error);
+    return task5_rekey_result(result, primitive_index);
+}
+
+static G1ClearanceResult task5_require_sphere(
+    const heightfield& field,
+    vec3 center,
+    float radius,
+    uint32_t primitive_index,
+    const G1ClearanceBudget& limits = g1_pose_clearance_budget())
+{
+    G1ClearanceResult result = seeded_result(401.0 + primitive_index);
+    char error[256] = {};
+    check(g1_sphere_clearance(
+              result, limits, field, center, radius,
+              error, static_cast<int>(sizeof(error))) == G1ClearanceOk,
+          error[0] == '\0' ?
+              "Task 5 direct sphere certifies" : error);
+    return task5_rekey_result(result, primitive_index);
+}
+
+static G1ClearanceResult task5_require_capsule(
+    const heightfield& field,
+    vec3 endpoint_a,
+    vec3 endpoint_b,
+    float radius,
+    uint32_t primitive_index,
+    const G1ClearanceBudget& limits = g1_pose_clearance_budget())
+{
+    G1ClearanceResult result = seeded_result(501.0 + primitive_index);
+    char error[256] = {};
+    check(g1_capsule_clearance(
+              result, limits, field,
+              endpoint_a, endpoint_b, radius,
+              error, static_cast<int>(sizeof(error))) == G1ClearanceOk,
+          error[0] == '\0' ?
+              "Task 5 direct capsule certifies" : error);
+    return task5_rekey_result(result, primitive_index);
+}
+
+static G1ClearanceResult task5_direct_foot(
+    const heightfield& field,
+    const vec3 centers[4],
+    float radius,
+    uint32_t primitive_base,
+    const G1ClearanceBudget& limits = g1_pose_clearance_budget())
+{
+    G1ClearanceResult spheres[4] = {};
+    for (uint32_t index = 0; index < 4; ++index) {
+        spheres[index] = task5_require_sphere(
+            field, centers[index], radius,
+            primitive_base + index, limits);
+    }
+    return task5_aggregate_results(spheres, 4);
+}
+
+static G1ClearanceResult task5_direct_swept_foot(
+    const heightfield& field,
+    const vec3 previous[4],
+    const vec3 current[4],
+    float radius,
+    uint32_t primitive_base)
+{
+    const G1ClearanceBudget limits =
+        g1_swing_foot_clearance_budget();
+    G1ClearanceResult capsules[4] = {};
+    for (uint32_t index = 0; index < 4; ++index) {
+        capsules[index] = task5_require_capsule(
+            field, previous[index], current[index], radius,
+            primitive_base + index, limits);
+    }
+    return task5_aggregate_results(capsules, 4);
+}
+
+static G1LegClearance task5_direct_leg(
+    const heightfield& field,
+    const slice1d<vec3> global_positions,
+    const slice1d<quat> global_rotations,
+    const G1LegConfig& config,
+    uint32_t primitive_base)
+{
+    G1LegClearance output = {};
+    output.knee = task5_require_point(
+        field, global_positions(config.knee), primitive_base + 0);
+    output.ankle = task5_require_point(
+        field, global_positions(config.ankle), primitive_base + 1);
+    output.toe = task5_require_point(
+        field, global_positions(config.contact), primitive_base + 2);
+
+    vec3 foot_centers[4] = {};
+    for (int index = 0; index < 4; ++index) {
+        foot_centers[index] =
+            global_positions(config.ankle) +
+            quat_mul_vec3(
+                global_rotations(config.ankle),
+                config.foot_sphere_centers_local[index]);
+    }
+    output.foot = task5_direct_foot(
+        field, foot_centers, config.foot_sphere_radius_m,
+        primitive_base + 3);
+
+    const vec3 thigh_a =
+        global_positions(config.hip) +
+        quat_mul_vec3(
+            global_rotations(config.hip),
+            config.thigh_start_local);
+    const vec3 thigh_b =
+        global_positions(config.hip) +
+        quat_mul_vec3(
+            global_rotations(config.hip),
+            config.thigh_end_local);
+    output.thigh = task5_require_capsule(
+        field, thigh_a, thigh_b, config.thigh_radius_m,
+        primitive_base + 7);
+
+    const vec3 shin_a =
+        global_positions(config.knee) +
+        quat_mul_vec3(
+            global_rotations(config.knee),
+            config.shin_start_local);
+    const vec3 shin_b =
+        global_positions(config.knee) +
+        quat_mul_vec3(
+            global_rotations(config.knee),
+            config.shin_end_local);
+    output.shin = task5_require_capsule(
+        field, shin_a, shin_b, config.shin_radius_m,
+        primitive_base + 8);
+
+    const G1ClearanceResult components[] = {
+        output.knee,
+        output.ankle,
+        output.toe,
+        output.foot,
+        output.thigh,
+        output.shin
+    };
+    output.minimum = task5_aggregate_results(
+        components,
+        static_cast<int>(
+            sizeof(components) / sizeof(components[0])));
+    return output;
+}
+
+static bool task5_leg_same(
+    const G1LegClearance& left,
+    const G1LegClearance& right)
+{
+    return clearance_result_same(left.knee, right.knee) &&
+           clearance_result_same(left.ankle, right.ankle) &&
+           clearance_result_same(left.toe, right.toe) &&
+           clearance_result_same(left.foot, right.foot) &&
+           clearance_result_same(left.thigh, right.thigh) &&
+           clearance_result_same(left.shin, right.shin) &&
+           clearance_result_same(left.minimum, right.minimum);
+}
+
+static G1LegClearance task5_seed_leg(double base)
+{
+    G1LegClearance output = {};
+    output.knee = seeded_result(base + 1.0);
+    output.ankle = seeded_result(base + 2.0);
+    output.toe = seeded_result(base + 3.0);
+    output.foot = seeded_result(base + 4.0);
+    output.thigh = seeded_result(base + 5.0);
+    output.shin = seeded_result(base + 6.0);
+    output.minimum = seeded_result(base + 7.0);
+    return output;
+}
+
+static G1PoseClearance task5_seed_pose(double base)
+{
+    G1PoseClearance output = {};
+    output.hips = seeded_result(base + 1.0);
+    output.left = task5_seed_leg(base + 10.0);
+    output.right = task5_seed_leg(base + 20.0);
+    output.minimum = seeded_result(base + 30.0);
+    return output;
+}
+
+static void task5_make_pose(
+    vec3 positions[G1_BoneCount],
+    quat rotations[G1_BoneCount])
+{
+    for (int bone = 0; bone < G1_BoneCount; ++bone) {
+        positions[bone] = vec3(0.0f, 1.5f, 0.0f);
+        rotations[bone] = quat();
+    }
+    positions[G1_Hips] = vec3(0.0f, 1.8f, 0.0f);
+
+    const G1LegConfig left = g1_left_leg_config();
+    positions[left.hip] = vec3(-0.35f, 1.2f, -0.15f);
+    positions[left.knee] = vec3(-0.30f, 0.9f, -0.10f);
+    positions[left.ankle] = vec3(-0.25f, 0.55f, -0.05f);
+    positions[left.contact] = vec3(-0.10f, 0.70f, -0.05f);
+    rotations[left.hip] = quat(0.0f, 1.0f, 0.0f, 0.0f);
+    rotations[left.knee] = quat(0.0f, 0.0f, 0.0f, 1.0f);
+    rotations[left.ankle] = quat(0.0f, 0.0f, 1.0f, 0.0f);
+
+    const G1LegConfig right = g1_right_leg_config();
+    positions[right.hip] = positions[left.hip];
+    positions[right.knee] = positions[left.knee];
+    positions[right.ankle] = positions[left.ankle];
+    positions[right.contact] = positions[left.contact];
+    rotations[right.hip] = quat(0.0f, 1.0f, 0.0f, 0.0f);
+    rotations[right.knee] = quat(0.0f, 0.0f, 0.0f, 1.0f);
+    rotations[right.ankle] = quat(0.0f, 0.0f, 1.0f, 0.0f);
+}
+
+static void test_task5_aggregate_certificates()
+{
+    heightfield field;
+    point_make_field(field, 17, 17, -1.0f, -1.0f, 0.125f);
+
+    const vec3 foot_centers[4] = {
+        vec3(-0.45f, 0.90f, -0.20f),
+        vec3(-0.15f, 1.10f, -0.10f),
+        vec3(0.15f, 0.80f, 0.10f),
+        vec3(0.45f, 0.80f, 0.20f)
+    };
+    const float radius = 0.02f;
+    const G1ClearanceResult expected_foot = task5_direct_foot(
+        field, foot_centers, radius, 0);
+    G1ClearanceResult foot = seeded_result(601.0);
+    char error[256] = {};
+    check(g1_foot_clearance(
+              foot, g1_pose_clearance_budget(), field,
+              foot_centers, radius,
+              error, static_cast<int>(sizeof(error))) == G1ClearanceOk,
+          error[0] == '\0' ?
+              "Task 5 foot aggregate certifies" : error);
+    check(clearance_result_same(foot, expected_foot),
+          "Task 5 foot equals four independent sphere certificates");
+    check(foot.witness.primitive_index == 2,
+          "Task 5 foot witness tie keeps the first stable primitive key");
+
+    const vec3 previous[4] = {
+        vec3(-0.45f, 0.90f, -0.20f),
+        vec3(-0.15f, 1.00f, -0.10f),
+        vec3(0.15f, 0.60f, 0.10f),
+        vec3(0.45f, 1.10f, 0.20f)
+    };
+    const vec3 current[4] = {
+        vec3(-0.42f, 0.91f, -0.18f),
+        vec3(-0.12f, 1.01f, -0.08f),
+        vec3(0.18f, float_from_bits(UINT32_C(0x3f000001)), 0.12f),
+        vec3(0.48f, 1.11f, 0.22f)
+    };
+    const G1ClearanceResult expected_sweep = task5_direct_swept_foot(
+        field, previous, current, radius, 0);
+    G1ClearanceResult sweep = seeded_result(603.0);
+    check(g1_swept_foot_clearance(
+              sweep, g1_swing_foot_clearance_budget(), field,
+              previous, current, radius,
+              error, static_cast<int>(sizeof(error))) == G1ClearanceOk,
+          error[0] == '\0' ?
+              "Task 5 swept foot certifies" : error);
+    check(clearance_result_same(sweep, expected_sweep),
+          "Task 5 swept foot uses the supplied actual endpoint bits");
+
+    G1ClearanceResult reversed = seeded_result(607.0);
+    check(g1_swept_foot_clearance(
+              reversed, g1_swing_foot_clearance_budget(), field,
+              current, previous, radius,
+              error, static_cast<int>(sizeof(error))) == G1ClearanceOk &&
+          clearance_result_same(sweep, reversed),
+          "Task 5 four-capsule sweep is reversal invariant");
+
+    vec3 fake_current[4] = {
+        current[0], current[1], current[2], current[3]
+    };
+    fake_current[2].y = float_from_bits(float_bits(current[2].y) + 1);
+    const G1ClearanceResult fake_sweep = task5_direct_swept_foot(
+        field, previous, fake_current, radius, 0);
+    check(!clearance_result_same(expected_sweep, fake_sweep),
+          "Task 5 sweep oracle distinguishes a one-ULP fake endpoint");
+
+    vec3 positions[G1_BoneCount];
+    quat rotations[G1_BoneCount];
+    task5_make_pose(positions, rotations);
+    const slice1d<vec3> position_slice(G1_BoneCount, positions);
+    const slice1d<quat> rotation_slice(G1_BoneCount, rotations);
+
+    const G1LegConfig left_config = g1_left_leg_config();
+    const G1LegClearance expected_left = task5_direct_leg(
+        field, position_slice, rotation_slice, left_config, 0);
+    G1LegClearance left = {};
+    left.minimum = seeded_result(611.0);
+    check(g1_measure_leg_clearance(
+              left, g1_pose_clearance_budget(), field,
+              position_slice, rotation_slice, left_config,
+              error, static_cast<int>(sizeof(error))) == G1ClearanceOk,
+          error[0] == '\0' ?
+              "Task 5 leg aggregate certifies" : error);
+    check(task5_leg_same(left, expected_left),
+          "Task 5 leg members equal direct transformed primitives");
+    check(left.knee.witness.primitive_index == 0 &&
+              left.ankle.witness.primitive_index == 1 &&
+              left.toe.witness.primitive_index == 2 &&
+              left.foot.witness.primitive_index >= 3 &&
+              left.foot.witness.primitive_index <= 6 &&
+              left.thigh.witness.primitive_index == 7 &&
+              left.shin.witness.primitive_index == 8,
+          "Task 5 standalone leg owns primitive indices 0 through 8");
+
+    G1PoseClearance expected_pose = {};
+    expected_pose.hips = task5_require_point(
+        field, positions[G1_Hips], 0);
+    expected_pose.left = task5_direct_leg(
+        field, position_slice, rotation_slice,
+        g1_left_leg_config(), 1);
+    expected_pose.right = task5_direct_leg(
+        field, position_slice, rotation_slice,
+        g1_right_leg_config(), 10);
+    const G1ClearanceResult pose_components[] = {
+        expected_pose.hips,
+        expected_pose.left.minimum,
+        expected_pose.right.minimum
+    };
+    expected_pose.minimum = task5_aggregate_results(
+        pose_components,
+        static_cast<int>(
+            sizeof(pose_components) / sizeof(pose_components[0])));
+
+    G1PoseClearance pose = {};
+    pose.minimum = seeded_result(613.0);
+    check(g1_measure_pose_clearance(
+              pose, g1_pose_clearance_budget(), field,
+              position_slice, rotation_slice,
+              error, static_cast<int>(sizeof(error))) == G1ClearanceOk,
+          error[0] == '\0' ?
+              "Task 5 pose aggregate certifies" : error);
+    check(clearance_result_same(pose.hips, expected_pose.hips) &&
+              task5_leg_same(pose.left, expected_pose.left) &&
+              task5_leg_same(pose.right, expected_pose.right) &&
+              clearance_result_same(
+                  pose.minimum, expected_pose.minimum),
+          "Task 5 pose members equal all nineteen direct primitives");
+    check(pose.hips.witness.primitive_index == 0 &&
+              pose.left.knee.witness.primitive_index == 1 &&
+              pose.left.ankle.witness.primitive_index == 2 &&
+              pose.left.toe.witness.primitive_index == 3 &&
+              pose.left.foot.witness.primitive_index >= 4 &&
+              pose.left.foot.witness.primitive_index <= 7 &&
+              pose.left.thigh.witness.primitive_index == 8 &&
+              pose.left.shin.witness.primitive_index == 9 &&
+              pose.right.knee.witness.primitive_index == 10 &&
+              pose.right.ankle.witness.primitive_index == 11 &&
+              pose.right.toe.witness.primitive_index == 12 &&
+              pose.right.foot.witness.primitive_index >= 13 &&
+              pose.right.foot.witness.primitive_index <= 16 &&
+              pose.right.thigh.witness.primitive_index == 17 &&
+              pose.right.shin.witness.primitive_index == 18,
+          "Task 5 pose owns Hips 0, left 1..9, and right 10..18");
+    check(double_bits(pose.left.minimum.lower_bound_m) ==
+              double_bits(pose.right.minimum.lower_bound_m) &&
+              pose.minimum.witness.primitive_index < 10,
+          "Task 5 pose minimum tie selects the stable left primitive");
+}
+
+static void task5_require_foot_failure(
+    const heightfield& field,
+    const vec3 centers[4],
+    float radius,
+    const G1ClearanceBudget& limits,
+    G1ClearanceStatus expected,
+    double seed,
+    const char* message)
+{
+    G1ClearanceResult output = seeded_result(seed);
+    const ByteSnapshot<G1ClearanceResult> output_before(output);
+    const ByteSnapshot<G1ClearanceBudget> limits_before(limits);
+    char error[128] = {};
+    check(g1_foot_clearance(
+              output, limits, field, centers, radius,
+              error, static_cast<int>(sizeof(error))) == expected,
+          message);
+    check(output_before.same(output) && limits_before.same(limits),
+          "Task 5 failed foot aggregate preserves output and limits");
+}
+
+static void test_task5_aggregate_transactions()
+{
+    heightfield field;
+    point_make_field(field, 9, 9, 0.0f, 0.0f, 0.25f);
+    const vec3 valid[4] = {
+        vec3(0.30f, 0.80f, 0.30f),
+        vec3(0.55f, 0.90f, 0.30f),
+        vec3(0.30f, 1.00f, 0.55f),
+        vec3(0.55f, 1.10f, 0.55f)
+    };
+    const float radius = 0.02f;
+
+    vec3 outside[4] = {valid[0], valid[1], valid[2], valid[3]};
+    outside[0].x = 0.0f;
+    task5_require_foot_failure(
+        field, outside, radius, g1_pose_clearance_budget(),
+        G1ClearanceOutsideDomain, 801.0,
+        "Task 5 foot reports outside-domain transactionally");
+
+    G1ClearanceBudget no_cells = g1_pose_clearance_budget();
+    no_cells.maximum_cells = 0;
+    task5_require_foot_failure(
+        field, valid, radius, no_cells,
+        G1ClearanceBudgetExceeded, 803.0,
+        "Task 5 foot reports tightened shared-budget exhaustion");
+
+    const G1ClearanceResult direct = task5_direct_foot(
+        field, valid, radius, 0);
+    check(direct.work.cells_visited > 0,
+          "Task 5 foot late-budget fixture consumes cells");
+    G1ClearanceBudget one_cell_short = g1_pose_clearance_budget();
+    one_cell_short.maximum_cells = direct.work.cells_visited - 1;
+    task5_require_foot_failure(
+        field, valid, radius, one_cell_short,
+        G1ClearanceBudgetExceeded, 805.0,
+        "Task 5 foot enforces one shared ledger across four spheres");
+
+    heightfield wide_guard;
+    point_make_field(wide_guard, 5, 5, 0.0f, 0.0f, 0.25f);
+    wide_guard.heights.set(16.0f);
+    const vec3 high[4] = {
+        vec3(0.50f, 20.0f, 0.50f),
+        vec3(0.75f, 20.0f, 0.50f),
+        vec3(0.50f, 20.0f, 0.75f),
+        vec3(0.75f, 20.0f, 0.75f)
+    };
+    task5_require_foot_failure(
+        wide_guard, high, 0.125f, g1_pose_clearance_budget(),
+        G1ClearanceUncertified, 807.0,
+        "Task 5 foot propagates an uncertified primitive");
+
+    vec3 invalid[4] = {valid[0], valid[1], valid[2], valid[3]};
+    invalid[3].z = float_from_bits(UINT32_C(0x7fc00001));
+    task5_require_foot_failure(
+        field, invalid, radius, g1_pose_clearance_budget(),
+        G1ClearanceInvalidInput, 809.0,
+        "Task 5 foot rejects invalid input transactionally");
+
+    heightfield invalid_field = field;
+    invalid_field.version = 1;
+    task5_require_foot_failure(
+        invalid_field, valid, radius, g1_pose_clearance_budget(),
+        G1ClearanceInvalidField, 811.0,
+        "Task 5 foot rejects an invalid field transactionally");
+
+    {
+        RoundingModeGuard guard;
+        check(std::fesetround(FE_UPWARD) == 0,
+              "Task 5 can enter hostile rounding for aggregate failure");
+        task5_require_foot_failure(
+            field, valid, radius, g1_pose_clearance_budget(),
+            G1ClearanceArithmeticFailure, 813.0,
+            "Task 5 foot rejects hostile arithmetic transactionally");
+    }
+
+    vec3 positions[G1_BoneCount];
+    quat rotations[G1_BoneCount];
+    task5_make_pose(positions, rotations);
+    const slice1d<vec3> position_slice(G1_BoneCount, positions);
+    const slice1d<quat> rotation_slice(G1_BoneCount, rotations);
+
+    heightfield budget_field;
+    point_make_field(
+        budget_field, 33, 33, -1.0f, -1.0f, 0.0625f);
+    G1PoseClearance measured_pose = task5_seed_pose(815.0);
+    char budget_error[256] = {};
+    const G1ClearanceStatus measured_status =
+        g1_measure_pose_clearance(
+            measured_pose, g1_pose_clearance_budget(), budget_field,
+            position_slice, rotation_slice,
+            budget_error, static_cast<int>(sizeof(budget_error)));
+    check(measured_status == G1ClearanceOk,
+          budget_error[0] == '\0' ?
+              "Task 5 late pose-budget baseline certifies" :
+              budget_error);
+    check(measured_pose.minimum.work.cells_visited > 19,
+          "Task 5 late pose-budget fixture has nontrivial shared work");
+    G1ClearanceBudget pose_one_cell_short =
+        g1_pose_clearance_budget();
+    pose_one_cell_short.maximum_cells =
+        measured_pose.minimum.work.cells_visited - 1;
+    G1PoseClearance budget_pose = task5_seed_pose(817.0);
+    const ByteSnapshot<G1PoseClearance> budget_pose_before(budget_pose);
+    check(g1_measure_pose_clearance(
+              budget_pose, pose_one_cell_short, budget_field,
+              position_slice, rotation_slice,
+              NULL, 0) == G1ClearanceBudgetExceeded &&
+              budget_pose_before.same(budget_pose),
+          "Task 5 late shared-budget failure preserves every pose byte");
+
+    positions[g1_left_leg_config().ankle].x =
+        float_from_bits(UINT32_C(0x7fc00002));
+    G1LegClearance leg = task5_seed_leg(820.0);
+    const ByteSnapshot<G1LegClearance> leg_before(leg);
+    check(g1_measure_leg_clearance(
+              leg, g1_pose_clearance_budget(), field,
+              position_slice, rotation_slice, g1_left_leg_config(),
+              NULL, 0) == G1ClearanceInvalidInput &&
+              leg_before.same(leg),
+          "Task 5 invalid transformed leg preserves every output byte");
+
+    task5_make_pose(positions, rotations);
+    positions[g1_right_leg_config().ankle].z =
+        float_from_bits(UINT32_C(0x7fc00003));
+    G1PoseClearance pose = task5_seed_pose(840.0);
+    const ByteSnapshot<G1PoseClearance> pose_before(pose);
+    check(g1_measure_pose_clearance(
+              pose, g1_pose_clearance_budget(), field,
+              position_slice, rotation_slice,
+              NULL, 0) == G1ClearanceInvalidInput &&
+              pose_before.same(pose),
+          "Task 5 late right-leg input preserves the complete pose output");
+}
+
+static int run_task5_aggregate_mode()
+{
+    test_task5_aggregate_certificates();
+    test_task5_aggregate_transactions();
+    return 0;
+}
+
+static G1SwingHistory task5_unique_history(uint32_t seed)
+{
+    G1SwingHistory history = {};
+    history.initialized = true;
+    for (uint32_t index = 0; index < 4; ++index) {
+        history.previous_sphere_centers[index] = vec3(
+            float_from_bits(UINT32_C(0x3e000001) + seed + index),
+            float_from_bits(UINT32_C(0x3f000001) + seed + index),
+            float_from_bits(UINT32_C(0x3e800001) + seed + index));
+    }
+    return history;
+}
+
+static G1SwingClearanceValidation task5_unique_swing_output(
+    uint32_t seed)
+{
+    G1SwingClearanceValidation output = {};
+    output.lower_margin_m = 701.0 + static_cast<double>(seed);
+    output.witness_upper_m = 702.0 + static_cast<double>(seed);
+    output.sweep_evaluated = true;
+    output.work.point_queries = UINT32_C(0x12340000) + seed;
+    output.work.cells_visited = UINT32_C(0x23450000) + seed;
+    output.work.primitive_triangle_pairs = UINT32_C(0x34560000) + seed;
+    output.work.face_patches = UINT32_C(0x45670000) + seed;
+    output.work.candidate_tests = UINT32_C(0x56780000) + seed;
+    output.work.subdivision_nodes = UINT32_C(0x67890000) + seed;
+    return output;
+}
+
+static void test_task5_checked_history()
+{
+    const vec3 initial[4] = {
+        vec3(-0.0f, 0.25f, -0.25f),
+        vec3(0.10f, 0.30f, 0.20f),
+        vec3(0.20f, 0.35f, 0.15f),
+        vec3(0.30f, 0.40f, 0.10f)
+    };
+    char error[128] = {};
+    G1SwingHistory history = task5_unique_history(UINT32_C(0x11));
+    check(g1_swing_history_reset(
+              history, initial,
+              error, static_cast<int>(sizeof(error))),
+          error[0] == '\0' ?
+              "Task 5 history reset accepts twelve runtime components" :
+              error);
+    check(history.initialized &&
+              float_bits(history.previous_sphere_centers[0].x) == 0 &&
+              float_bits(history.previous_sphere_centers[0].z) ==
+                  float_bits(-0.25f),
+          "Task 5 history reset canonicalizes zero and assigns all centers");
+
+    vec3 invalid[4] = {
+        initial[0], initial[1], initial[2], initial[3]
+    };
+    invalid[3].y = float_from_bits(UINT32_C(0x7fc00001));
+    const ByteSnapshot<G1SwingHistory> before_invalid_reset(history);
+    check(!g1_swing_history_reset(
+              history, invalid,
+              error, static_cast<int>(sizeof(error))) &&
+              before_invalid_reset.same(history),
+          "Task 5 failed history reset preserves every prior byte");
+
+    vec3 subnormal[4] = {
+        initial[0], initial[1], initial[2], initial[3]
+    };
+    subnormal[2].z = std::numeric_limits<float>::denorm_min();
+    const ByteSnapshot<G1SwingHistory> before_subnormal(history);
+    check(!g1_swing_history_reset(
+              history, subnormal, NULL, 0) &&
+              before_subnormal.same(history),
+          "Task 5 history rejects a nonzero subnormal transactionally");
+
+    G1SwingHistory uninitialized = task5_unique_history(UINT32_C(0x22));
+    uninitialized.initialized = false;
+    const ByteSnapshot<G1SwingHistory> before_uninitialized(uninitialized);
+    check(!g1_swing_history_commit(
+              uninitialized, initial,
+              error, static_cast<int>(sizeof(error))) &&
+              before_uninitialized.same(uninitialized),
+          "Task 5 commit requires initialized history transactionally");
+
+    const ByteSnapshot<G1SwingHistory> before_invalid_commit(history);
+    check(!g1_swing_history_commit(
+              history, invalid,
+              error, static_cast<int>(sizeof(error))) &&
+              before_invalid_commit.same(history),
+          "Task 5 failed history commit preserves every prior byte");
+
+    const vec3 accepted[4] = {
+        vec3(0.40f, 0.45f, 0.05f),
+        vec3(0.50f, 0.50f, -0.0f),
+        vec3(0.60f, 0.55f, -0.05f),
+        vec3(0.70f, 0.60f, -0.10f)
+    };
+    check(g1_swing_history_commit(
+              history, accepted,
+              error, static_cast<int>(sizeof(error))),
+          error[0] == '\0' ?
+              "Task 5 initialized history accepts committed centers" :
+              error);
+    check(history.initialized &&
+              float_bits(history.previous_sphere_centers[1].z) == 0 &&
+              float_bits(history.previous_sphere_centers[3].x) ==
+                  float_bits(accepted[3].x),
+          "Task 5 commit assigns the complete canonical candidate");
+}
+
+static void test_task5_actual_center_swing()
+{
+    heightfield field;
+    point_make_field(field, 9, 9, 0.0f, 0.0f, 0.25f);
+    const G1LegConfig config = g1_left_leg_config();
+    const float previous_y = config.planted_clearance_m * 2.0f;
+    const float current_y = config.swing_clearance_m * 2.0f;
+    const vec3 previous[4] = {
+        vec3(0.30f, previous_y, 0.30f),
+        vec3(0.55f, previous_y, 0.30f),
+        vec3(0.30f, previous_y, 0.55f),
+        vec3(0.55f, previous_y, 0.55f)
+    };
+    const vec3 current[4] = {
+        vec3(0.32f, current_y, 0.32f),
+        vec3(0.57f, current_y, 0.32f),
+        vec3(0.32f, current_y, 0.57f),
+        vec3(0.57f, current_y, 0.57f)
+    };
+    char error[256] = {};
+    G1SwingHistory history = task5_unique_history(UINT32_C(0x33));
+    check(g1_swing_history_reset(
+              history, previous,
+              error, static_cast<int>(sizeof(error))),
+          "Task 5 swing fixture initializes history");
+
+    vec3 adjusted_previous[4] = {};
+    vec3 adjusted_current[4] = {};
+    for (int index = 0; index < 4; ++index) {
+        adjusted_previous[index] = vec3(
+            previous[index].x,
+            config.planted_clearance_m,
+            previous[index].z);
+        adjusted_current[index] = vec3(
+            current[index].x,
+            config.swing_clearance_m,
+            current[index].z);
+    }
+    const G1ClearanceResult direct = task5_direct_swept_foot(
+        field, adjusted_previous, adjusted_current,
+        config.foot_sphere_radius_m, 0);
+    G1SwingClearanceValidation output =
+        task5_unique_swing_output(UINT32_C(0x34));
+    check(g1_swing_clearance_validate(
+              output, g1_swing_foot_clearance_budget(),
+              history, field, config, current,
+              false, 0.04f,
+              error, static_cast<int>(sizeof(error))) == G1ClearanceOk,
+          error[0] == '\0' ?
+              "Task 5 actual-center sweep certifies" : error);
+    const long double flat_oracle =
+        static_cast<long double>(config.planted_clearance_m) -
+        static_cast<long double>(config.foot_sphere_radius_m);
+    check(output.sweep_evaluated &&
+              clearance_work_same(output.work, direct.work) &&
+              static_cast<long double>(output.lower_margin_m) <=
+                  flat_oracle &&
+              flat_oracle <=
+                  static_cast<long double>(output.witness_upper_m) &&
+              static_cast<long double>(direct.lower_bound_m) <=
+                  flat_oracle &&
+              flat_oracle <=
+                  static_cast<long double>(direct.witness_upper_m) &&
+              output.witness_upper_m - output.lower_margin_m <=
+                  G1ClearanceMaximumCertificateWidthM,
+          "Task 5 swing matches four direct target-subtracted capsules");
+
+    G1SwingClearanceValidation contact =
+        task5_unique_swing_output(UINT32_C(0x35));
+    heightfield bypass_field;
+    check(g1_swing_clearance_validate(
+              contact, g1_swing_foot_clearance_budget(),
+              history, bypass_field, config, current,
+              true, 0.04f,
+              error, static_cast<int>(sizeof(error))) == G1ClearanceOk &&
+              !contact.sweep_evaluated &&
+              double_bits(contact.lower_margin_m) == 0 &&
+              double_bits(contact.witness_upper_m) == 0 &&
+              clearance_work_same(contact.work, G1ClearanceWork{}),
+          "Task 5 recorded contact bypass returns a zero-work success");
+
+    const float exact_dt = 0.04f;
+    const float adjacent_dt[] = {
+        std::nextafter(exact_dt, 0.0f),
+        std::nextafter(
+            exact_dt, std::numeric_limits<float>::infinity())
+    };
+    for (const float dt : adjacent_dt) {
+        G1SwingClearanceValidation rejected =
+            task5_unique_swing_output(UINT32_C(0x36));
+        const ByteSnapshot<G1SwingClearanceValidation> before(rejected);
+        check(g1_swing_clearance_validate(
+                  rejected, g1_swing_foot_clearance_budget(),
+                  history, field, config, current,
+                  true, dt, NULL, 0) == G1ClearanceInvalidInput &&
+                  before.same(rejected),
+              "Task 5 exact 25 Hz gate rejects each adjacent dt");
+    }
+}
+
+static void test_task5_actual_endpoint_rounding_trap()
+{
+    heightfield field;
+    point_make_field(field, 5, 5, 0.0f, 0.0f, 0.25f);
+    field.heights.set(float_from_bits(UINT32_C(0x30000000)));
+    const G1LegConfig config = g1_left_leg_config();
+    check(float_bits(config.swing_clearance_m) ==
+              UINT32_C(0x3c75c28f) &&
+              float_bits(config.foot_sphere_radius_m) ==
+              UINT32_C(0x3ca3d70a),
+          "Task 5 rounding trap uses the locked target and radius bits");
+
+    const vec3 previous[4] = {
+        vec3(0.50f, 1.0f, 0.50f),
+        vec3(0.75f, 1.0f, 0.50f),
+        vec3(0.50f, 1.0f, 0.75f),
+        vec3(0.75f, 1.0f, 0.75f)
+    };
+    vec3 actual[4] = {
+        vec3(0.50f, float_from_bits(UINT32_C(0x3d0f5c29)), 0.50f),
+        vec3(0.75f, 0.50f, 0.50f),
+        vec3(0.50f, 0.50f, 0.75f),
+        vec3(0.75f, 0.50f, 0.75f)
+    };
+    G1SwingHistory history = task5_unique_history(UINT32_C(0x41));
+    check(g1_swing_history_reset(history, previous, NULL, 0),
+          "Task 5 rounding trap initializes history");
+
+    G1SwingClearanceValidation actual_output =
+        task5_unique_swing_output(UINT32_C(0x42));
+    char error[256] = {};
+    check(g1_swing_clearance_validate(
+              actual_output, g1_swing_foot_clearance_budget(),
+              history, field, config, actual,
+              false, 0.04f,
+              error, static_cast<int>(sizeof(error))) == G1ClearanceOk,
+          error[0] == '\0' ?
+              "Task 5 exact actual endpoint certifies" : error);
+    check(actual_output.sweep_evaluated &&
+              actual_output.lower_margin_m >= 0.0 &&
+              actual_output.witness_upper_m > 0.0,
+          "Task 5 binary64 target subtraction preserves positive margin");
+
+    float materialized = float_from_bits(UINT32_C(0x41234567));
+    check(g1_apply_swing_lift_y(
+              materialized,
+              float_from_bits(UINT32_C(0x3d0f5c28)),
+              float_from_bits(UINT32_C(0x31000000)),
+              NULL, 0) == G1ClearanceOk &&
+              float_bits(materialized) == UINT32_C(0x3d0f5c28) &&
+              float_bits(materialized) + 1 == float_bits(actual[0].y),
+          "Task 5 fake baseline-plus-lift endpoint is one ULP low");
+    vec3 fake[4] = {actual[0], actual[1], actual[2], actual[3]};
+    fake[0].y = materialized;
+    G1SwingClearanceValidation fake_output =
+        task5_unique_swing_output(UINT32_C(0x43));
+    check(g1_swing_clearance_validate(
+              fake_output, g1_swing_foot_clearance_budget(),
+              history, field, config, fake,
+              false, 0.04f,
+              error, static_cast<int>(sizeof(error))) == G1ClearanceOk &&
+              fake_output.witness_upper_m < 0.0,
+          "Task 5 one-ULP fake endpoint is rejected by its negative margin");
+}
+
+static void task5_require_swing_failure(
+    const G1SwingHistory& history,
+    const heightfield& field,
+    const vec3 current[4],
+    const G1ClearanceBudget& limits,
+    float dt,
+    G1ClearanceStatus expected,
+    uint32_t seed,
+    const char* message)
+{
+    G1SwingClearanceValidation output = task5_unique_swing_output(seed);
+    const ByteSnapshot<G1SwingClearanceValidation> output_before(output);
+    const ByteSnapshot<G1SwingHistory> history_before(history);
+    const ByteSnapshot<G1ClearanceBudget> limits_before(limits);
+    check(g1_swing_clearance_validate(
+              output, limits, history, field, g1_left_leg_config(),
+              current, false, dt, NULL, 0) == expected,
+          message);
+    check(output_before.same(output) &&
+              history_before.same(history) &&
+              limits_before.same(limits),
+          "Task 5 failed swing preserves output, history, and limits");
+}
+
+static void test_task5_swing_transactions()
+{
+    heightfield field;
+    point_make_field(field, 5, 5, 0.0f, 0.0f, 0.25f);
+    const vec3 previous[4] = {
+        vec3(0.30f, 0.50f, 0.30f),
+        vec3(0.55f, 0.50f, 0.30f),
+        vec3(0.30f, 0.50f, 0.55f),
+        vec3(0.55f, 0.50f, 0.55f)
+    };
+    const vec3 current[4] = {
+        vec3(0.32f, 0.55f, 0.32f),
+        vec3(0.57f, 0.55f, 0.32f),
+        vec3(0.32f, 0.55f, 0.57f),
+        vec3(0.57f, 0.55f, 0.57f)
+    };
+    G1SwingHistory history = task5_unique_history(UINT32_C(0x51));
+    check(g1_swing_history_reset(history, previous, NULL, 0),
+          "Task 5 transaction fixture initializes history");
+
+    vec3 outside_previous[4] = {
+        previous[0], previous[1], previous[2], previous[3]
+    };
+    vec3 outside_current[4] = {
+        current[0], current[1], current[2], current[3]
+    };
+    outside_previous[0].x = 0.0f;
+    outside_current[0].x = 0.0f;
+    G1SwingHistory outside_history =
+        task5_unique_history(UINT32_C(0x52));
+    check(g1_swing_history_reset(
+              outside_history, outside_previous, NULL, 0),
+          "Task 5 outside fixture initializes history");
+    task5_require_swing_failure(
+        outside_history, field, outside_current,
+        g1_swing_foot_clearance_budget(), 0.04f,
+        G1ClearanceOutsideDomain, UINT32_C(0x53),
+        "Task 5 swing reports outside-domain transactionally");
+
+    G1ClearanceBudget no_cells = g1_swing_foot_clearance_budget();
+    no_cells.maximum_cells = 0;
+    task5_require_swing_failure(
+        history, field, current, no_cells, 0.04f,
+        G1ClearanceBudgetExceeded, UINT32_C(0x54),
+        "Task 5 swing reports shared-budget exhaustion transactionally");
+
+    heightfield wide_guard;
+    point_make_field(wide_guard, 5, 5, 0.0f, 0.0f, 0.25f);
+    wide_guard.heights.set(16.0f);
+    const vec3 high[4] = {
+        vec3(0.30f, 20.0f, 0.30f),
+        vec3(0.55f, 20.0f, 0.30f),
+        vec3(0.30f, 20.0f, 0.55f),
+        vec3(0.55f, 20.0f, 0.55f)
+    };
+    G1SwingHistory high_history =
+        task5_unique_history(UINT32_C(0x55));
+    check(g1_swing_history_reset(high_history, high, NULL, 0),
+          "Task 5 uncertified fixture initializes history");
+    task5_require_swing_failure(
+        high_history, wide_guard, high,
+        g1_swing_foot_clearance_budget(), 0.04f,
+        G1ClearanceUncertified, UINT32_C(0x56),
+        "Task 5 swing propagates uncertified geometry transactionally");
+
+    G1SwingHistory uninitialized = history;
+    uninitialized.initialized = false;
+    task5_require_swing_failure(
+        uninitialized, field, current,
+        g1_swing_foot_clearance_budget(), 0.04f,
+        G1ClearanceInvalidInput, UINT32_C(0x57),
+        "Task 5 swing rejects uninitialized history transactionally");
+
+    heightfield invalid_field = field;
+    invalid_field.version = 1;
+    task5_require_swing_failure(
+        history, invalid_field, current,
+        g1_swing_foot_clearance_budget(), 0.04f,
+        G1ClearanceInvalidField, UINT32_C(0x58),
+        "Task 5 swing rejects an invalid field transactionally");
+
+    {
+        RoundingModeGuard guard;
+        check(std::fesetround(FE_DOWNWARD) == 0,
+              "Task 5 can enter hostile rounding for swing failure");
+        task5_require_swing_failure(
+            history, field, current,
+            g1_swing_foot_clearance_budget(), 0.04f,
+            G1ClearanceArithmeticFailure, UINT32_C(0x59),
+            "Task 5 swing rejects hostile arithmetic transactionally");
+    }
+}
+
+static int run_task5_swing_mode()
+{
+    test_task5_checked_history();
+    test_task5_actual_center_swing();
+    test_task5_actual_endpoint_rounding_trap();
+    test_task5_swing_transactions();
+    return 0;
+}
+
 static void task34_parity_emit(
     const char* name,
     const heightfield& field,
@@ -3901,6 +4915,14 @@ static int run_task34_combined_parity_mode()
 
 int main(int argc, char** argv)
 {
+    if (argc == 2 &&
+        std::strcmp(argv[1], "--task5-aggregate") == 0) {
+        return run_task5_aggregate_mode();
+    }
+    if (argc == 2 &&
+        std::strcmp(argv[1], "--task5-swing") == 0) {
+        return run_task5_swing_mode();
+    }
     if (argc == 2 && std::strcmp(argv[1], "--query-parity") == 0) {
         return run_task34_combined_parity_mode();
     }
@@ -3979,6 +5001,12 @@ int main(int argc, char** argv)
     test_task34_sphere_capsule_output_guards();
     test_task34_exact_dyadic_fallback();
     test_task34_public_kind2_winner();
+    test_task5_aggregate_certificates();
+    test_task5_aggregate_transactions();
+    test_task5_checked_history();
+    test_task5_actual_center_swing();
+    test_task5_actual_endpoint_rounding_trap();
+    test_task5_swing_transactions();
     test_arithmetic_environment_rejection_and_restoration();
     return 0;
 }
