@@ -1663,6 +1663,9 @@ git commit -m "feat: compose footprint-aware G1 terrain IK"
 - Modify: `tests/cpp/test_g1_controller_state.cpp`
 - Modify: `tests/cpp/test_g1_ik.cpp`
 - Modify: `tests/cpp/test_scene_switch.cpp`
+- Modify: `tests/cpp/test_support_matching.cpp`
+- Modify: `tests/cpp/test_terrain_runtime.cpp`
+- Modify: `tests/cpp/test_route_runtime.cpp`
 
 **Interfaces:**
 - Consumes: Tasks 2, 4, and 5 command, footprint, and IK interfaces.
@@ -1796,9 +1799,10 @@ Add a controller-order fixture requiring:
 g1_controller_state_copy(working, accepted)
 < deterministic_route_command/input snapshot
 < matcher search/inertialization/simulation
+< checked raw-pose FK and support observation
 < support_pose_apply
-< contact update
-< g1_ik_checked_forward_kinematics
+< checked support-retargeted FK
+< contact update from authenticated support-retargeted toe positions
 < g1_footprint_observe_v2
 < g1_ik_frame_begin
 < checked begin-time safe-stop-result inspection
@@ -1825,6 +1829,19 @@ command, support-retarget baseline, checked FK, `G1FootprintOk`, initialized
 IK, `G1ClearanceOk`, and minimum `>= -0.01` independently for each member of
 the pair; poisoning either candidate gate must preserve the entire live unit.
 
+Update the existing controller-source contracts in
+`tests/cpp/test_support_matching.cpp`, `tests/cpp/test_terrain_runtime.cpp`,
+and `tests/cpp/test_route_runtime.cpp` as RED tests for the real Task-6
+architecture. They must reject the old compile-time-disabled IK claim,
+captures or aliases of outer runtime owners, and log-before-publication order;
+a local reference alias from the runner's `working_state` parameter to `state`
+is allowed. Require instead the named typed runner, startup-only `MM_IK`,
+immutable context lowering, checked raw-pose FK before support observation,
+checked support-retargeted FK before contact-history advance and footprint
+observation, coordinator publication before outer logging, and
+logging/rendering from accepted owners. Do not preserve obsolete marker
+strings or dead branches merely to satisfy a source scan.
+
 - [ ] **Step 2: Run the controller-state RED**
 
 ```bash
@@ -1841,11 +1858,33 @@ g++ -std=c++17 -O0 -g -Wall -Wextra -Werror -pedantic \
 g++ -std=c++17 -O0 -g -Wall -Wextra -Werror -pedantic -I. \
   -c tests/cpp/test_scene_switch.cpp \
   -o /tmp/g1-footprint-controller-red/scene-switch.o
+g++ -std=c++17 -O0 -g -Wall -Wextra -Werror -pedantic \
+  -DG1_IK_ENABLE_TEST_SEAMS -I. \
+  -c tests/cpp/test_g1_ik.cpp \
+  -o /tmp/g1-footprint-controller-red/ik.o
+
+for name in support_matching terrain_runtime route_runtime; do
+  g++ -std=c++17 -O0 -g -Wall -Wextra -Werror -pedantic -I. \
+    "tests/cpp/test_${name}.cpp" \
+    -o "/tmp/g1-footprint-controller-red/${name}"
+done
+! /tmp/g1-footprint-controller-red/support_matching --controller controller.cpp
+! /tmp/g1-footprint-controller-red/terrain_runtime
+! /tmp/g1-footprint-controller-red/route_runtime --controller controller.cpp
 ```
 
-Expected: the strict kernel builds; the four positive test compiles fail on
+Expected: the strict kernel builds; the five positive test compiles fail on
 the missing owners, runtime aggregate, production coordinator/checkpoints,
-pair-aware reset/switch, accepted diagnostic, and exact runner boundary. After
+pair-aware reset/switch, accepted diagnostic, exact runner boundary, and the
+missing typed IK rejection-snapshot API/contracts. The IK RED must be the
+missing snapshot symbol or its checkpoint contract, not a test-seam or
+unrelated compile failure. After
+their Task-6 assertions are written, the three controller-source executables
+build but fail specifically because the old controller lacks the named runner,
+typed startup IK/contact tuning, checked raw/retargeted FK and contact order,
+coordinator-before-log publication, or accepted-owner presentation. A compile
+failure, missing source file, obsolete marker-only assertion, or unrelated
+runtime failure is not valid RED evidence. After
 the production header and positive coordinator compile exist, compile each
 negative mode and accept its failure only when stderr specifically identifies
 the forbidden conversion to `G1FrameStageRunner`; a missing header, undeclared
@@ -2093,6 +2132,9 @@ struct G1FrameTuning
     bool clamping_enabled = true;
     float clamping_max_distance = 0.15f;
     float clamping_max_angle = 0.5f * PIf;
+    float contact_unlock_radius = 0.20f;
+    float contact_foot_height = 0.02f;
+    float contact_blending_halflife = 0.10f;
     bool ik_enabled = false;
 };
 
@@ -2282,6 +2324,16 @@ Retain current `MM_HALFLIFE` and `MM_SIMROT_HL` behavior by lowering their
 existing startup values into the corresponding tuning fields. Retain `MM_STRAFE`,
 scripted camera azimuth, and `MM_AUTODRIVE` by lowering them into the immutable
 input snapshot. Six-mode production tests authenticate all of these mappings.
+The three legacy contact-history values are likewise immutable typed tuning:
+`contact_unlock_radius`, `contact_foot_height`, and
+`contact_blending_halflife`. The obsolete legacy two-bone/toe pose-IK values
+are not represented because Task 5 is the sole pose-IK authority. Validate
+`contact_unlock_radius` as finite and nonnegative,
+`contact_foot_height` as finite and nonnegative, and
+`contact_blending_halflife` as positive normal binary32. In the linked
+production test, independently reject a negative and a nonfinite value for
+each nonnegative field, and reject zero and a nonfinite value for the
+halflife, before accepted state or publication changes.
 
 `g1_frame_runtime_reset` resolves and configures the route cursor entirely in
 local candidates and independently resets accepted and working states. Before
@@ -2436,6 +2488,20 @@ Clear a consumed latch only when this retry accepts; relatch on a new finite
 rejection.
 
 - [ ] **Step 6: Build contact horizons, observe, and stage after support retargeting**
+
+`G1FrameStageSupportObservation` computes a checked full FK for the raw
+inertialized pose before building the support observation. After
+`support_pose_apply`, `G1FrameStageContactUpdate` first computes a checked full
+FK for the support-retargeted baseline, then advances only the legacy
+contact-history arrays from those authenticated support-retargeted toe
+positions using the three immutable contact tuning fields and exact `dt`; it
+does not run the obsolete legacy two-bone or toe-orientation pose IK. Contact
+history does not mutate the pose, so `G1FrameStageFootprintObservation` reuses
+that same checked support-retargeted FK to build contact horizons and observe
+the footprint; it must not perform a redundant FK merely to manufacture the
+required order. Thus the executable order is checked raw-pose FK, support
+observation, support retarget, checked retargeted-pose FK, contact-history
+update, footprint observation, and Task-5 split IK.
 
 After `support_pose_apply`, compute checked FK for the support-retargeted
 baseline. Build contact horizons from the current matched database frame, then
@@ -2621,18 +2687,23 @@ on an accepted latch-consuming retry. The coordinator alone validates and
 publishes the state, accepted diagnostic, and publication. No timer, route,
 camera, contact, pose, or scene-frame owner is mutated after it returns.
 
-The outer loop then constructs one deterministic row only from
+The outer loop constructs every per-frame locomotion, matching query, pose,
+route-sample, and traversal value in a deterministic row only from
 `frame_runtime.accepted_state`, `frame_runtime.accepted_diagnostic`, and
-`frame_runtime.publication`; it never reads working scratch. A finite row uses
-the unchanged accepted locomotion/diagnostic plus the current validated
-requested intent, rejection, latch, and fresh publication
-`presentation_frame`. An accepted row requires the accepted diagnostic and
-publication presentation frames to agree. A log failure after an accepted swap
-is an outer fatal I/O failure, not transaction rollback. After successful
-logging, publish the UI snapshot, schedule scene-cycle changes, derive
-`Camera3D` from accepted camera scalars and accepted IK pose, render only
-`accepted_state.ik_global_bone_positions`, and increment the outer
-presentation/frame-limit counter.
+`frame_runtime.publication`; it never reads working state, transaction
+scratch, or runner locals. The logger may combine those values with immutable
+database/scene/manifest/test metadata—scene id, mode and route labels, fixed
+`dt`, database range/source mapping, manifest source metadata, and configured
+route target height—and with outer presentation/model-lifecycle counters that
+are not locomotion state. A finite row uses the unchanged accepted
+locomotion/diagnostic plus the current validated requested intent, rejection,
+latch, and fresh publication `presentation_frame`. An accepted row requires
+the accepted diagnostic and publication presentation frames to agree. A log
+failure after an accepted swap is an outer fatal I/O failure, not transaction
+rollback. After successful logging, publish the UI snapshot, schedule
+scene-cycle changes, derive `Camera3D` from accepted camera scalars and
+accepted IK pose, render only `accepted_state.ik_global_bone_positions`, and
+increment the outer presentation/frame-limit counter.
 
 On `OutsideDomain`, `BudgetExceeded`, blocked footprint, unavailable landing
 patch, no finite swing candidate, target-unreachable, or finite pose-clearance
@@ -2698,6 +2769,24 @@ for name in g1_controller_state g1_frame_transaction \
     /tmp/g1-frame-transaction/kernel.o \
     -o "/tmp/g1-frame-transaction/${name}-fast"
   "/tmp/g1-frame-transaction/${name}-fast"
+done
+
+for name in support_matching terrain_runtime route_runtime; do
+  g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
+    "tests/cpp/test_${name}.cpp" \
+    -o "/tmp/g1-frame-transaction/${name}-strict"
+  "/tmp/g1-frame-transaction/${name}-strict"
+  if test "$name" = support_matching || test "$name" = route_runtime; then
+    "/tmp/g1-frame-transaction/${name}-strict" --controller controller.cpp
+  fi
+
+  g++ -std=c++17 -O3 -ffast-math -DNDEBUG -I. \
+    "tests/cpp/test_${name}.cpp" \
+    -o "/tmp/g1-frame-transaction/${name}-fast"
+  "/tmp/g1-frame-transaction/${name}-fast"
+  if test "$name" = support_matching || test "$name" = route_runtime; then
+    "/tmp/g1-frame-transaction/${name}-fast" --controller controller.cpp
+  fi
 done
 
 # Link the exact controller-owned runner into the dynamic production test.
@@ -2806,7 +2895,8 @@ git add g1_frame_transaction.h g1_controller_frame_runtime.h \
   tests/cpp/test_g1_frame_transaction_production.cpp \
   tests/cpp/compile_g1_frame_transaction_runner_negative.cpp \
   tests/cpp/test_g1_controller_state.cpp tests/cpp/test_g1_ik.cpp \
-  tests/cpp/test_scene_switch.cpp
+  tests/cpp/test_scene_switch.cpp tests/cpp/test_support_matching.cpp \
+  tests/cpp/test_terrain_runtime.cpp tests/cpp/test_route_runtime.cpp
 git commit -m "feat: integrate footprint-aware G1 terrain IK"
 ```
 
