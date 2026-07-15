@@ -463,7 +463,10 @@ ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
     ControllerInteractionFrameState state;
     state.pose = adapter_.apply(locomotion_pose, runtime_output, dt);
     state.owns_pose = runtime_output.owns_pose;
-    state.synchronize_simulation_root = runtime_output.owns_pose;
+    state.synchronize_simulation_root =
+        runtime_output.owns_pose &&
+        (runtime_output.diagnostics.state != RuntimeState::Carry ||
+         runtime_output.diagnostics.recorded_carry);
     state.simulation_root_position = state.pose.positions[0];
     state.simulation_root_rotation = state.pose.rotations[0];
     return state;

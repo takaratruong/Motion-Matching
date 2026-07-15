@@ -707,7 +707,85 @@ void test_layered_anchor_and_nonidentity_grasp_move_with_root() {
     assert(near(controller.object_world(), desired_object, 2.0e-4F));
 }
 
-void test_rejected_layered_ik_preserves_last_safe_pose_and_anchor() {
+void test_layered_carry_inertializes_hold_to_live_seam_without_stalling_root() {
+    using namespace interaction;
+    const RuntimeFixture fixture = make_runtime_fixture();
+    const GraspAffordance affordance = fixture_affordance(fixture);
+    const Pose hold = final_hold_pose(fixture);
+    const Transform initial_object = object_world_from_hold_pose(
+        hold, Hand::Right, affordance);
+    const Transform initial_root = root_world(hold);
+    LocomotionSnapshot locomotion = fixture.locomotion;
+    locomotion.pose = hold;
+    locomotion.pose.rotations[g1_skeleton::Hips] = quat_mul(
+        locomotion.pose.rotations[g1_skeleton::Hips],
+        quat_from_angle_axis(0.60F, vec3(0.0F, 1.0F, 0.0F)));
+    IKConfig setup_ik{};
+    setup_ik.maximum_request_position_m = 2.0F;
+    setup_ik.maximum_request_orientation_radians = 4.0F;
+    setup_ik.accepted_position_m = 0.01F;
+    setup_ik.accepted_orientation_radians = 0.05F;
+    setup_ik.maximum_iterations = 64;
+    setup_ik.maximum_step_radians = 0.20F;
+    const IKResult setup_result = solve_hand_ik(
+        locomotion.pose,
+        Hand::Right,
+        hand_world(hold, Hand::Right),
+        setup_ik);
+    assert(setup_result.accepted);
+    locomotion.pose.positions[g1_skeleton::Simulation].x += 0.04F;
+
+    CarryController controller(
+        fixture.database, fixture.features, no_recorded_ranges());
+    controller.start(hold, Hand::Right, affordance, initial_object);
+
+    const Transform first_expected_object = compose(
+        root_world(locomotion.pose),
+        compose(inverse(initial_root), initial_object));
+    const Pose first = controller.update(locomotion, 0.04F);
+
+    assert(!controller.recorded());
+    assert(near(root_world(first), root_world(locomotion.pose), 2.0e-5F));
+    assert(length(
+        controller.object_world().position -
+        first_expected_object.position) <=
+        CarryConfig{}.maximum_grasp_drift_m);
+    assert(std::abs(
+        controller.object_world().position.y - initial_object.position.y) <=
+        CarryConfig{}.maximum_grasp_drift_m);
+    assert(hand_error(
+        first,
+        Hand::Right,
+        affordance,
+        controller.object_world()) <= IKConfig{}.accepted_position_m);
+
+    for (int tick = 0; tick < 120; ++tick) {
+        locomotion.pose.positions[g1_skeleton::Simulation].x += 0.01F;
+        const Pose output = controller.update(locomotion, 0.04F);
+        assert(near(
+            root_world(output), root_world(locomotion.pose), 2.0e-5F));
+        assert(hand_error(
+            output,
+            Hand::Right,
+            affordance,
+            controller.object_world()) <= IKConfig{}.accepted_position_m);
+        assert(std::abs(
+            controller.object_world().position.y -
+            initial_object.position.y) <=
+            CarryConfig{}.maximum_grasp_drift_m);
+    }
+
+    assert(std::abs(
+        controller.object_world().position.x - initial_object.position.x) >
+        0.20F);
+    const Pose final = controller.update(locomotion, 0.04F);
+    assert(near(
+        final.rotations[g1_skeleton::Hips],
+        locomotion.pose.rotations[g1_skeleton::Hips],
+        0.01F));
+}
+
+void test_rejected_layered_ik_preserves_last_safe_nonroot_pose_and_live_anchor() {
     using namespace interaction;
     const RuntimeFixture fixture = make_runtime_fixture();
     const GraspAffordance affordance = fixture_affordance(fixture);
@@ -718,8 +796,8 @@ void test_rejected_layered_ik_preserves_last_safe_pose_and_anchor() {
         hold, Hand::Right, affordance);
 
     IKConfig bounded{};
-    bounded.maximum_request_position_m = 0.05F;
-    bounded.accepted_position_m = 0.01F;
+    bounded.maximum_request_position_m = 1.0e-5F;
+    bounded.accepted_position_m = 1.0e-5F;
     CarryController controller(
         fixture.database,
         fixture.features,
@@ -751,8 +829,15 @@ void test_rejected_layered_ik_preserves_last_safe_pose_and_anchor() {
     const Pose rejected = controller.update(infeasible, 1.0F / 60.0F);
 
     assert(!controller.recorded());
-    assert(exact(rejected, safe_pose));
-    assert(exact(controller.object_world(), safe_object));
+    assert(near(
+        root_world(rejected), root_world(infeasible.pose), 2.0e-5F));
+    assert(exact(
+        rejected.positions[g1_skeleton::RightShoulderPitch],
+        safe_pose.positions[g1_skeleton::RightShoulderPitch]));
+    assert(exact(
+        rejected.rotations[g1_skeleton::RightShoulderPitch],
+        safe_pose.rotations[g1_skeleton::RightShoulderPitch]));
+    assert(near(controller.object_world(), desired_object, 2.0e-5F));
     assert(!near(controller.object_world(), unsolved_publication, 0.10F));
 }
 
@@ -1432,7 +1517,8 @@ int main() {
     test_fallback_preserves_locomotion_and_grasp();
     test_fallback_rotation_masks_are_layered();
     test_layered_anchor_and_nonidentity_grasp_move_with_root();
-    test_rejected_layered_ik_preserves_last_safe_pose_and_anchor();
+    test_layered_carry_inertializes_hold_to_live_seam_without_stalling_root();
+    test_rejected_layered_ik_preserves_last_safe_nonroot_pose_and_live_anchor();
     test_lifecycle_and_invalid_inputs_are_defensive();
     test_recorded_search_uses_pose_trajectory_and_aligns_object();
     test_recorded_cursor_cadence_remainder_and_tie_continuation();

@@ -17,6 +17,8 @@ namespace {
 constexpr size_t kVectorComponents = 3U;
 constexpr size_t kQuaternionComponents = 4U;
 constexpr size_t kHandCount = 2U;
+constexpr float kLayeredTransitionSeconds = 0.50F;
+constexpr int32_t kLayeredTransitionAttempts = 8;
 bool finite(float value) {
     return std::isfinite(value);
 }
@@ -623,6 +625,62 @@ bool continuous_object(
                maximum_orientation);
 }
 
+Pose remap_safe_pose_to_live_root(
+    const Pose& safe,
+    const Pose& locomotion) {
+    Pose remapped = safe;
+    constexpr size_t kRoot = g1_skeleton::Simulation;
+    remapped.positions[kRoot] = locomotion.positions[kRoot];
+    remapped.velocities[kRoot] = locomotion.velocities[kRoot];
+    remapped.rotations[kRoot] = locomotion.rotations[kRoot];
+    remapped.angular_velocities[kRoot] =
+        locomotion.angular_velocities[kRoot];
+    return remapped;
+}
+
+Pose blend_layered_transition(
+    const Pose& safe,
+    const Pose& target,
+    Hand active_hand,
+    float alpha) {
+    Pose blended = safe;
+    for (size_t bone = 0U; bone < g1_skeleton::BoneCount; ++bone) {
+        if (bone == static_cast<size_t>(g1_skeleton::Simulation)) {
+            blended.positions[bone] = target.positions[bone];
+            blended.velocities[bone] = target.velocities[bone];
+            blended.rotations[bone] = target.rotations[bone];
+            blended.angular_velocities[bone] =
+                target.angular_velocities[bone];
+            continue;
+        }
+        blended.positions[bone] =
+            (1.0F - alpha) * safe.positions[bone] +
+            alpha * target.positions[bone];
+        blended.velocities[bone] =
+            (1.0F - alpha) * safe.velocities[bone] +
+            alpha * target.velocities[bone];
+        blended.rotations[bone] = quat_nlerp_shortest(
+            safe.rotations[bone], target.rotations[bone], alpha);
+        blended.angular_velocities[bone] =
+            (1.0F - alpha) * safe.angular_velocities[bone] +
+            alpha * target.angular_velocities[bone];
+    }
+    for (size_t dof = 0U; dof < blended.hand_dof.size(); ++dof) {
+        blended.hand_dof[dof] =
+            (1.0F - alpha) * safe.hand_dof[dof] +
+            alpha * target.hand_dof[dof];
+        blended.hand_dof_velocities[dof] =
+            (1.0F - alpha) * safe.hand_dof_velocities[dof] +
+            alpha * target.hand_dof_velocities[dof];
+    }
+    for (const HingeJoint& joint : arm(active_hand)) {
+        const size_t bone = static_cast<size_t>(joint.bone);
+        blended.rotations[bone] = safe.rotations[bone];
+    }
+    blended.foot_contacts = target.foot_contacts;
+    return blended;
+}
+
 class CarryUpdateTransaction {
 public:
     CarryUpdateTransaction(
@@ -1130,9 +1188,61 @@ Pose CarryController::update(
         compose(desired_object, affordance_.hand_in_object),
         ik_config_);
     if (!ik.accepted) {
+        const Pose safe = remap_safe_pose_to_live_root(
+            last_safe_pose_, locomotion.pose);
+        IKConfig transition_ik = ik_config_;
+        transition_ik.accepted_position_m = std::min(
+            transition_ik.accepted_position_m,
+            config_.maximum_grasp_drift_m);
+        transition_ik.accepted_orientation_radians = std::min(
+            transition_ik.accepted_orientation_radians,
+            config_.maximum_grasp_drift_radians);
+        float alpha = std::clamp(
+            dt / kLayeredTransitionSeconds, 0.0F, 1.0F);
+        for (int32_t attempt = 0;
+             attempt < kLayeredTransitionAttempts;
+             ++attempt) {
+            Pose transition = blend_layered_transition(
+                safe, output, hand_, alpha);
+            const IKResult transition_result = solve_hand_ik(
+                transition,
+                hand_,
+                compose(desired_object, affordance_.hand_in_object),
+                transition_ik);
+            if (transition_result.accepted) {
+                const Transform transition_object = compose(
+                    hand_transform(transition, hand_),
+                    inverse(affordance_.hand_in_object));
+                if (valid_transform(transition_object) &&
+                    continuous_object(
+                        desired_object,
+                        transition_object,
+                        config_,
+                        transition_ik)) {
+                    object_world_ = transition_object;
+                    recorded_ = false;
+                    last_safe_pose_ = transition;
+                    transaction.commit();
+                    return transition;
+                }
+            }
+            alpha *= 0.5F;
+        }
+
+        const Transform safe_object = compose(
+            hand_transform(safe, hand_),
+            inverse(affordance_.hand_in_object));
+        if (!valid_transform(safe_object) ||
+            !continuous_object(
+                desired_object, safe_object, config_, transition_ik)) {
+            throw std::invalid_argument(
+                "interaction carry invalid layered safe grasp");
+        }
+        object_world_ = safe_object;
         recorded_ = false;
+        last_safe_pose_ = safe;
         transaction.commit();
-        return last_safe_pose_;
+        return safe;
     }
     const Transform published = compose(
         hand_transform(solved, hand_),

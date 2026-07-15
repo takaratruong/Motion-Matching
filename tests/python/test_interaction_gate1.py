@@ -74,6 +74,19 @@ class Gate1ReportContractTests(unittest.TestCase):
 
 
 class Gate1MakefileTests(unittest.TestCase):
+    def test_demo_pack_permits_reviewed_exclusions(self):
+        repository = Path(__file__).resolve().parents[2]
+        completed = subprocess.run(
+            ["make", "-Bn", "demo-interaction-pack"],
+            cwd=repository,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("--allow-rejections", completed.stdout)
+
     def test_gate_target_uses_safe_suite_and_configurable_paths(self):
         repository = Path(__file__).resolve().parents[2]
         completed = subprocess.run(

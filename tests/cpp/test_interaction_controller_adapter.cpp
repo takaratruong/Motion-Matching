@@ -1028,6 +1028,35 @@ void test_frame_handoff_retains_channels_and_exposes_root_sync() {
     assert(!released.synchronize_simulation_root);
 }
 
+void test_frame_handoff_keeps_layered_carry_simulation_root_live() {
+    const Pose locomotion = make_pose(-4.0F);
+    RuntimeOutput output;
+    output.owns_pose = true;
+    output.pose = make_pose(8.0F, true);
+
+    output.diagnostics.state = RuntimeState::Carry;
+    output.diagnostics.recorded_carry = false;
+    ControllerInteractionFrameHandoff layered_handoff;
+    const ControllerInteractionFrameState layered = layered_handoff.apply(
+        locomotion, output, interaction::kControllerStepSeconds);
+    assert(layered.owns_pose);
+    assert(!layered.synchronize_simulation_root);
+
+    output.diagnostics.state = RuntimeState::Align;
+    ControllerInteractionFrameHandoff pre_carry_handoff;
+    const ControllerInteractionFrameState pre_carry =
+        pre_carry_handoff.apply(
+            locomotion, output, interaction::kControllerStepSeconds);
+    assert(pre_carry.synchronize_simulation_root);
+
+    output.diagnostics.state = RuntimeState::Carry;
+    output.diagnostics.recorded_carry = true;
+    ControllerInteractionFrameHandoff recorded_handoff;
+    const ControllerInteractionFrameState recorded = recorded_handoff.apply(
+        locomotion, output, interaction::kControllerStepSeconds);
+    assert(recorded.synchronize_simulation_root);
+}
+
 void test_scene_handoff_retains_attached_pose_until_registry_reclaims_authority() {
     ControllerInteractionSceneHandoff handoff;
     InteractionTarget target;
@@ -1298,6 +1327,7 @@ int main() {
     test_adapter_exit_reentry_and_reset_capture_fresh_locomotion();
     test_frame_handoff_preserves_fresh_complete_nonowned_pose_for_60_frames();
     test_frame_handoff_retains_channels_and_exposes_root_sync();
+    test_frame_handoff_keeps_layered_carry_simulation_root_live();
     test_scene_handoff_retains_attached_pose_until_registry_reclaims_authority();
     test_carry_label_is_only_specific_during_carry();
     test_demo_target_preserves_object_in_table_transform();

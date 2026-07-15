@@ -221,7 +221,8 @@ demo-interaction-pack:
 	  --output "$(INTERACTION_DEMO_PACK)" \
 	  --target-fps 25 \
 	  --limit "$(DEMO_INTERACTION_LIMIT)" \
-	  --heldout-count 1
+	  --heldout-count 1 \
+	  --allow-rejections
 	python -m resources.validate_g1_interaction_database \
 	  --input "$(INTERACTION_DEMO_PACK)"
 
