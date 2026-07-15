@@ -131,7 +131,11 @@ FLAT_JOINT_NAMES = (
     "RightForeArm",
     "RightHand",
 )
-JOINT_TRANSLATION_SPEED_LIMIT_MPS = 12.0
+JOINT_TRANSLATION_LIMIT_M = 0.20
+DISTAL_LOWER_LIMB_JOINT_NAMES = frozenset(
+    ("LeftFoot", "LeftToe", "RightFoot", "RightToe")
+)
+DISTAL_LOWER_LIMB_TRANSLATION_SPEED_LIMIT_MPS = 12.0
 AUTHORITY_SEAM_TRANSLATION_LIMIT_M = 0.20
 JOINT_ROTATION_LIMIT_DEGREES = 60.0
 JOINT_QUATERNION_NORM_TOLERANCE = 1.0e-3
@@ -540,13 +544,26 @@ def validate_evidence(records: list[dict]) -> None:
                     f"seam exceeds max "
                     f"{AUTHORITY_SEAM_TRANSLATION_LIMIT_M:.6f} m"
                 )
-            translation_speed_mps = translation_step_m * CONTROL_RATE_HZ
-            if translation_speed_mps > JOINT_TRANSLATION_SPEED_LIMIT_MPS:
-                raise _error(
-                    f"joint {joint} ({joint_name}) frame {index - 1}->{index} "
-                    f"translation speed {translation_speed_mps:.6f} m/s "
-                    f"exceeds max {JOINT_TRANSLATION_SPEED_LIMIT_MPS:.6f} m/s"
-                )
+            if not authority_seam:
+                if joint_name in DISTAL_LOWER_LIMB_JOINT_NAMES:
+                    translation_speed_mps = translation_step_m * CONTROL_RATE_HZ
+                    if (
+                        translation_speed_mps
+                        > DISTAL_LOWER_LIMB_TRANSLATION_SPEED_LIMIT_MPS
+                    ):
+                        raise _error(
+                            f"joint {joint} ({joint_name}) frame "
+                            f"{index - 1}->{index} translation speed "
+                            f"{translation_speed_mps:.6f} m/s exceeds max "
+                            f"{DISTAL_LOWER_LIMB_TRANSLATION_SPEED_LIMIT_MPS:.6f} "
+                            "m/s"
+                        )
+                elif translation_step_m > JOINT_TRANSLATION_LIMIT_M:
+                    raise _error(
+                        f"joint {joint} ({joint_name}) frame {index - 1}->{index} "
+                        f"translation {translation_step_m:.6f} m exceeds max "
+                        f"{JOINT_TRANSLATION_LIMIT_M:.6f} m"
+                    )
             rotation_step_degrees = _joint_rotation_step_degrees(
                 previous["joint_world_rotations"][joint],
                 record["joint_world_rotations"][joint],
@@ -1029,34 +1046,75 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
         self.log = self.root / "pickup.jsonl"
         self.screenshot = self.root / "pickup.png"
 
-    def test_steady_translation_speed_accepts_exact_twelve_mps_and_rejects_more(self):
+    def test_anatomical_translation_limits_accept_exact_boundaries_and_reject_more(self):
         frame = 1
-        joint = 14
-        records = _valid_records()
-        records[frame]["joint_world_positions"][joint] = copy.deepcopy(
-            records[frame - 1]["joint_world_positions"][joint]
-        )
-        records[frame]["joint_world_positions"][joint][0] += (
-            12.0 / CONTROL_RATE_HZ
-        )
-        _write_records(self.log, records)
+        conservative_joints = (0, 1, 14, 21)
+        for joint in conservative_joints:
+            with self.subTest(
+                boundary="exact-conservative",
+                joint=FLAT_JOINT_NAMES[joint],
+            ):
+                records = _valid_records()
+                records[frame]["joint_world_positions"][joint] = copy.deepcopy(
+                    records[frame - 1]["joint_world_positions"][joint]
+                )
+                records[frame]["joint_world_positions"][joint][0] += 0.20
+                validate_evidence(records)
+
+            with self.subTest(
+                boundary="over-conservative",
+                joint=FLAT_JOINT_NAMES[joint],
+            ):
+                records = _valid_records()
+                records[frame]["joint_world_positions"][joint] = copy.deepcopy(
+                    records[frame - 1]["joint_world_positions"][joint]
+                )
+                records[frame]["joint_world_positions"][joint][0] += 0.200001
+                with self.assertRaisesRegex(
+                    EvidenceValidationError,
+                    rf"joint {joint} \({FLAT_JOINT_NAMES[joint]}\).*"
+                    rf"frame {frame - 1}->{frame}.*0\.200001.*0\.200000",
+                ):
+                    validate_evidence(records)
+
+        distal_lower_limb_joints = (4, 5, 8, 9)
+        for joint in distal_lower_limb_joints:
+            with self.subTest(
+                boundary="exact-distal-speed",
+                joint=FLAT_JOINT_NAMES[joint],
+            ):
+                records = _valid_records()
+                records[frame]["joint_world_positions"][joint] = copy.deepcopy(
+                    records[frame - 1]["joint_world_positions"][joint]
+                )
+                records[frame]["joint_world_positions"][joint][0] += (
+                    12.0 / CONTROL_RATE_HZ
+                )
+                validate_evidence(records)
+
+            with self.subTest(
+                boundary="over-distal-speed",
+                joint=FLAT_JOINT_NAMES[joint],
+            ):
+                records = _valid_records()
+                records[frame]["joint_world_positions"][joint] = copy.deepcopy(
+                    records[frame - 1]["joint_world_positions"][joint]
+                )
+                records[frame]["joint_world_positions"][joint][0] += (
+                    12.000001 / CONTROL_RATE_HZ
+                )
+                with self.assertRaisesRegex(
+                    EvidenceValidationError,
+                    rf"joint {joint} \({FLAT_JOINT_NAMES[joint]}\).*"
+                    rf"frame {frame - 1}->{frame}.*"
+                    r"12\.000001 m/s.*12\.000000 m/s",
+                ):
+                    validate_evidence(records)
+
+        _write_records(self.log, _valid_records())
         _write_png(self.screenshot)
         validate_evidence(load_evidence(self.log))
         validate_screenshot(self.screenshot)
-
-        records = _valid_records()
-        records[frame]["joint_world_positions"][joint] = copy.deepcopy(
-            records[frame - 1]["joint_world_positions"][joint]
-        )
-        records[frame]["joint_world_positions"][joint][0] += (
-            12.000001 / CONTROL_RATE_HZ
-        )
-        with self.assertRaisesRegex(
-            EvidenceValidationError,
-            rf"joint {joint} \(Head\).*frame {frame - 1}->{frame}.*"
-            r"12\.000001 m/s.*12\.000000 m/s",
-        ):
-            validate_evidence(records)
 
     def test_grasp_fields_have_exact_fixed_order(self):
         self.assertEqual(
@@ -1694,19 +1752,24 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
             )
         )
         for seam, frame, mutations in seams:
-            with self.subTest(seam=seam):
-                records = _valid_records()
-                records[frame].update(mutations)
-                records[frame]["joint_world_positions"][14] = copy.deepcopy(
-                    records[frame - 1]["joint_world_positions"][14]
-                )
-                records[frame]["joint_world_positions"][14][0] += 0.200001
-                with self.assertRaisesRegex(
-                    EvidenceValidationError,
-                    rf"joint 14 \(Head\).*frame {frame - 1}->{frame}.*"
-                    r"0\.200001.*0\.200000",
+            for joint in (5, 14):
+                with self.subTest(
+                    seam=seam,
+                    joint=FLAT_JOINT_NAMES[joint],
                 ):
-                    validate_evidence(records)
+                    records = _valid_records()
+                    records[frame].update(mutations)
+                    records[frame]["joint_world_positions"][joint] = copy.deepcopy(
+                        records[frame - 1]["joint_world_positions"][joint]
+                    )
+                    records[frame]["joint_world_positions"][joint][0] += 0.200001
+                    with self.assertRaisesRegex(
+                        EvidenceValidationError,
+                        rf"joint {joint} \({FLAT_JOINT_NAMES[joint]}\).*"
+                        rf"frame {frame - 1}->{frame}.*"
+                        r"0\.200001.*0\.200000",
+                    ):
+                        validate_evidence(records)
 
     def test_60_001_degree_joint_jump_is_rejected_at_reset(self):
         records = _valid_records()
