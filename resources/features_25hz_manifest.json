@@ -1,0 +1,12 @@
+{
+  "database_frame_count": 22296,
+  "database_sha256": "5d314ad8c673eef4b7759c5b8428d90069a7f147cfcd90d575eb686097a2a45f",
+  "feature_dimension": 27,
+  "output_frame_count": 22296,
+  "output_sha256": "61a5d5d1abc48f4292cad7b7a48ec977e2c4ad50e7bfa8719aad4b634c1f13ba",
+  "schema": "flat-locomotion-feature-cache-v1",
+  "source_fps": 60.0,
+  "source_frame_count": 53500,
+  "source_sha256": "f5f22665666c52fe0216254c4def0972f09cf78a65b990d732e500eaf7dd4f8a",
+  "target_fps": 25.0
+}

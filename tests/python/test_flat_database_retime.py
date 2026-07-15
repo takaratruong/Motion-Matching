@@ -1,5 +1,6 @@
 import hashlib
 import json
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -202,12 +203,27 @@ class AuthoritativeFlatDatabaseTests(unittest.TestCase):
         repository = Path(__file__).resolve().parents[2]
         source_path = repository / "resources" / "database_60hz.bin"
         output_path = repository / "resources" / "database.bin"
+        source_features_path = (
+            repository / "resources" / "features_60hz.bin")
+        output_features_path = repository / "resources" / "features.bin"
         manifest_path = (
             repository / "resources" / "database_25hz_manifest.json")
+        feature_manifest_path = (
+            repository / "resources" / "features_25hz_manifest.json")
 
         source_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
         output_hash = hashlib.sha256(output_path.read_bytes()).hexdigest()
+        source_features_hash = hashlib.sha256(
+            source_features_path.read_bytes()).hexdigest()
+        output_features_hash = hashlib.sha256(
+            output_features_path.read_bytes()).hexdigest()
+        source_features_header = struct.unpack(
+            "<II", source_features_path.read_bytes()[:8])
+        output_features_header = struct.unpack(
+            "<II", output_features_path.read_bytes()[:8])
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        feature_manifest = json.loads(
+            feature_manifest_path.read_text(encoding="utf-8"))
         source = read_database(source_path)
         output = read_database(output_path)
 
@@ -218,6 +234,31 @@ class AuthoritativeFlatDatabaseTests(unittest.TestCase):
         self.assertEqual(manifest["target_fps"], 25.0)
         self.assertEqual(source.bone_positions.shape, (53500, 23, 3))
         self.assertEqual(output.bone_positions.shape, (22296, 23, 3))
+        self.assertEqual(source_features_header, (53500, 27))
+        self.assertEqual(output_features_header, (22296, 27))
+        self.assertEqual(
+            source_features_header[0], source.bone_positions.shape[0])
+        self.assertEqual(
+            output_features_header[0], output.bone_positions.shape[0])
+        self.assertEqual(
+            source_features_hash,
+            "f5f22665666c52fe0216254c4def0972f09cf78a65b990d732e500eaf7dd4f8a")
+        self.assertEqual(
+            output_features_hash,
+            "61a5d5d1abc48f4292cad7b7a48ec977e2c4ad50e7bfa8719aad4b634c1f13ba")
+        self.assertEqual(
+            feature_manifest["source_sha256"], source_features_hash)
+        self.assertEqual(
+            feature_manifest["output_sha256"], output_features_hash)
+        self.assertEqual(
+            feature_manifest["schema"], "flat-locomotion-feature-cache-v1")
+        self.assertEqual(feature_manifest["source_frame_count"], 53500)
+        self.assertEqual(feature_manifest["output_frame_count"], 22296)
+        self.assertEqual(feature_manifest["feature_dimension"], 27)
+        self.assertEqual(feature_manifest["source_fps"], 60.0)
+        self.assertEqual(feature_manifest["target_fps"], 25.0)
+        self.assertEqual(feature_manifest["database_frame_count"], 22296)
+        self.assertEqual(feature_manifest["database_sha256"], output_hash)
         flat_controller_parents = np.array(
             [-1, 0, 1, 2, 3, 4, 1, 6, 7, 8, 1, 10, 11, 12, 13, 12,
              15, 16, 17, 12, 19, 20, 21],
