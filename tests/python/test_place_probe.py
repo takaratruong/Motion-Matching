@@ -1,16 +1,22 @@
 import copy
 import json
+import os
+from pathlib import Path
+import re
 import struct
+from types import SimpleNamespace
 import unittest
 
 import numpy as np
 
+from resources.g1_interaction_builder.artifacts import read_artifact_set
 from resources.g1_interaction_builder.phases import (
     derive_interaction_labels,
     hand_in_object,
     quaternion_angle,
 )
 from resources.g1_interaction_builder.schema import InteractionPhase
+from resources.g1_terrain_builder.kinematics import forward_local_hierarchy
 from tests.python.interaction_fixture import canonical_pickup_fixture
 
 
@@ -60,6 +66,9 @@ _DEFAULT_IK_CONFIG = (
     0.10,
     8,
 )
+_PROBE_JSON_ENV = "INTERACTION_PLACE_PROBE_JSON"
+_PROBE_PACK_ENV = "INTERACTION_PLACE_PROBE_PACK"
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _canonical_ik_fingerprint(config=_DEFAULT_IK_CONFIG):
@@ -77,6 +86,51 @@ def _canonical_ik_fingerprint(config=_DEFAULT_IK_CONFIG):
         state ^= value
         state = (state * 1099511628211) & 0xFFFFFFFFFFFFFFFF
     return state or 0x9E3779B97F4A7C15
+
+
+def _pack_labeled_fixture(pack):
+    artifact, _, _, _, _ = read_artifact_set(Path(pack))
+    start = int(artifact.range_starts[0])
+    stop = int(artifact.range_stops[0])
+    phases = artifact.phases[start:stop].copy()
+    active_hand = int(artifact.active_hands[0])
+    contact = int(np.flatnonzero(phases == InteractionPhase.CONTACT)[0])
+    hold = int(np.flatnonzero(phases == InteractionPhase.HOLD)[0])
+
+    positions = artifact.positions[start:stop].copy()
+    hand_bone = 23 if active_hand == 0 else 30
+    positions[hold, hand_bone, 0] += 0.030
+    world_positions, world_rotations = forward_local_hierarchy(
+        positions.astype(np.float64),
+        artifact.rotations[start:stop].astype(np.float64),
+        artifact.parents,
+    )
+    motion = SimpleNamespace(
+        hand_positions=world_positions[:, [23, 30]],
+        hand_rotations=world_rotations[:, [23, 30]],
+        object_positions=artifact.object_positions[start:stop],
+        object_rotations=artifact.object_rotations[start:stop],
+        hand_contacts=artifact.hand_contacts[start:stop],
+        source_frames=artifact.source_frames[start:stop],
+    )
+    return SimpleNamespace(
+        motion=motion,
+        active_hand=active_hand,
+        phases=phases,
+        contact_frame=contact,
+        hold_frame=hold,
+    )
+
+
+def _make_target_recipe(makefile, target):
+    match = re.search(
+        rf"^{re.escape(target)}:.*(?:\n\t.*)+",
+        makefile,
+        flags=re.MULTILINE,
+    )
+    if match is None:
+        raise AssertionError(f"missing Make target: {target}")
+    return match.group(0)
 
 
 def _certified_reverse_frames(labeled):
@@ -262,6 +316,58 @@ class PlaceProbeFixtureValidatorTests(unittest.TestCase):
         record = _fixture_record(self.labeled)
         with self.assertRaisesRegex(AssertionError, "compact and key-sorted"):
             validate_probe_record(json.dumps(record), self.labeled)
+        encoded = json.dumps(record, sort_keys=True, separators=(",", ":"))
+        with self.assertRaisesRegex(AssertionError, "one JSON record"):
+            validate_probe_record(f"{encoded}\n{{}}", self.labeled)
+
+    def test_validates_real_gate_stdout_when_present(self):
+        encoded = os.environ.get(_PROBE_JSON_ENV)
+        if encoded is None:
+            return
+        pack = os.environ.get(_PROBE_PACK_ENV)
+        self.assertIsNotNone(pack, "gate did not provide the probe pack")
+        labeled = _pack_labeled_fixture(pack)
+        record = validate_probe_record(encoded, labeled)
+        self.assertEqual(
+            encoded,
+            json.dumps(record, sort_keys=True, separators=(",", ":")),
+        )
+
+
+class PlaceProbePolicyTests(unittest.TestCase):
+    def test_negative_recoveries_use_distinct_staged_receivers(self):
+        source = (_REPOSITORY_ROOT / "interaction_place_probe.cpp").read_text()
+        receivers = re.findall(
+            r"require_two_frame_preflight_recovery\(\s*\*(\w+),",
+            source,
+        )
+        self.assertEqual(len(receivers), 2)
+        self.assertEqual(
+            len(set(receivers)),
+            2,
+            "stale and IK-mismatch recovery reused one receiver",
+        )
+        for receiver in receivers:
+            with self.subTest(receiver=receiver):
+                self.assertRegex(
+                    source,
+                    rf"run_actual_carry_staging\(\s*\*{receiver},",
+                )
+
+    def test_gate_captures_and_validates_one_probe_record(self):
+        makefile = (_REPOSITORY_ROOT / "Makefile").read_text()
+        recipe = _make_target_recipe(makefile, "gate-place-headless")
+        self.assertEqual(recipe.count("./interaction_place_probe"), 1)
+        self.assertIn('probe_output="$$(./interaction_place_probe', recipe)
+        self.assertIn('printf \'%s\\n\' "$$probe_output"', recipe)
+        self.assertIn(
+            f'{_PROBE_JSON_ENV}="$$probe_output"',
+            recipe,
+        )
+        self.assertIn(
+            f'{_PROBE_PACK_ENV}="$(INTERACTION_DEMO_PACK)"',
+            recipe,
+        )
 
 
 if __name__ == "__main__":

@@ -309,8 +309,12 @@ demo-interaction-pack:
 	  --input "$(INTERACTION_DEMO_PACK)"
 
 gate-place-headless: test-interaction-safe interaction_place_probe
-	./interaction_place_probe "$(INTERACTION_DEMO_PACK)" --json
-	python -m unittest tests.python.test_place_probe -v
+	@set -eu; \
+	  probe_output="$$(./interaction_place_probe "$(INTERACTION_DEMO_PACK)" --json)"; \
+	  printf '%s\n' "$$probe_output"; \
+	  INTERACTION_PLACE_PROBE_JSON="$$probe_output" \
+	  INTERACTION_PLACE_PROBE_PACK="$(INTERACTION_DEMO_PACK)" \
+	    python -m unittest tests.python.test_place_probe -v
 
 gate-playable-interaction: test-interaction-safe demo-interaction-pack \
   interaction_probe interaction_runtime_probe

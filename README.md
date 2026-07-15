@@ -119,8 +119,9 @@ make gate-place-headless
 gate runs the safe interaction suite, performs a real pickup to Carry, and
 drives native 25 Hz Carry updates with a deterministic flat-ground provider.
 Every far and staged placement candidate comes from `runtime.preview_place`
-for the retained destination handle; the probe submits only the current ready
-ID and never uses the manual distance resolver.
+for the retained destination handle. The successful fixture submits only its
+current ready ID and never uses the manual distance resolver; separate negative
+fixtures intentionally submit runtime-owned stale and IK-mismatched IDs.
 
 The single compact JSON record verifies the reversed-pickup state sequence,
 the certified stable Hold window, exact IK configuration identity, actual

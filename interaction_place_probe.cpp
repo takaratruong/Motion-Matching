@@ -684,6 +684,8 @@ public:
     DeterministicFlatLiveProvider live;
     std::unique_ptr<interaction::InteractionRuntime> runtime;
     std::vector<uint64_t> preview_ids;
+    int actual_carry_staging_runs = 0;
+    int preflight_recovery_runs = 0;
 
 private:
     interaction::LocomotionSnapshot initial_locomotion_for_fixture() const {
@@ -836,6 +838,10 @@ StagedCarry run_actual_carry_staging(
     AttachmentAudit& audit,
     uint64_t pickup_request_id) {
     using interaction::RuntimeState;
+    require(
+        fixture.actual_carry_staging_runs == 0,
+        "fixture repeated actual Carry staging");
+    ++fixture.actual_carry_staging_runs;
     StagedCarry staged{};
     staged.output = run_pickup_to_carry(
         fixture, audit, pickup_request_id);
@@ -910,6 +916,11 @@ interaction::RuntimeOutput require_two_frame_preflight_recovery(
     using interaction::Reason;
     using interaction::ResultCode;
     using interaction::RuntimeState;
+    require(
+        fixture.actual_carry_staging_runs == 1 &&
+            fixture.preflight_recovery_runs == 0,
+        "negative recovery receiver is not independently staged and clean");
+    ++fixture.preflight_recovery_runs;
 
     const interaction::InteractionTarget before =
         *fixture.registry.find(fixture.target);
@@ -1306,50 +1317,57 @@ int main(int argc, char** argv) {
                     success_staged.far.candidate.selection_id,
             "late contact changed certified reverse selection");
 
-        auto negative = std::make_unique<ProbeFixture>(
+        auto stale_receiver = std::make_unique<ProbeFixture>(
             database, features, config);
-        AttachmentAudit negative_audit{};
-        StagedCarry negative_staged = run_actual_carry_staging(
-            *negative, frames, negative_audit, 8101U);
+        AttachmentAudit stale_receiver_audit{};
+        StagedCarry stale_receiver_staged = run_actual_carry_staging(
+            *stale_receiver, frames, stale_receiver_audit, 8101U);
         require(
-            negative->owns_preview_id(
-                negative_staged.far.candidate.selection_id),
+            stale_receiver->owns_preview_id(
+                stale_receiver_staged.far.candidate.selection_id),
             "stale far ID lacks runtime-preview provenance");
-        negative_staged.output = require_two_frame_preflight_recovery(
-            *negative,
-            negative_staged.output,
-            negative_staged.far.candidate.selection_id,
+        stale_receiver_staged.output = require_two_frame_preflight_recovery(
+            *stale_receiver,
+            stale_receiver_staged.output,
+            stale_receiver_staged.far.candidate.selection_id,
             8301U);
-        const interaction::PlaceStagingPreview recovered_ready =
-            negative->preview();
+        const interaction::PlaceStagingPreview stale_recovered_ready =
+            stale_receiver->preview();
         require(
-            recovered_ready.accepted && recovered_ready.ready,
+            stale_recovered_ready.accepted && stale_recovered_ready.ready,
             "stale-ID recovery did not preserve ready Carry preview");
+
+        auto mismatch_receiver = std::make_unique<ProbeFixture>(
+            database, features, config);
+        AttachmentAudit mismatch_receiver_audit{};
+        StagedCarry mismatch_receiver_staged = run_actual_carry_staging(
+            *mismatch_receiver, frames, mismatch_receiver_audit, 8101U);
 
         interaction::RuntimeConfig mismatched_config = config;
         mismatched_config.ik.damping = std::nextafter(
             mismatched_config.ik.damping,
             std::numeric_limits<float>::infinity());
-        auto mismatched = std::make_unique<ProbeFixture>(
+        auto mismatch_producer = std::make_unique<ProbeFixture>(
             database, features, mismatched_config);
-        AttachmentAudit mismatched_audit{};
-        const StagedCarry mismatched_staged = run_actual_carry_staging(
-            *mismatched, frames, mismatched_audit, 8101U);
+        AttachmentAudit mismatch_producer_audit{};
+        const StagedCarry mismatch_producer_staged =
+            run_actual_carry_staging(
+            *mismatch_producer, frames, mismatch_producer_audit, 8101U);
         require(
-            mismatched->owns_preview_id(
-                mismatched_staged.staged.candidate.selection_id) &&
-                mismatched_staged.staged.ik_config_fingerprint !=
-                    recovered_ready.ik_config_fingerprint &&
-                mismatched_staged.staged.candidate.selection_id !=
-                    recovered_ready.candidate.selection_id,
+            mismatch_producer->owns_preview_id(
+                mismatch_producer_staged.staged.candidate.selection_id) &&
+                mismatch_producer_staged.staged.ik_config_fingerprint !=
+                    mismatch_receiver_staged.staged.ik_config_fingerprint &&
+                mismatch_producer_staged.staged.candidate.selection_id !=
+                    mismatch_receiver_staged.staged.candidate.selection_id,
             "IK-mismatched ID lacks distinct runtime-preview provenance");
-        negative_staged.output = require_two_frame_preflight_recovery(
-            *negative,
-            negative_staged.output,
-            mismatched_staged.staged.candidate.selection_id,
+        mismatch_receiver_staged.output = require_two_frame_preflight_recovery(
+            *mismatch_receiver,
+            mismatch_receiver_staged.output,
+            mismatch_producer_staged.staged.candidate.selection_id,
             8302U);
         require(
-            negative_staged.output.diagnostics.state ==
+            mismatch_receiver_staged.output.diagnostics.state ==
                 interaction::RuntimeState::Carry,
             "IK-mismatch recovery did not return to Carry");
 
