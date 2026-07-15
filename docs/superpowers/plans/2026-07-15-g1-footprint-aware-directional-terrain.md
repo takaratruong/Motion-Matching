@@ -1160,8 +1160,21 @@ git commit -m "feat: observe swept G1 foot terrain footprints"
 
 Extend `tests/cpp/test_g1_ik.cpp` under `G1_IK_ENABLE_TEST_SEAMS` to:
 
-- derive all 41 actual staged poses from one immutable support-retargeted baseline and require the full selector to choose the first real stage with `G1ClearanceOk`, nonnegative binary64 margin, and passed controller constraints;
-- require selected lift bits, materialized command-Y bits, twelve actual FK sphere-center bits, clearance result, and work to equal the independently probed stage;
+- invoke all 41 real production stages from one immutable support-retargeted
+  baseline through the diagnostic-only test wrapper and require the full
+  selector to choose the first stage with `G1ClearanceOk`, nonnegative
+  binary64 margin, and passed controller constraints. The wrapper returns no
+  staged positions, rotations, mutable directive, trace, or private geometry;
+- require selected lift bits, materialized command-Y bits, twelve actual FK
+  sphere-center bits, clearance result, and published work to equal the
+  independently invoked stage diagnostic. For the selected public output,
+  recompute checked FK and materialize the four centers independently of the
+  runtime helper before comparing all twelve words;
+- construct a nontrivially rotated pose and feed the real
+  `g1_footprint_observe_v2` output directly into `g1_ik_frame_begin` under both
+  strict and optimized-fast callers. Require all eight Task-4 current-center
+  words to match Task 5 recomputation exactly; a hand-built footprint is not
+  sufficient evidence for this cross-module boundary;
 - supply a footprint whose current probe bits disagree by one ULP with FK and require transactional `InvalidInput`;
 - supply `footprint.blocked=true` and require successful diagnostic safe-stop with unchanged pose/state/history;
 - supply a root/foot split of `0.32` with valid class-1 probes and require it to proceed through planting/staging rather than being flattened or treated as blocked;
@@ -1169,29 +1182,41 @@ Extend `tests/cpp/test_g1_ik.cpp` under `G1_IK_ENABLE_TEST_SEAMS` to:
   `landing_patch_ready=true`, and a selected surface `0.32 m` below the
   current sole. Require that lower surface height/normal to replace the swing
   base target before candidate zero and require each ladder entry to add to
-  that lower base, never to the old sole Y;
+  that lower base, never to the old sole Y. Drive the real per-foot stage, not
+  only begin/materialization, against terrain consistent with that height;
 - mirror the fixture for an up-step, and require the predicted landing X/Z to
   become the staged swing base X/Z. Require `target.surface.point` to equal the
   predicted landing X/Z and exact sampled surface height, require its normal to
   equal the sampled landing normal, and require the sole-center base Y to be
-  the one-rounding surface-height-plus-swing-clearance value;
+  the one-rounding surface-height-plus-swing-clearance value. Drive the real
+  per-foot stage against the corresponding upper terrain;
 - set `landing_expected=true` and `landing_patch_ready=false` and require a
   successful `G1IkStopLandingPatchUnavailable` safe stop with unchanged
   pose/state/history; set `landing_expected=false` and require the normal
   actual swing target path;
-- table-drive every clearance status: `OutsideDomain`, `BudgetExceeded`, and
-  `Uncertified` continue to the next lift while checked work accumulates;
-  `InvalidInput`, `InvalidField`, and `ArithmeticFailure` abort unchanged;
-- independently make an early candidate return `G1ClearanceOk` with a negative
-  lower margin, and make early candidates fail each checked controller
-  reach/correction/residual/invariance constraint, then require a later ladder
-  entry to pass. Each is candidate-local rejection, not a frame abort;
+- produce every clearance status through real strict-kernel inputs:
+  `OutsideDomain`, `BudgetExceeded`, and `Uncertified` continue to the next
+  lift, while `InvalidInput`, `InvalidField`, and `ArithmeticFailure` abort
+  unchanged. Because the certified validator leaves its output unchanged on
+  every non-`Ok` status, those finite calls publish zero margins/work and
+  contribute zero to `total_clearance_work`; never relabel work from an `Ok`
+  call as work from a non-`Ok` status;
+- independently make an early real candidate return `G1ClearanceOk` with a
+  negative lower margin, and exercise every checked controller
+  reach/correction/residual/invariance predicate with genuine stage inputs or
+  the same production predicate used by the real stage, then require a later
+  real ladder entry to pass. Each is candidate-local rejection, not a frame
+  abort. Test-only result mutation is forbidden;
 - stage both feet as swing feet with different winning indices. Require the
   left winner to remain in outer scratch while the right candidates run, and
   require both selected rotations and both twelve-word endpoint records to
   survive the final FK equality check;
 - require recorded contact to bypass the ladder, retain its world-space lock across a root level change, and use `target.sole_center` until checked release; and
-- snapshot a sentinel `G1CommandSnapshot` around every call and require byte identity, proving the IK API cannot alter requested travel or heading.
+- snapshot a sentinel `G1CommandSnapshot` around every call and require byte identity, proving the IK API cannot alter requested travel or heading; and
+- exercise `g1_ik_safe_stop_handoff` with positive and negative signed zeros.
+  When unlatched, every requested-velocity word must be copied exactly. When
+  latched, only X/Z become canonical `+0.0f`; Y retains its exact input bits,
+  including `-0.0f`.
 
 - [ ] **Step 2: Run the missing-runtime RED with a separate strict kernel**
 
@@ -1397,6 +1422,9 @@ static constexpr uint32_t G1SwingLiftCandidateBits[
 
 Entry `i` is `RN32(i/500 m)`, from `0x00000000` through `0x3da3d70a`.
 Load bits with `memcpy`; never generate the ladder arithmetically.
+Use a constexpr full-table ordering check in production and an independent
+exact-rational test oracle for all 41 words; checking only count, endpoints, or
+the production table against itself is insufficient.
 The two diagnostic structs above are copied verbatim from the authoritative
 certified-clearance contract; do not replace selected-candidate status/work or
 aggregate work with a rejection mask. `g1_ik_safe_stop_handoff` validates
@@ -1409,6 +1437,30 @@ X/Z only when latched, requests one forced matcher search when latched, assigns
 `target-unreachable`, `no-swing-candidate`, and `pose-clearance-rejected`; an
 unknown value returns `invalid` for diagnostics and fails validation before
 state publication.
+
+Under `G1_IK_ENABLE_TEST_SEAMS`, expose exactly one diagnostic-only wrapper:
+
+```cpp
+static inline bool g1_ik_stage_swing_candidate_for_test(
+    G1SwingCandidateDiagnostic& diagnostic,
+    const slice1d<vec3> local_positions,
+    const slice1d<quat> baseline_rotations,
+    const slice1d<int> bone_parents,
+    const G1SwingHistory& history,
+    const heightfield& field,
+    const G1LegConfig& config,
+    const G1FootTarget& target,
+    uint32_t candidate_index,
+    float dt,
+    char* error,
+    int error_capacity);
+```
+
+It calls the real private stage once, discards staged positions/rotations, and
+publishes only the diagnostic on success. Do not expose directive setters,
+trace storage, mutable seam state, staged pose arrays, adapters, or any second
+test symbol. Real geometry/status fixtures and shared production predicates
+provide branch coverage without laundering results.
 
 `g1_ik_frame_begin` performs the complete common validation, initializes a
 local transaction, and copies the support-retargeted baseline into caller-owned
@@ -1492,19 +1544,27 @@ Accept only exact `G1ClearanceOk`, nonnegative
 `validation.lower_margin_m`, and passed controller constraints. Advance to the
 next ladder entry on `OutsideDomain`, `BudgetExceeded`, `Uncertified`, an
 `Ok` certificate with negative lower margin, or a checked controller-local
-reach, correction-limit, residual, or endpoint-invariance rejection. Add every
-real call's work with checked arithmetic. Abort the whole transaction unchanged
+reach, correction-limit, residual, or endpoint-invariance rejection. The
+strict validator assigns `G1SwingClearanceValidation` only on `Ok`: copy and
+checked-add work only from those published `Ok` results, including `Ok`
+certificates rejected by a controller predicate or negative margin. Record the
+explicit finite non-`Ok` status with default zero margin/work; never fabricate
+attempted work. Abort the whole transaction unchanged
 only for `InvalidInput`, `InvalidField`, `ArithmeticFailure`, or a malformed
 checked controller call. Stop at the first pass, move its already-solved pose/result
 and complete `G1SwingCandidateDiagnostic` into outer scratch, and do not solve
 again. If all 41 reject, return successful safe-stop with unchanged accepted
 state, `selected_index=G1SwingNoCandidate`, default selected fields, and exact
-aggregate work.
+aggregate published-`Ok` work.
 
 After both feet compose sequentially in outer scratch, run one checked FK,
 compare both feet's selected endpoint bits, run fresh actual-center defensive
 certificates, and commit checked histories only into scratch state. Any later
-failure rolls the full frame back.
+failure rolls the accepted frame back. The split API's transaction and pose
+arrays are explicitly caller-owned working scratch and may remain dirty on a
+returned global error; Task 6 must discard them with its complete working
+state. `g1_ik_frame_evaluate` remains fully transactional because its scratch
+is local and is never published on failure.
 
 - [ ] **Step 6: Run strict, fast-caller, seam, and sanitizer GREEN**
 
