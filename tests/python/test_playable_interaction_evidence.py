@@ -131,7 +131,8 @@ FLAT_JOINT_NAMES = (
     "RightForeArm",
     "RightHand",
 )
-JOINT_TRANSLATION_LIMIT_M = 0.20
+JOINT_TRANSLATION_SPEED_LIMIT_MPS = 12.0
+AUTHORITY_SEAM_TRANSLATION_LIMIT_M = 0.20
 JOINT_ROTATION_LIMIT_DEGREES = 60.0
 JOINT_QUATERNION_NORM_TOLERANCE = 1.0e-3
 GRASP_COMPOSITION_TOLERANCE = 1.0e-5
@@ -519,16 +520,32 @@ def validate_evidence(records: list[dict]) -> None:
         if index == 0:
             continue
         previous = records[index - 1]
+        authority_seam = (
+            record["state"] != previous["state"]
+            or record["owns_pose"] != previous["owns_pose"]
+            or record["attached"] != previous["attached"]
+        )
         for joint, joint_name in enumerate(FLAT_JOINT_NAMES):
             translation_step_m = math.dist(
                 previous["joint_world_positions"][joint],
                 record["joint_world_positions"][joint],
             )
-            if translation_step_m > JOINT_TRANSLATION_LIMIT_M:
+            if (
+                authority_seam
+                and translation_step_m > AUTHORITY_SEAM_TRANSLATION_LIMIT_M
+            ):
                 raise _error(
                     f"joint {joint} ({joint_name}) frame {index - 1}->{index} "
-                    f"translation {translation_step_m:.6f} m exceeds max "
-                    f"{JOINT_TRANSLATION_LIMIT_M:.6f} m"
+                    f"translation {translation_step_m:.6f} m across authority "
+                    f"seam exceeds max "
+                    f"{AUTHORITY_SEAM_TRANSLATION_LIMIT_M:.6f} m"
+                )
+            translation_speed_mps = translation_step_m * CONTROL_RATE_HZ
+            if translation_speed_mps > JOINT_TRANSLATION_SPEED_LIMIT_MPS:
+                raise _error(
+                    f"joint {joint} ({joint_name}) frame {index - 1}->{index} "
+                    f"translation speed {translation_speed_mps:.6f} m/s "
+                    f"exceeds max {JOINT_TRANSLATION_SPEED_LIMIT_MPS:.6f} m/s"
                 )
             rotation_step_degrees = _joint_rotation_step_degrees(
                 previous["joint_world_rotations"][joint],
@@ -1012,12 +1029,34 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
         self.log = self.root / "pickup.jsonl"
         self.screenshot = self.root / "pickup.png"
 
-    def test_valid_synthetic_evidence_is_accepted(self):
-        _write_records(self.log, _valid_records())
+    def test_steady_translation_speed_accepts_exact_twelve_mps_and_rejects_more(self):
+        frame = 1
+        joint = 14
+        records = _valid_records()
+        records[frame]["joint_world_positions"][joint] = copy.deepcopy(
+            records[frame - 1]["joint_world_positions"][joint]
+        )
+        records[frame]["joint_world_positions"][joint][0] += (
+            12.0 / CONTROL_RATE_HZ
+        )
+        _write_records(self.log, records)
         _write_png(self.screenshot)
-        records = load_evidence(self.log)
-        validate_evidence(records)
+        validate_evidence(load_evidence(self.log))
         validate_screenshot(self.screenshot)
+
+        records = _valid_records()
+        records[frame]["joint_world_positions"][joint] = copy.deepcopy(
+            records[frame - 1]["joint_world_positions"][joint]
+        )
+        records[frame]["joint_world_positions"][joint][0] += (
+            12.000001 / CONTROL_RATE_HZ
+        )
+        with self.assertRaisesRegex(
+            EvidenceValidationError,
+            rf"joint {joint} \(Head\).*frame {frame - 1}->{frame}.*"
+            r"12\.000001 m/s.*12\.000000 m/s",
+        ):
+            validate_evidence(records)
 
     def test_grasp_fields_have_exact_fixed_order(self):
         self.assertEqual(
@@ -1637,25 +1676,27 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
         ):
             validate_evidence(records)
 
-    def test_point_200001_joint_jump_is_rejected_at_every_state_boundary(self):
+    def test_point_200001_joint_jump_is_rejected_at_every_authority_seam(self):
         records = _valid_records()
-        first_state_frames = {
-            state: next(
-                index for index, record in enumerate(records)
-                if record["state"] == state
+        seams = [
+            (
+                f"state-{records[frame - 1]['state']}-to-{record['state']}",
+                frame,
+                {},
             )
-            for state in ("Preflight", "PickupReplay", "Carry")
-        }
-        boundary_frames = {
-            "entry": first_state_frames["Preflight"],
-            "contact": first_state_frames["PickupReplay"],
-            "hold_to_carry": first_state_frames["Carry"],
-            "carry": first_state_frames["Carry"] + 20,
-            "reset": len(records) - 1,
-        }
-        for boundary, frame in boundary_frames.items():
-            with self.subTest(boundary=boundary):
+            for frame, record in enumerate(records[1:], start=1)
+            if record["state"] != records[frame - 1]["state"]
+        ]
+        seams.extend(
+            (
+                ("owns-pose-only", 1, {"owns_pose": True}),
+                ("attached-only", 1, {"attached": True}),
+            )
+        )
+        for seam, frame, mutations in seams:
+            with self.subTest(seam=seam):
                 records = _valid_records()
+                records[frame].update(mutations)
                 records[frame]["joint_world_positions"][14] = copy.deepcopy(
                     records[frame - 1]["joint_world_positions"][14]
                 )
