@@ -1963,12 +1963,15 @@ const char* autodemo_action_name(AutodemoAction action)
     return "none";
 }
 
+constexpr uint32_t kAutodemoResetPresentationFrames = 16U;
+
 struct ControllerAutodemoState
 {
     std::ofstream log;
     uint64_t render_frame = 0U;
     uint64_t runtime_tick = 0U;
     uint32_t warmup_render_ticks = 0U;
+    uint32_t reset_presentation_frames_remaining = 0U;
     int carry_command_count = 0;
     bool evidence_started = false;
     bool interact_pulsed = false;
@@ -3048,7 +3051,8 @@ int main(void)
             // input. It drives only the ordinary left-stick seam and the
             // existing scheduler edge seam.
             gamepadstick_left = vec3();
-            if (autodemo_state.evidence_started)
+            if (autodemo_state.evidence_started &&
+                autodemo_state.reset_presentation_frames_remaining == 0U)
             {
                 if (autodemo_state.render_frame == 30U &&
                     !autodemo_state.interact_pulsed)
@@ -4339,6 +4343,18 @@ int main(void)
 
         if (autodemo_configuration.has_value())
         {
+            if (autodemo_state.reset_presentation_frames_remaining > 0U)
+            {
+                --autodemo_state.reset_presentation_frames_remaining;
+                if (autodemo_state.reset_presentation_frames_remaining == 0U)
+                {
+                    publish_autodemo_evidence(*autodemo_configuration);
+                    autodemo_state.complete = true;
+                    autodemo_state.exit_requested = true;
+                }
+                return;
+            }
+
             ++autodemo_state.warmup_render_ticks;
             if (!autodemo_state.evidence_started)
             {
@@ -4529,9 +4545,9 @@ int main(void)
                         throw std::runtime_error(
                             "cannot close autodemo JSONL");
                     }
-                    publish_autodemo_evidence(*autodemo_configuration);
-                    autodemo_state.complete = true;
-                    autodemo_state.exit_requested = true;
+                    autodemo_state.reset_pending = false;
+                    autodemo_state.reset_presentation_frames_remaining =
+                        kAutodemoResetPresentationFrames;
                 }
                 else
                 {

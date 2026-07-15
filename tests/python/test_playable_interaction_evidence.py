@@ -2290,6 +2290,121 @@ class Task12PolicyTests(unittest.TestCase):
             "JSON writer must receive exactly the immutable final capture",
         )
 
+    def test_autodemo_drains_sixteen_unlogged_frames_before_exit(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        self.assertRegex(
+            controller,
+            r"constexpr\s+uint32_t\s+"
+            r"kAutodemoResetPresentationFrames\s*=\s*16U;",
+            "autodemo Reset must remain visible for the 0.25 s release",
+        )
+
+        state = self._source_between(
+            controller,
+            "struct ControllerAutodemoState",
+            "bool autodemo_render_is_due",
+        )
+        self.assertIn(
+            "uint32_t reset_presentation_frames_remaining = 0U;",
+            state,
+            "autodemo state must own the bounded presentation drain",
+        )
+
+        reset_completion = self._source_between(
+            controller,
+            "                if (autodemo_action == AutodemoAction::Reset)\n"
+            "                {\n"
+            "                    if (autodemo_state.collapsed_states.size()",
+            "                else\n"
+            "                {\n"
+            "                    ++autodemo_state.render_frame;",
+        )
+        self.assertIn(
+            "autodemo_state.reset_pending = false;",
+            reset_completion,
+            "the successful Reset edge must not be pulsed during the drain",
+        )
+        self.assertIn(
+            "autodemo_state.reset_presentation_frames_remaining =\n"
+            "                        kAutodemoResetPresentationFrames;",
+            reset_completion,
+            "the logged Reset must start the exact 16-frame drain",
+        )
+        for forbidden in (
+            "publish_autodemo_evidence(",
+            "autodemo_state.complete = true;",
+            "autodemo_state.exit_requested = true;",
+            "++autodemo_state.render_frame;",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(
+                    forbidden,
+                    reset_completion,
+                    "Reset recording must not publish, exit, or append a row",
+                )
+
+        post_draw = self._source_between(
+            controller,
+            "        EndDrawing();",
+            "            ++autodemo_state.warmup_render_ticks;",
+        )
+        required_order = (
+            "if (autodemo_state.reset_presentation_frames_remaining > 0U)",
+            "--autodemo_state.reset_presentation_frames_remaining;",
+            "if (autodemo_state.reset_presentation_frames_remaining == 0U)",
+            "publish_autodemo_evidence(*autodemo_configuration);",
+            "autodemo_state.complete = true;",
+            "autodemo_state.exit_requested = true;",
+            "return;",
+        )
+        positions = []
+        for marker in required_order:
+            self.assertIn(marker, post_draw)
+            positions.append(post_draw.index(marker))
+        self.assertEqual(
+            positions,
+            sorted(positions),
+            "drain countdown, publication, and exit must remain ordered",
+        )
+
+    def test_autodemo_reset_drain_is_input_free_and_precedes_logging(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        scripted_input = self._source_between(
+            controller,
+            "            // Auto evidence is deterministic in the absence of external",
+            "        // Get if strafe is desired",
+        )
+        self.assertRegex(
+            scripted_input,
+            r"if\s*\(autodemo_state\.evidence_started\s*&&\s*"
+            r"autodemo_state\.reset_presentation_frames_remaining\s*"
+            r"==\s*0U\)",
+            "drain renders must not issue Interact, Forward, or Reset input",
+        )
+
+        end_drawing = controller.index("        EndDrawing();")
+        drain = controller.index(
+            "if (autodemo_state.reset_presentation_frames_remaining > 0U)",
+            end_drawing,
+        )
+        warmup = controller.index(
+            "++autodemo_state.warmup_render_ticks;", drain
+        )
+        progression = controller.index(
+            "validate_autodemo_state_progression(", warmup
+        )
+        writer = controller.index("write_autodemo_record(", progression)
+        self.assertLess(end_drawing, drain)
+        self.assertLess(drain, warmup)
+        self.assertLess(warmup, progression)
+        self.assertLess(progression, writer)
+        drain_block = controller[drain:warmup]
+        self.assertIn("return;", drain_block)
+        self.assertNotIn("write_autodemo_record(", drain_block)
+        self.assertNotIn("++autodemo_state.render_frame", drain_block)
+        self.assertNotIn("WaitTime(", drain_block)
+        self.assertNotRegex(drain_block, r"\b(?:sleep|usleep)\s*\(")
+
     def test_canonical_world_is_initialized_once_before_log_and_update(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")
         initializer_marker = (
@@ -2684,6 +2799,20 @@ class PlayableInteractionEvidenceTests(unittest.TestCase):
         records = load_evidence(Path(os.environ["PLAYABLE_LOG"]))
         validate_evidence(records)
         validate_screenshot(Path(os.environ["PLAYABLE_SCREENSHOT"]))
+
+    def test_real_playable_evidence_preserves_exact_354_record_contract(self):
+        records = load_evidence(Path(os.environ["PLAYABLE_LOG"]))
+        self.assertEqual(len(records), 354)
+        self.assertEqual(
+            [record["render_frame"] for record in records],
+            list(range(354)),
+        )
+        self.assertEqual(records[-1]["render_frame"], 353)
+        self.assertEqual(records[-1]["state"], "Locomotion")
+        self.assertEqual(records[-1]["action"], "reset")
+        self.assertEqual(records[-1]["result"], "Reset")
+        self.assertEqual(records[-1]["reason"], "Reset")
+        self.assertFalse(records[-1]["attached"])
 
 
 if __name__ == "__main__":
