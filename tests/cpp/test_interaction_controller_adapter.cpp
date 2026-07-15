@@ -157,6 +157,9 @@ bool output_fields_equal(const RuntimeOutput& left, const RuntimeOutput& right) 
         !float_bits_equal(
             left_diagnostics.hand_orientation_error_radians,
             right_diagnostics.hand_orientation_error_radians) ||
+        !float_bits_equal(
+            left_diagnostics.hand_constraint_weight,
+            right_diagnostics.hand_constraint_weight) ||
         left_diagnostics.attached != right_diagnostics.attached ||
         left_diagnostics.recorded_carry != right_diagnostics.recorded_carry ||
         left_diagnostics.pack_available != right_diagnostics.pack_available) {
@@ -373,6 +376,8 @@ RuntimeOutput make_complete_output(int serial, RuntimeState state) {
     output.diagnostics.playback_speed = 1.05F;
     output.diagnostics.hand_position_error_m = 0.02F;
     output.diagnostics.hand_orientation_error_radians = 0.03F;
+    output.diagnostics.hand_constraint_weight =
+        0.01F * static_cast<float>(serial);
     output.diagnostics.attached = true;
     output.diagnostics.recorded_carry = true;
     output.diagnostics.pack_available = true;

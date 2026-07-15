@@ -67,6 +67,7 @@ struct RuntimeDiagnostics {
     float playback_speed = 1.0F;
     float hand_position_error_m = 0.0F;
     float hand_orientation_error_radians = 0.0F;
+    float hand_constraint_weight = 0.0F;
     bool attached = false;
     bool recorded_carry = false;
     bool pack_available = false;

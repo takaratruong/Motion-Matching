@@ -215,6 +215,17 @@ Transform hand_world(const Pose& pose, Hand hand) {
     return {world.positions[bone], world.rotations[bone]};
 }
 
+float authored_hand_constraint_weight(
+    int32_t frame,
+    const MatchCandidate& candidate) {
+    return std::clamp(
+        static_cast<float>(frame - candidate.entry_frame) /
+            static_cast<float>(
+                candidate.contact_frame - candidate.entry_frame),
+        0.0F,
+        1.0F);
+}
+
 IKResult apply_reach_ik(
     Pose& pose,
     int32_t frame,
@@ -224,12 +235,8 @@ IKResult apply_reach_ik(
     Transform source_contact_hand_world,
     const IKConfig& config) {
     const Transform sampled_hand = hand_world(pose, affordance.hand);
-    const float reach_alpha = std::clamp(
-        static_cast<float>(frame - candidate.entry_frame) /
-            static_cast<float>(
-                candidate.contact_frame - candidate.entry_frame),
-        0.0F,
-        1.0F);
+    const float reach_alpha = authored_hand_constraint_weight(
+        frame, candidate);
     Transform corrected_hand{};
     corrected_hand.position = sampled_hand.position + reach_alpha * (
         target_hand_world.position - source_contact_hand_world.position);
@@ -1334,6 +1341,18 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
                 diagnostics_.recorded_carry = carry_->recorded();
             }
         }
+    }
+
+    diagnostics_.hand_constraint_weight = 0.0F;
+    if (diagnostics_.result != ResultCode::Failed &&
+        candidate_.has_value() && player_.has_value() &&
+        (state_ == RuntimeState::Align ||
+         state_ == RuntimeState::PickupReplay ||
+         state_ == RuntimeState::Hold ||
+         state_ == RuntimeState::Carry)) {
+        diagnostics_.hand_constraint_weight =
+            authored_hand_constraint_weight(
+                player_->frame(), *candidate_);
     }
 
     RuntimeOutput output = passthrough(input, diagnostics_);

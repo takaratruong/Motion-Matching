@@ -77,6 +77,7 @@ bool exact(
            left.hand_position_error_m == right.hand_position_error_m &&
            left.hand_orientation_error_radians ==
                right.hand_orientation_error_radians &&
+           left.hand_constraint_weight == right.hand_constraint_weight &&
            left.attached == right.attached &&
            left.recorded_carry == right.recorded_carry &&
            left.pack_available == right.pack_available;
@@ -117,6 +118,13 @@ interaction::RuntimeOutput advance(
     interaction::InteractionRuntime& runtime,
     const interaction::LocomotionSnapshot& locomotion) {
     return runtime.update(idle_input(locomotion));
+}
+
+void assert_valid_hand_constraint_weight(
+    const interaction::RuntimeDiagnostics& diagnostics) {
+    assert(std::isfinite(diagnostics.hand_constraint_weight));
+    assert(diagnostics.hand_constraint_weight >= 0.0F);
+    assert(diagnostics.hand_constraint_weight <= 1.0F);
 }
 
 interaction::RuntimeOutput advance_until(
@@ -407,6 +415,8 @@ void test_frozen_public_contract_and_defaults() {
         decltype(&InteractionRuntime::diagnostics),
         const RuntimeDiagnostics& (InteractionRuntime::*)() const>);
     static_assert(std::is_same_v<
+        decltype(RuntimeDiagnostics{}.hand_constraint_weight), float>);
+    static_assert(std::is_same_v<
         decltype(&InteractionRuntime::update),
         RuntimeOutput (InteractionRuntime::*)(const RuntimeInput&)>);
 
@@ -430,6 +440,7 @@ void test_frozen_public_contract_and_defaults() {
     assert(diagnostics.reason == Reason::None);
     assert(diagnostics.object_state == ObjectState::Free);
     assert(diagnostics.clip == -1 && diagnostics.frame == -1);
+    assert(diagnostics.hand_constraint_weight == 0.0F);
     assert(!diagnostics.attached && !diagnostics.recorded_carry);
     assert(!diagnostics.pack_available);
 
@@ -667,6 +678,162 @@ void test_success_order_carry_and_reset() {
         fixture.registry.resolve_single_target(vec3(0.0F, 0.0F, 3.0F), 1.0F);
     assert(after_idle == restored);
     assert(output.diagnostics.result == ResultCode::Reset);
+}
+
+void test_hand_constraint_weight_tracks_authored_reach_and_attachment() {
+    using namespace interaction;
+    using namespace interaction::runtime_fixture_detail;
+    RuntimeFixture fixture = make_runtime_fixture();
+    InteractionRuntime runtime(
+        fixture.database, fixture.features, fixture.registry, RuntimeConfig{});
+
+    RuntimeOutput output = runtime.update(interact_input(
+        fixture.locomotion, fixture.request));
+    assert(output.diagnostics.state == RuntimeState::Preflight);
+    assert_valid_hand_constraint_weight(output.diagnostics);
+    assert(output.diagnostics.hand_constraint_weight == 0.0F);
+
+    output = advance(runtime, fixture.locomotion);
+    assert(output.diagnostics.state == RuntimeState::Align);
+    constexpr int32_t kEntryFrame = kFramesPerClip + 10;
+    constexpr int32_t kContactFrame =
+        kFramesPerClip + kContactLocalFrame;
+    assert(output.diagnostics.frame == kEntryFrame);
+    assert(output.diagnostics.hand_constraint_weight == 0.0F);
+
+    float previous_weight = output.diagnostics.hand_constraint_weight;
+    bool saw_precontact_pickup_replay = false;
+    bool saw_contact = false;
+    bool saw_attached_pickup_replay = false;
+    bool saw_hold = false;
+    bool saw_carry = false;
+    for (int update = 0; update < kMaximumUpdates; ++update) {
+        output = advance(runtime, fixture.locomotion);
+        assert_valid_hand_constraint_weight(output.diagnostics);
+
+        if (output.diagnostics.frame <= kContactFrame &&
+            (output.diagnostics.state == RuntimeState::Align ||
+             output.diagnostics.state == RuntimeState::PickupReplay)) {
+            const float expected = std::clamp(
+                static_cast<float>(
+                    output.diagnostics.frame - kEntryFrame) /
+                    static_cast<float>(kContactFrame - kEntryFrame),
+                0.0F,
+                1.0F);
+            assert(output.diagnostics.hand_constraint_weight == expected);
+            assert(output.diagnostics.hand_constraint_weight >=
+                   previous_weight);
+            previous_weight = output.diagnostics.hand_constraint_weight;
+            if (output.diagnostics.state == RuntimeState::PickupReplay &&
+                output.diagnostics.frame < kContactFrame) {
+                saw_precontact_pickup_replay = true;
+            }
+            if (output.diagnostics.frame == kContactFrame) {
+                saw_contact = true;
+                assert(output.diagnostics.phase == Phase::Contact);
+                assert(output.diagnostics.hand_constraint_weight == 1.0F);
+            }
+        }
+
+        if (output.diagnostics.attached) {
+            assert(output.diagnostics.hand_constraint_weight == 1.0F);
+            if (output.diagnostics.state == RuntimeState::PickupReplay) {
+                saw_attached_pickup_replay = true;
+            }
+        }
+        if (output.diagnostics.state == RuntimeState::Hold) {
+            saw_hold = true;
+            assert(output.diagnostics.hand_constraint_weight == 1.0F);
+        }
+        if (output.diagnostics.state == RuntimeState::Carry) {
+            saw_carry = true;
+            assert(output.diagnostics.hand_constraint_weight == 1.0F);
+            break;
+        }
+    }
+    assert(saw_precontact_pickup_replay);
+    assert(saw_contact);
+    assert(saw_attached_pickup_replay);
+    assert(saw_hold);
+    assert(saw_carry);
+}
+
+void test_hand_constraint_weight_resets_on_cancel_failure_and_reset() {
+    using namespace interaction;
+
+    {
+        RuntimeFixture fixture = make_runtime_fixture();
+        InteractionRuntime runtime(
+            fixture.database,
+            fixture.features,
+            fixture.registry,
+            RuntimeConfig{});
+        RuntimeOutput output = enter_align(runtime, fixture);
+        while (output.diagnostics.hand_constraint_weight == 0.0F) {
+            output = advance(runtime, fixture.locomotion);
+            assert(output.diagnostics.state == RuntimeState::Align);
+        }
+        output = runtime.update(cancel_input(fixture.locomotion));
+        assert(output.diagnostics.state == RuntimeState::Locomotion);
+        assert(output.diagnostics.result == ResultCode::Cancelled);
+        assert(output.diagnostics.hand_constraint_weight == 0.0F);
+    }
+
+    {
+        RuntimeFixture fixture = contact_failure_fixture();
+        RuntimeConfig config{};
+        config.ik.accepted_position_m =
+            config.ik.maximum_request_position_m;
+        InteractionRuntime runtime(
+            fixture.database,
+            fixture.features,
+            fixture.registry,
+            config);
+        RuntimeOutput output = enter_align(runtime, fixture);
+        bool saw_failure = false;
+        for (int update = 0; update < kMaximumUpdates; ++update) {
+            output = advance(runtime, fixture.locomotion);
+            assert_valid_hand_constraint_weight(output.diagnostics);
+            if (output.diagnostics.result == ResultCode::Failed) {
+                saw_failure = true;
+                assert(output.diagnostics.hand_constraint_weight == 0.0F);
+                break;
+            }
+        }
+        assert(saw_failure);
+    }
+
+    {
+        RuntimeFixture fixture = make_runtime_fixture();
+        InteractionRuntime runtime(
+            fixture.database,
+            fixture.features,
+            fixture.registry,
+            RuntimeConfig{});
+        RuntimeOutput output = enter_align(runtime, fixture);
+        output = advance_until(
+            runtime,
+            fixture.locomotion,
+            RuntimeState::PickupReplay,
+            RuntimeState::Align);
+        output = advance_until(
+            runtime,
+            fixture.locomotion,
+            RuntimeState::Hold,
+            RuntimeState::PickupReplay);
+        output = advance_until(
+            runtime,
+            fixture.locomotion,
+            RuntimeState::Carry,
+            RuntimeState::Hold);
+        assert(output.diagnostics.hand_constraint_weight == 1.0F);
+        output = runtime.update(reset_input(fixture.locomotion));
+        assert(output.diagnostics.state == RuntimeState::Locomotion);
+        assert(output.diagnostics.result == ResultCode::Reset);
+        assert(output.diagnostics.hand_constraint_weight == 0.0F);
+        output = advance(runtime, fixture.locomotion);
+        assert(output.diagnostics.hand_constraint_weight == 0.0F);
+    }
 }
 
 void test_carry_reset_preserves_a_newer_authoritative_generation() {
@@ -1540,6 +1707,8 @@ int main() {
     test_noncanonical_dt_cannot_mutate_owned_runtime_state();
     test_interact_without_explicit_request_is_rejected_after_preflight();
     test_success_order_carry_and_reset();
+    test_hand_constraint_weight_tracks_authored_reach_and_attachment();
+    test_hand_constraint_weight_resets_on_cancel_failure_and_reset();
     test_carry_reset_preserves_a_newer_authoritative_generation();
     test_carry_update_preserves_a_newer_authoritative_generation();
     test_align_cancel_releases_reservation();
