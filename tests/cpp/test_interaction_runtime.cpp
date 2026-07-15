@@ -80,6 +80,8 @@ bool exact(
            left.hand_constraint_weight == right.hand_constraint_weight &&
            left.attached == right.attached &&
            left.recorded_carry == right.recorded_carry &&
+           left.inactive_arm_targets_locomotion ==
+               right.inactive_arm_targets_locomotion &&
            left.inactive_arm_tracks_locomotion ==
                right.inactive_arm_tracks_locomotion &&
            left.pack_available == right.pack_available;
@@ -437,6 +439,9 @@ void test_frozen_public_contract_and_defaults() {
     static_assert(std::is_same_v<
         decltype(RuntimeDiagnostics{}.hand_constraint_weight), float>);
     static_assert(std::is_same_v<
+        decltype(RuntimeDiagnostics{}.inactive_arm_targets_locomotion),
+        bool>);
+    static_assert(std::is_same_v<
         decltype(RuntimeDiagnostics{}.inactive_arm_tracks_locomotion), bool>);
     static_assert(std::is_same_v<
         decltype(&InteractionRuntime::update),
@@ -464,6 +469,7 @@ void test_frozen_public_contract_and_defaults() {
     assert(diagnostics.clip == -1 && diagnostics.frame == -1);
     assert(diagnostics.hand_constraint_weight == 0.0F);
     assert(!diagnostics.attached && !diagnostics.recorded_carry);
+    assert(!diagnostics.inactive_arm_targets_locomotion);
     assert(!diagnostics.inactive_arm_tracks_locomotion);
     assert(!diagnostics.pack_available);
 
@@ -713,6 +719,7 @@ void test_layered_carry_publishes_inactive_arm_authority_transactionally() {
         fixture.database, fixture.features, fixture.registry, config);
 
     RuntimeOutput output = enter_carry_before_first_update(runtime, fixture);
+    assert(!output.diagnostics.inactive_arm_targets_locomotion);
     LocomotionSnapshot carry_locomotion = fixture.locomotion;
     carry_locomotion.pose = output.pose;
     for (int update = 0;
@@ -723,10 +730,12 @@ void test_layered_carry_publishes_inactive_arm_authority_transactionally() {
         if (!output.diagnostics.inactive_arm_tracks_locomotion) {
             assert(output.diagnostics.state == RuntimeState::Carry);
             assert(!output.diagnostics.recorded_carry);
+            assert(output.diagnostics.inactive_arm_targets_locomotion);
         }
     }
     assert(output.diagnostics.state == RuntimeState::Carry);
     assert(!output.diagnostics.recorded_carry);
+    assert(output.diagnostics.inactive_arm_targets_locomotion);
     assert(output.diagnostics.inactive_arm_tracks_locomotion);
 
     const RuntimeDiagnostics before_failure = runtime.diagnostics();
@@ -746,6 +755,7 @@ void test_layered_carry_publishes_inactive_arm_authority_transactionally() {
     assert(output.diagnostics.inactive_arm_tracks_locomotion);
     output = runtime.update(reset_input(carry_locomotion));
     assert(output.diagnostics.state == RuntimeState::Locomotion);
+    assert(!output.diagnostics.inactive_arm_targets_locomotion);
     assert(!output.diagnostics.inactive_arm_tracks_locomotion);
 }
 
@@ -761,6 +771,7 @@ void test_recorded_and_weighted_carry_never_publish_inactive_arm_authority() {
         InteractionRuntime runtime(
             fixture.database, fixture.features, fixture.registry, config);
         RuntimeOutput output = enter_carry_before_first_update(runtime, fixture);
+        assert(!output.diagnostics.inactive_arm_targets_locomotion);
         LocomotionSnapshot carry_locomotion = fixture.locomotion;
         carry_locomotion.pose = output.pose;
         bool saw_recorded = false;
@@ -768,6 +779,9 @@ void test_recorded_and_weighted_carry_never_publish_inactive_arm_authority() {
             output = advance(runtime, carry_locomotion);
             assert(output.diagnostics.state == RuntimeState::Carry);
             assert(!output.diagnostics.inactive_arm_tracks_locomotion);
+            assert(
+                output.diagnostics.inactive_arm_targets_locomotion ==
+                (!weighted_layered && !output.diagnostics.recorded_carry));
             saw_recorded = saw_recorded || output.diagnostics.recorded_carry;
         }
         if (!weighted_layered) assert(saw_recorded);

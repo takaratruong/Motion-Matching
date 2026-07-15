@@ -1514,6 +1514,18 @@ bool CarryController::recorded() const {
     return recorded_;
 }
 
+bool CarryController::inactive_arm_targets_locomotion() const {
+    if (!started_ || config_.inactive_arm_weight != 0.0F) return false;
+    if (transition_seam_key_ == kUnsetSeamKey &&
+        published_seam_key_ == kUnsetSeamKey) {
+        return false;
+    }
+    const int64_t current_seam_key = transition_active_
+        ? transition_seam_key_
+        : published_seam_key_;
+    return current_seam_key == kLayeredSeamKey;
+}
+
 bool CarryController::inactive_arm_tracks_locomotion() const {
     return started_ && !recorded_ &&
            config_.inactive_arm_weight == 0.0F &&

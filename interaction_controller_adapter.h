@@ -147,6 +147,10 @@ private:
     TargetRigArmIK target_rig_arm_ik_{};
     std::optional<ControllerInteractionHandConstraint>
         ownership_hand_constraint_{};
+    std::optional<Hand> inactive_arm_locomotion_hand_{};
+    std::optional<Hand> inactive_arm_return_hand_{};
+    float inactive_arm_blend_seconds_ = 0.0F;
+    FlatControllerPose inactive_arm_blend_source_{};
 };
 
 struct ControllerInteractionSceneState {

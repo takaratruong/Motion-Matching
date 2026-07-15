@@ -143,6 +143,8 @@ GRASP_COMPOSITION_TOLERANCE = 1.0e-5
 GRASP_EVIDENCE_STATES = ("PickupReplay", "Hold", "Carry")
 HAND_POSITION_LIMIT_M = 0.01
 HAND_CALIBRATED_ORIENTATION_LIMIT_DEGREES = 2.0
+# Canonical flat-autodemo morphology guard; recorded/high-carry motion is exempt.
+LAYERED_INACTIVE_HAND_ELEVATION_LIMIT_M = 0.10
 
 
 def _error(message: str) -> EvidenceValidationError:
@@ -641,6 +643,25 @@ def validate_evidence(records: list[dict]) -> None:
         for record in carry
     ):
         raise _error("all Carry records must be Held, attached, and own the pose")
+    for record in carry:
+        if record["carry_mode"] != "layered":
+            continue
+        if record["active_hand_joint"] == 22:
+            inactive_arm_joint, inactive_hand_joint = 16, 18
+        elif record["active_hand_joint"] == 18:
+            inactive_arm_joint, inactive_hand_joint = 20, 22
+        else:
+            continue
+        elevation_m = (
+            record["joint_world_positions"][inactive_hand_joint][1]
+            - record["joint_world_positions"][inactive_arm_joint][1]
+        )
+        if elevation_m > LAYERED_INACTIVE_HAND_ELEVATION_LIMIT_M + 1.0e-9:
+            raise _error(
+                f"layered inactive hand frame {record['render_frame']} elevation "
+                f"{elevation_m:.6f} m exceeds max "
+                f"{LAYERED_INACTIVE_HAND_ELEVATION_LIMIT_M:.6f} m"
+            )
     if carry[-1]["carry_mode"] not in {"recorded", "layered"}:
         raise _error("final Carry mode must be recorded or layered")
 
@@ -1531,6 +1552,50 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
                 _write_records(self.log, records)
                 with self.assertRaises(EvidenceValidationError):
                     validate_evidence(load_evidence(self.log))
+
+    def test_layered_inactive_hand_elevation_accepts_exact_boundary_only(self):
+        for active_hand_joint in (18, 22):
+            with self.subTest(active_hand_joint=active_hand_joint, boundary="exact"):
+                records = _valid_records()
+                if active_hand_joint == 18:
+                    for record in records:
+                        record["joint_world_positions"][18][1] = 1.10
+                        if record["grasp_evidence_valid"]:
+                            record["active_hand_joint"] = 18
+                            record["joint_world_positions"][18] = copy.deepcopy(
+                                record["grasp_world_position"]
+                            )
+                inactive_arm_joint, inactive_hand_joint = (
+                    (20, 22) if active_hand_joint == 18 else (16, 18)
+                )
+                for record in records:
+                    if record["state"] == "Carry":
+                        arm_y = record["joint_world_positions"][inactive_arm_joint][1]
+                        record["joint_world_positions"][inactive_hand_joint][1] = (
+                            arm_y + LAYERED_INACTIVE_HAND_ELEVATION_LIMIT_M
+                        )
+                validate_evidence(records)
+
+            with self.subTest(active_hand_joint=active_hand_joint, boundary="epsilon"):
+                violating = copy.deepcopy(records)
+                carry = next(
+                    record for record in violating if record["state"] == "Carry"
+                )
+                carry["joint_world_positions"][inactive_hand_joint][1] += 0.000001
+                with self.assertRaisesRegex(
+                    EvidenceValidationError, "layered inactive hand"
+                ):
+                    validate_evidence(violating)
+
+    def test_recorded_carry_excludes_inactive_hand_elevation_cap(self):
+        records = _valid_records()
+        for record in records:
+            if record["state"] == "Carry":
+                record["carry_mode"] = "recorded"
+            record["joint_world_positions"][18][1] = (
+                record["joint_world_positions"][16][1] + 0.50
+            )
+        validate_evidence(records)
 
     def test_carry_must_be_observed_by_evidence_frame_375(self):
         records = _valid_records()

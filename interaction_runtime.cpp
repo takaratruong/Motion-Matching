@@ -814,6 +814,8 @@ void InteractionRuntime::begin_carry() {
     diagnostics_.object_state = ObjectState::Held;
     diagnostics_.attached = true;
     diagnostics_.recorded_carry = false;
+    diagnostics_.inactive_arm_targets_locomotion =
+        carry_->inactive_arm_targets_locomotion();
     diagnostics_.inactive_arm_tracks_locomotion = false;
 }
 
@@ -1134,6 +1136,7 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
         diagnostics_.object_state = ObjectState::Free;
         diagnostics_.attached = false;
         diagnostics_.recorded_carry = false;
+        diagnostics_.inactive_arm_targets_locomotion = false;
         player_.reset();
         event_player_.reset();
         attachment_.reset();
@@ -1291,6 +1294,7 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
                        : authoritative->state);
             diagnostics_.attached = false;
             diagnostics_.recorded_carry = false;
+            diagnostics_.inactive_arm_targets_locomotion = false;
             diagnostics_.inactive_arm_tracks_locomotion = false;
             carry_.reset();
             player_.reset();
@@ -1324,6 +1328,7 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
                 diagnostics_.reason = Reason::TargetChanged;
                 diagnostics_.attached = false;
                 diagnostics_.recorded_carry = false;
+                diagnostics_.inactive_arm_targets_locomotion = false;
                 diagnostics_.inactive_arm_tracks_locomotion = false;
                 carry_.reset();
                 player_.reset();
@@ -1348,6 +1353,8 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
                 diagnostics_.object_state = ObjectState::Held;
                 diagnostics_.attached = true;
                 diagnostics_.recorded_carry = next_recorded_carry;
+                diagnostics_.inactive_arm_targets_locomotion =
+                    carry_->inactive_arm_targets_locomotion();
                 diagnostics_.inactive_arm_tracks_locomotion =
                     next_inactive_arm_tracks_locomotion;
             }

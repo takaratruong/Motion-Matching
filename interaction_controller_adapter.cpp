@@ -15,6 +15,10 @@ constexpr int kControllerRate = locomotion_timing::kRateHz;
 constexpr int kInteractionRuntimeRate = locomotion_timing::kRateHz;
 static_assert(kControllerRate == kInteractionRuntimeRate);
 constexpr float kOwnershipBlendSeconds = 0.25F;
+constexpr float kInactiveArmBlendSeconds = 0.50F;
+constexpr float kInactiveArmTranslationStepLimitM = 0.20F;
+constexpr float kInactiveArmRotationStepLimitRadians = 1.047197551F;
+constexpr int kInactiveArmBackoffIterations = 16;
 constexpr float kUnitRotationTolerance = 1.0e-3F;
 
 constexpr std::array<int32_t, g1_skeleton::BoneCount> kG1ToFlatBone = {
@@ -205,6 +209,63 @@ FlatWorldPose flat_world_pose(const FlatControllerPose& pose) {
     return world;
 }
 
+void copy_flat_bone_channels(
+    FlatControllerPose& destination,
+    const FlatControllerPose& source,
+    size_t bone) {
+    destination.positions[bone] = source.positions[bone];
+    destination.velocities[bone] = source.velocities[bone];
+    destination.rotations[bone] = source.rotations[bone];
+    destination.angular_velocities[bone] = source.angular_velocities[bone];
+}
+
+void blend_flat_arm_channels(
+    FlatControllerPose& destination,
+    const FlatControllerPose& source,
+    const FlatControllerPose& target,
+    size_t arm_begin,
+    float alpha) {
+    for (size_t bone = arm_begin; bone < arm_begin + 4U; ++bone) {
+        if (alpha <= 0.0F) {
+            copy_flat_bone_channels(destination, source, bone);
+        } else if (alpha >= 1.0F) {
+            copy_flat_bone_channels(destination, target, bone);
+        } else {
+            destination.positions[bone] = lerp(
+                source.positions[bone], target.positions[bone], alpha);
+            destination.velocities[bone] = lerp(
+                source.velocities[bone], target.velocities[bone], alpha);
+            destination.rotations[bone] = quat_nlerp_shortest(
+                source.rotations[bone], target.rotations[bone], alpha);
+            destination.angular_velocities[bone] = lerp(
+                source.angular_velocities[bone],
+                target.angular_velocities[bone],
+                alpha);
+        }
+    }
+}
+
+bool inactive_arm_step_within_limits(
+    const FlatControllerPose& previous,
+    const FlatControllerPose& candidate,
+    size_t arm_begin) {
+    const FlatWorldPose previous_world = flat_world_pose(previous);
+    const FlatWorldPose candidate_world = flat_world_pose(candidate);
+    for (size_t bone = arm_begin; bone < arm_begin + 4U; ++bone) {
+        if (length(
+                candidate_world.positions[bone] -
+                previous_world.positions[bone]) >
+                kInactiveArmTranslationStepLimitM ||
+            quat_angle_between(
+                previous_world.rotations[bone],
+                candidate_world.rotations[bone]) >
+                kInactiveArmRotationStepLimitRadians) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void solve_local_channel(
     vec3& local_position,
     vec3& local_velocity,
@@ -289,6 +350,72 @@ void update_flat_world_bone(
         quat_mul_vec3(
             world.rotations[parent_bone],
             pose.angular_velocities[bone]);
+}
+
+void preserve_flat_arm_world_channels(
+    FlatControllerPose& destination,
+    const FlatControllerPose& previous,
+    size_t arm_begin) {
+    const FlatWorldPose previous_world = flat_world_pose(previous);
+    FlatWorldPose destination_world = flat_world_pose(destination);
+    for (size_t bone = arm_begin; bone < arm_begin + 4U; ++bone) {
+        const int32_t parent = kFlatControllerParents[bone];
+        if (parent < 0) {
+            throw FormatError("inactive arm bone has no parent");
+        }
+        const size_t parent_bone = static_cast<size_t>(parent);
+        solve_local_channel(
+            destination.positions[bone],
+            destination.velocities[bone],
+            destination.rotations[bone],
+            destination.angular_velocities[bone],
+            previous_world.positions[bone],
+            previous_world.velocities[bone],
+            previous_world.rotations[bone],
+            previous_world.angular_velocities[bone],
+            destination_world.positions[parent_bone],
+            destination_world.velocities[parent_bone],
+            destination_world.rotations[parent_bone],
+            destination_world.angular_velocities[parent_bone]);
+        update_flat_world_bone(destination_world, destination, bone);
+    }
+}
+
+bool apply_bounded_flat_arm_target(
+    FlatControllerPose& output,
+    const FlatControllerPose& desired,
+    const FlatControllerPose& previous,
+    size_t arm_begin) {
+    if (inactive_arm_step_within_limits(previous, desired, arm_begin)) {
+        output = desired;
+        return true;
+    }
+
+    FlatControllerPose accepted = output;
+    preserve_flat_arm_world_channels(accepted, previous, arm_begin);
+    if (!inactive_arm_step_within_limits(previous, accepted, arm_begin)) {
+        throw FormatError(
+            "inactive arm world-preserving fallback exceeded step limits");
+    }
+    const FlatControllerPose baseline = accepted;
+    float lower = 0.0F;
+    float upper = 1.0F;
+    for (int iteration = 0;
+         iteration < kInactiveArmBackoffIterations;
+         ++iteration) {
+        const float trial_alpha = 0.5F * (lower + upper);
+        FlatControllerPose trial = output;
+        blend_flat_arm_channels(
+            trial, baseline, desired, arm_begin, trial_alpha);
+        if (inactive_arm_step_within_limits(previous, trial, arm_begin)) {
+            lower = trial_alpha;
+            accepted = trial;
+        } else {
+            upper = trial_alpha;
+        }
+    }
+    output = accepted;
+    return false;
 }
 
 Transform frame_transform(
@@ -570,6 +697,95 @@ ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
             } else {
                 state.pose = target;
             }
+
+            const bool valid_active_hand =
+                runtime_output.diagnostics.hand == Hand::Left ||
+                runtime_output.diagnostics.hand == Hand::Right;
+            const bool locomotion_target =
+                layered_carry && valid_active_hand &&
+                runtime_output.diagnostics.inactive_arm_targets_locomotion;
+            if (locomotion_target) {
+                inactive_arm_return_hand_.reset();
+                if (!inactive_arm_locomotion_hand_.has_value() ||
+                    *inactive_arm_locomotion_hand_ !=
+                        runtime_output.diagnostics.hand) {
+                    inactive_arm_locomotion_hand_ =
+                        runtime_output.diagnostics.hand;
+                    inactive_arm_blend_seconds_ = 0.0F;
+                    inactive_arm_blend_source_ = last_rendered_pose_;
+                }
+                const float inactive_arm_alpha = std::clamp(
+                    inactive_arm_blend_seconds_ / kInactiveArmBlendSeconds,
+                    0.0F,
+                    1.0F);
+                const size_t inactive_arm_begin =
+                    runtime_output.diagnostics.hand == Hand::Left
+                    ? 19U
+                    : 15U;
+                FlatControllerPose desired = state.pose;
+                blend_flat_arm_channels(
+                    desired,
+                    inactive_arm_blend_source_,
+                    locomotion_pose,
+                    inactive_arm_begin,
+                    inactive_arm_alpha);
+                (void)apply_bounded_flat_arm_target(
+                    state.pose,
+                    desired,
+                    last_rendered_pose_,
+                    inactive_arm_begin);
+                inactive_arm_blend_seconds_ = std::min(
+                    kInactiveArmBlendSeconds,
+                    inactive_arm_blend_seconds_ + std::max(dt, 0.0F));
+            } else {
+                if (inactive_arm_locomotion_hand_.has_value()) {
+                    inactive_arm_return_hand_ =
+                        inactive_arm_locomotion_hand_;
+                    inactive_arm_locomotion_hand_.reset();
+                    inactive_arm_blend_seconds_ = 0.0F;
+                    inactive_arm_blend_source_ = last_rendered_pose_;
+                }
+                if (inactive_arm_return_hand_.has_value()) {
+                    if (!valid_active_hand ||
+                        *inactive_arm_return_hand_ !=
+                            runtime_output.diagnostics.hand) {
+                        throw FormatError(
+                            "inactive arm return changed active hand");
+                    }
+                    const float inactive_arm_alpha = std::clamp(
+                        inactive_arm_blend_seconds_ /
+                            kInactiveArmBlendSeconds,
+                        0.0F,
+                        1.0F);
+                    const size_t inactive_arm_begin =
+                        runtime_output.diagnostics.hand == Hand::Left
+                        ? 19U
+                        : 15U;
+                    FlatControllerPose desired = state.pose;
+                    blend_flat_arm_channels(
+                        desired,
+                        inactive_arm_blend_source_,
+                        state.pose,
+                        inactive_arm_begin,
+                        inactive_arm_alpha);
+                    const bool full_target_applied =
+                        apply_bounded_flat_arm_target(
+                            state.pose,
+                            desired,
+                            last_rendered_pose_,
+                            inactive_arm_begin);
+                    inactive_arm_blend_seconds_ = std::min(
+                        kInactiveArmBlendSeconds,
+                        inactive_arm_blend_seconds_ + std::max(dt, 0.0F));
+                    if (inactive_arm_alpha >= 1.0F &&
+                        full_target_applied) {
+                        inactive_arm_return_hand_.reset();
+                        inactive_arm_blend_seconds_ = 0.0F;
+                    }
+                } else {
+                    inactive_arm_blend_seconds_ = 0.0F;
+                }
+            }
         }
 
         if (target_rig_arm_ik_.active()) {
@@ -604,6 +820,9 @@ ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
 
     if (runtime_owned_last_update_) {
         runtime_owned_last_update_ = false;
+        inactive_arm_locomotion_hand_.reset();
+        inactive_arm_return_hand_.reset();
+        inactive_arm_blend_seconds_ = 0.0F;
         release_active_ = true;
         blend_source_ = last_rendered_pose_;
         blend_seconds_ = 0.0F;
@@ -641,6 +860,10 @@ void ControllerInteractionFrameHandoff::reset() {
     last_rendered_pose_ = {};
     target_rig_arm_ik_.reset();
     ownership_hand_constraint_.reset();
+    inactive_arm_locomotion_hand_.reset();
+    inactive_arm_return_hand_.reset();
+    inactive_arm_blend_seconds_ = 0.0F;
+    inactive_arm_blend_source_ = {};
 }
 
 void ControllerInteractionSceneHandoff::reset_authority() {

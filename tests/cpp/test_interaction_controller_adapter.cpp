@@ -112,6 +112,17 @@ bool flat_pose_bits_equal(
     return left.foot_contacts == right.foot_contacts;
 }
 
+bool flat_bone_channels_bits_equal(
+    const FlatControllerPose& left,
+    const FlatControllerPose& right,
+    size_t bone) {
+    return vec_bits_equal(left.positions[bone], right.positions[bone]) &&
+        vec_bits_equal(left.velocities[bone], right.velocities[bone]) &&
+        quat_bits_equal(left.rotations[bone], right.rotations[bone]) &&
+        vec_bits_equal(
+            left.angular_velocities[bone], right.angular_velocities[bone]);
+}
+
 bool transform_bits_equal(const Transform& left, const Transform& right) {
     return vec_bits_equal(left.position, right.position) &&
            quat_bits_equal(left.rotation, right.rotation);
@@ -164,6 +175,8 @@ bool output_fields_equal(const RuntimeOutput& left, const RuntimeOutput& right) 
             right_diagnostics.hand_constraint_weight) ||
         left_diagnostics.attached != right_diagnostics.attached ||
         left_diagnostics.recorded_carry != right_diagnostics.recorded_carry ||
+        left_diagnostics.inactive_arm_targets_locomotion !=
+            right_diagnostics.inactive_arm_targets_locomotion ||
         left_diagnostics.inactive_arm_tracks_locomotion !=
             right_diagnostics.inactive_arm_tracks_locomotion ||
         left_diagnostics.pack_available != right_diagnostics.pack_available) {
@@ -1125,24 +1138,42 @@ void test_hand_constraint_keeps_layered_carry_lower_body_exact_and_selected_only
             fresh_locomotion.angular_velocities[bone] +
             vec3(0.03F * value, -0.02F * value, 0.01F * value);
     }
+    for (size_t bone = 19U; bone <= 22U; ++bone) {
+        const float value = static_cast<float>(bone + 1U);
+        fresh_locomotion.positions[bone] =
+            fresh_locomotion.positions[bone] +
+            vec3(0.004F * value, -0.003F * value, 0.002F * value);
+        fresh_locomotion.velocities[bone] =
+            vec3(-0.08F * value, 0.06F * value, -0.05F * value);
+        fresh_locomotion.rotations[bone] = quat_from_angle_axis(
+            0.013F * value,
+            normalize(vec3(0.7F, 0.2F, 0.4F + 0.01F * value)));
+        fresh_locomotion.angular_velocities[bone] =
+            vec3(0.05F * value, -0.03F * value, 0.07F * value);
+    }
     fresh_locomotion.foot_contacts = {0U, 1U};
     owned.diagnostics.state = RuntimeState::Carry;
     owned.diagnostics.recorded_carry = false;
+    owned.diagnostics.inactive_arm_targets_locomotion = true;
+    owned.diagnostics.inactive_arm_tracks_locomotion = true;
     owned.diagnostics.hand_constraint_weight = 1.0F;
     const ControllerInteractionHandConstraint carry_constraint =
         make_hand_constraint(owned, fresh_locomotion, Hand::Left);
 
-    const ControllerInteractionFrameState baseline = baseline_handoff.apply(
-        fresh_locomotion,
-        owned,
-        interaction::kControllerStepSeconds,
-        std::nullopt);
-    const ControllerInteractionFrameState constrained =
-        constrained_handoff.apply(
+    ControllerInteractionFrameState baseline{};
+    ControllerInteractionFrameState constrained{};
+    for (int tick = 0; tick < 14; ++tick) {
+        baseline = baseline_handoff.apply(
+            fresh_locomotion,
+            owned,
+            interaction::kControllerStepSeconds,
+            std::nullopt);
+        constrained = constrained_handoff.apply(
             fresh_locomotion,
             owned,
             interaction::kControllerStepSeconds,
             carry_constraint);
+    }
     require(
         constrained.hand_constraint_result.applied &&
             constrained.hand_constraint_result.reachable,
@@ -1194,6 +1225,12 @@ void test_hand_constraint_keeps_layered_carry_lower_body_exact_and_selected_only
     require(
         constrained.pose.foot_contacts == fresh_locomotion.foot_contacts,
         "layered hand constraint changed live locomotion contacts");
+    for (size_t bone = 19U; bone <= 22U; ++bone) {
+        require(
+            flat_bone_channels_bits_equal(
+                constrained.pose, fresh_locomotion, bone),
+            "selected-hand IK changed released inactive-arm locomotion");
+    }
 }
 
 void test_hand_constraint_mismatch_or_invalid_input_disables_atomically() {
@@ -1506,6 +1543,510 @@ void test_layered_carry_keeps_fresh_lower_body_and_contacts_bit_exact() {
     frame = handoff.apply(
         locomotion, output, interaction::kControllerStepSeconds);
     require_layered_authority(frame, locomotion);
+}
+
+void test_layered_carry_released_inactive_arm_uses_fresh_locomotion_authority() {
+    constexpr std::array<size_t, 4> left_chain = {15U, 16U, 17U, 18U};
+    constexpr std::array<size_t, 4> right_chain = {19U, 20U, 21U, 22U};
+
+    for (const Hand active_hand : {Hand::Left, Hand::Right}) {
+        const std::array<size_t, 4>& active_chain =
+            active_hand == Hand::Left ? left_chain : right_chain;
+        const std::array<size_t, 4>& inactive_chain =
+            active_hand == Hand::Left ? right_chain : left_chain;
+
+        const FlatControllerPose entry = make_flat_pose();
+        const Pose raw_reference = interaction::expand_flat_controller_pose(
+            entry, make_pose(0.375F));
+        RuntimeOutput output = make_owned_output(raw_reference);
+        output.diagnostics.hand = active_hand;
+
+        ControllerInteractionFrameHandoff handoff;
+        (void)handoff.apply(
+            entry, output, interaction::kControllerStepSeconds);
+
+        FlatControllerPose interaction_target = entry;
+        interaction_target.rotations[12] = quat_from_angle_axis(
+            0.52F, normalize(vec3(0.2F, 0.7F, 0.4F)));
+        interaction_target.angular_velocities[12] =
+            vec3(0.31F, -0.27F, 0.19F);
+        for (size_t bone = 15U; bone <= 22U; ++bone) {
+            const float value = static_cast<float>(bone + 1U);
+            interaction_target.velocities[bone] =
+                vec3(0.17F * value, -0.13F * value, 0.11F * value);
+            interaction_target.rotations[bone] = quat_from_angle_axis(
+                0.025F * value,
+                normalize(vec3(0.3F, 0.5F + 0.01F * value, 0.7F)));
+            interaction_target.angular_velocities[bone] =
+                vec3(-0.09F * value, 0.07F * value, 0.05F * value);
+        }
+        output.pose = interaction::expand_flat_controller_pose(
+            interaction_target, raw_reference);
+        output.diagnostics.state = RuntimeState::Carry;
+        output.diagnostics.recorded_carry = false;
+        output.diagnostics.inactive_arm_targets_locomotion = false;
+        output.diagnostics.inactive_arm_tracks_locomotion = false;
+
+        FlatControllerPose locomotion = entry;
+        for (size_t bone = 10U; bone <= 22U; ++bone) {
+            const float value = static_cast<float>(bone + 1U);
+            locomotion.positions[bone] = locomotion.positions[bone] +
+                vec3(0.003F * value, -0.002F * value, 0.004F * value);
+            locomotion.velocities[bone] =
+                vec3(-0.21F * value, 0.16F * value, -0.08F * value);
+            locomotion.rotations[bone] = quat_from_angle_axis(
+                0.018F * value,
+                normalize(vec3(0.8F, 0.4F, 0.2F + 0.01F * value)));
+            locomotion.angular_velocities[bone] =
+                vec3(0.12F * value, -0.04F * value, 0.15F * value);
+        }
+        const ControllerInteractionFrameState before_release = handoff.apply(
+            locomotion, output, interaction::kControllerStepSeconds);
+        output.diagnostics.inactive_arm_targets_locomotion = true;
+        const FlatControllerPose locomotion_before = locomotion;
+        const RuntimeOutput output_before = output;
+
+        ControllerInteractionFrameState frame = handoff.apply(
+            locomotion, output, interaction::kControllerStepSeconds);
+
+        for (size_t bone : inactive_chain) {
+            require(
+                flat_bone_channels_bits_equal(
+                    frame.pose, before_release.pose, bone),
+                "inactive Carry arm release was discontinuous on its first frame");
+        }
+        require(
+            !flat_bone_channels_bits_equal(frame.pose, locomotion, 12U),
+            "released inactive Carry arm surrendered spine authority");
+        bool active_chain_remained_owned = false;
+        for (size_t bone : active_chain) {
+            active_chain_remained_owned = active_chain_remained_owned ||
+                !flat_bone_channels_bits_equal(frame.pose, locomotion, bone);
+        }
+        require(
+            active_chain_remained_owned,
+            "released inactive Carry arm surrendered active-arm authority");
+        require(
+            flat_pose_bits_equal(locomotion, locomotion_before) &&
+                output_fields_equal(output, output_before),
+            "inactive-arm authority handoff mutated its inputs");
+
+        const auto require_bounded_step = [&](const FlatControllerPose& previous) {
+            const FlatWorldPose previous_world = flat_world_pose(previous);
+            const FlatWorldPose current_world = flat_world_pose(frame.pose);
+            for (size_t bone : inactive_chain) {
+                require(
+                    length(
+                        current_world.positions[bone] -
+                        previous_world.positions[bone]) <= 0.2F,
+                    "inactive Carry arm blend exceeded the positional seam bound");
+                require(
+                    rotation_distance(
+                        current_world.rotations[bone],
+                        previous_world.rotations[bone]) <=
+                        60.0F * 3.14159265358979323846F / 180.0F,
+                    "inactive Carry arm blend exceeded the rotational seam bound");
+            }
+        };
+
+        FlatControllerPose previous = frame.pose;
+        for (int tick = 0; tick < 12; ++tick) {
+            frame = handoff.apply(
+                locomotion, output, interaction::kControllerStepSeconds);
+            require_bounded_step(previous);
+            previous = frame.pose;
+        }
+        bool still_blending = false;
+        for (size_t bone : inactive_chain) {
+            still_blending = still_blending ||
+                !flat_bone_channels_bits_equal(
+                    frame.pose, locomotion, bone);
+        }
+        require(
+            still_blending,
+            "inactive Carry arm release ended before 0.50 seconds at 25 Hz");
+
+        frame = handoff.apply(
+            locomotion, output, interaction::kControllerStepSeconds);
+        require_bounded_step(previous);
+        for (size_t bone : inactive_chain) {
+            require(
+                flat_bone_channels_bits_equal(
+                    frame.pose, locomotion, bone),
+                "inactive Carry arm did not converge within one 25 Hz tick of 0.50 seconds");
+        }
+    }
+}
+
+void test_inactive_arm_locomotion_intent_does_not_change_other_carry_modes() {
+    constexpr std::array<size_t, 4> inactive_left = {15U, 16U, 17U, 18U};
+    const FlatControllerPose entry = make_flat_pose();
+    const Pose raw_reference = interaction::expand_flat_controller_pose(
+        entry, make_pose(0.375F));
+
+    FlatControllerPose interaction_target = entry;
+    for (size_t bone : inactive_left) {
+        interaction_target.rotations[bone] = quat_from_angle_axis(
+            0.65F,
+            normalize(vec3(
+                0.2F + 0.01F * static_cast<float>(bone),
+                0.8F,
+                0.3F)));
+    }
+    FlatControllerPose locomotion = entry;
+    for (size_t bone : inactive_left) {
+        locomotion.positions[bone].x += 0.05F;
+        locomotion.velocities[bone].y -= 0.07F;
+        locomotion.rotations[bone] = quat_from_angle_axis(
+            0.12F, vec3(0.0F, 1.0F, 0.0F));
+        locomotion.angular_velocities[bone].z += 0.09F;
+    }
+
+    const auto render = [&](
+        bool recorded_carry,
+        bool inactive_arm_tracks_locomotion,
+        bool inactive_arm_targets_locomotion) {
+        RuntimeOutput output = make_owned_output(raw_reference);
+        output.diagnostics.hand = Hand::Right;
+        ControllerInteractionFrameHandoff handoff;
+        (void)handoff.apply(
+            entry, output, interaction::kControllerStepSeconds);
+        output.pose = interaction::expand_flat_controller_pose(
+            interaction_target, raw_reference);
+        output.diagnostics.state = RuntimeState::Carry;
+        output.diagnostics.recorded_carry = recorded_carry;
+        output.diagnostics.inactive_arm_targets_locomotion =
+            inactive_arm_targets_locomotion;
+        output.diagnostics.inactive_arm_tracks_locomotion =
+            inactive_arm_tracks_locomotion;
+        return handoff.apply(
+            locomotion, output, interaction::kControllerStepSeconds);
+    };
+
+    const ControllerInteractionFrameState unreleased =
+        render(false, false, false);
+    const ControllerInteractionFrameState exact_flag_only =
+        render(false, true, false);
+    const ControllerInteractionFrameState recorded = render(true, true, true);
+    for (size_t bone : inactive_left) {
+        require(
+            !flat_bone_channels_bits_equal(
+                unreleased.pose, locomotion, bone),
+            "false inactive-arm intent unexpectedly surrendered authority");
+        require(
+            !flat_bone_channels_bits_equal(
+                exact_flag_only.pose, locomotion, bone),
+            "exact-tracking flag was reinterpreted as release intent");
+        require(
+            !flat_bone_channels_bits_equal(recorded.pose, locomotion, bone),
+            "recorded Carry unexpectedly surrendered inactive-arm authority");
+    }
+    require(
+        !unreleased.synchronize_simulation_root &&
+            !exact_flag_only.synchronize_simulation_root &&
+            recorded.synchronize_simulation_root,
+        "inactive-arm intent changed Carry root authority policy");
+}
+
+void test_inactive_arm_release_bounds_moving_target_and_spine() {
+    constexpr std::array<size_t, 4> left_chain = {15U, 16U, 17U, 18U};
+    constexpr std::array<size_t, 4> right_chain = {19U, 20U, 21U, 22U};
+    constexpr float rotation_step_limit =
+        60.0F * 3.14159265358979323846F / 180.0F;
+
+    for (const Hand active_hand : {Hand::Left, Hand::Right}) {
+        const std::array<size_t, 4>& active_chain =
+            active_hand == Hand::Left ? left_chain : right_chain;
+        const std::array<size_t, 4>& inactive_chain =
+            active_hand == Hand::Left ? right_chain : left_chain;
+        const FlatControllerPose entry = make_flat_pose();
+        const Pose raw_reference = interaction::expand_flat_controller_pose(
+            entry, make_pose(0.375F));
+        FlatControllerPose interaction_target = entry;
+        interaction_target.rotations[12] = quat_from_angle_axis(
+            0.70F, normalize(vec3(0.2F, 0.8F, 0.3F)));
+        for (size_t bone : active_chain) {
+            interaction_target.rotations[bone] = quat_from_angle_axis(
+                0.85F,
+                normalize(vec3(0.3F, 0.6F, 0.5F)));
+        }
+        for (size_t bone : inactive_chain) {
+            interaction_target.rotations[bone] = quat_from_angle_axis(
+                2.98F,
+                normalize(vec3(
+                    0.2F + 0.01F * static_cast<float>(bone),
+                    0.7F,
+                    0.4F)));
+        }
+
+        RuntimeOutput output = make_owned_output(raw_reference);
+        output.diagnostics.hand = active_hand;
+        ControllerInteractionFrameHandoff handoff;
+        (void)handoff.apply(
+            entry, output, interaction::kControllerStepSeconds);
+        output.pose = interaction::expand_flat_controller_pose(
+            interaction_target, raw_reference);
+        output.diagnostics.state = RuntimeState::Carry;
+        output.diagnostics.recorded_carry = false;
+        output.diagnostics.inactive_arm_targets_locomotion = false;
+
+        FlatControllerPose locomotion = entry;
+        const ControllerInteractionFrameState before_release = handoff.apply(
+            locomotion, output, interaction::kControllerStepSeconds);
+        interaction_target.rotations[12] = quat_from_angle_axis(
+            2.80F, normalize(vec3(0.2F, 0.8F, 0.3F)));
+        output.pose = interaction::expand_flat_controller_pose(
+            interaction_target, raw_reference);
+        output.diagnostics.inactive_arm_targets_locomotion = true;
+        ControllerInteractionFrameState frame = handoff.apply(
+            locomotion, output, interaction::kControllerStepSeconds);
+        const FlatWorldPose before_release_world =
+            flat_world_pose(before_release.pose);
+        const FlatWorldPose first_release_world = flat_world_pose(frame.pose);
+        for (size_t bone : inactive_chain) {
+            require(
+                length(
+                    first_release_world.positions[bone] -
+                    before_release_world.positions[bone]) <= 0.2F,
+                "parent-only inactive arm release exceeded positional bound");
+            require(
+                rotation_distance(
+                    first_release_world.rotations[bone],
+                    before_release_world.rotations[bone]) <=
+                    rotation_step_limit,
+                "parent-only inactive arm release exceeded rotational bound");
+        }
+
+        FlatControllerPose previous = frame.pose;
+        for (int tick = 0; tick < 80; ++tick) {
+            if (tick < 10) {
+                const float progress = static_cast<float>(tick + 1);
+                interaction_target.rotations[12] = quat_from_angle_axis(
+                    2.80F + 0.025F * progress,
+                    normalize(vec3(0.2F, 0.8F, 0.3F)));
+                for (size_t bone : inactive_chain) {
+                    locomotion.positions[bone].x += 0.0005F;
+                    locomotion.rotations[bone] = quat_from_angle_axis(
+                        0.012F * progress,
+                        normalize(vec3(
+                            0.8F,
+                            0.3F + 0.01F * static_cast<float>(bone),
+                            0.4F)));
+                }
+                output.pose = interaction::expand_flat_controller_pose(
+                    interaction_target, raw_reference);
+            }
+            const FlatControllerPose locomotion_before = locomotion;
+            const RuntimeOutput output_before = output;
+            frame = handoff.apply(
+                locomotion, output, interaction::kControllerStepSeconds);
+            require(
+                flat_pose_bits_equal(locomotion, locomotion_before) &&
+                    output_fields_equal(output, output_before),
+                "bounded inactive-arm handoff mutated moving inputs");
+            const FlatWorldPose previous_world = flat_world_pose(previous);
+            const FlatWorldPose current_world = flat_world_pose(frame.pose);
+            for (size_t bone : inactive_chain) {
+                require(
+                    length(
+                        current_world.positions[bone] -
+                        previous_world.positions[bone]) <= 0.2F,
+                    "moving-target inactive arm exceeded positional bound");
+                require(
+                    rotation_distance(
+                        current_world.rotations[bone],
+                        previous_world.rotations[bone]) <=
+                        rotation_step_limit,
+                    "moving-target inactive arm exceeded rotational bound");
+            }
+            previous = frame.pose;
+        }
+
+        for (size_t bone : inactive_chain) {
+            require(
+                flat_bone_channels_bits_equal(
+                    frame.pose, locomotion, bone),
+                "bounded inactive arm did not converge to moving locomotion target");
+        }
+        require(
+            !flat_bone_channels_bits_equal(frame.pose, locomotion, 12U),
+            "bounded inactive arm surrendered moving spine authority");
+        bool active_chain_owned = false;
+        for (size_t bone : active_chain) {
+            active_chain_owned = active_chain_owned ||
+                !flat_bone_channels_bits_equal(
+                    frame.pose, locomotion, bone);
+        }
+        require(
+            active_chain_owned,
+            "bounded inactive arm surrendered active-arm authority");
+
+        previous = frame.pose;
+        for (size_t bone : inactive_chain) {
+            locomotion.positions[bone].z += 0.0002F;
+            locomotion.rotations[bone] = quat_mul(
+                quat_from_angle_axis(
+                    0.005F,
+                    normalize(vec3(0.4F, 0.7F, 0.2F))),
+                locomotion.rotations[bone]);
+        }
+        frame = handoff.apply(
+            locomotion, output, interaction::kControllerStepSeconds);
+        const FlatWorldPose tracked_previous_world = flat_world_pose(previous);
+        const FlatWorldPose tracked_world = flat_world_pose(frame.pose);
+        for (size_t bone : inactive_chain) {
+            require(
+                flat_bone_channels_bits_equal(
+                    frame.pose, locomotion, bone),
+                "converged inactive arm did not track locomotion in the same tick");
+            require(
+                length(
+                    tracked_world.positions[bone] -
+                    tracked_previous_world.positions[bone]) <= 0.2F &&
+                    rotation_distance(
+                        tracked_world.rotations[bone],
+                        tracked_previous_world.rotations[bone]) <=
+                        rotation_step_limit,
+                "same-tick inactive arm tracking exceeded its bounds");
+        }
+    }
+}
+
+void test_inactive_arm_return_to_recorded_target_is_bounded_and_convergent() {
+    constexpr std::array<size_t, 4> left_chain = {15U, 16U, 17U, 18U};
+    constexpr std::array<size_t, 4> right_chain = {19U, 20U, 21U, 22U};
+    constexpr float rotation_step_limit =
+        60.0F * 3.14159265358979323846F / 180.0F;
+
+    for (const Hand active_hand : {Hand::Left, Hand::Right}) {
+        const std::array<size_t, 4>& active_chain =
+            active_hand == Hand::Left ? left_chain : right_chain;
+        const std::array<size_t, 4>& inactive_chain =
+            active_hand == Hand::Left ? right_chain : left_chain;
+        const FlatControllerPose entry = make_flat_pose();
+        const Pose raw_reference = interaction::expand_flat_controller_pose(
+            entry, make_pose(0.375F));
+        FlatControllerPose layered_target = entry;
+        for (size_t bone : active_chain) {
+            layered_target.rotations[bone] = quat_from_angle_axis(
+                0.70F, normalize(vec3(0.2F, 0.6F, 0.5F)));
+        }
+        for (size_t bone : inactive_chain) {
+            layered_target.rotations[bone] = quat_from_angle_axis(
+                2.60F, normalize(vec3(0.3F, 0.7F, 0.4F)));
+        }
+
+        RuntimeOutput output = make_owned_output(raw_reference);
+        output.diagnostics.hand = active_hand;
+        ControllerInteractionFrameHandoff handoff;
+        (void)handoff.apply(
+            entry, output, interaction::kControllerStepSeconds);
+        output.pose = interaction::expand_flat_controller_pose(
+            layered_target, raw_reference);
+        output.diagnostics.state = RuntimeState::Carry;
+        output.diagnostics.recorded_carry = false;
+        output.diagnostics.inactive_arm_targets_locomotion = false;
+
+        FlatControllerPose locomotion = entry;
+        (void)handoff.apply(
+            locomotion, output, interaction::kControllerStepSeconds);
+        output.diagnostics.inactive_arm_targets_locomotion = true;
+        ControllerInteractionFrameState frame{};
+        for (int tick = 0; tick < 30; ++tick) {
+            frame = handoff.apply(
+                locomotion, output, interaction::kControllerStepSeconds);
+        }
+        for (size_t bone : inactive_chain) {
+            require(
+                flat_bone_channels_bits_equal(
+                    frame.pose, locomotion, bone),
+                "inactive arm did not settle to locomotion before recorded switch");
+        }
+
+        FlatControllerPose recorded_target = entry;
+        recorded_target.rotations[12] = quat_from_angle_axis(
+            2.70F, normalize(vec3(0.2F, 0.8F, 0.3F)));
+        for (size_t bone : active_chain) {
+            recorded_target.rotations[bone] = quat_from_angle_axis(
+                0.95F, normalize(vec3(0.4F, 0.5F, 0.7F)));
+        }
+        for (size_t bone : inactive_chain) {
+            recorded_target.positions[bone].x += 0.02F;
+            recorded_target.velocities[bone] =
+                vec3(0.7F, -0.5F, 0.3F);
+            recorded_target.rotations[bone] = quat_from_angle_axis(
+                2.85F,
+                normalize(vec3(
+                    0.3F,
+                    0.5F + 0.01F * static_cast<float>(bone),
+                    0.8F)));
+            recorded_target.angular_velocities[bone] =
+                vec3(-0.6F, 0.4F, 0.8F);
+        }
+        output.pose = interaction::expand_flat_controller_pose(
+            recorded_target, raw_reference);
+        output.diagnostics.recorded_carry = true;
+        output.diagnostics.inactive_arm_targets_locomotion = false;
+
+        FlatControllerPose previous = frame.pose;
+        frame = handoff.apply(
+            locomotion, output, interaction::kControllerStepSeconds);
+        const auto require_bounded_step = [&](const FlatControllerPose& prior) {
+            const FlatWorldPose prior_world = flat_world_pose(prior);
+            const FlatWorldPose current_world = flat_world_pose(frame.pose);
+            for (size_t bone : inactive_chain) {
+                require(
+                    length(
+                        current_world.positions[bone] -
+                        prior_world.positions[bone]) <= 0.2F,
+                    "recorded return exceeded inactive-arm positional bound");
+                require(
+                    rotation_distance(
+                        current_world.rotations[bone],
+                        prior_world.rotations[bone]) <=
+                        rotation_step_limit,
+                    "recorded return exceeded inactive-arm rotational bound");
+            }
+        };
+        require_bounded_step(previous);
+        previous = frame.pose;
+
+        for (int tick = 0; tick < 80; ++tick) {
+            if (tick < 10) {
+                const float progress = static_cast<float>(tick + 1);
+                recorded_target.rotations[12] = quat_from_angle_axis(
+                    2.70F + 0.01F * progress,
+                    normalize(vec3(0.2F, 0.8F, 0.3F)));
+                for (size_t bone : inactive_chain) {
+                    recorded_target.positions[bone].z += 0.0003F;
+                    recorded_target.rotations[bone] = quat_from_angle_axis(
+                        2.85F - 0.01F * progress,
+                        normalize(vec3(
+                            0.3F,
+                            0.5F + 0.01F * static_cast<float>(bone),
+                            0.8F)));
+                }
+                output.pose = interaction::expand_flat_controller_pose(
+                    recorded_target, raw_reference);
+            }
+            frame = handoff.apply(
+                locomotion, output, interaction::kControllerStepSeconds);
+            require_bounded_step(previous);
+            previous = frame.pose;
+        }
+
+        const FlatControllerPose expected = interaction::collapse_interaction_pose(
+            output.pose, raw_reference, entry);
+        for (size_t bone : inactive_chain) {
+            require(
+                flat_bone_channels_bits_equal(
+                    frame.pose, expected, bone),
+                "inactive arm did not converge to recorded interaction target");
+        }
+        require(
+            !flat_bone_channels_bits_equal(frame.pose, locomotion, 12U),
+            "recorded inactive-arm return surrendered spine authority");
+    }
 }
 
 void test_frame_handoff_release_is_continuous_and_relinquishes_after_blend() {
@@ -2591,6 +3132,10 @@ int main() {
     test_frame_handoff_crosses_179_9_to_180_1_incrementally();
     test_frame_handoff_keeps_captured_neck_and_head_while_owned();
     test_layered_carry_keeps_fresh_lower_body_and_contacts_bit_exact();
+    test_layered_carry_released_inactive_arm_uses_fresh_locomotion_authority();
+    test_inactive_arm_locomotion_intent_does_not_change_other_carry_modes();
+    test_inactive_arm_release_bounds_moving_target_and_spine();
+    test_inactive_arm_return_to_recorded_target_is_bounded_and_convergent();
     test_frame_handoff_release_is_continuous_and_relinquishes_after_blend();
     test_frame_handoff_reset_and_reentry_capture_fresh_flat_reference();
     test_frame_handoff_preserves_fresh_complete_nonowned_pose_for_25_frames();

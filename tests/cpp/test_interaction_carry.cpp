@@ -390,6 +390,9 @@ void test_frozen_public_interface_and_defaults() {
         decltype(&CarryController::recorded),
         bool (CarryController::*)() const>);
     static_assert(std::is_same_v<
+        decltype(&CarryController::inactive_arm_targets_locomotion),
+        bool (CarryController::*)() const>);
+    static_assert(std::is_same_v<
         decltype(&CarryController::inactive_arm_tracks_locomotion),
         bool (CarryController::*)() const>);
     static_assert(std::is_same_v<
@@ -615,16 +618,19 @@ void test_fallback_preserves_locomotion_and_grasp() {
 
     CarryController fallback(
         fixture.database, fixture.features, no_recorded_ranges());
+    assert(!fallback.inactive_arm_targets_locomotion());
     assert(!fallback.inactive_arm_tracks_locomotion());
     assert(throws_as<std::logic_error>([&] {
         (void)fallback.update(locomotion, 1.0F / 60.0F);
     }));
 
     fallback.start(hold, Hand::Right, affordance, object);
+    assert(!fallback.inactive_arm_targets_locomotion());
     assert(!fallback.inactive_arm_tracks_locomotion());
     const Pose output = fallback.update(locomotion, 1.0F / 60.0F);
 
     assert(!fallback.recorded());
+    assert(fallback.inactive_arm_targets_locomotion());
     assert(!fallback.inactive_arm_tracks_locomotion());
     assert(near(
         output.rotations[g1_skeleton::RightShoulderPitch],
@@ -662,9 +668,11 @@ void test_default_layered_carry_releases_inactive_arm_after_hold_seam() {
     CarryController controller(
         fixture.database, fixture.features, no_recorded_ranges());
     controller.start(hold, Hand::Right, affordance, initial_object);
+    assert(!controller.inactive_arm_targets_locomotion());
     assert(!controller.inactive_arm_tracks_locomotion());
 
     Pose previous = controller.update(locomotion, 0.0F);
+    assert(controller.inactive_arm_targets_locomotion());
     assert(!controller.inactive_arm_tracks_locomotion());
     Transform previous_object = controller.object_world();
     for (int32_t bone = g1_skeleton::LeftShoulderPitch;
@@ -691,6 +699,7 @@ void test_default_layered_carry_releases_inactive_arm_after_hold_seam() {
 
     for (int tick = 0; tick < 10; ++tick) {
         const Pose current = controller.update(locomotion, 0.05F);
+        assert(controller.inactive_arm_targets_locomotion());
         assert(!controller.inactive_arm_tracks_locomotion());
         const Transform current_object = controller.object_world();
         for (int32_t bone = g1_skeleton::LeftShoulderPitch;
@@ -736,6 +745,7 @@ void test_default_layered_carry_releases_inactive_arm_after_hold_seam() {
     // One full-progress publication retires the seam. Later direct layered
     // Carry frames must continue publishing the current free arm unchanged.
     previous = controller.update(locomotion, 0.01F);
+    assert(controller.inactive_arm_targets_locomotion());
     assert(controller.inactive_arm_tracks_locomotion());
     previous_object = controller.object_world();
     for (int32_t bone = g1_skeleton::LeftShoulderPitch;
@@ -755,6 +765,7 @@ void test_default_layered_carry_releases_inactive_arm_after_hold_seam() {
     }
 
     const Pose direct = controller.update(locomotion, 0.01F);
+    assert(controller.inactive_arm_targets_locomotion());
     assert(controller.inactive_arm_tracks_locomotion());
     const Transform direct_object = controller.object_world();
     for (int32_t bone = g1_skeleton::LeftShoulderPitch;
@@ -821,6 +832,7 @@ void test_fallback_rotation_masks_are_layered() {
         Hand::Right,
         affordance,
         object_world_from_hold_pose(hold, Hand::Right, affordance));
+    assert(!fallback.inactive_arm_targets_locomotion());
 
     Pose output{};
     for (int tick = 0; tick < 32; ++tick) {
@@ -1326,10 +1338,12 @@ void test_initial_recorded_carry_smooths_nonarm_seam() {
         fixture.features,
         classify_carry_ranges(fixture.database));
     controller.start(hold, Hand::Right, affordance, object);
+    assert(!controller.inactive_arm_targets_locomotion());
 
     Pose output = controller.update(locomotion, 0.04F);
 
     assert(controller.recorded());
+    assert(!controller.inactive_arm_targets_locomotion());
     assert(near(root_world(output), root_world(locomotion.pose), 2.0e-5F));
     assert(near(
         output.rotations[g1_skeleton::LeftHipPitch],
