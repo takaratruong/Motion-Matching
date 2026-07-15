@@ -518,11 +518,17 @@ void test_segment_lengths_minimum_clavicle_swing_and_shortfall_semantics() {
                        minimum_swing) <= 1.0e-4F);
         }
         if (!solve_case.reachable) {
-            const float physical_shortfall =
-                length(solve_case.target - base.positions[19]) - 0.65F;
-            assert(result.reach_shortfall_m >= physical_shortfall);
-            assert(result.reach_shortfall_m <=
-                   physical_shortfall + 3.0e-4F);
+            const float full_chain_length =
+                length(base.positions[20] - base.positions[19]) +
+                length(base.positions[21] - base.positions[20]) +
+                length(base.positions[22] - base.positions[21]);
+            const float expected_clamped_shortfall =
+                length(solve_case.target - base.positions[19]) -
+                (full_chain_length -
+                 interaction::TargetRigArmIKConfig{}.reach_epsilon_m);
+            assert(std::fabs(
+                       result.reach_shortfall_m -
+                       expected_clamped_shortfall) <= 1.0e-5F);
             assert(std::fabs(
                        result.reach_shortfall_m -
                        result.position_error_m) <= 1.0e-5F);
@@ -557,6 +563,34 @@ void test_selected_angular_velocities_follow_shortest_local_delta() {
     assert_finite_selected_channels(pose, interaction::Hand::Right);
 }
 
+void test_reachable_small_angle_residual_is_not_physical_shortfall() {
+    FlatControllerPose pose = flat_reference();
+    interaction::TargetRigArmIK solver;
+    solver.begin_epoch(
+        interaction_reference(), pose, interaction::Hand::Right);
+
+    const FlatWorldPose initial = flat_world(pose);
+    const vec3 upper_root = initial.positions[20];
+    const vec3 seed_target = upper_root + vec3(0.50F, 0.0F, 0.0F);
+    const interaction::TargetRigArmIKResult seeded = solver.solve(
+        pose, {seed_target, quat()}, 1.0F, 1.0F / 60.0F);
+    assert(seeded.applied && seeded.reachable);
+
+    constexpr float small_angle_radians = 0.002F;
+    const vec3 perturbed_target = upper_root + quat_mul_vec3(
+        quat_from_angle_axis(
+            small_angle_radians, vec3(0.0F, 0.0F, 1.0F)),
+        seed_target - upper_root);
+    const interaction::TargetRigArmIKResult perturbed = solver.solve(
+        pose, {perturbed_target, quat()}, 1.0F, 1.0F / 60.0F);
+
+    assert(perturbed.applied);
+    assert(perturbed.position_error_m > 2.0e-4F);
+    assert(perturbed.position_error_m <= 1.0e-3F);
+    assert(perturbed.reachable);
+    assert(perturbed.reach_shortfall_m <= 1.0e-6F);
+}
+
 }  // namespace
 
 int main() {
@@ -572,5 +606,6 @@ int main() {
     test_invalid_epoch_reset_and_invalid_requests_do_not_mutate();
     test_segment_lengths_minimum_clavicle_swing_and_shortfall_semantics();
     test_selected_angular_velocities_follow_shortest_local_delta();
+    test_reachable_small_angle_residual_is_not_physical_shortfall();
     return 0;
 }

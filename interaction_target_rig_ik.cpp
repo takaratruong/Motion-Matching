@@ -475,11 +475,6 @@ TargetRigArmIKResult TargetRigArmIK::solve(
         world.positions[chain.hand] - requested_target);
     result.orientation_error_radians = orientation_error(
         world.rotations[chain.hand], requested_rotation);
-    if (result.position_error_m > 2.0F * config_.reach_epsilon_m) {
-        result.reachable = false;
-        result.reach_shortfall_m = std::max(
-            result.reach_shortfall_m, result.position_error_m);
-    }
     return result;
 }
 
