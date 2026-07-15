@@ -104,6 +104,7 @@ bool equivalent(const PlaceStep& left, const PlaceStep& right) {
            near(left.object_world, right.object_world) &&
            left.phase == right.phase &&
            left.source_frame == right.source_frame &&
+           left.source_frame_exact == right.source_frame_exact &&
            left.committed == right.committed &&
            left.release_due == right.release_due &&
            left.retract_finished == right.retract_finished &&
@@ -115,6 +116,30 @@ bool equivalent(const PlaceStep& left, const PlaceStep& right) {
            near(
                left.hand_orientation_error_radians,
                right.hand_orientation_error_radians) &&
+           near(
+               left.requested_root_correction_m,
+               right.requested_root_correction_m) &&
+           near(
+               left.applied_root_correction_m,
+               right.applied_root_correction_m) &&
+           near(
+               left.requested_yaw_correction_radians,
+               right.requested_yaw_correction_radians) &&
+           near(
+               left.applied_yaw_correction_radians,
+               right.applied_yaw_correction_radians) &&
+           near(
+               left.requested_hand_correction_m,
+               right.requested_hand_correction_m) &&
+           near(
+               left.applied_hand_correction_m,
+               right.applied_hand_correction_m) &&
+           near(
+               left.requested_hand_orientation_radians,
+               right.requested_hand_orientation_radians) &&
+           near(
+               left.applied_hand_orientation_radians,
+               right.applied_hand_orientation_radians) &&
            left.actual_fit.accepted == right.actual_fit.accepted &&
            left.actual_fit.reason == right.actual_fit.reason &&
            near(
@@ -693,6 +718,15 @@ void test_frozen_public_contract() {
     TEST_CHECK(!begin_result.accepted);
     TEST_CHECK(begin_result.reason == Reason::None);
     TEST_CHECK(step.phase == PlacePhase::Align);
+    TEST_CHECK(step.source_frame_exact == -1.0);
+    TEST_CHECK(step.requested_root_correction_m == 0.0F);
+    TEST_CHECK(step.applied_root_correction_m == 0.0F);
+    TEST_CHECK(step.requested_yaw_correction_radians == 0.0F);
+    TEST_CHECK(step.applied_yaw_correction_radians == 0.0F);
+    TEST_CHECK(step.requested_hand_correction_m == 0.0F);
+    TEST_CHECK(step.applied_hand_correction_m == 0.0F);
+    TEST_CHECK(step.requested_hand_orientation_radians == 0.0F);
+    TEST_CHECK(step.applied_hand_orientation_radians == 0.0F);
     (void)begin;
 }
 
@@ -1349,6 +1383,46 @@ void test_fractional_speed_weights_follow_exact_source_position() {
     }
 }
 
+void test_step_reports_exact_source_and_zeroes_corrections_after_release() {
+    Fixture fixture = make_fixture();
+    const Transform staging = root_transform(fixture.input.current_pose);
+    map_current_rigidly(
+        fixture,
+        Transform{
+            staging.position + vec3(0.10F, 0.0F, 0.0F),
+            quat_from_angle_axis(0.10F, vec3(0.0F, 1.0F, 0.0F))});
+    PlaceBeginInput begin = selected_begin(fixture);
+    PlaceController controller = make_controller(fixture);
+    TEST_CHECK(controller.begin(begin).accepted);
+    PlacePlayer oracle;
+    oracle.start(begin.candidate, begin.match_input);
+    oracle.advance(0.04F);
+    const PlaceStep first = controller.update(0.04F);
+    TEST_CHECK(first.source_frame_exact == oracle.source_frame_exact());
+    TEST_CHECK(first.requested_root_correction_m > 0.0F);
+    TEST_CHECK(first.applied_root_correction_m >= 0.0F);
+    TEST_CHECK(first.requested_yaw_correction_radians > 0.0F);
+    TEST_CHECK(first.applied_yaw_correction_radians >= 0.0F);
+    TEST_CHECK(first.requested_hand_correction_m >= 0.0F);
+    TEST_CHECK(first.applied_hand_correction_m >= 0.0F);
+    TEST_CHECK(first.requested_hand_orientation_radians >= 0.0F);
+    TEST_CHECK(first.applied_hand_orientation_radians >= 0.0F);
+
+    const PlaceStep release = run_to_terminal_before_ack(controller);
+    TEST_CHECK(release.release_due);
+    controller.acknowledge_release(release.object_world);
+    const PlaceStep retract = controller.update(0.04F);
+    TEST_CHECK(retract.source_frame_exact >= 0.0);
+    TEST_CHECK(retract.requested_root_correction_m == 0.0F);
+    TEST_CHECK(retract.applied_root_correction_m == 0.0F);
+    TEST_CHECK(retract.requested_yaw_correction_radians == 0.0F);
+    TEST_CHECK(retract.applied_yaw_correction_radians == 0.0F);
+    TEST_CHECK(retract.requested_hand_correction_m == 0.0F);
+    TEST_CHECK(retract.applied_hand_correction_m == 0.0F);
+    TEST_CHECK(retract.requested_hand_orientation_radians == 0.0F);
+    TEST_CHECK(retract.applied_hand_orientation_radians == 0.0F);
+}
+
 void test_authoritative_ik_position_limit_exact_and_nextabove() {
     Fixture fixture = make_fixture();
     const float limit = 0.02F;
@@ -1900,6 +1974,7 @@ int main() {
     test_begin_reuses_only_terminal_controllers_atomically();
     test_root_yaw_warp_uses_release_smoothstep_and_seven_tick_entry_blend();
     test_fractional_speed_weights_follow_exact_source_position();
+    test_step_reports_exact_source_and_zeroes_corrections_after_release();
     test_authoritative_ik_position_limit_exact_and_nextabove();
     test_authoritative_ik_orientation_limit_exact_and_nextabove();
     test_far_authored_entry_uses_only_mapped_release_residual();

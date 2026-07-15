@@ -86,6 +86,10 @@ inline const char* state_name(RuntimeState state) {
     case RuntimeState::PickupReplay: return "PickupReplay";
     case RuntimeState::Hold: return "Hold";
     case RuntimeState::Carry: return "Carry";
+    case RuntimeState::PlacePreflight: return "PlacePreflight";
+    case RuntimeState::PlaceAlign: return "PlaceAlign";
+    case RuntimeState::PlaceReplay: return "PlaceReplay";
+    case RuntimeState::PlaceRelease: return "PlaceRelease";
     }
     return "Unknown";
 }
@@ -138,6 +142,26 @@ inline const char* object_state_name(ObjectState state) {
     case ObjectState::Held: return "Held";
     }
     return "Unknown";
+}
+
+inline const char* place_mode_name(PlaceMotionMode mode) {
+    switch (mode) {
+    case PlaceMotionMode::None: return "none";
+    case PlaceMotionMode::RecordedPlace: return "recorded_place";
+    case PlaceMotionMode::ReversedPickup: return "reversed_pickup";
+    }
+    return "unknown";
+}
+
+inline const char* place_phase_name(PlacePhase phase) {
+    switch (phase) {
+    case PlacePhase::Align: return "align";
+    case PlacePhase::Lower: return "lower";
+    case PlacePhase::Release: return "release";
+    case PlacePhase::Retract: return "retract";
+    case PlacePhase::Finished: return "finished";
+    }
+    return "unknown";
 }
 
 inline void draw_interaction_scene(
@@ -304,8 +328,35 @@ inline void draw_interaction_text(
         y + 122,
         16,
         DARKGRAY);
+    DrawText(
+        TextFormat(
+            "place=%s/%s preview=%d ready=%d reason=%s cfg=%d",
+            place_mode_name(output.diagnostics.place.mode),
+            place_phase_name(output.diagnostics.place.phase),
+            output.diagnostics.place.preview_available ? 1 : 0,
+            output.diagnostics.place.preview.ready ? 1 : 0,
+            reason_name(output.diagnostics.place.preview.reason),
+            output.diagnostics.place.preflight_config_identity ? 1 : 0),
+        x,
+        y + 142,
+        14,
+        DARKGRAY);
+    DrawText(
+        TextFormat(
+            "place IK=%.3f/%.3f fp=%llu source=%.3f",
+            output.diagnostics.place.effective_ik
+                .maximum_request_position_m,
+            output.diagnostics.place.effective_ik
+                .maximum_request_orientation_radians,
+            static_cast<unsigned long long>(
+                output.diagnostics.place.ik_config_fingerprint),
+            output.diagnostics.place.source_frame_exact),
+        x,
+        y + 162,
+        14,
+        DARKGRAY);
     if (pack_diagnostic != nullptr && pack_diagnostic[0] != '\0') {
-        DrawText(pack_diagnostic, x, y + 142, 14, MAROON);
+        DrawText(pack_diagnostic, x, y + 182, 14, MAROON);
     }
 }
 

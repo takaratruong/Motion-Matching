@@ -1,6 +1,7 @@
 #pragma once
 
 #include "interaction_matcher.h"
+#include "interaction_place_controller.h"
 
 #include <algorithm>
 #include <array>
@@ -15,9 +16,13 @@ struct RuntimeFixture {
     Database database{};
     Features features{};
     TargetRegistry registry{};
+    PlacementSurfaceRegistry surface_registry{};
+    PlaceMotionLibrary place_library{};
     LocomotionSnapshot locomotion{};
     Transform original_object_world{};
     PickRequest request{};
+    SurfaceHandle surface{};
+    uint32_t place_affordance_id = 0U;
 };
 
 namespace runtime_fixture_detail {
@@ -273,6 +278,70 @@ inline InteractionTarget make_target() {
     return target;
 }
 
+inline PlacementSurface make_placement_surface(
+    uint64_t id = 900U,
+    vec3 top = vec3(0.0F, 0.65F, 3.0F)) {
+    PlacementSurface surface{};
+    surface.handle = {id, 3U};
+    surface.surface_world = {top, quat()};
+    surface.support_volume_world = {
+        top - vec3(0.0F, 0.35F, 0.0F), quat()};
+    surface.support_volume_size = vec3(1.0F, 0.70F, 1.0F);
+    surface.half_extent_x_m = 0.40F;
+    surface.half_extent_z_m = 0.40F;
+    surface.overhead_clearance_m = 0.50F;
+    surface.affordances = {{
+        77U,
+        Transform{vec3(0.0F, 0.10F, 0.0F), quat()},
+        vec3(0.0F, -0.10F, 0.0F),
+        vec3(0.0F, 1.0F, 0.0F),
+        0.01F,
+    }};
+    return surface;
+}
+
+inline RecordedPlaceClip make_recorded_place_clip(
+    const Database& database,
+    uint64_t id = 101U) {
+    RecordedPlaceClip clip{};
+    clip.id = id;
+    clip.object_profile_id = make_target().object_profile_id;
+    clip.fps_numerator = 25U;
+    clip.fps_denominator = 1U;
+    clip.entry_frame = 0;
+    clip.commit_frame = 8;
+    clip.release_frame = 12;
+    clip.retract_stop_frame = 15;
+    clip.hand = Hand::Right;
+    clip.hand_in_object = Transform{};
+    clip.object_bounds = make_target().object_bounds;
+    clip.source_surface = make_placement_surface(501U);
+    clip.source_affordance_id = 77U;
+
+    constexpr int32_t source_frame =
+        kFramesPerClip + kHoldLocalFrame;
+    const Pose source_pose = pose_at_frame(database, source_frame);
+    for (int32_t frame = 0; frame <= clip.retract_stop_frame; ++frame) {
+        const float alpha = std::min(frame, clip.release_frame) /
+            static_cast<float>(clip.release_frame);
+        const Transform object{
+            vec3(0.10F * (1.0F - alpha),
+                 0.95F - 0.20F * alpha,
+                 3.0F),
+            quat()};
+        Pose pose = source_pose;
+        pose.positions[g1_skeleton::Simulation].x = object.position.x;
+        pose.positions[kRightHandBone] =
+            object.position - pose.positions[g1_skeleton::Simulation];
+        pose.rotations[kRightHandBone] = object.rotation;
+        clip.poses.push_back(pose);
+        clip.object_poses.push_back(object);
+        clip.active_hand_contacts.push_back(
+            frame <= clip.release_frame ? 1U : 0U);
+    }
+    return clip;
+}
+
 inline LocomotionSnapshot make_locomotion(const Database& database) {
     LocomotionSnapshot locomotion{};
     constexpr int32_t kFirstRightReach = kFramesPerClip + 10;
@@ -386,6 +455,16 @@ inline RuntimeFixture make_runtime_fixture() {
     const RawQuery raw = build_raw_query(
         query_input_for(fixture, *target, *affordance));
     fixture.features.offsets.assign(raw.begin(), raw.end());
+    return fixture;
+}
+
+inline RuntimeFixture make_place_runtime_fixture() {
+    RuntimeFixture fixture = make_runtime_fixture();
+    fixture.surface = fixture.surface_registry.upsert(
+        runtime_fixture_detail::make_placement_surface());
+    fixture.place_affordance_id = 77U;
+    fixture.place_library.recorded.push_back(
+        runtime_fixture_detail::make_recorded_place_clip(fixture.database));
     return fixture;
 }
 

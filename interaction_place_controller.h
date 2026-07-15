@@ -19,6 +19,7 @@ struct PlaceStep {
     Transform object_world{};
     PlacePhase phase = PlacePhase::Align;
     int32_t source_frame = -1;
+    double source_frame_exact = -1.0;
     bool committed = false;
     bool release_due = false;
     bool retract_finished = false;
@@ -26,6 +27,14 @@ struct PlaceStep {
     Reason reason = Reason::None;
     float hand_position_error_m = 0.0F;
     float hand_orientation_error_radians = 0.0F;
+    float requested_root_correction_m = 0.0F;
+    float applied_root_correction_m = 0.0F;
+    float requested_yaw_correction_radians = 0.0F;
+    float applied_yaw_correction_radians = 0.0F;
+    float requested_hand_correction_m = 0.0F;
+    float applied_hand_correction_m = 0.0F;
+    float requested_hand_orientation_radians = 0.0F;
+    float applied_hand_orientation_radians = 0.0F;
     PlacementFit actual_fit{};
     bool support_sweep_clear = false;
 };

@@ -214,6 +214,159 @@ bool exact(
     return true;
 }
 
+bool exact(const ObjectLocalBounds& left, const ObjectLocalBounds& right) {
+    return exact(left.center_object, right.center_object) &&
+           exact(left.half_extents_object, right.half_extents_object);
+}
+
+bool exact(const Pose& left, const Pose& right) {
+    for (size_t bone = 0; bone < g1_skeleton::BoneCount; ++bone) {
+        if (!exact(left.positions[bone], right.positions[bone]) ||
+            !exact(left.velocities[bone], right.velocities[bone]) ||
+            !exact(left.rotations[bone], right.rotations[bone]) ||
+            !exact(
+                left.angular_velocities[bone],
+                right.angular_velocities[bone])) {
+            return false;
+        }
+    }
+    return left.hand_dof == right.hand_dof &&
+           left.hand_dof_velocities == right.hand_dof_velocities &&
+           left.foot_contacts == right.foot_contacts;
+}
+
+bool exact(const MatchCandidate& left, const MatchCandidate& right) {
+    return left.clip == right.clip &&
+           left.entry_frame == right.entry_frame &&
+           left.contact_frame == right.contact_frame &&
+           left.lift_frame == right.lift_frame &&
+           left.hold_frame == right.hold_frame &&
+           exact(left.scene_from_source, right.scene_from_source) &&
+           exact(left.entry_root_offset, right.entry_root_offset) &&
+           left.entry_yaw_offset == right.entry_yaw_offset &&
+           left.total_cost == right.total_cost &&
+           left.group_costs == right.group_costs;
+}
+
+bool exact(const PlaceTimingConfig& left, const PlaceTimingConfig& right) {
+    return left.canonical_fps == right.canonical_fps &&
+           left.playback_speed == right.playback_speed &&
+           left.entry_blend_seconds == right.entry_blend_seconds &&
+           left.reversed_commit_seconds == right.reversed_commit_seconds &&
+           left.maximum_alignment_seconds ==
+               right.maximum_alignment_seconds;
+}
+
+bool exact(const PlaceMatchConfig& left, const PlaceMatchConfig& right) {
+    return left.maximum_entry_root_error_m ==
+               right.maximum_entry_root_error_m &&
+           left.maximum_entry_yaw_error_radians ==
+               right.maximum_entry_yaw_error_radians;
+}
+
+bool exact(const IKConfig& left, const IKConfig& right) {
+    return left.maximum_request_position_m ==
+               right.maximum_request_position_m &&
+           left.maximum_request_orientation_radians ==
+               right.maximum_request_orientation_radians &&
+           left.accepted_position_m == right.accepted_position_m &&
+           left.accepted_orientation_radians ==
+               right.accepted_orientation_radians &&
+           left.damping == right.damping &&
+           left.finite_difference_radians ==
+               right.finite_difference_radians &&
+           left.orientation_scale_m_per_radian ==
+               right.orientation_scale_m_per_radian &&
+           left.maximum_step_radians == right.maximum_step_radians &&
+           left.maximum_iterations == right.maximum_iterations;
+}
+
+bool exact(const PlaceAffordance& left, const PlaceAffordance& right) {
+    return left.id == right.id &&
+           exact(left.object_in_surface, right.object_in_surface) &&
+           exact(left.support_point_object, right.support_point_object) &&
+           exact(
+               left.approach_direction_surface,
+               right.approach_direction_surface) &&
+           left.clearance_radius == right.clearance_radius;
+}
+
+bool exact(const PlacementSurface& left, const PlacementSurface& right) {
+    if (!(left.handle == right.handle) ||
+        !exact(left.surface_world, right.surface_world) ||
+        !exact(left.support_volume_world, right.support_volume_world) ||
+        !exact(left.support_volume_size, right.support_volume_size) ||
+        left.half_extent_x_m != right.half_extent_x_m ||
+        left.half_extent_z_m != right.half_extent_z_m ||
+        left.overhead_clearance_m != right.overhead_clearance_m ||
+        left.affordances.size() != right.affordances.size()) {
+        return false;
+    }
+    for (size_t index = 0; index < left.affordances.size(); ++index) {
+        if (!exact(left.affordances[index], right.affordances[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool exact(const PlaceCandidate& left, const PlaceCandidate& right) {
+    return left.mode == right.mode && left.source_id == right.source_id &&
+           left.selection_id == right.selection_id &&
+           exact(left.timing, right.timing) &&
+           exact(left.match, right.match) && exact(left.ik, right.ik) &&
+           left.clip == right.clip &&
+           left.entry_frame == right.entry_frame &&
+           left.commit_frame == right.commit_frame &&
+           left.release_frame == right.release_frame &&
+           left.stop_frame == right.stop_frame &&
+           left.direction == right.direction &&
+           exact(left.scene_from_source, right.scene_from_source) &&
+           exact(left.staging_root_world, right.staging_root_world) &&
+           exact(left.entry_root_offset, right.entry_root_offset) &&
+           left.entry_yaw_offset == right.entry_yaw_offset &&
+           left.total_cost == right.total_cost;
+}
+
+bool exact(const PlaceMatchInput& left, const PlaceMatchInput& right) {
+    return left.pickup_database == right.pickup_database &&
+           left.library == right.library &&
+           left.held_target == right.held_target &&
+           exact(left.pickup_candidate, right.pickup_candidate) &&
+           exact(left.current_pose, right.current_pose) &&
+           exact(left.current_object_world, right.current_object_world) &&
+           left.held_object_profile_id == right.held_object_profile_id &&
+           exact(left.held_object_bounds, right.held_object_bounds) &&
+           exact(left.held_affordance, right.held_affordance) &&
+           exact(left.surface, right.surface) &&
+           exact(left.place_affordance, right.place_affordance) &&
+           exact(left.object_dimensions, right.object_dimensions) &&
+           exact(left.timing, right.timing) &&
+           exact(left.match, right.match) && exact(left.ik, right.ik);
+}
+
+bool exact_held_metadata(
+    const InteractionTarget& retained,
+    const InteractionTarget& current) {
+    if (retained.handle != current.handle ||
+        !exact(retained.object_world, current.object_world) ||
+        retained.object_profile_id != current.object_profile_id ||
+        !exact(retained.object_bounds, current.object_bounds) ||
+        !exact(retained.object_dimensions, current.object_dimensions) ||
+        !exact(retained.table_world, current.table_world) ||
+        !exact(retained.table_size, current.table_size) ||
+        retained.owner_request != current.owner_request ||
+        retained.affordances.size() != current.affordances.size()) {
+        return false;
+    }
+    for (size_t index = 0; index < retained.affordances.size(); ++index) {
+        if (!exact(retained.affordances[index], current.affordances[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 Transform hand_world(const Pose& pose, Hand hand) {
     const WorldPose world = world_pose(pose);
     const size_t bone = hand == Hand::Left
@@ -447,6 +600,29 @@ InteractionRuntime::InteractionRuntime(
       config_(config),
       state_(RuntimeState::Locomotion) {
     validate_runtime_config(config_);
+    const PlaceController place_config_validator(config_.place, config_.ik);
+    (void)place_config_validator;
+    diagnostics_.state = state_;
+    diagnostics_.playback_speed = config_.playback.speed;
+    diagnostics_.pack_available = true;
+}
+
+InteractionRuntime::InteractionRuntime(
+    const Database& database,
+    const Features& features,
+    TargetRegistry& registry,
+    PlacementSurfaceRegistry& surface_registry,
+    const PlaceMotionLibrary& place_library,
+    RuntimeConfig config)
+    : database_(&database),
+      features_(&features),
+      registry_(&registry),
+      surface_registry_(&surface_registry),
+      place_library_(&place_library),
+      config_(config),
+      state_(RuntimeState::Locomotion) {
+    validate_runtime_config(config_);
+    place_controller_.emplace(config_.place, config_.ik);
     diagnostics_.state = state_;
     diagnostics_.playback_speed = config_.playback.speed;
     diagnostics_.pack_available = true;
@@ -467,6 +643,193 @@ RuntimeState InteractionRuntime::state() const {
 
 const RuntimeDiagnostics& InteractionRuntime::diagnostics() const {
     return diagnostics_;
+}
+
+InteractionRuntime::PlaceMatchBuildResult
+InteractionRuntime::make_place_match_input(
+    SurfaceHandle surface,
+    uint32_t affordance_id) const {
+    PlaceMatchBuildResult result{};
+    if (database_ == nullptr || features_ == nullptr || registry_ == nullptr ||
+        surface_registry_ == nullptr || place_library_ == nullptr ||
+        !place_controller_.has_value()) {
+        result.reason = Reason::PackUnavailable;
+        return result;
+    }
+    if (!request_.has_value() || !target_.has_value() ||
+        !affordance_.has_value() || !candidate_.has_value() ||
+        !attachment_.has_value() || !owns_reservation_) {
+        result.reason = Reason::TargetChanged;
+        return result;
+    }
+
+    const InteractionTarget* held = registry_->find(request_->target);
+    if (held == nullptr || held->state != ObjectState::Held ||
+        held->owner_request != request_->request_id ||
+        !registry_->validate(request_->target, request_->request_id) ||
+        attachment_->state() != ObjectState::Held ||
+        !exact_held_metadata(*target_, *held)) {
+        result.reason = Reason::TargetChanged;
+        return result;
+    }
+    const GraspAffordance* grasp = registry_->find_affordance(
+        held->handle, affordance_->id);
+    if (grasp == nullptr || !exact(*grasp, *affordance_)) {
+        result.reason = Reason::TargetChanged;
+        return result;
+    }
+
+    const PlacementSurface* destination = surface_registry_->find(surface);
+    if (destination == nullptr) {
+        result.reason = surface.id != 0U &&
+                surface_registry_->find_by_id(surface.id) != nullptr
+            ? Reason::SurfaceChanged
+            : Reason::SurfaceUnavailable;
+        return result;
+    }
+    const PlaceAffordance* place_affordance =
+        surface_registry_->find_affordance(surface, affordance_id);
+    if (place_affordance == nullptr) {
+        result.reason = Reason::SurfaceUnavailable;
+        return result;
+    }
+
+    result.input.pickup_database = database_;
+    result.input.library = place_library_;
+    result.input.held_target = held->handle;
+    result.input.pickup_candidate = *candidate_;
+    result.input.current_pose = pose_;
+    result.input.current_object_world = object_world_;
+    result.input.held_object_profile_id = held->object_profile_id;
+    result.input.held_object_bounds = held->object_bounds;
+    result.input.held_affordance = *grasp;
+    result.input.surface = *destination;
+    result.input.place_affordance = *place_affordance;
+    result.input.object_dimensions = held->object_dimensions;
+    result.input.timing = config_.place.timing;
+    result.input.match = config_.place.match;
+    result.input.ik = config_.ik;
+    result.accepted = true;
+    result.reason = Reason::None;
+    return result;
+}
+
+PlaceStagingPreview InteractionRuntime::preview_place(
+    SurfaceHandle surface,
+    uint32_t affordance_id) const {
+    if (state_ != RuntimeState::Carry ||
+        diagnostics_.object_state != ObjectState::Held ||
+        !diagnostics_.attached) {
+        PlaceStagingPreview rejected{};
+        rejected.reason = Reason::OutOfRange;
+        return rejected;
+    }
+    const PlaceMatchBuildResult built = make_place_match_input(
+        surface, affordance_id);
+    if (!built.accepted) {
+        PlaceStagingPreview rejected{};
+        rejected.reason = built.reason;
+        return rejected;
+    }
+    return preview_place_motion(built.input);
+}
+
+void InteractionRuntime::reset_place_attempt() {
+    place_request_.reset();
+    frozen_place_input_.reset();
+    active_place_input_.reset();
+    frozen_place_preview_ = PlaceStagingPreview{};
+    place_step_ = PlaceStep{};
+    place_final_frame_presented_ = false;
+    place_controller_.reset();
+    if (surface_registry_ != nullptr && place_library_ != nullptr) {
+        place_controller_.emplace(config_.place, config_.ik);
+    }
+}
+
+void InteractionRuntime::update_place_diagnostics(const PlaceStep& step) {
+    RuntimePlaceDiagnostics& place = diagnostics_.place;
+    place.source_frame = step.source_frame;
+    place.source_frame_exact = step.source_frame_exact;
+    place.phase = step.phase;
+    place.committed = step.committed;
+    place.release_due = step.release_due;
+    place.support_sweep_clear = step.support_sweep_clear;
+    place.actual_fit = step.actual_fit;
+    place.requested_root_correction_m =
+        step.requested_root_correction_m;
+    place.applied_root_correction_m = step.applied_root_correction_m;
+    place.requested_yaw_correction_radians =
+        step.requested_yaw_correction_radians;
+    place.applied_yaw_correction_radians =
+        step.applied_yaw_correction_radians;
+    place.requested_hand_correction_m =
+        step.requested_hand_correction_m;
+    place.applied_hand_correction_m = step.applied_hand_correction_m;
+    place.requested_hand_orientation_radians =
+        step.requested_hand_orientation_radians;
+    place.applied_hand_orientation_radians =
+        step.applied_hand_orientation_radians;
+    place.reason = step.reason;
+    diagnostics_.hand_position_error_m = step.hand_position_error_m;
+    diagnostics_.hand_orientation_error_radians =
+        step.hand_orientation_error_radians;
+    diagnostics_.frame = step.source_frame;
+
+    if (place.preview_available) {
+        const PlaceCandidate& candidate = place.preview.candidate;
+        place.mode = candidate.mode;
+        place.selection_id = candidate.selection_id;
+        place.clip = candidate.clip;
+        place.commit_frame = candidate.commit_frame;
+        place.time_to_release_seconds = place.released
+            ? 0.0F
+            : static_cast<float>(std::abs(
+                  static_cast<double>(candidate.release_frame) -
+                  step.source_frame_exact) /
+                  (static_cast<double>(kCanonicalFps) *
+                   candidate.timing.playback_speed));
+    }
+    place.support_position_error_m = length(
+        step.object_world.position - place.requested_goal_world.position);
+    place.support_orientation_error_radians = quat_angle_between(
+        step.object_world.rotation,
+        place.requested_goal_world.rotation);
+}
+
+void InteractionRuntime::reconstruct_carry(
+    const Pose& pose,
+    Transform object_world,
+    Reason reason,
+    ResultCode result) {
+    if (database_ == nullptr || features_ == nullptr ||
+        !affordance_.has_value()) {
+        throw std::logic_error(
+            "interaction runtime cannot reconstruct carry");
+    }
+    carry_.reset();
+    carry_.emplace(
+        *database_,
+        *features_,
+        classify_carry_ranges(*database_, config_.carry),
+        config_.carry,
+        config_.ik);
+    carry_->start(pose, affordance_->hand, *affordance_, object_world);
+    carry_started_ = true;
+    pose_ = pose;
+    object_world_ = object_world;
+    state_ = RuntimeState::Carry;
+    diagnostics_.state = state_;
+    diagnostics_.result = result;
+    diagnostics_.reason = reason;
+    diagnostics_.object_state = ObjectState::Held;
+    diagnostics_.attached = true;
+    diagnostics_.recorded_carry = false;
+    diagnostics_.inactive_arm_targets_locomotion =
+        carry_->inactive_arm_targets_locomotion();
+    diagnostics_.inactive_arm_tracks_locomotion = false;
+    diagnostics_.place.reason = reason;
+    reset_place_attempt();
 }
 
 void InteractionRuntime::drain_playback_events(
@@ -1267,6 +1630,356 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
                 }
             }
         }
+    } else if (state_ == RuntimeState::PlacePreflight) {
+        auto reject_preflight = [this](Reason reason) {
+            state_ = RuntimeState::Carry;
+            diagnostics_.state = state_;
+            diagnostics_.result = ResultCode::Rejected;
+            diagnostics_.reason = reason;
+            diagnostics_.object_state = ObjectState::Held;
+            diagnostics_.attached = true;
+            diagnostics_.place.reason = reason;
+            place_request_.reset();
+            frozen_place_input_.reset();
+            active_place_input_.reset();
+            frozen_place_preview_ = PlaceStagingPreview{};
+            place_step_ = PlaceStep{};
+            place_final_frame_presented_ = false;
+        };
+
+        if (!place_request_.has_value()) {
+            reject_preflight(Reason::TargetUnavailable);
+        } else if (!request_.has_value() ||
+                   place_request_->held_target != request_->target) {
+            reject_preflight(Reason::TargetChanged);
+        } else if (place_request_->request_id == 0U) {
+            reject_preflight(Reason::TargetUnavailable);
+        } else {
+            const PlaceMatchBuildResult built = make_place_match_input(
+                place_request_->surface,
+                place_request_->affordance_id);
+            if (!built.accepted) {
+                reject_preflight(built.reason);
+            } else if (!frozen_place_input_.has_value()) {
+                reject_preflight(
+                    frozen_place_preview_.reason == Reason::None
+                        ? Reason::TargetChanged
+                        : frozen_place_preview_.reason);
+            } else if (!exact(built.input, *frozen_place_input_)) {
+                reject_preflight(
+                    exact(built.input.surface, frozen_place_input_->surface)
+                        ? Reason::TargetChanged
+                        : Reason::SurfaceChanged);
+            } else {
+                const PlaceStagingPreview preview = preview_place_motion(
+                    built.input);
+                diagnostics_.place.preview_available = preview.accepted;
+                diagnostics_.place.preview = preview;
+                diagnostics_.place.selection_id =
+                    preview.candidate.selection_id;
+                diagnostics_.place.ik_config_fingerprint =
+                    preview.ik_config_fingerprint;
+                diagnostics_.place.candidate_certified = preview.accepted;
+                const bool config_identity = preview.accepted &&
+                    exact(built.input.timing, config_.place.timing) &&
+                    exact(built.input.match, config_.place.match) &&
+                    exact(built.input.ik, config_.ik) &&
+                    exact(preview.ik, built.input.ik) &&
+                    exact(preview.candidate.timing, built.input.timing) &&
+                    exact(preview.candidate.match, built.input.match) &&
+                    exact(preview.candidate.ik, built.input.ik) &&
+                    preview.ik_config_fingerprint != 0U;
+                diagnostics_.place.preflight_config_identity =
+                    config_identity;
+                if (!preview.accepted) {
+                    reject_preflight(preview.reason);
+                } else if (!config_identity) {
+                    reject_preflight(Reason::CorrectionLimit);
+                } else if (!frozen_place_preview_.accepted ||
+                           !exact(
+                               preview.candidate,
+                               frozen_place_preview_.candidate) ||
+                           preview.ik_config_fingerprint !=
+                               frozen_place_preview_.ik_config_fingerprint ||
+                           place_request_->selection_id !=
+                               preview.candidate.selection_id) {
+                    reject_preflight(Reason::TargetChanged);
+                } else if (!preview.ready) {
+                    reject_preflight(Reason::CorrectionLimit);
+                } else if (!place_controller_.has_value()) {
+                    reject_preflight(Reason::PackUnavailable);
+                } else {
+                    const PlaceBeginResult begun = place_controller_->begin(
+                        PlaceBeginInput{built.input, preview.candidate});
+                    if (!begun.accepted) {
+                        reject_preflight(begun.reason);
+                    } else {
+                        active_place_input_ = built.input;
+                        frozen_place_preview_ = preview;
+                        carry_.reset();
+                        carry_started_ = false;
+                        place_step_ = PlaceStep{};
+                        place_step_.pose = pose_;
+                        place_step_.object_world = object_world_;
+                        place_step_.phase = PlacePhase::Align;
+                        place_step_.source_frame =
+                            preview.candidate.entry_frame;
+                        place_step_.source_frame_exact =
+                            preview.candidate.entry_frame;
+                        place_step_.support_sweep_clear = true;
+                        state_ = RuntimeState::PlaceAlign;
+                        diagnostics_.state = state_;
+                        diagnostics_.result = ResultCode::Accepted;
+                        diagnostics_.reason = Reason::None;
+                        diagnostics_.object_state = ObjectState::Held;
+                        diagnostics_.attached = true;
+                        diagnostics_.recorded_carry = false;
+                        diagnostics_.inactive_arm_targets_locomotion = false;
+                        diagnostics_.inactive_arm_tracks_locomotion = false;
+                        diagnostics_.place.reason = Reason::None;
+                        diagnostics_.place.surface =
+                            place_request_->surface;
+                        diagnostics_.place.affordance_id =
+                            place_request_->affordance_id;
+                        diagnostics_.place.mode = preview.candidate.mode;
+                        diagnostics_.place.selection_id =
+                            preview.candidate.selection_id;
+                        diagnostics_.place.clip = preview.candidate.clip;
+                        diagnostics_.place.commit_frame =
+                            preview.candidate.commit_frame;
+                        diagnostics_.place.effective_ik = config_.ik;
+                        diagnostics_.place.requested_goal_world =
+                            placement_goal_world(
+                                built.input.surface,
+                                built.input.place_affordance
+                                    .object_in_surface);
+                        diagnostics_.place.requested_fit =
+                            evaluate_placement_fit(
+                                built.input.surface,
+                                built.input.place_affordance,
+                                built.input.held_object_bounds);
+                        diagnostics_.clip = preview.candidate.clip;
+                        update_place_diagnostics(place_step_);
+                    }
+                }
+            }
+        }
+    } else if (state_ == RuntimeState::PlaceAlign ||
+               state_ == RuntimeState::PlaceReplay) {
+        auto recover_or_publish_external_failure =
+            [this](const PlaceStep& step, Reason reason, ResultCode result) {
+                const InteractionTarget* held =
+                    request_.has_value() && registry_ != nullptr
+                    ? registry_->find(request_->target)
+                    : nullptr;
+                const bool still_held = request_.has_value() &&
+                    held != nullptr && held->state == ObjectState::Held &&
+                    held->owner_request == request_->request_id &&
+                    registry_->validate(
+                        request_->target, request_->request_id);
+                if (still_held) {
+                    reconstruct_carry(
+                        step.pose, step.object_world, reason, result);
+                    return;
+                }
+
+                const InteractionTarget* authoritative =
+                    request_.has_value() && registry_ != nullptr
+                    ? registry_->find_by_id(request_->target.id)
+                    : nullptr;
+                if (authoritative != nullptr) {
+                    object_world_ = authoritative->object_world;
+                    diagnostics_.target = authoritative->handle;
+                    diagnostics_.object_state = authoritative->state;
+                } else {
+                    diagnostics_.object_state = ObjectState::Free;
+                }
+                owns_reservation_ = false;
+                state_ = RuntimeState::Locomotion;
+                diagnostics_.state = state_;
+                diagnostics_.result = ResultCode::Failed;
+                diagnostics_.reason = Reason::TargetChanged;
+                diagnostics_.attached = false;
+                diagnostics_.recorded_carry = false;
+                diagnostics_.inactive_arm_targets_locomotion = false;
+                diagnostics_.inactive_arm_tracks_locomotion = false;
+                diagnostics_.place.reason = Reason::TargetChanged;
+                carry_.reset();
+                player_.reset();
+                event_player_.reset();
+                attachment_.reset();
+                candidate_.reset();
+                target_.reset();
+                affordance_.reset();
+                request_.reset();
+                reset_place_attempt();
+            };
+
+        if (!place_controller_.has_value() ||
+            !active_place_input_.has_value() ||
+            !place_request_.has_value() || !attachment_.has_value()) {
+            PlaceStep failed = place_step_;
+            failed.recover_to_carry = true;
+            failed.reason = Reason::PackUnavailable;
+            recover_or_publish_external_failure(
+                failed, failed.reason, ResultCode::Failed);
+        } else {
+            PlaceStep step = place_controller_->update(input.dt);
+            if (input.cancel_pressed) {
+                step = place_controller_->cancel();
+            }
+            place_step_ = step;
+            pose_ = step.pose;
+            object_world_ = step.object_world;
+            update_place_diagnostics(step);
+
+            if (step.recover_to_carry) {
+                recover_or_publish_external_failure(
+                    step,
+                    step.reason,
+                    step.reason == Reason::Cancelled
+                        ? ResultCode::Cancelled
+                        : ResultCode::Failed);
+            } else if (step.release_due) {
+                Reason release_failure = Reason::None;
+                const PlacementSurface* surface =
+                    surface_registry_ == nullptr
+                    ? nullptr
+                    : surface_registry_->find(place_request_->surface);
+                const PlaceAffordance* place_affordance =
+                    surface_registry_ == nullptr
+                    ? nullptr
+                    : surface_registry_->find_affordance(
+                          place_request_->surface,
+                          place_request_->affordance_id);
+                if (surface == nullptr || place_affordance == nullptr ||
+                    !exact(*surface, active_place_input_->surface) ||
+                    !exact(
+                        *place_affordance,
+                        active_place_input_->place_affordance)) {
+                    release_failure = Reason::SurfaceChanged;
+                }
+
+                PlacementFit actual{};
+                if (release_failure == Reason::None) {
+                    try {
+                        actual = evaluate_actual_placement_fit(
+                            *surface,
+                            *place_affordance,
+                            step.object_world,
+                            active_place_input_->held_object_bounds);
+                    } catch (const std::exception&) {
+                        actual.reason = Reason::PlacementOutOfBounds;
+                    }
+                    if (!actual.accepted) {
+                        release_failure = actual.reason == Reason::None
+                            ? Reason::PlacementOutOfBounds
+                            : actual.reason;
+                    }
+                }
+                if (release_failure == Reason::None &&
+                    !step.support_sweep_clear) {
+                    release_failure = Reason::BlockedPath;
+                }
+                diagnostics_.place.actual_fit = actual;
+
+                if (release_failure != Reason::None) {
+                    step.reason = release_failure;
+                    step.actual_fit = actual;
+                    update_place_diagnostics(step);
+                    recover_or_publish_external_failure(
+                        step, release_failure, ResultCode::Failed);
+                } else {
+                    const std::optional<TargetHandle> placed =
+                        attachment_->commit_place(
+                            step.object_world,
+                            PlacedSupportContext{
+                                surface->support_volume_world,
+                                surface->support_volume_size});
+                    if (!placed.has_value()) {
+                        recover_or_publish_external_failure(
+                            step, Reason::TargetChanged, ResultCode::Failed);
+                    } else {
+                        place_controller_->acknowledge_release(
+                            step.object_world);
+                        owns_reservation_ = false;
+                        diagnostics_.target = *placed;
+                        diagnostics_.object_state = ObjectState::Free;
+                        diagnostics_.attached = false;
+                        diagnostics_.result = ResultCode::Succeeded;
+                        diagnostics_.reason = Reason::None;
+                        diagnostics_.place.released = true;
+                        diagnostics_.place.release_due = false;
+                        diagnostics_.place.reason = Reason::None;
+                        diagnostics_.place.actual_fit = actual;
+                        diagnostics_.place.requested_root_correction_m = 0.0F;
+                        diagnostics_.place.applied_root_correction_m = 0.0F;
+                        diagnostics_.place.requested_yaw_correction_radians =
+                            0.0F;
+                        diagnostics_.place.applied_yaw_correction_radians =
+                            0.0F;
+                        diagnostics_.place.requested_hand_correction_m = 0.0F;
+                        diagnostics_.place.applied_hand_correction_m = 0.0F;
+                        diagnostics_.place
+                            .requested_hand_orientation_radians = 0.0F;
+                        diagnostics_.place
+                            .applied_hand_orientation_radians = 0.0F;
+                        state_ = RuntimeState::PlaceRelease;
+                        diagnostics_.state = state_;
+                        place_final_frame_presented_ = false;
+                    }
+                }
+            } else {
+                state_ = step.committed
+                    ? RuntimeState::PlaceReplay
+                    : RuntimeState::PlaceAlign;
+                diagnostics_.state = state_;
+                diagnostics_.result = ResultCode::Accepted;
+                diagnostics_.reason = Reason::None;
+                diagnostics_.object_state = ObjectState::Held;
+                diagnostics_.attached = true;
+                diagnostics_.place.reason = Reason::None;
+            }
+        }
+    } else if (state_ == RuntimeState::PlaceRelease) {
+        if (place_final_frame_presented_) {
+            state_ = RuntimeState::Locomotion;
+            diagnostics_.state = state_;
+            diagnostics_.result = ResultCode::Succeeded;
+            diagnostics_.reason = Reason::None;
+            diagnostics_.object_state = ObjectState::Free;
+            diagnostics_.attached = false;
+            diagnostics_.recorded_carry = false;
+            diagnostics_.inactive_arm_targets_locomotion = false;
+            diagnostics_.inactive_arm_tracks_locomotion = false;
+            carry_.reset();
+            player_.reset();
+            event_player_.reset();
+            attachment_.reset();
+            candidate_.reset();
+            target_.reset();
+            affordance_.reset();
+            request_.reset();
+            reset_place_attempt();
+        } else if (!place_controller_.has_value()) {
+            throw std::logic_error(
+                "interaction runtime place release controller is missing");
+        } else {
+            place_step_ = place_controller_->update(input.dt);
+            pose_ = place_step_.pose;
+            object_world_ = place_step_.object_world;
+            update_place_diagnostics(place_step_);
+            diagnostics_.state = RuntimeState::PlaceRelease;
+            diagnostics_.result = ResultCode::Succeeded;
+            diagnostics_.reason = Reason::None;
+            diagnostics_.object_state = ObjectState::Free;
+            diagnostics_.attached = false;
+            diagnostics_.place.released = true;
+            diagnostics_.place.reason = Reason::None;
+            if (place_step_.retract_finished) {
+                place_final_frame_presented_ = true;
+            }
+        }
     } else if (state_ == RuntimeState::Carry) {
         if (input.reset_pressed) {
             const InteractionTarget* authoritative =
@@ -1311,6 +2024,7 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
             target_.reset();
             affordance_.reset();
             request_.reset();
+            reset_place_attempt();
         } else {
             const InteractionTarget* authoritative = registry_->find_by_id(
                 request_->target.id);
@@ -1345,6 +2059,58 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
                 target_.reset();
                 affordance_.reset();
                 request_.reset();
+                reset_place_attempt();
+            } else if (input.interact_pressed) {
+                place_request_ = input.place_request;
+                frozen_place_input_.reset();
+                active_place_input_.reset();
+                frozen_place_preview_ = PlaceStagingPreview{};
+                diagnostics_.place = RuntimePlaceDiagnostics{};
+                diagnostics_.place.effective_ik = config_.ik;
+                if (place_request_.has_value()) {
+                    diagnostics_.place.surface = place_request_->surface;
+                    diagnostics_.place.affordance_id =
+                        place_request_->affordance_id;
+                    const PlaceMatchBuildResult built = make_place_match_input(
+                        place_request_->surface,
+                        place_request_->affordance_id);
+                    if (built.accepted) {
+                        frozen_place_input_ = built.input;
+                        frozen_place_preview_ = preview_place_motion(
+                            built.input);
+                        diagnostics_.place.preview_available =
+                            frozen_place_preview_.accepted;
+                        diagnostics_.place.preview = frozen_place_preview_;
+                        diagnostics_.place.candidate_certified =
+                            frozen_place_preview_.accepted;
+                        diagnostics_.place.mode =
+                            frozen_place_preview_.candidate.mode;
+                        diagnostics_.place.selection_id =
+                            frozen_place_preview_.candidate.selection_id;
+                        diagnostics_.place.ik_config_fingerprint =
+                            frozen_place_preview_.ik_config_fingerprint;
+                        diagnostics_.place.requested_goal_world =
+                            placement_goal_world(
+                                built.input.surface,
+                                built.input.place_affordance
+                                    .object_in_surface);
+                        diagnostics_.place.requested_fit =
+                            evaluate_placement_fit(
+                                built.input.surface,
+                                built.input.place_affordance,
+                                built.input.held_object_bounds);
+                    } else {
+                        frozen_place_preview_.reason = built.reason;
+                        diagnostics_.place.preview = frozen_place_preview_;
+                        diagnostics_.place.reason = built.reason;
+                    }
+                }
+                state_ = RuntimeState::PlacePreflight;
+                diagnostics_.state = state_;
+                diagnostics_.result = ResultCode::Accepted;
+                diagnostics_.reason = Reason::None;
+                diagnostics_.object_state = ObjectState::Held;
+                diagnostics_.attached = true;
             } else {
                 const Pose next_pose = carry_->update(
                     input.locomotion, input.dt);
@@ -1385,12 +2151,20 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
     if (state_ == RuntimeState::Align ||
         state_ == RuntimeState::PickupReplay ||
         state_ == RuntimeState::Hold ||
-        state_ == RuntimeState::Carry) {
+        state_ == RuntimeState::Carry ||
+        state_ == RuntimeState::PlacePreflight ||
+        state_ == RuntimeState::PlaceAlign ||
+        state_ == RuntimeState::PlaceReplay ||
+        state_ == RuntimeState::PlaceRelease) {
         output.owns_pose = true;
         output.pose = pose_;
     }
     if (state_ == RuntimeState::PickupReplay ||
-        state_ == RuntimeState::Hold) {
+        state_ == RuntimeState::Hold ||
+        state_ == RuntimeState::PlacePreflight ||
+        state_ == RuntimeState::PlaceAlign ||
+        state_ == RuntimeState::PlaceReplay ||
+        state_ == RuntimeState::PlaceRelease) {
         output.suppress_steering = true;
     }
     return output;

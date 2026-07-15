@@ -512,6 +512,7 @@ PlaceBeginResult PlaceController::begin(const PlaceBeginInput& input) {
         initial.object_world = initial_object;
         initial.phase = PlacePhase::Align;
         initial.source_frame = input.candidate.entry_frame;
+        initial.source_frame_exact = input.candidate.entry_frame;
         initial.support_sweep_clear = true;
 
         player_ = std::move(player);
@@ -581,6 +582,7 @@ PlaceStep PlaceController::update(float dt) {
     step.pose = pose;
     step.phase = sample.phase;
     step.source_frame = sample.source_frame;
+    step.source_frame_exact = trial.source_frame_exact();
     step.committed = sample.committed;
     step.retract_finished = trial.finished();
 
@@ -595,6 +597,18 @@ PlaceStep PlaceController::update(float dt) {
 
     const float progress = source_progress(
         begin_.candidate, trial.source_frame_exact());
+    const float root_weight = 1.0F - smoothstep(progress);
+    step.requested_root_correction_m = root_weight * std::hypot(
+        begin_.candidate.entry_root_offset.x,
+        begin_.candidate.entry_root_offset.z);
+    step.requested_yaw_correction_radians = std::abs(
+        root_weight * begin_.candidate.entry_yaw_offset);
+    step.applied_root_correction_m = std::hypot(
+        pose.positions[kRoot].x - sample.pose.positions[kRoot].x,
+        pose.positions[kRoot].z - sample.pose.positions[kRoot].z);
+    step.applied_yaw_correction_radians = rotation_gate::radians(
+        rotation_gate::measure(
+            pose.rotations[kRoot], sample.pose.rotations[kRoot]));
     const Transform current_hand = hand_world(
         pose, begin_.match_input.held_affordance.hand);
     const rotation_gate::Rotation current_hand_rotation_evidence =
@@ -634,6 +648,10 @@ PlaceStep PlaceController::update(float dt) {
         rotation_gate::measure(
             target_hand_rotation_evidence,
             current_hand_rotation_evidence);
+    step.requested_hand_correction_m =
+        static_cast<float>(requested_position);
+    step.requested_hand_orientation_radians =
+        rotation_gate::radians(requested_orientation);
     if (requested_position > ik_config_.maximum_request_position_m ||
         !rotation_gate::within(
             requested_orientation,
@@ -666,6 +684,13 @@ PlaceStep PlaceController::update(float dt) {
     step.pose = pose;
     step.hand_position_error_m = ik.position_error_m;
     step.hand_orientation_error_radians = ik.orientation_error_radians;
+    const Transform corrected_hand = hand_world(
+        pose, begin_.match_input.held_affordance.hand);
+    step.applied_hand_correction_m = static_cast<float>(distance(
+        corrected_hand.position, current_hand.position));
+    step.applied_hand_orientation_radians = rotation_gate::radians(
+        rotation_gate::measure(
+            corrected_hand.rotation, current_hand.rotation));
     const Transform object_world = hand_derived_object(
         pose, begin_.match_input.held_affordance);
     if (!valid_transform(object_world)) {
@@ -811,6 +836,14 @@ void PlaceController::acknowledge_release(Transform placed_world) {
     release_pending_ = false;
     release_acknowledged_ = true;
     last_step_.release_due = false;
+    last_step_.requested_root_correction_m = 0.0F;
+    last_step_.applied_root_correction_m = 0.0F;
+    last_step_.requested_yaw_correction_radians = 0.0F;
+    last_step_.applied_yaw_correction_radians = 0.0F;
+    last_step_.requested_hand_correction_m = 0.0F;
+    last_step_.applied_hand_correction_m = 0.0F;
+    last_step_.requested_hand_orientation_radians = 0.0F;
+    last_step_.applied_hand_orientation_radians = 0.0F;
 }
 
 PlaceStep PlaceController::cancel() {

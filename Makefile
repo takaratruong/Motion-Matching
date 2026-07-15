@@ -49,11 +49,17 @@ ifeq ($(PLATFORM),PLATFORM_WEB)
 endif
 
 CONTROLLER_CXXFLAGS := -std=c++17
+INTERACTION_PLACE_SOURCES := interaction_place_target.cpp \
+  interaction_place_collision.cpp interaction_place.cpp \
+  interaction_place_controller.cpp
+INTERACTION_PLACE_HEADERS := interaction_place_target.h \
+  interaction_place_collision.h interaction_place.h \
+  interaction_place_controller.h
 INTERACTION_SOURCES := interaction_pose.cpp interaction_target.cpp \
   interaction_features.cpp interaction_matcher.cpp interaction_playback.cpp \
   interaction_ik.cpp interaction_attachment.cpp interaction_carry.cpp \
   interaction_runtime.cpp interaction_controller_adapter.cpp \
-  interaction_target_rig_ik.cpp
+  interaction_target_rig_ik.cpp $(INTERACTION_PLACE_SOURCES)
 SOURCE := controller.cpp $(INTERACTION_SOURCES)
 HEADER = $(wildcard *.h)
 
@@ -141,6 +147,7 @@ INTERACTION_RUNTIME_SOURCES += interaction_carry.cpp interaction_ik.cpp
 INTERACTION_RUNTIME_SOURCES += interaction_attachment.cpp interaction_playback.cpp
 INTERACTION_RUNTIME_SOURCES += interaction_matcher.cpp interaction_features.cpp
 INTERACTION_RUNTIME_SOURCES += interaction_pose.cpp interaction_target.cpp
+INTERACTION_RUNTIME_SOURCES += $(INTERACTION_PLACE_SOURCES)
 
 .PHONY: test-python test-cpp test-interaction
 .PHONY: retime-flat-database test-flat-database-retime
@@ -219,11 +226,11 @@ $(CPP_TEST_DIR)/test_interaction_carry: tests/cpp/test_interaction_carry.cpp tes
 	$(CXX) $(CPP_TEST_FLAGS) -c tests/cpp/test_interaction_carry.cpp -o $(CPP_TEST_DIR)/test_interaction_carry.o
 	$(CXX) $(CPP_TEST_FLAGS) $(CPP_TEST_DIR)/test_interaction_carry.o interaction_carry.cpp interaction_ik.cpp interaction_matcher.cpp interaction_features.cpp interaction_pose.cpp interaction_target.cpp -o $@
 
-$(CPP_TEST_DIR)/test_interaction_runtime: tests/cpp/test_interaction_runtime.cpp tests/cpp/interaction_runtime_fixture.h interaction_runtime.h $(INTERACTION_RUNTIME_SOURCES) interaction_carry.h interaction_ik.h interaction_rotation_gate.h g1_arm_joint_metadata.h interaction_attachment.h interaction_playback.h interaction_matcher.h interaction_features.h interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
+$(CPP_TEST_DIR)/test_interaction_runtime: tests/cpp/test_interaction_runtime.cpp tests/cpp/interaction_runtime_fixture.h interaction_runtime.h $(INTERACTION_RUNTIME_SOURCES) $(INTERACTION_PLACE_HEADERS) interaction_carry.h interaction_ik.h interaction_rotation_gate.h g1_arm_joint_metadata.h interaction_attachment.h interaction_playback.h interaction_matcher.h interaction_features.h interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) -c tests/cpp/test_interaction_runtime.cpp -o $(CPP_TEST_DIR)/test_interaction_runtime.o
 	$(CXX) $(CPP_TEST_FLAGS) $(CPP_TEST_DIR)/test_interaction_runtime.o $(INTERACTION_RUNTIME_SOURCES) -o $@
 
-$(CPP_TEST_DIR)/test_interaction_controller_adapter: tests/cpp/test_interaction_controller_adapter.cpp tests/cpp/interaction_runtime_fixture.h interaction_controller_adapter.cpp interaction_controller_adapter.h interaction_target_rig_ik.cpp interaction_target_rig_ik.h interaction_runtime.h $(INTERACTION_RUNTIME_SOURCES) interaction_carry.h interaction_ik.h interaction_rotation_gate.h g1_arm_joint_metadata.h interaction_attachment.h interaction_playback.h interaction_matcher.h interaction_features.h interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
+$(CPP_TEST_DIR)/test_interaction_controller_adapter: tests/cpp/test_interaction_controller_adapter.cpp tests/cpp/interaction_runtime_fixture.h interaction_controller_adapter.cpp interaction_controller_adapter.h interaction_target_rig_ik.cpp interaction_target_rig_ik.h interaction_runtime.h $(INTERACTION_RUNTIME_SOURCES) $(INTERACTION_PLACE_HEADERS) interaction_carry.h interaction_ik.h interaction_rotation_gate.h g1_arm_joint_metadata.h interaction_attachment.h interaction_playback.h interaction_matcher.h interaction_features.h interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_controller_adapter.cpp interaction_controller_adapter.cpp interaction_target_rig_ik.cpp $(INTERACTION_RUNTIME_SOURCES) -o $@
 
 $(CPP_TEST_DIR)/test_interaction_target_rig_ik: tests/cpp/test_interaction_target_rig_ik.cpp interaction_target_rig_ik.cpp interaction_target_rig_ik.h interaction_controller_adapter.h interaction_pose.cpp interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
@@ -238,7 +245,7 @@ interaction_query_probe: interaction_query_probe.cpp interaction_features.cpp in
 $(SAFE_INTERACTION_QUERY_PROBE): interaction_query_probe.cpp interaction_features.cpp interaction_features.h interaction_pose.cpp interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(TASK12_BUILD_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) interaction_query_probe.cpp interaction_features.cpp interaction_pose.cpp -o $@
 
-interaction_runtime_probe: interaction_runtime_probe.cpp interaction_runtime.h $(INTERACTION_RUNTIME_SOURCES) interaction_carry.h interaction_ik.h interaction_rotation_gate.h g1_arm_joint_metadata.h interaction_attachment.h interaction_playback.h interaction_matcher.h interaction_features.h interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h
+interaction_runtime_probe: interaction_runtime_probe.cpp interaction_runtime.h $(INTERACTION_RUNTIME_SOURCES) $(INTERACTION_PLACE_HEADERS) interaction_carry.h interaction_ik.h interaction_rotation_gate.h g1_arm_joint_metadata.h interaction_attachment.h interaction_playback.h interaction_matcher.h interaction_features.h interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h
 	$(CXX) $(CPP_TEST_FLAGS) interaction_runtime_probe.cpp $(INTERACTION_RUNTIME_SOURCES) -o $@
 
 test-python: interaction_probe interaction_query_probe

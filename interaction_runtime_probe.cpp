@@ -127,6 +127,10 @@ std::string_view state_name(interaction::RuntimeState state) {
     case RuntimeState::PickupReplay: return "PickupReplay";
     case RuntimeState::Hold: return "Hold";
     case RuntimeState::Carry: return "Carry";
+    case RuntimeState::PlacePreflight: return "PlacePreflight";
+    case RuntimeState::PlaceAlign: return "PlaceAlign";
+    case RuntimeState::PlaceReplay: return "PlaceReplay";
+    case RuntimeState::PlaceRelease: return "PlaceRelease";
     }
     throw std::logic_error("invalid runtime state");
 }

@@ -1,6 +1,7 @@
 #include "interaction_runtime.h"
 #include "tests/cpp/interaction_runtime_fixture.h"
 
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
@@ -9,12 +10,17 @@
 #include <optional>
 #include <stdexcept>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace {
 
 constexpr float kDt = 1.0F / 25.0F;
 constexpr int kMaximumUpdates = 600;
+
+interaction::RuntimeFixture make_runtime_fixture() {
+    return interaction::make_place_runtime_fixture();
+}
 
 bool exact(vec3 left, vec3 right) {
     return left.x == right.x && left.y == right.y && left.z == right.z;
@@ -51,6 +57,200 @@ bool exact(
 }
 
 bool exact(
+    const interaction::GraspAffordance& left,
+    const interaction::GraspAffordance& right) {
+    return left.id == right.id && left.hand == right.hand &&
+           exact(left.hand_in_object, right.hand_in_object) &&
+           exact(
+               left.approach_direction_object,
+               right.approach_direction_object) &&
+           left.clearance_radius == right.clearance_radius;
+}
+
+bool exact(
+    const interaction::InteractionTarget& left,
+    const interaction::InteractionTarget& right) {
+    if (left.handle != right.handle ||
+        !exact(left.object_world, right.object_world) ||
+        left.object_profile_id != right.object_profile_id ||
+        !exact(
+            left.object_bounds.center_object,
+            right.object_bounds.center_object) ||
+        !exact(
+            left.object_bounds.half_extents_object,
+            right.object_bounds.half_extents_object) ||
+        !exact(left.object_dimensions, right.object_dimensions) ||
+        !exact(left.table_world, right.table_world) ||
+        !exact(left.table_size, right.table_size) ||
+        left.state != right.state ||
+        left.owner_request != right.owner_request ||
+        left.affordances.size() != right.affordances.size()) {
+        return false;
+    }
+    for (size_t index = 0; index < left.affordances.size(); ++index) {
+        if (!exact(left.affordances[index], right.affordances[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool exact(
+    const interaction::PlaceAffordance& left,
+    const interaction::PlaceAffordance& right) {
+    return left.id == right.id &&
+           exact(left.object_in_surface, right.object_in_surface) &&
+           exact(left.support_point_object, right.support_point_object) &&
+           exact(
+               left.approach_direction_surface,
+               right.approach_direction_surface) &&
+           left.clearance_radius == right.clearance_radius;
+}
+
+bool exact(
+    const interaction::PlacementSurface& left,
+    const interaction::PlacementSurface& right) {
+    if (!(left.handle == right.handle) ||
+        !exact(left.surface_world, right.surface_world) ||
+        !exact(left.support_volume_world, right.support_volume_world) ||
+        !exact(left.support_volume_size, right.support_volume_size) ||
+        left.half_extent_x_m != right.half_extent_x_m ||
+        left.half_extent_z_m != right.half_extent_z_m ||
+        left.overhead_clearance_m != right.overhead_clearance_m ||
+        left.affordances.size() != right.affordances.size()) {
+        return false;
+    }
+    for (size_t index = 0; index < left.affordances.size(); ++index) {
+        if (!exact(left.affordances[index], right.affordances[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool exact(
+    const interaction::IKConfig& left,
+    const interaction::IKConfig& right) {
+    return left.maximum_request_position_m ==
+               right.maximum_request_position_m &&
+           left.maximum_request_orientation_radians ==
+               right.maximum_request_orientation_radians &&
+           left.accepted_position_m == right.accepted_position_m &&
+           left.accepted_orientation_radians ==
+               right.accepted_orientation_radians &&
+           left.damping == right.damping &&
+           left.finite_difference_radians ==
+               right.finite_difference_radians &&
+           left.orientation_scale_m_per_radian ==
+               right.orientation_scale_m_per_radian &&
+           left.maximum_step_radians == right.maximum_step_radians &&
+           left.maximum_iterations == right.maximum_iterations;
+}
+
+bool exact(
+    const interaction::PlaceCandidate& left,
+    const interaction::PlaceCandidate& right) {
+    return left.mode == right.mode && left.source_id == right.source_id &&
+           left.selection_id == right.selection_id &&
+           left.timing.canonical_fps == right.timing.canonical_fps &&
+           left.timing.playback_speed == right.timing.playback_speed &&
+           left.timing.entry_blend_seconds ==
+               right.timing.entry_blend_seconds &&
+           left.timing.reversed_commit_seconds ==
+               right.timing.reversed_commit_seconds &&
+           left.timing.maximum_alignment_seconds ==
+               right.timing.maximum_alignment_seconds &&
+           left.match.maximum_entry_root_error_m ==
+               right.match.maximum_entry_root_error_m &&
+           left.match.maximum_entry_yaw_error_radians ==
+               right.match.maximum_entry_yaw_error_radians &&
+           exact(left.ik, right.ik) && left.clip == right.clip &&
+           left.entry_frame == right.entry_frame &&
+           left.commit_frame == right.commit_frame &&
+           left.release_frame == right.release_frame &&
+           left.stop_frame == right.stop_frame &&
+           left.direction == right.direction &&
+           exact(left.scene_from_source, right.scene_from_source) &&
+           exact(left.staging_root_world, right.staging_root_world) &&
+           exact(left.entry_root_offset, right.entry_root_offset) &&
+           left.entry_yaw_offset == right.entry_yaw_offset &&
+           left.total_cost == right.total_cost;
+}
+
+bool exact(
+    const interaction::PlaceStagingPreview& left,
+    const interaction::PlaceStagingPreview& right) {
+    return left.accepted == right.accepted && left.ready == right.ready &&
+           left.reason == right.reason &&
+           exact(left.candidate, right.candidate) &&
+           exact(left.ik, right.ik) &&
+           left.ik_config_fingerprint == right.ik_config_fingerprint &&
+           exact(left.staging_root_world, right.staging_root_world) &&
+           left.root_error_m == right.root_error_m &&
+           left.yaw_error_radians == right.yaw_error_radians;
+}
+
+bool exact(
+    const interaction::PlacementFit& left,
+    const interaction::PlacementFit& right) {
+    return left.accepted == right.accepted && left.reason == right.reason &&
+           left.support_gap_m == right.support_gap_m &&
+           left.lowest_corner_m == right.lowest_corner_m &&
+           left.highest_corner_m == right.highest_corner_m &&
+           left.footprint_valid == right.footprint_valid &&
+           left.overhead_valid == right.overhead_valid;
+}
+
+bool exact(
+    const interaction::RuntimePlaceDiagnostics& left,
+    const interaction::RuntimePlaceDiagnostics& right) {
+    return left.surface == right.surface &&
+           left.affordance_id == right.affordance_id &&
+           left.mode == right.mode &&
+           left.selection_id == right.selection_id &&
+           left.preview_available == right.preview_available &&
+           exact(left.preview, right.preview) &&
+           left.candidate_certified == right.candidate_certified &&
+           left.preflight_config_identity ==
+               right.preflight_config_identity &&
+           exact(left.effective_ik, right.effective_ik) &&
+           left.ik_config_fingerprint == right.ik_config_fingerprint &&
+           exact(left.requested_goal_world, right.requested_goal_world) &&
+           exact(left.requested_fit, right.requested_fit) &&
+           exact(left.actual_fit, right.actual_fit) &&
+           left.clip == right.clip &&
+           left.source_frame == right.source_frame &&
+           left.source_frame_exact == right.source_frame_exact &&
+           left.commit_frame == right.commit_frame &&
+           left.phase == right.phase &&
+           left.time_to_release_seconds == right.time_to_release_seconds &&
+           left.committed == right.committed &&
+           left.release_due == right.release_due &&
+           left.released == right.released &&
+           left.support_sweep_clear == right.support_sweep_clear &&
+           left.support_position_error_m == right.support_position_error_m &&
+           left.support_orientation_error_radians ==
+               right.support_orientation_error_radians &&
+           left.requested_root_correction_m ==
+               right.requested_root_correction_m &&
+           left.applied_root_correction_m ==
+               right.applied_root_correction_m &&
+           left.requested_yaw_correction_radians ==
+               right.requested_yaw_correction_radians &&
+           left.applied_yaw_correction_radians ==
+               right.applied_yaw_correction_radians &&
+           left.requested_hand_correction_m ==
+               right.requested_hand_correction_m &&
+           left.applied_hand_correction_m ==
+               right.applied_hand_correction_m &&
+           left.requested_hand_orientation_radians ==
+               right.requested_hand_orientation_radians &&
+           left.applied_hand_orientation_radians ==
+               right.applied_hand_orientation_radians &&
+           left.reason == right.reason;
+}
+
+bool exact(
     const interaction::RuntimeDiagnostics& left,
     const interaction::RuntimeDiagnostics& right) {
     return left.state == right.state &&
@@ -84,7 +284,18 @@ bool exact(
                right.inactive_arm_targets_locomotion &&
            left.inactive_arm_tracks_locomotion ==
                right.inactive_arm_tracks_locomotion &&
-           left.pack_available == right.pack_available;
+           left.pack_available == right.pack_available &&
+           exact(left.place, right.place);
+}
+
+bool exact(
+    const interaction::RuntimeOutput& left,
+    const interaction::RuntimeOutput& right) {
+    return left.owns_pose == right.owns_pose &&
+           left.suppress_steering == right.suppress_steering &&
+           exact(left.pose, right.pose) &&
+           exact(left.object_world, right.object_world) &&
+           exact(left.diagnostics, right.diagnostics);
 }
 
 interaction::RuntimeInput idle_input(
@@ -101,6 +312,15 @@ interaction::RuntimeInput interact_input(
     interaction::RuntimeInput input = idle_input(locomotion);
     input.interact_pressed = true;
     input.pick_request = request;
+    return input;
+}
+
+interaction::RuntimeInput place_interact_input(
+    const interaction::LocomotionSnapshot& locomotion,
+    std::optional<interaction::PlaceRequest> request) {
+    interaction::RuntimeInput input = idle_input(locomotion);
+    input.interact_pressed = true;
+    input.place_request = request;
     return input;
 }
 
@@ -173,6 +393,122 @@ interaction::RuntimeOutput enter_carry_before_first_update(
     assert(output.diagnostics.state == RuntimeState::Carry);
     assert(!output.diagnostics.inactive_arm_tracks_locomotion);
     return output;
+}
+
+interaction::PlaceRequest place_request_for(
+    const interaction::InteractionRuntime& runtime,
+    const interaction::RuntimeFixture& fixture,
+    uint64_t request_id = 1001U) {
+    const interaction::PlaceStagingPreview preview = runtime.preview_place(
+        fixture.surface, fixture.place_affordance_id);
+    assert(preview.accepted);
+    interaction::PlaceRequest request{};
+    request.held_target = fixture.request.target;
+    request.surface = fixture.surface;
+    request.affordance_id = fixture.place_affordance_id;
+    request.request_id = request_id;
+    request.selection_id = preview.candidate.selection_id;
+    return request;
+}
+
+interaction::RuntimeOutput enter_place_align(
+    interaction::InteractionRuntime& runtime,
+    const interaction::RuntimeFixture& fixture,
+    interaction::PlaceRequest request) {
+    using namespace interaction;
+    RuntimeOutput output = runtime.update(place_interact_input(
+        fixture.locomotion, request));
+    assert(output.diagnostics.state == RuntimeState::PlacePreflight);
+    output = advance(runtime, fixture.locomotion);
+    assert(output.diagnostics.state == RuntimeState::PlaceAlign);
+    assert(output.diagnostics.attached);
+    return output;
+}
+
+interaction::RuntimeOutput enter_ready_place_align(
+    interaction::InteractionRuntime& runtime,
+    const interaction::RuntimeFixture& fixture,
+    uint64_t request_id = 1001U) {
+    return enter_place_align(
+        runtime,
+        fixture,
+        place_request_for(runtime, fixture, request_id));
+}
+
+void assert_held_by_original_owner(
+    const interaction::RuntimeFixture& fixture) {
+    const interaction::InteractionTarget* held =
+        fixture.registry.find(fixture.request.target);
+    assert(held != nullptr);
+    assert(held->state == interaction::ObjectState::Held);
+    assert(held->owner_request == fixture.request.request_id);
+}
+
+void assert_fresh_carry_next_sample(
+    interaction::InteractionRuntime& runtime,
+    const interaction::RuntimeFixture& fixture,
+    const interaction::RuntimeOutput& recovery,
+    const interaction::RuntimeConfig& config = interaction::RuntimeConfig{}) {
+    using namespace interaction;
+    const InteractionTarget* target = fixture.registry.find(
+        fixture.request.target);
+    assert(target != nullptr);
+    const GraspAffordance* affordance = fixture.registry.find_affordance(
+        fixture.request.target, fixture.request.affordance_id);
+    assert(affordance != nullptr);
+    CarryController expected(
+        fixture.database,
+        fixture.features,
+        classify_carry_ranges(fixture.database, config.carry),
+        config.carry,
+        config.ik);
+    expected.start(
+        recovery.pose,
+        affordance->hand,
+        *affordance,
+        recovery.object_world);
+    const Pose expected_pose = expected.update(fixture.locomotion, kDt);
+    const Transform expected_object = expected.object_world();
+
+    const RuntimeOutput next = advance(runtime, fixture.locomotion);
+    assert(next.diagnostics.state == RuntimeState::Carry);
+    assert(exact(next.pose, expected_pose));
+    assert(exact(next.object_world, expected_object));
+    assert(next.diagnostics.attached);
+    assert_held_by_original_owner(fixture);
+}
+
+void assert_preflight_rejection_preserves_carry(
+    interaction::InteractionRuntime& runtime,
+    const interaction::RuntimeFixture& fixture,
+    const interaction::RuntimeInput& edge,
+    interaction::Reason expected_reason) {
+    using namespace interaction;
+    InteractionRuntime paused_control = runtime;
+    const RuntimeDiagnostics before = runtime.diagnostics();
+    const InteractionTarget target_before =
+        *fixture.registry.find(fixture.request.target);
+
+    RuntimeOutput output = runtime.update(edge);
+    assert(output.diagnostics.state == RuntimeState::PlacePreflight);
+    const Pose frozen_pose = output.pose;
+    const Transform frozen_object = output.object_world;
+    output = advance(runtime, fixture.locomotion);
+    assert(output.diagnostics.state == RuntimeState::Carry);
+    assert(output.diagnostics.result == ResultCode::Rejected);
+    assert(output.diagnostics.reason == expected_reason);
+    assert(exact(output.pose, frozen_pose));
+    assert(exact(output.object_world, frozen_object));
+    assert(exact(*fixture.registry.find(fixture.request.target), target_before));
+    assert(before.state == RuntimeState::Carry);
+
+    const RuntimeOutput trial_next = advance(runtime, fixture.locomotion);
+    const RuntimeOutput control_next = advance(
+        paused_control, fixture.locomotion);
+    assert(exact(trial_next.pose, control_next.pose));
+    assert(exact(trial_next.object_world, control_next.object_world));
+    assert(trial_next.diagnostics.state == RuntimeState::Carry);
+    assert_held_by_original_owner(fixture);
 }
 
 void assert_free(
@@ -367,6 +703,38 @@ interaction::RuntimeFixture curved_precontact_clearance_fixture() {
     return fixture;
 }
 
+interaction::RuntimeFixture reverse_place_runtime_fixture() {
+    using namespace interaction;
+    using namespace interaction::runtime_fixture_detail;
+    RuntimeFixture fixture = make_runtime_fixture();
+    fixture.place_library.recorded.clear();
+    for (int32_t local = kContactLocalFrame + 1;
+         local <= kHoldLocalFrame;
+         ++local) {
+        const int32_t frame = kFramesPerClip + local;
+        const float alpha = static_cast<float>(
+            local - (kContactLocalFrame + 1)) /
+            static_cast<float>(
+                kHoldLocalFrame - (kContactLocalFrame + 1));
+        vec3 object = read_vec3(
+            fixture.database.object_positions,
+            static_cast<size_t>(frame));
+        object.y = 0.80F + 0.15F * alpha;
+        write_vec3(
+            fixture.database.object_positions,
+            static_cast<size_t>(frame),
+            object);
+        const vec3 root = read_bone_position(
+            fixture.database, frame, g1_skeleton::Simulation);
+        write_bone_position(
+            fixture.database, frame, kRightHandBone, object - root);
+        write_bone_position(
+            fixture.database, frame, kLeftHandBone, object - root);
+    }
+    recompute_velocities(fixture.database);
+    return fixture;
+}
+
 void assert_invalid_runtime_config(interaction::RuntimeConfig config) {
     using namespace interaction;
     RuntimeFixture fixture = make_runtime_fixture();
@@ -382,6 +750,71 @@ void assert_invalid_runtime_config(interaction::RuntimeConfig config) {
     assert_free(fixture.registry, fixture.request.target);
 }
 
+void assert_both_runtime_constructors_reject_without_mutation(
+    interaction::RuntimeConfig config) {
+    using namespace interaction;
+    for (bool placement_enabled : {false, true}) {
+        RuntimeFixture fixture = make_runtime_fixture();
+        const InteractionTarget target_before =
+            *fixture.registry.find(fixture.request.target);
+        const PlacementSurface surface_before =
+            *fixture.surface_registry.find(fixture.surface);
+        bool threw = false;
+        try {
+            if (placement_enabled) {
+                InteractionRuntime runtime(
+                    fixture.database,
+                    fixture.features,
+                    fixture.registry,
+                    fixture.surface_registry,
+                    fixture.place_library,
+                    config);
+                (void)runtime;
+            } else {
+                InteractionRuntime runtime(
+                    fixture.database,
+                    fixture.features,
+                    fixture.registry,
+                    config);
+                (void)runtime;
+            }
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        assert(threw);
+        assert(exact(
+            *fixture.registry.find(fixture.request.target), target_before));
+        assert(exact(
+            *fixture.surface_registry.find(fixture.surface), surface_before));
+    }
+}
+
+void assert_both_runtime_constructors_accept(
+    interaction::RuntimeConfig config) {
+    using namespace interaction;
+    for (bool placement_enabled : {false, true}) {
+        RuntimeFixture fixture = make_runtime_fixture();
+        if (placement_enabled) {
+            InteractionRuntime runtime(
+                fixture.database,
+                fixture.features,
+                fixture.registry,
+                fixture.surface_registry,
+                fixture.place_library,
+                config);
+            (void)runtime;
+        } else {
+            InteractionRuntime runtime(
+                fixture.database,
+                fixture.features,
+                fixture.registry,
+                config);
+            (void)runtime;
+        }
+        assert_free(fixture.registry, fixture.request.target);
+    }
+}
+
 void test_frozen_public_contract_and_defaults() {
     using namespace interaction;
 
@@ -394,6 +827,10 @@ void test_frozen_public_contract_and_defaults() {
     static_assert(static_cast<uint8_t>(RuntimeState::PickupReplay) == 4U);
     static_assert(static_cast<uint8_t>(RuntimeState::Hold) == 5U);
     static_assert(static_cast<uint8_t>(RuntimeState::Carry) == 6U);
+    static_assert(static_cast<uint8_t>(RuntimeState::PlacePreflight) == 7U);
+    static_assert(static_cast<uint8_t>(RuntimeState::PlaceAlign) == 8U);
+    static_assert(static_cast<uint8_t>(RuntimeState::PlaceReplay) == 9U);
+    static_assert(static_cast<uint8_t>(RuntimeState::PlaceRelease) == 10U);
 
     static_assert(std::is_same_v<decltype(RuntimeConfig{}.matcher), MatchConfig>);
     static_assert(std::is_same_v<
@@ -402,11 +839,15 @@ void test_frozen_public_contract_and_defaults() {
     static_assert(std::is_same_v<
         decltype(RuntimeConfig{}.attachment), AttachmentConfig>);
     static_assert(std::is_same_v<decltype(RuntimeConfig{}.carry), CarryConfig>);
+    static_assert(std::is_same_v<
+        decltype(RuntimeConfig{}.place), PlaceControllerConfig>);
     static_assert(std::is_same_v<decltype(RuntimeInput{}.dt), float>);
     static_assert(std::is_same_v<
         decltype(RuntimeInput{}.locomotion), LocomotionSnapshot>);
     static_assert(std::is_same_v<
         decltype(RuntimeInput{}.pick_request), std::optional<PickRequest>>);
+    static_assert(std::is_same_v<
+        decltype(RuntimeInput{}.place_request), std::optional<PlaceRequest>>);
     static_assert(std::is_same_v<
         decltype(RuntimeDiagnostics{}.state), RuntimeState>);
     static_assert(std::is_same_v<
@@ -427,6 +868,18 @@ void test_frozen_public_contract_and_defaults() {
         const Features&,
         TargetRegistry&,
         RuntimeConfig>);
+    static_assert(std::is_constructible_v<
+        InteractionRuntime,
+        const Database&,
+        const Features&,
+        TargetRegistry&,
+        PlacementSurfaceRegistry&,
+        const PlaceMotionLibrary&,
+        RuntimeConfig>);
+    static_assert(std::is_same_v<
+        decltype(std::declval<const InteractionRuntime&>().preview_place(
+            SurfaceHandle{}, uint32_t{})),
+        PlaceStagingPreview>);
     static_assert(std::is_same_v<
         decltype(&InteractionRuntime::disabled),
         InteractionRuntime (*)(Reason)>);
@@ -475,6 +928,1218 @@ void test_frozen_public_contract_and_defaults() {
 
     const RuntimeOutput output{};
     assert(!output.owns_pose && !output.suppress_steering);
+}
+
+void test_place_preview_and_collapsed_success_lifecycle() {
+    using namespace interaction;
+    RuntimeFixture fixture = make_runtime_fixture();
+    InteractionRuntime runtime(
+        fixture.database,
+        fixture.features,
+        fixture.registry,
+        fixture.surface_registry,
+        fixture.place_library,
+        RuntimeConfig{});
+
+    const RuntimeDiagnostics before_preview = runtime.diagnostics();
+    const InteractionTarget before_target =
+        *fixture.registry.find(fixture.request.target);
+    const PlacementSurface before_surface =
+        *fixture.surface_registry.find(fixture.surface);
+    const PlaceStagingPreview before_carry = runtime.preview_place(
+        fixture.surface, fixture.place_affordance_id);
+    assert(!before_carry.accepted);
+    assert(before_carry.reason == Reason::OutOfRange);
+    assert(exact(runtime.diagnostics(), before_preview));
+    assert(exact(
+        *fixture.registry.find(fixture.request.target), before_target));
+    assert(exact(
+        *fixture.surface_registry.find(fixture.surface), before_surface));
+
+    RuntimeOutput output = enter_carry_before_first_update(runtime, fixture);
+    const RuntimeOutput frozen = output;
+    const RuntimeDiagnostics carry_diagnostics = runtime.diagnostics();
+    const InteractionTarget carry_target_before =
+        *fixture.registry.find(fixture.request.target);
+    const PlacementSurface carry_surface_before =
+        *fixture.surface_registry.find(fixture.surface);
+    const PlaceStagingPreview first = runtime.preview_place(
+        fixture.surface, fixture.place_affordance_id);
+    const PlaceStagingPreview second = runtime.preview_place(
+        fixture.surface, fixture.place_affordance_id);
+    assert(first.accepted);
+    assert(first.ready);
+    assert(first.candidate.selection_id != 0U);
+    assert(first.ik_config_fingerprint != 0U);
+    assert(exact(first, second));
+    assert(exact(runtime.diagnostics(), carry_diagnostics));
+    assert(exact(
+        *fixture.registry.find(fixture.request.target), carry_target_before));
+    assert(exact(
+        *fixture.surface_registry.find(fixture.surface), carry_surface_before));
+
+    PlaceRequest request{};
+    request.held_target = fixture.request.target;
+    request.surface = fixture.surface;
+    request.affordance_id = fixture.place_affordance_id;
+    request.request_id = 1001U;
+    request.selection_id = first.candidate.selection_id;
+    output = runtime.update(place_interact_input(fixture.locomotion, request));
+    assert(output.diagnostics.state == RuntimeState::PlacePreflight);
+    assert(output.owns_pose && output.suppress_steering);
+    assert(output.diagnostics.attached);
+    assert(exact(output.pose, frozen.pose));
+    assert(exact(output.object_world, frozen.object_world));
+    assert(exact(output.diagnostics.place.preview, first));
+
+    std::vector<RuntimeState> collapsed{RuntimeState::Carry};
+    RuntimeState previous = RuntimeState::Carry;
+    for (int update = 0; update < kMaximumUpdates; ++update) {
+        if (output.diagnostics.state != previous) {
+            collapsed.push_back(output.diagnostics.state);
+            previous = output.diagnostics.state;
+        }
+        if (output.diagnostics.state == RuntimeState::PlacePreflight ||
+            output.diagnostics.state == RuntimeState::PlaceAlign ||
+            output.diagnostics.state == RuntimeState::PlaceReplay ||
+            output.diagnostics.state == RuntimeState::PlaceRelease) {
+            assert(output.owns_pose);
+            assert(output.suppress_steering);
+        }
+        if (output.diagnostics.state == RuntimeState::PlacePreflight) {
+            assert(output.diagnostics.place.selection_id ==
+                   first.candidate.selection_id);
+        }
+        if (output.diagnostics.state == RuntimeState::PlaceReplay) {
+            assert(output.diagnostics.attached);
+            assert(output.diagnostics.object_state == ObjectState::Held);
+        }
+        if (output.diagnostics.state == RuntimeState::PlaceRelease) {
+            assert(!output.diagnostics.attached);
+            assert(output.diagnostics.object_state == ObjectState::Free);
+            assert(output.diagnostics.target.id == fixture.request.target.id);
+            assert(output.diagnostics.target.generation ==
+                   fixture.request.target.generation + 1U);
+            const InteractionTarget* placed = fixture.registry.find(
+                output.diagnostics.target);
+            assert(placed != nullptr);
+            assert(exact(placed->object_world, output.object_world));
+            assert(exact(
+                placed->table_world,
+                before_surface.support_volume_world));
+            assert(exact(
+                placed->table_size,
+                before_surface.support_volume_size));
+        }
+        if (output.diagnostics.state == RuntimeState::Locomotion) break;
+        output = advance(runtime, fixture.locomotion);
+    }
+    if (collapsed.empty() || collapsed.back() != RuntimeState::Locomotion) {
+        collapsed.push_back(output.diagnostics.state);
+    }
+    const std::vector<RuntimeState> expected = {
+        RuntimeState::Carry,
+        RuntimeState::PlacePreflight,
+        RuntimeState::PlaceAlign,
+        RuntimeState::PlaceReplay,
+        RuntimeState::PlaceRelease,
+        RuntimeState::Locomotion,
+    };
+    assert(collapsed == expected);
+    assert(output.diagnostics.result == ResultCode::Succeeded);
+    assert(output.diagnostics.reason == Reason::None);
+    assert(!output.owns_pose && !output.suppress_steering);
+    const InteractionTarget released_before_preview =
+        *fixture.registry.find(output.diagnostics.target);
+    const PlacementSurface surface_before_preview =
+        *fixture.surface_registry.find(fixture.surface);
+    const RuntimeDiagnostics diagnostics_before_preview =
+        runtime.diagnostics();
+    const PlaceStagingPreview after_release = runtime.preview_place(
+        fixture.surface, fixture.place_affordance_id);
+    assert(!after_release.accepted);
+    assert(after_release.reason == Reason::OutOfRange);
+    assert(exact(runtime.diagnostics(), diagnostics_before_preview));
+    assert(exact(
+        *fixture.registry.find(output.diagnostics.target),
+        released_before_preview));
+    assert(exact(
+        *fixture.surface_registry.find(fixture.surface),
+        surface_before_preview));
+
+    const TargetHandle placed_handle = output.diagnostics.target;
+    const std::optional<TargetHandle> resolved =
+        fixture.registry.resolve_single_target(
+            fixture.locomotion.pose.positions[g1_skeleton::Simulation],
+            5.0F);
+    assert(resolved.has_value());
+    assert(*resolved == placed_handle);
+    const InteractionTarget* placed = fixture.registry.find(placed_handle);
+    const GraspAffordance* placed_affordance =
+        fixture.registry.find_affordance(
+            placed_handle, fixture.request.affordance_id);
+    assert(placed != nullptr && placed_affordance != nullptr);
+    const QueryInput destination_query = query_input_for(
+        fixture, *placed, *placed_affordance);
+    assert(exact(
+        destination_query.table_world,
+        before_surface.support_volume_world));
+    assert(exact(
+        destination_query.table_size,
+        before_surface.support_volume_size));
+    assert(!exact(destination_query.table_world, before_target.table_world));
+
+    const PickRequest repick{
+        placed_handle,
+        fixture.request.affordance_id,
+        1002U,
+    };
+    output = runtime.update(interact_input(fixture.locomotion, repick));
+    assert(output.diagnostics.state == RuntimeState::Preflight);
+    output = advance(runtime, fixture.locomotion);
+    assert(output.diagnostics.state == RuntimeState::Align);
+    assert(output.diagnostics.target == placed_handle);
+}
+
+void test_runtime_validates_complete_place_and_ik_configuration() {
+    using namespace interaction;
+    const float infinity = std::numeric_limits<float>::infinity();
+    const float orientation_cap = 0.436332313F;
+
+    const auto rejects_place = [](const auto& mutate) {
+        RuntimeConfig config{};
+        mutate(config.place);
+        assert_both_runtime_constructors_reject_without_mutation(config);
+    };
+    rejects_place([](PlaceControllerConfig& value) {
+        value.timing.canonical_fps = 0.0F;
+    });
+    rejects_place([](PlaceControllerConfig& value) {
+        value.timing.playback_speed = 0.0F;
+    });
+    rejects_place([](PlaceControllerConfig& value) {
+        value.timing.entry_blend_seconds = 0.0F;
+    });
+    rejects_place([](PlaceControllerConfig& value) {
+        value.timing.reversed_commit_seconds = 0.0F;
+    });
+    rejects_place([](PlaceControllerConfig& value) {
+        value.timing.maximum_alignment_seconds = 0.0F;
+    });
+    rejects_place([](PlaceControllerConfig& value) {
+        value.timing.maximum_alignment_seconds = std::nextafter(
+            value.timing.entry_blend_seconds, 0.0F);
+    });
+    rejects_place([](PlaceControllerConfig& value) {
+        value.timing.maximum_alignment_seconds = std::nextafter(
+            value.timing.reversed_commit_seconds, 0.0F);
+    });
+    rejects_place([](PlaceControllerConfig& value) {
+        value.match.maximum_entry_root_error_m = 0.0F;
+    });
+    rejects_place([](PlaceControllerConfig& value) {
+        value.match.maximum_entry_root_error_m = std::nextafter(
+            0.25F, std::numeric_limits<float>::infinity());
+    });
+    rejects_place([](PlaceControllerConfig& value) {
+        value.match.maximum_entry_yaw_error_radians = 0.0F;
+    });
+    rejects_place([orientation_cap](PlaceControllerConfig& value) {
+        value.match.maximum_entry_yaw_error_radians = std::nextafter(
+            orientation_cap, std::numeric_limits<float>::infinity());
+    });
+    rejects_place([](PlaceControllerConfig& value) {
+        value.release_position_m = 0.0F;
+    });
+    rejects_place([](PlaceControllerConfig& value) {
+        value.release_position_m = std::nextafter(
+            0.02F, std::numeric_limits<float>::infinity());
+    });
+    rejects_place([](PlaceControllerConfig& value) {
+        value.release_orientation_radians = 0.0F;
+    });
+    rejects_place([orientation_cap](PlaceControllerConfig& value) {
+        value.release_orientation_radians = std::nextafter(
+            orientation_cap, std::numeric_limits<float>::infinity());
+    });
+
+    using IKMember = float IKConfig::*;
+    const std::array<IKMember, 8> ik_fields = {
+        &IKConfig::maximum_request_position_m,
+        &IKConfig::maximum_request_orientation_radians,
+        &IKConfig::accepted_position_m,
+        &IKConfig::accepted_orientation_radians,
+        &IKConfig::damping,
+        &IKConfig::finite_difference_radians,
+        &IKConfig::orientation_scale_m_per_radian,
+        &IKConfig::maximum_step_radians,
+    };
+    for (size_t index = 0; index < ik_fields.size(); ++index) {
+        RuntimeConfig config{};
+        config.ik.*ik_fields[index] = index < 4U ? -0.01F : 0.0F;
+        assert_both_runtime_constructors_reject_without_mutation(config);
+
+        config = RuntimeConfig{};
+        config.ik.*ik_fields[index] = infinity;
+        assert_both_runtime_constructors_reject_without_mutation(config);
+    }
+    {
+        RuntimeConfig config{};
+        config.ik.maximum_iterations = -1;
+        assert_both_runtime_constructors_reject_without_mutation(config);
+    }
+
+    const float position_cap = 0.12F;
+    for (IKMember capped : {
+             &IKConfig::maximum_request_position_m,
+             &IKConfig::maximum_request_orientation_radians}) {
+        RuntimeConfig config{};
+        config.ik.*capped = std::nextafter(
+            capped == &IKConfig::maximum_request_position_m
+                ? position_cap
+                : orientation_cap,
+            infinity);
+        assert_both_runtime_constructors_reject_without_mutation(config);
+    }
+
+    RuntimeConfig cap_config{};
+    cap_config.ik.maximum_request_position_m = position_cap;
+    cap_config.ik.maximum_request_orientation_radians = orientation_cap;
+    assert_both_runtime_constructors_accept(cap_config);
+    RuntimeConfig tighter_config{};
+    tighter_config.ik.maximum_request_position_m = 0.10F;
+    tighter_config.ik.maximum_request_orientation_radians = 0.40F;
+    assert_both_runtime_constructors_accept(tighter_config);
+
+    for (const RuntimeConfig& config : {cap_config, tighter_config}) {
+        RuntimeFixture fixture = make_runtime_fixture();
+        InteractionRuntime runtime(
+            fixture.database,
+            fixture.features,
+            fixture.registry,
+            fixture.surface_registry,
+            fixture.place_library,
+            config);
+        enter_carry_before_first_update(runtime, fixture);
+        const PlaceStagingPreview preview = runtime.preview_place(
+            fixture.surface, fixture.place_affordance_id);
+        assert(preview.accepted);
+        assert(exact(preview.ik, config.ik));
+        assert(preview.ik.maximum_request_position_m ==
+               config.ik.maximum_request_position_m);
+        assert(preview.ik.maximum_request_orientation_radians ==
+               config.ik.maximum_request_orientation_radians);
+    }
+}
+
+void test_runtime_forwards_nondefault_place_config_exactly() {
+    using namespace interaction;
+    RuntimeFixture fixture = make_runtime_fixture();
+    RuntimeConfig config{};
+    config.place.timing.playback_speed = 0.85F;
+    config.place.timing.entry_blend_seconds = 0.20F;
+    config.place.timing.reversed_commit_seconds = 0.40F;
+    config.place.timing.maximum_alignment_seconds = 0.90F;
+    config.place.match.maximum_entry_root_error_m = 0.20F;
+    config.place.match.maximum_entry_yaw_error_radians = 0.30F;
+    config.place.release_position_m = 0.015F;
+    config.place.release_orientation_radians = 0.10F;
+
+    InteractionRuntime runtime(
+        fixture.database,
+        fixture.features,
+        fixture.registry,
+        fixture.surface_registry,
+        fixture.place_library,
+        config);
+    enter_carry_before_first_update(runtime, fixture);
+    const PlaceStagingPreview preview = runtime.preview_place(
+        fixture.surface, fixture.place_affordance_id);
+    assert(preview.accepted && preview.ready);
+    assert(preview.candidate.timing.canonical_fps ==
+           config.place.timing.canonical_fps);
+    assert(preview.candidate.timing.playback_speed ==
+           config.place.timing.playback_speed);
+    assert(preview.candidate.timing.entry_blend_seconds ==
+           config.place.timing.entry_blend_seconds);
+    assert(preview.candidate.timing.reversed_commit_seconds ==
+           config.place.timing.reversed_commit_seconds);
+    assert(preview.candidate.timing.maximum_alignment_seconds ==
+           config.place.timing.maximum_alignment_seconds);
+    assert(preview.candidate.match.maximum_entry_root_error_m ==
+           config.place.match.maximum_entry_root_error_m);
+    assert(preview.candidate.match.maximum_entry_yaw_error_radians ==
+           config.place.match.maximum_entry_yaw_error_radians);
+
+    RuntimeOutput output = enter_place_align(
+        runtime, fixture, place_request_for(runtime, fixture));
+    assert(output.diagnostics.place.preflight_config_identity);
+    assert(exact(output.diagnostics.place.preview.candidate, preview.candidate));
+    const int32_t commit = preview.candidate.commit_frame;
+    double previous_source = output.diagnostics.place.source_frame_exact;
+    int ticks_to_commit = 0;
+    while (output.diagnostics.state == RuntimeState::PlaceAlign) {
+        output = advance(runtime, fixture.locomotion);
+        ++ticks_to_commit;
+        assert(output.diagnostics.place.source_frame_exact >= previous_source);
+        previous_source = output.diagnostics.place.source_frame_exact;
+    }
+    assert(output.diagnostics.state == RuntimeState::PlaceReplay);
+    assert(output.diagnostics.place.source_frame_exact >= commit);
+    assert(ticks_to_commit == static_cast<int>(std::ceil(
+        static_cast<double>(commit - preview.candidate.entry_frame) /
+        config.place.timing.playback_speed)));
+
+    RecordedPlaceClip& clip = fixture.place_library.recorded.front();
+    clip.poses.at(static_cast<size_t>(clip.release_frame))
+        .positions[kRightHandBone].x += 0.016F;
+    RuntimeOutput last_safe = output;
+    for (int update = 0; update < kMaximumUpdates; ++update) {
+        output = advance(runtime, fixture.locomotion);
+        if (output.diagnostics.state == RuntimeState::Carry) break;
+        last_safe = output;
+    }
+    assert(output.diagnostics.state == RuntimeState::Carry);
+    assert(output.diagnostics.result == ResultCode::Failed);
+    assert(output.diagnostics.reason == Reason::ReleasePosition);
+    assert(output.diagnostics.hand_position_error_m >
+           config.place.release_position_m);
+    assert(output.diagnostics.hand_position_error_m < 0.02F);
+    assert(output.diagnostics.attached);
+    assert(exact(output.pose, last_safe.pose));
+    assert(exact(output.object_world, last_safe.object_world));
+    assert_fresh_carry_next_sample(runtime, fixture, output, config);
+}
+
+void test_runtime_ik_identity_binds_every_scalar_and_iteration() {
+    using namespace interaction;
+    const auto preview_for = [](RuntimeConfig config) {
+        RuntimeFixture fixture = make_runtime_fixture();
+        InteractionRuntime runtime(
+            fixture.database,
+            fixture.features,
+            fixture.registry,
+            fixture.surface_registry,
+            fixture.place_library,
+            config);
+        enter_carry_before_first_update(runtime, fixture);
+        const PlaceStagingPreview preview = runtime.preview_place(
+            fixture.surface, fixture.place_affordance_id);
+        assert(preview.accepted && preview.ready);
+        assert(exact(preview.ik, config.ik));
+        assert(preview.ik_config_fingerprint != 0U);
+        return preview;
+    };
+
+    const RuntimeConfig baseline_config{};
+    const PlaceStagingPreview baseline = preview_for(baseline_config);
+    const PlaceStagingPreview duplicate = preview_for(baseline_config);
+    assert(baseline.ik_config_fingerprint ==
+           duplicate.ik_config_fingerprint);
+    assert(baseline.candidate.selection_id ==
+           duplicate.candidate.selection_id);
+
+    using IKMember = float IKConfig::*;
+    const std::array<IKMember, 8> fields = {
+        &IKConfig::maximum_request_position_m,
+        &IKConfig::maximum_request_orientation_radians,
+        &IKConfig::accepted_position_m,
+        &IKConfig::accepted_orientation_radians,
+        &IKConfig::damping,
+        &IKConfig::finite_difference_radians,
+        &IKConfig::orientation_scale_m_per_radian,
+        &IKConfig::maximum_step_radians,
+    };
+    for (size_t index = 0; index < fields.size(); ++index) {
+        RuntimeConfig perturbed = baseline_config;
+        float& scalar = perturbed.ik.*fields[index];
+        scalar = std::nextafter(
+            scalar,
+            index < 2U
+                ? 0.0F
+                : std::numeric_limits<float>::infinity());
+        const PlaceStagingPreview changed = preview_for(perturbed);
+        assert(changed.ik_config_fingerprint !=
+               baseline.ik_config_fingerprint);
+        assert(changed.candidate.selection_id !=
+               baseline.candidate.selection_id);
+    }
+    RuntimeConfig iterated = baseline_config;
+    ++iterated.ik.maximum_iterations;
+    const PlaceStagingPreview iteration_changed = preview_for(iterated);
+    assert(iteration_changed.ik_config_fingerprint !=
+           baseline.ik_config_fingerprint);
+    assert(iteration_changed.candidate.selection_id !=
+           baseline.candidate.selection_id);
+
+    RuntimeFixture fixture_a = make_runtime_fixture();
+    RuntimeFixture fixture_b = make_runtime_fixture();
+    RuntimeConfig config_b{};
+    config_b.ik.damping = std::nextafter(
+        config_b.ik.damping, std::numeric_limits<float>::infinity());
+    InteractionRuntime runtime_a(
+        fixture_a.database,
+        fixture_a.features,
+        fixture_a.registry,
+        fixture_a.surface_registry,
+        fixture_a.place_library,
+        RuntimeConfig{});
+    InteractionRuntime runtime_b(
+        fixture_b.database,
+        fixture_b.features,
+        fixture_b.registry,
+        fixture_b.surface_registry,
+        fixture_b.place_library,
+        config_b);
+    enter_carry_before_first_update(runtime_a, fixture_a);
+    enter_carry_before_first_update(runtime_b, fixture_b);
+    const PlaceStagingPreview preview_a = runtime_a.preview_place(
+        fixture_a.surface, fixture_a.place_affordance_id);
+    const PlaceStagingPreview preview_b = runtime_b.preview_place(
+        fixture_b.surface, fixture_b.place_affordance_id);
+    assert(preview_a.candidate.selection_id !=
+           preview_b.candidate.selection_id);
+    PlaceRequest stale = place_request_for(runtime_b, fixture_b);
+    stale.selection_id = preview_a.candidate.selection_id;
+    assert_preflight_rejection_preserves_carry(
+        runtime_b,
+        fixture_b,
+        place_interact_input(fixture_b.locomotion, stale),
+        Reason::TargetChanged);
+}
+
+void test_place_preflight_rejections_preserve_frozen_carry() {
+    using namespace interaction;
+    const auto make_enabled = [](RuntimeFixture& fixture) {
+        return InteractionRuntime(
+            fixture.database,
+            fixture.features,
+            fixture.registry,
+            fixture.surface_registry,
+            fixture.place_library,
+            RuntimeConfig{});
+    };
+
+    {
+        RuntimeFixture fixture = make_runtime_fixture();
+        InteractionRuntime runtime = make_enabled(fixture);
+        enter_carry_before_first_update(runtime, fixture);
+        assert_preflight_rejection_preserves_carry(
+            runtime,
+            fixture,
+            place_interact_input(fixture.locomotion, std::nullopt),
+            Reason::TargetUnavailable);
+    }
+    {
+        RuntimeFixture fixture = make_runtime_fixture();
+        InteractionRuntime runtime = make_enabled(fixture);
+        enter_carry_before_first_update(runtime, fixture);
+        PlaceRequest wrong = place_request_for(runtime, fixture);
+        ++wrong.held_target.id;
+        assert_preflight_rejection_preserves_carry(
+            runtime,
+            fixture,
+            place_interact_input(fixture.locomotion, wrong),
+            Reason::TargetChanged);
+    }
+    {
+        RuntimeFixture fixture = make_runtime_fixture();
+        InteractionRuntime runtime = make_enabled(fixture);
+        enter_carry_before_first_update(runtime, fixture);
+        PlaceRequest stale = place_request_for(runtime, fixture);
+        ++stale.selection_id;
+        assert_preflight_rejection_preserves_carry(
+            runtime,
+            fixture,
+            place_interact_input(fixture.locomotion, stale),
+            Reason::TargetChanged);
+    }
+    {
+        RuntimeFixture fixture = make_runtime_fixture();
+        InteractionRuntime runtime = make_enabled(fixture);
+        enter_carry_before_first_update(runtime, fixture);
+        PlaceRequest missing_action_id = place_request_for(runtime, fixture);
+        missing_action_id.request_id = 0U;
+        assert_preflight_rejection_preserves_carry(
+            runtime,
+            fixture,
+            place_interact_input(fixture.locomotion, missing_action_id),
+            Reason::TargetUnavailable);
+    }
+    {
+        RuntimeFixture fixture = make_runtime_fixture();
+        fixture.surface = fixture.surface_registry.upsert(
+            runtime_fixture_detail::make_placement_surface(
+                900U, vec3(0.55F, 0.65F, 3.0F)));
+        InteractionRuntime runtime = make_enabled(fixture);
+        enter_carry_before_first_update(runtime, fixture);
+        const PlaceStagingPreview far = runtime.preview_place(
+            fixture.surface, fixture.place_affordance_id);
+        assert(far.accepted);
+        assert(!far.ready);
+        assert(far.root_error_m > 0.25F);
+        PlaceRequest request{};
+        request.held_target = fixture.request.target;
+        request.surface = fixture.surface;
+        request.affordance_id = fixture.place_affordance_id;
+        request.request_id = 1001U;
+        request.selection_id = far.candidate.selection_id;
+        assert_preflight_rejection_preserves_carry(
+            runtime,
+            fixture,
+            place_interact_input(fixture.locomotion, request),
+            Reason::CorrectionLimit);
+    }
+    {
+        RuntimeFixture fixture = make_runtime_fixture();
+        fixture.surface = fixture.surface_registry.upsert(
+            runtime_fixture_detail::make_placement_surface(
+                900U, vec3(0.55F, 0.65F, 3.0F)));
+        InteractionRuntime runtime = make_enabled(fixture);
+        enter_carry_before_first_update(runtime, fixture);
+        const PlaceStagingPreview far_snapshot = runtime.preview_place(
+            fixture.surface, fixture.place_affordance_id);
+        assert(far_snapshot.accepted && !far_snapshot.ready);
+        advance(runtime, fixture.locomotion);
+        const PlaceStagingPreview moved_snapshot = runtime.preview_place(
+            fixture.surface, fixture.place_affordance_id);
+        assert(moved_snapshot.accepted);
+        assert(moved_snapshot.candidate.selection_id !=
+               far_snapshot.candidate.selection_id);
+        PlaceRequest stale_far{};
+        stale_far.held_target = fixture.request.target;
+        stale_far.surface = fixture.surface;
+        stale_far.affordance_id = fixture.place_affordance_id;
+        stale_far.request_id = 1001U;
+        stale_far.selection_id = far_snapshot.candidate.selection_id;
+        assert_preflight_rejection_preserves_carry(
+            runtime,
+            fixture,
+            place_interact_input(fixture.locomotion, stale_far),
+            Reason::TargetChanged);
+    }
+    {
+        RuntimeFixture fixture = make_runtime_fixture();
+        InteractionRuntime runtime(
+            fixture.database,
+            fixture.features,
+            fixture.registry,
+            RuntimeConfig{});
+        enter_carry_before_first_update(runtime, fixture);
+        const RuntimeDiagnostics before = runtime.diagnostics();
+        const InteractionTarget target_before =
+            *fixture.registry.find(fixture.request.target);
+        const PlacementSurface surface_before =
+            *fixture.surface_registry.find(fixture.surface);
+        const PlaceStagingPreview unavailable = runtime.preview_place(
+            fixture.surface, fixture.place_affordance_id);
+        assert(!unavailable.accepted);
+        assert(unavailable.reason == Reason::PackUnavailable);
+        assert(exact(runtime.diagnostics(), before));
+        assert(exact(
+            *fixture.registry.find(fixture.request.target), target_before));
+        assert(exact(
+            *fixture.surface_registry.find(fixture.surface), surface_before));
+        PlaceRequest request{};
+        request.held_target = fixture.request.target;
+        request.surface = fixture.surface;
+        request.affordance_id = fixture.place_affordance_id;
+        request.request_id = 1001U;
+        request.selection_id = 1U;
+        assert_preflight_rejection_preserves_carry(
+            runtime,
+            fixture,
+            place_interact_input(fixture.locomotion, request),
+            Reason::PackUnavailable);
+    }
+    {
+        RuntimeFixture fixture = make_runtime_fixture();
+        InteractionRuntime runtime = make_enabled(fixture);
+        const RuntimeOutput carry = enter_carry_before_first_update(
+            runtime, fixture);
+        const int32_t pickup_clip = carry.diagnostics.clip;
+        assert(pickup_clip >= 0);
+        fixture.place_library.recorded.clear();
+        fixture.database.active_hands.at(
+            static_cast<size_t>(pickup_clip)) = 0U;
+        const PlaceStagingPreview rejected = runtime.preview_place(
+            fixture.surface, fixture.place_affordance_id);
+        assert(!rejected.accepted);
+        assert(rejected.reason == Reason::NoCandidate);
+        PlaceRequest request{};
+        request.held_target = fixture.request.target;
+        request.surface = fixture.surface;
+        request.affordance_id = fixture.place_affordance_id;
+        request.request_id = 1001U;
+        assert_preflight_rejection_preserves_carry(
+            runtime,
+            fixture,
+            place_interact_input(fixture.locomotion, request),
+            Reason::NoCandidate);
+    }
+
+    const auto assert_mutated_snapshot_rejects = [](
+        RuntimeFixture& fixture,
+        InteractionRuntime& runtime,
+        bool mutate_target,
+        bool mutate_library,
+        bool mutate_surface,
+        Reason expected_reason) {
+        InteractionRuntime paused_control = runtime;
+        const PlaceRequest request = place_request_for(runtime, fixture);
+        RuntimeOutput output = runtime.update(place_interact_input(
+            fixture.locomotion, request));
+        assert(output.diagnostics.state == RuntimeState::PlacePreflight);
+        const Pose frozen_pose = output.pose;
+        const Transform frozen_object = output.object_world;
+        if (mutate_target) {
+            InteractionTarget* held = fixture.registry.find(
+                fixture.request.target);
+            assert(held != nullptr);
+            held->object_dimensions.x = std::nextafter(
+                held->object_dimensions.x,
+                std::numeric_limits<float>::infinity());
+        }
+        if (mutate_library) {
+            fixture.place_library.recorded.front()
+                .object_poses.front().position.x += 0.001F;
+        }
+        if (mutate_surface) {
+            PlacementSurface replacement =
+                runtime_fixture_detail::make_placement_surface();
+            replacement.surface_world.position.x += 0.01F;
+            replacement.support_volume_world.position.x += 0.01F;
+            fixture.surface_registry.upsert(replacement);
+        }
+        output = advance(runtime, fixture.locomotion);
+        assert(output.diagnostics.state == RuntimeState::Carry);
+        assert(output.diagnostics.result == ResultCode::Rejected);
+        assert(output.diagnostics.reason == expected_reason);
+        assert(output.diagnostics.attached);
+        assert(exact(output.pose, frozen_pose));
+        assert(exact(output.object_world, frozen_object));
+        assert_held_by_original_owner(fixture);
+        const RuntimeOutput trial_next = advance(runtime, fixture.locomotion);
+        const RuntimeOutput control_next = advance(
+            paused_control, fixture.locomotion);
+        assert(exact(trial_next.pose, control_next.pose));
+        assert(exact(trial_next.object_world, control_next.object_world));
+    };
+    {
+        RuntimeFixture fixture = make_runtime_fixture();
+        InteractionRuntime runtime = make_enabled(fixture);
+        enter_carry_before_first_update(runtime, fixture);
+        assert_mutated_snapshot_rejects(
+            fixture, runtime, true, false, false, Reason::TargetChanged);
+    }
+    {
+        RuntimeFixture fixture = make_runtime_fixture();
+        InteractionRuntime runtime = make_enabled(fixture);
+        enter_carry_before_first_update(runtime, fixture);
+        assert_mutated_snapshot_rejects(
+            fixture, runtime, false, true, false, Reason::TargetChanged);
+    }
+    {
+        RuntimeFixture fixture = make_runtime_fixture();
+        InteractionRuntime runtime = make_enabled(fixture);
+        enter_carry_before_first_update(runtime, fixture);
+        assert_mutated_snapshot_rejects(
+            fixture, runtime, false, false, true, Reason::SurfaceChanged);
+    }
+}
+
+void test_post_begin_place_failures_reconstruct_fresh_carry() {
+    using namespace interaction;
+    {
+        RuntimeFixture fixture = make_runtime_fixture();
+        InteractionRuntime runtime(
+            fixture.database,
+            fixture.features,
+            fixture.registry,
+            fixture.surface_registry,
+            fixture.place_library,
+            RuntimeConfig{});
+        enter_carry_before_first_update(runtime, fixture);
+        RuntimeOutput output = enter_ready_place_align(runtime, fixture);
+        for (int update = 0; update < 4; ++update) {
+            output = advance(runtime, fixture.locomotion);
+            assert(output.diagnostics.state == RuntimeState::PlaceAlign);
+        }
+        InteractionRuntime uncancelled = runtime;
+        output = runtime.update(cancel_input(fixture.locomotion));
+        const RuntimeOutput corresponding = advance(
+            uncancelled, fixture.locomotion);
+        assert(output.diagnostics.state == RuntimeState::Carry);
+        assert(output.diagnostics.result == ResultCode::Cancelled);
+        assert(output.diagnostics.reason == Reason::Cancelled);
+        assert(output.diagnostics.attached);
+        assert(exact(output.pose, corresponding.pose));
+        assert(exact(output.object_world, corresponding.object_world));
+        assert_fresh_carry_next_sample(runtime, fixture, output);
+    }
+    {
+        RuntimeFixture fixture = make_runtime_fixture();
+        InteractionRuntime runtime(
+            fixture.database,
+            fixture.features,
+            fixture.registry,
+            fixture.surface_registry,
+            fixture.place_library,
+            RuntimeConfig{});
+        enter_carry_before_first_update(runtime, fixture);
+        RuntimeOutput output = enter_ready_place_align(runtime, fixture);
+        while (output.diagnostics.state == RuntimeState::PlaceAlign) {
+            output = advance(runtime, fixture.locomotion);
+        }
+        assert(output.diagnostics.state == RuntimeState::PlaceReplay);
+        assert(output.diagnostics.place.committed);
+        fixture.place_library.recorded.front()
+            .poses.at(static_cast<size_t>(
+                fixture.place_library.recorded.front().release_frame))
+            .positions[kRightHandBone].x += 0.021F;
+        RuntimeOutput last_safe = output;
+        for (int update = 0; update < kMaximumUpdates; ++update) {
+            output = advance(runtime, fixture.locomotion);
+            if (output.diagnostics.state == RuntimeState::Carry) break;
+            last_safe = output;
+        }
+        assert(output.diagnostics.state == RuntimeState::Carry);
+        assert(output.diagnostics.result == ResultCode::Failed);
+        assert(output.diagnostics.reason == Reason::ReleasePosition);
+        assert(output.diagnostics.hand_position_error_m > 0.02F);
+        assert(output.diagnostics.attached);
+        assert(output.diagnostics.object_state == ObjectState::Held);
+        assert(exact(output.pose, last_safe.pose));
+        assert(exact(output.object_world, last_safe.object_world));
+        assert_held_by_original_owner(fixture);
+        assert_fresh_carry_next_sample(runtime, fixture, output);
+    }
+    {
+        RuntimeFixture trial_fixture = make_runtime_fixture();
+        RuntimeFixture control_fixture = make_runtime_fixture();
+        InteractionRuntime trial(
+            trial_fixture.database,
+            trial_fixture.features,
+            trial_fixture.registry,
+            trial_fixture.surface_registry,
+            trial_fixture.place_library,
+            RuntimeConfig{});
+        InteractionRuntime control(
+            control_fixture.database,
+            control_fixture.features,
+            control_fixture.registry,
+            control_fixture.surface_registry,
+            control_fixture.place_library,
+            RuntimeConfig{});
+        enter_carry_before_first_update(trial, trial_fixture);
+        enter_carry_before_first_update(control, control_fixture);
+        RuntimeOutput trial_output = enter_ready_place_align(
+            trial, trial_fixture);
+        RuntimeOutput control_output = enter_ready_place_align(
+            control, control_fixture);
+        assert(exact(trial_output, control_output));
+
+        PlacementSurface replacement =
+            runtime_fixture_detail::make_placement_surface();
+        replacement.surface_world.position.x += 0.01F;
+        replacement.support_volume_world.position.x += 0.01F;
+        const SurfaceHandle replacement_handle =
+            trial_fixture.surface_registry.upsert(replacement);
+        assert(replacement_handle.generation ==
+               trial_fixture.surface.generation + 1U);
+        const InteractionTarget held_before =
+            *trial_fixture.registry.find(trial_fixture.request.target);
+        for (int update = 0; update < kMaximumUpdates; ++update) {
+            trial_output = advance(trial, trial_fixture.locomotion);
+            control_output = advance(control, control_fixture.locomotion);
+            if (trial_output.diagnostics.state == RuntimeState::Carry) break;
+            assert(exact(trial_output.pose, control_output.pose));
+            assert(exact(trial_output.object_world, control_output.object_world));
+        }
+        assert(trial_output.diagnostics.state == RuntimeState::Carry);
+        assert(trial_output.diagnostics.result == ResultCode::Failed);
+        assert(trial_output.diagnostics.reason == Reason::SurfaceChanged);
+        assert(trial_output.diagnostics.attached);
+        assert(control_output.diagnostics.state == RuntimeState::PlaceRelease);
+        assert(exact(trial_output.pose, control_output.pose));
+        assert(exact(trial_output.object_world, control_output.object_world));
+        assert(exact(
+            *trial_fixture.registry.find(trial_fixture.request.target),
+            held_before));
+        assert_fresh_carry_next_sample(
+            trial, trial_fixture, trial_output);
+    }
+    {
+        RuntimeFixture fixture = make_runtime_fixture();
+        fixture.registry = TargetRegistry{};
+        InteractionTarget target = runtime_fixture_detail::make_target();
+        target.handle.generation = std::numeric_limits<uint32_t>::max();
+        const TargetHandle maximum = fixture.registry.upsert(target);
+        assert(maximum.generation == std::numeric_limits<uint32_t>::max());
+        fixture.request = {
+            maximum,
+            runtime_fixture_detail::kAffordanceId,
+            runtime_fixture_detail::kRequestId,
+        };
+        InteractionRuntime runtime(
+            fixture.database,
+            fixture.features,
+            fixture.registry,
+            fixture.surface_registry,
+            fixture.place_library,
+            RuntimeConfig{});
+        enter_carry_before_first_update(runtime, fixture);
+        RuntimeOutput output = enter_ready_place_align(runtime, fixture);
+        const InteractionTarget held_before =
+            *fixture.registry.find(fixture.request.target);
+        for (int update = 0; update < kMaximumUpdates; ++update) {
+            output = advance(runtime, fixture.locomotion);
+            if (output.diagnostics.state == RuntimeState::Carry) break;
+        }
+        assert(output.diagnostics.state == RuntimeState::Carry);
+        assert(output.diagnostics.result == ResultCode::Failed);
+        assert(output.diagnostics.reason == Reason::TargetChanged);
+        assert(output.diagnostics.attached);
+        assert(output.diagnostics.target == maximum);
+        assert(exact(
+            *fixture.registry.find(fixture.request.target), held_before));
+        assert(exact(
+            fixture.registry.find(fixture.request.target)->table_world,
+            held_before.table_world));
+        assert(exact(
+            fixture.registry.find(fixture.request.target)->table_size,
+            held_before.table_size));
+        assert_fresh_carry_next_sample(runtime, fixture, output);
+    }
+}
+
+void test_place_cancellation_boundaries_for_recorded_and_reverse() {
+    using namespace interaction;
+    for (bool reverse : {false, true}) {
+        for (int relative_to_commit : {-1, 0, 1}) {
+            RuntimeFixture trial_fixture = reverse
+                ? reverse_place_runtime_fixture()
+                : make_runtime_fixture();
+            RuntimeFixture control_fixture = reverse
+                ? reverse_place_runtime_fixture()
+                : make_runtime_fixture();
+            RuntimeConfig runtime_config{};
+            if (reverse) {
+                runtime_config.ik.accepted_position_m =
+                    runtime_config.ik.maximum_request_position_m;
+                runtime_config.ik.accepted_orientation_radians =
+                    runtime_config.ik.maximum_request_orientation_radians;
+            }
+            InteractionRuntime trial(
+                trial_fixture.database,
+                trial_fixture.features,
+                trial_fixture.registry,
+                trial_fixture.surface_registry,
+                trial_fixture.place_library,
+                runtime_config);
+            InteractionRuntime control(
+                control_fixture.database,
+                control_fixture.features,
+                control_fixture.registry,
+                control_fixture.surface_registry,
+                control_fixture.place_library,
+                runtime_config);
+            enter_carry_before_first_update(trial, trial_fixture);
+            enter_carry_before_first_update(control, control_fixture);
+            const PlaceStagingPreview preview = trial.preview_place(
+                trial_fixture.surface,
+                trial_fixture.place_affordance_id);
+            assert(preview.accepted && preview.ready);
+            assert(preview.candidate.mode ==
+                   (reverse
+                        ? PlaceMotionMode::ReversedPickup
+                        : PlaceMotionMode::RecordedPlace));
+            assert(preview.candidate.direction == (reverse ? -1 : 1));
+            RuntimeOutput trial_output = enter_ready_place_align(
+                trial, trial_fixture);
+            RuntimeOutput control_output = enter_ready_place_align(
+                control, control_fixture);
+            assert(exact(trial_output, control_output));
+
+            const int32_t direction = preview.candidate.direction;
+            const double target_source =
+                preview.candidate.commit_frame +
+                relative_to_commit * direction;
+            const double source_before_cancel = target_source - direction;
+            for (int update = 0; update < kMaximumUpdates; ++update) {
+                if (trial_output.diagnostics.place.source_frame_exact ==
+                    source_before_cancel) {
+                    break;
+                }
+                if (direction > 0) {
+                    assert(
+                        trial_output.diagnostics.place.source_frame_exact <
+                        source_before_cancel);
+                } else {
+                    assert(
+                        trial_output.diagnostics.place.source_frame_exact >
+                        source_before_cancel);
+                }
+                trial_output = advance(trial, trial_fixture.locomotion);
+                control_output = advance(control, control_fixture.locomotion);
+                assert(exact(trial_output, control_output));
+            }
+            assert(trial_output.diagnostics.place.source_frame_exact ==
+                   source_before_cancel);
+
+            trial_output = trial.update(cancel_input(
+                trial_fixture.locomotion));
+            control_output = advance(control, control_fixture.locomotion);
+            assert(control_output.diagnostics.place.source_frame_exact ==
+                   target_source);
+            if (relative_to_commit < 0) {
+                assert(trial_output.diagnostics.state == RuntimeState::Carry);
+                assert(trial_output.diagnostics.result ==
+                       ResultCode::Cancelled);
+                assert(trial_output.diagnostics.reason == Reason::Cancelled);
+                assert(trial_output.diagnostics.attached);
+                assert(control_output.diagnostics.state ==
+                       RuntimeState::PlaceAlign);
+                assert(exact(trial_output.pose, control_output.pose));
+                assert(exact(
+                    trial_output.object_world,
+                    control_output.object_world));
+                assert_fresh_carry_next_sample(
+                    trial, trial_fixture, trial_output, runtime_config);
+            } else {
+                assert(exact(trial_output, control_output));
+                assert(trial_output.diagnostics.state ==
+                       RuntimeState::PlaceReplay);
+                assert(trial_output.diagnostics.attached);
+                assert(trial_output.diagnostics.object_state ==
+                       ObjectState::Held);
+                assert(trial_output.diagnostics.place.committed);
+                assert(trial_output.diagnostics.reason == Reason::None);
+            }
+        }
+    }
+}
+
+void test_reset_and_duplicate_edges_are_ignored_in_every_place_state() {
+    using namespace interaction;
+    for (bool reset : {false, true}) {
+        RuntimeFixture trial_fixture = make_runtime_fixture();
+        RuntimeFixture control_fixture = make_runtime_fixture();
+        InteractionRuntime trial(
+            trial_fixture.database,
+            trial_fixture.features,
+            trial_fixture.registry,
+            trial_fixture.surface_registry,
+            trial_fixture.place_library,
+            RuntimeConfig{});
+        InteractionRuntime control(
+            control_fixture.database,
+            control_fixture.features,
+            control_fixture.registry,
+            control_fixture.surface_registry,
+            control_fixture.place_library,
+            RuntimeConfig{});
+        enter_carry_before_first_update(trial, trial_fixture);
+        enter_carry_before_first_update(control, control_fixture);
+        const PlaceRequest request = place_request_for(
+            trial, trial_fixture, reset ? 2001U : 2002U);
+        RuntimeOutput trial_output = trial.update(place_interact_input(
+            trial_fixture.locomotion, request));
+        RuntimeOutput control_output = control.update(place_interact_input(
+            control_fixture.locomotion, request));
+        assert(exact(trial_output, control_output));
+        assert(trial_output.diagnostics.state ==
+               RuntimeState::PlacePreflight);
+
+        uint32_t observed_states = 0U;
+        for (int update = 0; update < kMaximumUpdates; ++update) {
+            switch (trial_output.diagnostics.state) {
+                case RuntimeState::PlacePreflight:
+                    observed_states |= 1U << 0U;
+                    break;
+                case RuntimeState::PlaceAlign:
+                    observed_states |= 1U << 1U;
+                    break;
+                case RuntimeState::PlaceReplay:
+                    observed_states |= 1U << 2U;
+                    break;
+                case RuntimeState::PlaceRelease:
+                    observed_states |= 1U << 3U;
+                    break;
+                case RuntimeState::Locomotion:
+                    break;
+                default:
+                    assert(false && "unexpected state in place equivalence");
+            }
+            if (trial_output.diagnostics.state == RuntimeState::Locomotion) {
+                break;
+            }
+
+            RuntimeInput trial_input = idle_input(trial_fixture.locomotion);
+            if (reset) {
+                trial_input.reset_pressed = true;
+            } else {
+                trial_input.interact_pressed = true;
+                trial_input.place_request = request;
+            }
+            trial_output = trial.update(trial_input);
+            control_output = advance(control, control_fixture.locomotion);
+            assert(exact(trial_output, control_output));
+        }
+        assert(observed_states == 0x0FU);
+        assert(trial_output.diagnostics.state == RuntimeState::Locomotion);
+        assert(trial_output.diagnostics.result == ResultCode::Succeeded);
+        assert(trial_output.diagnostics.reason == Reason::None);
+    }
+}
+
+void test_recorded_and_reverse_place_diagnostics_are_deterministic() {
+    using namespace interaction;
+    for (bool reverse : {false, true}) {
+        RuntimeFixture first_fixture = reverse
+            ? reverse_place_runtime_fixture()
+            : make_runtime_fixture();
+        RuntimeFixture second_fixture = reverse
+            ? reverse_place_runtime_fixture()
+            : make_runtime_fixture();
+        RuntimeConfig config{};
+        if (reverse) {
+            config.ik.accepted_position_m =
+                config.ik.maximum_request_position_m;
+            config.ik.accepted_orientation_radians =
+                config.ik.maximum_request_orientation_radians;
+        }
+        InteractionRuntime first(
+            first_fixture.database,
+            first_fixture.features,
+            first_fixture.registry,
+            first_fixture.surface_registry,
+            first_fixture.place_library,
+            config);
+        InteractionRuntime second(
+            second_fixture.database,
+            second_fixture.features,
+            second_fixture.registry,
+            second_fixture.surface_registry,
+            second_fixture.place_library,
+            config);
+        enter_carry_before_first_update(first, first_fixture);
+        enter_carry_before_first_update(second, second_fixture);
+        const PlaceStagingPreview preview = first.preview_place(
+            first_fixture.surface, first_fixture.place_affordance_id);
+        const PlaceStagingPreview duplicate = second.preview_place(
+            second_fixture.surface, second_fixture.place_affordance_id);
+        assert(preview.accepted && preview.ready);
+        assert(exact(preview, duplicate));
+        const PlaceMotionMode expected_mode = reverse
+            ? PlaceMotionMode::ReversedPickup
+            : PlaceMotionMode::RecordedPlace;
+        assert(preview.candidate.mode == expected_mode);
+
+        const PlaceRequest request = place_request_for(first, first_fixture);
+        RuntimeOutput first_output = first.update(place_interact_input(
+            first_fixture.locomotion, request));
+        RuntimeOutput second_output = second.update(place_interact_input(
+            second_fixture.locomotion, request));
+        assert(exact(first_output, second_output));
+        double previous_source =
+            first_output.diagnostics.place.source_frame_exact;
+        bool have_source = false;
+        bool saw_align = false;
+        bool saw_replay = false;
+        bool saw_release = false;
+        int stop_sample_count = 0;
+        for (int update = 0; update < kMaximumUpdates; ++update) {
+            const RuntimeState state = first_output.diagnostics.state;
+            if (state == RuntimeState::Locomotion) break;
+            assert(state == RuntimeState::PlacePreflight ||
+                   state == RuntimeState::PlaceAlign ||
+                   state == RuntimeState::PlaceReplay ||
+                   state == RuntimeState::PlaceRelease);
+            assert(first_output.owns_pose);
+            assert(first_output.suppress_steering);
+            assert(first_output.diagnostics.place.mode == expected_mode);
+            assert(first_output.diagnostics.place.selection_id ==
+                   preview.candidate.selection_id);
+            assert(first_output.diagnostics.place.ik_config_fingerprint ==
+                   preview.ik_config_fingerprint);
+            assert(exact(
+                first_output.diagnostics.place.effective_ik,
+                config.ik));
+            assert(first_output.diagnostics.place.candidate_certified);
+            if (state != RuntimeState::PlacePreflight) {
+                assert(first_output.diagnostics.place.preflight_config_identity);
+            }
+            for (float correction : {
+                     first_output.diagnostics.place
+                         .requested_root_correction_m,
+                     first_output.diagnostics.place.applied_root_correction_m,
+                     first_output.diagnostics.place
+                         .requested_yaw_correction_radians,
+                     first_output.diagnostics.place
+                         .applied_yaw_correction_radians,
+                     first_output.diagnostics.place
+                         .requested_hand_correction_m,
+                     first_output.diagnostics.place.applied_hand_correction_m,
+                     first_output.diagnostics.place
+                         .requested_hand_orientation_radians,
+                     first_output.diagnostics.place
+                         .applied_hand_orientation_radians}) {
+                assert(std::isfinite(correction));
+                assert(correction >= 0.0F);
+            }
+            if (state == RuntimeState::PlaceAlign ||
+                state == RuntimeState::PlaceReplay ||
+                state == RuntimeState::PlaceRelease) {
+                const double source =
+                    first_output.diagnostics.place.source_frame_exact;
+                assert(std::isfinite(source));
+                if (have_source) {
+                    if (preview.candidate.direction > 0) {
+                        assert(source >= previous_source);
+                    } else {
+                        assert(source <= previous_source);
+                    }
+                }
+                previous_source = source;
+                have_source = true;
+                if (source == preview.candidate.stop_frame) {
+                    ++stop_sample_count;
+                }
+            }
+            saw_align = saw_align || state == RuntimeState::PlaceAlign;
+            saw_replay = saw_replay || state == RuntimeState::PlaceReplay;
+            saw_release = saw_release || state == RuntimeState::PlaceRelease;
+            if (state == RuntimeState::PlaceRelease) {
+                assert(first_output.diagnostics.place.released);
+                assert(!first_output.diagnostics.attached);
+                assert(first_output.diagnostics.place
+                           .requested_root_correction_m == 0.0F);
+                assert(first_output.diagnostics.place
+                           .applied_root_correction_m == 0.0F);
+                assert(first_output.diagnostics.place
+                           .requested_yaw_correction_radians == 0.0F);
+                assert(first_output.diagnostics.place
+                           .applied_yaw_correction_radians == 0.0F);
+                assert(first_output.diagnostics.place
+                           .requested_hand_correction_m == 0.0F);
+                assert(first_output.diagnostics.place
+                           .applied_hand_correction_m == 0.0F);
+                assert(first_output.diagnostics.place
+                           .requested_hand_orientation_radians == 0.0F);
+                assert(first_output.diagnostics.place
+                           .applied_hand_orientation_radians == 0.0F);
+            }
+            first_output = advance(first, first_fixture.locomotion);
+            second_output = advance(second, second_fixture.locomotion);
+            assert(exact(first_output, second_output));
+        }
+        assert(first_output.diagnostics.state == RuntimeState::Locomotion);
+        assert(first_output.diagnostics.result == ResultCode::Succeeded);
+        assert(first_output.diagnostics.reason == Reason::None);
+        assert(saw_align && saw_replay && saw_release);
+        assert(stop_sample_count == 1);
+    }
 }
 
 void test_disabled_is_permanent_pose_passthrough() {
@@ -1848,6 +3513,15 @@ void test_post_attach_target_change_never_clobbers_a_newer_generation() {
 
 int main() {
     test_frozen_public_contract_and_defaults();
+    test_place_preview_and_collapsed_success_lifecycle();
+    test_runtime_validates_complete_place_and_ik_configuration();
+    test_runtime_forwards_nondefault_place_config_exactly();
+    test_runtime_ik_identity_binds_every_scalar_and_iteration();
+    test_place_preflight_rejections_preserve_frozen_carry();
+    test_post_begin_place_failures_reconstruct_fresh_carry();
+    test_place_cancellation_boundaries_for_recorded_and_reverse();
+    test_reset_and_duplicate_edges_are_ignored_in_every_place_state();
+    test_recorded_and_reverse_place_diagnostics_are_deterministic();
     test_disabled_is_permanent_pose_passthrough();
     test_enabled_runtime_rejects_noncanonical_dt_before_mutation();
     test_noncanonical_dt_cannot_mutate_owned_runtime_state();

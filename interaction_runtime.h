@@ -2,6 +2,7 @@
 
 #include "interaction_attachment.h"
 #include "interaction_carry.h"
+#include "interaction_place_controller.h"
 #include "interaction_playback.h"
 
 #include <array>
@@ -18,6 +19,10 @@ enum class RuntimeState : uint8_t {
     PickupReplay,
     Hold,
     Carry,
+    PlacePreflight,
+    PlaceAlign,
+    PlaceReplay,
+    PlaceRelease,
 };
 
 struct PlaybackConfig {
@@ -36,6 +41,7 @@ struct RuntimeConfig {
     IKConfig ik{};
     AttachmentConfig attachment{};
     CarryConfig carry{};
+    PlaceControllerConfig place{};
 };
 
 struct RuntimeInput {
@@ -43,8 +49,46 @@ struct RuntimeInput {
     LocomotionSnapshot locomotion{};
     bool interact_pressed = false;
     std::optional<PickRequest> pick_request{};
+    std::optional<PlaceRequest> place_request{};
     bool cancel_pressed = false;
     bool reset_pressed = false;
+};
+
+struct RuntimePlaceDiagnostics {
+    SurfaceHandle surface{};
+    uint32_t affordance_id = 0U;
+    PlaceMotionMode mode = PlaceMotionMode::None;
+    uint64_t selection_id = 0U;
+    bool preview_available = false;
+    PlaceStagingPreview preview{};
+    bool candidate_certified = false;
+    bool preflight_config_identity = false;
+    IKConfig effective_ik{};
+    uint64_t ik_config_fingerprint = 0U;
+    Transform requested_goal_world{};
+    PlacementFit requested_fit{};
+    PlacementFit actual_fit{};
+    int32_t clip = -1;
+    int32_t source_frame = -1;
+    double source_frame_exact = -1.0;
+    int32_t commit_frame = -1;
+    PlacePhase phase = PlacePhase::Align;
+    float time_to_release_seconds = 0.0F;
+    bool committed = false;
+    bool release_due = false;
+    bool released = false;
+    bool support_sweep_clear = false;
+    float support_position_error_m = 0.0F;
+    float support_orientation_error_radians = 0.0F;
+    float requested_root_correction_m = 0.0F;
+    float applied_root_correction_m = 0.0F;
+    float requested_yaw_correction_radians = 0.0F;
+    float applied_yaw_correction_radians = 0.0F;
+    float requested_hand_correction_m = 0.0F;
+    float applied_hand_correction_m = 0.0F;
+    float requested_hand_orientation_radians = 0.0F;
+    float applied_hand_orientation_radians = 0.0F;
+    Reason reason = Reason::None;
 };
 
 struct RuntimeDiagnostics {
@@ -73,6 +117,7 @@ struct RuntimeDiagnostics {
     bool inactive_arm_targets_locomotion = false;
     bool inactive_arm_tracks_locomotion = false;
     bool pack_available = false;
+    RuntimePlaceDiagnostics place{};
 };
 
 struct RuntimeOutput {
@@ -90,19 +135,47 @@ public:
         const Features& features,
         TargetRegistry& registry,
         RuntimeConfig config);
+    InteractionRuntime(
+        const Database& database,
+        const Features& features,
+        TargetRegistry& registry,
+        PlacementSurfaceRegistry& surface_registry,
+        const PlaceMotionLibrary& place_library,
+        RuntimeConfig config);
     static InteractionRuntime disabled(Reason reason);
     RuntimeState state() const;
     const RuntimeDiagnostics& diagnostics() const;
+    PlaceStagingPreview preview_place(
+        SurfaceHandle surface,
+        uint32_t affordance_id) const;
     RuntimeOutput update(const RuntimeInput& input);
 
 private:
+    struct PlaceMatchBuildResult {
+        bool accepted = false;
+        Reason reason = Reason::None;
+        PlaceMatchInput input{};
+    };
+
     InteractionRuntime() = default;
     void drain_playback_events(float published_elapsed_seconds);
     void begin_carry();
+    PlaceMatchBuildResult make_place_match_input(
+        SurfaceHandle surface,
+        uint32_t affordance_id) const;
+    void reconstruct_carry(
+        const Pose& pose,
+        Transform object_world,
+        Reason reason,
+        ResultCode result);
+    void reset_place_attempt();
+    void update_place_diagnostics(const PlaceStep& step);
 
     const Database* database_ = nullptr;
     const Features* features_ = nullptr;
     TargetRegistry* registry_ = nullptr;
+    PlacementSurfaceRegistry* surface_registry_ = nullptr;
+    const PlaceMotionLibrary* place_library_ = nullptr;
     RuntimeConfig config_{};
     std::optional<PickRequest> request_{};
     std::optional<InteractionTarget> target_{};
@@ -112,6 +185,12 @@ private:
     std::optional<SequentialPlayer> event_player_{};
     std::optional<AttachmentController> attachment_{};
     std::optional<CarryController> carry_{};
+    std::optional<PlaceController> place_controller_{};
+    std::optional<PlaceRequest> place_request_{};
+    std::optional<PlaceMatchInput> frozen_place_input_{};
+    std::optional<PlaceMatchInput> active_place_input_{};
+    PlaceStagingPreview frozen_place_preview_{};
+    PlaceStep place_step_{};
     Pose entry_blend_source_{};
     Pose pose_{};
     Transform target_hand_world_{};
@@ -130,6 +209,7 @@ private:
     bool final_failure_frame_presented_ = false;
     bool carry_ready_ = false;
     bool carry_started_ = false;
+    bool place_final_frame_presented_ = false;
     Reason post_commit_reason_ = Reason::None;
     RuntimeState state_ = RuntimeState::Locomotion;
     RuntimeDiagnostics diagnostics_{};
