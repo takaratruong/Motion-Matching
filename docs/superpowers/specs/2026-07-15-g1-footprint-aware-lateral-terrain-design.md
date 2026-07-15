@@ -130,9 +130,10 @@ heading toward the velocity. Current contact points remain authoritative for
 planting; predicted points are lookahead observations only.
 
 The corridor construction is continuous in travel direction and has no
-forward/lateral mode switch. A forward, backward, diagonal, or lateral command
-with the same world-space path therefore observes the same terrain footprint;
-only the named-foot phase and independent desired heading differ.
+forward/lateral mode switch. Forward, backward, diagonal, and lateral commands
+therefore use the same observation algorithm. The physical footprint is still
+rotated by the independently commanded heading, as it must be for an elongated
+foot; terrain code never rotates that heading toward travel.
 
 The observation explicitly records a root/foot surface split. A split cannot be
 silently collapsed into four zero centerline features.
