@@ -160,19 +160,19 @@ vec3 gamepad_get_stick(int stick, const float deadzone = 0.2f)
 #endif
 #ifdef MM_DISCRETE
     // discrete-keyboard test mode. Scripted phases mimic a user mashing keys:
-    //   frames   0-119 : hold W (forward, -Z)
-    //   frames 120-179 : hold S (backward, +Z)   <- 180 deg move reversal
-    //   frames 180-239 : hold A (strafe-left, -X)
-    //   frames 240-299 : hold D (strafe-right, +X)
-    //   frames 300-399 : hold W again (forward)
+    //   frames   0-49  : hold W (forward, -Z)
+    //   frames  50-74  : hold S (backward, +Z)   <- 180 deg move reversal
+    //   frames  75-99  : hold A (strafe-left, -X)
+    //   frames 100-124 : hold D (strafe-right, +X)
+    //   frames 125-166 : hold W again (forward)
     // Heading is ALSO snapped via camera_azimuth in the main loop.
     if (stick == GAMEPAD_STICK_LEFT)
     {
         int f = g_frame;
-        if      (f < 120) return vec3( 0.0f, 0.0f, -0.9f); // W forward
-        else if (f < 180) return vec3( 0.0f, 0.0f, +0.9f); // S backward (180 flip)
-        else if (f < 240) return vec3(-0.9f, 0.0f,  0.0f); // A left
-        else if (f < 300) return vec3(+0.9f, 0.0f,  0.0f); // D right
+        if      (f < 50)  return vec3( 0.0f, 0.0f, -0.9f); // W forward
+        else if (f < 75)  return vec3( 0.0f, 0.0f, +0.9f); // S backward (180 flip)
+        else if (f < 100) return vec3(-0.9f, 0.0f,  0.0f); // A left
+        else if (f < 125) return vec3(+0.9f, 0.0f,  0.0f); // D right
         else              return vec3( 0.0f, 0.0f, -0.9f); // W forward
     }
     else

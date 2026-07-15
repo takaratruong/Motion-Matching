@@ -2516,6 +2516,13 @@ void test_controller_and_make_clock_policy() {
                 std::string::npos &&
             controller.find("&lmm_enabled") == std::string::npos,
         "the unretimed learned matcher can still be enabled at runtime");
+    require(
+        controller.find("if      (f < 50)") != std::string::npos &&
+            controller.find("else if (f < 75)") != std::string::npos &&
+            controller.find("else if (f < 100)") != std::string::npos &&
+            controller.find("else if (f < 125)") != std::string::npos &&
+            controller.find("g_frame >= 167") != std::string::npos,
+        "MM_DISCRETE input phases do not preserve their 25 Hz durations");
 
     const std::string database = read_text("database.h");
     require(
