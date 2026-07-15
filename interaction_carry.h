@@ -15,7 +15,7 @@ struct CarryConfig {
     float minimum_average_speed_mps = 0.20F;
     float search_interval_seconds = 0.10F;
     float spine_weight = 0.25F;
-    float inactive_arm_weight = 0.35F;
+    float inactive_arm_weight = 0.0F;
 };
 
 struct CarryRange {

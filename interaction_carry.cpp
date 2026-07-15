@@ -1275,15 +1275,17 @@ Pose CarryController::update(
                     final_hold_pose_.rotations[static_cast<size_t>(bone)],
                     config_.spine_weight);
         }
-        const Hand inactive = hand_ == Hand::Left
-            ? Hand::Right
-            : Hand::Left;
-        for (const HingeJoint& joint : arm(inactive)) {
-            const size_t bone = static_cast<size_t>(joint.bone);
-            output.rotations[bone] = quat_nlerp_shortest(
-                locomotion.pose.rotations[bone],
-                final_hold_pose_.rotations[bone],
-                config_.inactive_arm_weight);
+        if (config_.inactive_arm_weight > 0.0F) {
+            const Hand inactive = hand_ == Hand::Left
+                ? Hand::Right
+                : Hand::Left;
+            for (const HingeJoint& joint : arm(inactive)) {
+                const size_t bone = static_cast<size_t>(joint.bone);
+                output.rotations[bone] = quat_nlerp_shortest(
+                    locomotion.pose.rotations[bone],
+                    final_hold_pose_.rotations[bone],
+                    config_.inactive_arm_weight);
+            }
         }
 
         const auto accept_layered = [&](Pose requested) {
@@ -1420,6 +1422,22 @@ Pose CarryController::update(
                 hand_,
                 preserve_active_arm,
                 trial_progress);
+            if (candidate.seam_key == kLayeredSeamKey &&
+                config_.inactive_arm_weight == 0.0F &&
+                trial_progress >= 1.0F) {
+                const Hand inactive = hand_ == Hand::Left
+                    ? Hand::Right
+                    : Hand::Left;
+                for (const HingeJoint& joint : arm(inactive)) {
+                    const size_t bone = static_cast<size_t>(joint.bone);
+                    transition.positions[bone] = candidate.pose.positions[bone];
+                    transition.velocities[bone] =
+                        candidate.pose.velocities[bone];
+                    transition.rotations[bone] = candidate.pose.rotations[bone];
+                    transition.angular_velocities[bone] =
+                        candidate.pose.angular_velocities[bone];
+                }
+            }
             const IKResult transition_result = solve_hand_ik(
                 transition,
                 hand_,

@@ -401,7 +401,7 @@ void test_frozen_public_interface_and_defaults() {
     assert(near(config.minimum_average_speed_mps, 0.20F));
     assert(near(config.search_interval_seconds, 0.10F));
     assert(near(config.spine_weight, 0.25F));
-    assert(near(config.inactive_arm_weight, 0.35F));
+    assert(near(config.inactive_arm_weight, 0.0F));
 
     const CarryRange range{};
     assert(range.clip == -1);
@@ -630,6 +630,149 @@ void test_fallback_preserves_locomotion_and_grasp() {
         output, Hand::Right, affordance, fallback.object_world()) <= 0.04F);
 }
 
+void test_default_layered_carry_releases_inactive_arm_after_hold_seam() {
+    using namespace interaction;
+    const RuntimeFixture fixture = make_runtime_fixture();
+    const GraspAffordance affordance = fixture_affordance(fixture);
+    const Pose hold = final_hold_pose(fixture);
+    const Transform initial_object = object_world_from_hold_pose(
+        hold, Hand::Right, affordance);
+    LocomotionSnapshot locomotion = fixture.locomotion;
+    locomotion.pose = hold;
+
+    for (int32_t bone = g1_skeleton::LeftShoulderPitch;
+         bone <= g1_skeleton::LeftWrist;
+         ++bone) {
+        const size_t index = static_cast<size_t>(bone);
+        locomotion.pose.rotations[index] = quat_mul(
+            hold.rotations[index],
+            quat_from_angle_axis(0.75F, vec3(0.0F, 0.0F, 1.0F)));
+        locomotion.pose.velocities[index] =
+            vec3(0.01F * bone, -0.02F * bone, 0.03F * bone);
+        locomotion.pose.angular_velocities[index] =
+            vec3(-0.03F * bone, 0.02F * bone, -0.01F * bone);
+    }
+
+    CarryController controller(
+        fixture.database, fixture.features, no_recorded_ranges());
+    controller.start(hold, Hand::Right, affordance, initial_object);
+
+    Pose previous = controller.update(locomotion, 0.0F);
+    Transform previous_object = controller.object_world();
+    for (int32_t bone = g1_skeleton::LeftShoulderPitch;
+         bone <= g1_skeleton::LeftWrist;
+         ++bone) {
+        const size_t index = static_cast<size_t>(bone);
+        assert(near(previous.rotations[index], hold.rotations[index], 2.0e-4F));
+        assert(near(
+            previous.velocities[index], hold.velocities[index], 2.0e-5F));
+        assert(near(
+            previous.angular_velocities[index],
+            hold.angular_velocities[index],
+            2.0e-5F));
+    }
+    assert(hand_error(
+        previous,
+        Hand::Right,
+        affordance,
+        previous_object) <= IKConfig{}.accepted_position_m);
+    assert(rotation_distance(
+        hand_world(previous, Hand::Right).rotation,
+        compose(previous_object, affordance.hand_in_object).rotation) <=
+        IKConfig{}.accepted_orientation_radians);
+
+    for (int tick = 0; tick < 10; ++tick) {
+        const Pose current = controller.update(locomotion, 0.05F);
+        const Transform current_object = controller.object_world();
+        for (int32_t bone = g1_skeleton::LeftShoulderPitch;
+             bone <= g1_skeleton::LeftWrist;
+             ++bone) {
+            const size_t index = static_cast<size_t>(bone);
+            assert(rotation_distance(
+                previous.rotations[index], current.rotations[index]) <= 0.12F);
+        }
+        assert(hand_error(
+            current,
+            Hand::Right,
+            affordance,
+            current_object) <= IKConfig{}.accepted_position_m);
+        assert(rotation_distance(
+            hand_world(current, Hand::Right).rotation,
+            compose(current_object, affordance.hand_in_object).rotation) <=
+            IKConfig{}.accepted_orientation_radians);
+        assert(length(
+            current_object.position - previous_object.position) <=
+            CarryConfig{}.maximum_grasp_drift_m + 1.0e-5F);
+        assert(rotation_distance(
+            current_object.rotation, previous_object.rotation) <=
+            CarryConfig{}.maximum_grasp_drift_radians + 1.0e-5F);
+        previous = current;
+        previous_object = current_object;
+    }
+
+    // The exact seam endpoint already belongs to live locomotion; it must not
+    // retain normalization or blending residue from the Hold source.
+    for (int32_t bone = g1_skeleton::LeftShoulderPitch;
+         bone <= g1_skeleton::LeftWrist;
+         ++bone) {
+        const size_t index = static_cast<size_t>(bone);
+        assert(exact(previous.positions[index], locomotion.pose.positions[index]));
+        assert(exact(previous.velocities[index], locomotion.pose.velocities[index]));
+        assert(exact(previous.rotations[index], locomotion.pose.rotations[index]));
+        assert(exact(
+            previous.angular_velocities[index],
+            locomotion.pose.angular_velocities[index]));
+    }
+
+    // One full-progress publication retires the seam. Later direct layered
+    // Carry frames must continue publishing the current free arm unchanged.
+    previous = controller.update(locomotion, 0.01F);
+    previous_object = controller.object_world();
+    for (int32_t bone = g1_skeleton::LeftShoulderPitch;
+         bone <= g1_skeleton::LeftWrist;
+         ++bone) {
+        const size_t index = static_cast<size_t>(bone);
+        const quat changed = quat_mul(
+            locomotion.pose.rotations[index],
+            quat_from_angle_axis(0.04F, vec3(1.0F, 0.0F, 0.0F)));
+        locomotion.pose.rotations[index] = changed * 0.9995F;
+        locomotion.pose.positions[index] =
+            locomotion.pose.positions[index] + vec3(0.001F, 0.002F, 0.003F);
+        locomotion.pose.velocities[index] =
+            vec3(0.15F + bone, 0.25F + bone, 0.35F + bone);
+        locomotion.pose.angular_velocities[index] =
+            vec3(-0.45F - bone, -0.35F - bone, -0.25F - bone);
+    }
+
+    const Pose direct = controller.update(locomotion, 0.01F);
+    const Transform direct_object = controller.object_world();
+    for (int32_t bone = g1_skeleton::LeftShoulderPitch;
+         bone <= g1_skeleton::LeftWrist;
+         ++bone) {
+        const size_t index = static_cast<size_t>(bone);
+        assert(exact(direct.positions[index], locomotion.pose.positions[index]));
+        assert(exact(direct.velocities[index], locomotion.pose.velocities[index]));
+        assert(exact(direct.rotations[index], locomotion.pose.rotations[index]));
+        assert(exact(
+            direct.angular_velocities[index],
+            locomotion.pose.angular_velocities[index]));
+    }
+    assert(hand_error(
+        direct,
+        Hand::Right,
+        affordance,
+        direct_object) <= IKConfig{}.accepted_position_m);
+    assert(rotation_distance(
+        hand_world(direct, Hand::Right).rotation,
+        compose(direct_object, affordance.hand_in_object).rotation) <=
+        IKConfig{}.accepted_orientation_radians);
+    assert(length(direct_object.position - previous_object.position) <=
+        CarryConfig{}.maximum_grasp_drift_m + 1.0e-5F);
+    assert(rotation_distance(
+        direct_object.rotation, previous_object.rotation) <=
+        CarryConfig{}.maximum_grasp_drift_radians + 1.0e-5F);
+}
+
 void test_fallback_rotation_masks_are_layered() {
     using namespace interaction;
     const RuntimeFixture fixture = make_runtime_fixture();
@@ -655,6 +798,7 @@ void test_fallback_rotation_masks_are_layered() {
     CarryConfig accepting_carry{};
     accepting_carry.maximum_grasp_drift_m = 100.0F;
     accepting_carry.maximum_grasp_drift_radians = 10.0F;
+    accepting_carry.inactive_arm_weight = 0.35F;
     CarryController fallback(
         fixture.database,
         fixture.features,
@@ -698,6 +842,13 @@ void test_fallback_rotation_masks_are_layered() {
             output.rotations[bone],
             quat_nlerp_shortest(
                 locomotion_rotation, hold_rotation, 0.35F)));
+        assert(exact(
+            output.positions[bone], locomotion.pose.positions[bone]));
+        assert(exact(
+            output.velocities[bone], locomotion.pose.velocities[bone]));
+        assert(exact(
+            output.angular_velocities[bone],
+            locomotion.pose.angular_velocities[bone]));
     }
     for (int32_t bone = g1_skeleton::RightShoulderPitch;
          bone <= g1_skeleton::RightWrist;
@@ -1933,6 +2084,7 @@ int main() {
     test_grasp_threshold_and_quaternion_sign_do_not_split();
     test_average_speed_uses_planar_path_length();
     test_fallback_preserves_locomotion_and_grasp();
+    test_default_layered_carry_releases_inactive_arm_after_hold_seam();
     test_fallback_rotation_masks_are_layered();
     test_layered_anchor_and_nonidentity_grasp_move_with_root();
     test_layered_carry_smooths_ik_feasible_nonarm_seam();
