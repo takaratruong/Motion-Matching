@@ -3,6 +3,7 @@
 #include "interaction_matcher.h"
 
 #include <cstdint>
+#include <optional>
 
 namespace interaction {
 
@@ -48,6 +49,9 @@ public:
         float pre_lift_object_height);
     bool try_contact(const ContactMeasurement& measurement);
     void update(const ContactMeasurement& measurement, float dt);
+    std::optional<TargetHandle> commit_place(
+        Transform placed_world,
+        PlacedSupportContext destination_support);
     TargetHandle reset(Transform restored_object_world);
 
     Transform object_world() const;

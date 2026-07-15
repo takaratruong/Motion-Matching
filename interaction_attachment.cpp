@@ -297,6 +297,26 @@ void AttachmentController::update(
     held_seconds_ = next_held_seconds;
 }
 
+std::optional<TargetHandle> AttachmentController::commit_place(
+    Transform placed_world,
+    PlacedSupportContext destination_support) {
+    const std::optional<TargetHandle> placed = registry_->place_held(
+        request_.target,
+        request_.request_id,
+        placed_world,
+        destination_support);
+    if (!placed.has_value()) {
+        return std::nullopt;
+    }
+
+    object_world_ = placed_world;
+    state_ = ObjectState::Free;
+    held_seconds_ = 0.0F;
+    result_ = ResultCode::Succeeded;
+    reason_ = Reason::None;
+    return placed;
+}
+
 TargetHandle AttachmentController::reset(Transform restored_object_world) {
     if (!valid_transform(restored_object_world)) {
         throw std::invalid_argument(

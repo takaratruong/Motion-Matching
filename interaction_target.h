@@ -22,6 +22,11 @@ struct TargetHandle {
     }
 };
 
+struct PlacedSupportContext {
+    Transform table_world{};
+    vec3 table_size{};
+};
+
 struct ObjectLocalBounds {
     vec3 center_object{};
     vec3 half_extents_object{};
@@ -66,6 +71,11 @@ public:
     bool validate(TargetHandle handle, uint64_t request_id) const;
     bool attach(TargetHandle handle, uint64_t request_id);
     bool hold(TargetHandle handle, uint64_t request_id);
+    std::optional<TargetHandle> place_held(
+        TargetHandle held,
+        uint64_t owner_request,
+        Transform placed_world,
+        PlacedSupportContext destination_support);
     bool release(TargetHandle handle, uint64_t request_id);
     TargetHandle replace_pose(uint64_t id, Transform object_world);
     TargetHandle reset(uint64_t id, Transform object_world);

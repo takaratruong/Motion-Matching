@@ -162,6 +162,14 @@ void test_public_records() {
         decltype(InteractionTarget{}.object_profile_id), uint64_t>);
     static_assert(std::is_same_v<
         decltype(InteractionTarget{}.object_bounds), ObjectLocalBounds>);
+    static_assert(std::is_same_v<
+        decltype(PlacedSupportContext{}.table_world), Transform>);
+    static_assert(std::is_same_v<
+        decltype(PlacedSupportContext{}.table_size), vec3>);
+    static_assert(std::is_same_v<
+        decltype(&TargetRegistry::place_held),
+        std::optional<TargetHandle> (TargetRegistry::*)(
+            TargetHandle, uint64_t, Transform, PlacedSupportContext)>);
 
     const PickRequest request{TargetHandle{7, 2}, 5, 42};
     TEST_CHECK(request.target == (TargetHandle{7, 2}));
@@ -601,6 +609,259 @@ void test_reservation_state_machine() {
     TEST_CHECK(registry.release(handle, 302));
 }
 
+interaction::TargetHandle make_held_target(
+    interaction::TargetRegistry& registry,
+    interaction::InteractionTarget target,
+    uint64_t owner_request) {
+    const interaction::TargetHandle handle = registry.upsert(target);
+    TEST_CHECK(registry.reserve(handle, owner_request));
+    TEST_CHECK(registry.attach(handle, owner_request));
+    TEST_CHECK(registry.hold(handle, owner_request));
+    return handle;
+}
+
+void test_place_held_commits_pose_support_and_generation_atomically() {
+    using namespace interaction;
+
+    TargetRegistry registry;
+    constexpr uint64_t owner_request = 803U;
+    const TargetHandle held = make_held_target(
+        registry, make_target(80, 17), owner_request);
+    const Transform placed{
+        vec3(1.0F, 0.82F, 4.0F),
+        quat_from_angle_axis(0.37F, vec3(0.0F, 1.0F, 0.0F)),
+    };
+    const PlacedSupportContext destination{
+        Transform{
+            vec3(0.0F, 0.70F, 4.0F),
+            quat_from_angle_axis(-0.21F, vec3(0.0F, 1.0F, 0.0F)),
+        },
+        vec3(2.0F, 0.04F, 0.60F),
+    };
+    const InteractionTarget before = *registry.find(held);
+
+    const auto next = registry.place_held(
+        held, owner_request, placed, destination);
+
+    TEST_CHECK(next.has_value());
+    TEST_CHECK(next->id == held.id);
+    TEST_CHECK(next->generation == held.generation + 1U);
+    TEST_CHECK(registry.find(held) == nullptr);
+    const InteractionTarget* stored = registry.find(*next);
+    TEST_CHECK(stored != nullptr);
+    TEST_CHECK(stored->handle == *next);
+    TEST_CHECK(exact(stored->object_world, placed));
+    TEST_CHECK(exact(stored->table_world, destination.table_world));
+    TEST_CHECK(exact(stored->table_size, destination.table_size));
+    TEST_CHECK(stored->state == ObjectState::Free);
+    TEST_CHECK(stored->owner_request == 0U);
+    InteractionTarget expected = before;
+    expected.handle = *next;
+    expected.object_world = placed;
+    expected.table_world = destination.table_world;
+    expected.table_size = destination.table_size;
+    expected.state = ObjectState::Free;
+    expected.owner_request = 0U;
+    TEST_CHECK(exact(*stored, expected));
+}
+
+void test_place_held_rejects_identity_and_state_mismatches_transactionally() {
+    using namespace interaction;
+
+    const Transform placed{vec3(1.0F, 0.82F, 4.0F), quat()};
+    const PlacedSupportContext destination{
+        Transform{vec3(0.0F, 0.70F, 4.0F), quat()},
+        vec3(2.0F, 0.04F, 0.60F),
+    };
+
+    {
+        TargetRegistry registry;
+        constexpr uint64_t owner_request = 804U;
+        const TargetHandle held = make_held_target(
+            registry, make_target(81, 5), owner_request);
+        const InteractionTarget snapshot = *registry.find(held);
+        TEST_CHECK(!registry.place_held(
+            held, owner_request + 1U, placed, destination).has_value());
+        const InteractionTarget* preserved = registry.find(held);
+        TEST_CHECK(preserved != nullptr);
+        TEST_CHECK(exact(*preserved, snapshot));
+    }
+
+    {
+        TargetRegistry registry;
+        constexpr uint64_t owner_request = 810U;
+        const TargetHandle held = make_held_target(
+            registry, make_target(87, 10), owner_request);
+        const InteractionTarget snapshot = *registry.find(held);
+        TEST_CHECK(!registry.place_held(
+            held, 0U, placed, destination).has_value());
+        const InteractionTarget* preserved = registry.find(held);
+        TEST_CHECK(preserved != nullptr);
+        TEST_CHECK(exact(*preserved, snapshot));
+
+        TEST_CHECK(!registry.place_held(
+            TargetHandle{999U, held.generation},
+            owner_request,
+            placed,
+            destination).has_value());
+        preserved = registry.find(held);
+        TEST_CHECK(preserved != nullptr);
+        TEST_CHECK(exact(*preserved, snapshot));
+    }
+
+    {
+        TargetRegistry registry;
+        constexpr uint64_t owner_request = 805U;
+        const TargetHandle held = make_held_target(
+            registry, make_target(82, 6), owner_request);
+        const TargetHandle stale{held.id, held.generation - 1U};
+        const InteractionTarget snapshot = *registry.find(held);
+        TEST_CHECK(!registry.place_held(
+            stale, owner_request, placed, destination).has_value());
+        const InteractionTarget* preserved = registry.find(held);
+        TEST_CHECK(preserved != nullptr);
+        TEST_CHECK(exact(*preserved, snapshot));
+    }
+
+    for (const ObjectState state : {
+             ObjectState::Free,
+             ObjectState::Targeted,
+             ObjectState::Attached,
+         }) {
+        TargetRegistry registry;
+        constexpr uint64_t owner_request = 806U;
+        const TargetHandle handle = registry.upsert(make_target(83, 7));
+        if (state != ObjectState::Free) {
+            TEST_CHECK(registry.reserve(handle, owner_request));
+        }
+        if (state == ObjectState::Attached) {
+            TEST_CHECK(registry.attach(handle, owner_request));
+        }
+        const InteractionTarget snapshot = *registry.find(handle);
+        TEST_CHECK(snapshot.state == state);
+        TEST_CHECK(!registry.place_held(
+            handle, owner_request, placed, destination).has_value());
+        const InteractionTarget* preserved = registry.find(handle);
+        TEST_CHECK(preserved != nullptr);
+        TEST_CHECK(exact(*preserved, snapshot));
+    }
+}
+
+void test_place_held_validates_all_inputs_before_mutation_or_lookup() {
+    using namespace interaction;
+
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float infinity = std::numeric_limits<float>::infinity();
+    const Transform valid_placed{vec3(1.0F, 0.82F, 4.0F), quat()};
+    const PlacedSupportContext valid_destination{
+        Transform{vec3(0.0F, 0.70F, 4.0F), quat()},
+        vec3(2.0F, 0.04F, 0.60F),
+    };
+    const std::array<Transform, 4> invalid_placed = {{
+        {vec3(nan, 0.82F, 4.0F), quat()},
+        {vec3(1.0F, infinity, 4.0F), quat()},
+        {vec3(1.0F, 0.82F, 4.0F), quat(0.0F, 0.0F, 0.0F, 0.0F)},
+        {vec3(1.0F, 0.82F, 4.0F), quat(1.25F, 0.0F, 0.0F, 0.0F)},
+    }};
+    for (const Transform& invalid : invalid_placed) {
+        TargetRegistry registry;
+        const TargetHandle held = make_held_target(
+            registry, make_target(84, 8), 807U);
+        const InteractionTarget snapshot = *registry.find(held);
+        TEST_CHECK(throws_invalid_argument([&] {
+            (void)registry.place_held(
+                held, 807U, invalid, valid_destination);
+        }));
+        const InteractionTarget* preserved = registry.find(held);
+        TEST_CHECK(preserved != nullptr);
+        TEST_CHECK(exact(*preserved, snapshot));
+    }
+
+    std::array<PlacedSupportContext, 8> invalid_destinations{};
+    invalid_destinations.fill(valid_destination);
+    invalid_destinations[0].table_world.position.x = nan;
+    invalid_destinations[1].table_world.position.z = infinity;
+    invalid_destinations[2].table_world.rotation =
+        quat(0.0F, 0.0F, 0.0F, 0.0F);
+    invalid_destinations[3].table_world.rotation =
+        quat(0.5F, 0.0F, 0.0F, 0.0F);
+    invalid_destinations[4].table_size.x = 0.0F;
+    invalid_destinations[5].table_size.y = -0.01F;
+    invalid_destinations[6].table_size.z = nan;
+    invalid_destinations[7].table_size.x = infinity;
+    for (const PlacedSupportContext& invalid : invalid_destinations) {
+        TargetRegistry registry;
+        const TargetHandle held = make_held_target(
+            registry, make_target(85, 9), 808U);
+        const InteractionTarget snapshot = *registry.find(held);
+        TEST_CHECK(throws_invalid_argument([&] {
+            (void)registry.place_held(
+                held, 808U, valid_placed, invalid);
+        }));
+        const InteractionTarget* preserved = registry.find(held);
+        TEST_CHECK(preserved != nullptr);
+        TEST_CHECK(exact(*preserved, snapshot));
+    }
+
+    TargetRegistry empty;
+    Transform invalid = valid_placed;
+    invalid.position.y = nan;
+    TEST_CHECK(throws_invalid_argument([&] {
+        (void)empty.place_held(
+            TargetHandle{999U, 1U}, 1U, invalid, valid_destination);
+    }));
+
+    PlacedSupportContext invalid_support_transform = valid_destination;
+    invalid_support_transform.table_world.position.z = infinity;
+    TEST_CHECK(throws_invalid_argument([&] {
+        (void)empty.place_held(
+            TargetHandle{999U, 1U},
+            1U,
+            valid_placed,
+            invalid_support_transform);
+    }));
+
+    PlacedSupportContext invalid_support_size = valid_destination;
+    invalid_support_size.table_size.y = 0.0F;
+    TargetRegistry stale_registry;
+    const TargetHandle current = make_held_target(
+        stale_registry, make_target(88, 11U), 811U);
+    const TargetHandle stale{current.id, current.generation - 1U};
+    const InteractionTarget stale_snapshot = *stale_registry.find(current);
+    TEST_CHECK(throws_invalid_argument([&] {
+        (void)stale_registry.place_held(
+            stale,
+            811U,
+            valid_placed,
+            invalid_support_size);
+    }));
+    const InteractionTarget* stale_preserved = stale_registry.find(current);
+    TEST_CHECK(stale_preserved != nullptr);
+    TEST_CHECK(exact(*stale_preserved, stale_snapshot));
+}
+
+void test_place_held_generation_overflow_is_transactional() {
+    using namespace interaction;
+
+    constexpr uint32_t maximum = std::numeric_limits<uint32_t>::max();
+    constexpr uint64_t owner_request = 809U;
+    TargetRegistry registry;
+    const TargetHandle held = make_held_target(
+        registry, make_target(86, maximum), owner_request);
+    const InteractionTarget snapshot = *registry.find(held);
+    const Transform placed{vec3(1.0F, 0.82F, 4.0F), quat()};
+    const PlacedSupportContext destination{
+        Transform{vec3(0.0F, 0.70F, 4.0F), quat()},
+        vec3(2.0F, 0.04F, 0.60F),
+    };
+
+    TEST_CHECK(!registry.place_held(
+        held, owner_request, placed, destination).has_value());
+    const InteractionTarget* preserved = registry.find(held);
+    TEST_CHECK(preserved != nullptr);
+    TEST_CHECK(exact(*preserved, snapshot));
+}
+
 void test_pose_replacement_reset_and_affordance_lookup() {
     using namespace interaction;
 
@@ -669,6 +930,10 @@ int main() {
     test_nonfinite_mutations_reject_with_assertions_disabled();
     test_planar_resolution_and_free_filtering();
     test_reservation_state_machine();
+    test_place_held_commits_pose_support_and_generation_atomically();
+    test_place_held_rejects_identity_and_state_mismatches_transactionally();
+    test_place_held_validates_all_inputs_before_mutation_or_lookup();
+    test_place_held_generation_overflow_is_transactional();
     test_pose_replacement_reset_and_affordance_lookup();
     test_generation_overflow_is_rejected();
 }

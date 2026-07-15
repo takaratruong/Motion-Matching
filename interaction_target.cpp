@@ -274,6 +274,38 @@ bool TargetRegistry::hold(TargetHandle handle, uint64_t request_id) {
     return true;
 }
 
+std::optional<TargetHandle> TargetRegistry::place_held(
+    TargetHandle held,
+    uint64_t owner_request,
+    Transform placed_world,
+    PlacedSupportContext destination_support) {
+    validate_transform(placed_world, "placed object transform");
+    validate_transform(
+        destination_support.table_world,
+        "destination support transform");
+    validate_positive_size(
+        destination_support.table_size,
+        "destination support size");
+
+    InteractionTarget* target = find(held);
+    if (owner_request == 0U || target == nullptr ||
+        target->state != ObjectState::Held ||
+        target->owner_request != owner_request ||
+        target->handle.generation == std::numeric_limits<uint32_t>::max()) {
+        return std::nullopt;
+    }
+
+    TargetHandle placed = target->handle;
+    ++placed.generation;
+    target->handle = placed;
+    target->object_world = placed_world;
+    target->table_world = destination_support.table_world;
+    target->table_size = destination_support.table_size;
+    target->state = ObjectState::Free;
+    target->owner_request = 0U;
+    return placed;
+}
+
 bool TargetRegistry::release(TargetHandle handle, uint64_t request_id) {
     InteractionTarget* target = find(handle);
     if (request_id == 0 || target == nullptr ||

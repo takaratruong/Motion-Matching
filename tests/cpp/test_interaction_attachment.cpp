@@ -46,6 +46,49 @@ bool exact(
            left.rotation.z == right.rotation.z;
 }
 
+bool exact(vec3 left, vec3 right) {
+    return left.x == right.x && left.y == right.y && left.z == right.z;
+}
+
+bool exact(
+    const interaction::GraspAffordance& left,
+    const interaction::GraspAffordance& right) {
+    return left.id == right.id && left.hand == right.hand &&
+           exact(left.hand_in_object, right.hand_in_object) &&
+           exact(
+               left.approach_direction_object,
+               right.approach_direction_object) &&
+           left.clearance_radius == right.clearance_radius;
+}
+
+bool exact(
+    const interaction::InteractionTarget& left,
+    const interaction::InteractionTarget& right) {
+    if (left.handle != right.handle ||
+        !exact(left.object_world, right.object_world) ||
+        left.object_profile_id != right.object_profile_id ||
+        !exact(
+            left.object_bounds.center_object,
+            right.object_bounds.center_object) ||
+        !exact(
+            left.object_bounds.half_extents_object,
+            right.object_bounds.half_extents_object) ||
+        !exact(left.object_dimensions, right.object_dimensions) ||
+        !exact(left.table_world, right.table_world) ||
+        !exact(left.table_size, right.table_size) ||
+        left.state != right.state ||
+        left.owner_request != right.owner_request ||
+        left.affordances.size() != right.affordances.size()) {
+        return false;
+    }
+    for (size_t index = 0; index < left.affordances.size(); ++index) {
+        if (!exact(left.affordances[index], right.affordances[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 struct AttachmentFixture {
     interaction::TargetRegistry registry;
     interaction::InteractionTarget target;
@@ -53,12 +96,12 @@ struct AttachmentFixture {
     interaction::GraspAffordance affordance;
 };
 
-AttachmentFixture make_fixture() {
+AttachmentFixture make_fixture(uint32_t generation = 4U) {
     using namespace interaction;
 
     AttachmentFixture fixture{};
     InteractionTarget target{};
-    target.handle = {31, 4};
+    target.handle = {31, generation};
     target.object_world = {
         vec3(0.35F, 0.72F, -0.45F),
         quat_from_angle_axis(0.31F, vec3(0.0F, 1.0F, 0.0F)),
@@ -121,6 +164,68 @@ interaction::ContactMeasurement measurement_for_object(
     measurement.hand_world = interaction::compose(
         object_world, fixture.affordance.hand_in_object);
     return measurement;
+}
+
+interaction::Transform drive_to_held(
+    AttachmentFixture& fixture,
+    interaction::AttachmentController& attachment) {
+    using namespace interaction;
+
+    assert(attachment.begin(
+        fixture.target,
+        fixture.request,
+        fixture.affordance,
+        fixture.target.object_world.position.y));
+    assert(attachment.try_contact(valid_measurement(fixture)));
+    Transform held = fixture.target.object_world;
+    held.position = held.position + vec3(0.20F, 0.20F, -0.10F);
+    held.rotation = quat_from_angle_axis(
+        -0.42F, vec3(0.0F, 1.0F, 0.0F));
+    attachment.update(measurement_for_object(fixture, held), 1.0F);
+    assert(attachment.state() == ObjectState::Held);
+    assert(attachment.result() == ResultCode::Succeeded);
+    assert(attachment.reason() == Reason::None);
+    return held;
+}
+
+struct AttachmentSnapshot {
+    interaction::Transform object_world{};
+    interaction::ObjectState state = interaction::ObjectState::Free;
+    interaction::ResultCode result = interaction::ResultCode::None;
+    interaction::Reason reason = interaction::Reason::None;
+    float held_seconds = 0.0F;
+    interaction::InteractionTarget registry_target{};
+};
+
+AttachmentSnapshot snapshot_attachment(
+    const AttachmentFixture& fixture,
+    const interaction::AttachmentController& attachment) {
+    const interaction::InteractionTarget* stored =
+        fixture.registry.find_by_id(fixture.request.target.id);
+    assert(stored != nullptr);
+    return {
+        attachment.object_world(),
+        attachment.state(),
+        attachment.result(),
+        attachment.reason(),
+        attachment.held_seconds(),
+        *stored,
+    };
+}
+
+void assert_attachment_unchanged(
+    const AttachmentFixture& fixture,
+    const interaction::AttachmentController& attachment,
+    const AttachmentSnapshot& snapshot) {
+    assert(exact(attachment.object_world(), snapshot.object_world));
+    assert(attachment.state() == snapshot.state);
+    assert(attachment.result() == snapshot.result);
+    assert(attachment.reason() == snapshot.reason);
+    assert(attachment.held_seconds() == snapshot.held_seconds);
+    const interaction::InteractionTarget* stored =
+        fixture.registry.find_by_id(fixture.request.target.id);
+    assert(stored != nullptr);
+    assert(exact(*stored, snapshot.registry_target));
 }
 
 template<class Function>
@@ -211,6 +316,10 @@ void test_frozen_public_contract_and_defaults() {
     static_assert(std::is_same_v<
         decltype(&AttachmentController::reset),
         TargetHandle (AttachmentController::*)(Transform)>);
+    static_assert(std::is_same_v<
+        decltype(&AttachmentController::commit_place),
+        std::optional<TargetHandle> (AttachmentController::*)(
+            Transform, PlacedSupportContext)>);
     static_assert(std::is_same_v<
         decltype(&AttachmentController::object_world),
         Transform (AttachmentController::*)() const>);
@@ -637,6 +746,226 @@ void test_reset_restores_exact_pose_and_increments_generation() {
         fixture.request.target, fixture.request.request_id));
 }
 
+void test_commit_place_atomically_releases_to_destination_support() {
+    using namespace interaction;
+
+    AttachmentFixture fixture = make_fixture();
+    AttachmentController attachment(fixture.registry);
+    (void)drive_to_held(fixture, attachment);
+    const TargetHandle old_handle = fixture.request.target;
+    const InteractionTarget before = *fixture.registry.find(old_handle);
+    const Transform placed{
+        vec3(1.0F, 0.82F, 4.0F),
+        quat_from_angle_axis(0.37F, vec3(0.0F, 1.0F, 0.0F)),
+    };
+    const PlacedSupportContext destination{
+        Transform{
+            vec3(0.0F, 0.70F, 4.0F),
+            quat_from_angle_axis(-0.21F, vec3(0.0F, 1.0F, 0.0F)),
+        },
+        vec3(2.0F, 0.04F, 0.60F),
+    };
+
+    const auto next = attachment.commit_place(placed, destination);
+
+    assert(next.has_value());
+    assert(next->id == old_handle.id);
+    assert(next->generation == old_handle.generation + 1U);
+    assert(attachment.state() == ObjectState::Free);
+    assert(attachment.result() == ResultCode::Succeeded);
+    assert(attachment.reason() == Reason::None);
+    assert(exact(attachment.object_world(), placed));
+    assert(attachment.held_seconds() == 0.0F);
+    assert(fixture.registry.find(old_handle) == nullptr);
+    const InteractionTarget* stored = fixture.registry.find(*next);
+    assert(stored != nullptr);
+    assert(stored->state == ObjectState::Free);
+    assert(stored->owner_request == 0U);
+    assert(exact(stored->object_world, placed));
+    assert(exact(stored->table_world, destination.table_world));
+    assert(exact(stored->table_size, destination.table_size));
+    InteractionTarget expected = before;
+    expected.handle = *next;
+    expected.object_world = placed;
+    expected.table_world = destination.table_world;
+    expected.table_size = destination.table_size;
+    expected.state = ObjectState::Free;
+    expected.owner_request = 0U;
+    assert(exact(*stored, expected));
+
+    const AttachmentSnapshot committed = snapshot_attachment(
+        fixture, attachment);
+    assert(!attachment.commit_place(placed, destination).has_value());
+    assert_attachment_unchanged(fixture, attachment, committed);
+}
+
+void test_commit_place_registry_rejections_preserve_local_and_scene_state() {
+    using namespace interaction;
+
+    const Transform placed{vec3(1.0F, 0.82F, 4.0F), quat()};
+    const PlacedSupportContext destination{
+        Transform{vec3(0.0F, 0.70F, 4.0F), quat()},
+        vec3(2.0F, 0.04F, 0.60F),
+    };
+
+    {
+        AttachmentFixture fixture = make_fixture();
+        AttachmentController attachment(fixture.registry);
+        (void)drive_to_held(fixture, attachment);
+        InteractionTarget* stored = fixture.registry.find(
+            fixture.request.target);
+        assert(stored != nullptr);
+        ++stored->owner_request;
+        const AttachmentSnapshot snapshot = snapshot_attachment(
+            fixture, attachment);
+        assert(!attachment.commit_place(placed, destination).has_value());
+        assert_attachment_unchanged(fixture, attachment, snapshot);
+
+        stored = fixture.registry.find(fixture.request.target);
+        assert(stored != nullptr);
+        stored->owner_request = fixture.request.request_id;
+        const auto recovered = attachment.commit_place(placed, destination);
+        assert(recovered.has_value());
+        assert(attachment.state() == ObjectState::Free);
+        assert(attachment.result() == ResultCode::Succeeded);
+        assert(attachment.reason() == Reason::None);
+        assert(attachment.held_seconds() == 0.0F);
+        assert(exact(attachment.object_world(), placed));
+    }
+
+    {
+        AttachmentFixture fixture = make_fixture();
+        AttachmentController attachment(fixture.registry);
+        const Transform held = drive_to_held(fixture, attachment);
+        const TargetHandle replacement = fixture.registry.replace_pose(
+            fixture.request.target.id, held);
+        assert(fixture.registry.reserve(
+            replacement, fixture.request.request_id));
+        assert(fixture.registry.attach(
+            replacement, fixture.request.request_id));
+        assert(fixture.registry.hold(
+            replacement, fixture.request.request_id));
+        const AttachmentSnapshot snapshot = snapshot_attachment(
+            fixture, attachment);
+        assert(snapshot.registry_target.handle == replacement);
+        assert(!attachment.commit_place(placed, destination).has_value());
+        assert_attachment_unchanged(fixture, attachment, snapshot);
+    }
+
+    {
+        AttachmentFixture fixture = make_fixture();
+        AttachmentController attachment(fixture.registry);
+        (void)drive_to_held(fixture, attachment);
+        assert(fixture.registry.release(
+            fixture.request.target, fixture.request.request_id));
+        const AttachmentSnapshot snapshot = snapshot_attachment(
+            fixture, attachment);
+        assert(snapshot.registry_target.state == ObjectState::Free);
+        assert(!attachment.commit_place(placed, destination).has_value());
+        assert_attachment_unchanged(fixture, attachment, snapshot);
+    }
+}
+
+void test_commit_place_rejects_unstarted_and_attached_controllers() {
+    using namespace interaction;
+
+    const Transform placed{vec3(1.0F, 0.82F, 4.0F), quat()};
+    const PlacedSupportContext destination{
+        Transform{vec3(0.0F, 0.70F, 4.0F), quat()},
+        vec3(2.0F, 0.04F, 0.60F),
+    };
+
+    {
+        AttachmentFixture fixture = make_fixture();
+        AttachmentController attachment(fixture.registry);
+        const AttachmentSnapshot snapshot = snapshot_attachment(
+            fixture, attachment);
+        assert(!attachment.commit_place(placed, destination).has_value());
+        assert_attachment_unchanged(fixture, attachment, snapshot);
+    }
+
+    {
+        AttachmentFixture fixture = make_fixture();
+        AttachmentController attachment(fixture.registry);
+        assert(attachment.begin(
+            fixture.target,
+            fixture.request,
+            fixture.affordance,
+            fixture.target.object_world.position.y));
+        assert(attachment.try_contact(valid_measurement(fixture)));
+        assert(attachment.state() == ObjectState::Attached);
+        const AttachmentSnapshot snapshot = snapshot_attachment(
+            fixture, attachment);
+        assert(!attachment.commit_place(placed, destination).has_value());
+        assert_attachment_unchanged(fixture, attachment, snapshot);
+    }
+}
+
+void test_commit_place_invalid_inputs_and_overflow_are_transactional() {
+    using namespace interaction;
+
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const Transform valid_placed{vec3(1.0F, 0.82F, 4.0F), quat()};
+    const PlacedSupportContext valid_destination{
+        Transform{vec3(0.0F, 0.70F, 4.0F), quat()},
+        vec3(2.0F, 0.04F, 0.60F),
+    };
+
+    {
+        AttachmentFixture fixture = make_fixture();
+        AttachmentController attachment(fixture.registry);
+        (void)drive_to_held(fixture, attachment);
+        const AttachmentSnapshot snapshot = snapshot_attachment(
+            fixture, attachment);
+        Transform invalid = valid_placed;
+        invalid.position.x = nan;
+        assert(throws_invalid_argument([&] {
+            (void)attachment.commit_place(invalid, valid_destination);
+        }));
+        assert_attachment_unchanged(fixture, attachment, snapshot);
+    }
+
+    {
+        AttachmentFixture fixture = make_fixture();
+        AttachmentController attachment(fixture.registry);
+        (void)drive_to_held(fixture, attachment);
+        const AttachmentSnapshot snapshot = snapshot_attachment(
+            fixture, attachment);
+        PlacedSupportContext invalid = valid_destination;
+        invalid.table_world.rotation = quat(0.0F, 0.0F, 0.0F, 0.0F);
+        assert(throws_invalid_argument([&] {
+            (void)attachment.commit_place(valid_placed, invalid);
+        }));
+        assert_attachment_unchanged(fixture, attachment, snapshot);
+    }
+
+    {
+        AttachmentFixture fixture = make_fixture();
+        AttachmentController attachment(fixture.registry);
+        (void)drive_to_held(fixture, attachment);
+        const AttachmentSnapshot snapshot = snapshot_attachment(
+            fixture, attachment);
+        PlacedSupportContext invalid = valid_destination;
+        invalid.table_size.z = 0.0F;
+        assert(throws_invalid_argument([&] {
+            (void)attachment.commit_place(valid_placed, invalid);
+        }));
+        assert_attachment_unchanged(fixture, attachment, snapshot);
+    }
+
+    {
+        constexpr uint32_t maximum = std::numeric_limits<uint32_t>::max();
+        AttachmentFixture fixture = make_fixture(maximum);
+        AttachmentController attachment(fixture.registry);
+        (void)drive_to_held(fixture, attachment);
+        const AttachmentSnapshot snapshot = snapshot_attachment(
+            fixture, attachment);
+        assert(!attachment.commit_place(
+            valid_placed, valid_destination).has_value());
+        assert_attachment_unchanged(fixture, attachment, snapshot);
+    }
+}
+
 void test_repeated_contact_is_rejected_and_reset_can_rebegin() {
     using namespace interaction;
 
@@ -985,6 +1314,10 @@ int main() {
     test_held_contact_loss_is_terminal_and_freezes_last_valid_state();
     test_generation_change_fails_without_attaching_replacement();
     test_reset_restores_exact_pose_and_increments_generation();
+    test_commit_place_atomically_releases_to_destination_support();
+    test_commit_place_registry_rejections_preserve_local_and_scene_state();
+    test_commit_place_rejects_unstarted_and_attached_controllers();
+    test_commit_place_invalid_inputs_and_overflow_are_transactional();
     test_repeated_contact_is_rejected_and_reset_can_rebegin();
     test_begin_rejects_incoherent_or_unreserved_inputs();
     test_invalid_configuration_and_nonfinite_prelift_are_rejected();
