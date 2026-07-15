@@ -218,6 +218,14 @@ class AuthoritativeFlatDatabaseTests(unittest.TestCase):
         self.assertEqual(manifest["target_fps"], 25.0)
         self.assertEqual(source.bone_positions.shape, (53500, 23, 3))
         self.assertEqual(output.bone_positions.shape, (22296, 23, 3))
+        flat_controller_parents = np.array(
+            [-1, 0, 1, 2, 3, 4, 1, 6, 7, 8, 1, 10, 11, 12, 13, 12,
+             15, 16, 17, 12, 19, 20, 21],
+            dtype=np.int32)
+        np.testing.assert_array_equal(
+            source.bone_parents, flat_controller_parents)
+        np.testing.assert_array_equal(
+            output.bone_parents, flat_controller_parents)
         self.assertEqual(len(source.range_starts), 6)
         self.assertEqual(len(output.range_starts), 6)
         self.assertEqual(source.contact_states.shape[1], 2)
