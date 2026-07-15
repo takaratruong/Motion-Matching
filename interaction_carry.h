@@ -49,6 +49,7 @@ public:
         Transform object_world);
     Pose update(const LocomotionSnapshot& locomotion, float dt);
     bool recorded() const;
+    bool inactive_arm_tracks_locomotion() const;
     Transform object_world() const;
 
 private:

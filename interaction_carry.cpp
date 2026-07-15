@@ -1514,6 +1514,13 @@ bool CarryController::recorded() const {
     return recorded_;
 }
 
+bool CarryController::inactive_arm_tracks_locomotion() const {
+    return started_ && !recorded_ &&
+           config_.inactive_arm_weight == 0.0F &&
+           !transition_active_ &&
+           published_seam_key_ == kLayeredSeamKey;
+}
+
 Transform CarryController::object_world() const {
     return object_world_;
 }
