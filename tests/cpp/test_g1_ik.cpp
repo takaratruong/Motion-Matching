@@ -1,10 +1,16 @@
-#include "g1_ik.h"
+#include "g1_ik_runtime.h"
 
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <type_traits>
+
+static_assert(G1SwingLiftCandidateCount == 41,
+              "runtime owns the exact 41-stage swing ladder");
+static_assert(G1SwingNoCandidate == UINT32_MAX,
+              "runtime owns the no-candidate sentinel");
 
 static void check(bool condition, const char* message)
 {
@@ -3372,8 +3378,1224 @@ static void test_surface_orientation_hostile_rollback()
           "aliased shape diagnostic preserves pose and result bytes");
 }
 
-int main()
+#if defined(G1_IK_ENABLE_TEST_SEAMS)
+
+using G1IkResetSignature = bool (*)(
+    G1IkState&, const slice1d<vec3>, const slice1d<quat>,
+    const slice1d<int>, char*, int);
+using G1IkBeginSignature = bool (*)(
+    G1IkFrameTransaction&, array1d<vec3>&, array1d<quat>&,
+    const G1IkState&, const slice1d<vec3>, const slice1d<quat>,
+    const slice1d<int>, const slice1d<bool>, const heightfield&,
+    const G1FootprintObservation&, bool, float, char*, int);
+using G1IkStageSignature = bool (*)(
+    G1IkFrameTransaction&, array1d<vec3>&, array1d<quat>&, uint32_t,
+    const slice1d<int>, const slice1d<bool>, const heightfield&,
+    const G1FootprintObservation&, bool, float, char*, int);
+using G1IkFinishSignature = bool (*)(
+    G1IkState&, G1IkFrameResult&, G1IkFrameTransaction&,
+    array1d<vec3>&, array1d<quat>&, const slice1d<int>,
+    const heightfield&, float, char*, int);
+using G1IkEvaluateSignature = bool (*)(
+    array1d<vec3>&, array1d<quat>&, G1IkState&,
+    const slice1d<vec3>, const slice1d<quat>, const slice1d<int>,
+    const slice1d<bool>, const heightfield&, const G1FootprintObservation&,
+    bool, float, G1IkFrameResult&, char*, int);
+
+static_assert(std::is_same<decltype(&g1_ik_state_reset),
+                           G1IkResetSignature>::value,
+              "runtime state reset signature is fixed");
+static_assert(std::is_same<decltype(&g1_ik_frame_begin),
+                           G1IkBeginSignature>::value,
+              "runtime begin signature is fixed");
+static_assert(std::is_same<decltype(&g1_ik_frame_stage_foot),
+                           G1IkStageSignature>::value,
+              "runtime stage signature is fixed");
+static_assert(std::is_same<decltype(&g1_ik_frame_finish),
+                           G1IkFinishSignature>::value,
+              "runtime finish signature is fixed");
+static_assert(std::is_same<decltype(&g1_ik_frame_evaluate),
+                           G1IkEvaluateSignature>::value,
+              "runtime evaluate signature is fixed");
+
+template<typename T>
+struct G1RuntimeByteSnapshot
 {
+    unsigned char bytes[sizeof(T)];
+
+    explicit G1RuntimeByteSnapshot(const T& value)
+    {
+        std::memcpy(bytes, &value, sizeof(value));
+    }
+
+    bool same(const T& value) const
+    {
+        return std::memcmp(bytes, &value, sizeof(value)) == 0;
+    }
+};
+
+template<typename T>
+static void g1_runtime_poison_bytes(T& value, unsigned char byte)
+{
+    unsigned char* const bytes =
+        reinterpret_cast<unsigned char*>(&value);
+    for (size_t index = 0; index < sizeof(value); ++index) {
+        bytes[index] = byte;
+    }
+}
+
+static bool g1_runtime_vec3_bits_same(vec3 left, vec3 right)
+{
+    return terrain_float_bits(left.x) == terrain_float_bits(right.x) &&
+           terrain_float_bits(left.y) == terrain_float_bits(right.y) &&
+           terrain_float_bits(left.z) == terrain_float_bits(right.z);
+}
+
+static uint64_t g1_runtime_double_bits(double value)
+{
+    uint64_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static bool g1_runtime_array_vec3_same(
+    const array1d<vec3>& left, const array1d<vec3>& right)
+{
+    return left.size == right.size &&
+           std::memcmp(left.data, right.data,
+                       static_cast<size_t>(left.size) * sizeof(vec3)) == 0;
+}
+
+static bool g1_runtime_array_quat_same(
+    const array1d<quat>& left, const array1d<quat>& right)
+{
+    return left.size == right.size &&
+           std::memcmp(left.data, right.data,
+                       static_cast<size_t>(left.size) * sizeof(quat)) == 0;
+}
+
+struct G1RuntimeFixture
+{
+    database db;
+    heightfield field;
+    array1d<vec3> global_positions;
+    array1d<quat> global_rotations;
+    bool contact_values[2] = {false, false};
+    G1FootprintObservation footprint;
+    G1IkState state;
+};
+
+static vec3 g1_runtime_sphere_center(
+    const G1RuntimeFixture& fixture,
+    const G1LegConfig& config,
+    int probe)
+{
+    return fixture.global_positions(config.ankle) +
+           quat_mul_vec3(
+               fixture.global_rotations(config.ankle),
+               config.foot_sphere_centers_local[probe]);
+}
+
+static vec3 g1_runtime_sole_point(
+    const G1RuntimeFixture& fixture,
+    const G1LegConfig& config,
+    int probe)
+{
+    return fixture.global_positions(config.ankle) +
+           quat_mul_vec3(
+               fixture.global_rotations(config.ankle),
+               config.sole_points_local[probe]);
+}
+
+static void g1_runtime_refresh_current_probes(G1RuntimeFixture& fixture)
+{
+    const G1LegConfig configs[2] = {
+        g1_left_leg_config(), g1_right_leg_config()
+    };
+    fixture.footprint = G1FootprintObservation{};
+    G1SurfaceQueryStatus root_status = g1_surface_query_v2(
+        fixture.footprint.root_surface,
+        fixture.field,
+        fixture.global_positions(G1_Simulation).x,
+        fixture.global_positions(G1_Simulation).z);
+    check(root_status == G1SurfaceQueryValid,
+          "runtime fixture root is on the checked field");
+    fixture.footprint.blocked = false;
+    fixture.footprint.blocked_reason = walkability_clear;
+    fixture.footprint.work.sweeps = 24;
+    fixture.footprint.work.surface_queries = 33;
+    fixture.footprint.work.node_visits = 256;
+    for (int foot_index = 0; foot_index < 2; ++foot_index) {
+        G1FootprintFootObservation& foot =
+            fixture.footprint.feet[foot_index];
+        foot.current_contact = fixture.contact_values[foot_index];
+        foot.landing_sample = UINT32_MAX;
+        foot.encountered_walkability_class = 1;
+        foot.predicted_landing_walkability_class = 0;
+        for (int probe_index = 0; probe_index < 4; ++probe_index) {
+            G1FootprintProbe& probe = foot.probes[probe_index];
+            probe.current_sphere_center = g1_runtime_sphere_center(
+                fixture, configs[foot_index], probe_index);
+            probe.current_sole_point = g1_runtime_sole_point(
+                fixture, configs[foot_index], probe_index);
+            G1SurfaceQueryStatus status = g1_surface_query_v2(
+                probe.current_surface,
+                fixture.field,
+                probe.current_sole_point.x,
+                probe.current_sole_point.z);
+            check(status == G1SurfaceQueryValid,
+                  "runtime fixture sole probe is on the checked field");
+            probe.selected_landing_surface = probe.current_surface;
+            probe.corridor_minimum_height = probe.current_surface.height;
+            probe.corridor_maximum_height = probe.current_surface.height;
+            probe.encountered_walkability_class = 1;
+            for (int sample = 0;
+                 sample < G1CommandTrajectorySampleCount;
+                 ++sample) {
+                probe.predicted_sphere_centers[sample] =
+                    probe.current_sphere_center;
+                probe.predicted_sole_points[sample] =
+                    probe.current_sole_point;
+                probe.predicted_surface_status[sample] =
+                    G1SurfaceQueryValid;
+                probe.predicted_surfaces[sample] =
+                    probe.current_surface;
+            }
+        }
+    }
+}
+
+static void g1_runtime_make_fixture(G1RuntimeFixture& fixture)
+{
+    make_g1_database(fixture.db);
+    fixture.db.bone_positions(0, G1_Simulation) =
+        vec3(2.0f, 1.0f, 2.0f);
+    fixture.field.version = 2;
+    fixture.field.nx = 65;
+    fixture.field.nz = 65;
+    fixture.field.origin_x = -4.0f;
+    fixture.field.origin_z = -4.0f;
+    fixture.field.cell_size = 0.25f;
+    fixture.field.exterior_height = -10.0f;
+    fixture.field.heights.resize(65 * 65);
+    fixture.field.heights.set(0.0f);
+    fixture.global_positions.resize(G1_BoneCount);
+    fixture.global_rotations.resize(G1_BoneCount);
+    char error[256] = {};
+    check(g1_ik_checked_forward_kinematics(
+              fixture.global_positions,
+              fixture.global_rotations,
+              fixture.db.bone_positions(0),
+              fixture.db.bone_rotations(0),
+              fixture.db.bone_parents,
+              error, static_cast<int>(sizeof(error))),
+          error);
+    g1_runtime_refresh_current_probes(fixture);
+    check(g1_ik_state_reset(
+              fixture.state,
+              fixture.db.bone_positions(0),
+              fixture.db.bone_rotations(0),
+              fixture.db.bone_parents,
+              error, static_cast<int>(sizeof(error))),
+          error);
+}
+
+static void g1_runtime_set_landing(
+    G1RuntimeFixture& fixture,
+    int foot_index,
+    bool ready,
+    vec3 centroid,
+    float height,
+    vec3 normal)
+{
+    G1FootprintFootObservation& foot =
+        fixture.footprint.feet[foot_index];
+    foot.landing_expected = true;
+    foot.landing_patch_ready = ready;
+    foot.landing_sample = 2;
+    foot.predicted_landing_sole_center = centroid;
+    foot.predicted_landing_surface_status = G1SurfaceQueryValid;
+    foot.predicted_landing_surface.height = height;
+    foot.predicted_landing_surface.normal = normal;
+    foot.predicted_landing_walkability_class = 1;
+    foot.landing_patch_maximum_residual_m = 0.0;
+}
+
+static void g1_runtime_begin(
+    G1RuntimeFixture& fixture,
+    const G1FootprintObservation& footprint,
+    G1IkFrameTransaction& transaction,
+    array1d<vec3>& positions,
+    array1d<quat>& rotations)
+{
+    positions.resize(G1_BoneCount);
+    rotations.resize(G1_BoneCount);
+    positions.set(vec3(7.0f, 8.0f, 9.0f));
+    rotations.set(quat(0.5f, 0.5f, 0.5f, 0.5f));
+    char error[256] = {};
+    check(g1_ik_frame_begin(
+              transaction, positions, rotations,
+              fixture.state,
+              fixture.db.bone_positions(0),
+              fixture.db.bone_rotations(0),
+              fixture.db.bone_parents,
+              slice1d<bool>(2, fixture.contact_values),
+              fixture.field, footprint, true, 0.04f,
+              error, static_cast<int>(sizeof(error))),
+          error);
+}
+
+static void test_runtime_state_reset_and_footprint_preflight()
+{
+    G1RuntimeFixture fixture;
+    g1_runtime_make_fixture(fixture);
+    check(fixture.state.initialized &&
+              fixture.state.feet[0].lock.initialized &&
+              fixture.state.feet[1].lock.initialized &&
+              fixture.state.feet[0].swing.initialized &&
+              fixture.state.feet[1].swing.initialized,
+          "runtime reset initializes both lock and swing histories");
+    for (int foot_index = 0; foot_index < 2; ++foot_index) {
+        for (int probe = 0; probe < 4; ++probe) {
+            check(g1_runtime_vec3_bits_same(
+                      fixture.state.feet[foot_index]
+                          .swing.previous_sphere_centers[probe],
+                      fixture.footprint.feet[foot_index]
+                          .probes[probe].current_sphere_center),
+                  "runtime reset history owns exact FK sphere bits");
+        }
+    }
+
+    G1IkState poisoned = fixture.state;
+    poisoned.feet[1].swing.previous_sphere_centers[3].x =
+        g1_test_float_from_bits(UINT32_C(0x7fc00001));
+    const G1RuntimeByteSnapshot<G1IkState> poisoned_before(poisoned);
+    array1d<quat> invalid_rotations = fixture.db.bone_rotations(0);
+    invalid_rotations(G1_RightWrist) = quat(2.0f, 0.0f, 0.0f, 0.0f);
+    check(!g1_ik_state_reset(
+              poisoned,
+              fixture.db.bone_positions(0), invalid_rotations,
+              fixture.db.bone_parents, NULL, 0) &&
+              poisoned_before.same(poisoned),
+          "runtime reset validates the complete pose before assignment");
+
+    G1FootprintObservation mismatch = fixture.footprint;
+    mismatch.feet[1].probes[2].current_sphere_center.y =
+        std::nextafter(
+            mismatch.feet[1].probes[2].current_sphere_center.y,
+            std::numeric_limits<float>::infinity());
+    G1IkFrameTransaction transaction;
+    g1_runtime_poison_bytes(transaction, 0xa5);
+    const G1RuntimeByteSnapshot<G1IkFrameTransaction>
+        transaction_before(transaction);
+    array1d<vec3> scratch_positions(G1_BoneCount);
+    array1d<quat> scratch_rotations(G1_BoneCount);
+    scratch_positions.set(vec3(3.0f, 4.0f, 5.0f));
+    scratch_rotations.set(quat(0.5f, 0.5f, 0.5f, 0.5f));
+    const array1d<vec3> positions_before = scratch_positions;
+    const array1d<quat> rotations_before = scratch_rotations;
+    char error[256] = {};
+    check(!g1_ik_frame_begin(
+              transaction, scratch_positions, scratch_rotations,
+              fixture.state,
+              fixture.db.bone_positions(0),
+              fixture.db.bone_rotations(0),
+              fixture.db.bone_parents,
+              slice1d<bool>(2, fixture.contact_values),
+              fixture.field, mismatch, true, 0.04f,
+              error, static_cast<int>(sizeof(error))),
+          "one-ULP current footprint/FK mismatch is rejected");
+    check(transaction_before.same(transaction) &&
+              g1_runtime_array_vec3_same(
+                  scratch_positions, positions_before) &&
+              g1_runtime_array_quat_same(
+                  scratch_rotations, rotations_before),
+          "footprint/FK mismatch rolls back transaction and pose scratch");
+
+    G1FootprintObservation multilevel = fixture.footprint;
+    multilevel.feet[0].maximum_root_split_m = 0.32;
+    multilevel.feet[0].multilevel = true;
+    g1_runtime_begin(
+        fixture, multilevel, transaction,
+        scratch_positions, scratch_rotations);
+    check(transaction.initialized &&
+              !transaction.candidate_result.safe_stop_requested &&
+              transaction.next_foot == 0,
+          "valid class-one 0.32 m root/foot split proceeds unchanged");
+}
+
+static void test_runtime_blocked_and_landing_contract()
+{
+    G1RuntimeFixture fixture;
+    g1_runtime_make_fixture(fixture);
+    array1d<vec3> output_positions = fixture.db.bone_positions(0);
+    array1d<quat> output_rotations = fixture.db.bone_rotations(0);
+    const array1d<vec3> positions_before = output_positions;
+    const array1d<quat> rotations_before = output_rotations;
+    const G1RuntimeByteSnapshot<G1IkState> state_before(fixture.state);
+    G1IkFrameResult result;
+    g1_runtime_poison_bytes(result, 0x6b);
+
+    G1FootprintObservation blocked = fixture.footprint;
+    blocked.blocked = true;
+    blocked.blocked_reason = walkability_blocked_cell;
+    char error[256] = {};
+    check(g1_ik_frame_evaluate(
+              output_positions, output_rotations, fixture.state,
+              fixture.db.bone_positions(0),
+              fixture.db.bone_rotations(0),
+              fixture.db.bone_parents,
+              slice1d<bool>(2, fixture.contact_values),
+              fixture.field, blocked, true, 0.04f,
+              result, error, static_cast<int>(sizeof(error))),
+          error);
+    check(result.safe_stop_requested && !result.applied &&
+              result.stop_reason == G1IkStopFootprintBlocked &&
+              state_before.same(fixture.state) &&
+              g1_runtime_array_vec3_same(
+                  output_positions, positions_before) &&
+              g1_runtime_array_quat_same(
+                  output_rotations, rotations_before),
+          "blocked footprint safe-stops without pose/state/history publication");
+
+    G1FootprintObservation unready = fixture.footprint;
+    const vec3 ordinary =
+        fixture.global_positions(g1_left_leg_config().contact);
+    g1_runtime_set_landing(
+        fixture, 0, false,
+        vec3(ordinary.x + 0.10f, ordinary.y, ordinary.z),
+        0.0f, vec3(0.0f, 1.0f, 0.0f));
+    unready = fixture.footprint;
+    result = G1IkFrameResult{};
+    check(g1_ik_frame_evaluate(
+              output_positions, output_rotations, fixture.state,
+              fixture.db.bone_positions(0),
+              fixture.db.bone_rotations(0),
+              fixture.db.bone_parents,
+              slice1d<bool>(2, fixture.contact_values),
+              fixture.field, unready, true, 0.04f,
+              result, error, static_cast<int>(sizeof(error))),
+          error);
+    check(result.safe_stop_requested &&
+              result.stop_reason == G1IkStopLandingPatchUnavailable &&
+              state_before.same(fixture.state) &&
+              g1_runtime_array_vec3_same(
+                  output_positions, positions_before) &&
+              g1_runtime_array_quat_same(
+                  output_rotations, rotations_before),
+          "unready expected landing stops with all accepted owners unchanged");
+
+    const float landing_heights[2] = {0.0f, 0.64f};
+    const vec3 landing_normals[2] = {
+        vec3(0.0f, 1.0f, 0.0f),
+        vec3(-0.09950372f, 0.99503719f, 0.0f)
+    };
+    for (int direction = 0; direction < 2; ++direction) {
+        g1_runtime_refresh_current_probes(fixture);
+        const vec3 predicted(
+            ordinary.x + 0.12f + 0.03f * static_cast<float>(direction),
+            ordinary.y,
+            ordinary.z - 0.08f);
+        g1_runtime_set_landing(
+            fixture, 0, true, predicted,
+            landing_heights[direction], landing_normals[direction]);
+        G1IkFrameTransaction transaction = {};
+        array1d<vec3> scratch_positions;
+        array1d<quat> scratch_rotations;
+        g1_runtime_begin(
+            fixture, fixture.footprint, transaction,
+            scratch_positions, scratch_rotations);
+        float expected_y = 91.0f;
+        check(g1_apply_swing_lift_y(
+                  expected_y, landing_heights[direction],
+                  g1_left_leg_config().swing_clearance_m,
+                  error, static_cast<int>(sizeof(error))) ==
+                  G1ClearanceOk,
+              error);
+        const G1FootTarget& target =
+            transaction.candidate_result.feet[0].target;
+        check(terrain_float_bits(target.surface.point.x) ==
+                  terrain_float_bits(predicted.x) &&
+              terrain_float_bits(target.surface.point.z) ==
+                  terrain_float_bits(predicted.z) &&
+              terrain_float_bits(target.surface.point.y) ==
+                  terrain_float_bits(landing_heights[direction]) &&
+              g1_runtime_vec3_bits_same(
+                  target.surface.normal, landing_normals[direction]) &&
+              terrain_float_bits(target.sole_center.x) ==
+                  terrain_float_bits(predicted.x) &&
+              terrain_float_bits(target.sole_center.z) ==
+                  terrain_float_bits(predicted.z) &&
+              terrain_float_bits(target.sole_center.y) ==
+                  terrain_float_bits(expected_y),
+              "ready up/down landing replaces XZ, height, normal, and base Y");
+    }
+
+    g1_runtime_refresh_current_probes(fixture);
+    G1IkFrameTransaction ordinary_transaction = {};
+    array1d<vec3> ordinary_positions;
+    array1d<quat> ordinary_rotations;
+    g1_runtime_begin(
+        fixture, fixture.footprint, ordinary_transaction,
+        ordinary_positions, ordinary_rotations);
+    check(!fixture.footprint.feet[0].landing_expected &&
+              g1_runtime_vec3_bits_same(
+                  ordinary_transaction.candidate_result.feet[0]
+                      .target.sole_center,
+                  ordinary),
+          "no expected landing retains the checked ordinary swing base");
+}
+
+static G1ClearanceWork g1_runtime_work_add(
+    G1ClearanceWork left, const G1ClearanceWork& right)
+{
+    left.point_queries += right.point_queries;
+    left.cells_visited += right.cells_visited;
+    left.primitive_triangle_pairs += right.primitive_triangle_pairs;
+    left.face_patches += right.face_patches;
+    left.candidate_tests += right.candidate_tests;
+    left.subdivision_nodes += right.subdivision_nodes;
+    return left;
+}
+
+static bool g1_runtime_work_same(
+    const G1ClearanceWork& left,
+    const G1ClearanceWork& right)
+{
+    return left.point_queries == right.point_queries &&
+           left.cells_visited == right.cells_visited &&
+           left.primitive_triangle_pairs ==
+               right.primitive_triangle_pairs &&
+           left.face_patches == right.face_patches &&
+           left.candidate_tests == right.candidate_tests &&
+           left.subdivision_nodes == right.subdivision_nodes;
+}
+
+static bool g1_runtime_candidate_same(
+    const G1SwingCandidateDiagnostic& left,
+    const G1SwingCandidateDiagnostic& right)
+{
+    return std::memcmp(&left, &right, sizeof(left)) == 0;
+}
+
+static bool g1_runtime_stage_candidate_direct(
+    G1RuntimeFixture& fixture,
+    uint32_t foot_index,
+    uint32_t candidate_index,
+    const array1d<quat>& baseline_rotations,
+    G1SwingCandidateDiagnostic& diagnostic,
+    array1d<vec3>& output_positions,
+    array1d<quat>& output_rotations)
+{
+    const G1LegConfig configs[2] = {
+        g1_left_leg_config(), g1_right_leg_config()
+    };
+    output_positions.resize(G1_BoneCount);
+    output_rotations.resize(G1_BoneCount);
+    G1FootTarget target = {};
+    target.surface.point = fixture.global_positions(
+        configs[foot_index].contact);
+    target.surface.normal = vec3(0.0f, 1.0f, 0.0f);
+    target.sole_center = target.surface.point;
+    char error[256] = {};
+    const bool ok = g1_ik_stage_swing_candidate_for_test(
+        diagnostic,
+        output_positions,
+        output_rotations,
+        fixture.db.bone_positions(0),
+        baseline_rotations,
+        fixture.db.bone_parents,
+        fixture.state.feet[foot_index].swing,
+        fixture.field,
+        configs[foot_index],
+        target,
+        candidate_index,
+        0.04f,
+        error,
+        static_cast<int>(sizeof(error)));
+    check(ok, error[0] == '\0' ?
+              "direct candidate seam completed checked work" : error);
+    return diagnostic.clearance_status == G1ClearanceOk &&
+           diagnostic.lower_margin_m >= 0.0 &&
+           diagnostic.controller_constraints_passed &&
+           diagnostic.clearance_certified;
+}
+
+static void g1_runtime_set_directive(
+    uint32_t foot,
+    uint32_t candidate,
+    G1ClearanceStatus status,
+    G1IkTestCandidateRejection rejection = G1IkTestRejectNone,
+    bool negative_margin = false)
+{
+    G1IkTestCandidateDirective directive = {};
+    directive.enabled = true;
+    directive.clearance_status = status;
+    directive.local_rejection = rejection;
+    directive.force_negative_margin = negative_margin;
+    check(g1_ik_test_candidate_directive_set(
+              foot, candidate, directive),
+          "candidate directive is within the fixed seam table");
+}
+
+static bool g1_runtime_evaluate(
+    G1RuntimeFixture& fixture,
+    array1d<vec3>& positions,
+    array1d<quat>& rotations,
+    G1IkFrameResult& result,
+    char* error,
+    int error_capacity)
+{
+    return g1_ik_frame_evaluate(
+        positions, rotations, fixture.state,
+        fixture.db.bone_positions(0),
+        fixture.db.bone_rotations(0),
+        fixture.db.bone_parents,
+        slice1d<bool>(2, fixture.contact_values),
+        fixture.field, fixture.footprint,
+        true, 0.04f, result, error, error_capacity);
+}
+
+static void test_runtime_real_41_stage_selector()
+{
+    G1RuntimeFixture fixture;
+    g1_runtime_make_fixture(fixture);
+    check(g1_ik_test_candidate_seam_reset(),
+          "candidate seam resets before real-stage authentication");
+
+    G1SwingCandidateDiagnostic independent[G1SwingLiftCandidateCount] = {};
+    uint32_t first_passing = G1SwingNoCandidate;
+    for (uint32_t candidate = 0;
+         candidate < G1SwingLiftCandidateCount;
+         ++candidate) {
+        array1d<vec3> staged_positions;
+        array1d<quat> staged_rotations;
+        const bool passing = g1_runtime_stage_candidate_direct(
+            fixture, 0, candidate,
+            fixture.db.bone_rotations(0),
+            independent[candidate],
+            staged_positions, staged_rotations);
+        check(independent[candidate].candidate_index == candidate &&
+                  independent[candidate].lift_bits ==
+                      G1SwingLiftCandidateBits[candidate],
+              "direct seam authenticates candidate index and literal lift bits");
+        array1d<vec3> globals(G1_BoneCount);
+        array1d<quat> global_rotations(G1_BoneCount);
+        char error[256] = {};
+        check(g1_ik_checked_forward_kinematics(
+                  globals, global_rotations,
+                  staged_positions, staged_rotations,
+                  fixture.db.bone_parents,
+                  error, static_cast<int>(sizeof(error))),
+              error);
+        const G1LegConfig config = g1_left_leg_config();
+        vec3 verified_centers[4] = {};
+        check(g1_ik_runtime_compute_foot_centers(
+                  verified_centers, globals, global_rotations, config),
+              "direct seam independently materializes final FK centers");
+        for (int probe = 0; probe < 4; ++probe) {
+            const vec3 center = verified_centers[probe];
+            const uint32_t center_bits[3] = {
+                terrain_float_bits(center.x),
+                terrain_float_bits(center.y),
+                terrain_float_bits(center.z)
+            };
+            const uint32_t* const recorded_bits =
+                independent[candidate]
+                    .actual_sphere_center_bits[probe];
+            if (center_bits[0] != recorded_bits[0] ||
+                center_bits[1] != recorded_bits[1] ||
+                center_bits[2] != recorded_bits[2]) {
+                std::fprintf(
+                    stderr,
+                    "candidate=%u probe=%d actual=%08x,%08x,%08x "
+                    "recorded=%08x,%08x,%08x\n",
+                    candidate, probe,
+                    center_bits[0], center_bits[1], center_bits[2],
+                    recorded_bits[0], recorded_bits[1], recorded_bits[2]);
+            }
+            check(center_bits[0] ==
+                      independent[candidate]
+                          .actual_sphere_center_bits[probe][0] &&
+                  center_bits[1] ==
+                      independent[candidate]
+                          .actual_sphere_center_bits[probe][1] &&
+                  center_bits[2] ==
+                      independent[candidate]
+                          .actual_sphere_center_bits[probe][2],
+                  "direct seam records twelve actual post-FK endpoint words");
+        }
+        if (passing && first_passing == G1SwingNoCandidate) {
+            first_passing = candidate;
+        }
+    }
+    check(first_passing != G1SwingNoCandidate,
+          "independent probing discovers at least one real admissible stage");
+
+    array1d<vec3> positions = fixture.db.bone_positions(0);
+    array1d<quat> rotations = fixture.db.bone_rotations(0);
+    G1IkFrameResult result = {};
+    char error[256] = {};
+    check(g1_runtime_evaluate(
+              fixture, positions, rotations, result,
+              error, static_cast<int>(sizeof(error))),
+          error);
+    const G1SwingSelectionDiagnostic& selection =
+        result.feet[0].swing_selection;
+    check(result.applied && !result.safe_stop_requested &&
+              selection.selected_index == first_passing &&
+              selection.candidates_evaluated == first_passing + 1 &&
+              g1_runtime_candidate_same(
+                  selection.selected, independent[first_passing]),
+          "full selector chooses the independently authenticated first stage");
+}
+
+static void test_runtime_status_table_and_local_rejections()
+{
+    G1RuntimeFixture fixture;
+    g1_runtime_make_fixture(fixture);
+    check(g1_ik_test_candidate_seam_reset(),
+          "candidate seam resets before status table");
+    g1_runtime_set_directive(0, 0, G1ClearanceOutsideDomain);
+    g1_runtime_set_directive(0, 1, G1ClearanceBudgetExceeded);
+    g1_runtime_set_directive(0, 2, G1ClearanceUncertified);
+    g1_runtime_set_directive(
+        0, 3, G1ClearanceOk, G1IkTestRejectNone, true);
+    g1_runtime_set_directive(
+        0, 4, G1ClearanceOk, G1IkTestRejectReach);
+    g1_runtime_set_directive(
+        0, 5, G1ClearanceOk, G1IkTestRejectCorrection);
+    g1_runtime_set_directive(
+        0, 6, G1ClearanceOk, G1IkTestRejectResidual);
+    g1_runtime_set_directive(
+        0, 7, G1ClearanceOk, G1IkTestRejectInvariance);
+
+    array1d<vec3> positions = fixture.db.bone_positions(0);
+    array1d<quat> rotations = fixture.db.bone_rotations(0);
+    G1IkFrameResult result = {};
+    char error[256] = {};
+    check(g1_runtime_evaluate(
+              fixture, positions, rotations, result,
+              error, static_cast<int>(sizeof(error))),
+          error);
+    check(result.applied &&
+              result.feet[0].swing_selection.selected_index == 8 &&
+              result.feet[0].swing_selection.candidates_evaluated == 9,
+          "finite statuses, negative margin, and four local constraints advance");
+    const G1IkTestCandidateTrace& trace =
+        g1_ik_test_candidate_trace();
+    check(trace.calls[0] == 9,
+          "status table performs exactly nine real candidate stages");
+    G1ClearanceWork expected = {};
+    for (uint32_t candidate = 0; candidate <= 8; ++candidate) {
+        expected = g1_runtime_work_add(
+            expected, trace.diagnostics[0][candidate].clearance_work);
+    }
+    check(g1_runtime_work_same(
+              expected,
+              result.feet[0].swing_selection.total_clearance_work),
+          "status table accumulates every real strict-kernel work record");
+
+    const G1ClearanceStatus fatal[] = {
+        G1ClearanceInvalidInput,
+        G1ClearanceInvalidField,
+        G1ClearanceArithmeticFailure
+    };
+    for (const G1ClearanceStatus status : fatal) {
+        G1RuntimeFixture failed;
+        g1_runtime_make_fixture(failed);
+        check(g1_ik_test_candidate_seam_reset(),
+              "candidate seam resets before fatal status");
+        g1_runtime_set_directive(0, 0, status);
+        array1d<vec3> failed_positions = failed.db.bone_positions(0);
+        array1d<quat> failed_rotations = failed.db.bone_rotations(0);
+        const array1d<vec3> positions_before = failed_positions;
+        const array1d<quat> rotations_before = failed_rotations;
+        const G1RuntimeByteSnapshot<G1IkState> state_before(failed.state);
+        G1IkFrameResult failed_result;
+        g1_runtime_poison_bytes(failed_result, 0x9d);
+        const G1RuntimeByteSnapshot<G1IkFrameResult>
+            result_before(failed_result);
+        check(!g1_runtime_evaluate(
+                  failed, failed_positions, failed_rotations,
+                  failed_result, NULL, 0),
+              "fatal strict-kernel status aborts the transaction");
+        check(state_before.same(failed.state) &&
+                  result_before.same(failed_result) &&
+                  g1_runtime_array_vec3_same(
+                      failed_positions, positions_before) &&
+                  g1_runtime_array_quat_same(
+                      failed_rotations, rotations_before),
+              "fatal status preserves state, result, history, and pose");
+    }
+}
+
+static void test_runtime_all_41_and_two_foot_composition()
+{
+    G1RuntimeFixture exhausted;
+    g1_runtime_make_fixture(exhausted);
+    check(g1_ik_test_candidate_seam_reset(),
+          "candidate seam resets before all-41 rejection");
+    for (uint32_t candidate = 0;
+         candidate < G1SwingLiftCandidateCount;
+         ++candidate) {
+        g1_runtime_set_directive(
+            0, candidate, G1ClearanceUncertified);
+    }
+    array1d<vec3> exhausted_positions =
+        exhausted.db.bone_positions(0);
+    array1d<quat> exhausted_rotations =
+        exhausted.db.bone_rotations(0);
+    const array1d<vec3> exhausted_positions_before =
+        exhausted_positions;
+    const array1d<quat> exhausted_rotations_before =
+        exhausted_rotations;
+    const G1RuntimeByteSnapshot<G1IkState> exhausted_state_before(
+        exhausted.state);
+    G1IkFrameResult exhausted_result = {};
+    char error[256] = {};
+    check(g1_runtime_evaluate(
+              exhausted, exhausted_positions, exhausted_rotations,
+              exhausted_result,
+              error, static_cast<int>(sizeof(error))),
+          error);
+    const G1SwingSelectionDiagnostic& exhausted_selection =
+        exhausted_result.feet[0].swing_selection;
+    check(exhausted_result.safe_stop_requested &&
+              exhausted_result.stop_reason ==
+                  G1IkStopNoSwingCandidate &&
+              exhausted_selection.candidates_evaluated == 41 &&
+              exhausted_selection.selected_index == G1SwingNoCandidate &&
+              exhausted_selection.selected.candidate_index ==
+                  G1SwingNoCandidate &&
+              exhausted_state_before.same(exhausted.state) &&
+              g1_runtime_array_vec3_same(
+                  exhausted_positions, exhausted_positions_before) &&
+              g1_runtime_array_quat_same(
+                  exhausted_rotations, exhausted_rotations_before),
+          "all 41 rejection safe-stops with default selection and rollback");
+    const G1IkTestCandidateTrace& exhausted_trace =
+        g1_ik_test_candidate_trace();
+    G1ClearanceWork exhausted_work = {};
+    for (uint32_t candidate = 0; candidate < 41; ++candidate) {
+        exhausted_work = g1_runtime_work_add(
+            exhausted_work,
+            exhausted_trace.diagnostics[0][candidate].clearance_work);
+    }
+    check(g1_runtime_work_same(
+              exhausted_work,
+              exhausted_selection.total_clearance_work),
+          "all-41 safe stop reports exact aggregate checked work");
+
+    G1RuntimeFixture composed;
+    g1_runtime_make_fixture(composed);
+    check(g1_ik_test_candidate_seam_reset(),
+          "candidate seam resets before two-foot composition");
+    for (uint32_t candidate = 0; candidate < 2; ++candidate) {
+        g1_runtime_set_directive(
+            0, candidate, G1ClearanceUncertified);
+    }
+    for (uint32_t candidate = 0; candidate < 5; ++candidate) {
+        g1_runtime_set_directive(
+            1, candidate, G1ClearanceUncertified);
+    }
+    array1d<vec3> expected_left_positions;
+    array1d<quat> expected_left_rotations;
+    G1SwingCandidateDiagnostic expected_left = {};
+    check(g1_runtime_stage_candidate_direct(
+              composed, 0, 2,
+              composed.db.bone_rotations(0),
+              expected_left,
+              expected_left_positions,
+              expected_left_rotations),
+          "independent left winner is admissible");
+    array1d<vec3> expected_final_positions;
+    array1d<quat> expected_final_rotations;
+    G1SwingCandidateDiagnostic expected_right = {};
+    check(g1_runtime_stage_candidate_direct(
+              composed, 1, 5,
+              expected_left_rotations,
+              expected_right,
+              expected_final_positions,
+              expected_final_rotations),
+          "independent right winner is admissible after left winner");
+
+    array1d<vec3> composed_positions =
+        composed.db.bone_positions(0);
+    array1d<quat> composed_rotations =
+        composed.db.bone_rotations(0);
+    G1IkFrameResult composed_result = {};
+    check(g1_runtime_evaluate(
+              composed, composed_positions, composed_rotations,
+              composed_result,
+              error, static_cast<int>(sizeof(error))),
+          error);
+    check(composed_result.applied &&
+              composed_result.feet[0].swing_selection.selected_index == 2 &&
+              composed_result.feet[1].swing_selection.selected_index == 5 &&
+              g1_runtime_array_vec3_same(
+                  composed_positions, expected_final_positions) &&
+              g1_runtime_array_quat_same(
+                  composed_rotations, expected_final_rotations),
+          "right-foot staging starts from and preserves the left winner");
+    check(g1_runtime_candidate_same(
+              composed_result.feet[0].swing_selection.selected,
+              expected_left) &&
+          g1_runtime_candidate_same(
+              composed_result.feet[1].swing_selection.selected,
+              expected_right),
+          "both selected rotations/endpoints survive final FK equality");
+}
+
+static void test_runtime_landing_ladder_and_late_rollback()
+{
+    G1RuntimeFixture landing;
+    g1_runtime_make_fixture(landing);
+    const vec3 current =
+        landing.global_positions(g1_left_leg_config().contact);
+    g1_runtime_set_landing(
+        landing, 0, true,
+        vec3(current.x + 0.08f, current.y, current.z - 0.04f),
+        0.0f, vec3(0.0f, 1.0f, 0.0f));
+    check(g1_ik_test_candidate_seam_reset(),
+          "candidate seam resets before landing ladder authentication");
+    for (uint32_t candidate = 0; candidate < 41; ++candidate) {
+        g1_runtime_set_directive(
+            0, candidate, G1ClearanceUncertified);
+    }
+    array1d<vec3> positions = landing.db.bone_positions(0);
+    array1d<quat> rotations = landing.db.bone_rotations(0);
+    G1IkFrameResult result = {};
+    char error[256] = {};
+    check(g1_runtime_evaluate(
+              landing, positions, rotations, result,
+              error, static_cast<int>(sizeof(error))),
+          error);
+    check(result.safe_stop_requested &&
+              result.stop_reason == G1IkStopNoSwingCandidate,
+          "landing ladder fixture exhausts transactionally");
+    float landing_base_y = 0.0f;
+    check(g1_apply_swing_lift_y(
+              landing_base_y, 0.0f,
+              g1_left_leg_config().swing_clearance_m,
+              error, static_cast<int>(sizeof(error))) == G1ClearanceOk,
+          error);
+    const G1IkTestCandidateTrace& trace =
+        g1_ik_test_candidate_trace();
+    for (uint32_t candidate = 0; candidate < 41; ++candidate) {
+        float lift = 0.0f;
+        std::memcpy(
+            &lift, &G1SwingLiftCandidateBits[candidate], sizeof(lift));
+        float expected_y = 0.0f;
+        check(g1_apply_swing_lift_y(
+                  expected_y, landing_base_y, lift,
+                  error, static_cast<int>(sizeof(error))) ==
+                  G1ClearanceOk,
+              error);
+        check(terrain_float_bits(
+                  trace.base_sole_centers[0][candidate].y) ==
+                  terrain_float_bits(landing_base_y) &&
+              trace.diagnostics[0][candidate]
+                  .materialized_command_y_bits ==
+                  terrain_float_bits(expected_y),
+              "every literal lift adds once to the landing-aware lower base");
+    }
+
+    G1RuntimeFixture late;
+    g1_runtime_make_fixture(late);
+    check(g1_ik_test_candidate_seam_reset(),
+          "candidate seam resets before second-foot late failure");
+    g1_runtime_set_directive(
+        1, 0, G1ClearanceOk, G1IkTestRejectMalformedController);
+    array1d<vec3> late_positions = late.db.bone_positions(0);
+    array1d<quat> late_rotations = late.db.bone_rotations(0);
+    const array1d<vec3> late_positions_before = late_positions;
+    const array1d<quat> late_rotations_before = late_rotations;
+    const G1RuntimeByteSnapshot<G1IkState> late_state_before(late.state);
+    G1IkFrameResult late_result;
+    g1_runtime_poison_bytes(late_result, 0xc7);
+    const G1RuntimeByteSnapshot<G1IkFrameResult>
+        late_result_before(late_result);
+    check(!g1_runtime_evaluate(
+              late, late_positions, late_rotations, late_result,
+              error, static_cast<int>(sizeof(error))),
+          "malformed checked controller result aborts on the second foot");
+    check(late_state_before.same(late.state) &&
+              late_result_before.same(late_result) &&
+              g1_runtime_array_vec3_same(
+                  late_positions, late_positions_before) &&
+              g1_runtime_array_quat_same(
+                  late_rotations, late_rotations_before),
+          "second-foot late failure rolls back first-foot pose and all owners");
+}
+
+static void test_runtime_poison_and_alias_rollback()
+{
+    G1RuntimeFixture fixture;
+    g1_runtime_make_fixture(fixture);
+    fixture.state.initialized = false;
+    array1d<vec3> positions = fixture.db.bone_positions(0);
+    array1d<quat> rotations = fixture.db.bone_rotations(0);
+    const array1d<vec3> positions_before = positions;
+    const array1d<quat> rotations_before = rotations;
+    const G1RuntimeByteSnapshot<G1IkState> state_before(fixture.state);
+    G1IkFrameResult result;
+    g1_runtime_poison_bytes(result, 0xd9);
+    const G1RuntimeByteSnapshot<G1IkFrameResult> result_before(result);
+    check(!g1_runtime_evaluate(
+              fixture, positions, rotations, result, NULL, 0),
+          "poisoned uninitialized state is rejected");
+    check(state_before.same(fixture.state) &&
+              result_before.same(result) &&
+              g1_runtime_array_vec3_same(positions, positions_before) &&
+              g1_runtime_array_quat_same(rotations, rotations_before),
+          "poisoned state rejection preserves every caller owner");
+
+    G1RuntimeFixture alias;
+    g1_runtime_make_fixture(alias);
+    array1d<vec3> aliased_positions = alias.db.bone_positions(0);
+    array1d<quat> aliased_rotations = alias.db.bone_rotations(0);
+    const array1d<vec3> aliased_positions_before = aliased_positions;
+    const array1d<quat> aliased_rotations_before = aliased_rotations;
+    const G1RuntimeByteSnapshot<G1IkState> alias_state_before(alias.state);
+    G1IkFrameResult alias_result;
+    g1_runtime_poison_bytes(alias_result, 0xeb);
+    const G1RuntimeByteSnapshot<G1IkFrameResult>
+        alias_result_before(alias_result);
+    char error[256] = {};
+    check(!g1_ik_frame_evaluate(
+              aliased_positions, aliased_rotations, alias.state,
+              aliased_positions, alias.db.bone_rotations(0),
+              alias.db.bone_parents,
+              slice1d<bool>(2, alias.contact_values),
+              alias.field, alias.footprint, true, 0.04f,
+              alias_result,
+              error, static_cast<int>(sizeof(error))),
+          "mutable pose output aliasing immutable baseline is rejected");
+    check(alias_state_before.same(alias.state) &&
+              alias_result_before.same(alias_result) &&
+              g1_runtime_array_vec3_same(
+                  aliased_positions, aliased_positions_before) &&
+              g1_runtime_array_quat_same(
+                  aliased_rotations, aliased_rotations_before),
+          "baseline/output alias rejection preserves all caller bytes");
+}
+
+static void test_runtime_lock_stage_order_and_command_invariance()
+{
+    G1RuntimeFixture fixture;
+    g1_runtime_make_fixture(fixture);
+    fixture.contact_values[0] = true;
+    g1_runtime_refresh_current_probes(fixture);
+    check(g1_ik_test_candidate_seam_reset(),
+          "candidate seam resets before planted-lock bypass");
+    array1d<vec3> positions = fixture.db.bone_positions(0);
+    array1d<quat> rotations = fixture.db.bone_rotations(0);
+    G1IkFrameResult result = {};
+    char error[256] = {};
+    check(g1_runtime_evaluate(
+              fixture, positions, rotations, result,
+              error, static_cast<int>(sizeof(error))),
+          error);
+    check(result.applied && result.feet[0].recorded_contact &&
+              result.feet[0].swing_selection.candidates_evaluated == 0 &&
+              g1_ik_test_candidate_trace().calls[0] == 0,
+          "recorded contact bypasses the 41-stage ladder");
+    const vec3 locked_world = fixture.state.feet[0].lock.lock_point;
+
+    fixture.db.bone_positions(0, G1_Simulation).y += 0.32f;
+    check(g1_ik_checked_forward_kinematics(
+              fixture.global_positions, fixture.global_rotations,
+              fixture.db.bone_positions(0),
+              fixture.db.bone_rotations(0),
+              fixture.db.bone_parents,
+              error, static_cast<int>(sizeof(error))),
+          error);
+    g1_runtime_refresh_current_probes(fixture);
+    G1IkFrameTransaction level_transaction = {};
+    array1d<vec3> level_positions;
+    array1d<quat> level_rotations;
+    g1_runtime_begin(
+        fixture, fixture.footprint, level_transaction,
+        level_positions, level_rotations);
+    check(level_transaction.candidate_result.feet[0].recorded_contact &&
+              g1_runtime_vec3_bits_same(
+                  level_transaction.candidate_result.feet[0]
+                      .target.sole_center,
+                  locked_world),
+          "planted lock retains its world-space target across root level change");
+
+    fixture.contact_values[0] = false;
+    g1_runtime_refresh_current_probes(fixture);
+    G1IkFrameTransaction release_transaction = {};
+    array1d<vec3> release_positions;
+    array1d<quat> release_rotations;
+    g1_runtime_begin(
+        fixture, fixture.footprint, release_transaction,
+        release_positions, release_rotations);
+    check(release_transaction.candidate_state.feet[0].lock.releasing &&
+              !release_transaction.candidate_result.feet[0]
+                   .recorded_contact,
+          "checked falling edge enters bounded release before swing staging");
+
+    G1RuntimeFixture ordered;
+    g1_runtime_make_fixture(ordered);
+    G1CommandSnapshot command;
+    g1_runtime_poison_bytes(command, 0x73);
+    const G1RuntimeByteSnapshot<G1CommandSnapshot> command_before(command);
+    G1IkFrameTransaction transaction = {};
+    array1d<vec3> scratch_positions;
+    array1d<quat> scratch_rotations;
+    g1_runtime_begin(
+        ordered, ordered.footprint, transaction,
+        scratch_positions, scratch_rotations);
+    check(command_before.same(command),
+          "begin cannot mutate a sentinel command snapshot");
+    const G1RuntimeByteSnapshot<G1IkFrameTransaction>
+        before_wrong_order(transaction);
+    const array1d<vec3> before_wrong_positions = scratch_positions;
+    const array1d<quat> before_wrong_rotations = scratch_rotations;
+    check(!g1_ik_frame_stage_foot(
+              transaction, scratch_positions, scratch_rotations, 1,
+              ordered.db.bone_parents,
+              slice1d<bool>(2, ordered.contact_values),
+              ordered.field, ordered.footprint,
+              true, 0.04f, NULL, 0) &&
+              before_wrong_order.same(transaction) &&
+              g1_runtime_array_vec3_same(
+                  scratch_positions, before_wrong_positions) &&
+              g1_runtime_array_quat_same(
+                  scratch_rotations, before_wrong_rotations),
+          "stage rejects a foot that is not exactly next");
+    check(command_before.same(command),
+          "failed stage cannot mutate command bytes");
+    check(g1_ik_frame_stage_foot(
+              transaction, scratch_positions, scratch_rotations, 0,
+              ordered.db.bone_parents,
+              slice1d<bool>(2, ordered.contact_values),
+              ordered.field, ordered.footprint,
+              true, 0.04f,
+              error, static_cast<int>(sizeof(error))),
+          error);
+    G1IkState output_state = ordered.state;
+    G1IkFrameResult output_result = {};
+    const G1RuntimeByteSnapshot<G1IkState>
+        output_state_before(output_state);
+    const G1RuntimeByteSnapshot<G1IkFrameResult>
+        output_result_before(output_result);
+    check(!g1_ik_frame_finish(
+              output_state, output_result, transaction,
+              scratch_positions, scratch_rotations,
+              ordered.db.bone_parents, ordered.field, 0.04f,
+              NULL, 0) &&
+              output_state_before.same(output_state) &&
+              output_result_before.same(output_result),
+          "finish requires two fully staged feet transactionally");
+    check(g1_ik_frame_stage_foot(
+              transaction, scratch_positions, scratch_rotations, 1,
+              ordered.db.bone_parents,
+              slice1d<bool>(2, ordered.contact_values),
+              ordered.field, ordered.footprint,
+              true, 0.04f,
+              error, static_cast<int>(sizeof(error))),
+          error);
+    check(g1_ik_frame_finish(
+              output_state, output_result, transaction,
+              scratch_positions, scratch_rotations,
+              ordered.db.bone_parents, ordered.field, 0.04f,
+              error, static_cast<int>(sizeof(error))),
+          error);
+    check(command_before.same(command),
+          "finish cannot mutate requested travel or heading bytes");
+
+    G1IkSafeStopHandoff handoff = {};
+    check(g1_ik_safe_stop_handoff(
+              handoff, true, vec3(1.25f, 0.75f, -0.50f),
+              error, static_cast<int>(sizeof(error))) &&
+              terrain_float_bits(handoff.applied_velocity.x) == 0 &&
+              terrain_float_bits(handoff.applied_velocity.z) == 0 &&
+              terrain_float_bits(handoff.applied_velocity.y) ==
+                  terrain_float_bits(0.75f) &&
+              handoff.cancel_planar_inertia && handoff.force_search,
+          "latched safe stop zeroes only planar travel and forces one search");
+    check(g1_ik_safe_stop_handoff(
+              handoff, false, vec3(1.25f, 0.75f, -0.50f),
+              error, static_cast<int>(sizeof(error)) ) &&
+              g1_runtime_vec3_bits_same(
+                  handoff.applied_velocity,
+                  vec3(1.25f, 0.75f, -0.50f)) &&
+              !handoff.cancel_planar_inertia && !handoff.force_search,
+          "unlatched handoff preserves the complete requested velocity");
+
+    const char* const names[] = {
+        "none", "footprint-blocked", "footprint-outside-domain",
+        "footprint-budget-exceeded", "landing-patch-unavailable",
+        "target-unreachable", "no-swing-candidate",
+        "pose-clearance-rejected"
+    };
+    for (int reason = G1IkStopNone;
+         reason <= G1IkStopPoseClearanceRejected;
+         ++reason) {
+        check(std::strcmp(
+                  g1_ik_stop_reason_name(
+                      static_cast<G1IkStopReason>(reason)),
+                  names[reason]) == 0,
+              "stop reason diagnostic order is exact");
+    }
+    check(std::strcmp(
+              g1_ik_stop_reason_name(
+                  static_cast<G1IkStopReason>(999)),
+              "invalid") == 0,
+          "unknown stop reason is diagnostic-only invalid");
+}
+
+static int run_runtime_parity_mode()
+{
+    G1RuntimeFixture fixture;
+    g1_runtime_make_fixture(fixture);
+    G1SwingHistory history = fixture.state.feet[0].swing;
+    vec3 centers[4] = {};
+    for (int probe = 0; probe < 4; ++probe) {
+        centers[probe] = fixture.footprint.feet[0]
+            .probes[probe].current_sphere_center;
+    }
+    G1SwingClearanceValidation validation = {};
+    const G1ClearanceStatus status = g1_swing_clearance_validate(
+        validation, g1_swing_foot_clearance_budget(),
+        history, fixture.field, g1_left_leg_config(),
+        centers, false, 0.04f, NULL, 0);
+    std::printf(
+        "runtime-parity status=%u ladder=%08x,%08x,%08x "
+        "margins=%016llx,%016llx work=%u,%u,%u,%u,%u,%u\n",
+        static_cast<unsigned int>(status),
+        G1SwingLiftCandidateBits[0],
+        G1SwingLiftCandidateBits[20],
+        G1SwingLiftCandidateBits[40],
+        static_cast<unsigned long long>(
+            g1_runtime_double_bits(validation.lower_margin_m)),
+        static_cast<unsigned long long>(
+            g1_runtime_double_bits(validation.witness_upper_m)),
+        validation.work.point_queries,
+        validation.work.cells_visited,
+        validation.work.primitive_triangle_pairs,
+        validation.work.face_patches,
+        validation.work.candidate_tests,
+        validation.work.subdivision_nodes);
+    return status == G1ClearanceOk ? 0 : 1;
+}
+
+#endif
+
+int main(int argc, char** argv)
+{
+#if defined(G1_IK_ENABLE_TEST_SEAMS)
+    if (argc == 2 && std::strcmp(argv[1], "--parity") == 0) {
+        return run_runtime_parity_mode();
+    }
+#else
+    (void)argc;
+    (void)argv;
+#endif
     test_explicit_leg_geometry();
     test_database_shape_and_chain_validation();
     test_database_local_basis_validation();
@@ -3390,5 +4612,15 @@ int main()
     test_surface_orientation_staged_pose_and_fallback();
     test_surface_orientation_limit_semantics();
     test_surface_orientation_hostile_rollback();
+#if defined(G1_IK_ENABLE_TEST_SEAMS)
+    test_runtime_state_reset_and_footprint_preflight();
+    test_runtime_blocked_and_landing_contract();
+    test_runtime_real_41_stage_selector();
+    test_runtime_status_table_and_local_rejections();
+    test_runtime_all_41_and_two_foot_composition();
+    test_runtime_landing_ladder_and_late_rollback();
+    test_runtime_poison_and_alias_rollback();
+    test_runtime_lock_stage_order_and_command_invariance();
+#endif
     return 0;
 }
