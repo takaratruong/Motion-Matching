@@ -1849,11 +1849,21 @@ void test_offcenter_rotating_sweep_uses_angular_inflation() {
 }
 
 void test_commit_time_is_bounded_at_every_playback_speed() {
+    constexpr float strict_boundary_speed = 1.1428570747375488F;
+    TEST_CHECK(
+        strict_boundary_speed == std::nextafter(8.0F / 7.0F, 0.0F));
     for (bool recorded : {true, false}) {
-        for (float speed : {0.85F, 1.0F, 1.15F}) {
+        for (float speed : {
+                 0.85F, 1.0F, strict_boundary_speed, 1.15F}) {
             Fixture fixture = make_fixture(recorded);
             fixture.input.timing.playback_speed = speed;
             PlaceBeginInput begin = selected_begin(fixture);
+            const int64_t source_delta = std::abs(
+                static_cast<int64_t>(begin.candidate.commit_frame) -
+                begin.candidate.entry_frame);
+            const int32_t expected_ticks = static_cast<int32_t>(std::ceil(
+                static_cast<double>(source_delta) /
+                static_cast<double>(speed)));
             PlaceController controller = make_controller(fixture);
             TEST_CHECK(controller.begin(begin).accepted);
             int ticks = 0;
@@ -1862,9 +1872,13 @@ void test_commit_time_is_bounded_at_every_playback_speed() {
                 step = controller.update(0.04F);
                 ++ticks;
                 TEST_CHECK(ticks < 64);
+                if (ticks < expected_ticks) {
+                    TEST_CHECK(!step.committed);
+                }
             } while (!step.committed && !step.recover_to_carry);
             const float elapsed = static_cast<float>(ticks) * 0.04F;
             TEST_CHECK(step.committed);
+            TEST_CHECK(ticks == expected_ticks);
             TEST_CHECK(step.source_frame == begin.candidate.commit_frame);
             TEST_CHECK(elapsed >= fixture.input.timing.entry_blend_seconds);
             TEST_CHECK(elapsed <= fixture.input.timing.maximum_alignment_seconds);

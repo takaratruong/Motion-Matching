@@ -1067,20 +1067,32 @@ struct RecordedRow {
     const PlaceAffordance* source_affordance = nullptr;
 };
 
+std::optional<int32_t> observable_event_ticks(
+    int64_t source_samples,
+    float playback_speed) {
+    if (source_samples <= 0 ||
+        !rotation_gate::finite_bits(playback_speed) ||
+        !(playback_speed > 0.0F)) {
+        return std::nullopt;
+    }
+    const double tick_value = std::ceil(
+        static_cast<double>(source_samples) /
+        static_cast<double>(playback_speed));
+    if (!rotation_gate::finite_bits(tick_value) || tick_value < 1.0 ||
+        tick_value > std::numeric_limits<int32_t>::max()) {
+        return std::nullopt;
+    }
+    return static_cast<int32_t>(tick_value);
+}
+
 bool observable_commit_timing_valid(
     int32_t source_samples,
     const PlaceTimingConfig& timing) {
-    if (source_samples <= 0) return false;
-    const double tick_value = std::ceil(
-        static_cast<double>(source_samples) /
-        static_cast<double>(timing.playback_speed));
-    if (!rotation_gate::finite_bits(tick_value) || tick_value < 1.0 ||
-        tick_value > std::numeric_limits<int32_t>::max()) {
-        return false;
-    }
-    const int32_t ticks = static_cast<int32_t>(tick_value);
+    const std::optional<int32_t> ticks = observable_event_ticks(
+        source_samples, timing.playback_speed);
+    if (!ticks.has_value()) return false;
     const float elapsed_seconds = static_cast<float>(
-        static_cast<double>(ticks) /
+        static_cast<double>(*ticks) /
         static_cast<double>(kCanonicalFps));
     return elapsed_seconds >= timing.entry_blend_seconds &&
            elapsed_seconds <= timing.maximum_alignment_seconds;
@@ -1923,10 +1935,6 @@ Pose interpolate_source_pose(
     const PlaceCandidate& candidate,
     const PlaceMatchInput& input,
     double source_frame) {
-    const double rounded = std::round(source_frame);
-    if (std::abs(source_frame - rounded) <= kSourceFrameSnapTolerance) {
-        source_frame = rounded;
-    }
     const int32_t left = static_cast<int32_t>(std::floor(source_frame));
     const int32_t maximum = candidate.direction > 0
         ? candidate.stop_frame
@@ -1967,10 +1975,6 @@ Transform recorded_source_object(
     const PlaceCandidate& candidate,
     const PlaceMatchInput& input,
     double source_frame) {
-    const double rounded = std::round(source_frame);
-    if (std::abs(source_frame - rounded) <= kSourceFrameSnapTolerance) {
-        source_frame = rounded;
-    }
     const int32_t left = static_cast<int32_t>(std::floor(source_frame));
     const int32_t right = std::min(left + 1, candidate.stop_frame);
     const float alpha = static_cast<float>(source_frame - left);
@@ -2023,23 +2027,34 @@ Pose mapped_source_pose(
     return pose;
 }
 
-bool crosses(
-    double current,
-    double proposed,
-    int32_t event,
-    int32_t direction) {
-    if (direction > 0) {
-        return current < event && proposed >= event;
-    }
-    return current > event && proposed <= event;
-}
-
-int32_t discrete_source_frame(double source_frame) {
+int32_t discrete_source_frame(
+    double source_frame,
+    int32_t direction,
+    std::optional<int32_t> hidden_event_frame = std::nullopt) {
     const double rounded = std::round(source_frame);
     if (std::abs(source_frame - rounded) <= kSourceFrameSnapTolerance) {
-        return static_cast<int32_t>(rounded);
+        const int32_t rounded_frame = static_cast<int32_t>(rounded);
+        if (hidden_event_frame.has_value() &&
+            rounded_frame == *hidden_event_frame &&
+            source_frame != rounded) {
+            return rounded_frame - direction;
+        }
+        return rounded_frame;
     }
     return static_cast<int32_t>(std::floor(source_frame));
+}
+
+std::optional<int32_t> hidden_pending_event_frame(
+    const PlaceCandidate& candidate,
+    bool committed,
+    bool release_latched,
+    bool release_acknowledged,
+    bool finished) {
+    if (finished || release_latched) return std::nullopt;
+    if (!committed) return candidate.commit_frame;
+    return release_acknowledged
+        ? std::optional<int32_t>(candidate.stop_frame)
+        : std::optional<int32_t>(candidate.release_frame);
 }
 
 }  // namespace
@@ -2113,9 +2128,33 @@ void PlacePlayer::start(
 void PlacePlayer::start_validated(
     const PlaceCandidate& candidate,
     const PlaceMatchInput& input) {
+    const auto event_distance = [](int32_t start, int32_t stop) {
+        const int64_t difference =
+            static_cast<int64_t>(stop) - start;
+        return difference < 0 ? -difference : difference;
+    };
+    const std::optional<int32_t> commit_ticks = observable_event_ticks(
+        event_distance(candidate.entry_frame, candidate.commit_frame),
+        candidate.timing.playback_speed);
+    const std::optional<int32_t> release_ticks = observable_event_ticks(
+        event_distance(candidate.commit_frame, candidate.release_frame),
+        candidate.timing.playback_speed);
+    const std::optional<int32_t> stop_ticks = observable_event_ticks(
+        event_distance(candidate.release_frame, candidate.stop_frame),
+        candidate.timing.playback_speed);
+    if (!commit_ticks.has_value() || !release_ticks.has_value() ||
+        !stop_ticks.has_value()) {
+        throw std::invalid_argument(
+            "place player candidate event timing is invalid");
+    }
+
     candidate_ = candidate;
     input_ = input;
     source_frame_ = candidate.entry_frame;
+    segment_tick_ = 0;
+    commit_tick_count_ = *commit_ticks;
+    release_tick_count_ = *release_ticks;
+    stop_tick_count_ = *stop_ticks;
     started_ = true;
     committed_ = false;
     release_latched_ = false;
@@ -2130,47 +2169,47 @@ void PlacePlayer::advance(float dt) {
     }
     if (finished_ || release_latched_) return;
 
-    double canonical_ticks = static_cast<double>(dt) * kCanonicalFps;
-    if (std::abs(canonical_ticks - 1.0) <= 1.0e-6) {
-        canonical_ticks = 1.0;
+    ++segment_tick_;
+    const int32_t segment_start = !committed_
+        ? candidate_.entry_frame
+        : release_acknowledged_
+            ? candidate_.release_frame
+            : candidate_.commit_frame;
+    const int32_t event_frame = !committed_
+        ? candidate_.commit_frame
+        : release_acknowledged_
+            ? candidate_.stop_frame
+            : candidate_.release_frame;
+    const int32_t event_tick_count = !committed_
+        ? commit_tick_count_
+        : release_acknowledged_
+            ? stop_tick_count_
+            : release_tick_count_;
+
+    if (segment_tick_ >= event_tick_count) {
+        source_frame_ = event_frame;
+        segment_tick_ = 0;
+        if (!committed_) {
+            committed_ = true;
+        } else if (!release_acknowledged_) {
+            release_latched_ = true;
+        } else {
+            finished_ = true;
+        }
+        return;
     }
-    const double step =
-        canonical_ticks * candidate_.timing.playback_speed;
-    double proposed =
-        source_frame_ + static_cast<double>(candidate_.direction) * step;
+
+    double proposed = static_cast<double>(segment_start) +
+        static_cast<double>(candidate_.direction) *
+        static_cast<double>(segment_tick_) *
+        static_cast<double>(candidate_.timing.playback_speed);
     const double nearest_source_frame = std::round(proposed);
     if (std::abs(proposed - nearest_source_frame) <=
-        kSourceFrameSnapTolerance) {
+            kSourceFrameSnapTolerance &&
+        nearest_source_frame != static_cast<double>(event_frame)) {
         proposed = nearest_source_frame;
     }
 
-    if (!committed_ && crosses(
-            source_frame_,
-            proposed,
-            candidate_.commit_frame,
-            candidate_.direction)) {
-        source_frame_ = candidate_.commit_frame;
-        committed_ = true;
-        return;
-    }
-    if (!release_acknowledged_ && crosses(
-            source_frame_,
-            proposed,
-            candidate_.release_frame,
-            candidate_.direction)) {
-        source_frame_ = candidate_.release_frame;
-        release_latched_ = true;
-        return;
-    }
-    if (release_acknowledged_ && crosses(
-            source_frame_,
-            proposed,
-            candidate_.stop_frame,
-            candidate_.direction)) {
-        source_frame_ = candidate_.stop_frame;
-        finished_ = true;
-        return;
-    }
     source_frame_ = proposed;
 }
 
@@ -2178,7 +2217,15 @@ PlaceSample PlacePlayer::sample() const {
     if (!started_) throw std::logic_error("place player is not started");
     PlaceSample result{};
     result.pose = mapped_source_pose(candidate_, input_, source_frame_);
-    result.source_frame = discrete_source_frame(source_frame_);
+    result.source_frame = discrete_source_frame(
+        source_frame_,
+        candidate_.direction,
+        hidden_pending_event_frame(
+            candidate_,
+            committed_,
+            release_latched_,
+            release_acknowledged_,
+            finished_));
     result.phase = phase();
     result.committed = committed_;
     if (candidate_.mode == PlaceMotionMode::RecordedPlace) {
@@ -2203,7 +2250,17 @@ rotation_gate::Rotation PlacePlayer::mapped_root_rotation_evidence() const {
 }
 
 int32_t PlacePlayer::source_frame() const {
-    return started_ ? discrete_source_frame(source_frame_) : -1;
+    return started_
+        ? discrete_source_frame(
+            source_frame_,
+            candidate_.direction,
+            hidden_pending_event_frame(
+                candidate_,
+                committed_,
+                release_latched_,
+                release_acknowledged_,
+                finished_))
+        : -1;
 }
 
 double PlacePlayer::source_frame_exact() const {
@@ -2234,6 +2291,7 @@ void PlacePlayer::acknowledge_release() {
     }
     release_latched_ = false;
     release_acknowledged_ = true;
+    segment_tick_ = 0;
 }
 
 bool PlacePlayer::finished() const {

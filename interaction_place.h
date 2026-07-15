@@ -151,6 +151,10 @@ private:
     PlaceCandidate candidate_{};
     PlaceMatchInput input_{};
     double source_frame_ = 0.0;
+    int32_t segment_tick_ = 0;
+    int32_t commit_tick_count_ = 0;
+    int32_t release_tick_count_ = 0;
+    int32_t stop_tick_count_ = 0;
     bool started_ = false;
     bool committed_ = false;
     bool release_latched_ = false;

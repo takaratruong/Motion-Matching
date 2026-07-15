@@ -2564,6 +2564,272 @@ void advance_until_release(PlacePlayer& player) {
     TEST_CHECK(player.release_due());
 }
 
+int32_t ticks_until_commit(PlacePlayer& player) {
+    int32_t ticks = 0;
+    while (!player.committed() && ticks < 100) {
+        player.advance(0.04F);
+        ++ticks;
+    }
+    TEST_CHECK(player.committed());
+    return ticks;
+}
+
+int32_t ticks_until_release(PlacePlayer& player) {
+    int32_t ticks = 0;
+    while (!player.release_due() && ticks < 100) {
+        player.advance(0.04F);
+        ++ticks;
+    }
+    TEST_CHECK(player.release_due());
+    return ticks;
+}
+
+void configure_recorded_events(
+    PlaceFixture& fixture,
+    int32_t commit_frame,
+    int32_t release_frame) {
+    RecordedPlaceClip& clip = fixture.library.recorded.front();
+    clip.commit_frame = commit_frame;
+    clip.release_frame = release_frame;
+    for (int32_t frame = clip.entry_frame;
+         frame <= clip.retract_stop_frame;
+         ++frame) {
+        Transform object = clip.object_poses[static_cast<size_t>(frame)];
+        object.position.y = frame <= release_frame
+            ? 0.80F + 0.01F * static_cast<float>(release_frame - frame)
+            : 0.80F;
+        set_clip_object_and_hand(clip, frame, object);
+        clip.active_hand_contacts[static_cast<size_t>(frame)] =
+            frame <= release_frame ? 1U : 0U;
+    }
+
+    const Transform goal = placement_goal_world(
+        fixture.input.surface,
+        fixture.input.place_affordance.object_in_surface);
+    const Transform scene = compose(
+        goal,
+        inverse(clip.object_poses[static_cast<size_t>(release_frame)]));
+    fixture.input.current_pose =
+        clip.poses[static_cast<size_t>(clip.entry_frame)];
+    const Transform mapped_root = compose(
+        scene, root_transform(fixture.input.current_pose));
+    fixture.input.current_pose.positions[kRoot] = mapped_root.position;
+    fixture.input.current_pose.rotations[kRoot] = mapped_root.rotation;
+    fixture.input.current_object_world = compose(
+        scene,
+        clip.object_poses[static_cast<size_t>(clip.entry_frame)]);
+    refresh_pointers(fixture);
+}
+
+void configure_event_visibility_markers(
+    PlaceFixture& fixture,
+    bool recorded,
+    int32_t event_frame,
+    int32_t direction) {
+    constexpr float object_marker_m = 0.15F;
+    const int32_t prior_frame = event_frame - direction;
+    if (recorded) {
+        RecordedPlaceClip& clip = fixture.library.recorded.front();
+        for (int32_t frame : {prior_frame, event_frame}) {
+            Pose& pose = clip.poses[static_cast<size_t>(frame)];
+            pose.positions[g1_skeleton::LeftToe].x =
+                frame == event_frame ? 0.0F : 1.0F;
+            Transform object =
+                clip.object_poses[static_cast<size_t>(frame)];
+            object.position.x +=
+                frame == event_frame ? object_marker_m : -object_marker_m;
+            set_clip_object_and_hand(clip, frame, object);
+        }
+        configure_recorded_events(
+            fixture, clip.commit_frame, clip.release_frame);
+        return;
+    }
+
+    for (int32_t frame : {prior_frame, event_frame}) {
+        Pose pose = pose_at_frame(fixture.database, frame);
+        pose.positions[g1_skeleton::LeftToe].x =
+            frame == event_frame ? 0.0F : 1.0F;
+        write_bone_position(
+            fixture.database,
+            frame,
+            g1_skeleton::LeftToe,
+            pose.positions[g1_skeleton::LeftToe]);
+        Transform object = database_object_at(fixture.database, frame);
+        object.position.x +=
+            frame == event_frame ? object_marker_m : -object_marker_m;
+        set_database_object_and_hand(fixture.database, frame, object);
+    }
+    refresh_pointers(fixture);
+}
+
+void require_event_hidden_until_strict_tick(
+    PlacePlayer& player,
+    int32_t event_frame,
+    int32_t direction,
+    int32_t strict_ticks) {
+    TEST_CHECK(strict_ticks > 1);
+    for (int32_t tick = 1; tick < strict_ticks; ++tick) {
+        player.advance(0.04F);
+    }
+
+    const double remaining = static_cast<double>(direction) *
+        (static_cast<double>(event_frame) - player.source_frame_exact());
+    TEST_CHECK(remaining > 0.0);
+    const PlaceSample hidden = player.sample();
+    TEST_CHECK(hidden.source_frame != event_frame);
+
+    player.advance(0.04F);
+    TEST_CHECK(player.source_frame_exact() == event_frame);
+    const PlaceSample visible = player.sample();
+    TEST_CHECK(
+        hidden.pose.positions[g1_skeleton::LeftToe].x !=
+        visible.pose.positions[g1_skeleton::LeftToe].x);
+    TEST_CHECK(
+        hidden.source_object.position.x != visible.source_object.position.x);
+}
+
+void test_player_events_use_strict_ceil_tick_clock() {
+    constexpr float speed = 1.1428570747375488F;
+    TEST_CHECK(speed == std::nextafter(8.0F / 7.0F, 0.0F));
+    const auto strict_ticks = [speed](int32_t source_delta) {
+        return static_cast<int32_t>(std::ceil(
+            static_cast<double>(source_delta) /
+            static_cast<double>(speed)));
+    };
+    TEST_CHECK(strict_ticks(8) == 8);
+
+    PlaceFixture recorded_commit = make_fixture();
+    disable_reverse_tier(recorded_commit);
+    configure_event_visibility_markers(recorded_commit, true, 8, 1);
+    recorded_commit.input.timing.playback_speed = speed;
+    recorded_commit.input.timing.entry_blend_seconds = 0.32F;
+    const PlaceResult recorded_commit_selection = select_place_motion(
+        recorded_commit.input);
+    TEST_CHECK(recorded_commit_selection.accepted);
+    TEST_CHECK(recorded_commit_selection.candidate.mode ==
+               PlaceMotionMode::RecordedPlace);
+    PlacePlayer recorded_commit_player;
+    recorded_commit_player.start(
+        recorded_commit_selection.candidate, recorded_commit.input);
+    require_event_hidden_until_strict_tick(
+        recorded_commit_player,
+        recorded_commit_selection.candidate.commit_frame,
+        recorded_commit_selection.candidate.direction,
+        strict_ticks(8));
+    TEST_CHECK(recorded_commit_player.committed());
+
+    PlaceFixture recorded_release = make_fixture();
+    disable_reverse_tier(recorded_release);
+    configure_recorded_events(recorded_release, 1, 9);
+    configure_event_visibility_markers(recorded_release, true, 9, 1);
+    recorded_release.input.timing.playback_speed = speed;
+    recorded_release.input.timing.entry_blend_seconds = 0.04F;
+    const PlaceResult recorded_release_selection = select_place_motion(
+        recorded_release.input);
+    TEST_CHECK(recorded_release_selection.accepted);
+    PlacePlayer recorded_release_player;
+    recorded_release_player.start(
+        recorded_release_selection.candidate, recorded_release.input);
+    TEST_CHECK(ticks_until_commit(recorded_release_player) == 1);
+    require_event_hidden_until_strict_tick(
+        recorded_release_player,
+        recorded_release_selection.candidate.release_frame,
+        recorded_release_selection.candidate.direction,
+        strict_ticks(8));
+    TEST_CHECK(recorded_release_player.release_due());
+
+    PlaceFixture recorded_stop = make_fixture();
+    disable_reverse_tier(recorded_stop);
+    configure_recorded_events(recorded_stop, 1, 7);
+    configure_event_visibility_markers(recorded_stop, true, 15, 1);
+    recorded_stop.input.timing.playback_speed = speed;
+    recorded_stop.input.timing.entry_blend_seconds = 0.04F;
+    const PlaceResult recorded_stop_selection = select_place_motion(
+        recorded_stop.input);
+    TEST_CHECK(recorded_stop_selection.accepted);
+    PlacePlayer recorded_stop_player;
+    recorded_stop_player.start(
+        recorded_stop_selection.candidate, recorded_stop.input);
+    TEST_CHECK(ticks_until_commit(recorded_stop_player) == 1);
+    TEST_CHECK(ticks_until_release(recorded_stop_player) == strict_ticks(6));
+    recorded_stop_player.acknowledge_release();
+    require_event_hidden_until_strict_tick(
+        recorded_stop_player,
+        recorded_stop_selection.candidate.stop_frame,
+        recorded_stop_selection.candidate.direction,
+        strict_ticks(8));
+    TEST_CHECK(recorded_stop_player.finished());
+
+    PlaceFixture reverse_commit = make_fixture(false);
+    configure_event_visibility_markers(reverse_commit, false, 15, -1);
+    reverse_commit.input.timing.playback_speed = speed;
+    reverse_commit.input.timing.entry_blend_seconds = 0.32F;
+    reverse_commit.input.timing.reversed_commit_seconds = 0.30F;
+    const PlaceResult reverse_commit_selection = select_place_motion(
+        reverse_commit.input);
+    TEST_CHECK(reverse_commit_selection.accepted);
+    TEST_CHECK(reverse_commit_selection.candidate.mode ==
+               PlaceMotionMode::ReversedPickup);
+    TEST_CHECK(
+        reverse_commit_selection.candidate.entry_frame -
+            reverse_commit_selection.candidate.commit_frame == 8);
+    PlacePlayer reverse_commit_player;
+    reverse_commit_player.start(
+        reverse_commit_selection.candidate, reverse_commit.input);
+    require_event_hidden_until_strict_tick(
+        reverse_commit_player,
+        reverse_commit_selection.candidate.commit_frame,
+        reverse_commit_selection.candidate.direction,
+        strict_ticks(8));
+    TEST_CHECK(reverse_commit_player.committed());
+
+    PlaceFixture reverse_release = make_fixture(false);
+    configure_event_visibility_markers(reverse_release, false, 8, -1);
+    reverse_release.input.timing.playback_speed = speed;
+    reverse_release.input.timing.entry_blend_seconds = 0.28F;
+    reverse_release.input.timing.reversed_commit_seconds = 0.27F;
+    const PlaceResult reverse_release_selection = select_place_motion(
+        reverse_release.input);
+    TEST_CHECK(reverse_release_selection.accepted);
+    TEST_CHECK(
+        reverse_release_selection.candidate.commit_frame -
+            reverse_release_selection.candidate.release_frame == 8);
+    PlacePlayer reverse_release_player;
+    reverse_release_player.start(
+        reverse_release_selection.candidate, reverse_release.input);
+    TEST_CHECK(ticks_until_commit(reverse_release_player) == strict_ticks(7));
+    require_event_hidden_until_strict_tick(
+        reverse_release_player,
+        reverse_release_selection.candidate.release_frame,
+        reverse_release_selection.candidate.direction,
+        strict_ticks(8));
+    TEST_CHECK(reverse_release_player.release_due());
+
+    PlaceFixture reverse_stop = make_fixture(false);
+    configure_event_visibility_markers(reverse_stop, false, 0, -1);
+    reverse_stop.input.timing.playback_speed = speed;
+    reverse_stop.input.timing.entry_blend_seconds = 0.32F;
+    reverse_stop.input.timing.reversed_commit_seconds = 0.30F;
+    const PlaceResult reverse_stop_selection = select_place_motion(
+        reverse_stop.input);
+    TEST_CHECK(reverse_stop_selection.accepted);
+    TEST_CHECK(
+        reverse_stop_selection.candidate.release_frame -
+            reverse_stop_selection.candidate.stop_frame == 8);
+    PlacePlayer reverse_stop_player;
+    reverse_stop_player.start(
+        reverse_stop_selection.candidate, reverse_stop.input);
+    ticks_until_commit(reverse_stop_player);
+    ticks_until_release(reverse_stop_player);
+    reverse_stop_player.acknowledge_release();
+    require_event_hidden_until_strict_tick(
+        reverse_stop_player,
+        reverse_stop_selection.candidate.stop_frame,
+        reverse_stop_selection.candidate.direction,
+        strict_ticks(8));
+    TEST_CHECK(reverse_stop_player.finished());
+}
+
 void test_reverse_player_native_25hz_and_derivative_direction() {
     PlaceFixture fixture = make_fixture(false);
     const PlaceResult selected = select_place_motion(fixture.input);
@@ -3031,6 +3297,7 @@ int main(int argc, char** argv) {
     test_canonical_identity_normalizes_negative_zero_and_quaternion_sign();
     test_commit_event_derivation_and_runtime_bounds();
     test_mapped_reverse_hand_correction_uses_exact_ik_limit();
+    test_player_events_use_strict_ceil_tick_clock();
     test_reverse_player_native_25hz_and_derivative_direction();
     test_reverse_player_snaps_fractional_speed_integer_alignment();
     test_reverse_player_shortest_arc_and_hand_derived_object();
