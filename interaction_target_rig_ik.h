@@ -45,6 +45,7 @@ private:
     quat calibration_rotation_{};
     bool has_previous_pole_ = false;
     bool pole_stabilized_ = false;
+    bool pole_reacquiring_ = false;
     vec3 previous_pole_spine_{};
 };
 

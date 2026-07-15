@@ -246,6 +246,7 @@ void TargetRigArmIK::begin_epoch(
     active_ = true;
     has_previous_pole_ = false;
     pole_stabilized_ = false;
+    pole_reacquiring_ = false;
 
     const vec3 arm_direction = safe_direction(
         target_world.positions[chain.hand] -
@@ -354,15 +355,10 @@ TargetRigArmIKResult TargetRigArmIK::solve(
 
     vec3 upper_root = world.positions[chain.upper_arm];
     float arm_distance = length(solved_target - upper_root);
-    const float assisted_arm_outer = result.reachable
-        ? preferred_arm_outer
-        : arm_outer;
-    if (arm_distance > assisted_arm_outer + config_.reach_epsilon_m ||
+    const bool needs_outer_clavicle_assist =
+        arm_distance > arm_outer + config_.reach_epsilon_m;
+    if (needs_outer_clavicle_assist ||
         arm_distance < arm_inner - config_.reach_epsilon_m) {
-        const float desired_arm_distance =
-            arm_distance > assisted_arm_outer
-            ? assisted_arm_outer
-            : arm_inner;
         const float shoulder_target_distance = length(solved_target - shoulder);
         const vec3 shoulder_target_direction = safe_direction(
             solved_target - shoulder,
@@ -374,6 +370,15 @@ TargetRigArmIKResult TargetRigArmIK::solve(
         const float feasible_arm_maximum = std::min(
             arm_outer,
             shoulder_target_distance + clavicle_length);
+        const bool preferred_bend_is_feasible =
+            result.reachable &&
+            preferred_arm_outer >= feasible_arm_minimum &&
+            preferred_arm_outer <= feasible_arm_maximum;
+        const float desired_arm_distance = needs_outer_clavicle_assist
+            ? (preferred_bend_is_feasible
+                  ? preferred_arm_outer
+                  : arm_outer)
+            : arm_inner;
         const float feasible_arm_distance =
             feasible_arm_minimum <= feasible_arm_maximum
             ? std::clamp(
@@ -456,12 +461,18 @@ TargetRigArmIKResult TargetRigArmIK::solve(
     const float elbow_radial = std::sqrt(std::max(
         0.0F,
         upper_length * upper_length - elbow_along * elbow_along));
+    const bool was_pole_stabilized = pole_stabilized_;
     if (pole_stabilized_) {
         pole_stabilized_ =
             elbow_radial < kPoleStabilityExitRadiusM;
     } else {
         pole_stabilized_ =
             elbow_radial < kPoleStabilityEnterRadiusM;
+    }
+    if (was_pole_stabilized && !pole_stabilized_) {
+        pole_reacquiring_ = true;
+    } else if (pole_stabilized_) {
+        pole_reacquiring_ = false;
     }
     vec3 pole = pole_stabilized_ && has_previous_pole_
         ? perpendicular(
@@ -486,17 +497,26 @@ TargetRigArmIKResult TargetRigArmIK::solve(
     if (has_previous_pole_ && dot(pole, previous_pole_world) < 0.0F) {
         pole = -pole;
     }
-    if (has_previous_pole_ && !pole_stabilized_) {
+    if (has_previous_pole_ && pole_reacquiring_) {
         const vec3 previous_projected = perpendicular(
             previous_pole_world,
             arm_direction,
             config_.pole_epsilon_m);
         if (length(previous_projected) > config_.pole_epsilon_m) {
+            const float maximum_angle =
+                kPoleTrackingRateRadiansPerSecond * dt;
+            const float authored_angle = std::acos(std::clamp(
+                dot(previous_projected, pole), -1.0F, 1.0F));
             pole = bounded_direction_step(
                 previous_projected,
                 pole,
-                kPoleTrackingRateRadiansPerSecond * dt,
+                maximum_angle,
                 config_.pole_epsilon_m);
+            if (!(authored_angle > maximum_angle)) {
+                pole_reacquiring_ = false;
+            }
+        } else {
+            pole_reacquiring_ = false;
         }
     }
     const vec3 desired_elbow =
@@ -567,6 +587,7 @@ void TargetRigArmIK::reset() {
     calibration_rotation_ = quat();
     has_previous_pole_ = false;
     pole_stabilized_ = false;
+    pole_reacquiring_ = false;
     previous_pole_spine_ = vec3();
 }
 

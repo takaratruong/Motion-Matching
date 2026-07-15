@@ -377,7 +377,7 @@ void test_previous_pole_rotates_with_spine_at_singularity() {
     assert(dot(turned_pole, expected_pole) > 0.99F);
 }
 
-void test_assisted_targets_keep_feasible_bend_and_stable_spine_pole() {
+void test_genuine_clavicle_assist_reserves_elbow_bend() {
     constexpr float kMaximumAssistedBendRadians =
         165.1F * 3.14159265358979323846F / 180.0F;
     for (const interaction::Hand hand : {
@@ -389,61 +389,219 @@ void test_assisted_targets_keep_feasible_bend_and_stable_spine_pole() {
         const size_t hand_bone = left ? 18U : 22U;
         const float side = left ? -1.0F : 1.0F;
 
+        FlatControllerPose pose = flat_reference();
+        pose.rotations[12] = quat_from_angle_axis(
+            0.19F, vec3(0.0F, 1.0F, 0.0F));
+        const FlatControllerPose before = pose;
+        const FlatWorldPose base = flat_world(pose);
+        const vec3 target = base.positions[clavicle] + quat_mul_vec3(
+            base.rotations[12], vec3(side * 0.595F, 0.24F, 0.0F));
+        interaction::TargetRigArmIK solver;
+        solver.begin_epoch(interaction_reference(), pose, hand);
+        const interaction::TargetRigArmIKResult result = solver.solve(
+            pose, {target, quat()}, 1.0F, 1.0F / 25.0F);
+        const FlatWorldPose solved = flat_world(pose);
+
+        assert(result.applied && result.reachable);
+        assert(result.used_clavicle);
+        assert(length(solved.positions[hand_bone] - target) <= 1.0e-3F);
+        assert(elbow_bend_radians(
+                   solved, upper_arm, forearm, hand_bone) <=
+               kMaximumAssistedBendRadians);
+        for (size_t bone = 0; bone < pose.positions.size(); ++bone) {
+            assert(same_vec_bits(
+                pose.positions[bone], before.positions[bone]));
+            assert(same_vec_bits(
+                pose.velocities[bone], before.velocities[bone]));
+        }
+    }
+}
+
+void test_ordinary_near_outer_target_preserves_clavicle_authority() {
+    constexpr float kMaximumAssistedBendRadians =
+        165.0F * 3.14159265358979323846F / 180.0F;
+    constexpr float kReachEpsilonM = 1.0e-4F;
+    for (const interaction::Hand hand : {
+             interaction::Hand::Left, interaction::Hand::Right}) {
+        const bool left = hand == interaction::Hand::Left;
+        const size_t clavicle = left ? 15U : 19U;
+        const size_t upper_arm = left ? 16U : 20U;
+        const size_t forearm = left ? 17U : 21U;
+        const size_t hand_bone = left ? 18U : 22U;
+        const float side = left ? -1.0F : 1.0F;
+
+        FlatControllerPose pose = flat_reference();
+        pose.rotations[12] = quat_from_angle_axis(
+            -0.23F, vec3(0.0F, 1.0F, 0.0F));
+        const FlatControllerPose before = pose;
+        const FlatWorldPose base = flat_world(pose);
+        const float upper_length = length(pose.positions[forearm]);
+        const float forearm_length = length(pose.positions[hand_bone]);
+        const float arm_outer =
+            upper_length + forearm_length - kReachEpsilonM;
+        const float preferred_outer = std::sqrt(
+            upper_length * upper_length +
+            forearm_length * forearm_length -
+            2.0F * upper_length * forearm_length *
+                std::cos(kMaximumAssistedBendRadians));
+        const float target_distance =
+            0.5F * (preferred_outer + arm_outer);
+        assert(target_distance > preferred_outer);
+        assert(target_distance <= arm_outer);
+        const vec3 target_direction = normalize(quat_mul_vec3(
+            base.rotations[12], vec3(side, 0.35F, 0.10F)));
+        const vec3 target =
+            base.positions[upper_arm] + target_direction * target_distance;
+
+        interaction::TargetRigArmIK solver;
+        solver.begin_epoch(interaction_reference(), pose, hand);
+        const interaction::TargetRigArmIKResult result = solver.solve(
+            pose, {target, quat()}, 1.0F, 1.0F / 25.0F);
+        const FlatWorldPose solved = flat_world(pose);
+
+        assert(result.applied && result.reachable);
+        assert(!result.used_clavicle);
+        assert(same_quat_bits(
+            pose.rotations[clavicle], before.rotations[clavicle]));
+        assert(same_vec_bits(
+            pose.angular_velocities[clavicle],
+            before.angular_velocities[clavicle]));
+        assert(length(solved.positions[hand_bone] - target) <= 1.0e-3F);
+        assert(elbow_bend_radians(
+                   solved, upper_arm, forearm, hand_bone) >
+               kMaximumAssistedBendRadians);
+    }
+}
+
+void test_ordinary_bends_follow_current_authored_pole() {
+    for (const interaction::Hand hand : {
+             interaction::Hand::Left, interaction::Hand::Right}) {
+        const bool left = hand == interaction::Hand::Left;
+        const size_t upper_arm = left ? 16U : 20U;
+        const size_t forearm = left ? 17U : 21U;
+        const size_t hand_bone = left ? 18U : 22U;
+        const float side = left ? -1.0F : 1.0F;
         interaction::TargetRigArmIK solver;
         FlatControllerPose epoch = flat_reference();
         solver.begin_epoch(interaction_reference(), epoch, hand);
-        vec3 previous_pole_spine{};
-        bool has_previous_pole = false;
 
-        for (int tick = 0; tick < 8; ++tick) {
+        for (int tick = 0; tick < 2; ++tick) {
             FlatControllerPose pose = flat_reference();
-            const FlatControllerPose before = pose;
-            const float spine_angle = 0.04F * static_cast<float>(tick);
+            const float spine_angle = 0.17F * static_cast<float>(tick);
             pose.rotations[12] = quat_from_angle_axis(
                 spine_angle, vec3(0.0F, 1.0F, 0.0F));
-            const float twist = tick % 2 == 0 ? -1.1F : 1.1F;
-            const quat bend = quat_from_angle_axis(
-                side * 0.28F, vec3(0.0F, 0.0F, 1.0F));
-            const quat pole_noise = quat_from_angle_axis(
-                twist, vec3(side, 0.0F, 0.0F));
+            const float twist = tick == 0 ? -0.45F : 0.45F;
             pose.rotations[upper_arm] = normalized(quat_mul(
-                pole_noise, bend));
-
+                quat_from_angle_axis(twist, vec3(side, 0.0F, 0.0F)),
+                quat_from_angle_axis(
+                    side * 0.45F, vec3(0.0F, 0.0F, 1.0F))));
             const FlatWorldPose base = flat_world(pose);
-            const bool assisted_target = tick < 4;
-            const vec3 target_in_spine = assisted_target
+            const vec3 target = base.positions[upper_arm] + quat_mul_vec3(
+                base.rotations[12], vec3(side * 0.45F, 0.0F, 0.0F));
+            const vec3 authored_pole_spine = quat_inv_mul_vec3(
+                base.rotations[12],
+                projected_direction(
+                    base.positions[forearm] - base.positions[upper_arm],
+                    target - base.positions[upper_arm]));
+
+            const interaction::TargetRigArmIKResult result = solver.solve(
+                pose, {target, quat()}, 1.0F, 1.0F / 25.0F);
+            const FlatWorldPose solved = flat_world(pose);
+            const vec3 solved_pole_spine = quat_inv_mul_vec3(
+                solved.rotations[12],
+                arm_pole_direction(
+                    solved, upper_arm, forearm, hand_bone));
+
+            assert(result.applied && result.reachable);
+            assert(!result.used_clavicle);
+            assert(length(solved.positions[hand_bone] - target) <= 1.0e-3F);
+            assert(dot(solved_pole_spine, authored_pole_spine) > 0.999F);
+        }
+    }
+}
+
+void test_singular_exit_reacquires_then_restores_authored_pole_authority() {
+    constexpr float kMaximumPoleStepRadians =
+        4.0F * 3.14159265358979323846F / 180.0F;
+    for (const interaction::Hand hand : {
+             interaction::Hand::Left, interaction::Hand::Right}) {
+        const bool left = hand == interaction::Hand::Left;
+        const size_t clavicle = left ? 15U : 19U;
+        const size_t upper_arm = left ? 16U : 20U;
+        const size_t forearm = left ? 17U : 21U;
+        const size_t hand_bone = left ? 18U : 22U;
+        const float side = left ? -1.0F : 1.0F;
+        interaction::TargetRigArmIK solver;
+        FlatControllerPose epoch = flat_reference();
+        solver.begin_epoch(interaction_reference(), epoch, hand);
+        vec3 previous_solved_pole_spine{};
+        bool has_previous_solved_pole = false;
+
+        for (int tick = 0; tick < 28; ++tick) {
+            FlatControllerPose pose = flat_reference();
+            const float spine_angle = 0.015F * static_cast<float>(tick);
+            pose.rotations[12] = quat_from_angle_axis(
+                spine_angle, vec3(0.0F, 1.0F, 0.0F));
+            const bool singular = tick >= 1 && tick <= 3;
+            const bool final_authority_probe = tick == 27;
+            const float twist = final_authority_probe
+                ? -0.12F
+                : (tick == 0
+                      ? -0.25F
+                      : (singular && tick % 2 == 0 ? -1.10F : -0.05F));
+            pose.rotations[upper_arm] = normalized(quat_mul(
+                quat_from_angle_axis(twist, vec3(side, 0.0F, 0.0F)),
+                quat_from_angle_axis(
+                    side * 0.42F, vec3(0.0F, 0.0F, 1.0F))));
+            const FlatWorldPose base = flat_world(pose);
+            const vec3 target_in_spine = singular
                 ? vec3(side * 0.595F, 0.24F, 0.0F)
                 : vec3(side * 0.50F, 0.20F, 0.0F);
             const vec3 target = base.positions[clavicle] + quat_mul_vec3(
                 base.rotations[12], target_in_spine);
+            const vec3 authored_pole_spine = quat_inv_mul_vec3(
+                base.rotations[12],
+                projected_direction(
+                    base.positions[forearm] - base.positions[upper_arm],
+                    target - base.positions[upper_arm]));
+
             const interaction::TargetRigArmIKResult result = solver.solve(
                 pose, {target, quat()}, 1.0F, 1.0F / 25.0F);
             const FlatWorldPose solved = flat_world(pose);
-
-            assert(result.applied && result.reachable);
-            assert(result.used_clavicle == assisted_target);
-            assert(length(solved.positions[hand_bone] - target) <= 1.0e-3F);
-            if (assisted_target) {
-                assert(elbow_bend_radians(
-                           solved, upper_arm, forearm, hand_bone) <=
-                       kMaximumAssistedBendRadians);
-            }
-            for (size_t bone = 0; bone < pose.positions.size(); ++bone) {
-                assert(same_vec_bits(
-                    pose.positions[bone], before.positions[bone]));
-                assert(same_vec_bits(
-                    pose.velocities[bone], before.velocities[bone]));
-            }
-
-            const vec3 pole_spine = quat_inv_mul_vec3(
+            const vec3 solved_pole_spine = quat_inv_mul_vec3(
                 solved.rotations[12],
                 arm_pole_direction(
                     solved, upper_arm, forearm, hand_bone));
-            if (has_previous_pole) {
-                assert(dot(pole_spine, previous_pole_spine) > 0.99F);
+
+            assert(result.applied && result.reachable);
+            assert(result.used_clavicle == singular);
+            assert(length(solved.positions[hand_bone] - target) <= 1.0e-3F);
+            if (tick >= 4 && tick <= 26 && has_previous_solved_pole) {
+                assert(dot(
+                           solved_pole_spine,
+                           previous_solved_pole_spine) >=
+                       std::cos(kMaximumPoleStepRadians));
             }
-            previous_pole_spine = pole_spine;
-            has_previous_pole = true;
+            if (tick == 4) {
+                assert(dot(
+                           solved_pole_spine,
+                           authored_pole_spine) <
+                       0.99F);
+            }
+            if (tick == 26) {
+                assert(dot(
+                           solved_pole_spine,
+                           authored_pole_spine) >
+                       0.999F);
+            }
+            if (final_authority_probe) {
+                assert(dot(
+                           solved_pole_spine,
+                           authored_pole_spine) >
+                       0.999F);
+            }
+            previous_solved_pole_spine = solved_pole_spine;
+            has_previous_solved_pole = true;
         }
     }
 }
@@ -696,7 +854,10 @@ int main() {
     test_left_arm_is_mirrored_and_right_arm_remains_bit_exact();
     test_clavicle_assist_and_unreachable_clamp_are_finite();
     test_previous_pole_rotates_with_spine_at_singularity();
-    test_assisted_targets_keep_feasible_bend_and_stable_spine_pole();
+    test_genuine_clavicle_assist_reserves_elbow_bend();
+    test_ordinary_bends_follow_current_authored_pole();
+    test_ordinary_near_outer_target_preserves_clavicle_authority();
+    test_singular_exit_reacquires_then_restores_authored_pole_authority();
     test_straight_folded_and_antiparallel_targets_are_finite();
     test_invalid_epoch_reset_and_invalid_requests_do_not_mutate();
     test_segment_lengths_minimum_clavicle_swing_and_shortfall_semantics();
