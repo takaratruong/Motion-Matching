@@ -1,4 +1,5 @@
 #include "interaction_controller_adapter.h"
+#include "locomotion_timing.h"
 #include "tests/cpp/interaction_runtime_fixture.h"
 
 #include <array>
@@ -399,11 +400,33 @@ std::string read_text(const std::string& path) {
 
 void test_exact_constants() {
     static_assert(
-        interaction::kControllerStepSeconds == 1.0F / 60.0F,
-        "controller step must be exact binary32 1/60");
+        locomotion_timing::kRateHz == 25,
+        "flat locomotion must run at exactly 25 Hz");
+    static_assert(
+        locomotion_timing::kStepSeconds == 1.0F / 25.0F,
+        "flat locomotion step must be exact binary32 1/25");
+    static_assert(
+        interaction::kControllerStepSeconds ==
+            locomotion_timing::kStepSeconds,
+        "controller and flat locomotion steps must be identical");
     static_assert(
         interaction::kInteractionRuntimeStepSeconds == 1.0F / 25.0F,
         "runtime step must be exact binary32 1/25");
+    static_assert(
+        locomotion_timing::kTrajectoryFrameOffsets[0] == 8 &&
+            locomotion_timing::kTrajectoryFrameOffsets[1] == 17 &&
+            locomotion_timing::kTrajectoryFrameOffsets[2] == 25,
+        "trajectory feature offsets must be exact 25 Hz frame indices");
+    static_assert(
+        locomotion_timing::kTrajectorySampleTimesSeconds[0] == 0.32F &&
+            locomotion_timing::kTrajectorySampleTimesSeconds[1] == 0.68F &&
+            locomotion_timing::kTrajectorySampleTimesSeconds[2] == 1.0F,
+        "trajectory prediction must use the feature sample times");
+    static_assert(
+        locomotion_timing::kTrajectoryStepSeconds[0] == 0.32F &&
+            locomotion_timing::kTrajectoryStepSeconds[1] == 0.36F &&
+            locomotion_timing::kTrajectoryStepSeconds[2] == 0.32F,
+        "trajectory position prediction must use nonuniform step durations");
 }
 
 void test_flat_bridge_exact_parent_tree_anchor_map_and_unmapped_head() {
@@ -722,7 +745,7 @@ void test_scheduler_cadence_and_cache() {
     std::vector<int> due_ticks;
     RuntimeOutput newest{};
 
-    for (int tick = 1; tick <= 60; ++tick) {
+    for (int tick = 1; tick <= 25; ++tick) {
         const int calls_before = update_calls;
         const RuntimeOutput before = scheduler.cached_output();
         const RuntimeOutput& observed = scheduler.tick(
@@ -749,29 +772,19 @@ void test_scheduler_cadence_and_cache() {
                 return newest;
             });
 
-        assert(update_calls - calls_before <= 1);
-        assert(
-            scheduler.updated_last_tick() ==
-            (update_calls != calls_before));
-        if (update_calls == calls_before) {
-            assert(output_fields_equal(observed, before));
-        } else {
-            assert(output_fields_equal(observed, newest));
-        }
+        assert(update_calls == calls_before + 1);
+        assert(scheduler.updated_last_tick());
+        assert(output_fields_equal(observed, newest));
+        assert(!output_fields_equal(observed, before));
+        assert(scheduler.phase() == 0);
     }
 
     assert(update_calls == 25);
     assert(snapshot_calls == 25);
     assert(resolver_calls == 0);
     assert(scheduler.phase() == 0);
-    const std::vector<int> expected_first_block = {3, 5, 8, 10, 12};
-    assert(std::vector<int>(due_ticks.begin(), due_ticks.begin() + 5) ==
-           expected_first_block);
-    for (size_t block = 0; block < 5; ++block) {
-        for (size_t index = 0; index < expected_first_block.size(); ++index) {
-            assert(due_ticks[block * 5 + index] ==
-                   static_cast<int>(block * 12) + expected_first_block[index]);
-        }
+    for (int tick = 1; tick <= 25; ++tick) {
+        assert(due_ticks.at(static_cast<size_t>(tick - 1)) == tick);
     }
 }
 
@@ -799,42 +812,34 @@ void test_edges_latch_coalesce_and_clear_after_delivery() {
     };
 
     scheduler.tick({true, false, false}, snapshot_provider, resolver, update);
-    scheduler.tick({true, true, false}, snapshot_provider, resolver, update);
-    assert(snapshot_calls == 0);
-    assert(resolver_calls == 0);
-    assert(update_calls == 0);
-
-    scheduler.tick({false, false, true}, snapshot_provider, resolver, update);
     assert(snapshot_calls == 1);
     assert(resolver_calls == 1);
     assert(update_calls == 1);
     assert(delivered[0].interact_pressed);
-    assert(delivered[0].cancel_pressed);
-    assert(delivered[0].reset_pressed);
+    assert(!delivered[0].cancel_pressed);
+    assert(!delivered[0].reset_pressed);
     assert(delivered[0].pick_request.has_value());
     assert(delivered[0].pick_request->target == request.target);
     assert(delivered[0].pick_request->affordance_id == request.affordance_id);
     assert(delivered[0].pick_request->request_id == request.request_id);
 
-    scheduler.tick({}, snapshot_provider, resolver, update);
-    scheduler.tick({}, snapshot_provider, resolver, update);
+    scheduler.tick({false, true, true}, snapshot_provider, resolver, update);
     assert(snapshot_calls == 2);
     assert(resolver_calls == 1);
     assert(update_calls == 2);
     assert(!delivered[1].interact_pressed);
-    assert(!delivered[1].cancel_pressed);
-    assert(!delivered[1].reset_pressed);
+    assert(delivered[1].cancel_pressed);
+    assert(delivered[1].reset_pressed);
     assert(!delivered[1].pick_request.has_value());
 
-    ControllerInteractionScheduler due_edge_scheduler;
-    due_edge_scheduler.tick({}, snapshot_provider, resolver, update);
-    due_edge_scheduler.tick({}, snapshot_provider, resolver, update);
-    due_edge_scheduler.tick(
+    scheduler.tick(
         {true, true, true}, snapshot_provider, resolver, update);
-    const RuntimeInput& due_edge_input = delivered.back();
-    assert(due_edge_input.interact_pressed);
-    assert(due_edge_input.cancel_pressed);
-    assert(due_edge_input.reset_pressed);
+    const RuntimeInput& immediate = delivered.back();
+    assert(immediate.interact_pressed);
+    assert(immediate.cancel_pressed);
+    assert(immediate.reset_pressed);
+    assert(update_calls == 3);
+    assert(scheduler.phase() == 0);
 }
 
 void test_cache_changes_only_after_successful_due_delivery() {
@@ -846,25 +851,12 @@ void test_cache_changes_only_after_successful_due_delivery() {
     };
     int calls = 0;
 
-    scheduler.tick({true, false, false}, snapshot_provider, resolver,
-                   [&](const RuntimeInput&) {
-                       ++calls;
-                       return make_complete_output(1, RuntimeState::Locomotion);
-                   });
-    assert(!scheduler.updated_last_tick());
-    scheduler.tick({}, snapshot_provider, resolver,
-                   [&](const RuntimeInput&) {
-                       ++calls;
-                       return make_complete_output(1, RuntimeState::Locomotion);
-                   });
-    assert(!scheduler.updated_last_tick());
-    assert(calls == 0);
     const RuntimeOutput initial{};
     assert(output_fields_equal(scheduler.cached_output(), initial));
 
     bool threw = false;
     try {
-        scheduler.tick({}, snapshot_provider, resolver,
+        scheduler.tick({true, false, false}, snapshot_provider, resolver,
                        [&](const RuntimeInput& input) -> RuntimeOutput {
                            ++calls;
                            assert(input.interact_pressed);
@@ -877,23 +869,18 @@ void test_cache_changes_only_after_successful_due_delivery() {
     assert(calls == 1);
     assert(!scheduler.updated_last_tick());
     assert(output_fields_equal(scheduler.cached_output(), initial));
+    assert(scheduler.phase() == 0);
 
-    scheduler.tick({}, snapshot_provider, resolver,
-                   [&](const RuntimeInput&) {
-                       ++calls;
-                       return make_complete_output(2, RuntimeState::Disabled);
-                   });
-    assert(!scheduler.updated_last_tick());
-    const RuntimeOutput held = scheduler.cached_output();
     scheduler.tick({}, snapshot_provider, resolver,
                    [&](const RuntimeInput& input) {
                        ++calls;
                        assert(input.interact_pressed);
-                       return make_complete_output(3, RuntimeState::Locomotion);
+                       return make_complete_output(2, RuntimeState::Locomotion);
                    });
     assert(calls == 2);
     assert(scheduler.updated_last_tick());
-    assert(!output_fields_equal(scheduler.cached_output(), held));
+    assert(!output_fields_equal(scheduler.cached_output(), initial));
+    assert(scheduler.phase() == 0);
 }
 
 void require_flat_pose_near(
@@ -1063,7 +1050,10 @@ void test_frame_handoff_applies_validated_semantic_hand_constraint_and_releases_
         flat_pose_bits_equal(first_release.pose, constrained.pose),
         "release did not begin at the last constrained pose");
 
-    for (int release_frame = 1; release_frame < 15; ++release_frame) {
+    float release_elapsed_seconds = 0.0F;
+    while (release_elapsed_seconds + interaction::kControllerStepSeconds <
+           0.25F) {
+        release_elapsed_seconds += interaction::kControllerStepSeconds;
         const ControllerInteractionFrameState release = handoff.apply(
             entry,
             idle,
@@ -1073,15 +1063,26 @@ void test_frame_handoff_applies_validated_semantic_hand_constraint_and_releases_
             release.overrides_locomotion_pose,
             "normal 0.25 second release ended early");
     }
-    const ControllerInteractionFrameState relinquished = handoff.apply(
-        entry,
-        idle,
-        interaction::kControllerStepSeconds,
-        std::nullopt);
+    ControllerInteractionFrameState relinquished{};
+    do {
+        release_elapsed_seconds += interaction::kControllerStepSeconds;
+        relinquished = handoff.apply(
+            entry,
+            idle,
+            interaction::kControllerStepSeconds,
+            std::nullopt);
+    } while (relinquished.overrides_locomotion_pose &&
+             release_elapsed_seconds <=
+                 0.25F + interaction::kControllerStepSeconds);
     require(
         !relinquished.overrides_locomotion_pose &&
             flat_pose_bits_equal(relinquished.pose, entry),
         "normal 0.25 second release did not relinquish on time");
+    require(
+        release_elapsed_seconds >= 0.25F &&
+            release_elapsed_seconds <=
+                0.25F + interaction::kControllerStepSeconds,
+        "normal release duration escaped one 25 Hz tick of 0.25 seconds");
 }
 
 void test_hand_constraint_keeps_layered_carry_lower_body_exact_and_selected_only() {
@@ -1632,7 +1633,7 @@ void test_frame_handoff_reset_and_reentry_capture_fresh_flat_reference() {
         "re-entry reused a stale raw interaction reference");
 }
 
-void test_frame_handoff_preserves_fresh_complete_nonowned_pose_for_60_frames() {
+void test_frame_handoff_preserves_fresh_complete_nonowned_pose_for_25_frames() {
     ControllerInteractionFrameHandoff disabled_handoff;
     ControllerInteractionFrameHandoff loaded_handoff;
     ControllerInteractionScheduler disabled_scheduler;
@@ -1651,7 +1652,7 @@ void test_frame_handoff_preserves_fresh_complete_nonowned_pose_for_60_frames() {
     int loaded_runtime_calls = 0;
     FlatControllerPose previous{};
 
-    for (int tick = 1; tick <= 60; ++tick) {
+    for (int tick = 1; tick <= 25; ++tick) {
         FlatControllerPose fresh = make_flat_pose();
         fresh.positions[0].x += static_cast<float>(tick);
         fresh.velocities[0].z -= static_cast<float>(tick);
@@ -1882,7 +1883,7 @@ void test_frame_handoff_keeps_layered_carry_simulation_root_live() {
         "recorded Carry failed to publish full-body root/legs");
 }
 
-void test_scene_handoff_interpolates_25_hz_samples_at_render_phase_without_cache_endpoint_drift() {
+void test_scene_handoff_publishes_each_fresh_25_hz_sample_without_lag() {
     ControllerInteractionScheduler scheduler;
     ControllerInteractionSceneHandoff handoff;
     InteractionTarget target;
@@ -1895,9 +1896,7 @@ void test_scene_handoff_interpolates_25_hz_samples_at_render_phase_without_cache
     const InteractionTarget target_before = target;
 
     int update_calls = 0;
-    bool started_interpolating = false;
-    float previous_render_x = 0.0F;
-    for (int tick = 1; tick <= 24; ++tick) {
+    for (int tick = 1; tick <= 8; ++tick) {
         const RuntimeOutput& output = scheduler.tick(
             {},
             [] { return LocomotionSnapshot{}; },
@@ -1916,72 +1915,46 @@ void test_scene_handoff_interpolates_25_hz_samples_at_render_phase_without_cache
                 return next;
             });
         const RuntimeOutput output_before = output;
-        const float alpha =
-            static_cast<float>(scheduler.phase()) / 60.0F;
         const ControllerInteractionSceneState scene = handoff.apply(
             &target,
             output,
             authored_fallback,
-            alpha,
+            0.0F,
             scheduler.updated_last_tick());
 
         require(
             transform_bits_equal(target.object_world, target_before.object_world),
-            "scene interpolation mutated the registry transform");
+            "scene handoff mutated the registry transform");
         require(
             output_fields_equal(output, output_before),
-            "scene interpolation mutated the cached runtime sample");
-        if (update_calls == 0) {
-            require(
-                !scene.runtime_authority &&
-                    transform_bits_equal(scene.object_world, target.object_world),
-                "scene interpolation accepted an unselected cached sample");
-            continue;
-        }
+            "scene handoff mutated the fresh runtime sample");
 
         require(scene.runtime_authority, "held runtime sample lost authority");
-        const float previous_sample =
-            0.24F * static_cast<float>(std::max(update_calls - 2, 0));
         const float current_sample =
             0.24F * static_cast<float>(update_calls - 1);
-        const float expected_x =
-            previous_sample + (current_sample - previous_sample) * alpha;
         require(
-            near(scene.object_world.position.x, expected_x, 2.0e-5F),
-            "scene interpolation did not use the exact scheduler phase");
+            near(scene.object_world.position.x, current_sample, 2.0e-5F),
+            "scene handoff lagged behind the fresh runtime translation");
         require(
             near(scene.object_world.position.y, 1.0F) &&
                 near(scene.object_world.position.z, -2.0F),
-            "scene interpolation changed constant translation channels");
-        const quat expected_rotation = quat_nlerp_shortest(
-            quat_from_angle_axis(
-                0.2F * static_cast<float>(std::max(update_calls - 2, 0)),
-                vec3(0.0F, 1.0F, 0.0F)),
+            "scene handoff changed constant translation channels");
+        const quat expected_rotation =
             quat_from_angle_axis(
                 0.2F * static_cast<float>(update_calls - 1),
-                vec3(0.0F, 1.0F, 0.0F)),
-            alpha);
+                vec3(0.0F, 1.0F, 0.0F));
         require_same_rotation(
             scene.object_world.rotation,
             expected_rotation,
-            "scene interpolation did not nlerp the authoritative rotations");
-
-        if (started_interpolating) {
-            require(
-                near(
-                    scene.object_world.position.x - previous_render_x,
-                    0.1F,
-                    2.0e-5F),
-                "constant-velocity scene interpolation held or jumped");
-        }
-        if (update_calls >= 2) {
-            started_interpolating = true;
-            previous_render_x = scene.object_world.position.x;
-        }
+            "scene handoff lagged behind the fresh runtime rotation");
+        require(scheduler.phase() == 0, "synchronous scheduler phase drifted");
+        require(
+            scheduler.updated_last_tick(),
+            "synchronous scheduler did not publish a fresh sample");
     }
 }
 
-void test_scene_handoff_advances_fresh_equal_plateau_without_phase_wrap_rewind() {
+void test_scene_handoff_publishes_fresh_equal_plateau_samples_exactly() {
     ControllerInteractionScheduler scheduler;
     ControllerInteractionSceneHandoff handoff;
     InteractionTarget target;
@@ -1993,14 +1966,7 @@ void test_scene_handoff_advances_fresh_equal_plateau_without_phase_wrap_rewind()
     const Transform authored_fallback = target.object_world;
     int samples = 0;
     const std::array<float, 3> authoritative_x = {0.0F, 12.0F, 12.0F};
-    const std::array<int, 9> expected_phases = {
-        25, 50, 15, 40, 5, 30, 55, 20, 45};
-    const std::array<bool, 9> expected_fresh = {
-        false, false, true, false, true, false, false, true, false};
-    const std::array<float, 9> expected_x = {
-        -5.0F, -5.0F, 0.0F, 0.0F, 1.0F, 6.0F, 11.0F, 12.0F, 12.0F};
-
-    for (size_t tick = 0; tick < expected_x.size(); ++tick) {
+    for (size_t tick = 0; tick < authoritative_x.size(); ++tick) {
         const RuntimeOutput& output = scheduler.tick(
             {},
             [] { return LocomotionSnapshot{}; },
@@ -2020,25 +1986,28 @@ void test_scene_handoff_advances_fresh_equal_plateau_without_phase_wrap_rewind()
                 return next;
             });
         require(
-            scheduler.phase() == expected_phases[tick],
-            "scheduler phase sequence changed in plateau regression");
+            scheduler.phase() == 0,
+            "synchronous scheduler phase changed in plateau regression");
         require(
-            scheduler.updated_last_tick() == expected_fresh[tick],
-            "scheduler fresh-sample signal does not match due ticks");
+            scheduler.updated_last_tick(),
+            "synchronous scheduler did not expose a fresh plateau sample");
         const ControllerInteractionSceneState scene = handoff.apply(
             &target,
             output,
             authored_fallback,
-            static_cast<float>(scheduler.phase()) / 60.0F,
+            0.0F,
             scheduler.updated_last_tick());
         require(
-            near(scene.object_world.position.x, expected_x[tick], 2.0e-5F),
-            "fresh equal plateau sample rewound or replayed old interpolation");
+            near(
+                scene.object_world.position.x,
+                authoritative_x[tick],
+                2.0e-5F),
+            "fresh equal plateau sample was not published exactly");
     }
     require(samples == 3, "plateau regression did not deliver three samples");
 }
 
-void test_scene_handoff_uses_shortest_rotation_and_does_not_shift_cached_endpoints() {
+void test_scene_handoff_publishes_fresh_rotation_and_holds_only_explicit_cache() {
     ControllerInteractionSceneHandoff handoff;
     InteractionTarget target;
     target.handle = {41, 3};
@@ -2067,19 +2036,16 @@ void test_scene_handoff_uses_shortest_rotation_and_does_not_shift_cached_endpoin
             190.0F * 3.14159265358979323846F / 180.0F,
             vec3(0.0F, 1.0F, 0.0F))};
     const RuntimeOutput second_before = second;
-    const ControllerInteractionSceneState quarter = handoff.apply(
+    const ControllerInteractionSceneState fresh = handoff.apply(
         &target, second, authored_fallback, 0.25F, true);
     require_vec_near(
-        quarter.object_world.position,
-        vec3(2.5F, 1.0F, 2.0F),
-        "scene interpolation did not lerp a fresh sample");
+        fresh.object_world.position,
+        second.object_world.position,
+        "scene handoff lagged a fresh translation sample");
     require_same_rotation(
-        quarter.object_world.rotation,
-        quat_nlerp_shortest(
-            first.object_world.rotation,
-            second.object_world.rotation,
-            0.25F),
-        "scene interpolation took the long quaternion path");
+        fresh.object_world.rotation,
+        second.object_world.rotation,
+        "scene handoff lagged a fresh rotation sample");
 
     RuntimeOutput changed_but_not_fresh = second;
     changed_but_not_fresh.object_world.position.x = 20.0F;
@@ -2093,18 +2059,15 @@ void test_scene_handoff_uses_shortest_rotation_and_does_not_shift_cached_endpoin
         false);
     require_vec_near(
         cached.object_world.position,
-        vec3(7.5F, 1.0F, 2.0F),
-        "repeated cached output shifted the interpolation endpoints");
+        second.object_world.position,
+        "non-fresh output replaced the explicit cached sample");
     require_same_rotation(
         cached.object_world.rotation,
-        quat_nlerp_shortest(
-            first.object_world.rotation,
-            second.object_world.rotation,
-            0.75F),
-        "cached antipodal output changed the shortest-path endpoints");
+        second.object_world.rotation,
+        "non-fresh output replaced the explicit cached rotation");
     require(
         output_fields_equal(second, second_before),
-        "scene interpolation canonicalized the runtime quaternion in place");
+        "scene handoff canonicalized the runtime quaternion in place");
 }
 
 void test_scene_handoff_retains_post_failure_held_pose_until_registry_reclaims_authority() {
@@ -2140,18 +2103,12 @@ void test_scene_handoff_retains_post_failure_held_pose_until_registry_reclaims_a
     assert(held_scene.runtime_authority);
     require_vec_near(
         held_scene.object_world.position,
-        lerp(
-            attached.object_world.position,
-            post_failure.object_world.position,
-            0.25F),
-        "post-failure Held output did not retain interpolated authority");
+        post_failure.object_world.position,
+        "post-failure Held output lagged the fresh authoritative transform");
     require_same_rotation(
         held_scene.object_world.rotation,
-        quat_nlerp_shortest(
-            attached.object_world.rotation,
-            post_failure.object_world.rotation,
-            0.25F),
-        "post-failure Held rotation did not remain authoritative");
+        post_failure.object_world.rotation,
+        "post-failure Held rotation lagged the fresh authoritative transform");
 
     InteractionTarget stale_generation = target;
     stale_generation.handle = {41, 4};
@@ -2275,15 +2232,12 @@ void test_scene_handoff_rejects_invalid_alpha_atomically() {
         &target, second, authored_fallback, 0.75F, false);
     require_vec_near(
         unchanged.object_world.position,
-        vec3(7.5F, 1.0F, 2.0F),
-        "invalid alpha partially committed new interpolation endpoints");
+        second.object_world.position,
+        "invalid alpha partially committed a new cached transform");
     require_same_rotation(
         unchanged.object_world.rotation,
-        quat_nlerp_shortest(
-            first.object_world.rotation,
-            second.object_world.rotation,
-            0.75F),
-        "invalid alpha partially committed a new rotation endpoint");
+        second.object_world.rotation,
+        "invalid alpha partially committed a new cached rotation");
 }
 
 void test_carry_label_is_only_specific_during_carry() {
@@ -2427,11 +2381,13 @@ void test_debug_draw_uses_real_correction_geometry_and_complete_text() {
     assert(debug.find("object=%s carry=%s") != std::string::npos);
     assert(debug.find("controller_carry_mode_label(output)") !=
            std::string::npos);
+    assert(debug.find("runtime=25Hz controller=25Hz") != std::string::npos);
 }
 
 void test_controller_and_make_clock_policy() {
     const std::string controller = read_text("controller.cpp");
-    assert(controller.find("SetTargetFPS(60);") != std::string::npos);
+    assert(controller.find("SetTargetFPS(25);") != std::string::npos);
+    assert(controller.find("SetTargetFPS(60);") == std::string::npos);
     assert(controller.find(
                "const float dt = interaction::kControllerStepSeconds;") !=
            std::string::npos);
@@ -2449,23 +2405,15 @@ void test_controller_and_make_clock_policy() {
     require(
         scene_handoff_apply < frame_handoff_apply,
         "controller resolves scene authority after pose handoff");
-    const size_t scene_alpha =
-        controller.find("const float interaction_scene_alpha =");
     require(
-        scene_alpha != std::string::npos &&
-            scheduler_tick < scene_alpha &&
-            scene_alpha < scene_handoff_apply,
-        "controller does not compute render alpha after the scheduler tick");
-    require(
-        controller.find("interaction_scheduler.phase()", scene_alpha) <
-                scene_handoff_apply &&
-            controller.find("/ 60.0F;", scene_alpha) < scene_handoff_apply,
-        "controller scene alpha is not the exact post-tick phase over 60");
+        controller.find("const float interaction_scene_alpha =") ==
+            std::string::npos,
+        "synchronous scene publication still computes render interpolation");
     const size_t scene_sample_updated = controller.find(
         "const bool interaction_scene_sample_updated =");
     require(
         scene_sample_updated != std::string::npos &&
-            scene_alpha < scene_sample_updated &&
+            scheduler_tick < scene_sample_updated &&
             scene_sample_updated < scene_handoff_apply &&
             controller.find(
                 "interaction_scheduler.updated_last_tick()",
@@ -2473,9 +2421,11 @@ void test_controller_and_make_clock_policy() {
         "controller does not capture the explicit post-tick sample signal");
     require(
         controller.find(
-            "interaction_scene_sample_updated);", scene_handoff_apply) <
+            "0.0F,\n"
+            "                interaction_scene_sample_updated);",
+            scene_handoff_apply) <
             frame_handoff_apply,
-        "controller does not pass scheduler alpha and freshness to scene handoff");
+        "controller does not publish the fresh scene sample without lag");
     const size_t exact_affordance =
         controller.find("interaction_registry.find_affordance(");
     require(
@@ -2508,7 +2458,7 @@ void test_controller_and_make_clock_policy() {
             controller.find(
                 "interaction_scene_state.object_world,", scene_draw) !=
                 std::string::npos,
-        "controller does not draw the same interpolated scene transform");
+        "controller does not draw the same fresh scene transform");
     require(
         controller.find("interaction_frame_state.pose.positions[bone]") !=
             std::string::npos,
@@ -2543,7 +2493,10 @@ void test_controller_and_make_clock_policy() {
     assert(controller.find("runtime_accumulator") == std::string::npos);
     assert(controller.find("runtime_output_alpha") == std::string::npos);
     assert(controller.find(
-               "emscripten_set_main_loop_arg(update_callback, &u, 60, 1);") !=
+               "emscripten_set_main_loop_arg(update_callback, &u, 25, 1);") !=
+           std::string::npos);
+    assert(controller.find(
+               "emscripten_set_main_loop_arg(update_callback, &u, 60, 1);") ==
            std::string::npos);
     assert(controller.find(
                "emscripten_set_main_loop_arg(update_callback, &u, 0, 1);") ==
@@ -2552,6 +2505,27 @@ void test_controller_and_make_clock_policy() {
            std::string::npos);
     assert(controller.find("catch (const interaction::FormatError&") !=
            std::string::npos);
+
+    const std::string database = read_text("database.h");
+    require(
+        database.find("locomotion_timing::kTrajectoryFrameOffsets") !=
+            std::string::npos,
+        "database trajectory features do not share the 25 Hz timing contract");
+    require(
+        database.find("database_trajectory_index_clamp(db, i, 20)") ==
+                std::string::npos &&
+            database.find("database_trajectory_index_clamp(db, i, 40)") ==
+                std::string::npos &&
+            database.find("database_trajectory_index_clamp(db, i, 60)") ==
+                std::string::npos,
+        "database trajectory features retain 60 Hz frame offsets");
+    require(
+        controller.find("locomotion_timing::kTrajectorySampleTimesSeconds") !=
+                std::string::npos &&
+            controller.find("locomotion_timing::kTrajectoryStepSeconds") !=
+                std::string::npos,
+        "controller trajectory prediction does not use the shared horizons");
+    assert(controller.find("20.0f * dt") == std::string::npos);
 
     const std::string makefile = read_text("Makefile");
     const size_t sources_begin = makefile.find("INTERACTION_SOURCES :=");
@@ -2601,12 +2575,12 @@ int main() {
     test_layered_carry_keeps_fresh_lower_body_and_contacts_bit_exact();
     test_frame_handoff_release_is_continuous_and_relinquishes_after_blend();
     test_frame_handoff_reset_and_reentry_capture_fresh_flat_reference();
-    test_frame_handoff_preserves_fresh_complete_nonowned_pose_for_60_frames();
+    test_frame_handoff_preserves_fresh_complete_nonowned_pose_for_25_frames();
     test_frame_handoff_exposes_rendered_flat_root_sync();
     test_frame_handoff_keeps_layered_carry_simulation_root_live();
-    test_scene_handoff_interpolates_25_hz_samples_at_render_phase_without_cache_endpoint_drift();
-    test_scene_handoff_advances_fresh_equal_plateau_without_phase_wrap_rewind();
-    test_scene_handoff_uses_shortest_rotation_and_does_not_shift_cached_endpoints();
+    test_scene_handoff_publishes_each_fresh_25_hz_sample_without_lag();
+    test_scene_handoff_publishes_fresh_equal_plateau_samples_exactly();
+    test_scene_handoff_publishes_fresh_rotation_and_holds_only_explicit_cache();
     test_scene_handoff_retains_post_failure_held_pose_until_registry_reclaims_authority();
     test_scene_handoff_rejects_invalid_alpha_atomically();
     test_carry_label_is_only_specific_during_carry();

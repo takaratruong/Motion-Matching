@@ -99,16 +99,13 @@ EXPECTED_STATE_ORDER = (
     "Carry",
     "Locomotion",
 )
-RUNTIME_CACHED_FIELDS = (
-    "state",
-    "result",
-    "reason",
-    "object_state",
-    "attached",
-    "owns_pose",
-    "carry_mode",
-    "hand_constraint_weight",
-)
+CONTROL_RATE_HZ = 25
+INTERACT_FRAME = 13
+CARRY_COMMAND_COUNT = 63
+FINAL_CARRY_COMMAND = CARRY_COMMAND_COUNT - 1
+CARRY_DEADLINE_FRAMES = 375
+MAX_EVIDENCE_RECORDS = 500
+RESET_PRESENTATION_FRAMES = 7
 FLAT_JOINT_NAMES = (
     "Entity",
     "Hips",
@@ -303,7 +300,7 @@ def _joint_rotation_step_degrees(left: list[float], right: list[float]) -> float
 def _validate_record_types(record: dict) -> None:
     _require_integer(record, "render_frame", 0)
     _require_integer(record, "runtime_tick", 0)
-    _require_integer(record, "scheduler_phase", 0, 59)
+    _require_integer(record, "scheduler_phase", 0, 0)
     _require_enum(record, "state", STATES)
     _require_enum(record, "result", RESULTS)
     _require_enum(record, "reason", REASONS)
@@ -312,7 +309,7 @@ def _validate_record_types(record: dict) -> None:
         if type(record[name]) is not bool:
             raise _error(f"{name} must be a JSON boolean")
     _require_enum(record, "carry_mode", CARRY_MODES)
-    _require_integer(record, "carry_command_frame", -1, 149)
+    _require_integer(record, "carry_command_frame", -1, FINAL_CARRY_COMMAND)
     _require_position(record, "root_position")
     _require_position(record, "object_position")
     if type(record["grasp_evidence_valid"]) is not bool:
@@ -511,8 +508,10 @@ def _collapsed_states(records: list[dict]) -> tuple[str, ...]:
 def validate_evidence(records: list[dict]) -> None:
     if not records:
         raise _error("evidence has no render records")
-    if len(records) > 1200:
-        raise _error("evidence must contain at most 1200 render records")
+    if len(records) > MAX_EVIDENCE_RECORDS:
+        raise _error(
+            f"evidence must contain at most {MAX_EVIDENCE_RECORDS} render records"
+        )
     for index, record in enumerate(records):
         _require_joint_world_arrays(record)
         if record["render_frame"] != index:
@@ -541,29 +540,10 @@ def validate_evidence(records: list[dict]) -> None:
                     f"rotation {rotation_step_degrees:.6f} degrees exceeds max "
                     f"{JOINT_ROTATION_LIMIT_DEGREES:.6f} degrees"
                 )
-        runtime_step = record["runtime_tick"] - previous["runtime_tick"]
-        if runtime_step not in (0, 1):
-            raise _error("runtime_tick must be nondecreasing by at most one")
-        phase = previous["scheduler_phase"] + 25
-        expected_runtime_step = 0
-        if phase >= 60:
-            phase -= 60
-            expected_runtime_step = 1
-        if record["scheduler_phase"] != phase:
-            raise _error("scheduler_phase does not follow the exact 25-of-60 clock")
-        if runtime_step != expected_runtime_step:
-            raise _error("runtime_tick does not follow the exact 25-of-60 clock")
-        if runtime_step == 0:
-            changed = [
-                field
-                for field in RUNTIME_CACHED_FIELDS
-                if record[field] != previous[field]
-            ]
-            if changed:
-                raise _error(
-                    "cached runtime output changed on a non-due runtime tick: "
-                    + ", ".join(changed)
-                )
+        if record["runtime_tick"] != previous["runtime_tick"] + 1:
+            raise _error("runtime_tick must advance exactly once per 25 Hz frame")
+        if record["scheduler_phase"] != 0:
+            raise _error("scheduler_phase must remain zero at synchronous 25 Hz")
         if not previous["owns_pose"] and not record["owns_pose"]:
             root_step_m = math.dist(
                 previous["root_position"], record["root_position"]
@@ -574,8 +554,10 @@ def validate_evidence(records: list[dict]) -> None:
                 )
 
     interact = [record for record in records if record["action"] == "interact"]
-    if len(interact) != 1 or interact[0]["render_frame"] != 30:
-        raise _error("Interact must be pulsed exactly once on render frame 30")
+    if len(interact) != 1 or interact[0]["render_frame"] != INTERACT_FRAME:
+        raise _error(
+            f"Interact must be pulsed exactly once on render frame {INTERACT_FRAME}"
+        )
     post_interact = records[interact[0]["render_frame"]:]
     if any(
         record["state"] == "Disabled"
@@ -595,10 +577,17 @@ def validate_evidence(records: list[dict]) -> None:
         index for index, record in enumerate(records) if record["action"] == "forward"
     ]
     forward = [records[index] for index in forward_indices]
-    if len(forward) != 150:
-        raise _error("evidence must contain exactly 150 forward records")
-    if [record["carry_command_frame"] for record in forward] != list(range(150)):
-        raise _error("forward records must be numbered exactly 0 through 149")
+    if len(forward) != CARRY_COMMAND_COUNT:
+        raise _error(
+            f"evidence must contain exactly {CARRY_COMMAND_COUNT} forward records"
+        )
+    if [record["carry_command_frame"] for record in forward] != list(
+        range(CARRY_COMMAND_COUNT)
+    ):
+        raise _error(
+            f"forward records must be numbered exactly 0 through "
+            f"{FINAL_CARRY_COMMAND}"
+        )
     if any(record["state"] != "Carry" or not record["attached"] for record in forward):
         raise _error("every forward record must be attached Carry")
     if any(
@@ -622,29 +611,23 @@ def validate_evidence(records: list[dict]) -> None:
         raise _error("final Carry mode must be recorded or layered")
 
     first_carry_index = records.index(carry[0])
-    if first_carry_index > 900:
-        raise _error("Carry must be observed by evidence frame 900")
+    if first_carry_index > CARRY_DEADLINE_FRAMES:
+        raise _error(
+            f"Carry must be observed by evidence frame {CARRY_DEADLINE_FRAMES}"
+        )
     if forward_indices[0] != first_carry_index + 1:
         raise _error("forward command 0 must immediately follow first Carry")
-    if forward_indices[:149] != list(
-        range(forward_indices[0], forward_indices[0] + 149)
+    if forward_indices != list(
+        range(forward_indices[0], forward_indices[0] + CARRY_COMMAND_COUNT)
     ):
-        raise _error("forward commands 0 through 148 must be consecutive")
-    final_command_index = forward_indices[149]
-    for wait_index in range(forward_indices[148] + 1, final_command_index):
-        wait = records[wait_index]
-        if wait["state"] != "Carry" or wait["action"] != "none":
-            raise _error("only Carry none waits may precede command 149")
-        if wait["scheduler_phase"] + 25 >= 60:
-            raise _error("command 149 exceeded the first scheduler-alignment frame")
-    if records[final_command_index]["scheduler_phase"] + 25 < 60:
-        raise _error("command 149 must immediately precede a scheduler-due render")
-    if (
-        final_command_index + 1 >= len(records)
-        or records[final_command_index + 1]["runtime_tick"]
-        != records[final_command_index]["runtime_tick"] + 1
-    ):
-        raise _error("Reset must follow command 149 on the scheduler-due render")
+        raise _error(
+            f"forward commands 0 through {FINAL_CARRY_COMMAND} must be consecutive"
+        )
+    final_command_index = forward_indices[FINAL_CARRY_COMMAND]
+    if final_command_index + 1 >= len(records):
+        raise _error(
+            f"Reset must immediately follow command {FINAL_CARRY_COMMAND}"
+        )
 
     origin = carry[0]["root_position"]
     for index, record in enumerate(records):
@@ -674,8 +657,13 @@ def validate_evidence(records: list[dict]) -> None:
         raise _error(
             "final Carry object horizontal displacement must exceed 0.20 m"
         )
-    if carry[-1]["action"] != "forward" or carry[-1]["carry_command_frame"] != 149:
-        raise _error("the 150th command must be the final Carry record")
+    if (
+        carry[-1]["action"] != "forward"
+        or carry[-1]["carry_command_frame"] != FINAL_CARRY_COMMAND
+    ):
+        raise _error(
+            f"command {FINAL_CARRY_COMMAND} must be the final Carry record"
+        )
 
     final = records[-1]
     if records.index(carry[-1]) != len(records) - 2:
@@ -881,39 +869,24 @@ def _record_line(record: dict) -> str:
 
 
 def _reclock_records(records: list[dict]) -> None:
-    scheduler_phase = 15
-    runtime_tick = 1
     for render_frame, record in enumerate(records):
-        if render_frame != 0:
-            scheduler_phase += 25
-            if scheduler_phase >= 60:
-                scheduler_phase -= 60
-                runtime_tick += 1
         record["render_frame"] = render_frame
-        record["runtime_tick"] = runtime_tick
-        record["scheduler_phase"] = scheduler_phase
+        record["runtime_tick"] = render_frame + 1
+        record["scheduler_phase"] = 0
 
 
 def _valid_records() -> list[dict]:
     states = (
-        ["Locomotion"] * 31
+        ["Locomotion"] * 14
         + ["Preflight"] * 2
         + ["Align"] * 3
         + ["PickupReplay"] * 2
         + ["Hold"] * 3
-        + ["Carry"] * 151
+        + ["Carry"] * (CARRY_COMMAND_COUNT + 1)
         + ["Locomotion"]
     )
     records = []
-    scheduler_phase = 15
-    runtime_tick = 1
     for render_frame, state in enumerate(states):
-        if render_frame != 0:
-            scheduler_phase += 25
-            if scheduler_phase >= 60:
-                scheduler_phase -= 60
-                runtime_tick += 1
-
         attached = state in {"PickupReplay", "Hold", "Carry"}
         owns_pose = state in {"Align", "PickupReplay", "Hold", "Carry"}
         if state in {"Preflight", "Align"}:
@@ -928,12 +901,12 @@ def _valid_records() -> list[dict]:
         action = "none"
         carry_command_frame = -1
         root_x = 0.0
-        if render_frame == 30:
+        if render_frame == INTERACT_FRAME:
             action = "interact"
-        if state == "Carry" and render_frame > 41:
-            carry_command_frame = render_frame - 42
+        if state == "Carry" and render_frame > 24:
+            carry_command_frame = render_frame - 25
             action = "forward"
-            root_x = 0.002 * (carry_command_frame + 1)
+            root_x = 0.005 * (carry_command_frame + 1)
         if render_frame == len(states) - 1:
             root_x = 0.30
 
@@ -952,8 +925,8 @@ def _valid_records() -> list[dict]:
         grasp_evidence_valid = state in {"PickupReplay", "Hold", "Carry"}
         record = {
             "render_frame": render_frame,
-            "runtime_tick": runtime_tick,
-            "scheduler_phase": scheduler_phase,
+            "runtime_tick": render_frame + 1,
+            "scheduler_phase": 0,
             "state": state,
             "result": result,
             "reason": reason,
@@ -1413,39 +1386,31 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
             expected_joint = "LeftHand" if summary["state"] == "Hold" else "RightHand"
             self.assertEqual(summary["active_hand_joint_name"], expected_joint)
 
-    def test_synthetic_fixture_changes_runtime_only_on_due_ticks(self):
+    def test_synthetic_fixture_advances_runtime_once_per_25_hz_frame(self):
         records = _valid_records()
         for previous, record in zip(records, records[1:]):
-            if record["runtime_tick"] == previous["runtime_tick"]:
-                self.assertEqual(
-                    tuple(record[field] for field in RUNTIME_CACHED_FIELDS),
-                    tuple(previous[field] for field in RUNTIME_CACHED_FIELDS),
-                    f"cached runtime output changed on frame {record['render_frame']}",
-                )
+            self.assertEqual(record["runtime_tick"], previous["runtime_tick"] + 1)
+            self.assertEqual(record["scheduler_phase"], 0)
 
-    def test_non_due_cached_runtime_changes_are_rejected(self):
-        mutations = {
-            "state": (32, "Align"),
-            "result": (1, "Accepted"),
-            "reason": (1, "OutOfRange"),
-            "object_state": (1, "Targeted"),
-            "attached": (1, True),
-            "owns_pose": (1, True),
-            "carry_mode": (1, "layered"),
-        }
-        for field, (frame, value) in mutations.items():
-            with self.subTest(field=field):
+    def test_skipped_or_duplicate_25_hz_runtime_ticks_are_rejected(self):
+        for runtime_tick in (1, 4):
+            with self.subTest(runtime_tick=runtime_tick):
                 records = _valid_records()
-                records[frame][field] = value
+                records[2]["runtime_tick"] = runtime_tick
                 _write_records(self.log, records)
                 with self.assertRaisesRegex(
-                    EvidenceValidationError, "non-due runtime tick"
+                    EvidenceValidationError, "advance exactly once"
                 ):
                     validate_evidence(load_evidence(self.log))
 
+    def test_nonzero_scheduler_phase_is_rejected(self):
+        records = _valid_records()
+        records[2]["scheduler_phase"] = 1
+        with self.assertRaisesRegex(EvidenceValidationError, "scheduler_phase"):
+            validate_evidence(records)
+
     def test_unsuccessful_runtime_outputs_after_interact_are_rejected(self):
-        failure_frame = 31
-        failure_tick = _valid_records()[failure_frame]["runtime_tick"]
+        failure_frame = INTERACT_FRAME + 1
         for field, value in (
             ("result", "Rejected"),
             ("result", "Cancelled"),
@@ -1454,9 +1419,7 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
         ):
             with self.subTest(field=field, value=value):
                 records = _valid_records()
-                for record in records:
-                    if record["runtime_tick"] == failure_tick:
-                        record[field] = value
+                records[failure_frame][field] = value
                 _write_records(self.log, records)
                 with self.assertRaises(EvidenceValidationError):
                     validate_evidence(load_evidence(self.log))
@@ -1472,22 +1435,24 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
                 with self.assertRaises(EvidenceValidationError):
                     validate_evidence(load_evidence(self.log))
 
-    def test_carry_must_be_observed_by_evidence_frame_900(self):
+    def test_carry_must_be_observed_by_evidence_frame_375(self):
         records = _valid_records()
         first_carry = next(
             index for index, record in enumerate(records) if record["state"] == "Carry"
         )
-        delayed_carry_frame = 902
+        delayed_carry_frame = CARRY_DEADLINE_FRAMES + 2
         hold = records[first_carry - 1]
         records[first_carry:first_carry] = [
             copy.deepcopy(hold) for _ in range(delayed_carry_frame - first_carry)
         ]
         _reclock_records(records)
         _write_records(self.log, records)
-        with self.assertRaisesRegex(EvidenceValidationError, "frame 900"):
+        with self.assertRaisesRegex(
+            EvidenceValidationError, f"frame {CARRY_DEADLINE_FRAMES}"
+        ):
             validate_evidence(load_evidence(self.log))
 
-    def test_evidence_is_bounded_to_at_most_1200_records(self):
+    def test_evidence_is_bounded_to_at_most_500_records(self):
         records = _valid_records()
         first_forward = next(
             index
@@ -1496,12 +1461,15 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
         )
         waiting_carry = records[first_forward - 1]
         records[first_forward:first_forward] = [
-            copy.deepcopy(waiting_carry) for _ in range(1201 - len(records))
+            copy.deepcopy(waiting_carry)
+            for _ in range(MAX_EVIDENCE_RECORDS + 1 - len(records))
         ]
         _reclock_records(records)
-        self.assertEqual(len(records), 1201)
+        self.assertEqual(len(records), MAX_EVIDENCE_RECORDS + 1)
         _write_records(self.log, records)
-        with self.assertRaisesRegex(EvidenceValidationError, "at most 1200"):
+        with self.assertRaisesRegex(
+            EvidenceValidationError, f"at most {MAX_EVIDENCE_RECORDS}"
+        ):
             validate_evidence(load_evidence(self.log))
 
     def test_reset_action_appears_only_on_the_final_record(self):
@@ -1511,7 +1479,7 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
         with self.assertRaisesRegex(EvidenceValidationError, "Reset action"):
             validate_evidence(load_evidence(self.log))
 
-    def test_interact_action_appears_only_once_on_frame_30(self):
+    def test_interact_action_appears_only_once_on_frame_13(self):
         records = _valid_records()
         records[10]["action"] = "interact"
         _write_records(self.log, records)
@@ -1531,7 +1499,7 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
         with self.assertRaisesRegex(EvidenceValidationError, "immediately follow"):
             validate_evidence(load_evidence(self.log))
 
-    def test_forward_commands_zero_through_148_are_consecutive(self):
+    def test_forward_commands_zero_through_62_are_consecutive(self):
         records = _valid_records()
         command_10 = next(
             index
@@ -1545,52 +1513,36 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
         ]
         _reclock_records(records)
         _write_records(self.log, records)
-        with self.assertRaisesRegex(EvidenceValidationError, "0 through 148"):
+        with self.assertRaisesRegex(
+            EvidenceValidationError,
+            f"0 through {FINAL_CARRY_COMMAND}",
+        ):
             validate_evidence(load_evidence(self.log))
 
-    def test_only_minimal_scheduler_alignment_wait_precedes_command_149(self):
+    def test_no_wait_may_precede_final_command_62(self):
         records = _valid_records()
-        command_148 = next(
+        command_before_final = next(
             index
             for index, record in enumerate(records)
-            if record["carry_command_frame"] == 148
+            if record["carry_command_frame"] == FINAL_CARRY_COMMAND - 1
         )
-        wait = copy.deepcopy(records[command_148])
+        wait = copy.deepcopy(records[command_before_final])
         wait.update(action="none", carry_command_frame=-1)
-        records[command_148 + 1:command_148 + 1] = [
-            copy.deepcopy(wait) for _ in range(12)
-        ]
+        records.insert(command_before_final + 1, wait)
         _reclock_records(records)
         _write_records(self.log, records)
-        with self.assertRaisesRegex(EvidenceValidationError, "scheduler-alignment"):
+        with self.assertRaisesRegex(EvidenceValidationError, "must be consecutive"):
             validate_evidence(load_evidence(self.log))
 
-    def test_one_required_scheduler_alignment_wait_before_command_149_is_valid(self):
+    def test_reset_immediately_follows_command_62(self):
         records = _valid_records()
-        first_carry = next(
-            index for index, record in enumerate(records) if record["state"] == "Carry"
-        )
-        hold = records[first_carry - 1]
-        phase_zero_delay = next(
-            delay
-            for delay in range(12)
-            if (15 + 25 * (first_carry + delay)) % 60 == 0
-        )
-        records[first_carry:first_carry] = [
-            copy.deepcopy(hold) for _ in range(phase_zero_delay)
-        ]
-        _reclock_records(records)
-        command_148 = next(
-            index
-            for index, record in enumerate(records)
-            if record["carry_command_frame"] == 148
-        )
-        wait = copy.deepcopy(records[command_148])
-        wait.update(action="none", carry_command_frame=-1)
-        records.insert(command_148 + 1, wait)
+        wait = copy.deepcopy(records[-1])
+        wait.update(action="none", result="None", reason="None")
+        records.insert(len(records) - 1, wait)
         _reclock_records(records)
         _write_records(self.log, records)
-        validate_evidence(load_evidence(self.log))
+        with self.assertRaisesRegex(EvidenceValidationError, "immediately follow"):
+            validate_evidence(load_evidence(self.log))
 
     def test_carry_mode_may_fall_back_before_the_final_carry_record(self):
         records = _valid_records()
@@ -1642,10 +1594,10 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
 
     def test_adjacent_nonowned_root_jump_over_point_two_is_rejected(self):
         records = _valid_records()
-        self.assertFalse(records[29]["owns_pose"])
-        self.assertFalse(records[30]["owns_pose"])
-        self.assertEqual(records[30]["action"], "interact")
-        records[30]["root_position"][0] = 2.433498
+        self.assertFalse(records[INTERACT_FRAME - 1]["owns_pose"])
+        self.assertFalse(records[INTERACT_FRAME]["owns_pose"])
+        self.assertEqual(records[INTERACT_FRAME]["action"], "interact")
+        records[INTERACT_FRAME]["root_position"][0] = 2.433498
         _write_records(self.log, records)
         with self.assertRaisesRegex(
             EvidenceValidationError,
@@ -1686,12 +1638,20 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
             validate_evidence(records)
 
     def test_point_200001_joint_jump_is_rejected_at_every_state_boundary(self):
+        records = _valid_records()
+        first_state_frames = {
+            state: next(
+                index for index, record in enumerate(records)
+                if record["state"] == state
+            )
+            for state in ("Preflight", "PickupReplay", "Carry")
+        }
         boundary_frames = {
-            "entry": 31,
-            "contact": 36,
-            "hold_to_carry": 41,
-            "carry": 100,
-            "reset": 192,
+            "entry": first_state_frames["Preflight"],
+            "contact": first_state_frames["PickupReplay"],
+            "hold_to_carry": first_state_frames["Carry"],
+            "carry": first_state_frames["Carry"] + 20,
+            "reset": len(records) - 1,
         }
         for boundary, frame in boundary_frames.items():
             with self.subTest(boundary=boundary):
@@ -1739,7 +1699,7 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
         with self.assertRaises(EvidenceValidationError):
             validate_evidence(load_evidence(self.log))
 
-    def test_forward_count_must_be_exactly_150(self):
+    def test_forward_count_must_be_exactly_63(self):
         records = _valid_records()
         records[80]["action"] = "none"
         records[80]["carry_command_frame"] = -1
@@ -1752,7 +1712,7 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
         for record in records:
             command = record["carry_command_frame"]
             if command >= 0:
-                displacement = 0.20 * (command + 1) / 150.0
+                displacement = 0.20 * (command + 1) / CARRY_COMMAND_COUNT
                 record["root_position"][0] = displacement
                 record["object_position"][0] = displacement
                 record["grasp_world_position"][0] = displacement
@@ -2018,8 +1978,9 @@ class Task12PolicyTests(unittest.TestCase):
     def test_controller_retains_fixed_clock_and_autodemo_boundaries(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")
         self.assertIn(
-            "SetTargetFPS(60);", controller, "controller must retain fixed 60 Hz"
+            "SetTargetFPS(25);", controller, "controller must use fixed 25 Hz"
         )
+        self.assertNotIn("SetTargetFPS(60);", controller)
         self.assertIn(
             "ControllerInteractionScheduler",
             controller,
@@ -2047,6 +2008,11 @@ class Task12PolicyTests(unittest.TestCase):
             "runtime_accumulator",
             controller,
             "controller must not reintroduce accumulator scheduling",
+        )
+        self.assertNotIn(
+            "const float interaction_scene_alpha =",
+            controller,
+            "25 Hz scene publication must not add render interpolation lag",
         )
 
     def test_controller_uses_exact_23_pose_bridge_and_flat_toe_indices(self):
@@ -2290,12 +2256,13 @@ class Task12PolicyTests(unittest.TestCase):
             "JSON writer must receive exactly the immutable final capture",
         )
 
-    def test_autodemo_drains_sixteen_unlogged_frames_before_exit(self):
+    def test_autodemo_drains_seven_unlogged_frames_before_exit(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")
         self.assertRegex(
             controller,
             r"constexpr\s+uint32_t\s+"
-            r"kAutodemoResetPresentationFrames\s*=\s*16U;",
+            rf"kAutodemoResetPresentationFrames\s*=\s*"
+            rf"{RESET_PRESENTATION_FRAMES}U;",
             "autodemo Reset must remain visible for the 0.25 s release",
         )
 
@@ -2328,7 +2295,7 @@ class Task12PolicyTests(unittest.TestCase):
             "autodemo_state.reset_presentation_frames_remaining =\n"
             "                        kAutodemoResetPresentationFrames;",
             reset_completion,
-            "the logged Reset must start the exact 16-frame drain",
+            "the logged Reset must start the exact 7-frame drain",
         )
         for forbidden in (
             "publish_autodemo_evidence(",
@@ -2856,14 +2823,19 @@ class PlayableInteractionEvidenceTests(unittest.TestCase):
         validate_evidence(records)
         validate_screenshot(Path(os.environ["PLAYABLE_SCREENSHOT"]))
 
-    def test_real_playable_evidence_preserves_exact_354_record_contract(self):
+    def test_real_playable_evidence_preserves_bounded_25_hz_contract(self):
         records = load_evidence(Path(os.environ["PLAYABLE_LOG"]))
-        self.assertEqual(len(records), 354)
+        self.assertLessEqual(len(records), MAX_EVIDENCE_RECORDS)
         self.assertEqual(
             [record["render_frame"] for record in records],
-            list(range(354)),
+            list(range(len(records))),
         )
-        self.assertEqual(records[-1]["render_frame"], 353)
+        self.assertEqual(
+            [record["runtime_tick"] for record in records],
+            list(range(records[0]["runtime_tick"], records[0]["runtime_tick"] + len(records))),
+        )
+        self.assertTrue(all(record["scheduler_phase"] == 0 for record in records))
+        self.assertEqual(records[-1]["render_frame"], len(records) - 1)
         self.assertEqual(records[-1]["state"], "Locomotion")
         self.assertEqual(records[-1]["action"], "reset")
         self.assertEqual(records[-1]["result"], "Reset")
