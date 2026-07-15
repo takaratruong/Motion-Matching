@@ -26,6 +26,8 @@ EXPECTED_KEYS = (
     "root_position",
     "object_position",
     "root_displacement_m",
+    "joint_world_positions",
+    "joint_world_rotations",
     "action",
 )
 
@@ -91,6 +93,34 @@ RUNTIME_CACHED_FIELDS = (
     "owns_pose",
     "carry_mode",
 )
+FLAT_JOINT_NAMES = (
+    "Root",
+    "LeftHip",
+    "LeftKnee",
+    "LeftAnkle",
+    "LeftFoot",
+    "LeftToe",
+    "RightHip",
+    "RightKnee",
+    "RightAnkle",
+    "RightFoot",
+    "SpineLower",
+    "SpineMiddle",
+    "SpineUpper",
+    "Neck",
+    "Head",
+    "LeftShoulder",
+    "LeftUpperArm",
+    "LeftForearm",
+    "LeftHand",
+    "RightShoulder",
+    "RightUpperArm",
+    "RightForearm",
+    "RightHand",
+)
+JOINT_TRANSLATION_LIMIT_M = 0.20
+JOINT_ROTATION_LIMIT_DEGREES = 60.0
+JOINT_QUATERNION_NORM_TOLERANCE = 1.0e-3
 
 
 def _error(message: str) -> EvidenceValidationError:
@@ -133,6 +163,55 @@ def _require_position(record: dict, name: str) -> None:
             raise _error(f"{name} must contain only finite numbers")
 
 
+def _require_joint_world_arrays(record: dict) -> None:
+    frame = record["render_frame"]
+    specifications = (
+        ("joint_world_positions", 3),
+        ("joint_world_rotations", 4),
+    )
+    for field, component_count in specifications:
+        values = record[field]
+        if type(values) is not list or len(values) != len(FLAT_JOINT_NAMES):
+            raise _error(
+                f"frame {frame} {field} must contain exactly "
+                f"{len(FLAT_JOINT_NAMES)} joints"
+            )
+        for joint, components in enumerate(values):
+            joint_name = FLAT_JOINT_NAMES[joint]
+            if type(components) is not list or len(components) != component_count:
+                raise _error(
+                    f"frame {frame} joint {joint} ({joint_name}) {field} "
+                    f"must contain exactly {component_count} components"
+                )
+            if any(
+                type(component) not in (int, float)
+                or not math.isfinite(component)
+                for component in components
+            ):
+                raise _error(
+                    f"frame {frame} joint {joint} ({joint_name}) {field} "
+                    "must contain only finite numbers"
+                )
+
+    for joint, quaternion in enumerate(record["joint_world_rotations"]):
+        norm = math.sqrt(sum(component * component for component in quaternion))
+        norm_error = abs(norm - 1.0)
+        if norm_error > JOINT_QUATERNION_NORM_TOLERANCE:
+            raise _error(
+                f"frame {frame} joint {joint} ({FLAT_JOINT_NAMES[joint]}) "
+                f"quaternion norm error {norm_error:.6f} exceeds max "
+                f"{JOINT_QUATERNION_NORM_TOLERANCE:.6f}"
+            )
+
+
+def _joint_rotation_step_degrees(left: list[float], right: list[float]) -> float:
+    left_norm = math.sqrt(sum(component * component for component in left))
+    right_norm = math.sqrt(sum(component * component for component in right))
+    dot = sum(a * b for a, b in zip(left, right)) / (left_norm * right_norm)
+    sign_invariant_dot = min(1.0, max(0.0, abs(dot)))
+    return math.degrees(2.0 * math.acos(sign_invariant_dot))
+
+
 def _validate_record_types(record: dict) -> None:
     _require_integer(record, "render_frame", 0)
     _require_integer(record, "runtime_tick", 0)
@@ -153,6 +232,7 @@ def _validate_record_types(record: dict) -> None:
         raise _error("root_displacement_m must be a finite number")
     if displacement < 0.0:
         raise _error("root_displacement_m must be nonnegative")
+    _require_joint_world_arrays(record)
     _require_enum(record, "action", ACTIONS)
 
 
@@ -211,11 +291,33 @@ def validate_evidence(records: list[dict]) -> None:
     if len(records) > 1200:
         raise _error("evidence must contain at most 1200 render records")
     for index, record in enumerate(records):
+        _require_joint_world_arrays(record)
         if record["render_frame"] != index:
             raise _error("render_frame must start at zero and be sequential")
         if index == 0:
             continue
         previous = records[index - 1]
+        for joint, joint_name in enumerate(FLAT_JOINT_NAMES):
+            translation_step_m = math.dist(
+                previous["joint_world_positions"][joint],
+                record["joint_world_positions"][joint],
+            )
+            if translation_step_m > JOINT_TRANSLATION_LIMIT_M:
+                raise _error(
+                    f"joint {joint} ({joint_name}) frame {index - 1}->{index} "
+                    f"translation {translation_step_m:.6f} m exceeds max "
+                    f"{JOINT_TRANSLATION_LIMIT_M:.6f} m"
+                )
+            rotation_step_degrees = _joint_rotation_step_degrees(
+                previous["joint_world_rotations"][joint],
+                record["joint_world_rotations"][joint],
+            )
+            if rotation_step_degrees > JOINT_ROTATION_LIMIT_DEGREES:
+                raise _error(
+                    f"joint {joint} ({joint_name}) frame {index - 1}->{index} "
+                    f"rotation {rotation_step_degrees:.6f} degrees exceeds max "
+                    f"{JOINT_ROTATION_LIMIT_DEGREES:.6f} degrees"
+                )
         runtime_step = record["runtime_tick"] - previous["runtime_tick"]
         if runtime_step not in (0, 1):
             raise _error("runtime_tick must be nondecreasing by at most one")
@@ -427,6 +529,12 @@ def _record_line(record: dict) -> str:
     def position(name: str) -> str:
         return "[" + ",".join(f"{value:.6f}" for value in record[name]) + "]"
 
+    def joint_vectors(name: str) -> str:
+        return "[" + ",".join(
+            "[" + ",".join(f"{value:.6f}" for value in vector) + "]"
+            for vector in record[name]
+        ) + "]"
+
     return (
         f'{{"render_frame":{record["render_frame"]},'
         f'"runtime_tick":{record["runtime_tick"]},'
@@ -442,6 +550,8 @@ def _record_line(record: dict) -> str:
         f'"root_position":{position("root_position")},'
         f'"object_position":{position("object_position")},'
         f'"root_displacement_m":{record["root_displacement_m"]:.6f},'
+        f'"joint_world_positions":{joint_vectors("joint_world_positions")},'
+        f'"joint_world_rotations":{joint_vectors("joint_world_rotations")},'
         f'"action":{string("action")}}}\n'
     )
 
@@ -529,6 +639,13 @@ def _valid_records() -> list[dict]:
                 3.0,
             ],
             "root_displacement_m": root_x,
+            "joint_world_positions": [
+                [root_x, 0.05 * joint, 2.0]
+                for joint in range(len(FLAT_JOINT_NAMES))
+            ],
+            "joint_world_rotations": [
+                [1.0, 0.0, 0.0, 0.0] for _ in FLAT_JOINT_NAMES
+            ],
             "action": action,
         }
         records.append(record)
@@ -824,6 +941,77 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
             "adjacent non-owned root step must not exceed 0.20 m",
         ):
             validate_evidence(load_evidence(self.log))
+
+    def test_joint_world_arrays_require_exactly_23_joints(self):
+        for field in ("joint_world_positions", "joint_world_rotations"):
+            for length in (22, 24):
+                with self.subTest(field=field, length=length):
+                    records = _valid_records()
+                    records[0][field] = records[0][field][:length]
+                    if length == 24:
+                        records[0][field].append(copy.deepcopy(records[0][field][-1]))
+                    with self.assertRaisesRegex(
+                        EvidenceValidationError,
+                        rf"{field}.*exactly 23",
+                    ):
+                        validate_evidence(records)
+
+    def test_nonfinite_joint_world_component_is_rejected_with_joint_name(self):
+        records = _valid_records()
+        records[0]["joint_world_positions"][14][1] = math.nan
+        with self.assertRaisesRegex(
+            EvidenceValidationError,
+            r"frame 0 joint 14 \(Head\).*finite",
+        ):
+            validate_evidence(records)
+
+    def test_zero_joint_world_quaternion_is_rejected_with_joint_name(self):
+        records = _valid_records()
+        records[0]["joint_world_rotations"][13] = [0.0, 0.0, 0.0, 0.0]
+        with self.assertRaisesRegex(
+            EvidenceValidationError,
+            r"frame 0 joint 13 \(Neck\).*quaternion norm",
+        ):
+            validate_evidence(records)
+
+    def test_point_200001_joint_jump_is_rejected_at_every_state_boundary(self):
+        boundary_frames = {
+            "entry": 31,
+            "contact": 36,
+            "hold_to_carry": 41,
+            "carry": 100,
+            "reset": 192,
+        }
+        for boundary, frame in boundary_frames.items():
+            with self.subTest(boundary=boundary):
+                records = _valid_records()
+                records[frame]["joint_world_positions"][14] = copy.deepcopy(
+                    records[frame - 1]["joint_world_positions"][14]
+                )
+                records[frame]["joint_world_positions"][14][0] += 0.200001
+                with self.assertRaisesRegex(
+                    EvidenceValidationError,
+                    rf"joint 14 \(Head\).*frame {frame - 1}->{frame}.*"
+                    r"0\.200001.*0\.200000",
+                ):
+                    validate_evidence(records)
+
+    def test_60_001_degree_joint_jump_is_rejected_at_reset(self):
+        records = _valid_records()
+        frame = len(records) - 1
+        angle = math.radians(60.001)
+        records[frame]["joint_world_rotations"][13] = [
+            math.cos(0.5 * angle),
+            math.sin(0.5 * angle),
+            0.0,
+            0.0,
+        ]
+        with self.assertRaisesRegex(
+            EvidenceValidationError,
+            rf"joint 13 \(Neck\).*frame {frame - 1}->{frame}.*"
+            r"60\.001000.*60\.000000",
+        ):
+            validate_evidence(records)
 
     def test_illegal_state_order_is_rejected(self):
         records = _valid_records()
@@ -1235,6 +1423,37 @@ class Task12PolicyTests(unittest.TestCase):
             controller,
             "release must clear the prior owned reference",
         )
+
+    def test_autodemo_samples_all_rendered_joints_after_final_fk_before_draw(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        final_fk = controller.index("        forward_kinematics_full(")
+        capture = controller.index(
+            "capture_autodemo_rendered_joints(", final_fk
+        )
+        draw = controller.index("        BeginDrawing();", final_fk)
+        self.assertLess(
+            final_fk,
+            capture,
+            "autodemo joints must be sampled after final foot-IK FK",
+        )
+        self.assertLess(
+            capture,
+            draw,
+            "autodemo joints must be sampled before drawing",
+        )
+
+        capture_function = self._cpp_function(
+            controller,
+            "AutodemoRenderedJoints capture_autodemo_rendered_joints(",
+        )
+        self.assertIn("interaction::kFlatControllerBoneCount", capture_function)
+        self.assertIn("global_bone_positions.size", capture_function)
+        self.assertIn("global_bone_rotations.size", capture_function)
+        self.assertIn("quat_normalize(global_bone_rotations", capture_function)
+
+        writer = self._cpp_function(controller, "void write_autodemo_record(")
+        self.assertIn('\\"joint_world_positions\\":[', writer)
+        self.assertIn('\\"joint_world_rotations\\":[', writer)
 
     def test_canonical_world_is_initialized_once_before_log_and_update(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")

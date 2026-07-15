@@ -1362,6 +1362,64 @@ struct AutodemoConfiguration
     bool preserve_backups_after_rollback_failure = false;
 };
 
+struct AutodemoRenderedJoints
+{
+    std::array<vec3, interaction::kFlatControllerBoneCount> positions{};
+    std::array<quat, interaction::kFlatControllerBoneCount> rotations{};
+};
+
+constexpr std::array<const char*, interaction::kFlatControllerBoneCount>
+    kAutodemoFlatJointNames = {
+        "Root",
+        "LeftHip",
+        "LeftKnee",
+        "LeftAnkle",
+        "LeftFoot",
+        "LeftToe",
+        "RightHip",
+        "RightKnee",
+        "RightAnkle",
+        "RightFoot",
+        "SpineLower",
+        "SpineMiddle",
+        "SpineUpper",
+        "Neck",
+        "Head",
+        "LeftShoulder",
+        "LeftUpperArm",
+        "LeftForearm",
+        "LeftHand",
+        "RightShoulder",
+        "RightUpperArm",
+        "RightForearm",
+        "RightHand"};
+
+AutodemoRenderedJoints capture_autodemo_rendered_joints(
+    const slice1d<vec3> global_bone_positions,
+    const slice1d<quat> global_bone_rotations)
+{
+    if (global_bone_positions.size !=
+            static_cast<int>(interaction::kFlatControllerBoneCount) ||
+        global_bone_rotations.size !=
+            static_cast<int>(interaction::kFlatControllerBoneCount))
+    {
+        throw std::runtime_error(
+            "autodemo rendered joint arrays must contain exactly 23 joints");
+    }
+
+    AutodemoRenderedJoints rendered_joints;
+    for (size_t joint = 0;
+         joint < interaction::kFlatControllerBoneCount;
+         ++joint)
+    {
+        const int index = static_cast<int>(joint);
+        rendered_joints.positions[joint] = global_bone_positions(index);
+        rendered_joints.rotations[joint] =
+            quat_normalize(global_bone_rotations(index));
+    }
+    return rendered_joints;
+}
+
 std::filesystem::path autodemo_normalized_path(
     const std::filesystem::path& path)
 {
@@ -1922,6 +1980,7 @@ void write_autodemo_record(
     vec3 root_position,
     vec3 object_position,
     float root_displacement_m,
+    const AutodemoRenderedJoints& rendered_joints,
     AutodemoAction action)
 {
     if (scheduler_phase < 0 || scheduler_phase >= 60 ||
@@ -1934,6 +1993,39 @@ void write_autodemo_record(
         !autodemo_is_finite(root_displacement_m))
     {
         throw std::runtime_error("autodemo evidence contains invalid values");
+    }
+
+    constexpr float kQuaternionNormTolerance = 1.0e-3F;
+    for (size_t joint = 0;
+         joint < interaction::kFlatControllerBoneCount;
+         ++joint)
+    {
+        const vec3 position = rendered_joints.positions[joint];
+        const quat rotation = rendered_joints.rotations[joint];
+        if (!autodemo_is_finite(position.x) ||
+            !autodemo_is_finite(position.y) ||
+            !autodemo_is_finite(position.z) ||
+            !autodemo_is_finite(rotation.w) ||
+            !autodemo_is_finite(rotation.x) ||
+            !autodemo_is_finite(rotation.y) ||
+            !autodemo_is_finite(rotation.z))
+        {
+            throw std::runtime_error(
+                "autodemo frame " + std::to_string(render_frame) +
+                " joint " + std::to_string(joint) + " (" +
+                kAutodemoFlatJointNames[joint] +
+                ") contains a non-finite rendered transform");
+        }
+        const float norm_error = std::fabs(quat_length(rotation) - 1.0F);
+        if (!autodemo_is_finite(norm_error) ||
+            norm_error > kQuaternionNormTolerance)
+        {
+            throw std::runtime_error(
+                "autodemo frame " + std::to_string(render_frame) +
+                " joint " + std::to_string(joint) + " (" +
+                kAutodemoFlatJointNames[joint] +
+                ") rendered quaternion norm error exceeds 0.001");
+        }
     }
 
     output << std::fixed << std::setprecision(6)
@@ -1965,7 +2057,26 @@ void write_autodemo_record(
         << object_position.x << ',' << object_position.y << ','
         << object_position.z
         << "],\"root_displacement_m\":" << root_displacement_m
-        << ",\"action\":\"" << autodemo_action_name(action)
+        << ",\"joint_world_positions\":[";
+    for (size_t joint = 0;
+         joint < interaction::kFlatControllerBoneCount;
+         ++joint)
+    {
+        const vec3 position = rendered_joints.positions[joint];
+        output << (joint == 0U ? "" : ",") << '['
+            << position.x << ',' << position.y << ',' << position.z << ']';
+    }
+    output << "],\"joint_world_rotations\":[";
+    for (size_t joint = 0;
+         joint < interaction::kFlatControllerBoneCount;
+         ++joint)
+    {
+        const quat rotation = rendered_joints.rotations[joint];
+        output << (joint == 0U ? "" : ",") << '['
+            << rotation.w << ',' << rotation.x << ','
+            << rotation.y << ',' << rotation.z << ']';
+    }
+    output << "],\"action\":\"" << autodemo_action_name(action)
         << "\"}\n";
     if (!output)
     {
@@ -3642,6 +3753,14 @@ int main(void)
             adjusted_bone_positions,
             adjusted_bone_rotations,
             db.bone_parents);
+
+        std::optional<AutodemoRenderedJoints> autodemo_rendered_joints;
+        if (autodemo_configuration.has_value())
+        {
+            autodemo_rendered_joints = capture_autodemo_rendered_joints(
+                global_bone_positions,
+                global_bone_rotations);
+        }
         
         // Update camera
         
@@ -4199,6 +4318,7 @@ int main(void)
                     displayed_root,
                     interaction_scene_state.object_world.position,
                     root_displacement_m,
+                    autodemo_rendered_joints.value(),
                     autodemo_action);
 
                 if (!autodemo_state.carry_origin_captured &&
