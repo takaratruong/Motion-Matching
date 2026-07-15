@@ -239,6 +239,14 @@ def validate_evidence(records: list[dict]) -> None:
                     "cached runtime output changed on a non-due runtime tick: "
                     + ", ".join(changed)
                 )
+        if not previous["owns_pose"] and not record["owns_pose"]:
+            root_step_m = math.dist(
+                previous["root_position"], record["root_position"]
+            )
+            if root_step_m > 0.20:
+                raise _error(
+                    "adjacent non-owned root step must not exceed 0.20 m"
+                )
 
     interact = [record for record in records if record["action"] == "interact"]
     if len(interact) != 1 or interact[0]["render_frame"] != 30:
@@ -804,6 +812,19 @@ class EvidenceValidatorUnitTests(unittest.TestCase):
         with self.assertRaises(EvidenceValidationError):
             validate_evidence(load_evidence(self.log))
 
+    def test_adjacent_nonowned_root_jump_over_point_two_is_rejected(self):
+        records = _valid_records()
+        self.assertFalse(records[29]["owns_pose"])
+        self.assertFalse(records[30]["owns_pose"])
+        self.assertEqual(records[30]["action"], "interact")
+        records[30]["root_position"][0] = 2.433498
+        _write_records(self.log, records)
+        with self.assertRaisesRegex(
+            EvidenceValidationError,
+            "adjacent non-owned root step must not exceed 0.20 m",
+        ):
+            validate_evidence(load_evidence(self.log))
+
     def test_illegal_state_order_is_rejected(self):
         records = _valid_records()
         records[34]["state"] = "PickupReplay"
@@ -1215,29 +1236,82 @@ class Task12PolicyTests(unittest.TestCase):
             "release must clear the prior owned reference",
         )
 
-    def test_canonical_placement_is_one_time_and_root_only(self):
+    def test_canonical_world_is_initialized_once_before_log_and_update(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")
-        placement = self._source_between(
-            controller,
-            "        const bool use_autodemo_canonical_snapshot =",
-            "        // Advance the interaction runtime at exactly 25 of every 60",
+        initializer_marker = (
+            "    auto initialize_autodemo_canonical_world = [&]()"
         )
-        with self.subTest(boundary="one-time guard"):
-            self.assertLess(
-                placement.index("!autodemo_state.canonical_move_applied"),
-                placement.index("inertialize_root_adjust("),
-                "canonical placement must be guarded before the root move",
-            )
-        with self.subTest(boundary="root-only placement"):
-            self.assertNotIn(
-                "for (int bone = 0; bone < g1_skeleton::BoneCount; ++bone)",
-                placement,
-                "canonical placement must not copy the full canonical pose",
-            )
-        self.assertIn(
+        call_marker = "    initialize_autodemo_canonical_world();"
+        self.assertIn(initializer_marker, controller)
+        self.assertIn(call_marker, controller)
+        initializer = self._source_between(
+            controller,
+            initializer_marker,
+            call_marker,
+        )
+        call_index = controller.index(call_marker)
+        self.assertLess(
+            call_index,
+            controller.index("autodemo_state.log.imbue", call_index),
+            "canonical world initialization must precede autodemo logging",
+        )
+        self.assertLess(
+            call_index,
+            controller.index("    auto update_func = [&]()", call_index),
+            "canonical world initialization must precede the update loop",
+        )
+        self.assertEqual(
+            initializer.count("inertialize_root_adjust("),
+            1,
+            "canonical world initialization must adjust the rendered root once",
+        )
+        for forbidden in (
+            "curr_bone_positions(0) =",
+            "curr_bone_rotations(0) =",
+            "trns_bone_positions(0) =",
+            "trns_bone_rotations(0) =",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(
+                    forbidden,
+                    initializer,
+                    "canonical world initialization must not rewrite animation space",
+                )
+        for required in (
+            "bone_velocities(0) = canonical_pose.velocities[root];",
+            "bone_angular_velocities(0) =",
+            "simulation_position = canonical_pose.positions[root];",
+            "desired_velocity_change_curr = vec3();",
+            "trajectory_positions(0) = simulation_position;",
+            "future_root_positions[index]",
+            "adjusted_bone_positions(0) = bone_positions(0);",
             "reset_controller_contacts();",
-            placement,
-            "one-time canonical placement must reset controller contact locks",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(
+                    required,
+                    initializer,
+                    "canonical initializer is missing required world/root state",
+                )
+        self.assertNotIn(
+            "canonical_move_applied",
+            controller,
+            "canonical placement must not be deferred into the render loop",
+        )
+        update_loop = self._source_between(
+            controller,
+            "    auto update_func = [&]()",
+            "    std::function<void()> u{update_func};",
+        )
+        self.assertNotIn(
+            "const interaction::Pose& canonical_pose =",
+            update_loop,
+            "update loop must not physically place the canonical root",
+        )
+        self.assertIn(
+            "return autodemo_canonical_entry->snapshot;",
+            update_loop,
+            "canonical snapshot must remain private to the scheduler provider",
         )
 
     def test_canonical_snapshot_stays_in_scheduler_provider(self):

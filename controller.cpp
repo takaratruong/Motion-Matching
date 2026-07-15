@@ -1855,7 +1855,6 @@ struct ControllerAutodemoState
     int carry_command_count = 0;
     bool evidence_started = false;
     bool interact_pulsed = false;
-    bool canonical_move_applied = false;
     bool candidate_verified = false;
     bool carry_origin_captured = false;
     bool reset_pending = false;
@@ -2611,6 +2610,87 @@ int main(void)
         return pose;
     };
 
+    auto initialize_autodemo_canonical_world = [&]()
+    {
+        if (!autodemo_configuration.has_value())
+        {
+            return;
+        }
+        if (!autodemo_canonical_entry.has_value())
+        {
+            throw std::runtime_error(
+                "autodemo canonical world entry is unavailable");
+        }
+
+        const interaction::Pose& canonical_pose =
+            autodemo_canonical_entry->snapshot.pose;
+        constexpr size_t root = g1_skeleton::Simulation;
+
+        inertialize_root_adjust(
+            bone_offset_positions(0),
+            transition_src_position,
+            transition_src_rotation,
+            transition_dst_position,
+            transition_dst_rotation,
+            bone_positions(0),
+            bone_rotations(0),
+            canonical_pose.positions[root],
+            canonical_pose.rotations[root]);
+        bone_velocities(0) = canonical_pose.velocities[root];
+        bone_angular_velocities(0) =
+            canonical_pose.angular_velocities[root];
+
+        simulation_position = canonical_pose.positions[root];
+        simulation_velocity = canonical_pose.velocities[root];
+        simulation_acceleration = vec3();
+        simulation_rotation = canonical_pose.rotations[root];
+        simulation_angular_velocity =
+            canonical_pose.angular_velocities[root];
+        desired_velocity = simulation_velocity;
+        desired_rotation = simulation_rotation;
+        desired_velocity_change_curr = vec3();
+        desired_velocity_change_prev = vec3();
+        desired_rotation_change_curr = vec3();
+        desired_rotation_change_prev = vec3();
+
+        trajectory_positions(0) = simulation_position;
+        trajectory_velocities(0) = simulation_velocity;
+        trajectory_accelerations(0) = vec3();
+        trajectory_rotations(0) = simulation_rotation;
+        trajectory_angular_velocities(0) =
+            simulation_angular_velocity;
+        trajectory_desired_velocities(0) = simulation_velocity;
+        trajectory_desired_rotations(0) = simulation_rotation;
+        for (size_t index = 0;
+             index < autodemo_canonical_entry->snapshot
+                 .future_root_positions.size();
+             ++index)
+        {
+            const int trajectory_index = static_cast<int>(index) + 1;
+            trajectory_positions(trajectory_index) =
+                autodemo_canonical_entry->snapshot
+                    .future_root_positions[index];
+            trajectory_rotations(trajectory_index) =
+                autodemo_canonical_entry->snapshot
+                    .future_root_rotations[index];
+            trajectory_velocities(trajectory_index) =
+                autodemo_canonical_entry->future_root_velocities[index];
+            trajectory_angular_velocities(trajectory_index) =
+                autodemo_canonical_entry
+                    ->future_root_angular_velocities[index];
+            trajectory_accelerations(trajectory_index) = vec3();
+            trajectory_desired_velocities(trajectory_index) =
+                trajectory_velocities(trajectory_index);
+            trajectory_desired_rotations(trajectory_index) =
+                trajectory_rotations(trajectory_index);
+        }
+
+        adjusted_bone_positions(0) = bone_positions(0);
+        adjusted_bone_rotations(0) = bone_rotations(0);
+        reset_controller_contacts();
+    };
+    initialize_autodemo_canonical_world();
+
 #ifdef MM_DISCRETE
     // Optional env overrides so we can sweep halflife without recompiling.
     if (const char* e = getenv("MM_HALFLIFE"))  inertialize_blending_halflife = atof(e);
@@ -3219,79 +3299,6 @@ int main(void)
                  interaction::RuntimeState::Locomotion ||
              cached_interaction_state ==
                  interaction::RuntimeState::Preflight);
-        if (use_autodemo_canonical_snapshot &&
-            !autodemo_state.canonical_move_applied)
-        {
-            const interaction::Pose& canonical_pose =
-                autodemo_canonical_entry->snapshot.pose;
-            constexpr size_t root = g1_skeleton::Simulation;
-
-            // This is deliberately after ordinary locomotion adjustment and
-            // clamping. Place only the controller root; the full canonical
-            // snapshot remains private to the scheduler provider.
-            inertialize_root_adjust(
-                bone_offset_positions(0),
-                transition_src_position,
-                transition_src_rotation,
-                transition_dst_position,
-                transition_dst_rotation,
-                bone_positions(0),
-                bone_rotations(0),
-                canonical_pose.positions[root],
-                canonical_pose.rotations[root]);
-            bone_velocities(0) = canonical_pose.velocities[root];
-            bone_angular_velocities(0) =
-                canonical_pose.angular_velocities[root];
-
-            simulation_position = canonical_pose.positions[root];
-            simulation_velocity = canonical_pose.velocities[root];
-            simulation_acceleration = vec3();
-            simulation_rotation = canonical_pose.rotations[root];
-            simulation_angular_velocity =
-                canonical_pose.angular_velocities[root];
-            desired_velocity = simulation_velocity;
-            desired_rotation = simulation_rotation;
-            desired_velocity_change_curr = vec3();
-            desired_velocity_change_prev = vec3();
-            desired_rotation_change_curr = vec3();
-            desired_rotation_change_prev = vec3();
-
-            trajectory_positions(0) = simulation_position;
-            trajectory_velocities(0) = simulation_velocity;
-            trajectory_accelerations(0) = vec3();
-            trajectory_rotations(0) = simulation_rotation;
-            trajectory_angular_velocities(0) =
-                simulation_angular_velocity;
-            trajectory_desired_velocities(0) = simulation_velocity;
-            trajectory_desired_rotations(0) = simulation_rotation;
-            for (size_t index = 0;
-                 index < autodemo_canonical_entry->snapshot
-                     .future_root_positions.size();
-                 ++index)
-            {
-                const int trajectory_index = static_cast<int>(index) + 1;
-                trajectory_positions(trajectory_index) =
-                    autodemo_canonical_entry->snapshot
-                        .future_root_positions[index];
-                trajectory_rotations(trajectory_index) =
-                    autodemo_canonical_entry->snapshot
-                        .future_root_rotations[index];
-                trajectory_velocities(trajectory_index) =
-                    autodemo_canonical_entry
-                        ->future_root_velocities[index];
-                trajectory_angular_velocities(trajectory_index) =
-                    autodemo_canonical_entry
-                        ->future_root_angular_velocities[index];
-                trajectory_accelerations(trajectory_index) = vec3();
-                trajectory_desired_velocities(trajectory_index) =
-                    trajectory_velocities(trajectory_index);
-                    trajectory_desired_rotations(trajectory_index) =
-                        trajectory_rotations(trajectory_index);
-            }
-
-            reset_controller_contacts();
-            autodemo_state.canonical_move_applied = true;
-        }
 
         // Advance the interaction runtime at exactly 25 of every 60
         // controller ticks. The provider and resolver are invoked only by a
