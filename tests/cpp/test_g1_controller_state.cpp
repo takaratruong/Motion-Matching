@@ -1177,6 +1177,10 @@ static void poison_state(g1_controller_state& state)
     state.ik_frame.applied = true;
     state.ik_frame.safe_stop_requested = true;
     state.ik_frame.stop_reason = G1IkStopNoSwingCandidate;
+    state.ik_frame.root_reach.active = true;
+    state.ik_frame.root_reach.common_interval_found = true;
+    state.ik_frame.root_reach.applied = true;
+    state.ik_frame.root_reach.root_y_delta_m = 0.03125f;
     state.ik_frame.feet[0].target.desired_sole_normal =
         vec3(82.0f, 83.0f, 84.0f);
     state.ik_clearance = G1PoseClearance{};
@@ -1639,6 +1643,9 @@ static void test_reset_clears_every_dynamic_subsystem()
               !state.ik_frame.applied &&
               !state.ik_frame.safe_stop_requested &&
               state.ik_frame.stop_reason == G1IkStopNone &&
+              g1_root_reach_plan_is_valid(
+                  state.ik_frame.root_reach) &&
+              !state.ik_frame.root_reach.active &&
               state.ik_candidate_clearance_status == G1ClearanceOk &&
               !state.ik_candidate_rejected &&
               state.ik_clearance.minimum.lower_bound_m >= -0.01 &&
@@ -2118,6 +2125,10 @@ static void logical_hash_frame_result(
     logical_hash_value(hash, value.safe_stop_requested);
     logical_hash_value(hash, static_cast<int>(value.stop_reason));
     logical_hash_value(hash, value.max_correction_radians);
+    logical_hash_value(hash, value.root_reach.active);
+    logical_hash_value(hash, value.root_reach.common_interval_found);
+    logical_hash_value(hash, value.root_reach.applied);
+    logical_hash_value(hash, value.root_reach.root_y_delta_m);
     for (int foot = 0; foot < 2; ++foot) {
         const G1FootFrameResult& result = value.feet[foot];
         logical_hash_value(hash, result.recorded_contact);
@@ -2420,6 +2431,10 @@ static void poison_all_state_values_against(
     output.ik = G1IkState{};
     output.ik_frame = G1IkFrameResult{};
     output.ik_frame.applied = true;
+    output.ik_frame.root_reach.active = true;
+    output.ik_frame.root_reach.common_interval_found = true;
+    output.ik_frame.root_reach.applied = true;
+    output.ik_frame.root_reach.root_y_delta_m = 0.03125f;
     output.ik_frame.feet[0].target.desired_sole_normal =
         vec3(222.0f, 223.0f, 224.0f);
     output.ik_clearance = G1PoseClearance{};
@@ -3685,6 +3700,117 @@ static void test_applied_ik_result_coherence()
           "real applied Task-5 result passes complete accepted-state gates");
 
     const G1IkFrameResult valid_result = state.ik_frame;
+    check(g1_root_reach_plan_is_valid(valid_result.root_reach) &&
+              valid_result.root_reach.active ==
+                  (state.curr_bone_contacts(0) ||
+                   state.curr_bone_contacts(1)) &&
+              (!valid_result.root_reach.active ||
+               valid_result.root_reach.common_interval_found),
+          "accepted all-contact IK owns a valid common root-reach plan");
+    const uint64_t valid_plan_digest = state_logical_digest(state);
+    const auto reject_plan_mutation = [
+        &state, &valid_result, valid_plan_digest](
+        const G1IkFrameResult& forged,
+        const char* message) {
+        state.ik_frame = forged;
+        check(state_logical_digest(state) != valid_plan_digest &&
+                  !g1_controller_state_is_valid(state),
+              message);
+        state.ik_frame = valid_result;
+    };
+    {
+        G1IkFrameResult forged = valid_result;
+        forged.root_reach.active = !forged.root_reach.active;
+        reject_plan_mutation(
+            forged,
+            "accepted-state digest and validator own root-plan active");
+    }
+    {
+        G1IkFrameResult forged = valid_result;
+        forged.root_reach.common_interval_found =
+            !forged.root_reach.common_interval_found;
+        reject_plan_mutation(
+            forged,
+            "accepted-state digest and validator own root-plan common interval");
+    }
+    {
+        G1IkFrameResult forged = valid_result;
+        forged.root_reach.applied = !forged.root_reach.applied;
+        reject_plan_mutation(
+            forged,
+            "accepted-state digest and validator own root-plan application");
+    }
+    {
+        G1IkFrameResult forged = valid_result;
+        if (forged.root_reach.applied) {
+            forged.root_reach.root_y_delta_m = std::nextafter(
+                forged.root_reach.root_y_delta_m,
+                forged.root_reach.root_y_delta_m < 0.0f
+                    ? -std::numeric_limits<float>::infinity()
+                    : std::numeric_limits<float>::infinity());
+        } else {
+            forged.root_reach.root_y_delta_m = 0.03125f;
+        }
+        reject_plan_mutation(
+            forged,
+            "accepted-state digest and validator own exact root-plan delta bits");
+    }
+    {
+        const float original =
+            state.adjusted_bone_positions(G1_Simulation).y;
+        state.adjusted_bone_positions(G1_Simulation).y =
+            std::nextafter(
+                original,
+                std::numeric_limits<float>::infinity());
+        check(state_logical_digest(state) != valid_plan_digest &&
+                  !g1_controller_state_is_valid(state),
+              "accepted-state validator owns adjusted local Simulation Y as the root-plan baseline");
+        state.adjusted_bone_positions(G1_Simulation).y = original;
+        check(g1_controller_state_is_valid(state),
+              "restoring adjusted local Simulation Y restores the accepted pose certificate");
+    }
+    {
+        const float original =
+            state.ik_bone_positions(G1_Simulation).y;
+        state.ik_bone_positions(G1_Simulation).y =
+            std::nextafter(
+                original,
+                std::numeric_limits<float>::infinity());
+        check(state_logical_digest(state) != valid_plan_digest &&
+                  !g1_controller_state_is_valid(state),
+              "accepted-state validator owns accepted IK local Simulation Y as the strict plan result");
+        state.ik_bone_positions(G1_Simulation).y = original;
+        check(g1_controller_state_is_valid(state),
+              "restoring accepted IK local Simulation Y restores the accepted pose certificate");
+    }
+    {
+        const float original =
+            state.global_bone_positions(G1_Hips).y;
+        state.global_bone_positions(G1_Hips).y =
+            std::nextafter(
+                original,
+                std::numeric_limits<float>::infinity());
+        check(state_logical_digest(state) != valid_plan_digest &&
+                  !g1_controller_state_is_valid(state),
+              "accepted-state validator owns support-retargeted global Hips Y");
+        state.global_bone_positions(G1_Hips).y = original;
+        check(g1_controller_state_is_valid(state),
+              "restoring support-retargeted global Hips Y restores the accepted pose certificate");
+    }
+    {
+        const float original =
+            state.ik_global_bone_positions(G1_Hips).y;
+        state.ik_global_bone_positions(G1_Hips).y =
+            std::nextafter(
+                original,
+                std::numeric_limits<float>::infinity());
+        check(state_logical_digest(state) != valid_plan_digest &&
+                  !g1_controller_state_is_valid(state),
+              "accepted-state validator owns accepted IK global Hips Y");
+        state.ik_global_bone_positions(G1_Hips).y = original;
+        check(g1_controller_state_is_valid(state),
+              "restoring accepted IK global Hips Y restores the accepted pose certificate");
+    }
     check(g1_controller_state_vec3_bits_equal(
               state.ik_frame.feet[0].target.surface.point,
               state.ik.feet[0].lock.lock_point) &&
@@ -3864,6 +3990,11 @@ static void test_applied_ik_result_coherence()
         error, static_cast<int>(sizeof(error)));
     check(g1_controller_state_is_valid(swing),
           "real mixed-contact Task-5 result passes complete state gates");
+    check(g1_root_reach_plan_is_valid(
+              swing.ik_frame.root_reach) &&
+              swing.ik_frame.root_reach.active &&
+              swing.ik_frame.root_reach.common_interval_found,
+          "accepted mixed-contact IK retains its common root-reach plan");
 
     const G1FootTarget accepted_target = swing.ik_frame.feet[1].target;
     vec3 accepted_swing_normal;

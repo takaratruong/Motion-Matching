@@ -576,6 +576,8 @@ git commit -m "feat: plan bounded G1 IK root reach"
 - Modify: `tests/cpp/test_g1_frame_transaction_production.cpp`
 - Modify: `tests/cpp/test_g1_controller_logging.cpp`
 - Modify: `tests/cpp/compile_g1_ik_production.cpp`
+- Modify: `docs/superpowers/specs/2026-07-16-g1-ik-root-reach-preconditioner-design.md`
+- Modify: `docs/superpowers/plans/2026-07-16-g1-ik-root-reach-preconditioner.md`
 
 **Interfaces:**
 - Consumes: Task 2 `G1RootReachPlan`, `g1_plan_recorded_contact_root_reach`, and `g1_apply_root_reach_plan_y`.
@@ -621,6 +623,16 @@ only to the production frame-transaction fixture in Step 2.
 
 Add an infeasible two-contact fixture and an out-of-cap fixture. `g1_ik_frame_begin` must succeed with an active/non-common/canonical-zero plan and unchanged root; the ordinary left-then-right stage must then publish the existing finite `G1IkStopTargetUnreachable` diagnostic. No planner-specific stop reason or target mutation is permitted.
 
+Add the finite candidate-quantization case discovered by the strict planner
+totality regression. Begin retains a valid active/non-common/unapplied
+positive-zero plan, and both named foot solves independently succeed. After
+foot 1, the frame result—not either foot result—must request
+`G1IkStopTargetUnreachable`; `next_foot` remains 2 and both successful foot
+transcripts remain byte-authentic. Mutate common, applied, delta, stop reason,
+either foot success transcript, `next_foot`, and the frame safe-stop bit one at
+a time and require the exact after-foot-1 snapshot to reject each forgery
+transactionally.
+
 - [ ] **Step 2: Write frame-transaction ownership RED tests**
 
 In `tests/cpp/test_g1_ik.cpp`, extend the existing independent helper
@@ -663,6 +675,18 @@ positive zero. Only
 pose-certificate rejection regression: it retains no attempted IK payload,
 cannot publish its working plan, and preserves the prior accepted plan and all
 other atomic owners.
+
+Add a production transaction regression for the exact candidate-quantization
+source: with the unshifted symmetric support word `0xbf08efbb`, both feet
+succeed, the root plan remains active/non-common/canonical zero, and the real
+runner finite-rejects at `G1FrameStageSecondFootIk` while preserving accepted
+state, publication, command, travel, heading, and immutable artifacts. The
+injected pose-certificate global rollback must use a genuinely accepting
+all-contact source derived by the deterministic sweep: move the aligned
+support exactly one ULP toward positive infinity, from `0xbf08efbb` to
+`0xbf08efba`. Freeze its active/common/unapplied positive-zero plan, both
+successful foot residual words `0x33820000`, complete final FK, and only then
+inject the pose-certificate global rollback.
 
 - [ ] **Step 3: Run RED focused binaries**
 
@@ -814,6 +838,13 @@ Update:
 
 - `g1_ik_runtime_is_disabled_noop` to require the canonical inactive positive-zero plan;
 - `g1_ik_frame_rejection_snapshot` to enforce the exact checkpoint forms from Step 2;
+- `g1_ik_frame_stage_foot` to request frame-level
+  `G1IkStopTargetUnreachable` after successful foot 1 when the retained plan
+  is exactly active/non-common/unapplied positive zero and no prior stop
+  exists, without changing either foot transcript;
+- the after-foot-1 rejection snapshot and frame-transaction rejected-result
+  validators to admit that one planner-terminal form with two independently
+  successful feet while retaining all existing rejecting-foot forms;
 - accepted finish to retain the same plan unchanged;
 - `g1_controller_state_ik_frame_is_valid` to authenticate plan shape, contact activation, and active-implies-common on accepted results;
 - `g1_controller_state_is_valid` to authenticate strict applied local root Y plus root X/Z and every non-root local-position bit against the support-retargeted baseline;
@@ -946,14 +977,14 @@ Run:
 mkdir -p /tmp/g1-root-reach-cert/low-curb
 for frames in 1 32 800; do
   for ik in 0 1; do
-    DISPLAY=:1 \
-      G1_TERRAIN_DIR=/tmp/g1-terrain-footprint-runtime-v1 \
-      MM_TERRAIN_SCENE=grail-curb-low \
-      MM_TEST_MODE=route MM_TEST_ROUTE=curb-forward \
-      MM_TEST_FRAMES="$frames" MM_TEST_HEADING=forward \
-      MM_TERRAIN_WEIGHT=4 MM_IK="$ik" \
-      MM_LOG="/tmp/g1-root-reach-cert/low-curb/${frames}-${ik}.csv" \
-      /tmp/controller_g1_root_reach_candidate
+    DISPLAY=:1 MM_IK="$ik" \
+      /tmp/controller_g1_root_reach_candidate \
+      --terrain-dir /tmp/g1-terrain-footprint-runtime-v1 \
+      --terrain-scene grail-curb-low \
+      --test-mode route --test-route curb-forward \
+      --test-frames "$frames" --test-heading forward \
+      --terrain-weight 4 \
+      --log "/tmp/g1-root-reach-cert/low-curb/${frames}-${ik}.csv"
   done
   /home/ubuntu/miniconda3/envs/diffsim/bin/python -c '
 import sys

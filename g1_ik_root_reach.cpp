@@ -621,6 +621,44 @@ static G1RootReachCandidateStatus g1_root_reach_candidate_revalidate(
             adjusted_root_y,
             baseline_positions.data[G1_Simulation].y,
             plan)) {
+        double summed_root_y = 0.0;
+        float rounded_root_y = 0.0f;
+        if (applied &&
+            g1_root_reach_checked_add(
+                static_cast<double>(
+                    baseline_positions.data[G1_Simulation].y),
+                static_cast<double>(delta_m),
+                summed_root_y) &&
+            ik_checked_binary32_commit(
+                summed_root_y, rounded_root_y) &&
+            terrain_float_bits(rounded_root_y) ==
+                terrain_float_bits(
+                    baseline_positions.data[G1_Simulation].y)) {
+            const G1RootReachPlan negative_cap_plan = {
+                true,
+                true,
+                true,
+                -G1RootReachMaximumAdjustmentM
+            };
+            const G1RootReachPlan positive_cap_plan = {
+                true,
+                true,
+                true,
+                G1RootReachMaximumAdjustmentM
+            };
+            float negative_cap_root_y = 0.0f;
+            float positive_cap_root_y = 0.0f;
+            if (g1_apply_root_reach_plan_y(
+                    negative_cap_root_y,
+                    baseline_positions.data[G1_Simulation].y,
+                    negative_cap_plan) ||
+                g1_apply_root_reach_plan_y(
+                    positive_cap_root_y,
+                    baseline_positions.data[G1_Simulation].y,
+                    positive_cap_plan)) {
+                return G1RootReachCandidateRejected;
+            }
+        }
         return G1RootReachCandidateInvalid;
     }
     local_positions[G1_Simulation].y = adjusted_root_y;

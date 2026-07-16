@@ -510,6 +510,10 @@ static void logical_hash_frame_result(
     logical_hash_value(hash, value.safe_stop_requested);
     logical_hash_value(hash, static_cast<int>(value.stop_reason));
     logical_hash_value(hash, value.max_correction_radians);
+    logical_hash_value(hash, value.root_reach.active);
+    logical_hash_value(hash, value.root_reach.common_interval_found);
+    logical_hash_value(hash, value.root_reach.applied);
+    logical_hash_value(hash, value.root_reach.root_y_delta_m);
     for (int foot = 0; foot < 2; ++foot) {
         const G1FootFrameResult& result = value.feet[foot];
         logical_hash_value(hash, result.recorded_contact);
@@ -701,6 +705,44 @@ static uint64_t ik_frame_logical_digest(const G1IkFrameResult& value)
     uint64_t hash = UINT64_C(1469598103934665603);
     logical_hash_frame_result(hash, value);
     return hash;
+}
+
+static void test_root_reach_result_equality_and_digest_ownership()
+{
+    G1IkFrameResult baseline = {};
+    baseline.root_reach.active = true;
+    baseline.root_reach.common_interval_found = true;
+    baseline.root_reach.applied = true;
+    baseline.root_reach.root_y_delta_m = -0.01f;
+    check(g1_root_reach_plan_is_valid(baseline.root_reach),
+          "transaction result ownership starts from a valid root plan");
+    const uint64_t baseline_digest =
+        ik_frame_logical_digest(baseline);
+    const auto require_owned = [
+        &baseline, baseline_digest](
+        const G1IkFrameResult& mutated,
+        const char* message) {
+        check(!g1_frame_ik_result_equal(baseline, mutated) &&
+                  ik_frame_logical_digest(mutated) != baseline_digest,
+              message);
+    };
+
+    G1IkFrameResult mutated = baseline;
+    mutated.root_reach.active = false;
+    require_owned(mutated, "transaction equality owns root-plan active");
+    mutated = baseline;
+    mutated.root_reach.common_interval_found = false;
+    require_owned(
+        mutated, "transaction equality owns root-plan common interval");
+    mutated = baseline;
+    mutated.root_reach.applied = false;
+    require_owned(mutated, "transaction equality owns root-plan applied");
+    mutated = baseline;
+    mutated.root_reach.root_y_delta_m = std::nextafter(
+        baseline.root_reach.root_y_delta_m,
+        -std::numeric_limits<float>::infinity());
+    require_owned(
+        mutated, "transaction equality owns exact root-plan delta bits");
 }
 
 static uint64_t pose_clearance_logical_digest(
@@ -955,6 +997,110 @@ static void test_contact_iteration_provenance_is_authenticated()
         check(!g1_frame_rejected_ik_result_is_valid(forged),
               "frame publication rejects every in-range ordinary iteration forgery");
     }
+}
+
+static G1IkFrameResult successful_foot_planner_terminal_result()
+{
+    database db;
+    make_database(db, 1);
+    array1d<vec3> global_positions(G1_BoneCount);
+    array1d<quat> global_rotations(G1_BoneCount);
+    char error[512] = {};
+    check(g1_ik_checked_forward_kinematics(
+              global_positions,
+              global_rotations,
+              db.bone_positions(0),
+              db.bone_rotations(0),
+              db.bone_parents,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+    const G1LegConfig configs[2] = {
+        g1_left_leg_config(), g1_right_leg_config()
+    };
+    G1IkFrameResult result;
+    result.safe_stop_requested = true;
+    result.stop_reason = G1IkStopTargetUnreachable;
+    result.root_reach.active = true;
+    for (int foot = 0; foot < 2; ++foot) {
+        G1FootTarget target;
+        target.locked = true;
+        target.position_active = true;
+        target.surface.normal = vec3(0.0f, 1.0f, 0.0f);
+        target.desired_sole_normal = target.surface.normal;
+        check(g1_ik_checked_physical_sole_centroid(
+                  target.sole_center,
+                  global_positions(configs[foot].contact),
+                  global_rotations(configs[foot].contact),
+                  configs[foot]),
+              "planner-terminal fixture materializes each physical sole");
+        target.surface.point = target.sole_center;
+        G1IkRuntimeStagedCandidate staged;
+        check(g1_foot_target_is_valid(target) &&
+                  g1_ik_runtime_stage_recorded_contact(
+                      staged,
+                      db.bone_positions(0),
+                      db.bone_rotations(0),
+                      db.bone_parents,
+                      configs[foot],
+                      target,
+                      error,
+                      static_cast<int>(sizeof(error))) &&
+                  staged.passes,
+              error[0] == '\0'
+                  ? "planner-terminal fixture owns two successful named solves"
+                  : error);
+        result.feet[foot].recorded_contact = true;
+        result.feet[foot].target = target;
+        result.feet[foot].position = staged.position;
+        result.feet[foot].orientation = staged.orientation;
+    }
+    check(g1_root_reach_plan_is_valid(result.root_reach) &&
+              result.root_reach.active &&
+              !result.root_reach.common_interval_found &&
+              !result.root_reach.applied &&
+              terrain_float_bits(
+                  result.root_reach.root_y_delta_m) == 0U,
+          "planner-terminal frame result owns the canonical unavailable plan");
+    return result;
+}
+
+static void test_successful_foot_planner_terminal_validation()
+{
+    const G1IkFrameResult planner_terminal =
+        successful_foot_planner_terminal_result();
+    check(g1_frame_rejected_ik_result_is_valid(planner_terminal),
+          "frame validator accepts the successful-foot planner terminal");
+
+    G1IkFrameResult forged = planner_terminal;
+    forged.root_reach.common_interval_found = true;
+    check(!g1_frame_rejected_ik_result_is_valid(forged),
+          "frame validator rejects planner-terminal common forgery");
+    forged = planner_terminal;
+    forged.root_reach.applied = true;
+    check(!g1_frame_rejected_ik_result_is_valid(forged),
+          "frame validator rejects planner-terminal applied forgery");
+    forged = planner_terminal;
+    forged.root_reach.root_y_delta_m = std::nextafter(
+        0.0f, std::numeric_limits<float>::infinity());
+    check(!g1_frame_rejected_ik_result_is_valid(forged),
+          "frame validator rejects planner-terminal delta forgery");
+    forged = planner_terminal;
+    forged.stop_reason = G1IkStopNoSwingCandidate;
+    check(!g1_frame_rejected_ik_result_is_valid(forged),
+          "frame validator rejects planner-terminal reason forgery");
+    forged = planner_terminal;
+    forged.feet[0].position.reachable = false;
+    check(!g1_frame_rejected_ik_result_is_valid(forged),
+          "frame validator authenticates planner-terminal foot zero success");
+    forged = planner_terminal;
+    forged.feet[1].position.reachable = false;
+    check(!g1_frame_rejected_ik_result_is_valid(forged),
+          "frame validator authenticates planner-terminal foot one success");
+    forged = planner_terminal;
+    forged.safe_stop_requested = false;
+    check(!g1_frame_rejected_ik_result_is_valid(forged),
+          "frame validator authenticates planner-terminal frame safe stop");
 }
 
 static void test_ready_landing_is_validation_only_lookahead()
@@ -1317,6 +1463,8 @@ struct TransactionTrace
     const g1_controller_state* success_candidate = NULL;
     bool mutate_working_ik_provenance_after_transcript = false;
     bool mutate_disabled_ik_result_after_transcript = false;
+    bool mutate_support_diagnostic_hips = false;
+    bool mutate_rendered_diagnostic_hips = false;
 };
 
 static TransactionTrace trace;
@@ -1383,6 +1531,10 @@ static G1FrameAcceptedDiagnostic accepted_diagnostic_candidate(
     accepted.inertialized = pose_diagnostic(2.0f);
     accepted.support_retargeted = pose_diagnostic(3.0f);
     accepted.rendered = pose_diagnostic(4.0f);
+    accepted.support_retargeted.hips_y =
+        state.global_bone_positions(G1_Hips).y;
+    accepted.rendered.hips_y =
+        state.ik_global_bone_positions(G1_Hips).y;
     accepted.matching_enabled = true;
     accepted.adjustment_enabled = external.tuning.adjustment_enabled;
     accepted.clamping_enabled = external.tuning.clamping_enabled;
@@ -1511,6 +1663,20 @@ static G1FrameStageOutcome test_runner(
     } else if (stage == G1FrameStagePoseCertificate) {
         scratch.accepted_diagnostic_candidate =
             accepted_diagnostic_candidate(state, scratch, external);
+        if (trace.mutate_support_diagnostic_hips) {
+            scratch.accepted_diagnostic_candidate
+                .support_retargeted.hips_y = std::nextafter(
+                    scratch.accepted_diagnostic_candidate
+                        .support_retargeted.hips_y,
+                    std::numeric_limits<float>::infinity());
+        }
+        if (trace.mutate_rendered_diagnostic_hips) {
+            scratch.accepted_diagnostic_candidate.rendered.hips_y =
+                std::nextafter(
+                    scratch.accepted_diagnostic_candidate
+                        .rendered.hips_y,
+                    std::numeric_limits<float>::infinity());
+        }
         scratch.accepted_diagnostic_ready = true;
     }
     if (stage == G1FrameStageFinalFk) {
@@ -2414,6 +2580,19 @@ static void test_success_swaps_every_owner_and_publishes_complete_diagnostic()
     check(diagnostic_logical_digest(value.runtime.accepted_diagnostic) ==
               diagnostic_logical_digest(expected_diagnostic),
           "success publishes every accepted diagnostic field exactly");
+    check(terrain_float_bits(
+              value.runtime.accepted_diagnostic
+                  .support_retargeted.hips_y) ==
+              terrain_float_bits(
+                  value.runtime.accepted_state
+                      .global_bone_positions(G1_Hips).y),
+          "support diagnostic binds to support-retargeted checked FK");
+    check(terrain_float_bits(
+              value.runtime.accepted_diagnostic.rendered.hips_y) ==
+              terrain_float_bits(
+                  value.runtime.accepted_state
+                      .ik_global_bone_positions(G1_Hips).y),
+          "rendered diagnostic binds to accepted IK checked FK");
     G1FramePublication expected_publication;
     expected_publication.requested_intent.requested_velocity =
         value.external.input.move_stick;
@@ -2438,6 +2617,54 @@ static void test_success_swaps_every_owner_and_publishes_complete_diagnostic()
                   .contact_offset_velocities(1).z) ==
               terrain_float_bits(0.012f),
           "accepted success preserves nonzero tails across disparate owners");
+}
+
+static void test_success_diagnostic_hips_mutations_roll_back_transaction()
+{
+    for (int owner = 0; owner < 2; ++owner) {
+        fixture value;
+        scene_pack candidate_scene = make_success_candidate_scene();
+        g1_controller_state success_candidate;
+        char error[512] = {};
+        build_valid_full_success_candidate(
+            success_candidate,
+            candidate_scene,
+            value,
+            error,
+            static_cast<int>(sizeof(error)));
+        const float authoritative_hips_y = owner == 0
+            ? success_candidate.global_bone_positions(G1_Hips).y
+            : success_candidate.ik_global_bone_positions(G1_Hips).y;
+        check((terrain_float_bits(authoritative_hips_y) &
+                   UINT32_C(0x7f800000)) != 0U,
+              "transaction Hips mutation starts from a normal authoritative FK value");
+        const RuntimeEvidence before = runtime_evidence(value.runtime);
+        G1FrameTransactionTestSeam seam;
+        seam.hook = injection_hook;
+        reset_trace();
+        trace.success_candidate = &success_candidate;
+        trace.mutate_support_diagnostic_hips = owner == 0;
+        trace.mutate_rendered_diagnostic_hips = owner == 1;
+        check(g1_frame_transaction_run(
+                  value.runtime,
+                  test_runner,
+                  value.external,
+                  &seam,
+                  error,
+                  static_cast<int>(sizeof(error))) ==
+                  G1FrameTransactionGlobalError,
+              owner == 0
+                  ? "one-ULP support Hips diagnostic mismatch is rejected by transaction validation"
+                  : "one-ULP rendered Hips diagnostic mismatch is rejected by transaction validation");
+        check_global_preservation(
+            value.runtime,
+            before,
+            "a one-ULP Hips diagnostic mismatch cannot swap state or publish diagnostics");
+        check_stage_trace(
+            G1FrameStageCount - 1,
+            G1FrameStageCount - 1,
+            "Hips diagnostic authentication occurs after the complete ordered attempt");
+    }
 }
 
 static float poison_float(int salt)
@@ -2719,6 +2946,10 @@ static void poison_frame_result(G1IkFrameResult& value, int& salt)
     value.safe_stop_requested = true;
     value.stop_reason = static_cast<G1IkStopReason>(50 + salt++);
     value.max_correction_radians = poison_float(salt++);
+    value.root_reach.active = ((salt++) & 1) != 0;
+    value.root_reach.common_interval_found = ((salt++) & 1) != 0;
+    value.root_reach.applied = ((salt++) & 1) != 0;
+    value.root_reach.root_y_delta_m = poison_float(salt++);
     for (int foot = 0; foot < 2; ++foot) {
         G1FootFrameResult& result = value.feet[foot];
         result.recorded_contact = ((salt++ + foot) & 1) != 0;
@@ -3935,8 +4166,10 @@ static void test_safe_stop_latch_lifecycle()
 
 int main()
 {
+    test_root_reach_result_equality_and_digest_ownership();
     test_orientation_authenticates_desired_sole_normal();
     test_contact_iteration_provenance_is_authenticated();
+    test_successful_foot_planner_terminal_validation();
     test_ready_landing_is_validation_only_lookahead();
     test_target_and_ik_state_normals_are_transaction_owned();
     test_runtime_reset_publishes_mode_specific_route_cursor();
@@ -3946,6 +4179,7 @@ int main()
     test_input_checkpoint_publishes_ready_intent_only();
     test_success_iteration_provenance_is_checked_before_publication();
     test_success_swaps_every_owner_and_publishes_complete_diagnostic();
+    test_success_diagnostic_hips_mutations_roll_back_transaction();
     test_dirty_working_storage_is_overwritten_completely();
     test_coordinator_preflight_rejects_invalid_inputs_and_aliases();
     test_safe_stop_latch_lifecycle();

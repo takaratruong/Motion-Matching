@@ -446,7 +446,14 @@ static inline bool g1_frame_ik_result_equal(
         first.stop_reason != second.stop_reason ||
         !g1_frame_float_bits_equal(
             first.max_correction_radians,
-            second.max_correction_radians)) {
+            second.max_correction_radians) ||
+        first.root_reach.active != second.root_reach.active ||
+        first.root_reach.common_interval_found !=
+            second.root_reach.common_interval_found ||
+        first.root_reach.applied != second.root_reach.applied ||
+        !g1_frame_float_bits_equal(
+            first.root_reach.root_y_delta_m,
+            second.root_reach.root_y_delta_m)) {
         return false;
     }
     for (int foot = 0; foot < 2; ++foot) {
@@ -1529,7 +1536,8 @@ static inline bool g1_frame_rejected_ik_common_fields_are_valid(
     if (result.applied || !result.safe_stop_requested ||
         !g1_ik_runtime_stop_reason_is_valid(result.stop_reason) ||
         result.stop_reason == G1IkStopNone ||
-        terrain_float_bits(result.max_correction_radians) != 0U) {
+        terrain_float_bits(result.max_correction_radians) != 0U ||
+        !g1_root_reach_plan_is_valid(result.root_reach)) {
         return false;
     }
     for (int foot = 0; foot < 2; ++foot) {
@@ -1923,6 +1931,27 @@ static inline bool g1_frame_rejecting_foot_is_valid(
            g1_frame_no_swing_is_valid(foot);
 }
 
+static inline bool g1_frame_planner_terminal_is_valid(
+    const G1IkFrameResult& result,
+    const G1LegConfig (&configs)[2])
+{
+    const bool any_recorded_contact =
+        result.feet[0].recorded_contact ||
+        result.feet[1].recorded_contact;
+    return result.stop_reason == G1IkStopTargetUnreachable &&
+           any_recorded_contact &&
+           g1_root_reach_plan_is_valid(result.root_reach) &&
+           result.root_reach.active &&
+           !result.root_reach.common_interval_found &&
+           !result.root_reach.applied &&
+           terrain_float_bits(
+               result.root_reach.root_y_delta_m) == 0U &&
+           g1_frame_successful_foot_is_valid(
+               result.feet[0], configs[0]) &&
+           g1_frame_successful_foot_is_valid(
+               result.feet[1], configs[1]);
+}
+
 static inline bool g1_frame_rejected_ik_result_is_valid(
     const G1IkFrameResult& result)
 {
@@ -1949,7 +1978,8 @@ static inline bool g1_frame_rejected_ik_result_is_valid(
             result.feet[0], configs[0]) &&
         g1_frame_rejecting_foot_is_valid(
             result.feet[1], configs[1], result.stop_reason);
-    return rejected_after_foot_zero || rejected_after_foot_one;
+    return rejected_after_foot_zero || rejected_after_foot_one ||
+           g1_frame_planner_terminal_is_valid(result, configs);
 }
 
 static inline bool g1_frame_rejected_ik_common_is_valid(
@@ -1957,6 +1987,14 @@ static inline bool g1_frame_rejected_ik_common_is_valid(
     const G1FootprintObservation& footprint)
 {
     if (!g1_frame_rejected_ik_result_is_valid(result)) {
+        return false;
+    }
+    const bool any_recorded_contact =
+        footprint.feet[0].current_contact ||
+        footprint.feet[1].current_contact;
+    if (result.stop_reason == G1IkStopLandingPatchUnavailable
+            ? result.root_reach.active
+            : result.root_reach.active != any_recorded_contact) {
         return false;
     }
     for (int foot = 0; foot < 2; ++foot) {
@@ -2064,7 +2102,8 @@ static inline bool g1_frame_ik_candidate_rejection_is_valid(
             result.feet[0], configs[0]) &&
         g1_frame_rejecting_foot_is_valid(
             result.feet[1], configs[1], reason);
-    return rejected_after_foot_zero || rejected_after_foot_one;
+    return rejected_after_foot_zero || rejected_after_foot_one ||
+           g1_frame_planner_terminal_is_valid(result, configs);
 }
 
 static inline bool g1_frame_rejection_is_canonical(
@@ -2369,6 +2408,8 @@ static inline bool g1_frame_accepted_diagnostic_matches_success(
 {
     if (external.db == nullptr ||
         working_state.scene_frame <= 0 ||
+        working_state.global_bone_positions.size != G1_BoneCount ||
+        working_state.ik_global_bone_positions.size != G1_BoneCount ||
         diagnostic.scene_frame != working_state.scene_frame - 1 ||
         diagnostic.matching_enabled !=
             (external.tuning.mode != G1_TestSequential) ||
@@ -2379,7 +2420,13 @@ static inline bool g1_frame_accepted_diagnostic_matches_success(
         diagnostic.ik_enabled != external.tuning.ik_enabled ||
         !g1_frame_float_bits_equal(
             diagnostic.effective_terrain_weight,
-            external.tuning.effective_terrain_weight)) {
+            external.tuning.effective_terrain_weight) ||
+        !g1_frame_float_bits_equal(
+            diagnostic.support_retargeted.hips_y,
+            working_state.global_bone_positions(G1_Hips).y) ||
+        !g1_frame_float_bits_equal(
+            diagnostic.rendered.hips_y,
+            working_state.ik_global_bone_positions(G1_Hips).y)) {
         return false;
     }
     const database& db = *external.db;

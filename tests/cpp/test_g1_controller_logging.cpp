@@ -87,6 +87,46 @@ static void test_accepted_state_digest_ignores_padding_and_tracks_values()
             message);
     };
     check_oracle("rich accepted state matches the independent logical oracle");
+    const G1RootReachPlan canonical_plan =
+        rich_state.ik_frame.root_reach;
+    const uint64_t canonical_plan_digest =
+        g1_log_accepted_state_digest(rich_state);
+    const auto check_plan_mutation = [
+        &rich_state,
+        &check_oracle,
+        &canonical_plan,
+        canonical_plan_digest](
+        const G1RootReachPlan& plan,
+        const char* message) {
+        rich_state.ik_frame.root_reach = plan;
+        check_oracle(message);
+        logging_check(
+            g1_log_accepted_state_digest(rich_state) !=
+                canonical_plan_digest,
+            message);
+        rich_state.ik_frame.root_reach = canonical_plan;
+    };
+    G1RootReachPlan mutated_plan = canonical_plan;
+    mutated_plan.active = !mutated_plan.active;
+    check_plan_mutation(
+        mutated_plan,
+        "production and independent digests own root-plan active");
+    mutated_plan = canonical_plan;
+    mutated_plan.common_interval_found =
+        !mutated_plan.common_interval_found;
+    check_plan_mutation(
+        mutated_plan,
+        "production and independent digests own root-plan common interval");
+    mutated_plan = canonical_plan;
+    mutated_plan.applied = !mutated_plan.applied;
+    check_plan_mutation(
+        mutated_plan,
+        "production and independent digests own root-plan applied");
+    mutated_plan = canonical_plan;
+    mutated_plan.root_y_delta_m = 0.03125f;
+    check_plan_mutation(
+        mutated_plan,
+        "production and independent digests own exact root-plan delta bits");
     rich_state.curr_bone_positions(0).x += 0.125f;
     check_oracle("array element mutation remains aligned with the oracle");
     rich_state.footprint.feet[0].probes[0]

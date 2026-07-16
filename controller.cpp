@@ -1294,6 +1294,10 @@ static void g1_log_hash_frame_result(
     g1_log_hash_value(hash, value.safe_stop_requested);
     g1_log_hash_value(hash, static_cast<int>(value.stop_reason));
     g1_log_hash_value(hash, value.max_correction_radians);
+    g1_log_hash_value(hash, value.root_reach.active);
+    g1_log_hash_value(hash, value.root_reach.common_interval_found);
+    g1_log_hash_value(hash, value.root_reach.applied);
+    g1_log_hash_value(hash, value.root_reach.root_y_delta_m);
     for (int foot = 0; foot < 2; ++foot) {
         const G1FootFrameResult& result = value.feet[foot];
         g1_log_hash_value(hash, result.recorded_contact);

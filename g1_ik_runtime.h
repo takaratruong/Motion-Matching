@@ -75,6 +75,7 @@ struct G1IkFrameResult
     bool safe_stop_requested = false;
     G1IkStopReason stop_reason = G1IkStopNone;
     float max_correction_radians = 0.0f;
+    G1RootReachPlan root_reach;
     G1FootFrameResult feet[2];
 };
 
@@ -781,6 +782,31 @@ static inline bool g1_ik_frame_begin(
         }
     }
 
+    float adjusted_root_y =
+        baseline_positions(G1_Simulation).y;
+    if (!candidate.candidate_result.safe_stop_requested) {
+        const G1FootTarget& left_target =
+            candidate.candidate_result.feet[0].target;
+        const G1FootTarget& right_target =
+            candidate.candidate_result.feet[1].target;
+        if (!g1_plan_recorded_contact_root_reach(
+                candidate.candidate_result.root_reach,
+                baseline_positions,
+                baseline_rotations,
+                bone_parents,
+                contacts,
+                left_target,
+                right_target,
+                error,
+                error_capacity) ||
+            !g1_apply_root_reach_plan_y(
+                adjusted_root_y,
+                baseline_positions(G1_Simulation).y,
+                candidate.candidate_result.root_reach)) {
+            return false;
+        }
+    }
+
     std::memcpy(
         scratch_positions.data,
         baseline_positions.data,
@@ -789,6 +815,9 @@ static inline bool g1_ik_frame_begin(
         scratch_rotations.data,
         baseline_rotations.data,
         static_cast<std::size_t>(G1_BoneCount) * sizeof(quat));
+    if (candidate.candidate_result.root_reach.applied) {
+        scratch_positions(G1_Simulation).y = adjusted_root_y;
+    }
     transaction = candidate;
     return true;
 }
@@ -1364,6 +1393,24 @@ static inline bool g1_ik_frame_stage_foot(
     G1FootFrameResult& foot_result =
         candidate.candidate_result.feet[foot_index];
 
+    const auto request_planner_terminal_after_success =
+        [&candidate, foot_index]() {
+        const G1RootReachPlan& plan =
+            candidate.candidate_result.root_reach;
+        if (foot_index == 1 &&
+            candidate.next_foot == 2U &&
+            !candidate.candidate_result.safe_stop_requested &&
+            candidate.candidate_result.stop_reason == G1IkStopNone &&
+            g1_root_reach_plan_is_valid(plan) &&
+            plan.active &&
+            !plan.common_interval_found &&
+            !plan.applied &&
+            g1_ik_runtime_float_bits(plan.root_y_delta_m) == 0U) {
+            g1_ik_runtime_request_safe_stop(
+                candidate, G1IkStopTargetUnreachable);
+        }
+    };
+
     if (foot_result.recorded_contact) {
         G1IkRuntimeStagedCandidate planted = {};
         if (!g1_ik_runtime_stage_recorded_contact(
@@ -1395,6 +1442,9 @@ static inline bool g1_ik_frame_stage_foot(
                 sizeof(planted.rotations));
         }
         ++candidate.next_foot;
+        if (planted.passes) {
+            request_planner_terminal_after_success();
+        }
         transaction = candidate;
         return true;
     }
@@ -1462,6 +1512,9 @@ static inline bool g1_ik_frame_stage_foot(
             candidate, G1IkStopNoSwingCandidate);
     }
     ++candidate.next_foot;
+    if (selected) {
+        request_planner_terminal_after_success();
+    }
     transaction = candidate;
     return true;
 }
@@ -1503,7 +1556,10 @@ static inline bool g1_ik_runtime_is_disabled_noop(
         transaction.candidate_result.safe_stop_requested ||
         transaction.candidate_result.stop_reason != G1IkStopNone ||
         !float_is_positive_zero(
-            transaction.candidate_result.max_correction_radians)) {
+            transaction.candidate_result.max_correction_radians) ||
+        !g1_root_reach_plan_is_valid(
+            transaction.candidate_result.root_reach) ||
+        transaction.candidate_result.root_reach.active) {
         return false;
     }
     for (int foot = 0; foot < 2; ++foot) {
@@ -2146,6 +2202,14 @@ static inline bool g1_ik_frame_rejection_snapshot(
 
     const G1IkFrameResult& result =
         transaction.candidate_result;
+    const bool any_recorded_contact =
+        result.feet[0].recorded_contact ||
+        result.feet[1].recorded_contact;
+    const bool root_reach_form_is_valid =
+        g1_root_reach_plan_is_valid(result.root_reach) &&
+        (checkpoint == G1IkRejectionAfterBegin
+             ? !result.root_reach.active
+             : result.root_reach.active == any_recorded_contact);
     bool checkpoint_valid = false;
     if (checkpoint == G1IkRejectionAfterBegin) {
         const bool begin_target_forms_are_valid =
@@ -2161,6 +2225,7 @@ static inline bool g1_ik_frame_rejection_snapshot(
                         : (!result.feet[0].recorded_contact &&
                            noncontact_base_target[0])));
         checkpoint_valid =
+            root_reach_form_is_valid &&
             transaction.next_foot == 0U &&
             (result.stop_reason == G1IkStopFootprintBlocked ||
              result.stop_reason ==
@@ -2170,6 +2235,7 @@ static inline bool g1_ik_frame_rejection_snapshot(
             foot_stage_is_canonical(result.feet[1]);
     } else if (checkpoint == G1IkRejectionAfterFoot0) {
         checkpoint_valid =
+            root_reach_form_is_valid &&
             transaction.next_foot == 1U &&
             (result.stop_reason == G1IkStopTargetUnreachable ||
              result.stop_reason == G1IkStopNoSwingCandidate) &&
@@ -2177,14 +2243,28 @@ static inline bool g1_ik_frame_rejection_snapshot(
                 result.feet[0], configs[0], result.stop_reason) &&
             foot_stage_is_canonical(result.feet[1]);
     } else {
+        const bool planner_terminal =
+            result.stop_reason == G1IkStopTargetUnreachable &&
+            result.root_reach.active &&
+            !result.root_reach.common_interval_found &&
+            !result.root_reach.applied &&
+            g1_ik_runtime_float_bits(
+                result.root_reach.root_y_delta_m) == 0U &&
+            successful_foot_is_valid(
+                result.feet[0], configs[0]) &&
+            successful_foot_is_valid(
+                result.feet[1], configs[1]);
         checkpoint_valid =
+            root_reach_form_is_valid &&
             transaction.next_foot == 2U &&
             (result.stop_reason == G1IkStopTargetUnreachable ||
              result.stop_reason == G1IkStopNoSwingCandidate) &&
-            successful_foot_is_valid(
-                result.feet[0], configs[0]) &&
-            rejecting_foot_is_valid(
-                result.feet[1], configs[1], result.stop_reason);
+            (planner_terminal ||
+             (successful_foot_is_valid(
+                  result.feet[0], configs[0]) &&
+              rejecting_foot_is_valid(
+                  result.feet[1], configs[1],
+                  result.stop_reason)));
     }
     if (!checkpoint_valid) {
         return g1_ik_runtime_fail(
@@ -2227,6 +2307,28 @@ static inline bool g1_ik_frame_finish(
             scratch_positions, scratch_rotations) ||
         !g1_ik_parent_topology_validate(
             bone_parents, error, error_capacity)) {
+        return false;
+    }
+
+    const bool any_recorded_contact =
+        transaction.candidate_result.feet[0].recorded_contact ||
+        transaction.candidate_result.feet[1].recorded_contact;
+    const bool begin_classified_stop =
+        transaction.candidate_result.safe_stop_requested &&
+        (transaction.candidate_result.stop_reason ==
+             G1IkStopFootprintBlocked ||
+         transaction.candidate_result.stop_reason ==
+             G1IkStopLandingPatchUnavailable);
+    if (!g1_root_reach_plan_is_valid(
+            transaction.candidate_result.root_reach) ||
+        (begin_classified_stop
+             ? transaction.candidate_result.root_reach.active
+             : transaction.candidate_result.root_reach.active !=
+                   any_recorded_contact) ||
+        (!transaction.candidate_result.safe_stop_requested &&
+         transaction.candidate_result.root_reach.active &&
+         !transaction.candidate_result.root_reach
+              .common_interval_found)) {
         return false;
     }
 

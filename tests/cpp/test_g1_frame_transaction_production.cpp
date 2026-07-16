@@ -456,6 +456,10 @@ static void logical_hash_frame_result(
     logical_hash_value(hash, value.safe_stop_requested);
     logical_hash_value(hash, static_cast<int>(value.stop_reason));
     logical_hash_value(hash, value.max_correction_radians);
+    logical_hash_value(hash, value.root_reach.active);
+    logical_hash_value(hash, value.root_reach.common_interval_found);
+    logical_hash_value(hash, value.root_reach.applied);
+    logical_hash_value(hash, value.root_reach.root_y_delta_m);
     for (int foot = 0; foot < 2; ++foot) {
         const G1FootFrameResult& result = value.feet[foot];
         logical_hash_value(hash, result.recorded_contact);
@@ -511,6 +515,39 @@ static uint64_t ik_frame_logical_digest(const G1IkFrameResult& value)
     uint64_t hash = UINT64_C(1469598103934665603);
     logical_hash_frame_result(hash, value);
     return hash;
+}
+
+static void test_production_root_reach_digest_ownership()
+{
+    G1IkFrameResult baseline = {};
+    baseline.root_reach.active = true;
+    baseline.root_reach.common_interval_found = true;
+    baseline.root_reach.applied = true;
+    baseline.root_reach.root_y_delta_m = -0.01f;
+    check(g1_root_reach_plan_is_valid(baseline.root_reach),
+          "production digest ownership starts from a valid root plan");
+    const uint64_t digest = ik_frame_logical_digest(baseline);
+    const auto require_owned = [&baseline, digest](
+        const G1IkFrameResult& mutated,
+        const char* message) {
+        check(!g1_frame_ik_result_equal(baseline, mutated) &&
+                  ik_frame_logical_digest(mutated) != digest,
+              message);
+    };
+    G1IkFrameResult mutated = baseline;
+    mutated.root_reach.active = false;
+    require_owned(mutated, "production digest owns root-plan active");
+    mutated = baseline;
+    mutated.root_reach.common_interval_found = false;
+    require_owned(mutated, "production digest owns root-plan common interval");
+    mutated = baseline;
+    mutated.root_reach.applied = false;
+    require_owned(mutated, "production digest owns root-plan applied");
+    mutated = baseline;
+    mutated.root_reach.root_y_delta_m = std::nextafter(
+        baseline.root_reach.root_y_delta_m,
+        -std::numeric_limits<float>::infinity());
+    require_owned(mutated, "production digest owns exact root-plan delta bits");
 }
 
 static uint64_t state_logical_digest(const g1_controller_state& state)
@@ -863,6 +900,142 @@ static bool same_float_bits(float first, float second)
     return terrain_float_bits(first) == terrain_float_bits(second);
 }
 
+static float production_float_from_bits(uint32_t bits)
+{
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static void test_fixed_nonassociative_root_reach_fk_ownership()
+{
+    const float a = production_float_from_bits(UINT32_C(0x3f000000));
+    const float b = production_float_from_bits(UINT32_C(0x3f000001));
+    const float d = production_float_from_bits(UINT32_C(0xbc80e8f0));
+    database db;
+    make_database(db, 1);
+    array1d<vec3> support_local = db.bone_positions(0);
+    array1d<quat> local_rotations = db.bone_rotations(0);
+    support_local(G1_Simulation) = vec3(0.0f, a, 0.0f);
+    support_local(G1_Hips) = vec3(0.0f, b, 0.0f);
+    local_rotations(G1_Simulation) = quat();
+    local_rotations(G1_Hips) = quat();
+
+    const G1RootReachPlan plan = {true, true, true, d};
+    check(g1_root_reach_plan_is_valid(plan),
+          "the fixed multilevel fixture uses the certified Task-2 plan form");
+    array1d<vec3> accepted_local = support_local;
+    float expected_root_y = 0.0f;
+    check(g1_apply_root_reach_plan_y(
+              expected_root_y,
+              support_local(G1_Simulation).y,
+              plan),
+          "the fixed multilevel fixture applies root Y only through the strict helper");
+    accepted_local(G1_Simulation).y = expected_root_y;
+
+    array1d<vec3> support_global(G1_BoneCount);
+    array1d<quat> support_global_rotations(G1_BoneCount);
+    array1d<vec3> accepted_global(G1_BoneCount);
+    array1d<quat> accepted_global_rotations(G1_BoneCount);
+    char error[512] = {};
+    check(g1_ik_checked_forward_kinematics(
+              support_global,
+              support_global_rotations,
+              support_local,
+              local_rotations,
+              db.bone_parents,
+              error,
+              static_cast<int>(sizeof(error))) &&
+              g1_ik_checked_forward_kinematics(
+                  accepted_global,
+                  accepted_global_rotations,
+                  accepted_local,
+                  local_rotations,
+                  db.bone_parents,
+                  error,
+                  static_cast<int>(sizeof(error))),
+          error);
+
+    float reassociated_hips_y = 0.0f;
+    check(terrain_f32_add(
+              reassociated_hips_y,
+              support_global(G1_Hips).y,
+              plan.root_y_delta_m),
+          "the fixed multilevel fixture materializes the forbidden reassociation for comparison");
+    G1FrameAcceptedDiagnostic diagnostic = {};
+    diagnostic.support_retargeted.hips_y =
+        support_global(G1_Hips).y;
+    diagnostic.rendered.hips_y = accepted_global(G1_Hips).y;
+    check(terrain_float_bits(
+              accepted_local(G1_Simulation).y) ==
+              terrain_float_bits(expected_root_y) &&
+              terrain_float_bits(
+                  diagnostic.support_retargeted.hips_y) ==
+                  terrain_float_bits(support_global(G1_Hips).y) &&
+              terrain_float_bits(
+                  diagnostic.rendered.hips_y) ==
+                  terrain_float_bits(accepted_global(G1_Hips).y) &&
+              terrain_float_bits(accepted_global(G1_Hips).y) ==
+                  UINT32_C(0x3f7bf8ba) &&
+              terrain_float_bits(reassociated_hips_y) ==
+                  UINT32_C(0x3f7bf8b8) &&
+              terrain_float_bits(accepted_global(G1_Hips).y) !=
+                  terrain_float_bits(reassociated_hips_y),
+          "authoritative checked FK owns 0x3f7bf8ba while reassociated global-Hips plus delta is the distinct 0x3f7bf8b8");
+
+    g1_controller_state working_state;
+    working_state.scene_frame = 1;
+    working_state.global_bone_positions.resize(G1_BoneCount);
+    working_state.ik_global_bone_positions.resize(G1_BoneCount);
+    working_state.global_bone_positions.set(vec3());
+    working_state.ik_global_bone_positions.set(vec3());
+    working_state.global_bone_positions(G1_Hips) =
+        support_global(G1_Hips);
+    working_state.ik_global_bone_positions(G1_Hips) =
+        accepted_global(G1_Hips);
+    G1FrameExternalInputs external = {};
+    external.db = &db;
+    external.tuning.mode = G1_TestSequential;
+    diagnostic.scene_frame = 0;
+    diagnostic.query_database_frame = 0;
+    diagnostic.query_range = 0;
+    diagnostic.selected_database_frame = 0;
+    diagnostic.matching_enabled = false;
+    check(g1_frame_accepted_diagnostic_matches_success(
+              diagnostic, working_state, external),
+          "the fixed multilevel diagnostic passes the production success matcher through both authoritative FK owners");
+    const G1FrameAcceptedDiagnostic exact_diagnostic = diagnostic;
+    diagnostic.support_retargeted.hips_y = std::nextafter(
+        exact_diagnostic.support_retargeted.hips_y,
+        std::numeric_limits<float>::infinity());
+    check(!g1_frame_accepted_diagnostic_matches_success(
+              diagnostic, working_state, external),
+          "the production success matcher rejects a one-ULP support Hips diagnostic mutation");
+    diagnostic = exact_diagnostic;
+    diagnostic.rendered.hips_y = std::nextafter(
+        exact_diagnostic.rendered.hips_y,
+        std::numeric_limits<float>::infinity());
+    check(!g1_frame_accepted_diagnostic_matches_success(
+              diagnostic, working_state, external),
+          "the production success matcher rejects a one-ULP rendered Hips diagnostic mutation");
+    diagnostic = exact_diagnostic;
+    working_state.global_bone_positions(G1_Hips).y = std::nextafter(
+        support_global(G1_Hips).y,
+        std::numeric_limits<float>::infinity());
+    check(!g1_frame_accepted_diagnostic_matches_success(
+              diagnostic, working_state, external),
+          "the production success matcher rejects a one-ULP authoritative support FK mutation");
+    working_state.global_bone_positions(G1_Hips) =
+        support_global(G1_Hips);
+    working_state.ik_global_bone_positions(G1_Hips).y =
+        std::nextafter(
+            accepted_global(G1_Hips).y,
+            std::numeric_limits<float>::infinity());
+    check(!g1_frame_accepted_diagnostic_matches_success(
+              diagnostic, working_state, external),
+          "the production success matcher rejects a one-ULP authoritative rendered FK mutation");
+}
+
 static bool same_external_lowering(
     const G1FrameExternalInputs& actual,
     const G1FrameExternalInputs& expected)
@@ -1203,6 +1376,10 @@ struct ProductionTrace
     G1CommandIntent requested_intent;
     bool scripted_azimuth_applied = false;
     bool footprint_and_begin_ready = false;
+    bool support_local_pose_ready = false;
+    bool begin_root_only_ownership_exact = false;
+    vec3 support_local_positions[G1_BoneCount] = {};
+    quat support_local_rotations[G1_BoneCount] = {};
     bool foot0_completed = false;
     bool foot1_completed = false;
     bool final_fk_completed = false;
@@ -1333,10 +1510,54 @@ static G1FrameInjectedOutcome production_hook(
         production_trace.prior_latch_seen =
             scratch.prior_safe_stop_latched;
         production_trace.latch_handoff = scratch.safe_stop_handoff;
+    } else if (stage == G1FrameStageContactUpdate) {
+        production_trace.support_local_pose_ready =
+            working_state.adjusted_bone_positions.size == G1_BoneCount &&
+            working_state.adjusted_bone_rotations.size == G1_BoneCount;
+        if (production_trace.support_local_pose_ready) {
+            for (int bone = 0; bone < G1_BoneCount; ++bone) {
+                production_trace.support_local_positions[bone] =
+                    working_state.adjusted_bone_positions(bone);
+                production_trace.support_local_rotations[bone] =
+                    working_state.adjusted_bone_rotations(bone);
+            }
+        }
     } else if (stage == G1FrameStageFootprintObservation) {
         production_trace.footprint_and_begin_ready =
             scratch.footprint_status == G1FootprintOk &&
             scratch.ik_transaction.initialized;
+        float expected_root_y = 0.0f;
+        production_trace.begin_root_only_ownership_exact =
+            production_trace.support_local_pose_ready &&
+            g1_apply_root_reach_plan_y(
+                expected_root_y,
+                production_trace
+                    .support_local_positions[G1_Simulation].y,
+                scratch.ik_transaction.candidate_result.root_reach) &&
+            terrain_float_bits(
+                working_state.ik_candidate_bone_positions(
+                    G1_Simulation).y) ==
+                terrain_float_bits(expected_root_y);
+        for (int bone = 0;
+             production_trace.begin_root_only_ownership_exact &&
+             bone < G1_BoneCount;
+             ++bone) {
+            const vec3 actual_position =
+                working_state.ik_candidate_bone_positions(bone);
+            const vec3 baseline_position =
+                production_trace.support_local_positions[bone];
+            production_trace.begin_root_only_ownership_exact =
+                same_quat_bits(
+                    working_state.ik_candidate_bone_rotations(bone),
+                    production_trace.support_local_rotations[bone]) &&
+                (bone == G1_Simulation
+                     ? terrain_float_bits(actual_position.x) ==
+                           terrain_float_bits(baseline_position.x) &&
+                           terrain_float_bits(actual_position.z) ==
+                           terrain_float_bits(baseline_position.z)
+                     : same_vec3_bits(
+                           actual_position, baseline_position));
+        }
         if (expect_down_step_schedule) {
             const bool expected[4] = {false, false, true, true};
             production_trace.down_step_schedule_exact = true;
@@ -1473,7 +1694,18 @@ static void check_complete_success_publication(
                   publication_logical_digest(expected_publication) &&
               diagnostic_logical_digest(runtime.accepted_diagnostic) ==
                   diagnostic_logical_digest(
-                      production_trace.accepted_diagnostic_candidate),
+                      production_trace.accepted_diagnostic_candidate) &&
+              terrain_float_bits(
+                  runtime.accepted_diagnostic
+                      .support_retargeted.hips_y) ==
+                  terrain_float_bits(
+                      runtime.accepted_state
+                          .global_bone_positions(G1_Hips).y) &&
+              terrain_float_bits(
+                  runtime.accepted_diagnostic.rendered.hips_y) ==
+                  terrain_float_bits(
+                      runtime.accepted_state
+                          .ik_global_bone_positions(G1_Hips).y),
           message);
 }
 
@@ -1490,6 +1722,27 @@ static void check_complete_accepted_final_fk(
                   ik_frame_logical_digest(
                       production_trace.final_candidate_result),
           message);
+
+    float expected_root_y = 0.0f;
+    check(g1_apply_root_reach_plan_y(
+              expected_root_y,
+              accepted.adjusted_bone_positions(G1_Simulation).y,
+              accepted.ik_frame.root_reach) &&
+              terrain_float_bits(
+                  accepted.ik_bone_positions(G1_Simulation).y) ==
+                  terrain_float_bits(expected_root_y),
+          message);
+    for (int bone = 0; bone < G1_BoneCount; ++bone) {
+        const vec3 baseline = accepted.adjusted_bone_positions(bone);
+        const vec3 final_local = accepted.ik_bone_positions(bone);
+        check(bone == G1_Simulation
+                  ? terrain_float_bits(final_local.x) ==
+                        terrain_float_bits(baseline.x) &&
+                        terrain_float_bits(final_local.z) ==
+                        terrain_float_bits(baseline.z)
+                  : same_vec3_bits(final_local, baseline),
+              message);
+    }
 
     array1d<vec3> independent_positions(G1_BoneCount);
     array1d<quat> independent_rotations(G1_BoneCount);
@@ -1803,7 +2056,9 @@ static void test_real_runner_covers_all_six_modes_and_lowerings()
         check(production_trace.immutable_context_exact &&
                   production_trace.requested_intent_ready &&
                   production_trace.scripted_azimuth_applied &&
+                  production_trace.support_local_pose_ready &&
                   production_trace.footprint_and_begin_ready &&
+                  production_trace.begin_root_only_ownership_exact &&
                   production_trace.foot0_completed &&
                   production_trace.foot1_completed &&
                   production_trace.final_fk_completed &&
@@ -2847,6 +3102,11 @@ static void test_genuine_foot0_and_foot1_safe_stops()
                       .safe_stop_requested &&
                   scratch.ik_transaction.candidate_result.stop_reason ==
                       G1IkStopNoSwingCandidate &&
+                  g1_root_reach_plan_is_valid(
+                      scratch.ik_transaction.candidate_result
+                          .root_reach) &&
+                  !scratch.ik_transaction.candidate_result
+                       .root_reach.active &&
                   scratch.ik_transaction.candidate_result.feet[1]
                       .swing_selection.candidates_evaluated == 0 &&
                   !scratch.ik_transaction.candidate_result.feet[1]
@@ -2928,6 +3188,11 @@ static void test_genuine_foot0_and_foot1_safe_stops()
                       .safe_stop_requested &&
                   scratch.ik_transaction.candidate_result.stop_reason ==
                       G1IkStopNoSwingCandidate &&
+                  g1_root_reach_plan_is_valid(
+                      scratch.ik_transaction.candidate_result
+                          .root_reach) &&
+                  !scratch.ik_transaction.candidate_result
+                       .root_reach.active &&
                   !scratch.ik_transaction.candidate_result.applied,
               "real foot 0 completes before foot 1 exhausts candidates at cursor 2");
         check_real_rejection_snapshot_table(
@@ -3004,6 +3269,40 @@ static void align_begin_fixture_source_support(fixture& value)
     check(terrain_float_is_normal_or_zero_query(source_surface_height),
           "the accepting-control source support height is representable");
     value.support.values.set(source_surface_height);
+}
+
+static void shift_aligned_support_to_first_common_word(
+    fixture& value)
+{
+    const float aligned_support = value.support.values(0, 0);
+    check(terrain_float_bits(aligned_support) ==
+              UINT32_C(0xbf08efbb),
+          "common-plan fixture freezes its aligned support word");
+    const float shifted_support = std::nextafter(
+        aligned_support,
+        std::numeric_limits<float>::infinity());
+    check(terrain_float_bits(shifted_support) ==
+              UINT32_C(0xbf08efba),
+          "common-plan fixture uses the first accepting positive ULP");
+    value.support.values.set(shifted_support);
+}
+
+static void configure_quantized_all_contact_fixture(
+    fixture& value, bool planner_common)
+{
+    for (int frame = 0; frame < value.db.nframes(); ++frame) {
+        value.db.contact_states(frame, 0) = true;
+        value.db.contact_states(frame, 1) = true;
+    }
+    align_begin_fixture_source_support(value);
+    if (planner_common) {
+        shift_aligned_support_to_first_common_word(value);
+    } else {
+        check(terrain_float_bits(value.support.values(0, 0)) ==
+                  UINT32_C(0xbf08efbb),
+              "quantized terminal fixture retains the unshifted support word");
+    }
+    reset_ik_enabled_fixture(value, G1_TestFlat);
 }
 
 static void lift_begin_accepting_control_airborne_foot(fixture& value)
@@ -3086,6 +3385,10 @@ static void test_genuine_begin_time_safe_stop()
                 control_direct);
             lift_begin_accepting_control_airborne_foot(
                 control_coordinator);
+            shift_aligned_support_to_first_common_word(
+                control_direct);
+            shift_aligned_support_to_first_common_word(
+                control_coordinator);
             reset_begin_stop_runtime(control_direct);
             reset_begin_stop_runtime(control_coordinator);
             check_real_ik_accepting_control(
@@ -3095,9 +3398,42 @@ static void test_genuine_begin_time_safe_stop()
                 0,
                 "the real begin stage and coordinator accept when only the "
                 "hostile unavailable-patch terrain is removed");
+            const g1_controller_state& accepted =
+                control_coordinator.runtime.accepted_state;
+            vec3 accepted_right_sole;
+            check(g1_ik_checked_physical_sole_centroid(
+                      accepted_right_sole,
+                      accepted.global_bone_positions(G1_RightToe),
+                      accepted.global_bone_rotations(G1_RightToe),
+                      g1_right_leg_config()) &&
+                      terrain_float_bits(
+                          control_coordinator.support.values(0, 0)) ==
+                          UINT32_C(0xbf08efba) &&
+                      terrain_float_bits(
+                          accepted.adjusted_bone_positions(
+                              G1_Simulation).y) ==
+                          UINT32_C(0x3f08efba) &&
+                      terrain_float_bits(accepted_right_sole.y) ==
+                          UINT32_C(0x3ba3d688) &&
+                      accepted.ik_frame.root_reach.active &&
+                      accepted.ik_frame.root_reach
+                          .common_interval_found &&
+                      !accepted.ik_frame.root_reach.applied &&
+                      terrain_float_bits(
+                          accepted.ik_frame.root_reach
+                              .root_y_delta_m) == 0U,
+                  "terrain-removed control freezes the first common support, root, sole, and plan words");
         }
-        check(scratch.ik_transaction.candidate_result
+        check(variant == 0 &&
+                  terrain_float_bits(direct.support.values(0, 0)) ==
+                      UINT32_C(0xbf08efbb) &&
+                  scratch.ik_transaction.candidate_result
                   .safe_stop_requested &&
+                  g1_root_reach_plan_is_valid(
+                      scratch.ik_transaction.candidate_result
+                          .root_reach) &&
+                  !scratch.ik_transaction.candidate_result
+                       .root_reach.active &&
                   scratch.ik_transaction.candidate_result.feet[0]
                       .swing_selection.candidates_evaluated == 0 &&
                   scratch.ik_transaction.candidate_result.feet[1]
@@ -9887,7 +10223,16 @@ static void test_synthetic_non_descending_step_safe_stops_atomically()
             ++target_unreachable_rejections;
             check(rejection.stage == G1FrameRejectIkCandidate &&
                       rejection.attempted_footprint_available &&
-                      rejection.attempted_ik_available,
+                      rejection.attempted_ik_available &&
+                      g1_root_reach_plan_is_valid(
+                          rejection.ik_frame.root_reach) &&
+                      rejection.ik_frame.root_reach.active &&
+                      !rejection.ik_frame.root_reach
+                           .common_interval_found &&
+                      !rejection.ik_frame.root_reach.applied &&
+                      terrain_float_bits(
+                          rejection.ik_frame.root_reach
+                              .root_y_delta_m) == 0U,
                   "the impossible established lock rejects at the IK candidate stage");
 
             const G1FootFrameResult& left = rejection.ik_frame.feet[0];
@@ -10021,8 +10366,154 @@ static void test_synthetic_non_descending_step_safe_stops_atomically()
               value.runtime.accepted_state.route_frames == 0,
           "the non-descending six-frame fixture supplies pure safe-stop evidence: one impossible-lock rejection then five unavailable-patch retries, all atomic at zero cursors");
 }
+
+static void test_quantized_planner_terminal_rejects_atomically()
+{
+    fixture direct;
+    fixture coordinator;
+    configure_quantized_all_contact_fixture(direct, false);
+    configure_quantized_all_contact_fixture(coordinator, false);
+    const ProductionEvidence direct_before =
+        production_evidence(direct.runtime);
+    const ConstArtifactEvidence direct_artifacts_before =
+        const_artifact_evidence(direct.external);
+    G1FrameTransactionScratch scratch;
+    G1FrameTransactionStage terminal = G1FrameStageCount;
+    char error[1024] = {};
+    check(run_real_stage_prefix(
+              direct,
+              scratch,
+              G1FrameStageSecondFootIk,
+              terminal,
+              error,
+              static_cast<int>(sizeof(error))) ==
+                  G1FrameStageFiniteReject &&
+              terminal == G1FrameStageSecondFootIk,
+          "quantized planner terminal finite-rejects at the real second-foot stage");
+    const G1IkFrameTransaction& transaction =
+        scratch.ik_transaction;
+    const G1IkFrameResult& attempted =
+        transaction.candidate_result;
+    const G1LegConfig configs[2] = {
+        g1_left_leg_config(), g1_right_leg_config()
+    };
+    check(transaction.initialized &&
+              transaction.next_foot == 2U &&
+              attempted.safe_stop_requested &&
+              attempted.stop_reason == G1IkStopTargetUnreachable &&
+              attempted.root_reach.active &&
+              !attempted.root_reach.common_interval_found &&
+              !attempted.root_reach.applied &&
+              terrain_float_bits(
+                  attempted.root_reach.root_y_delta_m) == 0U &&
+              g1_frame_successful_foot_is_valid(
+                  attempted.feet[0], configs[0]) &&
+              g1_frame_successful_foot_is_valid(
+                  attempted.feet[1], configs[1]) &&
+              !attempted.feet[0].position.safe_stop_requested &&
+              !attempted.feet[0].orientation.safe_stop_requested &&
+              !attempted.feet[1].position.safe_stop_requested &&
+              !attempted.feet[1].orientation.safe_stop_requested &&
+              scratch.rejection.rejected &&
+              scratch.rejection.stage == G1FrameRejectIkCandidate &&
+              scratch.rejection.attempted_ik_available &&
+              g1_frame_ik_result_equal(
+                  scratch.rejection.ik_frame, attempted),
+          "quantized planner terminal retains two successful feet and one frame-level stop");
+    check_real_rejection_snapshot_table(
+        transaction, G1IkRejectionAfterFoot1);
+    check_real_coordinator_ik_rejection(
+        coordinator,
+        direct,
+        direct_before,
+        direct_artifacts_before,
+        G1FrameStageSecondFootIk,
+        scratch.rejection);
+}
+
+static void test_pose_certificate_discards_working_plan_and_prior_owners()
+{
+    fixture value;
+    configure_quantized_all_contact_fixture(value, true);
+    char error[1024] = {};
+    const G1RootReachPlan prior_plan =
+        value.runtime.accepted_state.ik_frame.root_reach;
+    check(g1_root_reach_plan_is_valid(prior_plan) &&
+              !prior_plan.active,
+          "pose-certificate rollback starts from a canonical prior accepted plan");
+    const ProductionEvidence before =
+        production_evidence(value.runtime);
+    const ConstArtifactEvidence artifacts_before =
+        const_artifact_evidence(value.external);
+    G1FrameTransactionTestSeam seam;
+    seam.hook = production_hook;
+    seam.control.injected_stage = G1FrameStagePoseCertificate;
+    seam.control.injected_outcome = G1FrameInjectGlobalError;
+    error[0] = '\0';
+    reset_production_trace(
+        value.external,
+        value.runtime.accepted_state.camera_azimuth);
+    const G1FrameTransactionStatus status =
+        g1_frame_transaction_run(
+            value.runtime,
+            g1_controller_frame_stage_run,
+            value.external,
+            &seam,
+            error,
+            static_cast<int>(sizeof(error)));
+    check(status == G1FrameTransactionGlobalError,
+          "the pose-certificate checkpoint returns the injected global rollback");
+    check_production_trace_through(
+        G1FrameStagePoseCertificate,
+        "the pose-certificate rollback executes the complete real attempted frame");
+    const G1RootReachPlan& attempted_plan =
+        production_trace.final_candidate_result.root_reach;
+    const G1RootReachPlan& retained_plan =
+        value.runtime.accepted_state.ik_frame.root_reach;
+    check(production_trace.final_fk_completed &&
+              production_trace.accepted_diagnostic_ready &&
+              g1_root_reach_plan_is_valid(attempted_plan) &&
+              attempted_plan.active &&
+              attempted_plan.common_interval_found &&
+              !attempted_plan.applied &&
+              terrain_float_bits(
+                  attempted_plan.root_y_delta_m) == 0U &&
+              terrain_float_bits(
+                  production_trace.final_candidate_result.feet[0]
+                      .position.contact_residual_m) ==
+                  UINT32_C(0x33820000) &&
+              terrain_float_bits(
+                  production_trace.final_candidate_result.feet[1]
+                      .position.contact_residual_m) ==
+                  UINT32_C(0x33820000) &&
+              g1_frame_successful_foot_is_valid(
+                  production_trace.final_candidate_result.feet[0],
+                  g1_left_leg_config()) &&
+              g1_frame_successful_foot_is_valid(
+                  production_trace.final_candidate_result.feet[1],
+                  g1_right_leg_config()) &&
+              g1_root_reach_plan_is_valid(retained_plan) &&
+              retained_plan.active == prior_plan.active &&
+              retained_plan.common_interval_found ==
+                  prior_plan.common_interval_found &&
+              retained_plan.applied == prior_plan.applied &&
+              terrain_float_bits(retained_plan.root_y_delta_m) ==
+                  terrain_float_bits(prior_plan.root_y_delta_m),
+          "the recorded-contact working plan reaches pose certification but cannot replace the prior accepted plan");
+    check_production_global_preservation(
+        value.runtime,
+        before,
+        "pose-certificate rollback preserves prior support, locks/history, command, route, travel, heading, publication, and diagnostic owners");
+    check_const_artifacts(
+        value.external,
+        artifacts_before,
+        "pose-certificate rollback preserves all immutable production artifacts");
+}
+
 int main()
 {
+    test_production_root_reach_digest_ownership();
+    test_fixed_nonassociative_root_reach_fk_ownership();
     test_real_runner_covers_all_six_modes_and_lowerings();
     test_scene_cycle_reaches_exact_dwell_boundary();
     test_search_inertialization_and_simulation_tuning_oracles();
@@ -10034,6 +10525,8 @@ int main()
     test_real_route_latch_consumption_and_resume();
     test_coordinator_rejects_structurally_valid_ik_forgery();
     test_synthetic_non_descending_step_safe_stops_atomically();
+    test_quantized_planner_terminal_rejects_atomically();
+    test_pose_certificate_discards_working_plan_and_prior_owners();
     test_genuine_foot0_and_foot1_safe_stops();
     test_genuine_begin_time_safe_stop();
     test_real_pose_certificate_classification();

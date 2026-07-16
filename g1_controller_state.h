@@ -1162,12 +1162,20 @@ static inline bool g1_controller_state_ik_frame_is_valid(
     const slice1d<bool> contacts,
     const G1FootprintObservation& footprint)
 {
+    if (contacts.size != 2 || contacts.data == NULL) {
+        return false;
+    }
     if (!value.applied) {
         G1IkFrameTransaction transaction;
         transaction.candidate_result = value;
         return g1_ik_runtime_is_disabled_noop(transaction);
     }
-    if (value.safe_stop_requested || value.stop_reason != G1IkStopNone ||
+    if (!g1_root_reach_plan_is_valid(value.root_reach) ||
+        value.root_reach.active !=
+            (contacts(0) || contacts(1)) ||
+        (value.root_reach.active &&
+         !value.root_reach.common_interval_found) ||
+        value.safe_stop_requested || value.stop_reason != G1IkStopNone ||
         !g1_ik_float_is_runtime_value(value.max_correction_radians) ||
         value.max_correction_radians < 0.0f ||
         value.max_correction_radians > 0.35f) {
@@ -1199,6 +1207,49 @@ static inline bool g1_controller_state_ik_frame_is_valid(
     }
     return g1_ik_runtime_float_bits(maximum_correction) ==
            g1_ik_runtime_float_bits(value.max_correction_radians);
+}
+
+static inline bool
+g1_controller_state_root_reach_local_pose_is_valid(
+    const g1_controller_state& state)
+{
+    if (state.adjusted_bone_positions.size != G1_BoneCount ||
+        state.ik_bone_positions.size != G1_BoneCount) {
+        return false;
+    }
+    float expected_root_y = 0.0f;
+    if (!g1_apply_root_reach_plan_y(
+            expected_root_y,
+            state.adjusted_bone_positions(G1_Simulation).y,
+            state.ik_frame.root_reach) ||
+        terrain_float_bits(
+            state.ik_bone_positions(G1_Simulation).y) !=
+            terrain_float_bits(expected_root_y) ||
+        terrain_float_bits(
+            state.ik_bone_positions(G1_Simulation).x) !=
+            terrain_float_bits(
+                state.adjusted_bone_positions(G1_Simulation).x) ||
+        terrain_float_bits(
+            state.ik_bone_positions(G1_Simulation).z) !=
+            terrain_float_bits(
+                state.adjusted_bone_positions(G1_Simulation).z)) {
+        return false;
+    }
+    for (int bone = 0; bone < G1_BoneCount; ++bone) {
+        if (bone != G1_Simulation) {
+            const vec3 accepted = state.ik_bone_positions(bone);
+            const vec3 baseline = state.adjusted_bone_positions(bone);
+            if (terrain_float_bits(accepted.x) !=
+                    terrain_float_bits(baseline.x) ||
+                terrain_float_bits(accepted.y) !=
+                    terrain_float_bits(baseline.y) ||
+                terrain_float_bits(accepted.z) !=
+                    terrain_float_bits(baseline.z)) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 static inline bool g1_controller_state_pose_clearance_is_valid(
@@ -2072,6 +2123,7 @@ static inline bool g1_controller_state_is_valid(
             state.ik_frame,
             state.curr_bone_contacts,
             state.footprint) ||
+        !g1_controller_state_root_reach_local_pose_is_valid(state) ||
         state.ik_candidate_clearance_status != G1ClearanceOk ||
         state.ik_candidate_rejected ||
         !g1_controller_state_pose_clearance_is_coherent(

@@ -68,6 +68,10 @@ The production order is:
    once to only `scratch_positions(G1_Simulation).y`.
 8. Run the existing fixed left-then-right bounded position/orientation IK,
    defensive clearance, final FK, pose certificate, and outer atomic commit.
+   If both foot stages succeed but the retained recorded-contact plan is the
+   active/non-common/canonical-zero bounded-rejection form, terminate after
+   foot 1 with the existing frame-level `target-unreachable` safe stop. Do
+   not enter final FK and do not mark either successful foot as failed.
 
 The preconditioner receives no command, trajectory, travel-direction, or
 heading owner. Root X/Z, every local rotation, the accepted support baseline,
@@ -129,6 +133,16 @@ one deterministic nearest-first frontier; this is a global budget, not a
 per-interval allowance. A result is publishable only when every contributing
 foot reports its rederived exact production target as reachable.
 
+A finite candidate-local quantization case is distinct from malformed
+arithmetic. A nonzero candidate delta can round back to the unchanged local
+root Y even though at least one signed 5 cm cap remains representable. Task 2
+classifies that candidate as rejected and publishes the ordinary valid
+active/non-common/unapplied positive-zero plan. The two named foot stages
+still execute in fixed order. If neither independently rejects, the frame
+converts the retained planner disposition to `target-unreachable` only after
+foot 1; this is a planner-level terminal form with two independently
+successful foot transcripts, not a forged foot failure.
+
 The search never probes outside the baseline analytic intersection merely
 because adjusted binary32 recomputation makes a nearer float production-
 reachable. The exact translated-level regression demonstrates this boundary:
@@ -153,8 +167,11 @@ provenance.
 - If the two feet have no common interval, the nearest interval lies outside
   the 5 cm bound, or the final production projection does not authenticate
   the selected float, no heuristic target or contact change is made. The
-  ordinary per-foot stage emits the existing finite
-  `target-unreachable` diagnostic.
+  ordinary per-foot stages run left then right. A rejecting foot emits the
+  existing finite `target-unreachable` diagnostic. If both feet succeed while
+  the retained plan is active/non-common/unapplied positive zero, the frame
+  emits the same diagnostic after foot 1 without changing either successful
+  foot result.
 - Angular correction limits, sole residuals, orientation alignment, swing
   clearance, and whole-pose clearance remain authoritative after root
   planning. The preconditioner cannot waive them.
@@ -168,10 +185,12 @@ provenance.
   the begin checkpoint retains the canonical inactive positive-zero plan.
   Rejections after foot 0 or foot 1 retain a valid plan whose `active` bit is
   exactly the OR of the recorded-contact bits; active/non-common/unapplied
-  positive zero is the allowed infeasible or out-of-cap form. An accepted
-  contact-active frame additionally requires a common interval. A later
-  finish or pose-certificate failure cannot publish the working plan into the
-  accepted controller state.
+  positive zero is the allowed infeasible, out-of-cap, or finite
+  candidate-quantization form. The after-foot-1 planner terminal authenticates
+  `target-unreachable`, that exact plan, two successful foot transcripts,
+  `next_foot == 2`, and a frame safe stop. An accepted contact-active frame
+  additionally requires a common interval. A later finish or pose-certificate
+  failure cannot publish the working plan into the accepted controller state.
 
 ## Tests
 
@@ -195,7 +214,11 @@ Write failures before production changes and cover:
 7. Invalid input, aliasing, and arithmetic rollback.
 8. Full frame rejection/acceptance ownership, including immutable command and
    heading snapshots, strict local-root application, root X/Z and non-root
-   position identity, and checkpoint-specific plan forms.
+   position identity, and checkpoint-specific plan forms. Include the
+   candidate-quantization terminal whose two foot solves succeed but whose
+   active/non-common/canonical-zero plan finite-rejects atomically at the
+   second-foot stage; mutate common/applied/delta, stop reason, either foot
+   success transcript, cursor, and frame safe-stop evidence independently.
 9. Authoritative support/rendered Hips FK bindings, including the fixed
    multilevel binary32 parenthesization fixture local root
    `a=0x3f000000`, local Hips Y `b=0x3f000001`, and Task 2 delta
@@ -207,6 +230,12 @@ Write failures before production changes and cover:
 11. Strict caller, optimized `-ffast-math` caller linked to the strict kernel,
    strict/fast parity records, ASan/UBSan/float sanitizers, and production
    no-seam/no-main controller builds and negative runner compilation.
+12. The injected pose-certificate global rollback uses a genuinely
+    planner-common all-contact source. Starting from the symmetric source
+    support word `0xbf08efbb`, move exactly one binary32 ULP toward positive
+    infinity to `0xbf08efba`; freeze the active/common/unapplied positive-zero
+    plan and both successful foot transcripts before proving the working plan
+    cannot replace the prior accepted plan.
 
 Task 2 also exposes a fixed-size planner audit only when
 `G1_IK_ENABLE_TEST_SEAMS` is defined. The audited wrapper calls the same
