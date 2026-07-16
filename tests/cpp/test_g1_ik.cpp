@@ -588,6 +588,13 @@ static float g1_test_float_from_bits(uint32_t bits)
     return value;
 }
 
+static uint64_t g1_test_double_bits(double value)
+{
+    uint64_t bits = 0U;
+    std::memcpy(&bits, &value, sizeof(value));
+    return bits;
+}
+
 static bool g1_test_float_same(float left, float right)
 {
     return terrain_float_bits(left) == terrain_float_bits(right);
@@ -4032,6 +4039,750 @@ static void test_generic_checked_ik_math()
     const float maximum = 0.35f;
     const quat identity;
 
+    const quat authentic_clamp_baseline(
+        g1_test_float_from_bits(UINT32_C(0x3f7fbb26)),
+        g1_test_float_from_bits(UINT32_C(0x219469e4)),
+        g1_test_float_from_bits(UINT32_C(0xbd3bb4cb)),
+        g1_test_float_from_bits(UINT32_C(0x24bb68fa)));
+    const quat over_twenty_four_baseline(
+        g1_test_float_from_bits(UINT32_C(0x3e8d9fbf)),
+        g1_test_float_from_bits(UINT32_C(0x3eef7400)),
+        g1_test_float_from_bits(UINT32_C(0x3f277667)),
+        g1_test_float_from_bits(UINT32_C(0x3f06b2a8)));
+    const quat exact_identity_fixtures[] = {
+        authentic_clamp_baseline,
+        over_twenty_four_baseline
+    };
+    for (const quat fixture : exact_identity_fixtures) {
+        double precise_angle = 7.0;
+        float rounded_angle = 8.0f;
+        check(ik_checked_quat_angle(
+                  precise_angle, rounded_angle, fixture, fixture),
+              "validated exact quaternion identity is measurable");
+        check(g1_test_double_bits(precise_angle) == UINT64_C(0) &&
+              terrain_float_bits(rounded_angle) == UINT32_C(0),
+              "validated exact quaternion identity owns positive zero");
+    }
+
+    const quat invalid_identity_fixtures[] = {
+        quat(0.0f, 0.0f, 0.0f, 0.0f),
+        quat(2.0f, 0.0f, 0.0f, 0.0f),
+        quat(g1_test_float_from_bits(UINT32_C(0x7fc00001)),
+             0.0f, 0.0f, 0.0f),
+        quat(std::numeric_limits<float>::infinity(),
+             0.0f, 0.0f, 0.0f)
+    };
+    for (const quat fixture : invalid_identity_fixtures) {
+        double precise_angle = 7.0;
+        float rounded_angle = 8.0f;
+        const uint64_t precise_before = g1_test_double_bits(precise_angle);
+        const uint32_t rounded_before = terrain_float_bits(rounded_angle);
+        check(!ik_checked_quat_angle(
+                  precise_angle, rounded_angle, fixture, fixture),
+              "invalid exact quaternion identity remains rejected");
+        check(g1_test_double_bits(precise_angle) == precise_before &&
+              terrain_float_bits(rounded_angle) == rounded_before,
+              "invalid identity angle leaves both outputs transactional");
+    }
+
+    const quat frozen_nonidentity(
+        g1_test_float_from_bits(UINT32_C(0x3f6c835e)),
+        g1_test_float_from_bits(UINT32_C(0x3ec3ef15)),
+        0.0f, 0.0f);
+    double frozen_precise = 0.0;
+    float frozen_rounded = 0.0f;
+    check(ik_checked_quat_angle(
+              frozen_precise, frozen_rounded,
+              identity, frozen_nonidentity),
+          "representative nonidentity angle remains measurable");
+    check(g1_test_double_bits(frozen_precise) ==
+              UINT64_C(0x3fe921fba3b12d9e) &&
+          terrain_float_bits(frozen_rounded) == UINT32_C(0x3f490fdd),
+          "representative nonidentity angle retains frozen words");
+
+    const quat exact_same_baseline(
+        g1_test_float_from_bits(UINT32_C(0xbe158345)),
+        g1_test_float_from_bits(UINT32_C(0xbeb4c8c9)),
+        g1_test_float_from_bits(UINT32_C(0x3edf9218)),
+        g1_test_float_from_bits(UINT32_C(0x3f507fd3)));
+    const float exact_same_maximum =
+        g1_test_float_from_bits(UINT32_C(0x30800000));
+    quat exact_same_normalized;
+    double exact_same_normalization_precise = 0.0;
+    float exact_same_normalization_rounded = 0.0f;
+    check(ik_checked_quat_normalize(
+              exact_same_normalized, exact_same_baseline) &&
+          !g1_test_quat_bits_same(
+              exact_same_normalized, exact_same_baseline) &&
+          ik_checked_quat_angle(
+              exact_same_normalization_precise,
+              exact_same_normalization_rounded,
+              exact_same_baseline,
+              exact_same_normalized) &&
+          g1_test_double_bits(
+              exact_same_normalization_precise) ==
+              UINT64_C(0x3f3287076c25c666) &&
+          terrain_float_bits(
+              exact_same_normalization_rounded) ==
+              UINT32_C(0x3994383b) &&
+          exact_same_normalization_precise >
+              static_cast<double>(exact_same_maximum) &&
+          exact_same_normalization_rounded > exact_same_maximum,
+          "same-input fixture has public over-cap normalization drift");
+    IKClampResult exact_same = {};
+    check(ik_clamp_local_delta(
+              exact_same,
+              exact_same_baseline,
+              exact_same_baseline,
+              exact_same_maximum),
+          "exact same-input clamp remains solvable");
+    check(!exact_same.limited &&
+          g1_test_quat_bits_same(
+              exact_same.value, exact_same_baseline) &&
+          terrain_float_bits(exact_same.requested_radians) ==
+              UINT32_C(0) &&
+          terrain_float_bits(exact_same.actual_radians) ==
+              UINT32_C(0),
+          "exact same-input clamp is an original-baseline no-op");
+
+    const quat authentic_clamp_desired(
+        g1_test_float_from_bits(UINT32_C(0xbf7a925b)),
+        g1_test_float_from_bits(UINT32_C(0x3d89e499)),
+        g1_test_float_from_bits(UINT32_C(0x3c88eb81)),
+        g1_test_float_from_bits(UINT32_C(0xbe455bf7)));
+    const float authentic_clamp_maximum =
+        g1_test_float_from_bits(UINT32_C(0x3eb33333));
+    quat authentic_normalized_desired;
+    quat authentic_canonical_desired;
+    double authentic_requested_precise = 0.0;
+    float authentic_requested_rounded = 0.0f;
+    check(ik_checked_quat_normalize(
+              authentic_normalized_desired,
+              authentic_clamp_desired) &&
+          ik_checked_quat_normalize(
+              authentic_canonical_desired,
+              authentic_normalized_desired) &&
+          ik_checked_quat_angle(
+              authentic_requested_precise,
+              authentic_requested_rounded,
+              authentic_clamp_baseline,
+              authentic_canonical_desired) &&
+          authentic_requested_precise >
+              static_cast<double>(authentic_clamp_maximum),
+          "authentic requested correction is independently public and over-cap");
+    IKClampResult authentic_clamp = {};
+    check(ik_clamp_local_delta(
+              authentic_clamp,
+              authentic_clamp_baseline,
+              authentic_clamp_desired,
+              authentic_clamp_maximum),
+          "authentic frame-16 clamp boundary remains solvable");
+    double authentic_clamp_precise = 0.0;
+    float authentic_clamp_rounded = 0.0f;
+    check(authentic_clamp.limited &&
+          ik_quat_is_unit(authentic_clamp.value) &&
+          terrain_float_bits(authentic_clamp.requested_radians) ==
+              terrain_float_bits(authentic_requested_rounded) &&
+          authentic_clamp.requested_radians >=
+              authentic_clamp_maximum &&
+          authentic_clamp.actual_radians > 0.0f &&
+          authentic_clamp.actual_radians <= authentic_clamp_maximum &&
+          ik_checked_quat_angle(
+              authentic_clamp_precise,
+              authentic_clamp_rounded,
+              authentic_clamp_baseline,
+              authentic_clamp.value),
+          "authentic frame-16 clamp is limited and independently measurable");
+    check(authentic_clamp_precise <=
+              static_cast<double>(authentic_clamp_maximum) &&
+          authentic_clamp_rounded <= authentic_clamp_maximum &&
+          authentic_clamp.actual_radians == authentic_clamp_rounded,
+          "authentic frame-16 clamp obeys both correction caps");
+
+#if defined(G1_IK_ENABLE_TEST_SEAMS)
+    check(IKClampBoundaryAttemptCapacity == 64U &&
+          IKClampBoundaryAuditCapacity == 64U &&
+          IKClampBoundaryAuditCapacity ==
+              IKClampBoundaryAttemptCapacity,
+          "clamp boundary audit owns the complete 64-attempt production frontier");
+
+    IKClampResult authentic_limit_sixteen = {};
+    g1_test_poison_bytes(authentic_limit_sixteen, 0xa5U);
+    const G1TestByteSnapshot<IKClampResult>
+        authentic_limit_sixteen_before(authentic_limit_sixteen);
+    IKClampBoundaryAudit authentic_audit_sixteen = {};
+    check(!ik_clamp_local_delta_audited_for_test(
+              authentic_limit_sixteen,
+              authentic_audit_sixteen,
+              authentic_clamp_baseline,
+              authentic_clamp_desired,
+              authentic_clamp_maximum,
+              16U) &&
+          authentic_limit_sixteen_before.same(
+              authentic_limit_sixteen),
+          "authentic sixteen-attempt clamp exhausts transactionally");
+    check(authentic_audit_sixteen.attempt_count == 16U &&
+          authentic_audit_sixteen.finite_exhausted,
+          "authentic sixteen-attempt audit publishes the exhausted frontier");
+    for (uint32_t attempt = 0U; attempt < 16U; ++attempt) {
+        const IKClampBoundaryAuditAttempt& recorded =
+            authentic_audit_sixteen.attempts[attempt];
+        check((recorded.precise_angle >
+                   static_cast<double>(authentic_clamp_maximum) ||
+               recorded.rounded_angle > authentic_clamp_maximum) &&
+              !recorded.accepted,
+              "authentic attempts zero through fifteen remain public-over-cap");
+        if (attempt != 0U) {
+            check(recorded.interpolation_angle <
+                      authentic_audit_sixteen
+                          .attempts[attempt - 1U]
+                          .interpolation_angle,
+                  "authentic sixteen-attempt interpolation is strictly decreasing");
+        }
+    }
+
+    IKClampResult authentic_limit_seventeen = {};
+    IKClampBoundaryAudit authentic_audit_seventeen = {};
+    check(ik_clamp_local_delta_audited_for_test(
+              authentic_limit_seventeen,
+              authentic_audit_seventeen,
+              authentic_clamp_baseline,
+              authentic_clamp_desired,
+              authentic_clamp_maximum,
+              17U),
+          "authentic seventeenth clamp attempt succeeds");
+    check(authentic_audit_seventeen.attempt_count == 17U &&
+          !authentic_audit_seventeen.finite_exhausted &&
+          authentic_audit_seventeen.attempts[16].accepted,
+          "authentic attempt sixteen is the first accepted frontier point");
+    double authentic_seventeen_precise = 0.0;
+    float authentic_seventeen_rounded = 0.0f;
+    check(ik_checked_quat_angle(
+              authentic_seventeen_precise,
+              authentic_seventeen_rounded,
+              authentic_clamp_baseline,
+              authentic_limit_seventeen.value) &&
+          authentic_seventeen_precise > 0.0 &&
+          authentic_seventeen_precise <=
+              static_cast<double>(authentic_clamp_maximum) &&
+          authentic_seventeen_rounded > 0.0f &&
+          authentic_seventeen_rounded <=
+              authentic_clamp_maximum &&
+          g1_test_double_bits(authentic_seventeen_precise) ==
+              g1_test_double_bits(
+                  authentic_audit_seventeen
+                      .attempts[16].precise_angle) &&
+          terrain_float_bits(authentic_seventeen_rounded) ==
+              terrain_float_bits(
+                  authentic_audit_seventeen
+                      .attempts[16].rounded_angle) &&
+          terrain_float_bits(
+              authentic_limit_seventeen.actual_radians) ==
+              terrain_float_bits(authentic_seventeen_rounded),
+          "authentic attempt sixteen owns a positive public dual-bounded correction");
+    for (uint32_t attempt = 0U; attempt < 16U; ++attempt) {
+        check(g1_test_double_bits(
+                  authentic_audit_sixteen
+                      .attempts[attempt].interpolation_angle) ==
+                  g1_test_double_bits(
+                      authentic_audit_seventeen
+                          .attempts[attempt].interpolation_angle) &&
+              g1_test_double_bits(
+                  authentic_audit_sixteen
+                      .attempts[attempt].precise_angle) ==
+                  g1_test_double_bits(
+                      authentic_audit_seventeen
+                          .attempts[attempt].precise_angle) &&
+              terrain_float_bits(
+                  authentic_audit_sixteen
+                      .attempts[attempt].rounded_angle) ==
+                  terrain_float_bits(
+                      authentic_audit_seventeen
+                          .attempts[attempt].rounded_angle) &&
+              authentic_audit_sixteen.attempts[attempt].accepted ==
+                  authentic_audit_seventeen.attempts[attempt].accepted,
+              "authentic sixteen-attempt trace is an exact seventeen-attempt prefix");
+    }
+    check(g1_test_clamp_result_same(
+              authentic_clamp, authentic_limit_seventeen),
+          "64-attempt production clamp equals the first-success audited result");
+    IKClampResult authentic_limit_sixty_four = {};
+    IKClampBoundaryAudit authentic_audit_sixty_four = {};
+    check(ik_clamp_local_delta_audited_for_test(
+              authentic_limit_sixty_four,
+              authentic_audit_sixty_four,
+              authentic_clamp_baseline,
+              authentic_clamp_desired,
+              authentic_clamp_maximum,
+              IKClampBoundaryAttemptCapacity) &&
+          authentic_audit_sixty_four.attempt_count == 17U &&
+          !authentic_audit_sixty_four.finite_exhausted &&
+          authentic_audit_sixty_four.attempts[16U].accepted &&
+          g1_test_clamp_result_same(
+              authentic_limit_sixty_four,
+              authentic_limit_seventeen) &&
+          g1_test_clamp_result_same(
+              authentic_clamp,
+              authentic_limit_sixty_four),
+          "authentic 64-attempt frontier stops at first-success index 16");
+
+    const quat over_twenty_four_desired(
+        g1_test_float_from_bits(UINT32_C(0xbeaf6a08)),
+        g1_test_float_from_bits(UINT32_C(0x3e910963)),
+        g1_test_float_from_bits(UINT32_C(0x3f43bf83)),
+        g1_test_float_from_bits(UINT32_C(0x3eeee422)));
+    const float over_twenty_four_maximum =
+        g1_test_float_from_bits(UINT32_C(0x3c5c0d24));
+    IKClampResult over_twenty_four_production = {};
+    quat over_twenty_four_normalized_desired;
+    quat over_twenty_four_canonical_desired;
+    double over_twenty_four_requested_precise = 0.0;
+    float over_twenty_four_requested_rounded = 0.0f;
+    check(ik_checked_quat_normalize(
+              over_twenty_four_normalized_desired,
+              over_twenty_four_desired) &&
+          ik_checked_quat_normalize(
+              over_twenty_four_canonical_desired,
+              over_twenty_four_normalized_desired) &&
+          ik_checked_quat_angle(
+              over_twenty_four_requested_precise,
+              over_twenty_four_requested_rounded,
+              over_twenty_four_baseline,
+              over_twenty_four_canonical_desired) &&
+          over_twenty_four_requested_precise >
+              static_cast<double>(over_twenty_four_maximum),
+          "greater-than-twenty-four request is valid and over-cap");
+    IKClampResult over_twenty_four_limit_forty_nine = {};
+    g1_test_poison_bytes(
+        over_twenty_four_limit_forty_nine, 0x3cU);
+    const G1TestByteSnapshot<IKClampResult>
+        over_twenty_four_limit_forty_nine_before(
+            over_twenty_four_limit_forty_nine);
+    IKClampBoundaryAudit over_twenty_four_audit_forty_nine = {};
+    check(!ik_clamp_local_delta_audited_for_test(
+              over_twenty_four_limit_forty_nine,
+              over_twenty_four_audit_forty_nine,
+              over_twenty_four_baseline,
+              over_twenty_four_desired,
+              over_twenty_four_maximum,
+              49U) &&
+          over_twenty_four_limit_forty_nine_before.same(
+              over_twenty_four_limit_forty_nine),
+          "long fixture exhausts 49 attempts transactionally");
+    check(over_twenty_four_audit_forty_nine.attempt_count == 49U &&
+          over_twenty_four_audit_forty_nine.finite_exhausted,
+          "long fixture publishes its complete 49-attempt exhausted frontier");
+    for (uint32_t attempt = 0U; attempt < 49U; ++attempt) {
+        const IKClampBoundaryAuditAttempt& recorded =
+            over_twenty_four_audit_forty_nine.attempts[attempt];
+        check(!recorded.accepted &&
+              (recorded.precise_angle >
+                   static_cast<double>(over_twenty_four_maximum) ||
+               recorded.rounded_angle >
+                   over_twenty_four_maximum),
+              "long fixture exhausted attempts remain public-over-cap");
+        if (attempt != 0U) {
+            check(recorded.interpolation_angle <
+                      over_twenty_four_audit_forty_nine
+                          .attempts[attempt - 1U]
+                          .interpolation_angle,
+                  "long fixture interpolation is strictly decreasing");
+        }
+    }
+
+    IKClampResult over_twenty_four_limit_fifty = {};
+    IKClampBoundaryAudit over_twenty_four_audit_fifty = {};
+    check(ik_clamp_local_delta_audited_for_test(
+              over_twenty_four_limit_fifty,
+              over_twenty_four_audit_fifty,
+              over_twenty_four_baseline,
+              over_twenty_four_desired,
+              over_twenty_four_maximum,
+              50U),
+          "long fixture succeeds on attempt 49");
+    check(over_twenty_four_audit_fifty.attempt_count == 50U &&
+          !over_twenty_four_audit_fifty.finite_exhausted &&
+          over_twenty_four_audit_fifty.attempts[49U].accepted,
+          "long fixture authenticates exact first success index 49");
+    for (uint32_t attempt = 0U; attempt < 49U; ++attempt) {
+        check(g1_test_double_bits(
+                  over_twenty_four_audit_forty_nine
+                      .attempts[attempt].interpolation_angle) ==
+                  g1_test_double_bits(
+                      over_twenty_four_audit_fifty
+                          .attempts[attempt].interpolation_angle) &&
+              g1_test_double_bits(
+                  over_twenty_four_audit_forty_nine
+                      .attempts[attempt].precise_angle) ==
+                  g1_test_double_bits(
+                      over_twenty_four_audit_fifty
+                          .attempts[attempt].precise_angle) &&
+              terrain_float_bits(
+                  over_twenty_four_audit_forty_nine
+                      .attempts[attempt].rounded_angle) ==
+                  terrain_float_bits(
+                      over_twenty_four_audit_fifty
+                          .attempts[attempt].rounded_angle) &&
+              over_twenty_four_audit_forty_nine
+                      .attempts[attempt].accepted ==
+                  over_twenty_four_audit_fifty
+                      .attempts[attempt].accepted,
+              "long 49-attempt exhaustion is an exact 50-attempt prefix");
+    }
+    double over_twenty_four_precise = 0.0;
+    float over_twenty_four_rounded = 0.0f;
+    check(over_twenty_four_limit_fifty.limited &&
+          terrain_float_bits(
+              over_twenty_four_limit_fifty.requested_radians) ==
+              terrain_float_bits(
+                  over_twenty_four_requested_rounded) &&
+          over_twenty_four_limit_fifty.actual_radians > 0.0f &&
+          ik_checked_quat_angle(
+              over_twenty_four_precise,
+              over_twenty_four_rounded,
+              over_twenty_four_baseline,
+              over_twenty_four_limit_fifty.value) &&
+          over_twenty_four_precise > 0.0 &&
+          over_twenty_four_precise <=
+              static_cast<double>(over_twenty_four_maximum) &&
+          over_twenty_four_rounded > 0.0f &&
+          over_twenty_four_rounded <=
+              over_twenty_four_maximum &&
+          terrain_float_bits(
+              over_twenty_four_limit_fifty.actual_radians) ==
+              terrain_float_bits(over_twenty_four_rounded),
+          "long fixture success owns a positive public dual-bounded correction");
+
+    IKClampResult over_twenty_four_limit_sixty_four = {};
+    IKClampBoundaryAudit over_twenty_four_audit_sixty_four = {};
+    check(ik_clamp_local_delta_audited_for_test(
+              over_twenty_four_limit_sixty_four,
+              over_twenty_four_audit_sixty_four,
+              over_twenty_four_baseline,
+              over_twenty_four_desired,
+              over_twenty_four_maximum,
+              IKClampBoundaryAttemptCapacity) &&
+          over_twenty_four_audit_sixty_four.attempt_count == 50U &&
+          !over_twenty_four_audit_sixty_four.finite_exhausted &&
+          over_twenty_four_audit_sixty_four.attempts[49U].accepted &&
+          g1_test_clamp_result_same(
+              over_twenty_four_limit_sixty_four,
+              over_twenty_four_limit_fifty),
+          "long 64-attempt frontier stops at first-success index 49");
+
+    check(ik_clamp_local_delta(
+              over_twenty_four_production,
+              over_twenty_four_baseline,
+              over_twenty_four_desired,
+              over_twenty_four_maximum) &&
+          g1_test_clamp_result_same(
+              over_twenty_four_production,
+              over_twenty_four_limit_sixty_four),
+          "64-attempt production equals the long fixture first-success result");
+
+    IKClampResult over_twenty_four_zero = {};
+    g1_test_poison_bytes(over_twenty_four_zero, 0xc3U);
+    const G1TestByteSnapshot<IKClampResult>
+        over_twenty_four_zero_before(over_twenty_four_zero);
+    IKClampBoundaryAudit over_twenty_four_zero_audit = {};
+    check(!ik_clamp_local_delta_audited_for_test(
+              over_twenty_four_zero,
+              over_twenty_four_zero_audit,
+              over_twenty_four_baseline,
+              over_twenty_four_desired,
+              over_twenty_four_maximum,
+              0U) &&
+          over_twenty_four_zero_audit.attempt_count == 0U &&
+          over_twenty_four_zero_audit.finite_exhausted &&
+          over_twenty_four_zero_before.same(over_twenty_four_zero),
+          "zero-attempt valid exhaustion preserves the result transactionally");
+
+    const quat public_origin_mismatch_baseline(
+        g1_test_float_from_bits(UINT32_C(0x3e55c293)),
+        g1_test_float_from_bits(UINT32_C(0x3f24d993)),
+        g1_test_float_from_bits(UINT32_C(0x3f3bcbd7)),
+        g1_test_float_from_bits(UINT32_C(0x3d767112)));
+    const quat public_origin_mismatch_desired(
+        g1_test_float_from_bits(UINT32_C(0x3d207104)),
+        g1_test_float_from_bits(UINT32_C(0xbe34e99a)),
+        g1_test_float_from_bits(UINT32_C(0xbf423675)),
+        g1_test_float_from_bits(UINT32_C(0x3f2038fc)));
+    const quat public_origin_mismatch_old_result(
+        g1_test_float_from_bits(UINT32_C(0x3e559a8b)),
+        g1_test_float_from_bits(UINT32_C(0x3f24cc43)),
+        g1_test_float_from_bits(UINT32_C(0x3f3bdd91)),
+        g1_test_float_from_bits(UINT32_C(0x3d73fe9e)));
+    const float public_origin_mismatch_maximum =
+        g1_test_float_from_bits(UINT32_C(0x3ac01ed9));
+    quat public_origin_normalized_desired;
+    quat public_origin_canonical_desired;
+    double public_origin_requested_precise = 0.0;
+    float public_origin_requested_rounded = 0.0f;
+    check(ik_checked_quat_normalize(
+              public_origin_normalized_desired,
+              public_origin_mismatch_desired) &&
+          ik_checked_quat_normalize(
+              public_origin_canonical_desired,
+              public_origin_normalized_desired) &&
+          ik_checked_quat_angle(
+              public_origin_requested_precise,
+              public_origin_requested_rounded,
+              public_origin_mismatch_baseline,
+              public_origin_canonical_desired) &&
+          public_origin_requested_precise >
+              static_cast<double>(public_origin_mismatch_maximum),
+          "mismatch requested correction is independently public and over-cap");
+    double public_origin_old_precise = 0.0;
+    float public_origin_old_rounded = 0.0f;
+    check(ik_checked_quat_angle(
+              public_origin_old_precise,
+              public_origin_old_rounded,
+              public_origin_mismatch_baseline,
+              public_origin_mismatch_old_result) &&
+          g1_test_double_bits(public_origin_old_precise) ==
+              UINT64_C(0x3f5804b9e5264d3e) &&
+          terrain_float_bits(public_origin_old_rounded) ==
+              UINT32_C(0x3ac025cf) &&
+          public_origin_old_precise >
+              static_cast<double>(public_origin_mismatch_maximum) &&
+          public_origin_old_rounded >
+              public_origin_mismatch_maximum,
+          "former normalized-origin success is publicly over-cap");
+    IKClampResult public_origin_corrected = {};
+    IKClampBoundaryAudit public_origin_audit = {};
+    check(ik_clamp_local_delta_audited_for_test(
+              public_origin_corrected,
+              public_origin_audit,
+              public_origin_mismatch_baseline,
+              public_origin_mismatch_desired,
+              public_origin_mismatch_maximum,
+              IKClampBoundaryAttemptCapacity),
+          "public-origin mismatch fixture remains solvable");
+    check(public_origin_audit.attempt_count == 3U &&
+          !public_origin_audit.finite_exhausted &&
+          !public_origin_audit.attempts[0U].accepted &&
+          !public_origin_audit.attempts[1U].accepted &&
+          (public_origin_audit.attempts[0U].precise_angle >
+               static_cast<double>(public_origin_mismatch_maximum) ||
+           public_origin_audit.attempts[0U].rounded_angle >
+               public_origin_mismatch_maximum) &&
+          (public_origin_audit.attempts[1U].precise_angle >
+               static_cast<double>(public_origin_mismatch_maximum) ||
+           public_origin_audit.attempts[1U].rounded_angle >
+               public_origin_mismatch_maximum) &&
+          public_origin_audit.attempts[2U].accepted,
+          "public-origin audit excludes the former false-positive result and continues");
+    double public_origin_corrected_precise = 0.0;
+    float public_origin_corrected_rounded = 0.0f;
+    check(!g1_test_quat_bits_same(
+              public_origin_corrected.value,
+              public_origin_mismatch_old_result) &&
+          public_origin_corrected.limited &&
+          terrain_float_bits(
+              public_origin_corrected.requested_radians) ==
+              terrain_float_bits(
+                  public_origin_requested_rounded) &&
+          public_origin_corrected.actual_radians > 0.0f &&
+          ik_checked_quat_angle(
+              public_origin_corrected_precise,
+              public_origin_corrected_rounded,
+              public_origin_mismatch_baseline,
+              public_origin_corrected.value) &&
+          public_origin_corrected_precise > 0.0 &&
+          public_origin_corrected_precise <=
+              static_cast<double>(public_origin_mismatch_maximum) &&
+          public_origin_corrected_rounded > 0.0f &&
+          public_origin_corrected_rounded <=
+              public_origin_mismatch_maximum &&
+          terrain_float_bits(
+              public_origin_corrected.actual_radians) ==
+              terrain_float_bits(public_origin_corrected_rounded),
+          "corrected frontier publishes a positive public dual-bounded result");
+
+    alignas(IKClampBoundaryAudit)
+        unsigned char clamp_overlap_storage[
+            sizeof(IKClampBoundaryAudit)] = {};
+    IKClampResult& clamp_overlap_result =
+        *reinterpret_cast<IKClampResult*>(
+            clamp_overlap_storage);
+    IKClampBoundaryAudit& clamp_overlap_audit =
+        *reinterpret_cast<IKClampBoundaryAudit*>(
+            clamp_overlap_storage);
+
+    g1_test_poison_bytes(clamp_overlap_storage, 0x3cU);
+    unsigned char clamp_exhaustion_overlap_before[
+        sizeof(clamp_overlap_storage)] = {};
+    std::memcpy(
+        clamp_exhaustion_overlap_before,
+        clamp_overlap_storage,
+        sizeof(clamp_overlap_storage));
+    const bool clamp_exhaustion_overlap_returned =
+        ik_clamp_local_delta_audited_for_test(
+            clamp_overlap_result,
+            clamp_overlap_audit,
+            over_twenty_four_baseline,
+            over_twenty_four_desired,
+            over_twenty_four_maximum,
+            0U);
+    const bool clamp_exhaustion_overlap_unchanged =
+        std::memcmp(
+            clamp_exhaustion_overlap_before,
+            clamp_overlap_storage,
+            sizeof(clamp_overlap_storage)) == 0;
+
+    g1_test_poison_bytes(clamp_overlap_storage, 0xc3U);
+    unsigned char clamp_success_overlap_before[
+        sizeof(clamp_overlap_storage)] = {};
+    std::memcpy(
+        clamp_success_overlap_before,
+        clamp_overlap_storage,
+        sizeof(clamp_overlap_storage));
+    const bool clamp_success_overlap_returned =
+        ik_clamp_local_delta_audited_for_test(
+            clamp_overlap_result,
+            clamp_overlap_audit,
+            authentic_clamp_baseline,
+            authentic_clamp_desired,
+            authentic_clamp_maximum,
+            17U);
+    const bool clamp_success_overlap_unchanged =
+        std::memcmp(
+            clamp_success_overlap_before,
+            clamp_overlap_storage,
+            sizeof(clamp_overlap_storage)) == 0;
+
+    check(!clamp_exhaustion_overlap_returned &&
+          clamp_exhaustion_overlap_unchanged,
+          "audited clamp rejects exhaustion result/audit overlap transactionally");
+    check(!clamp_success_overlap_returned &&
+          clamp_success_overlap_unchanged,
+          "audited clamp rejects success result/audit overlap transactionally");
+
+    IKClampResult hostile_audited_result = {};
+    IKClampBoundaryAudit hostile_audit = {};
+    g1_test_poison_bytes(hostile_audited_result, 0xa5U);
+    g1_test_poison_bytes(hostile_audit, 0x5aU);
+    const G1TestByteSnapshot<IKClampResult>
+        hostile_audited_result_before(hostile_audited_result);
+    const G1TestByteSnapshot<IKClampBoundaryAudit>
+        hostile_audit_before(hostile_audit);
+    check(!ik_clamp_local_delta_audited_for_test(
+              hostile_audited_result,
+              hostile_audit,
+              quat(),
+              quat(g1_test_float_from_bits(UINT32_C(0x7fc00001)),
+                   0.0f, 0.0f, 0.0f),
+              maximum,
+              IKClampBoundaryAttemptCapacity) &&
+          hostile_audited_result_before.same(hostile_audited_result) &&
+          hostile_audit_before.same(hostile_audit),
+          "hostile audited clamp failure is fully transactional");
+    check(!ik_clamp_local_delta_audited_for_test(
+              hostile_audited_result,
+              hostile_audit,
+              identity,
+              frozen_nonidentity,
+              maximum,
+              IKClampBoundaryAttemptCapacity + 1U) &&
+          hostile_audited_result_before.same(hostile_audited_result) &&
+          hostile_audit_before.same(hostile_audit),
+          "over-capacity audited clamp request is fully transactional");
+#endif
+
+    const vec3 authentic_two_bone_root(
+        g1_test_float_from_bits(UINT32_C(0xbe647f5e)),
+        g1_test_float_from_bits(UINT32_C(0x3f081988)),
+        g1_test_float_from_bits(UINT32_C(0xbedb4c3a)));
+    const vec3 authentic_two_bone_middle(
+        g1_test_float_from_bits(UINT32_C(0xbe7c58de)),
+        g1_test_float_from_bits(UINT32_C(0x3eae106c)),
+        g1_test_float_from_bits(UINT32_C(0xbee42d20)));
+    const vec3 authentic_two_bone_end(
+        g1_test_float_from_bits(UINT32_C(0xbe8e5e82)),
+        g1_test_float_from_bits(UINT32_C(0x3d526040)),
+        g1_test_float_from_bits(UINT32_C(0xbf056f33)));
+    const vec3 authentic_two_bone_target(
+        g1_test_float_from_bits(UINT32_C(0xbe7d214e)),
+        g1_test_float_from_bits(UINT32_C(0x3de3ff94)),
+        g1_test_float_from_bits(UINT32_C(0xbf0c0f74)));
+    const vec3 authentic_two_bone_hinge(
+        g1_test_float_from_bits(UINT32_C(0x3f7e742d)),
+        g1_test_float_from_bits(UINT32_C(0xbde0b8d5)),
+        g1_test_float_from_bits(UINT32_C(0x3ae6531b)));
+    const quat authentic_middle_local(
+        g1_test_float_from_bits(UINT32_C(0x3f75488c)),
+        g1_test_float_from_bits(UINT32_C(0xa45cdd35)),
+        g1_test_float_from_bits(UINT32_C(0x254b5306)),
+        g1_test_float_from_bits(UINT32_C(0xbe9296b3)));
+    const quat authentic_root_global(
+        g1_test_float_from_bits(UINT32_C(0xbf33ce15)),
+        g1_test_float_from_bits(UINT32_C(0x3e1cc18d)),
+        g1_test_float_from_bits(UINT32_C(0x3f30e3a5)),
+        g1_test_float_from_bits(UINT32_C(0xbd9c113d)));
+    const quat authentic_middle_global(
+        g1_test_float_from_bits(UINT32_C(0xbf31dd0a)),
+        g1_test_float_from_bits(UINT32_C(0xbd518909)),
+        g1_test_float_from_bits(UINT32_C(0x3f34b453)),
+        g1_test_float_from_bits(UINT32_C(0x3e032664)));
+    const quat authentic_root_parent_global(
+        g1_test_float_from_bits(UINT32_C(0xbf3bb8ec)),
+        g1_test_float_from_bits(UINT32_C(0x3e202adb)),
+        g1_test_float_from_bits(UINT32_C(0x3f2876aa)),
+        g1_test_float_from_bits(UINT32_C(0xbd8d8941)));
+    const float authentic_cap_neighbors[] = {
+        std::nextafter(authentic_clamp_maximum, 0.0f),
+        authentic_clamp_maximum,
+        std::nextafter(
+            authentic_clamp_maximum,
+            std::numeric_limits<float>::infinity())
+    };
+    for (const float cap : authentic_cap_neighbors) {
+        IKTwoBoneResult authentic_two_bone = {};
+        check(ik_two_bone_bounded(
+                  authentic_two_bone,
+                  authentic_clamp_baseline,
+                  authentic_middle_local,
+                  authentic_two_bone_root,
+                  authentic_two_bone_middle,
+                  authentic_two_bone_end,
+                  authentic_two_bone_target,
+                  authentic_two_bone_hinge,
+                  authentic_root_global,
+                  authentic_middle_global,
+                  authentic_root_parent_global,
+                  g1_right_leg_config().reach_buffer_m,
+                  cap),
+              "captured frame-16 full two-bone call remains solvable at cap neighbors");
+        check(authentic_two_bone.applied &&
+              authentic_two_bone.correction_limited &&
+              ik_quat_is_unit(authentic_two_bone.root_local) &&
+              ik_quat_is_unit(authentic_two_bone.middle_local),
+              "captured full two-bone result is applied, limited, and unit");
+        double root_precise = 0.0;
+        double middle_precise = 0.0;
+        float root_rounded = 0.0f;
+        float middle_rounded = 0.0f;
+        check(ik_checked_quat_angle(
+                  root_precise,
+                  root_rounded,
+                  authentic_clamp_baseline,
+                  authentic_two_bone.root_local) &&
+              ik_checked_quat_angle(
+                  middle_precise,
+                  middle_rounded,
+                  authentic_middle_local,
+                  authentic_two_bone.middle_local) &&
+              root_precise <= static_cast<double>(cap) &&
+              middle_precise <= static_cast<double>(cap) &&
+              root_rounded <= cap && middle_rounded <= cap &&
+              (root_rounded > 0.0f || middle_rounded > 0.0f) &&
+              authentic_two_bone.root_correction_radians ==
+                  root_rounded &&
+              authentic_two_bone.middle_correction_radians ==
+                  middle_rounded,
+              "captured full two-bone local corrections are independently capped");
+    }
+
     vec3 subnormal_commit_sentinel(7.0f, 8.0f, 9.0f);
     const vec3 subnormal_commit_before = subnormal_commit_sentinel;
     const float minimum_normal = std::numeric_limits<float>::min();
@@ -4076,7 +4827,8 @@ static void test_generic_checked_ik_math()
         over_source_angle = std::nextafter(
             over_source_angle, std::numeric_limits<float>::infinity());
     }
-    check(clamp.limited && clamp.actual_radians <= maximum,
+    check(clamp.limited && clamp.actual_radians > 0.0f &&
+          clamp.actual_radians <= maximum,
           "precise over-bound correction is classified and clamped");
 
     const vec3 clamp_axes[3] = {
@@ -4101,8 +4853,32 @@ static void test_generic_checked_ik_math()
                         swept, baseline, desired, maximum);
                     check(swept_ok,
                           "bounded clamp sweep remains solvable");
-                    check(swept.actual_radians <= maximum,
-                          "every swept clamp reports an in-bound actual delta");
+                    double swept_public_precise = 0.0;
+                    float swept_public_rounded = 0.0f;
+                    check(ik_checked_quat_angle(
+                              swept_public_precise,
+                              swept_public_rounded,
+                              baseline,
+                              swept.value) &&
+                          swept_public_precise <=
+                              static_cast<double>(maximum) &&
+                          swept_public_rounded <= maximum &&
+                          terrain_float_bits(
+                              swept.actual_radians) ==
+                              terrain_float_bits(
+                                  swept_public_rounded),
+                          "every swept clamp is publicly measured and in-bound");
+                    if (swept.limited) {
+                        check(swept.requested_radians >= maximum &&
+                              swept.actual_radians > 0.0f,
+                              "every limited sweep owns a positive applied correction");
+                    } else {
+                        check(terrain_float_bits(
+                                  swept.requested_radians) ==
+                                  terrain_float_bits(
+                                      swept.actual_radians),
+                              "every unlimited sweep reports one public requested/actual value");
+                    }
                 }
             }
         }
@@ -4133,6 +4909,8 @@ static void test_generic_checked_ik_math()
     check(independently_measured_precise_cap <=
               static_cast<double>(precise_cap_maximum) &&
           independently_measured_rounded_cap <= precise_cap_maximum &&
+          (!precise_cap_result.limited ||
+           independently_measured_rounded_cap > 0.0f) &&
           precise_cap_result.actual_radians ==
               independently_measured_rounded_cap,
           "precise and reported applied corrections both obey the cap");
@@ -4146,8 +4924,9 @@ static void test_generic_checked_ik_math()
           "admitted scaled equivalent quaternions are normalized safely");
     check(!clamp.limited && clamp.requested_radians == 0.0f &&
           clamp.actual_radians == 0.0f &&
-          g1_test_quat_bits_same(clamp.value, identity),
-          "normalization prevents a false correction on equal rotations");
+          g1_test_quat_bits_same(
+              clamp.value, tolerated_scaled_identity),
+          "same-input ownership preserves the original baseline bits");
 
     const quat antipodal(-1.0f, 0.0f, 0.0f, 0.0f);
     check(ik_clamp_local_delta(

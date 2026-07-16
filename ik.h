@@ -39,6 +39,35 @@ struct IKClampResult
     bool limited = false;
 };
 
+static constexpr uint32_t IKClampBoundaryAttemptCapacity = 64U;
+
+#if defined(G1_IK_ENABLE_TEST_SEAMS)
+static constexpr uint32_t IKClampBoundaryAuditCapacity = 64U;
+
+struct IKClampBoundaryAuditAttempt
+{
+    double interpolation_angle = 0.0;
+    double precise_angle = 0.0;
+    float rounded_angle = 0.0f;
+    bool accepted = false;
+};
+
+struct IKClampBoundaryAudit
+{
+    IKClampBoundaryAuditAttempt
+        attempts[IKClampBoundaryAuditCapacity] = {};
+    uint32_t attempt_count = 0U;
+    bool finite_exhausted = false;
+};
+
+static_assert(
+    IKClampBoundaryAttemptCapacity ==
+        static_cast<uint32_t>(
+            sizeof(((IKClampBoundaryAudit*)nullptr)->attempts) /
+            sizeof(((IKClampBoundaryAudit*)nullptr)->attempts[0])),
+    "IK clamp production frontier must equal audit capacity");
+#endif
+
 struct IKBendSelection
 {
     vec3 direction;
@@ -481,6 +510,14 @@ static inline bool ik_checked_quat_angle(
     if (!ik_quat_is_unit(left) || !ik_quat_is_unit(right)) {
         return false;
     }
+    if (terrain_float_bits(left.w) == terrain_float_bits(right.w) &&
+        terrain_float_bits(left.x) == terrain_float_bits(right.x) &&
+        terrain_float_bits(left.y) == terrain_float_bits(right.y) &&
+        terrain_float_bits(left.z) == terrain_float_bits(right.z)) {
+        precise_angle = 0.0;
+        rounded_angle = 0.0f;
+        return true;
+    }
     quat normalized_left;
     quat normalized_right;
     if (!ik_checked_quat_normalize(normalized_left, left) ||
@@ -560,16 +597,57 @@ static inline bool ik_checked_quat_between(
                static_cast<double>(crossed.z));
 }
 
+static inline bool ik_clamp_quat_bits_equal(
+    quat left, quat right)
+{
+    return terrain_float_bits(left.w) == terrain_float_bits(right.w) &&
+           terrain_float_bits(left.x) == terrain_float_bits(right.x) &&
+           terrain_float_bits(left.y) == terrain_float_bits(right.y) &&
+           terrain_float_bits(left.z) == terrain_float_bits(right.z);
+}
+
 static inline bool ik_clamp_local_delta(
     IKClampResult& output,
     quat baseline,
     quat desired,
-    float maximum_radians)
+    float maximum_radians
+#if defined(G1_IK_ENABLE_TEST_SEAMS)
+    , uint32_t attempt_limit = IKClampBoundaryAttemptCapacity,
+    IKClampBoundaryAudit* audit = nullptr
+#endif
+    )
 {
+#if defined(G1_IK_ENABLE_TEST_SEAMS)
+    if (attempt_limit > IKClampBoundaryAttemptCapacity) {
+        return false;
+    }
+#else
+    const uint32_t attempt_limit =
+        IKClampBoundaryAttemptCapacity;
+#endif
     if (!ik_quat_is_unit(baseline) || !ik_quat_is_unit(desired) ||
         !terrain_float_is_positive_normal(maximum_radians) ||
         maximum_radians > PIf) {
         return false;
+    }
+
+#if defined(G1_IK_ENABLE_TEST_SEAMS)
+    IKClampBoundaryAudit candidate_audit = {};
+#endif
+
+    if (ik_clamp_quat_bits_equal(baseline, desired)) {
+        IKClampResult candidate = {};
+        candidate.value = baseline;
+        candidate.requested_radians = 0.0f;
+        candidate.actual_radians = 0.0f;
+        candidate.limited = false;
+        output = candidate;
+#if defined(G1_IK_ENABLE_TEST_SEAMS)
+        if (audit != nullptr) {
+            *audit = candidate_audit;
+        }
+#endif
+        return true;
     }
 
     quat normalized_baseline;
@@ -594,108 +672,161 @@ static inline bool ik_clamp_local_delta(
     quat shortest = raw_dot < 0.0
         ? -normalized_desired
         : normalized_desired;
+    quat canonical_desired;
+    if (!ik_checked_quat_normalize(
+            canonical_desired, shortest)) {
+        return false;
+    }
     double cosine = fabs(raw_dot);
     cosine = cosine > 1.0 ? 1.0 : cosine;
     const volatile double theta = acos(cosine);
-    const volatile double precise_requested = 2.0 * theta;
+    const volatile double construction_requested = 2.0 * theta;
+    if (!terrain_double_is_finite(theta) ||
+        !terrain_double_is_finite(construction_requested)) {
+        return false;
+    }
+
+    double precise_requested = 0.0;
     float requested = 0.0f;
-    if (!terrain_double_is_finite(precise_requested) ||
-        !ik_checked_binary32_commit(precise_requested, requested)) {
+    if (!ik_checked_quat_angle(
+            precise_requested, requested,
+            baseline, canonical_desired)) {
         return false;
     }
 
     const bool limited =
         precise_requested > static_cast<double>(maximum_radians);
+    if (!limited) {
+        IKClampResult candidate = {};
+        candidate.value = canonical_desired;
+        candidate.requested_radians = requested;
+        candidate.actual_radians = requested;
+        candidate.limited = false;
+        output = candidate;
+#if defined(G1_IK_ENABLE_TEST_SEAMS)
+        if (audit != nullptr) {
+            *audit = candidate_audit;
+        }
+#endif
+        return true;
+    }
+
+    if (construction_requested <= 0.0) {
+        return false;
+    }
+    const volatile double sine_theta = sin(theta);
+    if (!terrain_double_is_finite(sine_theta) ||
+        sine_theta <= 0.0) {
+        return false;
+    }
+    double interpolation_angle =
+        static_cast<double>(maximum_radians);
     quat candidate_value;
     double precise_actual = 0.0;
     float actual = 0.0f;
-    if (!limited) {
-        if (!ik_checked_quat_normalize(candidate_value, shortest) ||
+    bool bounded_candidate_found = false;
+    for (uint32_t attempt = 0U;
+         attempt < attempt_limit; ++attempt) {
+        const volatile double alpha =
+            interpolation_angle / construction_requested;
+        if (!terrain_double_is_finite(alpha) || alpha <= 0.0 ||
+            alpha >= 1.0) {
+            return false;
+        }
+        const volatile double baseline_weight =
+            sin((1.0 - alpha) * theta) / sine_theta;
+        const volatile double desired_weight =
+            sin(alpha * theta) / sine_theta;
+        if (!ik_checked_quat_from_double(
+                candidate_value,
+                baseline_weight *
+                        static_cast<double>(normalized_baseline.w) +
+                    desired_weight * static_cast<double>(shortest.w),
+                baseline_weight *
+                        static_cast<double>(normalized_baseline.x) +
+                    desired_weight * static_cast<double>(shortest.x),
+                baseline_weight *
+                        static_cast<double>(normalized_baseline.y) +
+                    desired_weight * static_cast<double>(shortest.y),
+                baseline_weight *
+                        static_cast<double>(normalized_baseline.z) +
+                    desired_weight * static_cast<double>(shortest.z)) ||
             !ik_checked_quat_angle(
                 precise_actual, actual,
-                normalized_baseline, candidate_value)) {
+                baseline, candidate_value)) {
             return false;
         }
-    } else {
-        if (precise_requested <= 0.0) {
+        const bool accepted =
+            precise_actual > 0.0 && actual > 0.0f &&
+            precise_actual <=
+                static_cast<double>(maximum_radians) &&
+            actual <= maximum_radians;
+#if defined(G1_IK_ENABLE_TEST_SEAMS)
+        candidate_audit.attempts[attempt].interpolation_angle =
+            interpolation_angle;
+        candidate_audit.attempts[attempt].precise_angle =
+            precise_actual;
+        candidate_audit.attempts[attempt].rounded_angle = actual;
+        candidate_audit.attempts[attempt].accepted = accepted;
+        candidate_audit.attempt_count = attempt + 1U;
+#endif
+        if (accepted) {
+            bounded_candidate_found = true;
+            break;
+        }
+
+        const float materialized_interpolation =
+            static_cast<float>(interpolation_angle);
+        const double lower_binary32_angle = static_cast<double>(
+            std::nextafter(materialized_interpolation, 0.0f));
+        if (!terrain_double_is_finite(lower_binary32_angle) ||
+            lower_binary32_angle <= 0.0 ||
+            lower_binary32_angle >= interpolation_angle) {
+            break;
+        }
+
+        const double measured =
+            precise_actual > static_cast<double>(actual)
+                ? precise_actual
+                : static_cast<double>(actual);
+        if (!terrain_double_is_finite(measured) || measured < 0.0) {
             return false;
         }
-        const volatile double sine_theta = sin(theta);
-        if (!terrain_double_is_finite(sine_theta) ||
-            sine_theta <= 0.0) {
-            return false;
-        }
-        double interpolation_angle =
-            static_cast<double>(maximum_radians);
-        bool bounded_candidate_found = false;
-        for (int attempt = 0; attempt < 16; ++attempt) {
-            const volatile double alpha =
-                interpolation_angle / precise_requested;
-            if (!terrain_double_is_finite(alpha) || alpha <= 0.0 ||
-                alpha >= 1.0) {
-                return false;
-            }
-            const volatile double baseline_weight =
-                sin((1.0 - alpha) * theta) / sine_theta;
-            const volatile double desired_weight =
-                sin(alpha * theta) / sine_theta;
-            if (!ik_checked_quat_from_double(
-                    candidate_value,
-                    baseline_weight *
-                            static_cast<double>(normalized_baseline.w) +
-                        desired_weight * static_cast<double>(shortest.w),
-                    baseline_weight *
-                            static_cast<double>(normalized_baseline.x) +
-                        desired_weight * static_cast<double>(shortest.x),
-                    baseline_weight *
-                            static_cast<double>(normalized_baseline.y) +
-                        desired_weight * static_cast<double>(shortest.y),
-                    baseline_weight *
-                            static_cast<double>(normalized_baseline.z) +
-                        desired_weight * static_cast<double>(shortest.z)) ||
-                !ik_checked_quat_angle(
-                    precise_actual, actual,
-                    normalized_baseline, candidate_value)) {
-                return false;
-            }
-            if (precise_actual <=
-                    static_cast<double>(maximum_radians) &&
-                actual <= maximum_radians) {
-                bounded_candidate_found = true;
-                break;
-            }
-            const double measured =
-                precise_actual > static_cast<double>(actual)
-                    ? precise_actual
-                    : static_cast<double>(actual);
-            if (!terrain_double_is_finite(measured) ||
-                measured <= static_cast<double>(maximum_radians)) {
-                return false;
-            }
-            double next_angle = interpolation_angle *
+        double next_angle = lower_binary32_angle;
+        if (measured > static_cast<double>(maximum_radians)) {
+            next_angle = interpolation_angle *
                 (static_cast<double>(maximum_radians) / measured);
             if (!terrain_double_is_finite(next_angle) ||
                 next_angle <= 0.0) {
                 return false;
             }
-            const float materialized_interpolation =
-                static_cast<float>(interpolation_angle);
-            const double lower_binary32_angle = static_cast<double>(
-                std::nextafter(materialized_interpolation, 0.0f));
             if (next_angle >= lower_binary32_angle) {
                 next_angle = lower_binary32_angle;
             }
-            if (next_angle >= interpolation_angle) {
-                next_angle = std::nextafter(interpolation_angle, 0.0);
-            }
-            interpolation_angle = next_angle;
         }
-        if (!bounded_candidate_found) {
-            return false;
+        if (next_angle >= interpolation_angle) {
+            next_angle = std::nextafter(interpolation_angle, 0.0);
         }
+        if (!terrain_double_is_finite(next_angle) ||
+            next_angle <= 0.0 ||
+            next_angle >= interpolation_angle) {
+            break;
+        }
+        interpolation_angle = next_angle;
     }
 
-    if (precise_actual > static_cast<double>(maximum_radians) ||
+    if (!bounded_candidate_found) {
+#if defined(G1_IK_ENABLE_TEST_SEAMS)
+        candidate_audit.finite_exhausted = true;
+        if (audit != nullptr) {
+            *audit = candidate_audit;
+        }
+#endif
+        return false;
+    }
+
+    if (precise_actual <= 0.0 || actual <= 0.0f ||
+        precise_actual > static_cast<double>(maximum_radians) ||
         actual > maximum_radians) {
         return false;
     }
@@ -703,10 +834,46 @@ static inline bool ik_clamp_local_delta(
     candidate.value = candidate_value;
     candidate.requested_radians = requested;
     candidate.actual_radians = actual;
-    candidate.limited = limited;
+    candidate.limited = true;
     output = candidate;
+#if defined(G1_IK_ENABLE_TEST_SEAMS)
+    if (audit != nullptr) {
+        *audit = candidate_audit;
+    }
+#endif
     return true;
 }
+
+#if defined(G1_IK_ENABLE_TEST_SEAMS)
+static inline bool ik_clamp_local_delta_audited_for_test(
+    IKClampResult& output,
+    IKClampBoundaryAudit& audit,
+    quat baseline,
+    quat desired,
+    float maximum_radians,
+    uint32_t attempt_limit)
+{
+    const uintptr_t output_begin =
+        reinterpret_cast<uintptr_t>(&output);
+    const uintptr_t audit_begin =
+        reinterpret_cast<uintptr_t>(&audit);
+    if (output_begin > UINTPTR_MAX - sizeof(output) ||
+        audit_begin > UINTPTR_MAX - sizeof(audit)) {
+        return false;
+    }
+    const uintptr_t output_end =
+        output_begin + sizeof(output);
+    const uintptr_t audit_end =
+        audit_begin + sizeof(audit);
+    if (output_begin < audit_end &&
+        audit_begin < output_end) {
+        return false;
+    }
+    return ik_clamp_local_delta(
+        output, baseline, desired, maximum_radians,
+        attempt_limit, &audit);
+}
+#endif
 
 static inline bool ik_checked_radial_target(
     vec3& output,
