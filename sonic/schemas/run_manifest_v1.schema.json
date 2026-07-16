@@ -5,11 +5,139 @@
   "type": "object",
   "required": [
     "schema",
-    "external"
+    "experiment_id",
+    "run_id",
+    "status",
+    "created_utc"
   ],
   "properties": {
-    "schema": {
-      "const": "mm-sonic-run-manifest/v1"
+    "schema": {"const": "mm-sonic-run-manifest/v1"},
+    "experiment_id": {"type": "string", "minLength": 1},
+    "run_id": {"type": "string", "minLength": 1},
+    "status": {"enum": ["running", "complete", "failed", "not_run"]},
+    "created_utc": {"type": "string", "format": "date-time"},
+    "finalized_utc": {"type": "string", "format": "date-time"},
+    "external": {"$ref": "#/$defs/external"},
+    "repositories": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"$ref": "#/$defs/repository"}
+    },
+    "artifact_hashes": {"$ref": "#/$defs/artifactHashes"},
+    "command_script": {
+      "type": "object",
+      "required": ["id", "sha256"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/sha256OrNull"}
+      },
+      "additionalProperties": true
+    },
+    "perturbation": {
+      "type": "object",
+      "required": ["id", "lateral_offset_m", "yaw_offset_rad"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "lateral_offset_m": {"type": "number"},
+        "yaw_offset_rad": {"type": "number"}
+      },
+      "additionalProperties": false
+    },
+    "coordinate_transform": {
+      "type": "object",
+      "required": ["source", "target", "matrix"],
+      "properties": {
+        "source": {"type": "string", "minLength": 1},
+        "target": {"type": "string", "minLength": 1},
+        "matrix": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 3,
+            "items": {"type": "number"}
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "processes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "argv"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "argv": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "outcome": {"type": "object"},
+    "evidence": {
+      "type": "object",
+      "required": ["inventory_sha256", "file_count"],
+      "properties": {
+        "inventory_sha256": {"$ref": "#/$defs/sha256"},
+        "file_count": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"status": {"enum": ["complete", "failed", "not_run"]}},
+        "required": ["status"]
+      },
+      "then": {"$ref": "#/$defs/terminalManifest"}
+    }
+  ],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "sha256OrNull": {
+      "oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]
+    },
+    "repository": {
+      "type": "object",
+      "required": ["commit", "dirty"],
+      "properties": {
+        "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "dirty": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "artifactHashes": {
+      "type": "object",
+      "required": [
+        "policy",
+        "encoder",
+        "observation_config",
+        "model",
+        "source_mjcf",
+        "motion",
+        "terrain",
+        "joint_map",
+        "scene"
+      ],
+      "properties": {
+        "policy": {"$ref": "#/$defs/sha256OrNull"},
+        "encoder": {"$ref": "#/$defs/sha256OrNull"},
+        "observation_config": {"$ref": "#/$defs/sha256OrNull"},
+        "model": {"$ref": "#/$defs/sha256OrNull"},
+        "source_mjcf": {"$ref": "#/$defs/sha256OrNull"},
+        "motion": {"$ref": "#/$defs/sha256OrNull"},
+        "terrain": {"$ref": "#/$defs/sha256OrNull"},
+        "joint_map": {"$ref": "#/$defs/sha256OrNull"},
+        "scene": {"$ref": "#/$defs/sha256OrNull"}
+      },
+      "additionalProperties": false
     },
     "external": {
       "type": "object",
@@ -25,49 +153,36 @@
         "hashes"
       ],
       "properties": {
-        "gear_checkout": {
-          "type": "string",
-          "minLength": 1
-        },
-        "gear_commit": {
-          "type": "string",
-          "pattern": "^[0-9a-f]{40}$"
-        },
-        "gear_dirty": {
-          "type": "boolean"
-        },
-        "policy": {
-          "type": "string",
-          "minLength": 1
-        },
-        "observation_config": {
-          "type": "string",
-          "minLength": 1
-        },
-        "encoder": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "terrain_dir": {
-          "type": "string",
-          "minLength": 1
-        },
-        "source_mjcf": {
-          "type": "string",
-          "minLength": 1
-        },
+        "gear_checkout": {"type": "string", "minLength": 1},
+        "gear_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "gear_dirty": {"type": "boolean"},
+        "policy": {"type": "string", "minLength": 1},
+        "observation_config": {"type": "string", "minLength": 1},
+        "encoder": {"type": ["string", "null"]},
+        "terrain_dir": {"type": "string", "minLength": 1},
+        "source_mjcf": {"type": "string", "minLength": 1},
         "hashes": {
           "type": "object",
           "minProperties": 1,
-          "additionalProperties": {
-            "type": "string",
-            "pattern": "^[0-9a-f]{64}$"
-          }
+          "additionalProperties": {"$ref": "#/$defs/sha256"}
         }
       },
       "additionalProperties": false
+    },
+    "terminalManifest": {
+      "type": "object",
+      "required": [
+        "external",
+        "repositories",
+        "artifact_hashes",
+        "command_script",
+        "perturbation",
+        "coordinate_transform",
+        "processes",
+        "outcome",
+        "evidence",
+        "finalized_utc"
+      ]
     }
   },
   "additionalProperties": true
