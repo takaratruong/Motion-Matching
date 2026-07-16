@@ -32,21 +32,13 @@ static inline bool scene_frame_runtime_live_storage_preflight(
     char* error,
     int error_capacity)
 {
-    g1_controller_state_memory_range accepted_ranges[64] = {};
-    g1_controller_state_memory_range working_ranges[64] = {};
-    int accepted_count = 0;
-    int working_count = 0;
+    g1_controller_state_memory_range ranges[5][64] = {};
+    int counts[5] = {};
     if (error_capacity < 0 ||
         (extra_object_0 == nullptr) != (extra_object_0_bytes == 0U) ||
         (extra_object_1 == nullptr) != (extra_object_1_bytes == 0U) ||
-        !g1_frame_state_pair_reset_storage_is_safe(
-            runtime.accepted_state,
-            runtime.working_state,
-            accepted_ranges,
-            accepted_count,
-            working_ranges,
-            working_count,
-            64)) {
+        !g1_frame_runtime_storage_sets_are_safe(
+            runtime, false, ranges, counts)) {
         return false;
     }
 
@@ -80,17 +72,14 @@ static inline bool scene_frame_runtime_live_storage_preflight(
                 objects[first].bytes)) {
             return false;
         }
-        if (g1_frame_ranges_overlap_object(
-                accepted_ranges,
-                accepted_count,
-                objects[first].data,
-                objects[first].bytes) ||
-            g1_frame_ranges_overlap_object(
-                working_ranges,
-                working_count,
-                objects[first].data,
-                objects[first].bytes)) {
-            return false;
+        for (int state_index = 0; state_index < 5; ++state_index) {
+            if (g1_frame_ranges_overlap_object(
+                    ranges[state_index],
+                    counts[state_index],
+                    objects[first].data,
+                    objects[first].bytes)) {
+                return false;
+            }
         }
     }
 
@@ -100,46 +89,42 @@ static inline bool scene_frame_runtime_live_storage_preflight(
             ? static_cast<std::size_t>(error_capacity)
             : 0U
     };
-    return !g1_frame_error_overlaps_ranges(
-               error,
-               error_capacity,
-               accepted_ranges,
-               accepted_count) &&
-           !g1_frame_error_overlaps_ranges(
-               error,
-               error_capacity,
-               working_ranges,
-               working_count) &&
-           (diagnostic.bytes == 0U ||
-            !g1_controller_state_source_storage_overlaps(
-                diagnostic, db, support, scene)) &&
-           !g1_frame_ranges_overlap_sources(
-               accepted_ranges,
-               accepted_count,
-               db,
-               support,
-               scene) &&
-           !g1_frame_ranges_overlap_sources(
-               working_ranges,
-               working_count,
-               db,
-               support,
-               scene);
+    if (diagnostic.bytes > 0U &&
+        g1_controller_state_source_storage_overlaps(
+            diagnostic, db, support, scene)) {
+        return false;
+    }
+    for (int state_index = 0; state_index < 5; ++state_index) {
+        if (g1_frame_error_overlaps_ranges(
+                error,
+                error_capacity,
+                ranges[state_index],
+                counts[state_index]) ||
+            g1_frame_ranges_overlap_sources(
+                ranges[state_index],
+                counts[state_index],
+                db,
+                support,
+                scene)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static inline bool scene_frame_runtime_reset_candidate_is_valid(
     const G1FrameRuntime& runtime,
     const G1FrameResetConfig& config)
 {
-    return g1_frame_reset_candidate_is_valid(
-               runtime.accepted_state,
-               config.initial_search_time) &&
-           g1_frame_reset_candidate_is_valid(
-               runtime.working_state,
-               config.initial_search_time) &&
-           g1_frame_controller_states_equal(
-               runtime.accepted_state,
-               runtime.working_state) &&
+    const g1_controller_state* states[5] = {};
+    g1_frame_runtime_state_pointers(runtime, states);
+    for (int state_index = 0; state_index < 5; ++state_index) {
+        if (!g1_frame_reset_candidate_is_valid(
+                *states[state_index], config.initial_search_time)) {
+            return false;
+        }
+    }
+    return g1_frame_runtime_states_are_logically_equal(runtime) &&
            g1_frame_publication_is_valid(runtime.publication) &&
            !runtime.publication.rejection.rejected &&
            !runtime.publication.ik_safe_stop_latched &&
@@ -168,64 +153,59 @@ static inline bool scene_frame_runtime_candidate_is_isolated(
     char* error,
     int error_capacity)
 {
-    g1_controller_state_memory_range live_accepted_ranges[64] = {};
-    g1_controller_state_memory_range live_working_ranges[64] = {};
-    g1_controller_state_memory_range candidate_accepted_ranges[64] = {};
-    g1_controller_state_memory_range candidate_working_ranges[64] = {};
-    int live_accepted_count = 0;
-    int live_working_count = 0;
-    int candidate_accepted_count = 0;
-    int candidate_working_count = 0;
+    g1_controller_state_memory_range live_ranges[5][64] = {};
+    g1_controller_state_memory_range candidate_ranges[5][64] = {};
+    int live_counts[5] = {};
+    int candidate_counts[5] = {};
     if (error_capacity < 0 ||
-        !g1_frame_state_pair_reset_storage_is_safe(
-            live_runtime.accepted_state,
-            live_runtime.working_state,
-            live_accepted_ranges,
-            live_accepted_count,
-            live_working_ranges,
-            live_working_count,
-            64) ||
-        !g1_frame_state_pair_storage_is_exact(
-            candidate_runtime.accepted_state,
-            candidate_runtime.working_state,
-            candidate_accepted_ranges,
-            candidate_accepted_count,
-            candidate_working_ranges,
-            candidate_working_count,
-            64)) {
+        (extra_object_0 == nullptr) != (extra_object_0_bytes == 0U) ||
+        (extra_object_1 == nullptr) != (extra_object_1_bytes == 0U) ||
+        !g1_frame_runtime_storage_sets_are_safe(
+            live_runtime, false, live_ranges, live_counts) ||
+        !g1_frame_runtime_storage_sets_are_safe(
+            candidate_runtime,
+            true,
+            candidate_ranges,
+            candidate_counts)) {
         return false;
     }
 
-    const bool state_sets_are_disjoint =
-        g1_frame_state_range_sets_are_disjoint(
-            live_runtime.accepted_state,
-            live_accepted_ranges,
-            live_accepted_count,
-            candidate_runtime.accepted_state,
-            candidate_accepted_ranges,
-            candidate_accepted_count) &&
-        g1_frame_state_range_sets_are_disjoint(
-            live_runtime.accepted_state,
-            live_accepted_ranges,
-            live_accepted_count,
-            candidate_runtime.working_state,
-            candidate_working_ranges,
-            candidate_working_count) &&
-        g1_frame_state_range_sets_are_disjoint(
-            live_runtime.working_state,
-            live_working_ranges,
-            live_working_count,
-            candidate_runtime.accepted_state,
-            candidate_accepted_ranges,
-            candidate_accepted_count) &&
-        g1_frame_state_range_sets_are_disjoint(
-            live_runtime.working_state,
-            live_working_ranges,
-            live_working_count,
-            candidate_runtime.working_state,
-            candidate_working_ranges,
-            candidate_working_count);
-    if (!state_sets_are_disjoint) return false;
+    const g1_controller_state* live_states[5] = {};
+    const g1_controller_state* candidate_states[5] = {};
+    g1_frame_runtime_state_pointers(live_runtime, live_states);
+    g1_frame_runtime_state_pointers(candidate_runtime, candidate_states);
+    const g1_controller_state* states[10] = {
+        live_states[0], live_states[1], live_states[2],
+        live_states[3], live_states[4],
+        candidate_states[0], candidate_states[1], candidate_states[2],
+        candidate_states[3], candidate_states[4],
+    };
+    const g1_controller_state_memory_range* range_sets[10] = {
+        live_ranges[0], live_ranges[1], live_ranges[2],
+        live_ranges[3], live_ranges[4],
+        candidate_ranges[0], candidate_ranges[1], candidate_ranges[2],
+        candidate_ranges[3], candidate_ranges[4],
+    };
+    const int range_counts[10] = {
+        live_counts[0], live_counts[1], live_counts[2],
+        live_counts[3], live_counts[4],
+        candidate_counts[0], candidate_counts[1], candidate_counts[2],
+        candidate_counts[3], candidate_counts[4],
+    };
+    for (int first = 0; first < 10; ++first) {
+        for (int second = first + 1; second < 10; ++second) {
+            if (states[first] == states[second] ||
+                !g1_frame_state_range_sets_are_disjoint(
+                    *states[first],
+                    range_sets[first],
+                    range_counts[first],
+                    *states[second],
+                    range_sets[second],
+                    range_counts[second])) {
+                return false;
+            }
+        }
+    }
 
     const g1_controller_state_memory_range objects[] = {
         {&live_runtime, sizeof(live_runtime)},
@@ -260,43 +240,18 @@ static inline bool scene_frame_runtime_candidate_is_isolated(
                 return false;
             }
         }
-        if (g1_frame_ranges_overlap_object(
-                live_accepted_ranges,
-                live_accepted_count,
-                objects[first].data,
-                objects[first].bytes) ||
-            g1_frame_ranges_overlap_object(
-                live_working_ranges,
-                live_working_count,
-                objects[first].data,
-                objects[first].bytes) ||
-            g1_frame_ranges_overlap_object(
-                candidate_accepted_ranges,
-                candidate_accepted_count,
-                objects[first].data,
-                objects[first].bytes) ||
-            g1_frame_ranges_overlap_object(
-                candidate_working_ranges,
-                candidate_working_count,
-                objects[first].data,
-                objects[first].bytes)) {
-            return false;
+        for (int set = 0; set < 10; ++set) {
+            if (g1_frame_ranges_overlap_object(
+                    range_sets[set],
+                    range_counts[set],
+                    objects[first].data,
+                    objects[first].bytes)) {
+                return false;
+            }
         }
     }
 
-    const g1_controller_state_memory_range* const range_sets[] = {
-        live_accepted_ranges,
-        live_working_ranges,
-        candidate_accepted_ranges,
-        candidate_working_ranges,
-    };
-    const int range_counts[] = {
-        live_accepted_count,
-        live_working_count,
-        candidate_accepted_count,
-        candidate_working_count,
-    };
-    for (int set = 0; set < 4; ++set) {
+    for (int set = 0; set < 10; ++set) {
         if (g1_frame_error_overlaps_ranges(
                 error,
                 error_capacity,
@@ -338,6 +293,15 @@ static inline void scene_frame_runtime_swap(
         first.accepted_state, second.accepted_state);
     g1_controller_state_swap(
         first.working_state, second.working_state);
+    g1_controller_state_swap(
+        first.candidates.common_state,
+        second.candidates.common_state);
+    g1_controller_state_swap(
+        first.candidates.raw_state,
+        second.candidates.raw_state);
+    g1_controller_state_swap(
+        first.candidates.ik_state,
+        second.candidates.ik_state);
     using std::swap;
     swap(first.publication, second.publication);
     swap(first.accepted_diagnostic, second.accepted_diagnostic);

@@ -1,4 +1,6 @@
+#if !defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
 #define G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM
+#endif
 #include "g1_frame_transaction.h"
 
 #include <cstddef>
@@ -20,8 +22,12 @@ static void check(bool condition, const char* message)
 
 static_assert(G1FrameStageInputRouteCommand == 0,
               "input/route command is the first transaction stage");
-static_assert(G1FrameStagePoseCertificate + 1 == G1FrameStageCount,
-              "pose certification is the final transaction stage");
+static_assert(G1FrameStageRawBegin == G1FrameStageFootprintObservation + 1,
+              "raw certification follows the common candidate phase");
+static_assert(G1FrameStageIkBegin == G1FrameStageRawPoseCertificate + 1,
+              "IK certification follows raw certification");
+static_assert(G1FrameStageAcceptedFinalize + 1 == G1FrameStageCount,
+              "accepted finalization is the final transaction stage");
 static_assert(std::is_same<G1FrameStageRunner,
     G1FrameStageOutcome (*)(
         G1FrameTransactionStage,
@@ -30,6 +36,49 @@ static_assert(std::is_same<G1FrameStageRunner,
         const G1FrameExternalInputs&,
         char*, int)>::value,
     "the runner has only working state, scratch, and immutable external input");
+static_assert(std::is_same<G1RecoveryProvider,
+    G1RecoveryProviderStatus (*)(
+        G1RecoveryCandidateSet&,
+        const G1RecoveryRequest&,
+        char*, int)>::value,
+    "the coordinator consumes the strict recovery-provider contract unchanged");
+
+static G1RecoveryProviderStatus unexpected_recovery_provider(
+    G1RecoveryCandidateSet&,
+    const G1RecoveryRequest&,
+    char*, int)
+{
+    return G1RecoveryProviderGlobalError;
+}
+
+using G1FrameCoordinator = G1FrameTransactionStatus (*)(
+    G1FrameRuntime&,
+    G1FrameStageRunner,
+    G1RecoveryProvider,
+    const G1FrameExternalInputs&,
+    const G1FrameTransactionTestSeam*,
+    char*,
+    int);
+
+static G1FrameTransactionStatus g1_frame_transaction_run(
+    G1FrameRuntime& runtime,
+    G1FrameStageRunner runner,
+    const G1FrameExternalInputs& external,
+    const G1FrameTransactionTestSeam* seam,
+    char* error,
+    int error_capacity)
+{
+    const G1FrameCoordinator coordinator =
+        static_cast<G1FrameCoordinator>(&g1_frame_transaction_run);
+    return coordinator(
+        runtime,
+        runner,
+        unexpected_recovery_provider,
+        external,
+        seam,
+        error,
+        error_capacity);
+}
 
 static void make_database(database& db, int frames = 32)
 {
@@ -197,9 +246,18 @@ struct fixture
               error);
         seed_nonzero_array_tails(runtime.accepted_state);
         seed_nonzero_array_tails(runtime.working_state);
+        seed_nonzero_array_tails(runtime.candidates.common_state);
+        seed_nonzero_array_tails(runtime.candidates.raw_state);
+        seed_nonzero_array_tails(runtime.candidates.ik_state);
         runtime.working_state.camera_azimuth += 0.0625f;
         check(g1_controller_state_is_valid(runtime.accepted_state) &&
                   g1_controller_state_is_valid(runtime.working_state) &&
+                  g1_controller_state_is_valid(
+                      runtime.candidates.common_state) &&
+                  g1_controller_state_is_valid(
+                      runtime.candidates.raw_state) &&
+                  g1_controller_state_is_valid(
+                      runtime.candidates.ik_state) &&
                   terrain_float_bits(runtime.accepted_state.camera_azimuth) !=
                       terrain_float_bits(
                           runtime.working_state.camera_azimuth),
@@ -1441,10 +1499,12 @@ enum HostileRunnerMode
 
 struct TransactionTrace
 {
+    static constexpr int MaximumStageCalls =
+        2 + static_cast<int>(G1CandidateAttemptCapacity) * 17 + 1;
     int runner_calls[G1FrameStageCount] = {};
     int hook_calls[G1FrameStageCount] = {};
-    G1FrameTransactionStage runner_order[G1FrameStageCount] = {};
-    G1FrameTransactionStage hook_order[G1FrameStageCount] = {};
+    G1FrameTransactionStage runner_order[MaximumStageCalls] = {};
+    G1FrameTransactionStage hook_order[MaximumStageCalls] = {};
     int runner_total = 0;
     int hook_total = 0;
     G1FrameTransactionStage runner_outcome_stage = G1FrameStageCount;
@@ -1518,9 +1578,16 @@ static G1FrameAcceptedDiagnostic accepted_diagnostic_candidate(
         accepted.query[dimension] =
             0.001f * static_cast<float>(dimension + 1);
     }
-    accepted.query_database_frame = state.frame_index;
-    accepted.query_range = 0;
-    accepted.selected_database_frame = state.frame_index;
+    accepted.query_database_frame = scratch.query_database_frame >= 0
+        ? scratch.query_database_frame
+        : state.frame_index;
+    accepted.query_range = scratch.query_range >= 0
+        ? scratch.query_range
+        : 0;
+    accepted.selected_database_frame =
+        scratch.selected_database_frame >= 0
+            ? scratch.selected_database_frame
+            : state.frame_index;
     for (int sample = 0; sample < 4; ++sample) {
         const float base = 0.10f * static_cast<float>(sample + 1);
         accepted.terrain_query.values[sample] = base;
@@ -1535,7 +1602,8 @@ static G1FrameAcceptedDiagnostic accepted_diagnostic_candidate(
         state.global_bone_positions(G1_Hips).y;
     accepted.rendered.hips_y =
         state.ik_global_bone_positions(G1_Hips).y;
-    accepted.matching_enabled = true;
+    accepted.matching_enabled =
+        external.tuning.mode != G1_TestSequential;
     accepted.adjustment_enabled = external.tuning.adjustment_enabled;
     accepted.clamping_enabled = external.tuning.clamping_enabled;
     accepted.ik_enabled = external.tuning.ik_enabled;
@@ -1576,6 +1644,9 @@ static void apply_stage_marker(
     case G1FrameStageMatcherSearch:
         state.searched = true;
         break;
+    case G1FrameStageCandidateApply:
+        state.camera_azimuth += 0.002f;
+        break;
     case G1FrameStageInertialization:
         state.incumbent_cost += 0.003f;
         break;
@@ -1594,17 +1665,38 @@ static void apply_stage_marker(
     case G1FrameStageFootprintObservation:
         state.blocked_distance = 0.875f;
         break;
-    case G1FrameStageFirstFootIk:
+    case G1FrameStageRawBegin:
         state.selected_terrain_error += 0.009f;
         break;
-    case G1FrameStageSecondFootIk:
+    case G1FrameStageRawFirstFoot:
         state.clamp_xz += 0.010f;
         break;
-    case G1FrameStageFinalFk:
+    case G1FrameStageRawSecondFoot:
         state.camera_altitude += 0.011f;
         break;
-    case G1FrameStagePoseCertificate:
+    case G1FrameStageRawFinalFk:
         state.camera_distance += 0.012f;
+        break;
+    case G1FrameStageRawPoseCertificate:
+        state.camera_azimuth += 0.013f;
+        break;
+    case G1FrameStageIkBegin:
+        state.selected_terrain_error += 0.014f;
+        break;
+    case G1FrameStageIkFirstFoot:
+        state.camera_distance += 0.015f;
+        break;
+    case G1FrameStageIkSecondFoot:
+        state.adjustment_xz += 0.016f;
+        break;
+    case G1FrameStageIkFinalFk:
+        state.camera_altitude += 0.017f;
+        break;
+    case G1FrameStageIkPoseCertificate:
+        state.camera_distance += 0.018f;
+        break;
+    case G1FrameStageAcceptedFinalize:
+        state.selected_cost += 0.019f;
         break;
     default:
         break;
@@ -1620,7 +1712,7 @@ static G1FrameStageOutcome test_runner(
 {
     const int stage_index = static_cast<int>(stage);
     if (stage_index < 0 || stage_index >= G1FrameStageCount ||
-        trace.runner_total >= G1FrameStageCount) {
+        trace.runner_total >= TransactionTrace::MaximumStageCalls) {
         return G1FrameStageGlobalError;
     }
     ++trace.runner_calls[stage_index];
@@ -1660,7 +1752,28 @@ static G1FrameStageOutcome test_runner(
         scratch.requested_intent.requested_velocity = external.input.move_stick;
         scratch.requested_intent.desired_heading = state.desired_rotation;
         scratch.requested_intent_ready = true;
-    } else if (stage == G1FrameStagePoseCertificate) {
+    } else if (stage == G1FrameStageMatcherSearch) {
+        scratch.matching_scheduled = false;
+        scratch.legacy_search_performed = false;
+        scratch.transition_cost = 0.0f;
+        scratch.recovery_request_ready = false;
+        scratch.slot_zero_record = G1CandidateRecord{};
+        scratch.slot_zero_record.kind = G1CandidateIncumbent;
+        scratch.slot_zero_record.selected_frame = state.frame_index;
+        const int range_stop = external.db->range_stops(0);
+        scratch.slot_zero_record.executed_frame =
+            state.frame_index >= 0 && state.frame_index < range_stop - 1
+                ? state.frame_index + 1
+                : state.frame_index;
+        scratch.slot_zero_record.source_range = 0;
+        scratch.slot_zero_record.selected_cost = state.incumbent_cost;
+        scratch.slot_zero_record.recovery_rank = UINT32_MAX;
+        scratch.slot_zero_record.transitioned = false;
+    } else if (stage == G1FrameStageCandidateApply) {
+        state.frame_index = scratch.active_candidate.executed_frame;
+        state.selected_cost = scratch.active_candidate.selected_cost;
+        state.transitioned = scratch.active_candidate.transitioned;
+    } else if (stage == G1FrameStageAcceptedFinalize) {
         scratch.accepted_diagnostic_candidate =
             accepted_diagnostic_candidate(state, scratch, external);
         if (trace.mutate_support_diagnostic_hips) {
@@ -1679,14 +1792,22 @@ static G1FrameStageOutcome test_runner(
         }
         scratch.accepted_diagnostic_ready = true;
     }
-    if (stage == G1FrameStageFinalFk) {
-        scratch.ik_transaction = G1IkFrameTransaction{};
-        scratch.ik_transaction.initialized = true;
-        scratch.ik_transaction.next_foot = 2U;
-        scratch.ik_transaction.candidate_state = state.ik;
-        scratch.ik_transaction.candidate_result = state.ik_frame;
+    if (stage == G1FrameStageRawFinalFk ||
+        stage == G1FrameStageIkFinalFk) {
+        G1FrameBranchCertificateScratch& certificate =
+            stage == G1FrameStageRawFinalFk
+                ? scratch.raw_certificate
+                : scratch.ik_certificate;
+        certificate = G1FrameBranchCertificateScratch{};
+        certificate.ik_transaction.initialized = true;
+        certificate.ik_transaction.next_foot = 2U;
+        certificate.ik_transaction.candidate_state = state.ik;
+        certificate.ik_transaction.candidate_result = state.ik_frame;
+        certificate.pose_status = G1ClearanceOk;
+        certificate.pose_clearance = state.ik_clearance;
         for (int foot = 0; foot < 2; ++foot) {
-            scratch.ik_transaction.staged_iteration_provenance[foot] =
+            certificate.ik_transaction
+                .staged_iteration_provenance[foot] =
                 state.ik_frame.feet[foot].position.applied
                     ? state.ik_frame.feet[foot]
                           .position.iteration_provenance
@@ -1694,7 +1815,7 @@ static G1FrameStageOutcome test_runner(
         }
     }
     apply_stage_marker(state, stage);
-    if (stage == G1FrameStagePoseCertificate) {
+    if (stage == G1FrameStageAcceptedFinalize) {
         apply_success_tail(state, scratch.prior_safe_stop_latched);
         if (trace.mutate_working_ik_provenance_after_transcript) {
             state.ik_frame.feet[0].position.iteration_provenance =
@@ -1749,7 +1870,7 @@ static G1FrameStageOutcome hostile_runner(
             return G1FrameStageFiniteReject;
         }
     }
-    if (stage == G1FrameStagePoseCertificate) {
+    if (stage == G1FrameStageAcceptedFinalize) {
         if (trace.hostile_mode == HostileRunnerInvalidFinalState) {
             state.search_timer =
                 std::numeric_limits<float>::quiet_NaN();
@@ -1775,7 +1896,7 @@ static G1FrameInjectedOutcome injection_hook(
 {
     const int stage_index = static_cast<int>(stage);
     if (stage_index < 0 || stage_index >= G1FrameStageCount ||
-        trace.hook_total >= G1FrameStageCount) {
+        trace.hook_total >= TransactionTrace::MaximumStageCalls) {
         return G1FrameInjectGlobalError;
     }
     ++trace.hook_calls[stage_index];
@@ -1838,8 +1959,14 @@ struct RuntimeEvidence
 {
     uint64_t accepted = 0U;
     uint64_t working = 0U;
+    uint64_t common = 0U;
+    uint64_t raw = 0U;
+    uint64_t ik = 0U;
     StateStorageIdentities accepted_storage;
     StateStorageIdentities working_storage;
+    StateStorageIdentities common_storage;
+    StateStorageIdentities raw_storage;
+    StateStorageIdentities ik_storage;
     uint64_t publication = 0U;
     uint64_t diagnostic = 0U;
 };
@@ -1849,10 +1976,19 @@ static RuntimeEvidence runtime_evidence(const G1FrameRuntime& runtime)
     RuntimeEvidence output;
     output.accepted = state_logical_digest(runtime.accepted_state);
     output.working = state_logical_digest(runtime.working_state);
+    output.common = state_logical_digest(runtime.candidates.common_state);
+    output.raw = state_logical_digest(runtime.candidates.raw_state);
+    output.ik = state_logical_digest(runtime.candidates.ik_state);
     output.accepted_storage =
         state_storage_identities(runtime.accepted_state);
     output.working_storage =
         state_storage_identities(runtime.working_state);
+    output.common_storage =
+        state_storage_identities(runtime.candidates.common_state);
+    output.raw_storage =
+        state_storage_identities(runtime.candidates.raw_state);
+    output.ik_storage =
+        state_storage_identities(runtime.candidates.ik_state);
     output.publication = publication_logical_digest(runtime.publication);
     output.diagnostic =
         diagnostic_logical_digest(runtime.accepted_diagnostic);
@@ -1876,10 +2012,19 @@ static bool same_runtime_evidence(
 {
     return first.accepted == second.accepted &&
            first.working == second.working &&
+           first.common == second.common &&
+           first.raw == second.raw &&
+           first.ik == second.ik &&
            same_storage_identities(
                first.accepted_storage, second.accepted_storage) &&
            same_storage_identities(
                first.working_storage, second.working_storage) &&
+           same_storage_identities(
+               first.common_storage, second.common_storage) &&
+           same_storage_identities(
+               first.raw_storage, second.raw_storage) &&
+           same_storage_identities(
+               first.ik_storage, second.ik_storage) &&
            first.publication == second.publication &&
            first.diagnostic == second.diagnostic;
 }
@@ -1893,6 +2038,12 @@ static bool same_published_runtime_evidence(
                first.accepted_storage, second.accepted_storage) &&
            same_storage_identities(
                first.working_storage, second.working_storage) &&
+           same_storage_identities(
+               first.common_storage, second.common_storage) &&
+           same_storage_identities(
+               first.raw_storage, second.raw_storage) &&
+           same_storage_identities(
+               first.ik_storage, second.ik_storage) &&
            first.publication == second.publication &&
            first.diagnostic == second.diagnostic;
 }
@@ -1909,6 +2060,16 @@ static void check_finite_preservation(
               same_storage_identities(
                   state_storage_identities(runtime.working_state),
                   before.working_storage) &&
+              same_storage_identities(
+                  state_storage_identities(
+                      runtime.candidates.common_state),
+                  before.common_storage) &&
+              same_storage_identities(
+                  state_storage_identities(runtime.candidates.raw_state),
+                  before.raw_storage) &&
+              same_storage_identities(
+                  state_storage_identities(runtime.candidates.ik_state),
+                  before.ik_storage) &&
               diagnostic_logical_digest(runtime.accepted_diagnostic) ==
                   before.diagnostic,
           message);
@@ -1926,6 +2087,16 @@ static void check_global_preservation(
               same_storage_identities(
                   state_storage_identities(runtime.working_state),
                   before.working_storage) &&
+              same_storage_identities(
+                  state_storage_identities(
+                      runtime.candidates.common_state),
+                  before.common_storage) &&
+              same_storage_identities(
+                  state_storage_identities(runtime.candidates.raw_state),
+                  before.raw_storage) &&
+              same_storage_identities(
+                  state_storage_identities(runtime.candidates.ik_state),
+                  before.ik_storage) &&
               publication_logical_digest(runtime.publication) ==
                   before.publication &&
               diagnostic_logical_digest(runtime.accepted_diagnostic) ==
@@ -1939,7 +2110,12 @@ static void check_preflight_preservation(
     const char* message)
 {
     check_global_preservation(runtime, before, message);
-    check(state_logical_digest(runtime.working_state) == before.working,
+    check(state_logical_digest(runtime.working_state) == before.working &&
+              state_logical_digest(runtime.candidates.common_state) ==
+                  before.common &&
+              state_logical_digest(runtime.candidates.raw_state) ==
+                  before.raw &&
+              state_logical_digest(runtime.candidates.ik_state) == before.ik,
           message);
 }
 
@@ -2309,15 +2485,46 @@ static void build_expected_success(
         value.external.input.move_stick;
     scratch.requested_intent.desired_heading = expected_state.desired_rotation;
     scratch.requested_intent_ready = true;
-    for (int stage = 0; stage < G1FrameStageCount; ++stage) {
-        const G1FrameTransactionStage typed_stage =
-            static_cast<G1FrameTransactionStage>(stage);
-        if (typed_stage == G1FrameStagePoseCertificate) {
-            expected_diagnostic = accepted_diagnostic_candidate(
-                expected_state, scratch, value.external);
-        }
-        apply_stage_marker(expected_state, typed_stage);
+    apply_stage_marker(expected_state, G1FrameStageInputRouteCommand);
+    apply_stage_marker(expected_state, G1FrameStageMatcherSearch);
+    scratch.slot_zero_record = G1CandidateRecord{};
+    scratch.slot_zero_record.kind = G1CandidateIncumbent;
+    scratch.slot_zero_record.selected_frame = expected_state.frame_index;
+    const int range_stop = value.db.range_stops(0);
+    scratch.slot_zero_record.executed_frame =
+        expected_state.frame_index >= 0 &&
+                expected_state.frame_index < range_stop - 1
+            ? expected_state.frame_index + 1
+            : expected_state.frame_index;
+    scratch.slot_zero_record.source_range = 0;
+    scratch.slot_zero_record.selected_cost = expected_state.incumbent_cost;
+    scratch.slot_zero_record.recovery_rank = UINT32_MAX;
+    scratch.slot_zero_record.transitioned = false;
+    scratch.active_candidate = scratch.slot_zero_record;
+    expected_state.frame_index = scratch.active_candidate.executed_frame;
+    expected_state.selected_cost = scratch.active_candidate.selected_cost;
+    expected_state.transitioned = scratch.active_candidate.transitioned;
+    for (int stage = G1FrameStageCandidateApply;
+         stage <= G1FrameStageFootprintObservation;
+         ++stage) {
+        apply_stage_marker(
+            expected_state,
+            static_cast<G1FrameTransactionStage>(stage));
     }
+    const int branch_begin = value.external.tuning.ik_enabled
+        ? G1FrameStageIkBegin
+        : G1FrameStageRawBegin;
+    const int branch_end = value.external.tuning.ik_enabled
+        ? G1FrameStageIkPoseCertificate
+        : G1FrameStageRawPoseCertificate;
+    for (int stage = branch_begin; stage <= branch_end; ++stage) {
+        apply_stage_marker(
+            expected_state,
+            static_cast<G1FrameTransactionStage>(stage));
+    }
+    expected_diagnostic = accepted_diagnostic_candidate(
+        expected_state, scratch, value.external);
+    apply_stage_marker(expected_state, G1FrameStageAcceptedFinalize);
     apply_success_tail(
         expected_state, scratch.prior_safe_stop_latched);
     check(g1_controller_state_is_valid(expected_state),
@@ -2525,6 +2732,9 @@ static void check_success_swap_observability(
 static void test_success_swaps_every_owner_and_publishes_complete_diagnostic()
 {
     fixture value;
+    value.runtime.accepted_state.transitioned = true;
+    check(g1_controller_state_is_valid(value.runtime.accepted_state),
+          "swap oracle starts from a valid transitioned accepted state");
     const uint64_t accepted_before =
         state_logical_digest(value.runtime.accepted_state);
     const StateStorageIdentities accepted_storage_before =
@@ -2561,7 +2771,7 @@ static void test_success_swaps_every_owner_and_publishes_complete_diagnostic()
           error);
     check_stage_trace(
         G1FrameStageCount - 1, G1FrameStageCount - 1,
-        "accepted transaction runs all 12 stages exactly once in order");
+        "accepted transaction runs all 20 stages exactly once in order");
     check(trace.exact_initial_copy_seen,
           "runner observes a complete accepted-to-working copy before any stage mutation");
     check(g1_controller_state_is_valid(value.runtime.accepted_state) &&
@@ -3258,6 +3468,18 @@ static G1FrameTransactionStatus run_storage_preflight_case(
 template<class T>
 using G1StateArrayMember = array1d<T> g1_controller_state::*;
 
+static g1_controller_state& preflight_runtime_state(
+    G1FrameRuntime& runtime, int index)
+{
+    switch (index) {
+    case 0: return runtime.accepted_state;
+    case 1: return runtime.working_state;
+    case 2: return runtime.candidates.common_state;
+    case 3: return runtime.candidates.raw_state;
+    default: return runtime.candidates.ik_state;
+    }
+}
+
 template<class T>
 static void exercise_owner_side_preflight_matrix(
     G1StateArrayMember<T> member,
@@ -3445,6 +3667,83 @@ static void exercise_owner_error_overlap_preflight_matrix(
 }
 
 template<class T>
+static void exercise_workspace_owner_preflight_matrix(
+    G1StateArrayMember<T> member)
+{
+    char error[512] = {};
+    for (int state_index = 2; state_index < 5; ++state_index) {
+        {
+            fixture value;
+            const RuntimeEvidence before =
+                preflight_runtime_evidence(value.runtime);
+            array1d<T>& owner =
+                preflight_runtime_state(value.runtime, state_index).*member;
+            T* const saved = owner.data;
+            owner.data = NULL;
+            const G1FrameTransactionStatus status =
+                run_storage_preflight_case(
+                    value, error, static_cast<int>(sizeof(error)));
+            owner.data = saved;
+            check_restored_storage_preflight_failure(
+                value, before, status,
+                "every null common/raw/IK owner is rejected before any write");
+        }
+        {
+            fixture value;
+            const RuntimeEvidence before =
+                preflight_runtime_evidence(value.runtime);
+            array1d<T>& owner =
+                preflight_runtime_state(value.runtime, state_index).*member;
+            const int saved = owner.size;
+            check(saved > 1, "workspace owner has a reducible canonical size");
+            --owner.size;
+            const G1FrameTransactionStatus status =
+                run_storage_preflight_case(
+                    value, error, static_cast<int>(sizeof(error)));
+            owner.size = saved;
+            check_restored_storage_preflight_failure(
+                value, before, status,
+                "every wrong-size common/raw/IK owner is rejected before any write");
+        }
+        {
+            fixture value;
+            g1_controller_state& state =
+                preflight_runtime_state(value.runtime, state_index);
+            const array1d<T>& owner = state.*member;
+            expect_preflight_global(
+                value,
+                test_runner,
+                value.external,
+                reinterpret_cast<char*>(owner.data),
+                static_cast<int>(sizeof(T)),
+                "error overlap with every common/raw/IK owner is rejected");
+        }
+    }
+
+    for (int target_index = 0; target_index < 5; ++target_index) {
+        for (int peer_index = 0; peer_index < 5; ++peer_index) {
+            if (target_index == peer_index) continue;
+            fixture value;
+            const RuntimeEvidence before =
+                preflight_runtime_evidence(value.runtime);
+            array1d<T>& target =
+                preflight_runtime_state(value.runtime, target_index).*member;
+            const array1d<T>& peer =
+                preflight_runtime_state(value.runtime, peer_index).*member;
+            T* const saved = target.data;
+            target.data = peer.data;
+            const G1FrameTransactionStatus status =
+                run_storage_preflight_case(
+                    value, error, static_cast<int>(sizeof(error)));
+            target.data = saved;
+            check_restored_storage_preflight_failure(
+                value, before, status,
+                "every array owner alias across all five states is rejected before any write");
+        }
+    }
+}
+
+template<class T>
 static void exercise_owner_preflight_matrix(
     G1StateArrayMember<T> member,
     int owner_index)
@@ -3453,6 +3752,7 @@ static void exercise_owner_preflight_matrix(
     exercise_owner_side_preflight_matrix(member, owner_index, true);
     exercise_owner_cross_state_preflight_matrix(member, owner_index);
     exercise_owner_error_overlap_preflight_matrix(member);
+    exercise_workspace_owner_preflight_matrix(member);
 }
 
 static void exercise_all_49_owner_preflight_matrices()
@@ -3948,7 +4248,7 @@ static void test_coordinator_preflight_rejects_invalid_inputs_and_aliases()
               "unmodified valid route fixture is accepted");
         check_stage_trace(
             G1FrameStageCount - 1, G1FrameStageCount - 1,
-            "valid route baseline reaches all 12 stages exactly once");
+            "valid route baseline reaches all 20 stages exactly once");
         check(g1_controller_state_is_valid(
                   value.runtime.accepted_state) &&
                   g1_controller_state_is_valid(
@@ -4006,7 +4306,7 @@ static void test_coordinator_preflight_rejects_invalid_inputs_and_aliases()
 
     exercise_all_49_owner_preflight_matrices();
 
-    for (int overlap = 0; overlap < 4; ++overlap) {
+    for (int overlap = 0; overlap < 7; ++overlap) {
         fixture value;
         char* overlapping_error = NULL;
         int overlapping_capacity = 0;
@@ -4025,6 +4325,24 @@ static void test_coordinator_preflight_rejects_invalid_inputs_and_aliases()
             break;
         case 2:
             overlapping_error = reinterpret_cast<char*>(
+                &value.runtime.candidates.common_state);
+            overlapping_capacity = static_cast<int>(
+                sizeof(value.runtime.candidates.common_state));
+            break;
+        case 3:
+            overlapping_error = reinterpret_cast<char*>(
+                &value.runtime.candidates.raw_state);
+            overlapping_capacity = static_cast<int>(
+                sizeof(value.runtime.candidates.raw_state));
+            break;
+        case 4:
+            overlapping_error = reinterpret_cast<char*>(
+                &value.runtime.candidates.ik_state);
+            overlapping_capacity = static_cast<int>(
+                sizeof(value.runtime.candidates.ik_state));
+            break;
+        case 5:
+            overlapping_error = reinterpret_cast<char*>(
                 &value.runtime.publication);
             overlapping_capacity =
                 static_cast<int>(sizeof(value.runtime.publication));
@@ -4040,6 +4358,64 @@ static void test_coordinator_preflight_rejects_invalid_inputs_and_aliases()
             value, test_runner, value.external,
             overlapping_error, overlapping_capacity,
             "error overlap with any transaction-owned region is rejected");
+    }
+
+    for (int overlap = 0; overlap < 3; ++overlap) {
+        fixture value;
+        const RuntimeEvidence before =
+            preflight_runtime_evidence(value.runtime);
+        G1FrameTransactionTestSeam seam;
+        seam.hook = injection_hook;
+        if (overlap == 0) {
+            seam.certification_trace =
+                reinterpret_cast<G1CandidateCertificationTrace*>(
+                    &value.runtime.accepted_state);
+        } else if (overlap == 1) {
+            seam.certification_trace =
+                reinterpret_cast<G1CandidateCertificationTrace*>(
+                    value.runtime.candidates.raw_state
+                        .curr_bone_positions.data);
+        } else {
+            seam.certification_trace =
+                reinterpret_cast<G1CandidateCertificationTrace*>(
+                    value.db.features.data);
+        }
+        reset_trace();
+        check(g1_frame_transaction_run(
+                  value.runtime,
+                  test_runner,
+                  value.external,
+                  &seam,
+                  error,
+                  static_cast<int>(sizeof(error))) ==
+                  G1FrameTransactionGlobalError &&
+                  trace.runner_total == 0 &&
+                  same_runtime_evidence(
+                      runtime_evidence(value.runtime), before),
+              "aliased certification trace is rejected before reset or runtime mutation");
+    }
+
+    {
+        fixture value;
+        const RuntimeEvidence before =
+            preflight_runtime_evidence(value.runtime);
+        G1CandidateCertificationTrace certification;
+        G1FrameTransactionTestSeam seam;
+        seam.hook = injection_hook;
+        seam.certification_trace = &certification;
+        reset_trace();
+        check(g1_frame_transaction_run(
+                  value.runtime,
+                  test_runner,
+                  value.external,
+                  &seam,
+                  reinterpret_cast<char*>(&certification),
+                  static_cast<int>(sizeof(certification))) ==
+                  G1FrameTransactionGlobalError &&
+                  trace.runner_total == 0 &&
+                  same_runtime_evidence(
+                      runtime_evidence(value.runtime), before),
+              "error storage cannot alias the certification trace before reset");
     }
 }
 
@@ -4164,8 +4540,1807 @@ static void test_safe_stop_latch_lifecycle()
         "post-latch frame resumes the complete ordered transaction exactly once");
 }
 
+static void test_exact_storage_preflight_rejects_within_workspace_alias_before_trace_reset()
+{
+    fixture value;
+    const RuntimeEvidence before =
+        preflight_runtime_evidence(value.runtime);
+    array1d<vec3>& target =
+        value.runtime.candidates.common_state.curr_bone_positions;
+    const array1d<vec3>& peer =
+        value.runtime.candidates.common_state.curr_bone_velocities;
+    vec3* const saved = target.data;
+    target.data = peer.data + 1;
+    check(g1_ik_memory_ranges_overlap(
+              target.data,
+              static_cast<std::size_t>(target.size) * sizeof(vec3),
+              peer.data,
+              static_cast<std::size_t>(peer.size) * sizeof(vec3)),
+          "workspace regression creates a genuine aligned within-state alias");
+
+    G1CandidateCertificationTrace certification;
+    certification.attempt_count = 7U;
+    certification.legacy_traversals = 6U;
+    G1FrameTransactionTestSeam seam;
+    seam.hook = injection_hook;
+    seam.certification_trace = &certification;
+    char error[512] = {};
+    reset_trace();
+    const G1FrameTransactionStatus status = g1_frame_transaction_run(
+        value.runtime,
+        test_runner,
+        value.external,
+        &seam,
+        error,
+        static_cast<int>(sizeof(error)));
+    target.data = saved;
+
+    check(status == G1FrameTransactionGlobalError &&
+              certification.attempt_count == 7U &&
+              certification.legacy_traversals == 6U &&
+              trace.runner_total == 0 && trace.hook_total == 0 &&
+              same_runtime_evidence(
+                  runtime_evidence(value.runtime), before),
+          "within-state workspace aliases are rejected before trace reset, prefix work, or runtime mutation");
+}
+
+static constexpr G1CandidateRecord CandidateA = {
+    G1CandidateLegacy, 64, 65, 1, 1.25f, UINT32_MAX, true};
+static constexpr G1CandidateRecord CandidateB = {
+    G1CandidateRecoveryTransition, 96, 97, 2, 1.50f, 0U, true};
+static constexpr G1CandidateRecord CandidateC = {
+    G1CandidateRecoveryTransition, 128, 129, 3, 1.75f, 1U, true};
+static constexpr G1CandidateRecord Incumbent = {
+    G1CandidateIncumbent, 32, 33, 0, 2.0f, UINT32_MAX, false};
+
+static G1FrameRejectionDiagnostic candidate_finite_rejection(int frame)
+{
+    G1FrameRejectionDiagnostic rejection = finite_rejection();
+    if (frame != CandidateA.selected_frame) {
+        rejection.stop_reason = G1IkStopFootprintBudgetExceeded;
+        rejection.footprint_status = G1FootprintBudgetExceeded;
+    }
+    return rejection;
+}
+
+struct CandidateRunnerControl
+{
+    G1CandidateRecord slot_zero = CandidateA;
+    bool schedule_search = true;
+    int finite_frames[G1CandidateAttemptCapacity] = {};
+    G1FrameTransactionStage finite_stages[G1CandidateAttemptCapacity] = {};
+    uint32_t finite_count = 0U;
+    int global_frames[G1CandidateAttemptCapacity] = {};
+    G1FrameTransactionStage global_stages[G1CandidateAttemptCapacity] = {};
+    uint32_t global_count = 0U;
+    bool poison_a_after_common_copies = false;
+    int stage_calls[G1FrameStageCount] = {};
+    int attempt_frames[G1CandidateAttemptCapacity] = {};
+    uint32_t attempt_count = 0U;
+    int input_calls = 0;
+    int matcher_calls = 0;
+    int camera_calls = 0;
+    int command_calls = 0;
+    int accepted_finalize_calls = 0;
+    int presentation_calls = 0;
+    bool common_copy_boundary_valid = true;
+    bool prior_latch_seen[G1CandidateAttemptCapacity] = {};
+    bool force_search_seen[G1CandidateAttemptCapacity] = {};
+    int route_cursor_seen[G1CandidateAttemptCapacity] = {};
+    uint32_t dt_bits_seen[G1CandidateAttemptCapacity] = {};
+    G1CommandIntent intent_seen[G1CandidateAttemptCapacity] = {};
+    vec3 applied_handoff_seen[G1CandidateAttemptCapacity] = {};
+    vec3 traversal_input_seen[G1CandidateAttemptCapacity] = {};
+    uint64_t scratch_boundary_digest[G1CandidateAttemptCapacity] = {};
+    bool scratch_copy_boundaries_valid = true;
+    uint32_t rejected_a_poison_mask = 0U;
+};
+
+struct CandidateProviderControl
+{
+    G1RecoveryProviderStatus status = G1RecoveryProviderOk;
+    G1RecoveryCandidateSet set;
+    int calls = 0;
+    bool request_seen = false;
+    G1RecoveryRequest request;
+};
+
+static CandidateRunnerControl candidate_runner_control;
+static CandidateProviderControl candidate_provider_control;
+
+static void reset_candidate_controls()
+{
+    candidate_runner_control.slot_zero = CandidateA;
+    candidate_runner_control.schedule_search = true;
+    candidate_runner_control.finite_count = 0U;
+    candidate_runner_control.global_count = 0U;
+    candidate_runner_control.poison_a_after_common_copies = false;
+    candidate_runner_control.attempt_count = 0U;
+    candidate_runner_control.input_calls = 0;
+    candidate_runner_control.matcher_calls = 0;
+    candidate_runner_control.camera_calls = 0;
+    candidate_runner_control.command_calls = 0;
+    candidate_runner_control.accepted_finalize_calls = 0;
+    candidate_runner_control.presentation_calls = 0;
+    candidate_runner_control.common_copy_boundary_valid = true;
+    candidate_runner_control.scratch_copy_boundaries_valid = true;
+    candidate_runner_control.rejected_a_poison_mask = 0U;
+    for (int stage = 0; stage < G1FrameStageCount; ++stage) {
+        candidate_runner_control.stage_calls[stage] = 0;
+    }
+    for (uint32_t index = 0U;
+         index < G1CandidateAttemptCapacity;
+         ++index) {
+        candidate_runner_control.finite_frames[index] = 0;
+        candidate_runner_control.finite_stages[index] =
+            G1FrameStageInputRouteCommand;
+        candidate_runner_control.global_frames[index] = 0;
+        candidate_runner_control.global_stages[index] =
+            G1FrameStageInputRouteCommand;
+        candidate_runner_control.attempt_frames[index] = 0;
+        candidate_runner_control.prior_latch_seen[index] = false;
+        candidate_runner_control.force_search_seen[index] = false;
+        candidate_runner_control.route_cursor_seen[index] = 0;
+        candidate_runner_control.dt_bits_seen[index] = 0U;
+        candidate_runner_control.intent_seen[index].requested_velocity =
+            vec3();
+        candidate_runner_control.intent_seen[index].desired_heading = quat();
+        candidate_runner_control.applied_handoff_seen[index] = vec3();
+        candidate_runner_control.traversal_input_seen[index] = vec3();
+        candidate_runner_control.scratch_boundary_digest[index] = 0U;
+    }
+    candidate_provider_control.status = G1RecoveryProviderOk;
+    g1_frame_recovery_set_reset(candidate_provider_control.set);
+    candidate_provider_control.calls = 0;
+    candidate_provider_control.request_seen = false;
+    g1_frame_recovery_request_reset(candidate_provider_control.request);
+    candidate_provider_control.set.records[0] = CandidateB;
+    candidate_provider_control.set.records[1] = CandidateC;
+    candidate_provider_control.set.records[2] = Incumbent;
+    candidate_provider_control.set.count = 3U;
+    candidate_provider_control.set.work.accelerated_traversals = 1U;
+    candidate_provider_control.set.work.large_bounds_tested = 1U;
+    candidate_provider_control.set.work.small_bounds_tested = 1U;
+    candidate_provider_control.set.work.rows_tested = 2U;
+    candidate_provider_control.set.work.full_scores_materialized = 2U;
+}
+
+static void candidate_finite_at(
+    int frame, G1FrameTransactionStage stage)
+{
+    check(candidate_runner_control.finite_count <
+              G1CandidateAttemptCapacity,
+          "finite candidate control stays within the fixed attempt bound");
+    const uint32_t index = candidate_runner_control.finite_count++;
+    candidate_runner_control.finite_frames[index] = frame;
+    candidate_runner_control.finite_stages[index] = stage;
+}
+
+static void candidate_global_at(
+    int frame, G1FrameTransactionStage stage)
+{
+    check(candidate_runner_control.global_count <
+              G1CandidateAttemptCapacity,
+          "global candidate control stays within the fixed attempt bound");
+    const uint32_t index = candidate_runner_control.global_count++;
+    candidate_runner_control.global_frames[index] = frame;
+    candidate_runner_control.global_stages[index] = stage;
+}
+
+static bool candidate_outcome_matches(
+    const int* frames,
+    const G1FrameTransactionStage* stages,
+    uint32_t count,
+    int frame,
+    G1FrameTransactionStage stage)
+{
+    for (uint32_t index = 0U; index < count; ++index) {
+        if (frames[index] == frame && stages[index] == stage) return true;
+    }
+    return false;
+}
+
+static void make_candidate_database(database& db)
+{
+    make_database(db, 160);
+    db.range_starts.resize(4);
+    db.range_stops.resize(4);
+    db.range_starts(0) = 0;
+    db.range_stops(0) = 48;
+    db.range_starts(1) = 48;
+    db.range_stops(1) = 96;
+    db.range_starts(2) = 96;
+    db.range_stops(2) = 128;
+    db.range_starts(3) = 128;
+    db.range_stops(3) = 160;
+}
+
+static g1_controller_state& candidate_runtime_state(
+    G1FrameRuntime& runtime, int index)
+{
+    switch (index) {
+    case 0: return runtime.accepted_state;
+    case 1: return runtime.working_state;
+    case 2: return runtime.candidates.common_state;
+    case 3: return runtime.candidates.raw_state;
+    default: return runtime.candidates.ik_state;
+    }
+}
+
+struct candidate_fixture
+{
+    database db;
+    terrain_support_set support;
+    scene_pack scene = make_scene();
+    G1FrameRuntime runtime;
+    G1FrameExternalInputs external;
+    G1CandidateCertificationTrace certification;
+
+    candidate_fixture()
+    {
+        make_candidate_database(db);
+        support.values.resize(db.nframes(), 3);
+        support.values.set(-1.0f);
+        G1FrameResetConfig config;
+        config.initial_search_time = 0.375f;
+        config.ik_enabled = false;
+        char error[512] = {};
+        check(g1_frame_runtime_reset(
+                  runtime,
+                  db,
+                  support,
+                  scene,
+                  config,
+                  error,
+                  static_cast<int>(sizeof(error))),
+              error);
+        for (int index = 0; index < 5; ++index) {
+            g1_controller_state& state =
+                candidate_runtime_state(runtime, index);
+            state.frame_index = Incumbent.selected_frame;
+            state.incumbent_cost = Incumbent.selected_cost;
+            state.selected_cost = Incumbent.selected_cost;
+            check(g1_controller_state_is_valid(state),
+                  "candidate fixture starts with five valid independent owners");
+        }
+        external.db = &db;
+        external.support = &support;
+        external.scene = &scene;
+        external.input.move_stick = vec3(0.25f, 0.0f, -0.50f);
+        external.input.gait_target = 0.625f;
+        external.input.desired_strafe = true;
+        external.input.presentation_frame = 73;
+        external.tuning.initial_search_time = config.initial_search_time;
+        external.tuning.dt = 1.0f / 25.0f;
+        external.tuning.ik_enabled = false;
+        external.tuning.effective_terrain_weight = 0.75f;
+    }
+};
+
+static G1RecoveryProviderStatus candidate_provider(
+    G1RecoveryCandidateSet& output,
+    const G1RecoveryRequest& request,
+    char*,
+    int)
+{
+    ++candidate_provider_control.calls;
+    candidate_provider_control.request_seen = true;
+    candidate_provider_control.request = request;
+    if (candidate_provider_control.status != G1RecoveryProviderOk) {
+        return candidate_provider_control.status;
+    }
+    output = candidate_provider_control.set;
+    return G1RecoveryProviderOk;
+}
+
+static bool candidate_materialize_enabled_ik(
+    g1_controller_state& state,
+    const G1FrameExternalInputs& external,
+    char* error,
+    int error_capacity)
+{
+    if (external.db == nullptr || external.scene == nullptr ||
+        !g1_ik_frame_evaluate(
+            state.ik_bone_positions,
+            state.ik_bone_rotations,
+            state.ik,
+            state.adjusted_bone_positions,
+            state.adjusted_bone_rotations,
+            external.db->bone_parents,
+            state.curr_bone_contacts,
+            external.scene->terrain,
+            state.footprint,
+            true,
+            external.tuning.dt,
+            state.ik_frame,
+            error,
+            error_capacity) ||
+        !g1_ik_checked_forward_kinematics(
+            state.ik_global_bone_positions,
+            state.ik_global_bone_rotations,
+            state.ik_bone_positions,
+            state.ik_bone_rotations,
+            external.db->bone_parents,
+            error,
+            error_capacity)) {
+        return false;
+    }
+    std::memcpy(
+        state.ik_candidate_bone_positions.data,
+        state.ik_bone_positions.data,
+        static_cast<std::size_t>(G1_BoneCount) * sizeof(vec3));
+    std::memcpy(
+        state.ik_candidate_bone_rotations.data,
+        state.ik_bone_rotations.data,
+        static_cast<std::size_t>(G1_BoneCount) * sizeof(quat));
+    std::memcpy(
+        state.ik_candidate_global_bone_positions.data,
+        state.ik_global_bone_positions.data,
+        static_cast<std::size_t>(G1_BoneCount) * sizeof(vec3));
+    std::memcpy(
+        state.ik_candidate_global_bone_rotations.data,
+        state.ik_global_bone_rotations.data,
+        static_cast<std::size_t>(G1_BoneCount) * sizeof(quat));
+    if (g1_measure_pose_clearance(
+            state.ik_clearance,
+            g1_pose_clearance_budget(),
+            external.scene->terrain,
+            state.ik_global_bone_positions,
+            state.ik_global_bone_rotations,
+            error,
+            error_capacity) != G1ClearanceOk) {
+        return false;
+    }
+    state.ik_candidate_clearance = state.ik_clearance;
+    state.ik_candidate_clearance_status = G1ClearanceOk;
+    state.ik_candidate_rejected = false;
+    return g1_controller_state_is_valid(state);
+}
+
+static void candidate_fill_certificate(
+    G1FrameBranchCertificateScratch& certificate,
+    const g1_controller_state& state)
+{
+    certificate = G1FrameBranchCertificateScratch{};
+    certificate.ik_transaction.initialized = true;
+    certificate.ik_transaction.next_foot = 2U;
+    certificate.ik_transaction.candidate_state = state.ik;
+    certificate.ik_transaction.candidate_result = state.ik_frame;
+    for (int foot = 0; foot < 2; ++foot) {
+        certificate.ik_transaction.staged_iteration_provenance[foot] =
+            state.ik_frame.feet[foot].position.applied
+                ? state.ik_frame.feet[foot]
+                      .position.iteration_provenance
+                : G1LegIterationNone;
+    }
+    certificate.pose_status = G1ClearanceOk;
+    certificate.pose_clearance = state.ik_clearance;
+}
+
+enum CandidateRejectedPoisonOwner : uint32_t
+{
+    CandidatePoisonPrefix = 1U << 0,
+    CandidatePoisonRoute = 1U << 1,
+    CandidatePoisonTraversal = 1U << 2,
+    CandidatePoisonQuery = 1U << 3,
+    CandidatePoisonContact = 1U << 4,
+    CandidatePoisonFootprint = 1U << 5,
+    CandidatePoisonRecovery = 1U << 6,
+    CandidatePoisonCertificates = 1U << 7,
+    CandidatePoisonRejection = 1U << 8,
+    CandidatePoisonAcceptedDiagnostic = 1U << 9,
+};
+
+static constexpr uint32_t CandidatePoisonAll =
+    CandidatePoisonPrefix |
+    CandidatePoisonRoute |
+    CandidatePoisonTraversal |
+    CandidatePoisonQuery |
+    CandidatePoisonContact |
+    CandidatePoisonFootprint |
+    CandidatePoisonRecovery |
+    CandidatePoisonCertificates |
+    CandidatePoisonRejection |
+    CandidatePoisonAcceptedDiagnostic;
+
+static void candidate_hash_branch_certificate(
+    uint64_t& hash,
+    const G1FrameBranchCertificateScratch& certificate)
+{
+    logical_hash_value(hash, certificate.ik_transaction.initialized);
+    logical_hash_value(hash, certificate.ik_transaction.next_foot);
+    logical_hash_ik_state(
+        hash, certificate.ik_transaction.candidate_state);
+    logical_hash_frame_result(
+        hash, certificate.ik_transaction.candidate_result);
+    for (int foot = 0; foot < 2; ++foot) {
+        logical_hash_value(
+            hash,
+            static_cast<int>(certificate.ik_transaction
+                .staged_iteration_provenance[foot]));
+    }
+    logical_hash_value(
+        hash, static_cast<int>(certificate.pose_status));
+    logical_hash_pose_clearance(hash, certificate.pose_clearance);
+}
+
+static uint64_t candidate_scratch_boundary_digest(
+    const G1FrameTransactionScratch& scratch)
+{
+    uint64_t hash = UINT64_C(1469598103934665603);
+    logical_hash_value(hash, scratch.prior_safe_stop_latched);
+    logical_hash_value(hash, scratch.requested_intent_ready);
+    logical_hash_intent(hash, scratch.requested_intent);
+    logical_hash_value(hash, scratch.commanded_velocity);
+    logical_hash_value(hash, scratch.traversal_input);
+    logical_hash_value(
+        hash, scratch.safe_stop_handoff.applied_velocity);
+    logical_hash_value(
+        hash, scratch.safe_stop_handoff.cancel_planar_inertia);
+    logical_hash_value(hash, scratch.safe_stop_handoff.force_search);
+    logical_hash_value(hash, scratch.force_search);
+    logical_hash_route(hash, scratch.route_sample);
+    logical_hash_traversal(hash, scratch.traversal);
+    for (int dimension = 0; dimension < 31; ++dimension) {
+        logical_hash_value(hash, scratch.query[dimension]);
+    }
+    logical_hash_value(hash, scratch.query_database_frame);
+    logical_hash_value(hash, scratch.query_range);
+    logical_hash_value(hash, scratch.selected_database_frame);
+    logical_hash_centerline(hash, scratch.terrain_query);
+    logical_hash_pose_diagnostic(
+        hash, scratch.raw_selected_diagnostic);
+    logical_hash_pose_diagnostic(
+        hash, scratch.inertialized_diagnostic);
+    logical_hash_pose_diagnostic(
+        hash, scratch.support_retargeted_diagnostic);
+    logical_hash_pose_diagnostic(
+        hash, scratch.rendered_diagnostic);
+    for (int foot = 0; foot < 2; ++foot) {
+        for (int sample = 0;
+             sample < G1CommandTrajectorySampleCount;
+             ++sample) {
+            logical_hash_value(
+                hash, scratch.contact_schedule.contact[foot][sample]);
+        }
+    }
+    logical_hash_value(
+        hash, static_cast<int>(scratch.footprint_status));
+    logical_hash_footprint(hash, scratch.footprint);
+    candidate_hash_branch_certificate(hash, scratch.raw_certificate);
+    candidate_hash_branch_certificate(hash, scratch.ik_certificate);
+    logical_hash_value(
+        hash, static_cast<int>(scratch.rejection_branch));
+    logical_hash_rejection(hash, scratch.rejection);
+    logical_hash_value(hash, scratch.accepted_diagnostic_ready);
+    logical_hash_word(
+        hash,
+        diagnostic_logical_digest(
+            scratch.accepted_diagnostic_candidate));
+    return hash;
+}
+
+static bool candidate_branch_certificate_is_reset(
+    const G1FrameBranchCertificateScratch& certificate)
+{
+    const G1FrameBranchCertificateScratch canonical;
+    return certificate.ik_transaction.initialized ==
+               canonical.ik_transaction.initialized &&
+           certificate.ik_transaction.next_foot ==
+               canonical.ik_transaction.next_foot &&
+           g1_frame_ik_state_equal(
+               certificate.ik_transaction.candidate_state,
+               canonical.ik_transaction.candidate_state) &&
+           g1_frame_ik_result_equal(
+               certificate.ik_transaction.candidate_result,
+               canonical.ik_transaction.candidate_result) &&
+           certificate.ik_transaction.staged_iteration_provenance[0] ==
+               G1LegIterationNone &&
+           certificate.ik_transaction.staged_iteration_provenance[1] ==
+               G1LegIterationNone &&
+           certificate.pose_status == G1ClearanceInvalidInput &&
+           g1_controller_state_pose_clearance_equal(
+               certificate.pose_clearance,
+               canonical.pose_clearance);
+}
+
+static bool candidate_rejection_is_reset(
+    const G1FrameRejectionDiagnostic& rejection)
+{
+    const G1FrameRejectionDiagnostic canonical;
+    return rejection.rejected == canonical.rejected &&
+           rejection.stage == canonical.stage &&
+           rejection.stop_reason == canonical.stop_reason &&
+           rejection.attempted_footprint_available ==
+               canonical.attempted_footprint_available &&
+           rejection.footprint_status == canonical.footprint_status &&
+           g1_frame_footprint_equal(
+               rejection.attempted_footprint,
+               canonical.attempted_footprint) &&
+           rejection.attempted_ik_available ==
+               canonical.attempted_ik_available &&
+           g1_frame_ik_result_equal(
+               rejection.ik_frame, canonical.ik_frame) &&
+           rejection.attempted_pose_available ==
+               canonical.attempted_pose_available &&
+           rejection.pose_status == canonical.pose_status &&
+           g1_controller_state_pose_clearance_equal(
+               rejection.pose_clearance,
+               canonical.pose_clearance);
+}
+
+static bool candidate_private_scratch_is_reset(
+    const G1FrameTransactionScratch& scratch)
+{
+    const G1FrameAcceptedDiagnostic canonical_diagnostic;
+    return candidate_branch_certificate_is_reset(
+               scratch.raw_certificate) &&
+           candidate_branch_certificate_is_reset(
+               scratch.ik_certificate) &&
+           scratch.rejection_branch == G1FrameCertificateNone &&
+           candidate_rejection_is_reset(scratch.rejection) &&
+           !scratch.accepted_diagnostic_ready &&
+           g1_frame_accepted_diagnostic_equal(
+               scratch.accepted_diagnostic_candidate,
+               canonical_diagnostic);
+}
+
+static void candidate_poison_pose_diagnostic(
+    motion_match_pose_diagnostic& value, int& salt)
+{
+    value.hips_y = poison_float(salt++);
+    value.hips_clearance = poison_float(salt++);
+    value.left_toe_clearance = poison_float(salt++);
+    value.right_toe_clearance = poison_float(salt++);
+    value.minimum_clearance = poison_float(salt++);
+}
+
+static void candidate_poison_branch_certificate(
+    G1FrameBranchCertificateScratch& certificate, int& salt)
+{
+    certificate.ik_transaction.initialized = true;
+    certificate.ik_transaction.next_foot = 7U;
+    poison_ik_state(
+        certificate.ik_transaction.candidate_state, salt);
+    poison_frame_result(
+        certificate.ik_transaction.candidate_result, salt);
+    certificate.ik_transaction.staged_iteration_provenance[0] =
+        static_cast<G1LegIterationProvenance>(70 + salt++);
+    certificate.ik_transaction.staged_iteration_provenance[1] =
+        static_cast<G1LegIterationProvenance>(70 + salt++);
+    certificate.pose_status = G1ClearanceInvalidField;
+    poison_pose_clearance(certificate.pose_clearance, salt);
+}
+
+static void candidate_poison_accepted_diagnostic(
+    G1FrameAcceptedDiagnostic& value, int& salt)
+{
+    value.ready = true;
+    value.presentation_frame = -salt++;
+    value.scene_frame = -salt++;
+    value.route.command = poison_vec3(salt);
+    value.route.waypoint = -salt++;
+    value.route.complete = true;
+    value.traversal.blocked = true;
+    value.traversal.walkability_class = -salt++;
+    value.traversal.reason =
+        static_cast<walkability_reason>(70 + salt++);
+    value.traversal.distance = poison_float(salt++);
+    value.traversal.commanded_speed = poison_float(salt++);
+    value.traversal.applied_speed = poison_float(salt++);
+    value.traversal.point = poison_vec3(salt);
+    for (int dimension = 0; dimension < 31; ++dimension) {
+        value.query[dimension] = poison_float(salt++);
+    }
+    value.query_database_frame = -salt++;
+    value.query_range = -salt++;
+    value.selected_database_frame = -salt++;
+    for (int sample = 0; sample < 4; ++sample) {
+        value.terrain_query.values[sample] = poison_float(salt++);
+        value.terrain_query.points[sample] = poison_vec3(salt);
+    }
+    candidate_poison_pose_diagnostic(value.raw_selected, salt);
+    candidate_poison_pose_diagnostic(value.inertialized, salt);
+    candidate_poison_pose_diagnostic(value.support_retargeted, salt);
+    candidate_poison_pose_diagnostic(value.rendered, salt);
+    value.matching_enabled = false;
+    value.adjustment_enabled = false;
+    value.clamping_enabled = false;
+    value.ik_enabled = true;
+    value.effective_terrain_weight = poison_float(salt++);
+}
+
+static uint32_t candidate_poison_private_attempt(
+    G1FrameTransactionScratch& scratch)
+{
+    int salt = 2000;
+    uint32_t mask = 0U;
+
+    scratch.commanded_velocity = poison_vec3(salt);
+    scratch.traversal_input = poison_vec3(salt);
+    scratch.safe_stop_handoff.applied_velocity = poison_vec3(salt);
+    scratch.safe_stop_handoff.cancel_planar_inertia = true;
+    scratch.safe_stop_handoff.force_search = false;
+    scratch.force_search = false;
+    scratch.matching_scheduled = false;
+    scratch.legacy_search_performed = false;
+    scratch.transition_cost = poison_float(salt++);
+    scratch.recovery_request_ready = false;
+    mask |= CandidatePoisonPrefix;
+
+    scratch.route_sample.command = poison_vec3(salt);
+    scratch.route_sample.waypoint = -salt++;
+    scratch.route_sample.complete = true;
+    mask |= CandidatePoisonRoute;
+
+    scratch.traversal.blocked = true;
+    scratch.traversal.walkability_class = -salt++;
+    scratch.traversal.reason =
+        static_cast<walkability_reason>(70 + salt++);
+    scratch.traversal.distance = poison_float(salt++);
+    scratch.traversal.commanded_speed = poison_float(salt++);
+    scratch.traversal.applied_speed = poison_float(salt++);
+    scratch.traversal.point = poison_vec3(salt);
+    mask |= CandidatePoisonTraversal;
+
+    for (int dimension = 0; dimension < 31; ++dimension) {
+        scratch.query[dimension] = poison_float(salt++);
+    }
+    scratch.query_database_frame = -salt++;
+    scratch.query_range = -salt++;
+    scratch.selected_database_frame = -salt++;
+    for (int sample = 0; sample < 4; ++sample) {
+        scratch.terrain_query.values[sample] = poison_float(salt++);
+        scratch.terrain_query.points[sample] = poison_vec3(salt);
+    }
+    candidate_poison_pose_diagnostic(
+        scratch.raw_selected_diagnostic, salt);
+    candidate_poison_pose_diagnostic(
+        scratch.inertialized_diagnostic, salt);
+    candidate_poison_pose_diagnostic(
+        scratch.support_retargeted_diagnostic, salt);
+    candidate_poison_pose_diagnostic(
+        scratch.rendered_diagnostic, salt);
+    mask |= CandidatePoisonQuery;
+
+    for (int foot = 0; foot < 2; ++foot) {
+        for (int sample = 0;
+             sample < G1CommandTrajectorySampleCount;
+             ++sample) {
+            scratch.contact_schedule.contact[foot][sample] =
+                ((salt++ + foot + sample) & 1) != 0;
+        }
+    }
+    mask |= CandidatePoisonContact;
+
+    scratch.footprint_status = G1FootprintInvalidField;
+    poison_footprint(scratch.footprint, salt);
+    mask |= CandidatePoisonFootprint;
+
+    scratch.slot_zero_record = CandidateC;
+    scratch.recovery_request.db = nullptr;
+    for (uint32_t feature = 0U;
+         feature < G1RecoveryFeatureCount;
+         ++feature) {
+        scratch.recovery_request.raw_query[feature] =
+            poison_float(salt++);
+    }
+    scratch.recovery_request.incumbent_frame = -salt++;
+    scratch.recovery_request.legacy_selected_frame = -salt++;
+    scratch.recovery_request.transition_cost = poison_float(salt++);
+    scratch.recovery_request.public_incumbent_cost =
+        poison_float(salt++);
+    scratch.recovery_request.ignore_range_end = -salt++;
+    scratch.recovery_request.ignore_surrounding = -salt++;
+    mask |= CandidatePoisonRecovery;
+
+    candidate_poison_branch_certificate(
+        scratch.raw_certificate, salt);
+    candidate_poison_branch_certificate(
+        scratch.ik_certificate, salt);
+    scratch.rejection_branch =
+        static_cast<G1FrameCertificateBranch>(70U);
+    mask |= CandidatePoisonCertificates;
+
+    scratch.rejection.rejected = true;
+    scratch.rejection.stage =
+        static_cast<G1FrameRejectionStage>(70 + salt++);
+    scratch.rejection.stop_reason =
+        static_cast<G1IkStopReason>(70 + salt++);
+    scratch.rejection.attempted_footprint_available = true;
+    scratch.rejection.footprint_status = G1FootprintInvalidField;
+    poison_footprint(scratch.rejection.attempted_footprint, salt);
+    scratch.rejection.attempted_ik_available = true;
+    poison_frame_result(scratch.rejection.ik_frame, salt);
+    scratch.rejection.attempted_pose_available = true;
+    scratch.rejection.pose_status = G1ClearanceInvalidField;
+    poison_pose_clearance(scratch.rejection.pose_clearance, salt);
+    mask |= CandidatePoisonRejection;
+
+    candidate_poison_accepted_diagnostic(
+        scratch.accepted_diagnostic_candidate, salt);
+    scratch.accepted_diagnostic_ready = true;
+    mask |= CandidatePoisonAcceptedDiagnostic;
+    return mask;
+}
+
+static G1FrameStageOutcome candidate_runner(
+    G1FrameTransactionStage stage,
+    g1_controller_state& state,
+    G1FrameTransactionScratch& scratch,
+    const G1FrameExternalInputs& external,
+    char* error,
+    int error_capacity)
+{
+    const int stage_index = static_cast<int>(stage);
+    if (stage_index < 0 || stage_index >= G1FrameStageCount) {
+        return G1FrameStageGlobalError;
+    }
+    ++candidate_runner_control.stage_calls[stage_index];
+
+    if (stage == G1FrameStageInputRouteCommand) {
+        ++candidate_runner_control.input_calls;
+        ++candidate_runner_control.camera_calls;
+        ++candidate_runner_control.command_calls;
+        scratch.commanded_velocity = external.input.move_stick;
+        if (!g1_ik_safe_stop_handoff(
+                scratch.safe_stop_handoff,
+                scratch.prior_safe_stop_latched,
+                scratch.commanded_velocity,
+                error,
+                error_capacity)) {
+            return G1FrameStageGlobalError;
+        }
+        apply_latch_to_working_state(state, scratch.safe_stop_handoff);
+        scratch.traversal_input = scratch.safe_stop_handoff.applied_velocity;
+        scratch.force_search = scratch.safe_stop_handoff.force_search;
+        scratch.requested_intent.requested_velocity =
+            external.input.move_stick;
+        scratch.requested_intent.desired_heading = state.desired_rotation;
+        scratch.requested_intent_ready = true;
+        state.camera_azimuth += external.input.scripted_azimuth_delta;
+    } else if (stage == G1FrameStageMatcherSearch) {
+        ++candidate_runner_control.matcher_calls;
+        const bool matching_enabled =
+            external.tuning.mode != G1_TestSequential;
+        const bool scheduled = matching_enabled &&
+            candidate_runner_control.schedule_search;
+        scratch.matching_scheduled = scheduled;
+        scratch.legacy_search_performed = scheduled;
+        scratch.transition_cost = 0.25f;
+        scratch.recovery_request_ready = scheduled;
+        scratch.slot_zero_record = scheduled
+            ? candidate_runner_control.slot_zero
+            : Incumbent;
+        state.searched = scheduled;
+        if (scheduled) {
+            scratch.recovery_request = G1RecoveryRequest{};
+            scratch.recovery_request.db = external.db;
+            for (uint32_t feature = 0U;
+                 feature < G1RecoveryFeatureCount;
+                 ++feature) {
+                const float value =
+                    0.001f * static_cast<float>(feature + 1U);
+                scratch.recovery_request.raw_query[feature] = value;
+                scratch.query[feature] = value;
+            }
+            scratch.recovery_request.incumbent_frame =
+                Incumbent.selected_frame;
+            scratch.recovery_request.legacy_selected_frame =
+                scratch.slot_zero_record.selected_frame;
+            scratch.recovery_request.transition_cost =
+                scratch.transition_cost;
+            scratch.recovery_request.public_incumbent_cost =
+                Incumbent.selected_cost;
+            scratch.recovery_request.ignore_range_end = 20;
+            scratch.recovery_request.ignore_surrounding = 20;
+        }
+    } else if (stage == G1FrameStageCandidateApply) {
+        if (candidate_runner_control.attempt_count >=
+            G1CandidateAttemptCapacity) {
+            return G1FrameStageGlobalError;
+        }
+        const uint32_t attempt = candidate_runner_control.attempt_count++;
+        candidate_runner_control.scratch_boundary_digest[attempt] =
+            candidate_scratch_boundary_digest(scratch);
+        candidate_runner_control.scratch_copy_boundaries_valid =
+            candidate_runner_control.scratch_copy_boundaries_valid &&
+            candidate_private_scratch_is_reset(scratch);
+        candidate_runner_control.attempt_frames[attempt] =
+            scratch.active_candidate.selected_frame;
+        candidate_runner_control.prior_latch_seen[attempt] =
+            scratch.prior_safe_stop_latched;
+        candidate_runner_control.force_search_seen[attempt] =
+            scratch.force_search;
+        candidate_runner_control.route_cursor_seen[attempt] =
+            state.route_frames;
+        candidate_runner_control.dt_bits_seen[attempt] =
+            terrain_float_bits(external.tuning.dt);
+        candidate_runner_control.intent_seen[attempt] =
+            scratch.requested_intent;
+        candidate_runner_control.applied_handoff_seen[attempt] =
+            scratch.safe_stop_handoff.applied_velocity;
+        candidate_runner_control.traversal_input_seen[attempt] =
+            scratch.traversal_input;
+        state.frame_index = scratch.active_candidate.executed_frame;
+        state.selected_cost = scratch.active_candidate.selected_cost;
+        state.transitioned = scratch.active_candidate.transitioned;
+        scratch.query_database_frame =
+            scratch.active_candidate.selected_frame;
+        scratch.query_range = scratch.active_candidate.source_range;
+        scratch.selected_database_frame =
+            scratch.active_candidate.selected_frame;
+    } else if (stage == G1FrameStageInertialization) {
+        state.camera_azimuth += 0.01f;
+    } else if (stage == G1FrameStageSimulationUpdate) {
+        state.simulation_position.x += 0.02f;
+    } else if (stage == G1FrameStageSupportObservation) {
+        state.support_observation_now.delta[0] += 0.03f;
+    } else if (stage == G1FrameStageSupportRetarget) {
+        state.adjustment_xz += 0.04f;
+    } else if (stage == G1FrameStageContactUpdate) {
+        state.contact_points(0).x += 0.05f;
+    } else if (stage == G1FrameStageFootprintObservation) {
+        scratch.footprint_status = state.footprint_status;
+        scratch.footprint = state.footprint;
+    } else if (stage == G1FrameStageRawBegin) {
+        candidate_runner_control.common_copy_boundary_valid =
+            candidate_runner_control.common_copy_boundary_valid &&
+            g1_controller_state_is_valid(state);
+    } else if (stage == G1FrameStageRawFinalFk) {
+        candidate_fill_certificate(scratch.raw_certificate, state);
+    } else if (stage == G1FrameStageIkBegin) {
+        candidate_runner_control.common_copy_boundary_valid =
+            candidate_runner_control.common_copy_boundary_valid &&
+            g1_controller_state_is_valid(state);
+        if (!candidate_materialize_enabled_ik(
+                state, external, error, error_capacity)) {
+            return G1FrameStageGlobalError;
+        }
+    } else if (stage == G1FrameStageIkFinalFk) {
+        candidate_fill_certificate(scratch.ik_certificate, state);
+    } else if (stage == G1FrameStageIkPoseCertificate &&
+               candidate_runner_control.poison_a_after_common_copies &&
+               scratch.active_candidate.selected_frame ==
+                   CandidateA.selected_frame) {
+        poison_every_working_value(state);
+        candidate_runner_control.rejected_a_poison_mask =
+            candidate_poison_private_attempt(scratch);
+    } else if (stage == G1FrameStageAcceptedFinalize) {
+        ++candidate_runner_control.accepted_finalize_calls;
+        ++candidate_runner_control.presentation_calls;
+        scratch.accepted_diagnostic_candidate =
+            accepted_diagnostic_candidate(state, scratch, external);
+        scratch.accepted_diagnostic_ready = true;
+        ++state.scene_frame;
+        if (!scratch.prior_safe_stop_latched) state.route_frames += 3;
+        state.camera_distance += 0.125f;
+    }
+
+    const int active_frame = scratch.active_candidate.selected_frame;
+    if (candidate_outcome_matches(
+            candidate_runner_control.global_frames,
+            candidate_runner_control.global_stages,
+            candidate_runner_control.global_count,
+            active_frame,
+            stage)) {
+        return G1FrameStageGlobalError;
+    }
+    if (candidate_outcome_matches(
+            candidate_runner_control.finite_frames,
+            candidate_runner_control.finite_stages,
+            candidate_runner_control.finite_count,
+            active_frame,
+            stage)) {
+        scratch.rejection = candidate_finite_rejection(active_frame);
+        return G1FrameStageFiniteReject;
+    }
+    return G1FrameStageContinue;
+}
+
+static G1FrameTransactionStatus run_candidate_transaction(
+    candidate_fixture& fixture)
+{
+    G1FrameTransactionTestSeam seam;
+    seam.certification_trace = &fixture.certification;
+    char error[512] = {};
+    const G1FrameCoordinator coordinator =
+        static_cast<G1FrameCoordinator>(&g1_frame_transaction_run);
+    return coordinator(
+        fixture.runtime,
+        candidate_runner,
+        candidate_provider,
+        fixture.external,
+        &seam,
+        error,
+        static_cast<int>(sizeof(error)));
+}
+
+static void configure_abc_default()
+{
+    reset_candidate_controls();
+    candidate_finite_at(
+        CandidateA.selected_frame, G1FrameStageIkPoseCertificate);
+}
+
+static bool candidate_record_bits_equal(
+    const G1CandidateRecord& first,
+    const G1CandidateRecord& second)
+{
+    return first.kind == second.kind &&
+           first.selected_frame == second.selected_frame &&
+           first.executed_frame == second.executed_frame &&
+           first.source_range == second.source_range &&
+           terrain_float_bits(first.selected_cost) ==
+               terrain_float_bits(second.selected_cost) &&
+           first.recovery_rank == second.recovery_rank &&
+           first.transitioned == second.transitioned;
+}
+
+static bool candidate_common_diagnostic_fields_equal(
+    const G1FrameAcceptedDiagnostic& first,
+    const G1FrameAcceptedDiagnostic& second)
+{
+    if (first.ready != second.ready ||
+        first.presentation_frame != second.presentation_frame ||
+        first.scene_frame != second.scene_frame ||
+        !g1_frame_vec3_bits_equal(
+            first.route.command, second.route.command) ||
+        first.route.waypoint != second.route.waypoint ||
+        first.route.complete != second.route.complete ||
+        first.traversal.blocked != second.traversal.blocked ||
+        first.traversal.walkability_class !=
+            second.traversal.walkability_class ||
+        first.traversal.reason != second.traversal.reason ||
+        !g1_frame_float_bits_equal(
+            first.traversal.distance,
+            second.traversal.distance) ||
+        !g1_frame_float_bits_equal(
+            first.traversal.commanded_speed,
+            second.traversal.commanded_speed) ||
+        !g1_frame_float_bits_equal(
+            first.traversal.applied_speed,
+            second.traversal.applied_speed) ||
+        !g1_frame_vec3_bits_equal(
+            first.traversal.point,
+            second.traversal.point) ||
+        first.query_database_frame != second.query_database_frame ||
+        first.query_range != second.query_range ||
+        first.selected_database_frame !=
+            second.selected_database_frame ||
+        !g1_frame_pose_diagnostic_equal(
+            first.raw_selected, second.raw_selected) ||
+        !g1_frame_pose_diagnostic_equal(
+            first.inertialized, second.inertialized) ||
+        !g1_frame_pose_diagnostic_equal(
+            first.support_retargeted,
+            second.support_retargeted) ||
+        first.matching_enabled != second.matching_enabled ||
+        first.adjustment_enabled != second.adjustment_enabled ||
+        first.clamping_enabled != second.clamping_enabled ||
+        !g1_frame_float_bits_equal(
+            first.effective_terrain_weight,
+            second.effective_terrain_weight)) {
+        return false;
+    }
+    for (int dimension = 0; dimension < 31; ++dimension) {
+        if (!g1_frame_float_bits_equal(
+                first.query[dimension],
+                second.query[dimension])) {
+            return false;
+        }
+    }
+    for (int sample = 0; sample < 4; ++sample) {
+        if (!g1_frame_float_bits_equal(
+                first.terrain_query.values[sample],
+                second.terrain_query.values[sample]) ||
+            !g1_frame_vec3_bits_equal(
+                first.terrain_query.points[sample],
+                second.terrain_query.points[sample])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool candidate_mode_common_fields_equal(
+    const candidate_fixture& raw_mode,
+    const candidate_fixture& ik_mode)
+{
+    const g1_controller_state& raw = raw_mode.runtime.accepted_state;
+    const g1_controller_state& ik = ik_mode.runtime.accepted_state;
+    return candidate_record_bits_equal(
+               raw_mode.certification.attempts[1].candidate,
+               ik_mode.certification.attempts[1].candidate) &&
+           raw.frame_index == ik.frame_index &&
+           raw.frame_index == CandidateB.executed_frame &&
+           raw.transitioned == ik.transitioned &&
+           raw.transitioned &&
+           g1_frame_float_bits_equal(
+               raw.selected_cost, ik.selected_cost) &&
+           g1_frame_float_bits_equal(
+               raw.selected_cost, CandidateB.selected_cost) &&
+           g1_frame_support_state_equal(raw.support, ik.support) &&
+           g1_frame_support_observation_equal(
+               raw.support_observation_now,
+               ik.support_observation_now) &&
+           g1_frame_float_bits_equal(
+               raw.simulation_position.x,
+               ik.simulation_position.x) &&
+           g1_frame_float_bits_equal(
+               raw.simulation_position.z,
+               ik.simulation_position.z) &&
+           raw.route_index == ik.route_index &&
+           raw.route_waypoint == ik.route_waypoint &&
+           raw.route_frames == ik.route_frames &&
+           g1_frame_command_equal(raw.command, ik.command) &&
+           g1_frame_ik_state_equal(raw.ik, ik.ik) &&
+           candidate_common_diagnostic_fields_equal(
+               raw_mode.runtime.accepted_diagnostic,
+               ik_mode.runtime.accepted_diagnostic);
+}
+
+static bool candidate_visible_projection_matches_branch(
+    const g1_controller_state& visible,
+    const g1_controller_state& branch)
+{
+    return g1_frame_array_values_equal(
+               visible.ik_bone_positions,
+               branch.ik_bone_positions) &&
+           g1_frame_array_values_equal(
+               visible.ik_bone_rotations,
+               branch.ik_bone_rotations) &&
+           g1_frame_array_values_equal(
+               visible.ik_global_bone_positions,
+               branch.ik_global_bone_positions) &&
+           g1_frame_array_values_equal(
+               visible.ik_global_bone_rotations,
+               branch.ik_global_bone_rotations) &&
+           g1_frame_array_values_equal(
+               visible.ik_candidate_bone_positions,
+               branch.ik_candidate_bone_positions) &&
+           g1_frame_array_values_equal(
+               visible.ik_candidate_bone_rotations,
+               branch.ik_candidate_bone_rotations) &&
+           g1_frame_array_values_equal(
+               visible.ik_candidate_global_bone_positions,
+               branch.ik_candidate_global_bone_positions) &&
+           g1_frame_array_values_equal(
+               visible.ik_candidate_global_bone_rotations,
+               branch.ik_candidate_global_bone_rotations) &&
+           g1_controller_state_pose_clearance_equal(
+               visible.ik_clearance,
+               branch.ik_clearance) &&
+           g1_controller_state_pose_clearance_equal(
+               visible.ik_candidate_clearance,
+               branch.ik_candidate_clearance) &&
+           visible.ik_candidate_clearance_status ==
+               branch.ik_candidate_clearance_status &&
+           visible.ik_candidate_rejected ==
+               branch.ik_candidate_rejected &&
+           g1_frame_ik_result_equal(
+               visible.ik_frame, branch.ik_frame);
+}
+
+static void check_abc_trace(
+    const candidate_fixture& fixture,
+    const char* message)
+{
+    const G1CandidateCertificationTrace& value = fixture.certification;
+    check(value.attempt_count == 2U &&
+              value.legacy_traversals == 1U &&
+              value.recovery_provider_calls == 1U &&
+              value.common_evaluations == 2U &&
+              value.raw_evaluations == 2U &&
+              value.ik_evaluations == 2U &&
+              candidate_record_bits_equal(
+                  value.attempts[0].candidate, CandidateA) &&
+              candidate_record_bits_equal(
+                  value.attempts[1].candidate, CandidateB) &&
+              value.attempts[0].score_owner == G1CandidateScoreLegacy &&
+              value.attempts[1].score_owner ==
+                  G1CandidateScoreStrictRecovery &&
+              value.attempts[0].common ==
+                  G1CandidateDispositionAccepted &&
+              value.attempts[0].raw ==
+                  G1CandidateDispositionAccepted &&
+              value.attempts[0].ik ==
+                  G1CandidateDispositionFiniteRejected &&
+              value.attempts[1].common ==
+                  G1CandidateDispositionAccepted &&
+              value.attempts[1].raw ==
+                  G1CandidateDispositionAccepted &&
+              value.attempts[1].ik ==
+                  G1CandidateDispositionAccepted,
+          message);
+}
+
+static void run_abc_mode(candidate_fixture& fixture, bool ik_enabled)
+{
+    configure_abc_default();
+    fixture.external.tuning.ik_enabled = ik_enabled;
+    check(run_candidate_transaction(fixture) ==
+              G1FrameTransactionAccepted,
+          "A finite-rejects, B dual-accepts, and the transaction succeeds");
+    check_abc_trace(
+        fixture,
+        "A/B trace has exact order, ownership, phase dispositions, and work counts");
+    check(candidate_provider_control.calls == 1 &&
+              candidate_runner_control.attempt_count == 2U &&
+              candidate_runner_control.attempt_frames[0] ==
+                  CandidateA.selected_frame &&
+              candidate_runner_control.attempt_frames[1] ==
+                  CandidateB.selected_frame &&
+              candidate_runner_control.common_copy_boundary_valid,
+          "A/B execution stops before C and every common copy boundary is valid");
+}
+
+static void test_abc_selects_b_in_both_modes_and_stops_before_c()
+{
+    candidate_fixture raw_mode;
+    run_abc_mode(raw_mode, false);
+    candidate_fixture ik_mode;
+    run_abc_mode(ik_mode, true);
+
+    const g1_controller_state& raw = raw_mode.runtime.accepted_state;
+    const g1_controller_state& ik = ik_mode.runtime.accepted_state;
+    check(candidate_mode_common_fields_equal(raw_mode, ik_mode),
+          "A/B selection is mode-independent across the complete required common-field oracle");
+    check(candidate_visible_projection_matches_branch(
+              raw, raw_mode.runtime.candidates.raw_state) &&
+              g1_frame_ik_result_is_canonical(raw.ik_frame),
+          "IK-off publishes the complete canonical raw branch projection");
+    check(candidate_visible_projection_matches_branch(
+              ik, ik_mode.runtime.candidates.ik_state) &&
+              ik.ik_frame.applied &&
+              !ik.ik_frame.safe_stop_requested,
+          "IK-on publishes the complete accepted IK branch projection");
+}
+
+static void test_raw_rejection_short_circuits_ik_and_continues()
+{
+    candidate_fixture fixture;
+    reset_candidate_controls();
+    candidate_finite_at(
+        CandidateA.selected_frame, G1FrameStageRawPoseCertificate);
+    check(run_candidate_transaction(fixture) ==
+              G1FrameTransactionAccepted,
+          "raw rejection of A continues to accepted B");
+    check(fixture.certification.attempt_count == 2U &&
+              fixture.certification.attempts[0].common ==
+                  G1CandidateDispositionAccepted &&
+              fixture.certification.attempts[0].raw ==
+                  G1CandidateDispositionFiniteRejected &&
+              fixture.certification.attempts[0].ik ==
+                  G1CandidateDispositionNotRun &&
+              fixture.certification.ik_evaluations == 1U &&
+              candidate_runner_control.stage_calls[G1FrameStageIkBegin] == 1,
+          "raw finite rejection runs no IK work for A but B still evaluates");
+    check(!g1_frame_candidate_dual_outcome_is_valid(
+              G1CandidateDispositionAccepted,
+              G1CandidateDispositionFiniteRejected,
+              G1CandidateDispositionAccepted),
+          "forged raw-fail/IK-pass disposition cannot be selected");
+}
+
+static void test_raw_pass_ik_reject_cannot_be_selected()
+{
+    candidate_fixture fixture;
+    run_abc_mode(fixture, false);
+    check(fixture.runtime.accepted_state.frame_index ==
+              CandidateB.executed_frame &&
+              fixture.certification.attempts[0].raw ==
+                  G1CandidateDispositionAccepted &&
+              fixture.certification.attempts[0].ik ==
+                  G1CandidateDispositionFiniteRejected,
+          "raw-pass/IK-reject A cannot win before dual-certified B");
+}
+
+static void test_attempt_order_and_incumbent_deduplication()
+{
+    candidate_fixture fixture;
+    reset_candidate_controls();
+    candidate_finite_at(
+        CandidateA.selected_frame, G1FrameStageIkPoseCertificate);
+    candidate_finite_at(
+        CandidateB.selected_frame, G1FrameStageIkPoseCertificate);
+    candidate_finite_at(
+        CandidateC.selected_frame, G1FrameStageIkPoseCertificate);
+    check(run_candidate_transaction(fixture) ==
+              G1FrameTransactionAccepted,
+          "ordered tail reaches the deduplicated incumbent after three finite candidates");
+    check(fixture.certification.attempt_count == 4U &&
+              candidate_record_bits_equal(
+                  fixture.certification.attempts[0].candidate, CandidateA) &&
+              candidate_record_bits_equal(
+                  fixture.certification.attempts[1].candidate, CandidateB) &&
+              candidate_record_bits_equal(
+                  fixture.certification.attempts[2].candidate, CandidateC) &&
+              candidate_record_bits_equal(
+                  fixture.certification.attempts[3].candidate, Incumbent) &&
+              fixture.certification.attempts[3].score_owner ==
+                  G1CandidateScoreIncumbent,
+          "attempt order is legacy, ranked transitions, then one incumbent");
+    for (uint32_t index = 0U;
+         index < fixture.certification.attempt_count;
+         ++index) {
+        check(fixture.certification.attempts[index].score_owner !=
+                  G1CandidateScoreUnassigned,
+              "no materialized attempt retains unassigned score ownership");
+    }
+}
+
+static void test_rejected_attempt_storage_cannot_seed_next_attempt()
+{
+    candidate_fixture retry;
+    const StateStorageIdentities retry_working_before =
+        state_storage_identities(retry.runtime.working_state);
+    configure_abc_default();
+    candidate_runner_control.poison_a_after_common_copies = true;
+    check(run_candidate_transaction(retry) ==
+              G1FrameTransactionAccepted,
+          "poisoned rejected A is discarded before B");
+    check(candidate_runner_control.common_copy_boundary_valid &&
+              candidate_runner_control.rejected_a_poison_mask ==
+                  CandidatePoisonAll &&
+              candidate_runner_control.scratch_copy_boundaries_valid,
+          "rejected A poisons every private scratch owner and B starts from a fresh scratch copy");
+    const uint64_t retry_b_scratch_boundary =
+        candidate_runner_control.scratch_boundary_digest[1];
+    const G1CommandIntent retry_b_intent =
+        candidate_runner_control.intent_seen[1];
+    const vec3 retry_b_applied_handoff =
+        candidate_runner_control.applied_handoff_seen[1];
+    const vec3 retry_b_traversal_input =
+        candidate_runner_control.traversal_input_seen[1];
+    const bool retry_b_prior_latch =
+        candidate_runner_control.prior_latch_seen[1];
+    const bool retry_b_force_search =
+        candidate_runner_control.force_search_seen[1];
+    const int retry_b_route_cursor =
+        candidate_runner_control.route_cursor_seen[1];
+    const uint32_t retry_b_dt_bits =
+        candidate_runner_control.dt_bits_seen[1];
+    check(candidate_provider_control.request_seen &&
+              candidate_provider_control.request.db == &retry.db &&
+              candidate_provider_control.request.incumbent_frame ==
+                  Incumbent.selected_frame &&
+              candidate_provider_control.request.legacy_selected_frame ==
+                  CandidateA.selected_frame &&
+              terrain_float_bits(
+                  candidate_provider_control.request
+                      .public_incumbent_cost) ==
+                  terrain_float_bits(Incumbent.selected_cost) &&
+              terrain_float_bits(
+                  candidate_provider_control.request.raw_query[0]) ==
+                  terrain_float_bits(0.001f),
+          "provider receives the immutable prefix request rather than rejected-attempt poison");
+
+    candidate_fixture direct;
+    const StateStorageIdentities direct_working_before =
+        state_storage_identities(direct.runtime.working_state);
+    reset_candidate_controls();
+    candidate_runner_control.slot_zero = CandidateB;
+    g1_frame_recovery_set_reset(candidate_provider_control.set);
+    check(run_candidate_transaction(direct) ==
+              G1FrameTransactionAccepted,
+          "direct B-only baseline succeeds");
+
+    check(retry_b_scratch_boundary ==
+              candidate_runner_control.scratch_boundary_digest[0] &&
+              same_intent_bits(
+                  retry_b_intent,
+                  candidate_runner_control.intent_seen[0]) &&
+              g1_frame_vec3_bits_equal(
+                  retry_b_applied_handoff,
+                  candidate_runner_control.applied_handoff_seen[0]) &&
+              g1_frame_vec3_bits_equal(
+                  retry_b_traversal_input,
+                  candidate_runner_control.traversal_input_seen[0]) &&
+              retry_b_prior_latch ==
+                  candidate_runner_control.prior_latch_seen[0] &&
+              retry_b_force_search ==
+                  candidate_runner_control.force_search_seen[0] &&
+              retry_b_route_cursor ==
+                  candidate_runner_control.route_cursor_seen[0] &&
+              retry_b_dt_bits ==
+                  candidate_runner_control.dt_bits_seen[0] &&
+              candidate_runner_control.scratch_copy_boundaries_valid,
+          "B after rejected A receives the same complete fresh attempt boundary as direct B");
+
+    check(state_logical_digest(retry.runtime.accepted_state) ==
+              state_logical_digest(direct.runtime.accepted_state) &&
+              diagnostic_logical_digest(retry.runtime.accepted_diagnostic) ==
+                  diagnostic_logical_digest(
+                      direct.runtime.accepted_diagnostic) &&
+              publication_logical_digest(retry.runtime.publication) ==
+                  publication_logical_digest(direct.runtime.publication),
+          "B after poisoned A bit-matches direct B across all logical owners");
+    check(same_storage_identities(
+              state_storage_identities(retry.runtime.accepted_state),
+              retry_working_before) &&
+              same_storage_identities(
+                  state_storage_identities(direct.runtime.accepted_state),
+                  direct_working_before),
+          "both paths preserve their exact 49-owner working destinations through commit");
+}
+
+static void test_contact_phase_is_not_a_rank_or_admission_gate()
+{
+    candidate_fixture fixture;
+    reset_candidate_controls();
+    check(run_candidate_transaction(fixture) ==
+              G1FrameTransactionAccepted &&
+              fixture.runtime.accepted_state.frame_index ==
+                  CandidateA.executed_frame &&
+              candidate_provider_control.calls == 0 &&
+              candidate_runner_control
+                      .stage_calls[G1FrameStageContactUpdate] == 1 &&
+              fixture.certification.attempt_count == 1U,
+          "contact update is ordinary common work and does not reorder or admit candidates");
+}
+
+static void test_hidden_ik_commits_in_both_public_modes()
+{
+    candidate_fixture raw_mode;
+    run_abc_mode(raw_mode, false);
+    candidate_fixture ik_mode;
+    run_abc_mode(ik_mode, true);
+    check(g1_frame_ik_state_equal(
+              raw_mode.runtime.accepted_state.ik,
+              raw_mode.runtime.candidates.ik_state.ik) &&
+              g1_frame_ik_state_equal(
+                  ik_mode.runtime.accepted_state.ik,
+                  ik_mode.runtime.candidates.ik_state.ik) &&
+              g1_frame_ik_state_equal(
+                  raw_mode.runtime.accepted_state.ik,
+                  ik_mode.runtime.accepted_state.ik),
+          "the successful IK branch commits hidden state in both public modes");
+    check(g1_frame_ik_result_is_canonical(
+              raw_mode.runtime.accepted_state.ik_frame) &&
+              ik_mode.runtime.accepted_state.ik_frame.applied,
+          "hidden state ownership does not leak the enabled result into IK-off publication");
+}
+
+static void test_reset_switch_and_multiframe_hidden_state_are_paired()
+{
+    candidate_fixture artifacts;
+    G1FrameRuntime reset_off;
+    G1FrameRuntime reset_on;
+    G1FrameResetConfig off_config;
+    off_config.initial_search_time = 0.375f;
+    off_config.ik_enabled = false;
+    G1FrameResetConfig on_config = off_config;
+    on_config.ik_enabled = true;
+    char error[512] = {};
+    check(g1_frame_runtime_reset(
+              reset_off,
+              artifacts.db,
+              artifacts.support,
+              artifacts.scene,
+              off_config,
+              error,
+              static_cast<int>(sizeof(error))) &&
+              g1_frame_runtime_reset(
+                  reset_on,
+                  artifacts.db,
+                  artifacts.support,
+                  artifacts.scene,
+                  on_config,
+                  error,
+                  static_cast<int>(sizeof(error))),
+          error);
+    for (int index = 0; index < 5; ++index) {
+        check(g1_frame_controller_states_equal(
+                  candidate_runtime_state(reset_off, index),
+                  candidate_runtime_state(reset_on, index)),
+              "mode-independent reset pairs every visible and hidden workspace state");
+    }
+
+    candidate_fixture raw_frames;
+    candidate_fixture ik_frames;
+    for (int frame = 0; frame < 2; ++frame) {
+        if (frame == 0) {
+            run_abc_mode(raw_frames, false);
+            run_abc_mode(ik_frames, true);
+        } else {
+            reset_candidate_controls();
+            candidate_runner_control.slot_zero = CandidateC;
+            raw_frames.external.tuning.ik_enabled = false;
+            check(run_candidate_transaction(raw_frames) ==
+                      G1FrameTransactionAccepted,
+                  "second raw-mode frame accepts its fresh scheduled slot zero");
+            reset_candidate_controls();
+            candidate_runner_control.slot_zero = CandidateC;
+            ik_frames.external.tuning.ik_enabled = true;
+            check(run_candidate_transaction(ik_frames) ==
+                      G1FrameTransactionAccepted,
+                  "second IK-mode frame accepts its fresh scheduled slot zero");
+        }
+        check(g1_frame_ik_state_equal(
+                  raw_frames.runtime.accepted_state.ik,
+                  ik_frames.runtime.accepted_state.ik),
+              "hidden IK history remains paired across consecutive public-mode frames");
+    }
+}
+
+static void test_exact_dt_intent_and_heading_are_immutable_per_attempt()
+{
+    candidate_fixture fixture;
+    run_abc_mode(fixture, false);
+    for (uint32_t attempt = 0U; attempt < 2U; ++attempt) {
+        check(candidate_runner_control.dt_bits_seen[attempt] ==
+                  terrain_float_bits(1.0f / 25.0f) &&
+                  same_intent_bits(
+                      candidate_runner_control.intent_seen[attempt],
+                      fixture.runtime.publication.requested_intent) &&
+                  g1_frame_vec3_bits_equal(
+                      candidate_runner_control
+                          .applied_handoff_seen[attempt],
+                      fixture.external.input.move_stick) &&
+                  g1_frame_vec3_bits_equal(
+                      candidate_runner_control
+                          .traversal_input_seen[attempt],
+                      fixture.external.input.move_stick),
+              "every attempt sees exact 25 Hz requested, applied, traversal, and heading bits frozen by the prefix");
+    }
+}
+
+static void test_prior_safe_stop_latch_is_shared_and_consumed_once_on_winner()
+{
+    candidate_fixture fixture;
+    fixture.runtime.accepted_state.simulation_velocity =
+        vec3(0.75f, -0.50f, -0.25f);
+    fixture.runtime.accepted_state.simulation_acceleration =
+        vec3(-0.125f, 0.625f, 0.375f);
+    fixture.runtime.accepted_state.route_frames = 9;
+    check(g1_controller_state_is_valid(fixture.runtime.accepted_state),
+          "incoming latch fixture remains valid");
+
+    reset_candidate_controls();
+    candidate_runner_control.schedule_search = false;
+    candidate_finite_at(
+        Incumbent.selected_frame, G1FrameStageIkPoseCertificate);
+    check(run_candidate_transaction(fixture) ==
+              G1FrameTransactionFiniteRejected &&
+              fixture.runtime.publication.ik_safe_stop_latched,
+          "a finite incumbent attempt establishes an authentic incoming latch");
+
+    run_abc_mode(fixture, false);
+    check(candidate_runner_control.prior_latch_seen[0] &&
+              candidate_runner_control.prior_latch_seen[1] &&
+              candidate_runner_control.force_search_seen[0] &&
+              candidate_runner_control.force_search_seen[1] &&
+              candidate_runner_control.route_cursor_seen[0] == 9 &&
+              candidate_runner_control.route_cursor_seen[1] == 9 &&
+              fixture.runtime.accepted_state.route_frames == 9 &&
+              terrain_float_bits(
+                  fixture.runtime.accepted_state.simulation_velocity.x) == 0U &&
+              terrain_float_bits(
+                  fixture.runtime.accepted_state.simulation_velocity.z) == 0U &&
+              g1_frame_vec3_bits_equal(
+                  candidate_runner_control.applied_handoff_seen[0],
+                  vec3()) &&
+              g1_frame_vec3_bits_equal(
+                  candidate_runner_control.applied_handoff_seen[1],
+                  vec3()) &&
+              g1_frame_vec3_bits_equal(
+                  candidate_runner_control.traversal_input_seen[0],
+                  vec3()) &&
+              g1_frame_vec3_bits_equal(
+                  candidate_runner_control.traversal_input_seen[1],
+                  vec3()) &&
+              !fixture.runtime.publication.ik_safe_stop_latched &&
+              candidate_runner_control.accepted_finalize_calls == 1,
+          "all attempts share the incoming latch and only B consumes it through one frozen winner finalize");
+}
+
+static void test_prefix_camera_route_and_command_work_runs_once()
+{
+    candidate_fixture fixture;
+    run_abc_mode(fixture, false);
+    check(candidate_runner_control.input_calls == 1 &&
+              candidate_runner_control.matcher_calls == 1 &&
+              candidate_runner_control.camera_calls == 1 &&
+              candidate_runner_control.command_calls == 1 &&
+              candidate_runner_control.accepted_finalize_calls == 1 &&
+              candidate_runner_control.presentation_calls == 1 &&
+              candidate_provider_control.calls == 1 &&
+              candidate_runner_control.attempt_count == 2U,
+          "prefix, provider, winner finalize, and presentation each execute only at their bounded owner");
+}
+
+static void configure_seven_record_tail()
+{
+    g1_frame_recovery_set_reset(candidate_provider_control.set);
+    for (uint32_t rank = 0U;
+         rank < G1RecoveryTransitionCapacity;
+         ++rank) {
+        G1CandidateRecord record;
+        record.kind = G1CandidateRecoveryTransition;
+        record.selected_frame = 52 + static_cast<int>(rank);
+        record.executed_frame = record.selected_frame + 1;
+        record.source_range = 1;
+        record.selected_cost = 1.30f +
+            0.05f * static_cast<float>(rank);
+        record.recovery_rank = rank;
+        record.transitioned = true;
+        candidate_provider_control.set.records[rank] = record;
+    }
+    candidate_provider_control
+        .set.records[G1RecoveryTransitionCapacity] = Incumbent;
+    candidate_provider_control.set.count = G1RecoveryTailCapacity;
+    candidate_provider_control.set.work.accelerated_traversals = 1U;
+    candidate_provider_control.set.work.large_bounds_tested = 1U;
+    candidate_provider_control.set.work.small_bounds_tested = 1U;
+    candidate_provider_control.set.work.rows_tested =
+        G1RecoveryTransitionCapacity;
+    candidate_provider_control.set.work.full_scores_materialized =
+        G1RecoveryTransitionCapacity;
+}
+
+static void test_lazy_provider_and_attempt_work_bounds()
+{
+    {
+        reset_candidate_controls();
+        candidate_fixture fixture;
+        fixture.certification.attempt_count = 7U;
+        G1FrameTransactionTestSeam seam;
+        seam.certification_trace = &fixture.certification;
+        char error[512] = {};
+        const G1FrameCoordinator coordinator =
+            static_cast<G1FrameCoordinator>(&g1_frame_transaction_run);
+        check(coordinator(
+                  fixture.runtime,
+                  candidate_runner,
+                  nullptr,
+                  fixture.external,
+                  &seam,
+                  error,
+                  static_cast<int>(sizeof(error))) ==
+                  G1FrameTransactionGlobalError &&
+                  fixture.certification.attempt_count == 7U &&
+                  candidate_runner_control.input_calls == 0,
+              "null lazy dependency is rejected before trace reset or prefix work");
+    }
+    {
+        candidate_fixture fixture;
+        reset_candidate_controls();
+        check(run_candidate_transaction(fixture) ==
+                  G1FrameTransactionAccepted &&
+                  candidate_provider_control.calls == 0 &&
+                  fixture.certification.attempt_count == 1U,
+              "accepted slot zero performs no lazy provider work");
+    }
+    {
+        candidate_fixture fixture;
+        reset_candidate_controls();
+        candidate_global_at(
+            CandidateA.selected_frame, G1FrameStageCandidateApply);
+        check(run_candidate_transaction(fixture) ==
+                  G1FrameTransactionGlobalError &&
+                  candidate_provider_control.calls == 0 &&
+                  fixture.certification.attempt_count == 1U,
+              "global slot zero stops before provider construction");
+    }
+    {
+        candidate_fixture fixture;
+        reset_candidate_controls();
+        candidate_finite_at(-1, G1FrameStageInputRouteCommand);
+        check(run_candidate_transaction(fixture) ==
+                  G1FrameTransactionFiniteRejected &&
+                  candidate_provider_control.calls == 0 &&
+                  fixture.certification.attempt_count == 0U,
+              "finite prefix rejection publishes once without provider or attempt work");
+    }
+    {
+        candidate_fixture fixture;
+        reset_candidate_controls();
+        candidate_runner_control.schedule_search = false;
+        candidate_finite_at(
+            Incumbent.selected_frame, G1FrameStageIkPoseCertificate);
+        check(run_candidate_transaction(fixture) ==
+                  G1FrameTransactionFiniteRejected &&
+                  candidate_provider_control.calls == 0 &&
+                  fixture.certification.legacy_traversals == 0U &&
+                  fixture.certification.attempt_count == 1U,
+              "unscheduled incumbent exhaustion never calls recovery");
+    }
+    {
+        candidate_fixture fixture;
+        reset_candidate_controls();
+        fixture.external.tuning.mode = G1_TestSequential;
+        fixture.external.tuning.frame_limit = 1;
+        candidate_finite_at(
+            Incumbent.selected_frame, G1FrameStageIkPoseCertificate);
+        check(run_candidate_transaction(fixture) ==
+                  G1FrameTransactionFiniteRejected &&
+                  candidate_provider_control.calls == 0 &&
+                  fixture.certification.legacy_traversals == 0U,
+              "matching-disabled exhaustion never calls recovery");
+    }
+    {
+        candidate_fixture fixture;
+        configure_abc_default();
+        candidate_provider_control.status =
+            G1RecoveryProviderGlobalError;
+        check(run_candidate_transaction(fixture) ==
+                  G1FrameTransactionGlobalError &&
+                  candidate_provider_control.calls == 1 &&
+                  fixture.certification.attempt_count == 1U,
+              "provider global error stops before any tail attempt");
+    }
+    {
+        candidate_fixture fixture;
+        const uint64_t accepted_before =
+            state_logical_digest(fixture.runtime.accepted_state);
+        configure_abc_default();
+        candidate_finite_at(
+            CandidateB.selected_frame,
+            G1FrameStageAcceptedFinalize);
+        check(run_candidate_transaction(fixture) ==
+                  G1FrameTransactionFiniteRejected &&
+                  fixture.certification.attempt_count == 2U &&
+                  candidate_runner_control.accepted_finalize_calls == 1 &&
+                  candidate_runner_control.attempt_count == 2U &&
+                  state_logical_digest(fixture.runtime.accepted_state) ==
+                      accepted_before &&
+                  fixture.runtime.publication.rejection.stop_reason ==
+                      G1IkStopFootprintOutsideDomain,
+              "finite AcceptedFinalize stops the tail and publishes the earliest saved attempt failure");
+    }
+    {
+        candidate_fixture fixture;
+        reset_candidate_controls();
+        candidate_finite_at(
+            CandidateA.selected_frame, G1FrameStageIkPoseCertificate);
+        candidate_provider_control.set.records[1].recovery_rank = 7U;
+        check(run_candidate_transaction(fixture) ==
+                  G1FrameTransactionGlobalError &&
+                  candidate_provider_control.calls == 1 &&
+                  candidate_runner_control.attempt_count == 1U,
+              "the complete tail is validated before B can mask malformed C");
+    }
+    {
+        candidate_fixture fixture;
+        reset_candidate_controls();
+        candidate_finite_at(
+            CandidateA.selected_frame, G1FrameStageIkPoseCertificate);
+        candidate_provider_control.set.work.full_scores_materialized = 1U;
+        check(run_candidate_transaction(fixture) ==
+                  G1FrameTransactionGlobalError &&
+                  candidate_runner_control.attempt_count == 1U,
+              "invalid provider work provenance is rejected before the tail");
+    }
+    {
+        candidate_fixture fixture;
+        reset_candidate_controls();
+        configure_seven_record_tail();
+        candidate_finite_at(
+            CandidateA.selected_frame, G1FrameStageIkPoseCertificate);
+        for (uint32_t index = 0U;
+             index < candidate_provider_control.set.count;
+             ++index) {
+            candidate_finite_at(
+                candidate_provider_control.set.records[index]
+                    .selected_frame,
+                G1FrameStageIkPoseCertificate);
+        }
+        check(run_candidate_transaction(fixture) ==
+                  G1FrameTransactionFiniteRejected &&
+                  fixture.certification.attempt_count ==
+                      G1CandidateAttemptCapacity &&
+                  fixture.certification.common_evaluations ==
+                      G1CandidateAttemptCapacity &&
+                  fixture.certification.raw_evaluations ==
+                      G1CandidateAttemptCapacity &&
+                  fixture.certification.ik_evaluations ==
+                      G1CandidateAttemptCapacity &&
+                  candidate_provider_control.calls == 1,
+              "all seven valid tail records stay within exactly eight bounded attempts");
+    }
+    {
+        candidate_fixture fixture;
+        reset_candidate_controls();
+        candidate_finite_at(
+            CandidateA.selected_frame, G1FrameStageIkPoseCertificate);
+        candidate_provider_control.set.count =
+            G1CandidateAttemptCapacity;
+        check(run_candidate_transaction(fixture) ==
+                  G1FrameTransactionGlobalError &&
+                  candidate_runner_control.attempt_count == 1U,
+              "hostile count eight cannot materialize a ninth attempt");
+    }
+}
+
+static void test_hypothetical_ninth_attempt_is_global_error()
+{
+    candidate_fixture fixture;
+    const RuntimeEvidence before = runtime_evidence(fixture.runtime);
+    reset_candidate_controls();
+    candidate_finite_at(
+        CandidateA.selected_frame, G1FrameStageIkPoseCertificate);
+    candidate_provider_control.set.count = G1CandidateAttemptCapacity;
+    check(run_candidate_transaction(fixture) ==
+              G1FrameTransactionGlobalError &&
+              fixture.certification.attempt_count == 1U &&
+              candidate_runner_control.attempt_count == 1U &&
+              publication_logical_digest(fixture.runtime.publication) ==
+                  before.publication &&
+              state_logical_digest(fixture.runtime.accepted_state) ==
+                  before.accepted,
+          "hypothetical ninth attempt is a controlled nonpublishing global error");
+}
+
+static void test_scheduled_legacy_slot_zero_has_legacy_score_owner()
+{
+    candidate_fixture fixture;
+    reset_candidate_controls();
+    fixture.certification.attempt_count = G1CandidateAttemptCapacity;
+    fixture.certification.attempts[0].score_owner =
+        G1CandidateScoreStrictRecovery;
+    check(run_candidate_transaction(fixture) ==
+              G1FrameTransactionAccepted &&
+              fixture.certification.attempt_count == 1U &&
+              fixture.certification.legacy_traversals == 1U &&
+              fixture.certification.attempts[0].candidate.kind ==
+                  G1CandidateLegacy &&
+              fixture.certification.attempts[0].score_owner ==
+                  G1CandidateScoreLegacy,
+          "scheduled slot zero resets poison and owns legacy score provenance");
+}
+
+static void test_unscheduled_slot_zero_has_incumbent_score_owner()
+{
+    candidate_fixture fixture;
+    reset_candidate_controls();
+    candidate_runner_control.schedule_search = false;
+    check(run_candidate_transaction(fixture) ==
+              G1FrameTransactionAccepted &&
+              fixture.certification.attempt_count == 1U &&
+              fixture.certification.legacy_traversals == 0U &&
+              fixture.certification.attempts[0].candidate.kind ==
+                  G1CandidateIncumbent &&
+              fixture.certification.attempts[0].score_owner ==
+                  G1CandidateScoreIncumbent,
+          "unscheduled slot zero explicitly owns incumbent score provenance");
+}
+
+static void test_matching_disabled_slot_zero_has_incumbent_score_owner()
+{
+    candidate_fixture fixture;
+    reset_candidate_controls();
+    fixture.external.tuning.mode = G1_TestSequential;
+    fixture.external.tuning.frame_limit = 1;
+    check(run_candidate_transaction(fixture) ==
+              G1FrameTransactionAccepted &&
+              fixture.certification.attempt_count == 1U &&
+              fixture.certification.legacy_traversals == 0U &&
+              fixture.certification.attempts[0].candidate.kind ==
+                  G1CandidateIncumbent &&
+              fixture.certification.attempts[0].score_owner ==
+                  G1CandidateScoreIncumbent,
+          "matching-disabled slot zero explicitly owns incumbent score provenance");
+}
+
 int main()
 {
+    test_abc_selects_b_in_both_modes_and_stops_before_c();
+    test_raw_rejection_short_circuits_ik_and_continues();
+    test_raw_pass_ik_reject_cannot_be_selected();
+    test_attempt_order_and_incumbent_deduplication();
+    test_rejected_attempt_storage_cannot_seed_next_attempt();
+    test_contact_phase_is_not_a_rank_or_admission_gate();
+    test_hidden_ik_commits_in_both_public_modes();
+    test_reset_switch_and_multiframe_hidden_state_are_paired();
+    test_exact_dt_intent_and_heading_are_immutable_per_attempt();
+    test_prior_safe_stop_latch_is_shared_and_consumed_once_on_winner();
+    test_prefix_camera_route_and_command_work_runs_once();
+    test_lazy_provider_and_attempt_work_bounds();
+    test_hypothetical_ninth_attempt_is_global_error();
+    test_scheduled_legacy_slot_zero_has_legacy_score_owner();
+    test_unscheduled_slot_zero_has_incumbent_score_owner();
+    test_matching_disabled_slot_zero_has_incumbent_score_owner();
     test_root_reach_result_equality_and_digest_ownership();
     test_orientation_authenticates_desired_sole_normal();
     test_contact_iteration_provenance_is_authenticated();
@@ -4182,6 +6357,7 @@ int main()
     test_success_diagnostic_hips_mutations_roll_back_transaction();
     test_dirty_working_storage_is_overwritten_completely();
     test_coordinator_preflight_rejects_invalid_inputs_and_aliases();
+    test_exact_storage_preflight_rejects_within_workspace_alias_before_trace_reset();
     test_safe_stop_latch_lifecycle();
     return 0;
 }

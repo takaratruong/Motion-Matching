@@ -1,5 +1,6 @@
 #pragma once
 
+#include "g1_candidate_recovery.h"
 #include "g1_controller_state.h"
 #include "motion_match_log.h"
 #include "route_runtime.h"
@@ -66,10 +67,18 @@ struct G1FrameAcceptedDiagnostic
     float effective_terrain_weight = 0.0f;
 };
 
+struct G1FrameCandidateWorkspace
+{
+    g1_controller_state common_state;
+    g1_controller_state raw_state;
+    g1_controller_state ik_state;
+};
+
 struct G1FrameRuntime
 {
     g1_controller_state accepted_state;
     g1_controller_state working_state;
+    G1FrameCandidateWorkspace candidates;
     G1FramePublication publication;
     G1FrameAcceptedDiagnostic accepted_diagnostic;
 };
@@ -78,16 +87,24 @@ enum G1FrameTransactionStage
 {
     G1FrameStageInputRouteCommand = 0,
     G1FrameStageMatcherSearch,
+    G1FrameStageCandidateApply,
     G1FrameStageInertialization,
     G1FrameStageSimulationUpdate,
     G1FrameStageSupportObservation,
     G1FrameStageSupportRetarget,
     G1FrameStageContactUpdate,
     G1FrameStageFootprintObservation,
-    G1FrameStageFirstFootIk,
-    G1FrameStageSecondFootIk,
-    G1FrameStageFinalFk,
-    G1FrameStagePoseCertificate,
+    G1FrameStageRawBegin,
+    G1FrameStageRawFirstFoot,
+    G1FrameStageRawSecondFoot,
+    G1FrameStageRawFinalFk,
+    G1FrameStageRawPoseCertificate,
+    G1FrameStageIkBegin,
+    G1FrameStageIkFirstFoot,
+    G1FrameStageIkSecondFoot,
+    G1FrameStageIkFinalFk,
+    G1FrameStageIkPoseCertificate,
+    G1FrameStageAcceptedFinalize,
     G1FrameStageCount,
 };
 
@@ -103,6 +120,20 @@ enum G1FrameTransactionStatus
     G1FrameTransactionAccepted = 0,
     G1FrameTransactionFiniteRejected,
     G1FrameTransactionGlobalError,
+};
+
+enum G1FrameCertificateBranch : uint32_t
+{
+    G1FrameCertificateNone = 0U,
+    G1FrameCertificateRaw,
+    G1FrameCertificateIk,
+};
+
+struct G1FrameBranchCertificateScratch
+{
+    G1IkFrameTransaction ik_transaction;
+    G1ClearanceStatus pose_status = G1ClearanceInvalidInput;
+    G1PoseClearance pose_clearance;
 };
 
 struct G1FrameTransactionScratch
@@ -128,9 +159,16 @@ struct G1FrameTransactionScratch
     G1FootContactSchedule contact_schedule;
     G1FootprintStatus footprint_status = G1FootprintInvalidInput;
     G1FootprintObservation footprint;
-    G1IkFrameTransaction ik_transaction;
-    G1ClearanceStatus pose_status = G1ClearanceInvalidInput;
-    G1PoseClearance pose_clearance;
+    G1CandidateRecord slot_zero_record;
+    G1CandidateRecord active_candidate;
+    bool matching_scheduled = false;
+    bool legacy_search_performed = false;
+    float transition_cost = 0.0f;
+    bool recovery_request_ready = false;
+    G1RecoveryRequest recovery_request;
+    G1FrameBranchCertificateScratch raw_certificate;
+    G1FrameBranchCertificateScratch ik_certificate;
+    G1FrameCertificateBranch rejection_branch = G1FrameCertificateNone;
     G1FrameRejectionDiagnostic rejection;
     G1FrameAcceptedDiagnostic accepted_diagnostic_candidate;
     bool accepted_diagnostic_ready = false;
@@ -240,6 +278,123 @@ struct G1FrameTransactionTestControl
     G1FrameInjectedOutcome injected_outcome = G1FrameInjectContinue;
 };
 
+enum G1CandidateScoreOwner : uint32_t
+{
+    G1CandidateScoreUnassigned = 0U,
+    G1CandidateScoreLegacy,
+    G1CandidateScoreStrictRecovery,
+    G1CandidateScoreIncumbent,
+};
+
+enum G1CandidateDisposition : uint32_t
+{
+    G1CandidateDispositionNotRun = 0U,
+    G1CandidateDispositionAccepted,
+    G1CandidateDispositionFiniteRejected,
+    G1CandidateDispositionGlobalError,
+};
+
+struct G1CandidateAttemptTraceRecord
+{
+    G1CandidateRecord candidate;
+    G1CandidateScoreOwner score_owner = G1CandidateScoreUnassigned;
+    G1CandidateDisposition common = G1CandidateDispositionNotRun;
+    G1CandidateDisposition raw = G1CandidateDispositionNotRun;
+    G1CandidateDisposition ik = G1CandidateDispositionNotRun;
+    G1FrameRejectionStage rejection_stage = G1FrameRejectNone;
+    G1IkStopReason stop_reason = G1IkStopNone;
+};
+
+struct G1CandidateCertificationTrace
+{
+    G1CandidateAttemptTraceRecord attempts[G1CandidateAttemptCapacity] = {};
+    uint32_t attempt_count = 0U;
+    uint32_t legacy_traversals = 0U;
+    uint32_t recovery_provider_calls = 0U;
+    uint32_t common_evaluations = 0U;
+    uint32_t raw_evaluations = 0U;
+    uint32_t ik_evaluations = 0U;
+    bool recovery_request_available = false;
+    G1RecoveryRequest recovery_request;
+    G1RecoveryCandidateSet recovery_set;
+};
+
+static inline void g1_frame_candidate_record_reset(
+    G1CandidateRecord& record)
+{
+    record.kind = G1CandidateIncumbent;
+    record.selected_frame = -1;
+    record.executed_frame = -1;
+    record.source_range = -1;
+    record.selected_cost = FLT_MAX;
+    record.recovery_rank = UINT32_MAX;
+    record.transitioned = false;
+}
+
+static inline void g1_frame_attempt_trace_reset(
+    G1CandidateAttemptTraceRecord& record)
+{
+    g1_frame_candidate_record_reset(record.candidate);
+    record.score_owner = G1CandidateScoreUnassigned;
+    record.common = G1CandidateDispositionNotRun;
+    record.raw = G1CandidateDispositionNotRun;
+    record.ik = G1CandidateDispositionNotRun;
+    record.rejection_stage = G1FrameRejectNone;
+    record.stop_reason = G1IkStopNone;
+}
+
+static inline void g1_frame_recovery_request_reset(
+    G1RecoveryRequest& request)
+{
+    request.db = nullptr;
+    for (uint32_t feature = 0U;
+         feature < G1RecoveryFeatureCount;
+         ++feature) {
+        request.raw_query[feature] = 0.0f;
+    }
+    request.incumbent_frame = -1;
+    request.legacy_selected_frame = -1;
+    request.transition_cost = 0.0f;
+    request.public_incumbent_cost = FLT_MAX;
+    request.ignore_range_end = 20;
+    request.ignore_surrounding = 20;
+}
+
+static inline void g1_frame_recovery_set_reset(
+    G1RecoveryCandidateSet& set)
+{
+    for (uint32_t index = 0U;
+         index < G1CandidateAttemptCapacity;
+         ++index) {
+        g1_frame_candidate_record_reset(set.records[index]);
+    }
+    set.count = 0U;
+    set.work.accelerated_traversals = 0U;
+    set.work.large_bounds_tested = 0U;
+    set.work.small_bounds_tested = 0U;
+    set.work.rows_tested = 0U;
+    set.work.full_scores_materialized = 0U;
+}
+
+static inline void g1_frame_certification_trace_reset(
+    G1CandidateCertificationTrace& trace)
+{
+    for (uint32_t index = 0U;
+         index < G1CandidateAttemptCapacity;
+         ++index) {
+        g1_frame_attempt_trace_reset(trace.attempts[index]);
+    }
+    trace.attempt_count = 0U;
+    trace.legacy_traversals = 0U;
+    trace.recovery_provider_calls = 0U;
+    trace.common_evaluations = 0U;
+    trace.raw_evaluations = 0U;
+    trace.ik_evaluations = 0U;
+    trace.recovery_request_available = false;
+    g1_frame_recovery_request_reset(trace.recovery_request);
+    g1_frame_recovery_set_reset(trace.recovery_set);
+}
+
 using G1FrameTransactionTestHook = G1FrameInjectedOutcome (*)(
     G1FrameTransactionStage stage,
     const g1_controller_state& working_state,
@@ -253,6 +408,7 @@ struct G1FrameTransactionTestSeam
 {
     G1FrameTransactionTestHook hook = nullptr;
     G1FrameTransactionTestControl control;
+    G1CandidateCertificationTrace* certification_trace = nullptr;
 };
 #endif
 
@@ -772,6 +928,62 @@ static inline bool g1_frame_state_pair_reset_storage_is_safe(
                second_count);
 }
 
+static inline void g1_frame_runtime_state_pointers(
+    const G1FrameRuntime& runtime,
+    const g1_controller_state* states[5])
+{
+    states[0] = &runtime.accepted_state;
+    states[1] = &runtime.working_state;
+    states[2] = &runtime.candidates.common_state;
+    states[3] = &runtime.candidates.raw_state;
+    states[4] = &runtime.candidates.ik_state;
+}
+
+static inline bool g1_frame_runtime_storage_sets_are_safe(
+    const G1FrameRuntime& runtime,
+    bool require_exact_storage,
+    g1_controller_state_memory_range ranges[5][64],
+    int counts[5])
+{
+    const g1_controller_state* states[5] = {};
+    g1_frame_runtime_state_pointers(runtime, states);
+    for (int state_index = 0; state_index < 5; ++state_index) {
+        const bool collected = require_exact_storage
+            ? g1_controller_state_storage_ranges(
+                  *states[state_index],
+                  ranges[state_index],
+                  counts[state_index],
+                  64)
+            : g1_controller_state_reset_output_ranges(
+                  *states[state_index],
+                  ranges[state_index],
+                  counts[state_index],
+                  64);
+        if (!collected ||
+            (require_exact_storage &&
+             (counts[state_index] != 49 ||
+              !g1_controller_state_ranges_are_disjoint(
+                  ranges[state_index], counts[state_index])))) {
+            return false;
+        }
+    }
+    for (int first = 0; first < 5; ++first) {
+        for (int second = first + 1; second < 5; ++second) {
+            if (states[first] == states[second] ||
+                !g1_frame_state_range_sets_are_disjoint(
+                    *states[first],
+                    ranges[first],
+                    counts[first],
+                    *states[second],
+                    ranges[second],
+                    counts[second])) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static inline bool g1_frame_error_overlaps_ranges(
     char* error,
     int error_capacity,
@@ -1257,6 +1469,20 @@ static inline bool g1_frame_controller_states_equal(
            g1_frame_float_bits_equal(first.clamp_y, second.clamp_y);
 }
 
+static inline bool g1_frame_runtime_states_are_logically_equal(
+    const G1FrameRuntime& runtime)
+{
+    const g1_controller_state* states[5] = {};
+    g1_frame_runtime_state_pointers(runtime, states);
+    for (int state_index = 1; state_index < 5; ++state_index) {
+        if (!g1_frame_controller_states_equal(
+                *states[0], *states[state_index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static inline bool g1_frame_reset_candidate_is_valid(
     const g1_controller_state& state,
     float initial_search_time)
@@ -1295,31 +1521,13 @@ static inline bool g1_frame_reset_output_preflight(
     char* error,
     int error_capacity)
 {
-    g1_controller_state_memory_range accepted_ranges[64] = {};
-    g1_controller_state_memory_range working_ranges[64] = {};
-    int accepted_count = 0;
-    int working_count = 0;
+    g1_controller_state_memory_range ranges[5][64] = {};
+    int counts[5] = {};
     if (error_capacity < 0 ||
-        !g1_frame_state_pair_reset_storage_is_safe(
-            output.accepted_state,
-            output.working_state,
-            accepted_ranges,
-            accepted_count,
-            working_ranges,
-            working_count,
-            64) ||
+        !g1_frame_runtime_storage_sets_are_safe(
+            output, false, ranges, counts) ||
         g1_frame_error_overlaps_object(
             error, error_capacity, &output, sizeof(output)) ||
-        g1_frame_error_overlaps_ranges(
-            error,
-            error_capacity,
-            accepted_ranges,
-            accepted_count) ||
-        g1_frame_error_overlaps_ranges(
-            error,
-            error_capacity,
-            working_ranges,
-            working_count) ||
         g1_frame_error_overlaps_object(
             error, error_capacity, &config, sizeof(config))) {
         return false;
@@ -1330,20 +1538,31 @@ static inline bool g1_frame_reset_output_preflight(
     const g1_controller_state_memory_range config_object = {
         &config, sizeof(config)
     };
-    for (int index = 0; index < accepted_count; ++index) {
-        if (g1_controller_state_ranges_overlap(
-                accepted_ranges[index], output_object) ||
-            g1_controller_state_ranges_overlap(
-                accepted_ranges[index], config_object)) {
+    if (g1_controller_state_ranges_overlap(
+            output_object, config_object) ||
+        g1_controller_state_source_storage_overlaps(
+            output_object, db, support, scene) ||
+        g1_controller_state_source_storage_overlaps(
+            config_object, db, support, scene)) {
+        return false;
+    }
+    for (int state_index = 0; state_index < 5; ++state_index) {
+        if (g1_frame_error_overlaps_ranges(
+                error,
+                error_capacity,
+                ranges[state_index],
+                counts[state_index])) {
             return false;
         }
-    }
-    for (int index = 0; index < working_count; ++index) {
-        if (g1_controller_state_ranges_overlap(
-                working_ranges[index], output_object) ||
-            g1_controller_state_ranges_overlap(
-                working_ranges[index], config_object)) {
-            return false;
+        for (int index = 0; index < counts[state_index]; ++index) {
+            if (g1_controller_state_ranges_overlap(
+                    ranges[state_index][index], output_object) ||
+                g1_controller_state_ranges_overlap(
+                    ranges[state_index][index], config_object) ||
+                g1_controller_state_source_storage_overlaps(
+                    ranges[state_index][index], db, support, scene)) {
+                return false;
+            }
         }
     }
     const g1_controller_state_memory_range diagnostic = {
@@ -1355,23 +1574,7 @@ static inline bool g1_frame_reset_output_preflight(
     if (diagnostic.bytes > 0U &&
         g1_controller_state_source_storage_overlaps(
             diagnostic, db, support, scene)) {
-        return false;
-    }
-    if (g1_controller_state_source_storage_overlaps(
-            output_object, db, support, scene)) {
-        return false;
-    }
-    for (int index = 0; index < accepted_count; ++index) {
-        if (g1_controller_state_source_storage_overlaps(
-                accepted_ranges[index], db, support, scene)) {
-            return false;
-        }
-    }
-    for (int index = 0; index < working_count; ++index) {
-        if (g1_controller_state_source_storage_overlaps(
-                working_ranges[index], db, support, scene)) {
-            return false;
-        }
+                return false;
     }
     return true;
 }
@@ -2516,55 +2719,20 @@ static inline bool g1_frame_transaction_preflight(
     char* error,
     int error_capacity)
 {
-    g1_controller_state_memory_range accepted_ranges[64] = {};
-    g1_controller_state_memory_range working_ranges[64] = {};
-    int accepted_count = 0;
-    int working_count = 0;
+    g1_controller_state_memory_range ranges[5][64] = {};
+    int counts[5] = {};
     if (error_capacity < 0 ||
         external.db == nullptr ||
         external.support == nullptr ||
         external.scene == nullptr ||
-        !g1_frame_state_pair_storage_is_exact(
-            runtime.accepted_state,
-            runtime.working_state,
-            accepted_ranges,
-            accepted_count,
-            working_ranges,
-            working_count,
-            64) ||
+        !g1_frame_runtime_storage_sets_are_safe(
+            runtime, true, ranges, counts) ||
         g1_frame_error_overlaps_object(
             error, error_capacity, &runtime, sizeof(runtime)) ||
-        g1_frame_error_overlaps_ranges(
-            error,
-            error_capacity,
-            accepted_ranges,
-            accepted_count) ||
-        g1_frame_error_overlaps_ranges(
-            error,
-            error_capacity,
-            working_ranges,
-            working_count) ||
         g1_frame_error_overlaps_object(
             error, error_capacity, &external, sizeof(external))) {
         return false;
     }
-#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
-    if (g1_frame_error_overlaps_object(
-            error,
-            error_capacity,
-            test_seam,
-            test_seam != nullptr ? sizeof(*test_seam) : 0U) ||
-        (test_seam != nullptr &&
-         (test_seam->control.injected_stage <
-              G1FrameStageInputRouteCommand ||
-          test_seam->control.injected_stage > G1FrameStageCount ||
-          test_seam->control.injected_outcome <
-              G1FrameInjectContinue ||
-          test_seam->control.injected_outcome >
-              G1FrameInjectGlobalError))) {
-        return false;
-    }
-#endif
 
     const g1_controller_state_memory_range runtime_object = {
         &runtime, sizeof(runtime)
@@ -2580,40 +2748,13 @@ static inline bool g1_frame_transaction_preflight(
     };
     if (g1_controller_state_ranges_overlap(
             runtime_object, external_object) ||
-        g1_frame_ranges_overlap_object(
-            accepted_ranges,
-            accepted_count,
-            &runtime,
-            sizeof(runtime)) ||
-        g1_frame_ranges_overlap_object(
-            working_ranges,
-            working_count,
-            &runtime,
-            sizeof(runtime)) ||
-        g1_frame_ranges_overlap_object(
-            accepted_ranges,
-            accepted_count,
-            &external,
-            sizeof(external)) ||
-        g1_frame_ranges_overlap_object(
-            working_ranges,
-            working_count,
-            &external,
-            sizeof(external)) ||
         g1_controller_state_source_storage_overlaps(
             runtime_object,
             *external.db,
             *external.support,
             *external.scene) ||
-        g1_frame_ranges_overlap_sources(
-            accepted_ranges,
-            accepted_count,
-            *external.db,
-            *external.support,
-            *external.scene) ||
-        g1_frame_ranges_overlap_sources(
-            working_ranges,
-            working_count,
+        g1_controller_state_source_storage_overlaps(
+            external_object,
             *external.db,
             *external.support,
             *external.scene) ||
@@ -2625,7 +2766,39 @@ static inline bool g1_frame_transaction_preflight(
              *external.scene))) {
         return false;
     }
+
 #if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+    if (test_seam != nullptr &&
+        reinterpret_cast<uintptr_t>(test_seam) %
+                alignof(G1FrameTransactionTestSeam) !=
+            0U) {
+        return false;
+    }
+    if (g1_frame_error_overlaps_object(
+            error,
+            error_capacity,
+            test_seam,
+            test_seam != nullptr ? sizeof(*test_seam) : 0U) ||
+        (test_seam != nullptr &&
+         (test_seam->control.injected_stage <
+              G1FrameStageInputRouteCommand ||
+          test_seam->control.injected_stage > G1FrameStageCount ||
+          test_seam->control.injected_outcome <
+              G1FrameInjectContinue ||
+          test_seam->control.injected_outcome >
+              G1FrameInjectGlobalError))) {
+        return false;
+    }
+    const G1CandidateCertificationTrace* certification_trace =
+        test_seam != nullptr
+            ? test_seam->certification_trace
+            : nullptr;
+    if (certification_trace != nullptr &&
+        reinterpret_cast<uintptr_t>(certification_trace) %
+                alignof(G1CandidateCertificationTrace) !=
+            0U) {
+        return false;
+    }
     if (test_seam != nullptr &&
         (g1_ik_memory_ranges_overlap(
              &runtime,
@@ -2637,44 +2810,107 @@ static inline bool g1_frame_transaction_preflight(
              sizeof(external),
              test_seam,
              sizeof(*test_seam)) ||
-         g1_frame_ranges_overlap_object(
-             accepted_ranges,
-             accepted_count,
+         g1_controller_state_source_storage_overlaps(
+             {test_seam, sizeof(*test_seam)},
+             *external.db,
+             *external.support,
+             *external.scene))) {
+        return false;
+    }
+    if (certification_trace != nullptr &&
+        (g1_ik_memory_ranges_overlap(
+             &runtime,
+             sizeof(runtime),
+             certification_trace,
+             sizeof(*certification_trace)) ||
+         g1_ik_memory_ranges_overlap(
+             &external,
+             sizeof(external),
+             certification_trace,
+             sizeof(*certification_trace)) ||
+         g1_ik_memory_ranges_overlap(
              test_seam,
-             sizeof(*test_seam)) ||
-         g1_frame_ranges_overlap_object(
-             working_ranges,
-             working_count,
-             test_seam,
-             sizeof(*test_seam)))) {
+             sizeof(*test_seam),
+             certification_trace,
+             sizeof(*certification_trace)) ||
+         g1_frame_error_overlaps_object(
+             error,
+             error_capacity,
+             certification_trace,
+             sizeof(*certification_trace)) ||
+         g1_controller_state_source_storage_overlaps(
+             {certification_trace, sizeof(*certification_trace)},
+             *external.db,
+             *external.support,
+             *external.scene))) {
         return false;
     }
 #endif
 
-    if (!g1_frame_artifacts_are_valid(
-            *external.db,
-            *external.support,
-            *external.scene,
-            error,
-            error_capacity) ||
-        !g1_frame_input_snapshot_is_valid(
-            external.input, external.heading_override) ||
-        !g1_frame_tuning_is_valid(external.tuning) ||
-        !g1_controller_state_is_valid(runtime.accepted_state) ||
-        !g1_frame_publication_is_valid(runtime.publication) ||
-        !g1_frame_accepted_diagnostic_is_valid(
-            runtime.accepted_diagnostic) ||
-        !g1_frame_runtime_observation_relation_is_valid(runtime) ||
-        !g1_frame_float_bits_equal(
-            external.tuning.initial_search_time,
-            runtime.accepted_state.search_time) ||
-        !g1_frame_route_relation_is_valid(
-            external, runtime.accepted_state)) {
-        return false;
+    for (int state_index = 0; state_index < 5; ++state_index) {
+        if (g1_frame_error_overlaps_ranges(
+                error,
+                error_capacity,
+                ranges[state_index],
+                counts[state_index]) ||
+            g1_frame_ranges_overlap_object(
+                ranges[state_index],
+                counts[state_index],
+                &runtime,
+                sizeof(runtime)) ||
+            g1_frame_ranges_overlap_object(
+                ranges[state_index],
+                counts[state_index],
+                &external,
+                sizeof(external)) ||
+            g1_frame_ranges_overlap_sources(
+                ranges[state_index],
+                counts[state_index],
+                *external.db,
+                *external.support,
+                *external.scene)) {
+            return false;
+        }
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+        if (test_seam != nullptr &&
+            g1_frame_ranges_overlap_object(
+                ranges[state_index],
+                counts[state_index],
+                test_seam,
+                sizeof(*test_seam))) {
+            return false;
+        }
+        if (certification_trace != nullptr &&
+            g1_frame_ranges_overlap_object(
+                ranges[state_index],
+                counts[state_index],
+                certification_trace,
+                sizeof(*certification_trace))) {
+            return false;
+        }
+#endif
     }
-    return true;
-}
 
+    return g1_frame_artifacts_are_valid(
+               *external.db,
+               *external.support,
+               *external.scene,
+               error,
+               error_capacity) &&
+           g1_frame_input_snapshot_is_valid(
+               external.input, external.heading_override) &&
+           g1_frame_tuning_is_valid(external.tuning) &&
+           g1_controller_state_is_valid(runtime.accepted_state) &&
+           g1_frame_publication_is_valid(runtime.publication) &&
+           g1_frame_accepted_diagnostic_is_valid(
+               runtime.accepted_diagnostic) &&
+           g1_frame_runtime_observation_relation_is_valid(runtime) &&
+           g1_frame_float_bits_equal(
+               external.tuning.initial_search_time,
+               runtime.accepted_state.search_time) &&
+           g1_frame_route_relation_is_valid(
+               external, runtime.accepted_state);
+}
 static inline bool g1_frame_rejection_matches_scratch_transaction(
     const G1FrameRejectionDiagnostic& rejection,
     const G1FrameTransactionScratch& scratch)
@@ -2687,18 +2923,27 @@ static inline bool g1_frame_rejection_matches_scratch_transaction(
     }
     if (!rejection.attempted_ik_available) return true;
 
+    const G1FrameBranchCertificateScratch* certificate = nullptr;
+    if (scratch.rejection_branch == G1FrameCertificateRaw) {
+        certificate = &scratch.raw_certificate;
+    } else if (scratch.rejection_branch == G1FrameCertificateIk) {
+        certificate = &scratch.ik_certificate;
+    } else {
+        return false;
+    }
+
     G1IkRejectionCheckpoint checkpoint =
         G1IkRejectionAfterBegin;
-    if (scratch.ik_transaction.next_foot == 0U) {
+    if (certificate->ik_transaction.next_foot == 0U) {
         if (rejection.stage != G1FrameRejectLandingPatch) {
             return false;
         }
-    } else if (scratch.ik_transaction.next_foot == 1U) {
+    } else if (certificate->ik_transaction.next_foot == 1U) {
         if (rejection.stage != G1FrameRejectIkCandidate) {
             return false;
         }
         checkpoint = G1IkRejectionAfterFoot0;
-    } else if (scratch.ik_transaction.next_foot == 2U) {
+    } else if (certificate->ik_transaction.next_foot == 2U) {
         if (rejection.stage != G1FrameRejectIkCandidate) {
             return false;
         }
@@ -2708,13 +2953,20 @@ static inline bool g1_frame_rejection_matches_scratch_transaction(
     }
 
     G1IkFrameResult derived;
-    return g1_ik_frame_rejection_snapshot(
+    if (!g1_ik_frame_rejection_snapshot(
                derived,
-               scratch.ik_transaction,
+               certificate->ik_transaction,
                checkpoint,
                nullptr,
-               0) &&
-           g1_frame_ik_result_equal(derived, rejection.ik_frame);
+               0) ||
+        !g1_frame_ik_result_equal(derived, rejection.ik_frame)) {
+        return false;
+    }
+    return !rejection.attempted_pose_available ||
+           (rejection.pose_status == certificate->pose_status &&
+            g1_controller_state_pose_clearance_equal(
+                rejection.pose_clearance,
+                certificate->pose_clearance));
 }
 
 static inline bool g1_frame_publish_finite_rejection(
@@ -2775,12 +3027,23 @@ static inline bool g1_frame_success_candidates_are_valid(
     G1FramePublication& publication,
     G1FrameAcceptedDiagnostic& accepted_diagnostic)
 {
+    const G1FrameBranchCertificateScratch& visible_certificate =
+        external.tuning.ik_enabled
+            ? scratch.ik_certificate
+            : scratch.raw_certificate;
     if (!g1_controller_state_is_valid(working_state) ||
         !g1_frame_success_iteration_provenance_is_valid(
             working_state.ik_frame) ||
         !g1_frame_success_ik_matches_producer(
             working_state.ik_frame,
-            scratch.ik_transaction) ||
+            visible_certificate.ik_transaction) ||
+        !g1_frame_ik_state_equal(
+            working_state.ik,
+            scratch.ik_certificate.ik_transaction.candidate_state) ||
+        visible_certificate.pose_status != G1ClearanceOk ||
+        !g1_controller_state_pose_clearance_equal(
+            working_state.ik_clearance,
+            visible_certificate.pose_clearance) ||
         !g1_frame_route_relation_is_valid(external, working_state) ||
         !g1_frame_float_bits_equal(
             external.tuning.initial_search_time,
@@ -2813,9 +3076,30 @@ static inline bool g1_frame_success_candidates_are_valid(
     return true;
 }
 
-static inline G1FrameTransactionStatus g1_frame_transaction_run(
-    G1FrameRuntime& runtime,
+enum G1CandidateEvaluationOutcome : uint32_t
+{
+    G1CandidateDualAccepted = 0U,
+    G1CandidateFiniteRejected,
+    G1CandidateGlobalError,
+};
+
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+static inline bool g1_frame_candidate_dual_outcome_is_valid(
+    G1CandidateDisposition common,
+    G1CandidateDisposition raw,
+    G1CandidateDisposition ik)
+{
+    return common == G1CandidateDispositionAccepted &&
+           raw == G1CandidateDispositionAccepted &&
+           ik == G1CandidateDispositionAccepted;
+}
+#endif
+
+static inline G1FrameStageOutcome g1_frame_run_one_stage(
+    G1FrameTransactionStage stage,
     G1FrameStageRunner run_stage,
+    g1_controller_state& state,
+    G1FrameTransactionScratch& scratch,
     const G1FrameExternalInputs& external,
 #if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
     const G1FrameTransactionTestSeam* test_seam,
@@ -2823,7 +3107,556 @@ static inline G1FrameTransactionStatus g1_frame_transaction_run(
     char* error,
     int error_capacity)
 {
-    if (run_stage == nullptr ||
+    if (run_stage == nullptr) return G1FrameStageGlobalError;
+    const G1FrameStageOutcome outcome = run_stage(
+        stage, state, scratch, external, error, error_capacity);
+    if (outcome != G1FrameStageContinue) {
+        return outcome == G1FrameStageFiniteReject ||
+               outcome == G1FrameStageGlobalError
+            ? outcome
+            : G1FrameStageGlobalError;
+    }
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+    if (test_seam != nullptr && test_seam->hook != nullptr) {
+        const G1FrameInjectedOutcome injected = test_seam->hook(
+            stage,
+            state,
+            scratch,
+            external,
+            test_seam->control,
+            error,
+            error_capacity);
+        if (injected == G1FrameInjectFiniteReject) {
+            return G1FrameStageFiniteReject;
+        }
+        if (injected == G1FrameInjectGlobalError) {
+            return G1FrameStageGlobalError;
+        }
+        if (injected != G1FrameInjectContinue) {
+            return G1FrameStageGlobalError;
+        }
+    }
+#endif
+    return G1FrameStageContinue;
+}
+
+static inline bool g1_frame_branch_certificate_matches_state(
+    const g1_controller_state& state,
+    const G1FrameBranchCertificateScratch& certificate)
+{
+    return g1_controller_state_is_valid(state) &&
+           g1_frame_success_iteration_provenance_is_valid(
+               state.ik_frame) &&
+           g1_frame_success_ik_matches_producer(
+               state.ik_frame, certificate.ik_transaction) &&
+           g1_frame_ik_state_equal(
+               state.ik,
+               certificate.ik_transaction.candidate_state) &&
+           certificate.pose_status == G1ClearanceOk &&
+           g1_controller_state_pose_clearance_equal(
+               state.ik_clearance, certificate.pose_clearance);
+}
+
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+static inline void g1_frame_candidate_trace_failure(
+    G1CandidateAttemptTraceRecord* trace_record,
+    const G1FrameTransactionScratch& scratch)
+{
+    if (trace_record == nullptr) return;
+    trace_record->rejection_stage = scratch.rejection.stage;
+    trace_record->stop_reason = scratch.rejection.stop_reason;
+}
+#endif
+
+static inline G1CandidateEvaluationOutcome g1_frame_candidate_evaluate(
+    G1FrameCandidateWorkspace& workspace,
+    G1FrameTransactionScratch& candidate_scratch,
+    const g1_controller_state& immutable_baseline,
+    const G1FrameTransactionScratch& prefix_scratch,
+    const G1CandidateRecord& record,
+    G1FrameStageRunner run_stage,
+    const G1FrameExternalInputs& external,
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+    G1CandidateAttemptTraceRecord* trace_record,
+    const G1FrameTransactionTestSeam* test_seam,
+#endif
+    char* error,
+    int error_capacity)
+{
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+    G1CandidateCertificationTrace* certification_trace =
+        test_seam != nullptr
+            ? test_seam->certification_trace
+            : nullptr;
+#endif
+    if (!g1_controller_state_copy(
+            workspace.common_state,
+            immutable_baseline,
+            error,
+            error_capacity)) {
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+        if (trace_record != nullptr) {
+            trace_record->common = G1CandidateDispositionGlobalError;
+        }
+#endif
+        return G1CandidateGlobalError;
+    }
+    candidate_scratch = prefix_scratch;
+    candidate_scratch.active_candidate = record;
+    candidate_scratch.raw_certificate =
+        G1FrameBranchCertificateScratch{};
+    candidate_scratch.ik_certificate =
+        G1FrameBranchCertificateScratch{};
+    candidate_scratch.rejection_branch = G1FrameCertificateNone;
+    candidate_scratch.rejection = G1FrameRejectionDiagnostic{};
+    candidate_scratch.accepted_diagnostic_candidate =
+        G1FrameAcceptedDiagnostic{};
+    candidate_scratch.accepted_diagnostic_ready = false;
+
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+    if (certification_trace != nullptr) {
+        if (certification_trace->common_evaluations == UINT32_MAX) {
+            return G1CandidateGlobalError;
+        }
+        ++certification_trace->common_evaluations;
+    }
+#endif
+    for (int stage_index = G1FrameStageCandidateApply;
+         stage_index <= G1FrameStageFootprintObservation;
+         ++stage_index) {
+        const G1FrameStageOutcome outcome = g1_frame_run_one_stage(
+            static_cast<G1FrameTransactionStage>(stage_index),
+            run_stage,
+            workspace.common_state,
+            candidate_scratch,
+            external,
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+            test_seam,
+#endif
+            error,
+            error_capacity);
+        if (outcome == G1FrameStageFiniteReject) {
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+            if (trace_record != nullptr) {
+                trace_record->common =
+                    G1CandidateDispositionFiniteRejected;
+            }
+            g1_frame_candidate_trace_failure(
+                trace_record, candidate_scratch);
+#endif
+            return G1CandidateFiniteRejected;
+        }
+        if (outcome != G1FrameStageContinue) {
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+            if (trace_record != nullptr) {
+                trace_record->common =
+                    G1CandidateDispositionGlobalError;
+            }
+#endif
+            return G1CandidateGlobalError;
+        }
+    }
+    if (!g1_controller_state_is_valid(workspace.common_state)) {
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+        if (trace_record != nullptr) {
+            trace_record->common = G1CandidateDispositionGlobalError;
+        }
+#endif
+        return G1CandidateGlobalError;
+    }
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+    if (trace_record != nullptr) {
+        trace_record->common = G1CandidateDispositionAccepted;
+    }
+#endif
+
+    if (!g1_controller_state_copy(
+            workspace.raw_state,
+            workspace.common_state,
+            error,
+            error_capacity)) {
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+        if (trace_record != nullptr) {
+            trace_record->raw = G1CandidateDispositionGlobalError;
+        }
+#endif
+        return G1CandidateGlobalError;
+    }
+    candidate_scratch.rejection_branch = G1FrameCertificateRaw;
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+    if (certification_trace != nullptr) {
+        if (certification_trace->raw_evaluations == UINT32_MAX) {
+            return G1CandidateGlobalError;
+        }
+        ++certification_trace->raw_evaluations;
+    }
+#endif
+    for (int stage_index = G1FrameStageRawBegin;
+         stage_index <= G1FrameStageRawPoseCertificate;
+         ++stage_index) {
+        const G1FrameStageOutcome outcome = g1_frame_run_one_stage(
+            static_cast<G1FrameTransactionStage>(stage_index),
+            run_stage,
+            workspace.raw_state,
+            candidate_scratch,
+            external,
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+            test_seam,
+#endif
+            error,
+            error_capacity);
+        if (outcome == G1FrameStageFiniteReject) {
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+            if (trace_record != nullptr) {
+                trace_record->raw =
+                    G1CandidateDispositionFiniteRejected;
+            }
+            g1_frame_candidate_trace_failure(
+                trace_record, candidate_scratch);
+#endif
+            return G1CandidateFiniteRejected;
+        }
+        if (outcome != G1FrameStageContinue) {
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+            if (trace_record != nullptr) {
+                trace_record->raw = G1CandidateDispositionGlobalError;
+            }
+#endif
+            return G1CandidateGlobalError;
+        }
+    }
+    if (!g1_frame_branch_certificate_matches_state(
+            workspace.raw_state,
+            candidate_scratch.raw_certificate)) {
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+        if (trace_record != nullptr) {
+            trace_record->raw = G1CandidateDispositionGlobalError;
+        }
+#endif
+        return G1CandidateGlobalError;
+    }
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+    if (trace_record != nullptr) {
+        trace_record->raw = G1CandidateDispositionAccepted;
+    }
+#endif
+
+    if (!g1_controller_state_copy(
+            workspace.ik_state,
+            workspace.common_state,
+            error,
+            error_capacity)) {
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+        if (trace_record != nullptr) {
+            trace_record->ik = G1CandidateDispositionGlobalError;
+        }
+#endif
+        return G1CandidateGlobalError;
+    }
+    candidate_scratch.rejection_branch = G1FrameCertificateIk;
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+    if (certification_trace != nullptr) {
+        if (certification_trace->ik_evaluations == UINT32_MAX) {
+            return G1CandidateGlobalError;
+        }
+        ++certification_trace->ik_evaluations;
+    }
+#endif
+    for (int stage_index = G1FrameStageIkBegin;
+         stage_index <= G1FrameStageIkPoseCertificate;
+         ++stage_index) {
+        const G1FrameStageOutcome outcome = g1_frame_run_one_stage(
+            static_cast<G1FrameTransactionStage>(stage_index),
+            run_stage,
+            workspace.ik_state,
+            candidate_scratch,
+            external,
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+            test_seam,
+#endif
+            error,
+            error_capacity);
+        if (outcome == G1FrameStageFiniteReject) {
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+            if (trace_record != nullptr) {
+                trace_record->ik =
+                    G1CandidateDispositionFiniteRejected;
+            }
+            g1_frame_candidate_trace_failure(
+                trace_record, candidate_scratch);
+#endif
+            return G1CandidateFiniteRejected;
+        }
+        if (outcome != G1FrameStageContinue) {
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+            if (trace_record != nullptr) {
+                trace_record->ik = G1CandidateDispositionGlobalError;
+            }
+#endif
+            return G1CandidateGlobalError;
+        }
+    }
+    if (!g1_frame_branch_certificate_matches_state(
+            workspace.ik_state,
+            candidate_scratch.ik_certificate)) {
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+        if (trace_record != nullptr) {
+            trace_record->ik = G1CandidateDispositionGlobalError;
+        }
+#endif
+        return G1CandidateGlobalError;
+    }
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+    if (trace_record != nullptr) {
+        trace_record->ik = G1CandidateDispositionAccepted;
+        if (!g1_frame_candidate_dual_outcome_is_valid(
+                trace_record->common,
+                trace_record->raw,
+                trace_record->ik)) {
+            return G1CandidateGlobalError;
+        }
+    }
+#endif
+    return G1CandidateDualAccepted;
+}
+
+static inline int g1_frame_candidate_source_range(
+    const database& db,
+    int frame)
+{
+    for (int range = 0; range < db.nranges(); ++range) {
+        if (frame >= db.range_starts(range) &&
+            frame < db.range_stops(range)) {
+            return range;
+        }
+    }
+    return -1;
+}
+
+static inline bool g1_frame_candidate_record_is_valid(
+    const G1CandidateRecord& record,
+    const database& db)
+{
+    if (record.kind < G1CandidateLegacy ||
+        record.kind > G1CandidateIncumbent ||
+        record.selected_frame < 0 ||
+        record.selected_frame >= db.nframes() ||
+        record.source_range < 0 ||
+        record.source_range >= db.nranges() ||
+        record.selected_frame < db.range_starts(record.source_range) ||
+        record.selected_frame >= db.range_stops(record.source_range) ||
+        !terrain_float_is_finite(record.selected_cost) ||
+        record.selected_cost < 0.0f) {
+        return false;
+    }
+    const int range_stop = db.range_stops(record.source_range);
+    const int expected_executed =
+        record.selected_frame < range_stop - 1
+            ? record.selected_frame + 1
+            : record.selected_frame;
+    if (record.executed_frame != expected_executed) return false;
+    if (record.kind == G1CandidateRecoveryTransition) {
+        return record.transitioned &&
+               record.recovery_rank < G1RecoveryTransitionCapacity;
+    }
+    if (record.kind == G1CandidateIncumbent) {
+        return !record.transitioned &&
+               record.recovery_rank == UINT32_MAX;
+    }
+    return record.recovery_rank == UINT32_MAX;
+}
+
+static inline bool g1_frame_recovery_request_matches_prefix(
+    const G1RecoveryRequest& request,
+    const G1FrameTransactionScratch& prefix_scratch,
+    const g1_controller_state& immutable_baseline,
+    const G1CandidateRecord& legacy_record,
+    const G1FrameExternalInputs& external)
+{
+    if (!prefix_scratch.matching_scheduled ||
+        !prefix_scratch.legacy_search_performed ||
+        !prefix_scratch.recovery_request_ready ||
+        request.db == nullptr ||
+        request.db != external.db ||
+        request.incumbent_frame != immutable_baseline.frame_index ||
+        request.legacy_selected_frame != legacy_record.selected_frame ||
+        !g1_frame_float_bits_equal(
+            request.transition_cost, prefix_scratch.transition_cost) ||
+        !g1_frame_float_bits_equal(
+            request.public_incumbent_cost,
+            immutable_baseline.incumbent_cost) ||
+        !terrain_float_is_finite(request.transition_cost) ||
+        request.transition_cost < 0.0f ||
+        !terrain_float_is_finite(request.public_incumbent_cost) ||
+        request.public_incumbent_cost < 0.0f ||
+        request.ignore_range_end < 0 ||
+        request.ignore_surrounding < 0 ||
+        g1_frame_candidate_source_range(
+            *request.db, request.incumbent_frame) < 0 ||
+        g1_frame_candidate_source_range(
+            *request.db, request.legacy_selected_frame) < 0) {
+        return false;
+    }
+    for (uint32_t feature = 0U;
+         feature < G1RecoveryFeatureCount;
+         ++feature) {
+        if (!terrain_float_is_finite(request.raw_query[feature]) ||
+            !g1_frame_float_bits_equal(
+                request.raw_query[feature],
+                prefix_scratch.query[feature])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static inline bool g1_frame_recovery_set_is_valid(
+    const G1RecoveryCandidateSet& set,
+    const G1RecoveryRequest& request)
+{
+    if (request.db == nullptr ||
+        set.count > G1RecoveryTailCapacity ||
+        set.count >= G1CandidateAttemptCapacity ||
+        set.work.accelerated_traversals != 1U ||
+        set.work.full_scores_materialized != set.work.rows_tested ||
+        set.work.rows_tested >
+            static_cast<uint32_t>(request.db->nframes()) ||
+        set.work.large_bounds_tested >
+            static_cast<uint32_t>(request.db->nframes()) ||
+        set.work.small_bounds_tested >
+            static_cast<uint32_t>(request.db->nframes())) {
+        return false;
+    }
+
+    uint32_t transition_count = set.count;
+    const bool incumbent_expected =
+        request.legacy_selected_frame != request.incumbent_frame;
+    if (set.count > 0U &&
+        set.records[set.count - 1U].kind == G1CandidateIncumbent) {
+        --transition_count;
+    }
+    if ((incumbent_expected && transition_count + 1U != set.count) ||
+        (!incumbent_expected && transition_count != set.count) ||
+        transition_count > G1RecoveryTransitionCapacity ||
+        set.work.rows_tested < transition_count) {
+        return false;
+    }
+
+    for (uint32_t index = 0U; index < transition_count; ++index) {
+        const G1CandidateRecord& record = set.records[index];
+        if (!g1_frame_candidate_record_is_valid(
+                record, *request.db) ||
+            record.kind != G1CandidateRecoveryTransition ||
+            record.recovery_rank != index) {
+            return false;
+        }
+        const int range_start =
+            request.db->range_starts(record.source_range);
+        const int range_stop =
+            request.db->range_stops(record.source_range);
+        const int range_length = range_stop - range_start;
+        const int search_stop =
+            request.ignore_range_end < range_length
+                ? range_stop - request.ignore_range_end
+                : range_start;
+        const int64_t incumbent_separation =
+            record.selected_frame >= request.incumbent_frame
+                ? static_cast<int64_t>(record.selected_frame) -
+                      request.incumbent_frame
+                : static_cast<int64_t>(request.incumbent_frame) -
+                      record.selected_frame;
+        if (record.selected_frame == request.incumbent_frame ||
+            record.selected_frame == request.legacy_selected_frame ||
+            record.selected_frame >= search_stop ||
+            incumbent_separation <
+                static_cast<int64_t>(request.ignore_surrounding) ||
+            (record.selected_cost == 0.0f &&
+             terrain_float_bits(record.selected_cost) != 0U) ||
+            (terrain_float_bits(request.public_incumbent_cost) !=
+                 terrain_float_bits(FLT_MAX) &&
+             !(record.selected_cost < request.public_incumbent_cost))) {
+            return false;
+        }
+        for (uint32_t previous = 0U; previous < index; ++previous) {
+            if (set.records[previous].selected_frame ==
+                record.selected_frame) {
+                return false;
+            }
+        }
+        if (index > 0U) {
+            const G1CandidateRecord& previous = set.records[index - 1U];
+            if (record.selected_cost < previous.selected_cost ||
+                (record.selected_cost == previous.selected_cost &&
+                 record.selected_frame < previous.selected_frame)) {
+                return false;
+            }
+        }
+    }
+
+    if (incumbent_expected) {
+        const G1CandidateRecord& incumbent =
+            set.records[transition_count];
+        const int source_range = g1_frame_candidate_source_range(
+            *request.db, request.incumbent_frame);
+        if (!g1_frame_candidate_record_is_valid(
+                incumbent, *request.db) ||
+            incumbent.kind != G1CandidateIncumbent ||
+            incumbent.selected_frame != request.incumbent_frame ||
+            incumbent.source_range != source_range ||
+            !g1_frame_float_bits_equal(
+                incumbent.selected_cost,
+                request.public_incumbent_cost)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+static inline bool g1_frame_trace_append_attempt(
+    G1CandidateCertificationTrace* trace,
+    const G1CandidateRecord& candidate,
+    G1CandidateScoreOwner score_owner,
+    G1CandidateAttemptTraceRecord*& trace_record)
+{
+    trace_record = nullptr;
+    if (trace == nullptr) return true;
+    if (score_owner == G1CandidateScoreUnassigned ||
+        trace->attempt_count >= G1CandidateAttemptCapacity) {
+        return false;
+    }
+    trace_record = &trace->attempts[trace->attempt_count];
+    g1_frame_attempt_trace_reset(*trace_record);
+    trace_record->candidate = candidate;
+    trace_record->score_owner = score_owner;
+    ++trace->attempt_count;
+    return true;
+}
+#endif
+
+static inline bool g1_frame_candidate_failure_is_authentic(
+    const G1FrameTransactionScratch& scratch)
+{
+    return scratch.requested_intent_ready &&
+           g1_frame_intent_is_valid(scratch.requested_intent) &&
+           g1_frame_rejection_is_valid(scratch.rejection) &&
+           scratch.rejection.rejected &&
+           g1_frame_rejection_matches_scratch_transaction(
+               scratch.rejection, scratch);
+}
+
+static inline G1FrameTransactionStatus g1_frame_transaction_run(
+    G1FrameRuntime& runtime,
+    G1FrameStageRunner run_stage,
+    G1RecoveryProvider recovery_provider,
+    const G1FrameExternalInputs& external,
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+    const G1FrameTransactionTestSeam* test_seam,
+#endif
+    char* error,
+    int error_capacity)
+{
+    if (run_stage == nullptr || recovery_provider == nullptr ||
         !g1_frame_transaction_preflight(
             runtime,
             external,
@@ -2831,8 +3664,21 @@ static inline G1FrameTransactionStatus g1_frame_transaction_run(
             test_seam,
 #endif
             error,
-            error_capacity) ||
-        !g1_controller_state_copy(
+            error_capacity)) {
+        return G1FrameTransactionGlobalError;
+    }
+
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+    G1CandidateCertificationTrace* certification_trace =
+        test_seam != nullptr
+            ? test_seam->certification_trace
+            : nullptr;
+    if (certification_trace != nullptr) {
+        g1_frame_certification_trace_reset(*certification_trace);
+    }
+#endif
+
+    if (!g1_controller_state_copy(
             runtime.working_state,
             runtime.accepted_state,
             error,
@@ -2841,77 +3687,309 @@ static inline G1FrameTransactionStatus g1_frame_transaction_run(
         return G1FrameTransactionGlobalError;
     }
 
-    g1_controller_state& working_state = runtime.working_state;
-    G1FrameTransactionScratch scratch;
-    scratch.prior_safe_stop_latched =
+    G1FrameTransactionScratch prefix_scratch;
+    prefix_scratch.prior_safe_stop_latched =
         runtime.publication.ik_safe_stop_latched;
-
-    for (int stage_index = 0;
-         stage_index < G1FrameStageCount;
+    for (int stage_index = G1FrameStageInputRouteCommand;
+         stage_index <= G1FrameStageMatcherSearch;
          ++stage_index) {
-        const G1FrameTransactionStage stage =
-            static_cast<G1FrameTransactionStage>(stage_index);
-        const G1FrameStageOutcome outcome = run_stage(
-            stage, working_state, scratch, external,
-            error, error_capacity);
-        switch (outcome) {
-        case G1FrameStageContinue:
-            break;
-        case G1FrameStageFiniteReject:
-            if (!g1_frame_publish_finite_rejection(
-                    runtime, scratch, external, true)) {
+        const G1FrameStageOutcome outcome = g1_frame_run_one_stage(
+            static_cast<G1FrameTransactionStage>(stage_index),
+            run_stage,
+            runtime.working_state,
+            prefix_scratch,
+            external,
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+            test_seam,
+#endif
+            error,
+            error_capacity);
+        if (outcome == G1FrameStageFiniteReject) {
+            if (!g1_frame_candidate_failure_is_authentic(
+                    prefix_scratch) ||
+                !g1_frame_publish_finite_rejection(
+                    runtime,
+                    prefix_scratch,
+                    external,
+                    true)) {
                 return G1FrameTransactionGlobalError;
             }
             return G1FrameTransactionFiniteRejected;
-        case G1FrameStageGlobalError:
-            return G1FrameTransactionGlobalError;
-        default:
+        }
+        if (outcome != G1FrameStageContinue) {
             return G1FrameTransactionGlobalError;
         }
+    }
+    if (!g1_controller_state_is_valid(runtime.working_state)) {
+        return G1FrameTransactionGlobalError;
+    }
+
+    const bool matching_enabled =
+        external.tuning.mode != G1_TestSequential;
+    const bool matching_scheduled =
+        matching_enabled && prefix_scratch.matching_scheduled;
+    if (prefix_scratch.matching_scheduled != matching_scheduled ||
+        prefix_scratch.legacy_search_performed != matching_scheduled ||
+        prefix_scratch.recovery_request_ready != matching_scheduled) {
+        return G1FrameTransactionGlobalError;
+    }
+
+    G1CandidateRecord slot_zero = prefix_scratch.slot_zero_record;
 #if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
-        if (test_seam != nullptr && test_seam->hook != nullptr) {
-            const G1FrameInjectedOutcome injected = test_seam->hook(
-                stage,
-                working_state,
-                scratch,
-                external,
-                test_seam->control,
-                error,
-                error_capacity);
-            if (injected == G1FrameInjectFiniteReject) {
+    G1CandidateScoreOwner slot_zero_score_owner =
+        G1CandidateScoreUnassigned;
+#endif
+    if (matching_scheduled) {
+        slot_zero.kind = G1CandidateLegacy;
+        slot_zero.recovery_rank = UINT32_MAX;
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+        slot_zero_score_owner = G1CandidateScoreLegacy;
+        if (certification_trace != nullptr) {
+            certification_trace->legacy_traversals = 1U;
+        }
+#endif
+    } else {
+        slot_zero.kind = G1CandidateIncumbent;
+        slot_zero.recovery_rank = UINT32_MAX;
+        slot_zero.transitioned = false;
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+        slot_zero_score_owner = G1CandidateScoreIncumbent;
+#endif
+    }
+    prefix_scratch.slot_zero_record = slot_zero;
+
+    const int baseline_source_range = g1_frame_candidate_source_range(
+        *external.db, runtime.working_state.frame_index);
+    if (!g1_frame_candidate_record_is_valid(
+            slot_zero, *external.db) ||
+        (!matching_scheduled &&
+         (slot_zero.selected_frame !=
+              runtime.working_state.frame_index ||
+          slot_zero.source_range != baseline_source_range ||
+          !g1_frame_float_bits_equal(
+              slot_zero.selected_cost,
+              runtime.working_state.incumbent_cost)))) {
+        return G1FrameTransactionGlobalError;
+    }
+
+    bool first_failure_available = false;
+    G1FrameTransactionScratch first_failure_scratch;
+    G1FrameTransactionScratch candidate_scratch;
+
+    const auto evaluate_record =
+        [&](const G1CandidateRecord& record
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+            , G1CandidateScoreOwner score_owner
+#endif
+            ) -> G1CandidateEvaluationOutcome {
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+            G1CandidateAttemptTraceRecord* trace_record = nullptr;
+            if (!g1_frame_trace_append_attempt(
+                    certification_trace,
+                    record,
+                    score_owner,
+                    trace_record)) {
+                return G1CandidateGlobalError;
+            }
+#endif
+            const G1CandidateEvaluationOutcome outcome =
+                g1_frame_candidate_evaluate(
+                    runtime.candidates,
+                    candidate_scratch,
+                    runtime.working_state,
+                    prefix_scratch,
+                    record,
+                    run_stage,
+                    external,
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+                    trace_record,
+                    test_seam,
+#endif
+                    error,
+                    error_capacity);
+            if (outcome == G1CandidateFiniteRejected) {
+                if (!g1_frame_candidate_failure_is_authentic(
+                        candidate_scratch)) {
+                    return G1CandidateGlobalError;
+                }
+                if (!first_failure_available) {
+                    first_failure_scratch = candidate_scratch;
+                    first_failure_available = true;
+                }
+            }
+            return outcome;
+        };
+
+    const auto commit_selected =
+        [&]() -> G1FrameTransactionStatus {
+            g1_controller_state& visible =
+                external.tuning.ik_enabled
+                    ? runtime.candidates.ik_state
+                    : runtime.candidates.raw_state;
+            if (!g1_controller_state_copy(
+                    runtime.working_state,
+                    visible,
+                    error,
+                    error_capacity)) {
+                return G1FrameTransactionGlobalError;
+            }
+            runtime.working_state.ik =
+                runtime.candidates.ik_state.ik;
+
+            const G1FrameStageOutcome finalize_outcome =
+                g1_frame_run_one_stage(
+                    G1FrameStageAcceptedFinalize,
+                    run_stage,
+                    runtime.working_state,
+                    candidate_scratch,
+                    external,
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+                    test_seam,
+#endif
+                    error,
+                    error_capacity);
+            if (finalize_outcome == G1FrameStageFiniteReject) {
+                if (!g1_frame_candidate_failure_is_authentic(
+                        candidate_scratch)) {
+                    return G1FrameTransactionGlobalError;
+                }
+                if (!first_failure_available) {
+                    first_failure_scratch = candidate_scratch;
+                    first_failure_available = true;
+                }
                 if (!g1_frame_publish_finite_rejection(
-                        runtime, scratch, external, false)) {
+                        runtime,
+                        first_failure_scratch,
+                        external,
+                        true)) {
                     return G1FrameTransactionGlobalError;
                 }
                 return G1FrameTransactionFiniteRejected;
             }
-            if (injected == G1FrameInjectGlobalError) {
+            if (finalize_outcome != G1FrameStageContinue) {
                 return G1FrameTransactionGlobalError;
             }
-            if (injected != G1FrameInjectContinue) {
-                return G1FrameTransactionGlobalError;
-            }
-        }
-#endif
-    }
 
-    G1FramePublication publication_candidate;
-    G1FrameAcceptedDiagnostic accepted_diagnostic_candidate;
-    if (!g1_frame_success_candidates_are_valid(
-            working_state,
-            scratch,
-            external,
-            publication_candidate,
-            accepted_diagnostic_candidate)) {
+            G1FramePublication publication_candidate;
+            G1FrameAcceptedDiagnostic accepted_diagnostic_candidate;
+            if (!g1_frame_success_candidates_are_valid(
+                    runtime.working_state,
+                    candidate_scratch,
+                    external,
+                    publication_candidate,
+                    accepted_diagnostic_candidate)) {
+                return G1FrameTransactionGlobalError;
+            }
+            g1_controller_state_swap(
+                runtime.accepted_state, runtime.working_state);
+            runtime.accepted_diagnostic =
+                accepted_diagnostic_candidate;
+            runtime.publication = publication_candidate;
+            return G1FrameTransactionAccepted;
+        };
+
+    const G1CandidateEvaluationOutcome slot_zero_outcome =
+        evaluate_record(
+            slot_zero
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+            , slot_zero_score_owner
+#endif
+        );
+    if (slot_zero_outcome == G1CandidateGlobalError) {
         return G1FrameTransactionGlobalError;
     }
-    g1_controller_state_swap(
-        runtime.accepted_state, runtime.working_state);
-    runtime.accepted_diagnostic = accepted_diagnostic_candidate;
-    runtime.publication = publication_candidate;
-    return G1FrameTransactionAccepted;
-}
+    if (slot_zero_outcome == G1CandidateDualAccepted) {
+        return commit_selected();
+    }
+    if (!first_failure_available) {
+        return G1FrameTransactionGlobalError;
+    }
 
+    if (!matching_scheduled) {
+        if (!g1_frame_publish_finite_rejection(
+                runtime,
+                first_failure_scratch,
+                external,
+                true)) {
+            return G1FrameTransactionGlobalError;
+        }
+        return G1FrameTransactionFiniteRejected;
+    }
+
+    const G1RecoveryRequest& recovery_request =
+        prefix_scratch.recovery_request;
+    if (!g1_frame_recovery_request_matches_prefix(
+            recovery_request,
+            prefix_scratch,
+            runtime.working_state,
+            slot_zero,
+            external)) {
+        return G1FrameTransactionGlobalError;
+    }
+
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+    if (certification_trace != nullptr) {
+        certification_trace->recovery_request_available = true;
+        certification_trace->recovery_request = recovery_request;
+        certification_trace->recovery_provider_calls = 1U;
+    }
+#endif
+    G1RecoveryCandidateSet recovery_set;
+    const G1RecoveryProviderStatus provider_status =
+        recovery_provider(
+            recovery_set,
+            recovery_request,
+            error,
+            error_capacity);
+    if (provider_status != G1RecoveryProviderOk) {
+        return G1FrameTransactionGlobalError;
+    }
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+    if (certification_trace != nullptr) {
+        certification_trace->recovery_set = recovery_set;
+    }
+#endif
+    if (!g1_frame_recovery_set_is_valid(
+            recovery_set, recovery_request)) {
+        return G1FrameTransactionGlobalError;
+    }
+
+    for (uint32_t index = 0U;
+         index < recovery_set.count;
+         ++index) {
+        const G1CandidateRecord& record =
+            recovery_set.records[index];
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+        const G1CandidateScoreOwner score_owner =
+            record.kind == G1CandidateRecoveryTransition
+                ? G1CandidateScoreStrictRecovery
+                : G1CandidateScoreIncumbent;
+#endif
+        const G1CandidateEvaluationOutcome outcome =
+            evaluate_record(
+                record
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+                , score_owner
+#endif
+            );
+        if (outcome == G1CandidateGlobalError) {
+            return G1FrameTransactionGlobalError;
+        }
+        if (outcome == G1CandidateDualAccepted) {
+            return commit_selected();
+        }
+    }
+
+    if (!first_failure_available ||
+        !g1_frame_publish_finite_rejection(
+            runtime,
+            first_failure_scratch,
+            external,
+            true)) {
+        return G1FrameTransactionGlobalError;
+    }
+    return G1FrameTransactionFiniteRejected;
+}
 static inline bool g1_frame_runtime_reset(
     G1FrameRuntime& output,
     const database& db,
@@ -3001,39 +4079,79 @@ static inline bool g1_frame_runtime_reset(
             config.dt,
             config.trajectory_sample_time,
             error,
+            error_capacity) ||
+        !g1_controller_state_reset_configured(
+            candidate.candidates.common_state,
+            db,
+            support,
+            scene,
+            config.initial_search_time,
+            config.ik_enabled,
+            config.dt,
+            config.trajectory_sample_time,
+            error,
+            error_capacity) ||
+        !g1_controller_state_reset_configured(
+            candidate.candidates.raw_state,
+            db,
+            support,
+            scene,
+            config.initial_search_time,
+            config.ik_enabled,
+            config.dt,
+            config.trajectory_sample_time,
+            error,
+            error_capacity) ||
+        !g1_controller_state_reset_configured(
+            candidate.candidates.ik_state,
+            db,
+            support,
+            scene,
+            config.initial_search_time,
+            config.ik_enabled,
+            config.dt,
+            config.trajectory_sample_time,
+            error,
             error_capacity)) {
         return false;
     }
 
+    g1_controller_state* candidate_states[5] = {
+        &candidate.accepted_state,
+        &candidate.working_state,
+        &candidate.candidates.common_state,
+        &candidate.candidates.raw_state,
+        &candidate.candidates.ik_state,
+    };
     if (config.route_mode) {
-        candidate.accepted_state.route_index = route_index;
-        candidate.accepted_state.route_waypoint = 1;
-        candidate.accepted_state.route_frames = 0;
-        candidate.working_state.route_index = route_index;
-        candidate.working_state.route_waypoint = 1;
-        candidate.working_state.route_frames = 0;
+        for (int state_index = 0; state_index < 5; ++state_index) {
+            candidate_states[state_index]->route_index = route_index;
+            candidate_states[state_index]->route_waypoint = 1;
+            candidate_states[state_index]->route_frames = 0;
+        }
     } else {
-        candidate.accepted_state.route_index = -1;
-        candidate.accepted_state.route_waypoint = 0;
-        candidate.accepted_state.route_frames = 0;
-        candidate.working_state.route_index = -1;
-        candidate.working_state.route_waypoint = 0;
-        candidate.working_state.route_frames = 0;
+        for (int state_index = 0; state_index < 5; ++state_index) {
+            candidate_states[state_index]->route_index = -1;
+            candidate_states[state_index]->route_waypoint = 0;
+            candidate_states[state_index]->route_frames = 0;
+        }
     }
 
-    if (!g1_frame_reset_candidate_is_valid(
-            candidate.accepted_state,
-            config.initial_search_time) ||
-        !g1_frame_reset_candidate_is_valid(
-            candidate.working_state,
-            config.initial_search_time) ||
-        !g1_frame_controller_states_equal(
-            candidate.accepted_state,
-            candidate.working_state)) {
+    for (int state_index = 0; state_index < 5; ++state_index) {
+        if (!g1_frame_reset_candidate_is_valid(
+                *candidate_states[state_index],
+                config.initial_search_time)) {
+            return scene_error(
+                error,
+                error_capacity,
+                "frame runtime reset: independent state is invalid");
+        }
+    }
+    if (!g1_frame_runtime_states_are_logically_equal(candidate)) {
         return scene_error(
             error,
             error_capacity,
-            "frame runtime reset: independent state pair is invalid");
+            "frame runtime reset: independent states differ");
     }
 
     candidate.publication = G1FramePublication{};
@@ -3045,6 +4163,15 @@ static inline bool g1_frame_runtime_reset(
         output.accepted_state, candidate.accepted_state);
     g1_controller_state_swap(
         output.working_state, candidate.working_state);
+    g1_controller_state_swap(
+        output.candidates.common_state,
+        candidate.candidates.common_state);
+    g1_controller_state_swap(
+        output.candidates.raw_state,
+        candidate.candidates.raw_state);
+    g1_controller_state_swap(
+        output.candidates.ik_state,
+        candidate.candidates.ik_state);
     output.publication = candidate.publication;
     output.accepted_diagnostic = candidate.accepted_diagnostic;
     return true;

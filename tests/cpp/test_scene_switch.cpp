@@ -123,6 +123,507 @@ static scene_pack fixture_scene(const char* id, float x)
     return scene;
 }
 
+#define G1_FOR_EACH_STATE_ARRAY(MACRO) \
+    MACRO(curr_bone_positions); \
+    MACRO(curr_bone_velocities); \
+    MACRO(trns_bone_positions); \
+    MACRO(trns_bone_velocities); \
+    MACRO(curr_bone_rotations); \
+    MACRO(trns_bone_rotations); \
+    MACRO(curr_bone_angular_velocities); \
+    MACRO(trns_bone_angular_velocities); \
+    MACRO(curr_bone_contacts); \
+    MACRO(trns_bone_contacts); \
+    MACRO(bone_positions); \
+    MACRO(bone_velocities); \
+    MACRO(bone_angular_velocities); \
+    MACRO(bone_rotations); \
+    MACRO(bone_offset_positions); \
+    MACRO(bone_offset_velocities); \
+    MACRO(bone_offset_angular_velocities); \
+    MACRO(bone_offset_rotations); \
+    MACRO(adjusted_bone_positions); \
+    MACRO(global_bone_positions); \
+    MACRO(global_bone_velocities); \
+    MACRO(adjusted_bone_rotations); \
+    MACRO(global_bone_rotations); \
+    MACRO(global_bone_angular_velocities); \
+    MACRO(global_bone_computed); \
+    MACRO(trajectory_desired_velocities); \
+    MACRO(trajectory_positions); \
+    MACRO(trajectory_velocities); \
+    MACRO(trajectory_accelerations); \
+    MACRO(trajectory_angular_velocities); \
+    MACRO(trajectory_desired_rotations); \
+    MACRO(trajectory_rotations); \
+    MACRO(contact_bones); \
+    MACRO(contact_states); \
+    MACRO(contact_locks); \
+    MACRO(contact_positions); \
+    MACRO(contact_velocities); \
+    MACRO(contact_points); \
+    MACRO(contact_targets); \
+    MACRO(contact_offset_positions); \
+    MACRO(contact_offset_velocities); \
+    MACRO(ik_bone_positions); \
+    MACRO(ik_bone_rotations); \
+    MACRO(ik_global_bone_positions); \
+    MACRO(ik_global_bone_rotations); \
+    MACRO(ik_candidate_bone_positions); \
+    MACRO(ik_candidate_bone_rotations); \
+    MACRO(ik_candidate_global_bone_positions); \
+    MACRO(ik_candidate_global_bone_rotations)
+
+static void logical_hash_word(uint64_t& hash, uint64_t value)
+{
+    for (int byte = 0; byte < 8; ++byte) {
+        hash ^= (value >> (byte * 8)) & UINT64_C(0xff);
+        hash *= UINT64_C(1099511628211);
+    }
+}
+
+static void logical_hash_value(uint64_t& hash, bool value)
+{
+    logical_hash_word(hash, value ? 1U : 0U);
+}
+
+static void logical_hash_value(uint64_t& hash, int value)
+{
+    logical_hash_word(hash, static_cast<uint32_t>(value));
+}
+
+static void logical_hash_value(uint64_t& hash, uint32_t value)
+{
+    logical_hash_word(hash, value);
+}
+
+static void logical_hash_value(uint64_t& hash, float value)
+{
+    logical_hash_word(hash, terrain_float_bits(value));
+}
+
+static void logical_hash_value(uint64_t& hash, double value)
+{
+    uint64_t bits = 0U;
+    std::memcpy(&bits, &value, sizeof(bits));
+    logical_hash_word(hash, bits);
+}
+
+static void logical_hash_value(uint64_t& hash, vec3 value)
+{
+    logical_hash_value(hash, value.x);
+    logical_hash_value(hash, value.y);
+    logical_hash_value(hash, value.z);
+}
+
+static void logical_hash_value(uint64_t& hash, quat value)
+{
+    logical_hash_value(hash, value.w);
+    logical_hash_value(hash, value.x);
+    logical_hash_value(hash, value.y);
+    logical_hash_value(hash, value.z);
+}
+
+template<class T>
+static void logical_hash_array(uint64_t& hash, const array1d<T>& values)
+{
+    logical_hash_value(hash, values.size);
+    for (int index = 0; index < values.size; ++index) {
+        logical_hash_value(hash, values(index));
+    }
+}
+
+static void logical_hash_surface(
+    uint64_t& hash, const G1SurfaceSample& value)
+{
+    logical_hash_value(hash, value.height);
+    logical_hash_value(hash, value.normal);
+}
+
+static void logical_hash_clearance_work(
+    uint64_t& hash, const G1ClearanceWork& value)
+{
+    logical_hash_value(hash, value.point_queries);
+    logical_hash_value(hash, value.cells_visited);
+    logical_hash_value(hash, value.primitive_triangle_pairs);
+    logical_hash_value(hash, value.face_patches);
+    logical_hash_value(hash, value.candidate_tests);
+    logical_hash_value(hash, value.subdivision_nodes);
+}
+
+static void logical_hash_clearance_result(
+    uint64_t& hash, const G1ClearanceResult& value)
+{
+    logical_hash_value(hash, value.lower_bound_m);
+    logical_hash_value(hash, value.witness_upper_m);
+    logical_hash_value(hash, value.witness.body_x);
+    logical_hash_value(hash, value.witness.body_y);
+    logical_hash_value(hash, value.witness.body_z);
+    logical_hash_value(hash, value.witness.surface_x);
+    logical_hash_value(hash, value.witness.surface_y);
+    logical_hash_value(hash, value.witness.surface_z);
+    logical_hash_value(hash, value.witness.segment_parameter);
+    logical_hash_value(hash, value.witness.terrain_weight_0);
+    logical_hash_value(hash, value.witness.terrain_weight_1);
+    logical_hash_value(hash, value.witness.terrain_weight_2);
+    logical_hash_value(hash, value.witness.primitive_index);
+    logical_hash_value(hash, value.witness.cell_x);
+    logical_hash_value(hash, value.witness.cell_z);
+    logical_hash_value(hash, value.witness.terrain_triangle_index);
+    logical_hash_value(hash, value.witness.patch_index);
+    logical_hash_value(hash, value.witness.candidate_kind);
+    logical_hash_value(hash, value.witness.candidate_subindex);
+    logical_hash_clearance_work(hash, value.work);
+}
+
+static void logical_hash_leg_clearance(
+    uint64_t& hash, const G1LegClearance& value)
+{
+    logical_hash_clearance_result(hash, value.knee);
+    logical_hash_clearance_result(hash, value.ankle);
+    logical_hash_clearance_result(hash, value.toe);
+    logical_hash_clearance_result(hash, value.foot);
+    logical_hash_clearance_result(hash, value.thigh);
+    logical_hash_clearance_result(hash, value.shin);
+    logical_hash_clearance_result(hash, value.minimum);
+}
+
+static void logical_hash_pose_clearance(
+    uint64_t& hash, const G1PoseClearance& value)
+{
+    logical_hash_clearance_result(hash, value.hips);
+    logical_hash_leg_clearance(hash, value.left);
+    logical_hash_leg_clearance(hash, value.right);
+    logical_hash_clearance_result(hash, value.minimum);
+}
+
+static void logical_hash_intent(uint64_t& hash, const G1CommandIntent& value)
+{
+    logical_hash_value(hash, value.requested_velocity);
+    logical_hash_value(hash, value.desired_heading);
+}
+
+static void logical_hash_command(
+    uint64_t& hash, const G1CommandSnapshot& value)
+{
+    logical_hash_intent(hash, value.intent);
+    logical_hash_value(hash, value.applied_velocity);
+    for (int sample = 0;
+         sample < G1CommandTrajectorySampleCount;
+         ++sample) {
+        logical_hash_value(hash, value.predicted_desired_velocities[sample]);
+        logical_hash_value(hash, value.predicted_root_positions[sample]);
+        logical_hash_value(hash, value.predicted_root_rotations[sample]);
+        logical_hash_value(hash, value.predicted_desired_headings[sample]);
+    }
+}
+
+static void logical_hash_support(
+    uint64_t& hash, const support_frame_state& value)
+{
+    logical_hash_value(hash, value.height);
+    logical_hash_value(hash, value.velocity);
+    logical_hash_value(hash, value.nominal_height);
+    logical_hash_value(hash, value.nominal_velocity);
+    logical_hash_value(hash, value.offset_height);
+    logical_hash_value(hash, value.offset_velocity);
+    logical_hash_value(hash, value.airborne_frames);
+    logical_hash_value(hash, static_cast<int>(value.source));
+    logical_hash_value(hash, value.initialized);
+}
+
+static void logical_hash_support_observation(
+    uint64_t& hash, const support_observation& value)
+{
+    for (int index = 0; index < 3; ++index) {
+        logical_hash_value(hash, value.source_height[index]);
+        logical_hash_value(hash, value.runtime_height[index]);
+        logical_hash_value(hash, value.delta[index]);
+    }
+    logical_hash_value(hash, value.contact[0]);
+    logical_hash_value(hash, value.contact[1]);
+}
+
+static void logical_hash_footprint(
+    uint64_t& hash, const G1FootprintObservation& value)
+{
+    logical_hash_surface(hash, value.root_surface);
+    for (int foot_index = 0; foot_index < 2; ++foot_index) {
+        const G1FootprintFootObservation& foot = value.feet[foot_index];
+        for (int probe_index = 0; probe_index < 4; ++probe_index) {
+            const G1FootprintProbe& probe = foot.probes[probe_index];
+            logical_hash_value(hash, probe.current_sphere_center);
+            logical_hash_value(hash, probe.current_sole_point);
+            logical_hash_surface(hash, probe.current_surface);
+            for (int sample = 0;
+                 sample < G1CommandTrajectorySampleCount;
+                 ++sample) {
+                logical_hash_value(hash, probe.predicted_sphere_centers[sample]);
+                logical_hash_value(hash, probe.predicted_sole_points[sample]);
+                logical_hash_value(
+                    hash,
+                    static_cast<int>(probe.predicted_surface_status[sample]));
+                logical_hash_surface(hash, probe.predicted_surfaces[sample]);
+            }
+            logical_hash_surface(hash, probe.selected_landing_surface);
+            logical_hash_value(hash, probe.corridor_minimum_height);
+            logical_hash_value(hash, probe.corridor_maximum_height);
+            logical_hash_value(hash, probe.encountered_walkability_class);
+        }
+        logical_hash_value(hash, foot.current_contact);
+        logical_hash_value(hash, foot.landing_expected);
+        logical_hash_value(hash, foot.landing_patch_ready);
+        logical_hash_value(hash, foot.landing_sample);
+        logical_hash_value(hash, foot.predicted_landing_sole_center);
+        logical_hash_value(
+            hash, static_cast<int>(foot.predicted_landing_surface_status));
+        logical_hash_surface(hash, foot.predicted_landing_surface);
+        logical_hash_value(hash, foot.predicted_landing_walkability_class);
+        logical_hash_value(hash, foot.landing_patch_maximum_residual_m);
+        logical_hash_value(hash, foot.corridor_minimum_height);
+        logical_hash_value(hash, foot.corridor_maximum_height);
+        logical_hash_value(hash, foot.maximum_root_split_m);
+        logical_hash_value(hash, foot.encountered_walkability_class);
+        logical_hash_value(hash, foot.multilevel);
+    }
+    logical_hash_value(hash, value.blocked);
+    logical_hash_value(hash, static_cast<int>(value.blocked_reason));
+    logical_hash_value(hash, value.work.sweeps);
+    logical_hash_value(hash, value.work.surface_queries);
+    logical_hash_value(hash, value.work.node_visits);
+}
+
+static void logical_hash_lock(uint64_t& hash, const G1FootLockState& value)
+{
+    logical_hash_value(hash, value.initialized);
+    logical_hash_value(hash, value.contact);
+    logical_hash_value(hash, value.locked);
+    logical_hash_value(hash, value.position_active);
+    logical_hash_value(hash, value.releasing);
+    logical_hash_value(hash, value.release_frames);
+    logical_hash_value(hash, value.previous_input);
+    logical_hash_value(hash, value.lock_point);
+    logical_hash_value(hash, value.output_position);
+    logical_hash_value(hash, value.output_velocity);
+    logical_hash_value(hash, value.offset_position);
+    logical_hash_value(hash, value.offset_velocity);
+}
+
+static void logical_hash_ik_state(uint64_t& hash, const G1IkState& value)
+{
+    logical_hash_value(hash, value.initialized);
+    for (int foot = 0; foot < 2; ++foot) {
+        logical_hash_lock(hash, value.feet[foot].lock);
+        logical_hash_value(hash, value.feet[foot].swing.initialized);
+        for (int probe = 0; probe < 4; ++probe) {
+            logical_hash_value(
+                hash, value.feet[foot].swing.previous_sphere_centers[probe]);
+        }
+        logical_hash_value(
+            hash, value.feet[foot].baseline_sole_normal);
+    }
+}
+
+static void logical_hash_target(uint64_t& hash, const G1FootTarget& value)
+{
+    logical_hash_value(hash, value.locked);
+    logical_hash_value(hash, value.position_active);
+    logical_hash_value(hash, value.releasing);
+    logical_hash_value(hash, value.drift_limit_exceeded);
+    logical_hash_value(hash, value.surface.point);
+    logical_hash_value(hash, value.surface.normal);
+    logical_hash_value(hash, value.desired_sole_normal);
+    logical_hash_value(hash, value.sole_center);
+    logical_hash_value(hash, value.horizontal_drift_m);
+}
+
+static void logical_hash_swing_candidate(
+    uint64_t& hash, const G1SwingCandidateDiagnostic& value)
+{
+    logical_hash_value(hash, value.candidate_index);
+    logical_hash_value(hash, value.lift_bits);
+    logical_hash_value(hash, value.materialized_command_y_bits);
+    for (int probe = 0; probe < 4; ++probe) {
+        for (int axis = 0; axis < 3; ++axis) {
+            logical_hash_value(
+                hash, value.actual_sphere_center_bits[probe][axis]);
+        }
+    }
+    logical_hash_value(hash, static_cast<int>(value.clearance_status));
+    logical_hash_value(hash, value.controller_constraints_passed);
+    logical_hash_value(hash, value.clearance_certified);
+    logical_hash_value(hash, value.lower_margin_m);
+    logical_hash_value(hash, value.witness_upper_margin_m);
+    logical_hash_clearance_work(hash, value.clearance_work);
+}
+
+static void logical_hash_frame_result(
+    uint64_t& hash, const G1IkFrameResult& value)
+{
+    logical_hash_value(hash, value.applied);
+    logical_hash_value(hash, value.safe_stop_requested);
+    logical_hash_value(hash, static_cast<int>(value.stop_reason));
+    logical_hash_value(hash, value.max_correction_radians);
+    logical_hash_value(hash, value.root_reach.active);
+    logical_hash_value(hash, value.root_reach.common_interval_found);
+    logical_hash_value(hash, value.root_reach.applied);
+    logical_hash_value(hash, value.root_reach.root_y_delta_m);
+    for (int foot = 0; foot < 2; ++foot) {
+        const G1FootFrameResult& result = value.feet[foot];
+        logical_hash_value(hash, result.recorded_contact);
+        logical_hash_target(hash, result.target);
+        logical_hash_value(hash, result.swing_selection.candidates_evaluated);
+        logical_hash_value(hash, result.swing_selection.selected_index);
+        logical_hash_swing_candidate(hash, result.swing_selection.selected);
+        logical_hash_clearance_work(
+            hash, result.swing_selection.total_clearance_work);
+        logical_hash_value(hash, result.defensive_swing.lower_margin_m);
+        logical_hash_value(hash, result.defensive_swing.witness_upper_m);
+        logical_hash_value(hash, result.defensive_swing.sweep_evaluated);
+        logical_hash_clearance_work(hash, result.defensive_swing.work);
+        const G1LegSolveResult& position = result.position;
+        logical_hash_value(hash, position.applied);
+        logical_hash_value(hash, position.reachable);
+        logical_hash_value(hash, position.correction_limited);
+        logical_hash_value(hash, position.safe_stop_requested);
+        logical_hash_value(hash, position.iterations);
+        logical_hash_value(
+            hash, static_cast<int>(position.iteration_provenance));
+        logical_hash_value(hash, position.requested_ankle_target);
+        logical_hash_value(hash, position.clamped_ankle_target);
+        logical_hash_value(hash, position.hinge_axis_world);
+        logical_hash_value(hash, position.bend_direction);
+        logical_hash_value(hash, position.bend_used_current_projection);
+        logical_hash_value(hash, position.bend_used_hinge_fallback);
+        logical_hash_value(hash, position.bend_used_safe_perpendicular);
+        logical_hash_value(hash, position.bend_sign_flipped);
+        logical_hash_value(hash, position.raw_distance_m);
+        logical_hash_value(hash, position.clamped_distance_m);
+        logical_hash_value(hash, position.max_correction_radians);
+        logical_hash_value(hash, position.contact_residual_m);
+        const G1FootOrientationResult& orientation = result.orientation;
+        logical_hash_value(hash, orientation.applied);
+        logical_hash_value(hash, orientation.correction_limited);
+        logical_hash_value(hash, orientation.safe_stop_requested);
+        logical_hash_value(hash, orientation.target_global_rotation);
+        logical_hash_value(hash, orientation.requested_correction_radians);
+        logical_hash_value(hash, orientation.correction_radians);
+    }
+}
+
+static uint64_t state_logical_digest(const g1_controller_state& state)
+{
+    uint64_t hash = UINT64_C(1469598103934665603);
+#define HASH_VALUE(name) logical_hash_value(hash, state.name)
+#define HASH_ARRAY(name) logical_hash_array(hash, state.name)
+    HASH_VALUE(frame_index);
+    HASH_VALUE(scene_frame);
+    HASH_VALUE(search_time);
+    HASH_VALUE(search_timer);
+    HASH_VALUE(force_search_timer);
+    HASH_ARRAY(curr_bone_positions);
+    HASH_ARRAY(curr_bone_velocities);
+    HASH_ARRAY(trns_bone_positions);
+    HASH_ARRAY(trns_bone_velocities);
+    HASH_ARRAY(curr_bone_rotations);
+    HASH_ARRAY(trns_bone_rotations);
+    HASH_ARRAY(curr_bone_angular_velocities);
+    HASH_ARRAY(trns_bone_angular_velocities);
+    HASH_ARRAY(curr_bone_contacts);
+    HASH_ARRAY(trns_bone_contacts);
+    HASH_ARRAY(bone_positions);
+    HASH_ARRAY(bone_velocities);
+    HASH_ARRAY(bone_angular_velocities);
+    HASH_ARRAY(bone_rotations);
+    HASH_ARRAY(bone_offset_positions);
+    HASH_ARRAY(bone_offset_velocities);
+    HASH_ARRAY(bone_offset_angular_velocities);
+    HASH_ARRAY(bone_offset_rotations);
+    HASH_ARRAY(adjusted_bone_positions);
+    HASH_ARRAY(global_bone_positions);
+    HASH_ARRAY(global_bone_velocities);
+    HASH_ARRAY(adjusted_bone_rotations);
+    HASH_ARRAY(global_bone_rotations);
+    HASH_ARRAY(global_bone_angular_velocities);
+    HASH_ARRAY(global_bone_computed);
+    HASH_ARRAY(ik_bone_positions);
+    HASH_ARRAY(ik_bone_rotations);
+    HASH_ARRAY(ik_global_bone_positions);
+    HASH_ARRAY(ik_global_bone_rotations);
+    HASH_ARRAY(ik_candidate_bone_positions);
+    HASH_ARRAY(ik_candidate_bone_rotations);
+    HASH_ARRAY(ik_candidate_global_bone_positions);
+    HASH_ARRAY(ik_candidate_global_bone_rotations);
+    HASH_ARRAY(trajectory_desired_velocities);
+    HASH_ARRAY(trajectory_positions);
+    HASH_ARRAY(trajectory_velocities);
+    HASH_ARRAY(trajectory_accelerations);
+    HASH_ARRAY(trajectory_angular_velocities);
+    HASH_ARRAY(trajectory_desired_rotations);
+    HASH_ARRAY(trajectory_rotations);
+    HASH_ARRAY(contact_bones);
+    HASH_ARRAY(contact_states);
+    HASH_ARRAY(contact_locks);
+    HASH_ARRAY(contact_positions);
+    HASH_ARRAY(contact_velocities);
+    HASH_ARRAY(contact_points);
+    HASH_ARRAY(contact_targets);
+    HASH_ARRAY(contact_offset_positions);
+    HASH_ARRAY(contact_offset_velocities);
+    HASH_VALUE(transition_src_position);
+    HASH_VALUE(transition_dst_position);
+    HASH_VALUE(transition_src_rotation);
+    HASH_VALUE(transition_dst_rotation);
+    HASH_VALUE(desired_velocity);
+    HASH_VALUE(desired_velocity_change_curr);
+    HASH_VALUE(desired_velocity_change_prev);
+    HASH_VALUE(desired_rotation);
+    HASH_VALUE(desired_rotation_change_curr);
+    HASH_VALUE(desired_rotation_change_prev);
+    HASH_VALUE(desired_gait);
+    HASH_VALUE(desired_gait_velocity);
+    HASH_VALUE(simulation_position);
+    HASH_VALUE(simulation_velocity);
+    HASH_VALUE(simulation_acceleration);
+    HASH_VALUE(simulation_rotation);
+    HASH_VALUE(simulation_angular_velocity);
+    logical_hash_command(hash, state.command);
+    HASH_VALUE(footprint_status);
+    logical_hash_footprint(hash, state.footprint);
+    logical_hash_ik_state(hash, state.ik);
+    logical_hash_frame_result(hash, state.ik_frame);
+    logical_hash_pose_clearance(hash, state.ik_clearance);
+    logical_hash_pose_clearance(hash, state.ik_candidate_clearance);
+    HASH_VALUE(ik_candidate_clearance_status);
+    HASH_VALUE(ik_candidate_rejected);
+    logical_hash_support(hash, state.support);
+    logical_hash_support_observation(hash, state.support_observation_now);
+    HASH_VALUE(traversal_speed_scale);
+    HASH_VALUE(traversal_speed_scale_velocity);
+    HASH_VALUE(blocked);
+    HASH_VALUE(walkability_class);
+    HASH_VALUE(blocked_distance);
+    HASH_VALUE(blocked_point);
+    HASH_VALUE(route_index);
+    HASH_VALUE(route_waypoint);
+    HASH_VALUE(route_frames);
+    HASH_VALUE(camera_azimuth);
+    HASH_VALUE(camera_altitude);
+    HASH_VALUE(camera_distance);
+    HASH_VALUE(searched);
+    HASH_VALUE(transitioned);
+    HASH_VALUE(incumbent_cost);
+    HASH_VALUE(selected_cost);
+    HASH_VALUE(selected_terrain_error);
+    HASH_VALUE(adjustment_xz);
+    HASH_VALUE(adjustment_y);
+    HASH_VALUE(clamp_xz);
+    HASH_VALUE(clamp_y);
+#undef HASH_ARRAY
+#undef HASH_VALUE
+    return hash;
+}
+
 static uint64_t hash_bytes(
     uint64_t hash, const void* data, std::size_t bytes)
 {
@@ -137,46 +638,89 @@ static uint64_t hash_bytes(
 
 static uint64_t state_digest(const g1_controller_state& state)
 {
-    uint64_t hash = UINT64_C(1469598103934665603);
-    hash = hash_bytes(hash, &state, sizeof(state));
-    g1_controller_state_memory_range ranges[64] = {};
-    int count = 0;
-    check(g1_controller_state_storage_ranges(
-              state, ranges, count, 64) && count == 49,
-          "state digest covers every dynamic owner");
-    for (int index = 0; index < count; ++index) {
-        hash = hash_bytes(hash, ranges[index].data, ranges[index].bytes);
-    }
-    return hash;
+    return state_logical_digest(state);
 }
 
-struct state_storage_snapshot
+static g1_controller_state& runtime_state(
+    G1FrameRuntime& runtime, int index)
 {
-    std::array<const void*, 49> data = {};
-    std::array<std::size_t, 49> bytes = {};
+    switch (index) {
+    case 0: return runtime.accepted_state;
+    case 1: return runtime.working_state;
+    case 2: return runtime.candidates.common_state;
+    case 3: return runtime.candidates.raw_state;
+    default: return runtime.candidates.ik_state;
+    }
+}
+
+static const g1_controller_state& runtime_state(
+    const G1FrameRuntime& runtime, int index)
+{
+    switch (index) {
+    case 0: return runtime.accepted_state;
+    case 1: return runtime.working_state;
+    case 2: return runtime.candidates.common_state;
+    case 3: return runtime.candidates.raw_state;
+    default: return runtime.candidates.ik_state;
+    }
+}
+
+struct runtime_storage_snapshot
+{
+    uint64_t digest[5] = {};
+    const void* data[5][49] = {};
+    std::size_t bytes[5][49] = {};
 };
 
-static state_storage_snapshot state_storage(
-    const g1_controller_state& state)
+static runtime_storage_snapshot runtime_storage(
+    const G1FrameRuntime& runtime)
 {
-    g1_controller_state_memory_range ranges[64] = {};
-    int count = 0;
-    check(g1_controller_state_storage_ranges(
-              state, ranges, count, 64) && count == 49,
-          "state storage snapshot covers every dynamic owner");
-    state_storage_snapshot output;
-    for (int index = 0; index < count; ++index) {
-        output.data[static_cast<std::size_t>(index)] = ranges[index].data;
-        output.bytes[static_cast<std::size_t>(index)] = ranges[index].bytes;
+    runtime_storage_snapshot output;
+    for (int state_index = 0; state_index < 5; ++state_index) {
+        const g1_controller_state& state =
+            runtime_state(runtime, state_index);
+        output.digest[state_index] = state_digest(state);
+        g1_controller_state_memory_range ranges[64] = {};
+        int count = 0;
+        check(g1_controller_state_storage_ranges(
+                  state, ranges, count, 64) && count == 49,
+              "runtime storage snapshot covers all 245 dynamic owners");
+        for (int range = 0; range < count; ++range) {
+            output.data[state_index][range] = ranges[range].data;
+            output.bytes[state_index][range] = ranges[range].bytes;
+        }
     }
     return output;
 }
 
-static bool same_storage(
-    const state_storage_snapshot& first,
-    const state_storage_snapshot& second)
+static bool same_runtime_storage(
+    const runtime_storage_snapshot& first,
+    const runtime_storage_snapshot& second)
 {
-    return first.data == second.data && first.bytes == second.bytes;
+    return std::memcmp(&first, &second, sizeof(first)) == 0;
+}
+
+static bool snapshot_storage_is_disjoint_from_runtime(
+    const runtime_storage_snapshot& snapshot,
+    const G1FrameRuntime& runtime)
+{
+    const runtime_storage_snapshot active = runtime_storage(runtime);
+    for (int old_state = 0; old_state < 5; ++old_state) {
+        for (int old_range = 0; old_range < 49; ++old_range) {
+            for (int new_state = 0; new_state < 5; ++new_state) {
+                for (int new_range = 0; new_range < 49; ++new_range) {
+                    if (g1_ik_memory_ranges_overlap(
+                            snapshot.data[old_state][old_range],
+                            snapshot.bytes[old_state][old_range],
+                            active.data[new_state][new_range],
+                            active.bytes[new_state][new_range])) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    return true;
 }
 
 static uint64_t publication_digest(const G1FramePublication& publication)
@@ -220,12 +764,9 @@ struct transaction_fixture
     std::string snapshot_mesh_path;
     const float* snapshot_heights = NULL;
     int snapshot_model_id = 0;
-    uint64_t snapshot_accepted_digest = 0;
-    uint64_t snapshot_working_digest = 0;
+    runtime_storage_snapshot snapshot_runtime;
     uint64_t snapshot_publication_digest = 0;
     uint64_t snapshot_accepted_diagnostic_digest = 0;
-    state_storage_snapshot snapshot_accepted_storage;
-    state_storage_snapshot snapshot_working_storage;
 
     transaction_fixture()
     {
@@ -247,17 +788,36 @@ struct transaction_fixture
                   error,
                   static_cast<int>(sizeof(error))),
               error);
-        runtime.accepted_state.scene_frame = 17;
-        runtime.accepted_state.route_frames = 5;
-        runtime.working_state.scene_frame = 23;
-        runtime.working_state.route_frames = 7;
+        poison_runtime_states();
         runtime.publication.ik_safe_stop_latched = true;
         runtime.publication.presentation_frame = 71;
         runtime.accepted_diagnostic.ready = true;
         runtime.accepted_diagnostic.presentation_frame = 53;
-        runtime.accepted_diagnostic.scene_frame = 17;
+        runtime.accepted_diagnostic.scene_frame =
+            runtime.accepted_state.scene_frame - 1;
         models.live = 1;
         capture_active();
+    }
+
+    void poison_runtime_states()
+    {
+        for (int index = 0; index < 5; ++index) {
+            g1_controller_state& state = runtime_state(runtime, index);
+            state.scene_frame = 17 + index * 3;
+            state.route_frames = 5 + index * 2;
+            state.simulation_position.x = 2.0f +
+                0.125f * static_cast<float>(index);
+            state.simulation_position.z = 2.0f -
+                0.0625f * static_cast<float>(index);
+            G1FootLockState& lock = state.ik.feet[0].lock;
+            lock.contact = false;
+            lock.locked = false;
+            lock.position_active = true;
+            lock.releasing = true;
+            lock.release_frames = index + 1;
+            check(g1_controller_state_is_valid(state),
+                  "each poisoned live state remains independently valid");
+        }
     }
 
     void capture_active()
@@ -267,13 +827,10 @@ struct transaction_fixture
         snapshot_mesh_path = active_scene.mesh_path;
         snapshot_heights = active_scene.terrain.heights.data;
         snapshot_model_id = active_model.id;
-        snapshot_accepted_digest = state_digest(runtime.accepted_state);
-        snapshot_working_digest = state_digest(runtime.working_state);
+        snapshot_runtime = runtime_storage(runtime);
         snapshot_publication_digest = publication_digest(runtime.publication);
         snapshot_accepted_diagnostic_digest =
             accepted_diagnostic_digest(runtime.accepted_diagnostic);
-        snapshot_accepted_storage = state_storage(runtime.accepted_state);
-        snapshot_working_storage = state_storage(runtime.working_state);
     }
 
     bool active_matches_snapshot() const
@@ -283,20 +840,12 @@ struct transaction_fixture
                active_scene.mesh_path == snapshot_mesh_path &&
                active_scene.terrain.heights.data == snapshot_heights &&
                active_model.id == snapshot_model_id &&
-               state_digest(runtime.accepted_state) ==
-                   snapshot_accepted_digest &&
-               state_digest(runtime.working_state) ==
-                   snapshot_working_digest &&
+               same_runtime_storage(
+                   runtime_storage(runtime), snapshot_runtime) &&
                publication_digest(runtime.publication) ==
                    snapshot_publication_digest &&
                accepted_diagnostic_digest(runtime.accepted_diagnostic) ==
-                   snapshot_accepted_diagnostic_digest &&
-               same_storage(
-                   state_storage(runtime.accepted_state),
-                   snapshot_accepted_storage) &&
-               same_storage(
-                   state_storage(runtime.working_state),
-                   snapshot_working_storage);
+                   snapshot_accepted_diagnostic_digest;
     }
 
     bool switch_to(int target, char* error, int capacity)
@@ -358,15 +907,28 @@ struct transaction_fixture
             if (verify_commit_before_old_unload &&
                 model.id == snapshot_model_id)
             {
+                bool all_candidate_states_installed =
+                    scene_frame_runtime_reset_candidate_is_valid(
+                        runtime, config);
+                for (int index = 0; index < 5; ++index) {
+                    all_candidate_states_installed =
+                        all_candidate_states_installed &&
+                        g1_frame_reset_candidate_is_valid(
+                            runtime_state(runtime, index),
+                            config.initial_search_time) &&
+                        (index == 0 ||
+                         g1_frame_controller_states_equal(
+                             runtime.accepted_state,
+                             runtime_state(runtime, index)));
+                }
                 check(active_index == target &&
                           active_scene.metadata.id ==
                               catalog.ids[static_cast<size_t>(target)] &&
-                          runtime.accepted_state.simulation_position.x ==
-                              2.0f &&
-                          runtime.working_state.simulation_position.x ==
-                              2.0f &&
+                          all_candidate_states_installed &&
+                          snapshot_storage_is_disjoint_from_runtime(
+                              snapshot_runtime, runtime) &&
                           active_model.id == models.last_loaded_id,
-                      "scene, state pair, model, and index commit before old unload");
+                      "scene, all five states, model, and index commit before old unload");
             }
             ++models.unloads;
             --models.live;
@@ -472,30 +1034,44 @@ static void check_reset_state_member(
 static void check_reset_runtime_unit(
     const transaction_fixture& fixture)
 {
-    g1_controller_state_memory_range accepted_ranges[64] = {};
-    g1_controller_state_memory_range working_ranges[64] = {};
-    int accepted_count = 0;
-    int working_count = 0;
-    check(g1_frame_controller_states_equal(
-              fixture.runtime.accepted_state,
-              fixture.runtime.working_state) &&
-              g1_frame_state_pair_storage_is_exact(
-                  fixture.runtime.accepted_state,
-                  fixture.runtime.working_state,
-                  accepted_ranges,
-                  accepted_count,
-                  working_ranges,
-                  working_count,
-                  64) &&
-              accepted_count == 49 && working_count == 49,
-          "successful reset/switch installs equal, completely disjoint states");
-    check(fixture.runtime.accepted_state.route_index == 0 &&
-              fixture.runtime.accepted_state.route_waypoint == 1 &&
-              fixture.runtime.accepted_state.route_frames == 0 &&
-              fixture.runtime.working_state.route_index == 0 &&
-              fixture.runtime.working_state.route_waypoint == 1 &&
-              fixture.runtime.working_state.route_frames == 0,
-          "successful reset/switch installs identical route cursors");
+    g1_controller_state_memory_range ranges[5][64] = {};
+    int counts[5] = {};
+    for (int index = 0; index < 5; ++index) {
+        const g1_controller_state& state =
+            runtime_state(fixture.runtime, index);
+        check(g1_controller_state_storage_ranges(
+                  state, ranges[index], counts[index], 64) &&
+                  counts[index] == 49,
+              "each reset state owns exactly 49 heap-backed arrays");
+        if (index != 0) {
+            check(g1_frame_controller_states_equal(
+                      fixture.runtime.accepted_state, state),
+                  "all five reset states are logically equal");
+        }
+        check(state.route_index == 0 && state.route_waypoint == 1 &&
+                  state.route_frames == 0,
+              "all five reset states own the canonical route cursor");
+        check_reset_state_member(
+            state,
+            fixture.db,
+            fixture.active_scene,
+            fixture.config,
+            "each reset state passes every independent certification gate");
+    }
+    for (int first = 0; first < 5; ++first) {
+        for (int second = first + 1; second < 5; ++second) {
+            check(&runtime_state(fixture.runtime, first) !=
+                      &runtime_state(fixture.runtime, second) &&
+                      g1_frame_state_range_sets_are_disjoint(
+                          runtime_state(fixture.runtime, first),
+                          ranges[first],
+                          counts[first],
+                          runtime_state(fixture.runtime, second),
+                          ranges[second],
+                          counts[second]),
+                  "all ten reset-state object and heap pairs are disjoint");
+        }
+    }
     check(g1_frame_publication_is_valid(fixture.runtime.publication) &&
               !fixture.runtime.publication.rejection.rejected &&
               !fixture.runtime.publication.ik_safe_stop_latched &&
@@ -504,18 +1080,191 @@ static void check_reset_runtime_unit(
                   fixture.runtime.accepted_diagnostic) &&
               !fixture.runtime.accepted_diagnostic.ready,
           "successful reset/switch clears rejection, latch, and diagnostics");
-    check_reset_state_member(
-        fixture.runtime.accepted_state,
-        fixture.db,
-        fixture.active_scene,
-        fixture.config,
-        "accepted reset state passes every independent certification gate");
-    check_reset_state_member(
-        fixture.runtime.working_state,
-        fixture.db,
-        fixture.active_scene,
-        fixture.config,
-        "working reset state passes every independent certification gate");
+}
+
+template<class T>
+using state_array_member = array1d<T> g1_controller_state::*;
+
+template<class T>
+static void check_live_preflight_rejects_member_alias(
+    transaction_fixture& fixture,
+    state_array_member<T> member)
+{
+    char error[512] = {};
+    for (int first = 0; first < 5; ++first) {
+        for (int second = first + 1; second < 5; ++second) {
+            array1d<T>& target = runtime_state(fixture.runtime, second).*member;
+            const array1d<T>& peer =
+                runtime_state(fixture.runtime, first).*member;
+            T* const saved = target.data;
+            target.data = peer.data;
+            const bool accepted = scene_frame_runtime_live_storage_preflight(
+                fixture.runtime,
+                fixture.db,
+                fixture.support,
+                fixture.active_scene,
+                fixture.config,
+                &fixture.active_model,
+                sizeof(fixture.active_model),
+                &fixture.active_index,
+                sizeof(fixture.active_index),
+                error,
+                static_cast<int>(sizeof(error)));
+            target.data = saved;
+            check(!accepted && fixture.active_matches_snapshot(),
+                  "live preflight rejects each owner alias across all ten state pairs without mutation");
+        }
+    }
+}
+
+template<class T>
+static void check_candidate_isolation_rejects_member_alias(
+    transaction_fixture& fixture,
+    G1FrameRuntime& candidate,
+    state_array_member<T> member)
+{
+    char error[512] = {};
+    for (int live_index = 0; live_index < 5; ++live_index) {
+        for (int candidate_index = 0; candidate_index < 5; ++candidate_index) {
+            array1d<T>& target =
+                runtime_state(candidate, candidate_index).*member;
+            const array1d<T>& peer =
+                runtime_state(fixture.runtime, live_index).*member;
+            T* const saved = target.data;
+            target.data = peer.data;
+            const bool isolated = scene_frame_runtime_candidate_is_isolated(
+                fixture.runtime,
+                candidate,
+                fixture.db,
+                fixture.support,
+                fixture.active_scene,
+                fixture.active_scene,
+                fixture.config,
+                &fixture.active_model,
+                sizeof(fixture.active_model),
+                &fixture.active_index,
+                sizeof(fixture.active_index),
+                error,
+                static_cast<int>(sizeof(error)));
+            target.data = saved;
+            check(!isolated && fixture.active_matches_snapshot(),
+                  "candidate isolation rejects each owner alias across all 25 live/candidate pairs without publication");
+        }
+    }
+}
+
+static void test_five_state_reset_is_valid_equal_and_pairwise_disjoint()
+{
+    transaction_fixture fixture;
+    char error[512] = {};
+    check(scene_reset_current(
+              fixture.runtime,
+              fixture.db,
+              fixture.support,
+              fixture.active_scene,
+              fixture.config,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+    check_reset_runtime_unit(fixture);
+    fixture.unload_active();
+}
+
+static void test_five_state_live_preflight_rejects_each_array_alias()
+{
+    transaction_fixture fixture;
+#define CHECK_LIVE_ALIAS(name) \
+    check_live_preflight_rejects_member_alias( \
+        fixture, &g1_controller_state::name)
+    G1_FOR_EACH_STATE_ARRAY(CHECK_LIVE_ALIAS);
+#undef CHECK_LIVE_ALIAS
+    fixture.unload_active();
+}
+
+static void test_five_state_candidate_isolation_covers_all_ten_states()
+{
+    transaction_fixture fixture;
+    G1FrameRuntime candidate;
+    char error[512] = {};
+    check(g1_frame_runtime_reset(
+              candidate,
+              fixture.db,
+              fixture.support,
+              fixture.active_scene,
+              fixture.config,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+    check(scene_frame_runtime_candidate_is_isolated(
+              fixture.runtime,
+              candidate,
+              fixture.db,
+              fixture.support,
+              fixture.active_scene,
+              fixture.active_scene,
+              fixture.config,
+              &fixture.active_model,
+              sizeof(fixture.active_model),
+              &fixture.active_index,
+              sizeof(fixture.active_index),
+              error,
+              static_cast<int>(sizeof(error))),
+          "ten-state baseline is isolated");
+
+    const g1_controller_state* states[10] = {};
+    g1_controller_state_memory_range ranges[10][64] = {};
+    int counts[10] = {};
+    for (int index = 0; index < 5; ++index) {
+        states[index] = &runtime_state(fixture.runtime, index);
+        states[index + 5] = &runtime_state(candidate, index);
+    }
+    for (int index = 0; index < 10; ++index) {
+        check(g1_controller_state_storage_ranges(
+                  *states[index], ranges[index], counts[index], 64) &&
+                  counts[index] == 49,
+              "all ten states expose all 49 owners");
+    }
+    for (int first = 0; first < 10; ++first) {
+        for (int second = first + 1; second < 10; ++second) {
+            check(states[first] != states[second] &&
+                      g1_frame_state_range_sets_are_disjoint(
+                          *states[first], ranges[first], counts[first],
+                          *states[second], ranges[second], counts[second]),
+                  "all 45 ten-state heap-set pairs are disjoint");
+        }
+    }
+
+    g1_controller_state& candidate_common =
+        runtime_state(candidate, 2);
+    vec3* const saved_positions =
+        candidate_common.curr_bone_positions.data;
+    candidate_common.curr_bone_positions.data =
+        candidate_common.curr_bone_velocities.data + 1;
+    const bool within_state_isolated =
+        scene_frame_runtime_candidate_is_isolated(
+            fixture.runtime,
+            candidate,
+            fixture.db,
+            fixture.support,
+            fixture.active_scene,
+            fixture.active_scene,
+            fixture.config,
+            &fixture.active_model,
+            sizeof(fixture.active_model),
+            &fixture.active_index,
+            sizeof(fixture.active_index),
+            error,
+            static_cast<int>(sizeof(error)));
+    candidate_common.curr_bone_positions.data = saved_positions;
+    check(!within_state_isolated && fixture.active_matches_snapshot(),
+          "candidate isolation rejects within-state partial owner aliases without publication");
+
+#define CHECK_CANDIDATE_ALIAS(name) \
+    check_candidate_isolation_rejects_member_alias( \
+        fixture, candidate, &g1_controller_state::name)
+    G1_FOR_EACH_STATE_ARRAY(CHECK_CANDIDATE_ALIAS);
+#undef CHECK_CANDIDATE_ALIAS
+    fixture.unload_active();
 }
 
 static void test_scene_load_failure_and_invalid_target_skip_model_allocation()
@@ -610,7 +1359,7 @@ static void test_model_failures_cleanup_only_allocated_candidate()
     check(fixture.models.live == 0, "model failure fixture cleans up active model");
 }
 
-static void test_success_commits_atomically_and_unloads_old_model_once()
+static void test_five_state_success_swaps_every_state_atomically()
 {
     transaction_fixture fixture;
     char error[512] = {};
@@ -620,15 +1369,20 @@ static void test_success_commits_atomically_and_unloads_old_model_once()
     fixture.verify_commit_before_old_unload = true;
 
     check(fixture.switch_to(1, error, static_cast<int>(sizeof(error))), error);
+    bool all_five_installed = true;
+    for (int index = 0; index < 5; ++index) {
+        const g1_controller_state& state =
+            runtime_state(fixture.runtime, index);
+        all_five_installed = all_five_installed &&
+            state.scene_frame == 0 &&
+            state.simulation_position.x == 2.0f;
+    }
     check(fixture.active_index == 1 &&
               fixture.active_scene.metadata.id == "two" &&
               fixture.active_scene.mesh_path == "two.obj" &&
-              fixture.runtime.accepted_state.scene_frame == 0 &&
-              fixture.runtime.working_state.scene_frame == 0 &&
-              fixture.runtime.accepted_state.simulation_position.x == 2.0f &&
-              fixture.runtime.working_state.simulation_position.x == 2.0f &&
+              all_five_installed &&
               fixture.active_model.id == fixture.models.last_loaded_id,
-          "successful transaction commits all candidate objects");
+          "successful transaction commits all five candidate states and peer objects");
     check_reset_runtime_unit(fixture);
     check(std::count(
               fixture.models.unloaded_ids.begin(),
@@ -675,10 +1429,7 @@ static void test_reset_changes_only_state_and_is_transactional()
               fixture.active_scene.terrain.heights.data == heights,
           "reset does not reload or replace scene or model");
 
-    fixture.runtime.accepted_state.scene_frame = 33;
-    fixture.runtime.accepted_state.route_frames = 21;
-    fixture.runtime.working_state.scene_frame = 44;
-    fixture.runtime.working_state.route_frames = 22;
+    fixture.poison_runtime_states();
     fixture.runtime.publication.ik_safe_stop_latched = true;
     fixture.runtime.publication.presentation_frame = 83;
     fixture.capture_active();
@@ -731,38 +1482,24 @@ static void test_each_candidate_member_gate_is_independent_and_nonpublishing()
     fixture.capture_active();
     G1FrameRuntime candidate;
     char error[512] = {};
-    check(g1_frame_runtime_reset(
-              candidate,
-              fixture.db,
-              fixture.support,
-              fixture.active_scene,
-              fixture.config,
-              error,
-              static_cast<int>(sizeof(error))),
-          error);
-    candidate.accepted_state.footprint_status = G1FootprintInvalidInput;
-    check(!scene_frame_runtime_reset_candidate_is_valid(
-              candidate, fixture.config),
-          "poisoned accepted candidate gate is rejected");
-    check(fixture.active_matches_snapshot(),
-          "accepted-candidate gate cannot publish into the live unit");
-
-    check(g1_frame_runtime_reset(
-              candidate,
-              fixture.db,
-              fixture.support,
-              fixture.active_scene,
-              fixture.config,
-              error,
-              static_cast<int>(sizeof(error))),
-          error);
-    candidate.working_state.ik_candidate_clearance_status =
-        G1ClearanceInvalidInput;
-    check(!scene_frame_runtime_reset_candidate_is_valid(
-              candidate, fixture.config),
-          "poisoned working candidate gate is rejected");
-    check(fixture.active_matches_snapshot(),
-          "working-candidate gate cannot publish into the live unit");
+    for (int index = 0; index < 5; ++index) {
+        check(g1_frame_runtime_reset(
+                  candidate,
+                  fixture.db,
+                  fixture.support,
+                  fixture.active_scene,
+                  fixture.config,
+                  error,
+                  static_cast<int>(sizeof(error))),
+              error);
+        runtime_state(candidate, index).footprint_status =
+            G1FootprintInvalidInput;
+        check(!scene_frame_runtime_reset_candidate_is_valid(
+                  candidate, fixture.config),
+              "each poisoned five-state candidate gate is rejected");
+        check(fixture.active_matches_snapshot(),
+              "candidate validation cannot publish into the live unit");
+    }
 
     G1FrameResetConfig invalid_config = fixture.config;
     invalid_config.dt = std::nextafter(
@@ -782,14 +1519,62 @@ static void test_each_candidate_member_gate_is_independent_and_nonpublishing()
     fixture.unload_active();
 }
 
-int main()
+static void test_five_state_switch_failure_preserves_every_live_owner()
 {
     test_scene_load_failure_and_invalid_target_skip_model_allocation();
     test_reset_failure_preserves_active_objects_and_skips_model_load();
     test_model_failures_cleanup_only_allocated_candidate();
-    test_success_commits_atomically_and_unloads_old_model_once();
+    test_each_candidate_member_gate_is_independent_and_nonpublishing();
+}
+
+static void test_five_state_reset_failure_preserves_every_live_owner()
+{
+    transaction_fixture fixture;
+    char error[512] = {};
+    fixture.poison_runtime_states();
+    fixture.capture_active();
+
+    terrain_support_set bad_support;
+    bad_support.values = fixture.support.values;
+    bad_support.values(0, 0) =
+        std::numeric_limits<float>::quiet_NaN();
+    check(!scene_reset_current(
+              fixture.runtime,
+              fixture.db,
+              bad_support,
+              fixture.active_scene,
+              fixture.config,
+              error,
+              static_cast<int>(sizeof(error))) &&
+              fixture.active_matches_snapshot(),
+          "artifact failure preserves all five live state values and 245 owners");
+
+    G1FrameResetConfig malformed = fixture.config;
+    malformed.dt = std::nextafter(
+        malformed.dt, std::numeric_limits<float>::infinity());
+    error[0] = '\0';
+    check(!scene_reset_current(
+              fixture.runtime,
+              fixture.db,
+              fixture.support,
+              fixture.active_scene,
+              malformed,
+              error,
+              static_cast<int>(sizeof(error))) &&
+              fixture.active_matches_snapshot(),
+          "malformed reset config preserves all five live state values and 245 owners");
+    fixture.unload_active();
+}
+
+int main()
+{
+    test_five_state_reset_is_valid_equal_and_pairwise_disjoint();
+    test_five_state_live_preflight_rejects_each_array_alias();
+    test_five_state_candidate_isolation_covers_all_ten_states();
+    test_five_state_success_swaps_every_state_atomically();
+    test_five_state_switch_failure_preserves_every_live_owner();
+    test_five_state_reset_failure_preserves_every_live_owner();
     test_reset_changes_only_state_and_is_transactional();
     test_repeated_switches_leave_exactly_one_live_model();
-    test_each_candidate_member_gate_is_independent_and_nonpublishing();
     return 0;
 }
