@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from unittest import mock
 
 import mujoco
 import numpy as np
@@ -324,6 +325,64 @@ def _holden_inputs_from_source_fk(model, data, qpos):
     )
 
 
+def _float_tuple(values):
+    return tuple(float(value) for value in values)
+
+
+def _spec_joint_topology(spec):
+    return tuple(
+        (joint.name, joint.parent.name, int(joint.type))
+        for joint in spec.joints
+    )
+
+
+def _spec_joint_semantics(spec):
+    return tuple(
+        (
+            joint.name,
+            (
+                ("body", joint.parent.name),
+                ("default_class", joint.classname.name),
+                ("type", int(joint.type)),
+                ("align", int(joint.align)),
+                ("limited", int(joint.limited)),
+                ("actfrclimited", int(joint.actfrclimited)),
+                ("actgravcomp", int(joint.actgravcomp)),
+                ("group", int(joint.group)),
+                ("pos", _float_tuple(joint.pos)),
+                ("axis", _float_tuple(joint.axis)),
+                ("range", _float_tuple(joint.range)),
+                ("ref", float(joint.ref)),
+                ("springref", float(joint.springref)),
+                ("stiffness", _float_tuple(joint.stiffness)),
+                ("springdamper", _float_tuple(joint.springdamper)),
+                ("damping", _float_tuple(joint.damping)),
+                ("armature", float(joint.armature)),
+                ("frictionloss", float(joint.frictionloss)),
+                ("margin", float(joint.margin)),
+                ("solref_limit", _float_tuple(joint.solref_limit)),
+                ("solimp_limit", _float_tuple(joint.solimp_limit)),
+                ("solref_friction", _float_tuple(joint.solref_friction)),
+                ("solimp_friction", _float_tuple(joint.solimp_friction)),
+                ("actfrcrange", _float_tuple(joint.actfrcrange)),
+                ("userdata", _float_tuple(joint.userdata)),
+            ),
+        )
+        for joint in spec.joints
+    )
+
+
+def _model_joint_topology(model):
+    return tuple(
+        (
+            model.joint(joint_id).name,
+            model.body(int(model.jnt_bodyid[joint_id])).name,
+            int(model.jnt_type[joint_id]),
+        )
+        for joint_id in range(model.njnt)
+    )
+
+
 def _compile_pinned_gear_joint_model(scene_path):
     scene_root = ET.fromstring(scene_path.read_bytes())
     include_files = [
@@ -335,7 +394,8 @@ def _compile_pinned_gear_joint_model(scene_path):
 
     spec = mujoco.MjSpec.from_file(str(scene_path))
     before_bodies = tuple(body.name for body in spec.bodies)
-    before_joints = tuple(joint.name for joint in spec.joints)
+    before_joint_topology = _spec_joint_topology(spec)
+    before_joint_semantics = _spec_joint_semantics(spec)
     joint_references = {
         joint.name: float(joint.ref) for joint in spec.joints if joint.name
     }
@@ -353,9 +413,38 @@ def _compile_pinned_gear_joint_model(scene_path):
         spec.delete(mesh)
     if tuple(body.name for body in spec.bodies) != before_bodies:
         raise AssertionError("visual stripping changed GEAR bodies")
-    if tuple(joint.name for joint in spec.joints) != before_joints:
-        raise AssertionError("visual stripping changed GEAR joints")
-    return spec.compile(), len(mesh_geoms), len(meshes), joint_references
+    if _spec_joint_semantics(spec) != before_joint_semantics:
+        raise AssertionError("visual stripping changed GEAR joint semantics")
+    model = spec.compile()
+    if _model_joint_topology(model) != before_joint_topology:
+        raise AssertionError(
+            "compiled GEAR joint topology differs from stripped spec"
+        )
+    return model, len(mesh_geoms), len(meshes), joint_references
+
+
+class _MutatingSpecProxy:
+    def __init__(self, spec, *, delete_mutator=None, compiled_mutator=None):
+        self._spec = spec
+        self._delete_mutator = delete_mutator
+        self._compiled_mutator = compiled_mutator
+        self._delete_mutated = False
+
+    def __getattr__(self, name):
+        return getattr(self._spec, name)
+
+    def delete(self, element):
+        result = self._spec.delete(element)
+        if self._delete_mutator is not None and not self._delete_mutated:
+            self._delete_mutator(self._spec)
+            self._delete_mutated = True
+        return result
+
+    def compile(self):
+        model = self._spec.compile()
+        if self._compiled_mutator is not None:
+            self._compiled_mutator(model)
+        return model
 
 
 def _invoke_projection_cli(cli, contract_path, poses):
@@ -532,6 +621,38 @@ class SonicJointContractTests(unittest.TestCase):
             self.source_model.joint(joint_id).name: joint_id
             for joint_id in source_ids
         }
+        source_free_ids = tuple(
+            joint_id
+            for joint_id in range(self.source_model.njnt)
+            if self.source_model.jnt_type[joint_id]
+            == mujoco.mjtJoint.mjJNT_FREE
+        )
+        gear_free_ids = tuple(
+            joint_id
+            for joint_id in range(gear_model.njnt)
+            if gear_model.jnt_type[joint_id]
+            == mujoco.mjtJoint.mjJNT_FREE
+        )
+        self.assertEqual(len(source_free_ids), 1)
+        self.assertEqual(len(gear_free_ids), 1)
+        source_free_id = source_free_ids[0]
+        gear_free_id = gear_free_ids[0]
+        self.assertEqual(
+            (
+                self.source_model.joint(source_free_id).name,
+                self.source_model.body(
+                    int(self.source_model.jnt_bodyid[source_free_id])
+                ).name,
+            ),
+            ("floating_base_joint", "pelvis"),
+        )
+        self.assertEqual(
+            (
+                gear_model.joint(gear_free_id).name,
+                gear_model.body(int(gear_model.jnt_bodyid[gear_free_id])).name,
+            ),
+            ("floating_base_joint", "pelvis"),
+        )
         gear_ids = _source_hinge_ids(gear_model)
         gear_names = _model_joint_names(gear_model, gear_ids)
         gear_by_name = {gear_model.joint(name).name: gear_model.joint(name).id for name in gear_names}
@@ -544,6 +665,13 @@ class SonicJointContractTests(unittest.TestCase):
         for name in EXPECTED_SOURCE_JOINTS:
             source_id = source_by_name[name]
             gear_id = gear_by_name[name]
+            self.assertEqual(
+                gear_model.body(int(gear_model.jnt_bodyid[gear_id])).name,
+                self.source_model.body(
+                    int(self.source_model.jnt_bodyid[source_id])
+                ).name,
+                name,
+            )
             self.assertEqual(
                 int(self.source_model.jnt_type[source_id]),
                 int(mujoco.mjtJoint.mjJNT_HINGE),
@@ -589,9 +717,76 @@ class SonicJointContractTests(unittest.TestCase):
         print(
             "Pinned GEAR joint semantics: "
             "scene=scene_29dof_with_hand.xml body_joints=29 "
+            "free_base=floating_base_joint@pelvis "
             f"extra_hand_joints={len(extras)} removed_mesh_geoms={removed_geoms} "
             f"removed_mesh_assets={removed_meshes}"
         )
+
+    def test_joint_only_strip_rejects_joint_default_mutation(self):
+        spec = mujoco.MjSpec.from_file(str(self.gear_scene))
+
+        def mutate_joint_default(resolved_spec):
+            joint = resolved_spec.joint("left_knee_joint")
+            joint.damping[0] = float(joint.damping[0]) + 0.001
+
+        proxy = _MutatingSpecProxy(
+            spec,
+            delete_mutator=mutate_joint_default,
+        )
+        with mock.patch.object(mujoco.MjSpec, "from_file", return_value=proxy):
+            with self.assertRaisesRegex(
+                AssertionError,
+                "visual stripping changed GEAR joint semantics",
+            ):
+                _compile_pinned_gear_joint_model(self.gear_scene)
+
+    def test_joint_only_strip_rejects_compiled_topology_mutations(self):
+        def move_required_hinge(model):
+            joint_id = model.joint("left_knee_joint").id
+            model.jnt_bodyid[joint_id] = model.body("pelvis").id
+
+        def relocate_free_base(model):
+            joint_id = model.joint("floating_base_joint").id
+            model.jnt_bodyid[joint_id] = model.body("left_hip_pitch_link").id
+
+        def remove_free_base(model):
+            joint_id = model.joint("floating_base_joint").id
+            model.jnt_type[joint_id] = mujoco.mjtJoint.mjJNT_HINGE
+
+        def add_extra_free_base(model):
+            joint_id = model.joint("left_knee_joint").id
+            model.jnt_type[joint_id] = mujoco.mjtJoint.mjJNT_FREE
+
+        def replace_free_base(model):
+            free_id = model.joint("floating_base_joint").id
+            replacement_id = model.joint("left_knee_joint").id
+            model.jnt_type[free_id] = mujoco.mjtJoint.mjJNT_HINGE
+            model.jnt_type[replacement_id] = mujoco.mjtJoint.mjJNT_FREE
+
+        cases = (
+            ("wrong required hinge body", move_required_hinge),
+            ("relocated free base", relocate_free_base),
+            ("missing free base", remove_free_base),
+            ("extra free base", add_extra_free_base),
+            ("replaced free base", replace_free_base),
+        )
+        for label, mutator in cases:
+            with self.subTest(label=label):
+                spec = mujoco.MjSpec.from_file(str(self.gear_scene))
+                proxy = _MutatingSpecProxy(
+                    spec,
+                    compiled_mutator=mutator,
+                )
+                with mock.patch.object(
+                    mujoco.MjSpec,
+                    "from_file",
+                    return_value=proxy,
+                ):
+                    with self.assertRaisesRegex(
+                        AssertionError,
+                        "compiled GEAR joint topology differs from stripped spec",
+                    ):
+                        _compile_pinned_gear_joint_model(self.gear_scene)
 
     def test_source_to_target_reorder_is_name_driven(self):
         contract = load_joint_contract(COMMITTED_CONTRACT)
