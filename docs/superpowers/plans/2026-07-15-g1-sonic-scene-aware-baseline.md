@@ -1593,6 +1593,51 @@ git commit -m "feat: register SONIC baseline experiments and verdicts"
 - The file and stream runs use identical policy, encoder, observation config, G1 model, initial qpos, scene, and reference values. A decoded value mismatch prevents launch.
 - Stage B/C commands refuse to run until the matching Stage A evidence hashes pass.
 
+#### Corrected asynchronous scoring contract (independent-review amendment)
+
+The pinned unmodified SONIC controller runs its 50 Hz policy loop from a
+wall-clock recurrent thread; MuJoCo advances independently at 500 Hz.  A parent
+request for 200 simulator steps therefore does **not** prove that exactly 20
+policy actions were produced or that each action was held for exactly ten
+steps.  Stage A must not infer policy-frame alignment from simulator step
+counts.
+
+For the known-good file and stream gates, launch a fresh SONIC process only as
+far as `WAIT_FOR_CONTROL` while an explicitly unscored simulator epoch supplies
+low state.  In stream mode, enable the ZMQ input and preload frame zero followed
+by the exact 20-frame logical chunks while control is still inactive.  A padded
+transport publication followed by a one-frame receipt fence may be used to
+prove that the last logical chunk and required future horizon were assigned;
+neither is a scored logical chunk.  In file mode, reset and
+arm the loaded motion at frame zero while control is still inactive.  Then:
+
+1. prove that no policy target/state row exists while SONIC remains in
+   `WAIT_FOR_CONTROL`;
+2. stop the SONIC process group while it is still in authenticated
+   `WAIT_FOR_CONTROL`, reset MuJoCo to the registered initial qpos and a
+   distinct scored log epoch, and prime fresh low state while SONIC remains
+   stopped;
+3. resume SONIC, activate `CONTROL`, and do not stop it again until scoring
+   ends; a stdout transition marker followed by an external stop is not a
+   valid pre-tick barrier;
+4. drive the simulator until the official
+   target log contains the exact canonical frames `0..440`, rejecting an
+   overshoot, duplicate, omission, timeout, or post-stop row;
+5. score joint positions and base orientation from SONIC's own authenticated
+   `q.csv` and `base_quat.csv` rows.  The state files share exact indices and
+   timestamps.  The target file has values only, so pair it positionally using
+   the clean lifecycle, exact 441-row cardinality/order, and authenticated
+   one-state-row/one-target-row source order after applying the pinned joint
+   permutation;
+6. retain MuJoCo state/contact logs and the actual simulator-step/time totals as
+   asynchronous physical-cadence evidence.  Do not label them as lockstep
+   policy rows or require a fabricated 10:1 tick-to-step coupling.
+
+The file and stream runs must use the same cold pre-control lifecycle.  A
+MuJoCo-only reset after policy readiness is not an acceptable scored reset,
+because it leaves policy/history state warmed by an unaudited prior control
+epoch.
+
 - [ ] **Step 1: Write RED CLI parsing, exit-code, prerequisite, and mode tests**
 
 Patch all process/simulator dependencies with fakes. Require exact required arguments, no implicit external path, output confinement, `not_run` semantics, mode-specific prerequisites, stable command manifest, correct exit codes, and refusal to promote a known-good file pass when stream delivery failed.

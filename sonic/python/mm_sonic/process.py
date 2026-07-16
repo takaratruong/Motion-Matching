@@ -13,6 +13,7 @@ import math
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import signal
 import stat
@@ -20,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import MappingProxyType
 from typing import Callable, Mapping, Sequence
 
 import numpy as np
@@ -40,10 +42,40 @@ _MANAGED_GEAR_FLAGS = frozenset(
     }
 )
 _DEFAULT_STARTUP_MARKERS = ("Initialized ZMQ endpoint interface",)
+_WAIT_FOR_CONTROL_MARKER = "Init Done"
+_CONTROL_ACTIVE_MARKER = (
+    "[Control] DEBUG: operator_state.start=true, transitioning to CONTROL state"
+)
 _DEFAULT_ACTIVE_MARKERS = (
-    "[Control] DEBUG: operator_state.start=true, transitioning to CONTROL state",
+    _CONTROL_ACTIVE_MARKER,
     "ZMQ STREAMING MODE: ENABLED",
 )
+_LOADED_MOTION_STARTUP_MARKERS = (
+    "✓ Motion data loaded successfully!",
+    "Started with motion:",
+    "(paused at frame 0)",
+    "Initialized keyboard input interface (default)",
+)
+_LOADED_MOTION_ACTIVE_MARKERS = (
+    _CONTROL_ACTIVE_MARKER,
+    "Playing motion 0 from frame 0 to end (",
+)
+_LOADED_MOTION_RESET_MARKER = "Reset motion 0 to frame 0 (paused)"
+_STREAM_PROCESSING_START_MARKER = (
+    "[ZMQEndpointInterface] *** Starting ZMQ processing ***"
+)
+_STREAM_PROCESSING_END_MARKER = (
+    "[ZMQEndpointInterface] *** End of ZMQ decoding processing ***"
+)
+_STREAM_MERGER_PROCESSING_PREFIX = "[StreamedMotionMerger] Processing "
+_STREAM_MERGER_MERGED_PREFIX = "[StreamedMotionMerger] Merged motion: "
+_POST_ENABLE_LEFT_LINE = "Delta heading left: 0.1 rad"
+_POST_ENABLE_RIGHT_LINE = "Delta heading right: 0 rad"
+_POST_ENABLE_FENCE_SEMANTICS = (
+    "post-enable-reset-tail-complete-with-net-zero-heading"
+)
+_GEAR_LAUNCH_PROFILES = frozenset({"zmq_stream", "loaded_motion"})
+_SHELL_SAFE_ABSOLUTE_PATH = re.compile(r"/[A-Za-z0-9._/-]*\Z")
 
 
 class ProcessError(RuntimeError):
@@ -93,6 +125,34 @@ def _canonical_run_root(value: str | Path) -> Path:
     if not stat.S_ISDIR(mode):
         raise ProcessError("run_root must be a directory")
     return resolved
+
+
+def _require_shell_safe_absolute_path(value: Path, label: str) -> None:
+    if not value.is_absolute() or _SHELL_SAFE_ABSOLUTE_PATH.fullmatch(str(value)) is None:
+        raise ProcessError(
+            f"{label} must be a conservative shell-safe absolute path"
+        )
+
+
+def _gear_process_argv(
+    command: Sequence[str],
+    *,
+    launch_profile: str,
+    target_motion_logfile: str | Path,
+    logs_dir: str | Path,
+) -> tuple[str, ...]:
+    integration_flags = (
+        "--input-type",
+        "zmq" if launch_profile == "zmq_stream" else "keyboard",
+        "--target-motion-logfile",
+        str(target_motion_logfile),
+        "--logs-dir",
+        str(logs_dir),
+        "--enable-csv-logs",
+    )
+    if launch_profile == "zmq_stream":
+        integration_flags += ("--zmq-verbose",)
+    return tuple(command) + integration_flags
 
 
 def _confined_candidate(run_root: Path, value: str | Path, label: str) -> Path:
@@ -1497,8 +1557,10 @@ class GearProcess:
         logs_dir: str | Path,
         stdout_archive: str | Path,
         stderr_archive: str | Path,
-        startup_markers: Sequence[str] = _DEFAULT_STARTUP_MARKERS,
-        active_markers: Sequence[str] = _DEFAULT_ACTIVE_MARKERS,
+        launch_profile: str = "zmq_stream",
+        startup_markers: Sequence[str] | None = None,
+        active_markers: Sequence[str] | None = None,
+        wait_for_control_marker: str = _WAIT_FOR_CONTROL_MARKER,
         cancelled: Callable[[], bool] | None = None,
         readiness_timeout_s: float | None = 60.0,
         readiness_poll_s: float = 0.05,
@@ -1511,6 +1573,10 @@ class GearProcess:
     ) -> None:
         if not command or any(type(item) is not str or not item for item in command):
             raise ValueError("command must contain nonempty strings")
+        if launch_profile not in _GEAR_LAUNCH_PROFILES:
+            raise ValueError(
+                "launch_profile must be 'zmq_stream' or 'loaded_motion'"
+            )
         managed = [
             item
             for item in command
@@ -1525,6 +1591,7 @@ class GearProcess:
                 "the wrapper owns all integration flags"
             )
         self.run_root = _canonical_run_root(run_root)
+        _require_shell_safe_absolute_path(self.run_root, "run_root")
         target = _validate_confined_output_path(
             self.run_root,
             target_motion_logfile,
@@ -1535,6 +1602,7 @@ class GearProcess:
             logs_dir,
             "GEAR logs directory",
         )
+        _require_shell_safe_absolute_path(logs, "GEAR logs directory")
         stdout_path = _validate_confined_output_path(
             self.run_root,
             stdout_archive,
@@ -1560,29 +1628,45 @@ class GearProcess:
             (stderr_path, "GEAR stderr archive"),
         ):
             _create_confined_parents(self.run_root, path, label=label)
-        self.argv = tuple(
-            command
-        ) + (
-            "--input-type",
-            "zmq",
-            "--target-motion-logfile",
-            str(target),
-            "--logs-dir",
-            str(logs),
-            "--enable-csv-logs",
-            "--zmq-verbose",
+        self.argv = _gear_process_argv(
+            command,
+            launch_profile=launch_profile,
+            target_motion_logfile=target,
+            logs_dir=logs,
         )
+        self.launch_profile = launch_profile
         self.target_motion_logfile = target
         self.logs_dir = logs
         self.stdout_archive = stdout_path
         self.stderr_archive = stderr_path
         if readiness_poll_s <= 0.0 or signal_poll_s <= 0.0:
             raise ValueError("poll intervals must be positive")
-        self._startup_markers = tuple(startup_markers)
-        self._active_markers = tuple(active_markers)
+        default_startup = (
+            _DEFAULT_STARTUP_MARKERS
+            if launch_profile == "zmq_stream"
+            else _LOADED_MOTION_STARTUP_MARKERS
+        )
+        default_active = (
+            _DEFAULT_ACTIVE_MARKERS
+            if launch_profile == "zmq_stream"
+            else _LOADED_MOTION_ACTIVE_MARKERS
+        )
+        self._startup_markers = tuple(
+            default_startup if startup_markers is None else startup_markers
+        )
+        self._active_markers = tuple(
+            default_active if active_markers is None else active_markers
+        )
+        self._wait_for_control_marker = wait_for_control_marker
         markers = (*self._startup_markers, *self._active_markers)
         if any(type(marker) is not str or not marker for marker in markers):
             raise ValueError("readiness markers must be nonempty strings")
+        if (
+            type(self._wait_for_control_marker) is not str
+            or not self._wait_for_control_marker
+            or "\n" in self._wait_for_control_marker
+        ):
+            raise ValueError("wait_for_control_marker must be one nonempty line")
         self._cancelled = cancelled
         self._readiness_timeout_s = readiness_timeout_s
         self._readiness_poll_s = readiness_poll_s
@@ -1599,10 +1683,14 @@ class GearProcess:
         self._stderr_file = None
         self._reader_threads: list[threading.Thread] = []
         self._reader_errors: list[tuple[str, BaseException]] = []
-        self._observed = ""
+        self._observed = b""
         self._output_condition = threading.Condition()
         self._closed = False
         self._ready = False
+        self._startup_markers_ready = False
+        self._wait_for_control_ready = False
+        self._input_prepared = False
+        self._control_active = False
         self.signal_history: list[signal.Signals] = []
         self.cleanup_history: list[str] = []
 
@@ -1625,8 +1713,32 @@ class GearProcess:
         return self._process.poll()
 
     @property
+    def startup_markers_ready(self) -> bool:
+        """Whether authenticated model/interface cold loading has completed."""
+
+        return self._startup_markers_ready
+
+    @property
     def ready(self) -> bool:
         return self._ready
+
+    @property
+    def wait_for_control_ready(self) -> bool:
+        """Whether the authenticated process reached WAIT_FOR_CONTROL."""
+
+        return self._wait_for_control_ready
+
+    @property
+    def input_prepared(self) -> bool:
+        """Whether file playback or the ZMQ input was prepared in WAIT."""
+
+        return self._input_prepared
+
+    @property
+    def control_active(self) -> bool:
+        """Whether the exact WAIT_FOR_CONTROL -> CONTROL marker was observed."""
+
+        return self._control_active
 
     def _reader(self, name: str, stream, archive) -> None:
         try:
@@ -1636,10 +1748,10 @@ class GearProcess:
                     break
                 archive.write(chunk)
                 archive.flush()
-                text = chunk.decode("utf-8", errors="replace")
-                with self._output_condition:
-                    self._observed += text
-                    self._output_condition.notify_all()
+                if name == "stdout":
+                    with self._output_condition:
+                        self._observed += chunk
+                        self._output_condition.notify_all()
         except BaseException as error:
             with self._output_condition:
                 self._reader_errors.append((name, error))
@@ -1673,6 +1785,7 @@ class GearProcess:
     ) -> None:
         if not markers:
             return
+        encoded_markers = tuple(marker.encode("utf-8") for marker in markers)
         deadline = (
             None
             if self._readiness_timeout_s is None
@@ -1680,7 +1793,8 @@ class GearProcess:
         )
         with self._output_condition:
             while not all(
-                marker in self._observed[after_offset:] for marker in markers
+                marker in self._observed[after_offset:]
+                for marker in encoded_markers
             ):
                 reader_failure = self._reader_failure_locked()
                 if reader_failure is not None:
@@ -1690,8 +1804,8 @@ class GearProcess:
                 if self._process is not None and self._process.poll() is not None:
                     missing = [
                         marker
-                        for marker in markers
-                        if marker not in self._observed[after_offset:]
+                        for marker, encoded in zip(markers, encoded_markers)
+                        if encoded not in self._observed[after_offset:]
                     ]
                     raise ChildProcessDied(
                         f"GEAR child {self.pid} exited {self._process.returncode} "
@@ -1700,8 +1814,8 @@ class GearProcess:
                 if deadline is not None and time.monotonic() >= deadline:
                     missing = [
                         marker
-                        for marker in markers
-                        if marker not in self._observed[after_offset:]
+                        for marker, encoded in zip(markers, encoded_markers)
+                        if encoded not in self._observed[after_offset:]
                     ]
                     raise ProcessError(
                         f"timed out waiting for GEAR readiness markers {missing!r}"
@@ -1722,7 +1836,60 @@ class GearProcess:
             self.write_keys(key)
         self._wait_markers((marker,), after_offset=boundary)
 
-    def start(self) -> None:
+    def _wait_exact_line_range(
+        self, line: str, *, after_offset: int
+    ) -> tuple[int, int]:
+        if not line.endswith("\n") or "\n" in line[:-1]:
+            raise ProcessError("GEAR exact-line marker is invalid")
+        encoded_line = line.encode("utf-8")
+        deadline = (
+            None
+            if self._readiness_timeout_s is None
+            else time.monotonic() + self._readiness_timeout_s
+        )
+        with self._output_condition:
+            while encoded_line not in self._observed[after_offset:].splitlines(
+                keepends=True
+            ):
+                reader_failure = self._reader_failure_locked()
+                if reader_failure is not None:
+                    raise reader_failure
+                if _cancelled(self._cancelled):
+                    raise OperatorCancelled("operator cancelled GEAR readiness wait")
+                if self._process is not None and self._process.poll() is not None:
+                    raise ChildProcessDied(
+                        f"GEAR child {self.pid} exited {self._process.returncode} "
+                        f"before exact output line {line.rstrip()!r}"
+                    )
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise ProcessError(
+                        f"timed out waiting for exact GEAR output line "
+                        f"{line.rstrip()!r}"
+                    )
+                wait = self._readiness_poll_s
+                if deadline is not None:
+                    wait = min(wait, max(0.0, deadline - time.monotonic()))
+                self._output_condition.wait(wait)
+            reader_failure = self._reader_failure_locked()
+            if reader_failure is not None:
+                raise reader_failure
+
+            cursor = after_offset
+            for observed_line in self._observed[after_offset:].splitlines(
+                keepends=True
+            ):
+                start = cursor
+                cursor += len(observed_line)
+                if observed_line == encoded_line:
+                    return start, cursor
+        raise AssertionError("exact GEAR line vanished while holding output lock")
+
+    def _wait_exact_line(self, line: str, *, after_offset: int) -> int:
+        return self._wait_exact_line_range(line, after_offset=after_offset)[1]
+
+    def start_to_wait_for_control(self) -> None:
+        """Cold-start GEAR through exact authenticated WAIT_FOR_CONTROL only."""
+
         if self._closed:
             raise ProcessError("GEAR process is closed")
         if self._process is not None:
@@ -1787,13 +1954,13 @@ class GearProcess:
                 thread.start()
                 self._reader_threads.append(thread)
             self._wait_markers(self._startup_markers)
+            self._startup_markers_ready = True
+            self._wait_exact_line(f"{self._wait_for_control_marker}\n", after_offset=0)
+            self._wait_for_control_ready = True
             if len(self._active_markers) != 2:
                 raise ProcessError(
-                    "GEAR active_markers must contain CONTROL then STREAMING"
+                    "GEAR active_markers must contain CONTROL then input activation"
                 )
-            self._write_key_then_wait(b"]", self._active_markers[0])
-            self._write_key_then_wait(b"\n", self._active_markers[1])
-            self._ready = True
         except BaseException as error:
             try:
                 os.close(slave)
@@ -1813,6 +1980,93 @@ class GearProcess:
                 ) from error
             raise
 
+    def start(self) -> None:
+        """Backward-compatible full startup; phased callers use explicit APIs."""
+
+        self.start_to_wait_for_control()
+        # Preserve the long-standing convenience method's authenticated key
+        # order.  Stage A intentionally does not use this path: it prepares
+        # input in WAIT, resets physics, then activates CONTROL explicitly.
+        self._write_key_then_wait(b"]", self._active_markers[0])
+        self._control_active = True
+        self._ready = True
+        profile_key = b"\n" if self.launch_profile == "zmq_stream" else b"t"
+        self._write_key_then_wait(profile_key, self._active_markers[1])
+        self._input_prepared = True
+
+    def _require_wait_preparation_state(self, profile: str) -> None:
+        if self.launch_profile != profile:
+            raise ProcessError(f"input preparation requires {profile}")
+        if not self._wait_for_control_ready or self._control_active:
+            raise ProcessError("input preparation requires authenticated WAIT_FOR_CONTROL")
+        if self._input_prepared:
+            raise ProcessError("GEAR input is already prepared")
+        if self.group_is_stopped():
+            raise ProcessError("input preparation requires a running WAIT process")
+        self.require_alive()
+
+    def enable_stream_for_preload(self) -> Mapping[str, object]:
+        """Enable and clear the ZMQ input while policy control remains inactive."""
+
+        self._require_wait_preparation_state("zmq_stream")
+        with self._output_condition:
+            activation_boundary = len(self._observed)
+            self.write_keys(b"\n")
+        enabled_end = self._wait_exact_line(
+            f"{self._active_markers[1]}\n",
+            after_offset=activation_boundary,
+        )
+        with self._output_condition:
+            self.write_keys(b"qe")
+        left_end = self._wait_exact_line(
+            f"{_POST_ENABLE_LEFT_LINE}\n",
+            after_offset=enabled_end,
+        )
+        fence_end = self._wait_exact_line(
+            f"{_POST_ENABLE_RIGHT_LINE}\n",
+            after_offset=left_end,
+        )
+        self._input_prepared = True
+        return MappingProxyType(
+            {
+                "boundary": enabled_end,
+                "end_offset": fence_end,
+                "key_sequence": "qe",
+                "left_line": _POST_ENABLE_LEFT_LINE,
+                "right_line": _POST_ENABLE_RIGHT_LINE,
+                "semantics": _POST_ENABLE_FENCE_SEMANTICS,
+            }
+        )
+
+    def prepare_loaded_motion_for_scoring(self) -> None:
+        """Reset frame zero and arm loaded playback while still in WAIT."""
+
+        self._require_wait_preparation_state("loaded_motion")
+        self._write_key_then_wait(b"r", _LOADED_MOTION_RESET_MARKER)
+        self._write_key_then_wait(b"t", self._active_markers[1])
+        self._input_prepared = True
+
+    def activate_control(self) -> None:
+        """Enter CONTROL once and continue running after the exact marker."""
+
+        if (
+            not self._wait_for_control_ready
+            or not self._input_prepared
+            or self._control_active
+        ):
+            raise ProcessError(
+                "CONTROL activation requires one prepared WAIT_FOR_CONTROL epoch"
+            )
+        if self.group_is_stopped():
+            raise ProcessError("CONTROL activation requires the GEAR group resumed")
+        with self._output_condition:
+            boundary = len(self._observed)
+            self.write_keys(b"]")
+        marker = self._active_markers[0]
+        self._wait_exact_line(f"{marker}\n", after_offset=boundary)
+        self._control_active = True
+        self._ready = True
+
     def write_keys(self, keys: bytes) -> None:
         if type(keys) is not bytes or not keys:
             raise ValueError("keys must be nonempty bytes")
@@ -1828,6 +2082,21 @@ class GearProcess:
                 f"short GEAR PTY write: wrote {written} of {len(keys)} bytes"
             )
 
+    def reset_loaded_motion_for_scoring(self) -> None:
+        """Compatibility spelling for WAIT-phase loaded-motion preparation."""
+
+        self.prepare_loaded_motion_for_scoring()
+
+    def activate_loaded_motion_for_scoring(self) -> None:
+        """Resume a prepared file epoch and enter CONTROL without re-stopping."""
+
+        if self.launch_profile != "loaded_motion" or not self._input_prepared:
+            raise ProcessError("loaded_motion scoring activation requires preparation")
+        if not self.group_is_stopped():
+            raise ProcessError("loaded_motion scoring activation requires a stopped group")
+        self.continue_group()
+        self.activate_control()
+
     def require_alive(self) -> None:
         reader_failure = self._reader_failure()
         if reader_failure is not None:
@@ -1837,6 +2106,95 @@ class GearProcess:
         returncode = self._process.poll()
         if returncode is not None:
             raise ChildProcessDied(f"GEAR child {self.pid} exited {returncode}")
+
+    def publication_boundary(self) -> int:
+        """Capture a causal stdout boundary before a stream publication."""
+
+        if (
+            self.launch_profile != "zmq_stream"
+            or not self._wait_for_control_ready
+            or not self._input_prepared
+        ):
+            raise ProcessError(
+                "publication boundaries require a prepared zmq_stream process"
+            )
+        self.require_alive()
+        with self._output_condition:
+            reader_failure = self._reader_failure_locked()
+            if reader_failure is not None:
+                raise reader_failure
+            return len(self._observed)
+
+    def wait_for_stream_processing(
+        self,
+        after_offset: int,
+        *,
+        frame_count: int,
+        global_start: int,
+        merged_count: int,
+    ) -> Mapping[str, object]:
+        """Authenticate one WAIT-phase publication's pinned verbose transcript."""
+
+        if (
+            self.launch_profile != "zmq_stream"
+            or not self._wait_for_control_ready
+            or not self._input_prepared
+            or self._control_active
+            or type(after_offset) is not int
+            or after_offset < 0
+            or type(frame_count) is not int
+            or frame_count <= 0
+            or type(global_start) is not int
+            or global_start < 0
+            or type(merged_count) is not int
+            or merged_count != global_start + frame_count
+        ):
+            raise ProcessError(
+                "stream processing wait requires one prepared WAIT publication"
+            )
+        with self._output_condition:
+            if after_offset > len(self._observed):
+                raise ProcessError("stream publication boundary is in the future")
+        processing = (
+            f"{_STREAM_MERGER_PROCESSING_PREFIX}{frame_count} frames, "
+            f"incoming_frame_start={global_start}, frame_step=1\n"
+        )
+        copied = merged_count - frame_count
+        merged = (
+            f"{_STREAM_MERGER_MERGED_PREFIX}{merged_count} frames "
+            f"(copied: {copied} + incoming: {frame_count})\n"
+        )
+        start_line = _STREAM_PROCESSING_START_MARKER
+        start_range = self._wait_exact_line_range(
+            f"{start_line}\n", after_offset=after_offset
+        )
+        processing_range = self._wait_exact_line_range(
+            processing, after_offset=start_range[1]
+        )
+        merged_range = self._wait_exact_line_range(
+            merged, after_offset=processing_range[1]
+        )
+        end_line = _STREAM_PROCESSING_END_MARKER
+        end_range = self._wait_exact_line_range(
+            f"{end_line}\n", after_offset=merged_range[1]
+        )
+        return MappingProxyType(
+            {
+                "boundary": after_offset,
+                "end_offset": end_range[1],
+                "frame_count": frame_count,
+                "global_start": global_start,
+                "merged_count": merged_count,
+                "start_line": start_line,
+                "processing_line": processing.rstrip("\n"),
+                "merged_line": merged.rstrip("\n"),
+                "end_line": end_line,
+                "start_range": start_range,
+                "processing_range": processing_range,
+                "merged_range": merged_range,
+                "end_range": end_range,
+            }
+        )
 
     def _send_group_signal(self, sig: signal.Signals) -> bool:
         if self._process is None or self._pgid is None:
@@ -1938,6 +2296,27 @@ class GearProcess:
             f"GEAR reader threads did not drain to EOF before bound: {names}"
         )
 
+    def terminate_stopped_at_scoring_boundary(self) -> None:
+        """Kill a stopped scored group without a SIGCONT that could log row N+1."""
+
+        if self._closed:
+            return
+        self.require_alive()
+        if not self.group_is_stopped():
+            raise ProcessError(
+                "scoring-boundary termination requires a stopped GEAR group"
+            )
+        self.cleanup_history.append("scoring-boundary-SIGKILL")
+        self._send_group_signal(signal.SIGKILL)
+        if not self._wait_group_exit(self._kill_grace_s):
+            raise ProcessError(
+                f"GEAR process group {self.pgid} survived scoring-boundary SIGKILL"
+            )
+        # With the group already dead, the generic finalizer only drains and
+        # closes evidence descriptors; it cannot send the official key or
+        # resume the group.
+        self.close()
+
     def close(self) -> None:
         if self._closed:
             return
@@ -2010,6 +2389,10 @@ class GearProcess:
                                 f"failed to close GEAR archive: {error}"
                             )
             self._ready = False
+            self._startup_markers_ready = False
+            self._wait_for_control_ready = False
+            self._input_prepared = False
+            self._control_active = False
         if self._group_exists():
             raise ProcessError(
                 f"GEAR process group {self.pgid} survived cleanup"

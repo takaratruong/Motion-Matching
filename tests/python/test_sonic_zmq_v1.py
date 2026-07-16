@@ -503,6 +503,44 @@ class _PublisherContext:
 
 
 class PosePublisherPhaseTests(unittest.TestCase):
+    def test_owned_context_is_terminated_when_partial_socket_cleanup_raises(
+        self,
+    ) -> None:
+        class FailingSocket(_PublisherSocket):
+            def bind(self, _endpoint: str) -> None:
+                raise RuntimeError("bind failed")
+
+            def close(self, *, linger: int) -> None:
+                super().close(linger=linger)
+                raise RuntimeError("close failed")
+
+        class OwnedContext:
+            def __init__(self) -> None:
+                self.socket_value = FailingSocket()
+                self.terminated = False
+
+            def socket(self, _kind):
+                return self.socket_value
+
+            def term(self) -> None:
+                self.terminated = True
+
+        context = OwnedContext()
+        fake_zmq = SimpleNamespace(
+            PUB=1,
+            CONFLATE=2,
+            LINGER=3,
+            LAST_ENDPOINT=4,
+            Context=lambda: context,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = RunBundle.create(Path(directory), "stage-a", "partial-pub")
+            with mock.patch.dict(sys.modules, {"zmq": fake_zmq}):
+                with self.assertRaisesRegex(RuntimeError, "bind failed"):
+                    PosePublisher("tcp://127.0.0.1:*", bundle=bundle)
+        self.assertTrue(context.socket_value.closed)
+        self.assertTrue(context.terminated)
+
     def test_prepare_tags_encoding_and_archive_failures_at_production_seams(self) -> None:
         fake_zmq = SimpleNamespace(
             PUB=1,

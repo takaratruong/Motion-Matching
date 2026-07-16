@@ -352,14 +352,18 @@ def _validate_terminal_metadata(
     encoder = external["encoder"]
     if encoder is not None:
         _nonempty_string(encoder, "external.encoder")
-    if (
+    if external["gear_commit"] is None and status == "not_run":
+        pass
+    elif (
         type(external["gear_commit"]) is not str
         or _COMMIT.fullmatch(external["gear_commit"]) is None
     ):
         raise ContractError(
             "terminal manifest external.gear_commit must be a commit digest"
         )
-    if type(external["gear_dirty"]) is not bool:
+    if external["gear_dirty"] is None and status == "not_run":
+        pass
+    elif type(external["gear_dirty"]) is not bool:
         raise ContractError(
             "terminal manifest external.gear_dirty must be a boolean"
         )
@@ -369,7 +373,7 @@ def _validate_terminal_metadata(
     for name, value in external_hashes.items():
         _nonempty_string(name, "external.hashes key")
         _sha256_or_null(value, f"external.hashes.{name}")
-        if value is None:
+        if value is None and status != "not_run":
             raise ContractError(
                 f"terminal manifest external.hashes.{name} cannot be null"
             )
@@ -382,14 +386,18 @@ def _validate_terminal_metadata(
         repository = _exact_keys(
             value, frozenset(("commit", "dirty")), f"repositories.{name}"
         )
-        if (
+        if repository["commit"] is None and status == "not_run":
+            pass
+        elif (
             type(repository["commit"]) is not str
             or _COMMIT.fullmatch(repository["commit"]) is None
         ):
             raise ContractError(
                 f"terminal manifest repositories.{name}.commit is invalid"
             )
-        if type(repository["dirty"]) is not bool:
+        if repository["dirty"] is None and status == "not_run":
+            pass
+        elif type(repository["dirty"]) is not bool:
             raise ContractError(
                 f"terminal manifest repositories.{name}.dirty must be a boolean"
             )
@@ -467,6 +475,16 @@ def _validate_terminal_metadata(
             _nonempty_string(
                 argument, f"processes[{index}].argv[{argument_index}]"
             )
+        invocation_cwd = process.get("invocation_cwd")
+        if invocation_cwd is not None:
+            _nonempty_string(
+                invocation_cwd, f"processes[{index}].invocation_cwd"
+            )
+            if not Path(invocation_cwd).is_absolute():
+                raise ContractError(
+                    f"terminal manifest processes[{index}].invocation_cwd "
+                    "must be absolute"
+                )
 
 
 def _validate_terminal_manifest(manifest: object) -> dict[str, object]:
@@ -885,18 +903,30 @@ class RunBundle:
         elif phase == "readiness":
             if type(attempt) is not int or attempt <= 0:
                 raise ContractError(
-                    "readiness transmission phase requires a positive attempt"
+                    f"{phase} transmission phase requires a positive attempt"
+                )
+        elif phase in ("logical", "padding", "receipt_fence"):
+            if attempt is not None:
+                raise ContractError(
+                    f"{phase} transmission phase cannot have an attempt"
                 )
         else:
-            raise ContractError("transmission phase must be timeline or readiness")
+            raise ContractError(
+                "transmission phase must be timeline, readiness, "
+                "logical, padding, or receipt_fence"
+            )
         payload = bytes(message)
         digest = hashlib.sha256(payload).hexdigest()
         stem = f"{first_frame_index:06d}-{last_frame_index:06d}"
         if phase == "readiness":
             assert attempt is not None
             leaf_stem = f"attempt-{attempt:06d}__{stem}"
-            message_path = f"transmitted/readiness/{leaf_stem}.bin"
-            digest_path = f"transmitted/readiness/{leaf_stem}.sha256"
+            message_path = f"transmitted/{phase}/{leaf_stem}.bin"
+            digest_path = f"transmitted/{phase}/{leaf_stem}.sha256"
+        elif phase in ("logical", "padding", "receipt_fence"):
+            leaf_stem = stem
+            message_path = f"transmitted/{phase}/{leaf_stem}.bin"
+            digest_path = f"transmitted/{phase}/{leaf_stem}.sha256"
         else:
             leaf_stem = stem
             message_path = f"transmitted/{leaf_stem}.bin"

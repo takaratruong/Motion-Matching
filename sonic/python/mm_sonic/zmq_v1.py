@@ -340,9 +340,15 @@ class PosePublisher:
                 )
         except BaseException:
             if socket is not None:
-                socket.close(linger=0)
+                try:
+                    socket.close(linger=0)
+                except BaseException:
+                    pass
             if owns_context:
-                zmq_context.term()
+                try:
+                    zmq_context.term()
+                except BaseException:
+                    pass
             raise
 
         self._bundle = bundle
@@ -439,9 +445,11 @@ class PosePublisher:
         if self._closed:
             return
         self._closed = True
-        self._socket.close(linger=0)
-        if self._owns_context:
-            self._context.term()
+        try:
+            self._socket.close(linger=0)
+        finally:
+            if self._owns_context:
+                self._context.term()
 
     def __enter__(self) -> "PosePublisher":
         if self._closed:

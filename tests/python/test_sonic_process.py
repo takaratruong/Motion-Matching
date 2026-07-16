@@ -643,6 +643,7 @@ class GearProcessTests(TemporaryScriptCase):
             stderr_archive=self.root / "gear.stderr.log",
             startup_markers=("BOOT READY",),
             active_markers=active,
+            wait_for_control_marker="BOOT READY",
             readiness_poll_s=0.01,
             stop_grace_s=0.05,
             term_grace_s=0.05,
@@ -668,6 +669,7 @@ class GearProcessTests(TemporaryScriptCase):
             attrs = termios.tcgetattr(0)
             attrs[3] &= ~(termios.ICANON | termios.ECHO)
             termios.tcsetattr(0, termios.TCSANOW, attrs)
+            print("BOOT READY", flush=True)
             keys = os.read(0, 1)
             print("CONTROL READY", flush=True)
             keys += os.read(0, 1)
@@ -718,6 +720,7 @@ class GearProcessTests(TemporaryScriptCase):
             import termios
 
             print("Initialized ZMQ endpoint interface", flush=True)
+            print("Init Done", flush=True)
             attrs = termios.tcgetattr(0)
             attrs[3] &= ~(termios.ICANON | termios.ECHO)
             termios.tcsetattr(0, termios.TCSANOW, attrs)
@@ -753,6 +756,216 @@ class GearProcessTests(TemporaryScriptCase):
             self.assertEqual(keys_path.read_bytes(), b"]\n")
         finally:
             gear.close()
+
+    def test_loaded_motion_profile_uses_authenticated_keyboard_playback(self):
+        argv_path = self.root / "loaded-motion-argv.json"
+        keys_path = self.root / "loaded-motion-keys.bin"
+        child = self.script(
+            "official_loaded_motion_markers.py",
+            r'''
+            import json
+            import os
+            from pathlib import Path
+            import sys
+            import termios
+
+            Path(os.environ["ARGV_PATH"]).write_text(json.dumps(sys.argv[1:]))
+            print("✓ Motion data loaded successfully!", flush=True)
+            print("Started with motion: walk.csv (paused at frame 0)", flush=True)
+            print("Initialized keyboard input interface (default)", flush=True)
+            print("Init Done", flush=True)
+            attrs = termios.tcgetattr(0)
+            attrs[3] &= ~(termios.ICANON | termios.ECHO)
+            termios.tcsetattr(0, termios.TCSANOW, attrs)
+            keys = os.read(0, 1)
+            print(
+                "[Control] DEBUG: operator_state.start=true, "
+                "transitioning to CONTROL state",
+                flush=True,
+            )
+            keys += os.read(0, 1)
+            Path(os.environ["KEYS_PATH"]).write_bytes(keys)
+            print("Playing motion 0 from frame 0 to end (walk.csv)", flush=True)
+            while os.read(0, 1).lower() != b"o":
+                pass
+            ''',
+        )
+        target = self.root / "loaded-target.csv"
+        logs = self.root / "loaded-logs"
+        gear = GearProcess(
+            run_root=self.root,
+            command=[sys.executable, "-u", str(child), "/official/reference"],
+            target_motion_logfile=target,
+            logs_dir=logs,
+            stdout_archive=self.root / "loaded.stdout",
+            stderr_archive=self.root / "loaded.stderr",
+            launch_profile="loaded_motion",
+            readiness_timeout_s=0.15,
+            readiness_poll_s=0.005,
+            stop_grace_s=0.05,
+            term_grace_s=0.05,
+            kill_grace_s=0.2,
+            env=dict(
+                os.environ,
+                ARGV_PATH=str(argv_path),
+                KEYS_PATH=str(keys_path),
+            ),
+        )
+        try:
+            self.assertFalse(gear.startup_markers_ready)
+            gear.start()
+            self.assertTrue(gear.startup_markers_ready)
+            self.assertEqual(keys_path.read_bytes(), b"]t")
+            self.assertEqual(
+                json.loads(argv_path.read_text(encoding="utf-8")),
+                [
+                    "/official/reference",
+                    "--input-type",
+                    "keyboard",
+                    "--target-motion-logfile",
+                    str(target),
+                    "--logs-dir",
+                    str(logs),
+                    "--enable-csv-logs",
+                ],
+            )
+            self.assertTrue(gear.ready)
+        finally:
+            gear.close()
+        self.assertEqual(gear.cleanup_history[0], "official-stop-key")
+        self.assertFalse(process_exists(gear.pid))
+
+    def test_launch_profile_is_closed_and_default_remains_zmq_stream(self):
+        child = self.script("unused_profile.py", "raise SystemExit(0)\n")
+        common = dict(
+            run_root=self.root,
+            command=[sys.executable, str(child)],
+            target_motion_logfile=self.root / "profile-target.csv",
+            logs_dir=self.root / "profile-logs",
+            stdout_archive=self.root / "profile.stdout",
+            stderr_archive=self.root / "profile.stderr",
+        )
+        with self.assertRaisesRegex(ValueError, "launch_profile"):
+            GearProcess(**common, launch_profile="arbitrary")
+
+        gear = GearProcess(**common)
+        self.assertEqual(gear.launch_profile, "zmq_stream")
+        self.assertEqual(gear.argv[-8:], (
+            "--input-type",
+            "zmq",
+            "--target-motion-logfile",
+            str(self.root / "profile-target.csv"),
+            "--logs-dir",
+            str(self.root / "profile-logs"),
+            "--enable-csv-logs",
+            "--zmq-verbose",
+        ))
+
+    def test_loaded_motion_rejects_nonzero_start_frame_before_activation(self):
+        child = self.script(
+            "loaded_motion_wrong_frame.py",
+            r'''
+            import os
+            import termios
+
+            print("✓ Motion data loaded successfully!", flush=True)
+            print("Started with motion: walk.csv (paused at frame 1)", flush=True)
+            print("Initialized keyboard input interface (default)", flush=True)
+            attrs = termios.tcgetattr(0)
+            attrs[3] &= ~(termios.ICANON | termios.ECHO)
+            termios.tcsetattr(0, termios.TCSANOW, attrs)
+            os.read(0, 1)
+            print(
+                "[Control] DEBUG: operator_state.start=true, "
+                "transitioning to CONTROL state",
+                flush=True,
+            )
+            os.read(0, 1)
+            print("Playing motion 0 from frame 0 to end (walk.csv)", flush=True)
+            while os.read(0, 1).lower() != b"o":
+                pass
+            ''',
+        )
+        gear = GearProcess(
+            run_root=self.root,
+            command=[sys.executable, "-u", str(child), "/official/reference"],
+            target_motion_logfile=self.root / "wrong-frame-target.csv",
+            logs_dir=self.root / "wrong-frame-logs",
+            stdout_archive=self.root / "wrong-frame.stdout",
+            stderr_archive=self.root / "wrong-frame.stderr",
+            launch_profile="loaded_motion",
+            readiness_timeout_s=0.05,
+            readiness_poll_s=0.005,
+            stop_grace_s=0.05,
+            term_grace_s=0.05,
+            kill_grace_s=0.2,
+        )
+        try:
+            with self.assertRaisesRegex(ProcessError, "readiness"):
+                gear.start()
+        finally:
+            gear.close()
+        self.assertFalse(process_exists(gear.pid))
+
+    def test_loaded_motion_phased_activation_resumes_without_marker_restop(self):
+        keys_path = self.root / "scoring-reset-keys.bin"
+        child = self.script(
+            "loaded_motion_scoring_reset.py",
+            r'''
+            import os
+            from pathlib import Path
+            import termios
+
+            print("✓ Motion data loaded successfully!", flush=True)
+            print("Started with motion: walk.csv (paused at frame 0)", flush=True)
+            print("Initialized keyboard input interface (default)", flush=True)
+            print("Init Done", flush=True)
+            attrs = termios.tcgetattr(0)
+            attrs[3] &= ~(termios.ICANON | termios.ECHO)
+            termios.tcsetattr(0, termios.TCSANOW, attrs)
+            keys = os.read(0, 1)
+            print("Reset motion 0 to frame 0 (paused)", flush=True)
+            keys += os.read(0, 1)
+            print("Playing motion 0 from frame 0 to end (walk.csv)", flush=True)
+            keys += os.read(0, 1)
+            Path(os.environ["KEYS_PATH"]).write_bytes(keys)
+            print(
+                "[Control] DEBUG: operator_state.start=true, "
+                "transitioning to CONTROL state",
+                flush=True,
+            )
+            while os.read(0, 1).lower() != b"o":
+                pass
+            ''',
+        )
+        gear = GearProcess(
+            run_root=self.root,
+            command=[sys.executable, "-u", str(child), "/official/reference"],
+            target_motion_logfile=self.root / "scoring-reset-target.csv",
+            logs_dir=self.root / "scoring-reset-logs",
+            stdout_archive=self.root / "scoring-reset.stdout",
+            stderr_archive=self.root / "scoring-reset.stderr",
+            launch_profile="loaded_motion",
+            readiness_timeout_s=0.15,
+            readiness_poll_s=0.005,
+            signal_poll_s=0.005,
+            stop_grace_s=0.05,
+            term_grace_s=0.05,
+            kill_grace_s=0.2,
+            env=dict(os.environ, KEYS_PATH=str(keys_path)),
+        )
+        try:
+            gear.start_to_wait_for_control()
+            self.assertTrue(gear.wait_for_control_ready)
+            gear.prepare_loaded_motion_for_scoring()
+            gear.stop_group()
+            gear.activate_loaded_motion_for_scoring()
+            self.assertTrue(gear.control_active)
+            self.assertTrue(gear.group_is_resumed())
+            self.assertEqual(keys_path.read_bytes(), b"rt]")
+        finally:
+            gear.close()
+        self.assertFalse(process_exists(gear.pid))
 
     def test_archive_write_failure_is_surfaced_after_child_cleanup(self):
         child = self.script(
@@ -887,6 +1100,341 @@ class GearProcessTests(TemporaryScriptCase):
         finally:
             gear.close()
 
+    def test_stream_preparation_waits_for_post_enable_reset_fence(self):
+        release = self.root / "release-reset-tail"
+        enabled = self.root / "enabled"
+        keys = self.root / "post-enable.keys"
+        child = self.script(
+            "post_enable_reset_fence.py",
+            r'''
+            import os
+            from pathlib import Path
+            import termios
+            import time
+
+            attrs = termios.tcgetattr(0)
+            attrs[3] &= ~(termios.ICANON | termios.ECHO)
+            termios.tcsetattr(0, termios.TCSANOW, attrs)
+            print("BOOT READY", flush=True)
+            assert os.read(0, 1) == b"\n"
+            print("STREAM READY", flush=True)
+            Path(os.environ["ENABLED_PATH"]).write_bytes(b"enabled")
+            release = Path(os.environ["RELEASE_PATH"])
+            while not release.exists():
+                time.sleep(0.001)
+            keys = os.read(0, 2)
+            Path(os.environ["KEYS_PATH"]).write_bytes(keys)
+            if keys == b"qe":
+                print("Delta heading left: 0.1 rad", flush=True)
+                print("Delta heading right: 0 rad", flush=True)
+            while os.read(0, 1).lower() != b"o":
+                pass
+            ''',
+        )
+        gear = self.gear(
+            child,
+            readiness_timeout_s=0.5,
+            env=dict(
+                os.environ,
+                ENABLED_PATH=str(enabled),
+                RELEASE_PATH=str(release),
+                KEYS_PATH=str(keys),
+            ),
+        )
+        result = []
+        errors = []
+        try:
+            gear.start_to_wait_for_control()
+
+            def prepare():
+                try:
+                    result.append(gear.enable_stream_for_preload())
+                except BaseException as error:
+                    errors.append(error)
+
+            worker = threading.Thread(target=prepare)
+            worker.start()
+            deadline = time.monotonic() + 1.0
+            while not enabled.exists() and time.monotonic() < deadline:
+                time.sleep(0.001)
+            self.assertTrue(enabled.exists())
+            self.assertTrue(worker.is_alive())
+            self.assertFalse(gear.input_prepared)
+            release.write_bytes(b"release")
+            worker.join(timeout=1.0)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(keys.read_bytes(), b"qe")
+            self.assertTrue(gear.input_prepared)
+            fence = result[0]
+            self.assertEqual(
+                dict(fence),
+                {
+                    "boundary": fence["boundary"],
+                    "end_offset": fence["end_offset"],
+                    "key_sequence": "qe",
+                    "left_line": "Delta heading left: 0.1 rad",
+                    "right_line": "Delta heading right: 0 rad",
+                    "semantics": (
+                        "post-enable-reset-tail-complete-with-net-zero-heading"
+                    ),
+                },
+            )
+            self.assertLess(fence["boundary"], fence["end_offset"])
+        finally:
+            release.touch(exist_ok=True)
+            gear.close()
+
+    def test_stream_preparation_requires_authenticated_cold_wait(self):
+        child = self.script("never_started.py", "raise SystemExit(0)\n")
+        gear = self.gear(child)
+        try:
+            with self.assertRaisesRegex(ProcessError, "WAIT_FOR_CONTROL"):
+                gear.enable_stream_for_preload()
+            self.assertFalse(gear.input_prepared)
+        finally:
+            gear.close()
+
+    def test_stream_preparation_rejects_missing_or_reordered_fence_lines(self):
+        for label, lines in (
+            ("missing", ("Delta heading left: 0.1 rad",)),
+            (
+                "reordered",
+                (
+                    "Delta heading right: 0 rad",
+                    "Delta heading left: 0.1 rad",
+                ),
+            ),
+        ):
+            with self.subTest(label=label):
+                child = self.script(
+                    f"post_enable_{label}.py",
+                    f'''
+                    import os
+                    import termios
+
+                    attrs = termios.tcgetattr(0)
+                    attrs[3] &= ~(termios.ICANON | termios.ECHO)
+                    termios.tcsetattr(0, termios.TCSANOW, attrs)
+                    print("BOOT READY", flush=True)
+                    assert os.read(0, 1) == b"\\n"
+                    print("STREAM READY", flush=True)
+                    assert os.read(0, 2) == b"qe"
+                    for line in {lines!r}:
+                        print(line, flush=True)
+                    raise SystemExit(0)
+                    ''',
+                )
+                gear = GearProcess(
+                    run_root=self.root,
+                    command=[sys.executable, "-u", str(child)],
+                    target_motion_logfile=self.root / f"{label}.target.csv",
+                    logs_dir=self.root / f"{label}-logs",
+                    stdout_archive=self.root / f"{label}.stdout",
+                    stderr_archive=self.root / f"{label}.stderr",
+                    startup_markers=("BOOT READY",),
+                    active_markers=("CONTROL READY", "STREAM READY"),
+                    wait_for_control_marker="BOOT READY",
+                    readiness_timeout_s=0.1,
+                    readiness_poll_s=0.005,
+                    stop_grace_s=0.05,
+                    term_grace_s=0.05,
+                    kill_grace_s=0.2,
+                )
+                try:
+                    gear.start_to_wait_for_control()
+                    with self.assertRaises(ProcessError):
+                        gear.enable_stream_for_preload()
+                    self.assertFalse(gear.input_prepared)
+                finally:
+                    gear.close()
+
+    def test_raw_utf8_observation_offsets_equal_archived_byte_offsets(self):
+        child = self.script(
+            "raw_utf8_offsets.py",
+            r'''
+            import os
+            import termios
+            import time
+
+            attrs = termios.tcgetattr(0)
+            attrs[3] &= ~(termios.ICANON | termios.ECHO)
+            termios.tcsetattr(0, termios.TCSANOW, attrs)
+            os.write(2, "✓ stderr noise\n".encode("utf-8"))
+            time.sleep(0.02)
+            os.write(1, b"\xe2")
+            time.sleep(0.01)
+            os.write(1, b"\x9c\x93 BOOT READY\n")
+            assert os.read(0, 1) == b"\n"
+            print("STREAM READY", flush=True)
+            assert os.read(0, 2) == b"qe"
+            print("Delta heading left: 0.1 rad", flush=True)
+            print("Delta heading right: 0 rad", flush=True)
+            while os.read(0, 1).lower() != b"o":
+                pass
+            ''',
+        )
+        gear = GearProcess(
+            run_root=self.root,
+            command=[sys.executable, "-u", str(child)],
+            target_motion_logfile=self.root / "utf8.target.csv",
+            logs_dir=self.root / "utf8-logs",
+            stdout_archive=self.root / "utf8.stdout",
+            stderr_archive=self.root / "utf8.stderr",
+            startup_markers=("✓ BOOT READY",),
+            active_markers=("CONTROL READY", "STREAM READY"),
+            wait_for_control_marker="✓ BOOT READY",
+            readiness_timeout_s=0.2,
+            readiness_poll_s=0.005,
+            stop_grace_s=0.05,
+            term_grace_s=0.05,
+            kill_grace_s=0.2,
+        )
+        try:
+            gear.start_to_wait_for_control()
+            fence = gear.enable_stream_for_preload()
+            boundary = gear.publication_boundary()
+            archived = (self.root / "utf8.stdout").read_bytes()
+            self.assertEqual(boundary, len(archived))
+            self.assertIn(
+                "✓ stderr noise".encode("utf-8"),
+                (self.root / "utf8.stderr").read_bytes(),
+            )
+            self.assertEqual(fence["end_offset"], boundary)
+            self.assertEqual(archived[: fence["boundary"]].decode("utf-8").splitlines()[-1], "STREAM READY")
+        finally:
+            gear.close()
+
+    def test_wait_preload_requires_exact_authenticated_processing_transcript(self):
+        child = self.script(
+            "wait_preload_processing.py",
+            r'''
+            import os
+            import termios
+
+            attrs = termios.tcgetattr(0)
+            attrs[3] &= ~(termios.ICANON | termios.ECHO)
+            termios.tcsetattr(0, termios.TCSANOW, attrs)
+            print("BOOT READY", flush=True)
+            os.read(0, 1)
+            print("STREAM READY", flush=True)
+            assert os.read(0, 2) == b"qe"
+            print("Delta heading left: 0.1 rad", flush=True)
+            print("Delta heading right: 0 rad", flush=True)
+            os.read(0, 1)
+            print(
+                "[ZMQEndpointInterface] *** Starting ZMQ processing ***",
+                flush=True,
+            )
+            print("[ZMQEndpointInterface] Protocol version: 1", flush=True)
+            print("[ZMQEndpointInterface] Protocol version 1 established", flush=True)
+            print(
+                "[StreamedMotionMerger] Processing 20 frames, "
+                "incoming_frame_start=1, frame_step=1",
+                flush=True,
+            )
+            print(
+                "[StreamedMotionMerger] Merged motion: 21 frames "
+                "(copied: 1 + incoming: 20)",
+                flush=True,
+            )
+            print("[ZMQEndpointInterface] active_protocol_version_=1", flush=True)
+            print("[ZMQEndpointInterface] result.motion->GetEncodeMode()=0", flush=True)
+            print("[ZMQEndpointInterface] motion name: streamed", flush=True)
+            print(
+                "[ZMQEndpointInterface] Merged streamed data: 21 current-rate "
+                "frames, window [0..20] (message-index), frame_step=1, "
+                "frame_offset_adjustment=0, did_catchup=0",
+                flush=True,
+            )
+            print(
+                "[ZMQEndpointInterface] *** End of ZMQ decoding processing ***",
+                flush=True,
+            )
+            while os.read(0, 1).lower() != b"o":
+                pass
+            ''',
+        )
+        gear = self.gear(child, readiness_timeout_s=0.1)
+        try:
+            gear.start_to_wait_for_control()
+            gear.enable_stream_for_preload()
+            boundary = gear.publication_boundary()
+            gear.write_keys(b"x")
+            marker = gear.wait_for_stream_processing(
+                boundary,
+                frame_count=20,
+                global_start=1,
+                merged_count=21,
+            )
+            self.assertEqual(marker["frame_count"], 20)
+            self.assertEqual(marker["global_start"], 1)
+            self.assertEqual(marker["merged_count"], 21)
+            archived = (self.root / "gear.stdout.log").read_bytes()
+            for key, line in (
+                ("start_range", marker["start_line"]),
+                ("processing_range", marker["processing_line"]),
+                ("merged_range", marker["merged_line"]),
+                ("end_range", marker["end_line"]),
+            ):
+                start, end = marker[key]
+                self.assertEqual(archived[start:end], f"{line}\n".encode("ascii"))
+            self.assertLess(marker["start_range"][1], marker["processing_range"][0])
+            self.assertLess(marker["merged_range"][1], marker["end_range"][0])
+            self.assertEqual(marker["end_offset"], marker["end_range"][1])
+        finally:
+            gear.close()
+
+    def test_wait_preload_rejects_publication_without_exact_decoder_end(self):
+        child = self.script(
+            "wait_preload_missing_end.py",
+            r'''
+            import os
+            import termios
+
+            attrs = termios.tcgetattr(0)
+            attrs[3] &= ~(termios.ICANON | termios.ECHO)
+            termios.tcsetattr(0, termios.TCSANOW, attrs)
+            print("BOOT READY", flush=True)
+            os.read(0, 1)
+            print("STREAM READY", flush=True)
+            assert os.read(0, 2) == b"qe"
+            print("Delta heading left: 0.1 rad", flush=True)
+            print("Delta heading right: 0 rad", flush=True)
+            os.read(0, 1)
+            print(
+                "[ZMQEndpointInterface] *** Starting ZMQ processing ***",
+                flush=True,
+            )
+            print(
+                "[StreamedMotionMerger] Processing 20 frames, "
+                "incoming_frame_start=1, frame_step=1",
+                flush=True,
+            )
+            print(
+                "[StreamedMotionMerger] Merged motion: 21 frames "
+                "(copied: 1 + incoming: 20)",
+                flush=True,
+            )
+            print("[ZMQEndpointInterface] one post-merge diagnostic", flush=True)
+            ''',
+        )
+        gear = self.gear(child, readiness_timeout_s=0.1)
+        try:
+            gear.start_to_wait_for_control()
+            gear.enable_stream_for_preload()
+            boundary = gear.publication_boundary()
+            gear.write_keys(b"x")
+            with self.assertRaises(ProcessError):
+                gear.wait_for_stream_processing(
+                    boundary,
+                    frame_count=20,
+                    global_start=1,
+                    merged_count=21,
+                )
+        finally:
+            gear.close()
+
     def test_rejects_conflate_or_duplicate_managed_flags(self):
         child = self.script("unused.py", "raise SystemExit(0)\n")
         for flag in (
@@ -970,6 +1518,45 @@ class GearProcessTests(TemporaryScriptCase):
                     stderr_archive=self.root / "err-c",
                 )
             self.assertEqual(marker.read_text(encoding="utf-8"), "evidence")
+
+    def test_rejects_shell_unsafe_run_root_and_logs_before_any_spawn_or_write(
+        self,
+    ):
+        child = self.script("unused_shell_path.py", "raise SystemExit(0)\n")
+        sentinel = self.root / "shell-injection-sentinel"
+        for name in ("run root", "run;touch-shell-injection-sentinel"):
+            with self.subTest(name=name):
+                unsafe_root = self.root / name
+                unsafe_root.mkdir()
+                with patch("mm_sonic.process.subprocess.Popen") as popen:
+                    with self.assertRaisesRegex(ProcessError, "shell-safe"):
+                        GearProcess(
+                            run_root=unsafe_root,
+                            command=[sys.executable, str(child)],
+                            target_motion_logfile=unsafe_root / "target.csv",
+                            logs_dir=unsafe_root / "gear-logs",
+                            stdout_archive=unsafe_root / "out",
+                            stderr_archive=unsafe_root / "err",
+                        )
+                popen.assert_not_called()
+                self.assertEqual(tuple(unsafe_root.iterdir()), ())
+                self.assertFalse(sentinel.exists())
+
+    def test_rejects_shell_unsafe_logs_path_before_creating_it(self):
+        child = self.script("unused_shell_logs.py", "raise SystemExit(0)\n")
+        unsafe_logs = self.root / "gear logs;touch-owned"
+        with patch("mm_sonic.process.subprocess.Popen") as popen:
+            with self.assertRaisesRegex(ProcessError, "shell-safe"):
+                GearProcess(
+                    run_root=self.root,
+                    command=[sys.executable, str(child)],
+                    target_motion_logfile=self.root / "target-safe.csv",
+                    logs_dir=unsafe_logs,
+                    stdout_archive=self.root / "out-safe",
+                    stderr_archive=self.root / "err-safe",
+                )
+        popen.assert_not_called()
+        self.assertFalse(unsafe_logs.exists())
 
     def test_cleanup_escalates_term_then_kill_and_leaves_no_group_orphan(self):
         grandchild_path = self.root / "grandchild.pid"
@@ -1202,6 +1789,7 @@ class SimulationPolicyGateTests(TemporaryScriptCase):
             stderr_archive=self.root / "stderr",
             startup_markers=("BOOT READY",),
             active_markers=("CONTROL READY", "STREAM READY"),
+            wait_for_control_marker="BOOT READY",
             readiness_poll_s=0.005,
             signal_poll_s=0.005,
             stop_grace_s=0.05,

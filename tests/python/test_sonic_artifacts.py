@@ -10,6 +10,8 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+from jsonschema import Draft202012Validator
+
 from mm_sonic.artifacts import RunBundle, verify_run_inventory
 from mm_sonic.coordinator import (
     AbortDecisionRecord,
@@ -794,6 +796,32 @@ class RunManifestSchemaTests(unittest.TestCase):
             1,
         )
         self.assertEqual(schema["properties"]["processes"]["minItems"], 1)
+
+    def test_schema_allows_unauthenticated_identity_only_for_not_run(self):
+        root = Path(__file__).resolve().parents[2]
+        schema = json.loads(
+            (root / "sonic" / "schemas" / "run_manifest_v1.schema.json").read_text("utf-8")
+        )
+        validator = Draft202012Validator(schema)
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = RunBundle.create(temporary, "not-run-null", "run")
+            metadata = terminal_metadata()
+            metadata.pop("scene_registration")
+            metadata["external"]["gear_commit"] = None
+            metadata["external"]["gear_dirty"] = None
+            metadata["external"]["hashes"] = {"policy": None}
+            metadata["repositories"] = {
+                "motion_matching": {"commit": None, "dirty": None},
+                "gear_sonic": {"commit": None, "dirty": None},
+            }
+            bundle.update_manifest(metadata)
+            bundle.finalize("not_run", outcome={"reason": "missing"})
+            manifest = json.loads(
+                (bundle.path / "manifest.json").read_text("ascii")
+            )
+            validator.validate(manifest)
+            manifest["status"] = "failed"
+            self.assertTrue(tuple(validator.iter_errors(manifest)))
 
 
 if __name__ == "__main__":

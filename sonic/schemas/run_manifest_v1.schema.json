@@ -142,7 +142,8 @@
             "type": "array",
             "items": {"type": "string"},
             "minItems": 1
-          }
+          },
+          "invocation_cwd": {"type": "string", "pattern": "^/"}
         },
         "additionalProperties": true
       }
@@ -184,6 +185,22 @@
           "artifact_hashes": {"$ref": "#/$defs/completeArtifactHashes"}
         }
       }
+    },
+    {
+      "if": {
+        "properties": {"status": {"enum": ["complete", "failed"]}},
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "external": {"$ref": "#/$defs/authenticatedExternal"},
+          "repositories": {
+            "type": "object",
+            "minProperties": 1,
+            "additionalProperties": {"$ref": "#/$defs/authenticatedRepository"}
+          }
+        }
+      }
     }
   ],
   "$defs": {
@@ -201,8 +218,13 @@
       "type": "object",
       "required": ["commit", "dirty"],
       "properties": {
-        "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
-        "dirty": {"type": "boolean"}
+        "commit": {
+          "oneOf": [
+            {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            {"type": "null"}
+          ]
+        },
+        "dirty": {"type": ["boolean", "null"]}
       },
       "additionalProperties": false
     },
@@ -273,8 +295,13 @@
       ],
       "properties": {
         "gear_checkout": {"type": "string", "minLength": 1},
-        "gear_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
-        "gear_dirty": {"type": "boolean"},
+        "gear_commit": {
+          "oneOf": [
+            {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            {"type": "null"}
+          ]
+        },
+        "gear_dirty": {"type": ["boolean", "null"]},
         "policy": {"type": "string", "minLength": 1},
         "observation_config": {"type": "string", "minLength": 1},
         "encoder": {"type": ["string", "null"]},
@@ -283,10 +310,39 @@
         "hashes": {
           "type": "object",
           "minProperties": 1,
-          "additionalProperties": {"$ref": "#/$defs/sha256"}
+          "additionalProperties": {"$ref": "#/$defs/sha256OrNull"}
         }
       },
       "additionalProperties": false
+    },
+    "authenticatedRepository": {
+      "allOf": [
+        {"$ref": "#/$defs/repository"},
+        {
+          "type": "object",
+          "properties": {
+            "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "dirty": {"type": "boolean"}
+          }
+        }
+      ]
+    },
+    "authenticatedExternal": {
+      "allOf": [
+        {"$ref": "#/$defs/external"},
+        {
+          "type": "object",
+          "properties": {
+            "gear_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "gear_dirty": {"type": "boolean"},
+            "hashes": {
+              "type": "object",
+              "minProperties": 1,
+              "additionalProperties": {"$ref": "#/$defs/sha256"}
+            }
+          }
+        }
+      ]
     },
     "terminalManifest": {
       "type": "object",

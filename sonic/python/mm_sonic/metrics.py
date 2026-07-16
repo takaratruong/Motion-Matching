@@ -14,7 +14,7 @@ from typing import Iterable, Mapping
 
 import numpy as np
 
-from .artifacts import RunBundle
+from .artifacts import RunBundle, verify_run_inventory
 from .coordinator import (
     LOGGER_JOINT_PERMUTATION,
     DeliveryAudit,
@@ -46,6 +46,587 @@ MINIMUM_PELVIS_UP_DOT = 0.5
 REFERENCE_PENETRATION_LIMIT_M = 0.005
 KNOWN_GOOD_METRIC_MULTIPLIER = 1.5
 KNOWN_GOOD_ZERO_EPSILON = 1.0e-8
+STAGE_A_GATE_NAMES = (
+    "external_identity",
+    "joint_projection_round_trip",
+    "basis_and_scene_alignment",
+    "flat_mm_kinematic_replay",
+    "known_good_file_dynamic",
+    "known_good_stream_delivery",
+    "known_good_stream_dynamic",
+)
+STAGE_A_IDENTITY_KEYS = frozenset(
+    (
+        "policy",
+        "encoder",
+        "observation_config",
+        "external_commit",
+        "official_model_xml",
+        "generated_flat_scene",
+        "initial_qpos",
+        "mm_reference_buffer",
+        "known_good_reference_buffer",
+    )
+)
+_STAGE_A_REGISTRY_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "configs"
+    / "experiments"
+    / "stage_a.json"
+)
+_STAGE_A_EVIDENCE_KEYS = frozenset(
+    (
+        "schema",
+        "registry_sha256",
+        "command",
+        "mode",
+        "argv",
+        "invocation_cwd",
+        "environment",
+        "command_status",
+        "stage_a_status",
+        "gates",
+        "identity",
+        "identity_sha256",
+        "metrics",
+        "outputs",
+    )
+)
+_STAGE_A_GATE_KEYS = frozenset(
+    (
+        "name",
+        "status",
+        "reason",
+        "identity",
+        "evidence_hashes",
+        "metrics",
+        "outputs",
+    )
+)
+_STAGE_A_ENVIRONMENT_ALLOWLIST = (
+    "CUDA_VISIBLE_DEVICES",
+    "LD_LIBRARY_PATH",
+    "PATH",
+    "PYTHONPATH",
+)
+_STAGE_A_REQUIRED_OPTIONS = frozenset(
+    (
+        "mode",
+        "gear-checkout",
+        "policy",
+        "observation-config",
+        "source-mjcf",
+        "terrain-dir",
+        "output-root",
+    )
+)
+_STAGE_A_OPTION_NAMES = _STAGE_A_REQUIRED_OPTIONS | {"encoder"}
+_STAGE_A_EXTERNAL_OPTIONS = MappingProxyType(
+    {
+        "gear-checkout": "gear_checkout",
+        "policy": "policy",
+        "observation-config": "observation_config",
+        "source-mjcf": "source_mjcf",
+        "terrain-dir": "terrain_dir",
+        "encoder": "encoder",
+    }
+)
+_STAGE_A_PRIMARY_OUTPUTS = MappingProxyType(
+    {name: f"gates/{name}.json" for name in STAGE_A_GATE_NAMES}
+)
+_STAGE_A_GATE_HASH_KEYS = MappingProxyType(
+    {
+        name: frozenset(
+            (
+                f"{name}_sha256",
+                *(
+                    ("delivery_audit_sha256",)
+                    if name == "known_good_stream_delivery"
+                    else ()
+                ),
+            )
+        )
+        for name in STAGE_A_GATE_NAMES
+    }
+)
+_STAGE_A_DELIVERY_AUDIT_SUMMARY = MappingProxyType(
+    {
+        "readiness_publications": 1,
+        "logical_publications": 22,
+        "padding_publications": 1,
+        "receipt_fence_publications": 1,
+        "consumer_markers": 25,
+    }
+)
+
+
+def _stage_a_json_bytes(value: object, label: str) -> bytes:
+    try:
+        return (
+            json.dumps(
+                value,
+                allow_nan=False,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("ascii")
+    except (TypeError, ValueError) as error:
+        raise ContractError(f"{label} is not finite JSON data") from error
+
+
+def stage_a_identity_sha256(identity: Mapping[str, str]) -> str:
+    """Hash the exact complete Stage A experiment identity."""
+
+    if not isinstance(identity, Mapping) or set(identity) != STAGE_A_IDENTITY_KEYS:
+        raise ContractError("Stage A identity has invalid keys")
+    copied = dict(identity)
+    for name, value in copied.items():
+        if type(name) is not str or type(value) is not str or not value:
+            raise ContractError("Stage A identity values must be nonempty strings")
+        if name == "external_commit":
+            if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
+                raise ContractError("Stage A external commit is invalid")
+        elif len(value) != 64 or any(
+            character not in "0123456789abcdef" for character in value
+        ):
+            raise ContractError(f"Stage A identity {name} is not a SHA-256")
+    return hashlib.sha256(_stage_a_json_bytes(copied, "Stage A identity")).hexdigest()
+
+
+def _stage_a_no_duplicates(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    output: dict[str, object] = {}
+    for key, value in pairs:
+        if key in output:
+            raise ContractError(f"duplicate Stage A evidence key: {key}")
+        output[key] = value
+    return output
+
+
+def _stage_a_sha256(value: object) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _stage_a_regular_bytes(path: Path, label: str) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
+        os, "O_NOFOLLOW", 0
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ContractError(f"{label} is unavailable") from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ContractError(f"{label} must be one regular file")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise ContractError(f"{label} changed while being read")
+        raw = b"".join(chunks)
+        if len(raw) != after.st_size:
+            raise ContractError(f"{label} changed while being read")
+        return raw
+    finally:
+        os.close(descriptor)
+
+
+def _stage_a_output_sha256(bundle: Path, relative: object) -> str:
+    if type(relative) is not str:
+        raise ContractError("Stage A output path is invalid")
+    pure = PurePosixPath(relative)
+    if (
+        pure.is_absolute()
+        or not pure.parts
+        or any(part in ("", ".", "..") for part in pure.parts)
+        or pure.as_posix() != relative
+        or relative in ("manifest.json", "inventory.json")
+    ):
+        raise ContractError("Stage A output is not confined")
+    return hashlib.sha256(
+        _stage_a_regular_bytes(
+            bundle.joinpath(*pure.parts), f"Stage A output {relative}"
+        )
+    ).hexdigest()
+
+
+def _stage_a_invocation(argv: object) -> Mapping[str, str]:
+    if (
+        type(argv) is not list
+        or len(argv) < 2
+        or argv[0:2] != ["mm_sonic.cli", "stage-a"]
+        or any(type(argument) is not str or not argument for argument in argv)
+    ):
+        raise ContractError("Stage A argv is invalid")
+    options: dict[str, str] = {}
+    index = 2
+    while index < len(argv):
+        argument = argv[index]
+        if not argument.startswith("--") or argument == "--":
+            raise ContractError("Stage A argv contains a positional argument")
+        raw_option = argument[2:]
+        if "=" in raw_option:
+            option, value = raw_option.split("=", 1)
+            index += 1
+        else:
+            option = raw_option
+            if index + 1 >= len(argv):
+                raise ContractError("Stage A argv option is incomplete")
+            value = argv[index + 1]
+            if value.startswith("--"):
+                raise ContractError("Stage A argv option has an empty value")
+            index += 2
+        if option not in _STAGE_A_OPTION_NAMES:
+            raise ContractError(f"Stage A argv option is unknown: --{option}")
+        if not value:
+            raise ContractError(f"Stage A argv option is empty: --{option}")
+        if option in options:
+            raise ContractError(f"Stage A argv option is duplicated: --{option}")
+        options[option] = value
+    if set(options) - {"encoder"} != _STAGE_A_REQUIRED_OPTIONS:
+        raise ContractError("Stage A argv is missing a required option")
+    if options["mode"] != "known-good-stream":
+        raise ContractError("Stage A argv is not known-good-stream")
+    return MappingProxyType(options)
+
+
+def _stage_a_invocation_cwd(value: object) -> Path:
+    if type(value) is not str or not value:
+        raise ContractError("Stage A invocation cwd is invalid")
+    if value.startswith("~"):
+        raise ContractError("Stage A invocation cwd uses user expansion")
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        raise ContractError("Stage A invocation cwd is not absolute")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ContractError("Stage A invocation cwd cannot be resolved") from error
+    if value != str(resolved) or not resolved.is_dir():
+        raise ContractError("Stage A invocation cwd is not canonical")
+    return resolved
+
+
+def _stage_a_resolved_path(
+    value: object,
+    label: str,
+    *,
+    invocation_cwd: Path | None,
+) -> Path:
+    if type(value) is not str or not value:
+        raise ContractError(f"{label} path is invalid")
+    if value.startswith("~"):
+        raise ContractError(f"{label} path uses user expansion")
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        if invocation_cwd is None:
+            raise ContractError(f"{label} path is not absolute")
+        candidate = invocation_cwd / candidate
+    try:
+        return candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ContractError(f"{label} path cannot be resolved") from error
+
+
+def validate_stage_a_prerequisite(
+    evidence_path: str | os.PathLike[str],
+    *,
+    expected_identity: Mapping[str, str] | None,
+) -> Mapping[str, object]:
+    """Authenticate a complete Stage A pass before any Stage B/C launch."""
+
+    candidate = Path(evidence_path).expanduser()
+    if not verify_run_inventory(candidate.parent):
+        raise ContractError("Stage A evidence inventory did not authenticate")
+    try:
+        observed = candidate.lstat()
+    except OSError as error:
+        raise ContractError("Stage A evidence is unavailable") from error
+    if stat.S_ISLNK(observed.st_mode) or not stat.S_ISREG(observed.st_mode):
+        raise ContractError("Stage A evidence must be a regular non-symlink file")
+    if observed.st_nlink != 1:
+        raise ContractError("Stage A evidence must not be a hard-link alias")
+    try:
+        path = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ContractError("Stage A evidence cannot be resolved") from error
+    if path.name != "stage-a-evidence.json" or path.parent != candidate.parent.resolve():
+        raise ContractError("Stage A evidence path is not canonical")
+    try:
+        raw = _stage_a_regular_bytes(path, "Stage A evidence")
+        document = json.loads(
+            raw.decode("ascii"), object_pairs_hook=_stage_a_no_duplicates
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ContractError("Stage A evidence is not canonical JSON") from error
+    if type(document) is not dict or raw != _stage_a_json_bytes(
+        document, "Stage A evidence"
+    ):
+        raise ContractError("Stage A evidence is not canonical JSON")
+    if document.get("schema") != "mm-sonic-stage-a-evidence/v1":
+        raise ContractError("Stage A evidence schema is invalid")
+    if set(document) != _STAGE_A_EVIDENCE_KEYS:
+        raise ContractError("Stage A evidence has invalid keys")
+    registry_raw = _stage_a_regular_bytes(
+        _STAGE_A_REGISTRY_PATH, "current Stage A registry"
+    )
+    registry_sha256 = hashlib.sha256(registry_raw).hexdigest()
+    if document.get("registry_sha256") != registry_sha256:
+        raise ContractError("Stage A evidence registry is stale")
+    if document.get("command") != "stage-a":
+        raise ContractError("Stage A evidence command is invalid")
+    if document.get("mode") != "known-good-stream":
+        raise ContractError("Stage A evidence mode must be known-good-stream")
+    argv = document.get("argv")
+    invocation = _stage_a_invocation(argv)
+    if invocation["mode"] != document["mode"]:
+        raise ContractError("Stage A evidence argv changed")
+    invocation_cwd = _stage_a_invocation_cwd(
+        document.get("invocation_cwd")
+    )
+    output_root = _stage_a_resolved_path(
+        invocation["output-root"],
+        "Stage A argv output-root",
+        invocation_cwd=invocation_cwd,
+    )
+    bundle = path.parent
+    if bundle.parent.name != "stage-a" or output_root != bundle.parent.parent:
+        raise ContractError("Stage A argv output-root does not contain this bundle")
+    environment = document.get("environment")
+    if (
+        type(environment) is not dict
+        or set(environment) != {"allowlist", "values"}
+        or environment.get("allowlist") != list(_STAGE_A_ENVIRONMENT_ALLOWLIST)
+        or type(environment.get("values")) is not dict
+        or any(
+            name not in _STAGE_A_ENVIRONMENT_ALLOWLIST
+            or type(value) is not str
+            for name, value in environment["values"].items()
+        )
+    ):
+        raise ContractError("Stage A evidence environment is invalid")
+    gates = document.get("gates")
+    if type(gates) is not list or len(gates) != len(STAGE_A_GATE_NAMES):
+        raise ContractError("Stage A gate evidence is incomplete")
+    reconstructed_identity: dict[str, str] = {}
+    reconstructed_metrics: dict[str, object] = {}
+    reconstructed_outputs: dict[str, str] = {}
+    for index, name in enumerate(STAGE_A_GATE_NAMES):
+        gate = gates[index]
+        if (
+            type(gate) is not dict
+            or set(gate) != _STAGE_A_GATE_KEYS
+            or gate.get("name") != name
+        ):
+            raise ContractError("Stage A gate order changed")
+        if gate.get("status") != "pass":
+            if name.startswith("known_good_stream"):
+                raise ContractError(
+                    "Stage A stream delivery and dynamic gates must pass"
+                )
+            raise ContractError(f"Stage A gate did not pass: {name}")
+        if gate.get("reason") is not None:
+            raise ContractError("passing Stage A gate has a reason")
+        gate_identity = gate.get("identity")
+        evidence_hashes = gate.get("evidence_hashes")
+        gate_metrics = gate.get("metrics")
+        gate_outputs = gate.get("outputs")
+        if (
+            type(gate_identity) is not dict
+            or type(evidence_hashes) is not dict
+            or not evidence_hashes
+            or type(gate_metrics) is not dict
+            or type(gate_outputs) is not dict
+            or not gate_outputs
+        ):
+            raise ContractError("Stage A passing gate evidence is incomplete")
+        if any(
+            type(hash_name) is not str
+            or not hash_name
+            or not _stage_a_sha256(digest)
+            for hash_name, digest in evidence_hashes.items()
+        ):
+            raise ContractError("Stage A gate evidence hashes are invalid")
+        if set(evidence_hashes) != _STAGE_A_GATE_HASH_KEYS[name]:
+            raise ContractError("Stage A gate evidence hash keys changed")
+        for identity_name, identity_value in gate_identity.items():
+            if identity_name not in STAGE_A_IDENTITY_KEYS:
+                raise ContractError("Stage A gate identity key is invalid")
+            current = reconstructed_identity.get(identity_name)
+            if current is not None and current != identity_value:
+                raise ContractError("Stage A gate identities conflict")
+            reconstructed_identity[identity_name] = identity_value
+        if gate_metrics:
+            reconstructed_metrics[name] = gate_metrics
+        for relative, digest in gate_outputs.items():
+            if not _stage_a_sha256(digest):
+                raise ContractError("Stage A gate output digest is invalid")
+            if relative in reconstructed_outputs:
+                raise ContractError("Stage A gate output is duplicated")
+            if _stage_a_output_sha256(path.parent, relative) != digest:
+                raise ContractError("Stage A gate output digest changed")
+            reconstructed_outputs[relative] = digest
+        primary_relative = _STAGE_A_PRIMARY_OUTPUTS[name]
+        primary_digest = gate_outputs.get(primary_relative)
+        primary_hash_name = f"{name}_sha256"
+        if (
+            not _stage_a_sha256(primary_digest)
+            or evidence_hashes.get(primary_hash_name) != primary_digest
+        ):
+            raise ContractError("Stage A gate primary evidence hash changed")
+        if name == "known_good_stream_delivery":
+            primary_raw = _stage_a_regular_bytes(
+                path.parent / primary_relative,
+                "Stage A stream delivery primary output",
+            )
+            try:
+                primary_payload = json.loads(
+                    primary_raw.decode("ascii"),
+                    object_pairs_hook=_stage_a_no_duplicates,
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ContractError(
+                    "Stage A stream delivery primary output is invalid"
+                ) from error
+            if (
+                type(primary_payload) is not dict
+                or primary_raw
+                != _stage_a_json_bytes(
+                    primary_payload, "Stage A stream delivery primary output"
+                )
+            ):
+                raise ContractError(
+                    "Stage A stream delivery primary output is not canonical"
+                )
+            delivery_audit = primary_payload.get("delivery_audit")
+            if type(delivery_audit) is not dict:
+                raise ContractError("Stage A stream delivery audit is missing")
+            audit_core = dict(delivery_audit)
+            embedded_digest = audit_core.pop("evidence_sha256", None)
+            if not _stage_a_sha256(embedded_digest):
+                raise ContractError("Stage A stream delivery audit hash is invalid")
+            for summary_name, summary_value in (
+                _STAGE_A_DELIVERY_AUDIT_SUMMARY.items()
+            ):
+                observed_summary = audit_core.pop(summary_name, None)
+                if (
+                    type(observed_summary) is not int
+                    or observed_summary != summary_value
+                ):
+                    raise ContractError(
+                        "Stage A stream delivery audit summary changed"
+                    )
+            computed_audit_digest = hashlib.sha256(
+                _stage_a_json_bytes(
+                    audit_core, "Stage A stream delivery audit core"
+                )
+            ).hexdigest()
+            if (
+                embedded_digest != computed_audit_digest
+                or evidence_hashes.get("delivery_audit_sha256")
+                != computed_audit_digest
+            ):
+                raise ContractError("Stage A stream delivery audit hash changed")
+    if (
+        document.get("command_status") != "pass"
+        or document.get("stage_a_status") != "pass"
+    ):
+        raise ContractError("Stage A evidence is not a complete pass")
+    identity = document.get("identity")
+    if type(identity) is not dict or identity != reconstructed_identity:
+        raise ContractError("Stage A identity is missing")
+    identity_hash = stage_a_identity_sha256(identity)
+    if document.get("identity_sha256") != identity_hash:
+        raise ContractError("Stage A identity digest is invalid")
+    if expected_identity is not None:
+        expected_hash = stage_a_identity_sha256(expected_identity)
+        if expected_hash != identity_hash or dict(expected_identity) != dict(identity):
+            raise ContractError("Stage A identity does not match this experiment")
+    if document.get("metrics") != reconstructed_metrics:
+        raise ContractError("Stage A top-level metrics do not match its gates")
+    if document.get("outputs") != reconstructed_outputs:
+        raise ContractError("Stage A top-level outputs do not match its gates")
+
+    manifest_path = path.parent / "manifest.json"
+    try:
+        manifest_raw = _stage_a_regular_bytes(
+            manifest_path, "Stage A terminal manifest"
+        )
+        manifest = json.loads(
+            manifest_raw.decode("ascii"), object_pairs_hook=_stage_a_no_duplicates
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ContractError("Stage A terminal manifest is invalid") from error
+    if type(manifest) is not dict:
+        raise ContractError("Stage A terminal manifest is invalid")
+    if manifest.get("status") != "complete" or manifest.get("outcome") != {
+        "stage_a_status": "pass",
+        "status": "pass",
+    }:
+        raise ContractError("Stage A terminal manifest is not an exact pass")
+    processes = manifest.get("processes")
+    if (
+        type(processes) is not list
+        or not processes
+        or type(processes[0]) is not dict
+        or set(processes[0])
+        != {"name", "argv", "invocation_cwd", "environment"}
+        or processes[0]
+        != {
+            "name": "mm_sonic.cli",
+            "argv": argv,
+            "invocation_cwd": str(invocation_cwd),
+            "environment": environment,
+        }
+    ):
+        raise ContractError("Stage A terminal invocation does not match evidence")
+    external = manifest.get("external")
+    if type(external) is not dict:
+        raise ContractError("Stage A terminal external inputs are invalid")
+    for option_name, manifest_name in _STAGE_A_EXTERNAL_OPTIONS.items():
+        argument_value = invocation.get(option_name)
+        manifest_value = external.get(manifest_name)
+        if option_name == "encoder" and argument_value is None:
+            if manifest_value is not None:
+                raise ContractError("Stage A argv encoder changed")
+            continue
+        if argument_value is None or manifest_value is None:
+            raise ContractError(f"Stage A argv {option_name} changed")
+        if _stage_a_resolved_path(
+            argument_value,
+            f"Stage A argv {option_name}",
+            invocation_cwd=invocation_cwd,
+        ) != _stage_a_resolved_path(
+            manifest_value,
+            f"Stage A manifest external.{manifest_name}",
+            invocation_cwd=None,
+        ):
+            raise ContractError(f"Stage A argv {option_name} changed")
+    return MappingProxyType(document)
 
 
 def _finite(value: object, label: str) -> float:
