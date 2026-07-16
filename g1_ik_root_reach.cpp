@@ -300,7 +300,16 @@ struct G1RootReachFootGeometry
 };
 
 static constexpr uint32_t
-    G1RootReachMaximumBoundaryCandidateTests = 32U;
+    G1RootReachMaximumBoundaryCandidateTests = 64U;
+
+#if defined(G1_IK_ENABLE_TEST_SEAMS)
+static_assert(
+    G1RootReachMaximumBoundaryCandidateTests ==
+        static_cast<uint32_t>(
+            sizeof(((G1RootReachPlannerAudit*)nullptr)->attempts) /
+            sizeof(((G1RootReachPlannerAudit*)nullptr)->attempts[0])),
+    "G1 root-reach production ceiling must equal audit capacity");
+#endif
 
 struct G1RootReachCandidateCursor
 {

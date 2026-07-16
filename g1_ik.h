@@ -529,7 +529,7 @@ struct G1RootReachAuditAttempt
 struct G1RootReachPlannerAudit
 {
     G1RootReachAuditCursor cursors[4];
-    G1RootReachAuditAttempt attempts[32];
+    G1RootReachAuditAttempt attempts[64];
     uint32_t cursor_count;
     uint32_t attempt_count;
 };
