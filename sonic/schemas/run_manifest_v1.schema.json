@@ -14,8 +14,9 @@
     "schema": {"const": "mm-sonic-run-manifest/v1"},
     "experiment_id": {"type": "string", "minLength": 1},
     "run_id": {"type": "string", "minLength": 1},
-    "status": {"enum": ["running", "complete", "failed", "not_run"]},
+    "status": {"enum": ["running", "finalizing", "complete", "failed", "not_run"]},
     "created_utc": {"type": "string", "format": "date-time"},
+    "finalization_started_utc": {"type": "string", "format": "date-time"},
     "finalized_utc": {"type": "string", "format": "date-time"},
     "external": {"$ref": "#/$defs/external"},
     "repositories": {
@@ -65,6 +66,7 @@
     },
     "processes": {
       "type": "array",
+      "minItems": 1,
       "items": {
         "type": "object",
         "required": ["name", "argv"],
@@ -93,10 +95,28 @@
   "allOf": [
     {
       "if": {
+        "properties": {"status": {"const": "finalizing"}},
+        "required": ["status"]
+      },
+      "then": {"required": ["finalization_started_utc"]}
+    },
+    {
+      "if": {
         "properties": {"status": {"enum": ["complete", "failed", "not_run"]}},
         "required": ["status"]
       },
       "then": {"$ref": "#/$defs/terminalManifest"}
+    },
+    {
+      "if": {
+        "properties": {"status": {"const": "complete"}},
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "artifact_hashes": {"$ref": "#/$defs/completeArtifactHashes"}
+        }
+      }
     }
   ],
   "$defs": {
@@ -136,6 +156,32 @@
         "terrain": {"$ref": "#/$defs/sha256OrNull"},
         "joint_map": {"$ref": "#/$defs/sha256OrNull"},
         "scene": {"$ref": "#/$defs/sha256OrNull"}
+      },
+      "additionalProperties": false
+    },
+    "completeArtifactHashes": {
+      "type": "object",
+      "required": [
+        "policy",
+        "encoder",
+        "observation_config",
+        "model",
+        "source_mjcf",
+        "motion",
+        "terrain",
+        "joint_map",
+        "scene"
+      ],
+      "properties": {
+        "policy": {"$ref": "#/$defs/sha256"},
+        "encoder": {"$ref": "#/$defs/sha256OrNull"},
+        "observation_config": {"$ref": "#/$defs/sha256"},
+        "model": {"$ref": "#/$defs/sha256"},
+        "source_mjcf": {"$ref": "#/$defs/sha256"},
+        "motion": {"$ref": "#/$defs/sha256"},
+        "terrain": {"$ref": "#/$defs/sha256"},
+        "joint_map": {"$ref": "#/$defs/sha256"},
+        "scene": {"$ref": "#/$defs/sha256"}
       },
       "additionalProperties": false
     },
@@ -181,6 +227,7 @@
         "processes",
         "outcome",
         "evidence",
+        "finalization_started_utc",
         "finalized_utc"
       ]
     }

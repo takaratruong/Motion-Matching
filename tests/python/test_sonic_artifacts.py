@@ -7,6 +7,7 @@ from pathlib import Path
 import stat
 import tempfile
 import unittest
+from unittest import mock
 
 from mm_sonic.artifacts import RunBundle, verify_run_inventory
 from mm_sonic.joints import ContractError
@@ -129,6 +130,35 @@ class RunBundleLifecycleTests(unittest.TestCase):
     def tearDown(self):
         self._temporary.cleanup()
 
+    def _finalized_bundle(self, experiment_id: str) -> RunBundle:
+        bundle = RunBundle.create(self.root, experiment_id, "run")
+        bundle.update_manifest(terminal_metadata())
+        bundle.write_text("logs/evidence.txt", "registered\n")
+        bundle.finalize("complete", outcome={"integration_pass": True})
+        return bundle
+
+    @staticmethod
+    def _rewrite_manifest(bundle: RunBundle, mutate) -> None:
+        path = bundle.path / "manifest.json"
+        path.chmod(0o644)
+        manifest = json.loads(path.read_text("utf-8"))
+        mutate(manifest)
+        path.write_text(
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="ascii",
+        )
+
+    @staticmethod
+    def _rewrite_inventory(bundle: RunBundle, mutate) -> None:
+        path = bundle.path / "inventory.json"
+        path.chmod(0o644)
+        inventory = json.loads(path.read_text("utf-8"))
+        mutate(inventory)
+        path.write_text(
+            json.dumps(inventory, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="ascii",
+        )
+
     def test_candidate_abort_accept_and_timing_records_are_incremental_jsonl(self):
         records = (
             (self.bundle.record_candidate, {"candidate_id": "c0", "raw": {"v": 1}}, "candidates.jsonl"),
@@ -147,6 +177,16 @@ class RunBundleLifecycleTests(unittest.TestCase):
             self.assertEqual(len(decoded), expected_counts[filename])
             self.assertEqual(decoded[-1]["record"], record)
             self.assertEqual(decoded[-1]["sequence"], sum(expected_counts.values()))
+
+    def test_incremental_records_reject_hard_linked_external_targets(self):
+        victim = self.root / "external-candidates.jsonl"
+        victim.write_bytes(b'{"external":true}\n')
+        os.link(victim, self.bundle.path / "candidates.jsonl")
+
+        with self.assertRaisesRegex(ContractError, "hard link"):
+            self.bundle.record_candidate({"candidate_id": "must-not-append"})
+        self.assertEqual(victim.read_bytes(), b'{"external":true}\n')
+        self.assertEqual(self.bundle.status, "running")
 
     def test_terminal_statuses_write_inventory_and_make_all_evidence_read_only(self):
         for index, terminal in enumerate(("complete", "failed", "not_run")):
@@ -209,6 +249,143 @@ class RunBundleLifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, "unregistered"):
             verify_run_inventory(self.bundle.path)
 
+    def test_inventory_authenticates_terminal_status_and_outcome(self):
+        cases = (
+            ("status", lambda value: value.update({"status": "failed"})),
+            (
+                "outcome",
+                lambda value: value.update(
+                    {"outcome": {"integration_pass": False, "tampered": True}}
+                ),
+            ),
+        )
+        for index, (label, mutate) in enumerate(cases):
+            with self.subTest(label=label):
+                bundle = self._finalized_bundle(f"manifest-tamper-{index}")
+                self._rewrite_manifest(bundle, mutate)
+                with self.assertRaisesRegex(
+                    ContractError, "terminal manifest core SHA-256"
+                ):
+                    verify_run_inventory(bundle.path)
+
+    def test_inventory_rejects_nonterminal_manifest_status(self):
+        bundle = self._finalized_bundle("nonterminal-status")
+        self._rewrite_manifest(
+            bundle, lambda value: value.update({"status": "running"})
+        )
+        with self.assertRaisesRegex(ContractError, "terminal manifest status"):
+            verify_run_inventory(bundle.path)
+
+    def test_inventory_rejects_unsupported_manifest_and_inventory_schemas(self):
+        manifest_bundle = self._finalized_bundle("manifest-schema")
+        self._rewrite_manifest(
+            manifest_bundle,
+            lambda value: value.update({"schema": "unsupported-manifest"}),
+        )
+        with self.assertRaisesRegex(ContractError, "manifest.*unsupported schema"):
+            verify_run_inventory(manifest_bundle.path)
+
+        inventory_bundle = self._finalized_bundle("inventory-schema")
+        self._rewrite_inventory(
+            inventory_bundle,
+            lambda value: value.update({"schema": "unsupported-inventory"}),
+        )
+        with self.assertRaisesRegex(ContractError, "inventory.*unsupported schema"):
+            verify_run_inventory(inventory_bundle.path)
+
+    def test_inventory_validates_declared_file_count(self):
+        bundle = self._finalized_bundle("file-count-tamper")
+
+        def mutate(value):
+            value["evidence"]["file_count"] += 1
+
+        self._rewrite_manifest(bundle, mutate)
+        with self.assertRaisesRegex(ContractError, "file_count"):
+            verify_run_inventory(bundle.path)
+
+    def test_inventory_rejects_fifo_and_unregistered_directory_entries(self):
+        fifo_bundle = self._finalized_bundle("fifo-entry")
+        os.mkfifo(fifo_bundle.path / "unexpected.fifo")
+        with self.assertRaisesRegex(ContractError, "special entry"):
+            verify_run_inventory(fifo_bundle.path)
+
+        directory_bundle = self._finalized_bundle("directory-entry")
+        (directory_bundle.path / "unexpected-empty-directory").mkdir()
+        with self.assertRaisesRegex(ContractError, "unregistered director"):
+            verify_run_inventory(directory_bundle.path)
+
+    def test_finalize_rejects_replaced_run_path_without_touching_symlink_target(self):
+        self.bundle.update_manifest(terminal_metadata())
+        self.bundle.write_text("evidence.txt", "registered\n")
+        victim = self.root / "input-tree"
+        victim.mkdir()
+        victim_file = victim / "input.bin"
+        victim_file.write_bytes(b"read-only input identity\n")
+        victim_file.chmod(0o666)
+        expected_mode = stat.S_IMODE(victim_file.stat().st_mode)
+
+        original = self.bundle.path
+        moved = original.with_name("run-moved")
+        original.rename(moved)
+        original.symlink_to(victim, target_is_directory=True)
+
+        with self.assertRaisesRegex(ContractError, "run path identity"):
+            self.bundle.finalize("complete", outcome={"integration_pass": True})
+        self.assertEqual(stat.S_IMODE(victim_file.stat().st_mode), expected_mode)
+        self.assertEqual(victim_file.read_bytes(), b"read-only input identity\n")
+        self.assertFalse((victim / "inventory.json").exists())
+
+    def test_finalize_rejects_hard_link_alias_without_changing_input_inode(self):
+        self.bundle.update_manifest(terminal_metadata())
+        victim = self.root / "input.bin"
+        victim.write_bytes(b"external input\n")
+        victim.chmod(0o666)
+        expected_mode = stat.S_IMODE(victim.stat().st_mode)
+        os.link(victim, self.bundle.path / "hard-linked-input.bin")
+
+        with self.assertRaisesRegex(ContractError, "hard link"):
+            self.bundle.finalize("failed", outcome={"failure_layer": "fixture"})
+        self.assertEqual(stat.S_IMODE(victim.stat().st_mode), expected_mode)
+        self.assertEqual(victim.read_bytes(), b"external input\n")
+
+    def test_finalize_rejects_unregistered_empty_directories(self):
+        self.bundle.update_manifest(terminal_metadata())
+        (self.bundle.path / "unexpected-empty-directory").mkdir()
+
+        with self.assertRaisesRegex(ContractError, "unregistered director"):
+            self.bundle.finalize("failed", outcome={"reason": "fixture"})
+        self.assertEqual(self.bundle.status, "finalizing")
+
+    def test_sealing_failure_is_permanently_fail_closed_on_disk_and_in_api(self):
+        self.bundle.update_manifest(terminal_metadata())
+        self.bundle.write_text("evidence.txt", "registered\n")
+
+        with mock.patch.object(
+            self.bundle,
+            "_seal_evidence",
+            side_effect=OSError("injected sealing failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "injected sealing failure"):
+                self.bundle.finalize(
+                    "complete", outcome={"integration_pass": True}
+                )
+
+        manifest = json.loads(
+            (self.bundle.path / "manifest.json").read_text("utf-8")
+        )
+        self.assertEqual(self.bundle.status, "finalizing")
+        self.assertEqual(manifest["status"], "finalizing")
+        self.assertNotIn("outcome", manifest)
+        self.assertNotIn("evidence", manifest)
+        self.assertNotIn("finalized_utc", manifest)
+        with self.assertRaisesRegex(ContractError, "finalizing"):
+            self.bundle.write_text("late.txt", "forbidden\n")
+        with self.assertRaisesRegex(ContractError, "finalizing"):
+            self.bundle.record_timing({"name": "late", "duration_ns": 1})
+        with self.assertRaisesRegex(ContractError, "finalizing"):
+            self.bundle.finalize("failed", outcome={"reason": "retry"})
+        self.assertFalse((self.bundle.path / "late.txt").exists())
+
     def test_finalize_requires_complete_identity_metadata_and_valid_status(self):
         with self.assertRaisesRegex(ContractError, "terminal status"):
             self.bundle.finalize("running", outcome={})
@@ -225,6 +402,114 @@ class RunBundleLifecycleTests(unittest.TestCase):
         other.update_manifest(invalid)
         with self.assertRaisesRegex(ContractError, "artifact_hashes"):
             other.finalize("failed", outcome={"reason": "fixture"})
+
+    def test_finalize_rejects_every_malformed_manifest_category_before_transition(self):
+        cases = (
+            (
+                "external",
+                lambda value: value["external"].update(
+                    {"gear_dirty": "not-a-boolean"}
+                ),
+            ),
+            (
+                "repositories",
+                lambda value: value["repositories"]["motion_matching"].update(
+                    {"commit": "short"}
+                ),
+            ),
+            (
+                "command_script",
+                lambda value: value["command_script"].update(
+                    {"sha256": "not-a-sha256"}
+                ),
+            ),
+            (
+                "perturbation",
+                lambda value: value["perturbation"].update(
+                    {"lateral_offset_m": "not-a-number"}
+                ),
+            ),
+            (
+                "coordinate_transform",
+                lambda value: value["coordinate_transform"].update(
+                    {"matrix": [[1.0, 0.0], [0.0, 1.0]]}
+                ),
+            ),
+            (
+                "processes",
+                lambda value: value.update(
+                    {"processes": [{"name": "mm", "argv": []}]}
+                ),
+            ),
+            (
+                "processes",
+                lambda value: value.update({"processes": []}),
+            ),
+        )
+        for index, (label, mutate) in enumerate(cases):
+            with self.subTest(label=label):
+                metadata = terminal_metadata()
+                mutate(metadata)
+                bundle = RunBundle.create(
+                    self.root, f"malformed-{index}", "run"
+                )
+                bundle.update_manifest(metadata)
+                with self.assertRaisesRegex(ContractError, label):
+                    bundle.finalize("failed", outcome={"reason": "fixture"})
+                self.assertEqual(bundle.status, "running")
+                manifest = json.loads(
+                    (bundle.path / "manifest.json").read_text("utf-8")
+                )
+                self.assertEqual(manifest["status"], "running")
+
+    def test_complete_requires_every_mandatory_artifact_hash_but_not_encoder(self):
+        mandatory = (
+            "policy",
+            "observation_config",
+            "model",
+            "source_mjcf",
+            "motion",
+            "terrain",
+            "joint_map",
+            "scene",
+        )
+        for index, name in enumerate(mandatory):
+            with self.subTest(name=name):
+                metadata = terminal_metadata()
+                metadata["artifact_hashes"] = dict(metadata["artifact_hashes"])
+                metadata["artifact_hashes"][name] = None
+                bundle = RunBundle.create(
+                    self.root, f"complete-null-{index}", "run"
+                )
+                bundle.update_manifest(metadata)
+                with self.assertRaisesRegex(
+                    ContractError, rf"complete.*{name}"
+                ):
+                    bundle.finalize("complete", outcome={"integration_pass": True})
+                self.assertEqual(bundle.status, "running")
+
+        encoder_optional = RunBundle.create(
+            self.root, "complete-encoder-null", "run"
+        )
+        encoder_optional.update_manifest(terminal_metadata())
+        encoder_optional.finalize(
+            "complete", outcome={"integration_pass": True}
+        )
+        self.assertEqual(encoder_optional.status, "complete")
+
+    def test_failed_and_not_run_can_record_unavailable_artifact_hashes_as_null(self):
+        for index, terminal in enumerate(("failed", "not_run")):
+            with self.subTest(terminal=terminal):
+                metadata = terminal_metadata()
+                metadata["artifact_hashes"] = {
+                    key: None for key in metadata["artifact_hashes"]
+                }
+                bundle = RunBundle.create(
+                    self.root, f"unavailable-{index}", "run"
+                )
+                bundle.update_manifest(metadata)
+                bundle.finalize(terminal, outcome={"reason": "unavailable"})
+                self.assertEqual(bundle.status, terminal)
 
 
 class RunManifestSchemaTests(unittest.TestCase):
@@ -248,6 +533,45 @@ class RunManifestSchemaTests(unittest.TestCase):
                 "finalized_utc",
             }.issubset(terminal_required)
         )
+
+    def test_schema_has_a_complete_only_nonnull_artifact_rule(self):
+        root = Path(__file__).resolve().parents[2]
+        schema = json.loads(
+            (root / "sonic" / "schemas" / "run_manifest_v1.schema.json").read_text("utf-8")
+        )
+        self.assertIn("finalizing", schema["properties"]["status"]["enum"])
+        complete_rules = [
+            rule
+            for rule in schema["allOf"]
+            if rule.get("if", {}).get("properties", {}).get("status")
+            == {"const": "complete"}
+        ]
+        self.assertEqual(len(complete_rules), 1)
+        self.assertEqual(
+            complete_rules[0]["then"]["properties"]["artifact_hashes"]["$ref"],
+            "#/$defs/completeArtifactHashes",
+        )
+        complete_hashes = schema["$defs"]["completeArtifactHashes"]
+        for name in (
+            "policy",
+            "observation_config",
+            "model",
+            "source_mjcf",
+            "motion",
+            "terrain",
+            "joint_map",
+            "scene",
+        ):
+            self.assertEqual(
+                complete_hashes["properties"][name], {"$ref": "#/$defs/sha256"}
+            )
+        self.assertEqual(
+            schema["properties"]["processes"]["items"]["properties"]["argv"][
+                "minItems"
+            ],
+            1,
+        )
+        self.assertEqual(schema["properties"]["processes"]["minItems"], 1)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -45,7 +46,23 @@ _ARTIFACT_HASH_KEYS = frozenset(
 )
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _RESERVED_OUTPUTS = frozenset(("manifest.json", "inventory.json"))
+
+_EXTERNAL_KEYS = frozenset(
+    (
+        "gear_checkout",
+        "gear_commit",
+        "gear_dirty",
+        "policy",
+        "observation_config",
+        "encoder",
+        "terrain_dir",
+        "source_mjcf",
+        "hashes",
+    )
+)
+_MANDATORY_COMPLETE_HASHES = _ARTIFACT_HASH_KEYS - {"encoder"}
 
 
 def _utc_now() -> str:
@@ -91,6 +108,22 @@ def _regular_read_flags() -> int:
     return os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 
 
+def _inode_identity(metadata: os.stat_result) -> tuple[int, int]:
+    return metadata.st_dev, metadata.st_ino
+
+
+def _opened_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
 def _write_all(descriptor: int, data: bytes) -> None:
     view = memoryview(data)
     while view:
@@ -118,49 +151,381 @@ def _json_copy(value: object, label: str) -> object:
     return json.loads(_json_bytes(value, label))
 
 
-def _sha256_regular(path: Path) -> tuple[str, int]:
+def _mapping(value: object, label: str) -> dict[str, object]:
+    if type(value) is not dict:
+        raise ContractError(f"terminal manifest {label} must be an object")
+    return value
+
+
+def _exact_keys(
+    value: object, expected: frozenset[str], label: str
+) -> dict[str, object]:
+    output = _mapping(value, label)
+    if set(output) != expected:
+        raise ContractError(f"terminal manifest {label} has invalid keys")
+    return output
+
+
+def _nonempty_string(value: object, label: str) -> str:
+    if type(value) is not str or not value:
+        raise ContractError(f"terminal manifest {label} must be a nonempty string")
+    return value
+
+
+def _sha256_or_null(value: object, label: str) -> None:
+    if value is not None and (
+        type(value) is not str or _SHA256.fullmatch(value) is None
+    ):
+        raise ContractError(
+            f"terminal manifest {label} must be a SHA-256 digest or null"
+        )
+
+
+def _finite_number(value: object, label: str) -> float:
+    if type(value) not in (int, float) or not math.isfinite(float(value)):
+        raise ContractError(f"terminal manifest {label} must be a finite number")
+    return float(value)
+
+
+def _timestamp(value: object, label: str) -> str:
+    text = _nonempty_string(value, label)
     try:
-        metadata = path.lstat()
-    except OSError as error:
-        raise ContractError(f"cannot inspect evidence file: {path}") from error
-    if stat.S_ISLNK(metadata.st_mode):
-        raise ContractError(f"evidence path is a symlink: {path}")
-    if not stat.S_ISREG(metadata.st_mode):
-        raise ContractError(f"evidence path is not a regular file: {path}")
-    try:
-        descriptor = os.open(path, _regular_read_flags())
-    except OSError as error:
-        raise ContractError(f"cannot open evidence read-only: {path}") from error
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ContractError(
+            f"terminal manifest {label} must be an ISO-8601 timestamp"
+        ) from error
+    if parsed.tzinfo is None:
+        raise ContractError(
+            f"terminal manifest {label} must include a timezone"
+        )
+    return text
+
+
+def _validate_terminal_metadata(
+    manifest: Mapping[str, object], status: str
+) -> None:
+    missing = sorted(_TERMINAL_MANIFEST_KEYS - set(manifest))
+    if missing:
+        raise ContractError(f"terminal manifest is missing fields: {missing}")
+
+    external = _exact_keys(manifest["external"], _EXTERNAL_KEYS, "external")
+    for name in (
+        "gear_checkout",
+        "policy",
+        "observation_config",
+        "terrain_dir",
+        "source_mjcf",
+    ):
+        _nonempty_string(external[name], f"external.{name}")
+    encoder = external["encoder"]
+    if encoder is not None:
+        _nonempty_string(encoder, "external.encoder")
+    if (
+        type(external["gear_commit"]) is not str
+        or _COMMIT.fullmatch(external["gear_commit"]) is None
+    ):
+        raise ContractError(
+            "terminal manifest external.gear_commit must be a commit digest"
+        )
+    if type(external["gear_dirty"]) is not bool:
+        raise ContractError(
+            "terminal manifest external.gear_dirty must be a boolean"
+        )
+    external_hashes = _mapping(external["hashes"], "external.hashes")
+    if not external_hashes:
+        raise ContractError("terminal manifest external.hashes must not be empty")
+    for name, value in external_hashes.items():
+        _nonempty_string(name, "external.hashes key")
+        _sha256_or_null(value, f"external.hashes.{name}")
+        if value is None:
+            raise ContractError(
+                f"terminal manifest external.hashes.{name} cannot be null"
+            )
+
+    repositories = _mapping(manifest["repositories"], "repositories")
+    if not repositories:
+        raise ContractError("terminal manifest repositories must not be empty")
+    for name, value in repositories.items():
+        _nonempty_string(name, "repositories key")
+        repository = _exact_keys(
+            value, frozenset(("commit", "dirty")), f"repositories.{name}"
+        )
+        if (
+            type(repository["commit"]) is not str
+            or _COMMIT.fullmatch(repository["commit"]) is None
+        ):
+            raise ContractError(
+                f"terminal manifest repositories.{name}.commit is invalid"
+            )
+        if type(repository["dirty"]) is not bool:
+            raise ContractError(
+                f"terminal manifest repositories.{name}.dirty must be a boolean"
+            )
+
+    artifact_hashes = _exact_keys(
+        manifest["artifact_hashes"], _ARTIFACT_HASH_KEYS, "artifact_hashes"
+    )
+    for name, value in artifact_hashes.items():
+        _sha256_or_null(value, f"artifact_hashes.{name}")
+    if status == "complete":
+        for name in sorted(_MANDATORY_COMPLETE_HASHES):
+            if artifact_hashes[name] is None:
+                raise ContractError(
+                    "complete terminal manifest requires "
+                    f"artifact_hashes.{name}"
+                )
+
+    command = _mapping(manifest["command_script"], "command_script")
+    if not {"id", "sha256"}.issubset(command):
+        raise ContractError("terminal manifest command_script has invalid keys")
+    _nonempty_string(command["id"], "command_script.id")
+    _sha256_or_null(command["sha256"], "command_script.sha256")
+
+    perturbation = _exact_keys(
+        manifest["perturbation"],
+        frozenset(("id", "lateral_offset_m", "yaw_offset_rad")),
+        "perturbation",
+    )
+    _nonempty_string(perturbation["id"], "perturbation.id")
+    _finite_number(
+        perturbation["lateral_offset_m"], "perturbation.lateral_offset_m"
+    )
+    _finite_number(perturbation["yaw_offset_rad"], "perturbation.yaw_offset_rad")
+
+    transform = _exact_keys(
+        manifest["coordinate_transform"],
+        frozenset(("source", "target", "matrix")),
+        "coordinate_transform",
+    )
+    _nonempty_string(transform["source"], "coordinate_transform.source")
+    _nonempty_string(transform["target"], "coordinate_transform.target")
+    matrix = transform["matrix"]
+    if type(matrix) is not list or len(matrix) != 3:
+        raise ContractError(
+            "terminal manifest coordinate_transform.matrix must be 3x3"
+        )
+    for row_index, row in enumerate(matrix):
+        if type(row) is not list or len(row) != 3:
+            raise ContractError(
+                "terminal manifest coordinate_transform.matrix must be 3x3"
+            )
+        for column_index, value in enumerate(row):
+            _finite_number(
+                value,
+                "coordinate_transform.matrix"
+                f"[{row_index}][{column_index}]",
+            )
+
+    processes = manifest["processes"]
+    if type(processes) is not list or not processes:
+        raise ContractError("terminal manifest processes must be a nonempty array")
+    for index, value in enumerate(processes):
+        process = _mapping(value, f"processes[{index}]")
+        if not {"name", "argv"}.issubset(process):
+            raise ContractError(
+                f"terminal manifest processes[{index}] has invalid keys"
+            )
+        _nonempty_string(process["name"], f"processes[{index}].name")
+        argv = process["argv"]
+        if type(argv) is not list or not argv:
+            raise ContractError(
+                f"terminal manifest processes[{index}].argv must not be empty"
+            )
+        for argument_index, argument in enumerate(argv):
+            _nonempty_string(
+                argument, f"processes[{index}].argv[{argument_index}]"
+            )
+
+
+def _validate_terminal_manifest(manifest: object) -> dict[str, object]:
+    value = _mapping(manifest, "root")
+    required = {
+        "schema",
+        "experiment_id",
+        "run_id",
+        "status",
+        "created_utc",
+        "finalization_started_utc",
+        "finalized_utc",
+        "outcome",
+        "evidence",
+    }
+    missing = sorted(required - set(value))
+    if missing:
+        raise ContractError(f"terminal manifest is missing fields: {missing}")
+    if value["schema"] != _MANIFEST_SCHEMA:
+        raise ContractError("terminal manifest has an unsupported schema")
+    _identifier(value["experiment_id"], "experiment")
+    _identifier(value["run_id"], "run")
+    status = value["status"]
+    if type(status) is not str or status not in _TERMINAL_STATUSES:
+        raise ContractError(
+            "terminal manifest status must be complete, failed, or not_run"
+        )
+    _timestamp(value["created_utc"], "created_utc")
+    _timestamp(value["finalization_started_utc"], "finalization_started_utc")
+    _timestamp(value["finalized_utc"], "finalized_utc")
+    _mapping(value["outcome"], "outcome")
+    evidence = _exact_keys(
+        value["evidence"],
+        frozenset(("inventory_sha256", "file_count")),
+        "evidence",
+    )
+    inventory_sha256 = evidence["inventory_sha256"]
+    if (
+        type(inventory_sha256) is not str
+        or _SHA256.fullmatch(inventory_sha256) is None
+    ):
+        raise ContractError(
+            "terminal manifest evidence.inventory_sha256 must be a SHA-256 digest"
+        )
+    file_count = evidence["file_count"]
+    if type(file_count) is not int or file_count < 0:
+        raise ContractError(
+            "terminal manifest evidence.file_count must be a nonnegative integer"
+        )
+    _validate_terminal_metadata(value, status)
+    return value
+
+
+def _terminal_manifest_core(manifest: Mapping[str, object]) -> dict[str, object]:
+    core = dict(manifest)
+    core.pop("evidence", None)
+    return core
+
+
+def _sha256_descriptor(
+    descriptor: int, relative: str
+) -> tuple[str, int]:
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode):
+        raise ContractError(f"evidence is not a regular file: {relative}")
+    if before.st_nlink != 1:
+        raise ContractError(f"evidence is a hard link alias: {relative}")
+    os.lseek(descriptor, 0, os.SEEK_SET)
     digest = hashlib.sha256()
     size = 0
-    try:
-        before = os.fstat(descriptor)
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-            size += len(chunk)
-        after = os.fstat(descriptor)
-        identity_before = (
-            before.st_dev,
-            before.st_ino,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
-        )
-        identity_after = (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-        )
-        if identity_before != identity_after or size != before.st_size:
-            raise ContractError(f"evidence changed while hashing: {path}")
-    finally:
-        os.close(descriptor)
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+        size += len(chunk)
+    after = os.fstat(descriptor)
+    if _opened_identity(before) != _opened_identity(after) or size != before.st_size:
+        raise ContractError(f"evidence changed while hashing: {relative}")
     return digest.hexdigest(), size
+
+
+def _read_descriptor_bytes(descriptor: int, relative: str) -> bytes:
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode):
+        raise ContractError(f"evidence is not a regular file: {relative}")
+    if before.st_nlink != 1:
+        raise ContractError(f"evidence is a hard link alias: {relative}")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    size = 0
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+    after = os.fstat(descriptor)
+    if _opened_identity(before) != _opened_identity(after) or size != before.st_size:
+        raise ContractError(f"evidence changed while reading: {relative}")
+    return b"".join(chunks)
+
+
+def _read_regular_at(directory_fd: int, filename: str) -> bytes:
+    try:
+        observed = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as error:
+        raise ContractError(f"cannot inspect evidence file: {filename}") from error
+    if stat.S_ISLNK(observed.st_mode) or not stat.S_ISREG(observed.st_mode):
+        raise ContractError(f"evidence is not a safe regular file: {filename}")
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            filename, _regular_read_flags(), dir_fd=directory_fd
+        )
+        opened = os.fstat(descriptor)
+        if _inode_identity(observed) != _inode_identity(opened):
+            raise ContractError(f"evidence file changed while opening: {filename}")
+        return _read_descriptor_bytes(descriptor, filename)
+    except OSError as error:
+        raise ContractError(f"cannot read evidence file safely: {filename}") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _walk_directory_fd(
+    directory_fd: int,
+    prefix: str = "",
+):
+    try:
+        names = sorted(os.listdir(directory_fd))
+    except OSError as error:
+        raise ContractError("cannot enumerate retained run directory") from error
+    for name in names:
+        relative = name if not prefix else f"{prefix}/{name}"
+        try:
+            observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as error:
+            raise ContractError(f"cannot inspect evidence entry: {relative}") from error
+        if stat.S_ISLNK(observed.st_mode):
+            raise ContractError(f"evidence tree contains a symlink: {relative}")
+        if stat.S_ISDIR(observed.st_mode):
+            try:
+                child = os.open(name, _directory_flags(), dir_fd=directory_fd)
+            except OSError as error:
+                raise ContractError(
+                    f"cannot open evidence directory safely: {relative}"
+                ) from error
+            try:
+                opened = os.fstat(child)
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or _inode_identity(observed) != _inode_identity(opened)
+                ):
+                    raise ContractError(
+                        f"evidence directory changed while opening: {relative}"
+                    )
+                yield "directory", relative, child, opened
+                yield from _walk_directory_fd(child, relative)
+            finally:
+                os.close(child)
+            continue
+        if stat.S_ISREG(observed.st_mode):
+            try:
+                descriptor = os.open(
+                    name, _regular_read_flags(), dir_fd=directory_fd
+                )
+            except OSError as error:
+                raise ContractError(
+                    f"cannot open evidence file safely: {relative}"
+                ) from error
+            try:
+                opened = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or _inode_identity(observed) != _inode_identity(opened)
+                ):
+                    raise ContractError(
+                        f"evidence file changed while opening: {relative}"
+                    )
+                if opened.st_nlink != 1:
+                    raise ContractError(
+                        f"evidence is a hard link alias: {relative}"
+                    )
+                yield "file", relative, descriptor, opened
+            finally:
+                os.close(descriptor)
+            continue
+        raise ContractError(f"evidence tree contains a special entry: {relative}")
 
 
 class RunBundle:
@@ -261,7 +626,37 @@ class RunBundle:
 
     def _ensure_running(self) -> None:
         if self._status != "running":
-            raise ContractError(f"run bundle is already finalized as {self._status}")
+            raise ContractError(
+                "run bundle is already finalized or finalizing: "
+                f"{self._status}"
+            )
+
+    def _require_path_identity(self) -> None:
+        expected = os.fstat(self._directory_fd)
+        try:
+            observed = self._path.lstat()
+        except OSError as error:
+            raise ContractError(
+                "run path identity is missing or inaccessible"
+            ) from error
+        if stat.S_ISLNK(observed.st_mode) or not stat.S_ISDIR(observed.st_mode):
+            raise ContractError("run path identity was replaced")
+        descriptor = -1
+        try:
+            descriptor = os.open(self._path, _directory_flags())
+            opened = os.fstat(descriptor)
+        except OSError as error:
+            raise ContractError("run path identity cannot be opened safely") from error
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        if (
+            _inode_identity(observed) != _inode_identity(opened)
+            or _inode_identity(expected) != _inode_identity(opened)
+        ):
+            raise ContractError(
+                "run path identity no longer matches the retained directory"
+            )
 
     def _open_parent(
         self, parts: tuple[str, ...], *, create: bool
@@ -377,10 +772,20 @@ class RunBundle:
                 os.O_WRONLY
                 | os.O_APPEND
                 | os.O_CREAT
+                | getattr(os, "O_NONBLOCK", 0)
                 | getattr(os, "O_CLOEXEC", 0)
                 | getattr(os, "O_NOFOLLOW", 0)
             )
             descriptor = os.open(leaf, flags, 0o644, dir_fd=parent)
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                raise ContractError(
+                    f"{kind} evidence target is not a regular file"
+                )
+            if opened.st_nlink != 1:
+                raise ContractError(
+                    f"{kind} evidence target is a hard link alias"
+                )
             _write_all(descriptor, payload)
             os.fsync(descriptor)
             os.fsync(parent)
@@ -414,6 +819,7 @@ class RunBundle:
             "run_id",
             "status",
             "created_utc",
+            "finalization_started_utc",
             "finalized_utc",
             "outcome",
             "evidence",
@@ -428,7 +834,9 @@ class RunBundle:
         self._replace_internal("manifest.json", _json_bytes(candidate, "manifest"))
         self._manifest = candidate
 
-    def _replace_internal(self, filename: str, data: bytes) -> None:
+    def _replace_internal(
+        self, filename: str, data: bytes, *, mode: int = 0o644
+    ) -> None:
         temporary = f".{filename}.{uuid.uuid4().hex}.tmp"
         descriptor = -1
         try:
@@ -439,8 +847,9 @@ class RunBundle:
                 | getattr(os, "O_CLOEXEC", 0)
                 | getattr(os, "O_NOFOLLOW", 0)
             )
-            descriptor = os.open(temporary, flags, 0o644, dir_fd=self._directory_fd)
+            descriptor = os.open(temporary, flags, mode, dir_fd=self._directory_fd)
             _write_all(descriptor, data)
+            os.fchmod(descriptor, mode)
             os.fsync(descriptor)
             os.close(descriptor)
             descriptor = -1
@@ -459,20 +868,52 @@ class RunBundle:
             except FileNotFoundError:
                 pass
 
-    def _inventory(self) -> dict[str, object]:
+    def _inventory(
+        self, terminal_manifest_core_sha256: str
+    ) -> dict[str, object]:
         files: dict[str, object] = {}
-        for candidate in sorted(self._path.rglob("*")):
-            relative = candidate.relative_to(self._path).as_posix()
-            metadata = candidate.lstat()
-            if stat.S_ISLNK(metadata.st_mode):
-                raise ContractError(f"evidence tree contains a symlink: {relative}")
-            if stat.S_ISDIR(metadata.st_mode):
+        directories: set[str] = set()
+        for kind, relative, descriptor, _ in _walk_directory_fd(
+            self._directory_fd
+        ):
+            parts = _relative_parts(relative)
+            if "/".join(parts) != relative:
+                raise ContractError(f"evidence path is not canonical: {relative}")
+            if kind == "directory":
+                directories.add(relative)
                 continue
             if relative in _RESERVED_OUTPUTS:
                 continue
-            digest, size = _sha256_regular(candidate)
+            digest, size = _sha256_descriptor(descriptor, relative)
             files[relative] = {"sha256": digest, "size": size}
-        return {"schema": _INVENTORY_SCHEMA, "files": files}
+        expected_directories: set[str] = set()
+        for relative in files:
+            parts = _relative_parts(relative)
+            expected_directories.update(
+                "/".join(parts[:index]) for index in range(1, len(parts))
+            )
+        extra_directories = sorted(directories - expected_directories)
+        if extra_directories:
+            raise ContractError(
+                f"run contains unregistered directories: {extra_directories}"
+            )
+        return {
+            "schema": _INVENTORY_SCHEMA,
+            "terminal_manifest_core_sha256": terminal_manifest_core_sha256,
+            "files": files,
+        }
+
+    def _seal_evidence(self) -> None:
+        for kind, relative, descriptor, metadata in _walk_directory_fd(
+            self._directory_fd
+        ):
+            if kind == "directory":
+                continue
+            if metadata.st_nlink != 1:
+                raise ContractError(f"evidence is a hard link alias: {relative}")
+            os.fchmod(descriptor, stat.S_IMODE(metadata.st_mode) & ~0o222)
+            os.fsync(descriptor)
+        os.fsync(self._directory_fd)
 
     def finalize(
         self,
@@ -487,96 +928,193 @@ class RunBundle:
             )
         if not isinstance(outcome, Mapping):
             raise ContractError("run outcome must be a mapping")
-        missing = sorted(_TERMINAL_MANIFEST_KEYS - set(self._manifest))
-        if missing:
-            raise ContractError(f"terminal manifest is missing fields: {missing}")
-        artifact_hashes = self._manifest["artifact_hashes"]
-        if not isinstance(artifact_hashes, dict) or set(artifact_hashes) != _ARTIFACT_HASH_KEYS:
-            raise ContractError("terminal manifest artifact_hashes has invalid keys")
-        if any(
-            value is not None
-            and (type(value) is not str or _SHA256.fullmatch(value) is None)
-            for value in artifact_hashes.values()
-        ):
-            raise ContractError(
-                "terminal manifest artifact_hashes must be SHA-256 digests or null"
-            )
+        _validate_terminal_metadata(self._manifest, status)
         copied_outcome = _json_copy(dict(outcome), "run outcome")
         assert isinstance(copied_outcome, dict)
 
-        inventory = self._inventory()
-        inventory_bytes = _json_bytes(inventory, "evidence inventory")
-        self._replace_internal("inventory.json", inventory_bytes)
-        evidence = {
-            "inventory_sha256": hashlib.sha256(inventory_bytes).hexdigest(),
-            "file_count": len(inventory["files"]),
-        }
-        terminal_manifest = dict(self._manifest)
-        terminal_manifest.update(
+        finalizing_manifest = dict(self._manifest)
+        finalizing_manifest.update(
+            {
+                "status": "finalizing",
+                "finalization_started_utc": _utc_now(),
+            }
+        )
+        self._status = "finalizing"
+        self._manifest = finalizing_manifest
+        self._replace_internal(
+            "manifest.json",
+            _json_bytes(finalizing_manifest, "finalizing manifest"),
+        )
+
+        self._require_path_identity()
+        terminal_core = dict(finalizing_manifest)
+        terminal_core.update(
             {
                 "status": status,
                 "finalized_utc": _utc_now(),
                 "outcome": copied_outcome,
-                "evidence": evidence,
             }
         )
+        terminal_core_sha256 = hashlib.sha256(
+            _json_bytes(terminal_core, "terminal manifest core")
+        ).hexdigest()
+        inventory = self._inventory(terminal_core_sha256)
+        inventory_bytes = _json_bytes(inventory, "evidence inventory")
+        self._replace_internal("inventory.json", inventory_bytes)
+        self._seal_evidence()
+        evidence = {
+            "inventory_sha256": hashlib.sha256(inventory_bytes).hexdigest(),
+            "file_count": len(inventory["files"]),
+        }
+        terminal_manifest = dict(terminal_core)
+        terminal_manifest["evidence"] = evidence
+        _validate_terminal_manifest(terminal_manifest)
         self._replace_internal(
-            "manifest.json", _json_bytes(terminal_manifest, "terminal manifest")
+            "manifest.json",
+            _json_bytes(terminal_manifest, "terminal manifest"),
+            mode=0o444,
         )
-
-        for candidate in sorted(self._path.rglob("*")):
-            metadata = candidate.lstat()
-            if stat.S_ISREG(metadata.st_mode):
-                candidate.chmod(stat.S_IMODE(metadata.st_mode) & ~0o222)
-        os.fsync(self._directory_fd)
         self._manifest = terminal_manifest
         self._status = status
         return MappingProxyType(inventory)
 
 
 def verify_run_inventory(path: str | os.PathLike[str]) -> bool:
-    root = Path(path).expanduser().resolve(strict=True)
-    if not root.is_dir():
-        raise ContractError(f"run bundle is not a directory: {root}")
-    inventory_path = root / "inventory.json"
-    manifest_path = root / "manifest.json"
+    root = Path(path).expanduser()
     try:
-        inventory_bytes = inventory_path.read_bytes()
+        observed_root = root.lstat()
+    except OSError as error:
+        raise ContractError(f"cannot inspect run bundle: {root}") from error
+    if stat.S_ISLNK(observed_root.st_mode) or not stat.S_ISDIR(
+        observed_root.st_mode
+    ):
+        raise ContractError(f"run bundle is not a safe directory: {root}")
+
+    root_fd = -1
+    try:
+        root_fd = os.open(root, _directory_flags())
+        opened_root = os.fstat(root_fd)
+        if _inode_identity(observed_root) != _inode_identity(opened_root):
+            raise ContractError("run bundle changed while opening")
+
+        inventory_bytes = _read_regular_at(root_fd, "inventory.json")
+        manifest_bytes = _read_regular_at(root_fd, "manifest.json")
         inventory = json.loads(inventory_bytes)
-        manifest = json.loads(manifest_path.read_bytes())
+        manifest = json.loads(manifest_bytes)
     except (OSError, json.JSONDecodeError) as error:
+        if root_fd >= 0:
+            os.close(root_fd)
+            root_fd = -1
         raise ContractError("run inventory or manifest is unreadable") from error
-    if type(inventory) is not dict or set(inventory) != {"schema", "files"}:
-        raise ContractError("run inventory has invalid keys")
-    if inventory["schema"] != _INVENTORY_SCHEMA or type(inventory["files"]) is not dict:
-        raise ContractError("run inventory has an unsupported schema")
-    expected_inventory_hash = manifest.get("evidence", {}).get("inventory_sha256")
-    actual_inventory_hash = hashlib.sha256(inventory_bytes).hexdigest()
-    if expected_inventory_hash != actual_inventory_hash:
-        raise ContractError("inventory SHA-256 does not match the manifest")
-    for relative, registered in inventory["files"].items():
-        if type(relative) is not str or type(registered) is not dict:
-            raise ContractError("run inventory entry is invalid")
-        parts = _relative_parts(relative)
-        candidate = root.joinpath(*parts)
-        digest, size = _sha256_regular(candidate)
-        if registered.get("sha256") != digest:
-            raise ContractError(f"evidence SHA-256 mismatch: {relative}")
-        if registered.get("size") != size:
-            raise ContractError(f"evidence size mismatch: {relative}")
-    actual_files: set[str] = set()
-    for candidate in root.rglob("*"):
-        relative = candidate.relative_to(root).as_posix()
-        metadata = candidate.lstat()
-        if stat.S_ISLNK(metadata.st_mode):
-            raise ContractError(f"run evidence contains a symlink: {relative}")
-        if stat.S_ISREG(metadata.st_mode) and relative not in _RESERVED_OUTPUTS:
+    except BaseException:
+        if root_fd >= 0:
+            os.close(root_fd)
+            root_fd = -1
+        raise
+    try:
+        terminal = _validate_terminal_manifest(manifest)
+        if type(inventory) is not dict or set(inventory) != {
+            "schema",
+            "terminal_manifest_core_sha256",
+            "files",
+        }:
+            raise ContractError("run inventory has invalid keys")
+        if inventory["schema"] != _INVENTORY_SCHEMA:
+            raise ContractError("run inventory has an unsupported schema")
+        core_digest = inventory["terminal_manifest_core_sha256"]
+        if type(core_digest) is not str or _SHA256.fullmatch(core_digest) is None:
+            raise ContractError(
+                "run inventory terminal manifest core SHA-256 is invalid"
+            )
+        files = inventory["files"]
+        if type(files) is not dict:
+            raise ContractError("run inventory files must be an object")
+
+        evidence = terminal["evidence"]
+        assert isinstance(evidence, dict)
+        actual_inventory_hash = hashlib.sha256(inventory_bytes).hexdigest()
+        if evidence["inventory_sha256"] != actual_inventory_hash:
+            raise ContractError("inventory SHA-256 does not match the manifest")
+        actual_core_hash = hashlib.sha256(
+            _json_bytes(
+                _terminal_manifest_core(terminal), "terminal manifest core"
+            )
+        ).hexdigest()
+        if core_digest != actual_core_hash:
+            raise ContractError(
+                "terminal manifest core SHA-256 does not match the inventory"
+            )
+        if evidence["file_count"] != len(files):
+            raise ContractError(
+                "terminal manifest evidence.file_count does not match the inventory"
+            )
+
+        registered_files: set[str] = set()
+        expected_directories: set[str] = set()
+        for relative, registered in files.items():
+            if type(relative) is not str or type(registered) is not dict:
+                raise ContractError("run inventory entry is invalid")
+            parts = _relative_parts(relative)
+            if "/".join(parts) != relative or relative in _RESERVED_OUTPUTS:
+                raise ContractError(
+                    f"run inventory path is not canonical evidence: {relative}"
+                )
+            if set(registered) != {"sha256", "size"}:
+                raise ContractError(f"run inventory entry has invalid keys: {relative}")
+            digest = registered["sha256"]
+            size = registered["size"]
+            if type(digest) is not str or _SHA256.fullmatch(digest) is None:
+                raise ContractError(
+                    f"run inventory entry has invalid SHA-256: {relative}"
+                )
+            if type(size) is not int or size < 0:
+                raise ContractError(
+                    f"run inventory entry has invalid size: {relative}"
+                )
+            registered_files.add(relative)
+            expected_directories.update(
+                "/".join(parts[:index]) for index in range(1, len(parts))
+            )
+
+        actual_files: set[str] = set()
+        actual_directories: set[str] = set()
+        for kind, relative, descriptor, _ in _walk_directory_fd(root_fd):
+            if kind == "directory":
+                actual_directories.add(relative)
+                continue
             actual_files.add(relative)
-    registered_files = set(inventory["files"])
-    extra = sorted(actual_files - registered_files)
-    if extra:
-        raise ContractError(f"run contains unregistered evidence: {extra}")
-    missing = sorted(registered_files - actual_files)
-    if missing:
-        raise ContractError(f"run is missing registered evidence: {missing}")
-    return True
+            if relative not in registered_files:
+                continue
+            digest, size = _sha256_descriptor(descriptor, relative)
+            registered = files[relative]
+            assert isinstance(registered, dict)
+            if registered["sha256"] != digest:
+                raise ContractError(f"evidence SHA-256 mismatch: {relative}")
+            if registered["size"] != size:
+                raise ContractError(f"evidence size mismatch: {relative}")
+
+        expected_files = registered_files | _RESERVED_OUTPUTS
+        extra_files = sorted(actual_files - expected_files)
+        if extra_files:
+            raise ContractError(
+                f"run contains unregistered evidence: {extra_files}"
+            )
+        missing_files = sorted(expected_files - actual_files)
+        if missing_files:
+            raise ContractError(
+                f"run is missing registered evidence: {missing_files}"
+            )
+        extra_directories = sorted(actual_directories - expected_directories)
+        if extra_directories:
+            raise ContractError(
+                f"run contains unregistered directories: {extra_directories}"
+            )
+        missing_directories = sorted(expected_directories - actual_directories)
+        if missing_directories:
+            raise ContractError(
+                f"run is missing registered directories: {missing_directories}"
+            )
+        return True
+    finally:
+        if root_fd >= 0:
+            os.close(root_fd)

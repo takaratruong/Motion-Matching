@@ -11,11 +11,6 @@ import numpy as np
 from mm_sonic.artifacts import RunBundle
 from mm_sonic.joints import ContractError
 from mm_sonic.reference import (
-    BODY_POS_HEADER,
-    BODY_QUAT_HEADER,
-    JOINT_POS_HEADER,
-    JOINT_VEL_HEADER,
-    ROOT_DIAGNOSTIC_HEADER,
     ReferenceDiagnostics,
     format_f32,
     load_reference_directory,
@@ -24,6 +19,90 @@ from mm_sonic.reference import (
     write_reference_bundle,
 )
 from mm_sonic.timeline import CanonicalTargetBuffer
+
+
+EXPECTED_JOINT_POS_HEADER = (
+    "joint_0",
+    "joint_1",
+    "joint_2",
+    "joint_3",
+    "joint_4",
+    "joint_5",
+    "joint_6",
+    "joint_7",
+    "joint_8",
+    "joint_9",
+    "joint_10",
+    "joint_11",
+    "joint_12",
+    "joint_13",
+    "joint_14",
+    "joint_15",
+    "joint_16",
+    "joint_17",
+    "joint_18",
+    "joint_19",
+    "joint_20",
+    "joint_21",
+    "joint_22",
+    "joint_23",
+    "joint_24",
+    "joint_25",
+    "joint_26",
+    "joint_27",
+    "joint_28",
+)
+EXPECTED_JOINT_VEL_HEADER = (
+    "joint_vel_0",
+    "joint_vel_1",
+    "joint_vel_2",
+    "joint_vel_3",
+    "joint_vel_4",
+    "joint_vel_5",
+    "joint_vel_6",
+    "joint_vel_7",
+    "joint_vel_8",
+    "joint_vel_9",
+    "joint_vel_10",
+    "joint_vel_11",
+    "joint_vel_12",
+    "joint_vel_13",
+    "joint_vel_14",
+    "joint_vel_15",
+    "joint_vel_16",
+    "joint_vel_17",
+    "joint_vel_18",
+    "joint_vel_19",
+    "joint_vel_20",
+    "joint_vel_21",
+    "joint_vel_22",
+    "joint_vel_23",
+    "joint_vel_24",
+    "joint_vel_25",
+    "joint_vel_26",
+    "joint_vel_27",
+    "joint_vel_28",
+)
+EXPECTED_BODY_QUAT_HEADER = (
+    "body_0_w",
+    "body_0_x",
+    "body_0_y",
+    "body_0_z",
+)
+EXPECTED_BODY_POS_HEADER = ("body_0_x", "body_0_y", "body_0_z")
+EXPECTED_ROOT_DIAGNOSTIC_HEADER = (
+    "frame_index",
+    "physical_pelvis_x",
+    "physical_pelvis_y",
+    "physical_pelvis_z",
+    "virtual_root_x",
+    "virtual_root_y",
+    "virtual_root_z",
+    "virtual_root_qw",
+    "virtual_root_qx",
+    "virtual_root_qy",
+    "virtual_root_qz",
+)
 
 
 def float_bits(value: np.ndarray) -> np.ndarray:
@@ -140,10 +219,10 @@ class OfficialReferenceTests(unittest.TestCase):
         self.assertTrue((self.bundle.path / "mm_root_diagnostic.csv").is_file())
 
         expected_headers = {
-            "joint_pos.csv": JOINT_POS_HEADER,
-            "joint_vel.csv": JOINT_VEL_HEADER,
-            "body_quat.csv": BODY_QUAT_HEADER,
-            "body_pos.csv": BODY_POS_HEADER,
+            "joint_pos.csv": EXPECTED_JOINT_POS_HEADER,
+            "joint_vel.csv": EXPECTED_JOINT_VEL_HEADER,
+            "body_quat.csv": EXPECTED_BODY_QUAT_HEADER,
+            "body_pos.csv": EXPECTED_BODY_POS_HEADER,
         }
         for filename, header in expected_headers.items():
             raw = (reference / filename).read_bytes()
@@ -152,7 +231,9 @@ class OfficialReferenceTests(unittest.TestCase):
             self.assertEqual(lines[0], ",".join(header), filename)
             self.assertEqual(len(lines), self.canonical.count + 1, filename)
         diagnostic_lines = (self.bundle.path / "mm_root_diagnostic.csv").read_text("ascii").splitlines()
-        self.assertEqual(diagnostic_lines[0], ",".join(ROOT_DIAGNOSTIC_HEADER))
+        self.assertEqual(
+            diagnostic_lines[0], ",".join(EXPECTED_ROOT_DIAGNOSTIC_HEADER)
+        )
         self.assertEqual(len(diagnostic_lines), self.canonical.count + 1)
         self.assertEqual(read_body_indexes(reference / "metadata.txt"), (0,))
         metadata = (reference / "metadata.txt").read_text("utf-8")
