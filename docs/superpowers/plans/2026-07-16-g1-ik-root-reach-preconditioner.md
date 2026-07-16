@@ -18,7 +18,7 @@
 - Empty/out-of-cap/minimum-shell intersections leave the root unchanged so the ordinary foot stage publishes the existing finite `target-unreachable` result.
 - Nonfinite input, topology/alias failure, or arithmetic failure is a global error with no output assignment.
 - Preserve the existing left-then-right IK order, 41-entry swing ladder, clearance gates, and atomic outer rollback.
-- Add no runtime option and no CSV column. Existing `support_retargeted_hips_y` and `ik_adjusted_hips_y` expose the delta.
+- Add no runtime option and no CSV column. The existing `support_retargeted_hips_y` and `ik_adjusted_hips_y` difference remains approximate live quality evidence; exact provenance comes from the retained plan, strict local-root relation, and authoritative FK owners.
 - `g1_clearance.cpp` and `g1_ik_root_reach.cpp` are separate strict-FP objects built with `-fno-fast-math -ffp-contract=off -frounding-math`; callers may use `-ffast-math`, final links may not, and LTO is forbidden.
 - Terrain packs remain separate. Do not replace the running visualizer until the complete Task 8 certification passes.
 
@@ -29,11 +29,13 @@
 - Modify `g1_ik.h`: add the value-only physical target and root plan types/declarations; make named physical-sole IK consume the shared target derivation.
 - Modify `g1_ik_runtime.h`: retain the plan in `G1IkFrameResult`, invoke/apply it at frame begin, and authenticate canonical/accepted/rejected forms.
 - Modify `g1_controller_state.h`: require a valid plan on accepted controller state and authenticate its relationship to the current contact schedule.
-- Modify `g1_frame_transaction.h`: include the plan in equality and validate the rendered/support root-Y relationship.
+- Modify `g1_frame_transaction.h`: include the plan in equality and bind support/rendered Hips diagnostics independently to their authoritative checked-FK arrays.
 - Modify `controller.cpp`: include the plan in the accepted-state logical digest only; do not change logging schema or runtime controls.
 - Modify `tests/cpp/test_g1_ik.cpp`: strict math, authentic geometry, no-op, interval, boundary, alias, rollback, and parity tests.
+- Modify `tests/cpp/test_g1_controller_state.cpp`: accepted plan/contact/common-interval provenance and independent logical-hash ownership.
 - Modify `tests/cpp/test_g1_frame_transaction.cpp`: logical ownership, accepted/rejected publication, immutable command/heading, and rollback tests.
 - Modify `tests/cpp/test_g1_frame_transaction_production.cpp`: production-stage root-only mutation, diagnostic relation, no-seam, closure, and controller build/link tests.
+- Modify `tests/cpp/test_g1_controller_logging.cpp`: cross-check the controller-owned accepted-state digest after every plan-field mutation.
 - Modify `tests/cpp/compile_g1_ik_production.cpp`: compile the public production surface without a test seam.
 - Modify `docs/superpowers/specs/2026-07-16-g1-ik-root-reach-preconditioner-design.md` only if implementation review discovers a real design correction; do not rewrite it to match an accidental implementation.
 
@@ -572,11 +574,12 @@ git commit -m "feat: plan bounded G1 IK root reach"
 - Modify: `tests/cpp/test_g1_controller_state.cpp`
 - Modify: `tests/cpp/test_g1_frame_transaction.cpp`
 - Modify: `tests/cpp/test_g1_frame_transaction_production.cpp`
+- Modify: `tests/cpp/test_g1_controller_logging.cpp`
 - Modify: `tests/cpp/compile_g1_ik_production.cpp`
 
 **Interfaces:**
 - Consumes: Task 2 `G1RootReachPlan`, `g1_plan_recorded_contact_root_reach`, and `g1_apply_root_reach_plan_y`.
-- Produces: `G1IkFrameResult::root_reach`, runtime begin integration, equality/digest ownership, rejection snapshot ownership, and accepted diagnostic relation `rendered.hips_y == support_retargeted.hips_y + root_reach.root_y_delta_m`.
+- Produces: `G1IkFrameResult::root_reach`, runtime begin integration, equality/digest ownership, checkpoint-specific rejection ownership, exact accepted local-root provenance, and independent support/rendered Hips bindings to their authoritative checked-FK arrays.
 
 - [ ] **Step 1: Write runtime begin RED tests**
 
@@ -601,79 +604,286 @@ check(g1_apply_root_reach_plan_y(
       "scratch root Y authenticates the retained plan");
 ```
 
-Add exact byte no-op assertions for IK disabled, no contacts, and already-reachable contacts, including positive/negative-zero inputs. Add a later-foot failure and a finish/clearance failure to prove the caller's accepted state, support, lock/history, command, route, heading, and published root plan all roll back.
+Loop over all 31 local positions: require baseline bits for every non-root bone
+and root X/Z, with only the authenticated root Y allowed to differ. At the end
+of begin, require every scratch local rotation bit to equal the baseline; later
+leg IK, rather than this preconditioner, remains the rotation owner.
+
+Add exact byte no-op assertions for IK disabled, no contacts, and
+already-reachable contacts, including positive/negative-zero inputs. Add
+blocked-footprint and unavailable-landing begin fixtures which prove the
+planner is not invoked and the retained plan is canonical inactive positive
+zero. Add a later-foot failure and finish/global failure to prove the runtime
+IK transaction and caller preserve accepted state, support, lock/history,
+command, route, independent heading, and the previously published root plan.
+Outer pose-certificate rollback is not owned by `test_g1_ik.cpp`; assign it
+only to the production frame-transaction fixture in Step 2.
 
 Add an infeasible two-contact fixture and an out-of-cap fixture. `g1_ik_frame_begin` must succeed with an active/non-common/canonical-zero plan and unchanged root; the ordinary left-then-right stage must then publish the existing finite `G1IkStopTargetUnreachable` diagnostic. No planner-specific stop reason or target mutation is permitted.
 
 - [ ] **Step 2: Write frame-transaction ownership RED tests**
 
-Add one-bit/one-field mutations of `active`, `common_interval_found`, `applied`, and `root_y_delta_m` to the independent logical digest/equality tests. Authentic accepted and finite-rejected production fixtures must reject every forgery while preserving accepted-state, publication, command, and heading digests. Assert the only pose-position difference before/after accepted IK is `G1_Simulation.y`; all root X/Z and every non-root local position remain bit-equal.
+In `tests/cpp/test_g1_ik.cpp`, extend the existing independent helper
+`g1_runtime_frame_result_same` to compare `active`,
+`common_interval_found`, `applied`, and exact `root_y_delta_m` bits. Add an
+otherwise identical pair differing only in `root_reach` and require the helper
+to report a mismatch; this test-local equality owner is separate from
+production `g1_frame_ik_result_equal`.
 
-Add accepted diagnostic mutations for `support_retargeted.hips_y`, `rendered.hips_y`, and delta so that each broken sum is rejected. Use `g1_apply_root_reach_plan_y` to form the independent expected binary32 value rather than ordinary `+` in a fast caller.
+Add one-bit/one-field mutations of `active`, `common_interval_found`, `applied`, and `root_y_delta_m` to `g1_frame_ik_result_equal`, the controller-owned `g1_log_hash_frame_result`, and all three independent `logical_hash_frame_result` oracles in `test_g1_controller_state.cpp`, `test_g1_frame_transaction.cpp`, and `test_g1_frame_transaction_production.cpp`. Update dirty-value/poison helpers so checked copy and swap tests own the new field. In `test_g1_controller_logging.cpp`, mutate each plan field and require the production digest to stay equal to the independent oracle while changing from the unmodified digest.
 
-In `tests/cpp/test_g1_controller_state.cpp`, mutate each plan field on an otherwise authentic accepted state and require `g1_controller_state_is_valid` to reject it. Preserve a canonical inactive plan for disabled IK; for applied IK require `g1_root_reach_plan_is_valid(value.root_reach)` and `value.root_reach.active == (contacts(0) || contacts(1))`.
+Authentic accepted and finite-rejected production fixtures must reject every forgery while preserving accepted-state, publication, command, travel, and heading digests. Assert the only local-position difference between support-retargeted and accepted IK poses is `G1_Simulation.y`; root X/Z and every non-root local position remain bit-equal.
+
+Use `g1_apply_root_reach_plan_y` to recompute expected accepted local
+`G1_Simulation.y` from
+`working_state.adjusted_bone_positions(G1_Simulation).y`; do not use raw
+float `+` in a fast caller. Independently require
+`diagnostic.support_retargeted.hips_y` to equal
+`working_state.global_bone_positions(G1_Hips).y` and
+`diagnostic.rendered.hips_y` to equal
+`working_state.ik_global_bone_positions(G1_Hips).y` by exact bits. Add an
+adversarial binary32 fixture in which
+`f32(support_retargeted.hips_y + delta)` differs from rendered checked FK and
+prove the authoritative local/FK relations accept while the obsolete
+reassociated expression is not an oracle. Freeze the multilevel values local
+root `a=0x3f000000`, local Hips Y `b=0x3f000001`, and Task 2 delta
+`d=0xbc80e8f0`: strict checked `(a+d)+b` must produce `0x3f7bf8ba`, while
+reassociated `(a+b)+d` produces `0x3f7bf8b8`. Mutate each local-root and Hips
+owner independently and require rejection.
+
+In `tests/cpp/test_g1_controller_state.cpp`, mutate each plan field on an otherwise authentic accepted state and require `g1_controller_state_is_valid` to reject it. Preserve a canonical inactive plan for disabled IK. For an accepted IK result require `g1_root_reach_plan_is_valid(value.root_reach)`, `value.root_reach.active == (contacts(0) || contacts(1))`, and `!value.root_reach.active || value.root_reach.common_interval_found`.
+
+Own rejection forms by checkpoint: outer footprint rejection has no attempted
+IK result; direct blocked/unavailable-landing rejection after begin has the
+canonical inactive plan; rejection after foot 0 or foot 1 has a valid plan
+whose `active` bit equals the OR of recorded contacts; and the legitimate
+infeasible/out-of-cap target-unreachable form is active/non-common/unapplied
+positive zero. Only
+`tests/cpp/test_g1_frame_transaction_production.cpp` owns the outer
+pose-certificate rejection regression: it retains no attempted IK payload,
+cannot publish its working plan, and preserves the prior accepted plan and all
+other atomic owners.
 
 - [ ] **Step 3: Run RED focused binaries**
 
-Compile/link `test_g1_ik`, `test_g1_frame_transaction`, and `test_g1_frame_transaction_production` against strict `g1_clearance.cpp` and `g1_ik_root_reach.cpp` objects. Expected: failures identify the missing `root_reach` field, missing digest/equality ownership, and missing runtime application.
+Before any production edit, build both inherited strict kernels and the
+separately compiled no-main production runner, then attempt all five changed
+test executables independently. Each test must fail for missing Task 3
+result/provenance ownership, while the inherited kernels and no-main runner
+object must compile successfully:
+
+```bash
+set -euo pipefail
+out=/tmp/g1-root-reach-plan/task3-red
+rm -rf "$out"
+mkdir -p "$out"
+
+strict=(-std=c++17 -O2 -Wall -Wextra -Werror -pedantic \
+  -fno-fast-math -ffp-contract=off -frounding-math -I.)
+warn=(-std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I.)
+rayinc=(-I/home/ubuntu/apps/raylib/src -I/home/ubuntu/apps/raygui/src)
+raylib=(-L/home/ubuntu/apps/raylib/src -lraylib -lGL -lm -lpthread -ldl -lrt -lX11)
+
+g++ "${strict[@]}" -c g1_clearance.cpp -o "$out/clearance.o"
+g++ "${strict[@]}" -c g1_ik_root_reach.cpp \
+  -o "$out/root-reach.o"
+g++ "${strict[@]}" -DG1_IK_ENABLE_TEST_SEAMS \
+  -c g1_ik_root_reach.cpp -o "$out/root-reach-audit.o"
+g++ "${warn[@]}" "${rayinc[@]}" \
+  -DG1_CONTROLLER_NO_MAIN -DG1_FRAME_TRANSACTION_ENABLE_TEST_SEAM \
+  -c controller.cpp -o "$out/controller-runner.o"
+
+build_g1_ik_red()
+{
+  g++ "${warn[@]}" -DG1_IK_ENABLE_TEST_SEAMS \
+    -c tests/cpp/test_g1_ik.cpp -o "$out/test-g1-ik.o" &&
+  g++ "$out/test-g1-ik.o" "$out/root-reach-audit.o" \
+    "$out/clearance.o" -o "$out/test-g1-ik" &&
+  "$out/test-g1-ik"
+}
+
+build_controller_state_red()
+{
+  g++ "${warn[@]}" -c tests/cpp/test_g1_controller_state.cpp \
+    -o "$out/test-controller-state.o" &&
+  g++ "$out/test-controller-state.o" "$out/root-reach.o" \
+    "$out/clearance.o" -o "$out/test-controller-state" &&
+  "$out/test-controller-state"
+}
+
+build_frame_transaction_red()
+{
+  g++ "${warn[@]}" -c tests/cpp/test_g1_frame_transaction.cpp \
+    -o "$out/test-frame-transaction.o" &&
+  g++ "$out/test-frame-transaction.o" "$out/root-reach.o" \
+    "$out/clearance.o" -o "$out/test-frame-transaction" &&
+  "$out/test-frame-transaction"
+}
+
+build_frame_production_red()
+{
+  g++ "${warn[@]}" -DG1_FRAME_TRANSACTION_ENABLE_TEST_SEAM \
+    -c tests/cpp/test_g1_frame_transaction_production.cpp \
+    -o "$out/test-frame-production.o" &&
+  g++ "$out/test-frame-production.o" "$out/controller-runner.o" \
+    "$out/root-reach.o" "$out/clearance.o" "${raylib[@]}" \
+    -o "$out/test-frame-production" &&
+  "$out/test-frame-production"
+}
+
+build_controller_logging_red()
+{
+  g++ "${warn[@]}" "${rayinc[@]}" \
+    -c tests/cpp/test_g1_controller_logging.cpp \
+    -o "$out/test-controller-logging.o" &&
+  g++ "$out/test-controller-logging.o" "$out/root-reach.o" \
+    "$out/clearance.o" "${raylib[@]}" \
+    -o "$out/test-controller-logging" &&
+  "$out/test-controller-logging"
+}
+
+red_failures=0
+expect_task3_red()
+{
+  name="$1"
+  shift
+  if "$@" >"$out/$name.stdout" 2>"$out/$name.stderr"; then
+    printf 'unexpected GREEN before Task 3 production edits: %s\n' \
+      "$name" >&2
+    exit 1
+  fi
+  if ! rg -n 'root_reach|G1IkFrameResult' "$out/$name.stderr" \
+       >"$out/$name.relevant"; then
+    printf 'unrelated RED failure for %s\n' "$name" >&2
+    sed -n '1,40p' "$out/$name.stderr" >&2
+    exit 1
+  fi
+  sed -n '1p' "$out/$name.relevant" >"$out/$name.first-relevant"
+  red_failures=$((red_failures + 1))
+}
+
+expect_task3_red g1-ik build_g1_ik_red
+expect_task3_red controller-state build_controller_state_red
+expect_task3_red frame-transaction build_frame_transaction_red
+expect_task3_red frame-production build_frame_production_red
+expect_task3_red controller-logging build_controller_logging_red
+test "$red_failures" -eq 5
+```
+
+All final links in these build attempts are neutral object/library-only
+commands. Preserve the five `*.first-relevant` files plus the successful
+strict-kernel and no-main-controller compile commands in the Task 3 report.
+Do not weaken a Task 2 assertion or begin production edits until all five
+independent RED attempts have been recorded.
 
 - [ ] **Step 4: Integrate the planner at frame begin**
 
-Add `G1RootReachPlan root_reach;` immediately before `feet[2]` in `G1IkFrameResult`. In `g1_ik_frame_begin`, keep the existing disabled branch byte-identical. For enabled, non-safe-stopped frames, after both exact `G1FootTarget` values exist and before copying the pose to scratch:
+Add `G1RootReachPlan root_reach;` immediately before `feet[2]` in `G1IkFrameResult`. In `g1_ik_frame_begin`, keep the existing disabled branch byte-identical. Materialize both exact `G1FootTarget` values and complete the existing blocked-footprint/unavailable-landing classification first. For enabled frames which still have no requested safe stop, plan and compute the adjusted local root into a scalar before copying either scratch array:
 
 ```cpp
-G1FootTarget targets[2] = {
-    candidate.candidate_result.feet[0].target,
-    candidate.candidate_result.feet[1].target,
-};
-if (!g1_plan_recorded_contact_root_reach(
-        candidate.candidate_result.root_reach,
-        baseline_positions, baseline_rotations, bone_parents, contacts,
-        targets[0], targets[1], error, error_capacity)) {
-    return false;
+float adjusted_root_y = baseline_positions(G1_Simulation).y;
+if (!candidate.candidate_result.safe_stop_requested) {
+    const G1FootTarget& left_target =
+        candidate.candidate_result.feet[0].target;
+    const G1FootTarget& right_target =
+        candidate.candidate_result.feet[1].target;
+    if (!g1_plan_recorded_contact_root_reach(
+            candidate.candidate_result.root_reach,
+            baseline_positions, baseline_rotations, bone_parents, contacts,
+            left_target, right_target, error, error_capacity) ||
+        !g1_apply_root_reach_plan_y(
+            adjusted_root_y,
+            baseline_positions(G1_Simulation).y,
+            candidate.candidate_result.root_reach)) {
+        return false;
+    }
 }
 ```
 
-Copy the untouched baseline arrays as today. If `root_reach.applied`, compute the exact root Y through `g1_apply_root_reach_plan_y` and assign only `scratch_positions(G1_Simulation).y`. Do not change a target or request a new stop reason when no interval exists; the existing recorded-contact stage remains the failure owner.
+Only after the planner and strict apply helper succeed, copy the untouched
+baseline arrays as today. If `root_reach.applied`, assign the already computed
+`adjusted_root_y` only to `scratch_positions(G1_Simulation).y`. This order
+keeps both scratch arrays and the caller's transaction unchanged on every
+planner/apply global error. Do not change a target or request a new stop reason
+when no interval exists; the existing recorded-contact stage remains the
+failure owner.
 
 - [ ] **Step 5: Authenticate every result owner**
 
 Update:
 
 - `g1_ik_runtime_is_disabled_noop` to require the canonical inactive positive-zero plan;
-- `g1_ik_frame_rejection_snapshot` to require a valid plan, canonical at begin-time footprint/landing rejection, otherwise active exactly when a recorded contact was eligible for planning;
+- `g1_ik_frame_rejection_snapshot` to enforce the exact checkpoint forms from Step 2;
 - accepted finish to retain the same plan unchanged;
-- `g1_controller_state_ik_frame_is_valid` to authenticate plan shape and contact activation;
+- `g1_controller_state_ik_frame_is_valid` to authenticate plan shape, contact activation, and active-implies-common on accepted results;
+- `g1_controller_state_is_valid` to authenticate strict applied local root Y plus root X/Z and every non-root local-position bit against the support-retargeted baseline;
 - `g1_frame_ik_result_equal`, rejected-result validators, and canonical-result validators;
-- `g1_frame_accepted_diagnostic_matches_success` to authenticate strict checked support/rendered Hips Y plus the retained delta;
-- `g1_log_hash_ik_frame_result` in `controller.cpp` and both independent logical hash oracles in the frame transaction tests.
+- `g1_frame_accepted_diagnostic_matches_success` to bind support and rendered Hips Y independently to `global_bone_positions` and `ik_global_bone_positions`; never re-associate global Hips Y with the root delta;
+- the actual controller function `g1_log_hash_frame_result` and all three independent result-hash oracles; and
+- `test_g1_controller_logging.cpp` so production digest/oracle parity owns all four plan fields.
 
-Do not add a CSV field. The existing row builder continues to write support and rendered Hips values from their authoritative owners.
+Do not add a CSV field. The existing row builder continues to write support
+and rendered Hips values from their authoritative owners. Their difference is
+approximate live quality evidence only; the retained local plan and exact
+owner bindings are the provenance gates.
 
 - [ ] **Step 6: Run focused strict, fast-caller, parity, sanitizer, and production closure gates**
 
-Run all Task 2 commands plus equivalent strict/fast/sanitized builds for:
+Run the complete inherited Task 2 strict/fast/parity/sanitizer matrix, then equivalent strict/fast/sanitized builds for:
 
 ```bash
+tests/cpp/test_g1_controller_state.cpp
 tests/cpp/test_g1_frame_transaction.cpp
 tests/cpp/test_g1_frame_transaction_production.cpp
+tests/cpp/test_g1_controller_logging.cpp
 ```
 
-Link each executable with both strict objects. Then run:
+Link each executable with both strict objects. Compile the production runner
+from `controller.cpp` under `G1_CONTROLLER_NO_MAIN` for the production
+transaction test; link with a neutral driver, never `-ffast-math`, and do not
+use LTO. Compile both strict objects with `-frecord-gcc-switches`; require
+their recorded switches to contain `-fno-fast-math`, `-ffp-contract=off`, and
+`-frounding-math`, to exclude `-ffast-math`, and require `readelf -SW` to show
+no `.gnu.lto` section. Run the public/no-seam and all three negative-runner
+modes:
 
 ```bash
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
   -c tests/cpp/compile_g1_ik_production.cpp \
   -o /tmp/g1-root-reach-plan/task3/production.o
+g++ /tmp/g1-root-reach-plan/task3/production.o \
+  /tmp/g1-root-reach-plan/task3/root-reach.o \
+  /tmp/g1-root-reach-plan/task3/clearance.o \
+  -o /tmp/g1-root-reach-plan/task3/production
+/tmp/g1-root-reach-plan/task3/production
 ! nm -C /tmp/g1-root-reach-plan/task3/production.o | \
   rg 'for_test|test_seam'
-g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
-  -c tests/cpp/compile_g1_frame_transaction_runner_negative.cpp \
-  -o /tmp/g1-root-reach-plan/task3/runner-negative.o \
-  2>/tmp/g1-root-reach-plan/task3/runner-negative.stderr && exit 1 || true
+for mode in VOID_CONTEXT PUBLICATION_CONTEXT ACCEPTED_CONTEXT; do
+  if g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
+       -D"G1_FRAME_NEGATIVE_${mode}" \
+       -c tests/cpp/compile_g1_frame_transaction_runner_negative.cpp \
+       -o "/tmp/g1-root-reach-plan/task3/runner-negative-${mode}.o" \
+       2>"/tmp/g1-root-reach-plan/task3/runner-negative-${mode}.stderr"; then
+    exit 1
+  fi
+done
+if g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
+     -c tests/cpp/compile_g1_ik_seam_negative.cpp \
+     -o /tmp/g1-root-reach-plan/task3/ik-seam-negative.o \
+     2>/tmp/g1-root-reach-plan/task3/ik-seam-negative.stderr; then
+  exit 1
+fi
 ```
 
-Expected: strict/fast/sanitizer tests exit `0`; authentic rejection and acceptance fixtures publish; all plan forgeries fail; no private seam is present in production; the negative runner compile remains rejected.
+Build and neutrally link a no-seam production controller with both strict
+objects, inspect it with `nm -C`, and run the existing production source/no-main
+closure test. Every final link is an object/library-only neutral `g++` command
+which contains neither `-ffast-math` nor `-flto`. Expected: every
+strict/fast/sanitizer test exits `0`; authentic
+rejection and acceptance fixtures publish; all plan forgeries fail; controller
+digest and every independent oracle agree; no private seam is present; all
+negative compiles remain rejected; exact 25 Hz, independent travel/heading,
+separate terrain packs, and the exact CSV schema remain unchanged.
 
 - [ ] **Step 7: Commit runtime integration**
 
@@ -683,6 +893,7 @@ git add g1_ik_runtime.h g1_controller_state.h g1_frame_transaction.h \
   tests/cpp/test_g1_controller_state.cpp \
   tests/cpp/test_g1_frame_transaction.cpp \
   tests/cpp/test_g1_frame_transaction_production.cpp \
+  tests/cpp/test_g1_controller_logging.cpp \
   tests/cpp/compile_g1_ik_production.cpp
 git diff --cached --check
 git commit -m "feat: precondition recorded-contact G1 IK reach"
@@ -772,7 +983,7 @@ Expected at frame 1: accepted, `ik_applied=1`, no safe stop, both recorded feet 
 
 - [ ] **Step 3: Run inherited focused and full source tests**
 
-Run the complete Python suite and these exact native tests in strict, release caller/strict kernels, and sanitizer configurations: `test_cleanup_runtime`, `test_g1_candidate_audit`, `test_g1_candidate_audit_controller`, `test_g1_clearance`, `test_g1_command_runtime`, `test_g1_controller_logging`, `test_g1_controller_state`, `test_g1_footprint_runtime`, `test_g1_frame_transaction`, `test_g1_frame_transaction_production`, `test_g1_ik`, `test_g1_skeleton`, `test_motion_match_log`, `test_route_runtime`, `test_scene_runtime`, `test_scene_switch`, `test_support_matching`, `test_support_runtime`, `test_terrain_database`, and `test_terrain_runtime`. Run both negative compile fixtures `compile_g1_ik_seam_negative.cpp` and `compile_g1_frame_transaction_runner_negative.cpp`, and the positive production fixture `compile_g1_ik_production.cpp`.
+Run the complete Python suite and these exact native tests in strict, release caller/strict kernels, and sanitizer configurations: `test_cleanup_runtime`, `test_g1_candidate_audit`, `test_g1_candidate_audit_controller`, `test_g1_clearance`, `test_g1_command_runtime`, `test_g1_controller_logging`, `test_g1_controller_state`, `test_g1_footprint_runtime`, `test_g1_frame_transaction`, `test_g1_frame_transaction_production`, `test_g1_ik`, `test_g1_skeleton`, `test_motion_match_log`, `test_route_runtime`, `test_scene_runtime`, `test_scene_switch`, `test_support_matching`, `test_support_runtime`, `test_terrain_database`, and `test_terrain_runtime`. Run `compile_g1_ik_seam_negative.cpp` strictly as a compile-only `-c` negative gate and fail if compilation succeeds; a missing definition at link time is not privacy evidence. Run every mode of `compile_g1_frame_transaction_runner_negative.cpp` as a compile-only negative gate, and compile/link/run the positive production fixture `compile_g1_ik_production.cpp`.
 
 Expected: every invocation exits `0`, strict builds emit no warning, sanitizer output is empty, strict/fast parity records are identical, the database/terrain pack validator remains unchanged, and `git diff --check` is silent.
 

@@ -53,15 +53,20 @@ The production order is:
 
 1. Build the ordinary terrain-support baseline exactly as today.
 2. Run checked FK and materialize both exact `G1FootTarget` values.
-3. For recorded-contact feet, derive the same surface-aligned physical-sole
+3. Complete the existing blocked-footprint and unavailable-landing
+   classification. If either requests a begin-time stop, retain the canonical
+   inactive plan and do not invoke root planning.
+4. For recorded-contact feet, derive the same surface-aligned physical-sole
    position target that the named solver will consume.
-4. Build and intersect their feasible root-Y reach intervals.
-5. Select the baseline-analytic-admitted binary32 delta closest to positive
+5. Build and intersect their feasible root-Y reach intervals.
+6. Select the baseline-analytic-admitted binary32 delta closest to positive
    zero, bounded to `[-0.05 m, +0.05 m]`, and authenticate it with the
    adjusted production target and reach projection.
-6. Apply that delta once to only
-   `scratch_positions(G1_Simulation).y`.
-7. Run the existing fixed left-then-right bounded position/orientation IK,
+7. Before publishing either scratch array, use the strict checked apply helper
+   to compute the adjusted local root Y into a scalar candidate. Copy the
+   untouched baseline arrays only after that succeeds, then assign the scalar
+   once to only `scratch_positions(G1_Simulation).y`.
+8. Run the existing fixed left-then-right bounded position/orientation IK,
    defensive clearance, final FK, pose certificate, and outer atomic commit.
 
 The preconditioner receives no command, trajectory, travel-direction, or
@@ -81,6 +86,23 @@ The plan is computed before its destination pose is changed. On success, the
 transaction result retains the root-Y delta so validators can authenticate
 the adjustment against the candidate pose. It is not persistent controller
 state and is recomputed from each accepted support-retargeted baseline.
+
+Accepted provenance is authenticated at the operations which actually own
+the bits. The strict checked apply helper recomputes expected local
+`G1_Simulation.y` from the untouched support-retargeted local root and the
+retained plan. The accepted IK local pose must match that value, retain root
+X/Z bit for bit, and retain every non-root local position bit for bit. The
+support-retargeted and rendered Hips diagnostics are then independently bound
+to `global_bone_positions(G1_Hips).y` and
+`ik_global_bone_positions(G1_Hips).y`, respectively, after both global arrays
+have passed their existing checked-FK ownership gates.
+
+Do not authenticate the plan by requiring exact binary32 equality between
+rendered Hips Y and support-retargeted Hips Y plus the delta. Checked FK forms
+the rendered value as the adjusted local root followed by the parent/child
+addition, while that diagnostic expression adds the delta after the baseline
+parent/child addition. Those differently parenthesized binary32 operations
+need not have identical bits.
 
 Refactor, rather than duplicate, the two pieces of math shared with production
 IK:
@@ -116,10 +138,12 @@ the baseline analytic interval first admits `0xbc80e8f5`; therefore
 production-valid gap is about 26 nm in root Y and does not justify changing
 the proof domain or the named solver.
 
-No runtime option and no log column is added. Existing
-`support_retargeted_hips_y` and `ik_adjusted_hips_y` values expose the
-candidate-only correction. The transaction result and logical state digests
-provide internal provenance.
+No runtime option and no log column is added. The difference between existing
+`support_retargeted_hips_y` and `ik_adjusted_hips_y` remains approximate live
+quality evidence for the candidate-only correction; it is not the exact plan
+oracle. The retained result, strict local-root relation, authoritative FK
+bindings, equality, and logical state digests provide exact internal
+provenance.
 
 ## Failure and Rollback
 
@@ -139,6 +163,15 @@ provide internal provenance.
 - A later finite or global failure discards the entire working pose, root
   delta, lock/history state, timers, and route progress through the existing
   frame transaction.
+- An outer footprint rejection occurs before IK begin and therefore publishes
+  no attempted IK plan. A direct blocked or unavailable-landing rejection at
+  the begin checkpoint retains the canonical inactive positive-zero plan.
+  Rejections after foot 0 or foot 1 retain a valid plan whose `active` bit is
+  exactly the OR of the recorded-contact bits; active/non-common/unapplied
+  positive zero is the allowed infeasible or out-of-cap form. An accepted
+  contact-active frame additionally requires a common interval. A later
+  finish or pose-certificate failure cannot publish the working plan into the
+  accepted controller state.
 
 ## Tests
 
@@ -161,10 +194,19 @@ Write failures before production changes and cover:
    revalidation.
 7. Invalid input, aliasing, and arithmetic rollback.
 8. Full frame rejection/acceptance ownership, including immutable command and
-   heading snapshots and candidate-root-only position differences.
-9. Strict caller, optimized `-ffast-math` caller linked to the strict kernel,
+   heading snapshots, strict local-root application, root X/Z and non-root
+   position identity, and checkpoint-specific plan forms.
+9. Authoritative support/rendered Hips FK bindings, including the fixed
+   multilevel binary32 parenthesization fixture local root
+   `a=0x3f000000`, local Hips Y `b=0x3f000001`, and Task 2 delta
+   `d=0xbc80e8f0`: checked FK `(a+d)+b` is `0x3f7bf8ba`, while the
+   reassociated `(a+b)+d` is `0x3f7bf8b8`. This proves recomputing
+   `support Hips + delta` is not the accepted exact oracle.
+10. All independent logical hashes, controller-state validation, controller
+   logging digest parity, dirty-copy ownership, and plan-field forgeries.
+11. Strict caller, optimized `-ffast-math` caller linked to the strict kernel,
    strict/fast parity records, ASan/UBSan/float sanitizers, and production
-   no-seam builds.
+   no-seam/no-main controller builds and negative runner compilation.
 
 Task 2 also exposes a fixed-size planner audit only when
 `G1_IK_ENABLE_TEST_SEAMS` is defined. The audited wrapper calls the same
