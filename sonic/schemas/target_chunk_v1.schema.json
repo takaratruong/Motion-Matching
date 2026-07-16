@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "target-chunk/v1",
+  "title": "Validated 50 Hz SONIC target chunk v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "session_id",
+    "accepted_chunk_id",
+    "source_candidate_id",
+    "frame_index",
+    "timestamps_s",
+    "joint_position",
+    "joint_velocity",
+    "body_quat_w",
+    "physical_pelvis_position",
+    "virtual_root_position",
+    "virtual_root_quat_w",
+    "scene",
+    "command",
+    "hashes"
+  ],
+  "$defs": {
+    "float": {"type": "number"},
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "vec3": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/float"},
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "quat": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/float"},
+      "minItems": 4,
+      "maxItems": 4
+    },
+    "joints": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/float"},
+      "minItems": 29,
+      "maxItems": 29
+    },
+    "targetJoints": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/joints"},
+      "minItems": 20,
+      "maxItems": 20
+    },
+    "targetVec3": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/vec3"},
+      "minItems": 20,
+      "maxItems": 20
+    },
+    "targetQuat": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/quat"},
+      "minItems": 20,
+      "maxItems": 20
+    }
+  },
+  "properties": {
+    "schema": {"const": "target-chunk/v1"},
+    "session_id": {"type": "string", "minLength": 1},
+    "accepted_chunk_id": {"type": "string", "minLength": 1},
+    "source_candidate_id": {"type": "string", "minLength": 1},
+    "frame_index": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": 0},
+      "minItems": 20,
+      "maxItems": 20
+    },
+    "timestamps_s": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/float"},
+      "minItems": 20,
+      "maxItems": 20
+    },
+    "joint_position": {"$ref": "#/$defs/targetJoints"},
+    "joint_velocity": {"$ref": "#/$defs/targetJoints"},
+    "body_quat_w": {"$ref": "#/$defs/targetQuat"},
+    "physical_pelvis_position": {"$ref": "#/$defs/targetVec3"},
+    "virtual_root_position": {"$ref": "#/$defs/targetVec3"},
+    "virtual_root_quat_w": {"$ref": "#/$defs/targetQuat"},
+    "scene": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scene_id",
+        "route_id",
+        "terrain_weight",
+        "coordinate_signature",
+        "heightfield_sha256",
+        "mesh_sha256",
+        "walkability_sha256"
+      ],
+      "properties": {
+        "scene_id": {"type": "string", "minLength": 1},
+        "route_id": {"type": "string", "minLength": 1},
+        "terrain_weight": {"$ref": "#/$defs/float"},
+        "coordinate_signature": {"type": "string", "minLength": 1},
+        "heightfield_sha256": {"$ref": "#/$defs/sha256"},
+        "mesh_sha256": {"$ref": "#/$defs/sha256"},
+        "walkability_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requested_velocity_holden",
+        "desired_heading_holden_wxyz",
+        "applied_velocity_holden"
+      ],
+      "properties": {
+        "requested_velocity_holden": {"$ref": "#/$defs/vec3"},
+        "desired_heading_holden_wxyz": {"$ref": "#/$defs/quat"},
+        "applied_velocity_holden": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/vec3"},
+          "minItems": 10,
+          "maxItems": 10
+        }
+      }
+    },
+    "hashes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["canonical_target_sha256", "diagnostic_sha256"],
+      "properties": {
+        "canonical_target_sha256": {"$ref": "#/$defs/sha256"},
+        "diagnostic_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  }
+}

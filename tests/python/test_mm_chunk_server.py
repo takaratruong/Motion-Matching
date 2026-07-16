@@ -6,11 +6,21 @@ import subprocess
 import struct
 import unittest
 
+import numpy as np
+
+from mm_sonic.joints import load_joint_contract
+from mm_sonic.schema import (
+    loads_exact,
+    parse_initial_boundary,
+    parse_source_chunk,
+)
+
 
 ROOT = Path(__file__).resolve().parents[2]
 SERVER = Path(os.environ.get(
     "SONIC_MM_SERVER", ROOT / "sonic" / "build" / "mm_chunk_server"))
 SCHEMA = ROOT / "sonic" / "schemas" / "mm_chunk_v1.schema.json"
+JOINT_CONTRACT = ROOT / "sonic" / "configs" / "g1_joint_contract.json"
 MIN_BINARY32_SUBNORMAL = struct.unpack("<f", bytes.fromhex("01000000"))[0]
 MAX_BINARY32_SUBNORMAL = struct.unpack("<f", bytes.fromhex("ffff7f00"))[0]
 MAX_BINARY32 = struct.unpack("<f", bytes.fromhex("ffff7f7f"))[0]
@@ -93,7 +103,7 @@ class ChunkServer:
         if not line:
             stderr = self.process.stderr.read().decode("utf-8", "replace")
             raise AssertionError(f"server exited without a response: {stderr}")
-        decoded = json.loads(line)
+        decoded = loads_exact(line.decode("utf-8"))
         self.assert_envelope(decoded)
         return decoded
 
@@ -505,14 +515,64 @@ class RealArtifactChunkServerTest(unittest.TestCase):
     def test_real_generate_emits_11_boundaries_and_abort_regenerates_exactly(self):
         server = ChunkServer(real=True)
         try:
+            contract = load_joint_contract(JOINT_CONTRACT)
+            source_names = tuple(row.source_joint for row in contract.rows)
+            target_names = tuple(
+                next(
+                    row.target_name
+                    for row in contract.rows
+                    if row.target_index == index
+                )
+                for index in range(29)
+            )
             identity = server.request(hello())["data"]
             self.assertNotEqual(identity["build_commit"], "test-adapter")
             initial = server.request(reset())["data"]["initial_boundary"]
             first = server.request(generate())["data"]
+            initial_model = parse_initial_boundary(initial, contract)
+            first_model = parse_source_chunk(first, contract)
+            self.assertEqual(initial_model.source_joint_names, source_names)
+            self.assertEqual(first_model.source_joint_names, source_names)
+            self.assertEqual(first_model.target_joint_names, target_names)
             self.assertEqual(len(first["joint_position_source"]), 11)
             self.assertEqual(len(first["joint_velocity_source"]), 11)
-            self.assertEqual(first["joint_position_source"][0], initial["joint_position_source"])
-            self.assertEqual(first["joint_velocity_source"][0], initial["joint_velocity_source"])
+            self.assertEqual(
+                first["joint_position_source"][0],
+                initial["joint_position_source"],
+            )
+            self.assertEqual(
+                first["joint_velocity_source"][0],
+                initial["joint_velocity_source"],
+            )
+            np.testing.assert_array_equal(
+                first_model.joint_position_source[0].view(np.uint32),
+                initial_model.joint_position_source.view(np.uint32),
+            )
+            np.testing.assert_array_equal(
+                first_model.joint_velocity_source[0].view(np.uint32),
+                initial_model.joint_velocity_source.view(np.uint32),
+            )
+            maximum_quaternion_norm_error = 0.0
+            for field in (
+                "physical_pelvis_orientation_holden",
+                "virtual_root_orientation_holden",
+            ):
+                raw = np.asarray(first[field], np.float32)
+                decoded = getattr(first_model, field)
+                np.testing.assert_array_equal(
+                    decoded.view(np.uint32), raw.view(np.uint32)
+                )
+                maximum_quaternion_norm_error = max(
+                    maximum_quaternion_norm_error,
+                    float(
+                        np.max(
+                            np.abs(
+                                np.linalg.norm(raw.astype(np.float64), axis=1)
+                                - 1.0
+                            )
+                        )
+                    ),
+                )
             self.assertTrue(server.request(finish("abort", "r3", "c000000"))["ok"])
             second = server.request(generate("r4"))["data"]
             self.assertEqual(second, first)
@@ -526,6 +586,8 @@ class RealArtifactChunkServerTest(unittest.TestCase):
                 "real artifact evidence: "
                 f"sha256={hashlib.sha256(canonical).hexdigest()} "
                 f"boundaries={len(first['timestamps_s'])} "
+                f"quaternion_norm_error={maximum_quaternion_norm_error:.9g} "
+                "names_exact=true decode_repair=false "
                 "abort_regenerate_equal=true"
             )
             self.assertTrue(server.request(finish("abort", "r5", "c000000"))["ok"])
