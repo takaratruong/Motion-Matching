@@ -20,6 +20,7 @@ _JOINT_COUNT = 29
 _TERRAIN_SAMPLE_COUNT = 4
 _SOURCE_RATE_HZ = 25
 _QUATERNION_NORM_TOLERANCE = 1.0e-5
+_COORDINATE_SIGNATURE = "holden-y-up-right-handed-forward-plus-z"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -117,6 +118,21 @@ def _fixed_integer(value: object, expected: int, label: str) -> int:
 def _binary32(value: object, label: str) -> np.float32:
     if type(value) not in (int, float):
         raise ContractError(f"{label} must be a JSON number")
+    if type(value) is int:
+        try:
+            with np.errstate(over="ignore", invalid="ignore"):
+                converted = np.float32(value)
+        except (OverflowError, ValueError) as error:
+            raise ContractError(
+                f"{label} is not a finite binary32 number"
+            ) from error
+        if not np.isfinite(converted):
+            raise ContractError(f"{label} does not round-trip through binary32")
+        if int(converted) != value:
+            raise ContractError(
+                f"{label} integer does not recover an exact binary32 value"
+            )
+        return converted
     try:
         number = float(value)
     except (OverflowError, ValueError) as error:
@@ -495,6 +511,14 @@ def parse_source_chunk(
         ),
         "source chunk.virtual_root_orientation_holden",
     )
+    scene = _parse_scene(source["scene"])
+    artifacts = _parse_artifacts(source["artifacts"])
+    if scene["coordinate_signature"] != artifacts["coordinate_signature"]:
+        raise ContractError("scene and artifact coordinate signatures disagree")
+    if scene["coordinate_signature"] != _COORDINATE_SIGNATURE:
+        raise ContractError(
+            "coordinate signature must equal " + _COORDINATE_SIGNATURE
+        )
     return SourceChunk(
         session_id=_string(source["session_id"], "source chunk.session_id"),
         candidate_id=_string(source["candidate_id"], "source chunk.candidate_id"),
@@ -564,7 +588,7 @@ def parse_source_chunk(
             (_STEP_COUNT,),
             "source chunk.support_target",
         ),
-        scene=_parse_scene(source["scene"]),
+        scene=scene,
         command=_parse_command(source["command"]),
-        artifacts=_parse_artifacts(source["artifacts"]),
+        artifacts=artifacts,
     )

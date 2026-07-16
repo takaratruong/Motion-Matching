@@ -336,6 +336,32 @@ class SourceChunkTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(ContractError):
                 parse_source_chunk(payload, self.fixture.contract)
 
+    def test_chunk_rejects_wrong_scene_coordinate_signature(self):
+        payload = self.fixture.chunk()
+        payload["scene"]["coordinate_signature"] = "wrong-scene-basis"
+        with self.assertRaises(ContractError):
+            parse_source_chunk(payload, self.fixture.contract)
+
+    def test_chunk_rejects_wrong_artifact_coordinate_signature(self):
+        payload = self.fixture.chunk()
+        payload["artifacts"]["coordinate_signature"] = "wrong-artifact-basis"
+        with self.assertRaises(ContractError):
+            parse_source_chunk(payload, self.fixture.contract)
+
+    def test_chunk_rejects_mismatched_coordinate_signatures(self):
+        payload = self.fixture.chunk()
+        payload["scene"]["coordinate_signature"] = "wrong-scene-basis"
+        payload["artifacts"]["coordinate_signature"] = "wrong-artifact-basis"
+        with self.assertRaises(ContractError):
+            parse_source_chunk(payload, self.fixture.contract)
+
+    def test_chunk_rejects_matching_noncanonical_coordinate_signatures(self):
+        payload = self.fixture.chunk()
+        payload["scene"]["coordinate_signature"] = "wrong-shared-basis"
+        payload["artifacts"]["coordinate_signature"] = "wrong-shared-basis"
+        with self.assertRaises(ContractError):
+            parse_source_chunk(payload, self.fixture.contract)
+
     def test_chunk_rejects_every_wrong_length_or_shape_family(self):
         mutations = {
             "timestamps_s": lambda value: value[:-1],
@@ -434,6 +460,21 @@ class SourceChunkTests(unittest.TestCase):
             int(chunk.terrain_cost[0].view(np.uint32)),
             int(original.view(np.uint32)),
         )
+
+    def test_chunk_rejects_json_integers_that_lose_binary32_precision(self):
+        for value in (2**60 + 1, -(2**60 + 1)):
+            payload = self.fixture.chunk()
+            payload["terrain_cost"][0] = value
+            with self.subTest(value=value), self.assertRaises(ContractError):
+                parse_source_chunk(payload, self.fixture.contract)
+
+    def test_chunk_accepts_genuinely_binary32_exact_json_integers(self):
+        for value in (2**60, -(2**60)):
+            payload = self.fixture.chunk()
+            payload["terrain_cost"][0] = value
+            chunk = parse_source_chunk(payload, self.fixture.contract)
+            with self.subTest(value=value):
+                self.assertEqual(int(chunk.terrain_cost[0]), value)
 
     def test_chunk_rejects_nonunit_quaternions(self):
         paths = (

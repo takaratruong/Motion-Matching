@@ -24,6 +24,18 @@ JOINT_CONTRACT = ROOT / "sonic" / "configs" / "g1_joint_contract.json"
 MIN_BINARY32_SUBNORMAL = struct.unpack("<f", bytes.fromhex("01000000"))[0]
 MAX_BINARY32_SUBNORMAL = struct.unpack("<f", bytes.fromhex("ffff7f00"))[0]
 MAX_BINARY32 = struct.unpack("<f", bytes.fromhex("ffff7f7f"))[0]
+PROJECTED_BOUNDARY_FIELDS = (
+    "joint_position_source",
+    "joint_velocity_source",
+    "physical_pelvis_position_holden",
+    "physical_pelvis_orientation_holden",
+    "virtual_root_position_holden",
+    "virtual_root_orientation_holden",
+)
+QUATERNION_BOUNDARY_FIELDS = (
+    "physical_pelvis_orientation_holden",
+    "virtual_root_orientation_holden",
+)
 
 
 def hello(request_id="r0"):
@@ -534,29 +546,35 @@ class RealArtifactChunkServerTest(unittest.TestCase):
             self.assertEqual(initial_model.source_joint_names, source_names)
             self.assertEqual(first_model.source_joint_names, source_names)
             self.assertEqual(first_model.target_joint_names, target_names)
+            self.assertEqual(
+                tuple(initial["source_joint_names"]),
+                initial_model.source_joint_names,
+            )
+            self.assertEqual(
+                tuple(first["source_joint_names"]),
+                first_model.source_joint_names,
+            )
+            self.assertEqual(
+                initial_model.source_joint_names,
+                first_model.source_joint_names,
+            )
             self.assertEqual(len(first["joint_position_source"]), 11)
             self.assertEqual(len(first["joint_velocity_source"]), 11)
-            self.assertEqual(
-                first["joint_position_source"][0],
-                initial["joint_position_source"],
-            )
-            self.assertEqual(
-                first["joint_velocity_source"][0],
-                initial["joint_velocity_source"],
-            )
-            np.testing.assert_array_equal(
-                first_model.joint_position_source[0].view(np.uint32),
-                initial_model.joint_position_source.view(np.uint32),
-            )
-            np.testing.assert_array_equal(
-                first_model.joint_velocity_source[0].view(np.uint32),
-                initial_model.joint_velocity_source.view(np.uint32),
-            )
+            for field in PROJECTED_BOUNDARY_FIELDS:
+                raw_initial = np.asarray(initial[field], np.float32)
+                raw_candidate = np.asarray(first[field][0], np.float32)
+                decoded_initial = getattr(initial_model, field)
+                decoded_candidate = getattr(first_model, field)[0]
+                for actual, expected in (
+                    (decoded_initial, raw_initial),
+                    (decoded_candidate, raw_candidate),
+                    (decoded_candidate, decoded_initial),
+                ):
+                    np.testing.assert_array_equal(
+                        actual.view(np.uint32), expected.view(np.uint32)
+                    )
             maximum_quaternion_norm_error = 0.0
-            for field in (
-                "physical_pelvis_orientation_holden",
-                "virtual_root_orientation_holden",
-            ):
+            for field in QUATERNION_BOUNDARY_FIELDS:
                 raw = np.asarray(first[field], np.float32)
                 decoded = getattr(first_model, field)
                 np.testing.assert_array_equal(
@@ -586,6 +604,7 @@ class RealArtifactChunkServerTest(unittest.TestCase):
                 "real artifact evidence: "
                 f"sha256={hashlib.sha256(canonical).hexdigest()} "
                 f"boundaries={len(first['timestamps_s'])} "
+                f"boundary_zero_fields={len(PROJECTED_BOUNDARY_FIELDS)} "
                 f"quaternion_norm_error={maximum_quaternion_norm_error:.9g} "
                 "names_exact=true decode_repair=false "
                 "abort_regenerate_equal=true"
