@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
+from numbers import Integral
 import os
 from pathlib import Path
 import re
@@ -861,6 +862,8 @@ class RunBundle:
         *,
         first_frame_index: int,
         last_frame_index: int,
+        phase: str = "timeline",
+        attempt: int | None = None,
     ) -> Mapping[str, object]:
         """Confine one exact packed message and its digest to this run."""
 
@@ -876,20 +879,39 @@ class RunBundle:
             raise ContractError(
                 "transmitted frame range must be nonnegative and ordered"
             )
+        if phase == "timeline":
+            if attempt is not None:
+                raise ContractError("timeline transmission phase cannot have an attempt")
+        elif phase == "readiness":
+            if type(attempt) is not int or attempt <= 0:
+                raise ContractError(
+                    "readiness transmission phase requires a positive attempt"
+                )
+        else:
+            raise ContractError("transmission phase must be timeline or readiness")
         payload = bytes(message)
         digest = hashlib.sha256(payload).hexdigest()
         stem = f"{first_frame_index:06d}-{last_frame_index:06d}"
-        message_path = f"transmitted/{stem}.bin"
-        digest_path = f"transmitted/{stem}.sha256"
+        if phase == "readiness":
+            assert attempt is not None
+            leaf_stem = f"attempt-{attempt:06d}__{stem}"
+            message_path = f"transmitted/readiness/{leaf_stem}.bin"
+            digest_path = f"transmitted/readiness/{leaf_stem}.sha256"
+        else:
+            leaf_stem = stem
+            message_path = f"transmitted/{leaf_stem}.bin"
+            digest_path = f"transmitted/{leaf_stem}.sha256"
         self.write_bytes(message_path, payload)
         self.write_text(
             digest_path,
-            f"{digest}  {stem}.bin\n",
+            f"{digest}  {leaf_stem}.bin\n",
         )
         return MappingProxyType(
             {
                 "first_frame_index": first_frame_index,
                 "last_frame_index": last_frame_index,
+                "phase": phase,
+                "attempt": attempt,
                 "message_path": message_path,
                 "digest_path": digest_path,
                 "sha256": digest,
@@ -980,6 +1002,175 @@ class RunBundle:
 
     def record_timing(self, record: Mapping[str, object]) -> None:
         self._append_record("timing", "timings.jsonl", record)
+
+    def write_readiness(self, readiness: object) -> None:
+        """Persist the exact official-log identity and scoring boundary once."""
+
+        self._append_record(
+            "readiness",
+            "readiness.jsonl",
+            {
+                "session_id": getattr(readiness, "session_id"),
+                "official_log_path": getattr(readiness, "official_log_path"),
+                "log_identity": [
+                    getattr(readiness, "log_device"),
+                    getattr(readiness, "log_inode"),
+                ],
+                "readiness_log_start_offset": getattr(
+                    readiness, "readiness_log_start_offset"
+                ),
+                "scoring_log_offset": getattr(
+                    readiness, "scoring_log_offset"
+                ),
+                "readiness_attempts": getattr(
+                    readiness, "readiness_attempts"
+                ),
+                "expected_row_sha256": getattr(
+                    readiness, "expected_row_sha256"
+                ),
+            },
+        )
+
+    def write_prepared(self, source: object, target: object) -> None:
+        """Append the compact source/target identity before local publication."""
+
+        try:
+            frame_value = getattr(target, "frame_index")
+        except AttributeError:
+            frame_value = getattr(getattr(target, "buffer"), "frame_index")
+        frames = list(frame_value)
+        if (
+            not frames
+            or any(
+                isinstance(value, bool) or not isinstance(value, Integral)
+                for value in frames
+            )
+        ):
+            raise ContractError(
+                "prepared target frame indices must be nonempty integers"
+            )
+        frame_indices = [int(value) for value in frames]
+        if frame_indices[0] < 0 or any(
+            right != left + 1
+            for left, right in zip(frame_indices, frame_indices[1:])
+        ):
+            raise ContractError(
+                "prepared target frame indices must be nonnegative and contiguous"
+            )
+        hashes = dict(getattr(target, "hashes", {}))
+        self.record_candidate(
+            {
+                "session_id": getattr(source, "session_id"),
+                "candidate_id": getattr(source, "candidate_id"),
+                "predecessor_id": getattr(source, "predecessor_id"),
+                "source_rows": len(getattr(source, "timestamps_s")),
+                "accepted_chunk_id": getattr(target, "accepted_chunk_id"),
+                "source_candidate_id": getattr(target, "source_candidate_id"),
+                "target_frames": [frame_indices[0], frame_indices[-1]],
+                "target_hashes": hashes,
+            }
+        )
+
+    def write_rejection(self, rejection: object) -> None:
+        self._append_record(
+            "rejection",
+            "rejections.jsonl",
+            {
+                "candidate_id": getattr(rejection, "candidate_id"),
+                "failure_site": getattr(rejection, "failure_site"),
+                "error_type": getattr(rejection, "error_type"),
+                "error_message": getattr(rejection, "error_message"),
+                "mm_alive": getattr(rejection, "mm_alive"),
+                "abort_required": getattr(rejection, "abort_required"),
+                "abort_sent": getattr(rejection, "abort_sent"),
+                "timeline_abort_required": getattr(
+                    rejection, "timeline_abort_required"
+                ),
+            },
+        )
+
+    def write_abort_decision(self, decision: object) -> None:
+        self.record_abort(
+            {
+                "candidate_id": getattr(decision, "candidate_id"),
+                "mm_abort_required": getattr(decision, "mm_abort_required"),
+                "mm_abort_sent": getattr(decision, "mm_abort_sent"),
+                "timeline_abort_required": getattr(
+                    decision, "timeline_abort_required"
+                ),
+                "timeline_aborted": getattr(decision, "timeline_aborted"),
+                "errors": list(getattr(decision, "errors")),
+            }
+        )
+
+    def write_accepted(self, accepted: object) -> None:
+        target = getattr(accepted, "target")
+        advance = getattr(accepted, "advance")
+        frame_value = getattr(getattr(target, "buffer"), "frame_index")
+        frames = list(frame_value)
+        self.record_accept(
+            {
+                "accepted_chunk_id": getattr(target, "accepted_chunk_id"),
+                "source_candidate_id": getattr(target, "source_candidate_id"),
+                "target_frames": [int(frames[0]), int(frames[-1])],
+                "target_hashes": dict(getattr(target, "hashes", {})),
+                "advance": {
+                    "steps": getattr(advance, "steps"),
+                    "sim_time_start_s": getattr(advance, "sim_time_start_s"),
+                    "sim_time_end_s": getattr(advance, "sim_time_end_s"),
+                    "state_rows": getattr(advance, "state_rows"),
+                    "contact_rows": getattr(advance, "contact_rows"),
+                },
+                "timings_ns": dict(getattr(accepted, "timings_ns")),
+                "wall_started_ns": getattr(accepted, "wall_started_ns"),
+                "wall_finished_ns": getattr(accepted, "wall_finished_ns"),
+            }
+        )
+
+    def write_timing(self, timing: object) -> None:
+        self.record_timing(
+            {
+                "candidate_id": getattr(timing, "candidate_id"),
+                "durations_ns": dict(getattr(timing, "durations_ns")),
+                "failed_stage": getattr(timing, "failed_stage"),
+                "wall_started_ns": getattr(timing, "wall_started_ns"),
+                "wall_finished_ns": getattr(timing, "wall_finished_ns"),
+            }
+        )
+
+    def write_terminal_verdict(self, verdict: object) -> None:
+        audit = getattr(verdict, "delivery_audit")
+        audit_value = None
+        if audit is not None:
+            audit_value = {
+                "expected_rows": getattr(audit, "expected_rows"),
+                "observed_rows": getattr(audit, "observed_rows"),
+                "transmitted_indices_exact": getattr(
+                    audit, "transmitted_indices_exact"
+                ),
+                "official_rows_exact": getattr(audit, "official_rows_exact"),
+                "evidence_sha256": getattr(audit, "evidence_sha256"),
+            }
+        payload = {
+            "schema": "mm-sonic-terminal-verdict/v1",
+            "status": getattr(verdict, "status"),
+            "failure_phase": getattr(verdict, "failure_phase"),
+            "failure_site": getattr(verdict, "failure_site"),
+            "error_type": getattr(verdict, "error_type"),
+            "error_message": getattr(verdict, "error_message"),
+            "accepted_chunks": getattr(verdict, "accepted_chunks"),
+            "simulation_paused": getattr(verdict, "simulation_paused"),
+            "delivery_audit_required": getattr(
+                verdict, "delivery_audit_required"
+            ),
+            "delivery_audit_completed": getattr(
+                verdict, "delivery_audit_completed"
+            ),
+            "delivery_audit": audit_value,
+        }
+        self.write_bytes(
+            "terminal-verdict.json", _json_bytes(payload, "terminal verdict")
+        )
 
     def update_manifest(self, fields: Mapping[str, object]) -> None:
         self._ensure_running()

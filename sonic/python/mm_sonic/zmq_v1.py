@@ -25,6 +25,14 @@ _FIELD_DTYPES = {
 }
 
 
+def _tag_failure(error: BaseException, site: str) -> None:
+    if getattr(error, "failure_site", None) is None:
+        try:
+            error.failure_site = site
+        except BaseException:
+            pass
+
+
 def pose_header(count: int) -> dict[str, object]:
     return {
         "v": 1,
@@ -122,6 +130,18 @@ class DecodedPoseV1:
             body_quat_w=self.body_quat_w,
             frame_index=self.frame_index,
         )
+
+
+@dataclass(frozen=True)
+class PreparedPosePublication:
+    """One exact archived message awaiting a single local socket send."""
+
+    message: bytes
+    archive: Mapping[str, object]
+    phase: str
+    attempt: int | None
+    _publisher_token: object
+    _sequence: int
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -331,27 +351,89 @@ class PosePublisher:
         self._socket = socket
         self._endpoint = bound
         self._closed = False
+        self._publication_token = object()
+        self._next_publication = 0
+        self._prepared_publications: dict[int, PreparedPosePublication] = {}
+        self._sent_publications: set[int] = set()
 
     @property
     def endpoint(self) -> str:
         return self._endpoint
 
-    def send(
-        self, buffer: CanonicalTargetBuffer
+    def prepare(
+        self,
+        buffer: CanonicalTargetBuffer,
+        *,
+        phase: str = "timeline",
+        attempt: int | None = None,
+    ) -> PreparedPosePublication:
+        if self._closed:
+            raise ContractError("PosePublisher is closed")
+        try:
+            message = encode_pose_v1(buffer)
+            decoded = verify_pose_v1_parity(message, buffer)
+        except BaseException as error:
+            _tag_failure(error, "zmq_encoding")
+            raise
+        first_frame_index = int(decoded.frame_index[0])
+        last_frame_index = int(decoded.frame_index[-1])
+        try:
+            archived = self._bundle.archive_transmission(
+                message,
+                first_frame_index=first_frame_index,
+                last_frame_index=last_frame_index,
+                phase=phase,
+                attempt=attempt,
+            )
+        except BaseException as error:
+            _tag_failure(error, "artifact_enqueue")
+            raise
+        sequence = self._next_publication
+        self._next_publication += 1
+        publication = PreparedPosePublication(
+            message=message,
+            archive=archived,
+            phase=phase,
+            attempt=attempt,
+            _publisher_token=self._publication_token,
+            _sequence=sequence,
+        )
+        self._prepared_publications[sequence] = publication
+        return publication
+
+    def send_prepared(
+        self,
+        publication: PreparedPosePublication,
     ) -> Mapping[str, object]:
         if self._closed:
             raise ContractError("PosePublisher is closed")
-        message = encode_pose_v1(buffer)
-        decoded = verify_pose_v1_parity(message, buffer)
-        first_frame_index = int(decoded.frame_index[0])
-        last_frame_index = int(decoded.frame_index[-1])
-        archived = self._bundle.archive_transmission(
-            message,
-            first_frame_index=first_frame_index,
-            last_frame_index=last_frame_index,
-        )
-        self._socket.send(message)
-        return archived
+        if not isinstance(publication, PreparedPosePublication):
+            raise ContractError("local send requires a prepared pose publication")
+        if (
+            publication._publisher_token is not self._publication_token
+            or self._prepared_publications.get(publication._sequence)
+            is not publication
+        ):
+            raise ContractError(
+                "local send requires the exact prepared object archived by this publisher"
+            )
+        if publication._sequence in self._sent_publications:
+            raise ContractError("prepared pose publication was already sent")
+        self._socket.send(publication.message)
+        self._sent_publications.add(publication._sequence)
+        result = dict(publication.archive)
+        result["local_send_completed"] = True
+        return MappingProxyType(result)
+
+    def send(
+        self,
+        buffer: CanonicalTargetBuffer,
+        *,
+        phase: str = "timeline",
+        attempt: int | None = None,
+    ) -> Mapping[str, object]:
+        publication = self.prepare(buffer, phase=phase, attempt=attempt)
+        return self.send_prepared(publication)
 
     def close(self) -> None:
         if self._closed:

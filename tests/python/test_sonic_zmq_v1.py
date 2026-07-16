@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 import hashlib
 import importlib.util
 import json
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -417,6 +419,196 @@ class TransmissionArtifactTests(unittest.TestCase):
                         first_frame_index=first,
                         last_frame_index=last,
                     )
+
+    def test_readiness_attempts_have_unique_append_only_phase_paths(self) -> None:
+        buffer = make_buffer(1, 0)
+        message = manual_message(buffer)
+        first = self.bundle.archive_transmission(
+            message,
+            first_frame_index=0,
+            last_frame_index=0,
+            phase="readiness",
+            attempt=1,
+        )
+        second = self.bundle.archive_transmission(
+            message,
+            first_frame_index=0,
+            last_frame_index=0,
+            phase="readiness",
+            attempt=2,
+        )
+
+        self.assertEqual(
+            first["message_path"],
+            "transmitted/readiness/attempt-000001__000000-000000.bin",
+        )
+        self.assertEqual(
+            second["message_path"],
+            "transmitted/readiness/attempt-000002__000000-000000.bin",
+        )
+        self.assertEqual(
+            (self.bundle.path / first["message_path"]).read_bytes(), message
+        )
+        self.assertEqual(
+            (self.bundle.path / second["message_path"]).read_bytes(), message
+        )
+        self.assertEqual(first["sha256"], second["sha256"])
+        self.assertEqual(first["phase"], "readiness")
+        self.assertEqual(second["attempt"], 2)
+
+        with self.assertRaisesRegex(ContractError, "attempt"):
+            self.bundle.archive_transmission(
+                message,
+                first_frame_index=0,
+                last_frame_index=0,
+                phase="readiness",
+            )
+        with self.assertRaisesRegex(ContractError, "phase"):
+            self.bundle.archive_transmission(
+                message,
+                first_frame_index=0,
+                last_frame_index=0,
+                phase="timeline",
+                attempt=1,
+            )
+
+
+class _PublisherSocket:
+    def __init__(self) -> None:
+        self.sent: list[bytes] = []
+        self.closed = False
+
+    def setsockopt(self, *_args) -> None:
+        pass
+
+    def bind(self, endpoint: str) -> None:
+        self.endpoint = endpoint
+
+    def getsockopt(self, _option):
+        return b"tcp://127.0.0.1:45678"
+
+    def send(self, message: bytes) -> None:
+        self.sent.append(message)
+
+    def close(self, *, linger: int) -> None:
+        self.closed = True
+
+
+class _PublisherContext:
+    def __init__(self) -> None:
+        self.socket_value = _PublisherSocket()
+
+    def socket(self, _kind):
+        return self.socket_value
+
+
+class PosePublisherPhaseTests(unittest.TestCase):
+    def test_prepare_tags_encoding_and_archive_failures_at_production_seams(self) -> None:
+        fake_zmq = SimpleNamespace(
+            PUB=1,
+            CONFLATE=2,
+            LINGER=3,
+            LAST_ENDPOINT=4,
+        )
+        context = _PublisherContext()
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = RunBundle.create(Path(directory), "stage-a", "failure-sites")
+            with mock.patch.dict(sys.modules, {"zmq": fake_zmq}):
+                publisher = PosePublisher(
+                    "tcp://127.0.0.1:*", bundle=bundle, context=context
+                )
+            buffer = make_buffer(1, 0)
+            with mock.patch(
+                "mm_sonic.zmq_v1.encode_pose_v1",
+                side_effect=ContractError("injected encoding failure"),
+            ):
+                with self.assertRaises(ContractError) as encoding:
+                    publisher.prepare(buffer, phase="readiness", attempt=1)
+            self.assertEqual(encoding.exception.failure_site, "zmq_encoding")
+
+            with mock.patch.object(
+                bundle,
+                "archive_transmission",
+                side_effect=ContractError("injected archive failure"),
+            ):
+                with self.assertRaises(ContractError) as archive:
+                    publisher.prepare(buffer, phase="readiness", attempt=1)
+            self.assertEqual(archive.exception.failure_site, "artifact_enqueue")
+
+            publisher.prepare(buffer, phase="timeline")
+            with self.assertRaisesRegex(
+                ContractError, "already exists"
+            ) as real_archive:
+                publisher.prepare(buffer, phase="timeline")
+            self.assertEqual(
+                real_archive.exception.failure_site, "artifact_enqueue"
+            )
+            self.assertEqual(context.socket_value.sent, [])
+            publisher.close()
+
+    def test_cloned_preparation_cannot_send_unarchived_replacement_bytes(self) -> None:
+        fake_zmq = SimpleNamespace(
+            PUB=1,
+            CONFLATE=2,
+            LINGER=3,
+            LAST_ENDPOINT=4,
+        )
+        context = _PublisherContext()
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = RunBundle.create(Path(directory), "stage-a", "clone")
+            with mock.patch.dict(sys.modules, {"zmq": fake_zmq}):
+                publisher = PosePublisher(
+                    "tcp://127.0.0.1:*", bundle=bundle, context=context
+                )
+            publication = publisher.prepare(
+                make_buffer(1, 0), phase="readiness", attempt=1
+            )
+            forged = replace(publication, message=publication.message + b"forged")
+
+            with self.assertRaisesRegex(ContractError, "exact prepared object"):
+                publisher.send_prepared(forged)
+            self.assertEqual(context.socket_value.sent, [])
+            publisher.send_prepared(publication)
+            self.assertEqual(context.socket_value.sent, [publication.message])
+            publisher.close()
+
+    def test_prepare_archives_before_one_local_send_and_never_calls_it_an_ack(self) -> None:
+        fake_zmq = SimpleNamespace(
+            PUB=1,
+            CONFLATE=2,
+            LINGER=3,
+            LAST_ENDPOINT=4,
+        )
+        context = _PublisherContext()
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = RunBundle.create(Path(directory), "stage-a", "phased")
+            with mock.patch.dict(sys.modules, {"zmq": fake_zmq}):
+                publisher = PosePublisher(
+                    "tcp://127.0.0.1:*", bundle=bundle, context=context
+                )
+            buffer = make_buffer(1, 0)
+            publication = publisher.prepare(
+                buffer, phase="readiness", attempt=1
+            )
+
+            self.assertEqual(context.socket_value.sent, [])
+            self.assertEqual(publication.message, encode_pose_v1(buffer))
+            archived = bundle.path / publication.archive["message_path"]
+            self.assertEqual(archived.read_bytes(), publication.message)
+
+            result = publisher.send_prepared(publication)
+            self.assertEqual(context.socket_value.sent, [publication.message])
+            self.assertTrue(result["local_send_completed"])
+            self.assertNotIn("ack", repr(result).lower())
+            with self.assertRaisesRegex(ContractError, "already sent"):
+                publisher.send_prepared(publication)
+
+            publication_two = publisher.prepare(
+                buffer, phase="readiness", attempt=2
+            )
+            publisher.send_prepared(publication_two)
+            self.assertEqual(len(context.socket_value.sent), 2)
+            publisher.close()
 
 
 class DependencyContractTests(unittest.TestCase):

@@ -6,11 +6,22 @@ import os
 from pathlib import Path
 import stat
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
 from mm_sonic.artifacts import RunBundle, verify_run_inventory
+from mm_sonic.coordinator import (
+    AbortDecisionRecord,
+    AcceptedChunk,
+    DeliveryAudit,
+    PreflightResult,
+    RejectionRecord,
+    TerminalVerdict,
+    TimingRecord,
+)
 from mm_sonic.joints import ContractError
+from mm_sonic.process import AdvanceResult
 
 
 def scene_registration_metadata() -> dict[str, object]:
@@ -209,6 +220,150 @@ class RunBundleLifecycleTests(unittest.TestCase):
             self.assertEqual(len(decoded), expected_counts[filename])
             self.assertEqual(decoded[-1]["record"], record)
             self.assertEqual(decoded[-1]["sequence"], sum(expected_counts.values()))
+
+    def test_coordinator_records_are_structured_and_terminal_verdict_is_exclusive(self):
+        readiness = PreflightResult(
+            session_id="s0",
+            readiness_log_start_offset=0,
+            scoring_log_offset=321,
+            readiness_attempts=2,
+            official_log_path="/run/target.csv",
+            log_device=11,
+            log_inode=22,
+            expected_row_sha256="0" * 64,
+        )
+        self.bundle.write_readiness(readiness)
+        source = SimpleNamespace(
+            session_id="s0",
+            candidate_id="s0:candidate:000000",
+            predecessor_id=None,
+            timestamps_s=[index / 25.0 for index in range(11)],
+        )
+        target = SimpleNamespace(
+            accepted_chunk_id="s0:target:1-20",
+            source_candidate_id=source.candidate_id,
+            frame_index=list(range(1, 21)),
+            hashes={
+                "canonical_target_sha256": "1" * 64,
+                "diagnostic_sha256": "2" * 64,
+            },
+        )
+        self.bundle.write_prepared(source, target)
+        rejection = RejectionRecord(
+            candidate_id=source.candidate_id,
+            failure_site="source_validation",
+            error_type="ContractError",
+            error_message="bad source",
+            mm_alive=True,
+            abort_required=True,
+            abort_sent=False,
+            timeline_abort_required=False,
+        )
+        self.bundle.write_rejection(rejection)
+        self.bundle.write_abort_decision(
+            AbortDecisionRecord(
+                candidate_id=source.candidate_id,
+                mm_abort_required=True,
+                mm_abort_sent=True,
+                timeline_abort_required=False,
+                timeline_aborted=False,
+                errors=(),
+            )
+        )
+        timing = TimingRecord(
+            candidate_id=source.candidate_id,
+            durations_ns={
+                "mm_generation": 11,
+                "projection_validation": 13,
+                "resampling": None,
+                "artifact_enqueue": None,
+                "publication": None,
+                "simulation_advance": None,
+            },
+            failed_stage="source_validation",
+            wall_started_ns=100,
+            wall_finished_ns=200,
+        )
+        self.bundle.write_timing(timing)
+
+        accepted_target = SimpleNamespace(
+            accepted_chunk_id="s0:target:1-20",
+            source_candidate_id=source.candidate_id,
+            buffer=SimpleNamespace(frame_index=list(range(1, 21))),
+            hashes=target.hashes,
+        )
+        accepted = AcceptedChunk(
+            target=accepted_target,
+            advance=AdvanceResult(80, 0.0, 0.4, 20, 80),
+            timings_ns={
+                "mm_generation": 1,
+                "projection_validation": 2,
+                "resampling": 3,
+                "artifact_enqueue": 4,
+                "publication": 5,
+                "simulation_advance": 6,
+            },
+            wall_started_ns=300,
+            wall_finished_ns=400,
+        )
+        self.bundle.write_accepted(accepted)
+
+        verdict = TerminalVerdict(
+            status="failed",
+            failure_phase="pre_commit",
+            failure_site="source_validation",
+            error_type="ContractError",
+            error_message="bad source",
+            accepted_chunks=0,
+            simulation_paused=True,
+            delivery_audit_required=True,
+            delivery_audit_completed=False,
+            delivery_audit=None,
+        )
+        self.bundle.write_terminal_verdict(verdict)
+
+        candidate = json.loads(
+            (self.bundle.path / "candidates.jsonl").read_text("ascii").splitlines()[0]
+        )["record"]
+        self.assertEqual(candidate["candidate_id"], source.candidate_id)
+        self.assertEqual(candidate["target_frames"], [1, 20])
+        persisted_readiness = json.loads(
+            (self.bundle.path / "readiness.jsonl").read_text("ascii").splitlines()[0]
+        )["record"]
+        self.assertEqual(persisted_readiness["session_id"], "s0")
+        self.assertEqual(persisted_readiness["scoring_log_offset"], 321)
+        self.assertEqual(persisted_readiness["log_identity"], [11, 22])
+        abort = json.loads(
+            (self.bundle.path / "aborts.jsonl").read_text("ascii").splitlines()[0]
+        )["record"]
+        self.assertTrue(abort["mm_abort_sent"])
+        terminal_path = self.bundle.path / "terminal-verdict.json"
+        terminal = json.loads(terminal_path.read_text("ascii"))
+        self.assertEqual(terminal["schema"], "mm-sonic-terminal-verdict/v1")
+        self.assertTrue(terminal["delivery_audit_required"])
+        self.assertFalse(terminal["delivery_audit_completed"])
+        self.assertNotIn("ack", terminal_path.read_text("ascii").lower())
+        with self.assertRaisesRegex(ContractError, "already exists"):
+            self.bundle.write_terminal_verdict(verdict)
+
+    def test_prepared_record_rejects_nonintegral_and_noncontiguous_frames(self):
+        source = SimpleNamespace(
+            session_id="s0",
+            candidate_id="c0",
+            predecessor_id=None,
+            timestamps_s=[index / 25.0 for index in range(11)],
+        )
+        for frames in ([1.5, 2.5], [1, 3], [2, 1], [True, 1]):
+            target = SimpleNamespace(
+                accepted_chunk_id="target",
+                source_candidate_id="c0",
+                frame_index=frames,
+                hashes={},
+            )
+            with self.subTest(frames=frames):
+                with self.assertRaisesRegex(ContractError, "frame indices"):
+                    self.bundle.write_prepared(source, target)
+        self.assertFalse((self.bundle.path / "candidates.jsonl").exists())
 
     def test_incremental_records_reject_hard_linked_external_targets(self):
         victim = self.root / "external-candidates.jsonl"

@@ -24,6 +24,9 @@ from typing import Callable, Mapping, Sequence
 
 import numpy as np
 
+from .joints import ContractError
+from .transform import mujoco_to_holden_quaternions, mujoco_to_holden_vectors
+
 
 _PROTOCOL_VERSION = 1
 _MANAGED_GEAR_FLAGS = frozenset(
@@ -57,6 +60,20 @@ class ChildProcessDied(ProcessError):
 
 class OperatorCancelled(ProcessError):
     """The operator requested cancellation."""
+
+
+def _at_failure_site(error: BaseException, site: str) -> BaseException:
+    """Preserve an exception type while attaching its coordinator phase."""
+
+    if getattr(error, "failure_site", None) is None:
+        try:
+            error.failure_site = site
+        except BaseException:
+            tagged = ProcessError(str(error))
+            tagged.failure_site = site
+            tagged.__cause__ = error
+            return tagged
+    return error
 
 
 def _canonical_run_root(value: str | Path) -> Path:
@@ -426,6 +443,497 @@ def _safe_kill_created_group(
     except ProcessLookupError:
         return False
     return True
+
+
+class _RemoteMMError(ProcessProtocolError):
+    """A valid MM error response, which proves no successful candidate reply."""
+
+
+class MMChunkClient:
+    """Strict persistent MM JSONL client with unbounded generation waits.
+
+    Candidate ownership becomes conservative after the first request byte is
+    written.  A zero-byte write failure is the only request failure that proves
+    the candidate cannot be outstanding; partial/full writes and malformed or
+    lost responses retain the coordinator-owned candidate ID for abort.
+    """
+
+    def __init__(
+        self,
+        *,
+        run_root: str | Path,
+        command: Sequence[str],
+        stdout_archive: str | Path,
+        stderr_archive: str | Path,
+        cancelled: Callable[[], bool] | None = None,
+        poll_interval_s: float = 0.05,
+        stop_grace_s: float = 1.0,
+        term_grace_s: float = 1.0,
+        kill_grace_s: float = 1.0,
+        env: Mapping[str, str] | None = None,
+        cwd: str | Path | None = None,
+    ) -> None:
+        self.run_root = _canonical_run_root(run_root)
+        if not command or any(type(item) is not str or not item for item in command):
+            raise ValueError("MM command must contain nonempty strings")
+        if poll_interval_s <= 0.0:
+            raise ValueError("MM poll_interval_s must be positive")
+        self.command = tuple(command)
+        self.stdout_archive = _validate_confined_output_path(
+            self.run_root, stdout_archive, "MM stdout archive"
+        )
+        self.stderr_archive = _validate_confined_output_path(
+            self.run_root, stderr_archive, "MM stderr archive"
+        )
+        if self.stdout_archive == self.stderr_archive:
+            raise ProcessError("MM archive output paths must be distinct")
+        self._cancelled = cancelled
+        self._poll_interval_s = poll_interval_s
+        self._stop_grace_s = max(0.0, stop_grace_s)
+        self._term_grace_s = max(0.0, term_grace_s)
+        self._kill_grace_s = max(0.0, kill_grace_s)
+        self._request_number = 0
+        self._read_buffer = bytearray()
+        self._closed = False
+        self._session_id: str | None = None
+        self.outstanding_candidate_id: str | None = None
+        self.active_candidate_id: str | None = None
+        self._process: subprocess.Popen[bytes] | None = None
+        self._pgid: int | None = None
+        self._stdout_file = _open_exclusive_binary_output(
+            self.run_root, self.stdout_archive, "MM stdout archive"
+        )
+        try:
+            self._stderr_file = _open_exclusive_binary_output(
+                self.run_root, self.stderr_archive, "MM stderr archive"
+            )
+        except BaseException:
+            self._stdout_file.close()
+            raise
+        try:
+            self._process = subprocess.Popen(
+                self.command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=self._stderr_file,
+                cwd=None if cwd is None else str(Path(cwd)),
+                env=None if env is None else dict(env),
+                start_new_session=True,
+                bufsize=0,
+            )
+            self._pgid = _verify_new_process_group(self._process)
+        except BaseException as error:
+            cleanup_ok = True
+            if self._process is not None:
+                cleanup_ok = _cleanup_expected_new_group(
+                    self._process,
+                    term_grace_s=self._term_grace_s,
+                    kill_grace_s=self._kill_grace_s,
+                )
+                for stream in (self._process.stdin, self._process.stdout):
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except OSError:
+                            pass
+            self._stdout_file.close()
+            self._stderr_file.close()
+            if not cleanup_ok:
+                raise ProcessError(
+                    f"unverified MM group {self._process.pid} survived cleanup"
+                ) from error
+            raise
+
+    @property
+    def pid(self) -> int:
+        assert self._process is not None
+        return self._process.pid
+
+    @property
+    def pgid(self) -> int:
+        assert self._pgid is not None
+        return self._pgid
+
+    @property
+    def returncode(self) -> int | None:
+        assert self._process is not None
+        return self._process.poll()
+
+    def _stderr_tail(self) -> str:
+        self._stderr_file.flush()
+        try:
+            raw = self.stderr_archive.read_bytes()[-8192:]
+        except OSError:
+            return ""
+        return raw.decode("utf-8", errors="replace").strip()
+
+    def _death_error(self) -> ChildProcessDied:
+        assert self._process is not None
+        returncode: int | str | None = self._process.poll()
+        if returncode is None:
+            try:
+                returncode = self._process.wait(timeout=0.05)
+            except subprocess.TimeoutExpired:
+                returncode = "unknown"
+        detail = self._stderr_tail()
+        suffix = f": {detail}" if detail else ""
+        return ChildProcessDied(
+            f"MM chunk server {self.pid} exited {returncode}{suffix}"
+        )
+
+    def require_alive(self) -> None:
+        if self._closed:
+            raise ChildProcessDied("MM chunk client is closed")
+        assert self._process is not None
+        if self._process.poll() is not None:
+            raise self._death_error()
+
+    def _next_request_id(self) -> str:
+        value = f"m{self._request_number}"
+        self._request_number += 1
+        return value
+
+    def _write_request(
+        self,
+        request: Mapping[str, object],
+        *,
+        candidate_id: str | None = None,
+    ) -> None:
+        self.require_alive()
+        assert self._process is not None and self._process.stdin is not None
+        try:
+            payload = json.dumps(
+                request,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8") + b"\n"
+        except (TypeError, ValueError) as error:
+            raise ProcessProtocolError(f"invalid MM request: {error}") from error
+        view = memoryview(payload)
+        written_total = 0
+        fd = self._process.stdin.fileno()
+        try:
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("zero-byte MM request write")
+                written_total += written
+                if candidate_id is not None and written_total > 0:
+                    self.outstanding_candidate_id = candidate_id
+                view = view[written:]
+        except (BrokenPipeError, OSError) as error:
+            if self._process.poll() is not None:
+                raise self._death_error() from error
+            qualifier = "before first byte" if written_total == 0 else "after partial write"
+            raise ProcessError(f"failed to write MM request {qualifier}: {error}") from error
+
+    def _read_line(self) -> str:
+        assert self._process is not None and self._process.stdout is not None
+        fd = self._process.stdout.fileno()
+        while True:
+            newline = self._read_buffer.find(b"\n")
+            if newline >= 0:
+                line = bytes(self._read_buffer[: newline + 1])
+                del self._read_buffer[: newline + 1]
+                self._stdout_file.write(line)
+                self._stdout_file.flush()
+                try:
+                    return line[:-1].decode("utf-8")
+                except UnicodeDecodeError as error:
+                    raise ProcessProtocolError(
+                        f"MM response is not valid UTF-8: {error}"
+                    ) from error
+            if _cancelled(self._cancelled):
+                raise OperatorCancelled("operator cancelled MM request")
+            ready, _, _ = select.select([fd], [], [], self._poll_interval_s)
+            if ready:
+                chunk = os.read(fd, 65536)
+                if chunk:
+                    self._read_buffer.extend(chunk)
+                    continue
+                if self._read_buffer:
+                    partial = bytes(self._read_buffer)
+                    self._stdout_file.write(partial)
+                    self._stdout_file.flush()
+                    self._read_buffer.clear()
+                    raise ProcessProtocolError(
+                        "MM stdout ended with an unterminated JSONL response"
+                    )
+            if self._process.poll() is not None:
+                raise self._death_error()
+
+    def _request(
+        self,
+        op: str,
+        *,
+        candidate_write_id: str | None = None,
+        **fields: object,
+    ) -> dict[str, object]:
+        request_id = self._next_request_id()
+        request = {"v": _PROTOCOL_VERSION, "op": op, "request_id": request_id}
+        request.update(fields)
+        self._write_request(request, candidate_id=candidate_write_id)
+        response = _loads_exact(self._read_line())
+        if type(response) is not dict:
+            raise ProcessProtocolError("MM response must be an object")
+        if response.get("ok") is True:
+            envelope = _exact_object(
+                response,
+                {"v", "ok", "op", "request_id", "data"},
+                "MM success response",
+            )
+            data = envelope["data"]
+        elif response.get("ok") is False:
+            envelope = _exact_object(
+                response,
+                {"v", "ok", "op", "request_id", "error"},
+                "MM error response",
+            )
+            remote = _exact_object(
+                envelope["error"], {"code", "message"}, "MM error response.error"
+            )
+            if type(remote["code"]) is not str or type(remote["message"]) is not str:
+                raise ProcessProtocolError("MM error code and message must be strings")
+            data = None
+        else:
+            raise ProcessProtocolError("MM response ok must be a boolean")
+        if envelope["v"] != _PROTOCOL_VERSION or type(envelope["v"]) is not int:
+            raise ProcessProtocolError("MM response version must equal 1")
+        if envelope["op"] != op or type(envelope["op"]) is not str:
+            raise ProcessProtocolError("MM response op mismatch")
+        if envelope["request_id"] != request_id:
+            raise ProcessProtocolError("MM response request_id mismatch")
+        if envelope["ok"] is False:
+            assert type(remote) is dict
+            raise _RemoteMMError(f"{remote['code']}: {remote['message']}")
+        if type(data) is not dict:
+            raise ProcessProtocolError("MM success response data must be an object")
+        return data
+
+    @staticmethod
+    def _identifier(value: object, label: str) -> str:
+        if type(value) is not str or not value or "\x00" in value:
+            raise ValueError(f"{label} must be a nonempty string")
+        return value
+
+    def hello(self) -> dict[str, object]:
+        data = self._request("hello")
+        if data.get("protocol_version") != 1 or type(data.get("protocol_version")) is not int:
+            raise ProcessProtocolError("unexpected MM protocol version")
+        return data
+
+    def reset(self, config: object, *, session_id: str) -> dict[str, object]:
+        if self.outstanding_candidate_id is not None:
+            raise ProcessError("cannot reset MM with an outstanding candidate")
+        session = self._identifier(session_id, "session_id")
+        scene_id = self._identifier(getattr(config, "scene_id", None), "scene_id")
+        route_id = self._identifier(getattr(config, "route_id", None), "route_id")
+        terrain_weight = getattr(config, "terrain_weight", None)
+        if type(terrain_weight) not in (int, float) or not math.isfinite(
+            float(terrain_weight)
+        ):
+            raise ValueError("terrain_weight must be finite")
+        data = self._request(
+            "reset",
+            session_id=session,
+            scene_id=scene_id,
+            route_id=route_id,
+            terrain_weight=float(terrain_weight),
+        )
+        source = _exact_object(
+            data,
+            {"session_id", "active_candidate_id", "scene", "initial_boundary"},
+            "MM reset data",
+        )
+        if source["session_id"] != session or source["active_candidate_id"] is not None:
+            raise ProcessProtocolError("MM reset state identity mismatch")
+        if type(source["scene"]) is not dict or type(source["initial_boundary"]) is not dict:
+            raise ProcessProtocolError("MM reset data contains invalid objects")
+        self._session_id = session
+        self.active_candidate_id = None
+        self.outstanding_candidate_id = None
+        return source
+
+    def generate(
+        self,
+        command: object,
+        *,
+        session_id: str,
+        candidate_id: str,
+        predecessor_id: str | None,
+        source_intervals: int,
+    ) -> dict[str, object]:
+        if self.outstanding_candidate_id is not None:
+            raise ProcessError("MM already has an outstanding candidate")
+        session = self._identifier(session_id, "session_id")
+        candidate = self._identifier(candidate_id, "candidate_id")
+        if session != self._session_id:
+            raise ProcessError("MM generate session does not match reset")
+        if predecessor_id is not None:
+            predecessor_id = self._identifier(predecessor_id, "predecessor_id")
+        if predecessor_id != self.active_candidate_id:
+            raise ProcessError("MM generate predecessor does not match active state")
+        if type(source_intervals) is not int or source_intervals != 10:
+            raise ValueError("MM source_intervals must equal 10")
+        try:
+            velocity = mujoco_to_holden_vectors(
+                getattr(command, "requested_velocity_mujoco")
+            )
+            heading = mujoco_to_holden_quaternions(
+                getattr(command, "desired_heading_mujoco_wxyz")
+            )
+        except (AttributeError, ContractError) as error:
+            raise ValueError("MM command has an invalid target-basis value") from error
+        try:
+            data = self._request(
+                "generate",
+                candidate_write_id=candidate,
+                session_id=session,
+                candidate_id=candidate,
+                predecessor_id=predecessor_id,
+                source_intervals=source_intervals,
+                requested_velocity_holden=velocity.tolist(),
+                desired_heading_holden_wxyz=heading.tolist(),
+            )
+        except _RemoteMMError:
+            # A valid server error response proves it did not publish a
+            # successful candidate for this request.
+            self.outstanding_candidate_id = None
+            raise
+        if data.get("session_id") != session or data.get("candidate_id") != candidate:
+            raise ProcessProtocolError("MM generated candidate identity mismatch")
+        if data.get("predecessor_id") != predecessor_id:
+            raise ProcessProtocolError("MM generated predecessor identity mismatch")
+        return data
+
+    def commit(self, candidate_id: str) -> None:
+        candidate = self._identifier(candidate_id, "candidate_id")
+        if candidate != self.outstanding_candidate_id or self._session_id is None:
+            raise ProcessError("MM commit candidate does not match outstanding state")
+        data = self._request(
+            "commit", session_id=self._session_id, candidate_id=candidate
+        )
+        source = _exact_object(
+            data,
+            {"session_id", "candidate_id", "active_candidate_id"},
+            "MM commit data",
+        )
+        if (
+            source["session_id"] != self._session_id
+            or source["candidate_id"] != candidate
+            or source["active_candidate_id"] != candidate
+        ):
+            raise ProcessProtocolError("MM commit identity mismatch")
+        self.active_candidate_id = candidate
+        self.outstanding_candidate_id = None
+
+    def abort(self, candidate_id: str) -> None:
+        candidate = self._identifier(candidate_id, "candidate_id")
+        if candidate != self.outstanding_candidate_id or self._session_id is None:
+            raise ProcessError("MM abort candidate does not match outstanding state")
+        data = self._request(
+            "abort", session_id=self._session_id, candidate_id=candidate
+        )
+        source = _exact_object(
+            data,
+            {"session_id", "candidate_id", "active_candidate_id"},
+            "MM abort data",
+        )
+        if (
+            source["session_id"] != self._session_id
+            or source["candidate_id"] != candidate
+            or source["active_candidate_id"] != self.active_candidate_id
+        ):
+            raise ProcessProtocolError("MM abort identity mismatch")
+        self.outstanding_candidate_id = None
+
+    def _drain_stdout(self, deadline: float) -> bytes:
+        assert self._process is not None and self._process.stdout is not None
+        residual = bytearray()
+        if self._read_buffer:
+            residual.extend(self._read_buffer)
+            self._stdout_file.write(self._read_buffer)
+            self._stdout_file.flush()
+            self._read_buffer.clear()
+        fd = self._process.stdout.fileno()
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select(
+                [fd], [], [], min(self._poll_interval_s, max(0.0, deadline - time.monotonic()))
+            )
+            if ready:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                residual.extend(chunk)
+                self._stdout_file.write(chunk)
+                self._stdout_file.flush()
+            elif self._process.poll() is not None:
+                continue
+        return bytes(residual)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        process = self._process
+        assert process is not None and self._pgid is not None
+        close_error: BaseException | None = None
+        try:
+            if process.poll() is None:
+                try:
+                    data = self._request("close")
+                    if data != {}:
+                        raise ProcessProtocolError(
+                            "MM close data must be the protocol v1 empty object"
+                        )
+                except BaseException as error:
+                    close_error = error
+                deadline = time.monotonic() + self._stop_grace_s
+                try:
+                    residual = self._drain_stdout(deadline)
+                    if residual and close_error is None:
+                        close_error = ProcessProtocolError(
+                            "residual stdout followed the MM close response"
+                        )
+                except BaseException as error:
+                    if close_error is None:
+                        close_error = error
+            if _linux_group_states(self._pgid):
+                _safe_kill_created_group(process, self._pgid, signal.SIGTERM)
+                deadline = time.monotonic() + self._term_grace_s
+                while _linux_group_states(self._pgid) and time.monotonic() < deadline:
+                    process.poll()
+                    time.sleep(0.01)
+            if _linux_group_states(self._pgid):
+                _safe_kill_created_group(process, self._pgid, signal.SIGKILL)
+                deadline = time.monotonic() + self._kill_grace_s
+                while _linux_group_states(self._pgid) and time.monotonic() < deadline:
+                    process.poll()
+                    time.sleep(0.01)
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=max(0.1, self._kill_grace_s))
+                except subprocess.TimeoutExpired:
+                    pass
+        finally:
+            self._closed = True
+            for stream in (process.stdin, process.stdout):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+            self._stdout_file.close()
+            self._stderr_file.close()
+        if _linux_group_states(self._pgid):
+            raise ProcessError(f"MM process group {self._pgid} survived cleanup") from close_error
+        if close_error is not None and not isinstance(close_error, ChildProcessDied):
+            raise close_error
+
+    def __enter__(self) -> "MMChunkClient":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
 
 
 class GatedSimulatorClient:
@@ -1579,15 +2087,33 @@ class SimulationPolicyGate:
     def release_steps(self, steps: int) -> AdvanceResult:
         _positive_integer(steps, "steps")
         self.require_paused()
-        self._require_bound_sim_dt()
-        self.gear.require_alive()
-        self.simulator.require_alive()
+        try:
+            self._require_bound_sim_dt()
+        except BaseException as error:
+            raise _at_failure_site(error, "simulator_advance")
+        try:
+            self.gear.require_alive()
+        except BaseException as error:
+            raise _at_failure_site(error, "process_resume")
+        try:
+            self.simulator.require_alive()
+        except BaseException as error:
+            raise _at_failure_site(error, "simulator_advance")
         self._paused = False
         result: AdvanceResult | None = None
         operation_error: BaseException | None = None
         try:
-            self.gear.continue_group()
-            result = self.simulator.advance(steps)
+            try:
+                self.gear.continue_group()
+            except BaseException as error:
+                operation_error = _at_failure_site(error, "process_resume")
+            if operation_error is None:
+                try:
+                    result = self.simulator.advance(steps)
+                except BaseException as error:
+                    operation_error = _at_failure_site(
+                        error, "simulator_advance"
+                    )
         except BaseException as error:
             operation_error = error
         stop_error: BaseException | None = None
@@ -1603,17 +2129,20 @@ class SimulationPolicyGate:
         if stop_error is not None:
             raise stop_error
         assert result is not None
-        if result.steps != steps:
-            raise ProcessProtocolError(
-                f"simulator reply reports {result.steps} steps, expected {steps}"
-            )
-        expected = steps * self.sim_dt
-        actual = result.sim_time_end_s - result.sim_time_start_s
-        if not math.isfinite(actual) or abs(actual - expected) > self.tolerance:
-            raise ProcessProtocolError(
-                "MuJoCo time delta mismatch: "
-                f"expected {expected:.17g}, found {actual:.17g}"
-            )
+        try:
+            if result.steps != steps:
+                raise ProcessProtocolError(
+                    f"simulator reply reports {result.steps} steps, expected {steps}"
+                )
+            expected = steps * self.sim_dt
+            actual = result.sim_time_end_s - result.sim_time_start_s
+            if not math.isfinite(actual) or abs(actual - expected) > self.tolerance:
+                raise ProcessProtocolError(
+                    "MuJoCo time delta mismatch: "
+                    f"expected {expected:.17g}, found {actual:.17g}"
+                )
+        except BaseException as error:
+            raise _at_failure_site(error, "simulator_advance")
         return result
 
     def advance(self, duration_s: float) -> AdvanceResult:

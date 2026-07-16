@@ -1250,8 +1250,9 @@ class SimulationPolicyGateTests(TemporaryScriptCase):
         simulator = FakeSimulatorClient(delta_error=2e-12)
         gate = SimulationPolicyGate(self.gear, simulator)
         gate.pause()
-        with self.assertRaisesRegex(ProcessProtocolError, "MuJoCo time"):
+        with self.assertRaisesRegex(ProcessProtocolError, "MuJoCo time") as raised:
             gate.advance(0.4)
+        self.assertEqual(raised.exception.failure_site, "simulator_advance")
         self.assertTrue(gate.is_paused)
         self.assertTrue(self.gear.group_is_stopped())
 
@@ -1287,10 +1288,26 @@ class SimulationPolicyGateTests(TemporaryScriptCase):
             raise ProcessError("synthetic CONT verification failure")
 
         self.gear.continue_group = resume_then_fail
-        with self.assertRaisesRegex(ProcessError, "CONT verification"):
+        with self.assertRaisesRegex(ProcessError, "CONT verification") as raised:
             gate.release_steps(80)
+        self.assertEqual(raised.exception.failure_site, "process_resume")
         self.assertTrue(self.gear.group_is_stopped())
         self.assertEqual(simulator.steps, [])
+
+    def test_simulator_request_failure_is_tagged_after_verified_resume(self):
+        class FailingSimulator(FakeSimulatorClient):
+            def advance(self, steps):
+                self.steps.append(steps)
+                raise ProcessProtocolError("synthetic advance failure")
+
+        simulator = FailingSimulator()
+        gate = SimulationPolicyGate(self.gear, simulator)
+        gate.pause()
+        with self.assertRaisesRegex(ProcessProtocolError, "advance failure") as raised:
+            gate.release_steps(80)
+        self.assertEqual(raised.exception.failure_site, "simulator_advance")
+        self.assertTrue(gate.is_paused)
+        self.assertTrue(self.gear.group_is_stopped())
 
     def test_gate_binds_and_rechecks_simulator_reported_sim_dt(self):
         simulator = FakeSimulatorClient(sim_dt=0.01)
