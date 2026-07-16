@@ -110,7 +110,17 @@ static int g1_active_range(const database& db, const int frame)
     return -1;
 }
 
-void inertialize_root_adjust(
+#if defined(__GNUC__) && !defined(__clang__)
+#define G1_RUNTIME_COMPILER_BOUNDARY __attribute__((noinline, noclone))
+#elif defined(__clang__)
+#define G1_RUNTIME_COMPILER_BOUNDARY __attribute__((noinline))
+#elif defined(_MSC_VER)
+#define G1_RUNTIME_COMPILER_BOUNDARY __declspec(noinline)
+#else
+#define G1_RUNTIME_COMPILER_BOUNDARY
+#endif
+
+inline G1_RUNTIME_COMPILER_BOUNDARY void inertialize_root_adjust(
     vec3& offset_position,
     vec3& transition_src_position,
     quat& transition_src_rotation,
@@ -138,7 +148,7 @@ void inertialize_root_adjust(
         rotation_difference, transition_dst_rotation);
 }
 
-void inertialize_pose_reset(
+inline void inertialize_pose_reset(
     slice1d<vec3> bone_offset_positions,
     slice1d<vec3> bone_offset_velocities,
     slice1d<quat> bone_offset_rotations,
@@ -160,7 +170,7 @@ void inertialize_pose_reset(
     transition_dst_rotation = quat();
 }
 
-void inertialize_pose_transition(
+inline G1_RUNTIME_COMPILER_BOUNDARY void inertialize_pose_transition(
     slice1d<vec3> bone_offset_positions,
     slice1d<vec3> bone_offset_velocities,
     slice1d<quat> bone_offset_rotations,
@@ -227,7 +237,7 @@ void inertialize_pose_transition(
     }
 }
 
-void inertialize_pose_update(
+inline G1_RUNTIME_COMPILER_BOUNDARY void inertialize_pose_update(
     slice1d<vec3> bone_positions,
     slice1d<vec3> bone_velocities,
     slice1d<quat> bone_rotations,
@@ -306,7 +316,7 @@ void inertialize_pose_update(
     }
 }
 
-void query_copy_denormalized_feature(
+inline void query_copy_denormalized_feature(
     slice1d<float> query,
     int& offset,
     const int size,
@@ -322,7 +332,8 @@ void query_copy_denormalized_feature(
     offset += size;
 }
 
-void query_compute_trajectory_position_feature(
+inline G1_RUNTIME_COMPILER_BOUNDARY void
+query_compute_trajectory_position_feature(
     slice1d<float> query,
     int& offset,
     const vec3 root_position,
@@ -344,7 +355,8 @@ void query_compute_trajectory_position_feature(
     offset += 6;
 }
 
-void query_compute_trajectory_direction_feature(
+inline G1_RUNTIME_COMPILER_BOUNDARY void
+query_compute_trajectory_direction_feature(
     slice1d<float> query,
     int& offset,
     const quat root_rotation,
@@ -368,7 +380,7 @@ void query_compute_trajectory_direction_feature(
     offset += 6;
 }
 
-void simulation_positions_update(
+inline G1_RUNTIME_COMPILER_BOUNDARY void simulation_positions_update(
     vec3& position,
     vec3& velocity,
     vec3& acceleration,
@@ -387,7 +399,7 @@ void simulation_positions_update(
     acceleration = eydt*(acceleration - j1*y*dt);
 }
 
-void simulation_rotations_update(
+inline void simulation_rotations_update(
     quat& rotation,
     vec3& angular_velocity,
     const quat desired_rotation,
@@ -401,7 +413,7 @@ void simulation_rotations_update(
         halflife, dt);
 }
 
-void trajectory_positions_predict(
+inline G1_RUNTIME_COMPILER_BOUNDARY void trajectory_positions_predict(
     slice1d<vec3> positions,
     slice1d<vec3> velocities,
     slice1d<vec3> accelerations,
@@ -430,7 +442,7 @@ void trajectory_positions_predict(
     }
 }
 
-void trajectory_rotations_predict(
+inline G1_RUNTIME_COMPILER_BOUNDARY void trajectory_rotations_predict(
     slice1d<quat> rotations,
     slice1d<vec3> angular_velocities,
     const quat rotation,
@@ -452,7 +464,7 @@ void trajectory_rotations_predict(
     }
 }
 
-quat adjust_character_rotation(
+inline G1_RUNTIME_COMPILER_BOUNDARY quat adjust_character_rotation(
     const quat character_rotation,
     const quat simulation_rotation,
     const float halflife,
@@ -467,7 +479,8 @@ quat adjust_character_rotation(
     return quat_mul(adjustment_rotation, character_rotation);
 }
 
-quat adjust_character_rotation_by_velocity(
+inline G1_RUNTIME_COMPILER_BOUNDARY quat
+adjust_character_rotation_by_velocity(
     const quat character_rotation,
     const vec3 character_angular_velocity,
     const quat simulation_rotation,
@@ -490,7 +503,7 @@ quat adjust_character_rotation_by_velocity(
     return quat_mul(adjustment_rotation, character_rotation);
 }
 
-quat clamp_character_rotation(
+inline G1_RUNTIME_COMPILER_BOUNDARY quat clamp_character_rotation(
     const quat character_rotation,
     const quat simulation_rotation,
     const float max_angle)
@@ -513,6 +526,8 @@ quat clamp_character_rotation(
         return character_rotation;
     }
 }
+
+#undef G1_RUNTIME_COMPILER_BOUNDARY
 
 static inline bool g1_runtime_config_is_valid(
     const g1_runtime_config& config)
