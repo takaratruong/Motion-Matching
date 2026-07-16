@@ -253,6 +253,137 @@ WALKABILITY_REASONS = {
 }
 LANDING_PATCH_RESIDUAL_LIMIT = struct.unpack(
     ">f", bytes.fromhex("3ba3d70a"))[0]
+CONTACT_RESIDUAL_LIMIT = LANDING_PATCH_RESIDUAL_LIMIT
+GATE_E_ROUTES = frozenset({
+    ("grail-curb-low", "curb-forward"),
+    ("stairs-shallow", "ascent-landing-descent"),
+    ("stairs-standard", "ascent-landing-descent"),
+    ("stairs-unseen-variable", "ascent-landing-descent"),
+    ("ramp-05-up-down", "up-landing-down"),
+    ("ramp-10-up-down", "up-landing-down"),
+    ("cross-slope-05", "forward-cross-slope"),
+    ("cross-slope-10", "forward-cross-slope"),
+    ("mixed-multilevel", "full-course"),
+})
+GATE_E_STRESS_ROUTES = frozenset({
+    ("grail-curb-default", "curb-forward"),
+    ("grail-curb-medium", "curb-forward"),
+    ("grail-curb-high", "curb-forward"),
+    ("ramp-15-stress", "up-landing-down"),
+})
+GATE_D_IK_ROUTES = frozenset({
+    ("blocked-course", "wall-safe-stop"),
+    ("blocked-course", "ramp-safe-stop"),
+})
+GATE_E_STRESS_REJECTION_SIGNATURES = frozenset({
+    ("footprint", "footprint-blocked", 1, 0, 0),
+    ("footprint", "footprint-outside-domain", 0, 0, 0),
+    ("footprint", "footprint-budget-exceeded", 0, 0, 0),
+    ("landing-patch", "landing-patch-unavailable", 1, 1, 0),
+    ("ik-candidate", "target-unreachable", 1, 1, 0),
+    ("ik-candidate", "no-swing-candidate", 1, 1, 0),
+    ("pose-certificate", "pose-clearance-rejected", 1, 0, 0),
+    ("pose-certificate", "pose-clearance-rejected", 1, 0, 1),
+})
+GATE_D_IK_REJECTION_SIGNATURE = (
+    "footprint", "footprint-blocked", 1, 0, 0)
+G1_SWING_LIFT_BITS = (
+    0x00000000, 0x3b03126f, 0x3b83126f, 0x3bc49ba6,
+    0x3c03126f, 0x3c23d70a, 0x3c449ba6, 0x3c656042,
+    0x3c83126f, 0x3c9374bc, 0x3ca3d70a, 0x3cb43958,
+    0x3cc49ba6, 0x3cd4fdf4, 0x3ce56042, 0x3cf5c28f,
+    0x3d03126f, 0x3d0b4396, 0x3d1374bc, 0x3d1ba5e3,
+    0x3d23d70a, 0x3d2c0831, 0x3d343958, 0x3d3c6a7f,
+    0x3d449ba6, 0x3d4ccccd, 0x3d54fdf4, 0x3d5d2f1b,
+    0x3d656042, 0x3d6d9168, 0x3d75c28f, 0x3d7df3b6,
+    0x3d83126f, 0x3d872b02, 0x3d8b4396, 0x3d8f5c29,
+    0x3d9374bc, 0x3d978d50, 0x3d9ba5e3, 0x3d9fbe77,
+    0x3da3d70a,
+)
+GATE_E_SWING_WORK_LIMITS = {
+    "point_queries": 0,
+    "cells_visited": 256,
+    "primitive_triangle_pairs": 512,
+    "face_patches": 4096,
+    "candidate_tests": 16384,
+    "subdivision_nodes": 8192,
+}
+GATE_E_PAIR_INVARIANT_GROUPS = (
+    ("matching", (
+        "frame", "fixed_dt", "scene_id", "mode", "route",
+        "query_bits_hex", "query_database_frame", "query_range",
+        "selected_database_frame", "database_frame", "range",
+        "source_range", "searched", "transitioned", "incumbent_cost",
+        "selected_cost", "selected_terrain_error",
+        "effective_terrain_weight",
+        "terrain0", "terrain1", "terrain2", "terrain3",
+        "terrain_point0_x", "terrain_point0_y", "terrain_point0_z",
+        "terrain_point1_x", "terrain_point1_y", "terrain_point1_z",
+        "terrain_point2_x", "terrain_point2_y", "terrain_point2_z",
+        "terrain_point3_x", "terrain_point3_y", "terrain_point3_z",
+        "source_name", "source_terrain", "source_index",
+        "continuation_cost",
+    )),
+    ("support", (
+        "raw_selected_hips_y", "inertialized_hips_y",
+        "hips_inertial_offset_y", "runtime_root_surface_height",
+        "runtime_left_toe_surface_height",
+        "runtime_right_toe_surface_height",
+        "adjustment_xz", "adjustment_y", "clamp_xz", "clamp_y",
+        "matching_enabled", "adjustment_enabled", "clamping_enabled",
+        "support_retargeting_enabled", "source_root_height",
+        "runtime_support_root_height", "source_left_toe_height",
+        "source_right_toe_height", "runtime_support_left_toe_height",
+        "runtime_support_right_toe_height", "support_root_delta",
+        "support_left_toe_delta", "support_right_toe_delta",
+        "support_height", "support_velocity", "support_source",
+        "airborne_frames", "left_contact", "right_contact",
+        "support_retargeted_hips_y",
+    )),
+    ("simulation", (
+        "simulation_x", "simulation_z", "walkability_class", "blocked",
+        "blocked_reason", "blocked_distance", "blocked_point_x",
+        "blocked_point_z", "commanded_speed", "applied_speed",
+        "route_waypoint", "route_complete", "route_target_height",
+        "scene_generation", "scene_frame", "scene_reset_count",
+        "scene_switch_failed", "motion_pack_load_count",
+        "model_load_count", "model_unload_count", "live_model_count",
+    )),
+    ("intent", (
+        "requested_velocity_x", "requested_velocity_y",
+        "requested_velocity_z", "applied_velocity_x",
+        "applied_velocity_y", "applied_velocity_z",
+        "desired_heading_bits_hex", "predicted_heading_bits_hex",
+        "simulation_heading_error_deg",
+    )),
+)
+GATE_E_ATOMIC_HOLD_FIELDS = (
+    "scene_generation", "scene_frame", "scene_reset_count",
+    "query_bits_hex", "searched", "transitioned", "incumbent_cost",
+    "selected_cost", "selected_terrain_error",
+    "terrain0", "terrain1", "terrain2", "terrain3",
+    "terrain_point0_x", "terrain_point0_y", "terrain_point0_z",
+    "terrain_point1_x", "terrain_point1_y", "terrain_point1_z",
+    "terrain_point2_x", "terrain_point2_y", "terrain_point2_z",
+    "terrain_point3_x", "terrain_point3_y", "terrain_point3_z",
+    "query_database_frame", "query_range", "selected_database_frame",
+    "database_frame", "range", "source_range", "route_waypoint",
+    "route_complete",
+    "source_name", "source_terrain", "source_index", "continuation_cost",
+    "simulation_x", "simulation_z", "walkability_class", "blocked",
+    "blocked_reason", "blocked_distance", "support_height",
+    "support_velocity", "support_source", "runtime_support_root_height",
+    "runtime_support_left_toe_height", "runtime_support_right_toe_height",
+    "support_retargeted_hips_y", "ik_adjusted_hips_y", "rendered_hips_y",
+    "left_recorded_contact", "right_recorded_contact",
+    "left_locked", "right_locked", "left_target_height",
+    "right_target_height", "left_target_normal_x", "left_target_normal_y",
+    "left_target_normal_z", "right_target_normal_x",
+    "right_target_normal_y", "right_target_normal_z",
+    "ik_candidate_clearance_status", "ik_candidate_minimum_clearance",
+    "ik_minimum_clearance", "rendered_min_clearance",
+    "accepted_state_digest_hex",
+)
 
 # Gate A callers keep their historical name and exact immutable tuple. Runtime
 # readers accept the append-only suffix without weakening that prerequisite.
@@ -648,9 +779,6 @@ def _check_rejected_landing_schema(row, index, foot):
                 walkability not in {1, 2}):
             raise ValueError(
                 f"row {index}: rejected {foot} landing is malformed")
-        if _integer(row, f"{foot}_recorded_contact", index) != 0:
-            raise ValueError(
-                f"row {index}: rejected {foot} landing is not a swing foot")
         if ready and (
                 status != "valid" or walkability != 1 or
                 residual > LANDING_PATCH_RESIDUAL_LIMIT):
@@ -752,28 +880,43 @@ def _check_disabled_ik_is_canonical(row, index):
                 f"row {index}: disabled IK output is not canonical")
 
 
-def _rejected_foot_is_canonical(row, index, foot):
+def _rejected_landing_is_canonical(row, index, foot):
     prefix = f"rejected_{foot}"
     if (_integer(row, f"{prefix}_landing_expected", index) != 0 or
             _integer(row, f"{prefix}_landing_patch_ready", index) != 0 or
             _uint32(row, f"{prefix}_landing_sample", index) != 2 ** 32 - 1 or
             row[f"{prefix}_landing_surface_status"] != "invalid" or
-            _integer(row, f"{prefix}_landing_walkability_class", index) != 0 or
-            _integer(row, f"{prefix}_reachable", index) != 0 or
-            _integer(row, f"{prefix}_correction_limited", index) != 0 or
-            row[f"{prefix}_selected_clearance_status"] != "invalid-input"):
+            _integer(row, f"{prefix}_landing_walkability_class", index) != 0):
         return False
     scalar_suffixes = (
         "landing_center_x", "landing_center_y", "landing_center_z",
         "landing_surface_height", "landing_surface_normal_x",
         "landing_surface_normal_y", "landing_surface_normal_z",
-        "landing_patch_maximum_residual", "target_x", "target_y",
-        "target_z", "target_normal_x", "target_normal_y",
-        "target_normal_z", "selected_lower_margin",
+        "landing_patch_maximum_residual",
+    )
+    return all(_finite(row, f"{prefix}_{suffix}", index) == 0.0
+               for suffix in scalar_suffixes)
+
+
+def _rejected_ik_payload_is_canonical(row, index, foot):
+    prefix = f"rejected_{foot}"
+    if (_integer(row, f"{prefix}_reachable", index) != 0 or
+            _integer(row, f"{prefix}_correction_limited", index) != 0 or
+            row[f"{prefix}_selected_clearance_status"] != "invalid-input"):
+        return False
+    scalar_suffixes = (
+        "target_x", "target_y", "target_z", "target_normal_x",
+        "target_normal_y", "target_normal_z", "selected_lower_margin",
         "selected_witness_upper",
     )
     return all(_finite(row, f"{prefix}_{suffix}", index) == 0.0
                for suffix in scalar_suffixes)
+
+
+def _rejected_foot_is_canonical(row, index, foot):
+    return (
+        _rejected_landing_is_canonical(row, index, foot) and
+        _rejected_ik_payload_is_canonical(row, index, foot))
 
 
 def _check_rejection_schema(row, index, previous_digest):
@@ -807,12 +950,18 @@ def _check_rejection_schema(row, index, previous_digest):
     if previous_digest is None or digest != previous_digest:
         raise ValueError(
             f"row {index}: finite rejection changed accepted-state digest")
+    if (not footprint_available and
+            not all(_rejected_landing_is_canonical(row, index, foot)
+                    for foot in ("left", "right"))):
+        raise ValueError(
+            f"row {index}: rejection without attempted footprint has "
+            "noncanonical landing fields")
     if (not ik_available and
-            not all(_rejected_foot_is_canonical(row, index, foot)
+            not all(_rejected_ik_payload_is_canonical(row, index, foot)
                     for foot in ("left", "right"))):
         raise ValueError(
             f"row {index}: rejection without attempted IK has noncanonical "
-            "foot fields")
+            "target/solve fields")
     if stage == "footprint":
         if ik_available or pose_available or pose_status != "invalid-input":
             raise ValueError(
@@ -875,7 +1024,8 @@ def _check_swing_selection_schema(row, index, foot):
         raise ValueError(
             f"row {index}: {foot} swing evaluated more than 41 candidates")
     if selected != no_candidate:
-        if evaluated != 41 or selected >= 41:
+        if (evaluated == 0 or selected >= 41 or
+                evaluated != selected + 1):
             raise ValueError(
                 f"row {index}: {foot} selected swing index is inconsistent")
         return
@@ -1047,6 +1197,8 @@ def check_rows(rows, *, allow_ik=False):
     active_runtime_suffix = (
         RUNTIME_SUFFIX if full_runtime else LEGACY_RUNTIME_SUFFIX)
     previous = None
+    previous_query_frame = None
+    previous_query_range = None
     previous_range = None
     previous_generation = None
     previous_scene_frame = None
@@ -1088,6 +1240,9 @@ def check_rows(rows, *, allow_ik=False):
             raise ValueError(f"row {index}: frame sequence is {frame}")
         if transitioned not in (0, 1) or searched not in (0, 1):
             raise ValueError(f"row {index}: flags must be 0 or 1")
+        row_rejected_for_lifecycle = (
+            full_runtime and
+            _integer(row, "frame_rejected", index) == 1)
         generation_changed = False
         if runtime:
             generation = _integer(row, "scene_generation", index)
@@ -1097,14 +1252,21 @@ def check_rows(rows, *, allow_ik=False):
                 if scene_frame != 0:
                     raise ValueError(f"row {index}: initial scene_frame must be 0")
             elif generation == previous_generation:
-                if scene_frame != previous_scene_frame + 1:
+                expected_scene_frame = (
+                    previous_scene_frame if row_rejected_for_lifecycle
+                    else previous_scene_frame + 1)
+                if scene_frame != expected_scene_frame:
+                    action = "freeze" if row_rejected_for_lifecycle else "increment"
                     raise ValueError(
-                        f"row {index}: scene_frame did not increment")
+                        f"row {index}: scene_frame did not {action}")
                 if reset_count != previous_reset_count:
                     raise ValueError(
                         f"row {index}: scene_reset_count changed without reset")
             else:
                 generation_changed = True
+                if row_rejected_for_lifecycle:
+                    raise ValueError(
+                        f"row {index}: rejected frame changed generation")
                 if generation != previous_generation + 1:
                     raise ValueError(
                         f"row {index}: scene_generation must increment by one")
@@ -1114,15 +1276,23 @@ def check_rows(rows, *, allow_ik=False):
                 if reset_count != previous_reset_count + 1:
                     raise ValueError(
                         f"row {index}: scene_reset_count must increment by one")
-        if previous is not None and not generation_changed and query_frame != previous:
+        expected_query_frame = (
+            previous_query_frame if row_rejected_for_lifecycle else previous)
+        if (previous is not None and not generation_changed and
+                query_frame != expected_query_frame):
             raise ValueError(
                 f"row {index}: query frame {query_frame} does not match "
-                f"prior pose frame {previous}")
+                f"prior {'accepted query' if row_rejected_for_lifecycle else 'pose'} "
+                f"frame {expected_query_frame}")
+        expected_query_range = (
+            previous_query_range
+            if row_rejected_for_lifecycle else previous_range)
         if (previous_range is not None and not generation_changed and
-                query_range != previous_range):
+                query_range != expected_query_range):
             raise ValueError(
                 f"row {index}: query range {query_range} does not match "
-                f"prior pose range {previous_range}")
+                f"prior {'accepted query' if row_rejected_for_lifecycle else 'pose'} "
+                f"range {expected_query_range}")
         if transitioned and not searched:
             raise ValueError(f"row {index}: transition without search")
         if transitioned and selected_frame == query_frame:
@@ -1232,8 +1402,7 @@ def check_rows(rows, *, allow_ik=False):
                 previous_accepted_digest = _check_full_runtime_suffix(
                     row, index, previous_accepted_digest)
         _check_query_snapshot(row, index)
-        row_rejected = (
-            full_runtime and _integer(row, "frame_rejected", index) == 1)
+        row_rejected = row_rejected_for_lifecycle
         if (previous is not None and not generation_changed and
                 not transitioned and not row_rejected and
                 current != previous + 1):
@@ -1245,6 +1414,8 @@ def check_rows(rows, *, allow_ik=False):
             raise ValueError(
                 f"row {index}: range change without transition")
         previous = current
+        previous_query_frame = query_frame
+        previous_query_range = query_range
         previous_range = current_range
         if runtime:
             previous_generation = generation
@@ -2399,6 +2570,545 @@ def check_gate_d(rows):
     }
 
 
+def _check_gate_e_forward_heading(rows, gate_name):
+    desired = HEADING_BITS["forward"]
+    predicted = desired * 4
+    for index, row in enumerate(rows):
+        if (row["desired_heading_bits_hex"] != desired or
+                row["predicted_heading_bits_hex"] != predicted):
+            raise ValueError(
+                f"row {index}: {gate_name} requires exact forward heading")
+
+
+def _check_gate_e_pair_contract(
+        rows, control, *, expected_scene, expected_route,
+        allowed_routes, expected_frames, gate_name):
+    cell = (expected_scene, expected_route)
+    if cell not in allowed_routes:
+        raise ValueError(f"{gate_name} scene/route is outside its allowlist")
+    _require_full_runtime_header(rows)
+    _require_full_runtime_header(control)
+    if len(rows) != expected_frames or len(control) != expected_frames:
+        raise ValueError(
+            f"{gate_name} requires exactly {expected_frames} rows per log")
+    for label, values in (("treatment", rows), ("control", control)):
+        if any(row["mode"] != "route" for row in values):
+            raise ValueError(f"{gate_name} {label} requires route mode")
+        if any((row["scene_id"], row["route"]) != cell for row in values):
+            raise ValueError(
+                f"{gate_name} {label} scene/route identity changed")
+        if len({_integer(row, "scene_generation", index)
+                for index, row in enumerate(values)}) != 1:
+            raise ValueError(f"{gate_name} {label} requires one generation")
+        if any(_finite(row, "effective_terrain_weight", index) != 4.0
+               for index, row in enumerate(values)):
+            raise ValueError(f"{gate_name} {label} weight must remain 4")
+        if any(_integer(row, "matching_enabled", index) != 1
+               for index, row in enumerate(values)):
+            raise ValueError(f"{gate_name} {label} matching must remain enabled")
+        if any(_integer(row, "support_retargeting_enabled", index) != 1
+               for index, row in enumerate(values)):
+            raise ValueError(
+                f"{gate_name} {label} support retargeting must remain enabled")
+        if label == "treatment":
+            for name, diagnostic in (
+                    ("adjustment_enabled", "adjustment"),
+                    ("clamping_enabled", "clamping")):
+                if any(_integer(row, name, index) != 1
+                       for index, row in enumerate(values)):
+                    raise ValueError(
+                        f"{gate_name} treatment {diagnostic} must remain enabled")
+        _check_gate_e_forward_heading(values, gate_name)
+
+    summary = check_rows(rows, allow_ik=True)
+    check_rows(control)
+    if any(_integer(row, "ik_enabled", index) != 1
+           for index, row in enumerate(rows)):
+        raise ValueError(f"{gate_name} treatment requires IK enabled")
+    if any(_integer(row, "ik_enabled", index) != 0
+           for index, row in enumerate(control)):
+        raise ValueError(f"{gate_name} control requires IK disabled")
+    for index, row in enumerate(control):
+        _check_disabled_ik_is_canonical(row, index)
+    return summary, cell
+
+
+def _compare_gate_e_pair_invariants(
+        rows, control, gate_name, stop_before=None):
+    stop = len(rows) if stop_before is None else stop_before
+    for index, (treatment, baseline) in enumerate(
+            zip(rows[:stop], control[:stop])):
+        for group, names in GATE_E_PAIR_INVARIANT_GROUPS:
+            for name in names:
+                if treatment[name] != baseline[name]:
+                    raise ValueError(
+                        f"row {index}: {gate_name} pair invariant {name} "
+                        f"differs in {group} group")
+    return stop
+
+
+def _gate_e_swing_work(row, index, foot, scope):
+    return {
+        suffix: _uint32(
+            row, f"{foot}_swing_{scope}_work_{suffix}", index)
+        for suffix in GATE_E_SWING_WORK_LIMITS
+    }
+
+
+def _check_gate_e_contact_bypass(row, index, foot):
+    no_candidate = 2 ** 32 - 1
+    scalar_fields = (
+        f"{foot}_swing_selected_lift_bits",
+        f"{foot}_swing_materialized_command_y_bits",
+        f"{foot}_swing_lower_margin",
+        f"{foot}_swing_witness_upper_margin",
+    )
+    valid = (
+        _uint32(row, f"{foot}_swing_candidates_evaluated", index) == 0 and
+        _uint32(row, f"{foot}_swing_selected_index", index) == no_candidate and
+        all(_finite(row, name, index) == 0.0 for name in scalar_fields) and
+        row[f"{foot}_swing_actual_sphere_center_bits_hex"] ==
+            "00000000" * 12 and
+        row[f"{foot}_swing_selected_clearance_status"] == "invalid-input" and
+        _integer(
+            row,
+            f"{foot}_swing_selected_controller_constraints_passed",
+            index) == 0 and
+        _integer(
+            row, f"{foot}_swing_selected_clearance_certified", index) == 0 and
+        all(value == 0 for value in
+            _gate_e_swing_work(row, index, foot, "selected").values()) and
+        all(value == 0 for value in
+            _gate_e_swing_work(row, index, foot, "total").values()))
+    if not valid:
+        raise ValueError(
+            f"row {index}: {foot} recorded-contact bypass is not canonical")
+
+
+def _check_gate_e_selected_swing(row, index, foot):
+    evaluated = _uint32(
+        row, f"{foot}_swing_candidates_evaluated", index)
+    selected = _uint32(row, f"{foot}_swing_selected_index", index)
+    if (evaluated < 1 or evaluated > len(G1_SWING_LIFT_BITS) or
+            selected >= len(G1_SWING_LIFT_BITS) or
+            evaluated != selected + 1):
+        raise ValueError(
+            f"row {index}: {foot} swing evaluated/selected index disagrees")
+    lift_bits = _uint32(row, f"{foot}_swing_selected_lift_bits", index)
+    if lift_bits != G1_SWING_LIFT_BITS[selected]:
+        raise ValueError(f"row {index}: {foot} swing lift bits changed")
+    command_bits = _uint32(
+        row, f"{foot}_swing_materialized_command_y_bits", index)
+    command = struct.unpack(">f", command_bits.to_bytes(4, "big"))[0]
+    if not math.isfinite(command):
+        raise ValueError(
+            f"row {index}: {foot} swing materialized command is non-finite")
+    target_height = _float32(row, f"{foot}_target_height", index)
+    target_height = struct.unpack(">f", struct.pack(">f", target_height))[0]
+    lift = struct.unpack(">f", lift_bits.to_bytes(4, "big"))[0]
+    expected_command_bits = _float32_bits(
+        target_height + lift, index,
+        f"{foot} swing materialized command")
+    if command_bits != expected_command_bits:
+        raise ValueError(
+            f"row {index}: {foot} swing materialized command bits "
+            "do not equal target_height plus selected lift")
+    if row[f"{foot}_swing_selected_clearance_status"] != "ok":
+        raise ValueError(
+            f"row {index}: {foot} swing selected status is not ok")
+    if _integer(
+            row,
+            f"{foot}_swing_selected_controller_constraints_passed",
+            index) != 1:
+        raise ValueError(
+            f"row {index}: {foot} swing controller constraints did not pass")
+    if _integer(
+            row, f"{foot}_swing_selected_clearance_certified", index) != 1:
+        raise ValueError(
+            f"row {index}: {foot} swing clearance is not certified")
+    lower = _finite(row, f"{foot}_swing_lower_margin", index)
+    upper = _finite(row, f"{foot}_swing_witness_upper_margin", index)
+    if lower < 0.0 or upper < lower:
+        raise ValueError(f"row {index}: {foot} swing margin is invalid")
+    if upper - lower > 1.0e-6:
+        raise ValueError(
+            f"row {index}: {foot} swing certificate width exceeds 1e-6")
+    selected_work = _gate_e_swing_work(row, index, foot, "selected")
+    total_work = _gate_e_swing_work(row, index, foot, "total")
+    for name, limit in GATE_E_SWING_WORK_LIMITS.items():
+        if selected_work[name] > limit:
+            raise ValueError(
+                f"row {index}: {foot} selected swing work {name} exceeds budget")
+        if (total_work[name] < selected_work[name] or
+                total_work[name] > limit * evaluated):
+            raise ValueError(
+                f"row {index}: {foot} total work {name} is inconsistent")
+
+
+def _check_gate_e_successful_row(row, index):
+    if _integer(row, "ik_applied", index) != 1:
+        raise ValueError(f"row {index}: Gate E requires IK applied")
+    if (_integer(row, "frame_rejected", index) != 0 or
+            _integer(row, "ik_safe_stop_latched", index) != 0):
+        raise ValueError(f"row {index}: Gate E forbids finite rejection")
+    if (_integer(row, "ik_safe_stop_requested", index) != 0 or
+            row["ik_stop_reason"] != "none" or
+            _integer(row, "ik_candidate_rejected", index) != 0):
+        raise ValueError(f"row {index}: Gate E accepted IK requested a stop")
+    if row["ik_candidate_clearance_status"] != "ok":
+        raise ValueError(
+            f"row {index}: Gate E candidate clearance status is not ok")
+    if _finite(row, "max_ik_correction", index) > .35:
+        raise ValueError(f"row {index}: Gate E correction exceeds 0.35 rad")
+
+    for foot in ("left", "right"):
+        recorded = _integer(row, f"{foot}_recorded_contact", index)
+        source_contact = _integer(row, f"{foot}_contact", index)
+        locked = _integer(row, f"{foot}_locked", index)
+        reachable = _integer(row, f"{foot}_reachable", index)
+        if recorded != source_contact:
+            raise ValueError(
+                f"row {index}: {foot} recorded contact disagrees with source")
+        if locked != recorded:
+            raise ValueError(
+                f"row {index}: {foot} contact lock disagrees with contact")
+        if reachable != 1:
+            raise ValueError(f"row {index}: {foot} target is not reachable")
+        if _finite(row, f"{foot}_contact_residual", index) > \
+                CONTACT_RESIDUAL_LIMIT:
+            raise ValueError(
+                f"row {index}: {foot} contact residual exceeds promoted 0.005f")
+        if _finite(row, f"{foot}_sole_normal_alignment", index) < .999:
+            raise ValueError(
+                f"row {index}: {foot} sole alignment is below 0.999")
+        normal = tuple(
+            _finite(row, f"{foot}_target_normal_{axis}", index)
+            for axis in "xyz")
+        length = math.sqrt(sum(component * component for component in normal))
+        if abs(length - 1.0) > 1.0e-5:
+            raise ValueError(f"row {index}: {foot} target is not a unit normal")
+        if normal[1] <= 0.0:
+            raise ValueError(f"row {index}: {foot} target is not an upward normal")
+        if recorded:
+            _check_gate_e_contact_bypass(row, index, foot)
+        else:
+            _check_gate_e_selected_swing(row, index, foot)
+
+        for part in ("toe", "foot"):
+            candidate_name = f"{foot}_candidate_{part}_clearance"
+            accepted_name = f"{foot}_{part}_clearance"
+            if row[candidate_name] != row[accepted_name]:
+                raise ValueError(
+                    f"row {index}: {foot} candidate and accepted {part} "
+                    "clearance differ")
+            if recorded and _finite(row, accepted_name, index) < -.005:
+                raise ValueError(
+                    f"row {index}: Gate E planted {foot} {part} clearance "
+                    "fell below -0.005 m")
+        for part in ("knee", "ankle", "toe", "foot", "shin", "thigh"):
+            if _finite(row, f"{foot}_{part}_clearance", index) < -.01:
+                raise ValueError(
+                    f"row {index}: Gate E accepted {foot} clearance "
+                    "fell below -0.01 m")
+    for name in (
+            "ik_hips_clearance", "ik_minimum_clearance",
+            "ik_candidate_minimum_clearance", "rendered_min_clearance"):
+        if _finite(row, name, index) < -.01:
+            raise ValueError(
+                f"row {index}: Gate E physical clearance fell below -0.01 m")
+
+
+def _check_gate_e_successful_rows(rows):
+    for index, row in enumerate(rows):
+        _check_gate_e_successful_row(row, index)
+
+
+def _gate_e_drift_report(rows):
+    observed = []
+    corrected = []
+    counts = {}
+    foot_means = {}
+    for foot in ("left", "right"):
+        foot_observed = []
+        foot_corrected = []
+        for index, row in enumerate(rows):
+            if (_integer(row, f"{foot}_recorded_contact", index) == 1 and
+                    _integer(row, f"{foot}_locked", index) == 1):
+                observed_value = _finite(
+                    row, f"{foot}_observed_lock_drift", index)
+                corrected_value = _finite(
+                    row, f"{foot}_lock_drift", index)
+                if observed_value < 0.0 or corrected_value < 0.0:
+                    raise ValueError(
+                        f"row {index}: {foot} lock drift must be nonnegative")
+                foot_observed.append(observed_value)
+                foot_corrected.append(corrected_value)
+        if len(foot_observed) < 10:
+            raise ValueError(
+                f"Gate E {foot} foot requires at least 10 planted samples")
+        counts[foot] = len(foot_observed)
+        observed_mean = statistics.mean(foot_observed)
+        corrected_mean = statistics.mean(foot_corrected)
+        if not corrected_mean < observed_mean:
+            raise ValueError(
+                f"Gate E {foot} corrected lock drift did not strictly "
+                "improve its mean")
+        foot_means[foot] = (observed_mean, corrected_mean)
+        observed.extend(foot_observed)
+        corrected.extend(foot_corrected)
+    observed_mean = statistics.mean(observed)
+    corrected_mean = statistics.mean(corrected)
+    if not corrected_mean < observed_mean:
+        raise ValueError(
+            "Gate E corrected lock drift did not strictly improve its mean")
+    return {
+        "left_planted_samples": counts["left"],
+        "right_planted_samples": counts["right"],
+        "left_mean_observed_lock_drift": foot_means["left"][0],
+        "left_mean_corrected_lock_drift": foot_means["left"][1],
+        "right_mean_observed_lock_drift": foot_means["right"][0],
+        "right_mean_corrected_lock_drift": foot_means["right"][1],
+        "mean_observed_lock_drift": observed_mean,
+        "mean_corrected_lock_drift": corrected_mean,
+    }
+
+
+def _check_gate_e_atomic_tail(rows, first, gate_name):
+    baseline = rows[first - 1]
+    for index in range(first, len(rows)):
+        row = rows[index]
+        for name in GATE_E_ATOMIC_HOLD_FIELDS:
+            if row[name] != baseline[name]:
+                raise ValueError(
+                    f"row {index}: {gate_name} root-reach/atomic field "
+                    f"{name} changed after rejection")
+
+
+def _gate_e_rejection_signature(row, index):
+    return (
+        row["frame_rejection_stage"],
+        row["rejected_stop_reason"],
+        _integer(row, "rejected_attempted_footprint_available", index),
+        _integer(row, "rejected_attempted_ik_available", index),
+        _integer(row, "rejected_attempted_pose_available", index),
+    )
+
+
+def _check_gate_e_rejection_tail(
+        rows, first, gate_name, permitted_signatures):
+    if any(_integer(row, "route_complete", index) == 1
+           for index, row in enumerate(rows)):
+        raise ValueError(
+            f"{gate_name} safe-stop branch forbids route completion")
+    first_signature = _gate_e_rejection_signature(rows[first], first)
+    if first_signature not in permitted_signatures:
+        raise ValueError(
+            f"{gate_name} rejection stage/reason/availability is not permitted")
+    for index in range(first + 1, len(rows)):
+        if _gate_e_rejection_signature(rows[index], index) != first_signature:
+            raise ValueError(
+                f"row {index}: {gate_name} rejection "
+                "stage/reason/availability changed within the tail")
+    return first_signature
+
+
+def check_gate_e_pair(
+        rows, control, *, expected_scene, expected_route):
+    summary, cell = _check_gate_e_pair_contract(
+        rows, control,
+        expected_scene=expected_scene, expected_route=expected_route,
+        allowed_routes=GATE_E_ROUTES, expected_frames=800,
+        gate_name="Gate E")
+    _compare_gate_e_pair_invariants(rows, control, "Gate E")
+    _check_gate_e_successful_rows(rows)
+    if any(_integer(row, "walkability_class", index) != 1
+           for index, row in enumerate(rows)):
+        raise ValueError("Gate E normal route requires class-1 traversal")
+    if any(_integer(row, name, index) != 0
+           for index, row in enumerate(rows)
+           for name in ("blocked", "footprint_blocked")):
+        raise ValueError("Gate E normal route contains a block")
+    if not any(_integer(row, "route_complete", index) == 1
+               for index, row in enumerate(rows)):
+        raise ValueError("Gate E normal route did not complete")
+    return {
+        **summary,
+        "scene": cell[0],
+        "route": cell[1],
+        **_gate_e_drift_report(rows),
+    }
+
+
+def check_gate_e_stress_pair(
+        rows, control, *, expected_scene, expected_route):
+    summary, cell = _check_gate_e_pair_contract(
+        rows, control,
+        expected_scene=expected_scene, expected_route=expected_route,
+        allowed_routes=GATE_E_STRESS_ROUTES, expected_frames=800,
+        gate_name="Gate E stress")
+    if any(_integer(row, "walkability_class", index) == 0
+           for index, row in enumerate(rows)):
+        raise ValueError("Gate E stress entered class-0 walkability")
+    rejected = [
+        index for index, row in enumerate(rows)
+        if _integer(row, "frame_rejected", index) == 1
+    ]
+    if not rejected:
+        _compare_gate_e_pair_invariants(rows, control, "Gate E stress")
+        _check_gate_e_successful_rows(rows)
+        if not any(_integer(row, "route_complete", index) == 1
+                   for index, row in enumerate(rows)):
+            raise ValueError(
+                "Gate E stress neither completed nor atomically safe-stopped")
+        if any(_integer(row, name, index) != 0
+               for index, row in enumerate(rows)
+               for name in ("blocked", "footprint_blocked")):
+            raise ValueError("Gate E stress traversal contains a block")
+        return {
+            **summary, "scene": cell[0], "route": cell[1],
+            "branch": "traverse", "first_rejected_frame": -1,
+        }
+
+    first = rejected[0]
+    if first == 0 or rejected != list(range(first, len(rows))):
+        raise ValueError("Gate E stress rejection must form an atomic tail")
+    _check_gate_e_rejection_tail(
+        rows, first, "Gate E stress", GATE_E_STRESS_REJECTION_SIGNATURES)
+    _compare_gate_e_pair_invariants(
+        rows, control, "Gate E stress", stop_before=first)
+    _check_gate_e_successful_rows(rows[:first])
+    if any(_finite(row, "actual_simulation_speed", index) > 1.0e-4 or
+           _finite(row, "applied_speed", index) > 1.0e-4
+           for index, row in enumerate(rows[first:], first)):
+        raise ValueError("Gate E stress safe-stop tail did not remain stopped")
+    baseline = rows[first - 1]
+    base_x = _finite(baseline, "simulation_x", first - 1)
+    base_z = _finite(baseline, "simulation_z", first - 1)
+    maximum_displacement = max(
+        math.hypot(
+            _finite(row, "simulation_x", index) - base_x,
+            _finite(row, "simulation_z", index) - base_z)
+        for index, row in enumerate(rows[first:], first))
+    if maximum_displacement > .02:
+        raise ValueError(
+            "Gate E stress safe-stop displacement exceeded 0.02 m")
+    base_support = (
+        _finite(baseline, "source_root_height", first - 1) +
+        _finite(baseline, "support_height", first - 1))
+    maximum_support_rise = max(0.0, max(
+        _finite(row, "source_root_height", index) +
+        _finite(row, "support_height", index) - base_support
+        for index, row in enumerate(rows[first:], first)))
+    if maximum_support_rise > .02:
+        raise ValueError("Gate E stress support rise exceeded 0.02 m")
+    for index, row in enumerate(rows[first:], first):
+        for name in (
+                "rendered_min_clearance", "ik_candidate_minimum_clearance",
+                "ik_minimum_clearance"):
+            if _finite(row, name, index) < -.01:
+                raise ValueError(
+                    f"row {index}: Gate E stress clearance fell below -0.01 m")
+    _check_gate_e_atomic_tail(rows, first, "Gate E stress")
+    return {
+        **summary, "scene": cell[0], "route": cell[1],
+        "branch": "safe-stop", "first_rejected_frame": first,
+        "rejected_frames": len(rejected),
+        "maximum_stopped_displacement": maximum_displacement,
+        "maximum_stopped_support_rise": maximum_support_rise,
+    }
+
+
+def check_gate_d_ik_pair(
+        rows, control, *, expected_scene, expected_route):
+    summary, cell = _check_gate_e_pair_contract(
+        rows, control,
+        expected_scene=expected_scene, expected_route=expected_route,
+        allowed_routes=GATE_D_IK_ROUTES, expected_frames=600,
+        gate_name="Gate D IK")
+    control_report = check_gate_d(control)
+    if any(_integer(row, "walkability_class", index) == 0
+           for index, row in enumerate(rows)):
+        raise ValueError("Gate D IK entered class-0 walkability")
+    rejected = [
+        index for index, row in enumerate(rows)
+        if _integer(row, "frame_rejected", index) == 1
+    ]
+    if not rejected or rejected[0] == 0 or \
+            rejected != list(range(rejected[0], len(rows))):
+        raise ValueError("Gate D IK requires one atomic rejected tail")
+    first = rejected[0]
+    _check_gate_e_rejection_tail(
+        rows, first, "Gate D IK", {GATE_D_IK_REJECTION_SIGNATURE})
+    control_at_rejection = control[first]
+    valid_control_signature = (
+        _integer(control_at_rejection, "blocked", first) == 1 and
+        control_at_rejection["blocked_reason"] in
+            WALKABILITY_REASONS - {"clear"} and
+        _finite(control_at_rejection, "blocked_distance", first) >= .0199 and
+        _finite(control_at_rejection, "applied_speed", first) <= 1.0e-4 and
+        (_finite(control_at_rejection, "commanded_speed", first) > 1.0e-4 or
+         _integer(control_at_rejection, "route_complete", first) == 1))
+    if not valid_control_signature:
+        raise ValueError(
+            "Gate D IK paired control lacks a valid Gate-D blocked reserve "
+            "and stop signature at the treatment rejection frame")
+    _compare_gate_e_pair_invariants(
+        rows, control, "Gate D IK", stop_before=first)
+    _check_gate_e_successful_rows(rows[:first])
+
+    stopped_run = list(range(first, len(rows)))
+    if any(
+            _finite(rows[index], "applied_speed", index) > 1.0e-4 or
+            _finite(rows[index], "actual_simulation_speed", index) > 1.0e-4
+            for index in stopped_run):
+        raise ValueError(
+            "Gate D IK tail has motion; 25 stopped frames are insufficient")
+    if len(stopped_run) < 25:
+        raise ValueError("Gate D IK did not hold 25 consecutive stopped frames")
+    minimum_blocked_distance = min(
+        _finite(rows[index], "blocked_distance", index)
+        for index in stopped_run)
+    if minimum_blocked_distance < .0199:
+        raise ValueError("Gate D IK stopped distance fell below 0.0199 m")
+    minimum_clearance = min(
+        _finite(rows[index], name, index)
+        for index in stopped_run
+        for name in (
+            "rendered_min_clearance", "ik_candidate_minimum_clearance",
+            "ik_minimum_clearance"))
+    if minimum_clearance < -.01:
+        raise ValueError("Gate D IK clearance fell below -0.01 m")
+
+    first_blocked = next((
+        index for index, row in enumerate(rows)
+        if _integer(row, "blocked", index) == 1
+    ), None)
+    if first_blocked is None or first_blocked < 20:
+        raise ValueError("Gate D IK requires a blocked event and 20-row baseline")
+    pre_support = max(
+        _finite(row, "source_root_height", index) +
+        _finite(row, "support_height", index)
+        for index, row in enumerate(
+            rows[first_blocked - 20:first_blocked], first_blocked - 20))
+    blocked_support_rise = max(0.0, max(
+        _finite(row, "source_root_height", index) +
+        _finite(row, "support_height", index) - pre_support
+        for index, row in enumerate(rows[first_blocked:], first_blocked)))
+    if blocked_support_rise > .02:
+        raise ValueError("Gate D IK blocked support rise exceeded 0.02 m")
+    _check_gate_e_atomic_tail(rows, first, "Gate D IK")
+    return {
+        **summary, "scene": cell[0], "route": cell[1],
+        "branch": "safe-stop", "first_rejected_frame": first,
+        "rejected_frames": len(rejected),
+        "stopped_frames": len(stopped_run),
+        "minimum_blocked_distance": minimum_blocked_distance,
+        "minimum_clearance": minimum_clearance,
+        "maximum_blocked_support_rise": blocked_support_rise,
+        "control_stopped_frames": control_report["stopped_frames"],
+    }
+
+
 def _check_model_counters(rows):
     previous_loads = None
     previous_unloads = None
@@ -2723,6 +3433,9 @@ def main(argv=None):
     runtime_gate = parser.add_mutually_exclusive_group()
     runtime_gate.add_argument("--gate-c", action="store_true")
     runtime_gate.add_argument("--gate-d", action="store_true")
+    runtime_gate.add_argument("--gate-d-ik", action="store_true")
+    runtime_gate.add_argument("--gate-e", action="store_true")
+    runtime_gate.add_argument("--gate-e-stress", action="store_true")
     runtime_gate.add_argument("--gate-f", action="store_true")
     runtime_gate.add_argument("--gate-l", action="store_true")
     runtime_gate.add_argument("--gate-l-safety-only", action="store_true")
@@ -2734,6 +3447,8 @@ def main(argv=None):
     parser.add_argument("--compare-flat-baseline")
     parser.add_argument("--expected-end-x", type=float)
     parser.add_argument("--expected-end-z", type=float)
+    parser.add_argument("--expected-scene")
+    parser.add_argument("--expected-route")
     parser.add_argument("--expected-heading", choices=tuple(HEADING_BITS))
     parser.add_argument(
         "--expected-relative-direction",
@@ -2743,11 +3458,40 @@ def main(argv=None):
     parser.add_argument("--expect-switch-failure", action="store_true")
     args = parser.parse_args(argv)
     gate_l_mode = args.gate_l or args.gate_l_safety_only
+    gate_e_mode = args.gate_e or args.gate_e_stress or args.gate_d_ik
     if args.expect_switch_failure and any((
             args.gate_a, args.gate_c, args.gate_d, args.gate_f,
-            gate_l_mode, args.gate_l2_pair, args.gate_l2_exit_stress)):
+            gate_e_mode, gate_l_mode, args.gate_l2_pair,
+            args.gate_l2_exit_stress)):
         parser.error(
             "--expect-switch-failure may not combine with gate flags")
+    if gate_e_mode:
+        if args.gate_a:
+            parser.error(
+                "--gate-e/--gate-e-stress/--gate-d-ik may not combine "
+                "with --gate-a")
+        if (args.compare_ik_off is None or args.expected_scene is None or
+                args.expected_route is None):
+            selected = (
+                "--gate-e" if args.gate_e else
+                "--gate-e-stress" if args.gate_e_stress else "--gate-d-ik")
+            parser.error(
+                f"{selected} requires --compare-ik-off/--expected-scene/"
+                "--expected-route")
+        if any((
+                args.compare_forward, args.compare_forward_baseline,
+                args.compare_flat_baseline,
+                args.expected_end_x is not None,
+                args.expected_end_z is not None,
+                args.expected_heading is not None,
+                args.expected_relative_direction is not None,
+                args.require_multilevel)):
+            parser.error(
+                "Gate-E/Gate-D-IK modes may not combine with Gate-L options")
+    elif args.expected_scene is not None or args.expected_route is not None:
+        parser.error(
+            "--expected-scene/--expected-route requires --gate-e, "
+            "--gate-e-stress, or --gate-d-ik")
     if gate_l_mode and args.compare_flat_baseline is None:
         if args.expected_end_x is None:
             parser.error("--gate-l requires --expected-end-x")
@@ -2805,13 +3549,14 @@ def main(argv=None):
                 "baseline options")
         if args.compare_ik_off is None:
             parser.error("--gate-l2-exit-stress requires --compare-ik-off")
-    if not gate_l_mode and not args.gate_l2_exit_stress and any((
+    if (not gate_l_mode and not args.gate_l2_exit_stress and
+            not gate_e_mode and any((
             args.compare_ik_off, args.compare_forward,
             args.compare_forward_baseline, args.compare_flat_baseline,
             args.expected_end_x is not None, args.expected_end_z is not None,
             args.expected_heading is not None,
             args.expected_relative_direction is not None,
-            args.require_multilevel)):
+            args.require_multilevel))):
         parser.error("Gate-L options require a Gate-L mode")
     expected_scene_ids = None
     if args.gate_f:
@@ -2826,7 +3571,8 @@ def main(argv=None):
     rows = read_rows(args.log)
     summary = check_rows(
         rows, allow_ik=bool(
-            gate_l_mode or args.gate_l2_pair or args.gate_l2_exit_stress))
+            gate_e_mode or gate_l_mode or args.gate_l2_pair or
+            args.gate_l2_exit_stress))
     if args.compare_control:
         treatment, control = compare_control(
             rows, read_rows(args.compare_control))
@@ -2849,6 +3595,24 @@ def main(argv=None):
         _print_gate_report("gate-c", check_gate_c(rows))
     if args.gate_d:
         _print_gate_report("gate-d", check_gate_d(rows))
+    if args.gate_e:
+        _print_gate_report(
+            "gate-e", check_gate_e_pair(
+                rows, read_rows(args.compare_ik_off),
+                expected_scene=args.expected_scene,
+                expected_route=args.expected_route))
+    if args.gate_e_stress:
+        _print_gate_report(
+            "gate-e-stress", check_gate_e_stress_pair(
+                rows, read_rows(args.compare_ik_off),
+                expected_scene=args.expected_scene,
+                expected_route=args.expected_route))
+    if args.gate_d_ik:
+        _print_gate_report(
+            "gate-d-ik", check_gate_d_ik_pair(
+                rows, read_rows(args.compare_ik_off),
+                expected_scene=args.expected_scene,
+                expected_route=args.expected_route))
     if args.gate_f:
         _print_gate_report(
             "gate-f", check_gate_f(rows, expected_scene_ids))

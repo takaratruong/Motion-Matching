@@ -626,10 +626,11 @@ def gate_l_check(rows, **changes):
 
 
 def rejection_rows(stage="landing-patch"):
-    rows = [
-        runtime_row(0, ik_enabled=1, accepted_state_digest_hex="1" * 16),
-        runtime_row(1, ik_enabled=1, accepted_state_digest_hex="1" * 16),
-    ]
+    accepted = runtime_row(
+        0, ik_enabled=1, accepted_state_digest_hex="1" * 16)
+    rejected_copy = dict(accepted)
+    rejected_copy["frame"] = "1"
+    rows = [accepted, rejected_copy]
     rejected = rows[1]
     rejected.update({
         "frame_rejected": "1",
@@ -655,6 +656,35 @@ def rejection_rows(stage="landing-patch"):
             "rejected_pose_status": "outside-domain",
         })
     return rows
+
+
+def transition_rejection_rows():
+    accepted = runtime_row(
+        0, ik_enabled=1, accepted_state_digest_hex="1" * 16)
+    transitioned = runtime_row(
+        1, ik_enabled=1, accepted_state_digest_hex="2" * 16,
+        searched=1, transitioned=1,
+        query_database_frame=100, query_range=0,
+        selected_database_frame=500, database_frame=501,
+        range=2, source_range=2,
+        incumbent_cost=2, selected_cost=1)
+    rejected = dict(transitioned)
+    rejected.update({
+        "frame": "2",
+        "frame_rejected": "1",
+        "ik_safe_stop_latched": "1",
+        "frame_rejection_stage": "landing-patch",
+        "rejected_attempted_footprint_available": "1",
+        "rejected_attempted_ik_available": "1",
+        "rejected_stop_reason": "landing-patch-unavailable",
+        "rejected_left_landing_expected": "1",
+        "rejected_left_landing_patch_ready": "0",
+        "rejected_left_landing_sample": "1",
+        "rejected_left_landing_surface_status": "valid",
+        "rejected_left_landing_walkability_class": "1",
+        "rejected_left_landing_patch_maximum_residual": ".006",
+    })
+    return [accepted, transitioned, rejected]
 
 
 def gate_l2_pair_rows():
@@ -684,7 +714,9 @@ def exit_safe_stop_rows(ik=1):
     baseline = rows[69]
     held_digest = baseline["accepted_state_digest_hex"]
     held_fields = (
-        "database_frame", "range", "source_range",
+        "scene_generation", "scene_frame", "scene_reset_count",
+        "query_database_frame", "query_range", "selected_database_frame",
+        "database_frame", "range", "source_range", "route_waypoint",
         "left_recorded_contact", "right_recorded_contact",
         "left_target_height", "right_target_height",
         "simulation_x", "simulation_z", "rendered_hips_y",
@@ -695,9 +727,6 @@ def exit_safe_stop_rows(ik=1):
         for name in held_fields:
             item[name] = baseline[name]
         item.update({
-            "query_database_frame": baseline["database_frame"],
-            "selected_database_frame": baseline["database_frame"],
-            "query_range": baseline["range"],
             "accepted_state_digest_hex": held_digest,
             "frame_rejected": "1",
             "frame_rejection_stage": "landing-patch",
@@ -719,6 +748,204 @@ def exit_safe_stop_rows(ik=1):
     return rows
 
 
+GATE_E_NORMAL_CASES = (
+    ("grail-curb-low", "curb-forward"),
+    ("stairs-shallow", "ascent-landing-descent"),
+    ("stairs-standard", "ascent-landing-descent"),
+    ("stairs-unseen-variable", "ascent-landing-descent"),
+    ("ramp-05-up-down", "up-landing-down"),
+    ("ramp-10-up-down", "up-landing-down"),
+    ("cross-slope-05", "forward-cross-slope"),
+    ("cross-slope-10", "forward-cross-slope"),
+    ("mixed-multilevel", "full-course"),
+)
+
+GATE_E_STRESS_CASES = (
+    ("grail-curb-default", "curb-forward"),
+    ("grail-curb-medium", "curb-forward"),
+    ("grail-curb-high", "curb-forward"),
+    ("ramp-15-stress", "up-landing-down"),
+)
+
+GATE_D_IK_CASES = (
+    ("blocked-course", "wall-safe-stop"),
+    ("blocked-course", "ramp-safe-stop"),
+)
+
+SWING_LIFT_BITS = (
+    0x00000000, 0x3b03126f, 0x3b83126f, 0x3bc49ba6,
+    0x3c03126f, 0x3c23d70a, 0x3c449ba6, 0x3c656042,
+    0x3c83126f, 0x3c9374bc, 0x3ca3d70a, 0x3cb43958,
+    0x3cc49ba6, 0x3cd4fdf4, 0x3ce56042, 0x3cf5c28f,
+    0x3d03126f, 0x3d0b4396, 0x3d1374bc, 0x3d1ba5e3,
+    0x3d23d70a, 0x3d2c0831, 0x3d343958, 0x3d3c6a7f,
+    0x3d449ba6, 0x3d4ccccd, 0x3d54fdf4, 0x3d5d2f1b,
+    0x3d656042, 0x3d6d9168, 0x3d75c28f, 0x3d7df3b6,
+    0x3d83126f, 0x3d872b02, 0x3d8b4396, 0x3d8f5c29,
+    0x3d9374bc, 0x3d978d50, 0x3d9ba5e3, 0x3d9fbe77,
+    0x3da3d70a,
+)
+
+
+def _set_gate_e_contact(item, foot, planted):
+    item[f"{foot}_contact"] = str(int(planted))
+    item[f"{foot}_recorded_contact"] = str(int(planted))
+    item[f"{foot}_locked"] = str(int(planted))
+    item[f"{foot}_reachable"] = "1"
+    item[f"{foot}_observed_lock_drift"] = ".02" if planted else "0"
+    item[f"{foot}_lock_drift"] = ".01" if planted else "0"
+    item[f"{foot}_contact_residual"] = ".001"
+    item[f"{foot}_sole_normal_alignment"] = "1"
+    item[f"{foot}_target_normal_x"] = "0"
+    item[f"{foot}_target_normal_y"] = "1"
+    item[f"{foot}_target_normal_z"] = "0"
+
+
+def _set_gate_e_contact_bypass(item, foot):
+    item[f"{foot}_swing_candidates_evaluated"] = "0"
+    item[f"{foot}_swing_selected_index"] = str(2 ** 32 - 1)
+    item[f"{foot}_swing_selected_lift_bits"] = "0"
+    item[f"{foot}_swing_materialized_command_y_bits"] = "0"
+    item[f"{foot}_swing_actual_sphere_center_bits_hex"] = "00000000" * 12
+    item[f"{foot}_swing_selected_clearance_status"] = "invalid-input"
+    item[f"{foot}_swing_selected_controller_constraints_passed"] = "0"
+    item[f"{foot}_swing_selected_clearance_certified"] = "0"
+    item[f"{foot}_swing_lower_margin"] = "0"
+    item[f"{foot}_swing_witness_upper_margin"] = "0"
+    for scope in ("selected", "total"):
+        for suffix in (
+                "point_queries", "cells_visited",
+                "primitive_triangle_pairs", "face_patches",
+                "candidate_tests", "subdivision_nodes"):
+            item[f"{foot}_swing_{scope}_work_{suffix}"] = "0"
+
+
+def _set_gate_e_swing(item, foot, selected_index=1):
+    _set_gate_e_contact(item, foot, False)
+    evaluated = selected_index + 1
+    item[f"{foot}_swing_candidates_evaluated"] = str(evaluated)
+    item[f"{foot}_swing_selected_index"] = str(selected_index)
+    item[f"{foot}_swing_selected_lift_bits"] = str(
+        SWING_LIFT_BITS[selected_index])
+    target_height = struct.unpack(
+        ">f", struct.pack(">f", float(item[f"{foot}_target_height"])))[0]
+    lift = struct.unpack(
+        ">f", SWING_LIFT_BITS[selected_index].to_bytes(4, "big"))[0]
+    item[f"{foot}_swing_materialized_command_y_bits"] = str(
+        int.from_bytes(struct.pack(">f", target_height + lift), "big"))
+    sphere = "".join(
+        struct.pack(">f", value).hex()
+        for value in (.1, .8, .2) * 4)
+    item[f"{foot}_swing_actual_sphere_center_bits_hex"] = sphere
+    item[f"{foot}_swing_selected_clearance_status"] = "ok"
+    item[f"{foot}_swing_selected_controller_constraints_passed"] = "1"
+    item[f"{foot}_swing_selected_clearance_certified"] = "1"
+    item[f"{foot}_swing_lower_margin"] = ".01"
+    item[f"{foot}_swing_witness_upper_margin"] = ".0100005"
+    selected = (0, 1, 2, 3, 4, 5)
+    total = tuple(value * evaluated for value in selected)
+    suffixes = (
+        "point_queries", "cells_visited", "primitive_triangle_pairs",
+        "face_patches", "candidate_tests", "subdivision_nodes",
+    )
+    for suffix, value in zip(suffixes, selected):
+        item[f"{foot}_swing_selected_work_{suffix}"] = str(value)
+    for suffix, value in zip(suffixes, total):
+        item[f"{foot}_swing_total_work_{suffix}"] = str(value)
+
+
+def gate_e_rows(
+        count=800, scene="grail-curb-low", route="curb-forward"):
+    treatment = gate_l_rows(
+        heading="forward", count=count, ik=1, scene=scene, route=route,
+        end_x=0, end_z=6, multilevel=False)
+    control = gate_l_rows(
+        heading="forward", count=count, ik=0, scene=scene, route=route,
+        end_x=0, end_z=6, multilevel=False)
+    for index, (on, off) in enumerate(zip(treatment, control)):
+        left_planted = (index // 10) % 2 == 0
+        for foot, planted in (
+                ("left", left_planted), ("right", not left_planted)):
+            _set_gate_e_contact(on, foot, planted)
+            if planted:
+                _set_gate_e_contact_bypass(on, foot)
+            else:
+                _set_gate_e_swing(on, foot)
+            off[f"{foot}_contact"] = str(int(planted))
+        on["accepted_state_digest_hex"] = f"{index + 1:016x}"
+        off["accepted_state_digest_hex"] = f"{index + 1001:016x}"
+    return treatment, control
+
+
+def gate_e_safe_stop_rows(stop=700):
+    treatment, control = gate_e_rows(
+        scene="grail-curb-medium", route="curb-forward")
+    for item in treatment + control:
+        item["walkability_class"] = "2"
+    held = dict(treatment[stop - 1])
+    for index in range(stop, len(treatment)):
+        item = dict(held)
+        item.update({
+            "frame": str(index),
+            "actual_simulation_speed": "0",
+            "applied_speed": "0",
+            "applied_velocity_x": "0",
+            "applied_velocity_y": "0",
+            "applied_velocity_z": "0",
+            "route_complete": "0",
+            "frame_rejected": "1",
+            "frame_rejection_stage": "footprint",
+            "ik_safe_stop_latched": "1",
+            "rejected_attempted_footprint_available": "1",
+            "rejected_stop_reason": "footprint-blocked",
+        })
+        treatment[index] = item
+    return treatment, control
+
+
+def gate_d_ik_rows(route="wall-safe-stop"):
+    treatment, control = gate_e_rows(
+        count=600, scene="blocked-course", route=route)
+    for index, (on, off) in enumerate(zip(treatment, control)):
+        blocked = index >= 100
+        speed = max(0.0, .5 - max(0, index - 100) * .05)
+        position = min(index * .02, 2.2)
+        for item in (on, off):
+            item.update({
+                "blocked": str(int(blocked)),
+                "blocked_reason": "blocked-cell" if blocked else "clear",
+                "blocked_distance": ".03" if blocked else "3.4e38",
+                "applied_speed": str(speed),
+                "simulation_x": "0",
+                "simulation_z": str(position),
+                "applied_velocity_x": "0",
+                "applied_velocity_y": "0",
+                "applied_velocity_z": str(speed),
+                "route_complete": str(int(index >= 200)),
+            })
+        on["actual_simulation_speed"] = str(speed)
+    stop = 111
+    held = dict(treatment[stop - 1])
+    for index in range(stop, len(treatment)):
+        item = dict(held)
+        item.update({
+            "frame": str(index),
+            "actual_simulation_speed": "0",
+            "applied_speed": "0",
+            "applied_velocity_x": "0",
+            "applied_velocity_y": "0",
+            "applied_velocity_z": "0",
+            "route_complete": "0",
+            "frame_rejected": "1",
+            "frame_rejection_stage": "footprint",
+            "ik_safe_stop_latched": "1",
+            "rejected_attempted_footprint_available": "1",
+            "rejected_stop_reason": "footprint-blocked",
+        })
+        treatment[index] = item
+    return treatment, control
+
+
 class RuntimeLogTests(unittest.TestCase):
     def test_runtime_columns_append_after_gate_a(self):
         self.assertEqual(len(GATE_A_COLUMNS), 62)
@@ -736,6 +963,519 @@ class RuntimeLogTests(unittest.TestCase):
         middle = start + len(IK_SUFFIX)
         self.assertEqual(tuple(RUNTIME_COLUMNS[start:middle]), IK_SUFFIX)
         self.assertEqual(tuple(RUNTIME_COLUMNS[middle:]), DIRECTIONAL_SUFFIX)
+
+    def test_gate_e_accepts_only_exact_normal_matrix_and_800_forward_rows(self):
+        self.assertEqual(
+            runtime_log.GATE_E_ROUTES, frozenset(GATE_E_NORMAL_CASES))
+        treatment, control = gate_e_rows()
+        report = runtime_log.check_gate_e_pair(
+            treatment, control,
+            expected_scene="grail-curb-low",
+            expected_route="curb-forward")
+        self.assertEqual(report["frames"], 800)
+        self.assertEqual(report["scene"], "grail-curb-low")
+        self.assertEqual(report["route"], "curb-forward")
+        self.assertGreaterEqual(report["left_planted_samples"], 10)
+        self.assertGreaterEqual(report["right_planted_samples"], 10)
+        self.assertLess(
+            report["mean_corrected_lock_drift"],
+            report["mean_observed_lock_drift"])
+
+        for changed_rows, scene, route, diagnostic in (
+                (treatment[:-1], "grail-curb-low", "curb-forward",
+                 "exactly 800"),
+                (treatment, "grail-curb-default", "curb-forward",
+                 "allowlist"),
+                (treatment, "grail-curb-low", "wrong-route",
+                 "allowlist")):
+            with self.subTest(scene=scene, route=route, diagnostic=diagnostic):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    runtime_log.check_gate_e_pair(
+                        changed_rows, control,
+                        expected_scene=scene, expected_route=route)
+
+        changed = [dict(item) for item in treatment]
+        changed[200]["scene_id"] = "grail-curb-default"
+        with self.assertRaisesRegex(ValueError, "scene/route"):
+            runtime_log.check_gate_e_pair(
+                changed, control,
+                expected_scene="grail-curb-low",
+                expected_route="curb-forward")
+
+        changed = [dict(item) for item in treatment]
+        changed[200]["desired_heading_bits_hex"] = heading_bits("positive-x")
+        with self.assertRaisesRegex(ValueError, "forward heading"):
+            runtime_log.check_gate_e_pair(
+                changed, control,
+                expected_scene="grail-curb-low",
+                expected_route="curb-forward")
+
+    def test_gate_e_locks_treatment_control_and_pair_invariant_groups(self):
+        treatment, control = gate_e_rows()
+        changed = [dict(item) for item in treatment]
+        for item in changed:
+            item["rendered_hips_y"] = str(
+                float(item["rendered_hips_y"]) + .01)
+            item["ik_adjusted_hips_y"] = str(
+                float(item["ik_adjusted_hips_y"]) + .01)
+        self.assertEqual(runtime_log.check_gate_e_pair(
+            changed, control,
+            expected_scene="grail-curb-low",
+            expected_route="curb-forward")["frames"], 800)
+
+        treatment_mutations = (
+            ("ik_enabled", "0", "IK enabled"),
+            ("ik_applied", "0", "IK applied"),
+            ("matching_enabled", "0", "matching"),
+            ("support_retargeting_enabled", "0", "support retargeting"),
+            ("effective_terrain_weight", "3", "weight"),
+            ("route_complete", "0", "complete"),
+            ("frame_rejected", "1", "rejection|scene_frame"),
+        )
+        for name, value, diagnostic in treatment_mutations:
+            changed = [dict(item) for item in treatment]
+            index = 799 if name == "route_complete" else 200
+            changed[index][name] = value
+            with self.subTest(treatment=name):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    runtime_log.check_gate_e_pair(
+                        changed, control,
+                        expected_scene="grail-curb-low",
+                        expected_route="curb-forward")
+
+        for name in ("adjustment_enabled", "clamping_enabled"):
+            changed = [dict(item) for item in treatment]
+            changed_control = [dict(item) for item in control]
+            changed[200][name] = "0"
+            changed_control[200][name] = "0"
+            with self.subTest(treatment_configuration=name):
+                with self.assertRaisesRegex(ValueError, name.split("_")[0]):
+                    runtime_log.check_gate_e_pair(
+                        changed, changed_control,
+                        expected_scene="grail-curb-low",
+                        expected_route="curb-forward")
+
+        changed_control = [dict(item) for item in control]
+        changed_control[200]["ik_enabled"] = "1"
+        with self.assertRaisesRegex(ValueError, "IK (?:must be|disabled)"):
+            runtime_log.check_gate_e_pair(
+                treatment, changed_control,
+                expected_scene="grail-curb-low",
+                expected_route="curb-forward")
+
+        invariant_mutations = (
+            ("source_name", "different-source", "matching"),
+            ("support_height", ".001", "support"),
+            ("simulation_x", ".001", "simulation"),
+            ("requested_velocity_z", ".5000001", "intent"),
+        )
+        for name, value, group in invariant_mutations:
+            changed_control = [dict(item) for item in control]
+            changed_control[200][name] = value
+            with self.subTest(pair_group=group):
+                with self.assertRaisesRegex(
+                        ValueError, f"pair invariant.*{name}"):
+                    runtime_log.check_gate_e_pair(
+                        treatment, changed_control,
+                        expected_scene="grail-curb-low",
+                        expected_route="curb-forward")
+
+    def test_gate_e_binds_contact_lock_reach_residual_normal_and_clearance(self):
+        treatment, control = gate_e_rows()
+        residual_limit = struct.unpack(">f", bytes.fromhex("3ba3d70a"))[0]
+        mutations = (
+            (20, "left_recorded_contact", "0", "recorded contact"),
+            (20, "left_locked", "0", "lock"),
+            (20, "left_reachable", "0", "reachable"),
+            (20, "left_contact_residual",
+             str(math.nextafter(residual_limit, math.inf)), "residual"),
+            (20, "left_sole_normal_alignment", ".9989", "sole alignment"),
+            (20, "left_target_normal_y", ".9", "unit normal"),
+            (20, "left_target_normal_y", "-1", "upward normal"),
+            (20, "left_candidate_toe_clearance", ".029", "candidate.*accepted"),
+            (20, "left_toe_clearance", "-.00501", "planted"),
+            (20, "left_knee_clearance", "-.01001", "clearance"),
+            (20, "ik_minimum_clearance", "-.01001", "clearance"),
+            (20, "max_ik_correction", ".35001", "correction"),
+        )
+        for index, name, value, diagnostic in mutations:
+            changed = [dict(item) for item in treatment]
+            changed[index][name] = value
+            if name == "left_toe_clearance":
+                changed[index]["left_candidate_toe_clearance"] = value
+            with self.subTest(name=name, value=value):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    runtime_log.check_gate_e_pair(
+                        changed, control,
+                        expected_scene="grail-curb-low",
+                        expected_route="curb-forward")
+
+    def test_gate_e_owns_canonical_contact_bypass(self):
+        treatment, control = gate_e_rows()
+        mutations = (
+            ("left_swing_candidates_evaluated", "1",
+             "contact bypass|no-candidate"),
+            ("left_swing_selected_index", "0",
+             "contact bypass|selected swing"),
+            ("left_swing_selected_lift_bits", "1",
+             "contact bypass|no-candidate"),
+            ("left_swing_materialized_command_y_bits", "1",
+             "contact bypass|no-candidate"),
+            ("left_swing_actual_sphere_center_bits_hex",
+             "3f800000" + "00000000" * 11,
+             "contact bypass|no-candidate"),
+            ("left_swing_selected_clearance_status", "ok",
+             "contact bypass|no-candidate"),
+            ("left_swing_selected_controller_constraints_passed", "1",
+             "contact bypass|no-candidate"),
+            ("left_swing_selected_clearance_certified", "1",
+             "contact bypass|no-candidate"),
+            ("left_swing_lower_margin", ".001",
+             "contact bypass|no-candidate"),
+            ("left_swing_selected_work_cells_visited", "1",
+             "contact bypass|no-candidate"),
+            ("left_swing_total_work_cells_visited", "1",
+             "contact bypass"),
+        )
+        for name, value, diagnostic in mutations:
+            changed = [dict(item) for item in treatment]
+            changed[20][name] = value
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    runtime_log.check_gate_e_pair(
+                        changed, control,
+                        expected_scene="grail-curb-low",
+                        expected_route="curb-forward")
+
+    def test_gate_e_owns_full_selected_swing_ladder_and_work(self):
+        treatment, control = gate_e_rows()
+        self.assertEqual(runtime_log.check_gate_e_pair(
+            treatment, control,
+            expected_scene="grail-curb-low",
+            expected_route="curb-forward")["frames"], 800)
+        mutations = (
+            ("left_swing_candidates_evaluated", "3",
+             "evaluated|selected swing index"),
+            ("left_swing_selected_index", "0",
+             "selected index|selected swing index"),
+            ("left_swing_selected_lift_bits", "0", "lift bits"),
+            ("left_swing_materialized_command_y_bits", str(0x7f800000),
+             "materialized"),
+            ("left_swing_materialized_command_y_bits",
+             str(SWING_LIFT_BITS[2]), "materialized.*bits"),
+            ("left_swing_actual_sphere_center_bits_hex",
+             "7f800000" + "00000000" * 11, "non-finite"),
+            ("left_swing_selected_clearance_status", "uncertified", "status"),
+            ("left_swing_selected_controller_constraints_passed", "0",
+             "constraints"),
+            ("left_swing_selected_clearance_certified", "0", "certified"),
+            ("left_swing_lower_margin", "-.001", "margin"),
+            ("left_swing_witness_upper_margin", ".010002", "width"),
+            ("left_swing_selected_work_point_queries", "1", "work"),
+            ("left_swing_selected_work_cells_visited", "257", "work"),
+            ("left_swing_total_work_cells_visited", "0", "total work"),
+        )
+        for name, value, diagnostic in mutations:
+            changed = [dict(item) for item in treatment]
+            changed[10][name] = value
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    runtime_log.check_gate_e_pair(
+                        changed, control,
+                        expected_scene="grail-curb-low",
+                        expected_route="curb-forward")
+
+    def test_gate_e_requires_ten_samples_per_foot_and_strict_mean_improvement(self):
+        treatment, control = gate_e_rows()
+        for index, (on, off) in enumerate(zip(treatment, control)):
+            if index < 9:
+                _set_gate_e_contact(on, "left", True)
+                _set_gate_e_contact_bypass(on, "left")
+                off["left_contact"] = "1"
+            else:
+                _set_gate_e_swing(on, "left")
+                off["left_contact"] = "0"
+        with self.assertRaisesRegex(ValueError, "left.*10 planted"):
+            runtime_log.check_gate_e_pair(
+                treatment, control,
+                expected_scene="grail-curb-low",
+                expected_route="curb-forward")
+
+        treatment, control = gate_e_rows()
+        for item in treatment:
+            if item["left_locked"] == "1":
+                item["left_lock_drift"] = item["left_observed_lock_drift"]
+            if item["right_locked"] == "1":
+                item["right_lock_drift"] = item["right_observed_lock_drift"]
+        with self.assertRaisesRegex(ValueError, "strictly improve"):
+            runtime_log.check_gate_e_pair(
+                treatment, control,
+                expected_scene="grail-curb-low",
+                expected_route="curb-forward")
+
+        treatment, control = gate_e_rows()
+        for item in treatment:
+            if item["left_locked"] == "1":
+                item["left_observed_lock_drift"] = ".01"
+                item["left_lock_drift"] = ".02"
+            if item["right_locked"] == "1":
+                item["right_observed_lock_drift"] = ".1"
+                item["right_lock_drift"] = "0"
+        with self.assertRaisesRegex(ValueError, "left.*strictly improve"):
+            runtime_log.check_gate_e_pair(
+                treatment, control,
+                expected_scene="grail-curb-low",
+                expected_route="curb-forward")
+
+        for name in ("left_observed_lock_drift", "left_lock_drift"):
+            treatment, control = gate_e_rows()
+            treatment[20][name] = "-.001"
+            with self.subTest(nonnegative=name):
+                with self.assertRaisesRegex(ValueError, "nonnegative"):
+                    runtime_log.check_gate_e_pair(
+                        treatment, control,
+                        expected_scene="grail-curb-low",
+                        expected_route="curb-forward")
+
+    def test_gate_e_stress_accepts_exact_traverse_or_atomic_safe_stop(self):
+        self.assertEqual(
+            runtime_log.GATE_E_STRESS_ROUTES,
+            frozenset(GATE_E_STRESS_CASES))
+        treatment, control = gate_e_rows(
+            scene="grail-curb-medium", route="curb-forward")
+        for item in treatment + control:
+            item["walkability_class"] = "2"
+        report = runtime_log.check_gate_e_stress_pair(
+            treatment, control,
+            expected_scene="grail-curb-medium",
+            expected_route="curb-forward")
+        self.assertEqual(report["branch"], "traverse")
+
+        treatment, control = gate_e_safe_stop_rows()
+        report = runtime_log.check_gate_e_stress_pair(
+            treatment, control,
+            expected_scene="grail-curb-medium",
+            expected_route="curb-forward")
+        self.assertEqual(report["branch"], "safe-stop")
+        self.assertEqual(report["first_rejected_frame"], 700)
+
+        mutations = (
+            (750, "actual_simulation_speed", ".001", "stopped"),
+            (750, "simulation_z", "6.021", "displacement"),
+            (750, "support_height", ".021", "support rise"),
+            (750, "accepted_state_digest_hex", "f" * 16, "digest"),
+            (750, "ik_adjusted_hips_y", ".9", "atomic"),
+            (750, "scene_frame", "700", "atomic|scene_frame"),
+            (100, "source_name", "different", "pair invariant"),
+        )
+        for index, name, value, diagnostic in mutations:
+            treatment, control = gate_e_safe_stop_rows()
+            treatment[index][name] = value
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    runtime_log.check_gate_e_stress_pair(
+                        treatment, control,
+                        expected_scene="grail-curb-medium",
+                        expected_route="curb-forward")
+
+        treatment, control = gate_e_safe_stop_rows()
+        treatment[750]["frame_rejected"] = "0"
+        with self.assertRaisesRegex(ValueError, "tail|rejection|scene_frame"):
+            runtime_log.check_gate_e_stress_pair(
+                treatment, control,
+                expected_scene="grail-curb-medium",
+                expected_route="curb-forward")
+
+        treatment, control = gate_e_safe_stop_rows()
+        treatment[750].update({
+            "frame_rejection_stage": "ik-candidate",
+            "rejected_stop_reason": "target-unreachable",
+            "rejected_attempted_ik_available": "1",
+        })
+        with self.assertRaisesRegex(ValueError, "stage/reason/availability"):
+            runtime_log.check_gate_e_stress_pair(
+                treatment, control,
+                expected_scene="grail-curb-medium",
+                expected_route="curb-forward")
+
+        for name, value in (
+                ("frame_rejection_stage", "ik-candidate"),
+                ("rejected_stop_reason", "target-unreachable"),
+                ("rejected_attempted_footprint_available", "0"),
+                ("rejected_attempted_ik_available", "1"),
+                ("rejected_attempted_pose_available", "1"),
+                ("route_complete", "1")):
+            treatment, control = gate_e_safe_stop_rows()
+            treatment[750][name] = value
+            with self.subTest(stress_rejection_owner=name):
+                with self.assertRaises(ValueError):
+                    runtime_log.check_gate_e_stress_pair(
+                        treatment, control,
+                        expected_scene="grail-curb-medium",
+                        expected_route="curb-forward")
+
+    def test_gate_d_ik_pair_reuses_control_gate_and_proves_atomic_hold(self):
+        self.assertEqual(
+            runtime_log.GATE_D_IK_ROUTES, frozenset(GATE_D_IK_CASES))
+        treatment, control = gate_d_ik_rows()
+        report = runtime_log.check_gate_d_ik_pair(
+            treatment, control,
+            expected_scene="blocked-course",
+            expected_route="wall-safe-stop")
+        self.assertEqual(report["frames"], 600)
+        self.assertGreaterEqual(report["stopped_frames"], 25)
+        self.assertGreaterEqual(report["minimum_blocked_distance"], .0199)
+
+        mutations = (
+            (112, "walkability_class", "0", "class-0"),
+            (112, "blocked_distance", ".0198", "distance"),
+            (112, "rendered_min_clearance", "-.01001", "clearance"),
+            (112, "support_height", ".021", "support rise"),
+            (112, "accepted_state_digest_hex", "f" * 16, "digest"),
+            (112, "ik_adjusted_hips_y", ".9", "root-reach|atomic"),
+        )
+        for index, name, value, diagnostic in mutations:
+            treatment, control = gate_d_ik_rows()
+            treatment[index][name] = value
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    runtime_log.check_gate_d_ik_pair(
+                        treatment, control,
+                        expected_scene="blocked-course",
+                        expected_route="wall-safe-stop")
+
+        treatment, control = gate_d_ik_rows()
+        for item in treatment[112:590]:
+            item["applied_speed"] = ".1"
+            item["actual_simulation_speed"] = ".1"
+        with self.assertRaisesRegex(ValueError, "25.*stopped"):
+            runtime_log.check_gate_d_ik_pair(
+                treatment, control,
+                expected_scene="blocked-course",
+                expected_route="wall-safe-stop")
+
+        treatment, control = gate_d_ik_rows()
+        treatment[200]["applied_speed"] = ".1"
+        treatment[200]["actual_simulation_speed"] = ".1"
+        with self.subTest(blocked_tail="late-motion"):
+            with self.assertRaisesRegex(ValueError, "tail.*stopped"):
+                runtime_log.check_gate_d_ik_pair(
+                    treatment, control,
+                    expected_scene="blocked-course",
+                    expected_route="wall-safe-stop")
+
+        treatment, control = gate_d_ik_rows()
+        treatment[200].update({
+            "frame_rejection_stage": "ik-candidate",
+            "rejected_stop_reason": "target-unreachable",
+            "rejected_attempted_ik_available": "1",
+        })
+        with self.subTest(blocked_tail="alternate-rejection"):
+            with self.assertRaisesRegex(
+                    ValueError, "stage/reason/availability"):
+                runtime_log.check_gate_d_ik_pair(
+                    treatment, control,
+                    expected_scene="blocked-course",
+                    expected_route="wall-safe-stop")
+
+        for name, value in (
+                ("frame_rejection_stage", "ik-candidate"),
+                ("rejected_stop_reason", "target-unreachable"),
+                ("rejected_attempted_footprint_available", "0"),
+                ("rejected_attempted_ik_available", "1"),
+                ("rejected_attempted_pose_available", "1"),
+                ("route_complete", "1")):
+            treatment, control = gate_d_ik_rows()
+            treatment[200][name] = value
+            with self.subTest(blocked_rejection_owner=name):
+                with self.assertRaises(ValueError):
+                    runtime_log.check_gate_d_ik_pair(
+                        treatment, control,
+                        expected_scene="blocked-course",
+                        expected_route="wall-safe-stop")
+
+        treatment, control = gate_d_ik_rows()
+        control[120]["walkability_class"] = "0"
+        with self.assertRaisesRegex(ValueError, "Gate D entered blocked"):
+            runtime_log.check_gate_d_ik_pair(
+                treatment, control,
+                expected_scene="blocked-course",
+                expected_route="wall-safe-stop")
+
+    def test_gate_d_ik_pair_causally_binds_control_at_rejection(self):
+        treatment, control = gate_d_ik_rows()
+        first_rejected = next(
+            index for index, item in enumerate(treatment)
+            if int(item["frame_rejected"]) == 1)
+        self.assertEqual(first_rejected, 111)
+        self.assertEqual(control[first_rejected - 1]["blocked"], "1")
+        control[first_rejected].update({
+            "blocked": "0",
+            "blocked_reason": "clear",
+        })
+        with self.assertRaisesRegex(ValueError, "paired control.*rejection"):
+            runtime_log.check_gate_d_ik_pair(
+                treatment, control,
+                expected_scene="blocked-course",
+                expected_route="wall-safe-stop")
+
+    def test_rejected_tail_freezes_accepted_matching_provenance(self):
+        for name, mutate in (
+                ("source_name", lambda item: "forged-source"),
+                ("query_bits_hex", lambda item: "3f800000" + item[8:]),
+                ("source_index", lambda item: str(int(item) + 1))):
+            treatment, control = gate_d_ik_rows()
+            treatment[112][name] = mutate(treatment[112][name])
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, "root-reach|atomic"):
+                    runtime_log.check_gate_d_ik_pair(
+                        treatment, control,
+                        expected_scene="blocked-course",
+                        expected_route="wall-safe-stop")
+
+    def test_gate_e_cli_dispatches_all_modes_and_locks_composition(self):
+        normal, normal_off = gate_e_rows()
+        stress, stress_off = gate_e_safe_stop_rows()
+        blocked, blocked_off = gate_d_ik_rows()
+        with tempfile.TemporaryDirectory() as directory:
+            paths = {}
+            for name, values in (
+                    ("normal", normal), ("normal-off", normal_off),
+                    ("stress", stress), ("stress-off", stress_off),
+                    ("blocked", blocked), ("blocked-off", blocked_off)):
+                paths[name] = os.path.join(directory, name + ".csv")
+                write_columns(paths[name], values, RUNTIME_COLUMNS)
+            cases = (
+                ("gate-e", paths["normal"], paths["normal-off"],
+                 "grail-curb-low", "curb-forward"),
+                ("gate-e-stress", paths["stress"], paths["stress-off"],
+                 "grail-curb-medium", "curb-forward"),
+                ("gate-d-ik", paths["blocked"], paths["blocked-off"],
+                 "blocked-course", "wall-safe-stop"),
+            )
+            for flag, primary, control_path, scene, route in cases:
+                output = io.StringIO()
+                with self.subTest(flag=flag), contextlib.redirect_stdout(output):
+                    self.assertEqual(runtime_log.main([
+                        primary, f"--{flag}",
+                        "--compare-ik-off", control_path,
+                        "--expected-scene", scene,
+                        "--expected-route", route,
+                    ]), 0)
+                self.assertTrue(
+                    output.getvalue().startswith(f"VALID {flag} "))
+
+        for extra, diagnostic in (
+                (["--gate-e"], "compare-ik-off.*expected-scene.*expected-route"),
+                (["--gate-e", "--gate-e-stress"], "not allowed"),
+                (["--expected-scene", "x"], "requires"),
+                (["--gate-e", "--gate-a"], "may not combine")):
+            stderr = io.StringIO()
+            with self.subTest(extra=extra), contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as raised:
+                    runtime_log.main(["unused.csv", *extra])
+            self.assertEqual(raised.exception.code, 2)
+            self.assertRegex(stderr.getvalue(), diagnostic)
 
     def test_legacy_runtime_schema_remains_readable_for_earlier_gates(self):
         legacy_c = legacy_runtime_rows(gate_c_rows())
@@ -791,7 +1531,7 @@ class RuntimeLogTests(unittest.TestCase):
             ("ik_enabled", 70, "0", "IK enabled"),
             ("ik_applied", 70, "0", "IK applied"),
             ("walkability_class", 70, "2", "class-1"),
-            ("frame_rejected", 70, "1", "rejection"),
+            ("frame_rejected", 70, "1", "rejection|scene_frame"),
             ("left_toe_clearance", 70, "-.006", "planted"),
             ("left_foot_clearance", 70, "-.006", "planted"),
             ("left_candidate_toe_clearance", 70, "-.006", "planted"),
@@ -851,7 +1591,8 @@ class RuntimeLogTests(unittest.TestCase):
             "rejected_left_landing_walkability_class": "1",
             "rejected_left_landing_patch_maximum_residual": ".006",
         })
-        with self.assertRaisesRegex(ValueError, "accepted-state digest"):
+        with self.assertRaisesRegex(
+                ValueError, "accepted-state digest|scene_frame"):
             gate_l_check(changed_digest, safety_only=True)
 
     def test_gate_l_enforces_ik_route_completion_endpoint_and_no_stop(self):
@@ -865,7 +1606,7 @@ class RuntimeLogTests(unittest.TestCase):
             ("footprint_blocked", 60, "1",
              "safe-stop|accepted footprint.*blocked"),
             ("ik_safe_stop_latched", 60, "1", "safe-stop"),
-            ("frame_rejected", 60, "1", "rejection"),
+            ("frame_rejected", 60, "1", "rejection|scene_frame"),
         )
         for name, index, value, diagnostic in cases:
             rows = gate_l_rows()
@@ -1605,6 +2346,24 @@ class RuntimeLogTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "availability|rejection"):
                     check_rows(changed, allow_ik=True)
 
+    def test_rejected_transition_freezes_accepted_query_cursor(self):
+        rows = transition_rejection_rows()
+        self.assertEqual(check_rows(rows, allow_ik=True)["frames"], 3)
+
+        for name, value, diagnostic in (
+                ("query_database_frame", "101", "accepted query.*frame"),
+                ("query_range", "1", "accepted query.*range")):
+            changed = [dict(item) for item in rows]
+            changed[2][name] = value
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    check_rows(changed, allow_ik=True)
+
+        changed = [dict(item) for item in rows]
+        changed[1]["query_range"] = "1"
+        with self.assertRaisesRegex(ValueError, "prior pose range"):
+            check_rows(changed, allow_ik=True)
+
     def test_landing_patch_rejection_requires_attempted_unready_patch_evidence(self):
         rows = rejection_rows()
         rows[1].update({
@@ -1667,6 +2426,63 @@ class RuntimeLogTests(unittest.TestCase):
         rows[1]["rejected_left_target_x"] = "1"
         with self.assertRaisesRegex(ValueError, "canonical"):
             check_rows(rows, allow_ik=True)
+
+    def test_pose_rejection_keeps_footprint_landing_without_attempted_ik(self):
+        rows = rejection_rows("pose-certificate")
+        rows[1].update({
+            "rejected_left_landing_expected": "1",
+            "rejected_left_landing_patch_ready": "0",
+            "rejected_left_landing_sample": "1",
+            "rejected_left_landing_center_x": "-.0123839173",
+            "rejected_left_landing_center_y": ".0927663371",
+            "rejected_left_landing_center_z": "-.0442949049",
+            "rejected_left_landing_surface_status": "valid",
+            "rejected_left_landing_surface_height": "0",
+            "rejected_left_landing_surface_normal_x": "0",
+            "rejected_left_landing_surface_normal_y": "1",
+            "rejected_left_landing_surface_normal_z": "0",
+            "rejected_left_landing_walkability_class": "1",
+            "rejected_left_landing_patch_maximum_residual":
+                ".089818030595779419",
+        })
+        self.assertEqual(check_rows(rows, allow_ik=True)["frames"], 2)
+
+        changed = [dict(item) for item in rows]
+        changed[1]["rejected_attempted_footprint_available"] = "0"
+        with self.assertRaisesRegex(ValueError, "availability|footprint"):
+            check_rows(changed, allow_ik=True)
+
+        changed = [dict(item) for item in rows]
+        changed[1]["rejected_left_target_x"] = ".01"
+        with self.assertRaisesRegex(ValueError, "attempted IK|canonical"):
+            check_rows(changed, allow_ik=True)
+
+    def test_rejected_landing_does_not_use_republished_accepted_contact(self):
+        rows = rejection_rows()
+        rows[1].update({
+            "frame_rejection_stage": "ik-candidate",
+            "rejected_stop_reason": "no-swing-candidate",
+            "left_recorded_contact": "1",
+            "rejected_left_landing_expected": "1",
+            "rejected_left_landing_patch_ready": "1",
+            "rejected_left_landing_sample": "3",
+            "rejected_left_landing_surface_status": "valid",
+            "rejected_left_landing_walkability_class": "1",
+            "rejected_left_landing_patch_maximum_residual": "0",
+        })
+        self.assertEqual(check_rows(rows, allow_ik=True)["frames"], 2)
+
+        for name, value in (
+                ("rejected_left_landing_sample", "0"),
+                ("rejected_left_landing_surface_status", "outside"),
+                ("rejected_left_landing_walkability_class", "0"),
+                ("rejected_left_landing_patch_maximum_residual", ".006")):
+            changed = [dict(item) for item in rows]
+            changed[1][name] = value
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(
+                        ValueError, "landing.*malformed|ready.*inconsistent"):
+                    check_rows(changed, allow_ik=True)
 
     def test_surface_height_names_are_frozen_before_runtime_schema(self):
         for name in (
