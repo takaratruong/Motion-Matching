@@ -6,11 +6,13 @@ BUILD_COMMIT := $(shell git -C ../.. rev-parse HEAD 2>/dev/null || echo unknown)
 JOINT_CONTRACT := $(abspath ../configs/g1_joint_contract.json)
 SCENE_REGISTRY := $(abspath ../configs/scene_registry.json)
 
-.PHONY: all clean mm_chunk_server
+.PHONY: all clean mm_chunk_server route_schedule_cli
 
 all: mm_chunk_server
 
 mm_chunk_server: $(BUILD_DIR)/mm_chunk_server
+
+route_schedule_cli: $(BUILD_DIR)/route_schedule_cli
 
 $(BUILD_DIR)/mm_chunk_server: mm_chunk_server.cpp mm_chunk_protocol.h \
 		mm_chunk_json.h g1_runtime.h g1_joint_projection.h \
@@ -24,5 +26,10 @@ $(BUILD_DIR)/mm_chunk_server: mm_chunk_server.cpp mm_chunk_protocol.h \
 		-DMM_CHUNK_DEFAULT_SCENE_REGISTRY=\"$(SCENE_REGISTRY)\" \
 		mm_chunk_server.cpp -o $@
 
+$(BUILD_DIR)/route_schedule_cli: route_schedule_cli.cpp ../../route_runtime.h \
+		../../scene_runtime.h ../../json_runtime.h ../../terrain_runtime.h
+	mkdir -p $(BUILD_DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) route_schedule_cli.cpp -o $@
+
 clean:
-	rm -f $(BUILD_DIR)/mm_chunk_server
+	rm -f $(BUILD_DIR)/mm_chunk_server $(BUILD_DIR)/route_schedule_cli

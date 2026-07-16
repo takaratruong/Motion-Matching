@@ -17,6 +17,9 @@ from typing import Mapping
 
 LOCK_SCHEMA = "gear-sonic-lock/v1"
 LOCK_REPOSITORY = "https://github.com/NVlabs/GR00T-WholeBodyControl.git"
+CURRENT_FRAME_ADVANCEMENT_SHA256 = (
+    "adcd05aa6abdde2f849ac3cfef6971f629a6972b680d78fb959b7eb5d8649f33"
+)
 
 LOCK_PATH_KEYS = (
     "known_good_reference",
@@ -25,6 +28,7 @@ LOCK_PATH_KEYS = (
     "zmq_example_source",
     "zmq_decoder_source",
     "stream_merger_source",
+    "current_frame_advancement_source",
 )
 
 SOURCE_PATH_KEYS = LOCK_PATH_KEYS[1:]
@@ -72,7 +76,15 @@ KNOWN_GOOD_REFERENCE_FILES = (
     "metadata.txt",
 )
 
-_LOCK_KEYS = frozenset(("schema", "repository", "commit", *LOCK_PATH_KEYS))
+_LOCK_KEYS = frozenset(
+    (
+        "schema",
+        "repository",
+        "commit",
+        "current_frame_advancement_sha256",
+        *LOCK_PATH_KEYS,
+    )
+)
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _PERMUTATION_RE = re.compile(
     r"\bmujoco_to_isaaclab\b\s*=\s*\{(?P<values>[^}]*)\}",
@@ -194,6 +206,16 @@ def verify_gear_checkout(
             _verify_permutation(source, contents)
         else:
             hashes[f"gear:{key}"] = _sha256_file(source)
+        if (
+            key == "current_frame_advancement_source"
+            and hashes[f"gear:{key}"]
+            != lock_data["current_frame_advancement_sha256"]
+        ):
+            raise ExternalInputError(
+                "pinned CurrentFrameAdvancement source hash mismatch: "
+                f"expected {lock_data['current_frame_advancement_sha256']}, "
+                f"found {hashes[f'gear:{key}']}"
+            )
 
     reference = _checkout_path(
         checkout,
@@ -375,6 +397,14 @@ def _load_lock(lock: Path) -> dict[str, str]:
         data["commit"]
     ):
         raise ExternalInputError("GEAR lock commit must be 40 lowercase hex digits")
+    advancement_digest = data["current_frame_advancement_sha256"]
+    if (
+        not isinstance(advancement_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", advancement_digest) is None
+    ):
+        raise ExternalInputError(
+            "GEAR lock CurrentFrameAdvancement digest must be lowercase SHA-256"
+        )
 
     for key in LOCK_PATH_KEYS:
         value = data[key]

@@ -23,6 +23,7 @@ from typing import Callable, Mapping, Protocol
 
 import numpy as np
 
+from .commands import CommandSample
 from .joints import ContractError, JointContract
 from .process import AdvanceResult
 from .schema import InitialBoundary, SourceChunk, parse_initial_boundary, parse_source_chunk
@@ -68,38 +69,6 @@ class IntegrationFailure(RuntimeError):
         self.site = site
         self.cause = cause
         super().__init__(f"{phase} integration failure at {site}: {cause}")
-
-
-def _finite_tuple(value: object, width: int, label: str) -> tuple[float, ...]:
-    if type(value) not in (tuple, list) or len(value) != width:
-        raise ContractError(f"command {label} must have width {width}")
-    output: list[float] = []
-    for item in value:
-        if type(item) not in (int, float) or not math.isfinite(float(item)):
-            raise ContractError(f"command {label} must contain finite values")
-        output.append(float(item))
-    return tuple(output)
-
-
-@dataclass(frozen=True)
-class CommandSample:
-    """One target-basis command value, latched only at a chunk boundary."""
-
-    requested_velocity_mujoco: tuple[float, float, float]
-    desired_heading_mujoco_wxyz: tuple[float, float, float, float]
-
-    def __post_init__(self) -> None:
-        velocity = _finite_tuple(
-            self.requested_velocity_mujoco, 3, "velocity"
-        )
-        heading = _finite_tuple(
-            self.desired_heading_mujoco_wxyz, 4, "heading quaternion"
-        )
-        norm = math.sqrt(sum(value * value for value in heading))
-        if abs(norm - 1.0) > 1.0e-6:
-            raise ContractError("command heading quaternion must be unit length")
-        object.__setattr__(self, "requested_velocity_mujoco", velocity)
-        object.__setattr__(self, "desired_heading_mujoco_wxyz", heading)
 
 
 @dataclass(frozen=True)
@@ -986,6 +955,13 @@ class Coordinator:
                     "ready_paused coordinator requires a queued command"
                 )
             latched = self._pending_command
+            if latched.chunk_index != self._accepted_chunks:
+                self._pending_command = None
+                raise ContractError(
+                    "command chunk_index "
+                    f"{latched.chunk_index} does not equal next chunk_index "
+                    f"{self._accepted_chunks}"
+                )
             self._pending_command = None
             self._latched_command = latched
             candidate_id = self._candidate_id()

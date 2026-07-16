@@ -7,5 +7,7 @@
   "policy_parameters_source": "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/policy_parameters.hpp",
   "zmq_example_source": "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/tests/test_zmq_manager.py",
   "zmq_decoder_source": "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/input_interface/zmq_packed_message_subscriber.hpp",
-  "stream_merger_source": "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/input_interface/streamed_motion_merger.hpp"
+  "stream_merger_source": "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/input_interface/streamed_motion_merger.hpp",
+  "current_frame_advancement_source": "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/src/g1_deploy_onnx_ref.cpp",
+  "current_frame_advancement_sha256": "adcd05aa6abdde2f849ac3cfef6971f629a6972b680d78fb959b7eb5d8649f33"
 }

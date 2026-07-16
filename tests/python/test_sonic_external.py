@@ -67,6 +67,10 @@ LOCK_PATHS = {
         "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/"
         "input_interface/streamed_motion_merger.hpp"
     ),
+    "current_frame_advancement_source": (
+        "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/src/"
+        "g1_deploy_onnx_ref.cpp"
+    ),
 }
 
 KNOWN_GOOD_REFERENCE = (
@@ -153,11 +157,15 @@ class ExternalPreflightTests(unittest.TestCase):
         return self._git("rev-parse", "HEAD")
 
     def _write_lock(self, commit):
+        advancement = self.checkout / LOCK_PATHS["current_frame_advancement_source"]
         lock = {
             "schema": "gear-sonic-lock/v1",
             "repository": "https://github.com/NVlabs/GR00T-WholeBodyControl.git",
             "commit": commit,
             "known_good_reference": KNOWN_GOOD_REFERENCE,
+            "current_frame_advancement_sha256": hashlib.sha256(
+                advancement.read_bytes()
+            ).hexdigest(),
             **LOCK_PATHS,
         }
         self.lock_path.write_text(
@@ -192,6 +200,16 @@ class ExternalPreflightTests(unittest.TestCase):
         self._write_lock(self._head())
 
         with self.assertRaisesRegex(ExternalInputError, "zmq_decoder_source"):
+            verify_gear_checkout(self.checkout, self.lock_path)
+
+    def test_mismatched_current_frame_advancement_digest_is_rejected(self):
+        lock = json.loads(self.lock_path.read_text(encoding="utf-8"))
+        lock["current_frame_advancement_sha256"] = "0" * 64
+        self.lock_path.write_text(
+            json.dumps(lock, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        with self.assertRaisesRegex(ExternalInputError, "CurrentFrameAdvancement"):
             verify_gear_checkout(self.checkout, self.lock_path)
 
     def test_modified_target_permutation_is_rejected(self):
@@ -386,6 +404,7 @@ class ExternalPreflightTests(unittest.TestCase):
             {
                 "encoder",
                 "gear:joint_names_source",
+                "gear:current_frame_advancement_source",
                 "gear:known_good_reference/body_ang_vel.csv",
                 "gear:known_good_reference/body_lin_vel.csv",
                 "gear:known_good_reference/body_pos.csv",

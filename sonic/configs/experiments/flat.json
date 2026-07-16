@@ -1,0 +1,20 @@
+{
+  "schema": "mm-sonic-flat-experiment/v1",
+  "scene_id": "sonic-flat-baseline",
+  "route_id": "flat-12s",
+  "chunk_intervals": 10,
+  "source_rate_hz": 25,
+  "target_rate_hz": 50,
+  "chunk_count": 30,
+  "duration_s": 12.0,
+  "terrain_weight": 0.0,
+  "success": {
+    "minimum_pelvis_local_height_m": 0.45,
+    "minimum_pelvis_up_dot": 0.5,
+    "forbidden_contact_groups": ["pelvis", "knees", "torso", "hands"],
+    "known_good_metric_multiplier": 1.5,
+    "known_good_zero_epsilon": 1e-8,
+    "require_exact_command_coverage": true,
+    "require_exact_frame_coverage": true
+  }
+}

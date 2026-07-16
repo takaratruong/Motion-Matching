@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://motion-matching.invalid/schemas/trial_verdict_v1.schema.json",
+  "title": "MM SONIC trial verdict v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "stage",
+    "scene_id",
+    "terrain_weight",
+    "expected_frames",
+    "expected_sim_time_s",
+    "integration_pass",
+    "kinematic_pass",
+    "dynamic_pass",
+    "failure_layer",
+    "metrics",
+    "timings",
+    "evidence_hashes"
+  ],
+  "properties": {
+    "schema": {"const": "mm-sonic-trial-verdict/v1"},
+    "stage": {"enum": ["A", "B", "C"]},
+    "scene_id": {"type": "string", "minLength": 1},
+    "terrain_weight": {"type": "number"},
+    "expected_frames": {"type": "integer", "minimum": 1},
+    "expected_sim_time_s": {"type": "number", "exclusiveMinimum": 0},
+    "integration_pass": {"type": "boolean"},
+    "kinematic_pass": {"type": "boolean"},
+    "dynamic_pass": {"type": "boolean"},
+    "failure_layer": {
+      "type": ["string", "null"],
+      "enum": [
+        null,
+        "integration",
+        "gear_setup_model_simulator_or_harness",
+        "bridge_protocol",
+        "joint_or_coordinate_conversion",
+        "reference_distribution_or_sonic_tracking",
+        "motion_matching_reference",
+        "low_level_tracking_contact_domain_mismatch"
+      ]
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "joint_position_rmse_rad",
+        "pelvis_orientation_rms_rad",
+        "swing_foot_scuff_count",
+        "minimum_foot_clearance_m",
+        "horizontal_path_drift_m",
+        "joint_tracking_trace_rad",
+        "pelvis_tracking_trace_rad",
+        "contact_impulses_ns",
+        "policy_execution_timing_ns"
+      ],
+      "properties": {
+        "joint_position_rmse_rad": {"type": "number", "minimum": 0},
+        "pelvis_orientation_rms_rad": {"type": "number", "minimum": 0},
+        "swing_foot_scuff_count": {"type": "integer", "minimum": 0},
+        "minimum_foot_clearance_m": {"type": "number"},
+        "horizontal_path_drift_m": {"type": "number", "minimum": 0},
+        "joint_tracking_trace_rad": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "number", "minimum": 0}
+        },
+        "pelvis_tracking_trace_rad": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "number", "minimum": 0}
+        },
+        "contact_impulses_ns": {
+          "type": "array",
+          "items": {"type": "number", "minimum": 0}
+        },
+        "policy_execution_timing_ns": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/timingSummary"}
+          ]
+        }
+      }
+    },
+    "timings": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/timingSummary"}
+    },
+    "evidence_hashes": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}$"
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"dynamic_pass": {"const": true}},
+        "required": ["dynamic_pass"]
+      },
+      "then": {
+        "properties": {"integration_pass": {"const": true}}
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "integration_pass": {"const": true},
+          "kinematic_pass": {"const": true},
+          "dynamic_pass": {"const": true}
+        },
+        "required": ["integration_pass", "kinematic_pass", "dynamic_pass"]
+      },
+      "then": {
+        "properties": {"failure_layer": {"const": null}}
+      }
+    }
+  ],
+  "$defs": {
+    "timingSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["p50", "p95", "p99"],
+      "properties": {
+        "p50": {"type": "number", "minimum": 0},
+        "p95": {"type": "number", "minimum": 0},
+        "p99": {"type": "number", "minimum": 0}
+      }
+    }
+  }
+}

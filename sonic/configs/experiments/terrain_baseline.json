@@ -1,0 +1,27 @@
+{
+  "schema": "mm-sonic-terrain-experiment/v1",
+  "chunk_intervals": 10,
+  "source_rate_hz": 25,
+  "target_rate_hz": 50,
+  "conditions": {
+    "aware": 4.0,
+    "blind": 0.0
+  },
+  "scenes": [
+    {"scene_id": "grail-curb-low", "route_id": "curb-forward"},
+    {"scene_id": "ramp-10-up-down", "route_id": "up-landing-down"},
+    {"scene_id": "stairs-shallow", "route_id": "ascent-landing-descent"}
+  ],
+  "success": {
+    "target_radius_m": 0.25,
+    "duration_multiplier": 1.25,
+    "minimum_pelvis_local_height_m": 0.45,
+    "minimum_pelvis_up_dot": 0.5,
+    "forbidden_contact_groups": ["pelvis", "knees", "torso", "hands"],
+    "require_exact_frame_coverage": true
+  },
+  "hypothesis": {
+    "aware_minimum_successes": 8,
+    "aware_minus_blind_minimum": 3
+  }
+}

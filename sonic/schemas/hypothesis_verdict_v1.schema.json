@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://motion-matching.invalid/schemas/hypothesis_verdict_v1.schema.json",
+  "title": "MM SONIC hypothesis verdict v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "status", "terrain_classes", "overall_hypothesis", "evidence_hashes"],
+  "properties": {
+    "schema": {"const": "mm-sonic-hypothesis-verdict/v1"},
+    "status": {"enum": ["complete", "incomplete", "not_run"]},
+    "terrain_classes": {
+      "type": "array",
+      "maxItems": 3,
+      "items": {"$ref": "#/$defs/classVerdict"}
+    },
+    "overall_hypothesis": {
+      "type": ["string", "null"],
+      "enum": [null, "supported", "not_supported", "inconclusive"]
+    },
+    "evidence_hashes": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}$"
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"status": {"const": "complete"}},
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "terrain_classes": {
+            "minItems": 3,
+            "maxItems": 3,
+            "allOf": [
+              {
+                "contains": {
+                  "type": "object",
+                  "required": ["scene_id"],
+                  "properties": {"scene_id": {"const": "grail-curb-low"}}
+                },
+                "minContains": 1,
+                "maxContains": 1
+              },
+              {
+                "contains": {
+                  "type": "object",
+                  "required": ["scene_id"],
+                  "properties": {"scene_id": {"const": "ramp-10-up-down"}}
+                },
+                "minContains": 1,
+                "maxContains": 1
+              },
+              {
+                "contains": {
+                  "type": "object",
+                  "required": ["scene_id"],
+                  "properties": {"scene_id": {"const": "stairs-shallow"}}
+                },
+                "minContains": 1,
+                "maxContains": 1
+              }
+            ]
+          },
+          "overall_hypothesis": {
+            "enum": ["supported", "not_supported", "inconclusive"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"status": {"enum": ["incomplete", "not_run"]}},
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {"overall_hypothesis": {"const": null}}
+      }
+    }
+  ],
+  "$defs": {
+    "classVerdict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scene_id",
+        "aware_successes",
+        "blind_successes",
+        "scored_trials_per_condition",
+        "aware_integration_failures",
+        "blind_integration_failures",
+        "kinematic_defects",
+        "pass_margin",
+        "composition_verdict",
+        "awareness_verdict",
+        "evidence_hashes"
+      ],
+      "properties": {
+        "scene_id": {
+          "enum": ["grail-curb-low", "ramp-10-up-down", "stairs-shallow"]
+        },
+        "aware_successes": {"type": "integer", "minimum": 0, "maximum": 10},
+        "blind_successes": {"type": "integer", "minimum": 0, "maximum": 10},
+        "scored_trials_per_condition": {"const": 10},
+        "aware_integration_failures": {"type": "integer", "minimum": 0, "maximum": 10},
+        "blind_integration_failures": {"type": "integer", "minimum": 0, "maximum": 10},
+        "kinematic_defects": {"type": "integer", "minimum": 0, "maximum": 2},
+        "pass_margin": {"type": "integer", "minimum": -10, "maximum": 10},
+        "composition_verdict": {"enum": ["supported", "not_supported"]},
+        "awareness_verdict": {"enum": ["supported", "not_supported", "inconclusive"]},
+        "evidence_hashes": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      }
+    }
+  }
+}

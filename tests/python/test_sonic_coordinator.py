@@ -573,8 +573,9 @@ class Harness:
         self.events.clear()
 
     @staticmethod
-    def command(speed: float = 0.5) -> CommandSample:
+    def command(speed: float = 0.5, *, chunk_index: int = 0) -> CommandSample:
         return CommandSample(
+            chunk_index=chunk_index,
             requested_velocity_mujoco=(speed, 0.0, 0.0),
             desired_heading_mujoco_wxyz=(1.0, 0.0, 0.0, 0.0),
         )
@@ -607,7 +608,7 @@ class CoordinatorContractTests(unittest.TestCase):
         ):
             with self.subTest(expected=expected):
                 with self.assertRaisesRegex(ContractError, expected):
-                    CommandSample(velocity, heading)
+                    CommandSample(0, velocity, heading)
 
     def test_session_config_requires_real_protocol_route(self) -> None:
         with self.assertRaisesRegex(ContractError, "route_id"):
@@ -956,7 +957,7 @@ class CoordinatorSuccessTests(unittest.TestCase):
 
     def test_mid_generation_input_is_queued_without_mutating_the_latched_candidate(self) -> None:
         first = Harness.command(0.25)
-        second = Harness.command(0.75)
+        second = Harness.command(0.75, chunk_index=1)
         self.harness.coordinator.queue_command(first)
         observed_state: list[CoordinatorState] = []
 
@@ -983,6 +984,33 @@ class CoordinatorSuccessTests(unittest.TestCase):
             ],
         )
         self.assertEqual(self.harness.timeline.canonical_buffer.count, 41)
+
+    def test_command_chunk_index_must_equal_the_next_acceptance(self) -> None:
+        for wrong in (1, 2):
+            with self.subTest(initial_index=wrong):
+                with self.assertRaisesRegex(ContractError, "chunk_index 0"):
+                    self.harness.coordinator.run_one_chunk(
+                        Harness.command(chunk_index=wrong)
+                    )
+                self.assertEqual(
+                    self.harness.coordinator.state,
+                    CoordinatorState.READY_PAUSED,
+                )
+                self.assertEqual(self.harness.mm.generated_commands, [])
+
+        self.harness.coordinator.run_one_chunk(Harness.command(chunk_index=0))
+        generated = list(self.harness.mm.generated_commands)
+        for wrong in (0, 2):
+            with self.subTest(successor_index=wrong):
+                with self.assertRaisesRegex(ContractError, "chunk_index 1"):
+                    self.harness.coordinator.run_one_chunk(
+                        Harness.command(chunk_index=wrong)
+                    )
+                self.assertEqual(
+                    self.harness.coordinator.state,
+                    CoordinatorState.READY_PAUSED,
+                )
+                self.assertEqual(self.harness.mm.generated_commands, generated)
 
     def test_slow_generation_has_no_scientific_timeout(self) -> None:
         self.harness.coordinator.queue_command(Harness.command())
@@ -1633,6 +1661,7 @@ class MMChunkClientTests(unittest.TestCase):
             started = time.monotonic()
             generated = client.generate(
                 CommandSample(
+                    chunk_index=0,
                     requested_velocity_mujoco=(0.5, -0.25, 0.125),
                     desired_heading_mujoco_wxyz=(1.0, 0.0, 0.0, 0.0),
                 ),
