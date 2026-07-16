@@ -7,6 +7,7 @@
 #include "sonic/cpp/g1_joint_contract_io.h"
 #include "sonic/cpp/g1_joint_projection.h"
 #include "sonic/cpp/g1_runtime.h"
+#include "sonic/cpp/sonic_flat_scene.h"
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
@@ -27,6 +28,10 @@
 
 #ifndef MM_CHUNK_DEFAULT_JOINT_CONTRACT
 #define MM_CHUNK_DEFAULT_JOINT_CONTRACT "sonic/configs/g1_joint_contract.json"
+#endif
+
+#ifndef MM_CHUNK_DEFAULT_SCENE_REGISTRY
+#define MM_CHUNK_DEFAULT_SCENE_REGISTRY "sonic/configs/scene_registry.json"
 #endif
 
 static constexpr const char* MM_CHUNK_SCHEMA = "mm-chunk/v1";
@@ -148,6 +153,7 @@ public:
     bool initialize(
         const char* terrain_root,
         const char* contract_path,
+        const char* registry_path,
         std::string& message)
     {
         char error[1024] = {};
@@ -155,8 +161,10 @@ public:
         identity_.build_commit = MM_CHUNK_BUILD_COMMIT;
         identity_.skeleton_signature = G1_SkeletonSignature;
         if (terrain_root_.empty() || contract_path == nullptr ||
-            contract_path[0] == '\0') {
-            message = "terrain root and joint contract are required";
+            contract_path[0] == '\0' || registry_path == nullptr ||
+            registry_path[0] == '\0') {
+            message =
+                "terrain root, joint contract, and scene registry are required";
             return false;
         }
         std::string manifest_path;
@@ -186,6 +194,11 @@ public:
             !sha256_file_hex(
                 identity_.joint_contract_sha256,
                 contract_path,
+                error,
+                static_cast<int>(sizeof(error))) ||
+            !sonic_flat_scene_definition_load(
+                flat_definition_,
+                registry_path,
                 error,
                 static_cast<int>(sizeof(error)))) {
             message = error;
@@ -292,25 +305,37 @@ public:
         std::string& message)
     {
         char error[1024] = {};
-        const int scene_index =
-            scene_catalog_find(catalog_, request.scene_id.c_str());
-        if (scene_index < 0 ||
-            static_cast<std::size_t>(scene_index) >= catalog_.ids.size() ||
-            catalog_.ids[static_cast<std::size_t>(scene_index)] !=
-                request.scene_id) {
-            message = "unknown scene: " + request.scene_id;
-            return false;
-        }
-        if (!scene_pack_load(
-                context.scene,
-                terrain_root_.c_str(),
-                manifest_,
-                catalog_,
-                scene_index,
-                error,
-                static_cast<int>(sizeof(error)))) {
-            message = error;
-            return false;
+        if (request.scene_id == SonicFlatSceneId) {
+            if (!sonic_flat_scene_build(
+                    context.scene,
+                    flat_definition_,
+                    request.route_id,
+                    error,
+                    static_cast<int>(sizeof(error)))) {
+                message = error;
+                return false;
+            }
+        } else {
+            const int scene_index =
+                scene_catalog_find(catalog_, request.scene_id.c_str());
+            if (scene_index < 0 ||
+                static_cast<std::size_t>(scene_index) >= catalog_.ids.size() ||
+                catalog_.ids[static_cast<std::size_t>(scene_index)] !=
+                    request.scene_id) {
+                message = "unknown scene: " + request.scene_id;
+                return false;
+            }
+            if (!scene_pack_load(
+                    context.scene,
+                    terrain_root_.c_str(),
+                    manifest_,
+                    catalog_,
+                    scene_index,
+                    error,
+                    static_cast<int>(sizeof(error)))) {
+                message = error;
+                return false;
+            }
         }
         const scene_route* route =
             scene_route_find(context.scene.metadata, request.route_id.c_str());
@@ -579,6 +604,7 @@ private:
     }
 
     std::string terrain_root_;
+    sonic_flat_scene_definition flat_definition_;
     mm_server_identity identity_;
     mm_server_scene_identity scene_identity_;
     motion_pack_manifest manifest_;
@@ -1318,9 +1344,14 @@ int main()
     if (contract_path == nullptr || contract_path[0] == '\0') {
         contract_path = MM_CHUNK_DEFAULT_JOINT_CONTRACT;
     }
+    const char* registry_path = std::getenv("SONIC_SCENE_REGISTRY");
+    if (registry_path == nullptr || registry_path[0] == '\0') {
+        registry_path = MM_CHUNK_DEFAULT_SCENE_REGISTRY;
+    }
     mm_real_adapter adapter;
     std::string error;
-    if (!adapter.initialize(terrain_root, contract_path, error)) {
+    if (!adapter.initialize(
+            terrain_root, contract_path, registry_path, error)) {
         std::fprintf(
             stderr,
             "MM chunk server artifact error: %s\n",

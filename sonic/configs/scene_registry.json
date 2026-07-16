@@ -1,0 +1,14 @@
+{
+  "schema": "mm-sonic-scene-registry/v1",
+  "scenes": {
+    "sonic-flat-baseline": {
+      "kind": "analytic-flat",
+      "coordinate_signature": "holden-y-up-right-handed-forward-plus-z",
+      "bounds_xz": [-10.0, -10.0, 10.0, 10.0],
+      "spawn_position_holden": [0.0, 0.0, 0.0],
+      "spawn_yaw_holden": 0.0,
+      "height_m": 0.0,
+      "walkability_class": 1
+    }
+  }
+}

@@ -13,6 +13,37 @@ from mm_sonic.artifacts import RunBundle, verify_run_inventory
 from mm_sonic.joints import ContractError
 
 
+def scene_registration_metadata() -> dict[str, object]:
+    return {
+        "scene_id": "sonic-flat-baseline",
+        "route_id": "flat-12s",
+        "source_kind": "analytic-flat",
+        "source_hashes": {
+            "registry": "d" * 64,
+            "manifest": "e" * 64,
+            "scene_index": "f" * 64,
+        },
+        "coordinate_source": "holden-y-up-right-handed-forward-plus-z",
+        "coordinate_target": "mujoco-z-up-right-handed-forward-plus-x",
+        "transform_matrix": [
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, -1.0],
+            [0.0, 1.0, 0.0],
+        ],
+        "output_hashes": {
+            "gear_scene_xml": "1" * 64,
+            "scene_registration": "2" * 64,
+        },
+        "allowed_foot_geoms": [11, 12],
+        "forbidden_geom_groups": {
+            "pelvis": [1],
+            "knees": [2, 3],
+            "torso": [4, 5, 6],
+            "hands": [7, 8, 9, 10],
+        },
+    }
+
+
 def terminal_metadata() -> dict[str, object]:
     return {
         "external": {
@@ -52,6 +83,7 @@ def terminal_metadata() -> dict[str, object]:
             "target": "mujoco-z-up-right-handed-forward-plus-x",
             "matrix": [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]],
         },
+        "scene_registration": scene_registration_metadata(),
         "processes": [
             {"name": "mm", "argv": ["sonic/build/mm_chunk_server"]},
             {"name": "gear", "argv": ["g1_deploy", "--input-type", "zmq"]},
@@ -510,6 +542,41 @@ class RunBundleLifecycleTests(unittest.TestCase):
                 bundle.update_manifest(metadata)
                 bundle.finalize(terminal, outcome={"reason": "unavailable"})
                 self.assertEqual(bundle.status, terminal)
+
+    def test_scene_registration_is_complete_only_and_always_validated(self):
+        missing = terminal_metadata()
+        missing.pop("scene_registration")
+        complete = RunBundle.create(
+            self.root, "missing-complete-scene", "run"
+        )
+        complete.update_manifest(missing)
+        with self.assertRaisesRegex(
+            ContractError, "complete.*scene_registration"
+        ):
+            complete.finalize("complete", outcome={"integration_pass": True})
+
+        for index, terminal in enumerate(("failed", "not_run")):
+            with self.subTest(terminal=terminal):
+                bundle = RunBundle.create(
+                    self.root, f"missing-scene-{index}", "run"
+                )
+                bundle.update_manifest(missing)
+                bundle.finalize(terminal, outcome={"reason": terminal})
+                self.assertEqual(bundle.status, terminal)
+
+        malformed = terminal_metadata()
+        malformed["scene_registration"] = scene_registration_metadata()
+        malformed_scene = malformed["scene_registration"]
+        assert isinstance(malformed_scene, dict)
+        forbidden = malformed_scene["forbidden_geom_groups"]
+        assert isinstance(forbidden, dict)
+        forbidden["pelvis"] = [11]
+        failed = RunBundle.create(self.root, "malformed-scene", "run")
+        failed.update_manifest(malformed)
+        with self.assertRaisesRegex(
+            ContractError, "scene_registration.*overlap"
+        ):
+            failed.finalize("failed", outcome={"reason": "fixture"})
 
 
 class RunManifestSchemaTests(unittest.TestCase):

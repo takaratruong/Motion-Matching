@@ -63,6 +63,28 @@ _EXTERNAL_KEYS = frozenset(
     )
 )
 _MANDATORY_COMPLETE_HASHES = _ARTIFACT_HASH_KEYS - {"encoder"}
+_SCENE_REGISTRATION_KEYS = frozenset(
+    (
+        "scene_id",
+        "route_id",
+        "source_kind",
+        "source_hashes",
+        "coordinate_source",
+        "coordinate_target",
+        "transform_matrix",
+        "output_hashes",
+        "allowed_foot_geoms",
+        "forbidden_geom_groups",
+    )
+)
+_FORBIDDEN_GEOM_GROUPS = frozenset(("pelvis", "knees", "torso", "hands"))
+_HOLDEN_COORDINATE_SIGNATURE = "holden-y-up-right-handed-forward-plus-z"
+_MUJOCO_COORDINATE_SIGNATURE = "mujoco-z-up-right-handed-forward-plus-x"
+_HOLDEN_TO_MUJOCO_MATRIX = (
+    (1.0, 0.0, 0.0),
+    (0.0, 0.0, -1.0),
+    (0.0, 1.0, 0.0),
+)
 
 
 def _utc_now() -> str:
@@ -202,12 +224,120 @@ def _timestamp(value: object, label: str) -> str:
     return text
 
 
+def _hash_mapping(value: object, label: str) -> None:
+    hashes = _mapping(value, label)
+    if not hashes:
+        raise ContractError(f"terminal manifest {label} must not be empty")
+    for name, digest in hashes.items():
+        _nonempty_string(name, f"{label} key")
+        _sha256_or_null(digest, f"{label}.{name}")
+        if digest is None:
+            raise ContractError(
+                f"terminal manifest {label}.{name} cannot be null"
+            )
+
+
+def _geom_ids(value: object, label: str) -> tuple[int, ...]:
+    if type(value) is not list or not value:
+        raise ContractError(
+            f"terminal manifest {label} must be a nonempty array"
+        )
+    if any(type(item) is not int or item < 0 for item in value):
+        raise ContractError(
+            f"terminal manifest {label} must contain nonnegative integers"
+        )
+    if len(set(value)) != len(value):
+        raise ContractError(f"terminal manifest {label} contains duplicates")
+    return tuple(value)
+
+
+def _validate_scene_registration(value: object) -> None:
+    scene = _exact_keys(
+        value, _SCENE_REGISTRATION_KEYS, "scene_registration"
+    )
+    _nonempty_string(scene["scene_id"], "scene_registration.scene_id")
+    route_id = scene["route_id"]
+    if route_id is not None:
+        _nonempty_string(route_id, "scene_registration.route_id")
+    _nonempty_string(scene["source_kind"], "scene_registration.source_kind")
+    _hash_mapping(scene["source_hashes"], "scene_registration.source_hashes")
+    source = _nonempty_string(
+        scene["coordinate_source"], "scene_registration.coordinate_source"
+    )
+    target = _nonempty_string(
+        scene["coordinate_target"], "scene_registration.coordinate_target"
+    )
+    if (
+        source != _HOLDEN_COORDINATE_SIGNATURE
+        or target != _MUJOCO_COORDINATE_SIGNATURE
+    ):
+        raise ContractError(
+            "terminal manifest scene_registration coordinate signatures changed"
+        )
+    matrix = scene["transform_matrix"]
+    if type(matrix) is not list or len(matrix) != 3:
+        raise ContractError(
+            "terminal manifest scene_registration.transform_matrix must be 3x3"
+        )
+    normalized_matrix: list[tuple[float, ...]] = []
+    for row_index, row in enumerate(matrix):
+        if type(row) is not list or len(row) != 3:
+            raise ContractError(
+                "terminal manifest scene_registration.transform_matrix must be 3x3"
+            )
+        normalized_matrix.append(
+            tuple(
+                _finite_number(
+                    item,
+                    "scene_registration.transform_matrix"
+                    f"[{row_index}][{column_index}]",
+                )
+                for column_index, item in enumerate(row)
+            )
+        )
+    if tuple(normalized_matrix) != _HOLDEN_TO_MUJOCO_MATRIX:
+        raise ContractError(
+            "terminal manifest scene_registration.transform_matrix changed"
+        )
+    _hash_mapping(scene["output_hashes"], "scene_registration.output_hashes")
+    allowed = set(
+        _geom_ids(
+            scene["allowed_foot_geoms"],
+            "scene_registration.allowed_foot_geoms",
+        )
+    )
+    groups = _exact_keys(
+        scene["forbidden_geom_groups"],
+        _FORBIDDEN_GEOM_GROUPS,
+        "scene_registration.forbidden_geom_groups",
+    )
+    used = set(allowed)
+    for name in sorted(_FORBIDDEN_GEOM_GROUPS):
+        current = set(
+            _geom_ids(
+                groups[name],
+                f"scene_registration.forbidden_geom_groups.{name}",
+            )
+        )
+        if current & used:
+            raise ContractError(
+                "terminal manifest scene_registration geom groups overlap"
+            )
+        used.update(current)
+
+
 def _validate_terminal_metadata(
     manifest: Mapping[str, object], status: str
 ) -> None:
     missing = sorted(_TERMINAL_MANIFEST_KEYS - set(manifest))
     if missing:
         raise ContractError(f"terminal manifest is missing fields: {missing}")
+    if status == "complete" and "scene_registration" not in manifest:
+        raise ContractError(
+            "complete terminal manifest requires scene_registration"
+        )
+    if "scene_registration" in manifest:
+        _validate_scene_registration(manifest["scene_registration"])
 
     external = _exact_keys(manifest["external"], _EXTERNAL_KEYS, "external")
     for name in (
