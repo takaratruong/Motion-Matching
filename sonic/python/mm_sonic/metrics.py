@@ -688,13 +688,19 @@ def validate_hypothesis_verdict_semantics(
         raise ContractError("hypothesis verdict status is invalid")
     if type(classes) not in (list, tuple):
         raise ContractError("hypothesis terrain_classes must be an array")
+    if status == "not_run":
+        if classes or overall_claim is not None:
+            raise ContractError(
+                "not_run hypothesis cannot contain class or overall results"
+            )
+        return
     aggregates: dict[str, SceneHypothesisVerdict] = {}
     for record in classes:
         scene_id, aggregate = _validate_class_verdict_semantics(record)
         if scene_id in aggregates:
             raise ContractError("hypothesis terrain class is duplicated")
         aggregates[scene_id] = aggregate
-    if status != "complete":
+    if status == "incomplete":
         if overall_claim is not None:
             raise ContractError("incomplete hypothesis requires null overall result")
         return

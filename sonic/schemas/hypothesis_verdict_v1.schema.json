@@ -122,11 +122,23 @@
     },
     {
       "if": {
-        "properties": {"status": {"enum": ["incomplete", "not_run"]}},
+        "properties": {"status": {"const": "incomplete"}},
         "required": ["status"]
       },
       "then": {
         "properties": {"overall_hypothesis": {"const": null}}
+      }
+    },
+    {
+      "if": {
+        "properties": {"status": {"const": "not_run"}},
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "terrain_classes": {"maxItems": 0},
+          "overall_hypothesis": {"const": null}
+        }
       }
     }
   ],

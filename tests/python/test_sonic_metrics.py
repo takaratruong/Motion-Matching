@@ -1086,6 +1086,40 @@ class VerdictSchemaTests(unittest.TestCase):
                 with self.assertRaisesRegex(ContractError, expected):
                     metrics_module.validate_hypothesis_verdict_semantics(document)
 
+    def test_not_run_forbids_results_but_incomplete_retains_partial_evidence(
+        self,
+    ) -> None:
+        validator = schema_validator("hypothesis_verdict_v1.schema.json")
+        partial_class = class_verdict("grail-curb-low")
+        valid_not_run = hypothesis_verdict(
+            [],
+            status="not_run",
+            overall_hypothesis=None,
+        )
+        incomplete = hypothesis_verdict(
+            [partial_class],
+            status="incomplete",
+            overall_hypothesis=None,
+        )
+        not_run_with_class = hypothesis_verdict(
+            [partial_class],
+            status="not_run",
+            overall_hypothesis=None,
+        )
+        not_run_with_claim = hypothesis_verdict(
+            [],
+            status="not_run",
+            overall_hypothesis="supported",
+        )
+
+        for valid in (valid_not_run, incomplete):
+            self.assertTrue(validator.is_valid(valid))
+            metrics_module.validate_hypothesis_verdict_semantics(valid)
+        for invalid in (not_run_with_class, not_run_with_claim):
+            self.assertFalse(validator.is_valid(invalid))
+            with self.assertRaisesRegex(ContractError, "not_run"):
+                metrics_module.validate_hypothesis_verdict_semantics(invalid)
+
 
 if __name__ == "__main__":
     unittest.main()
