@@ -454,6 +454,54 @@ class ChunkServerSourceOwnershipTest(unittest.TestCase):
     "SONIC_TERRAIN_DIR is required for the guarded real-artifact test",
 )
 class RealArtifactChunkServerTest(unittest.TestCase):
+    def test_embedded_nul_scene_and_route_cannot_alias_real_ids(self):
+        aliases = (
+            ("scene_id", "grail-curb-low\x00ignored-suffix"),
+            ("route_id", "curb-forward\x00ignored-suffix"),
+        )
+        for field, alias in aliases:
+            with self.subTest(field=field):
+                server = ChunkServer(real=True)
+                try:
+                    self.assertTrue(server.request(hello())["ok"])
+                    self.assertTrue(server.request(reset())["ok"])
+                    baseline = server.request(generate())["data"]
+                    self.assertTrue(server.request(finish(
+                        "abort", "nul-baseline-abort", "c000000"
+                    ))["ok"])
+
+                    aliased_reset = reset(f"nul-{field}", "replacement")
+                    aliased_reset[field] = alias
+                    aliased_reset["terrain_weight"] = 0.0
+                    failed = server.request(aliased_reset)
+                    self.assertFalse(failed["ok"], failed)
+                    self.assertEqual(failed["error"]["code"], "reset_failed")
+
+                    regenerated = server.request(generate(
+                        f"nul-{field}-regenerate"
+                    ))["data"]
+                    self.assertEqual(regenerated["session_id"], "s1")
+                    self.assertEqual(regenerated["scene"], baseline["scene"])
+                    self.assertEqual(
+                        regenerated["terrain_cost"], baseline["terrain_cost"]
+                    )
+                    self.assertEqual(regenerated, baseline)
+                    self.assertTrue(server.request(finish(
+                        "abort", f"nul-{field}-abort", "c000000"
+                    ))["ok"])
+                    self.assertTrue(server.request({
+                        "v": 1,
+                        "op": "close",
+                        "request_id": f"nul-{field}-close",
+                    })["ok"])
+                    return_code, stdout_tail, stderr = server.wait(timeout=240)
+                    self.assertEqual(
+                        return_code, 0, stderr.decode("utf-8", "replace")
+                    )
+                    self.assertEqual(stdout_tail, b"")
+                finally:
+                    server.terminate()
+
     def test_real_generate_emits_11_boundaries_and_abort_regenerates_exactly(self):
         server = ChunkServer(real=True)
         try:

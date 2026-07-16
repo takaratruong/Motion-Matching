@@ -294,7 +294,10 @@ public:
         char error[1024] = {};
         const int scene_index =
             scene_catalog_find(catalog_, request.scene_id.c_str());
-        if (scene_index < 0) {
+        if (scene_index < 0 ||
+            static_cast<std::size_t>(scene_index) >= catalog_.ids.size() ||
+            catalog_.ids[static_cast<std::size_t>(scene_index)] !=
+                request.scene_id) {
             message = "unknown scene: " + request.scene_id;
             return false;
         }
@@ -311,7 +314,7 @@ public:
         }
         const scene_route* route =
             scene_route_find(context.scene.metadata, request.route_id.c_str());
-        if (route == nullptr) {
+        if (route == nullptr || route->id != request.route_id) {
             message = "scene " + request.scene_id + " has no route " +
                       request.route_id;
             return false;
