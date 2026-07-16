@@ -48,13 +48,14 @@
 - Create `tests/cpp/compile_g1_candidate_recovery_production.cpp`: positive no-seam signature/link fixture.
 - Create `tests/cpp/compile_g1_candidate_recovery_seam_negative.cpp`: compile-time privacy fixture for the exhaustive/audit interface.
 - Modify `g1_frame_transaction.h`: candidate stages, branch scratch, fixed workspace, recovery-provider dependency, bounded coordinator, hidden-state commit, first-failure ownership, trace types, preflight, validation, reset, and publication.
-- Modify `g1_controller_frame_runtime.h`: keep one exact external production stage-runner declaration matching the expanded stage enum.
+- Modify `scene_switch.h`: extend runtime preflight, reset validation, candidate isolation, atomic swap, and rollback from two controller states to all five runtime states.
 - Modify `controller.cpp`: split matcher preparation from candidate application; implement common/raw/IK/finalize stages; pass the strict provider; add canonical disabled log projection; and add seam-only trace/timing output after the transaction.
 - Create `g1_candidate_certification_trace.h`: seam-only TSV serialization, post-transaction same-matrix exhaustive comparison, and timing-file support; an empty no-seam preprocessor branch exposes no type or symbol.
 - Modify `tests/cpp/test_g1_frame_transaction.cpp`: generic A/B/C coordinator, ordering, poison, hidden ownership, full first-failure, global-error, capacity, and exact-`dt` tests.
+- Modify `tests/cpp/test_scene_switch.cpp`: five-state reset/switch validation, ten-way live/candidate storage isolation, atomic swap, and failure rollback.
 - Modify `tests/cpp/test_g1_frame_transaction_production.cpp`: real runner A/B/C, genuine swing rejection, legacy slot-zero identity, provider laziness, work counters, mode parity, source/closure/lexical guards, and no-seam integration.
 - Modify `tests/cpp/test_g1_controller_logging.cpp`: canonical disabled projection, hidden-state poison, schema identity, selected-cost/provenance, and accepted-state digest ownership.
-- Modify `tests/cpp/compile_g1_frame_transaction_runner_negative.cpp`: retain all existing forbidden context modes for the expanded coordinator signature.
+- Verify unchanged `tests/cpp/compile_g1_frame_transaction_runner_negative.cpp`: retain all existing forbidden context modes; the stage-runner type is unchanged, so this fixture requires no edit.
 - Verify only `database.h`, `g1_ik.h`, `g1_ik_root_reach.cpp`, `g1_ik_runtime.h`, `g1_clearance.h`, `g1_clearance.cpp`, `motion_match_log.h`, `resources/check_g1_runtime_log.py`, and all terrain assets. Leave the running process entirely undiscovered and untouched.
 
 ---
@@ -178,7 +179,8 @@ Run from the worktree root after the root-frontier owner has committed and relea
 ```bash
 set -euo pipefail
 out=/tmp/g1-bounded-candidate-cert
-mkdir -p "$out/base/build" "$out/base/logs"
+mkdir -p "$out/base/build" "$out/base/logs" \
+  "$out/base/current-frontier"
 test "$(sha256sum docs/superpowers/specs/2026-07-16-g1-bounded-candidate-certification-design.md | cut -d' ' -f1)" = \
   10c21cb51a351b9cc2f4c1e03d58472e485bba36d0449967de4e08e33a7ec6dd
 git merge-base --is-ancestor f6a6448 HEAD
@@ -213,6 +215,52 @@ for ik in 0 1; do
     --test-route curb-forward --test-frames 32 --test-heading forward \
     --terrain-weight 4 --log "$out/base/logs/low-curb-${ik}.csv"
 done
+
+# Freeze only short current-frontier behavior evidence before feature work.
+# The first 800-frame current-frontier run is forbidden until Task 6's
+# ZERO_REJECTION_32.PASS marker exists.
+gate_l_routes=(
+  stairs-shallow:ascent-landing-descent
+  stairs-standard:ascent-landing-descent
+  grail-curb-low:curb-forward
+  ramp-05-up-down:up-landing-down
+  ramp-10-up-down:up-landing-down
+)
+for specification in "${gate_l_routes[@]}"; do
+  IFS=: read -r scene route <<<"$specification"
+  stem="${scene}__${route}"
+  for ik in 0 1; do
+    DISPLAY=:1 MM_IK="$ik" "$out/base/controller" \
+      --terrain-dir /tmp/g1-terrain-footprint-runtime-v1 \
+      --terrain-scene "$scene" --test-mode route --test-route "$route" \
+      --test-frames 32 --test-heading forward --terrain-weight 4 \
+      --log "$out/base/current-frontier/forward32-${stem}-${ik}.csv"
+  done
+done
+
+flat_cases=(
+  flat-positive-z:forward:forward
+  flat-positive-z:backward:backward
+  flat-positive-z:positive-x:left
+  flat-positive-z:negative-x:right
+  flat-positive-x:positive-x:forward
+  flat-positive-x:negative-x:backward
+  flat-positive-x:forward:right
+  flat-positive-x:backward:left
+)
+for specification in "${flat_cases[@]}"; do
+  IFS=: read -r route heading relative <<<"$specification"
+  stem="${route}__${heading}__${relative}"
+  DISPLAY=:1 MM_IK=0 "$out/base/controller" \
+    --terrain-dir /tmp/g1-terrain-footprint-runtime-v1 \
+    --terrain-scene stairs-shallow --test-mode route --test-route "$route" \
+    --test-frames 100 --test-heading "$heading" --terrain-weight 4 \
+    --log "$out/base/current-frontier/flat-${stem}.csv"
+done
+sha256sum "$out/base/controller" \
+  "$out/base/current-frontier"/*.csv \
+  > "$out/base/current-frontier/SHA256SUMS"
+sha256sum -c "$out/base/current-frontier/SHA256SUMS"
 /home/ubuntu/miniconda3/envs/diffsim/bin/python - <<'PY'
 import csv, struct
 root = "/tmp/g1-bounded-candidate-cert/base/logs"
@@ -234,7 +282,7 @@ print("VALID frozen legacy row-6 owner")
 PY
 ```
 
-Expected: every command exits `0`; the spec hash matches; excluded files are clean; the neutral link succeeds; and the IK-off baseline freezes the authoritative row-6 query, selected frame/range, and `0x40250630` public score. Keep this `/tmp` tree through Tasks 1–6.
+Expected: every command exits `0`; the spec hash matches; excluded files are clean; the neutral link succeeds; the IK-off baseline freezes the authoritative row-6 query, selected frame/range, and `0x40250630` public score; and the frozen controller, ten 32-frame forward captures, and eight 100-frame flat captures authenticate as one current-frontier evidence set. No 800-frame process has run. Keep this `/tmp` tree through Tasks 1–6.
 
 - [ ] **Step 2: Write the provider RED tests and compile-only ownership fixtures**
 
@@ -438,9 +486,10 @@ Expected staged paths: exactly the five Task 1 files.
 
 **Files:**
 - Modify: `g1_frame_transaction.h:46-258,668-1378,2450-3051`
-- Modify: `g1_controller_frame_runtime.h:1-11`
+- Modify: `scene_switch.h:20-506`
 - Modify: `tests/cpp/test_g1_frame_transaction.cpp:1-4187`
-- Modify: `tests/cpp/compile_g1_frame_transaction_runner_negative.cpp`
+- Modify: `tests/cpp/test_scene_switch.cpp:1-850`
+- Verify only: `tests/cpp/compile_g1_frame_transaction_runner_negative.cpp`
 - Reference only: `g1_controller_state.h`
 - Consume: Task 1 provider contract and implementation
 
@@ -546,26 +595,27 @@ static inline G1FrameTransactionStatus g1_frame_transaction_run(
 ```cpp
 enum G1CandidateScoreOwner : uint32_t
 {
-    G1CandidateScoreLegacy = 0U,
+    G1CandidateScoreUnassigned = 0U,
+    G1CandidateScoreLegacy,
     G1CandidateScoreStrictRecovery,
     G1CandidateScoreIncumbent,
 };
 
 enum G1CandidateDisposition : uint32_t
 {
-    G1CandidateNotRun = 0U,
-    G1CandidateAccepted,
-    G1CandidateFiniteRejected,
-    G1CandidateGlobalError,
+    G1CandidateDispositionNotRun = 0U,
+    G1CandidateDispositionAccepted,
+    G1CandidateDispositionFiniteRejected,
+    G1CandidateDispositionGlobalError,
 };
 
 struct G1CandidateAttemptTraceRecord
 {
     G1CandidateRecord candidate;
-    G1CandidateScoreOwner score_owner = G1CandidateScoreIncumbent;
-    G1CandidateDisposition common = G1CandidateNotRun;
-    G1CandidateDisposition raw = G1CandidateNotRun;
-    G1CandidateDisposition ik = G1CandidateNotRun;
+    G1CandidateScoreOwner score_owner = G1CandidateScoreUnassigned;
+    G1CandidateDisposition common = G1CandidateDispositionNotRun;
+    G1CandidateDisposition raw = G1CandidateDispositionNotRun;
+    G1CandidateDisposition ik = G1CandidateDispositionNotRun;
     G1FrameRejectionStage rejection_stage = G1FrameRejectNone;
     G1IkStopReason stop_reason = G1IkStopNone;
 };
@@ -604,7 +654,7 @@ static constexpr G1CandidateRecord Incumbent = {
 
 The stub matcher publishes A as slot zero and a valid immutable request. The provider publishes B, C, then Incumbent and increments a test counter. Candidate A's common/raw phases pass and IK phase finite-rejects; B passes all phases; C and Incumbent are configured to fail the test if entered.
 
-Add these exact test functions:
+Add these exact test functions and call every one from the default full-test `main` path:
 
 ```cpp
 static void test_abc_selects_b_in_both_modes_and_stops_before_c();
@@ -620,11 +670,31 @@ static void test_prior_safe_stop_latch_is_shared_and_consumed_once_on_winner();
 static void test_prefix_camera_route_and_command_work_runs_once();
 static void test_lazy_provider_and_attempt_work_bounds();
 static void test_hypothetical_ninth_attempt_is_global_error();
+static void test_scheduled_legacy_slot_zero_has_legacy_score_owner();
+static void test_unscheduled_slot_zero_has_incumbent_score_owner();
+static void test_matching_disabled_slot_zero_has_incumbent_score_owner();
 ```
 
-For A/B/C, run once with `external.tuning.ik_enabled = false` and once with `true`. Require identical query, selected/executed frame, range, source, strict score bits, transition flag, support, simulation XZ, route, requested/applied velocity, desired/predicted heading, and complete committed `state.ik`. Require raw visible arrays and canonical `ik_frame` in the off run; require IK arrays/result in the on run. Require trace dispositions `A=(accepted,accepted,finite-rejected)`, `B=(accepted,accepted,accepted)`, exactly two attempts, one provider call, two common/raw evaluations, two IK evaluations, and no C materialization.
+In `tests/cpp/test_scene_switch.cpp`, add these exact lifecycle tests and call all six from `main`:
 
-For raw rejection, reject A at `G1FrameStageRawPoseCertificate` and assert its IK stage counters remain zero while B executes. Require `g1_frame_candidate_dual_outcome_is_valid(G1CandidateAccepted, G1CandidateFiniteRejected, G1CandidateAccepted) == false`.
+```cpp
+static void test_five_state_reset_is_valid_equal_and_pairwise_disjoint();
+static void test_five_state_live_preflight_rejects_each_array_alias();
+static void test_five_state_candidate_isolation_covers_all_ten_states();
+static void test_five_state_success_swaps_every_state_atomically();
+static void test_five_state_switch_failure_preserves_every_live_owner();
+static void test_five_state_reset_failure_preserves_every_live_owner();
+```
+
+Extend the existing test `state_storage_snapshot` into `runtime_storage_snapshot` with `digest[5]` and `data[5][49]`/`bytes[5][49]`, indexed exactly as accepted, working, common, raw, IK. `capture_active()` snapshots all five logical digests, all 245 heap ranges, publication, accepted diagnostic, scene/model/index, and counters; `active_matches_snapshot()` compares every one. Before every failure case, poison each state with a distinct valid `scene_frame`, `route_frames`, simulation X/Z, and hidden-IK release-frame value so accidentally resetting, partially swapping, or cross-copying any workspace is observable.
+
+On successful reset/switch, require all five states independently pass `check_reset_state_member`, all ten within-runtime address pairs differ, all ten within-runtime heap-set pairs are disjoint, all five logical states are equal, and every route/IK/publication owner is canonical. For candidate isolation, hold five live plus five candidate states simultaneously and require all 45 pairwise heap-set comparisons disjoint; then alias one range at a time for each of the 25 live/candidate state pairs and require precommit rejection. On scene-load, reset, candidate-validation, unallocated-model, allocated-model, and malformed-config failures, require the complete five-state snapshot and storage addresses unchanged. On success, require all five candidate states installed before the old model unload callback, and require every old state storage set moved into the temporary old runtime rather than leaked or retained by the active runtime.
+
+For A/B/C, run once with `external.tuning.ik_enabled = false` and once with `true`. Require identical query, selected/executed frame, range, source, strict score bits, transition flag, support, simulation XZ, route, requested/applied velocity, desired/predicted heading, and complete committed `state.ik`. Require raw visible arrays and canonical `ik_frame` in the off run; require IK arrays/result in the on run. Require A's score owner to be `G1CandidateScoreLegacy`, B's to be `G1CandidateScoreStrictRecovery`, trace dispositions `A=(accepted,accepted,finite-rejected)`, `B=(accepted,accepted,accepted)`, exactly two attempts, one provider call, two common/raw evaluations, two IK evaluations, and no C materialization.
+
+The three slot-zero ownership tests must independently exercise (a) a scheduled legacy search, (b) a frame with no scheduled search, and (c) matching disabled. Transaction-entry trace reset leaves `score_owner == G1CandidateScoreUnassigned`; the coordinator must overwrite it before the first attempt. Require legacy/legacy in case (a), incumbent/incumbent in cases (b) and (c), and fail if any attempted trace record retains the unassigned poison. The default therefore cannot make an omitted incumbent assignment pass.
+
+For raw rejection, reject A at `G1FrameStageRawPoseCertificate` and assert its IK stage counters remain zero while B executes. Require `g1_frame_candidate_dual_outcome_is_valid(G1CandidateDispositionAccepted, G1CandidateDispositionFiniteRejected, G1CandidateDispositionAccepted) == false`.
 
 For poison isolation, write distinct noncanonical values to every scalar, array tail, support/contact owner, transition offset, route field, IK lock/history, certificate, and diagnostic during rejected A. Compare the complete B result with a direct B-only run from the same baseline using existing logical digests and per-array storage identities.
 
@@ -647,9 +717,17 @@ if g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic \
 fi
 rg 'G1FrameStageRawBegin|G1RecoveryProvider|G1FrameCandidateWorkspace|no member' \
   "$out/frame-red.stderr"
+if g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
+     -c tests/cpp/test_scene_switch.cpp \
+     -o "$out/scene-switch-red.o" 2>"$out/scene-switch-red.stderr"; then
+  echo 'ERROR: five-state scene-switch RED unexpectedly compiled' >&2
+  exit 1
+fi
+rg 'candidates|common_state|raw_state|ik_state|no member' \
+  "$out/scene-switch-red.stderr"
 ```
 
-Expected: compilation fails on the missing expanded coordinator/workspace interface, not an unrelated warning.
+Expected: both compilations fail on the missing expanded coordinator/workspace interface or five-state scene lifecycle, not an unrelated warning.
 
 - [ ] **Step 2: Add fixed workspace allocation, disjointness, and preflight ownership**
 
@@ -673,6 +751,8 @@ for (uint32_t i = 0U; i < 5U; ++i) {
 Implement all ten pairwise state-object address comparisons; do not express this as chained C++ inequality. Because the five states are members of `G1FrameRuntime`, their object extents necessarily lie inside the enclosing runtime and must not be tested for disjointness from their parent. Collect only each state's heap-backed array storage ranges; require those ranges pairwise disjoint across all five states and disjoint from the enclosing runtime's fixed-object extent, every non-array fixed member, `G1FrameExternalInputs`, error storage, database/support/scene sources, and the optional seam/trace object. Do not allocate during a frame.
 
 In `g1_frame_runtime_reset`, call `g1_controller_state_reset_configured` exactly five times into a temporary candidate runtime, assign the same mode-independent reset configuration to all five, verify all five logical states equal, then swap each state into output. Scene switch continues to call this reset path, so paired modes initialize identical hidden IK and workspace shapes.
+
+Update `scene_switch.h` in the same task. `scene_frame_runtime_live_storage_preflight` must collect five state range sets and validate each against sources/error/fixed objects. `scene_frame_runtime_reset_candidate_is_valid` must independently validate accepted, working, common, raw, and IK and require all five logically equal. `scene_frame_runtime_candidate_is_isolated` must collect ten state range sets (five live, five candidate), require all ten state addresses distinct, all 45 heap-set pairs disjoint, and every heap set disjoint from both runtime fixed extents, config, extras, error, database, support, and both scenes. `scene_frame_runtime_swap` must call `g1_controller_state_swap` for accepted, working, `candidates.common_state`, `candidates.raw_state`, and `candidates.ik_state` before swapping publication/diagnostic. `scene_reset_current` and `scene_switch_transaction` keep their current precommit/failure order; no live owner changes until the complete five-state candidate and model are valid.
 
 - [ ] **Step 3: Implement the bounded phase runner and fresh-copy protocol**
 
@@ -730,11 +810,11 @@ return DualAccepted only after both branch ranges accept
 
 Every deep copy uses `g1_controller_state_copy` and therefore overwrites all array and scalar owners. A finite stage stops only that record; a global stage stops the outer frame. Invoke the existing test hook immediately after each continued real stage, preserving the current real-outcome-before-hook rule.
 
-Add `g1_frame_candidate_dual_outcome_is_valid(common, raw, ik)` and require common/raw/IK all `G1CandidateAccepted`; raw finite plus IK accepted is invalid even for a forged seam result.
+Add `g1_frame_candidate_dual_outcome_is_valid(common, raw, ik)` and require common/raw/IK all `G1CandidateDispositionAccepted`; raw finite plus IK accepted is invalid even for a forged seam result. Keep `G1CandidateDualAccepted`, `G1CandidateFiniteRejected`, and `G1CandidateGlobalError` exclusively in `G1CandidateEvaluationOutcome`; no disposition enumerator reuses those identifiers.
 
 - [ ] **Step 4: Implement lazy tail construction, first-success commit, and hidden IK projection**
 
-Run `InputRouteCommand` and `MatcherSearch` once on `runtime.working_state`; this becomes the immutable candidate baseline. Attempt `prefix_scratch.slot_zero_record` first. Only after its finite scheduled-search rejection call `recovery_provider` once, validate count/order/kinds/ranks/dedup/cost/provenance/work, and iterate the returned tail.
+Run `InputRouteCommand` and `MatcherSearch` once on `runtime.working_state`; this becomes the immutable candidate baseline. Before evaluating slot zero, explicitly assign both candidate and score owner: a scheduled legacy result uses `G1CandidateLegacy` plus `G1CandidateScoreLegacy`; no scheduled search and matching-disabled frames use `G1CandidateIncumbent` plus `G1CandidateScoreIncumbent`. Never derive this owner from the record's default, and reject `G1CandidateScoreUnassigned` before evaluation. Attempt `prefix_scratch.slot_zero_record` first. Only after its finite scheduled-search rejection call `recovery_provider` once, validate count/order/kinds/ranks/dedup/cost/provenance/work, and iterate the returned tail. Assign every recovery transition `G1CandidateScoreStrictRecovery` and a tail incumbent `G1CandidateScoreIncumbent` before its attempt.
 
 On dual acceptance, perform:
 
@@ -760,48 +840,59 @@ Build Task 1's strict provider once and link the generic test with its stub prov
 ```bash
 set -euo pipefail
 out=/tmp/g1-bounded-candidate-cert/task2
-g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic \
-  -fno-fast-math -ffp-contract=off -frounding-math -I. \
-  -c g1_candidate_recovery.cpp -o "$out/recovery.o"
+strict=(-std=c++17 -O2 -Wall -Wextra -Werror -pedantic \
+  -fno-fast-math -ffp-contract=off -frounding-math -I.)
+fast=(-std=c++17 -O3 -ffast-math -DNDEBUG -I.)
+g++ "${strict[@]}" -c g1_clearance.cpp -o "$out/clearance.o"
+g++ "${strict[@]}" -c g1_ik_root_reach.cpp -o "$out/root-reach.o"
+g++ "${strict[@]}" -c g1_candidate_recovery.cpp -o "$out/recovery.o"
 for mode in strict fast; do
-  flags=(-O2 -Wall -Wextra -Werror -pedantic)
-  test "$mode" = fast && flags=(-O3 -ffast-math -DNDEBUG)
-  g++ -std=c++17 "${flags[@]}" \
-    -DG1_FRAME_TRANSACTION_ENABLE_TEST_SEAM -I. \
-    -c tests/cpp/test_g1_frame_transaction.cpp \
-    -o "$out/frame-${mode}.o"
-  g++ "$out/frame-${mode}.o" "$out/recovery.o" \
-    -o "$out/frame-${mode}"
-  "$out/frame-${mode}"
+  flags=("${strict[@]}")
+  test "$mode" = fast && flags=("${fast[@]}")
+  for name in g1_frame_transaction scene_switch; do
+    g++ "${flags[@]}" \
+      -c "tests/cpp/test_${name}.cpp" -o "$out/${name}-${mode}.o"
+    g++ "$out/${name}-${mode}.o" "$out/clearance.o" \
+      "$out/root-reach.o" "$out/recovery.o" \
+      -o "$out/${name}-${mode}"
+    "$out/${name}-${mode}"
+  done
 done
 
 san=(-std=c++17 -O1 -g -fno-omit-frame-pointer \
   -fsanitize=address,undefined,float-cast-overflow,float-divide-by-zero \
   -fno-sanitize-recover=all)
 g++ "${san[@]}" -fno-fast-math -ffp-contract=off -frounding-math -I. \
+  -c g1_clearance.cpp -o "$out/clearance-san.o"
+g++ "${san[@]}" -fno-fast-math -ffp-contract=off -frounding-math -I. \
+  -c g1_ik_root_reach.cpp -o "$out/root-reach-san.o"
+g++ "${san[@]}" -fno-fast-math -ffp-contract=off -frounding-math -I. \
   -c g1_candidate_recovery.cpp -o "$out/recovery-san.o"
-g++ "${san[@]}" -DG1_FRAME_TRANSACTION_ENABLE_TEST_SEAM -I. \
-  -c tests/cpp/test_g1_frame_transaction.cpp -o "$out/frame-san.o"
-g++ "${san[@]}" "$out/frame-san.o" "$out/recovery-san.o" \
-  -o "$out/frame-san"
-ASAN_OPTIONS=detect_leaks=1 \
-UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 "$out/frame-san"
+for name in g1_frame_transaction scene_switch; do
+  g++ "${san[@]}" -I. -c "tests/cpp/test_${name}.cpp" \
+    -o "$out/${name}-san.o"
+  g++ "${san[@]}" "$out/${name}-san.o" "$out/clearance-san.o" \
+    "$out/root-reach-san.o" "$out/recovery-san.o" \
+    -o "$out/${name}-san"
+  ASAN_OPTIONS=detect_leaks=1 \
+  UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+    "$out/${name}-san"
+done
 ```
 
-Expected: all coordinator fixtures pass under strict and fast callers; sanitizers are silent; and test traces show no recovery/evaluation after success or global error.
+Expected: all coordinator and five-state scene lifecycle fixtures pass under strict and fast callers; sanitizers are silent; all five reset/switch owners are valid and isolated; every failure preserves the complete live five-state runtime; and test traces show no recovery/evaluation after success or global error.
 
 - [ ] **Step 6: Commit the coordinator and hidden-state owner**
 
 ```bash
-git add g1_frame_transaction.h g1_controller_frame_runtime.h \
-  tests/cpp/test_g1_frame_transaction.cpp \
-  tests/cpp/compile_g1_frame_transaction_runner_negative.cpp
+git add g1_frame_transaction.h scene_switch.h \
+  tests/cpp/test_g1_frame_transaction.cpp tests/cpp/test_scene_switch.cpp
 git diff --cached --check
 git diff --cached --name-only
 git commit -m "feat: coordinate bounded dual candidate certification"
 ```
 
-Expected staged paths: exactly the four Task 2 files. The production controller is integrated in Task 3; this commit's acceptance gate is the generic coordinator suite, which does not compile `controller.cpp`.
+Expected staged paths: exactly the four modified Task 2 files. The unchanged compile-negative runner remains verification input for Tasks 3 and 5 and is not staged. The production controller is integrated in Task 3; this commit's acceptance gate is the generic coordinator plus scene-switch suites, which do not compile `controller.cpp`.
 
 ---
 
@@ -1132,6 +1223,24 @@ static void test_global_error_after_finite_attempt_publishes_no_finite_evidence(
 static void test_success_after_private_failures_publishes_no_rejection();
 ```
 
+Give every assertion introduced by these seven tests a message beginning with the exact prefix `first-failure-red:`. Add a `run_first_failure_tests()` helper that calls exactly these seven functions. Change the test entry point to `int main(int argc, char** argv)` with this contract:
+
+```cpp
+if (argc == 2 && std::strcmp(argv[1], "--first-failure-red") == 0) {
+    std::fputs("G1_FIRST_FAILURE_RED_SELECTED\n", stderr);
+    run_first_failure_tests();
+    return 0;
+}
+if (argc != 1) {
+    return 2;
+}
+run_all_inherited_and_task2_tests();
+run_first_failure_tests();
+return 0;
+```
+
+`run_all_inherited_and_task2_tests()` denotes the existing default-main call sequence after Task 2, factored without changing its order. The selector branch calls none of those inherited tests. The normal no-argument path still runs every inherited, Task 2, and new Task 4 test.
+
 Use three finite records with distinct requested intent bits, footprint digests, IK checkpoints, pose work, rejection stages, and stop reasons. Require the published result to equal the first record's complete value snapshot, not its diagnostic alone. On exhaustion assert:
 
 ```cpp
@@ -1147,6 +1256,41 @@ no accepted candidate provenance
 ```
 
 Copy the first scratch, flip one saved footprint bit, and require authenticated publication failure. Restore it, flip the saved IK transaction's `next_foot`, staged provenance, candidate result, and candidate state independently, and require failure for each. Construct a scratch containing only the correct `G1FrameRejectionDiagnostic` with canonical/default producer fields and require failure. After one finite A, inject a global error in B; require the incoming publication, accepted diagnostic, accepted state, hidden IK, and latch to remain exactly as before the outer call.
+
+Prove the transaction behavior itself is RED against the completed Task 3 implementation by running only the dedicated new-test selector:
+
+```bash
+set -euo pipefail
+out=/tmp/g1-bounded-candidate-cert/task4/transaction-red
+rm -rf "$out"
+mkdir -p "$out"
+strict=(-std=c++17 -O2 -Wall -Wextra -Werror -pedantic \
+  -fno-fast-math -ffp-contract=off -frounding-math -I.)
+g++ "${strict[@]}" -c g1_clearance.cpp -o "$out/clearance.o"
+g++ "${strict[@]}" -c g1_ik_root_reach.cpp -o "$out/root-reach.o"
+g++ "${strict[@]}" -c g1_candidate_recovery.cpp -o "$out/recovery.o"
+if ! g++ "${strict[@]}" -c tests/cpp/test_g1_frame_transaction.cpp \
+     -o "$out/frame.o" 2>"$out/frame.compile.stderr"; then
+  echo 'ERROR: first-failure RED test source did not compile' >&2
+  exit 1
+fi
+if ! g++ "$out/frame.o" "$out/clearance.o" "$out/root-reach.o" \
+     "$out/recovery.o" -o "$out/frame" \
+     2>"$out/frame.link.stderr"; then
+  echo 'ERROR: first-failure RED test executable did not link' >&2
+  exit 1
+fi
+if "$out/frame" --first-failure-red >"$out/frame.output" 2>&1; then
+  echo 'ERROR: first-failure transaction RED unexpectedly passed' >&2
+  exit 1
+fi
+test "$(rg -c '^G1_FIRST_FAILURE_RED_SELECTED$' \
+  "$out/frame.output")" -eq 1
+rg '^G1 frame transaction test failed: first-failure-red:' \
+  "$out/frame.output"
+```
+
+Expected: every compilation and the link succeed; the selector sentinel appears exactly once; and the executable fails in an assertion bearing the unique new-test prefix. Because this selector invokes only the seven Task 4 tests, neither a compile failure nor an inherited-test failure can satisfy RED. The later no-argument GREEN and full-suite invocations still execute all tests.
 
 - [ ] **Step 2: Write RED logging tests for a poisoned hidden IK owner**
 
@@ -1380,10 +1524,11 @@ static void test_trace_is_written_only_after_candidate_selection();
 static void test_exhaustive_oracle_result_cannot_change_selected_candidate();
 static void test_unattempted_tail_records_are_not_run_in_trace();
 static void test_trace_cost_words_are_hex_not_reformatted_floats();
+static void test_trace_slot_zero_uses_authenticated_score_owner();
 static void test_benchmark_timestamp_surrounds_only_outer_transaction();
 ```
 
-Use a synthetic accelerated tail with six transitions plus the incumbent. Accept the second transition, then require TSV rows for slot zero and the full seven-record tail: the first three slots are attempted with real dispositions, remaining slots are `attempted=0` and all branches `not-run`. Mutate one exhaustive frame, cost bit, source range, order, rank, and count independently and require the trace append to fail before writing any partial transaction block.
+Use a synthetic accelerated tail with six transitions plus the incumbent. Accept the second transition, then require TSV rows for slot zero and the full seven-record tail: the first three slots are attempted with real dispositions, remaining slots are `attempted=0` and all branches `not-run`. Mutate one exhaustive frame, cost bit, source range, order, rank, and count independently and require the trace append to fail before writing any partial transaction block. Run three slot-zero-only cases: scheduled legacy has `attempts[0].score_owner == G1CandidateScoreLegacy` and text `legacy`; unscheduled search and matching-disabled each have incumbent kind, `attempts[0].score_owner == G1CandidateScoreIncumbent`, and text `incumbent`. A mismatch between candidate kind and authenticated score owner fails serialization rather than being relabeled.
 
 To prove the oracle is post-selection only, snapshot accepted state, selected record, attempt trace, provider counters, and complete output bytes after the transaction. Append the authentic snapshot once, then pass copied completed traces with (a) one accelerated-set cost bit changed and (b) a copied request corrupted so the exhaustive call globally errors. The authentic append succeeds; the two copied trace appends fail before writing a block; the already-selected state/output snapshot remains byte-identical throughout. The production coordinator and provider signatures contain no oracle parameter or trace-return path.
 
@@ -1417,11 +1562,11 @@ Create the seam-only header. Validate an absolute, nonempty path; reject an alre
 Construct the complete trace sequence as:
 
 ```text
-slot 0: trace.attempts[0].candidate, legacy score owner
+slot 0: trace.attempts[0].candidate and trace.attempts[0].score_owner
 tail:   trace.recovery_set.records[0..count-1]
 ```
 
-Map tail dispositions from attempted records by exact candidate equality; tail entries after first acceptance remain not-run. Reject duplicate candidates, missing attempted prefixes, a tail count above seven, an attempt count above eight, recovery counters outside `(0 or 1)`, a recovery set without its request, a request without the exact database pointer, and any set/oracle mismatch. The serializer may read selection output but cannot mutate runtime, scratch, request, set, state, or provider counters.
+Map slot-zero score-owner text only from the authenticated `trace.attempts[0].score_owner`; never hard-code `legacy`. Require legacy kind/legacy owner or incumbent kind/incumbent owner and reject every other slot-zero kind/owner pairing. Map tail dispositions from attempted records by exact candidate equality; tail entries after first acceptance remain not-run. Reject duplicate candidates, missing attempted prefixes, a tail count above seven, an attempt count above eight, recovery counters outside `(0 or 1)`, a recovery set without its request, a request without the exact database pointer, and any set/oracle mismatch. The serializer may read selection output but cannot mutate runtime, scratch, request, set, state, or provider counters.
 
 Place the exhaustive call in this post-transaction header path. Keep `g1_recovery_candidates_build` free of exhaustive references; add both a source and `nm -C` guard for that separation.
 
@@ -1719,7 +1864,8 @@ Expected staged paths: exactly the four Task 5 files. The no-seam runtime behavi
 **Files:**
 - Verify only: all source and test files from Tasks 1-5
 - Verify only: `/tmp/g1-terrain-footprint-runtime-v1`
-- Verify only: `/tmp/g1-footprint-prechange-oracle`
+- Verify only as asset evidence, never as a behavior oracle: `/tmp/g1-footprint-prechange-oracle`
+- Consume only after the 32-frame marker: Task 1's hashed current-frontier controller and captures under `/tmp/g1-bounded-candidate-cert/base/current-frontier/`
 - Generate only: `/tmp/g1-bounded-candidate-cert/live/`
 - Do not modify or commit any repository file in this task
 - Consume: Tasks 1-5 and the mandatory Task 1 execution-base evidence
@@ -1728,7 +1874,10 @@ Expected staged paths: exactly the four Task 5 files. The no-seam runtime behavi
 - Build three disposable executables: dual-seam trace, no-seam release, and no-seam benchmark. Each uses separately compiled strict `g1_clearance.cpp`, `g1_ik_root_reach.cpp`, and `g1_candidate_recovery.cpp`; a fast controller caller; a neutral final link; and no LTO.
 - The trace executable uses the same loaded in-memory motion `database` for production accelerated recovery and the post-transaction exhaustive oracle. Never transfer a score/list between separately compiled binaries as an acceptance oracle.
 - The release executable produces the unchanged production CSV only. The benchmark executable adds only the transaction timing file.
+- Every Gate L physical/property checker consumes a no-seam release CSV. A separate trace process reruns the exact deterministic inputs into a production-schema CSV and TSV; byte-compare the release and trace CSVs before using that TSV for same-build oracle or recovery-boundary evidence.
 - Never run an 800- or 832-frame command until the paired 32-frame trace/runtime prerequisite creates `/tmp/g1-bounded-candidate-cert/live/ZERO_REJECTION_32.PASS`.
+- After that marker, the hashed Task 1 controller is the only separate-build behavior baseline. For each compared run, authenticate the candidate's first recovery presentation frame from its same-process TSV. Compare every `GATE_L_ORACLE_INVARIANTS` field through the exact prefix before that frame; require full-run equality when no recovery occurs. The exact same-build accelerated/exhaustive trace remains authoritative for every recovery row.
+- The older `/tmp/g1-footprint-prechange-oracle` corpus is retained only to prove those assets were not modified. Never pass one of its paths to any behavior checker.
 - Never inspect, discover, signal, replace, restart, attach to, or otherwise touch the running visualizer. All commands below invoke unique disposable paths directly; none uses `ps`, `pgrep`, `pidof`, `kill`, `pkill`, `systemctl`, or a visualizer helper.
 
 - [ ] **Step 1: Build and authenticate the three disposable executables**
@@ -1742,7 +1891,9 @@ mkdir -p "$root/build" "$root/trace32" "$root/low-curb" \
 test "$(sha256sum docs/superpowers/specs/2026-07-16-g1-bounded-candidate-certification-design.md | cut -d' ' -f1)" = \
   10c21cb51a351b9cc2f4c1e03d58472e485bba36d0449967de4e08e33a7ec6dd
 sha256sum -c /tmp/g1-bounded-candidate-cert/base/immutable-files.before.sha256
-sha256sum -c /tmp/g1-footprint-prechange-oracle/SHA256SUMS
+sha256sum -c \
+  /tmp/g1-bounded-candidate-cert/base/current-frontier/SHA256SUMS
+(cd /tmp/g1-footprint-prechange-oracle && sha256sum -c SHA256SUMS)
 
 strict=(-std=c++17 -O3 -DNDEBUG -fno-fast-math -ffp-contract=off \
   -frounding-math -frecord-gcc-switches -I.)
@@ -1798,7 +1949,7 @@ sha256sum "$root/controller-trace" "$root/controller-release" \
   "$root/controller-benchmark" > "$root/BINARIES.sha256"
 ```
 
-Expected: all three neutral links succeed, all strict objects record all three strict flags and no fast/LTO flag, release contains no test-seam/timing string, benchmark contains no candidate trace/oracle, immutable oracles are intact, and no running process has been queried or changed.
+Expected: all three neutral links succeed, all strict objects record all three strict flags and no fast/LTO flag, release contains no test-seam/timing string, benchmark contains no candidate trace/oracle, the Task 1 current-frontier controller/captures and older asset-only corpus authenticate unchanged, and no running process has been queried or changed.
 
 - [ ] **Step 2: Pass the mandatory paired 32-frame same-build prerequisite**
 
@@ -2057,12 +2208,154 @@ Expected: 9 normal Gate E pairs pass and complete, 4 stress pairs retain their c
 
 - [ ] **Step 5: Re-run the complete 30-cell Gate L matrix plus lateral, exit, tangent, and flat gates**
 
-Run the full quality gate, not safety-only:
+Run the full physical quality gate only on no-seam `controller-release` logs.
+For every identical mode/cell input, run a second `controller-trace` process to
+produce a disposable production-schema CSV plus its TSV. Require the release
+and trace CSV files to be byte-identical before the TSV may locate a recovery
+boundary. Thus the seam process supplies post-selection oracle evidence but is
+never the only certified runtime. The comparison helper then authenticates
+every same-build accelerated/exhaustive row, discovers the first recovery frame
+from the TSV rather than from behavior differences, and never reads the older
+allowlisted oracle corpus:
 
 ```bash
 set -euo pipefail
 root=/tmp/g1-bounded-candidate-cert/live
+base=/tmp/g1-bounded-candidate-cert/base
 test "$(cat "$root/ZERO_REJECTION_32.PASS")" = PASS
+sha256sum -c "$base/current-frontier/SHA256SUMS"
+
+compare_frontier() {
+  /home/ubuntu/miniconda3/envs/diffsim/bin/python - \
+    "$1" "$2" "$3" <<'PY'
+import csv
+import sys
+from pathlib import Path
+from resources.check_g1_runtime_log import (
+    GATE_L_ORACLE_INVARIANTS,
+    read_rows,
+)
+
+current_path, frontier_path, trace_path = map(Path, sys.argv[1:4])
+current = read_rows(current_path)
+frontier = read_rows(frontier_path)
+assert len(current) == len(frontier) and current
+with trace_path.open(newline="", encoding="utf-8") as stream:
+    trace = list(csv.DictReader(stream, delimiter="\t"))
+assert trace
+assert all(row["oracle_equal"] == "1" for row in trace)
+
+recovery_frames = set()
+for row in trace:
+    calls = int(row["recovery_provider_calls"])
+    traversals = int(row["recovery_traversals"])
+    accelerated = int(row["accelerated_count"])
+    exhaustive = int(row["exhaustive_count"])
+    assert calls in (0, 1)
+    if calls == 0:
+        assert traversals == accelerated == exhaustive == 0
+    else:
+        assert traversals == 1
+        assert accelerated == exhaustive
+        recovery_frames.add(int(row["presentation_frame"]))
+
+frame_to_index = {}
+for index, row in enumerate(current):
+    frame = int(row["frame"])
+    assert frame not in frame_to_index
+    frame_to_index[frame] = index
+assert list(frame_to_index) == list(range(len(current)))
+trace_frames = {int(row["presentation_frame"]) for row in trace}
+assert trace_frames == set(frame_to_index)
+
+if recovery_frames:
+    first_recovery = min(recovery_frames)
+    assert first_recovery in frame_to_index
+    stop = frame_to_index[first_recovery]
+    mode = f"prefix-before-recovery-{first_recovery}"
+else:
+    stop = len(current)
+    mode = "full-zero-recovery"
+
+for index, (candidate, baseline) in enumerate(
+        zip(current[:stop], frontier[:stop])):
+    for name in GATE_L_ORACLE_INVARIANTS:
+        assert candidate[name] == baseline[name], (
+            index, name, candidate[name], baseline[name])
+print(
+    f"VALID current-frontier comparison mode={mode} rows={stop} "
+    f"candidate={current_path.name}")
+PY
+}
+
+verify_frontier_capture() {
+  /home/ubuntu/miniconda3/envs/diffsim/bin/python - \
+    "$1" "$2" <<'PY'
+import sys
+from resources.check_g1_runtime_log import (
+    GATE_L_ORACLE_INVARIANTS,
+    read_rows,
+)
+
+long_rows = read_rows(sys.argv[1])
+captured = read_rows(sys.argv[2])
+assert len(long_rows) == 800 and len(captured) == 32
+for index, (current, frozen) in enumerate(zip(long_rows[:32], captured)):
+    for name in GATE_L_ORACLE_INVARIANTS:
+        assert current[name] == frozen[name], (index, name)
+print("VALID frozen current-frontier 32-frame capture")
+PY
+}
+
+check_flat_l4_contract() {
+  /home/ubuntu/miniconda3/envs/diffsim/bin/python - \
+    "$1" "$2" "$3" "$4" <<'PY'
+import sys
+from resources.check_g1_runtime_log import (
+    _check_disabled_ik_is_canonical,
+    _gate_l_heading,
+    _gate_l_surface_split,
+    _integer,
+    _relative_travel_direction,
+    _require_full_runtime_header,
+    check_rows,
+    read_rows,
+)
+
+path, route, heading, expected_relative = sys.argv[1:5]
+rows = read_rows(path)
+_require_full_runtime_header(rows)
+check_rows(rows, allow_ik=True)
+assert len(rows) == 100
+assert {(row["scene_id"], row["route"]) for row in rows} == {
+    ("stairs-shallow", route)}
+assert all(row["mode"] == "route" for row in rows)
+assert len({_integer(row, "scene_generation", index)
+            for index, row in enumerate(rows)}) == 1
+_gate_l_heading(rows, heading)
+assert all(_integer(row, "ik_enabled", index) == 0 and
+           _integer(row, "ik_applied", index) == 0
+           for index, row in enumerate(rows))
+for index, row in enumerate(rows):
+    _check_disabled_ik_is_canonical(row, index)
+assert all(_integer(row, name, index) == 0
+           for index, row in enumerate(rows)
+           for name in (
+               "footprint_blocked", "blocked", "ik_safe_stop_requested",
+               "ik_safe_stop_latched", "frame_rejected"))
+assert all(row["footprint_status"] == "invalid-input" for row in rows)
+assert _integer(rows[-1], "route_complete", 99) == 1
+maximum_split = _gate_l_surface_split(rows, False)
+assert maximum_split < .04
+relative, distance = _relative_travel_direction(rows, heading)
+assert relative == expected_relative
+print(
+    f"VALID Gate L4 properties route={route} heading={heading} "
+    f"relative={relative} distance={distance:.6f} "
+    f"maximum_split={maximum_split:.6f}")
+PY
+}
+
 quality="$root/gate-l/quality-verdicts.tsv"
 : > "$quality"
 routes=(
@@ -2087,25 +2380,40 @@ for specification in "${routes[@]}"; do
     on="$root/gate-l/${stem}-on.csv"
     for ik in 0 1; do
       log="$off"; test "$ik" = 1 && log="$on"
+      trace="$root/gate-l/${stem}-${ik}.tsv"
+      trace_runtime="$root/gate-l/trace-runtime-${stem}-${ik}.csv"
+      frontier="$root/gate-l/frontier-${stem}-${ik}.csv"
       DISPLAY=:1 MM_IK="$ik" "$root/controller-release" \
         --terrain-dir /tmp/g1-terrain-footprint-runtime-v1 \
         --terrain-scene "$scene" --test-mode route --test-route "$route" \
         --test-frames 800 --test-heading "$heading" --terrain-weight 4 \
         --log "$log"
+      DISPLAY=:1 MM_IK="$ik" MM_CANDIDATE_TRACE="$trace" \
+        "$root/controller-trace" \
+        --terrain-dir /tmp/g1-terrain-footprint-runtime-v1 \
+        --terrain-scene "$scene" --test-mode route --test-route "$route" \
+        --test-frames 800 --test-heading "$heading" --terrain-weight 4 \
+        --log "$trace_runtime"
+      cmp "$log" "$trace_runtime"
+      DISPLAY=:1 MM_IK="$ik" "$base/controller" \
+        --terrain-dir /tmp/g1-terrain-footprint-runtime-v1 \
+        --terrain-scene "$scene" --test-mode route --test-route "$route" \
+        --test-frames 800 --test-heading "$heading" --terrain-weight 4 \
+        --log "$frontier"
+      compare_frontier "$log" "$frontier" "$trace"
+      if test "$heading" = forward; then
+        verify_frontier_capture "$frontier" \
+          "$base/current-frontier/forward32-${scene}__${route}-${ik}.csv"
+      fi
     done
     extra=()
     if test "$heading" != forward; then
       extra=(--compare-forward \
         "$root/gate-l/${scene}__${route}__forward-on.csv")
     fi
-    baseline=()
-    if test "$heading" = forward; then
-      baseline=(--compare-forward-baseline \
-        "/tmp/g1-footprint-prechange-oracle/forward-${scene}__${route}.csv")
-    fi
     /home/ubuntu/miniconda3/envs/diffsim/bin/python \
       resources/check_g1_runtime_log.py "$on" --gate-l \
-      --compare-ik-off "$off" "${extra[@]}" "${baseline[@]}" \
+      --compare-ik-off "$off" "${extra[@]}" \
       --expected-end-x "$end_x" --expected-end-z "$end_z" \
       --expected-heading "$heading" --require-multilevel
     printf '%s\tPASS\n' "$stem" >> "$quality"
@@ -2121,12 +2429,33 @@ test "$(awk -F '\t' '$2 == "PASS" {n++} END {print n+0}' "$quality")" -eq 30
   "$root/gate-l/stairs-standard__ascent-landing-descent__negative-x-on.csv"
 
 for ik in 0 1; do
+  release="$root/gate-l/landing-exit-stress-${ik}.csv"
+  trace_runtime="$root/gate-l/trace-runtime-landing-exit-stress-${ik}.csv"
+  trace="$root/gate-l/landing-exit-stress-${ik}.tsv"
   DISPLAY=:1 MM_IK="$ik" "$root/controller-release" \
     --terrain-dir /tmp/g1-terrain-footprint-runtime-v1 \
     --terrain-scene stairs-standard --test-mode route \
     --test-route landing-side-exit-stress --test-frames 800 \
     --test-heading positive-x --terrain-weight 4 \
-    --log "$root/gate-l/landing-exit-stress-${ik}.csv"
+    --log "$release"
+  DISPLAY=:1 MM_IK="$ik" MM_CANDIDATE_TRACE="$trace" \
+    "$root/controller-trace" \
+    --terrain-dir /tmp/g1-terrain-footprint-runtime-v1 \
+    --terrain-scene stairs-standard --test-mode route \
+    --test-route landing-side-exit-stress --test-frames 800 \
+    --test-heading positive-x --terrain-weight 4 \
+    --log "$trace_runtime"
+  cmp "$release" "$trace_runtime"
+  DISPLAY=:1 MM_IK="$ik" "$base/controller" \
+    --terrain-dir /tmp/g1-terrain-footprint-runtime-v1 \
+    --terrain-scene stairs-standard --test-mode route \
+    --test-route landing-side-exit-stress --test-frames 800 \
+    --test-heading positive-x --terrain-weight 4 \
+    --log "$root/gate-l/frontier-landing-exit-stress-${ik}.csv"
+  compare_frontier \
+    "$release" \
+    "$root/gate-l/frontier-landing-exit-stress-${ik}.csv" \
+    "$trace"
 done
 /home/ubuntu/miniconda3/envs/diffsim/bin/python \
   resources/check_g1_runtime_log.py \
@@ -2134,12 +2463,33 @@ done
   --compare-ik-off "$root/gate-l/landing-exit-stress-0.csv"
 
 for ik in 0 1; do
+  release="$root/gate-l/tangent-${ik}.csv"
+  trace_runtime="$root/gate-l/trace-runtime-tangent-${ik}.csv"
+  trace="$root/gate-l/tangent-${ik}.tsv"
   DISPLAY=:1 MM_IK="$ik" "$root/controller-release" \
     --terrain-dir /tmp/g1-terrain-footprint-runtime-v1 \
     --terrain-scene mixed-multilevel --test-mode route \
     --test-route tangent-level-boundary --test-frames 800 \
     --test-heading positive-x --terrain-weight 4 \
-    --log "$root/gate-l/tangent-${ik}.csv"
+    --log "$release"
+  DISPLAY=:1 MM_IK="$ik" MM_CANDIDATE_TRACE="$trace" \
+    "$root/controller-trace" \
+    --terrain-dir /tmp/g1-terrain-footprint-runtime-v1 \
+    --terrain-scene mixed-multilevel --test-mode route \
+    --test-route tangent-level-boundary --test-frames 800 \
+    --test-heading positive-x --terrain-weight 4 \
+    --log "$trace_runtime"
+  cmp "$release" "$trace_runtime"
+  DISPLAY=:1 MM_IK="$ik" "$base/controller" \
+    --terrain-dir /tmp/g1-terrain-footprint-runtime-v1 \
+    --terrain-scene mixed-multilevel --test-mode route \
+    --test-route tangent-level-boundary --test-frames 800 \
+    --test-heading positive-x --terrain-weight 4 \
+    --log "$root/gate-l/frontier-tangent-${ik}.csv"
+  compare_frontier \
+    "$release" \
+    "$root/gate-l/frontier-tangent-${ik}.csv" \
+    "$trace"
 done
 /home/ubuntu/miniconda3/envs/diffsim/bin/python \
   resources/check_g1_runtime_log.py "$root/gate-l/tangent-1.csv" --gate-l \
@@ -2161,20 +2511,27 @@ for specification in "${flat_cases[@]}"; do
   IFS=: read -r route heading relative <<<"$specification"
   stem="${route}__${heading}__${relative}"
   final="$root/gate-l/flat-${stem}.csv"
-  baseline="/tmp/g1-footprint-prechange-oracle/flat-${stem}.csv"
+  baseline="$base/current-frontier/flat-${stem}.csv"
+  trace="$root/gate-l/flat-${stem}.tsv"
+  trace_runtime="$root/gate-l/trace-runtime-flat-${stem}.csv"
   DISPLAY=:1 MM_IK=0 "$root/controller-release" \
     --terrain-dir /tmp/g1-terrain-footprint-runtime-v1 \
     --terrain-scene stairs-shallow --test-mode route --test-route "$route" \
     --test-frames 100 --test-heading "$heading" --terrain-weight 4 \
     --log "$final"
-  /home/ubuntu/miniconda3/envs/diffsim/bin/python \
-    resources/check_g1_runtime_log.py "$final" --gate-l \
-    --compare-flat-baseline "$baseline" --expected-heading "$heading" \
-    --expected-relative-direction "$relative"
+  DISPLAY=:1 MM_IK=0 MM_CANDIDATE_TRACE="$trace" \
+    "$root/controller-trace" \
+    --terrain-dir /tmp/g1-terrain-footprint-runtime-v1 \
+    --terrain-scene stairs-shallow --test-mode route --test-route "$route" \
+    --test-frames 100 --test-heading "$heading" --terrain-weight 4 \
+    --log "$trace_runtime"
+  cmp "$final" "$trace_runtime"
+  check_flat_l4_contract "$final" "$route" "$heading" "$relative"
+  compare_frontier "$final" "$baseline" "$trace"
 done
 ```
 
-Expected: all 30 paired full Gate L cells pass; both lateral directions pass the L2 relation; exit stress retains its allowed branch; tangent traversal passes; all eight flat cases match their immutable pre-footprint oracles. No gate is weakened or replaced with safety-only.
+Expected: every physical Gate L, L2, exit, tangent, and flat checker consumes only no-seam release CSVs. For both modes of all 30 cells, both exit modes, both tangent modes, and all eight flat cases, the separately run trace binary emits a byte-identical production CSV before its TSV is trusted; therefore no test-only column or seam-only behavior enters certification. All 30 paired full Gate L physical cells pass; both lateral directions pass the L2 relation; exit stress retains its allowed branch; tangent traversal passes; and all eight flat cases reproduce the complete Gate L4 property contract. Every candidate trace proves exact same-build accelerated/exhaustive equality. Each release/current-frontier pair is equal over all `GATE_L_ORACLE_INVARIANTS` rows when recovery is absent, or over the exact prefix before the trace-authenticated first recovery frame otherwise. The five forward current-frontier runs also reproduce their hashed 32-frame captures. No gate is weakened or replaced with safety-only, and no stale pre-frontier behavior path is consumed.
 
 - [ ] **Step 6: Audit evidence, repository scope, commits, and the untouched production surface**
 
@@ -2184,7 +2541,9 @@ root=/tmp/g1-bounded-candidate-cert/live
 test "$(cat "$root/ZERO_REJECTION_32.PASS")" = PASS
 sha256sum -c "$root/BINARIES.sha256"
 sha256sum -c /tmp/g1-bounded-candidate-cert/base/immutable-files.before.sha256
-sha256sum -c /tmp/g1-footprint-prechange-oracle/SHA256SUMS
+sha256sum -c \
+  /tmp/g1-bounded-candidate-cert/base/current-frontier/SHA256SUMS
+(cd /tmp/g1-footprint-prechange-oracle && sha256sum -c SHA256SUMS)
 test "$(sha256sum docs/superpowers/specs/2026-07-16-g1-bounded-candidate-certification-design.md | cut -d' ' -f1)" = \
   10c21cb51a351b9cc2f4c1e03d58472e485bba36d0449967de4e08e33a7ec6dd
 git diff --check
@@ -2202,15 +2561,15 @@ printf '%s\n' \
   g1_candidate_certification_trace.h \
   g1_candidate_recovery.cpp \
   g1_candidate_recovery.h \
-  g1_controller_frame_runtime.h \
   g1_frame_transaction.h \
+  scene_switch.h \
   tests/cpp/compile_g1_candidate_recovery_production.cpp \
   tests/cpp/compile_g1_candidate_recovery_seam_negative.cpp \
-  tests/cpp/compile_g1_frame_transaction_runner_negative.cpp \
   tests/cpp/test_g1_candidate_recovery.cpp \
   tests/cpp/test_g1_controller_logging.cpp \
   tests/cpp/test_g1_frame_transaction.cpp \
   tests/cpp/test_g1_frame_transaction_production.cpp \
+  tests/cpp/test_scene_switch.cpp \
   | sort > "$expected"
 cmp "$expected" "$root/changed-paths.txt"
 test "$(git log --format=%s \
@@ -2218,8 +2577,8 @@ test "$(git log --format=%s \
   | rg -c '^(feat: add strict bounded recovery provider|feat: coordinate bounded dual candidate certification|feat: publish bounded candidate outcomes atomically|feat: integrate bounded candidate certification|test: trace bounded candidate certification)$')" -eq 5
 ```
 
-Review the 32-frame trace, exact 800-row release result, three performance summaries, 9 normal/4 stress/2 blocked Gate reports, 30 Gate L verdicts, L2/exit/tangent/flat reports, native/Python test logs, recorded compiler switches, binary hashes, and five task commits. Resolve any Critical or Important code-review finding test-first and rerun the affected focused matrix plus every live gate whose ownership could change.
+Review the 32-frame trace, exact 800-row release result, three performance summaries, 9 normal/4 stress/2 blocked Gate reports, 30 Gate L verdicts, trace-bounded current-frontier comparison output, L2/exit/tangent/flat reports, native/Python test logs, recorded compiler switches, binary hashes, and five task commits. Resolve any Critical or Important code-review finding test-first and rerun the affected focused matrix plus every live gate whose ownership could change.
 
-Expected: evidence hashes verify; changed source paths are exactly the thirteen planned paths; exactly five task commits have the planned subjects; the final worktree status exactly matches the recorded pre-implementation unrelated status; schema, checker, spec, terrain, and prechange oracles are unchanged; `git diff --check` is silent; no repository evidence artifact was created; and the running visualizer was neither discovered nor touched. There is deliberately no Task 6 commit.
+Expected: evidence hashes verify; changed source paths are exactly the thirteen planned paths; exactly five task commits have the planned subjects; the final worktree status exactly matches the recorded pre-implementation unrelated status; the unchanged compile-negative runner has executed in the later verification matrices; schema, checker, spec, terrain, current-frontier captures/controller, and asset-only prechange corpus are unchanged; `git diff --check` is silent; no repository evidence artifact was created; and the running visualizer was neither discovered nor touched. There is deliberately no Task 6 commit.
 
 ---
