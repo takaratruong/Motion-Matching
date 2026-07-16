@@ -53,33 +53,17 @@ static size_t count_occurrences(
     return count;
 }
 
-static std::string call_text(
-    const std::string& source, const char* function, size_t start)
+static std::string compact_source(const std::string& source)
 {
-    const size_t name = find_required(
-        source, function, start, "matcher call exists");
-    const size_t open = find_required(
-        source, "(", name + std::strlen(function), "matcher call opens");
-    int depth = 0;
-    for (size_t i = open; i < source.size(); ++i) {
-        if (source[i] == '(') {
-            ++depth;
-        } else if (source[i] == ')' && --depth == 0) {
-            return source.substr(name, i - name + 1);
+    std::string output;
+    output.reserve(source.size());
+    for (const char value : source) {
+        if (value != ' ' && value != '\t' &&
+            value != '\r' && value != '\n') {
+            output.push_back(value);
         }
     }
-    check(false, "matcher call closes");
-    return std::string();
-}
-
-static void check_matcher_call_is_support_free(
-    const std::string& call, const char* message)
-{
-    check(call.find("state.support") == std::string::npos &&
-          call.find("support_rows") == std::string::npos &&
-          call.find("terrain_support") == std::string::npos &&
-          call.find("terrain_support.bin") == std::string::npos,
-          message);
+    return output;
 }
 
 static void test_pure_matching_invariance()
@@ -152,208 +136,166 @@ static void test_controller_source_contract(const char* path)
         (std::istreambuf_iterator<char>(input)),
         std::istreambuf_iterator<char>());
 
-    const size_t update_begin = find_required(
-        source, "auto update_func = [&]()", 0, "fixed update exists");
-    const size_t update_end = find_required(
-        source, "#if defined(PLATFORM_WEB)", update_begin,
-        "fixed update closes");
-    const std::string update = source.substr(
-        update_begin, update_end - update_begin);
-
-    check(count_occurrences(update, "state.transitioned = false;") == 1 &&
-          count_occurrences(update, "state.transitioned = true;") == 1,
-          "transition flag has one reset and one searched-frame assignment");
-    const size_t transitioned_reset = find_required(
-        update, "state.transitioned = false;", 0,
-        "transition reset exists");
-    const size_t input_work = find_required(
-        update, "gamepad_get_stick", 0, "input work exists");
-    const size_t query_build = find_required(
-        update, "array1d<float> query", 0, "query construction exists");
-    const size_t search = find_required(
-        update, "database_search(", query_build, "database search exists");
-    const size_t prior = find_required(
-        update, "const int prior_index = state.frame_index;", query_build,
-        "searched source frame is captured");
-    const size_t searched_change = find_required(
-        update, "best_index != prior_index", search,
-        "transition compares the searched source frame");
-    const size_t transition_true = find_required(
-        update, "state.transitioned = true;", searched_change,
-        "real searched change sets transition");
-    const size_t sequential_advance = find_required(
-        update, "database_trajectory_index_clamp(\n                db, state.frame_index, 1)",
-        transition_true, "sequential source advance exists");
-    const size_t inertialization = find_required(
-        update, "inertialize_pose_update(", sequential_advance,
-        "pose inertialization exists");
-    const size_t simulation_xz = find_required(
-        update, "simulation_positions_update(", inertialization,
-        "simulation XZ integration exists");
-    const size_t preliminary_fk = find_required(
-        update, "forward_kinematics_full(", simulation_xz,
-        "preliminary support-local FK exists");
-    const size_t observation = find_required(
-        update, "support_observation_build_walkable(", preliminary_fk,
-        "walkability-filtered support observation exists");
-    const size_t support_update = find_required(
-        update, "support_frame_update(", observation,
-        "support update exists");
-    const size_t adjustment = find_required(
-        update, "horizontal_adjust_character_position", support_update,
-        "horizontal adjustment follows support update");
-    const size_t clamp = find_required(
-        update, "horizontal_clamp_character_position", adjustment,
-        "horizontal clamp follows adjustment");
-    const size_t support_apply = find_required(
-        update, "support_pose_apply(", clamp,
-        "world support follows horizontal root work");
-    const size_t final_fk = find_required(
-        update, "forward_kinematics_full(", support_apply,
-        "final FK follows world support");
-
-    check(transitioned_reset < input_work && input_work < query_build &&
-          query_build < prior && prior < search && search < searched_change &&
-          searched_change < transition_true &&
-          transition_true < sequential_advance &&
-          sequential_advance < inertialization &&
-          inertialization < simulation_xz && simulation_xz < preliminary_fk &&
-          preliminary_fk < observation && observation < support_update &&
-          support_update < adjustment && adjustment < clamp &&
-          clamp < support_apply && support_apply < final_fk,
-          "fixed update stage order preserves matching and rebases support");
-    check(count_occurrences(
-              update, "support_observation_build_walkable(") == 1 &&
-          count_occurrences(update, "support_frame_update(") == 1 &&
-          count_occurrences(update, "support_pose_apply(") == 1 &&
-          count_occurrences(update, "forward_kinematics_full(") == 2,
-          "support is observed, updated, and applied exactly once");
-    const std::string observation_call = call_text(
-        update, "support_observation_build_walkable", preliminary_fk);
-    check(observation_call.find("support_rows") != std::string::npos &&
-          observation_call.find("state.frame_index") != std::string::npos &&
-          observation_call.find("active_scene.terrain") !=
+    check(source.find("static constexpr bool ik_enabled = false;") ==
               std::string::npos &&
-          observation_call.find("active_scene.walkability") !=
-              std::string::npos &&
-          observation_call.find(
-              "state.global_bone_positions(G1_Simulation)") !=
-              std::string::npos &&
-          observation_call.find(
-              "state.global_bone_positions(G1_LeftToe)") !=
-              std::string::npos &&
-          observation_call.find(
-              "state.global_bone_positions(G1_RightToe)") !=
-              std::string::npos &&
-          observation_call.find("state.curr_bone_contacts(0)") !=
-              std::string::npos &&
-          observation_call.find("state.curr_bone_contacts(1)") !=
+          source.find("if constexpr (ik_enabled)") == std::string::npos,
+          "Task6 runtime IK must replace the compile-time-disabled IK path");
+    check(source.find("auto update_func = [&]()") == std::string::npos,
+          "Task6 uses a named noncapturing frame runner, not the old update lambda");
+    check(source.find("#include \"g1_controller_frame_runtime.h\"") !=
               std::string::npos,
-          "support observes the current G1 source frame and recorded contacts");
-    const std::string update_call = call_text(
-        update, "support_frame_update", observation);
-    check(update_call.find("state.support_observation_now") !=
-              std::string::npos &&
-          update_call.find("state.transitioned") != std::string::npos &&
-          update_call.find("dt") != std::string::npos,
-          "support inertializer rebases from the same-frame transition flag");
+          "controller includes the shared typed production-runner declaration");
 
-    const std::string query_to_search = update.substr(
-        query_build, search - query_build);
-    check(query_to_search.find("state.support") == std::string::npos &&
-          query_to_search.find("support_rows") == std::string::npos &&
-          query_to_search.find("terrain_support") == std::string::npos,
-          "query construction has no support coupling");
-    check(query_to_search.find("active_scene.terrain") != std::string::npos &&
-          query_to_search.find("runtime_terrain") == std::string::npos,
-          "query samples only active-scene G1HF/v2");
-    check_matcher_call_is_support_free(
-        call_text(update, "database_search", query_build),
-        "database search has no support coupling");
-    const char* isolated_apis[] = {
-        "database_frame_cost",
-        "database_raw_terrain_error",
-        "database_build_bounds",
-    };
-    for (const char* api : isolated_apis) {
-        size_t call_start = 0;
-        while ((call_start = source.find(api, call_start)) !=
-               std::string::npos) {
-            check_matcher_call_is_support_free(
-                call_text(source, api, call_start),
-                "matching cost/bounds API has no support coupling");
-            ++call_start;
+    const size_t runner = find_required(
+        source, "G1FrameStageOutcome g1_controller_frame_stage_run(", 0,
+        "Task6 named production stage runner exists");
+    const size_t signature_end = find_required(
+        source, ")", runner, "production runner signature closes");
+    const std::string signature = compact_source(source.substr(
+        runner, signature_end - runner + 1));
+    check(signature.find("G1FrameTransactionStagestage") !=
+              std::string::npos &&
+          signature.find("g1_controller_state&working_state") !=
+              std::string::npos &&
+          signature.find("G1FrameTransactionScratch&scratch") !=
+              std::string::npos &&
+          signature.find("constG1FrameExternalInputs&external") !=
+              std::string::npos &&
+          signature.find("char*error") != std::string::npos &&
+          signature.find("interror_capacity") != std::string::npos,
+          "production runner has the exact typed noncapturing authority boundary");
+
+    const size_t body_open = find_required(
+        source, "{", signature_end, "production runner body opens");
+    int brace_depth = 0;
+    size_t body_close = std::string::npos;
+    for (size_t cursor = body_open; cursor < source.size(); ++cursor) {
+        if (source[cursor] == '{') {
+            ++brace_depth;
+        } else if (source[cursor] == '}' && --brace_depth == 0) {
+            body_close = cursor;
+            break;
         }
     }
-    const size_t startup_builder = find_required(
-        source, "database_build_matching_features(", 0,
-        "startup feature builder exists");
-    const size_t ui_builder = find_required(
-        source, "database_build_matching_features(", startup_builder + 1,
-        "UI feature builder exists");
-    check(source.find("database_build_matching_features(", ui_builder + 1) ==
-              std::string::npos,
-          "only startup and UI feature builders exist");
-    const std::string startup_builder_call = call_text(
-        source, "database_build_matching_features", startup_builder);
-    const std::string ui_builder_call = call_text(
-        source, "database_build_matching_features", ui_builder);
-    check_matcher_call_is_support_free(
-        startup_builder_call, "startup feature builder has no support coupling");
-    check_matcher_call_is_support_free(
-        ui_builder_call, "UI feature builder has no support coupling");
-    check(startup_builder_call.find("effective_terrain_weight") !=
-              std::string::npos &&
-          ui_builder_call.find("requested_terrain_weight") !=
-              std::string::npos,
-          "feature builders consume only published or requested UI weight");
-    const size_t rebuild_validation = find_required(
-        source, "g1_matching_features_validate(", ui_builder,
-        "UI rebuild validates 31D features");
-    const size_t effective_publish = find_required(
-        source, "effective_terrain_weight = requested_terrain_weight;",
-        rebuild_validation, "validated UI weight is published");
-    check(ui_builder < rebuild_validation &&
-          rebuild_validation < effective_publish,
-          "effective terrain weight publishes only after validation");
+    check(body_close != std::string::npos,
+          "production runner body closes");
+    const std::string body = compact_source(source.substr(
+        body_open, body_close - body_open + 1));
 
-    check(source.find("vec3 adjust_character_position(") ==
-              std::string::npos &&
-          source.find("vec3 adjust_character_position_by_velocity(") ==
-              std::string::npos &&
-          source.find("vec3 clamp_character_position(") ==
+    const size_t diagnostic_candidate = body.find(
+        "scratch.accepted_diagnostic_candidate=diagnostic;");
+    const size_t diagnostic_ready = body.find(
+        "scratch.accepted_diagnostic_ready=true;", diagnostic_candidate);
+    check(diagnostic_candidate != std::string::npos &&
+              diagnostic_ready != std::string::npos &&
+              diagnostic_candidate < diagnostic_ready &&
+              count_occurrences(
+                  body, "scratch.accepted_diagnostic_candidate=diagnostic;") ==
+                  1 &&
+              count_occurrences(
+                  body, "scratch.accepted_diagnostic_ready=true;") == 1 &&
+              count_occurrences(body, "accepted_diagnostic") == 2,
+          "runner publishes exactly one diagnostic candidate through scratch");
+
+    const char* forbidden_runner_authority[] = {
+        "accepted_state", "publication",
+        "frame_runtime", "getenv", "gamepad_get_stick",
+        "GetGamepadAxisMovement", "deterministic_log", "Camera3D",
+        "controlled_runtime_error", "BeginDrawing",
+        "draw_g1_skeleton", "g1_ik_frame_evaluate",
+    };
+    for (const char* forbidden : forbidden_runner_authority) {
+        check(body.find(forbidden) == std::string::npos,
+              "runner has no accepted/publication/input/UI/log/cleanup authority");
+    }
+    check(body.find("g1_controller_state&state=working_state;") !=
               std::string::npos,
-          "dead 3D root-position alternatives are absent");
-    check(update.find(
-              "state.adjusted_bone_positions = state.bone_positions;") ==
+          "runner may name only its working-state parameter as local state");
+    check(body.find("external.input") != std::string::npos &&
+          body.find("external.tuning") != std::string::npos,
+          "runner consumes immutable typed input and tuning snapshots");
+
+    static const char* stages[] = {
+        "caseG1FrameStageInputRouteCommand:",
+        "caseG1FrameStageMatcherSearch:",
+        "caseG1FrameStageInertialization:",
+        "caseG1FrameStageSimulationUpdate:",
+        "caseG1FrameStageSupportObservation:",
+        "caseG1FrameStageSupportRetarget:",
+        "caseG1FrameStageContactUpdate:",
+        "caseG1FrameStageFootprintObservation:",
+        "caseG1FrameStageFirstFootIk:",
+        "caseG1FrameStageSecondFootIk:",
+        "caseG1FrameStageFinalFk:",
+        "caseG1FrameStagePoseCertificate:",
+    };
+    size_t stage_positions[12] = {};
+    size_t stage_start = 0;
+    for (int index = 0; index < 12; ++index) {
+        stage_positions[index] = find_required(
+            body, stages[index], stage_start,
+            "runner has every authenticated stage exactly once and in order");
+        check(count_occurrences(body, stages[index]) == 1,
+              "runner has one case for each authenticated stage");
+        stage_start = stage_positions[index] + 1;
+    }
+
+    const std::string raw_support = body.substr(
+        stage_positions[4], stage_positions[5] - stage_positions[4]);
+    const size_t raw_fk = find_required(
+        raw_support, "g1_ik_checked_forward_kinematics(", 0,
+        "support observation begins with checked raw-pose FK");
+    const size_t observation = find_required(
+        raw_support, "support_observation_build(", raw_fk,
+        "support observation consumes checked raw-pose FK");
+    check(raw_fk < observation &&
+          count_occurrences(raw_support,
+              "g1_ik_checked_forward_kinematics(") == 1 &&
+          count_occurrences(raw_support, "support_observation_build(") == 1,
+          "raw FK and support observation each execute exactly once");
+
+    const std::string retarget = body.substr(
+        stage_positions[5], stage_positions[6] - stage_positions[5]);
+    check(count_occurrences(retarget, "support_pose_apply(") == 1,
+          "support-retarget stage applies the support pose exactly once");
+
+    const std::string contact = body.substr(
+        stage_positions[6], stage_positions[7] - stage_positions[6]);
+    const size_t retargeted_fk = find_required(
+        contact, "g1_ik_checked_forward_kinematics(", 0,
+        "contact stage begins with checked support-retargeted FK");
+    const size_t contact_history = find_required(
+        contact, "contact_update(", retargeted_fk,
+        "contact history advances from checked support-retargeted toe positions");
+    check(retargeted_fk < contact_history &&
+          count_occurrences(contact, "contact_update(") == 1 &&
+          count_occurrences(body, "contact_update(") == 1,
+          "one contact-history update follows the checked retargeted FK");
+    check(contact.find("external.tuning.contact_unlock_radius") !=
+              std::string::npos &&
+          contact.find("external.tuning.contact_foot_height") !=
+              std::string::npos &&
+          contact.find("external.tuning.contact_blending_halflife") !=
               std::string::npos,
-          "support output is not overwritten before final FK");
-    check(source.find("static constexpr bool ik_enabled = false;") !=
-              std::string::npos &&
-          source.find("static constexpr bool lmm_enabled = false;") !=
-              std::string::npos &&
-          source.find("if constexpr (ik_enabled)") != std::string::npos,
-          "IK and LMM stay compile-time disabled");
-    check(source.find("log_row.support_retargeting_enabled = true;") !=
-              std::string::npos &&
-          source.find("world-Y support enabled; IK disabled") !=
+          "contact history consumes immutable typed contact tuning");
+
+    const size_t ik_parser = find_required(
+        source, "g1_parse_ik_enabled(", 0,
+        "startup has a checked exact MM_IK parser");
+    const size_t ik_environment = find_required(
+        source, "getenv(\"MM_IK\")", ik_parser,
+        "MM_IK is sampled once at startup");
+    const size_t raylib_start = find_required(
+        source, "InitWindow(", ik_environment,
+        "Raylib starts after immutable startup parsing");
+    check(ik_environment < raylib_start &&
+          count_occurrences(source, "getenv(\"MM_IK\")") == 1 &&
+          body.find("MM_IK") == std::string::npos,
+          "MM_IK is startup-only and never reread by the runner");
+    check(compact_source(source).find(
+              "frame_external.tuning.ik_enabled=process_config.ik_enabled;") !=
               std::string::npos,
-          "support-enabled log and UI claims are honest");
-    check(source.find("requested_terrain_weight") != std::string::npos &&
-          source.find("effective_terrain_weight") != std::string::npos &&
-          source.find("applied_feature_weight_terrain") == std::string::npos &&
-          source.find("feature_weight_terrain") == std::string::npos,
-          "terrain weight has separate requested and effective state");
-    check(source.find(
-              "log_row.effective_terrain_weight =\n"
-              "                effective_terrain_weight;") !=
-              std::string::npos &&
-          source.find("requested %.3f (unapplied %.3f)") !=
-              std::string::npos &&
-          source.find("&requested_terrain_weight") != std::string::npos,
-          "logs use effective weight and UI exposes unapplied requests");
-    check(source.find("runtime_terrain") == std::string::npos,
-          "legacy runtime terrain alias is absent");
+          "immutable startup IK is lowered into the typed frame context");
 }
 
 int main(int argc, char** argv)

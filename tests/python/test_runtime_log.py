@@ -1,5 +1,8 @@
 import contextlib
+import hashlib
 import io
+import math
+import os
 import struct
 import tempfile
 import unittest
@@ -16,7 +19,7 @@ from resources.check_g1_runtime_log import (
 )
 
 
-RUNTIME_SUFFIX = (
+LEGACY_RUNTIME_SUFFIX = (
     "source_name", "source_terrain", "source_index", "continuation_cost",
     "source_root_height", "source_left_toe_height", "source_right_toe_height",
     "runtime_support_root_height", "runtime_support_left_toe_height",
@@ -32,6 +35,123 @@ RUNTIME_SUFFIX = (
     "motion_pack_load_count", "model_load_count", "model_unload_count",
     "live_model_count",
 )
+
+
+def _columns(text):
+    return tuple(name.strip() for name in text.split(",") if name.strip())
+
+
+IK_SUFFIX = _columns("""
+ik_applied,ik_safe_stop_requested,ik_stop_reason,max_ik_correction,
+actual_simulation_speed,ik_candidate_rejected,ik_candidate_clearance_status,
+left_candidate_toe_clearance,left_candidate_foot_clearance,
+right_candidate_toe_clearance,right_candidate_foot_clearance,
+ik_candidate_minimum_clearance,
+left_recorded_contact,right_recorded_contact,left_locked,right_locked,
+left_observed_lock_drift,right_observed_lock_drift,
+left_lock_drift,right_lock_drift,
+left_sole_normal_alignment,right_sole_normal_alignment,
+left_contact_residual,right_contact_residual,
+left_target_height,right_target_height,
+left_target_normal_x,left_target_normal_y,left_target_normal_z,
+right_target_normal_x,right_target_normal_y,right_target_normal_z,
+left_swing_candidates_evaluated,left_swing_selected_index,
+left_swing_selected_lift_bits,left_swing_materialized_command_y_bits,
+left_swing_actual_sphere_center_bits_hex,
+left_swing_selected_clearance_status,
+left_swing_selected_controller_constraints_passed,
+left_swing_selected_clearance_certified,
+left_swing_lower_margin,left_swing_witness_upper_margin,
+left_swing_selected_work_point_queries,left_swing_selected_work_cells_visited,
+left_swing_selected_work_primitive_triangle_pairs,
+left_swing_selected_work_face_patches,left_swing_selected_work_candidate_tests,
+left_swing_selected_work_subdivision_nodes,
+left_swing_total_work_point_queries,left_swing_total_work_cells_visited,
+left_swing_total_work_primitive_triangle_pairs,
+left_swing_total_work_face_patches,left_swing_total_work_candidate_tests,
+left_swing_total_work_subdivision_nodes,
+right_swing_candidates_evaluated,right_swing_selected_index,
+right_swing_selected_lift_bits,right_swing_materialized_command_y_bits,
+right_swing_actual_sphere_center_bits_hex,
+right_swing_selected_clearance_status,
+right_swing_selected_controller_constraints_passed,
+right_swing_selected_clearance_certified,
+right_swing_lower_margin,right_swing_witness_upper_margin,
+right_swing_selected_work_point_queries,right_swing_selected_work_cells_visited,
+right_swing_selected_work_primitive_triangle_pairs,
+right_swing_selected_work_face_patches,right_swing_selected_work_candidate_tests,
+right_swing_selected_work_subdivision_nodes,
+right_swing_total_work_point_queries,right_swing_total_work_cells_visited,
+right_swing_total_work_primitive_triangle_pairs,
+right_swing_total_work_face_patches,right_swing_total_work_candidate_tests,
+right_swing_total_work_subdivision_nodes,
+left_reachable,right_reachable,left_knee_clearance,left_ankle_clearance,
+left_toe_clearance,left_foot_clearance,left_shin_clearance,
+left_thigh_clearance,right_knee_clearance,right_ankle_clearance,
+right_toe_clearance,right_foot_clearance,right_shin_clearance,
+right_thigh_clearance,ik_hips_clearance,ik_minimum_clearance
+""")
+
+DIRECTIONAL_SUFFIX = _columns("""
+requested_velocity_x,requested_velocity_y,requested_velocity_z,
+applied_velocity_x,applied_velocity_y,applied_velocity_z,
+desired_heading_bits_hex,predicted_heading_bits_hex,
+simulation_heading_error_deg,rendered_heading_error_deg,
+footprint_status,footprint_blocked,footprint_blocked_reason,
+footprint_root_height,
+left_footprint_min_height,left_footprint_max_height,
+right_footprint_min_height,right_footprint_max_height,
+left_maximum_root_split,right_maximum_root_split,
+left_footprint_multilevel,right_footprint_multilevel,
+left_landing_expected,left_landing_patch_ready,left_landing_sample,
+left_landing_surface_status,left_landing_walkability_class,
+left_predicted_landing_center_x,left_predicted_landing_center_y,
+left_predicted_landing_center_z,left_predicted_landing_height,
+left_predicted_landing_normal_x,left_predicted_landing_normal_y,
+left_predicted_landing_normal_z,left_landing_patch_maximum_residual,
+right_landing_expected,right_landing_patch_ready,right_landing_sample,
+right_landing_surface_status,right_landing_walkability_class,
+right_predicted_landing_center_x,right_predicted_landing_center_y,
+right_predicted_landing_center_z,right_predicted_landing_height,
+right_predicted_landing_normal_x,right_predicted_landing_normal_y,
+right_predicted_landing_normal_z,right_landing_patch_maximum_residual,
+footprint_sweeps,footprint_surface_queries,footprint_node_visits,
+frame_rejected,frame_rejection_stage,ik_safe_stop_latched,
+rejected_attempted_footprint_available,rejected_attempted_ik_available,
+rejected_stop_reason,rejected_attempted_pose_available,rejected_pose_status,
+rejected_pose_minimum_clearance,
+rejected_left_landing_expected,rejected_left_landing_patch_ready,
+rejected_left_landing_sample,rejected_left_landing_center_x,
+rejected_left_landing_center_y,rejected_left_landing_center_z,
+rejected_left_landing_surface_status,rejected_left_landing_surface_height,
+rejected_left_landing_surface_normal_x,
+rejected_left_landing_surface_normal_y,
+rejected_left_landing_surface_normal_z,
+rejected_left_landing_walkability_class,
+rejected_left_landing_patch_maximum_residual,
+rejected_left_target_x,rejected_left_target_y,rejected_left_target_z,
+rejected_left_target_normal_x,rejected_left_target_normal_y,
+rejected_left_target_normal_z,rejected_left_reachable,
+rejected_left_correction_limited,rejected_left_selected_clearance_status,
+rejected_left_selected_lower_margin,rejected_left_selected_witness_upper,
+rejected_right_landing_expected,rejected_right_landing_patch_ready,
+rejected_right_landing_sample,rejected_right_landing_center_x,
+rejected_right_landing_center_y,rejected_right_landing_center_z,
+rejected_right_landing_surface_status,rejected_right_landing_surface_height,
+rejected_right_landing_surface_normal_x,
+rejected_right_landing_surface_normal_y,
+rejected_right_landing_surface_normal_z,
+rejected_right_landing_walkability_class,
+rejected_right_landing_patch_maximum_residual,
+rejected_right_target_x,rejected_right_target_y,rejected_right_target_z,
+rejected_right_target_normal_x,rejected_right_target_normal_y,
+rejected_right_target_normal_z,rejected_right_reachable,
+rejected_right_correction_limited,rejected_right_selected_clearance_status,
+rejected_right_selected_lower_margin,rejected_right_selected_witness_upper,
+accepted_state_digest_hex
+""")
+
+RUNTIME_SUFFIX = LEGACY_RUNTIME_SUFFIX + IK_SUFFIX + DIRECTIONAL_SUFFIX
 
 TASK11_SCENE_IDS = (
     "grail-curb-default",
@@ -156,6 +276,68 @@ def runtime_row(frame, **changes):
         "support_retargeting_enabled": "1", "ik_enabled": "0",
         "adjustment_y": "0", "clamp_y": "0", "fixed_dt": ".04",
         "mode": "route", "route": "fixture-route", "scene_id": "fixture",
+    })
+    for name in IK_SUFFIX + DIRECTIONAL_SUFFIX:
+        values.setdefault(name, "0")
+    values.update({
+        "ik_stop_reason": "none",
+        "ik_candidate_clearance_status": "ok",
+        "left_swing_actual_sphere_center_bits_hex": "00000000" * 12,
+        "left_swing_selected_clearance_status": "invalid-input",
+        "right_swing_actual_sphere_center_bits_hex": "00000000" * 12,
+        "right_swing_selected_clearance_status": "invalid-input",
+        "left_swing_selected_index": str(2 ** 32 - 1),
+        "right_swing_selected_index": str(2 ** 32 - 1),
+        "left_sole_normal_alignment": "1",
+        "right_sole_normal_alignment": "1",
+        "left_target_normal_y": "1",
+        "right_target_normal_y": "1",
+        "left_candidate_toe_clearance": ".03",
+        "left_candidate_foot_clearance": ".03",
+        "right_candidate_toe_clearance": ".03",
+        "right_candidate_foot_clearance": ".03",
+        "ik_candidate_minimum_clearance": ".03",
+        "left_knee_clearance": ".03",
+        "left_ankle_clearance": ".03",
+        "left_toe_clearance": ".03",
+        "left_foot_clearance": ".03",
+        "left_shin_clearance": ".03",
+        "left_thigh_clearance": ".03",
+        "right_knee_clearance": ".03",
+        "right_ankle_clearance": ".03",
+        "right_toe_clearance": ".03",
+        "right_foot_clearance": ".03",
+        "right_shin_clearance": ".03",
+        "right_thigh_clearance": ".03",
+        "ik_hips_clearance": ".03",
+        "ik_minimum_clearance": ".03",
+        "requested_velocity_z": ".5",
+        "applied_velocity_z": ".5",
+        "desired_heading_bits_hex": "3f800000000000000000000000000000",
+        "predicted_heading_bits_hex":
+            "3f800000000000000000000000000000" * 4,
+        "footprint_status": "ok",
+        "footprint_blocked_reason": "clear",
+        "left_landing_sample": str(2 ** 32 - 1),
+        "left_landing_surface_status": "invalid",
+        "left_predicted_landing_normal_y": "0",
+        "right_landing_sample": str(2 ** 32 - 1),
+        "right_landing_surface_status": "invalid",
+        "right_predicted_landing_normal_y": "0",
+        "frame_rejection_stage": "none",
+        "rejected_stop_reason": "none",
+        "rejected_pose_status": "invalid-input",
+        "rejected_left_landing_sample": str(2 ** 32 - 1),
+        "rejected_left_landing_surface_status": "invalid",
+        "rejected_left_landing_surface_normal_y": "0",
+        "rejected_left_target_normal_y": "0",
+        "rejected_left_selected_clearance_status": "invalid-input",
+        "rejected_right_landing_sample": str(2 ** 32 - 1),
+        "rejected_right_landing_surface_status": "invalid",
+        "rejected_right_landing_surface_normal_y": "0",
+        "rejected_right_target_normal_y": "0",
+        "rejected_right_selected_clearance_status": "invalid-input",
+        "accepted_state_digest_hex": "0000000000000000",
     })
     values.update({key: str(value) for key, value in changes.items()})
     if "query_bits_hex" not in changes:
@@ -298,6 +480,41 @@ def write_runtime_rows(stream, rows):
     stream.flush()
 
 
+def legacy_runtime_rows(rows):
+    columns = tuple(GATE_A_COLUMNS) + LEGACY_RUNTIME_SUFFIX
+    return [{name: item[name] for name in columns} for item in rows]
+
+
+def write_columns(path, rows, columns):
+    with open(path, "w", encoding="utf-8", newline="") as stream:
+        stream.write(",".join(columns) + "\n")
+        for item in rows:
+            stream.write(",".join(item[name] for name in columns) + "\n")
+
+
+def make_oracle_tree(directory, basename, rows):
+    legacy_columns = tuple(GATE_A_COLUMNS) + LEGACY_RUNTIME_SUFFIX
+    names = ("controller",) + tuple(runtime_log.FLAT_ORACLE_CASES) + tuple(
+        runtime_log.FORWARD_ORACLE_CASES)
+    for name in names:
+        path = os.path.join(directory, name)
+        if name == "controller":
+            with open(path, "wb") as stream:
+                stream.write(b"test-controller")
+        elif name == basename:
+            write_columns(path, rows, legacy_columns)
+        else:
+            with open(path, "wb") as stream:
+                stream.write(name.encode("ascii"))
+    record = os.path.join(directory, "SHA256SUMS")
+    with open(record, "w", encoding="ascii", newline="") as stream:
+        for name in names:
+            with open(os.path.join(directory, name), "rb") as payload:
+                digest = hashlib.file_digest(payload, "sha256").hexdigest()
+            stream.write(f"{digest}  {name}\n")
+    return os.path.join(directory, basename)
+
+
 def set_terrain(values, sample, value):
     values[f"terrain{sample}"] = str(value)
     query_values = [0.0] * 27 + [
@@ -308,12 +525,1148 @@ def set_terrain(values, sample, value):
         struct.pack(">f", query_value).hex() for query_value in query_values)
 
 
+HEADING_COMPONENTS = {
+    "forward": (1.0, 0.0, 0.0, 0.0),
+    "backward": (0.0, 0.0, 1.0, 0.0),
+    "positive-x": (0.707106769, 0.0, 0.707106769, 0.0),
+    "negative-x": (0.707106769, 0.0, -0.707106769, 0.0),
+    "diagonal-positive-x": (0.923879504, 0.0, 0.382683426, 0.0),
+    "diagonal-negative-x": (0.923879504, 0.0, -0.382683426, 0.0),
+}
+
+
+def heading_bits(name):
+    return "".join(struct.pack(">f", value).hex()
+                   for value in HEADING_COMPONENTS[name])
+
+
+def gate_l_rows(
+        heading="positive-x", count=120, ik=1,
+        scene="stairs-standard", route="ascent-landing-descent",
+        end_x=1.2, end_z=2.4, multilevel=True):
+    rows = []
+    bits = heading_bits(heading)
+    for frame in range(count):
+        phase = frame / (count - 1)
+        hips_y = .8 + .02 * math.sin(frame * .1)
+        rows.append(runtime_row(
+            frame,
+            scene_id=scene,
+            route=route,
+            ik_enabled=ik,
+            ik_applied=ik,
+            actual_simulation_speed=.5,
+            simulation_x=end_x * phase,
+            simulation_z=end_z * phase,
+            route_complete=int(frame == count - 1),
+            route_target_height=.36,
+            desired_heading_bits_hex=bits,
+            predicted_heading_bits_hex=bits * 4,
+            simulation_heading_error_deg=3,
+            rendered_heading_error_deg=5,
+            max_ik_correction=.1,
+            left_recorded_contact=1,
+            right_recorded_contact=1,
+            left_locked=1,
+            right_locked=1,
+            left_target_height=0,
+            right_target_height=0,
+            rendered_hips_y=hips_y,
+            support_retargeted_hips_y=hips_y,
+            ik_adjusted_hips_y=hips_y,
+            footprint_status=("ok" if ik else "invalid-input"),
+            footprint_blocked=0,
+            footprint_blocked_reason="clear",
+            footprint_root_height=0,
+            left_footprint_min_height=0,
+            left_footprint_max_height=(.08 if ik and multilevel else 0),
+            right_footprint_min_height=0,
+            right_footprint_max_height=0,
+            left_maximum_root_split=(.08 if ik and multilevel else 0),
+            left_footprint_multilevel=int(ik and multilevel and frame == 40),
+            runtime_root_surface_height=0,
+            runtime_left_toe_surface_height=(
+                .08 if multilevel and frame == 41 else 0),
+            runtime_right_toe_surface_height=0,
+            requested_velocity_x=.25,
+            requested_velocity_z=.5,
+            applied_velocity_x=.25,
+            applied_velocity_z=.5,
+            walkability_class=1,
+            blocked=0,
+            blocked_reason="clear",
+            accepted_state_digest_hex=f"{frame + 1:016x}",
+        ))
+    if not ik:
+        for item in rows:
+            for name in IK_SUFFIX:
+                item[name] = "0"
+            item.update({
+                "ik_stop_reason": "none",
+                "ik_candidate_clearance_status": "invalid-input",
+                "left_swing_selected_index": str(2 ** 32 - 1),
+                "left_swing_actual_sphere_center_bits_hex": "00000000" * 12,
+                "left_swing_selected_clearance_status": "invalid-input",
+                "right_swing_selected_index": str(2 ** 32 - 1),
+                "right_swing_actual_sphere_center_bits_hex": "00000000" * 12,
+                "right_swing_selected_clearance_status": "invalid-input",
+            })
+    return rows
+
+
+def gate_l_check(rows, **changes):
+    options = {
+        "expected_end_x": 1.2,
+        "expected_end_z": 2.4,
+        "expected_heading": "positive-x",
+        "require_multilevel": True,
+    }
+    options.update(changes)
+    return runtime_log.check_gate_l(rows, **options)
+
+
+def rejection_rows(stage="landing-patch"):
+    rows = [
+        runtime_row(0, ik_enabled=1, accepted_state_digest_hex="1" * 16),
+        runtime_row(1, ik_enabled=1, accepted_state_digest_hex="1" * 16),
+    ]
+    rejected = rows[1]
+    rejected.update({
+        "frame_rejected": "1",
+        "ik_safe_stop_latched": "1",
+        "frame_rejection_stage": stage,
+        "rejected_attempted_footprint_available": "1",
+    })
+    if stage == "landing-patch":
+        rejected.update({
+            "rejected_attempted_ik_available": "1",
+            "rejected_stop_reason": "landing-patch-unavailable",
+            "rejected_left_landing_expected": "1",
+            "rejected_left_landing_patch_ready": "0",
+            "rejected_left_landing_sample": "1",
+            "rejected_left_landing_surface_status": "valid",
+            "rejected_left_landing_walkability_class": "1",
+            "rejected_left_landing_patch_maximum_residual": ".006",
+        })
+    elif stage == "pose-certificate":
+        rejected.update({
+            "rejected_stop_reason": "pose-clearance-rejected",
+            "rejected_attempted_pose_available": "0",
+            "rejected_pose_status": "outside-domain",
+        })
+    return rows
+
+
+def gate_l2_pair_rows():
+    positive = gate_l_rows(heading="positive-x")
+    negative = gate_l_rows(heading="negative-x")
+    for item in positive[20:25]:
+        item["left_target_height"] = ".10"
+        item["right_target_height"] = "0"
+    for item in negative[60:65]:
+        item["left_target_height"] = "0"
+        item["right_target_height"] = ".10"
+    return positive, negative
+
+
+def exit_safe_stop_rows(ik=1):
+    rows = gate_l_rows(
+        heading="positive-x", count=72, ik=ik,
+        scene="stairs-standard", route="landing-side-exit-stress",
+        end_x=.8, end_z=1.2, multilevel=False)
+    for item in rows:
+        item["route_complete"] = "0"
+    if not ik:
+        rows[-1]["route_complete"] = "1"
+        return rows
+    for item in rows:
+        item["left_recorded_contact"] = "0"
+    baseline = rows[69]
+    held_digest = baseline["accepted_state_digest_hex"]
+    held_fields = (
+        "database_frame", "range", "source_range",
+        "left_recorded_contact", "right_recorded_contact",
+        "left_target_height", "right_target_height",
+        "simulation_x", "simulation_z", "rendered_hips_y",
+        "ik_minimum_clearance", "rendered_min_clearance",
+    )
+    for index in (70, 71):
+        item = rows[index]
+        for name in held_fields:
+            item[name] = baseline[name]
+        item.update({
+            "query_database_frame": baseline["database_frame"],
+            "selected_database_frame": baseline["database_frame"],
+            "query_range": baseline["range"],
+            "accepted_state_digest_hex": held_digest,
+            "frame_rejected": "1",
+            "frame_rejection_stage": "landing-patch",
+            "ik_safe_stop_latched": "1",
+            "rejected_attempted_footprint_available": "1",
+            "rejected_attempted_ik_available": "1",
+            "rejected_stop_reason": "landing-patch-unavailable",
+            "rejected_left_landing_expected": "1",
+            "rejected_left_landing_patch_ready": "0",
+            "rejected_left_landing_sample": "1",
+            "rejected_left_landing_surface_status": "valid",
+            "rejected_left_landing_walkability_class": "1",
+            "rejected_left_landing_patch_maximum_residual": ".006",
+            "rejected_left_target_normal_y": "1",
+            "rejected_left_reachable": "1",
+            "rejected_right_target_normal_y": "1",
+            "rejected_right_reachable": "1",
+        })
+    return rows
+
+
 class RuntimeLogTests(unittest.TestCase):
     def test_runtime_columns_append_after_gate_a(self):
+        self.assertEqual(len(GATE_A_COLUMNS), 62)
+        self.assertEqual(len(IK_SUFFIX), 92)
+        self.assertEqual(len(DIRECTIONAL_SUFFIX), 109)
+        self.assertEqual(len(RUNTIME_COLUMNS), 305)
+        self.assertEqual(len(set(RUNTIME_COLUMNS)), 305)
         self.assertEqual(
             tuple(RUNTIME_COLUMNS[-len(RUNTIME_SUFFIX):]), RUNTIME_SUFFIX)
         self.assertEqual(
             tuple(RUNTIME_COLUMNS[:-len(RUNTIME_SUFFIX)]), GATE_A_COLUMNS)
+
+    def test_directional_columns_append_after_exact_ik_suffix(self):
+        start = len(GATE_A_COLUMNS) + len(LEGACY_RUNTIME_SUFFIX)
+        middle = start + len(IK_SUFFIX)
+        self.assertEqual(tuple(RUNTIME_COLUMNS[start:middle]), IK_SUFFIX)
+        self.assertEqual(tuple(RUNTIME_COLUMNS[middle:]), DIRECTIONAL_SUFFIX)
+
+    def test_legacy_runtime_schema_remains_readable_for_earlier_gates(self):
+        legacy_c = legacy_runtime_rows(gate_c_rows())
+        self.assertEqual(check_rows(legacy_c)["frames"], len(legacy_c))
+        self.assertEqual(
+            runtime_log.check_gate_c(legacy_c)["frames"], len(legacy_c))
+
+        legacy_d = legacy_runtime_rows(gate_d_rows())
+        report = runtime_log.check_gate_d(legacy_d)
+        self.assertEqual(report["frames"], len(legacy_d))
+        self.assertIn("minimum_certified_clearance", report)
+
+        legacy_f = legacy_runtime_rows(
+            scene_cycle_rows(list(TASK11_SCENE_IDS)))
+        self.assertEqual(runtime_log.check_gate_f(
+            legacy_f, TASK11_SCENE_IDS)["complete_cycles"], 2)
+
+    def test_gate_l_accepts_all_exact_heading_codes_on_one_physical_path(self):
+        for heading in HEADING_COMPONENTS:
+            rows = gate_l_rows(heading=heading)
+            report = gate_l_check(rows, expected_heading=heading)
+            with self.subTest(heading=heading):
+                self.assertEqual(report["frames"], 120)
+                self.assertEqual(report["heading"], heading)
+                self.assertLessEqual(report["endpoint_error_m"], .25)
+
+    def test_gate_l_rejects_one_bit_desired_or_predicted_heading_change(self):
+        for name, offset in (
+                ("desired_heading_bits_hex", 31),
+                ("predicted_heading_bits_hex", 127)):
+            rows = gate_l_rows()
+            word = rows[33][name]
+            rows[33][name] = word[:offset] + (
+                "1" if word[offset] != "1" else "2") + word[offset + 1:]
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, "heading bits"):
+                    gate_l_check(rows)
+                with self.assertRaisesRegex(ValueError, "heading bits"):
+                    gate_l_check(rows, safety_only=True)
+
+    def test_gate_l_safety_only_defers_only_rendered_quality_thresholds(self):
+        rows = gate_l_rows()
+        for item in rows[50:]:
+            item["rendered_heading_error_deg"] = "25"
+        self.assertEqual(
+            gate_l_check(rows, safety_only=True)["frames"], 120)
+        with self.assertRaisesRegex(ValueError, "heading error"):
+            gate_l_check(rows)
+
+        safety_mutations = (
+            ("route_complete", -1, "0", "complete"),
+            ("ik_safe_stop_requested", 70, "1", "safe-stop"),
+            ("ik_enabled", 70, "0", "IK enabled"),
+            ("ik_applied", 70, "0", "IK applied"),
+            ("walkability_class", 70, "2", "class-1"),
+            ("frame_rejected", 70, "1", "rejection"),
+            ("left_toe_clearance", 70, "-.006", "planted"),
+            ("left_foot_clearance", 70, "-.006", "planted"),
+            ("left_candidate_toe_clearance", 70, "-.006", "planted"),
+            ("rendered_min_clearance", 70, "-.011", "clearance"),
+            ("ik_minimum_clearance", 70, "-.011", "clearance"),
+            ("ik_candidate_minimum_clearance", 70, "-.011", "clearance"),
+            ("max_ik_correction", 70, ".351", "correction"),
+        )
+        for name, index, value, diagnostic in safety_mutations:
+            changed = gate_l_rows()
+            changed[index][name] = value
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    gate_l_check(changed, safety_only=True)
+
+        endpoint = gate_l_rows(end_x=.8, end_z=1.8)
+        with self.assertRaisesRegex(ValueError, "endpoint"):
+            gate_l_check(endpoint, safety_only=True)
+
+        hips = gate_l_rows()
+        hips[75]["rendered_hips_y"] = str(
+            float(hips[74]["rendered_hips_y"]) + .05001)
+        with self.assertRaisesRegex(ValueError, "Hips"):
+            gate_l_check(hips, safety_only=True)
+
+        without_multilevel = gate_l_rows(multilevel=False)
+        with self.assertRaisesRegex(ValueError, "multilevel"):
+            gate_l_check(without_multilevel, safety_only=True)
+
+        excessive_support = gate_l_rows(
+            scene="mixed-multilevel", route="tangent-level-boundary")
+        excessive_support[60]["support_velocity"] = "1.51"
+        with self.assertRaisesRegex(ValueError, "support velocity"):
+            gate_l_check(excessive_support, safety_only=True)
+
+        treatment = gate_l_rows()
+        mismatched_control = gate_l_rows(ik=0)
+        mismatched_control[25]["requested_velocity_x"] = ".25000003"
+        with self.assertRaisesRegex(ValueError, "IK-off invariant"):
+            gate_l_check(
+                treatment, compare_ik_off=mismatched_control,
+                safety_only=True)
+
+        changed_digest = gate_l_rows()
+        changed_digest[70].update({
+            "left_recorded_contact": "0",
+            "frame_rejected": "1",
+            "ik_safe_stop_latched": "1",
+            "frame_rejection_stage": "landing-patch",
+            "rejected_attempted_footprint_available": "1",
+            "rejected_attempted_ik_available": "1",
+            "rejected_stop_reason": "landing-patch-unavailable",
+            "rejected_left_landing_expected": "1",
+            "rejected_left_landing_patch_ready": "0",
+            "rejected_left_landing_sample": "1",
+            "rejected_left_landing_surface_status": "valid",
+            "rejected_left_landing_walkability_class": "1",
+            "rejected_left_landing_patch_maximum_residual": ".006",
+        })
+        with self.assertRaisesRegex(ValueError, "accepted-state digest"):
+            gate_l_check(changed_digest, safety_only=True)
+
+    def test_gate_l_enforces_ik_route_completion_endpoint_and_no_stop(self):
+        cases = (
+            ("ik_enabled", 0, "0", "IK enabled"),
+            ("ik_applied", 10, "0", "IK applied"),
+            ("mode", 10, "terrain", "route mode"),
+            ("scene_generation", 60, "1", "one generation"),
+            ("walkability_class", 60, "2", "class-1"),
+            ("route_complete", -1, "0", "complete"),
+            ("footprint_blocked", 60, "1",
+             "safe-stop|accepted footprint.*blocked"),
+            ("ik_safe_stop_latched", 60, "1", "safe-stop"),
+            ("frame_rejected", 60, "1", "rejection"),
+        )
+        for name, index, value, diagnostic in cases:
+            rows = gate_l_rows()
+            rows[index][name] = value
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    gate_l_check(rows)
+
+        rows = gate_l_rows(end_x=.8, end_z=1.8)
+        with self.assertRaisesRegex(ValueError, "endpoint"):
+            gate_l_check(rows)
+
+    def test_gate_l_enforces_physical_clearance_hips_and_correction_limits(self):
+        cases = (
+            ("left_toe_clearance", "-.00501", "planted toe/foot"),
+            ("left_foot_clearance", "-.00501", "planted toe/foot"),
+            ("right_toe_clearance", "-.00501", "planted toe/foot"),
+            ("right_foot_clearance", "-.00501", "planted toe/foot"),
+            ("left_candidate_toe_clearance", "-.00501",
+             "planted toe/foot"),
+            ("left_candidate_foot_clearance", "-.00501",
+             "planted toe/foot"),
+            ("right_candidate_toe_clearance", "-.00501",
+             "planted toe/foot"),
+            ("right_candidate_foot_clearance", "-.00501",
+             "planted toe/foot"),
+            ("rendered_min_clearance", "-.01001", "physical clearance"),
+            ("ik_minimum_clearance", "-.01001", "physical clearance"),
+            ("ik_candidate_minimum_clearance", "-.01001",
+             "physical clearance"),
+            ("max_ik_correction", ".35001", "correction"),
+        )
+        for name, value, diagnostic in cases:
+            rows = gate_l_rows()
+            rows[75][name] = value
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    gate_l_check(rows)
+
+        rows = gate_l_rows()
+        rows[75]["rendered_hips_y"] = str(
+            float(rows[74]["rendered_hips_y"]) + .05001)
+        with self.assertRaisesRegex(ValueError, "Hips"):
+            gate_l_check(rows)
+
+        rows = gate_l_rows()
+        rows[75]["left_recorded_contact"] = "0"
+        rows[75]["left_toe_clearance"] = "-.5"
+        self.assertEqual(gate_l_check(rows)["frames"], 120)
+
+    def test_gate_l_locks_median_p95_and_maximum_rendered_heading_error(self):
+        rows = gate_l_rows()
+        for item in rows[50:86]:
+            item["rendered_heading_error_deg"] = "10.01"
+        with self.assertRaisesRegex(ValueError, "median.*heading error"):
+            gate_l_check(rows)
+
+        rows = gate_l_rows()
+        for item in rows[50:54]:
+            item["rendered_heading_error_deg"] = "20.01"
+        with self.assertRaisesRegex(ValueError, "95th.*heading error"):
+            gate_l_check(rows)
+
+        rows = gate_l_rows()
+        rows[75]["rendered_heading_error_deg"] = "35.01"
+        with self.assertRaisesRegex(ValueError, "maximum.*heading error"):
+            gate_l_check(rows)
+
+    def test_gate_l_requires_multilevel_report_no_later_than_surface_split(self):
+        rows = gate_l_rows()
+        self.assertGreaterEqual(
+            gate_l_check(rows)["maximum_surface_split_m"], .04)
+
+        rows = gate_l_rows(multilevel=False)
+        with self.assertRaisesRegex(ValueError, "multilevel"):
+            gate_l_check(rows)
+
+        rows = gate_l_rows()
+        rows[40]["left_footprint_multilevel"] = "0"
+        rows[42]["left_footprint_multilevel"] = "1"
+        with self.assertRaisesRegex(ValueError, "same-or-earlier"):
+            gate_l_check(rows)
+
+        rows = gate_l_rows(multilevel=False)
+        self.assertEqual(
+            gate_l_check(rows, require_multilevel=False)["frames"], 120)
+
+    def test_gate_l_ik_off_pair_locks_matcher_support_simulation_and_intent(self):
+        treatment = gate_l_rows(ik=1)
+        control = gate_l_rows(ik=0)
+        report = gate_l_check(treatment, compare_ik_off=control)
+        self.assertEqual(report["paired_ik_off_frames"], 120)
+
+        for name, value in (
+                ("query_bits_hex", "00000001" + "00000000" * 30),
+                ("selected_database_frame", "999"),
+                ("selected_cost", "1.00000012"),
+                ("terrain0", ".01"),
+                ("runtime_support_root_height", ".01"),
+                ("runtime_support_left_toe_height", ".01"),
+                ("support_left_toe_delta", ".01"),
+                ("simulation_x", ".01"),
+                ("matching_enabled", "0"),
+                ("requested_velocity_x", ".25000003")):
+            changed = gate_l_rows(ik=0)
+            changed[25][name] = value
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, "IK-off invariant"):
+                    gate_l_check(treatment, compare_ik_off=changed)
+
+        unsafe_control = gate_l_rows(ik=0)
+        unsafe_control[25]["footprint_blocked"] = "1"
+        with self.assertRaisesRegex(
+                ValueError, "IK-off control.*safe-stop|accepted footprint.*blocked"):
+            gate_l_check(treatment, compare_ik_off=unsafe_control)
+
+        noncanonical_control = gate_l_rows(ik=0)
+        noncanonical_control[25]["footprint_status"] = "ok"
+        with self.assertRaisesRegex(ValueError, "IK-off control.*footprint"):
+            gate_l_check(treatment, compare_ik_off=noncanonical_control)
+
+        for name, value in (
+                ("left_footprint_multilevel", "1"),
+                ("footprint_sweeps", "123"),
+                ("footprint_root_height", "9"),
+                ("ik_candidate_rejected", "1"),
+                ("ik_candidate_clearance_status", "outside-domain"),
+                ("ik_minimum_clearance", "-100")):
+            noncanonical_control = gate_l_rows(ik=0)
+            noncanonical_control[25][name] = value
+            with self.subTest(canonical_field=name):
+                with self.assertRaisesRegex(
+                        ValueError,
+                        "invalid-input footprint.*canonical|"
+                        "accepted IK candidate|disabled IK.*canonical"):
+                    gate_l_check(
+                        treatment, compare_ik_off=noncanonical_control)
+
+    def test_gate_l_support_bound_uses_forward_pair_or_tangential_cap(self):
+        rows = gate_l_rows(
+            scene="mixed-multilevel", route="tangent-level-boundary")
+        rows[60]["support_velocity"] = "1.51"
+        with self.assertRaisesRegex(ValueError, "support velocity"):
+            gate_l_check(rows)
+
+        unpaired_forward = gate_l_rows(heading="forward")
+        unpaired_forward[60]["support_velocity"] = "2"
+        self.assertEqual(gate_l_check(
+            unpaired_forward, expected_heading="forward")["frames"], 120)
+
+        rows = gate_l_rows()
+        forward = gate_l_rows(heading="forward")
+        for item in forward:
+            item["support_velocity"] = ".8"
+        rows[60]["support_velocity"] = "1.05"
+        self.assertEqual(gate_l_check(
+            rows, compare_forward=forward)["frames"], 120)
+        rows[60]["support_velocity"] = "1.06"
+        with self.assertRaisesRegex(ValueError, "support velocity"):
+            gate_l_check(rows, compare_forward=forward)
+
+        wrong_forward = gate_l_rows(
+            heading="forward", scene="ramp-05-up-down",
+            route="up-landing-down")
+        with self.assertRaisesRegex(ValueError, "stairs-standard"):
+            gate_l_check(gate_l_rows(), compare_forward=wrong_forward)
+
+    def test_gate_l2_pair_requires_both_legs_in_both_three_frame_roles(self):
+        positive, negative = gate_l2_pair_rows()
+        report = runtime_log.check_gate_l2_pair(positive, negative)
+        self.assertEqual(report["role_coverage"],
+                         "left:downhill+uphill,right:downhill+uphill")
+
+        missing = [dict(item) for item in negative]
+        for item in missing:
+            item["left_target_height"] = "0"
+            item["right_target_height"] = "0"
+        with self.assertRaisesRegex(ValueError, "leg-role coverage"):
+            runtime_log.check_gate_l2_pair(positive, missing)
+
+        short_positive = [dict(item) for item in positive]
+        for item in short_positive[22:25]:
+            item["left_target_height"] = "0"
+            item["right_target_height"] = "0"
+        with self.assertRaisesRegex(ValueError, "leg-role coverage"):
+            runtime_log.check_gate_l2_pair(short_positive, negative)
+
+        flat_positive = [dict(item) for item in positive]
+        for item in flat_positive:
+            item["left_footprint_multilevel"] = "0"
+            item["right_footprint_multilevel"] = "0"
+            item["runtime_left_toe_surface_height"] = "0"
+            item["runtime_right_toe_surface_height"] = "0"
+        with self.assertRaisesRegex(ValueError, "multilevel"):
+            runtime_log.check_gate_l2_pair(flat_positive, negative)
+
+        fast_positive = [dict(item) for item in positive]
+        fast_positive[30]["support_velocity"] = "1.51"
+        with self.assertRaisesRegex(ValueError, "support velocity"):
+            runtime_log.check_gate_l2_pair(fast_positive, negative)
+
+    def test_gate_l2_pair_locks_route_headings_completion_and_safety(self):
+        positive, negative = gate_l2_pair_rows()
+        cases = (
+            (positive, 10, "route", "different", "one scene"),
+            (positive, -1, "route_complete", "0", "complete"),
+            (positive, 10, "ik_safe_stop_requested", "1", "safe-stop"),
+            (negative, 10, "desired_heading_bits_hex",
+             heading_bits("positive-x"), "heading bits"),
+        )
+        for target, index, name, value, diagnostic in cases:
+            left = [dict(item) for item in positive]
+            right = [dict(item) for item in negative]
+            changed = left if target is positive else right
+            changed[index][name] = value
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    runtime_log.check_gate_l2_pair(left, right)
+
+    def test_gate_l2_exit_stress_accepts_only_completed_or_proven_rollback(self):
+        treatment = exit_safe_stop_rows(ik=1)
+        control = exit_safe_stop_rows(ik=0)
+        report = runtime_log.check_gate_l2_exit_stress(treatment, control)
+        self.assertEqual(report["branch"], "safe-stop")
+        self.assertEqual(report["rejected_frames"], 2)
+        self.assertEqual(report["paired_ik_off_frames"], 70)
+
+        unreachable = [dict(item) for item in treatment]
+        for item in unreachable:
+            item["left_recorded_contact"] = "1"
+        for item in unreachable[70:]:
+            item.update({
+                "frame_rejection_stage": "ik-candidate",
+                "rejected_stop_reason": "target-unreachable",
+                "rejected_left_landing_expected": "0",
+                "rejected_left_landing_patch_ready": "0",
+                "rejected_left_landing_sample": str(2 ** 32 - 1),
+                "rejected_left_landing_surface_status": "invalid",
+                "rejected_left_landing_walkability_class": "0",
+                "rejected_left_landing_patch_maximum_residual": "0",
+                "rejected_left_target_normal_y": "1",
+                "rejected_left_reachable": "0",
+                "rejected_right_reachable": "1",
+            })
+        self.assertEqual(runtime_log.check_gate_l2_exit_stress(
+            unreachable, control)["branch"], "safe-stop")
+
+        right_unreachable = [dict(item) for item in unreachable]
+        for item in right_unreachable[70:]:
+            item.update({
+                "rejected_left_reachable": "1",
+                "rejected_right_target_normal_y": "1",
+                "rejected_right_reachable": "0",
+            })
+        self.assertEqual(runtime_log.check_gate_l2_exit_stress(
+            right_unreachable, control)["branch"], "safe-stop")
+
+        canonical_other_foot = [dict(item) for item in unreachable]
+        for item in canonical_other_foot[70:]:
+            item["rejected_left_reachable"] = "1"
+            item["rejected_right_reachable"] = "1"
+        with self.assertRaisesRegex(ValueError, "outside.*contract"):
+            runtime_log.check_gate_l2_exit_stress(
+                canonical_other_foot, control)
+
+        no_swing = [dict(item) for item in treatment]
+        for item in no_swing:
+            item["left_recorded_contact"] = "0"
+        for item in no_swing[70:]:
+            item.update({
+                "frame_rejection_stage": "ik-candidate",
+                "rejected_stop_reason": "no-swing-candidate",
+                "rejected_left_landing_expected": "0",
+                "rejected_left_landing_patch_ready": "0",
+                "rejected_left_landing_sample": str(2 ** 32 - 1),
+                "rejected_left_landing_surface_status": "invalid",
+                "rejected_left_landing_walkability_class": "0",
+                "rejected_left_landing_patch_maximum_residual": "0",
+                "rejected_left_target_normal_y": "1",
+                "rejected_left_reachable": "1",
+                "rejected_left_selected_clearance_status": "invalid-input",
+                "rejected_right_reachable": "1",
+            })
+        self.assertEqual(runtime_log.check_gate_l2_exit_stress(
+            no_swing, control)["branch"], "safe-stop")
+
+        right_no_swing = [dict(item) for item in treatment]
+        for item in right_no_swing:
+            item["right_recorded_contact"] = "0"
+        for item in right_no_swing[70:]:
+            item.update({
+                "frame_rejection_stage": "ik-candidate",
+                "rejected_stop_reason": "no-swing-candidate",
+                "rejected_left_landing_expected": "0",
+                "rejected_left_landing_patch_ready": "0",
+                "rejected_left_landing_sample": str(2 ** 32 - 1),
+                "rejected_left_landing_surface_status": "invalid",
+                "rejected_left_landing_walkability_class": "0",
+                "rejected_left_landing_patch_maximum_residual": "0",
+                "rejected_left_target_normal_y": "1",
+                "rejected_left_reachable": "1",
+                "rejected_left_selected_clearance_status": "ok",
+                "rejected_right_target_normal_y": "1",
+                "rejected_right_reachable": "1",
+                "rejected_right_selected_clearance_status": "invalid-input",
+            })
+        self.assertEqual(runtime_log.check_gate_l2_exit_stress(
+            right_no_swing, control)["branch"], "safe-stop")
+
+        canonical_other_swing = [dict(item) for item in no_swing]
+        for item in canonical_other_swing[70:]:
+            item["rejected_left_selected_clearance_status"] = "ok"
+            item["rejected_right_reachable"] = "1"
+        with self.assertRaisesRegex(ValueError, "outside.*contract"):
+            runtime_log.check_gate_l2_exit_stress(
+                canonical_other_swing, control)
+
+        completed = gate_l_rows(
+            heading="positive-x", count=72, ik=1,
+            scene="stairs-standard", route="landing-side-exit-stress",
+            end_x=0, end_z=5.53, multilevel=False)
+        completed_control = gate_l_rows(
+            heading="positive-x", count=72, ik=0,
+            scene="stairs-standard", route="landing-side-exit-stress",
+            end_x=0, end_z=5.53, multilevel=False)
+        self.assertEqual(runtime_log.check_gate_l2_exit_stress(
+            completed, completed_control)["branch"], "complete")
+
+        for name, value, diagnostic in (
+                ("rejected_left_landing_patch_maximum_residual",
+                 str(struct.unpack(">f", struct.pack(">f", .005))[0]),
+                 "outside.*contract"),
+                ("left_target_height", ".2", "committed target"),
+                ("rejected_stop_reason", "target-unreachable", "rejection"),
+                ("walkability_class", "2", "class-1"),
+                ("ik_applied", "0", "IK applied"),
+                ("footprint_blocked", "1", "block")):
+            changed = [dict(item) for item in treatment]
+            target_index = 10 if name in {
+                "walkability_class", "ik_applied", "footprint_blocked"} else 70
+            changed[target_index][name] = value
+            if name == "left_target_height":
+                changed[71][name] = value
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    runtime_log.check_gate_l2_exit_stress(changed, control)
+
+    def test_gate_l_cli_wires_safety_pairing_and_exact_requirements(self):
+        treatment = gate_l_rows()
+        control = gate_l_rows(ik=0)
+        with tempfile.NamedTemporaryFile("w+", suffix=".csv") as on_stream, \
+                tempfile.NamedTemporaryFile("w+", suffix=".csv") as off_stream:
+            write_runtime_rows(on_stream, treatment)
+            write_runtime_rows(off_stream, control)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(runtime_log.main([
+                    on_stream.name, "--gate-l-safety-only",
+                    "--compare-ik-off", off_stream.name,
+                    "--expected-end-x", "1.2",
+                    "--expected-end-z", "2.4",
+                    "--expected-heading", "positive-x",
+                    "--require-multilevel",
+                ]), 0)
+        self.assertTrue(output.getvalue().startswith("VALID gate-l-safety "))
+
+        for extra, diagnostic in (
+                (["--gate-l"], "expected-end-x"),
+                (["--gate-l", "--expected-end-x", "1",
+                  "--expected-end-z", "2"], "expected-heading"),
+                (["--gate-l", "--expected-end-x", "1",
+                  "--expected-end-z", "2",
+                  "--expected-heading", "forward"], "compare-ik-off"),
+                (["--gate-l2-exit-stress", "--expected-end-x", "1"],
+                 "may not combine")):
+            stderr = io.StringIO()
+            with self.subTest(extra=extra):
+                with contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as raised:
+                        runtime_log.main(["unused.csv", *extra])
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn(diagnostic, stderr.getvalue())
+
+    def test_gate_l4_authenticates_flat_oracle_and_relative_direction(self):
+        rows = gate_l_rows(
+            heading="forward", count=100, ik=0,
+            scene="stairs-shallow", route="flat-positive-z",
+            end_x=0, end_z=1, multilevel=False)
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = make_oracle_tree(
+                directory,
+                "flat-flat-positive-z__forward__forward.csv", rows)
+            report = runtime_log.check_gate_l4(
+                rows, baseline,
+                expected_heading="forward",
+                expected_relative_direction="forward")
+            self.assertEqual(report["relative_direction"], "forward")
+            self.assertEqual(report["frames"], 100)
+
+    def test_gate_l4_accepts_exact_eight_absolute_relative_pairs(self):
+        for basename, (scene, route, heading, relative) in \
+                runtime_log.FLAT_ORACLE_CASES.items():
+            end_x, end_z = (0, 1) if route == "flat-positive-z" else (1, 0)
+            rows = gate_l_rows(
+                heading=heading, count=100, ik=0, scene=scene, route=route,
+                end_x=end_x, end_z=end_z, multilevel=False)
+            with self.subTest(basename=basename), \
+                    tempfile.TemporaryDirectory() as directory:
+                baseline = make_oracle_tree(directory, basename, rows)
+                report = runtime_log.check_gate_l4(
+                    rows, baseline, expected_heading=heading,
+                    expected_relative_direction=relative)
+                self.assertEqual(report["relative_direction"], relative)
+
+    def test_gate_l4_rejects_oracle_invariant_sha_and_pairing_drift(self):
+        rows = gate_l_rows(
+            heading="forward", count=100, ik=0,
+            scene="stairs-shallow", route="flat-positive-z",
+            end_x=0, end_z=1, multilevel=False)
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = make_oracle_tree(
+                directory,
+                "flat-flat-positive-z__forward__forward.csv", rows)
+            changed = [dict(item) for item in rows]
+            changed[25]["simulation_x"] = ".001"
+            with self.assertRaisesRegex(ValueError, "flat oracle invariant"):
+                runtime_log.check_gate_l4(
+                    changed, baseline, expected_heading="forward",
+                    expected_relative_direction="forward")
+
+            changed = [dict(item) for item in rows]
+            changed[25]["runtime_root_surface_height"] = ".01"
+            with self.assertRaisesRegex(ValueError, "flat oracle invariant"):
+                runtime_log.check_gate_l4(
+                    changed, baseline, expected_heading="forward",
+                    expected_relative_direction="forward")
+
+            with self.assertRaisesRegex(ValueError, "relative direction"):
+                runtime_log.check_gate_l4(
+                    rows, baseline, expected_heading="forward",
+                    expected_relative_direction="left")
+
+            with open(os.path.join(directory, "SHA256SUMS"),
+                      "r+", encoding="ascii") as stream:
+                record = stream.read()
+                stream.seek(0)
+                stream.write(record.replace(
+                    "flat-flat-positive-x__positive-x__forward.csv\n",
+                    "missing-paired-flat-oracle.csv\n", 1))
+                stream.truncate()
+            with self.assertRaisesRegex(ValueError, "SHA256|oracle record"):
+                runtime_log.check_gate_l4(
+                    rows, baseline, expected_heading="forward",
+                    expected_relative_direction="forward")
+
+    def test_gate_l4_rejects_ik_surface_split_stop_and_wrong_length(self):
+        baseline_rows = gate_l_rows(
+            heading="forward", count=100, ik=0,
+            scene="stairs-shallow", route="flat-positive-z",
+            end_x=0, end_z=1, multilevel=False)
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = make_oracle_tree(
+                directory,
+                "flat-flat-positive-z__forward__forward.csv", baseline_rows)
+            for name, index, value, diagnostic in (
+                    ("ik_enabled", 10, "1", "IK disabled"),
+                    ("footprint_blocked", 10, "1",
+                     "block/stop|accepted footprint.*blocked"),
+                    ("runtime_left_toe_surface_height", 10, ".04",
+                     "surface split"),
+                    ("left_footprint_multilevel", 10, "1",
+                     "invalid-input footprint.*canonical"),
+                    ("footprint_sweeps", 10, "123",
+                     "invalid-input footprint.*canonical"),
+                    ("footprint_root_height", 10, "9",
+                     "invalid-input footprint.*canonical"),
+                    ("ik_candidate_rejected", 10, "1",
+                     "accepted IK candidate|disabled IK.*canonical"),
+                    ("ik_candidate_clearance_status", 10, "outside-domain",
+                     "disabled IK.*canonical"),
+                    ("ik_minimum_clearance", 10, "-100",
+                     "disabled IK.*canonical")):
+                changed = [dict(item) for item in baseline_rows]
+                changed[index][name] = value
+                with self.subTest(name=name):
+                    with self.assertRaisesRegex(ValueError, diagnostic):
+                        runtime_log.check_gate_l4(
+                            changed, baseline, expected_heading="forward",
+                            expected_relative_direction="forward")
+            with self.assertRaisesRegex(ValueError, "exactly 100"):
+                runtime_log.check_gate_l4(
+                    baseline_rows[:-1], baseline,
+                    expected_heading="forward",
+                    expected_relative_direction="forward")
+
+    def test_forward_baseline_authenticates_invariants_and_quality(self):
+        rows = gate_l_rows(
+            heading="forward", count=800, ik=0,
+            scene="stairs-standard", route="ascent-landing-descent",
+            end_x=0, end_z=4.8, multilevel=True)
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = make_oracle_tree(
+                directory,
+                "forward-stairs-standard__ascent-landing-descent.csv", rows)
+            report = runtime_log.check_gate_l_forward_baseline(rows, baseline)
+            self.assertEqual(report["frames"], 800)
+
+            changed = [dict(item) for item in rows]
+            changed[100]["simulation_z"] = "9"
+            with self.assertRaisesRegex(ValueError, "forward oracle invariant"):
+                runtime_log.check_gate_l_forward_baseline(changed, baseline)
+
+            changed = [dict(item) for item in rows]
+            changed[100].update({
+                "footprint_status": "ok",
+                "footprint_sweeps": "123",
+                "footprint_root_height": "9",
+            })
+            with self.assertRaisesRegex(
+                    ValueError, "forward.*footprint|invalid-input footprint"):
+                runtime_log.check_gate_l_forward_baseline(changed, baseline)
+
+            changed = [dict(item) for item in rows]
+            changed[200]["rendered_min_clearance"] = "-.001"
+            with self.assertRaisesRegex(ValueError, "clearance regressed"):
+                runtime_log.check_gate_l_forward_baseline(changed, baseline)
+
+            changed = [dict(item) for item in rows]
+            changed[300]["rendered_hips_y"] = str(
+                float(changed[299]["rendered_hips_y"]) + .049)
+            with self.assertRaisesRegex(ValueError, "Hips step regressed"):
+                runtime_log.check_gate_l_forward_baseline(changed, baseline)
+
+    def test_gate_l_consumes_forward_baseline_through_paired_ik_off(self):
+        treatment = gate_l_rows(
+            heading="forward", count=800, ik=1,
+            scene="stairs-standard", route="ascent-landing-descent",
+            end_x=0, end_z=4.8, multilevel=True)
+        control = gate_l_rows(
+            heading="forward", count=800, ik=0,
+            scene="stairs-standard", route="ascent-landing-descent",
+            end_x=0, end_z=4.8, multilevel=True)
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = make_oracle_tree(
+                directory,
+                "forward-stairs-standard__ascent-landing-descent.csv",
+                control)
+            report = runtime_log.check_gate_l(
+                treatment, expected_end_x=0, expected_end_z=4.8,
+                expected_heading="forward", require_multilevel=True,
+                compare_ik_off=control,
+                compare_forward_baseline=baseline)
+        self.assertEqual(report["forward_baseline_frames"], 800)
+
+    def test_gate_l4_cli_dispatches_without_endpoint_options(self):
+        rows = gate_l_rows(
+            heading="forward", count=100, ik=0,
+            scene="stairs-shallow", route="flat-positive-z",
+            end_x=0, end_z=1, multilevel=False)
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = make_oracle_tree(
+                directory,
+                "flat-flat-positive-z__forward__forward.csv", rows)
+            log = os.path.join(directory, "current.csv")
+            write_columns(log, rows, RUNTIME_COLUMNS)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(runtime_log.main([
+                    log, "--gate-l", "--compare-flat-baseline", baseline,
+                    "--expected-heading", "forward",
+                    "--expected-relative-direction", "forward",
+                ]), 0)
+        self.assertTrue(output.getvalue().startswith("VALID gate-l4 "))
+
+    def test_gate_l2_cli_dispatches_pair_and_exit_stress(self):
+        positive, negative = gate_l2_pair_rows()
+        treatment = exit_safe_stop_rows(ik=1)
+        control = exit_safe_stop_rows(ik=0)
+        with tempfile.TemporaryDirectory() as directory:
+            paths = {}
+            for name, values in (
+                    ("positive", positive), ("negative", negative),
+                    ("exit-on", treatment), ("exit-off", control)):
+                paths[name] = os.path.join(directory, name + ".csv")
+                write_columns(paths[name], values, RUNTIME_COLUMNS)
+            pair_output = io.StringIO()
+            with contextlib.redirect_stdout(pair_output):
+                self.assertEqual(runtime_log.main([
+                    paths["positive"], "--gate-l2-pair", paths["negative"],
+                ]), 0)
+            exit_output = io.StringIO()
+            with contextlib.redirect_stdout(exit_output):
+                self.assertEqual(runtime_log.main([
+                    paths["exit-on"], "--gate-l2-exit-stress",
+                    "--compare-ik-off", paths["exit-off"],
+                ]), 0)
+        self.assertTrue(
+            pair_output.getvalue().startswith("VALID gate-l2-pair "))
+        self.assertTrue(
+            exit_output.getvalue().startswith("VALID gate-l2-exit-stress "))
+
+    def test_full_suffix_rejects_malformed_bit_words_statuses_and_landings(self):
+        mutations = (
+            ("desired_heading_bits_hex", "0" * 31, "float words"),
+            ("predicted_heading_bits_hex",
+             "7f800000" + "00000000" * 15, "non-finite"),
+            ("left_swing_actual_sphere_center_bits_hex",
+             "00000000" * 11, "float words"),
+            ("accepted_state_digest_hex", "ABCDEF0123456789", "uint64"),
+            ("footprint_status", "unknown", "unknown value"),
+            ("left_landing_patch_ready", "1", "absent.*landing"),
+            ("left_predicted_landing_center_x", ".1", "absent.*landing"),
+            ("left_swing_selected_lift_bits", "1", "no-candidate.*canonical"),
+            ("right_swing_selected_work_point_queries", "1",
+             "no-candidate.*canonical"),
+            ("left_footprint_min_height", ".2", "envelope"),
+            ("max_ik_correction", "-.1", "nonnegative"),
+        )
+        for name, value, diagnostic in mutations:
+            rows = [runtime_row(0)]
+            rows[0][name] = value
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    check_rows(rows)
+
+    def test_full_suffix_binds_accepted_status_reasons_and_landing_readiness(self):
+        simple_mutations = (
+            ("ik_stop_reason", "no-swing-candidate", "accepted.*stop reason"),
+            ("ik_safe_stop_requested", "1", "accepted.*safe-stop"),
+            ("ik_candidate_rejected", "1", "accepted IK candidate"),
+            ("ik_candidate_clearance_status", "outside-domain",
+             "candidate clearance status"),
+            ("footprint_blocked_reason", "blocked-cell",
+             "footprint.*blocked reason"),
+            ("footprint_blocked", "1", "footprint.*blocked"),
+        )
+        for name, value, diagnostic in simple_mutations:
+            rows = [runtime_row(0, ik_enabled=1, ik_applied=1)]
+            rows[0][name] = value
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    check_rows(rows, allow_ik=True)
+
+        unready = [runtime_row(
+            0, ik_enabled=1, ik_applied=1, left_recorded_contact=0,
+            left_landing_expected=1, left_landing_patch_ready=0,
+            left_landing_sample=1, left_landing_surface_status="valid",
+            left_landing_walkability_class=1,
+            left_predicted_landing_normal_y=1,
+            left_landing_patch_maximum_residual=.006)]
+        with self.assertRaisesRegex(ValueError, "accepted.*landing.*ready"):
+            check_rows(unready, allow_ik=True)
+
+    def test_landing_readiness_uses_exact_float32_residual_limit(self):
+        limit = struct.unpack(">f", bytes.fromhex("3ba3d70a"))[0]
+        just_above = math.nextafter(limit, math.inf)
+        self.assertLess(just_above, .005)
+
+        accepted = [runtime_row(
+            0, left_landing_expected=1, left_landing_patch_ready=1,
+            left_landing_sample=1, left_landing_surface_status="valid",
+            left_landing_walkability_class=1,
+            left_predicted_landing_normal_y=1,
+            left_landing_patch_maximum_residual=just_above)]
+        with self.assertRaisesRegex(ValueError, "ready.*landing.*inconsistent"):
+            check_rows(accepted)
+
+        rejected = rejection_rows()
+        rejected[1].update({
+            "frame_rejection_stage": "ik-candidate",
+            "rejected_stop_reason": "target-unreachable",
+            "rejected_left_landing_patch_ready": "1",
+            "rejected_left_landing_patch_maximum_residual": str(just_above),
+        })
+        with self.assertRaisesRegex(
+                ValueError, "rejected left ready patch is inconsistent"):
+            check_rows(rejected, allow_ik=True)
+
+    def test_expected_landing_requires_valid_future_swing_sample(self):
+        valid = [runtime_row(
+            0, left_recorded_contact=0, left_landing_expected=1,
+            left_landing_patch_ready=1, left_landing_sample=1,
+            left_landing_surface_status="valid",
+            left_landing_walkability_class=1,
+            left_predicted_landing_normal_y=1,
+            left_landing_patch_maximum_residual=0)]
+        self.assertEqual(check_rows(valid)["frames"], 1)
+
+        mutations = (
+            ({"left_landing_sample": "0"}, "expected left landing.*malformed"),
+            ({"left_landing_patch_ready": "0",
+              "left_landing_surface_status": "outside"},
+             "expected left landing.*malformed"),
+            ({"left_landing_patch_ready": "0",
+              "left_landing_walkability_class": "0"},
+             "expected left landing.*malformed"),
+            ({"left_recorded_contact": "1"}, "expected left landing.*swing"),
+        )
+        for changes, diagnostic in mutations:
+            changed = [dict(valid[0])]
+            changed[0].update(changes)
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    check_rows(changed)
+
+        rejected = rejection_rows()
+        rejected[1].update({
+            "frame_rejection_stage": "ik-candidate",
+            "rejected_stop_reason": "target-unreachable",
+            "rejected_left_landing_patch_ready": "1",
+            "rejected_left_landing_patch_maximum_residual": "0",
+        })
+        self.assertEqual(check_rows(rejected, allow_ik=True)["frames"], 2)
+        rejected[1]["rejected_left_landing_sample"] = "0"
+        with self.assertRaisesRegex(
+                ValueError, "rejected left landing.*malformed"):
+            check_rows(rejected, allow_ik=True)
+
+    def test_finite_rejection_preserves_digest_and_locks_stage_availability(self):
+        rows = rejection_rows()
+        self.assertEqual(check_rows(rows, allow_ik=True)["frames"], 2)
+
+        changed = [dict(item) for item in rows]
+        changed[1]["accepted_state_digest_hex"] = "2" * 16
+        with self.assertRaisesRegex(ValueError, "accepted-state digest"):
+            check_rows(changed, allow_ik=True)
+
+        for name, value in (
+                ("rejected_attempted_footprint_available", "0"),
+                ("rejected_attempted_ik_available", "0"),
+                ("rejected_attempted_pose_available", "1"),
+                ("rejected_stop_reason", "no-swing-candidate"),
+                ("rejected_pose_status", "ok")):
+            changed = [dict(item) for item in rows]
+            changed[1][name] = value
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, "availability|rejection"):
+                    check_rows(changed, allow_ik=True)
+
+    def test_landing_patch_rejection_requires_attempted_unready_patch_evidence(self):
+        rows = rejection_rows()
+        rows[1].update({
+            "rejected_left_landing_expected": "0",
+            "rejected_left_landing_sample": str(2 ** 32 - 1),
+            "rejected_left_landing_surface_status": "invalid",
+            "rejected_left_landing_walkability_class": "0",
+            "rejected_left_landing_patch_maximum_residual": "0",
+        })
+        with self.assertRaisesRegex(ValueError, "unready patch evidence"):
+            check_rows(rows, allow_ik=True)
+
+    def test_pose_rejection_ignores_unavailable_default_but_authenticates_available(self):
+        rows = rejection_rows("pose-certificate")
+        rows[1]["rejected_pose_minimum_clearance"] = "0"
+        self.assertEqual(check_rows(rows, allow_ik=True)["frames"], 2)
+
+        changed = [dict(item) for item in rows]
+        changed[1]["rejected_attempted_pose_available"] = "1"
+        with self.assertRaisesRegex(ValueError, "available rejected pose"):
+            check_rows(changed, allow_ik=True)
+
+        available = rejection_rows("pose-certificate")
+        available[1].update({
+            "rejected_attempted_pose_available": "1",
+            "rejected_pose_status": "ok",
+            "rejected_pose_minimum_clearance": "-.006",
+        })
+        self.assertEqual(check_rows(available, allow_ik=True)["frames"], 2)
+
+        available[1]["rejected_pose_minimum_clearance"] = "0"
+        with self.assertRaisesRegex(ValueError, "does not violate"):
+            check_rows(available, allow_ik=True)
+
+    def test_accepted_rows_require_canonical_rejection_defaults(self):
+        for name, value in (
+                ("frame_rejection_stage", "footprint"),
+                ("rejected_attempted_footprint_available", "1"),
+                ("rejected_stop_reason", "target-unreachable"),
+                ("rejected_pose_status", "outside-domain")):
+            rows = [runtime_row(0)]
+            rows[0][name] = value
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, "accepted row"):
+                    check_rows(rows)
+
+        for name, value in (
+                ("rejected_left_target_x", "1"),
+                ("rejected_right_reachable", "1"),
+                ("rejected_left_landing_surface_normal_y", "1"),
+                ("rejected_right_selected_lower_margin", ".1")):
+            rows = [runtime_row(0)]
+            rows[0][name] = value
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, "canonical"):
+                    check_rows(rows)
+
+    def test_rejection_without_attempted_ik_requires_canonical_foot_fields(self):
+        rows = rejection_rows("pose-certificate")
+        rows[1]["rejected_left_target_x"] = "1"
+        with self.assertRaisesRegex(ValueError, "canonical"):
+            check_rows(rows, allow_ik=True)
 
     def test_surface_height_names_are_frozen_before_runtime_schema(self):
         for name in (
@@ -430,6 +1783,13 @@ class RuntimeLogTests(unittest.TestCase):
         rows = gate_d_rows()
         rows[50]["walkability_class"] = "0"
         with self.assertRaisesRegex(ValueError, "entered blocked"):
+            runtime_log.check_gate_d(rows)
+
+    def test_gate_d_rejects_physical_penetration_even_with_traversal_reserve(self):
+        rows = gate_d_rows()
+        rows[50]["blocked_distance"] = ".04"
+        rows[50]["rendered_min_clearance"] = "-.40"
+        with self.assertRaisesRegex(ValueError, "physical clearance"):
             runtime_log.check_gate_d(rows)
 
     def test_gate_d_requires_twenty_pre_block_baseline_rows(self):
@@ -932,7 +2292,7 @@ class RuntimeLogTests(unittest.TestCase):
         cases.append((rows, "never stopped"))
         rows = gate_d_rows()
         rows[50]["blocked_distance"] = ".019"
-        cases.append((rows, "clearance"))
+        cases.append((rows, "distance"))
         rows = gate_d_rows()
         for item in rows[30:76]:
             item["applied_speed"] = ".1"

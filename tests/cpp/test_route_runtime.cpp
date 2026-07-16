@@ -36,34 +36,173 @@ static std::string read_source(const char* path)
         std::istreambuf_iterator<char>());
 }
 
-static void check_snapshot_publication_contract(const char* path)
+static size_t source_occurrence_count(
+    const std::string& source, const std::string& needle)
+{
+    size_t count = 0;
+    size_t position = 0;
+    while ((position = source.find(needle, position)) != std::string::npos) {
+        ++count;
+        position += needle.size();
+    }
+    return count;
+}
+
+static std::string compact_source(const std::string& source)
+{
+    std::string output;
+    output.reserve(source.size());
+    for (const char value : source) {
+        if (value != ' ' && value != '\t' &&
+            value != '\r' && value != '\n') {
+            output.push_back(value);
+        }
+    }
+    return output;
+}
+
+static size_t task6_main_signature_position(const std::string& compact)
+{
+    const size_t void_signature = compact.find("intmain(void)");
+    if (void_signature != std::string::npos) {
+        return void_signature;
+    }
+    return compact.find("intmain(intargc,char**argv)");
+}
+
+static void test_task6_main_signature_forms()
+{
+    check(task6_main_signature_position(
+              compact_source("int main(void) {}")) != std::string::npos,
+          "publication audit recognizes conventional main(void)");
+    check(task6_main_signature_position(
+              compact_source("int main(int argc, char** argv) {}")) !=
+              std::string::npos,
+          "publication audit recognizes conventional main(argc, argv)");
+}
+
+static void check_task6_publication_contract(const char* path)
 {
     const std::string source = read_source(path);
-    const size_t build = source.find("if (!g1_runtime_diagnostics_build(");
-    const size_t serialize = source.find(
-        "if (!motion_match_query_bits_hex(", build);
-    const size_t suffix = source.find("log_row.source_name =", serialize);
-    const size_t write = source.find(
-        "if (!deterministic_log.write(", suffix);
-    const size_t publish = source.find(
-        "runtime_snapshot = snapshot_candidate;", build);
-    const size_t ready = source.find(
-        "runtime_snapshot_ready = true;", publish);
-    const size_t clear = source.find(
-        "scene_switch_failed = false;", ready);
-    check(build != std::string::npos && serialize != std::string::npos &&
-              suffix != std::string::npos && write != std::string::npos &&
-              publish != std::string::npos && ready != std::string::npos &&
-              clear != std::string::npos,
-          "snapshot publication source markers exist");
-    check(build < serialize && serialize < suffix && suffix < write &&
-              write < publish && publish < ready && ready < clear,
-          "snapshot publishes only after successful serialization and write");
-    const std::string suffix_population = source.substr(suffix, write - suffix);
-    check(suffix_population.find("runtime_snapshot.") == std::string::npos,
-          "runtime suffix population does not read persistent snapshot");
-    check(suffix_population.find("snapshot_candidate.") != std::string::npos,
-          "runtime suffix population reads local snapshot candidate");
+    const std::string compact = compact_source(source);
+    const size_t main_signature = task6_main_signature_position(compact);
+    check(main_signature != std::string::npos,
+          "controller has one concrete production main");
+    const size_t main_open = compact.find("{", main_signature);
+    check(main_open != std::string::npos,
+          "production main body opens");
+    int depth = 0;
+    size_t main_close = std::string::npos;
+    for (size_t cursor = main_open; cursor < compact.size(); ++cursor) {
+        if (compact[cursor] == '{') {
+            ++depth;
+        } else if (compact[cursor] == '}' && --depth == 0) {
+            main_close = cursor;
+            break;
+        }
+    }
+    check(main_close != std::string::npos,
+          "production main body closes");
+    const std::string main_body = compact.substr(
+        main_open, main_close - main_open + 1);
+
+    const size_t coordinator = main_body.find(
+        "g1_frame_transaction_run(frame_runtime,"
+        "::g1_controller_frame_stage_run,frame_external,");
+    check(coordinator != std::string::npos &&
+              source_occurrence_count(
+                  main_body, "g1_frame_transaction_run(") == 1,
+          "Task6 outer loop must call the typed frame coordinator exactly once");
+    check(main_body.find("autoupdate_func=[&]()") == std::string::npos,
+          "Task6 outer loop contains no capturing update lambda");
+    check(source_occurrence_count(
+              main_body, "G1FrameRuntimeframe_runtime;") == 1 &&
+          source_occurrence_count(
+              main_body, "G1FrameExternalInputsframe_external;") == 1,
+          "main owns one frame runtime and one immutable external snapshot");
+
+    const size_t status = main_body.rfind(
+        "constG1FrameTransactionStatusframe_status=", coordinator);
+    const size_t global_error = main_body.find(
+        "G1FrameTransactionGlobalError", coordinator);
+    const size_t log_build = main_body.find(
+        "g1_build_accepted_log_row(", coordinator);
+    const size_t log_write = main_body.find(
+        "deterministic_log.write(", log_build);
+    const size_t camera = main_body.find(
+        "update_g1_camera_from_accepted(", log_write);
+    const size_t render = main_body.find("draw_g1_skeleton(", camera);
+    check(status != std::string::npos && status <= coordinator &&
+              global_error != std::string::npos &&
+              log_build != std::string::npos &&
+              log_write != std::string::npos &&
+              camera != std::string::npos && render != std::string::npos &&
+              coordinator < global_error && global_error < log_build &&
+              log_build < log_write && log_write < camera && camera < render,
+          "coordinator publication and status handling precede accepted-owner log, camera, and render");
+
+    const std::string log_call = main_body.substr(
+        log_build, log_write - log_build);
+    check(log_call.find("frame_runtime.accepted_state") !=
+              std::string::npos &&
+          log_call.find("frame_runtime.accepted_diagnostic") !=
+              std::string::npos &&
+          log_call.find("frame_runtime.publication") !=
+              std::string::npos &&
+          log_call.find("frame_runtime.working_state") ==
+              std::string::npos,
+          "log rows are built only from accepted state/diagnostic and publication");
+
+    const std::string camera_to_render = main_body.substr(
+        camera, render - camera);
+    check(camera_to_render.find(
+              "frame_runtime.accepted_state.camera_azimuth") !=
+              std::string::npos &&
+          camera_to_render.find(
+              "frame_runtime.accepted_state.camera_altitude") !=
+              std::string::npos &&
+          camera_to_render.find(
+              "frame_runtime.accepted_state.camera_distance") !=
+              std::string::npos &&
+          camera_to_render.find(
+              "frame_runtime.accepted_state.ik_global_bone_positions(0)") !=
+              std::string::npos,
+          "camera derives only from accepted camera scalars and final-FK root");
+    const std::string render_tail = main_body.substr(render);
+    check(render_tail.find(
+              "frame_runtime.accepted_state.ik_global_bone_positions") !=
+              std::string::npos &&
+          render_tail.find(
+              "frame_runtime.accepted_state.ik_global_bone_rotations") !=
+              std::string::npos &&
+          render_tail.find("frame_runtime.working_state") ==
+              std::string::npos,
+          "skeleton renders only the accepted final IK pose");
+
+    check(main_body.find("working_state") == std::string::npos &&
+          source_occurrence_count(main_body, "accepted_state") ==
+              source_occurrence_count(
+                  main_body, "frame_runtime.accepted_state") &&
+          source_occurrence_count(main_body, "accepted_diagnostic") ==
+              source_occurrence_count(
+                  main_body, "frame_runtime.accepted_diagnostic") &&
+          source_occurrence_count(main_body, "publication") ==
+              source_occurrence_count(
+                  main_body, "frame_runtime.publication"),
+          "outer main has no accepted/working/publication aliases or alternate owners");
+
+    const size_t move_snapshot = main_body.rfind(
+        "frame_external.input.move_stick=", coordinator);
+    const size_t look_snapshot = main_body.rfind(
+        "frame_external.input.look_stick=", coordinator);
+    const size_t ik_lowering = main_body.find(
+        "frame_external.tuning.ik_enabled=process_config.ik_enabled;");
+    check(move_snapshot != std::string::npos &&
+              look_snapshot != std::string::npos &&
+              ik_lowering != std::string::npos &&
+              move_snapshot < coordinator && look_snapshot < coordinator &&
+              ik_lowering < coordinator,
+          "device input and startup-only IK are lowered before the coordinator");
 }
 
 static void check_route_sample_cursor_contract(const char* path)
@@ -966,7 +1105,7 @@ static void test_executable_frame_prediction_failures_are_transactional()
 int main(int argc, char** argv)
 {
     if (argc == 3 && std::strcmp(argv[1], "--controller") == 0) {
-        check_snapshot_publication_contract(argv[2]);
+        check_task6_publication_contract(argv[2]);
         return 0;
     }
     if (argc == 3 && std::strcmp(argv[1], "--route-header") == 0) {
@@ -976,6 +1115,7 @@ int main(int argc, char** argv)
     check(argc == 1,
           "usage: test_route_runtime [--controller path|--route-header path]");
 
+    test_task6_main_signature_forms();
     test_four_horizon_route_predictions();
     test_tangent_level_boundary_exact_schedule();
     test_hold_completion_and_speed_scales();
@@ -1271,15 +1411,20 @@ int main(int argc, char** argv)
         "applied_speed,route_waypoint,route_complete,route_target_height,"
         "scene_generation,scene_frame,scene_reset_count,scene_switch_failed,"
         "motion_pack_load_count,model_load_count,model_unload_count,"
-        "live_model_count\n";
+        "live_model_count,ik_applied,ik_safe_stop_requested,ik_stop_reason,";
     check(std::strstr(header, expected_header_suffix) != NULL,
           "exact append-only runtime header suffix");
     check(std::strstr(
               data,
               ",s,t,3,1,2,3,4,5,6,7,8,9,10,11,12,both,13,1,0,14,15,"
               "16,17,2,1,blocked-cell,18,19,20,0.5,0.25,4,1,21,5,6,7,1,"
-              "1,8,7,1\n") != NULL,
+              "1,8,7,1,0,0,none,") != NULL,
           "runtime row suffix matches header order");
+    check(std::strstr(
+              header,
+              "rejected_right_selected_witness_upper,"
+              "accepted_state_digest_hex\n") != NULL,
+          "directional suffix closes with accepted-state digest");
     check(std::remove(log_path) == 0, "remove exact runtime log");
     return 0;
 }

@@ -48,6 +48,8 @@ enum G1Bone
 inline constexpr char G1_SkeletonSignature[] =
     "6138d9364b6f4178c25e2c1ac7039f3ce5fedf6b11a0b8375dea712633abd2e7";
 
+inline constexpr uint32_t G1_Exact25HzBits = UINT32_C(0x3d23d70a);
+
 struct G1LegConfig
 {
     const char* name;
@@ -90,7 +92,11 @@ static inline G1LegConfig g1_leg_config(
     config.knee_hinge_axis_local = vec3(0.0f, 0.0f, -1.0f);
     config.foot_forward_local = vec3(1.0f, 0.0f, 0.0f);
     config.sole_normal_local = vec3(0.0f, 1.0f, 0.0f);
-    config.foot_sphere_radius_m = 0.02f;
+    // GRAIL rev physical collision geometry is the authority for the 5 mm
+    // proxy radius. Its leg/contact body positions match the retained
+    // kinematic model, so no joint or database rebuild is implied here.
+    // config.contact is the ankle_roll physical owner of every local probe.
+    config.foot_sphere_radius_m = 0.005f;
     config.foot_sphere_centers_local[0] =
         vec3(-0.05f, -0.03f, -0.025f);
     config.foot_sphere_centers_local[1] =
@@ -139,5 +145,5 @@ static inline bool g1_dt_is_exact_25_hz(float dt)
     uint32_t bits = 0;
     std::memcpy(&bits, &dt, sizeof(bits));
     // Exact binary32 encoding of 1.0f / 25.0f (0.04f).
-    return bits == UINT32_C(0x3d23d70a);
+    return bits == G1_Exact25HzBits;
 }

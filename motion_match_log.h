@@ -46,6 +46,129 @@ struct motion_match_pose_diagnostic
     float minimum_clearance = 0.0f;
 };
 
+struct motion_match_clearance_work_diagnostic
+{
+    uint32_t point_queries = 0;
+    uint32_t cells_visited = 0;
+    uint32_t primitive_triangle_pairs = 0;
+    uint32_t face_patches = 0;
+    uint32_t candidate_tests = 0;
+    uint32_t subdivision_nodes = 0;
+};
+
+struct motion_match_swing_diagnostic
+{
+    uint32_t candidates_evaluated = 0;
+    uint32_t selected_index = UINT32_MAX;
+    uint32_t selected_lift_bits = 0;
+    uint32_t materialized_command_y_bits = 0;
+    char actual_sphere_center_bits_hex[12 * 8 + 1] =
+        "000000000000000000000000000000000000000000000000"
+        "000000000000000000000000000000000000000000000000";
+    const char* selected_clearance_status = "invalid-input";
+    bool selected_controller_constraints_passed = false;
+    bool selected_clearance_certified = false;
+    double lower_margin = 0.0;
+    double witness_upper_margin = 0.0;
+    motion_match_clearance_work_diagnostic selected_work;
+    motion_match_clearance_work_diagnostic total_work;
+};
+
+struct motion_match_ik_diagnostic
+{
+    bool applied = false;
+    bool safe_stop_requested = false;
+    const char* stop_reason = "none";
+    float max_correction = 0.0f;
+    float actual_simulation_speed = 0.0f;
+    bool candidate_rejected = false;
+    const char* candidate_clearance_status = "invalid-input";
+    double candidate_toe_clearance[2] = {};
+    double candidate_foot_clearance[2] = {};
+    double candidate_minimum_clearance = 0.0;
+    bool recorded_contact[2] = {};
+    bool locked[2] = {};
+    float observed_lock_drift[2] = {};
+    float lock_drift[2] = {};
+    float sole_normal_alignment[2] = {};
+    float contact_residual[2] = {};
+    float target_height[2] = {};
+    vec3 target_normal[2] = {};
+    motion_match_swing_diagnostic swing[2];
+    bool reachable[2] = {};
+    double knee_clearance[2] = {};
+    double ankle_clearance[2] = {};
+    double toe_clearance[2] = {};
+    double foot_clearance[2] = {};
+    double shin_clearance[2] = {};
+    double thigh_clearance[2] = {};
+    double hips_clearance = 0.0;
+    double minimum_clearance = 0.0;
+};
+
+struct motion_match_landing_diagnostic
+{
+    bool expected = false;
+    bool patch_ready = false;
+    uint32_t sample = UINT32_MAX;
+    const char* surface_status = "invalid";
+    int walkability_class = 0;
+    vec3 center;
+    float height = 0.0f;
+    vec3 normal;
+    double patch_maximum_residual = 0.0;
+};
+
+struct motion_match_rejected_foot_diagnostic
+{
+    motion_match_landing_diagnostic landing;
+    vec3 target;
+    vec3 target_normal;
+    bool reachable = false;
+    bool correction_limited = false;
+    const char* selected_clearance_status = "invalid-input";
+    double selected_lower_margin = 0.0;
+    double selected_witness_upper = 0.0;
+};
+
+struct motion_match_directional_diagnostic
+{
+    vec3 requested_velocity;
+    vec3 applied_velocity;
+    char desired_heading_bits_hex[4 * 8 + 1] =
+        "00000000000000000000000000000000";
+    char predicted_heading_bits_hex[4 * 4 * 8 + 1] =
+        "00000000000000000000000000000000"
+        "00000000000000000000000000000000"
+        "00000000000000000000000000000000"
+        "00000000000000000000000000000000";
+    double simulation_heading_error_deg = 0.0;
+    double rendered_heading_error_deg = 0.0;
+    const char* footprint_status = "invalid-input";
+    bool footprint_blocked = false;
+    const char* footprint_blocked_reason = "clear";
+    float footprint_root_height = 0.0f;
+    float footprint_min_height[2] = {};
+    float footprint_max_height[2] = {};
+    double maximum_root_split[2] = {};
+    bool footprint_multilevel[2] = {};
+    motion_match_landing_diagnostic landing[2];
+    uint32_t footprint_sweeps = 0;
+    uint32_t footprint_surface_queries = 0;
+    uint32_t footprint_node_visits = 0;
+    bool frame_rejected = false;
+    const char* frame_rejection_stage = "none";
+    bool ik_safe_stop_latched = false;
+    bool rejected_attempted_footprint_available = false;
+    bool rejected_attempted_ik_available = false;
+    const char* rejected_stop_reason = "none";
+    bool rejected_attempted_pose_available = false;
+    const char* rejected_pose_status = "invalid-input";
+    double rejected_pose_minimum_clearance = 0.0;
+    motion_match_rejected_foot_diagnostic rejected[2];
+    char accepted_state_digest_hex[16 + 1] = "0000000000000000";
+};
+
 struct motion_match_log_row
 {
     int frame = 0;
@@ -54,6 +177,7 @@ struct motion_match_log_row
     const char* mode = "live";
     const char* route = "manual";
     const char* query_bits_hex = "";
+    char query_bits_storage[31 * 8 + 1] = {};
     int query_database_frame = 0;
     int query_range = 0;
     int selected_database_frame = 0;
@@ -126,6 +250,8 @@ struct motion_match_log_row
     int model_load_count = 0;
     int model_unload_count = 0;
     int live_model_count = 0;
+    motion_match_ik_diagnostic ik;
+    motion_match_directional_diagnostic directional;
 };
 
 struct motion_match_log
@@ -154,7 +280,7 @@ struct motion_match_log
         if (file == NULL) {
             return io_error(error, error_capacity, "open", errno);
         }
-        const bool header_ok = fprintf(file,
+        bool header_ok = fprintf(file,
             "frame,fixed_dt,scene_id,mode,route,query_bits_hex,"
             "query_database_frame,query_range,selected_database_frame,"
             "database_frame,range,source_range,searched,transitioned,"
@@ -188,7 +314,145 @@ struct motion_match_log
             "commanded_speed,applied_speed,route_waypoint,route_complete,"
             "route_target_height,scene_generation,scene_frame,"
             "scene_reset_count,scene_switch_failed,motion_pack_load_count,"
-            "model_load_count,model_unload_count,live_model_count\n") >= 0;
+            "model_load_count,model_unload_count,live_model_count") >= 0;
+        if (header_ok) header_ok = fputs(
+            ",ik_applied,ik_safe_stop_requested,ik_stop_reason,"
+            "max_ik_correction,actual_simulation_speed,ik_candidate_rejected,"
+            "ik_candidate_clearance_status,left_candidate_toe_clearance,"
+            "left_candidate_foot_clearance,right_candidate_toe_clearance,"
+            "right_candidate_foot_clearance,ik_candidate_minimum_clearance,"
+            "left_recorded_contact,right_recorded_contact,left_locked,"
+            "right_locked,left_observed_lock_drift,right_observed_lock_drift,"
+            "left_lock_drift,right_lock_drift,left_sole_normal_alignment,"
+            "right_sole_normal_alignment,left_contact_residual,"
+            "right_contact_residual,left_target_height,right_target_height,"
+            "left_target_normal_x,left_target_normal_y,left_target_normal_z,"
+            "right_target_normal_x,right_target_normal_y,"
+            "right_target_normal_z,"
+            "left_swing_candidates_evaluated,left_swing_selected_index,"
+            "left_swing_selected_lift_bits,"
+            "left_swing_materialized_command_y_bits,"
+            "left_swing_actual_sphere_center_bits_hex,"
+            "left_swing_selected_clearance_status,"
+            "left_swing_selected_controller_constraints_passed,"
+            "left_swing_selected_clearance_certified,"
+            "left_swing_lower_margin,left_swing_witness_upper_margin,"
+            "left_swing_selected_work_point_queries,"
+            "left_swing_selected_work_cells_visited,"
+            "left_swing_selected_work_primitive_triangle_pairs,"
+            "left_swing_selected_work_face_patches,"
+            "left_swing_selected_work_candidate_tests,"
+            "left_swing_selected_work_subdivision_nodes,"
+            "left_swing_total_work_point_queries,"
+            "left_swing_total_work_cells_visited,"
+            "left_swing_total_work_primitive_triangle_pairs,"
+            "left_swing_total_work_face_patches,"
+            "left_swing_total_work_candidate_tests,"
+            "left_swing_total_work_subdivision_nodes,"
+            "right_swing_candidates_evaluated,right_swing_selected_index,"
+            "right_swing_selected_lift_bits,"
+            "right_swing_materialized_command_y_bits,"
+            "right_swing_actual_sphere_center_bits_hex,"
+            "right_swing_selected_clearance_status,"
+            "right_swing_selected_controller_constraints_passed,"
+            "right_swing_selected_clearance_certified,"
+            "right_swing_lower_margin,right_swing_witness_upper_margin,"
+            "right_swing_selected_work_point_queries,"
+            "right_swing_selected_work_cells_visited,"
+            "right_swing_selected_work_primitive_triangle_pairs,"
+            "right_swing_selected_work_face_patches,"
+            "right_swing_selected_work_candidate_tests,"
+            "right_swing_selected_work_subdivision_nodes,"
+            "right_swing_total_work_point_queries,"
+            "right_swing_total_work_cells_visited,"
+            "right_swing_total_work_primitive_triangle_pairs,"
+            "right_swing_total_work_face_patches,"
+            "right_swing_total_work_candidate_tests,"
+            "right_swing_total_work_subdivision_nodes,"
+            "left_reachable,right_reachable,left_knee_clearance,"
+            "left_ankle_clearance,left_toe_clearance,left_foot_clearance,"
+            "left_shin_clearance,left_thigh_clearance,right_knee_clearance,"
+            "right_ankle_clearance,right_toe_clearance,right_foot_clearance,"
+            "right_shin_clearance,right_thigh_clearance,ik_hips_clearance,"
+            "ik_minimum_clearance", file) >= 0;
+        if (header_ok) header_ok = fputs(
+            ",requested_velocity_x,requested_velocity_y,"
+            "requested_velocity_z,applied_velocity_x,applied_velocity_y,"
+            "applied_velocity_z,desired_heading_bits_hex,"
+            "predicted_heading_bits_hex,simulation_heading_error_deg,"
+            "rendered_heading_error_deg,footprint_status,footprint_blocked,"
+            "footprint_blocked_reason,footprint_root_height,"
+            "left_footprint_min_height,left_footprint_max_height,"
+            "right_footprint_min_height,right_footprint_max_height,"
+            "left_maximum_root_split,right_maximum_root_split,"
+            "left_footprint_multilevel,right_footprint_multilevel,"
+            "left_landing_expected,left_landing_patch_ready,"
+            "left_landing_sample,left_landing_surface_status,"
+            "left_landing_walkability_class,"
+            "left_predicted_landing_center_x,"
+            "left_predicted_landing_center_y,"
+            "left_predicted_landing_center_z,left_predicted_landing_height,"
+            "left_predicted_landing_normal_x,"
+            "left_predicted_landing_normal_y,"
+            "left_predicted_landing_normal_z,"
+            "left_landing_patch_maximum_residual,"
+            "right_landing_expected,right_landing_patch_ready,"
+            "right_landing_sample,right_landing_surface_status,"
+            "right_landing_walkability_class,"
+            "right_predicted_landing_center_x,"
+            "right_predicted_landing_center_y,"
+            "right_predicted_landing_center_z,"
+            "right_predicted_landing_height,"
+            "right_predicted_landing_normal_x,"
+            "right_predicted_landing_normal_y,"
+            "right_predicted_landing_normal_z,"
+            "right_landing_patch_maximum_residual,"
+            "footprint_sweeps,footprint_surface_queries,"
+            "footprint_node_visits,frame_rejected,frame_rejection_stage,"
+            "ik_safe_stop_latched,rejected_attempted_footprint_available,"
+            "rejected_attempted_ik_available,rejected_stop_reason,"
+            "rejected_attempted_pose_available,rejected_pose_status,"
+            "rejected_pose_minimum_clearance,"
+            "rejected_left_landing_expected,"
+            "rejected_left_landing_patch_ready,rejected_left_landing_sample,"
+            "rejected_left_landing_center_x,"
+            "rejected_left_landing_center_y,"
+            "rejected_left_landing_center_z,"
+            "rejected_left_landing_surface_status,"
+            "rejected_left_landing_surface_height,"
+            "rejected_left_landing_surface_normal_x,"
+            "rejected_left_landing_surface_normal_y,"
+            "rejected_left_landing_surface_normal_z,"
+            "rejected_left_landing_walkability_class,"
+            "rejected_left_landing_patch_maximum_residual,"
+            "rejected_left_target_x,rejected_left_target_y,"
+            "rejected_left_target_z,rejected_left_target_normal_x,"
+            "rejected_left_target_normal_y,rejected_left_target_normal_z,"
+            "rejected_left_reachable,rejected_left_correction_limited,"
+            "rejected_left_selected_clearance_status,"
+            "rejected_left_selected_lower_margin,"
+            "rejected_left_selected_witness_upper,"
+            "rejected_right_landing_expected,"
+            "rejected_right_landing_patch_ready,"
+            "rejected_right_landing_sample,"
+            "rejected_right_landing_center_x,"
+            "rejected_right_landing_center_y,"
+            "rejected_right_landing_center_z,"
+            "rejected_right_landing_surface_status,"
+            "rejected_right_landing_surface_height,"
+            "rejected_right_landing_surface_normal_x,"
+            "rejected_right_landing_surface_normal_y,"
+            "rejected_right_landing_surface_normal_z,"
+            "rejected_right_landing_walkability_class,"
+            "rejected_right_landing_patch_maximum_residual,"
+            "rejected_right_target_x,rejected_right_target_y,"
+            "rejected_right_target_z,rejected_right_target_normal_x,"
+            "rejected_right_target_normal_y,rejected_right_target_normal_z,"
+            "rejected_right_reachable,rejected_right_correction_limited,"
+            "rejected_right_selected_clearance_status,"
+            "rejected_right_selected_lower_margin,"
+            "rejected_right_selected_witness_upper,"
+            "accepted_state_digest_hex\n", file) >= 0;
         if (!header_ok || fflush(file) != 0) {
             const int saved_errno = errno;
             fclose(file);
@@ -196,6 +460,209 @@ struct motion_match_log
             return io_error(error, error_capacity, "initialize", saved_errno);
         }
         return true;
+    }
+
+    bool write_work(const motion_match_clearance_work_diagnostic& work)
+    {
+        return fprintf(
+            file, ",%u,%u,%u,%u,%u,%u",
+            (unsigned)work.point_queries,
+            (unsigned)work.cells_visited,
+            (unsigned)work.primitive_triangle_pairs,
+            (unsigned)work.face_patches,
+            (unsigned)work.candidate_tests,
+            (unsigned)work.subdivision_nodes) >= 0;
+    }
+
+    bool write_swing(const motion_match_swing_diagnostic& swing)
+    {
+        bool ok = fprintf(
+            file, ",%u,%u,%u,%u,%s,%s,%d,%d,%.17g,%.17g",
+            (unsigned)swing.candidates_evaluated,
+            (unsigned)swing.selected_index,
+            (unsigned)swing.selected_lift_bits,
+            (unsigned)swing.materialized_command_y_bits,
+            swing.actual_sphere_center_bits_hex,
+            swing.selected_clearance_status,
+            (int)swing.selected_controller_constraints_passed,
+            (int)swing.selected_clearance_certified,
+            swing.lower_margin,
+            swing.witness_upper_margin) >= 0;
+        if (ok) ok = write_work(swing.selected_work);
+        if (ok) ok = write_work(swing.total_work);
+        return ok;
+    }
+
+    bool write_ik(const motion_match_ik_diagnostic& ik)
+    {
+        bool ok = fprintf(
+            file,
+            ",%d,%d,%s,%.9g,%.9g,%d,%s,"
+            "%.17g,%.17g,%.17g,%.17g,%.17g,"
+            "%d,%d,%d,%d,%.9g,%.9g,%.9g,%.9g,"
+            "%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,"
+            "%.9g,%.9g,%.9g,%.9g,%.9g,%.9g",
+            (int)ik.applied,
+            (int)ik.safe_stop_requested,
+            ik.stop_reason,
+            ik.max_correction,
+            ik.actual_simulation_speed,
+            (int)ik.candidate_rejected,
+            ik.candidate_clearance_status,
+            ik.candidate_toe_clearance[0],
+            ik.candidate_foot_clearance[0],
+            ik.candidate_toe_clearance[1],
+            ik.candidate_foot_clearance[1],
+            ik.candidate_minimum_clearance,
+            (int)ik.recorded_contact[0],
+            (int)ik.recorded_contact[1],
+            (int)ik.locked[0],
+            (int)ik.locked[1],
+            ik.observed_lock_drift[0],
+            ik.observed_lock_drift[1],
+            ik.lock_drift[0],
+            ik.lock_drift[1],
+            ik.sole_normal_alignment[0],
+            ik.sole_normal_alignment[1],
+            ik.contact_residual[0],
+            ik.contact_residual[1],
+            ik.target_height[0],
+            ik.target_height[1],
+            ik.target_normal[0].x,
+            ik.target_normal[0].y,
+            ik.target_normal[0].z,
+            ik.target_normal[1].x,
+            ik.target_normal[1].y,
+            ik.target_normal[1].z) >= 0;
+        if (ok) ok = write_swing(ik.swing[0]);
+        if (ok) ok = write_swing(ik.swing[1]);
+        if (ok) ok = fprintf(
+            file,
+            ",%d,%d,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,"
+            "%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g",
+            (int)ik.reachable[0],
+            (int)ik.reachable[1],
+            ik.knee_clearance[0],
+            ik.ankle_clearance[0],
+            ik.toe_clearance[0],
+            ik.foot_clearance[0],
+            ik.shin_clearance[0],
+            ik.thigh_clearance[0],
+            ik.knee_clearance[1],
+            ik.ankle_clearance[1],
+            ik.toe_clearance[1],
+            ik.foot_clearance[1],
+            ik.shin_clearance[1],
+            ik.thigh_clearance[1],
+            ik.hips_clearance,
+            ik.minimum_clearance) >= 0;
+        return ok;
+    }
+
+    bool write_landing(const motion_match_landing_diagnostic& landing)
+    {
+        return fprintf(
+            file,
+            ",%d,%d,%u,%s,%d,%.9g,%.9g,%.9g,%.9g,"
+            "%.9g,%.9g,%.9g,%.17g",
+            (int)landing.expected,
+            (int)landing.patch_ready,
+            (unsigned)landing.sample,
+            landing.surface_status,
+            landing.walkability_class,
+            landing.center.x,
+            landing.center.y,
+            landing.center.z,
+            landing.height,
+            landing.normal.x,
+            landing.normal.y,
+            landing.normal.z,
+            landing.patch_maximum_residual) >= 0;
+    }
+
+    bool write_rejected_foot(
+        const motion_match_rejected_foot_diagnostic& rejected)
+    {
+        return fprintf(
+            file,
+            ",%d,%d,%u,%.9g,%.9g,%.9g,%s,%.9g,%.9g,%.9g,%.9g,%d,"
+            "%.17g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%d,%d,%s,%.17g,%.17g",
+            (int)rejected.landing.expected,
+            (int)rejected.landing.patch_ready,
+            (unsigned)rejected.landing.sample,
+            rejected.landing.center.x,
+            rejected.landing.center.y,
+            rejected.landing.center.z,
+            rejected.landing.surface_status,
+            rejected.landing.height,
+            rejected.landing.normal.x,
+            rejected.landing.normal.y,
+            rejected.landing.normal.z,
+            rejected.landing.walkability_class,
+            rejected.landing.patch_maximum_residual,
+            rejected.target.x,
+            rejected.target.y,
+            rejected.target.z,
+            rejected.target_normal.x,
+            rejected.target_normal.y,
+            rejected.target_normal.z,
+            (int)rejected.reachable,
+            (int)rejected.correction_limited,
+            rejected.selected_clearance_status,
+            rejected.selected_lower_margin,
+            rejected.selected_witness_upper) >= 0;
+    }
+
+    bool write_directional(
+        const motion_match_directional_diagnostic& directional)
+    {
+        bool ok = fprintf(
+            file,
+            ",%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%s,%s,%.17g,%.17g,"
+            "%s,%d,%s,%.9g,%.9g,%.9g,%.9g,%.9g,%.17g,%.17g,%d,%d",
+            directional.requested_velocity.x,
+            directional.requested_velocity.y,
+            directional.requested_velocity.z,
+            directional.applied_velocity.x,
+            directional.applied_velocity.y,
+            directional.applied_velocity.z,
+            directional.desired_heading_bits_hex,
+            directional.predicted_heading_bits_hex,
+            directional.simulation_heading_error_deg,
+            directional.rendered_heading_error_deg,
+            directional.footprint_status,
+            (int)directional.footprint_blocked,
+            directional.footprint_blocked_reason,
+            directional.footprint_root_height,
+            directional.footprint_min_height[0],
+            directional.footprint_max_height[0],
+            directional.footprint_min_height[1],
+            directional.footprint_max_height[1],
+            directional.maximum_root_split[0],
+            directional.maximum_root_split[1],
+            (int)directional.footprint_multilevel[0],
+            (int)directional.footprint_multilevel[1]) >= 0;
+        if (ok) ok = write_landing(directional.landing[0]);
+        if (ok) ok = write_landing(directional.landing[1]);
+        if (ok) ok = fprintf(
+            file, ",%u,%u,%u,%d,%s,%d,%d,%d,%s,%d,%s,%.17g",
+            (unsigned)directional.footprint_sweeps,
+            (unsigned)directional.footprint_surface_queries,
+            (unsigned)directional.footprint_node_visits,
+            (int)directional.frame_rejected,
+            directional.frame_rejection_stage,
+            (int)directional.ik_safe_stop_latched,
+            (int)directional.rejected_attempted_footprint_available,
+            (int)directional.rejected_attempted_ik_available,
+            directional.rejected_stop_reason,
+            (int)directional.rejected_attempted_pose_available,
+            directional.rejected_pose_status,
+            directional.rejected_pose_minimum_clearance) >= 0;
+        if (ok) ok = write_rejected_foot(directional.rejected[0]);
+        if (ok) ok = write_rejected_foot(directional.rejected[1]);
+        if (ok) ok = fprintf(
+            file, ",%s\n", directional.accepted_state_digest_hex) >= 0;
+        return ok;
     }
 
     bool write(
@@ -250,7 +717,7 @@ struct motion_match_log
             ",%s,%s,%d,%.9g,"
             "%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,"
             "%s,%d,%d,%d,%.9g,%.9g,%.9g,%.9g,%d,%d,%s,"
-            "%.9g,%.9g,%.9g,%.9g,%.9g,%d,%d,%.9g,%d,%d,%d,%d,%d,%d,%d,%d\n",
+            "%.9g,%.9g,%.9g,%.9g,%.9g,%d,%d,%.9g,%d,%d,%d,%d,%d,%d,%d,%d",
             r.source_name, r.source_terrain, r.source_index,
             r.continuation_cost,
             r.source_root_height, r.source_left_toe_height,
@@ -271,6 +738,8 @@ struct motion_match_log
             r.scene_generation, r.scene_frame, r.scene_reset_count,
             (int)r.scene_switch_failed, r.motion_pack_load_count,
             r.model_load_count, r.model_unload_count, r.live_model_count) >= 0;
+        if (ok) ok = write_ik(r.ik);
+        if (ok) ok = write_directional(r.directional);
         if (ok) ok = fflush(file) == 0;
         return ok ? true : io_error(error, error_capacity, "write", errno);
     }

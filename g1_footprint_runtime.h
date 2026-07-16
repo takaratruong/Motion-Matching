@@ -98,6 +98,53 @@ static inline G1FootprintBudget g1_footprint_budget()
     return G1FootprintBudget{};
 }
 
+#if defined(__GNUC__) && !defined(__clang__)
+#define G1_FOOTPRINT_GEOMETRY_NOINLINE \
+    __attribute__((noinline, noclone))
+#elif defined(__clang__)
+#define G1_FOOTPRINT_GEOMETRY_NOINLINE __attribute__((noinline))
+#elif defined(_MSC_VER)
+#define G1_FOOTPRINT_GEOMETRY_NOINLINE __declspec(noinline)
+#else
+#define G1_FOOTPRINT_GEOMETRY_NOINLINE
+#endif
+
+static inline G1_FOOTPRINT_GEOMETRY_NOINLINE bool
+g1_footprint_materialize_current_geometry(
+    vec3 sphere_centers[4],
+    vec3 sole_points[4],
+    vec3 contact_position,
+    quat contact_rotation,
+    const G1LegConfig& config)
+{
+    if (sphere_centers == NULL || sole_points == NULL ||
+        !g1_ik_vec3_is_runtime_value(contact_position) ||
+        !ik_quat_is_unit(contact_rotation)) {
+        return false;
+    }
+    for (int probe = 0; probe < 4; ++probe) {
+        const vec3 sphere_offset = quat_mul_vec3(
+            contact_rotation,
+            config.foot_sphere_centers_local[probe]);
+        const vec3 sole_offset = quat_mul_vec3(
+            contact_rotation,
+            config.sole_points_local[probe]);
+        const vec3 sphere_center = contact_position + sphere_offset;
+        const vec3 sole_point = contact_position + sole_offset;
+        if (!g1_ik_vec3_is_runtime_value(sphere_offset) ||
+            !g1_ik_vec3_is_runtime_value(sole_offset) ||
+            !g1_ik_vec3_is_runtime_value(sphere_center) ||
+            !g1_ik_vec3_is_runtime_value(sole_point)) {
+            return false;
+        }
+        sphere_centers[probe] = sphere_center;
+        sole_points[probe] = sole_point;
+    }
+    return true;
+}
+
+#undef G1_FOOTPRINT_GEOMETRY_NOINLINE
+
 static inline bool g1_footprint_checked_byte_count(
     std::size_t& output,
     int count,
@@ -668,38 +715,27 @@ static inline G1FootprintStatus g1_footprint_observe_v2(
     for (int foot_index = 0; foot_index < 2; ++foot_index) {
         G1FootprintFootObservation& foot = candidate.feet[foot_index];
         foot.current_contact = contacts.contact[foot_index][0];
+        vec3 current_sphere_centers[4] = {};
+        vec3 current_sole_points[4] = {};
+        if (!g1_footprint_materialize_current_geometry(
+                current_sphere_centers,
+                current_sole_points,
+                global_positions(legs[foot_index].contact),
+                global_rotations(legs[foot_index].contact),
+                legs[foot_index])) {
+            return g1_footprint_observation_failure(
+                output,
+                G1FootprintArithmeticFailure,
+                error,
+                error_capacity,
+                "G1 footprint current geometry arithmetic failed");
+        }
         for (int probe_index = 0; probe_index < 4; ++probe_index) {
             G1FootprintProbe& probe = foot.probes[probe_index];
-            const quat ankle_rotation =
-                global_rotations(legs[foot_index].ankle);
-            const vec3 sphere_offset = quat_mul_vec3(
-                ankle_rotation,
-                legs[foot_index].foot_sphere_centers_local[probe_index]);
-            const vec3 sole_offset = quat_mul_vec3(
-                ankle_rotation,
-                legs[foot_index].sole_points_local[probe_index]);
-            if (!g1_ik_vec3_is_runtime_value(sphere_offset) ||
-                !g1_ik_vec3_is_runtime_value(sole_offset)) {
-                return g1_footprint_observation_failure(
-                    output,
-                    G1FootprintArithmeticFailure,
-                    error,
-                    error_capacity,
-                    "G1 footprint ankle rotation arithmetic failed");
-            }
             probe.current_sphere_center =
-                global_positions(legs[foot_index].ankle) + sphere_offset;
+                current_sphere_centers[probe_index];
             probe.current_sole_point =
-                global_positions(legs[foot_index].ankle) + sole_offset;
-            if (!g1_ik_vec3_is_runtime_value(probe.current_sphere_center) ||
-                !g1_ik_vec3_is_runtime_value(probe.current_sole_point)) {
-                return g1_footprint_observation_failure(
-                    output,
-                    G1FootprintArithmeticFailure,
-                    error,
-                    error_capacity,
-                    "G1 footprint current geometry arithmetic failed");
-            }
+                current_sole_points[probe_index];
             vec3 transported_spheres[G1CommandTrajectorySampleCount];
             vec3 transported_soles[G1CommandTrajectorySampleCount];
             if (!g1_footprint_transport_point(

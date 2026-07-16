@@ -50,6 +50,7 @@ struct G1FootIkState
 {
     G1FootLockState lock;
     G1SwingHistory swing;
+    vec3 baseline_sole_normal;
 };
 
 struct G1IkState
@@ -83,6 +84,37 @@ struct G1IkFrameTransaction
     uint32_t next_foot = 0;
     G1IkState candidate_state;
     G1IkFrameResult candidate_result;
+    G1LegIterationProvenance staged_iteration_provenance[2] = {
+        G1LegIterationNone,
+        G1LegIterationNone,
+    };
+};
+
+static inline bool g1_ik_runtime_iteration_transcript_matches(
+    const G1IkFrameTransaction& transaction)
+{
+    if (transaction.next_foot > 2U) return false;
+    for (uint32_t foot = 0; foot < 2U; ++foot) {
+        const G1LegSolveResult& position =
+            transaction.candidate_result.feet[foot].position;
+        const G1LegIterationProvenance expected = position.applied
+            ? position.iteration_provenance
+            : G1LegIterationNone;
+        if (transaction.staged_iteration_provenance[foot] != expected ||
+            (foot >= transaction.next_foot &&
+             transaction.staged_iteration_provenance[foot] !=
+                 G1LegIterationNone)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+enum G1IkRejectionCheckpoint
+{
+    G1IkRejectionAfterBegin = 0,
+    G1IkRejectionAfterFoot0,
+    G1IkRejectionAfterFoot1,
 };
 
 struct G1IkSafeStopHandoff
@@ -99,7 +131,7 @@ static constexpr uint32_t G1SwingLiftCandidateBits[
     0x3c83126fu, 0x3c9374bcu, 0x3ca3d70au, 0x3cb43958u,
     0x3cc49ba6u, 0x3cd4fdf4u, 0x3ce56042u, 0x3cf5c28fu,
     0x3d03126fu, 0x3d0b4396u, 0x3d1374bcu, 0x3d1ba5e3u,
-    0x3d23d70au, 0x3d2c0831u, 0x3d343958u, 0x3d3c6a7fu,
+    G1_Exact25HzBits, 0x3d2c0831u, 0x3d343958u, 0x3d3c6a7fu,
     0x3d449ba6u, 0x3d4ccccdu, 0x3d54fdf4u, 0x3d5d2f1bu,
     0x3d656042u, 0x3d6d9168u, 0x3d75c28fu, 0x3d7df3b6u,
     0x3d83126fu, 0x3d872b02u, 0x3d8b4396u, 0x3d8f5c29u,
@@ -185,7 +217,9 @@ static inline bool g1_ik_runtime_state_is_valid(const G1IkState& state)
     if (!state.initialized) return false;
     for (int foot = 0; foot < 2; ++foot) {
         if (!g1_foot_lock_state_is_valid(state.feet[foot].lock) ||
-            !g1_ik_runtime_history_is_valid(state.feet[foot].swing)) {
+            !g1_ik_runtime_history_is_valid(state.feet[foot].swing) ||
+            !g1_ik_surface_normal_is_valid(
+                state.feet[foot].baseline_sole_normal)) {
             return false;
         }
     }
@@ -259,39 +293,24 @@ static inline bool g1_ik_runtime_pose_ranges_are_disjoint(
                parents.data, parent_bytes);
 }
 
-#if defined(__GNUC__) || defined(__clang__)
-#define G1_IK_RUNTIME_NOINLINE __attribute__((noinline))
-#elif defined(_MSC_VER)
-#define G1_IK_RUNTIME_NOINLINE __declspec(noinline)
-#else
-#define G1_IK_RUNTIME_NOINLINE
-#endif
-
-static inline G1_IK_RUNTIME_NOINLINE bool
+static inline bool
 g1_ik_runtime_compute_foot_centers(
     vec3 output[4],
     const slice1d<vec3> global_positions,
     const slice1d<quat> global_rotations,
     const G1LegConfig& config)
 {
-    for (int probe = 0; probe < 4; ++probe) {
-        const vec3 offset = quat_mul_vec3(
-            global_rotations(config.ankle),
-            config.foot_sphere_centers_local[probe]);
-        const vec3 center = global_positions(config.ankle) + offset;
-        if (!g1_ik_vec3_is_runtime_value(offset) ||
-            !g1_ik_vec3_is_runtime_value(center)) {
-            return false;
-        }
-        // Preserve the exact staged-FK call-boundary words.  The strict
-        // clearance kernel canonicalizes its own public inputs; diagnostics
-        // must not rewrite signed zero or any other valid binary32 value.
-        output[probe] = center;
-    }
-    return true;
+    vec3 sole_points[4] = {};
+    // The footprint observer and IK preflight intentionally share this
+    // no-clone materialization boundary.  Exact provenance must not depend
+    // on the optimizer choosing different reassociation for the two owners.
+    return g1_footprint_materialize_current_geometry(
+        output,
+        sole_points,
+        global_positions(config.contact),
+        global_rotations(config.contact),
+        config);
 }
-
-#undef G1_IK_RUNTIME_NOINLINE
 
 static inline const char* g1_ik_stop_reason_name(G1IkStopReason reason)
 {
@@ -378,18 +397,31 @@ static inline bool g1_ik_state_reset(
     candidate.initialized = true;
     for (int foot = 0; foot < 2; ++foot) {
         vec3 centers[4] = {};
+        vec3 sole_center;
+        vec3 sole_normal;
         if (!g1_ik_runtime_compute_foot_centers(
                 centers, global_positions, global_rotations,
                 configs[foot]) ||
+            !g1_ik_checked_physical_sole_centroid(
+                sole_center,
+                global_positions(configs[foot].contact),
+                global_rotations(configs[foot].contact),
+                configs[foot]) ||
+            !ik_checked_quat_rotate(
+                sole_normal,
+                global_rotations(configs[foot].contact),
+                configs[foot].sole_normal_local) ||
+            !g1_ik_surface_normal_is_valid(sole_normal) ||
             !g1_foot_lock_reset(
                 candidate.feet[foot].lock,
-                global_positions(configs[foot].contact),
+                sole_center,
                 error, error_capacity) ||
             !g1_swing_history_reset(
                 candidate.feet[foot].swing,
                 centers, error, error_capacity)) {
             return false;
         }
+        candidate.feet[foot].baseline_sole_normal = sole_normal;
     }
     if (!g1_ik_runtime_state_is_valid(candidate)) {
         return g1_ik_runtime_fail(
@@ -563,36 +595,30 @@ static inline void g1_ik_runtime_request_safe_stop(
     transaction.candidate_result.stop_reason = reason;
 }
 
-static inline bool g1_ik_runtime_materialize_landing_target(
-    G1FootTarget& target,
+static inline bool g1_ik_runtime_validate_landing_lookahead(
+    const G1FootTarget& target,
     const G1FootprintFootObservation& footprint,
     const G1LegConfig& config,
     char* error,
     int error_capacity)
 {
-    float sole_y = 0.0f;
-    if (g1_apply_swing_lift_y(
-            sole_y,
-            footprint.predicted_landing_surface.height,
-            config.swing_clearance_m,
-            error,
-            error_capacity) != G1ClearanceOk) {
-        return false;
-    }
-    target.surface.point = vec3(
-        footprint.predicted_landing_sole_center.x,
-        footprint.predicted_landing_surface.height,
-        footprint.predicted_landing_sole_center.z);
-    target.surface.normal =
-        footprint.predicted_landing_surface.normal;
-    target.sole_center = vec3(
-        footprint.predicted_landing_sole_center.x,
-        sole_y,
-        footprint.predicted_landing_sole_center.z);
-    if (!g1_foot_target_is_valid(target)) {
+    if (!g1_foot_target_is_valid(target) ||
+        !g1_foot_runtime_config_validate(
+            config, error, error_capacity) ||
+        !footprint.landing_expected ||
+        !footprint.landing_patch_ready ||
+        footprint.landing_sample >=
+            G1CommandTrajectorySampleCount ||
+        !g1_ik_vec3_is_runtime_value(
+            footprint.predicted_landing_sole_center) ||
+        footprint.predicted_landing_surface_status !=
+            G1SurfaceQueryValid ||
+        footprint.predicted_landing_walkability_class != 1 ||
+        !g1_ik_runtime_surface_sample_is_valid(
+            footprint.predicted_landing_surface)) {
         return g1_ik_runtime_fail(
             error, error_capacity,
-            "G1 IK landing materialization produced an invalid target");
+            "G1 IK ready landing lookahead is invalid");
     }
     return true;
 }
@@ -684,31 +710,44 @@ static inline bool g1_ik_frame_begin(
 
     for (int foot_index = 0; foot_index < 2; ++foot_index) {
         G1FootTarget target = {};
-        const bool lock_was_established =
-            candidate.candidate_state.feet[foot_index].lock.locked;
+        vec3 current_sole_center;
+        vec3 current_sole_normal;
+        if (!g1_ik_checked_physical_sole_centroid(
+                current_sole_center,
+                global_positions(configs[foot_index].contact),
+                global_rotations(configs[foot_index].contact),
+                configs[foot_index]) ||
+            !ik_checked_quat_rotate(
+                current_sole_normal,
+                global_rotations(configs[foot_index].contact),
+                configs[foot_index].sole_normal_local) ||
+            !g1_ik_surface_normal_is_valid(
+                current_sole_normal)) {
+            return g1_ik_runtime_fail(
+                error, error_capacity,
+                "G1 IK frame could not materialize physical sole pose");
+        }
         if (!g1_foot_lock_update(
                 candidate.candidate_state.feet[foot_index].lock,
                 target,
                 field,
                 configs[foot_index],
-                global_positions(configs[foot_index].contact),
+                current_sole_center,
                 contacts.data[foot_index],
                 dt,
                 error,
                 error_capacity)) {
             return false;
         }
-        // The checked lock owns a continuity-preserving output on its rising
-        // edge.  Once established, recorded contact is the exact immutable
-        // world lock, independent of later root-level animation changes.
-        if (contacts.data[foot_index] && lock_was_established) {
-            target.sole_center = candidate.candidate_state
-                .feet[foot_index].lock.lock_point;
-            if (!g1_foot_target_is_valid(target)) {
-                return g1_ik_runtime_fail(
-                    error, error_capacity,
-                    "G1 IK established contact lock target is invalid");
-            }
+        target.desired_sole_normal = contacts.data[foot_index]
+            ? target.surface.normal
+            : current_sole_normal;
+        candidate.candidate_state.feet[foot_index]
+            .baseline_sole_normal = current_sole_normal;
+        if (!g1_foot_target_is_valid(target)) {
+            return g1_ik_runtime_fail(
+                error, error_capacity,
+                "G1 IK frame produced an invalid desired sole normal");
         }
         candidate.candidate_result.feet[foot_index]
             .recorded_contact = contacts.data[foot_index];
@@ -731,14 +770,14 @@ static inline bool g1_ik_frame_begin(
                     G1IkStopLandingPatchUnavailable);
                 break;
             }
-            G1FootTarget target = candidate.candidate_result
-                .feet[foot_index].target;
-            if (!g1_ik_runtime_materialize_landing_target(
-                    target, foot, configs[foot_index],
+            if (!g1_ik_runtime_validate_landing_lookahead(
+                    candidate.candidate_result.feet[foot_index]
+                        .target,
+                    foot,
+                    configs[foot_index],
                     error, error_capacity)) {
                 return false;
             }
-            candidate.candidate_result.feet[foot_index].target = target;
         }
     }
 
@@ -784,9 +823,55 @@ static inline bool g1_ik_runtime_clearance_status_is_fatal(
 static inline bool g1_ik_runtime_controller_constraints_pass(
     const G1LegSolveResult& position,
     const G1FootOrientationResult& orientation,
-    vec3 position_endpoint,
-    vec3 final_endpoint)
+    vec3 final_contact_origin,
+    quat final_contact_rotation,
+    const G1FootTarget& target,
+    const G1LegConfig& config)
 {
+    vec3 final_sole_center;
+    double sole_residual_precise_m = DBL_MAX;
+    float sole_residual_m = FLT_MAX;
+    vec3 final_sole_normal;
+    vec3 normalized_target_normal;
+    vec3 final_forward;
+    vec3 frozen_forward;
+    double normal_alignment = 0.0;
+    double heading_alignment = 0.0;
+    const bool endpoint_is_valid =
+        g1_foot_target_is_valid(target) &&
+        g1_ik_checked_physical_sole_centroid(
+            final_sole_center,
+            final_contact_origin,
+            final_contact_rotation,
+            config) &&
+        ik_checked_distance_precise(
+            sole_residual_precise_m,
+            sole_residual_m,
+            final_sole_center,
+            target.sole_center) &&
+        ik_checked_normalize(
+            normalized_target_normal,
+            target.desired_sole_normal) &&
+        ik_checked_quat_rotate(
+            final_sole_normal,
+            final_contact_rotation,
+            config.sole_normal_local) &&
+        ik_checked_quat_rotate(
+            final_forward,
+            final_contact_rotation,
+            config.foot_forward_local) &&
+        ik_checked_quat_rotate(
+            frozen_forward,
+            orientation.target_global_rotation,
+            config.foot_forward_local) &&
+        ik_checked_dot(
+            normal_alignment,
+            final_sole_normal,
+            normalized_target_normal) &&
+        ik_checked_dot(
+            heading_alignment,
+            final_forward,
+            frozen_forward);
     return position.applied &&
            position.reachable &&
            !position.correction_limited &&
@@ -796,8 +881,14 @@ static inline bool g1_ik_runtime_controller_constraints_pass(
            orientation.applied &&
            !orientation.correction_limited &&
            !orientation.safe_stop_requested &&
-           g1_ik_vec3_bits_equal(
-               position_endpoint, final_endpoint);
+           endpoint_is_valid &&
+           g1_ik_contact_residual_is_converged_precise(
+               sole_residual_precise_m) &&
+           g1_ik_runtime_float_bits(
+               position.contact_residual_m) ==
+               g1_ik_runtime_float_bits(sole_residual_m) &&
+           normal_alignment >= 0.99999 &&
+           heading_alignment >= 0.99999;
 }
 
 static inline bool g1_ik_runtime_stage_swing_candidate(
@@ -870,40 +961,15 @@ static inline bool g1_ik_runtime_stage_swing_candidate(
         G1_BoneCount, candidate.positions);
     const slice1d<quat> staged_rotations(
         G1_BoneCount, candidate.rotations);
-    if (!g1_apply_named_contact_position_ik(
+    if (!g1_apply_named_physical_sole_ik(
             staged_rotations,
             staged_positions,
             baseline_rotations,
             bone_parents,
             config,
             staged_target.sole_center,
+            staged_target.desired_sole_normal,
             candidate.position,
-            error,
-            error_capacity)) {
-        return false;
-    }
-
-    vec3 position_global_storage[G1_BoneCount];
-    quat position_rotation_storage[G1_BoneCount];
-    const slice1d<vec3> position_globals(
-        G1_BoneCount, position_global_storage);
-    const slice1d<quat> position_global_rotations(
-        G1_BoneCount, position_rotation_storage);
-    if (!g1_ik_checked_forward_kinematics(
-            position_globals,
-            position_global_rotations,
-            staged_positions,
-            staged_rotations,
-            bone_parents,
-            error,
-            error_capacity) ||
-        !g1_apply_named_foot_orientation(
-            staged_rotations,
-            staged_positions,
-            baseline_rotations,
-            bone_parents,
-            config,
-            staged_target.surface.normal,
             candidate.orientation,
             error,
             error_capacity)) {
@@ -936,8 +1002,10 @@ static inline bool g1_ik_runtime_stage_swing_candidate(
         g1_ik_runtime_controller_constraints_pass(
             candidate.position,
             candidate.orientation,
-            position_globals(config.contact),
-            final_globals(config.contact));
+            final_globals(config.contact),
+            final_global_rotations(config.contact),
+            staged_target,
+            config);
 
     for (int probe = 0; probe < 4; ++probe) {
         candidate.diagnostic.actual_sphere_center_bits[probe][0] =
@@ -1050,27 +1118,102 @@ static inline bool g1_ik_runtime_stage_recorded_contact(
         G1_BoneCount, candidate.positions);
     const slice1d<quat> staged_rotations(
         G1_BoneCount, candidate.rotations);
-    if (!g1_apply_named_contact_position_ik(
+    if (!g1_apply_named_physical_sole_ik(
             staged_rotations,
             staged_positions,
             baseline_rotations,
             bone_parents,
             config,
             target.sole_center,
+            target.desired_sole_normal,
             candidate.position,
-            error,
-            error_capacity) ||
-        !g1_apply_named_foot_orientation(
-            staged_rotations,
-            staged_positions,
-            baseline_rotations,
-            bone_parents,
-            config,
-            target.surface.normal,
             candidate.orientation,
             error,
             error_capacity)) {
         return false;
+    }
+    bool baseline_fallback_used = false;
+    if (!candidate.position.reachable) {
+        vec3 baseline_globals_storage[G1_BoneCount];
+        quat baseline_global_rotations_storage[G1_BoneCount];
+        const slice1d<vec3> baseline_globals(
+            G1_BoneCount, baseline_globals_storage);
+        const slice1d<quat> baseline_global_rotations(
+            G1_BoneCount, baseline_global_rotations_storage);
+        double baseline_residual_precise_m = DBL_MAX;
+        float baseline_residual_m = FLT_MAX;
+        vec3 baseline_sole_center;
+        if (!g1_ik_checked_forward_kinematics(
+                baseline_globals,
+                baseline_global_rotations,
+                staged_positions,
+                baseline_rotations,
+                bone_parents,
+                error,
+                error_capacity) ||
+            !g1_ik_checked_physical_sole_centroid(
+                baseline_sole_center,
+                baseline_globals(config.contact),
+                baseline_global_rotations(config.contact),
+                config) ||
+            !ik_checked_distance_precise(
+                baseline_residual_precise_m,
+                baseline_residual_m,
+                baseline_sole_center,
+                target.sole_center)) {
+            return g1_ik_error(
+                error, error_capacity,
+                "G1 recorded contact baseline residual became invalid");
+        }
+        if (g1_ik_contact_residual_is_converged_precise(
+                baseline_residual_precise_m)) {
+            baseline_fallback_used = true;
+            std::memcpy(
+                candidate.rotations,
+                baseline_rotations.data,
+                sizeof(candidate.rotations));
+            candidate.position = G1LegSolveResult{};
+            if (!g1_apply_named_position_ik(
+                    staged_rotations,
+                    staged_positions,
+                    baseline_rotations,
+                    bone_parents,
+                    config,
+                    baseline_globals(config.ankle),
+                    candidate.position,
+                    error,
+                    error_capacity)) {
+                return false;
+            }
+            if (!g1_ik_leg_result_is_valid(candidate.position) ||
+                !candidate.position.reachable ||
+                candidate.position.correction_limited ||
+                candidate.position.safe_stop_requested ||
+                candidate.position.max_correction_radians != 0.0f ||
+                !g1_ik_vec3_bits_equal(
+                    candidate.position.requested_ankle_target,
+                    candidate.position.clamped_ankle_target) ||
+                g1_ik_runtime_float_bits(
+                    candidate.position.raw_distance_m) !=
+                    g1_ik_runtime_float_bits(
+                        candidate.position.clamped_distance_m)) {
+                return g1_ik_error(
+                    error, error_capacity,
+                    "G1 recorded contact fallback was incoherent");
+            }
+            if (!g1_apply_named_foot_orientation(
+                    staged_rotations,
+                    staged_positions,
+                    baseline_rotations,
+                    bone_parents,
+                    config,
+                    target.desired_sole_normal,
+                    candidate.orientation,
+                    error,
+                    error_capacity)) {
+                return false;
+            }
+        }
     }
     vec3 globals_storage[G1_BoneCount];
     quat rotations_storage[G1_BoneCount];
@@ -1078,6 +1221,9 @@ static inline bool g1_ik_runtime_stage_recorded_contact(
         G1_BoneCount, globals_storage);
     const slice1d<quat> global_rotations(
         G1_BoneCount, rotations_storage);
+    vec3 final_sole_center;
+    double final_residual_precise_m = DBL_MAX;
+    float final_residual_m = FLT_MAX;
     if (!g1_ik_checked_forward_kinematics(
             globals,
             global_rotations,
@@ -1090,19 +1236,42 @@ static inline bool g1_ik_runtime_stage_recorded_contact(
             candidate.sphere_centers,
             globals,
             global_rotations,
-            config)) {
+            config) ||
+        !g1_ik_checked_physical_sole_centroid(
+            final_sole_center,
+            globals(config.contact),
+            global_rotations(config.contact),
+            config) ||
+        !ik_checked_distance_precise(
+            final_residual_precise_m,
+            final_residual_m,
+            final_sole_center,
+            target.sole_center)) {
         return false;
     }
+    if (baseline_fallback_used) {
+        candidate.position.contact_residual_m = final_residual_m;
+        candidate.position.iteration_provenance =
+            G1LegIterationBaselineFallback1;
+        candidate.position.safe_stop_requested =
+            !candidate.position.reachable ||
+            candidate.position.correction_limited ||
+            !g1_ik_contact_residual_is_converged_precise(
+                final_residual_precise_m);
+        if (!g1_ik_leg_result_is_valid(candidate.position)) {
+            return g1_ik_error(
+                error, error_capacity,
+                "G1 recorded contact fallback final residual was invalid");
+        }
+    }
     candidate.passes =
-        candidate.position.applied &&
-        candidate.position.reachable &&
-        !candidate.position.correction_limited &&
-        !candidate.position.safe_stop_requested &&
-        g1_ik_contact_residual_is_converged(
-            candidate.position.contact_residual_m) &&
-        candidate.orientation.applied &&
-        !candidate.orientation.correction_limited &&
-        !candidate.orientation.safe_stop_requested;
+        g1_ik_runtime_controller_constraints_pass(
+            candidate.position,
+            candidate.orientation,
+            globals(config.contact),
+            global_rotations(config.contact),
+            target,
+            config);
     output = candidate;
     return true;
 }
@@ -1146,7 +1315,8 @@ static inline bool g1_ik_frame_stage_foot(
         footprint.feet[0].current_contact != contacts.data[0] ||
         footprint.feet[1].current_contact != contacts.data[1] ||
         !g1_ik_runtime_state_is_valid(
-            transaction.candidate_state)) {
+            transaction.candidate_state) ||
+        !g1_ik_runtime_iteration_transcript_matches(transaction)) {
         return false;
     }
 
@@ -1208,6 +1378,8 @@ static inline bool g1_ik_frame_stage_foot(
             return false;
         }
         foot_result.position = planted.position;
+        candidate.staged_iteration_provenance[foot_index] =
+            planted.position.iteration_provenance;
         foot_result.orientation = planted.orientation;
         if (!planted.passes) {
             g1_ik_runtime_request_safe_stop(
@@ -1262,6 +1434,8 @@ static inline bool g1_ik_frame_stage_foot(
             selection.selected_index = candidate_index;
             selection.selected = staged.diagnostic;
             foot_result.position = staged.position;
+            candidate.staged_iteration_provenance[foot_index] =
+                staged.position.iteration_provenance;
             foot_result.orientation = staged.orientation;
             std::memcpy(
                 scratch_positions.data,
@@ -1324,7 +1498,8 @@ static inline bool g1_ik_runtime_is_disabled_noop(
                work.candidate_tests == 0U &&
                work.subdivision_nodes == 0U;
     };
-    if (transaction.candidate_result.applied ||
+    if (!g1_ik_runtime_iteration_transcript_matches(transaction) ||
+        transaction.candidate_result.applied ||
         transaction.candidate_result.safe_stop_requested ||
         transaction.candidate_result.stop_reason != G1IkStopNone ||
         !float_is_positive_zero(
@@ -1351,6 +1526,7 @@ static inline bool g1_ik_runtime_is_disabled_noop(
             target.drift_limit_exceeded ||
             !vec3_is_positive_zero(target.surface.point) ||
             !vec3_is_positive_zero(target.surface.normal) ||
+            !vec3_is_positive_zero(target.desired_sole_normal) ||
             !vec3_is_positive_zero(target.sole_center) ||
             !float_is_positive_zero(target.horizontal_drift_m) ||
             selection.candidates_evaluated != 0U ||
@@ -1375,6 +1551,8 @@ static inline bool g1_ik_runtime_is_disabled_noop(
             position.correction_limited ||
             position.safe_stop_requested ||
             position.iterations != 0 ||
+            position.iteration_provenance !=
+                G1LegIterationNone ||
             !vec3_is_positive_zero(position.requested_ankle_target) ||
             !vec3_is_positive_zero(position.clamped_ankle_target) ||
             !vec3_is_positive_zero(position.hinge_axis_world) ||
@@ -1420,6 +1598,604 @@ static inline bool g1_ik_runtime_is_disabled_noop(
     return true;
 }
 
+static inline bool g1_ik_frame_rejection_snapshot(
+    G1IkFrameResult& output,
+    const G1IkFrameTransaction& transaction,
+    G1IkRejectionCheckpoint expected_checkpoint,
+    char* error,
+    int error_capacity)
+{
+    if (error_capacity < 0) return false;
+
+    const std::size_t error_bytes =
+        error != NULL && error_capacity > 0
+            ? static_cast<std::size_t>(error_capacity)
+            : 0U;
+    if (g1_ik_memory_ranges_overlap(
+            error, error_bytes, &output, sizeof(output)) ||
+        g1_ik_memory_ranges_overlap(
+            error, error_bytes,
+            &transaction, sizeof(transaction))) {
+        return false;
+    }
+    if (g1_ik_memory_ranges_overlap(
+            &output, sizeof(output),
+            &transaction, sizeof(transaction))) {
+        return g1_ik_runtime_fail(
+            error, error_capacity,
+            "G1 IK rejection snapshot output aliases its transaction");
+    }
+
+    static_assert(
+        sizeof(G1IkRejectionCheckpoint) == sizeof(int),
+        "G1 IK rejection checkpoint uses an exact int representation");
+    int checkpoint = -1;
+    std::memcpy(
+        &checkpoint, &expected_checkpoint,
+        sizeof(expected_checkpoint));
+    if (checkpoint < G1IkRejectionAfterBegin ||
+        checkpoint > G1IkRejectionAfterFoot1) {
+        return g1_ik_runtime_fail(
+            error, error_capacity,
+            "G1 IK rejection snapshot checkpoint is invalid");
+    }
+
+    const auto double_bits = [](double value) {
+        uint64_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return bits;
+    };
+    const auto float_is_positive_zero = [](float value) {
+        return g1_ik_runtime_float_bits(value) == 0U;
+    };
+    const auto double_is_positive_zero = [&double_bits](double value) {
+        return double_bits(value) == 0U;
+    };
+    const auto vec3_is_positive_zero =
+        [&float_is_positive_zero](vec3 value) {
+            return float_is_positive_zero(value.x) &&
+                   float_is_positive_zero(value.y) &&
+                   float_is_positive_zero(value.z);
+        };
+    const auto work_is_zero = [](const G1ClearanceWork& work) {
+        return work.point_queries == 0U &&
+               work.cells_visited == 0U &&
+               work.primitive_triangle_pairs == 0U &&
+               work.face_patches == 0U &&
+               work.candidate_tests == 0U &&
+               work.subdivision_nodes == 0U;
+    };
+    const auto work_is_at_least = [](
+        const G1ClearanceWork& whole,
+        const G1ClearanceWork& part) {
+        return whole.point_queries >= part.point_queries &&
+               whole.cells_visited >= part.cells_visited &&
+               whole.primitive_triangle_pairs >=
+                   part.primitive_triangle_pairs &&
+               whole.face_patches >= part.face_patches &&
+               whole.candidate_tests >= part.candidate_tests &&
+               whole.subdivision_nodes >=
+                   part.subdivision_nodes;
+    };
+    const G1ClearanceBudget swing_budget =
+        g1_swing_foot_clearance_budget();
+    const auto work_is_within = [&swing_budget](
+        const G1ClearanceWork& work,
+        uint32_t multiplier) {
+        return static_cast<uint64_t>(work.point_queries) <=
+                   static_cast<uint64_t>(
+                       swing_budget.maximum_point_queries) * multiplier &&
+               static_cast<uint64_t>(work.cells_visited) <=
+                   static_cast<uint64_t>(
+                       swing_budget.maximum_cells) * multiplier &&
+               static_cast<uint64_t>(
+                   work.primitive_triangle_pairs) <=
+                   static_cast<uint64_t>(
+                       swing_budget.maximum_primitive_triangle_pairs) *
+                       multiplier &&
+               static_cast<uint64_t>(work.face_patches) <=
+                   static_cast<uint64_t>(
+                       swing_budget.maximum_face_patches) * multiplier &&
+               static_cast<uint64_t>(work.candidate_tests) <=
+                   static_cast<uint64_t>(
+                       swing_budget.maximum_candidate_tests) * multiplier &&
+               static_cast<uint64_t>(work.subdivision_nodes) <=
+                   static_cast<uint64_t>(
+                       swing_budget.maximum_subdivision_nodes) * multiplier;
+    };
+    const auto candidate_is_canonical = [
+        &double_is_positive_zero, &work_is_zero](
+        const G1SwingCandidateDiagnostic& selected) {
+        if (selected.candidate_index != G1SwingNoCandidate ||
+            selected.lift_bits != 0U ||
+            selected.materialized_command_y_bits != 0U ||
+            selected.clearance_status != G1ClearanceInvalidInput ||
+            selected.controller_constraints_passed ||
+            selected.clearance_certified ||
+            !double_is_positive_zero(selected.lower_margin_m) ||
+            !double_is_positive_zero(
+                selected.witness_upper_margin_m) ||
+            !work_is_zero(selected.clearance_work)) {
+            return false;
+        }
+        for (int probe = 0; probe < 4; ++probe) {
+            for (int axis = 0; axis < 3; ++axis) {
+                if (selected.actual_sphere_center_bits[probe][axis] !=
+                    0U) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+    const auto selection_is_canonical = [
+        &candidate_is_canonical, &work_is_zero](
+        const G1SwingSelectionDiagnostic& selection) {
+        return selection.candidates_evaluated == 0U &&
+               selection.selected_index == G1SwingNoCandidate &&
+               candidate_is_canonical(selection.selected) &&
+               work_is_zero(selection.total_clearance_work);
+    };
+    const auto defensive_is_canonical = [
+        &double_is_positive_zero, &work_is_zero](
+        const G1SwingClearanceValidation& defensive) {
+        return double_is_positive_zero(defensive.lower_margin_m) &&
+               double_is_positive_zero(defensive.witness_upper_m) &&
+               !defensive.sweep_evaluated &&
+               work_is_zero(defensive.work);
+    };
+    const auto position_is_canonical = [
+        &float_is_positive_zero, &vec3_is_positive_zero](
+        const G1LegSolveResult& position) {
+        return !position.applied && !position.reachable &&
+               !position.correction_limited &&
+               !position.safe_stop_requested &&
+               position.iterations == 0 &&
+               position.iteration_provenance ==
+                   G1LegIterationNone &&
+               vec3_is_positive_zero(
+                   position.requested_ankle_target) &&
+               vec3_is_positive_zero(
+                   position.clamped_ankle_target) &&
+               vec3_is_positive_zero(position.hinge_axis_world) &&
+               vec3_is_positive_zero(position.bend_direction) &&
+               !position.bend_used_current_projection &&
+               !position.bend_used_hinge_fallback &&
+               !position.bend_used_safe_perpendicular &&
+               !position.bend_sign_flipped &&
+               float_is_positive_zero(position.raw_distance_m) &&
+               float_is_positive_zero(position.clamped_distance_m) &&
+               float_is_positive_zero(
+                   position.max_correction_radians) &&
+               g1_ik_runtime_float_bits(
+                   position.contact_residual_m) ==
+                   g1_ik_runtime_float_bits(
+                       std::numeric_limits<float>::max());
+    };
+    const auto orientation_is_canonical = [
+        &float_is_positive_zero](
+        const G1FootOrientationResult& orientation) {
+        return !orientation.applied &&
+               !orientation.correction_limited &&
+               !orientation.safe_stop_requested &&
+               g1_ik_runtime_float_bits(
+                   orientation.target_global_rotation.w) ==
+                   g1_ik_runtime_float_bits(1.0f) &&
+               float_is_positive_zero(
+                   orientation.target_global_rotation.x) &&
+               float_is_positive_zero(
+                   orientation.target_global_rotation.y) &&
+               float_is_positive_zero(
+                   orientation.target_global_rotation.z) &&
+               float_is_positive_zero(
+                   orientation.requested_correction_radians) &&
+               float_is_positive_zero(
+                   orientation.correction_radians);
+    };
+    const auto foot_stage_is_canonical = [
+        &selection_is_canonical,
+        &position_is_canonical,
+        &orientation_is_canonical](
+        const G1FootFrameResult& foot) {
+        return selection_is_canonical(foot.swing_selection) &&
+               position_is_canonical(foot.position) &&
+               orientation_is_canonical(foot.orientation);
+    };
+    const auto position_is_complete = [](
+        const G1LegSolveResult& position,
+        const G1LegConfig& config) {
+        const int primary_bend_provenance =
+            (position.bend_used_current_projection ? 1 : 0) +
+            (position.bend_used_hinge_fallback ? 1 : 0);
+        const bool residual_converged =
+            g1_ik_contact_residual_is_converged(
+                position.contact_residual_m);
+        const bool residual_at_threshold =
+            g1_ik_runtime_float_bits(
+                position.contact_residual_m) ==
+            g1_ik_runtime_float_bits(0.005f);
+        const bool definite_constraints_failed =
+            !position.reachable ||
+            position.correction_limited ||
+            !residual_converged;
+        const bool safe_stop_is_coherent =
+            definite_constraints_failed
+                ? position.safe_stop_requested
+                : (residual_at_threshold ||
+                   !position.safe_stop_requested);
+        const bool reachable_projection_matches =
+            !position.reachable ||
+            (g1_ik_vec3_bits_equal(
+                 position.requested_ankle_target,
+                 position.clamped_ankle_target) &&
+             g1_ik_runtime_float_bits(
+                 position.raw_distance_m) ==
+                 g1_ik_runtime_float_bits(
+                     position.clamped_distance_m));
+        return g1_ik_leg_result_is_valid(position) &&
+               g1_ik_contact_iterations_have_valid_provenance(
+                   position) &&
+               position.max_correction_radians <=
+                   config.max_correction_radians &&
+               primary_bend_provenance == 1 &&
+               (!position.bend_used_safe_perpendicular ||
+                position.bend_used_hinge_fallback) &&
+               (!position.bend_sign_flipped ||
+                position.bend_used_hinge_fallback) &&
+               (!position.correction_limited ||
+                position.max_correction_radians > 0.0f) &&
+               safe_stop_is_coherent &&
+               reachable_projection_matches;
+    };
+    const auto orientation_is_complete = [](
+        const G1FootOrientationResult& orientation,
+        const G1FootTarget& target,
+        const G1LegConfig& config) {
+        vec3 aligned_sole_normal;
+        vec3 normalized_target_normal;
+        double normal_alignment = 0.0;
+        const bool target_alignment_is_valid =
+            ik_checked_normalize(
+                normalized_target_normal,
+                target.desired_sole_normal) &&
+            ik_checked_quat_rotate(
+                aligned_sole_normal,
+                orientation.target_global_rotation,
+                config.sole_normal_local) &&
+            ik_checked_dot(
+                normal_alignment,
+                aligned_sole_normal,
+                normalized_target_normal) &&
+            normal_alignment >= 0.99999;
+        return orientation.applied &&
+               ik_quat_is_unit(
+                   orientation.target_global_rotation) &&
+               g1_ik_float_is_runtime_value(
+                   orientation.requested_correction_radians) &&
+               orientation.requested_correction_radians >= 0.0f &&
+               g1_ik_float_is_runtime_value(
+                   orientation.correction_radians) &&
+               orientation.correction_radians >= 0.0f &&
+               orientation.correction_radians <=
+                   orientation.requested_correction_radians &&
+               orientation.correction_radians <=
+                   config.max_correction_radians &&
+               orientation.safe_stop_requested ==
+                   orientation.correction_limited &&
+               (!orientation.correction_limited ||
+                (orientation.requested_correction_radians >=
+                     config.max_correction_radians &&
+                 orientation.correction_radians > 0.0f)) &&
+               (orientation.correction_limited ||
+                g1_ik_runtime_float_bits(
+                    orientation.requested_correction_radians) ==
+                    g1_ik_runtime_float_bits(
+                        orientation.correction_radians)) &&
+               target_alignment_is_valid;
+    };
+    const auto staged_constraints_pass = [](
+        const G1LegSolveResult& position,
+        const G1FootOrientationResult& orientation) {
+        return position.reachable &&
+               !position.correction_limited &&
+               !position.safe_stop_requested &&
+               g1_ik_contact_residual_is_converged(
+                   position.contact_residual_m) &&
+               !orientation.correction_limited &&
+               !orientation.safe_stop_requested;
+    };
+    const auto float_word_is_runtime_value = [](uint32_t bits) {
+        float value = 0.0f;
+        std::memcpy(&value, &bits, sizeof(value));
+        return g1_ik_float_is_runtime_value(value);
+    };
+    const auto selected_swing_is_valid = [
+        &float_word_is_runtime_value,
+        &work_is_at_least,
+        &work_is_within](
+        const G1FootFrameResult& foot) {
+        const G1SwingSelectionDiagnostic& selection =
+            foot.swing_selection;
+        if (selection.candidates_evaluated == 0U ||
+            selection.candidates_evaluated >
+                G1SwingLiftCandidateCount ||
+            selection.selected_index >=
+                selection.candidates_evaluated ||
+            selection.candidates_evaluated !=
+                selection.selected_index + 1U ||
+            selection.selected_index >=
+                G1SwingLiftCandidateCount) {
+            return false;
+        }
+        const G1SwingCandidateDiagnostic& selected =
+            selection.selected;
+        if (selected.candidate_index !=
+                selection.selected_index ||
+            selected.lift_bits !=
+                G1SwingLiftCandidateBits[
+                    selection.selected_index] ||
+            !float_word_is_runtime_value(
+                selected.materialized_command_y_bits) ||
+            selected.clearance_status != G1ClearanceOk ||
+            !selected.controller_constraints_passed ||
+            !selected.clearance_certified ||
+            !terrain_double_is_finite(selected.lower_margin_m) ||
+            selected.lower_margin_m < 0.0 ||
+            !terrain_double_is_finite(
+                selected.witness_upper_margin_m) ||
+            selected.witness_upper_margin_m <
+                selected.lower_margin_m) {
+            return false;
+        }
+        const volatile double certificate_width =
+            selected.witness_upper_margin_m -
+            selected.lower_margin_m;
+        if (!terrain_double_is_finite(certificate_width) ||
+            certificate_width < 0.0 ||
+            certificate_width >
+                G1ClearanceMaximumCertificateWidthM ||
+            !work_is_within(selected.clearance_work, 1U) ||
+            !work_is_within(
+                selection.total_clearance_work,
+                selection.candidates_evaluated) ||
+            !work_is_at_least(
+                selection.total_clearance_work,
+                selected.clearance_work)) {
+            return false;
+        }
+        float lift = 0.0f;
+        std::memcpy(
+            &lift, &selected.lift_bits, sizeof(lift));
+        float expected_y = 0.0f;
+        if (g1_apply_swing_lift_y(
+                expected_y, foot.target.sole_center.y, lift,
+                NULL, 0) != G1ClearanceOk ||
+            g1_ik_runtime_float_bits(expected_y) !=
+                selected.materialized_command_y_bits) {
+            return false;
+        }
+        for (int probe = 0; probe < 4; ++probe) {
+            for (int axis = 0; axis < 3; ++axis) {
+                if (!float_word_is_runtime_value(
+                        selected.actual_sphere_center_bits[
+                            probe][axis])) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+    const auto no_swing_is_valid = [
+        &candidate_is_canonical,
+        &work_is_within,
+        &position_is_canonical,
+        &orientation_is_canonical](
+        const G1FootFrameResult& foot) {
+        const G1SwingSelectionDiagnostic& selection =
+            foot.swing_selection;
+        return !foot.recorded_contact &&
+               selection.candidates_evaluated ==
+                   G1SwingLiftCandidateCount &&
+               selection.selected_index == G1SwingNoCandidate &&
+               candidate_is_canonical(selection.selected) &&
+               work_is_within(
+                   selection.total_clearance_work,
+                   G1SwingLiftCandidateCount) &&
+               position_is_canonical(foot.position) &&
+               orientation_is_canonical(foot.orientation);
+    };
+    const auto successful_foot_is_valid = [
+        &selection_is_canonical,
+        &position_is_complete,
+        &orientation_is_complete,
+        &staged_constraints_pass,
+        &selected_swing_is_valid](
+        const G1FootFrameResult& foot,
+        const G1LegConfig& config) {
+        if (!position_is_complete(foot.position, config) ||
+            !orientation_is_complete(
+                foot.orientation, foot.target, config) ||
+            !staged_constraints_pass(
+                foot.position, foot.orientation)) {
+            return false;
+        }
+        return foot.recorded_contact
+            ? selection_is_canonical(foot.swing_selection)
+            : selected_swing_is_valid(foot);
+    };
+    const auto rejecting_foot_is_valid = [
+        &selection_is_canonical,
+        &position_is_complete,
+        &orientation_is_complete,
+        &staged_constraints_pass,
+        &no_swing_is_valid](
+        const G1FootFrameResult& foot,
+        const G1LegConfig& config,
+        G1IkStopReason reason) {
+        if (reason == G1IkStopTargetUnreachable) {
+            return foot.recorded_contact &&
+                   selection_is_canonical(
+                       foot.swing_selection) &&
+                   position_is_complete(foot.position, config) &&
+                   orientation_is_complete(
+                       foot.orientation, foot.target, config) &&
+                   !staged_constraints_pass(
+                       foot.position, foot.orientation);
+        }
+        return reason == G1IkStopNoSwingCandidate &&
+               no_swing_is_valid(foot);
+    };
+
+    int reason = -1;
+    static_assert(
+        sizeof(G1IkStopReason) == sizeof(reason),
+        "G1 IK stop reason uses an exact int representation");
+    std::memcpy(
+        &reason,
+        &transaction.candidate_result.stop_reason,
+        sizeof(reason));
+    if (!transaction.initialized ||
+        !g1_ik_runtime_state_is_valid(
+            transaction.candidate_state) ||
+        !g1_ik_runtime_iteration_transcript_matches(transaction) ||
+        transaction.candidate_result.applied ||
+        !transaction.candidate_result.safe_stop_requested ||
+        reason <= G1IkStopNone ||
+        reason > G1IkStopPoseClearanceRejected ||
+        !float_is_positive_zero(
+            transaction.candidate_result
+                .max_correction_radians)) {
+        return g1_ik_runtime_fail(
+            error, error_capacity,
+            "G1 IK rejection snapshot has invalid common fields");
+    }
+
+    const G1LegConfig configs[2] = {
+        g1_left_leg_config(), g1_right_leg_config()
+    };
+    bool noncontact_base_target[2] = {false, false};
+    for (int foot_index = 0; foot_index < 2; ++foot_index) {
+        const G1FootIkState& foot_state =
+            transaction.candidate_state.feet[foot_index];
+        const G1FootFrameResult& foot =
+            transaction.candidate_result.feet[foot_index];
+        bool recorded_contact_provenance_is_valid = true;
+        bool noncontact_provenance_is_valid = true;
+        if (foot.recorded_contact) {
+            float expected_horizontal_drift = 0.0f;
+            bool expected_drift_limit_exceeded = false;
+            recorded_contact_provenance_is_valid =
+                g1_ik_vec3_bits_equal(
+                    foot.target.sole_center,
+                    foot_state.lock.lock_point) &&
+                g1_ik_vec3_bits_equal(
+                    foot.target.surface.point,
+                    foot_state.lock.lock_point) &&
+                g1_ik_vec3_bits_equal(
+                    foot.target.desired_sole_normal,
+                    foot.target.surface.normal) &&
+                g1_foot_horizontal_drift(
+                    expected_horizontal_drift,
+                    expected_drift_limit_exceeded,
+                    foot_state.lock.previous_input,
+                    foot_state.lock.lock_point) &&
+                g1_ik_runtime_float_bits(
+                    foot.target.horizontal_drift_m) ==
+                    g1_ik_runtime_float_bits(
+                        expected_horizontal_drift) &&
+                foot.target.drift_limit_exceeded ==
+                    expected_drift_limit_exceeded;
+        } else {
+            noncontact_base_target[foot_index] =
+                g1_ik_vec3_bits_equal(
+                    foot.target.sole_center,
+                    foot_state.lock.output_position) &&
+                g1_ik_runtime_float_bits(
+                    foot.target.surface.point.x) ==
+                    g1_ik_runtime_float_bits(
+                        foot_state.lock.previous_input.x) &&
+                g1_ik_runtime_float_bits(
+                    foot.target.surface.point.z) ==
+                    g1_ik_runtime_float_bits(
+                    foot_state.lock.previous_input.z);
+            noncontact_provenance_is_valid =
+                g1_ik_runtime_float_bits(
+                    foot.target.horizontal_drift_m) == 0U &&
+                !foot.target.drift_limit_exceeded &&
+                g1_ik_vec3_bits_equal(
+                    foot.target.desired_sole_normal,
+                    foot_state.baseline_sole_normal) &&
+                noncontact_base_target[foot_index];
+        }
+        if (!g1_foot_target_is_valid(foot.target) ||
+            !g1_ik_surface_target_is_valid(
+                foot.target.surface) ||
+            foot.recorded_contact != foot_state.lock.contact ||
+            foot.target.locked != foot_state.lock.locked ||
+            foot.target.position_active !=
+                foot_state.lock.position_active ||
+            foot.target.releasing != foot_state.lock.releasing ||
+            !recorded_contact_provenance_is_valid ||
+            !noncontact_provenance_is_valid ||
+            !defensive_is_canonical(foot.defensive_swing)) {
+            return g1_ik_runtime_fail(
+                error, error_capacity,
+                "G1 IK rejection snapshot has invalid foot provenance");
+        }
+    }
+
+    const G1IkFrameResult& result =
+        transaction.candidate_result;
+    bool checkpoint_valid = false;
+    if (checkpoint == G1IkRejectionAfterBegin) {
+        const bool begin_target_forms_are_valid =
+            result.stop_reason == G1IkStopFootprintBlocked
+                ? ((result.feet[0].recorded_contact ||
+                    noncontact_base_target[0]) &&
+                   (result.feet[1].recorded_contact ||
+                    noncontact_base_target[1]))
+                : ((!result.feet[0].recorded_contact ||
+                    !result.feet[1].recorded_contact) &&
+                   (!result.feet[1].recorded_contact
+                        ? noncontact_base_target[1]
+                        : (!result.feet[0].recorded_contact &&
+                           noncontact_base_target[0])));
+        checkpoint_valid =
+            transaction.next_foot == 0U &&
+            (result.stop_reason == G1IkStopFootprintBlocked ||
+             result.stop_reason ==
+                 G1IkStopLandingPatchUnavailable) &&
+            begin_target_forms_are_valid &&
+            foot_stage_is_canonical(result.feet[0]) &&
+            foot_stage_is_canonical(result.feet[1]);
+    } else if (checkpoint == G1IkRejectionAfterFoot0) {
+        checkpoint_valid =
+            transaction.next_foot == 1U &&
+            (result.stop_reason == G1IkStopTargetUnreachable ||
+             result.stop_reason == G1IkStopNoSwingCandidate) &&
+            rejecting_foot_is_valid(
+                result.feet[0], configs[0], result.stop_reason) &&
+            foot_stage_is_canonical(result.feet[1]);
+    } else {
+        checkpoint_valid =
+            transaction.next_foot == 2U &&
+            (result.stop_reason == G1IkStopTargetUnreachable ||
+             result.stop_reason == G1IkStopNoSwingCandidate) &&
+            successful_foot_is_valid(
+                result.feet[0], configs[0]) &&
+            rejecting_foot_is_valid(
+                result.feet[1], configs[1], result.stop_reason);
+    }
+    if (!checkpoint_valid) {
+        return g1_ik_runtime_fail(
+            error, error_capacity,
+            "G1 IK rejection snapshot does not match its checkpoint");
+    }
+
+    output = result;
+    return true;
+}
+
 static inline bool g1_ik_frame_finish(
     G1IkState& output_state,
     G1IkFrameResult& output_result,
@@ -1437,6 +2213,7 @@ static inline bool g1_ik_frame_finish(
         transaction.next_foot != 2 ||
         !g1_ik_runtime_state_is_valid(
             transaction.candidate_state) ||
+        !g1_ik_runtime_iteration_transcript_matches(transaction) ||
         !g1_ik_runtime_stop_reason_is_valid(
             transaction.candidate_result.stop_reason) ||
         !g1_dt_is_exact_25_hz(dt) ||
@@ -1495,6 +2272,8 @@ static inline bool g1_ik_frame_finish(
         const G1SwingSelectionDiagnostic& selection =
             candidate.candidate_result.feet[foot_index]
                 .swing_selection;
+        G1FootTarget final_target =
+            candidate.candidate_result.feet[foot_index].target;
         if (!candidate.candidate_result.feet[foot_index]
                  .recorded_contact) {
             if (selection.selected_index == G1SwingNoCandidate ||
@@ -1503,6 +2282,19 @@ static inline bool g1_ik_frame_finish(
                 return g1_ik_runtime_fail(
                     error, error_capacity,
                     "G1 IK final swing selection is incomplete");
+            }
+            float lift = 0.0f;
+            std::memcpy(
+                &lift,
+                &selection.selected.lift_bits,
+                sizeof(lift));
+            if (g1_apply_swing_lift_y(
+                    final_target.sole_center.y,
+                    final_target.sole_center.y,
+                    lift,
+                    error,
+                    error_capacity) != G1ClearanceOk) {
+                return false;
             }
             for (int probe = 0; probe < 4; ++probe) {
                 const uint32_t bits[3] = {
@@ -1522,6 +2314,19 @@ static inline bool g1_ik_frame_finish(
                     }
                 }
             }
+        }
+        if (!g1_ik_runtime_controller_constraints_pass(
+                candidate.candidate_result.feet[foot_index].position,
+                candidate.candidate_result.feet[foot_index].orientation,
+                global_positions(configs[foot_index].contact),
+                global_rotations(configs[foot_index].contact),
+                final_target,
+                configs[foot_index])) {
+            g1_ik_runtime_request_safe_stop(
+                candidate, G1IkStopTargetUnreachable);
+            output_result = candidate.candidate_result;
+            transaction = candidate;
+            return true;
         }
 
         G1SwingClearanceValidation defensive = {};

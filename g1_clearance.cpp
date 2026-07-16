@@ -4670,9 +4670,9 @@ static G1ClearanceStatus g1_clearance_leg_with_ledger(
     vec3 foot_centers[4] = {};
     for (int index = 0; index < 4; ++index) {
         const vec3 sphere_center =
-            global_positions(config.ankle) +
+            global_positions(config.contact) +
             quat_mul_vec3(
-                global_rotations(config.ankle),
+                global_rotations(config.contact),
                 config.foot_sphere_centers_local[index]);
         foot_centers[index] = sphere_center;
     }

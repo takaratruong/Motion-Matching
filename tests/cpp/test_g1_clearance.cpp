@@ -3974,21 +3974,21 @@ static Task5LockedLegGeometry task5_locked_leg_geometry()
 {
     Task5LockedLegGeometry geometry = {};
     geometry.foot_centers[0] = vec3(
-        float_from_bits(UINT32_C(0xbe4ccccd)),
-        float_from_bits(UINT32_C(0x3f051eb9)),
-        float_from_bits(UINT32_C(0xbccccccd)));
-    geometry.foot_centers[1] = vec3(
-        float_from_bits(UINT32_C(0xbe4ccccd)),
-        float_from_bits(UINT32_C(0x3f051eb9)),
+        float_from_bits(UINT32_C(0xbe19999a)),
+        float_from_bits(UINT32_C(0x3f2b851f)),
         float_from_bits(UINT32_C(0xbd99999a)));
+    geometry.foot_centers[1] = vec3(
+        float_from_bits(UINT32_C(0xbe19999a)),
+        float_from_bits(UINT32_C(0x3f2b851f)),
+        float_from_bits(UINT32_C(0xbccccccd)));
     geometry.foot_centers[2] = vec3(
-        float_from_bits(UINT32_C(0xbebd70a4)),
-        float_from_bits(UINT32_C(0x3f051eb9)),
-        float_from_bits(UINT32_C(0xbca3d70b)));
-    geometry.foot_centers[3] = vec3(
-        float_from_bits(UINT32_C(0xbebd70a4)),
-        float_from_bits(UINT32_C(0x3f051eb9)),
+        float_from_bits(UINT32_C(0x3ca3d708)),
+        float_from_bits(UINT32_C(0x3f2b851f)),
         float_from_bits(UINT32_C(0xbda3d70a)));
+    geometry.foot_centers[3] = vec3(
+        float_from_bits(UINT32_C(0x3ca3d708)),
+        float_from_bits(UINT32_C(0x3f2b851f)),
+        float_from_bits(UINT32_C(0xbca3d70b)));
     geometry.thigh_a = vec3(
         float_from_bits(UINT32_C(0xbeb33333)),
         float_from_bits(UINT32_C(0x3f9c28f6)),
@@ -4017,9 +4017,9 @@ static void task5_check_strict_transform_oracle(
 #ifndef __FAST_MATH__
     for (int index = 0; index < 4; ++index) {
         const vec3 transformed =
-            global_positions(config.ankle) +
+            global_positions(config.contact) +
             quat_mul_vec3(
-                global_rotations(config.ankle),
+                global_rotations(config.contact),
                 config.foot_sphere_centers_local[index]);
         check(task5_vec3_bits_same(
                   transformed, locked.foot_centers[index]),
@@ -4115,6 +4115,97 @@ static bool task5_leg_same(
            clearance_result_same(left.minimum, right.minimum);
 }
 
+static void task5_make_pose(
+    vec3 positions[G1_BoneCount],
+    quat rotations[G1_BoneCount]);
+
+static void test_task5_physical_foot_geometry_uses_contact_frame()
+{
+    heightfield field;
+    point_make_field(field, 17, 17, -1.0f, -1.0f, 0.125f);
+    for (int z = 0; z < field.nz; ++z) {
+        for (int x = 0; x < field.nx; ++x) {
+            field.heights(z * field.nx + x) =
+                static_cast<float>(3 * x + z) * 0.002f;
+        }
+    }
+
+    vec3 positions[G1_BoneCount];
+    quat rotations[G1_BoneCount];
+    task5_make_pose(positions, rotations);
+    const G1LegConfig config = g1_left_leg_config();
+    const quat identity(1.0f, 0.0f, 0.0f, 0.0f);
+    const quat half_turn_y(0.0f, 0.0f, 1.0f, 0.0f);
+    positions[config.contact] = positions[config.ankle];
+    rotations[config.ankle] = identity;
+    rotations[config.contact] = identity;
+
+    G1LegClearance identity_contact = {};
+    char error[256] = {};
+    check(g1_measure_leg_clearance(
+              identity_contact,
+              g1_pose_clearance_budget(),
+              field,
+              slice1d<vec3>(G1_BoneCount, positions),
+              slice1d<quat>(G1_BoneCount, rotations),
+              config,
+              error,
+              static_cast<int>(sizeof(error))) == G1ClearanceOk,
+          error[0] == '\0'
+              ? "identity contact-owner leg clearance succeeds"
+              : error);
+
+    rotations[config.contact] = half_turn_y;
+
+#ifndef __FAST_MATH__
+    vec3 contact_owned_centers[4] = {};
+    vec3 ankle_owned_centers[4] = {};
+    for (int probe = 0; probe < 4; ++probe) {
+        contact_owned_centers[probe] = positions[config.contact] +
+            quat_mul_vec3(
+                rotations[config.contact],
+                config.foot_sphere_centers_local[probe]);
+        ankle_owned_centers[probe] = positions[config.ankle] +
+            quat_mul_vec3(
+                rotations[config.ankle],
+                config.foot_sphere_centers_local[probe]);
+    }
+    const G1ClearanceResult expected = task5_direct_foot(
+        field,
+        contact_owned_centers,
+        config.foot_sphere_radius_m,
+        3);
+    const G1ClearanceResult stale_ankle_owned = task5_direct_foot(
+        field,
+        ankle_owned_centers,
+        config.foot_sphere_radius_m,
+        3);
+    check(!clearance_result_same(expected, stale_ankle_owned),
+          "asymmetric terrain discriminates contact-owned foot geometry from the fixed ankle frame");
+#endif
+
+    G1LegClearance actual = {};
+    error[0] = '\0';
+    check(g1_measure_leg_clearance(
+              actual,
+              g1_pose_clearance_budget(),
+              field,
+              slice1d<vec3>(G1_BoneCount, positions),
+              slice1d<quat>(G1_BoneCount, rotations),
+              config,
+              error,
+              static_cast<int>(sizeof(error))) == G1ClearanceOk,
+          error[0] == '\0'
+              ? "contact-owner leg clearance succeeds"
+              : error);
+#ifndef __FAST_MATH__
+    check(clearance_result_same(actual.foot, expected),
+          "clearance transforms all physical foot spheres from config.contact");
+#endif
+    check(!clearance_result_same(actual.foot, identity_contact.foot),
+          "rotating config.contact with a fixed ankle changes physical foot clearance");
+}
+
 static G1LegClearance task5_seed_leg(double base)
 {
     G1LegClearance output = {};
@@ -4156,6 +4247,7 @@ static void task5_make_pose(
     rotations[left.hip] = quat(0.0f, 1.0f, 0.0f, 0.0f);
     rotations[left.knee] = quat(0.0f, 0.0f, 0.0f, 1.0f);
     rotations[left.ankle] = quat(0.0f, 0.0f, 1.0f, 0.0f);
+    rotations[left.contact] = quat();
 
     const G1LegConfig right = g1_right_leg_config();
     positions[right.hip] = positions[left.hip];
@@ -4165,6 +4257,7 @@ static void task5_make_pose(
     rotations[right.hip] = quat(0.0f, 1.0f, 0.0f, 0.0f);
     rotations[right.knee] = quat(0.0f, 0.0f, 0.0f, 1.0f);
     rotations[right.ankle] = quat(0.0f, 0.0f, 1.0f, 0.0f);
+    rotations[right.contact] = quat();
 }
 
 static void test_task5_aggregate_certificates()
@@ -4475,6 +4568,7 @@ static void test_task5_aggregate_transactions()
 
 static int run_task5_aggregate_mode()
 {
+    test_task5_physical_foot_geometry_uses_contact_frame();
     test_task5_aggregate_certificates();
     test_task5_aggregate_transactions();
     return 0;
@@ -4749,7 +4843,7 @@ static void test_task5_actual_endpoint_rounding_trap()
     check(float_bits(config.swing_clearance_m) ==
               UINT32_C(0x3c75c28f) &&
               float_bits(config.foot_sphere_radius_m) ==
-              UINT32_C(0x3ca3d70a),
+              UINT32_C(0x3ba3d70a),
           "Task 5 rounding trap uses the locked target and radius bits");
 
     const vec3 previous[4] = {
@@ -4759,7 +4853,7 @@ static void test_task5_actual_endpoint_rounding_trap()
         vec3(0.75f, 1.0f, 0.75f)
     };
     vec3 actual[4] = {
-        vec3(0.50f, float_from_bits(UINT32_C(0x3d0f5c29)), 0.50f),
+        vec3(0.50f, float_from_bits(UINT32_C(0x3ca3d70b)), 0.50f),
         vec3(0.75f, 0.50f, 0.50f),
         vec3(0.50f, 0.50f, 0.75f),
         vec3(0.75f, 0.50f, 0.75f)
@@ -4786,10 +4880,10 @@ static void test_task5_actual_endpoint_rounding_trap()
     float materialized = float_from_bits(UINT32_C(0x41234567));
     check(g1_apply_swing_lift_y(
               materialized,
-              float_from_bits(UINT32_C(0x3d0f5c28)),
-              float_from_bits(UINT32_C(0x31000000)),
+              float_from_bits(UINT32_C(0x3ca3d70a)),
+              float_from_bits(UINT32_C(0x30800000)),
               NULL, 0) == G1ClearanceOk &&
-              float_bits(materialized) == UINT32_C(0x3d0f5c28) &&
+              float_bits(materialized) == UINT32_C(0x3ca3d70a) &&
               float_bits(materialized) + 1 == float_bits(actual[0].y),
           "Task 5 fake baseline-plus-lift endpoint is one ULP low");
     vec3 fake[4] = {actual[0], actual[1], actual[2], actual[3]};
@@ -5504,6 +5598,7 @@ int main(int argc, char** argv)
     test_task34_exact_dyadic_fallback();
     test_task34_public_kind2_winner();
     test_task5_aggregate_certificates();
+    test_task5_physical_foot_geometry_uses_contact_frame();
     test_task5_aggregate_transactions();
     test_task5_checked_history();
     test_task5_actual_center_swing();

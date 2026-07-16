@@ -53,6 +53,8 @@ class G1KinematicContractOwnershipTests(unittest.TestCase):
     def test_fixed_geometry_literals_have_one_production_owner(self):
         geometry_literals = (
             r"vec3\(-0\.05f, -0\.03f, -0\.025f\)",
+            r"vec3\(-0\.05f, -0\.03f, \+0\.025f\)",
+            r"vec3\(\+0\.12f, -0\.03f, -0\.030f\)",
             r"vec3\(\+0\.12f, -0\.03f, \+0\.030f\)",
             r"vec3\(-0\.078f, -0\.17f, 0\.0f\)",
             r"vec3\(0\.0f, -0\.28f, 0\.0f\)",
@@ -61,6 +63,33 @@ class G1KinematicContractOwnershipTests(unittest.TestCase):
             matches = production_matches(pattern)
             self.assertEqual(len(matches), 1, pattern)
             self.assertEqual(matches[0][0], CONTRACT.name)
+
+    def test_physical_foot_geometry_has_explicit_rev_provenance_and_contact_owner(self):
+        text = CONTRACT.read_text(encoding="utf-8")
+        self.assertIn("GRAIL rev physical collision geometry", text)
+        self.assertIn("config.contact is the ankle_roll physical owner", text)
+        self.assertRegex(
+            text,
+            r"config\.foot_sphere_radius_m\s*=\s*0\.005f\s*;",
+        )
+        self.assertEqual(
+            len(re.findall(r"vec3\([^,]+, -0\.03f, [^)]+\)", text)),
+            4,
+        )
+        self.assertRegex(
+            text,
+            r"config\.sole_points_local\[index\]\s*=\s*"
+            r"config\.foot_sphere_centers_local\[index\]\s*-\s*"
+            r"config\.sole_normal_local\s*\*\s*"
+            r"config\.foot_sphere_radius_m\s*;",
+        )
+
+        footprint = (ROOT / "g1_footprint_runtime.h").read_text(encoding="utf-8")
+        clearance = (ROOT / "g1_clearance.cpp").read_text(encoding="utf-8")
+        self.assertIn("global_positions(legs[foot_index].contact)", footprint)
+        self.assertIn("global_rotations(legs[foot_index].contact)", footprint)
+        self.assertIn("global_positions(config.contact) +", clearance)
+        self.assertIn("global_rotations(config.contact)", clearance)
 
 
 if __name__ == "__main__":

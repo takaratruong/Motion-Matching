@@ -113,8 +113,8 @@ struct PoseFixture
             positions[bone] = vec3(1.0f, 1.0f, 1.0f);
             rotations[bone] = quat(1.0f, 0.0f, 0.0f, 0.0f);
         }
-        positions[G1_LeftAnkle] = vec3(0.80f, 0.08f, 0.80f);
-        positions[G1_RightAnkle] = vec3(0.80f, 0.08f, 1.10f);
+        positions[G1_LeftToe] = vec3(0.80f, 0.08f, 0.80f);
+        positions[G1_RightToe] = vec3(0.80f, 0.08f, 1.10f);
     }
 
     slice1d<vec3> position_slice()
@@ -210,6 +210,103 @@ static void require_observation_failure_preserves(
 {
     check(actual == expected, message);
     check(same_bytes(output, before), message);
+}
+
+static void test_physical_foot_geometry_uses_contact_frame()
+{
+    TerrainFixture terrain(151, 151, 0.0f, 0.0f, 0.02f);
+    PoseFixture pose;
+    const G1LegConfig config = g1_left_leg_config();
+    const vec3 owner_position(0.80f, 0.20f, 0.80f);
+    const quat identity(1.0f, 0.0f, 0.0f, 0.0f);
+    const quat half_turn_y(0.0f, 0.0f, 1.0f, 0.0f);
+    pose.positions[config.ankle] = owner_position;
+    pose.positions[config.contact] = owner_position;
+    pose.rotations[config.ankle] = identity;
+    pose.rotations[config.contact] = identity;
+
+    G1FootprintObservation identity_observation = {};
+    char error[256] = {};
+    check(observe(
+              identity_observation,
+              g1_footprint_budget(),
+              terrain,
+              stationary_command(),
+              contact_schedule(false, false, false, false),
+              pose,
+              error,
+              static_cast<int>(sizeof(error))) == G1FootprintOk,
+          error[0] == '\0'
+              ? "identity contact-frame observation succeeds"
+              : error);
+
+    pose.rotations[config.contact] = half_turn_y;
+    G1FootprintObservation rotated_observation = {};
+    error[0] = '\0';
+    check(observe(
+              rotated_observation,
+              g1_footprint_budget(),
+              terrain,
+              stationary_command(),
+              contact_schedule(false, false, false, false),
+              pose,
+              error,
+              static_cast<int>(sizeof(error))) == G1FootprintOk,
+          error[0] == '\0'
+              ? "rotated contact-frame observation succeeds"
+              : error);
+
+    check(config.contact != config.ankle,
+          "physical contact owner is distinct from the ankle joint");
+    check(bits(config.foot_sphere_radius_m) == bits(0.005f),
+          "GRAIL rev physical proxy radius is exactly five millimetres");
+    for (int probe = 0; probe < 4; ++probe) {
+        check(bits(config.foot_sphere_centers_local[probe].y) ==
+                  bits(-0.03f) &&
+                  bits(config.sole_points_local[probe].y) ==
+                  bits(-0.035f),
+              "physical sphere and derived sole heights are exact");
+        const vec3 identity_sphere = owner_position +
+            quat_mul_vec3(
+                identity, config.foot_sphere_centers_local[probe]);
+        const vec3 rotated_sphere = owner_position +
+            quat_mul_vec3(
+                half_turn_y,
+                config.foot_sphere_centers_local[probe]);
+        const vec3 identity_sole = owner_position +
+            quat_mul_vec3(identity, config.sole_points_local[probe]);
+        const vec3 rotated_sole = owner_position +
+            quat_mul_vec3(half_turn_y, config.sole_points_local[probe]);
+        check(!same_vec3_bits(identity_sphere, rotated_sphere) &&
+                  !same_vec3_bits(identity_sole, rotated_sole),
+              "contact rotation discriminates every physical probe from the fixed ankle frame");
+        check(same_vec3_bits(
+                  identity_observation.feet[0].probes[probe]
+                      .current_sphere_center,
+                  identity_sphere) &&
+                  same_vec3_bits(
+                      identity_observation.feet[0].probes[probe]
+                          .current_sole_point,
+                      identity_sole),
+              "identity contact frame owns exact current physical geometry");
+        check(same_vec3_bits(
+                  rotated_observation.feet[0].probes[probe]
+                      .current_sphere_center,
+                  rotated_sphere) &&
+                  same_vec3_bits(
+                      rotated_observation.feet[0].probes[probe]
+                          .current_sole_point,
+                      rotated_sole) &&
+                  same_vec3_bits(
+                      rotated_observation.feet[0].probes[probe]
+                          .predicted_sphere_centers[0],
+                      rotated_sphere) &&
+                  same_vec3_bits(
+                      rotated_observation.feet[0].probes[probe]
+                          .predicted_sole_points[0],
+                      rotated_sole),
+              "rotated contact frame, not fixed ankle, owns footprint endpoints");
+    }
 }
 
 static void test_contact_schedule_exact_horizons_and_transaction()
@@ -398,8 +495,8 @@ static void test_six_heading_transport_and_phase_anchors()
     };
     TerrainFixture terrain(151, 151, 0.0f, 0.0f, 0.02f);
     PoseFixture pose;
-    pose.positions[G1_LeftAnkle] = vec3(1.0f, 0.08f, 1.0f);
-    pose.positions[G1_RightAnkle] = vec3(1.0f, 0.08f, 1.30f);
+    pose.positions[G1_LeftToe] = vec3(1.0f, 0.08f, 1.0f);
+    pose.positions[G1_RightToe] = vec3(1.0f, 0.08f, 1.30f);
     const G1LegConfig legs[] = {g1_left_leg_config(), g1_right_leg_config()};
 
     for (const quat heading : headings) {
@@ -424,14 +521,14 @@ static void test_six_heading_transport_and_phase_anchors()
         for (int foot = 0; foot < 2; ++foot) {
             for (int probe = 0; probe < 4; ++probe) {
                 const vec3 expected_current_sphere =
-                    pose.positions[legs[foot].ankle] +
+                    pose.positions[legs[foot].contact] +
                     quat_mul_vec3(
-                        pose.rotations[legs[foot].ankle],
+                        pose.rotations[legs[foot].contact],
                         legs[foot].foot_sphere_centers_local[probe]);
                 const vec3 expected_current_sole =
-                    pose.positions[legs[foot].ankle] +
+                    pose.positions[legs[foot].contact] +
                     quat_mul_vec3(
-                        pose.rotations[legs[foot].ankle],
+                        pose.rotations[legs[foot].contact],
                         legs[foot].sole_points_local[probe]);
                 check(same_vec3_bits(
                           observation.feet[foot].probes[probe]
@@ -515,8 +612,8 @@ static void test_lateral_split_and_centerline_invariance()
     TerrainFixture terrain;
     terrain.set_x_step(0.60f, 0.32f);
     PoseFixture pose;
-    pose.positions[G1_LeftAnkle] = vec3(0.63f, 0.40f, 0.80f);
-    pose.positions[G1_RightAnkle] = vec3(0.90f, 0.08f, 1.10f);
+    pose.positions[G1_LeftToe] = vec3(0.63f, 0.40f, 0.80f);
+    pose.positions[G1_RightToe] = vec3(0.90f, 0.08f, 1.10f);
     G1CommandSnapshot command = stationary_command(0.62f, 0.95f);
     G1FootprintObservation observation = {};
     check(observe(
@@ -561,8 +658,8 @@ static void test_exact_multilevel_threshold()
         TerrainFixture terrain;
         terrain.set_x_step(0.60f, heights[index]);
         PoseFixture pose;
-        pose.positions[G1_LeftAnkle] = vec3(0.63f, 0.08f, 0.80f);
-        pose.positions[G1_RightAnkle] = vec3(0.90f, 0.08f, 1.10f);
+        pose.positions[G1_LeftToe] = vec3(0.63f, 0.08f, 0.80f);
+        pose.positions[G1_RightToe] = vec3(0.90f, 0.08f, 1.10f);
         G1FootprintObservation observation = {};
         check(observe(
                   observation,
@@ -586,8 +683,8 @@ static void test_swept_interior_node_and_reversal_invariance()
 {
     TerrainFixture terrain(81, 81, 0.0f, 0.0f, 0.025f);
     PoseFixture pose;
-    pose.positions[G1_LeftAnkle] = vec3(0.75f, 0.08f, 0.80f);
-    pose.positions[G1_RightAnkle] = vec3(0.75f, 0.08f, 1.10f);
+    pose.positions[G1_LeftToe] = vec3(0.75f, 0.08f, 0.80f);
+    pose.positions[G1_RightToe] = vec3(0.75f, 0.08f, 1.10f);
     vec3 roots[] = {
         vec3(0.75f, 0.0f, 0.95f),
         vec3(0.90f, 0.0f, 0.95f),
@@ -623,10 +720,10 @@ static void test_swept_interior_node_and_reversal_invariance()
 
     PoseFixture reverse_pose;
     const vec3 displacement = roots[3] - roots[0];
-    reverse_pose.positions[G1_LeftAnkle] =
-        pose.positions[G1_RightAnkle] + displacement;
-    reverse_pose.positions[G1_RightAnkle] =
-        pose.positions[G1_LeftAnkle] + displacement;
+    reverse_pose.positions[G1_LeftToe] =
+        pose.positions[G1_RightToe] + displacement;
+    reverse_pose.positions[G1_RightToe] =
+        pose.positions[G1_LeftToe] + displacement;
     vec3 reverse_roots[] = {roots[3], roots[2], roots[1], roots[0]};
     const G1CommandSnapshot reverse_command =
         make_command(reverse_roots, rotations);
@@ -694,19 +791,19 @@ static void check_landing_case(bool down_step)
     PoseFixture pose;
     vec3 roots[4];
     if (down_step) {
-        pose.positions[G1_LeftAnkle] = vec3(0.65f, 0.40f, 0.80f);
+        pose.positions[G1_LeftToe] = vec3(0.65f, 0.40f, 0.80f);
         roots[0] = vec3(0.65f, 0.32f, 0.95f);
         roots[1] = vec3(0.75f, 0.32f, 0.95f);
         roots[2] = vec3(1.05f, 0.00f, 0.95f);
         roots[3] = vec3(1.20f, 0.00f, 0.95f);
     } else {
-        pose.positions[G1_LeftAnkle] = vec3(1.15f, 0.08f, 0.80f);
+        pose.positions[G1_LeftToe] = vec3(1.15f, 0.08f, 0.80f);
         roots[0] = vec3(1.15f, 0.00f, 0.95f);
         roots[1] = vec3(1.00f, 0.00f, 0.95f);
         roots[2] = vec3(0.55f, 0.32f, 0.95f);
         roots[3] = vec3(0.40f, 0.32f, 0.95f);
     }
-    pose.positions[G1_RightAnkle] = vec3(1.40f, 0.08f, 1.10f);
+    pose.positions[G1_RightToe] = vec3(1.40f, 0.08f, 1.10f);
     quat rotations[4] = {
         quat(1.0f, 0.0f, 0.0f, 0.0f),
         quat(1.0f, 0.0f, 0.0f, 0.0f),
@@ -772,8 +869,8 @@ static void test_landing_edges_and_discontinuity()
     TerrainFixture terrain(151, 151, 0.0f, 0.0f, 0.02f);
     terrain.set_x_step(0.80f, 0.32f);
     PoseFixture pose;
-    pose.positions[G1_LeftAnkle] = vec3(0.40f, 0.40f, 0.80f);
-    pose.positions[G1_RightAnkle] = vec3(1.30f, 0.08f, 1.10f);
+    pose.positions[G1_LeftToe] = vec3(0.40f, 0.40f, 0.80f);
+    pose.positions[G1_RightToe] = vec3(1.30f, 0.08f, 1.10f);
     vec3 roots[] = {
         vec3(0.40f, 0.32f, 0.95f),
         vec3(0.60f, 0.32f, 0.95f),
@@ -836,8 +933,8 @@ static void test_exact_landing_residual_threshold()
         TerrainFixture terrain(151, 151, 0.0f, 0.0f, 0.02f);
         terrain.set_x_step(0.80f, heights[index]);
         PoseFixture pose;
-        pose.positions[G1_LeftAnkle] = vec3(0.40f, 0.08f, 0.80f);
-        pose.positions[G1_RightAnkle] = vec3(1.30f, 0.08f, 1.10f);
+        pose.positions[G1_LeftToe] = vec3(0.40f, 0.08f, 0.80f);
+        pose.positions[G1_RightToe] = vec3(1.30f, 0.08f, 1.10f);
         vec3 roots[] = {
             vec3(0.40f, 0.0f, 0.95f),
             vec3(0.60f, 0.0f, 0.95f),
@@ -965,8 +1062,8 @@ static void test_landing_centroid_uses_authoritative_large_endpoint_axis()
           "authoritative G1HF/v2 accepts the large endpoint coordinate");
 
     PoseFixture pose;
-    pose.positions[G1_LeftAnkle] = vec3(endpoint_x, 0.08f, 0.80f);
-    pose.positions[G1_RightAnkle] = vec3(endpoint_x, 0.08f, 1.10f);
+    pose.positions[G1_LeftToe] = vec3(endpoint_x, 0.08f, 0.80f);
+    pose.positions[G1_RightToe] = vec3(endpoint_x, 0.08f, 1.10f);
     G1FootprintObservation output;
     poison(output);
     const G1FootprintObservation before = output;
@@ -1161,8 +1258,8 @@ static void test_failure_budget_alias_and_blocked_matrix()
         G1FootprintInvalidInput,
         "nonfinite command is transactional");
 
-    const vec3 saved_pose = pose.positions[G1_LeftAnkle];
-    pose.positions[G1_LeftAnkle].x =
+    const vec3 saved_pose = pose.positions[G1_LeftToe];
+    pose.positions[G1_LeftToe].x =
         std::numeric_limits<float>::quiet_NaN();
     poison(output);
     before = output;
@@ -1172,10 +1269,10 @@ static void test_failure_budget_alias_and_blocked_matrix()
         observe(output, g1_footprint_budget(), terrain, command, contacts, pose),
         G1FootprintInvalidInput,
         "nonfinite pose is transactional");
-    pose.positions[G1_LeftAnkle] = saved_pose;
+    pose.positions[G1_LeftToe] = saved_pose;
 
-    const quat saved_rotation = pose.rotations[G1_LeftAnkle];
-    pose.rotations[G1_LeftAnkle] = quat(2.0f, 0.0f, 0.0f, 0.0f);
+    const quat saved_rotation = pose.rotations[G1_LeftToe];
+    pose.rotations[G1_LeftToe] = quat(2.0f, 0.0f, 0.0f, 0.0f);
     poison(output);
     before = output;
     require_observation_failure_preserves(
@@ -1184,10 +1281,10 @@ static void test_failure_budget_alias_and_blocked_matrix()
         observe(output, g1_footprint_budget(), terrain, command, contacts, pose),
         G1FootprintInvalidInput,
         "nonunit pose rotation is transactional");
-    pose.rotations[G1_LeftAnkle] = saved_rotation;
+    pose.rotations[G1_LeftToe] = saved_rotation;
 
     PoseFixture arithmetic_pose;
-    arithmetic_pose.positions[G1_LeftAnkle].x =
+    arithmetic_pose.positions[G1_LeftToe].x =
         std::numeric_limits<float>::max();
     G1CommandSnapshot arithmetic_command = stationary_command();
     for (int sample = 0; sample < 4; ++sample) {
@@ -1210,8 +1307,8 @@ static void test_failure_budget_alias_and_blocked_matrix()
         "root transport arithmetic overflow is transactional");
 
     PoseFixture boundary_pose;
-    boundary_pose.positions[G1_LeftAnkle] = vec3(0.07f, 0.08f, 0.80f);
-    boundary_pose.positions[G1_RightAnkle] = vec3(0.30f, 0.08f, 1.10f);
+    boundary_pose.positions[G1_LeftToe] = vec3(0.07f, 0.08f, 0.80f);
+    boundary_pose.positions[G1_RightToe] = vec3(0.30f, 0.08f, 1.10f);
     vec3 boundary_roots[] = {
         vec3(0.07f, 0.0f, 0.95f),
         vec3(std::nextafter(0.07f, -std::numeric_limits<float>::infinity()),
@@ -1371,6 +1468,7 @@ int main(int argc, char** argv)
     check(argc == 1 || parity, "only optional --parity argument is accepted");
     static_assert(G1CommandTrajectorySampleCount == 4,
                   "footprint contract requires four command samples");
+    test_physical_foot_geometry_uses_contact_frame();
     test_contact_schedule_exact_horizons_and_transaction();
     test_six_heading_transport_and_phase_anchors();
     test_lateral_split_and_centerline_invariance();

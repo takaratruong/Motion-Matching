@@ -181,10 +181,10 @@ static void test_explicit_leg_geometry()
             check_vec3(
                 config.sole_points_local[probe],
                 sphere_centers[probe] -
-                    vec3(0.0f, 1.0f, 0.0f) * 0.02f,
+                    vec3(0.0f, 1.0f, 0.0f) * 0.005f,
                 "sphere-bottom sole probe");
         }
-        check(config.foot_sphere_radius_m == 0.02f,
+        check(config.foot_sphere_radius_m == 0.005f,
               "XML foot-sphere radius");
         check_vec3(
             config.thigh_start_local,
@@ -628,6 +628,9 @@ static bool g1_test_foot_target_same(
            left.releasing == right.releasing &&
            left.drift_limit_exceeded == right.drift_limit_exceeded &&
            g1_test_surface_same(left.surface, right.surface) &&
+           g1_test_vec3_same(
+               left.desired_sole_normal,
+               right.desired_sole_normal) &&
            g1_test_vec3_same(left.sole_center, right.sole_center) &&
            g1_test_float_same(
                left.horizontal_drift_m, right.horizontal_drift_m);
@@ -813,6 +816,18 @@ static void test_checked_surface_query()
 
 static void test_planted_lock_lifecycle()
 {
+    const G1FootTarget canonical_inactive = {};
+    check(g1_foot_target_is_valid(canonical_inactive),
+          "canonical inactive target sentinel is valid");
+    G1FootTarget signed_zero_inactive = canonical_inactive;
+    const uint32_t negative_zero_bits = UINT32_C(0x80000000);
+    std::memcpy(
+        &signed_zero_inactive.desired_sole_normal.x,
+        &negative_zero_bits,
+        sizeof(negative_zero_bits));
+    check(!g1_foot_target_is_valid(signed_zero_inactive),
+          "inactive target sentinel requires canonical positive-zero normals");
+
     heightfield field;
     g1_test_make_surface(field, 3, 3);
     for (int z = 0; z < 3; ++z) {
@@ -837,8 +852,8 @@ static void test_planted_lock_lifecycle()
     check(state.locked && state.position_active && !state.releasing &&
           target.locked && target.position_active && !target.releasing,
           "contact rising edge activates planted lock");
-    check(g1_test_vec3_same(target.sole_center, initial),
-          "rising-edge frame owns exact pre-transition output");
+    check(g1_test_vec3_same(target.sole_center, state.lock_point),
+          "rising-edge frame immediately owns exact world lock");
     check(state.lock_point.x == initial.x &&
           state.lock_point.z == initial.z,
           "rising edge freezes support XZ");
@@ -873,15 +888,14 @@ static void test_planted_lock_lifecycle()
           error);
     check(state.releasing && state.release_frames > 0,
           "release remains active across multiple frames");
-    const vec3 before_recontact = target.sole_center;
     check(g1_foot_lock_update(
               state, target, field, leg, released_input, true, dt,
               error, static_cast<int>(sizeof(error))),
           error);
     check(state.locked && state.position_active && !state.releasing,
           "recontact during release restores lock");
-    check(g1_test_vec3_same(target.sole_center, before_recontact),
-          "recontact transition is position-continuous");
+    check(g1_test_vec3_same(target.sole_center, state.lock_point),
+          "recontact immediately materializes its immutable world lock");
 
     check(g1_foot_lock_update(
               state, target, field, leg, released_input, false, dt,
@@ -945,6 +959,49 @@ static void test_planted_lock_lifecycle()
     check(!zero_offset_state.position_active &&
           !zero_offset_state.releasing,
           "zero-offset release settles after two stable updates");
+}
+
+static void test_planted_rising_edge_materializes_current_lock()
+{
+    heightfield field;
+    g1_test_make_surface(field, 3, 3);
+    field.heights.set(0.0f);
+    const G1LegConfig leg = g1_left_leg_config();
+    const float dt = 1.0f / 25.0f;
+    char error[256] = {};
+
+    // A matcher transition may change the source-pose sole on the same frame
+    // that recorded contact rises.  The immutable world lock must be acquired
+    // and materialized immediately at the current landing point; returning a
+    // stale displayed endpoint for one planted frame creates a delayed snap.
+    const vec3 displayed_sole(0.25f, 0.008f, 0.50f);
+    const vec3 matched_input(0.30f, 0.009f, 0.55f);
+    G1FootLockState state = {};
+    check(g1_foot_lock_reset(
+              state, displayed_sole,
+              error, static_cast<int>(sizeof(error))),
+          error);
+    G1FootTarget target = {};
+    check(g1_foot_lock_update(
+              state, target, field, leg, matched_input, true, dt,
+              error, static_cast<int>(sizeof(error))),
+          error);
+
+    check(state.lock_point.x == matched_input.x &&
+          state.lock_point.z == matched_input.z,
+          "rising contact acquires immutable lock at current landing point");
+    check(g1_test_vec3_same(target.sole_center, state.lock_point),
+          "rising contact immediately materializes immutable world lock");
+
+    const vec3 acquired_lock = state.lock_point;
+    check(g1_foot_lock_update(
+              state, target, field, leg, matched_input, true, dt,
+              error, static_cast<int>(sizeof(error))),
+          error);
+    check(g1_test_vec3_same(state.lock_point, acquired_lock),
+          "established contact retains displayed-sole world lock");
+    check(g1_test_vec3_same(target.sole_center, acquired_lock),
+          "established contact has no delayed acquisition snap");
 }
 
 static void test_planted_lock_drift_dt_and_rollback()
@@ -1201,6 +1258,7 @@ static bool g1_test_leg_solve_result_same(
            left.correction_limited == right.correction_limited &&
            left.safe_stop_requested == right.safe_stop_requested &&
            left.iterations == right.iterations &&
+           left.iteration_provenance == right.iteration_provenance &&
            g1_test_vec3_same(
                left.requested_ankle_target,
                right.requested_ankle_target) &&
@@ -1786,6 +1844,8 @@ static G1LegSolveResult g1_test_leg_result_sentinel()
     result.correction_limited = true;
     result.safe_stop_requested = true;
     result.iterations = 7;
+    result.iteration_provenance =
+        G1LegIterationBaselineFallback1;
     result.requested_ankle_target = vec3(1.0f, 2.0f, 3.0f);
     result.clamped_ankle_target = vec3(4.0f, 5.0f, 6.0f);
     result.hinge_axis_world = vec3(0.0f, 0.0f, -1.0f);
@@ -1937,11 +1997,18 @@ static void test_named_solver_success_and_bend_mapping()
     check(fixed_point_result.applied && fixed_point_result.reachable &&
           !fixed_point_result.correction_limited &&
           !fixed_point_result.safe_stop_requested &&
+          fixed_point_result.iteration_provenance ==
+              G1LegIterationDirect1 &&
           fixed_point_result.max_correction_radians == 0.0f &&
           g1_test_vec3_same(
               fixed_point_result.requested_ankle_target,
               fixed_point_result.clamped_ankle_target),
           "current ankle target is an explicit zero-correction no-op");
+    G1LegSolveResult forged_fallback = fixed_point_result;
+    forged_fallback.iteration_provenance =
+        G1LegIterationBaselineFallback1;
+    check(!g1_ik_leg_result_is_valid(forged_fallback),
+          "raw Direct1 sentinel cannot be relabeled as durable fallback provenance");
 
     g1_test_copy_g1_pose(fixed_point_pose, db.bone_rotations(0));
     fixed_point_pose(right.hip) = staged_right_hip;
@@ -2580,6 +2647,40 @@ static void test_named_contact_residual_contract()
               precise_over_limit),
           "contact convergence classifies the retained promoted residual");
 
+    array1d<vec3> refinement_globals;
+    array1d<quat> refinement_global_rotations;
+    g1_test_global_pose(
+        refinement_globals,
+        refinement_global_rotations,
+        db,
+        db.bone_rotations(0));
+    const G1LegConfig refinement_leg = g1_right_leg_config();
+    const vec3 refinement_target =
+        refinement_globals(refinement_leg.contact) +
+        vec3(-0.04f, 0.009f, -0.027f);
+    array1d<quat> refinement_pose = db.bone_rotations(0);
+    G1LegSolveResult refinement_result = {};
+    check(g1_apply_named_contact_position_ik(
+              refinement_pose,
+              db.bone_positions(0),
+              db.bone_rotations(0),
+              db.bone_parents,
+              refinement_leg,
+              refinement_target,
+              refinement_result,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+    check(refinement_result.reachable &&
+          !refinement_result.correction_limited &&
+          !refinement_result.safe_stop_requested &&
+          refinement_result.iterations == 1 &&
+          refinement_result.iteration_provenance ==
+              G1LegIterationContact1 &&
+          g1_ik_contact_residual_is_converged(
+              refinement_result.contact_residual_m),
+          "reachable contact terminates at the exact five-millimeter contract");
+
     array1d<quat> reference_pose = db.bone_rotations(0);
     G1LegSolveResult reference_result = {};
     check(g1_apply_named_position_ik(
@@ -2588,6 +2689,10 @@ static void test_named_contact_residual_contract()
               leg, vec3(-0.05f, -0.43f, 0.0f),
               reference_result, error, static_cast<int>(sizeof(error))),
           error);
+    check(reference_result.iterations == 1 &&
+              reference_result.iteration_provenance ==
+                  G1LegIterationDirect1,
+          "low-level named position solve owns Direct1 provenance");
     array1d<vec3> reference_global_positions;
     array1d<quat> reference_global_rotations;
     g1_test_global_pose(
@@ -2604,7 +2709,9 @@ static void test_named_contact_residual_contract()
               result, error, static_cast<int>(sizeof(error))),
           error);
     check(result.applied && result.iterations >= 1 &&
-          result.iterations <= 4,
+          result.iterations <= 4 &&
+          result.iteration_provenance >= G1LegIterationContact1 &&
+          result.iteration_provenance <= G1LegIterationContact4,
           "contact solve reports bounded iteration ownership");
     array1d<vec3> final_global_positions;
     array1d<quat> final_global_rotations;
@@ -2631,6 +2738,7 @@ static void test_named_contact_residual_contract()
               result, error, static_cast<int>(sizeof(error))),
           error);
     check(result.iterations == 4 && result.safe_stop_requested &&
+          result.iteration_provenance == G1LegIterationContact4 &&
           result.contact_residual_m > 0.005f,
           "unreachable contact commits closest result at four-iteration cap");
 
@@ -2648,6 +2756,309 @@ static void test_named_contact_residual_contract()
           g1_test_leg_solve_result_same(
               late_result, late_result_before),
           "later residual failure rolls back complete pose and result");
+}
+
+static void test_named_contact_live_baseline_continuity()
+{
+    database db;
+    make_g1_database(db);
+    const G1LegConfig leg = g1_right_leg_config();
+    char error[256] = {};
+
+    struct LivePoseBoneBits
+    {
+        int bone;
+        uint32_t position[3];
+        uint32_t rotation[4];
+    };
+    static const LivePoseBoneBits live_pose[] = {
+        {0,
+         {UINT32_C(0xbd6d5991), UINT32_C(0x00000000),
+          UINT32_C(0xbf35f28c)},
+         {UINT32_C(0x3f7ffe26), UINT32_C(0x00000000),
+          UINT32_C(0x3bf64db3), UINT32_C(0x00000000)}},
+        {1,
+         {UINT32_C(0xbb360d56), UINT32_C(0x3f4d5f92),
+          UINT32_C(0x3b7b6870)},
+         {UINT32_C(0x3f34f9d1), UINT32_C(0xbc7a09dc),
+          UINT32_C(0xbf34f812), UINT32_C(0xbc8a54ce)}},
+        {8,
+         {UINT32_C(0xa2a00000), UINT32_C(0xbdd25461),
+          UINT32_C(0x3d83ff69)},
+         {UINT32_C(0x3f7fff94), UINT32_C(0xa5380000),
+          UINT32_C(0xa29f8000), UINT32_C(0xbb6b3a19)}},
+        {9,
+         {UINT32_C(0xa3e00000), UINT32_C(0xbcf991bc),
+          UINT32_C(0x3d54fdf4)},
+         {UINT32_C(0x3f7f0248), UINT32_C(0xbc23be73),
+          UINT32_C(0xba65b243), UINT32_C(0x3db2dc43)}},
+        {10,
+         {UINT32_C(0x3ccccee6), UINT32_C(0xbdfe32a0),
+          UINT32_C(0xa3f40000)},
+         {UINT32_C(0x3f7fb0b6), UINT32_C(0xa4200000),
+          UINT32_C(0xbd496caa), UINT32_C(0xa31c0000)}},
+        {11,
+         {UINT32_C(0xbda04d98), UINT32_C(0xbe35989e),
+          UINT32_C(0x3b0cd48f)},
+         {UINT32_C(0x3f7c81b5), UINT32_C(0x24600000),
+          UINT32_C(0x22500000), UINT32_C(0xbe2896a4)}},
+        {12,
+         {UINT32_C(0x24200000), UINT32_C(0xbe999ae9),
+          UINT32_C(0xb8c610c6)},
+         {UINT32_C(0x3f7f910d), UINT32_C(0xa4c80000),
+          UINT32_C(0x22000000), UINT32_C(0x3d6e3d04)}},
+        {13,
+         {UINT32_C(0xa4318000), UINT32_C(0xbc8fd5cb),
+          UINT32_C(0xa38d0000)},
+         {UINT32_C(0x3f800000), UINT32_C(0x00000000),
+          UINT32_C(0x20800000), UINT32_C(0x21b00000)}}
+    };
+    for (const LivePoseBoneBits& value : live_pose) {
+        db.bone_positions(0, value.bone) = vec3(
+            g1_test_float_from_bits(value.position[0]),
+            g1_test_float_from_bits(value.position[1]),
+            g1_test_float_from_bits(value.position[2]));
+        db.bone_rotations(0, value.bone) = quat(
+            g1_test_float_from_bits(value.rotation[0]),
+            g1_test_float_from_bits(value.rotation[1]),
+            g1_test_float_from_bits(value.rotation[2]),
+            g1_test_float_from_bits(value.rotation[3]));
+    }
+
+    array1d<vec3> baseline_global_positions(G1_BoneCount);
+    array1d<quat> baseline_global_rotations(G1_BoneCount);
+    check(g1_ik_checked_forward_kinematics(
+              baseline_global_positions, baseline_global_rotations,
+              db.bone_positions(0), db.bone_rotations(0),
+              db.bone_parents, error, static_cast<int>(sizeof(error))),
+          error);
+    const vec3 expected_hip(
+        g1_test_float_from_bits(UINT32_C(0xbe42ca8c)),
+        g1_test_float_from_bits(UINT32_C(0x3f0e7408)),
+        g1_test_float_from_bits(UINT32_C(0xbf290acd)));
+    const vec3 expected_knee(
+        g1_test_float_from_bits(UINT32_C(0xbe4a3cc1)),
+        g1_test_float_from_bits(UINT32_C(0x3ebcc716)),
+        g1_test_float_from_bits(UINT32_C(0xbf354232)));
+    const vec3 expected_ankle(
+        g1_test_float_from_bits(UINT32_C(0xbe54b4f5)),
+        g1_test_float_from_bits(UINT32_C(0x3d9536c4)),
+        g1_test_float_from_bits(UINT32_C(0xbf41bc4d)));
+    const vec3 expected_contact(
+        g1_test_float_from_bits(UINT32_C(0xbe55834c)),
+        g1_test_float_from_bits(UINT32_C(0x3d62a9b4)),
+        g1_test_float_from_bits(UINT32_C(0xbf41f2a4)));
+    check(g1_test_vec3_same(
+              baseline_global_positions(leg.hip), expected_hip) &&
+          g1_test_vec3_same(
+              baseline_global_positions(leg.knee), expected_knee) &&
+          g1_test_vec3_same(
+              baseline_global_positions(leg.ankle), expected_ankle) &&
+          g1_test_vec3_same(
+              baseline_global_positions(leg.contact), expected_contact),
+          "live right-contact fixture reproduces exact baseline FK bits");
+
+    const vec3 desired_contact(
+        g1_test_float_from_bits(UINT32_C(0xbe555e61)),
+        g1_test_float_from_bits(UINT32_C(0x3d62eeee)),
+        g1_test_float_from_bits(UINT32_C(0xbf420c6b)));
+    double baseline_residual_precise_m = 0.0;
+    float baseline_residual_m = 0.0f;
+    check(ik_checked_distance_precise(
+              baseline_residual_precise_m, baseline_residual_m,
+              expected_contact, desired_contact) &&
+          baseline_residual_precise_m > 0.00042 &&
+          baseline_residual_precise_m < 0.00043 &&
+          g1_ik_contact_residual_is_converged_precise(
+              baseline_residual_precise_m),
+          "live desired contact is a converged nonzero 0.423 mm residual");
+
+    vec3 contact_offset;
+    vec3 within_limit_contact;
+    vec3 over_limit_contact;
+    vec3 live_reconstructed_ankle;
+    vec3 within_limit_reconstructed_ankle;
+    vec3 reconstructed_ankle;
+    check(ik_checked_vec3_subtract(
+              contact_offset, expected_contact, expected_ankle) &&
+          ik_checked_vec3_subtract(
+              live_reconstructed_ankle,
+              desired_contact, contact_offset) &&
+          ik_checked_vec3_add(
+              within_limit_contact, expected_contact,
+              vec3(0.0f, 0.002f, 0.0f)) &&
+          ik_checked_vec3_subtract(
+              within_limit_reconstructed_ankle,
+              within_limit_contact, contact_offset) &&
+          ik_checked_vec3_add(
+              over_limit_contact, expected_contact,
+              vec3(0.0f, 0.006f, 0.0f)) &&
+          ik_checked_vec3_subtract(
+              reconstructed_ankle, over_limit_contact, contact_offset),
+          "live and control targets reconstruct with checked math");
+    array1d<quat> output = db.bone_rotations(0);
+    G1LegSolveResult result = {};
+    check(g1_apply_named_contact_position_ik(
+              output, db.bone_positions(0), db.bone_rotations(0),
+              db.bone_parents, leg, within_limit_contact,
+              result, error, static_cast<int>(sizeof(error))),
+          error);
+    check(result.iterations == 1 && result.reachable &&
+          !result.correction_limited && !result.safe_stop_requested &&
+          !g1_test_vec3_same(
+              within_limit_reconstructed_ankle, expected_ankle) &&
+          g1_test_vec3_same(
+              result.requested_ankle_target,
+              within_limit_reconstructed_ankle),
+          "reachable two-millimeter contact adjustment is not suppressed");
+
+    double over_limit_residual_precise_m = 0.0;
+    float over_limit_residual_m = 0.0f;
+    check(ik_checked_distance_precise(
+              over_limit_residual_precise_m, over_limit_residual_m,
+              expected_contact, over_limit_contact) &&
+          !g1_ik_contact_residual_is_converged_precise(
+              over_limit_residual_precise_m),
+          "six-millimeter control remains outside convergence contract");
+    output = db.bone_rotations(0);
+    result = G1LegSolveResult{};
+    check(g1_apply_named_contact_position_ik(
+              output, db.bone_positions(0), db.bone_rotations(0),
+              db.bone_parents, leg, over_limit_contact,
+              result, error, static_cast<int>(sizeof(error))),
+          error);
+    check(result.iterations >= 1 &&
+          result.iterations <= G1ContactSolveMaximumIterations &&
+          result.iteration_provenance >= G1LegIterationContact1 &&
+          result.iteration_provenance <= G1LegIterationContact4 &&
+          result.reachable &&
+          !result.correction_limited && !result.safe_stop_requested &&
+          g1_ik_contact_residual_is_converged(
+              result.contact_residual_m) &&
+          g1_ik_contact_iterations_have_valid_provenance(result) &&
+          g1_test_vec3_same(
+              result.requested_ankle_target, reconstructed_ankle),
+          "reachable six-millimeter request resolves under the exact convergence contract");
+
+    output = db.bone_rotations(0);
+    result = G1LegSolveResult{};
+    check(g1_apply_named_contact_position_ik(
+              output, db.bone_positions(0), db.bone_rotations(0),
+              db.bone_parents, leg, desired_contact,
+              result, error, static_cast<int>(sizeof(error))),
+          error);
+    check(result.applied && result.iterations == 1 && !result.reachable &&
+          result.iteration_provenance == G1LegIterationContact1 &&
+          !result.correction_limited && result.safe_stop_requested &&
+          g1_ik_contact_residual_is_converged(
+              result.contact_residual_m) &&
+          g1_ik_contact_iterations_have_valid_provenance(result),
+          "generic live contact keeps its converged one-pass failure provenance");
+    check(g1_test_vec3_same(
+              result.requested_ankle_target,
+              live_reconstructed_ankle) &&
+          !g1_test_vec3_same(
+              result.requested_ankle_target,
+              result.clamped_ankle_target) &&
+          !g1_test_float_same(
+              result.raw_distance_m, result.clamped_distance_m),
+          "generic live reconstruction retains shell rejection evidence");
+
+    vec3 baseline_sole_normal;
+    vec3 baseline_sole_center;
+    check(ik_checked_quat_rotate(
+              baseline_sole_normal,
+              baseline_global_rotations(leg.contact),
+              leg.sole_normal_local) &&
+          ik_vec3_is_unit(baseline_sole_normal) &&
+          g1_ik_checked_physical_sole_centroid(
+              baseline_sole_center,
+              baseline_global_positions(leg.contact),
+              baseline_global_rotations(leg.contact),
+              leg),
+          "live recorded-contact fixture has an exact sole normal");
+    G1FootTarget recorded_target = {};
+    recorded_target.locked = true;
+    recorded_target.position_active = true;
+    recorded_target.surface.point = baseline_sole_center;
+    recorded_target.surface.normal = baseline_sole_normal;
+    recorded_target.desired_sole_normal = baseline_sole_normal;
+    recorded_target.sole_center = baseline_sole_center;
+    check(g1_foot_target_is_valid(recorded_target),
+          "live recorded-contact target is valid");
+
+    G1FootTarget rejected_target = recorded_target;
+    check(ik_checked_vec3_add(
+              rejected_target.sole_center, baseline_sole_center,
+              vec3(0.0f, -0.006f, 0.0f)),
+          "six-millimeter recorded-contact rejection is representable");
+    rejected_target.surface.point = rejected_target.sole_center;
+    G1IkRuntimeStagedCandidate rejected_recorded = {};
+    check(g1_ik_runtime_stage_recorded_contact(
+              rejected_recorded,
+              db.bone_positions(0), db.bone_rotations(0),
+              db.bone_parents, leg, rejected_target,
+              error, static_cast<int>(sizeof(error))),
+          error);
+    check(!rejected_recorded.passes &&
+          !rejected_recorded.position.reachable &&
+          rejected_recorded.position.safe_stop_requested &&
+          rejected_recorded.position.contact_residual_m > 0.005f,
+          "recorded contact over five millimeters retains rejection");
+
+    G1IkRuntimeStagedCandidate recorded = {};
+    check(g1_ik_runtime_stage_recorded_contact(
+              recorded,
+              db.bone_positions(0), db.bone_rotations(0),
+              db.bone_parents, leg, recorded_target,
+              error, static_cast<int>(sizeof(error))),
+          error);
+    check(recorded.passes && recorded.position.applied &&
+          recorded.position.iterations == 1 &&
+          recorded.position.reachable &&
+          !recorded.position.correction_limited &&
+          !recorded.position.safe_stop_requested &&
+          recorded.position.max_correction_radians == 0.0f &&
+          recorded.orientation.applied &&
+          !recorded.orientation.correction_limited &&
+          !recorded.orientation.safe_stop_requested,
+          "converged live recorded contact accepts the exact baseline solve");
+    check(g1_test_vec3_same(
+              recorded.position.requested_ankle_target,
+              expected_ankle) &&
+          g1_test_vec3_same(
+              recorded.position.requested_ankle_target,
+              recorded.position.clamped_ankle_target) &&
+          g1_test_float_same(
+              recorded.position.raw_distance_m,
+              recorded.position.clamped_distance_m),
+          "recorded fallback preserves reachable target and shell equality");
+    array1d<vec3> final_global_positions(G1_BoneCount);
+    array1d<quat> final_global_rotations(G1_BoneCount);
+    check(g1_ik_checked_forward_kinematics(
+              final_global_positions, final_global_rotations,
+              db.bone_positions(0),
+              slice1d<quat>(G1_BoneCount, recorded.rotations),
+              db.bone_parents,
+              error, static_cast<int>(sizeof(error))),
+          error);
+    double fresh_residual_precise_m = 0.0;
+    float fresh_residual_m = 0.0f;
+    vec3 final_sole_center;
+    check(g1_ik_checked_physical_sole_centroid(
+              final_sole_center,
+              final_global_positions(leg.contact),
+              final_global_rotations(leg.contact),
+              leg) &&
+          ik_checked_distance_precise(
+              fresh_residual_precise_m, fresh_residual_m,
+              final_sole_center, recorded_target.sole_center) &&
+          g1_test_float_same(
+              recorded.position.contact_residual_m,
+              fresh_residual_m) &&
+          g1_ik_contact_residual_is_converged_precise(
+              fresh_residual_precise_m),
+          "recorded fallback reports fresh committed FK residual");
 }
 
 static G1FootOrientationResult g1_test_orientation_result_sentinel()
@@ -3434,6 +3845,9 @@ using G1IkFinishSignature = bool (*)(
     G1IkState&, G1IkFrameResult&, G1IkFrameTransaction&,
     array1d<vec3>&, array1d<quat>&, const slice1d<int>,
     const heightfield&, float, char*, int);
+using G1IkRejectionSnapshotSignature = bool (*)(
+    G1IkFrameResult&, const G1IkFrameTransaction&,
+    G1IkRejectionCheckpoint, char*, int);
 using G1IkEvaluateSignature = bool (*)(
     array1d<vec3>&, array1d<quat>&, G1IkState&,
     const slice1d<vec3>, const slice1d<quat>, const slice1d<int>,
@@ -3465,6 +3879,10 @@ static_assert(std::is_same<decltype(&g1_ik_frame_stage_foot),
 static_assert(std::is_same<decltype(&g1_ik_frame_finish),
                            G1IkFinishSignature>::value,
               "runtime finish signature is fixed");
+static_assert(
+    std::is_same<decltype(&g1_ik_frame_rejection_snapshot),
+                 G1IkRejectionSnapshotSignature>::value,
+    "runtime rejection snapshot signature is exact and value-only");
 static_assert(std::is_same<decltype(&g1_ik_frame_evaluate),
                            G1IkEvaluateSignature>::value,
               "runtime evaluate signature is fixed");
@@ -3472,6 +3890,10 @@ static_assert(
     std::is_same<decltype(&g1_ik_stage_swing_candidate_for_test),
                  G1IkCandidateTestSignature>::value,
     "runtime test seam is exactly one diagnostic-only stage wrapper");
+static_assert(G1IkRejectionAfterBegin == 0 &&
+              G1IkRejectionAfterFoot0 == 1 &&
+              G1IkRejectionAfterFoot1 == 2,
+              "runtime rejection checkpoints have the exact public order");
 
 template<typename T, typename = void>
 struct G1RuntimeHasEnabledMember : std::false_type {};
@@ -3520,8 +3942,14 @@ static_assert(std::is_same<
                   G1IkState G1IkFrameTransaction::*>::value &&
               std::is_same<
                   decltype(&G1IkFrameTransaction::candidate_result),
-                  G1IkFrameResult G1IkFrameTransaction::*>::value,
-              "runtime transaction publishes the four fixed member types");
+                  G1IkFrameResult G1IkFrameTransaction::*>::value &&
+              std::is_same<
+                  decltype(
+                      &G1IkFrameTransaction::
+                          staged_iteration_provenance),
+                  G1LegIterationProvenance
+                      (G1IkFrameTransaction::*)[2]>::value,
+              "runtime transaction publishes the five fixed member types");
 static_assert(!G1RuntimeHasEnabledMember<G1IkFrameTransaction>::value &&
               !G1RuntimeHasTerminalSafeStopMember<
                   G1IkFrameTransaction>::value &&
@@ -3538,12 +3966,16 @@ static_assert(!G1RuntimeHasEnabledMember<G1IkFrameTransaction>::value &&
 static inline void g1_runtime_bind_published_transaction_shape(
     G1IkFrameTransaction& transaction)
 {
-    auto& [initialized, next_foot, candidate_state, candidate_result] =
-        transaction;
+    auto& [initialized,
+           next_foot,
+           candidate_state,
+           candidate_result,
+           staged_iteration_provenance] = transaction;
     (void)initialized;
     (void)next_foot;
     (void)candidate_state;
     (void)candidate_result;
+    (void)staged_iteration_provenance;
 }
 
 template<typename T>
@@ -3613,28 +4045,6 @@ struct G1RuntimeFixture
     G1IkState state;
 };
 
-static vec3 g1_runtime_sphere_center(
-    const G1RuntimeFixture& fixture,
-    const G1LegConfig& config,
-    int probe)
-{
-    return fixture.global_positions(config.ankle) +
-           quat_mul_vec3(
-               fixture.global_rotations(config.ankle),
-               config.foot_sphere_centers_local[probe]);
-}
-
-static vec3 g1_runtime_sole_point(
-    const G1RuntimeFixture& fixture,
-    const G1LegConfig& config,
-    int probe)
-{
-    return fixture.global_positions(config.ankle) +
-           quat_mul_vec3(
-               fixture.global_rotations(config.ankle),
-               config.sole_points_local[probe]);
-}
-
 #if defined(__GNUC__) || defined(__clang__)
 #define G1_IK_TEST_NOINLINE __attribute__((noinline))
 #elif defined(_MSC_VER)
@@ -3652,10 +4062,10 @@ g1_runtime_independent_foot_centers(
 {
     for (int probe = 0; probe < 4; ++probe) {
         const vec3 offset = quat_mul_vec3(
-            global_rotations(config.ankle),
+            global_rotations(config.contact),
             config.foot_sphere_centers_local[probe]);
         const vec3 center =
-            global_positions(config.ankle) + offset;
+            global_positions(config.contact) + offset;
         if (!g1_ik_vec3_is_runtime_value(offset) ||
             !g1_ik_vec3_is_runtime_value(center)) {
             return false;
@@ -3692,12 +4102,23 @@ static void g1_runtime_refresh_current_probes(G1RuntimeFixture& fixture)
         foot.landing_sample = UINT32_MAX;
         foot.encountered_walkability_class = 1;
         foot.predicted_landing_walkability_class = 0;
+        vec3 current_sphere_centers[4] = {};
+        vec3 current_sole_points[4] = {};
+        check(g1_footprint_materialize_current_geometry(
+                  current_sphere_centers,
+                  current_sole_points,
+                  fixture.global_positions(
+                      configs[foot_index].contact),
+                  fixture.global_rotations(
+                      configs[foot_index].contact),
+                  configs[foot_index]),
+              "runtime fixture uses the production current-foot materializer");
         for (int probe_index = 0; probe_index < 4; ++probe_index) {
             G1FootprintProbe& probe = foot.probes[probe_index];
-            probe.current_sphere_center = g1_runtime_sphere_center(
-                fixture, configs[foot_index], probe_index);
-            probe.current_sole_point = g1_runtime_sole_point(
-                fixture, configs[foot_index], probe_index);
+            probe.current_sphere_center =
+                current_sphere_centers[probe_index];
+            probe.current_sole_point =
+                current_sole_points[probe_index];
             G1SurfaceQueryStatus status = g1_surface_query_v2(
                 probe.current_surface,
                 fixture.field,
@@ -3944,6 +4365,19 @@ static void test_runtime_state_reset_and_footprint_preflight()
               fixture.state.feet[1].swing.initialized,
           "runtime reset initializes both lock and swing histories");
     for (int foot_index = 0; foot_index < 2; ++foot_index) {
+        const G1LegConfig config = foot_index == 0
+            ? g1_left_leg_config()
+            : g1_right_leg_config();
+        vec3 expected_normal;
+        check(ik_checked_quat_rotate(
+                  expected_normal,
+                  fixture.global_rotations(config.contact),
+                  config.sole_normal_local) &&
+                  g1_runtime_vec3_bits_same(
+                      fixture.state.feet[foot_index]
+                          .baseline_sole_normal,
+                      expected_normal),
+              "runtime reset owns exact baseline sole-normal bits");
         for (int probe = 0; probe < 4; ++probe) {
             check(g1_runtime_vec3_bits_same(
                       fixture.state.feet[foot_index]
@@ -4002,6 +4436,43 @@ static void test_runtime_state_reset_and_footprint_preflight()
 
 }
 
+static vec3 g1_runtime_expected_physical_sole_point_local(int probe)
+{
+    static const vec3 points[4] = {
+        vec3(-0.05f, -0.035f, -0.025f),
+        vec3(-0.05f, -0.035f, +0.025f),
+        vec3(+0.12f, -0.035f, -0.030f),
+        vec3(+0.12f, -0.035f, +0.030f)
+    };
+    check(probe >= 0 && probe < 4,
+          "physical sole oracle receives one of four probes");
+    return points[probe];
+}
+
+static bool g1_runtime_config_matches_physical_foot_contract(
+    const G1LegConfig& config)
+{
+    if (terrain_float_bits(config.foot_sphere_radius_m) !=
+        terrain_float_bits(0.005f)) {
+        return false;
+    }
+    for (int probe = 0; probe < 4; ++probe) {
+        const vec3 expected_sole =
+            g1_runtime_expected_physical_sole_point_local(probe);
+        const vec3 expected_center(
+            expected_sole.x, -0.03f, expected_sole.z);
+        if (!g1_runtime_vec3_bits_same(
+                config.foot_sphere_centers_local[probe],
+                expected_center) ||
+            !g1_runtime_vec3_bits_same(
+                config.sole_points_local[probe],
+                expected_sole)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static vec3 g1_runtime_current_sole_centroid(
     const G1RuntimeFixture& fixture,
     const G1LegConfig& config)
@@ -4010,8 +4481,18 @@ static vec3 g1_runtime_current_sole_centroid(
     volatile double sum_y = 0.0;
     volatile double sum_z = 0.0;
     for (int probe = 0; probe < 4; ++probe) {
-        const vec3 point =
-            g1_runtime_sole_point(fixture, config, probe);
+        vec3 offset;
+        vec3 point;
+        check(ik_checked_quat_rotate(
+                  offset,
+                  fixture.global_rotations(config.contact),
+                  g1_runtime_expected_physical_sole_point_local(probe)) &&
+                  ik_checked_vec3_add(
+                      point,
+                      fixture.global_positions(config.contact),
+                      offset) &&
+                  g1_ik_vec3_is_runtime_value(point),
+              "physical sole oracle contact-frame transform is finite");
         sum_x = sum_x + static_cast<double>(point.x);
         sum_y = sum_y + static_cast<double>(point.y);
         sum_z = sum_z + static_cast<double>(point.z);
@@ -4022,6 +4503,760 @@ static vec3 g1_runtime_current_sole_centroid(
               terrain_v2_round_output(sum_z / 4.0, output.z),
           "current sole centroid rounds through the checked v2 path");
     return output;
+}
+
+static bool g1_runtime_independent_sole_centroid(
+    vec3& output,
+    const slice1d<vec3> global_positions,
+    const slice1d<quat> global_rotations,
+    const G1LegConfig& config)
+{
+    if (global_positions.size != G1_BoneCount ||
+        global_rotations.size != G1_BoneCount ||
+        global_positions.data == NULL || global_rotations.data == NULL) {
+        return false;
+    }
+    volatile double sum_x = 0.0;
+    volatile double sum_y = 0.0;
+    volatile double sum_z = 0.0;
+    for (int probe = 0; probe < 4; ++probe) {
+        vec3 offset;
+        vec3 point;
+        if (!ik_checked_quat_rotate(
+                offset,
+                global_rotations(config.contact),
+                g1_runtime_expected_physical_sole_point_local(probe)) ||
+            !ik_checked_vec3_add(
+                point,
+                global_positions(config.contact),
+                offset) ||
+            !g1_ik_vec3_is_runtime_value(point)) {
+            return false;
+        }
+        sum_x = sum_x + static_cast<double>(point.x);
+        sum_y = sum_y + static_cast<double>(point.y);
+        sum_z = sum_z + static_cast<double>(point.z);
+    }
+    const volatile double centroid_x = sum_x / 4.0;
+    const volatile double centroid_y = sum_y / 4.0;
+    const volatile double centroid_z = sum_z / 4.0;
+    return terrain_v2_round_output(centroid_x, output.x) &&
+           terrain_v2_round_output(centroid_y, output.y) &&
+           terrain_v2_round_output(centroid_z, output.z);
+}
+
+static void test_runtime_coupled_physical_sole_orientation_contract()
+{
+    G1RuntimeFixture fixture;
+    g1_runtime_make_fixture(fixture);
+    const G1LegConfig config = g1_left_leg_config();
+    const float slope = 8.0f * PIf / 180.0f;
+    G1FootTarget target = {};
+    target.sole_center = fixture.global_positions(config.contact);
+    target.surface.point = target.sole_center;
+    target.surface.normal =
+        vec3(-std::sin(slope), std::cos(slope), 0.0f);
+    target.desired_sole_normal = target.surface.normal;
+
+    array1d<quat> legacy_pose = fixture.db.bone_rotations(0);
+    G1LegSolveResult legacy_position = {};
+    char error[512] = {};
+    check(g1_apply_named_contact_position_ik(
+              legacy_pose,
+              fixture.db.bone_positions(0),
+              fixture.db.bone_rotations(0),
+              fixture.db.bone_parents,
+              config,
+              target.sole_center,
+              legacy_position,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+    array1d<vec3> legacy_position_globals(G1_BoneCount);
+    array1d<quat> legacy_position_global_rotations(G1_BoneCount);
+    check(g1_ik_checked_forward_kinematics(
+              legacy_position_globals,
+              legacy_position_global_rotations,
+              fixture.db.bone_positions(0),
+              legacy_pose,
+              fixture.db.bone_parents,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+    G1FootOrientationResult legacy_orientation = {};
+    check(g1_apply_named_foot_orientation(
+              legacy_pose,
+              fixture.db.bone_positions(0),
+              fixture.db.bone_rotations(0),
+              fixture.db.bone_parents,
+              config,
+              target.surface.normal,
+              legacy_orientation,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+    array1d<vec3> legacy_final_globals(G1_BoneCount);
+    array1d<quat> legacy_final_global_rotations(G1_BoneCount);
+    check(g1_ik_checked_forward_kinematics(
+              legacy_final_globals,
+              legacy_final_global_rotations,
+              fixture.db.bone_positions(0),
+              legacy_pose,
+              fixture.db.bone_parents,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+    const bool legacy_joint_origin_invariance_would_pass =
+        g1_runtime_vec3_bits_same(
+            legacy_position_globals(config.contact),
+            legacy_final_globals(config.contact));
+
+    G1IkRuntimeStagedCandidate candidate = {};
+    check(g1_ik_runtime_stage_recorded_contact(
+              candidate,
+              fixture.db.bone_positions(0),
+              fixture.db.bone_rotations(0),
+              fixture.db.bone_parents,
+              config,
+              target,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+
+    array1d<vec3> final_globals(G1_BoneCount);
+    array1d<quat> final_global_rotations(G1_BoneCount);
+    const slice1d<vec3> candidate_positions(
+        G1_BoneCount, candidate.positions);
+    const slice1d<quat> candidate_rotations(
+        G1_BoneCount, candidate.rotations);
+    check(g1_ik_checked_forward_kinematics(
+              final_globals,
+              final_global_rotations,
+              candidate_positions,
+              candidate_rotations,
+              fixture.db.bone_parents,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+
+    quat frozen_target_rotation;
+    check(g1_surface_aligned_foot_rotation(
+              frozen_target_rotation,
+              fixture.global_rotations(config.contact),
+              config,
+              target.surface.normal,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+    const vec3 physical_local_centroid(0.035f, -0.035f, 0.0f);
+    vec3 frozen_offset;
+    vec3 expected_contact_origin;
+    check(ik_checked_quat_rotate(
+              frozen_offset,
+              frozen_target_rotation,
+              physical_local_centroid) &&
+              ik_checked_vec3_subtract(
+                  expected_contact_origin,
+                  target.sole_center,
+                  frozen_offset),
+          "coupled sole oracle derives contact origin from frozen rotation");
+
+    vec3 final_sole;
+    check(g1_runtime_independent_sole_centroid(
+              final_sole,
+              final_globals,
+              final_global_rotations,
+              config),
+          "coupled sole oracle materializes final contact-frame geometry");
+    double final_sole_residual = 0.0;
+    float final_sole_residual_f32 = 0.0f;
+    double final_origin_residual = 0.0;
+    float final_origin_residual_f32 = 0.0f;
+    check(ik_checked_distance_precise(
+              final_sole_residual,
+              final_sole_residual_f32,
+              final_sole,
+              target.sole_center) &&
+              ik_checked_distance_precise(
+                  final_origin_residual,
+                  final_origin_residual_f32,
+                  final_globals(config.contact),
+                  expected_contact_origin),
+          "coupled sole oracle measures final physical endpoints");
+
+    vec3 final_up;
+    vec3 final_forward;
+    const vec3 expected_heading = g1_test_projected_heading(
+        fixture.global_rotations(config.contact),
+        config,
+        target.surface.normal);
+    double normal_alignment = 0.0;
+    double heading_alignment = 0.0;
+    check(ik_checked_quat_rotate(
+              final_up,
+              final_global_rotations(config.contact),
+              config.sole_normal_local) &&
+              ik_checked_quat_rotate(
+                  final_forward,
+                  final_global_rotations(config.contact),
+                  config.foot_forward_local) &&
+              ik_checked_dot(
+                  normal_alignment,
+                  final_up,
+                  target.surface.normal) &&
+              ik_checked_dot(
+                  heading_alignment,
+                  final_forward,
+                  expected_heading),
+          "coupled sole oracle measures final orientation axes");
+
+    const bool physical_endpoint_converged =
+        g1_ik_contact_residual_is_converged_precise(
+            final_sole_residual);
+    const bool reported_residual_is_physical =
+        terrain_float_bits(candidate.position.contact_residual_m) ==
+            terrain_float_bits(final_sole_residual_f32);
+    const bool derived_contact_origin_converged =
+        g1_ik_contact_residual_is_converged_precise(
+            final_origin_residual);
+    if (!physical_endpoint_converged ||
+        !reported_residual_is_physical ||
+        !derived_contact_origin_converged) {
+        std::fprintf(
+            stderr,
+            "coupled-sole RED evidence: staged_passes=%d "
+            "joint_origin_invariant=%d physical_residual=%.9f "
+            "reported_residual=%.9f origin_residual=%.9f "
+            "normal_dot=%.9f heading_dot=%.9f\n",
+            candidate.passes ? 1 : 0,
+            legacy_joint_origin_invariance_would_pass ? 1 : 0,
+            final_sole_residual,
+            candidate.position.contact_residual_m,
+            final_origin_residual,
+            normal_alignment,
+            heading_alignment);
+    }
+    check(candidate.passes,
+          "bounded recorded slope transaction remains otherwise admissible");
+    check(candidate.position.iterations == 1 &&
+              candidate.position.iteration_provenance ==
+                  G1LegIterationContact1 &&
+              g1_ik_contact_iterations_have_valid_provenance(
+                  candidate.position),
+          "coupled sole keeps authentic Contact1 producer provenance");
+    for (int forged_iterations = 2;
+         forged_iterations <= G1ContactSolveMaximumIterations;
+         ++forged_iterations) {
+        G1LegSolveResult forged = candidate.position;
+        forged.iterations = forged_iterations;
+        check(!g1_ik_leg_result_is_valid(forged) &&
+                  !g1_ik_contact_iterations_have_valid_provenance(
+                      forged),
+              "coupled sole rejects every count-only Contact1 forgery");
+    }
+    const G1LegIterationProvenance forged_provenance[] = {
+        G1LegIterationNone,
+        G1LegIterationDirect1,
+        G1LegIterationContact2,
+        G1LegIterationContact3,
+        G1LegIterationContact4,
+        G1LegIterationBaselineFallback1,
+    };
+    for (G1LegIterationProvenance provenance : forged_provenance) {
+        G1LegSolveResult forged = candidate.position;
+        forged.iteration_provenance = provenance;
+        check(!g1_ik_leg_result_is_valid(forged) &&
+                  !g1_ik_contact_iterations_have_valid_provenance(
+                      forged),
+              "coupled sole rejects every enum-only Contact1 forgery");
+    }
+    check(legacy_joint_origin_invariance_would_pass,
+          "separate legacy control proves joint-origin invariance is insufficient");
+    check(normal_alignment >= 0.99999,
+          "coupled solve aligns the physical foot normal");
+    check(heading_alignment >= 0.99999,
+          "coupled solve preserves baseline foot heading");
+    check(derived_contact_origin_converged,
+          "coupled solve reaches C minus frozen-R times physical centroid");
+    check(physical_endpoint_converged,
+          "coupled solve keeps the final physical sole at the requested target");
+    check(reported_residual_is_physical,
+          "coupled solve reports the independently verified sole residual");
+}
+
+static void test_orientation_overwrite_preserves_contact_provenance()
+{
+    G1RuntimeFixture fixture;
+    g1_runtime_make_fixture(fixture);
+    const G1LegConfig config = g1_left_leg_config();
+    const vec3 current_sole =
+        g1_runtime_current_sole_centroid(fixture, config);
+    const float slope = -13.0f * PIf / 180.0f;
+    const vec3 desired_sole_center =
+        current_sole + vec3(0.014f, 0.014f, 0.0f);
+    const vec3 desired_normal(
+        -std::sin(slope), std::cos(slope), 0.0f);
+    array1d<quat> pose = fixture.db.bone_rotations(0);
+    G1LegSolveResult position;
+    G1FootOrientationResult orientation;
+    char error[512] = {};
+    check(g1_apply_named_physical_sole_ik(
+              pose,
+              fixture.db.bone_positions(0),
+              fixture.db.bone_rotations(0),
+              fixture.db.bone_parents,
+              config,
+              desired_sole_center,
+              desired_normal,
+              position,
+              orientation,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+    check(position.iterations == 1 &&
+              position.iteration_provenance ==
+                  G1LegIterationContact1 &&
+              position.correction_limited &&
+              orientation.correction_limited &&
+              position.contact_residual_m > 0.005f &&
+              g1_ik_leg_result_is_valid(position) &&
+              g1_ik_contact_iterations_have_valid_provenance(position),
+          "orientation-overwritten residual preserves authentic Contact1 provenance");
+}
+
+static void test_runtime_proxy_sole_lock_endpoint_contract()
+{
+    G1RuntimeFixture fixture;
+    g1_runtime_make_fixture(fixture);
+    const G1LegConfig config = g1_left_leg_config();
+    const vec3 identity_toe =
+        fixture.global_positions(config.contact);
+    const vec3 identity_sole =
+        g1_runtime_current_sole_centroid(fixture, config);
+    const bool config_matches_physical_contract =
+        g1_runtime_config_matches_physical_foot_contract(config);
+    array1d<quat> bend_baseline = fixture.db.bone_rotations(0);
+    for (int bend_step = 0; bend_step < 2; ++bend_step) {
+        array1d<vec3> bend_globals(G1_BoneCount);
+        array1d<quat> bend_global_rotations(G1_BoneCount);
+        char bend_error[256] = {};
+        check(g1_ik_checked_forward_kinematics(
+                  bend_globals,
+                  bend_global_rotations,
+                  fixture.db.bone_positions(0),
+                  bend_baseline,
+                  fixture.db.bone_parents,
+                  bend_error,
+                  static_cast<int>(sizeof(bend_error))),
+              bend_error);
+        array1d<quat> bent_pose = bend_baseline;
+        G1LegSolveResult bend_result = {};
+        check(g1_apply_named_position_ik(
+                  bent_pose,
+                  fixture.db.bone_positions(0),
+                  bend_baseline,
+                  fixture.db.bone_parents,
+                  config,
+                  bend_globals(config.ankle) +
+                      vec3(0.0f, 0.02f, 0.0f),
+                  bend_result,
+                  bend_error,
+                  static_cast<int>(sizeof(bend_error))) &&
+                  bend_result.reachable &&
+                  !bend_result.correction_limited &&
+                  !bend_result.safe_stop_requested,
+              "sole-lock regression incrementally bends a reachable leg");
+        std::memcpy(
+            bend_baseline.data,
+            bent_pose.data,
+            static_cast<size_t>(G1_BoneCount) * sizeof(quat));
+    }
+    std::memcpy(
+        fixture.db.bone_rotations(0).data,
+        bend_baseline.data,
+        static_cast<size_t>(G1_BoneCount) * sizeof(quat));
+    char error[512] = {};
+    check(g1_ik_checked_forward_kinematics(
+              fixture.global_positions,
+              fixture.global_rotations,
+              fixture.db.bone_positions(0),
+              fixture.db.bone_rotations(0),
+              fixture.db.bone_parents,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+    const vec3 current_toe =
+        fixture.global_positions(config.contact);
+    const vec3 current_sole =
+        g1_runtime_current_sole_centroid(fixture, config);
+
+    float terrain_height = 0.0f;
+    check(terrain_f32_sub(
+              terrain_height, current_toe.y, 0.035f),
+          "sole-lock regression constructs the checked flat surface");
+    fixture.field.heights.set(terrain_height);
+    g1_runtime_refresh_current_probes(fixture);
+    check(g1_ik_state_reset(
+              fixture.state,
+              fixture.db.bone_positions(0),
+              fixture.db.bone_rotations(0),
+              fixture.db.bone_parents,
+              error, static_cast<int>(sizeof(error))),
+          error);
+
+    const vec3 reset_input =
+        fixture.state.feet[0].lock.previous_input;
+    const bool reset_uses_proxy_sole =
+        g1_runtime_vec3_bits_same(reset_input, current_sole);
+    const bool reset_uses_toe =
+        g1_runtime_vec3_bits_same(reset_input, current_toe);
+
+    fixture.contact_values[0] = true;
+    g1_runtime_refresh_current_probes(fixture);
+    G1IkFrameTransaction rising = {};
+    array1d<vec3> scratch_positions;
+    array1d<quat> scratch_rotations;
+    g1_runtime_begin(
+        fixture, fixture.footprint, rising,
+        scratch_positions, scratch_rotations);
+    const vec3 rising_target =
+        rising.candidate_result.feet[0].target.sole_center;
+    const bool rising_is_exact_world_lock =
+        g1_runtime_vec3_bits_same(
+            rising_target,
+            rising.candidate_state.feet[0].lock.lock_point);
+    fixture.state = rising.candidate_state;
+
+    G1IkFrameTransaction established = {};
+    g1_runtime_begin(
+        fixture, fixture.footprint, established,
+        scratch_positions, scratch_rotations);
+    const vec3 established_target =
+        established.candidate_result.feet[0].target.sole_center;
+    float expected_lock_y = 0.0f;
+    check(terrain_f32_add(
+              expected_lock_y,
+              terrain_height,
+              config.planted_clearance_m),
+          "sole-lock regression constructs the checked planted clearance");
+    const bool established_is_exact_world_lock =
+        terrain_float_bits(established_target.y) ==
+            terrain_float_bits(expected_lock_y) &&
+        g1_runtime_vec3_bits_same(
+            established_target,
+            established.candidate_state.feet[0].lock.lock_point);
+    const bool established_normal_is_exact_terrain =
+        g1_runtime_vec3_bits_same(
+            established.candidate_result.feet[0]
+                .target.desired_sole_normal,
+            established.candidate_result.feet[0]
+                .target.surface.normal);
+
+    float target_jump_y = 0.0f;
+    check(terrain_f32_sub(
+              target_jump_y,
+              established_target.y,
+              rising_target.y),
+          "sole-lock regression measures the checked target jump");
+    const float sole_to_toe_x = identity_sole.x - identity_toe.x;
+    const float sole_to_toe_y = identity_sole.y - identity_toe.y;
+    const bool proxy_offset_is_exposed =
+        std::fabs(sole_to_toe_x - 0.035f) <= 1.0e-6f &&
+        std::fabs(sole_to_toe_y + 0.035f) <= 1.0e-6f;
+    const bool no_downward_thirty_mm_jump =
+        std::fabs(target_jump_y) < 0.005f;
+
+    check(g1_ik_frame_stage_foot(
+              established,
+              scratch_positions,
+              scratch_rotations,
+              0,
+              fixture.db.bone_parents,
+              slice1d<bool>(2, fixture.contact_values),
+              fixture.field,
+              fixture.footprint,
+              true,
+              0.04f,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+    array1d<vec3> solved_globals(G1_BoneCount);
+    array1d<quat> solved_global_rotations(G1_BoneCount);
+    check(g1_ik_checked_forward_kinematics(
+              solved_globals,
+              solved_global_rotations,
+              scratch_positions,
+              scratch_rotations,
+              fixture.db.bone_parents,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+    vec3 solved_sole;
+    check(g1_runtime_independent_sole_centroid(
+              solved_sole,
+              solved_globals,
+              solved_global_rotations,
+              config),
+          "recorded solve independently materializes the proxy sole");
+    double solved_residual = 0.0;
+    float solved_residual_f32 = 0.0f;
+    check(ik_checked_distance_precise(
+              solved_residual,
+              solved_residual_f32,
+              solved_sole,
+              established_target),
+          "recorded solve independently measures the proxy sole residual");
+    const G1LegSolveResult& recorded_position =
+        established.candidate_result.feet[0].position;
+    const bool recorded_stage_passes =
+        !established.candidate_result.safe_stop_requested &&
+        established.candidate_result.stop_reason == G1IkStopNone &&
+        recorded_position.applied &&
+        recorded_position.reachable &&
+        !recorded_position.correction_limited &&
+        !recorded_position.safe_stop_requested;
+    const bool reported_residual_matches_proxy_sole =
+        terrain_float_bits(recorded_position.contact_residual_m) ==
+            terrain_float_bits(solved_residual_f32);
+    const bool physical_sole_is_not_below_terrain =
+        solved_sole.y >= terrain_height;
+    const bool solver_residual_uses_proxy_sole =
+        solved_residual <= 0.005;
+
+    if (!config_matches_physical_contract ||
+        !reset_uses_proxy_sole ||
+        !rising_is_exact_world_lock ||
+        !no_downward_thirty_mm_jump ||
+        !recorded_stage_passes ||
+        !physical_sole_is_not_below_terrain ||
+        !solver_residual_uses_proxy_sole ||
+        !reported_residual_matches_proxy_sole) {
+        std::fprintf(
+            stderr,
+            "sole-centroid RED evidence: geometry_contract=%d reset_toe=%d "
+            "offset_x=%.9f offset_y=%.9f rising_y=%.9f "
+            "established_y=%.9f jump_y=%.9f solved_sole=(%.9f,%.9f,%.9f) "
+            "terrain_y=%.9f fresh_residual=%.9f reported_residual=%.9f "
+            "reachable=%d safe_stop=%d\n",
+            config_matches_physical_contract ? 1 : 0,
+            reset_uses_toe ? 1 : 0,
+            sole_to_toe_x,
+            sole_to_toe_y,
+            rising_target.y,
+            established_target.y,
+            target_jump_y,
+            solved_sole.x,
+            solved_sole.y,
+            solved_sole.z,
+            terrain_height,
+            solved_residual,
+            recorded_position.contact_residual_m,
+            recorded_position.reachable ? 1 : 0,
+            established.candidate_result.safe_stop_requested ? 1 : 0);
+    }
+    check(proxy_offset_is_exposed,
+          "physical contact-frame sole exposes exact 35 mm X/Y offsets");
+    check(config_matches_physical_contract,
+          "configured probes match the approved physical foot contract");
+    check(established_is_exact_world_lock,
+          "established contact remains the exact immutable world lock");
+    check(established_normal_is_exact_terrain,
+          "established contact retains the authoritative terrain normal");
+    check(reset_uses_proxy_sole,
+          "runtime reset binds lock history to the proxy sole centroid");
+    check(rising_is_exact_world_lock,
+          "rising contact immediately materializes the proxy-sole world lock");
+    check(no_downward_thirty_mm_jump,
+          "sole lock removes the synthetic thirty millimeter downward jump");
+    check(recorded_stage_passes,
+          "recorded sole endpoint remains reachable and commits without safe-stop");
+    check(physical_sole_is_not_below_terrain,
+          "recorded solve does not place the physical proxy sole below terrain");
+    check(solver_residual_uses_proxy_sole,
+          "recorded residual is measured from the physical proxy sole");
+    check(reported_residual_matches_proxy_sole,
+          "reported recorded residual equals independent physical sole FK");
+}
+
+static void test_runtime_ready_landing_preserves_current_swing_contract()
+{
+    G1RuntimeFixture fixture;
+    g1_runtime_make_fixture(fixture);
+    const G1LegConfig config = g1_left_leg_config();
+    fixture.db.bone_rotations(0, config.contact) =
+        quat_from_angle_axis(
+            -0.11f, vec3(0.0f, 0.0f, 1.0f));
+    char error[512] = {};
+    check(g1_ik_checked_forward_kinematics(
+              fixture.global_positions,
+              fixture.global_rotations,
+              fixture.db.bone_positions(0),
+              fixture.db.bone_rotations(0),
+              fixture.db.bone_parents,
+              error,
+              static_cast<int>(sizeof(error))) &&
+              g1_ik_state_reset(
+                  fixture.state,
+                  fixture.db.bone_positions(0),
+                  fixture.db.bone_rotations(0),
+                  fixture.db.bone_parents,
+                  error,
+                  static_cast<int>(sizeof(error))),
+          error);
+    g1_runtime_refresh_current_probes(fixture);
+
+    const vec3 current_sole =
+        g1_runtime_current_sole_centroid(fixture, config);
+    vec3 baseline_sole_normal;
+    check(ik_checked_quat_rotate(
+              baseline_sole_normal,
+              fixture.global_rotations(config.contact),
+              config.sole_normal_local) &&
+              ik_vec3_is_unit(baseline_sole_normal),
+          "pitched swing owns a checked baseline physical sole normal");
+    G1SurfaceTarget current_surface = {};
+    check(g1_surface_target_sample(
+              current_surface,
+              fixture.field,
+              current_sole.x,
+              current_sole.z,
+              config.planted_clearance_m,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+
+    float landing_surface_height = 0.0f;
+    check(terrain_f32_sub(
+              landing_surface_height,
+              current_sole.y,
+              0.082f),
+          "authentic-style landing fixture owns a checked 67 mm sole drop");
+    const vec3 predicted_landing(
+        current_sole.x + 0.096f,
+        current_sole.y,
+        current_sole.z);
+    const vec3 predicted_landing_normal(0.0f, 1.0f, 0.0f);
+    g1_runtime_set_landing(
+        fixture,
+        0,
+        true,
+        predicted_landing,
+        landing_surface_height,
+        predicted_landing_normal);
+    const G1RuntimeByteSnapshot<G1FootprintObservation>
+        footprint_before(fixture.footprint);
+
+    G1IkFrameTransaction transaction = {};
+    array1d<vec3> scratch_positions;
+    array1d<quat> scratch_rotations;
+    g1_runtime_begin(
+        fixture,
+        fixture.footprint,
+        transaction,
+        scratch_positions,
+        scratch_rotations);
+    const G1FootTarget& target =
+        transaction.candidate_result.feet[0].target;
+    const bool target_retains_baseline_normal =
+        g1_runtime_vec3_bits_same(
+            target.desired_sole_normal,
+            baseline_sole_normal);
+    const G1RuntimeByteSnapshot<G1IkFrameTransaction>
+        transaction_before_stage(transaction);
+
+    G1IkRuntimeStagedCandidate candidate = {};
+    check(g1_ik_runtime_stage_swing_candidate(
+              candidate,
+              scratch_positions,
+              scratch_rotations,
+              fixture.db.bone_parents,
+              transaction.candidate_state.feet[0].swing,
+              fixture.field,
+              config,
+              target,
+              0,
+              0.04f,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+    vec3 staged_sole_normal;
+    double staged_normal_alignment = 0.0;
+    check(ik_checked_quat_rotate(
+              staged_sole_normal,
+              candidate.orientation.target_global_rotation,
+              config.sole_normal_local) &&
+              ik_checked_dot(
+                  staged_normal_alignment,
+                  staged_sole_normal,
+                  baseline_sole_normal),
+          "staged pitched swing exposes its requested physical sole normal");
+
+    const bool target_retains_current_sole =
+        g1_runtime_vec3_bits_same(target.sole_center, current_sole);
+    const bool target_retains_current_surface =
+        g1_runtime_vec3_bits_same(
+            target.surface.point, current_surface.point) &&
+        g1_runtime_vec3_bits_same(
+            target.surface.normal, current_surface.normal);
+    const bool lookahead_is_immutable =
+        footprint_before.same(fixture.footprint) &&
+        g1_runtime_vec3_bits_same(
+            fixture.footprint.feet[0]
+                .predicted_landing_sole_center,
+            predicted_landing) &&
+        terrain_float_bits(
+            fixture.footprint.feet[0]
+                .predicted_landing_surface.height) ==
+            terrain_float_bits(landing_surface_height) &&
+        g1_runtime_vec3_bits_same(
+            fixture.footprint.feet[0]
+                .predicted_landing_surface.normal,
+            predicted_landing_normal);
+    const bool transaction_is_immutable =
+        transaction_before_stage.same(transaction);
+    const bool candidate_zero_preserves_pose =
+        candidate.passes &&
+        candidate.diagnostic.candidate_index == 0U &&
+        candidate.diagnostic.lift_bits == 0U &&
+        candidate.position.max_correction_radians == 0.0f &&
+        candidate.orientation.correction_radians == 0.0f &&
+        staged_normal_alignment >= 0.99999;
+    if (!target_retains_current_sole ||
+        !target_retains_current_surface ||
+        !target_retains_baseline_normal ||
+        !candidate_zero_preserves_pose) {
+        std::fprintf(
+            stderr,
+            "current-swing RED evidence: current=(%.9f,%.9f,%.9f) "
+            "target=(%.9f,%.9f,%.9f) landing=(%.9f,%.9f,%.9f) "
+            "position_correction=%.9f orientation_correction=%.9f "
+            "normal_dot=%.9f passes=%d\n",
+            current_sole.x,
+            current_sole.y,
+            current_sole.z,
+            target.sole_center.x,
+            target.sole_center.y,
+            target.sole_center.z,
+            predicted_landing.x,
+            landing_surface_height + config.swing_clearance_m,
+            predicted_landing.z,
+            candidate.position.max_correction_radians,
+            candidate.orientation.correction_radians,
+            staged_normal_alignment,
+            candidate.passes ? 1 : 0);
+    }
+    check(target_retains_current_sole,
+          "ready landing retains the current physical swing sole this frame");
+    check(target_retains_current_surface,
+          "ready landing retains the authoritative current terrain sample");
+    check(target_retains_baseline_normal,
+          "airborne swing retains its baseline physical sole normal");
+    check(lookahead_is_immutable,
+          "future landing remains immutable footprint lookahead only");
+    check(transaction_is_immutable,
+          "candidate staging leaves the current-frame transaction immutable");
+    check(candidate_zero_preserves_pose,
+          "clear pitched swing accepts candidate zero without pose correction");
 }
 
 static float g1_runtime_configure_real_step_landing(
@@ -4148,8 +5383,8 @@ static void test_runtime_blocked_and_landing_contract()
           "blocked footprint safe-stops without pose/state/history publication");
 
     G1FootprintObservation unready = fixture.footprint;
-    const vec3 ordinary =
-        fixture.global_positions(g1_left_leg_config().contact);
+    const vec3 ordinary = g1_runtime_current_sole_centroid(
+        fixture, g1_left_leg_config());
     g1_runtime_set_landing(
         fixture, 0, false,
         vec3(ordinary.x + 0.10f, ordinary.y, ordinary.z),
@@ -4206,9 +5441,12 @@ static void test_runtime_blocked_and_landing_contract()
             staged_foot.probes[probe].encountered_walkability_class = 1;
         }
         const uint32_t expected_surface_bits = direction < 0
-            ? UINT32_C(0x3e1c5048)
-            : UINT32_C(0x3f4aeb1c);
+            ? UINT32_C(0x3e19b1ba)
+            : UINT32_C(0x3f4a4378);
         float independently_offset = 0.0f;
+        const double expected_root_split_m = std::fabs(
+            static_cast<double>(current_centroid.y) -
+            static_cast<double>(landing_height));
         check((direction < 0
                    ? terrain_f32_sub(
                          independently_offset,
@@ -4219,14 +5457,14 @@ static void test_runtime_blocked_and_landing_contract()
                   terrain_float_bits(independently_offset) ==
                       terrain_float_bits(landing_height) &&
                   terrain_float_bits(current_centroid.y) ==
-                      UINT32_C(0x3ef1ff2e) &&
+                      UINT32_C(0x3ef0afe7) &&
                   terrain_float_bits(landing_height) ==
                       expected_surface_bits &&
                   staged_foot.encountered_walkability_class == 1 &&
                   staged_foot.predicted_landing_walkability_class == 1 &&
                   staged_foot.multilevel &&
                   staged_foot.maximum_root_split_m ==
-                      static_cast<double>(0.32f) &&
+                      expected_root_split_m &&
                   terrain_float_bits(staged_foot
                           .corridor_minimum_height) ==
                       terrain_float_bits(corridor_minimum) &&
@@ -4240,34 +5478,53 @@ static void test_runtime_blocked_and_landing_contract()
         g1_runtime_begin(
             staged_landing, staged_landing.footprint, transaction,
             scratch_positions, scratch_rotations);
-        float expected_y = 91.0f;
-        check(g1_apply_swing_lift_y(
-                  expected_y, landing_height,
-                  g1_left_leg_config().swing_clearance_m,
-                  error, static_cast<int>(sizeof(error))) ==
-                  G1ClearanceOk,
-              error);
+        G1SurfaceTarget current_surface = {};
+        vec3 current_sole_normal;
+        check(g1_surface_target_sample(
+                  current_surface,
+                  staged_landing.field,
+                  current_centroid.x,
+                  current_centroid.z,
+                  g1_left_leg_config().planted_clearance_m,
+                  error,
+                  static_cast<int>(sizeof(error))) &&
+                  ik_checked_quat_rotate(
+                      current_sole_normal,
+                      staged_landing.global_rotations(
+                          g1_left_leg_config().contact),
+                      g1_left_leg_config().sole_normal_local) &&
+                  g1_ik_surface_normal_is_valid(
+                      current_sole_normal),
+              "multilevel lookahead owns a checked current sole pose");
         const vec3 predicted = staged_landing.footprint.feet[0]
             .predicted_landing_sole_center;
         const vec3 landing_normal = staged_landing.footprint.feet[0]
             .predicted_landing_surface.normal;
         const G1FootTarget& target =
             transaction.candidate_result.feet[0].target;
-        check(terrain_float_bits(target.surface.point.x) ==
-                  terrain_float_bits(predicted.x) &&
-              terrain_float_bits(target.surface.point.z) ==
-                  terrain_float_bits(predicted.z) &&
-              terrain_float_bits(target.surface.point.y) ==
+        check(g1_runtime_vec3_bits_same(
+                  target.surface.point,
+                  current_surface.point) &&
+              g1_runtime_vec3_bits_same(
+                  target.surface.normal,
+                  current_surface.normal) &&
+              g1_runtime_vec3_bits_same(
+                  target.desired_sole_normal,
+                  current_sole_normal) &&
+              g1_runtime_vec3_bits_same(
+                  target.sole_center,
+                  current_centroid) &&
+              terrain_float_bits(predicted.y) ==
+                  terrain_float_bits(current_centroid.y) &&
+              terrain_float_bits(
+                  staged_landing.footprint.feet[0]
+                      .predicted_landing_surface.height) ==
                   terrain_float_bits(landing_height) &&
               g1_runtime_vec3_bits_same(
-                  target.surface.normal, landing_normal) &&
-              terrain_float_bits(target.sole_center.x) ==
-                  terrain_float_bits(predicted.x) &&
-              terrain_float_bits(target.sole_center.z) ==
-                  terrain_float_bits(predicted.z) &&
-              terrain_float_bits(target.sole_center.y) ==
-                  terrain_float_bits(expected_y),
-              "ready up/down landing replaces XZ, height, normal, and base Y");
+                  staged_landing.footprint.feet[0]
+                      .predicted_landing_surface.normal,
+                  landing_normal),
+              "ready up/down landing remains lookahead while current IK retains its sole pose");
 
         for (uint32_t candidate = 0;
              candidate < G1SwingLiftCandidateCount;
@@ -4287,12 +5544,12 @@ static void test_runtime_blocked_and_landing_contract()
                 sizeof(lift));
             float materialized_y = 0.0f;
             check(g1_apply_swing_lift_y(
-                      materialized_y, expected_y, lift,
+                      materialized_y, current_centroid.y, lift,
                       error, static_cast<int>(sizeof(error))) ==
                       G1ClearanceOk &&
                       diagnostic.materialized_command_y_bits ==
                           terrain_float_bits(materialized_y),
-                  "every real ladder stage adds once to the landing-aware base");
+                  "every real ladder stage adds once to the current-frame base");
         }
         check(g1_ik_frame_stage_foot(
                   transaction, scratch_positions, scratch_rotations, 0,
@@ -4304,7 +5561,7 @@ static void test_runtime_blocked_and_landing_contract()
                   transaction.next_foot == 1 &&
                   transaction.candidate_result.feet[0]
                       .swing_selection.candidates_evaluated > 0,
-              "real class-one multilevel up/down plateau reaches foot staging");
+              "real class-one multilevel lookahead permits current-frame foot staging");
     }
 
     g1_runtime_refresh_current_probes(fixture);
@@ -4403,9 +5660,16 @@ static G1FootTarget g1_runtime_current_target(
         : g1_right_leg_config();
     G1FootTarget target = {};
     target.sole_center =
-        fixture.global_positions(config.contact);
+        g1_runtime_current_sole_centroid(fixture, config);
     target.surface.point = target.sole_center;
     target.surface.normal = vec3(0.0f, 1.0f, 0.0f);
+    check(ik_checked_quat_rotate(
+              target.desired_sole_normal,
+              fixture.global_rotations(config.contact),
+              config.sole_normal_local) &&
+              g1_ik_surface_normal_is_valid(
+                  target.desired_sole_normal),
+          "current target owns the baseline physical sole normal");
     return target;
 }
 
@@ -4556,18 +5820,18 @@ static void g1_runtime_configure_finite_status(
     if (expected == G1ClearanceOutsideDomain) {
         fixture.field.nx = 5;
         fixture.field.nz = 5;
-        fixture.field.origin_x = 1.86f;
+        fixture.field.origin_x = 1.845f;
         fixture.field.origin_z = 1.95f;
         fixture.field.cell_size = 0.05f;
         fixture.field.heights.resize(25);
         fixture.field.heights.set(0.0f);
     } else if (expected == G1ClearanceBudgetExceeded) {
-        fixture.field.nx = 129;
-        fixture.field.nz = 129;
-        fixture.field.origin_x = 1.70f;
-        fixture.field.origin_z = 1.70f;
-        fixture.field.cell_size = 0.005f;
-        fixture.field.heights.resize(129 * 129);
+        fixture.field.nx = 257;
+        fixture.field.nz = 257;
+        fixture.field.origin_x = 1.84f;
+        fixture.field.origin_z = 1.90f;
+        fixture.field.cell_size = 0.001f;
+        fixture.field.heights.resize(257 * 257);
         fixture.field.heights.set(0.0f);
     } else {
         check(expected == G1ClearanceUncertified,
@@ -4683,7 +5947,7 @@ static void test_runtime_status_table_and_local_rejections()
 
     G1RuntimeFixture recovering;
     g1_runtime_make_fixture(recovering);
-    recovering.field.heights.set(0.458f);
+    recovering.field.heights.set(0.456f);
     for (int probe = 0; probe < 4; ++probe) {
         recovering.state.feet[0].swing
             .previous_sphere_centers[probe].y += 0.20f;
@@ -4712,26 +5976,38 @@ static void test_runtime_status_table_and_local_rejections()
                   recovery[0].clearance_work) &&
               g1_runtime_candidate_passes(recovery[1]),
           "real negative Ok certificate rejects locally before later recovery");
-    array1d<vec3> recovery_positions =
-        recovering.db.bone_positions(0);
-    array1d<quat> recovery_rotations =
-        recovering.db.bone_rotations(0);
-    G1IkFrameResult recovery_result = {};
+    G1IkFrameTransaction recovery_transaction = {};
+    array1d<vec3> recovery_positions;
+    array1d<quat> recovery_rotations;
     char error[256] = {};
-    check(g1_runtime_evaluate(
-              recovering, recovery_positions, recovery_rotations,
-              recovery_result,
-              error, static_cast<int>(sizeof(error))),
+    g1_runtime_begin(
+        recovering, recovering.footprint, recovery_transaction,
+        recovery_positions, recovery_rotations);
+    check(g1_ik_frame_stage_foot(
+              recovery_transaction,
+              recovery_positions,
+              recovery_rotations,
+              0,
+              recovering.db.bone_parents,
+              slice1d<bool>(2, recovering.contact_values),
+              recovering.field,
+              recovering.footprint,
+              true,
+              0.04f,
+              error,
+              static_cast<int>(sizeof(error))),
           error);
     G1ClearanceWork recovery_work = {};
     recovery_work = g1_runtime_work_add(
         recovery_work, recovery[0].clearance_work);
     recovery_work = g1_runtime_work_add(
         recovery_work, recovery[1].clearance_work);
-    check(recovery_result.applied &&
-              recovery_result.feet[0].swing_selection.selected_index == 1 &&
+    check(!recovery_transaction.candidate_result.safe_stop_requested &&
+              recovery_transaction.candidate_result.feet[0]
+                  .swing_selection.selected_index == 1 &&
               g1_runtime_work_same(
-                  recovery_result.feet[0].swing_selection
+                  recovery_transaction.candidate_result.feet[0]
+                      .swing_selection
                       .total_clearance_work,
                   recovery_work),
           "negative Ok work remains truthful and later real stage wins");
@@ -4743,6 +6019,14 @@ static void test_runtime_status_table_and_local_rejections()
         current[probe] = fatal_base.state.feet[0].swing
             .previous_sphere_centers[probe];
     }
+
+    G1RuntimeFixture invalid_baseline_normal;
+    g1_runtime_make_fixture(invalid_baseline_normal);
+    invalid_baseline_normal.state.feet[0]
+        .baseline_sole_normal = vec3();
+    g1_runtime_require_unchanged_failure(
+        invalid_baseline_normal,
+        "runtime rejects an invalid baseline sole-normal owner unchanged");
 
     G1SwingClearanceValidation strict_output;
     g1_runtime_poison_bytes(strict_output, 0x81);
@@ -4801,40 +6085,65 @@ static void test_runtime_status_table_and_local_rejections()
     const G1LegConfig config = g1_left_leg_config();
     const vec3 current_contact =
         controller.global_positions(config.contact);
+    vec3 current_sole;
+    check(g1_ik_checked_physical_sole_centroid(
+              current_sole,
+              current_contact,
+              controller.global_rotations(config.contact),
+              config),
+          "controller predicate fixture materializes physical sole");
+    G1FootTarget valid_target = {};
+    valid_target.sole_center = current_sole;
+    valid_target.surface.point = current_sole;
+    valid_target.surface.normal = vec3(0.0f, 1.0f, 0.0f);
+    valid_target.desired_sole_normal =
+        valid_target.surface.normal;
     array1d<quat> valid_pose = controller.db.bone_rotations(0);
     G1LegSolveResult valid_position = {};
-    check(g1_apply_named_contact_position_ik(
+    G1FootOrientationResult valid_orientation = {};
+    check(g1_apply_named_physical_sole_ik(
               valid_pose,
               controller.db.bone_positions(0),
               controller.db.bone_rotations(0),
               controller.db.bone_parents,
-              config, current_contact, valid_position,
+              config,
+              valid_target.sole_center,
+              valid_target.desired_sole_normal,
+              valid_position,
+              valid_orientation,
               error, static_cast<int>(sizeof(error))),
           error);
-    const array1d<quat> valid_orientation_baseline = valid_pose;
-    G1FootOrientationResult valid_orientation = {};
-    check(g1_apply_named_foot_orientation(
-              valid_pose,
-              controller.db.bone_positions(0),
-              valid_orientation_baseline,
+    array1d<vec3> valid_globals(G1_BoneCount);
+    array1d<quat> valid_global_rotations(G1_BoneCount);
+    check(g1_ik_checked_forward_kinematics(
+              valid_globals, valid_global_rotations,
+              controller.db.bone_positions(0), valid_pose,
               controller.db.bone_parents,
-              config, vec3(0.0f, 1.0f, 0.0f),
-              valid_orientation,
               error, static_cast<int>(sizeof(error))),
           error);
     check(g1_ik_runtime_controller_constraints_pass(
               valid_position, valid_orientation,
-              current_contact, current_contact),
+              valid_globals(config.contact),
+              valid_global_rotations(config.contact),
+              valid_target, config),
           "shared production controller predicate accepts real no-op geometry");
 
     array1d<quat> far_pose = controller.db.bone_rotations(0);
     G1LegSolveResult far_position = {};
-    check(g1_apply_named_contact_position_ik(
+    G1FootOrientationResult far_orientation = {};
+    G1FootTarget far_target = valid_target;
+    far_target.sole_center = vec3(3.0f, 0.0f, 0.0f);
+    far_target.surface.point = far_target.sole_center;
+    check(g1_apply_named_physical_sole_ik(
               far_pose,
               controller.db.bone_positions(0),
               controller.db.bone_rotations(0),
               controller.db.bone_parents,
-              config, vec3(3.0f, 0.0f, 0.0f), far_position,
+              config,
+              far_target.sole_center,
+              far_target.desired_sole_normal,
+              far_position,
+              far_orientation,
               error, static_cast<int>(sizeof(error))),
           error);
     // The checked contact solver converges reachable, unlimited results by
@@ -4846,8 +6155,10 @@ static void test_runtime_status_table_and_local_rejections()
               !g1_ik_contact_residual_is_converged(
                   far_position.contact_residual_m) &&
               !g1_ik_runtime_controller_constraints_pass(
-                  far_position, valid_orientation,
-                  current_contact, current_contact),
+                  far_position, far_orientation,
+                  current_contact,
+                  controller.global_rotations(config.contact),
+                  far_target, config),
           "real reach/residual result is rejected by the production predicate");
 
     array1d<vec3> far_globals(G1_BoneCount);
@@ -4860,39 +6171,59 @@ static void test_runtime_status_table_and_local_rejections()
           error);
 
     array1d<quat> steep_pose = controller.db.bone_rotations(0);
+    G1LegSolveResult steep_position = {};
     G1FootOrientationResult steep_orientation = {};
     const float steep = 45.0f * PIf / 180.0f;
-    check(g1_apply_named_foot_orientation(
+    G1FootTarget steep_target = valid_target;
+    steep_target.surface.normal =
+        vec3(-std::sin(steep), std::cos(steep), 0.0f);
+    steep_target.desired_sole_normal =
+        steep_target.surface.normal;
+    check(g1_apply_named_physical_sole_ik(
               steep_pose,
               controller.db.bone_positions(0),
               controller.db.bone_rotations(0),
               controller.db.bone_parents,
               config,
-              vec3(-std::sin(steep), std::cos(steep), 0.0f),
+              steep_target.sole_center,
+              steep_target.desired_sole_normal,
+              steep_position,
               steep_orientation,
+              error, static_cast<int>(sizeof(error))),
+          error);
+    array1d<vec3> steep_globals(G1_BoneCount);
+    array1d<quat> steep_global_rotations(G1_BoneCount);
+    check(g1_ik_checked_forward_kinematics(
+              steep_globals, steep_global_rotations,
+              controller.db.bone_positions(0), steep_pose,
+              controller.db.bone_parents,
               error, static_cast<int>(sizeof(error))),
           error);
     check(steep_orientation.correction_limited &&
               !g1_ik_runtime_controller_constraints_pass(
-                  valid_position, steep_orientation,
-                  current_contact, current_contact),
+                  steep_position, steep_orientation,
+                  steep_globals(config.contact),
+                  steep_global_rotations(config.contact),
+                  steep_target, config),
           "real correction-limited result is rejected by production predicate");
 
     check(!g1_ik_runtime_controller_constraints_pass(
               valid_position, valid_orientation,
-              current_contact, far_globals(config.contact)),
+              far_globals(config.contact),
+              far_global_rotations(config.contact),
+              valid_target, config),
           "distinct real FK endpoints exercise invariance rejection");
 
     G1RuntimeFixture controller_ladder;
     g1_runtime_make_fixture(controller_ladder);
-    const vec3 old_contact = controller_ladder.global_positions(
-        g1_left_leg_config().contact);
+    const vec3 old_sole = g1_runtime_current_sole_centroid(
+        controller_ladder, g1_left_leg_config());
     G1FootTarget established_target = {};
     check(g1_foot_lock_update(
               controller_ladder.state.feet[0].lock,
               established_target,
               controller_ladder.field,
-              g1_left_leg_config(), old_contact,
+              g1_left_leg_config(), old_sole,
               true, 0.04f,
               error, static_cast<int>(sizeof(error))),
           error);
@@ -4957,8 +6288,8 @@ static void test_runtime_all_41_and_two_foot_composition()
     G1RuntimeFixture composed;
     g1_runtime_make_fixture(composed);
     composed.field.heights.set(0.46f);
-    const vec3 old_left_contact =
-        composed.global_positions(g1_left_leg_config().contact);
+    const vec3 old_left_sole = g1_runtime_current_sole_centroid(
+        composed, g1_left_leg_config());
     G1FootTarget established = {};
     char error[256] = {};
     check(g1_foot_lock_update(
@@ -4966,7 +6297,7 @@ static void test_runtime_all_41_and_two_foot_composition()
               established,
               composed.field,
               g1_left_leg_config(),
-              old_left_contact,
+              old_left_sole,
               true, 0.04f,
               error, static_cast<int>(sizeof(error))),
           error);
@@ -5172,7 +6503,7 @@ static void test_runtime_landing_ladder_and_late_rollback()
 {
     G1RuntimeFixture late;
     g1_runtime_make_fixture(late);
-    late.field.heights.set(0.458f);
+    late.field.heights.set(0.456f);
     for (int foot = 0; foot < 2; ++foot) {
         for (int probe = 0; probe < 4; ++probe) {
             late.state.feet[foot].swing
@@ -5274,7 +6605,13 @@ static void test_runtime_lock_stage_order_and_command_invariance()
 {
     G1RuntimeFixture fixture;
     g1_runtime_make_fixture(fixture);
+    const G1LegConfig left = g1_left_leg_config();
+    const vec3 initial_sole =
+        g1_runtime_current_sole_centroid(fixture, left);
+    fixture.field.heights.set(
+        initial_sole.y - left.planted_clearance_m);
     fixture.contact_values[0] = true;
+    fixture.contact_values[1] = true;
     g1_runtime_refresh_current_probes(fixture);
     array1d<vec3> positions = fixture.db.bone_positions(0);
     array1d<quat> rotations = fixture.db.bone_rotations(0);
@@ -5313,6 +6650,25 @@ static void test_runtime_lock_stage_order_and_command_invariance()
 
     fixture.contact_values[0] = false;
     g1_runtime_refresh_current_probes(fixture);
+    const vec3 release_current_sole =
+        g1_runtime_current_sole_centroid(
+            fixture, g1_left_leg_config());
+    const vec3 future_release_landing(
+        release_current_sole.x + 0.10f,
+        release_current_sole.y,
+        release_current_sole.z);
+    g1_runtime_set_landing(
+        fixture, 0, true, future_release_landing,
+        0.0f, vec3(0.0f, 1.0f, 0.0f));
+    vec3 release_current_normal;
+    check(ik_checked_quat_rotate(
+              release_current_normal,
+              fixture.global_rotations(
+                  g1_left_leg_config().contact),
+              g1_left_leg_config().sole_normal_local) &&
+              g1_ik_surface_normal_is_valid(
+                  release_current_normal),
+          "release fixture owns its current physical sole normal");
     G1IkFrameTransaction release_transaction = {};
     array1d<vec3> release_positions;
     array1d<quat> release_rotations;
@@ -5321,8 +6677,25 @@ static void test_runtime_lock_stage_order_and_command_invariance()
         release_positions, release_rotations);
     check(release_transaction.candidate_state.feet[0].lock.releasing &&
               !release_transaction.candidate_result.feet[0]
-                   .recorded_contact,
-          "checked falling edge enters bounded release before swing staging");
+                   .recorded_contact &&
+              g1_runtime_vec3_bits_same(
+                  release_transaction.candidate_result.feet[0]
+                      .target.sole_center,
+                  release_transaction.candidate_state.feet[0]
+                      .lock.output_position) &&
+              !g1_runtime_vec3_bits_same(
+                  release_transaction.candidate_result.feet[0]
+                      .target.sole_center,
+                  future_release_landing) &&
+              g1_runtime_vec3_bits_same(
+                  release_transaction.candidate_result.feet[0]
+                      .target.desired_sole_normal,
+                  release_current_normal) &&
+              g1_runtime_vec3_bits_same(
+                  fixture.footprint.feet[0]
+                      .predicted_landing_sole_center,
+                  future_release_landing),
+          "checked falling edge retains bounded release pose while landing stays lookahead");
 
     G1RuntimeFixture ordered;
     g1_runtime_make_fixture(ordered);
@@ -5385,6 +6758,37 @@ static void test_runtime_lock_stage_order_and_command_invariance()
               true, 0.04f,
               error, static_cast<int>(sizeof(error))),
           error);
+    check(transaction.candidate_result.feet[0].position.applied &&
+              transaction.staged_iteration_provenance[0] ==
+                  transaction.candidate_result.feet[0]
+                      .position.iteration_provenance &&
+              g1_ik_runtime_iteration_transcript_matches(transaction),
+          "completed split stages retain producer-owned iteration provenance");
+    G1IkFrameTransaction forged_iteration_transcript = transaction;
+    forged_iteration_transcript.staged_iteration_provenance[0] =
+        G1LegIterationNone;
+    const G1RuntimeByteSnapshot<G1IkFrameTransaction>
+        forged_iteration_transcript_before(forged_iteration_transcript);
+    const array1d<vec3> scratch_positions_before_forged_finish =
+        scratch_positions;
+    const array1d<quat> scratch_rotations_before_forged_finish =
+        scratch_rotations;
+    check(!g1_ik_frame_finish(
+              output_state, output_result, forged_iteration_transcript,
+              scratch_positions, scratch_rotations,
+              ordered.db.bone_parents, ordered.field, 0.04f,
+              NULL, 0) &&
+              output_state_before.same(output_state) &&
+              output_result_before.same(output_result) &&
+              forged_iteration_transcript_before.same(
+                  forged_iteration_transcript) &&
+              g1_runtime_array_vec3_same(
+                  scratch_positions,
+                  scratch_positions_before_forged_finish) &&
+              g1_runtime_array_quat_same(
+                  scratch_rotations,
+                  scratch_rotations_before_forged_finish),
+          "finish rejects a transcript-only iteration provenance mutation transactionally");
     check(g1_ik_frame_finish(
               output_state, output_result, transaction,
               scratch_positions, scratch_rotations,
@@ -5420,6 +6824,12 @@ static void test_runtime_lock_stage_order_and_command_invariance()
               canonical_disabled_bytes.same(
                   disabled_transaction.candidate_result) &&
               disabled_transaction.next_foot == 0 &&
+              disabled_transaction.staged_iteration_provenance[0] ==
+                  G1LegIterationNone &&
+              disabled_transaction.staged_iteration_provenance[1] ==
+                  G1LegIterationNone &&
+              g1_ik_runtime_iteration_transcript_matches(
+                  disabled_transaction) &&
               g1_runtime_array_vec3_same(
                   disabled_positions,
                   disabled.db.bone_positions(0)) &&
@@ -5556,6 +6966,12 @@ static void test_runtime_lock_stage_order_and_command_invariance()
               canonical_disabled_bytes.same(
                   disabled_transaction.candidate_result) &&
               disabled_transaction.next_foot == 2 &&
+              disabled_transaction.staged_iteration_provenance[0] ==
+                  G1LegIterationNone &&
+              disabled_transaction.staged_iteration_provenance[1] ==
+                  G1LegIterationNone &&
+              g1_ik_runtime_iteration_transcript_matches(
+                  disabled_transaction) &&
               disabled_transaction.candidate_result.feet[0]
                       .swing_selection.candidates_evaluated == 0 &&
               disabled_transaction.candidate_result.feet[1]
@@ -5568,6 +6984,15 @@ static void test_runtime_lock_stage_order_and_command_invariance()
                   disabled_rotations,
                   disabled.db.bone_rotations(0)),
           "disabled split publishes the exact default result without state or pose");
+    G1IkFrameTransaction forged_disabled_transcript =
+        disabled_transaction;
+    forged_disabled_transcript.staged_iteration_provenance[0] =
+        G1LegIterationDirect1;
+    check(!g1_ik_runtime_iteration_transcript_matches(
+              forged_disabled_transcript) &&
+              !g1_ik_runtime_is_disabled_noop(
+                  forged_disabled_transcript),
+          "disabled split rejects every noncanonical iteration transcript");
 
     G1IkSafeStopHandoff handoff = {};
     check(g1_ik_safe_stop_handoff(
@@ -5635,6 +7060,1736 @@ static void test_runtime_lock_stage_order_and_command_invariance()
           "unknown stop reason is diagnostic-only invalid");
 }
 
+static bool g1_runtime_target_same(
+    const G1FootTarget& left, const G1FootTarget& right)
+{
+    return left.locked == right.locked &&
+           left.position_active == right.position_active &&
+           left.releasing == right.releasing &&
+           left.drift_limit_exceeded == right.drift_limit_exceeded &&
+           g1_runtime_vec3_bits_same(
+               left.surface.point, right.surface.point) &&
+           g1_runtime_vec3_bits_same(
+               left.surface.normal, right.surface.normal) &&
+           g1_runtime_vec3_bits_same(
+               left.desired_sole_normal,
+               right.desired_sole_normal) &&
+           g1_runtime_vec3_bits_same(
+               left.sole_center, right.sole_center) &&
+           terrain_float_bits(left.horizontal_drift_m) ==
+               terrain_float_bits(right.horizontal_drift_m);
+}
+
+static bool g1_runtime_rejection_candidate_same(
+    const G1SwingCandidateDiagnostic& left,
+    const G1SwingCandidateDiagnostic& right)
+{
+    if (left.candidate_index != right.candidate_index ||
+        left.lift_bits != right.lift_bits ||
+        left.materialized_command_y_bits !=
+            right.materialized_command_y_bits ||
+        left.clearance_status != right.clearance_status ||
+        left.controller_constraints_passed !=
+            right.controller_constraints_passed ||
+        left.clearance_certified != right.clearance_certified ||
+        g1_runtime_double_bits(left.lower_margin_m) !=
+            g1_runtime_double_bits(right.lower_margin_m) ||
+        g1_runtime_double_bits(left.witness_upper_margin_m) !=
+            g1_runtime_double_bits(right.witness_upper_margin_m) ||
+        !g1_runtime_work_same(
+            left.clearance_work, right.clearance_work)) {
+        return false;
+    }
+    for (int probe = 0; probe < 4; ++probe) {
+        for (int axis = 0; axis < 3; ++axis) {
+            if (left.actual_sphere_center_bits[probe][axis] !=
+                right.actual_sphere_center_bits[probe][axis]) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool g1_runtime_selection_same(
+    const G1SwingSelectionDiagnostic& left,
+    const G1SwingSelectionDiagnostic& right)
+{
+    return left.candidates_evaluated == right.candidates_evaluated &&
+           left.selected_index == right.selected_index &&
+           g1_runtime_rejection_candidate_same(
+               left.selected, right.selected) &&
+           g1_runtime_work_same(
+               left.total_clearance_work,
+               right.total_clearance_work);
+}
+
+static bool g1_runtime_defensive_same(
+    const G1SwingClearanceValidation& left,
+    const G1SwingClearanceValidation& right)
+{
+    return g1_runtime_double_bits(left.lower_margin_m) ==
+               g1_runtime_double_bits(right.lower_margin_m) &&
+           g1_runtime_double_bits(left.witness_upper_m) ==
+               g1_runtime_double_bits(right.witness_upper_m) &&
+           left.sweep_evaluated == right.sweep_evaluated &&
+           g1_runtime_work_same(left.work, right.work);
+}
+
+static bool g1_runtime_foot_result_same(
+    const G1FootFrameResult& left,
+    const G1FootFrameResult& right)
+{
+    return left.recorded_contact == right.recorded_contact &&
+           g1_runtime_target_same(left.target, right.target) &&
+           g1_runtime_selection_same(
+               left.swing_selection, right.swing_selection) &&
+           g1_runtime_defensive_same(
+               left.defensive_swing, right.defensive_swing) &&
+           g1_test_leg_solve_result_same(
+               left.position, right.position) &&
+           g1_test_orientation_result_same(
+               left.orientation, right.orientation);
+}
+
+static bool g1_runtime_frame_result_same(
+    const G1IkFrameResult& left,
+    const G1IkFrameResult& right)
+{
+    return left.applied == right.applied &&
+           left.safe_stop_requested == right.safe_stop_requested &&
+           left.stop_reason == right.stop_reason &&
+           terrain_float_bits(left.max_correction_radians) ==
+               terrain_float_bits(right.max_correction_radians) &&
+           g1_runtime_foot_result_same(left.feet[0], right.feet[0]) &&
+           g1_runtime_foot_result_same(left.feet[1], right.feet[1]);
+}
+
+static bool g1_runtime_target_is_real_base(
+    const G1IkFrameTransaction& transaction,
+    int foot_index)
+{
+    const G1FootTarget& target =
+        transaction.candidate_result.feet[foot_index].target;
+    const G1FootLockState& lock =
+        transaction.candidate_state.feet[foot_index].lock;
+    return g1_runtime_vec3_bits_same(
+               target.sole_center, lock.output_position) &&
+           terrain_float_bits(target.surface.point.x) ==
+               terrain_float_bits(lock.previous_input.x) &&
+           terrain_float_bits(target.surface.point.z) ==
+               terrain_float_bits(lock.previous_input.z) &&
+           terrain_float_bits(target.horizontal_drift_m) == 0U &&
+           !target.drift_limit_exceeded;
+}
+
+static bool g1_runtime_foot_stage_is_canonical(
+    const G1FootFrameResult& foot)
+{
+    const G1SwingSelectionDiagnostic selection = {};
+    const G1SwingClearanceValidation defensive = {};
+    const G1LegSolveResult position = {};
+    const G1FootOrientationResult orientation = {};
+    return g1_runtime_selection_same(
+               foot.swing_selection, selection) &&
+           g1_runtime_defensive_same(
+               foot.defensive_swing, defensive) &&
+           g1_test_leg_solve_result_same(
+               foot.position, position) &&
+           g1_test_orientation_result_same(
+               foot.orientation, orientation);
+}
+
+static bool g1_runtime_orientation_diagnostic_is_complete(
+    const G1FootOrientationResult& orientation)
+{
+    return orientation.applied &&
+           ik_quat_is_unit(orientation.target_global_rotation) &&
+           g1_ik_float_is_runtime_value(
+               orientation.requested_correction_radians) &&
+           orientation.requested_correction_radians >= 0.0f &&
+           g1_ik_float_is_runtime_value(
+               orientation.correction_radians) &&
+           orientation.correction_radians >= 0.0f;
+}
+
+static bool g1_runtime_completed_contact_is_successful(
+    const G1FootFrameResult& foot)
+{
+    return foot.recorded_contact &&
+           g1_foot_target_is_valid(foot.target) &&
+           g1_runtime_selection_same(
+               foot.swing_selection,
+               G1SwingSelectionDiagnostic{}) &&
+           g1_ik_leg_result_is_valid(foot.position) &&
+           foot.position.reachable &&
+           !foot.position.correction_limited &&
+           !foot.position.safe_stop_requested &&
+           g1_ik_contact_residual_is_converged(
+               foot.position.contact_residual_m) &&
+           g1_runtime_orientation_diagnostic_is_complete(
+               foot.orientation) &&
+           !foot.orientation.correction_limited &&
+           !foot.orientation.safe_stop_requested;
+}
+
+static bool g1_runtime_completed_swing_is_successful(
+    const G1FootFrameResult& foot)
+{
+    const G1SwingSelectionDiagnostic& selection =
+        foot.swing_selection;
+    return !foot.recorded_contact &&
+           g1_foot_target_is_valid(foot.target) &&
+           selection.candidates_evaluated > 0U &&
+           selection.candidates_evaluated <=
+               G1SwingLiftCandidateCount &&
+           selection.selected_index <
+               selection.candidates_evaluated &&
+           selection.selected.candidate_index ==
+               selection.selected_index &&
+           selection.selected.lift_bits ==
+               G1SwingLiftCandidateBits[
+                   selection.selected_index] &&
+           g1_runtime_candidate_passes(selection.selected) &&
+           g1_ik_leg_result_is_valid(foot.position) &&
+           foot.position.reachable &&
+           !foot.position.correction_limited &&
+           !foot.position.safe_stop_requested &&
+           g1_ik_contact_residual_is_converged(
+               foot.position.contact_residual_m) &&
+           g1_runtime_orientation_diagnostic_is_complete(
+               foot.orientation) &&
+           !foot.orientation.correction_limited &&
+           !foot.orientation.safe_stop_requested;
+}
+
+static void g1_runtime_stage_rejection_fixture_foot(
+    G1RuntimeFixture& fixture,
+    G1IkFrameTransaction& transaction,
+    array1d<vec3>& positions,
+    array1d<quat>& rotations,
+    uint32_t foot_index)
+{
+    char error[256] = {};
+    check(g1_ik_frame_stage_foot(
+              transaction, positions, rotations, foot_index,
+              fixture.db.bone_parents,
+              slice1d<bool>(2, fixture.contact_values),
+              fixture.field, fixture.footprint,
+              true, 0.04f,
+              error, static_cast<int>(sizeof(error))),
+          error);
+}
+
+static G1IkFrameTransaction g1_runtime_after_begin_rejection(
+    bool blocked)
+{
+    G1RuntimeFixture fixture;
+    g1_runtime_make_fixture(fixture);
+    if (blocked) {
+        fixture.footprint.blocked = true;
+        fixture.footprint.blocked_reason =
+            walkability_blocked_cell;
+    } else {
+        const vec3 current = fixture.global_positions(
+            g1_left_leg_config().contact);
+        g1_runtime_set_landing(
+            fixture, 0, false,
+            vec3(current.x + 0.10f, current.y, current.z),
+            0.0f, vec3(0.0f, 1.0f, 0.0f));
+    }
+    G1IkFrameTransaction transaction = {};
+    array1d<vec3> positions;
+    array1d<quat> rotations;
+    g1_runtime_begin(
+        fixture, fixture.footprint, transaction,
+        positions, rotations);
+    check(transaction.initialized && transaction.next_foot == 0U &&
+              !transaction.candidate_result.applied &&
+              transaction.candidate_result.safe_stop_requested &&
+              transaction.candidate_result.stop_reason ==
+                  (blocked
+                       ? G1IkStopFootprintBlocked
+                       : G1IkStopLandingPatchUnavailable) &&
+              terrain_float_bits(transaction.candidate_result
+                      .max_correction_radians) == 0U &&
+              g1_foot_target_is_valid(
+                  transaction.candidate_result.feet[0].target) &&
+              g1_foot_target_is_valid(
+                  transaction.candidate_result.feet[1].target) &&
+              g1_runtime_foot_stage_is_canonical(
+                  transaction.candidate_result.feet[0]) &&
+              g1_runtime_foot_stage_is_canonical(
+                  transaction.candidate_result.feet[1]) &&
+              g1_runtime_target_is_real_base(transaction, 1) &&
+              (!blocked ||
+               g1_runtime_target_is_real_base(transaction, 0)),
+          "genuine begin produces a canonical typed rejection");
+    return transaction;
+}
+
+static G1IkFrameTransaction g1_runtime_after_begin_releasing_rejection()
+{
+    G1RuntimeFixture fixture;
+    g1_runtime_make_fixture(fixture);
+    G1FootTarget established = {};
+    char error[256] = {};
+    check(g1_foot_lock_update(
+              fixture.state.feet[0].lock,
+              established,
+              fixture.field,
+              g1_left_leg_config(),
+              g1_runtime_current_sole_centroid(
+                  fixture, g1_left_leg_config()),
+              true, 0.04f,
+              error, static_cast<int>(sizeof(error))),
+          error);
+    fixture.footprint.blocked = true;
+    fixture.footprint.blocked_reason =
+        walkability_blocked_cell;
+    G1IkFrameTransaction transaction = {};
+    array1d<vec3> positions;
+    array1d<quat> rotations;
+    g1_runtime_begin(
+        fixture, fixture.footprint, transaction,
+        positions, rotations);
+    check(transaction.next_foot == 0U &&
+              transaction.candidate_result.stop_reason ==
+                  G1IkStopFootprintBlocked &&
+              transaction.candidate_state.feet[0].lock.releasing &&
+              transaction.candidate_state.feet[0]
+                  .lock.position_active &&
+              !transaction.candidate_result.feet[0]
+                   .recorded_contact &&
+              transaction.candidate_result.feet[0]
+                  .target.releasing &&
+              transaction.candidate_result.feet[0]
+                  .target.position_active,
+          "genuine blocked begin preserves releasing-foot provenance");
+    return transaction;
+}
+
+static G1IkFrameTransaction
+g1_runtime_after_begin_blocked_both_recorded()
+{
+    G1RuntimeFixture fixture;
+    g1_runtime_make_fixture(fixture);
+    fixture.contact_values[0] = true;
+    fixture.contact_values[1] = true;
+    g1_runtime_refresh_current_probes(fixture);
+    fixture.footprint.blocked = true;
+    fixture.footprint.blocked_reason =
+        walkability_blocked_cell;
+    G1IkFrameTransaction transaction = {};
+    array1d<vec3> positions;
+    array1d<quat> rotations;
+    g1_runtime_begin(
+        fixture, fixture.footprint, transaction,
+        positions, rotations);
+    check(transaction.next_foot == 0U &&
+              transaction.candidate_result.stop_reason ==
+                  G1IkStopFootprintBlocked &&
+              transaction.candidate_result.feet[0]
+                  .recorded_contact &&
+              transaction.candidate_result.feet[1]
+                  .recorded_contact,
+          "blocked begin authentically records both rising contacts");
+    return transaction;
+}
+
+static G1IkFrameTransaction
+g1_runtime_after_begin_foot1_unavailable()
+{
+    G1RuntimeFixture fixture;
+    g1_runtime_make_fixture(fixture);
+    const vec3 left = fixture.global_positions(
+        g1_left_leg_config().contact);
+    const vec3 right = g1_runtime_current_sole_centroid(
+        fixture, g1_right_leg_config());
+    g1_runtime_set_landing(
+        fixture, 0, true,
+        vec3(left.x + 0.10f, left.y, left.z),
+        0.0f, vec3(0.0f, 1.0f, 0.0f));
+    g1_runtime_set_landing(
+        fixture, 1, false,
+        vec3(right.x + 0.10f, right.y, right.z),
+        0.0f, vec3(0.0f, 1.0f, 0.0f));
+    G1IkFrameTransaction transaction = {};
+    array1d<vec3> positions;
+    array1d<quat> rotations;
+    g1_runtime_begin(
+        fixture, fixture.footprint, transaction,
+        positions, rotations);
+    check(transaction.next_foot == 0U &&
+              transaction.candidate_result.stop_reason ==
+                  G1IkStopLandingPatchUnavailable &&
+              !transaction.candidate_result.feet[0]
+                   .recorded_contact &&
+              !transaction.candidate_result.feet[1]
+                   .recorded_contact &&
+              g1_runtime_target_is_real_base(transaction, 0) &&
+              g1_runtime_target_is_real_base(transaction, 1),
+          "foot-zero ready lookahead retains its base before foot-one unavailable stop");
+    return transaction;
+}
+
+static G1IkFrameTransaction g1_runtime_after_foot0_no_swing()
+{
+    G1RuntimeFixture fixture;
+    g1_runtime_make_fixture(fixture);
+    g1_runtime_configure_finite_status(
+        fixture, G1ClearanceOutsideDomain);
+    G1IkFrameTransaction transaction = {};
+    array1d<vec3> positions;
+    array1d<quat> rotations;
+    g1_runtime_begin(
+        fixture, fixture.footprint, transaction,
+        positions, rotations);
+    g1_runtime_stage_rejection_fixture_foot(
+        fixture, transaction, positions, rotations, 0);
+    const G1FootFrameResult& rejected =
+        transaction.candidate_result.feet[0];
+    check(transaction.next_foot == 1U &&
+              transaction.candidate_result.stop_reason ==
+                  G1IkStopNoSwingCandidate &&
+              !rejected.recorded_contact &&
+              rejected.swing_selection.candidates_evaluated ==
+                  G1SwingLiftCandidateCount &&
+              rejected.swing_selection.selected_index ==
+                  G1SwingNoCandidate &&
+              g1_runtime_candidate_is_default(
+                  rejected.swing_selection.selected) &&
+              g1_test_leg_solve_result_same(
+                  rejected.position, G1LegSolveResult{}) &&
+              g1_test_orientation_result_same(
+                  rejected.orientation,
+                  G1FootOrientationResult{}) &&
+              g1_runtime_foot_stage_is_canonical(
+                  transaction.candidate_result.feet[1]),
+          "genuine foot-zero no-swing rejection is complete");
+    return transaction;
+}
+
+static G1IkFrameTransaction g1_runtime_after_foot0_unreachable(
+    bool planar_drift)
+{
+    G1RuntimeFixture fixture;
+    g1_runtime_make_fixture(fixture);
+    fixture.contact_values[0] = true;
+    char error[256] = {};
+    G1FootTarget established = {};
+    check(g1_foot_lock_update(
+              fixture.state.feet[0].lock,
+              established,
+              fixture.field,
+              g1_left_leg_config(),
+              g1_runtime_current_sole_centroid(
+                  fixture, g1_left_leg_config()),
+              true, 0.04f,
+              error, static_cast<int>(sizeof(error))),
+          error);
+    if (planar_drift) {
+        fixture.db.bone_positions(0, G1_Simulation).x += 3.0f;
+    } else {
+        fixture.db.bone_positions(0, G1_Simulation).y += 3.0f;
+    }
+    check(g1_ik_checked_forward_kinematics(
+              fixture.global_positions, fixture.global_rotations,
+              fixture.db.bone_positions(0),
+              fixture.db.bone_rotations(0),
+              fixture.db.bone_parents,
+              error, static_cast<int>(sizeof(error))),
+          error);
+    g1_runtime_refresh_current_probes(fixture);
+    G1IkFrameTransaction transaction = {};
+    array1d<vec3> positions;
+    array1d<quat> rotations;
+    g1_runtime_begin(
+        fixture, fixture.footprint, transaction,
+        positions, rotations);
+    g1_runtime_stage_rejection_fixture_foot(
+        fixture, transaction, positions, rotations, 0);
+    const G1FootFrameResult& rejected =
+        transaction.candidate_result.feet[0];
+    check(transaction.next_foot == 1U &&
+              transaction.candidate_result.stop_reason ==
+                  G1IkStopTargetUnreachable &&
+              rejected.recorded_contact &&
+              g1_runtime_selection_same(
+                  rejected.swing_selection,
+                  G1SwingSelectionDiagnostic{}) &&
+              g1_ik_leg_result_is_valid(rejected.position) &&
+              g1_runtime_orientation_diagnostic_is_complete(
+                  rejected.orientation) &&
+              (planar_drift
+                   ? (terrain_float_bits(
+                          rejected.target.horizontal_drift_m) != 0U &&
+                      rejected.target.horizontal_drift_m > 0.20f &&
+                      rejected.target.drift_limit_exceeded)
+                   : (terrain_float_bits(
+                          rejected.target.horizontal_drift_m) == 0U &&
+                      !rejected.target.drift_limit_exceeded)) &&
+              (!rejected.position.reachable ||
+               rejected.position.correction_limited ||
+               rejected.position.safe_stop_requested ||
+               !g1_ik_contact_residual_is_converged(
+                   rejected.position.contact_residual_m) ||
+               rejected.orientation.correction_limited ||
+               rejected.orientation.safe_stop_requested) &&
+              g1_runtime_foot_stage_is_canonical(
+                  transaction.candidate_result.feet[1]),
+          "genuine foot-zero established lock rejection is complete");
+    return transaction;
+}
+
+static G1IkFrameTransaction
+g1_runtime_after_foot0_fallback_orientation_residual()
+{
+    G1RuntimeFixture fixture;
+    g1_runtime_make_fixture(fixture);
+    fixture.db.bone_rotations(0, G1_LeftToe) =
+        quat_from_angle_axis(
+            -0.11f, vec3(0.0f, 0.0f, 1.0f));
+    char error[256] = {};
+    check(g1_ik_checked_forward_kinematics(
+              fixture.global_positions,
+              fixture.global_rotations,
+              fixture.db.bone_positions(0),
+              fixture.db.bone_rotations(0),
+              fixture.db.bone_parents,
+              error, static_cast<int>(sizeof(error))),
+          error);
+    const G1LegConfig left_config = g1_left_leg_config();
+    fixture.db.bone_positions(0, G1_Simulation).y +=
+        left_config.planted_clearance_m -
+        g1_runtime_current_sole_centroid(
+            fixture, left_config).y;
+    check(g1_ik_checked_forward_kinematics(
+              fixture.global_positions,
+              fixture.global_rotations,
+              fixture.db.bone_positions(0),
+              fixture.db.bone_rotations(0),
+              fixture.db.bone_parents,
+              error, static_cast<int>(sizeof(error))) &&
+              g1_ik_state_reset(
+                  fixture.state,
+                  fixture.db.bone_positions(0),
+                  fixture.db.bone_rotations(0),
+                  fixture.db.bone_parents,
+                  error, static_cast<int>(sizeof(error))),
+          error);
+    fixture.contact_values[0] = true;
+    g1_runtime_refresh_current_probes(fixture);
+    G1FootTarget established = {};
+    check(g1_foot_lock_update(
+              fixture.state.feet[0].lock,
+              established,
+              fixture.field,
+              left_config,
+              g1_runtime_current_sole_centroid(
+                  fixture, left_config),
+              true, 0.04f,
+              error, static_cast<int>(sizeof(error))),
+          error);
+
+    fixture.db.bone_positions(0, G1_Simulation).x += 0.0008f;
+    fixture.db.bone_positions(0, G1_Simulation).y += 0.00483f;
+    check(g1_ik_checked_forward_kinematics(
+              fixture.global_positions,
+              fixture.global_rotations,
+              fixture.db.bone_positions(0),
+              fixture.db.bone_rotations(0),
+              fixture.db.bone_parents,
+              error, static_cast<int>(sizeof(error))),
+          error);
+    g1_runtime_refresh_current_probes(fixture);
+    const vec3 fallback_ankle =
+        fixture.global_positions(left_config.ankle);
+    double fallback_baseline_residual_precise_m = DBL_MAX;
+    float fallback_baseline_residual_m = FLT_MAX;
+    check(ik_checked_distance_precise(
+              fallback_baseline_residual_precise_m,
+              fallback_baseline_residual_m,
+              g1_runtime_current_sole_centroid(
+                  fixture, left_config),
+              established.sole_center) &&
+              fallback_baseline_residual_precise_m > 0.0 &&
+              g1_ik_contact_residual_is_converged_precise(
+                  fallback_baseline_residual_precise_m) &&
+              g1_ik_contact_residual_is_converged(
+                  fallback_baseline_residual_m),
+          "fallback fixture baseline remains inside the physical residual contract");
+
+    G1IkFrameTransaction transaction = {};
+    array1d<vec3> positions;
+    array1d<quat> rotations;
+    g1_runtime_begin(
+        fixture, fixture.footprint, transaction,
+        positions, rotations);
+    g1_runtime_stage_rejection_fixture_foot(
+        fixture, transaction, positions, rotations, 0);
+    const G1FootFrameResult& rejected =
+        transaction.candidate_result.feet[0];
+    check(transaction.next_foot == 1U &&
+              transaction.candidate_result.stop_reason ==
+                  G1IkStopTargetUnreachable &&
+              rejected.recorded_contact &&
+              g1_runtime_selection_same(
+                  rejected.swing_selection,
+                  G1SwingSelectionDiagnostic{}) &&
+              rejected.position.applied &&
+              rejected.position.reachable &&
+              !rejected.position.correction_limited &&
+              rejected.position.safe_stop_requested &&
+              rejected.position.iterations == 1 &&
+              terrain_float_bits(
+                  rejected.position.max_correction_radians) == 0U &&
+              g1_runtime_vec3_bits_same(
+                  rejected.position.requested_ankle_target,
+                  fallback_ankle) &&
+              rejected.position.contact_residual_m > 0.005f &&
+              g1_runtime_orientation_diagnostic_is_complete(
+                  rejected.orientation) &&
+              g1_runtime_foot_stage_is_canonical(
+                  transaction.candidate_result.feet[1]),
+          "genuine recorded-contact fallback preserves its one-iteration final-residual stop");
+    return transaction;
+}
+
+static G1IkFrameTransaction g1_runtime_after_foot1_no_swing()
+{
+    G1RuntimeFixture fixture;
+    g1_runtime_make_fixture(fixture);
+    fixture.contact_values[0] = true;
+    const vec3 right = g1_runtime_current_sole_centroid(
+        fixture, g1_right_leg_config());
+    float blocking_height = 0.0f;
+    check(terrain_f32_add(
+              blocking_height,
+              right.y,
+              0.09f),
+          "foot-one rejection owns a checked obstacle above the full ladder");
+    const G1LegConfig left_config = g1_left_leg_config();
+    const vec3 left =
+        g1_runtime_current_sole_centroid(fixture, left_config);
+    const float left_lift =
+        blocking_height + left_config.planted_clearance_m - left.y;
+    fixture.db.bone_positions(0, G1_LeftHipYaw).y += left_lift;
+    fixture.field.heights.set(blocking_height);
+    char setup_error[256] = {};
+    check(g1_ik_checked_forward_kinematics(
+              fixture.global_positions,
+              fixture.global_rotations,
+              fixture.db.bone_positions(0),
+              fixture.db.bone_rotations(0),
+              fixture.db.bone_parents,
+              setup_error,
+              static_cast<int>(sizeof(setup_error))) &&
+              g1_ik_state_reset(
+                  fixture.state,
+                  fixture.db.bone_positions(0),
+                  fixture.db.bone_rotations(0),
+                  fixture.db.bone_parents,
+                  setup_error,
+                  static_cast<int>(sizeof(setup_error))),
+          setup_error);
+    g1_runtime_refresh_current_probes(fixture);
+    const vec3 inert_future_landing(
+        right.x + 6.0f, right.y, right.z);
+    g1_runtime_set_landing(
+        fixture, 1, true,
+        inert_future_landing,
+        0.0f, vec3(0.0f, 1.0f, 0.0f));
+    G1IkFrameTransaction transaction = {};
+    array1d<vec3> positions;
+    array1d<quat> rotations;
+    g1_runtime_begin(
+        fixture, fixture.footprint, transaction,
+        positions, rotations);
+    g1_runtime_stage_rejection_fixture_foot(
+        fixture, transaction, positions, rotations, 0);
+    check(transaction.next_foot == 1U &&
+              transaction.candidate_result.stop_reason ==
+                  G1IkStopNone &&
+              g1_runtime_completed_contact_is_successful(
+                  transaction.candidate_result.feet[0]),
+          "foot zero completes a genuine successful contact stage");
+    g1_runtime_stage_rejection_fixture_foot(
+        fixture, transaction, positions, rotations, 1);
+    const G1FootFrameResult& rejected =
+        transaction.candidate_result.feet[1];
+    G1ClearanceWork expected_total = {};
+    expected_total.cells_visited = 186U;
+    expected_total.primitive_triangle_pairs = 372U;
+    expected_total.face_patches = 2976U;
+    expected_total.candidate_tests = 11904U;
+    check(transaction.next_foot == 2U &&
+              transaction.candidate_result.stop_reason ==
+                  G1IkStopNoSwingCandidate &&
+              rejected.swing_selection.candidates_evaluated ==
+                  G1SwingLiftCandidateCount &&
+              rejected.swing_selection.selected_index ==
+                  G1SwingNoCandidate &&
+              g1_runtime_candidate_is_default(
+                  rejected.swing_selection.selected) &&
+              g1_runtime_vec3_bits_same(
+                  fixture.footprint.feet[1]
+                      .predicted_landing_sole_center,
+                  inert_future_landing) &&
+              g1_runtime_target_is_real_base(
+                  transaction, 1) &&
+              g1_runtime_work_same(
+                  rejected.swing_selection.total_clearance_work,
+                  expected_total) &&
+              g1_test_leg_solve_result_same(
+                  rejected.position, G1LegSolveResult{}) &&
+              g1_test_orientation_result_same(
+                  rejected.orientation,
+                  G1FootOrientationResult{}),
+          "foot one preserves genuine nonzero work for all 41 rejections");
+    return transaction;
+}
+
+static G1IkFrameTransaction g1_runtime_after_foot1_unreachable(
+    bool boundary_surface_normal)
+{
+    G1RuntimeFixture fixture;
+    g1_runtime_make_fixture(fixture);
+    fixture.contact_values[1] = true;
+    char error[256] = {};
+    const vec3 right = g1_runtime_current_sole_centroid(
+        fixture, g1_right_leg_config());
+    G1FootTarget established = {};
+    check(g1_foot_lock_update(
+              fixture.state.feet[1].lock,
+              established,
+              fixture.field,
+              g1_right_leg_config(),
+              right,
+              true, 0.04f,
+              error, static_cast<int>(sizeof(error))),
+          error);
+    fixture.db.bone_positions(0, G1_RightHipPitch).y += 3.0f;
+    check(g1_ik_checked_forward_kinematics(
+              fixture.global_positions, fixture.global_rotations,
+              fixture.db.bone_positions(0),
+              fixture.db.bone_rotations(0),
+              fixture.db.bone_parents,
+              error, static_cast<int>(sizeof(error))),
+          error);
+    g1_runtime_refresh_current_probes(fixture);
+    vec3 boundary_normal;
+    if (boundary_surface_normal) {
+        boundary_normal = vec3(
+            g1_test_float_from_bits(UINT32_C(0x3d98e05c)),
+            g1_test_float_from_bits(UINT32_C(0x3f7f486f)),
+            g1_test_float_from_bits(UINT32_C(0x3abb194a)));
+        vec3 normalized_boundary;
+        double raw_self_alignment = 0.0;
+        check(g1_ik_surface_normal_is_valid(boundary_normal) &&
+                  ik_checked_normalize(
+                      normalized_boundary, boundary_normal) &&
+                  ik_checked_dot(
+                      raw_self_alignment,
+                      normalized_boundary,
+                      boundary_normal) &&
+                  raw_self_alignment < 0.99999,
+              "boundary surface normal is valid only after normalization");
+        const vec3 left = g1_runtime_current_sole_centroid(
+            fixture, g1_left_leg_config());
+        float landing_height = 0.0f;
+        check(terrain_f32_sub(
+                  landing_height, left.y,
+                  g1_left_leg_config().swing_clearance_m),
+              "boundary landing height is exact binary32");
+        g1_runtime_set_landing(
+            fixture, 0, true,
+            vec3(left.x, left.y, left.z),
+            landing_height, boundary_normal);
+    }
+    G1IkFrameTransaction transaction = {};
+    array1d<vec3> positions;
+    array1d<quat> rotations;
+    g1_runtime_begin(
+        fixture, fixture.footprint, transaction,
+        positions, rotations);
+    g1_runtime_stage_rejection_fixture_foot(
+        fixture, transaction, positions, rotations, 0);
+    vec3 current_left_normal;
+    check(ik_checked_quat_rotate(
+              current_left_normal,
+              fixture.global_rotations(
+                  g1_left_leg_config().contact),
+              g1_left_leg_config().sole_normal_local) &&
+              g1_ik_surface_normal_is_valid(
+                  current_left_normal),
+          "swing rejection fixture owns its current sole normal");
+    check(transaction.next_foot == 1U &&
+              transaction.candidate_result.stop_reason ==
+                  G1IkStopNone &&
+              g1_runtime_completed_swing_is_successful(
+                  transaction.candidate_result.feet[0]) &&
+              (!boundary_surface_normal ||
+               (g1_runtime_vec3_bits_same(
+                    fixture.footprint.feet[0]
+                        .predicted_landing_surface.normal,
+                    boundary_normal) &&
+                g1_runtime_vec3_bits_same(
+                    transaction.candidate_result.feet[0]
+                        .target.desired_sole_normal,
+                    current_left_normal))),
+          "foot zero completes a genuine successful swing stage");
+    g1_runtime_stage_rejection_fixture_foot(
+        fixture, transaction, positions, rotations, 1);
+    const G1FootFrameResult& rejected =
+        transaction.candidate_result.feet[1];
+    check(transaction.next_foot == 2U &&
+              transaction.candidate_result.stop_reason ==
+                  G1IkStopTargetUnreachable &&
+              rejected.recorded_contact &&
+              g1_ik_leg_result_is_valid(rejected.position) &&
+              g1_runtime_orientation_diagnostic_is_complete(
+                  rejected.orientation),
+          "foot one produces a genuine established-lock rejection");
+    return transaction;
+}
+
+static void g1_runtime_rejection_snapshot_must_fail(
+    const G1IkFrameTransaction& transaction,
+    G1IkRejectionCheckpoint checkpoint,
+    const char* message)
+{
+    const G1RuntimeByteSnapshot<G1IkFrameTransaction>
+        transaction_before(transaction);
+    G1IkFrameResult output;
+    g1_runtime_poison_bytes(output, 0xa5);
+    const G1RuntimeByteSnapshot<G1IkFrameResult>
+        output_before(output);
+    char error[256] = {};
+    check(!g1_ik_frame_rejection_snapshot(
+              output, transaction, checkpoint,
+              error, static_cast<int>(sizeof(error))) &&
+              output_before.same(output) &&
+              transaction_before.same(transaction),
+          message);
+}
+
+static void g1_runtime_rejection_snapshot_must_succeed(
+    const G1IkFrameTransaction& transaction,
+    G1IkRejectionCheckpoint checkpoint,
+    const char* message)
+{
+    const G1RuntimeByteSnapshot<G1IkFrameTransaction>
+        transaction_before(transaction);
+    G1IkFrameResult output;
+    g1_runtime_poison_bytes(output, 0x5a);
+    char error[256] = {};
+    check(g1_ik_frame_rejection_snapshot(
+              output, transaction, checkpoint,
+              error, static_cast<int>(sizeof(error))) &&
+              g1_runtime_frame_result_same(
+                  output, transaction.candidate_result) &&
+              transaction_before.same(transaction),
+          message);
+    for (int wrong = G1IkRejectionAfterBegin;
+         wrong <= G1IkRejectionAfterFoot1;
+         ++wrong) {
+        if (wrong != static_cast<int>(checkpoint)) {
+            g1_runtime_rejection_snapshot_must_fail(
+                transaction,
+                static_cast<G1IkRejectionCheckpoint>(wrong),
+                "both wrong typed rejection checkpoints fail");
+        }
+    }
+}
+
+static void test_runtime_rejection_snapshot_contract()
+{
+    const G1IkFrameTransaction begin_blocked =
+        g1_runtime_after_begin_rejection(true);
+    const G1IkFrameTransaction begin_unready =
+        g1_runtime_after_begin_rejection(false);
+    const G1IkFrameTransaction begin_releasing =
+        g1_runtime_after_begin_releasing_rejection();
+    const G1IkFrameTransaction begin_blocked_both_recorded =
+        g1_runtime_after_begin_blocked_both_recorded();
+    const G1IkFrameTransaction begin_foot1_unavailable =
+        g1_runtime_after_begin_foot1_unavailable();
+    const G1IkFrameTransaction foot0_unreachable =
+        g1_runtime_after_foot0_unreachable(false);
+    const G1IkFrameTransaction foot0_unreachable_with_drift =
+        g1_runtime_after_foot0_unreachable(true);
+    const G1IkFrameTransaction
+        foot0_fallback_orientation_residual =
+            g1_runtime_after_foot0_fallback_orientation_residual();
+    const G1IkFrameTransaction foot0_no_swing =
+        g1_runtime_after_foot0_no_swing();
+    const G1IkFrameTransaction foot1_unreachable =
+        g1_runtime_after_foot1_unreachable(false);
+    const G1IkFrameTransaction foot1_unreachable_boundary_normal =
+        g1_runtime_after_foot1_unreachable(true);
+    const G1IkFrameTransaction foot1_no_swing =
+        g1_runtime_after_foot1_no_swing();
+    check(foot0_unreachable.candidate_result.feet[0]
+                  .position.iteration_provenance ==
+              G1LegIterationContact4 &&
+              foot0_unreachable.staged_iteration_provenance[0] ==
+                  G1LegIterationContact4 &&
+              foot0_unreachable.staged_iteration_provenance[1] ==
+                  G1LegIterationNone &&
+              g1_ik_runtime_iteration_transcript_matches(
+                  foot0_unreachable),
+          "ordinary rejection retains its authentic four-pass producer transcript");
+    check(foot0_fallback_orientation_residual.candidate_result.feet[0]
+                  .position.iteration_provenance ==
+              G1LegIterationBaselineFallback1 &&
+              foot0_fallback_orientation_residual
+                      .staged_iteration_provenance[0] ==
+                  G1LegIterationBaselineFallback1 &&
+              foot0_fallback_orientation_residual
+                      .staged_iteration_provenance[1] ==
+                  G1LegIterationNone &&
+              g1_ik_runtime_iteration_transcript_matches(
+                  foot0_fallback_orientation_residual),
+          "baseline fallback retains a disjoint producer transcript");
+    double precise_over_threshold = 0.0;
+    float rounded_at_threshold = 0.0f;
+    check(ik_checked_distance_precise(
+              precise_over_threshold,
+              rounded_at_threshold,
+              vec3(0.005f, 1.0e-6f, 0.0f),
+              vec3()) &&
+              terrain_float_bits(rounded_at_threshold) ==
+                  terrain_float_bits(0.005f) &&
+              precise_over_threshold >
+                  static_cast<double>(0.005f) &&
+              !g1_ik_contact_residual_is_converged_precise(
+                  precise_over_threshold),
+          "typed snapshot boundary is grounded in retained precise-over proof");
+    G1IkFrameTransaction foot0_rounded_residual_ambiguity =
+        foot0_unreachable;
+    G1LegSolveResult& ambiguous_position =
+        foot0_rounded_residual_ambiguity.candidate_result
+            .feet[0].position;
+    ambiguous_position.reachable = true;
+    ambiguous_position.correction_limited = false;
+    ambiguous_position.safe_stop_requested = true;
+    ambiguous_position.iterations = 4;
+    ambiguous_position.clamped_ankle_target =
+        ambiguous_position.requested_ankle_target;
+    ambiguous_position.clamped_distance_m =
+        ambiguous_position.raw_distance_m;
+    ambiguous_position.contact_residual_m =
+        rounded_at_threshold;
+    G1IkFrameTransaction foot0_reachable_limited =
+        foot0_unreachable;
+    G1LegSolveResult& reachable_limited_position =
+        foot0_reachable_limited.candidate_result
+            .feet[0].position;
+    reachable_limited_position.reachable = true;
+    reachable_limited_position.correction_limited = true;
+    reachable_limited_position.safe_stop_requested = true;
+    reachable_limited_position.clamped_ankle_target =
+        reachable_limited_position.requested_ankle_target;
+    reachable_limited_position.clamped_distance_m =
+        reachable_limited_position.raw_distance_m;
+    check(reachable_limited_position.max_correction_radians > 0.0f,
+          "reachable limited snapshot fixture retains real correction evidence");
+
+    g1_runtime_rejection_snapshot_must_succeed(
+        begin_blocked, G1IkRejectionAfterBegin,
+        "blocked begin snapshot publishes exact diagnostics");
+    g1_runtime_rejection_snapshot_must_succeed(
+        begin_unready, G1IkRejectionAfterBegin,
+        "unready landing snapshot publishes exact diagnostics");
+    g1_runtime_rejection_snapshot_must_succeed(
+        begin_releasing, G1IkRejectionAfterBegin,
+        "releasing begin snapshot preserves exact lock provenance");
+    g1_runtime_rejection_snapshot_must_succeed(
+        begin_blocked_both_recorded,
+        G1IkRejectionAfterBegin,
+        "blocked begin accepts two authentic recorded contacts");
+    g1_runtime_rejection_snapshot_must_succeed(
+        begin_foot1_unavailable,
+        G1IkRejectionAfterBegin,
+        "unavailable begin accepts ordered foot-zero materialization");
+    g1_runtime_rejection_snapshot_must_succeed(
+        foot0_unreachable, G1IkRejectionAfterFoot0,
+        "foot-zero target-unreachable snapshot is exact");
+    g1_runtime_rejection_snapshot_must_succeed(
+        foot0_unreachable_with_drift,
+        G1IkRejectionAfterFoot0,
+        "foot-zero rejection preserves genuine nonzero drift evidence");
+    g1_runtime_rejection_snapshot_must_succeed(
+        foot0_fallback_orientation_residual,
+        G1IkRejectionAfterFoot0,
+        "one-iteration recorded-contact fallback publishes its final physical residual stop");
+    g1_runtime_rejection_snapshot_must_succeed(
+        foot0_no_swing, G1IkRejectionAfterFoot0,
+        "foot-zero no-swing snapshot is exact");
+    g1_runtime_rejection_snapshot_must_succeed(
+        foot0_rounded_residual_ambiguity,
+        G1IkRejectionAfterFoot0,
+        "exact rounded residual threshold permits retained precise-over stop");
+    g1_runtime_rejection_snapshot_must_succeed(
+        foot0_reachable_limited,
+        G1IkRejectionAfterFoot0,
+        "reachable correction-limited rejection keeps exact projection");
+    g1_runtime_rejection_snapshot_must_succeed(
+        foot1_unreachable, G1IkRejectionAfterFoot1,
+        "foot-one target-unreachable snapshot is exact");
+    g1_runtime_rejection_snapshot_must_succeed(
+        foot1_unreachable_boundary_normal,
+        G1IkRejectionAfterFoot1,
+        "completed orientation accepts normalized boundary-valid normal");
+    g1_runtime_rejection_snapshot_must_succeed(
+        foot1_no_swing, G1IkRejectionAfterFoot1,
+        "foot-one no-swing snapshot is exact");
+
+    g1_runtime_rejection_snapshot_must_fail(
+        begin_blocked,
+        static_cast<G1IkRejectionCheckpoint>(99),
+        "unknown rejection checkpoint fails transactionally");
+
+    G1IkFrameTransaction poisoned = begin_blocked;
+    poisoned.candidate_state.initialized = false;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "invalid candidate state fails before snapshot");
+    poisoned = begin_blocked;
+    poisoned.initialized = false;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "uninitialized begin rejection fails");
+    poisoned = begin_blocked;
+    poisoned.candidate_result.applied = true;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "applied rejection fails");
+    poisoned = begin_blocked;
+    poisoned.candidate_result.safe_stop_requested = false;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "non-safe-stop rejection fails");
+    poisoned = begin_blocked;
+    poisoned.candidate_result.stop_reason = G1IkStopNone;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "none stop reason fails");
+    poisoned = begin_blocked;
+    poisoned.candidate_result.max_correction_radians = -0.0f;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "negative-zero correction fails canonical rejection");
+    poisoned = begin_blocked;
+    poisoned.next_foot = 1U;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "begin checkpoint requires exact cursor zero");
+    poisoned = begin_blocked;
+    poisoned.staged_iteration_provenance[0] =
+        G1LegIterationContact1;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "begin checkpoint requires a canonical empty iteration transcript");
+    poisoned = foot0_no_swing;
+    poisoned.next_foot = 0U;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "foot-zero checkpoint rejects cursor zero");
+    poisoned = foot0_no_swing;
+    poisoned.next_foot = 2U;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "foot-zero checkpoint rejects cursor two");
+    poisoned = foot1_no_swing;
+    poisoned.next_foot = 1U;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "foot-one checkpoint requires exact cursor two");
+    poisoned = begin_blocked;
+    poisoned.candidate_result.feet[0].recorded_contact = true;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "recorded contact must match candidate lock contact");
+    poisoned = foot1_no_swing;
+    poisoned.candidate_result.feet[0].target.locked = false;
+    poisoned.candidate_result.feet[0]
+        .target.position_active = false;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "target lock and active flags must match candidate lock");
+    poisoned = begin_releasing;
+    poisoned.candidate_result.feet[0].target.releasing = false;
+    poisoned.candidate_result.feet[0]
+        .target.position_active = false;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "target releasing and active flags must match candidate lock");
+    poisoned = begin_blocked;
+    poisoned.candidate_result.feet[0].target.sole_center.x =
+        g1_test_float_from_bits(UINT32_C(0x7fc00001));
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "nonfinite begin target fails bit-safely");
+    poisoned = begin_blocked;
+    poisoned.candidate_result.feet[0].target.sole_center.x += 0.001f;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "blocked noncontact sole must be the real base lock output");
+    poisoned = begin_blocked;
+    poisoned.candidate_result.feet[0].target.surface.point.x += 0.001f;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "blocked noncontact surface X/Z must match lock input");
+    poisoned = begin_blocked;
+    poisoned.candidate_result.feet[0].target.horizontal_drift_m = -0.0f;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "noncontact drift requires canonical positive zero");
+    poisoned = begin_blocked;
+    poisoned.candidate_result.feet[0]
+        .target.desired_sole_normal.y =
+            std::nextafter(1.0f, 0.0f);
+    check(g1_foot_target_is_valid(
+              poisoned.candidate_result.feet[0].target),
+          "forged begin airborne normal remains structurally valid");
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "begin airborne normal authenticates to immutable baseline provenance");
+    poisoned = begin_blocked;
+    poisoned.candidate_state.feet[0]
+        .baseline_sole_normal.y =
+            std::nextafter(1.0f, 0.0f);
+    check(g1_ik_runtime_state_is_valid(
+              poisoned.candidate_state),
+          "one-bit baseline normal forgery remains structurally valid");
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "begin target and immutable baseline normal must agree bit-exactly");
+    poisoned = foot0_no_swing;
+    poisoned.candidate_result.feet[0]
+        .target.desired_sole_normal.y =
+            std::nextafter(1.0f, 0.0f);
+    check(g1_foot_target_is_valid(
+              poisoned.candidate_result.feet[0].target),
+          "forged foot-zero airborne normal remains structurally valid");
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "foot-zero no-swing normal authenticates to immutable baseline provenance");
+    poisoned = foot1_no_swing;
+    poisoned.candidate_result.feet[1]
+        .target.desired_sole_normal.y =
+            std::nextafter(1.0f, 0.0f);
+    check(g1_foot_target_is_valid(
+              poisoned.candidate_result.feet[1].target),
+          "forged later-foot airborne normal remains structurally valid");
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "later-foot no-swing normal authenticates to immutable baseline provenance");
+    poisoned = begin_unready;
+    poisoned.candidate_result.feet[1].target.sole_center.z += 0.001f;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "unavailable landing leaves foot one at its real base target");
+    poisoned = begin_blocked;
+    poisoned.candidate_result.feet[0].target.surface.normal = vec3();
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "enabled begin target always owns a valid sampled surface");
+    poisoned = foot0_no_swing;
+    poisoned.candidate_result.feet[0].target.surface.normal = vec3();
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "no-swing target retains its valid sampled surface");
+    poisoned = begin_blocked_both_recorded;
+    poisoned.candidate_result.feet[0]
+        .target.desired_sole_normal = vec3(0.6f, 0.8f, 0.0f);
+    check(g1_foot_target_is_valid(
+              poisoned.candidate_result.feet[0].target),
+          "forged recorded desired normal remains structurally valid");
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "recorded desired sole normal is authenticated to terrain");
+    poisoned = begin_blocked_both_recorded;
+    poisoned.candidate_state.feet[0].lock.output_position.x =
+        std::nextafter(
+            poisoned.candidate_state.feet[0].lock.lock_point.x,
+            std::numeric_limits<float>::infinity());
+    poisoned.candidate_result.feet[0].target.sole_center =
+        poisoned.candidate_state.feet[0].lock.output_position;
+    check(g1_ik_runtime_state_is_valid(
+              poisoned.candidate_state) &&
+              g1_foot_target_is_valid(
+                  poisoned.candidate_result.feet[0].target) &&
+              !g1_ik_vec3_bits_equal(
+                  poisoned.candidate_result.feet[0]
+                      .target.sole_center,
+                  poisoned.candidate_state.feet[0]
+                      .lock.lock_point),
+          "forged recorded spring output remains structurally valid");
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "recorded contact target requires the exact immutable lock");
+    poisoned = begin_blocked_both_recorded;
+    poisoned.candidate_result.stop_reason =
+        G1IkStopLandingPatchUnavailable;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "unavailable landing requires at least one noncontact foot");
+    poisoned = foot1_no_swing;
+    poisoned.candidate_result.feet[1].target.sole_center.y += 0.001f;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "later noncontact target must retain its authenticated real base");
+    poisoned = begin_blocked;
+    poisoned.candidate_result.feet[0]
+        .defensive_swing.sweep_evaluated = true;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "finish-only defensive diagnostics fail before finish");
+    poisoned = begin_blocked;
+    poisoned.candidate_result.feet[0]
+        .defensive_swing.lower_margin_m = 1.0;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "finish-only defensive lower margin stays canonical");
+    poisoned = begin_blocked;
+    poisoned.candidate_result.feet[0]
+        .defensive_swing.witness_upper_m = 1.0;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "finish-only defensive witness stays canonical");
+    poisoned = begin_blocked;
+    poisoned.candidate_result.feet[0]
+        .defensive_swing.work.cells_visited = 1U;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "finish-only defensive work stays canonical");
+    poisoned = begin_blocked;
+    poisoned.candidate_result.feet[0].target.position_active = true;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "poisoned begin target fails");
+    poisoned = begin_blocked;
+    poisoned.candidate_result.feet[0]
+        .swing_selection.candidates_evaluated = 1U;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "staged foot fields fail at begin checkpoint");
+    poisoned = begin_blocked;
+    poisoned.candidate_result.feet[0]
+        .swing_selection.selected.candidate_index = 0U;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "canonical selected candidate sentinel is exact");
+    poisoned = begin_blocked;
+    poisoned.candidate_result.feet[0]
+        .swing_selection.selected.lift_bits = 1U;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "canonical selected lift word is zero");
+    poisoned = begin_blocked;
+    poisoned.candidate_result.feet[0]
+        .swing_selection.selected.materialized_command_y_bits = 1U;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "canonical selected materialized word is zero");
+    poisoned = begin_blocked;
+    poisoned.candidate_result.feet[0]
+        .swing_selection.selected.actual_sphere_center_bits[0][0] = 1U;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "canonical selected sphere words are zero");
+    poisoned = begin_blocked;
+    poisoned.candidate_result.feet[0]
+        .swing_selection.selected.clearance_status = G1ClearanceOk;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "canonical selected status is invalid-input");
+    poisoned = begin_blocked;
+    poisoned.candidate_result.feet[0]
+        .swing_selection.selected.lower_margin_m = -0.0;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "canonical selected margin requires positive zero");
+    poisoned = begin_blocked;
+    poisoned.candidate_result.feet[0]
+        .swing_selection.selected.clearance_work.cells_visited = 1U;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "canonical selected work is zero");
+    poisoned = begin_blocked;
+    poisoned.candidate_result.feet[0]
+        .swing_selection.total_clearance_work.cells_visited = 1U;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "canonical selection total work is zero");
+    poisoned = begin_blocked;
+    poisoned.candidate_result.feet[0].position.contact_residual_m = 0.0f;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "canonical position residual is exact FLT_MAX");
+    poisoned = begin_blocked;
+    poisoned.candidate_result.feet[0]
+        .orientation.target_global_rotation.x = 1.0f;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterBegin,
+        "canonical orientation is the exact identity");
+
+    poisoned = foot0_unreachable;
+    poisoned.candidate_result.feet[0].recorded_contact = false;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "target-unreachable rejection requires recorded contact");
+    poisoned = foot0_unreachable;
+    poisoned.candidate_result.feet[0].target.sole_center.x += 0.001f;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "recorded-contact sole center comes from the lock runtime");
+    poisoned = foot0_unreachable;
+    poisoned.candidate_result.feet[0].target.surface.point.x += 0.001f;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "recorded-contact surface X comes from the lock point");
+    poisoned = foot0_unreachable;
+    poisoned.candidate_result.feet[0].target.surface.point.y += 0.001f;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "recorded-contact surface Y comes from the lock point");
+    poisoned = foot0_unreachable;
+    poisoned.candidate_result.feet[0].target.horizontal_drift_m += 0.001f;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "recorded-contact horizontal drift is recomputed exactly");
+    poisoned = foot0_unreachable;
+    poisoned.candidate_result.feet[0].target.drift_limit_exceeded =
+        !poisoned.candidate_result.feet[0]
+             .target.drift_limit_exceeded;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "recorded-contact drift flag is recomputed exactly");
+    poisoned = foot0_unreachable_with_drift;
+    poisoned.candidate_result.feet[0].target.horizontal_drift_m = 0.0f;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "nonzero recorded-contact drift cannot be hardcoded to zero");
+    poisoned = foot0_unreachable_with_drift;
+    poisoned.candidate_result.feet[0]
+        .target.drift_limit_exceeded = false;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "exceeded recorded-contact drift flag cannot be hardcoded false");
+    poisoned = foot0_unreachable;
+    poisoned.candidate_result.feet[0].position.applied = false;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "target-unreachable position diagnostic must be complete");
+    poisoned = foot0_unreachable;
+    poisoned.candidate_result.feet[0]
+        .position.safe_stop_requested = false;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "target-unreachable position safe stop matches its failure");
+    poisoned = foot0_rounded_residual_ambiguity;
+    poisoned.candidate_result.feet[0].position.iterations = 0;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "rounded-threshold precise-over stop retains a completed position solve");
+    poisoned = foot0_rounded_residual_ambiguity;
+    poisoned.candidate_result.feet[0].position.contact_residual_m =
+        std::nextafter(0.005f, 0.0f);
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "below-threshold completed position cannot claim residual stop");
+    poisoned = foot0_reachable_limited;
+    poisoned.candidate_result.feet[0]
+        .position.clamped_ankle_target.x += 0.001f;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "reachable limited position preserves exact projected target");
+    poisoned = foot0_reachable_limited;
+    poisoned.candidate_result.feet[0].position.clamped_distance_m =
+        std::nextafter(
+            poisoned.candidate_result.feet[0]
+                .position.raw_distance_m,
+            std::numeric_limits<float>::infinity());
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "reachable limited position preserves exact projected distance");
+    poisoned = foot0_unreachable;
+    poisoned.candidate_result.feet[0].orientation.applied = false;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "target-unreachable orientation diagnostic must be complete");
+    poisoned = foot0_unreachable;
+    poisoned.candidate_result.feet[0]
+        .orientation.target_global_rotation =
+            quat(0.0f, 1.0f, 0.0f, 0.0f);
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "completed orientation aligns sole normal to target surface");
+    poisoned = foot0_unreachable;
+    poisoned.candidate_result.feet[0]
+        .orientation.correction_limited = true;
+    poisoned.candidate_result.feet[0]
+        .orientation.safe_stop_requested = true;
+    poisoned.candidate_result.feet[0]
+        .orientation.requested_correction_radians = 0.0f;
+    poisoned.candidate_result.feet[0]
+        .orientation.correction_radians = 0.0f;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "limited orientation cannot report zero requested/actual correction");
+    poisoned = foot0_unreachable;
+    poisoned.candidate_result.feet[0]
+        .position.correction_limited = true;
+    poisoned.candidate_result.feet[0]
+        .position.safe_stop_requested = true;
+    poisoned.candidate_result.feet[0]
+        .position.max_correction_radians = 0.0f;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "limited position cannot report zero maximum correction");
+    poisoned = foot0_unreachable;
+    poisoned.candidate_result.feet[0]
+        .position.bend_used_current_projection = true;
+    poisoned.candidate_result.feet[0]
+        .position.bend_used_hinge_fallback = false;
+    poisoned.candidate_result.feet[0]
+        .position.bend_used_safe_perpendicular = false;
+    poisoned.candidate_result.feet[0]
+        .position.bend_sign_flipped = true;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "flipped bend sign requires hinge fallback provenance");
+    poisoned = foot0_unreachable;
+    check(!g1_ik_contact_residual_is_converged(
+              poisoned.candidate_result.feet[0]
+                  .position.contact_residual_m) &&
+              poisoned.candidate_result.feet[0]
+                  .position.iterations == 4,
+          "genuine unreachable fixture exhausts four residual iterations");
+    for (int forged_iterations = 1;
+         forged_iterations < G1ContactSolveMaximumIterations;
+         ++forged_iterations) {
+        poisoned = foot0_unreachable;
+        poisoned.candidate_result.feet[0].position.iterations =
+            forged_iterations;
+        g1_runtime_rejection_snapshot_must_fail(
+            poisoned, G1IkRejectionAfterFoot0,
+            "ordinary unconverged contact solve authenticates all four refinement iterations");
+    }
+    poisoned = foot0_unreachable;
+    poisoned.candidate_result.feet[0].position.iterations = 3;
+    poisoned.candidate_result.feet[0].position.iteration_provenance =
+        G1LegIterationContact3;
+    check(g1_ik_leg_result_is_valid(
+              poisoned.candidate_result.feet[0].position) &&
+              g1_ik_contact_iterations_have_valid_provenance(
+                  poisoned.candidate_result.feet[0].position),
+          "coherent Contact3 relabel remains structurally valid before producer authentication");
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "ordinary rejection rejects a coherent count-and-enum relabel against its transcript");
+    poisoned = foot0_unreachable;
+    poisoned.staged_iteration_provenance[0] =
+        G1LegIterationContact3;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "ordinary rejection rejects a transcript-only enum mutation");
+    for (int forged_iterations = 2;
+         forged_iterations <= G1ContactSolveMaximumIterations;
+         ++forged_iterations) {
+        poisoned = foot0_fallback_orientation_residual;
+        poisoned.candidate_result.feet[0].position.iterations =
+            forged_iterations;
+        g1_runtime_rejection_snapshot_must_fail(
+            poisoned, G1IkRejectionAfterFoot0,
+            "baseline fallback authenticates its single position iteration");
+    }
+    poisoned = foot0_fallback_orientation_residual;
+    poisoned.candidate_result.feet[0].position.iteration_provenance =
+        G1LegIterationContact1;
+    check(g1_ik_leg_result_is_valid(
+              poisoned.candidate_result.feet[0].position) &&
+              g1_ik_contact_iterations_have_valid_provenance(
+                  poisoned.candidate_result.feet[0].position),
+          "Contact1 relabel of a fallback remains structurally valid before producer authentication");
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "fallback rejection rejects an enum-only Contact1 relabel against its transcript");
+    poisoned = foot0_fallback_orientation_residual;
+    poisoned.staged_iteration_provenance[0] =
+        G1LegIterationContact1;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "fallback rejection rejects a transcript-only Contact1 relabel");
+    poisoned = foot0_fallback_orientation_residual;
+    poisoned.candidate_result.feet[0].position.iterations =
+        G1ContactSolveMaximumIterations;
+    poisoned.candidate_result.feet[0].position.reachable = false;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "fallback iteration provenance cannot be spoofed by flipping reachability");
+    poisoned = foot0_unreachable;
+    poisoned.candidate_result.feet[0].position.reachable = true;
+    poisoned.candidate_result.feet[0]
+        .position.correction_limited = false;
+    poisoned.candidate_result.feet[0]
+        .position.safe_stop_requested = false;
+    poisoned.candidate_result.feet[0].position.contact_residual_m = 0.0f;
+    poisoned.candidate_result.feet[0]
+        .orientation.correction_limited = false;
+    poisoned.candidate_result.feet[0]
+        .orientation.safe_stop_requested = false;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "target-unreachable reason requires a genuinely failing stage");
+    poisoned = foot0_no_swing;
+    poisoned.candidate_result.feet[0]
+        .swing_selection.candidates_evaluated =
+            G1SwingLiftCandidateCount - 1U;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "no-swing rejection requires all 41 candidates");
+    poisoned = foot0_no_swing;
+    poisoned.candidate_result.feet[0]
+        .swing_selection.selected_index = 0U;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "no-swing rejection requires no selection");
+    poisoned = foot0_no_swing;
+    poisoned.candidate_result.feet[0]
+        .swing_selection.selected.candidate_index = 0U;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "no-swing rejection retains canonical nested selection");
+    poisoned = foot0_no_swing;
+    poisoned.candidate_result.feet[0]
+        .swing_selection.total_clearance_work.cells_visited = UINT32_MAX;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "no-swing aggregate work must stay within 41 budgets");
+    poisoned = foot0_no_swing;
+    poisoned.candidate_result.feet[1].position.applied = true;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot0,
+        "unstaged second foot must remain canonical");
+
+    poisoned = foot1_unreachable;
+    poisoned.candidate_result.feet[0]
+        .swing_selection.selected.candidate_index =
+            G1SwingNoCandidate;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "completed successful swing selection must match");
+    poisoned = foot1_unreachable;
+    poisoned.candidate_result.feet[0]
+        .swing_selection.selected_index =
+            poisoned.candidate_result.feet[0]
+                .swing_selection.candidates_evaluated;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "successful swing selection index stays inside count");
+    poisoned = foot1_unreachable;
+    poisoned.candidate_result.feet[0]
+        .swing_selection.candidates_evaluated = 0U;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "successful swing evaluates a bounded nonzero count");
+    poisoned = foot1_unreachable;
+    poisoned.candidate_result.feet[0]
+        .swing_selection.candidates_evaluated = 2U;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "successful swing count is exactly selected index plus one");
+    poisoned = foot1_unreachable;
+    poisoned.candidate_result.feet[0]
+        .swing_selection.selected.lift_bits ^= 1U;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "successful swing selected lift matches immutable ladder");
+    poisoned = foot1_unreachable;
+    poisoned.candidate_result.feet[0]
+        .swing_selection.selected.materialized_command_y_bits ^= 1U;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "successful swing materialized Y matches target plus lift");
+    poisoned = foot1_unreachable;
+    poisoned.candidate_result.feet[0]
+        .swing_selection.selected.actual_sphere_center_bits[0][0] =
+            UINT32_C(0x7f800000);
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "successful swing selected sphere centers remain finite");
+    poisoned = foot1_unreachable;
+    poisoned.candidate_result.feet[0]
+        .swing_selection.selected.clearance_status =
+            G1ClearanceOutsideDomain;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "successful swing selected clearance is certified Ok");
+    poisoned = foot1_unreachable;
+    poisoned.candidate_result.feet[0]
+        .swing_selection.selected.controller_constraints_passed = false;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "successful swing selected controller constraints pass");
+    poisoned = foot1_unreachable;
+    poisoned.candidate_result.feet[0]
+        .swing_selection.selected.clearance_certified = false;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "successful swing selected clearance is certified");
+    poisoned = foot1_unreachable;
+    poisoned.candidate_result.feet[0]
+        .swing_selection.selected.witness_upper_margin_m =
+            poisoned.candidate_result.feet[0]
+                .swing_selection.selected.lower_margin_m +
+            2.0 * G1ClearanceMaximumCertificateWidthM;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "successful swing selected certificate width is bounded");
+    poisoned = foot1_unreachable;
+    poisoned.candidate_result.feet[0]
+        .swing_selection.selected.clearance_work.cells_visited =
+            UINT32_MAX;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "successful swing selected work stays within one budget");
+    poisoned = foot1_unreachable;
+    poisoned.candidate_result.feet[0]
+        .swing_selection.total_clearance_work.cells_visited =
+            UINT32_MAX;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "successful swing total work stays within evaluated budgets");
+    poisoned = foot1_unreachable;
+    poisoned.candidate_result.feet[0].position.reachable = false;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "successful swing position diagnostics must pass");
+    poisoned = foot1_unreachable;
+    poisoned.candidate_result.feet[0]
+        .position.bend_used_current_projection = false;
+    poisoned.candidate_result.feet[0]
+        .position.bend_used_hinge_fallback = false;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "successful position owns exactly one primary bend provenance");
+    poisoned = foot1_unreachable;
+    poisoned.candidate_result.feet[0]
+        .position.bend_used_current_projection = true;
+    poisoned.candidate_result.feet[0]
+        .position.bend_used_hinge_fallback = false;
+    poisoned.candidate_result.feet[0]
+        .position.bend_used_safe_perpendicular = true;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "safe-perpendicular bend requires hinge fallback provenance");
+    poisoned = foot1_unreachable;
+    poisoned.candidate_result.feet[0]
+        .position.clamped_ankle_target.x += 0.001f;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "successful position requested and clamped targets match exactly");
+    poisoned = foot1_unreachable;
+    poisoned.candidate_result.feet[0]
+        .position.clamped_distance_m += 0.001f;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "successful position raw and clamped distances match exactly");
+    poisoned = foot1_unreachable;
+    poisoned.candidate_result.feet[0]
+        .orientation.correction_limited = true;
+    poisoned.candidate_result.feet[0]
+        .orientation.safe_stop_requested = true;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "successful swing orientation diagnostics must pass");
+    poisoned = foot1_unreachable;
+    poisoned.candidate_result.feet[0]
+        .orientation.requested_correction_radians += 0.001f;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "successful orientation requested and actual corrections match");
+    poisoned = foot1_no_swing;
+    poisoned.candidate_result.feet[0]
+        .swing_selection.candidates_evaluated = 1U;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "completed successful contact has canonical selection");
+    poisoned = foot1_no_swing;
+    poisoned.candidate_result.feet[0].position.applied = false;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "completed successful contact position must pass");
+    poisoned = foot1_no_swing;
+    poisoned.candidate_result.feet[0].orientation.applied = false;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "completed successful contact orientation must pass");
+    poisoned = foot1_unreachable;
+    poisoned.candidate_result.stop_reason =
+        G1IkStopNoSwingCandidate;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "foot-one rejection reason must match completed diagnostics");
+    poisoned = foot1_no_swing;
+    poisoned.candidate_result.feet[1].position.applied = true;
+    g1_runtime_rejection_snapshot_must_fail(
+        poisoned, G1IkRejectionAfterFoot1,
+        "no-swing completed position remains canonical");
+
+    G1IkFrameResult output;
+    g1_runtime_poison_bytes(output, 0x67);
+    const G1RuntimeByteSnapshot<G1IkFrameResult> output_before(output);
+    const G1RuntimeByteSnapshot<G1IkFrameTransaction>
+        input_before(begin_blocked);
+    check(!g1_ik_frame_rejection_snapshot(
+              output, begin_blocked, G1IkRejectionAfterBegin,
+              NULL, -1) &&
+              output_before.same(output) &&
+              input_before.same(begin_blocked),
+          "negative error capacity preserves output and input");
+
+    G1IkFrameTransaction output_alias = begin_blocked;
+    const G1RuntimeByteSnapshot<G1IkFrameTransaction>
+        output_alias_before(output_alias);
+    check(!g1_ik_frame_rejection_snapshot(
+              output_alias.candidate_result,
+              output_alias,
+              G1IkRejectionAfterBegin,
+              NULL, 0) &&
+              output_alias_before.same(output_alias),
+          "output/input alias is rejected without a byte write");
+
+    output = G1IkFrameResult{};
+    g1_runtime_poison_bytes(output, 0x4d);
+    const G1RuntimeByteSnapshot<G1IkFrameResult>
+        error_output_before(output);
+    check(!g1_ik_frame_rejection_snapshot(
+              output, begin_blocked, G1IkRejectionAfterBegin,
+              reinterpret_cast<char*>(&output) + 1, 8) &&
+              error_output_before.same(output),
+          "error/output alias is rejected before diagnostics write");
+
+    G1IkFrameTransaction error_input = begin_blocked;
+    const G1RuntimeByteSnapshot<G1IkFrameTransaction>
+        error_input_before(error_input);
+    output = G1IkFrameResult{};
+    g1_runtime_poison_bytes(output, 0x39);
+    const G1RuntimeByteSnapshot<G1IkFrameResult>
+        error_input_output_before(output);
+    check(!g1_ik_frame_rejection_snapshot(
+              output, error_input, G1IkRejectionAfterBegin,
+              reinterpret_cast<char*>(&error_input) + 1, 8) &&
+              error_input_before.same(error_input) &&
+              error_input_output_before.same(output),
+          "error/input alias is rejected before diagnostics write");
+}
+
 static int run_runtime_parity_mode()
 {
     G1RuntimeFixture fixture;
@@ -5675,6 +8830,21 @@ static int run_runtime_parity_mode()
 int main(int argc, char** argv)
 {
 #if defined(G1_IK_ENABLE_TEST_SEAMS)
+    if (argc == 2 &&
+        std::strcmp(argv[1], "--coupled-sole-contract") == 0) {
+        test_runtime_coupled_physical_sole_orientation_contract();
+        return 0;
+    }
+    if (argc == 2 &&
+        std::strcmp(argv[1], "--sole-lock-contract") == 0) {
+        test_runtime_proxy_sole_lock_endpoint_contract();
+        return 0;
+    }
+    if (argc == 2 &&
+        std::strcmp(argv[1], "--current-swing-contract") == 0) {
+        test_runtime_ready_landing_preserves_current_swing_contract();
+        return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--parity") == 0) {
         return run_runtime_parity_mode();
     }
@@ -5689,11 +8859,13 @@ int main(int argc, char** argv)
     test_null_and_short_error_buffers();
     test_checked_surface_query();
     test_planted_lock_lifecycle();
+    test_planted_rising_edge_materializes_current_lock();
     test_planted_lock_drift_dt_and_rollback();
     test_generic_checked_ik_math();
     test_named_solver_success_and_bend_mapping();
     test_named_solver_preflight_and_rollback();
     test_named_contact_residual_contract();
+    test_named_contact_live_baseline_continuity();
     test_surface_aligned_named_foot_orientation();
     test_surface_orientation_staged_pose_and_fallback();
     test_surface_orientation_limit_semantics();
@@ -5701,6 +8873,10 @@ int main(int argc, char** argv)
 #if defined(G1_IK_ENABLE_TEST_SEAMS)
     test_runtime_lift_ladder_and_observer_crosspath();
     test_runtime_state_reset_and_footprint_preflight();
+    test_runtime_coupled_physical_sole_orientation_contract();
+    test_orientation_overwrite_preserves_contact_provenance();
+    test_runtime_proxy_sole_lock_endpoint_contract();
+    test_runtime_ready_landing_preserves_current_swing_contract();
     test_runtime_blocked_and_landing_contract();
     test_runtime_real_41_stage_selector();
     test_runtime_status_table_and_local_rejections();
@@ -5708,6 +8884,7 @@ int main(int argc, char** argv)
     test_runtime_landing_ladder_and_late_rollback();
     test_runtime_poison_and_alias_rollback();
     test_runtime_lock_stage_order_and_command_invariance();
+    test_runtime_rejection_snapshot_contract();
 #endif
     return 0;
 }

@@ -50,7 +50,7 @@ struct database
     int ncontacts() const { return contact_states.cols; }
 };
 
-void database_load(database& db, const char* filename)
+inline void database_load(database& db, const char* filename)
 {
     FILE* f = fopen(filename, "rb");
     assert(f != NULL);
@@ -69,7 +69,7 @@ void database_load(database& db, const char* filename)
     fclose(f);
 }
 
-void database_save_matching_features(const database& db, const char* filename)
+inline void database_save_matching_features(const database& db, const char* filename)
 {
     FILE* f = fopen(filename, "wb");
     assert(f != NULL);
@@ -84,7 +84,7 @@ void database_save_matching_features(const database& db, const char* filename)
 // When we add an offset to a frame in the database there is a chance
 // it will go out of the relevant range so here we can clamp it to 
 // the last frame of that range.
-int database_trajectory_index_clamp(database& db, int frame, int offset)
+inline int database_trajectory_index_clamp(database& db, int frame, int offset)
 {
     for (int i = 0; i < db.nranges(); i++)
     {
@@ -154,7 +154,7 @@ static inline void disable_feature_group(
     }
 }
 
-void normalize_feature(
+inline void normalize_feature(
     slice2d<float> features,
     slice1d<float> features_offset,
     slice1d<float> features_scale,
@@ -287,7 +287,7 @@ static inline float normalize_query_feature(
         : (value - offset) / scale;
 }
 
-void denormalize_features(
+inline void denormalize_features(
     slice1d<float> features,
     const slice1d<float> features_offset,
     const slice1d<float> features_scale)
@@ -303,7 +303,7 @@ void denormalize_features(
 //--------------------------------------
 
 // Here I am using a simple recursive version of forward kinematics
-void forward_kinematics(
+inline void forward_kinematics(
     vec3& bone_position,
     quat& bone_rotation,
     const slice1d<vec3> bone_positions,
@@ -335,7 +335,7 @@ void forward_kinematics(
 }
 
 // Forward kinematics but also compute the velocities
-void forward_kinematics_velocity(
+inline void forward_kinematics_velocity(
     vec3& bone_position,
     vec3& bone_velocity,
     quat& bone_rotation,
@@ -385,7 +385,7 @@ void forward_kinematics_velocity(
 }
 
 // Compute forward kinematics for all joints
-void forward_kinematics_full(
+inline void forward_kinematics_full(
     slice1d<vec3> global_bone_positions,
     slice1d<quat> global_bone_rotations,
     const slice1d<vec3> local_bone_positions,
@@ -414,7 +414,7 @@ void forward_kinematics_full(
 
 // Compute forward kinematics of just some joints using a
 // mask to indicate which joints are already computed
-void forward_kinematics_partial(
+inline void forward_kinematics_partial(
     slice1d<vec3> global_bone_positions,
     slice1d<quat> global_bone_rotations,
     slice1d<bool> global_bone_computed,
@@ -451,7 +451,7 @@ void forward_kinematics_partial(
 }
 
 // Same but including velocity
-void forward_kinematics_velocity_partial(
+inline void forward_kinematics_velocity_partial(
     slice1d<vec3> global_bone_positions,
     slice1d<vec3> global_bone_velocities,
     slice1d<quat> global_bone_rotations,
@@ -508,7 +508,7 @@ void forward_kinematics_velocity_partial(
 //--------------------------------------
 
 // Compute a feature for the position of a bone relative to the simulation/root bone
-void compute_bone_position_feature(database& db, int& offset, int bone, float weight = 1.0f)
+inline void compute_bone_position_feature(database& db, int& offset, int bone, float weight = 1.0f)
 {
     for (int i = 0; i < db.nframes(); i++)
     {
@@ -536,7 +536,7 @@ void compute_bone_position_feature(database& db, int& offset, int bone, float we
 }
 
 // Similar but for a bone's velocity
-void compute_bone_velocity_feature(database& db, int& offset, int bone, float weight = 1.0f)
+inline void compute_bone_velocity_feature(database& db, int& offset, int bone, float weight = 1.0f)
 {
     for (int i = 0; i < db.nframes(); i++)
     {
@@ -577,7 +577,7 @@ static inline void database_trajectory_horizons(int out[3])
 }
 
 // Compute the trajectory at one-third, two-thirds, and one second in the future
-void compute_trajectory_position_feature(database& db, int& offset, float weight = 1.0f)
+inline void compute_trajectory_position_feature(database& db, int& offset, float weight = 1.0f)
 {
     int horizons[3];
     database_trajectory_horizons(horizons);
@@ -606,7 +606,7 @@ void compute_trajectory_position_feature(database& db, int& offset, float weight
 }
 
 // Same for direction
-void compute_trajectory_direction_feature(database& db, int& offset, float weight = 1.0f)
+inline void compute_trajectory_direction_feature(database& db, int& offset, float weight = 1.0f)
 {
     int horizons[3];
     database_trajectory_horizons(horizons);
@@ -688,7 +688,7 @@ static inline float database_raw_terrain_error(
 // Build the Motion Matching search acceleration structure. Here we
 // just use axis aligned bounding boxes regularly spaced at BOUND_SM_SIZE
 // and BOUND_LR_SIZE frames
-void database_build_bounds(database& db)
+inline void database_build_bounds(database& db)
 {
     int nbound_sm = ((db.nframes() + BOUND_SM_SIZE - 1) / BOUND_SM_SIZE);
     int nbound_lr = ((db.nframes() + BOUND_LR_SIZE - 1) / BOUND_LR_SIZE);
@@ -719,7 +719,7 @@ void database_build_bounds(database& db)
 }
 
 // Build all motion matching features and acceleration structure
-void database_build_matching_features(
+inline void database_build_matching_features(
     database& db,
     const float feature_weight_foot_position,
     const float feature_weight_foot_velocity,
@@ -794,7 +794,7 @@ void database_build_matching_features(
 // against the query feature vector, first checking the 
 // query distance to the axis aligned bounding boxes used 
 // for the acceleration structure.
-void motion_matching_search(
+inline void motion_matching_search(
     int& __restrict__ best_index, 
     float& __restrict__ best_cost, 
     const slice1d<int> range_starts,
@@ -929,7 +929,7 @@ void motion_matching_search(
 }
 
 // Search database
-void database_search(
+inline void database_search(
     int& best_index, 
     float& best_cost, 
     const database& db, 

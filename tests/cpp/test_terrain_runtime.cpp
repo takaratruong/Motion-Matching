@@ -1568,146 +1568,145 @@ static const char* require_source_token(
     return found;
 }
 
-static void test_controller_traversability_guard_data_flow()
+static size_t source_token_count(const char* begin, const char* token)
+{
+    size_t count = 0;
+    const size_t length = strlen(token);
+    while ((begin = strstr(begin, token)) != NULL) {
+        ++count;
+        begin += length;
+    }
+    return count;
+}
+
+static std::string compact_source_segment(const std::string& input)
+{
+    std::string output;
+    output.reserve(input.size());
+    for (const char value : input) {
+        if (value != ' ' && value != '\t' &&
+            value != '\r' && value != '\n') {
+            output.push_back(value);
+        }
+    }
+    return output;
+}
+
+static void test_controller_task6_terrain_ik_pipeline()
 {
     const std::vector<char> source = read_controller_source();
-    const char* desired = require_source_token(
-        source.data(), "vec3 desired_velocity_curr = desired_velocity_update(",
-        "controller computes unguarded desired velocity");
-    const char* commanded = require_source_token(
-        desired, "const vec3 commanded_velocity = desired_velocity_curr;",
-        "controller preserves commanded velocity");
-    const char* limit = require_source_token(
-        commanded, "traversability_limit_command(",
-        "controller limits desired velocity");
-    const char* planar_stop = require_source_token(
-        limit, "traversability_stop_blocked_planar_dynamics(",
-        "controller stops blocked planar dynamics");
-    const char* desired_state = require_source_token(
-        planar_stop, "state.desired_velocity = desired_velocity_curr;",
-        "controller stores limited desired velocity");
-    const char* trajectory = require_source_token(
-        desired_state, "trajectory_desired_velocities_predict(",
-        "controller predicts trajectory from limited velocity");
-    const char* future_forward = require_source_token(
-        trajectory,
-        "simulation_fwrd_speed * state.traversal_speed_scale,",
-        "controller limits future forward trajectory speed");
-    const char* future_side = require_source_token(
-        future_forward,
-        "simulation_side_speed * state.traversal_speed_scale,",
-        "controller limits future side trajectory speed");
-    const char* future_back = require_source_token(
-        future_side,
-        "simulation_back_speed * state.traversal_speed_scale,",
-        "controller limits future back trajectory speed");
-    const char* matcher = require_source_token(
-        future_back, "const int query_database_frame = state.frame_index;",
-        "controller matching follows limited trajectory prediction");
-    check(commanded < limit && limit < planar_stop &&
-              planar_stop < desired_state &&
-              desired_state < trajectory && trajectory < future_forward &&
-              future_forward < future_side && future_side < future_back &&
-              future_back < matcher,
-          "limiting precedes trajectory prediction and matching");
+    const char* const source_begin = source.data();
+    const char* runner = require_source_token(
+        source_begin,
+        "G1FrameStageOutcome g1_controller_frame_stage_run(",
+        "Task6 named stage runner must own the terrain and IK pipeline");
+    const char* signature_close = require_source_token(
+        runner, ")", "Task6 runner signature closes");
+    const char* body_open = require_source_token(
+        signature_close, "{", "Task6 runner body opens");
+    int depth = 0;
+    const char* body_close = NULL;
+    for (const char* cursor = body_open; *cursor != '\0'; ++cursor) {
+        if (*cursor == '{') {
+            ++depth;
+        } else if (*cursor == '}' && --depth == 0) {
+            body_close = cursor;
+            break;
+        }
+    }
+    check(body_close != NULL, "Task6 runner body closes");
+    const std::string body_raw(
+        body_open, static_cast<size_t>(body_close - body_open + 1));
+    const std::string body = compact_source_segment(body_raw);
 
-    const char* update = require_source_token(
-        matcher, "// Update Simulation",
-        "controller simulation update site");
-    const char* before = require_source_token(
-        update, "const vec3 simulation_before = state.simulation_position;",
-        "controller captures pre-integration simulation position");
-    const char* integrate = require_source_token(
-        before, "simulation_positions_update(",
-        "controller integrates simulation position");
-    const char* preflight = require_source_token(
-        integrate,
-        "const walkability_sweep_result integrated_traversal = "
-        "traversability_preflight_step(",
-        "controller preflights integrated state and traversal once");
-    const char* conditional = require_source_token(
-        preflight,
-        "if (integrated_traversal.blocked) {",
-        "controller enters hard clip on a blocked preflight");
-    const char* clip = require_source_token(
-        conditional, "traversability_apply_sweep_result(",
-        "controller applies the preflight result without a second sweep");
-    const char* current = require_source_token(
-        clip, "walkability_footprint_class(",
-        "controller samples current footprint after clipping");
-    const char* rotate = require_source_token(
-        clip, "simulation_rotations_update(",
-        "controller rotation update follows planar clipping");
-    check(before < integrate && integrate < preflight &&
-              preflight < conditional &&
-              conditional < clip && clip < current && current < rotate,
-          "integration is immediately surrounded by capture and clip");
-    require_source_token(
-        current, "active_scene.walkability",
-        "current footprint uses active walkability grid");
-    require_source_token(
-        current, "active_scene.terrain",
-        "current footprint uses active v2 terrain");
-    require_source_token(
-        current, "state.simulation_position.x",
-        "current footprint samples clipped simulation x");
-    require_source_token(
-        current, "state.simulation_position.z",
-        "current footprint samples clipped simulation z");
+    const size_t footprint_stage = body.find(
+        "caseG1FrameStageFootprintObservation:");
+    const size_t foot0_stage = body.find("caseG1FrameStageFirstFootIk:");
+    const size_t foot1_stage = body.find("caseG1FrameStageSecondFootIk:");
+    const size_t final_fk_stage = body.find("caseG1FrameStageFinalFk:");
+    const size_t pose_stage = body.find("caseG1FrameStagePoseCertificate:");
+    check(footprint_stage != std::string::npos &&
+              foot0_stage != std::string::npos &&
+              foot1_stage != std::string::npos &&
+              final_fk_stage != std::string::npos &&
+              pose_stage != std::string::npos &&
+              footprint_stage < foot0_stage && foot0_stage < foot1_stage &&
+              foot1_stage < final_fk_stage && final_fk_stage < pose_stage,
+          "footprint, split-foot IK, final FK, and pose certification stages are ordered");
 
-    const char* current_state = require_source_token(
-        current, "state.walkability_class = current_walkability_class;",
-        "controller stores current accepted footprint class");
-    const char* blocked_state = require_source_token(
-        clip, "state.blocked = traversal.blocked;",
-        "controller refreshes blocked state after clipping");
-    const char* distance_state = require_source_token(
-        clip, "state.blocked_distance = traversal.distance;",
-        "controller refreshes blocked distance after clipping");
-    const char* point_state = require_source_token(
-        clip, "state.blocked_point = traversal.point;",
-        "controller refreshes blocked point after clipping");
-    check(clip < current_state && clip < blocked_state &&
-              clip < distance_state && clip < point_state,
-          "post-clip traversal and current-footprint diagnostics are active");
+    const std::string footprint = body.substr(
+        footprint_stage, foot0_stage - footprint_stage);
+    const size_t schedule = footprint.find(
+        "g1_foot_contact_schedule_build(");
+    const size_t observe = footprint.find("g1_footprint_observe_v2(");
+    const size_t begin = footprint.find("g1_ik_frame_begin(");
+    const size_t begin_stop = footprint.find(
+        "candidate_result.safe_stop_requested", begin);
+    const size_t begin_snapshot = footprint.find(
+        "g1_ik_frame_rejection_snapshot(", begin_stop);
+    check(schedule != std::string::npos && observe != std::string::npos &&
+              begin != std::string::npos && begin_stop != std::string::npos &&
+              begin_snapshot != std::string::npos &&
+              schedule < observe && observe < begin &&
+              begin < begin_stop && begin_stop < begin_snapshot,
+          "contact horizons and footprint precede checked begin-time IK safe-stop inspection");
+    check(source_token_count(
+              footprint.c_str(), "g1_foot_contact_schedule_build(") == 1 &&
+          source_token_count(
+              footprint.c_str(), "g1_footprint_observe_v2(") == 1 &&
+          source_token_count(footprint.c_str(), "g1_ik_frame_begin(") == 1,
+          "footprint stage owns one schedule, observation, and IK begin call");
+    check(footprint.find("state.command") != std::string::npos &&
+          footprint.find("external.scene->terrain") != std::string::npos &&
+          footprint.find("external.scene->walkability") !=
+              std::string::npos &&
+          footprint.find("desired_rotation =") == std::string::npos,
+          "physical footprint consumes immutable command/scene data without rewriting heading");
 
-    const char* raw_snapshot = require_source_token(
-        matcher, "terrain_centerline_snapshot_compute_v2(",
-        "controller computes the ordinary v2 terrain snapshot");
-    const char* walkability_snapshot = require_source_token(
-        raw_snapshot,
-        "terrain_centerline_snapshot_apply_walkability_v2(",
-        "controller masks inaccessible terrain snapshot samples");
-    const char* walkability_grid = require_source_token(
-        walkability_snapshot, "active_scene.walkability,",
-        "terrain snapshot mask uses active walkability");
-    const char* animation_root = require_source_token(
-        walkability_grid, "state.bone_positions(0),",
-        "terrain snapshot mask uses animation root as feature base");
-    const char* footprint_origin = require_source_token(
-        animation_root, "state.simulation_position,",
-        "terrain snapshot mask uses authoritative simulation footprint");
-    const char* footprint_radius = require_source_token(
-        footprint_origin, "0.20f))",
-        "terrain snapshot mask uses the runtime footprint radius");
-    const char* finite_snapshot = require_source_token(
-        footprint_radius,
-        "for (int terrain_feature = 0; terrain_feature < 4; "
-        "++terrain_feature) {",
-        "controller validates the final terrain snapshot");
-    const char* query_copy = require_source_token(
-        finite_snapshot,
-        "query(offset++) = terrain_query_snapshot.values[terrain_feature];",
-        "controller copies the final terrain snapshot into the 31D query");
-    check(raw_snapshot < walkability_snapshot &&
-              walkability_snapshot < walkability_grid &&
-              walkability_grid < animation_root &&
-              animation_root < footprint_origin &&
-              footprint_origin < footprint_radius &&
-              footprint_radius < finite_snapshot &&
-              finite_snapshot < query_copy,
-          "raw snapshot, walkability mask, validation, and query copy are "
-          "ordered");
+    const std::string foot0 = body.substr(
+        foot0_stage, foot1_stage - foot0_stage);
+    const std::string foot1 = body.substr(
+        foot1_stage, final_fk_stage - foot1_stage);
+    check(source_token_count(foot0.c_str(), "g1_ik_frame_stage_foot(") == 1 &&
+          foot0.find(",0,") != std::string::npos &&
+          foot0.find("G1IkRejectionAfterFoot0") != std::string::npos,
+          "first-foot stage runs only foot zero and snapshots its real rejection checkpoint");
+    check(source_token_count(foot1.c_str(), "g1_ik_frame_stage_foot(") == 1 &&
+          foot1.find(",1,") != std::string::npos &&
+          foot1.find("G1IkRejectionAfterFoot1") != std::string::npos,
+          "second-foot stage runs only foot one and snapshots its real rejection checkpoint");
+
+    const std::string final_fk = body.substr(
+        final_fk_stage, pose_stage - final_fk_stage);
+    check(source_token_count(final_fk.c_str(), "g1_ik_frame_finish(") == 1 &&
+          final_fk.find("state.ik_candidate_bone_positions") !=
+              std::string::npos &&
+          final_fk.find("state.ik_candidate_bone_rotations") !=
+              std::string::npos,
+          "final-FK stage finishes the split transaction from candidate pose owners");
+
+    const std::string pose = body.substr(pose_stage);
+    const size_t clearance_budget = pose.find("g1_pose_clearance_budget(");
+    const size_t clearance = pose.find("g1_measure_pose_clearance(");
+    check(clearance_budget != std::string::npos &&
+              clearance != std::string::npos &&
+              clearance_budget < clearance &&
+              source_token_count(pose.c_str(),
+                  "g1_measure_pose_clearance(") == 1,
+          "pose stage certifies the final split-IK pose exactly once");
+    check(pose.find("state.footprint=scratch.footprint;") !=
+              std::string::npos &&
+          pose.find("state.footprint_status=G1FootprintOk;") !=
+              std::string::npos &&
+          pose.find("scratch.accepted_diagnostic_candidate") !=
+              std::string::npos,
+          "only the fully certified working frame stages accepted footprint and diagnostics");
+
+    check(body.find("g1_ik_frame_evaluate(") == std::string::npos &&
+          body.find("ik_two_bone(") == std::string::npos &&
+          body.find("ik_look_at(") == std::string::npos &&
+          body.find("if constexpr (ik_enabled)") == std::string::npos,
+          "controller runner contains no one-shot or legacy pose-IK authority");
 }
 
 static void test_f32_helpers_match_one_round_producer_operations()
@@ -3678,6 +3677,7 @@ int main(int argc, char** argv)
 {
     check(argc == 1 || argc == 6,
           "expected zero or five artifact arguments");
+    test_controller_task6_terrain_ik_pipeline();
     test_sidecar_loads_valid_file();
     test_sidecar_rejects_every_truncation();
     test_sidecar_rejects_invalid_schema_sizes_and_values();
@@ -3702,7 +3702,6 @@ int main(int argc, char** argv)
     test_blocked_planar_stop_preserves_vertical_bits();
     test_traversability_clip_is_planar_and_bit_preserving();
     test_walkability_guard_reaches_safe_stop();
-    test_controller_traversability_guard_data_flow();
     test_payload_allocation_failures_are_actionable_and_transactional();
     test_f32_helpers_match_one_round_producer_operations();
     test_heightfield_versions_preserve_v1_and_use_v2_triangles();
