@@ -7,6 +7,35 @@
     "aware": 4.0,
     "blind": 0.0
   },
+  "perturbations": [
+    {"id": "lateral_p003", "physical_lateral_offset_m": 0.03, "physical_yaw_offset_rad": 0.0},
+    {"id": "lateral_m003", "physical_lateral_offset_m": -0.03, "physical_yaw_offset_rad": 0.0},
+    {"id": "lateral_p006", "physical_lateral_offset_m": 0.06, "physical_yaw_offset_rad": 0.0},
+    {"id": "lateral_m006", "physical_lateral_offset_m": -0.06, "physical_yaw_offset_rad": 0.0},
+    {"id": "yaw_p002", "physical_lateral_offset_m": 0.0, "physical_yaw_offset_rad": 0.03490658503988659},
+    {"id": "yaw_m002", "physical_lateral_offset_m": 0.0, "physical_yaw_offset_rad": -0.03490658503988659},
+    {"id": "yaw_p004", "physical_lateral_offset_m": 0.0, "physical_yaw_offset_rad": 0.06981317007977318},
+    {"id": "yaw_m004", "physical_lateral_offset_m": 0.0, "physical_yaw_offset_rad": -0.06981317007977318},
+    {"id": "combined_p", "physical_lateral_offset_m": 0.03, "physical_yaw_offset_rad": 0.03490658503988659},
+    {"id": "combined_m", "physical_lateral_offset_m": -0.03, "physical_yaw_offset_rad": -0.03490658503988659}
+  ],
+  "trial_identity_contract": {
+    "shared_across_conditions_and_perturbations": [
+      "scene_id",
+      "route_id",
+      "command_artifact_id",
+      "command_sha256",
+      "duration_s",
+      "mm_initial_state_sha256"
+    ],
+    "shared_within_condition": ["mm_reference_sha256"],
+    "condition_fields": ["condition", "terrain_weight"],
+    "physical_perturbation_fields": [
+      "perturbation_id",
+      "physical_lateral_offset_m",
+      "physical_yaw_offset_rad"
+    ]
+  },
   "scenes": [
     {"scene_id": "grail-curb-low", "route_id": "curb-forward"},
     {"scene_id": "ramp-10-up-down", "route_id": "up-landing-down"},

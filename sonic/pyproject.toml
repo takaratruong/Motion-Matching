@@ -13,6 +13,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+test = [
+  "jsonschema==4.25.1",
+]
 integration = [
   "mujoco",
   "pyzmq",

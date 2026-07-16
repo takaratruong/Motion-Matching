@@ -70,7 +70,54 @@
           "overall_hypothesis": {
             "enum": ["supported", "not_supported", "inconclusive"]
           }
-        }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "terrain_classes": {
+                  "items": {
+                    "properties": {
+                      "awareness_verdict": {"const": "supported"}
+                    },
+                    "required": ["awareness_verdict"]
+                  }
+                }
+              },
+              "required": ["terrain_classes"]
+            },
+            "then": {
+              "properties": {
+                "overall_hypothesis": {"const": "supported"}
+              }
+            },
+            "else": {
+              "if": {
+                "properties": {
+                  "terrain_classes": {
+                    "contains": {
+                      "properties": {
+                        "awareness_verdict": {"const": "not_supported"}
+                      },
+                      "required": ["awareness_verdict"]
+                    }
+                  }
+                },
+                "required": ["terrain_classes"]
+              },
+              "then": {
+                "properties": {
+                  "overall_hypothesis": {"const": "not_supported"}
+                }
+              },
+              "else": {
+                "properties": {
+                  "overall_hypothesis": {"const": "inconclusive"}
+                }
+              }
+            }
+          }
+        ]
       }
     },
     {
@@ -121,7 +168,56 @@
             "pattern": "^[0-9a-f]{64}$"
           }
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"aware_successes": {"minimum": 8}},
+            "required": ["aware_successes"]
+          },
+          "then": {
+            "properties": {"composition_verdict": {"const": "supported"}}
+          },
+          "else": {
+            "properties": {
+              "composition_verdict": {"const": "not_supported"}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "aware_successes": {"minimum": 8},
+              "blind_successes": {"minimum": 8}
+            },
+            "required": ["aware_successes", "blind_successes"]
+          },
+          "then": {
+            "properties": {
+              "awareness_verdict": {"const": "inconclusive"}
+            }
+          },
+          "else": {
+            "if": {
+              "properties": {
+                "aware_successes": {"minimum": 8},
+                "pass_margin": {"minimum": 3}
+              },
+              "required": ["aware_successes", "pass_margin"]
+            },
+            "then": {
+              "properties": {
+                "awareness_verdict": {"const": "supported"}
+              }
+            },
+            "else": {
+              "properties": {
+                "awareness_verdict": {"const": "not_supported"}
+              }
+            }
+          }
+        }
+      ]
     }
   }
 }

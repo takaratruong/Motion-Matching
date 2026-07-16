@@ -119,6 +119,215 @@
       "then": {
         "properties": {"failure_layer": {"const": null}}
       }
+    },
+    {
+      "if": {
+        "properties": {"integration_pass": {"const": false}},
+        "required": ["integration_pass"]
+      },
+      "then": {
+        "properties": {
+          "dynamic_pass": {"const": false},
+          "failure_layer": {"const": "integration"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"integration_pass": {"const": true}},
+        "required": ["integration_pass"]
+      },
+      "then": {
+        "properties": {
+          "failure_layer": {"not": {"const": "integration"}}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"failure_layer": {"const": null}},
+        "required": ["failure_layer"]
+      },
+      "then": {
+        "properties": {
+          "integration_pass": {"const": true},
+          "dynamic_pass": {"const": true}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"stage": {"const": "A"}},
+        "required": ["stage"]
+      },
+      "then": {
+        "properties": {
+          "failure_layer": {
+            "enum": [
+              null,
+              "integration",
+              "gear_setup_model_simulator_or_harness",
+              "bridge_protocol"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"stage": {"const": "B"}},
+        "required": ["stage"]
+      },
+      "then": {
+        "properties": {
+          "failure_layer": {
+            "enum": [
+              null,
+              "integration",
+              "gear_setup_model_simulator_or_harness",
+              "bridge_protocol",
+              "joint_or_coordinate_conversion",
+              "reference_distribution_or_sonic_tracking"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"stage": {"const": "C"}},
+        "required": ["stage"]
+      },
+      "then": {
+        "properties": {
+          "failure_layer": {
+            "enum": [
+              null,
+              "integration",
+              "gear_setup_model_simulator_or_harness",
+              "bridge_protocol",
+              "motion_matching_reference",
+              "low_level_tracking_contact_domain_mismatch"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "stage": {"const": "A"},
+          "integration_pass": {"const": true},
+          "dynamic_pass": {"const": false}
+        },
+        "required": ["stage", "integration_pass", "dynamic_pass"]
+      },
+      "then": {
+        "properties": {
+          "failure_layer": {
+            "enum": [
+              "gear_setup_model_simulator_or_harness",
+              "bridge_protocol"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "stage": {"const": "B"},
+          "integration_pass": {"const": true},
+          "kinematic_pass": {"const": false}
+        },
+        "required": ["stage", "integration_pass", "kinematic_pass"]
+      },
+      "then": {
+        "properties": {
+          "failure_layer": {
+            "enum": [
+              "gear_setup_model_simulator_or_harness",
+              "bridge_protocol",
+              "joint_or_coordinate_conversion"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "stage": {"const": "B"},
+          "integration_pass": {"const": true},
+          "kinematic_pass": {"const": true},
+          "dynamic_pass": {"const": false}
+        },
+        "required": [
+          "stage",
+          "integration_pass",
+          "kinematic_pass",
+          "dynamic_pass"
+        ]
+      },
+      "then": {
+        "properties": {
+          "failure_layer": {
+            "enum": [
+              "gear_setup_model_simulator_or_harness",
+              "bridge_protocol",
+              "reference_distribution_or_sonic_tracking"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "stage": {"const": "C"},
+          "integration_pass": {"const": true},
+          "kinematic_pass": {"const": false}
+        },
+        "required": ["stage", "integration_pass", "kinematic_pass"]
+      },
+      "then": {
+        "properties": {
+          "failure_layer": {
+            "enum": [
+              "gear_setup_model_simulator_or_harness",
+              "bridge_protocol",
+              "motion_matching_reference"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "stage": {"const": "C"},
+          "integration_pass": {"const": true},
+          "kinematic_pass": {"const": true},
+          "dynamic_pass": {"const": false}
+        },
+        "required": [
+          "stage",
+          "integration_pass",
+          "kinematic_pass",
+          "dynamic_pass"
+        ]
+      },
+      "then": {
+        "properties": {
+          "failure_layer": {
+            "enum": [
+              "gear_setup_model_simulator_or_harness",
+              "bridge_protocol",
+              "low_level_tracking_contact_domain_mismatch"
+            ]
+          }
+        }
+      }
     }
   ],
   "$defs": {

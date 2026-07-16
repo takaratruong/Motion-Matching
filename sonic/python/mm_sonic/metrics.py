@@ -523,6 +523,190 @@ def attribute_failure(
     return None
 
 
+def validate_trial_verdict_semantics(document: Mapping[str, object]) -> None:
+    """Reject verdict-field combinations that contradict available evidence."""
+
+    if not isinstance(document, Mapping):
+        raise ContractError("trial verdict must be a mapping")
+    try:
+        stage = document["stage"]
+        integration_pass = document["integration_pass"]
+        kinematic_pass = document["kinematic_pass"]
+        dynamic_pass = document["dynamic_pass"]
+        failure_layer = document["failure_layer"]
+    except KeyError as error:
+        raise ContractError(
+            f"trial verdict is missing semantic field: {error.args[0]}"
+        ) from error
+    if stage not in {"A", "B", "C"}:
+        raise ContractError("trial verdict stage must be A, B, or C")
+    if any(
+        type(value) is not bool
+        for value in (integration_pass, kinematic_pass, dynamic_pass)
+    ):
+        raise ContractError("trial verdict pass fields must be booleans")
+    if failure_layer is not None and type(failure_layer) is not str:
+        raise ContractError("trial verdict failure layer must be a string or null")
+
+    early_layers = {
+        "gear_setup_model_simulator_or_harness",
+        "bridge_protocol",
+    }
+    stage_layers = {
+        "A": early_layers,
+        "B": early_layers
+        | {
+            "joint_or_coordinate_conversion",
+            "reference_distribution_or_sonic_tracking",
+        },
+        "C": early_layers
+        | {
+            "motion_matching_reference",
+            "low_level_tracking_contact_domain_mismatch",
+        },
+    }
+    if not integration_pass:
+        if dynamic_pass or failure_layer != "integration":
+            raise ContractError(
+                "terminal integration failure requires integration attribution"
+            )
+        return
+    if failure_layer == "integration":
+        raise ContractError(
+            "integration attribution requires integration_pass=false"
+        )
+
+    if (
+        stage == "A"
+        and dynamic_pass
+        and not kinematic_pass
+        and (failure_layer is None or failure_layer in early_layers)
+    ):
+        return
+    if stage == "A":
+        should_succeed = dynamic_pass
+        local_layer = None
+    elif not kinematic_pass:
+        should_succeed = False
+        local_layer = (
+            "joint_or_coordinate_conversion"
+            if stage == "B"
+            else "motion_matching_reference"
+        )
+    elif not dynamic_pass:
+        should_succeed = False
+        local_layer = (
+            "reference_distribution_or_sonic_tracking"
+            if stage == "B"
+            else "low_level_tracking_contact_domain_mismatch"
+        )
+    else:
+        should_succeed = True
+        local_layer = None
+    if should_succeed:
+        if failure_layer is not None:
+            raise ContractError("passing trial verdict requires null failure layer")
+        return
+    if failure_layer is None:
+        raise ContractError("failed trial verdict requires failure attribution")
+    if failure_layer not in stage_layers[stage]:
+        raise ContractError("trial verdict failure attribution contradicts its stage")
+    if failure_layer not in early_layers and failure_layer != local_layer:
+        raise ContractError("trial verdict failure attribution contradicts pass fields")
+
+
+def _validate_class_verdict_semantics(
+    record: Mapping[str, object],
+) -> tuple[str, SceneHypothesisVerdict]:
+    required = {
+        "scene_id",
+        "aware_successes",
+        "blind_successes",
+        "scored_trials_per_condition",
+        "aware_integration_failures",
+        "blind_integration_failures",
+        "kinematic_defects",
+        "pass_margin",
+        "composition_verdict",
+        "awareness_verdict",
+    }
+    if not isinstance(record, Mapping) or not required.issubset(record):
+        raise ContractError("hypothesis class verdict is incomplete")
+    scene_id = record["scene_id"]
+    if scene_id not in REGISTERED_TERRAIN_SCENE_IDS:
+        raise ContractError("hypothesis class scene is not registered")
+    scored = record["scored_trials_per_condition"]
+    if type(scored) is not int or scored != 10:
+        raise ContractError("hypothesis class scored trial count must equal 10")
+    aware = record["aware_successes"]
+    blind = record["blind_successes"]
+    integration_failures = (
+        record["aware_integration_failures"],
+        record["blind_integration_failures"],
+    )
+    try:
+        aggregate = aggregate_scene_hypothesis(aware, blind)
+    except ContractError as error:
+        raise ContractError("hypothesis class success counts are invalid") from error
+    if any(
+        type(value) is not int or value < 0 or value > scored
+        for value in integration_failures
+    ) or aware + integration_failures[0] > scored or blind + integration_failures[1] > scored:
+        raise ContractError(
+            "hypothesis class counts exceed scored trials per condition"
+        )
+    defects = record["kinematic_defects"]
+    if type(defects) is not int or defects < 0 or defects > 2:
+        raise ContractError("hypothesis class kinematic defect count is invalid")
+    if record["pass_margin"] != aggregate.pass_margin:
+        raise ContractError("hypothesis class pass_margin contradicts success counts")
+    expected_composition = (
+        "supported" if aggregate.composition_feasible else "not_supported"
+    )
+    if record["composition_verdict"] != expected_composition:
+        raise ContractError(
+            "hypothesis class composition verdict contradicts success counts"
+        )
+    if record["awareness_verdict"] != aggregate.awareness_effect:
+        raise ContractError(
+            "hypothesis class awareness verdict contradicts success counts"
+        )
+    return scene_id, aggregate
+
+
+def validate_hypothesis_verdict_semantics(
+    document: Mapping[str, object],
+) -> None:
+    """Recompute every arithmetic, per-class, and overall hypothesis field."""
+
+    if not isinstance(document, Mapping):
+        raise ContractError("hypothesis verdict must be a mapping")
+    status = document.get("status")
+    classes = document.get("terrain_classes")
+    overall_claim = document.get("overall_hypothesis")
+    if status not in {"complete", "incomplete", "not_run"}:
+        raise ContractError("hypothesis verdict status is invalid")
+    if type(classes) not in (list, tuple):
+        raise ContractError("hypothesis terrain_classes must be an array")
+    aggregates: dict[str, SceneHypothesisVerdict] = {}
+    for record in classes:
+        scene_id, aggregate = _validate_class_verdict_semantics(record)
+        if scene_id in aggregates:
+            raise ContractError("hypothesis terrain class is duplicated")
+        aggregates[scene_id] = aggregate
+    if status != "complete":
+        if overall_claim is not None:
+            raise ContractError("incomplete hypothesis requires null overall result")
+        return
+    if set(aggregates) != set(REGISTERED_TERRAIN_SCENE_IDS):
+        raise ContractError("complete hypothesis requires three registered classes")
+    expected = aggregate_overall_hypothesis(aggregates).awareness_effect
+    if overall_claim != expected:
+        raise ContractError(
+            "overall hypothesis contradicts the three class verdicts"
+        )
+
+
 def _canonical_bytes(buffer: CanonicalTargetBuffer) -> bytes:
     if not isinstance(buffer, CanonicalTargetBuffer):
         raise ContractError("delivery audit requires a canonical target buffer")

@@ -10,8 +10,10 @@ import tempfile
 from types import MappingProxyType
 import unittest
 
+from jsonschema import Draft202012Validator
 import numpy as np
 
+import mm_sonic.metrics as metrics_module
 from mm_sonic.artifacts import RunBundle
 from mm_sonic.coordinator import (
     LOGGER_JOINT_PERMUTATION,
@@ -45,6 +47,92 @@ from mm_sonic.zmq_v1 import encode_pose_v1
 
 
 ROOT = Path(__file__).resolve().parents[2]
+SHA_A = "a" * 64
+
+
+def verdict_metrics() -> dict[str, object]:
+    return {
+        "joint_position_rmse_rad": 0.1,
+        "pelvis_orientation_rms_rad": 0.01,
+        "swing_foot_scuff_count": 0,
+        "minimum_foot_clearance_m": 0.02,
+        "horizontal_path_drift_m": 0.03,
+        "joint_tracking_trace_rad": [0.1],
+        "pelvis_tracking_trace_rad": [0.01],
+        "contact_impulses_ns": [0.0],
+        "policy_execution_timing_ns": {"p50": 1, "p95": 2, "p99": 3},
+    }
+
+
+def trial_verdict(**changes: object) -> dict[str, object]:
+    document = {
+        "schema": "mm-sonic-trial-verdict/v1",
+        "stage": "C",
+        "scene_id": "grail-curb-low",
+        "terrain_weight": 4.0,
+        "expected_frames": 21,
+        "expected_sim_time_s": 0.4,
+        "integration_pass": True,
+        "kinematic_pass": True,
+        "dynamic_pass": True,
+        "failure_layer": None,
+        "metrics": verdict_metrics(),
+        "timings": {"generation": {"p50": 1, "p95": 2, "p99": 3}},
+        "evidence_hashes": {"run": SHA_A},
+    }
+    document.update(changes)
+    return document
+
+
+def class_verdict(
+    scene_id: str,
+    *,
+    aware_successes: int = 8,
+    blind_successes: int = 5,
+    aware_integration_failures: int = 0,
+    blind_integration_failures: int = 0,
+    kinematic_defects: int = 0,
+    **changes: object,
+) -> dict[str, object]:
+    aggregate = aggregate_scene_hypothesis(aware_successes, blind_successes)
+    document = {
+        "scene_id": scene_id,
+        "aware_successes": aware_successes,
+        "blind_successes": blind_successes,
+        "scored_trials_per_condition": 10,
+        "aware_integration_failures": aware_integration_failures,
+        "blind_integration_failures": blind_integration_failures,
+        "kinematic_defects": kinematic_defects,
+        "pass_margin": aggregate.pass_margin,
+        "composition_verdict": (
+            "supported" if aggregate.composition_feasible else "not_supported"
+        ),
+        "awareness_verdict": aggregate.awareness_effect,
+        "evidence_hashes": {"class": SHA_A},
+    }
+    document.update(changes)
+    return document
+
+
+def hypothesis_verdict(
+    terrain_classes: list[dict[str, object]],
+    *,
+    overall_hypothesis: str | None,
+    status: str = "complete",
+) -> dict[str, object]:
+    return {
+        "schema": "mm-sonic-hypothesis-verdict/v1",
+        "status": status,
+        "terrain_classes": terrain_classes,
+        "overall_hypothesis": overall_hypothesis,
+        "evidence_hashes": {"aggregate": SHA_A},
+    }
+
+
+def schema_validator(name: str) -> Draft202012Validator:
+    schema = json.loads((ROOT / "sonic/schemas" / name).read_text())
+    Draft202012Validator.check_schema(schema)
+    return Draft202012Validator(schema)
 
 
 def canonical_buffer(count: int = 4) -> CanonicalTargetBuffer:
@@ -720,6 +808,13 @@ class ThresholdAndVerdictTests(unittest.TestCase):
 
 
 class VerdictSchemaTests(unittest.TestCase):
+    def test_draft_2020_12_validator_is_an_exact_test_dependency(self) -> None:
+        pyproject = (ROOT / "sonic/pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn(
+            'test = [\n  "jsonschema==4.25.1",\n]',
+            pyproject,
+        )
+
     def test_verdict_schemas_are_strict_draft_2020_12_contracts(self) -> None:
         for name, schema_name in (
             ("trial_verdict_v1.schema.json", "mm-sonic-trial-verdict/v1"),
@@ -787,6 +882,209 @@ class VerdictSchemaTests(unittest.TestCase):
         self.assertEqual(complete_classes["minItems"], 3)
         self.assertEqual(complete_classes["maxItems"], 3)
         self.assertEqual(len(complete_classes["allOf"]), 3)
+
+    def test_real_trial_instances_enforce_terminal_integration_attribution(
+        self,
+    ) -> None:
+        validator = schema_validator("trial_verdict_v1.schema.json")
+        valid_failure = trial_verdict(
+            integration_pass=False,
+            kinematic_pass=False,
+            dynamic_pass=False,
+            failure_layer="integration",
+        )
+        self.assertTrue(validator.is_valid(trial_verdict()))
+        self.assertTrue(validator.is_valid(valid_failure))
+        for wrong_layer in (None, "bridge_protocol"):
+            contradictory = trial_verdict(
+                integration_pass=False,
+                kinematic_pass=False,
+                dynamic_pass=False,
+                failure_layer=wrong_layer,
+            )
+            with self.subTest(wrong_layer=wrong_layer):
+                self.assertFalse(
+                    validator.is_valid(contradictory),
+                    "terminal integration failure accepted wrong attribution",
+                )
+
+        self.assertTrue(
+            hasattr(metrics_module, "validate_trial_verdict_semantics"),
+            "missing runtime trial semantic validator",
+        )
+        metrics_module.validate_trial_verdict_semantics(trial_verdict())
+        metrics_module.validate_trial_verdict_semantics(valid_failure)
+        for wrong_layer in (None, "bridge_protocol"):
+            with self.subTest(runtime_wrong_layer=wrong_layer):
+                with self.assertRaisesRegex(ContractError, "integration"):
+                    metrics_module.validate_trial_verdict_semantics(
+                        trial_verdict(
+                            integration_pass=False,
+                            kinematic_pass=False,
+                            dynamic_pass=False,
+                            failure_layer=wrong_layer,
+                        )
+                    )
+
+        valid_stage_a = trial_verdict(
+            stage="A",
+            kinematic_pass=False,
+            dynamic_pass=True,
+            failure_layer=None,
+        )
+        unavailable_stage_a_evidence = trial_verdict(
+            stage="A",
+            kinematic_pass=False,
+            dynamic_pass=True,
+            failure_layer="bridge_protocol",
+        )
+        contradictory_stage_c = trial_verdict(
+            stage="C",
+            kinematic_pass=False,
+            dynamic_pass=True,
+            failure_layer="low_level_tracking_contact_domain_mismatch",
+        )
+        self.assertTrue(validator.is_valid(valid_stage_a))
+        self.assertTrue(
+            validator.is_valid(unavailable_stage_a_evidence),
+            "schema inferred an unavailable Stage A bridge result",
+        )
+        self.assertFalse(validator.is_valid(contradictory_stage_c))
+        metrics_module.validate_trial_verdict_semantics(valid_stage_a)
+        metrics_module.validate_trial_verdict_semantics(
+            unavailable_stage_a_evidence
+        )
+        with self.assertRaisesRegex(ContractError, "failure|pass"):
+            metrics_module.validate_trial_verdict_semantics(
+                contradictory_stage_c
+            )
+
+    def test_real_hypothesis_instances_cannot_contradict_aggregation(self) -> None:
+        validator = schema_validator("hypothesis_verdict_v1.schema.json")
+        unsupported_classes = [
+            class_verdict(scene_id, aware_successes=7, blind_successes=4)
+            for scene_id in (
+                "grail-curb-low",
+                "ramp-10-up-down",
+                "stairs-shallow",
+            )
+        ]
+        valid = hypothesis_verdict(
+            unsupported_classes,
+            overall_hypothesis="not_supported",
+        )
+        contradictory_overall = hypothesis_verdict(
+            unsupported_classes,
+            overall_hypothesis="supported",
+        )
+        self.assertTrue(validator.is_valid(valid))
+        self.assertFalse(
+            validator.is_valid(contradictory_overall),
+            "three not-supported classes accepted an overall supported claim",
+        )
+
+        contradictory_class = hypothesis_verdict(
+            [
+                class_verdict(
+                    scene_id,
+                    composition_verdict="not_supported",
+                    awareness_verdict="not_supported",
+                )
+                for scene_id in (
+                    "grail-curb-low",
+                    "ramp-10-up-down",
+                    "stairs-shallow",
+                )
+            ],
+            overall_hypothesis="not_supported",
+        )
+        self.assertFalse(
+            validator.is_valid(contradictory_class),
+            "per-class verdict accepted counts that imply support",
+        )
+
+        supported = hypothesis_verdict(
+            [
+                class_verdict(scene_id)
+                for scene_id in (
+                    "grail-curb-low",
+                    "ramp-10-up-down",
+                    "stairs-shallow",
+                )
+            ],
+            overall_hypothesis="supported",
+        )
+        inconclusive = hypothesis_verdict(
+            [
+                class_verdict(scene_id, aware_successes=10, blind_successes=8)
+                for scene_id in (
+                    "grail-curb-low",
+                    "ramp-10-up-down",
+                    "stairs-shallow",
+                )
+            ],
+            overall_hypothesis="inconclusive",
+        )
+        incomplete = hypothesis_verdict(
+            [],
+            status="incomplete",
+            overall_hypothesis=None,
+        )
+        for representative in (supported, inconclusive, incomplete):
+            self.assertTrue(validator.is_valid(representative))
+            metrics_module.validate_hypothesis_verdict_semantics(representative)
+
+        self.assertTrue(
+            hasattr(metrics_module, "validate_hypothesis_verdict_semantics"),
+            "missing runtime hypothesis semantic validator",
+        )
+        metrics_module.validate_hypothesis_verdict_semantics(valid)
+        contradictions = (
+            ("overall", contradictory_overall),
+            ("composition", contradictory_class),
+            (
+                "pass_margin",
+                hypothesis_verdict(
+                    [
+                        class_verdict(
+                            scene_id,
+                            aware_successes=8,
+                            blind_successes=5,
+                            pass_margin=2,
+                        )
+                        for scene_id in (
+                            "grail-curb-low",
+                            "ramp-10-up-down",
+                            "stairs-shallow",
+                        )
+                    ],
+                    overall_hypothesis="supported",
+                ),
+            ),
+            (
+                "counts",
+                hypothesis_verdict(
+                    [
+                        class_verdict(
+                            scene_id,
+                            aware_successes=8,
+                            blind_successes=5,
+                            aware_integration_failures=3,
+                        )
+                        for scene_id in (
+                            "grail-curb-low",
+                            "ramp-10-up-down",
+                            "stairs-shallow",
+                        )
+                    ],
+                    overall_hypothesis="supported",
+                ),
+            ),
+        )
+        for expected, document in contradictions:
+            with self.subTest(expected=expected):
+                with self.assertRaisesRegex(ContractError, expected):
+                    metrics_module.validate_hypothesis_verdict_semantics(document)
 
 
 if __name__ == "__main__":

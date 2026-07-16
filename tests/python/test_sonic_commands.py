@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+from dataclasses import fields as dataclass_fields
+from dataclasses import replace
 import hashlib
 import json
 import math
@@ -11,6 +13,7 @@ import subprocess
 import tempfile
 import unittest
 
+import mm_sonic.commands as commands_module
 from mm_sonic.commands import (
     CommandSample,
     PERTURBATIONS,
@@ -219,6 +222,165 @@ class CommandValueTests(unittest.TestCase):
             ),
         )
 
+    def test_stage_c_trial_expansion_freezes_every_scientific_identity(self) -> None:
+        self.assertTrue(
+            hasattr(commands_module, "expand_stage_c_scored_trials"),
+            "missing immutable Stage C trial expander",
+        )
+        trials = commands_module.expand_stage_c_scored_trials(
+            scene_id="grail-curb-low",
+            route_id="curb-forward",
+            command_artifact_id="commands/grail-curb-low.json",
+            command_sha256="a" * 64,
+            duration_s=4.8,
+            mm_initial_state_sha256="b" * 64,
+            mm_reference_sha256_by_condition={
+                "aware": "c" * 64,
+                "blind": "d" * 64,
+            },
+        )
+        self.assertEqual(len(trials), 20)
+        self.assertTrue(
+            all(
+                isinstance(trial, commands_module.StageCTrialIdentity)
+                for trial in trials
+            )
+        )
+        with self.assertRaises(FrozenInstanceError):
+            trials[0].condition = "blind"
+
+        expected_pairs = {
+            (condition, perturbation_id)
+            for condition in ("aware", "blind")
+            for perturbation_id, _lateral, _yaw in PERTURBATIONS
+        }
+        self.assertEqual(
+            {(trial.condition, trial.perturbation_id) for trial in trials},
+            expected_pairs,
+        )
+        global_fields = (
+            "scene_id",
+            "route_id",
+            "command_artifact_id",
+            "command_sha256",
+            "duration_s",
+            "mm_initial_state_sha256",
+        )
+        for name in global_fields:
+            self.assertEqual({getattr(trial, name) for trial in trials}, {
+                getattr(trials[0], name)
+            })
+        expected_weights = {"aware": 4.0, "blind": 0.0}
+        expected_references = {"aware": "c" * 64, "blind": "d" * 64}
+        expected_perturbations = {
+            perturbation_id: (lateral, yaw)
+            for perturbation_id, lateral, yaw in PERTURBATIONS
+        }
+        for condition in expected_weights:
+            condition_trials = tuple(
+                trial for trial in trials if trial.condition == condition
+            )
+            self.assertEqual(len(condition_trials), 10)
+            self.assertEqual(
+                {trial.terrain_weight for trial in condition_trials},
+                {expected_weights[condition]},
+            )
+            self.assertEqual(
+                {trial.mm_reference_sha256 for trial in condition_trials},
+                {expected_references[condition]},
+            )
+            for trial in condition_trials:
+                self.assertEqual(
+                    (
+                        trial.physical_lateral_offset_m,
+                        trial.physical_yaw_offset_rad,
+                    ),
+                    expected_perturbations[trial.perturbation_id],
+                )
+
+        self.assertEqual(
+            tuple(field.name for field in dataclass_fields(trials[0])),
+            (
+                "scene_id",
+                "route_id",
+                "condition",
+                "terrain_weight",
+                "perturbation_id",
+                "physical_lateral_offset_m",
+                "physical_yaw_offset_rad",
+                "command_artifact_id",
+                "command_sha256",
+                "duration_s",
+                "mm_initial_state_sha256",
+                "mm_reference_sha256",
+            ),
+        )
+
+    def test_stage_c_trial_validator_rejects_every_identity_confound(self) -> None:
+        self.assertTrue(
+            hasattr(commands_module, "validate_stage_c_scored_trials"),
+            "missing Stage C trial invariance validator",
+        )
+        trials = commands_module.expand_stage_c_scored_trials(
+            scene_id="ramp-10-up-down",
+            route_id="up-landing-down",
+            command_artifact_id="commands/ramp.json",
+            command_sha256="1" * 64,
+            duration_s=12.0,
+            mm_initial_state_sha256="2" * 64,
+            mm_reference_sha256_by_condition={
+                "aware": "3" * 64,
+                "blind": "4" * 64,
+            },
+        )
+        self.assertEqual(
+            commands_module.validate_stage_c_scored_trials(trials),
+            trials,
+        )
+        mutations = (
+            ("missing trial", trials[:-1]),
+            ("duplicate trial", trials[:-1] + (trials[0],)),
+            (
+                "command artifact",
+                (
+                    replace(
+                        trials[0],
+                        command_artifact_id="commands/replacement.json",
+                    ),
+                )
+                + trials[1:],
+            ),
+            (
+                "command_sha256",
+                (replace(trials[0], command_sha256="5" * 64),) + trials[1:],
+            ),
+            (
+                "duration_s",
+                (replace(trials[0], duration_s=13.0),) + trials[1:],
+            ),
+            (
+                "initial state",
+                (
+                    replace(trials[0], mm_initial_state_sha256="6" * 64),
+                )
+                + trials[1:],
+            ),
+            (
+                "reference",
+                (replace(trials[0], mm_reference_sha256="7" * 64),)
+                + trials[1:],
+            ),
+        )
+        for expected, changed in mutations:
+            with self.subTest(expected=expected):
+                with self.assertRaisesRegex(ContractError, expected):
+                    commands_module.validate_stage_c_scored_trials(changed)
+
+        with self.assertRaisesRegex(ContractError, "terrain weight"):
+            replace(trials[0], terrain_weight=0.0)
+        with self.assertRaisesRegex(ContractError, "physical perturbation"):
+            replace(trials[0], physical_lateral_offset_m=0.031)
+
     def test_direct_route_definitions_enforce_the_compiler_invariants(self) -> None:
         valid = {
             "scene_id": "scene",
@@ -403,6 +565,31 @@ class RegistryTests(unittest.TestCase):
                 "source_rate_hz": 25,
                 "target_rate_hz": 50,
                 "conditions": {"aware": 4.0, "blind": 0.0},
+                "perturbations": [
+                    {
+                        "id": perturbation_id,
+                        "physical_lateral_offset_m": lateral,
+                        "physical_yaw_offset_rad": yaw,
+                    }
+                    for perturbation_id, lateral, yaw in PERTURBATIONS
+                ],
+                "trial_identity_contract": {
+                    "shared_across_conditions_and_perturbations": [
+                        "scene_id",
+                        "route_id",
+                        "command_artifact_id",
+                        "command_sha256",
+                        "duration_s",
+                        "mm_initial_state_sha256",
+                    ],
+                    "shared_within_condition": ["mm_reference_sha256"],
+                    "condition_fields": ["condition", "terrain_weight"],
+                    "physical_perturbation_fields": [
+                        "perturbation_id",
+                        "physical_lateral_offset_m",
+                        "physical_yaw_offset_rad",
+                    ],
+                },
                 "scenes": [
                     {"scene_id": "grail-curb-low", "route_id": "curb-forward"},
                     {"scene_id": "ramp-10-up-down", "route_id": "up-landing-down"},
