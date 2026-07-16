@@ -1,0 +1,221 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "mm-chunk/v1",
+  "title": "Transactional motion-matching source chunk v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "session_id",
+    "candidate_id",
+    "predecessor_id",
+    "source_rate_hz",
+    "source_intervals",
+    "timestamps_s",
+    "source_joint_names",
+    "target_joint_names",
+    "joint_position_source",
+    "joint_velocity_source",
+    "physical_pelvis_position_holden",
+    "physical_pelvis_orientation_holden",
+    "virtual_root_position_holden",
+    "virtual_root_orientation_holden",
+    "selected_database_frame",
+    "searched",
+    "transitioned",
+    "terrain_cost",
+    "terrain_values",
+    "terrain_points_holden",
+    "support_height",
+    "support_target",
+    "scene",
+    "command",
+    "artifacts"
+  ],
+  "$defs": {
+    "float": {"type": "number"},
+    "vec3": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/float"},
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "quat": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/float"},
+      "minItems": 4,
+      "maxItems": 4
+    },
+    "joints": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/float"},
+      "minItems": 29,
+      "maxItems": 29
+    },
+    "jointNames": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "minItems": 29,
+      "maxItems": 29,
+      "uniqueItems": true
+    },
+    "boundaryJoints": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/joints"},
+      "minItems": 11,
+      "maxItems": 11
+    },
+    "boundaryVec3": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/vec3"},
+      "minItems": 11,
+      "maxItems": 11
+    },
+    "boundaryQuat": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/quat"},
+      "minItems": 11,
+      "maxItems": 11
+    },
+    "stepFloat": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/float"},
+      "minItems": 10,
+      "maxItems": 10
+    },
+    "stepBool": {
+      "type": "array",
+      "items": {"type": "boolean"},
+      "minItems": 10,
+      "maxItems": 10
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  },
+  "properties": {
+    "schema": {"const": "mm-chunk/v1"},
+    "session_id": {"type": "string", "minLength": 1},
+    "candidate_id": {"type": "string", "minLength": 1},
+    "predecessor_id": {
+      "type": ["string", "null"]
+    },
+    "source_rate_hz": {"const": 25},
+    "source_intervals": {"const": 10},
+    "timestamps_s": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/float"},
+      "minItems": 11,
+      "maxItems": 11
+    },
+    "source_joint_names": {"$ref": "#/$defs/jointNames"},
+    "target_joint_names": {"$ref": "#/$defs/jointNames"},
+    "joint_position_source": {"$ref": "#/$defs/boundaryJoints"},
+    "joint_velocity_source": {"$ref": "#/$defs/boundaryJoints"},
+    "physical_pelvis_position_holden": {"$ref": "#/$defs/boundaryVec3"},
+    "physical_pelvis_orientation_holden": {"$ref": "#/$defs/boundaryQuat"},
+    "virtual_root_position_holden": {"$ref": "#/$defs/boundaryVec3"},
+    "virtual_root_orientation_holden": {"$ref": "#/$defs/boundaryQuat"},
+    "selected_database_frame": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": 0},
+      "minItems": 10,
+      "maxItems": 10
+    },
+    "searched": {"$ref": "#/$defs/stepBool"},
+    "transitioned": {"$ref": "#/$defs/stepBool"},
+    "terrain_cost": {"$ref": "#/$defs/stepFloat"},
+    "terrain_values": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": {"$ref": "#/$defs/float"},
+        "minItems": 4,
+        "maxItems": 4
+      },
+      "minItems": 10,
+      "maxItems": 10
+    },
+    "terrain_points_holden": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": {"$ref": "#/$defs/vec3"},
+        "minItems": 4,
+        "maxItems": 4
+      },
+      "minItems": 10,
+      "maxItems": 10
+    },
+    "support_height": {"$ref": "#/$defs/stepFloat"},
+    "support_target": {"$ref": "#/$defs/stepFloat"},
+    "scene": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scene_id",
+        "route_id",
+        "terrain_weight",
+        "coordinate_signature",
+        "heightfield_sha256",
+        "mesh_sha256",
+        "walkability_sha256"
+      ],
+      "properties": {
+        "scene_id": {"type": "string", "minLength": 1},
+        "route_id": {"type": "string", "minLength": 1},
+        "terrain_weight": {"$ref": "#/$defs/float"},
+        "coordinate_signature": {"type": "string", "minLength": 1},
+        "heightfield_sha256": {"$ref": "#/$defs/sha256"},
+        "mesh_sha256": {"$ref": "#/$defs/sha256"},
+        "walkability_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requested_velocity_holden",
+        "desired_heading_holden_wxyz",
+        "applied_velocity_holden"
+      ],
+      "properties": {
+        "requested_velocity_holden": {"$ref": "#/$defs/vec3"},
+        "desired_heading_holden_wxyz": {"$ref": "#/$defs/quat"},
+        "applied_velocity_holden": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/vec3"},
+          "minItems": 10,
+          "maxItems": 10
+        }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "build_commit",
+        "joint_contract_sha256",
+        "motion_manifest_sha256",
+        "database_sha256",
+        "terrain_features_sha256",
+        "terrain_support_sha256",
+        "scene_index_sha256",
+        "skeleton_signature",
+        "coordinate_signature"
+      ],
+      "properties": {
+        "build_commit": {"type": "string", "minLength": 1},
+        "joint_contract_sha256": {"$ref": "#/$defs/sha256"},
+        "motion_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "database_sha256": {"$ref": "#/$defs/sha256"},
+        "terrain_features_sha256": {"$ref": "#/$defs/sha256"},
+        "terrain_support_sha256": {"$ref": "#/$defs/sha256"},
+        "scene_index_sha256": {"$ref": "#/$defs/sha256"},
+        "skeleton_signature": {"$ref": "#/$defs/sha256"},
+        "coordinate_signature": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}
