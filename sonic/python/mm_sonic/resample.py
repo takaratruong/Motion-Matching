@@ -23,7 +23,7 @@ _SOURCE_INTERVALS = 10
 _SOURCE_BOUNDARIES = 11
 _TARGET_ROWS = 20
 _JOINT_COUNT = 29
-_SOURCE_DT_S = 0.04
+_SOURCE_DT_S = float(np.float32(0.04))
 _MINIMUM_QUATERNION_NORM = 1.0e-12
 _SLERP_LINEAR_THRESHOLD = 0.9995
 
@@ -379,18 +379,10 @@ def resample_source_chunk(
             _SOURCE_DT_S,
             0.5,
         )
-        right_q, right_v = hermite_pair(
-            mapped_position_f64[interval],
-            mapped_velocity_f64[interval],
-            mapped_position_f64[interval + 1],
-            mapped_velocity_f64[interval + 1],
-            _SOURCE_DT_S,
-            1.0,
-        )
         target_position[midpoint] = midpoint_q
-        target_position[right] = right_q
+        target_position[right] = mapped_position[interval + 1]
         target_velocity[midpoint] = midpoint_v
-        target_velocity[right] = right_v
+        target_velocity[right] = mapped_velocity[interval + 1]
         target_physical_position[midpoint] = (
             physical_position[interval].astype(np.float64)
             + physical_position[interval + 1].astype(np.float64)

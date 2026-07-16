@@ -355,6 +355,82 @@ class SourceChunkResamplingTests(unittest.TestCase):
             expected_velocity.view(np.uint32),
         )
 
+    def test_midpoint_uses_binary32_source_interval_promoted_to_float64(self):
+        row = next(row for row in self.contract.rows if row.target_index == 0)
+        # Fixed binary32 endpoints/derivatives and fixed uint32 oracles.  The
+        # expected midpoint uses dt bits 0x3d23d70a promoted to binary64; a
+        # binary64 0.04 literal instead produces q=0xbc70d1a4, v=0x417da97c.
+        fixture = np.array(
+            [0xBEA78EB6, 0x41147FFC, 0x3D7E2899, 0xC164CD2F],
+            dtype=np.uint32,
+        ).view(np.float32)
+        position = self.chunk.joint_position_source.copy()
+        velocity = self.chunk.joint_velocity_source.copy()
+        position[0, row.source_index] = fixture[0]
+        velocity[0, row.source_index] = fixture[1]
+        position[1, row.source_index] = fixture[2]
+        velocity[1, row.source_index] = fixture[3]
+        candidate = replace(
+            self.chunk,
+            joint_position_source=readonly(position),
+            joint_velocity_source=readonly(velocity),
+        )
+
+        actual = resample_source_chunk(candidate, self.contract)
+
+        self.assertEqual(
+            int(actual.joint_position[0, row.target_index].view(np.uint32)),
+            0xBC70D1A7,
+        )
+        self.assertEqual(
+            int(actual.joint_velocity[0, row.target_index].view(np.uint32)),
+            0x417DA97D,
+        )
+
+    def test_right_endpoints_copy_signed_zero_position_and_velocity_bits(self):
+        row = next(row for row in self.contract.rows if row.target_index == 0)
+        negative_zero = np.array([0x80000000], dtype=np.uint32).view(np.float32)[0]
+        position = self.chunk.joint_position_source.copy()
+        velocity = self.chunk.joint_velocity_source.copy()
+        position[0, row.source_index] = np.float32(0.25)
+        velocity[0, row.source_index] = np.float32(0.5)
+        position[1, row.source_index] = negative_zero
+        velocity[1, row.source_index] = negative_zero
+        candidate = replace(
+            self.chunk,
+            joint_position_source=readonly(position),
+            joint_velocity_source=readonly(velocity),
+        )
+        mapped_position = map_source_joints(
+            candidate.joint_position_source,
+            candidate.source_joint_names,
+            self.contract,
+        )
+        mapped_velocity = map_source_joints(
+            candidate.joint_velocity_source,
+            candidate.source_joint_names,
+            self.contract,
+        )
+        self.assertEqual(
+            int(mapped_position[1, row.target_index].view(np.uint32)),
+            0x80000000,
+        )
+        self.assertEqual(
+            int(mapped_velocity[1, row.target_index].view(np.uint32)),
+            0x80000000,
+        )
+
+        actual = resample_source_chunk(candidate, self.contract)
+
+        self.assertEqual(
+            int(actual.joint_position[1, row.target_index].view(np.uint32)),
+            0x80000000,
+        )
+        self.assertEqual(
+            int(actual.joint_velocity[1, row.target_index].view(np.uint32)),
+            0x80000000,
+        )
+
     def test_positions_are_linear_and_orientations_use_shortest_path_slerp(self):
         actual = resample_source_chunk(self.chunk, self.contract)
         physical = holden_to_mujoco_vectors(
