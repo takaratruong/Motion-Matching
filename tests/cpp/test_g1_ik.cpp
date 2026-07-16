@@ -9391,6 +9391,103 @@ static void test_runtime_rejection_snapshot_contract()
 
 static int run_runtime_parity_mode()
 {
+    const vec3 reach_root(
+        g1_test_float_from_bits(UINT32_C(0x00000000)),
+        g1_test_float_from_bits(UINT32_C(0x00000000)),
+        g1_test_float_from_bits(UINT32_C(0x00000000)));
+    const vec3 reach_middle(
+        g1_test_float_from_bits(UINT32_C(0x00000000)),
+        g1_test_float_from_bits(UINT32_C(0xbecccccd)),
+        g1_test_float_from_bits(UINT32_C(0x00000000)));
+    const vec3 reach_end(
+        g1_test_float_from_bits(UINT32_C(0x00000000)),
+        g1_test_float_from_bits(UINT32_C(0xbf4ccccd)),
+        g1_test_float_from_bits(UINT32_C(0x00000000)));
+    const vec3 reach_requested(
+        g1_test_float_from_bits(UINT32_C(0x40000000)),
+        g1_test_float_from_bits(UINT32_C(0x3752d427)),
+        g1_test_float_from_bits(UINT32_C(0x00000000)));
+    const float reach_buffer =
+        g1_test_float_from_bits(UINT32_C(0x3c75c28f));
+    IKReachShell reach_shell = {};
+    IKTargetProjection projection = {};
+    if (!ik_effective_reach_shell(
+            reach_shell,
+            reach_root,
+            reach_middle,
+            reach_end,
+            reach_buffer) ||
+        !ik_project_target(
+            projection,
+            reach_root,
+            reach_middle,
+            reach_end,
+            reach_requested,
+            reach_buffer)) {
+        return 1;
+    }
+
+    const vec3 current_contact_origin(
+        g1_test_float_from_bits(UINT32_C(0x3e800000)),
+        g1_test_float_from_bits(UINT32_C(0x3dcccccd)),
+        g1_test_float_from_bits(UINT32_C(0xbe000000)));
+    const vec3 current_ankle_origin(
+        g1_test_float_from_bits(UINT32_C(0x3e4ccccd)),
+        g1_test_float_from_bits(UINT32_C(0x3e19999a)),
+        g1_test_float_from_bits(UINT32_C(0xbe000000)));
+    const vec3 desired_sole_center(
+        g1_test_float_from_bits(UINT32_C(0x3e99999a)),
+        g1_test_float_from_bits(UINT32_C(0x3d4ccccd)),
+        g1_test_float_from_bits(UINT32_C(0xbe4ccccd)));
+    const quat contact_rotations[2] = {
+        quat(
+            g1_test_float_from_bits(UINT32_C(0x3f800000)),
+            g1_test_float_from_bits(UINT32_C(0x00000000)),
+            g1_test_float_from_bits(UINT32_C(0x00000000)),
+            g1_test_float_from_bits(UINT32_C(0x00000000))),
+        quat(
+            g1_test_float_from_bits(UINT32_C(0x3f3504f3)),
+            g1_test_float_from_bits(UINT32_C(0x00000000)),
+            g1_test_float_from_bits(UINT32_C(0x3f3504f3)),
+            g1_test_float_from_bits(UINT32_C(0x00000000))),
+    };
+    const vec3 surface_normals[3] = {
+        vec3(
+            g1_test_float_from_bits(UINT32_C(0x00000000)),
+            g1_test_float_from_bits(UINT32_C(0x3f800000)),
+            g1_test_float_from_bits(UINT32_C(0x00000000))),
+        vec3(
+            g1_test_float_from_bits(UINT32_C(0xbf19999a)),
+            g1_test_float_from_bits(UINT32_C(0x3f4ccccd)),
+            g1_test_float_from_bits(UINT32_C(0x00000000))),
+        vec3(
+            g1_test_float_from_bits(UINT32_C(0x00000000)),
+            g1_test_float_from_bits(UINT32_C(0x3f4ccccd)),
+            g1_test_float_from_bits(UINT32_C(0x3f19999a))),
+    };
+    const G1LegConfig configs[2] = {
+        g1_left_leg_config(),
+        g1_right_leg_config(),
+    };
+    G1PhysicalSolePositionTarget physical_targets[2][3] = {};
+    char physical_error[256] = {};
+    for (int leg = 0; leg < 2; ++leg) {
+        for (int normal = 0; normal < 3; ++normal) {
+            if (!g1_physical_sole_position_target(
+                    physical_targets[leg][normal],
+                    current_contact_origin,
+                    contact_rotations[leg],
+                    current_ankle_origin,
+                    configs[leg],
+                    desired_sole_center,
+                    surface_normals[normal],
+                    physical_error,
+                    static_cast<int>(sizeof(physical_error)))) {
+                return 1;
+            }
+        }
+    }
+
     G1RuntimeFixture fixture;
     g1_runtime_make_fixture(fixture);
     G1SwingHistory history = fixture.state.feet[0].swing;
@@ -9404,6 +9501,50 @@ static int run_runtime_parity_mode()
         validation, g1_swing_foot_clearance_budget(),
         history, fixture.field, g1_left_leg_config(),
         centers, false, 0.04f, NULL, 0);
+    if (status != G1ClearanceOk) {
+        return 1;
+    }
+    std::printf(
+        "reach-shell min=%016llx max=%016llx min32=%08x max32=%08x\n",
+        static_cast<unsigned long long>(
+            g1_runtime_double_bits(reach_shell.minimum_distance_m)),
+        static_cast<unsigned long long>(
+            g1_runtime_double_bits(reach_shell.maximum_distance_m)),
+        terrain_float_bits(reach_shell.minimum_distance_f32_m),
+        terrain_float_bits(reach_shell.maximum_distance_f32_m));
+    std::printf(
+        "target-projection reachable=%u clamped=%08x,%08x,%08x "
+        "raw=%08x distance=%08x min=%08x max=%08x\n",
+        projection.reachable ? 1U : 0U,
+        terrain_float_bits(projection.clamped_target.x),
+        terrain_float_bits(projection.clamped_target.y),
+        terrain_float_bits(projection.clamped_target.z),
+        terrain_float_bits(projection.raw_distance_m),
+        terrain_float_bits(projection.clamped_distance_m),
+        terrain_float_bits(projection.minimum_distance_m),
+        terrain_float_bits(projection.maximum_distance_m));
+    for (int leg = 0; leg < 2; ++leg) {
+        for (int normal = 0; normal < 3; ++normal) {
+            const G1PhysicalSolePositionTarget& target =
+                physical_targets[leg][normal];
+            std::printf(
+                "physical-sole leg=%u normal=%u "
+                "rotation=%08x,%08x,%08x,%08x "
+                "contact=%08x,%08x,%08x ankle=%08x,%08x,%08x\n",
+                static_cast<unsigned int>(leg),
+                static_cast<unsigned int>(normal),
+                terrain_float_bits(target.contact_rotation.w),
+                terrain_float_bits(target.contact_rotation.x),
+                terrain_float_bits(target.contact_rotation.y),
+                terrain_float_bits(target.contact_rotation.z),
+                terrain_float_bits(target.contact_origin.x),
+                terrain_float_bits(target.contact_origin.y),
+                terrain_float_bits(target.contact_origin.z),
+                terrain_float_bits(target.ankle_target.x),
+                terrain_float_bits(target.ankle_target.y),
+                terrain_float_bits(target.ankle_target.z));
+        }
+    }
     std::printf(
         "runtime-parity status=%u ladder=%08x,%08x,%08x "
         "margins=%016llx,%016llx work=%u,%u,%u,%u,%u,%u\n",
@@ -9421,7 +9562,7 @@ static int run_runtime_parity_mode()
         validation.work.face_patches,
         validation.work.candidate_tests,
         validation.work.subdivision_nodes);
-    return status == G1ClearanceOk ? 0 : 1;
+    return 0;
 }
 
 #endif
