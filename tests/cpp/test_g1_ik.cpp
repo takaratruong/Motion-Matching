@@ -1189,6 +1189,47 @@ static bool g1_test_quat_bits_same(quat left, quat right)
            g1_test_float_same(left.z, right.z);
 }
 
+template<typename T>
+struct G1TestByteSnapshot
+{
+    unsigned char bytes[sizeof(T)];
+
+    explicit G1TestByteSnapshot(const T& value)
+    {
+        std::memcpy(bytes, &value, sizeof(value));
+    }
+
+    bool same(const T& value) const
+    {
+        return std::memcmp(bytes, &value, sizeof(value)) == 0;
+    }
+};
+
+template<typename T>
+static void g1_test_poison_bytes(T& value, unsigned char byte)
+{
+    unsigned char* const bytes =
+        reinterpret_cast<unsigned char*>(&value);
+    for (size_t index = 0; index < sizeof(value); ++index) {
+        bytes[index] = byte;
+    }
+}
+
+template<typename Destination, typename Source>
+static void g1_test_copy_prefix_bytes(
+    Destination& destination, const Source& source)
+{
+    static_assert(sizeof(destination) >= sizeof(source),
+                  "test alias destination owns the source prefix");
+    unsigned char* const destination_bytes =
+        reinterpret_cast<unsigned char*>(&destination);
+    const unsigned char* const source_bytes =
+        reinterpret_cast<const unsigned char*>(&source);
+    for (size_t index = 0; index < sizeof(source); ++index) {
+        destination_bytes[index] = source_bytes[index];
+    }
+}
+
 static bool g1_test_target_projection_same(
     const IKTargetProjection& left, const IKTargetProjection& right)
 {
@@ -1248,6 +1289,216 @@ static bool g1_test_two_bone_result_same(
                right.middle_correction_radians) &&
            g1_test_target_projection_same(left.target, right.target) &&
            g1_test_bend_selection_same(left.bend, right.bend);
+}
+
+static void test_shared_effective_reach_shell()
+{
+    struct ReachFixture
+    {
+        vec3 root;
+        vec3 middle;
+        vec3 end;
+        vec3 requested;
+        float buffer;
+        bool reachable;
+        const char* materialize_message;
+        const char* projection_message;
+    };
+
+    const float outer = 0.8f;
+    const float outer_inside = std::nextafter(outer, 0.0f);
+    const float outer_outside = std::nextafter(
+        outer, std::numeric_limits<float>::infinity());
+    const ReachFixture fixtures[] = {
+        {
+            vec3(0.1f, 0.2f, -0.3f),
+            vec3(-0.05f, -0.18f, -0.28f),
+            vec3(-0.1f, -0.5f, -0.24f),
+            vec3(-0.1f, -0.5f, -0.24f),
+            0.015f,
+            true,
+            "ordinary shared reach shell materializes",
+            "ordinary projection consumes shared reach shell",
+        },
+        {
+            vec3(),
+            vec3(0.0f, -0.4f, 0.0f),
+            vec3(0.001f, -0.784f, 0.0f),
+            vec3(0.001f, -0.784f, 0.0f),
+            0.015f,
+            true,
+            "nearly extended shared reach shell materializes",
+            "nearly extended projection consumes shared reach shell",
+        },
+        {
+            vec3(),
+            vec3(0.0f, -0.4f, 0.0f),
+            vec3(0.0f, -0.2f, 0.0f),
+            vec3(0.0f, -0.2f, 0.0f),
+            0.015f,
+            true,
+            "folded minimum shared reach shell materializes",
+            "folded minimum projection consumes shared reach shell",
+        },
+        {
+            vec3(),
+            vec3(0.0f, -0.4f, 0.0f),
+            vec3(0.0f, -outer, 0.0f),
+            vec3(0.0f, -outer, 0.0f),
+            0.015f,
+            true,
+            "exact-boundary shared reach shell materializes",
+            "exact-boundary projection consumes shared reach shell",
+        },
+        {
+            vec3(),
+            vec3(0.0f, -0.4f, 0.0f),
+            vec3(0.0f, -outer, 0.0f),
+            vec3(0.0f, -outer_inside, 0.0f),
+            0.015f,
+            true,
+            "one-ULP-inside shared reach shell materializes",
+            "one-ULP-inside projection consumes shared reach shell",
+        },
+        {
+            vec3(),
+            vec3(0.0f, -0.4f, 0.0f),
+            vec3(0.0f, -outer, 0.0f),
+            vec3(0.0f, -outer_outside, 0.0f),
+            0.015f,
+            false,
+            "one-ULP-outside shared reach shell materializes",
+            "one-ULP-outside projection consumes shared reach shell",
+        },
+    };
+
+    for (const ReachFixture& fixture : fixtures) {
+        IKReachShell shell = {};
+        check(ik_effective_reach_shell(
+                  shell,
+                  fixture.root,
+                  fixture.middle,
+                  fixture.end,
+                  fixture.buffer),
+              fixture.materialize_message);
+        IKTargetProjection projection = {};
+        check(ik_project_target(
+                  projection,
+                  fixture.root,
+                  fixture.middle,
+                  fixture.end,
+                  fixture.requested,
+                  fixture.buffer),
+              fixture.projection_message);
+        check(projection.reachable == fixture.reachable,
+              "shared reach boundary classification is exact");
+        check(terrain_float_bits(projection.minimum_distance_m) ==
+                  terrain_float_bits(shell.minimum_distance_f32_m) &&
+              terrain_float_bits(projection.maximum_distance_m) ==
+                  terrain_float_bits(shell.maximum_distance_f32_m),
+              "projection and planner own one shell implementation");
+    }
+
+    const int strict_fast_boundary_step = 25;
+    const vec3 strict_fast_boundary_end(
+        0.071f + 0.0013f *
+            static_cast<float>(strict_fast_boundary_step),
+        -0.63f + 0.0007f *
+            static_cast<float>(strict_fast_boundary_step),
+        0.019f - 0.0002f *
+            static_cast<float>(strict_fast_boundary_step));
+    const vec3 strict_fast_boundary_middle =
+        strict_fast_boundary_end * 0.5f;
+    IKReachShell strict_fast_boundary_shell = {};
+    IKTargetProjection strict_fast_boundary_projection = {};
+    check(ik_effective_reach_shell(
+              strict_fast_boundary_shell,
+              vec3(),
+              strict_fast_boundary_middle,
+              strict_fast_boundary_end,
+              0.015f) &&
+              ik_project_target(
+                  strict_fast_boundary_projection,
+                  vec3(),
+                  strict_fast_boundary_middle,
+                  strict_fast_boundary_end,
+                  strict_fast_boundary_end,
+                  0.015f),
+          "strict/fast current-end boundary remains projectable");
+    check(strict_fast_boundary_projection.reachable &&
+              terrain_float_bits(
+                  strict_fast_boundary_projection.raw_distance_m) ==
+                  terrain_float_bits(
+                      strict_fast_boundary_projection.clamped_distance_m) &&
+              terrain_float_bits(
+                  strict_fast_boundary_projection.maximum_distance_m) ==
+                  terrain_float_bits(
+                      strict_fast_boundary_shell.maximum_distance_f32_m),
+          "strict shell contains the exact fast-caller current endpoint");
+
+    const float nan =
+        g1_test_float_from_bits(UINT32_C(0x7fc00001));
+    const vec3 valid_root;
+    const vec3 valid_middle(0.0f, -0.4f, 0.0f);
+    const vec3 valid_end(0.0f, -0.8f, 0.0f);
+    const vec3 invalid_roots[] = {
+        vec3(nan, 0.0f, 0.0f),
+        vec3(std::numeric_limits<float>::infinity(), 0.0f, 0.0f),
+    };
+    for (const vec3& invalid_root : invalid_roots) {
+        IKReachShell sentinel;
+        g1_test_poison_bytes(sentinel, 0xa5);
+        const G1TestByteSnapshot<IKReachShell> before(sentinel);
+        check(!ik_effective_reach_shell(
+                  sentinel, invalid_root, valid_middle, valid_end,
+                  0.015f),
+              "invalid shared reach input is rejected");
+        check(before.same(sentinel),
+              "invalid shared reach input preserves poisoned output");
+    }
+
+    IKReachShell zero_link;
+    g1_test_poison_bytes(zero_link, 0x6d);
+    const G1TestByteSnapshot<IKReachShell> zero_link_before(zero_link);
+    check(!ik_effective_reach_shell(
+              zero_link, valid_root, valid_root, valid_end, 0.015f),
+          "zero shared reach link is rejected");
+    check(zero_link_before.same(zero_link),
+          "zero shared reach link preserves poisoned output");
+
+    IKReachShell bad_buffer;
+    g1_test_poison_bytes(bad_buffer, 0x3c);
+    const G1TestByteSnapshot<IKReachShell> bad_buffer_before(bad_buffer);
+    check(!ik_effective_reach_shell(
+              bad_buffer, valid_root, valid_middle, valid_end, 0.0f),
+          "invalid shared reach buffer is rejected");
+    check(bad_buffer_before.same(bad_buffer),
+          "invalid shared reach buffer preserves poisoned output");
+
+    for (int alias_input = 0; alias_input < 3; ++alias_input) {
+        IKReachShell aliased;
+        g1_test_poison_bytes(aliased, 0x79);
+        const vec3 alias_value = alias_input == 0
+            ? valid_root
+            : (alias_input == 1 ? valid_middle : valid_end);
+        g1_test_copy_prefix_bytes(aliased, alias_value);
+        const G1TestByteSnapshot<IKReachShell> before(aliased);
+        const uintptr_t alias_address =
+            reinterpret_cast<uintptr_t>(&aliased);
+        const vec3& overlapping_input =
+            *reinterpret_cast<const vec3*>(alias_address);
+        const vec3& root = alias_input == 0
+            ? overlapping_input : valid_root;
+        const vec3& middle = alias_input == 1
+            ? overlapping_input : valid_middle;
+        const vec3& end = alias_input == 2
+            ? overlapping_input : valid_end;
+        check(!ik_effective_reach_shell(
+                  aliased, root, middle, end, 0.015f),
+              "shared reach output/input overlap is rejected");
+        check(before.same(aliased),
+              "shared reach overlap preserves every output byte");
+    }
 }
 
 static bool g1_test_leg_solve_result_same(
@@ -1319,6 +1570,354 @@ static void g1_test_global_pose(
     forward_kinematics_full(
         positions, rotations,
         db.bone_positions(0), local_rotations, db.bone_parents);
+}
+
+static void test_shared_physical_sole_position_target()
+{
+    database db;
+    make_g1_database(db);
+    array1d<vec3> global_positions;
+    array1d<quat> global_rotations;
+    g1_test_global_pose(
+        global_positions, global_rotations,
+        db, db.bone_rotations(0));
+
+    const float angle = 6.0f * PIf / 180.0f;
+    const vec3 normals[] = {
+        vec3(0.0f, 1.0f, 0.0f),
+        vec3(-std::sin(angle), std::cos(angle), 0.0f),
+        vec3(0.0f, std::cos(angle), std::sin(angle)),
+    };
+    const G1LegConfig configs[] = {
+        g1_left_leg_config(),
+        g1_right_leg_config(),
+    };
+    char error[512] = {};
+    for (const G1LegConfig& config : configs) {
+        vec3 desired_sole_center;
+        check(g1_ik_checked_physical_sole_centroid(
+                  desired_sole_center,
+                  global_positions(config.contact),
+                  global_rotations(config.contact),
+                  config),
+              "physical-target fixture materializes current sole");
+        for (const vec3& desired_normal : normals) {
+            G1PhysicalSolePositionTarget target = {};
+            check(g1_physical_sole_position_target(
+                      target,
+                      global_positions(config.contact),
+                      global_rotations(config.contact),
+                      global_positions(config.ankle),
+                      config,
+                      desired_sole_center,
+                      desired_normal,
+                      error,
+                      static_cast<int>(sizeof(error))),
+                  error);
+            check(ik_quat_is_unit(target.contact_rotation) &&
+                      g1_ik_vec3_is_runtime_value(
+                          target.contact_origin) &&
+                      g1_ik_vec3_is_runtime_value(target.ankle_target),
+                  "shared physical target is finite and unit");
+
+            vec3 materialized_sole_center;
+            double sole_residual_precise_m = 0.0;
+            float sole_residual_m = 0.0f;
+            check(g1_ik_checked_physical_sole_centroid(
+                      materialized_sole_center,
+                      target.contact_origin,
+                      target.contact_rotation,
+                      config) &&
+                      ik_checked_distance_precise(
+                          sole_residual_precise_m,
+                          sole_residual_m,
+                          materialized_sole_center,
+                          desired_sole_center),
+                  "shared physical target rematerializes its sole center");
+            check(g1_ik_contact_residual_is_converged_precise(
+                      sole_residual_precise_m) &&
+                      sole_residual_precise_m <= 1.0e-6,
+                  "shared physical target owns a converged sole center");
+
+            array1d<quat> solved_pose = db.bone_rotations(0);
+            G1LegSolveResult position = {};
+            G1FootOrientationResult orientation = {};
+            check(g1_apply_named_physical_sole_ik(
+                      solved_pose,
+                      db.bone_positions(0),
+                      db.bone_rotations(0),
+                      db.bone_parents,
+                      config,
+                      desired_sole_center,
+                      desired_normal,
+                      position,
+                      orientation,
+                      error,
+                      static_cast<int>(sizeof(error))),
+                  error);
+            check(position.iterations == 1 &&
+                      position.iteration_provenance ==
+                          G1LegIterationContact1,
+                  "shared physical-target fixture preserves Contact1 ownership");
+            check(g1_ik_vec3_bits_equal(
+                      target.ankle_target,
+                      position.requested_ankle_target),
+                  "planner and production solver consume one ankle target");
+            check(g1_test_quat_bits_same(
+                      target.contact_rotation,
+                      orientation.target_global_rotation),
+                  "planner and production solver consume one contact rotation");
+        }
+    }
+
+    const G1LegConfig valid_config = g1_left_leg_config();
+    const vec3 valid_contact_origin =
+        global_positions(valid_config.contact);
+    const quat valid_contact_rotation =
+        global_rotations(valid_config.contact);
+    const vec3 valid_ankle_origin =
+        global_positions(valid_config.ankle);
+    vec3 valid_sole_center;
+    check(g1_ik_checked_physical_sole_centroid(
+              valid_sole_center,
+              valid_contact_origin,
+              valid_contact_rotation,
+              valid_config),
+          "invalid-input fixture materializes valid sole center");
+    const vec3 valid_normal(0.0f, 1.0f, 0.0f);
+    const float nan =
+        g1_test_float_from_bits(UINT32_C(0x7fc00001));
+
+    const auto expect_unchanged_failure = [&error](
+            const vec3& current_contact_origin,
+            const quat& current_contact_rotation,
+            const vec3& current_ankle_origin,
+            const G1LegConfig& config,
+            const vec3& desired_sole_center,
+            const vec3& desired_sole_normal,
+            int error_capacity,
+            const char* message) {
+        G1PhysicalSolePositionTarget output;
+        g1_test_poison_bytes(output, 0xa7);
+        const G1TestByteSnapshot<G1PhysicalSolePositionTarget>
+            before(output);
+        check(!g1_physical_sole_position_target(
+                  output,
+                  current_contact_origin,
+                  current_contact_rotation,
+                  current_ankle_origin,
+                  config,
+                  desired_sole_center,
+                  desired_sole_normal,
+                  error,
+                  error_capacity),
+              message);
+        check(before.same(output),
+              "failed physical target preserves every output byte");
+    };
+
+    G1LegConfig malformed_config = valid_config;
+    malformed_config.contact = valid_config.ankle;
+    expect_unchanged_failure(
+        valid_contact_origin, valid_contact_rotation,
+        valid_ankle_origin, malformed_config,
+        valid_sole_center, valid_normal,
+        static_cast<int>(sizeof(error)),
+        "malformed physical-target config is rejected");
+    expect_unchanged_failure(
+        vec3(nan, 0.0f, 0.0f), valid_contact_rotation,
+        valid_ankle_origin, valid_config,
+        valid_sole_center, valid_normal,
+        static_cast<int>(sizeof(error)),
+        "nonfinite contact origin is rejected");
+    expect_unchanged_failure(
+        valid_contact_origin, quat(2.0f, 0.0f, 0.0f, 0.0f),
+        valid_ankle_origin, valid_config,
+        valid_sole_center, valid_normal,
+        static_cast<int>(sizeof(error)),
+        "nonunit contact rotation is rejected");
+    expect_unchanged_failure(
+        valid_contact_origin, valid_contact_rotation,
+        vec3(nan, 0.0f, 0.0f), valid_config,
+        valid_sole_center, valid_normal,
+        static_cast<int>(sizeof(error)),
+        "nonfinite ankle origin is rejected");
+    expect_unchanged_failure(
+        valid_contact_origin, valid_contact_rotation,
+        valid_ankle_origin, valid_config,
+        vec3(nan, 0.0f, 0.0f), valid_normal,
+        static_cast<int>(sizeof(error)),
+        "nonfinite desired sole center is rejected");
+    expect_unchanged_failure(
+        valid_contact_origin, valid_contact_rotation,
+        valid_ankle_origin, valid_config,
+        valid_sole_center, vec3(nan, 1.0f, 0.0f),
+        static_cast<int>(sizeof(error)),
+        "nonfinite desired sole normal is rejected");
+    expect_unchanged_failure(
+        valid_contact_origin, valid_contact_rotation,
+        valid_ankle_origin, valid_config,
+        valid_sole_center, vec3(0.0f, -1.0f, 0.0f),
+        static_cast<int>(sizeof(error)),
+        "downward desired sole normal is rejected");
+    expect_unchanged_failure(
+        valid_contact_origin, valid_contact_rotation,
+        valid_ankle_origin, valid_config,
+        valid_sole_center, valid_normal, -1,
+        "negative physical-target error capacity is rejected");
+
+    for (int aliased_input = 0; aliased_input < 5; ++aliased_input) {
+        alignas(G1LegConfig) G1PhysicalSolePositionTarget output;
+        g1_test_poison_bytes(output, 0x5b);
+        if (aliased_input == 1) {
+            g1_test_copy_prefix_bytes(
+                output, valid_contact_rotation);
+        } else {
+            const vec3 alias_value = aliased_input == 4
+                ? valid_normal
+                : (aliased_input == 0
+                    ? valid_contact_origin
+                    : (aliased_input == 2
+                        ? valid_ankle_origin
+                        : valid_sole_center));
+            g1_test_copy_prefix_bytes(output, alias_value);
+        }
+        const G1TestByteSnapshot<G1PhysicalSolePositionTarget>
+            before(output);
+        const vec3& alias_vec =
+            *static_cast<const vec3*>(
+                static_cast<const void*>(&output));
+        const quat& alias_quat =
+            *static_cast<const quat*>(
+                static_cast<const void*>(&output));
+        const vec3& contact_origin = aliased_input == 0
+            ? alias_vec : valid_contact_origin;
+        const quat& contact_rotation = aliased_input == 1
+            ? alias_quat : valid_contact_rotation;
+        const vec3& ankle_origin = aliased_input == 2
+            ? alias_vec : valid_ankle_origin;
+        const vec3& sole_center = aliased_input == 3
+            ? alias_vec : valid_sole_center;
+        const vec3& sole_normal = aliased_input == 4
+            ? alias_vec : valid_normal;
+        check(!g1_physical_sole_position_target(
+                  output,
+                  contact_origin,
+                  contact_rotation,
+                  ankle_origin,
+                  valid_config,
+                  sole_center,
+                  sole_normal,
+                  error,
+                  static_cast<int>(sizeof(error))),
+              "physical target rejects every output/value-input overlap");
+        check(before.same(output),
+              "physical target output/input overlap preserves output");
+    }
+
+    G1LegConfig output_config_alias = valid_config;
+    const G1TestByteSnapshot<G1LegConfig>
+        output_config_alias_before(output_config_alias);
+    const uintptr_t output_config_alias_address =
+        reinterpret_cast<uintptr_t>(&output_config_alias);
+    G1PhysicalSolePositionTarget& config_overlapping_output =
+        *reinterpret_cast<G1PhysicalSolePositionTarget*>(
+            output_config_alias_address);
+    check(!g1_physical_sole_position_target(
+              config_overlapping_output,
+              valid_contact_origin,
+              valid_contact_rotation,
+              valid_ankle_origin,
+              output_config_alias,
+              valid_sole_center,
+              valid_normal,
+              error,
+              static_cast<int>(sizeof(error))),
+          "physical target rejects output/config overlap");
+    check(output_config_alias_before.same(output_config_alias),
+          "physical target output/config overlap preserves storage");
+
+    G1PhysicalSolePositionTarget error_output_alias;
+    g1_test_poison_bytes(error_output_alias, 0x34);
+    const G1TestByteSnapshot<G1PhysicalSolePositionTarget>
+        error_output_alias_before(error_output_alias);
+    check(!g1_physical_sole_position_target(
+              error_output_alias,
+              valid_contact_origin,
+              valid_contact_rotation,
+              valid_ankle_origin,
+              valid_config,
+              valid_sole_center,
+              valid_normal,
+              reinterpret_cast<char*>(&error_output_alias) + 1,
+              8),
+          "physical target rejects error/output overlap");
+    check(error_output_alias_before.same(error_output_alias),
+          "physical target error/output overlap preserves output");
+
+    struct PhysicalInputs
+    {
+        vec3 current_contact_origin;
+        quat current_contact_rotation;
+        vec3 current_ankle_origin;
+        G1LegConfig config;
+        vec3 desired_sole_center;
+        vec3 desired_sole_normal;
+    };
+    for (int aliased_input = 0; aliased_input < 6; ++aliased_input) {
+        PhysicalInputs inputs = {
+            valid_contact_origin,
+            valid_contact_rotation,
+            valid_ankle_origin,
+            valid_config,
+            valid_sole_center,
+            valid_normal,
+        };
+        char* overlapping_error = NULL;
+        switch (aliased_input) {
+        case 0:
+            overlapping_error = reinterpret_cast<char*>(
+                &inputs.current_contact_origin);
+            break;
+        case 1:
+            overlapping_error = reinterpret_cast<char*>(
+                &inputs.current_contact_rotation);
+            break;
+        case 2:
+            overlapping_error = reinterpret_cast<char*>(
+                &inputs.current_ankle_origin);
+            break;
+        case 3:
+            overlapping_error = reinterpret_cast<char*>(&inputs.config);
+            break;
+        case 4:
+            overlapping_error = reinterpret_cast<char*>(
+                &inputs.desired_sole_center);
+            break;
+        default:
+            overlapping_error = reinterpret_cast<char*>(
+                &inputs.desired_sole_normal);
+            break;
+        }
+        G1PhysicalSolePositionTarget output;
+        g1_test_poison_bytes(output, 0x8c);
+        const G1TestByteSnapshot<PhysicalInputs> inputs_before(inputs);
+        const G1TestByteSnapshot<G1PhysicalSolePositionTarget>
+            output_before(output);
+        check(!g1_physical_sole_position_target(
+                  output,
+                  inputs.current_contact_origin,
+                  inputs.current_contact_rotation,
+                  inputs.current_ankle_origin,
+                  inputs.config,
+                  inputs.desired_sole_center,
+                  inputs.desired_sole_normal,
+                  overlapping_error,
+                  4),
+              "physical target rejects error overlap with every input");
+        check(inputs_before.same(inputs) && output_before.same(output),
+              "physical target error/input overlap preserves all storage");
+    }
 }
 
 static void test_generic_checked_ik_math()
@@ -8861,6 +9460,8 @@ int main(int argc, char** argv)
     test_planted_lock_lifecycle();
     test_planted_rising_edge_materializes_current_lock();
     test_planted_lock_drift_dt_and_rollback();
+    test_shared_effective_reach_shell();
+    test_shared_physical_sole_position_target();
     test_generic_checked_ik_math();
     test_named_solver_success_and_bend_mapping();
     test_named_solver_preflight_and_rollback();

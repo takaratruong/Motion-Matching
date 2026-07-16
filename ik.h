@@ -16,6 +16,21 @@ struct IKTargetProjection
     float maximum_distance_m = 0.0f;
 };
 
+struct IKReachShell
+{
+    double minimum_distance_m = 0.0;
+    double maximum_distance_m = 0.0;
+    float minimum_distance_f32_m = 0.0f;
+    float maximum_distance_f32_m = 0.0f;
+};
+
+bool ik_effective_reach_shell(
+    IKReachShell& output,
+    const vec3& root,
+    const vec3& middle,
+    const vec3& end,
+    float reach_buffer_m);
+
 struct IKClampResult
 {
     quat value;
@@ -806,136 +821,13 @@ static inline bool ik_checked_materialize_shell_target(
     return false;
 }
 
-static inline bool ik_project_target(
+bool ik_project_target(
     IKTargetProjection& output,
     vec3 root,
     vec3 middle,
     vec3 end,
     vec3 requested,
-    float reach_buffer_m)
-{
-    if (!ik_vec3_is_runtime_value(root) ||
-        !ik_vec3_is_runtime_value(middle) ||
-        !ik_vec3_is_runtime_value(end) ||
-        !ik_vec3_is_runtime_value(requested) ||
-        !terrain_float_is_positive_normal(reach_buffer_m)) {
-        return false;
-    }
-
-    double upper = 0.0;
-    double lower = 0.0;
-    double current_distance = 0.0;
-    double raw_distance = 0.0;
-    float upper_float = 0.0f;
-    float lower_float = 0.0f;
-    float current_float = 0.0f;
-    float raw_float = 0.0f;
-    if (!ik_checked_distance_precise(
-            upper, upper_float, middle, root) ||
-        !ik_checked_distance_precise(
-            lower, lower_float, end, middle) ||
-        !ik_checked_distance_precise(
-            current_distance, current_float, end, root) ||
-        !ik_checked_distance_precise(
-            raw_distance, raw_float, requested, root) ||
-        upper <= static_cast<double>(reach_buffer_m) ||
-        lower <= static_cast<double>(reach_buffer_m)) {
-        return false;
-    }
-
-    const volatile double nominal_minimum =
-        fabs(upper - lower) +
-        static_cast<double>(reach_buffer_m);
-    const volatile double nominal_maximum =
-        upper + lower -
-        static_cast<double>(reach_buffer_m);
-    if (!terrain_double_is_finite(nominal_minimum) ||
-        !terrain_double_is_finite(nominal_maximum) ||
-        nominal_minimum <= 0.0 ||
-        nominal_maximum < nominal_minimum) {
-        return false;
-    }
-    const double effective_minimum =
-        current_distance < nominal_minimum
-        ? current_distance
-        : nominal_minimum;
-    const double effective_maximum =
-        current_distance > nominal_maximum
-        ? current_distance
-        : nominal_maximum;
-    float minimum = 0.0f;
-    float maximum = 0.0f;
-    if (!ik_checked_binary32_commit(effective_minimum, minimum) ||
-        !ik_checked_binary32_commit(effective_maximum, maximum)) {
-        return false;
-    }
-
-    vec3 direction(0.0f, -1.0f, 0.0f);
-    if (raw_distance > 1.0e-7) {
-        if (!ik_checked_vec3_from_double(
-                direction,
-                (static_cast<double>(requested.x) -
-                    static_cast<double>(root.x)) / raw_distance,
-                (static_cast<double>(requested.y) -
-                    static_cast<double>(root.y)) / raw_distance,
-                (static_cast<double>(requested.z) -
-                    static_cast<double>(root.z)) / raw_distance) ||
-            !ik_vec3_is_unit(direction)) {
-            return false;
-        }
-    } else if (current_distance > 1.0e-7) {
-        if (!ik_checked_vec3_from_double(
-                direction,
-                (static_cast<double>(end.x) -
-                    static_cast<double>(root.x)) / current_distance,
-                (static_cast<double>(end.y) -
-                    static_cast<double>(root.y)) / current_distance,
-                (static_cast<double>(end.z) -
-                    static_cast<double>(root.z)) / current_distance) ||
-            !ik_vec3_is_unit(direction)) {
-            return false;
-        }
-    }
-
-    vec3 clamped_target;
-    double materialized_distance = 0.0;
-    float clamped_float = 0.0f;
-    const bool reachable =
-        raw_distance >= effective_minimum &&
-        raw_distance <= effective_maximum;
-    if (reachable) {
-        clamped_target = requested;
-        materialized_distance = raw_distance;
-        clamped_float = raw_float;
-    } else {
-        const double boundary_distance =
-            raw_distance < effective_minimum
-                ? effective_minimum
-                : effective_maximum;
-        if (!ik_checked_materialize_shell_target(
-                clamped_target,
-                materialized_distance,
-                clamped_float,
-                root, direction, boundary_distance,
-                effective_minimum, effective_maximum)) {
-            return false;
-        }
-    }
-    if (materialized_distance < effective_minimum ||
-        materialized_distance > effective_maximum) {
-        return false;
-    }
-
-    IKTargetProjection candidate = {};
-    candidate.reachable = reachable;
-    candidate.clamped_target = clamped_target;
-    candidate.raw_distance_m = raw_float;
-    candidate.clamped_distance_m = clamped_float;
-    candidate.minimum_distance_m = minimum;
-    candidate.maximum_distance_m = maximum;
-    output = candidate;
-    return true;
-}
+    float reach_buffer_m);
 
 static inline bool ik_select_bend_direction(
     IKBendSelection& output,

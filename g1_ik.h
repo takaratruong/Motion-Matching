@@ -475,6 +475,24 @@ struct G1FootTarget
     float horizontal_drift_m = 0.0f;
 };
 
+struct G1PhysicalSolePositionTarget
+{
+    quat contact_rotation;
+    vec3 contact_origin;
+    vec3 ankle_target;
+};
+
+bool g1_physical_sole_position_target(
+    G1PhysicalSolePositionTarget& output,
+    const vec3& current_contact_origin,
+    const quat& current_contact_rotation,
+    const vec3& current_ankle_origin,
+    const G1LegConfig& config,
+    const vec3& desired_sole_center,
+    const vec3& desired_sole_normal,
+    char* error,
+    int error_capacity);
+
 static inline vec3 g1_ik_vec3_canonicalize(vec3 value)
 {
     return vec3(
@@ -1599,13 +1617,14 @@ static inline bool g1_ik_contact_iterations_have_valid_provenance(
                 G1LegIterationBaselineFallback1);
 }
 
-static inline bool g1_apply_named_contact_position_ik(
+static inline bool g1_apply_named_contact_position_ik_from_initial_target(
     slice1d<quat> output_rotations,
     const slice1d<vec3> local_positions,
     const slice1d<quat> baseline_rotations,
     const slice1d<int> parents,
     const G1LegConfig& config,
     vec3 desired_contact,
+    vec3 ankle_target,
     G1LegSolveResult& output,
     char* error,
     int error_capacity)
@@ -1616,31 +1635,11 @@ static inline bool g1_apply_named_contact_position_ik(
             error, error_capacity)) {
         return false;
     }
-    if (!g1_ik_vec3_is_runtime_value(desired_contact)) {
+    if (!g1_ik_vec3_is_runtime_value(desired_contact) ||
+        !g1_ik_vec3_is_runtime_value(ankle_target)) {
         return g1_ik_error(
             error, error_capacity,
             "G1 contact residual target is invalid");
-    }
-
-    array1d<vec3> baseline_global_positions(G1_BoneCount);
-    array1d<quat> baseline_global_rotations(G1_BoneCount);
-    if (!g1_ik_checked_forward_kinematics(
-            baseline_global_positions, baseline_global_rotations,
-            local_positions, baseline_rotations, parents,
-            error, error_capacity)) {
-        return false;
-    }
-    vec3 contact_offset;
-    vec3 ankle_target;
-    if (!ik_checked_vec3_subtract(
-            contact_offset,
-            baseline_global_positions(config.contact),
-            baseline_global_positions(config.ankle)) ||
-        !ik_checked_vec3_subtract(
-            ankle_target, desired_contact, contact_offset)) {
-        return g1_ik_error(
-            error, error_capacity,
-            "G1 contact residual initial target overflowed");
     }
 
     array1d<quat> candidate_pose(output_rotations);
@@ -1740,6 +1739,62 @@ static inline bool g1_apply_named_contact_position_ik(
         static_cast<size_t>(G1_BoneCount) * sizeof(quat));
     output = aggregate;
     return true;
+}
+
+static inline bool g1_apply_named_contact_position_ik(
+    slice1d<quat> output_rotations,
+    const slice1d<vec3> local_positions,
+    const slice1d<quat> baseline_rotations,
+    const slice1d<int> parents,
+    const G1LegConfig& config,
+    vec3 desired_contact,
+    G1LegSolveResult& output,
+    char* error,
+    int error_capacity)
+{
+    if (!g1_ik_pose_inputs_validate(
+            output_rotations, local_positions,
+            baseline_rotations, parents, config,
+            error, error_capacity)) {
+        return false;
+    }
+    if (!g1_ik_vec3_is_runtime_value(desired_contact)) {
+        return g1_ik_error(
+            error, error_capacity,
+            "G1 contact residual target is invalid");
+    }
+
+    array1d<vec3> baseline_global_positions(G1_BoneCount);
+    array1d<quat> baseline_global_rotations(G1_BoneCount);
+    if (!g1_ik_checked_forward_kinematics(
+            baseline_global_positions, baseline_global_rotations,
+            local_positions, baseline_rotations, parents,
+            error, error_capacity)) {
+        return false;
+    }
+    vec3 contact_offset;
+    vec3 ankle_target;
+    if (!ik_checked_vec3_subtract(
+            contact_offset,
+            baseline_global_positions(config.contact),
+            baseline_global_positions(config.ankle)) ||
+        !ik_checked_vec3_subtract(
+            ankle_target, desired_contact, contact_offset)) {
+        return g1_ik_error(
+            error, error_capacity,
+            "G1 contact residual initial target overflowed");
+    }
+    return g1_apply_named_contact_position_ik_from_initial_target(
+        output_rotations,
+        local_positions,
+        baseline_rotations,
+        parents,
+        config,
+        desired_contact,
+        ankle_target,
+        output,
+        error,
+        error_capacity);
 }
 
 struct G1FootOrientationResult
@@ -2307,41 +2362,30 @@ static inline bool g1_apply_named_physical_sole_ik(
         return false;
     }
 
-    quat frozen_target_rotation;
-    if (!g1_surface_aligned_foot_rotation(
-            frozen_target_rotation,
+    G1PhysicalSolePositionTarget physical_target = {};
+    if (!g1_physical_sole_position_target(
+            physical_target,
+            baseline_global_positions(config.contact),
             baseline_global_rotations(config.contact),
+            baseline_global_positions(config.ankle),
             config,
+            desired_sole_center,
             surface_normal,
             error,
             error_capacity)) {
         return false;
     }
-    vec3 frozen_sole_offset;
-    vec3 desired_contact_origin;
-    if (!g1_ik_checked_physical_sole_centroid(
-            frozen_sole_offset,
-            vec3(),
-            frozen_target_rotation,
-            config) ||
-        !ik_checked_vec3_subtract(
-            desired_contact_origin,
-            desired_sole_center,
-            frozen_sole_offset)) {
-        return g1_ik_error(
-            error, error_capacity,
-            "G1 physical sole IK could not derive the contact origin");
-    }
 
     array1d<quat> candidate_pose(baseline_rotations);
     G1LegSolveResult position_candidate = {};
-    if (!g1_apply_named_contact_position_ik(
+    if (!g1_apply_named_contact_position_ik_from_initial_target(
             candidate_pose,
             local_positions,
             baseline_rotations,
             parents,
             config,
-            desired_contact_origin,
+            physical_target.contact_origin,
+            physical_target.ankle_target,
             position_candidate,
             error,
             error_capacity)) {
@@ -2366,7 +2410,7 @@ static inline bool g1_apply_named_physical_sole_ik(
         !ik_checked_quat_inverse_multiply(
             desired_contact_local,
             position_global_rotations(contact_parent),
-            frozen_target_rotation)) {
+            physical_target.contact_rotation)) {
         return g1_ik_error(
             error, error_capacity,
             "G1 physical sole IK could not materialize frozen rotation");
@@ -2390,7 +2434,7 @@ static inline bool g1_apply_named_physical_sole_ik(
     orientation_candidate.safe_stop_requested =
         bounded_orientation.limited;
     orientation_candidate.target_global_rotation =
-        frozen_target_rotation;
+        physical_target.contact_rotation;
     orientation_candidate.requested_correction_radians =
         bounded_orientation.requested_radians;
     orientation_candidate.correction_radians =
@@ -2438,7 +2482,7 @@ static inline bool g1_apply_named_physical_sole_ik(
             config.foot_forward_local) ||
         !ik_checked_quat_rotate(
             frozen_forward,
-            frozen_target_rotation,
+            physical_target.contact_rotation,
             config.foot_forward_local) ||
         !ik_checked_dot(
             normal_alignment,
