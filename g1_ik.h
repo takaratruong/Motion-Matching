@@ -482,6 +482,77 @@ struct G1PhysicalSolePositionTarget
     vec3 ankle_target;
 };
 
+static constexpr float G1RootReachMaximumAdjustmentM = 0.05f;
+
+struct G1RootReachPlan
+{
+    bool active = false;
+    bool common_interval_found = false;
+    bool applied = false;
+    float root_y_delta_m = 0.0f;
+};
+
+bool g1_root_reach_plan_is_valid(const G1RootReachPlan& plan);
+
+bool g1_plan_recorded_contact_root_reach(
+    G1RootReachPlan& output,
+    const slice1d<vec3> baseline_positions,
+    const slice1d<quat> baseline_rotations,
+    const slice1d<int> parents,
+    const slice1d<bool> recorded_contacts,
+    const G1FootTarget& left_target,
+    const G1FootTarget& right_target,
+    char* error,
+    int error_capacity);
+
+#if defined(G1_IK_ENABLE_TEST_SEAMS)
+
+enum G1RootReachAuditStatus : uint32_t
+{
+    G1RootReachAuditRejected = 1U,
+    G1RootReachAuditAccepted = 2U,
+};
+
+struct G1RootReachAuditCursor
+{
+    uint32_t interval_index;
+    uint32_t initial_delta_bits;
+};
+
+struct G1RootReachAuditAttempt
+{
+    uint32_t cursor_index;
+    uint32_t delta_bits;
+    G1RootReachAuditStatus status;
+};
+
+struct G1RootReachPlannerAudit
+{
+    G1RootReachAuditCursor cursors[4];
+    G1RootReachAuditAttempt attempts[32];
+    uint32_t cursor_count;
+    uint32_t attempt_count;
+};
+
+bool g1_plan_recorded_contact_root_reach_audited(
+    G1RootReachPlan& output,
+    G1RootReachPlannerAudit& audit,
+    const slice1d<vec3> baseline_positions,
+    const slice1d<quat> baseline_rotations,
+    const slice1d<int> parents,
+    const slice1d<bool> recorded_contacts,
+    const G1FootTarget& left_target,
+    const G1FootTarget& right_target,
+    char* error,
+    int error_capacity);
+
+#endif
+
+bool g1_apply_root_reach_plan_y(
+    float& output_root_y,
+    float baseline_root_y,
+    const G1RootReachPlan& plan);
+
 bool g1_physical_sole_position_target(
     G1PhysicalSolePositionTarget& output,
     const vec3& current_contact_origin,

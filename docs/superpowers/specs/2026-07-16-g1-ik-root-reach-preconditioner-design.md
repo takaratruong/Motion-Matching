@@ -4,7 +4,9 @@
 
 Allow an exact recorded-contact sole target to remain physically reachable by
 moving only the reversible IK candidate root in world Y by the smallest
-certified amount. Preserve recorded contact timing, exact terrain locks,
+dual-certified amount: the nearest binary32 delta which is both admitted by
+the baseline analytic reach interval and authenticated against the adjusted
+production target. Preserve recorded contact timing, exact terrain locks,
 independent travel and heading, IK-off byte identity, and the existing atomic
 safe-stop transaction.
 
@@ -30,6 +32,15 @@ both feet reachable, left/right contact residuals of approximately
 `0.000174 m` and `0.000134 m`, route progress, and balanced cleanup. No
 production source or running visualizer was changed by that probe.
 
+Those residuals are historical feasibility evidence from a disposable binary
+which predates the Task 1 strict projection kernel; they are not the Task 2
+acceptance oracle. Replaying the embedded frame through the current strict
+kernel selects binary32 delta `0xbc80e8f0`
+(`-0.01573607325553894 m`). The named production solve then reports precise
+physical-sole residuals of approximately `0.0020950164 m` left and
+`0.0001104668 m` right. Both are reachable, correction-unlimited, and satisfy
+the unchanged exact promoted `<= 0.005f` production convergence rule.
+
 ## Architectural Boundary
 
 The correction belongs to a frame-level, two-foot preconditioner at the start
@@ -45,9 +56,9 @@ The production order is:
 3. For recorded-contact feet, derive the same surface-aligned physical-sole
    position target that the named solver will consume.
 4. Build and intersect their feasible root-Y reach intervals.
-5. Select the feasible binary32 delta closest to positive zero, bounded to
-   `[-0.05 m, +0.05 m]`, and revalidate it with the production reach
-   projection.
+5. Select the baseline-analytic-admitted binary32 delta closest to positive
+   zero, bounded to `[-0.05 m, +0.05 m]`, and authenticate it with the
+   adjusted production target and reach projection.
 6. Apply that delta once to only
    `scratch_positions(G1_Simulation).y`.
 7. Run the existing fixed left-then-right bounded position/orientation IK,
@@ -80,10 +91,30 @@ IK:
 Each recorded foot contributes the root-Y values for which its exact ankle
 target remains inside that effective shell. The fixed-size interval
 intersection handles both feet without order dependence. The selected float
-is the member nearest zero; boundary rounding is moved toward the interval
-interior and then checked again through the real projection. A result is
-publishable only when every contributing foot reports the exact requested
-target as reachable.
+is the dual-certified member nearest zero: baseline analytic admission is a
+required proof domain, then adjusted production-target authentication is the
+second proof. Boundary rounding is moved toward the analytic interval
+interior and then checked again through the real projection. Revalidation
+must apply the candidate to a fixed 31-bone copy of the local pose and rerun
+the same checked strict FK. It must then rederive the physical ankle target
+from the adjusted contact origin/rotation and ankle origin, using the original
+desired sole center/normal, before projecting the adjusted hip/knee/ankle
+points. Neither translating previously computed global points nor projecting
+the baseline-derived ankle target is numerically equivalent to the named
+production solver, so neither may authenticate publication. At most 32
+adjacent boundary floats are tested in total across all intervals, chosen by
+one deterministic nearest-first frontier; this is a global budget, not a
+per-interval allowance. A result is publishable only when every contributing
+foot reports its rederived exact production target as reachable.
+
+The search never probes outside the baseline analytic intersection merely
+because adjusted binary32 recomputation makes a nearer float production-
+reachable. The exact translated-level regression demonstrates this boundary:
+the adjusted production target accepts `0xbc80e8e7` through `0xbc80e8f5`, but
+the baseline analytic interval first admits `0xbc80e8f5`; therefore
+`0xbc80e8f5` is the nearest dual-certified result. The intentionally excluded
+production-valid gap is about 26 nm in root Y and does not justify changing
+the proof domain or the named solver.
 
 No runtime option and no log column is added. Existing
 `support_retargeted_hips_y` and `ik_adjusted_hips_y` values expose the
@@ -114,8 +145,10 @@ provide internal provenance.
 Write failures before production changes and cover:
 
 1. The authentic two-contact geometry corresponding to the measured live
-   frame, including the nearest common delta and sub-millimetre final
-   residuals.
+   frame, including the nearest dual-certified common delta and exact
+   production convergence for both final physical-sole residuals; plus an
+   exact translated-level case distinguishing baseline analytic admission
+   from adjusted production-target reachability.
 2. One recorded contact plus one swing foot, and two contacts whose interval
    order is reversed, proving order independence.
 3. Flat, ramp, and cross-slope normals using the shared physical-sole target
@@ -132,6 +165,22 @@ Write failures before production changes and cover:
 9. Strict caller, optimized `-ffast-math` caller linked to the strict kernel,
    strict/fast parity records, ASan/UBSan/float sanitizers, and production
    no-seam builds.
+
+Task 2 also exposes a fixed-size planner audit only when
+`G1_IK_ENABLE_TEST_SEAMS` is defined. The audited wrapper calls the same
+private planner implementation as the ordinary wrapper and transactionally
+records the sorted cursors' initial materialized binary32 bits plus every
+global attempt's cursor index, candidate bits, and rejected/accepted status.
+The trace holds at most four cursors and exactly the planner-wide maximum of
+32 attempts. It is used to prove the authentic inward sequence, a real
+multi-cursor switch, one-cursor exhaustion, and a symmetric two-cursor trace
+which alternates cursors for exactly 32 total rejections. The combination
+rejects both a sequential/per-interval scheduler and a 33/64/128-attempt
+budget regression; audit capacity is checked before every write so a
+hypothetical 33rd attempt fails transactionally rather than truncating the
+trace. Invalid execution publishes neither plan nor trace. A root-reach
+object compiled without the macro exposes no audit declaration or symbol and
+still runs the complete ordinary non-seam test surface.
 
 After focused tests, rebuild a disposable controller and run:
 

@@ -1920,6 +1920,1763 @@ static void test_shared_physical_sole_position_target()
     }
 }
 
+struct G1RootReachTestFixture
+{
+    array1d<vec3> positions;
+    array1d<quat> rotations;
+    array1d<int> parents;
+    array1d<bool> contacts;
+    G1FootTarget targets[2];
+
+    G1RootReachTestFixture()
+        : positions(G1_BoneCount),
+          rotations(G1_BoneCount),
+          parents(G1_BoneCount),
+          contacts(2)
+    {
+    }
+};
+
+static G1FootTarget g1_test_root_reach_locked_target(
+    vec3 sole_center,
+    vec3 normal = vec3(0.0f, 1.0f, 0.0f))
+{
+    G1FootTarget target = {};
+    target.locked = true;
+    target.position_active = true;
+    target.surface.point = sole_center;
+    target.surface.normal = normal;
+    target.desired_sole_normal = normal;
+    target.sole_center = sole_center;
+    return target;
+}
+
+static bool g1_test_root_reach_plan_same(
+    const G1RootReachPlan& left,
+    const G1RootReachPlan& right)
+{
+    return left.active == right.active &&
+           left.common_interval_found == right.common_interval_found &&
+           left.applied == right.applied &&
+           terrain_float_bits(left.root_y_delta_m) ==
+               terrain_float_bits(right.root_y_delta_m);
+}
+
+static void g1_test_root_reach_set_standard_parents(
+    array1d<int>& parents)
+{
+    static const int expected[G1_BoneCount] = {
+        -1, 0, 1, 2, 3, 4, 5, 6, 1, 8, 9, 10, 11, 12, 1, 14,
+        15, 16, 17, 18, 19, 20, 21, 22, 16, 24, 25, 26, 27, 28, 29
+    };
+    parents.resize(G1_BoneCount);
+    for (int bone = 0; bone < G1_BoneCount; ++bone) {
+        parents(bone) = expected[bone];
+    }
+}
+
+static void g1_test_make_lowcurb_root_reach_fixture(
+    G1RootReachTestFixture& fixture)
+{
+    static const float positions[G1_BoneCount][3] = {
+        {-0.0974905789f, 0.0f, -0.543979824f},
+        {-0.00277789449f, 0.802239537f, 0.00383618101f},
+        {7.80625564e-18f, -0.102700002f, -0.064452f},
+        {4.68375339e-17f, -0.0304649994f, -0.0520000011f},
+        {0.0250010006f, -0.124119997f, 5.55111512e-17f},
+        {-0.0782729983f, -0.177340001f, -0.00214889995f},
+        {1.38777878e-17f, -0.300009996f, 9.44450003e-05f},
+        {-1.27935856e-17f, -0.0175579991f, 5.42101086e-18f},
+        {-4.33680869e-18f, -0.102700002f, 0.064452f},
+        {-2.42861287e-17f, -0.0304649994f, 0.0520000011f},
+        {0.0250010006f, -0.124119997f, -2.6454533e-17f},
+        {-0.0782729983f, -0.177340001f, 0.00214889995f},
+        {3.46944695e-17f, -0.300009996f, -9.44450003e-05f},
+        {-3.84891771e-17f, -0.0175579991f, -1.52872506e-17f},
+        {0.0f, 0.0f, 0.0f},
+        {-0.0039634998f, 0.0350000001f, 1.53956708e-17f},
+        {8.14676289e-18f, 0.0189999994f, -6.02816408e-17f},
+        {0.00395630021f, 0.237780005f, -0.100220002f},
+        {-5.37764278e-17f, -0.0138309998f, -0.0379999988f},
+        {-2.77555756e-17f, -0.103200004f, -0.00624000002f},
+        {0.0157830007f, -0.0805179998f, 1.66533454e-16f},
+        {0.100000001f, -0.00999999978f, -0.00188790995f},
+        {0.0379999988f, -1.14491749e-16f, 4.16333634e-17f},
+        {0.0460000001f, 9.02056208e-17f, -6.9388939e-18f},
+        {0.00395630021f, 0.237780005f, 0.100210004f},
+        {-1.73472348e-17f, -0.0138309998f, 0.0379999988f},
+        {4.85722573e-17f, -0.103200004f, 0.00624000002f},
+        {0.0157830007f, -0.0805179998f, -1.94289029e-16f},
+        {0.100000001f, -0.00999999978f, 0.00188790995f},
+        {0.0379999988f, -4.33680869e-17f, 3.46944695e-16f},
+        {0.0460000001f, -1.31838984e-16f, -2.8449465e-16f},
+    };
+    static const float rotations[G1_BoneCount][4] = {
+        {0.989499688f, 0.0f, 0.144534484f, -0.0f},
+        {0.706936896f, -0.0152611397f, -0.706910253f, -0.0168861412f},
+        {0.999896586f, -1.35308431e-16f, -4.08608694e-18f, 0.0143801998f},
+        {0.992987454f, 0.0796737f, 0.0069852802f, 0.0870587826f},
+        {0.999852538f, -3.46944695e-17f, 0.0171720963f, -3.81639165e-17f},
+        {0.982150555f, -3.46944695e-17f, 1.12757026e-17f, -0.188096374f},
+        {0.999246478f, 6.24500451e-17f, 2.25514052e-17f, 0.0388132706f},
+        {0.994751096f, -0.102324151f, -1.73472348e-17f, 1.73472348e-17f},
+        {0.999993563f, -1.5959456e-16f, -4.32325616e-18f, -0.00358927832f},
+        {0.996128559f, -0.0099941371f, -0.00087622198f, 0.0873341784f},
+        {0.998790145f, -3.46944695e-17f, -0.0491758958f, -8.45677695e-18f},
+        {0.986354172f, 4.85722573e-17f, 2.81892565e-18f, -0.164637148f},
+        {0.998307049f, -8.67361738e-17f, 1.73472348e-18f, 0.0581636578f},
+        {1.0f, 0.0f, 2.16840434e-19f, 1.19262239e-18f},
+        {0.999896348f, -4.16333634e-17f, -0.0143953664f, 3.25260652e-19f},
+        {0.999992847f, -0.00378602976f, -9.20724814e-19f, -2.27682456e-18f},
+        {1.0f, 6.9388939e-18f, 2.96546235e-18f, -0.000143281883f},
+        {0.867101908f, 0.121839553f, -0.0673205554f, 0.478285789f},
+        {0.87760812f, 0.47937876f, -2.77555756e-17f, -1.2490009e-16f},
+        {0.974277854f, 1.11022302e-16f, -0.225350112f, 2.77555756e-17f},
+        {0.840601623f, 5.55111512e-17f, 0.0f, -0.541653872f},
+        {0.972235322f, 0.234005332f, 2.77555756e-17f, -2.77555756e-17f},
+        {0.999271274f, 1.11022302e-16f, -8.32667268e-17f, -0.0381694026f},
+        {0.999973118f, -1.66533454e-16f, 0.00733127445f, 2.77555756e-17f},
+        {0.953638792f, -0.134025499f, 0.0376045294f, 0.266825974f},
+        {0.898395002f, -0.439188302f, -5.55111512e-17f, 1.04083409e-17f},
+        {0.999400556f, -5.55111512e-17f, -0.0346198194f, 3.46944695e-17f},
+        {0.862934768f, -5.55111512e-17f, 8.32667268e-17f, -0.505315363f},
+        {0.995286703f, -0.0969763175f, 1.38777878e-17f, 5.55111512e-17f},
+        {0.993609309f, 0.0f, 4.16333634e-17f, -0.112873778f},
+        {0.979608893f, -5.55111512e-17f, -0.200913966f, 5.55111512e-17f},
+    };
+    fixture.positions.resize(G1_BoneCount);
+    fixture.rotations.resize(G1_BoneCount);
+    g1_test_root_reach_set_standard_parents(fixture.parents);
+    for (int bone = 0; bone < G1_BoneCount; ++bone) {
+        fixture.positions(bone) = vec3(
+            positions[bone][0], positions[bone][1], positions[bone][2]);
+        fixture.rotations(bone) = quat(
+            rotations[bone][0], rotations[bone][1],
+            rotations[bone][2], rotations[bone][3]);
+    }
+    fixture.contacts.resize(2);
+    fixture.contacts(0) = true;
+    fixture.contacts(1) = true;
+    fixture.targets[0] = g1_test_root_reach_locked_target(
+        vec3(0.0612203553f, 0.00499999989f, -0.603566289f));
+    fixture.targets[1] = g1_test_root_reach_locked_target(
+        vec3(-0.250562072f, 0.00499999989f, -0.515012741f));
+}
+
+static void g1_test_make_identity_root_reach_fixture(
+    G1RootReachTestFixture& fixture)
+{
+    database db;
+    make_g1_database(db);
+    fixture.positions = db.bone_positions(0);
+    fixture.rotations = db.bone_rotations(0);
+    fixture.parents = db.bone_parents;
+    fixture.contacts(0) = true;
+    fixture.contacts(1) = true;
+    array1d<vec3> globals(G1_BoneCount);
+    array1d<quat> global_rotations(G1_BoneCount);
+    char error[256] = {};
+    check(g1_ik_checked_forward_kinematics(
+              globals, global_rotations,
+              fixture.positions, fixture.rotations, fixture.parents,
+              error, static_cast<int>(sizeof(error))), error);
+    const G1LegConfig configs[2] = {
+        g1_left_leg_config(), g1_right_leg_config()
+    };
+    for (int foot = 0; foot < 2; ++foot) {
+        vec3 sole;
+        check(g1_ik_checked_physical_sole_centroid(
+                  sole, globals(configs[foot].contact),
+                  global_rotations(configs[foot].contact), configs[foot]),
+              "identity reach fixture materializes current sole");
+        fixture.targets[foot] =
+            g1_test_root_reach_locked_target(sole);
+    }
+}
+
+static G1RootReachPlan g1_test_root_reach_plan(
+    const G1RootReachTestFixture& fixture,
+    char* error,
+    int error_capacity)
+{
+    G1RootReachPlan plan = {};
+    check(g1_plan_recorded_contact_root_reach(
+              plan,
+              fixture.positions,
+              fixture.rotations,
+              fixture.parents,
+              fixture.contacts,
+              fixture.targets[0],
+              fixture.targets[1],
+              error,
+              error_capacity),
+          error != NULL && error_capacity > 0 ? error :
+              "root reach plan materializes");
+    return plan;
+}
+
+static void test_root_reach_authentic_lowcurb()
+{
+    G1RootReachTestFixture fixture;
+    g1_test_make_lowcurb_root_reach_fixture(fixture);
+    char error[512] = {};
+    const G1TestByteSnapshot<vec3> root_before(
+        fixture.positions(G1_Simulation));
+    G1RootReachPlan plan = g1_test_root_reach_plan(
+        fixture, error, static_cast<int>(sizeof(error)));
+    check(g1_root_reach_plan_is_valid(plan) && plan.active &&
+              plan.common_interval_found && plan.applied &&
+              plan.root_y_delta_m >= -0.0161f &&
+              plan.root_y_delta_m <= -0.0157f &&
+              terrain_float_bits(plan.root_y_delta_m) ==
+                  UINT32_C(0xbc80e8f0),
+          "authentic low-curb frame selects the measured root correction");
+    const volatile double authentic_upper_endpoint =
+        -0.01573606586774029;
+    const volatile float authentic_rounded_endpoint =
+        static_cast<float>(authentic_upper_endpoint);
+    const float authentic_inward_endpoint = std::nextafter(
+        authentic_rounded_endpoint,
+        -std::numeric_limits<float>::infinity());
+    check(terrain_float_bits(authentic_rounded_endpoint) ==
+              UINT32_C(0xbc80e8ec) &&
+              static_cast<double>(authentic_rounded_endpoint) >
+                  authentic_upper_endpoint &&
+              terrain_float_bits(authentic_inward_endpoint) ==
+                  UINT32_C(0xbc80e8ed) &&
+              static_cast<double>(authentic_inward_endpoint) <=
+                  authentic_upper_endpoint,
+          "rounded negative upper endpoint requires one inward nextafter");
+    check(root_before.same(fixture.positions(G1_Simulation)),
+          "planning leaves the authentic baseline pose byte-exact");
+
+    float applied_root_y = 123.0f;
+    check(g1_apply_root_reach_plan_y(
+              applied_root_y,
+              fixture.positions(G1_Simulation).y,
+              plan),
+          "authentic root reach plan applies");
+    array1d<vec3> adjusted_positions = fixture.positions;
+    adjusted_positions(G1_Simulation).y = applied_root_y;
+    check(terrain_float_bits(
+              adjusted_positions(G1_Simulation).x) ==
+              terrain_float_bits(fixture.positions(G1_Simulation).x) &&
+          terrain_float_bits(
+              adjusted_positions(G1_Simulation).z) ==
+              terrain_float_bits(fixture.positions(G1_Simulation).z),
+          "root reach application changes only local root Y");
+
+    const G1LegConfig configs[2] = {
+        g1_left_leg_config(), g1_right_leg_config()
+    };
+    const uint32_t boundary_candidate_bits[4] = {
+        UINT32_C(0xbc80e8ed),
+        UINT32_C(0xbc80e8ee),
+        UINT32_C(0xbc80e8ef),
+        UINT32_C(0xbc80e8f0),
+    };
+    for (int candidate_index = 0; candidate_index < 4; ++candidate_index) {
+        const G1RootReachPlan candidate_plan = {
+            true, true, true,
+            g1_test_float_from_bits(
+                boundary_candidate_bits[candidate_index])
+        };
+        array1d<vec3> candidate_positions = fixture.positions;
+        check(g1_apply_root_reach_plan_y(
+                  candidate_positions(G1_Simulation).y,
+                  fixture.positions(G1_Simulation).y,
+                  candidate_plan),
+              "authentic boundary candidate applies to local root");
+        array1d<vec3> candidate_globals(G1_BoneCount);
+        array1d<quat> candidate_global_rotations(G1_BoneCount);
+        check(g1_ik_checked_forward_kinematics(
+                  candidate_globals, candidate_global_rotations,
+                  candidate_positions, fixture.rotations, fixture.parents,
+                  error, static_cast<int>(sizeof(error))), error);
+        bool all_reachable = true;
+        for (int foot = 0; foot < 2; ++foot) {
+            G1PhysicalSolePositionTarget candidate_physical_target = {};
+            IKTargetProjection projection = {};
+            check(g1_physical_sole_position_target(
+                      candidate_physical_target,
+                      candidate_globals(configs[foot].contact),
+                      candidate_global_rotations(configs[foot].contact),
+                      candidate_globals(configs[foot].ankle),
+                      configs[foot],
+                      fixture.targets[foot].sole_center,
+                      fixture.targets[foot].desired_sole_normal,
+                      error, static_cast<int>(sizeof(error))) &&
+                  ik_project_target(
+                      projection,
+                      candidate_globals(configs[foot].hip),
+                      candidate_globals(configs[foot].knee),
+                      candidate_globals(configs[foot].ankle),
+                      candidate_physical_target.ankle_target,
+                      configs[foot].reach_buffer_m),
+                  "authentic boundary production target/projection materializes");
+            all_reachable = all_reachable && projection.reachable &&
+                g1_ik_vec3_bits_equal(
+                    projection.clamped_target,
+                    candidate_physical_target.ankle_target);
+        }
+        check(all_reachable == (candidate_index == 3),
+              "only the fourth adjacent float passes production-target revalidation");
+    }
+    array1d<vec3> adjusted_globals(G1_BoneCount);
+    array1d<quat> adjusted_global_rotations(G1_BoneCount);
+    check(g1_ik_checked_forward_kinematics(
+              adjusted_globals, adjusted_global_rotations,
+              adjusted_positions, fixture.rotations, fixture.parents,
+              error, static_cast<int>(sizeof(error))), error);
+    for (int foot = 0; foot < 2; ++foot) {
+        G1PhysicalSolePositionTarget expected_physical_target = {};
+        check(g1_physical_sole_position_target(
+                  expected_physical_target,
+                  adjusted_globals(configs[foot].contact),
+                  adjusted_global_rotations(configs[foot].contact),
+                  adjusted_globals(configs[foot].ankle),
+                  configs[foot],
+                  fixture.targets[foot].sole_center,
+                  fixture.targets[foot].desired_sole_normal,
+                  error, static_cast<int>(sizeof(error))), error);
+        array1d<quat> solved = fixture.rotations;
+        G1LegSolveResult position = {};
+        G1FootOrientationResult orientation = {};
+        check(g1_apply_named_physical_sole_ik(
+                  solved,
+                  adjusted_positions,
+                  fixture.rotations,
+                  fixture.parents,
+                  configs[foot],
+                  fixture.targets[foot].sole_center,
+                  fixture.targets[foot].desired_sole_normal,
+                  position,
+                  orientation,
+                  error,
+                  static_cast<int>(sizeof(error))), error);
+        check(g1_ik_vec3_bits_equal(
+                  position.requested_ankle_target,
+                  expected_physical_target.ankle_target) &&
+                  position.reachable && !position.correction_limited &&
+                  g1_ik_contact_residual_is_converged(
+                      position.contact_residual_m),
+              "authentic planner target exactly matches reachable production target");
+        array1d<vec3> final_positions(G1_BoneCount);
+        array1d<quat> final_rotations(G1_BoneCount);
+        vec3 final_sole;
+        double residual_precise = 0.0;
+        float residual_f32 = 0.0f;
+        check(g1_ik_checked_forward_kinematics(
+                  final_positions, final_rotations,
+                  adjusted_positions, solved, fixture.parents,
+                  error, static_cast<int>(sizeof(error))) &&
+              g1_ik_checked_physical_sole_centroid(
+                  final_sole,
+                  final_positions(configs[foot].contact),
+                  final_rotations(configs[foot].contact),
+                  configs[foot]) &&
+              ik_checked_distance_precise(
+                  residual_precise, residual_f32,
+                  final_sole, fixture.targets[foot].sole_center),
+              "authentic adjusted physical sole residual materializes");
+        check(g1_ik_contact_residual_is_converged_precise(
+                  residual_precise) && residual_precise < 0.0022,
+              "authentic final physical sole meets the strict-kernel bound");
+    }
+}
+
+static void test_root_reach_dual_certification_domain()
+{
+    G1RootReachTestFixture fixture;
+    g1_test_make_lowcurb_root_reach_fixture(fixture);
+    const float world_level =
+        g1_test_float_from_bits(UINT32_C(0x38d1b717));
+    fixture.positions(G1_Simulation).y = world_level;
+    for (int foot = 0; foot < 2; ++foot) {
+        fixture.targets[foot].sole_center.y += world_level;
+        fixture.targets[foot].surface.point =
+            fixture.targets[foot].sole_center;
+    }
+    char error[512] = {};
+    const G1RootReachPlan plan = g1_test_root_reach_plan(
+        fixture, error, static_cast<int>(sizeof(error)));
+    check(plan.active && plan.common_interval_found && plan.applied &&
+              terrain_float_bits(plan.root_y_delta_m) ==
+                  UINT32_C(0xbc80e8f5),
+          "exact-level fixture selects the nearest dual-certified root float");
+
+    const G1LegConfig configs[2] = {
+        g1_left_leg_config(), g1_right_leg_config()
+    };
+    array1d<vec3> baseline_globals(G1_BoneCount);
+    array1d<quat> baseline_global_rotations(G1_BoneCount);
+    check(g1_ik_checked_forward_kinematics(
+              baseline_globals, baseline_global_rotations,
+              fixture.positions, fixture.rotations, fixture.parents,
+              error, static_cast<int>(sizeof(error))), error);
+    double common_analytic_upper = DBL_MAX;
+    for (int foot = 0; foot < 2; ++foot) {
+        G1PhysicalSolePositionTarget baseline_target = {};
+        IKReachShell shell = {};
+        check(g1_physical_sole_position_target(
+                  baseline_target,
+                  baseline_globals(configs[foot].contact),
+                  baseline_global_rotations(configs[foot].contact),
+                  baseline_globals(configs[foot].ankle),
+                  configs[foot],
+                  fixture.targets[foot].sole_center,
+                  fixture.targets[foot].desired_sole_normal,
+                  error, static_cast<int>(sizeof(error))) &&
+              ik_effective_reach_shell(
+                  shell,
+                  baseline_globals(configs[foot].hip),
+                  baseline_globals(configs[foot].knee),
+                  baseline_globals(configs[foot].ankle),
+                  configs[foot].reach_buffer_m),
+              "exact-level baseline analytic geometry materializes");
+        const volatile double x =
+            static_cast<double>(baseline_target.ankle_target.x) -
+            static_cast<double>(baseline_globals(configs[foot].hip).x);
+        const volatile double y =
+            static_cast<double>(baseline_target.ankle_target.y) -
+            static_cast<double>(baseline_globals(configs[foot].hip).y);
+        const volatile double z =
+            static_cast<double>(baseline_target.ankle_target.z) -
+            static_cast<double>(baseline_globals(configs[foot].hip).z);
+        const volatile double x_squared = x * x;
+        const volatile double z_squared = z * z;
+        const volatile double horizontal_squared =
+            x_squared + z_squared;
+        const volatile double maximum_squared =
+            shell.maximum_distance_m * shell.maximum_distance_m;
+        const volatile double vertical_squared =
+            maximum_squared - horizontal_squared;
+        const volatile double maximum_vertical =
+            std::sqrt(vertical_squared);
+        const volatile double analytic_upper = y + maximum_vertical;
+        check(terrain_double_is_finite(analytic_upper),
+              "exact-level baseline analytic endpoint is finite");
+        if (analytic_upper < common_analytic_upper) {
+            common_analytic_upper = analytic_upper;
+        }
+    }
+    const float production_first =
+        g1_test_float_from_bits(UINT32_C(0xbc80e8e7));
+    const float analytic_last_outside =
+        g1_test_float_from_bits(UINT32_C(0xbc80e8f4));
+    const float analytic_first_inside =
+        g1_test_float_from_bits(UINT32_C(0xbc80e8f5));
+    check(static_cast<double>(production_first) >
+              common_analytic_upper &&
+              static_cast<double>(analytic_last_outside) >
+                  common_analytic_upper &&
+              static_cast<double>(analytic_first_inside) <=
+                  common_analytic_upper,
+          "production-reachable nearer floats remain outside baseline analytic admission");
+
+    for (uint32_t bits = UINT32_C(0xbc80e8e6);
+         bits <= UINT32_C(0xbc80e8f5);
+         ++bits) {
+        const G1RootReachPlan candidate_plan = {
+            true, true, true, g1_test_float_from_bits(bits)
+        };
+        array1d<vec3> candidate_positions = fixture.positions;
+        check(g1_apply_root_reach_plan_y(
+                  candidate_positions(G1_Simulation).y,
+                  fixture.positions(G1_Simulation).y,
+                  candidate_plan),
+              "dual-certification candidate applies to local root");
+        array1d<vec3> candidate_globals(G1_BoneCount);
+        array1d<quat> candidate_global_rotations(G1_BoneCount);
+        check(g1_ik_checked_forward_kinematics(
+                  candidate_globals, candidate_global_rotations,
+                  candidate_positions, fixture.rotations, fixture.parents,
+                  error, static_cast<int>(sizeof(error))), error);
+        bool all_production_targets_reachable = true;
+        for (int foot = 0; foot < 2; ++foot) {
+            G1PhysicalSolePositionTarget physical_target = {};
+            IKTargetProjection projection = {};
+            check(g1_physical_sole_position_target(
+                      physical_target,
+                      candidate_globals(configs[foot].contact),
+                      candidate_global_rotations(configs[foot].contact),
+                      candidate_globals(configs[foot].ankle),
+                      configs[foot],
+                      fixture.targets[foot].sole_center,
+                      fixture.targets[foot].desired_sole_normal,
+                      error, static_cast<int>(sizeof(error))) &&
+                  ik_project_target(
+                      projection,
+                      candidate_globals(configs[foot].hip),
+                      candidate_globals(configs[foot].knee),
+                      candidate_globals(configs[foot].ankle),
+                      physical_target.ankle_target,
+                      configs[foot].reach_buffer_m),
+                  "dual-certification production target materializes");
+            all_production_targets_reachable =
+                all_production_targets_reachable &&
+                projection.reachable &&
+                g1_ik_vec3_bits_equal(
+                    projection.clamped_target,
+                    physical_target.ankle_target);
+        }
+        check(all_production_targets_reachable ==
+                  (bits >= UINT32_C(0xbc80e8e7)),
+              "exact-level production authentication boundary is owned by bits");
+    }
+}
+
+static void test_root_reach_interval_sets_and_boundaries()
+{
+    char error[512] = {};
+    G1RootReachTestFixture fixture;
+    g1_test_make_identity_root_reach_fixture(fixture);
+
+    fixture.contacts(1) = false;
+    fixture.targets[0].sole_center.y -= 0.02f;
+    fixture.targets[0].surface.point = fixture.targets[0].sole_center;
+    G1RootReachPlan left_only = g1_test_root_reach_plan(
+        fixture, error, static_cast<int>(sizeof(error)));
+    check(left_only.active && left_only.common_interval_found &&
+              left_only.applied && left_only.root_y_delta_m < 0.0f,
+          "one recorded left contact ignores the swing right foot");
+
+    G1RootReachTestFixture order_a;
+    g1_test_make_identity_root_reach_fixture(order_a);
+    order_a.targets[0].sole_center.y -= 0.018f;
+    order_a.targets[0].surface.point = order_a.targets[0].sole_center;
+    order_a.targets[1].sole_center.y -= 0.027f;
+    order_a.targets[1].surface.point = order_a.targets[1].sole_center;
+    G1RootReachTestFixture order_b;
+    g1_test_make_identity_root_reach_fixture(order_b);
+    order_b.targets[0].sole_center.y -= 0.027f;
+    order_b.targets[0].surface.point = order_b.targets[0].sole_center;
+    order_b.targets[1].sole_center.y -= 0.018f;
+    order_b.targets[1].surface.point = order_b.targets[1].sole_center;
+    const G1RootReachPlan plan_a = g1_test_root_reach_plan(
+        order_a, error, static_cast<int>(sizeof(error)));
+    const G1RootReachPlan plan_b = g1_test_root_reach_plan(
+        order_b, error, static_cast<int>(sizeof(error)));
+    check(g1_test_root_reach_plan_same(plan_a, plan_b),
+          "reversed per-foot interval lower-bound order has exact plan bits");
+
+    G1RootReachTestFixture reachable;
+    g1_test_make_identity_root_reach_fixture(reachable);
+    reachable.contacts(1) = false;
+    const G1RootReachPlan no_adjustment = g1_test_root_reach_plan(
+        reachable, error, static_cast<int>(sizeof(error)));
+    check(no_adjustment.active && no_adjustment.common_interval_found &&
+              !no_adjustment.applied &&
+              terrain_float_bits(no_adjustment.root_y_delta_m) == 0U,
+          "already reachable contact selects canonical positive zero");
+
+    G1RootReachTestFixture raised = reachable;
+    raised.positions(G1_Simulation).y += 0.02f;
+    const G1RootReachPlan retained_lock = g1_test_root_reach_plan(
+        raised, error, static_cast<int>(sizeof(error)));
+    check(retained_lock.active && retained_lock.common_interval_found &&
+              retained_lock.applied && retained_lock.root_y_delta_m < 0.0f,
+          "world-space lock remains fixed across a support level change");
+
+    G1RootReachTestFixture no_contacts;
+    g1_test_make_identity_root_reach_fixture(no_contacts);
+    no_contacts.contacts(0) = false;
+    no_contacts.contacts(1) = false;
+    const G1RootReachPlan inactive = g1_test_root_reach_plan(
+        no_contacts, error, static_cast<int>(sizeof(error)));
+    check(!inactive.active && !inactive.common_interval_found &&
+              !inactive.applied &&
+              terrain_float_bits(inactive.root_y_delta_m) == 0U,
+          "no contacts publish the canonical inactive plan");
+
+    G1RootReachTestFixture disjoint;
+    g1_test_make_identity_root_reach_fixture(disjoint);
+    disjoint.targets[0].sole_center.y -= 0.04f;
+    disjoint.targets[0].surface.point = disjoint.targets[0].sole_center;
+    disjoint.targets[1].sole_center.y += 0.98f;
+    disjoint.targets[1].surface.point = disjoint.targets[1].sole_center;
+    const G1RootReachPlan disjoint_plan = g1_test_root_reach_plan(
+        disjoint, error, static_cast<int>(sizeof(error)));
+    check(disjoint_plan.active && !disjoint_plan.common_interval_found &&
+              !disjoint_plan.applied &&
+              terrain_float_bits(disjoint_plan.root_y_delta_m) == 0U,
+          "disjoint two-foot maximum shells publish finite no-plan");
+
+    G1RootReachTestFixture minimum_shell;
+    g1_test_make_identity_root_reach_fixture(minimum_shell);
+    minimum_shell.contacts(1) = false;
+    minimum_shell.positions(G1_LeftKnee) = vec3(0.0f, -0.4f, 0.0f);
+    minimum_shell.positions(G1_LeftAnkle) = vec3(0.0f, 0.39f, 0.0f);
+    minimum_shell.positions(G1_LeftToe) = vec3();
+    array1d<vec3> minimum_globals(G1_BoneCount);
+    array1d<quat> minimum_rotations(G1_BoneCount);
+    check(g1_ik_checked_forward_kinematics(
+              minimum_globals, minimum_rotations,
+              minimum_shell.positions, minimum_shell.rotations,
+              minimum_shell.parents,
+              error, static_cast<int>(sizeof(error))), error);
+    vec3 minimum_sole;
+    check(g1_ik_checked_physical_sole_centroid(
+              minimum_sole,
+              minimum_globals(G1_LeftToe),
+              minimum_rotations(G1_LeftToe),
+              g1_left_leg_config()),
+          "minimum-shell split fixture materializes sole");
+    minimum_sole.y += 0.005f;
+    minimum_shell.targets[0] =
+        g1_test_root_reach_locked_target(minimum_sole);
+    const G1RootReachPlan split_plan = g1_test_root_reach_plan(
+        minimum_shell, error, static_cast<int>(sizeof(error)));
+    check(split_plan.active && split_plan.common_interval_found &&
+              split_plan.applied && split_plan.root_y_delta_m > 0.0f &&
+              terrain_float_bits(split_plan.root_y_delta_m) ==
+                  UINT32_C(0x3ba3d720),
+          "minimum-shell hole preserves and selects the nearer upper interval");
+
+    G1RootReachTestFixture minimum_conflict;
+    g1_test_make_identity_root_reach_fixture(minimum_conflict);
+    minimum_conflict.positions(G1_LeftKnee) =
+        vec3(0.0f, -0.5f, 0.0f);
+    minimum_conflict.positions(G1_LeftAnkle) =
+        vec3(0.015625f, 0.0f, 0.0f);
+    minimum_conflict.positions(G1_LeftToe) = vec3();
+    minimum_conflict.positions(G1_RightKnee) =
+        vec3(0.0f, -0.5f, 0.0f);
+    minimum_conflict.positions(G1_RightAnkle) =
+        vec3(0.015625f, 0.0f, 0.0f);
+    minimum_conflict.positions(G1_RightToe) = vec3();
+    array1d<vec3> conflict_globals(G1_BoneCount);
+    array1d<quat> conflict_rotations(G1_BoneCount);
+    check(g1_ik_checked_forward_kinematics(
+              conflict_globals, conflict_rotations,
+              minimum_conflict.positions, minimum_conflict.rotations,
+              minimum_conflict.parents,
+              error, static_cast<int>(sizeof(error))), error);
+    const G1LegConfig conflict_configs[2] = {
+        g1_left_leg_config(), g1_right_leg_config()
+    };
+    for (int foot = 0; foot < 2; ++foot) {
+        vec3 sole;
+        check(g1_ik_checked_physical_sole_centroid(
+                  sole,
+                  conflict_globals(conflict_configs[foot].contact),
+                  conflict_rotations(conflict_configs[foot].contact),
+                  conflict_configs[foot]),
+              "minimum-shell conflict fixture materializes sole");
+        sole.y += foot == 0 ? -0.02f : 0.02f;
+        minimum_conflict.targets[foot] =
+            g1_test_root_reach_locked_target(sole);
+    }
+    G1RootReachTestFixture conflict_left = minimum_conflict;
+    conflict_left.contacts(1) = false;
+    G1RootReachTestFixture conflict_right = minimum_conflict;
+    conflict_right.contacts(0) = false;
+    const G1RootReachPlan conflict_left_plan = g1_test_root_reach_plan(
+        conflict_left, error, static_cast<int>(sizeof(error)));
+    const G1RootReachPlan conflict_right_plan = g1_test_root_reach_plan(
+        conflict_right, error, static_cast<int>(sizeof(error)));
+    const G1RootReachPlan conflict_plan = g1_test_root_reach_plan(
+        minimum_conflict, error, static_cast<int>(sizeof(error)));
+    check(conflict_left_plan.common_interval_found &&
+              conflict_right_plan.common_interval_found &&
+              conflict_plan.active && !conflict_plan.common_interval_found &&
+              !conflict_plan.applied &&
+              terrain_float_bits(conflict_plan.root_y_delta_m) == 0U,
+          "two individually feasible minimum shells conflict after intersection");
+
+    const float negative_cap = -G1RootReachMaximumAdjustmentM;
+    const float positive_cap = G1RootReachMaximumAdjustmentM;
+    const float negative_cases[3] = {
+        std::nextafter(negative_cap, 0.0f),
+        negative_cap,
+        std::nextafter(negative_cap,
+                       -std::numeric_limits<float>::infinity()),
+    };
+    for (int index = 0; index < 3; ++index) {
+        G1RootReachTestFixture cap;
+        g1_test_make_identity_root_reach_fixture(cap);
+        cap.contacts(1) = false;
+        cap.positions(G1_Simulation).y = 0.5f;
+        cap.positions(G1_LeftKnee) = vec3(0.0f, -0.25f, 0.0f);
+        cap.positions(G1_LeftAnkle) = vec3(0.0f, -0.25f, 0.0f);
+        cap.positions(G1_LeftToe) = vec3();
+        array1d<vec3> cap_globals(G1_BoneCount);
+        array1d<quat> cap_rotations(G1_BoneCount);
+        vec3 cap_sole;
+        check(g1_ik_checked_forward_kinematics(
+                  cap_globals, cap_rotations,
+                  cap.positions, cap.rotations, cap.parents,
+                  error, static_cast<int>(sizeof(error))) &&
+              g1_ik_checked_physical_sole_centroid(
+                  cap_sole,
+                  cap_globals(G1_LeftToe),
+                  cap_rotations(G1_LeftToe),
+                  g1_left_leg_config()),
+              "negative cap fixture materializes exact current sole");
+        cap_sole.y += negative_cases[index];
+        cap.targets[0] = g1_test_root_reach_locked_target(cap_sole);
+        const G1RootReachPlan cap_plan = g1_test_root_reach_plan(
+            cap, error, static_cast<int>(sizeof(error)));
+        const bool expected_available = index < 2;
+        check(cap_plan.active &&
+                  cap_plan.common_interval_found == expected_available &&
+                  cap_plan.applied == expected_available &&
+                  terrain_float_bits(cap_plan.root_y_delta_m) ==
+                      (expected_available
+                           ? terrain_float_bits(negative_cases[index])
+                           : 0U),
+              "negative cap accepts inside/exact and rejects one ULP outside");
+    }
+
+    G1RootReachTestFixture positive_geometry;
+    g1_test_make_identity_root_reach_fixture(positive_geometry);
+    positive_geometry.contacts(1) = false;
+    positive_geometry.positions(G1_LeftKnee) =
+        vec3(0.0f, -0.5f, 0.0f);
+    positive_geometry.positions(G1_LeftAnkle) =
+        vec3(0.0f, 0.375f, 0.0f);
+    positive_geometry.positions(G1_LeftToe) = vec3();
+    positive_geometry.positions(G1_Simulation).y = 0.125f;
+    array1d<vec3> positive_globals(G1_BoneCount);
+    array1d<quat> positive_rotations(G1_BoneCount);
+    check(g1_ik_checked_forward_kinematics(
+              positive_globals, positive_rotations,
+              positive_geometry.positions, positive_geometry.rotations,
+              positive_geometry.parents,
+              error, static_cast<int>(sizeof(error))), error);
+    vec3 positive_sole;
+    check(g1_ik_checked_physical_sole_centroid(
+              positive_sole,
+              positive_globals(G1_LeftToe),
+              positive_rotations(G1_LeftToe),
+              g1_left_leg_config()),
+          "positive cap fixture materializes minimum-shell sole");
+    const float positive_cases[3] = {
+        std::nextafter(positive_cap, 0.0f),
+        positive_cap,
+        std::nextafter(positive_cap,
+                       std::numeric_limits<float>::infinity()),
+    };
+    for (int index = 0; index < 3; ++index) {
+        G1RootReachTestFixture cap = positive_geometry;
+        vec3 target = positive_sole;
+        target.y += positive_cases[index];
+        cap.targets[0] = g1_test_root_reach_locked_target(target);
+        const G1RootReachPlan cap_plan = g1_test_root_reach_plan(
+            cap, error, static_cast<int>(sizeof(error)));
+        const bool expected_available = index < 2;
+        check(cap_plan.active &&
+                  cap_plan.common_interval_found == expected_available &&
+                  cap_plan.applied == expected_available &&
+                  terrain_float_bits(cap_plan.root_y_delta_m) ==
+                      (expected_available
+                           ? terrain_float_bits(positive_cases[index])
+                           : 0U),
+              "positive cap accepts inside/exact and rejects one ULP outside");
+    }
+
+    G1RootReachTestFixture rounded_upper = positive_geometry;
+    vec3 rounded_upper_target = positive_sole;
+    rounded_upper_target.y += 0.017f;
+    rounded_upper_target.x += 0.001f;
+    rounded_upper.targets[0] =
+        g1_test_root_reach_locked_target(rounded_upper_target);
+    const volatile double positive_lower_endpoint =
+        0.016996000873460232;
+    const volatile float positive_rounded_endpoint =
+        static_cast<float>(positive_lower_endpoint);
+    const float positive_inward_endpoint = std::nextafter(
+        positive_rounded_endpoint,
+        std::numeric_limits<float>::infinity());
+    check(terrain_float_bits(positive_rounded_endpoint) ==
+              UINT32_C(0x3c8b3b32) &&
+              static_cast<double>(positive_rounded_endpoint) <
+                  positive_lower_endpoint &&
+              terrain_float_bits(positive_inward_endpoint) ==
+                  UINT32_C(0x3c8b3b33) &&
+              static_cast<double>(positive_inward_endpoint) >=
+                  positive_lower_endpoint,
+          "rounded positive lower endpoint requires one inward nextafter");
+    const G1RootReachPlan upper_plan = g1_test_root_reach_plan(
+        rounded_upper, error, static_cast<int>(sizeof(error)));
+    check(upper_plan.common_interval_found && upper_plan.applied &&
+              terrain_float_bits(upper_plan.root_y_delta_m) ==
+                  UINT32_C(0x3c8b3b35),
+          "rounded lower endpoint passes bounded actual-FK certification");
+
+    G1RootReachTestFixture adjusted_target_revalidation;
+    g1_test_make_identity_root_reach_fixture(
+        adjusted_target_revalidation);
+    adjusted_target_revalidation.contacts(1) = false;
+    adjusted_target_revalidation.targets[0].sole_center.y =
+        g1_test_float_from_bits(UINT32_C(0xbf1474da));
+    adjusted_target_revalidation.targets[0].surface.point =
+        adjusted_target_revalidation.targets[0].sole_center;
+    const G1RootReachPlan adjusted_target_plan =
+        g1_test_root_reach_plan(
+            adjusted_target_revalidation,
+            error, static_cast<int>(sizeof(error)));
+    check(adjusted_target_plan.active &&
+              adjusted_target_plan.common_interval_found &&
+              adjusted_target_plan.applied &&
+              terrain_float_bits(
+                  adjusted_target_plan.root_y_delta_m) ==
+                  UINT32_C(0xbd4ccccb),
+          "adjusted-target revalidation selects the nearest dual-certified candidate");
+    array1d<vec3> adjusted_target_positions =
+        adjusted_target_revalidation.positions;
+    check(g1_apply_root_reach_plan_y(
+              adjusted_target_positions(G1_Simulation).y,
+              adjusted_target_revalidation.positions(G1_Simulation).y,
+              adjusted_target_plan),
+          "adjusted-target candidate applies to the local root");
+    array1d<vec3> adjusted_target_globals(G1_BoneCount);
+    array1d<quat> adjusted_target_global_rotations(G1_BoneCount);
+    check(g1_ik_checked_forward_kinematics(
+              adjusted_target_globals,
+              adjusted_target_global_rotations,
+              adjusted_target_positions,
+              adjusted_target_revalidation.rotations,
+              adjusted_target_revalidation.parents,
+              error, static_cast<int>(sizeof(error))), error);
+    const G1LegConfig adjusted_target_config =
+        g1_left_leg_config();
+    G1PhysicalSolePositionTarget adjusted_physical_target = {};
+    IKTargetProjection adjusted_target_projection = {};
+    check(g1_physical_sole_position_target(
+              adjusted_physical_target,
+              adjusted_target_globals(adjusted_target_config.contact),
+              adjusted_target_global_rotations(
+                  adjusted_target_config.contact),
+              adjusted_target_globals(adjusted_target_config.ankle),
+              adjusted_target_config,
+              adjusted_target_revalidation.targets[0].sole_center,
+              adjusted_target_revalidation.targets[0]
+                  .desired_sole_normal,
+              error, static_cast<int>(sizeof(error))) &&
+              ik_project_target(
+                  adjusted_target_projection,
+                  adjusted_target_globals(adjusted_target_config.hip),
+                  adjusted_target_globals(adjusted_target_config.knee),
+                  adjusted_target_globals(adjusted_target_config.ankle),
+                  adjusted_physical_target.ankle_target,
+                  adjusted_target_config.reach_buffer_m),
+          "adjusted-target production projection materializes");
+    check(adjusted_target_projection.reachable &&
+              g1_ik_vec3_bits_equal(
+                  adjusted_target_projection.clamped_target,
+                  adjusted_physical_target.ankle_target),
+          "published root plan authenticates the recomputed production target");
+
+    G1RootReachTestFixture revalidation_refusal = positive_geometry;
+    revalidation_refusal.positions(G1_Simulation).y = 100.0f;
+    array1d<vec3> refusal_globals(G1_BoneCount);
+    array1d<quat> refusal_global_rotations(G1_BoneCount);
+    check(g1_ik_checked_forward_kinematics(
+              refusal_globals, refusal_global_rotations,
+              revalidation_refusal.positions,
+              revalidation_refusal.rotations,
+              revalidation_refusal.parents,
+              error, static_cast<int>(sizeof(error))), error);
+    vec3 refusal_sole;
+    check(g1_ik_checked_physical_sole_centroid(
+              refusal_sole,
+              refusal_globals(G1_LeftToe),
+              refusal_global_rotations(G1_LeftToe),
+              g1_left_leg_config()),
+          "projection-refusal fixture materializes actual high-level sole");
+    refusal_sole.x += 0.001f;
+    refusal_sole.y += 0.017f;
+    revalidation_refusal.targets[0] =
+        g1_test_root_reach_locked_target(refusal_sole);
+    const G1RootReachPlan refusal_plan = g1_test_root_reach_plan(
+        revalidation_refusal, error, static_cast<int>(sizeof(error)));
+    check(refusal_plan.active && !refusal_plan.common_interval_found &&
+              !refusal_plan.applied &&
+              terrain_float_bits(refusal_plan.root_y_delta_m) == 0U,
+          "analytic interval refuses publication when all projections reject");
+
+    const volatile double refusal_analytic_lower =
+        0.016994290965213238;
+    const float refusal_first =
+        g1_test_float_from_bits(UINT32_C(0x3c8b379d));
+    check(static_cast<double>(refusal_first) >=
+              refusal_analytic_lower,
+          "first refusal candidate is admitted by the closed analytic interval");
+    for (uint32_t candidate_index = 0U;
+         candidate_index < 32U;
+         ++candidate_index) {
+        const uint32_t bits = UINT32_C(0x3c8b379d) + candidate_index;
+        const G1RootReachPlan candidate_plan = {
+            true, true, true, g1_test_float_from_bits(bits)
+        };
+        array1d<vec3> candidate_positions =
+            revalidation_refusal.positions;
+        check(g1_apply_root_reach_plan_y(
+                  candidate_positions(G1_Simulation).y,
+                  revalidation_refusal.positions(G1_Simulation).y,
+                  candidate_plan),
+              "projection-refusal candidate applies to local root");
+        array1d<vec3> candidate_globals(G1_BoneCount);
+        array1d<quat> candidate_rotations(G1_BoneCount);
+        check(g1_ik_checked_forward_kinematics(
+                  candidate_globals, candidate_rotations,
+                  candidate_positions,
+                  revalidation_refusal.rotations,
+                  revalidation_refusal.parents,
+                  error, static_cast<int>(sizeof(error))), error);
+        G1PhysicalSolePositionTarget refusal_target = {};
+        IKTargetProjection projection = {};
+        check(g1_physical_sole_position_target(
+                  refusal_target,
+                  candidate_globals(G1_LeftToe),
+                  candidate_rotations(G1_LeftToe),
+                  candidate_globals(G1_LeftAnkle),
+                  g1_left_leg_config(),
+                  revalidation_refusal.targets[0].sole_center,
+                  revalidation_refusal.targets[0]
+                      .desired_sole_normal,
+                  error, static_cast<int>(sizeof(error))) &&
+              ik_project_target(
+                  projection,
+                  candidate_globals(G1_LeftHipYaw),
+                  candidate_globals(G1_LeftKnee),
+                  candidate_globals(G1_LeftAnkle),
+                  refusal_target.ankle_target,
+                  g1_left_leg_config().reach_buffer_m),
+              "projection-refusal adjusted production target materializes");
+        check(!projection.reachable ||
+                  !g1_ik_vec3_bits_equal(
+                      projection.clamped_target,
+                      refusal_target.ankle_target),
+              "each bounded analytic boundary float is projection-rejected");
+    }
+}
+
+#if defined(G1_IK_ENABLE_TEST_SEAMS)
+
+static void test_root_reach_planner_audit_trace()
+{
+    char error[512] = {};
+    G1RootReachTestFixture authentic;
+    g1_test_make_lowcurb_root_reach_fixture(authentic);
+    G1RootReachPlan authentic_plan = {};
+    G1RootReachPlannerAudit authentic_audit = {};
+    check(g1_plan_recorded_contact_root_reach_audited(
+              authentic_plan,
+              authentic_audit,
+              authentic.positions,
+              authentic.rotations,
+              authentic.parents,
+              authentic.contacts,
+              authentic.targets[0],
+              authentic.targets[1],
+              error,
+              static_cast<int>(sizeof(error))), error);
+    const uint32_t authentic_attempt_bits[4] = {
+        UINT32_C(0xbc80e8ed),
+        UINT32_C(0xbc80e8ee),
+        UINT32_C(0xbc80e8ef),
+        UINT32_C(0xbc80e8f0),
+    };
+    check(authentic_audit.cursor_count == 1U &&
+              authentic_audit.cursors[0].interval_index == 0U &&
+              authentic_audit.cursors[0].initial_delta_bits ==
+                  UINT32_C(0xbc80e8ed) &&
+              authentic_audit.attempt_count == 4U,
+          "authentic audit owns the production initial boundary and attempt count");
+    for (uint32_t attempt = 0U; attempt < 4U; ++attempt) {
+        check(authentic_audit.attempts[attempt].cursor_index == 0U &&
+                  authentic_audit.attempts[attempt].delta_bits ==
+                      authentic_attempt_bits[attempt] &&
+                  authentic_audit.attempts[attempt].status ==
+                      (attempt == 3U
+                           ? G1RootReachAuditAccepted
+                           : G1RootReachAuditRejected),
+              "authentic audit owns every production revalidation attempt");
+    }
+
+    G1RootReachTestFixture interleaved;
+    g1_test_make_identity_root_reach_fixture(interleaved);
+    interleaved.contacts(1) = false;
+    interleaved.positions(G1_LeftKnee) =
+        vec3(0.0f, -0.4f, 0.0f);
+    interleaved.positions(G1_LeftAnkle) =
+        vec3(0.0f, 0.39f, 0.0f);
+    interleaved.positions(G1_LeftToe) = vec3();
+    interleaved.positions(G1_Simulation).y =
+        g1_test_float_from_bits(UINT32_C(0xbe4c63f1));
+    array1d<vec3> interleaved_globals(G1_BoneCount);
+    array1d<quat> interleaved_rotations(G1_BoneCount);
+    check(g1_ik_checked_forward_kinematics(
+              interleaved_globals,
+              interleaved_rotations,
+              interleaved.positions,
+              interleaved.rotations,
+              interleaved.parents,
+              error,
+              static_cast<int>(sizeof(error))), error);
+    vec3 interleaved_sole;
+    check(g1_ik_checked_physical_sole_centroid(
+              interleaved_sole,
+              interleaved_globals(G1_LeftToe),
+              interleaved_rotations(G1_LeftToe),
+              g1_left_leg_config()),
+          "interleaved audit fixture materializes its sole");
+    interleaved_sole.y =
+        g1_test_float_from_bits(UINT32_C(0xbe703afb));
+    interleaved.targets[0] =
+        g1_test_root_reach_locked_target(interleaved_sole);
+    G1RootReachPlan interleaved_plan = {};
+    G1RootReachPlannerAudit interleaved_audit = {};
+    check(g1_plan_recorded_contact_root_reach_audited(
+              interleaved_plan,
+              interleaved_audit,
+              interleaved.positions,
+              interleaved.rotations,
+              interleaved.parents,
+              interleaved.contacts,
+              interleaved.targets[0],
+              interleaved.targets[1],
+              error,
+              static_cast<int>(sizeof(error))), error);
+    check(interleaved_plan.active &&
+              interleaved_plan.common_interval_found &&
+              interleaved_plan.applied &&
+              terrain_float_bits(interleaved_plan.root_y_delta_m) ==
+                  UINT32_C(0x3c23d730) &&
+              interleaved_audit.cursor_count == 2U &&
+              interleaved_audit.cursors[0].interval_index == 0U &&
+              interleaved_audit.cursors[0].initial_delta_bits ==
+                  UINT32_C(0xbc23d730) &&
+              interleaved_audit.cursors[1].interval_index == 1U &&
+              interleaved_audit.cursors[1].initial_delta_bits ==
+                  UINT32_C(0x3c23d730) &&
+              interleaved_audit.attempt_count == 2U,
+          "two-interval audit owns both production cursor initializations");
+    check(interleaved_audit.attempts[0].cursor_index == 0U &&
+              interleaved_audit.attempts[0].delta_bits ==
+                  UINT32_C(0xbc23d730) &&
+              interleaved_audit.attempts[0].status ==
+                  G1RootReachAuditRejected &&
+              interleaved_audit.attempts[1].cursor_index == 1U &&
+              interleaved_audit.attempts[1].delta_bits ==
+                  UINT32_C(0x3c23d730) &&
+              interleaved_audit.attempts[1].status ==
+                  G1RootReachAuditAccepted,
+          "global frontier switches cursors after the nearer tie rejects");
+
+    G1RootReachTestFixture two_cursor_exhaustion;
+    g1_test_make_identity_root_reach_fixture(
+        two_cursor_exhaustion);
+    two_cursor_exhaustion.contacts(1) = false;
+    two_cursor_exhaustion.positions(G1_LeftKnee) =
+        vec3(0.0f, -0.4f, 0.0f);
+    two_cursor_exhaustion.positions(G1_LeftAnkle) =
+        vec3(0.0f, 0.39f, 0.0f);
+    two_cursor_exhaustion.positions(G1_LeftToe) = vec3();
+    two_cursor_exhaustion.positions(G1_Simulation).y = 100.0f;
+    array1d<vec3> exhaustion_globals(G1_BoneCount);
+    array1d<quat> exhaustion_rotations(G1_BoneCount);
+    check(g1_ik_checked_forward_kinematics(
+              exhaustion_globals,
+              exhaustion_rotations,
+              two_cursor_exhaustion.positions,
+              two_cursor_exhaustion.rotations,
+              two_cursor_exhaustion.parents,
+              error,
+              static_cast<int>(sizeof(error))), error);
+    vec3 exhaustion_sole;
+    check(g1_ik_checked_physical_sole_centroid(
+              exhaustion_sole,
+              exhaustion_globals(G1_LeftToe),
+              exhaustion_rotations(G1_LeftToe),
+              g1_left_leg_config()),
+          "two-cursor exhaustion fixture materializes its sole");
+    exhaustion_sole.x += 0.001f;
+    exhaustion_sole.y += 0.01f;
+    two_cursor_exhaustion.targets[0] =
+        g1_test_root_reach_locked_target(exhaustion_sole);
+    G1RootReachPlan exhaustion_plan = {};
+    G1RootReachPlannerAudit exhaustion_audit = {};
+    check(g1_plan_recorded_contact_root_reach_audited(
+              exhaustion_plan,
+              exhaustion_audit,
+              two_cursor_exhaustion.positions,
+              two_cursor_exhaustion.rotations,
+              two_cursor_exhaustion.parents,
+              two_cursor_exhaustion.contacts,
+              two_cursor_exhaustion.targets[0],
+              two_cursor_exhaustion.targets[1],
+              error,
+              static_cast<int>(sizeof(error))), error);
+    check(exhaustion_plan.active &&
+              !exhaustion_plan.common_interval_found &&
+              !exhaustion_plan.applied &&
+              terrain_float_bits(exhaustion_plan.root_y_delta_m) == 0U &&
+              exhaustion_audit.cursor_count == 2U &&
+              exhaustion_audit.cursors[0].interval_index == 0U &&
+              exhaustion_audit.cursors[0].initial_delta_bits ==
+                  UINT32_C(0xbc230dce) &&
+              exhaustion_audit.cursors[1].interval_index == 1U &&
+              exhaustion_audit.cursors[1].initial_delta_bits ==
+                  UINT32_C(0x3c230dce) &&
+              exhaustion_audit.attempt_count == 32U,
+          "two-cursor refusal exhausts one planner-wide 32-attempt budget");
+    for (uint32_t attempt = 0U; attempt < 32U; ++attempt) {
+        const uint32_t cursor = attempt & 1U;
+        const uint32_t magnitude_bits =
+            UINT32_C(0x3c230dce) + attempt / 2U;
+        const uint32_t expected_bits = cursor == 0U
+            ? magnitude_bits | UINT32_C(0x80000000)
+            : magnitude_bits;
+        check(exhaustion_audit.attempts[attempt].cursor_index ==
+                  cursor &&
+                  exhaustion_audit.attempts[attempt].delta_bits ==
+                      expected_bits &&
+                  exhaustion_audit.attempts[attempt].status ==
+                      G1RootReachAuditRejected,
+              "two-cursor refusal alternates globally within the exact ceiling");
+    }
+
+    G1RootReachTestFixture refusal;
+    g1_test_make_identity_root_reach_fixture(refusal);
+    refusal.contacts(1) = false;
+    refusal.positions(G1_LeftKnee) = vec3(0.0f, -0.5f, 0.0f);
+    refusal.positions(G1_LeftAnkle) = vec3(0.0f, 0.375f, 0.0f);
+    refusal.positions(G1_LeftToe) = vec3();
+    refusal.positions(G1_Simulation).y = 100.0f;
+    array1d<vec3> refusal_globals(G1_BoneCount);
+    array1d<quat> refusal_rotations(G1_BoneCount);
+    check(g1_ik_checked_forward_kinematics(
+              refusal_globals,
+              refusal_rotations,
+              refusal.positions,
+              refusal.rotations,
+              refusal.parents,
+              error,
+              static_cast<int>(sizeof(error))), error);
+    vec3 refusal_sole;
+    check(g1_ik_checked_physical_sole_centroid(
+              refusal_sole,
+              refusal_globals(G1_LeftToe),
+              refusal_rotations(G1_LeftToe),
+              g1_left_leg_config()),
+          "audit refusal fixture materializes its sole");
+    refusal_sole.x += 0.001f;
+    refusal_sole.y += 0.017f;
+    refusal.targets[0] =
+        g1_test_root_reach_locked_target(refusal_sole);
+    G1RootReachPlan refusal_plan = {};
+    G1RootReachPlannerAudit refusal_audit = {};
+    check(g1_plan_recorded_contact_root_reach_audited(
+              refusal_plan,
+              refusal_audit,
+              refusal.positions,
+              refusal.rotations,
+              refusal.parents,
+              refusal.contacts,
+              refusal.targets[0],
+              refusal.targets[1],
+              error,
+              static_cast<int>(sizeof(error))), error);
+    check(refusal_plan.active &&
+              !refusal_plan.common_interval_found &&
+              !refusal_plan.applied &&
+              terrain_float_bits(refusal_plan.root_y_delta_m) == 0U &&
+              refusal_audit.cursor_count == 1U &&
+              refusal_audit.cursors[0].interval_index == 0U &&
+              refusal_audit.cursors[0].initial_delta_bits ==
+                  UINT32_C(0x3c8b379d) &&
+              refusal_audit.attempt_count == 32U,
+          "refusal audit owns the one global 32-attempt ceiling");
+    for (uint32_t attempt = 0U; attempt < 32U; ++attempt) {
+        check(refusal_audit.attempts[attempt].cursor_index == 0U &&
+                  refusal_audit.attempts[attempt].delta_bits ==
+                      UINT32_C(0x3c8b379d) + attempt &&
+                  refusal_audit.attempts[attempt].status ==
+                      G1RootReachAuditRejected,
+              "refusal audit owns every globally bounded rejected attempt");
+    }
+
+    G1RootReachPlan poisoned_plan;
+    G1RootReachPlannerAudit poisoned_audit;
+    g1_test_poison_bytes(poisoned_plan, 0x5a);
+    g1_test_poison_bytes(poisoned_audit, 0xa5);
+    const G1TestByteSnapshot<G1RootReachPlan> plan_before(
+        poisoned_plan);
+    const G1TestByteSnapshot<G1RootReachPlannerAudit> audit_before(
+        poisoned_audit);
+    check(!g1_plan_recorded_contact_root_reach_audited(
+              poisoned_plan,
+              poisoned_audit,
+              slice1d<vec3>(
+                  G1_BoneCount - 1,
+                  authentic.positions.data),
+              authentic.rotations,
+              authentic.parents,
+              authentic.contacts,
+              authentic.targets[0],
+              authentic.targets[1],
+              error,
+              static_cast<int>(sizeof(error))) &&
+              plan_before.same(poisoned_plan) &&
+              audit_before.same(poisoned_audit),
+          "invalid audited planning preserves poisoned plan and trace");
+
+    G1RootReachTestFixture arithmetic_failure;
+    g1_test_make_identity_root_reach_fixture(arithmetic_failure);
+    arithmetic_failure.contacts(1) = false;
+    arithmetic_failure.positions(G1_Simulation).y = 1.0e20f;
+    arithmetic_failure.positions(G1_Hips).y = -1.0e20f;
+    arithmetic_failure.targets[0].sole_center.y -= 0.02f;
+    arithmetic_failure.targets[0].surface.point =
+        arithmetic_failure.targets[0].sole_center;
+    G1RootReachPlan arithmetic_plan;
+    G1RootReachPlannerAudit arithmetic_audit;
+    g1_test_poison_bytes(arithmetic_plan, 0x26);
+    g1_test_poison_bytes(arithmetic_audit, 0x62);
+    const G1TestByteSnapshot<G1RootReachPlan> arithmetic_plan_before(
+        arithmetic_plan);
+    const G1TestByteSnapshot<G1RootReachPlannerAudit>
+        arithmetic_audit_before(arithmetic_audit);
+    check(!g1_plan_recorded_contact_root_reach_audited(
+              arithmetic_plan,
+              arithmetic_audit,
+              arithmetic_failure.positions,
+              arithmetic_failure.rotations,
+              arithmetic_failure.parents,
+              arithmetic_failure.contacts,
+              arithmetic_failure.targets[0],
+              arithmetic_failure.targets[1],
+              error,
+              static_cast<int>(sizeof(error))) &&
+              arithmetic_plan_before.same(arithmetic_plan) &&
+              arithmetic_audit_before.same(arithmetic_audit),
+          "late audited arithmetic failure publishes neither plan nor partial trace");
+
+    alignas(G1RootReachPlannerAudit)
+        unsigned char overlap_storage[
+            sizeof(G1RootReachPlannerAudit)] = {};
+    g1_test_poison_bytes(overlap_storage, 0x3c);
+    unsigned char overlap_before[sizeof(overlap_storage)] = {};
+    std::memcpy(
+        overlap_before, overlap_storage, sizeof(overlap_storage));
+    G1RootReachPlan& overlap_plan =
+        *reinterpret_cast<G1RootReachPlan*>(overlap_storage);
+    G1RootReachPlannerAudit& overlap_audit =
+        *reinterpret_cast<G1RootReachPlannerAudit*>(overlap_storage);
+    check(!g1_plan_recorded_contact_root_reach_audited(
+              overlap_plan,
+              overlap_audit,
+              authentic.positions,
+              authentic.rotations,
+              authentic.parents,
+              authentic.contacts,
+              authentic.targets[0],
+              authentic.targets[1],
+              error,
+              static_cast<int>(sizeof(error))) &&
+              std::memcmp(
+                  overlap_before,
+                  overlap_storage,
+                  sizeof(overlap_storage)) == 0,
+          "audited planner rejects plan/trace overlap transactionally");
+
+    G1RootReachPlan error_plan;
+    G1RootReachPlannerAudit error_audit;
+    g1_test_poison_bytes(error_plan, 0x17);
+    g1_test_poison_bytes(error_audit, 0x71);
+    const G1TestByteSnapshot<G1RootReachPlan> error_plan_before(
+        error_plan);
+    const G1TestByteSnapshot<G1RootReachPlannerAudit> error_audit_before(
+        error_audit);
+    check(!g1_plan_recorded_contact_root_reach_audited(
+              error_plan,
+              error_audit,
+              authentic.positions,
+              authentic.rotations,
+              authentic.parents,
+              authentic.contacts,
+              authentic.targets[0],
+              authentic.targets[1],
+              reinterpret_cast<char*>(&error_audit) + 1,
+              4) &&
+              error_plan_before.same(error_plan) &&
+              error_audit_before.same(error_audit),
+          "audited planner rejects error/trace overlap transactionally");
+
+    static constexpr size_t AuditInputStorageBytes =
+        static_cast<size_t>(G1_BoneCount) * sizeof(quat) >
+                sizeof(G1RootReachPlannerAudit)
+            ? static_cast<size_t>(G1_BoneCount) * sizeof(quat)
+            : sizeof(G1RootReachPlannerAudit);
+    for (int owner = 0; owner < 6; ++owner) {
+        alignas(G1RootReachPlannerAudit)
+            unsigned char owner_storage[AuditInputStorageBytes] = {};
+        slice1d<vec3> positions = authentic.positions;
+        slice1d<quat> rotations = authentic.rotations;
+        slice1d<int> parents = authentic.parents;
+        slice1d<bool> contacts = authentic.contacts;
+        const G1FootTarget* left_target = &authentic.targets[0];
+        const G1FootTarget* right_target = &authentic.targets[1];
+        if (owner == 0) {
+            std::memcpy(
+                owner_storage,
+                authentic.positions.data,
+                static_cast<size_t>(G1_BoneCount) * sizeof(vec3));
+            positions = slice1d<vec3>(
+                G1_BoneCount,
+                reinterpret_cast<vec3*>(owner_storage));
+        } else if (owner == 1) {
+            std::memcpy(
+                owner_storage,
+                authentic.rotations.data,
+                static_cast<size_t>(G1_BoneCount) * sizeof(quat));
+            rotations = slice1d<quat>(
+                G1_BoneCount,
+                reinterpret_cast<quat*>(owner_storage));
+        } else if (owner == 2) {
+            std::memcpy(
+                owner_storage,
+                authentic.parents.data,
+                static_cast<size_t>(G1_BoneCount) * sizeof(int));
+            parents = slice1d<int>(
+                G1_BoneCount,
+                reinterpret_cast<int*>(owner_storage));
+        } else if (owner == 3) {
+            std::memcpy(
+                owner_storage,
+                authentic.contacts.data,
+                2U * sizeof(bool));
+            contacts = slice1d<bool>(
+                2,
+                reinterpret_cast<bool*>(owner_storage));
+        } else if (owner == 4) {
+            std::memcpy(
+                owner_storage,
+                &authentic.targets[0],
+                sizeof(G1FootTarget));
+            left_target = reinterpret_cast<G1FootTarget*>(
+                owner_storage);
+        } else {
+            std::memcpy(
+                owner_storage,
+                &authentic.targets[1],
+                sizeof(G1FootTarget));
+            right_target = reinterpret_cast<G1FootTarget*>(
+                owner_storage);
+        }
+        unsigned char owner_before[AuditInputStorageBytes] = {};
+        std::memcpy(
+            owner_before, owner_storage, sizeof(owner_storage));
+        G1RootReachPlan owner_plan;
+        g1_test_poison_bytes(owner_plan, 0x4d);
+        const G1TestByteSnapshot<G1RootReachPlan> owner_plan_before(
+            owner_plan);
+        G1RootReachPlannerAudit& owner_audit =
+            *reinterpret_cast<G1RootReachPlannerAudit*>(owner_storage);
+        check(!g1_plan_recorded_contact_root_reach_audited(
+                  owner_plan,
+                  owner_audit,
+                  positions,
+                  rotations,
+                  parents,
+                  contacts,
+                  *left_target,
+                  *right_target,
+                  error,
+                  static_cast<int>(sizeof(error))) &&
+                  owner_plan_before.same(owner_plan) &&
+                  std::memcmp(
+                      owner_before,
+                      owner_storage,
+                      sizeof(owner_storage)) == 0,
+              "audited planner rejects trace overlap with every input owner");
+    }
+}
+
+#endif
+
+static void test_root_reach_validation_alias_and_apply_rollback()
+{
+    char error[512] = {};
+    G1RootReachTestFixture valid;
+    g1_test_make_identity_root_reach_fixture(valid);
+    valid.contacts(1) = false;
+
+    const auto expect_plan_failure = [&error](
+            const slice1d<vec3> positions,
+            const slice1d<quat> rotations,
+            const slice1d<int> parents,
+            const slice1d<bool> contacts,
+            const G1FootTarget& left,
+            const G1FootTarget& right,
+            int error_capacity,
+            const char* message) {
+        G1RootReachPlan output;
+        g1_test_poison_bytes(output, 0xa5);
+        const G1TestByteSnapshot<G1RootReachPlan> before(output);
+        check(!g1_plan_recorded_contact_root_reach(
+                  output, positions, rotations, parents, contacts,
+                  left, right, error, error_capacity), message);
+        check(before.same(output),
+              "failed root reach planning preserves poisoned output");
+    };
+
+    expect_plan_failure(
+        slice1d<vec3>(G1_BoneCount - 1, valid.positions.data),
+        valid.rotations, valid.parents, valid.contacts,
+        valid.targets[0], valid.targets[1],
+        static_cast<int>(sizeof(error)),
+        "short root reach position slice is rejected");
+    expect_plan_failure(
+        valid.positions,
+        slice1d<quat>(G1_BoneCount - 1, valid.rotations.data),
+        valid.parents, valid.contacts,
+        valid.targets[0], valid.targets[1],
+        static_cast<int>(sizeof(error)),
+        "short root reach rotation slice is rejected");
+    expect_plan_failure(
+        valid.positions, valid.rotations,
+        slice1d<int>(G1_BoneCount - 1, valid.parents.data),
+        valid.contacts, valid.targets[0], valid.targets[1],
+        static_cast<int>(sizeof(error)),
+        "short root reach parent slice is rejected");
+    expect_plan_failure(
+        valid.positions, valid.rotations, valid.parents,
+        slice1d<bool>(1, valid.contacts.data),
+        valid.targets[0], valid.targets[1],
+        static_cast<int>(sizeof(error)),
+        "malformed root reach contact slice is rejected");
+
+    G1RootReachTestFixture bad_parent = valid;
+    bad_parent.parents(G1_LeftAnkle) = G1_Hips;
+    expect_plan_failure(
+        bad_parent.positions, bad_parent.rotations, bad_parent.parents,
+        bad_parent.contacts, bad_parent.targets[0], bad_parent.targets[1],
+        static_cast<int>(sizeof(error)),
+        "malformed root reach topology is rejected");
+
+    G1RootReachTestFixture bad_target = valid;
+    bad_target.targets[0].desired_sole_normal = vec3();
+    expect_plan_failure(
+        bad_target.positions, bad_target.rotations, bad_target.parents,
+        bad_target.contacts, bad_target.targets[0], bad_target.targets[1],
+        static_cast<int>(sizeof(error)),
+        "malformed recorded target is rejected");
+
+    const float invalid_values[] = {
+        g1_test_float_from_bits(UINT32_C(0x7fc00001)),
+        g1_test_float_from_bits(UINT32_C(0x00000001)),
+        std::numeric_limits<float>::max(),
+    };
+    for (float invalid : invalid_values) {
+        G1RootReachTestFixture arithmetic = valid;
+        arithmetic.positions(G1_Simulation).y = invalid;
+        expect_plan_failure(
+            arithmetic.positions, arithmetic.rotations,
+            arithmetic.parents, arithmetic.contacts,
+            arithmetic.targets[0], arithmetic.targets[1],
+            static_cast<int>(sizeof(error)),
+            "nonfinite/subnormal/overflow root reach arithmetic rolls back");
+    }
+    G1RootReachTestFixture unrepresentable_apply = valid;
+    unrepresentable_apply.positions(G1_Simulation).y = 1.0e20f;
+    unrepresentable_apply.positions(G1_Hips).y = -1.0e20f;
+    unrepresentable_apply.targets[0].sole_center.y -= 0.02f;
+    unrepresentable_apply.targets[0].surface.point =
+        unrepresentable_apply.targets[0].sole_center;
+    expect_plan_failure(
+        unrepresentable_apply.positions,
+        unrepresentable_apply.rotations,
+        unrepresentable_apply.parents,
+        unrepresentable_apply.contacts,
+        unrepresentable_apply.targets[0],
+        unrepresentable_apply.targets[1],
+        static_cast<int>(sizeof(error)),
+        "actual-FK revalidation arithmetic failure rolls back globally");
+
+    G1RootReachTestFixture empty_then_failure = valid;
+    empty_then_failure.contacts(1) = true;
+    empty_then_failure.targets[0].sole_center.x =
+        std::numeric_limits<float>::max();
+    empty_then_failure.targets[0].surface.point =
+        empty_then_failure.targets[0].sole_center;
+    empty_then_failure.positions(G1_RightHipYaw) =
+        vec3(0.0f, -std::numeric_limits<float>::max(), 0.0f);
+    empty_then_failure.positions(G1_RightHipRoll) = vec3();
+    empty_then_failure.positions(G1_RightHipPitch) = vec3();
+    empty_then_failure.positions(G1_RightKnee) =
+        vec3(0.0f, std::numeric_limits<float>::max(), 0.0f);
+    empty_then_failure.positions(G1_RightAnkle) =
+        vec3(0.0f, std::numeric_limits<float>::max(), 0.0f);
+    empty_then_failure.positions(G1_RightToe) = vec3();
+    expect_plan_failure(
+        empty_then_failure.positions,
+        empty_then_failure.rotations,
+        empty_then_failure.parents,
+        empty_then_failure.contacts,
+        empty_then_failure.targets[0],
+        empty_then_failure.targets[1],
+        static_cast<int>(sizeof(error)),
+        "empty left interval does not hide right-foot arithmetic failure");
+    expect_plan_failure(
+        valid.positions, valid.rotations, valid.parents, valid.contacts,
+        valid.targets[0], valid.targets[1], -1,
+        "negative root reach error capacity rolls back");
+
+    G1RootReachTestFixture output_position_alias = valid;
+    const G1TestByteSnapshot<vec3> aliased_root_before(
+        output_position_alias.positions(G1_Simulation));
+    G1RootReachPlan& position_output =
+        *reinterpret_cast<G1RootReachPlan*>(
+            &output_position_alias.positions(G1_Simulation));
+    check(!g1_plan_recorded_contact_root_reach(
+              position_output,
+              output_position_alias.positions,
+              output_position_alias.rotations,
+              output_position_alias.parents,
+              output_position_alias.contacts,
+              output_position_alias.targets[0],
+              output_position_alias.targets[1],
+              error, static_cast<int>(sizeof(error))) &&
+              aliased_root_before.same(
+                  output_position_alias.positions(G1_Simulation)),
+          "root reach output/position overlap preserves input storage");
+
+    G1RootReachTestFixture output_rotation_alias = valid;
+    const G1TestByteSnapshot<quat> aliased_rotation_before(
+        output_rotation_alias.rotations(G1_Simulation));
+    G1RootReachPlan& rotation_output =
+        *reinterpret_cast<G1RootReachPlan*>(
+            &output_rotation_alias.rotations(G1_Simulation));
+    check(!g1_plan_recorded_contact_root_reach(
+              rotation_output,
+              output_rotation_alias.positions,
+              output_rotation_alias.rotations,
+              output_rotation_alias.parents,
+              output_rotation_alias.contacts,
+              output_rotation_alias.targets[0],
+              output_rotation_alias.targets[1],
+              error, static_cast<int>(sizeof(error))) &&
+              aliased_rotation_before.same(
+                  output_rotation_alias.rotations(G1_Simulation)),
+          "root reach output/rotation overlap preserves input storage");
+
+    G1RootReachTestFixture output_parent_alias = valid;
+    const G1TestByteSnapshot<int> aliased_parent_before(
+        output_parent_alias.parents(0));
+    G1RootReachPlan& parent_output =
+        *reinterpret_cast<G1RootReachPlan*>(
+            output_parent_alias.parents.data);
+    check(!g1_plan_recorded_contact_root_reach(
+              parent_output,
+              output_parent_alias.positions,
+              output_parent_alias.rotations,
+              output_parent_alias.parents,
+              output_parent_alias.contacts,
+              output_parent_alias.targets[0],
+              output_parent_alias.targets[1],
+              error, static_cast<int>(sizeof(error))) &&
+              aliased_parent_before.same(output_parent_alias.parents(0)),
+          "root reach output/parent overlap preserves input storage");
+
+    G1RootReachTestFixture output_contact_alias = valid;
+    output_contact_alias.contacts.resize(
+        static_cast<int>(sizeof(G1RootReachPlan)));
+    output_contact_alias.contacts.set(false);
+    output_contact_alias.contacts(0) = true;
+    unsigned char contact_before[sizeof(G1RootReachPlan)] = {};
+    std::memcpy(
+        contact_before,
+        output_contact_alias.contacts.data,
+        sizeof(contact_before));
+    G1RootReachPlan& contact_output =
+        *reinterpret_cast<G1RootReachPlan*>(
+            output_contact_alias.contacts.data);
+    check(!g1_plan_recorded_contact_root_reach(
+              contact_output,
+              output_contact_alias.positions,
+              output_contact_alias.rotations,
+              output_contact_alias.parents,
+              slice1d<bool>(2, output_contact_alias.contacts.data),
+              output_contact_alias.targets[0],
+              output_contact_alias.targets[1],
+              error, static_cast<int>(sizeof(error))) &&
+              std::memcmp(
+                  contact_before,
+                  output_contact_alias.contacts.data,
+                  sizeof(contact_before)) == 0,
+          "root reach output/contact overlap preserves input storage");
+
+    for (int target_index = 0; target_index < 2; ++target_index) {
+        G1RootReachTestFixture output_target_alias = valid;
+        const G1TestByteSnapshot<G1FootTarget> target_before(
+            output_target_alias.targets[target_index]);
+        const uintptr_t target_alias_address = reinterpret_cast<uintptr_t>(
+            &output_target_alias.targets[target_index]);
+        G1RootReachPlan& target_output =
+            *reinterpret_cast<G1RootReachPlan*>(target_alias_address);
+        check(!g1_plan_recorded_contact_root_reach(
+                  target_output,
+                  output_target_alias.positions,
+                  output_target_alias.rotations,
+                  output_target_alias.parents,
+                  output_target_alias.contacts,
+                  output_target_alias.targets[0],
+                  output_target_alias.targets[1],
+                  error, static_cast<int>(sizeof(error))) &&
+                  target_before.same(
+                      output_target_alias.targets[target_index]),
+              "root reach output/each-target overlap preserves storage");
+    }
+
+    G1RootReachPlan error_output;
+    g1_test_poison_bytes(error_output, 0x39);
+    const G1TestByteSnapshot<G1RootReachPlan> error_output_before(
+        error_output);
+    check(!g1_plan_recorded_contact_root_reach(
+              error_output,
+              valid.positions, valid.rotations, valid.parents,
+              valid.contacts, valid.targets[0], valid.targets[1],
+              reinterpret_cast<char*>(&error_output) + 1, 4) &&
+              error_output_before.same(error_output),
+          "root reach error/output overlap rolls back exactly");
+
+    const G1TestByteSnapshot<vec3> error_input_before(
+        valid.positions(G1_Simulation));
+    G1RootReachPlan separate_output;
+    g1_test_poison_bytes(separate_output, 0x53);
+    const G1TestByteSnapshot<G1RootReachPlan> separate_output_before(
+        separate_output);
+    check(!g1_plan_recorded_contact_root_reach(
+              separate_output,
+              valid.positions, valid.rotations, valid.parents,
+              valid.contacts, valid.targets[0], valid.targets[1],
+              reinterpret_cast<char*>(&valid.positions(G1_Simulation)), 4) &&
+              separate_output_before.same(separate_output) &&
+              error_input_before.same(valid.positions(G1_Simulation)),
+          "root reach error/input overlap preserves both storages");
+
+    for (int input_index = 0; input_index < 6; ++input_index) {
+        G1RootReachTestFixture error_alias = valid;
+        char* overlapping_error = NULL;
+        switch (input_index) {
+        case 0:
+            overlapping_error = reinterpret_cast<char*>(
+                error_alias.positions.data);
+            break;
+        case 1:
+            overlapping_error = reinterpret_cast<char*>(
+                error_alias.rotations.data);
+            break;
+        case 2:
+            overlapping_error = reinterpret_cast<char*>(
+                error_alias.parents.data);
+            break;
+        case 3:
+            overlapping_error = reinterpret_cast<char*>(
+                error_alias.contacts.data);
+            break;
+        case 4:
+            overlapping_error = reinterpret_cast<char*>(
+                &error_alias.targets[0]);
+            break;
+        default:
+            overlapping_error = reinterpret_cast<char*>(
+                &error_alias.targets[1]);
+            break;
+        }
+        const unsigned char input_byte_before =
+            static_cast<unsigned char>(*overlapping_error);
+        G1RootReachPlan output;
+        g1_test_poison_bytes(output, 0x71);
+        const G1TestByteSnapshot<G1RootReachPlan> output_before(output);
+        check(!g1_plan_recorded_contact_root_reach(
+                  output,
+                  error_alias.positions,
+                  error_alias.rotations,
+                  error_alias.parents,
+                  error_alias.contacts,
+                  error_alias.targets[0],
+                  error_alias.targets[1],
+                  overlapping_error,
+                  1) &&
+                  output_before.same(output) &&
+                  static_cast<unsigned char>(*overlapping_error) ==
+                      input_byte_before,
+              "root reach rejects error overlap with every input owner");
+    }
+
+    const G1RootReachPlan valid_noop = {
+        true, true, false, 0.0f
+    };
+    float negative_zero = g1_test_float_from_bits(UINT32_C(0x80000000));
+    float no_op_output = 1.0f;
+    check(g1_apply_root_reach_plan_y(
+              no_op_output, negative_zero, valid_noop) &&
+              terrain_float_bits(no_op_output) == UINT32_C(0x80000000),
+          "no-op plan preserves a negative-zero root baseline bit-exactly");
+
+    const G1RootReachPlan valid_applied = {
+        true, true, true, 0.01f
+    };
+    float applied_output = 0.0f;
+    check(g1_apply_root_reach_plan_y(
+              applied_output, 0.25f, valid_applied) &&
+              terrain_float_bits(applied_output) ==
+                  terrain_float_bits(0.26f),
+          "applied root reach uses checked binary32 publication");
+
+    const G1RootReachPlan invalid_plans[] = {
+        {false, true, false, 0.0f},
+        {true, false, true, 0.01f},
+        {true, true, false, 0.01f},
+        {true, true, true, 0.0f},
+        {true, true, true,
+         std::nextafter(G1RootReachMaximumAdjustmentM,
+                        std::numeric_limits<float>::infinity())},
+        {true, true, true,
+         g1_test_float_from_bits(UINT32_C(0x00000001))},
+        {true, true, false,
+         g1_test_float_from_bits(UINT32_C(0x80000000))},
+    };
+    for (const G1RootReachPlan& invalid : invalid_plans) {
+        float output = 17.0f;
+        const uint32_t before = terrain_float_bits(output);
+        check(!g1_root_reach_plan_is_valid(invalid) &&
+                  !g1_apply_root_reach_plan_y(output, 0.25f, invalid) &&
+                  terrain_float_bits(output) == before,
+              "invalid root reach plan cannot publish a root value");
+    }
+    float overflow_output = 19.0f;
+    const uint32_t overflow_before = terrain_float_bits(overflow_output);
+    check(!g1_apply_root_reach_plan_y(
+              overflow_output,
+              std::numeric_limits<float>::max(),
+              valid_applied) &&
+              terrain_float_bits(overflow_output) == overflow_before,
+          "root reach application overflow preserves output");
+
+    alignas(G1RootReachPlan)
+        unsigned char alias_storage[sizeof(G1RootReachPlan)] = {};
+    std::memcpy(alias_storage, &valid_applied, sizeof(valid_applied));
+    unsigned char alias_before[sizeof(alias_storage)] = {};
+    std::memcpy(alias_before, alias_storage, sizeof(alias_storage));
+    const uintptr_t apply_alias_address =
+        reinterpret_cast<uintptr_t>(alias_storage);
+    G1RootReachPlan& alias_plan =
+        *reinterpret_cast<G1RootReachPlan*>(apply_alias_address);
+    float& alias_output =
+        *reinterpret_cast<float*>(apply_alias_address);
+    check(!g1_apply_root_reach_plan_y(
+              alias_output, 0.25f, alias_plan) &&
+              std::memcmp(
+                  alias_before, alias_storage, sizeof(alias_storage)) == 0,
+          "root reach apply rejects output/plan overlap");
+}
+
 static void test_generic_checked_ik_math()
 {
     const float maximum = 0.35f;
@@ -9488,6 +11245,54 @@ static int run_runtime_parity_mode()
         }
     }
 
+    G1RootReachTestFixture root_reach_fixture;
+    g1_test_make_lowcurb_root_reach_fixture(root_reach_fixture);
+    G1RootReachPlan root_reach_plan = {};
+    if (!g1_plan_recorded_contact_root_reach(
+            root_reach_plan,
+            root_reach_fixture.positions,
+            root_reach_fixture.rotations,
+            root_reach_fixture.parents,
+            root_reach_fixture.contacts,
+            root_reach_fixture.targets[0],
+            root_reach_fixture.targets[1],
+            physical_error,
+            static_cast<int>(sizeof(physical_error)))) {
+        return 1;
+    }
+    float applied_root_y = 0.0f;
+    if (!g1_apply_root_reach_plan_y(
+            applied_root_y,
+            root_reach_fixture.positions(G1_Simulation).y,
+            root_reach_plan)) {
+        return 1;
+    }
+    root_reach_fixture.contacts(0) = false;
+    root_reach_fixture.contacts(1) = false;
+    G1RootReachPlan inactive_root_reach_plan = {};
+    if (!g1_plan_recorded_contact_root_reach(
+            inactive_root_reach_plan,
+            root_reach_fixture.positions,
+            root_reach_fixture.rotations,
+            root_reach_fixture.parents,
+            root_reach_fixture.contacts,
+            root_reach_fixture.targets[0],
+            root_reach_fixture.targets[1],
+            physical_error,
+            static_cast<int>(sizeof(physical_error)))) {
+        return 1;
+    }
+    const G1RootReachPlan negative_zero_noop = {
+        true, true, false, 0.0f
+    };
+    float negative_zero_output = 0.0f;
+    if (!g1_apply_root_reach_plan_y(
+            negative_zero_output,
+            g1_test_float_from_bits(UINT32_C(0x80000000)),
+            negative_zero_noop)) {
+        return 1;
+    }
+
     G1RuntimeFixture fixture;
     g1_runtime_make_fixture(fixture);
     G1SwingHistory history = fixture.state.feet[0].swing;
@@ -9546,6 +11351,19 @@ static int run_runtime_parity_mode()
         }
     }
     std::printf(
+        "root-reach-plan active=%u common=%u applied=%u delta=%08x "
+        "root=%08x inactive=%u,%u,%u,%08x noop=%08x\n",
+        root_reach_plan.active ? 1U : 0U,
+        root_reach_plan.common_interval_found ? 1U : 0U,
+        root_reach_plan.applied ? 1U : 0U,
+        terrain_float_bits(root_reach_plan.root_y_delta_m),
+        terrain_float_bits(applied_root_y),
+        inactive_root_reach_plan.active ? 1U : 0U,
+        inactive_root_reach_plan.common_interval_found ? 1U : 0U,
+        inactive_root_reach_plan.applied ? 1U : 0U,
+        terrain_float_bits(inactive_root_reach_plan.root_y_delta_m),
+        terrain_float_bits(negative_zero_output));
+    std::printf(
         "runtime-parity status=%u ladder=%08x,%08x,%08x "
         "margins=%016llx,%016llx work=%u,%u,%u,%u,%u,%u\n",
         static_cast<unsigned int>(status),
@@ -9603,6 +11421,13 @@ int main(int argc, char** argv)
     test_planted_lock_drift_dt_and_rollback();
     test_shared_effective_reach_shell();
     test_shared_physical_sole_position_target();
+    test_root_reach_authentic_lowcurb();
+    test_root_reach_dual_certification_domain();
+    test_root_reach_interval_sets_and_boundaries();
+#if defined(G1_IK_ENABLE_TEST_SEAMS)
+    test_root_reach_planner_audit_trace();
+#endif
+    test_root_reach_validation_alias_and_apply_rollback();
     test_generic_checked_ik_math();
     test_named_solver_success_and_bend_mapping();
     test_named_solver_preflight_and_rollback();

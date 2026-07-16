@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Keep exact recorded-contact terrain targets reachable by applying the smallest certified, reversible world-Y translation to only the IK candidate root.
+**Goal:** Keep exact recorded-contact terrain targets reachable by applying the smallest dual-certified, reversible world-Y translation to only the IK candidate root: the nearest binary32 delta both admitted by the baseline analytic interval and authenticated against the adjusted production target.
 
 **Architecture:** Move the shared reach-shell and physical-sole target arithmetic into a strict-FP translation unit, then use it from both the existing production solver and a fixed-size two-foot interval planner. `g1_ik_frame_begin` computes the plan from the untouched support-retargeted pose, applies its binary32 delta only to scratch bone `G1_Simulation`, and carries the value-only plan through existing result, rollback, equality, digest, rejection, and accepted-diagnostic owners.
 
@@ -12,7 +12,7 @@
 
 - The runtime cadence remains exact 25 Hz (`dt` binary32 `0.04f`).
 - The correction cap is exactly `[-0.05 m, +0.05 m]`.
-- Choose the feasible binary32 root-Y delta nearest positive zero; move a rounded boundary toward the feasible interval interior and revalidate it through production projection.
+- Choose the dual-certified binary32 root-Y delta nearest positive zero: remain inside the baseline analytic proof domain, move a rounded boundary toward that interval's interior, and authenticate the adjusted production target through production projection. Do not probe outside the analytic domain merely because adjusted recomputation makes a nearer float reachable.
 - Change only reversible `scratch_positions(G1_Simulation).y`; do not mutate support state, simulation X/Z, command, trajectory, heading, matcher input, contact timing, target, lock, local rotation, terrain artifact, or motion data.
 - IK disabled, no recorded contact, and already-reachable contacts are exact no-ops; canonical zero is positive zero.
 - Empty/out-of-cap/minimum-shell intersections leave the root unchanged so the ordinary foot stage publishes the existing finite `target-unreachable` result.
@@ -409,11 +409,50 @@ bool g1_apply_root_reach_plan_y(
     float& output_root_y,
     float baseline_root_y,
     const G1RootReachPlan& plan);
+
+#if defined(G1_IK_ENABLE_TEST_SEAMS)
+enum G1RootReachAuditStatus : uint32_t {
+    G1RootReachAuditRejected = 1U,
+    G1RootReachAuditAccepted = 2U,
+};
+
+struct G1RootReachAuditCursor {
+    uint32_t interval_index;
+    uint32_t initial_delta_bits;
+};
+
+struct G1RootReachAuditAttempt {
+    uint32_t cursor_index;
+    uint32_t delta_bits;
+    G1RootReachAuditStatus status;
+};
+
+struct G1RootReachPlannerAudit {
+    G1RootReachAuditCursor cursors[4];
+    G1RootReachAuditAttempt attempts[32];
+    uint32_t cursor_count;
+    uint32_t attempt_count;
+};
+
+bool g1_plan_recorded_contact_root_reach_audited(
+    G1RootReachPlan& output,
+    G1RootReachPlannerAudit& audit,
+    const slice1d<vec3> baseline_positions,
+    const slice1d<quat> baseline_rotations,
+    const slice1d<int> parents,
+    const slice1d<bool> recorded_contacts,
+    const G1FootTarget& left_target,
+    const G1FootTarget& right_target,
+    char* error,
+    int error_capacity);
+#endif
 ```
 
 - [ ] **Step 1: Write the authentic two-contact RED regression**
 
-Materialize the exact live low-curb/Takara support-retargeted fixture used by the debugger probe. Assert planning is active, a common interval exists, `applied` is true, the delta is in `[-0.0161f, -0.0157f]`, and applying it changes only root Y. Run the named production physical-sole solver for both feet and require `reachable`, no correction limit, and final sole residual below `0.001 m` (the measured live residuals were about `0.000174 m` and `0.000134 m`).
+Materialize the exact live low-curb/Takara support-retargeted fixture used by the debugger probe. Assert planning is active, a common interval exists, `applied` is true, the delta is in `[-0.0161f, -0.0157f]`, and applying it changes only root Y. Run the named production physical-sole solver for both feet and require `reachable`, no correction limit, and the unchanged exact promoted `<= 0.005f` contact-convergence rule. The current strict kernel selects delta bits `0xbc80e8f0` and yields precise final physical-sole residuals of approximately `0.0020950164 m` left and `0.0001104668 m` right; test the tighter observed envelope `< 0.0022 m`. The older `0.000174 m` / `0.000134 m` debugger values came from a disposable binary predating Task 1 strict projection and remain historical feasibility evidence only.
+
+Also translate the candidate root and both exact world-space locks by level bits `0x38d1b717`. Assert the planner selects `0xbc80e8f5`. Recompute the baseline analytic endpoint and prove `0xbc80e8e7` through `0xbc80e8f4` are outside analytic admission, even though adjusted production-target projection accepts `0xbc80e8e7` through `0xbc80e8f5` and rejects `0xbc80e8e6`. This owns the contract that "nearest" means nearest dual-certified float and that the planner never probes outside its analytic proof domain; the intentionally excluded production-valid gap is only about 26 nm and does not justify changing the named solver.
 
 - [ ] **Step 2: Write interval-set and order RED tests**
 
@@ -427,9 +466,36 @@ Add deterministic fixtures for:
 - two disjoint maximum-shell intervals;
 - a minimum-shell hole that splits one foot into two intervals;
 - a minimum-shell conflict after two-foot intersection;
-- nearest feasible corrections just inside, exactly at, and one ULP outside both `-0.05f` and `+0.05f`;
+- nearest dual-certified corrections just inside, exactly at, and one ULP outside both `-0.05f` and `+0.05f`;
 - a rounded lower/upper endpoint which becomes valid only after `nextafter` toward the interval interior;
 - a candidate which analytic interval math admits but production `ik_project_target` rejects, proving revalidation refuses publication.
+
+Under `G1_IK_ENABLE_TEST_SEAMS`, call the audited wrapper and assert the
+production trace, rather than a manually reconstructed approximation:
+
+- the authentic frame materializes initial bits `0xbc80e8ed` and attempts
+  `ed`, `ee`, `ef`, `f0` on cursor zero with statuses rejected, rejected,
+  rejected, accepted;
+- the projection-refusal frame emits exactly 32 rejected attempts and never a
+  33rd;
+- a real minimum-shell two-cursor frame switches cursors according to the
+  global nearest-first ordering before acceptance; and
+- a symmetric high-level minimum-shell frame records two cursors and exactly
+  32 alternating rejected attempts before the canonical unavailable plan,
+  proving the ceiling is planner-wide rather than per interval;
+- invalid input/alias/arithmetic leaves poisoned plan and audit byte-exact.
+
+The one-cursor 32-rejection trace catches a 33/128 loop bound, the real
+reject-then-other-cursor acceptance trace catches sequential interval search,
+and the alternating two-cursor 32-rejection trace catches independent
+per-cursor budgets. Check trace capacity before each write so any hypothetical
+33rd global attempt returns false transactionally instead of being silently
+truncated.
+
+For every `-0.05f` and `+0.05f` inside/exact/outside case, assert all four
+plan fields and exact delta bits: inside and exact are active/common/applied
+with their expected selected bits, while outside is the canonical
+active/non-common/unapplied/positive-zero disposition.
 
 For every order pair, compare all four plan fields by bits. Poison output for invalid pose sizes, topology, target, contact slice, alias, nonfinite arithmetic, and error overlap; require false with unchanged output.
 
@@ -460,14 +526,30 @@ For each recorded foot:
 3. Derive the unchanged effective reach shell with Task 1's helper.
 4. Solve `minimum <= length(target - (hip + (0,delta,0))) <= maximum` as up to two closed Y intervals; intersect fixed arrays without allocation and sort by `(lower, upper)`.
 5. Intersect with the exact double cap corresponding to binary32 `[-0.05f,+0.05f]`.
-6. Examine intervals in increasing absolute distance from zero. Materialize positive zero when contained; otherwise round the nearest endpoint to binary32, move one ULP toward the interval interior when needed, then re-run `ik_project_target` for every recorded foot on the translated hip/knee/ankle points.
-7. Publish only a candidate for which every projection is reachable and its clamped target bits equal the exact requested ankle target bits.
+6. Treat the common baseline analytic intersection as a required proof domain. Create one cursor per common interval and examine only analytically admitted candidate floats through a single deterministic global frontier ordered by absolute distance from positive zero, then `(lower, upper, original index)`. Materialize positive zero when contained; otherwise round the nearest endpoint to binary32 and move one ULP toward the interval interior when needed. Test at most 32 adjacent boundary floats total across all cursors, advancing only the rejected cursor; this is one planner-wide budget, not 32 attempts per interval. Never probe outside the analytic intervals even if adjusted recomputation would authenticate a nearer float.
+7. For each candidate, copy the fixed 31 local positions, apply the candidate to local `G1_Simulation.y` with `g1_apply_root_reach_plan_y`, and rerun the same checked strict FK. For every recorded foot, rederive the physical ankle target from the adjusted contact origin/rotation and ankle origin plus the original desired sole center/normal, then call `ik_project_target` on the actual adjusted hip/knee/ankle points. Translating the untouched FK's global points or projecting the baseline-derived target is not numerically equivalent to the named production solver and must not authenticate publication.
+8. Publish only a candidate for which every projection is reachable and its clamped target bits equal the rederived exact production ankle-target bits.
+
+Keep one private implementation for both public wrappers. The ordinary
+wrapper supplies no audit. The test-only audited wrapper supplies a local
+fixed-size trace and assigns it only after planner success; it rejects audit
+overlap with the plan, every input owner, and the error buffer. Record each
+sorted materializable cursor's interval index and first candidate bits, then
+record every rejected/accepted global attempt after real adjusted-target
+revalidation. Invalid execution assigns neither output. Compile all audit
+code and its public declaration only under `G1_IK_ENABLE_TEST_SEAMS`.
 
 If contact planning is active but no candidate survives, return `true` with `{active=true, common_interval_found=false, applied=false, root_y_delta_m=+0}`. Reserve `false` for malformed input/arithmetic/alias failures. `g1_apply_root_reach_plan_y` uses checked double addition and binary32 commit, canonicalizes zero, and assigns output only after validation.
 
 - [ ] **Step 5: Run Task 1's full strict/fast/parity/sanitizer matrix**
 
 Expected: all Task 1 and Task 2 tests pass; strict and fast parity records remain byte-identical; sanitizers emit no report.
+
+Build the focused audited tests with both caller and strict root-reach object
+using `G1_IK_ENABLE_TEST_SEAMS`. Separately compile the ordinary test binary
+and root-reach object without that macro and run it successfully. Use `nm -C`
+on the no-seam root object and require no `audit` or test-seam symbol, then run
+the existing positive public/no-seam compile and neutral controller link.
 
 - [ ] **Step 6: Commit the planner**
 
