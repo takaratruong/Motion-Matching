@@ -11,6 +11,9 @@ ROOT = Path(__file__).resolve().parents[2]
 SERVER = Path(os.environ.get(
     "SONIC_MM_SERVER", ROOT / "sonic" / "build" / "mm_chunk_server"))
 SCHEMA = ROOT / "sonic" / "schemas" / "mm_chunk_v1.schema.json"
+MIN_BINARY32_SUBNORMAL = struct.unpack("<f", bytes.fromhex("01000000"))[0]
+MAX_BINARY32_SUBNORMAL = struct.unpack("<f", bytes.fromhex("ffff7f00"))[0]
+MAX_BINARY32 = struct.unpack("<f", bytes.fromhex("ffff7f7f"))[0]
 
 
 def hello(request_id="r0"):
@@ -243,6 +246,67 @@ class ChunkServerProtocolTest(unittest.TestCase):
         self.assertFalse(response["ok"])
         self.assertEqual(response["error"]["code"], "invalid_request")
 
+    def test_exact_binary32_boundaries_have_no_unstated_weight_range(self):
+        self.assertTrue(self.server.request(hello())["ok"])
+        for index, weight in enumerate((
+            MIN_BINARY32_SUBNORMAL,
+            -MIN_BINARY32_SUBNORMAL,
+            MAX_BINARY32_SUBNORMAL,
+            -MAX_BINARY32_SUBNORMAL,
+            -4.0,
+            16.0,
+            MAX_BINARY32,
+        )):
+            with self.subTest(weight=weight):
+                request = reset(f"weight-{index}")
+                request["terrain_weight"] = weight
+                response = self.server.request(request)
+                self.assertTrue(response["ok"], response)
+                self.assertEqual(
+                    struct.pack("<f", response["data"]["scene"]["terrain_weight"]),
+                    struct.pack("<f", weight),
+                )
+
+        request = generate("subnormal-vector")
+        request["requested_velocity_holden"] = [
+            MIN_BINARY32_SUBNORMAL,
+            -MAX_BINARY32_SUBNORMAL,
+            0.5,
+        ]
+        candidate = self.server.request(request)
+        self.assertTrue(candidate["ok"], candidate)
+        for applied in candidate["data"]["command"]["applied_velocity_holden"]:
+            self.assertEqual(
+                [struct.pack("<f", value) for value in applied],
+                [
+                    struct.pack("<f", MIN_BINARY32_SUBNORMAL),
+                    struct.pack("<f", -MAX_BINARY32_SUBNORMAL),
+                    struct.pack("<f", 0.5),
+                ],
+            )
+
+    def test_identifiers_have_no_byte_or_control_character_ceiling(self):
+        request_id = "request\x00\n🙂"
+        response = self.server.request(hello(request_id))
+        self.assertTrue(response["ok"], response)
+        self.assertEqual(response["request_id"], request_id)
+
+        long_identifier = "会" * 257
+        request = reset("long-identifiers", long_identifier)
+        request["scene_id"] = "scene\x01" + long_identifier
+        request["route_id"] = "route\t" + long_identifier
+        response = self.server.request(request)
+        self.assertTrue(response["ok"], response)
+        self.assertEqual(response["data"]["session_id"], long_identifier)
+        self.assertEqual(response["data"]["scene"]["scene_id"], request["scene_id"])
+        self.assertEqual(response["data"]["scene"]["route_id"], request["route_id"])
+
+    def test_request_line_has_no_unstated_one_mib_ceiling(self):
+        request_id = "r" * (1024 * 1024 + 32)
+        response = self.server.request(hello(request_id))
+        self.assertTrue(response["ok"], response)
+        self.assertEqual(response["request_id"], request_id)
+
     def test_schema_identity_matches_generated_candidate(self):
         schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
         self.assertEqual(schema["$id"], "mm-chunk/v1")
@@ -260,6 +324,129 @@ class ChunkServerProtocolTest(unittest.TestCase):
         self.assertEqual(return_code, 0)
         self.assertEqual(stdout_tail, b"")
         self.assertIn(b"test adapter", stderr)
+
+    def test_failed_reset_stages_preserve_prior_session_and_scene(self):
+        self.assertTrue(self.server.request(hello())["ok"])
+        self.assertTrue(self.server.request(reset())["ok"])
+        baseline = self.server.request(generate())["data"]
+        self.assertTrue(self.server.request(finish("abort", "r3", "c000000"))["ok"])
+
+        failures = (
+            ("fail-scene", "curb-forward"),
+            ("grail-curb-low", "fail-route"),
+            ("fail-reset", "curb-forward"),
+            ("fail-observe", "curb-forward"),
+        )
+        for index, (scene_id, route_id) in enumerate(failures):
+            with self.subTest(scene_id=scene_id, route_id=route_id):
+                request = reset(f"failed-reset-{index}", "replacement")
+                request["scene_id"] = scene_id
+                request["route_id"] = route_id
+                request["terrain_weight"] = 7.0
+                failed = self.server.request(request)
+                self.assertFalse(failed["ok"], failed)
+                self.assertEqual(failed["error"]["code"], "reset_failed")
+
+                regenerated = self.server.request(generate(
+                    f"regenerate-{index}", "c000000", None
+                ))
+                self.assertTrue(regenerated["ok"], regenerated)
+                self.assertEqual(regenerated["data"], baseline)
+                self.assertTrue(self.server.request(finish(
+                    "abort", f"abort-{index}", "c000000"
+                ))["ok"])
+
+    def test_serialization_failure_never_publishes_reset_or_candidate(self):
+        self.assertTrue(self.server.request(hello())["ok"])
+        self.assertTrue(self.server.request(reset())["ok"])
+        baseline = self.server.request(generate())["data"]
+        self.assertEqual(baseline["terrain_cost"][0], 4.0)
+        self.assertTrue(self.server.request(finish("abort", "r3", "c000000"))["ok"])
+
+        bad_reset = reset("nonfinite-reset", "replacement")
+        bad_reset["scene_id"] = "nonfinite-reset"
+        bad_reset["terrain_weight"] = 7.0
+        response = self.server.request(bad_reset)
+        self.assertFalse(response["ok"], response)
+        self.assertEqual(response["error"]["code"], "serialization_failed")
+
+        after_reset_failure = self.server.request(generate("after-bad-reset"))
+        self.assertTrue(after_reset_failure["ok"], after_reset_failure)
+        self.assertEqual(after_reset_failure["data"], baseline)
+        self.assertTrue(self.server.request(finish(
+            "abort", "after-bad-reset-abort", "c000000"
+        ))["ok"])
+
+        response = self.server.request(generate(
+            "nonfinite-generate", "nonfinite-generate"
+        ))
+        self.assertFalse(response["ok"], response)
+        self.assertEqual(response["error"]["code"], "serialization_failed")
+
+        after_generate_failure = self.server.request(generate("after-bad-generate"))
+        self.assertTrue(after_generate_failure["ok"], after_generate_failure)
+        self.assertEqual(after_generate_failure["data"], baseline)
+        self.assertTrue(self.server.request(finish(
+            "abort", "after-bad-generate-abort", "c000000"
+        ))["ok"])
+
+
+class ChunkServerSourceOwnershipTest(unittest.TestCase):
+    def test_real_reset_builds_candidate_features_before_controller_reset(self):
+        source = (ROOT / "sonic" / "cpp" / "mm_chunk_server.cpp").read_text(
+            encoding="utf-8"
+        )
+        adapter = source.index("class mm_real_adapter")
+        reset_start = source.index("    bool prepare_reset(\n", adapter)
+        reset_stop = source.index("\n    bool clone(\n", reset_start)
+        reset_body = source[reset_start:reset_stop]
+        self.assertLess(
+            reset_body.index("rebuild_matching_features("),
+            reset_body.index("g1_controller_state_reset("),
+            "requested-weight features must be validated before controller reset",
+        )
+
+    def test_artifact_helpers_have_one_odr_safe_shared_owner(self):
+        controller = (ROOT / "controller.cpp").read_text(encoding="utf-8")
+        server = (ROOT / "sonic" / "cpp" / "mm_chunk_server.cpp").read_text(
+            encoding="utf-8"
+        )
+        projector = (
+            ROOT / "sonic" / "cpp" / "g1_project_pose_cli.cpp"
+        ).read_text(encoding="utf-8")
+        database_header = (
+            ROOT / "sonic" / "cpp" / "g1_database_validation.h"
+        ).read_text(encoding="utf-8")
+        contract_header = (
+            ROOT / "sonic" / "cpp" / "g1_joint_contract_io.h"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('#include "sonic/cpp/g1_database_validation.h"', controller)
+        self.assertIn('#include "sonic/cpp/g1_database_validation.h"', server)
+        self.assertIn('#include "sonic/cpp/g1_joint_contract_io.h"', server)
+        self.assertIn('#include "sonic/cpp/g1_joint_contract_io.h"', projector)
+        self.assertIn("static inline bool g1_database_validate(", database_header)
+        self.assertIn(
+            "static inline bool g1_matching_features_validate(",
+            database_header,
+        )
+        self.assertIn(
+            "static inline bool sonic_joint_contract_load(",
+            contract_header,
+        )
+
+        combined = controller + server + projector
+        for duplicate in (
+            "static bool g1_database_validate(",
+            "static bool g1_matching_features_validate(",
+            "static bool mm_server_database_is_valid(",
+            "static bool mm_server_matching_features_are_valid(",
+            "static int mm_server_bone_index(",
+            "static bool mm_server_load_joint_contract(",
+            "static int cli_bone_index(",
+            "static bool cli_load_contract(",
+        ):
+            self.assertNotIn(duplicate, combined)
 
 
 @unittest.skipUnless(
@@ -294,6 +481,29 @@ class RealArtifactChunkServerTest(unittest.TestCase):
                 "abort_regenerate_equal=true"
             )
             self.assertTrue(server.request(finish("abort", "r5", "c000000"))["ok"])
+
+            failed_reset = reset("real-failed-rebuild", "replacement")
+            failed_reset["terrain_weight"] = -4.0
+            failed = server.request(failed_reset)
+            self.assertFalse(failed["ok"], failed)
+            self.assertEqual(failed["error"]["code"], "reset_failed")
+            after_failure = server.request(generate("real-after-failure"))["data"]
+            self.assertEqual(after_failure, first)
+            self.assertTrue(server.request(finish(
+                "abort", "real-after-failure-abort", "c000000"
+            ))["ok"])
+
+            route_failure = reset("real-failed-route", "replacement")
+            route_failure["route_id"] = "missing-route"
+            failed = server.request(route_failure)
+            self.assertFalse(failed["ok"], failed)
+            self.assertEqual(failed["error"]["code"], "reset_failed")
+            after_route_failure = server.request(generate("real-after-route"))["data"]
+            self.assertEqual(after_route_failure, first)
+            self.assertTrue(server.request(finish(
+                "abort", "real-after-route-abort", "c000000"
+            ))["ok"])
+
             self.assertTrue(server.request({"v": 1, "op": "close", "request_id": "r6"})["ok"])
             return_code, stdout_tail, stderr = server.wait(timeout=240)
             self.assertEqual(return_code, 0, stderr.decode("utf-8", "replace"))

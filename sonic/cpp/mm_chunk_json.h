@@ -85,11 +85,7 @@ static inline bool mm_chunk_json_has_no_duplicate_members(
 static inline bool mm_chunk_json_identifier_is_valid(
     const std::string& value)
 {
-    if (value.empty() || value.size() > 128) return false;
-    for (unsigned char character : value) {
-        if (character < 0x20u || character == 0x7fu) return false;
-    }
-    return true;
+    return !value.empty();
 }
 
 static inline bool mm_chunk_json_string_member(
@@ -164,19 +160,13 @@ static inline bool mm_chunk_json_binary32_value(
             std::string(label) + " must be a finite binary32 number");
     }
     const float encoded = static_cast<float>(value.number_value);
-    std::uint32_t bits = 0;
-    static_assert(sizeof(bits) == sizeof(encoded), "binary32 is required");
-    std::memcpy(&bits, &encoded, sizeof(bits));
-    const std::uint32_t exponent = bits & UINT32_C(0x7f800000);
-    const std::uint32_t fraction = bits & UINT32_C(0x007fffff);
     if (!std::isfinite(encoded) ||
-        (exponent == 0 && fraction != 0) ||
         static_cast<double>(encoded) != value.number_value) {
         return mm_chunk_fail(
             error,
             "invalid_request",
             std::string(label) +
-                " must be an exact normal-or-zero binary32 number");
+                " must be an exact finite binary32 number");
     }
     output = encoded == 0.0f ? 0.0f : encoded;
     return true;
@@ -319,13 +309,6 @@ static inline bool mm_chunk_json_parse_request(
                 "terrain_weight",
                 error)) {
             return false;
-        }
-        if (output.reset.terrain_weight < 0.0f ||
-            output.reset.terrain_weight > 10.0f) {
-            return mm_chunk_fail(
-                error,
-                "invalid_request",
-                "terrain_weight must be in [0,10]");
         }
         return true;
     case mm_chunk_op_generate: {

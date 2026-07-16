@@ -176,7 +176,33 @@ class mm_chunk_protocol
 {
 public:
     using state_type = typename Adapter::state_type;
+    using reset_context_type = typename Adapter::reset_context_type;
     using session_type = mm_chunk_session<state_type>;
+
+    struct reset_preparation
+    {
+        state_type state;
+        reset_context_type adapter_context;
+        mm_chunk_boundary boundary;
+        std::string session_id;
+        bool ready = false;
+
+        reset_preparation() = default;
+        reset_preparation(const reset_preparation&) = delete;
+        reset_preparation& operator=(const reset_preparation&) = delete;
+    };
+
+    struct generate_preparation
+    {
+        state_type state;
+        mm_chunk_candidate candidate;
+        std::string candidate_id;
+        bool ready = false;
+
+        generate_preparation() = default;
+        generate_preparation(const generate_preparation&) = delete;
+        generate_preparation& operator=(const generate_preparation&) = delete;
+    };
 
     explicit mm_chunk_protocol(Adapter& adapter) : adapter_(adapter) {}
 
@@ -200,12 +226,18 @@ public:
         return true;
     }
 
-    bool reset(
+    bool prepare_reset(
         const mm_chunk_reset_request& request,
-        mm_chunk_boundary& initial_boundary,
+        reset_preparation& preparation,
         mm_chunk_error& error)
     {
         mm_chunk_clear_error(error);
+        if (preparation.ready) {
+            return mm_chunk_fail(
+                error,
+                "invalid_preparation",
+                "reset preparation is already ready");
+        }
         if (!ready_for_operation(error)) return false;
         if (session_.candidate_ready) {
             return candidate_outstanding(error);
@@ -218,31 +250,68 @@ public:
                 "reset identifiers must be nonempty");
         }
 
-        state_type next;
-        mm_chunk_boundary next_boundary;
         std::string adapter_error;
-        if (!adapter_.reset(next, next_boundary, request, adapter_error)) {
+        if (!adapter_.prepare_reset(
+                preparation.state,
+                preparation.boundary,
+                preparation.adapter_context,
+                request,
+                adapter_error)) {
             return mm_chunk_fail(
                 error,
                 "reset_failed",
                 adapter_error.empty() ? "reset adapter failed" : adapter_error);
         }
 
-        adapter_.swap(session_.active, next);
-        clear_candidate_state();
-        session_.reset = true;
-        session_.session_id = request.session_id;
-        session_.active_candidate_id.clear();
-        initial_boundary = next_boundary;
+        preparation.session_id = request.session_id;
+        preparation.ready = true;
         return true;
     }
 
-    bool generate(
-        const mm_chunk_generate_request& request,
-        mm_chunk_candidate& output,
+    bool publish_reset(
+        reset_preparation& preparation,
         mm_chunk_error& error)
     {
         mm_chunk_clear_error(error);
+        if (!preparation.ready) {
+            return mm_chunk_fail(
+                error,
+                "invalid_preparation",
+                "reset preparation is not ready");
+        }
+        adapter_.publish_reset(preparation.adapter_context);
+        adapter_.swap(session_.active, preparation.state);
+        clear_candidate_state();
+        session_.reset = true;
+        session_.session_id.swap(preparation.session_id);
+        session_.active_candidate_id.clear();
+        preparation.ready = false;
+        return true;
+    }
+
+    bool reset(
+        const mm_chunk_reset_request& request,
+        mm_chunk_boundary& initial_boundary,
+        mm_chunk_error& error)
+    {
+        reset_preparation preparation;
+        if (!prepare_reset(request, preparation, error)) return false;
+        initial_boundary = preparation.boundary;
+        return publish_reset(preparation, error);
+    }
+
+    bool prepare_generate(
+        const mm_chunk_generate_request& request,
+        generate_preparation& preparation,
+        mm_chunk_error& error)
+    {
+        mm_chunk_clear_error(error);
+        if (preparation.ready) {
+            return mm_chunk_fail(
+                error,
+                "invalid_preparation",
+                "generate preparation is already ready");
+        }
         if (!ready_for_operation(error)) return false;
         if (!session_.reset) {
             return mm_chunk_fail(
@@ -284,9 +353,9 @@ public:
                 "candidate ID must differ from its predecessor");
         }
 
-        state_type next;
         std::string adapter_error;
-        if (!adapter_.clone(next, session_.active, adapter_error)) {
+        if (!adapter_.clone(
+                preparation.state, session_.active, adapter_error)) {
             return mm_chunk_fail(
                 error,
                 "generation_failed",
@@ -299,7 +368,8 @@ public:
         generated.steps.reserve(
             static_cast<std::size_t>(MM_CHUNK_SOURCE_INTERVALS));
         mm_chunk_boundary boundary;
-        if (!adapter_.observe(boundary, next, adapter_error)) {
+        if (!adapter_.observe(
+                boundary, preparation.state, adapter_error)) {
             return mm_chunk_fail(
                 error,
                 "generation_failed",
@@ -311,7 +381,11 @@ public:
         for (int step = 0; step < MM_CHUNK_SOURCE_INTERVALS; ++step) {
             mm_chunk_step_diagnostic diagnostic;
             if (!adapter_.advance(
-                    diagnostic, next, request, step, adapter_error)) {
+                    diagnostic,
+                    preparation.state,
+                    request,
+                    step,
+                    adapter_error)) {
                 return mm_chunk_fail(
                     error,
                     "generation_failed",
@@ -319,7 +393,8 @@ public:
                         ? "matcher advance failed"
                         : adapter_error);
             }
-            if (!adapter_.observe(boundary, next, adapter_error)) {
+            if (!adapter_.observe(
+                    boundary, preparation.state, adapter_error)) {
                 return mm_chunk_fail(
                     error,
                     "generation_failed",
@@ -331,11 +406,39 @@ public:
             generated.boundaries.push_back(boundary);
         }
 
-        adapter_.swap(session_.candidate, next);
-        session_.candidate_ready = true;
-        session_.candidate_id = request.candidate_id;
-        output = std::move(generated);
+        preparation.candidate = std::move(generated);
+        preparation.candidate_id = request.candidate_id;
+        preparation.ready = true;
         return true;
+    }
+
+    bool publish_generate(
+        generate_preparation& preparation,
+        mm_chunk_error& error)
+    {
+        mm_chunk_clear_error(error);
+        if (!preparation.ready) {
+            return mm_chunk_fail(
+                error,
+                "invalid_preparation",
+                "generate preparation is not ready");
+        }
+        adapter_.swap(session_.candidate, preparation.state);
+        session_.candidate_ready = true;
+        session_.candidate_id.swap(preparation.candidate_id);
+        preparation.ready = false;
+        return true;
+    }
+
+    bool generate(
+        const mm_chunk_generate_request& request,
+        mm_chunk_candidate& output,
+        mm_chunk_error& error)
+    {
+        generate_preparation preparation;
+        if (!prepare_generate(request, preparation, error)) return false;
+        output = preparation.candidate;
+        return publish_generate(preparation, error);
     }
 
     bool commit(

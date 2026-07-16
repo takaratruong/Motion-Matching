@@ -13,6 +13,7 @@ mm_chunk_server: $(BUILD_DIR)/mm_chunk_server
 
 $(BUILD_DIR)/mm_chunk_server: mm_chunk_server.cpp mm_chunk_protocol.h \
 		mm_chunk_json.h g1_runtime.h g1_joint_projection.h \
+		g1_database_validation.h g1_joint_contract_io.h \
 		../configs/g1_joint_contract.json
 	mkdir -p $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) \

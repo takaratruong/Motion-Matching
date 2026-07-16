@@ -3,6 +3,8 @@
 #pragma GCC diagnostic ignored "-Wunused-result"
 #endif
 #include "sonic/cpp/mm_chunk_json.h"
+#include "sonic/cpp/g1_database_validation.h"
+#include "sonic/cpp/g1_joint_contract_io.h"
 #include "sonic/cpp/g1_joint_projection.h"
 #include "sonic/cpp/g1_runtime.h"
 #if defined(__GNUC__) || defined(__clang__)
@@ -14,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -94,437 +97,6 @@ static void mm_server_fill_fixed_joint_names(mm_server_identity& identity)
         mm_server_target_joint_names + MM_CHUNK_JOINT_COUNT);
 }
 
-template<typename T>
-static bool mm_server_animation_shape_is_valid(
-    const array2d<T>& values,
-    int frames,
-    int bones,
-    const char* label,
-    char* error,
-    int capacity)
-{
-    if (values.rows != frames || values.cols != bones ||
-        values.data == nullptr) {
-        return scene_error(
-            error,
-            capacity,
-            "G1 database %s shape mismatch: expected %dx%d, got %dx%d",
-            label,
-            frames,
-            bones,
-            values.rows,
-            values.cols);
-    }
-    return true;
-}
-
-static bool mm_server_database_is_valid(
-    const database& db,
-    char* error,
-    int capacity)
-{
-    const int frames = db.nframes();
-    const int bones = db.nbones();
-    if (frames <= 0) {
-        return scene_error(error, capacity, "G1 database has no frames");
-    }
-    if (!mm_server_animation_shape_is_valid(
-            db.bone_positions,
-            frames,
-            bones,
-            "bone_positions",
-            error,
-            capacity) ||
-        !mm_server_animation_shape_is_valid(
-            db.bone_velocities,
-            frames,
-            bones,
-            "bone_velocities",
-            error,
-            capacity) ||
-        !mm_server_animation_shape_is_valid(
-            db.bone_rotations,
-            frames,
-            bones,
-            "bone_rotations",
-            error,
-            capacity) ||
-        !mm_server_animation_shape_is_valid(
-            db.bone_angular_velocities,
-            frames,
-            bones,
-            "bone_angular_velocities",
-            error,
-            capacity)) {
-        return false;
-    }
-    if (db.contact_states.rows != frames || db.contact_states.cols != 2 ||
-        db.contact_states.data == nullptr) {
-        return scene_error(
-            error,
-            capacity,
-            "G1 database contact shape mismatch: expected %dx2, got %dx%d",
-            frames,
-            db.contact_states.rows,
-            db.contact_states.cols);
-    }
-    if (db.range_starts.size <= 0 ||
-        db.range_stops.size != db.range_starts.size ||
-        db.range_starts.data == nullptr || db.range_stops.data == nullptr) {
-        return scene_error(
-            error,
-            capacity,
-            "G1 database range arrays must be nonempty and equal-sized");
-    }
-    int expected_start = 0;
-    for (int range = 0; range < db.nranges(); ++range) {
-        const int start = db.range_starts(range);
-        const int stop = db.range_stops(range);
-        if (start != expected_start || stop <= start || stop > frames) {
-            return scene_error(
-                error,
-                capacity,
-                "G1 database range %d is not contiguous/in-bounds: "
-                "expected start %d, got [%d,%d) for %d frames",
-                range,
-                expected_start,
-                start,
-                stop,
-                frames);
-        }
-        expected_start = stop;
-    }
-    if (expected_start != frames) {
-        return scene_error(
-            error,
-            capacity,
-            "G1 database ranges stop at %d instead of covering %d frames",
-            expected_start,
-            frames);
-    }
-    return true;
-}
-
-static bool mm_server_feature_value_is_safe(float value)
-{
-    const std::uint32_t magnitude =
-        feature_float_bits(value) & UINT32_C(0x7fffffff);
-    return feature_float_is_finite(value) &&
-           magnitude != UINT32_C(0x7f7fffff);
-}
-
-static bool mm_server_matching_features_are_valid(
-    const database& db,
-    char* error,
-    int capacity)
-{
-    static constexpr int expected_features = 31;
-    if (db.features.rows != db.nframes() ||
-        db.features.cols != expected_features || db.features.data == nullptr ||
-        db.features_offset.size != expected_features ||
-        db.features_scale.size != expected_features ||
-        db.features_offset.data == nullptr ||
-        db.features_scale.data == nullptr) {
-        return scene_error(
-            error,
-            capacity,
-            "G1 matching feature build failed: expected %dx%d features, "
-            "got %dx%d",
-            db.nframes(),
-            expected_features,
-            db.features.rows,
-            db.features.cols);
-    }
-    for (int feature = 0; feature < expected_features; ++feature) {
-        if (!mm_server_feature_value_is_safe(db.features_offset(feature)) ||
-            !feature_float_is_positive_finite(db.features_scale(feature))) {
-            return scene_error(
-                error,
-                capacity,
-                "G1 matching feature %d has invalid offset/scale",
-                feature);
-        }
-    }
-    for (int index = 0; index < db.features.rows * db.features.cols;
-         ++index) {
-        if (!mm_server_feature_value_is_safe(db.features.data[index])) {
-            return scene_error(
-                error,
-                capacity,
-                "G1 matching feature row payload is invalid at value %d",
-                index);
-        }
-    }
-
-    const int small_rows =
-        (db.nframes() + BOUND_SM_SIZE - 1) / BOUND_SM_SIZE;
-    const int large_rows =
-        (db.nframes() + BOUND_LR_SIZE - 1) / BOUND_LR_SIZE;
-    const array2d<float>* bounds[4] = {
-        &db.bound_sm_min,
-        &db.bound_sm_max,
-        &db.bound_lr_min,
-        &db.bound_lr_max,
-    };
-    const int expected_rows[4] = {
-        small_rows, small_rows, large_rows, large_rows};
-    for (int bound = 0; bound < 4; ++bound) {
-        if (bounds[bound]->rows != expected_rows[bound] ||
-            bounds[bound]->cols != expected_features ||
-            bounds[bound]->data == nullptr) {
-            return scene_error(
-                error,
-                capacity,
-                "G1 matching bound %d shape mismatch: expected %dx%d, "
-                "got %dx%d",
-                bound,
-                expected_rows[bound],
-                expected_features,
-                bounds[bound]->rows,
-                bounds[bound]->cols);
-        }
-        for (int index = 0;
-             index < bounds[bound]->rows * bounds[bound]->cols;
-             ++index) {
-            if (!mm_server_feature_value_is_safe(
-                    bounds[bound]->data[index])) {
-                return scene_error(
-                    error,
-                    capacity,
-                    "G1 matching bound %d has invalid value at %d",
-                    bound,
-                    index);
-            }
-        }
-    }
-    for (int index = 0; index < small_rows * expected_features; ++index) {
-        if (db.bound_sm_min.data[index] > db.bound_sm_max.data[index]) {
-            return scene_error(
-                error, capacity, "G1 small matching bounds are inverted");
-        }
-    }
-    for (int index = 0; index < large_rows * expected_features; ++index) {
-        if (db.bound_lr_min.data[index] > db.bound_lr_max.data[index]) {
-            return scene_error(
-                error, capacity, "G1 large matching bounds are inverted");
-        }
-    }
-    return true;
-}
-
-static int mm_server_bone_index(const std::string& name)
-{
-    static const char* const names[G1_BoneCount] = {
-        "Simulation", "Hips", "LeftHipPitch", "LeftHipRoll",
-        "LeftHipYaw", "LeftKnee", "LeftAnkle", "LeftToe",
-        "RightHipPitch", "RightHipRoll", "RightHipYaw", "RightKnee",
-        "RightAnkle", "RightToe", "Spine", "Spine1", "Spine2",
-        "LeftShoulderPitch", "LeftShoulderRoll", "LeftShoulderYaw",
-        "LeftElbow", "LeftWristRoll", "LeftWristPitch", "LeftWrist",
-        "RightShoulderPitch", "RightShoulderRoll", "RightShoulderYaw",
-        "RightElbow", "RightWristRoll", "RightWristPitch", "RightWrist",
-    };
-    for (int index = 0; index < G1_BoneCount; ++index) {
-        if (name == names[index]) return index;
-    }
-    return -1;
-}
-
-static bool mm_server_contract_float(
-    float& output,
-    const json_value& object,
-    const char* key,
-    char* error,
-    int capacity)
-{
-    const json_value* value = json_member(object, key);
-    return value != nullptr &&
-           scene_number_float(output, *value, key, error, capacity);
-}
-
-template<std::size_t Size>
-static bool mm_server_contract_float_array(
-    float (&output)[Size],
-    const json_value& object,
-    const char* key,
-    char* error,
-    int capacity)
-{
-    const json_value* value = json_member(object, key);
-    if (value == nullptr || value->kind != json_array ||
-        value->array_value.size() != Size) {
-        return scene_error(
-            error, capacity, "joint contract field %s has invalid shape", key);
-    }
-    for (std::size_t index = 0; index < Size; ++index) {
-        if (!scene_number_float(
-                output[index], value->array_value[index], key, error, capacity)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool mm_server_load_joint_contract(
-    sonic_joint_contract_entry (&contract)[SonicG1JointCount],
-    mm_server_identity& identity,
-    const char* path,
-    char* error,
-    int capacity)
-{
-    json_value document;
-    if (!json_document_load(document, path, error, capacity) ||
-        !scene_exact_keys(
-            document,
-            {"rows", "source_mjcf_sha256", "target_order_source_sha256"},
-            "joint contract",
-            error,
-            capacity)) {
-        return false;
-    }
-    const json_value* source_hash = json_member(document, "source_mjcf_sha256");
-    const json_value* target_hash =
-        json_member(document, "target_order_source_sha256");
-    const json_value* rows = json_member(document, "rows");
-    if (source_hash == nullptr || target_hash == nullptr ||
-        source_hash->kind != json_string || target_hash->kind != json_string ||
-        !scene_sha_is_valid(source_hash->string_value) ||
-        !scene_sha_is_valid(target_hash->string_value) || rows == nullptr ||
-        rows->kind != json_array ||
-        rows->array_value.size() != SonicG1JointCount) {
-        return scene_error(
-            error, capacity, "joint contract identity or row count is invalid");
-    }
-
-    std::vector<std::string> source_names(
-        static_cast<std::size_t>(SonicG1JointCount));
-    std::vector<std::string> target_names(
-        static_cast<std::size_t>(SonicG1JointCount));
-    for (int row = 0; row < SonicG1JointCount; ++row) {
-        const json_value& encoded =
-            rows->array_value[static_cast<std::size_t>(row)];
-        if (!scene_exact_keys(
-                encoded,
-                {"axis_holden", "lower", "qpos_address", "sign",
-                 "source_bone", "source_index", "source_joint",
-                 "source_parent", "static_local_holden_wxyz",
-                 "target_index", "target_name", "upper", "zero_offset"},
-                "joint contract row",
-                error,
-                capacity)) {
-            return false;
-        }
-        sonic_joint_contract_entry entry;
-        std::string source_bone;
-        std::string source_parent;
-        int qpos_address = -1;
-        float axis[3] = {};
-        float rotation[4] = {};
-        if (!scene_member_int(
-                entry.source_index,
-                encoded,
-                "source_index",
-                "joint contract row",
-                error,
-                capacity) ||
-            !scene_member_int(
-                entry.target_index,
-                encoded,
-                "target_index",
-                "joint contract row",
-                error,
-                capacity) ||
-            !scene_member_int(
-                qpos_address,
-                encoded,
-                "qpos_address",
-                "joint contract row",
-                error,
-                capacity) ||
-            qpos_address < 0 ||
-            !scene_member_string(
-                source_bone,
-                encoded,
-                "source_bone",
-                "joint contract row",
-                error,
-                capacity) ||
-            !scene_member_string(
-                source_parent,
-                encoded,
-                "source_parent",
-                "joint contract row",
-                error,
-                capacity) ||
-            !scene_member_string(
-                entry.source_joint,
-                encoded,
-                "source_joint",
-                "joint contract row",
-                error,
-                capacity) ||
-            !scene_member_string(
-                entry.target_joint,
-                encoded,
-                "target_name",
-                "joint contract row",
-                error,
-                capacity) ||
-            !mm_server_contract_float_array(
-                axis, encoded, "axis_holden", error, capacity) ||
-            !mm_server_contract_float_array(
-                rotation,
-                encoded,
-                "static_local_holden_wxyz",
-                error,
-                capacity) ||
-            !mm_server_contract_float(
-                entry.sign, encoded, "sign", error, capacity) ||
-            !mm_server_contract_float(
-                entry.zero_offset, encoded, "zero_offset", error, capacity) ||
-            !mm_server_contract_float(
-                entry.lower, encoded, "lower", error, capacity) ||
-            !mm_server_contract_float(
-                entry.upper, encoded, "upper", error, capacity)) {
-            return false;
-        }
-        entry.source_bone = mm_server_bone_index(source_bone);
-        entry.source_parent = mm_server_bone_index(source_parent);
-        entry.axis_holden = vec3(axis[0], axis[1], axis[2]);
-        entry.static_local_holden =
-            quat(rotation[0], rotation[1], rotation[2], rotation[3]);
-        if (entry.source_index < 0 || entry.source_index >= SonicG1JointCount ||
-            entry.target_index < 0 || entry.target_index >= SonicG1JointCount ||
-            entry.source_bone < 0 || entry.source_parent < 0 ||
-            !source_names[static_cast<std::size_t>(entry.source_index)].empty() ||
-            !target_names[static_cast<std::size_t>(entry.target_index)].empty()) {
-            return scene_error(
-                error, capacity, "joint contract row %d identity is invalid", row);
-        }
-        source_names[static_cast<std::size_t>(entry.source_index)] =
-            entry.source_joint;
-        target_names[static_cast<std::size_t>(entry.target_index)] =
-            entry.target_joint;
-        contract[row] = entry;
-    }
-    if (!sonic_projection_contract_valid(contract, error, capacity)) {
-        return false;
-    }
-    mm_server_identity fixed;
-    mm_server_fill_fixed_joint_names(fixed);
-    if (source_names != fixed.source_joint_names ||
-        target_names != fixed.target_joint_names) {
-        return scene_error(
-            error, capacity, "joint contract source/target order is not fixed");
-    }
-    identity.source_joint_names = source_names;
-    identity.target_joint_names = target_names;
-    if (!sha256_file_hex(identity.joint_contract_sha256, path, error, capacity)) {
-        return false;
-    }
-    return true;
-}
-
 struct mm_matching_feature_storage
 {
     array2d<float> features;
@@ -560,10 +132,18 @@ struct mm_matching_feature_storage
     }
 };
 
+struct mm_real_reset_context
+{
+    scene_pack scene;
+    mm_matching_feature_storage features;
+    mm_server_scene_identity identity;
+};
+
 class mm_real_adapter
 {
 public:
     using state_type = g1_controller_state;
+    using reset_context_type = mm_real_reset_context;
 
     bool initialize(
         const char* terrain_root,
@@ -580,6 +160,7 @@ public:
             return false;
         }
         std::string manifest_path;
+        sonic_joint_contract_metadata contract_metadata;
         if (!scene_join(
                 manifest_path,
                 terrain_root_.c_str(),
@@ -596,15 +177,31 @@ public:
                 manifest_path.c_str(),
                 error,
                 static_cast<int>(sizeof(error))) ||
-            !mm_server_load_joint_contract(
+            !sonic_joint_contract_load(
                 contract_,
-                identity_,
+                &contract_metadata,
+                contract_path,
+                error,
+                static_cast<int>(sizeof(error))) ||
+            !sha256_file_hex(
+                identity_.joint_contract_sha256,
                 contract_path,
                 error,
                 static_cast<int>(sizeof(error)))) {
             message = error;
             return false;
         }
+        mm_server_identity fixed_names;
+        mm_server_fill_fixed_joint_names(fixed_names);
+        if (contract_metadata.source_joint_names !=
+                fixed_names.source_joint_names ||
+            contract_metadata.target_joint_names !=
+                fixed_names.target_joint_names) {
+            message = "joint contract source/target order is not fixed";
+            return false;
+        }
+        identity_.source_joint_names = contract_metadata.source_joint_names;
+        identity_.target_joint_names = contract_metadata.target_joint_names;
         identity_.database_sha256 = manifest_.database.sha256;
         identity_.terrain_features_sha256 =
             manifest_.terrain_features.sha256;
@@ -644,7 +241,7 @@ public:
         }
 
         database_load(database_, database_path.c_str());
-        if (!mm_server_database_is_valid(
+        if (!g1_database_validate(
                 database_, error, static_cast<int>(sizeof(error))) ||
             terrain_rows.values.rows != database_.nframes() ||
             terrain_rows.values.cols != 4) {
@@ -681,9 +278,16 @@ public:
         return scene_identity_;
     }
 
-    bool reset(
+    const mm_server_scene_identity& prepared_scene_identity(
+        const reset_context_type& context) const
+    {
+        return context.identity;
+    }
+
+    bool prepare_reset(
         state_type& output,
         mm_chunk_boundary& boundary,
+        reset_context_type& context,
         const mm_chunk_reset_request& request,
         std::string& message)
     {
@@ -694,9 +298,8 @@ public:
             message = "unknown scene: " + request.scene_id;
             return false;
         }
-        scene_pack next_scene;
         if (!scene_pack_load(
-                next_scene,
+                context.scene,
                 terrain_root_.c_str(),
                 manifest_,
                 catalog_,
@@ -707,10 +310,20 @@ public:
             return false;
         }
         const scene_route* route =
-            scene_route_find(next_scene.metadata, request.route_id.c_str());
+            scene_route_find(context.scene.metadata, request.route_id.c_str());
         if (route == nullptr) {
             message = "scene " + request.scene_id + " has no route " +
                       request.route_id;
+            return false;
+        }
+
+        mm_matching_feature_storage prior_features;
+        if (!rebuild_matching_features(
+                request.terrain_weight,
+                prior_features,
+                error,
+                sizeof(error))) {
+            message = error;
             return false;
         }
 
@@ -719,14 +332,16 @@ public:
                 next_state,
                 database_,
                 support_,
-                next_scene,
+                context.scene,
                 error,
                 static_cast<int>(sizeof(error)))) {
+            context.features.swap_with(database_);
+            prior_features.swap_with(database_);
             message = error;
             return false;
         }
         next_state.route_index = static_cast<int>(
-            route - next_scene.metadata.routes.data());
+            route - context.scene.metadata.routes.data());
         next_state.route_waypoint = 1;
         next_state.route_frames = 0;
         next_state.adjusted_bone_rotations = next_state.bone_rotations;
@@ -740,26 +355,35 @@ public:
             next_state.adjusted_bone_positions,
             next_state.adjusted_bone_rotations,
             database_.bone_parents);
-        if (!observe_boundary(boundary, next_state, error, sizeof(error)) ||
-            !rebuild_matching_features(
-                request.terrain_weight, error, sizeof(error))) {
+        if (!observe_boundary(boundary, next_state, error, sizeof(error))) {
+            context.features.swap_with(database_);
+            prior_features.swap_with(database_);
             message = error;
             return false;
         }
 
-        scene_pack_swap(active_scene_, next_scene);
+        context.features.swap_with(database_);
+        prior_features.swap_with(database_);
         g1_controller_state_swap(output, next_state);
-        scene_identity_.scene_id = request.scene_id;
-        scene_identity_.route_id = request.route_id;
-        scene_identity_.terrain_weight = request.terrain_weight;
-        scene_identity_.coordinate_signature =
-            active_scene_.metadata.coordinate_signature;
-        scene_identity_.heightfield_sha256 =
-            active_scene_.metadata.heightfield.sha256;
-        scene_identity_.mesh_sha256 = active_scene_.metadata.mesh.sha256;
-        scene_identity_.walkability_sha256 =
-            active_scene_.metadata.walkability.sha256;
+        context.identity.scene_id = request.scene_id;
+        context.identity.route_id = request.route_id;
+        context.identity.terrain_weight = request.terrain_weight;
+        context.identity.coordinate_signature =
+            context.scene.metadata.coordinate_signature;
+        context.identity.heightfield_sha256 =
+            context.scene.metadata.heightfield.sha256;
+        context.identity.mesh_sha256 = context.scene.metadata.mesh.sha256;
+        context.identity.walkability_sha256 =
+            context.scene.metadata.walkability.sha256;
         return true;
+    }
+
+    void publish_reset(reset_context_type& context)
+    {
+        context.features.swap_with(database_);
+        scene_pack_swap(active_scene_, context.scene);
+        using std::swap;
+        swap(scene_identity_, context.identity);
     }
 
     bool clone(
@@ -861,10 +485,10 @@ public:
 private:
     bool rebuild_matching_features(
         float terrain_weight,
+        mm_matching_feature_storage& prior,
         char* error,
         int capacity)
     {
-        mm_matching_feature_storage prior;
         prior.swap_with(database_);
         database_build_matching_features(
             database_,
@@ -877,7 +501,7 @@ private:
             G1_RightAnkle,
             G1_Hips,
             terrain_weight);
-        if (!mm_server_matching_features_are_valid(
+        if (!g1_matching_features_validate(
                 database_, error, capacity) ||
             !motion_manifest_validate_database(
                 manifest_, database_, error, capacity)) {
@@ -887,6 +511,16 @@ private:
             return false;
         }
         return true;
+    }
+
+    bool rebuild_matching_features(
+        float terrain_weight,
+        char* error,
+        int capacity)
+    {
+        mm_matching_feature_storage prior;
+        return rebuild_matching_features(
+            terrain_weight, prior, error, capacity);
     }
 
     bool observe_boundary(
@@ -958,10 +592,17 @@ struct mm_fake_state
     std::vector<int> history;
 };
 
+struct mm_fake_reset_context
+{
+    mm_server_scene_identity identity;
+    float matching_feature_weight = 0.0f;
+};
+
 class mm_fake_adapter
 {
 public:
     using state_type = mm_fake_state;
+    using reset_context_type = mm_fake_reset_context;
 
     mm_fake_adapter()
     {
@@ -983,26 +624,61 @@ public:
         return scene_identity_;
     }
 
-    bool reset(
+    const mm_server_scene_identity& prepared_scene_identity(
+        const reset_context_type& context) const
+    {
+        return context.identity;
+    }
+
+    bool prepare_reset(
         state_type& state,
         mm_chunk_boundary& boundary,
+        reset_context_type& context,
         const mm_chunk_reset_request& request,
         std::string& message)
     {
         if (request.scene_id == "fail-scene") {
-            message = "injected fake reset failure";
+            message = "injected fake scene failure";
+            return false;
+        }
+        if (request.route_id == "fail-route") {
+            message = "injected fake route failure";
             return false;
         }
         state.frame = 0;
         state.history.assign(1, 0);
-        scene_identity_.scene_id = request.scene_id;
-        scene_identity_.route_id = request.route_id;
-        scene_identity_.terrain_weight = request.terrain_weight;
-        scene_identity_.coordinate_signature = G1_RuntimeCoordinateSignature;
-        scene_identity_.heightfield_sha256 = std::string(64, '8');
-        scene_identity_.mesh_sha256 = std::string(64, '9');
-        scene_identity_.walkability_sha256 = std::string(64, 'a');
-        return observe(boundary, state, message);
+        if (request.scene_id == "fail-reset") {
+            message = "injected fake controller reset failure";
+            return false;
+        }
+
+        context.identity.scene_id = request.scene_id;
+        context.identity.route_id = request.route_id;
+        context.identity.terrain_weight = request.terrain_weight;
+        context.identity.coordinate_signature = G1_RuntimeCoordinateSignature;
+        context.identity.heightfield_sha256 = std::string(64, '8');
+        context.identity.mesh_sha256 = std::string(64, '9');
+        context.identity.walkability_sha256 = std::string(64, 'a');
+        context.matching_feature_weight = request.terrain_weight;
+        mm_chunk_boundary next_boundary;
+        if (!observe(next_boundary, state, message)) return false;
+        if (request.scene_id == "fail-observe") {
+            message = "injected fake observation failure";
+            return false;
+        }
+        if (request.scene_id == "nonfinite-reset") {
+            next_boundary.physical_pelvis_position_holden[0] =
+                std::numeric_limits<float>::infinity();
+        }
+        boundary = next_boundary;
+        return true;
+    }
+
+    void publish_reset(reset_context_type& context)
+    {
+        using std::swap;
+        swap(scene_identity_, context.identity);
+        swap(active_matching_feature_weight_, context.matching_feature_weight);
     }
 
     bool clone(
@@ -1061,7 +737,12 @@ public:
         diagnostic.selected_database_frame = 1000 + state.frame;
         diagnostic.searched = (step % 3) == 0;
         diagnostic.transitioned = step == 6;
-        diagnostic.terrain_cost = static_cast<float>(step) * 0.25f;
+        diagnostic.terrain_cost = active_matching_feature_weight_ +
+                                  static_cast<float>(step) * 0.25f;
+        if (request.candidate_id == "nonfinite-generate" && step == 6) {
+            diagnostic.terrain_cost =
+                std::numeric_limits<float>::infinity();
+        }
         diagnostic.applied_velocity_holden[0] =
             request.requested_velocity_holden[0];
         diagnostic.applied_velocity_holden[1] =
@@ -1087,6 +768,7 @@ public:
 private:
     mm_server_identity identity_;
     mm_server_scene_identity scene_identity_;
+    float active_matching_feature_weight_ = 0.0f;
 };
 
 static void mm_json_write_string_array(
@@ -1497,21 +1179,12 @@ static bool mm_server_emit(const std::string& response)
 template<typename Adapter>
 static int mm_server_run(Adapter& adapter)
 {
-    mm_chunk_protocol<Adapter> protocol(adapter);
+    using protocol_type = mm_chunk_protocol<Adapter>;
+    protocol_type protocol(adapter);
     std::string line;
     while (std::getline(std::cin, line)) {
         mm_chunk_request request;
         mm_chunk_error error;
-        if (line.size() > 1024u * 1024u) {
-            request.operation_text = "<invalid>";
-            mm_chunk_fail(
-                error, "invalid_request", "request exceeds 1 MiB");
-            if (!mm_server_emit(mm_json_error_response(
-                    request.operation_text, request.request_id, error))) {
-                return 2;
-            }
-            continue;
-        }
         if (!mm_chunk_json_parse_request(request, line, error)) {
             if (!mm_server_emit(mm_json_error_response(
                     request.operation_text, request.request_id, error))) {
@@ -1527,24 +1200,45 @@ static int mm_server_run(Adapter& adapter)
             success = protocol.hello(error);
             if (success) data = mm_json_hello_data(adapter.identity());
         } else if (request.operation == mm_chunk_op_reset) {
-            mm_chunk_boundary initial;
-            success = protocol.reset(request.reset, initial, error);
+            typename protocol_type::reset_preparation preparation;
+            success = protocol.prepare_reset(
+                request.reset, preparation, error);
             if (success) {
                 data = mm_json_reset_data(
                     request.reset.session_id,
-                    initial,
+                    preparation.boundary,
                     adapter.identity(),
-                    adapter.scene_identity());
+                    adapter.prepared_scene_identity(
+                        preparation.adapter_context));
+                if (data.empty()) {
+                    success = false;
+                    mm_chunk_fail(
+                        error,
+                        "serialization_failed",
+                        "response contains a non-finite or unserializable value");
+                } else {
+                    success = protocol.publish_reset(preparation, error);
+                }
             }
         } else if (request.operation == mm_chunk_op_generate) {
-            mm_chunk_candidate candidate;
-            success = protocol.generate(request.generate, candidate, error);
+            typename protocol_type::generate_preparation preparation;
+            success = protocol.prepare_generate(
+                request.generate, preparation, error);
             if (success) {
                 data = mm_json_generate_data(
                     request.generate,
-                    candidate,
+                    preparation.candidate,
                     adapter.identity(),
                     adapter.scene_identity());
+                if (data.empty()) {
+                    success = false;
+                    mm_chunk_fail(
+                        error,
+                        "serialization_failed",
+                        "response contains a non-finite or unserializable value");
+                } else {
+                    success = protocol.publish_generate(preparation, error);
+                }
             }
         } else if (request.operation == mm_chunk_op_commit) {
             success = protocol.commit(

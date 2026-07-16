@@ -27,6 +27,11 @@ struct fake_state
     std::vector<int> history;
 };
 
+struct fake_reset_context
+{
+    std::string scene_id;
+};
+
 static std::uint64_t fake_hash(const fake_state& state)
 {
     std::uint64_t hash = UINT64_C(1469598103934665603);
@@ -47,21 +52,28 @@ static std::uint64_t fake_hash(const fake_state& state)
 struct fake_adapter
 {
     using state_type = fake_state;
+    using reset_context_type = fake_reset_context;
 
     int clone_count = 0;
     int swap_count = 0;
     int fail_step = -1;
+    int observe_count = 0;
+    int fail_observe_call = -1;
+    bool fail_clone = false;
     bool fail_reset = false;
-    bool fail_observe = false;
+    int reset_publish_count = 0;
+    std::string published_scene_id;
 
-    bool reset(
+    bool prepare_reset(
         state_type& state,
         mm_chunk_boundary& boundary,
+        reset_context_type& context,
         const mm_chunk_reset_request& request,
         std::string& error)
     {
         state.frame = 100 + static_cast<int>(request.scene_id.size());
         state.history.assign(1, state.frame);
+        context.scene_id = request.scene_id;
         if (fail_reset) {
             error = "injected reset failure";
             return false;
@@ -69,13 +81,39 @@ struct fake_adapter
         return observe(boundary, state, error);
     }
 
+    void publish_reset(reset_context_type& context)
+    {
+        ++reset_publish_count;
+        published_scene_id.swap(context.scene_id);
+    }
+
+    bool reset(
+        state_type& state,
+        mm_chunk_boundary& boundary,
+        const mm_chunk_reset_request& request,
+        std::string& error)
+    {
+        reset_context_type context;
+        if (!prepare_reset(state, boundary, context, request, error)) {
+            return false;
+        }
+        publish_reset(context);
+        return true;
+    }
+
     bool clone(
         state_type& destination,
         const state_type& source,
-        std::string&)
+        std::string& error)
     {
         ++clone_count;
         destination = source;
+        if (fail_clone) {
+            destination.frame += 7000;
+            destination.history.push_back(destination.frame);
+            error = "injected clone failure after destination mutation";
+            return false;
+        }
         return true;
     }
 
@@ -91,8 +129,9 @@ struct fake_adapter
         const state_type& state,
         std::string& error)
     {
-        if (fail_observe) {
-            error = "injected observation failure";
+        ++observe_count;
+        if (observe_count == fail_observe_call) {
+            error = "injected observation failure at configured call";
             return false;
         }
         boundary = mm_chunk_boundary();
@@ -189,6 +228,186 @@ static void require_error(
     CHECK(!result);
     CHECK(error.code == code);
     CHECK(!error.message.empty());
+}
+
+enum matrix_state
+{
+    matrix_pre_hello,
+    matrix_hello_no_reset,
+    matrix_reset_no_candidate,
+    matrix_outstanding_candidate,
+    matrix_committed,
+    matrix_aborted,
+    matrix_closed,
+    matrix_state_count,
+};
+
+enum matrix_operation
+{
+    matrix_hello,
+    matrix_reset,
+    matrix_generate,
+    matrix_commit,
+    matrix_abort,
+    matrix_close,
+    matrix_operation_count,
+};
+
+static void setup_matrix_state(
+    fake_engine& protocol,
+    matrix_state state,
+    mm_chunk_error& error)
+{
+    if (state == matrix_pre_hello) return;
+    CHECK(protocol.hello(error));
+    if (state == matrix_hello_no_reset) return;
+    if (state == matrix_closed) {
+        CHECK(protocol.close(error));
+        return;
+    }
+    mm_chunk_boundary initial;
+    CHECK(protocol.reset(reset_request(), initial, error));
+    if (state == matrix_reset_no_candidate) return;
+    mm_chunk_candidate candidate;
+    CHECK(protocol.generate(
+        generate_request("c000000", true), candidate, error));
+    if (state == matrix_outstanding_candidate) return;
+    if (state == matrix_committed) {
+        CHECK(protocol.commit("s1", "c000000", error));
+    } else {
+        CHECK(state == matrix_aborted);
+        CHECK(protocol.abort("s1", "c000000", error));
+    }
+}
+
+static bool invoke_matrix_operation(
+    fake_engine& protocol,
+    matrix_state state,
+    matrix_operation operation,
+    mm_chunk_error& error)
+{
+    mm_chunk_boundary boundary;
+    mm_chunk_candidate candidate;
+    switch (operation) {
+    case matrix_hello:
+        return protocol.hello(error);
+    case matrix_reset:
+        return protocol.reset(reset_request("matrix-reset"), boundary, error);
+    case matrix_generate:
+        if (state == matrix_committed) {
+            return protocol.generate(
+                generate_request("c000001", false, "c000000"),
+                candidate,
+                error);
+        }
+        return protocol.generate(
+            generate_request("c000000", true), candidate, error);
+    case matrix_commit:
+        return protocol.commit("s1", "c000000", error);
+    case matrix_abort:
+        return protocol.abort("s1", "c000000", error);
+    default:
+        return protocol.close(error);
+    }
+}
+
+static void test_complete_protocol_state_matrix()
+{
+    static const char* const expected[matrix_state_count]
+                                     [matrix_operation_count] = {
+        {nullptr, "hello_required", "hello_required", "hello_required",
+         "hello_required", "hello_required"},
+        {"hello_already_received", nullptr, "reset_required",
+         "reset_required", "reset_required", nullptr},
+        {"hello_already_received", nullptr, nullptr, "no_candidate",
+         "no_candidate", nullptr},
+        {"hello_already_received", "candidate_outstanding",
+         "candidate_outstanding", nullptr, nullptr,
+         "candidate_outstanding"},
+        {"hello_already_received", nullptr, nullptr, "no_candidate",
+         "no_candidate", nullptr},
+        {"hello_already_received", nullptr, nullptr, "no_candidate",
+         "no_candidate", nullptr},
+        {"closed", "closed", "closed", "closed", "closed", "closed"},
+    };
+
+    for (int state_index = 0; state_index < matrix_state_count;
+         ++state_index) {
+        for (int operation_index = 0;
+             operation_index < matrix_operation_count;
+             ++operation_index) {
+            fake_adapter adapter;
+            fake_engine protocol(adapter);
+            mm_chunk_error error;
+            const matrix_state state =
+                static_cast<matrix_state>(state_index);
+            setup_matrix_state(protocol, state, error);
+            const bool result = invoke_matrix_operation(
+                protocol,
+                state,
+                static_cast<matrix_operation>(operation_index),
+                error);
+            const char* code = expected[state_index][operation_index];
+            if (code == nullptr) {
+                CHECK(result);
+                CHECK(error.code.empty());
+            } else {
+                require_error(result, error, code);
+            }
+        }
+    }
+}
+
+static void test_preparation_is_inert_until_explicit_publication()
+{
+    fake_adapter adapter;
+    fake_engine protocol(adapter);
+    mm_chunk_error error;
+    CHECK(protocol.hello(error));
+
+    fake_engine::reset_preparation reset_prepared;
+    CHECK(protocol.prepare_reset(
+        reset_request(), reset_prepared, error));
+    CHECK(reset_prepared.ready);
+    CHECK(!protocol.session().reset);
+    CHECK(protocol.session().session_id.empty());
+    CHECK(adapter.reset_publish_count == 0);
+    CHECK(adapter.published_scene_id.empty());
+    CHECK(reset_prepared.boundary.physical_pelvis_position_holden[0] ==
+          static_cast<float>(reset_prepared.state.frame));
+
+    CHECK(protocol.publish_reset(reset_prepared, error));
+    CHECK(!reset_prepared.ready);
+    CHECK(protocol.session().reset);
+    CHECK(protocol.session().session_id == "s1");
+    CHECK(adapter.reset_publish_count == 1);
+    CHECK(adapter.published_scene_id == "fixture-scene");
+    require_error(
+        protocol.publish_reset(reset_prepared, error),
+        error,
+        "invalid_preparation");
+
+    const std::uint64_t active = fake_hash(protocol.session().active);
+    const std::uint64_t candidate = fake_hash(protocol.session().candidate);
+    fake_engine::generate_preparation generate_prepared;
+    CHECK(protocol.prepare_generate(
+        generate_request("c000000", true), generate_prepared, error));
+    CHECK(generate_prepared.ready);
+    CHECK(generate_prepared.candidate.boundaries.size() == 11u);
+    CHECK(generate_prepared.candidate.steps.size() == 10u);
+    CHECK(fake_hash(protocol.session().active) == active);
+    CHECK(fake_hash(protocol.session().candidate) == candidate);
+    CHECK(!protocol.session().candidate_ready);
+
+    CHECK(protocol.publish_generate(generate_prepared, error));
+    CHECK(!generate_prepared.ready);
+    CHECK(fake_hash(protocol.session().active) == active);
+    CHECK(protocol.session().candidate_ready);
+    CHECK(protocol.session().candidate_id == "c000000");
+    require_error(
+        protocol.publish_generate(generate_prepared, error),
+        error,
+        "invalid_preparation");
 }
 
 static void test_legal_sequence_is_transactional_and_continuous()
@@ -306,12 +525,25 @@ static void test_failures_never_publish_or_mutate_active_state()
     CHECK(protocol.hello(error));
     CHECK(protocol.reset(reset_request(), initial, error));
     const std::uint64_t active = fake_hash(protocol.session().active);
+    const std::uint64_t candidate = fake_hash(protocol.session().candidate);
 
-    adapter.fail_step = 4;
+    adapter.fail_clone = true;
     mm_chunk_candidate output;
     output.boundaries.push_back(mm_chunk_boundary());
     output.boundaries[0].joint_position_source[0] = 12345.0f;
     const mm_chunk_candidate sentinel = output;
+    require_error(
+        protocol.generate(
+            generate_request("failed-clone", true), output, error),
+        error,
+        "generation_failed");
+    CHECK(output == sentinel);
+    CHECK(fake_hash(protocol.session().active) == active);
+    CHECK(fake_hash(protocol.session().candidate) == candidate);
+    CHECK(!protocol.session().candidate_ready);
+
+    adapter.fail_clone = false;
+    adapter.fail_step = 4;
     require_error(
         protocol.generate(
             generate_request("failed", true), output, error),
@@ -319,27 +551,34 @@ static void test_failures_never_publish_or_mutate_active_state()
         "generation_failed");
     CHECK(output == sentinel);
     CHECK(fake_hash(protocol.session().active) == active);
+    CHECK(fake_hash(protocol.session().candidate) == candidate);
     CHECK(!protocol.session().candidate_ready);
 
     adapter.fail_step = -1;
-    adapter.fail_observe = true;
+    adapter.fail_observe_call = adapter.observe_count + 7;
     require_error(
         protocol.generate(
-            generate_request("failed-observe", true), output, error),
+            generate_request("failed-late-observe", true), output, error),
         error,
         "generation_failed");
     CHECK(output == sentinel);
     CHECK(fake_hash(protocol.session().active) == active);
+    CHECK(fake_hash(protocol.session().candidate) == candidate);
     CHECK(!protocol.session().candidate_ready);
 
-    adapter.fail_observe = false;
+    adapter.fail_observe_call = -1;
     adapter.fail_reset = true;
+    mm_chunk_boundary reset_sentinel;
+    reset_sentinel.joint_position_source[0] = 54321.0f;
+    initial = reset_sentinel;
     require_error(
         protocol.reset(reset_request("replacement"), initial, error),
         error,
         "reset_failed");
+    CHECK(initial == reset_sentinel);
     CHECK(protocol.session().session_id == "s1");
     CHECK(fake_hash(protocol.session().active) == active);
+    CHECK(fake_hash(protocol.session().candidate) == candidate);
 }
 
 static void test_every_illegal_identity_and_interval_is_rejected()
@@ -367,10 +606,19 @@ static void test_every_illegal_identity_and_interval_is_rejected()
         protocol.commit("s1", "c0", error), error, "no_candidate");
     require_error(
         protocol.abort("s1", "c0", error), error, "no_candidate");
+
+    CHECK(protocol.generate(generate_request("c0", true), output, error));
+    require_error(
+        protocol.abort("other", "c0", error), error, "session_mismatch");
+    require_error(
+        protocol.abort("s1", "other", error), error, "candidate_mismatch");
+    CHECK(protocol.abort("s1", "c0", error));
 }
 
 int main()
 {
+    test_complete_protocol_state_matrix();
+    test_preparation_is_inert_until_explicit_publication();
     test_legal_sequence_is_transactional_and_continuous();
     test_failures_never_publish_or_mutate_active_state();
     test_every_illegal_identity_and_interval_is_rejected();
