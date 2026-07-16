@@ -642,21 +642,63 @@ class SonicCLITests(unittest.TestCase):
         self.assertIn("--gear-checkout", stderr)
         self.assertFalse(self.output.exists())
 
-    def test_literal_tilde_path_is_rejected_before_bundle_creation(self) -> None:
-        output = self.root / "literal-tilde-output"
-        command = [
-            "stage-a",
-            "--mode",
-            "known-good-stream",
-            *self._common(output=output),
-        ]
-        command[command.index("--gear-checkout") + 1] = "~"
+    def test_tilde_aliases_on_every_path_option_reject_before_bundle_creation(
+        self,
+    ) -> None:
+        options = (
+            "--gear-checkout",
+            "--policy",
+            "--observation-config",
+            "--encoder",
+            "--source-mjcf",
+            "--terrain-dir",
+            "--output-root",
+        )
+        for option in options:
+            for form in ("split", "equals"):
+                for alias in ("~", "~/x", "~user/x"):
+                    with self.subTest(option=option, form=form, alias=alias):
+                        output = self.root / "tilde-output"
+                        valid = {
+                            "--gear-checkout": str(self.gear),
+                            "--policy": str(self.policy),
+                            "--observation-config": str(self.observation),
+                            "--encoder": str(self.policy),
+                            "--source-mjcf": str(self.source_mjcf),
+                            "--terrain-dir": str(self.terrain),
+                            "--output-root": str(output),
+                        }
+                        valid[option] = alias
+                        ordered = [
+                            "--gear-checkout",
+                            "--policy",
+                            "--observation-config",
+                        ]
+                        if option == "--encoder":
+                            ordered.append("--encoder")
+                        ordered += [
+                            "--source-mjcf",
+                            "--terrain-dir",
+                            "--output-root",
+                        ]
+                        command = ["stage-a", "--mode", "known-good-stream"]
+                        for flag in ordered:
+                            value = valid[flag]
+                            if flag == option and form == "equals":
+                                command.append(f"{flag}={value}")
+                            else:
+                                command.extend([flag, value])
 
-        code, _stdout, stderr = self._run(command)
+                        with patch.object(
+                            cli_module.RunBundle, "create"
+                        ) as create_bundle:
+                            code, _stdout, stderr = self._run(command)
 
-        self.assertEqual(code, 2)
-        self.assertIn("user expansion", stderr)
-        self.assertFalse(output.exists())
+                        self.assertEqual(code, 2)
+                        self.assertIn("user expansion", stderr)
+                        create_bundle.assert_not_called()
+                        if option != "--output-root":
+                            self.assertFalse(output.exists())
 
     def test_output_root_must_be_confined_away_from_external_inputs(self) -> None:
         nested = self.gear / "forbidden-output"
@@ -1519,6 +1561,48 @@ class SonicCLITests(unittest.TestCase):
             metrics_module._stage_a_resolved_path(
                 "~", "Stage A test path", invocation_cwd=self.root
             )
+
+    def test_stage_a_invocation_cwd_accepts_only_the_canonical_sealed_string(
+        self,
+    ) -> None:
+        canonical = self.root / "canonical-cwd"
+        canonical.mkdir()
+        sealed = str(canonical.resolve(strict=True))
+
+        accepted = metrics_module._stage_a_invocation_cwd(sealed)
+        self.assertEqual(str(accepted), sealed)
+
+        # A relative argv path is resolved against the sealed invocation cwd,
+        # not the later validator cwd, so the same string authenticates the
+        # canonical file even after chdir into an unrelated directory.
+        validation_cwd = self.root / "nested" / "validator-cwd"
+        validation_cwd.mkdir(parents=True)
+        relative_target = os.path.relpath(self.policy, canonical)
+        original_cwd = Path.cwd()
+        try:
+            os.chdir(validation_cwd)
+            resolved = metrics_module._stage_a_resolved_path(
+                relative_target,
+                "Stage A policy",
+                invocation_cwd=accepted,
+            )
+        finally:
+            os.chdir(original_cwd)
+        self.assertEqual(resolved, self.policy.resolve(strict=True))
+
+        parent_segment = f"{canonical}/../{canonical.name}"
+        self.assertEqual(Path(parent_segment).resolve(strict=True), canonical)
+        noncanonical = {
+            "relative": canonical.name,
+            "trailing-slash": f"{sealed}/",
+            "parent-segment": parent_segment,
+            "tilde": "~",
+            "tilde-child": f"~/{canonical.name}",
+        }
+        for label, value in noncanonical.items():
+            with self.subTest(label=label):
+                with self.assertRaises(ContractError):
+                    metrics_module._stage_a_invocation_cwd(value)
 
     def test_stage_a_registry_has_the_exact_ordered_gate_contract(self) -> None:
         registry = json.loads(
@@ -2774,8 +2858,27 @@ class ProductionAdapterBoundaryTests(unittest.TestCase):
             self.assertEqual(set(first["event_sha256"]), {
                 "start", "processing", "merged", "end"
             })
-            self.assertIn("merged_to_end", first["intervening_ranges"])
-            self.assertIn("merged_to_end", first["intervening_sha256"])
+            merged_end = first["merged_range"][1]
+            end_start = first["end_range"][0]
+            expected_merged_to_end = (
+                b"[ZMQEndpointInterface] active_protocol_version_=1\n"
+                b"[ZMQEndpointInterface] result.motion->GetEncodeMode()=0\n"
+                b"[ZMQEndpointInterface] motion name: streamed\n"
+                b"[ZMQEndpointInterface] Merged streamed data: accepted\n"
+            )
+            self.assertEqual(
+                first["intervening_ranges"]["merged_to_end"],
+                [merged_end, end_start],
+            )
+            self.assertEqual(
+                frozen_prefix[merged_end:end_start], expected_merged_to_end
+            )
+            self.assertEqual(
+                first["intervening_sha256"]["merged_to_end"],
+                hashlib.sha256(
+                    frozen_prefix[merged_end:end_start]
+                ).hexdigest(),
+            )
             self.assertEqual(
                 transcript["post_enable_fence"], dict(evidence.post_enable_fence)
             )

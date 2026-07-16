@@ -1435,6 +1435,143 @@ class GearProcessTests(TemporaryScriptCase):
         finally:
             gear.close()
 
+    def test_wait_preload_stays_blocked_until_exact_delayed_decoder_end(self):
+        child = self.script(
+            "wait_preload_delayed_end.py",
+            r'''
+            import os
+            import termios
+
+            attrs = termios.tcgetattr(0)
+            attrs[3] &= ~(termios.ICANON | termios.ECHO)
+            termios.tcsetattr(0, termios.TCSANOW, attrs)
+            print("BOOT READY", flush=True)
+            os.read(0, 1)
+            print("STREAM READY", flush=True)
+            assert os.read(0, 2) == b"qe"
+            print("Delta heading left: 0.1 rad", flush=True)
+            print("Delta heading right: 0 rad", flush=True)
+            os.read(0, 1)
+            print(
+                "[ZMQEndpointInterface] *** Starting ZMQ processing ***",
+                flush=True,
+            )
+            print("[ZMQEndpointInterface] Protocol version: 1", flush=True)
+            print("[ZMQEndpointInterface] Protocol version 1 established", flush=True)
+            print(
+                "[StreamedMotionMerger] Processing 20 frames, "
+                "incoming_frame_start=1, frame_step=1",
+                flush=True,
+            )
+            print(
+                "[StreamedMotionMerger] Merged motion: 21 frames "
+                "(copied: 1 + incoming: 20)",
+                flush=True,
+            )
+            print("[ZMQEndpointInterface] active_protocol_version_=1", flush=True)
+            print("[ZMQEndpointInterface] motion name: streamed", flush=True)
+            os.read(0, 1)
+            print(
+                "[ZMQEndpointInterface] *** End of ZMQ decoding processing ***",
+                flush=True,
+            )
+            while os.read(0, 1).lower() != b"o":
+                pass
+            ''',
+        )
+        gear = self.gear(child, readiness_timeout_s=2.0)
+        waiter = None
+        marker_result = []
+        wait_errors = []
+        archive = self.root / "gear.stdout.log"
+        merged_to_end_diagnostics = (
+            b"[ZMQEndpointInterface] active_protocol_version_=1\n"
+            b"[ZMQEndpointInterface] motion name: streamed\n"
+        )
+        end_line = (
+            "[ZMQEndpointInterface] *** End of ZMQ decoding processing ***"
+        )
+        try:
+            gear.start_to_wait_for_control()
+            gear.enable_stream_for_preload()
+            boundary = gear.publication_boundary()
+            end_wait_requested = threading.Event()
+            wait_exact_line_range = gear._wait_exact_line_range
+
+            def observe_exact_line_wait(line, *, after_offset):
+                if line == f"{end_line}\n":
+                    end_wait_requested.set()
+                return wait_exact_line_range(line, after_offset=after_offset)
+
+            gear._wait_exact_line_range = observe_exact_line_wait
+
+            def wait_for_end():
+                try:
+                    marker_result.append(
+                        gear.wait_for_stream_processing(
+                            boundary,
+                            frame_count=20,
+                            global_start=1,
+                            merged_count=21,
+                        )
+                    )
+                except BaseException as error:  # noqa: BLE001
+                    wait_errors.append(error)
+
+            waiter = threading.Thread(target=wait_for_end)
+            waiter.start()
+            gear.write_keys(b"x")
+            self.assertTrue(end_wait_requested.wait(timeout=1.0))
+
+            deadline = time.monotonic() + 1.0
+            while (
+                merged_to_end_diagnostics not in archive.read_bytes()
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.005)
+            # The full Start/processing/Merged sequence plus a post-merge
+            # diagnostic is now archived, but the pinned End line is still
+            # withheld behind the second PTY byte.
+            self.assertIn(merged_to_end_diagnostics, archive.read_bytes())
+            self.assertTrue(waiter.is_alive())
+            self.assertEqual(marker_result, [])
+            self.assertEqual(wait_errors, [])
+
+            gear.write_keys(b"\n")
+            waiter.join(timeout=1.0)
+            self.assertFalse(waiter.is_alive())
+            self.assertEqual(wait_errors, [])
+
+            marker = marker_result[0]
+            archived = archive.read_bytes()
+            end_start, end_end = marker["end_range"]
+            self.assertEqual(
+                marker["end_line"],
+                end_line,
+            )
+            self.assertEqual(
+                archived[end_start:end_end],
+                f"{marker['end_line']}\n".encode("ascii"),
+            )
+            self.assertEqual(marker["end_offset"], end_end)
+            self.assertLessEqual(
+                marker["start_range"][1], marker["processing_range"][0]
+            )
+            self.assertLessEqual(
+                marker["processing_range"][1], marker["merged_range"][0]
+            )
+            self.assertLess(marker["merged_range"][1], end_start)
+            self.assertEqual(
+                archived[marker["merged_range"][1] : end_start],
+                merged_to_end_diagnostics,
+            )
+        finally:
+            try:
+                gear.close()
+            finally:
+                if waiter is not None:
+                    waiter.join(timeout=1.0)
+
     def test_rejects_conflate_or_duplicate_managed_flags(self):
         child = self.script("unused.py", "raise SystemExit(0)\n")
         for flag in (
