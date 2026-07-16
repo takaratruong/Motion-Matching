@@ -725,6 +725,48 @@ class RunBundle:
             raise ContractError("evidence text must be a string")
         return self.write_bytes(relative, text.encode("utf-8"))
 
+    def archive_transmission(
+        self,
+        message: bytes | bytearray | memoryview,
+        *,
+        first_frame_index: int,
+        last_frame_index: int,
+    ) -> Mapping[str, object]:
+        """Confine one exact packed message and its digest to this run."""
+
+        self._ensure_running()
+        if not isinstance(message, (bytes, bytearray, memoryview)):
+            raise ContractError("transmitted message must be bytes")
+        if (
+            type(first_frame_index) is not int
+            or type(last_frame_index) is not int
+            or first_frame_index < 0
+            or last_frame_index < first_frame_index
+        ):
+            raise ContractError(
+                "transmitted frame range must be nonnegative and ordered"
+            )
+        payload = bytes(message)
+        digest = hashlib.sha256(payload).hexdigest()
+        stem = f"{first_frame_index:06d}-{last_frame_index:06d}"
+        message_path = f"transmitted/{stem}.bin"
+        digest_path = f"transmitted/{stem}.sha256"
+        self.write_bytes(message_path, payload)
+        self.write_text(
+            digest_path,
+            f"{digest}  {stem}.bin\n",
+        )
+        return MappingProxyType(
+            {
+                "first_frame_index": first_frame_index,
+                "last_frame_index": last_frame_index,
+                "message_path": message_path,
+                "digest_path": digest_path,
+                "sha256": digest,
+                "size": len(payload),
+            }
+        )
+
     def open_input(self, path: str | os.PathLike[str]) -> BinaryIO:
         self._ensure_running()
         candidate = Path(path).expanduser()
