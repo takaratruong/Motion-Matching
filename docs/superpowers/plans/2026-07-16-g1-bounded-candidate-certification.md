@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Implement the frozen design at `docs/superpowers/specs/2026-07-16-g1-bounded-candidate-certification-design.md`; its required SHA-256 is `10c21cb51a351b9cc2f4c1e03d58472e485bba36d0449967de4e08e33a7ec6dd`.
-- Do not start source execution unless certified root-frontier implementation commit `f6a6448` and frozen design commit `07f9c7c` are both ancestors of `HEAD` (`07f9c7c` descends `f6a6448`), or while another worker has uncommitted ownership of `g1_ik.h`, `g1_ik_root_reach.cpp`, `tests/cpp/test_g1_ik.cpp`, or `tests/cpp/g1_root_reach_live_fixture_bits.h`. This plan never edits those four files and preserves their certified behavior.
+- Do not start source execution unless certified clamp-boundary commit `29ef804`, certified root-frontier commit `f6a6448`, and frozen design commit `07f9c7c` are ancestors of `HEAD` (`29ef804` descends the other two), or while another worker has uncommitted ownership of `ik.h`, `g1_ik.h`, `g1_ik_root_reach.cpp`, `tests/cpp/test_g1_ik.cpp`, or `tests/cpp/g1_root_reach_live_fixture_bits.h`. This plan never edits those five files and preserves their certified behavior.
 - `K` is exactly 8: one unchanged legacy slot zero, at most six distinct strict-recovery transitions, and one incumbent continuation, with the incumbent omitted when slot zero already attempted it.
 - Keep exactly one production `database_search` call. It remains the sole slot-zero query, normalization, exclusions, range choice, selected frame, transition flag, public `incumbent_cost`, and public `selected_cost` owner.
 - If slot zero dual-accepts or globally errors, recovery enumeration and recovery evaluation are both zero. Only a finite slot-zero rejection on a scheduled-search frame may invoke exactly one additional accelerated traversal.
@@ -174,7 +174,7 @@ G1RecoveryProviderStatus g1_recovery_candidates_exhaustive_for_test(
 
 - [ ] **Step 1: Freeze the execution base and legacy evidence before the first feature edit**
 
-Run from the worktree root after the root-frontier owner has committed and released the four excluded files:
+Run from the worktree root after the clamp-boundary owner has committed and released the five excluded files:
 
 ```bash
 set -euo pipefail
@@ -185,8 +185,9 @@ test "$(sha256sum docs/superpowers/specs/2026-07-16-g1-bounded-candidate-certifi
   10c21cb51a351b9cc2f4c1e03d58472e485bba36d0449967de4e08e33a7ec6dd
 git merge-base --is-ancestor f6a6448 HEAD
 git merge-base --is-ancestor 07f9c7c HEAD
+git merge-base --is-ancestor 29ef804 HEAD
 git diff --exit-code -- \
-  g1_ik.h g1_ik_root_reach.cpp tests/cpp/test_g1_ik.cpp \
+  ik.h g1_ik.h g1_ik_root_reach.cpp tests/cpp/test_g1_ik.cpp \
   tests/cpp/g1_root_reach_live_fixture_bits.h
 git rev-parse HEAD > "$out/base/execution-base.txt"
 git status --short > "$out/base/status.before"
@@ -282,7 +283,7 @@ print("VALID frozen legacy row-6 owner")
 PY
 ```
 
-Expected: every command exits `0`; the spec hash matches; excluded files are clean; the neutral link succeeds; the IK-off baseline freezes the authoritative row-6 query, selected frame/range, and `0x40250630` public score; and the frozen controller, ten 32-frame forward captures, and eight 100-frame flat captures authenticate as one current-frontier evidence set. No 800-frame process has run. Keep this `/tmp` tree through Tasks 1–6.
+Expected: every command exits `0`; the spec hash matches; all five excluded files are clean; the neutral link succeeds; the IK-off baseline freezes the authoritative row-6 query, selected frame/range, and `0x40250630` public score; and the frozen controller, ten 32-frame forward captures, and eight 100-frame flat captures authenticate as one current-frontier evidence set. No 800-frame process has run. Keep this `/tmp` tree through Tasks 1–6.
 
 - [ ] **Step 2: Write the provider RED tests and compile-only ownership fixtures**
 
