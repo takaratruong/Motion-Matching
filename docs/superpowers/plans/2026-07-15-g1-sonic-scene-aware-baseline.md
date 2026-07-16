@@ -340,14 +340,16 @@ git commit -m "feat: certify G1 MM to SONIC joint projection"
 
 ---
 
-### Task 3: Extract one renderer-free matcher step with exact visual-runtime parity
+### Task 3: Extract one renderer-free matcher step with strict visual-runtime behavioral parity
 
 **Files:**
 - Modify: `g1_controller_state.h`
 - Modify: `controller.cpp`
 - Modify: `tests/cpp/test_g1_controller_state.cpp`
 - Create: `sonic/cpp/g1_runtime.h`
+- Create: `sonic/python/mm_sonic/runtime_parity.py`
 - Create: `tests/cpp/test_g1_runtime.cpp`
+- Create: `tests/python/test_sonic_runtime_parity.py`
 - Create: `tests/fixtures/sonic/g1_runtime_flat_64.csv`
 
 **Interfaces:**
@@ -355,6 +357,7 @@ git commit -m "feat: certify G1 MM to SONIC joint projection"
 - `g1_runtime_step` owns ordinary MM only. The dormant LAFAN learned path remains in the visual controller but is unavailable to the server.
 - Input is an already resolved world-space requested velocity and unit desired heading. For `direct` mode, all four command horizons use the latched request; for `route` mode, the existing deterministic route callbacks remain unchanged; for `visual` mode, the controller supplies its existing gamepad-derived callbacks.
 - The kernel includes command publication, traversability, 31D query creation, search/transition, inertialization, simulation-root update, support observation/update, horizontal adjustment/clamping, and final support-retargeted FK. It stops before logging, foot-lock IK, camera, GUI, drawing, and window handling.
+- Oracle parity is byte-exact for the header and every field except `incumbent_cost`, `selected_cost`, `selected_terrain_error`, and `continuation_cost`. Those four diagnostic binary32 costs may differ by at most 8 ULP because translation-unit extraction changes GCC `-O3 -ffast-math` scheduling. Row count/order, all frame/range/selection decisions, the complete 31D query bits, and every physical/root/support state remain exact.
 
 Use these public structures:
 
@@ -431,6 +434,8 @@ Extend the controller-state test to fill every scalar and array, deep clone, mut
 
 Add a source-ownership test requiring `controller.cpp` to call `g1_runtime_step` exactly once per update and forbidding `database_search`, `inertialize_pose_update`, `support_frame_update`, and `terrain_centerline_snapshot_compute_v2` in the render adapter after extraction.
 
+Add Python parity-checker tests requiring exact headers and 64-row ownership, exact equality for all non-cost fields, acceptance at exactly 8 binary32 ULP for only the four registered diagnostic costs, rejection at 9 ULP, and rejection of malformed, non-finite, missing, extra, or reordered data.
+
 - [ ] **Step 3: Run RED**
 
 ~~~bash
@@ -441,6 +446,9 @@ g++ -std=c++17 -O0 -g -Wall -Wextra -Werror -pedantic -I. \
 g++ -std=c++17 -O0 -g -Wall -Wextra -Werror -pedantic -I. \
   tests/cpp/test_g1_runtime.cpp \
   -o /tmp/test_g1_runtime
+PYTHONPATH=sonic/python \
+  /home/ubuntu/miniconda3/envs/diffsim/bin/python \
+  -m unittest tests.python.test_sonic_runtime_parity -v
 ~~~
 
 Expected: clone/runtime API failures and source-ownership failure.
@@ -473,7 +481,7 @@ Move, without algebraic cleanup or constant changes, the existing ordinary match
 
 For direct server commands, use the existing transactional prediction builder with `route_mode=true`, a constant four-horizon velocity callback, and an active heading override. This preserves the same rotation/position smoothing without calling gamepad code.
 
-- [ ] **Step 5: Run unit GREEN, rebuild the visual controller, and compare the oracle byte-for-byte**
+- [ ] **Step 5: Run unit GREEN, rebuild the visual controller, and enforce strict oracle parity**
 
 ~~~bash
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
@@ -484,6 +492,9 @@ g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
   tests/cpp/test_g1_runtime.cpp \
   -o /tmp/test_g1_runtime
 /tmp/test_g1_runtime
+PYTHONPATH=sonic/python \
+  /home/ubuntu/miniconda3/envs/diffsim/bin/python \
+  -m unittest tests.python.test_sonic_runtime_parity -v
 g++ -std=c++17 -O3 -ffast-math -DNDEBUG -D_DEFAULT_SOURCE \
   -DPLATFORM_DESKTOP -I. -I/home/ubuntu/apps/raylib/src \
   -I/home/ubuntu/apps/raygui/src controller.cpp \
@@ -493,18 +504,24 @@ DISPLAY=:1 G1_TERRAIN_DIR=/home/ubuntu/projects/motion-matching/resources/g1_ter
   MM_TEST_MODE=flat MM_TEST_FRAMES=64 \
   MM_LOG=/tmp/g1_runtime_flat_64_after.csv \
   /tmp/controller_sonic_refactored
-cmp tests/fixtures/sonic/g1_runtime_flat_64.csv \
+PYTHONPATH=sonic/python \
+  /home/ubuntu/miniconda3/envs/diffsim/bin/python \
+  -m mm_sonic.runtime_parity \
+  tests/fixtures/sonic/g1_runtime_flat_64.csv \
   /tmp/g1_runtime_flat_64_after.csv
 ~~~
 
-Expected: all tests pass and `cmp` emits no output. Any numeric drift blocks server work.
+Expected: all tests pass; every non-cost field is exact; and the checker reports no more than 8 ULP in only the four registered diagnostic cost columns. Any decision, query-bit, physical/root/support-state drift, any unregistered column drift, or a registered cost drift above 8 ULP blocks server work.
 
 - [ ] **Step 6: Commit**
 
 ~~~bash
 git add g1_controller_state.h controller.cpp sonic/cpp/g1_runtime.h \
-  tests/cpp/test_g1_controller_state.cpp tests/cpp/test_g1_runtime.cpp \
-  tests/fixtures/sonic/g1_runtime_flat_64.csv
+  sonic/python/mm_sonic/runtime_parity.py tests/cpp/test_g1_controller_state.cpp \
+  tests/cpp/test_g1_runtime.cpp tests/python/test_sonic_runtime_parity.py \
+  tests/fixtures/sonic/g1_runtime_flat_64.csv \
+  docs/superpowers/plans/2026-07-15-g1-sonic-scene-aware-baseline.md \
+  docs/superpowers/specs/2026-07-15-g1-sonic-scene-aware-baseline-design.md
 git commit -m "refactor: expose renderer-free G1 matcher step"
 ~~~
 

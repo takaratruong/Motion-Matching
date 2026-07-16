@@ -1,6 +1,7 @@
 #include "g1_controller_state.h"
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -43,6 +44,32 @@ static bool source_has_call(
         position += name.size();
     }
     return false;
+}
+
+static std::size_t source_call_count(
+    const std::string& source, const char* function_name)
+{
+    const std::string name(function_name);
+    std::size_t count = 0;
+    std::size_t position = 0;
+    while ((position = source.find(name, position)) != std::string::npos) {
+        const bool left_boundary =
+            position == 0 || !identifier_character(source[position - 1]);
+        std::size_t after = position + name.size();
+        const bool right_boundary =
+            after == source.size() || !identifier_character(source[after]);
+        while (after < source.size() &&
+               (source[after] == ' ' || source[after] == '\t' ||
+                source[after] == '\r' || source[after] == '\n')) {
+            ++after;
+        }
+        if (left_boundary && right_boundary && after < source.size() &&
+            source[after] == '(') {
+            ++count;
+        }
+        position += name.size();
+    }
+    return count;
 }
 
 static std::string read_source(const char* path, const char* description)
@@ -128,6 +155,14 @@ static std::string read_controller_source()
     return read_source(path, "controller source opens and reads");
 }
 
+static std::string read_runtime_source()
+{
+    const char* override_path = std::getenv("G1_RUNTIME_SOURCE");
+    const char* path = override_path != NULL
+        ? override_path : "sonic/cpp/g1_runtime.h";
+    return read_source(path, "G1 runtime source opens and reads");
+}
+
 static std::size_t count_occurrences(
     const std::string& source, const char* needle)
 {
@@ -143,7 +178,10 @@ static std::size_t count_occurrences(
 static void test_active_scene_sources_use_checked_v2_queries()
 {
     const std::string controller_source = read_controller_source();
-    check_source_uses_checked_v2_queries(controller_source, true);
+    check_source_uses_checked_v2_queries(controller_source, false);
+
+    const std::string runtime_source = read_runtime_source();
+    check_source_uses_checked_v2_queries(runtime_source, true);
 
     const char* override_path = std::getenv("G1_STATE_SOURCE");
     const char* path =
@@ -155,9 +193,9 @@ static void test_active_scene_sources_use_checked_v2_queries()
 
 static void test_controller_wires_idle_match_transition_cost()
 {
-    const std::string source = read_controller_source();
+    const std::string source = read_runtime_source();
     const std::size_t prior = source.find(
-        "const int prior_index = state.frame_index;");
+        "const int prior_index = next.frame_index;");
     check(prior != std::string::npos,
           "ordinary matcher captures the incumbent frame");
     const std::size_t policy = source.find(
@@ -173,7 +211,7 @@ static void test_controller_wires_idle_match_transition_cost()
               policy_call.find("traversal.commanded_speed") !=
                   std::string::npos &&
               policy_call.find(
-                  "walkability_xz_length(state.simulation_velocity)") !=
+                  "walkability_xz_length(next.simulation_velocity)") !=
                   std::string::npos,
           "idle policy consumes raw command and planar simulation speeds");
 
@@ -188,6 +226,23 @@ static void test_controller_wires_idle_match_transition_cost()
     check(source_call_argument_count(search_call) == 5 &&
               search_call.find("transition_cost") != std::string::npos,
           "idle transition cost is the fifth database_search argument");
+}
+
+static void test_controller_delegates_one_renderer_free_runtime_step()
+{
+    const std::string source = read_controller_source();
+    check(source_call_count(source, "g1_runtime_step") == 1,
+          "controller calls exactly one renderer-free runtime step");
+    const char* forbidden_calls[] = {
+        "database_search",
+        "inertialize_pose_update",
+        "support_frame_update",
+        "terrain_centerline_snapshot_compute_v2"
+    };
+    for (const char* forbidden : forbidden_calls) {
+        check(source_call_count(source, forbidden) == 0,
+              "render adapter does not retain ordinary matcher ownership");
+    }
 }
 
 static void test_controller_validates_ik_geometry_before_window()
@@ -219,14 +274,15 @@ static void test_controller_validates_ik_geometry_before_window()
 
 static void test_controller_publishes_independent_travel_and_heading()
 {
-    const std::string source = read_controller_source();
-    const std::size_t heading_parse = source.find(
+    const std::string controller_source = read_controller_source();
+    const std::string runtime_source = read_runtime_source();
+    const std::size_t heading_parse = controller_source.find(
         "g1_test_heading_override_parse(");
-    const std::size_t heading_mode_guard = source.find(
+    const std::size_t heading_mode_guard = controller_source.find(
         "if (test_heading.active", heading_parse);
-    const std::size_t heading_guard_mode = source.find(
+    const std::size_t heading_guard_mode = controller_source.find(
         "test_config.mode != G1_TestRoute", heading_mode_guard);
-    const std::size_t window = source.find("InitWindow(");
+    const std::size_t window = controller_source.find("InitWindow(");
     check(heading_parse != std::string::npos &&
               heading_mode_guard != std::string::npos &&
               heading_guard_mode != std::string::npos &&
@@ -236,62 +292,65 @@ static void test_controller_publishes_independent_travel_and_heading()
               heading_guard_mode < window,
           "heading override parses and rejects live use before Raylib startup");
 
-    const std::size_t command = source.find(
+    const std::size_t command = controller_source.find(
         "const vec3 commanded_velocity = desired_velocity_curr;");
-    const std::size_t heading = source.find(
+    const std::size_t heading = controller_source.find(
         "quat desired_rotation_curr = desired_rotation_update(", command);
-    const std::size_t override_guard = source.find(
+    const std::size_t override_guard = controller_source.find(
         "if (test_heading.active)", heading);
-    const std::size_t override_assign = source.find(
+    const std::size_t override_assign = controller_source.find(
         "desired_rotation_curr = test_heading.heading;", override_guard);
-    const std::size_t traversal = source.find(
-        "desired_velocity_curr = traversability_limit_command(",
-        override_assign);
+    const std::size_t request = controller_source.find(
+        "g1_runtime_step_request runtime_request;", override_assign);
+    const std::size_t builder = controller_source.find(
+        "const auto visual_prediction_builder", request);
+    const std::size_t runtime_step = controller_source.find(
+        "if (!g1_runtime_step(", builder);
     check(command != std::string::npos && heading != std::string::npos &&
               override_guard != std::string::npos &&
               override_assign != std::string::npos &&
-              traversal != std::string::npos &&
+              request != std::string::npos &&
+              builder != std::string::npos &&
+              runtime_step != std::string::npos &&
               command < heading && heading < override_guard &&
-              override_guard < override_assign && override_assign < traversal,
-          "heading selection and override precede terrain velocity limiting");
+              override_guard < override_assign && override_assign < request &&
+              request < builder && builder < runtime_step,
+          "visual adapter resolves intent before its single runtime call");
     const std::string heading_call = source_call_text(
-        source,
+        controller_source,
         "desired_rotation_update",
         heading,
         "controller has the current heading-selection call");
     check(heading_call.find("commanded_velocity") != std::string::npos &&
               heading_call.find("desired_velocity_curr") == std::string::npos,
           "heading selection consumes requested travel, not limited travel");
-    const std::string traversal_call = source_call_text(
-        source,
-        "traversability_limit_command",
-        traversal,
-        "controller has the terrain velocity limiter call");
-    check(traversal_call.find("rotation") == std::string::npos &&
-              traversal_call.find("heading") == std::string::npos,
-          "terrain limiter receives no heading reference");
 
-    const std::size_t frame_builder = source.find(
-        "g1_command_frame_prediction_build(", traversal);
-    const std::size_t publication = source.find(
-        "state.command = frame_prediction.command;", frame_builder);
-    const std::size_t query = source.find(
-        "// Make query vector for search.", publication);
-    check(frame_builder != std::string::npos &&
-              publication != std::string::npos &&
-              query != std::string::npos &&
-              frame_builder < publication && publication < query,
-          "controller invokes one frame seam before publishing state");
+    const std::string request_path =
+        controller_source.substr(request, builder - request);
+    check(request_path.find(
+              "runtime_request.requested_velocity_holden = "
+              "commanded_velocity;") != std::string::npos &&
+              request_path.find(
+                  "runtime_request.desired_heading_holden = "
+                  "desired_rotation_curr;") != std::string::npos &&
+              request_path.find(
+                  "runtime_request.matching_enabled = matching_enabled;") !=
+                  std::string::npos,
+          "visual adapter publishes independent travel, heading, and mode");
+
+    const std::size_t frame_builder = controller_source.find(
+        "g1_command_frame_prediction_build(", builder);
     const std::string frame_call = source_call_text(
-        source,
+        controller_source,
         "g1_command_frame_prediction_build",
         frame_builder,
         "controller has the transactional frame-prediction call");
     check(source_call_argument_count(frame_call) == 10 &&
               frame_call.find("frame_prediction") != std::string::npos &&
               frame_call.find("frame_seed") != std::string::npos &&
-              frame_call.find("frame_request") != std::string::npos &&
-              frame_call.find("artifact_error") != std::string::npos,
+              frame_call.find("adapter_request") != std::string::npos &&
+              frame_call.find("callback_error") != std::string::npos &&
+              frame_call.find("callback_capacity") != std::string::npos,
           "controller supplies the complete transactional frame seam");
 
     const std::size_t route_prediction = frame_call.find(
@@ -319,45 +378,76 @@ static void test_controller_publishes_independent_travel_and_heading()
         "deterministic_route_predict_commands",
         route_prediction,
         "controller frame seam wraps deterministic route prediction");
-    check(route_call.find("desired_velocity_curr") != std::string::npos &&
-              route_call.find("state.traversal_speed_scale") !=
+    check(route_call.find("runtime_state.desired_velocity") !=
+                  std::string::npos &&
+              route_call.find("runtime_state.traversal_speed_scale") !=
                   std::string::npos &&
               route_call.find("gamepad") == std::string::npos,
           "route callback consumes applied travel and no synthetic gamepad");
 
-    const std::string frame_path = source.substr(command, query - command);
-    check(frame_path.find(
-              "frame_request.route_mode = test_config.mode == G1_TestRoute;") !=
-              std::string::npos &&
-              frame_path.find(
-                  "frame_request.heading_override = test_heading;") !=
-              std::string::npos &&
-              frame_path.find(
-                  "if (test_config.mode != G1_TestRoute)") ==
-              std::string::npos &&
-              frame_path.find(
-                  "state.trajectory_desired_rotations.set("
-                  "test_heading.heading);") == std::string::npos &&
-              frame_path.find("g1_command_snapshot_build(") ==
-                  std::string::npos,
-          "controller delegates route/live, heading, and snapshot policy");
-    check(frame_path.find(
-              "frame_prediction.predicted_root_velocities[index]") !=
-              std::string::npos &&
-              frame_path.find(
-                  "frame_prediction.predicted_root_accelerations[index]") !=
-              std::string::npos &&
-              frame_path.find(
-                  "frame_prediction.predicted_root_angular_velocities[index]") !=
-              std::string::npos,
-          "controller publishes every auxiliary trajectory owner after success");
-    check(frame_path.find(
+    const std::size_t runtime_command = runtime_source.find(
+        "const vec3 commanded_velocity = request.requested_velocity_holden;");
+    const std::size_t runtime_heading = runtime_source.find(
+        "const quat desired_rotation_curr = request.desired_heading_holden;",
+        runtime_command);
+    const std::size_t traversal = runtime_source.find(
+        "vec3 desired_velocity_curr = traversability_limit_command(",
+        runtime_heading);
+    const std::size_t intent = runtime_source.find(
+        "G1CommandIntent command_intent;", traversal);
+    const std::size_t prediction = runtime_source.find(
+        "if (!prediction_builder(", intent);
+    const std::size_t publication = runtime_source.find(
+        "next.command = frame_prediction.command;", prediction);
+    const std::size_t query = runtime_source.find(
+        "array1d<float> query(db.nfeatures());", publication);
+    check(runtime_command != std::string::npos &&
+              runtime_heading != std::string::npos &&
+              traversal != std::string::npos &&
+              intent != std::string::npos &&
+              prediction != std::string::npos &&
+              publication != std::string::npos &&
+              query != std::string::npos &&
+              runtime_command < runtime_heading &&
+              runtime_heading < traversal && traversal < intent &&
+              intent < prediction && prediction < publication &&
+              publication < query,
+          "runtime limits travel before publishing one transactional frame");
+    const std::string traversal_call = source_call_text(
+        runtime_source,
+        "traversability_limit_command",
+        traversal,
+        "runtime has the terrain velocity limiter call");
+    check(traversal_call.find("commanded_velocity") != std::string::npos &&
+              traversal_call.find("rotation") == std::string::npos &&
+              traversal_call.find("heading") == std::string::npos,
+          "terrain limiter receives requested travel and no heading reference");
+
+    const std::string runtime_path =
+        runtime_source.substr(runtime_command, query - runtime_command);
+    check(runtime_path.find(
               "command_intent.requested_velocity = commanded_velocity;") !=
               std::string::npos &&
-              frame_path.find(
+              runtime_path.find(
                   "command_intent.desired_heading = desired_rotation_curr;") !=
+                  std::string::npos &&
+              runtime_path.find(
+                  "frame_request.route_mode = "
+                  "request.mode != G1RuntimeVisual;") != std::string::npos &&
+              runtime_path.find(
+                  "frame_request.applied_velocity = desired_velocity_curr;") !=
                   std::string::npos,
-          "immutable intent records requested travel and independent heading");
+          "shared runtime preserves immutable intent and applied travel");
+    check(runtime_path.find(
+              "frame_prediction.predicted_root_velocities[index]") !=
+              std::string::npos &&
+              runtime_path.find(
+                  "frame_prediction.predicted_root_accelerations[index]") !=
+                  std::string::npos &&
+              runtime_path.find(
+                  "frame_prediction.predicted_root_angular_velocities[index]") !=
+                  std::string::npos,
+          "shared runtime publishes every auxiliary trajectory owner");
 }
 
 static void test_failed_model_load_reaches_counted_shared_cleanup()
@@ -535,10 +625,11 @@ static void test_idle_match_transition_cost_policy()
 static void test_scene_first_frame_seeds_desired_trajectory()
 {
     const std::string controller_source = read_controller_source();
+    const std::string runtime_source = read_runtime_source();
     check(source_has_call(
-              controller_source,
+              runtime_source,
               "g1_controller_state_seed_first_frame_desired_velocity"),
-          "controller delegates first-frame seeding to resettable state");
+          "shared runtime delegates first-frame seeding to resettable state");
     check(controller_source.find("rendered_frames == 0") ==
               std::string::npos &&
               controller_source.find("rendered_frames==0") ==
@@ -792,6 +883,368 @@ static void poison_state(g1_controller_state& state)
     state.adjustment_y = 82.0f;
     state.clamp_xz = 83.0f;
     state.clamp_y = 84.0f;
+}
+
+static void fill_clone_array(array1d<vec3>& values, int size, float base)
+{
+    values.resize(size);
+    for (int index = 0; index < size; ++index) {
+        const float offset = static_cast<float>(index);
+        values(index) = vec3(
+            base + offset, base + 0.25f + offset, base + 0.50f + offset);
+    }
+}
+
+static void fill_clone_array(array1d<quat>& values, int size, float base)
+{
+    values.resize(size);
+    for (int index = 0; index < size; ++index) {
+        const float offset = static_cast<float>(index);
+        values(index) = quat(
+            base + offset,
+            base + 0.25f + offset,
+            base + 0.50f + offset,
+            base + 0.75f + offset);
+    }
+}
+
+static void fill_clone_array(array1d<bool>& values, int size, int base)
+{
+    values.resize(size);
+    for (int index = 0; index < size; ++index) {
+        values(index) = ((base + index) % 2) != 0;
+    }
+}
+
+static void fill_clone_array(array1d<int>& values, int size, int base)
+{
+    values.resize(size);
+    for (int index = 0; index < size; ++index) {
+        values(index) = base + index;
+    }
+}
+
+static void fill_valid_clone_shape(g1_controller_state& state)
+{
+    poison_state(state);
+    float value = 200.0f;
+#define FILL_BONE_VEC(name) \
+    fill_clone_array(state.name, G1_BoneCount, value); value += 10.0f
+    FILL_BONE_VEC(curr_bone_positions);
+    FILL_BONE_VEC(curr_bone_velocities);
+    FILL_BONE_VEC(trns_bone_positions);
+    FILL_BONE_VEC(trns_bone_velocities);
+#undef FILL_BONE_VEC
+#define FILL_BONE_QUAT(name) \
+    fill_clone_array(state.name, G1_BoneCount, value); value += 10.0f
+    FILL_BONE_QUAT(curr_bone_rotations);
+    FILL_BONE_QUAT(trns_bone_rotations);
+#undef FILL_BONE_QUAT
+    fill_clone_array(
+        state.curr_bone_angular_velocities, G1_BoneCount, value);
+    value += 10.0f;
+    fill_clone_array(
+        state.trns_bone_angular_velocities, G1_BoneCount, value);
+    value += 10.0f;
+    fill_clone_array(state.curr_bone_contacts, 2, 0);
+    fill_clone_array(state.trns_bone_contacts, 2, 1);
+
+#define FILL_BONE_VEC(name) \
+    fill_clone_array(state.name, G1_BoneCount, value); value += 10.0f
+    FILL_BONE_VEC(bone_positions);
+    FILL_BONE_VEC(bone_velocities);
+    FILL_BONE_VEC(bone_angular_velocities);
+#undef FILL_BONE_VEC
+#define FILL_BONE_QUAT(name) \
+    fill_clone_array(state.name, G1_BoneCount, value); value += 10.0f
+    FILL_BONE_QUAT(bone_rotations);
+#undef FILL_BONE_QUAT
+#define FILL_BONE_VEC(name) \
+    fill_clone_array(state.name, G1_BoneCount, value); value += 10.0f
+    FILL_BONE_VEC(bone_offset_positions);
+    FILL_BONE_VEC(bone_offset_velocities);
+    FILL_BONE_VEC(bone_offset_angular_velocities);
+#undef FILL_BONE_VEC
+    fill_clone_array(
+        state.bone_offset_rotations, G1_BoneCount, value);
+    value += 10.0f;
+    fill_clone_array(state.adjusted_bone_positions, G1_BoneCount, value);
+    value += 10.0f;
+    fill_clone_array(state.global_bone_positions, G1_BoneCount, value);
+    value += 10.0f;
+    fill_clone_array(state.global_bone_velocities, G1_BoneCount, value);
+    value += 10.0f;
+    fill_clone_array(state.adjusted_bone_rotations, G1_BoneCount, value);
+    value += 10.0f;
+    fill_clone_array(state.global_bone_rotations, G1_BoneCount, value);
+    value += 10.0f;
+    fill_clone_array(
+        state.global_bone_angular_velocities, G1_BoneCount, value);
+    fill_clone_array(state.global_bone_computed, G1_BoneCount, 1);
+
+#define FILL_TRAJECTORY_VEC(name) \
+    fill_clone_array( \
+        state.name, G1CommandTrajectorySampleCount, value); value += 10.0f
+    FILL_TRAJECTORY_VEC(trajectory_desired_velocities);
+    FILL_TRAJECTORY_VEC(trajectory_positions);
+    FILL_TRAJECTORY_VEC(trajectory_velocities);
+    FILL_TRAJECTORY_VEC(trajectory_accelerations);
+    FILL_TRAJECTORY_VEC(trajectory_angular_velocities);
+#undef FILL_TRAJECTORY_VEC
+#define FILL_TRAJECTORY_QUAT(name) \
+    fill_clone_array( \
+        state.name, G1CommandTrajectorySampleCount, value); value += 10.0f
+    FILL_TRAJECTORY_QUAT(trajectory_desired_rotations);
+    FILL_TRAJECTORY_QUAT(trajectory_rotations);
+#undef FILL_TRAJECTORY_QUAT
+
+    fill_clone_array(state.contact_bones, 2, 900);
+    fill_clone_array(state.contact_states, 2, 0);
+    fill_clone_array(state.contact_locks, 2, 1);
+#define FILL_CONTACT_VEC(name) \
+    fill_clone_array(state.name, 2, value); value += 10.0f
+    FILL_CONTACT_VEC(contact_positions);
+    FILL_CONTACT_VEC(contact_velocities);
+    FILL_CONTACT_VEC(contact_points);
+    FILL_CONTACT_VEC(contact_targets);
+    FILL_CONTACT_VEC(contact_offset_positions);
+    FILL_CONTACT_VEC(contact_offset_velocities);
+#undef FILL_CONTACT_VEC
+}
+
+template<typename T>
+static bool same_array_bits(
+    const array1d<T>& first, const array1d<T>& second)
+{
+    return first.size == second.size &&
+           (first.size == 0 ||
+            std::memcmp(
+                first.data,
+                second.data,
+                static_cast<std::size_t>(first.size) * sizeof(T)) == 0);
+}
+
+static bool same_state_bits(
+    const g1_controller_state& first,
+    const g1_controller_state& second)
+{
+#define SAME_ARRAY(name) \
+    if (!same_array_bits(first.name, second.name)) return false
+    SAME_ARRAY(curr_bone_positions);
+    SAME_ARRAY(curr_bone_velocities);
+    SAME_ARRAY(trns_bone_positions);
+    SAME_ARRAY(trns_bone_velocities);
+    SAME_ARRAY(curr_bone_rotations);
+    SAME_ARRAY(trns_bone_rotations);
+    SAME_ARRAY(curr_bone_angular_velocities);
+    SAME_ARRAY(trns_bone_angular_velocities);
+    SAME_ARRAY(curr_bone_contacts);
+    SAME_ARRAY(trns_bone_contacts);
+    SAME_ARRAY(bone_positions);
+    SAME_ARRAY(bone_velocities);
+    SAME_ARRAY(bone_angular_velocities);
+    SAME_ARRAY(bone_rotations);
+    SAME_ARRAY(bone_offset_positions);
+    SAME_ARRAY(bone_offset_velocities);
+    SAME_ARRAY(bone_offset_angular_velocities);
+    SAME_ARRAY(bone_offset_rotations);
+    SAME_ARRAY(adjusted_bone_positions);
+    SAME_ARRAY(global_bone_positions);
+    SAME_ARRAY(global_bone_velocities);
+    SAME_ARRAY(adjusted_bone_rotations);
+    SAME_ARRAY(global_bone_rotations);
+    SAME_ARRAY(global_bone_angular_velocities);
+    SAME_ARRAY(global_bone_computed);
+    SAME_ARRAY(trajectory_desired_velocities);
+    SAME_ARRAY(trajectory_positions);
+    SAME_ARRAY(trajectory_velocities);
+    SAME_ARRAY(trajectory_accelerations);
+    SAME_ARRAY(trajectory_angular_velocities);
+    SAME_ARRAY(trajectory_desired_rotations);
+    SAME_ARRAY(trajectory_rotations);
+    SAME_ARRAY(contact_bones);
+    SAME_ARRAY(contact_states);
+    SAME_ARRAY(contact_locks);
+    SAME_ARRAY(contact_positions);
+    SAME_ARRAY(contact_velocities);
+    SAME_ARRAY(contact_points);
+    SAME_ARRAY(contact_targets);
+    SAME_ARRAY(contact_offset_positions);
+    SAME_ARRAY(contact_offset_velocities);
+#undef SAME_ARRAY
+
+    return first.frame_index == second.frame_index &&
+           first.scene_frame == second.scene_frame &&
+           same_float_bits(first.search_time, second.search_time) &&
+           same_float_bits(first.search_timer, second.search_timer) &&
+           same_float_bits(
+               first.force_search_timer, second.force_search_timer) &&
+           same_vec3_bits(
+               first.transition_src_position,
+               second.transition_src_position) &&
+           same_vec3_bits(
+               first.transition_dst_position,
+               second.transition_dst_position) &&
+           same_quat_bits(
+               first.transition_src_rotation,
+               second.transition_src_rotation) &&
+           same_quat_bits(
+               first.transition_dst_rotation,
+               second.transition_dst_rotation) &&
+           same_vec3_bits(first.desired_velocity, second.desired_velocity) &&
+           same_vec3_bits(
+               first.desired_velocity_change_curr,
+               second.desired_velocity_change_curr) &&
+           same_vec3_bits(
+               first.desired_velocity_change_prev,
+               second.desired_velocity_change_prev) &&
+           same_quat_bits(first.desired_rotation, second.desired_rotation) &&
+           same_vec3_bits(
+               first.desired_rotation_change_curr,
+               second.desired_rotation_change_curr) &&
+           same_vec3_bits(
+               first.desired_rotation_change_prev,
+               second.desired_rotation_change_prev) &&
+           same_float_bits(first.desired_gait, second.desired_gait) &&
+           same_float_bits(
+               first.desired_gait_velocity,
+               second.desired_gait_velocity) &&
+           same_vec3_bits(
+               first.simulation_position, second.simulation_position) &&
+           same_vec3_bits(
+               first.simulation_velocity, second.simulation_velocity) &&
+           same_vec3_bits(
+               first.simulation_acceleration,
+               second.simulation_acceleration) &&
+           same_quat_bits(
+               first.simulation_rotation, second.simulation_rotation) &&
+           same_vec3_bits(
+               first.simulation_angular_velocity,
+               second.simulation_angular_velocity) &&
+           same_command_snapshot_bits(first.command, second.command) &&
+           std::memcmp(
+               &first.support,
+               &second.support,
+               sizeof(first.support)) == 0 &&
+           std::memcmp(
+               &first.support_observation_now,
+               &second.support_observation_now,
+               sizeof(first.support_observation_now)) == 0 &&
+           same_float_bits(
+               first.traversal_speed_scale,
+               second.traversal_speed_scale) &&
+           same_float_bits(
+               first.traversal_speed_scale_velocity,
+               second.traversal_speed_scale_velocity) &&
+           first.blocked == second.blocked &&
+           first.walkability_class == second.walkability_class &&
+           same_float_bits(
+               first.blocked_distance, second.blocked_distance) &&
+           same_vec3_bits(first.blocked_point, second.blocked_point) &&
+           first.route_index == second.route_index &&
+           first.route_waypoint == second.route_waypoint &&
+           first.route_frames == second.route_frames &&
+           same_float_bits(first.camera_azimuth, second.camera_azimuth) &&
+           same_float_bits(first.camera_altitude, second.camera_altitude) &&
+           same_float_bits(first.camera_distance, second.camera_distance) &&
+           first.searched == second.searched &&
+           first.transitioned == second.transitioned &&
+           same_float_bits(first.incumbent_cost, second.incumbent_cost) &&
+           same_float_bits(first.selected_cost, second.selected_cost) &&
+           same_float_bits(
+               first.selected_terrain_error,
+               second.selected_terrain_error) &&
+           same_float_bits(first.adjustment_xz, second.adjustment_xz) &&
+           same_float_bits(first.adjustment_y, second.adjustment_y) &&
+           same_float_bits(first.clamp_xz, second.clamp_xz) &&
+           same_float_bits(first.clamp_y, second.clamp_y);
+}
+
+static void test_clone_is_deep_and_transactional()
+{
+    g1_controller_state source;
+    fill_valid_clone_shape(source);
+    const g1_controller_state source_before(source);
+    g1_controller_state clone;
+    char error[512] = {};
+    check(g1_controller_state_clone(
+              clone, source, error, static_cast<int>(sizeof(error))),
+          error);
+    check(same_state_bits(clone, source),
+          "clone preserves every scalar and array value");
+
+#define CHECK_DISTINCT_ARRAY(name) \
+    check(clone.name.data != source.name.data, \
+          "clone array storage is pointer-independent")
+    CHECK_DISTINCT_ARRAY(curr_bone_positions);
+    CHECK_DISTINCT_ARRAY(curr_bone_velocities);
+    CHECK_DISTINCT_ARRAY(trns_bone_positions);
+    CHECK_DISTINCT_ARRAY(trns_bone_velocities);
+    CHECK_DISTINCT_ARRAY(curr_bone_rotations);
+    CHECK_DISTINCT_ARRAY(trns_bone_rotations);
+    CHECK_DISTINCT_ARRAY(curr_bone_angular_velocities);
+    CHECK_DISTINCT_ARRAY(trns_bone_angular_velocities);
+    CHECK_DISTINCT_ARRAY(curr_bone_contacts);
+    CHECK_DISTINCT_ARRAY(trns_bone_contacts);
+    CHECK_DISTINCT_ARRAY(bone_positions);
+    CHECK_DISTINCT_ARRAY(bone_velocities);
+    CHECK_DISTINCT_ARRAY(bone_angular_velocities);
+    CHECK_DISTINCT_ARRAY(bone_rotations);
+    CHECK_DISTINCT_ARRAY(bone_offset_positions);
+    CHECK_DISTINCT_ARRAY(bone_offset_velocities);
+    CHECK_DISTINCT_ARRAY(bone_offset_angular_velocities);
+    CHECK_DISTINCT_ARRAY(bone_offset_rotations);
+    CHECK_DISTINCT_ARRAY(adjusted_bone_positions);
+    CHECK_DISTINCT_ARRAY(global_bone_positions);
+    CHECK_DISTINCT_ARRAY(global_bone_velocities);
+    CHECK_DISTINCT_ARRAY(adjusted_bone_rotations);
+    CHECK_DISTINCT_ARRAY(global_bone_rotations);
+    CHECK_DISTINCT_ARRAY(global_bone_angular_velocities);
+    CHECK_DISTINCT_ARRAY(global_bone_computed);
+    CHECK_DISTINCT_ARRAY(trajectory_desired_velocities);
+    CHECK_DISTINCT_ARRAY(trajectory_positions);
+    CHECK_DISTINCT_ARRAY(trajectory_velocities);
+    CHECK_DISTINCT_ARRAY(trajectory_accelerations);
+    CHECK_DISTINCT_ARRAY(trajectory_angular_velocities);
+    CHECK_DISTINCT_ARRAY(trajectory_desired_rotations);
+    CHECK_DISTINCT_ARRAY(trajectory_rotations);
+    CHECK_DISTINCT_ARRAY(contact_bones);
+    CHECK_DISTINCT_ARRAY(contact_states);
+    CHECK_DISTINCT_ARRAY(contact_locks);
+    CHECK_DISTINCT_ARRAY(contact_positions);
+    CHECK_DISTINCT_ARRAY(contact_velocities);
+    CHECK_DISTINCT_ARRAY(contact_points);
+    CHECK_DISTINCT_ARRAY(contact_targets);
+    CHECK_DISTINCT_ARRAY(contact_offset_positions);
+    CHECK_DISTINCT_ARRAY(contact_offset_velocities);
+#undef CHECK_DISTINCT_ARRAY
+
+    poison_state(clone);
+    clone.frame_index = source.frame_index + 1;
+    check(same_state_bits(source, source_before),
+          "mutating every clone subsystem cannot mutate the source");
+
+    g1_controller_state replacement;
+    fill_valid_clone_shape(replacement);
+    replacement.frame_index = -123;
+    g1_controller_state_swap(clone, replacement);
+    check(same_state_bits(source, source_before),
+          "swapping the clone cannot mutate or alias the source");
+
+    g1_controller_state prior_output;
+    fill_valid_clone_shape(prior_output);
+    prior_output.frame_index = 321;
+    const g1_controller_state output_before(prior_output);
+    g1_controller_state invalid(source);
+    invalid.trajectory_positions.resize(3);
+    check(!g1_controller_state_clone(
+              prior_output,
+              invalid,
+              error,
+              static_cast<int>(sizeof(error))),
+          "invalid clone source is rejected");
+    check(same_state_bits(prior_output, output_before),
+          "failed clone preserves the prior output transactionally");
 }
 
 static void check_vec_array(
@@ -1193,6 +1646,7 @@ static void test_swap_owns_complete_command_snapshot()
 int main()
 {
     test_active_scene_sources_use_checked_v2_queries();
+    test_controller_delegates_one_renderer_free_runtime_step();
     test_controller_wires_idle_match_transition_cost();
     test_controller_validates_ik_geometry_before_window();
     test_controller_publishes_independent_travel_and_heading();
@@ -1203,5 +1657,6 @@ int main()
     test_reset_clears_every_dynamic_subsystem();
     test_failed_reset_preserves_prior_state();
     test_swap_owns_complete_command_snapshot();
+    test_clone_is_deep_and_transactional();
     return 0;
 }

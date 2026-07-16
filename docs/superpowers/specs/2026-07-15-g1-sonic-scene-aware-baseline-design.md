@@ -588,6 +588,15 @@ inside the isolated branch's ignored run area.
 - Run nominal curb, ramp, and stair smoke tests.
 - Run the matched aware/blind perturbation matrix.
 
+The renderer-free extraction is registered against a frozen 64-frame
+pre-refactor flat oracle. Header, row ownership, frame/range/selection
+decisions, 31D query bits, and every physical, root, and support-state field
+must match exactly. Only `incumbent_cost`, `selected_cost`,
+`selected_terrain_error`, and `continuation_cost` may differ, with a hard
+ceiling of 8 binary32 ULP, because GCC `-O3 -ffast-math` reschedules their
+startup feature normalization when the translation unit is extracted. This
+tolerance does not permit a different query, selected frame, or state.
+
 GPU and MuJoCo policy tests are explicit experiment commands rather than
 ordinary CPU unit tests. Their output manifests and verdicts are retained as
 evidence.

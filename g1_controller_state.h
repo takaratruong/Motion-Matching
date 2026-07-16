@@ -238,6 +238,119 @@ static inline void g1_controller_state_swap(
     swap(first.clamp_y, second.clamp_y);
 }
 
+template<typename T>
+static inline bool g1_controller_state_array_has_shape(
+    const array1d<T>& values, const int expected)
+{
+    return values.size == expected && values.data != NULL;
+}
+
+static inline bool g1_controller_state_is_valid_shape(
+    const g1_controller_state& state)
+{
+    const int bones = G1_BoneCount;
+    const int trajectory = G1CommandTrajectorySampleCount;
+    const int contacts = 2;
+    return
+        g1_controller_state_array_has_shape(
+            state.curr_bone_positions, bones) &&
+        g1_controller_state_array_has_shape(
+            state.curr_bone_velocities, bones) &&
+        g1_controller_state_array_has_shape(
+            state.trns_bone_positions, bones) &&
+        g1_controller_state_array_has_shape(
+            state.trns_bone_velocities, bones) &&
+        g1_controller_state_array_has_shape(
+            state.curr_bone_rotations, bones) &&
+        g1_controller_state_array_has_shape(
+            state.trns_bone_rotations, bones) &&
+        g1_controller_state_array_has_shape(
+            state.curr_bone_angular_velocities, bones) &&
+        g1_controller_state_array_has_shape(
+            state.trns_bone_angular_velocities, bones) &&
+        g1_controller_state_array_has_shape(
+            state.curr_bone_contacts, contacts) &&
+        g1_controller_state_array_has_shape(
+            state.trns_bone_contacts, contacts) &&
+        g1_controller_state_array_has_shape(state.bone_positions, bones) &&
+        g1_controller_state_array_has_shape(state.bone_velocities, bones) &&
+        g1_controller_state_array_has_shape(
+            state.bone_angular_velocities, bones) &&
+        g1_controller_state_array_has_shape(state.bone_rotations, bones) &&
+        g1_controller_state_array_has_shape(
+            state.bone_offset_positions, bones) &&
+        g1_controller_state_array_has_shape(
+            state.bone_offset_velocities, bones) &&
+        g1_controller_state_array_has_shape(
+            state.bone_offset_angular_velocities, bones) &&
+        g1_controller_state_array_has_shape(
+            state.bone_offset_rotations, bones) &&
+        g1_controller_state_array_has_shape(
+            state.adjusted_bone_positions, bones) &&
+        g1_controller_state_array_has_shape(
+            state.global_bone_positions, bones) &&
+        g1_controller_state_array_has_shape(
+            state.global_bone_velocities, bones) &&
+        g1_controller_state_array_has_shape(
+            state.adjusted_bone_rotations, bones) &&
+        g1_controller_state_array_has_shape(
+            state.global_bone_rotations, bones) &&
+        g1_controller_state_array_has_shape(
+            state.global_bone_angular_velocities, bones) &&
+        g1_controller_state_array_has_shape(
+            state.global_bone_computed, bones) &&
+        g1_controller_state_array_has_shape(
+            state.trajectory_desired_velocities, trajectory) &&
+        g1_controller_state_array_has_shape(
+            state.trajectory_positions, trajectory) &&
+        g1_controller_state_array_has_shape(
+            state.trajectory_velocities, trajectory) &&
+        g1_controller_state_array_has_shape(
+            state.trajectory_accelerations, trajectory) &&
+        g1_controller_state_array_has_shape(
+            state.trajectory_angular_velocities, trajectory) &&
+        g1_controller_state_array_has_shape(
+            state.trajectory_desired_rotations, trajectory) &&
+        g1_controller_state_array_has_shape(
+            state.trajectory_rotations, trajectory) &&
+        g1_controller_state_array_has_shape(
+            state.contact_bones, contacts) &&
+        g1_controller_state_array_has_shape(
+            state.contact_states, contacts) &&
+        g1_controller_state_array_has_shape(
+            state.contact_locks, contacts) &&
+        g1_controller_state_array_has_shape(
+            state.contact_positions, contacts) &&
+        g1_controller_state_array_has_shape(
+            state.contact_velocities, contacts) &&
+        g1_controller_state_array_has_shape(
+            state.contact_points, contacts) &&
+        g1_controller_state_array_has_shape(
+            state.contact_targets, contacts) &&
+        g1_controller_state_array_has_shape(
+            state.contact_offset_positions, contacts) &&
+        g1_controller_state_array_has_shape(
+            state.contact_offset_velocities, contacts);
+}
+
+static inline bool g1_controller_state_clone(
+    g1_controller_state& out,
+    const g1_controller_state& source,
+    char* error,
+    int capacity)
+{
+    if (&out == &source) {
+        return true;
+    }
+    g1_controller_state candidate(source);
+    if (!g1_controller_state_is_valid_shape(candidate)) {
+        return scene_error(
+            error, capacity, "controller clone: invalid state shape");
+    }
+    g1_controller_state_swap(out, candidate);
+    return true;
+}
+
 static inline bool g1_controller_state_reset(
     g1_controller_state& out,
     const database& db,

@@ -49,6 +49,7 @@
 #include "g1_runtime_diagnostics.h"
 #include "scene_switch.h"
 #include "motion_match_log.h"
+#include "sonic/cpp/g1_runtime.h"
 #include "cleanup_runtime.h"
 
 #if defined(__GNUC__)
@@ -255,48 +256,6 @@ static bool g1_parse_test_config(
             14 * out.scene_dwell_frames);
     }
     return true;
-}
-
-static motion_match_pose_diagnostic g1_pose_diagnostic(
-    const slice1d<vec3> local_positions,
-    const slice1d<quat> local_rotations,
-    const slice1d<int> parents,
-    const heightfield& terrain)
-{
-    array1d<vec3> positions(local_positions.size);
-    array1d<quat> rotations(local_rotations.size);
-    forward_kinematics_full(
-        positions, rotations, local_positions, local_rotations, parents);
-    motion_match_pose_diagnostic out;
-    out.hips_y = positions(G1_Hips).y;
-    out.hips_clearance = positions(G1_Hips).y - heightfield_sample_v2(
-        terrain, positions(G1_Hips).x, positions(G1_Hips).z);
-    out.left_toe_clearance = positions(G1_LeftToe).y - heightfield_sample_v2(
-        terrain, positions(G1_LeftToe).x, positions(G1_LeftToe).z);
-    out.right_toe_clearance = positions(G1_RightToe).y - heightfield_sample_v2(
-        terrain, positions(G1_RightToe).x, positions(G1_RightToe).z);
-    out.minimum_clearance = out.hips_clearance;
-    const int probes[] = {
-        G1_LeftKnee, G1_RightKnee, G1_LeftAnkle, G1_RightAnkle,
-        G1_LeftToe, G1_RightToe
-    };
-    for (int i = 0; i < 6; ++i) {
-        const vec3 p = positions(probes[i]);
-        out.minimum_clearance = minf(
-            out.minimum_clearance,
-            p.y - heightfield_sample_v2(terrain, p.x, p.z));
-    }
-    return out;
-}
-
-static bool g1_pose_diagnostic_is_finite(
-    const motion_match_pose_diagnostic& diagnostic)
-{
-    return terrain_float_is_finite(diagnostic.hips_y) &&
-           terrain_float_is_finite(diagnostic.hips_clearance) &&
-           terrain_float_is_finite(diagnostic.left_toe_clearance) &&
-           terrain_float_is_finite(diagnostic.right_toe_clearance) &&
-           terrain_float_is_finite(diagnostic.minimum_clearance);
 }
 
 template<typename T>
@@ -523,18 +482,6 @@ static bool g1_matching_features_validate(
         }
     }
     return true;
-}
-
-static int g1_active_range(const database& db, const int frame)
-{
-    for (int range = 0; range < db.nranges(); ++range)
-    {
-        if (frame >= db.range_starts(range) && frame < db.range_stops(range))
-        {
-            return range;
-        }
-    }
-    return -1;
 }
 
 //-------------------------------------- MM_DISCRETE instrumentation
@@ -853,344 +800,6 @@ quat desired_rotation_update(
     }
 }
 
-//--------------------------------------
-
-// Moving the root is a little bit difficult when we have the
-// inertializer set up in the way we do. Essentially we need
-// to also make sure to adjust all of the locations where 
-// we are transforming the data to and from as well as the 
-// offsets being blended out
-void inertialize_root_adjust(
-    vec3& offset_position,
-    vec3& transition_src_position,
-    quat& transition_src_rotation,
-    vec3& transition_dst_position,
-    quat& transition_dst_rotation,
-    vec3& position,
-    quat& rotation,
-    const vec3 input_position,
-    const quat input_rotation)
-{
-    // Find the position difference and add it to the state and transition location
-    vec3 position_difference = input_position - position;
-    position = position_difference + position;
-    transition_dst_position = position_difference + transition_dst_position;
-    
-    // Find the point at which we want to now transition from in the src data
-    transition_src_position = transition_src_position + quat_mul_vec3(transition_src_rotation,
-        quat_inv_mul_vec3(transition_dst_rotation, position - offset_position - transition_dst_position));
-    transition_dst_position = position;
-    offset_position = vec3();
-    
-    // Find the rotation difference. We need to normalize here or some error can accumulate 
-    // over time during adjustment.
-    quat rotation_difference = quat_normalize(quat_mul_inv(input_rotation, rotation));
-    
-    // Apply the rotation difference to the current rotation and transition location
-    rotation = quat_mul(rotation_difference, rotation);
-    transition_dst_rotation = quat_mul(rotation_difference, transition_dst_rotation);
-}
-
-void inertialize_pose_reset(
-    slice1d<vec3> bone_offset_positions,
-    slice1d<vec3> bone_offset_velocities,
-    slice1d<quat> bone_offset_rotations,
-    slice1d<vec3> bone_offset_angular_velocities,
-    vec3& transition_src_position,
-    quat& transition_src_rotation,
-    vec3& transition_dst_position,
-    quat& transition_dst_rotation,
-    const vec3 root_position,
-    const quat root_rotation)
-{
-    bone_offset_positions.zero();
-    bone_offset_velocities.zero();
-    bone_offset_rotations.set(quat());
-    bone_offset_angular_velocities.zero();
-    
-    transition_src_position = root_position;
-    transition_src_rotation = root_rotation;
-    transition_dst_position = vec3();
-    transition_dst_rotation = quat();
-}
-
-// This function transitions the inertializer for 
-// the full character. It takes as input the current 
-// offsets, as well as the root transition locations,
-// current root state, and the full pose information 
-// for the pose being transitioned from (src) as well 
-// as the pose being transitioned to (dst) in their
-// own animation spaces.
-void inertialize_pose_transition(
-    slice1d<vec3> bone_offset_positions,
-    slice1d<vec3> bone_offset_velocities,
-    slice1d<quat> bone_offset_rotations,
-    slice1d<vec3> bone_offset_angular_velocities,
-    vec3& transition_src_position,
-    quat& transition_src_rotation,
-    vec3& transition_dst_position,
-    quat& transition_dst_rotation,
-    const vec3 root_position,
-    const vec3 root_velocity,
-    const quat root_rotation,
-    const vec3 root_angular_velocity,
-    const slice1d<vec3> bone_src_positions,
-    const slice1d<vec3> bone_src_velocities,
-    const slice1d<quat> bone_src_rotations,
-    const slice1d<vec3> bone_src_angular_velocities,
-    const slice1d<vec3> bone_dst_positions,
-    const slice1d<vec3> bone_dst_velocities,
-    const slice1d<quat> bone_dst_rotations,
-    const slice1d<vec3> bone_dst_angular_velocities)
-{
-    // First we record the root position and rotation
-    // in the animation data for the source and destination
-    // animation
-    transition_dst_position = root_position;
-    transition_dst_rotation = root_rotation;
-    transition_src_position = bone_dst_positions(0);
-    transition_src_rotation = bone_dst_rotations(0);
-    
-    // We then find the velocities so we can transition the 
-    // root inertiaizers
-    vec3 world_space_dst_velocity = quat_mul_vec3(transition_dst_rotation, 
-        quat_inv_mul_vec3(transition_src_rotation, bone_dst_velocities(0)));
-    
-    vec3 world_space_dst_angular_velocity = quat_mul_vec3(transition_dst_rotation, 
-        quat_inv_mul_vec3(transition_src_rotation, bone_dst_angular_velocities(0)));
-    
-    // Transition inertializers recording the offsets for 
-    // the root joint
-    inertialize_transition(
-        bone_offset_positions(0),
-        bone_offset_velocities(0),
-        root_position,
-        root_velocity,
-        root_position,
-        world_space_dst_velocity);
-        
-    inertialize_transition(
-        bone_offset_rotations(0),
-        bone_offset_angular_velocities(0),
-        root_rotation,
-        root_angular_velocity,
-        root_rotation,
-        world_space_dst_angular_velocity);
-    
-    // Transition all the inertializers for each other bone
-    for (int i = 1; i < bone_offset_positions.size; i++)
-    {
-        inertialize_transition(
-            bone_offset_positions(i),
-            bone_offset_velocities(i),
-            bone_src_positions(i),
-            bone_src_velocities(i),
-            bone_dst_positions(i),
-            bone_dst_velocities(i));
-            
-        inertialize_transition(
-            bone_offset_rotations(i),
-            bone_offset_angular_velocities(i),
-            bone_src_rotations(i),
-            bone_src_angular_velocities(i),
-            bone_dst_rotations(i),
-            bone_dst_angular_velocities(i));
-    }
-}
-
-// This function updates the inertializer states. Here 
-// it outputs the smoothed animation (input plus offset) 
-// as well as updating the offsets themselves. It takes 
-// as input the current playing animation as well as the 
-// root transition locations, a halflife, and a dt
-void inertialize_pose_update(
-    slice1d<vec3> bone_positions,
-    slice1d<vec3> bone_velocities,
-    slice1d<quat> bone_rotations,
-    slice1d<vec3> bone_angular_velocities,
-    slice1d<vec3> bone_offset_positions,
-    slice1d<vec3> bone_offset_velocities,
-    slice1d<quat> bone_offset_rotations,
-    slice1d<vec3> bone_offset_angular_velocities,
-    const slice1d<vec3> bone_input_positions,
-    const slice1d<vec3> bone_input_velocities,
-    const slice1d<quat> bone_input_rotations,
-    const slice1d<vec3> bone_input_angular_velocities,
-    const vec3 transition_src_position,
-    const quat transition_src_rotation,
-    const vec3 transition_dst_position,
-    const quat transition_dst_rotation,
-    const float halflife,
-    const float dt)
-{
-    // First we find the next root position, velocity, rotation
-    // and rotational velocity in the world space by transforming 
-    // the input animation from it's animation space into the 
-    // space of the currently playing animation.
-    vec3 world_space_position = quat_mul_vec3(transition_dst_rotation, 
-        quat_inv_mul_vec3(transition_src_rotation, 
-            bone_input_positions(0) - transition_src_position)) + transition_dst_position;
-    
-    vec3 world_space_velocity = quat_mul_vec3(transition_dst_rotation, 
-        quat_inv_mul_vec3(transition_src_rotation, bone_input_velocities(0)));
-    
-    // Normalize here because quat inv mul can sometimes produce 
-    // unstable returns when the two rotations are very close.
-    quat world_space_rotation = quat_normalize(quat_mul(transition_dst_rotation, 
-        quat_inv_mul(transition_src_rotation, bone_input_rotations(0))));
-    
-    vec3 world_space_angular_velocity = quat_mul_vec3(transition_dst_rotation, 
-        quat_inv_mul_vec3(transition_src_rotation, bone_input_angular_velocities(0)));
-    
-    // Then we update these two inertializers with these new world space inputs
-    inertialize_update(
-        bone_positions(0),
-        bone_velocities(0),
-        bone_offset_positions(0),
-        bone_offset_velocities(0),
-        world_space_position,
-        world_space_velocity,
-        halflife,
-        dt);
-        
-    inertialize_update(
-        bone_rotations(0),
-        bone_angular_velocities(0),
-        bone_offset_rotations(0),
-        bone_offset_angular_velocities(0),
-        world_space_rotation,
-        world_space_angular_velocity,
-        halflife,
-        dt);        
-    
-    // Then we update the inertializers for the rest of the bones
-    for (int i = 1; i < bone_positions.size; i++)
-    {
-        inertialize_update(
-            bone_positions(i),
-            bone_velocities(i),
-            bone_offset_positions(i),
-            bone_offset_velocities(i),
-            bone_input_positions(i),
-            bone_input_velocities(i),
-            halflife,
-            dt);
-            
-        inertialize_update(
-            bone_rotations(i),
-            bone_angular_velocities(i),
-            bone_offset_rotations(i),
-            bone_offset_angular_velocities(i),
-            bone_input_rotations(i),
-            bone_input_angular_velocities(i),
-            halflife,
-            dt);
-    }
-}
-
-//--------------------------------------
-
-// Copy a part of a feature vector from the 
-// matching database into the query feature vector
-void query_copy_denormalized_feature(
-    slice1d<float> query, 
-    int& offset, 
-    const int size, 
-    const slice1d<float> features,
-    const slice1d<float> features_offset,
-    const slice1d<float> features_scale)
-{
-    for (int i = 0; i < size; i++)
-    {
-        query(offset + i) = features(offset + i) * features_scale(offset + i) + features_offset(offset + i);
-    }
-    
-    offset += size;
-}
-
-// Compute the query feature vector for the current 
-// trajectory controlled by the gamepad.
-void query_compute_trajectory_position_feature(
-    slice1d<float> query, 
-    int& offset, 
-    const vec3 root_position, 
-    const quat root_rotation, 
-    const slice1d<vec3> trajectory_positions)
-{
-    vec3 traj0 = quat_inv_mul_vec3(root_rotation, trajectory_positions(1) - root_position);
-    vec3 traj1 = quat_inv_mul_vec3(root_rotation, trajectory_positions(2) - root_position);
-    vec3 traj2 = quat_inv_mul_vec3(root_rotation, trajectory_positions(3) - root_position);
-    
-    query(offset + 0) = traj0.x;
-    query(offset + 1) = traj0.z;
-    query(offset + 2) = traj1.x;
-    query(offset + 3) = traj1.z;
-    query(offset + 4) = traj2.x;
-    query(offset + 5) = traj2.z;
-    
-    offset += 6;
-}
-
-// Same but for the trajectory direction
-void query_compute_trajectory_direction_feature(
-    slice1d<float> query, 
-    int& offset, 
-    const quat root_rotation, 
-    const slice1d<quat> trajectory_rotations)
-{
-    vec3 traj0 = quat_inv_mul_vec3(root_rotation, quat_mul_vec3(trajectory_rotations(1), vec3(0, 0, 1)));
-    vec3 traj1 = quat_inv_mul_vec3(root_rotation, quat_mul_vec3(trajectory_rotations(2), vec3(0, 0, 1)));
-    vec3 traj2 = quat_inv_mul_vec3(root_rotation, quat_mul_vec3(trajectory_rotations(3), vec3(0, 0, 1)));
-    
-    query(offset + 0) = traj0.x;
-    query(offset + 1) = traj0.z;
-    query(offset + 2) = traj1.x;
-    query(offset + 3) = traj1.z;
-    query(offset + 4) = traj2.x;
-    query(offset + 5) = traj2.z;
-    
-    offset += 6;
-}
-
-//--------------------------------------
-
-// Taken from https://theorangeduck.com/page/spring-roll-call#controllers
-void simulation_positions_update(
-    vec3& position, 
-    vec3& velocity, 
-    vec3& acceleration, 
-    const vec3 desired_velocity, 
-    const float halflife, 
-    const float dt)
-{
-    float y = halflife_to_damping(halflife) / 2.0f; 
-    vec3 j0 = velocity - desired_velocity;
-    vec3 j1 = acceleration + j0*y;
-    float eydt = fast_negexpf(y*dt);
-    
-    vec3 position_prev = position;
-
-    position = eydt*(((-j1)/(y*y)) + ((-j0 - j1*dt)/y)) + 
-        (j1/(y*y)) + j0/y + desired_velocity * dt + position_prev;
-    velocity = eydt*(j0 + j1*dt) + desired_velocity;
-    acceleration = eydt*(acceleration - j1*y*dt);
-    
-}
-
-void simulation_rotations_update(
-    quat& rotation, 
-    vec3& angular_velocity, 
-    const quat desired_rotation, 
-    const float halflife, 
-    const float dt)
-{
-    simple_spring_damper_exact(
-        rotation, 
-        angular_velocity, 
-        desired_rotation, 
-        halflife, dt);
-}
-
 // Predict what the desired velocity will be in the 
 // future. Here we need to use the future trajectory 
 // rotation as well as predicted future camera 
@@ -1224,37 +833,6 @@ void trajectory_desired_velocities_predict(
     }
 }
 
-void trajectory_positions_predict(
-    slice1d<vec3> positions, 
-    slice1d<vec3> velocities, 
-    slice1d<vec3> accelerations, 
-    const vec3 position, 
-    const vec3 velocity, 
-    const vec3 acceleration, 
-    const slice1d<vec3> desired_velocities, 
-    const float halflife,
-    const float dt)
-{
-    positions(0) = position;
-    velocities(0) = velocity;
-    accelerations(0) = acceleration;
-    
-    for (int i = 1; i < positions.size; i++)
-    {
-        positions(i) = positions(i-1);
-        velocities(i) = velocities(i-1);
-        accelerations(i) = accelerations(i-1);
-        
-        simulation_positions_update(
-            positions(i), 
-            velocities(i), 
-            accelerations(i), 
-            desired_velocities(i), 
-            halflife, 
-            dt);
-    }
-}
-
 // Predict desired rotations given the estimated future 
 // camera rotation and other parameters
 void trajectory_desired_rotations_predict(
@@ -1279,29 +857,6 @@ void trajectory_desired_rotations_predict(
                 camera_azimuth, gamepadstick_right, desired_strafe, i * dt),
             desired_strafe,
             desired_velocities(i));
-    }
-}
-
-void trajectory_rotations_predict(
-    slice1d<quat> rotations, 
-    slice1d<vec3> angular_velocities, 
-    const quat rotation, 
-    const vec3 angular_velocity, 
-    const slice1d<quat> desired_rotations, 
-    const float halflife,
-    const float dt)
-{
-    rotations.set(rotation);
-    angular_velocities.set(angular_velocity);
-    
-    for (int i = 1; i < rotations.size; i++)
-    {
-        simulation_rotations_update(
-            rotations(i), 
-            angular_velocities(i), 
-            desired_rotations(i), 
-            halflife, 
-            i * dt);
     }
 }
 
@@ -1548,95 +1103,6 @@ void draw_trajectory(
         DrawLine3D(to_Vector3(trajectory_positions(i-1)), to_Vector3(trajectory_positions(i)), color);
     }
 }
-
-quat adjust_character_rotation(
-    const quat character_rotation,
-    const quat simulation_rotation,
-    const float halflife,
-    const float dt)
-{
-    // Find the difference in rotation (from character to simulation).
-    // Here `quat_abs` forces the quaternion to take the shortest 
-    // path and normalization is required as sometimes taking 
-    // the difference between two very similar rotations can 
-    // introduce numerical instability
-    quat difference_rotation = quat_abs(quat_normalize(
-        quat_mul_inv(simulation_rotation, character_rotation)));
-    
-    // Damp that difference using the given halflife and dt
-    quat adjustment_rotation = damp_adjustment_exact(
-        difference_rotation,
-        halflife,
-        dt);
-    
-    // Apply the damped adjustment to the character
-    return quat_mul(adjustment_rotation, character_rotation);
-}
-
-quat adjust_character_rotation_by_velocity(
-    const quat character_rotation,
-    const vec3 character_angular_velocity,
-    const quat simulation_rotation,
-    const float max_adjustment_ratio,
-    const float halflife,
-    const float dt)
-{
-    // Find and damp the desired rotational adjustment
-    quat adjustment_rotation = damp_adjustment_exact(
-        quat_abs(quat_normalize(quat_mul_inv(
-            simulation_rotation, character_rotation))),
-        halflife,
-        dt);
-    
-    // If the length of the adjustment is greater than the angular velocity 
-    // multiplied by the ratio then we need to clamp this adjustment
-    float max_length = max_adjustment_ratio *
-        length(character_angular_velocity) * dt;
-    
-    if (length(quat_to_scaled_angle_axis(adjustment_rotation)) > max_length)
-    {
-        // To clamp can convert to scaled angle axis, rescale, and convert back
-        adjustment_rotation = quat_from_scaled_angle_axis(max_length * 
-            normalize(quat_to_scaled_angle_axis(adjustment_rotation)));
-    }
-    
-    // Apply the adjustment
-    return quat_mul(adjustment_rotation, character_rotation);
-}
-
-//--------------------------------------
-
-quat clamp_character_rotation(
-    const quat character_rotation,
-    const quat simulation_rotation,
-    const float max_angle)
-{
-    // If the angle between the character rotation and simulation 
-    // rotation exceeds the threshold we need to clamp it back
-    if (quat_angle_between(character_rotation, simulation_rotation) > max_angle)
-    {
-        // First, find the rotational difference between the two
-        quat diff = quat_abs(quat_mul_inv(
-            character_rotation, simulation_rotation));
-        
-        // We can then decompose it into angle and axis
-        float diff_angle; vec3 diff_axis;
-        quat_to_angle_axis(diff, diff_angle, diff_axis);
-        
-        // We then clamp the angle to within our bounds
-        diff_angle = clampf(diff_angle, -max_angle, max_angle);
-        
-        // And apply back the clamped rotation
-        return quat_mul(
-          quat_from_angle_axis(diff_angle, diff_axis), simulation_rotation);
-    }
-    else
-    {
-        return character_rotation;
-    }
-}
-
-//--------------------------------------
 
 void update_callback(void* args)
 {
@@ -2237,12 +1703,6 @@ int main(void)
             }
         }
 
-        state.transitioned = false;
-        state.adjustment_xz = 0.0f;
-        state.adjustment_y = 0.0f;
-        state.clamp_xz = 0.0f;
-        state.clamp_y = 0.0f;
-
 #ifdef MM_DISCRETE
         if (test_config.mode == G1_TestLive) {
         // Camera-azimuth scripting. MM_MODE selects the pattern:
@@ -2361,295 +1821,9 @@ int main(void)
             desired_rotation_curr = test_heading.heading;
         }
 
-        traversability_diagnostics traversal = {};
-        desired_velocity_curr = traversability_limit_command(
-            state.traversal_speed_scale,
-            state.traversal_speed_scale_velocity,
-            traversal,
-            active_scene.walkability,
-            active_scene.terrain,
-            state.simulation_position,
-            commanded_velocity,
-            dt);
-        if (!g1_runtime_traversal_is_finite(traversal) ||
-            !terrain_float_is_finite(desired_velocity_curr.x) ||
-            !terrain_float_is_finite(desired_velocity_curr.y) ||
-            !terrain_float_is_finite(desired_velocity_curr.z))
-        {
-            controlled_runtime_error(
-                "command traversal produced non-finite diagnostics");
-            return;
-        }
-        traversability_stop_blocked_planar_dynamics(
-            traversal,
-            state.simulation_velocity,
-            state.simulation_acceleration);
-        state.blocked = traversal.blocked;
-        state.walkability_class = traversal.walkability_class;
-        state.blocked_distance = traversal.distance;
-        state.blocked_point = traversal.point;
-        
-        // Check if we should force a search because input changed quickly
-        state.desired_velocity_change_prev = state.desired_velocity_change_curr;
-        state.desired_velocity_change_curr =  (desired_velocity_curr - state.desired_velocity) / dt;
-        state.desired_velocity = desired_velocity_curr;
-        g1_controller_state_seed_first_frame_desired_velocity(state);
-        
-        state.desired_rotation_change_prev = state.desired_rotation_change_curr;
-        state.desired_rotation_change_curr = quat_to_scaled_angle_axis(quat_abs(quat_mul_inv(desired_rotation_curr, state.desired_rotation))) / dt;
-        state.desired_rotation =  desired_rotation_curr;
-
-        bool force_search = false;
-
-        if (state.force_search_timer <= 0.0f && (
-            (length(state.desired_velocity_change_prev) >= desired_velocity_change_threshold &&
-             length(state.desired_velocity_change_curr)  < desired_velocity_change_threshold)
-        ||  (length(state.desired_rotation_change_prev) >= desired_rotation_change_threshold &&
-             length(state.desired_rotation_change_curr)  < desired_rotation_change_threshold)))
-        {
-            force_search = true;
-            state.force_search_timer = state.search_time;
-        }
-        else if (state.force_search_timer > 0)
-        {
-            state.force_search_timer -= dt;
-        }
-        
-        // Predict and publish the complete future trajectory transactionally.
-        G1CommandIntent command_intent;
-        command_intent.requested_velocity = commanded_velocity;
-        command_intent.desired_heading = desired_rotation_curr;
-
-        G1CommandFramePrediction frame_seed = {};
-        frame_seed.command = state.command;
-        for (int index = 0;
-             index < G1CommandTrajectorySampleCount;
-             ++index) {
-            frame_seed.command.predicted_desired_velocities[index] =
-                state.trajectory_desired_velocities(index);
-            frame_seed.command.predicted_root_positions[index] =
-                state.trajectory_positions(index);
-            frame_seed.command.predicted_root_rotations[index] =
-                state.trajectory_rotations(index);
-            frame_seed.command.predicted_desired_headings[index] =
-                state.trajectory_desired_rotations(index);
-            frame_seed.predicted_root_velocities[index] =
-                state.trajectory_velocities(index);
-            frame_seed.predicted_root_accelerations[index] =
-                state.trajectory_accelerations(index);
-            frame_seed.predicted_root_angular_velocities[index] =
-                state.trajectory_angular_velocities(index);
-        }
-
-        G1CommandFramePredictionRequest frame_request;
-        frame_request.route_mode = test_config.mode == G1_TestRoute;
-        frame_request.heading_override = test_heading;
-        frame_request.intent = command_intent;
-        frame_request.applied_velocity = desired_velocity_curr;
-
-        G1CommandFramePrediction frame_prediction;
-        if (!g1_command_frame_prediction_build(
-                frame_prediction,
-                frame_seed,
-                frame_request,
-                [&](slice1d<vec3> desired_velocities,
-                    bool& route_force_search,
-                    char* callback_error,
-                    int callback_capacity) {
-                    deterministic_route_prediction prediction;
-                    if (!deterministic_route_predict_commands(
-                            prediction,
-                            active_scene.metadata.routes[
-                                static_cast<size_t>(state.route_index)],
-                            state.route_frames,
-                            desired_velocity_curr,
-                            dt,
-                            0.50f,
-                            trajectory_sample_time,
-                            state.traversal_speed_scale,
-                            false,
-                            callback_error,
-                            callback_capacity)) {
-                        return false;
-                    }
-                    for (int index = 0;
-                         index < G1CommandTrajectorySampleCount;
-                         ++index) {
-                        desired_velocities(index) = prediction.commands[index];
-                    }
-                    route_force_search = prediction.force_search;
-                    return true;
-                },
-                [&](slice1d<quat> desired_rotations,
-                    const slice1d<vec3> desired_velocities,
-                    char*, int) {
-                    trajectory_desired_rotations_predict(
-                        desired_rotations,
-                        desired_velocities,
-                        state.desired_rotation,
-                        state.camera_azimuth,
-                        gamepadstick_left,
-                        gamepadstick_right,
-                        desired_strafe,
-                        trajectory_sample_time);
-                    return true;
-                },
-                [&](slice1d<quat> rotations,
-                    slice1d<vec3> angular_velocities,
-                    const slice1d<quat> desired_rotations,
-                    const slice1d<vec3>,
-                    char*, int) {
-                    trajectory_rotations_predict(
-                        rotations,
-                        angular_velocities,
-                        state.simulation_rotation,
-                        state.simulation_angular_velocity,
-                        desired_rotations,
-                        simulation_rotation_halflife,
-                        trajectory_sample_time);
-                    return true;
-                },
-                [&](slice1d<vec3> desired_velocities,
-                    const slice1d<quat> rotations,
-                    char*, int) {
-                    trajectory_desired_velocities_predict(
-                        desired_velocities,
-                        rotations,
-                        state.desired_velocity,
-                        state.camera_azimuth,
-                        gamepadstick_left,
-                        gamepadstick_right,
-                        desired_strafe,
-                        simulation_fwrd_speed * state.traversal_speed_scale,
-                        simulation_side_speed * state.traversal_speed_scale,
-                        simulation_back_speed * state.traversal_speed_scale,
-                        trajectory_sample_time);
-                    return true;
-                },
-                [&](slice1d<vec3> positions,
-                    slice1d<vec3> velocities,
-                    slice1d<vec3> accelerations,
-                    const slice1d<vec3> desired_velocities,
-                    char*, int) {
-                    trajectory_positions_predict(
-                        positions,
-                        velocities,
-                        accelerations,
-                        state.simulation_position,
-                        state.simulation_velocity,
-                        state.simulation_acceleration,
-                        desired_velocities,
-                        simulation_velocity_halflife,
-                        trajectory_sample_time);
-                    return true;
-                },
-                artifact_error,
-                static_cast<int>(sizeof(artifact_error)))) {
-            controlled_runtime_error(artifact_error);
-            return;
-        }
-
-        state.command = frame_prediction.command;
-        for (int index = 0;
-             index < G1CommandTrajectorySampleCount;
-             ++index) {
-            state.trajectory_desired_velocities(index) =
-                frame_prediction.command.predicted_desired_velocities[index];
-            state.trajectory_positions(index) =
-                frame_prediction.command.predicted_root_positions[index];
-            state.trajectory_rotations(index) =
-                frame_prediction.command.predicted_root_rotations[index];
-            state.trajectory_desired_rotations(index) =
-                frame_prediction.command.predicted_desired_headings[index];
-            state.trajectory_velocities(index) =
-                frame_prediction.predicted_root_velocities[index];
-            state.trajectory_accelerations(index) =
-                frame_prediction.predicted_root_accelerations[index];
-            state.trajectory_angular_velocities(index) =
-                frame_prediction.predicted_root_angular_velocities[index];
-        }
-        force_search = force_search || frame_prediction.force_search;
-           
-        // Make query vector for search.
-        // In theory this only needs to be done when a search is 
-        // actually required however for visualization purposes it
-        // can be nice to do it every frame
-        array1d<float> query(db.nfeatures());
-                
-        // Compute the features of the query vector
-
-        slice1d<float> query_features = lmm_enabled ? slice1d<float>(features_curr) : db.features(state.frame_index);
-
-        int offset = 0;
-        query_copy_denormalized_feature(query, offset, 3, query_features, db.features_offset, db.features_scale); // Left Foot Position
-        query_copy_denormalized_feature(query, offset, 3, query_features, db.features_offset, db.features_scale); // Right Foot Position
-        query_copy_denormalized_feature(query, offset, 3, query_features, db.features_offset, db.features_scale); // Left Foot Velocity
-        query_copy_denormalized_feature(query, offset, 3, query_features, db.features_offset, db.features_scale); // Right Foot Velocity
-        query_copy_denormalized_feature(query, offset, 3, query_features, db.features_offset, db.features_scale); // Hip Velocity
-        query_compute_trajectory_position_feature(query, offset, state.bone_positions(0), state.bone_rotations(0), state.trajectory_positions);
-        query_compute_trajectory_direction_feature(query, offset, state.bone_rotations(0), state.trajectory_rotations);
-
-        const int query_database_frame = state.frame_index;
-        const int query_range = g1_active_range(db, query_database_frame);
-        if (active_scene.terrain.version != 2 ||
-            !terrain_heightfield_is_queryable(active_scene.terrain) ||
-            !terrain_centerline_inputs_are_valid(
-                state.bone_positions(0),
-                state.trajectory_positions,
-                state.trajectory_rotations)) {
-            controlled_runtime_error(
-                "terrain centerline inputs are invalid");
-            return;
-        }
-        terrain_centerline_snapshot terrain_query_snapshot = {};
-        terrain_centerline_snapshot_compute_v2(
-            terrain_query_snapshot,
-            active_scene.terrain,
-            state.bone_positions(0),
-            state.trajectory_positions,
-            state.trajectory_rotations);
-        if (!terrain_centerline_snapshot_apply_walkability_v2(
-                terrain_query_snapshot,
-                active_scene.terrain,
-                active_scene.walkability,
-                state.bone_positions(0),
-                state.simulation_position,
-                0.20f)) {
-            controlled_runtime_error(
-                "terrain centerline walkability mask is invalid");
-            return;
-        }
-        for (int terrain_feature = 0; terrain_feature < 4; ++terrain_feature) {
-            const vec3 point = terrain_query_snapshot.points[terrain_feature];
-            if (!terrain_float_is_finite(
-                    terrain_query_snapshot.values[terrain_feature]) ||
-                !terrain_float_is_finite(point.x) ||
-                !terrain_float_is_finite(point.y) ||
-                !terrain_float_is_finite(point.z)) {
-                snprintf(
-                    artifact_error,
-                    sizeof(artifact_error),
-                    "terrain query snapshot %d is invalid",
-                    terrain_feature);
-                controlled_runtime_error(artifact_error);
-                return;
-            }
-        }
-        for (int terrain_feature = 0; terrain_feature < 4; ++terrain_feature)
-        {
-            query(offset++) = terrain_query_snapshot.values[terrain_feature];
-        }
-
-        assert(offset == db.nfeatures());
-        if (!motion_match_query_is_finite_31d(query)) {
-            controlled_runtime_error(
-                "expected exactly 31 finite query values");
-            return;
-        }
-
-        // Check if we reached the end of the current anim
-        bool end_of_anim = database_trajectory_index_clamp(db, state.frame_index, 1) == state.frame_index;
-        if (test_config.mode == G1_TestSequential && end_of_anim) {
+        if (test_config.mode == G1_TestSequential &&
+            database_trajectory_index_clamp(db, state.frame_index, 1) ==
+                state.frame_index) {
             snprintf(
                 artifact_error,
                 sizeof(artifact_error),
@@ -2660,28 +1834,198 @@ int main(void)
             controlled_runtime_error(artifact_error);
             return;
         }
-        const bool matching_enabled = test_config.mode != G1_TestSequential;
-        state.searched = matching_enabled &&
-            (force_search || state.search_timer <= 0.0f || end_of_anim);
-        state.incumbent_cost = 0.0f;
-        state.selected_cost = 0.0f;
-        state.selected_terrain_error = 0.0f;
-        state.incumbent_cost = end_of_anim
-            ? FLT_MAX : database_frame_cost(db, state.frame_index, query);
-        state.selected_cost = state.incumbent_cost;
-        state.selected_terrain_error = database_raw_terrain_error(
-            db, state.frame_index, query);
-        int selected_database_frame = query_database_frame;
-        
-        // Do we need to search?
-#ifdef MM_DISCRETE
-        int   dbg_best_index = state.frame_index;   // -1 == no search this frame
-        bool  dbg_did_search = state.searched;
-        bool  dbg_did_transition = false;
-        quat  dbg_root_before = state.bone_rotations(0);
-        quat  dbg_off_before  = state.bone_offset_rotations(0);
-        quat  dbg_trns_dst_rot = state.trns_bone_rotations(0);
-#endif
+
+        const bool matching_enabled =
+            test_config.mode != G1_TestSequential;
+        g1_runtime_config runtime_config;
+        runtime_config.dt = dt;
+        runtime_config.trajectory_sample_time = trajectory_sample_time;
+        runtime_config.inertialize_blending_halflife =
+            inertialize_blending_halflife;
+        runtime_config.desired_velocity_change_threshold =
+            desired_velocity_change_threshold;
+        runtime_config.desired_rotation_change_threshold =
+            desired_rotation_change_threshold;
+        runtime_config.simulation_velocity_halflife =
+            simulation_velocity_halflife;
+        runtime_config.simulation_rotation_halflife =
+            simulation_rotation_halflife;
+        runtime_config.adjustment_position_halflife =
+            adjustment_position_halflife;
+        runtime_config.adjustment_rotation_halflife =
+            adjustment_rotation_halflife;
+        runtime_config.adjustment_position_max_ratio =
+            adjustment_position_max_ratio;
+        runtime_config.adjustment_rotation_max_ratio =
+            adjustment_rotation_max_ratio;
+        runtime_config.clamping_max_distance = clamping_max_distance;
+        runtime_config.clamping_max_angle = clamping_max_angle;
+        runtime_config.synchronization_enabled = synchronization_enabled;
+        runtime_config.adjustment_enabled = adjustment_enabled;
+        runtime_config.adjustment_by_velocity_enabled =
+            adjustment_by_velocity_enabled;
+        runtime_config.clamping_enabled = clamping_enabled;
+
+        g1_runtime_step_request runtime_request;
+        runtime_request.mode = test_config.mode == G1_TestRoute
+            ? G1RuntimeRoute
+            : G1RuntimeVisual;
+        runtime_request.requested_velocity_holden = commanded_velocity;
+        runtime_request.desired_heading_holden = desired_rotation_curr;
+        runtime_request.matching_enabled = matching_enabled;
+
+        const auto visual_prediction_builder =
+            [&](G1CommandFramePrediction& frame_prediction,
+                const G1CommandFramePrediction& frame_seed,
+                const G1CommandFramePredictionRequest& frame_request,
+                g1_controller_state& runtime_state,
+                const g1_runtime_config& step_config,
+                char* callback_error,
+                int callback_capacity)
+            {
+                G1CommandFramePredictionRequest adapter_request =
+                    frame_request;
+                adapter_request.heading_override = test_heading;
+                return g1_command_frame_prediction_build(
+                    frame_prediction,
+                    frame_seed,
+                    adapter_request,
+                    [&](slice1d<vec3> desired_velocities,
+                        bool& route_force_search,
+                        char* route_error,
+                        int route_capacity) {
+                        deterministic_route_prediction prediction;
+                        if (!deterministic_route_predict_commands(
+                                prediction,
+                                active_scene.metadata.routes[
+                                    static_cast<size_t>(
+                                        runtime_state.route_index)],
+                                runtime_state.route_frames,
+                                runtime_state.desired_velocity,
+                                step_config.dt,
+                                0.50f,
+                                step_config.trajectory_sample_time,
+                                runtime_state.traversal_speed_scale,
+                                false,
+                                route_error,
+                                route_capacity)) {
+                            return false;
+                        }
+                        for (int index = 0;
+                             index < G1CommandTrajectorySampleCount;
+                             ++index) {
+                            desired_velocities(index) =
+                                prediction.commands[index];
+                        }
+                        route_force_search = prediction.force_search;
+                        return true;
+                    },
+                    [&](slice1d<quat> desired_rotations,
+                        const slice1d<vec3> desired_velocities,
+                        char*, int) {
+                        trajectory_desired_rotations_predict(
+                            desired_rotations,
+                            desired_velocities,
+                            runtime_state.desired_rotation,
+                            runtime_state.camera_azimuth,
+                            gamepadstick_left,
+                            gamepadstick_right,
+                            desired_strafe,
+                            step_config.trajectory_sample_time);
+                        return true;
+                    },
+                    [&](slice1d<quat> rotations,
+                        slice1d<vec3> angular_velocities,
+                        const slice1d<quat> desired_rotations,
+                        const slice1d<vec3>,
+                        char*, int) {
+                        trajectory_rotations_predict(
+                            rotations,
+                            angular_velocities,
+                            runtime_state.simulation_rotation,
+                            runtime_state.simulation_angular_velocity,
+                            desired_rotations,
+                            step_config.simulation_rotation_halflife,
+                            step_config.trajectory_sample_time);
+                        return true;
+                    },
+                    [&](slice1d<vec3> desired_velocities,
+                        const slice1d<quat> rotations,
+                        char*, int) {
+                        trajectory_desired_velocities_predict(
+                            desired_velocities,
+                            rotations,
+                            runtime_state.desired_velocity,
+                            runtime_state.camera_azimuth,
+                            gamepadstick_left,
+                            gamepadstick_right,
+                            desired_strafe,
+                            simulation_fwrd_speed *
+                                runtime_state.traversal_speed_scale,
+                            simulation_side_speed *
+                                runtime_state.traversal_speed_scale,
+                            simulation_back_speed *
+                                runtime_state.traversal_speed_scale,
+                            step_config.trajectory_sample_time);
+                        return true;
+                    },
+                    [&](slice1d<vec3> positions,
+                        slice1d<vec3> velocities,
+                        slice1d<vec3> accelerations,
+                        const slice1d<vec3> desired_velocities,
+                        char*, int) {
+                        trajectory_positions_predict(
+                            positions,
+                            velocities,
+                            accelerations,
+                            runtime_state.simulation_position,
+                            runtime_state.simulation_velocity,
+                            runtime_state.simulation_acceleration,
+                            desired_velocities,
+                            step_config.simulation_velocity_halflife,
+                            step_config.trajectory_sample_time);
+                        return true;
+                    },
+                    callback_error,
+                    callback_capacity);
+            };
+
+        g1_runtime_step_result runtime_result;
+        if (!g1_runtime_step(
+                runtime_result,
+                state,
+                db,
+                support_rows,
+                active_scene,
+                runtime_request,
+                runtime_config,
+                visual_prediction_builder,
+                artifact_error,
+                static_cast<int>(sizeof(artifact_error)))) {
+            controlled_runtime_error(artifact_error);
+            return;
+        }
+
+        const traversability_diagnostics traversal =
+            runtime_result.traversal;
+        const int query_database_frame =
+            runtime_result.query_database_frame;
+        const int selected_database_frame =
+            runtime_result.selected_database_frame;
+        const int query_range = runtime_result.query_range;
+        const terrain_centerline_snapshot terrain_query_snapshot =
+            runtime_result.terrain;
+        const motion_match_pose_diagnostic raw_selected_diagnostic =
+            runtime_result.raw_selected;
+        const motion_match_pose_diagnostic inertialized_diagnostic =
+            runtime_result.inertialized;
+        const motion_match_pose_diagnostic rendered_diagnostic =
+            runtime_result.projected;
+        const slice1d<float> query(31, runtime_result.query);
+
+        // Keep Holden's dormant learned matcher type-checked in the visual
+        // translation unit. G1 never enables or exposes this branch; the
+        // renderer-free runtime owns only the ordinary database matcher.
         if (state.searched)
         {
             if (lmm_enabled)
@@ -2749,80 +2093,7 @@ int main(void)
                     latent_curr = latent_proj;
                 }
             }
-            else
-            {
-                // Search
-                
-                const int prior_index = state.frame_index;
-                int best_index = end_of_anim ? -1 : prior_index;
-                float best_cost = FLT_MAX;
-                const float transition_cost =
-                    g1_idle_match_transition_cost(
-                        traversal.commanded_speed,
-                        walkability_xz_length(state.simulation_velocity));
-                
-                database_search(
-                    best_index,
-                    best_cost,
-                    db,
-                    query,
-                    transition_cost);
-                selected_database_frame = best_index;
-                if (best_index != prior_index) {
-                    state.selected_cost = best_cost;
-                    state.selected_terrain_error = database_raw_terrain_error(
-                        db, best_index, query);
-                }
-                
-                // Transition if better frame found
-                
-                if (best_index != prior_index)
-                {
-                    state.transitioned = true;
-                    state.trns_bone_positions = db.bone_positions(best_index);
-                    state.trns_bone_velocities = db.bone_velocities(best_index);
-                    state.trns_bone_rotations = db.bone_rotations(best_index);
-                    state.trns_bone_angular_velocities = db.bone_angular_velocities(best_index);
-                    
-                    inertialize_pose_transition(
-                        state.bone_offset_positions,
-                        state.bone_offset_velocities,
-                        state.bone_offset_rotations,
-                        state.bone_offset_angular_velocities,
-                        state.transition_src_position,
-                        state.transition_src_rotation,
-                        state.transition_dst_position,
-                        state.transition_dst_rotation,
-                        state.bone_positions(0),
-                        state.bone_velocities(0),
-                        state.bone_rotations(0),
-                        state.bone_angular_velocities(0),
-                        state.curr_bone_positions,
-                        state.curr_bone_velocities,
-                        state.curr_bone_rotations,
-                        state.curr_bone_angular_velocities,
-                        state.trns_bone_positions,
-                        state.trns_bone_velocities,
-                        state.trns_bone_rotations,
-                        state.trns_bone_angular_velocities);
-                    
-                    state.frame_index = best_index;
-#ifdef MM_DISCRETE
-                    dbg_did_transition = true;
-                    dbg_trns_dst_rot = state.trns_bone_rotations(0);
-#endif
-                }
-#ifdef MM_DISCRETE
-                dbg_best_index = best_index;
-#endif
-            }
-
-            // Reset search timer
-            state.search_timer = state.search_time;
         }
-        
-        // Tick down search timer
-        state.search_timer -= dt;
 
         if (lmm_enabled)
         {
@@ -2849,311 +2120,11 @@ int main(void)
                 decompressor,
                 dt);
         }
-        else
-        {
-            // Tick frame
-            state.frame_index = database_trajectory_index_clamp(
-                db, state.frame_index, 1);
-            
-            // Look-up Next Pose
-            state.curr_bone_positions = db.bone_positions(state.frame_index);
-            state.curr_bone_velocities = db.bone_velocities(state.frame_index);
-            state.curr_bone_rotations = db.bone_rotations(state.frame_index);
-            state.curr_bone_angular_velocities = db.bone_angular_velocities(state.frame_index);
-            state.curr_bone_contacts = db.contact_states(state.frame_index);
-        }
-        
-        // Update inertializer
-        
-        inertialize_pose_update(
-            state.bone_positions,
-            state.bone_velocities,
-            state.bone_rotations,
-            state.bone_angular_velocities,
-            state.bone_offset_positions,
-            state.bone_offset_velocities,
-            state.bone_offset_rotations,
-            state.bone_offset_angular_velocities,
-            state.curr_bone_positions,
-            state.curr_bone_velocities,
-            state.curr_bone_rotations,
-            state.curr_bone_angular_velocities,
-            state.transition_src_position,
-            state.transition_src_rotation,
-            state.transition_dst_position,
-            state.transition_dst_rotation,
-            inertialize_blending_halflife,
-            dt);
-
-        motion_match_pose_diagnostic raw_selected_diagnostic;
-        motion_match_pose_diagnostic inertialized_diagnostic;
-        array1d<vec3> raw_selected_positions(state.curr_bone_positions);
-        array1d<quat> raw_selected_rotations(state.curr_bone_rotations);
-        raw_selected_positions(0) = state.bone_positions(0);
-        raw_selected_rotations(0) = state.bone_rotations(0);
-        raw_selected_diagnostic = g1_pose_diagnostic(
-            raw_selected_positions, raw_selected_rotations,
-            db.bone_parents, active_scene.terrain);
-        inertialized_diagnostic = g1_pose_diagnostic(
-            state.bone_positions, state.bone_rotations,
-            db.bone_parents, active_scene.terrain);
-        if (!g1_pose_diagnostic_is_finite(raw_selected_diagnostic) ||
-            !g1_pose_diagnostic_is_finite(inertialized_diagnostic) ||
-            !terrain_float_is_finite(state.incumbent_cost) ||
-            !terrain_float_is_finite(state.selected_cost) ||
-            !terrain_float_is_finite(state.selected_terrain_error))
-        {
-            controlled_runtime_error(
-                "motion costs or pose diagnostics are non-finite");
-            return;
-        }
-        
-        // Update Simulation
-        
-        const vec3 simulation_before = state.simulation_position;
-        simulation_positions_update(
-            state.simulation_position,
-            state.simulation_velocity,
-            state.simulation_acceleration,
-            state.desired_velocity,
-            simulation_velocity_halflife,
-            dt);
-        const walkability_sweep_result integrated_traversal = traversability_preflight_step(
-            simulation_before,
-            state.simulation_position,
-            state.simulation_velocity,
-            state.simulation_acceleration,
-            active_scene.walkability,
-            active_scene.terrain,
-            0.20f);
-        if (integrated_traversal.blocked) {
-            traversability_apply_sweep_result(
-                simulation_before,
-                state.simulation_position,
-                state.simulation_velocity,
-                state.simulation_acceleration,
-                traversal,
-                integrated_traversal);
-        }
-        walkability_reason current_reason = walkability_clear;
-        const int current_walkability_class = walkability_footprint_class(
-            active_scene.walkability,
-            active_scene.terrain,
-            state.simulation_position.x,
-            state.simulation_position.z,
-            0.20f,
-            current_reason);
-        state.blocked = traversal.blocked;
-        state.blocked_distance = traversal.distance;
-        state.blocked_point = traversal.point;
-        state.walkability_class = current_walkability_class;
-        if (!g1_runtime_traversal_is_finite(traversal) ||
-            state.walkability_class < 0 || state.walkability_class > 2 ||
-            !terrain_float_is_finite(state.simulation_position.x) ||
-            !terrain_float_is_finite(state.simulation_position.y) ||
-            !terrain_float_is_finite(state.simulation_position.z))
-        {
-            controlled_runtime_error(
-                "integrated traversal or simulation state is invalid");
-            return;
-        }
-            
-        simulation_rotations_update(
-            state.simulation_rotation,
-            state.simulation_angular_velocity,
-            state.desired_rotation,
-            simulation_rotation_halflife,
-            dt);
-
-        // Observe the active-scene world level from the fully inertialized,
-        // support-local pose. Matching and simulation XZ are complete before
-        // this downstream world-Y transform is updated.
-        forward_kinematics_full(
-            state.global_bone_positions,
-            state.global_bone_rotations,
-            state.bone_positions,
-            state.bone_rotations,
-            db.bone_parents);
-        if (!support_observation_build_walkable(
-                state.support_observation_now,
-                support_rows,
-                state.frame_index,
-                active_scene.terrain,
-                active_scene.walkability,
-                state.global_bone_positions(G1_Simulation),
-                state.global_bone_positions(G1_LeftToe),
-                state.global_bone_positions(G1_RightToe),
-                state.curr_bone_contacts(0),
-                state.curr_bone_contacts(1),
-                artifact_error,
-                static_cast<int>(sizeof(artifact_error))) ||
-            !support_frame_update(
-                state.support,
-                state.support_observation_now,
-                state.transitioned,
-                dt,
-                artifact_error,
-                static_cast<int>(sizeof(artifact_error))))
-        {
-            controlled_runtime_error(artifact_error);
-            return;
-        }
-        if (!support_observation_is_finite(state.support_observation_now) ||
-            !g1_runtime_support_state_is_finite(state.support))
-        {
-            controlled_runtime_error(
-                "support observation or state is non-finite");
-            return;
-        }
-        
-        // Synchronization 
-        
-        if (synchronization_enabled)
-        {
-            vec3 synchronized_position = lerp(
-                state.simulation_position,
-                state.bone_positions(0),
-                synchronization_data_factor);
-                
-            quat synchronized_rotation = quat_nlerp_shortest(
-                state.simulation_rotation,
-                state.bone_rotations(0),
-                synchronization_data_factor);
-          
-            state.simulation_position = synchronized_position;
-            state.simulation_rotation = synchronized_rotation;
-            
-            inertialize_root_adjust(
-                state.bone_offset_positions(0),
-                state.transition_src_position,
-                state.transition_src_rotation,
-                state.transition_dst_position,
-                state.transition_dst_rotation,
-                state.bone_positions(0),
-                state.bone_rotations(0),
-                synchronized_position,
-                synchronized_rotation);
-        }
-        
-        // Adjustment 
-        
-        if (!synchronization_enabled && adjustment_enabled)
-        {
-            const vec3 before_adjustment =
-                state.bone_positions(G1_Simulation);
-            vec3 adjusted_position;
-            quat adjusted_rotation = state.bone_rotations(G1_Simulation);
-            
-            if (adjustment_by_velocity_enabled)
-            {
-                adjusted_position =
-                    horizontal_adjust_character_position_by_velocity(
-                    before_adjustment,
-                    state.bone_velocities(G1_Simulation),
-                    state.simulation_position,
-                    adjustment_position_max_ratio,
-                    adjustment_position_halflife,
-                    dt);
-                
-                adjusted_rotation = adjust_character_rotation_by_velocity(
-                    state.bone_rotations(G1_Simulation),
-                    state.bone_angular_velocities(G1_Simulation),
-                    state.simulation_rotation,
-                    adjustment_rotation_max_ratio,
-                    adjustment_rotation_halflife,
-                    dt);
-            }
-            else
-            {
-                adjusted_position = horizontal_adjust_character_position(
-                    before_adjustment,
-                    state.simulation_position,
-                    adjustment_position_halflife,
-                    dt);
-                
-                adjusted_rotation = adjust_character_rotation(
-                    state.bone_rotations(G1_Simulation),
-                    state.simulation_rotation,
-                    adjustment_rotation_halflife,
-                    dt);
-            }
-
-            state.adjustment_xz =
-                horizontal_length(adjusted_position - before_adjustment);
-            state.adjustment_y =
-                adjusted_position.y - before_adjustment.y;
-            inertialize_root_adjust(
-                state.bone_offset_positions(G1_Simulation),
-                state.transition_src_position,
-                state.transition_src_rotation,
-                state.transition_dst_position,
-                state.transition_dst_rotation,
-                state.bone_positions(G1_Simulation),
-                state.bone_rotations(G1_Simulation),
-                adjusted_position,
-                adjusted_rotation);
-        }
-        
-        // Clamping
-        
-        if (!synchronization_enabled && clamping_enabled)
-        {
-            const vec3 before_clamp = state.bone_positions(G1_Simulation);
-            vec3 adjusted_position = horizontal_clamp_character_position(
-                before_clamp,
-                state.simulation_position,
-                clamping_max_distance);
-            quat adjusted_rotation = state.bone_rotations(G1_Simulation);
-            
-            adjusted_rotation = clamp_character_rotation(
-                adjusted_rotation,
-                state.simulation_rotation,
-                clamping_max_angle);
-
-            state.clamp_xz =
-                horizontal_length(adjusted_position - before_clamp);
-            state.clamp_y = adjusted_position.y - before_clamp.y;
-            inertialize_root_adjust(
-                state.bone_offset_positions(G1_Simulation),
-                state.transition_src_position,
-                state.transition_src_rotation,
-                state.transition_dst_position,
-                state.transition_dst_rotation,
-                state.bone_positions(G1_Simulation),
-                state.bone_rotations(G1_Simulation),
-                adjusted_position,
-                adjusted_rotation);
-        }
-
-        if (state.adjustment_y != 0.0f || state.clamp_y != 0.0f)
-        {
-            controlled_runtime_error("horizontal-root invariant failed");
-            return;
-        }
-
-        state.adjusted_bone_rotations = state.bone_rotations;
-        support_pose_apply(
-            state.adjusted_bone_positions,
-            state.bone_positions,
-            state.support.height);
-        forward_kinematics_full(
-            state.global_bone_positions,
-            state.global_bone_rotations,
-            state.adjusted_bone_positions,
-            state.adjusted_bone_rotations,
-            db.bone_parents);
-
-        const motion_match_pose_diagnostic rendered_diagnostic =
-            g1_pose_diagnostic(
-                state.adjusted_bone_positions,
-                state.adjusted_bone_rotations,
-                db.bone_parents,
-                active_scene.terrain);
-        if (!g1_pose_diagnostic_is_finite(rendered_diagnostic)) {
-            controlled_runtime_error(
-                "final support-retargeted pose diagnostic is non-finite");
-            return;
-        }
+#ifdef MM_DISCRETE
+        const int dbg_best_index = selected_database_frame;
+        const bool dbg_did_search = state.searched;
+        const bool dbg_did_transition = state.transitioned;
+#endif
 
         g1_runtime_diagnostic_snapshot snapshot_candidate;
         if (!g1_runtime_diagnostics_build(
