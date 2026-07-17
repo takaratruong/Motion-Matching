@@ -604,6 +604,12 @@ void test_slot_approach_accumulates_inclusive_travel_and_rejects_overshoot() {
             static_cast<double>(left.x) - static_cast<double>(right.x),
             static_cast<double>(left.z) - static_cast<double>(right.z)));
     };
+    const auto xyz_endpoint_distance = [](vec3 left, vec3 right) {
+        return static_cast<float>(std::hypot(
+            static_cast<double>(left.x) - static_cast<double>(right.x),
+            static_cast<double>(left.y) - static_cast<double>(right.y),
+            static_cast<double>(left.z) - static_cast<double>(right.z)));
+    };
     const auto same_float_bits = [](float left, float right) {
         return std::memcmp(&left, &right, sizeof(left)) == 0;
     };
@@ -641,10 +647,11 @@ void test_slot_approach_accumulates_inclusive_travel_and_rejects_overshoot() {
             inclusive_slot.root_world.position.z == 0.50F,
         "inclusive-travel fixture did not map slot ID 9 to (0.80, 0.50)");
 
+    constexpr float inclusive_travel_cap_m = 1.00002F;
     const vec3 start_endpoint =
         inclusive_scenario.start.root_world.position;
     inclusive_scenario.observation.displayed_root.position =
-        vec3(0.50F, 0.0F, 0.50F);
+        vec3(0.50F, 10.0F, 0.50F);
     const vec3 middle_endpoint =
         inclusive_scenario.observation.displayed_root.position;
     inclusive_assist.observe(inclusive_scenario.observation);
@@ -656,16 +663,29 @@ void test_slot_approach_accumulates_inclusive_travel_and_rejects_overshoot() {
         "first inclusive-travel endpoint left SlotApproach");
 
     inclusive_scenario.observation.displayed_root.position =
-        vec3(1.00002F, 0.0F, 0.50F);
+        vec3(0.50F, -10.0F, inclusive_travel_cap_m);
     const vec3 boundary_endpoint =
         inclusive_scenario.observation.displayed_root.position;
     inclusive_assist.observe(inclusive_scenario.observation);
     const float expected_assisted_travel_m =
         planar_endpoint_distance(start_endpoint, middle_endpoint) +
         planar_endpoint_distance(middle_endpoint, boundary_endpoint);
+    const float start_to_boundary_planar_m =
+        planar_endpoint_distance(start_endpoint, boundary_endpoint);
+    const float expected_xyz_travel_m =
+        xyz_endpoint_distance(start_endpoint, middle_endpoint) +
+        xyz_endpoint_distance(middle_endpoint, boundary_endpoint);
     require(
-        same_float_bits(expected_assisted_travel_m, 1.00002F),
+        same_float_bits(
+            expected_assisted_travel_m, inclusive_travel_cap_m),
         "inclusive endpoint arithmetic did not equal exactly 1.00002 m");
+    require(
+        !same_float_bits(
+            start_to_boundary_planar_m, expected_assisted_travel_m),
+        "inclusive endpoint arithmetic matched start-to-current planar distance");
+    require(
+        expected_xyz_travel_m > inclusive_travel_cap_m,
+        "inclusive endpoint XYZ path did not exceed the travel cap");
     require(
         same_float_bits(
             inclusive_assist.diagnostics().assisted_travel_m,
@@ -696,13 +716,57 @@ void test_slot_approach_accumulates_inclusive_travel_and_rejects_overshoot() {
     const interaction::MappedPickSlot frozen_slot =
         frozen_before.slot_selection.ordered[frozen_index];
     const float first_overshoot = std::nextafter(
-        1.00002F, std::numeric_limits<float>::infinity());
+        inclusive_travel_cap_m,
+        std::numeric_limits<float>::infinity());
+    const vec3 overshoot_start_endpoint =
+        overshoot_scenario.start.root_world.position;
+    const vec3 overshoot_middle_endpoint(0.50F, 10.0F, 0.50F);
+    const vec3 overshoot_endpoint(
+        0.50F, -10.0F, first_overshoot);
+    const float expected_overshoot_travel_m =
+        planar_endpoint_distance(
+            overshoot_start_endpoint, overshoot_middle_endpoint) +
+        planar_endpoint_distance(
+            overshoot_middle_endpoint, overshoot_endpoint);
+    const float overshoot_start_to_current_planar_m =
+        planar_endpoint_distance(
+            overshoot_start_endpoint, overshoot_endpoint);
+    const float expected_overshoot_xyz_travel_m =
+        xyz_endpoint_distance(
+            overshoot_start_endpoint, overshoot_middle_endpoint) +
+        xyz_endpoint_distance(
+            overshoot_middle_endpoint, overshoot_endpoint);
+    require(
+        same_float_bits(expected_overshoot_travel_m, first_overshoot),
+        "overshoot endpoint arithmetic was not the first float above 1.00002 m");
+    require(
+        !same_float_bits(
+            overshoot_start_to_current_planar_m,
+            expected_overshoot_travel_m),
+        "overshoot endpoint arithmetic matched start-to-current planar distance");
+    require(
+        expected_overshoot_xyz_travel_m > inclusive_travel_cap_m,
+        "overshoot endpoint XYZ path did not exceed the travel cap");
+
     overshoot_scenario.observation.displayed_root.position =
-        vec3(first_overshoot, 0.0F, 0.50F);
+        overshoot_middle_endpoint;
+    overshoot_assist.observe(overshoot_scenario.observation);
+    require(
+        overshoot_assist.diagnostics().state ==
+                interaction::PickAssistState::SlotApproach &&
+            overshoot_assist.diagnostics().reason ==
+                interaction::PickAssistReason::None,
+        "first overshoot-fixture endpoint left SlotApproach");
+    overshoot_scenario.observation.displayed_root.position =
+        overshoot_endpoint;
     const interaction::PickAssistOutput overshoot_output =
         overshoot_assist.observe(overshoot_scenario.observation);
     const interaction::PickAssistDiagnostics& failed =
         overshoot_assist.diagnostics();
+    require(
+        same_float_bits(
+            failed.assisted_travel_m, expected_overshoot_travel_m),
+        "overshoot travel did not accumulate consecutive planar endpoint distances");
     require(
         failed.state == interaction::PickAssistState::Failed &&
             failed.reason ==
