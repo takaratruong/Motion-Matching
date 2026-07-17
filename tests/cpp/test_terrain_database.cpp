@@ -458,6 +458,302 @@ static void fill_adversarial_disabled_query(array1d<float>& query)
     }
 }
 
+struct validated_candidate_script
+{
+    int rejected = -1;
+    int fatal = -1;
+    int calls[128] = {};
+    int count = 0;
+};
+
+static database_candidate_verdict evaluate_validated_candidate(
+    void* raw,
+    int frame)
+{
+    validated_candidate_script& script =
+        *static_cast<validated_candidate_script*>(raw);
+    CHECK(script.count < 128);
+    script.calls[script.count++] = frame;
+    if (frame == script.fatal) return DatabaseCandidateFatal;
+    if (frame == script.rejected) return DatabaseCandidateReject;
+    return DatabaseCandidateAccept;
+}
+
+static bool validated_script_contains(
+    const validated_candidate_script& script,
+    int frame)
+{
+    for (int index = 0; index < script.count; ++index) {
+        if (script.calls[index] == frame) return true;
+    }
+    return false;
+}
+
+static void fill_validated_search_database(database& db)
+{
+    const int frames = 96;
+    db.bone_positions.resize(frames, 1);
+    db.features.resize(frames, 1);
+    db.features_offset.resize(1);
+    db.features_scale.resize(1);
+    db.range_starts.resize(1);
+    db.range_stops.resize(1);
+    db.features_offset(0) = 0.0f;
+    db.features_scale(0) = 1.0f;
+    db.range_starts(0) = 0;
+    db.range_stops(0) = frames;
+    db.features.set(100.0f);
+    db.features(40, 0) = 0.0f;
+    db.features(41, 0) = 3.0f;
+    db.features(51, 0) = 3.0f;
+    db.features(70, 0) = 1.0f;
+    db.features(80, 0) = 2.0f;
+    database_build_bounds(db);
+}
+
+static database_search_status run_validated_search(
+    int& best_index,
+    float& best_cost,
+    const database& db,
+    const slice1d<float> query,
+    int ignore_surrounding,
+    int neighborhood_center,
+    validated_candidate_script& script,
+    const unsigned char* mask = nullptr,
+    int mask_count = 0)
+{
+    database_candidate_validator validator;
+    validator.context = &script;
+    validator.evaluate = evaluate_validated_candidate;
+    return database_search_validated(
+        best_index,
+        best_cost,
+        db,
+        query,
+        0.0f,
+        0,
+        ignore_surrounding,
+        mask,
+        mask_count,
+        neighborhood_center,
+        &validator);
+}
+
+static void test_validated_search_semantics()
+{
+    database db;
+    fill_validated_search_database(db);
+    array1d<float> query(1);
+    query(0) = 0.0f;
+
+    validated_candidate_script rejected;
+    rejected.rejected = 40;
+    int best_index = -1;
+    float best_cost = FLT_MAX;
+    CHECK(run_validated_search(
+              best_index, best_cost, db, query, 0, -1, rejected) ==
+          DatabaseSearchComplete);
+    CHECK(validated_script_contains(rejected, 40));
+    CHECK(validated_script_contains(rejected, 70));
+    CHECK(best_index == 70);
+    CHECK(float_bits(best_cost) == float_bits(1.0f));
+
+    validated_candidate_script fatal;
+    fatal.fatal = 40;
+    best_index = -1;
+    best_cost = -3.0f;
+    CHECK(run_validated_search(
+              best_index, best_cost, db, query, 0, -1, fatal) ==
+          DatabaseSearchCandidateFatal);
+    CHECK(best_index == -1);
+    CHECK(float_bits(best_cost) == float_bits(FLT_MAX));
+
+    validated_candidate_script neighborhood;
+    db.features(51, 0) = 0.0f;
+    database_build_bounds(db);
+    best_index = -1;
+    best_cost = FLT_MAX;
+    CHECK(run_validated_search(
+              best_index, best_cost, db, query, 20, 51, neighborhood) ==
+          DatabaseSearchComplete);
+    CHECK(!validated_script_contains(neighborhood, 40));
+    CHECK(!validated_script_contains(neighborhood, 41));
+    CHECK(!validated_script_contains(neighborhood, 51));
+    CHECK(best_index == 80);
+    CHECK(float_bits(best_cost) == float_bits(4.0f));
+
+    validated_candidate_script incumbent;
+    db.features(51, 0) = 3.0f;
+    database_build_bounds(db);
+    incumbent.rejected = 40;
+    best_index = 70;
+    best_cost = -5.0f;
+    CHECK(run_validated_search(
+              best_index, best_cost, db, query, 0, 50, incumbent) ==
+          DatabaseSearchComplete);
+    CHECK(best_index == 70);
+    CHECK(float_bits(best_cost) == float_bits(1.0f));
+    CHECK(!validated_script_contains(incumbent, 70));
+
+    validated_candidate_script tie;
+    db.features(41, 0) = 0.0f;
+    database_build_bounds(db);
+    best_index = -1;
+    best_cost = FLT_MAX;
+    CHECK(run_validated_search(
+              best_index, best_cost, db, query, 0, -1, tie) ==
+          DatabaseSearchComplete);
+    CHECK(best_index == 40);
+    CHECK(float_bits(best_cost) == UINT32_C(0));
+    CHECK(validated_script_contains(tie, 40));
+    CHECK(!validated_script_contains(tie, 41));
+
+    unsigned char mask[96] = {};
+    mask[70] = 1;
+    validated_candidate_script masked;
+    best_index = -1;
+    best_cost = FLT_MAX;
+    CHECK(run_validated_search(
+              best_index,
+              best_cost,
+              db,
+              query,
+              0,
+              -1,
+              masked,
+              mask,
+              96) == DatabaseSearchComplete);
+    CHECK(best_index == 70);
+    CHECK(masked.count == 1 && masked.calls[0] == 70);
+}
+
+static void test_validated_search_rejects_malformed_inputs_and_preserves_legacy()
+{
+    database db;
+    fill_validated_search_database(db);
+    array1d<float> query(1);
+    query(0) = 0.0f;
+
+    int legacy_index = -1;
+    float legacy_cost = FLT_MAX;
+    database_search(legacy_index, legacy_cost, db, query, 0.0f, 0, 0);
+    int validated_index = -1;
+    float validated_cost = FLT_MAX;
+    CHECK(database_search_validated(
+              validated_index,
+              validated_cost,
+              db,
+              query,
+              0.0f,
+              0,
+              0,
+              nullptr,
+              0,
+              DatabaseUseIncumbentNeighborhood,
+              nullptr) == DatabaseSearchComplete);
+    CHECK(validated_index == legacy_index);
+    CHECK(float_bits(validated_cost) == float_bits(legacy_cost));
+
+    database_candidate_validator malformed;
+    validated_index = 7;
+    validated_cost = -7.0f;
+    CHECK(database_search_validated(
+              validated_index,
+              validated_cost,
+              db,
+              query,
+              0.0f,
+              0,
+              0,
+              nullptr,
+              0,
+              -1,
+              &malformed) == DatabaseSearchInvalidInput);
+    CHECK(validated_index == -1);
+    CHECK(float_bits(validated_cost) == float_bits(FLT_MAX));
+
+    const unsigned char short_mask[1] = {1};
+    validated_candidate_script script;
+    validated_index = 8;
+    validated_cost = -8.0f;
+    CHECK(run_validated_search(
+              validated_index,
+              validated_cost,
+              db,
+              query,
+              0,
+              -1,
+              script,
+              short_mask,
+              1) == DatabaseSearchInvalidInput);
+    CHECK(validated_index == -1);
+    CHECK(float_bits(validated_cost) == float_bits(FLT_MAX));
+
+    validated_index = 9;
+    validated_cost = -9.0f;
+    CHECK(run_validated_search(
+              validated_index,
+              validated_cost,
+              db,
+              query,
+              0,
+              db.nframes(),
+              script) == DatabaseSearchInvalidInput);
+    CHECK(validated_index == -1);
+    CHECK(float_bits(validated_cost) == float_bits(FLT_MAX));
+
+    database missing_offsets;
+    fill_validated_search_database(missing_offsets);
+    missing_offsets.features_offset.resize(0);
+    validated_candidate_script missing_offsets_script;
+    validated_index = 10;
+    validated_cost = -10.0f;
+    CHECK(run_validated_search(
+              validated_index,
+              validated_cost,
+              missing_offsets,
+              query,
+              0,
+              -1,
+              missing_offsets_script) == DatabaseSearchInvalidInput);
+    CHECK(validated_index == -1);
+    CHECK(float_bits(validated_cost) == float_bits(FLT_MAX));
+
+    database missing_bounds;
+    fill_validated_search_database(missing_bounds);
+    missing_bounds.bound_sm_min.resize(0, 0);
+    validated_candidate_script missing_bounds_script;
+    validated_index = 11;
+    validated_cost = -11.0f;
+    CHECK(run_validated_search(
+              validated_index,
+              validated_cost,
+              missing_bounds,
+              query,
+              0,
+              -1,
+              missing_bounds_script) == DatabaseSearchInvalidInput);
+    CHECK(validated_index == -1);
+    CHECK(float_bits(validated_cost) == float_bits(FLT_MAX));
+
+    database invalid_range;
+    fill_validated_search_database(invalid_range);
+    invalid_range.range_stops(0) = invalid_range.nframes() + 1;
+    validated_candidate_script invalid_range_script;
+    validated_index = 12;
+    validated_cost = -12.0f;
+    CHECK(run_validated_search(
+              validated_index,
+              validated_cost,
+              invalid_range,
+              query,
+              0,
+              -1,
+              invalid_range_script) == DatabaseSearchInvalidInput);
+    CHECK(validated_index == -1);
+    CHECK(float_bits(validated_cost) == float_bits(FLT_MAX));
+}
+
 static void test_cost_and_incumbent_search_semantics()
 {
     database db;
@@ -664,5 +960,7 @@ int main()
     test_cost_and_incumbent_search_semantics();
     test_transition_cost_hysteresis_semantics();
     test_candidate_mask_search_semantics();
+    test_validated_search_semantics();
+    test_validated_search_rejects_malformed_inputs_and_preserves_legacy();
     return 0;
 }

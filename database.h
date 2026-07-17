@@ -789,14 +789,36 @@ void database_build_matching_features(
     database_build_bounds(db);
 }
 
+enum database_candidate_verdict
+{
+    DatabaseCandidateAccept,
+    DatabaseCandidateReject,
+    DatabaseCandidateFatal
+};
+
+enum database_search_status
+{
+    DatabaseSearchComplete,
+    DatabaseSearchInvalidInput,
+    DatabaseSearchCandidateFatal
+};
+
+struct database_candidate_validator
+{
+    void* context = nullptr;
+    database_candidate_verdict (*evaluate)(void*, int) = nullptr;
+};
+
+constexpr int DatabaseUseIncumbentNeighborhood = -2;
+
 // Motion Matching search function essentially consists
-// of comparing every feature vector in the database, 
-// against the query feature vector, first checking the 
-// query distance to the axis aligned bounding boxes used 
+// of comparing every feature vector in the database,
+// against the query feature vector, first checking the
+// query distance to the axis aligned bounding boxes used
 // for the acceleration structure.
-void motion_matching_search(
-    int& __restrict__ best_index, 
-    float& __restrict__ best_cost, 
+database_search_status motion_matching_search_validated(
+    int& __restrict__ best_index,
+    float& __restrict__ best_cost,
     const slice1d<int> range_starts,
     const slice1d<int> range_stops,
     const slice2d<float> features,
@@ -811,25 +833,39 @@ void motion_matching_search(
     const int ignore_range_end,
     const int ignore_surrounding,
     const unsigned char* candidate_mask = nullptr,
-    const int candidate_mask_count = 0)
+    const int candidate_mask_count = 0,
+    const int neighborhood_center = DatabaseUseIncumbentNeighborhood,
+    const database_candidate_validator* validator = nullptr)
 {
     // Keep strict header builds warning-clean while these legacy public API
     // parameters remain unused by the normalized-distance implementation.
     (void)features_offset;
     (void)features_scale;
 
-    int nfeatures = query_normalized.size;
-    int nranges = range_starts.size;
-    
-    int curr_index = best_index;
+    const int nfeatures = query_normalized.size;
+    const int nranges = range_starts.size;
+    const int resolved_neighborhood_center =
+        neighborhood_center == DatabaseUseIncumbentNeighborhood
+            ? best_index
+            : neighborhood_center;
+
+    if (best_index < -1 || best_index >= features.rows ||
+        resolved_neighborhood_center < -1 ||
+        resolved_neighborhood_center >= features.rows ||
+        ignore_range_end < 0 || ignore_surrounding < 0 ||
+        (candidate_mask != nullptr &&
+         candidate_mask_count != features.rows) ||
+        (validator != nullptr && validator->evaluate == nullptr))
+    {
+        best_index = -1;
+        best_cost = FLT_MAX;
+        return DatabaseSearchInvalidInput;
+    }
+
+    const int curr_index = resolved_neighborhood_center;
 
     if (candidate_mask != nullptr)
     {
-        if (candidate_mask_count != features.rows)
-        {
-            best_index = -1;
-            return;
-        }
         if (best_index != -1 && candidate_mask[best_index] != 1)
         {
             best_index = -1;
@@ -936,11 +972,26 @@ void motion_matching_search(
                         }
                     }
                     
-                    // If cost is lower than current best then update best
+                    // Validate only candidates that can beat the lowest-cost
+                    // accepted incumbent. A rejected candidate must not lower
+                    // the pruning threshold.
                     if (curr_cost < best_cost)
                     {
-                        best_index = i;
-                        best_cost = curr_cost;
+                        const database_candidate_verdict verdict =
+                            validator == nullptr
+                                ? DatabaseCandidateAccept
+                                : validator->evaluate(validator->context, i);
+                        if (verdict == DatabaseCandidateAccept)
+                        {
+                            best_index = i;
+                            best_cost = curr_cost;
+                        }
+                        else if (verdict != DatabaseCandidateReject)
+                        {
+                            best_index = -1;
+                            best_cost = FLT_MAX;
+                            return DatabaseSearchCandidateFatal;
+                        }
                     }
                     
                     i++;
@@ -948,6 +999,161 @@ void motion_matching_search(
             }
         }
     }
+
+    return DatabaseSearchComplete;
+}
+
+void motion_matching_search(
+    int& __restrict__ best_index,
+    float& __restrict__ best_cost,
+    const slice1d<int> range_starts,
+    const slice1d<int> range_stops,
+    const slice2d<float> features,
+    const slice1d<float> features_offset,
+    const slice1d<float> features_scale,
+    const slice2d<float> bound_sm_min,
+    const slice2d<float> bound_sm_max,
+    const slice2d<float> bound_lr_min,
+    const slice2d<float> bound_lr_max,
+    const slice1d<float> query_normalized,
+    const float transition_cost,
+    const int ignore_range_end,
+    const int ignore_surrounding,
+    const unsigned char* candidate_mask = nullptr,
+    const int candidate_mask_count = 0)
+{
+    // Preserve the legacy malformed-mask result exactly.
+    if (candidate_mask != nullptr && candidate_mask_count != features.rows)
+    {
+        best_index = -1;
+        return;
+    }
+    (void)motion_matching_search_validated(
+        best_index,
+        best_cost,
+        range_starts,
+        range_stops,
+        features,
+        features_offset,
+        features_scale,
+        bound_sm_min,
+        bound_sm_max,
+        bound_lr_min,
+        bound_lr_max,
+        query_normalized,
+        transition_cost,
+        ignore_range_end,
+        ignore_surrounding,
+        candidate_mask,
+        candidate_mask_count,
+        DatabaseUseIncumbentNeighborhood,
+        nullptr);
+}
+
+static bool database_search_shape_is_valid(const database& db)
+{
+    const int frames = db.nframes();
+    const int features = db.nfeatures();
+    const int expected_small_bounds =
+        (frames + BOUND_SM_SIZE - 1) / BOUND_SM_SIZE;
+    const int expected_large_bounds =
+        (frames + BOUND_LR_SIZE - 1) / BOUND_LR_SIZE;
+    if (frames <= 0 || db.bone_positions.cols <= 0 ||
+        db.bone_positions.data == nullptr || features <= 0 ||
+        db.features.rows != frames || db.features.data == nullptr ||
+        db.features_offset.size != features ||
+        db.features_offset.data == nullptr ||
+        db.features_scale.size != features ||
+        db.features_scale.data == nullptr ||
+        db.range_starts.size <= 0 ||
+        db.range_starts.size != db.range_stops.size ||
+        db.range_starts.data == nullptr || db.range_stops.data == nullptr ||
+        db.bound_sm_min.rows != expected_small_bounds ||
+        db.bound_sm_min.cols != features || db.bound_sm_min.data == nullptr ||
+        db.bound_sm_max.rows != expected_small_bounds ||
+        db.bound_sm_max.cols != features || db.bound_sm_max.data == nullptr ||
+        db.bound_lr_min.rows != expected_large_bounds ||
+        db.bound_lr_min.cols != features || db.bound_lr_min.data == nullptr ||
+        db.bound_lr_max.rows != expected_large_bounds ||
+        db.bound_lr_max.cols != features || db.bound_lr_max.data == nullptr)
+    {
+        return false;
+    }
+
+    int prior_stop = 0;
+    for (int range = 0; range < db.nranges(); ++range)
+    {
+        const int start = db.range_starts(range);
+        const int stop = db.range_stops(range);
+        if (start < prior_stop || start < 0 || stop <= start || stop > frames)
+        {
+            return false;
+        }
+        prior_stop = stop;
+    }
+    return true;
+}
+
+database_search_status database_search_validated(
+    int& best_index,
+    float& best_cost,
+    const database& db,
+    const slice1d<float> query,
+    const float transition_cost,
+    const int ignore_range_end,
+    const int ignore_surrounding,
+    const unsigned char* candidate_mask,
+    const int candidate_mask_count,
+    const int neighborhood_center,
+    const database_candidate_validator* validator)
+{
+    if (!database_search_shape_is_valid(db) ||
+        query.size != db.nfeatures() || query.data == nullptr ||
+        best_index < -1 || best_index >= db.nframes() ||
+        (neighborhood_center != DatabaseUseIncumbentNeighborhood &&
+         (neighborhood_center < -1 || neighborhood_center >= db.nframes())) ||
+        ignore_range_end < 0 || ignore_surrounding < 0 ||
+        (candidate_mask != nullptr &&
+         candidate_mask_count != db.nframes()) ||
+        (validator != nullptr && validator->evaluate == nullptr))
+    {
+        best_index = -1;
+        best_cost = FLT_MAX;
+        return DatabaseSearchInvalidInput;
+    }
+
+    if (best_index == -1)
+    {
+        best_cost = FLT_MAX;
+    }
+
+    array1d<float> query_normalized(db.nfeatures());
+    for (int i = 0; i < db.nfeatures(); i++)
+    {
+        query_normalized(i) = normalize_query_feature(
+            query(i), db.features_offset(i), db.features_scale(i));
+    }
+
+    return motion_matching_search_validated(
+        best_index,
+        best_cost,
+        db.range_starts,
+        db.range_stops,
+        db.features,
+        db.features_offset,
+        db.features_scale,
+        db.bound_sm_min,
+        db.bound_sm_max,
+        db.bound_lr_min,
+        db.bound_lr_max,
+        query_normalized,
+        transition_cost,
+        ignore_range_end,
+        ignore_surrounding,
+        candidate_mask,
+        candidate_mask_count,
+        neighborhood_center,
+        validator);
 }
 
 // Search database
