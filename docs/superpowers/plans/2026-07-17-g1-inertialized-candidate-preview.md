@@ -622,9 +622,10 @@ assert(step50.query_database_frame == 50);
 assert(step51.selected_database_frame == 865);
 assert(step51_emitted_database_frame == 866);
 assert(step52.candidate_preview.candidate_limit_rejection_count > 0);
-assert(step52.candidate_preview.first_rejected_database_frame == 927);
+assert(step52.candidate_preview.first_rejected_database_frame == 0);
 assert(step52.candidate_preview.first_rejected_joint_index == left_ankle_roll_row);
-assert(float_bits(step52.candidate_preview.first_rejected_joint_position) ==
+assert(replay_validator.saw_rejection(927, left_ankle_roll_row));
+assert(float_bits(replay_validator.rejected_position(927)) ==
        float_bits(-0.27224052f));
 assert(step52.selected_database_frame != 927);
 assert(final_projection_succeeds);

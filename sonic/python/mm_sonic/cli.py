@@ -155,6 +155,9 @@ _REMOTE_JOINT_LIMIT_MESSAGE = re.compile(
 _REMOTE_NO_SAFE_CANDIDATE_MESSAGE = (
     "no joint-limit-safe database candidate"
 )
+_REMOTE_NO_INERTIALIZED_SAFE_CANDIDATE_MESSAGE = (
+    "no inertialized-joint-safe database candidate"
+)
 _COLD_GEAR_STARTUP_TIMEOUT_S = 600.0
 _LOW_STATE_BOOTSTRAP_TIMEOUT_S = 15.0
 _SCORING_TARGET_TIMEOUT_S = 30.0
@@ -201,6 +204,16 @@ def _is_remote_no_safe_candidate(error: BaseException) -> bool:
         isinstance(error, _RemoteMMError)
         and error.code == "generation_failed"
         and error.message == _REMOTE_NO_SAFE_CANDIDATE_MESSAGE
+    )
+
+
+def _is_remote_no_inertialized_safe_candidate(
+    error: BaseException,
+) -> bool:
+    return (
+        isinstance(error, _RemoteMMError)
+        and error.code == "generation_failed"
+        and error.message == _REMOTE_NO_INERTIALIZED_SAFE_CANDIDATE_MESSAGE
     )
 
 
@@ -4191,13 +4204,22 @@ class DefaultStageAOperations:
                         no_safe_candidate = _is_remote_no_safe_candidate(
                             error
                         )
+                        no_inertialized_safe_candidate = (
+                            _is_remote_no_inertialized_safe_candidate(error)
+                        )
                         if (
                             isinstance(error, ContractError)
                             and "joint limit" in str(error).lower()
                         ) or _is_remote_registered_joint_limit(
                             error
-                        ) or no_safe_candidate:
-                            if no_safe_candidate:
+                        ) or no_safe_candidate or no_inertialized_safe_candidate:
+                            if no_inertialized_safe_candidate:
+                                scientific_reason = (
+                                    "flat MM reference found no authenticated "
+                                    "inertialized-joint-safe database candidate at "
+                                    f"chunk {command.chunk_index}: {error}"
+                                )
+                            elif no_safe_candidate:
                                 scientific_reason = (
                                     "flat MM reference found no authenticated "
                                     "joint-limit-safe database candidate at chunk "

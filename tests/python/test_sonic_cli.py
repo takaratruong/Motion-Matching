@@ -2890,6 +2890,53 @@ class ProductionAdapterBoundaryTests(unittest.TestCase):
                 self.assertIsNone(evidence)
                 self.assertEqual(aborted, ())
 
+    def test_exact_remote_no_inertialized_safe_candidate_is_scientific(self):
+        message = "no inertialized-joint-safe database candidate"
+        result, evidence, aborted, events = self._remote_generation_error_case(
+            code="generation_failed",
+            message=message,
+            label="remote-no-inertialized-safe-candidate",
+        )
+        self.assertEqual(result.status, "scientific_failure")
+        self.assertEqual(aborted, ())
+        self.assertEqual(events[:2], ("hello", "reset"))
+        self.assertEqual(events.count("generate"), 6)
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertEqual(evidence["failure_boundary"], "source_chunk")
+        self.assertIn(message, evidence["reason"])
+
+    def test_no_inertialized_safe_candidate_lookalikes_are_integration_failures(self):
+        message = "no inertialized-joint-safe database candidate"
+        cases = (
+            ("invalid_candidate", message, True, ""),
+            ("generation_failed", "prefix " + message, True, ""),
+            ("generation_failed", message + " suffix", True, ""),
+            ("generation_failed", message.upper(), True, ""),
+            (
+                "generation_failed",
+                "no inertialized_joint_safe database candidate",
+                True,
+                "",
+            ),
+            ("generation_failed", message, False, ""),
+            ("generation_failed", "child process exited", False, message),
+        )
+        for index, (code, observed, remote, stderr) in enumerate(cases):
+            with self.subTest(code=code, observed=observed, remote=remote):
+                result, evidence, aborted, _events = (
+                    self._remote_generation_error_case(
+                        code=code,
+                        message=observed,
+                        label=f"remote-no-inertialized-safe-lookalike-{index}",
+                        remote_error=remote,
+                        stderr_message=stderr,
+                    )
+                )
+                self.assertEqual(result.status, "integration_failure")
+                self.assertIsNone(evidence)
+                self.assertEqual(aborted, ())
+
     def test_run_feasibility_drift_fails_before_reset_or_chunk_acceptance(self):
         count_drift = _joint_feasibility_identity()
         count_drift["frame_count"] += 1
