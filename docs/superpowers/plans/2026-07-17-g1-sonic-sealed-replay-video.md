@@ -114,7 +114,7 @@ if __name__ == "__main__":
 Run:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 sonic/.venv/bin/python -m unittest \
+PYTHONPATH=sonic/python PYTHONDONTWRITEBYTECODE=1 sonic/.venv/bin/python -m unittest \
   tests.python.test_sonic_replay_video -v
 ```
 
@@ -483,9 +483,9 @@ if __name__ == "__main__":
 Run:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 sonic/.venv/bin/python -m unittest \
+PYTHONPATH=sonic/python PYTHONDONTWRITEBYTECODE=1 sonic/.venv/bin/python -m unittest \
   tests.python.test_sonic_replay_video -v
-MUJOCO_GL=egl PYTHONDONTWRITEBYTECODE=1 sonic/.venv/bin/python \
+MUJOCO_GL=egl PYTHONPATH=sonic/python PYTHONDONTWRITEBYTECODE=1 sonic/.venv/bin/python \
   -m mm_sonic.replay_video \
   --run-root sonic/runs/stage-b-official-sonic-4c97fc2-clean-final-r13-20260717/stage-b/stage-b-20260717T190656038623Z-b746af3f \
   --output-dir sonic/runs/stage-b-official-sonic-4c97fc2-clean-final-r13-20260717/video-evidence \
@@ -524,7 +524,7 @@ Expected: verifier returns true and the inventory hash is `79d623a86993385f5ec88
 Run:
 
 ```bash
-MUJOCO_GL=egl PYTHONDONTWRITEBYTECODE=1 sonic/.venv/bin/python \
+MUJOCO_GL=egl PYTHONPATH=sonic/python PYTHONDONTWRITEBYTECODE=1 sonic/.venv/bin/python \
   -m mm_sonic.replay_video \
   --run-root sonic/runs/stage-b-official-sonic-4c97fc2-clean-final-r13-20260717/stage-b/stage-b-20260717T190656038623Z-b746af3f \
   --output-dir sonic/runs/stage-b-official-sonic-4c97fc2-clean-final-r13-20260717/video-evidence
@@ -561,8 +561,18 @@ Expected: visual inspection passes with no clipping that hides the robot or stat
 Run:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 PYTEST_ADDOPTS='-p no:cacheprovider' \
-  sonic/.venv/bin/python -m pytest -q
+PYTHONPATH=sonic/python PYTHONDONTWRITEBYTECODE=1 \
+  /home/ubuntu/miniconda3/envs/diffsim/bin/python -B -W error -m unittest \
+  tests.python.test_sonic_artifacts tests.python.test_sonic_cli \
+  tests.python.test_sonic_commands tests.python.test_sonic_coordinator \
+  tests.python.test_sonic_external tests.python.test_sonic_gated_sim \
+  tests.python.test_sonic_joints tests.python.test_sonic_metrics \
+  tests.python.test_sonic_process tests.python.test_sonic_reference \
+  tests.python.test_sonic_replay_video tests.python.test_sonic_resample \
+  tests.python.test_sonic_runtime_parity tests.python.test_sonic_scene \
+  tests.python.test_sonic_schema tests.python.test_sonic_timeline \
+  tests.python.test_sonic_timing tests.python.test_sonic_transform \
+  tests.python.test_sonic_zmq_v1
 pgrep -af 'mm_sonic.replay_video|ffmpeg.*g1-sonic-stage-b-r13' || true
 git status --short --branch
 ```
