@@ -76,6 +76,42 @@ interaction::InteractionTarget make_target() {
     return target;
 }
 
+interaction::InteractionTarget make_frozen_slot_target() {
+    interaction::InteractionTarget target{};
+    target.handle = {51U, 4U};
+    target.object_world = {vec3(0.0F, 0.80F, 0.0F), quat()};
+    target.object_profile_id = 101U;
+    target.object_bounds = {vec3(), vec3(0.05F, 0.10F, 0.05F)};
+    target.object_dimensions = vec3(0.10F, 0.20F, 0.10F);
+    target.table_world = {vec3(100.0F, 0.0F, 100.0F), quat()};
+    target.table_size = vec3(1.0F, 0.10F, 1.0F);
+    target.state = interaction::ObjectState::Free;
+    target.owner_request = 0U;
+
+    interaction::GraspAffordance affordance{};
+    affordance.id = 7U;
+    affordance.hand = interaction::Hand::Right;
+    affordance.hand_in_object = {vec3(), quat()};
+    affordance.approach_direction_object = vec3(0.0F, 0.0F, 1.0F);
+    affordance.clearance_radius = 0.04F;
+    affordance.interaction_slots = {
+        {12U, 0.70F, 0.0F, 0.0F},
+        {9U, 0.0F, 0.50F, 0.0F},
+        {11U, 0.0F, 0.80F, 0.0F},
+    };
+    target.affordances.push_back(affordance);
+    return target;
+}
+
+interaction::PickAssistStart make_frozen_slot_start(
+    const interaction::InteractionTarget& target) {
+    interaction::PickAssistStart start{};
+    start.target_snapshot = target;
+    start.affordance_id = target.affordances.front().id;
+    start.root_world = {vec3(0.0F, 0.0F, 0.0F), quat()};
+    return start;
+}
+
 struct Scenario {
     interaction::InteractionTarget target = make_target();
     interaction::PickAssistStart start{};
@@ -192,6 +228,146 @@ void test_idle_does_not_override_input() {
     require(
         assist.diagnostics().state == interaction::PickAssistState::Idle,
         "Idle diagnostics reported the wrong state");
+}
+
+void test_begin_selects_and_freezes_one_authored_slot() {
+    const interaction::InteractionTarget target = make_frozen_slot_target();
+    const interaction::PickAssistStart start = make_frozen_slot_start(target);
+    interaction::ControllerPickAssist assist;
+
+    require(assist.begin(start, &target), "valid frozen-slot begin failed");
+    const interaction::PickAssistDiagnostics& diagnostics =
+        assist.diagnostics();
+    require(
+        diagnostics.state == interaction::PickAssistState::SlotApproach,
+        "valid begin did not enter SlotApproach");
+    require(
+        diagnostics.selected_slot_id == 9U,
+        "deterministic begin did not select authored slot ID 9");
+    require(
+        diagnostics.slot_selection.selected_index.has_value(),
+        "valid begin did not retain its selected diagnostic index");
+    require(
+        diagnostics.route_length_m ==
+            diagnostics.slot_selection.ordered[
+                *diagnostics.slot_selection.selected_index].route_length_m,
+        "begin route did not retain selected-slot provenance");
+}
+
+void require_frozen_slot_begin_failure(
+    interaction::InteractionTarget target,
+    interaction::PickAssistStart start,
+    interaction::PickAssistReason expected,
+    const char* message) {
+    start.target_snapshot = target;
+    interaction::ControllerPickAssist assist;
+    require(!assist.begin(start, &target), message);
+    require(
+        assist.diagnostics().state == interaction::PickAssistState::Failed &&
+            assist.diagnostics().reason == expected,
+        "frozen-slot begin failure reported the wrong stable reason");
+    require(
+        !assist.active() && !assist.owns_manual_interact(),
+        "failed frozen-slot begin retained input ownership");
+}
+
+void test_begin_maps_every_aggregate_no_winner_reason() {
+    {
+        interaction::InteractionTarget target = make_frozen_slot_target();
+        target.affordances.front().interaction_slots.clear();
+        require_frozen_slot_begin_failure(
+            target,
+            make_frozen_slot_start(target),
+            interaction::PickAssistReason::NoAuthoredSlot,
+            "begin accepted a target with no authored slots");
+    }
+    {
+        interaction::InteractionTarget target = make_frozen_slot_target();
+        target.object_world.rotation =
+            quat(0.5F, 0.5F, 0.5F, -0.5F);
+        require_frozen_slot_begin_failure(
+            target,
+            make_frozen_slot_start(target),
+            interaction::PickAssistReason::InvalidGeometry,
+            "begin accepted invalid slot mapping geometry");
+    }
+    {
+        interaction::InteractionTarget target = make_frozen_slot_target();
+        target.affordances.front().interaction_slots = {
+            {20U, 0.0F, 1.10F, 0.0F},
+            {21U, 0.0F, 1.20F, 0.0F},
+        };
+        require_frozen_slot_begin_failure(
+            target,
+            make_frozen_slot_start(target),
+            interaction::PickAssistReason::OutsideTravelEnvelope,
+            "begin accepted only outside-envelope slots");
+    }
+    {
+        interaction::InteractionTarget target = make_frozen_slot_target();
+        interaction::PickAssistStart start = make_frozen_slot_start(target);
+        start.obstacles.push_back({
+            vec3(0.0F, 0.0F, 0.0F),
+            vec3(0.10F, 0.10F, 0.10F),
+        });
+        require_frozen_slot_begin_failure(
+            target,
+            start,
+            interaction::PickAssistReason::AllSlotsBlocked,
+            "begin accepted an all-blocked slot set");
+    }
+}
+
+void test_slot_reason_mapping_is_exhaustive_and_same_named() {
+    struct Mapping {
+        interaction::PickSlotReason slot;
+        interaction::PickAssistReason assist;
+    };
+    const Mapping mappings[] = {
+        {interaction::PickSlotReason::None,
+         interaction::PickAssistReason::None},
+        {interaction::PickSlotReason::NoAuthoredSlot,
+         interaction::PickAssistReason::NoAuthoredSlot},
+        {interaction::PickSlotReason::InvalidGeometry,
+         interaction::PickAssistReason::InvalidGeometry},
+        {interaction::PickSlotReason::OutsideTravelEnvelope,
+         interaction::PickAssistReason::OutsideTravelEnvelope},
+        {interaction::PickSlotReason::TableBlocked,
+         interaction::PickAssistReason::TableBlocked},
+        {interaction::PickSlotReason::ObstacleBlocked,
+         interaction::PickAssistReason::ObstacleBlocked},
+        {interaction::PickSlotReason::AllSlotsBlocked,
+         interaction::PickAssistReason::AllSlotsBlocked},
+    };
+    for (const Mapping& mapping : mappings) {
+        require(
+            interaction::pick_assist_reason_from_slot_reason(mapping.slot) ==
+                mapping.assist,
+            "pick-slot reason did not map one-to-one to assist reason");
+    }
+}
+
+void test_failed_begin_can_immediately_begin_a_valid_attempt() {
+    interaction::InteractionTarget invalid = make_frozen_slot_target();
+    invalid.affordances.front().interaction_slots.clear();
+    interaction::ControllerPickAssist assist;
+    require(
+        !assist.begin(make_frozen_slot_start(invalid), &invalid),
+        "retry fixture unexpectedly accepted its invalid attempt");
+    require(
+        !assist.active() && !assist.owns_manual_interact(),
+        "retry fixture retained ownership after failure");
+
+    const interaction::InteractionTarget valid = make_frozen_slot_target();
+    require(
+        assist.begin(make_frozen_slot_start(valid), &valid),
+        "failed assist could not immediately begin a valid attempt");
+    require(
+        assist.diagnostics().state ==
+                interaction::PickAssistState::SlotApproach &&
+            assist.diagnostics().reason == interaction::PickAssistReason::None &&
+            assist.diagnostics().selected_slot_id == 9U,
+        "valid retry did not replace the failed attempt diagnostics");
 }
 
 void test_diagnostic_names_are_stable() {
@@ -1347,6 +1523,10 @@ void test_final_preview_deadline_precedes_valid_certification() {
 int main() {
     try {
         test_idle_does_not_override_input();
+        test_begin_selects_and_freezes_one_authored_slot();
+        test_begin_maps_every_aggregate_no_winner_reason();
+        test_slot_reason_mapping_is_exhaustive_and_same_named();
+        test_failed_begin_can_immediately_begin_a_valid_attempt();
         test_diagnostic_names_are_stable();
         test_constructor_rejects_unsafe_or_nonfinite_config();
         test_begin_latches_planar_routes_and_enforces_inclusive_envelope();
