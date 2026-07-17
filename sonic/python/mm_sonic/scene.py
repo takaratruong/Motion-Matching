@@ -163,9 +163,7 @@ def _read_regular(
     *,
     maximum_bytes: int,
 ) -> tuple[Path, bytes]:
-    candidate = Path(path)
-    if not candidate.is_absolute():
-        candidate = Path(os.path.abspath(os.fspath(candidate)))
+    candidate = Path(os.path.abspath(os.fspath(path)))
     _reject_symlink_components(candidate, label)
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
@@ -751,9 +749,7 @@ def _make_output_directory(
     *,
     input_roots: Sequence[Path],
 ) -> Path:
-    output = Path(path)
-    if not output.is_absolute():
-        output = Path(os.path.abspath(os.fspath(output)))
+    output = Path(os.path.abspath(os.fspath(path)))
     _reject_symlink_components(output.parent, "scene output parent")
     for root in input_roots:
         protected = Path(os.path.abspath(os.fspath(root)))
@@ -771,23 +767,35 @@ def _make_output_directory(
     return output
 
 
+def _parse_xml_root(contents: bytes, label: str) -> ET.Element:
+    try:
+        text = contents.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise SceneError(
+            f"{label} must be UTF-8 and must not contain a DOCTYPE"
+        ) from error
+    if "<!DOCTYPE" in text.upper():
+        raise SceneError(f"{label} must not contain a DOCTYPE")
+    try:
+        return ET.fromstring(contents)
+    except (ET.ParseError, ValueError) as error:
+        raise SceneError(f"{label} is malformed") from error
+
+
 def _load_official_scene(
     official_scene_xml: Path | str,
     expected_official_scene_sha256: str,
     expected_robot_sha256: str,
-) -> tuple[Path, ET.ElementTree, Path, str, str]:
+    *,
+    label_prefix: str = "",
+) -> tuple[Path, ET.ElementTree, Path, bytes, str, str]:
     scene_path, scene_bytes, scene_sha = _read_authenticated(
         official_scene_xml,
         expected_official_scene_sha256,
-        "official scene XML",
+        f"{label_prefix}official scene XML",
         maximum_bytes=_MAXIMUM_JSON_BYTES,
     )
-    if b"<!DOCTYPE" in scene_bytes.upper():
-        raise SceneError("official scene XML must not contain a DOCTYPE")
-    try:
-        root = ET.fromstring(scene_bytes)
-    except ET.ParseError as error:
-        raise SceneError("official scene XML is malformed") from error
+    root = _parse_xml_root(scene_bytes, f"{label_prefix}official scene XML")
     if root.tag != "mujoco":
         raise SceneError("official scene XML root must be mujoco")
     includes = root.findall("include")
@@ -804,14 +812,55 @@ def _load_official_scene(
         or relative in (".", "..")
     ):
         raise SceneError("official robot include path is unsafe")
-    robot_path, _, robot_sha = _read_authenticated(
+    robot_path, robot_bytes, robot_sha = _read_authenticated(
         scene_path.parent / relative,
         expected_robot_sha256,
-        "robot include XML",
+        f"{label_prefix}robot include XML",
         maximum_bytes=_MAXIMUM_JSON_BYTES,
     )
-    include.attrib["file"] = str(robot_path)
-    return scene_path, ET.ElementTree(root), robot_path, scene_sha, robot_sha
+    return (
+        scene_path,
+        ET.ElementTree(root),
+        robot_path,
+        robot_bytes,
+        scene_sha,
+        robot_sha,
+    )
+
+
+def _run_local_robot_bytes(robot_path: Path, robot_bytes: bytes) -> bytes:
+    root = _parse_xml_root(robot_bytes, "official robot XML")
+    if root.tag != "mujoco":
+        raise SceneError("official robot XML root must be mujoco")
+    compilers = root.findall("compiler")
+    if len(compilers) != 1:
+        raise SceneError("official robot must contain exactly one compiler")
+    compiler = compilers[0]
+    if compiler.attrib.get("meshdir") != "meshes":
+        raise SceneError("official robot compiler meshdir must be exactly meshes")
+
+    mesh_directory = robot_path.parent / "meshes"
+    _reject_symlink_components(mesh_directory, "official robot mesh directory")
+    try:
+        mesh_status = os.stat(mesh_directory, follow_symlinks=False)
+        resolved_mesh_directory = mesh_directory.resolve(strict=True)
+        resolved_mesh_directory.relative_to(robot_path.parent)
+    except (OSError, ValueError) as error:
+        raise SceneError(
+            "official robot mesh directory must remain inside its input directory"
+        ) from error
+    if not stat.S_ISDIR(mesh_status.st_mode):
+        raise SceneError("official robot mesh directory must be a real directory")
+
+    compiler.attrib["meshdir"] = str(resolved_mesh_directory)
+    tree = ET.ElementTree(root)
+    ET.indent(tree, space="  ")
+    return ET.tostring(
+        root,
+        encoding="utf-8",
+        xml_declaration=True,
+        short_empty_elements=True,
+    ) + b"\n"
 
 
 def _overlay_bytes(
@@ -1053,10 +1102,21 @@ def register_scene(
         mm_scene_identity,
     )
 
-    scene_path, tree, robot_path, official_sha, robot_sha = _load_official_scene(
+    (
+        scene_path,
+        tree,
+        official_robot_path,
+        official_robot_bytes,
+        official_sha,
+        official_robot_sha,
+    ) = _load_official_scene(
         official_scene_xml,
         expected_official_scene_sha256,
         expected_robot_sha256,
+    )
+    generated_robot_bytes = _run_local_robot_bytes(
+        official_robot_path,
+        official_robot_bytes,
     )
     input_roots = [
         Path(os.path.abspath(os.fspath(registry_path))).parent,
@@ -1067,6 +1127,17 @@ def register_scene(
         output_dir,
         input_roots=input_roots,
     )
+    generated_robot_path = output / "gear_robot.xml"
+    _write_exclusive(
+        generated_robot_path,
+        generated_robot_bytes,
+        "run-local robot XML",
+    )
+    generated_robot_sha = _sha256_bytes(generated_robot_bytes)
+    includes = tree.getroot().findall("include")
+    if len(includes) != 1 or set(includes[0].attrib) != {"file"}:
+        raise SceneError("official scene robot include changed after authentication")
+    includes[0].attrib["file"] = str(generated_robot_path)
     if terrain is not None:
         transformed_path = output / "terrain.obj"
         transform_record = transform_obj(
@@ -1101,7 +1172,8 @@ def register_scene(
 
     output_hashes: dict[str, str] = {
         "official_scene": official_sha,
-        "robot_include": robot_sha,
+        "official_robot": official_robot_sha,
+        "robot_include": generated_robot_sha,
         "gear_scene_xml": overlay_sha,
     }
     if transform_record is not None:
@@ -1121,9 +1193,12 @@ def register_scene(
         "output_bounds_mujoco": (
             None if target_bounds is None else target_bounds.tolist()
         ),
+        "official_scene": str(scene_path),
         "official_scene_sha256": official_sha,
-        "robot_include": str(robot_path),
-        "robot_include_sha256": robot_sha,
+        "official_robot_include": str(official_robot_path),
+        "official_robot_include_sha256": official_robot_sha,
+        "robot_include": str(generated_robot_path),
+        "robot_include_sha256": generated_robot_sha,
         "gear_scene_sha256": overlay_sha,
         "transformed_obj_sha256": (
             None
@@ -1315,18 +1390,13 @@ def replay_kinematic_reference(
         raise SceneError("physical pelvis quaternion must be unit length")
     pelvis_quaternion /= norms[:, None]
 
-    _, overlay_bytes, overlay_sha = _read_authenticated(
+    overlay_path, overlay_bytes, overlay_sha = _read_authenticated(
         scene.gear_scene_xml,
         scene.output_hashes.get("gear_scene_xml"),
         "registered GEAR scene XML",
         maximum_bytes=_MAXIMUM_JSON_BYTES,
     )
-    if b"<!DOCTYPE" in overlay_bytes.upper():
-        raise SceneError("registered GEAR scene XML must not contain a DOCTYPE")
-    try:
-        overlay_root = ET.fromstring(overlay_bytes)
-    except ET.ParseError as error:
-        raise SceneError("registered GEAR scene XML is malformed") from error
+    overlay_root = _parse_xml_root(overlay_bytes, "registered GEAR scene XML")
     includes = overlay_root.findall("include")
     if (
         overlay_root.tag != "mujoco"
@@ -1343,6 +1413,10 @@ def replay_kinematic_reference(
         "registered robot include",
         maximum_bytes=_MAXIMUM_JSON_BYTES,
     )
+    try:
+        robot_path.relative_to(overlay_path.parent)
+    except ValueError as error:
+        raise SceneError("registered robot include escapes the scene output") from error
 
     if scene.transformed_obj is None:
         transformed_sha: str | None = None
@@ -1365,7 +1439,7 @@ def replay_kinematic_reference(
         ):
             raise SceneError("registered transformed OBJ path identity changed")
 
-    registration_path = scene.gear_scene_xml.parent / "scene_registration.json"
+    registration_path = overlay_path.parent / "scene_registration.json"
     _, registration_bytes, _ = _read_authenticated(
         registration_path,
         scene.output_hashes.get("scene_registration"),
@@ -1373,8 +1447,35 @@ def replay_kinematic_reference(
         maximum_bytes=_MAXIMUM_JSON_BYTES,
     )
     registration = _json_bytes(registration_bytes, "registered scene registration")
+    official_scene_value = registration.get("official_scene")
+    official_robot_value = registration.get("official_robot_include")
+    if (
+        type(official_scene_value) is not str
+        or not Path(official_scene_value).is_absolute()
+        or type(official_robot_value) is not str
+        or not Path(official_robot_value).is_absolute()
+    ):
+        raise SceneError("registered original scene identities changed")
+    (
+        official_scene_path,
+        _,
+        official_robot_path,
+        _,
+        official_scene_sha,
+        official_robot_sha,
+    ) = _load_official_scene(
+        official_scene_value,
+        scene.output_hashes.get("official_scene"),
+        scene.output_hashes.get("official_robot"),
+        label_prefix="registered ",
+    )
     if (
         registration.get("gear_scene_sha256") != overlay_sha
+        or official_scene_value != str(official_scene_path)
+        or registration.get("official_scene_sha256") != official_scene_sha
+        or official_robot_value != str(official_robot_path)
+        or registration.get("official_robot_include_sha256")
+        != official_robot_sha
         or registration.get("robot_include") != str(robot_path)
         or registration.get("robot_include_sha256") != robot_sha
         or registration.get("transformed_obj_sha256") != transformed_sha
@@ -1382,7 +1483,7 @@ def replay_kinematic_reference(
         raise SceneError("registered scene registration identity changed")
     mujoco = _import_mujoco()
     try:
-        model = mujoco.MjModel.from_xml_path(str(scene.gear_scene_xml))
+        model = mujoco.MjModel.from_xml_path(str(overlay_path))
     except (ValueError, OSError) as error:
         raise SceneError(f"registered GEAR scene does not load: {error}") from error
     allowed, forbidden = _resolve_contact_groups(model)

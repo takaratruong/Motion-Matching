@@ -1,3 +1,4 @@
+from dataclasses import replace
 import hashlib
 import json
 import os
@@ -224,7 +225,7 @@ def _synthetic_robot_xml():
         )
     return (
         '<mujoco model="synthetic_g1">'
-        '<compiler angle="radian"/>'
+        '<compiler angle="radian" meshdir="meshes"/>'
         '<worldbody><body name="pelvis" pos="0 0 0.2">'
         '<freejoint name="floating_base_joint"/>'
         '<geom name="pelvis_geom" type="sphere" size="0.1" density="100"/>'
@@ -236,6 +237,7 @@ def _synthetic_robot_xml():
 def _official_scene_fixture(root):
     inputs = root / "official-input"
     inputs.mkdir()
+    (inputs / "meshes").mkdir()
     robot = inputs / "robot.xml"
     robot.write_text(_synthetic_robot_xml(), encoding="utf-8")
     scene = inputs / "official_scene.xml"
@@ -450,6 +452,62 @@ class RegistryAndObjTests(unittest.TestCase):
 
 
 class OverlayAndAuthenticationTests(unittest.TestCase):
+    def test_absolute_dotdot_output_cannot_enter_authenticated_input(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            terrain_root = root / "terrain"
+            _terrain_fixture(terrain_root)
+            official, robot = _official_scene_fixture(root)
+            detour = root / "detour"
+            detour.mkdir()
+            canonical_output = official.parent / "escaped-output"
+            disguised_output = detour / ".." / official.parent.name / canonical_output.name
+            self.assertTrue(disguised_output.is_absolute())
+            self.assertNotEqual(disguised_output, canonical_output)
+            with self.assertRaisesRegex(SceneError, "output.*input"):
+                register_scene(
+                    "sonic-flat-baseline",
+                    "flat-12s",
+                    registry_path=REGISTRY,
+                    terrain_dir=terrain_root,
+                    official_scene_xml=official,
+                    output_dir=disguised_output,
+                    expected_official_scene_sha256=_sha256(official),
+                    expected_robot_sha256=_sha256(robot),
+                    mm_hello_identity=_mm_hello_identity(terrain_root),
+                    mm_scene_identity=_flat_scene_identity(),
+                )
+            self.assertFalse(canonical_output.exists())
+
+    def test_utf16_doctype_is_rejected_for_official_scene_and_robot(self):
+        for target in ("scene", "robot"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                terrain_root = root / "terrain"
+                _terrain_fixture(terrain_root)
+                official, robot = _official_scene_fixture(root)
+                selected = official if target == "scene" else robot
+                document = (
+                    '<?xml version="1.0" encoding="UTF-16"?>\n'
+                    '<!DOCTYPE mujoco [<!ENTITY marker "authenticated">]>\n'
+                    + selected.read_text(encoding="utf-8")
+                )
+                selected.write_bytes(document.encode("utf-16"))
+                with self.assertRaisesRegex(SceneError, "DOCTYPE"):
+                    register_scene(
+                        "sonic-flat-baseline",
+                        "flat-12s",
+                        registry_path=REGISTRY,
+                        terrain_dir=terrain_root,
+                        official_scene_xml=official,
+                        output_dir=root / "rejected-output",
+                        expected_official_scene_sha256=_sha256(official),
+                        expected_robot_sha256=_sha256(robot),
+                        mm_hello_identity=_mm_hello_identity(terrain_root),
+                        mm_scene_identity=_flat_scene_identity(),
+                    )
+                self.assertFalse((root / "rejected-output").exists())
+
     def test_flat_overlay_loads_with_absolute_robot_and_one_named_plane(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -494,8 +552,19 @@ class OverlayAndAuthenticationTests(unittest.TestCase):
             root_xml = ET.parse(registered.gear_scene_xml).getroot()
             includes = root_xml.findall("include")
             self.assertEqual(len(includes), 1)
-            self.assertEqual(includes[0].attrib["file"], str(robot.resolve()))
-            self.assertTrue(Path(includes[0].attrib["file"]).is_absolute())
+            generated_robot = Path(includes[0].attrib["file"])
+            self.assertEqual(
+                generated_robot,
+                registered.gear_scene_xml.parent / "gear_robot.xml",
+            )
+            self.assertTrue(generated_robot.is_absolute())
+            generated_compiler = ET.parse(generated_robot).getroot().find("compiler")
+            self.assertIsNotNone(generated_compiler)
+            assert generated_compiler is not None
+            self.assertEqual(
+                generated_compiler.attrib["meshdir"],
+                str((robot.parent / "meshes").resolve()),
+            )
             terrain_geoms = root_xml.findall("./worldbody/geom[@name='mm_terrain']")
             self.assertEqual(len(terrain_geoms), 1)
             self.assertEqual(terrain_geoms[0].attrib["type"], "plane")
@@ -818,6 +887,65 @@ class OverlayAndAuthenticationTests(unittest.TestCase):
                     mm_scene_identity=_flat_scene_identity(),
                 )
 
+    def test_robot_compiler_meshdir_and_real_mesh_directory_fail_closed(self):
+        cases = (
+            "missing-compiler",
+            "duplicate-compiler",
+            "wrong-meshdir",
+            "doctype",
+            "symlink-meshes",
+        )
+        for case in cases:
+            with (
+                self.subTest(case=case),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                terrain_root = root / "terrain"
+                _terrain_fixture(terrain_root)
+                official, robot = _official_scene_fixture(root)
+                if case == "doctype":
+                    robot.write_bytes(b"<!DOCTYPE mujoco []>\n" + robot.read_bytes())
+                    pattern = "DOCTYPE"
+                elif case == "symlink-meshes":
+                    meshes = robot.parent / "meshes"
+                    meshes.rmdir()
+                    outside = root / "outside-meshes"
+                    outside.mkdir()
+                    meshes.symlink_to(outside, target_is_directory=True)
+                    pattern = "symlink"
+                else:
+                    tree = ET.parse(robot)
+                    compiler = tree.getroot().find("compiler")
+                    assert compiler is not None
+                    if case == "missing-compiler":
+                        tree.getroot().remove(compiler)
+                        pattern = "exactly one compiler"
+                    elif case == "duplicate-compiler":
+                        ET.SubElement(
+                            tree.getroot(), "compiler", {"meshdir": "meshes"}
+                        )
+                        pattern = "exactly one compiler"
+                    else:
+                        compiler.attrib["meshdir"] = "other"
+                        pattern = "meshdir.*exactly meshes"
+                    tree.write(robot, encoding="utf-8", xml_declaration=True)
+
+                with self.assertRaisesRegex(SceneError, pattern):
+                    register_scene(
+                        "sonic-flat-baseline",
+                        "flat-12s",
+                        registry_path=REGISTRY,
+                        terrain_dir=terrain_root,
+                        official_scene_xml=official,
+                        output_dir=root / "rejected-output",
+                        expected_official_scene_sha256=_sha256(official),
+                        expected_robot_sha256=_sha256(robot),
+                        mm_hello_identity=_mm_hello_identity(terrain_root),
+                        mm_scene_identity=_flat_scene_identity(),
+                    )
+                self.assertFalse((root / "rejected-output").exists())
+
 
 class KinematicReplayTests(unittest.TestCase):
     def setUp(self):
@@ -951,8 +1079,22 @@ class KinematicReplayTests(unittest.TestCase):
                 "registered GEAR scene XML.*SHA-256",
             ),
             (
-                "robot include",
+                "official scene",
+                lambda scene: self.official,
+                "registered official scene XML.*SHA-256",
+            ),
+            (
+                "official robot include",
                 lambda scene: self.robot,
+                "registered robot include.*SHA-256",
+            ),
+            (
+                "generated robot include",
+                lambda scene: Path(
+                    ET.parse(scene.gear_scene_xml).getroot().find("include").attrib[
+                        "file"
+                    ]
+                ),
                 "registered robot include.*SHA-256",
             ),
             (
@@ -980,6 +1122,30 @@ class KinematicReplayTests(unittest.TestCase):
         sidecar.symlink_to(self.robot)
         with self.assertRaisesRegex(SceneError, "symlink"):
             self._replay(0.3, scene=scene)
+
+    def test_replay_rejects_absolute_dotdot_robot_include_escape(self):
+        scene = self._register_flat("dotdot-replay")
+        overlay_tree = ET.parse(scene.gear_scene_xml)
+        include = overlay_tree.getroot().find("include")
+        assert include is not None
+        generated_robot = Path(include.attrib["file"])
+        outside_robot = self.root / "outside-robot.xml"
+        outside_robot.write_bytes(generated_robot.read_bytes())
+        detour = scene.gear_scene_xml.parent / "detour"
+        detour.mkdir()
+        include.attrib["file"] = str(
+            detour / ".." / ".." / outside_robot.name
+        )
+        overlay_tree.write(
+            scene.gear_scene_xml,
+            encoding="utf-8",
+            xml_declaration=True,
+        )
+        output_hashes = dict(scene.output_hashes)
+        output_hashes["gear_scene_xml"] = _sha256(scene.gear_scene_xml)
+        attacked = replace(scene, output_hashes=output_hashes)
+        with self.assertRaisesRegex(SceneError, "robot include escapes"):
+            self._replay(0.3, scene=attacked)
 
 
 class ManifestSchemaTests(unittest.TestCase):
@@ -1268,6 +1434,100 @@ class RealTerrainServerIdentityTests(unittest.TestCase):
     "SONIC_GEAR_CHECKOUT and SONIC_TERRAIN_DIR are required for official GEAR",
 )
 class OfficialGearIntegrationTests(unittest.TestCase):
+    def test_run_local_robot_preserves_structure_and_mesh_provenance(self):
+        checkout = Path(os.environ["SONIC_GEAR_CHECKOUT"]).resolve(strict=True)
+        deploy = checkout / "gear_sonic_deploy/g1"
+        official = deploy / "scene_29dof_with_hand.xml"
+        robot = deploy / "g1_29dof_with_hand.xml"
+        meshes = (deploy / "meshes").resolve(strict=True)
+        self.assertEqual(_sha256(official), GEAR_SCENE_SHA256)
+        self.assertEqual(_sha256(robot), GEAR_ROBOT_SHA256)
+
+        original_root = ET.parse(robot).getroot()
+        original_compiler = original_root.find("compiler")
+        self.assertIsNotNone(original_compiler)
+        assert original_compiler is not None
+        self.assertEqual(original_compiler.attrib.get("meshdir"), "meshes")
+        unresolved = [
+            mesh.attrib["file"]
+            for mesh in original_root.findall("./asset/mesh")
+            if not (meshes / mesh.attrib["file"]).is_file()
+            or (meshes / mesh.attrib["file"]).read_bytes().startswith(
+                b"version https://git-lfs.github.com/spec/v1\n"
+            )
+        ]
+        if unresolved:
+            self.skipTest(
+                "not_run: pinned official GEAR mesh assets are unresolved "
+                f"({len(unresolved)} files; first={unresolved[0]})"
+            )
+
+        terrain_root = Path(os.environ["SONIC_TERRAIN_DIR"]).resolve(strict=True)
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "official-flat"
+            registered = register_scene(
+                "sonic-flat-baseline",
+                "flat-12s",
+                registry_path=REGISTRY,
+                terrain_dir=terrain_root,
+                official_scene_xml=official,
+                output_dir=output,
+                expected_official_scene_sha256=GEAR_SCENE_SHA256,
+                expected_robot_sha256=GEAR_ROBOT_SHA256,
+                mm_hello_identity=_mm_hello_identity(terrain_root),
+                mm_scene_identity=_flat_scene_identity(),
+            )
+
+            overlay_root = ET.parse(registered.gear_scene_xml).getroot()
+            includes = overlay_root.findall("include")
+            self.assertEqual(len(includes), 1)
+            generated_robot = Path(includes[0].attrib["file"]).resolve(strict=True)
+            self.assertEqual(generated_robot.parent, output.resolve(strict=True))
+            self.assertFalse(generated_robot.is_symlink())
+            self.assertNotEqual(generated_robot, robot)
+
+            generated_root = ET.parse(generated_robot).getroot()
+            generated_compilers = generated_root.findall("compiler")
+            self.assertEqual(len(generated_compilers), 1)
+            self.assertEqual(generated_compilers[0].attrib.get("meshdir"), str(meshes))
+            generated_compilers[0].attrib["meshdir"] = "meshes"
+            self.assertEqual(
+                _element_structure(generated_root),
+                _element_structure(original_root),
+            )
+
+            self.assertEqual(
+                set(registered.output_hashes),
+                {
+                    "official_scene",
+                    "official_robot",
+                    "gear_scene_xml",
+                    "robot_include",
+                    "scene_registration",
+                },
+            )
+            self.assertEqual(
+                registered.output_hashes["official_robot"], GEAR_ROBOT_SHA256
+            )
+            self.assertEqual(
+                registered.output_hashes["robot_include"], _sha256(generated_robot)
+            )
+            registration = json.loads(
+                (output / "scene_registration.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(registration["official_scene"], str(official))
+            self.assertEqual(
+                registration["official_scene_sha256"], GEAR_SCENE_SHA256
+            )
+            self.assertEqual(registration["official_robot_include"], str(robot))
+            self.assertEqual(
+                registration["official_robot_include_sha256"], GEAR_ROBOT_SHA256
+            )
+            self.assertEqual(registration["robot_include"], str(generated_robot))
+            self.assertEqual(
+                registration["robot_include_sha256"], _sha256(generated_robot)
+            )
+
     def test_pinned_official_gear_or_explicit_lfs_not_run(self):
         checkout = Path(os.environ["SONIC_GEAR_CHECKOUT"]).resolve(
             strict=True
