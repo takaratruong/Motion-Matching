@@ -216,6 +216,17 @@ def _run_checked(argv: list[str]) -> subprocess.CompletedProcess[str]:
     return completed
 
 
+def _finish_encoder(encoder: Any) -> None:
+    assert encoder.stderr is not None
+    try:
+        stderr = encoder.stderr.read().decode("utf-8", errors="replace")
+    finally:
+        encoder.stderr.close()
+    returncode = encoder.wait()
+    if returncode != 0:
+        raise ContractError(f"ffmpeg encoding failed: {stderr[-2000:]}")
+
+
 def render_replay(run_root: Path, output_dir: Path, *, ffmpeg: str = "ffmpeg", ffprobe: str = "ffprobe") -> dict[str, object]:
     root = run_root.expanduser().resolve(strict=True)
     out = output_dir.expanduser().resolve(strict=False)
@@ -287,11 +298,7 @@ def render_replay(run_root: Path, output_dir: Path, *, ffmpeg: str = "ffmpeg", f
             frame = np.concatenate((left.render(), right.render()), axis=1)
             encoder.stdin.write(np.ascontiguousarray(frame, dtype=np.uint8).tobytes())
         encoder.stdin.close()
-        assert encoder.stderr is not None
-        stderr = encoder.stderr.read().decode("utf-8", errors="replace")
-        returncode = encoder.wait()
-        if returncode != 0:
-            raise ContractError(f"ffmpeg encoding failed: {stderr[-2000:]}")
+        _finish_encoder(encoder)
         encoder = None
         select = "select='" + "+".join(
             f"eq(n,{frame})" for frame in (0, 119, 239, 359, 479, 599)

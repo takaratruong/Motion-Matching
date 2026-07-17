@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -12,12 +13,21 @@ from mm_sonic.joints import ContractError
 from mm_sonic.replay_video import (
     ReplayState,
     _ensure_offscreen_framebuffer,
+    _finish_encoder,
     load_state_stream,
     validate_probe,
 )
 
 
 class ReplayStateContractTests(unittest.TestCase):
+    def test_finishing_encoder_closes_stderr(self) -> None:
+        stderr = io.BytesIO(b"")
+        encoder = SimpleNamespace(stderr=stderr, wait=lambda: 0)
+
+        _finish_encoder(encoder)
+
+        self.assertTrue(stderr.closed)
+
     def test_expands_offscreen_framebuffer_without_shrinking_it(self) -> None:
         global_visual = SimpleNamespace(offwidth=320, offheight=1080)
         model = SimpleNamespace(vis=SimpleNamespace(global_=global_visual))
