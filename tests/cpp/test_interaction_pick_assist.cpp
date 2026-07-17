@@ -2017,8 +2017,12 @@ void test_final_preview_certifies_frozen_slot_and_submits_once() {
         "Submitted continued driving controller output");
     assist.cancel();
     require(
-        assist.diagnostics().state == interaction::PickAssistState::Submitted,
-        "cancel changed Submitted");
+        assist.diagnostics().state == interaction::PickAssistState::Submitted &&
+            assist.diagnostics().reason == interaction::PickAssistReason::None &&
+            !assist.active() && !assist.owns_manual_interact(),
+        "cancel changed terminal Submitted state or ownership");
+    require(!assist.take_submission(9U).has_value(),
+        "cancel created a second Submitted request");
 }
 
 void test_final_preview_diagnostics_capture_rejection_and_retry_reset() {
@@ -2140,6 +2144,85 @@ void require_cancel_cleared(interaction::ControllerPickAssist& assist) {
         "cancelled assist remained active");
     require(!assist.observe({}).override_steering,
         "cancel did not release override on the same tick");
+}
+
+void test_frozen_slot_cancel_clears_state_and_restarts() {
+    FrozenSlotScenario scenario;
+    interaction::ControllerPickAssist assist;
+    require(
+        assist.begin(scenario.start, &scenario.target),
+        "frozen-slot cancel fixture begin failed");
+    const interaction::PickAssistDiagnostics frozen_before =
+        assist.diagnostics();
+
+    scenario.observation.displayed_root.position.x = -0.60F;
+    const interaction::PickAssistOutput steering_output =
+        assist.observe(scenario.observation);
+    require(
+        steering_output.override_steering &&
+            !is_zero(steering_output.left_stick) &&
+            !steering_output.needs_preview &&
+            !steering_output.stationary_constraint &&
+            !steering_output.submit_interact &&
+            assist.diagnostics().assisted_travel_m > 0.0F,
+        "frozen-slot cancel fixture did not produce steering and travel");
+    require_frozen_slot_provenance_unchanged(
+        frozen_before,
+        assist.diagnostics(),
+        "frozen-slot cancel fixture changed provenance before cancellation");
+
+    assist.cancel();
+    require_zero_pick_assist_output(
+        assist.observe(scenario.observation),
+        "frozen-slot cancel emitted same-tick output");
+    require_zero_pick_assist_output(
+        assist.observe(scenario.observation),
+        "frozen-slot cancel emitted subsequent output");
+
+    const interaction::PickAssistDiagnostics& cancelled =
+        assist.diagnostics();
+    require(
+        cancelled.state == interaction::PickAssistState::Idle &&
+            cancelled.reason == interaction::PickAssistReason::Cancelled,
+        "frozen-slot cancel did not remain visibly Idle/Cancelled");
+    require(
+        cancelled.target == interaction::TargetHandle{} &&
+            cancelled.affordance_id == 0U &&
+            cancelled.selected_slot == -1 &&
+            cancelled.selected_slot_id == 0U,
+        "frozen-slot cancel retained identity diagnostics");
+    require(
+        cancelled.slot_selection.ordered.empty() &&
+            !cancelled.slot_selection.selected_index.has_value() &&
+            cancelled.slot_selection.reason ==
+                interaction::PickSlotReason::NoAuthoredSlot,
+        "frozen-slot cancel retained selection diagnostics");
+    require(
+        cancelled.slot_route_lengths_m == std::array<float, 2>{} &&
+            cancelled.slot_permitted == std::array<bool, 2>{} &&
+            cancelled.route_length_m == 0.0F &&
+            cancelled.assisted_travel_m == 0.0F &&
+            cancelled.object_origin_distance_m == 0.0F &&
+            cancelled.object_bounds_center_distance_m == 0.0F &&
+            cancelled.root_error_m == 0.0F &&
+            cancelled.yaw_error_radians == 0.0F &&
+            cancelled.speed_mps == 0.0F &&
+            cancelled.settle_ticks == 0U,
+        "frozen-slot cancel retained travel or motion diagnostics");
+    require_final_preview_diagnostics_cleared(cancelled);
+    require(
+        !assist.active() && !assist.owns_manual_interact() &&
+            !assist.take_submission(10U).has_value(),
+        "frozen-slot cancel retained ownership or submission");
+
+    FrozenSlotScenario restarted;
+    require(
+        assist.begin(restarted.start, &restarted.target) &&
+            assist.diagnostics().state ==
+                interaction::PickAssistState::SlotApproach &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::None,
+        "frozen-slot cancel did not permit an immediate valid restart");
 }
 
 void test_cancel_clears_every_pre_submit_phase() {
@@ -2612,6 +2695,7 @@ int main() {
         test_final_preview_certifies_frozen_slot_and_submits_once();
         test_final_preview_diagnostics_capture_rejection_and_retry_reset();
         test_preview_root_provenance_rejects_one_bit_perturbations();
+        test_frozen_slot_cancel_clears_state_and_restarts();
         test_cancel_clears_every_pre_submit_phase();
         test_target_by_id_and_runtime_changes_fail_before_submission();
         test_nonfinite_target_observation_and_preview_fail_closed();
