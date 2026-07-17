@@ -65,6 +65,12 @@ bool same_float_bits_exact(float left, float right) {
     return std::memcmp(&left, &right, sizeof(left)) == 0;
 }
 
+bool same_vec3_bits_exact(vec3 left, vec3 right) {
+    return same_float_bits_exact(left.x, right.x) &&
+        same_float_bits_exact(left.y, right.y) &&
+        same_float_bits_exact(left.z, right.z);
+}
+
 bool same_transform_bits_exact(
     interaction::Transform left,
     interaction::Transform right) {
@@ -564,15 +570,11 @@ void test_slot_approach_emits_slow_radius_arrival_steering() {
     require(
         output.override_steering && output.force_strafe,
         "slow-radius SlotApproach did not own strafe steering");
-    require_near(
-        output.left_stick,
-        expected_left,
-        2.0e-5F,
+    require(
+        same_vec3_bits_exact(output.left_stick, expected_left),
         "slow-radius SlotApproach did not use arrival navigation steering");
-    require_near(
-        output.right_stick,
-        expected_right,
-        2.0e-5F,
+    require(
+        same_vec3_bits_exact(output.right_stick, expected_right),
         "slow-radius SlotApproach did not use frozen-root facing steering");
     require(
         !output.needs_preview && !output.stationary_constraint &&
