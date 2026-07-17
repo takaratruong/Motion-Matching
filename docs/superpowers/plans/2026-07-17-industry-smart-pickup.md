@@ -537,7 +537,7 @@ Make, and raylib for the final native visualization only.
       const PickSlotConfig& config = {});
   ```
 
-- [ ] **Step 1: Write failing object-planar mapping tests**
+- [x] **Step 1: Write failing object-planar mapping tests**
 
   In `tests/cpp/test_interaction_pick_slots.cpp`, create one target with a slot
   `{7U, 0.20F, -0.40F, 0.25F}`. Assert:
@@ -556,7 +556,7 @@ Make, and raylib for the final native visualization only.
   `1.25F` is preserved exactly, and a quaternion whose object-forward projects
   to zero in XZ yields `PickSlotReason::InvalidGeometry`.
 
-- [ ] **Step 2: Write failing direct-clearance tests**
+- [x] **Step 2: Write failing direct-clearance tests**
 
   Cover all exact geometry contracts with real pure-function calls:
 
@@ -579,7 +579,7 @@ Make, and raylib for the final native visualization only.
     the two derived target-distance diagnostics do change.
   - Direct length exactly `1.00002F` is eligible and `1.00003F` is not.
 
-- [ ] **Step 3: Write failing deterministic-ranking tests**
+- [x] **Step 3: Write failing deterministic-ranking tests**
 
   Provide at least four clear authored slots and assert ordering by the exact
   tuple:
@@ -612,7 +612,7 @@ Make, and raylib for the final native visualization only.
   margin. Every constructor/call must fail closed with the same result in normal
   and fast-math builds.
 
-- [ ] **Step 4: Add the explicit Make target and verify the red failure**
+- [x] **Step 4: Add the explicit Make target and verify the red failure**
 
   Add `build/tests/test_interaction_pick_slots` to `CPP_TEST_BINS`, with only
   `interaction_pick_slots.cpp`, `interaction_target.cpp`, and
@@ -626,7 +626,7 @@ Make, and raylib for the final native visualization only.
 
   Expected: compilation fails because the new interface has no implementation.
 
-- [ ] **Step 5: Implement finite object-planar mapping and half-up keys**
+- [x] **Step 5: Implement finite object-planar mapping and half-up keys**
 
   Derive target planar forward from object rotation applied to world +Z,
   normalize only XZ, and use
@@ -650,7 +650,7 @@ Make, and raylib for the final native visualization only.
   do not use `std::isfinite` in this fast-math-sensitive seam. Validate every
   `PickSlotConfig` scalar before mapping any candidate.
 
-- [ ] **Step 6: Implement exact closed-segment table and sphere/AABB clearance**
+- [x] **Step 6: Implement exact closed-segment table and sphere/AABB clearance**
 
   For the table, transform segment endpoints by inverse table yaw and apply a
   two-axis slab intersection against half extents plus `0.24F`; use slab epsilon
@@ -672,7 +672,7 @@ Make, and raylib for the final native visualization only.
 
   Iterate blockers in input order and retain the first failing index.
 
-- [ ] **Step 7: Implement selection and frozen-route revalidation**
+- [x] **Step 7: Implement selection and frozen-route revalidation**
 
   Map/evaluate every authored slot in authored order for diagnostics. Select
   among `reason == PickSlotReason::None` by the quantized tuple without sorting
@@ -684,7 +684,7 @@ Make, and raylib for the final native visualization only.
   differing current/frozen Y that distinguishes this fixed-current-Y result from
   a sloped-segment result.
 
-- [ ] **Step 8: Run focused normal and fast-math tests**
+- [x] **Step 8: Run focused normal and fast-math tests**
 
   Run:
 
