@@ -624,7 +624,10 @@ void expect_frozen_slot_observation_failure(
                 interaction::PickAssistState::SlotApproach &&
             frozen_before.reason == interaction::PickAssistReason::None &&
             frozen_before.selected_slot_id == 9U &&
-            frozen_before.slot_selection.selected_index.has_value(),
+            frozen_before.slot_selection.selected_index.has_value() &&
+            frozen_before.settle_ticks == 0U &&
+            same_float_bits_exact(
+                frozen_before.assisted_travel_m, 0.0F),
         "fixture did not freeze selected slot ID 9");
 
     test_case.mutate(scenario);
@@ -660,6 +663,10 @@ void expect_frozen_slot_observation_failure(
         frozen_before,
         failed,
         failed_provenance_message.c_str());
+    require_case(
+        failed.settle_ticks == frozen_before.settle_ticks &&
+            same_float_bits_exact(failed.assisted_travel_m, 0.0F),
+        "failure advanced settling or accumulated assisted travel");
 
     const interaction::PickAssistOutput terminal_output =
         assist.observe(scenario.observation);
@@ -686,6 +693,10 @@ void expect_frozen_slot_observation_failure(
         frozen_before,
         terminal,
         terminal_provenance_message.c_str());
+    require_case(
+        terminal.settle_ticks == frozen_before.settle_ticks &&
+            same_float_bits_exact(terminal.assisted_travel_m, 0.0F),
+        "stable terminal failure advanced settling or assisted travel");
 }
 
 void test_slot_approach_target_unavailable_failures_are_stable() {
@@ -856,6 +867,53 @@ void test_slot_approach_slot_identity_failures_precede_snapshot_mismatch() {
             [](FrozenSlotScenario& scenario) {
                 selected_authored_slot(scenario).root_x_object_m =
                     float_from_bits(0x7fc00001U);
+            },
+        },
+    }};
+    for (const FrozenSlotObservationFailureCase& test_case : cases) {
+        expect_frozen_slot_observation_failure(test_case);
+    }
+}
+
+void test_slot_approach_nonfinite_observation_failures_are_stable() {
+    const std::array<FrozenSlotObservationFailureCase, 5> cases{{
+        {
+            "nonfinite displayed root position",
+            interaction::PickAssistReason::OutsideTravelEnvelope,
+            [](FrozenSlotScenario& scenario) {
+                scenario.observation.displayed_root.position.x =
+                    float_from_bits(0x7fc00001U);
+            },
+        },
+        {
+            "nonfinite simulation velocity",
+            interaction::PickAssistReason::OutsideTravelEnvelope,
+            [](FrozenSlotScenario& scenario) {
+                scenario.observation.simulation_velocity.z =
+                    float_from_bits(0x7fc00001U);
+            },
+        },
+        {
+            "NaN displayed planar speed",
+            interaction::PickAssistReason::OutsideTravelEnvelope,
+            [](FrozenSlotScenario& scenario) {
+                scenario.observation.displayed_planar_speed_mps =
+                    float_from_bits(0x7fc00001U);
+            },
+        },
+        {
+            "negative displayed planar speed",
+            interaction::PickAssistReason::OutsideTravelEnvelope,
+            [](FrozenSlotScenario& scenario) {
+                scenario.observation.displayed_planar_speed_mps = -0.01F;
+            },
+        },
+        {
+            "nonfinite camera azimuth",
+            interaction::PickAssistReason::OutsideTravelEnvelope,
+            [](FrozenSlotScenario& scenario) {
+                scenario.observation.camera_azimuth =
+                    float_from_bits(0x7f800000U);
             },
         },
     }};
@@ -3024,6 +3082,7 @@ int main() {
         test_slot_approach_target_unavailable_failures_are_stable();
         test_slot_approach_target_snapshot_failures_are_stable();
         test_slot_approach_slot_identity_failures_precede_snapshot_mismatch();
+        test_slot_approach_nonfinite_observation_failures_are_stable();
         test_slot_approach_unchanged_identity_still_steers();
         test_slot_approach_emits_slow_radius_arrival_steering();
         test_slot_approach_latches_inclusive_arrival_boundaries();
