@@ -286,6 +286,26 @@ class ReleaseFastMathMakefileTests(unittest.TestCase):
     BINARY = "build/tests/test_interaction_target_release_fast_math"
     CARRY_TARGET = "test-interaction-carry-release-fast-math"
     CARRY_BINARY = "build/tests/test_interaction_carry_release_fast_math"
+    PICK_PREVIEW_TARGET = "test-pick-entry-preview-release-fast-math"
+    PICK_PREVIEW_BINARY = (
+        "build/tests/test_pick_entry_preview_release_fast_math"
+    )
+    PICK_ORACLE_BINARY = "build/tests/test_pick_entry_oracle"
+    INTERACTION_RUNTIME_SOURCES = (
+        "interaction_runtime.cpp",
+        "interaction_carry.cpp",
+        "interaction_ik.cpp",
+        "interaction_attachment.cpp",
+        "interaction_playback.cpp",
+        "interaction_matcher.cpp",
+        "interaction_features.cpp",
+        "interaction_pose.cpp",
+        "interaction_target.cpp",
+        "interaction_place_target.cpp",
+        "interaction_place_collision.cpp",
+        "interaction_place.cpp",
+        "interaction_place_controller.cpp",
+    )
 
     def _dry_run(self, target: str) -> list[str]:
         repository = Path(__file__).resolve().parents[2]
@@ -342,6 +362,47 @@ class ReleaseFastMathMakefileTests(unittest.TestCase):
             lines.count(self.CARRY_BINARY), 1, "\n".join(lines)
         )
 
+    def _assert_pick_preview_compiles_and_runs(self, lines: list[str]):
+        compile_lines = [
+            line
+            for line in lines
+            if "tests/cpp/test_pick_entry_preview_fast_math.cpp" in line
+            and f"-o {self.PICK_PREVIEW_BINARY}" in line
+        ]
+        self.assertEqual(len(compile_lines), 1, "\n".join(lines))
+        compile_parts = compile_lines[0].split()
+        for flag in ("-O3", "-DNDEBUG", "-ffast-math", "-I."):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, compile_parts)
+        for source in self.INTERACTION_RUNTIME_SOURCES:
+            with self.subTest(source=source):
+                self.assertEqual(compile_parts.count(source), 1)
+        self.assertEqual(
+            lines.count(
+                f"{self.PICK_PREVIEW_BINARY} --fast-math-canary"
+            ),
+            1,
+            "\n".join(lines),
+        )
+
+    def _assert_pick_oracle_compiles_without_probe(self, lines: list[str]):
+        compile_lines = [
+            line
+            for line in lines
+            if "tests/cpp/test_pick_entry_oracle.cpp" in line
+            and f"-o {self.PICK_ORACLE_BINARY}" in line
+        ]
+        self.assertEqual(len(compile_lines), 1, "\n".join(lines))
+        compile_parts = compile_lines[0].split()
+        self.assertIn("-I.", compile_parts)
+        for flag in ("-O3", "-DNDEBUG", "-ffast-math"):
+            with self.subTest(flag=flag):
+                self.assertNotIn(flag, compile_parts)
+        for source in self.INTERACTION_RUNTIME_SOURCES:
+            with self.subTest(source=source):
+                self.assertEqual(compile_parts.count(source), 1)
+        self.assertNotIn("interaction_query_probe", "\n".join(lines))
+
     def test_release_fast_math_target_compiles_and_runs_target_validation(self):
         self._assert_compiles_and_runs(self._dry_run(self.TARGET))
 
@@ -357,6 +418,220 @@ class ReleaseFastMathMakefileTests(unittest.TestCase):
         self._assert_carry_compiles_and_runs(
             self._dry_run("test-interaction-safe")
         )
+
+    def test_pick_entry_preview_release_fast_math_target_compiles_and_runs(self):
+        self._assert_pick_preview_compiles_and_runs(
+            self._dry_run(self.PICK_PREVIEW_TARGET)
+        )
+
+    def test_safe_suite_executes_pick_entry_preview_release_fast_math(self):
+        self._assert_pick_preview_compiles_and_runs(
+            self._dry_run("test-interaction-safe")
+        )
+
+    def test_pick_entry_oracle_target_compiles_without_probe_dependency(self):
+        self._assert_pick_oracle_compiles_without_probe(
+            self._dry_run(self.PICK_ORACLE_BINARY)
+        )
+
+
+class StationaryMotionMatchingMakefileTests(unittest.TestCase):
+    DEBUG_BINARY = "build/tests/test_stationary_motion_matching"
+    RELEASE_BINARY = (
+        "build/tests/test_stationary_motion_matching_release_fast_math"
+    )
+    TEST_SOURCE = "tests/cpp/test_stationary_motion_matching.cpp"
+
+    def _compile_line(self, target: str) -> list[str]:
+        repository = Path(__file__).resolve().parents[2]
+        completed = subprocess.run(
+            ["make", "-Bn", target],
+            cwd=repository,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        lines = [line.strip() for line in completed.stdout.splitlines()]
+        matches = [
+            line
+            for line in lines
+            if self.TEST_SOURCE in line and f"-o {target}" in line
+        ]
+        self.assertEqual(len(matches), 1, "\n".join(lines))
+        return matches[0].split()
+
+    def test_debug_target_compiles_header_only_test(self):
+        parts = self._compile_line(self.DEBUG_BINARY)
+        self.assertEqual(parts.count(self.TEST_SOURCE), 1)
+        self.assertNotIn("stationary_motion_matching.cpp", parts)
+        for flag in ("-O3", "-DNDEBUG", "-ffast-math"):
+            with self.subTest(flag=flag):
+                self.assertNotIn(flag, parts)
+
+    def test_release_target_compiles_with_fast_math_contract(self):
+        parts = self._compile_line(self.RELEASE_BINARY)
+        self.assertEqual(parts.count(self.TEST_SOURCE), 1)
+        self.assertNotIn("stationary_motion_matching.cpp", parts)
+        for flag in ("-O3", "-DNDEBUG", "-ffast-math", "-I."):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, parts)
+
+
+class InteractionArrivalMakefileTests(unittest.TestCase):
+    NORMAL_BINARY = "build/tests/test_interaction_arrival"
+    RELEASE_BINARY = (
+        "build/tests/test_interaction_arrival_release_fast_math"
+    )
+    RELEASE_TARGET = "test-interaction-arrival-release-fast-math"
+    TEST_SOURCE = "tests/cpp/test_interaction_arrival.cpp"
+    PRODUCTION_SOURCE = "interaction_arrival.cpp"
+
+    def _dry_run(self, target: str) -> list[str]:
+        repository = Path(__file__).resolve().parents[2]
+        completed = subprocess.run(
+            ["make", "-Bn", target],
+            cwd=repository,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return [line.strip() for line in completed.stdout.splitlines()]
+
+    def _compile_parts(self, lines: list[str], binary: str) -> list[str]:
+        matches = [
+            line
+            for line in lines
+            if self.TEST_SOURCE in line and f"-o {binary}" in line
+        ]
+        self.assertEqual(len(matches), 1, "\n".join(lines))
+        parts = matches[0].split()
+        self.assertEqual(parts.count(self.TEST_SOURCE), 1)
+        self.assertEqual(parts.count(self.PRODUCTION_SOURCE), 1)
+        self.assertIn("-I.", parts)
+        return parts
+
+    def test_normal_target_compiles_each_source_once(self):
+        parts = self._compile_parts(
+            self._dry_run(self.NORMAL_BINARY), self.NORMAL_BINARY
+        )
+        for flag in ("-O3", "-DNDEBUG", "-ffast-math"):
+            with self.subTest(flag=flag):
+                self.assertNotIn(flag, parts)
+
+    def test_cpp_suite_includes_normal_arrival_binary(self):
+        self._compile_parts(
+            self._dry_run("test-cpp"), self.NORMAL_BINARY
+        )
+
+    def _assert_release_compiles_and_runs(self, lines: list[str]):
+        parts = self._compile_parts(lines, self.RELEASE_BINARY)
+        for flag in ("-O3", "-DNDEBUG", "-ffast-math"):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, parts)
+        self.assertEqual(lines.count(self.RELEASE_BINARY), 1, "\n".join(lines))
+
+    def test_release_target_compiles_and_runs_once(self):
+        self._assert_release_compiles_and_runs(
+            self._dry_run(self.RELEASE_TARGET)
+        )
+
+    def test_safe_suite_executes_release_arrival_validation(self):
+        self._assert_release_compiles_and_runs(
+            self._dry_run("test-interaction-safe")
+        )
+
+
+class InteractionArrivalControllerMakefileTests(unittest.TestCase):
+    NORMAL_BINARY = "build/tests/test_interaction_arrival_controller"
+    RELEASE_BINARY = (
+        "build/tests/test_interaction_arrival_controller_release_fast_math"
+    )
+    RELEASE_TARGET = (
+        "test-interaction-arrival-controller-release-fast-math"
+    )
+    TEST_SOURCE = "tests/cpp/test_interaction_arrival_controller.cpp"
+    SHARED_SOURCES = (
+        "interaction_arrival.cpp",
+        "locomotion_controller_update.cpp",
+    )
+
+    def _dry_run(self, target: str) -> list[str]:
+        repository = Path(__file__).resolve().parents[2]
+        completed = subprocess.run(
+            ["make", "-Bn", target],
+            cwd=repository,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return [line.strip() for line in completed.stdout.splitlines()]
+
+    def _compile_parts(self, lines: list[str], binary: str) -> list[str]:
+        matches = [
+            line
+            for line in lines
+            if self.TEST_SOURCE in line and f"-o {binary}" in line
+        ]
+        self.assertEqual(len(matches), 1, "\n".join(lines))
+        parts = matches[0].split()
+        self.assertEqual(parts.count(self.TEST_SOURCE), 1)
+        for source in self.SHARED_SOURCES:
+            with self.subTest(source=source):
+                self.assertEqual(parts.count(source), 1)
+        self.assertIn("-I.", parts)
+        for forbidden in ("raylib", "-lGL", "-lX11", "-lraylib"):
+            with self.subTest(forbidden=forbidden):
+                self.assertFalse(
+                    any(forbidden in part for part in parts), matches[0]
+                )
+        return parts
+
+    def test_normal_oracle_links_shared_non_graphical_sources_once(self):
+        parts = self._compile_parts(
+            self._dry_run(self.NORMAL_BINARY), self.NORMAL_BINARY
+        )
+        for flag in ("-O3", "-DNDEBUG", "-ffast-math"):
+            with self.subTest(flag=flag):
+                self.assertNotIn(flag, parts)
+
+    def test_cpp_suite_includes_normal_controller_arrival_oracle(self):
+        self._compile_parts(self._dry_run("test-cpp"), self.NORMAL_BINARY)
+
+    def _assert_release_compiles_and_runs(self, lines: list[str]):
+        parts = self._compile_parts(lines, self.RELEASE_BINARY)
+        for flag in ("-O3", "-DNDEBUG", "-ffast-math"):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, parts)
+        self.assertEqual(lines.count(self.RELEASE_BINARY), 1, "\n".join(lines))
+
+    def test_release_oracle_compiles_and_runs_once(self):
+        self._assert_release_compiles_and_runs(
+            self._dry_run(self.RELEASE_TARGET)
+        )
+
+    def test_safe_suite_executes_release_controller_arrival_oracle(self):
+        self._assert_release_compiles_and_runs(
+            self._dry_run("test-interaction-safe")
+        )
+
+    def test_real_controller_links_each_shared_source_once(self):
+        lines = self._dry_run("controller")
+        matches = [
+            line
+            for line in lines
+            if "controller.cpp" in line and "-o controller" in line
+        ]
+        self.assertEqual(len(matches), 1, "\n".join(lines))
+        parts = matches[0].split()
+        for source in self.SHARED_SOURCES:
+            with self.subTest(source=source):
+                self.assertEqual(parts.count(source), 1)
 
 
 @unittest.skipUnless(

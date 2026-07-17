@@ -1,4 +1,5 @@
 #include "interaction_controller_adapter.h"
+#include "tests/cpp/pick_entry_oracle_roots.h"
 
 #include <algorithm>
 #include <array>
@@ -133,6 +134,196 @@ bool exact(
     const interaction::Transform& right) {
     return exact(left.position, right.position) &&
            exact(left.rotation, right.rotation);
+}
+
+enum class PositionMatrixRoot : uint8_t { Reach, Plus };
+
+struct PositionMatrixRow {
+    const char* label = "baseline_reach";
+    PositionMatrixRoot pickup_root = PositionMatrixRoot::Reach;
+    vec3 pickup_translation{};
+    float pickup_yaw_radians = 0.0F;
+    vec3 destination_translation{};
+    float destination_yaw_radians = 0.0F;
+};
+
+const std::array<PositionMatrixRow, 3> kPositionMatrixRows{{
+    {"baseline_reach",
+     PositionMatrixRoot::Reach,
+     vec3(),
+     0.0F,
+     vec3(),
+     0.0F},
+    {"positive_plus",
+     PositionMatrixRoot::Plus,
+     vec3(0.60F, 0.0F, -0.40F),
+     kPi / 6.0F,
+     vec3(-0.40F, 0.0F, 0.30F),
+     -kPi / 6.0F},
+    {"negative_reach",
+     PositionMatrixRoot::Reach,
+     vec3(-0.60F, 0.0F, 0.40F),
+     -kPi / 6.0F,
+     vec3(0.40F, 0.0F, -0.30F),
+     kPi / 6.0F},
+}};
+
+bool identity_scene_transform(vec3 translation, float yaw_radians_value) {
+    return exact(translation, vec3()) && yaw_radians_value == 0.0F;
+}
+
+interaction::Transform scene_transform(
+    vec3 translation,
+    float yaw_radians_value) {
+    return {
+        translation,
+        quat_from_angle_axis(
+            yaw_radians_value, vec3(0.0F, 1.0F, 0.0F)),
+    };
+}
+
+bool same_target_locals(
+    const interaction::InteractionTarget& authored,
+    const interaction::InteractionTarget& transformed) {
+    if (transformed.handle != authored.handle ||
+        !exact(transformed.table_size, authored.table_size) ||
+        transformed.object_profile_id != authored.object_profile_id ||
+        !exact(
+            transformed.object_dimensions,
+            authored.object_dimensions) ||
+        !exact(
+            transformed.object_bounds.center_object,
+            authored.object_bounds.center_object) ||
+        !exact(
+            transformed.object_bounds.half_extents_object,
+            authored.object_bounds.half_extents_object) ||
+        transformed.state != authored.state ||
+        transformed.owner_request != authored.owner_request ||
+        transformed.affordances.size() != authored.affordances.size()) {
+        return false;
+    }
+    for (size_t index = 0; index < authored.affordances.size(); ++index) {
+        if (!interaction::same_authored_grasp_affordance(
+                authored.affordances[index],
+                transformed.affordances[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void require_target_locals_unchanged(
+    const interaction::InteractionTarget& authored,
+    const interaction::InteractionTarget& transformed) {
+    require(
+        same_target_locals(authored, transformed),
+        "pickup scene transform changed target-local data");
+}
+
+void require_authored_slot_identity_mutations_are_observable(
+    interaction::InteractionTarget& authored) {
+    require(
+        !authored.affordances.empty(),
+        "slot identity fixture has no grasp affordance");
+    authored.affordances.front().interaction_slots = {
+        {3U, -0.41F, -0.22F, 1.10F},
+        {9U, 0.18F, -0.39F, 0.20F},
+    };
+
+    interaction::InteractionTarget reordered = authored;
+    std::swap(
+        reordered.affordances.front().interaction_slots[0],
+        reordered.affordances.front().interaction_slots[1]);
+    require(
+        !same_target_locals(authored, reordered),
+        "pickup scene slot order mutation preserved local identity");
+
+    interaction::InteractionTarget changed = authored;
+    changed.affordances.front()
+        .interaction_slots[0].root_x_object_m += 0.001F;
+    require(
+        !same_target_locals(authored, changed),
+        "pickup scene slot value mutation preserved local identity");
+}
+
+interaction::InteractionTarget transform_pickup_scene(
+    const interaction::InteractionTarget& authored,
+    const PositionMatrixRow& row) {
+    interaction::InteractionTarget transformed = authored;
+    if (!identity_scene_transform(
+            row.pickup_translation, row.pickup_yaw_radians)) {
+        const interaction::Transform scene_from_authored = scene_transform(
+            row.pickup_translation, row.pickup_yaw_radians);
+        transformed.table_world = interaction::compose(
+            scene_from_authored, authored.table_world);
+        transformed.object_world = interaction::compose(
+            scene_from_authored, authored.object_world);
+    }
+    require_target_locals_unchanged(authored, transformed);
+    return transformed;
+}
+
+void require_destination_locals_unchanged(
+    const interaction::PlacementSurface& authored,
+    const interaction::PlacementSurface& transformed) {
+    require(
+        transformed.handle == authored.handle &&
+            exact(
+                transformed.support_volume_size,
+                authored.support_volume_size) &&
+            transformed.half_extent_x_m == authored.half_extent_x_m &&
+            transformed.half_extent_z_m == authored.half_extent_z_m &&
+            transformed.overhead_clearance_m ==
+                authored.overhead_clearance_m &&
+            transformed.affordances.size() == authored.affordances.size(),
+        "destination scene transform changed surface-local data");
+    for (size_t index = 0; index < authored.affordances.size(); ++index) {
+        const interaction::PlaceAffordance& expected =
+            authored.affordances[index];
+        const interaction::PlaceAffordance& actual =
+            transformed.affordances[index];
+        require(
+            actual.id == expected.id &&
+                exact(actual.object_in_surface, expected.object_in_surface) &&
+                exact(
+                    actual.support_point_object,
+                    expected.support_point_object) &&
+                exact(
+                    actual.approach_direction_surface,
+                    expected.approach_direction_surface) &&
+                actual.clearance_radius == expected.clearance_radius,
+            "destination transform changed a local place affordance");
+    }
+}
+
+interaction::PlacementSurface transform_destination_scene(
+    const interaction::PlacementSurface& authored,
+    const PositionMatrixRow& row) {
+    interaction::PlacementSurface transformed = authored;
+    if (!identity_scene_transform(
+            row.destination_translation,
+            row.destination_yaw_radians)) {
+        const interaction::Transform scene_from_authored = scene_transform(
+            row.destination_translation, row.destination_yaw_radians);
+        transformed.surface_world = interaction::compose(
+            scene_from_authored, authored.surface_world);
+        transformed.support_volume_world = interaction::compose(
+            scene_from_authored, authored.support_volume_world);
+    }
+    require_destination_locals_unchanged(authored, transformed);
+    return transformed;
+}
+
+bool exact_placement_fit(
+    const interaction::PlacementFit& left,
+    const interaction::PlacementFit& right) {
+    return left.accepted == right.accepted &&
+        left.reason == right.reason &&
+        left.support_gap_m == right.support_gap_m &&
+        left.lowest_corner_m == right.lowest_corner_m &&
+        left.highest_corner_m == right.highest_corner_m &&
+        left.footprint_valid == right.footprint_valid &&
+        left.overhead_valid == right.overhead_valid;
 }
 
 bool exact(
@@ -392,92 +583,67 @@ interaction::LocomotionSnapshot initial_locomotion(
     return locomotion;
 }
 
-interaction::InteractionTarget make_headless_target(
-    const interaction::Database& database) {
-    interaction::InteractionTarget target =
-        interaction::make_controller_demo_target(database);
-    require(
-        target.affordances.size() == 1U,
-        "headless fixture requires one pickup affordance");
-    const int32_t contact = first_phase_frame(
-        database, 0U, interaction::Phase::Contact);
-    const interaction::Transform source_contact_hand = hand_transform(
-        interaction::pose_at_frame(database, contact),
-        target.affordances.front().hand);
-    const interaction::Transform source_rest_object = frame_transform(
-        database.object_positions,
-        database.object_rotations,
-        static_cast<size_t>(contact - 1));
-    target.affordances.front().hand_in_object = interaction::compose(
-        interaction::inverse(source_rest_object), source_contact_hand);
-    return target;
+interaction::PickEntryRoot selected_canonical_root(
+    const interaction::Database& database,
+    const interaction::InteractionTarget& target,
+    PositionMatrixRoot selected) {
+    const pick_entry_oracle::OracleRoots roots =
+        pick_entry_oracle::make_oracle_roots(database, target);
+    switch (selected) {
+    case PositionMatrixRoot::Reach: return roots.reach;
+    case PositionMatrixRoot::Plus: return roots.plus;
+    }
+    fail("position matrix row has an invalid root selector");
 }
 
-interaction::PlacementSurface make_headless_destination_surface(
-    const interaction::Database& database,
-    const interaction::InteractionTarget& source_target) {
-    interaction::PlacementSurface destination =
-        interaction::make_controller_demo_destination_surface(
-            database, source_target);
-    require(
-        destination.affordances.size() == 1U,
-        "headless fixture requires one placement affordance");
-    const int32_t contact = first_phase_frame(
-        database, 0U, interaction::Phase::Contact);
-    const interaction::Transform source_table = frame_transform(
-        database.table_positions, database.table_rotations, 0U);
-    const vec3 source_table_size = read_vec3(database.table_sizes, 0U);
-    const interaction::Transform source_surface = interaction::compose(
-        source_table,
-        interaction::Transform{
-            vec3(0.0F, 0.5F * source_table_size.y, 0.0F), quat()});
-    const interaction::Transform source_rest_object = frame_transform(
-        database.object_positions,
-        database.object_rotations,
-        static_cast<size_t>(contact - 1));
-    const vec3 source_normal = quat_mul_vec3(
-        source_table.rotation, vec3(0.0F, 1.0F, 0.0F));
-    const float projection_distance = dot(
-        source_surface.position - source_rest_object.position,
-        source_normal);
-    const vec3 projected_support = source_rest_object.position +
-        projection_distance * source_normal;
-
-    interaction::PlaceAffordance& place = destination.affordances.front();
-    place.support_point_object = interaction::compose(
-        interaction::inverse(source_rest_object),
-        interaction::Transform{projected_support, quat()}).position;
-    const interaction::Transform rest_object_in_surface =
-        interaction::compose(
-            interaction::inverse(source_surface), source_rest_object);
-    place.object_in_surface = rest_object_in_surface;
-    interaction::PlacementFit rest_fit =
-        interaction::evaluate_placement_fit(
-            destination, place, source_target.object_bounds);
-    if (!rest_fit.accepted) {
-        require(
-            rest_fit.footprint_valid && rest_fit.overhead_valid &&
-                rest_fit.support_gap_m == 0.0F &&
-                rest_fit.lowest_corner_m < 0.0F,
-            "rest-authored destination has an unexpected fit failure");
-        const float bounds_clearance = -rest_fit.lowest_corner_m;
-        const vec3 destination_normal = quat_mul_vec3(
-            destination.surface_world.rotation,
-            vec3(0.0F, 1.0F, 0.0F));
-        destination.surface_world.position =
-            destination.surface_world.position -
-            bounds_clearance * destination_normal;
-        destination.support_volume_world.position =
-            destination.support_volume_world.position -
-            bounds_clearance * destination_normal;
-        place.object_in_surface.position.y += bounds_clearance;
-        rest_fit = interaction::evaluate_placement_fit(
-            destination, place, source_target.object_bounds);
+std::string_view position_matrix_root_name(PositionMatrixRoot selected) {
+    switch (selected) {
+    case PositionMatrixRoot::Reach: return "Reach";
+    case PositionMatrixRoot::Plus: return "Plus";
     }
+    fail("position matrix row has an invalid root selector");
+}
+
+void require_selected_initial_root(
+    const interaction::Database& database,
+    const interaction::InteractionTarget& target,
+    const PositionMatrixRow& row,
+    const interaction::LocomotionSnapshot& locomotion) {
+    const interaction::PickEntryRoot selected = selected_canonical_root(
+        database, target, row.pickup_root);
+    const size_t root = static_cast<size_t>(g1_skeleton::Simulation);
+    const vec3 actual = locomotion.pose.positions[root];
     require(
-        rest_fit.accepted,
-        "rest-authored destination slot is not support-fit");
-    return destination;
+        std::hypot(
+            actual.x - selected.world_x,
+            actual.z - selected.world_z) <= 1.0e-5F &&
+            std::abs(shortest_angle(
+                yaw_radians(locomotion.pose.rotations[root]) -
+                selected.world_yaw_radians)) <= 1.0e-5F,
+        std::string(row.label) +
+            " initial live root does not match selected canonical " +
+            std::string(position_matrix_root_name(row.pickup_root)) +
+            " root");
+}
+
+interaction::LocomotionSnapshot initial_locomotion_for_row(
+    const interaction::Database& database,
+    const interaction::InteractionTarget& target,
+    const PositionMatrixRow& row) {
+    interaction::LocomotionSnapshot locomotion = initial_locomotion(
+        database, target);
+    if (row.pickup_root == PositionMatrixRoot::Reach) {
+        return locomotion;
+    }
+    const interaction::runtime_detail::PickSnapshotMap mapped =
+        interaction::runtime_detail::map_pick_entry_snapshot(
+            locomotion,
+            selected_canonical_root(database, target, row.pickup_root));
+    require(
+        mapped.accepted && mapped.reason == interaction::Reason::None,
+        std::string(row.label) +
+            " canonical root rejected production snapshot mapping");
+    return mapped.snapshot;
 }
 
 vec3 step_planar_toward(vec3 current, vec3 target, float distance) {
@@ -601,22 +767,47 @@ public:
     ProbeFixture(
         interaction::Database database_value,
         const interaction::Features& features_value,
-        interaction::RuntimeConfig config_value)
+        interaction::RuntimeConfig config_value,
+        const PositionMatrixRow& position_row_value =
+            kPositionMatrixRows.front())
         : database(std::move(database_value)),
           features(features_value),
           config(config_value),
+          position_row(position_row_value),
           live(initial_locomotion_for_fixture()) {
-        interaction::InteractionTarget authored =
-            make_headless_target(database);
+        interaction::InteractionTarget controller_authored =
+            interaction::make_controller_demo_target(database);
+        require_authored_slot_identity_mutations_are_observable(
+            controller_authored);
+        interaction::InteractionTarget authored = transform_pickup_scene(
+            controller_authored, position_row);
         target = registry.upsert(std::move(authored));
         const interaction::InteractionTarget* registered = registry.find(target);
         require(registered != nullptr, "authored target registration failed");
         pick_affordance = registered->affordances.at(0).id;
         authored_target = *registered;
 
+        const interaction::PlacementSurface controller_destination =
+            interaction::make_controller_demo_destination_surface(
+                database, controller_authored);
+        const interaction::PlacementFit baseline_destination_fit =
+            interaction::evaluate_placement_fit(
+                controller_destination,
+                controller_destination.affordances.at(0),
+                controller_authored.object_bounds);
         interaction::PlacementSurface destination =
-            make_headless_destination_surface(
-                database, authored_target);
+            transform_destination_scene(
+                controller_destination, position_row);
+        const interaction::PlacementFit fresh_destination_fit =
+            interaction::evaluate_placement_fit(
+                destination,
+                destination.affordances.at(0),
+                authored_target.object_bounds);
+        require(
+            baseline_destination_fit.accepted &&
+                exact_placement_fit(
+                    fresh_destination_fit, baseline_destination_fit),
+            "rigid destination transform changed fresh placement fit");
         place_affordance = destination.affordances.at(0).id;
         destination_surface = surfaces.upsert(std::move(destination));
         const interaction::PlacementSurface* retained =
@@ -625,7 +816,10 @@ public:
         authored_destination = *retained;
 
         live = DeterministicFlatLiveProvider(
-            initial_locomotion(database, authored_target));
+            initial_locomotion_for_row(
+                database, authored_target, position_row));
+        require_selected_initial_root(
+            database, authored_target, position_row, live.snapshot());
         runtime = std::make_unique<interaction::InteractionRuntime>(
             database,
             features,
@@ -681,6 +875,7 @@ public:
     uint32_t place_affordance = 0U;
     interaction::InteractionTarget authored_target{};
     interaction::PlacementSurface authored_destination{};
+    PositionMatrixRow position_row{};
     DeterministicFlatLiveProvider live;
     std::unique_ptr<interaction::InteractionRuntime> runtime;
     std::vector<uint64_t> preview_ids;
@@ -689,9 +884,12 @@ public:
 
 private:
     interaction::LocomotionSnapshot initial_locomotion_for_fixture() const {
-        interaction::InteractionTarget target_for_mapping =
-            make_headless_target(database);
-        return initial_locomotion(database, target_for_mapping);
+        const interaction::InteractionTarget authored =
+            interaction::make_controller_demo_target(database);
+        const interaction::InteractionTarget target_for_mapping =
+            transform_pickup_scene(authored, position_row);
+        return initial_locomotion_for_row(
+            database, target_for_mapping, position_row);
     }
 };
 
@@ -743,6 +941,33 @@ interaction::RuntimeOutput run_pickup_to_carry(
             held->owner_request == request_id,
         "registry did not retain the pickup owner in Carry");
     return output;
+}
+
+interaction::Reason run_height_rejection_control(
+    const interaction::Database& database,
+    const interaction::Features& features,
+    interaction::RuntimeConfig config,
+    const PositionMatrixRow& successful_row,
+    const char* label,
+    float destination_height_m) {
+    PositionMatrixRow control = successful_row;
+    control.label = label;
+    control.destination_translation.y = destination_height_m;
+    auto fixture = std::make_unique<ProbeFixture>(
+        database, features, config, control);
+    AttachmentAudit audit{};
+    const interaction::RuntimeOutput carry = run_pickup_to_carry(
+        *fixture, audit, 8101U);
+    const interaction::PlaceStagingPreview preview = fixture->preview();
+    require(
+        carry.diagnostics.state == interaction::RuntimeState::Carry &&
+            carry.diagnostics.attached &&
+            audit.attach_events == 1 && audit.release_events == 0 &&
+            !preview.accepted && !preview.ready &&
+            preview.reason == interaction::Reason::PlacementOutOfBounds,
+        std::string(label) +
+            " did not preserve the signed-height capability limit");
+    return preview.reason;
 }
 
 void require_preview_configuration(
@@ -807,13 +1032,13 @@ void require_expected_reverse_source(
     const interaction::Transform source_hand = hand_transform(
         interaction::pose_at_frame(fixture.database, frames.contact),
         grasp->hand);
-    const interaction::Transform expected_scene = planar_alignment(
-        source_hand, goal_hand);
+    const interaction::Transform mapped_goal_hand = interaction::compose(
+        preview.candidate.scene_from_source, source_hand);
     require(
-        near(preview.candidate.scene_from_source, expected_scene),
-        "runtime preview scene mapping differs from source/destination");
+        near(mapped_goal_hand, goal_hand),
+        "runtime preview scene mapping missed the destination hand goal");
     const interaction::Transform expected_staging = interaction::compose(
-        expected_scene,
+        preview.candidate.scene_from_source,
         root_transform(interaction::pose_at_frame(
             fixture.database, frames.reverse_start)));
     require(
@@ -991,7 +1216,8 @@ struct PlacementEvidence {
 PlacementEvidence run_successful_place_and_repick(
     ProbeFixture& fixture,
     const StagedCarry& staged,
-    AttachmentAudit& audit) {
+    AttachmentAudit& audit,
+    bool verify_repick_preflight = true) {
     using interaction::ObjectState;
     using interaction::Reason;
     using interaction::ResultCode;
@@ -1121,11 +1347,25 @@ PlacementEvidence run_successful_place_and_repick(
         placed != nullptr && destination != nullptr &&
             place_affordance != nullptr,
         "released target or retained destination became unavailable");
+    const interaction::Transform transformed_goal =
+        interaction::placement_goal_world(
+            *destination, place_affordance->object_in_surface);
     require(
-        exact(placed->object_world, release_object) &&
-            exact(placed->table_world, destination->support_volume_world) &&
-            exact(placed->table_size, destination->support_volume_size),
-        "released target did not commit destination support context");
+        exact(placed->object_world, release_object),
+        "released target differs from the runtime release pose");
+    require(
+        exact(placed->table_world, destination->support_volume_world) &&
+            exact(placed->table_size, destination->support_volume_size) &&
+            exact(
+                destination->surface_world,
+                fixture.authored_destination.surface_world) &&
+            exact(
+                destination->support_volume_world,
+                fixture.authored_destination.support_volume_world),
+        "released target did not commit transformed destination context");
+    require(
+        near(placed->object_world, transformed_goal),
+        "released target did not finish at the transformed goal");
     const interaction::PlacementFit fit =
         interaction::evaluate_actual_placement_fit(
             *destination,
@@ -1134,6 +1374,10 @@ PlacementEvidence run_successful_place_and_repick(
             placed->object_bounds);
     require(fit.accepted, "released target failed fresh actual-fit check");
     evidence.actual_fit = true;
+    if (!verify_repick_preflight) {
+        evidence.final_output = output;
+        return evidence;
+    }
 
     const interaction::GraspAffordance* repick_affordance =
         fixture.registry.find_affordance(
@@ -1185,7 +1429,8 @@ PlacementEvidence run_successful_place_and_repick(
     }
     require(
         repick_locomotion_settled,
-        "native-rate post-release Locomotion did not settle for repick");
+        std::string(fixture.position_row.label) +
+            " native-rate post-release Locomotion did not settle for repick");
 
     interaction::QueryInput repick_query{};
     repick_query.locomotion = fixture.live.snapshot();
@@ -1203,6 +1448,7 @@ PlacementEvidence run_successful_place_and_repick(
             !exact(repick_query.table_world, fixture.authored_target.table_world),
         "fresh pick query did not use destination support context");
     static_cast<void>(interaction::build_raw_query(repick_query));
+    evidence.repick_support_is_destination = true;
 
     const interaction::PickRequest repick{
         placed_handle, fixture.pick_affordance, 8202U};
@@ -1217,14 +1463,15 @@ PlacementEvidence run_successful_place_and_repick(
         repick_output.diagnostics.state == RuntimeState::Align &&
             repick_output.diagnostics.target == placed_handle,
         "released generation did not pass fresh destination pick preflight");
-    evidence.repick_support_is_destination = true;
     evidence.final_output = output;
     return evidence;
 }
 
 void print_json(
     const PlacementEvidence& evidence,
-    int attachment_transitions) {
+    int attachment_transitions,
+    interaction::Reason positive_height_result,
+    interaction::Reason negative_height_result) {
     std::cout
         << "{\"actual_carry_staging\":true"
         << ",\"actual_fit\":" << (evidence.actual_fit ? "true" : "false")
@@ -1240,6 +1487,12 @@ void print_json(
         << ",\"ik_config_bound\":true"
         << ",\"ik_config_fingerprint\":" << evidence.ik_fingerprint
         << ",\"mode\":\"reversed_pickup\""
+        << ",\"position_height_controls\":2"
+        << ",\"position_height_negative_result\":\""
+        << reason_name(negative_height_result) << '"'
+        << ",\"position_height_positive_result\":\""
+        << reason_name(positive_height_result) << '"'
+        << ",\"position_matrix_cases\":" << kPositionMatrixRows.size()
         << ",\"release_frame\":" << evidence.release_frame
         << ",\"repick_support_is_destination\":"
         << (evidence.repick_support_is_destination ? "true" : "false")
@@ -1377,7 +1630,53 @@ int main(int argc, char** argv) {
             evidence.release_frame == frames.contact &&
                 evidence.reverse_start_frame == frames.reverse_start,
             "final evidence frames differ from fixture-derived frames");
-        print_json(evidence, success_audit.attach_events);
+        for (size_t index = 1U;
+             index < kPositionMatrixRows.size();
+             ++index) {
+            const PositionMatrixRow& row = kPositionMatrixRows[index];
+            auto matrix_case = std::make_unique<ProbeFixture>(
+                database, features, config, row);
+            AttachmentAudit matrix_audit{};
+            const StagedCarry matrix_staged = run_actual_carry_staging(
+                *matrix_case, frames, matrix_audit, 8101U);
+            const PlacementEvidence matrix_evidence =
+                run_successful_place_and_repick(
+                    *matrix_case, matrix_staged, matrix_audit, false);
+            require(
+                matrix_evidence.states == evidence.states &&
+                    matrix_evidence.release_frame == evidence.release_frame &&
+                    matrix_evidence.reverse_start_frame ==
+                        evidence.reverse_start_frame &&
+                    matrix_evidence.ik_fingerprint ==
+                        evidence.ik_fingerprint &&
+                    matrix_evidence.actual_fit &&
+                    matrix_audit.attach_events == 1 &&
+                    matrix_audit.release_events == 1 &&
+                    !matrix_audit.attached,
+                std::string(row.label) +
+                    " did not match baseline placement evidence");
+        }
+        const interaction::Reason positive_height_result =
+            run_height_rejection_control(
+                database,
+                features,
+                config,
+                kPositionMatrixRows[1],
+                "positive_height_control",
+                0.05F);
+        const interaction::Reason negative_height_result =
+            run_height_rejection_control(
+                database,
+                features,
+                config,
+                kPositionMatrixRows[2],
+                "negative_height_control",
+                -0.05F);
+        print_json(
+            evidence,
+            success_audit.attach_events,
+            positive_height_result,
+            negative_height_result);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "interaction_place_probe: " << error.what() << '\n';

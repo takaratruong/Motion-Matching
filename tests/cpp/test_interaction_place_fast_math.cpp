@@ -156,6 +156,7 @@ Fixture make_fixture(float speed) {
         Transform{vec3(), quat()},
         vec3(0.0F, 1.0F, 0.0F),
         0.01F,
+        {},
     };
     fixture.input.surface = make_surface(77U);
     fixture.input.place_affordance = fixture.input.surface.affordances.front();

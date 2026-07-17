@@ -256,6 +256,49 @@ void test_required_boundaries() {
     TEST_CHECK(!ambiguous.resolve_single_target(vec3(), 1.0F).has_value());
 }
 
+void test_authored_interaction_slot_validation() {
+    using namespace interaction;
+
+    InteractionTarget target = make_target(13, 1);
+    target.affordances.front().interaction_slots = {
+        {3U, -0.41F, -0.22F, 1.10F},
+        {9U, 0.18F, -0.39F, 0.20F},
+    };
+
+    TargetRegistry valid_registry;
+    const TargetHandle valid = valid_registry.upsert(target);
+    TEST_CHECK(valid_registry.find(valid) != nullptr);
+
+    const auto rejected = [&](auto mutate) {
+        InteractionTarget malformed = target;
+        mutate(malformed.affordances.front().interaction_slots);
+        TargetRegistry registry;
+        TEST_CHECK(throws_invalid_argument([&] {
+            (void)registry.upsert(malformed);
+        }));
+    };
+    rejected([](auto& slots) { slots[0].id = 0U; });
+    rejected([](auto& slots) { slots[1].id = slots[0].id; });
+    rejected([](auto& slots) {
+        slots[0].root_x_object_m =
+            std::numeric_limits<float>::quiet_NaN();
+    });
+    rejected([](auto& slots) {
+        slots[0].root_z_object_m =
+            std::numeric_limits<float>::infinity();
+    });
+    rejected([](auto& slots) {
+        slots[0].root_yaw_object_radians =
+            std::numeric_limits<float>::quiet_NaN();
+    });
+
+    InteractionTarget legacy = make_target(14, 1);
+    legacy.affordances.front().interaction_slots.clear();
+    TargetRegistry legacy_registry;
+    const TargetHandle legacy_handle = legacy_registry.upsert(legacy);
+    TEST_CHECK(legacy_registry.find(legacy_handle) != nullptr);
+}
+
 void test_upsert_validation_and_replacement() {
     using namespace interaction;
 
@@ -925,6 +968,7 @@ int main() {
     test_registry_and_resolver();
     test_direct_id_lookup_ignores_generation_and_target_count();
     test_required_boundaries();
+    test_authored_interaction_slot_validation();
     test_upsert_validation_and_replacement();
     test_registry_mutation_validation_is_strict_and_transactional();
     test_nonfinite_mutations_reject_with_assertions_disabled();

@@ -131,6 +131,55 @@ using the destination support context. The Python validator independently
 checks sorted compact output, earliest-window selection, and invariance when
 only the source clip's last contact sample is cleared.
 
+# Playable walk, pickup, carry, and placement evidence
+
+Run the focused headless placement proof first, then the native-25-Hz graphical
+gate on a working X11 display:
+
+```bash
+make gate-place-headless
+
+PATH=$PWD/.venv/bin:/home/ubuntu/miniconda3/envs/diffsim/bin:$PATH \
+GRAIL_ROOT=/home/ubuntu/datasets/GRAIL/data/pickup_table \
+G1_XML=/home/ubuntu/projects/mjx-diffphysics/env/g1/assets/g1_29dof.xml \
+DISPLAY=${DISPLAY:-:1} \
+make gate-playable-placement
+```
+
+The graphical gate starts from the live default spawn more than 2.80 m from
+the pickup object. It uses ordinary flat-ground left-stick locomotion for at
+least 25 ticks and 2.00 m, settles for five live 25 Hz rows, picks up, carries,
+and places. The clip-0 Reach root is only a navigation waypoint. Canonical
+snapshot substitution, canonical relocation, and direct scripted root writes
+are disabled throughout placement mode.
+
+During Carry, `MM_INTERACTION_PLACE_AUTODEMO=1` latches the exact retained
+authored pair—the retained authored destination—and calls only the runtime-owned
+placement preview. This
+is intentionally distinct from the manual 1.00 m surface resolver used by the
+ordinary `F` pick/place control. The diagnostic pack has no local true place
+data, so the expected successful mode is `reversed_pickup`; recorded place data
+can select `recorded_place` when it is added later.
+
+The gate atomically publishes the JSONL and screenshot after eighteen
+consecutive logged, no-input locomotion handoff frames. The first fifteen keep
+the demo visible through the bounded post-release arm return; publication also
+requires at least three consecutive frames after every interaction pose
+overlay has relinquished to ordinary locomotion. Those final frames may retain
+the natural motion of the idle locomotion database—they are not frozen poses.
+If the overlay needs longer, the no-input tail extends deterministically up to
+75 frames. Pickup's separate seven-frame unlogged Reset drain is unchanged:
+
+- `playable-evidence/placement/placement.jsonl`
+- `playable-evidence/placement/placement.png`
+
+The independently captured native-rate lossless review video is kept at
+`playable-evidence/placement/placement-native25-ffv1.mkv`. The evidence path
+variables are `PLACEMENT_EVIDENCE_DIR`, `PLACEMENT_LOG_PATH`,
+`PLACEMENT_SCREENSHOT_PATH`, and `PLACEMENT_FEATURES_OUTPUT`. This gate proves
+the current tabletop and flat-ground scope only; terrain, constrained shelves,
+and articulated objects remain separate work.
+
 # Playable G1 Tabletop Pickup
 
 The desktop controller now combines the existing flat locomotion controller with one authored G1 tabletop pickup. Locomotion, interaction matching, rendering, scene publication, and the ownership handoff advance synchronously at a fixed 25 Hz; none of them is driven by wall-clock frame time.
@@ -176,6 +225,24 @@ MM_INTERACTION_PACK=resources/g1_interaction ./controller
 ```
 
 Use WASD or the left gamepad stick to move, the arrow keys or right stick to control the camera/facing, and the existing walk/strafe controls for locomotion. Near the highlighted target, press `F` (gamepad right-face-left) to request pickup or placement. The authored destination table copies the source table dimensions and sits exactly 1.20 m farther along world +Z. While carrying, move within the manual 1.00 m surface-selection envelope and press `F`; the controller then stages through the ordinary Carry movement input and submits placement only from a newly ready runtime preview. Press `X` (right-face-up) to clear staging or cancel while cancellation is allowed, and `R` (right-face-right) to reset the held object. Invalid or out-of-range requests leave the object unmoved and report a diagnostic reason.
+
+In Locomotion, `F` starts manual pick assist. A bounded 1.45 m
+root-to-object acquisition query finds the sole free target, but the exact
+assisted route remains at most 1.00 m. Its two legs are current root to the
+common Reach entry, then entry to an eligible affordance slot. The controller drives this
+route with ordinary flat-ground locomotion, evaluates both live entry-slot
+previews from one post-step snapshot, freezes one feasible and ready slot, and
+brakes through stationary motion matching. It then requires five consecutive
+settled 25 Hz ticks, certifies a fresh final preview, and hands exactly one
+pickup request to the existing interaction runtime. `X` cancels any
+pre-submission assist and releases its movement override in the same tick;
+Carry keeps the existing `F` placement controls and `X` staging/cancellation
+controls.
+
+The manual-assist overlay reports state, reason, selected slot, settle count,
+route length, position and yaw errors, displayed speed, and the latched
+`object_distance_at_begin`. Its world-space route and slot marker are
+diagnostic only; green means the final live preview was certified.
 
 The manual demo intentionally supplies no recorded place clips, so its successful placement mode is `ReversedPickup`. On release, the object remains at the destination table with that table's support context and is immediately available for a later pickup.
 

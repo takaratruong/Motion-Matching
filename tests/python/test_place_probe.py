@@ -34,6 +34,10 @@ _EXPECTED_KEYS = (
     "ik_config_bound",
     "ik_config_fingerprint",
     "mode",
+    "position_height_controls",
+    "position_height_negative_result",
+    "position_height_positive_result",
+    "position_matrix_cases",
     "release_frame",
     "repick_support_is_destination",
     "reverse_start_frame",
@@ -195,6 +199,10 @@ def _fixture_record(labeled):
         "ik_config_bound": True,
         "ik_config_fingerprint": _canonical_ik_fingerprint(),
         "mode": "reversed_pickup",
+        "position_height_controls": 2,
+        "position_height_negative_result": "PlacementOutOfBounds",
+        "position_height_positive_result": "PlacementOutOfBounds",
+        "position_matrix_cases": 3,
         "release_frame": release,
         "repick_support_is_destination": True,
         "reverse_start_frame": reverse_start,
@@ -299,6 +307,9 @@ class PlaceProbeFixtureValidatorTests(unittest.TestCase):
             ("far_preview_ready", True),
             ("ik_config_bound", False),
             ("ik_config_fingerprint", 0),
+            ("position_height_controls", 0),
+            ("position_height_negative_result", "None"),
+            ("position_height_positive_result", "None"),
             ("runtime_preview_only", False),
             ("staged_preview_ready", False),
             ("staged_selection_id_changed", False),
@@ -335,6 +346,25 @@ class PlaceProbeFixtureValidatorTests(unittest.TestCase):
 
 
 class PlaceProbePolicyTests(unittest.TestCase):
+    def test_pickup_scene_identity_asserts_slot_order_and_local_values(self):
+        source = (_REPOSITORY_ROOT / "interaction_place_probe.cpp").read_text()
+        check = re.search(
+            r"void require_authored_slot_identity_mutations_are_observable"
+            r"\([^)]*\)\s*\{.*?\n\}",
+            source,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(
+            check,
+            "placement probe lacks authored-slot identity mutation checks",
+        )
+        body = check.group(0)
+        self.assertIn("{3U, -0.41F, -0.22F, 1.10F}", body)
+        self.assertIn("{9U, 0.18F, -0.39F, 0.20F}", body)
+        self.assertIn("std::swap(", body)
+        self.assertIn("root_x_object_m += 0.001F", body)
+        self.assertGreaterEqual(body.count("same_target_locals"), 2)
+
     def test_negative_recoveries_use_distinct_staged_receivers(self):
         source = (_REPOSITORY_ROOT / "interaction_place_probe.cpp").read_text()
         receivers = re.findall(

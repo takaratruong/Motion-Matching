@@ -2,6 +2,7 @@
 #include "locomotion_timing.h"
 #include "tests/cpp/interaction_runtime_fixture.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cmath>
@@ -319,6 +320,22 @@ FlatControllerPose make_flat_pose(bool opposite_quaternion_sign = false) {
     return pose;
 }
 
+Pose make_adversarial_true_g1_reference() {
+    Pose pose = make_pose(0.25F);
+    for (quat& rotation : pose.rotations) rotation = quat();
+    pose.rotations[g1_skeleton::LeftHipPitch] = quat_from_angle_axis(
+        3.141592654F, normalize(vec3(0.2F, 0.1F, 0.9F)));
+    pose.rotations[g1_skeleton::RightHipPitch] = quat_from_angle_axis(
+        -3.141592654F, normalize(vec3(0.1F, 0.3F, 0.9F)));
+    pose.rotations[g1_skeleton::Spine] = quat_from_angle_axis(
+        3.141592654F, normalize(vec3(0.7F, 0.2F, 0.4F)));
+    pose.rotations[g1_skeleton::LeftShoulderPitch] = quat_from_angle_axis(
+        3.141592654F, normalize(vec3(0.3F, 0.8F, 0.2F)));
+    pose.rotations[g1_skeleton::RightShoulderPitch] = quat_from_angle_axis(
+        -3.141592654F, normalize(vec3(0.4F, 0.7F, 0.2F)));
+    return pose;
+}
+
 FlatWorldPose flat_world_pose(const FlatControllerPose& pose) {
     FlatWorldPose world;
     for (size_t bone = 0; bone < interaction::kFlatControllerBoneCount;
@@ -572,6 +589,284 @@ void test_flat_bridge_expansion_matches_every_world_anchor_and_retains_reference
     assert(expanded.hand_dof == reference.hand_dof);
     assert(expanded.hand_dof_velocities == reference.hand_dof_velocities);
     assert(expanded.foot_contacts == flat.foot_contacts);
+}
+
+void test_calibrated_flat_bridge_reference_is_exact_true_g1_pose() {
+    const FlatControllerPose flat_reference = make_flat_pose();
+    Pose interaction_reference = make_adversarial_true_g1_reference();
+    interaction_reference.foot_contacts = flat_reference.foot_contacts;
+
+    const Pose expanded = interaction::expand_flat_controller_pose(
+        flat_reference, interaction_reference, flat_reference);
+
+    require(
+        pose_bits_equal(expanded, interaction_reference),
+        "calibrated expansion changed its exact true-G1 reference pose");
+}
+
+void test_calibrated_flat_bridge_transfers_supported_world_deltas() {
+    const FlatControllerPose flat_reference = make_flat_pose();
+    FlatControllerPose flat_current = flat_reference;
+    flat_current.positions[0] =
+        flat_current.positions[0] + vec3(0.35F, -0.07F, 0.18F);
+    flat_current.velocities[0] =
+        flat_current.velocities[0] + vec3(-0.11F, 0.09F, 0.05F);
+    for (size_t bone : {0U, 2U, 5U, 10U, 12U, 15U, 18U, 22U}) {
+        const float value = static_cast<float>(bone + 1U);
+        flat_current.rotations[bone] = quat_mul(
+            quat_from_angle_axis(
+                0.013F * value,
+                normalize(vec3(0.4F, 0.7F, 0.2F))),
+            flat_current.rotations[bone]);
+        flat_current.angular_velocities[bone] =
+            flat_current.angular_velocities[bone] +
+            vec3(0.004F * value, -0.003F * value, 0.002F * value);
+    }
+    flat_current.foot_contacts = {0U, 1U};
+
+    const Pose interaction_reference = make_adversarial_true_g1_reference();
+    const Pose expanded = interaction::expand_flat_controller_pose(
+        flat_current, interaction_reference, flat_reference);
+    const FlatWorldPose flat_current_world = flat_world_pose(flat_current);
+    const FlatWorldPose flat_reference_world = flat_world_pose(flat_reference);
+    const interaction::WorldPose interaction_reference_world =
+        interaction::world_pose(interaction_reference);
+    const interaction::WorldPose expanded_world =
+        interaction::world_pose(expanded);
+
+    for (const interaction::FlatControllerAnchor anchor :
+         interaction::kFlatControllerAnchors) {
+        const quat flat_world_delta = quat_mul(
+            flat_current_world.rotations[anchor.flat_bone],
+            quat_inv(flat_reference_world.rotations[anchor.flat_bone]));
+        const quat expected_rotation = quat_mul(
+            flat_world_delta,
+            interaction_reference_world.rotations[anchor.g1_bone]);
+        require_same_rotation(
+            expanded_world.rotations[anchor.g1_bone],
+            expected_rotation,
+            "calibrated expansion lost a mapped world-rotation delta",
+            3.0e-4F);
+        require_vec_near(
+            expanded_world.angular_velocities[anchor.g1_bone],
+            interaction_reference_world.angular_velocities[anchor.g1_bone] +
+                flat_current_world.angular_velocities[anchor.flat_bone] -
+                flat_reference_world.angular_velocities[anchor.flat_bone],
+            "calibrated expansion lost a mapped world-angular delta",
+            4.0e-4F);
+    }
+
+    require_vec_near(
+        expanded.positions[0],
+        interaction_reference.positions[0] + flat_current.positions[0] -
+            flat_reference.positions[0],
+        "calibrated expansion lost the root-position delta");
+    require_vec_near(
+        expanded.velocities[0],
+        interaction_reference.velocities[0] + flat_current.velocities[0] -
+            flat_reference.velocities[0],
+        "calibrated expansion lost the root-velocity delta");
+
+    std::array<bool, g1_skeleton::BoneCount> mapped{};
+    for (const interaction::FlatControllerAnchor anchor :
+         interaction::kFlatControllerAnchors) {
+        mapped[anchor.g1_bone] = true;
+    }
+    for (size_t bone = 1; bone < g1_skeleton::BoneCount; ++bone) {
+        require(
+            vec_bits_equal(
+                expanded.positions[bone],
+                interaction_reference.positions[bone]) &&
+                vec_bits_equal(
+                    expanded.velocities[bone],
+                    interaction_reference.velocities[bone]),
+            "calibrated expansion warped true-G1 non-root morphology");
+        if (!mapped[bone]) {
+            require(
+                quat_bits_equal(
+                    expanded.rotations[bone],
+                    interaction_reference.rotations[bone]) &&
+                    vec_bits_equal(
+                        expanded.angular_velocities[bone],
+                        interaction_reference.angular_velocities[bone]),
+                "calibrated expansion changed an unmapped true-G1 channel");
+        }
+    }
+    require(
+        expanded.hand_dof == interaction_reference.hand_dof &&
+            expanded.hand_dof_velocities ==
+                interaction_reference.hand_dof_velocities &&
+            expanded.foot_contacts == flat_current.foot_contacts,
+        "calibrated expansion changed hand channels or lost contacts");
+}
+
+void test_calibrated_flat_bridge_round_trips_representable_flat_pose() {
+    const FlatControllerPose flat_reference = make_flat_pose();
+    FlatControllerPose flat_current = flat_reference;
+    flat_current.positions[0] =
+        flat_current.positions[0] + vec3(-0.21F, 0.04F, 0.13F);
+    flat_current.velocities[0] =
+        flat_current.velocities[0] + vec3(0.07F, -0.03F, 0.09F);
+    for (const interaction::FlatControllerAnchor anchor :
+         interaction::kFlatControllerAnchors) {
+        const size_t bone = anchor.flat_bone;
+        const float value = static_cast<float>(bone + 1U);
+        flat_current.rotations[bone] = quat_mul(
+            quat_from_angle_axis(
+                0.004F * value,
+                normalize(vec3(0.3F, 0.8F, 0.5F))),
+            flat_current.rotations[bone]);
+        flat_current.angular_velocities[bone] =
+            flat_current.angular_velocities[bone] +
+            vec3(0.001F * value, -0.002F * value, 0.003F * value);
+    }
+    flat_current.foot_contacts = {0U, 1U};
+    const Pose interaction_reference = make_adversarial_true_g1_reference();
+
+    const Pose expanded = interaction::expand_flat_controller_pose(
+        flat_current, interaction_reference, flat_reference);
+    const FlatControllerPose collapsed = interaction::collapse_interaction_pose(
+        expanded, interaction_reference, flat_reference);
+
+    assert_flat_pose_near(collapsed, flat_current, 6.0e-4F);
+    for (const size_t unmapped_flat_bone : {13U, 14U}) {
+        require(
+            quat_bits_equal(
+                collapsed.rotations[unmapped_flat_bone],
+                flat_reference.rotations[unmapped_flat_bone]) &&
+                vec_bits_equal(
+                    collapsed.angular_velocities[unmapped_flat_bone],
+                    flat_reference.angular_velocities[unmapped_flat_bone]),
+            "representable round trip changed an unmapped flat channel");
+    }
+}
+
+void test_calibrated_flat_bridge_projects_nonrepresentable_flat_morphology() {
+    const FlatControllerPose flat_reference = make_flat_pose();
+    FlatControllerPose flat_current = flat_reference;
+    flat_current.positions[5] =
+        flat_current.positions[5] + vec3(3.0F, -2.0F, 4.0F);
+    flat_current.velocities[18] =
+        flat_current.velocities[18] + vec3(-5.0F, 6.0F, 7.0F);
+    const Pose interaction_reference = make_adversarial_true_g1_reference();
+
+    const Pose expanded = interaction::expand_flat_controller_pose(
+        flat_current, interaction_reference, flat_reference);
+    for (size_t bone = 1; bone < g1_skeleton::BoneCount; ++bone) {
+        require(
+            vec_bits_equal(
+                expanded.positions[bone],
+                interaction_reference.positions[bone]) &&
+                vec_bits_equal(
+                    expanded.velocities[bone],
+                    interaction_reference.velocities[bone]),
+            "nonrepresentable flat translations warped true-G1 morphology");
+    }
+    const FlatControllerPose projected = interaction::collapse_interaction_pose(
+        expanded, interaction_reference, flat_reference);
+    require(
+        vec_bits_equal(
+            projected.positions[5], flat_reference.positions[5]) &&
+            vec_bits_equal(
+                projected.velocities[18], flat_reference.velocities[18]),
+        "calibrated bridge did not explicitly project unsupported flat channels");
+}
+
+void test_calibrated_flat_bridge_is_antipodal_invariant() {
+    FlatControllerPose flat_reference = make_flat_pose();
+    FlatControllerPose flat_current = flat_reference;
+    flat_current.rotations[12] = quat_mul(
+        quat_from_angle_axis(
+            0.17F, normalize(vec3(0.2F, 0.9F, 0.3F))),
+        flat_current.rotations[12]);
+    Pose interaction_reference = make_adversarial_true_g1_reference();
+
+    FlatControllerPose antipodal_current = flat_current;
+    FlatControllerPose antipodal_flat_reference = flat_reference;
+    Pose antipodal_interaction_reference = interaction_reference;
+    for (quat& rotation : antipodal_current.rotations) rotation = -rotation;
+    for (quat& rotation : antipodal_flat_reference.rotations) {
+        rotation = -rotation;
+    }
+    for (quat& rotation : antipodal_interaction_reference.rotations) {
+        rotation = -rotation;
+    }
+
+    const Pose positive = interaction::expand_flat_controller_pose(
+        flat_current, interaction_reference, flat_reference);
+    const Pose antipodal = interaction::expand_flat_controller_pose(
+        antipodal_current,
+        antipodal_interaction_reference,
+        antipodal_flat_reference);
+    const interaction::WorldPose positive_world = interaction::world_pose(
+        positive);
+    const interaction::WorldPose antipodal_world = interaction::world_pose(
+        antipodal);
+    for (size_t bone = 0; bone < g1_skeleton::BoneCount; ++bone) {
+        require_vec_near(
+            antipodal_world.positions[bone],
+            positive_world.positions[bone],
+            "antipodal calibrated expansion changed a world position",
+            4.0e-4F);
+        require_same_rotation(
+            antipodal_world.rotations[bone],
+            positive_world.rotations[bone],
+            "antipodal calibrated expansion changed a world rotation",
+            4.0e-4F);
+        require_vec_near(
+            antipodal_world.angular_velocities[bone],
+            positive_world.angular_velocities[bone],
+            "antipodal calibrated expansion changed angular velocity",
+            4.0e-4F);
+    }
+}
+
+void test_calibrated_flat_bridge_rejects_invalid_input_without_mutation() {
+    const auto expect_format_error = [](const auto& operation) {
+        bool threw = false;
+        try {
+            operation();
+        } catch (const interaction::FormatError&) {
+            threw = true;
+        }
+        require(threw, "calibrated expansion accepted invalid input");
+    };
+    FlatControllerPose flat_current = make_flat_pose();
+    Pose interaction_reference = make_adversarial_true_g1_reference();
+    FlatControllerPose flat_reference = make_flat_pose();
+
+    flat_current.positions[8].z = std::numeric_limits<float>::quiet_NaN();
+    const FlatControllerPose flat_current_before = flat_current;
+    expect_format_error([&] {
+        (void)interaction::expand_flat_controller_pose(
+            flat_current, interaction_reference, flat_reference);
+    });
+    require(
+        flat_pose_bits_equal(flat_current, flat_current_before),
+        "calibrated expansion mutated invalid current flat input");
+
+    flat_current = make_flat_pose();
+    interaction_reference.rotations[25] = quat(0.0F, 0.0F, 0.0F, 0.0F);
+    const Pose interaction_reference_before = interaction_reference;
+    expect_format_error([&] {
+        (void)interaction::expand_flat_controller_pose(
+            flat_current, interaction_reference, flat_reference);
+    });
+    require(
+        pose_bits_equal(interaction_reference, interaction_reference_before),
+        "calibrated expansion mutated invalid true-G1 reference");
+
+    interaction_reference = make_adversarial_true_g1_reference();
+    flat_reference.angular_velocities[14].x =
+        std::numeric_limits<float>::infinity();
+    const FlatControllerPose flat_reference_before = flat_reference;
+    expect_format_error([&] {
+        (void)interaction::expand_flat_controller_pose(
+            flat_current, interaction_reference, flat_reference);
+    });
+    require(
+        flat_pose_bits_equal(flat_reference, flat_reference_before),
+        "calibrated expansion mutated invalid flat reference");
 }
 
 void test_reference_retarget_raw_reference_is_exact_flat_reference() {
@@ -1352,6 +1647,134 @@ void test_frame_handoff_first_owned_frame_is_exact_displayed_reference() {
         "first ownership frame did not preserve displayed entry pose");
 }
 
+void test_frame_handoff_solves_positive_targeted_constraint_on_owned_entry() {
+    const FlatControllerPose entry = make_flat_pose();
+    const Pose raw_reference = interaction::expand_flat_controller_pose(
+        entry, make_pose(0.375F));
+    RuntimeOutput owned = make_owned_output(raw_reference);
+    owned.diagnostics.target = {70U, 3U};
+    owned.diagnostics.affordance_id = 8U;
+    owned.diagnostics.hand = Hand::Right;
+    owned.diagnostics.object_state = ObjectState::Targeted;
+    owned.diagnostics.attached = false;
+    owned.diagnostics.hand_constraint_weight = 0.04F;
+    const ControllerInteractionHandConstraint constraint =
+        make_hand_constraint(owned, entry, Hand::Right);
+
+    ControllerInteractionFrameHandoff handoff;
+    const ControllerInteractionFrameState targeted = handoff.apply(
+        entry,
+        owned,
+        interaction::kControllerStepSeconds,
+        constraint);
+    require(
+        targeted.runtime_owns_pose &&
+            targeted.hand_constraint_validated &&
+            targeted.hand_constraint_result.applied &&
+            targeted.hand_constraint_result.reachable,
+        "positive-weight owned Targeted entry did not publish a validated "
+        "reachable hand solve");
+}
+
+void test_calibrated_bridge_keeps_exact_25_hz_handoff_continuous_and_reaches_oracle() {
+    FlatControllerPose entry = make_flat_pose();
+    for (size_t bone = 1; bone < entry.positions.size(); ++bone) {
+        entry.positions[bone] = 3.0F * entry.positions[bone];
+    }
+    FlatControllerPose canonical_oracle = entry;
+    canonical_oracle.positions[0] =
+        canonical_oracle.positions[0] + vec3(0.05F, 0.0F, -0.03F);
+    canonical_oracle.velocities[0] =
+        canonical_oracle.velocities[0] + vec3(0.02F, 0.0F, -0.01F);
+
+    Pose true_g1_reference = make_adversarial_true_g1_reference();
+    true_g1_reference.foot_contacts = entry.foot_contacts;
+    const Pose calibrated_live = interaction::expand_flat_controller_pose(
+        entry, true_g1_reference, entry);
+    const Pose canonical_source = interaction::expand_flat_controller_pose(
+        canonical_oracle, true_g1_reference, entry);
+    const Pose legacy_absolute_anchor =
+        interaction::expand_flat_controller_pose(entry, true_g1_reference);
+
+    ControllerInteractionFrameHandoff calibrated_handoff;
+    ControllerInteractionFrameHandoff legacy_handoff;
+    RuntimeOutput calibrated_output = make_owned_output(calibrated_live);
+    RuntimeOutput legacy_output = make_owned_output(legacy_absolute_anchor);
+    ControllerInteractionFrameState calibrated_frame = calibrated_handoff.apply(
+        entry,
+        calibrated_output,
+        interaction::kControllerStepSeconds);
+    ControllerInteractionFrameState legacy_frame = legacy_handoff.apply(
+        entry,
+        legacy_output,
+        interaction::kControllerStepSeconds);
+
+    float calibrated_max_translation = 0.0F;
+    float calibrated_max_rotation = 0.0F;
+    float legacy_max_translation = 0.0F;
+    constexpr float kEntryBlendSeconds = 0.25F;
+    for (int32_t tick = 1; tick <= 7; ++tick) {
+        const float elapsed_seconds =
+            static_cast<float>(tick) * interaction::kControllerStepSeconds;
+        const float alpha = std::clamp(
+            elapsed_seconds / kEntryBlendSeconds, 0.0F, 1.0F);
+        calibrated_output.pose = interaction::interpolate_pose(
+            calibrated_live, canonical_source, alpha);
+        legacy_output.pose = interaction::interpolate_pose(
+            legacy_absolute_anchor, canonical_source, alpha);
+
+        const ControllerInteractionFrameState next_calibrated =
+            calibrated_handoff.apply(
+                entry,
+                calibrated_output,
+                interaction::kControllerStepSeconds);
+        const ControllerInteractionFrameState next_legacy = legacy_handoff.apply(
+            entry,
+            legacy_output,
+            interaction::kControllerStepSeconds);
+        const FlatWorldPose calibrated_before = flat_world_pose(
+            calibrated_frame.pose);
+        const FlatWorldPose calibrated_after = flat_world_pose(
+            next_calibrated.pose);
+        const FlatWorldPose legacy_before = flat_world_pose(legacy_frame.pose);
+        const FlatWorldPose legacy_after = flat_world_pose(next_legacy.pose);
+        for (size_t bone = 0; bone < entry.positions.size(); ++bone) {
+            calibrated_max_translation = std::max(
+                calibrated_max_translation,
+                length(
+                    calibrated_after.positions[bone] -
+                    calibrated_before.positions[bone]));
+            calibrated_max_rotation = std::max(
+                calibrated_max_rotation,
+                rotation_distance(
+                    calibrated_before.rotations[bone],
+                    calibrated_after.rotations[bone]));
+            legacy_max_translation = std::max(
+                legacy_max_translation,
+                length(
+                    legacy_after.positions[bone] -
+                    legacy_before.positions[bone]));
+        }
+        calibrated_frame = next_calibrated;
+        legacy_frame = next_legacy;
+    }
+
+    require(
+        legacy_max_translation > 0.20F,
+        "legacy absolute-anchor bridge did not reproduce the >0.20 m basis jump");
+    require(
+        calibrated_max_translation <= 0.20F + 1.0e-5F,
+        "calibrated bridge exceeded the 0.20 m exact-25-Hz step limit");
+    require(
+        calibrated_max_rotation <= 1.047197551F + 1.0e-5F,
+        "calibrated bridge exceeded the 60-degree exact-25-Hz step limit");
+    require_flat_pose_near(
+        calibrated_frame.pose,
+        canonical_oracle,
+        "calibrated bridge merely smoothed and did not reach the oracle",
+        7.0e-4F);
+}
+
 void test_frame_handoff_applies_validated_semantic_hand_constraint_and_releases_from_it() {
     const FlatControllerPose entry = make_flat_pose();
     const Pose raw_reference = interaction::expand_flat_controller_pose(
@@ -1360,6 +1783,9 @@ void test_frame_handoff_applies_validated_semantic_hand_constraint_and_releases_
     owned.diagnostics.target = {71U, 4U};
     owned.diagnostics.affordance_id = 9U;
     owned.diagnostics.hand = Hand::Right;
+    owned.diagnostics.state = RuntimeState::Hold;
+    owned.diagnostics.object_state = ObjectState::Held;
+    owned.diagnostics.attached = true;
     owned.diagnostics.hand_constraint_weight = 0.0F;
 
     const FlatWorldPose entry_world = flat_world_pose(entry);
@@ -1490,6 +1916,217 @@ void test_frame_handoff_applies_validated_semantic_hand_constraint_and_releases_
         "normal release duration escaped one 25 Hz tick of 0.25 seconds");
 }
 
+void test_frame_handoff_starts_matching_constraint_after_attachment_inside_owned_epoch() {
+    const FlatControllerPose entry = make_flat_pose();
+    const Pose raw_reference = interaction::expand_flat_controller_pose(
+        entry, make_pose(0.375F));
+    RuntimeOutput owned = make_owned_output(raw_reference);
+    owned.diagnostics.target = {72U, 5U};
+    owned.diagnostics.affordance_id = 10U;
+    owned.diagnostics.hand = Hand::Right;
+    owned.diagnostics.object_state = ObjectState::Targeted;
+    owned.diagnostics.hand_constraint_weight = 0.0F;
+
+    ControllerInteractionFrameHandoff handoff;
+    const ControllerInteractionFrameState targeted = handoff.apply(
+        entry,
+        owned,
+        interaction::kControllerStepSeconds,
+        std::nullopt);
+    require(
+        targeted.runtime_owns_pose &&
+            !targeted.hand_constraint_validated &&
+            !targeted.hand_constraint_result.applied,
+        "Targeted ownership entry unexpectedly started a hand constraint");
+
+    FlatControllerPose later_locomotion = entry;
+    later_locomotion.rotations[22] = quat_from_angle_axis(
+        0.17F, normalize(vec3(0.3F, 0.8F, 0.4F)));
+    FlatControllerPose later_runtime = entry;
+    later_runtime.rotations[22] = quat_from_angle_axis(
+        -0.12F, normalize(vec3(0.7F, 0.2F, 0.5F)));
+    owned.pose = interaction::expand_flat_controller_pose(
+        later_runtime, raw_reference);
+    owned.diagnostics.state = RuntimeState::PickupReplay;
+    owned.diagnostics.object_state = ObjectState::Attached;
+    owned.diagnostics.attached = true;
+    owned.diagnostics.hand_constraint_weight = 1.0F;
+    const ControllerInteractionHandConstraint constraint =
+        make_hand_constraint(owned, entry, Hand::Right);
+    const ControllerInteractionFrameState attached = handoff.apply(
+        later_locomotion,
+        owned,
+        interaction::kControllerStepSeconds,
+        constraint);
+    interaction::TargetRigArmIK expected_solver;
+    expected_solver.begin_epoch(raw_reference, entry, Hand::Right);
+    require(
+        attached.hand_constraint_validated &&
+            attached.hand_constraint_result.applied &&
+            attached.hand_constraint_result.reachable,
+        "matching attached constraint did not start inside active pose ownership");
+    require_same_rotation(
+        attached.hand_constraint_calibration_rotation,
+        expected_solver.calibration_rotation(),
+        "delayed constraint did not use the stored ownership references");
+
+    owned.diagnostics.state = RuntimeState::Carry;
+    owned.diagnostics.object_state = ObjectState::Held;
+    owned.diagnostics.recorded_carry = true;
+    const ControllerInteractionFrameState held = handoff.apply(
+        later_locomotion,
+        owned,
+        interaction::kControllerStepSeconds,
+        constraint);
+    require(
+        held.hand_constraint_validated &&
+            held.hand_constraint_result.applied &&
+            held.hand_constraint_result.reachable,
+        "active delayed constraint did not remain solved in Carry");
+    require_same_rotation(
+        held.hand_constraint_calibration_rotation,
+        attached.hand_constraint_calibration_rotation,
+        "active delayed constraint restarted after entering Carry");
+}
+
+void test_delayed_constraint_rejects_identity_switched_before_first_constraint() {
+    const FlatControllerPose entry = make_flat_pose();
+    const Pose raw_reference = interaction::expand_flat_controller_pose(
+        entry, make_pose(0.375F));
+    RuntimeOutput owned = make_owned_output(raw_reference);
+    owned.diagnostics.target = {721U, 5U};
+    owned.diagnostics.affordance_id = 101U;
+    owned.diagnostics.hand = Hand::Right;
+    owned.diagnostics.object_state = ObjectState::Targeted;
+
+    ControllerInteractionFrameHandoff handoff;
+    (void)handoff.apply(
+        entry,
+        owned,
+        interaction::kControllerStepSeconds,
+        std::nullopt);
+
+    RuntimeOutput switched = owned;
+    switched.diagnostics.state = RuntimeState::PickupReplay;
+    switched.diagnostics.target = {722U, 6U};
+    switched.diagnostics.affordance_id = 102U;
+    switched.diagnostics.hand = Hand::Left;
+    switched.diagnostics.object_state = ObjectState::Attached;
+    switched.diagnostics.attached = true;
+    switched.diagnostics.hand_constraint_weight = 1.0F;
+    const ControllerInteractionHandConstraint switched_constraint =
+        make_hand_constraint(switched, entry, Hand::Left);
+    const ControllerInteractionFrameState switched_frame = handoff.apply(
+        entry,
+        switched,
+        interaction::kControllerStepSeconds,
+        switched_constraint);
+    require(
+        !switched_frame.hand_constraint_validated &&
+            !switched_frame.hand_constraint_result.applied,
+        "switched identity started the first constraint inside ownership");
+
+    owned.diagnostics.state = RuntimeState::Carry;
+    owned.diagnostics.object_state = ObjectState::Held;
+    owned.diagnostics.attached = true;
+    owned.diagnostics.recorded_carry = true;
+    owned.diagnostics.hand_constraint_weight = 1.0F;
+    const ControllerInteractionHandConstraint stale_original =
+        make_hand_constraint(owned, entry, Hand::Right);
+    const ControllerInteractionFrameState rolled_back = handoff.apply(
+        entry,
+        owned,
+        interaction::kControllerStepSeconds,
+        stale_original);
+    require(
+        !rolled_back.hand_constraint_validated &&
+            !rolled_back.hand_constraint_result.applied,
+        "poisoned ownership identity resurrected after rollback");
+}
+
+void test_delayed_constraint_rejects_free_lifecycle() {
+    {
+        const FlatControllerPose entry = make_flat_pose();
+        const Pose raw_reference = interaction::expand_flat_controller_pose(
+            entry, make_pose(0.375F));
+        RuntimeOutput owned = make_owned_output(raw_reference);
+        owned.diagnostics.target = {723U, 7U};
+        owned.diagnostics.affordance_id = 103U;
+        owned.diagnostics.hand = Hand::Right;
+        owned.diagnostics.object_state = ObjectState::Targeted;
+
+        ControllerInteractionFrameHandoff handoff;
+        (void)handoff.apply(
+            entry,
+            owned,
+            interaction::kControllerStepSeconds,
+            std::nullopt);
+
+        owned.diagnostics.state = RuntimeState::PickupReplay;
+        owned.diagnostics.object_state = ObjectState::Free;
+        owned.diagnostics.attached = false;
+        owned.diagnostics.hand_constraint_weight = 1.0F;
+        const ControllerInteractionHandConstraint constraint =
+            make_hand_constraint(owned, entry, Hand::Right);
+        const ControllerInteractionFrameState invalid = handoff.apply(
+            entry,
+            owned,
+            interaction::kControllerStepSeconds,
+            constraint);
+        require(
+            !invalid.hand_constraint_validated &&
+                !invalid.hand_constraint_result.applied,
+            "Free delayed constraint started before attachment");
+
+        owned.diagnostics.object_state = ObjectState::Attached;
+        owned.diagnostics.attached = true;
+        const ControllerInteractionFrameState attached = handoff.apply(
+            entry,
+            owned,
+            interaction::kControllerStepSeconds,
+            constraint);
+        require(
+            attached.hand_constraint_validated &&
+                attached.hand_constraint_result.applied &&
+                attached.hand_constraint_result.reachable,
+            "Attached state did not start after Free lifecycle rejection");
+    }
+}
+
+void test_delayed_constraint_accepts_targeted_lifecycle() {
+    const FlatControllerPose entry = make_flat_pose();
+    const Pose raw_reference = interaction::expand_flat_controller_pose(
+        entry, make_pose(0.375F));
+    RuntimeOutput owned = make_owned_output(raw_reference);
+    owned.diagnostics.target = {724U, 8U};
+    owned.diagnostics.affordance_id = 104U;
+    owned.diagnostics.hand = Hand::Right;
+    owned.diagnostics.object_state = ObjectState::Targeted;
+    owned.diagnostics.attached = false;
+
+    ControllerInteractionFrameHandoff handoff;
+    (void)handoff.apply(
+        entry,
+        owned,
+        interaction::kControllerStepSeconds,
+        std::nullopt);
+
+    owned.diagnostics.hand_constraint_weight = 0.04F;
+    const ControllerInteractionHandConstraint constraint =
+        make_hand_constraint(owned, entry, Hand::Right);
+    const ControllerInteractionFrameState targeted = handoff.apply(
+        entry,
+        owned,
+        interaction::kControllerStepSeconds,
+        constraint);
+    require(
+        targeted.hand_constraint_validated &&
+            targeted.hand_constraint_result.applied &&
+            targeted.hand_constraint_result.reachable,
+        "delayed positive-weight Targeted constraint did not start inside "
+        "the owned reach epoch");
+}
+
 void test_hand_constraint_keeps_layered_carry_lower_body_exact_and_selected_only() {
     const FlatControllerPose entry = make_flat_pose();
     const Pose raw_reference = interaction::expand_flat_controller_pose(
@@ -1498,6 +2135,9 @@ void test_hand_constraint_keeps_layered_carry_lower_body_exact_and_selected_only
     owned.diagnostics.target = {72U, 5U};
     owned.diagnostics.affordance_id = 10U;
     owned.diagnostics.hand = Hand::Left;
+    owned.diagnostics.state = RuntimeState::Hold;
+    owned.diagnostics.object_state = ObjectState::Held;
+    owned.diagnostics.attached = true;
     owned.diagnostics.hand_constraint_weight = 0.0F;
     const ControllerInteractionHandConstraint constraint =
         make_hand_constraint(owned, entry, Hand::Left);
@@ -1643,6 +2283,8 @@ void test_layered_carry_final_composite_guard_is_atomic_for_both_hands() {
         output.diagnostics.affordance_id =
             hand == Hand::Left ? 31U : 32U;
         output.diagnostics.hand = hand;
+        output.diagnostics.object_state = ObjectState::Held;
+        output.diagnostics.attached = true;
         output.diagnostics.hand_constraint_weight = 0.0F;
         ControllerInteractionHandConstraint constraint =
             make_hand_constraint(output, entry, hand);
@@ -1791,6 +2433,9 @@ void test_hand_constraint_mismatch_or_invalid_input_disables_atomically() {
     owned.diagnostics.target = {73U, 6U};
     owned.diagnostics.affordance_id = 11U;
     owned.diagnostics.hand = Hand::Right;
+    owned.diagnostics.state = RuntimeState::Hold;
+    owned.diagnostics.object_state = ObjectState::Held;
+    owned.diagnostics.attached = true;
     owned.diagnostics.hand_constraint_weight = 0.0F;
     const ControllerInteractionHandConstraint valid =
         make_hand_constraint(owned, entry, Hand::Right);
@@ -1861,6 +2506,9 @@ void test_hand_constraint_reset_and_reentry_recalibrates_selected_hand() {
     first_owned.diagnostics.target = {75U, 1U};
     first_owned.diagnostics.affordance_id = 13U;
     first_owned.diagnostics.hand = Hand::Right;
+    first_owned.diagnostics.state = RuntimeState::Hold;
+    first_owned.diagnostics.object_state = ObjectState::Held;
+    first_owned.diagnostics.attached = true;
     first_owned.diagnostics.hand_constraint_weight = 0.0F;
     const ControllerInteractionHandConstraint first_constraint =
         make_hand_constraint(first_owned, first_entry, Hand::Right);
@@ -1903,6 +2551,9 @@ void test_hand_constraint_reset_and_reentry_recalibrates_selected_hand() {
     second_owned.diagnostics.target = {76U, 2U};
     second_owned.diagnostics.affordance_id = 14U;
     second_owned.diagnostics.hand = Hand::Left;
+    second_owned.diagnostics.state = RuntimeState::Hold;
+    second_owned.diagnostics.object_state = ObjectState::Held;
+    second_owned.diagnostics.attached = true;
     second_owned.diagnostics.hand_constraint_weight = 0.0F;
     const ControllerInteractionHandConstraint second_constraint =
         make_hand_constraint(second_owned, second_entry, Hand::Left);
@@ -3282,11 +3933,56 @@ void test_place_release_generation_change_ends_constraint_without_free_object_so
     require(
         held.hand_constraint_result.applied,
         "held setup did not activate the semantic hand constraint");
+    const FlatWorldPose held_world = flat_world_pose(held.pose);
 
     output.diagnostics.state = RuntimeState::PlaceRelease;
     output.diagnostics.target = {81U, 7U};
     output.diagnostics.object_state = ObjectState::Free;
     output.diagnostics.attached = false;
+    output.diagnostics.hand_constraint_weight = 0.0F;
+    FlatControllerPose authored_release = locomotion;
+    authored_release.positions[0] = authored_release.positions[0] +
+        vec3(0.04F, 0.01F, -0.03F);
+    authored_release.velocities[0] = authored_release.velocities[0] +
+        vec3(0.10F, -0.02F, 0.06F);
+    authored_release.rotations[0] = quat_normalize(quat_mul(
+        quat_from_angle_axis(
+            0.08F, normalize(vec3(0.2F, 0.9F, 0.3F))),
+        locomotion.rotations[0]));
+    authored_release.angular_velocities[0] =
+        authored_release.angular_velocities[0] +
+        vec3(0.02F, -0.03F, 0.04F);
+    authored_release.rotations[12] = quat_normalize(quat_mul(
+        quat_from_angle_axis(
+            0.12F, normalize(vec3(0.3F, 0.4F, 0.8F))),
+        locomotion.rotations[12]));
+    authored_release.angular_velocities[12] =
+        authored_release.angular_velocities[12] +
+        vec3(-0.05F, 0.04F, 0.03F);
+    authored_release.rotations[15] = quat_normalize(quat_mul(
+        quat_from_angle_axis(
+            0.16F, normalize(vec3(0.7F, 0.2F, 0.5F))),
+        locomotion.rotations[15]));
+    authored_release.velocities[17] = authored_release.velocities[17] +
+        vec3(0.03F, -0.02F, 0.01F);
+    authored_release.foot_contacts = {
+        static_cast<uint8_t>(1U - locomotion.foot_contacts[0]),
+        static_cast<uint8_t>(1U - locomotion.foot_contacts[1])};
+    output.pose = interaction::expand_flat_controller_pose(
+        authored_release, raw_reference);
+    FlatControllerPose expected_authored_release =
+        interaction::collapse_interaction_pose(
+            output.pose, raw_reference, locomotion);
+    for (size_t bone = 0U;
+         bone < expected_authored_release.rotations.size();
+         ++bone) {
+        if (quat_dot(
+                held.pose.rotations[bone],
+                expected_authored_release.rotations[bone]) < 0.0F) {
+            expected_authored_release.rotations[bone] =
+                -expected_authored_release.rotations[bone];
+        }
+    }
     ControllerInteractionHandConstraint free_constraint = held_constraint;
     free_constraint.target = output.diagnostics.target;
     free_constraint.grasp_world.position =
@@ -3304,6 +4000,192 @@ void test_place_release_generation_change_ends_constraint_without_free_object_so
         !released.hand_constraint_validated &&
             !released.hand_constraint_result.applied,
         "new free target generation received an IK solve");
+    const FlatWorldPose released_world = flat_world_pose(released.pose);
+    float maximum_active_arm_translation_m = 0.0F;
+    float maximum_active_arm_velocity_mps = 0.0F;
+    float maximum_active_arm_rotation_radians = 0.0F;
+    float maximum_active_arm_angular_velocity_radians_per_second = 0.0F;
+    for (size_t bone = 19U; bone <= 22U; ++bone) {
+        maximum_active_arm_translation_m = std::max(
+            maximum_active_arm_translation_m,
+            length(
+                released_world.positions[bone] -
+                held_world.positions[bone]));
+        maximum_active_arm_velocity_mps = std::max(
+            maximum_active_arm_velocity_mps,
+            length(
+                released_world.velocities[bone] -
+                held_world.velocities[bone]));
+        maximum_active_arm_rotation_radians = std::max(
+            maximum_active_arm_rotation_radians,
+            rotation_distance(
+                released_world.rotations[bone],
+                held_world.rotations[bone]));
+        maximum_active_arm_angular_velocity_radians_per_second = std::max(
+            maximum_active_arm_angular_velocity_radians_per_second,
+            length(
+                released_world.angular_velocities[bone] -
+                held_world.angular_velocities[bone]));
+    }
+    if (maximum_active_arm_translation_m > 1.0e-5F ||
+        maximum_active_arm_velocity_mps > 1.0e-5F ||
+        maximum_active_arm_rotation_radians > 1.0e-5F ||
+        maximum_active_arm_angular_velocity_radians_per_second > 1.0e-5F) {
+        throw std::runtime_error(
+            "first PlaceRelease active-arm step was " +
+            std::to_string(maximum_active_arm_translation_m) +
+            " m / " + std::to_string(maximum_active_arm_velocity_mps) +
+            " mps / " +
+            std::to_string(maximum_active_arm_rotation_radians) +
+            " radians / " +
+            std::to_string(
+                maximum_active_arm_angular_velocity_radians_per_second) +
+            " radps");
+    }
+    for (size_t bone = 0U; bone < released.pose.positions.size(); ++bone) {
+        if (bone >= 19U && bone <= 22U) continue;
+        if (!flat_bone_channels_bits_equal(
+                released.pose, expected_authored_release, bone)) {
+            const char* channel =
+                !vec_bits_equal(
+                    released.pose.positions[bone],
+                    expected_authored_release.positions[bone])
+                ? "position"
+                : (!vec_bits_equal(
+                       released.pose.velocities[bone],
+                       expected_authored_release.velocities[bone])
+                       ? "velocity"
+                       : (!quat_bits_equal(
+                              released.pose.rotations[bone],
+                              expected_authored_release.rotations[bone])
+                              ? "rotation"
+                              : "angular velocity"));
+            throw std::runtime_error(
+                "active-arm release preservation changed authored bone " +
+                std::to_string(bone) + " " + channel);
+        }
+    }
+    require(
+        released.pose.foot_contacts == expected_authored_release.foot_contacts,
+        "active-arm release preservation changed authored foot contacts");
+
+    FlatControllerPose previous_displayed = released.pose;
+    float release_elapsed_seconds = interaction::kControllerStepSeconds;
+    bool reached_authored_retract = false;
+    for (int tick = 1; tick <= 10; ++tick) {
+        const float progress = static_cast<float>(tick);
+        FlatControllerPose authored_retract = authored_release;
+        authored_retract.positions[0] = authored_retract.positions[0] +
+            vec3(0.002F * progress, 0.0F, -0.001F * progress);
+        authored_retract.velocities[0] = authored_retract.velocities[0] +
+            vec3(0.003F * progress, 0.0F, 0.002F * progress);
+        authored_retract.rotations[12] = quat_normalize(quat_mul(
+            quat_from_angle_axis(
+                0.01F * progress,
+                normalize(vec3(0.4F, 0.3F, 0.8F))),
+            authored_release.rotations[12]));
+        authored_retract.rotations[15] = quat_normalize(quat_mul(
+            quat_from_angle_axis(
+                -0.012F * progress,
+                normalize(vec3(0.6F, 0.5F, 0.2F))),
+            authored_release.rotations[15]));
+        authored_retract.rotations[20] = quat_normalize(quat_mul(
+            quat_from_angle_axis(
+                0.015F * progress,
+                normalize(vec3(0.2F, 0.7F, 0.4F))),
+            authored_release.rotations[20]));
+        authored_retract.angular_velocities[21] =
+            authored_retract.angular_velocities[21] +
+            vec3(0.01F * progress, -0.008F * progress, 0.006F * progress);
+        authored_retract.foot_contacts = {
+            static_cast<uint8_t>(tick % 2),
+            static_cast<uint8_t>((tick + 1) % 2)};
+        output.pose = interaction::expand_flat_controller_pose(
+            authored_retract, raw_reference);
+        FlatControllerPose expected_authored_retract =
+            interaction::collapse_interaction_pose(
+                output.pose, raw_reference, locomotion);
+        for (size_t bone = 0U;
+             bone < expected_authored_retract.rotations.size();
+             ++bone) {
+            if (quat_dot(
+                    previous_displayed.rotations[bone],
+                    expected_authored_retract.rotations[bone]) < 0.0F) {
+                expected_authored_retract.rotations[bone] =
+                    -expected_authored_retract.rotations[bone];
+            }
+        }
+
+        const ControllerInteractionFrameState retract = handoff.apply(
+            locomotion,
+            output,
+            interaction::kControllerStepSeconds,
+            free_constraint);
+        require(
+            retract.runtime_owns_pose &&
+                !retract.hand_constraint_validated &&
+                !retract.hand_constraint_result.applied,
+            "runtime-owned Free retract solved a hand constraint");
+        for (size_t bone = 0U; bone < retract.pose.positions.size(); ++bone) {
+            if (bone >= 19U && bone <= 22U) continue;
+            require(
+                flat_bone_channels_bits_equal(
+                    retract.pose, expected_authored_retract, bone),
+                "active-arm retract blend changed a non-active authored channel");
+        }
+        require(
+            retract.pose.foot_contacts ==
+                expected_authored_retract.foot_contacts,
+            "active-arm retract blend changed authored foot contacts");
+
+        const FlatWorldPose previous_world =
+            flat_world_pose(previous_displayed);
+        const FlatWorldPose retract_world = flat_world_pose(retract.pose);
+        float maximum_translation_step_m = 0.0F;
+        float maximum_rotation_step_radians = 0.0F;
+        for (size_t bone = 19U; bone <= 22U; ++bone) {
+            maximum_translation_step_m = std::max(
+                maximum_translation_step_m,
+                length(
+                    retract_world.positions[bone] -
+                    previous_world.positions[bone]));
+            maximum_rotation_step_radians = std::max(
+                maximum_rotation_step_radians,
+                rotation_distance(
+                    retract_world.rotations[bone],
+                    previous_world.rotations[bone]));
+        }
+        require(
+            maximum_translation_step_m <= 0.20F + 1.0e-5F &&
+                maximum_rotation_step_radians <= 1.047197551F + 1.0e-5F,
+            "active-arm retract blend exceeded one 25 Hz bounded step");
+
+        bool selected_arm_is_authored = true;
+        for (size_t bone = 19U; bone <= 22U; ++bone) {
+            selected_arm_is_authored = selected_arm_is_authored &&
+                flat_bone_channels_bits_equal(
+                    retract.pose, expected_authored_retract, bone);
+        }
+        if (release_elapsed_seconds < 0.25F) {
+            require(
+                !selected_arm_is_authored,
+                "active-arm retract blend ended before 0.25 seconds");
+        } else {
+            require(
+                selected_arm_is_authored,
+                "active-arm retract blend missed its authored endpoint");
+            reached_authored_retract = true;
+        }
+        previous_displayed = retract.pose;
+        if (reached_authored_retract) break;
+        release_elapsed_seconds += interaction::kControllerStepSeconds;
+    }
+    require(
+        reached_authored_retract &&
+            release_elapsed_seconds >= 0.25F &&
+            release_elapsed_seconds <=
+                0.25F + interaction::kControllerStepSeconds,
+        "active-arm retract blend escaped one 25 Hz tick of 0.25 seconds");
 
     output.diagnostics.target = held_constraint.target;
     output.diagnostics.object_state = ObjectState::Held;
@@ -3357,6 +4239,381 @@ void test_normal_release_starts_at_last_displayed_place_release_pose() {
             first_release.overrides_locomotion_pose &&
             flat_pose_bits_equal(first_release.pose, displayed.pose),
         "0.25 second release did not start at the last PlaceRelease pose");
+}
+
+void test_place_release_active_arm_return_is_bounded_after_ownership() {
+    constexpr float kMaximumTranslationStepM = 0.04F;
+    constexpr float kMaximumRotationStepRadians =
+        10.0F * 3.14159265358979323846F / 180.0F;
+
+    for (Hand hand : {Hand::Left, Hand::Right}) {
+        const FlatControllerPose locomotion = make_flat_pose();
+        FlatControllerPose final_place_release = locomotion;
+        const size_t arm_begin = hand == Hand::Left ? 15U : 19U;
+        const std::array<float, 4> return_angles = {
+            0.35F, -0.25F, 0.20F, 1.40F};
+        const std::array<vec3, 4> return_axes = {
+            normalize(vec3(0.3F, 0.8F, 0.4F)),
+            normalize(vec3(0.7F, 0.2F, 0.5F)),
+            normalize(vec3(0.2F, 0.6F, 0.8F)),
+            normalize(vec3(0.5F, 0.7F, 0.3F))};
+        for (size_t offset = 0U; offset < 4U; ++offset) {
+            const size_t bone = arm_begin + offset;
+            final_place_release.rotations[bone] = quat_normalize(quat_mul(
+                quat_from_angle_axis(
+                    return_angles[offset], return_axes[offset]),
+                locomotion.rotations[bone]));
+        }
+
+        const Pose raw_reference = interaction::expand_flat_controller_pose(
+            locomotion, make_pose(0.90625F));
+        RuntimeOutput output = make_owned_output(raw_reference);
+        output.diagnostics.state = RuntimeState::PlaceRelease;
+        output.diagnostics.target = {
+            hand == Hand::Left ? 90U : 91U, 1U};
+        output.diagnostics.affordance_id = 17U;
+        output.diagnostics.hand = hand;
+        output.diagnostics.object_state = ObjectState::Free;
+        output.diagnostics.attached = false;
+
+        ControllerInteractionFrameHandoff handoff;
+        (void)handoff.apply(
+            locomotion, output, interaction::kControllerStepSeconds);
+        output.pose = interaction::expand_flat_controller_pose(
+            final_place_release, raw_reference, locomotion);
+        const ControllerInteractionFrameState displayed = handoff.apply(
+            locomotion, output, interaction::kControllerStepSeconds);
+        require_flat_pose_near(
+            displayed.pose,
+            final_place_release,
+            "PlaceRelease active-arm return setup did not reach its pose");
+
+        RuntimeOutput idle;
+        ControllerInteractionFrameState previous = handoff.apply(
+            locomotion, idle, interaction::kControllerStepSeconds);
+        require(
+            previous.overrides_locomotion_pose &&
+                flat_pose_bits_equal(previous.pose, displayed.pose),
+            "post-PlaceRelease return was discontinuous on its first Free frame");
+
+        bool relinquished = false;
+        int release_tick = 0;
+        for (int tick = 1; tick <= 30; ++tick) {
+            const ControllerInteractionFrameState frame = handoff.apply(
+                locomotion, idle, interaction::kControllerStepSeconds);
+            const FlatWorldPose previous_world =
+                flat_world_pose(previous.pose);
+            const FlatWorldPose frame_world = flat_world_pose(frame.pose);
+            float maximum_translation_step_m = 0.0F;
+            float maximum_rotation_step_radians = 0.0F;
+            for (size_t bone = arm_begin; bone < arm_begin + 4U; ++bone) {
+                maximum_translation_step_m = std::max(
+                    maximum_translation_step_m,
+                    length(
+                        frame_world.positions[bone] -
+                        previous_world.positions[bone]));
+                maximum_rotation_step_radians = std::max(
+                    maximum_rotation_step_radians,
+                    rotation_distance(
+                        previous_world.rotations[bone],
+                        frame_world.rotations[bone]));
+            }
+            if (maximum_translation_step_m >
+                    kMaximumTranslationStepM + 1.0e-5F ||
+                maximum_rotation_step_radians >
+                    kMaximumRotationStepRadians + 1.0e-5F) {
+                throw std::runtime_error(
+                    "post-PlaceRelease active-arm return step was " +
+                    std::to_string(maximum_translation_step_m) + " m / " +
+                    std::to_string(
+                        maximum_rotation_step_radians * 180.0F /
+                        3.14159265358979323846F) +
+                    " degrees");
+            }
+
+            if (tick >= 7) {
+                for (size_t bone = 0U;
+                     bone < interaction::kFlatControllerBoneCount;
+                    ++bone) {
+                    if (bone >= arm_begin && bone < arm_begin + 4U) continue;
+                    require(
+                        flat_bone_channels_bits_equal(
+                            frame.pose, locomotion, bone),
+                        "active-arm return changed a non-arm locomotion channel");
+                }
+                require(
+                    frame.pose.foot_contacts == locomotion.foot_contacts,
+                    "active-arm return delayed locomotion foot contacts");
+            }
+            previous = frame;
+            if (!frame.overrides_locomotion_pose) {
+                require(
+                    flat_pose_bits_equal(frame.pose, locomotion),
+                    "active-arm return relinquished away from locomotion");
+                relinquished = true;
+                release_tick = tick;
+                break;
+            }
+        }
+        require(
+            relinquished && release_tick >= 12 && release_tick <= 30,
+            "post-PlaceRelease active-arm return did not converge after its bounded 0.50 second blend");
+    }
+}
+
+void test_same_generation_free_lifecycle_ends_constraint_without_resurrection() {
+    const FlatControllerPose locomotion = make_flat_pose();
+    const Pose raw_reference = interaction::expand_flat_controller_pose(
+        locomotion, make_pose(0.78125F));
+    RuntimeOutput output = make_owned_output(raw_reference);
+    output.diagnostics.state = RuntimeState::PlaceReplay;
+    output.diagnostics.target = {85U, 12U};
+    output.diagnostics.affordance_id = 15U;
+    output.diagnostics.hand = Hand::Right;
+    output.diagnostics.object_state = ObjectState::Held;
+    output.diagnostics.attached = true;
+    output.diagnostics.hand_constraint_weight = 0.0F;
+    const ControllerInteractionHandConstraint constraint =
+        make_hand_constraint(output, locomotion, Hand::Right);
+
+    ControllerInteractionFrameHandoff handoff;
+    (void)handoff.apply(
+        locomotion,
+        output,
+        interaction::kControllerStepSeconds,
+        constraint);
+    output.diagnostics.hand_constraint_weight = 1.0F;
+    const ControllerInteractionFrameState held = handoff.apply(
+        locomotion,
+        output,
+        interaction::kControllerStepSeconds,
+        constraint);
+    require(
+        held.hand_constraint_result.applied,
+        "same-generation lifecycle setup did not solve while Held");
+
+    output.diagnostics.state = RuntimeState::PlaceRelease;
+    output.diagnostics.object_state = ObjectState::Free;
+    output.diagnostics.attached = false;
+    const ControllerInteractionFrameState released = handoff.apply(
+        locomotion,
+        output,
+        interaction::kControllerStepSeconds,
+        constraint);
+    require(
+        !released.hand_constraint_validated &&
+            !released.hand_constraint_result.applied,
+        "same-generation Free lifecycle retained a semantic solve");
+
+    output.diagnostics.state = RuntimeState::PlaceReplay;
+    output.diagnostics.object_state = ObjectState::Held;
+    output.diagnostics.attached = true;
+    const ControllerInteractionFrameState stale_held = handoff.apply(
+        locomotion,
+        output,
+        interaction::kControllerStepSeconds,
+        constraint);
+    require(
+        !stale_held.hand_constraint_validated &&
+            !stale_held.hand_constraint_result.applied,
+        "same-generation Held rollback resurrected an ended constraint epoch");
+}
+
+void test_left_place_release_reset_clears_blend_and_rejects_free_entry_solve() {
+    const FlatControllerPose locomotion = make_flat_pose();
+    const Pose raw_reference = interaction::expand_flat_controller_pose(
+        locomotion, make_pose(0.8125F));
+    RuntimeOutput output = make_owned_output(raw_reference);
+    output.diagnostics.state = RuntimeState::PlaceReplay;
+    output.diagnostics.target = {83U, 10U};
+    output.diagnostics.affordance_id = 13U;
+    output.diagnostics.hand = Hand::Left;
+    output.diagnostics.object_state = ObjectState::Held;
+    output.diagnostics.attached = true;
+    output.diagnostics.hand_constraint_weight = 0.0F;
+    const ControllerInteractionHandConstraint held_constraint =
+        make_hand_constraint(output, locomotion, Hand::Left);
+
+    ControllerInteractionFrameHandoff handoff;
+    (void)handoff.apply(
+        locomotion,
+        output,
+        interaction::kControllerStepSeconds,
+        held_constraint);
+    output.diagnostics.hand_constraint_weight = 1.0F;
+    const ControllerInteractionFrameState held = handoff.apply(
+        locomotion,
+        output,
+        interaction::kControllerStepSeconds,
+        held_constraint);
+    require(
+        held.hand_constraint_result.applied,
+        "left held setup did not activate the semantic hand constraint");
+    const FlatWorldPose held_world = flat_world_pose(held.pose);
+
+    output.diagnostics.state = RuntimeState::PlaceRelease;
+    output.diagnostics.target = {83U, 11U};
+    output.diagnostics.object_state = ObjectState::Free;
+    output.diagnostics.attached = false;
+    output.diagnostics.hand_constraint_weight = 0.0F;
+    const ControllerInteractionFrameState released = handoff.apply(
+        locomotion,
+        output,
+        interaction::kControllerStepSeconds,
+        std::nullopt);
+    const FlatWorldPose released_world = flat_world_pose(released.pose);
+    for (size_t bone = 15U; bone <= 18U; ++bone) {
+        require_vec_near(
+            released_world.positions[bone],
+            held_world.positions[bone],
+            "left PlaceRelease did not preserve active-arm world position");
+        require_vec_near(
+            released_world.velocities[bone],
+            held_world.velocities[bone],
+            "left PlaceRelease did not preserve active-arm world velocity");
+        require_same_rotation(
+            released_world.rotations[bone],
+            held_world.rotations[bone],
+            "left PlaceRelease did not preserve active-arm world rotation");
+        require_vec_near(
+            released_world.angular_velocities[bone],
+            held_world.angular_velocities[bone],
+            "left PlaceRelease did not preserve active-arm angular velocity");
+    }
+
+    FlatControllerPose authored_retract = locomotion;
+    authored_retract.rotations[16] = quat_normalize(quat_mul(
+        quat_from_angle_axis(
+            0.10F, normalize(vec3(0.5F, 0.3F, 0.7F))),
+        locomotion.rotations[16]));
+    output.pose = interaction::expand_flat_controller_pose(
+        authored_retract, raw_reference);
+    const FlatControllerPose expected_authored_retract =
+        interaction::collapse_interaction_pose(
+            output.pose, raw_reference, locomotion);
+    const ControllerInteractionFrameState retract = handoff.apply(
+        locomotion,
+        output,
+        interaction::kControllerStepSeconds,
+        std::nullopt);
+    bool left_arm_is_fully_authored = true;
+    for (size_t bone = 15U; bone <= 18U; ++bone) {
+        left_arm_is_fully_authored = left_arm_is_fully_authored &&
+            flat_bone_channels_bits_equal(
+                retract.pose, expected_authored_retract, bone);
+    }
+    require(
+        !left_arm_is_fully_authored,
+        "left active-arm release blend ended after one frame");
+
+    handoff.reset();
+    RuntimeOutput free_entry = make_owned_output(raw_reference);
+    free_entry.diagnostics.state = RuntimeState::PlaceRelease;
+    free_entry.diagnostics.target = {84U, 1U};
+    free_entry.diagnostics.affordance_id = 14U;
+    free_entry.diagnostics.hand = Hand::Left;
+    free_entry.diagnostics.object_state = ObjectState::Free;
+    free_entry.diagnostics.attached = false;
+    free_entry.diagnostics.hand_constraint_weight = 1.0F;
+    const ControllerInteractionHandConstraint free_constraint =
+        make_hand_constraint(free_entry, locomotion, Hand::Left);
+    const ControllerInteractionFrameState after_reset = handoff.apply(
+        locomotion,
+        free_entry,
+        interaction::kControllerStepSeconds,
+        free_constraint);
+    require(
+        !after_reset.hand_constraint_validated &&
+            !after_reset.hand_constraint_result.applied,
+        "reset re-entry started a semantic constraint on a Free object");
+    require(
+        flat_pose_bits_equal(after_reset.pose, locomotion),
+        "reset re-entry retained a stale left-arm release overlay");
+}
+
+void test_place_release_clears_stale_inactive_arm_return_before_composite() {
+    const FlatControllerPose entry = make_flat_pose();
+    const Pose raw_reference = interaction::expand_flat_controller_pose(
+        entry, make_pose(0.84375F));
+    RuntimeOutput output = make_owned_output(raw_reference);
+    output.diagnostics.state = RuntimeState::Carry;
+    output.diagnostics.target = {86U, 2U};
+    output.diagnostics.affordance_id = 16U;
+    output.diagnostics.hand = Hand::Left;
+    output.diagnostics.object_state = ObjectState::Held;
+    output.diagnostics.attached = true;
+    output.diagnostics.recorded_carry = false;
+    output.diagnostics.inactive_arm_targets_locomotion = true;
+    output.diagnostics.inactive_arm_tracks_locomotion = true;
+    output.diagnostics.hand_constraint_weight = 0.0F;
+    const ControllerInteractionHandConstraint constraint =
+        make_hand_constraint(output, entry, Hand::Left);
+
+    FlatControllerPose carry_locomotion = entry;
+    for (size_t bone = 19U; bone <= 22U; ++bone) {
+        carry_locomotion.rotations[bone] = quat_normalize(quat_mul(
+            quat_from_angle_axis(
+                0.20F + 0.02F * static_cast<float>(bone - 19U),
+                normalize(vec3(0.3F, 0.8F, 0.4F))),
+            entry.rotations[bone]));
+    }
+    ControllerInteractionFrameHandoff handoff;
+    (void)handoff.apply(
+        carry_locomotion,
+        output,
+        interaction::kControllerStepSeconds,
+        constraint);
+    output.diagnostics.hand_constraint_weight = 1.0F;
+    (void)handoff.apply(
+        carry_locomotion,
+        output,
+        interaction::kControllerStepSeconds,
+        constraint);
+
+    FlatControllerPose authored_place = entry;
+    for (size_t bone = 19U; bone <= 22U; ++bone) {
+        authored_place.rotations[bone] = quat_normalize(quat_mul(
+            quat_from_angle_axis(
+                -0.18F - 0.015F * static_cast<float>(bone - 19U),
+                normalize(vec3(0.7F, 0.2F, 0.5F))),
+            entry.rotations[bone]));
+    }
+    output.pose = interaction::expand_flat_controller_pose(
+        authored_place, raw_reference);
+    output.diagnostics.recorded_carry = false;
+    output.diagnostics.inactive_arm_targets_locomotion = false;
+    output.diagnostics.inactive_arm_tracks_locomotion = false;
+    for (RuntimeState state : {
+             RuntimeState::PlacePreflight,
+             RuntimeState::PlaceAlign,
+             RuntimeState::PlaceReplay}) {
+        output.diagnostics.state = state;
+        (void)handoff.apply(
+            entry,
+            output,
+            interaction::kControllerStepSeconds,
+            constraint);
+    }
+
+    output.diagnostics.state = RuntimeState::PlaceRelease;
+    output.diagnostics.target = {86U, 3U};
+    output.diagnostics.object_state = ObjectState::Free;
+    output.diagnostics.attached = false;
+    output.diagnostics.hand_constraint_weight = 0.0F;
+    const FlatControllerPose expected_release =
+        interaction::collapse_interaction_pose(
+            output.pose, raw_reference, carry_locomotion);
+    const ControllerInteractionFrameState released = handoff.apply(
+        entry,
+        output,
+        interaction::kControllerStepSeconds,
+        std::nullopt);
+    for (size_t bone = 19U; bone <= 22U; ++bone) {
+        require(
+            flat_bone_channels_bits_equal(
+                released.pose, expected_release, bone),
+            "PlaceRelease retained a stale inactive-arm return overlay");
+    }
 }
 
 void test_frame_handoff_reset_and_reentry_capture_fresh_flat_reference() {
@@ -4229,8 +5486,10 @@ void test_demo_target_preserves_object_in_table_transform() {
     Database database;
     database.clip_count = 1;
     database.frame_count = 4;
+    database.bone_count = g1_skeleton::BoneCount;
     database.range_starts = {0};
     database.range_stops = {4};
+    database.hand_dof_count = 14U;
     database.phases = {
         static_cast<uint8_t>(Phase::Approach),
         static_cast<uint8_t>(Phase::Reach),
@@ -4240,7 +5499,9 @@ void test_demo_target_preserves_object_in_table_transform() {
 
     const Transform source_table{
         vec3(2.0F, 0.8F, -1.0F),
-        quat_from_angle_axis(0.65F, vec3(0.0F, 1.0F, 0.0F))};
+        quat_normalize(quat_mul(
+            quat_from_angle_axis(0.65F, vec3(0.0F, 1.0F, 0.0F)),
+            quat_from_angle_axis(0.06F, vec3(1.0F, 0.0F, 0.0F))))};
     const Transform object_in_table{
         vec3(0.35F, 0.45F, -0.22F),
         quat_from_angle_axis(-0.4F, vec3(0.0F, 1.0F, 0.0F))};
@@ -4281,6 +5542,45 @@ void test_demo_target_preserves_object_in_table_transform() {
         database.object_rotations[frame * 4 + 3] = object.rotation.z;
     }
 
+    const size_t pose_samples =
+        static_cast<size_t>(database.frame_count) * g1_skeleton::BoneCount;
+    database.positions.assign(pose_samples * 3U, 0.0F);
+    database.velocities.assign(pose_samples * 3U, 0.0F);
+    database.rotations.assign(pose_samples * 4U, 0.0F);
+    database.angular_velocities.assign(pose_samples * 3U, 0.0F);
+    for (size_t sample = 0; sample < pose_samples; ++sample) {
+        database.rotations[sample * 4U] = 1.0F;
+    }
+    database.hand_dof.assign(
+        static_cast<size_t>(database.frame_count) * 14U, 0.0F);
+    database.hand_dof_velocities.assign(
+        static_cast<size_t>(database.frame_count) * 14U, 0.0F);
+    database.foot_contacts.assign(
+        static_cast<size_t>(database.frame_count) * 2U, 0U);
+    const Transform expected_grasp{
+        vec3(0.04F, 0.10F, -0.03F),
+        quat_from_angle_axis(0.31F, normalize(vec3(0.7F, 0.2F, 0.5F)))};
+    const Transform contact_hand = compose(source_object, expected_grasp);
+    const size_t contact_hand_sample =
+        (2U * g1_skeleton::BoneCount +
+         static_cast<size_t>(g1_skeleton::LeftWrist));
+    database.positions[contact_hand_sample * 3U] = contact_hand.position.x;
+    database.positions[contact_hand_sample * 3U + 1U] =
+        contact_hand.position.y;
+    database.positions[contact_hand_sample * 3U + 2U] =
+        contact_hand.position.z;
+    database.rotations[contact_hand_sample * 4U] = contact_hand.rotation.w;
+    database.rotations[contact_hand_sample * 4U + 1U] =
+        contact_hand.rotation.x;
+    database.rotations[contact_hand_sample * 4U + 2U] =
+        contact_hand.rotation.y;
+    database.rotations[contact_hand_sample * 4U + 3U] =
+        contact_hand.rotation.z;
+    const Transform rest_object = transform_from_arrays(
+        database.object_positions, database.object_rotations, 1U);
+    const Transform expected_grasp_from_contact = compose(
+        inverse(rest_object), contact_hand);
+
     const InteractionTarget target =
         interaction::make_controller_demo_target(database);
     assert(target.handle.id != 0U);
@@ -4300,11 +5600,53 @@ void test_demo_target_preserves_object_in_table_transform() {
     assert_same_rotation(relocated_local.rotation, object_in_table.rotation);
     assert(target.affordances.size() == 1);
     assert(target.affordances[0].hand == Hand::Left);
+    assert_vec_near(
+        target.affordances[0].hand_in_object.position,
+        expected_grasp_from_contact.position);
+    assert_same_rotation(
+        target.affordances[0].hand_in_object.rotation,
+        expected_grasp_from_contact.rotation);
     assert(target.state == ObjectState::Free);
 
-    const Transform selected_source = transform_from_arrays(
-        database.object_positions, database.object_rotations, 1);
-    assert_vec_near(selected_source.position, source_object.position);
+    assert_vec_near(rest_object.position, source_object.position);
+
+    const vec3 source_normal = quat_mul_vec3(
+        source_table.rotation, vec3(0.0F, 1.0F, 0.0F));
+    assert(
+        std::fabs(source_normal.x) > 0.02F ||
+        std::fabs(source_normal.z) > 0.02F);
+    const Transform source_surface = compose(
+        source_table,
+        Transform{
+            vec3(0.0F, 0.5F * database.table_sizes[1], 0.0F), quat()});
+    const Transform raw_object_in_surface = compose(
+        inverse(source_surface), source_object);
+    float expected_lowest_corner_m =
+        std::numeric_limits<float>::infinity();
+    for (int sign_x : {-1, 1}) {
+        for (int sign_y : {-1, 1}) {
+            for (int sign_z : {-1, 1}) {
+                const vec3 corner_object =
+                    target.object_bounds.center_object + vec3(
+                        static_cast<float>(sign_x) *
+                            target.object_bounds.half_extents_object.x,
+                        static_cast<float>(sign_y) *
+                            target.object_bounds.half_extents_object.y,
+                        static_cast<float>(sign_z) *
+                            target.object_bounds.half_extents_object.z);
+                const vec3 corner_surface =
+                    raw_object_in_surface.position + quat_mul_vec3(
+                        raw_object_in_surface.rotation, corner_object);
+                expected_lowest_corner_m = std::min(
+                    expected_lowest_corner_m, corner_surface.y);
+            }
+        }
+    }
+    const float expected_bounds_clearance_m =
+        expected_lowest_corner_m < 0.0F
+        ? -expected_lowest_corner_m
+        : 0.0F;
+    const vec3 destination_normal = source_normal;
 
     const interaction::PlacementSurface destination =
         interaction::make_controller_demo_destination_surface(
@@ -4313,14 +5655,12 @@ void test_demo_target_preserves_object_in_table_transform() {
     assert(destination.handle.generation != 0U);
     assert_vec_near(
         destination.support_volume_world.position,
-        target.table_world.position + vec3(0.0F, 0.0F, 1.20F));
+        target.table_world.position + vec3(0.0F, 0.0F, 1.20F) -
+            expected_bounds_clearance_m * destination_normal);
     assert_same_rotation(
         destination.support_volume_world.rotation,
         target.table_world.rotation);
     assert_vec_near(destination.support_volume_size, target.table_size);
-    const vec3 destination_normal = quat_mul_vec3(
-        destination.support_volume_world.rotation,
-        vec3(0.0F, 1.0F, 0.0F));
     assert_vec_near(
         destination.surface_world.position,
         destination.support_volume_world.position +
@@ -4335,8 +5675,18 @@ void test_demo_target_preserves_object_in_table_transform() {
 
     const interaction::PlaceAffordance& place =
         destination.affordances.front();
-    const vec3 source_normal = quat_mul_vec3(
-        source_table.rotation, vec3(0.0F, 1.0F, 0.0F));
+    const interaction::PlacementFit authored_fit =
+        interaction::evaluate_placement_fit(
+            destination, place, target.object_bounds);
+    assert(authored_fit.accepted);
+    Transform expected_object_in_surface = raw_object_in_surface;
+    expected_object_in_surface.position.y += expected_bounds_clearance_m;
+    assert_vec_near(
+        place.object_in_surface.position,
+        expected_object_in_surface.position);
+    assert_same_rotation(
+        place.object_in_surface.rotation,
+        expected_object_in_surface.rotation);
     const vec3 source_top = source_table.position +
         source_normal * (0.5F * database.table_sizes[1]);
     const vec3 to_top = source_top - source_object.position;
@@ -4354,13 +5704,116 @@ void test_demo_target_preserves_object_in_table_transform() {
     const vec3 destination_support = compose(
         destination_object,
         Transform{place.support_point_object, quat()}).position;
+    const vec3 expected_support_surface = compose(
+        expected_object_in_surface,
+        Transform{expected_support_object, quat()}).position;
     assert_vec_near(
         destination_support,
-        destination.surface_world.position,
+        compose(
+            destination.surface_world,
+            Transform{expected_support_surface, quat()}).position,
         2.0e-5F);
     assert_vec_near(
         place.approach_direction_surface,
         vec3(0.0F, 1.0F, 0.0F));
+}
+
+void test_demo_scene_rejects_every_malformed_consumed_shape_as_format_error() {
+    const Database valid =
+        interaction::runtime_fixture_detail::make_database();
+    const auto expect_format_error = [](
+        const Database& malformed,
+        const std::string& label) {
+        try {
+            (void)interaction::make_controller_demo_target(malformed);
+        } catch (const interaction::FormatError&) {
+            return;
+        } catch (const std::exception& error) {
+            throw std::runtime_error(
+                label + " leaked a non-FormatError exception: " + error.what());
+        }
+        throw std::runtime_error(label + " was accepted");
+    };
+    const auto verify_exact_channel = [
+        &valid,
+        &expect_format_error](const char* label, auto member) {
+        Database truncated = valid;
+        auto& truncated_values = truncated.*member;
+        truncated_values.pop_back();
+        expect_format_error(
+            truncated, std::string(label) + " truncated shape");
+
+        Database extended = valid;
+        auto& extended_values = extended.*member;
+        extended_values.push_back(extended_values.back());
+        expect_format_error(
+            extended, std::string(label) + " extra-tail shape");
+    };
+
+    verify_exact_channel("range_starts", &Database::range_starts);
+    verify_exact_channel("range_stops", &Database::range_stops);
+    verify_exact_channel("active_hands", &Database::active_hands);
+    verify_exact_channel("phases", &Database::phases);
+    verify_exact_channel("positions", &Database::positions);
+    verify_exact_channel("velocities", &Database::velocities);
+    verify_exact_channel("rotations", &Database::rotations);
+    verify_exact_channel(
+        "angular_velocities", &Database::angular_velocities);
+    verify_exact_channel("hand_dof", &Database::hand_dof);
+    verify_exact_channel(
+        "hand_dof_velocities", &Database::hand_dof_velocities);
+    verify_exact_channel("foot_contacts", &Database::foot_contacts);
+    verify_exact_channel("object_positions", &Database::object_positions);
+    verify_exact_channel("object_rotations", &Database::object_rotations);
+    verify_exact_channel("table_positions", &Database::table_positions);
+    verify_exact_channel("table_rotations", &Database::table_rotations);
+    verify_exact_channel("table_sizes", &Database::table_sizes);
+    verify_exact_channel(
+        "object_dimensions", &Database::object_dimensions);
+    verify_exact_channel(
+        "approach_directions_object",
+        &Database::approach_directions_object);
+
+    Database incompatible_hand_dof = valid;
+    incompatible_hand_dof.hand_dof_count = 13U;
+    expect_format_error(
+        incompatible_hand_dof, "incompatible hand_dof_count 13");
+    incompatible_hand_dof = valid;
+    incompatible_hand_dof.hand_dof_count = 15U;
+    expect_format_error(
+        incompatible_hand_dof, "incompatible hand_dof_count 15");
+}
+
+void test_demo_destination_rejects_unsupported_fit_categories() {
+    const Database database =
+        interaction::runtime_fixture_detail::make_database();
+    const InteractionTarget valid_target =
+        interaction::make_controller_demo_target(database);
+    const auto expect_format_error = [
+        &database](const InteractionTarget& target, const char* label) {
+        try {
+            (void)interaction::make_controller_demo_destination_surface(
+                database, target);
+        } catch (const interaction::FormatError&) {
+            return;
+        } catch (const std::exception& error) {
+            throw std::runtime_error(
+                std::string(label) +
+                " leaked a non-FormatError exception: " + error.what());
+        }
+        throw std::runtime_error(
+            std::string(label) + " destination was accepted");
+    };
+
+    InteractionTarget footprint_failure = valid_target;
+    footprint_failure.table_size.x = 0.05F;
+    footprint_failure.table_size.z = 0.05F;
+    expect_format_error(footprint_failure, "footprint-invalid");
+
+    InteractionTarget overhead_failure = valid_target;
+    overhead_failure.object_bounds.half_extents_object =
+        vec3(0.01F, 3.00F, 0.01F);
+    expect_format_error(overhead_failure, "overhead-invalid");
 }
 
 void test_cross_pack_frame_count_validation() {
@@ -4498,15 +5951,58 @@ void test_controller_and_make_clock_policy() {
             std::string::npos,
         "controller does not publish the final handoff pose");
     require(
-        controller.find(
-            "latest_owned_interaction_pose = interaction_output.pose;") !=
+        controller.find("latest_owned_interaction_pose") ==
             std::string::npos,
-        "controller does not cache the raw owned G1 pose");
+        "controller retains a dynamic owned-pose bridge reference");
+    const size_t canonical_world_initialization = controller.find(
+        "        initialize_autodemo_canonical_world();");
+    const size_t fixed_flat_reference = controller.find(
+        "const interaction::FlatControllerPose\n"
+        "        interaction_flat_reference_pose = [&]()");
+    require(
+        canonical_world_initialization != std::string::npos &&
+            fixed_flat_reference != std::string::npos &&
+            canonical_world_initialization < fixed_flat_reference,
+        "controller does not freeze the flat reference after canonical init");
     require(
         controller.find(
-            "latest_owned_interaction_pose = interaction_frame_state.pose;") ==
+            "reference.velocities.fill(vec3());", fixed_flat_reference) !=
+                std::string::npos &&
+            controller.find(
+                "reference.angular_velocities.fill(vec3());",
+                fixed_flat_reference) != std::string::npos,
+        "controller fixed flat reference retains dynamic channels");
+    for (const std::string channel : {
+             "positions", "velocities", "rotations",
+             "angular_velocities"}) {
+        require(
+            controller.find(
+                "interaction_reference_pose." + channel +
+                    "[interaction_root] =\n"
+                    "        interaction_flat_reference_pose." + channel +
+                    "[0];",
+                fixed_flat_reference) != std::string::npos,
+            "controller does not scene-align every fixed G1 root channel");
+    }
+    require(
+        controller.find(
+            "flat_locomotion_pose,\n"
+            "                interaction_reference_pose,\n"
+            "                interaction_flat_reference_pose);") !=
+                std::string::npos &&
+            controller.find(
+                "interaction_frame_state.pose,\n"
+                "                interaction_reference_pose,\n"
+                "                interaction_flat_reference_pose);") !=
+                std::string::npos,
+        "controller does not use its fixed reference pair for live and debug poses");
+    require(
+        controller.find(
+            "if (use_autodemo_canonical_snapshot)\n"
+            "                    {\n"
+            "                        return autodemo_canonical_entry->snapshot;") !=
             std::string::npos,
-        "controller makes a rendered/reconstructed pose runtime authority");
+        "controller lost the canonical pickup snapshot exception");
     require(
         controller.find("interaction_debug_pose") != std::string::npos,
         "controller does not isolate reconstructed G1 debug pose");
@@ -4597,10 +6093,21 @@ void test_controller_and_make_clock_policy() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 &&
+        std::strcmp(argv[1], "--post-release-arm-fast-math-canary") == 0) {
+        test_place_release_active_arm_return_is_bounded_after_ownership();
+        return 0;
+    }
     test_exact_constants();
     test_flat_bridge_exact_parent_tree_anchor_map_and_unmapped_head();
     test_flat_bridge_expansion_matches_every_world_anchor_and_retains_reference();
+    test_calibrated_flat_bridge_reference_is_exact_true_g1_pose();
+    test_calibrated_flat_bridge_transfers_supported_world_deltas();
+    test_calibrated_flat_bridge_round_trips_representable_flat_pose();
+    test_calibrated_flat_bridge_projects_nonrepresentable_flat_morphology();
+    test_calibrated_flat_bridge_is_antipodal_invariant();
+    test_calibrated_flat_bridge_rejects_invalid_input_without_mutation();
     test_reference_retarget_raw_reference_is_exact_flat_reference();
     test_reference_retarget_fixes_nonroot_translations_under_mismatched_source();
     test_reference_retarget_transfers_mapped_world_rotation_delta();
@@ -4616,7 +6123,13 @@ int main() {
     test_scheduler_reset_clears_place_latch_before_another_preview();
     test_scheduler_clears_far_place_when_carry_authority_ends();
     test_frame_handoff_first_owned_frame_is_exact_displayed_reference();
+    test_frame_handoff_solves_positive_targeted_constraint_on_owned_entry();
+    test_calibrated_bridge_keeps_exact_25_hz_handoff_continuous_and_reaches_oracle();
     test_frame_handoff_applies_validated_semantic_hand_constraint_and_releases_from_it();
+    test_frame_handoff_starts_matching_constraint_after_attachment_inside_owned_epoch();
+    test_delayed_constraint_rejects_free_lifecycle();
+    test_delayed_constraint_accepts_targeted_lifecycle();
+    test_delayed_constraint_rejects_identity_switched_before_first_constraint();
     test_hand_constraint_keeps_layered_carry_lower_body_exact_and_selected_only();
     test_layered_carry_final_composite_guard_is_atomic_for_both_hands();
     test_hand_constraint_mismatch_or_invalid_input_disables_atomically();
@@ -4638,6 +6151,10 @@ int main() {
     test_all_place_states_keep_one_full_body_runtime_ownership_epoch();
     test_place_release_generation_change_ends_constraint_without_free_object_solve();
     test_normal_release_starts_at_last_displayed_place_release_pose();
+    test_place_release_active_arm_return_is_bounded_after_ownership();
+    test_same_generation_free_lifecycle_ends_constraint_without_resurrection();
+    test_left_place_release_reset_clears_blend_and_rejects_free_entry_solve();
+    test_place_release_clears_stale_inactive_arm_return_before_composite();
     test_frame_handoff_reset_and_reentry_capture_fresh_flat_reference();
     test_frame_handoff_preserves_fresh_complete_nonowned_pose_for_25_frames();
     test_frame_handoff_exposes_rendered_flat_root_sync();
@@ -4651,6 +6168,8 @@ int main() {
     test_carry_label_is_only_specific_during_carry();
     test_place_debug_status_prefers_active_controller_preview_values();
     test_demo_target_preserves_object_in_table_transform();
+    test_demo_scene_rejects_every_malformed_consumed_shape_as_format_error();
+    test_demo_destination_rejects_unsupported_fit_categories();
     test_cross_pack_frame_count_validation();
     test_debug_draw_uses_real_correction_geometry_and_complete_text();
     test_controller_and_make_clock_policy();

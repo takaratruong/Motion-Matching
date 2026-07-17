@@ -11,20 +11,6 @@ bool finite_nonnegative(float value) {
     return std::isfinite(value) && value >= 0.0F;
 }
 
-bool exact(vec3 left, vec3 right) {
-    return left.x == right.x && left.y == right.y && left.z == right.z;
-}
-
-bool exact(quat left, quat right) {
-    return left.w == right.w && left.x == right.x &&
-           left.y == right.y && left.z == right.z;
-}
-
-bool exact(const Transform& left, const Transform& right) {
-    return exact(left.position, right.position) &&
-           exact(left.rotation, right.rotation);
-}
-
 bool valid_position(vec3 position) {
     return std::isfinite(position.x) && std::isfinite(position.y) &&
            std::isfinite(position.z);
@@ -49,31 +35,17 @@ bool valid_transform(const Transform& transform) {
 }
 
 bool exact(const GraspAffordance& left, const GraspAffordance& right) {
-    return left.id == right.id && left.hand == right.hand &&
-           exact(left.hand_in_object, right.hand_in_object) &&
-           exact(
-               left.approach_direction_object,
-               right.approach_direction_object) &&
-           left.clearance_radius == right.clearance_radius;
+    return same_authored_grasp_affordance(left, right);
 }
 
 bool exact_target_core(
     const InteractionTarget& left,
     const InteractionTarget& right) {
-    return left.handle == right.handle &&
-           exact(left.object_world, right.object_world) &&
-           left.object_profile_id == right.object_profile_id &&
-           exact(
-               left.object_bounds.center_object,
-               right.object_bounds.center_object) &&
-           exact(
-               left.object_bounds.half_extents_object,
-               right.object_bounds.half_extents_object) &&
-           exact(left.object_dimensions, right.object_dimensions) &&
-           exact(left.table_world, right.table_world) &&
-           exact(left.table_size, right.table_size) &&
-           left.state == right.state &&
-           left.owner_request == right.owner_request;
+    InteractionTarget left_core = left;
+    InteractionTarget right_core = right;
+    left_core.affordances.clear();
+    right_core.affordances.clear();
+    return same_interaction_target_snapshot(left_core, right_core);
 }
 
 bool exact_affordances(

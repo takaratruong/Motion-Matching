@@ -435,6 +435,7 @@ Fixture make_fixture(bool recorded = true) {
         Transform{vec3(), quat()},
         vec3(0.0F, 1.0F, 0.0F),
         0.01F,
+        {},
     };
     fixture.input.surface = make_surface();
     fixture.input.place_affordance = fixture.input.surface.affordances.front();

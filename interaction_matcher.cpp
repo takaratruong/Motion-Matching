@@ -37,6 +37,7 @@ struct FailureSet {
 
 enum class CandidateStatus {
     Accepted,
+    NoCandidate,
     OutOfRange,
     CorrectionLimit,
     BlockedPath,
@@ -45,6 +46,8 @@ enum class CandidateStatus {
 
 struct CandidateEvaluation {
     CandidateStatus status = CandidateStatus::OutOfRange;
+    bool path_feasible = false;
+    bool total_cost_available = false;
     MatchCandidate candidate{};
 };
 
@@ -72,36 +75,62 @@ bool positive_dimensions(vec3 value) {
            value.y > 0.0F && value.z > 0.0F;
 }
 
-bool same_vec3(vec3 left, vec3 right) {
-    return left.x == right.x && left.y == right.y && left.z == right.z;
-}
-
-bool same_quat(quat left, quat right) {
-    return left.w == right.w && left.x == right.x &&
-           left.y == right.y && left.z == right.z;
-}
-
 bool same_affordance(
     const GraspAffordance& left,
     const GraspAffordance& right) {
-    return left.id == right.id && left.hand == right.hand &&
-           same_vec3(
-               left.hand_in_object.position,
-               right.hand_in_object.position) &&
-           same_quat(
-               left.hand_in_object.rotation,
-               right.hand_in_object.rotation) &&
-           same_vec3(
-               left.approach_direction_object,
-               right.approach_direction_object) &&
-           left.clearance_radius == right.clearance_radius;
+    return same_authored_grasp_affordance(left, right);
 }
 
-const GraspAffordance* exact_target_affordance(const MatchInput& input) {
+const GraspAffordance* exact_target_affordance(
+    const matcher_detail::PickEvaluationInput& input) {
     for (const GraspAffordance& affordance : input.target.affordances) {
-        if (affordance.id == input.request.affordance_id) return &affordance;
+        if (affordance.id == input.affordance.id) return &affordance;
     }
     return nullptr;
+}
+
+std::optional<Reason> validate_pick_context(
+    const matcher_detail::PickEvaluationInput& input) {
+    if (input.database == nullptr || input.features == nullptr) {
+        return Reason::PackUnavailable;
+    }
+    if (input.target.handle.id == 0U ||
+        input.target.handle.generation == 0U) {
+        return Reason::TargetUnavailable;
+    }
+    const GraspAffordance* authored = exact_target_affordance(input);
+    if (authored == nullptr || !same_affordance(*authored, input.affordance)) {
+        return Reason::TargetUnavailable;
+    }
+    if (input.target.state == ObjectState::Attached ||
+        input.target.state == ObjectState::Held) {
+        return Reason::TargetUnavailable;
+    }
+    if (!finite(input.target.object_world.position) ||
+        !finite(input.target.object_world.rotation) ||
+        !positive_dimensions(input.target.object_dimensions) ||
+        !finite(input.target.table_world.position) ||
+        !finite(input.target.table_world.rotation) ||
+        !positive_dimensions(input.target.table_size) ||
+        !finite(input.affordance.hand_in_object.position) ||
+        !finite(input.affordance.hand_in_object.rotation) ||
+        !finite(input.affordance.clearance_radius) ||
+        input.affordance.clearance_radius < 0.0F) {
+        return Reason::TargetUnavailable;
+    }
+    return std::nullopt;
+}
+
+matcher_detail::PickEvaluationInput pick_evaluation_input(
+    const MatchInput& input) {
+    return {
+        input.database,
+        input.features,
+        input.query,
+        input.locomotion,
+        input.target,
+        input.affordance,
+    };
 }
 
 std::optional<Reason> validate_request(const MatchInput& input) {
@@ -118,7 +147,10 @@ std::optional<Reason> validate_request(const MatchInput& input) {
     if (input.request.affordance_id != input.affordance.id) {
         return Reason::TargetUnavailable;
     }
-    const GraspAffordance* authored = exact_target_affordance(input);
+    const matcher_detail::PickEvaluationInput evaluation_input =
+        pick_evaluation_input(input);
+    const GraspAffordance* authored = exact_target_affordance(
+        evaluation_input);
     if (authored == nullptr || !same_affordance(*authored, input.affordance)) {
         return Reason::TargetUnavailable;
     }
@@ -130,19 +162,7 @@ std::optional<Reason> validate_request(const MatchInput& input) {
         input.target.owner_request != input.request.request_id) {
         return Reason::TargetChanged;
     }
-    if (!finite(input.target.object_world.position) ||
-        !finite(input.target.object_world.rotation) ||
-        !positive_dimensions(input.target.object_dimensions) ||
-        !finite(input.target.table_world.position) ||
-        !finite(input.target.table_world.rotation) ||
-        !positive_dimensions(input.target.table_size) ||
-        !finite(input.affordance.hand_in_object.position) ||
-        !finite(input.affordance.hand_in_object.rotation) ||
-        !finite(input.affordance.clearance_radius) ||
-        input.affordance.clearance_radius < 0.0F) {
-        return Reason::TargetUnavailable;
-    }
-    return std::nullopt;
+    return validate_pick_context(evaluation_input);
 }
 
 vec3 read_vec3(const std::vector<float>& values, size_t index) {
@@ -299,7 +319,7 @@ vec3 corrected_hand_position(
 }
 
 bool path_is_clear(
-    const MatchInput& input,
+    const matcher_detail::PickEvaluationInput& input,
     const ClipFrames& frames,
     const Transform& scene_from_source,
     int32_t entry_frame,
@@ -442,7 +462,7 @@ std::optional<ClipFrames> inspect_clip(
 }
 
 std::optional<std::array<float, 5>> group_costs(
-    const MatchInput& input,
+    const matcher_detail::PickEvaluationInput& input,
     int32_t entry_frame) {
     const Features& features = *input.features;
     if (features.dimension != kFeatureDimension ||
@@ -488,11 +508,13 @@ std::optional<float> total_cost(
 }
 
 CandidateEvaluation evaluate_candidate(
-    const MatchInput& input,
+    const matcher_detail::PickEvaluationInput& input,
     const MatchConfig& config,
     const ClipFrames& frames,
     int32_t entry_frame,
-    const Transform& current_root) {
+    const Transform& current_root,
+    const matcher_detail::CandidateFeasibility& candidate_feasibility) {
+    CandidateEvaluation evaluation{};
     try {
         const Database& database = *input.database;
         const Transform source_object = source_object_transform(
@@ -514,7 +536,8 @@ CandidateEvaluation evaluate_candidate(
                 config.maximum_root_correction_m ||
             std::abs(yaw_offset) >
                 config.maximum_yaw_correction_radians) {
-            return {CandidateStatus::CorrectionLimit, {}};
+            evaluation.status = CandidateStatus::CorrectionLimit;
+            return evaluation;
         }
 
         const Transform mapped_hand = compose(
@@ -529,7 +552,8 @@ CandidateEvaluation evaluate_candidate(
                 config.maximum_hand_correction_m ||
             quat_angle_between(mapped_hand.rotation, target_hand.rotation) >
                 config.maximum_hand_orientation_radians) {
-            return {CandidateStatus::CorrectionLimit, {}};
+            evaluation.status = CandidateStatus::CorrectionLimit;
+            return evaluation;
         }
 
         if (!path_is_clear(
@@ -539,40 +563,80 @@ CandidateEvaluation evaluate_candidate(
                 entry_frame,
                 root_offset,
                 yaw_offset)) {
-            return {CandidateStatus::BlockedPath, {}};
+            evaluation.status = CandidateStatus::BlockedPath;
+            return evaluation;
         }
 
+        evaluation.candidate.clip = frames.clip;
+        evaluation.candidate.entry_frame = entry_frame;
+        evaluation.candidate.contact_frame = frames.contact;
+        evaluation.candidate.lift_frame = frames.lift;
+        evaluation.candidate.hold_frame = frames.hold;
+        evaluation.candidate.scene_from_source = scene_from_source;
+        evaluation.candidate.entry_root_offset = root_offset;
+        evaluation.candidate.entry_yaw_offset = yaw_offset;
+    } catch (const std::out_of_range&) {
+        evaluation.status = CandidateStatus::OutOfRange;
+        return evaluation;
+    }
+
+    if (candidate_feasibility) {
+        const Reason reason = candidate_feasibility(evaluation.candidate);
+        switch (reason) {
+        case Reason::None:
+            break;
+        case Reason::NoCandidate:
+            evaluation.status = CandidateStatus::NoCandidate;
+            return evaluation;
+        case Reason::OutOfRange:
+            evaluation.status = CandidateStatus::OutOfRange;
+            return evaluation;
+        case Reason::CorrectionLimit:
+            evaluation.status = CandidateStatus::CorrectionLimit;
+            return evaluation;
+        case Reason::BlockedPath:
+            evaluation.status = CandidateStatus::BlockedPath;
+            return evaluation;
+        default:
+            throw std::invalid_argument(
+                "interaction candidate feasibility returned a non-hard reason");
+        }
+    }
+
+    evaluation.path_feasible = true;
+
+    try {
         const std::optional<std::array<float, 5>> costs =
             group_costs(input, entry_frame);
         if (!costs.has_value()) {
-            return {CandidateStatus::OutOfRange, {}};
+            evaluation.status = CandidateStatus::OutOfRange;
+            return evaluation;
         }
+        evaluation.candidate.group_costs = *costs;
         const std::optional<float> cost = total_cost(*costs, config);
+        if (cost.has_value()) {
+            evaluation.total_cost_available = true;
+            evaluation.candidate.total_cost = *cost;
+        }
         if (!cost.has_value() || !finite(config.maximum_cost) ||
             *cost > config.maximum_cost) {
-            return {CandidateStatus::PoorMatch, {}};
+            evaluation.status = CandidateStatus::PoorMatch;
+            return evaluation;
         }
 
-        MatchCandidate candidate{};
-        candidate.clip = frames.clip;
-        candidate.entry_frame = entry_frame;
-        candidate.contact_frame = frames.contact;
-        candidate.lift_frame = frames.lift;
-        candidate.hold_frame = frames.hold;
-        candidate.scene_from_source = scene_from_source;
-        candidate.entry_root_offset = root_offset;
-        candidate.entry_yaw_offset = yaw_offset;
-        candidate.total_cost = *cost;
-        candidate.group_costs = *costs;
-        return {CandidateStatus::Accepted, candidate};
+        evaluation.status = CandidateStatus::Accepted;
+        return evaluation;
     } catch (const std::out_of_range&) {
-        return {CandidateStatus::OutOfRange, {}};
+        evaluation.status = CandidateStatus::OutOfRange;
+        return evaluation;
     }
 }
 
 void remember_failure(FailureSet& failures, CandidateStatus status) {
     switch (status) {
     case CandidateStatus::Accepted:
+        return;
+    case CandidateStatus::NoCandidate:
         return;
     case CandidateStatus::OutOfRange:
         failures.out_of_range = true;
@@ -602,7 +666,19 @@ bool better_candidate(
 void consider(
     const CandidateEvaluation& evaluation,
     std::optional<MatchCandidate>& best,
-    FailureSet& failures) {
+    FailureSet& failures,
+    matcher_detail::PickEvaluation& result) {
+    if (evaluation.path_feasible && !result.path_feasible) {
+        result.path_feasible = true;
+        result.feasible_entry_frame = evaluation.candidate.entry_frame;
+        result.contact_frame = evaluation.candidate.contact_frame;
+    }
+    if (evaluation.total_cost_available &&
+        (!result.total_cost_available ||
+         evaluation.candidate.total_cost < result.total_cost)) {
+        result.total_cost_available = true;
+        result.total_cost = evaluation.candidate.total_cost;
+    }
     if (evaluation.status != CandidateStatus::Accepted) {
         remember_failure(failures, evaluation.status);
         return;
@@ -620,16 +696,45 @@ Reason aggregate_reason(const FailureSet& failures) {
     return Reason::NoCandidate;
 }
 
+Reason aggregate_hard_reason(const FailureSet& failures) {
+    if (failures.out_of_range) return Reason::OutOfRange;
+    if (failures.correction_limit) return Reason::CorrectionLimit;
+    if (failures.blocked_path) return Reason::BlockedPath;
+    return Reason::NoCandidate;
+}
+
+void finish_evaluation(
+    matcher_detail::PickEvaluation& result,
+    const std::optional<MatchCandidate>& best,
+    const FailureSet& failures) {
+    result.path_reason = result.path_feasible
+        ? Reason::None
+        : aggregate_hard_reason(failures);
+    if (best.has_value()) {
+        result.match_ready = true;
+        result.match_reason = Reason::None;
+        result.selection = {true, *best, Reason::None};
+        result.total_cost_available = true;
+        result.total_cost = best->total_cost;
+        return;
+    }
+    result.match_ready = false;
+    result.selection = reject(aggregate_reason(failures));
+    result.match_reason = result.selection.reason;
+}
+
 }  // namespace
 
-MatchResult select_whole_clip(
-    const MatchInput& input,
-    const MatchConfig& config) {
-    if (input.database == nullptr || input.features == nullptr) {
-        return reject(Reason::PackUnavailable);
-    }
-    if (const std::optional<Reason> invalid = validate_request(input)) {
-        return reject(*invalid);
+matcher_detail::PickEvaluation matcher_detail::evaluate_pick_entries(
+    const PickEvaluationInput& input,
+    const MatchConfig& config,
+    const CandidateFeasibility& candidate_feasibility) {
+    PickEvaluation result{};
+    if (const std::optional<Reason> invalid = validate_pick_context(input)) {
+        result.path_reason = *invalid;
+        result.match_reason = *invalid;
+        result.selection = reject(*invalid);
+        return result;
     }
 
     const WorldPose current_pose = world_pose(input.locomotion.pose);
@@ -639,7 +744,10 @@ MatchResult select_whole_clip(
         planar_distance(
             current_root.position,
             input.target.object_world.position) > config.maximum_approach_m) {
-        return reject(Reason::OutOfRange);
+        result.path_reason = Reason::OutOfRange;
+        result.match_reason = Reason::OutOfRange;
+        result.selection = reject(Reason::OutOfRange);
+        return result;
     }
 
     const Database& database = *input.database;
@@ -658,12 +766,19 @@ MatchResult select_whole_clip(
     for (const ClipFrames& frames : clips) {
         consider(
             evaluate_candidate(
-                input, config, frames, frames.reach, current_root),
+                input,
+                config,
+                frames,
+                frames.reach,
+                current_root,
+                candidate_feasibility),
             best,
-            failures);
+            failures,
+            result);
     }
     if (best.has_value()) {
-        return {true, *best, Reason::None};
+        finish_evaluation(result, best, failures);
+        return result;
     }
 
     for (const ClipFrames& frames : clips) {
@@ -676,15 +791,32 @@ MatchResult select_whole_clip(
             }
             consider(
                 evaluate_candidate(
-                    input, config, frames, frame, current_root),
+                    input,
+                    config,
+                    frames,
+                    frame,
+                    current_root,
+                    candidate_feasibility),
                 best,
-                failures);
+                failures,
+                result);
         }
     }
-    if (best.has_value()) {
-        return {true, *best, Reason::None};
+    finish_evaluation(result, best, failures);
+    return result;
+}
+
+MatchResult select_whole_clip(
+    const MatchInput& input,
+    const MatchConfig& config) {
+    if (input.database == nullptr || input.features == nullptr) {
+        return reject(Reason::PackUnavailable);
     }
-    return reject(aggregate_reason(failures));
+    if (const std::optional<Reason> invalid = validate_request(input)) {
+        return reject(*invalid);
+    }
+    return matcher_detail::evaluate_pick_entries(
+        pick_evaluation_input(input), config).selection;
 }
 
 }  // namespace interaction

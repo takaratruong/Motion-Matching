@@ -6,12 +6,59 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+namespace interaction {
+
+struct PickBuildObservation {
+    bool accepted = false;
+    Reason reason = Reason::None;
+};
+
+struct InteractionRuntimeTestAccess {
+    static PickBuildObservation build_pick_evaluation(
+        const InteractionRuntime& runtime,
+        const LocomotionSnapshot& locomotion,
+        TargetHandle target,
+        uint32_t affordance_id,
+        bool require_free) {
+        const InteractionRuntime::PickEvaluationBuild built =
+            runtime.build_pick_evaluation(
+                locomotion, target, affordance_id, require_free);
+        return {built.accepted, built.reason};
+    }
+
+    static const std::optional<MatchCandidate>& candidate(
+        const InteractionRuntime& runtime) {
+        return runtime.candidate_;
+    }
+
+    static float player_elapsed_seconds(
+        const InteractionRuntime& runtime) {
+        return runtime.player_.value().elapsed_seconds();
+    }
+
+    static int32_t player_frame(const InteractionRuntime& runtime) {
+        return runtime.player_.value().frame();
+    }
+
+    static float clearance_elapsed_seconds(
+        const InteractionRuntime& runtime) {
+        return runtime.clearance_player_.value().elapsed_seconds();
+    }
+
+    static int32_t clearance_frame(const InteractionRuntime& runtime) {
+        return runtime.clearance_player_.value().frame();
+    }
+};
+
+}  // namespace interaction
 
 namespace {
 
@@ -54,6 +101,226 @@ bool exact(
     return left.hand_dof == right.hand_dof &&
            left.hand_dof_velocities == right.hand_dof_velocities &&
            left.foot_contacts == right.foot_contacts;
+}
+
+bool exact(
+    const interaction::LocomotionSnapshot& left,
+    const interaction::LocomotionSnapshot& right) {
+    if (!exact(left.pose, right.pose)) return false;
+    for (size_t index = 0;
+         index < left.future_root_positions.size();
+         ++index) {
+        if (!exact(
+                left.future_root_positions[index],
+                right.future_root_positions[index]) ||
+            !exact(
+                left.future_root_rotations[index],
+                right.future_root_rotations[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool same_float_bits(float left, float right) {
+    uint32_t left_bits = 0U;
+    uint32_t right_bits = 0U;
+    static_assert(sizeof(left_bits) == sizeof(left));
+    std::memcpy(&left_bits, &left, sizeof(left_bits));
+    std::memcpy(&right_bits, &right, sizeof(right_bits));
+    return left_bits == right_bits;
+}
+
+bool same_bits(vec3 left, vec3 right) {
+    return same_float_bits(left.x, right.x) &&
+           same_float_bits(left.y, right.y) &&
+           same_float_bits(left.z, right.z);
+}
+
+bool same_bits(quat left, quat right) {
+    return same_float_bits(left.w, right.w) &&
+           same_float_bits(left.x, right.x) &&
+           same_float_bits(left.y, right.y) &&
+           same_float_bits(left.z, right.z);
+}
+
+bool same_bits(
+    const interaction::LocomotionSnapshot& left,
+    const interaction::LocomotionSnapshot& right) {
+    for (size_t bone = 0; bone < g1_skeleton::BoneCount; ++bone) {
+        if (!same_bits(
+                left.pose.positions[bone], right.pose.positions[bone]) ||
+            !same_bits(
+                left.pose.velocities[bone], right.pose.velocities[bone]) ||
+            !same_bits(
+                left.pose.rotations[bone], right.pose.rotations[bone]) ||
+            !same_bits(
+                left.pose.angular_velocities[bone],
+                right.pose.angular_velocities[bone])) {
+            return false;
+        }
+    }
+    for (size_t index = 0; index < left.pose.hand_dof.size(); ++index) {
+        if (!same_float_bits(
+                left.pose.hand_dof[index], right.pose.hand_dof[index]) ||
+            !same_float_bits(
+                left.pose.hand_dof_velocities[index],
+                right.pose.hand_dof_velocities[index])) {
+            return false;
+        }
+    }
+    if (left.pose.foot_contacts != right.pose.foot_contacts) return false;
+    for (size_t index = 0;
+         index < left.future_root_positions.size();
+         ++index) {
+        if (!same_bits(
+                left.future_root_positions[index],
+                right.future_root_positions[index]) ||
+            !same_bits(
+                left.future_root_rotations[index],
+                right.future_root_rotations[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool near(float left, float right, float tolerance = 2.0e-4F) {
+    return std::abs(left - right) <= tolerance;
+}
+
+bool near(vec3 left, vec3 right, float tolerance = 2.0e-4F) {
+    return near(left.x, right.x, tolerance) &&
+           near(left.y, right.y, tolerance) &&
+           near(left.z, right.z, tolerance);
+}
+
+bool near_rotation(quat left, quat right, float tolerance = 2.0e-4F) {
+    const auto same_sign = [&]() {
+        return near(left.w, right.w, tolerance) &&
+               near(left.x, right.x, tolerance) &&
+               near(left.y, right.y, tolerance) &&
+               near(left.z, right.z, tolerance);
+    };
+    if (same_sign()) return true;
+    right = -right;
+    return same_sign();
+}
+
+float orientation_yaw(quat value) {
+    value = value / quat_length(value);
+    const vec3 forward = quat_mul_vec3(
+        value, vec3(0.0F, 0.0F, 1.0F));
+    return std::atan2(forward.x, forward.z);
+}
+
+std::vector<float*> snapshot_float_fields(
+    interaction::LocomotionSnapshot& snapshot) {
+    std::vector<float*> fields;
+    const auto append_vec3 = [&](vec3& value) {
+        fields.push_back(&value.x);
+        fields.push_back(&value.y);
+        fields.push_back(&value.z);
+    };
+    const auto append_quat = [&](quat& value) {
+        fields.push_back(&value.w);
+        fields.push_back(&value.x);
+        fields.push_back(&value.y);
+        fields.push_back(&value.z);
+    };
+    for (vec3& value : snapshot.pose.positions) append_vec3(value);
+    for (vec3& value : snapshot.pose.velocities) append_vec3(value);
+    for (quat& value : snapshot.pose.rotations) append_quat(value);
+    for (vec3& value : snapshot.pose.angular_velocities) append_vec3(value);
+    for (float& value : snapshot.pose.hand_dof) fields.push_back(&value);
+    for (float& value : snapshot.pose.hand_dof_velocities) {
+        fields.push_back(&value);
+    }
+    for (vec3& value : snapshot.future_root_positions) append_vec3(value);
+    for (quat& value : snapshot.future_root_rotations) append_quat(value);
+    return fields;
+}
+
+uint32_t canonical_float_bits(float value) {
+    uint32_t bits = 0U;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    return (bits & 0x7fffffffU) == 0U ? 0U : bits;
+}
+
+float float_from_bits(uint32_t bits) {
+    float value = 0.0F;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+void reference_hash_byte(uint64_t& digest, uint8_t value) {
+    digest ^= value;
+    digest *= 1099511628211ULL;
+}
+
+void reference_hash_float(uint64_t& digest, float value) {
+    const uint32_t bits = canonical_float_bits(value);
+    for (unsigned shift = 0U; shift < 32U; shift += 8U) {
+        reference_hash_byte(
+            digest, static_cast<uint8_t>((bits >> shift) & 0xffU));
+    }
+}
+
+void reference_hash_vec3(uint64_t& digest, vec3 value) {
+    reference_hash_float(digest, value.x);
+    reference_hash_float(digest, value.y);
+    reference_hash_float(digest, value.z);
+}
+
+void reference_hash_quat(uint64_t& digest, quat value) {
+    const std::array<float, 4> components{
+        value.w, value.x, value.y, value.z};
+    bool negate = false;
+    for (float component : components) {
+        const uint32_t bits = canonical_float_bits(component);
+        if ((bits & 0x7fffffffU) != 0U) {
+            negate = (bits & 0x80000000U) != 0U;
+            break;
+        }
+    }
+    for (float component : components) {
+        reference_hash_float(digest, negate ? -component : component);
+    }
+}
+
+uint64_t reference_snapshot_fingerprint(
+    const interaction::LocomotionSnapshot& snapshot) {
+    uint64_t digest = 14695981039346656037ULL;
+    for (vec3 value : snapshot.pose.positions) {
+        reference_hash_vec3(digest, value);
+    }
+    for (vec3 value : snapshot.pose.velocities) {
+        reference_hash_vec3(digest, value);
+    }
+    for (quat value : snapshot.pose.rotations) {
+        reference_hash_quat(digest, value);
+    }
+    for (vec3 value : snapshot.pose.angular_velocities) {
+        reference_hash_vec3(digest, value);
+    }
+    for (float value : snapshot.pose.hand_dof) {
+        reference_hash_float(digest, value);
+    }
+    for (float value : snapshot.pose.hand_dof_velocities) {
+        reference_hash_float(digest, value);
+    }
+    for (uint8_t value : snapshot.pose.foot_contacts) {
+        reference_hash_byte(digest, value);
+    }
+    for (vec3 value : snapshot.future_root_positions) {
+        reference_hash_vec3(digest, value);
+    }
+    for (quat value : snapshot.future_root_rotations) {
+        reference_hash_quat(digest, value);
+    }
+    return digest == 0U ? 14695981039346656037ULL : digest;
 }
 
 bool exact(
@@ -298,6 +565,131 @@ bool exact(
            exact(left.diagnostics, right.diagnostics);
 }
 
+bool exact(
+    const interaction::MatchCandidate& left,
+    const interaction::MatchCandidate& right) {
+    return left.clip == right.clip &&
+           left.entry_frame == right.entry_frame &&
+           left.contact_frame == right.contact_frame &&
+           left.lift_frame == right.lift_frame &&
+           left.hold_frame == right.hold_frame &&
+           exact(left.scene_from_source, right.scene_from_source) &&
+           exact(left.entry_root_offset, right.entry_root_offset) &&
+           left.entry_yaw_offset == right.entry_yaw_offset &&
+           left.total_cost == right.total_cost &&
+           left.group_costs == right.group_costs;
+}
+
+bool exact(
+    const interaction::PickEntryRoot& left,
+    const interaction::PickEntryRoot& right) {
+    return left.world_x == right.world_x &&
+           left.world_z == right.world_z &&
+           left.world_yaw_radians == right.world_yaw_radians;
+}
+
+bool same_bits(
+    const interaction::PickEntryRoot& left,
+    const interaction::PickEntryRoot& right) {
+    return same_float_bits(left.world_x, right.world_x) &&
+           same_float_bits(left.world_z, right.world_z) &&
+           same_float_bits(
+               left.world_yaw_radians, right.world_yaw_radians);
+}
+
+bool exact(
+    const interaction::PickEntryPreview& left,
+    const interaction::PickEntryPreview& right) {
+    return left.path_feasible == right.path_feasible &&
+           left.match_ready == right.match_ready &&
+           left.path_reason == right.path_reason &&
+           left.match_reason == right.match_reason &&
+           exact(left.prospective_root, right.prospective_root) &&
+           left.feasible_entry_frame == right.feasible_entry_frame &&
+           left.contact_frame == right.contact_frame &&
+           left.total_cost == right.total_cost &&
+           exact(left.match_candidate, right.match_candidate);
+}
+
+void assert_exact(
+    const interaction::RuntimeObservation& left,
+    const interaction::RuntimeObservation& right) {
+    assert(left.state == right.state);
+    assert(exact(left.diagnostics, right.diagnostics));
+    assert(left.targets.size() == right.targets.size());
+    for (size_t index = 0; index < left.targets.size(); ++index) {
+        assert(exact(left.targets[index], right.targets[index]));
+    }
+    assert(left.surfaces.size() == right.surfaces.size());
+    for (size_t index = 0; index < left.surfaces.size(); ++index) {
+        assert(exact(left.surfaces[index], right.surfaces[index]));
+    }
+    assert(same_bits(left.caller_snapshot, right.caller_snapshot));
+}
+
+interaction::PickEntryRoot live_pick_entry_root(
+    const interaction::LocomotionSnapshot& snapshot) {
+    constexpr size_t root = static_cast<size_t>(g1_skeleton::Simulation);
+    const vec3 forward = quat_mul_vec3(
+        snapshot.pose.rotations[root], vec3(0.0F, 0.0F, 1.0F));
+    return {
+        snapshot.pose.positions[root].x,
+        snapshot.pose.positions[root].z,
+        std::atan2(forward.x, forward.z),
+    };
+}
+
+void assert_preview_rejected(
+    const interaction::PickEntryPreview& preview,
+    interaction::Reason reason) {
+    assert(!preview.path_feasible);
+    assert(!preview.match_ready);
+    assert(preview.path_reason == reason);
+    assert(preview.match_reason == reason);
+    assert(preview.feasible_entry_frame == -1);
+    assert(preview.contact_frame == -1);
+    assert(preview.total_cost == 0.0F);
+    assert(exact(preview.match_candidate, interaction::MatchCandidate{}));
+}
+
+void assert_preview_root(
+    const interaction::PickEntryPreview& preview,
+    const interaction::PickEntryRoot& root) {
+    assert(same_bits(preview.prospective_root, root));
+}
+
+void assert_same_next_update_after_preview(
+    interaction::InteractionRuntime& previewed_runtime,
+    interaction::RuntimeFixture& previewed,
+    interaction::InteractionRuntime& untouched_runtime,
+    interaction::RuntimeFixture& untouched,
+    const interaction::RuntimeInput& input) {
+    std::optional<interaction::RuntimeOutput> previewed_output;
+    std::optional<interaction::RuntimeOutput> untouched_output;
+    bool previewed_threw = false;
+    bool untouched_threw = false;
+    try {
+        previewed_output = previewed_runtime.update(input);
+    } catch (const std::out_of_range&) {
+        previewed_threw = true;
+    }
+    try {
+        untouched_output = untouched_runtime.update(input);
+    } catch (const std::out_of_range&) {
+        untouched_threw = true;
+    }
+    assert(previewed_threw == untouched_threw);
+    assert(previewed_output.has_value() == untouched_output.has_value());
+    if (previewed_output.has_value()) {
+        assert(exact(*previewed_output, *untouched_output));
+    }
+    assert_exact(
+        interaction::observe(
+            previewed_runtime, previewed, input.locomotion),
+        interaction::observe(
+            untouched_runtime, untouched, input.locomotion));
+}
+
 interaction::RuntimeInput idle_input(
     const interaction::LocomotionSnapshot& locomotion) {
     interaction::RuntimeInput input{};
@@ -393,6 +785,16 @@ interaction::RuntimeOutput enter_carry_before_first_update(
     assert(output.diagnostics.state == RuntimeState::Carry);
     assert(!output.diagnostics.inactive_arm_tracks_locomotion);
     return output;
+}
+
+void seed_authored_interaction_slots(interaction::RuntimeFixture& fixture) {
+    interaction::InteractionTarget* target = fixture.registry.find(
+        fixture.request.target);
+    assert(target != nullptr);
+    target->affordances.front().interaction_slots = {
+        {3U, -0.41F, -0.22F, 1.10F},
+        {9U, 0.18F, -0.39F, 0.20F},
+    };
 }
 
 interaction::PlaceRequest place_request_for(
@@ -625,6 +1027,26 @@ interaction::RuntimeFixture post_ik_table_crossing_fixture() {
     affordance.clearance_radius = 0.005F;
     affordance.hand_in_object.position.y -= 0.06F;
     affordance.hand_in_object.position.z += 0.04F;
+
+    const RawQuery raw = build_raw_query(query_input_for(
+        fixture, *target, affordance));
+    fixture.features.offsets.assign(raw.begin(), raw.end());
+    return fixture;
+}
+
+interaction::RuntimeFixture entry_blend_table_crossing_fixture() {
+    using namespace interaction;
+    RuntimeFixture fixture = make_runtime_fixture();
+    fixture.locomotion.pose.positions[kRightHandBone] =
+        vec3(0.0F, 0.55F, 0.20F);
+    const InteractionTarget* target = fixture.registry.find(
+        fixture.request.target);
+    const GraspAffordance* affordance = fixture.registry.find_affordance(
+        fixture.request.target, fixture.request.affordance_id);
+    assert(target != nullptr && affordance != nullptr);
+    const RawQuery raw = build_raw_query(query_input_for(
+        fixture, *target, *affordance));
+    fixture.features.offsets.assign(raw.begin(), raw.end());
     return fixture;
 }
 
@@ -813,6 +1235,1012 @@ void assert_both_runtime_constructors_accept(
         }
         assert_free(fixture.registry, fixture.request.target);
     }
+}
+
+void test_pick_snapshot_map_is_a_rigid_planar_world_map() {
+    using namespace interaction;
+    constexpr size_t root = static_cast<size_t>(g1_skeleton::Simulation);
+    const LocomotionSnapshot input = make_pick_snapshot_fixture();
+    const PickEntryRoot slot{2.25F, -1.75F, 0.70F};
+
+    const runtime_detail::PickSnapshotMap mapped =
+        runtime_detail::map_pick_entry_snapshot(input, slot);
+    assert(mapped.accepted);
+    assert(mapped.reason == Reason::None);
+
+    const vec3 live_forward = quat_mul_vec3(
+        input.pose.rotations[root], vec3(0.0F, 0.0F, 1.0F));
+    const float live_yaw = std::atan2(live_forward.x, live_forward.z);
+    const float yaw_delta = std::atan2(
+        std::sin(slot.world_yaw_radians - live_yaw),
+        std::cos(slot.world_yaw_radians - live_yaw));
+    const quat rotation_delta = quat_from_angle_axis(
+        yaw_delta, vec3(0.0F, 1.0F, 0.0F));
+    const vec3 slot_position(
+        slot.world_x, input.pose.positions[root].y, slot.world_z);
+    const vec3 translation_delta =
+        slot_position -
+        quat_mul_vec3(rotation_delta, input.pose.positions[root]);
+
+    assert(mapped.snapshot.pose.positions[root].x == slot.world_x);
+    assert(mapped.snapshot.pose.positions[root].y ==
+           input.pose.positions[root].y);
+    assert(mapped.snapshot.pose.positions[root].z == slot.world_z);
+    assert(near_rotation(
+        mapped.snapshot.pose.rotations[root],
+        quat_mul(rotation_delta, input.pose.rotations[root])));
+    const vec3 mapped_forward = quat_mul_vec3(
+        mapped.snapshot.pose.rotations[root],
+        vec3(0.0F, 0.0F, 1.0F));
+    const float mapped_yaw = std::atan2(
+        mapped_forward.x, mapped_forward.z);
+    assert(near(
+        std::atan2(
+            std::sin(mapped_yaw - slot.world_yaw_radians),
+            std::cos(mapped_yaw - slot.world_yaw_radians)),
+        0.0F));
+    assert(near(
+        mapped.snapshot.pose.velocities[root],
+        quat_mul_vec3(rotation_delta, input.pose.velocities[root])));
+    assert(near(
+        mapped.snapshot.pose.angular_velocities[root],
+        quat_mul_vec3(
+            rotation_delta, input.pose.angular_velocities[root])));
+
+    for (size_t index = 0;
+         index < input.future_root_positions.size();
+         ++index) {
+        assert(near(
+            mapped.snapshot.future_root_positions[index],
+            quat_mul_vec3(
+                rotation_delta, input.future_root_positions[index]) +
+                translation_delta));
+        assert(near_rotation(
+            mapped.snapshot.future_root_rotations[index],
+            quat_mul(
+                rotation_delta, input.future_root_rotations[index])));
+    }
+
+    const WorldPose live_world = world_pose(input.pose);
+    const WorldPose mapped_world = world_pose(mapped.snapshot.pose);
+    for (size_t bone = 0; bone < g1_skeleton::BoneCount; ++bone) {
+        assert(near(
+            mapped_world.positions[bone],
+            quat_mul_vec3(rotation_delta, live_world.positions[bone]) +
+                translation_delta,
+            5.0e-4F));
+        assert(near_rotation(
+            mapped_world.rotations[bone],
+            quat_mul(rotation_delta, live_world.rotations[bone]),
+            5.0e-4F));
+        assert(near(
+            mapped_world.velocities[bone],
+            quat_mul_vec3(rotation_delta, live_world.velocities[bone]),
+            8.0e-4F));
+        assert(near(
+            mapped_world.angular_velocities[bone],
+            quat_mul_vec3(
+                rotation_delta, live_world.angular_velocities[bone]),
+            8.0e-4F));
+    }
+
+
+    for (float scale : {0.9991F, 1.0009F}) {
+        LocomotionSnapshot scaled = input;
+        scaled.pose.rotations[root] =
+            scale * scaled.pose.rotations[root];
+        const runtime_detail::PickSnapshotMap scaled_map =
+            runtime_detail::map_pick_entry_snapshot(scaled, slot);
+        assert(scaled_map.accepted);
+        assert(near_rotation(
+            scaled_map.snapshot.pose.rotations[root],
+            quat_mul(rotation_delta, scaled.pose.rotations[root])));
+        assert(near(
+            quat_length(scaled_map.snapshot.pose.rotations[root]),
+            quat_length(scaled.pose.rotations[root])));
+        const float yaw_error = std::atan2(
+            std::sin(
+                orientation_yaw(
+                    scaled_map.snapshot.pose.rotations[root]) -
+                slot.world_yaw_radians),
+            std::cos(
+                orientation_yaw(
+                    scaled_map.snapshot.pose.rotations[root]) -
+                slot.world_yaw_radians));
+        assert(near(yaw_error, 0.0F));
+    }
+}
+
+void test_pick_snapshot_map_preserves_local_channels_and_input() {
+    using namespace interaction;
+    constexpr size_t root = static_cast<size_t>(g1_skeleton::Simulation);
+    const LocomotionSnapshot input = make_pick_snapshot_fixture();
+    const LocomotionSnapshot before = input;
+    const runtime_detail::PickSnapshotMap mapped =
+        runtime_detail::map_pick_entry_snapshot(
+            input, PickEntryRoot{2.25F, -1.75F, 0.70F});
+    assert(mapped.accepted);
+    assert(exact(input, before));
+
+    for (size_t bone = 0; bone < g1_skeleton::BoneCount; ++bone) {
+        if (bone == root) continue;
+        assert(exact(
+            mapped.snapshot.pose.positions[bone],
+            input.pose.positions[bone]));
+        assert(exact(
+            mapped.snapshot.pose.velocities[bone],
+            input.pose.velocities[bone]));
+        assert(exact(
+            mapped.snapshot.pose.rotations[bone],
+            input.pose.rotations[bone]));
+        assert(exact(
+            mapped.snapshot.pose.angular_velocities[bone],
+            input.pose.angular_velocities[bone]));
+    }
+    assert(mapped.snapshot.pose.hand_dof == input.pose.hand_dof);
+    assert(
+        mapped.snapshot.pose.hand_dof_velocities ==
+        input.pose.hand_dof_velocities);
+    assert(mapped.snapshot.pose.foot_contacts == input.pose.foot_contacts);
+}
+
+void test_pick_snapshot_map_rejects_every_nonfinite_or_nonunit_input() {
+    using namespace interaction;
+    constexpr size_t root = static_cast<size_t>(g1_skeleton::Simulation);
+    const LocomotionSnapshot baseline = make_pick_snapshot_fixture();
+    const PickEntryRoot valid_slot{2.25F, -1.75F, 0.70F};
+    const auto require = [](bool condition) {
+        if (!condition) {
+            throw std::runtime_error("pick snapshot fast-math canary failed");
+        }
+    };
+    const auto assert_rejected = [](
+        const LocomotionSnapshot& snapshot, PickEntryRoot slot) {
+        const LocomotionSnapshot before = snapshot;
+        const runtime_detail::PickSnapshotMap mapped =
+            runtime_detail::map_pick_entry_snapshot(snapshot, slot);
+        if (mapped.accepted || mapped.reason != Reason::OutOfRange ||
+            !exact(mapped.snapshot, LocomotionSnapshot{}) ||
+            !same_bits(snapshot, before)) {
+            throw std::runtime_error("pick snapshot rejection contract failed");
+        }
+    };
+
+    const std::array<float, 4> nonfinite{
+        float_from_bits(0x7f800000U),
+        float_from_bits(0xff800000U),
+        float_from_bits(0x7fc00001U),
+        float_from_bits(0x7f800001U),
+    };
+    LocomotionSnapshot field_source = baseline;
+    const size_t field_count = snapshot_float_fields(field_source).size();
+    for (size_t field = 0; field < field_count; ++field) {
+        for (float invalid : nonfinite) {
+            LocomotionSnapshot mutated = baseline;
+            *snapshot_float_fields(mutated).at(field) = invalid;
+            assert_rejected(mutated, valid_slot);
+        }
+    }
+
+    for (size_t contact = 0; contact < baseline.pose.foot_contacts.size();
+         ++contact) {
+        LocomotionSnapshot mutated = baseline;
+        mutated.pose.foot_contacts[contact] = 2U;
+        assert_rejected(mutated, valid_slot);
+    }
+
+    for (size_t field = 0; field < 3U; ++field) {
+        for (float invalid : nonfinite) {
+            PickEntryRoot slot = valid_slot;
+            std::array<float*, 3> slot_fields{
+                &slot.world_x, &slot.world_z, &slot.world_yaw_radians};
+            *slot_fields[field] = invalid;
+            assert_rejected(baseline, slot);
+        }
+    }
+
+    LocomotionSnapshot nonunit = baseline;
+    nonunit.pose.rotations[root] = quat(1.01F, 0.0F, 0.0F, 0.0F);
+    assert_rejected(nonunit, valid_slot);
+    nonunit.pose.rotations[root] = quat(0.0F, 0.0F, 0.0F, 0.0F);
+    assert_rejected(nonunit, valid_slot);
+    nonunit.pose.rotations[root] = quat(
+        std::numeric_limits<float>::max(),
+        std::numeric_limits<float>::max(),
+        std::numeric_limits<float>::max(),
+        std::numeric_limits<float>::max());
+    assert_rejected(nonunit, valid_slot);
+
+    LocomotionSnapshot undefined_yaw = baseline;
+    constexpr float half_sqrt_two = 0.7071067811865475244F;
+    undefined_yaw.pose.rotations[root] =
+        quat(half_sqrt_two, half_sqrt_two, 0.0F, 0.0F);
+    assert_rejected(undefined_yaw, valid_slot);
+
+    LocomotionSnapshot overflow = baseline;
+    overflow.pose.positions[root].x = std::numeric_limits<float>::max();
+    assert_rejected(
+        overflow,
+        PickEntryRoot{
+            -std::numeric_limits<float>::max(),
+            valid_slot.world_z,
+            valid_slot.world_yaw_radians});
+
+    LocomotionSnapshot large_finite_geometry = baseline;
+    large_finite_geometry.pose.positions[root + 1U] =
+        vec3(1.0e20F, -2.0e20F, 3.0e20F);
+    assert_rejected(large_finite_geometry, valid_slot);
+
+    LocomotionSnapshot finite_nonunit_locals = baseline;
+    finite_nonunit_locals.pose.rotations[root + 1U] =
+        quat(2.0F, 0.0F, 0.0F, 0.0F);
+    finite_nonunit_locals.future_root_rotations[0] =
+        quat(0.25F, 0.0F, 0.0F, 0.0F);
+    require(runtime_detail::map_pick_entry_snapshot(
+                finite_nonunit_locals, valid_slot)
+                .accepted);
+}
+
+void test_pick_snapshot_fingerprint_is_fieldwise_and_canonical() {
+    using namespace interaction;
+    LocomotionSnapshot input = make_pick_snapshot_fixture();
+    const LocomotionSnapshot before = input;
+    const uint64_t expected = reference_snapshot_fingerprint(input);
+    const uint64_t digest =
+        runtime_detail::locomotion_snapshot_fingerprint(input);
+    assert(digest == expected);
+    assert(digest != 0U);
+    assert(exact(input, before));
+
+    const size_t field_count = snapshot_float_fields(input).size();
+    for (size_t field = 0; field < field_count; ++field) {
+        LocomotionSnapshot mutated = input;
+        float& value = *snapshot_float_fields(mutated).at(field);
+        value = std::nextafter(
+            value, std::numeric_limits<float>::infinity());
+        assert(
+            runtime_detail::locomotion_snapshot_fingerprint(mutated) !=
+            digest);
+    }
+    for (size_t contact = 0; contact < input.pose.foot_contacts.size();
+         ++contact) {
+        LocomotionSnapshot mutated = input;
+        mutated.pose.foot_contacts[contact] ^= 1U;
+        assert(
+            runtime_detail::locomotion_snapshot_fingerprint(mutated) !=
+            digest);
+    }
+
+    LocomotionSnapshot negative_zero = input;
+    negative_zero.pose.positions[1].x = -0.0F;
+    LocomotionSnapshot positive_zero = negative_zero;
+    positive_zero.pose.positions[1].x = 0.0F;
+    assert(
+        runtime_detail::locomotion_snapshot_fingerprint(negative_zero) ==
+        runtime_detail::locomotion_snapshot_fingerprint(positive_zero));
+
+    LocomotionSnapshot opposite_quaternions = input;
+    for (quat& rotation : opposite_quaternions.pose.rotations) {
+        rotation = -rotation;
+    }
+    for (quat& rotation : opposite_quaternions.future_root_rotations) {
+        rotation = -rotation;
+    }
+    assert(
+        runtime_detail::locomotion_snapshot_fingerprint(
+            opposite_quaternions) == digest);
+
+    LocomotionSnapshot reordered = input;
+    std::swap(
+        reordered.pose.positions[0].x,
+        reordered.pose.positions[0].y);
+    assert(
+        runtime_detail::locomotion_snapshot_fingerprint(reordered) !=
+        digest);
+}
+
+void test_pick_preview_public_api_reports_path_and_match_separately() {
+    using namespace interaction;
+    static_assert(std::is_same_v<
+        decltype(std::declval<const InteractionRuntime&>().preview_pick(
+            std::declval<const LocomotionSnapshot&>(),
+            PickEntryRoot{},
+            TargetHandle{},
+            uint32_t{})),
+        PickEntryPreview>);
+
+    RuntimeFixture accepted_fixture = make_runtime_fixture();
+    InteractionRuntime accepted_runtime(
+        accepted_fixture.database,
+        accepted_fixture.features,
+        accepted_fixture.registry,
+        RuntimeConfig{});
+    const PickEntryRoot accepted_root = live_pick_entry_root(
+        accepted_fixture.locomotion);
+    const PickEntryPreview accepted = accepted_runtime.preview_pick(
+        accepted_fixture.locomotion,
+        accepted_root,
+        accepted_fixture.request.target,
+        accepted_fixture.request.affordance_id);
+    assert(accepted.path_feasible);
+    assert(accepted.match_ready);
+    assert(accepted.path_reason == Reason::None);
+    assert(accepted.match_reason == Reason::None);
+    assert_preview_root(accepted, accepted_root);
+    assert(accepted.feasible_entry_frame == 85);
+    assert(accepted.contact_frame == 100);
+    assert(accepted.match_candidate.entry_frame == 85);
+    assert(accepted.match_candidate.contact_frame == 100);
+    assert(near(accepted.total_cost, 0.80F / 7.0F));
+    assert(accepted.total_cost == accepted.match_candidate.total_cost);
+
+    RuntimeFixture blocked_fixture = make_runtime_fixture();
+    blocked_fixture.registry.find(blocked_fixture.request.target)
+        ->table_size.z = 1.60F;
+    InteractionRuntime blocked_runtime(
+        blocked_fixture.database,
+        blocked_fixture.features,
+        blocked_fixture.registry,
+        RuntimeConfig{});
+    const PickEntryPreview blocked = blocked_runtime.preview_pick(
+        blocked_fixture.locomotion,
+        live_pick_entry_root(blocked_fixture.locomotion),
+        blocked_fixture.request.target,
+        blocked_fixture.request.affordance_id);
+    assert_preview_rejected(blocked, Reason::BlockedPath);
+
+    RuntimeFixture costly_fixture = high_cost_fixture();
+    InteractionRuntime costly_runtime(
+        costly_fixture.database,
+        costly_fixture.features,
+        costly_fixture.registry,
+        RuntimeConfig{});
+    const PickEntryPreview costly = costly_runtime.preview_pick(
+        costly_fixture.locomotion,
+        live_pick_entry_root(costly_fixture.locomotion),
+        costly_fixture.request.target,
+        costly_fixture.request.affordance_id);
+    assert(costly.path_feasible);
+    assert(!costly.match_ready);
+    assert(costly.path_reason == Reason::None);
+    assert(costly.match_reason == Reason::PoorMatch);
+    assert(costly.feasible_entry_frame == 85);
+    assert(costly.contact_frame == 100);
+    assert(near(costly.total_cost, 106.40F, 1.0e-4F));
+    assert(exact(costly.match_candidate, MatchCandidate{}));
+
+    RuntimeFixture malformed_fixture = make_runtime_fixture();
+    malformed_fixture.features.values.clear();
+    InteractionRuntime malformed_runtime(
+        malformed_fixture.database,
+        malformed_fixture.features,
+        malformed_fixture.registry,
+        RuntimeConfig{});
+    const PickEntryPreview malformed = malformed_runtime.preview_pick(
+        malformed_fixture.locomotion,
+        live_pick_entry_root(malformed_fixture.locomotion),
+        malformed_fixture.request.target,
+        malformed_fixture.request.affordance_id);
+    assert(malformed.path_feasible);
+    assert(!malformed.match_ready);
+    assert(malformed.path_reason == Reason::None);
+    assert(malformed.match_reason == Reason::OutOfRange);
+    assert(malformed.feasible_entry_frame == 85);
+    assert(malformed.contact_frame == 100);
+    assert(malformed.total_cost == 0.0F);
+    assert(exact(malformed.match_candidate, MatchCandidate{}));
+
+    RuntimeFixture fallback_fixture = make_runtime_fixture();
+    for (size_t dimension = 0; dimension < kFeatureDimension; ++dimension) {
+        fallback_fixture.features.values.at(
+            85U * kFeatureDimension + dimension) = 20.0F;
+    }
+    InteractionRuntime fallback_runtime(
+        fallback_fixture.database,
+        fallback_fixture.features,
+        fallback_fixture.registry,
+        RuntimeConfig{});
+    const PickEntryPreview fallback = fallback_runtime.preview_pick(
+        fallback_fixture.locomotion,
+        live_pick_entry_root(fallback_fixture.locomotion),
+        fallback_fixture.request.target,
+        fallback_fixture.request.affordance_id);
+    assert(fallback.path_feasible && fallback.match_ready);
+    assert(fallback.feasible_entry_frame == 85);
+    assert(fallback.contact_frame == 100);
+    assert(fallback.match_candidate.entry_frame == 75);
+    assert(fallback.total_cost == fallback.match_candidate.total_cost);
+    assert(fallback.total_cost < 9.0F);
+
+    RuntimeFixture mixed_fixture = high_cost_fixture();
+    mixed_fixture.database.active_hands.at(0) = 1U;
+    mixed_fixture.features.values.resize(
+        75U * static_cast<size_t>(kFeatureDimension));
+    InteractionRuntime mixed_runtime(
+        mixed_fixture.database,
+        mixed_fixture.features,
+        mixed_fixture.registry,
+        RuntimeConfig{});
+    const PickEntryPreview mixed = mixed_runtime.preview_pick(
+        mixed_fixture.locomotion,
+        live_pick_entry_root(mixed_fixture.locomotion),
+        mixed_fixture.request.target,
+        mixed_fixture.request.affordance_id);
+    assert(mixed.path_feasible);
+    assert(!mixed.match_ready);
+    assert(mixed.path_reason == Reason::None);
+    assert(mixed.match_reason == Reason::OutOfRange);
+    assert(mixed.feasible_entry_frame == 10);
+    assert(mixed.contact_frame == 25);
+    assert(near(mixed.total_cost, 106.40F, 1.0e-4F));
+    assert(exact(mixed.match_candidate, MatchCandidate{}));
+}
+
+void test_pick_preview_rejects_invalid_runtime_target_and_root_inputs() {
+    using namespace interaction;
+    RuntimeFixture fixture = make_runtime_fixture();
+    const PickEntryRoot root = live_pick_entry_root(fixture.locomotion);
+
+    const InteractionRuntime disabled = InteractionRuntime::disabled(
+        Reason::PackUnavailable);
+    assert_preview_rejected(
+        disabled.preview_pick(
+            fixture.locomotion,
+            root,
+            fixture.request.target,
+            fixture.request.affordance_id),
+        Reason::PackUnavailable);
+
+    InteractionRuntime non_locomotion(
+        fixture.database, fixture.features, fixture.registry, RuntimeConfig{});
+    const RuntimeOutput edge = non_locomotion.update(interact_input(
+        fixture.locomotion, fixture.request));
+    assert(edge.diagnostics.state == RuntimeState::Preflight);
+    assert_preview_rejected(
+        non_locomotion.preview_pick(
+            fixture.locomotion,
+            root,
+            fixture.request.target,
+            fixture.request.affordance_id),
+        Reason::TargetUnavailable);
+
+    RuntimeFixture target_fixture = make_runtime_fixture();
+    InteractionRuntime target_runtime(
+        target_fixture.database,
+        target_fixture.features,
+        target_fixture.registry,
+        RuntimeConfig{});
+    assert_preview_rejected(
+        target_runtime.preview_pick(
+            target_fixture.locomotion,
+            live_pick_entry_root(target_fixture.locomotion),
+            TargetHandle{},
+            target_fixture.request.affordance_id),
+        Reason::TargetUnavailable);
+    TargetHandle stale = target_fixture.request.target;
+    ++stale.generation;
+    assert_preview_rejected(
+        target_runtime.preview_pick(
+            target_fixture.locomotion,
+            live_pick_entry_root(target_fixture.locomotion),
+            stale,
+            target_fixture.request.affordance_id),
+        Reason::TargetChanged);
+    TargetHandle zero_generation = target_fixture.request.target;
+    zero_generation.generation = 0U;
+    assert_preview_rejected(
+        target_runtime.preview_pick(
+            target_fixture.locomotion,
+            live_pick_entry_root(target_fixture.locomotion),
+            zero_generation,
+            target_fixture.request.affordance_id),
+        Reason::TargetChanged);
+    assert_preview_rejected(
+        target_runtime.preview_pick(
+            target_fixture.locomotion,
+            live_pick_entry_root(target_fixture.locomotion),
+            target_fixture.request.target,
+            0U),
+        Reason::TargetUnavailable);
+
+    const std::array<float, 4> nonfinite{
+        float_from_bits(0x7f800000U),
+        float_from_bits(0xff800000U),
+        float_from_bits(0x7fc00001U),
+        float_from_bits(0x7f800001U),
+    };
+    for (size_t field = 0; field < 3U; ++field) {
+        for (float value : nonfinite) {
+            PickEntryRoot invalid = live_pick_entry_root(
+                target_fixture.locomotion);
+            std::array<float*, 3> fields{
+                &invalid.world_x,
+                &invalid.world_z,
+                &invalid.world_yaw_radians,
+            };
+            *fields[field] = value;
+            const PickEntryPreview preview = target_runtime.preview_pick(
+                target_fixture.locomotion,
+                invalid,
+                target_fixture.request.target,
+                target_fixture.request.affordance_id);
+            assert_preview_rejected(preview, Reason::OutOfRange);
+            assert_preview_root(preview, invalid);
+        }
+    }
+
+    LocomotionSnapshot invalid_snapshot = target_fixture.locomotion;
+    invalid_snapshot.pose.rotations[g1_skeleton::Simulation] =
+        quat(1.01F, 0.0F, 0.0F, 0.0F);
+    assert_preview_rejected(
+        target_runtime.preview_pick(
+            invalid_snapshot,
+            live_pick_entry_root(target_fixture.locomotion),
+            target_fixture.request.target,
+            target_fixture.request.affordance_id),
+        Reason::OutOfRange);
+}
+
+void test_pick_preview_is_deterministic_and_const_on_every_outcome() {
+    using namespace interaction;
+    const auto prove_no_mutation = [](
+        RuntimeFixture& previewed_fixture,
+        RuntimeFixture& control_fixture,
+        bool expect_exception) {
+        InteractionRuntime previewed(
+            previewed_fixture.database,
+            previewed_fixture.features,
+            previewed_fixture.registry,
+            RuntimeConfig{});
+        InteractionRuntime control(
+            control_fixture.database,
+            control_fixture.features,
+            control_fixture.registry,
+            RuntimeConfig{});
+        const PickEntryRoot root = live_pick_entry_root(
+            previewed_fixture.locomotion);
+        const RuntimeObservation before = observe(
+            previewed, previewed_fixture, previewed_fixture.locomotion);
+        std::optional<PickEntryPreview> first;
+        std::optional<PickEntryPreview> second;
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            bool threw = false;
+            try {
+                const PickEntryPreview preview = previewed.preview_pick(
+                    previewed_fixture.locomotion,
+                    root,
+                    previewed_fixture.request.target,
+                    previewed_fixture.request.affordance_id);
+                if (attempt == 0) first = preview;
+                else second = preview;
+            } catch (const std::out_of_range&) {
+                threw = true;
+            }
+            assert(threw == expect_exception);
+            assert_exact(
+                before,
+                observe(
+                    previewed,
+                    previewed_fixture,
+                    previewed_fixture.locomotion));
+        }
+        if (!expect_exception) {
+            assert(first.has_value() && second.has_value());
+            assert(exact(*first, *second));
+        }
+        assert_same_next_update_after_preview(
+            previewed,
+            previewed_fixture,
+            control,
+            control_fixture,
+            interact_input(
+                previewed_fixture.locomotion,
+                previewed_fixture.request));
+        assert_same_next_update_after_preview(
+            previewed,
+            previewed_fixture,
+            control,
+            control_fixture,
+            idle_input(previewed_fixture.locomotion));
+    };
+
+    RuntimeFixture accepted = make_runtime_fixture();
+    RuntimeFixture accepted_control = make_runtime_fixture();
+    prove_no_mutation(accepted, accepted_control, false);
+
+    RuntimeFixture rejected = make_runtime_fixture();
+    RuntimeFixture rejected_control = make_runtime_fixture();
+    rejected.registry.find(rejected.request.target)->table_size.z = 1.60F;
+    rejected_control.registry.find(rejected_control.request.target)
+        ->table_size.z = 1.60F;
+    prove_no_mutation(rejected, rejected_control, false);
+
+    RuntimeFixture exceptional = make_runtime_fixture();
+    RuntimeFixture exceptional_control = make_runtime_fixture();
+    exceptional.features.offsets.clear();
+    exceptional_control.features.offsets.clear();
+    prove_no_mutation(exceptional, exceptional_control, true);
+}
+
+void test_pick_preview_matches_normal_preflight_for_same_realized_snapshot() {
+    using namespace interaction;
+    RuntimeFixture fixture = make_runtime_fixture();
+    InteractionRuntime runtime(
+        fixture.database, fixture.features, fixture.registry, RuntimeConfig{});
+    PickEntryRoot root = live_pick_entry_root(fixture.locomotion);
+    root.world_x += 0.17F;
+    root.world_z += 0.11F;
+    root.world_yaw_radians += 0.19F;
+    const runtime_detail::PickSnapshotMap realized =
+        runtime_detail::map_pick_entry_snapshot(fixture.locomotion, root);
+    assert(realized.accepted);
+    assert(!exact(realized.snapshot, fixture.locomotion));
+
+    const PickEntryPreview preview = runtime.preview_pick(
+        fixture.locomotion,
+        root,
+        fixture.request.target,
+        fixture.request.affordance_id);
+    assert(preview.path_feasible && preview.match_ready);
+    const PickBuildObservation free_build =
+        InteractionRuntimeTestAccess::build_pick_evaluation(
+            runtime,
+            realized.snapshot,
+            fixture.request.target,
+            fixture.request.affordance_id,
+            true);
+    assert(free_build.accepted);
+    assert(free_build.reason == Reason::None);
+
+    const InteractionTarget* free_target = fixture.registry.find(
+        fixture.request.target);
+    assert(free_target != nullptr);
+    assert(free_target->state == ObjectState::Free);
+    assert(free_target->owner_request == 0U);
+
+    RuntimeOutput output = runtime.update(interact_input(
+        realized.snapshot, fixture.request));
+    assert(output.diagnostics.state == RuntimeState::Preflight);
+    output = runtime.update(idle_input(realized.snapshot));
+    assert(output.diagnostics.state == RuntimeState::Align);
+    assert(output.diagnostics.result == ResultCode::Accepted);
+    assert(output.diagnostics.reason == Reason::None);
+    assert(output.diagnostics.clip == preview.match_candidate.clip);
+    assert(output.diagnostics.frame == preview.match_candidate.entry_frame);
+    assert(output.diagnostics.total_cost == preview.match_candidate.total_cost);
+    assert(output.diagnostics.group_costs ==
+           preview.match_candidate.group_costs);
+    const std::optional<MatchCandidate>& preflight_candidate =
+        InteractionRuntimeTestAccess::candidate(runtime);
+    assert(preflight_candidate.has_value());
+    assert(exact(*preflight_candidate, preview.match_candidate));
+    const InteractionTarget* targeted = fixture.registry.find(
+        fixture.request.target);
+    assert(targeted != nullptr);
+    assert(targeted->state == ObjectState::Targeted);
+    assert(targeted->owner_request == fixture.request.request_id);
+    const PickBuildObservation targeted_build =
+        InteractionRuntimeTestAccess::build_pick_evaluation(
+            runtime,
+            realized.snapshot,
+            fixture.request.target,
+            fixture.request.affordance_id,
+            false);
+    assert(targeted_build.accepted);
+    assert(targeted_build.reason == Reason::None);
+    const PickBuildObservation preview_rule_after_reservation =
+        InteractionRuntimeTestAccess::build_pick_evaluation(
+            runtime,
+            realized.snapshot,
+            fixture.request.target,
+            fixture.request.affordance_id,
+            true);
+    assert(!preview_rule_after_reservation.accepted);
+    assert(preview_rule_after_reservation.reason == Reason::TargetUnavailable);
+
+    RuntimeFixture blocked_fixture = make_runtime_fixture();
+    blocked_fixture.registry.find(blocked_fixture.request.target)
+        ->table_size.z = 1.60F;
+    InteractionRuntime blocked_runtime(
+        blocked_fixture.database,
+        blocked_fixture.features,
+        blocked_fixture.registry,
+        RuntimeConfig{});
+    const PickEntryPreview blocked_preview = blocked_runtime.preview_pick(
+        blocked_fixture.locomotion,
+        live_pick_entry_root(blocked_fixture.locomotion),
+        blocked_fixture.request.target,
+        blocked_fixture.request.affordance_id);
+    assert_preview_rejected(blocked_preview, Reason::BlockedPath);
+    RuntimeOutput blocked_output = blocked_runtime.update(interact_input(
+        blocked_fixture.locomotion, blocked_fixture.request));
+    assert(blocked_output.diagnostics.state == RuntimeState::Preflight);
+    blocked_output = blocked_runtime.update(idle_input(
+        blocked_fixture.locomotion));
+    assert(blocked_output.diagnostics.state == RuntimeState::Locomotion);
+    assert(blocked_output.diagnostics.result == ResultCode::Rejected);
+    assert(blocked_output.diagnostics.reason == blocked_preview.match_reason);
+    const InteractionTarget* released = blocked_fixture.registry.find(
+        blocked_fixture.request.target);
+    assert(released != nullptr);
+    assert(released->state == ObjectState::Free);
+    assert(released->owner_request == 0U);
+}
+
+void test_pick_preview_never_reserves_or_constructs_request_authority() {
+    using namespace interaction;
+    RuntimeFixture fixture = make_place_runtime_fixture();
+    RuntimeFixture control_fixture = make_place_runtime_fixture();
+    InteractionRuntime runtime(
+        fixture.database,
+        fixture.features,
+        fixture.registry,
+        fixture.surface_registry,
+        fixture.place_library,
+        RuntimeConfig{});
+    InteractionRuntime control(
+        control_fixture.database,
+        control_fixture.features,
+        control_fixture.registry,
+        control_fixture.surface_registry,
+        control_fixture.place_library,
+        RuntimeConfig{});
+    const PickRequest request_before = fixture.request;
+    const RuntimeObservation before = observe(
+        runtime, fixture, fixture.locomotion);
+    const PickEntryPreview preview = runtime.preview_pick(
+        fixture.locomotion,
+        live_pick_entry_root(fixture.locomotion),
+        fixture.request.target,
+        fixture.request.affordance_id);
+    assert(preview.match_ready);
+    assert_exact(before, observe(runtime, fixture, fixture.locomotion));
+    assert(fixture.request.target == request_before.target);
+    assert(fixture.request.affordance_id == request_before.affordance_id);
+    assert(fixture.request.request_id == request_before.request_id);
+    const InteractionTarget* target = fixture.registry.find(
+        fixture.request.target);
+    assert(target != nullptr);
+    assert(target->state == ObjectState::Free);
+    assert(target->owner_request == 0U);
+    assert_same_next_update_after_preview(
+        runtime,
+        fixture,
+        control,
+        control_fixture,
+        interact_input(fixture.locomotion, fixture.request));
+    assert_same_next_update_after_preview(
+        runtime,
+        fixture,
+        control,
+        control_fixture,
+        idle_input(fixture.locomotion));
+}
+
+void test_pick_preview_rejection_reason_mapping_is_exact() {
+    using namespace interaction;
+    const auto check = [](
+        InteractionRuntime& runtime,
+        RuntimeFixture& fixture,
+        const LocomotionSnapshot& snapshot,
+        PickEntryRoot root,
+        TargetHandle target,
+        uint32_t affordance_id,
+        Reason reason) {
+        const RuntimeObservation before = observe(runtime, fixture, snapshot);
+        const PickEntryPreview preview = runtime.preview_pick(
+            snapshot, root, target, affordance_id);
+        assert_preview_rejected(preview, reason);
+        assert_preview_root(preview, root);
+        assert_exact(before, observe(runtime, fixture, snapshot));
+    };
+
+    RuntimeFixture disabled_fixture = make_runtime_fixture();
+    InteractionRuntime disabled = InteractionRuntime::disabled(
+        Reason::PackUnavailable);
+    check(
+        disabled,
+        disabled_fixture,
+        disabled_fixture.locomotion,
+        live_pick_entry_root(disabled_fixture.locomotion),
+        disabled_fixture.request.target,
+        disabled_fixture.request.affordance_id,
+        Reason::PackUnavailable);
+
+    RuntimeFixture state_fixture = make_runtime_fixture();
+    InteractionRuntime state_runtime(
+        state_fixture.database,
+        state_fixture.features,
+        state_fixture.registry,
+        RuntimeConfig{});
+    (void)state_runtime.update(interact_input(
+        state_fixture.locomotion, state_fixture.request));
+    LocomotionSnapshot invalid_while_busy = state_fixture.locomotion;
+    invalid_while_busy.pose.positions[g1_skeleton::Simulation].x =
+        float_from_bits(0x7fc00001U);
+    check(
+        state_runtime,
+        state_fixture,
+        invalid_while_busy,
+        live_pick_entry_root(state_fixture.locomotion),
+        state_fixture.request.target,
+        state_fixture.request.affordance_id,
+        Reason::TargetUnavailable);
+
+    RuntimeFixture lookup_fixture = make_runtime_fixture();
+    InteractionRuntime lookup_runtime(
+        lookup_fixture.database,
+        lookup_fixture.features,
+        lookup_fixture.registry,
+        RuntimeConfig{});
+    const PickEntryRoot lookup_root = live_pick_entry_root(
+        lookup_fixture.locomotion);
+    check(
+        lookup_runtime,
+        lookup_fixture,
+        lookup_fixture.locomotion,
+        lookup_root,
+        TargetHandle{},
+        lookup_fixture.request.affordance_id,
+        Reason::TargetUnavailable);
+    check(
+        lookup_runtime,
+        lookup_fixture,
+        lookup_fixture.locomotion,
+        lookup_root,
+        TargetHandle{999U, 1U},
+        lookup_fixture.request.affordance_id,
+        Reason::TargetUnavailable);
+    TargetHandle stale = lookup_fixture.request.target;
+    ++stale.generation;
+    check(
+        lookup_runtime,
+        lookup_fixture,
+        lookup_fixture.locomotion,
+        lookup_root,
+        stale,
+        lookup_fixture.request.affordance_id,
+        Reason::TargetChanged);
+    TargetHandle zero_generation = lookup_fixture.request.target;
+    zero_generation.generation = 0U;
+    check(
+        lookup_runtime,
+        lookup_fixture,
+        lookup_fixture.locomotion,
+        lookup_root,
+        zero_generation,
+        lookup_fixture.request.affordance_id,
+        Reason::TargetChanged);
+    check(
+        lookup_runtime,
+        lookup_fixture,
+        lookup_fixture.locomotion,
+        lookup_root,
+        lookup_fixture.request.target,
+        0U,
+        Reason::TargetUnavailable);
+    check(
+        lookup_runtime,
+        lookup_fixture,
+        lookup_fixture.locomotion,
+        lookup_root,
+        lookup_fixture.request.target,
+        999U,
+        Reason::TargetUnavailable);
+
+    for (ObjectState state : {
+             ObjectState::Targeted,
+             ObjectState::Attached,
+             ObjectState::Held}) {
+        RuntimeFixture nonfree_fixture = make_runtime_fixture();
+        InteractionTarget* target = nonfree_fixture.registry.find(
+            nonfree_fixture.request.target);
+        assert(target != nullptr);
+        target->state = state;
+        target->owner_request = 1234U;
+        InteractionRuntime nonfree_runtime(
+            nonfree_fixture.database,
+            nonfree_fixture.features,
+            nonfree_fixture.registry,
+            RuntimeConfig{});
+        check(
+            nonfree_runtime,
+            nonfree_fixture,
+            nonfree_fixture.locomotion,
+            live_pick_entry_root(nonfree_fixture.locomotion),
+            nonfree_fixture.request.target,
+            nonfree_fixture.request.affordance_id,
+            Reason::TargetUnavailable);
+    }
+    RuntimeFixture owned_free_fixture = make_runtime_fixture();
+    InteractionTarget* owned_free_target = owned_free_fixture.registry.find(
+        owned_free_fixture.request.target);
+    assert(owned_free_target != nullptr);
+    owned_free_target->state = ObjectState::Free;
+    owned_free_target->owner_request = 1234U;
+    InteractionRuntime owned_free_runtime(
+        owned_free_fixture.database,
+        owned_free_fixture.features,
+        owned_free_fixture.registry,
+        RuntimeConfig{});
+    check(
+        owned_free_runtime,
+        owned_free_fixture,
+        owned_free_fixture.locomotion,
+        live_pick_entry_root(owned_free_fixture.locomotion),
+        owned_free_fixture.request.target,
+        owned_free_fixture.request.affordance_id,
+        Reason::TargetUnavailable);
+
+    RuntimeFixture map_fixture = make_runtime_fixture();
+    InteractionRuntime map_runtime(
+        map_fixture.database,
+        map_fixture.features,
+        map_fixture.registry,
+        RuntimeConfig{});
+    for (size_t field = 0; field < 3U; ++field) {
+        PickEntryRoot invalid = live_pick_entry_root(map_fixture.locomotion);
+        std::array<float*, 3> fields{
+            &invalid.world_x,
+            &invalid.world_z,
+            &invalid.world_yaw_radians,
+        };
+        *fields[field] = float_from_bits(0x7f800000U);
+        check(
+            map_runtime,
+            map_fixture,
+            map_fixture.locomotion,
+            invalid,
+            map_fixture.request.target,
+            map_fixture.request.affordance_id,
+            Reason::OutOfRange);
+    }
+    LocomotionSnapshot nonfinite_snapshot = map_fixture.locomotion;
+    nonfinite_snapshot.pose.velocities[1].y = float_from_bits(0x7fc00001U);
+    check(
+        map_runtime,
+        map_fixture,
+        nonfinite_snapshot,
+        live_pick_entry_root(map_fixture.locomotion),
+        map_fixture.request.target,
+        map_fixture.request.affordance_id,
+        Reason::OutOfRange);
+    LocomotionSnapshot nonunit = map_fixture.locomotion;
+    nonunit.pose.rotations[g1_skeleton::Simulation] =
+        quat(1.01F, 0.0F, 0.0F, 0.0F);
+    check(
+        map_runtime,
+        map_fixture,
+        nonunit,
+        live_pick_entry_root(map_fixture.locomotion),
+        map_fixture.request.target,
+        map_fixture.request.affordance_id,
+        Reason::OutOfRange);
+    LocomotionSnapshot undefined_yaw = map_fixture.locomotion;
+    constexpr float half_sqrt_two = 0.7071067811865475244F;
+    undefined_yaw.pose.rotations[g1_skeleton::Simulation] =
+        quat(half_sqrt_two, half_sqrt_two, 0.0F, 0.0F);
+    check(
+        map_runtime,
+        map_fixture,
+        undefined_yaw,
+        live_pick_entry_root(map_fixture.locomotion),
+        map_fixture.request.target,
+        map_fixture.request.affordance_id,
+        Reason::OutOfRange);
+    LocomotionSnapshot overflow = map_fixture.locomotion;
+    overflow.pose.positions[g1_skeleton::Simulation].x =
+        std::numeric_limits<float>::max();
+    PickEntryRoot overflow_root = live_pick_entry_root(map_fixture.locomotion);
+    overflow_root.world_x = -std::numeric_limits<float>::max();
+    check(
+        map_runtime,
+        map_fixture,
+        overflow,
+        overflow_root,
+        map_fixture.request.target,
+        map_fixture.request.affordance_id,
+        Reason::OutOfRange);
 }
 
 void test_frozen_public_contract_and_defaults() {
@@ -1657,6 +3085,58 @@ void test_place_preflight_rejections_preserve_frozen_carry() {
         assert_mutated_snapshot_rejects(
             fixture, runtime, false, false, true, Reason::SurfaceChanged);
     }
+}
+
+void test_place_preflight_rejects_authored_slot_metadata_change() {
+    using namespace interaction;
+
+    RuntimeFixture fixture = make_runtime_fixture();
+    seed_authored_interaction_slots(fixture);
+    InteractionRuntime runtime(
+        fixture.database,
+        fixture.features,
+        fixture.registry,
+        fixture.surface_registry,
+        fixture.place_library,
+        RuntimeConfig{});
+    RuntimeOutput output = enter_carry_before_first_update(runtime, fixture);
+    const PlaceRequest request = place_request_for(runtime, fixture);
+    output = runtime.update(place_interact_input(fixture.locomotion, request));
+    assert(output.diagnostics.state == RuntimeState::PlacePreflight);
+
+    InteractionTarget* held = fixture.registry.find(fixture.request.target);
+    assert(held != nullptr);
+    held->affordances.front()
+        .interaction_slots[0].root_x_object_m += 0.001F;
+
+    output = advance(runtime, fixture.locomotion);
+    assert(output.diagnostics.state == RuntimeState::Carry);
+    assert(output.diagnostics.result == ResultCode::Rejected);
+    assert(output.diagnostics.reason == Reason::TargetChanged);
+    assert(output.diagnostics.attached);
+}
+
+void test_carry_rejects_authored_slot_order_change() {
+    using namespace interaction;
+
+    RuntimeFixture fixture = make_runtime_fixture();
+    seed_authored_interaction_slots(fixture);
+    InteractionRuntime runtime(
+        fixture.database, fixture.features, fixture.registry, RuntimeConfig{});
+    RuntimeOutput output = enter_carry_before_first_update(runtime, fixture);
+    assert(output.diagnostics.attached);
+
+    InteractionTarget* held = fixture.registry.find(fixture.request.target);
+    assert(held != nullptr);
+    std::swap(
+        held->affordances.front().interaction_slots[0],
+        held->affordances.front().interaction_slots[1]);
+
+    output = advance(runtime, fixture.locomotion);
+    assert(output.diagnostics.state == RuntimeState::Locomotion);
+    assert(output.diagnostics.result == ResultCode::Failed);
+    assert(output.diagnostics.reason == Reason::TargetChanged);
+    assert(!output.diagnostics.attached);
 }
 
 void test_post_begin_place_failures_reconstruct_fresh_carry() {
@@ -2664,6 +4144,57 @@ void test_hand_constraint_weight_tracks_authored_reach_and_attachment() {
     assert(saw_carry);
 }
 
+void test_place_hand_constraint_weight_is_full_until_release() {
+    using namespace interaction;
+    RuntimeFixture fixture = make_runtime_fixture();
+    InteractionRuntime runtime(
+        fixture.database,
+        fixture.features,
+        fixture.registry,
+        fixture.surface_registry,
+        fixture.place_library,
+        RuntimeConfig{});
+
+    RuntimeOutput output = enter_carry_before_first_update(runtime, fixture);
+    assert(output.diagnostics.hand_constraint_weight == 1.0F);
+    const PlaceRequest request = place_request_for(runtime, fixture, 9191U);
+    output = runtime.update(place_interact_input(
+        fixture.locomotion, request));
+
+    bool saw_preflight = false;
+    bool saw_align = false;
+    bool saw_replay = false;
+    bool saw_release = false;
+    for (int update = 0; update < kMaximumUpdates; ++update) {
+        const RuntimeState state = output.diagnostics.state;
+        if (state == RuntimeState::PlacePreflight ||
+            state == RuntimeState::PlaceAlign ||
+            state == RuntimeState::PlaceReplay) {
+            assert(output.diagnostics.attached);
+            assert(output.diagnostics.object_state == ObjectState::Held);
+            assert(output.owns_pose);
+            assert(output.diagnostics.hand_constraint_weight == 1.0F);
+            saw_preflight = saw_preflight ||
+                state == RuntimeState::PlacePreflight;
+            saw_align = saw_align || state == RuntimeState::PlaceAlign;
+            saw_replay = saw_replay || state == RuntimeState::PlaceReplay;
+        } else if (state == RuntimeState::PlaceRelease) {
+            assert(!output.diagnostics.attached);
+            assert(output.diagnostics.object_state == ObjectState::Free);
+            assert(output.diagnostics.hand_constraint_weight == 0.0F);
+            saw_release = true;
+        } else if (state == RuntimeState::Locomotion) {
+            assert(output.diagnostics.hand_constraint_weight == 0.0F);
+            break;
+        } else {
+            assert(false && "unexpected state during placement weight proof");
+        }
+        output = advance(runtime, fixture.locomotion);
+    }
+    assert(output.diagnostics.state == RuntimeState::Locomotion);
+    assert(saw_preflight && saw_align && saw_replay && saw_release);
+}
+
 void test_hand_constraint_weight_resets_on_cancel_failure_and_reset() {
     using namespace interaction;
 
@@ -3159,7 +4690,260 @@ void test_hold_interval_precedes_its_canonical_stop_frame_event() {
             runtime_fixture_detail::kHoldLocalFrame);
 }
 
-void test_post_ik_contact_sweep_cannot_cross_the_expanded_table() {
+void test_blocked_reach_transition_falls_back_to_safe_approach_entry() {
+    using namespace interaction;
+    RuntimeFixture fixture = entry_blend_table_crossing_fixture();
+    RuntimeConfig config{};
+    config.ik.accepted_position_m = 0.01F;
+    config.ik.maximum_iterations = 64;
+    config.attachment.maximum_position_error_m = 0.02F;
+    InteractionRuntime runtime(
+        fixture.database, fixture.features, fixture.registry, config);
+
+    constexpr int32_t kExpectedApproachEntry =
+        runtime_fixture_detail::kFramesPerClip;
+    constexpr int32_t kExpectedReachEntry =
+        runtime_fixture_detail::kFramesPerClip + 10;
+    constexpr int32_t kExpectedContact =
+        runtime_fixture_detail::kFramesPerClip +
+        runtime_fixture_detail::kContactLocalFrame;
+
+    const MatchInput matcher_input = match_input_for(fixture);
+    const vec3 live_hand = world_pose(fixture.locomotion.pose).positions[
+        kRightHandBone];
+    const float expanded_table_top =
+        matcher_input.target.table_world.position.y +
+        0.5F * matcher_input.target.table_size.y +
+        matcher_input.affordance.clearance_radius;
+    const float expanded_table_front =
+        matcher_input.target.table_world.position.z -
+        0.5F * matcher_input.target.table_size.z -
+        matcher_input.affordance.clearance_radius;
+    assert(live_hand.y < expanded_table_top);
+    assert(live_hand.z < expanded_table_front);
+    const vec3 authored_approach_hand = world_pose(pose_at_frame(
+        fixture.database, kExpectedApproachEntry)).positions[kRightHandBone];
+    const vec3 authored_reach_hand = world_pose(pose_at_frame(
+        fixture.database, kExpectedReachEntry)).positions[kRightHandBone];
+    assert(authored_approach_hand.y > expanded_table_top);
+    assert(authored_approach_hand.z < expanded_table_front);
+    assert(authored_reach_hand.y > expanded_table_top);
+    assert(authored_reach_hand.z < expanded_table_front);
+    const MatchResult unfiltered = select_whole_clip(
+        matcher_input, config.matcher);
+    assert(unfiltered.accepted);
+    assert(unfiltered.candidate.entry_frame == kExpectedReachEntry);
+    const runtime_detail::RealizedPickTransitionEvaluation blocked_reach =
+        runtime_detail::evaluate_realized_pick_transition(
+            fixture.database,
+            fixture.locomotion.pose,
+            unfiltered.candidate,
+            matcher_input.target,
+            matcher_input.affordance,
+            config.playback,
+            config.ik);
+    assert(!blocked_reach.feasible);
+    assert(blocked_reach.reason == Reason::BlockedPath);
+
+    const matcher_detail::PickEvaluation safe_match =
+        matcher_detail::evaluate_pick_entries(
+            {
+                matcher_input.database,
+                matcher_input.features,
+                matcher_input.query,
+                matcher_input.locomotion,
+                matcher_input.target,
+                matcher_input.affordance,
+            },
+            config.matcher,
+            [&](const MatchCandidate& candidate) {
+                const runtime_detail::RealizedPickTransitionEvaluation
+                    realized = runtime_detail::evaluate_realized_pick_transition(
+                    fixture.database,
+                    fixture.locomotion.pose,
+                    candidate,
+                    matcher_input.target,
+                    matcher_input.affordance,
+                    config.playback,
+                    config.ik);
+                return realized.reason;
+            });
+    assert(safe_match.selection.accepted);
+    assert(safe_match.selection.candidate.entry_frame ==
+           kExpectedApproachEntry);
+    const runtime_detail::RealizedPickTransitionEvaluation safe_approach =
+        runtime_detail::evaluate_realized_pick_transition(
+            fixture.database,
+            fixture.locomotion.pose,
+            safe_match.selection.candidate,
+            matcher_input.target,
+            matcher_input.affordance,
+            config.playback,
+            config.ik);
+    assert(safe_approach.feasible);
+    assert(safe_approach.reason == Reason::None);
+
+    const PickEntryPreview preview = runtime.preview_pick(
+        fixture.locomotion,
+        live_pick_entry_root(fixture.locomotion),
+        fixture.request.target,
+        fixture.request.affordance_id);
+    assert(preview.path_feasible);
+    assert(preview.match_ready);
+    assert(preview.path_reason == Reason::None);
+    assert(preview.match_reason == Reason::None);
+    assert(preview.match_candidate.entry_frame == kExpectedApproachEntry);
+    assert(preview.match_candidate.contact_frame == kExpectedContact);
+
+    RuntimeOutput output = runtime.update(interact_input(
+        fixture.locomotion, fixture.request));
+    assert(output.diagnostics.state == RuntimeState::Preflight);
+    output = advance(runtime, fixture.locomotion);
+    assert(output.diagnostics.state == RuntimeState::Align);
+    assert(output.diagnostics.frame == kExpectedApproachEntry);
+
+    for (int update = 0;
+         update < kMaximumUpdates &&
+         output.diagnostics.state != RuntimeState::Carry &&
+         output.diagnostics.result != ResultCode::Failed;
+         ++update) {
+        output = advance(runtime, fixture.locomotion);
+    }
+    assert(output.diagnostics.state == RuntimeState::Carry);
+    assert(output.diagnostics.result == ResultCode::Succeeded);
+    assert(output.diagnostics.reason == Reason::None);
+    assert(output.diagnostics.attached);
+    assert_held_by_original_owner(fixture);
+}
+
+void test_nonunit_fractional_wall_endpoint_is_certified_before_commit() {
+    using namespace interaction;
+    RuntimeConfig config{};
+    config.playback.speed = 0.85F;
+
+    RuntimeFixture trace_fixture = make_nonunit_fractional_arc_fixture();
+    InteractionRuntime trace_runtime(
+        trace_fixture.database,
+        trace_fixture.features,
+        trace_fixture.registry,
+        config);
+    RuntimeOutput trace = enter_align(trace_runtime, trace_fixture);
+    float previous_clearance_elapsed =
+        InteractionRuntimeTestAccess::clearance_elapsed_seconds(
+            trace_runtime);
+    assert(previous_clearance_elapsed == 0.0F);
+    assert(InteractionRuntimeTestAccess::player_elapsed_seconds(
+               trace_runtime) == previous_clearance_elapsed);
+    assert(InteractionRuntimeTestAccess::clearance_frame(trace_runtime) ==
+           InteractionRuntimeTestAccess::player_frame(trace_runtime));
+    for (int update = 0; update < 20; ++update) {
+        if (trace.diagnostics.state != RuntimeState::Align) break;
+        trace = advance(trace_runtime, trace_fixture.locomotion);
+        const float player_elapsed =
+            InteractionRuntimeTestAccess::player_elapsed_seconds(
+                trace_runtime);
+        const float clearance_elapsed =
+            InteractionRuntimeTestAccess::clearance_elapsed_seconds(
+                trace_runtime);
+        assert(clearance_elapsed > previous_clearance_elapsed);
+        assert(near(clearance_elapsed, player_elapsed, 1.0e-6F));
+        assert(InteractionRuntimeTestAccess::clearance_frame(trace_runtime) ==
+               InteractionRuntimeTestAccess::player_frame(trace_runtime));
+        previous_clearance_elapsed = clearance_elapsed;
+    }
+    assert(trace.diagnostics.state == RuntimeState::PickupReplay);
+    trace = advance(trace_runtime, trace_fixture.locomotion);
+    assert(trace.diagnostics.state == RuntimeState::PickupReplay);
+    constexpr int32_t kFractionalLeftFrame =
+        runtime_fixture_detail::kFramesPerClip + 21;
+    assert(trace.diagnostics.frame == kFractionalLeftFrame);
+    const vec3 fractional_hand = world_pose(trace.pose).positions[
+        kRightHandBone];
+
+    RuntimeFixture fixture = make_nonunit_fractional_arc_fixture();
+    set_fractional_endpoint_table(fixture, fractional_hand);
+    const MatchInput input = match_input_for(fixture);
+    const MatchResult authored = select_whole_clip(input, config.matcher);
+    assert(authored.accepted);
+    assert(authored.candidate.entry_frame ==
+           runtime_fixture_detail::kFramesPerClip + 10);
+    const vec3 integer_start = world_pose(pose_at_frame(
+        fixture.database, kFractionalLeftFrame)).positions[kRightHandBone];
+    const vec3 integer_stop = world_pose(pose_at_frame(
+        fixture.database, kFractionalLeftFrame + 1)).positions[
+            kRightHandBone];
+    assert(length(fractional_hand - integer_start) > 0.10F);
+    assert(length(fractional_hand - integer_stop) > 0.10F);
+
+    const runtime_detail::RealizedPickTransitionEvaluation reach_evaluation =
+        runtime_detail::evaluate_realized_pick_transition(
+            fixture.database,
+            fixture.locomotion.pose,
+            authored.candidate,
+            input.target,
+            input.affordance,
+            config.playback,
+            config.ik);
+    if (reach_evaluation.feasible) {
+        InteractionRuntime mismatch(
+            fixture.database,
+            fixture.features,
+            fixture.registry,
+            config);
+        RuntimeOutput output = enter_align(mismatch, fixture);
+        for (int update = 0;
+             update < kMaximumUpdates &&
+             output.diagnostics.result != ResultCode::Failed &&
+             output.diagnostics.state != RuntimeState::Carry;
+             ++update) {
+            output = advance(mismatch, fixture.locomotion);
+        }
+        assert(output.diagnostics.result == ResultCode::Failed);
+        assert(output.diagnostics.reason == Reason::BlockedPath);
+        assert(!output.diagnostics.attached);
+    }
+    assert(!reach_evaluation.feasible);
+    assert(reach_evaluation.reason == Reason::BlockedPath);
+
+    RuntimeFixture execution_fixture =
+        make_nonunit_fractional_arc_fixture();
+    set_fractional_endpoint_table(execution_fixture, fractional_hand);
+    InteractionRuntime runtime(
+        execution_fixture.database,
+        execution_fixture.features,
+        execution_fixture.registry,
+        config);
+    const PickEntryPreview preview = runtime.preview_pick(
+        execution_fixture.locomotion,
+        live_pick_entry_root(execution_fixture.locomotion),
+        execution_fixture.request.target,
+        execution_fixture.request.affordance_id);
+    assert(preview.path_feasible);
+    assert(preview.match_ready);
+    assert(execution_fixture.database.phases.at(
+               static_cast<size_t>(preview.match_candidate.entry_frame)) ==
+           static_cast<uint8_t>(Phase::Approach));
+    RuntimeOutput output = runtime.update(interact_input(
+        execution_fixture.locomotion, execution_fixture.request));
+    assert(output.diagnostics.state == RuntimeState::Preflight);
+    output = advance(runtime, execution_fixture.locomotion);
+    assert(output.diagnostics.state == RuntimeState::Align);
+    assert(output.diagnostics.frame ==
+           preview.match_candidate.entry_frame);
+    for (int update = 0;
+         update < kMaximumUpdates &&
+         output.diagnostics.state != RuntimeState::Carry &&
+         output.diagnostics.result != ResultCode::Failed;
+         ++update) {
+        output = advance(runtime, execution_fixture.locomotion);
+    }
+    assert(output.diagnostics.state == RuntimeState::Carry);
+    assert(output.diagnostics.result == ResultCode::Succeeded);
+    assert(output.diagnostics.reason == Reason::None);
+    assert(output.diagnostics.attached);
+}
+
+void test_realized_post_ik_table_sweep_is_rejected_in_preflight() {
     using namespace interaction;
     RuntimeFixture fixture = post_ik_table_crossing_fixture();
     const InteractionTarget* authored = fixture.registry.find(
@@ -3186,27 +4970,23 @@ void test_post_ik_contact_sweep_cannot_cross_the_expanded_table() {
     config.attachment.maximum_position_error_m = 0.02F;
     InteractionRuntime runtime(
         fixture.database, fixture.features, fixture.registry, config);
+    const PickEntryPreview preview = runtime.preview_pick(
+        fixture.locomotion,
+        live_pick_entry_root(fixture.locomotion),
+        fixture.request.target,
+        fixture.request.affordance_id);
+    assert_preview_rejected(preview, Reason::BlockedPath);
     RuntimeOutput output = runtime.update(interact_input(
         fixture.locomotion, fixture.request));
     assert(output.diagnostics.state == RuntimeState::Preflight);
     output = advance(runtime, fixture.locomotion);
-    assert(output.diagnostics.state == RuntimeState::Align);
-
-    bool saw_blocked = false;
-    for (int update = 0; update < kMaximumUpdates; ++update) {
-        output = advance(runtime, fixture.locomotion);
-        if (output.diagnostics.result == ResultCode::Failed) {
-            assert(output.diagnostics.reason == Reason::BlockedPath);
-            assert(!output.diagnostics.attached);
-            saw_blocked = true;
-            break;
-        }
-        assert(output.diagnostics.state != RuntimeState::Carry);
-    }
-    assert(saw_blocked);
+    assert(output.diagnostics.state == RuntimeState::Locomotion);
+    assert(output.diagnostics.result == ResultCode::Rejected);
+    assert(output.diagnostics.reason == Reason::BlockedPath);
+    assert(!output.diagnostics.attached);
 }
 
-void test_post_ik_precontact_sweep_cannot_cross_the_expanded_object() {
+void test_realized_post_ik_object_sweep_is_rejected_in_preflight() {
     using namespace interaction;
     RuntimeFixture fixture = post_ik_object_crossing_fixture();
     const InteractionTarget* authored = fixture.registry.find(
@@ -3249,27 +5029,23 @@ void test_post_ik_precontact_sweep_cannot_cross_the_expanded_object() {
     config.attachment.maximum_position_error_m = 0.02F;
     InteractionRuntime runtime(
         fixture.database, fixture.features, fixture.registry, config);
+    const PickEntryPreview preview = runtime.preview_pick(
+        fixture.locomotion,
+        live_pick_entry_root(fixture.locomotion),
+        fixture.request.target,
+        fixture.request.affordance_id);
+    assert_preview_rejected(preview, Reason::BlockedPath);
     RuntimeOutput output = runtime.update(interact_input(
         fixture.locomotion, fixture.request));
     assert(output.diagnostics.state == RuntimeState::Preflight);
     output = advance(runtime, fixture.locomotion);
-    assert(output.diagnostics.state == RuntimeState::Align);
-
-    bool saw_blocked = false;
-    for (int update = 0; update < kMaximumUpdates; ++update) {
-        output = advance(runtime, fixture.locomotion);
-        if (output.diagnostics.result == ResultCode::Failed) {
-            assert(output.diagnostics.reason == Reason::BlockedPath);
-            assert(!output.diagnostics.attached);
-            saw_blocked = true;
-            break;
-        }
-        assert(output.diagnostics.state != RuntimeState::Carry);
-    }
-    assert(saw_blocked);
+    assert(output.diagnostics.state == RuntimeState::Locomotion);
+    assert(output.diagnostics.result == ResultCode::Rejected);
+    assert(output.diagnostics.reason == Reason::BlockedPath);
+    assert(!output.diagnostics.attached);
 }
 
-void test_canonical_clearance_visits_curved_precontact_samples() {
+void test_curved_precontact_blocked_reach_falls_back_to_safe_approach() {
     using namespace interaction;
     RuntimeFixture fixture = curved_precontact_clearance_fixture();
     const InteractionTarget* target = fixture.registry.find(
@@ -3292,16 +5068,99 @@ void test_canonical_clearance_visits_curved_precontact_samples() {
     config.ik.maximum_iterations = 64;
     InteractionRuntime runtime(
         fixture.database, fixture.features, fixture.registry, config);
+    const MatchInput matcher_input = match_input_for(fixture);
+    const MatchResult unfiltered = select_whole_clip(
+        matcher_input, config.matcher);
+    assert(unfiltered.accepted);
+    assert(fixture.database.phases.at(
+               static_cast<size_t>(unfiltered.candidate.entry_frame)) ==
+           static_cast<uint8_t>(Phase::Reach));
+    const runtime_detail::RealizedPickTransitionEvaluation blocked_reach =
+        runtime_detail::evaluate_realized_pick_transition(
+            fixture.database,
+            fixture.locomotion.pose,
+            unfiltered.candidate,
+            matcher_input.target,
+            matcher_input.affordance,
+            config.playback,
+            config.ik);
+    assert(!blocked_reach.feasible);
+    assert(blocked_reach.reason == Reason::BlockedPath);
+    const PickEntryPreview preview = runtime.preview_pick(
+        fixture.locomotion,
+        live_pick_entry_root(fixture.locomotion),
+        fixture.request.target,
+        fixture.request.affordance_id);
+    assert(preview.path_feasible);
+    assert(preview.match_ready);
+    assert(preview.path_reason == Reason::None);
+    assert(preview.match_reason == Reason::None);
+    assert(fixture.database.phases.at(
+               static_cast<size_t>(
+                   preview.match_candidate.entry_frame)) ==
+           static_cast<uint8_t>(Phase::Approach));
     RuntimeOutput output = enter_align(runtime, fixture);
+    assert(output.diagnostics.frame ==
+           preview.match_candidate.entry_frame);
     for (int update = 0;
          update < kMaximumUpdates &&
+         output.diagnostics.state != RuntimeState::Carry &&
          output.diagnostics.result != ResultCode::Failed;
          ++update) {
         output = advance(runtime, fixture.locomotion);
     }
-    assert(output.diagnostics.result == ResultCode::Failed);
-    assert(output.diagnostics.reason == Reason::BlockedPath);
-    assert(!output.diagnostics.attached);
+    assert(output.diagnostics.state == RuntimeState::Carry);
+    assert(output.diagnostics.result == ResultCode::Succeeded);
+    assert(output.diagnostics.reason == Reason::None);
+    assert(output.diagnostics.attached);
+}
+
+void test_runtime_clearance_backstop_rejects_post_certification_change() {
+    using namespace interaction;
+    RuntimeFixture fixture = make_runtime_fixture();
+    InteractionRuntime runtime(
+        fixture.database,
+        fixture.features,
+        fixture.registry,
+        RuntimeConfig{});
+
+    const PickEntryPreview preview = runtime.preview_pick(
+        fixture.locomotion,
+        live_pick_entry_root(fixture.locomotion),
+        fixture.request.target,
+        fixture.request.affordance_id);
+    assert(preview.path_feasible);
+    assert(preview.match_ready);
+    assert(preview.match_candidate.entry_frame ==
+           runtime_fixture_detail::kFramesPerClip + 10);
+
+    RuntimeOutput output = enter_align(runtime, fixture);
+    assert(output.diagnostics.frame ==
+           preview.match_candidate.entry_frame);
+    constexpr int32_t kFuturePrecontactFrame =
+        runtime_fixture_detail::kFramesPerClip + 18;
+    assert(kFuturePrecontactFrame > output.diagnostics.frame);
+    vec3 future_hand = runtime_fixture_detail::read_bone_position(
+        fixture.database, kFuturePrecontactFrame, kRightHandBone);
+    future_hand.y = 0.60F;
+    runtime_fixture_detail::write_bone_position(
+        fixture.database,
+        kFuturePrecontactFrame,
+        kRightHandBone,
+        future_hand);
+
+    bool saw_blocked = false;
+    for (int update = 0; update < kMaximumUpdates; ++update) {
+        output = advance(runtime, fixture.locomotion);
+        if (output.diagnostics.result == ResultCode::Failed) {
+            assert(output.diagnostics.reason == Reason::BlockedPath);
+            assert(!output.diagnostics.attached);
+            saw_blocked = true;
+            break;
+        }
+        assert(output.diagnostics.state != RuntimeState::Carry);
+    }
+    assert(saw_blocked);
 }
 
 void test_stale_generation_is_rejected() {
@@ -3644,13 +5503,31 @@ void test_post_attach_target_change_never_clobbers_a_newer_generation() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 &&
+        std::strcmp(argv[1], "--pick-map-fast-math-canary") == 0) {
+        test_pick_snapshot_map_rejects_every_nonfinite_or_nonunit_input();
+        return 0;
+    }
+    assert(argc == 1);
+    test_pick_snapshot_map_is_a_rigid_planar_world_map();
+    test_pick_snapshot_map_preserves_local_channels_and_input();
+    test_pick_snapshot_map_rejects_every_nonfinite_or_nonunit_input();
+    test_pick_snapshot_fingerprint_is_fieldwise_and_canonical();
+    test_pick_preview_public_api_reports_path_and_match_separately();
+    test_pick_preview_rejects_invalid_runtime_target_and_root_inputs();
+    test_pick_preview_is_deterministic_and_const_on_every_outcome();
+    test_pick_preview_matches_normal_preflight_for_same_realized_snapshot();
+    test_pick_preview_never_reserves_or_constructs_request_authority();
+    test_pick_preview_rejection_reason_mapping_is_exact();
     test_frozen_public_contract_and_defaults();
     test_place_preview_and_collapsed_success_lifecycle();
     test_runtime_validates_complete_place_and_ik_configuration();
     test_runtime_forwards_nondefault_place_config_exactly();
     test_runtime_ik_identity_binds_every_scalar_and_iteration();
     test_place_preflight_rejections_preserve_frozen_carry();
+    test_carry_rejects_authored_slot_order_change();
+    test_place_preflight_rejects_authored_slot_metadata_change();
     test_post_begin_place_failures_reconstruct_fresh_carry();
     test_place_cancellation_boundaries_for_recorded_and_reverse();
     test_cancel_on_release_update_preserves_release_for_both_modes();
@@ -3664,6 +5541,7 @@ int main() {
     test_layered_carry_publishes_inactive_arm_authority_transactionally();
     test_recorded_and_weighted_carry_never_publish_inactive_arm_authority();
     test_hand_constraint_weight_tracks_authored_reach_and_attachment();
+    test_place_hand_constraint_weight_is_full_until_release();
     test_hand_constraint_weight_resets_on_cancel_failure_and_reset();
     test_carry_reset_preserves_a_newer_authoritative_generation();
     test_carry_update_preserves_a_newer_authoritative_generation();
@@ -3677,9 +5555,12 @@ int main() {
     test_canonical_updates_cannot_skip_post_attach_contact_loss();
     test_pickup_success_precedes_later_canonical_contact_loss();
     test_hold_interval_precedes_its_canonical_stop_frame_event();
-    test_post_ik_contact_sweep_cannot_cross_the_expanded_table();
-    test_post_ik_precontact_sweep_cannot_cross_the_expanded_object();
-    test_canonical_clearance_visits_curved_precontact_samples();
+    test_blocked_reach_transition_falls_back_to_safe_approach_entry();
+    test_nonunit_fractional_wall_endpoint_is_certified_before_commit();
+    test_realized_post_ik_table_sweep_is_rejected_in_preflight();
+    test_realized_post_ik_object_sweep_is_rejected_in_preflight();
+    test_curved_precontact_blocked_reach_falls_back_to_safe_approach();
+    test_runtime_clearance_backstop_rejects_post_certification_change();
     test_stale_generation_is_rejected();
     test_align_rejects_profile_or_bounds_snapshot_changes();
     test_failed_reservation_never_releases_an_existing_owner();

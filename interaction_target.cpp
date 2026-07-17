@@ -30,6 +30,20 @@ bool finite(quat value) {
            finite(value.z);
 }
 
+bool exact(vec3 left, vec3 right) {
+    return left.x == right.x && left.y == right.y && left.z == right.z;
+}
+
+bool exact(quat left, quat right) {
+    return left.w == right.w && left.x == right.x &&
+           left.y == right.y && left.z == right.z;
+}
+
+bool exact(const Transform& left, const Transform& right) {
+    return exact(left.position, right.position) &&
+           exact(left.rotation, right.rotation);
+}
+
 bool valid_rotation(quat value) {
     if (!finite(value)) return false;
     const float norm = quat_length(value);
@@ -99,6 +113,28 @@ void validate_affordance(const GraspAffordance& affordance) {
         throw std::invalid_argument(
             "interaction target clearance must be finite and nonnegative");
     }
+    for (size_t left = 0; left < affordance.interaction_slots.size(); ++left) {
+        const GraspInteractionSlot& slot =
+            affordance.interaction_slots[left];
+        if (slot.id == 0U) {
+            throw std::invalid_argument(
+                "interaction target slot ID must be nonzero");
+        }
+        if (!finite(slot.root_x_object_m) ||
+            !finite(slot.root_z_object_m) ||
+            !finite(slot.root_yaw_object_radians)) {
+            throw std::invalid_argument(
+                "interaction target slot geometry must be finite");
+        }
+        for (size_t right = left + 1U;
+             right < affordance.interaction_slots.size();
+             ++right) {
+            if (slot.id == affordance.interaction_slots[right].id) {
+                throw std::invalid_argument(
+                    "interaction target slot IDs must be unique");
+            }
+        }
+    }
 }
 
 void validate_target(const InteractionTarget& target) {
@@ -162,6 +198,60 @@ InteractionTarget& target_with_id(
 }
 
 }  // namespace
+
+bool same_authored_grasp_affordance(
+    const GraspAffordance& left,
+    const GraspAffordance& right) {
+    if (left.id != right.id || left.hand != right.hand ||
+        !exact(left.hand_in_object, right.hand_in_object) ||
+        !exact(
+            left.approach_direction_object,
+            right.approach_direction_object) ||
+        left.clearance_radius != right.clearance_radius ||
+        left.interaction_slots.size() != right.interaction_slots.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < left.interaction_slots.size(); ++i) {
+        const GraspInteractionSlot& a = left.interaction_slots[i];
+        const GraspInteractionSlot& b = right.interaction_slots[i];
+        if (a.id != b.id ||
+            a.root_x_object_m != b.root_x_object_m ||
+            a.root_z_object_m != b.root_z_object_m ||
+            a.root_yaw_object_radians != b.root_yaw_object_radians) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool same_interaction_target_snapshot(
+    const InteractionTarget& left,
+    const InteractionTarget& right) {
+    if (left.handle != right.handle ||
+        !exact(left.object_world, right.object_world) ||
+        left.object_profile_id != right.object_profile_id ||
+        !exact(
+            left.object_bounds.center_object,
+            right.object_bounds.center_object) ||
+        !exact(
+            left.object_bounds.half_extents_object,
+            right.object_bounds.half_extents_object) ||
+        !exact(left.object_dimensions, right.object_dimensions) ||
+        !exact(left.table_world, right.table_world) ||
+        !exact(left.table_size, right.table_size) ||
+        left.state != right.state ||
+        left.owner_request != right.owner_request ||
+        left.affordances.size() != right.affordances.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < left.affordances.size(); ++i) {
+        if (!same_authored_grasp_affordance(
+                left.affordances[i], right.affordances[i])) {
+            return false;
+        }
+    }
+    return true;
+}
 
 TargetHandle TargetRegistry::upsert(InteractionTarget target) {
     validate_target(target);

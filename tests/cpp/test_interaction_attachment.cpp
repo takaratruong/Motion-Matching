@@ -1157,6 +1157,29 @@ void test_begin_rejects_incoherent_or_unreserved_inputs() {
     }
 }
 
+void test_begin_rejects_authored_slot_metadata_mismatch() {
+    using namespace interaction;
+
+    AttachmentFixture fixture = make_fixture();
+    InteractionTarget* stored = fixture.registry.find(fixture.request.target);
+    assert(stored != nullptr);
+    stored->affordances.front().interaction_slots = {
+        {3U, -0.41F, -0.22F, 1.10F},
+        {9U, 0.18F, -0.39F, 0.20F},
+    };
+    fixture.target = *stored;
+    fixture.affordance = stored->affordances.front();
+
+    GraspAffordance copied = fixture.affordance;
+    copied.interaction_slots[0].root_x_object_m += 0.001F;
+    assert_begin_rejected(
+        fixture,
+        fixture.target,
+        fixture.request,
+        copied,
+        Reason::TargetUnavailable);
+}
+
 void test_invalid_configuration_and_nonfinite_prelift_are_rejected() {
     using namespace interaction;
 
@@ -1320,6 +1343,7 @@ int main() {
     test_commit_place_invalid_inputs_and_overflow_are_transactional();
     test_repeated_contact_is_rejected_and_reset_can_rebegin();
     test_begin_rejects_incoherent_or_unreserved_inputs();
+    test_begin_rejects_authored_slot_metadata_mismatch();
     test_invalid_configuration_and_nonfinite_prelift_are_rejected();
     test_invalid_contact_scalars_and_transforms_do_not_attach();
     test_overflowing_derived_pose_does_not_attach_or_mutate();

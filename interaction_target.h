@@ -32,12 +32,20 @@ struct ObjectLocalBounds {
     vec3 half_extents_object{};
 };
 
+struct GraspInteractionSlot {
+    uint32_t id = 0U;
+    float root_x_object_m = 0.0F;
+    float root_z_object_m = 0.0F;
+    float root_yaw_object_radians = 0.0F;
+};
+
 struct GraspAffordance {
     uint32_t id = 0;
     Hand hand = Hand::Right;
     Transform hand_in_object{};
     vec3 approach_direction_object{};
     float clearance_radius = 0.04F;
+    std::vector<GraspInteractionSlot> interaction_slots;
 };
 
 struct InteractionTarget {
@@ -58,6 +66,13 @@ struct PickRequest {
     uint32_t affordance_id = 0;
     uint64_t request_id = 0;
 };
+
+bool same_authored_grasp_affordance(
+    const GraspAffordance& left,
+    const GraspAffordance& right);
+bool same_interaction_target_snapshot(
+    const InteractionTarget& left,
+    const InteractionTarget& right);
 
 class TargetRegistry {
 public:

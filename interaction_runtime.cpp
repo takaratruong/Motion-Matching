@@ -4,6 +4,8 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <stdexcept>
 
 namespace interaction {
@@ -16,6 +18,271 @@ constexpr float kMaximumPlaybackSpeed = 1.15F;
 constexpr float kSlabEpsilon = 1.0e-7F;
 constexpr double kEventTimeEpsilon = 1.0e-6;
 constexpr double kEventSourceTolerance = 1.0e-4;
+constexpr size_t kPickRoot =
+    static_cast<size_t>(g1_skeleton::Simulation);
+constexpr float kPickRootNormTolerance = 1.0e-3F;
+constexpr float kPickYawPlanarLengthSquared = 1.0e-8F;
+constexpr float kPickYawTolerance = 2.0e-4F;
+constexpr float kPickInvariantTolerance = 1.0e-3F;
+
+uint32_t pick_float_bits(float value) {
+    uint32_t bits = 0U;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+bool pick_finite(float value) {
+    return (pick_float_bits(value) & 0x7f800000U) != 0x7f800000U;
+}
+
+bool pick_finite(vec3 value) {
+    return pick_finite(value.x) && pick_finite(value.y) &&
+           pick_finite(value.z);
+}
+
+bool pick_finite(quat value) {
+    return pick_finite(value.w) && pick_finite(value.x) &&
+           pick_finite(value.y) && pick_finite(value.z);
+}
+
+bool pick_same_bits(float left, float right) {
+    return pick_float_bits(left) == pick_float_bits(right);
+}
+
+bool pick_same_bits(vec3 left, vec3 right) {
+    return pick_same_bits(left.x, right.x) &&
+           pick_same_bits(left.y, right.y) &&
+           pick_same_bits(left.z, right.z);
+}
+
+bool pick_same_bits(quat left, quat right) {
+    return pick_same_bits(left.w, right.w) &&
+           pick_same_bits(left.x, right.x) &&
+           pick_same_bits(left.y, right.y) &&
+           pick_same_bits(left.z, right.z);
+}
+
+bool pick_valid_snapshot_fields(const LocomotionSnapshot& snapshot) {
+    for (size_t bone = 0; bone < g1_skeleton::BoneCount; ++bone) {
+        if (!pick_finite(snapshot.pose.positions[bone]) ||
+            !pick_finite(snapshot.pose.velocities[bone]) ||
+            !pick_finite(snapshot.pose.rotations[bone]) ||
+            !pick_finite(snapshot.pose.angular_velocities[bone])) {
+            return false;
+        }
+    }
+    for (float value : snapshot.pose.hand_dof) {
+        if (!pick_finite(value)) return false;
+    }
+    for (float value : snapshot.pose.hand_dof_velocities) {
+        if (!pick_finite(value)) return false;
+    }
+    for (uint8_t value : snapshot.pose.foot_contacts) {
+        if (value > 1U) return false;
+    }
+    for (size_t index = 0;
+         index < snapshot.future_root_positions.size();
+         ++index) {
+        if (!pick_finite(snapshot.future_root_positions[index]) ||
+            !pick_finite(snapshot.future_root_rotations[index])) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool pick_valid_root_rotation(const LocomotionSnapshot& snapshot) {
+    const float root_norm = quat_length(snapshot.pose.rotations[kPickRoot]);
+    return pick_finite(root_norm) &&
+           std::abs(root_norm - 1.0F) <= kPickRootNormTolerance;
+}
+
+bool pick_orientation_yaw(quat value, float& yaw) {
+    const float norm = quat_length(value);
+    if (!pick_finite(norm) || !(norm > 0.0F)) return false;
+    const quat normalized = value / norm;
+    if (!pick_finite(normalized)) return false;
+    const vec3 forward = quat_mul_vec3(
+        normalized, vec3(0.0F, 0.0F, 1.0F));
+    if (!pick_finite(forward)) return false;
+    const float planar_length_squared =
+        forward.x * forward.x + forward.z * forward.z;
+    if (!pick_finite(planar_length_squared) ||
+        !(planar_length_squared > kPickYawPlanarLengthSquared)) {
+        return false;
+    }
+    yaw = std::atan2(forward.x, forward.z);
+    return pick_finite(yaw);
+}
+
+bool pick_preserves_local_channels(
+    const LocomotionSnapshot& live,
+    const LocomotionSnapshot& mapped,
+    PickEntryRoot slot) {
+    if (!pick_same_bits(mapped.pose.positions[kPickRoot].x, slot.world_x) ||
+        !pick_same_bits(
+            mapped.pose.positions[kPickRoot].y,
+            live.pose.positions[kPickRoot].y) ||
+        !pick_same_bits(mapped.pose.positions[kPickRoot].z, slot.world_z)) {
+        return false;
+    }
+    for (size_t bone = 0; bone < g1_skeleton::BoneCount; ++bone) {
+        if (bone == kPickRoot) continue;
+        if (!pick_same_bits(
+                live.pose.positions[bone], mapped.pose.positions[bone]) ||
+            !pick_same_bits(
+                live.pose.velocities[bone], mapped.pose.velocities[bone]) ||
+            !pick_same_bits(
+                live.pose.rotations[bone], mapped.pose.rotations[bone]) ||
+            !pick_same_bits(
+                live.pose.angular_velocities[bone],
+                mapped.pose.angular_velocities[bone])) {
+            return false;
+        }
+    }
+    for (size_t index = 0; index < live.pose.hand_dof.size(); ++index) {
+        if (!pick_same_bits(
+                live.pose.hand_dof[index], mapped.pose.hand_dof[index]) ||
+            !pick_same_bits(
+                live.pose.hand_dof_velocities[index],
+                mapped.pose.hand_dof_velocities[index])) {
+            return false;
+        }
+    }
+    return live.pose.foot_contacts == mapped.pose.foot_contacts;
+}
+
+bool pick_near(float left, float right) {
+    if (!pick_finite(left) || !pick_finite(right)) return false;
+    const float delta = left - right;
+    return pick_finite(delta) &&
+           std::abs(delta) <= kPickInvariantTolerance;
+}
+
+bool pick_near(vec3 left, vec3 right) {
+    return pick_near(left.x, right.x) && pick_near(left.y, right.y) &&
+           pick_near(left.z, right.z);
+}
+
+bool pick_near_components(quat left, quat right) {
+    return pick_near(left.w, right.w) && pick_near(left.x, right.x) &&
+           pick_near(left.y, right.y) && pick_near(left.z, right.z);
+}
+
+bool pick_near_rotation(quat left, quat right) {
+    return pick_near_components(left, right) ||
+           pick_near_components(left, -right);
+}
+
+bool pick_rigid_world_map(
+    const LocomotionSnapshot& live,
+    const LocomotionSnapshot& mapped,
+    quat rotation_delta,
+    vec3 translation_delta) {
+    const WorldPose live_world = world_pose(live.pose);
+    const WorldPose mapped_world = world_pose(mapped.pose);
+    for (size_t bone = 0; bone < g1_skeleton::BoneCount; ++bone) {
+        if (!pick_finite(live_world.positions[bone]) ||
+            !pick_finite(live_world.rotations[bone]) ||
+            !pick_finite(live_world.velocities[bone]) ||
+            !pick_finite(live_world.angular_velocities[bone]) ||
+            !pick_finite(mapped_world.positions[bone]) ||
+            !pick_finite(mapped_world.rotations[bone]) ||
+            !pick_finite(mapped_world.velocities[bone]) ||
+            !pick_finite(mapped_world.angular_velocities[bone])) {
+            return false;
+        }
+        const vec3 expected_position = quat_mul_vec3(
+            rotation_delta, live_world.positions[bone]) + translation_delta;
+        const quat expected_rotation = quat_mul(
+            rotation_delta, live_world.rotations[bone]);
+        const vec3 expected_velocity = quat_mul_vec3(
+            rotation_delta, live_world.velocities[bone]);
+        const vec3 expected_angular_velocity = quat_mul_vec3(
+            rotation_delta, live_world.angular_velocities[bone]);
+        if (!pick_finite(expected_position) ||
+            !pick_finite(expected_rotation) ||
+            !pick_finite(expected_velocity) ||
+            !pick_finite(expected_angular_velocity) ||
+            !pick_near(mapped_world.positions[bone], expected_position) ||
+            !pick_near_rotation(
+                mapped_world.rotations[bone], expected_rotation) ||
+            !pick_near(mapped_world.velocities[bone], expected_velocity) ||
+            !pick_near(
+                mapped_world.angular_velocities[bone],
+                expected_angular_velocity)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool pick_rigid_future_map(
+    const LocomotionSnapshot& live,
+    const LocomotionSnapshot& mapped,
+    quat rotation_delta,
+    vec3 translation_delta) {
+    for (size_t index = 0;
+         index < live.future_root_positions.size();
+         ++index) {
+        const vec3 expected_position = quat_mul_vec3(
+            rotation_delta, live.future_root_positions[index]) +
+            translation_delta;
+        const quat expected_rotation = quat_mul(
+            rotation_delta, live.future_root_rotations[index]);
+        if (!pick_finite(expected_position) ||
+            !pick_finite(expected_rotation) ||
+            !pick_near(
+                mapped.future_root_positions[index], expected_position) ||
+            !pick_near_rotation(
+                mapped.future_root_rotations[index], expected_rotation)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+uint32_t pick_canonical_float_bits(float value) {
+    const uint32_t bits = pick_float_bits(value);
+    return (bits & 0x7fffffffU) == 0U ? 0U : bits;
+}
+
+void pick_hash_byte(uint64_t& digest, uint8_t value) {
+    digest ^= value;
+    digest *= 1099511628211ULL;
+}
+
+void pick_hash_float(uint64_t& digest, float value) {
+    const uint32_t bits = pick_canonical_float_bits(value);
+    for (unsigned shift = 0U; shift < 32U; shift += 8U) {
+        pick_hash_byte(
+            digest, static_cast<uint8_t>((bits >> shift) & 0xffU));
+    }
+}
+
+void pick_hash_vec3(uint64_t& digest, vec3 value) {
+    pick_hash_float(digest, value.x);
+    pick_hash_float(digest, value.y);
+    pick_hash_float(digest, value.z);
+}
+
+void pick_hash_quat(uint64_t& digest, quat value) {
+    const std::array<float, 4> components{
+        value.w, value.x, value.y, value.z};
+    bool negate = false;
+    for (float component : components) {
+        const uint32_t bits = pick_canonical_float_bits(component);
+        if ((bits & 0x7fffffffU) != 0U) {
+            negate = (bits & 0x80000000U) != 0U;
+            break;
+        }
+    }
+    for (float component : components) {
+        pick_hash_float(digest, negate ? -component : component);
+    }
+}
 
 bool finite_nonnegative(float value) {
     return std::isfinite(value) && value >= 0.0F;
@@ -178,40 +445,13 @@ bool exact(const Transform& left, const Transform& right) {
 bool exact(
     const GraspAffordance& left,
     const GraspAffordance& right) {
-    return left.id == right.id && left.hand == right.hand &&
-           exact(left.hand_in_object, right.hand_in_object) &&
-           exact(
-               left.approach_direction_object,
-               right.approach_direction_object) &&
-           left.clearance_radius == right.clearance_radius;
+    return same_authored_grasp_affordance(left, right);
 }
 
 bool exact(
     const InteractionTarget& left,
     const InteractionTarget& right) {
-    if (left.handle != right.handle ||
-        !exact(left.object_world, right.object_world) ||
-        left.object_profile_id != right.object_profile_id ||
-        !exact(
-            left.object_bounds.center_object,
-            right.object_bounds.center_object) ||
-        !exact(
-            left.object_bounds.half_extents_object,
-            right.object_bounds.half_extents_object) ||
-        !exact(left.object_dimensions, right.object_dimensions) ||
-        !exact(left.table_world, right.table_world) ||
-        !exact(left.table_size, right.table_size) ||
-        left.state != right.state ||
-        left.owner_request != right.owner_request ||
-        left.affordances.size() != right.affordances.size()) {
-        return false;
-    }
-    for (size_t index = 0; index < left.affordances.size(); ++index) {
-        if (!exact(left.affordances[index], right.affordances[index])) {
-            return false;
-        }
-    }
-    return true;
+    return same_interaction_target_snapshot(left, right);
 }
 
 bool exact(const ObjectLocalBounds& left, const ObjectLocalBounds& right) {
@@ -360,7 +600,8 @@ bool exact_held_metadata(
         return false;
     }
     for (size_t index = 0; index < retained.affordances.size(); ++index) {
-        if (!exact(retained.affordances[index], current.affordances[index])) {
+        if (!same_authored_grasp_affordance(
+                retained.affordances[index], current.affordances[index])) {
             return false;
         }
     }
@@ -528,6 +769,102 @@ void accumulate_runtime_clearance(
     has_previous = true;
 }
 
+void advance_transition_clearance(
+    bool& path_clear,
+    bool& has_previous,
+    vec3& previous_hand_world,
+    SequentialPlayer& clearance_player,
+    float target_elapsed_seconds,
+    const Database& database,
+    const MatchCandidate& candidate,
+    const InteractionTarget& target,
+    const GraspAffordance& affordance,
+    Transform target_hand_world,
+    Transform source_contact_hand_world,
+    const PlaybackConfig& playback_config,
+    const IKConfig& ik_config,
+    const Pose& entry_blend_source) {
+    const float source_rate = kCanonicalFps * playback_config.speed;
+    const float contact_elapsed_seconds =
+        static_cast<float>(candidate.contact_frame - candidate.entry_frame) /
+        source_rate;
+    const float clamped_target = std::min(
+        target_elapsed_seconds, contact_elapsed_seconds);
+    const auto advance_and_accumulate = [&](float segment_seconds) {
+        clearance_player.advance(segment_seconds);
+        const EventPose stop = event_pose(
+            clearance_player,
+            candidate,
+            affordance,
+            target_hand_world,
+            source_contact_hand_world,
+            ik_config,
+            entry_blend_source,
+            playback_config.entry_blend_seconds);
+        const double stop_source = source_frame_at_elapsed(
+            database,
+            candidate,
+            clearance_player.elapsed_seconds(),
+            playback_config.speed);
+        if (stop_source <=
+            static_cast<double>(candidate.contact_frame) +
+                kEventTimeEpsilon) {
+            const bool exempt_target_object = stop_source >
+                static_cast<double>(candidate.contact_frame - 1) +
+                    kEventTimeEpsilon;
+            accumulate_runtime_clearance(
+                path_clear,
+                has_previous,
+                previous_hand_world,
+                hand_world(stop.pose, affordance.hand).position,
+                target,
+                affordance,
+                exempt_target_object);
+        }
+    };
+    while (static_cast<double>(clamped_target) -
+               static_cast<double>(clearance_player.elapsed_seconds()) >
+           kEventTimeEpsilon) {
+        const float event_elapsed_seconds =
+            clearance_player.elapsed_seconds();
+        const double start_source = source_frame_at_elapsed(
+            database,
+            candidate,
+            event_elapsed_seconds,
+            playback_config.speed);
+        const float remaining_seconds = std::max(
+            0.0F, clamped_target - event_elapsed_seconds);
+        float segment_seconds = remaining_seconds;
+        if (start_source <
+            static_cast<double>(candidate.contact_frame) -
+                kEventTimeEpsilon) {
+            const double next_source = std::min(
+                std::floor(start_source + kEventTimeEpsilon) + 1.0,
+                static_cast<double>(candidate.contact_frame));
+            const double to_boundary_seconds =
+                (next_source - start_source) /
+                static_cast<double>(source_rate);
+            if (to_boundary_seconds > kEventTimeEpsilon) {
+                segment_seconds = std::min(
+                    segment_seconds,
+                    static_cast<float>(to_boundary_seconds));
+            }
+        }
+        if (!(segment_seconds > 0.0F)) break;
+        advance_and_accumulate(segment_seconds);
+    }
+    if (static_cast<double>(target_elapsed_seconds) + kEventTimeEpsilon >=
+            static_cast<double>(contact_elapsed_seconds) &&
+        clearance_player.frame() < candidate.contact_frame) {
+        const float remaining_seconds = std::max(
+            0.0F,
+            contact_elapsed_seconds - clearance_player.elapsed_seconds());
+        advance_and_accumulate(std::max(
+            remaining_seconds,
+            static_cast<float>(kEventTimeEpsilon)));
+    }
+}
+
 Pose mapped_pose_at_frame(
     const Database& database,
     const MatchCandidate& candidate,
@@ -589,6 +926,205 @@ ContactMeasurement contact_measurement(
 
 }  // namespace
 
+namespace runtime_detail {
+
+RealizedPickTransitionEvaluation evaluate_realized_pick_transition(
+    const Database& database,
+    const Pose& live_entry_pose,
+    const MatchCandidate& candidate,
+    const InteractionTarget& target,
+    const GraspAffordance& affordance,
+    const PlaybackConfig& playback_config,
+    const IKConfig& ik_config) {
+    if (!valid_playback_config(playback_config) ||
+        !valid_ik_config(ik_config)) {
+        throw std::invalid_argument(
+            "invalid realized pickup transition configuration");
+    }
+
+    SequentialPlayer timeline_player(database);
+    timeline_player.start(candidate, live_entry_pose, playback_config.speed);
+    SequentialPlayer clearance_player(database);
+    clearance_player.start(candidate, live_entry_pose, playback_config.speed);
+    const Transform target_hand_world = compose(
+        target.object_world, affordance.hand_in_object);
+    const Transform source_contact_hand_world = hand_world(
+        mapped_pose_at_frame(
+            database, candidate, candidate.contact_frame),
+        affordance.hand);
+
+    bool path_clear = true;
+    bool has_previous = false;
+    vec3 previous_hand_world{};
+    accumulate_runtime_clearance(
+        path_clear,
+        has_previous,
+        previous_hand_world,
+        hand_world(live_entry_pose, affordance.hand).position,
+        target,
+        affordance,
+        false);
+    if (!path_clear) {
+        return {false, Reason::BlockedPath, candidate.entry_frame};
+    }
+
+    while (clearance_player.frame() < candidate.contact_frame) {
+        timeline_player.advance(kFixedDt);
+        advance_transition_clearance(
+            path_clear,
+            has_previous,
+            previous_hand_world,
+            clearance_player,
+            timeline_player.elapsed_seconds(),
+            database,
+            candidate,
+            target,
+            affordance,
+            target_hand_world,
+            source_contact_hand_world,
+            playback_config,
+            ik_config,
+            live_entry_pose);
+        if (!path_clear) {
+            return {
+                false,
+                Reason::BlockedPath,
+                clearance_player.frame(),
+            };
+        }
+    }
+
+    return {true, Reason::None, clearance_player.frame()};
+}
+
+PickSnapshotMap map_pick_entry_snapshot(
+    const LocomotionSnapshot& snapshot,
+    PickEntryRoot root) {
+    const auto rejected = []() {
+        PickSnapshotMap result{};
+        result.reason = Reason::OutOfRange;
+        return result;
+    };
+    if (!pick_valid_snapshot_fields(snapshot) ||
+        !pick_finite(root.world_x) || !pick_finite(root.world_z) ||
+        !pick_finite(root.world_yaw_radians)) {
+        return rejected();
+    }
+    if (!pick_valid_root_rotation(snapshot)) {
+        return rejected();
+    }
+
+    float live_yaw = 0.0F;
+    if (!pick_orientation_yaw(
+            snapshot.pose.rotations[kPickRoot], live_yaw)) {
+        return rejected();
+    }
+    const float raw_yaw_delta = root.world_yaw_radians - live_yaw;
+    if (!pick_finite(raw_yaw_delta)) return rejected();
+    const float yaw_delta = std::atan2(
+        std::sin(raw_yaw_delta), std::cos(raw_yaw_delta));
+    if (!pick_finite(yaw_delta)) return rejected();
+    const quat rotation_delta = quat_from_angle_axis(
+        yaw_delta, vec3(0.0F, 1.0F, 0.0F));
+    if (!pick_finite(rotation_delta)) return rejected();
+    const vec3 slot_position(
+        root.world_x,
+        snapshot.pose.positions[kPickRoot].y,
+        root.world_z);
+    if (!pick_finite(slot_position)) return rejected();
+    const vec3 rotated_live_root = quat_mul_vec3(
+        rotation_delta, snapshot.pose.positions[kPickRoot]);
+    if (!pick_finite(rotated_live_root)) return rejected();
+    const vec3 translation_delta = slot_position - rotated_live_root;
+    if (!pick_finite(translation_delta)) return rejected();
+
+    PickSnapshotMap result{};
+    result.snapshot = snapshot;
+    result.snapshot.pose.positions[kPickRoot] = slot_position;
+    result.snapshot.pose.rotations[kPickRoot] = quat_mul(
+        rotation_delta, snapshot.pose.rotations[kPickRoot]);
+    result.snapshot.pose.velocities[kPickRoot] = quat_mul_vec3(
+        rotation_delta, snapshot.pose.velocities[kPickRoot]);
+    result.snapshot.pose.angular_velocities[kPickRoot] = quat_mul_vec3(
+        rotation_delta, snapshot.pose.angular_velocities[kPickRoot]);
+    for (size_t index = 0;
+         index < snapshot.future_root_positions.size();
+         ++index) {
+        result.snapshot.future_root_positions[index] =
+            quat_mul_vec3(
+                rotation_delta, snapshot.future_root_positions[index]) +
+            translation_delta;
+        result.snapshot.future_root_rotations[index] = quat_mul(
+            rotation_delta, snapshot.future_root_rotations[index]);
+    }
+    if (!pick_valid_snapshot_fields(result.snapshot)) return rejected();
+
+    float mapped_yaw = 0.0F;
+    if (!pick_orientation_yaw(
+            result.snapshot.pose.rotations[kPickRoot], mapped_yaw)) {
+        return rejected();
+    }
+    const float raw_yaw_error = root.world_yaw_radians - mapped_yaw;
+    if (!pick_finite(raw_yaw_error)) return rejected();
+    const float yaw_error = std::atan2(
+        std::sin(raw_yaw_error), std::cos(raw_yaw_error));
+    if (!pick_finite(yaw_error) ||
+        std::abs(yaw_error) > kPickYawTolerance) {
+        return rejected();
+    }
+
+    if (!pick_preserves_local_channels(snapshot, result.snapshot, root) ||
+        !pick_rigid_world_map(
+            snapshot,
+            result.snapshot,
+            rotation_delta,
+            translation_delta) ||
+        !pick_rigid_future_map(
+            snapshot,
+            result.snapshot,
+            rotation_delta,
+            translation_delta)) {
+        return rejected();
+    }
+    result.accepted = true;
+    return result;
+}
+
+uint64_t locomotion_snapshot_fingerprint(
+    const LocomotionSnapshot& snapshot) {
+    uint64_t digest = 14695981039346656037ULL;
+    for (vec3 value : snapshot.pose.positions) {
+        pick_hash_vec3(digest, value);
+    }
+    for (vec3 value : snapshot.pose.velocities) {
+        pick_hash_vec3(digest, value);
+    }
+    for (quat value : snapshot.pose.rotations) {
+        pick_hash_quat(digest, value);
+    }
+    for (vec3 value : snapshot.pose.angular_velocities) {
+        pick_hash_vec3(digest, value);
+    }
+    for (float value : snapshot.pose.hand_dof) {
+        pick_hash_float(digest, value);
+    }
+    for (float value : snapshot.pose.hand_dof_velocities) {
+        pick_hash_float(digest, value);
+    }
+    for (uint8_t value : snapshot.pose.foot_contacts) {
+        pick_hash_byte(digest, value);
+    }
+    for (vec3 value : snapshot.future_root_positions) {
+        pick_hash_vec3(digest, value);
+    }
+    for (quat value : snapshot.future_root_rotations) {
+        pick_hash_quat(digest, value);
+    }
+    return digest == 0U ? 14695981039346656037ULL : digest;
+}
+
+}  // namespace runtime_detail
+
 InteractionRuntime::InteractionRuntime(
     const Database& database,
     const Features& features,
@@ -643,6 +1179,149 @@ RuntimeState InteractionRuntime::state() const {
 
 const RuntimeDiagnostics& InteractionRuntime::diagnostics() const {
     return diagnostics_;
+}
+
+InteractionRuntime::PickEvaluationBuild
+InteractionRuntime::build_pick_evaluation(
+    const LocomotionSnapshot& locomotion,
+    TargetHandle target_handle,
+    uint32_t affordance_id,
+    bool require_free) const {
+    PickEvaluationBuild result{};
+    if (database_ == nullptr || features_ == nullptr || registry_ == nullptr) {
+        result.reason = Reason::PackUnavailable;
+        return result;
+    }
+    if (target_handle.id == 0U) {
+        result.reason = Reason::TargetUnavailable;
+        return result;
+    }
+    const InteractionTarget* target = registry_->find_by_id(target_handle.id);
+    if (target == nullptr) {
+        result.reason = Reason::TargetUnavailable;
+        return result;
+    }
+    if (target->handle.generation != target_handle.generation) {
+        result.reason = Reason::TargetChanged;
+        return result;
+    }
+    if (affordance_id == 0U ||
+        (require_free &&
+         (target->state != ObjectState::Free ||
+          target->owner_request != 0U))) {
+        result.reason = Reason::TargetUnavailable;
+        return result;
+    }
+    const GraspAffordance* affordance = registry_->find_affordance(
+        target->handle, affordance_id);
+    if (affordance == nullptr) {
+        result.reason = Reason::TargetUnavailable;
+        return result;
+    }
+
+    result.input.database = database_;
+    result.input.features = features_;
+    result.input.query = normalize_query(
+        build_raw_query(make_query_input(locomotion, *target, *affordance)),
+        *features_);
+    result.input.locomotion = locomotion;
+    result.input.target = *target;
+    result.input.affordance = *affordance;
+    result.accepted = true;
+    result.reason = Reason::None;
+    return result;
+}
+
+matcher_detail::PickEvaluation
+InteractionRuntime::evaluate_pick_entries_realized(
+    const matcher_detail::PickEvaluationInput& input) const {
+    return matcher_detail::evaluate_pick_entries(
+        input,
+        config_.matcher,
+        [this, &input](const MatchCandidate& candidate) {
+            return runtime_detail::evaluate_realized_pick_transition(
+                *input.database,
+                input.locomotion.pose,
+                candidate,
+                input.target,
+                input.affordance,
+                config_.playback,
+                config_.ik).reason;
+        });
+}
+
+void InteractionRuntime::advance_pick_clearance(
+    float target_elapsed_seconds) {
+    if (database_ == nullptr || !candidate_.has_value() ||
+        !target_.has_value() || !affordance_.has_value() ||
+        !clearance_player_.has_value()) {
+        throw std::logic_error(
+            "interaction runtime clearance state is incomplete");
+    }
+    advance_transition_clearance(
+        corrected_path_clear_,
+        has_previous_corrected_hand_,
+        previous_corrected_hand_world_,
+        *clearance_player_,
+        target_elapsed_seconds,
+        *database_,
+        *candidate_,
+        *target_,
+        *affordance_,
+        target_hand_world_,
+        source_contact_hand_world_,
+        config_.playback,
+        config_.ik,
+        entry_blend_source_);
+}
+
+PickEntryPreview InteractionRuntime::preview_pick(
+    const LocomotionSnapshot& live_flat_snapshot,
+    PickEntryRoot prospective_root,
+    TargetHandle target,
+    uint32_t affordance_id) const {
+    PickEntryPreview preview{};
+    preview.prospective_root = prospective_root;
+    if (database_ == nullptr || features_ == nullptr || registry_ == nullptr) {
+        preview.path_reason = Reason::PackUnavailable;
+        preview.match_reason = Reason::PackUnavailable;
+        return preview;
+    }
+    if (state_ != RuntimeState::Locomotion) {
+        preview.path_reason = Reason::TargetUnavailable;
+        preview.match_reason = Reason::TargetUnavailable;
+        return preview;
+    }
+    const runtime_detail::PickSnapshotMap mapped =
+        runtime_detail::map_pick_entry_snapshot(
+            live_flat_snapshot, prospective_root);
+    if (!mapped.accepted) {
+        preview.path_reason = mapped.reason;
+        preview.match_reason = mapped.reason;
+        return preview;
+    }
+    const PickEvaluationBuild built = build_pick_evaluation(
+        mapped.snapshot, target, affordance_id, true);
+    if (!built.accepted) {
+        preview.path_reason = built.reason;
+        preview.match_reason = built.reason;
+        return preview;
+    }
+    const matcher_detail::PickEvaluation evaluated =
+        evaluate_pick_entries_realized(built.input);
+    preview.path_feasible = evaluated.path_feasible;
+    preview.match_ready = evaluated.match_ready;
+    preview.path_reason = evaluated.path_reason;
+    preview.match_reason = evaluated.match_reason;
+    preview.feasible_entry_frame = evaluated.feasible_entry_frame;
+    preview.contact_frame = evaluated.contact_frame;
+    preview.total_cost = evaluated.total_cost_available
+        ? evaluated.total_cost
+        : 0.0F;
+    if (evaluated.match_ready) {
+        preview.match_candidate = evaluated.selection.candidate;
+    }
+    return preview;
 }
 
 InteractionRuntime::PlaceMatchBuildResult
@@ -908,22 +1587,6 @@ void InteractionRuntime::drain_playback_events(
             stop.hand_position_error_m;
         diagnostics_.hand_orientation_error_radians =
             stop.hand_orientation_error_radians;
-
-        if (stop_source <=
-            static_cast<double>(candidate_->contact_frame) +
-                kEventTimeEpsilon) {
-            const bool exempt_target_object = stop_source >
-                static_cast<double>(candidate_->contact_frame - 1) +
-                    kEventTimeEpsilon;
-            accumulate_runtime_clearance(
-                corrected_path_clear_,
-                has_previous_corrected_hand_,
-                previous_corrected_hand_world_,
-                hand_world(stop.pose, affordance_->hand).position,
-                *target_,
-                *affordance_,
-                exempt_target_object);
-        }
 
         if (!post_commit_failure_ && !contact_evaluated_ &&
             event_player_->frame() >= candidate_->contact_frame) {
@@ -1266,120 +1929,146 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
                                     request.target, request.request_id)) {
                                 reject(Reason::TargetChanged);
                             } else {
-                                target_ = *reserved;
-                                affordance_ = *reserved_affordance;
-                                const NormalizedQuery query = normalize_query(
-                                    build_raw_query(make_query_input(
+                                const PickEvaluationBuild built =
+                                    build_pick_evaluation(
                                         input.locomotion,
-                                        *target_,
-                                        *affordance_)),
-                                    *features_);
-                                MatchInput match_input{};
-                                match_input.database = database_;
-                                match_input.features = features_;
-                                match_input.query = query;
-                                match_input.locomotion = input.locomotion;
-                                match_input.target = *target_;
-                                match_input.affordance = *affordance_;
-                                match_input.request = request;
-                                const MatchResult match = select_whole_clip(
-                                    match_input, config_.matcher);
-                                if (!match.accepted) {
-                                    reject(match.reason);
+                                        request.target,
+                                        request.affordance_id,
+                                        false);
+                                if (!built.accepted) {
+                                    reject(built.reason);
                                 } else {
-                                    candidate_ = match.candidate;
-                                    player_.emplace(*database_);
-                                    player_->start(
-                                        *candidate_,
-                                        input.locomotion.pose,
-                                        config_.playback.speed);
-                                    event_player_.emplace(*database_);
-                                    event_player_->start(
-                                        *candidate_,
-                                        input.locomotion.pose,
-                                        config_.playback.speed);
-                                    attachment_.emplace(
-                                        *registry_, config_.attachment);
-                                    if (!attachment_->begin(
-                                            *target_,
-                                            request,
-                                            *affordance_,
-                                            original_object_world_.position.y)) {
-                                        reject(attachment_->reason());
+                                    target_ = built.input.target;
+                                    affordance_ = built.input.affordance;
+                                    const MatchResult match =
+                                        evaluate_pick_entries_realized(
+                                            built.input).selection;
+                                    if (!match.accepted) {
+                                        reject(match.reason);
                                     } else {
-                                        entry_blend_source_ =
+                                        candidate_ = match.candidate;
+                                        player_.emplace(*database_);
+                                        player_->start(
+                                            *candidate_,
+                                            input.locomotion.pose,
+                                            config_.playback.speed);
+                                        event_player_.emplace(*database_);
+                                        event_player_->start(
+                                            *candidate_,
+                                            input.locomotion.pose,
+                                            config_.playback.speed);
+                                        clearance_player_.emplace(*database_);
+                                        clearance_player_->start(
+                                            *candidate_,
+                                            input.locomotion.pose,
+                                            config_.playback.speed);
+                                        attachment_.emplace(
+                                            *registry_, config_.attachment);
+                                        if (!attachment_->begin(
+                                                *target_,
+                                                request,
+                                                *affordance_,
+                                                original_object_world_
+                                                    .position.y)) {
+                                            reject(attachment_->reason());
+                                        } else {
+                                            entry_blend_source_ =
                                             input.locomotion.pose;
-                                        pose_ = entry_blend_source_;
-                                        target_hand_world_ = compose(
-                                            target_->object_world,
-                                            affordance_->hand_in_object);
-                                        source_contact_hand_world_ = hand_world(
-                                            mapped_pose_at_frame(
-                                                *database_,
-                                                *candidate_,
-                                                candidate_->contact_frame),
-                                            affordance_->hand);
-                                        has_previous_corrected_hand_ = false;
-                                        corrected_path_clear_ = true;
-                                        accumulate_runtime_clearance(
-                                            corrected_path_clear_,
-                                            has_previous_corrected_hand_,
-                                            previous_corrected_hand_world_,
-                                            hand_world(
-                                                entry_blend_source_,
-                                                affordance_->hand).position,
-                                            *target_,
-                                            *affordance_,
-                                            false);
-                                        entry_blend_elapsed_seconds_ = 0.0F;
-                                        const float wall_time_to_contact =
-                                            database_->time_to_contact.at(
-                                                static_cast<size_t>(
-                                                    candidate_->entry_frame)) /
-                                            config_.playback.speed;
-                                        commit_seconds_ = std::min({
-                                            config_.playback.commit_horizon_seconds,
-                                            wall_time_to_contact,
-                                            config_.playback.maximum_alignment_seconds,
-                                        });
-                                        contact_evaluated_ = false;
-                                        ever_attached_ = false;
-                                        post_commit_failure_ = false;
-                                        final_failure_frame_presented_ = false;
-                                        carry_ready_ = false;
-                                        carry_started_ = false;
-                                        post_commit_reason_ = Reason::None;
-                                        carry_.reset();
-                                        state_ = RuntimeState::Align;
-                                        diagnostics_.state = state_;
-                                        diagnostics_.result =
-                                            ResultCode::Accepted;
-                                        diagnostics_.reason = Reason::None;
-                                        diagnostics_.target = request.target;
-                                        diagnostics_.object_state =
-                                            ObjectState::Targeted;
-                                        diagnostics_.affordance_id =
-                                            request.affordance_id;
-                                        diagnostics_.clip = candidate_->clip;
-                                        diagnostics_.frame = player_->frame();
-                                        diagnostics_.phase = player_->phase();
-                                        diagnostics_.hand = affordance_->hand;
-                                        diagnostics_.total_cost =
-                                            candidate_->total_cost;
-                                        diagnostics_.group_costs =
-                                            candidate_->group_costs;
-                                        diagnostics_.requested_root_correction_m =
-                                            std::hypot(
-                                                candidate_->entry_root_offset.x,
-                                                candidate_->entry_root_offset.z);
-                                        diagnostics_.applied_root_correction_m =
-                                            diagnostics_.requested_root_correction_m;
-                                        diagnostics_.requested_yaw_correction_radians =
-                                            std::abs(candidate_->entry_yaw_offset);
-                                        diagnostics_.applied_yaw_correction_radians =
-                                            diagnostics_.requested_yaw_correction_radians;
-                                        diagnostics_.playback_speed =
-                                            config_.playback.speed;
+                                            pose_ = entry_blend_source_;
+                                            target_hand_world_ = compose(
+                                                target_->object_world,
+                                                affordance_->hand_in_object);
+                                            source_contact_hand_world_ =
+                                                hand_world(
+                                                    mapped_pose_at_frame(
+                                                        *database_,
+                                                        *candidate_,
+                                                        candidate_
+                                                            ->contact_frame),
+                                                    affordance_->hand);
+                                            has_previous_corrected_hand_ =
+                                                false;
+                                            corrected_path_clear_ = true;
+                                            accumulate_runtime_clearance(
+                                                corrected_path_clear_,
+                                                has_previous_corrected_hand_,
+                                                previous_corrected_hand_world_,
+                                                hand_world(
+                                                    entry_blend_source_,
+                                                    affordance_->hand)
+                                                    .position,
+                                                *target_,
+                                                *affordance_,
+                                                false);
+                                            entry_blend_elapsed_seconds_ =
+                                                0.0F;
+                                            const float wall_time_to_contact =
+                                                database_->time_to_contact.at(
+                                                    static_cast<size_t>(
+                                                        candidate_
+                                                            ->entry_frame)) /
+                                                config_.playback.speed;
+                                            commit_seconds_ = std::min({
+                                                config_.playback
+                                                    .commit_horizon_seconds,
+                                                wall_time_to_contact,
+                                                config_.playback
+                                                    .maximum_alignment_seconds,
+                                            });
+                                            contact_evaluated_ = false;
+                                            ever_attached_ = false;
+                                            post_commit_failure_ = false;
+                                            final_failure_frame_presented_ =
+                                                false;
+                                            carry_ready_ = false;
+                                            carry_started_ = false;
+                                            post_commit_reason_ = Reason::None;
+                                            carry_.reset();
+                                            state_ = RuntimeState::Align;
+                                            diagnostics_.state = state_;
+                                            diagnostics_.result =
+                                                ResultCode::Accepted;
+                                            diagnostics_.reason = Reason::None;
+                                            diagnostics_.target =
+                                                request.target;
+                                            diagnostics_.object_state =
+                                                ObjectState::Targeted;
+                                            diagnostics_.affordance_id =
+                                                request.affordance_id;
+                                            diagnostics_.clip =
+                                                candidate_->clip;
+                                            diagnostics_.frame =
+                                                player_->frame();
+                                            diagnostics_.phase =
+                                                player_->phase();
+                                            diagnostics_.hand =
+                                                affordance_->hand;
+                                            diagnostics_.total_cost =
+                                                candidate_->total_cost;
+                                            diagnostics_.group_costs =
+                                                candidate_->group_costs;
+                                            diagnostics_
+                                                .requested_root_correction_m =
+                                                std::hypot(
+                                                    candidate_
+                                                        ->entry_root_offset.x,
+                                                    candidate_
+                                                        ->entry_root_offset.z);
+                                            diagnostics_
+                                                .applied_root_correction_m =
+                                                diagnostics_
+                                                    .requested_root_correction_m;
+                                            diagnostics_
+                                                .requested_yaw_correction_radians =
+                                                std::abs(candidate_
+                                                    ->entry_yaw_offset);
+                                            diagnostics_
+                                                .applied_yaw_correction_radians =
+                                                diagnostics_
+                                                    .requested_yaw_correction_radians;
+                                            diagnostics_.playback_speed =
+                                                config_.playback.speed;
+                                        }
                                     }
                                 }
                             }
@@ -1391,6 +2080,7 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
                             owns_reservation_ = false;
                             player_.reset();
                             event_player_.reset();
+                            clearance_player_.reset();
                             attachment_.reset();
                             carry_.reset();
                             candidate_.reset();
@@ -1423,6 +2113,7 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
             diagnostics_.attached = false;
             player_.reset();
             event_player_.reset();
+            clearance_player_.reset();
             attachment_.reset();
             candidate_.reset();
             target_.reset();
@@ -1448,6 +2139,7 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
             } else {
                 player_->advance(input.dt);
                 entry_blend_elapsed_seconds_ += input.dt;
+                advance_pick_clearance(player_->elapsed_seconds());
                 Pose sampled = player_->sample();
                 if (player_->frame() <= candidate_->contact_frame) {
                     const IKResult ik = apply_reach_ik(
@@ -1509,6 +2201,7 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
         diagnostics_.inactive_arm_targets_locomotion = false;
         player_.reset();
         event_player_.reset();
+        clearance_player_.reset();
         attachment_.reset();
         carry_.reset();
         candidate_.reset();
@@ -1518,6 +2211,7 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
         const float published_elapsed_seconds = player_->elapsed_seconds();
         if (!player_->finished()) player_->advance(input.dt);
         entry_blend_elapsed_seconds_ += input.dt;
+        advance_pick_clearance(player_->elapsed_seconds());
         Pose sampled = player_->sample();
         if (!post_commit_failure_ &&
             player_->frame() <= candidate_->contact_frame) {
@@ -1571,6 +2265,7 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
                 player_->elapsed_seconds();
             const bool extending_final_pose = player_->finished();
             if (!extending_final_pose) player_->advance(input.dt);
+            advance_pick_clearance(player_->elapsed_seconds());
             pose_ = apply_entry_blend(
                 entry_blend_source_,
                 player_->sample(),
@@ -1807,6 +2502,7 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
                 carry_.reset();
                 player_.reset();
                 event_player_.reset();
+                clearance_player_.reset();
                 attachment_.reset();
                 candidate_.reset();
                 target_.reset();
@@ -1955,6 +2651,7 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
             carry_.reset();
             player_.reset();
             event_player_.reset();
+            clearance_player_.reset();
             attachment_.reset();
             candidate_.reset();
             target_.reset();
@@ -2019,6 +2716,7 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
             carry_.reset();
             player_.reset();
             event_player_.reset();
+            clearance_player_.reset();
             attachment_.reset();
             candidate_.reset();
             target_.reset();
@@ -2033,7 +2731,9 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
                 authoritative->handle == request_->target &&
                 registry_->validate(
                     request_->target, request_->request_id) &&
-                authoritative->state == ObjectState::Held;
+                authoritative->state == ObjectState::Held &&
+                target_.has_value() &&
+                exact_held_metadata(*target_, *authoritative);
             if (!still_owns_held_target) {
                 if (authoritative != nullptr) {
                     object_world_ = authoritative->object_world;
@@ -2054,6 +2754,7 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
                 carry_.reset();
                 player_.reset();
                 event_player_.reset();
+                clearance_player_.reset();
                 attachment_.reset();
                 candidate_.reset();
                 target_.reset();
@@ -2144,6 +2845,13 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
         diagnostics_.hand_constraint_weight =
             authored_hand_constraint_weight(
                 player_->frame(), *candidate_);
+    }
+    if (diagnostics_.result != ResultCode::Failed &&
+        diagnostics_.attached &&
+        (state_ == RuntimeState::PlacePreflight ||
+         state_ == RuntimeState::PlaceAlign ||
+         state_ == RuntimeState::PlaceReplay)) {
+        diagnostics_.hand_constraint_weight = 1.0F;
     }
 
     RuntimeOutput output = passthrough(input, diagnostics_);

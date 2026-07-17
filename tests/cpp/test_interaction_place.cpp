@@ -399,6 +399,7 @@ PlaceFixture make_fixture(bool include_recorded = true) {
         Transform{vec3(), quat()},
         vec3(0.0F, 1.0F, 0.0F),
         0.01F,
+        {},
     };
     fixture.input.surface = make_surface();
     fixture.input.place_affordance = fixture.input.surface.affordances.front();
@@ -1790,6 +1791,10 @@ void assert_selection_id_changes(
 
 void test_complete_snapshot_identity_and_pointer_independence() {
     PlaceFixture base = make_fixture();
+    base.input.held_affordance.interaction_slots = {
+        {3U, -0.41F, -0.22F, 1.10F},
+        {9U, 0.18F, -0.39F, 0.20F},
+    };
     base.library.recorded.push_back(make_recorded_clip(202U));
     refresh_pointers(base);
     const uint64_t baseline = accepted_selection_id(base);
@@ -1862,6 +1867,14 @@ void test_complete_snapshot_identity_and_pointer_independence() {
         },
         [](PlaceFixture& value) {
             value.input.held_affordance.clearance_radius += 0.001F;
+        },
+        [](PlaceFixture& value) {
+            std::swap(
+                value.input.held_affordance.interaction_slots[0],
+                value.input.held_affordance.interaction_slots[1]);
+        },
+        [](PlaceFixture& value) {
+            ++value.input.held_affordance.interaction_slots[0].id;
         },
         [](PlaceFixture& value) { value.input.object_dimensions.x += 0.001F; },
         [](PlaceFixture& value) { value.input.object_dimensions.y += 0.001F; },

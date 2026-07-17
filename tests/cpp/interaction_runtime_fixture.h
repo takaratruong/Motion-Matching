@@ -1,7 +1,6 @@
 #pragma once
 
-#include "interaction_matcher.h"
-#include "interaction_place_controller.h"
+#include "interaction_runtime.h"
 
 #include <algorithm>
 #include <array>
@@ -9,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <vector>
 
 namespace interaction {
 
@@ -24,6 +24,35 @@ struct RuntimeFixture {
     SurfaceHandle surface{};
     uint32_t place_affordance_id = 0U;
 };
+
+struct RuntimeObservation {
+    RuntimeState state{};
+    RuntimeDiagnostics diagnostics{};
+    std::vector<InteractionTarget> targets{};
+    std::vector<PlacementSurface> surfaces{};
+    LocomotionSnapshot caller_snapshot{};
+};
+
+inline RuntimeObservation observe(
+    const InteractionRuntime& runtime,
+    const RuntimeFixture& fixture,
+    const LocomotionSnapshot& caller) {
+    RuntimeObservation observation{};
+    observation.state = runtime.state();
+    observation.diagnostics = runtime.diagnostics();
+    observation.caller_snapshot = caller;
+    if (fixture.request.target.id != 0U) {
+        const InteractionTarget* target = fixture.registry.find_by_id(
+            fixture.request.target.id);
+        if (target != nullptr) observation.targets.push_back(*target);
+    }
+    if (fixture.surface.id != 0U) {
+        const PlacementSurface* surface = fixture.surface_registry.find_by_id(
+            fixture.surface.id);
+        if (surface != nullptr) observation.surfaces.push_back(*surface);
+    }
+    return observation;
+}
 
 namespace runtime_fixture_detail {
 
@@ -88,6 +117,18 @@ inline void write_identity_rotation(
     database.rotations.at(offset + 1U) = 0.0F;
     database.rotations.at(offset + 2U) = 0.0F;
     database.rotations.at(offset + 3U) = 0.0F;
+}
+
+inline void write_bone_rotation(
+    Database& database,
+    int32_t frame,
+    size_t bone,
+    quat rotation) {
+    const size_t offset = quaternion_offset(frame, bone);
+    database.rotations.at(offset) = rotation.w;
+    database.rotations.at(offset + 1U) = rotation.x;
+    database.rotations.at(offset + 2U) = rotation.y;
+    database.rotations.at(offset + 3U) = rotation.z;
 }
 
 inline float carry_x(int32_t clip, int32_t local_frame) {
@@ -264,6 +305,7 @@ inline InteractionTarget make_target() {
         Transform{vec3(), quat()},
         vec3(0.0F, 0.0F, -1.0F),
         0.04F,
+        {},
     }};
     assert(target.object_profile_id != 0U);
     assert(target.object_bounds.center_object.x == 0.0F);
@@ -458,6 +500,41 @@ inline RuntimeFixture make_runtime_fixture() {
     return fixture;
 }
 
+inline RuntimeFixture make_nonunit_fractional_arc_fixture() {
+    RuntimeFixture fixture = make_runtime_fixture();
+    constexpr int32_t kArcStart =
+        runtime_fixture_detail::kFramesPerClip + 21;
+    constexpr int32_t kArcStop = kArcStart + 1;
+    constexpr size_t kRightWristPitch =
+        static_cast<size_t>(g1_skeleton::RightWristPitch);
+    runtime_fixture_detail::write_bone_rotation(
+        fixture.database,
+        kArcStart,
+        kRightWristPitch,
+        quat_from_angle_axis(-1.20F, vec3(0.0F, 1.0F, 0.0F)));
+    runtime_fixture_detail::write_bone_rotation(
+        fixture.database,
+        kArcStop,
+        kRightWristPitch,
+        quat_from_angle_axis(1.20F, vec3(0.0F, 1.0F, 0.0F)));
+    return fixture;
+}
+
+inline void set_fractional_endpoint_table(
+    RuntimeFixture& fixture,
+    vec3 center_world) {
+    InteractionTarget* target = fixture.registry.find(fixture.request.target);
+    if (target == nullptr) {
+        throw std::logic_error("fractional arc target missing");
+    }
+    target->table_world = {center_world, quat()};
+    target->table_size = vec3(0.01F, 0.01F, 0.01F);
+    target->affordances.at(0).clearance_radius = 0.005F;
+    const RawQuery raw = build_raw_query(query_input_for(
+        fixture, *target, target->affordances.at(0)));
+    fixture.features.offsets.assign(raw.begin(), raw.end());
+}
+
 inline RuntimeFixture make_place_runtime_fixture() {
     RuntimeFixture fixture = make_runtime_fixture();
     fixture.surface = fixture.surface_registry.upsert(
@@ -466,6 +543,64 @@ inline RuntimeFixture make_place_runtime_fixture() {
     fixture.place_library.recorded.push_back(
         runtime_fixture_detail::make_recorded_place_clip(fixture.database));
     return fixture;
+}
+
+inline LocomotionSnapshot make_pick_snapshot_fixture() {
+    LocomotionSnapshot snapshot{};
+    const auto unit = [](quat value) {
+        return value / quat_length(value);
+    };
+    for (size_t bone = 0; bone < g1_skeleton::BoneCount; ++bone) {
+        const float index = static_cast<float>(bone + 1U);
+        snapshot.pose.positions[bone] = vec3(
+            0.007F * index,
+            0.011F * index,
+            -0.005F * index);
+        snapshot.pose.velocities[bone] = vec3(
+            -0.013F * index,
+            0.003F * index,
+            0.009F * index);
+        snapshot.pose.rotations[bone] = quat_from_angle_axis(
+            0.004F * index, vec3(0.0F, 1.0F, 0.0F));
+        snapshot.pose.angular_velocities[bone] = vec3(
+            0.002F * index,
+            -0.006F * index,
+            0.008F * index);
+    }
+
+    constexpr size_t root = static_cast<size_t>(g1_skeleton::Simulation);
+    snapshot.pose.positions[root] = vec3(1.25F, 0.93F, -0.60F);
+    snapshot.pose.velocities[root] = vec3(0.40F, -0.20F, 0.80F);
+    snapshot.pose.rotations[root] = unit(quat_mul(
+        quat_from_angle_axis(0.31F, vec3(0.0F, 1.0F, 0.0F)),
+        quat_mul(
+            quat_from_angle_axis(-0.19F, vec3(1.0F, 0.0F, 0.0F)),
+            quat_from_angle_axis(0.13F, vec3(0.0F, 0.0F, 1.0F)))));
+    snapshot.pose.angular_velocities[root] = vec3(-0.10F, 0.30F, 0.20F);
+
+    for (size_t index = 0; index < snapshot.pose.hand_dof.size(); ++index) {
+        const float value = static_cast<float>(index + 1U);
+        snapshot.pose.hand_dof[index] = 0.021F * value;
+        snapshot.pose.hand_dof_velocities[index] = -0.017F * value;
+    }
+    snapshot.pose.foot_contacts = {1U, 1U};
+    snapshot.future_root_positions = {
+        vec3(1.40F, 0.94F, -0.20F),
+        vec3(1.75F, 0.96F, 0.15F),
+        vec3(2.10F, 1.01F, 0.55F),
+    };
+    snapshot.future_root_rotations = {
+        unit(quat_mul(
+            quat_from_angle_axis(0.43F, vec3(0.0F, 1.0F, 0.0F)),
+            quat_from_angle_axis(-0.11F, vec3(1.0F, 0.0F, 0.0F)))),
+        unit(quat_mul(
+            quat_from_angle_axis(0.58F, vec3(0.0F, 1.0F, 0.0F)),
+            quat_from_angle_axis(0.09F, vec3(0.0F, 0.0F, 1.0F)))),
+        unit(quat_mul(
+            quat_from_angle_axis(0.72F, vec3(0.0F, 1.0F, 0.0F)),
+            quat_from_angle_axis(0.07F, vec3(1.0F, 0.0F, 0.0F)))),
+    };
+    return snapshot;
 }
 
 inline MatchInput match_input_for(const RuntimeFixture& fixture) {

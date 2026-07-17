@@ -72,6 +72,15 @@ struct FlatControllerPose {
 Pose expand_flat_controller_pose(
     const FlatControllerPose& flat_pose,
     const Pose& interaction_reference);
+// Expands the representable flat-controller subspace around a fixed reference
+// pair. Root translation/velocity and mapped world rotation/angular-velocity
+// deltas are transferred; true-G1 non-root translation/velocity morphology and
+// unmapped local channels are invariant. Unsupported flat non-root translation
+// and velocity deltas are therefore projected out.
+Pose expand_flat_controller_pose(
+    const FlatControllerPose& flat_pose,
+    const Pose& interaction_reference,
+    const FlatControllerPose& flat_reference);
 FlatControllerPose collapse_interaction_pose(
     const Pose& interaction_pose,
     const Pose& interaction_reference,
@@ -168,9 +177,20 @@ private:
     Pose ownership_interaction_reference_{};
     FlatControllerPose ownership_flat_reference_{};
     FlatControllerPose last_rendered_pose_{};
+    TargetHandle ownership_target_{};
+    uint32_t ownership_affordance_id_ = 0U;
+    Hand ownership_hand_ = Hand::Right;
+    bool ownership_identity_poisoned_ = false;
     TargetRigArmIK target_rig_arm_ik_{};
     std::optional<ControllerInteractionHandConstraint>
         ownership_hand_constraint_{};
+    bool hand_constraint_applied_last_update_ = false;
+    std::optional<Hand> active_arm_release_hand_{};
+    float active_arm_release_blend_seconds_ = 0.0F;
+    FlatControllerPose active_arm_release_source_{};
+    std::optional<Hand> post_release_active_arm_hand_{};
+    float post_release_active_arm_blend_seconds_ = 0.0F;
+    FlatControllerPose post_release_active_arm_source_{};
     std::optional<Hand> inactive_arm_locomotion_hand_{};
     std::optional<Hand> inactive_arm_return_hand_{};
     float inactive_arm_blend_seconds_ = 0.0F;

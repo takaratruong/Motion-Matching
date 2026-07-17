@@ -2301,11 +2301,21 @@ class Task12PolicyTests(unittest.TestCase):
         )
         self.assertIn("destination.overhead_clearance_m = 2.00F;", adapter)
         self.assertIn("projected_support_world", adapter)
-        self.assertIn("inverse(stable_source_object)", adapter)
-        self.assertNotIn("object_bounds", self._cpp_function(
+        self.assertIn(
+            "CertifiedControllerSceneSource certified_controller_scene_source(",
+            adapter,
+        )
+        self.assertIn("inverse(source.rest_object_world)", adapter)
+        self.assertIn("source.contact_hand_world", adapter)
+        destination_constructor = self._cpp_function(
             adapter,
             "PlacementSurface make_controller_demo_destination_surface(",
-        ))
+        )
+        self.assertIn(
+            "certify_controller_destination_fit(", destination_constructor
+        )
+        self.assertIn("source_target.object_bounds", destination_constructor)
+        self.assertNotIn("stable_source_object", destination_constructor)
 
     def test_manual_place_resolver_is_the_only_nearby_surface_lookup(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")
@@ -2439,6 +2449,13 @@ class Task12PolicyTests(unittest.TestCase):
             velocity_update,
             "place staging must enter through ordinary Carry input",
         )
+        self.assertNotRegex(
+            controller,
+            r"gamepadstick_left\s*=\s*0\.25F\s*\*\s*"
+            r"controller_place_staging_stick\(",
+            "placement auto-demo must use the full staging input so the "
+            "25 Hz controller can reach a ready preview within 150 ticks",
+        )
         steering_gate = self._source_between(
             controller,
             "        if (!autodemo_configuration.has_value() &&",
@@ -2461,8 +2478,9 @@ class Task12PolicyTests(unittest.TestCase):
         controller = Path("controller.cpp").read_text(encoding="utf-8")
         self.assertEqual(
             controller.count("interaction_registry.resolve_single_target("),
-            1,
-            "only the Locomotion pick resolver may select a target",
+            2,
+            "manual assist acquisition and auto-demo submission are the only "
+            "target selectors",
         )
         self.assertNotIn("interaction_registry.reset(", controller)
         self.assertNotIn("interaction_registry.replace_pose(", controller)
@@ -2470,6 +2488,753 @@ class Task12PolicyTests(unittest.TestCase):
         self.assertIn(
             "Interaction: F pick/place  X cancel  R reset",
             Path("interaction_debug_draw.h").read_text(encoding="utf-8"),
+        )
+
+    def test_manual_pick_assist_owns_locomotion_f_not_legacy_resolver(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        self.assertIn('#include "interaction_pick_assist.h"', controller)
+        self.assertRegex(
+            controller,
+            r"interaction::ControllerPickAssist\s+manual_pick_assist\s*\(\s*"
+            r"manual_pick_assist_config\s*\)\s*;",
+        )
+
+        manual_input = self._source_between(
+            controller,
+            "        // Manual pick-assist input begins.",
+            "        // Manual pick-assist input ends.",
+        )
+        normalized_input = " ".join(manual_input.split())
+        self.assertIn("interaction_edges.interact_pressed", manual_input)
+        self.assertIn(
+            "interaction_scheduler.cached_output().diagnostics.state == "
+            "interaction::RuntimeState::Locomotion",
+            normalized_input,
+        )
+        self.assertIn(
+            "interaction_edges.interact_pressed = false;",
+            manual_input,
+            "raw F must be consumed before the scheduler sees it",
+        )
+        self.assertLess(
+            controller.index("        // Manual pick-assist input ends."),
+            controller.index("interaction_scheduler.tick("),
+        )
+
+        resolver = self._source_between(
+            controller,
+            "                [&](const interaction::LocomotionSnapshot& snapshot)\n"
+            "                    -> std::optional<interaction::PickRequest>",
+            "                [&](const interaction::LocomotionSnapshot& snapshot)\n"
+            "                    -> std::optional<interaction::ControllerPlaceTarget>",
+        )
+        legacy_lookup = resolver.index(
+            "interaction_registry.resolve_single_target("
+        )
+        auto_only_guard = resolver.index(
+            "if (!autodemo_configuration.has_value())"
+        )
+        self.assertLess(auto_only_guard, legacy_lookup)
+        self.assertIn("return std::nullopt;", resolver[auto_only_guard:legacy_lookup])
+
+    def test_manual_pick_assist_activation_rebuilds_current_target_plan(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        manual_input = self._source_between(
+            controller,
+            "        // Manual pick-assist input begins.",
+            "        // Manual pick-assist input ends.",
+        )
+        for required in (
+            "manual_pick_assist_config.maximum_assisted_path_m +",
+            "manual_pick_assist_config.arrival.maximum_standoff_m",
+            "interaction_registry.resolve_single_target(",
+            "interaction_registry.find(*manual_pick_target_handle)",
+            "manual_pick_target->affordances.size() == 1U",
+            "interaction::make_pick_reach_waypoint(",
+            "interaction::make_pick_entry_slots(",
+            "interaction::PickAssistStart",
+            "manual_pick_assist.begin(",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, manual_input)
+        ordered = (
+            "interaction_registry.resolve_single_target(",
+            "interaction_registry.find(*manual_pick_target_handle)",
+            "interaction::make_pick_reach_waypoint(",
+            "interaction::make_pick_entry_slots(",
+            "manual_pick_assist.begin(",
+        )
+        positions = [manual_input.find(marker) for marker in ordered]
+        self.assertTrue(all(position >= 0 for position in positions))
+        if all(position >= 0 for position in positions):
+            self.assertEqual(
+                positions,
+                sorted(positions),
+                "activation must resolve current identity/pose before planning and begin",
+            )
+        self.assertRegex(
+            manual_input,
+            r"start\.root_world\s*=\s*interaction::Transform\s*\{\s*"
+            r"bone_positions\(0\),\s*bone_rotations\(0\)\s*\}\s*;",
+        )
+        self.assertNotIn("interaction_authored_target", manual_input)
+
+    def test_manual_pick_assist_applies_prior_output_without_hijacking_camera(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        self.assertIn(
+            "interaction::PickAssistOutput manual_pick_assist_output{};",
+            controller,
+        )
+        raw_input = self._source_between(
+            controller,
+            "        // Get gamepad stick states",
+            "        // Press edges and runtime updates share",
+        )
+        self.assertIn(
+            "const vec3 raw_gamepadstick_right = gamepadstick_right;",
+            raw_input,
+        )
+        self.assertIn(
+            "const bool raw_desired_strafe = desired_strafe_update();",
+            raw_input,
+        )
+
+        prior_output = self._source_between(
+            controller,
+            "        // Manual pick-assist prior output begins.",
+            "        // Manual pick-assist prior output ends.",
+        )
+        for required in (
+            "!manual_pick_assist_activation_tick",
+            "manual_pick_assist_output.override_steering",
+            "gamepadstick_left = manual_pick_assist_output.left_stick;",
+            "gamepadstick_right = manual_pick_assist_output.right_stick;",
+            "manual_pick_assist_output.force_strafe",
+            "desired_strafe = true;",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, prior_output)
+        self.assertLess(
+            controller.index("        // Manual pick-assist prior output ends."),
+            controller.index("vec3 desired_velocity_curr = desired_velocity_update("),
+        )
+
+        manual_input = self._source_between(
+            controller,
+            "        // Manual pick-assist input begins.",
+            "        // Manual pick-assist input ends.",
+        )
+        self.assertIn("manual_pick_assist_activation_tick = true;", manual_input)
+        self.assertIn("gamepadstick_left = vec3();", manual_input)
+        self.assertIn("gamepadstick_right = vec3();", manual_input)
+
+        camera_update = self._source_between(
+            controller,
+            "        orbit_camera_update(",
+            "        // Render",
+        )
+        self.assertIn("raw_gamepadstick_right", camera_update)
+        self.assertIn("raw_desired_strafe", camera_update)
+        self.assertNotIn("manual_pick_assist_output", camera_update)
+
+    def test_controller_materializes_one_post_step_live_flat_snapshot(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        seam = self._source_between(
+            controller,
+            "        const interaction::RuntimeState cached_interaction_state =",
+            "                [&](const interaction::LocomotionSnapshot& snapshot)\n"
+            "                    -> std::optional<interaction::PickRequest>",
+        )
+        self.assertEqual(
+            seam.count("interaction::LocomotionSnapshot live_flat_snapshot"),
+            1,
+        )
+        for required in (
+            "live_flat_snapshot.pose = locomotion_pose;",
+            "live_flat_snapshot.future_root_positions[index] =",
+            "live_flat_snapshot.future_root_rotations[index] =",
+            "const interaction::LocomotionSnapshot& snapshot =\n"
+            "                        live_flat_snapshot;",
+            "return autodemo_canonical_entry->snapshot;",
+            "return snapshot;",
+            "// Placement pickup preview provider begins.",
+            "// Placement pickup preview provider ends.",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, seam)
+        snapshot = seam.index(
+            "interaction::LocomotionSnapshot live_flat_snapshot"
+        )
+        scheduler = seam.index("interaction_scheduler.tick(")
+        provider_alias = seam.index(
+            "const interaction::LocomotionSnapshot& snapshot ="
+        )
+        self.assertLess(snapshot, scheduler)
+        self.assertLess(scheduler, provider_alias)
+        self.assertNotIn("interaction::LocomotionSnapshot snapshot;", seam)
+
+    def test_manual_pick_preview_and_observe_share_live_snapshot_fingerprint(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        self.assertEqual(controller.count("interaction_runtime.preview_pick("), 1)
+        self.assertEqual(controller.count("preview_pick_entry_slots("), 2)
+
+        helper = self._source_between(
+            controller,
+            "    auto preview_pick_entry_slots =",
+            "    auto make_flat_controller_pose =",
+        )
+        for required in (
+            "const interaction::LocomotionSnapshot& snapshot",
+            "const interaction::PickEntrySlots& slots",
+            "interaction::TargetHandle target",
+            "uint32_t affordance_id",
+            "for (size_t index = 0; index < previews.size(); ++index)",
+            "interaction_runtime.preview_pick(",
+            "slots.ordered[index].prospective_root",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, helper)
+
+        observation = self._source_between(
+            controller,
+            "        // Manual pick-assist observation begins.",
+            "        // Manual pick-assist observation ends.",
+        )
+        for required in (
+            "locomotion_snapshot_fingerprint(live_flat_snapshot)",
+            "manual_pick_assist_output.needs_preview",
+            "preview_pick_entry_slots(\n"
+            "                    live_flat_snapshot,",
+            "manual_pick_preview_snapshot_fingerprint =\n"
+            "                    live_flat_snapshot_fingerprint;",
+            "observation.runtime_state = cached_interaction_state;",
+            "observation.displayed_root = interaction::Transform{",
+            "observation.simulation_velocity = simulation_velocity;",
+            "observation.displayed_planar_speed_mps =",
+            "observation.camera_azimuth = camera_azimuth;",
+            "observation.snapshot_fingerprint =\n"
+            "                live_flat_snapshot_fingerprint;",
+            "observation.preview_snapshot_fingerprint =\n"
+            "                manual_pick_preview_snapshot_fingerprint;",
+            "observation.previews = manual_pick_previews;",
+            "manual_pick_assist.observe(observation)",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, observation)
+        self.assertRegex(
+            observation,
+            r"interaction_registry\.find_by_id\(\s*"
+            r"manual_pick_assist\.diagnostics\(\)\.target\.id\s*\)",
+        )
+        self.assertIn(
+            "if (!manual_pick_assist_cancelled_this_tick)", observation
+        )
+        self.assertNotIn("manual_pick_assist_activation_tick", observation)
+        self.assertEqual(controller.count("manual_pick_assist.observe("), 1)
+        cached_output = observation[observation.index(
+            "manual_pick_assist_output = {};"
+        ):]
+        self.assertNotIn("manual_pick_assist_output.submit_interact", cached_output)
+        self.assertLess(
+            controller.index("        // Manual pick-assist observation ends."),
+            controller.index("interaction_scheduler.tick("),
+        )
+
+    def test_manual_pick_activation_observes_post_step_and_caches_next_tick_output(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        manual_input = self._source_between(
+            controller,
+            "        // Manual pick-assist input begins.",
+            "        // Manual pick-assist input ends.",
+        )
+        observation = self._source_between(
+            controller,
+            "        // Manual pick-assist observation begins.",
+            "        // Manual pick-assist observation ends.",
+        )
+        prior_output = self._source_between(
+            controller,
+            "        // Manual pick-assist prior output begins.",
+            "        // Manual pick-assist prior output ends.",
+        )
+
+        for required in (
+            "manual_pick_assist_activation_tick = true;",
+            "gamepadstick_left = vec3();",
+            "gamepadstick_right = vec3();",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, manual_input)
+        self.assertIn("if (!manual_pick_assist_cancelled_this_tick)", observation)
+        self.assertNotIn("manual_pick_assist_activation_tick", observation)
+        self.assertIn(
+            "manual_pick_assist_output.override_steering =\n"
+            "                observed_output.override_steering;",
+            observation,
+        )
+        self.assertIn(
+            "gamepadstick_left = manual_pick_assist_output.left_stick;",
+            prior_output,
+        )
+        self.assertLess(
+            controller.index("manual_pick_assist_activation_tick = true;"),
+            controller.index("interaction::LocomotionSnapshot live_flat_snapshot"),
+        )
+        self.assertLess(
+            controller.index("interaction::LocomotionSnapshot live_flat_snapshot"),
+            controller.index("manual_pick_assist.observe(observation)"),
+        )
+
+    def test_manual_pick_assist_submits_exactly_one_latched_request(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        observation = self._source_between(
+            controller,
+            "        // Manual pick-assist observation begins.",
+            "        // Manual pick-assist observation ends.",
+        )
+        submit_pulse = self._source_between(
+            observation,
+            "            if (observed_output.submit_interact)",
+            "            manual_pick_assist_output = {};",
+        )
+        self.assertIn("interaction_edges.interact_pressed = true;", submit_pulse)
+        self.assertIn("manual_pick_assist_synthetic_interact = true;", submit_pulse)
+
+        resolver = self._source_between(
+            controller,
+            "                [&](const interaction::LocomotionSnapshot& snapshot)\n"
+            "                    -> std::optional<interaction::PickRequest>",
+            "                [&](const interaction::LocomotionSnapshot& snapshot)\n"
+            "                    -> std::optional<interaction::ControllerPlaceTarget>",
+        )
+        submission = self._source_between(
+            resolver,
+            "                    // Manual pick-assist submission begins.",
+            "                    // Manual pick-assist submission ends.",
+        )
+        for required in (
+            "manual_pick_assist_synthetic_interact",
+            "manual_pick_assist.owns_manual_interact()",
+            "if (manual_pick_request.has_value())",
+            "++interaction_next_request_id;",
+            "return manual_pick_request;",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, submission)
+        self.assertRegex(
+            submission,
+            r"manual_pick_assist\.take_submission\(\s*"
+            r"interaction_next_request_id\s*\)",
+        )
+        self.assertNotIn("interaction_next_request_id++", submission)
+        self.assertLess(
+            resolver.index("// Manual pick-assist submission begins."),
+            resolver.index("if (!autodemo_configuration.has_value())"),
+        )
+        self.assertEqual(controller.count("manual_pick_assist.take_submission("), 1)
+
+    def test_manual_braking_uses_combined_stationary_search_only(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        search = self._source_between(
+            controller,
+            "        // Placement stationary search begins.",
+            "        // Placement stationary search ends.",
+        )
+        for required in (
+            "const bool manual_pick_stationary_constraint_active =",
+            "manual_pick_assist_output.stationary_constraint",
+            "interaction::RuntimeState::Locomotion",
+            "const bool manual_pick_stationary_constraint_latched_this_tick =",
+            "manual_pick_stationary_constraint_active &&",
+            "!manual_pick_stationary_constraint_was_active",
+            "const bool interaction_stationary_constraint_active =",
+            "placement_autodemo_state.stationary_constraint_active ||",
+            "manual_pick_stationary_constraint_active",
+            "manual_pick_stationary_constraint_latched_this_tick;",
+            "!interaction_stationary_constraint_active",
+            "if (interaction_stationary_constraint_active)",
+            "stationary_motion_matching::search(",
+            "best_index != frame_index ||",
+            "manual_pick_stationary_constraint_latched_this_tick",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, search)
+
+        constrained = self._source_between(
+            search,
+            "                if (interaction_stationary_constraint_active)",
+            "                else\n                {\n                    database_search(",
+        )
+        placement_counters = self._source_between(
+            constrained,
+            "                    // Placement stationary evidence counters begin.",
+            "                    // Placement stationary evidence counters end.",
+        )
+        for counter in (
+            "stationary_search_calls",
+            "stationary_selected_frame",
+            "stationary_selected_range",
+        ):
+            with self.subTest(counter=counter):
+                self.assertIn(counter, placement_counters)
+                self.assertEqual(constrained.count(counter), placement_counters.count(counter))
+
+    def test_manual_stationary_diagnostics_are_attempt_local_and_guarded(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        declaration = self._source_between(
+            controller,
+            "struct ManualPickStationaryDiagnostics",
+            "};",
+        )
+        for required in (
+            "uint64_t search_count = 0U;",
+            "uint64_t transition_count = 0U;",
+            "int selected_frame = -1;",
+            "float selected_cost = 0.0F;",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, declaration)
+
+        manual_input = self._source_between(
+            controller,
+            "        // Manual pick-assist input begins.",
+            "        // Manual pick-assist input ends.",
+        )
+        self.assertEqual(
+            manual_input.count("manual_pick_stationary_diagnostics = {};"),
+            2,
+            "only cancel and a successful new begin may clear manual history",
+        )
+        cancel = manual_input[:manual_input.index(
+            "            interaction_edges.interact_pressed &&"
+        )]
+        self.assertIn("manual_pick_stationary_diagnostics = {};", cancel)
+        successful_begin = self._source_between(
+            manual_input,
+            "                    if (manual_pick_assist.begin(start))",
+            "                    }\n                }",
+        )
+        self.assertIn(
+            "manual_pick_stationary_diagnostics = {};", successful_begin
+        )
+
+        search_update = self._source_between(
+            controller,
+            "                    // Manual stationary diagnostics search begins.",
+            "                    // Manual stationary diagnostics search ends.",
+        )
+        for required in (
+            "if (manual_pick_stationary_constraint_active)",
+            "++manual_pick_stationary_diagnostics.search_count;",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, search_update)
+        self.assertRegex(
+            search_update,
+            r"manual_pick_stationary_diagnostics\.selected_frame\s*=\s*"
+            r"best_index;",
+        )
+        self.assertRegex(
+            search_update,
+            r"manual_pick_stationary_diagnostics\.selected_cost\s*=\s*"
+            r"best_cost;",
+        )
+        self.assertNotIn("placement_autodemo_state", search_update)
+
+        transition_update = self._source_between(
+            controller,
+            "                    // Manual stationary diagnostics transition begins.",
+            "                    // Manual stationary diagnostics transition ends.",
+        )
+        self.assertIn(
+            "if (manual_pick_stationary_constraint_active)", transition_update
+        )
+        self.assertIn(
+            "++manual_pick_stationary_diagnostics.transition_count;",
+            transition_update,
+        )
+        self.assertNotIn("placement_autodemo_state", transition_update)
+        transition_branch = self._source_between(
+            controller,
+            "                if (best_index != frame_index ||",
+            "                    frame_index = best_index;",
+        )
+        self.assertLess(
+            transition_branch.index("inertialize_pose_transition("),
+            transition_branch.index(
+                "// Manual stationary diagnostics transition begins."
+            ),
+        )
+
+    def test_manual_pick_cancel_releases_same_tick_and_carry_controls_pass_through(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        manual_input = self._source_between(
+            controller,
+            "        // Manual pick-assist input begins.",
+            "        // Manual pick-assist input ends.",
+        )
+        cancel = self._source_between(
+            manual_input,
+            "        if (!autodemo_configuration.has_value() &&\n"
+            "            interaction_edges.cancel_pressed &&",
+            "        if (!autodemo_configuration.has_value() &&\n"
+            "            !manual_pick_assist_cancelled_this_tick &&\n"
+            "            interaction_edges.interact_pressed &&",
+        )
+        for required in (
+            "manual_pick_assist.owns_manual_interact()",
+            "manual_pick_assist.cancel();",
+            "interaction_edges.cancel_pressed = false;",
+            "manual_pick_assist_output = {};",
+            "manual_pick_assist_cancelled_this_tick = true;",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, cancel)
+        self.assertNotIn("RuntimeState::Carry", manual_input)
+
+        prior_output = self._source_between(
+            controller,
+            "        // Manual pick-assist prior output begins.",
+            "        // Manual pick-assist prior output ends.",
+        )
+        self.assertNotIn("cancel", prior_output)
+        self.assertLess(
+            controller.index("manual_pick_assist_output = {};", controller.index(
+                "// Manual pick-assist input begins."
+            )),
+            controller.index("// Manual pick-assist prior output begins."),
+        )
+
+        observation = self._source_between(
+            controller,
+            "        // Manual pick-assist observation begins.",
+            "        // Manual pick-assist observation ends.",
+        )
+        self.assertIn("!manual_pick_assist_cancelled_this_tick", observation)
+        carry = self._source_between(
+            controller,
+            "        if (!autodemo_configuration.has_value() &&",
+            "        // Get if strafe is desired",
+        )
+        self.assertIn("interaction::RuntimeState::Carry", carry)
+        self.assertIn("controller_place_staging_stick(", carry)
+
+    def test_manual_pick_cancel_dominates_simultaneous_f(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        manual_input = self._source_between(
+            controller,
+            "        // Manual pick-assist input begins.",
+            "        // Manual pick-assist input ends.",
+        )
+        cancel = manual_input[:manual_input.index(
+            "            interaction_edges.interact_pressed &&"
+        )]
+        self.assertIn("interaction_edges.interact_pressed = false;", cancel)
+        self.assertIn(
+            "if (!autodemo_configuration.has_value() &&\n"
+            "            !manual_pick_assist_cancelled_this_tick &&\n"
+            "            interaction_edges.interact_pressed &&",
+            manual_input,
+        )
+        self.assertLess(
+            manual_input.index("manual_pick_assist.cancel();"),
+            manual_input.index("!manual_pick_assist_cancelled_this_tick"),
+        )
+
+    def test_manual_pick_assist_draws_acceptance_diagnostics_without_pose_writes(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        self.assertIn(
+            "float manual_pick_object_distance_at_begin_m = 0.0F;",
+            controller,
+        )
+        manual_input = self._source_between(
+            controller,
+            "        // Manual pick-assist input begins.",
+            "        // Manual pick-assist input ends.",
+        )
+        self.assertGreaterEqual(
+            manual_input.count("manual_pick_object_distance_at_begin_m = 0.0F;"),
+            2,
+            "cancel and retry must both clear the prior acceptance distance",
+        )
+        self.assertIn("if (manual_pick_assist.begin(start))", manual_input)
+        self.assertIn(
+            "manual_pick_object_distance_at_begin_m =\n"
+            "                            autodemo_planar_distance(",
+            manual_input,
+        )
+
+        route = self._source_between(
+            controller,
+            "        // Manual pick-assist route rendering begins.",
+            "        // Manual pick-assist route rendering ends.",
+        )
+        for required in (
+            "manual_pick_assist.active() ||",
+            "manual_pick_final_preview_certified_this_tick",
+            "DrawLine3D(",
+            "bone_positions(0)",
+            "manual_pick_common_entry",
+            "manual_pick_entry_slots.ordered[",
+            "interaction::PickAssistState::ReadyToSubmit",
+            "? GREEN",
+            "DrawSphereWires(",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, route)
+
+        diagnostics = self._source_between(
+            controller,
+            "        // Manual pick-assist diagnostics begins.",
+            "        // Manual pick-assist diagnostics ends.",
+        )
+        for required in (
+            '"assist=%s reason=%s slot=%d settle=%u/%u route=%.3fm "',
+            '"object_distance_at_begin=%.3fm"',
+            "interaction::pick_assist_state_name(",
+            "interaction::pick_assist_reason_name(",
+            "manual_pick_assist_config.required_settle_ticks",
+            "manual_pick_object_distance_at_begin_m",
+            '"error=%.3fm yaw=%.2fdeg speed=%.3fm/s"',
+            "diagnostics.yaw_error_radians * 180.0F / PIf",
+            '"final=%d fp_equal=%d roots_finite=%d root_equal=%d"',
+            '"path=%d/%s match=%d/%s"',
+            '"entry=%d contact=%d cost=%.3f"',
+            "manual_pick_diagnostics.final_preview.available",
+            "manual_pick_diagnostics.final_preview.fingerprint_equal",
+            "manual_pick_diagnostics.final_preview.path_feasible",
+            "manual_pick_diagnostics.final_preview.path_reason",
+            "manual_pick_diagnostics.final_preview.match_ready",
+            "manual_pick_diagnostics.final_preview.match_reason",
+            "manual_pick_diagnostics.final_preview.feasible_entry_frame",
+            "manual_pick_diagnostics.final_preview.contact_frame",
+            "manual_pick_diagnostics.final_preview.total_cost",
+            "interaction::debug_draw::reason_name(",
+            '"stationary searches=%llu transitions=%llu frame=%d cost=%.3f"',
+            "manual_pick_stationary_diagnostics.search_count",
+            "manual_pick_stationary_diagnostics.transition_count",
+            "manual_pick_stationary_diagnostics.selected_frame",
+            "manual_pick_stationary_diagnostics.selected_cost",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, diagnostics)
+        self.assertRegex(
+            diagnostics,
+            r"manual_pick_diagnostics\.final_preview\s*"
+            r"\.all_preview_roots_finite",
+        )
+        self.assertRegex(
+            diagnostics,
+            r"manual_pick_diagnostics\.final_preview\s*"
+            r"\.prospective_root_equal",
+        )
+        self.assertLess(
+            controller.index("interaction::debug_draw::draw_interaction_text("),
+            controller.index("// Manual pick-assist diagnostics begins."),
+        )
+        for forbidden in (
+            "simulation_position =",
+            "simulation_rotation =",
+            "bone_positions(0) =",
+            "bone_rotations(0) =",
+            "interaction_registry.replace_pose(",
+            "interaction_registry.reset(",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, route + diagnostics)
+
+    def test_live_flat_pick_oracle_sources_are_explicit_prerequisites(self):
+        makefile = Path("Makefile").read_text(encoding="utf-8")
+        for target in (
+            "$(LIVE_FLAT_PICK_ENTRY_ORACLE_TEST)",
+            "$(LIVE_FLAT_PICK_ENTRY_ORACLE_RELEASE_TEST)",
+        ):
+            with self.subTest(target=target):
+                prerequisites = self._source_between(
+                    makefile,
+                    f"{target}:",
+                    "\n\t",
+                )
+                self.assertIn(
+                    "$(LIVE_FLAT_PICK_ASSIST_SOURCES)",
+                    prerequisites,
+                )
+
+    def test_real_pack_oracle_covers_manual_assist_route_and_one_shot_handoff(self):
+        oracle = Path("tests/cpp/test_live_flat_pick_entry_oracle.cpp").read_text(
+            encoding="utf-8"
+        )
+        makefile = Path("Makefile").read_text(encoding="utf-8")
+        for include in (
+            '#include "interaction_pick_assist.h"',
+            '#include "interaction_pick_approach.h"',
+            '#include "locomotion_controller_update.h"',
+        ):
+            with self.subTest(include=include):
+                self.assertIn(include, oracle)
+        witness = self._cpp_function(
+            oracle, "void run_manual_pick_assist_oracle("
+        )
+        for required in (
+            "root_to_object_m > 1.00F",
+            "root_to_object_m <= 1.45F",
+            "registry.resolve_single_target(\n            start_position, 1.45F)",
+            "assist.begin(start)",
+            "diagnostics.slot_route_lengths_m",
+            "assist_config.maximum_assisted_path_m",
+            "preview_pick(",
+            "preview.path_feasible && preview.match_ready",
+            "const bool activation_tick = assist_tick == 0U;",
+            "if (!activation_tick &&\n"
+            "            prior_assist_output.override_steering)",
+            "desired_velocity_update(",
+            "desired_rotation_update(",
+            "simulation_positions_update(",
+            "simulation_rotations_update(",
+            "maximum_tick_displacement_m",
+            "prior_assist_output.needs_preview",
+            "locomotion_snapshot_fingerprint(live_flat_snapshot)",
+            "assist.observe(observation)",
+            "settled_observation_count == 5U",
+            "stationary_constraint_edges == 1U",
+            "stationary_output_applied_ticks > 0U",
+            "interaction::ControllerInteractionScheduler scheduler",
+            "provider_calls_before_certification",
+            "resolver_calls_before_certification",
+            "assist.take_submission(next_request_id)",
+            "if (request.has_value())",
+            "++next_request_id",
+            "certified_provider_snapshot_fingerprint ==\n"
+            "                    live_flat_snapshot_fingerprint",
+            "submission_count == 1U",
+            "RuntimeState::Preflight",
+            "RuntimeState::Align",
+            "Reason::TargetUnavailable",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, witness)
+        for forbidden in (
+            "observation.displayed_root = {\n        common_entry",
+            "observation.displayed_root = frozen_slot.waypoint",
+            "const interaction::LocomotionSnapshot settled_snapshot",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, witness)
+        self.assertIn(
+            "run_manual_pick_assist_oracle(\n"
+            "            flat_database, interaction_database, interaction_features, bridge);",
+            oracle,
+        )
+        for source in (
+            "interaction_pick_assist.cpp",
+            "interaction_pick_approach.cpp",
+            "interaction_arrival.cpp",
+            "locomotion_controller_update.cpp",
+        ):
+            with self.subTest(source=source):
+                self.assertGreaterEqual(makefile.count(source), 3)
+        self.assertIn(
+            "locomotion_controller_update.h", makefile
         )
 
     def test_readme_documents_manual_destination_and_reversed_pickup(self):
@@ -2483,6 +3248,23 @@ class Task12PolicyTests(unittest.TestCase):
         ):
             with self.subTest(required=required):
                 self.assertIn(required, readme)
+
+    def test_readme_documents_manual_pick_assist_contract(self):
+        readme = Path("README.md").read_text(encoding="utf-8")
+        normalized_readme = " ".join(readme.split())
+        for required in (
+            "bounded 1.45 m root-to-object acquisition query",
+            "assisted route remains at most 1.00 m",
+            "ordinary flat-ground locomotion",
+            "both live entry-slot previews",
+            "five consecutive settled 25 Hz ticks",
+            "exactly one pickup request",
+            "`X` cancels any pre-submission assist",
+            "Carry keeps the existing `F` placement controls",
+            "object_distance_at_begin",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, normalized_readme)
 
     def test_controller_uses_exact_23_pose_bridge_and_flat_toe_indices(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")
@@ -2559,25 +3341,62 @@ class Task12PolicyTests(unittest.TestCase):
             "controller must lock the actual flat right toe (index 9)",
         )
 
-        self.assertIn(
-            "std::optional<interaction::Pose> latest_owned_interaction_pose;",
-            controller,
-            "controller must cache the exact prior owned G1 handoff pose",
-        )
-        self.assertIn(
-            "latest_owned_interaction_pose = interaction_output.pose;",
-            controller,
-            "owned frames must cache the raw G1 runtime reference",
-        )
         self.assertNotIn(
-            "latest_owned_interaction_pose = interaction_debug_pose;",
+            "latest_owned_interaction_pose",
             controller,
-            "reconstructed debug poses must never become runtime authority",
+            "flat/G1 calibration must never follow a dynamic owned pose",
+        )
+        canonical_init = controller.index(
+            "        initialize_autodemo_canonical_world();"
+        )
+        flat_reference_capture = controller.index(
+            "const interaction::FlatControllerPose\n"
+            "        interaction_flat_reference_pose = [&]()"
+        )
+        self.assertLess(
+            canonical_init,
+            flat_reference_capture,
+            "the flat reference must be captured after canonical pickup init",
+        )
+        self.assertEqual(
+            controller.count("interaction_flat_reference_pose ="),
+            1,
+            "the calibrated flat reference must be frozen exactly once",
+        )
+        fixed_pair = controller[flat_reference_capture:]
+        self.assertIn("reference.velocities.fill(vec3());", fixed_pair)
+        self.assertIn("reference.angular_velocities.fill(vec3());", fixed_pair)
+        for channel in (
+            "positions", "velocities", "rotations", "angular_velocities"
+        ):
+            with self.subTest(root_channel=channel):
+                self.assertIn(
+                    f"interaction_reference_pose.{channel}[interaction_root] =\n"
+                    f"        interaction_flat_reference_pose.{channel}[0];",
+                    fixed_pair,
+                    "the true-G1 reference root must be scene-aligned to flat",
+                )
+        self.assertRegex(
+            controller,
+            r"expand_flat_controller_pose\(\s*flat_locomotion_pose,\s*"
+            r"interaction_reference_pose,\s*interaction_flat_reference_pose\s*\)",
+            "ordinary live snapshots must use the frozen reference pair",
+        )
+        self.assertRegex(
+            controller,
+            r"expand_flat_controller_pose\(\s*interaction_frame_state\.pose,\s*"
+            r"interaction_reference_pose,\s*interaction_flat_reference_pose\s*\)",
+            "debug reconstruction must use the same frozen reference pair",
         )
         self.assertIn(
-            "latest_owned_interaction_pose.reset();",
+            "if (use_autodemo_canonical_snapshot)",
             controller,
-            "release must clear the prior owned reference",
+            "canonical pickup must retain its exact snapshot exception",
+        )
+        self.assertIn(
+            "return autodemo_canonical_entry->snapshot;",
+            controller,
+            "canonical pickup must bypass ordinary live reconstruction",
         )
 
     def test_flat_joint_names_match_character_h_order(self):
@@ -3036,6 +3855,100 @@ class Task12PolicyTests(unittest.TestCase):
         self.assertNotIn("interaction_registry.replace_pose", constraint_block)
         self.assertNotIn("interaction_registry.reset", constraint_block)
         self.assertNotIn("interaction_registry.upsert", constraint_block)
+
+    def test_selected_grasp_constraint_covers_targeted_reach_but_not_free(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        constraint_block = self._source_between(
+            controller,
+            "        const interaction::InteractionTarget* selected_constraint_target =",
+            "        interaction_frame_state = interaction_frame_handoff.apply(",
+        )
+        predicate = self._source_between(
+            constraint_block,
+            "        if (selected_constraint_target != nullptr &&",
+            "        {\n            interaction::ControllerInteractionHandConstraint constraint;",
+        )
+        self.assertEqual(
+            " ".join(predicate.split()),
+            "if (selected_constraint_target != nullptr && "
+            "interaction_scene_target == selected_constraint_target && "
+            "selected_affordance != nullptr && "
+            "(selected_constraint_target->state == "
+            "interaction::ObjectState::Targeted || "
+            "selected_constraint_target->state == "
+            "interaction::ObjectState::Attached || "
+            "selected_constraint_target->state == "
+            "interaction::ObjectState::Held) && "
+            "selected_affordance->hand == "
+            "interaction_output.diagnostics.hand)",
+            "the selected grasp gate must admit exactly the Targeted/Attached/Held "
+            "union and reject Free before constructing a final-rig constraint",
+        )
+
+    def test_both_evidence_writers_use_the_exact_positive_weight_rejection_guard(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        helper = self._cpp_function(
+            controller,
+            "bool autodemo_hand_constraint_evidence_valid(",
+        )
+        helper_predicate = self._source_between(
+            helper,
+            "    return autodemo_is_finite(capture.hand_constraint_weight)",
+            ";\n}",
+        )
+        self.assertEqual(
+            " ".join(helper_predicate.split()),
+            "return autodemo_is_finite(capture.hand_constraint_weight) && "
+            "capture.hand_constraint_weight >= 0.0F && "
+            "capture.hand_constraint_weight <= 1.0F && "
+            "(capture.hand_constraint_weight == 0.0F || "
+            "(capture.hand_constraint_validated && "
+            "capture.hand_constraint_result.applied && "
+            "capture.hand_constraint_result.reachable))",
+            "zero weight must be the only no-solve exception; every positive "
+            "weight must require the same-frame validated/applied/reachable conjunction",
+        )
+
+        helper_call = "!autodemo_hand_constraint_evidence_valid(capture)"
+        for name, signature in (
+            ("pickup", "void write_autodemo_record("),
+            ("placement", "void write_placement_autodemo_record("),
+        ):
+            with self.subTest(writer=name):
+                writer = self._cpp_function(controller, signature)
+                rejection_predicate = self._source_between(
+                    writer,
+                    "    if (scheduler_phase != 0 ||",
+                    "    {\n        throw std::runtime_error",
+                )
+                normalized = " ".join(rejection_predicate.split())
+                self.assertEqual(
+                    rejection_predicate.count(helper_call),
+                    1,
+                    "each writer's primary pre-publication rejection predicate "
+                    "must invoke the shared final-FK guard exactly once",
+                )
+                self.assertIn(
+                    f"|| {helper_call} ||",
+                    normalized,
+                    "invalid hand-constraint evidence must be a negated top-level "
+                    "OR rejection term, not an unrelated or permissive helper call",
+                )
+                self.assertEqual(
+                    writer.count(helper_call),
+                    1,
+                    "the writer must not satisfy the source contract with an "
+                    "irrelevant duplicate helper call",
+                )
+                guard_call = writer.index(helper_call)
+                rejection = writer.index("throw std::runtime_error", guard_call)
+                publication = writer.index("output <<", rejection)
+                self.assertLess(guard_call, rejection)
+                self.assertLess(
+                    rejection,
+                    publication,
+                    "the rejecting guard must execute before JSON publication",
+                )
 
     def test_canonical_row_invariant_is_limited_to_locomotion_prefix(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")

@@ -16,9 +16,14 @@
 #include "nnet.h"
 #include "lmm.h"
 #include "interaction_controller_adapter.h"
+#include "interaction_arrival.h"
 #include "interaction_debug_draw.h"
+#include "interaction_pick_assist.h"
+#include "interaction_pick_approach.h"
 #include "interaction_runtime.h"
+#include "locomotion_controller_update.h"
 #include "locomotion_timing.h"
+#include "stationary_motion_matching.h"
 
 #include <algorithm>
 #include <array>
@@ -35,6 +40,7 @@
 #include <initializer_list>
 #include <locale>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -295,31 +301,6 @@ void desired_gait_update(
         dt);
 }
 
-vec3 desired_velocity_update(
-    const vec3 gamepadstick_left,
-    const float camera_azimuth,
-    const quat simulation_rotation,
-    const float fwrd_speed,
-    const float side_speed,
-    const float back_speed)
-{
-    // Find stick position in world space by rotating using camera azimuth
-    vec3 global_stick_direction = quat_mul_vec3(
-        quat_from_angle_axis(camera_azimuth, vec3(0, 1, 0)), gamepadstick_left);
-    
-    // Find stick position local to current facing direction
-    vec3 local_stick_direction = quat_inv_mul_vec3(
-        simulation_rotation, global_stick_direction);
-    
-    // Scale stick by forward, sideways and backwards speeds
-    vec3 local_desired_velocity = local_stick_direction.z > 0.0 ?
-        vec3(side_speed, 0.0f, fwrd_speed) * local_stick_direction :
-        vec3(side_speed, 0.0f, back_speed) * local_stick_direction;
-    
-    // Re-orientate into the world space
-    return quat_mul_vec3(simulation_rotation, local_desired_velocity);
-}
-
 vec3 controller_place_staging_stick(
     const interaction::PlaceStagingPreview& preview,
     const interaction::Transform& current_root,
@@ -369,45 +350,26 @@ vec3 controller_place_staging_stick(
     return quat_inv_mul_vec3(camera_control_basis, world_command);
 }
 
-quat desired_rotation_update(
-    const quat desired_rotation,
-    const vec3 gamepadstick_left,
-    const vec3 gamepadstick_right,
-    const float camera_azimuth,
-    const bool desired_strafe,
-    const vec3 desired_velocity)
+vec3 controller_world_navigation_stick(
+    vec3 target_world,
+    vec3 current_world,
+    float camera_azimuth,
+    float slow_radius_m)
 {
-    quat desired_rotation_curr = desired_rotation;
-    
-    // If strafe is active then desired direction is coming from right
-    // stick as long as that stick is being used, otherwise we assume
-    // forward facing
-    if (desired_strafe)
+    vec3 world_command = target_world - current_world;
+    world_command.y = 0.0F;
+    const float distance_m = length(world_command);
+    if (distance_m <= 1.0e-5F)
     {
-        vec3 desired_direction = quat_mul_vec3(quat_from_angle_axis(camera_azimuth, vec3(0, 1, 0)), vec3(0, 0, -1));
-
-        if (length(gamepadstick_right) > 0.01f)
-        {
-            desired_direction = quat_mul_vec3(quat_from_angle_axis(camera_azimuth, vec3(0, 1, 0)), normalize(gamepadstick_right));
-        }
-        
-        return quat_from_angle_axis(atan2f(desired_direction.x, desired_direction.z), vec3(0, 1, 0));            
+        return vec3();
     }
-    
-    // If strafe is not active the desired direction comes from the left 
-    // stick as long as that stick is being used
-    else if (length(gamepadstick_left) > 0.01f)
-    {
-        
-        vec3 desired_direction = normalize(desired_velocity);
-        return quat_from_angle_axis(atan2f(desired_direction.x, desired_direction.z), vec3(0, 1, 0));
-    }
-    
-    // Otherwise desired direction remains the same
-    else
-    {
-        return desired_rotation_curr;
-    }
+    const float magnitude = slow_radius_m > 0.0F
+        ? clampf(distance_m / slow_radius_m, 0.15F, 1.0F)
+        : 1.0F;
+    world_command = magnitude * normalize(world_command);
+    const quat camera_control_basis = quat_from_angle_axis(
+        camera_azimuth, vec3(0.0F, 1.0F, 0.0F));
+    return quat_inv_mul_vec3(camera_control_basis, world_command);
 }
 
 //--------------------------------------
@@ -710,86 +672,6 @@ void query_compute_trajectory_direction_feature(
 }
 
 //--------------------------------------
-
-// Collide against the obscales which are
-// essentially bounding boxes of a given size
-vec3 simulation_collide_obstacles(
-    const vec3 prev_pos,
-    const vec3 next_pos,
-    const slice1d<vec3> obstacles_positions,
-    const slice1d<vec3> obstacles_scales,
-    const float radius = 0.6f)
-{
-    vec3 dx = next_pos - prev_pos;
-    vec3 proj_pos = prev_pos;
-    
-    // Substep because I'm too lazy to implement CCD
-    int substeps = 1 + (int)(length(dx) * 5.0f);
-    
-    for (int j = 0; j < substeps; j++)
-    {
-        proj_pos = proj_pos + dx / substeps;
-        
-        for (int i = 0; i < obstacles_positions.size; i++)
-        {
-            // Find nearest point inside obscale and push out
-            vec3 nearest = clamp(proj_pos, 
-              obstacles_positions(i) - 0.5f * obstacles_scales(i),
-              obstacles_positions(i) + 0.5f * obstacles_scales(i));
-
-            if (length(nearest - proj_pos) < radius)
-            {
-                proj_pos = radius * normalize(proj_pos - nearest) + nearest;
-            }
-        }
-    } 
-    
-    return proj_pos;
-}
-
-// Taken from https://theorangeduck.com/page/spring-roll-call#controllers
-void simulation_positions_update(
-    vec3& position, 
-    vec3& velocity, 
-    vec3& acceleration, 
-    const vec3 desired_velocity, 
-    const float halflife, 
-    const float dt,
-    const slice1d<vec3> obstacles_positions,
-    const slice1d<vec3> obstacles_scales)
-{
-    float y = halflife_to_damping(halflife) / 2.0f; 
-    vec3 j0 = velocity - desired_velocity;
-    vec3 j1 = acceleration + j0*y;
-    float eydt = fast_negexpf(y*dt);
-    
-    vec3 position_prev = position;
-
-    position = eydt*(((-j1)/(y*y)) + ((-j0 - j1*dt)/y)) + 
-        (j1/(y*y)) + j0/y + desired_velocity * dt + position_prev;
-    velocity = eydt*(j0 + j1*dt) + desired_velocity;
-    acceleration = eydt*(acceleration - j1*y*dt);
-    
-    position = simulation_collide_obstacles(
-        position_prev, 
-        position,
-        obstacles_positions,
-        obstacles_scales);
-}
-
-void simulation_rotations_update(
-    quat& rotation, 
-    vec3& angular_velocity, 
-    const quat desired_rotation, 
-    const float halflife, 
-    const float dt)
-{
-    simple_spring_damper_exact(
-        rotation, 
-        angular_velocity, 
-        desired_rotation, 
-        halflife, dt);
-}
 
 // Predict what the desired velocity will be in the 
 // future. Here we need to use the future trajectory 
@@ -1407,8 +1289,15 @@ void save_matching_features_checked(
     }
 }
 
+enum class AutodemoMode
+{
+    Pickup,
+    Placement,
+};
+
 struct AutodemoConfiguration
 {
+    AutodemoMode mode = AutodemoMode::Pickup;
     std::filesystem::path log_final;
     std::filesystem::path log_temporary;
     std::filesystem::path log_backup;
@@ -1433,6 +1322,18 @@ struct AutodemoEvidenceCapture
     std::array<vec3, interaction::kFlatControllerBoneCount> joint_positions{};
     std::array<quat, interaction::kFlatControllerBoneCount> joint_rotations{};
 };
+
+bool autodemo_hand_constraint_evidence_valid(
+    const AutodemoEvidenceCapture& capture)
+{
+    return autodemo_is_finite(capture.hand_constraint_weight) &&
+        capture.hand_constraint_weight >= 0.0F &&
+        capture.hand_constraint_weight <= 1.0F &&
+        (capture.hand_constraint_weight == 0.0F ||
+         (capture.hand_constraint_validated &&
+          capture.hand_constraint_result.applied &&
+          capture.hand_constraint_result.reachable));
+}
 
 constexpr std::array<const char*, interaction::kFlatControllerBoneCount>
     kAutodemoFlatJointNames = {
@@ -1501,7 +1402,10 @@ AutodemoEvidenceCapture capture_autodemo_evidence(
     const bool interaction_owned_state =
         state == interaction::RuntimeState::PickupReplay ||
         state == interaction::RuntimeState::Hold ||
-        state == interaction::RuntimeState::Carry;
+        state == interaction::RuntimeState::Carry ||
+        state == interaction::RuntimeState::PlacePreflight ||
+        state == interaction::RuntimeState::PlaceAlign ||
+        state == interaction::RuntimeState::PlaceReplay;
     const bool selected_target_agrees =
         scene_target != nullptr &&
         runtime_output.diagnostics.target == scene_target->handle;
@@ -1560,13 +1464,26 @@ void autodemo_require_parent_directory(
 std::optional<AutodemoConfiguration> parse_autodemo_environment()
 {
     const char* autodemo_value = std::getenv("MM_INTERACTION_AUTODEMO");
-    if (autodemo_value == nullptr)
+    const char* placement_autodemo_value =
+        std::getenv("MM_INTERACTION_PLACE_AUTODEMO");
+    if (autodemo_value == nullptr && placement_autodemo_value == nullptr)
     {
         return std::nullopt;
     }
-    if (std::string(autodemo_value) != "1")
+    if (autodemo_value != nullptr && placement_autodemo_value != nullptr)
+    {
+        throw std::runtime_error(
+            "pickup and placement auto-demo modes are mutually exclusive");
+    }
+    if (autodemo_value != nullptr && std::string(autodemo_value) != "1")
     {
         throw std::runtime_error("MM_INTERACTION_AUTODEMO must equal 1");
+    }
+    if (placement_autodemo_value != nullptr &&
+        std::string(placement_autodemo_value) != "1")
+    {
+        throw std::runtime_error(
+            "MM_INTERACTION_PLACE_AUTODEMO must equal 1");
     }
 
     const char* log_value = std::getenv("MM_INTERACTION_LOG");
@@ -1583,6 +1500,9 @@ std::optional<AutodemoConfiguration> parse_autodemo_environment()
     }
 
     AutodemoConfiguration configuration;
+    configuration.mode = placement_autodemo_value != nullptr
+        ? AutodemoMode::Placement
+        : AutodemoMode::Pickup;
     configuration.log_final = std::filesystem::path(log_value);
     configuration.screenshot_final =
         std::filesystem::path(screenshot_value);
@@ -1995,8 +1915,12 @@ AutodemoCanonicalEntry make_autodemo_canonical_entry(
 enum class AutodemoAction
 {
     None,
+    Approach,
     Interact,
     Forward,
+    LatchDestination,
+    Stage,
+    Place,
     Reset,
 };
 
@@ -2012,8 +1936,12 @@ const char* autodemo_action_name(AutodemoAction action)
     switch (action)
     {
     case AutodemoAction::None: return "none";
+    case AutodemoAction::Approach: return "approach";
     case AutodemoAction::Interact: return "interact";
     case AutodemoAction::Forward: return "forward";
+    case AutodemoAction::LatchDestination: return "latch_destination";
+    case AutodemoAction::Stage: return "stage";
+    case AutodemoAction::Place: return "place";
     case AutodemoAction::Reset: return "reset";
     }
     return "none";
@@ -2062,9 +1990,577 @@ struct ControllerAutodemoState
     std::string failure;
 };
 
+constexpr uint64_t kPlacementAutodemoMaximumEvidenceFrames = 900U;
+constexpr uint32_t kPlacementAutodemoMinimumWalkTicks = 25U;
+constexpr uint32_t kPlacementAutodemoMaximumWalkTicks = 250U;
+constexpr uint32_t kPlacementAutodemoSettleTicks = 5U;
+constexpr float kPlacementAutodemoInitialDistanceM = 2.80F;
+constexpr float kPlacementAutodemoMinimumWalkDisplacementM = 2.00F;
+constexpr float kPlacementAutodemoSettleMaximumSpeedMps = 0.10F;
+constexpr float kPlacementAutodemoReachEntryDistanceM = 0.60F;
+constexpr float kPlacementAutodemoReachEntryToleranceM = 0.12F;
+constexpr float kPlacementAutodemoAlignmentPositionErrorM = 0.15F;
+constexpr interaction::ArrivalConfig kPlacementAutodemoArrivalConfig{};
+constexpr float kPlacementAutodemoReachYawErrorRadians =
+    20.0F * PIf / 180.0F;
+constexpr float kPlacementAutodemoNavigationSlowRadiusM = 0.35F;
+constexpr uint32_t kPlacementAutodemoMinimumCarryTicks = 25U;
+constexpr uint32_t kPlacementAutodemoMaximumCarryTicks = 150U;
+constexpr uint32_t kPlacementAutodemoPickupToCarryTicks = 375U;
+constexpr uint32_t kPlacementAutodemoPlaceTicks = 250U;
+// Keep the placement demo alive through the complete 0.50 s post-release
+// arm return, then require three frames fully relinquished to ordinary
+// locomotion before publication. "Settled" here means no interaction pose
+// overlay; the locomotion database may still contain natural idle motion.
+// This is intentionally separate from pickup's seven-frame, unlogged Reset
+// presentation drain above.
+constexpr uint32_t kPlacementAutodemoReturnFrames = 15U;
+constexpr uint32_t kPlacementAutodemoSettledFrames = 3U;
+constexpr uint32_t kPlacementAutodemoHandoffFrames =
+    kPlacementAutodemoReturnFrames +
+    kPlacementAutodemoSettledFrames;
+constexpr uint32_t kPlacementAutodemoMaximumHandoffFrames = 75U;
+static_assert(
+    kPlacementAutodemoReturnFrames ==
+        locomotion_timing::ticks_for_milliseconds(600U));
+static_assert(
+    kPlacementAutodemoSettledFrames ==
+        locomotion_timing::ticks_for_milliseconds(120U));
+static_assert(kPlacementAutodemoHandoffFrames == 18U);
+static_assert(
+    kPlacementAutodemoMaximumHandoffFrames ==
+        locomotion_timing::ticks_for_milliseconds(3000U));
+
+enum class PlacementPickPreviewFailure : uint8_t
+{
+    None,
+    NoPath,
+    Deadline,
+};
+
+const char* placement_pick_preview_failure_name(
+    PlacementPickPreviewFailure failure)
+{
+    switch (failure)
+    {
+    case PlacementPickPreviewFailure::None: return "none";
+    case PlacementPickPreviewFailure::NoPath: return "no_path";
+    case PlacementPickPreviewFailure::Deadline: return "deadline";
+    }
+    throw std::runtime_error(
+        "placement pickup preview has an invalid pending failure");
+}
+
+const char* placement_pick_preview_reason_name(interaction::Reason reason)
+{
+    switch (reason)
+    {
+    case interaction::Reason::None: return "None";
+    case interaction::Reason::PackUnavailable: return "PackUnavailable";
+    case interaction::Reason::TargetUnavailable: return "TargetUnavailable";
+    case interaction::Reason::TargetChanged: return "TargetChanged";
+    case interaction::Reason::OutOfRange: return "OutOfRange";
+    case interaction::Reason::NoCandidate: return "NoCandidate";
+    case interaction::Reason::PoorMatch: return "PoorMatch";
+    case interaction::Reason::BlockedPath: return "BlockedPath";
+    case interaction::Reason::CorrectionLimit: return "CorrectionLimit";
+    case interaction::Reason::Cancelled: return "Cancelled";
+    case interaction::Reason::ContactPosition: return "ContactPosition";
+    case interaction::Reason::ContactOrientation:
+        return "ContactOrientation";
+    case interaction::Reason::JointLimit: return "JointLimit";
+    case interaction::Reason::LostContact: return "LostContact";
+    case interaction::Reason::ClipEnded: return "ClipEnded";
+    case interaction::Reason::Reset: return "Reset";
+    case interaction::Reason::SurfaceUnavailable: return "SurfaceUnavailable";
+    case interaction::Reason::SurfaceChanged: return "SurfaceChanged";
+    case interaction::Reason::PlacementOutOfBounds:
+        return "PlacementOutOfBounds";
+    case interaction::Reason::ReleasePosition: return "ReleasePosition";
+    case interaction::Reason::ReleaseOrientation: return "ReleaseOrientation";
+    }
+    throw std::runtime_error(
+        "placement pickup preview has an invalid reason");
+}
+
+struct ControllerPlacementAutodemoState
+{
+    interaction::Transform reach_waypoint{};
+    interaction::PickEntrySlots pick_entry_slots{};
+    std::array<interaction::PickEntryPreview, 2> pick_entry_previews{};
+    interaction::Transform interaction_waypoint{};
+    vec3 reach_entry_point{};
+    std::optional<interaction::PlaceStagingPreview> live_preview{};
+    interaction::PlacementFit final_actual_fit{};
+    vec3 walking_origin{};
+    vec3 previous_displayed_root{};
+    vec3 carry_origin_root{};
+    vec3 carry_origin_object{};
+    vec3 left_stick_command{};
+    uint64_t render_frame = 0U;
+    int64_t pick_preview_epoch = -1;
+    int64_t pick_preview_consumed_epoch = -1;
+    uint64_t pick_preview_epoch_count = 0U;
+    uint64_t pick_preview_snapshot_fingerprint = 0U;
+    uint32_t walk_ticks = 0U;
+    uint32_t pick_preview_elapsed_ticks = 0U;
+    uint32_t settle_ticks = 0U;
+    uint32_t pickup_to_carry_ticks = 0U;
+    uint32_t carry_staging_ticks = 0U;
+    uint32_t place_ticks = 0U;
+    uint32_t post_entry_ticks = 0U;
+    uint32_t handoff_frames_remaining = 0U;
+    uint32_t handoff_frames_recorded = 0U;
+    uint32_t post_release_settled_frames_recorded = 0U;
+    uint64_t runtime_preview_calls = 0U;
+    uint64_t runtime_pick_preview_calls = 0U;
+    uint64_t pick_preview_mutation_count = 0U;
+    uint64_t locomotion_provider_calls = 0U;
+    uint64_t live_flat_provider_calls = 0U;
+    uint64_t canonical_snapshot_provider_calls = 0U;
+    uint64_t root_relocation_calls = 0U;
+    uint64_t simulation_root_initialization_calls = 0U;
+    uint64_t displayed_root_initialization_calls = 0U;
+    uint64_t pick_resolver_calls = 0U;
+    uint64_t placement_surface_resolver_calls = 0U;
+    uint64_t free_selector_calls = 0U;
+    uint64_t external_match_input_calls = 0U;
+    uint64_t preview_mutation_count = 0U;
+    uint64_t direct_root_write_calls = 0U;
+    uint64_t initial_far_selection_id = 0U;
+    uint64_t current_selection_id = 0U;
+    uint64_t submitted_selection_id = 0U;
+    uint64_t preview_ik_fingerprint = 0U;
+    uint64_t pick_interact_submission_count = 0U;
+    uint64_t pick_reservation_transition_count = 0U;
+    uint32_t attachment_transition_count = 0U;
+    uint32_t attached_to_free_transition_count = 0U;
+    uint64_t stationary_candidate_count = 0U;
+    uint64_t stationary_search_calls = 0U;
+    uint64_t stationary_transition_count = 0U;
+    int stationary_selected_frame = -1;
+    int stationary_selected_range = -1;
+    float initial_pickup_distance_m = 0.0F;
+    float last_root_speed_mps = 0.0F;
+    float interaction_lateral_offset_m = 0.0F;
+    float brake_simulation_speed_mps = 0.0F;
+    bool origin_captured = false;
+    bool evidence_started = false;
+    bool interact_pulsed = false;
+    bool reach_entry_reached = false;
+    bool reach_braking = false;
+    bool stationary_constraint_active = false;
+    bool destination_latched = false;
+    bool last_provider_was_live_flat = false;
+    bool pick_resolver_used_live_flat = false;
+    bool destination_generation_changed_before_place = false;
+    bool initial_preview_verified = false;
+    bool place_observed = false;
+    bool actual_fit_captured = false;
+    bool final_support_sweep_clear = false;
+    bool destination_support_committed = false;
+    bool attachment_initialized = false;
+    bool last_attached = false;
+    std::optional<size_t> frozen_pick_entry_index{};
+    std::optional<uint64_t> pick_entry_freeze_tick{};
+    PlacementPickPreviewFailure pending_pick_preview_failure =
+        PlacementPickPreviewFailure::None;
+    bool pick_preview_failure_recorded = false;
+    bool final_record_written = false;
+    bool screenshot_captured = false;
+    std::vector<interaction::RuntimeState> collapsed_states;
+};
+
+struct ManualPickStationaryDiagnostics
+{
+    uint64_t search_count = 0U;
+    uint64_t transition_count = 0U;
+    int selected_frame = -1;
+    float selected_cost = 0.0F;
+};
+
+struct PlacementPickPreviewObservation
+{
+    interaction::RuntimeState runtime_state =
+        interaction::RuntimeState::Disabled;
+    interaction::RuntimeDiagnostics diagnostics{};
+    std::optional<interaction::InteractionTarget> target{};
+    std::optional<interaction::PlacementSurface> surface{};
+    uint64_t request_sequence = 0U;
+    interaction::Transform displayed_root{};
+    interaction::Transform simulation_root{};
+    interaction::ControllerInteractionEdges pending_edges{};
+};
+
 float autodemo_planar_distance(vec3 left, vec3 right)
 {
     return std::hypot(left.x - right.x, left.z - right.z);
+}
+
+bool autodemo_same_ik(
+    const interaction::IKConfig& left,
+    const interaction::IKConfig& right)
+{
+    return left.maximum_request_position_m ==
+               right.maximum_request_position_m &&
+        left.maximum_request_orientation_radians ==
+               right.maximum_request_orientation_radians &&
+        left.accepted_position_m == right.accepted_position_m &&
+        left.accepted_orientation_radians ==
+               right.accepted_orientation_radians &&
+        left.damping == right.damping &&
+        left.finite_difference_radians ==
+               right.finite_difference_radians &&
+        left.orientation_scale_m_per_radian ==
+               right.orientation_scale_m_per_radian &&
+        left.maximum_step_radians == right.maximum_step_radians &&
+        left.maximum_iterations == right.maximum_iterations;
+}
+
+bool placement_pick_preview_same_vec3(vec3 left, vec3 right)
+{
+    return left.x == right.x && left.y == right.y && left.z == right.z;
+}
+
+bool placement_pick_preview_same_quat(quat left, quat right)
+{
+    return left.w == right.w && left.x == right.x &&
+        left.y == right.y && left.z == right.z;
+}
+
+bool placement_pick_preview_same_transform(
+    const interaction::Transform& left,
+    const interaction::Transform& right)
+{
+    return placement_pick_preview_same_vec3(
+               left.position, right.position) &&
+        placement_pick_preview_same_quat(
+               left.rotation, right.rotation);
+}
+
+bool placement_pick_preview_same_affordance(
+    const interaction::GraspAffordance& left,
+    const interaction::GraspAffordance& right)
+{
+    return left.id == right.id && left.hand == right.hand &&
+        placement_pick_preview_same_transform(
+            left.hand_in_object, right.hand_in_object) &&
+        placement_pick_preview_same_vec3(
+            left.approach_direction_object,
+            right.approach_direction_object) &&
+        left.clearance_radius == right.clearance_radius;
+}
+
+bool placement_pick_preview_same_target(
+    const interaction::InteractionTarget& left,
+    const interaction::InteractionTarget& right)
+{
+    if (left.handle != right.handle ||
+        !placement_pick_preview_same_transform(
+            left.object_world, right.object_world) ||
+        left.object_profile_id != right.object_profile_id ||
+        !placement_pick_preview_same_vec3(
+            left.object_bounds.center_object,
+            right.object_bounds.center_object) ||
+        !placement_pick_preview_same_vec3(
+            left.object_bounds.half_extents_object,
+            right.object_bounds.half_extents_object) ||
+        !placement_pick_preview_same_vec3(
+            left.object_dimensions, right.object_dimensions) ||
+        !placement_pick_preview_same_transform(
+            left.table_world, right.table_world) ||
+        !placement_pick_preview_same_vec3(
+            left.table_size, right.table_size) ||
+        left.state != right.state ||
+        left.owner_request != right.owner_request ||
+        left.affordances.size() != right.affordances.size())
+    {
+        return false;
+    }
+    for (size_t index = 0; index < left.affordances.size(); ++index)
+    {
+        if (!placement_pick_preview_same_affordance(
+                left.affordances[index], right.affordances[index]))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool placement_pick_preview_same_place_affordance(
+    const interaction::PlaceAffordance& left,
+    const interaction::PlaceAffordance& right)
+{
+    return left.id == right.id &&
+        placement_pick_preview_same_transform(
+            left.object_in_surface, right.object_in_surface) &&
+        placement_pick_preview_same_vec3(
+            left.support_point_object, right.support_point_object) &&
+        placement_pick_preview_same_vec3(
+            left.approach_direction_surface,
+            right.approach_direction_surface) &&
+        left.clearance_radius == right.clearance_radius;
+}
+
+bool placement_pick_preview_same_surface(
+    const interaction::PlacementSurface& left,
+    const interaction::PlacementSurface& right)
+{
+    if (!(left.handle == right.handle) ||
+        !placement_pick_preview_same_transform(
+            left.surface_world, right.surface_world) ||
+        !placement_pick_preview_same_transform(
+            left.support_volume_world, right.support_volume_world) ||
+        !placement_pick_preview_same_vec3(
+            left.support_volume_size, right.support_volume_size) ||
+        left.half_extent_x_m != right.half_extent_x_m ||
+        left.half_extent_z_m != right.half_extent_z_m ||
+        left.overhead_clearance_m != right.overhead_clearance_m ||
+        left.affordances.size() != right.affordances.size())
+    {
+        return false;
+    }
+    for (size_t index = 0; index < left.affordances.size(); ++index)
+    {
+        if (!placement_pick_preview_same_place_affordance(
+                left.affordances[index], right.affordances[index]))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool placement_pick_preview_same_candidate(
+    const interaction::PlaceCandidate& left,
+    const interaction::PlaceCandidate& right)
+{
+    return left.mode == right.mode &&
+        left.source_id == right.source_id &&
+        left.selection_id == right.selection_id &&
+        left.timing.canonical_fps == right.timing.canonical_fps &&
+        left.timing.playback_speed == right.timing.playback_speed &&
+        left.timing.entry_blend_seconds ==
+            right.timing.entry_blend_seconds &&
+        left.timing.reversed_commit_seconds ==
+            right.timing.reversed_commit_seconds &&
+        left.timing.maximum_alignment_seconds ==
+            right.timing.maximum_alignment_seconds &&
+        left.match.maximum_entry_root_error_m ==
+            right.match.maximum_entry_root_error_m &&
+        left.match.maximum_entry_yaw_error_radians ==
+            right.match.maximum_entry_yaw_error_radians &&
+        autodemo_same_ik(left.ik, right.ik) &&
+        left.clip == right.clip &&
+        left.entry_frame == right.entry_frame &&
+        left.commit_frame == right.commit_frame &&
+        left.release_frame == right.release_frame &&
+        left.stop_frame == right.stop_frame &&
+        left.direction == right.direction &&
+        placement_pick_preview_same_transform(
+            left.scene_from_source, right.scene_from_source) &&
+        placement_pick_preview_same_transform(
+            left.staging_root_world, right.staging_root_world) &&
+        placement_pick_preview_same_vec3(
+            left.entry_root_offset, right.entry_root_offset) &&
+        left.entry_yaw_offset == right.entry_yaw_offset &&
+        left.total_cost == right.total_cost;
+}
+
+bool placement_pick_preview_same_place_preview(
+    const interaction::PlaceStagingPreview& left,
+    const interaction::PlaceStagingPreview& right)
+{
+    return left.accepted == right.accepted &&
+        left.ready == right.ready &&
+        left.reason == right.reason &&
+        placement_pick_preview_same_candidate(
+            left.candidate, right.candidate) &&
+        autodemo_same_ik(left.ik, right.ik) &&
+        left.ik_config_fingerprint == right.ik_config_fingerprint &&
+        placement_pick_preview_same_transform(
+            left.staging_root_world, right.staging_root_world) &&
+        left.root_error_m == right.root_error_m &&
+        left.yaw_error_radians == right.yaw_error_radians;
+}
+
+bool placement_pick_preview_same_fit(
+    const interaction::PlacementFit& left,
+    const interaction::PlacementFit& right)
+{
+    return left.accepted == right.accepted &&
+        left.reason == right.reason &&
+        left.support_gap_m == right.support_gap_m &&
+        left.lowest_corner_m == right.lowest_corner_m &&
+        left.highest_corner_m == right.highest_corner_m &&
+        left.footprint_valid == right.footprint_valid &&
+        left.overhead_valid == right.overhead_valid;
+}
+
+bool placement_pick_preview_same_place_diagnostics(
+    const interaction::RuntimePlaceDiagnostics& left,
+    const interaction::RuntimePlaceDiagnostics& right)
+{
+    return left.surface == right.surface &&
+        left.affordance_id == right.affordance_id &&
+        left.mode == right.mode &&
+        left.selection_id == right.selection_id &&
+        left.preview_available == right.preview_available &&
+        placement_pick_preview_same_place_preview(
+            left.preview, right.preview) &&
+        left.candidate_certified == right.candidate_certified &&
+        left.preflight_config_identity == right.preflight_config_identity &&
+        autodemo_same_ik(left.effective_ik, right.effective_ik) &&
+        left.ik_config_fingerprint == right.ik_config_fingerprint &&
+        placement_pick_preview_same_transform(
+            left.requested_goal_world, right.requested_goal_world) &&
+        placement_pick_preview_same_fit(
+            left.requested_fit, right.requested_fit) &&
+        placement_pick_preview_same_fit(
+            left.actual_fit, right.actual_fit) &&
+        left.clip == right.clip &&
+        left.source_frame == right.source_frame &&
+        left.source_frame_exact == right.source_frame_exact &&
+        left.commit_frame == right.commit_frame &&
+        left.phase == right.phase &&
+        left.time_to_release_seconds == right.time_to_release_seconds &&
+        left.committed == right.committed &&
+        left.release_due == right.release_due &&
+        left.released == right.released &&
+        left.support_sweep_clear == right.support_sweep_clear &&
+        left.support_position_error_m == right.support_position_error_m &&
+        left.support_orientation_error_radians ==
+            right.support_orientation_error_radians &&
+        left.requested_root_correction_m ==
+            right.requested_root_correction_m &&
+        left.applied_root_correction_m ==
+            right.applied_root_correction_m &&
+        left.requested_yaw_correction_radians ==
+            right.requested_yaw_correction_radians &&
+        left.applied_yaw_correction_radians ==
+            right.applied_yaw_correction_radians &&
+        left.requested_hand_correction_m ==
+            right.requested_hand_correction_m &&
+        left.applied_hand_correction_m ==
+            right.applied_hand_correction_m &&
+        left.requested_hand_orientation_radians ==
+            right.requested_hand_orientation_radians &&
+        left.applied_hand_orientation_radians ==
+            right.applied_hand_orientation_radians &&
+        left.reason == right.reason;
+}
+
+bool placement_pick_preview_same_diagnostics(
+    const interaction::RuntimeDiagnostics& left,
+    const interaction::RuntimeDiagnostics& right)
+{
+    return left.state == right.state &&
+        left.result == right.result &&
+        left.reason == right.reason &&
+        left.target == right.target &&
+        left.object_state == right.object_state &&
+        left.affordance_id == right.affordance_id &&
+        left.clip == right.clip &&
+        left.frame == right.frame &&
+        left.phase == right.phase &&
+        left.hand == right.hand &&
+        left.total_cost == right.total_cost &&
+        left.group_costs == right.group_costs &&
+        left.requested_root_correction_m ==
+            right.requested_root_correction_m &&
+        left.applied_root_correction_m ==
+            right.applied_root_correction_m &&
+        left.requested_yaw_correction_radians ==
+            right.requested_yaw_correction_radians &&
+        left.applied_yaw_correction_radians ==
+            right.applied_yaw_correction_radians &&
+        left.playback_speed == right.playback_speed &&
+        left.hand_position_error_m == right.hand_position_error_m &&
+        left.hand_orientation_error_radians ==
+            right.hand_orientation_error_radians &&
+        left.hand_constraint_weight == right.hand_constraint_weight &&
+        left.attached == right.attached &&
+        left.recorded_carry == right.recorded_carry &&
+        left.inactive_arm_targets_locomotion ==
+            right.inactive_arm_targets_locomotion &&
+        left.inactive_arm_tracks_locomotion ==
+            right.inactive_arm_tracks_locomotion &&
+        left.pack_available == right.pack_available &&
+        placement_pick_preview_same_place_diagnostics(
+            left.place, right.place);
+}
+
+PlacementPickPreviewObservation capture_placement_pick_preview_observation(
+    const interaction::InteractionRuntime& runtime,
+    const interaction::TargetRegistry& target_registry,
+    const interaction::PlacementSurfaceRegistry& surface_registry,
+    interaction::TargetHandle target_handle,
+    interaction::SurfaceHandle surface_handle,
+    uint64_t request_sequence,
+    interaction::Transform displayed_root,
+    interaction::Transform simulation_root,
+    interaction::ControllerInteractionEdges pending_edges)
+{
+    PlacementPickPreviewObservation observation{};
+    observation.runtime_state = runtime.state();
+    observation.diagnostics = runtime.diagnostics();
+    const interaction::InteractionTarget* target =
+        target_registry.find_by_id(target_handle.id);
+    if (target != nullptr)
+    {
+        observation.target = *target;
+    }
+    const interaction::PlacementSurface* surface =
+        surface_registry.find_by_id(surface_handle.id);
+    if (surface != nullptr)
+    {
+        observation.surface = *surface;
+    }
+    observation.request_sequence = request_sequence;
+    observation.displayed_root = displayed_root;
+    observation.simulation_root = simulation_root;
+    observation.pending_edges = pending_edges;
+    return observation;
+}
+
+bool operator==(
+    const PlacementPickPreviewObservation& left,
+    const PlacementPickPreviewObservation& right)
+{
+    if (left.runtime_state != right.runtime_state ||
+        !placement_pick_preview_same_diagnostics(
+            left.diagnostics, right.diagnostics) ||
+        left.target.has_value() != right.target.has_value() ||
+        left.surface.has_value() != right.surface.has_value() ||
+        left.request_sequence != right.request_sequence ||
+        !placement_pick_preview_same_transform(
+            left.displayed_root, right.displayed_root) ||
+        !placement_pick_preview_same_transform(
+            left.simulation_root, right.simulation_root) ||
+        left.pending_edges.interact_pressed !=
+            right.pending_edges.interact_pressed ||
+        left.pending_edges.cancel_pressed !=
+            right.pending_edges.cancel_pressed ||
+        left.pending_edges.reset_pressed !=
+            right.pending_edges.reset_pressed)
+    {
+        return false;
+    }
+    if (left.target.has_value() &&
+        !placement_pick_preview_same_target(*left.target, *right.target))
+    {
+        return false;
+    }
+    return !left.surface.has_value() ||
+        placement_pick_preview_same_surface(*left.surface, *right.surface);
+}
+
+bool operator!=(
+    const PlacementPickPreviewObservation& left,
+    const PlacementPickPreviewObservation& right)
+{
+    return !(left == right);
 }
 
 void validate_autodemo_state_progression(
@@ -2088,6 +2584,57 @@ void validate_autodemo_state_progression(
     if (next >= expected.size() || expected[next] != runtime_state)
     {
         throw std::runtime_error("autodemo runtime state regression");
+    }
+    state.collapsed_states.push_back(runtime_state);
+}
+
+void validate_placement_autodemo_state_progression(
+    ControllerPlacementAutodemoState& state,
+    const interaction::RuntimeDiagnostics& diagnostics)
+{
+    const interaction::RuntimeState runtime_state = diagnostics.state;
+    if (!state.collapsed_states.empty() &&
+        state.collapsed_states.back() == runtime_state)
+    {
+        return;
+    }
+    constexpr std::array<interaction::RuntimeState, 11> expected = {
+        interaction::RuntimeState::Locomotion,
+        interaction::RuntimeState::Preflight,
+        interaction::RuntimeState::Align,
+        interaction::RuntimeState::PickupReplay,
+        interaction::RuntimeState::Hold,
+        interaction::RuntimeState::Carry,
+        interaction::RuntimeState::PlacePreflight,
+        interaction::RuntimeState::PlaceAlign,
+        interaction::RuntimeState::PlaceReplay,
+        interaction::RuntimeState::PlaceRelease,
+        interaction::RuntimeState::Locomotion};
+    const size_t next = state.collapsed_states.size();
+    if (next >= expected.size() || expected[next] != runtime_state)
+    {
+        std::string message =
+            "placement auto-demo runtime state regression: expected=";
+        message += next < expected.size()
+            ? interaction::debug_draw::state_name(expected[next])
+            : "<complete>";
+        message += " observed=";
+        message += interaction::debug_draw::state_name(runtime_state);
+        message += " result=";
+        message += interaction::debug_draw::result_name(diagnostics.result);
+        message += " reason=";
+        message += interaction::debug_draw::reason_name(diagnostics.reason);
+        message += " collapsed=";
+        for (size_t index = 0; index < state.collapsed_states.size(); ++index)
+        {
+            if (index != 0U)
+            {
+                message += ',';
+            }
+            message += interaction::debug_draw::state_name(
+                state.collapsed_states[index]);
+        }
+        throw std::runtime_error(message);
     }
     state.collapsed_states.push_back(runtime_state);
 }
@@ -2138,9 +2685,7 @@ void write_autodemo_record(
         !autodemo_is_finite(root_position.y) ||
         !autodemo_is_finite(root_position.z) ||
         !autodemo_is_finite(root_displacement_m) ||
-        !autodemo_is_finite(capture.hand_constraint_weight) ||
-        capture.hand_constraint_weight < 0.0F ||
-        capture.hand_constraint_weight > 1.0F ||
+        !autodemo_hand_constraint_evidence_valid(capture) ||
         !autodemo_is_finite(
             capture.hand_constraint_result.reach_shortfall_m) ||
         capture.hand_constraint_result.reach_shortfall_m < 0.0F ||
@@ -2152,12 +2697,7 @@ void write_autodemo_record(
         capture.grasp_evidence_valid != active_hand_is_valid ||
         (!capture.grasp_evidence_valid &&
          capture.active_hand_joint != -1) ||
-        (interaction_owned_state && !capture.grasp_evidence_valid) ||
-        (capture.grasp_evidence_valid &&
-         capture.hand_constraint_weight > 0.0F &&
-         (!capture.hand_constraint_validated ||
-          !capture.hand_constraint_result.applied ||
-          !capture.hand_constraint_result.reachable)))
+        (interaction_owned_state && !capture.grasp_evidence_valid))
     {
         throw std::runtime_error("autodemo evidence contains invalid values");
     }
@@ -2300,6 +2840,700 @@ void write_autodemo_record(
     }
 }
 
+void write_placement_autodemo_record(
+    std::ostream& output,
+    const ControllerPlacementAutodemoState& state,
+    uint64_t runtime_tick,
+    int scheduler_phase,
+    const interaction::RuntimeOutput& runtime_output,
+    const interaction::RuntimeConfig& runtime_config,
+    const interaction::InteractionTarget& source_target,
+    const interaction::PlacementSurface& destination,
+    uint32_t destination_affordance_id,
+    interaction::ObjectLocalBounds object_bounds,
+    const AutodemoEvidenceCapture& capture,
+    vec3 displayed_root,
+    float pickup_distance_m,
+    float walking_displacement_m,
+    float displayed_root_speed_mps,
+    AutodemoAction action,
+    const char* demo_phase,
+    uint32_t phase_counter,
+    int carry_staging_tick,
+    bool preview_called_this_tick,
+    bool destination_support_committed)
+{
+    const interaction::PlaceStagingPreview preview =
+        state.live_preview.has_value()
+        ? *state.live_preview
+        : interaction::PlaceStagingPreview{};
+    const interaction::PlaceAffordance* place_affordance = nullptr;
+    for (const interaction::PlaceAffordance& affordance :
+         destination.affordances)
+    {
+        if (affordance.id == destination_affordance_id)
+        {
+            place_affordance = &affordance;
+            break;
+        }
+    }
+    if (place_affordance == nullptr)
+    {
+        throw std::runtime_error(
+            "placement auto-demo authored affordance disappeared");
+    }
+    if (source_target.affordances.size() != 1U)
+    {
+        throw std::runtime_error(
+            "placement auto-demo source affordance disappeared");
+    }
+    const interaction::GraspAffordance& grasp_affordance =
+        source_target.affordances.front();
+    const int interaction_hand_side =
+        grasp_affordance.hand == interaction::Hand::Right ? 1 : -1;
+    const interaction::Transform place_goal =
+        interaction::placement_goal_world(
+            destination, place_affordance->object_in_surface);
+    const interaction::PlacementFit requested =
+        interaction::evaluate_placement_fit(
+            destination, *place_affordance, object_bounds);
+    const interaction::PlacementFit actual = state.actual_fit_captured
+        ? state.final_actual_fit
+        : interaction::PlacementFit{};
+    const interaction::PlaceCandidate& candidate = preview.candidate;
+    const char* place_mode = preview.accepted
+        ? interaction::debug_draw::place_mode_name(candidate.mode)
+        : "none";
+    const char* place_source = "none";
+    if (preview.accepted)
+    {
+        place_source = candidate.mode ==
+                interaction::PlaceMotionMode::RecordedPlace
+            ? "recorded_place"
+            : "pickup_clip_0";
+    }
+    const bool place_state =
+        runtime_output.diagnostics.state ==
+            interaction::RuntimeState::PlacePreflight ||
+        runtime_output.diagnostics.state ==
+            interaction::RuntimeState::PlaceAlign ||
+        runtime_output.diagnostics.state ==
+            interaction::RuntimeState::PlaceReplay ||
+        runtime_output.diagnostics.state ==
+            interaction::RuntimeState::PlaceRelease ||
+        state.place_observed;
+    const char* place_phase = place_state
+        ? interaction::debug_draw::place_phase_name(
+              runtime_output.diagnostics.place.phase)
+        : "none";
+    const float place_position_error_m = length(
+        capture.object_world.position - place_goal.position);
+    const float place_orientation_error_degrees =
+        quat_angle_between(
+            capture.object_world.rotation, place_goal.rotation) *
+        180.0F / PIf;
+    const float reach_waypoint_position_error_m =
+        autodemo_planar_distance(
+            displayed_root, state.reach_waypoint.position);
+    const float reach_waypoint_yaw_error_degrees = std::abs(
+        autodemo_shortest_angle(
+            autodemo_yaw_radians(capture.joint_rotations[0]) -
+            autodemo_yaw_radians(state.reach_waypoint.rotation))) *
+        180.0F / PIf;
+    const float left_stick_magnitude = length(state.left_stick_command);
+
+    const bool pick_preview_available = state.pick_preview_epoch >= 0;
+    const bool pick_entry_selection_frozen =
+        state.frozen_pick_entry_index.has_value();
+    if (state.pick_preview_consumed_epoch < -1 ||
+        state.pick_preview_consumed_epoch > state.pick_preview_epoch ||
+        state.pick_preview_epoch_count >
+            kPlacementAutodemoMaximumWalkTicks ||
+        state.runtime_pick_preview_calls !=
+            2U * state.pick_preview_epoch_count ||
+        state.pick_preview_elapsed_ticks !=
+            state.pick_preview_epoch_count ||
+        state.pick_preview_mutation_count != 0U ||
+        (pick_preview_available !=
+         (state.pick_preview_epoch_count != 0U)) ||
+        (pick_preview_available &&
+         (state.pick_preview_epoch != static_cast<int64_t>(
+              state.pick_preview_epoch_count - 1U) ||
+          state.pick_preview_snapshot_fingerprint == 0U)) ||
+        (!pick_preview_available &&
+         state.pick_preview_snapshot_fingerprint != 0U) ||
+        (pick_entry_selection_frozen !=
+         state.pick_entry_freeze_tick.has_value()) ||
+        (pick_entry_selection_frozen &&
+         (*state.frozen_pick_entry_index >= state.pick_entry_slots.ordered.size() ||
+          !pick_preview_available ||
+          state.pick_preview_consumed_epoch != state.pick_preview_epoch ||
+          *state.pick_entry_freeze_tick > runtime_tick ||
+          !placement_pick_preview_same_transform(
+              state.interaction_waypoint,
+              state.pick_entry_slots
+                  .ordered[*state.frozen_pick_entry_index].waypoint))) ||
+        (state.pending_pick_preview_failure !=
+             PlacementPickPreviewFailure::None &&
+         (pick_entry_selection_frozen || !pick_preview_available ||
+          state.pick_preview_consumed_epoch != state.pick_preview_epoch)) ||
+        (state.pick_preview_failure_recorded !=
+         (state.pending_pick_preview_failure !=
+          PlacementPickPreviewFailure::None)))
+    {
+        throw std::runtime_error(
+            "placement pickup preview evidence state is incoherent");
+    }
+
+    for (size_t i = 0; i < state.pick_entry_slots.ordered.size(); ++i)
+    {
+        const interaction::PickEntrySlot& slot =
+            state.pick_entry_slots.ordered[i];
+        const interaction::PickEntryPreview& slot_preview =
+            state.pick_entry_previews[i];
+        const bool cost_available = pick_preview_available &&
+            (slot_preview.match_ready ||
+             slot_preview.match_reason == interaction::Reason::PoorMatch);
+        if ((i == 0U &&
+             slot.identity != interaction::PickEntrySlotIdentity::Plus) ||
+            (i == 1U &&
+             slot.identity != interaction::PickEntrySlotIdentity::Minus) ||
+            !autodemo_is_finite(slot.waypoint.position.x) ||
+            !autodemo_is_finite(slot.waypoint.position.y) ||
+            !autodemo_is_finite(slot.waypoint.position.z) ||
+            !autodemo_is_finite(slot.waypoint.rotation.w) ||
+            !autodemo_is_finite(slot.waypoint.rotation.x) ||
+            !autodemo_is_finite(slot.waypoint.rotation.y) ||
+            !autodemo_is_finite(slot.waypoint.rotation.z) ||
+            !autodemo_is_finite(slot.prospective_root.world_x) ||
+            !autodemo_is_finite(slot.prospective_root.world_z) ||
+            !autodemo_is_finite(
+                slot.prospective_root.world_yaw_radians) ||
+            !autodemo_is_finite(slot.hand_score) ||
+            !autodemo_is_finite(state.pick_entry_slots.clearance_chord_m) ||
+            !autodemo_is_finite(
+                state.pick_entry_slots.preserved_standoff_m) ||
+            (pick_preview_available &&
+             (slot_preview.prospective_root.world_x !=
+                  slot.prospective_root.world_x ||
+              slot_preview.prospective_root.world_z !=
+                  slot.prospective_root.world_z ||
+              slot_preview.prospective_root.world_yaw_radians !=
+                  slot.prospective_root.world_yaw_radians ||
+              slot_preview.path_feasible !=
+                  (slot_preview.path_reason == interaction::Reason::None) ||
+              slot_preview.match_ready !=
+                  (slot_preview.match_reason == interaction::Reason::None))) ||
+            (cost_available &&
+             (!autodemo_is_finite(slot_preview.total_cost) ||
+              slot_preview.total_cost < 0.0F)) ||
+            (pick_entry_selection_frozen &&
+             *state.frozen_pick_entry_index == i &&
+             !(slot_preview.path_feasible && slot_preview.match_ready)))
+        {
+            throw std::runtime_error(
+                "placement pickup preview slot evidence is incoherent");
+        }
+    }
+    const interaction::PickEntrySlot& pick_plus =
+        state.pick_entry_slots.ordered[0];
+    const interaction::PickEntrySlot& pick_minus =
+        state.pick_entry_slots.ordered[1];
+    const interaction::PickEntryPreview& pick_plus_preview =
+        state.pick_entry_previews[0];
+    const interaction::PickEntryPreview& pick_minus_preview =
+        state.pick_entry_previews[1];
+    const bool pick_plus_cost_available = pick_preview_available &&
+        (pick_plus_preview.match_ready ||
+         pick_plus_preview.match_reason == interaction::Reason::PoorMatch);
+    const bool pick_minus_cost_available = pick_preview_available &&
+        (pick_minus_preview.match_ready ||
+         pick_minus_preview.match_reason == interaction::Reason::PoorMatch);
+    const bool pick_plus_eligible = pick_preview_available &&
+        pick_plus_preview.path_feasible && pick_plus_preview.match_ready;
+    const bool pick_minus_eligible = pick_preview_available &&
+        pick_minus_preview.path_feasible && pick_minus_preview.match_ready;
+    const size_t frozen_pick_entry_index =
+        state.frozen_pick_entry_index.value_or(
+            state.pick_entry_slots.ordered.size());
+
+    if (scheduler_phase != 0 ||
+        !autodemo_is_finite(pickup_distance_m) ||
+        !autodemo_is_finite(walking_displacement_m) ||
+        !autodemo_is_finite(displayed_root_speed_mps) ||
+        !autodemo_is_finite(left_stick_magnitude) ||
+        !autodemo_is_finite(state.interaction_lateral_offset_m) ||
+        !autodemo_is_finite(reach_waypoint_position_error_m) ||
+        !autodemo_is_finite(reach_waypoint_yaw_error_degrees) ||
+        !autodemo_is_finite(state.brake_simulation_speed_mps) ||
+        state.brake_simulation_speed_mps < 0.0F ||
+        state.stationary_transition_count >
+            state.stationary_search_calls ||
+        !autodemo_hand_constraint_evidence_valid(capture) ||
+        (state.stationary_search_calls == 0U &&
+         (state.stationary_transition_count != 0U ||
+          state.stationary_selected_frame != -1 ||
+          state.stationary_selected_range != -1)) ||
+        (state.stationary_search_calls != 0U &&
+         (state.stationary_selected_frame < 0 ||
+          state.stationary_selected_range < 0)) ||
+        (runtime_output.diagnostics.attached && runtime_output.owns_pose &&
+         !capture.grasp_evidence_valid))
+    {
+        throw std::runtime_error(
+            "placement auto-demo evidence contains invalid values");
+    }
+
+    output << std::fixed << std::setprecision(6)
+        << "{\"render_frame\":" << state.render_frame
+        << ",\"runtime_tick\":" << runtime_tick
+        << ",\"scheduler_phase\":" << scheduler_phase
+        << ",\"state\":\""
+        << interaction::debug_draw::state_name(
+            runtime_output.diagnostics.state)
+        << "\",\"result\":\""
+        << interaction::debug_draw::result_name(
+            runtime_output.diagnostics.result)
+        << "\",\"reason\":\""
+        << placement_pick_preview_reason_name(
+               runtime_output.diagnostics.reason)
+        << "\",\"object_state\":\""
+        << interaction::debug_draw::object_state_name(
+            runtime_output.diagnostics.object_state)
+        << "\",\"attached\":"
+        << (runtime_output.diagnostics.attached ? "true" : "false")
+        << ",\"owns_pose\":"
+        << (runtime_output.owns_pose ? "true" : "false")
+        << ",\"action\":\"" << autodemo_action_name(action)
+        << "\",\"demo_phase\":\"" << demo_phase
+        << "\",\"phase_counter\":" << phase_counter
+        << ",\"pickup_distance_m\":" << pickup_distance_m
+        << ",\"walking_origin_displacement_m\":"
+        << walking_displacement_m
+        << ",\"displayed_root_speed_mps\":"
+        << displayed_root_speed_mps
+        << ",\"left_stick_command\":["
+        << state.left_stick_command.x << ','
+        << state.left_stick_command.y << ','
+        << state.left_stick_command.z
+        << "],\"left_stick_magnitude\":"
+        << left_stick_magnitude
+        << ",\"root_position\":["
+        << displayed_root.x << ',' << displayed_root.y << ','
+        << displayed_root.z
+        << "],\"object_position\":["
+        << capture.object_world.position.x << ','
+        << capture.object_world.position.y << ','
+        << capture.object_world.position.z
+        << "],\"object_world_rotation\":["
+        << capture.object_world.rotation.w << ','
+        << capture.object_world.rotation.x << ','
+        << capture.object_world.rotation.y << ','
+        << capture.object_world.rotation.z
+        << "],\"locomotion_provider_kind\":\""
+        << (state.last_provider_was_live_flat
+                ? "live_flat" : "canonical")
+        << "\",\"canonical_snapshot_used\":"
+        << (state.canonical_snapshot_provider_calls != 0U
+                ? "true" : "false")
+        << ",\"root_relocation_applied\":"
+        << (state.root_relocation_calls != 0U ? "true" : "false")
+        << ",\"simulation_root_initialized_from_reach\":"
+        << (state.simulation_root_initialization_calls != 0U
+                ? "true" : "false")
+        << ",\"displayed_root_initialized_from_reach\":"
+        << (state.displayed_root_initialization_calls != 0U
+                ? "true" : "false")
+        << ",\"reach_waypoint_position\":["
+        << state.reach_waypoint.position.x << ','
+        << state.reach_waypoint.position.y << ','
+        << state.reach_waypoint.position.z
+        << "],\"reach_waypoint_rotation\":["
+        << state.reach_waypoint.rotation.w << ','
+        << state.reach_waypoint.rotation.x << ','
+        << state.reach_waypoint.rotation.y << ','
+        << state.reach_waypoint.rotation.z
+        << "],\"interaction_waypoint_position\":["
+        << state.interaction_waypoint.position.x << ','
+        << state.interaction_waypoint.position.y << ','
+        << state.interaction_waypoint.position.z
+        << "],\"interaction_waypoint_rotation\":["
+        << state.interaction_waypoint.rotation.w << ','
+        << state.interaction_waypoint.rotation.x << ','
+        << state.interaction_waypoint.rotation.y << ','
+        << state.interaction_waypoint.rotation.z
+        << "],\"interaction_lateral_offset_m\":"
+        << state.interaction_lateral_offset_m
+        << ",\"interaction_object_position\":["
+        << source_target.object_world.position.x << ','
+        << source_target.object_world.position.y << ','
+        << source_target.object_world.position.z
+        << "],\"interaction_object_dimensions\":["
+        << source_target.object_dimensions.x << ','
+        << source_target.object_dimensions.y << ','
+        << source_target.object_dimensions.z
+        << "],\"interaction_object_rotation\":["
+        << source_target.object_world.rotation.w << ','
+        << source_target.object_world.rotation.x << ','
+        << source_target.object_world.rotation.y << ','
+        << source_target.object_world.rotation.z
+        << "],\"interaction_approach_direction_object\":["
+        << grasp_affordance.approach_direction_object.x << ','
+        << grasp_affordance.approach_direction_object.y << ','
+        << grasp_affordance.approach_direction_object.z
+        << "],\"interaction_clearance_radius_m\":"
+        << grasp_affordance.clearance_radius
+        << ",\"interaction_hand_side\":"
+        << interaction_hand_side
+        << ",\"reach_waypoint_position_error_m\":"
+        << reach_waypoint_position_error_m
+        << ",\"reach_waypoint_yaw_error_degrees\":"
+        << reach_waypoint_yaw_error_degrees
+        << ",\"reach_brake_latched\":"
+        << (state.reach_braking ? "true" : "false")
+        << ",\"stationary_candidate_count\":"
+        << state.stationary_candidate_count
+        << ",\"stationary_constraint_active\":"
+        << (state.stationary_constraint_active ? "true" : "false")
+        << ",\"stationary_search_calls\":"
+        << state.stationary_search_calls
+        << ",\"stationary_transition_count\":"
+        << state.stationary_transition_count
+        << ",\"stationary_selected_frame\":"
+        << state.stationary_selected_frame
+        << ",\"stationary_selected_range\":"
+        << state.stationary_selected_range
+        << ",\"brake_simulation_speed_mps\":"
+        << state.brake_simulation_speed_mps
+        << ",\"pick_resolver_maximum_m\":"
+        << runtime_config.matcher.maximum_approach_m
+        << ",\"pick_resolver_live_flat\":"
+        << (state.pick_resolver_used_live_flat ? "true" : "false")
+        << ",\"destination_handle_id\":" << destination.handle.id
+        << ",\"destination_generation\":"
+        << destination.handle.generation
+        << ",\"destination_affordance_id\":"
+        << destination_affordance_id
+        << ",\"destination_generation_changed_before_place\":"
+        << (state.destination_generation_changed_before_place
+                ? "true" : "false")
+        << ",\"placement_surface_resolver_calls\":"
+        << state.placement_surface_resolver_calls
+        << ",\"runtime_preview_calls\":" << state.runtime_preview_calls
+        << ",\"runtime_preview_source_state\":\""
+        << (preview_called_this_tick ? "Carry" : "none")
+        << "\",\"free_selector_calls\":" << state.free_selector_calls
+        << ",\"external_match_input_calls\":"
+        << state.external_match_input_calls
+        << ",\"preview_mutation_count\":"
+        << state.preview_mutation_count
+        << ",\"far_selection_id\":"
+        << state.initial_far_selection_id
+        << ",\"current_selection_id\":"
+        << state.current_selection_id
+        << ",\"submitted_selection_id\":"
+        << (action == AutodemoAction::Place
+                ? state.submitted_selection_id : 0U)
+        << ",\"candidate_certified\":"
+        << (preview.accepted ? "true" : "false")
+        << ",\"place_mode\":\"" << place_mode
+        << "\",\"place_source\":\"" << place_source
+        << "\",\"place_source_id\":" << candidate.source_id
+        << ",\"preview_accepted\":"
+        << (preview.accepted ? "true" : "false")
+        << ",\"preview_ready\":"
+        << (preview.ready ? "true" : "false")
+        << ",\"preview_ik_fingerprint\":"
+        << preview.ik_config_fingerprint
+        << ",\"ik_maximum_request_position_m\":"
+        << runtime_config.ik.maximum_request_position_m
+        << ",\"ik_maximum_request_orientation_degrees\":"
+        << runtime_config.ik.maximum_request_orientation_radians *
+            180.0F / PIf
+        << ",\"ik_accepted_position_m\":"
+        << runtime_config.ik.accepted_position_m
+        << ",\"ik_accepted_orientation_degrees\":"
+        << runtime_config.ik.accepted_orientation_radians * 180.0F / PIf
+        << ",\"ik_damping\":" << runtime_config.ik.damping
+        << ",\"ik_finite_difference_radians\":"
+        << runtime_config.ik.finite_difference_radians
+        << ",\"ik_orientation_scale_m_per_radian\":"
+        << runtime_config.ik.orientation_scale_m_per_radian
+        << ",\"ik_maximum_step_radians\":"
+        << runtime_config.ik.maximum_step_radians
+        << ",\"ik_maximum_iterations\":"
+        << runtime_config.ik.maximum_iterations
+        << ",\"staging_root_position\":["
+        << preview.staging_root_world.position.x << ','
+        << preview.staging_root_world.position.y << ','
+        << preview.staging_root_world.position.z
+        << "],\"staging_root_rotation\":["
+        << preview.staging_root_world.rotation.w << ','
+        << preview.staging_root_world.rotation.x << ','
+        << preview.staging_root_world.rotation.y << ','
+        << preview.staging_root_world.rotation.z
+        << "],\"preview_root_error_m\":" << preview.root_error_m
+        << ",\"preview_yaw_error_degrees\":"
+        << preview.yaw_error_radians * 180.0F / PIf
+        << ",\"carry_staging_tick\":" << carry_staging_tick
+        << ",\"selected_staging_root\":"
+        << (preview.accepted ? "true" : "false")
+        << ",\"direct_root_write\":"
+        << (state.direct_root_write_calls != 0U ? "true" : "false")
+        << ",\"place_phase\":\"" << place_phase
+        << "\",\"place_goal_position\":["
+        << place_goal.position.x << ',' << place_goal.position.y << ','
+        << place_goal.position.z
+        << "],\"place_goal_rotation\":["
+        << place_goal.rotation.w << ',' << place_goal.rotation.x << ','
+        << place_goal.rotation.y << ',' << place_goal.rotation.z
+        << "],\"place_position_error_m\":" << place_position_error_m
+        << ",\"place_orientation_error_degrees\":"
+        << place_orientation_error_degrees
+        << ",\"requested_fit_accepted\":"
+        << (requested.accepted ? "true" : "false")
+        << ",\"requested_support_gap_m\":" << requested.support_gap_m
+        << ",\"requested_lowest_corner_m\":"
+        << requested.lowest_corner_m
+        << ",\"requested_highest_corner_m\":"
+        << requested.highest_corner_m
+        << ",\"requested_footprint_valid\":"
+        << (requested.footprint_valid ? "true" : "false")
+        << ",\"requested_overhead_valid\":"
+        << (requested.overhead_valid ? "true" : "false")
+        << ",\"actual_fit_accepted\":"
+        << (actual.accepted ? "true" : "false")
+        << ",\"actual_support_gap_m\":" << actual.support_gap_m
+        << ",\"actual_lowest_corner_m\":" << actual.lowest_corner_m
+        << ",\"actual_highest_corner_m\":" << actual.highest_corner_m
+        << ",\"actual_footprint_valid\":"
+        << (actual.footprint_valid ? "true" : "false")
+        << ",\"actual_bound_corners_valid\":"
+        << (actual.accepted && actual.footprint_valid &&
+                actual.overhead_valid ? "true" : "false")
+        << ",\"actual_overhead_valid\":"
+        << (actual.overhead_valid ? "true" : "false")
+        << ",\"support_sweep_clear\":"
+        << (state.final_support_sweep_clear ? "true" : "false")
+        << ",\"attachment_transition_count\":"
+        << state.attachment_transition_count
+        << ",\"attached_to_free_transition_count\":"
+        << state.attached_to_free_transition_count
+        << ",\"destination_support_committed\":"
+        << (destination_support_committed ? "true" : "false")
+        << ",\"grasp_evidence_valid\":"
+        << (capture.grasp_evidence_valid ? "true" : "false")
+        << ",\"active_hand_joint\":" << capture.active_hand_joint
+        << ",\"hand_constraint_weight\":"
+        << capture.hand_constraint_weight
+        << ",\"hand_constraint_validated\":"
+        << (capture.hand_constraint_validated ? "true" : "false")
+        << ",\"hand_constraint_applied\":"
+        << (capture.hand_constraint_result.applied ? "true" : "false")
+        << ",\"hand_constraint_reachable\":"
+        << (capture.hand_constraint_result.reachable ? "true" : "false")
+        << ",\"hand_constraint_used_clavicle\":"
+        << (capture.hand_constraint_result.used_clavicle ? "true" : "false")
+        << ",\"hand_constraint_reach_shortfall_m\":"
+        << capture.hand_constraint_result.reach_shortfall_m
+        << ",\"hand_constraint_calibration_rotation\":["
+        << capture.hand_constraint_calibration_rotation.w << ','
+        << capture.hand_constraint_calibration_rotation.x << ','
+        << capture.hand_constraint_calibration_rotation.y << ','
+        << capture.hand_constraint_calibration_rotation.z
+        << "],\"calibrated_hand_world_rotation\":["
+        << capture.calibrated_hand_world_rotation.w << ','
+        << capture.calibrated_hand_world_rotation.x << ','
+        << capture.calibrated_hand_world_rotation.y << ','
+        << capture.calibrated_hand_world_rotation.z
+        << "],\"hand_in_object_position\":["
+        << capture.hand_in_object.position.x << ','
+        << capture.hand_in_object.position.y << ','
+        << capture.hand_in_object.position.z
+        << "],\"hand_in_object_rotation\":["
+        << capture.hand_in_object.rotation.w << ','
+        << capture.hand_in_object.rotation.x << ','
+        << capture.hand_in_object.rotation.y << ','
+        << capture.hand_in_object.rotation.z
+        << "],\"grasp_world_position\":["
+        << capture.grasp_world.position.x << ','
+        << capture.grasp_world.position.y << ','
+        << capture.grasp_world.position.z
+        << "],\"grasp_world_rotation\":["
+        << capture.grasp_world.rotation.w << ','
+        << capture.grasp_world.rotation.x << ','
+        << capture.grasp_world.rotation.y << ','
+        << capture.grasp_world.rotation.z
+        << "],\"joint_world_positions\":[";
+    for (size_t joint = 0;
+         joint < interaction::kFlatControllerBoneCount;
+         ++joint)
+    {
+        const vec3 position = capture.joint_positions[joint];
+        output << (joint == 0U ? "" : ",") << '['
+            << position.x << ',' << position.y << ',' << position.z << ']';
+    }
+    output << "],\"joint_world_rotations\":[";
+    for (size_t joint = 0;
+         joint < interaction::kFlatControllerBoneCount;
+         ++joint)
+    {
+        const quat rotation = capture.joint_rotations[joint];
+        output << (joint == 0U ? "" : ",") << '['
+            << rotation.w << ',' << rotation.x << ','
+            << rotation.y << ',' << rotation.z << ']';
+    }
+    output << ']'
+        << ",\"pick_preview_epoch\":" << state.pick_preview_epoch
+        << ",\"pick_preview_consumed_epoch\":"
+        << state.pick_preview_consumed_epoch
+        << ",\"pick_preview_snapshot_fingerprint\":"
+        << state.pick_preview_snapshot_fingerprint
+        << ",\"pick_preview_snapshot_source\":\""
+        << (pick_preview_available ? "live_flat" : "unset")
+        << "\",\"pick_preview_epoch_count\":"
+        << state.pick_preview_epoch_count
+        << ",\"runtime_pick_preview_calls\":"
+        << state.runtime_pick_preview_calls
+        << ",\"pick_preview_mutation_count\":"
+        << state.pick_preview_mutation_count
+        << ",\"pick_preview_elapsed_ticks\":"
+        << state.pick_preview_elapsed_ticks
+        << ",\"pick_preview_pending_failure\":\""
+        << placement_pick_preview_failure_name(
+               state.pending_pick_preview_failure)
+        << "\",\"pick_preview_failure_recorded\":"
+        << (state.pick_preview_failure_recorded ? "true" : "false")
+        << ",\"pick_entry_selected_slot\":\""
+        << (pick_entry_selection_frozen
+                ? interaction::pick_entry_slot_name(
+                      state.pick_entry_slots
+                          .ordered[frozen_pick_entry_index].identity)
+                : "none")
+        << "\",\"pick_entry_selection_frozen\":"
+        << (pick_entry_selection_frozen ? "true" : "false")
+        << ",\"pick_entry_freeze_tick\":"
+        << (state.pick_entry_freeze_tick.has_value()
+                ? static_cast<int64_t>(*state.pick_entry_freeze_tick)
+                : -1)
+        << ",\"pick_interact_submission_count\":"
+        << state.pick_interact_submission_count
+        << ",\"pick_reservation_transition_count\":"
+        << state.pick_reservation_transition_count
+        << ",\"pick_plus_identity\":\""
+        << interaction::pick_entry_slot_name(pick_plus.identity)
+        << "\",\"pick_plus_evaluation_order\":0"
+        << ",\"pick_plus_waypoint_position\":["
+        << pick_plus.waypoint.position.x << ','
+        << pick_plus.waypoint.position.y << ','
+        << pick_plus.waypoint.position.z
+        << "],\"pick_plus_waypoint_rotation\":["
+        << pick_plus.waypoint.rotation.w << ','
+        << pick_plus.waypoint.rotation.x << ','
+        << pick_plus.waypoint.rotation.y << ','
+        << pick_plus.waypoint.rotation.z
+        << "],\"pick_plus_prospective_world_x\":"
+        << pick_plus.prospective_root.world_x
+        << ",\"pick_plus_prospective_world_z\":"
+        << pick_plus.prospective_root.world_z
+        << ",\"pick_plus_prospective_world_yaw_radians\":"
+        << pick_plus.prospective_root.world_yaw_radians
+        << ",\"pick_plus_clearance_chord_m\":"
+        << state.pick_entry_slots.clearance_chord_m
+        << ",\"pick_plus_preserved_standoff_m\":"
+        << state.pick_entry_slots.preserved_standoff_m
+        << ",\"pick_plus_hand_score\":" << pick_plus.hand_score
+        << ",\"pick_plus_path_feasible\":"
+        << (pick_preview_available && pick_plus_preview.path_feasible
+                ? "true" : "false")
+        << ",\"pick_plus_match_ready\":"
+        << (pick_preview_available && pick_plus_preview.match_ready
+                ? "true" : "false")
+        << ",\"pick_plus_path_reason\":\""
+        << placement_pick_preview_reason_name(
+               pick_preview_available
+                   ? pick_plus_preview.path_reason
+                   : interaction::Reason::NoCandidate)
+        << "\",\"pick_plus_match_reason\":\""
+        << placement_pick_preview_reason_name(
+               pick_preview_available
+                   ? pick_plus_preview.match_reason
+                   : interaction::Reason::NoCandidate)
+        << "\",\"pick_plus_feasible_entry_frame\":"
+        << (pick_preview_available
+                ? pick_plus_preview.feasible_entry_frame : -1)
+        << ",\"pick_plus_contact_frame\":"
+        << (pick_preview_available ? pick_plus_preview.contact_frame : -1)
+        << ",\"pick_plus_cost_available\":"
+        << (pick_plus_cost_available ? "true" : "false")
+        << ",\"pick_plus_total_cost\":"
+        << (pick_plus_cost_available ? pick_plus_preview.total_cost : 0.0F)
+        << ",\"pick_plus_eligible\":"
+        << (pick_plus_eligible ? "true" : "false")
+        << ",\"pick_plus_selected\":"
+        << (pick_entry_selection_frozen && frozen_pick_entry_index == 0U
+                ? "true" : "false")
+        << ",\"pick_minus_identity\":\""
+        << interaction::pick_entry_slot_name(pick_minus.identity)
+        << "\",\"pick_minus_evaluation_order\":1"
+        << ",\"pick_minus_waypoint_position\":["
+        << pick_minus.waypoint.position.x << ','
+        << pick_minus.waypoint.position.y << ','
+        << pick_minus.waypoint.position.z
+        << "],\"pick_minus_waypoint_rotation\":["
+        << pick_minus.waypoint.rotation.w << ','
+        << pick_minus.waypoint.rotation.x << ','
+        << pick_minus.waypoint.rotation.y << ','
+        << pick_minus.waypoint.rotation.z
+        << "],\"pick_minus_prospective_world_x\":"
+        << pick_minus.prospective_root.world_x
+        << ",\"pick_minus_prospective_world_z\":"
+        << pick_minus.prospective_root.world_z
+        << ",\"pick_minus_prospective_world_yaw_radians\":"
+        << pick_minus.prospective_root.world_yaw_radians
+        << ",\"pick_minus_clearance_chord_m\":"
+        << state.pick_entry_slots.clearance_chord_m
+        << ",\"pick_minus_preserved_standoff_m\":"
+        << state.pick_entry_slots.preserved_standoff_m
+        << ",\"pick_minus_hand_score\":" << pick_minus.hand_score
+        << ",\"pick_minus_path_feasible\":"
+        << (pick_preview_available && pick_minus_preview.path_feasible
+                ? "true" : "false")
+        << ",\"pick_minus_match_ready\":"
+        << (pick_preview_available && pick_minus_preview.match_ready
+                ? "true" : "false")
+        << ",\"pick_minus_path_reason\":\""
+        << placement_pick_preview_reason_name(
+               pick_preview_available
+                   ? pick_minus_preview.path_reason
+                   : interaction::Reason::NoCandidate)
+        << "\",\"pick_minus_match_reason\":\""
+        << placement_pick_preview_reason_name(
+               pick_preview_available
+                   ? pick_minus_preview.match_reason
+                   : interaction::Reason::NoCandidate)
+        << "\",\"pick_minus_feasible_entry_frame\":"
+        << (pick_preview_available
+                ? pick_minus_preview.feasible_entry_frame : -1)
+        << ",\"pick_minus_contact_frame\":"
+        << (pick_preview_available ? pick_minus_preview.contact_frame : -1)
+        << ",\"pick_minus_cost_available\":"
+        << (pick_minus_cost_available ? "true" : "false")
+        << ",\"pick_minus_total_cost\":"
+        << (pick_minus_cost_available ? pick_minus_preview.total_cost : 0.0F)
+        << ",\"pick_minus_eligible\":"
+        << (pick_minus_eligible ? "true" : "false")
+        << ",\"pick_minus_selected\":"
+        << (pick_entry_selection_frozen && frozen_pick_entry_index == 1U
+                ? "true" : "false")
+        << "}\n";
+    if (!output)
+    {
+        throw std::runtime_error(
+            "cannot write placement auto-demo JSONL");
+    }
+}
+
 void validate_autodemo_screenshot(
     const AutodemoConfiguration& configuration)
 {
@@ -2383,6 +3617,13 @@ int main(void)
         std::fprintf(stderr, "controller: %s\n", error.what());
         return 1;
     }
+
+    const bool pickup_autodemo_enabled =
+        autodemo_configuration.has_value() &&
+        autodemo_configuration->mode == AutodemoMode::Pickup;
+    const bool placement_autodemo_enabled =
+        autodemo_configuration.has_value() &&
+        autodemo_configuration->mode == AutodemoMode::Placement;
 
     // Init Window
     
@@ -2502,9 +3743,12 @@ int main(void)
         feature_weight_hip_velocity,
         feature_weight_trajectory_positions,
         feature_weight_trajectory_directions);
-        
+
+    std::vector<int> stationary_candidates;
     try
     {
+        stationary_candidates =
+            stationary_motion_matching::derive_candidates(db);
         save_matching_features_checked(db, matching_features_output);
     }
     catch (const std::exception& error)
@@ -2621,6 +3865,7 @@ int main(void)
 
     std::optional<AutodemoCanonicalEntry> autodemo_canonical_entry;
     ControllerAutodemoState autodemo_state;
+    ControllerPlacementAutodemoState placement_autodemo_state;
     if (autodemo_configuration.has_value())
     {
         try
@@ -2633,10 +3878,49 @@ int main(void)
                         ? "autodemo requires a valid interaction pack"
                         : interaction_pack_diagnostic);
             }
-            autodemo_canonical_entry = make_autodemo_canonical_entry(
-                *interaction_database,
-                *interaction_features,
-                interaction_authored_target);
+            if (pickup_autodemo_enabled)
+            {
+                autodemo_canonical_entry = make_autodemo_canonical_entry(
+                    *interaction_database,
+                    *interaction_features,
+                    interaction_authored_target);
+            }
+            // Placement auto-demo setup begins.
+            if (placement_autodemo_enabled)
+            {
+                placement_autodemo_state.stationary_candidate_count =
+                    stationary_candidates.size();
+                if (stationary_candidates.empty())
+                {
+                    throw std::runtime_error(
+                        "placement auto-demo requires stationary locomotion candidates");
+                }
+                placement_autodemo_state.reach_waypoint =
+                    interaction::make_pick_reach_waypoint(
+                        *interaction_database,
+                        interaction_authored_target);
+                placement_autodemo_state.pick_entry_slots =
+                    interaction::make_pick_entry_slots(
+                        placement_autodemo_state.reach_waypoint,
+                        interaction_authored_target);
+                placement_autodemo_state.interaction_lateral_offset_m =
+                    placement_autodemo_state.pick_entry_slots
+                        .clearance_chord_m;
+                vec3 reach_facing = quat_mul_vec3(
+                    placement_autodemo_state.reach_waypoint.rotation,
+                    vec3(0.0F, 0.0F, 1.0F));
+                reach_facing.y = 0.0F;
+                if (length(reach_facing) <= 1.0e-5F)
+                {
+                    throw std::runtime_error(
+                        "placement Reach waypoint has no planar facing");
+                }
+                reach_facing = normalize(reach_facing);
+                placement_autodemo_state.reach_entry_point =
+                    placement_autodemo_state.reach_waypoint.position -
+                    kPlacementAutodemoReachEntryDistanceM * reach_facing;
+            }
+            // Placement auto-demo setup ends.
         }
         catch (const std::exception& error)
         {
@@ -2934,11 +4218,47 @@ int main(void)
 
     const float dt = interaction::kControllerStepSeconds;
     interaction::ControllerInteractionScheduler interaction_scheduler;
+    const interaction::PickAssistConfig manual_pick_assist_config{};
+    interaction::ControllerPickAssist manual_pick_assist(
+        manual_pick_assist_config);
+    interaction::Transform manual_pick_reach_waypoint{};
+    interaction::PickEntrySlots manual_pick_entry_slots{};
+    interaction::PickAssistOutput manual_pick_assist_output{};
+    ManualPickStationaryDiagnostics manual_pick_stationary_diagnostics{};
+    vec3 manual_pick_previous_displayed_root = bone_positions(0);
+    bool manual_pick_stationary_constraint_was_active = false;
+    vec3 manual_pick_common_entry{};
+    float manual_pick_object_distance_at_begin_m = 0.0F;
     interaction::ControllerInteractionFrameHandoff interaction_frame_handoff;
     interaction::ControllerInteractionSceneHandoff interaction_scene_handoff;
     uint64_t interaction_next_request_id = 1U;
     interaction::ControllerInteractionFrameState interaction_frame_state{};
-    std::optional<interaction::Pose> latest_owned_interaction_pose;
+
+    auto resolve_autodemo_place_target =
+        [&](const interaction::LocomotionSnapshot&)
+            -> std::optional<interaction::ControllerPlaceTarget>
+    {
+        if (!placement_autodemo_enabled || !interaction_pack_loaded ||
+            interaction_destination_surface_handle.id == 0U ||
+            interaction_destination_surface_handle.generation == 0U ||
+            interaction_destination_affordance_id == 0U)
+        {
+            throw std::logic_error(
+                "placement auto-demo destination identity is unavailable");
+        }
+        if (interaction_surface_registry.find(
+                interaction_destination_surface_handle) == nullptr)
+        {
+            placement_autodemo_state
+                .destination_generation_changed_before_place = true;
+            throw std::logic_error(
+                "placement auto-demo destination generation changed");
+        }
+        return interaction::ControllerPlaceTarget{
+            interaction_destination_surface_handle,
+            interaction_destination_affordance_id,
+            interaction_next_request_id++};
+    };
 
     auto resolve_manual_place_target =
         [&](const interaction::LocomotionSnapshot& snapshot)
@@ -2950,6 +4270,11 @@ int main(void)
         }
         if (autodemo_configuration.has_value())
         {
+            if (placement_autodemo_enabled)
+            {
+                ++placement_autodemo_state
+                      .placement_surface_resolver_calls;
+            }
             throw std::logic_error(
                 "autodemo invoked the manual place resolver");
         }
@@ -2970,6 +4295,31 @@ int main(void)
             *surface_handle,
             surface->affordances.front().id,
             interaction_next_request_id++};
+    };
+
+    auto runtime_place_preview = [&interaction_runtime](
+        interaction::SurfaceHandle surface,
+        uint32_t affordance_id)
+    {
+        return interaction_runtime.preview_place(surface, affordance_id);
+    };
+
+    auto preview_pick_entry_slots = [&interaction_runtime](
+        const interaction::LocomotionSnapshot& snapshot,
+        const interaction::PickEntrySlots& slots,
+        interaction::TargetHandle target,
+        uint32_t affordance_id)
+    {
+        std::array<interaction::PickEntryPreview, 2> previews{};
+        for (size_t index = 0; index < previews.size(); ++index)
+        {
+            previews[index] = interaction_runtime.preview_pick(
+                snapshot,
+                slots.ordered[index].prospective_root,
+                target,
+                affordance_id);
+        }
+        return previews;
     };
 
     auto make_flat_controller_pose = [&]()
@@ -2996,6 +4346,14 @@ int main(void)
         if (!autodemo_configuration.has_value())
         {
             return;
+        }
+        if (placement_autodemo_enabled)
+        {
+            ++placement_autodemo_state.root_relocation_calls;
+            ++placement_autodemo_state
+                  .simulation_root_initialization_calls;
+            ++placement_autodemo_state
+                  .displayed_root_initialization_calls;
         }
         if (!autodemo_canonical_entry.has_value())
         {
@@ -3070,7 +4428,31 @@ int main(void)
         adjusted_bone_rotations(0) = bone_rotations(0);
         reset_controller_contacts();
     };
-    initialize_autodemo_canonical_world();
+    if (pickup_autodemo_enabled)
+    {
+        initialize_autodemo_canonical_world();
+    }
+    const interaction::FlatControllerPose
+        interaction_flat_reference_pose = [&]()
+    {
+        interaction::FlatControllerPose reference =
+            make_flat_controller_pose();
+        reference.velocities.fill(vec3());
+        reference.angular_velocities.fill(vec3());
+        reference.foot_contacts = {};
+        return reference;
+    }();
+    constexpr size_t interaction_root = g1_skeleton::Simulation;
+    interaction_reference_pose.velocities.fill(vec3());
+    interaction_reference_pose.angular_velocities.fill(vec3());
+    interaction_reference_pose.positions[interaction_root] =
+        interaction_flat_reference_pose.positions[0];
+    interaction_reference_pose.velocities[interaction_root] =
+        interaction_flat_reference_pose.velocities[0];
+    interaction_reference_pose.rotations[interaction_root] =
+        interaction_flat_reference_pose.rotations[0];
+    interaction_reference_pose.angular_velocities[interaction_root] =
+        interaction_flat_reference_pose.angular_velocities[0];
 
 #ifdef MM_DISCRETE
     // Optional env overrides so we can sweep halflife without recompiling.
@@ -3107,6 +4489,13 @@ int main(void)
     {
         AutodemoAction autodemo_action = AutodemoAction::None;
         int autodemo_carry_command_frame = -1;
+        bool placement_arrival_facing_override = false;
+        bool placement_brake_latched_this_tick = false;
+        bool placement_pick_interact_submitted_this_tick = false;
+        bool manual_pick_assist_activation_tick = false;
+        bool manual_pick_assist_cancelled_this_tick = false;
+        bool manual_pick_assist_synthetic_interact = false;
+        bool manual_pick_final_preview_certified_this_tick = false;
 
 #ifdef MM_DISCRETE
         // Camera-azimuth scripting. MM_MODE selects the pattern:
@@ -3142,6 +4531,8 @@ int main(void)
         // Get gamepad stick states
         vec3 gamepadstick_left = gamepad_get_stick(GAMEPAD_STICK_LEFT);
         vec3 gamepadstick_right = gamepad_get_stick(GAMEPAD_STICK_RIGHT);
+        const vec3 raw_gamepadstick_right = gamepadstick_right;
+        const bool raw_desired_strafe = desired_strafe_update();
 
         // Press edges and runtime updates share the fixed 25 Hz controller
         // tick. Camera input remains live while interaction output suppresses
@@ -3157,7 +4548,7 @@ int main(void)
         {
             gamepadstick_left = vec3();
         }
-        if (autodemo_configuration.has_value())
+        if (pickup_autodemo_enabled)
         {
             // Auto evidence is deterministic in the absence of external
             // input. It drives only the ordinary left-stick seam and the
@@ -3193,6 +4584,401 @@ int main(void)
                 }
             }
         }
+        else if (placement_autodemo_enabled)
+        {
+            // Placement auto-demo input begins.
+            gamepadstick_left = vec3();
+            gamepadstick_right = vec3();
+            interaction_edges = {};
+            placement_autodemo_state.left_stick_command = vec3();
+            if (placement_autodemo_state.handoff_frames_remaining == 0U)
+            {
+                if (placement_autodemo_state.pending_pick_preview_failure !=
+                        PlacementPickPreviewFailure::None &&
+                    placement_autodemo_state.pick_preview_failure_recorded)
+                {
+                    throw std::runtime_error(
+                        placement_autodemo_state
+                                    .pending_pick_preview_failure ==
+                                PlacementPickPreviewFailure::NoPath
+                            ? "placement pickup preview found no feasible path"
+                            : "placement pickup preview exceeded 250 ticks");
+                }
+                const interaction::RuntimeState cached_state =
+                    interaction_scheduler.cached_output().diagnostics.state;
+                const vec3 displayed_root = bone_positions(0);
+                const float pickup_distance_m = autodemo_planar_distance(
+                    displayed_root,
+                    interaction_authored_target.object_world.position);
+                const float walking_displacement_m =
+                    placement_autodemo_state.origin_captured
+                    ? autodemo_planar_distance(
+                          displayed_root,
+                          placement_autodemo_state.walking_origin)
+                    : 0.0F;
+                const bool in_standoff_band =
+                    pickup_distance_m >=
+                        kPlacementAutodemoArrivalConfig.minimum_standoff_m &&
+                    pickup_distance_m <=
+                        kPlacementAutodemoArrivalConfig.maximum_standoff_m;
+                const bool walk_contract_met =
+                    placement_autodemo_state.walk_ticks >=
+                        kPlacementAutodemoMinimumWalkTicks &&
+                    walking_displacement_m >=
+                        kPlacementAutodemoMinimumWalkDisplacementM;
+                const float reach_entry_error_m =
+                    autodemo_planar_distance(
+                        displayed_root,
+                        placement_autodemo_state.reach_entry_point);
+                if (!placement_autodemo_state.reach_entry_reached &&
+                    reach_entry_error_m <=
+                        kPlacementAutodemoReachEntryToleranceM)
+                {
+                    placement_autodemo_state.reach_entry_reached = true;
+                }
+
+                // Placement pickup preview consume begins.
+                if (!placement_autodemo_state
+                         .frozen_pick_entry_index.has_value() &&
+                    placement_autodemo_state.pending_pick_preview_failure ==
+                        PlacementPickPreviewFailure::None &&
+                    placement_autodemo_state.pick_preview_epoch >
+                        placement_autodemo_state
+                            .pick_preview_consumed_epoch)
+                {
+                    placement_autodemo_state.pick_preview_consumed_epoch =
+                        placement_autodemo_state.pick_preview_epoch;
+                    const bool any_path_feasible =
+                        placement_autodemo_state
+                                .pick_entry_previews[0].path_feasible ||
+                        placement_autodemo_state
+                                .pick_entry_previews[1].path_feasible;
+                    if (!any_path_feasible)
+                    {
+                        placement_autodemo_state
+                            .pending_pick_preview_failure =
+                                PlacementPickPreviewFailure::NoPath;
+                    }
+                    else
+                    {
+                        const std::optional<size_t> selected =
+                            interaction::choose_pick_entry_slot(
+                                placement_autodemo_state.pick_entry_slots,
+                                placement_autodemo_state.pick_entry_previews,
+                                {true, true},
+                                interaction_authored_target
+                                    .affordances.front().hand);
+                        if (selected.has_value())
+                        {
+                            placement_autodemo_state
+                                .frozen_pick_entry_index = selected;
+                            placement_autodemo_state.interaction_waypoint =
+                                placement_autodemo_state.pick_entry_slots
+                                    .ordered[*selected].waypoint;
+                            placement_autodemo_state.pick_entry_freeze_tick =
+                                autodemo_state.runtime_tick + 1U;
+                        }
+                        else if (placement_autodemo_state
+                                     .pick_preview_elapsed_ticks >=
+                                 kPlacementAutodemoMaximumWalkTicks)
+                        {
+                            placement_autodemo_state
+                                .pending_pick_preview_failure =
+                                    PlacementPickPreviewFailure::Deadline;
+                        }
+                    }
+                }
+
+                const float interaction_position_error_m =
+                    autodemo_planar_distance(
+                        displayed_root,
+                        placement_autodemo_state
+                            .interaction_waypoint.position);
+                const float interaction_yaw_error_radians = std::abs(
+                    autodemo_shortest_angle(
+                        autodemo_yaw_radians(bone_rotations(0)) -
+                        autodemo_yaw_radians(
+                            placement_autodemo_state
+                                .interaction_waypoint.rotation)));
+                const float planar_simulation_speed_mps = std::hypot(
+                    simulation_velocity.x, simulation_velocity.z);
+
+                // Placement arrival latch begins.
+                if (placement_autodemo_state
+                        .frozen_pick_entry_index.has_value() &&
+                    placement_autodemo_state.pending_pick_preview_failure ==
+                        PlacementPickPreviewFailure::None &&
+                    !placement_autodemo_state.reach_braking &&
+                    !placement_autodemo_state.interact_pulsed &&
+                    cached_state == interaction::RuntimeState::Locomotion &&
+                    interaction::arrival_ready(
+                        interaction_position_error_m,
+                        planar_simulation_speed_mps,
+                        interaction_yaw_error_radians,
+                        pickup_distance_m))
+                {
+                    placement_autodemo_state.reach_braking = true;
+                    placement_autodemo_state.brake_simulation_speed_mps =
+                        planar_simulation_speed_mps;
+                    placement_brake_latched_this_tick = true;
+                    placement_arrival_facing_override = false;
+                    gamepadstick_left = vec3();
+                    gamepadstick_right = vec3();
+                }
+                // Placement arrival latch ends.
+                const bool reach_alignment_ready =
+                    placement_autodemo_state
+                        .frozen_pick_entry_index.has_value() &&
+                    placement_autodemo_state.reach_entry_reached &&
+                    interaction_position_error_m <=
+                        kPlacementAutodemoAlignmentPositionErrorM &&
+                    interaction_yaw_error_radians <=
+                        kPlacementAutodemoReachYawErrorRadians;
+
+                if (placement_autodemo_state.pending_pick_preview_failure ==
+                        PlacementPickPreviewFailure::None &&
+                    !placement_autodemo_state.interact_pulsed &&
+                    cached_state == interaction::RuntimeState::Locomotion)
+                {
+                    if (placement_autodemo_state
+                            .frozen_pick_entry_index.has_value() &&
+                        placement_autodemo_state.settle_ticks >=
+                            kPlacementAutodemoSettleTicks &&
+                        walk_contract_met && in_standoff_band &&
+                        reach_alignment_ready &&
+                        placement_autodemo_state
+                                .pick_interact_submission_count == 0U)
+                    {
+                        placement_pick_interact_submitted_this_tick = true;
+                        interaction_edges.interact_pressed = true;
+                        placement_autodemo_state.interact_pulsed = true;
+                        ++placement_autodemo_state.pick_interact_submission_count;
+                        autodemo_action = AutodemoAction::Interact;
+                    }
+                    else if (!placement_autodemo_state.reach_braking)
+                    {
+                        if (placement_autodemo_state
+                                .frozen_pick_entry_index.has_value())
+                        {
+                            // Placement frozen arrival steering begins.
+                            gamepadstick_left =
+                                interaction::arrival_navigation_stick(
+                                    placement_autodemo_state
+                                        .interaction_waypoint.position,
+                                    displayed_root,
+                                    camera_azimuth);
+                            vec3 interaction_forward = quat_mul_vec3(
+                                placement_autodemo_state
+                                    .interaction_waypoint.rotation,
+                                vec3(0.0F, 0.0F, 1.0F));
+                            interaction_forward.y = 0.0F;
+                            gamepadstick_right =
+                                interaction::arrival_facing_stick(
+                                    interaction_forward,
+                                    camera_azimuth);
+                            placement_arrival_facing_override = true;
+                            // Placement frozen arrival steering ends.
+                            autodemo_action = AutodemoAction::Approach;
+                        }
+                        else if (!placement_autodemo_state
+                                      .reach_entry_reached)
+                        {
+                            // Placement unfrozen entry steering begins.
+                            gamepadstick_left =
+                                controller_world_navigation_stick(
+                                    placement_autodemo_state
+                                        .reach_entry_point,
+                                    displayed_root,
+                                    camera_azimuth,
+                                    kPlacementAutodemoNavigationSlowRadiusM);
+                            if (length(gamepadstick_left) <= 1.0e-4F)
+                            {
+                                vec3 reach_facing = quat_mul_vec3(
+                                    placement_autodemo_state
+                                        .reach_waypoint.rotation,
+                                    vec3(0.0F, 0.0F, 1.0F));
+                                reach_facing.y = 0.0F;
+                                gamepadstick_left =
+                                    controller_world_navigation_stick(
+                                        displayed_root +
+                                            0.05F * normalize(reach_facing),
+                                        displayed_root,
+                                        camera_azimuth,
+                                        kPlacementAutodemoNavigationSlowRadiusM);
+                            }
+                            // Placement unfrozen entry steering ends.
+                            autodemo_action = AutodemoAction::Approach;
+                        }
+                    }
+
+                    // Placement post-entry diagnostic begins.
+                    if (placement_autodemo_state
+                            .frozen_pick_entry_index.has_value() &&
+                        !placement_autodemo_state.interact_pulsed)
+                    {
+                        ++placement_autodemo_state.post_entry_ticks;
+                        if (placement_autodemo_state.post_entry_ticks == 250U)
+                        {
+                            const float displayed_speed_mps =
+                                placement_autodemo_state.origin_captured
+                                ? autodemo_planar_distance(
+                                      displayed_root,
+                                      placement_autodemo_state
+                                          .previous_displayed_root) /
+                                      dt
+                                : 0.0F;
+                            std::string message =
+                                "placement auto-demo post-entry exceeded 250 ticks:";
+                            message += " interaction_error_m=" +
+                                std::to_string(interaction_position_error_m);
+                            message += " standoff_m=" +
+                                std::to_string(pickup_distance_m);
+                            message += " displayed_speed_mps=" +
+                                std::to_string(displayed_speed_mps);
+                            message += " simulation_speed_mps=" +
+                                std::to_string(planar_simulation_speed_mps);
+                            message += " yaw_error_degrees=" +
+                                std::to_string(
+                                    interaction_yaw_error_radians *
+                                    180.0F / PIf);
+                            message += " brake_latched=";
+                            message += placement_autodemo_state.reach_braking
+                                ? "true" : "false";
+                            message += " stationary_search_calls=" +
+                                std::to_string(
+                                    placement_autodemo_state
+                                        .stationary_search_calls);
+                            message += " stationary_transition_count=" +
+                                std::to_string(
+                                    placement_autodemo_state
+                                        .stationary_transition_count);
+                            message += " stationary_selected_frame=" +
+                                std::to_string(
+                                    placement_autodemo_state
+                                        .stationary_selected_frame);
+                            message += " stationary_selected_range=" +
+                                std::to_string(
+                                    placement_autodemo_state
+                                        .stationary_selected_range);
+                            throw std::runtime_error(message);
+                        }
+                    }
+                    // Placement post-entry diagnostic ends.
+                }
+                // Placement pickup preview consume ends.
+                else if (cached_state ==
+                             interaction::RuntimeState::Carry &&
+                         !placement_autodemo_state.destination_latched)
+                {
+                    interaction_edges.interact_pressed = true;
+                    placement_autodemo_state.destination_latched = true;
+                    autodemo_action = AutodemoAction::LatchDestination;
+                }
+                else if (cached_state ==
+                             interaction::RuntimeState::Carry &&
+                         interaction_scheduler.place_preview().has_value())
+                {
+                    gamepadstick_left = controller_place_staging_stick(
+                        *interaction_scheduler.place_preview(),
+                        interaction::Transform{
+                            displayed_root, bone_rotations(0)},
+                        camera_azimuth);
+                    autodemo_action = AutodemoAction::Stage;
+                }
+            }
+            placement_autodemo_state.left_stick_command =
+                gamepadstick_left;
+            // Placement auto-demo input ends.
+        }
+        // Manual pick-assist input begins.
+        if (!autodemo_configuration.has_value() &&
+            interaction_edges.cancel_pressed &&
+            manual_pick_assist.owns_manual_interact())
+        {
+            manual_pick_assist.cancel();
+            interaction_edges.cancel_pressed = false;
+            interaction_edges.interact_pressed = false;
+            manual_pick_assist_output = {};
+            manual_pick_stationary_diagnostics = {};
+            manual_pick_common_entry = {};
+            manual_pick_object_distance_at_begin_m = 0.0F;
+            manual_pick_assist_cancelled_this_tick = true;
+        }
+        if (!autodemo_configuration.has_value() &&
+            !manual_pick_assist_cancelled_this_tick &&
+            interaction_edges.interact_pressed &&
+            interaction_scheduler.cached_output().diagnostics.state ==
+                interaction::RuntimeState::Locomotion)
+        {
+            interaction_edges.interact_pressed = false;
+            if (!manual_pick_assist.active())
+            {
+                manual_pick_assist_activation_tick = true;
+                manual_pick_assist_output = {};
+                manual_pick_common_entry = {};
+                manual_pick_object_distance_at_begin_m = 0.0F;
+                const interaction::Transform manual_pick_root{
+                    bone_positions(0), bone_rotations(0)};
+                const float manual_pick_acquisition_radius_m =
+                    manual_pick_assist_config.maximum_assisted_path_m +
+                    manual_pick_assist_config.arrival.maximum_standoff_m;
+                const std::optional<interaction::TargetHandle>
+                    manual_pick_target_handle =
+                        interaction_registry.resolve_single_target(
+                            manual_pick_root.position,
+                            manual_pick_acquisition_radius_m);
+                const interaction::InteractionTarget* manual_pick_target =
+                    manual_pick_target_handle.has_value()
+                    ? interaction_registry.find(*manual_pick_target_handle)
+                    : nullptr;
+                if (interaction_pack_loaded &&
+                    interaction_database.has_value() &&
+                    manual_pick_target != nullptr &&
+                    manual_pick_target->state ==
+                        interaction::ObjectState::Free &&
+                    manual_pick_target->affordances.size() == 1U)
+                {
+                    manual_pick_reach_waypoint =
+                        interaction::make_pick_reach_waypoint(
+                            *interaction_database, *manual_pick_target);
+                    manual_pick_entry_slots =
+                        interaction::make_pick_entry_slots(
+                            manual_pick_reach_waypoint,
+                            *manual_pick_target);
+                    interaction::PickAssistStart start{};
+                    start.target = manual_pick_target->handle;
+                    start.affordance_id =
+                        manual_pick_target->affordances.front().id;
+                    start.hand =
+                        manual_pick_target->affordances.front().hand;
+                    start.object_world = manual_pick_target->object_world;
+                    start.root_world = interaction::Transform{
+                        bone_positions(0), bone_rotations(0)};
+                    start.reach_waypoint = manual_pick_reach_waypoint;
+                    start.slots = manual_pick_entry_slots;
+                    if (manual_pick_assist.begin(start))
+                    {
+                        manual_pick_stationary_diagnostics = {};
+                        vec3 reach_facing = quat_mul_vec3(
+                            manual_pick_reach_waypoint.rotation,
+                            vec3(0.0F, 0.0F, 1.0F));
+                        reach_facing.y = 0.0F;
+                        manual_pick_common_entry =
+                            manual_pick_reach_waypoint.position -
+                            manual_pick_assist_config
+                                .reach_entry_distance_m *
+                                normalize(reach_facing);
+                        manual_pick_object_distance_at_begin_m =
+                            autodemo_planar_distance(
+                                manual_pick_root.position,
+                                manual_pick_target->object_world.position);
+                    }
+                }
+                gamepadstick_left = vec3();
+                gamepadstick_right = vec3();
+            }
+        }
+        // Manual pick-assist input ends.
         if (!autodemo_configuration.has_value() &&
             !interaction_edges.cancel_pressed &&
             !interaction_edges.reset_pressed &&
@@ -3208,10 +4994,27 @@ int main(void)
         }
 
         // Get if strafe is desired
-        bool desired_strafe = desired_strafe_update();
+        bool desired_strafe = raw_desired_strafe;
 #ifdef MM_DISCRETE
         desired_strafe = g_force_strafe;
 #endif
+        if (placement_arrival_facing_override)
+        {
+            desired_strafe = true;
+        }
+        // Manual pick-assist prior output begins.
+        if (!manual_pick_assist_activation_tick &&
+            manual_pick_assist_output.override_steering)
+        {
+            gamepadstick_left = manual_pick_assist_output.left_stick;
+            gamepadstick_right = manual_pick_assist_output.right_stick;
+        }
+        if (!manual_pick_assist_activation_tick &&
+            manual_pick_assist_output.force_strafe)
+        {
+            desired_strafe = true;
+        }
+        // Manual pick-assist prior output ends.
         
         // Get the desired gait (walk / run)
         desired_gait_update(
@@ -3333,19 +5136,46 @@ int main(void)
 
         // Check if we reached the end of the current anim
         bool end_of_anim = database_trajectory_index_clamp(db, frame_index, 1) == frame_index;
-        
+
+        // Placement stationary search begins.
+        placement_autodemo_state.stationary_constraint_active =
+            placement_autodemo_enabled &&
+            placement_autodemo_state.reach_braking &&
+            interaction_scheduler.cached_output().diagnostics.state ==
+                interaction::RuntimeState::Locomotion &&
+            (!placement_autodemo_state.interact_pulsed ||
+             placement_pick_interact_submitted_this_tick);
+        const bool manual_pick_stationary_constraint_active =
+            !autodemo_configuration.has_value() &&
+            manual_pick_assist_output.stationary_constraint &&
+            interaction_scheduler.cached_output().diagnostics.state ==
+                interaction::RuntimeState::Locomotion;
+        const bool manual_pick_stationary_constraint_latched_this_tick =
+            manual_pick_stationary_constraint_active &&
+            !manual_pick_stationary_constraint_was_active;
+        manual_pick_stationary_constraint_was_active =
+            manual_pick_stationary_constraint_active;
+        const bool interaction_stationary_constraint_active =
+            placement_autodemo_state.stationary_constraint_active ||
+            manual_pick_stationary_constraint_active;
+        const bool motion_search_due =
+            force_search || search_timer <= 0.0F || end_of_anim ||
+            placement_brake_latched_this_tick ||
+            manual_pick_stationary_constraint_latched_this_tick;
+
         // Do we need to search?
 #ifdef MM_DISCRETE
         int   dbg_best_index = frame_index;   // -1 == no search this frame
-        bool  dbg_did_search = (force_search || search_timer <= 0.0f || end_of_anim);
+        bool  dbg_did_search = motion_search_due;
         bool  dbg_did_transition = false;
         quat  dbg_root_before = bone_rotations(0);
         quat  dbg_off_before  = bone_offset_rotations(0);
         quat  dbg_trns_dst_rot = trns_bone_rotations(0);
 #endif
-        if (force_search || search_timer <= 0.0f || end_of_anim)
+        if (motion_search_due)
         {
-            if (lmm_enabled)
+            if (lmm_enabled &&
+                !interaction_stationary_constraint_active)
             {
                 // Project query onto nearest feature vector
                 
@@ -3416,16 +5246,69 @@ int main(void)
                 
                 int best_index = end_of_anim ? -1 : frame_index;
                 float best_cost = FLT_MAX;
+
+                if (interaction_stationary_constraint_active)
+                {
+                    const stationary_motion_matching::SearchResult result =
+                        stationary_motion_matching::search(
+                            db, query, stationary_candidates);
+                    best_index = result.frame;
+                    best_cost = result.cost;
+                    // Manual stationary diagnostics search begins.
+                    if (manual_pick_stationary_constraint_active)
+                    {
+                        ++manual_pick_stationary_diagnostics.search_count;
+                        manual_pick_stationary_diagnostics.selected_frame =
+                            best_index;
+                        manual_pick_stationary_diagnostics.selected_cost =
+                            best_cost;
+                    }
+                    // Manual stationary diagnostics search ends.
+                    // Placement stationary evidence counters begin.
+                    if (placement_autodemo_state
+                            .stationary_constraint_active)
+                    {
+                        ++placement_autodemo_state.stationary_search_calls;
+                        placement_autodemo_state.stationary_selected_frame =
+                            best_index;
+                        placement_autodemo_state.stationary_selected_range =
+                            -1;
+                        for (int range = 0; range < db.nranges(); ++range)
+                        {
+                            if (best_index >= db.range_starts(range) &&
+                                best_index < db.range_stops(range))
+                            {
+                                placement_autodemo_state
+                                    .stationary_selected_range = range;
+                                break;
+                            }
+                        }
+                        if (placement_autodemo_state
+                                .stationary_selected_range < 0)
+                        {
+                            throw std::logic_error(
+                                "stationary locomotion selection escaped clip ranges");
+                        }
+                    }
+                    // Placement stationary evidence counters end.
+                }
+                else
+                {
+                    database_search(
+                        best_index,
+                        best_cost,
+                        db,
+                        query);
+                }
                 
-                database_search(
-                    best_index,
-                    best_cost,
-                    db,
-                    query);
+                // Transition if better frame found, or guarantee that the
+                // first constrained selection traverses the inertializer once.
                 
-                // Transition if better frame found
-                
-                if (best_index != frame_index)
+                if (best_index != frame_index ||
+                    (placement_autodemo_state.stationary_constraint_active &&
+                     placement_autodemo_state
+                         .stationary_transition_count == 0U) ||
+                    manual_pick_stationary_constraint_latched_this_tick)
                 {
                     trns_bone_positions = db.bone_positions(best_index);
                     trns_bone_velocities = db.bone_velocities(best_index);
@@ -3453,7 +5336,19 @@ int main(void)
                         trns_bone_velocities,
                         trns_bone_rotations,
                         trns_bone_angular_velocities);
-                    
+
+                    if (placement_autodemo_state
+                            .stationary_constraint_active)
+                    {
+                        ++placement_autodemo_state
+                              .stationary_transition_count;
+                    }
+                    // Manual stationary diagnostics transition begins.
+                    if (manual_pick_stationary_constraint_active)
+                    {
+                        ++manual_pick_stationary_diagnostics.transition_count;
+                    }
+                    // Manual stationary diagnostics transition ends.
                     frame_index = best_index;
 #ifdef MM_DISCRETE
                     dbg_did_transition = true;
@@ -3471,6 +5366,7 @@ int main(void)
         
         // Tick down search timer
         search_timer -= dt;
+        // Placement stationary search ends.
 
         if (lmm_enabled)
         {
@@ -3672,53 +5568,261 @@ int main(void)
         const interaction::RuntimeState cached_interaction_state =
             interaction_scheduler.cached_output().diagnostics.state;
         const bool use_autodemo_canonical_snapshot =
-            autodemo_configuration.has_value() &&
+            pickup_autodemo_enabled &&
             autodemo_canonical_entry.has_value() &&
             autodemo_state.interact_pulsed &&
             (cached_interaction_state ==
                  interaction::RuntimeState::Locomotion ||
              cached_interaction_state ==
                  interaction::RuntimeState::Preflight);
-
         // Advance locomotion and interaction synchronously once per 25 Hz
         // controller tick.
+        const uint64_t placement_preview_calls_before_tick =
+            placement_autodemo_state.runtime_preview_calls;
+        const uint64_t placement_provider_calls_before_tick =
+            placement_autodemo_state.locomotion_provider_calls;
         const interaction::FlatControllerPose flat_locomotion_pose =
             make_flat_controller_pose();
-        const interaction::Pose& locomotion_reference =
-            latest_owned_interaction_pose.has_value()
-                ? *latest_owned_interaction_pose
-                : interaction_reference_pose;
         interaction::Pose locomotion_pose =
             interaction::expand_flat_controller_pose(
-                flat_locomotion_pose, locomotion_reference);
+                flat_locomotion_pose,
+                interaction_reference_pose,
+                interaction_flat_reference_pose);
+        interaction::LocomotionSnapshot live_flat_snapshot{};
+        live_flat_snapshot.pose = locomotion_pose;
+        for (size_t index = 0;
+             index < live_flat_snapshot.future_root_positions.size();
+             ++index)
+        {
+            const int trajectory_index = static_cast<int>(index) + 1;
+            live_flat_snapshot.future_root_positions[index] =
+                trajectory_positions(trajectory_index);
+            live_flat_snapshot.future_root_rotations[index] =
+                trajectory_rotations(trajectory_index);
+        }
+        // Manual pick-assist observation begins.
+        const uint64_t live_flat_snapshot_fingerprint =
+            interaction::runtime_detail::
+                locomotion_snapshot_fingerprint(live_flat_snapshot);
+        const float manual_pick_displayed_planar_speed_mps =
+            autodemo_planar_distance(
+                bone_positions(0), manual_pick_previous_displayed_root) / dt;
+        manual_pick_previous_displayed_root = bone_positions(0);
+        if (!manual_pick_assist_cancelled_this_tick)
+        {
+            std::optional<std::array<interaction::PickEntryPreview, 2>>
+                manual_pick_previews;
+            uint64_t manual_pick_preview_snapshot_fingerprint = 0U;
+            if (manual_pick_assist_output.needs_preview)
+            {
+                manual_pick_previews = preview_pick_entry_slots(
+                    live_flat_snapshot,
+                    manual_pick_entry_slots,
+                    manual_pick_assist.diagnostics().target,
+                    manual_pick_assist.diagnostics().affordance_id);
+                manual_pick_preview_snapshot_fingerprint =
+                    live_flat_snapshot_fingerprint;
+            }
+            const interaction::InteractionTarget* manual_pick_target =
+                interaction_registry.find_by_id(
+                    manual_pick_assist.diagnostics().target.id);
+            interaction::PickAssistObservation observation{};
+            observation.runtime_state = cached_interaction_state;
+            observation.target = manual_pick_target;
+            observation.displayed_root = interaction::Transform{
+                bone_positions(0), bone_rotations(0)};
+            observation.simulation_velocity = simulation_velocity;
+            observation.displayed_planar_speed_mps =
+                manual_pick_displayed_planar_speed_mps;
+            observation.camera_azimuth = camera_azimuth;
+            observation.snapshot_fingerprint =
+                live_flat_snapshot_fingerprint;
+            observation.preview_snapshot_fingerprint =
+                manual_pick_preview_snapshot_fingerprint;
+            observation.previews = manual_pick_previews;
+            const interaction::PickAssistOutput observed_output =
+                manual_pick_assist.observe(observation);
+            if (observed_output.submit_interact)
+            {
+                interaction_edges.interact_pressed = true;
+                manual_pick_assist_synthetic_interact = true;
+                manual_pick_final_preview_certified_this_tick = true;
+            }
+            manual_pick_assist_output = {};
+            manual_pick_assist_output.override_steering =
+                observed_output.override_steering;
+            manual_pick_assist_output.left_stick =
+                observed_output.left_stick;
+            manual_pick_assist_output.right_stick =
+                observed_output.right_stick;
+            manual_pick_assist_output.force_strafe =
+                observed_output.force_strafe;
+            manual_pick_assist_output.stationary_constraint =
+                observed_output.stationary_constraint;
+            manual_pick_assist_output.needs_preview =
+                observed_output.needs_preview;
+        }
+        // Manual pick-assist observation ends.
         const interaction::RuntimeOutput& interaction_output =
             interaction_scheduler.tick(
                 interaction_edges,
                 [&]()
                 {
+                    if (placement_autodemo_enabled)
+                    {
+                        ++placement_autodemo_state
+                              .locomotion_provider_calls;
+                        if (use_autodemo_canonical_snapshot)
+                        {
+                            ++placement_autodemo_state
+                                  .canonical_snapshot_provider_calls;
+                            placement_autodemo_state
+                                .last_provider_was_live_flat = false;
+                        }
+                        else
+                        {
+                            ++placement_autodemo_state
+                                  .live_flat_provider_calls;
+                            placement_autodemo_state
+                                .last_provider_was_live_flat = true;
+                        }
+                    }
                     if (use_autodemo_canonical_snapshot)
                     {
                         return autodemo_canonical_entry->snapshot;
                     }
-                    interaction::LocomotionSnapshot snapshot;
-                    snapshot.pose = locomotion_pose;
-                    for (size_t index = 0;
-                         index < snapshot.future_root_positions.size();
-                         ++index)
+                    // Placement pickup preview provider begins.
+                    const interaction::LocomotionSnapshot& snapshot =
+                        live_flat_snapshot;
+                    if (placement_autodemo_enabled &&
+                        placement_autodemo_state.reach_entry_reached &&
+                        !placement_autodemo_state
+                             .frozen_pick_entry_index.has_value() &&
+                        placement_autodemo_state
+                                .pending_pick_preview_failure ==
+                            PlacementPickPreviewFailure::None &&
+                        !placement_autodemo_state.interact_pulsed &&
+                        interaction_runtime.state() ==
+                            interaction::RuntimeState::Locomotion)
                     {
-                        const int trajectory_index =
-                            static_cast<int>(index) + 1;
-                        snapshot.future_root_positions[index] =
-                            trajectory_positions(trajectory_index);
-                        snapshot.future_root_rotations[index] =
-                            trajectory_rotations(trajectory_index);
+                        const uint64_t fingerprint =
+                            live_flat_snapshot_fingerprint;
+                        const PlacementPickPreviewObservation runtime_before =
+                            capture_placement_pick_preview_observation(
+                                interaction_runtime,
+                                interaction_registry,
+                                interaction_surface_registry,
+                                interaction_scene_target_handle,
+                                interaction_destination_surface_handle,
+                                interaction_next_request_id,
+                                interaction::Transform{
+                                    bone_positions(0), bone_rotations(0)},
+                                interaction::Transform{
+                                    simulation_position,
+                                    simulation_rotation},
+                                interaction_edges);
+
+                        std::array<interaction::PickEntryPreview, 2> previews{};
+                        try
+                        {
+                            previews = preview_pick_entry_slots(
+                                snapshot,
+                                placement_autodemo_state.pick_entry_slots,
+                                interaction_scene_target_handle,
+                                interaction_authored_target
+                                    .affordances.front().id);
+                        }
+                        catch (...)
+                        {
+                            if (capture_placement_pick_preview_observation(
+                                    interaction_runtime,
+                                    interaction_registry,
+                                    interaction_surface_registry,
+                                    interaction_scene_target_handle,
+                                    interaction_destination_surface_handle,
+                                    interaction_next_request_id,
+                                    interaction::Transform{
+                                        bone_positions(0), bone_rotations(0)},
+                                    interaction::Transform{
+                                        simulation_position,
+                                        simulation_rotation},
+                                    interaction_edges) != runtime_before)
+                            {
+                                ++placement_autodemo_state
+                                      .pick_preview_mutation_count;
+                                throw std::runtime_error(
+                                    "pickup preview mutated protected state");
+                            }
+                            throw;
+                        }
+
+                        if (capture_placement_pick_preview_observation(
+                                interaction_runtime,
+                                interaction_registry,
+                                interaction_surface_registry,
+                                interaction_scene_target_handle,
+                                interaction_destination_surface_handle,
+                                interaction_next_request_id,
+                                interaction::Transform{
+                                    bone_positions(0), bone_rotations(0)},
+                                interaction::Transform{
+                                    simulation_position,
+                                    simulation_rotation},
+                                interaction_edges) != runtime_before)
+                        {
+                            ++placement_autodemo_state
+                                  .pick_preview_mutation_count;
+                            throw std::runtime_error(
+                                "pickup preview mutated protected state");
+                        }
+
+                        placement_autodemo_state.pick_entry_previews = previews;
+                        placement_autodemo_state
+                            .pick_preview_snapshot_fingerprint = fingerprint;
+                        placement_autodemo_state.pick_preview_epoch =
+                            static_cast<int64_t>(placement_autodemo_state
+                                .pick_preview_epoch_count);
+                        ++placement_autodemo_state.pick_preview_epoch_count;
+                        placement_autodemo_state
+                            .runtime_pick_preview_calls += 2U;
+                        ++placement_autodemo_state.pick_preview_elapsed_ticks;
                     }
                     return snapshot;
+                    // Placement pickup preview provider ends.
                 },
                 [&](const interaction::LocomotionSnapshot& snapshot)
                     -> std::optional<interaction::PickRequest>
                 {
                     if (!interaction_pack_loaded)
+                    {
+                        return std::nullopt;
+                    }
+                    // Manual pick-assist submission begins.
+                    if (manual_pick_assist_synthetic_interact &&
+                        manual_pick_assist.owns_manual_interact())
+                    {
+                        const std::optional<interaction::PickRequest>
+                            manual_pick_request =
+                                manual_pick_assist.take_submission(
+                                    interaction_next_request_id);
+                        if (manual_pick_request.has_value())
+                        {
+                            ++interaction_next_request_id;
+                        }
+                        return manual_pick_request;
+                    }
+                    // Manual pick-assist submission ends.
+                    if (placement_autodemo_enabled)
+                    {
+                        ++placement_autodemo_state.pick_resolver_calls;
+                        placement_autodemo_state
+                            .pick_resolver_used_live_flat =
+                            placement_autodemo_state
+                                .last_provider_was_live_flat &&
+                            placement_autodemo_state
+                                .canonical_snapshot_provider_calls == 0U;
+                    }
+                    if (!autodemo_configuration.has_value())
                     {
                         return std::nullopt;
                     }
@@ -3741,22 +5845,131 @@ int main(void)
                         target->affordances.front().id,
                         interaction_next_request_id++};
                 },
-                resolve_manual_place_target,
-                [&interaction_runtime](
-                    interaction::SurfaceHandle surface,
+                [&](const interaction::LocomotionSnapshot& snapshot)
+                    -> std::optional<interaction::ControllerPlaceTarget>
+                {
+                    if (placement_autodemo_enabled)
+                    {
+                        return resolve_autodemo_place_target(snapshot);
+                    }
+                    return resolve_manual_place_target(snapshot);
+                },
+                [&](interaction::SurfaceHandle surface,
                     uint32_t affordance_id)
                 {
-                    return interaction_runtime.preview_place(
-                        surface, affordance_id);
+                    if (placement_autodemo_enabled &&
+                        interaction_runtime.state() !=
+                            interaction::RuntimeState::Carry)
+                    {
+                        throw std::logic_error(
+                            "placement auto-demo preview escaped Carry");
+                    }
+                    const interaction::RuntimeDiagnostics before =
+                        interaction_runtime.diagnostics();
+                    const interaction::InteractionTarget* before_target_ptr =
+                        interaction_registry.find_by_id(
+                            interaction_authored_target.handle.id);
+                    const std::optional<interaction::InteractionTarget>
+                        before_target = before_target_ptr == nullptr
+                        ? std::nullopt
+                        : std::optional<interaction::InteractionTarget>(
+                              *before_target_ptr);
+                    if (placement_autodemo_enabled)
+                    {
+                        ++placement_autodemo_state.runtime_preview_calls;
+                    }
+                    const interaction::PlaceStagingPreview preview =
+                        runtime_place_preview(surface, affordance_id);
+                    const interaction::RuntimeDiagnostics& after =
+                        interaction_runtime.diagnostics();
+                    const interaction::InteractionTarget* after_target =
+                        interaction_registry.find_by_id(
+                            interaction_authored_target.handle.id);
+                    const bool target_changed =
+                        before_target.has_value() !=
+                            (after_target != nullptr) ||
+                        (before_target.has_value() &&
+                         (after_target->handle != before_target->handle ||
+                          after_target->state != before_target->state ||
+                          after_target->owner_request !=
+                              before_target->owner_request ||
+                          length(
+                              after_target->object_world.position -
+                              before_target->object_world.position) != 0.0F ||
+                          quat_angle_between(
+                              after_target->object_world.rotation,
+                              before_target->object_world.rotation) != 0.0F));
+                    const bool diagnostics_changed =
+                        after.state != before.state ||
+                        after.result != before.result ||
+                        after.reason != before.reason ||
+                        after.target != before.target ||
+                        after.object_state != before.object_state ||
+                        after.affordance_id != before.affordance_id ||
+                        after.clip != before.clip ||
+                        after.frame != before.frame ||
+                        after.phase != before.phase ||
+                        after.hand != before.hand ||
+                        after.attached != before.attached ||
+                        after.place.selection_id !=
+                            before.place.selection_id ||
+                        after.place.preview_available !=
+                            before.place.preview_available ||
+                        after.place.phase != before.place.phase ||
+                        after.place.released != before.place.released;
+                    if (placement_autodemo_enabled &&
+                        (target_changed || diagnostics_changed))
+                    {
+                        ++placement_autodemo_state.preview_mutation_count;
+                        throw std::logic_error(
+                            "placement auto-demo preview mutated runtime or "
+                            "target diagnostics");
+                    }
+                    return preview;
                 },
                 [&](const interaction::RuntimeInput& input)
                 {
                     return interaction_runtime.update(input);
                 });
+        const uint64_t placement_preview_call_delta =
+            placement_autodemo_state.runtime_preview_calls -
+            placement_preview_calls_before_tick;
+        const uint64_t placement_provider_call_delta =
+            placement_autodemo_state.locomotion_provider_calls -
+            placement_provider_calls_before_tick;
+        if (placement_autodemo_enabled &&
+            (placement_preview_call_delta > 1U ||
+             placement_provider_call_delta != 1U))
+        {
+            throw std::logic_error(
+                "placement auto-demo callback count violated exact 25 Hz");
+        }
+        const bool placement_preview_called_this_tick =
+            placement_autodemo_enabled &&
+            placement_preview_call_delta == 1U;
         if (autodemo_configuration.has_value() &&
             interaction_scheduler.updated_last_tick())
         {
             ++autodemo_state.runtime_tick;
+        }
+        if (placement_autodemo_enabled &&
+            interaction_scheduler.updated_last_tick())
+        {
+            if (interaction_scheduler.place_preview().has_value())
+            {
+                placement_autodemo_state.live_preview =
+                    *interaction_scheduler.place_preview();
+            }
+            else if (interaction_output.diagnostics.state ==
+                         interaction::RuntimeState::PlacePreflight &&
+                     interaction_output.diagnostics.place.preview_available)
+            {
+                placement_autodemo_state.live_preview =
+                    interaction_output.diagnostics.place.preview;
+                placement_autodemo_state.submitted_selection_id =
+                    interaction_output.diagnostics.place.selection_id;
+                autodemo_action = AutodemoAction::Place;
+            }
         }
         const bool interaction_scene_sample_updated =
             interaction_scheduler.updated_last_tick();
@@ -3815,6 +6028,8 @@ int main(void)
             interaction_scene_target == selected_constraint_target &&
             selected_affordance != nullptr &&
             (selected_constraint_target->state ==
+                 interaction::ObjectState::Targeted ||
+             selected_constraint_target->state ==
                  interaction::ObjectState::Attached ||
              selected_constraint_target->state ==
                  interaction::ObjectState::Held) &&
@@ -3854,14 +6069,6 @@ int main(void)
             interaction_frame_state.pose.foot_contacts[0] != 0U;
         curr_bone_contacts(1) =
             interaction_frame_state.pose.foot_contacts[1] != 0U;
-        if (interaction_frame_state.runtime_owns_pose)
-        {
-            latest_owned_interaction_pose = interaction_output.pose;
-        }
-        else
-        {
-            latest_owned_interaction_pose.reset();
-        }
         if (interaction_frame_state.synchronize_simulation_root)
         {
             simulation_position =
@@ -3872,9 +6079,8 @@ int main(void)
         const interaction::Pose interaction_debug_pose =
             interaction::expand_flat_controller_pose(
                 interaction_frame_state.pose,
-                interaction_frame_state.runtime_owns_pose
-                    ? interaction_output.pose
-                    : locomotion_pose);
+                interaction_reference_pose,
+                interaction_flat_reference_pose);
         
 #ifdef MM_DISCRETE
         {
@@ -4087,8 +6293,8 @@ int main(void)
             camera_distance,
             bone_positions(0) + vec3(0, 1, 0),
             // simulation_position + vec3(0, 1, 0),
-            gamepadstick_right,
-            desired_strafe,
+            raw_gamepadstick_right,
+            raw_desired_strafe,
             dt);
 
         // Render
@@ -4162,6 +6368,43 @@ int main(void)
             interaction_debug_pose,
             locomotion_pose,
             interaction_config.matcher.maximum_approach_m);
+        // Manual pick-assist route rendering begins.
+        if (manual_pick_assist.active() ||
+            manual_pick_final_preview_certified_this_tick)
+        {
+            const interaction::PickAssistDiagnostics& diagnostics =
+                manual_pick_assist.diagnostics();
+            DrawLine3D(
+                to_Vector3(bone_positions(0)),
+                to_Vector3(manual_pick_common_entry),
+                GOLD);
+            if (diagnostics.selected_slot >= 0 &&
+                diagnostics.selected_slot <
+                    static_cast<int>(manual_pick_entry_slots.ordered.size()))
+            {
+                const vec3 frozen_slot = manual_pick_entry_slots.ordered[
+                    static_cast<size_t>(diagnostics.selected_slot)]
+                        .waypoint.position;
+                const bool final_preview_certified =
+                    diagnostics.state ==
+                        interaction::PickAssistState::ReadyToSubmit ||
+                    manual_pick_final_preview_certified_this_tick;
+                const Color frozen_slot_color = final_preview_certified
+                    ? GREEN
+                    : ORANGE;
+                DrawLine3D(
+                    to_Vector3(manual_pick_common_entry),
+                    to_Vector3(frozen_slot),
+                    frozen_slot_color);
+                DrawSphereWires(
+                    to_Vector3(frozen_slot),
+                    0.06F,
+                    8,
+                    12,
+                    frozen_slot_color);
+            }
+        }
+        // Manual pick-assist route rendering ends.
         
         // G1: no skinned mesh — draw the skeleton directly from bone transforms.
         // Sphere at each joint, capsule (cylinder) from each bone to its parent.
@@ -4204,6 +6447,86 @@ int main(void)
             interaction_pack_diagnostic.c_str(),
             340,
             20);
+        // Manual pick-assist diagnostics begins.
+        const interaction::PickAssistDiagnostics& manual_pick_diagnostics =
+            manual_pick_assist.diagnostics();
+        DrawText(
+            TextFormat(
+                "assist=%s reason=%s slot=%d settle=%u/%u route=%.3fm "
+                "object_distance_at_begin=%.3fm",
+                interaction::pick_assist_state_name(
+                    manual_pick_diagnostics.state),
+                interaction::pick_assist_reason_name(
+                    manual_pick_diagnostics.reason),
+                manual_pick_diagnostics.selected_slot,
+                manual_pick_diagnostics.settle_ticks,
+                manual_pick_assist_config.required_settle_ticks,
+                manual_pick_diagnostics.route_length_m,
+                manual_pick_object_distance_at_begin_m),
+            340,
+            262,
+            14,
+            DARKGRAY);
+        DrawText(
+            TextFormat(
+                "error=%.3fm yaw=%.2fdeg speed=%.3fm/s",
+                manual_pick_diagnostics.root_error_m,
+                manual_pick_diagnostics.yaw_error_radians * 180.0F / PIf,
+                manual_pick_diagnostics.speed_mps),
+            340,
+            282,
+            14,
+            DARKGRAY);
+        DrawText(
+            TextFormat(
+                "final=%d fp_equal=%d roots_finite=%d root_equal=%d",
+                manual_pick_diagnostics.final_preview.available,
+                manual_pick_diagnostics.final_preview.fingerprint_equal,
+                manual_pick_diagnostics.final_preview
+                    .all_preview_roots_finite,
+                manual_pick_diagnostics.final_preview
+                    .prospective_root_equal),
+            340,
+            302,
+            14,
+            DARKGRAY);
+        DrawText(
+            TextFormat(
+                "path=%d/%s match=%d/%s",
+                manual_pick_diagnostics.final_preview.path_feasible,
+                interaction::debug_draw::reason_name(
+                    manual_pick_diagnostics.final_preview.path_reason),
+                manual_pick_diagnostics.final_preview.match_ready,
+                interaction::debug_draw::reason_name(
+                    manual_pick_diagnostics.final_preview.match_reason)),
+            340,
+            322,
+            14,
+            DARKGRAY);
+        DrawText(
+            TextFormat(
+                "entry=%d contact=%d cost=%.3f",
+                manual_pick_diagnostics.final_preview.feasible_entry_frame,
+                manual_pick_diagnostics.final_preview.contact_frame,
+                manual_pick_diagnostics.final_preview.total_cost),
+            340,
+            342,
+            14,
+            DARKGRAY);
+        DrawText(
+            TextFormat(
+                "stationary searches=%llu transitions=%llu frame=%d cost=%.3f",
+                static_cast<unsigned long long>(
+                    manual_pick_stationary_diagnostics.search_count),
+                static_cast<unsigned long long>(
+                    manual_pick_stationary_diagnostics.transition_count),
+                manual_pick_stationary_diagnostics.selected_frame,
+                manual_pick_stationary_diagnostics.selected_cost),
+            340,
+            362,
+            14,
+            DARKGRAY);
+        // Manual pick-assist diagnostics ends.
 
         // UI
         
@@ -4477,7 +6800,7 @@ int main(void)
 
         EndDrawing();
 
-        if (autodemo_configuration.has_value())
+        if (pickup_autodemo_enabled)
         {
             if (autodemo_state.reset_presentation_frames_remaining > 0U)
             {
@@ -4695,6 +7018,787 @@ int main(void)
                     {
                         throw std::runtime_error(
                             "autodemo evidence exceeded its 25 Hz bound");
+                    }
+                }
+            }
+        }
+        else if (placement_autodemo_enabled)
+        {
+            ++autodemo_state.warmup_render_ticks;
+            const interaction::RuntimeState runtime_state =
+                interaction_output.diagnostics.state;
+            const vec3 displayed_root = bone_positions(0);
+            const AutodemoEvidenceCapture& capture =
+                autodemo_evidence_capture.value();
+            if (!placement_autodemo_state.evidence_started)
+            {
+                if (runtime_state == interaction::RuntimeState::Locomotion)
+                {
+                    if (autodemo_state.runtime_tick == 0U)
+                    {
+                        throw std::runtime_error(
+                            "placement auto-demo did not warm on a 25 Hz tick");
+                    }
+                    placement_autodemo_state.walking_origin = displayed_root;
+                    placement_autodemo_state.previous_displayed_root =
+                        displayed_root;
+                    placement_autodemo_state.origin_captured = true;
+                    placement_autodemo_state.initial_pickup_distance_m =
+                        autodemo_planar_distance(
+                            displayed_root, capture.object_world.position);
+                    if (!(placement_autodemo_state
+                              .initial_pickup_distance_m >
+                          kPlacementAutodemoInitialDistanceM))
+                    {
+                        throw std::runtime_error(
+                            "placement auto-demo default spawn must be more "
+                            "than 2.80 m from the pickup object");
+                    }
+                    placement_autodemo_state.evidence_started = true;
+                    placement_autodemo_state.attachment_initialized = true;
+                    placement_autodemo_state.last_attached =
+                        interaction_output.diagnostics.attached;
+                }
+                else if (runtime_state !=
+                         interaction::RuntimeState::Disabled)
+                {
+                    throw std::runtime_error(
+                        "placement auto-demo warmup produced an unexpected "
+                        "state");
+                }
+                else if (autodemo_state.warmup_render_ticks >=
+                         kAutodemoWarmupFrames)
+                {
+                    throw std::runtime_error(
+                        "placement auto-demo warmup exceeded its 25 Hz "
+                        "deadline");
+                }
+            }
+
+            if (placement_autodemo_state.evidence_started)
+            {
+                validate_placement_autodemo_state_progression(
+                    placement_autodemo_state,
+                    interaction_output.diagnostics);
+                const interaction::ResultCode result =
+                    interaction_output.diagnostics.result;
+                if (placement_autodemo_state.interact_pulsed &&
+                    (runtime_state == interaction::RuntimeState::Disabled ||
+                     result == interaction::ResultCode::Rejected ||
+                     result == interaction::ResultCode::Cancelled ||
+                     result == interaction::ResultCode::Failed ||
+                     result == interaction::ResultCode::Reset))
+                {
+                    std::string message =
+                        "placement auto-demo runtime failed after Interact: ";
+                    message += "state=";
+                    message += interaction::debug_draw::state_name(
+                        runtime_state);
+                    message += " result=";
+                    message += interaction::debug_draw::result_name(result);
+                    message += " reason=";
+                    message += interaction::debug_draw::reason_name(
+                        interaction_output.diagnostics.reason);
+                    throw std::runtime_error(message);
+                }
+                if (!placement_autodemo_state.place_observed &&
+                    interaction_surface_registry.find(
+                        interaction_destination_surface_handle) == nullptr)
+                {
+                    placement_autodemo_state
+                        .destination_generation_changed_before_place = true;
+                    throw std::runtime_error(
+                        "placement auto-demo destination generation changed "
+                        "before Place");
+                }
+
+                const float displayed_root_speed_mps =
+                    placement_autodemo_state.render_frame == 0U
+                    ? 0.0F
+                    : 25.0F * autodemo_planar_distance(
+                          displayed_root,
+                          placement_autodemo_state.previous_displayed_root);
+                placement_autodemo_state.last_root_speed_mps =
+                    displayed_root_speed_mps;
+                const float walking_displacement_m =
+                    autodemo_planar_distance(
+                        displayed_root,
+                        placement_autodemo_state.walking_origin);
+                const float pickup_distance_m = autodemo_planar_distance(
+                    displayed_root, capture.object_world.position);
+                const bool in_standoff_band =
+                    pickup_distance_m >=
+                        kPlacementAutodemoArrivalConfig.minimum_standoff_m &&
+                    pickup_distance_m <=
+                        kPlacementAutodemoArrivalConfig.maximum_standoff_m;
+                const float reach_position_error_m =
+                    autodemo_planar_distance(
+                        displayed_root,
+                        placement_autodemo_state.reach_waypoint.position);
+                const float interaction_position_error_m =
+                    autodemo_planar_distance(
+                        displayed_root,
+                        placement_autodemo_state
+                            .interaction_waypoint.position);
+                const float reach_yaw_error_radians = std::abs(
+                    autodemo_shortest_angle(
+                        autodemo_yaw_radians(bone_rotations(0)) -
+                        autodemo_yaw_radians(
+                            placement_autodemo_state
+                                .reach_waypoint.rotation)));
+
+                if (interaction_output.diagnostics.attached !=
+                    placement_autodemo_state.last_attached)
+                {
+                    ++placement_autodemo_state.attachment_transition_count;
+                    if (placement_autodemo_state.last_attached &&
+                        !interaction_output.diagnostics.attached)
+                    {
+                        ++placement_autodemo_state
+                              .attached_to_free_transition_count;
+                    }
+                    placement_autodemo_state.last_attached =
+                        interaction_output.diagnostics.attached;
+                }
+
+                const interaction::InteractionTarget* observed_pick_target =
+                    interaction_registry.find_by_id(
+                        interaction_authored_target.handle.id);
+                if (runtime_state == interaction::RuntimeState::Align &&
+                    observed_pick_target != nullptr &&
+                    observed_pick_target->state == interaction::ObjectState::Targeted &&
+                    observed_pick_target->owner_request + 1U ==
+                        interaction_next_request_id &&
+                    interaction_output.diagnostics.target ==
+                        observed_pick_target->handle &&
+                    interaction_output.diagnostics.object_state ==
+                        interaction::ObjectState::Targeted &&
+                    placement_autodemo_state
+                            .pick_reservation_transition_count == 0U)
+                {
+                    ++placement_autodemo_state
+                          .pick_reservation_transition_count;
+                }
+
+                const bool pickup_candidate_state =
+                    runtime_state == interaction::RuntimeState::Align ||
+                    runtime_state ==
+                        interaction::RuntimeState::PickupReplay ||
+                    runtime_state == interaction::RuntimeState::Hold ||
+                    runtime_state == interaction::RuntimeState::Carry;
+                if (pickup_candidate_state &&
+                    interaction_output.diagnostics.clip != 0)
+                {
+                    throw std::runtime_error(
+                        "placement auto-demo pickup accepted a non-clip-0 "
+                        "candidate");
+                }
+                if (runtime_state == interaction::RuntimeState::Carry &&
+                    !interaction_output.diagnostics.attached)
+                {
+                    throw std::runtime_error(
+                        "placement auto-demo Carry lost attachment");
+                }
+                const bool owned_pre_release =
+                    runtime_state == interaction::RuntimeState::Carry ||
+                    runtime_state ==
+                        interaction::RuntimeState::PlacePreflight ||
+                    runtime_state ==
+                        interaction::RuntimeState::PlaceAlign ||
+                    runtime_state ==
+                        interaction::RuntimeState::PlaceReplay;
+                if (owned_pre_release &&
+                    (interaction_output.diagnostics.object_state !=
+                         interaction::ObjectState::Held ||
+                     !interaction_output.diagnostics.attached ||
+                     !interaction_output.owns_pose ||
+                     !capture.grasp_evidence_valid ||
+                     capture.hand_constraint_weight != 1.0F ||
+                     !capture.hand_constraint_validated ||
+                     !capture.hand_constraint_result.applied ||
+                     !capture.hand_constraint_result.reachable))
+                {
+                    std::ostringstream message;
+                    message
+                        << "placement auto-demo lost its validated full-weight "
+                           "rendered grasp"
+                        << " state="
+                        << interaction::debug_draw::state_name(runtime_state)
+                        << " object_state="
+                        << interaction::debug_draw::object_state_name(
+                               interaction_output.diagnostics.object_state)
+                        << " attached="
+                        << (interaction_output.diagnostics.attached
+                                ? "true" : "false")
+                        << " owns_pose="
+                        << (interaction_output.owns_pose ? "true" : "false")
+                        << " grasp_valid="
+                        << (capture.grasp_evidence_valid ? "true" : "false")
+                        << " weight=" << capture.hand_constraint_weight
+                        << " validated="
+                        << (capture.hand_constraint_validated
+                                ? "true" : "false")
+                        << " applied="
+                        << (capture.hand_constraint_result.applied
+                                ? "true" : "false")
+                        << " reachable="
+                        << (capture.hand_constraint_result.reachable
+                                ? "true" : "false")
+                        << " reach_shortfall="
+                        << capture.hand_constraint_result.reach_shortfall_m
+                        << " target="
+                        << interaction_output.diagnostics.target.id << ':'
+                        << interaction_output.diagnostics.target.generation
+                        << " affordance="
+                        << interaction_output.diagnostics.affordance_id
+                        << " hand="
+                        << (interaction_output.diagnostics.hand ==
+                                    interaction::Hand::Left
+                                ? "left" : "right");
+                    throw std::runtime_error(message.str());
+                }
+
+                if (placement_autodemo_state.interact_pulsed &&
+                    !placement_autodemo_state.destination_latched &&
+                    runtime_state != interaction::RuntimeState::Carry)
+                {
+                    ++placement_autodemo_state.pickup_to_carry_ticks;
+                    if (placement_autodemo_state.pickup_to_carry_ticks >
+                        kPlacementAutodemoPickupToCarryTicks)
+                    {
+                        throw std::runtime_error(
+                            "placement auto-demo pickup-to-Carry exceeded "
+                            "375 ticks");
+                    }
+                }
+
+                bool far_preview_this_tick = false;
+                if (placement_preview_called_this_tick)
+                {
+                    if (!placement_autodemo_state.live_preview.has_value())
+                    {
+                        throw std::runtime_error(
+                            "placement auto-demo preview call produced no "
+                            "live preview");
+                    }
+                    const interaction::PlaceStagingPreview& preview =
+                        *placement_autodemo_state.live_preview;
+                    if (!preview.accepted ||
+                        preview.candidate.selection_id == 0U ||
+                        preview.candidate.source_id == 0U ||
+                        preview.ik_config_fingerprint == 0U ||
+                        !autodemo_same_ik(preview.ik, interaction_config.ik) ||
+                        !autodemo_same_ik(
+                            preview.candidate.ik, interaction_config.ik))
+                    {
+                        std::ostringstream message;
+                        message
+                            << "placement auto-demo preview was not a "
+                               "certified runtime-owned candidate: accepted="
+                            << (preview.accepted ? "true" : "false")
+                            << " reason="
+                            << interaction::debug_draw::reason_name(
+                                   preview.reason)
+                            << " source_id="
+                            << preview.candidate.source_id
+                            << " selection_id="
+                            << preview.candidate.selection_id
+                            << " ik_fingerprint="
+                            << preview.ik_config_fingerprint
+                            << " preview_ik_exact="
+                            << (autodemo_same_ik(
+                                    preview.ik, interaction_config.ik)
+                                    ? "true" : "false")
+                            << " candidate_ik_exact="
+                            << (autodemo_same_ik(
+                                    preview.candidate.ik,
+                                    interaction_config.ik)
+                                    ? "true" : "false");
+                        throw std::runtime_error(message.str());
+                    }
+                    placement_autodemo_state.current_selection_id =
+                        preview.candidate.selection_id;
+                    if (!placement_autodemo_state.initial_preview_verified)
+                    {
+                        if (runtime_state !=
+                                interaction::RuntimeState::Carry ||
+                            autodemo_action !=
+                                AutodemoAction::LatchDestination ||
+                            preview.ready ||
+                            (preview.root_error_m <=
+                                 interaction::kPlaceStagingMaximumRootErrorM &&
+                             preview.yaw_error_radians <=
+                                 interaction::
+                                     kPlaceStagingMaximumYawErrorRadians))
+                        {
+                            throw std::runtime_error(
+                                "placement auto-demo initial far preview was "
+                                "not intrinsically not-ready");
+                        }
+                        placement_autodemo_state.initial_far_selection_id =
+                            preview.candidate.selection_id;
+                        placement_autodemo_state.preview_ik_fingerprint =
+                            preview.ik_config_fingerprint;
+                        placement_autodemo_state.carry_origin_root =
+                            displayed_root;
+                        placement_autodemo_state.carry_origin_object =
+                            capture.object_world.position;
+                        placement_autodemo_state.initial_preview_verified =
+                            true;
+                        far_preview_this_tick = true;
+                    }
+                    else if (preview.ik_config_fingerprint !=
+                             placement_autodemo_state
+                                 .preview_ik_fingerprint)
+                    {
+                        throw std::runtime_error(
+                            "placement auto-demo preview IK fingerprint "
+                            "changed during staging");
+                    }
+
+                    if (runtime_state ==
+                        interaction::RuntimeState::PlacePreflight)
+                    {
+                        if (autodemo_action != AutodemoAction::Place ||
+                            !preview.ready ||
+                            preview.root_error_m >
+                                interaction::
+                                    kPlaceStagingMaximumRootErrorM ||
+                            preview.yaw_error_radians >
+                                interaction::
+                                    kPlaceStagingMaximumYawErrorRadians ||
+                            placement_autodemo_state
+                                    .submitted_selection_id !=
+                                preview.candidate.selection_id ||
+                            preview.candidate.selection_id ==
+                                placement_autodemo_state
+                                    .initial_far_selection_id)
+                        {
+                            throw std::runtime_error(
+                                "placement auto-demo Place edge did not use "
+                                "the current distinct ready live preview");
+                        }
+                        if (placement_autodemo_state.carry_staging_ticks <
+                                kPlacementAutodemoMinimumCarryTicks ||
+                            placement_autodemo_state.carry_staging_ticks >
+                                kPlacementAutodemoMaximumCarryTicks ||
+                            autodemo_planar_distance(
+                                displayed_root,
+                                placement_autodemo_state
+                                    .carry_origin_root) <= 0.20F ||
+                            autodemo_planar_distance(
+                                capture.object_world.position,
+                                placement_autodemo_state
+                                    .carry_origin_object) <= 0.20F)
+                        {
+                            throw std::runtime_error(
+                                "placement auto-demo ordinary Carry staging "
+                                "contract was not met");
+                        }
+                        placement_autodemo_state.place_observed = true;
+                    }
+                }
+
+                const char* demo_phase = "pickup";
+                uint32_t phase_counter =
+                    placement_autodemo_state.pickup_to_carry_ticks;
+                int carry_staging_tick = -1;
+                if (autodemo_action == AutodemoAction::Approach)
+                {
+                    ++placement_autodemo_state.walk_ticks;
+                    placement_autodemo_state.settle_ticks = 0U;
+                    demo_phase = "approach";
+                    phase_counter = placement_autodemo_state.walk_ticks;
+                }
+                else if (autodemo_action == AutodemoAction::Interact)
+                {
+                    demo_phase = "interact";
+                    phase_counter = placement_autodemo_state.settle_ticks;
+                }
+                else if (!placement_autodemo_state.interact_pulsed &&
+                         runtime_state ==
+                             interaction::RuntimeState::Locomotion)
+                {
+                    const bool walk_contract_met =
+                        placement_autodemo_state.walk_ticks >=
+                            kPlacementAutodemoMinimumWalkTicks &&
+                        walking_displacement_m >=
+                            kPlacementAutodemoMinimumWalkDisplacementM;
+                    if (placement_autodemo_state
+                            .frozen_pick_entry_index.has_value() &&
+                        walk_contract_met && in_standoff_band &&
+                        displayed_root_speed_mps <=
+                            kPlacementAutodemoSettleMaximumSpeedMps &&
+                        interaction_position_error_m <=
+                            kPlacementAutodemoAlignmentPositionErrorM &&
+                        reach_yaw_error_radians <=
+                            kPlacementAutodemoReachYawErrorRadians)
+                    {
+                        ++placement_autodemo_state.settle_ticks;
+                    }
+                    else
+                    {
+                        placement_autodemo_state.settle_ticks = 0U;
+                    }
+                    demo_phase = "settle";
+                    phase_counter =
+                        placement_autodemo_state.settle_ticks;
+                }
+                else if (runtime_state ==
+                         interaction::RuntimeState::Carry)
+                {
+                    if (far_preview_this_tick)
+                    {
+                        demo_phase = "carry_preview";
+                        phase_counter = 1U;
+                    }
+                    else if (placement_preview_called_this_tick)
+                    {
+                        if (autodemo_action != AutodemoAction::Stage ||
+                            placement_autodemo_state.live_preview->ready ||
+                            length(placement_autodemo_state
+                                       .left_stick_command) <= 1.0e-4F)
+                        {
+                            throw std::runtime_error(
+                                "placement auto-demo staging escaped "
+                                "ordinary nonzero Carry input");
+                        }
+                        carry_staging_tick = static_cast<int>(
+                            placement_autodemo_state.carry_staging_ticks);
+                        ++placement_autodemo_state.carry_staging_ticks;
+                        if (placement_autodemo_state.carry_staging_ticks >
+                            kPlacementAutodemoMaximumCarryTicks)
+                        {
+                            throw std::runtime_error(
+                                "placement auto-demo Carry staging exceeded "
+                                "150 ticks");
+                        }
+                        demo_phase = "carry_staging";
+                        phase_counter =
+                            placement_autodemo_state.carry_staging_ticks;
+                    }
+                }
+
+                const bool place_runtime_state =
+                    runtime_state ==
+                        interaction::RuntimeState::PlacePreflight ||
+                    runtime_state ==
+                        interaction::RuntimeState::PlaceAlign ||
+                    runtime_state ==
+                        interaction::RuntimeState::PlaceReplay ||
+                    runtime_state ==
+                        interaction::RuntimeState::PlaceRelease;
+                if (place_runtime_state)
+                {
+                    ++placement_autodemo_state.place_ticks;
+                    if (placement_autodemo_state.place_ticks >
+                        kPlacementAutodemoPlaceTicks)
+                    {
+                        throw std::runtime_error(
+                            "placement auto-demo Place exceeded 250 ticks");
+                    }
+                    demo_phase = "place";
+                    phase_counter = placement_autodemo_state.place_ticks;
+                }
+
+                if (runtime_state ==
+                        interaction::RuntimeState::PlaceRelease &&
+                    interaction_output.diagnostics.place.released &&
+                    !placement_autodemo_state.actual_fit_captured)
+                {
+                    placement_autodemo_state.final_actual_fit =
+                        interaction_output.diagnostics.place.actual_fit;
+                    placement_autodemo_state.final_support_sweep_clear =
+                        interaction_output.diagnostics.place
+                            .support_sweep_clear;
+                    placement_autodemo_state.actual_fit_captured = true;
+                }
+
+                const interaction::InteractionTarget* committed_target =
+                    interaction_registry.find_by_id(
+                        interaction_authored_target.handle.id);
+                if (committed_target != nullptr &&
+                    committed_target->state ==
+                        interaction::ObjectState::Free &&
+                    placement_autodemo_state.place_observed)
+                {
+                    placement_autodemo_state.destination_support_committed =
+                        length(
+                            committed_target->table_world.position -
+                            interaction_authored_destination_surface
+                                .support_volume_world.position) <= 1.0e-5F &&
+                        quat_angle_between(
+                            committed_target->table_world.rotation,
+                            interaction_authored_destination_surface
+                                .support_volume_world.rotation) <= 1.0e-5F &&
+                        length(
+                            committed_target->table_size -
+                            interaction_authored_destination_surface
+                                .support_volume_size) <= 1.0e-5F;
+                }
+
+                const bool final_locomotion =
+                    placement_autodemo_state.place_observed &&
+                    runtime_state ==
+                        interaction::RuntimeState::Locomotion;
+                if (final_locomotion)
+                {
+                    ++placement_autodemo_state.handoff_frames_recorded;
+                    if (placement_autodemo_state.handoff_frames_recorded >
+                        kPlacementAutodemoMaximumHandoffFrames)
+                    {
+                        throw std::runtime_error(
+                            "placement auto-demo handoff exceeded seventy-five "
+                            "frames");
+                    }
+                    if (!interaction_frame_state.overrides_locomotion_pose)
+                    {
+                        ++placement_autodemo_state
+                              .post_release_settled_frames_recorded;
+                    }
+                    else
+                    {
+                        placement_autodemo_state
+                            .post_release_settled_frames_recorded = 0U;
+                    }
+                    const bool placement_presentation_ready =
+                        placement_autodemo_state.handoff_frames_recorded >=
+                            kPlacementAutodemoHandoffFrames &&
+                        placement_autodemo_state
+                                .post_release_settled_frames_recorded >=
+                            kPlacementAutodemoSettledFrames;
+                    placement_autodemo_state.handoff_frames_remaining =
+                        placement_presentation_ready ? 0U : 1U;
+                    demo_phase = "handoff";
+                    phase_counter =
+                        placement_autodemo_state.handoff_frames_recorded;
+                }
+
+                const bool publish_pick_preview_failure =
+                    placement_autodemo_state
+                            .pending_pick_preview_failure !=
+                        PlacementPickPreviewFailure::None &&
+                    !placement_autodemo_state
+                         .pick_preview_failure_recorded;
+                std::optional<ControllerPlacementAutodemoState>
+                    terminal_record_state;
+                if (publish_pick_preview_failure)
+                {
+                    terminal_record_state = placement_autodemo_state;
+                    terminal_record_state->pick_preview_failure_recorded =
+                        true;
+                }
+                const ControllerPlacementAutodemoState& record_state =
+                    terminal_record_state.has_value()
+                    ? *terminal_record_state
+                    : placement_autodemo_state;
+                write_placement_autodemo_record(
+                    autodemo_state.log,
+                    record_state,
+                    autodemo_state.runtime_tick,
+                    interaction_scheduler.phase(),
+                    interaction_output,
+                    interaction_config,
+                    interaction_authored_target,
+                    interaction_authored_destination_surface,
+                    interaction_destination_affordance_id,
+                    interaction_authored_target.object_bounds,
+                    capture,
+                    displayed_root,
+                    pickup_distance_m,
+                    walking_displacement_m,
+                    displayed_root_speed_mps,
+                    autodemo_action,
+                    demo_phase,
+                    phase_counter,
+                    carry_staging_tick,
+                    placement_preview_called_this_tick,
+                    placement_autodemo_state
+                        .destination_support_committed);
+                if (publish_pick_preview_failure)
+                {
+                    autodemo_state.log.flush();
+                    if (!autodemo_state.log)
+                    {
+                        throw std::runtime_error(
+                            "cannot flush terminal pickup preview evidence");
+                    }
+                    placement_autodemo_state
+                        .pick_preview_failure_recorded = true;
+                }
+
+                placement_autodemo_state.previous_displayed_root =
+                    displayed_root;
+                if (placement_autodemo_state.walk_ticks >
+                        kPlacementAutodemoMaximumWalkTicks &&
+                    !placement_autodemo_state.interact_pulsed &&
+                    !placement_autodemo_state.reach_entry_reached)
+                {
+                    std::string message =
+                        "placement auto-demo approach exceeded 250 ticks: ";
+                    message += "entry_reached=";
+                    message += placement_autodemo_state.reach_entry_reached
+                        ? "true" : "false";
+                    message += " entry_error_m=" + std::to_string(
+                        autodemo_planar_distance(
+                            displayed_root,
+                            placement_autodemo_state.reach_entry_point));
+                    message += " waypoint_position_error_m=" +
+                        std::to_string(reach_position_error_m);
+                    message += " waypoint_yaw_error_degrees=" +
+                        std::to_string(
+                            reach_yaw_error_radians * 180.0F / PIf);
+                    message += " pickup_distance_m=" +
+                        std::to_string(pickup_distance_m);
+                    message += " root_speed_mps=" +
+                        std::to_string(displayed_root_speed_mps);
+                    message += " walk_displacement_m=" +
+                        std::to_string(walking_displacement_m);
+                    throw std::runtime_error(message);
+                }
+
+                if (final_locomotion)
+                {
+                    const interaction::PlaceAffordance& place_affordance =
+                        interaction_authored_destination_surface
+                            .affordances.front();
+                    const interaction::Transform place_goal =
+                        interaction::placement_goal_world(
+                            interaction_authored_destination_surface,
+                            place_affordance.object_in_surface);
+                    const float final_orientation_error_degrees =
+                        quat_angle_between(
+                            capture.object_world.rotation,
+                            place_goal.rotation) * 180.0F / PIf;
+                    const interaction::PlaceMotionMode mode =
+                        placement_autodemo_state.live_preview.has_value()
+                        ? placement_autodemo_state.live_preview
+                              ->candidate.mode
+                        : interaction::PlaceMotionMode::None;
+                    const bool instrumentation_clean =
+                        placement_autodemo_state
+                                .locomotion_provider_calls ==
+                            placement_autodemo_state
+                                .live_flat_provider_calls &&
+                        placement_autodemo_state
+                                .canonical_snapshot_provider_calls == 0U &&
+                        placement_autodemo_state.root_relocation_calls == 0U &&
+                        placement_autodemo_state
+                                .simulation_root_initialization_calls == 0U &&
+                        placement_autodemo_state
+                                .displayed_root_initialization_calls == 0U &&
+                        placement_autodemo_state.pick_resolver_calls == 1U &&
+                        placement_autodemo_state
+                            .pick_resolver_used_live_flat &&
+                        placement_autodemo_state
+                                .placement_surface_resolver_calls == 0U &&
+                        placement_autodemo_state.free_selector_calls == 0U &&
+                        placement_autodemo_state
+                                .external_match_input_calls == 0U &&
+                        placement_autodemo_state.preview_mutation_count == 0U &&
+                        placement_autodemo_state.direct_root_write_calls == 0U &&
+                        !placement_autodemo_state
+                             .destination_generation_changed_before_place;
+                    if (interaction_output.diagnostics.result !=
+                            interaction::ResultCode::Succeeded ||
+                        interaction_output.diagnostics.reason !=
+                            interaction::Reason::None ||
+                        interaction_output.diagnostics.object_state !=
+                            interaction::ObjectState::Free ||
+                        interaction_output.diagnostics.attached ||
+                        interaction_output.owns_pose ||
+                        placement_autodemo_state.collapsed_states.size() !=
+                            11U ||
+                        placement_autodemo_state.walk_ticks <
+                            kPlacementAutodemoMinimumWalkTicks ||
+                        walking_displacement_m <
+                            kPlacementAutodemoMinimumWalkDisplacementM ||
+                        placement_autodemo_state.settle_ticks <
+                            kPlacementAutodemoSettleTicks ||
+                        placement_autodemo_state
+                                .attachment_transition_count != 2U ||
+                        placement_autodemo_state
+                                .attached_to_free_transition_count != 1U ||
+                        !placement_autodemo_state.actual_fit_captured ||
+                        !placement_autodemo_state.final_actual_fit.accepted ||
+                        !placement_autodemo_state.final_actual_fit
+                             .footprint_valid ||
+                        !placement_autodemo_state.final_actual_fit
+                             .overhead_valid ||
+                        placement_autodemo_state.final_actual_fit
+                                .support_gap_m < -0.005F ||
+                        placement_autodemo_state.final_actual_fit
+                                .support_gap_m > 0.020F ||
+                        !placement_autodemo_state
+                             .final_support_sweep_clear ||
+                        !placement_autodemo_state
+                             .destination_support_committed ||
+                        length(
+                            capture.object_world.position -
+                            place_goal.position) > 0.020F ||
+                        final_orientation_error_degrees > 10.0F ||
+                        (mode !=
+                             interaction::PlaceMotionMode::RecordedPlace &&
+                         mode != interaction::PlaceMotionMode::
+                                     ReversedPickup) ||
+                        !instrumentation_clean)
+                    {
+                        throw std::runtime_error(
+                            "placement auto-demo final evidence contract was "
+                            "not met");
+                    }
+                    if (placement_autodemo_state.handoff_frames_recorded >=
+                            kPlacementAutodemoHandoffFrames &&
+                        placement_autodemo_state
+                                .post_release_settled_frames_recorded >=
+                            kPlacementAutodemoSettledFrames)
+                    {
+                        const std::string screenshot_temporary =
+                            autodemo_configuration->screenshot_temporary
+                                .string();
+                        TakeScreenshot(screenshot_temporary.c_str());
+                        validate_autodemo_screenshot(
+                            *autodemo_configuration);
+                        placement_autodemo_state.screenshot_captured = true;
+                        autodemo_state.log.flush();
+                        if (!autodemo_state.log)
+                        {
+                            throw std::runtime_error(
+                                "cannot flush placement auto-demo JSONL");
+                        }
+                        autodemo_state.log.close();
+                        if (autodemo_state.log.fail())
+                        {
+                            throw std::runtime_error(
+                                "cannot close placement auto-demo JSONL");
+                        }
+                        placement_autodemo_state.final_record_written = true;
+                        publish_autodemo_evidence(
+                            *autodemo_configuration);
+                        autodemo_state.complete = true;
+                        autodemo_state.exit_requested = true;
+                    }
+                    else
+                    {
+                        ++placement_autodemo_state.render_frame;
+                        if (placement_autodemo_state.render_frame >=
+                            kPlacementAutodemoMaximumEvidenceFrames)
+                        {
+                            throw std::runtime_error(
+                                "placement auto-demo evidence exceeded its "
+                                "900 record bound");
+                        }
+                    }
+                }
+                else
+                {
+                    ++placement_autodemo_state.render_frame;
+                    if (placement_autodemo_state.render_frame >=
+                        kPlacementAutodemoMaximumEvidenceFrames)
+                    {
+                        throw std::runtime_error(
+                            "placement auto-demo evidence exceeded its 900 "
+                            "record bound");
                     }
                 }
             }

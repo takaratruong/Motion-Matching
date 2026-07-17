@@ -44,6 +44,24 @@ struct RuntimeConfig {
     PlaceControllerConfig place{};
 };
 
+struct PickEntryRoot {
+    float world_x = 0.0F;
+    float world_z = 0.0F;
+    float world_yaw_radians = 0.0F;
+};
+
+struct PickEntryPreview {
+    bool path_feasible = false;
+    bool match_ready = false;
+    Reason path_reason = Reason::None;
+    Reason match_reason = Reason::None;
+    PickEntryRoot prospective_root{};
+    int32_t feasible_entry_frame = -1;
+    int32_t contact_frame = -1;
+    float total_cost = 0.0F;
+    MatchCandidate match_candidate{};
+};
+
 struct RuntimeInput {
     float dt = 0.0F;
     LocomotionSnapshot locomotion{};
@@ -128,6 +146,37 @@ struct RuntimeOutput {
     RuntimeDiagnostics diagnostics{};
 };
 
+namespace runtime_detail {
+
+struct RealizedPickTransitionEvaluation {
+    bool feasible = false;
+    Reason reason = Reason::None;
+    int32_t frame = -1;
+};
+
+RealizedPickTransitionEvaluation evaluate_realized_pick_transition(
+    const Database& database,
+    const Pose& live_entry_pose,
+    const MatchCandidate& candidate,
+    const InteractionTarget& target,
+    const GraspAffordance& affordance,
+    const PlaybackConfig& playback_config,
+    const IKConfig& ik_config);
+
+struct PickSnapshotMap {
+    bool accepted = false;
+    Reason reason = Reason::None;
+    LocomotionSnapshot snapshot{};
+};
+
+PickSnapshotMap map_pick_entry_snapshot(
+    const LocomotionSnapshot& snapshot,
+    PickEntryRoot root);
+uint64_t locomotion_snapshot_fingerprint(
+    const LocomotionSnapshot& snapshot);
+
+}  // namespace runtime_detail
+
 class InteractionRuntime {
 public:
     InteractionRuntime(
@@ -145,12 +194,25 @@ public:
     static InteractionRuntime disabled(Reason reason);
     RuntimeState state() const;
     const RuntimeDiagnostics& diagnostics() const;
+    PickEntryPreview preview_pick(
+        const LocomotionSnapshot& live_flat_snapshot,
+        PickEntryRoot prospective_root,
+        TargetHandle target,
+        uint32_t affordance_id) const;
     PlaceStagingPreview preview_place(
         SurfaceHandle surface,
         uint32_t affordance_id) const;
     RuntimeOutput update(const RuntimeInput& input);
 
 private:
+    friend struct InteractionRuntimeTestAccess;
+
+    struct PickEvaluationBuild {
+        bool accepted = false;
+        Reason reason = Reason::None;
+        matcher_detail::PickEvaluationInput input{};
+    };
+
     struct PlaceMatchBuildResult {
         bool accepted = false;
         Reason reason = Reason::None;
@@ -158,6 +220,14 @@ private:
     };
 
     InteractionRuntime() = default;
+    PickEvaluationBuild build_pick_evaluation(
+        const LocomotionSnapshot& locomotion,
+        TargetHandle target_handle,
+        uint32_t affordance_id,
+        bool require_free) const;
+    matcher_detail::PickEvaluation evaluate_pick_entries_realized(
+        const matcher_detail::PickEvaluationInput& input) const;
+    void advance_pick_clearance(float target_elapsed_seconds);
     void drain_playback_events(float published_elapsed_seconds);
     void begin_carry();
     PlaceMatchBuildResult make_place_match_input(
@@ -183,6 +253,7 @@ private:
     std::optional<MatchCandidate> candidate_{};
     std::optional<SequentialPlayer> player_{};
     std::optional<SequentialPlayer> event_player_{};
+    std::optional<SequentialPlayer> clearance_player_{};
     std::optional<AttachmentController> attachment_{};
     std::optional<CarryController> carry_{};
     std::optional<PlaceController> place_controller_{};

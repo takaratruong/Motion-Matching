@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <string>
 
 namespace interaction {
@@ -19,8 +20,13 @@ constexpr float kOwnershipBlendSeconds = 0.25F;
 constexpr float kInactiveArmBlendSeconds = 0.50F;
 constexpr float kInactiveArmTranslationStepLimitM = 0.20F;
 constexpr float kInactiveArmRotationStepLimitRadians = 1.047197551F;
+constexpr float kPostReleaseActiveArmBlendSeconds = 0.50F;
+constexpr float kPostReleaseActiveArmTranslationStepLimitM = 0.04F;
+constexpr float kPostReleaseActiveArmRotationStepLimitRadians =
+    10.0F * 3.14159265358979323846F / 180.0F;
 constexpr int kInactiveArmBackoffIterations = 16;
 constexpr size_t kLayeredCarryLowerBodyBoneCount = 10U;
+constexpr float kControllerSceneSupportAlignmentRoundoffM = 1.0e-7F;
 constexpr float kLayeredCarryLowerBodyHalfLifeSeconds = 0.10F;
 constexpr float kLayeredCarryLowerBodyNominalSeconds = 0.50F;
 constexpr float kLayeredCarryTerminalPositionM = 0.001F;
@@ -151,6 +157,22 @@ bool raw_pose_channels_equal(const Pose& left, const Pose& right) {
     return left.foot_contacts == right.foot_contacts;
 }
 
+bool raw_flat_kinematic_channels_equal(
+    const FlatControllerPose& left,
+    const FlatControllerPose& right) {
+    for (size_t bone = 0; bone < kFlatControllerBoneCount; ++bone) {
+        if (!raw_channels_equal(left.positions[bone], right.positions[bone]) ||
+            !raw_channels_equal(left.velocities[bone], right.velocities[bone]) ||
+            !raw_channels_equal(left.rotations[bone], right.rotations[bone]) ||
+            !raw_channels_equal(
+                left.angular_velocities[bone],
+                right.angular_velocities[bone])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool valid_constraint_hand(Hand hand) {
     return hand == Hand::Left || hand == Hand::Right;
 }
@@ -183,6 +205,13 @@ bool constraint_identity_matches(
     return left.target == right.target &&
         left.affordance_id == right.affordance_id &&
         left.hand == right.hand;
+}
+
+bool hand_constraint_lifecycle_valid(
+    const RuntimeDiagnostics& diagnostics) {
+    return diagnostics.object_state == ObjectState::Targeted ||
+        diagnostics.object_state == ObjectState::Attached ||
+        diagnostics.object_state == ObjectState::Held;
 }
 
 quat normalized_rotation(quat rotation) {
@@ -261,18 +290,21 @@ void blend_flat_arm_channels(
 bool inactive_arm_step_within_limits(
     const FlatControllerPose& previous,
     const FlatControllerPose& candidate,
-    size_t arm_begin) {
+    size_t arm_begin,
+    float translation_limit_m = kInactiveArmTranslationStepLimitM,
+    float rotation_limit_radians =
+        kInactiveArmRotationStepLimitRadians) {
     const FlatWorldPose previous_world = flat_world_pose(previous);
     const FlatWorldPose candidate_world = flat_world_pose(candidate);
     for (size_t bone = arm_begin; bone < arm_begin + 4U; ++bone) {
         if (length(
                 candidate_world.positions[bone] -
                 previous_world.positions[bone]) >
-                kInactiveArmTranslationStepLimitM ||
+                translation_limit_m ||
             quat_angle_between(
                 previous_world.rotations[bone],
                 candidate_world.rotations[bone]) >
-                kInactiveArmRotationStepLimitRadians) {
+                rotation_limit_radians) {
             return false;
         }
     }
@@ -520,15 +552,28 @@ bool apply_bounded_flat_arm_target(
     FlatControllerPose& output,
     const FlatControllerPose& desired,
     const FlatControllerPose& previous,
-    size_t arm_begin) {
-    if (inactive_arm_step_within_limits(previous, desired, arm_begin)) {
+    size_t arm_begin,
+    float translation_limit_m = kInactiveArmTranslationStepLimitM,
+    float rotation_limit_radians =
+        kInactiveArmRotationStepLimitRadians) {
+    if (inactive_arm_step_within_limits(
+            previous,
+            desired,
+            arm_begin,
+            translation_limit_m,
+            rotation_limit_radians)) {
         output = desired;
         return true;
     }
 
     FlatControllerPose accepted = output;
     preserve_flat_arm_world_channels(accepted, previous, arm_begin);
-    if (!inactive_arm_step_within_limits(previous, accepted, arm_begin)) {
+    if (!inactive_arm_step_within_limits(
+            previous,
+            accepted,
+            arm_begin,
+            translation_limit_m,
+            rotation_limit_radians)) {
         throw FormatError(
             "inactive arm world-preserving fallback exceeded step limits");
     }
@@ -542,7 +587,12 @@ bool apply_bounded_flat_arm_target(
         FlatControllerPose trial = output;
         blend_flat_arm_channels(
             trial, baseline, desired, arm_begin, trial_alpha);
-        if (inactive_arm_step_within_limits(previous, trial, arm_begin)) {
+        if (inactive_arm_step_within_limits(
+                previous,
+                trial,
+                arm_begin,
+                translation_limit_m,
+                rotation_limit_radians)) {
             lower = trial_alpha;
             accepted = trial;
         } else {
@@ -581,6 +631,229 @@ Transform clip_transform(
     const std::vector<float>& rotations,
     size_t clip) {
     return frame_transform(positions, rotations, clip);
+}
+
+size_t checked_controller_scene_shape_product(
+    size_t left,
+    size_t right,
+    const char* label) {
+    if (right != 0U &&
+        left > std::numeric_limits<size_t>::max() / right) {
+        throw FormatError(
+            std::string("controller scene shape overflow for ") + label);
+    }
+    return left * right;
+}
+
+void require_controller_scene_shape(
+    size_t actual,
+    size_t expected,
+    const char* label) {
+    if (actual != expected) {
+        throw FormatError(
+            std::string("controller scene ") + label +
+            " has invalid shape");
+    }
+}
+
+void validate_certified_controller_scene_shapes(const Database& database) {
+    if (database.clip_count == 0U) {
+        throw FormatError("interaction database has no certified clip 0");
+    }
+    if (database.bone_count != g1_skeleton::BoneCount) {
+        throw FormatError("controller scene requires the exact G1 skeleton");
+    }
+    constexpr size_t kHandDofCount = 14U;
+    if (database.hand_dof_count != kHandDofCount) {
+        throw FormatError("controller scene requires 14 hand DOFs");
+    }
+
+    const size_t frames = static_cast<size_t>(database.frame_count);
+    const size_t bones = static_cast<size_t>(database.bone_count);
+    const size_t clips = static_cast<size_t>(database.clip_count);
+    const size_t frame_bones = checked_controller_scene_shape_product(
+        frames, bones, "frame/bone channels");
+    const size_t bone_vectors = checked_controller_scene_shape_product(
+        frame_bones, 3U, "bone vector channels");
+    const size_t bone_rotations = checked_controller_scene_shape_product(
+        frame_bones, 4U, "bone rotation channels");
+    const size_t hand_values = checked_controller_scene_shape_product(
+        frames, kHandDofCount, "hand DOF channels");
+    const size_t frame_pairs = checked_controller_scene_shape_product(
+        frames, 2U, "foot contact channels");
+    const size_t frame_vectors = checked_controller_scene_shape_product(
+        frames, 3U, "object position channels");
+    const size_t frame_rotations = checked_controller_scene_shape_product(
+        frames, 4U, "object rotation channels");
+    const size_t clip_vectors = checked_controller_scene_shape_product(
+        clips, 3U, "clip vector channels");
+    const size_t clip_rotations = checked_controller_scene_shape_product(
+        clips, 4U, "clip rotation channels");
+
+    require_controller_scene_shape(
+        database.range_starts.size(), clips, "range_starts");
+    require_controller_scene_shape(
+        database.range_stops.size(), clips, "range_stops");
+    require_controller_scene_shape(
+        database.active_hands.size(), clips, "active_hands");
+    require_controller_scene_shape(
+        database.phases.size(), frames, "phases");
+    require_controller_scene_shape(
+        database.positions.size(), bone_vectors, "positions");
+    require_controller_scene_shape(
+        database.velocities.size(), bone_vectors, "velocities");
+    require_controller_scene_shape(
+        database.rotations.size(), bone_rotations, "rotations");
+    require_controller_scene_shape(
+        database.angular_velocities.size(),
+        bone_vectors,
+        "angular_velocities");
+    require_controller_scene_shape(
+        database.hand_dof.size(), hand_values, "hand_dof");
+    require_controller_scene_shape(
+        database.hand_dof_velocities.size(),
+        hand_values,
+        "hand_dof_velocities");
+    require_controller_scene_shape(
+        database.foot_contacts.size(), frame_pairs, "foot_contacts");
+    require_controller_scene_shape(
+        database.object_positions.size(),
+        frame_vectors,
+        "object_positions");
+    require_controller_scene_shape(
+        database.object_rotations.size(),
+        frame_rotations,
+        "object_rotations");
+    require_controller_scene_shape(
+        database.table_positions.size(), clip_vectors, "table_positions");
+    require_controller_scene_shape(
+        database.table_rotations.size(), clip_rotations, "table_rotations");
+    require_controller_scene_shape(
+        database.table_sizes.size(), clip_vectors, "table_sizes");
+    require_controller_scene_shape(
+        database.object_dimensions.size(),
+        clip_vectors,
+        "object_dimensions");
+    require_controller_scene_shape(
+        database.approach_directions_object.size(),
+        clip_vectors,
+        "approach_directions_object");
+}
+
+struct CertifiedControllerSceneSource {
+    int32_t contact_frame = -1;
+    Hand hand = Hand::Right;
+    Transform contact_hand_world{};
+    Transform rest_object_world{};
+    Transform table_world{};
+    vec3 table_size{};
+    vec3 object_dimensions{};
+    vec3 approach_direction_object{};
+};
+
+CertifiedControllerSceneSource certified_controller_scene_source(
+    const Database& database) {
+    validate_certified_controller_scene_shapes(database);
+    const int32_t start = database.range_starts.at(0U);
+    const int32_t stop = database.range_stops.at(0U);
+    if (start < 0 || start >= stop ||
+        stop > static_cast<int32_t>(database.frame_count)) {
+        throw FormatError("interaction database clip 0 range is invalid");
+    }
+
+    int32_t contact = -1;
+    for (int32_t frame = start; frame < stop; ++frame) {
+        if (database.phases.at(static_cast<size_t>(frame)) ==
+            static_cast<uint8_t>(Phase::Contact)) {
+            contact = frame;
+            break;
+        }
+    }
+    if (contact <= start) {
+        throw FormatError("clip 0 has no pre-contact object sample");
+    }
+
+    const uint8_t hand_value = database.active_hands.at(0U);
+    if (hand_value > static_cast<uint8_t>(Hand::Right)) {
+        throw FormatError("clip 0 active hand is invalid");
+    }
+    const Hand hand = static_cast<Hand>(hand_value);
+    const Pose contact_pose = pose_at_frame(database, contact);
+    const WorldPose contact_world = world_pose(contact_pose);
+    const size_t hand_bone = hand == Hand::Left
+        ? static_cast<size_t>(g1_skeleton::LeftWrist)
+        : static_cast<size_t>(g1_skeleton::RightWrist);
+    const Transform contact_hand{
+        contact_world.positions[hand_bone],
+        normalized_rotation(contact_world.rotations[hand_bone])};
+    const Transform rest_object = frame_transform(
+        database.object_positions,
+        database.object_rotations,
+        static_cast<size_t>(contact - 1));
+    const Transform source_table = clip_transform(
+        database.table_positions, database.table_rotations, 0U);
+    const vec3 source_table_size = clip_vector(database.table_sizes, 0U);
+    const vec3 object_dimensions = clip_vector(
+        database.object_dimensions, 0U);
+    const vec3 approach_direction_object = clip_vector(
+        database.approach_directions_object, 0U);
+    if (!valid_constraint_transform(contact_hand) ||
+        !valid_constraint_transform(rest_object) ||
+        !valid_constraint_transform(source_table) ||
+        !finite(source_table_size) || !finite(object_dimensions) ||
+        source_table_size.x <= 0.0F || source_table_size.y <= 0.0F ||
+        source_table_size.z <= 0.0F || object_dimensions.x <= 0.0F ||
+        object_dimensions.y <= 0.0F || object_dimensions.z <= 0.0F) {
+        throw FormatError("clip 0 certified scene geometry is invalid");
+    }
+    return {
+        contact,
+        hand,
+        contact_hand,
+        rest_object,
+        source_table,
+        source_table_size,
+        object_dimensions,
+        approach_direction_object};
+}
+
+void certify_controller_destination_fit(
+    PlacementSurface& destination,
+    ObjectLocalBounds object_bounds) {
+    if (destination.affordances.size() != 1U) {
+        throw FormatError(
+            "controller destination requires one placement affordance");
+    }
+    PlaceAffordance& affordance = destination.affordances.front();
+    PlacementFit fit = evaluate_placement_fit(
+        destination, affordance, object_bounds);
+    if (!fit.accepted) {
+        if (!fit.footprint_valid || !fit.overhead_valid ||
+            !finite(fit.support_gap_m) ||
+            std::fabs(fit.support_gap_m) >
+                kControllerSceneSupportAlignmentRoundoffM ||
+            !(fit.lowest_corner_m < 0.0F) ||
+            !finite(fit.lowest_corner_m)) {
+            throw FormatError(
+                "controller destination has an unsupported fit failure");
+        }
+        const float bounds_clearance = -fit.lowest_corner_m;
+        const vec3 destination_normal = quat_mul_vec3(
+            destination.surface_world.rotation,
+            vec3(0.0F, 1.0F, 0.0F));
+        destination.surface_world.position =
+            destination.surface_world.position -
+            bounds_clearance * destination_normal;
+        destination.support_volume_world.position =
+            destination.support_volume_world.position -
+            bounds_clearance * destination_normal;
+        affordance.object_in_surface.position.y += bounds_clearance;
+        fit = evaluate_placement_fit(
+            destination, affordance, object_bounds);
+    }
+    if (!fit.accepted) {
+        throw FormatError("controller destination is not support-fit");
+    }
 }
 
 FlatControllerPose blend_flat_pose(
@@ -645,6 +918,78 @@ Pose expand_flat_controller_pose(
                     expanded_world.velocities[parent_bone],
                     expanded_world.rotations[parent_bone],
                     expanded_world.angular_velocities[parent_bone]);
+            }
+        }
+        update_g1_world_bone(expanded_world, expanded, g1_bone);
+    }
+    expanded.foot_contacts = flat_pose.foot_contacts;
+    validate_interaction_pose(expanded);
+    return expanded;
+}
+
+Pose expand_flat_controller_pose(
+    const FlatControllerPose& flat_pose,
+    const Pose& interaction_reference,
+    const FlatControllerPose& flat_reference) {
+    validate_flat_pose(flat_pose);
+    validate_interaction_pose(interaction_reference);
+    validate_flat_pose(flat_reference);
+
+    if (raw_flat_kinematic_channels_equal(flat_pose, flat_reference)) {
+        Pose expanded = interaction_reference;
+        expanded.foot_contacts = flat_pose.foot_contacts;
+        return expanded;
+    }
+
+    const FlatWorldPose flat_world = flat_world_pose(flat_pose);
+    const FlatWorldPose flat_reference_world =
+        flat_world_pose(flat_reference);
+    const WorldPose interaction_reference_world =
+        world_pose(interaction_reference);
+    Pose expanded = interaction_reference;
+    WorldPose expanded_world{};
+
+    for (size_t g1_bone = 0; g1_bone < g1_skeleton::BoneCount; ++g1_bone) {
+        const int32_t flat_bone_value = kG1ToFlatBone[g1_bone];
+        if (flat_bone_value >= 0) {
+            const size_t flat_bone =
+                static_cast<size_t>(flat_bone_value);
+            const quat flat_world_delta = normalized_rotation(quat_mul(
+                flat_world.rotations[flat_bone],
+                quat_inv(flat_reference_world.rotations[flat_bone])));
+            const quat desired_world_rotation = normalized_rotation(quat_mul(
+                flat_world_delta,
+                interaction_reference_world.rotations[g1_bone]));
+            const vec3 desired_world_angular_velocity =
+                interaction_reference_world.angular_velocities[g1_bone] +
+                flat_world.angular_velocities[flat_bone] -
+                flat_reference_world.angular_velocities[flat_bone];
+
+            const int32_t parent = g1_skeleton::kParents[g1_bone];
+            if (parent < 0) {
+                expanded.positions[g1_bone] =
+                    interaction_reference.positions[g1_bone] +
+                    flat_world.positions[flat_bone] -
+                    flat_reference_world.positions[flat_bone];
+                expanded.velocities[g1_bone] =
+                    interaction_reference.velocities[g1_bone] +
+                    flat_world.velocities[flat_bone] -
+                    flat_reference_world.velocities[flat_bone];
+                expanded.rotations[g1_bone] = desired_world_rotation;
+                expanded.angular_velocities[g1_bone] =
+                    desired_world_angular_velocity;
+            } else {
+                const size_t parent_bone = static_cast<size_t>(parent);
+                expanded.rotations[g1_bone] = normalized_rotation(
+                    quat_inv_mul(
+                        expanded_world.rotations[parent_bone],
+                        desired_world_rotation));
+                expanded.angular_velocities[g1_bone] =
+                    quat_inv_mul_vec3(
+                        expanded_world.rotations[parent_bone],
+                        desired_world_angular_velocity -
+                            expanded_world
+                                .angular_velocities[parent_bone]);
             }
         }
         update_g1_world_bone(expanded_world, expanded, g1_bone);
@@ -904,7 +1249,14 @@ ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
         if (!runtime_owned_last_update_) {
             ownership_interaction_reference_ = runtime_output.pose;
             ownership_flat_reference_ =
-                release_active_ ? last_rendered_pose_ : locomotion_pose;
+                release_active_ || post_release_active_arm_hand_.has_value()
+                ? last_rendered_pose_
+                : locomotion_pose;
+            ownership_target_ = runtime_output.diagnostics.target;
+            ownership_affordance_id_ =
+                runtime_output.diagnostics.affordance_id;
+            ownership_hand_ = runtime_output.diagnostics.hand;
+            ownership_identity_poisoned_ = false;
             release_active_ = false;
             runtime_owned_last_update_ = true;
             state.pose = ownership_flat_reference_;
@@ -914,7 +1266,18 @@ ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
             lower_body_inertial_offsets_ = {};
             target_rig_arm_ik_.reset();
             ownership_hand_constraint_.reset();
-            if (hand_constraint.has_value() &&
+            hand_constraint_applied_last_update_ = false;
+            active_arm_release_hand_.reset();
+            active_arm_release_blend_seconds_ = 0.0F;
+            active_arm_release_source_ = {};
+            post_release_active_arm_hand_.reset();
+            post_release_active_arm_blend_seconds_ = 0.0F;
+            post_release_active_arm_source_ = {};
+            const bool initial_constraint_lifecycle_valid =
+                hand_constraint_lifecycle_valid(
+                    runtime_output.diagnostics);
+            if (initial_constraint_lifecycle_valid &&
+                hand_constraint.has_value() &&
                 constraint_identity_matches(
                     *hand_constraint, runtime_output.diagnostics)) {
                 ownership_hand_constraint_ = hand_constraint;
@@ -934,6 +1297,19 @@ ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
                         target.rotations[bone]) < 0.0F) {
                     target.rotations[bone] = -target.rotations[bone];
                 }
+            }
+            const bool releasing_active_constraint =
+                runtime_output.diagnostics.state ==
+                    RuntimeState::PlaceRelease &&
+                runtime_output.diagnostics.object_state ==
+                    ObjectState::Free &&
+                !runtime_output.diagnostics.attached &&
+                hand_constraint_applied_last_update_ &&
+                ownership_hand_constraint_.has_value();
+            if (releasing_active_constraint) {
+                inactive_arm_locomotion_hand_.reset();
+                inactive_arm_return_hand_.reset();
+                inactive_arm_blend_seconds_ = 0.0F;
             }
 
             if (layered_carry) {
@@ -1171,17 +1547,50 @@ ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
             }
         }
 
+        const bool ownership_identity_changed =
+            runtime_output.diagnostics.target != ownership_target_ ||
+            runtime_output.diagnostics.affordance_id !=
+                ownership_affordance_id_ ||
+            runtime_output.diagnostics.hand != ownership_hand_;
+        const bool hand_constraint_lifecycle_is_valid =
+            hand_constraint_lifecycle_valid(runtime_output.diagnostics);
+        const bool starts_active_arm_release =
+            runtime_output.diagnostics.state == RuntimeState::PlaceRelease &&
+            runtime_output.diagnostics.object_state == ObjectState::Free &&
+            !runtime_output.diagnostics.attached &&
+            hand_constraint_applied_last_update_ &&
+            ownership_hand_constraint_.has_value();
+        if (starts_active_arm_release) {
+            active_arm_release_hand_ = ownership_hand_constraint_->hand;
+            active_arm_release_blend_seconds_ = 0.0F;
+            active_arm_release_source_ = last_rendered_pose_;
+            inactive_arm_locomotion_hand_.reset();
+            inactive_arm_return_hand_.reset();
+            inactive_arm_blend_seconds_ = 0.0F;
+        }
         const bool hand_constraint_epoch_ended =
-            ownership_hand_constraint_.has_value() &&
-            (runtime_output.diagnostics.target !=
-                 ownership_hand_constraint_->target ||
-             runtime_output.diagnostics.affordance_id !=
-                 ownership_hand_constraint_->affordance_id ||
-             runtime_output.diagnostics.hand !=
-                 ownership_hand_constraint_->hand);
+            ownership_identity_changed ||
+            (ownership_hand_constraint_.has_value() &&
+             !hand_constraint_lifecycle_is_valid);
         if (hand_constraint_epoch_ended) {
             target_rig_arm_ik_.reset();
             ownership_hand_constraint_.reset();
+            ownership_identity_poisoned_ = true;
+        }
+
+        const bool hand_constraint_epoch_can_start =
+            !ownership_identity_poisoned_ &&
+            !ownership_hand_constraint_.has_value() &&
+            hand_constraint.has_value() &&
+            hand_constraint_lifecycle_is_valid &&
+            constraint_identity_matches(
+                *hand_constraint, runtime_output.diagnostics);
+        if (hand_constraint_epoch_can_start) {
+            ownership_hand_constraint_ = hand_constraint;
+            target_rig_arm_ik_.begin_epoch(
+                ownership_interaction_reference_,
+                ownership_flat_reference_,
+                hand_constraint->hand);
         }
 
         if (target_rig_arm_ik_.active()) {
@@ -1191,6 +1600,7 @@ ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
         if (hand_constraint.has_value() &&
             ownership_hand_constraint_.has_value() &&
             target_rig_arm_ik_.active() &&
+            hand_constraint_lifecycle_is_valid &&
             constraint_identity_matches(
                 *hand_constraint, runtime_output.diagnostics) &&
             constraint_identity_matches(
@@ -1201,6 +1611,65 @@ ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
                 hand_constraint->grasp_world,
                 runtime_output.diagnostics.hand_constraint_weight,
                 dt);
+        }
+        hand_constraint_applied_last_update_ =
+            state.hand_constraint_result.applied;
+
+        const bool active_arm_release_lifecycle =
+            runtime_output.diagnostics.state == RuntimeState::PlaceRelease &&
+            runtime_output.diagnostics.object_state == ObjectState::Free &&
+            !runtime_output.diagnostics.attached;
+        if (active_arm_release_hand_.has_value() &&
+            active_arm_release_lifecycle) {
+            const size_t active_arm_begin =
+                *active_arm_release_hand_ == Hand::Left ? 15U : 19U;
+            FlatControllerPose release_source = state.pose;
+            preserve_flat_arm_world_channels(
+                release_source,
+                active_arm_release_source_,
+                active_arm_begin);
+            const float release_alpha = std::clamp(
+                active_arm_release_blend_seconds_ /
+                    kOwnershipBlendSeconds,
+                0.0F,
+                1.0F);
+            FlatControllerPose desired = state.pose;
+            blend_flat_arm_channels(
+                desired,
+                release_source,
+                state.pose,
+                active_arm_begin,
+                release_alpha);
+            const bool full_target_applied =
+                apply_bounded_flat_arm_target(
+                    state.pose,
+                    desired,
+                    last_rendered_pose_,
+                    active_arm_begin);
+            active_arm_release_blend_seconds_ = std::min(
+                kOwnershipBlendSeconds,
+                active_arm_release_blend_seconds_ + std::max(dt, 0.0F));
+            if (release_alpha >= 1.0F && full_target_applied) {
+                active_arm_release_hand_.reset();
+                active_arm_release_blend_seconds_ = 0.0F;
+                active_arm_release_source_ = {};
+            }
+        } else if (active_arm_release_hand_.has_value()) {
+            active_arm_release_hand_.reset();
+            active_arm_release_blend_seconds_ = 0.0F;
+            active_arm_release_source_ = {};
+        }
+
+        if (active_arm_release_lifecycle &&
+            valid_constraint_hand(runtime_output.diagnostics.hand)) {
+            post_release_active_arm_hand_ =
+                runtime_output.diagnostics.hand;
+            post_release_active_arm_blend_seconds_ = 0.0F;
+            post_release_active_arm_source_ = state.pose;
+        } else {
+            post_release_active_arm_hand_.reset();
+            post_release_active_arm_blend_seconds_ = 0.0F;
+            post_release_active_arm_source_ = {};
         }
 
         if (validate_lower_handoff_final_composite &&
@@ -1232,6 +1701,17 @@ ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
         inactive_arm_locomotion_hand_.reset();
         inactive_arm_return_hand_.reset();
         inactive_arm_blend_seconds_ = 0.0F;
+        hand_constraint_applied_last_update_ = false;
+        active_arm_release_hand_.reset();
+        active_arm_release_blend_seconds_ = 0.0F;
+        active_arm_release_source_ = {};
+        if (post_release_active_arm_hand_.has_value()) {
+            post_release_active_arm_blend_seconds_ = 0.0F;
+            post_release_active_arm_source_ = last_rendered_pose_;
+        } else {
+            post_release_active_arm_blend_seconds_ = 0.0F;
+            post_release_active_arm_source_ = {};
+        }
         release_active_ = true;
         blend_source_ = last_rendered_pose_;
         blend_seconds_ = 0.0F;
@@ -1249,13 +1729,57 @@ ControllerInteractionFrameState ControllerInteractionFrameHandoff::apply(
                 ? blend_source_
                 : blend_flat_pose(blend_source_, locomotion_pose, alpha);
             state.overrides_locomotion_pose = true;
-            last_rendered_pose_ = state.pose;
             blend_seconds_ += std::max(dt, 0.0F);
         }
-        return state;
+    } else {
+        state.pose = locomotion_pose;
     }
 
-    state.pose = locomotion_pose;
+    if (post_release_active_arm_hand_.has_value()) {
+        const size_t active_arm_begin =
+            *post_release_active_arm_hand_ == Hand::Left ? 15U : 19U;
+        const float active_arm_alpha = std::clamp(
+            post_release_active_arm_blend_seconds_ /
+                kPostReleaseActiveArmBlendSeconds,
+            0.0F,
+            1.0F);
+        bool full_target_applied = false;
+        if (active_arm_alpha > 0.0F) {
+            FlatControllerPose return_source = state.pose;
+            preserve_flat_arm_world_channels(
+                return_source,
+                post_release_active_arm_source_,
+                active_arm_begin);
+            FlatControllerPose desired = state.pose;
+            blend_flat_arm_channels(
+                desired,
+                return_source,
+                locomotion_pose,
+                active_arm_begin,
+                active_arm_alpha);
+            full_target_applied = apply_bounded_flat_arm_target(
+                state.pose,
+                desired,
+                last_rendered_pose_,
+                active_arm_begin,
+                kPostReleaseActiveArmTranslationStepLimitM,
+                kPostReleaseActiveArmRotationStepLimitRadians);
+        }
+        post_release_active_arm_blend_seconds_ = std::min(
+            kPostReleaseActiveArmBlendSeconds,
+            post_release_active_arm_blend_seconds_ + std::max(dt, 0.0F));
+        if (active_arm_alpha >= 1.0F && full_target_applied) {
+            post_release_active_arm_hand_.reset();
+            post_release_active_arm_blend_seconds_ = 0.0F;
+            post_release_active_arm_source_ = {};
+        } else {
+            state.overrides_locomotion_pose = true;
+        }
+    }
+
+    if (state.overrides_locomotion_pose) {
+        last_rendered_pose_ = state.pose;
+    }
     return state;
 }
 
@@ -1267,8 +1791,19 @@ void ControllerInteractionFrameHandoff::reset() {
     ownership_interaction_reference_ = {};
     ownership_flat_reference_ = {};
     last_rendered_pose_ = {};
+    ownership_target_ = {};
+    ownership_affordance_id_ = 0U;
+    ownership_hand_ = Hand::Right;
+    ownership_identity_poisoned_ = false;
     target_rig_arm_ik_.reset();
     ownership_hand_constraint_.reset();
+    hand_constraint_applied_last_update_ = false;
+    active_arm_release_hand_.reset();
+    active_arm_release_blend_seconds_ = 0.0F;
+    active_arm_release_source_ = {};
+    post_release_active_arm_hand_.reset();
+    post_release_active_arm_blend_seconds_ = 0.0F;
+    post_release_active_arm_source_ = {};
     inactive_arm_locomotion_hand_.reset();
     inactive_arm_return_hand_.reset();
     inactive_arm_blend_seconds_ = 0.0F;
@@ -1344,55 +1879,31 @@ RuntimePlaceDiagnostics controller_place_debug_diagnostics(
 }
 
 InteractionTarget make_controller_demo_target(const Database& database) {
-    if (database.clip_count == 0U || database.range_starts.empty() ||
-        database.range_stops.empty()) {
-        throw FormatError("interaction database has no clip 0");
-    }
-
-    const int32_t start = database.range_starts.at(0);
-    const int32_t stop = database.range_stops.at(0);
-    int32_t contact = -1;
-    for (int32_t frame = start; frame < stop; ++frame) {
-        if (database.phases.at(static_cast<size_t>(frame)) ==
-            static_cast<uint8_t>(Phase::Contact)) {
-            contact = frame;
-            break;
-        }
-    }
-    if (contact <= start) {
-        throw FormatError("clip 0 has no pre-contact object sample");
-    }
-
-    const Transform source_table = clip_transform(
-        database.table_positions, database.table_rotations, 0U);
-    const Transform source_object = frame_transform(
-        database.object_positions,
-        database.object_rotations,
-        static_cast<size_t>(contact - 1));
-    const Transform object_in_table = compose(inverse(source_table), source_object);
+    const CertifiedControllerSceneSource source =
+        certified_controller_scene_source(database);
+    const Transform object_in_table = compose(
+        inverse(source.table_world), source.rest_object_world);
 
     InteractionTarget target;
     target.handle = {1U, 1U};
-    target.table_world = source_table;
+    target.table_world = source.table_world;
     target.table_world.position.x = 0.0F;
     target.table_world.position.z = 3.0F;
     target.object_world = compose(target.table_world, object_in_table);
-    target.table_size = clip_vector(database.table_sizes, 0U);
+    target.table_size = source.table_size;
     target.object_profile_id = 1U;
-    target.object_dimensions = clip_vector(database.object_dimensions, 0U);
+    target.object_dimensions = source.object_dimensions;
     target.object_bounds = {
         vec3(), target.object_dimensions * 0.5F};
     target.state = ObjectState::Free;
 
     GraspAffordance affordance;
     affordance.id = 1U;
-    affordance.hand = static_cast<Hand>(database.active_hands.at(0));
-    affordance.hand_in_object = clip_transform(
-        database.grasp_positions_object,
-        database.grasp_rotations_object,
-        0U);
+    affordance.hand = source.hand;
+    affordance.hand_in_object = compose(
+        inverse(source.rest_object_world), source.contact_hand_world);
     affordance.approach_direction_object =
-        clip_vector(database.approach_directions_object, 0U);
+        source.approach_direction_object;
     target.affordances.push_back(affordance);
     return target;
 }
@@ -1400,48 +1911,25 @@ InteractionTarget make_controller_demo_target(const Database& database) {
 PlacementSurface make_controller_demo_destination_surface(
     const Database& database,
     const InteractionTarget& source_target) {
-    if (database.clip_count == 0U || database.range_starts.empty() ||
-        database.range_stops.empty()) {
-        throw FormatError("interaction database has no clip 0");
-    }
-    const int32_t start = database.range_starts.at(0);
-    const int32_t stop = database.range_stops.at(0);
-    int32_t lift = -1;
-    for (int32_t frame = start; frame < stop; ++frame) {
-        if (database.phases.at(static_cast<size_t>(frame)) ==
-            static_cast<uint8_t>(Phase::Lift)) {
-            lift = frame;
-            break;
-        }
-    }
-    if (lift <= start) {
-        throw FormatError("clip 0 has no stable pre-lift object sample");
-    }
-
-    const Transform source_table = clip_transform(
-        database.table_positions, database.table_rotations, 0U);
-    const vec3 source_table_size = clip_vector(database.table_sizes, 0U);
-    const Transform stable_source_object = frame_transform(
-        database.object_positions,
-        database.object_rotations,
-        static_cast<size_t>(lift - 1));
+    const CertifiedControllerSceneSource source =
+        certified_controller_scene_source(database);
     const Transform source_surface_world = compose(
-        source_table,
+        source.table_world,
         Transform{
-            vec3(0.0F, 0.5F * source_table_size.y, 0.0F), quat()});
+            vec3(0.0F, 0.5F * source.table_size.y, 0.0F), quat()});
     const vec3 source_table_normal = quat_mul_vec3(
-        source_table.rotation, vec3(0.0F, 1.0F, 0.0F));
+        source.table_world.rotation, vec3(0.0F, 1.0F, 0.0F));
     const float projection_distance = dot(
-        source_surface_world.position - stable_source_object.position,
+        source_surface_world.position - source.rest_object_world.position,
         source_table_normal);
     const vec3 projected_support_world =
-        stable_source_object.position +
+        source.rest_object_world.position +
         projection_distance * source_table_normal;
     const vec3 support_point_object = compose(
-        inverse(stable_source_object),
+        inverse(source.rest_object_world),
         Transform{projected_support_world, quat()}).position;
     const Transform source_object_in_surface = compose(
-        inverse(source_surface_world), stable_source_object);
+        inverse(source_surface_world), source.rest_object_world);
 
     Transform destination_table = source_target.table_world;
     destination_table.position.z += 1.20F;
@@ -1459,14 +1947,13 @@ PlacementSurface make_controller_demo_destination_surface(
 
     PlaceAffordance affordance;
     affordance.id = 1U;
-    affordance.object_in_surface.rotation =
-        source_object_in_surface.rotation;
-    affordance.object_in_surface.position = -quat_mul_vec3(
-        affordance.object_in_surface.rotation, support_point_object);
+    affordance.object_in_surface = source_object_in_surface;
     affordance.support_point_object = support_point_object;
     affordance.approach_direction_surface = vec3(0.0F, 1.0F, 0.0F);
     affordance.clearance_radius = 0.04F;
     destination.affordances.push_back(affordance);
+    certify_controller_destination_fit(
+        destination, source_target.object_bounds);
     return destination;
 }
 

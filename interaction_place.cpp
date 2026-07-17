@@ -408,6 +408,13 @@ void hash_grasp(CanonicalHash& hash, const GraspAffordance& value) {
     hash.transform(value.hand_in_object);
     hash.vector(value.approach_direction_object);
     hash.scalar(value.clearance_radius);
+    hash.u64(static_cast<uint64_t>(value.interaction_slots.size()));
+    for (const GraspInteractionSlot& slot : value.interaction_slots) {
+        hash.u32(slot.id);
+        hash.scalar(slot.root_x_object_m);
+        hash.scalar(slot.root_z_object_m);
+        hash.scalar(slot.root_yaw_object_radians);
+    }
 }
 
 void hash_place_affordance(CanonicalHash& hash, const PlaceAffordance& value) {

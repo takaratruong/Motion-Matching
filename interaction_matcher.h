@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 
 namespace interaction {
 
@@ -77,6 +78,38 @@ struct MatchResult {
     MatchCandidate candidate{};
     Reason reason = Reason::None;
 };
+
+namespace matcher_detail {
+
+using CandidateFeasibility = std::function<Reason(const MatchCandidate&)>;
+
+struct PickEvaluationInput {
+    const Database* database = nullptr;
+    const Features* features = nullptr;
+    NormalizedQuery query{};
+    LocomotionSnapshot locomotion{};
+    InteractionTarget target{};
+    GraspAffordance affordance{};
+};
+
+struct PickEvaluation {
+    bool path_feasible = false;
+    bool match_ready = false;
+    Reason path_reason = Reason::None;
+    Reason match_reason = Reason::None;
+    int32_t feasible_entry_frame = -1;
+    int32_t contact_frame = -1;
+    bool total_cost_available = false;
+    float total_cost = 0.0F;
+    MatchResult selection{};
+};
+
+PickEvaluation evaluate_pick_entries(
+    const PickEvaluationInput& input,
+    const MatchConfig& config,
+    const CandidateFeasibility& candidate_feasibility = {});
+
+}  // namespace matcher_detail
 
 MatchResult select_whole_clip(
     const MatchInput& input,
