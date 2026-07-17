@@ -231,6 +231,17 @@ bool is_zero(vec3 value) {
     return value.x == 0.0F && value.y == 0.0F && value.z == 0.0F;
 }
 
+void require_zero_pick_assist_output(
+    const interaction::PickAssistOutput& output,
+    const char* message) {
+    require(
+        !output.override_steering && is_zero(output.left_stick) &&
+            is_zero(output.right_stick) && !output.force_strafe &&
+            !output.stationary_constraint && !output.needs_preview &&
+            !output.submit_interact,
+        message);
+}
+
 void require_final_preview_diagnostics_cleared(
     const interaction::PickAssistDiagnostics& diagnostics) {
     const auto& preview = diagnostics.final_preview;
@@ -512,6 +523,318 @@ void test_slot_approach_emits_far_camera_relative_steering() {
             same_frozen_provenance(
                 rotated_assist.diagnostics(), assist.diagnostics()),
         "camera azimuth changed frozen slot ID, index, root, or route provenance");
+}
+
+void test_slot_approach_runtime_change_precedes_target_and_metrics() {
+    FrozenSlotScenario scenario;
+    interaction::ControllerPickAssist assist;
+
+    require(
+        assist.begin(scenario.start, &scenario.target),
+        "runtime-precedence fixture begin failed");
+    const interaction::PickAssistDiagnostics frozen_before =
+        assist.diagnostics();
+    scenario.observation.runtime_state =
+        interaction::RuntimeState::Preflight;
+    scenario.observation.target = nullptr;
+    scenario.observation.displayed_root.position.x =
+        float_from_bits(0x7fc00001U);
+
+    const interaction::PickAssistOutput failed_output =
+        assist.observe(scenario.observation);
+    require(
+        assist.diagnostics().state ==
+                interaction::PickAssistState::Failed &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::RuntimeChanged,
+        "runtime precedence did not fail SlotApproach with RuntimeChanged");
+    require_zero_pick_assist_output(
+        failed_output,
+        "runtime precedence emitted output while failing");
+    require(
+        !assist.active() && !assist.owns_manual_interact() &&
+            !assist.take_submission(301U).has_value(),
+        "runtime precedence retained ownership or submitted");
+    require_frozen_slot_provenance_unchanged(
+        frozen_before,
+        assist.diagnostics(),
+        "runtime precedence changed frozen slot provenance");
+
+    const interaction::PickAssistOutput terminal_output =
+        assist.observe(scenario.observation);
+    require(
+        assist.diagnostics().state ==
+                interaction::PickAssistState::Failed &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::RuntimeChanged,
+        "runtime precedence failure was not terminal and stable");
+    require_zero_pick_assist_output(
+        terminal_output,
+        "stable runtime failure emitted output");
+    require(
+        !assist.active() && !assist.owns_manual_interact() &&
+            !assist.take_submission(302U).has_value(),
+        "stable runtime failure reacquired ownership or submitted");
+    require_frozen_slot_provenance_unchanged(
+        frozen_before,
+        assist.diagnostics(),
+        "stable runtime failure changed frozen slot provenance");
+}
+
+using FrozenSlotMutation = void (*)(FrozenSlotScenario&);
+
+struct FrozenSlotObservationFailureCase {
+    const char* name;
+    interaction::PickAssistReason expected_reason;
+    FrozenSlotMutation mutate;
+};
+
+interaction::GraspInteractionSlot& selected_authored_slot(
+    FrozenSlotScenario& scenario) {
+    std::vector<interaction::GraspInteractionSlot>& slots =
+        scenario.target.affordances.front().interaction_slots;
+    const auto selected = std::find_if(
+        slots.begin(), slots.end(), [](const auto& slot) {
+            return slot.id == 9U;
+        });
+    require(
+        selected != slots.end(),
+        "identity fixture had no selected authored slot ID 9");
+    return *selected;
+}
+
+void expect_frozen_slot_observation_failure(
+    const FrozenSlotObservationFailureCase& test_case) {
+    const auto require_case = [&](bool condition, const char* detail) {
+        if (!condition) {
+            throw std::runtime_error(
+                std::string(test_case.name) + ": " + detail);
+        }
+    };
+
+    FrozenSlotScenario scenario;
+    interaction::ControllerPickAssist assist;
+    require_case(
+        assist.begin(scenario.start, &scenario.target),
+        "fixture begin failed");
+    const interaction::PickAssistDiagnostics frozen_before =
+        assist.diagnostics();
+    require_case(
+        frozen_before.state ==
+                interaction::PickAssistState::SlotApproach &&
+            frozen_before.reason == interaction::PickAssistReason::None &&
+            frozen_before.selected_slot_id == 9U &&
+            frozen_before.slot_selection.selected_index.has_value(),
+        "fixture did not freeze selected slot ID 9");
+
+    test_case.mutate(scenario);
+    const interaction::PickAssistOutput failed_output =
+        assist.observe(scenario.observation);
+    const interaction::PickAssistDiagnostics failed =
+        assist.diagnostics();
+    require_case(
+        failed.state == interaction::PickAssistState::Failed,
+        "observation did not enter Failed");
+    require_case(
+        failed.reason == test_case.expected_reason,
+        "observation reported the wrong stable reason");
+    if (test_case.expected_reason ==
+        interaction::PickAssistReason::SlotChanged) {
+        require_case(
+            failed.reason != interaction::PickAssistReason::TargetChanged,
+            "slot identity change was classified as TargetChanged");
+    }
+    const std::string failed_output_message =
+        std::string(test_case.name) +
+        ": failing observation emitted output";
+    require_zero_pick_assist_output(
+        failed_output, failed_output_message.c_str());
+    require_case(
+        !assist.active() && !assist.owns_manual_interact() &&
+            !assist.take_submission(401U).has_value(),
+        "failure retained ownership or produced a submission");
+    const std::string failed_provenance_message =
+        std::string(test_case.name) +
+        ": failure changed frozen slot ID, root, or index";
+    require_frozen_slot_provenance_unchanged(
+        frozen_before,
+        failed,
+        failed_provenance_message.c_str());
+
+    const interaction::PickAssistOutput terminal_output =
+        assist.observe(scenario.observation);
+    const interaction::PickAssistDiagnostics terminal =
+        assist.diagnostics();
+    require_case(
+        terminal.state == interaction::PickAssistState::Failed &&
+            terminal.reason == test_case.expected_reason &&
+            terminal.reason == failed.reason,
+        "second observation changed the terminal state or reason");
+    const std::string terminal_output_message =
+        std::string(test_case.name) +
+        ": stable terminal observation emitted output";
+    require_zero_pick_assist_output(
+        terminal_output, terminal_output_message.c_str());
+    require_case(
+        !assist.active() && !assist.owns_manual_interact() &&
+            !assist.take_submission(402U).has_value(),
+        "stable terminal failure reacquired ownership or submitted");
+    const std::string terminal_provenance_message =
+        std::string(test_case.name) +
+        ": stable terminal failure changed frozen provenance";
+    require_frozen_slot_provenance_unchanged(
+        frozen_before,
+        terminal,
+        terminal_provenance_message.c_str());
+}
+
+void test_slot_approach_target_unavailable_failures_are_stable() {
+    const std::array<FrozenSlotObservationFailureCase, 2> cases{{
+        {
+            "null current target",
+            interaction::PickAssistReason::TargetUnavailable,
+            [](FrozenSlotScenario& scenario) {
+                scenario.observation.target = nullptr;
+            },
+        },
+        {
+            "different current target handle ID",
+            interaction::PickAssistReason::TargetUnavailable,
+            [](FrozenSlotScenario& scenario) {
+                ++scenario.target.handle.id;
+            },
+        },
+    }};
+    for (const FrozenSlotObservationFailureCase& test_case : cases) {
+        expect_frozen_slot_observation_failure(test_case);
+    }
+}
+
+void test_slot_approach_target_snapshot_failures_are_stable() {
+    const std::array<FrozenSlotObservationFailureCase, 5> cases{{
+        {
+            "same-ID generation mutation",
+            interaction::PickAssistReason::TargetChanged,
+            [](FrozenSlotScenario& scenario) {
+                ++scenario.target.handle.generation;
+            },
+        },
+        {
+            "same-ID object-pose mutation",
+            interaction::PickAssistReason::TargetChanged,
+            [](FrozenSlotScenario& scenario) {
+                scenario.target.object_world.position.x = std::nextafter(
+                    scenario.target.object_world.position.x, 1.0F);
+            },
+        },
+        {
+            "same-ID targeted-state mutation",
+            interaction::PickAssistReason::TargetChanged,
+            [](FrozenSlotScenario& scenario) {
+                scenario.target.state = interaction::ObjectState::Targeted;
+            },
+        },
+        {
+            "same-ID owner-request mutation",
+            interaction::PickAssistReason::TargetChanged,
+            [](FrozenSlotScenario& scenario) {
+                scenario.target.owner_request = 811U;
+            },
+        },
+        {
+            "same-ID selected-affordance grasp mutation",
+            interaction::PickAssistReason::TargetChanged,
+            [](FrozenSlotScenario& scenario) {
+                interaction::GraspAffordance& affordance =
+                    scenario.target.affordances.front();
+                affordance.hand_in_object.position.x = std::nextafter(
+                    affordance.hand_in_object.position.x, 1.0F);
+            },
+        },
+    }};
+    for (const FrozenSlotObservationFailureCase& test_case : cases) {
+        expect_frozen_slot_observation_failure(test_case);
+    }
+}
+
+void test_slot_approach_slot_identity_failures_precede_snapshot_mismatch() {
+    const std::array<FrozenSlotObservationFailureCase, 4> cases{{
+        {
+            "selected authored slot geometry mutation",
+            interaction::PickAssistReason::SlotChanged,
+            [](FrozenSlotScenario& scenario) {
+                interaction::GraspInteractionSlot& slot =
+                    selected_authored_slot(scenario);
+                slot.root_x_object_m = std::nextafter(
+                    slot.root_x_object_m, 1.0F);
+            },
+        },
+        {
+            "selected authored slot ID mutation",
+            interaction::PickAssistReason::SlotChanged,
+            [](FrozenSlotScenario& scenario) {
+                selected_authored_slot(scenario).id = 109U;
+            },
+        },
+        {
+            "ordered authored slot vector mutation",
+            interaction::PickAssistReason::SlotChanged,
+            [](FrozenSlotScenario& scenario) {
+                std::vector<interaction::GraspInteractionSlot>& slots =
+                    scenario.target.affordances.front().interaction_slots;
+                require(
+                    slots.size() == 3U && slots[1].id == 9U,
+                    "slot-order fixture did not retain selected index 1");
+                std::swap(slots.front(), slots.back());
+            },
+        },
+        {
+            "combined selected-slot and object-pose mutation",
+            interaction::PickAssistReason::SlotChanged,
+            [](FrozenSlotScenario& scenario) {
+                interaction::GraspInteractionSlot& slot =
+                    selected_authored_slot(scenario);
+                slot.root_z_object_m = std::nextafter(
+                    slot.root_z_object_m, 1.0F);
+                scenario.target.object_world.position.z = std::nextafter(
+                    scenario.target.object_world.position.z, 1.0F);
+            },
+        },
+    }};
+    for (const FrozenSlotObservationFailureCase& test_case : cases) {
+        expect_frozen_slot_observation_failure(test_case);
+    }
+}
+
+void test_slot_approach_unchanged_identity_still_steers() {
+    FrozenSlotScenario scenario;
+    interaction::ControllerPickAssist assist;
+    require(
+        assist.begin(scenario.start, &scenario.target),
+        "unchanged-identity fixture begin failed");
+    const interaction::PickAssistDiagnostics frozen_before =
+        assist.diagnostics();
+
+    const interaction::PickAssistOutput output =
+        assist.observe(scenario.observation);
+    require(
+        output.override_steering && !is_zero(output.left_stick) &&
+            is_zero(output.right_stick) && !output.force_strafe &&
+            !output.stationary_constraint && !output.needs_preview &&
+            !output.submit_interact,
+        "unchanged target and slot identity did not keep far steering active");
+    require(
+        assist.diagnostics().state ==
+                interaction::PickAssistState::SlotApproach &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::None &&
+            assist.active() && assist.owns_manual_interact() &&
+            !assist.take_submission(403U).has_value(),
+        "unchanged target and slot identity changed ownership or state");
+    require_frozen_slot_provenance_unchanged(
+        frozen_before,
+        assist.diagnostics(),
+        "unchanged observation changed frozen slot provenance");
 }
 
 void test_slot_approach_emits_slow_radius_arrival_steering() {
@@ -2267,6 +2590,11 @@ int main() {
         test_idle_does_not_override_input();
         test_begin_selects_and_freezes_one_authored_slot();
         test_slot_approach_emits_far_camera_relative_steering();
+        test_slot_approach_runtime_change_precedes_target_and_metrics();
+        test_slot_approach_target_unavailable_failures_are_stable();
+        test_slot_approach_target_snapshot_failures_are_stable();
+        test_slot_approach_slot_identity_failures_precede_snapshot_mismatch();
+        test_slot_approach_unchanged_identity_still_steers();
         test_slot_approach_emits_slow_radius_arrival_steering();
         test_slot_approach_accumulates_inclusive_travel_and_rejects_overshoot();
         test_slot_approach_revalidates_frozen_route_against_table();
