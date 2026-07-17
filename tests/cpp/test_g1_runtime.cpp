@@ -399,6 +399,25 @@ static void make_masked_candidate_cost_order(
     database_build_bounds(db);
 }
 
+static void make_forced_neighbor_cost_order(
+    database& db,
+    const terrain_support_set& support,
+    const scene_pack& scene)
+{
+    float query[31] = {};
+    capture_legacy_query(query, db, support, scene);
+    for (int frame = 0; frame < db.nframes(); ++frame) {
+        for (int dimension = 0; dimension < 31; ++dimension) {
+            db.features(frame, dimension) = query[dimension] + 50.0f;
+        }
+    }
+    for (int dimension = 0; dimension < 31; ++dimension) {
+        db.features(2, dimension) = query[dimension];
+        db.features(20, dimension) = query[dimension];
+    }
+    database_build_bounds(db);
+}
+
 static void test_direct_runtime_boundary_and_advance()
 {
     database db;
@@ -578,6 +597,52 @@ static void test_feasible_runtime_progression_and_masked_search()
           error);
     check(result.selected_database_frame == 21 && state.frame_index == 22,
           "runtime skips the cheaper search-unsafe candidate");
+
+    make_forced_neighbor_cost_order(db, support, scene);
+    raw_safe.set(1);
+    search_safe.zero();
+    raw_safe(1) = 0;
+    search_safe(2) = 1;
+    search_safe(20) = 1;
+    float forced_query_values[31] = {};
+    capture_legacy_query(forced_query_values, db, support, scene);
+    array1d<float> forced_query(31);
+    for (int dimension = 0; dimension < 31; ++dimension) {
+        forced_query(dimension) = forced_query_values[dimension];
+    }
+    int direct_index = -1;
+    float direct_cost = FLT_MAX;
+    database_search(
+        direct_index,
+        direct_cost,
+        db,
+        forced_query,
+        0.0f,
+        20,
+        20,
+        search_safe.data,
+        search_safe.size);
+    check(direct_index == 2,
+          "fixture makes the nearby frame the uncentered search winner");
+    const g1_runtime_frame_feasibility preserve_neighborhood =
+        make_feasibility_view(raw_safe, search_safe, db.nframes());
+    reset_runtime_state(state, db, support, scene);
+    state.search_timer = 100.0f;
+    std::memset(error, 0, sizeof(error));
+    check(g1_runtime_step(
+              result,
+              state,
+              db,
+              support,
+              scene,
+              preserve_neighborhood,
+              request,
+              config,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+    check(result.selected_database_frame == 20 && state.frame_index == 21,
+          "forced masked search preserves the current-frame neighborhood");
 }
 
 static void test_feasible_runtime_failures_are_transactional()

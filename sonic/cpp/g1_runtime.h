@@ -893,7 +893,7 @@ static inline bool g1_runtime_step_internal(
     if (next.searched)
     {
         const int prior_index = next.frame_index;
-        int best_index = end_of_anim || unsafe_successor ? -1 : prior_index;
+        int best_index = end_of_anim ? -1 : prior_index;
         float best_cost = FLT_MAX;
         const float transition_cost =
             g1_idle_match_transition_cost(
