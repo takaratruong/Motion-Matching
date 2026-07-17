@@ -740,11 +740,12 @@ class GatedSimulatorClientTests(TemporaryScriptCase):
 
 class GearProcessTests(TemporaryScriptCase):
     def gear(self, child, *, active=("CONTROL READY", "STREAM READY"), **kwargs):
+        logs_dir = kwargs.pop("logs_dir", self.root / "gear-logs")
         return GearProcess(
             run_root=self.root,
             command=[sys.executable, "-u", str(child)],
             target_motion_logfile=self.root / "target.csv",
-            logs_dir=self.root / "gear-logs",
+            logs_dir=logs_dir,
             stdout_archive=self.root / "gear.stdout.log",
             stderr_archive=self.root / "gear.stderr.log",
             startup_markers=("BOOT READY",),
@@ -831,6 +832,37 @@ class GearProcessTests(TemporaryScriptCase):
         marker.write_text("evidence\n", encoding="utf-8")
         preserved.close()
         self.assertEqual(marker.read_text(encoding="utf-8"), "evidence\n")
+
+    def test_close_cannot_follow_replaced_logs_parent_outside_run_root(self):
+        child = self.script("unused_swapped_logs.py", "raise SystemExit(0)\n")
+        parent = self.root / "managed"
+        logs = parent / "gear-logs"
+        gear = self.gear(child, logs_dir=logs)
+        moved_parent = self.root / "managed-original"
+        parent.rename(moved_parent)
+
+        with tempfile.TemporaryDirectory() as outside_text:
+            outside = Path(outside_text)
+            outside_logs = outside / "gear-logs"
+            outside_logs.mkdir()
+            parent.symlink_to(outside, target_is_directory=True)
+
+            gear.close()
+
+            self.assertTrue(outside_logs.is_dir())
+            self.assertFalse((moved_parent / "gear-logs").exists())
+
+    def test_close_retains_a_replacement_logs_leaf_with_different_inode(self):
+        child = self.script("unused_replaced_logs.py", "raise SystemExit(0)\n")
+        gear = self.gear(child)
+        original = self.root / "original-gear-logs"
+        gear.logs_dir.rename(original)
+        gear.logs_dir.mkdir()
+
+        gear.close()
+
+        self.assertTrue(original.is_dir())
+        self.assertTrue(gear.logs_dir.is_dir())
 
     def test_default_markers_follow_literal_official_control_then_stream_order(self):
         keys_path = self.root / "default-marker-keys.bin"

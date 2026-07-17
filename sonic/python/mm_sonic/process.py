@@ -263,6 +263,109 @@ def _create_exclusive_directory(
     return candidate
 
 
+@dataclass(frozen=True)
+class _OwnedDirectory:
+    parent_fd: int
+    name: str
+    device: int
+    inode: int
+
+
+def _bind_owned_directory(
+    run_root: Path,
+    candidate: Path,
+    label: str,
+) -> _OwnedDirectory:
+    """Retain a no-follow parent descriptor and the created leaf identity."""
+
+    try:
+        relative = candidate.relative_to(run_root)
+    except ValueError as error:
+        raise ProcessError(f"{label} must be beneath run_root") from error
+    parts = relative.parts
+    if not parts:
+        raise ProcessError(f"{label} must be a descendant beneath run_root")
+    flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    parent_fd: int | None = None
+    leaf_fd: int | None = None
+    retained = False
+    try:
+        expected_root = run_root.stat(follow_symlinks=False)
+        parent_fd = os.open(run_root, flags)
+        opened_root = os.fstat(parent_fd)
+        if (
+            not stat.S_ISDIR(opened_root.st_mode)
+            or opened_root.st_dev != expected_root.st_dev
+            or opened_root.st_ino != expected_root.st_ino
+        ):
+            raise ProcessError(f"{label} run_root identity changed")
+        for part in parts[:-1]:
+            next_fd = os.open(part, flags, dir_fd=parent_fd)
+            os.close(parent_fd)
+            parent_fd = next_fd
+        leaf_fd = os.open(parts[-1], flags, dir_fd=parent_fd)
+        leaf = os.fstat(leaf_fd)
+        if not stat.S_ISDIR(leaf.st_mode):
+            raise ProcessError(f"{label} is not a directory")
+        retained = True
+        return _OwnedDirectory(
+            parent_fd=parent_fd,
+            name=parts[-1],
+            device=leaf.st_dev,
+            inode=leaf.st_ino,
+        )
+    except ProcessError:
+        raise
+    except OSError as error:
+        raise ProcessError(f"cannot bind {label} identity") from error
+    finally:
+        if leaf_fd is not None:
+            try:
+                os.close(leaf_fd)
+            except OSError:
+                pass
+        if parent_fd is not None and not retained:
+            try:
+                os.close(parent_fd)
+            except OSError:
+                pass
+
+
+def _remove_owned_empty_directory(owned: _OwnedDirectory) -> None:
+    """Remove only the empty leaf created under the retained parent."""
+
+    try:
+        try:
+            current = os.stat(
+                owned.name,
+                dir_fd=owned.parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError:
+            return
+        if (
+            not stat.S_ISDIR(current.st_mode)
+            or current.st_dev != owned.device
+            or current.st_ino != owned.inode
+        ):
+            return
+        try:
+            os.rmdir(owned.name, dir_fd=owned.parent_fd)
+        except OSError:
+            # Nonempty evidence or a concurrent identity change is retained.
+            pass
+    finally:
+        try:
+            os.close(owned.parent_fd)
+        except OSError:
+            pass
+
+
 def _open_exclusive_binary_output(
     run_root: Path,
     value: str | Path,
@@ -1698,6 +1801,11 @@ class GearProcess:
         self._control_active = False
         self.signal_history: list[signal.Signals] = []
         self.cleanup_history: list[str] = []
+        self._owned_logs_directory = _bind_owned_directory(
+            self.run_root,
+            self.logs_dir,
+            "GEAR logs directory",
+        )
 
     @property
     def pid(self) -> int:
@@ -2401,12 +2509,12 @@ class GearProcess:
             # The wrapper creates this directory exclusively.  GEAR fills it
             # during a normal run; an earlier peer failure can leave it empty,
             # and empty unregistered directories cannot enter sealed evidence.
-            try:
-                self.logs_dir.rmdir()
-            except OSError:
-                # Nonempty evidence (or a path-identity problem) is retained
-                # for the bundle's strict inventory validation.
-                pass
+            # Retained no-follow identity prevents a child-controlled path swap
+            # from redirecting cleanup outside the run bundle.
+            owned_logs = self._owned_logs_directory
+            self._owned_logs_directory = None
+            if owned_logs is not None:
+                _remove_owned_empty_directory(owned_logs)
         if self._group_exists():
             raise ProcessError(
                 f"GEAR process group {self.pgid} survived cleanup"
