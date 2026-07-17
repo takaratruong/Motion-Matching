@@ -800,10 +800,18 @@ void test_slot_approach_accumulates_inclusive_travel_and_rejects_overshoot() {
 
 void test_slot_approach_revalidates_frozen_route_against_table() {
     FrozenSlotScenario scenario;
+    scenario.target.object_world = {vec3(), quat()};
+    scenario.target.affordances.front().interaction_slots = {
+        {9U, 0.80F, 0.0F, 0.0F},
+        {11U, -0.80F, 0.0F, 0.0F},
+        {12U, 0.0F, -0.90F, 0.0F},
+    };
     scenario.target.table_world = {
-        vec3(-0.10F, 0.0F, 0.80F), quat()};
+        vec3(0.40F, 0.0F, 0.30F), quat()};
     scenario.target.table_size = vec3(0.02F, 0.10F, 0.02F);
+    scenario.start.root_world = {vec3(), quat()};
     scenario.start.target_snapshot = scenario.target;
+    scenario.observation.displayed_root = scenario.start.root_world;
     interaction::ControllerPickAssist assist;
 
     require(
@@ -821,21 +829,61 @@ void test_slot_approach_revalidates_frozen_route_against_table() {
     const interaction::MappedPickSlot& frozen_slot =
         frozen_before.slot_selection.ordered[selected];
     require(
-        frozen_slot.root_world.position.x == 0.0F &&
+        frozen_slot.root_world.position.x == 0.80F &&
             frozen_slot.root_world.position.y == 0.0F &&
-            frozen_slot.root_world.position.z == 0.50F &&
+            frozen_slot.root_world.position.z == 0.0F &&
             frozen_slot.route_length_m == 0.80F,
         "table-revalidation fixture froze unexpected slot geometry");
 
     scenario.observation.displayed_root.position =
-        vec3(-0.20F, 0.0F, 1.10F);
+        vec3(0.0F, 0.0F, 0.60F);
+    const interaction::Transform current_root =
+        scenario.observation.displayed_root;
+    const auto alternate = std::find_if(
+        frozen_before.slot_selection.ordered.begin(),
+        frozen_before.slot_selection.ordered.end(),
+        [](const interaction::MappedPickSlot& slot) {
+            return slot.id == 11U;
+        });
+    require(
+        alternate != frozen_before.slot_selection.ordered.end(),
+        "table-revalidation fixture had no alternate slot ID 11");
+    require(
+        alternate->root_world.position.x == -0.80F &&
+            alternate->root_world.position.y == 0.0F &&
+            alternate->root_world.position.z == 0.0F &&
+            alternate->route_length_m == frozen_slot.route_length_m,
+        "table-revalidation fixture mapped an unexpected alternate endpoint");
+    require(
+        interaction::revalidate_frozen_pick_slot(
+            current_root,
+            frozen_slot.root_world,
+            scenario.start.target_snapshot,
+            scenario.start.obstacles) ==
+                interaction::PickSlotReason::TableBlocked,
+        "exact selected frozen table route was not TableBlocked");
+    require(
+        interaction::revalidate_frozen_pick_slot(
+            current_root,
+            current_root,
+            scenario.start.target_snapshot,
+            scenario.start.obstacles) == interaction::PickSlotReason::None,
+        "current table endpoint was not clear");
+    require(
+        interaction::revalidate_frozen_pick_slot(
+            current_root,
+            alternate->root_world,
+            scenario.start.target_snapshot,
+            scenario.start.obstacles) == interaction::PickSlotReason::None,
+        "alternate authored table endpoint was not clear");
     const interaction::PickAssistOutput output =
         assist.observe(scenario.observation);
     const interaction::PickAssistDiagnostics& failed =
         assist.diagnostics();
     require(
         failed.state == interaction::PickAssistState::Failed &&
-            failed.reason == interaction::PickAssistReason::TableBlocked,
+            failed.reason == interaction::PickAssistReason::TableBlocked &&
+            same_float_bits_exact(failed.assisted_travel_m, 0.60F),
         "newly blocked frozen route did not fail immediately with TableBlocked");
     require(
         !assist.active() && !assist.owns_manual_interact() &&
@@ -850,10 +898,20 @@ void test_slot_approach_revalidates_frozen_route_against_table() {
 
 void test_slot_approach_revalidates_frozen_route_against_obstacles() {
     FrozenSlotScenario scenario;
+    scenario.target.object_world = {vec3(), quat()};
+    scenario.target.affordances.front().interaction_slots = {
+        {9U, 0.80F, 0.0F, 0.0F},
+        {11U, -0.80F, 0.0F, 0.0F},
+        {12U, 0.0F, -0.90F, 0.0F},
+    };
+    scenario.start.root_world = {
+        vec3(0.0F, 10.0F, 0.0F), quat()};
+    scenario.start.target_snapshot = scenario.target;
     scenario.start.obstacles.push_back({
-        vec3(-0.10F, 0.0F, 1.20F),
+        vec3(0.64F, 0.0F, 0.62F),
         vec3(0.02F, 0.10F, 0.02F),
     });
+    scenario.observation.displayed_root = scenario.start.root_world;
     interaction::ControllerPickAssist assist;
 
     require(
@@ -871,21 +929,61 @@ void test_slot_approach_revalidates_frozen_route_against_obstacles() {
     const interaction::MappedPickSlot& frozen_slot =
         frozen_before.slot_selection.ordered[selected];
     require(
-        frozen_slot.root_world.position.x == 0.0F &&
-            frozen_slot.root_world.position.y == 0.0F &&
-            frozen_slot.root_world.position.z == 0.50F &&
+        frozen_slot.root_world.position.x == 0.80F &&
+            frozen_slot.root_world.position.y == 10.0F &&
+            frozen_slot.root_world.position.z == 0.0F &&
             frozen_slot.route_length_m == 0.80F,
         "obstacle-revalidation fixture froze unexpected slot geometry");
 
     scenario.observation.displayed_root.position =
-        vec3(-0.20F, 0.0F, 1.30F);
+        vec3(0.0F, 0.0F, 0.60F);
+    const interaction::Transform current_root =
+        scenario.observation.displayed_root;
+    const auto alternate = std::find_if(
+        frozen_before.slot_selection.ordered.begin(),
+        frozen_before.slot_selection.ordered.end(),
+        [](const interaction::MappedPickSlot& slot) {
+            return slot.id == 11U;
+        });
+    require(
+        alternate != frozen_before.slot_selection.ordered.end(),
+        "obstacle-revalidation fixture had no alternate slot ID 11");
+    require(
+        alternate->root_world.position.x == -0.80F &&
+            alternate->root_world.position.y == 10.0F &&
+            alternate->root_world.position.z == 0.0F &&
+            alternate->route_length_m == frozen_slot.route_length_m,
+        "obstacle-revalidation fixture mapped an unexpected alternate endpoint");
+    require(
+        interaction::revalidate_frozen_pick_slot(
+            current_root,
+            frozen_slot.root_world,
+            scenario.start.target_snapshot,
+            scenario.start.obstacles) ==
+                interaction::PickSlotReason::ObstacleBlocked,
+        "exact selected frozen obstacle route was not ObstacleBlocked");
+    require(
+        interaction::revalidate_frozen_pick_slot(
+            current_root,
+            current_root,
+            scenario.start.target_snapshot,
+            scenario.start.obstacles) == interaction::PickSlotReason::None,
+        "current obstacle endpoint was not clear");
+    require(
+        interaction::revalidate_frozen_pick_slot(
+            current_root,
+            alternate->root_world,
+            scenario.start.target_snapshot,
+            scenario.start.obstacles) == interaction::PickSlotReason::None,
+        "alternate authored obstacle endpoint was not clear");
     const interaction::PickAssistOutput output =
         assist.observe(scenario.observation);
     const interaction::PickAssistDiagnostics& failed =
         assist.diagnostics();
     require(
         failed.state == interaction::PickAssistState::Failed &&
-            failed.reason == interaction::PickAssistReason::ObstacleBlocked,
+            failed.reason == interaction::PickAssistReason::ObstacleBlocked &&
+            same_float_bits_exact(failed.assisted_travel_m, 0.60F),
         "newly blocked frozen route did not fail immediately with ObstacleBlocked");
     require(
         !assist.active() && !assist.owns_manual_interact() &&
