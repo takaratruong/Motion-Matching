@@ -508,6 +508,11 @@ def _safe_kill_created_group(
 class _RemoteMMError(ProcessProtocolError):
     """A valid MM error response, which proves no successful candidate reply."""
 
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        self.message = message
+        super().__init__(f"{code}: {message}")
+
 
 class MMChunkClient:
     """Strict persistent MM JSONL client with unbounded generation waits.
@@ -765,7 +770,7 @@ class MMChunkClient:
             raise ProcessProtocolError("MM response request_id mismatch")
         if envelope["ok"] is False:
             assert type(remote) is dict
-            raise _RemoteMMError(f"{remote['code']}: {remote['message']}")
+            raise _RemoteMMError(remote["code"], remote["message"])
         if type(data) is not dict:
             raise ProcessProtocolError("MM success response data must be an object")
         return data

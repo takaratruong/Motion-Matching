@@ -31,7 +31,7 @@ from mm_sonic.coordinator import Coordinator, SessionConfig, expected_official_t
 from mm_sonic.external import ExternalInputs
 from mm_sonic.joints import ContractError
 from mm_sonic.metrics import validate_stage_a_prerequisite
-from mm_sonic.process import GearProcess, ProcessError
+from mm_sonic.process import GearProcess, ProcessError, _RemoteMMError
 from mm_sonic.timeline import CanonicalTargetBuffer
 from mm_sonic.zmq_v1 import PosePublisher, encode_pose_v1
 
@@ -2395,6 +2395,264 @@ class ProductionAdapterBoundaryTests(unittest.TestCase):
             cli_module._validate_target_prefix(rows[0] + rows[2], rows)
         with self.assertRaisesRegex(ContractError, "overshoot"):
             cli_module._validate_target_prefix(b"".join(rows + rows[-1:]), rows)
+
+    def _remote_generation_error_case(
+        self, *, code: str, message: str, label: str
+    ) -> tuple[GateResult, dict[str, object] | None, tuple[str, ...]]:
+        case_root = self.root / label
+        case_root.mkdir()
+        sonic_root = case_root / "sonic"
+        mm_server = sonic_root / "build/mm_chunk_server"
+        mm_server.parent.mkdir(parents=True)
+        mm_server.write_bytes(b"authenticated mm server")
+        mm_server.chmod(0o755)
+
+        gear = case_root / "gear"
+        terrain = case_root / "terrain"
+        gear.mkdir()
+        terrain.mkdir()
+        policy = case_root / "policy.onnx"
+        observation = case_root / "observation.yaml"
+        source = case_root / "source.xml"
+        policy.write_bytes(b"policy")
+        observation.write_bytes(b"observations: []\n")
+        source.write_bytes(b"<mujoco/>\n")
+        inputs = ExternalInputs(
+            gear_checkout=gear.resolve(),
+            policy=policy.resolve(),
+            observation_config=observation.resolve(),
+            encoder=None,
+            terrain_dir=terrain.resolve(),
+            source_mjcf=source.resolve(),
+        )
+        context = StageAContext(
+            gear_commit="1" * 40,
+            gear_dirty=False,
+            external_hashes=MappingProxyType({}),
+            motion_matching_commit="2" * 40,
+            motion_matching_dirty=False,
+            artifact_hashes=MappingProxyType({}),
+            known_good_reference=gear,
+            processes=(),
+        )
+        scene_xml = case_root / "scene.xml"
+        scene_xml.write_bytes(b"<mujoco/>\n")
+        scene = cli_module.RegisteredScene(
+            scene_id="sonic-flat-baseline",
+            route_id="flat-12s",
+            source_kind="analytic-flat",
+            source_mesh=None,
+            source_heightfield=None,
+            source_hashes=MappingProxyType({}),
+            coordinate_source="holden-y-up-right-handed-forward-plus-z",
+            coordinate_target="mujoco-z-up-right-handed-forward-plus-x",
+            transform_matrix=np.eye(3, dtype=np.float64),
+            transformed_obj=None,
+            gear_scene_xml=scene_xml,
+            output_hashes=MappingProxyType({}),
+            allowed_foot_geoms=(),
+            forbidden_geom_groups=MappingProxyType({}),
+        )
+        initial = SimpleNamespace(
+            physical_pelvis_position_holden=np.zeros(3, dtype=np.float32),
+            virtual_root_position_holden=np.zeros(3, dtype=np.float32),
+            virtual_root_orientation_holden=np.array(
+                [1.0, 0.0, 0.0, 0.0], dtype=np.float32
+            ),
+        )
+
+        class FakeTimeline:
+            def __init__(self, _initial, _contract):
+                self.last_accepted_candidate_id = None
+                self._count = 1
+
+            @property
+            def canonical_buffer(self):
+                return SimpleNamespace(count=self._count)
+
+            def prepare(self, value):
+                return value
+
+            def commit(self, value):
+                self.last_accepted_candidate_id = value.candidate_id
+                self._count += 20
+                return SimpleNamespace(
+                    physical_pelvis_position=np.zeros(
+                        (20, 3), dtype=np.float32
+                    ),
+                    virtual_root_position=np.zeros((20, 3), dtype=np.float32),
+                    virtual_root_quat_w=np.tile(
+                        np.array(
+                            [[1.0, 0.0, 0.0, 0.0]], dtype=np.float32
+                        ),
+                        (20, 1),
+                    ),
+                )
+
+        class FakeValidator:
+            def validate_initial(self, _value):
+                return initial
+
+            def validate_source(self, value):
+                return SimpleNamespace(candidate_id=value["candidate_id"])
+
+        aborted: list[str] = []
+
+        class FakeMMClient:
+            def __init__(
+                self, *, stdout_archive, stderr_archive, **_kwargs
+            ):
+                Path(stdout_archive).write_bytes(b"reset accepted\n")
+                Path(stderr_archive).write_bytes(b"")
+                self.outstanding_candidate_id = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def hello(self):
+                return {}
+
+            def reset(self, _config, *, session_id):
+                self.session_id = session_id
+                return {"scene": {}}
+
+            def generate(self, _command, *, candidate_id, **_kwargs):
+                chunk = int(candidate_id.rsplit(":", 1)[1])
+                if chunk == 5:
+                    self.outstanding_candidate_id = None
+                    raise _RemoteMMError(code, message)
+                self.outstanding_candidate_id = candidate_id
+                return {"candidate_id": candidate_id}
+
+            def commit(self, candidate_id):
+                if self.outstanding_candidate_id != candidate_id:
+                    raise AssertionError("fake candidate ownership changed")
+                self.outstanding_candidate_id = None
+
+            def abort(self, candidate_id):
+                aborted.append(candidate_id)
+                self.outstanding_candidate_id = None
+
+        contract = SimpleNamespace(
+            rows=(
+                SimpleNamespace(
+                    source_joint="left_ankle_roll_joint",
+                    lower=-0.2618,
+                    upper=0.2618,
+                ),
+            )
+        )
+        operations = cli_module.DefaultStageAOperations()
+        operations._runtime[id(context)] = {
+            "scene": scene,
+            "verified_external": SimpleNamespace(inputs=inputs),
+        }
+        request = StageARequest(
+            command="stage-a",
+            mode="mm-reference",
+            argv=(),
+            namespace=argparse.Namespace(),
+            environment=MappingProxyType({}),
+        )
+        bundle = RunBundle.create(case_root / "runs", "stage-a", label)
+        try:
+            with (
+                patch.object(cli_module, "_SONIC_ROOT", sonic_root),
+                patch.object(
+                    cli_module, "load_joint_contract", return_value=contract
+                ),
+                patch.object(
+                    cli_module, "SourceValidator", return_value=FakeValidator()
+                ),
+                patch.object(cli_module, "MMChunkClient", FakeMMClient),
+                patch.object(cli_module, "verify_mm_scene_identity"),
+                patch.object(cli_module, "TargetTimeline", FakeTimeline),
+            ):
+                result = operations.run_gate(
+                    "flat_mm_kinematic_replay", request, context, bundle
+                )
+            evidence_path = bundle.path / "gates/flat_mm_kinematic_replay.json"
+            evidence = (
+                json.loads(evidence_path.read_text("ascii"))
+                if evidence_path.exists()
+                else None
+            )
+            return result, evidence, tuple(aborted)
+        finally:
+            bundle.__del__()
+
+    def test_remote_joint_limit_failure_is_scientific_at_source_chunk(self):
+        result, evidence, aborted = self._remote_generation_error_case(
+            code="generation_failed",
+            message=(
+                "joint left_ankle_roll_joint position -0.307408422 is outside "
+                "range [-0.261799991, 0.261799991]"
+            ),
+            label="remote-joint-limit",
+        )
+        self.assertEqual(result.status, "scientific_failure")
+        self.assertEqual(aborted, ())
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertEqual(
+            {
+                key: evidence[key]
+                for key in (
+                    "status",
+                    "failed_chunk",
+                    "failure_boundary",
+                    "initial_boundary_accepted",
+                    "completed_chunks",
+                    "partial_frame_count",
+                    "required_chunks",
+                    "required_frame_count",
+                )
+            },
+            {
+                "status": "scientific_failure",
+                "failed_chunk": 5,
+                "failure_boundary": "source_chunk",
+                "initial_boundary_accepted": True,
+                "completed_chunks": 5,
+                "partial_frame_count": 101,
+                "required_chunks": 30,
+                "required_frame_count": 601,
+            },
+        )
+
+    def test_remote_joint_limit_lookalikes_remain_integration_failures(self):
+        limit = (
+            "joint left_ankle_roll_joint position -0.307408422 is outside "
+            "range [-0.261799991, 0.261799991]"
+        )
+        cases = (
+            ("generation_failed", "database runtime invariant failed"),
+            ("invalid_candidate", limit),
+            (
+                "generation_failed",
+                "joint invented_joint position -0.307408422 is outside range "
+                "[-0.261799991, 0.261799991]",
+            ),
+            ("generation_failed", limit + " trailing"),
+            (
+                "generation_failed",
+                "joint left_ankle_roll_joint position -0.2 is outside range "
+                "[-0.261799991, 0.261799991]",
+            ),
+        )
+        for index, (code, message) in enumerate(cases):
+            with self.subTest(code=code, message=message):
+                result, evidence, aborted = self._remote_generation_error_case(
+                    code=code,
+                    message=message,
+                    label=f"remote-lookalike-{index}",
+                )
+                self.assertEqual(result.status, "integration_failure")
+                self.assertIsNone(evidence)
+                self.assertEqual(aborted, ())
 
     def test_initial_joint_limit_failure_is_scientific_before_chunk_zero(
         self,

@@ -41,6 +41,7 @@ from .external import (
 )
 from .joints import (
     ContractError,
+    SOURCE_JOINT_ORDER,
     contract_json_bytes,
     generate_joint_contract,
     load_joint_contract,
@@ -57,6 +58,7 @@ from .process import (
     GearProcess,
     MMChunkClient,
     ProcessError,
+    _RemoteMMError,
     _gear_process_argv,
     _linux_group_states,
 )
@@ -137,6 +139,15 @@ _SHA256_CHARS = frozenset("0123456789abcdef")
 _LOCAL_ZMQ_ENDPOINT = re.compile(
     r"^tcp://(?P<host>127\.0\.0\.1):(?P<port>[1-9][0-9]{0,4})$"
 )
+_REMOTE_FINITE_NUMBER = (
+    r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
+)
+_REMOTE_JOINT_LIMIT_MESSAGE = re.compile(
+    rf"\Ajoint (?P<joint>[a-z][a-z0-9_]*_joint) "
+    rf"position (?P<position>{_REMOTE_FINITE_NUMBER}) is outside range "
+    rf"\[(?P<lower>{_REMOTE_FINITE_NUMBER}), "
+    rf"(?P<upper>{_REMOTE_FINITE_NUMBER})\]\Z"
+)
 _COLD_GEAR_STARTUP_TIMEOUT_S = 600.0
 _LOW_STATE_BOOTSTRAP_TIMEOUT_S = 15.0
 _SCORING_TARGET_TIMEOUT_S = 30.0
@@ -153,6 +164,31 @@ _POST_ENABLE_RIGHT_LINE = "Delta heading right: 0 rad"
 _POST_ENABLE_FENCE_SEMANTICS = (
     "post-enable-reset-tail-complete-with-net-zero-heading"
 )
+
+
+def _is_remote_registered_joint_limit(error: BaseException) -> bool:
+    if not isinstance(error, _RemoteMMError) or error.code != "generation_failed":
+        return False
+    # The authenticated server renders this message from its loaded contract;
+    # retain only the fixed registered name and self-consistent numeric meaning.
+    match = _REMOTE_JOINT_LIMIT_MESSAGE.fullmatch(error.message)
+    if match is None or match.group("joint") not in SOURCE_JOINT_ORDER:
+        return False
+    try:
+        position = float(match.group("position"))
+        lower = float(match.group("lower"))
+        upper = float(match.group("upper"))
+    except ValueError:
+        return False
+    return (
+        math.isfinite(position)
+        and math.isfinite(lower)
+        and math.isfinite(upper)
+        and lower < upper
+        and (position < lower or position > upper)
+    )
+
+
 _PRELOAD_CONSUMER_TRANSCRIPT_PATH = (
     "dynamic/stream/preload-consumer-transcript.json"
 )
@@ -4069,9 +4105,10 @@ class DefaultStageAOperations:
                     except BaseException as error:
                         if client.outstanding_candidate_id == candidate_id:
                             client.abort(candidate_id)
-                        if isinstance(error, ContractError) and "joint limit" in str(
-                            error
-                        ).lower():
+                        if (
+                            isinstance(error, ContractError)
+                            and "joint limit" in str(error).lower()
+                        ) or _is_remote_registered_joint_limit(error):
                             scientific_reason = (
                                 "flat MM reference violated the registered joint "
                                 f"limits at chunk {command.chunk_index}: {error}"

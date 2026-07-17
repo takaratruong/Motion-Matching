@@ -12,15 +12,19 @@ from unittest.mock import patch
 
 import numpy as np
 
+from mm_sonic.commands import CommandSample
+from mm_sonic.coordinator import SessionConfig
 from mm_sonic.process import (
     AdvanceResult,
     ChildProcessDied,
     GatedSimulatorClient,
     GearProcess,
+    MMChunkClient,
     OperatorCancelled,
     ProcessError,
     ProcessProtocolError,
     SimulationPolicyGate,
+    _RemoteMMError,
 )
 
 
@@ -44,6 +48,108 @@ class TemporaryScriptCase(unittest.TestCase):
         path = self.root / name
         path.write_text(textwrap.dedent(source), encoding="utf-8")
         return path
+
+
+class MMChunkClientRemoteErrorTests(TemporaryScriptCase):
+    def test_valid_generation_error_retains_structure_and_clears_candidate(self):
+        message = (
+            "joint left_ankle_roll_joint position -0.307408422 is outside "
+            "range [-0.261799991, 0.261799991]"
+        )
+        child = self.script(
+            "mm_remote_error.py",
+            r'''
+            import json
+            import sys
+
+            for line in sys.stdin:
+                request = json.loads(line)
+                op = request["op"]
+                if op == "hello":
+                    response = {
+                        "v": 1,
+                        "ok": True,
+                        "op": op,
+                        "request_id": request["request_id"],
+                        "data": {"protocol_version": 1},
+                    }
+                elif op == "reset":
+                    response = {
+                        "v": 1,
+                        "ok": True,
+                        "op": op,
+                        "request_id": request["request_id"],
+                        "data": {
+                            "session_id": request["session_id"],
+                            "active_candidate_id": None,
+                            "scene": {},
+                            "initial_boundary": {},
+                        },
+                    }
+                elif op == "generate":
+                    response = {
+                        "v": 1,
+                        "ok": False,
+                        "op": op,
+                        "request_id": request["request_id"],
+                        "error": {
+                            "code": "generation_failed",
+                            "message": (
+                                "joint left_ankle_roll_joint position "
+                                "-0.307408422 is outside range "
+                                "[-0.261799991, 0.261799991]"
+                            ),
+                        },
+                    }
+                elif op == "close":
+                    response = {
+                        "v": 1,
+                        "ok": True,
+                        "op": op,
+                        "request_id": request["request_id"],
+                        "data": {},
+                    }
+                print(json.dumps(response, separators=(",", ":")), flush=True)
+                if op == "close":
+                    break
+            ''',
+        )
+        client = MMChunkClient(
+            run_root=self.root,
+            command=(sys.executable, "-u", str(child)),
+            stdout_archive=self.root / "mm.stdout.jsonl",
+            stderr_archive=self.root / "mm.stderr.log",
+            poll_interval_s=0.01,
+            stop_grace_s=0.05,
+            term_grace_s=0.05,
+            kill_grace_s=0.05,
+        )
+        try:
+            client.hello()
+            client.reset(
+                SessionConfig("sonic-flat-baseline", "flat-12s", 0.0),
+                session_id="session-remote-error",
+            )
+            with self.assertRaises(_RemoteMMError) as raised:
+                client.generate(
+                    CommandSample(
+                        chunk_index=0,
+                        requested_velocity_mujoco=(0.5, 0.0, 0.0),
+                        desired_heading_mujoco_wxyz=(1.0, 0.0, 0.0, 0.0),
+                    ),
+                    session_id="session-remote-error",
+                    candidate_id="candidate-remote-error",
+                    predecessor_id=None,
+                    source_intervals=10,
+                )
+            self.assertEqual(raised.exception.code, "generation_failed")
+            self.assertEqual(raised.exception.message, message)
+            self.assertEqual(
+                str(raised.exception), f"generation_failed: {message}"
+            )
+            self.assertIsNone(client.outstanding_candidate_id)
+        finally:
+            client.close()
 
 
 class GatedSimulatorClientTests(TemporaryScriptCase):
