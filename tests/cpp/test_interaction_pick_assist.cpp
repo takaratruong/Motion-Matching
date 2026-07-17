@@ -508,6 +508,88 @@ void test_slot_approach_emits_far_camera_relative_steering() {
         "camera azimuth changed frozen slot ID, index, root, or route provenance");
 }
 
+void test_slot_approach_emits_slow_radius_arrival_steering() {
+    const interaction::PickAssistConfig config{};
+    FrozenSlotScenario scenario;
+    interaction::ControllerPickAssist assist(config);
+
+    require(
+        assist.begin(scenario.start, &scenario.target),
+        "slow-radius approach begin failed");
+    const interaction::PickAssistDiagnostics frozen_before =
+        assist.diagnostics();
+    require(
+        frozen_before.state == interaction::PickAssistState::SlotApproach &&
+            frozen_before.reason == interaction::PickAssistReason::None &&
+            frozen_before.selected_slot_id == 9U &&
+            frozen_before.slot_selection.selected_index.has_value(),
+        "slow-radius fixture did not select slot ID 9");
+    const interaction::Transform frozen_root =
+        frozen_before.slot_selection.ordered[
+            *frozen_before.slot_selection.selected_index].root_world;
+    require(
+        frozen_root.position.x == 0.0F &&
+            frozen_root.position.y == 0.0F &&
+            frozen_root.position.z == 0.50F,
+        "slow-radius fixture froze an unexpected root");
+
+    scenario.observation.displayed_root.position =
+        vec3(-0.30F, 0.0F, 0.50F);
+    scenario.observation.camera_azimuth = 0.25F * PIf;
+    const float root_error_m = static_cast<float>(std::hypot(
+        static_cast<double>(
+            frozen_root.position.x -
+            scenario.observation.displayed_root.position.x),
+        static_cast<double>(
+            frozen_root.position.z -
+            scenario.observation.displayed_root.position.z)));
+    require(
+        root_error_m < config.arrival.slow_radius_m &&
+            root_error_m > config.arrival.latch_position_error_m,
+        "slow-radius fixture was not between slow and arrival radii");
+
+    const vec3 expected_left = interaction::arrival_navigation_stick(
+        frozen_root.position,
+        scenario.observation.displayed_root.position,
+        scenario.observation.camera_azimuth,
+        config.arrival);
+    vec3 frozen_forward = quat_mul_vec3(
+        frozen_root.rotation, vec3(0.0F, 0.0F, 1.0F));
+    frozen_forward.y = 0.0F;
+    const vec3 expected_right = interaction::arrival_facing_stick(
+        frozen_forward, scenario.observation.camera_azimuth);
+
+    const interaction::PickAssistOutput output =
+        assist.observe(scenario.observation);
+    require(
+        output.override_steering && output.force_strafe,
+        "slow-radius SlotApproach did not own strafe steering");
+    require_near(
+        output.left_stick,
+        expected_left,
+        2.0e-5F,
+        "slow-radius SlotApproach did not use arrival navigation steering");
+    require_near(
+        output.right_stick,
+        expected_right,
+        2.0e-5F,
+        "slow-radius SlotApproach did not use frozen-root facing steering");
+    require(
+        !output.needs_preview && !output.stationary_constraint &&
+            !output.submit_interact,
+        "slow-radius SlotApproach emitted preview, stationary, or submission output");
+    require(
+        assist.diagnostics().state ==
+                interaction::PickAssistState::SlotApproach &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::None,
+        "slow-radius SlotApproach changed state or reason");
+    require_frozen_slot_provenance_unchanged(
+        frozen_before,
+        assist.diagnostics(),
+        "slow-radius SlotApproach changed frozen slot provenance");
+}
+
 void test_slot_approach_accumulates_inclusive_travel_and_rejects_overshoot() {
     const auto configure_travel_scenario = [](FrozenSlotScenario& scenario) {
         scenario.target.object_world.position.x = 0.80F;
@@ -2021,6 +2103,7 @@ int main() {
         test_idle_does_not_override_input();
         test_begin_selects_and_freezes_one_authored_slot();
         test_slot_approach_emits_far_camera_relative_steering();
+        test_slot_approach_emits_slow_radius_arrival_steering();
         test_slot_approach_accumulates_inclusive_travel_and_rejects_overshoot();
         test_slot_approach_revalidates_frozen_route_against_table();
         test_slot_approach_revalidates_frozen_route_against_obstacles();
