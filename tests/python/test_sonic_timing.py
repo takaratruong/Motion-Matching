@@ -1054,15 +1054,22 @@ class ScoredEpochTests(TemporaryCase):
 
         def __init__(self) -> None:
             self.events: list[str] = []
+            self.band_states: list[object] = []
             self.closed = False
 
         def hello(self):
             self.events.append("hello")
             return {}
 
-        def reset(self, **_kwargs):
+        def reset(self, *, elastic_band_enabled, **_kwargs):
             self.events.append("reset")
-            return {"nq": 36, "sim_dt_s": self.sim_dt, "sim_time_s": 0.0}
+            self.band_states.append(elastic_band_enabled)
+            return {
+                "nq": 36,
+                "sim_dt_s": self.sim_dt,
+                "sim_time_s": 0.0,
+                "elastic_band_enabled": elastic_band_enabled,
+            }
 
         def advance(self, steps: int) -> AdvanceResult:
             self.events.append(f"advance-{steps}")
@@ -1238,6 +1245,14 @@ class ScoredEpochTests(TemporaryCase):
                     self.assertTrue(publisher.closed)
                 self.assertEqual(execution.bootstrap_steps, 7)
                 self.assertEqual(execution.wait_maintenance_steps, 7)
+                # Bootstrap resets with the band on; the scored reset turns it off.
+                self.assertEqual(simulator.band_states, [True, False])
+                self.assertIs(
+                    execution.bootstrap["reset"]["elastic_band_enabled"], True
+                )
+                self.assertIs(
+                    execution.prime["reset"]["elastic_band_enabled"], False
+                )
         self.assertEqual(
             driven_phases,
             [
@@ -1332,6 +1347,45 @@ class ScoredEpochTests(TemporaryCase):
                 log_dir=self.root / "scored",
             )
         self.assertEqual(simulator.calls, [])
+
+    def test_scored_reset_disables_band_and_retains_echoed_response(self) -> None:
+        class Gear:
+            wait_for_control_ready = True
+            input_prepared = True
+            control_active = False
+
+            def group_is_stopped(self) -> bool:
+                return True
+
+        class Simulator:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, object]] = []
+
+            def reset(self, *, elastic_band_enabled, **kwargs):
+                self.calls.append(("reset", elastic_band_enabled))
+                return {
+                    "nq": 36,
+                    "sim_dt_s": 0.002,
+                    "sim_time_s": 0.0,
+                    "elastic_band_enabled": elastic_band_enabled,
+                }
+
+            def advance(self, steps):
+                self.calls.append(("advance", steps))
+                return AdvanceResult(steps, 0.0, steps * 0.002, 0, steps)
+
+        simulator = Simulator()
+        prime = cli_module._reset_and_prime_scored_epoch(
+            Gear(),
+            simulator,
+            scene_xml=self.root / "scene.xml",
+            initial_qpos=np.zeros(36),
+            log_dir=self.root / "scored",
+        )
+        self.assertEqual(
+            simulator.calls, [("reset", False), ("advance", 1)]
+        )
+        self.assertIs(prime["reset"]["elastic_band_enabled"], False)
 
 
 def write_gear_logs(

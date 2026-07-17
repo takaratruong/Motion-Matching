@@ -3105,6 +3105,7 @@ def _reset_and_prime_scored_epoch(
         lateral_offset_m=0.0,
         yaw_offset_rad=0.0,
         log_dir=log_dir,
+        elastic_band_enabled=False,
     )
     prime = simulator.advance(1)
     if getattr(prime, "steps", None) != 1:
@@ -3370,12 +3371,15 @@ def _execute_known_good_scoring_epoch(
     cleanup_failure: BaseException | None = None
     try:
         simulator.hello()
-        simulator.reset(
-            scene_xml=scene.gear_scene_xml,
-            initial_qpos=initial_qpos,
-            lateral_offset_m=0.0,
-            yaw_offset_rad=0.0,
-            log_dir=bundle.path / f"dynamic/{mode}/bootstrap-sim-logs",
+        bootstrap["reset"] = dict(
+            simulator.reset(
+                scene_xml=scene.gear_scene_xml,
+                initial_qpos=initial_qpos,
+                lateral_offset_m=0.0,
+                yaw_offset_rad=0.0,
+                log_dir=bundle.path / f"dynamic/{mode}/bootstrap-sim-logs",
+                elastic_band_enabled=True,
+            )
         )
         bootstrap_steps = _drive_simulator_until(
             gear.start_to_wait_for_control,

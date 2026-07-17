@@ -49,9 +49,11 @@ class FakeBackend:
     def sim_dt(self):
         return self._sim_dt
 
-    def reset_from_qpos(self, qpos, lateral_offset_m, yaw_offset_rad):
+    def reset_from_qpos(
+        self, qpos, lateral_offset_m, yaw_offset_rad, *, elastic_band_enabled
+    ):
         self.reset_calls.append(
-            (qpos.copy(), lateral_offset_m, yaw_offset_rad)
+            (qpos.copy(), lateral_offset_m, yaw_offset_rad, elastic_band_enabled)
         )
         self._data.qpos[:] = physical_qpos_with_perturbation(
             qpos,
@@ -102,7 +104,7 @@ class GatedSimulatorRunnerTests(unittest.TestCase):
         self.runner.close()
         self.temporary.cleanup()
 
-    def reset(self, qpos=None, *, lateral=0.0, yaw=0.0):
+    def reset(self, qpos=None, *, lateral=0.0, yaw=0.0, elastic_band_enabled=True):
         if qpos is None:
             qpos = np.zeros(36, dtype=np.float64)
             qpos[2] = 0.8
@@ -114,7 +116,38 @@ class GatedSimulatorRunnerTests(unittest.TestCase):
             lateral_offset_m=lateral,
             yaw_offset_rad=yaw,
             log_dir=self.log_dir,
+            elastic_band_enabled=elastic_band_enabled,
         )
+
+    def test_reset_requires_and_echoes_a_strict_band_boolean(self):
+        first = self.reset(elastic_band_enabled=True)
+        self.assertIs(first["elastic_band_enabled"], True)
+        self.assertIs(self.backends[-1].reset_calls[-1][3], True)
+
+        second = self.runner.reset(
+            scene_xml=self.scene,
+            initial_qpos=np.r_[np.zeros(3), 1.0, np.zeros(32)],
+            lateral_offset_m=0.0,
+            yaw_offset_rad=0.0,
+            log_dir=self.root / "scored-band-sim",
+            elastic_band_enabled=False,
+        )
+        self.assertIs(second["elastic_band_enabled"], False)
+        self.assertIs(self.backends[-1].reset_calls[-1][3], False)
+
+    def test_reset_rejects_nonboolean_band_state_without_touching_backend(self):
+        for value in (0, 1, None, "true"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ProtocolError, "elastic_band_enabled"):
+                    self.runner.reset(
+                        scene_xml=self.scene,
+                        initial_qpos=np.r_[np.zeros(3), 1.0, np.zeros(32)],
+                        lateral_offset_m=0.0,
+                        yaw_offset_rad=0.0,
+                        log_dir=self.root / f"band-{value}-sim",
+                        elastic_band_enabled=value,
+                    )
+        self.assertEqual(self.backends, [])
 
     def test_reset_is_idle_and_requires_exact_nq_values(self):
         with self.assertRaisesRegex(ProtocolError, "exactly 36"):
@@ -142,6 +175,7 @@ class GatedSimulatorRunnerTests(unittest.TestCase):
             lateral_offset_m=0.0,
             yaw_offset_rad=0.0,
             log_dir=second_logs,
+            elastic_band_enabled=True,
         )
 
         self.assertEqual(len(self.backends), 1)
@@ -172,6 +206,7 @@ class GatedSimulatorRunnerTests(unittest.TestCase):
                 lateral_offset_m=0.0,
                 yaw_offset_rad=0.0,
                 log_dir=self.root / "replacement-scene-logs",
+                elastic_band_enabled=True,
             )
 
         self.assertEqual(len(self.backends), 1)
@@ -201,6 +236,7 @@ class GatedSimulatorRunnerTests(unittest.TestCase):
                 lateral_offset_m=0.0,
                 yaw_offset_rad=0.0,
                 log_dir=self.root / "mutated-scene-logs",
+                elastic_band_enabled=True,
             )
 
         self.assertEqual(len(self.backends), 1)
@@ -225,6 +261,7 @@ class GatedSimulatorRunnerTests(unittest.TestCase):
                 lateral_offset_m=0.0,
                 yaw_offset_rad=0.0,
                 log_dir=self.root / "other-scene-logs",
+                elastic_band_enabled=True,
             )
 
         self.assertEqual(len(self.backends), 1)
@@ -322,6 +359,7 @@ class GatedSimulatorRunnerTests(unittest.TestCase):
                     lateral_offset_m=0.0,
                     yaw_offset_rad=0.0,
                     log_dir=self.log_dir / "bad",
+                    elastic_band_enabled=True,
                 )
             self.assertEqual(bad.step_calls, 0)
         finally:
@@ -340,6 +378,7 @@ class GatedSimulatorRunnerTests(unittest.TestCase):
                     lateral_offset_m=0.0,
                     yaw_offset_rad=0.0,
                     log_dir=self.log_dir,
+                    elastic_band_enabled=True,
                 )
             with self.assertRaisesRegex(ProtocolError, "absolute"):
                 self.runner.reset(
@@ -348,6 +387,7 @@ class GatedSimulatorRunnerTests(unittest.TestCase):
                     lateral_offset_m=0.0,
                     yaw_offset_rad=0.0,
                     log_dir=Path("relative-log"),
+                    elastic_band_enabled=True,
                 )
         finally:
             os.chdir(original_cwd)
@@ -371,6 +411,7 @@ class GatedSimulatorRunnerTests(unittest.TestCase):
                         lateral_offset_m=0.0,
                         yaw_offset_rad=0.0,
                         log_dir=self.root / "outside-scene-logs",
+                        elastic_band_enabled=True,
                     )
 
                 linked_scene = self.root / "linked-scene.xml"
@@ -382,6 +423,7 @@ class GatedSimulatorRunnerTests(unittest.TestCase):
                         lateral_offset_m=0.0,
                         yaw_offset_rad=0.0,
                         log_dir=self.root / "linked-scene-logs",
+                        elastic_band_enabled=True,
                     )
 
             existing_logs = self.root / "existing-sim-logs"
@@ -395,6 +437,7 @@ class GatedSimulatorRunnerTests(unittest.TestCase):
                     lateral_offset_m=0.0,
                     yaw_offset_rad=0.0,
                     log_dir=existing_logs,
+                    elastic_band_enabled=True,
                 )
             self.assertEqual(marker.read_text(encoding="utf-8"), "original")
         finally:
@@ -450,6 +493,7 @@ class GatedSimulatorProtocolTests(unittest.TestCase):
                 "lateral_offset_m": 0.0,
                 "yaw_offset_rad": 0.0,
                 "log_dir": str(self.root / "sim"),
+                "elastic_band_enabled": True,
             },
             separators=(",", ":"),
         )
@@ -464,6 +508,47 @@ class GatedSimulatorProtocolTests(unittest.TestCase):
         self.assertFalse(responses[1]["ok"])
         self.assertIn("exactly 36", responses[1]["error"]["message"])
         self.assertEqual(backend.step_calls, 0)
+
+    def test_reset_request_echoes_band_boolean_and_rejects_nonboolean(self):
+        def reset_request(band):
+            return json.dumps(
+                {
+                    "v": 1,
+                    "op": "reset",
+                    "request_id": "g1",
+                    "scene_xml": str(self.scene),
+                    "initial_qpos": [0.0] * 3 + [1.0] + [0.0] * 32,
+                    "lateral_offset_m": 0.0,
+                    "yaw_offset_rad": 0.0,
+                    "log_dir": str(self.root / "band-sim"),
+                    "elastic_band_enabled": band,
+                },
+                separators=(",", ":"),
+            )
+
+        responses, backend = self.run_server(
+            [
+                '{"v":1,"op":"hello","request_id":"g0"}',
+                reset_request(False),
+                '{"v":1,"op":"close","request_id":"g2"}',
+            ]
+        )
+        self.assertTrue(responses[1]["ok"])
+        self.assertIs(responses[1]["data"]["elastic_band_enabled"], False)
+        self.assertIs(backend.reset_calls[-1][3], False)
+
+        rejected, rejected_backend = self.run_server(
+            [
+                '{"v":1,"op":"hello","request_id":"g0"}',
+                reset_request(1),
+                '{"v":1,"op":"close","request_id":"g2"}',
+            ]
+        )
+        self.assertFalse(rejected[1]["ok"])
+        self.assertIn(
+            "elastic_band_enabled", rejected[1]["error"]["message"]
+        )
+        self.assertEqual(rejected_backend.reset_calls, [])
 
     def test_advance_before_reset_is_rejected_without_constructing_backend(self):
         constructed = []
@@ -660,7 +745,11 @@ class ExternalGearBackendBoundaryTests(unittest.TestCase):
         backend = ExternalGearBackend.__new__(ExternalGearBackend)
         backend._bindings = SimpleNamespace(mujoco=mujoco)
         backend._simulator = SimpleNamespace(
-            sim_env=SimpleNamespace(mj_model=model, mj_data=data)
+            sim_env=SimpleNamespace(
+                mj_model=model,
+                mj_data=data,
+                elastic_band=SimpleNamespace(enable=False),
+            )
         )
         initial = np.zeros(36, dtype=np.float64)
         initial[:7] = [1.2, -0.4, 0.81, 1.0, 0.0, 0.0, 0.0]
@@ -671,6 +760,7 @@ class ExternalGearBackendBoundaryTests(unittest.TestCase):
             initial,
             lateral_offset_m=0.09,
             yaw_offset_rad=math.pi / 2.0,
+            elastic_band_enabled=True,
         )
 
         np.testing.assert_array_equal(initial, unchanged)
@@ -685,6 +775,57 @@ class ExternalGearBackendBoundaryTests(unittest.TestCase):
         np.testing.assert_array_equal(data.ctrl, np.zeros(29))
         self.assertEqual(mujoco.reset_calls, 1)
         self.assertEqual(mujoco.forward_calls, 1)
+
+    def _band_backend(self, band):
+        events = []
+
+        class FakeMujoco:
+            def mj_resetData(self, _model, _data):
+                events.append(("reset", getattr(band, "enable", "<missing>")))
+
+            def mj_forward(self, _model, _data):
+                events.append("forward")
+
+        model = SimpleNamespace(nq=36)
+        data = SimpleNamespace(
+            qpos=np.zeros(36, dtype=np.float64),
+            qvel=np.zeros(35, dtype=np.float64),
+            ctrl=np.zeros(29, dtype=np.float64),
+        )
+        backend = ExternalGearBackend.__new__(ExternalGearBackend)
+        backend._bindings = SimpleNamespace(mujoco=FakeMujoco())
+        sim_env = SimpleNamespace(mj_model=model, mj_data=data)
+        if band is not None:
+            sim_env.elastic_band = band
+        backend._simulator = SimpleNamespace(sim_env=sim_env)
+        return backend, events
+
+    def test_external_reset_applies_band_state_before_mujoco_reset(self):
+        band = SimpleNamespace(enable=True)
+        backend, events = self._band_backend(band)
+        qpos = np.r_[np.zeros(3), 1.0, np.zeros(32)]
+
+        backend.reset_from_qpos(
+            qpos, 0.0, 0.0, elastic_band_enabled=False
+        )
+        self.assertFalse(band.enable)
+        self.assertEqual(events[0], ("reset", False))
+
+        backend.reset_from_qpos(
+            qpos, 0.0, 0.0, elastic_band_enabled=True
+        )
+        self.assertTrue(band.enable)
+        self.assertEqual(events[2], ("reset", True))
+
+    def test_external_reset_rejects_missing_band_or_nonboolean_state(self):
+        qpos = np.r_[np.zeros(3), 1.0, np.zeros(32)]
+        backend, _events = self._band_backend(None)
+        with self.assertRaisesRegex(ProtocolError, "elastic_band"):
+            backend.reset_from_qpos(qpos, 0.0, 0.0, elastic_band_enabled=True)
+
+        backend, _events = self._band_backend(SimpleNamespace(enable=False))
+        with self.assertRaisesRegex(ProtocolError, "elastic_band_enabled"):
+            backend.reset_from_qpos(qpos, 0.0, 0.0, elastic_band_enabled=1)
 
 
 def _external_module_names():

@@ -62,6 +62,8 @@ class SimulatorBackend(Protocol):
         qpos: np.ndarray,
         lateral_offset_m: float,
         yaw_offset_rad: float,
+        *,
+        elastic_band_enabled: bool,
     ) -> None:
         raise NotImplementedError
 
@@ -357,9 +359,12 @@ class GatedSimulatorRunner:
         lateral_offset_m: float,
         yaw_offset_rad: float,
         log_dir: str | Path,
+        elastic_band_enabled: bool,
     ) -> dict[str, object]:
         if self._closed:
             raise ProtocolError("simulator runner is closed")
+        if type(elastic_band_enabled) is not bool:
+            raise ProtocolError("elastic_band_enabled must be a boolean")
         try:
             scene = _confined_existing_path(
                 self.run_root,
@@ -417,7 +422,12 @@ class GatedSimulatorRunner:
                 raise ProtocolError(
                     "backend.sim_dt must divide the exact 50 Hz state period"
                 )
-            backend.reset_from_qpos(qpos.copy(), lateral, yaw)
+            backend.reset_from_qpos(
+                qpos.copy(),
+                lateral,
+                yaw,
+                elastic_band_enabled=elastic_band_enabled,
+            )
             start_time = _finite_number(backend.data.time, "backend.data.time")
             try:
                 _create_exclusive_directory(
@@ -437,7 +447,12 @@ class GatedSimulatorRunner:
             self._state_rows = 0
             self._contact_rows = 0
             self._state_stride = int(stride)
-            return {"nq": nq, "sim_dt_s": sim_dt, "sim_time_s": start_time}
+            return {
+                "nq": nq,
+                "sim_dt_s": sim_dt,
+                "sim_time_s": start_time,
+                "elastic_band_enabled": elastic_band_enabled,
+            }
         except BaseException:
             self._close_active()
             raise
@@ -604,11 +619,14 @@ def _handle_request(
                 "lateral_offset_m",
                 "yaw_offset_rad",
                 "log_dir",
+                "elastic_band_enabled",
             },
             "reset request",
         )
         if type(source["scene_xml"]) is not str or not source["scene_xml"]:
             raise ProtocolError("scene_xml must be a nonempty string")
+        if type(source["elastic_band_enabled"]) is not bool:
+            raise ProtocolError("elastic_band_enabled must be a JSON boolean")
         if type(source["log_dir"]) is not str or not source["log_dir"]:
             raise ProtocolError("log_dir must be a nonempty string")
         if type(source["initial_qpos"]) is not list:
@@ -633,6 +651,7 @@ def _handle_request(
                     source["yaw_offset_rad"], "yaw_offset_rad"
                 ),
                 log_dir=source["log_dir"],
+                elastic_band_enabled=source["elastic_band_enabled"],
             ),
         )
     if op == "advance":
@@ -958,7 +977,11 @@ class ExternalGearBackend:
         qpos: np.ndarray,
         lateral_offset_m: float,
         yaw_offset_rad: float,
+        *,
+        elastic_band_enabled: bool,
     ) -> None:
+        if type(elastic_band_enabled) is not bool:
+            raise ProtocolError("elastic_band_enabled must be a boolean")
         if qpos.shape != (int(self.model.nq),):
             raise ProtocolError(
                 f"initial_qpos must contain exactly {int(self.model.nq)} values"
@@ -968,6 +991,12 @@ class ExternalGearBackend:
             lateral_offset_m=lateral_offset_m,
             yaw_offset_rad=yaw_offset_rad,
         )
+        band = getattr(self._simulator.sim_env, "elastic_band", None)
+        if band is None or not hasattr(band, "enable"):
+            raise ProtocolError(
+                "pinned simulator is missing its elastic_band object"
+            )
+        band.enable = elastic_band_enabled
         self._bindings.mujoco.mj_resetData(self.model, self.data)
         self.data.qpos[:] = physical
         self.data.qvel[:] = 0.0

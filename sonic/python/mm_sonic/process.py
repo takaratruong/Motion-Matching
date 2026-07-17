@@ -1616,7 +1616,10 @@ class GatedSimulatorClient:
         lateral_offset_m: float,
         yaw_offset_rad: float,
         log_dir: str | Path,
+        elastic_band_enabled: bool,
     ) -> dict[str, object]:
+        if type(elastic_band_enabled) is not bool:
+            raise ValueError("elastic_band_enabled must be a boolean")
         self._sim_dt_s = None
         scene = _confined_existing_path(
             self.run_root,
@@ -1640,8 +1643,9 @@ class GatedSimulatorClient:
                 lateral_offset_m=float(lateral_offset_m),
                 yaw_offset_rad=float(yaw_offset_rad),
                 log_dir=str(logs),
+                elastic_band_enabled=elastic_band_enabled,
             ),
-            {"nq", "sim_dt_s", "sim_time_s"},
+            {"nq", "sim_dt_s", "sim_time_s", "elastic_band_enabled"},
             "reset data",
         )
         if type(data["nq"]) is not int or data["nq"] <= 0:
@@ -1650,8 +1654,20 @@ class GatedSimulatorClient:
         if sim_dt <= 0.0:
             raise ProcessProtocolError("reset data.sim_dt_s must be positive")
         sim_time = _finite_number(data["sim_time_s"], "reset data.sim_time_s")
+        if (
+            type(data["elastic_band_enabled"]) is not bool
+            or data["elastic_band_enabled"] != elastic_band_enabled
+        ):
+            raise ProcessProtocolError(
+                "reset data.elastic_band_enabled must echo the requested boolean"
+            )
         self._sim_dt_s = sim_dt
-        return {"nq": data["nq"], "sim_dt_s": sim_dt, "sim_time_s": sim_time}
+        return {
+            "nq": data["nq"],
+            "sim_dt_s": sim_dt,
+            "sim_time_s": sim_time,
+            "elastic_band_enabled": data["elastic_band_enabled"],
+        }
 
     def advance(self, steps: int) -> AdvanceResult:
         _positive_integer(steps, "steps")

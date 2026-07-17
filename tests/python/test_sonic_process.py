@@ -179,7 +179,13 @@ class GatedSimulatorClientTests(TemporaryScriptCase):
                 if op == "hello":
                     data = {"protocol": "gated-sim/v1"}
                 elif op == "reset":
-                    data = {"nq": 36, "sim_dt_s": 0.005, "sim_time_s": 0.0}
+                    assert type(request["elastic_band_enabled"]) is bool
+                    data = {
+                        "nq": 36,
+                        "sim_dt_s": 0.005,
+                        "sim_time_s": 0.0,
+                        "elastic_band_enabled": request["elastic_band_enabled"],
+                    }
                 elif op == "advance":
                     steps = request["steps"]
                     data = {
@@ -221,8 +227,10 @@ class GatedSimulatorClientTests(TemporaryScriptCase):
                 lateral_offset_m=0.0,
                 yaw_offset_rad=0.0,
                 log_dir=self.root / "logs",
+                elastic_band_enabled=False,
             )
             self.assertEqual(reset["nq"], 36)
+            self.assertIs(reset["elastic_band_enabled"], False)
             self.assertEqual(client.sim_dt, reset["sim_dt_s"])
             result = client.advance(80)
             self.assertEqual(
@@ -581,7 +589,94 @@ class GatedSimulatorClientTests(TemporaryScriptCase):
                     lateral_offset_m=0.0,
                     yaw_offset_rad=0.0,
                     log_dir=self.root / "logs",
+                    elastic_band_enabled=True,
                 )
+        finally:
+            client.close()
+
+    def test_reset_rejects_response_band_that_does_not_echo_request(self):
+        child = self.script(
+            "mismatched_band.py",
+            r'''
+            import json
+            import sys
+            request = json.loads(sys.stdin.readline())
+            print(json.dumps({
+                "v": 1,
+                "ok": True,
+                "op": "reset",
+                "request_id": request["request_id"],
+                "data": {
+                    "nq": 36,
+                    "sim_dt_s": 0.005,
+                    "sim_time_s": 0.0,
+                    "elastic_band_enabled": not request["elastic_band_enabled"],
+                },
+            }), flush=True)
+            close = json.loads(sys.stdin.readline())
+            print(json.dumps({
+                "v": 1,
+                "ok": True,
+                "op": "close",
+                "request_id": close["request_id"],
+                "data": {"closed": True},
+            }), flush=True)
+            ''',
+        )
+        client = self.client(child)
+        try:
+            scene = self.root / "scene.xml"
+            scene.write_text("<mujoco/>", encoding="utf-8")
+            with self.assertRaisesRegex(
+                ProcessProtocolError, "elastic_band_enabled"
+            ):
+                client.reset(
+                    scene_xml=scene,
+                    initial_qpos=np.zeros(36),
+                    lateral_offset_m=0.0,
+                    yaw_offset_rad=0.0,
+                    log_dir=self.root / "logs",
+                    elastic_band_enabled=True,
+                )
+        finally:
+            client.close()
+
+    def test_reset_requires_a_strict_boolean_band_argument(self):
+        child = self.script(
+            "band_type_child.py",
+            r'''
+            import json
+            import sys
+            for line in sys.stdin:
+                request = json.loads(line)
+                print(json.dumps({
+                    "v": 1,
+                    "ok": True,
+                    "op": request["op"],
+                    "request_id": request["request_id"],
+                    "data": {"closed": True},
+                }), flush=True)
+                if request["op"] == "close":
+                    break
+            ''',
+        )
+        client = self.client(child)
+        try:
+            scene = self.root / "scene.xml"
+            scene.write_text("<mujoco/>", encoding="utf-8")
+            for value in (0, 1, None):
+                with self.subTest(value=value):
+                    with self.assertRaisesRegex(
+                        ValueError, "elastic_band_enabled"
+                    ):
+                        client.reset(
+                            scene_xml=scene,
+                            initial_qpos=np.zeros(36),
+                            lateral_offset_m=0.0,
+                            yaw_offset_rad=0.0,
+                            log_dir=self.root / "logs",
+                            elastic_band_enabled=value,
+                        )
         finally:
             client.close()
 
@@ -722,6 +817,7 @@ class GatedSimulatorClientTests(TemporaryScriptCase):
                         lateral_offset_m=0.0,
                         yaw_offset_rad=0.0,
                         log_dir=self.root / "sim-a",
+                        elastic_band_enabled=True,
                     )
 
             existing_logs = self.root / "existing-reset-logs"
@@ -733,6 +829,7 @@ class GatedSimulatorClientTests(TemporaryScriptCase):
                     lateral_offset_m=0.0,
                     yaw_offset_rad=0.0,
                     log_dir=existing_logs,
+                    elastic_band_enabled=True,
                 )
         finally:
             client.close()
