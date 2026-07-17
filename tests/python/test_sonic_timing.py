@@ -726,6 +726,48 @@ class TargetCoverageTests(TemporaryCase):
         self.assertGreater(result.wall_duration_s, 0.0)
         self.assertTrue(gear.stopped)
 
+    def test_terminal_fence_signals_stop_before_rechecking_group_state(self) -> None:
+        expected = canonical()
+        rows = self.rows(expected)
+        target = self.root / "immediate-stop.target.csv"
+        target.write_bytes(b"")
+
+        class Gear(self.Gear):
+            def __init__(self, path: Path) -> None:
+                super().__init__(path)
+                self.group_state_checks = 0
+
+            def group_is_stopped(self) -> bool:
+                self.group_state_checks += 1
+                if self.group_state_checks == 2 and not self.stopped:
+                    # Model the real /proc-wide pre-stop inspection: while it
+                    # scans, the 50 Hz controller can append another row.
+                    with self.target.open("ab") as output:
+                        output.write(rows[-1])
+                return self.stopped
+
+        emitted = False
+
+        def emit() -> None:
+            nonlocal emitted
+            if not emitted:
+                target.write_bytes(b"".join(rows))
+                emitted = True
+
+        gear = Gear(target)
+        result = cli_module._drive_authoritative_target_coverage(
+            gear,
+            self.Simulator(emit),
+            target,
+            expected,
+            maximum_wall_seconds=0.2,
+        )
+
+        self.assertEqual(result.target_rows, expected.count)
+        self.assertEqual(gear.stop_calls, 1)
+        self.assertEqual(gear.group_state_checks, 1)
+        self.assertEqual(target.read_bytes(), b"".join(rows))
+
     def test_stage_b_601_rows_require_exact_12_second_active_control(self) -> None:
         expected = canonical(601)
         rows = self.rows(expected)

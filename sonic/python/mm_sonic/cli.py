@@ -2959,7 +2959,7 @@ def _drive_authoritative_target_coverage(
                         raise ContractError(
                             "exact CONTROL coverage lacked its pre-audit stop fence"
                         )
-                if not bool(gear.group_is_stopped()):
+                if not terminal_pre_stopped:
                     gear.stop_group()
                 stopped = reader.read()
                 if stopped != raw:
