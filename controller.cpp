@@ -2547,9 +2547,19 @@ int main(int argc, char** argv)
         frame_external.tuning.simulation_rotation_halflife =
             process_config.simulation_rotation_halflife;
         frame_external.input.desired_strafe = process_config.desired_strafe;
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+        const G1FrameTransactionTestSeam* const test_seam_pointer =
+            nullptr;
+#endif
         const G1FrameTransactionStatus frame_status =
             ::g1_frame_transaction_run(frame_runtime,
-            ::g1_controller_frame_stage_run, frame_external, artifact_error,
+            ::g1_controller_frame_stage_run,
+            ::g1_recovery_candidates_build,
+            frame_external,
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
+            test_seam_pointer,
+#endif
+            artifact_error,
             static_cast<int>(sizeof(artifact_error)));
         if (frame_status == G1FrameTransactionGlobalError) {
             ::controlled_runtime_error(artifact_error);
@@ -3182,7 +3192,7 @@ static void g1_runner_build_prediction(
     state.command.applied_velocity = applied_velocity;
 }
 
-static void g1_runner_build_query(
+[[gnu::noinline]] static void g1_runner_build_query(
     float query[31],
     terrain_centerline_snapshot& terrain_query,
     const g1_controller_state& state,
@@ -3633,6 +3643,222 @@ static bool g1_runner_copy_final_pose(
     return true;
 }
 
+static G1FrameStageOutcome g1_runner_certificate_begin(
+    g1_controller_state& state,
+    G1FrameBranchCertificateScratch& branch,
+    G1FrameCertificateBranch branch_kind,
+    bool enabled,
+    G1FrameTransactionScratch& scratch,
+    const G1FrameExternalInputs& external,
+    char* error,
+    int error_capacity)
+{
+    if ((branch_kind != G1FrameCertificateRaw &&
+         branch_kind != G1FrameCertificateIk) ||
+        enabled != (branch_kind == G1FrameCertificateIk)) {
+        return g1_runner_fail(
+            error,
+            error_capacity,
+            "G1 certificate begin received an invalid branch identity");
+    }
+    scratch.rejection_branch = branch_kind;
+    if (!::g1_ik_frame_begin(
+            branch.ik_transaction,
+            state.ik_candidate_bone_positions,
+            state.ik_candidate_bone_rotations,
+            state.ik,
+            state.adjusted_bone_positions,
+            state.adjusted_bone_rotations,
+            external.db->bone_parents,
+            state.curr_bone_contacts,
+            external.scene->terrain,
+            scratch.footprint,
+            enabled,
+            external.tuning.dt,
+            error,
+            error_capacity)) {
+        return G1FrameStageGlobalError;
+    }
+    if (!branch.ik_transaction.candidate_result
+             .safe_stop_requested) {
+        return G1FrameStageContinue;
+    }
+    G1IkFrameResult attempted;
+    if (!::g1_ik_frame_rejection_snapshot(
+            attempted,
+            branch.ik_transaction,
+            G1IkRejectionAfterBegin,
+            error,
+            error_capacity)) {
+        return G1FrameStageGlobalError;
+    }
+    g1_runner_ik_rejection(
+        scratch, G1FrameRejectLandingPatch, attempted);
+    return G1FrameStageFiniteReject;
+}
+
+static G1FrameStageOutcome g1_runner_certificate_foot(
+    g1_controller_state& state,
+    G1FrameBranchCertificateScratch& branch,
+    G1FrameCertificateBranch branch_kind,
+    int foot,
+    bool enabled,
+    G1FrameTransactionScratch& scratch,
+    const G1FrameExternalInputs& external,
+    char* error,
+    int error_capacity)
+{
+    if ((branch_kind != G1FrameCertificateRaw &&
+         branch_kind != G1FrameCertificateIk) ||
+        enabled != (branch_kind == G1FrameCertificateIk) ||
+        (foot != 0 && foot != 1)) {
+        return g1_runner_fail(
+            error,
+            error_capacity,
+            "G1 certificate foot received an invalid branch identity");
+    }
+    scratch.rejection_branch = branch_kind;
+    if (!::g1_ik_frame_stage_foot(
+            branch.ik_transaction,
+            state.ik_candidate_bone_positions,
+            state.ik_candidate_bone_rotations,
+            foot,
+            external.db->bone_parents,
+            state.curr_bone_contacts,
+            external.scene->terrain,
+            scratch.footprint,
+            enabled,
+            external.tuning.dt,
+            error,
+            error_capacity)) {
+        return G1FrameStageGlobalError;
+    }
+    if (!branch.ik_transaction.candidate_result
+             .safe_stop_requested) {
+        return G1FrameStageContinue;
+    }
+    G1IkFrameResult attempted;
+    const G1IkRejectionCheckpoint checkpoint = foot == 0
+        ? G1IkRejectionAfterFoot0
+        : G1IkRejectionAfterFoot1;
+    if (!::g1_ik_frame_rejection_snapshot(
+            attempted,
+            branch.ik_transaction,
+            checkpoint,
+            error,
+            error_capacity)) {
+        return G1FrameStageGlobalError;
+    }
+    g1_runner_ik_rejection(
+        scratch, G1FrameRejectIkCandidate, attempted);
+    return G1FrameStageFiniteReject;
+}
+
+static G1FrameStageOutcome g1_runner_certificate_finish(
+    g1_controller_state& state,
+    G1FrameBranchCertificateScratch& branch,
+    bool enabled,
+    G1FrameTransactionScratch&,
+    const G1FrameExternalInputs& external,
+    char* error,
+    int error_capacity)
+{
+    if (!::g1_ik_frame_finish(
+            state.ik,
+            state.ik_frame,
+            branch.ik_transaction,
+            state.ik_candidate_bone_positions,
+            state.ik_candidate_bone_rotations,
+            external.db->bone_parents,
+            external.scene->terrain,
+            external.tuning.dt,
+            error,
+            error_capacity)) {
+        return G1FrameStageGlobalError;
+    }
+    if (state.ik_frame.safe_stop_requested ||
+        enabled != state.ik_frame.applied) {
+        return g1_runner_fail(
+            error,
+            error_capacity,
+            "G1 IK finish produced an invalid terminal branch result");
+    }
+    if (!g1_runner_copy_final_pose(
+            state,
+            *external.db,
+            error,
+            error_capacity)) {
+        return G1FrameStageGlobalError;
+    }
+    branch.ik_transaction.candidate_state = state.ik;
+    branch.ik_transaction.candidate_result = state.ik_frame;
+    return G1FrameStageContinue;
+}
+
+static G1FrameStageOutcome g1_runner_pose_certificate(
+    g1_controller_state& state,
+    G1FrameBranchCertificateScratch& branch,
+    G1FrameCertificateBranch branch_kind,
+    G1FrameTransactionScratch& scratch,
+    const G1FrameExternalInputs& external,
+    char* error,
+    int error_capacity)
+{
+    if (branch_kind != G1FrameCertificateRaw &&
+        branch_kind != G1FrameCertificateIk) {
+        return g1_runner_fail(
+            error,
+            error_capacity,
+            "G1 pose certificate received an invalid branch identity");
+    }
+    scratch.rejection_branch = branch_kind;
+    const G1ClearanceBudget limits = ::g1_pose_clearance_budget();
+    branch.pose_status = ::g1_measure_pose_clearance(
+        branch.pose_clearance,
+        limits,
+        external.scene->terrain,
+        state.ik_global_bone_positions,
+        state.ik_global_bone_rotations,
+        error,
+        error_capacity);
+    const bool threshold_failure =
+        branch.pose_status == G1ClearanceOk &&
+        (branch.pose_clearance.left.toe.lower_bound_m < -0.005 ||
+         branch.pose_clearance.left.foot.lower_bound_m < -0.005 ||
+         branch.pose_clearance.right.toe.lower_bound_m < -0.005 ||
+         branch.pose_clearance.right.foot.lower_bound_m < -0.005 ||
+         branch.pose_clearance.minimum.lower_bound_m < -0.01);
+    if (branch.pose_status == G1ClearanceOutsideDomain ||
+        branch.pose_status == G1ClearanceBudgetExceeded ||
+        branch.pose_status == G1ClearanceUncertified ||
+        threshold_failure) {
+        G1FrameRejectionDiagnostic rejection;
+        rejection.rejected = true;
+        rejection.stage = G1FrameRejectPoseCertificate;
+        rejection.stop_reason = G1IkStopPoseClearanceRejected;
+        rejection.attempted_footprint_available = true;
+        rejection.footprint_status = G1FootprintOk;
+        rejection.attempted_footprint = scratch.footprint;
+        rejection.pose_status = branch.pose_status;
+        rejection.attempted_pose_available = threshold_failure;
+        if (threshold_failure) {
+            rejection.pose_clearance = branch.pose_clearance;
+        }
+        scratch.rejection = rejection;
+        return G1FrameStageFiniteReject;
+    }
+    if (branch.pose_status != G1ClearanceOk) {
+        return G1FrameStageGlobalError;
+    }
+    state.footprint_status = G1FootprintOk;
+    state.footprint = scratch.footprint;
+    state.ik_clearance = branch.pose_clearance;
+    state.ik_candidate_clearance = branch.pose_clearance;
+    state.ik_candidate_clearance_status = G1ClearanceOk;
+    state.ik_candidate_rejected = false;
+    return G1FrameStageContinue;
+}
+
 G1FrameStageOutcome g1_controller_frame_stage_run(
     G1FrameTransactionStage stage,
     g1_controller_state& working_state,
@@ -3858,47 +4084,176 @@ G1FrameStageOutcome g1_controller_frame_stage_run(
         state.selected_terrain_error = g1_runner_terrain_error(
             *external.db, state.frame_index, scratch.query);
         int selected = state.frame_index;
+        const int prior_index = state.frame_index;
+        const traversability_diagnostics& traversal =
+            scratch.traversal;
+        scratch.transition_cost = ::g1_idle_match_transition_cost(
+            traversal.commanded_speed,
+            ::walkability_xz_length(state.simulation_velocity));
         if (state.searched) {
-            const int prior_index = state.frame_index;
             float best_cost = FLT_MAX;
-            const traversability_diagnostics& traversal =
-                scratch.traversal;
-            const float transition_cost =
-                ::g1_idle_match_transition_cost(
-                    traversal.commanded_speed,
-                    ::walkability_xz_length(state.simulation_velocity));
             const slice1d<float> query(31, scratch.query);
             ::database_search(
                 selected,
                 best_cost,
                 *external.db,
                 query,
-                transition_cost);
+                scratch.transition_cost);
             if (selected >= 0 && selected != prior_index) {
                 state.selected_cost = best_cost;
                 state.selected_terrain_error =
                     g1_runner_terrain_error(
                         *external.db, selected, scratch.query);
-                for (int bone = 0; bone < G1_BoneCount; ++bone) {
-                    state.trns_bone_positions(bone) =
-                        external.db->bone_positions(selected, bone);
-                    state.trns_bone_velocities(bone) =
-                        external.db->bone_velocities(selected, bone);
-                    state.trns_bone_rotations(bone) =
-                        external.db->bone_rotations(selected, bone);
-                    state.trns_bone_angular_velocities(bone) =
-                        external.db->bone_angular_velocities(
-                            selected, bone);
-                }
-                g1_runner_pose_transition(state);
-                state.frame_index = selected;
-                state.transitioned = true;
             }
             state.search_timer = state.search_time;
             state.force_search_timer = state.search_time;
         }
-        scratch.selected_database_frame =
-            selected >= 0 ? selected : state.frame_index;
+
+        const int slot_selected = selected >= 0
+            ? selected
+            : prior_index;
+        G1CandidateRecord slot_zero;
+        slot_zero.kind = state.searched
+            ? G1CandidateLegacy
+            : G1CandidateIncumbent;
+        slot_zero.selected_frame = slot_selected;
+        slot_zero.executed_frame = g1_runner_trajectory_clamp(
+            *external.db, slot_selected, 1);
+        slot_zero.source_range = g1_runner_active_range(
+            *external.db, slot_selected);
+        slot_zero.selected_cost = state.searched
+            ? state.selected_cost
+            : state.incumbent_cost;
+        slot_zero.recovery_rank = UINT32_MAX;
+        slot_zero.transitioned = state.searched &&
+            slot_selected != prior_index;
+        scratch.slot_zero_record = slot_zero;
+        scratch.matching_scheduled = state.searched;
+        scratch.legacy_search_performed = state.searched;
+        scratch.recovery_request_ready = false;
+        if (state.searched) {
+            scratch.recovery_request = G1RecoveryRequest{};
+            scratch.recovery_request.db = external.db;
+            for (uint32_t feature = 0U;
+                 feature < G1RecoveryFeatureCount;
+                 ++feature) {
+                scratch.recovery_request.raw_query[feature] =
+                    scratch.query[feature];
+            }
+            scratch.recovery_request.incumbent_frame = prior_index;
+            scratch.recovery_request.legacy_selected_frame =
+                slot_selected;
+            scratch.recovery_request.transition_cost =
+                scratch.transition_cost;
+            scratch.recovery_request.public_incumbent_cost =
+                state.incumbent_cost;
+            scratch.recovery_request.ignore_range_end = 20;
+            scratch.recovery_request.ignore_surrounding = 20;
+            scratch.recovery_request_ready = true;
+        }
+        return G1FrameStageContinue;
+    }
+    case G1FrameStageCandidateApply: {
+        const G1CandidateRecord& candidate =
+            scratch.active_candidate;
+        const int source_range = g1_runner_active_range(
+            *external.db, candidate.selected_frame);
+        const int executed_frame = g1_runner_trajectory_clamp(
+            *external.db, candidate.selected_frame, 1);
+        bool owner_valid = false;
+        if (candidate.kind == G1CandidateLegacy) {
+            owner_valid = scratch.matching_scheduled &&
+                scratch.legacy_search_performed &&
+                scratch.recovery_request_ready &&
+                candidate.selected_frame ==
+                    scratch.slot_zero_record.selected_frame &&
+                candidate.executed_frame ==
+                    scratch.slot_zero_record.executed_frame &&
+                candidate.source_range ==
+                    scratch.slot_zero_record.source_range &&
+                ::terrain_float_bits(candidate.selected_cost) ==
+                    ::terrain_float_bits(
+                        scratch.slot_zero_record.selected_cost) &&
+                candidate.recovery_rank == UINT32_MAX &&
+                candidate.transitioned ==
+                    scratch.slot_zero_record.transitioned;
+        } else if (candidate.kind ==
+                   G1CandidateRecoveryTransition) {
+            owner_valid = scratch.matching_scheduled &&
+                scratch.legacy_search_performed &&
+                scratch.recovery_request_ready &&
+                candidate.recovery_rank <
+                    G1RecoveryTransitionCapacity &&
+                candidate.transitioned &&
+                candidate.selected_frame !=
+                    scratch.recovery_request.incumbent_frame &&
+                candidate.selected_frame !=
+                    scratch.recovery_request.legacy_selected_frame &&
+                (::terrain_float_bits(
+                     scratch.recovery_request.public_incumbent_cost) ==
+                     ::terrain_float_bits(FLT_MAX) ||
+                 candidate.selected_cost <
+                     scratch.recovery_request.public_incumbent_cost);
+        } else if (candidate.kind == G1CandidateIncumbent) {
+            const int incumbent_frame = scratch.matching_scheduled
+                ? scratch.recovery_request.incumbent_frame
+                : scratch.slot_zero_record.selected_frame;
+            const float incumbent_cost = scratch.matching_scheduled
+                ? scratch.recovery_request.public_incumbent_cost
+                : scratch.slot_zero_record.selected_cost;
+            owner_valid = candidate.selected_frame ==
+                    incumbent_frame &&
+                ::terrain_float_bits(candidate.selected_cost) ==
+                    ::terrain_float_bits(incumbent_cost) &&
+                candidate.recovery_rank == UINT32_MAX &&
+                !candidate.transitioned;
+        }
+        if (!owner_valid || source_range < 0 ||
+            candidate.source_range != source_range ||
+            candidate.executed_frame != executed_frame ||
+            !::g1_frame_candidate_record_is_valid(
+                candidate, *external.db)) {
+            return g1_runner_fail(
+                error,
+                error_capacity,
+                "G1 candidate application received invalid provenance");
+        }
+
+        if (candidate.kind == G1CandidateRecoveryTransition) {
+            state.selected_cost = candidate.selected_cost;
+            state.selected_terrain_error = g1_runner_terrain_error(
+                *external.db,
+                candidate.selected_frame,
+                scratch.query);
+        } else if (candidate.kind == G1CandidateIncumbent) {
+            state.selected_cost = state.incumbent_cost;
+            state.selected_terrain_error = g1_runner_terrain_error(
+                *external.db,
+                candidate.selected_frame,
+                scratch.query);
+        }
+        if (candidate.transitioned) {
+            for (int bone = 0; bone < G1_BoneCount; ++bone) {
+                state.trns_bone_positions(bone) =
+                    external.db->bone_positions(
+                        candidate.selected_frame, bone);
+                state.trns_bone_velocities(bone) =
+                    external.db->bone_velocities(
+                        candidate.selected_frame, bone);
+                state.trns_bone_rotations(bone) =
+                    external.db->bone_rotations(
+                        candidate.selected_frame, bone);
+                state.trns_bone_angular_velocities(bone) =
+                    external.db->bone_angular_velocities(
+                        candidate.selected_frame, bone);
+            }
+            g1_runner_pose_transition(state);
+            state.frame_index = candidate.selected_frame;
+            state.transitioned = true;
+        } else {
+            state.transitioned = false;
+        }
+        scratch.selected_database_frame = candidate.selected_frame;
         float timer = 0.0f;
         if (!::terrain_f32_sub(
                 timer,
@@ -3920,8 +4275,7 @@ G1FrameStageOutcome g1_controller_frame_stage_run(
             }
             state.force_search_timer = timer;
         }
-        state.frame_index = g1_runner_trajectory_clamp(
-            *external.db, state.frame_index, 1);
+        state.frame_index = candidate.executed_frame;
         for (int bone = 0; bone < G1_BoneCount; ++bone) {
             state.curr_bone_positions(bone) =
                 external.db->bone_positions(state.frame_index, bone);
@@ -4028,6 +4382,25 @@ G1FrameStageOutcome g1_controller_frame_stage_run(
             external.tuning.contact_foot_height,
             external.tuning.contact_blending_halflife,
             external.tuning.dt);
+        for (int bone = 0; bone < G1_BoneCount; ++bone) {
+            state.ik_bone_positions(bone) =
+                state.adjusted_bone_positions(bone);
+            state.ik_bone_rotations(bone) =
+                state.adjusted_bone_rotations(bone);
+            state.ik_global_bone_positions(bone) =
+                state.global_bone_positions(bone);
+            state.ik_global_bone_rotations(bone) =
+                state.global_bone_rotations(bone);
+            state.ik_candidate_bone_positions(bone) =
+                state.adjusted_bone_positions(bone);
+            state.ik_candidate_bone_rotations(bone) =
+                state.adjusted_bone_rotations(bone);
+            state.ik_candidate_global_bone_positions(bone) =
+                state.global_bone_positions(bone);
+            state.ik_candidate_global_bone_rotations(bone) =
+                state.global_bone_rotations(bone);
+        }
+        state.ik_frame = G1IkFrameResult{};
         scratch.support_retargeted_diagnostic =
             motion_match_pose_snapshot(
                 state.global_bone_positions,
@@ -4088,180 +4461,120 @@ G1FrameStageOutcome g1_controller_frame_stage_run(
                 true);
             return G1FrameStageFiniteReject;
         }
-        if (!::g1_ik_frame_begin(
-                scratch.ik_transaction,
-                state.ik_candidate_bone_positions,
-                state.ik_candidate_bone_rotations,
-                state.ik,
-                state.adjusted_bone_positions,
-                state.adjusted_bone_rotations,
-                external.db->bone_parents,
-                state.curr_bone_contacts,
-                external.scene->terrain,
-                scratch.footprint,
-                external.tuning.ik_enabled,
-                external.tuning.dt,
-                error,
-                error_capacity)) {
-            return G1FrameStageGlobalError;
-        }
-        if (scratch.ik_transaction.candidate_result
-                .safe_stop_requested) {
-            G1IkFrameResult attempted;
-            if (!::g1_ik_frame_rejection_snapshot(
-                    attempted,
-                    scratch.ik_transaction,
-                    G1IkRejectionAfterBegin,
-                    error,
-                    error_capacity)) {
-                return G1FrameStageGlobalError;
-            }
-            g1_runner_ik_rejection(
-                scratch, G1FrameRejectLandingPatch, attempted);
-            return G1FrameStageFiniteReject;
-        }
-        return G1FrameStageContinue;
-    }
-    case G1FrameStageFirstFootIk: {
-        if (!::g1_ik_frame_stage_foot(
-                scratch.ik_transaction,
-                state.ik_candidate_bone_positions,
-                state.ik_candidate_bone_rotations,
-                0,
-                external.db->bone_parents,
-                state.curr_bone_contacts,
-                external.scene->terrain,
-                scratch.footprint,
-                external.tuning.ik_enabled,
-                external.tuning.dt,
-                error,
-                error_capacity)) {
-            return G1FrameStageGlobalError;
-        }
-        if (scratch.ik_transaction.candidate_result
-                .safe_stop_requested) {
-            G1IkFrameResult attempted;
-            if (!::g1_ik_frame_rejection_snapshot(
-                    attempted,
-                    scratch.ik_transaction,
-                    G1IkRejectionAfterFoot0,
-                    error,
-                    error_capacity)) {
-                return G1FrameStageGlobalError;
-            }
-            g1_runner_ik_rejection(
-                scratch, G1FrameRejectIkCandidate, attempted);
-            return G1FrameStageFiniteReject;
-        }
-        return G1FrameStageContinue;
-    }
-    case G1FrameStageSecondFootIk: {
-        if (!::g1_ik_frame_stage_foot(
-                scratch.ik_transaction,
-                state.ik_candidate_bone_positions,
-                state.ik_candidate_bone_rotations,
-                1,
-                external.db->bone_parents,
-                state.curr_bone_contacts,
-                external.scene->terrain,
-                scratch.footprint,
-                external.tuning.ik_enabled,
-                external.tuning.dt,
-                error,
-                error_capacity)) {
-            return G1FrameStageGlobalError;
-        }
-        if (scratch.ik_transaction.candidate_result
-                .safe_stop_requested) {
-            G1IkFrameResult attempted;
-            if (!::g1_ik_frame_rejection_snapshot(
-                    attempted,
-                    scratch.ik_transaction,
-                    G1IkRejectionAfterFoot1,
-                    error,
-                    error_capacity)) {
-                return G1FrameStageGlobalError;
-            }
-            g1_runner_ik_rejection(
-                scratch, G1FrameRejectIkCandidate, attempted);
-            return G1FrameStageFiniteReject;
-        }
-        return G1FrameStageContinue;
-    }
-    case G1FrameStageFinalFk: {
-        if (!::g1_ik_frame_finish(
-                state.ik,
-                state.ik_frame,
-                scratch.ik_transaction,
-                state.ik_candidate_bone_positions,
-                state.ik_candidate_bone_rotations,
-                external.db->bone_parents,
-                external.scene->terrain,
-                external.tuning.dt,
-                error,
-                error_capacity)) {
-            return G1FrameStageGlobalError;
-        }
-        if (state.ik_frame.safe_stop_requested) {
-            return g1_runner_fail(
-                error, error_capacity,
-                "G1 IK finish requested an unrepresentable terminal stop");
-        }
-        if (!g1_runner_copy_final_pose(
-                state,
-                *external.db,
-                error,
-                error_capacity)) {
-            return G1FrameStageGlobalError;
-        }
-        scratch.ik_transaction.candidate_state = state.ik;
-        scratch.ik_transaction.candidate_result = state.ik_frame;
-        return G1FrameStageContinue;
-    }
-    case G1FrameStagePoseCertificate: {
-        const G1ClearanceBudget limits =
-            ::g1_pose_clearance_budget();
-        scratch.pose_status = ::g1_measure_pose_clearance(
-            scratch.pose_clearance,
-            limits,
-            external.scene->terrain,
-            state.ik_global_bone_positions,
-            state.ik_global_bone_rotations,
-            error,
-            error_capacity);
-        const bool threshold_failure =
-            scratch.pose_status == G1ClearanceOk &&
-            (scratch.pose_clearance.left.toe.lower_bound_m < -0.005 ||
-             scratch.pose_clearance.left.foot.lower_bound_m < -0.005 ||
-             scratch.pose_clearance.right.toe.lower_bound_m < -0.005 ||
-             scratch.pose_clearance.right.foot.lower_bound_m < -0.005 ||
-             scratch.pose_clearance.minimum.lower_bound_m < -0.01);
-        if (scratch.pose_status == G1ClearanceOutsideDomain ||
-            scratch.pose_status == G1ClearanceBudgetExceeded ||
-            scratch.pose_status == G1ClearanceUncertified ||
-            threshold_failure) {
-            G1FrameRejectionDiagnostic rejection;
-            rejection.rejected = true;
-            rejection.stage = G1FrameRejectPoseCertificate;
-            rejection.stop_reason = G1IkStopPoseClearanceRejected;
-            rejection.attempted_footprint_available = true;
-            rejection.footprint_status = G1FootprintOk;
-            rejection.attempted_footprint = scratch.footprint;
-            rejection.pose_status = scratch.pose_status;
-            rejection.attempted_pose_available = threshold_failure;
-            if (threshold_failure) {
-                rejection.pose_clearance = scratch.pose_clearance;
-            }
-            scratch.rejection = rejection;
-            return G1FrameStageFiniteReject;
-        }
-        if (scratch.pose_status != G1ClearanceOk) {
-            return G1FrameStageGlobalError;
-        }
         state.footprint_status = G1FootprintOk;
         state.footprint = scratch.footprint;
-        state.ik_clearance = scratch.pose_clearance;
-        state.ik_candidate_clearance = scratch.pose_clearance;
+        return G1FrameStageContinue;
+    }
+    case G1FrameStageRawBegin:
+        return g1_runner_certificate_begin(
+            state,
+            scratch.raw_certificate,
+            G1FrameCertificateRaw,
+            false,
+            scratch,
+            external,
+            error,
+            error_capacity);
+    case G1FrameStageRawFirstFoot:
+        return g1_runner_certificate_foot(
+            state,
+            scratch.raw_certificate,
+            G1FrameCertificateRaw,
+            0,
+            false,
+            scratch,
+            external,
+            error,
+            error_capacity);
+    case G1FrameStageRawSecondFoot:
+        return g1_runner_certificate_foot(
+            state,
+            scratch.raw_certificate,
+            G1FrameCertificateRaw,
+            1,
+            false,
+            scratch,
+            external,
+            error,
+            error_capacity);
+    case G1FrameStageRawFinalFk:
+        return g1_runner_certificate_finish(
+            state,
+            scratch.raw_certificate,
+            false,
+            scratch,
+            external,
+            error,
+            error_capacity);
+    case G1FrameStageRawPoseCertificate:
+        return g1_runner_pose_certificate(
+            state,
+            scratch.raw_certificate,
+            G1FrameCertificateRaw,
+            scratch,
+            external,
+            error,
+            error_capacity);
+    case G1FrameStageIkBegin:
+        return g1_runner_certificate_begin(
+            state,
+            scratch.ik_certificate,
+            G1FrameCertificateIk,
+            true,
+            scratch,
+            external,
+            error,
+            error_capacity);
+    case G1FrameStageIkFirstFoot:
+        return g1_runner_certificate_foot(
+            state,
+            scratch.ik_certificate,
+            G1FrameCertificateIk,
+            0,
+            true,
+            scratch,
+            external,
+            error,
+            error_capacity);
+    case G1FrameStageIkSecondFoot:
+        return g1_runner_certificate_foot(
+            state,
+            scratch.ik_certificate,
+            G1FrameCertificateIk,
+            1,
+            true,
+            scratch,
+            external,
+            error,
+            error_capacity);
+    case G1FrameStageIkFinalFk:
+        return g1_runner_certificate_finish(
+            state,
+            scratch.ik_certificate,
+            true,
+            scratch,
+            external,
+            error,
+            error_capacity);
+    case G1FrameStageIkPoseCertificate:
+        return g1_runner_pose_certificate(
+            state,
+            scratch.ik_certificate,
+            G1FrameCertificateIk,
+            scratch,
+            external,
+            error,
+            error_capacity);
+    case G1FrameStageAcceptedFinalize: {
+        const G1FrameBranchCertificateScratch& visible_certificate =
+            external.tuning.ik_enabled
+                ? scratch.ik_certificate
+                : scratch.raw_certificate;
+        state.footprint_status = G1FootprintOk;
+        state.footprint = scratch.footprint;
+        state.ik_clearance = visible_certificate.pose_clearance;
+        state.ik_candidate_clearance =
+            visible_certificate.pose_clearance;
         state.ik_candidate_clearance_status = G1ClearanceOk;
         state.ik_candidate_rejected = false;
         scratch.rendered_diagnostic = motion_match_pose_snapshot(

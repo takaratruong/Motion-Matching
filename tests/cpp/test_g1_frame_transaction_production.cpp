@@ -20,10 +20,14 @@ static void check(bool condition, const char* message)
 
 static_assert(G1FrameStageInputRouteCommand == 0,
               "input/route command is the first transaction stage");
-static_assert(G1FrameStageCount == 12,
-              "the transaction has exactly twelve authenticated stages");
-static_assert(G1FrameStagePoseCertificate + 1 == G1FrameStageCount,
-              "pose certification is the final transaction stage");
+static_assert(G1FrameStageRawBegin ==
+                  G1FrameStageFootprintObservation + 1,
+              "raw certification follows the common candidate phase");
+static_assert(G1FrameStageIkBegin ==
+                  G1FrameStageRawPoseCertificate + 1,
+              "IK certification follows raw certification");
+static_assert(G1FrameStageAcceptedFinalize + 1 == G1FrameStageCount,
+              "accepted finalization is the final transaction stage");
 static_assert(std::is_same<G1FrameStageRunner,
     G1FrameStageOutcome (*)(
         G1FrameTransactionStage,
@@ -32,6 +36,41 @@ static_assert(std::is_same<G1FrameStageRunner,
         const G1FrameExternalInputs&,
         char*, int)>::value,
     "the runner has only working state, scratch, and immutable external input");
+static_assert(std::is_same<G1RecoveryProvider,
+    G1RecoveryProviderStatus (*)(
+        G1RecoveryCandidateSet&,
+        const G1RecoveryRequest&,
+        char*, int)>::value,
+    "the real coordinator consumes the strict recovery provider unchanged");
+
+using G1FrameCoordinator = G1FrameTransactionStatus (*)(
+    G1FrameRuntime&,
+    G1FrameStageRunner,
+    G1RecoveryProvider,
+    const G1FrameExternalInputs&,
+    const G1FrameTransactionTestSeam*,
+    char*,
+    int);
+
+static G1FrameTransactionStatus g1_frame_transaction_run(
+    G1FrameRuntime& runtime,
+    G1FrameStageRunner runner,
+    const G1FrameExternalInputs& external,
+    const G1FrameTransactionTestSeam* seam,
+    char* error,
+    int error_capacity)
+{
+    const G1FrameCoordinator coordinator =
+        static_cast<G1FrameCoordinator>(&::g1_frame_transaction_run);
+    return coordinator(
+        runtime,
+        runner,
+        ::g1_recovery_candidates_build,
+        external,
+        seam,
+        error,
+        error_capacity);
+}
 
 static void make_database(database& db, int frames = 32)
 {
@@ -1524,8 +1563,22 @@ static G1FrameInjectedOutcome production_hook(
         }
     } else if (stage == G1FrameStageFootprintObservation) {
         production_trace.footprint_and_begin_ready =
-            scratch.footprint_status == G1FootprintOk &&
-            scratch.ik_transaction.initialized;
+            scratch.footprint_status == G1FootprintOk;
+        if (expect_down_step_schedule) {
+            const bool expected[4] = {false, false, true, true};
+            production_trace.down_step_schedule_exact = true;
+            for (int sample = 0; sample < 4; ++sample) {
+                production_trace.down_step_schedule_exact =
+                    production_trace.down_step_schedule_exact &&
+                    scratch.contact_schedule.contact[0][sample] ==
+                        expected[sample];
+            }
+        }
+    } else if (stage == G1FrameStageIkBegin) {
+        production_trace.footprint_and_begin_ready =
+            production_trace.footprint_and_begin_ready &&
+            scratch.raw_certificate.ik_transaction.initialized &&
+            scratch.ik_certificate.ik_transaction.initialized;
         float expected_root_y = 0.0f;
         production_trace.begin_root_only_ownership_exact =
             production_trace.support_local_pose_ready &&
@@ -1533,7 +1586,8 @@ static G1FrameInjectedOutcome production_hook(
                 expected_root_y,
                 production_trace
                     .support_local_positions[G1_Simulation].y,
-                scratch.ik_transaction.candidate_result.root_reach) &&
+                scratch.ik_certificate.ik_transaction
+                    .candidate_result.root_reach) &&
             terrain_float_bits(
                 working_state.ik_candidate_bone_positions(
                     G1_Simulation).y) ==
@@ -1558,49 +1612,54 @@ static G1FrameInjectedOutcome production_hook(
                      : same_vec3_bits(
                            actual_position, baseline_position));
         }
-        if (expect_down_step_schedule) {
-            const bool expected[4] = {false, false, true, true};
-            production_trace.down_step_schedule_exact = true;
-            for (int sample = 0; sample < 4; ++sample) {
-                production_trace.down_step_schedule_exact =
-                    production_trace.down_step_schedule_exact &&
-                    scratch.contact_schedule.contact[0][sample] ==
-                        expected[sample];
-            }
-        }
-    } else if (stage == G1FrameStageFirstFootIk) {
+    } else if (stage == G1FrameStageIkFirstFoot) {
         production_trace.foot0_completed =
-            scratch.ik_transaction.next_foot == 1;
-    } else if (stage == G1FrameStageSecondFootIk) {
+            scratch.ik_certificate.ik_transaction.next_foot == 1;
+    } else if (stage == G1FrameStageIkSecondFoot) {
         production_trace.foot1_completed =
-            scratch.ik_transaction.next_foot == 2;
-    } else if (stage == G1FrameStageFinalFk) {
-        const bool ik_application_exact = external.tuning.ik_enabled
-            ? scratch.ik_transaction.candidate_result.applied &&
+            scratch.ik_certificate.ik_transaction.next_foot == 2;
+    } else if (stage == G1FrameStageRawFinalFk ||
+               stage == G1FrameStageIkFinalFk) {
+        const bool visible_stage = external.tuning.ik_enabled
+            ? stage == G1FrameStageIkFinalFk
+            : stage == G1FrameStageRawFinalFk;
+        const G1FrameBranchCertificateScratch& certificate =
+            stage == G1FrameStageIkFinalFk
+                ? scratch.ik_certificate
+                : scratch.raw_certificate;
+        const bool branch_enabled = stage == G1FrameStageIkFinalFk;
+        const bool ik_application_exact = branch_enabled
+            ? certificate.ik_transaction.candidate_result.applied &&
                 working_state.ik_frame.applied
-            : !scratch.ik_transaction.candidate_result.applied &&
+            : !certificate.ik_transaction.candidate_result.applied &&
                 !working_state.ik_frame.applied &&
                 g1_ik_runtime_is_disabled_noop(
-                    scratch.ik_transaction);
+                    certificate.ik_transaction);
         production_trace.final_fk_completed =
-            scratch.ik_transaction.initialized &&
-            scratch.ik_transaction.next_foot == 2 &&
-            ik_application_exact &&
-            ik_state_logical_digest(working_state.ik) ==
-                ik_state_logical_digest(
-                    scratch.ik_transaction.candidate_state) &&
-            ik_frame_logical_digest(working_state.ik_frame) ==
-                ik_frame_logical_digest(
-                    scratch.ik_transaction.candidate_result) &&
-            working_state.ik_bone_positions.size == G1_BoneCount &&
-            working_state.ik_bone_rotations.size == G1_BoneCount &&
-            working_state.ik_global_bone_positions.size == G1_BoneCount &&
-            working_state.ik_global_bone_rotations.size == G1_BoneCount;
-        if (production_trace.final_fk_completed) {
+            production_trace.final_fk_completed ||
+            (visible_stage &&
+             certificate.ik_transaction.initialized &&
+             certificate.ik_transaction.next_foot == 2 &&
+             ik_application_exact &&
+             ik_state_logical_digest(working_state.ik) ==
+                 ik_state_logical_digest(
+                     certificate.ik_transaction.candidate_state) &&
+             ik_frame_logical_digest(working_state.ik_frame) ==
+                 ik_frame_logical_digest(
+                     certificate.ik_transaction.candidate_result) &&
+             working_state.ik_bone_positions.size == G1_BoneCount &&
+             working_state.ik_bone_rotations.size == G1_BoneCount &&
+             working_state.ik_global_bone_positions.size == G1_BoneCount &&
+             working_state.ik_global_bone_rotations.size == G1_BoneCount);
+        if (stage == G1FrameStageIkFinalFk &&
+            certificate.ik_transaction.initialized &&
+            certificate.ik_transaction.next_foot == 2) {
             production_trace.final_candidate_state =
-                scratch.ik_transaction.candidate_state;
+                certificate.ik_transaction.candidate_state;
+        }
+        if (visible_stage && production_trace.final_fk_completed) {
             production_trace.final_candidate_result =
-                scratch.ik_transaction.candidate_result;
+                certificate.ik_transaction.candidate_result;
             for (int bone = 0; bone < G1_BoneCount; ++bone) {
                 production_trace.final_local_positions[bone] =
                     working_state.ik_bone_positions(bone);
@@ -1612,7 +1671,7 @@ static G1FrameInjectedOutcome production_hook(
                     working_state.ik_global_bone_rotations(bone);
             }
         }
-    } else if (stage == G1FrameStagePoseCertificate) {
+    } else if (stage == G1FrameStageAcceptedFinalize) {
         G1FrameAcceptedDiagnostic expected;
         expected.ready = true;
         expected.presentation_frame =
@@ -2272,8 +2331,8 @@ static void test_scene_cycle_reaches_exact_dwell_boundary()
                           scene_frame_before,
                   "each real SceneCycle/Terrain transaction advances exactly one accepted scene frame");
             check_production_trace_through(
-                G1FrameStagePoseCertificate,
-                "each dwell transaction completes all twelve real stages");
+                G1FrameStageAcceptedFinalize,
+                "each dwell transaction completes all twenty real stages");
             check_complete_success_publication(
                 value->runtime,
                 value->external,
@@ -2332,7 +2391,7 @@ static void test_search_inertialization_and_simulation_tuning_oracles()
                   G1FrameTransactionAccepted,
               error);
         check_production_trace_through(
-            G1FrameStagePoseCertificate,
+            G1FrameStageAcceptedFinalize,
             "search-time oracle completes every real stage");
         check_complete_success_publication(
             value.runtime,
@@ -2413,7 +2472,7 @@ static void test_search_inertialization_and_simulation_tuning_oracles()
                   G1FrameTransactionAccepted,
               error);
         check_production_trace_through(
-            G1FrameStagePoseCertificate,
+            G1FrameStageAcceptedFinalize,
             "inertial/simulation oracle completes every real stage");
         check_complete_success_publication(
             value.runtime,
@@ -2596,6 +2655,14 @@ struct ContactTuningOutcome
     vec3 offset_after_decay;
 };
 
+static G1FrameStageOutcome run_real_stage_prefix(
+    fixture& value,
+    G1FrameTransactionScratch& scratch,
+    G1FrameTransactionStage last_stage,
+    G1FrameTransactionStage& terminal_stage,
+    char* error,
+    int error_capacity);
+
 static ContactTuningOutcome run_contact_tuning_sequence(
     float unlock_radius,
     float foot_height,
@@ -2628,29 +2695,31 @@ static ContactTuningOutcome run_contact_tuning_sequence(
         value.external.input.presentation_frame = 300 + frame;
         const ConstArtifactEvidence artifacts_before =
             const_artifact_evidence(value.external);
-        G1FrameTransactionTestSeam seam;
-        seam.hook = production_hook;
-        reset_production_trace(
-            value.external, value.runtime.accepted_state.camera_azimuth);
-        check(g1_frame_transaction_run(
-                  value.runtime,
-                  g1_controller_frame_stage_run,
-                  value.external,
-                  &seam,
+        G1FrameTransactionScratch scratch;
+        G1FrameTransactionStage terminal = G1FrameStageCount;
+        check(run_real_stage_prefix(
+                  value,
+                  scratch,
+                  G1FrameStageFootprintObservation,
+                  terminal,
                   error,
                   static_cast<int>(sizeof(error))) ==
-                  G1FrameTransactionAccepted,
-              error);
-        check_production_trace_through(
-            G1FrameStagePoseCertificate,
-            "contact-tuning oracle completes every real stage");
-        check_complete_success_publication(
-            value.runtime,
-            value.external,
-            "contact-tuning oracle publishes the complete canonical success payload");
-        check_complete_accepted_final_fk(
-            value,
-            "contact-tuning oracle publishes exact independently checked final FK");
+                      G1FrameStageContinue &&
+                  terminal == G1FrameStageFootprintObservation,
+              error[0] != '\0'
+                  ? error
+                  : "contact-tuning oracle completes the authenticated real "
+                    "common candidate prefix");
+        check(g1_controller_state_is_valid(value.runtime.working_state) &&
+                  g1_controller_state_copy(
+                      value.runtime.accepted_state,
+                      value.runtime.working_state,
+                      error,
+                      static_cast<int>(sizeof(error))),
+              error[0] != '\0'
+                  ? error
+                  : "contact-tuning oracle commits a valid common candidate "
+                    "projection for the next history step");
         check_const_artifacts(
             value.external,
             artifacts_before,
@@ -2759,6 +2828,13 @@ static G1FrameStageOutcome run_real_stage_prefix(
     }
     for (int stage = 0; stage <= static_cast<int>(last_stage); ++stage) {
         terminal_stage = static_cast<G1FrameTransactionStage>(stage);
+        if (terminal_stage == G1FrameStageCandidateApply) {
+            scratch.active_candidate = scratch.slot_zero_record;
+        } else if (terminal_stage == G1FrameStageRawBegin) {
+            scratch.rejection_branch = G1FrameCertificateRaw;
+        } else if (terminal_stage == G1FrameStageIkBegin) {
+            scratch.rejection_branch = G1FrameCertificateIk;
+        }
         const G1FrameStageOutcome outcome =
             g1_controller_frame_stage_run(
                 terminal_stage,
@@ -2991,9 +3067,10 @@ static void check_real_ik_accepting_control(
               static_cast<int>(sizeof(error))) ==
               G1FrameStageContinue &&
               terminal == last_stage &&
-              scratch.ik_transaction.initialized &&
-              scratch.ik_transaction.next_foot == expected_next_foot &&
-              !scratch.ik_transaction.candidate_result
+              scratch.ik_certificate.ik_transaction.initialized &&
+              scratch.ik_certificate.ik_transaction.next_foot ==
+                  expected_next_foot &&
+              !scratch.ik_certificate.ik_transaction.candidate_result
                    .safe_stop_requested,
           message);
 
@@ -3031,7 +3108,7 @@ static void check_real_ik_accepting_control(
               coordinator_value.runtime.accepted_diagnostic.ready,
           message);
     check_production_trace_through(
-        G1FrameStagePoseCertificate, message);
+        G1FrameStageAcceptedFinalize, message);
     check_complete_success_publication(
         coordinator_value.runtime, coordinator_value.external, message);
     check_complete_accepted_final_fk(coordinator_value, message);
@@ -3058,7 +3135,7 @@ static void test_genuine_foot0_and_foot1_safe_stops()
         check_real_ik_accepting_control(
             control_direct,
             control_coordinator,
-            G1FrameStageFirstFootIk,
+            G1FrameStageIkFirstFoot,
             1,
             "the real first-foot stage and coordinator accept when the "
             "hostile foot-0 swing history is absent");
@@ -3091,29 +3168,33 @@ static void test_genuine_foot0_and_foot1_safe_stops()
         check(run_real_stage_prefix(
                   direct,
                   scratch,
-                  G1FrameStageFirstFootIk,
+                  G1FrameStageIkFirstFoot,
                   terminal,
                   error,
                   static_cast<int>(sizeof(error))) ==
                   G1FrameStageFiniteReject &&
-                  terminal == G1FrameStageFirstFootIk &&
-                  scratch.ik_transaction.next_foot == 1 &&
-                  scratch.ik_transaction.candidate_result
+                  terminal == G1FrameStageIkFirstFoot &&
+                  scratch.ik_certificate.ik_transaction.next_foot == 1 &&
+                  scratch.ik_certificate.ik_transaction.candidate_result
                       .safe_stop_requested &&
-                  scratch.ik_transaction.candidate_result.stop_reason ==
+                  scratch.ik_certificate.ik_transaction
+                          .candidate_result.stop_reason ==
                       G1IkStopNoSwingCandidate &&
                   g1_root_reach_plan_is_valid(
-                      scratch.ik_transaction.candidate_result
+                      scratch.ik_certificate.ik_transaction.candidate_result
                           .root_reach) &&
-                  !scratch.ik_transaction.candidate_result
+                  !scratch.ik_certificate.ik_transaction.candidate_result
                        .root_reach.active &&
-                  scratch.ik_transaction.candidate_result.feet[1]
+                  scratch.ik_certificate.ik_transaction
+                      .candidate_result.feet[1]
                       .swing_selection.candidates_evaluated == 0 &&
-                  !scratch.ik_transaction.candidate_result.feet[1]
+                  !scratch.ik_certificate.ik_transaction
+                       .candidate_result.feet[1]
                        .position.applied,
               "real foot 0 exhausts candidates, advances to cursor 1, and stops before foot 1");
         check_real_rejection_snapshot_table(
-            scratch.ik_transaction, G1IkRejectionAfterFoot0);
+            scratch.ik_certificate.ik_transaction,
+            G1IkRejectionAfterFoot0);
         check(scratch.rejection.stage == G1FrameRejectIkCandidate,
               "real foot-0 finite diagnostic names the first-foot stage");
         check_real_coordinator_ik_rejection(
@@ -3121,7 +3202,7 @@ static void test_genuine_foot0_and_foot1_safe_stops()
             direct,
             direct_before,
             direct_artifacts_before,
-            G1FrameStageFirstFootIk,
+            G1FrameStageIkFirstFoot,
             scratch.rejection);
     }
 
@@ -3142,7 +3223,7 @@ static void test_genuine_foot0_and_foot1_safe_stops()
         check_real_ik_accepting_control(
             control_direct,
             control_coordinator,
-            G1FrameStageSecondFootIk,
+            G1FrameStageIkSecondFoot,
             2,
             "the real second-foot stage and coordinator accept when the "
             "hostile foot-1 swing history is absent");
@@ -3175,28 +3256,31 @@ static void test_genuine_foot0_and_foot1_safe_stops()
         check(run_real_stage_prefix(
                   direct,
                   scratch,
-                  G1FrameStageSecondFootIk,
+                  G1FrameStageIkSecondFoot,
                   terminal,
                   error,
                   static_cast<int>(sizeof(error))) ==
                   G1FrameStageFiniteReject &&
-                  terminal == G1FrameStageSecondFootIk &&
-                  scratch.ik_transaction.next_foot == 2 &&
-                  !scratch.ik_transaction.candidate_result
+                  terminal == G1FrameStageIkSecondFoot &&
+                  scratch.ik_certificate.ik_transaction.next_foot == 2 &&
+                  !scratch.ik_certificate.ik_transaction.candidate_result
                        .feet[0].position.safe_stop_requested &&
-                  scratch.ik_transaction.candidate_result
+                  scratch.ik_certificate.ik_transaction.candidate_result
                       .safe_stop_requested &&
-                  scratch.ik_transaction.candidate_result.stop_reason ==
+                  scratch.ik_certificate.ik_transaction
+                          .candidate_result.stop_reason ==
                       G1IkStopNoSwingCandidate &&
                   g1_root_reach_plan_is_valid(
-                      scratch.ik_transaction.candidate_result
+                      scratch.ik_certificate.ik_transaction.candidate_result
                           .root_reach) &&
-                  !scratch.ik_transaction.candidate_result
+                  !scratch.ik_certificate.ik_transaction.candidate_result
                        .root_reach.active &&
-                  !scratch.ik_transaction.candidate_result.applied,
+                  !scratch.ik_certificate.ik_transaction
+                       .candidate_result.applied,
               "real foot 0 completes before foot 1 exhausts candidates at cursor 2");
         check_real_rejection_snapshot_table(
-            scratch.ik_transaction, G1IkRejectionAfterFoot1);
+            scratch.ik_certificate.ik_transaction,
+            G1IkRejectionAfterFoot1);
         check(scratch.rejection.stage == G1FrameRejectIkCandidate,
               "real foot-1 finite diagnostic names the second-foot stage");
         check_real_coordinator_ik_rejection(
@@ -3204,7 +3288,7 @@ static void test_genuine_foot0_and_foot1_safe_stops()
             direct,
             direct_before,
             direct_artifacts_before,
-            G1FrameStageSecondFootIk,
+            G1FrameStageIkSecondFoot,
             scratch.rejection);
     }
 }
@@ -3360,15 +3444,16 @@ static void test_genuine_begin_time_safe_stop()
         const G1FrameStageOutcome outcome = run_real_stage_prefix(
             direct,
             scratch,
-            G1FrameStageFootprintObservation,
+            G1FrameStageIkBegin,
             terminal,
             error,
             static_cast<int>(sizeof(error)));
         if (outcome != G1FrameStageFiniteReject ||
-            terminal != G1FrameStageFootprintObservation ||
-            !scratch.ik_transaction.initialized ||
-            scratch.ik_transaction.next_foot != 0 ||
-            scratch.ik_transaction.candidate_result.stop_reason !=
+            terminal != G1FrameStageIkBegin ||
+            !scratch.ik_certificate.ik_transaction.initialized ||
+            scratch.ik_certificate.ik_transaction.next_foot != 0 ||
+            scratch.ik_certificate.ik_transaction
+                    .candidate_result.stop_reason !=
                 G1IkStopLandingPatchUnavailable) {
             continue;
         }
@@ -3394,7 +3479,7 @@ static void test_genuine_begin_time_safe_stop()
             check_real_ik_accepting_control(
                 control_direct,
                 control_coordinator,
-                G1FrameStageFootprintObservation,
+                G1FrameStageIkBegin,
                 0,
                 "the real begin stage and coordinator accept when only the "
                 "hostile unavailable-patch terrain is removed");
@@ -3427,29 +3512,32 @@ static void test_genuine_begin_time_safe_stop()
         check(variant == 0 &&
                   terrain_float_bits(direct.support.values(0, 0)) ==
                       UINT32_C(0xbf08efbb) &&
-                  scratch.ik_transaction.candidate_result
+                  scratch.ik_certificate.ik_transaction.candidate_result
                   .safe_stop_requested &&
                   g1_root_reach_plan_is_valid(
-                      scratch.ik_transaction.candidate_result
+                      scratch.ik_certificate.ik_transaction.candidate_result
                           .root_reach) &&
-                  !scratch.ik_transaction.candidate_result
+                  !scratch.ik_certificate.ik_transaction.candidate_result
                        .root_reach.active &&
-                  scratch.ik_transaction.candidate_result.feet[0]
+                  scratch.ik_certificate.ik_transaction
+                      .candidate_result.feet[0]
                       .swing_selection.candidates_evaluated == 0 &&
-                  scratch.ik_transaction.candidate_result.feet[1]
+                  scratch.ik_certificate.ik_transaction
+                      .candidate_result.feet[1]
                       .swing_selection.candidates_evaluated == 0 &&
                   scratch.rejection.stage == G1FrameRejectLandingPatch &&
                   scratch.rejection.attempted_footprint_available &&
                   scratch.rejection.attempted_ik_available,
               "successful real begin requests unavailable-patch stop before either foot");
         check_real_rejection_snapshot_table(
-            scratch.ik_transaction, G1IkRejectionAfterBegin);
+            scratch.ik_certificate.ik_transaction,
+            G1IkRejectionAfterBegin);
         check_real_coordinator_ik_rejection(
             coordinator,
             direct,
             direct_before,
             direct_artifacts_before,
-            G1FrameStageFootprintObservation,
+            G1FrameStageIkBegin,
             scratch.rejection);
     }
     check(found,
@@ -3475,7 +3563,7 @@ static void test_real_pose_certificate_classification()
         check(run_real_stage_prefix(
                   value,
                   scratch,
-                  G1FrameStageFinalFk,
+                  G1FrameStageIkFinalFk,
                   terminal,
                   error,
                   static_cast<int>(sizeof(error))) ==
@@ -3484,7 +3572,7 @@ static void test_real_pose_certificate_classification()
         value.scene.terrain.origin_x = 100.0f;
         const G1FrameStageOutcome outcome =
             g1_controller_frame_stage_run(
-                G1FrameStagePoseCertificate,
+                G1FrameStageIkPoseCertificate,
                 value.runtime.working_state,
                 scratch,
                 value.external,
@@ -3512,7 +3600,7 @@ static void test_real_pose_certificate_classification()
         check(run_real_stage_prefix(
                   value,
                   scratch,
-                  G1FrameStageFinalFk,
+                  G1FrameStageIkFinalFk,
                   terminal,
                   error,
                   static_cast<int>(sizeof(error))) ==
@@ -3546,7 +3634,7 @@ static void test_real_pose_certificate_classification()
         }
         const G1FrameStageOutcome outcome =
             g1_controller_frame_stage_run(
-                G1FrameStagePoseCertificate,
+                G1FrameStageIkPoseCertificate,
                 value.runtime.working_state,
                 scratch,
                 value.external,
@@ -3566,7 +3654,7 @@ static void test_real_pose_certificate_classification()
                   threshold_failed &&
                   pose_clearance_logical_digest(pose) ==
                       pose_clearance_logical_digest(
-                          scratch.pose_clearance),
+                          scratch.ik_certificate.pose_clearance),
               "real Ok certificate rejected by controller thresholds publishes the complete certificate");
     }
 
@@ -3579,7 +3667,7 @@ static void test_real_pose_certificate_classification()
         check(run_real_stage_prefix(
                   value,
                   scratch,
-                  G1FrameStageFinalFk,
+                  G1FrameStageIkFinalFk,
                   terminal,
                   error,
                   static_cast<int>(sizeof(error))) ==
@@ -3595,7 +3683,7 @@ static void test_real_pose_certificate_classification()
             return hash;
         }();
         check(g1_controller_frame_stage_run(
-                  G1FrameStagePoseCertificate,
+                  G1FrameStageIkPoseCertificate,
                   value.runtime.working_state,
                   scratch,
                   value.external,
@@ -4894,6 +4982,38 @@ static bool analyze_no_main_root_closure(
     return true;
 }
 
+static bool build_authenticated_production_no_main_closure_source(
+    const NoMainSourceView& no_main_view,
+    std::string& output,
+    std::string& error)
+{
+    const std::vector<CppToken> tokens = tokenize_cpp_source(
+        no_main_view.visible, error);
+    if (!error.empty()) return false;
+    const std::vector<std::size_t> query_boundaries =
+        cpp_find_token_sequence(
+            tokens,
+            0,
+            tokens.size(),
+            {"[[", "gnu", "::", "noinline", "]]", "static", "void",
+             "g1_runner_build_query", "("});
+    if (query_boundaries.size() != 1) {
+        error = "legacy query builder does not have one exact authenticated out-of-line boundary";
+        return false;
+    }
+    output = no_main_view.visible;
+    const std::size_t attribute_begin =
+        tokens[query_boundaries[0]].begin;
+    const std::size_t attribute_end =
+        tokens[query_boundaries[0] + 4].end;
+    output.replace(
+        attribute_begin,
+        attribute_end - attribute_begin,
+        attribute_end - attribute_begin,
+        ' ');
+    return true;
+}
+
 static std::set<std::string> production_trusted_no_main_calls()
 {
     return {
@@ -4909,6 +5029,7 @@ static std::set<std::string> production_trusted_no_main_calls()
         "::g1_footprint_observe_v2",
         "::g1_foot_contact_schedule_build",
         "::g1_footprint_budget",
+        "::g1_frame_candidate_record_is_valid",
         "::g1_idle_match_transition_cost",
         "::g1_ik_checked_forward_kinematics",
         "::g1_ik_frame_begin",
@@ -6091,7 +6212,9 @@ static void check_structural_main_update_contract(
     const std::string exact_coordinator =
         "constG1FrameTransactionStatusframe_status="
         "::g1_frame_transaction_run(frame_runtime,"
-        "::g1_controller_frame_stage_run,frame_external,artifact_error,"
+        "::g1_controller_frame_stage_run,"
+        "::g1_recovery_candidates_build,frame_external,"
+        "test_seam_pointer,artifact_error,"
         "static_cast<int>(sizeof(artifact_error)));";
     check(cpp_exact_statement_containing(
               tokens,
@@ -8622,16 +8745,24 @@ static void check_structural_production_runner_contract(
     const char* stage_names[] = {
         "G1FrameStageInputRouteCommand",
         "G1FrameStageMatcherSearch",
+        "G1FrameStageCandidateApply",
         "G1FrameStageInertialization",
         "G1FrameStageSimulationUpdate",
         "G1FrameStageSupportObservation",
         "G1FrameStageSupportRetarget",
         "G1FrameStageContactUpdate",
         "G1FrameStageFootprintObservation",
-        "G1FrameStageFirstFootIk",
-        "G1FrameStageSecondFootIk",
-        "G1FrameStageFinalFk",
-        "G1FrameStagePoseCertificate",
+        "G1FrameStageRawBegin",
+        "G1FrameStageRawFirstFoot",
+        "G1FrameStageRawSecondFoot",
+        "G1FrameStageRawFinalFk",
+        "G1FrameStageRawPoseCertificate",
+        "G1FrameStageIkBegin",
+        "G1FrameStageIkFirstFoot",
+        "G1FrameStageIkSecondFoot",
+        "G1FrameStageIkFinalFk",
+        "G1FrameStageIkPoseCertificate",
+        "G1FrameStageAcceptedFinalize",
     };
     std::vector<std::size_t> cases;
     for (const char* stage_name : stage_names) {
@@ -8660,35 +8791,48 @@ static void check_structural_production_runner_contract(
     const auto check_case_call = [&tokens, &cases, switch_close](
         std::size_t case_index,
         const char* name,
-        std::size_t expected_count) {
+        std::size_t expected_count,
+        bool global_call = true) {
         const std::size_t end = case_index + 1 < cases.size()
             ? cases[case_index + 1]
             : switch_close;
         const std::vector<CppCallRecord> calls = cpp_calls_named(
             tokens, cases[case_index] + 3, end, name);
-        bool all_global = calls.size() == expected_count;
+        const std::string expected_key = global_call
+            ? "::" + std::string(name)
+            : std::string(name);
+        bool exact_owner = calls.size() == expected_count;
         for (const CppCallRecord& call : calls) {
-            all_global = all_global && call.key == "::" + std::string(name);
+            exact_owner = exact_owner && call.key == expected_key;
         }
-        check(all_global,
+        check(exact_owner,
               "each stage invokes only its exact direct global production operation");
     };
     check_case_call(0, "deterministic_route_command", 1);
-    check_case_call(2, "inertialize_pose_update", 1);
-    check_case_call(3, "simulation_positions_update", 1);
-    check_case_call(3, "simulation_rotations_update", 1);
-    check_case_call(4, "g1_ik_checked_forward_kinematics", 1);
-    check_case_call(4, "support_observation_build", 1);
-    check_case_call(5, "support_pose_apply", 1);
-    check_case_call(6, "g1_ik_checked_forward_kinematics", 1);
-    check_case_call(6, "contact_update", 1);
-    check_case_call(7, "g1_foot_contact_schedule_build", 1);
-    check_case_call(7, "g1_footprint_observe_v2", 1);
-    check_case_call(7, "g1_ik_frame_begin", 1);
-    check_case_call(8, "g1_ik_frame_stage_foot", 1);
-    check_case_call(9, "g1_ik_frame_stage_foot", 1);
-    check_case_call(10, "g1_ik_frame_finish", 1);
-    check_case_call(11, "g1_measure_pose_clearance", 1);
+    check_case_call(1, "database_search", 1);
+    check_case_call(2, "g1_frame_candidate_record_is_valid", 1);
+    check_case_call(3, "inertialize_pose_update", 1);
+    check_case_call(4, "simulation_positions_update", 1);
+    check_case_call(4, "simulation_rotations_update", 1);
+    check_case_call(5, "g1_ik_checked_forward_kinematics", 1);
+    check_case_call(5, "support_observation_build", 1);
+    check_case_call(6, "support_pose_apply", 1);
+    check_case_call(7, "g1_ik_checked_forward_kinematics", 1);
+    check_case_call(7, "contact_update", 1);
+    check_case_call(8, "g1_foot_contact_schedule_build", 1);
+    check_case_call(8, "g1_footprint_observe_v2", 1);
+    check_case_call(8, "g1_ik_frame_begin", 0);
+    check_case_call(9, "g1_runner_certificate_begin", 1, false);
+    check_case_call(10, "g1_runner_certificate_foot", 1, false);
+    check_case_call(11, "g1_runner_certificate_foot", 1, false);
+    check_case_call(12, "g1_runner_certificate_finish", 1, false);
+    check_case_call(13, "g1_runner_pose_certificate", 1, false);
+    check_case_call(14, "g1_runner_certificate_begin", 1, false);
+    check_case_call(15, "g1_runner_certificate_foot", 1, false);
+    check_case_call(16, "g1_runner_certificate_foot", 1, false);
+    check_case_call(17, "g1_runner_certificate_finish", 1, false);
+    check_case_call(18, "g1_runner_pose_certificate", 1, false);
+    check_case_call(19, "motion_match_pose_snapshot", 1, false);
     check(cpp_calls_named(
               tokens,
               runner.body_begin + 1,
@@ -8760,7 +8904,7 @@ static void check_structural_production_runner_contract(
     }
     check(cpp_find_token_sequence(
               tokens,
-              cases[11] + 3,
+              cases[19] + 3,
               switch_close,
               {"scratch", ".", "accepted_diagnostic_candidate"}).size() >= 1,
           "pose certification builds only the scratch accepted-diagnostic candidate");
@@ -8874,7 +9018,7 @@ static void check_coordinator_header_has_generic_runner_identity()
           "the generic coordinator header never names the production runner");
     const std::set<std::string> audited_names = {
         "g1_controller_frame_stage_run", "g1_frame_transaction_run",
-        "run_stage", "outcome", "hook",
+        "g1_frame_run_one_stage", "run_stage", "outcome", "hook",
     };
     check(audit_controller_macros(tokens, audited_names, error),
           error.empty()
@@ -8917,103 +9061,98 @@ static void check_coordinator_header_has_generic_runner_identity()
         {"G1FrameStageRunner", "run_stage"});
     check(runner_types.size() == 1,
           "the coordinator receives one generic typed stage runner");
-    const std::vector<CppCallRecord> runner_calls = cpp_calls_named(
-        tokens, body_begin + 1, body_end, "run_stage");
-    check(runner_calls.size() == 1 &&
-              runner_calls[0].key == "run_stage" &&
+
+    std::size_t helper_name = std::string::npos;
+    std::size_t helper_parameters_begin = std::string::npos;
+    std::size_t helper_parameters_end = std::string::npos;
+    std::size_t helper_body_begin = std::string::npos;
+    std::size_t helper_body_end = std::string::npos;
+    for (std::size_t index = 0; index + 1 < tokens.size(); ++index) {
+        if (tokens[index].directive ||
+            tokens[index].text != "g1_frame_run_one_stage" ||
+            tokens[index + 1].text != "(") {
+            continue;
+        }
+        const std::size_t close = cpp_matching_token(
+            tokens, index + 1, "(", ")");
+        if (close == std::string::npos) continue;
+        std::size_t next = close + 1;
+        while (next < tokens.size() && tokens[next].directive) ++next;
+        if (next < tokens.size() && tokens[next].text == "{") {
+            check(helper_name == std::string::npos,
+                  "the coordinator header has one stage-run helper definition");
+            helper_name = index;
+            helper_parameters_begin = index + 1;
+            helper_parameters_end = close;
+            helper_body_begin = next;
+            helper_body_end = cpp_matching_token(tokens, next, "{", "}");
+        }
+    }
+    check(helper_name != std::string::npos &&
+              helper_body_end != std::string::npos,
+          "the generic stage-run helper has one tokenized inline definition");
+    check(cpp_find_token_sequence(
+              tokens,
+              helper_parameters_begin + 1,
+              helper_parameters_end,
+              {"G1FrameStageRunner", "run_stage"}).size() == 1,
+          "the stage-run helper receives the generic typed runner directly");
+    const std::vector<CppCallRecord> helper_runner_calls = cpp_calls_named(
+        tokens, helper_body_begin + 1, helper_body_end, "run_stage");
+    check(helper_runner_calls.size() == 1 &&
+              helper_runner_calls[0].key == "run_stage" &&
               cpp_compact_tokens(
                   tokens,
-                  runner_calls[0].name,
-                  runner_calls[0].closing + 1) ==
-                  "run_stage(stage,working_state,scratch,external,error,error_capacity)",
-          "the coordinator invokes its generic runner once with exact direct stage owners");
+                  helper_runner_calls[0].name,
+                  helper_runner_calls[0].closing + 1) ==
+                  "run_stage(stage,state,scratch,external,error,error_capacity)",
+          "the stage-run helper invokes its generic runner once with exact direct stage owners");
     const std::vector<int> depth = cpp_brace_depth_before(tokens);
     std::size_t runner_statement_begin = 0;
     std::size_t runner_statement_end = 0;
     check(cpp_exact_statement_containing(
               tokens,
               depth,
-              runner_calls[0].name,
-              body_begin + 1,
-              body_end,
+              helper_runner_calls[0].name,
+              helper_body_begin + 1,
+              helper_body_end,
               "constG1FrameStageOutcomeoutcome="
-              "run_stage(stage,working_state,scratch,external,error,error_capacity);",
+              "run_stage(stage,state,scratch,external,error,error_capacity);",
               runner_statement_begin,
               runner_statement_end),
-          "the direct runner outcome is bound once to an immutable exact stage result");
-    const std::vector<std::size_t> outcome_switches =
+          "the helper's direct runner outcome is bound once to an immutable exact stage result");
+    const std::vector<std::size_t> outcome_guards =
         cpp_find_token_sequence(
             tokens,
             runner_statement_end + 1,
-            body_end,
-            {"switch", "(", "outcome", ")", "{"});
-    check(outcome_switches.size() == 1,
-          "coordinator has one direct switch over the exact runner outcome");
-    const std::size_t outcome_switch_open = outcome_switches[0] + 4;
-    const std::size_t outcome_switch_close = cpp_matching_token(
-        tokens, outcome_switch_open, "{", "}");
-    check(outcome_switch_close != std::string::npos &&
-              runner_statement_end < outcome_switches[0],
-          "runner outcome switch is balanced and directly downstream");
-    const int outcome_case_depth = depth[outcome_switch_open] + 1;
-    const char* outcomes[] = {
-        "G1FrameStageContinue", "G1FrameStageFiniteReject",
-        "G1FrameStageGlobalError",
-    };
-    std::vector<std::size_t> outcome_cases;
-    for (const char* outcome : outcomes) {
-        const std::vector<std::size_t> matches =
-            cpp_find_token_sequence_at_depth(
-                tokens,
-                depth,
-                outcome_switch_open + 1,
-                outcome_switch_close,
-                {"case", outcome, ":"},
-                outcome_case_depth);
-        check(matches.size() == 1 &&
-                  (outcome_cases.empty() ||
-                   outcome_cases.back() < matches[0]),
-              "coordinator outcome switch has one ordered exact status case");
-        outcome_cases.push_back(matches[0]);
-    }
-    const std::vector<std::size_t> outcome_defaults =
-        cpp_find_token_sequence_at_depth(
-            tokens,
-            depth,
-            outcome_switch_open + 1,
-            outcome_switch_close,
-            {"default", ":"},
-            outcome_case_depth);
-    check(outcome_defaults.size() == 1 &&
+            helper_body_end,
+            {"if", "(", "outcome", "!=",
+             "G1FrameStageContinue", ")", "{"});
+    check(outcome_guards.size() == 1,
+          "the stage-run helper has one exact non-Continue outcome guard");
+    const std::size_t outcome_guard_open = outcome_guards[0] + 6;
+    const std::size_t outcome_guard_close = cpp_matching_token(
+        tokens, outcome_guard_open, "{", "}");
+    check(outcome_guard_close != std::string::npos &&
               cpp_compact_tokens(
                   tokens,
-                  outcome_cases[0],
-                  outcome_cases[1]) ==
-                  "caseG1FrameStageContinue:break;",
-          "only exact Continue breaks through the outcome switch; unknown outcomes are handled");
-    check(cpp_case_has_unconditional_terminal(
-              tokens,
-              depth,
-              outcome_cases[1],
-              outcome_cases[2],
-              outcome_case_depth,
-              "G1FrameTransactionFiniteRejected") &&
-              cpp_case_has_unconditional_terminal(
-                  tokens,
-                  depth,
-                  outcome_cases[2],
-                  outcome_defaults[0],
-                  outcome_case_depth,
-                  "G1FrameTransactionGlobalError"),
-          "finite/global outcomes terminate in their exact statuses before hook fallthrough");
+                  outcome_guards[0],
+                  outcome_guard_close + 1) ==
+                  "if(outcome!=G1FrameStageContinue){"
+                  "returnoutcome==G1FrameStageFiniteReject||"
+                  "outcome==G1FrameStageGlobalError?outcome:"
+                  "G1FrameStageGlobalError;}",
+          "only authentic finite/global outcomes propagate; unknown runner outcomes become global errors");
 
     const std::vector<CppCallRecord> hook_calls = cpp_calls_named(
-        tokens, body_begin + 1, body_end, "hook");
+        tokens, helper_body_begin + 1, helper_body_end, "hook");
     check(hook_calls.size() == 1 &&
               hook_calls[0].key == "->hook" &&
-              outcome_switch_close < hook_calls[0].name,
+              outcome_guard_close < hook_calls[0].name,
           "test hook is invoked once only after a real Continue outcome");
-    for (std::size_t index = body_begin + 1; index + 1 < body_end; ++index) {
+    for (std::size_t index = helper_body_begin + 1;
+         index + 1 < helper_body_end;
+         ++index) {
         if (tokens[index].kind != CppTokenIdentifier ||
             tokens[index + 1].text != "(") {
             continue;
@@ -9027,33 +9166,67 @@ static void check_coordinator_header_has_generic_runner_identity()
     }
     check(cpp_find_token_sequence(
               tokens,
-              body_begin + 1,
-              body_end,
+              helper_body_begin + 1,
+              helper_body_end,
               {"run_stage", "==", "nullptr"}).size() == 1 &&
+              cpp_find_token_sequence(
+                  tokens,
+                  helper_body_begin + 1,
+                  helper_body_end,
+                  {"run_stage", "!=", "nullptr"}).empty() &&
+              cpp_direct_assignment_count(
+                  tokens,
+                  helper_body_begin + 1,
+                  helper_body_end,
+                  "run_stage") == 0,
+          "generic runner identity is used only for one null preflight and one exact call");
+
+    const std::vector<CppCallRecord> coordinator_runner_calls =
+        cpp_calls_named(tokens, body_begin + 1, body_end, "run_stage");
+    const std::vector<CppCallRecord> coordinator_stage_helpers =
+        cpp_calls_named(
+            tokens,
+            body_begin + 1,
+            body_end,
+            "g1_frame_run_one_stage");
+    const std::vector<CppCallRecord> coordinator_candidate_helpers =
+        cpp_calls_named(
+            tokens,
+            body_begin + 1,
+            body_end,
+            "g1_frame_candidate_evaluate");
+    bool exact_propagation =
+        coordinator_stage_helpers.size() == 2 &&
+        coordinator_candidate_helpers.size() == 1;
+    for (const CppCallRecord& call : coordinator_stage_helpers) {
+        exact_propagation =
+            exact_propagation &&
+            cpp_identifier_count(
+                tokens, call.name, call.closing + 1, "run_stage") == 1;
+    }
+    for (const CppCallRecord& call : coordinator_candidate_helpers) {
+        exact_propagation =
+            exact_propagation &&
+            cpp_identifier_count(
+                tokens, call.name, call.closing + 1, "run_stage") == 1;
+    }
+    check(coordinator_runner_calls.empty() && exact_propagation &&
+              cpp_identifier_count(
+                  tokens,
+                  body_begin + 1,
+                  body_end,
+                  "run_stage") == 4 &&
               cpp_find_token_sequence(
                   tokens,
                   body_begin + 1,
                   body_end,
-                  {"run_stage", "!=", "nullptr"}).empty() &&
+                  {"run_stage", "==", "nullptr"}).size() == 1 &&
               cpp_direct_assignment_count(
                   tokens,
                   body_begin + 1,
                   body_end,
                   "run_stage") == 0,
-          "generic runner identity is used only for one null preflight and one exact call");
-    for (std::size_t index = body_begin + 1; index < body_end; ++index) {
-        if (tokens[index].directive || tokens[index].text != "run_stage" ||
-            (index == runner_calls[0].name)) {
-            continue;
-        }
-        const bool null_comparison =
-            index + 2 < body_end &&
-            (tokens[index + 1].text == "==" ||
-             tokens[index + 1].text == "!=") &&
-            tokens[index + 2].text == "nullptr";
-        check(null_comparison,
-              "the coordinator may only null-check, never identify, its generic runner");
-    }
+          "the coordinator only null-checks and forwards its immutable runner to exact typed helpers");
 }
 
 static void test_controller_source_and_no_main_contract()
@@ -9432,8 +9605,17 @@ static void test_controller_source_and_no_main_contract()
     check_structural_main_helper_contracts(
         controller_tokens, no_main_view);
     structural_error.clear();
+    std::string authenticated_closure_source;
+    check(build_authenticated_production_no_main_closure_source(
+              no_main_view,
+              authenticated_closure_source,
+              structural_error),
+          structural_error.empty()
+              ? "legacy query builder has one authenticated out-of-line boundary"
+              : structural_error.c_str());
+    structural_error.clear();
     check(analyze_no_main_root_closure(
-              no_main_view.visible,
+              authenticated_closure_source,
               "g1_controller_frame_stage_run",
               production_trusted_no_main_calls(),
               structural_error),
@@ -9628,7 +9810,7 @@ static void test_each_other_mode_has_real_atomic_checkpoint()
         {G1_TestSequential, G1FrameStageMatcherSearch},
         {G1_TestFlat, G1FrameStageSupportRetarget},
         {G1_TestRoute, G1FrameStageFootprintObservation},
-        {G1_TestSceneCycle, G1FrameStagePoseCertificate},
+        {G1_TestSceneCycle, G1FrameStageAcceptedFinalize},
     };
     for (const ModeCheckpoint& test : cases) {
         fixture finite;
@@ -9876,7 +10058,7 @@ static void test_real_route_latch_consumption_and_resume()
               G1FrameTransactionAccepted,
           error);
     check_production_trace_through(
-        G1FrameStagePoseCertificate,
+        G1FrameStageAcceptedFinalize,
         "latch consumption completes all twelve real stages");
     check_complete_success_publication(
         value.runtime,
@@ -9947,7 +10129,7 @@ static void test_real_route_latch_consumption_and_resume()
               value.runtime.accepted_state.route_frames > route_frames,
           "the next real frame resumes the same route after one frozen retry");
     check_production_trace_through(
-        G1FrameStagePoseCertificate,
+        G1FrameStageAcceptedFinalize,
         "post-latch route resume completes all twelve real stages");
     check_complete_success_publication(
         value.runtime,
@@ -10383,15 +10565,15 @@ static void test_quantized_planner_terminal_rejects_atomically()
     check(run_real_stage_prefix(
               direct,
               scratch,
-              G1FrameStageSecondFootIk,
+              G1FrameStageIkSecondFoot,
               terminal,
               error,
               static_cast<int>(sizeof(error))) ==
                   G1FrameStageFiniteReject &&
-              terminal == G1FrameStageSecondFootIk,
+              terminal == G1FrameStageIkSecondFoot,
           "quantized planner terminal finite-rejects at the real second-foot stage");
     const G1IkFrameTransaction& transaction =
-        scratch.ik_transaction;
+        scratch.ik_certificate.ik_transaction;
     const G1IkFrameResult& attempted =
         transaction.candidate_result;
     const G1LegConfig configs[2] = {
@@ -10427,7 +10609,7 @@ static void test_quantized_planner_terminal_rejects_atomically()
         direct,
         direct_before,
         direct_artifacts_before,
-        G1FrameStageSecondFootIk,
+        G1FrameStageIkSecondFoot,
         scratch.rejection);
 }
 
@@ -10447,7 +10629,7 @@ static void test_pose_certificate_discards_working_plan_and_prior_owners()
         const_artifact_evidence(value.external);
     G1FrameTransactionTestSeam seam;
     seam.hook = production_hook;
-    seam.control.injected_stage = G1FrameStagePoseCertificate;
+    seam.control.injected_stage = G1FrameStageIkPoseCertificate;
     seam.control.injected_outcome = G1FrameInjectGlobalError;
     error[0] = '\0';
     reset_production_trace(
@@ -10464,14 +10646,14 @@ static void test_pose_certificate_discards_working_plan_and_prior_owners()
     check(status == G1FrameTransactionGlobalError,
           "the pose-certificate checkpoint returns the injected global rollback");
     check_production_trace_through(
-        G1FrameStagePoseCertificate,
+        G1FrameStageIkPoseCertificate,
         "the pose-certificate rollback executes the complete real attempted frame");
     const G1RootReachPlan& attempted_plan =
         production_trace.final_candidate_result.root_reach;
     const G1RootReachPlan& retained_plan =
         value.runtime.accepted_state.ik_frame.root_reach;
     check(production_trace.final_fk_completed &&
-              production_trace.accepted_diagnostic_ready &&
+              !production_trace.accepted_diagnostic_ready &&
               g1_root_reach_plan_is_valid(attempted_plan) &&
               attempted_plan.active &&
               attempted_plan.common_interval_found &&
@@ -10510,6 +10692,855 @@ static void test_pose_certificate_discards_working_plan_and_prior_owners()
         "pose-certificate rollback preserves all immutable production artifacts");
 }
 
+static constexpr int RealIncumbentSelectedFrame = 32;
+static constexpr int RealIncumbentExecutedFrame = 33;
+static constexpr int RealCandidateASelectedFrame = 64;
+static constexpr int RealCandidateAExecutedFrame = 65;
+static constexpr int RealCandidateBSelectedFrame = 96;
+static constexpr int RealCandidateBExecutedFrame = 97;
+static constexpr int RealCandidateCSelectedFrame = 128;
+static constexpr int RealCandidateCExecutedFrame = 129;
+
+static bool real_candidate_record_bits_equal(
+    const G1CandidateRecord& first,
+    const G1CandidateRecord& second)
+{
+    return first.kind == second.kind &&
+           first.selected_frame == second.selected_frame &&
+           first.executed_frame == second.executed_frame &&
+           first.source_range == second.source_range &&
+           terrain_float_bits(first.selected_cost) ==
+               terrain_float_bits(second.selected_cost) &&
+           first.recovery_rank == second.recovery_rank &&
+           first.transitioned == second.transitioned;
+}
+
+static void configure_real_candidate_fixture(
+    fixture& value,
+    bool hostile_left_history,
+    bool hostile_right_history,
+    int incumbent_frame = RealIncumbentSelectedFrame,
+    bool legacy_selects_incumbent = false)
+{
+    make_database(value.db, 160);
+    value.support.values.resize(value.db.nframes(), 3);
+    value.support.values.set(-1.0f);
+    value.db.contact_states.set(true);
+    value.scene.metadata.spawn_yaw = 0.0f;
+    value.db.features_offset(22) = 1.0f;
+    value.db.features_offset(24) = 1.0f;
+    value.db.features_offset(26) = 1.0f;
+    for (int frame = 0; frame < value.db.nframes(); ++frame) {
+        value.db.features(frame, 15) = 4.0f;
+    }
+    value.db.features(RealIncumbentSelectedFrame, 15) =
+        legacy_selects_incumbent ? 0.0f : 2.0f;
+    value.db.features(159, 15) = 2.0f;
+    value.db.features(RealCandidateASelectedFrame, 15) =
+        legacy_selects_incumbent ? 4.0f : 0.0f;
+    value.db.features(RealCandidateBSelectedFrame, 15) =
+        legacy_selects_incumbent ? 4.0f : 0.5f;
+    value.db.features(RealCandidateCSelectedFrame, 15) =
+        legacy_selects_incumbent ? 4.0f : 0.75f;
+
+    value.db.contact_states(RealCandidateAExecutedFrame, 0) = false;
+    value.db.contact_states(RealCandidateAExecutedFrame, 1) = true;
+    value.db.contact_states(RealCandidateBSelectedFrame, 0) = false;
+    value.db.contact_states(RealCandidateBSelectedFrame, 1) = true;
+    value.db.contact_states(RealCandidateBExecutedFrame, 0) = true;
+    value.db.contact_states(RealCandidateBExecutedFrame, 1) = false;
+    value.db.contact_states(RealCandidateCExecutedFrame, 0) = false;
+    value.db.contact_states(RealCandidateCExecutedFrame, 1) = true;
+    if (legacy_selects_incumbent) {
+        value.db.contact_states(RealIncumbentExecutedFrame, 0) = false;
+        value.db.contact_states(RealIncumbentExecutedFrame, 1) = true;
+    }
+    database_build_bounds(value.db);
+    align_begin_fixture_source_support(value);
+    shift_aligned_support_to_first_common_word(value);
+
+    G1FrameResetConfig config;
+    config.initial_search_time = 0.375f;
+    config.ik_enabled = false;
+    config.dt = 1.0f / 25.0f;
+    config.trajectory_sample_time = 1.0f / 3.0f;
+    char error[1024] = {};
+    check(g1_frame_runtime_reset(
+              value.runtime,
+              value.db,
+              value.support,
+              value.scene,
+              config,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+    value.external = G1FrameExternalInputs{};
+    value.external.db = &value.db;
+    value.external.support = &value.support;
+    value.external.scene = &value.scene;
+    value.external.input.move_stick = vec3();
+    value.external.input.look_stick = vec3();
+    value.external.input.presentation_frame = 83;
+    value.external.tuning.mode = G1_TestFlat;
+    value.external.tuning.frame_limit = value.db.nframes();
+    value.external.tuning.initial_search_time = config.initial_search_time;
+    value.external.tuning.dt = config.dt;
+    value.external.tuning.trajectory_sample_time =
+        config.trajectory_sample_time;
+    value.external.tuning.effective_terrain_weight = 0.0f;
+    value.external.tuning.ik_enabled = false;
+
+    g1_controller_state& accepted = value.runtime.accepted_state;
+    accepted.frame_index = incumbent_frame;
+    accepted.search_timer = 0.0f;
+    accepted.force_search_timer = accepted.search_time;
+    if (hostile_left_history) {
+        force_swing_history_below_terrain(accepted, 0);
+    } else {
+        for (int probe = 0; probe < 4; ++probe) {
+            accepted.ik.feet[0]
+                .swing.previous_sphere_centers[probe].y += 0.05f;
+        }
+    }
+    if (hostile_right_history) {
+        force_swing_history_below_terrain(accepted, 1);
+    } else {
+        for (int probe = 0; probe < 4; ++probe) {
+            accepted.ik.feet[1]
+                .swing.previous_sphere_centers[probe].y += 0.05f;
+        }
+    }
+    check(g1_controller_state_is_valid(accepted),
+          "the real bounded-candidate source state is valid");
+}
+
+static G1FrameInjectedOutcome real_candidate_c_guard(
+    G1FrameTransactionStage,
+    const g1_controller_state&,
+    G1FrameTransactionScratch& scratch,
+    const G1FrameExternalInputs&,
+    const G1FrameTransactionTestControl&,
+    char*,
+    int)
+{
+    return scratch.active_candidate.selected_frame ==
+               RealCandidateCSelectedFrame
+        ? G1FrameInjectGlobalError
+        : G1FrameInjectContinue;
+}
+
+static G1RecoveryProviderStatus real_provider_global_error(
+    G1RecoveryCandidateSet&,
+    const G1RecoveryRequest&,
+    char*,
+    int)
+{
+    return G1RecoveryProviderGlobalError;
+}
+
+static G1FrameTransactionStatus run_real_candidate_fixture(
+    fixture& value,
+    G1CandidateCertificationTrace& certification,
+    G1RecoveryProvider provider,
+    G1FrameTransactionTestHook hook,
+    char* error,
+    int error_capacity)
+{
+    G1FrameTransactionTestSeam seam;
+    seam.hook = hook;
+    seam.certification_trace = &certification;
+    const G1FrameCoordinator coordinator =
+        static_cast<G1FrameCoordinator>(&::g1_frame_transaction_run);
+    return coordinator(
+        value.runtime,
+        g1_controller_frame_stage_run,
+        provider,
+        value.external,
+        &seam,
+        error,
+        error_capacity);
+}
+
+static G1FrameTransactionStatus run_real_candidate_fixture(
+    fixture& value,
+    G1CandidateCertificationTrace& certification,
+    char* error,
+    int error_capacity)
+{
+    return run_real_candidate_fixture(
+        value,
+        certification,
+        ::g1_recovery_candidates_build,
+        real_candidate_c_guard,
+        error,
+        error_capacity);
+}
+
+static bool real_candidate_common_diagnostic_equal(
+    const G1FrameAcceptedDiagnostic& first,
+    const G1FrameAcceptedDiagnostic& second)
+{
+    if (first.ready != second.ready ||
+        first.presentation_frame != second.presentation_frame ||
+        first.scene_frame != second.scene_frame ||
+        first.query_database_frame != second.query_database_frame ||
+        first.query_range != second.query_range ||
+        first.selected_database_frame !=
+            second.selected_database_frame ||
+        !g1_frame_pose_diagnostic_equal(
+            first.raw_selected, second.raw_selected) ||
+        !g1_frame_pose_diagnostic_equal(
+            first.inertialized, second.inertialized) ||
+        !g1_frame_pose_diagnostic_equal(
+            first.support_retargeted,
+            second.support_retargeted) ||
+        first.matching_enabled != second.matching_enabled ||
+        first.adjustment_enabled != second.adjustment_enabled ||
+        first.clamping_enabled != second.clamping_enabled ||
+        !g1_frame_float_bits_equal(
+            first.effective_terrain_weight,
+            second.effective_terrain_weight)) {
+        return false;
+    }
+    for (int feature = 0; feature < 31; ++feature) {
+        if (!g1_frame_float_bits_equal(
+                first.query[feature], second.query[feature])) {
+            return false;
+        }
+    }
+    for (int sample = 0; sample < 4; ++sample) {
+        if (!g1_frame_float_bits_equal(
+                first.terrain_query.values[sample],
+                second.terrain_query.values[sample]) ||
+            !g1_frame_vec3_bits_equal(
+                first.terrain_query.points[sample],
+                second.terrain_query.points[sample])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool real_candidate_visible_projection_matches(
+    const g1_controller_state& visible,
+    const g1_controller_state& branch)
+{
+    return g1_frame_array_values_equal(
+               visible.ik_bone_positions,
+               branch.ik_bone_positions) &&
+           g1_frame_array_values_equal(
+               visible.ik_bone_rotations,
+               branch.ik_bone_rotations) &&
+           g1_frame_array_values_equal(
+               visible.ik_global_bone_positions,
+               branch.ik_global_bone_positions) &&
+           g1_frame_array_values_equal(
+               visible.ik_global_bone_rotations,
+               branch.ik_global_bone_rotations) &&
+           g1_frame_ik_result_equal(
+               visible.ik_frame,
+               branch.ik_frame) &&
+           g1_controller_state_pose_clearance_equal(
+               visible.ik_clearance,
+               branch.ik_clearance);
+}
+
+static void check_real_abc_trace(
+    const G1CandidateCertificationTrace& trace,
+    const char* message)
+{
+    check(trace.attempt_count == 2U &&
+              trace.legacy_traversals == 1U &&
+              trace.recovery_provider_calls == 1U &&
+              trace.common_evaluations == 2U &&
+              trace.raw_evaluations == 2U &&
+              trace.ik_evaluations == 2U &&
+              trace.attempts[0].candidate.kind == G1CandidateLegacy &&
+              trace.attempts[0].candidate.selected_frame ==
+                  RealCandidateASelectedFrame &&
+              trace.attempts[0].candidate.executed_frame ==
+                  RealCandidateAExecutedFrame &&
+              trace.attempts[0].candidate.source_range == 0 &&
+              trace.attempts[0].score_owner == G1CandidateScoreLegacy &&
+              trace.attempts[0].common ==
+                  G1CandidateDispositionAccepted &&
+              trace.attempts[0].raw ==
+                  G1CandidateDispositionAccepted &&
+              trace.attempts[0].ik ==
+                  G1CandidateDispositionFiniteRejected &&
+              trace.attempts[0].rejection_stage ==
+                  G1FrameRejectIkCandidate &&
+              trace.attempts[0].stop_reason ==
+                  G1IkStopNoSwingCandidate &&
+              trace.attempts[1].candidate.kind ==
+                  G1CandidateRecoveryTransition &&
+              trace.attempts[1].candidate.selected_frame ==
+                  RealCandidateBSelectedFrame &&
+              trace.attempts[1].candidate.executed_frame ==
+                  RealCandidateBExecutedFrame &&
+              trace.attempts[1].candidate.source_range == 0 &&
+              trace.attempts[1].candidate.recovery_rank == 0U &&
+              trace.attempts[1].score_owner ==
+                  G1CandidateScoreStrictRecovery &&
+              trace.attempts[1].common ==
+                  G1CandidateDispositionAccepted &&
+              trace.attempts[1].raw ==
+                  G1CandidateDispositionAccepted &&
+              trace.attempts[1].ik ==
+                  G1CandidateDispositionAccepted,
+          message);
+}
+
+static void run_real_abc_mode(
+    fixture& value,
+    G1CandidateCertificationTrace& certification,
+    bool ik_enabled)
+{
+    configure_real_candidate_fixture(value, true, false);
+    value.external.tuning.ik_enabled = ik_enabled;
+    char error[1024] = {};
+    check(run_real_candidate_fixture(
+              value,
+              certification,
+              error,
+              static_cast<int>(sizeof(error))) ==
+              G1FrameTransactionAccepted,
+          error[0] != '\0'
+              ? error
+              : "the real A/B recovery fixture accepts its first dual "
+                "certificate candidate");
+    check_real_abc_trace(
+        certification,
+        "real A/B certification has exact order, ownership, and branch outcomes");
+}
+
+static void test_real_abc_selects_b_in_both_modes()
+{
+    fixture raw;
+    fixture ik;
+    G1CandidateCertificationTrace raw_trace;
+    G1CandidateCertificationTrace ik_trace;
+    run_real_abc_mode(raw, raw_trace, false);
+    run_real_abc_mode(ik, ik_trace, true);
+    const g1_controller_state& raw_state = raw.runtime.accepted_state;
+    const g1_controller_state& ik_state = ik.runtime.accepted_state;
+    check(raw_state.frame_index == RealCandidateBExecutedFrame &&
+              ik_state.frame_index == RealCandidateBExecutedFrame &&
+              raw.runtime.accepted_diagnostic.selected_database_frame ==
+                  RealCandidateBSelectedFrame &&
+              ik.runtime.accepted_diagnostic.selected_database_frame ==
+                  RealCandidateBSelectedFrame &&
+              raw.runtime.accepted_diagnostic.query_database_frame ==
+                  RealIncumbentSelectedFrame &&
+              raw.runtime.accepted_diagnostic.query_range == 0 &&
+              real_candidate_record_bits_equal(
+                  raw_trace.attempts[1].candidate,
+                  ik_trace.attempts[1].candidate) &&
+              g1_frame_float_bits_equal(
+                  raw_state.selected_cost,
+                  raw_trace.attempts[1].candidate.selected_cost) &&
+              g1_frame_float_bits_equal(
+                  ik_state.selected_cost,
+                  ik_trace.attempts[1].candidate.selected_cost) &&
+              raw_state.selected_cost < raw_state.incumbent_cost &&
+              ik_state.selected_cost < ik_state.incumbent_cost &&
+              g1_frame_controller_states_equal(
+                  raw.runtime.candidates.common_state,
+                  ik.runtime.candidates.common_state) &&
+              g1_frame_controller_states_equal(
+                  raw.runtime.candidates.raw_state,
+                  ik.runtime.candidates.raw_state) &&
+              g1_frame_controller_states_equal(
+                  raw.runtime.candidates.ik_state,
+                  ik.runtime.candidates.ik_state) &&
+              g1_frame_ik_state_equal(raw_state.ik, ik_state.ik) &&
+              real_candidate_common_diagnostic_equal(
+                  raw.runtime.accepted_diagnostic,
+                  ik.runtime.accepted_diagnostic) &&
+              raw_state.scene_frame == 1 && ik_state.scene_frame == 1 &&
+              raw_state.route_frames == 0 && ik_state.route_frames == 0,
+          "real B selection is mode-independent across query, cost, provenance, common, hidden, and lifecycle owners");
+    check(real_candidate_visible_projection_matches(
+              raw_state, raw.runtime.candidates.raw_state) &&
+              g1_frame_ik_result_is_canonical(raw_state.ik_frame) &&
+              raw_state.ik_candidate_clearance_status == G1ClearanceOk &&
+              real_candidate_visible_projection_matches(
+                  ik_state, ik.runtime.candidates.ik_state) &&
+              ik_state.ik_frame.applied &&
+              !ik_state.ik_frame.safe_stop_requested &&
+              ik_state.ik_candidate_clearance_status == G1ClearanceOk,
+          "raw publishes the canonical off branch while IK publishes the successful on branch");
+}
+
+static void test_real_a_raw_passes_and_ik_reports_no_swing_candidate()
+{
+    fixture value;
+    G1CandidateCertificationTrace trace;
+    run_real_abc_mode(value, trace, false);
+    check(trace.attempts[0].raw == G1CandidateDispositionAccepted &&
+              trace.attempts[0].ik ==
+                  G1CandidateDispositionFiniteRejected &&
+              trace.attempts[0].rejection_stage ==
+                  G1FrameRejectIkCandidate &&
+              trace.attempts[0].stop_reason ==
+                  G1IkStopNoSwingCandidate,
+          "real A passes raw certification and finite-rejects only at the unchanged IK swing boundary");
+}
+
+static void test_real_b_contact_release_is_not_an_eligibility_gate()
+{
+    fixture value;
+    G1CandidateCertificationTrace trace;
+    run_real_abc_mode(value, trace, true);
+    check(value.db.contact_states(RealCandidateBSelectedFrame, 1) &&
+              !value.db.contact_states(RealCandidateBExecutedFrame, 1) &&
+              trace.attempts[1].candidate.selected_frame ==
+                  RealCandidateBSelectedFrame &&
+              trace.attempts[1].common ==
+                  G1CandidateDispositionAccepted &&
+              trace.attempts[1].raw ==
+                  G1CandidateDispositionAccepted &&
+              trace.attempts[1].ik ==
+                  G1CandidateDispositionAccepted,
+          "the strict B record executes and accepts across a real immediate right-contact release");
+}
+
+static void test_real_c_never_executes_after_b_accepts()
+{
+    fixture value;
+    G1CandidateCertificationTrace trace;
+    run_real_abc_mode(value, trace, false);
+    check(trace.attempt_count == 2U &&
+              trace.recovery_set.count == 3U &&
+              trace.recovery_set.records[1].selected_frame ==
+                  RealCandidateCSelectedFrame,
+          "C is materialized by the strict provider but its fail-on-entry guard never executes after B accepts");
+}
+
+static void run_real_incumbent_fallback(
+    fixture& value,
+    G1CandidateCertificationTrace& trace,
+    int incumbent_frame)
+{
+    configure_real_candidate_fixture(
+        value, true, true, incumbent_frame, false);
+    char error[1024] = {};
+    check(run_real_candidate_fixture(
+              value,
+              trace,
+              ::g1_recovery_candidates_build,
+              nullptr,
+              error,
+              static_cast<int>(sizeof(error))) ==
+              G1FrameTransactionAccepted,
+          error[0] != '\0'
+              ? error
+              : "the real incumbent accepts after all three ranked "
+                "recovery candidates finite-reject");
+}
+
+static void test_real_incumbent_runs_last_with_clamped_plus_one()
+{
+    fixture value;
+    G1CandidateCertificationTrace trace;
+    run_real_incumbent_fallback(
+        value, trace, RealIncumbentSelectedFrame);
+    check(trace.attempt_count == 4U &&
+              trace.attempts[0].candidate.selected_frame ==
+                  RealCandidateASelectedFrame &&
+              trace.attempts[1].candidate.selected_frame ==
+                  RealCandidateBSelectedFrame &&
+              trace.attempts[2].candidate.selected_frame ==
+                  RealCandidateCSelectedFrame &&
+              trace.attempts[3].candidate.kind == G1CandidateIncumbent &&
+              trace.attempts[3].candidate.selected_frame ==
+                  RealIncumbentSelectedFrame &&
+              trace.attempts[3].candidate.executed_frame ==
+                  RealIncumbentExecutedFrame &&
+              trace.attempts[3].score_owner ==
+                  G1CandidateScoreIncumbent &&
+              trace.attempts[3].common ==
+                  G1CandidateDispositionAccepted &&
+              trace.attempts[3].raw ==
+                  G1CandidateDispositionAccepted &&
+              trace.attempts[3].ik ==
+                  G1CandidateDispositionAccepted &&
+              value.runtime.accepted_state.frame_index ==
+                  RealIncumbentExecutedFrame &&
+              !value.runtime.accepted_state.transitioned &&
+              value.runtime.accepted_diagnostic.selected_database_frame ==
+                  RealIncumbentSelectedFrame,
+          "A, B, and C finite-reject in rank order before one incumbent executes ordinary clamped plus one");
+}
+
+static void test_real_legacy_incumbent_is_not_retried()
+{
+    fixture value;
+    configure_real_candidate_fixture(
+        value, true, false, RealIncumbentSelectedFrame, true);
+    G1CandidateCertificationTrace trace;
+    char error[1024] = {};
+    check(run_real_candidate_fixture(
+              value,
+              trace,
+              ::g1_recovery_candidates_build,
+              nullptr,
+              error,
+              static_cast<int>(sizeof(error))) ==
+              G1FrameTransactionFiniteRejected,
+          error);
+    check(trace.attempt_count == 1U &&
+              trace.legacy_traversals == 1U &&
+              trace.recovery_provider_calls == 1U &&
+              trace.attempts[0].candidate.kind == G1CandidateLegacy &&
+              trace.attempts[0].candidate.selected_frame ==
+                  RealIncumbentSelectedFrame &&
+              trace.recovery_set.count == 0U,
+          "a scheduled legacy record at the incumbent is certified once and never appended for retry");
+}
+
+static void test_real_provider_global_error_rolls_back_every_owner()
+{
+    fixture value;
+    configure_real_candidate_fixture(value, true, false);
+    const ProductionEvidence before = production_evidence(value.runtime);
+    const ConstArtifactEvidence artifacts_before =
+        const_artifact_evidence(value.external);
+    G1CandidateCertificationTrace trace;
+    char error[1024] = {};
+    check(run_real_candidate_fixture(
+              value,
+              trace,
+              real_provider_global_error,
+              nullptr,
+              error,
+              static_cast<int>(sizeof(error))) ==
+              G1FrameTransactionGlobalError,
+          "a strict-provider global error aborts the real transaction");
+    check(trace.attempt_count == 1U &&
+              trace.recovery_provider_calls == 1U &&
+              trace.attempts[0].stop_reason ==
+                  G1IkStopNoSwingCandidate,
+          "provider failure follows one authentic A rejection");
+    check_production_global_preservation(
+        value.runtime,
+        before,
+        "provider global error preserves accepted, publication, diagnostic, and storage owners");
+    check_const_artifacts(
+        value.external,
+        artifacts_before,
+        "provider global error preserves every immutable owner");
+}
+
+static void test_legacy_slot_zero_acceptance_has_exact_pre_feature_public_owners()
+{
+    for (int mode = 0; mode < 2; ++mode) {
+        fixture value;
+        configure_real_candidate_fixture(value, false, false);
+        value.external.tuning.ik_enabled = mode != 0;
+        G1CandidateCertificationTrace trace;
+        char error[1024] = {};
+        check(run_real_candidate_fixture(
+                  value,
+                  trace,
+                  ::g1_recovery_candidates_build,
+                  nullptr,
+                  error,
+                  static_cast<int>(sizeof(error))) ==
+                  G1FrameTransactionAccepted,
+              error);
+        bool positive_zero_query = true;
+        for (int feature = 0; feature < 31; ++feature) {
+            const float normalized =
+                (value.runtime.accepted_diagnostic.query[feature] -
+                 value.db.features_offset(feature)) /
+                value.db.features_scale(feature);
+            positive_zero_query = positive_zero_query &&
+                terrain_float_bits(normalized) == 0U;
+        }
+        check(positive_zero_query &&
+                  trace.attempt_count == 1U &&
+                  trace.legacy_traversals == 1U &&
+                  trace.recovery_provider_calls == 0U &&
+                  trace.attempts[0].candidate.kind ==
+                      G1CandidateLegacy &&
+                  trace.attempts[0].candidate.selected_frame ==
+                      RealCandidateASelectedFrame &&
+                  trace.attempts[0].candidate.executed_frame ==
+                      RealCandidateAExecutedFrame &&
+                  trace.attempts[0].candidate.source_range == 0 &&
+                  terrain_float_bits(
+                      trace.attempts[0].candidate.selected_cost) ==
+                      terrain_float_bits(1.0f) &&
+                  value.runtime.accepted_state.frame_index ==
+                      RealCandidateAExecutedFrame &&
+                  value.runtime.accepted_state.transitioned &&
+                  terrain_float_bits(
+                      value.runtime.accepted_state.incumbent_cost) ==
+                      terrain_float_bits(4.0f) &&
+                  terrain_float_bits(
+                      value.runtime.accepted_state.selected_cost) ==
+                      terrain_float_bits(1.0f) &&
+                  terrain_float_bits(
+                      value.runtime.accepted_state
+                          .selected_terrain_error) == 0U &&
+                  value.runtime.accepted_diagnostic
+                          .query_database_frame ==
+                      RealIncumbentSelectedFrame &&
+                  value.runtime.accepted_diagnostic.query_range == 0 &&
+                  value.runtime.accepted_diagnostic
+                          .selected_database_frame ==
+                      RealCandidateASelectedFrame,
+              "legacy slot zero retains every exact pre-feature query, frame, transition, cost, terrain, and provenance owner");
+    }
+}
+
+static void test_legacy_slot_zero_acceptance_never_materializes_recovery()
+{
+    fixture value;
+    configure_real_candidate_fixture(value, false, false);
+    G1CandidateCertificationTrace trace;
+    char error[1024] = {};
+    check(run_real_candidate_fixture(
+              value,
+              trace,
+              ::g1_recovery_candidates_build,
+              nullptr,
+              error,
+              static_cast<int>(sizeof(error))) ==
+              G1FrameTransactionAccepted,
+          error);
+    check(trace.attempt_count == 1U &&
+              trace.legacy_traversals == 1U &&
+              trace.recovery_provider_calls == 0U &&
+              !trace.recovery_request_available &&
+              trace.recovery_set.count == 0U,
+          "accepted slot zero has counters (1,0), one attempt, and no recovery materialization");
+}
+
+static void test_matching_disabled_and_unscheduled_frames_attempt_only_incumbent()
+{
+    for (int variant = 0; variant < 2; ++variant) {
+        fixture value;
+        configure_real_candidate_fixture(value, false, false);
+        if (variant == 0) {
+            value.external.tuning.mode = G1_TestSequential;
+            value.external.tuning.frame_limit = 1;
+        } else {
+            value.runtime.accepted_state.search_timer =
+                value.runtime.accepted_state.search_time;
+        }
+        G1CandidateCertificationTrace trace;
+        char error[1024] = {};
+        check(run_real_candidate_fixture(
+                  value,
+                  trace,
+                  ::g1_recovery_candidates_build,
+                  nullptr,
+                  error,
+                  static_cast<int>(sizeof(error))) ==
+                  G1FrameTransactionAccepted,
+              error);
+        check(trace.attempt_count == 1U &&
+                  trace.legacy_traversals == 0U &&
+                  trace.recovery_provider_calls == 0U &&
+                  trace.attempts[0].candidate.kind ==
+                      G1CandidateIncumbent &&
+                  trace.attempts[0].score_owner ==
+                      G1CandidateScoreIncumbent,
+              "matching-disabled and unscheduled frames each attempt only the incumbent");
+    }
+}
+
+static void test_end_of_animation_public_sentinels_do_not_leak_private_score()
+{
+    fixture value;
+    G1CandidateCertificationTrace trace;
+    run_real_incumbent_fallback(value, trace, 159);
+    check(trace.attempt_count == 4U &&
+              trace.attempts[3].candidate.kind == G1CandidateIncumbent &&
+              trace.attempts[3].candidate.selected_frame == 159 &&
+              trace.attempts[3].candidate.executed_frame == 159 &&
+              terrain_float_bits(
+                  trace.attempts[3].candidate.selected_cost) ==
+                  terrain_float_bits(FLT_MAX) &&
+              terrain_float_bits(
+                  value.runtime.accepted_state.incumbent_cost) ==
+                  terrain_float_bits(FLT_MAX) &&
+              terrain_float_bits(
+                  value.runtime.accepted_state.selected_cost) ==
+                  terrain_float_bits(FLT_MAX),
+          "end-of-animation incumbent preserves exact public FLT_MAX words instead of its private strict score");
+}
+
+static ExactFunctionRange real_controller_runner_range(
+    const std::vector<CppToken>& tokens)
+{
+    const std::vector<std::string> signature = {
+        "G1FrameStageOutcome", "g1_controller_frame_stage_run", "(",
+        "G1FrameTransactionStage", "stage", ",",
+        "g1_controller_state", "&", "working_state", ",",
+        "G1FrameTransactionScratch", "&", "scratch", ",",
+        "const", "G1FrameExternalInputs", "&", "external", ",",
+        "char", "*", "error", ",", "int", "error_capacity", ")",
+    };
+    ExactFunctionRange runner;
+    check(cpp_exact_function_range(tokens, signature, runner),
+          "the exact production stage runner is present");
+    return runner;
+}
+
+static void test_stage_runner_trusted_call_closure_is_exact()
+{
+    const std::string source = read_source_file("controller.cpp");
+    const NoMainSourceView no_main_view = no_main_source_view(source);
+    std::string error;
+    std::string closure_source;
+    check(build_authenticated_production_no_main_closure_source(
+              no_main_view,
+              closure_source,
+              error),
+          error.empty()
+              ? "the legacy query builder has one exact authenticated out-of-line boundary"
+              : error.c_str());
+    error.clear();
+    check(analyze_no_main_root_closure(
+              closure_source,
+              "g1_controller_frame_stage_run",
+              production_trusted_no_main_calls(),
+              error),
+          error.empty()
+              ? "the expanded production runner has one exact trusted no-main closure"
+              : error.c_str());
+}
+
+static void test_controller_contains_one_production_database_search_call()
+{
+    std::string error;
+    const std::vector<CppToken> tokens = tokenize_cpp_source(
+        read_source_file("controller.cpp"), error);
+    check(error.empty(), error.empty() ? "controller tokenizes" : error.c_str());
+    const ExactFunctionRange runner = real_controller_runner_range(tokens);
+    const std::vector<CppCallRecord> all_searches = cpp_calls_named(
+        tokens, 0, tokens.size(), "database_search");
+    const std::vector<CppCallRecord> runner_searches = cpp_calls_named(
+        tokens, runner.body_begin + 1, runner.body_end, "database_search");
+    const std::vector<CppCallRecord> runner_providers = cpp_calls_named(
+        tokens,
+        runner.body_begin + 1,
+        runner.body_end,
+        "g1_recovery_candidates_build");
+    const std::vector<std::size_t> matcher_cases = cpp_find_token_sequence(
+        tokens,
+        runner.body_begin + 1,
+        runner.body_end,
+        {"case", "G1FrameStageMatcherSearch", ":"});
+    const std::vector<std::size_t> apply_cases = cpp_find_token_sequence(
+        tokens,
+        runner.body_begin + 1,
+        runner.body_end,
+        {"case", "G1FrameStageCandidateApply", ":"});
+    check(all_searches.size() == 1U &&
+              runner_searches.size() == 1U &&
+              runner_searches[0].key == "::database_search" &&
+              matcher_cases.size() == 1U &&
+              apply_cases.size() == 1U &&
+              runner_searches[0].name > matcher_cases[0] &&
+              runner_searches[0].name < apply_cases[0] &&
+              runner_providers.empty(),
+          "controller production code has one database_search, only MatcherSearch owns it, and the runner never calls recovery");
+}
+
+static void test_controller_has_no_candidate_contact_rank_gate()
+{
+    std::string error;
+    const std::vector<CppToken> tokens = tokenize_cpp_source(
+        read_source_file("controller.cpp"), error);
+    check(error.empty(), error.empty() ? "controller tokenizes" : error.c_str());
+    const ExactFunctionRange runner = real_controller_runner_range(tokens);
+    const std::vector<std::size_t> apply_cases = cpp_find_token_sequence(
+        tokens,
+        runner.body_begin + 1,
+        runner.body_end,
+        {"case", "G1FrameStageCandidateApply", ":"});
+    const std::vector<std::size_t> inertial_cases = cpp_find_token_sequence(
+        tokens,
+        runner.body_begin + 1,
+        runner.body_end,
+        {"case", "G1FrameStageInertialization", ":"});
+    check(apply_cases.size() == 1U && inertial_cases.size() == 1U,
+          "candidate-apply case has an exact bounded range");
+    const std::vector<std::size_t> active_outside =
+        cpp_find_token_sequence(
+            tokens,
+            inertial_cases[0],
+            runner.body_end,
+            {"scratch", ".", "active_candidate"});
+    check(active_outside.empty(),
+          "no contact, footprint, certificate, or finalize stage can rank-gate an active candidate");
+}
+
+static void test_controller_has_no_persistent_dual_certificate_owner()
+{
+    std::string error;
+    const std::vector<CppToken> tokens = tokenize_cpp_source(
+        read_source_file("controller.cpp"), error);
+    check(error.empty(), error.empty() ? "controller tokenizes" : error.c_str());
+    check(cpp_find_token_sequence(
+                  tokens,
+                  0,
+                  tokens.size(),
+                  {"state", ".", "raw_certificate"}).empty() &&
+              cpp_find_token_sequence(
+                  tokens,
+                  0,
+                  tokens.size(),
+                  {"state", ".", "ik_certificate"}).empty() &&
+              cpp_find_token_sequence(
+                  tokens,
+                  0,
+                  tokens.size(),
+                  {"working_state", ".", "raw_certificate"}).empty() &&
+              cpp_find_token_sequence(
+                  tokens,
+                  0,
+                  tokens.size(),
+                  {"working_state", ".", "ik_certificate"}).empty() &&
+              cpp_find_token_sequence(
+                  tokens,
+                  0,
+                  tokens.size(),
+                  {"G1FrameBranchCertificateScratch",
+                   "raw_certificate"}).empty() &&
+              cpp_find_token_sequence(
+                  tokens,
+                  0,
+                  tokens.size(),
+                  {"G1FrameBranchCertificateScratch",
+                   "ik_certificate"}).empty(),
+          "dual certificate ownership exists only in transaction scratch, never persistent controller state");
+}
+
+static void test_production_no_seam_links_with_strict_recovery_provider()
+{
+    std::string error;
+    const std::vector<CppToken> tokens = tokenize_cpp_source(
+        read_source_file("controller.cpp"), error);
+    check(error.empty(), error.empty() ? "controller tokenizes" : error.c_str());
+    const std::vector<CppCallRecord> calls = cpp_calls_named(
+        tokens, 0, tokens.size(), "g1_frame_transaction_run");
+    check(calls.size() == 1U &&
+              calls[0].key == "::g1_frame_transaction_run" &&
+              cpp_find_token_sequence(
+                  tokens,
+                  calls[0].name,
+                  calls[0].closing + 1,
+                  {"::", "g1_controller_frame_stage_run", ",",
+                   "::", "g1_recovery_candidates_build", ",",
+                   "frame_external"}).size() == 1U,
+          "the sole production coordinator call binds the real runner directly to the strict provider");
+}
+
 int main()
 {
     test_production_root_reach_digest_ownership();
@@ -10527,6 +11558,22 @@ int main()
     test_synthetic_non_descending_step_safe_stops_atomically();
     test_quantized_planner_terminal_rejects_atomically();
     test_pose_certificate_discards_working_plan_and_prior_owners();
+    test_real_abc_selects_b_in_both_modes();
+    test_real_a_raw_passes_and_ik_reports_no_swing_candidate();
+    test_real_b_contact_release_is_not_an_eligibility_gate();
+    test_real_c_never_executes_after_b_accepts();
+    test_real_incumbent_runs_last_with_clamped_plus_one();
+    test_real_legacy_incumbent_is_not_retried();
+    test_real_provider_global_error_rolls_back_every_owner();
+    test_legacy_slot_zero_acceptance_has_exact_pre_feature_public_owners();
+    test_legacy_slot_zero_acceptance_never_materializes_recovery();
+    test_matching_disabled_and_unscheduled_frames_attempt_only_incumbent();
+    test_end_of_animation_public_sentinels_do_not_leak_private_score();
+    test_stage_runner_trusted_call_closure_is_exact();
+    test_controller_contains_one_production_database_search_call();
+    test_controller_has_no_candidate_contact_rank_gate();
+    test_controller_has_no_persistent_dual_certificate_owner();
+    test_production_no_seam_links_with_strict_recovery_provider();
     test_genuine_foot0_and_foot1_safe_stops();
     test_genuine_begin_time_safe_stop();
     test_real_pose_certificate_classification();
