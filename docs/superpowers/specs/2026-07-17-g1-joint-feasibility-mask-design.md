@@ -154,7 +154,9 @@ mask byte is one.
 
 The branch-and-bound boxes remain unchanged. Their bounds may cover skipped
 frames, which can reduce pruning efficiency but cannot change the minimum among
-allowed frames. Mask shape and binary values are validated before search.
+allowed frames. Mask shape and binary values are validated once when the
+immutable certificate is constructed; the G1 search wrapper passes only that
+prevalidated slice, so no full-mask scan occurs in the per-step hot path.
 
 If no allowed candidate exists, search returns no index and the G1 runtime
 fails generation with an explicit `no joint-limit-safe database candidate`
@@ -207,7 +209,11 @@ fail integration preflight.
 - Certificate construction or non-limit raw projection failure:
   integration/configuration failure before a trial.
 - No search-safe candidate for the current query:
-  scientific `generation_failed` during the MM gate.
+  scientific `generation_failed` during the MM gate. The server renders the
+  exact fixed message `no joint-limit-safe database candidate`, and the Python
+  verdict boundary recognizes only that anchored message with the structured
+  `generation_failed` code. Lookalikes and other generation errors remain
+  integration failures.
 - Actual inertialized pose outside registered limits:
   scientific `generation_failed`, unchanged from the repaired verdict path.
 - Malformed mask identity or cross-process mismatch:
@@ -230,7 +236,8 @@ Implementation is test-first and includes:
 4. Runtime RED tests reproducing a safe selected frame with an unsafe immediate
    successor and proving search is forced before progression.
 5. Protocol/schema RED tests for exact certificate identity and mismatch
-   rejection.
+   rejection, plus CLI verdict tests for the exact search-exhaustion error and
+   integration-owned lookalikes.
 6. The existing joint-limit verdict protected evaluator, all focused C++ and
    Python suites, and the complete warning-strict catalog.
 7. A fresh full-database certificate scan whose counts are reconciled against
