@@ -17,7 +17,11 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 
-from .joints import TARGET_JOINT_ORDER
+from .joints import ContractError, TARGET_JOINT_ORDER
+from .schema import (
+    JointFeasibilityIdentity,
+    parse_joint_feasibility_identity,
+)
 
 
 HOLDEN_COORDINATE_SIGNATURE = "holden-y-up-right-handed-forward-plus-z"
@@ -1246,7 +1250,7 @@ def register_scene(
 def _verify_mm_hello_identity(
     source_hashes: Mapping[str, str],
     mm_hello_identity: Mapping[str, object] | None,
-) -> None:
+) -> JointFeasibilityIdentity:
     mismatch = not isinstance(mm_hello_identity, Mapping) or (
         mm_hello_identity.get("coordinate_signature")
         != HOLDEN_COORDINATE_SIGNATURE
@@ -1259,6 +1263,15 @@ def _verify_mm_hello_identity(
         raise SceneError(
             "MM hello identity does not match authenticated scene artifacts"
         )
+    assert mm_hello_identity is not None
+    try:
+        return parse_joint_feasibility_identity(
+            mm_hello_identity.get("joint_feasibility")
+        )
+    except ContractError as error:
+        raise SceneError(
+            f"MM hello joint feasibility identity is invalid: {error}"
+        ) from error
 
 
 def _verify_mm_reset_identity(
@@ -1303,18 +1316,21 @@ def verify_mm_scene_identity(
     scene: RegisteredScene,
     mm_hello_identity: Mapping[str, object] | None,
     mm_scene_identity: Mapping[str, object] | None,
-) -> None:
+) -> JointFeasibilityIdentity:
     """Bind MM hello/reset identities to authenticated scene artifacts."""
 
     if not isinstance(scene, RegisteredScene):
         raise SceneError("MM scene identity is invalid")
-    _verify_mm_hello_identity(scene.source_hashes, mm_hello_identity)
+    joint_feasibility = _verify_mm_hello_identity(
+        scene.source_hashes, mm_hello_identity
+    )
     _verify_mm_reset_identity(
         scene.scene_id,
         scene.route_id,
         scene.source_hashes,
         mm_scene_identity,
     )
+    return joint_feasibility
 
 
 def penetration_exceeds_threshold(

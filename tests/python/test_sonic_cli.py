@@ -32,6 +32,7 @@ from mm_sonic.external import ExternalInputs
 from mm_sonic.joints import ContractError
 from mm_sonic.metrics import validate_stage_a_prerequisite
 from mm_sonic.process import GearProcess, ProcessError, _RemoteMMError
+from mm_sonic.schema import parse_joint_feasibility_identity
 from mm_sonic.timeline import CanonicalTargetBuffer
 from mm_sonic.zmq_v1 import PosePublisher, encode_pose_v1
 
@@ -49,6 +50,42 @@ GATES = (
 
 def _sha(label: str) -> str:
     return hashlib.sha256(label.encode("ascii")).hexdigest()
+
+
+def _joint_feasibility_identity(*, mask_sha256: str | None = None):
+    violations = [0] * 29
+    for index, count in {
+        4: 20,
+        5: 938,
+        9: 4,
+        10: 14,
+        11: 52,
+        14: 12,
+        18: 13,
+        25: 10,
+    }.items():
+        violations[index] = count
+    return {
+        "schema": "g1-joint-feasibility-certificate/v1",
+        "frame_count": 459682,
+        "raw_safe_count": 458619,
+        "raw_unsafe_count": 1063,
+        "search_safe_count": 458000,
+        "joint_limit_violation_count": violations,
+        "mask_sha256": "a" * 64 if mask_sha256 is None else mask_sha256,
+    }
+
+
+def _joint_feasibility_hello(identity=None):
+    source = _joint_feasibility_identity() if identity is None else identity
+    return {
+        "joint_feasibility": {
+            **source,
+            "joint_limit_violation_count": list(
+                source["joint_limit_violation_count"]
+            ),
+        }
+    }
 
 
 def _canonical(count: int = 21) -> CanonicalTargetBuffer:
@@ -297,6 +334,7 @@ class CompleteStageAFake:
                 }
             )
             scene = _scene_registration()
+            metrics["joint_feasibility"] = _joint_feasibility_identity()
             if self.deferred_scene_identity:
                 artifact_hashes.update(
                     {"model": _sha("model"), "scene": _sha("scene")}
@@ -777,6 +815,19 @@ class SonicCLITests(unittest.TestCase):
         self.assertEqual(
             manifest["processes"][-1]["name"],
             "gated-simulator-import-preflight",
+        )
+        expected_feasibility = _joint_feasibility_identity()
+        self.assertEqual(manifest["joint_feasibility"], expected_feasibility)
+        evidence = self._evidence(bundle)
+        self.assertEqual(
+            evidence["gates"][2]["metrics"]["joint_feasibility"],
+            expected_feasibility,
+        )
+        self.assertEqual(
+            evidence["metrics"]["basis_and_scene_alignment"][
+                "joint_feasibility"
+            ],
+            expected_feasibility,
         )
         self.assertTrue(verify_run_inventory(bundle))
 
@@ -1686,7 +1737,10 @@ class ProductionAdapterBoundaryTests(unittest.TestCase):
         )
         operations = cli_module.DefaultStageAOperations()
         operations._runtime[id(context)] = {
-            "verified_external": SimpleNamespace(inputs=inputs)
+            "verified_external": SimpleNamespace(inputs=inputs),
+            "joint_feasibility": parse_joint_feasibility_identity(
+                _joint_feasibility_identity()
+            ),
         }
         environment = {"PATH": "/usr/bin:/bin", "CUDA_VISIBLE_DEVICES": "0"}
         request = StageARequest(
@@ -1982,7 +2036,7 @@ class ProductionAdapterBoundaryTests(unittest.TestCase):
 
             def hello(self):
                 snapshot("hello")
-                return {}
+                return _joint_feasibility_hello()
 
             def reset(self, *_args, **_kwargs):
                 snapshot("reset")
@@ -2027,6 +2081,121 @@ class ProductionAdapterBoundaryTests(unittest.TestCase):
                     "mm_chunk_server-preflight",
                 ],
             )
+        finally:
+            bundle.__del__()
+
+    def test_preflight_joint_feasibility_is_parsed_before_reset_and_retained(self):
+        (
+            sonic_root,
+            _inputs,
+            context,
+            operations,
+            request,
+            _environment,
+        ) = self._attempt_provenance_fixture()
+        linked = subprocess.CompletedProcess(
+            args=(),
+            returncode=0,
+            stdout=(
+                b"libnvinfer.so.10 => /opt/libnvinfer.so.10\n"
+                b"libcudart.so.12 => /opt/libcudart.so.12\n"
+            ),
+            stderr=b"",
+        )
+        imported = subprocess.CompletedProcess(
+            args=(), returncode=0, stdout=b"imported\n", stderr=b""
+        )
+        scene_xml = self.root / "preflight-scene.xml"
+        scene_xml.write_bytes(b"<mujoco/>\n")
+        scene = cli_module.RegisteredScene(
+            scene_id="sonic-flat-baseline",
+            route_id="flat-12s",
+            source_kind="analytic-flat",
+            source_mesh=None,
+            source_heightfield=None,
+            source_hashes=MappingProxyType(
+                {"manifest": _sha("manifest"), "scene_index": _sha("index")}
+            ),
+            coordinate_source="holden-y-up-right-handed-forward-plus-z",
+            coordinate_target="mujoco-z-up-right-handed-forward-plus-x",
+            transform_matrix=np.eye(3, dtype=np.float64),
+            transformed_obj=None,
+            gear_scene_xml=scene_xml,
+            output_hashes=MappingProxyType(
+                {
+                    "gear_scene_xml": _sha("gear-scene"),
+                    "scene_registration": _sha("scene-registration"),
+                }
+            ),
+            allowed_foot_geoms=(1,),
+            forbidden_geom_groups=MappingProxyType(
+                {"pelvis": (2,), "knees": (3,), "torso": (4,), "hands": (5,)}
+            ),
+        )
+        preflight = _joint_feasibility_identity()
+        events: list[str] = []
+
+        class FakeMMClient:
+            def __init__(self, **_kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def hello(self):
+                events.append("hello")
+                return _joint_feasibility_hello(preflight)
+
+            def reset(self, *_args, **_kwargs):
+                events.append("reset")
+                return {"scene": {}}
+
+        bundle = RunBundle.create(self.root / "runs", "preflight-feasibility", "run")
+        try:
+            with (
+                patch.object(cli_module, "_SONIC_ROOT", sonic_root),
+                patch.object(
+                    cli_module, "_find_unresolved_git_lfs_capabilities", return_value=()
+                ),
+                patch.object(cli_module.shutil, "which", return_value=sys.executable),
+                patch.object(
+                    cli_module.subprocess, "run", side_effect=[linked, imported]
+                ),
+                patch.object(cli_module, "_cuda_device_count", return_value=1),
+                patch.object(cli_module, "MMChunkClient", FakeMMClient),
+                patch.object(cli_module, "register_scene", return_value=scene),
+                patch.object(
+                    cli_module,
+                    "_model_initial_state",
+                    return_value=(
+                        np.zeros(36, dtype=np.float64),
+                        np.arange(29, dtype=np.int64),
+                        np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64),
+                    ),
+                ),
+            ):
+                result = operations.run_gate(
+                    "basis_and_scene_alignment", request, context, bundle
+                )
+            self.assertEqual(result.status, "pass")
+            self.assertEqual(events, ["hello", "reset"])
+            expected = parse_joint_feasibility_identity(preflight)
+            self.assertEqual(
+                operations._state(context)["joint_feasibility"], expected
+            )
+            expected_payload = _joint_feasibility_identity()
+            self.assertEqual(
+                result.metrics["joint_feasibility"], expected_payload
+            )
+            payload = json.loads(
+                (bundle.path / "gates/basis_and_scene_alignment.json").read_text(
+                    "ascii"
+                )
+            )
+            self.assertEqual(payload["joint_feasibility"], expected_payload)
         finally:
             bundle.__del__()
 
@@ -2079,7 +2248,7 @@ class ProductionAdapterBoundaryTests(unittest.TestCase):
 
             def hello(self):
                 snapshot("hello")
-                return {}
+                return _joint_feasibility_hello()
 
             def reset(self, *_args, **_kwargs):
                 snapshot("reset")
@@ -2397,8 +2566,20 @@ class ProductionAdapterBoundaryTests(unittest.TestCase):
             cli_module._validate_target_prefix(b"".join(rows + rows[-1:]), rows)
 
     def _remote_generation_error_case(
-        self, *, code: str, message: str, label: str
-    ) -> tuple[GateResult, dict[str, object] | None, tuple[str, ...]]:
+        self,
+        *,
+        code: str,
+        message: str,
+        label: str,
+        run_identity: dict[str, object] | None = None,
+        remote_error: bool = True,
+        stderr_message: str = "",
+    ) -> tuple[
+        GateResult,
+        dict[str, object] | None,
+        tuple[str, ...],
+        tuple[str, ...],
+    ]:
         case_root = self.root / label
         case_root.mkdir()
         sonic_root = case_root / "sonic"
@@ -2496,14 +2677,21 @@ class ProductionAdapterBoundaryTests(unittest.TestCase):
             def validate_source(self, value):
                 return SimpleNamespace(candidate_id=value["candidate_id"])
 
+        preflight_identity = _joint_feasibility_identity()
+        run_feasibility = (
+            _joint_feasibility_identity()
+            if run_identity is None
+            else run_identity
+        )
         aborted: list[str] = []
+        events: list[str] = []
 
         class FakeMMClient:
             def __init__(
                 self, *, stdout_archive, stderr_archive, **_kwargs
             ):
                 Path(stdout_archive).write_bytes(b"reset accepted\n")
-                Path(stderr_archive).write_bytes(b"")
+                Path(stderr_archive).write_text(stderr_message, encoding="ascii")
                 self.outstanding_candidate_id = None
 
             def __enter__(self):
@@ -2513,17 +2701,22 @@ class ProductionAdapterBoundaryTests(unittest.TestCase):
                 return False
 
             def hello(self):
-                return {}
+                events.append("hello")
+                return _joint_feasibility_hello(run_feasibility)
 
             def reset(self, _config, *, session_id):
+                events.append("reset")
                 self.session_id = session_id
                 return {"scene": {}}
 
             def generate(self, _command, *, candidate_id, **_kwargs):
+                events.append("generate")
                 chunk = int(candidate_id.rsplit(":", 1)[1])
                 if chunk == 5:
                     self.outstanding_candidate_id = None
-                    raise _RemoteMMError(code, message)
+                    if remote_error:
+                        raise _RemoteMMError(code, message)
+                    raise ProcessError(message)
                 self.outstanding_candidate_id = candidate_id
                 return {"candidate_id": candidate_id}
 
@@ -2549,6 +2742,9 @@ class ProductionAdapterBoundaryTests(unittest.TestCase):
         operations._runtime[id(context)] = {
             "scene": scene,
             "verified_external": SimpleNamespace(inputs=inputs),
+            "joint_feasibility": parse_joint_feasibility_identity(
+                preflight_identity
+            ),
         }
         request = StageARequest(
             command="stage-a",
@@ -2580,12 +2776,12 @@ class ProductionAdapterBoundaryTests(unittest.TestCase):
                 if evidence_path.exists()
                 else None
             )
-            return result, evidence, tuple(aborted)
+            return result, evidence, tuple(aborted), tuple(events)
         finally:
             bundle.__del__()
 
     def test_remote_joint_limit_failure_is_scientific_at_source_chunk(self):
-        result, evidence, aborted = self._remote_generation_error_case(
+        result, evidence, aborted, _events = self._remote_generation_error_case(
             code="generation_failed",
             message=(
                 "joint left_ankle_roll_joint position -0.307408422 is outside "
@@ -2645,7 +2841,7 @@ class ProductionAdapterBoundaryTests(unittest.TestCase):
         )
         for index, (code, message) in enumerate(cases):
             with self.subTest(code=code, message=message):
-                result, evidence, aborted = self._remote_generation_error_case(
+                result, evidence, aborted, _events = self._remote_generation_error_case(
                     code=code,
                     message=message,
                     label=f"remote-lookalike-{index}",
@@ -2653,6 +2849,78 @@ class ProductionAdapterBoundaryTests(unittest.TestCase):
                 self.assertEqual(result.status, "integration_failure")
                 self.assertIsNone(evidence)
                 self.assertEqual(aborted, ())
+
+    def test_exact_remote_no_safe_candidate_is_scientific(self):
+        message = "no joint-limit-safe database candidate"
+        result, evidence, aborted, events = self._remote_generation_error_case(
+            code="generation_failed",
+            message=message,
+            label="remote-no-safe-candidate",
+        )
+        self.assertEqual(result.status, "scientific_failure")
+        self.assertEqual(aborted, ())
+        self.assertEqual(events[:2], ("hello", "reset"))
+        self.assertEqual(events.count("generate"), 6)
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertEqual(evidence["failure_boundary"], "source_chunk")
+        self.assertIn(message, evidence["reason"])
+
+    def test_no_safe_candidate_text_lookalikes_are_integration_failures(self):
+        message = "no joint-limit-safe database candidate"
+        cases = (
+            ("invalid_candidate", message, True, ""),
+            ("generation_failed", "prefix " + message, True, ""),
+            ("generation_failed", message + " suffix", True, ""),
+            ("generation_failed", message, False, ""),
+            ("generation_failed", "child process exited", False, message),
+        )
+        for index, (code, observed, remote, stderr) in enumerate(cases):
+            with self.subTest(code=code, observed=observed, remote=remote):
+                result, evidence, aborted, _events = (
+                    self._remote_generation_error_case(
+                        code=code,
+                        message=observed,
+                        label=f"remote-no-safe-lookalike-{index}",
+                        remote_error=remote,
+                        stderr_message=stderr,
+                    )
+                )
+                self.assertEqual(result.status, "integration_failure")
+                self.assertIsNone(evidence)
+                self.assertEqual(aborted, ())
+
+    def test_run_feasibility_drift_fails_before_reset_or_chunk_acceptance(self):
+        count_drift = _joint_feasibility_identity()
+        count_drift["frame_count"] += 1
+        count_drift["raw_safe_count"] += 1
+
+        vector_drift = _joint_feasibility_identity()
+        vector_drift["joint_limit_violation_count"][5] -= 1
+        vector_drift["joint_limit_violation_count"][11] += 1
+
+        digest_drift = _joint_feasibility_identity(mask_sha256="b" * 64)
+        malformed = _joint_feasibility_identity()
+        malformed["search_safe_count"] = 0
+        for label, identity in (
+            ("count", count_drift),
+            ("vector", vector_drift),
+            ("digest", digest_drift),
+            ("malformed", malformed),
+        ):
+            with self.subTest(label=label):
+                result, evidence, aborted, events = (
+                    self._remote_generation_error_case(
+                        code="generation_failed",
+                        message="no joint-limit-safe database candidate",
+                        label=f"run-feasibility-drift-{label}",
+                        run_identity=identity,
+                    )
+                )
+                self.assertEqual(result.status, "integration_failure")
+                self.assertIsNone(evidence)
+                self.assertEqual(aborted, ())
+                self.assertEqual(events, ("hello",))
 
     def test_initial_joint_limit_failure_is_scientific_before_chunk_zero(
         self,
@@ -2725,7 +2993,7 @@ class ProductionAdapterBoundaryTests(unittest.TestCase):
                 return False
 
             def hello(self):
-                return {}
+                return _joint_feasibility_hello()
 
             def reset(self, _config, *, session_id):
                 self.session_id = session_id
@@ -2740,6 +3008,9 @@ class ProductionAdapterBoundaryTests(unittest.TestCase):
         operations._runtime[id(context)] = {
             "scene": scene,
             "verified_external": SimpleNamespace(inputs=inputs),
+            "joint_feasibility": parse_joint_feasibility_identity(
+                _joint_feasibility_identity()
+            ),
         }
         bundle = RunBundle.create(self.root / "runs", "initial-limit", "run")
         request = StageARequest(

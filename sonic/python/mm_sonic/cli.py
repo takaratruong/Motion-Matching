@@ -73,6 +73,10 @@ from .scene import (
     replay_kinematic_reference,
     verify_mm_scene_identity,
 )
+from .schema import (
+    JointFeasibilityIdentity,
+    parse_joint_feasibility_identity,
+)
 from .timeline import CanonicalTargetBuffer, TargetTimeline
 from .transform import (
     holden_to_mujoco_quaternions,
@@ -148,6 +152,9 @@ _REMOTE_JOINT_LIMIT_MESSAGE = re.compile(
     rf"\[(?P<lower>{_REMOTE_FINITE_NUMBER}), "
     rf"(?P<upper>{_REMOTE_FINITE_NUMBER})\]\Z"
 )
+_REMOTE_NO_SAFE_CANDIDATE_MESSAGE = (
+    "no joint-limit-safe database candidate"
+)
 _COLD_GEAR_STARTUP_TIMEOUT_S = 600.0
 _LOW_STATE_BOOTSTRAP_TIMEOUT_S = 15.0
 _SCORING_TARGET_TIMEOUT_S = 30.0
@@ -187,6 +194,40 @@ def _is_remote_registered_joint_limit(error: BaseException) -> bool:
         and lower < upper
         and (position < lower or position > upper)
     )
+
+
+def _is_remote_no_safe_candidate(error: BaseException) -> bool:
+    return (
+        isinstance(error, _RemoteMMError)
+        and error.code == "generation_failed"
+        and error.message == _REMOTE_NO_SAFE_CANDIDATE_MESSAGE
+    )
+
+
+def _joint_feasibility_from_hello(
+    hello: object,
+) -> JointFeasibilityIdentity:
+    if not isinstance(hello, Mapping):
+        raise ContractError("MM hello identity must be an object")
+    return parse_joint_feasibility_identity(hello.get("joint_feasibility"))
+
+
+def _joint_feasibility_payload(
+    identity: JointFeasibilityIdentity,
+) -> dict[str, object]:
+    if not isinstance(identity, JointFeasibilityIdentity):
+        raise ContractError("joint feasibility identity has the wrong type")
+    return {
+        "schema": identity.schema,
+        "frame_count": identity.frame_count,
+        "raw_safe_count": identity.raw_safe_count,
+        "raw_unsafe_count": identity.raw_unsafe_count,
+        "search_safe_count": identity.search_safe_count,
+        "joint_limit_violation_count": list(
+            identity.joint_limit_violation_count
+        ),
+        "mask_sha256": identity.mask_sha256,
+    }
 
 
 _PRELOAD_CONSUMER_TRANSCRIPT_PATH = (
@@ -658,6 +699,7 @@ def _context_manifest(
     inputs: ExternalInputs,
     context: StageAContext,
     scene_registration: Mapping[str, object] | None,
+    joint_feasibility: Mapping[str, object] | None,
     artifact_hashes: Mapping[str, str | None],
     processes: Sequence[Mapping[str, object]],
 ) -> dict[str, object]:
@@ -710,6 +752,8 @@ def _context_manifest(
     }
     if scene_registration is not None:
         manifest["scene_registration"] = dict(scene_registration)
+    if joint_feasibility is not None:
+        manifest["joint_feasibility"] = dict(joint_feasibility)
     return manifest
 
 
@@ -742,6 +786,7 @@ def _execute(
     artifact_hashes = dict(context.artifact_hashes)
     processes = [dict(value) for value in context.processes]
     scene_registration: Mapping[str, object] | None = None
+    joint_feasibility: Mapping[str, object] | None = None
     command_status = "pass"
     failure_reason: str | None = None
 
@@ -773,6 +818,18 @@ def _execute(
                             f"{artifact_name}"
                         )
                     artifact_hashes[artifact_name] = artifact_digest
+                if name == "basis_and_scene_alignment":
+                    try:
+                        feasibility_value = result.metrics[
+                            "joint_feasibility"
+                        ]
+                    except KeyError as error:
+                        raise ContractError(
+                            "basis gate lacks joint feasibility evidence"
+                        ) from error
+                    joint_feasibility = _joint_feasibility_payload(
+                        parse_joint_feasibility_identity(feasibility_value)
+                    )
             processes.extend(dict(value) for value in result.processes)
         except ContractError as error:
             result = GateResult(
@@ -859,6 +916,7 @@ def _execute(
             inputs,
             context,
             scene_registration,
+            joint_feasibility,
             artifact_hashes,
             processes,
         )
@@ -3907,6 +3965,7 @@ class DefaultStageAOperations:
             cwd=_REPOSITORY_ROOT,
         ) as client:
             hello = client.hello()
+            joint_feasibility = _joint_feasibility_from_hello(hello)
             reset = client.reset(
                 SessionConfig(
                     scene_id=FLAT_SCENE_ID,
@@ -3942,6 +4001,7 @@ class DefaultStageAOperations:
                 "initial_pelvis_quaternion": initial_pelvis,
                 "mm_hello": hello,
                 "mm_scene": reset["scene"],
+                "joint_feasibility": joint_feasibility,
             }
         )
         relative = "gates/basis_and_scene_alignment.json"
@@ -3957,6 +4017,9 @@ class DefaultStageAOperations:
                     "gear_scene_xml"
                 ],
                 "initial_qpos_sha256": initial_qpos_sha256,
+                "joint_feasibility": _joint_feasibility_payload(
+                    joint_feasibility
+                ),
                 "scene_registration_sha256": scene.output_hashes[
                     "scene_registration"
                 ],
@@ -3978,6 +4041,13 @@ class DefaultStageAOperations:
             ),
             evidence_hashes=MappingProxyType(
                 {"basis_and_scene_alignment_sha256": digest}
+            ),
+            metrics=MappingProxyType(
+                {
+                    "joint_feasibility": _joint_feasibility_payload(
+                        joint_feasibility
+                    )
+                }
             ),
             outputs=_new_outputs(bundle, before),
             scene_registration=scene_registration,
@@ -4001,6 +4071,13 @@ class DefaultStageAOperations:
         scene = state.get("scene")
         if not isinstance(scene, RegisteredScene):
             raise ContractError("flat MM replay requires the registered scene")
+        expected_joint_feasibility = state.get("joint_feasibility")
+        if not isinstance(
+            expected_joint_feasibility, JointFeasibilityIdentity
+        ):
+            raise ContractError(
+                "flat MM replay requires preflight joint feasibility identity"
+            )
         mm_server = _SONIC_ROOT / "build/mm_chunk_server"
         if not mm_server.is_file() or not os.access(mm_server, os.X_OK):
             raise CapabilityUnavailable("registered MM chunk server is unavailable")
@@ -4050,6 +4127,12 @@ class DefaultStageAOperations:
             cwd=_REPOSITORY_ROOT,
         ) as client:
             hello = client.hello()
+            run_joint_feasibility = _joint_feasibility_from_hello(hello)
+            if run_joint_feasibility != expected_joint_feasibility:
+                raise ContractError(
+                    "MM joint feasibility identity changed between "
+                    "preflight and reference run"
+                )
             reset = client.reset(
                 SessionConfig(
                     scene_id=FLAT_SCENE_ID,
@@ -4105,14 +4188,26 @@ class DefaultStageAOperations:
                     except BaseException as error:
                         if client.outstanding_candidate_id == candidate_id:
                             client.abort(candidate_id)
+                        no_safe_candidate = _is_remote_no_safe_candidate(
+                            error
+                        )
                         if (
                             isinstance(error, ContractError)
                             and "joint limit" in str(error).lower()
-                        ) or _is_remote_registered_joint_limit(error):
-                            scientific_reason = (
-                                "flat MM reference violated the registered joint "
-                                f"limits at chunk {command.chunk_index}: {error}"
-                            )
+                        ) or _is_remote_registered_joint_limit(
+                            error
+                        ) or no_safe_candidate:
+                            if no_safe_candidate:
+                                scientific_reason = (
+                                    "flat MM reference found no authenticated "
+                                    "joint-limit-safe database candidate at chunk "
+                                    f"{command.chunk_index}: {error}"
+                                )
+                            else:
+                                scientific_reason = (
+                                    "flat MM reference violated the registered joint "
+                                    f"limits at chunk {command.chunk_index}: {error}"
+                                )
                             failed_chunk = command.chunk_index
                             failure_boundary = "source_chunk"
                             break

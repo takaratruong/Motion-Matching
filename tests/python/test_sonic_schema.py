@@ -9,9 +9,11 @@ from mm_sonic.joints import load_joint_contract
 from mm_sonic.schema import (
     ContractError,
     InitialBoundary,
+    JointFeasibilityIdentity,
     SourceChunk,
     loads_exact,
     parse_initial_boundary,
+    parse_joint_feasibility_identity,
     parse_source_chunk,
 )
 
@@ -24,6 +26,134 @@ TARGET_SCHEMA = ROOT / "sonic" / "schemas" / "target_chunk_v1.schema.json"
 
 def f32(value):
     return float(np.float32(value))
+
+
+def joint_feasibility_identity():
+    violations = [0] * 29
+    for index, count in {
+        4: 20,
+        5: 938,
+        9: 4,
+        10: 14,
+        11: 52,
+        14: 12,
+        18: 13,
+        25: 10,
+    }.items():
+        violations[index] = count
+    return {
+        "schema": "g1-joint-feasibility-certificate/v1",
+        "frame_count": 459682,
+        "raw_safe_count": 458619,
+        "raw_unsafe_count": 1063,
+        "search_safe_count": 458000,
+        "joint_limit_violation_count": violations,
+        "mask_sha256": "a" * 64,
+    }
+
+
+class JointFeasibilityIdentityTests(unittest.TestCase):
+    def test_valid_real_shaped_identity_is_frozen_and_owned(self):
+        source = joint_feasibility_identity()
+        parsed = parse_joint_feasibility_identity(source)
+        self.assertEqual(
+            parsed,
+            JointFeasibilityIdentity(
+                schema="g1-joint-feasibility-certificate/v1",
+                frame_count=459682,
+                raw_safe_count=458619,
+                raw_unsafe_count=1063,
+                search_safe_count=458000,
+                joint_limit_violation_count=tuple(
+                    source["joint_limit_violation_count"]
+                ),
+                mask_sha256="a" * 64,
+            ),
+        )
+        source["joint_limit_violation_count"][5] = 0
+        self.assertEqual(parsed.joint_limit_violation_count[5], 938)
+        with self.assertRaises((AttributeError, TypeError)):
+            parsed.raw_safe_count = 0
+
+    def test_identity_requires_a_plain_dict_with_exact_keys_and_schema(self):
+        valid = joint_feasibility_identity()
+        cases = []
+        missing = dict(valid)
+        missing.pop("mask_sha256")
+        cases.append(missing)
+        extra = dict(valid)
+        extra["unknown"] = 1
+        cases.append(extra)
+        schema = dict(valid)
+        schema["schema"] = "g1-joint-feasibility-certificate/v2"
+        cases.append(schema)
+        cases.extend((MappingProxyType(valid), [], None))
+        for value in cases:
+            with self.subTest(value=value), self.assertRaises(ContractError):
+                parse_joint_feasibility_identity(value)
+
+    def test_identity_rejects_wrong_count_types_bools_and_negative_counts(self):
+        count_fields = (
+            "frame_count",
+            "raw_safe_count",
+            "raw_unsafe_count",
+            "search_safe_count",
+        )
+        for field in count_fields:
+            for value in (True, False, 1.0, "1", None, -1):
+                candidate = joint_feasibility_identity()
+                candidate[field] = value
+                with self.subTest(field=field, value=value), self.assertRaises(
+                    ContractError
+                ):
+                    parse_joint_feasibility_identity(candidate)
+
+    def test_identity_reconciles_frame_and_search_counts(self):
+        cases = (
+            ("frame_count", 459681),
+            ("raw_safe_count", 458618),
+            ("raw_unsafe_count", 1062),
+            ("search_safe_count", 0),
+            ("search_safe_count", 458620),
+        )
+        for field, value in cases:
+            candidate = joint_feasibility_identity()
+            candidate[field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(
+                ContractError
+            ):
+                parse_joint_feasibility_identity(candidate)
+
+    def test_identity_requires_exact_nonnegative_29_count_vector_and_sum(self):
+        valid = joint_feasibility_identity()
+        vectors = (
+            tuple(valid["joint_limit_violation_count"]),
+            valid["joint_limit_violation_count"][:-1],
+            valid["joint_limit_violation_count"] + [0],
+            [*valid["joint_limit_violation_count"][:5], -1, *([0] * 23)],
+            [*valid["joint_limit_violation_count"][:5], True, *([0] * 23)],
+            [*valid["joint_limit_violation_count"][:5], 1.0, *([0] * 23)],
+            [0] * 29,
+        )
+        for vector in vectors:
+            candidate = joint_feasibility_identity()
+            candidate["joint_limit_violation_count"] = vector
+            with self.subTest(vector=vector), self.assertRaises(ContractError):
+                parse_joint_feasibility_identity(candidate)
+
+    def test_identity_requires_a_lowercase_full_sha256_digest(self):
+        for value in (
+            "A" * 64,
+            "a" * 63,
+            "a" * 65,
+            "g" * 64,
+            "a" * 63 + "\n",
+            7,
+        ):
+            candidate = joint_feasibility_identity()
+            candidate["mask_sha256"] = value
+            with self.subTest(value=value), self.assertRaises(ContractError):
+                parse_joint_feasibility_identity(candidate)
 
 
 class SourceFixture:

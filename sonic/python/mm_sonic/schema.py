@@ -65,6 +65,17 @@ class SourceChunk:
     artifacts: Mapping[str, str]
 
 
+@dataclass(frozen=True)
+class JointFeasibilityIdentity:
+    schema: str
+    frame_count: int
+    raw_safe_count: int
+    raw_unsafe_count: int
+    search_safe_count: int
+    joint_limit_violation_count: tuple[int, ...]
+    mask_sha256: str
+
+
 def _object_no_duplicates(
     pairs: list[tuple[str, object]],
 ) -> dict[str, object]:
@@ -112,6 +123,12 @@ def _string(value: object, label: str, *, nonempty: bool = True) -> str:
 def _fixed_integer(value: object, expected: int, label: str) -> int:
     if type(value) is not int or value != expected:
         raise ContractError(f"{label} must equal {expected}")
+    return value
+
+
+def _nonnegative_integer(value: object, label: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ContractError(f"{label} must be a nonnegative integer")
     return value
 
 
@@ -252,6 +269,85 @@ def _sha256(value: object, label: str) -> str:
     if _SHA256.fullmatch(result) is None:
         raise ContractError(f"{label} must be a lowercase SHA-256 digest")
     return result
+
+
+def parse_joint_feasibility_identity(
+    value: object,
+) -> JointFeasibilityIdentity:
+    """Validate and own an authenticated G1 database feasibility identity."""
+
+    fields = {
+        "schema",
+        "frame_count",
+        "raw_safe_count",
+        "raw_unsafe_count",
+        "search_safe_count",
+        "joint_limit_violation_count",
+        "mask_sha256",
+    }
+    source = _exact_object(value, fields, "joint feasibility identity")
+    schema = source["schema"]
+    if (
+        type(schema) is not str
+        or schema != "g1-joint-feasibility-certificate/v1"
+    ):
+        raise ContractError(
+            "joint feasibility identity.schema must equal "
+            "g1-joint-feasibility-certificate/v1"
+        )
+    frame_count = _nonnegative_integer(
+        source["frame_count"], "joint feasibility identity.frame_count"
+    )
+    raw_safe_count = _nonnegative_integer(
+        source["raw_safe_count"],
+        "joint feasibility identity.raw_safe_count",
+    )
+    raw_unsafe_count = _nonnegative_integer(
+        source["raw_unsafe_count"],
+        "joint feasibility identity.raw_unsafe_count",
+    )
+    search_safe_count = _nonnegative_integer(
+        source["search_safe_count"],
+        "joint feasibility identity.search_safe_count",
+    )
+    if frame_count != raw_safe_count + raw_unsafe_count:
+        raise ContractError(
+            "joint feasibility identity frame count does not reconcile"
+        )
+    if search_safe_count <= 0 or search_safe_count > raw_safe_count:
+        raise ContractError(
+            "joint feasibility identity search-safe count is invalid"
+        )
+    violation_source = source["joint_limit_violation_count"]
+    if type(violation_source) is not list or len(violation_source) != _JOINT_COUNT:
+        raise ContractError(
+            "joint feasibility identity.joint_limit_violation_count "
+            f"must have length {_JOINT_COUNT}"
+        )
+    violation_count = tuple(
+        _nonnegative_integer(
+            item,
+            "joint feasibility identity.joint_limit_violation_count"
+            f"[{index}]",
+        )
+        for index, item in enumerate(violation_source)
+    )
+    if sum(violation_count) != raw_unsafe_count:
+        raise ContractError(
+            "joint feasibility identity joint-limit counts do not reconcile"
+        )
+    return JointFeasibilityIdentity(
+        schema=schema,
+        frame_count=frame_count,
+        raw_safe_count=raw_safe_count,
+        raw_unsafe_count=raw_unsafe_count,
+        search_safe_count=search_safe_count,
+        joint_limit_violation_count=violation_count,
+        mask_sha256=_sha256(
+            source["mask_sha256"],
+            "joint feasibility identity.mask_sha256",
+        ),
+    )
 
 
 def _parse_scene(value: object) -> Mapping[str, object]:

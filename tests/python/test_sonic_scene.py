@@ -74,6 +74,15 @@ def _mm_hello_identity(terrain_root):
         "coordinate_signature": index["coordinate_signature"],
         "motion_manifest_sha256": _sha256(manifest_path),
         "scene_index_sha256": _sha256(index_path),
+        "joint_feasibility": {
+            "schema": "g1-joint-feasibility-certificate/v1",
+            "frame_count": 1,
+            "raw_safe_count": 1,
+            "raw_unsafe_count": 0,
+            "search_safe_count": 1,
+            "joint_limit_violation_count": [0] * 29,
+            "mask_sha256": "a" * 64,
+        },
     }
 
 
@@ -1071,6 +1080,18 @@ class KinematicReplayTests(unittest.TestCase):
                 self.registered, bad_hello, _flat_scene_identity()
             )
 
+        malformed_feasibility = dict(hello)
+        malformed_feasibility["joint_feasibility"] = {
+            **hello["joint_feasibility"],
+            "search_safe_count": 0,
+        }
+        with self.assertRaisesRegex(SceneError, "joint feasibility"):
+            verify_mm_scene_identity(
+                self.registered,
+                malformed_feasibility,
+                _flat_scene_identity(),
+            )
+
     def test_replay_reauthenticates_every_registered_dependency(self):
         cases = (
             (
@@ -1390,7 +1411,12 @@ class RealTerrainServerIdentityTests(unittest.TestCase):
         )
         responses = self._exchange_resets(scenes)
         self.assertTrue(all(response["ok"] for response in responses), responses)
-        for name, value in _mm_hello_identity(self.terrain_root).items():
+        for name in (
+            "coordinate_signature",
+            "motion_manifest_sha256",
+            "scene_index_sha256",
+        ):
+            value = _mm_hello_identity(self.terrain_root)[name]
             self.assertEqual(responses[0]["data"].get(name), value)
         for index, (scene_id, route_id) in enumerate(scenes):
             actual = responses[index + 1]["data"]["scene"]
