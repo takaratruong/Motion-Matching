@@ -783,7 +783,7 @@ Make, and raylib for the final native visualization only.
   value one-to-one (`None` through `AllSlotsBlocked`); target/runtime/arrival
   reasons are created only by their owning assist checks.
 
-- [ ] **Step 1: Replace old fixture expectations with a failing one-slot begin test**
+- [x] **Step 1: Replace old fixture expectations with a failing one-slot begin test**
 
   Build a target with three slots arranged so deterministic selection picks slot
   ID `9`. Pass the same target as the post-step observation and assert `begin`:
