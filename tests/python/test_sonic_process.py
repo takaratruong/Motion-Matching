@@ -2249,11 +2249,10 @@ class GearProcessTests(TemporaryScriptCase):
         gear.start()
         gear.stop_group()
         calls = []
+        gear._stopped_member_pids = (gear.pid, gear.pid + 1)
 
-        def synthetic_states(_pgid):
+        def synthetic_member_states(_pgid, _pids):
             calls.append(True)
-            if len(calls) == 1:
-                return {gear.pid: "T", gear.pid + 1: "T"}
             if len(calls) < 4:
                 return {gear.pid: "R", gear.pid + 1: "T"}
             return {gear.pid: "R", gear.pid + 1: "S"}
@@ -2262,7 +2261,14 @@ class GearProcessTests(TemporaryScriptCase):
             with (
                 patch(
                     "mm_sonic.process._linux_group_states",
-                    side_effect=synthetic_states,
+                    side_effect=AssertionError(
+                        "continue must not perform a process-table inventory"
+                    ),
+                ),
+                patch(
+                    "mm_sonic.process._linux_member_states",
+                    side_effect=synthetic_member_states,
+                    create=True,
                 ),
                 patch.object(gear, "_send_group_signal", return_value=True),
             ):

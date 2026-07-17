@@ -1822,6 +1822,26 @@ def _linux_group_states(pgid: int) -> dict[int, str]:
     return states
 
 
+def _linux_member_states(pgid: int, pids: Sequence[int]) -> dict[int, str]:
+    """Read only the frozen member set captured after a verified SIGSTOP."""
+
+    states: dict[int, str] = {}
+    for pid in pids:
+        try:
+            raw = (Path("/proc") / str(pid) / "stat").read_text(
+                encoding="utf-8"
+            )
+            close = raw.rfind(") ")
+            fields = raw[close + 2 :].split()
+            state = fields[0]
+            member_pgid = int(fields[2])
+        except (OSError, ValueError, IndexError):
+            continue
+        if member_pgid == pgid:
+            states[pid] = state
+    return states
+
+
 class GearProcess:
     """Official GEAR deployment wrapper with a PTY and verified process group."""
 
@@ -1986,6 +2006,8 @@ class GearProcess:
         self._wait_for_control_ready = False
         self._input_prepared = False
         self._control_active = False
+        self._stopped_member_pids: tuple[int, ...] = ()
+        self._resume_verified_after_stop = False
         self.signal_history: list[signal.Signals] = []
         self.cleanup_history: list[str] = []
         self._owned_logs_directory = owned_logs
@@ -2353,7 +2375,12 @@ class GearProcess:
             raise ProcessError(
                 "CONTROL activation requires one prepared WAIT_FOR_CONTROL epoch"
             )
-        if self.group_is_stopped():
+        leader_state = _linux_member_states(self.pgid, (self.pid,)).get(self.pid)
+        if (
+            not self._resume_verified_after_stop
+            or leader_state is None
+            or leader_state in ("T", "t")
+        ):
             raise ProcessError("CONTROL activation requires the GEAR group resumed")
         with self._output_condition:
             boundary = len(self._observed)
@@ -2525,9 +2552,17 @@ class GearProcess:
         if self._process.poll() is not None and not _linux_group_states(self._pgid):
             self.require_alive()
         self._send_group_signal(signal.SIGSTOP)
+        self._resume_verified_after_stop = False
         deadline = time.monotonic() + 2.0
-        while not self.group_is_stopped():
-            if not _linux_group_states(self._pgid):
+        while True:
+            states = _linux_group_states(self._pgid)
+            live = {
+                pid: state for pid, state in states.items() if state != "Z"
+            }
+            if live and all(state in ("T", "t") for state in live.values()):
+                self._stopped_member_pids = tuple(sorted(live))
+                break
+            if not states:
                 self.require_alive()
             if time.monotonic() >= deadline:
                 raise ProcessError(f"GEAR process group {self.pgid} did not stop")
@@ -2538,13 +2573,35 @@ class GearProcess:
 
     def continue_group(self) -> None:
         self.require_alive()
+        members = self._stopped_member_pids
+        if not members:
+            states = _linux_group_states(self.pgid)
+            live = {
+                pid: state for pid, state in states.items() if state != "Z"
+            }
+            if not live or any(
+                state not in ("T", "t") for state in live.values()
+            ):
+                raise ProcessError(
+                    "GEAR process group has no verified stopped member set"
+                )
+            members = tuple(sorted(live))
+            self._stopped_member_pids = members
         self._send_group_signal(signal.SIGCONT)
         deadline = time.monotonic() + 2.0
-        while not self.group_is_resumed():
+        while True:
+            states = _linux_member_states(self.pgid, members)
+            leader_state = states.get(self.pid)
+            if leader_state is not None and all(
+                state not in ("T", "t") for state in states.values()
+            ):
+                break
             self.require_alive()
             if time.monotonic() >= deadline:
                 raise ProcessError(f"GEAR process group {self.pgid} did not continue")
             time.sleep(self._signal_poll_s)
+        self._stopped_member_pids = ()
+        self._resume_verified_after_stop = True
 
     def _group_exists(self) -> bool:
         if self._pgid is None:
