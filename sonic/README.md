@@ -22,6 +22,14 @@ PYTHONPATH=sonic/python sonic/.venv/bin/python -m unittest \
   tests.python.test_sonic_external -v
 ```
 
+The `integration` extra installs the three pinned upstream runtime dependencies
+(`scipy==1.15.3`, `PyYAML==6.0.3`, `cyclonedds==0.10.2`) alongside `mujoco` and
+`pyzmq`. It intentionally does **not** declare a PyPI `unitree_sdk2py`: the
+pinned Unitree Python SDK is resolved from
+`external_dependencies/unitree_sdk2_python` inside the authenticated
+`--gear-checkout`, so callers never supply a Unitree `PYTHONPATH` and the
+checkout is never mutated.
+
 ## Stage A integration gate
 
 The Stage A CLI is non-interactive. All external inputs and the isolated output

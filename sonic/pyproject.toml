@@ -19,6 +19,9 @@ test = [
 integration = [
   "mujoco",
   "pyzmq",
+  "scipy==1.15.3",
+  "PyYAML==6.0.3",
+  "cyclonedds==0.10.2",
 ]
 
 [tool.setuptools]

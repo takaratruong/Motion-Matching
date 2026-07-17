@@ -587,38 +587,129 @@ def _verified_checkout(path: str | Path) -> Path:
     return checkout
 
 
+def _require_module_origin(
+    module: object,
+    *,
+    base: Path,
+    label: str,
+) -> None:
+    origin_text = getattr(module, "__file__", None)
+    search_locations = getattr(module, "__path__", None)
+    has_origin = type(origin_text) is str and bool(origin_text)
+    if not has_origin and origin_text is not None:
+        raise ProtocolError(f"{label} module origin is unavailable")
+    if has_origin:
+        try:
+            origin = Path(origin_text).resolve(strict=True)
+            origin.relative_to(base)
+        except (OSError, ValueError) as error:
+            raise ProtocolError(
+                f"{label} module origin is outside {base}: {origin_text}"
+            ) from error
+    if search_locations is None:
+        if not has_origin:
+            raise ProtocolError(f"{label} module origin is unavailable")
+        return
+    try:
+        locations = tuple(search_locations)
+    except TypeError as error:
+        raise ProtocolError(f"{label} package search path is invalid") from error
+    if not locations and not has_origin:
+        raise ProtocolError(f"{label} package search path is unavailable")
+    for location_text in locations:
+        if type(location_text) is not str or not location_text:
+            raise ProtocolError(f"{label} package search path is invalid")
+        try:
+            location = Path(location_text).resolve(strict=True)
+            location.relative_to(base)
+        except (OSError, ValueError) as error:
+            raise ProtocolError(
+                f"{label} package search path is outside {base}: {location_text}"
+            ) from error
+
+
+def _require_unitree_origins(unitree_source: Path) -> None:
+    names = sorted(
+        name
+        for name in sys.modules
+        if name == "unitree_sdk2py" or name.startswith("unitree_sdk2py.")
+    )
+    if "unitree_sdk2py" not in names:
+        raise ProtocolError("unitree_sdk2py module origin is unavailable")
+    for name in names:
+        _require_module_origin(
+            sys.modules.get(name),
+            base=unitree_source,
+            label=name,
+        )
+
+
 def _require_class_origin(
     cls: type,
     *,
     checkout: Path,
     label: str,
 ) -> None:
-    module = sys.modules.get(cls.__module__)
-    origin_text = None if module is None else getattr(module, "__file__", None)
-    if type(origin_text) is not str or not origin_text:
-        raise ProtocolError(f"{label} module origin is unavailable")
-    try:
-        origin = Path(origin_text).resolve(strict=True)
-        origin.relative_to(checkout)
-    except (OSError, ValueError) as error:
+    _require_module_origin(
+        sys.modules.get(cls.__module__),
+        base=checkout,
+        label=label,
+    )
+
+
+def _resolve_unitree_source(checkout: Path) -> Path:
+    """Locate the pinned Unitree Python package inside the verified checkout.
+
+    The source must be a real in-checkout directory: an escaping symlink is
+    rejected rather than followed, and the package directory itself must exist.
+    """
+
+    source = checkout / "external_dependencies" / "unitree_sdk2_python"
+    if source.is_symlink():
         raise ProtocolError(
-            f"{label} module origin is outside verified checkout: {origin_text}"
+            f"unitree source must be a real directory, not a symlink: {source}"
+        )
+    if not source.is_dir():
+        raise ProtocolError(f"unitree source directory is missing: {source}")
+    resolved = source.resolve(strict=True)
+    try:
+        resolved.relative_to(checkout)
+    except ValueError as error:
+        raise ProtocolError(
+            f"unitree source escapes verified checkout: {source}"
         ) from error
+    package = resolved / "unitree_sdk2py"
+    if package.is_symlink() or not package.is_dir():
+        raise ProtocolError(
+            f"unitree source lacks the unitree_sdk2py package: {package}"
+        )
+    return resolved
 
 
 def load_external_bindings(gear_checkout: str | Path) -> _ExternalBindings:
     """Resolve the pinned external imports without constructing a simulator."""
 
     checkout = _verified_checkout(gear_checkout)
+    unitree_source = _resolve_unitree_source(checkout)
     checkout_text = str(checkout)
-    while checkout_text in sys.path:
-        sys.path.remove(checkout_text)
+    unitree_text = str(unitree_source)
+    for entry in (checkout_text, unitree_text):
+        while entry in sys.path:
+            sys.path.remove(entry)
+    sys.path.insert(0, unitree_text)
     sys.path.insert(0, checkout_text)
     previous_dont_write_bytecode = sys.dont_write_bytecode
     sys.dont_write_bytecode = True
     try:
+        import unitree_sdk2py
+
+        # Authenticate the complete cached namespace before importing GEAR:
+        # BaseSimulator imports Unitree children at module load time and must
+        # never observe a shadow module.
+        _require_unitree_origins(unitree_source)
         from gear_sonic.utils.mujoco_sim.base_sim import BaseSimulator
         from gear_sonic.utils.mujoco_sim.configs import SimLoopConfig
+        _require_unitree_origins(unitree_source)
         import mujoco
     finally:
         sys.dont_write_bytecode = previous_dont_write_bytecode

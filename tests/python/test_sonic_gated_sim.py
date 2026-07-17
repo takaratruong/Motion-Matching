@@ -485,20 +485,32 @@ class ExternalGearBackendBoundaryTests(unittest.TestCase):
         self.assertEqual(mujoco.forward_calls, 1)
 
 
+def _external_module_names():
+    return tuple(
+        name
+        for name in sys.modules
+        if name in ("gear_sonic", "unitree_sdk2py")
+        or name.startswith("gear_sonic.")
+        or name.startswith("unitree_sdk2py.")
+    )
+
+
 class ExternalCheckoutProvenanceTests(unittest.TestCase):
-    def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
-        self.checkout = self.root / "gear"
-        package = self.checkout / "gear_sonic" / "utils" / "mujoco_sim"
+    def _seed_gear(self, checkout):
+        package = checkout / "gear_sonic" / "utils" / "mujoco_sim"
         package.mkdir(parents=True)
         for init in (
-            self.checkout / "gear_sonic" / "__init__.py",
-            self.checkout / "gear_sonic" / "utils" / "__init__.py",
+            checkout / "gear_sonic" / "__init__.py",
+            checkout / "gear_sonic" / "utils" / "__init__.py",
             package / "__init__.py",
         ):
             init.write_text("", encoding="utf-8")
         (package / "base_sim.py").write_text(
+            "import unitree_sdk2py\n"
+            "import unitree_sdk2py.b2\n"
+            "import unitree_sdk2py.core.channel as channel\n"
+            "unitree_sdk2py.GEAR_IMPORT_OBSERVED = True\n"
+            "channel.GEAR_IMPORT_OBSERVED = True\n"
             "class BaseSimulator:\n    pass\n",
             encoding="utf-8",
         )
@@ -506,12 +518,30 @@ class ExternalCheckoutProvenanceTests(unittest.TestCase):
             "class SimLoopConfig:\n    pass\n",
             encoding="utf-8",
         )
-        subprocess.run(["git", "init", "-q", str(self.checkout)], check=True)
+
+    def _seed_unitree(self, source_dir):
+        package = source_dir / "unitree_sdk2py"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text(
+            "VERSION = 'synthetic'\n", encoding="utf-8"
+        )
+        core = package / "core"
+        core.mkdir()
+        (core / "__init__.py").write_text("", encoding="utf-8")
+        (core / "channel.py").write_text(
+            "VERSION = 'synthetic-channel'\n", encoding="utf-8"
+        )
+        # Match the pinned SDK's implicit namespace package layout.
+        (package / "b2").mkdir()
+        return package
+
+    def _commit(self, checkout):
+        subprocess.run(["git", "init", "-q", str(checkout)], check=True)
         subprocess.run(
             [
                 "git",
                 "-C",
-                str(self.checkout),
+                str(checkout),
                 "config",
                 "user.email",
                 "test@example.com",
@@ -519,36 +549,42 @@ class ExternalCheckoutProvenanceTests(unittest.TestCase):
             check=True,
         )
         subprocess.run(
-            ["git", "-C", str(self.checkout), "config", "user.name", "Test"],
+            ["git", "-C", str(checkout), "config", "user.name", "Test"],
             check=True,
         )
+        subprocess.run(["git", "-C", str(checkout), "add", "."], check=True)
         subprocess.run(
-            ["git", "-C", str(self.checkout), "add", "."],
+            ["git", "-C", str(checkout), "commit", "-qm", "synthetic"],
             check=True,
         )
-        subprocess.run(
-            ["git", "-C", str(self.checkout), "commit", "-qm", "synthetic"],
-            check=True,
-        )
-        self.commit = subprocess.check_output(
-            ["git", "-C", str(self.checkout), "rev-parse", "HEAD"],
+        return subprocess.check_output(
+            ["git", "-C", str(checkout), "rev-parse", "HEAD"],
             text=True,
         ).strip()
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.checkout = self.root / "gear"
+        self.checkout.mkdir()
+        self._seed_gear(self.checkout)
+        self._seed_unitree(
+            self.checkout / "external_dependencies" / "unitree_sdk2_python"
+        )
+        self.commit = self._commit(self.checkout)
         self.saved_modules = {
-            name: module
-            for name, module in sys.modules.items()
-            if name == "gear_sonic" or name.startswith("gear_sonic.")
+            name: sys.modules[name] for name in _external_module_names()
         }
         for name in self.saved_modules:
             sys.modules.pop(name, None)
 
     def tearDown(self):
-        for name in tuple(sys.modules):
-            if name == "gear_sonic" or name.startswith("gear_sonic."):
-                sys.modules.pop(name, None)
+        for name in _external_module_names():
+            sys.modules.pop(name, None)
         sys.modules.update(self.saved_modules)
-        while str(self.checkout) in sys.path:
-            sys.path.remove(str(self.checkout))
+        for entry in tuple(sys.path):
+            if entry.startswith(str(self.root)):
+                sys.path.remove(entry)
         self.temporary.cleanup()
 
     def test_checkout_must_be_clean_including_untracked_files(self):
@@ -575,6 +611,98 @@ class ExternalCheckoutProvenanceTests(unittest.TestCase):
             sys.modules[module_name] = shadow
             with self.assertRaisesRegex(ProtocolError, "origin"):
                 gated_sim.load_external_bindings(self.checkout)
+
+    def test_unitree_source_is_resolved_from_pinned_checkout_without_caller_path(self):
+        unitree_source = str(
+            self.checkout / "external_dependencies" / "unitree_sdk2_python"
+        )
+        # The isolated caller supplies no Unitree Python path of its own.
+        self.assertNotIn(unitree_source, sys.path)
+        self.assertNotIn("unitree_sdk2py", sys.modules)
+
+        with patch.object(gated_sim, "PINNED_GEAR_COMMIT", self.commit):
+            bindings = gated_sim.load_external_bindings(self.checkout)
+
+        unitree = sys.modules["unitree_sdk2py"]
+        origin = Path(unitree.__file__).resolve()
+        expected = (
+            self.checkout
+            / "external_dependencies"
+            / "unitree_sdk2_python"
+            / "unitree_sdk2py"
+            / "__init__.py"
+        ).resolve()
+        self.assertEqual(origin, expected)
+        self.assertEqual(bindings.checkout, self.checkout.resolve())
+
+    def test_missing_unitree_source_directory_is_rejected(self):
+        checkout = self.root / "gear_no_unitree"
+        checkout.mkdir()
+        self._seed_gear(checkout)
+        commit = self._commit(checkout)
+        with patch.object(gated_sim, "PINNED_GEAR_COMMIT", commit):
+            with self.assertRaisesRegex(ProtocolError, "unitree"):
+                gated_sim.load_external_bindings(checkout)
+
+    def test_escaping_symlink_unitree_source_is_rejected(self):
+        checkout = self.root / "gear_symlinked_unitree"
+        checkout.mkdir()
+        self._seed_gear(checkout)
+        outside = self.root / "outside_unitree"
+        self._seed_unitree(outside)
+        source = checkout / "external_dependencies" / "unitree_sdk2_python"
+        source.parent.mkdir(parents=True)
+        # Commit an escaping symlink; validation must refuse to follow it.
+        source.symlink_to(outside, target_is_directory=True)
+        commit = self._commit(checkout)
+        with patch.object(gated_sim, "PINNED_GEAR_COMMIT", commit):
+            with self.assertRaisesRegex(ProtocolError, "symlink"):
+                gated_sim.load_external_bindings(checkout)
+
+    def test_wrong_origin_unitree_module_is_rejected(self):
+        with patch.object(gated_sim, "PINNED_GEAR_COMMIT", self.commit):
+            outside = self.root / "shadow_unitree"
+            outside.mkdir()
+            shadow_file = outside / "__init__.py"
+            shadow_file.write_text("", encoding="utf-8")
+            shadow = types.ModuleType("unitree_sdk2py")
+            shadow.__file__ = str(shadow_file)
+            sys.modules["unitree_sdk2py"] = shadow
+            with self.assertRaisesRegex(ProtocolError, "origin"):
+                gated_sim.load_external_bindings(self.checkout)
+            self.assertFalse(hasattr(shadow, "GEAR_IMPORT_OBSERVED"))
+
+    def test_wrong_origin_cached_unitree_child_is_rejected_before_gear_import(self):
+        unitree_source = str(
+            self.checkout / "external_dependencies" / "unitree_sdk2_python"
+        )
+        sys.path.insert(0, unitree_source)
+        try:
+            __import__("unitree_sdk2py")
+        finally:
+            sys.path.remove(unitree_source)
+        pinned_root = sys.modules["unitree_sdk2py"]
+
+        outside = self.root / "shadow_unitree" / "core"
+        outside.mkdir(parents=True)
+        core_file = outside / "__init__.py"
+        channel_file = outside / "channel.py"
+        core_file.write_text("", encoding="utf-8")
+        channel_file.write_text("", encoding="utf-8")
+        shadow_core = types.ModuleType("unitree_sdk2py.core")
+        shadow_core.__file__ = str(core_file)
+        shadow_core.__path__ = [str(outside)]
+        shadow_channel = types.ModuleType("unitree_sdk2py.core.channel")
+        shadow_channel.__file__ = str(channel_file)
+        sys.modules["unitree_sdk2py.core"] = shadow_core
+        sys.modules["unitree_sdk2py.core.channel"] = shadow_channel
+        pinned_root.core = shadow_core
+        shadow_core.channel = shadow_channel
+
+        with patch.object(gated_sim, "PINNED_GEAR_COMMIT", self.commit):
+            with self.assertRaisesRegex(ProtocolError, "origin"):
+                gated_sim.load_external_bindings(self.checkout)
+        self.assertFalse(hasattr(shadow_channel, "GEAR_IMPORT_OBSERVED"))
 
 
 if __name__ == "__main__":
