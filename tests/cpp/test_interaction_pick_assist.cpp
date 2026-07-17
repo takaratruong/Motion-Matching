@@ -112,6 +112,18 @@ interaction::PickAssistStart make_frozen_slot_start(
     return start;
 }
 
+struct FrozenSlotScenario {
+    interaction::InteractionTarget target = make_frozen_slot_target();
+    interaction::PickAssistStart start = make_frozen_slot_start(target);
+    interaction::PickAssistObservation observation{};
+
+    FrozenSlotScenario() {
+        start.root_world = {vec3(-0.80F, 0.0F, 0.50F), quat()};
+        observation.target = &target;
+        observation.displayed_root = start.root_world;
+    }
+};
+
 struct Scenario {
     interaction::InteractionTarget target = make_target();
     interaction::PickAssistStart start{};
@@ -254,32 +266,31 @@ void test_begin_selects_and_freezes_one_authored_slot() {
         "begin route did not retain selected-slot provenance");
 }
 
-void test_slot_approach_observe_is_inert_before_legacy_preflight() {
-    const interaction::InteractionTarget target = make_frozen_slot_target();
-    const interaction::PickAssistStart start = make_frozen_slot_start(target);
+void test_slot_approach_emits_far_camera_relative_steering() {
+    FrozenSlotScenario scenario;
     interaction::ControllerPickAssist assist;
 
-    require(assist.begin(start, &target), "SlotApproach begin failed");
-    interaction::PickAssistObservation invalid_observation{};
-    invalid_observation.runtime_state = interaction::RuntimeState::Preflight;
+    require(
+        assist.begin(scenario.start, &scenario.target),
+        "far-approach begin failed");
+    require(
+        assist.diagnostics().slot_selection.selected_index.has_value(),
+        "far-approach begin did not retain its selected index");
+    const interaction::MappedPickSlot frozen_slot =
+        assist.diagnostics().slot_selection.ordered[
+            *assist.diagnostics().slot_selection.selected_index];
+    require(
+        frozen_slot.id == 9U && frozen_slot.route_length_m == 0.80F,
+        "far-approach fixture did not select the exact 0.80 m slot");
 
     const interaction::PickAssistOutput output =
-        assist.observe(invalid_observation);
+        assist.observe(scenario.observation);
     require(
-        !output.override_steering && is_zero(output.left_stick) &&
-            is_zero(output.right_stick) && !output.force_strafe &&
-            !output.stationary_constraint && !output.needs_preview &&
-            !output.submit_interact,
-        "SlotApproach processed an invalid legacy observation");
-    require(
-        assist.diagnostics().state ==
-                interaction::PickAssistState::SlotApproach &&
-            assist.diagnostics().reason == interaction::PickAssistReason::None,
-        "invalid legacy observation changed SlotApproach diagnostics");
-    require(assist.active() && assist.owns_manual_interact(),
-        "inert SlotApproach observation released ownership");
-    require(!assist.take_submission(1U).has_value(),
-        "inert SlotApproach observation produced a submission");
+        output.override_steering &&
+            output.left_stick.x == 1.0F &&
+            output.left_stick.y == 0.0F &&
+            output.left_stick.z == 0.0F,
+        "far SlotApproach did not emit ordinary camera-relative steering");
 }
 
 void require_frozen_slot_begin_failure(
@@ -1552,7 +1563,7 @@ int main() {
     try {
         test_idle_does_not_override_input();
         test_begin_selects_and_freezes_one_authored_slot();
-        test_slot_approach_observe_is_inert_before_legacy_preflight();
+        test_slot_approach_emits_far_camera_relative_steering();
         test_begin_maps_every_aggregate_no_winner_reason();
         test_slot_reason_mapping_is_exhaustive_and_same_named();
         test_failed_begin_can_immediately_begin_a_valid_attempt();
