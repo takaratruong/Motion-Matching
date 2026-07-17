@@ -2915,58 +2915,74 @@ static inline bool g1_frame_rejection_matches_scratch_transaction(
     const G1FrameRejectionDiagnostic& rejection,
     const G1FrameTransactionScratch& scratch)
 {
-    if (rejection.attempted_footprint_available &&
+    if (rejection.footprint_status != scratch.footprint_status ||
         !g1_frame_footprint_equal(
             rejection.attempted_footprint,
             scratch.footprint)) {
         return false;
     }
-    if (!rejection.attempted_ik_available) return true;
 
-    const G1FrameBranchCertificateScratch* certificate = nullptr;
-    if (scratch.rejection_branch == G1FrameCertificateRaw) {
-        certificate = &scratch.raw_certificate;
-    } else if (scratch.rejection_branch == G1FrameCertificateIk) {
-        certificate = &scratch.ik_certificate;
-    } else {
-        return false;
-    }
-
-    G1IkRejectionCheckpoint checkpoint =
-        G1IkRejectionAfterBegin;
-    if (certificate->ik_transaction.next_foot == 0U) {
-        if (rejection.stage != G1FrameRejectLandingPatch) {
+    if (rejection.attempted_ik_available) {
+        if (scratch.rejection_branch != G1FrameCertificateIk) {
             return false;
         }
-    } else if (certificate->ik_transaction.next_foot == 1U) {
-        if (rejection.stage != G1FrameRejectIkCandidate) {
+        const G1IkFrameTransaction& transaction =
+            scratch.ik_certificate.ik_transaction;
+        G1IkRejectionCheckpoint checkpoint =
+            G1IkRejectionAfterBegin;
+        if (transaction.next_foot == 0U) {
+            if (rejection.stage != G1FrameRejectLandingPatch) {
+                return false;
+            }
+        } else if (transaction.next_foot == 1U) {
+            if (rejection.stage != G1FrameRejectIkCandidate) {
+                return false;
+            }
+            checkpoint = G1IkRejectionAfterFoot0;
+        } else if (transaction.next_foot == 2U) {
+            if (rejection.stage != G1FrameRejectIkCandidate) {
+                return false;
+            }
+            checkpoint = G1IkRejectionAfterFoot1;
+        } else {
             return false;
         }
-        checkpoint = G1IkRejectionAfterFoot0;
-    } else if (certificate->ik_transaction.next_foot == 2U) {
-        if (rejection.stage != G1FrameRejectIkCandidate) {
+
+        G1IkFrameResult derived;
+        if (!g1_ik_frame_rejection_snapshot(
+                derived,
+                transaction,
+                checkpoint,
+                nullptr,
+                0) ||
+            !g1_frame_ik_result_equal(
+                derived, rejection.ik_frame)) {
             return false;
         }
-        checkpoint = G1IkRejectionAfterFoot1;
-    } else {
-        return false;
     }
 
-    G1IkFrameResult derived;
-    if (!g1_ik_frame_rejection_snapshot(
-               derived,
-               certificate->ik_transaction,
-               checkpoint,
-               nullptr,
-               0) ||
-        !g1_frame_ik_result_equal(derived, rejection.ik_frame)) {
-        return false;
-    }
-    return !rejection.attempted_pose_available ||
-           (rejection.pose_status == certificate->pose_status &&
-            g1_controller_state_pose_clearance_equal(
+    if (rejection.stage == G1FrameRejectPoseCertificate) {
+        const G1FrameBranchCertificateScratch* certificate = nullptr;
+        if (scratch.rejection_branch == G1FrameCertificateRaw) {
+            certificate = &scratch.raw_certificate;
+        } else if (scratch.rejection_branch == G1FrameCertificateIk) {
+            certificate = &scratch.ik_certificate;
+        } else {
+            return false;
+        }
+        if (rejection.pose_status != certificate->pose_status ||
+            !g1_controller_state_pose_clearance_equal(
                 rejection.pose_clearance,
-                certificate->pose_clearance));
+                certificate->pose_clearance)) {
+            return false;
+        }
+    } else if (rejection.attempted_pose_available) {
+        return false;
+    } else if (!rejection.attempted_ik_available &&
+               scratch.rejection_branch != G1FrameCertificateNone) {
+        return false;
+    }
+    return true;
 }
 
 static inline bool g1_frame_publish_finite_rejection(
@@ -3020,8 +3036,44 @@ static inline bool g1_frame_success_ik_matches_producer(
                result, transaction.candidate_result);
 }
 
+static inline bool g1_frame_public_pose_arrays_equal(
+    const g1_controller_state& first,
+    const g1_controller_state& second)
+{
+    return g1_frame_array_values_equal(
+               first.ik_bone_positions,
+               second.ik_bone_positions) &&
+           g1_frame_array_values_equal(
+               first.ik_bone_rotations,
+               second.ik_bone_rotations) &&
+           g1_frame_array_values_equal(
+               first.ik_global_bone_positions,
+               second.ik_global_bone_positions) &&
+           g1_frame_array_values_equal(
+               first.ik_global_bone_rotations,
+               second.ik_global_bone_rotations) &&
+           g1_frame_array_values_equal(
+               first.ik_candidate_bone_positions,
+               second.ik_candidate_bone_positions) &&
+           g1_frame_array_values_equal(
+               first.ik_candidate_bone_rotations,
+               second.ik_candidate_bone_rotations) &&
+           g1_frame_array_values_equal(
+               first.ik_candidate_global_bone_positions,
+               second.ik_candidate_global_bone_positions) &&
+           g1_frame_array_values_equal(
+               first.ik_candidate_global_bone_rotations,
+               second.ik_candidate_global_bone_rotations);
+}
+
+static inline bool g1_frame_branch_certificate_matches_state(
+    const g1_controller_state& state,
+    const G1FrameBranchCertificateScratch& certificate);
+
 static inline bool g1_frame_success_candidates_are_valid(
     const g1_controller_state& working_state,
+    const g1_controller_state& raw_state,
+    const g1_controller_state& ik_state,
     const G1FrameTransactionScratch& scratch,
     const G1FrameExternalInputs& external,
     G1FramePublication& publication,
@@ -3031,7 +3083,18 @@ static inline bool g1_frame_success_candidates_are_valid(
         external.tuning.ik_enabled
             ? scratch.ik_certificate
             : scratch.raw_certificate;
+    const g1_controller_state& visible_state =
+        external.tuning.ik_enabled ? ik_state : raw_state;
     if (!g1_controller_state_is_valid(working_state) ||
+        !g1_frame_branch_certificate_matches_state(
+            raw_state, scratch.raw_certificate) ||
+        !g1_frame_branch_certificate_matches_state(
+            ik_state, scratch.ik_certificate) ||
+        !g1_frame_success_iteration_provenance_is_valid(
+            scratch.ik_certificate.ik_transaction.candidate_result) ||
+        !g1_frame_success_ik_matches_producer(
+            scratch.ik_certificate.ik_transaction.candidate_result,
+            scratch.ik_certificate.ik_transaction) ||
         !g1_frame_success_iteration_provenance_is_valid(
             working_state.ik_frame) ||
         !g1_frame_success_ik_matches_producer(
@@ -3040,6 +3103,11 @@ static inline bool g1_frame_success_candidates_are_valid(
         !g1_frame_ik_state_equal(
             working_state.ik,
             scratch.ik_certificate.ik_transaction.candidate_state) ||
+        (!external.tuning.ik_enabled &&
+         !g1_frame_ik_result_is_canonical(
+             working_state.ik_frame)) ||
+        !g1_frame_public_pose_arrays_equal(
+            working_state, visible_state) ||
         visible_certificate.pose_status != G1ClearanceOk ||
         !g1_controller_state_pose_clearance_equal(
             working_state.ik_clearance,
@@ -3690,6 +3758,31 @@ static inline G1FrameTransactionStatus g1_frame_transaction_run(
     G1FrameTransactionScratch prefix_scratch;
     prefix_scratch.prior_safe_stop_latched =
         runtime.publication.ik_safe_stop_latched;
+    G1FrameTransactionScratch first_failure_scratch;
+    bool first_failure_available = false;
+    const auto retain_first_failure =
+        [&](const G1FrameTransactionScratch& scratch) -> bool {
+            if (!g1_frame_candidate_failure_is_authentic(scratch)) {
+                return false;
+            }
+            if (!first_failure_available) {
+                first_failure_scratch = scratch;
+                first_failure_available = true;
+            }
+            return true;
+        };
+    const auto publish_first_failure =
+        [&]() -> G1FrameTransactionStatus {
+            if (!first_failure_available ||
+                !g1_frame_publish_finite_rejection(
+                    runtime,
+                    first_failure_scratch,
+                    external,
+                    true)) {
+                return G1FrameTransactionGlobalError;
+            }
+            return G1FrameTransactionFiniteRejected;
+        };
     for (int stage_index = G1FrameStageInputRouteCommand;
          stage_index <= G1FrameStageMatcherSearch;
          ++stage_index) {
@@ -3705,16 +3798,10 @@ static inline G1FrameTransactionStatus g1_frame_transaction_run(
             error,
             error_capacity);
         if (outcome == G1FrameStageFiniteReject) {
-            if (!g1_frame_candidate_failure_is_authentic(
-                    prefix_scratch) ||
-                !g1_frame_publish_finite_rejection(
-                    runtime,
-                    prefix_scratch,
-                    external,
-                    true)) {
+            if (!retain_first_failure(prefix_scratch)) {
                 return G1FrameTransactionGlobalError;
             }
-            return G1FrameTransactionFiniteRejected;
+            return publish_first_failure();
         }
         if (outcome != G1FrameStageContinue) {
             return G1FrameTransactionGlobalError;
@@ -3772,8 +3859,6 @@ static inline G1FrameTransactionStatus g1_frame_transaction_run(
         return G1FrameTransactionGlobalError;
     }
 
-    bool first_failure_available = false;
-    G1FrameTransactionScratch first_failure_scratch;
     G1FrameTransactionScratch candidate_scratch;
 
     const auto evaluate_record =
@@ -3808,13 +3893,8 @@ static inline G1FrameTransactionStatus g1_frame_transaction_run(
                     error,
                     error_capacity);
             if (outcome == G1CandidateFiniteRejected) {
-                if (!g1_frame_candidate_failure_is_authentic(
-                        candidate_scratch)) {
+                if (!retain_first_failure(candidate_scratch)) {
                     return G1CandidateGlobalError;
-                }
-                if (!first_failure_available) {
-                    first_failure_scratch = candidate_scratch;
-                    first_failure_available = true;
                 }
             }
             return outcome;
@@ -3849,22 +3929,10 @@ static inline G1FrameTransactionStatus g1_frame_transaction_run(
                     error,
                     error_capacity);
             if (finalize_outcome == G1FrameStageFiniteReject) {
-                if (!g1_frame_candidate_failure_is_authentic(
-                        candidate_scratch)) {
+                if (!retain_first_failure(candidate_scratch)) {
                     return G1FrameTransactionGlobalError;
                 }
-                if (!first_failure_available) {
-                    first_failure_scratch = candidate_scratch;
-                    first_failure_available = true;
-                }
-                if (!g1_frame_publish_finite_rejection(
-                        runtime,
-                        first_failure_scratch,
-                        external,
-                        true)) {
-                    return G1FrameTransactionGlobalError;
-                }
-                return G1FrameTransactionFiniteRejected;
+                return publish_first_failure();
             }
             if (finalize_outcome != G1FrameStageContinue) {
                 return G1FrameTransactionGlobalError;
@@ -3874,6 +3942,8 @@ static inline G1FrameTransactionStatus g1_frame_transaction_run(
             G1FrameAcceptedDiagnostic accepted_diagnostic_candidate;
             if (!g1_frame_success_candidates_are_valid(
                     runtime.working_state,
+                    runtime.candidates.raw_state,
+                    runtime.candidates.ik_state,
                     candidate_scratch,
                     external,
                     publication_candidate,
@@ -3906,14 +3976,7 @@ static inline G1FrameTransactionStatus g1_frame_transaction_run(
     }
 
     if (!matching_scheduled) {
-        if (!g1_frame_publish_finite_rejection(
-                runtime,
-                first_failure_scratch,
-                external,
-                true)) {
-            return G1FrameTransactionGlobalError;
-        }
-        return G1FrameTransactionFiniteRejected;
+        return publish_first_failure();
     }
 
     const G1RecoveryRequest& recovery_request =
@@ -3980,15 +4043,7 @@ static inline G1FrameTransactionStatus g1_frame_transaction_run(
         }
     }
 
-    if (!first_failure_available ||
-        !g1_frame_publish_finite_rejection(
-            runtime,
-            first_failure_scratch,
-            external,
-            true)) {
-        return G1FrameTransactionGlobalError;
-    }
-    return G1FrameTransactionFiniteRejected;
+    return publish_first_failure();
 }
 static inline bool g1_frame_runtime_reset(
     G1FrameRuntime& output,

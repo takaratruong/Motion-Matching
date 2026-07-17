@@ -8,7 +8,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <limits>
+#include <string>
 #include <type_traits>
 #include <utility>
 
@@ -1544,6 +1547,16 @@ static G1FrameRejectionDiagnostic finite_rejection()
     return rejection;
 }
 
+static void install_finite_rejection(
+    G1FrameTransactionScratch& scratch,
+    const G1FrameRejectionDiagnostic& rejection)
+{
+    scratch.footprint_status = rejection.footprint_status;
+    scratch.footprint = rejection.attempted_footprint;
+    scratch.rejection_branch = G1FrameCertificateNone;
+    scratch.rejection = rejection;
+}
+
 static motion_match_pose_diagnostic pose_diagnostic(float base)
 {
     motion_match_pose_diagnostic value;
@@ -1794,6 +1807,9 @@ static G1FrameStageOutcome test_runner(
     }
     if (stage == G1FrameStageRawFinalFk ||
         stage == G1FrameStageIkFinalFk) {
+        if (stage == G1FrameStageRawFinalFk) {
+            state.ik_frame = G1IkFrameResult{};
+        }
         G1FrameBranchCertificateScratch& certificate =
             stage == G1FrameStageRawFinalFk
                 ? scratch.raw_certificate
@@ -1828,7 +1844,7 @@ static G1FrameStageOutcome test_runner(
 
     if (stage == trace.runner_outcome_stage) {
         if (trace.runner_outcome == G1FrameStageFiniteReject) {
-            scratch.rejection = finite_rejection();
+            install_finite_rejection(scratch, finite_rejection());
         }
         return trace.runner_outcome;
     }
@@ -1860,12 +1876,12 @@ static G1FrameStageOutcome hostile_runner(
             return G1FrameStageFiniteReject;
         }
         if (trace.hostile_mode == HostileRunnerMalformedRejection) {
-            scratch.rejection = finite_rejection();
+            install_finite_rejection(scratch, finite_rejection());
             scratch.rejection.stage = G1FrameRejectNone;
             return G1FrameStageFiniteReject;
         }
         if (trace.hostile_mode == HostileRunnerNoncanonicalRejection) {
-            scratch.rejection = finite_rejection();
+            install_finite_rejection(scratch, finite_rejection());
             scratch.rejection.attempted_footprint.root_surface.height = 1.0f;
             return G1FrameStageFiniteReject;
         }
@@ -1934,7 +1950,7 @@ static G1FrameInjectedOutcome injection_hook(
         return G1FrameInjectContinue;
     }
     if (control.injected_outcome == G1FrameInjectFiniteReject) {
-        scratch.rejection = finite_rejection();
+        install_finite_rejection(scratch, finite_rejection());
     }
     return control.injected_outcome;
 }
@@ -2522,6 +2538,9 @@ static void build_expected_success(
             expected_state,
             static_cast<G1FrameTransactionStage>(stage));
     }
+    if (!value.external.tuning.ik_enabled) {
+        expected_state.ik_frame = G1IkFrameResult{};
+    }
     expected_diagnostic = accepted_diagnostic_candidate(
         expected_state, scratch, value.external);
     apply_stage_marker(expected_state, G1FrameStageAcceptedFinalize);
@@ -2682,7 +2701,6 @@ static void check_success_swap_observability(
     REQUIRE_CHANGED_AGGREGATE(command, command_logical_digest);
     REQUIRE_CHANGED_AGGREGATE(footprint, footprint_logical_digest);
     REQUIRE_CHANGED_AGGREGATE(ik, ik_state_logical_digest);
-    REQUIRE_CHANGED_AGGREGATE(ik_frame, ik_frame_logical_digest);
     REQUIRE_CHANGED_AGGREGATE(
         ik_clearance, pose_clearance_logical_digest);
     REQUIRE_CHANGED_AGGREGATE(
@@ -2722,6 +2740,10 @@ static void check_success_swap_observability(
                   G1ClearanceOk &&
               !prior_accepted.ik_candidate_rejected &&
               !published_candidate.ik_candidate_rejected &&
+              g1_frame_ik_result_is_canonical(
+                  prior_accepted.ik_frame) &&
+              g1_frame_ik_result_is_canonical(
+                  published_candidate.ik_frame) &&
               terrain_float_bits(prior_accepted.adjustment_y) == 0U &&
               terrain_float_bits(published_candidate.adjustment_y) == 0U &&
               terrain_float_bits(prior_accepted.clamp_y) == 0U &&
@@ -4634,6 +4656,13 @@ struct CandidateRunnerControl
     uint64_t scratch_boundary_digest[G1CandidateAttemptCapacity] = {};
     bool scratch_copy_boundaries_valid = true;
     uint32_t rejected_a_poison_mask = 0U;
+    struct FiniteRecord
+    {
+        int frame = 0;
+        G1FrameTransactionStage stage = G1FrameStageInputRouteCommand;
+        G1FrameTransactionScratch scratch;
+    } finite_records[3];
+    uint32_t finite_record_count = 0U;
 };
 
 struct CandidateProviderControl
@@ -4665,6 +4694,7 @@ static void reset_candidate_controls()
     candidate_runner_control.common_copy_boundary_valid = true;
     candidate_runner_control.scratch_copy_boundaries_valid = true;
     candidate_runner_control.rejected_a_poison_mask = 0U;
+    candidate_runner_control.finite_record_count = 0U;
     for (int stage = 0; stage < G1FrameStageCount; ++stage) {
         candidate_runner_control.stage_calls[stage] = 0;
     }
@@ -4714,6 +4744,22 @@ static void candidate_finite_at(
     const uint32_t index = candidate_runner_control.finite_count++;
     candidate_runner_control.finite_frames[index] = frame;
     candidate_runner_control.finite_stages[index] = stage;
+}
+
+static void candidate_finite_record_at(
+    int frame,
+    G1FrameTransactionStage stage,
+    const G1FrameTransactionScratch& scratch)
+{
+    check(candidate_runner_control.finite_record_count < 3U,
+          "first-failure-red: finite record fixture has exact capacity");
+    CandidateRunnerControl::FiniteRecord& record =
+        candidate_runner_control.finite_records[
+            candidate_runner_control.finite_record_count++];
+    record.frame = frame;
+    record.stage = stage;
+    record.scratch = scratch;
+    candidate_finite_at(frame, stage);
 }
 
 static void candidate_global_at(
@@ -5325,13 +5371,13 @@ static G1FrameStageOutcome candidate_runner(
                 scratch.query[feature] = value;
             }
             scratch.recovery_request.incumbent_frame =
-                Incumbent.selected_frame;
+                state.frame_index;
             scratch.recovery_request.legacy_selected_frame =
                 scratch.slot_zero_record.selected_frame;
             scratch.recovery_request.transition_cost =
                 scratch.transition_cost;
             scratch.recovery_request.public_incumbent_cost =
-                Incumbent.selected_cost;
+                state.incumbent_cost;
             scratch.recovery_request.ignore_range_end = 20;
             scratch.recovery_request.ignore_surrounding = 20;
         }
@@ -5432,7 +5478,22 @@ static G1FrameStageOutcome candidate_runner(
             candidate_runner_control.finite_count,
             active_frame,
             stage)) {
-        scratch.rejection = candidate_finite_rejection(active_frame);
+        for (uint32_t index = 0U;
+             index < candidate_runner_control.finite_record_count;
+             ++index) {
+            const CandidateRunnerControl::FiniteRecord& record =
+                candidate_runner_control.finite_records[index];
+            if (record.frame == active_frame &&
+                record.stage == stage) {
+                const G1CandidateRecord active_candidate =
+                    scratch.active_candidate;
+                scratch = record.scratch;
+                scratch.active_candidate = active_candidate;
+                return G1FrameStageFiniteReject;
+            }
+        }
+        install_finite_rejection(
+            scratch, candidate_finite_rejection(active_frame));
         return G1FrameStageFiniteReject;
     }
     return G1FrameStageContinue;
@@ -6323,7 +6384,558 @@ static void test_matching_disabled_slot_zero_has_incumbent_score_owner()
           "matching-disabled slot zero explicitly owns incumbent score provenance");
 }
 
-int main()
+static uint64_t first_failure_ik_state_digest(const G1IkState& state)
+{
+    uint64_t hash = UINT64_C(1469598103934665603);
+    logical_hash_ik_state(hash, state);
+    return hash;
+}
+
+static void first_failure_seed_intent(
+    G1FrameTransactionScratch& scratch, int record)
+{
+    scratch.requested_intent_ready = true;
+    scratch.requested_intent.requested_velocity = vec3(
+        0.125f * static_cast<float>(record + 1),
+        0.0f,
+        -0.0625f * static_cast<float>(record + 1));
+    if (record == 0) {
+        scratch.requested_intent.desired_heading = quat();
+    } else if (record == 1) {
+        scratch.requested_intent.desired_heading =
+            quat(-1.0f, 0.0f, 0.0f, 0.0f);
+    } else {
+        scratch.requested_intent.desired_heading =
+            quat(0.0f, 0.0f, 1.0f, 0.0f);
+    }
+}
+
+static void first_failure_seed_footprint(
+    G1FrameTransactionScratch& scratch,
+    const g1_controller_state& producer,
+    uint32_t record)
+{
+    scratch.footprint_status = G1FootprintOk;
+    scratch.footprint = producer.footprint;
+    scratch.footprint.work.sweeps = record + 1U;
+    scratch.footprint.work.surface_queries = record + 2U;
+    scratch.footprint.work.node_visits = record + 3U;
+}
+
+static G1FrameTransactionScratch first_failure_landing_record(
+    candidate_fixture& fixture)
+{
+    G1FrameTransactionScratch scratch;
+    first_failure_seed_intent(scratch, 0);
+    g1_controller_state& producer =
+        fixture.runtime.candidates.common_state;
+    char error[512] = {};
+    check(g1_controller_state_copy(
+              producer,
+              fixture.runtime.accepted_state,
+              error,
+              static_cast<int>(sizeof(error))),
+          "first-failure-red: landing producer state copies exactly");
+    first_failure_seed_footprint(scratch, producer, 0U);
+    G1FootprintFootObservation& landing = scratch.footprint.feet[0];
+    check(!landing.current_contact,
+          "first-failure-red: landing producer owns a noncontact foot");
+    landing.landing_expected = true;
+    landing.landing_patch_ready = false;
+    landing.landing_sample = 1U;
+    landing.predicted_landing_sole_center =
+        landing.probes[0].predicted_sphere_centers[1];
+    landing.predicted_landing_surface_status = G1SurfaceQueryValid;
+    landing.predicted_landing_surface = scratch.footprint.root_surface;
+    landing.predicted_landing_walkability_class = 1;
+    for (int probe = 0; probe < 4; ++probe) {
+        landing.probes[probe].selected_landing_surface =
+            scratch.footprint.root_surface;
+    }
+    scratch.rejection_branch = G1FrameCertificateIk;
+    check(g1_ik_frame_begin(
+              scratch.ik_certificate.ik_transaction,
+              producer.ik_candidate_bone_positions,
+              producer.ik_candidate_bone_rotations,
+              producer.ik,
+              producer.adjusted_bone_positions,
+              producer.adjusted_bone_rotations,
+              fixture.db.bone_parents,
+              producer.curr_bone_contacts,
+              fixture.scene.terrain,
+              scratch.footprint,
+              true,
+              fixture.external.tuning.dt,
+              error,
+              static_cast<int>(sizeof(error))),
+          "first-failure-red: landing producer reaches the exact begin checkpoint");
+    check(scratch.ik_certificate.ik_transaction.next_foot == 0U &&
+              scratch.ik_certificate.ik_transaction.candidate_result
+                  .safe_stop_requested &&
+              scratch.ik_certificate.ik_transaction.candidate_result
+                      .stop_reason ==
+                  G1IkStopLandingPatchUnavailable,
+          "first-failure-red: landing producer owns the begin stop reason");
+    scratch.rejection.rejected = true;
+    scratch.rejection.stage = G1FrameRejectLandingPatch;
+    scratch.rejection.stop_reason = G1IkStopLandingPatchUnavailable;
+    scratch.rejection.attempted_footprint_available = true;
+    scratch.rejection.footprint_status = G1FootprintOk;
+    scratch.rejection.attempted_footprint = scratch.footprint;
+    scratch.rejection.attempted_ik_available = true;
+    check(g1_ik_frame_rejection_snapshot(
+              scratch.rejection.ik_frame,
+              scratch.ik_certificate.ik_transaction,
+              G1IkRejectionAfterBegin,
+              error,
+              static_cast<int>(sizeof(error))),
+          "first-failure-red: landing diagnostic derives from its saved transaction");
+    check(g1_frame_rejection_is_valid(scratch.rejection),
+          "first-failure-red: landing diagnostic is publicly valid");
+    return scratch;
+}
+
+static G1FrameTransactionScratch first_failure_foot_record(
+    candidate_fixture& fixture)
+{
+    G1FrameTransactionScratch scratch;
+    first_failure_seed_intent(scratch, 1);
+    g1_controller_state& producer =
+        fixture.runtime.candidates.raw_state;
+    char error[512] = {};
+    check(g1_controller_state_copy(
+              producer,
+              fixture.runtime.accepted_state,
+              error,
+              static_cast<int>(sizeof(error))),
+          "first-failure-red: foot producer state copies exactly");
+    first_failure_seed_footprint(scratch, producer, 1U);
+    for (int foot = 0; foot < 2; ++foot) {
+        if (!scratch.footprint.feet[foot].current_contact) {
+            scratch.footprint.feet[foot].landing_expected = false;
+            scratch.footprint.feet[foot].landing_patch_ready = false;
+            scratch.footprint.feet[foot].landing_sample = UINT32_MAX;
+        }
+    }
+    scratch.rejection_branch = G1FrameCertificateIk;
+    G1IkFrameTransaction& transaction =
+        scratch.ik_certificate.ik_transaction;
+    check(g1_ik_frame_begin(
+              transaction,
+              producer.ik_candidate_bone_positions,
+              producer.ik_candidate_bone_rotations,
+              producer.ik,
+              producer.adjusted_bone_positions,
+              producer.adjusted_bone_rotations,
+              fixture.db.bone_parents,
+              producer.curr_bone_contacts,
+              fixture.scene.terrain,
+              scratch.footprint,
+              true,
+              fixture.external.tuning.dt,
+              error,
+              static_cast<int>(sizeof(error))) &&
+              !transaction.candidate_result.safe_stop_requested &&
+              g1_ik_frame_stage_foot(
+                  transaction,
+                  producer.ik_candidate_bone_positions,
+                  producer.ik_candidate_bone_rotations,
+                  0U,
+                  fixture.db.bone_parents,
+                  producer.curr_bone_contacts,
+                  fixture.scene.terrain,
+                  scratch.footprint,
+                  true,
+                  fixture.external.tuning.dt,
+                  error,
+                  static_cast<int>(sizeof(error))),
+          "first-failure-red: foot producer reaches the exact foot-zero checkpoint");
+    G1FootFrameResult& rejected = transaction.candidate_result.feet[0];
+    check(!rejected.recorded_contact,
+          "first-failure-red: foot producer owns the noncontact no-swing form");
+    rejected.swing_selection = G1SwingSelectionDiagnostic{};
+    rejected.swing_selection.candidates_evaluated =
+        G1SwingLiftCandidateCount;
+    rejected.position = G1LegSolveResult{};
+    rejected.orientation = G1FootOrientationResult{};
+    transaction.staged_iteration_provenance[0] = G1LegIterationNone;
+    transaction.candidate_result.safe_stop_requested = true;
+    transaction.candidate_result.stop_reason = G1IkStopNoSwingCandidate;
+    scratch.rejection.rejected = true;
+    scratch.rejection.stage = G1FrameRejectIkCandidate;
+    scratch.rejection.stop_reason = G1IkStopNoSwingCandidate;
+    scratch.rejection.attempted_footprint_available = true;
+    scratch.rejection.footprint_status = G1FootprintOk;
+    scratch.rejection.attempted_footprint = scratch.footprint;
+    scratch.rejection.attempted_ik_available = true;
+    check(g1_ik_frame_rejection_snapshot(
+              scratch.rejection.ik_frame,
+              transaction,
+              G1IkRejectionAfterFoot0,
+              error,
+              static_cast<int>(sizeof(error))),
+          "first-failure-red: foot diagnostic derives from its saved transaction");
+    check(g1_frame_rejection_is_valid(scratch.rejection),
+          "first-failure-red: foot diagnostic is publicly valid");
+    return scratch;
+}
+
+static G1FrameTransactionScratch first_failure_pose_record(
+    candidate_fixture& fixture)
+{
+    G1FrameTransactionScratch scratch;
+    first_failure_seed_intent(scratch, 2);
+    g1_controller_state& producer =
+        fixture.runtime.candidates.ik_state;
+    char error[512] = {};
+    check(g1_controller_state_copy(
+              producer,
+              fixture.runtime.accepted_state,
+              error,
+              static_cast<int>(sizeof(error))),
+          "first-failure-red: pose producer state copies exactly");
+    first_failure_seed_footprint(scratch, producer, 2U);
+    scratch.rejection_branch = G1FrameCertificateRaw;
+    scratch.raw_certificate.ik_transaction.initialized = true;
+    scratch.raw_certificate.ik_transaction.next_foot = 2U;
+    scratch.raw_certificate.ik_transaction.candidate_state = producer.ik;
+    scratch.raw_certificate.ik_transaction.candidate_result =
+        producer.ik_frame;
+    for (int bone = 0; bone < G1_BoneCount; ++bone) {
+        producer.ik_global_bone_positions(bone).y -= 1.0f;
+    }
+    scratch.raw_certificate.pose_status = g1_measure_pose_clearance(
+        scratch.raw_certificate.pose_clearance,
+        g1_pose_clearance_budget(),
+        fixture.scene.terrain,
+        producer.ik_global_bone_positions,
+        producer.ik_global_bone_rotations,
+        error,
+        static_cast<int>(sizeof(error)));
+    check(scratch.raw_certificate.pose_status == G1ClearanceOk,
+          "first-failure-red: pose producer clearance completes within budget");
+    check(!g1_controller_state_pose_clearance_meets_thresholds(
+              scratch.raw_certificate.pose_clearance),
+          "first-failure-red: pose producer owns certified rejecting work");
+    scratch.rejection.rejected = true;
+    scratch.rejection.stage = G1FrameRejectPoseCertificate;
+    scratch.rejection.stop_reason = G1IkStopPoseClearanceRejected;
+    scratch.rejection.attempted_footprint_available = true;
+    scratch.rejection.footprint_status = G1FootprintOk;
+    scratch.rejection.attempted_footprint = scratch.footprint;
+    scratch.rejection.attempted_pose_available = true;
+    scratch.rejection.pose_status = scratch.raw_certificate.pose_status;
+    scratch.rejection.pose_clearance =
+        scratch.raw_certificate.pose_clearance;
+    check(g1_frame_rejection_is_valid(scratch.rejection),
+          "first-failure-red: pose diagnostic is publicly valid");
+    return scratch;
+}
+
+static void first_failure_configure_three_attempts(
+    candidate_fixture& fixture,
+    G1FrameTransactionScratch (&records)[3])
+{
+    reset_candidate_controls();
+    for (int index = 0; index < 5; ++index) {
+        g1_controller_state& state =
+            candidate_runtime_state(fixture.runtime, index);
+        state.frame_index = CandidateA.selected_frame;
+        state.incumbent_cost = Incumbent.selected_cost;
+        state.selected_cost = Incumbent.selected_cost;
+        check(g1_controller_state_is_valid(state),
+              "first-failure-red: three-record owner stays valid");
+    }
+    candidate_provider_control.set.records[0] = CandidateB;
+    candidate_provider_control.set.records[1] = CandidateC;
+    candidate_provider_control.set.count = 2U;
+    candidate_provider_control.set.work.rows_tested = 2U;
+    candidate_provider_control.set.work.full_scores_materialized = 2U;
+    records[0] = first_failure_landing_record(fixture);
+    records[1] = first_failure_foot_record(fixture);
+    records[2] = first_failure_pose_record(fixture);
+}
+
+static uint32_t first_failure_publisher_source_occurrences()
+{
+    std::ifstream input("g1_frame_transaction.h", std::ios::binary);
+    check(input.good(),
+          "first-failure-red: finite publisher source is readable");
+    const std::string source{
+        std::istreambuf_iterator<char>(input),
+        std::istreambuf_iterator<char>()};
+    const std::string needle = "g1_frame_publish_finite_rejection(";
+    uint32_t count = 0U;
+    std::size_t cursor = 0U;
+    while ((cursor = source.find(needle, cursor)) != std::string::npos) {
+        ++count;
+        cursor += needle.size();
+    }
+    return count;
+}
+
+static void test_exhaustion_publishes_complete_first_failing_scratch_once()
+{
+    candidate_fixture fixture;
+    G1FrameTransactionScratch records[3];
+    first_failure_configure_three_attempts(fixture, records);
+    candidate_finite_record_at(
+        CandidateA.selected_frame, G1FrameStageIkBegin, records[0]);
+    candidate_finite_record_at(
+        CandidateB.selected_frame, G1FrameStageIkFirstFoot, records[1]);
+    candidate_finite_record_at(
+        CandidateC.selected_frame, G1FrameStageRawPoseCertificate,
+        records[2]);
+    const uint64_t accepted_before =
+        state_logical_digest(fixture.runtime.accepted_state);
+    const StateStorageIdentities accepted_storage_before =
+        state_storage_identities(fixture.runtime.accepted_state);
+    const int route_index_before = fixture.runtime.accepted_state.route_index;
+    const int route_waypoint_before =
+        fixture.runtime.accepted_state.route_waypoint;
+    const int route_frames_before = fixture.runtime.accepted_state.route_frames;
+    const G1FootprintObservation footprint_before =
+        fixture.runtime.accepted_state.footprint;
+    const G1PoseClearance pose_before =
+        fixture.runtime.accepted_state.ik_clearance;
+    const uint64_t hidden_ik_before = first_failure_ik_state_digest(
+        fixture.runtime.accepted_state.ik);
+    const uint64_t accepted_diagnostic_before =
+        diagnostic_logical_digest(fixture.runtime.accepted_diagnostic);
+    G1FramePublication expected = fixture.runtime.publication;
+    expected.requested_intent = records[0].requested_intent;
+    expected.rejection = records[0].rejection;
+    expected.ik_safe_stop_latched = true;
+    expected.presentation_frame = fixture.external.input.presentation_frame;
+
+    const G1FrameTransactionStatus status =
+        run_candidate_transaction(fixture);
+    check(status == G1FrameTransactionFiniteRejected,
+          "first-failure-red: three finite records exhaust to one rejection");
+    check(publication_logical_digest(fixture.runtime.publication) ==
+              publication_logical_digest(expected),
+          "first-failure-red: publication equals the first complete value snapshot");
+    check(state_logical_digest(fixture.runtime.accepted_state) ==
+              accepted_before &&
+              same_storage_identities(
+                  state_storage_identities(fixture.runtime.accepted_state),
+                  accepted_storage_before),
+          "first-failure-red: exhaustion preserves accepted digest and storage identities");
+    check(fixture.runtime.accepted_state.route_index == route_index_before &&
+              fixture.runtime.accepted_state.route_waypoint ==
+                  route_waypoint_before &&
+              fixture.runtime.accepted_state.route_frames ==
+                  route_frames_before &&
+              g1_frame_footprint_equal(
+                  fixture.runtime.accepted_state.footprint,
+                  footprint_before) &&
+              g1_controller_state_pose_clearance_equal(
+                  fixture.runtime.accepted_state.ik_clearance,
+                  pose_before) &&
+              first_failure_ik_state_digest(
+                  fixture.runtime.accepted_state.ik) == hidden_ik_before,
+          "first-failure-red: accepted route common pose and hidden IK stay unchanged");
+    check(fixture.runtime.publication.presentation_frame ==
+              fixture.external.input.presentation_frame &&
+              fixture.runtime.publication.ik_safe_stop_latched &&
+              fixture.certification.attempt_count == 3U &&
+              candidate_runner_control.accepted_finalize_calls == 0 &&
+              candidate_runner_control.presentation_calls == 0 &&
+              diagnostic_logical_digest(
+                  fixture.runtime.accepted_diagnostic) ==
+                  accepted_diagnostic_before,
+          "first-failure-red: exhaustion owns one presentation row and no accepted provenance");
+    check(first_failure_publisher_source_occurrences() == 2U,
+          "first-failure-red: finite publication has one authenticated call site");
+}
+
+static void test_later_failure_cannot_replace_first_branch_or_reason()
+{
+    candidate_fixture fixture;
+    G1FrameTransactionScratch records[3];
+    first_failure_configure_three_attempts(fixture, records);
+    candidate_finite_record_at(
+        CandidateA.selected_frame, G1FrameStageIkBegin, records[0]);
+    candidate_finite_record_at(
+        CandidateB.selected_frame, G1FrameStageIkFirstFoot, records[1]);
+    candidate_finite_record_at(
+        CandidateC.selected_frame, G1FrameStageRawPoseCertificate,
+        records[2]);
+    check(run_candidate_transaction(fixture) ==
+              G1FrameTransactionFiniteRejected &&
+              fixture.runtime.publication.rejection.stage ==
+                  records[0].rejection.stage &&
+              fixture.runtime.publication.rejection.stop_reason ==
+                  records[0].rejection.stop_reason &&
+              same_intent_bits(
+                  fixture.runtime.publication.requested_intent,
+                  records[0].requested_intent) &&
+              fixture.runtime.publication.rejection.stage !=
+                  records[1].rejection.stage &&
+              fixture.runtime.publication.rejection.stage !=
+                  records[2].rejection.stage,
+          "first-failure-red: later branch reason and intent cannot replace the first");
+}
+
+static void test_saved_footprint_mutation_is_global_error()
+{
+    candidate_fixture fixture;
+    G1FrameTransactionScratch records[3];
+    first_failure_configure_three_attempts(fixture, records);
+    G1FrameTransactionScratch mutated = records[0];
+    mutated.footprint.work.sweeps ^= 1U;
+    const uint64_t publication_before =
+        publication_logical_digest(fixture.runtime.publication);
+    check(!g1_frame_publish_finite_rejection(
+              fixture.runtime, mutated, fixture.external, true) &&
+              publication_logical_digest(fixture.runtime.publication) ==
+                  publication_before,
+          "first-failure-red: saved footprint mutation is a nonpublishing global error");
+}
+
+static void test_saved_ik_transaction_mutation_is_global_error()
+{
+    candidate_fixture fixture;
+    G1FrameTransactionScratch records[3];
+    first_failure_configure_three_attempts(fixture, records);
+    const uint64_t publication_before =
+        publication_logical_digest(fixture.runtime.publication);
+    const auto rejected = [&](const G1FrameTransactionScratch& scratch) {
+        return !g1_frame_publish_finite_rejection(
+                   fixture.runtime, scratch, fixture.external, true) &&
+               publication_logical_digest(fixture.runtime.publication) ==
+                   publication_before;
+    };
+    G1FrameTransactionScratch mutated = records[0];
+    mutated.ik_certificate.ik_transaction.next_foot = 1U;
+    check(rejected(mutated),
+          "first-failure-red: saved IK next-foot mutation is global");
+    mutated = records[0];
+    mutated.ik_certificate.ik_transaction
+        .staged_iteration_provenance[0] = G1LegIterationContact1;
+    check(rejected(mutated),
+          "first-failure-red: saved IK staged provenance mutation is global");
+    mutated = records[0];
+    mutated.ik_certificate.ik_transaction.candidate_result
+        .safe_stop_requested = false;
+    check(rejected(mutated),
+          "first-failure-red: saved IK result mutation is global");
+    mutated = records[0];
+    ++mutated.ik_certificate.ik_transaction.candidate_state
+          .feet[0].lock.release_frames;
+    check(rejected(mutated),
+          "first-failure-red: saved IK state mutation is global");
+}
+
+static void test_diagnostic_only_failure_copy_cannot_publish()
+{
+    candidate_fixture fixture;
+    G1FrameTransactionScratch records[3];
+    first_failure_configure_three_attempts(fixture, records);
+    G1FrameTransactionScratch diagnostic_only;
+    first_failure_seed_intent(diagnostic_only, 0);
+    diagnostic_only.rejection = candidate_finite_rejection(
+        CandidateA.selected_frame);
+    const uint64_t publication_before =
+        publication_logical_digest(fixture.runtime.publication);
+    check(!g1_frame_publish_finite_rejection(
+              fixture.runtime,
+              diagnostic_only,
+              fixture.external,
+              true) &&
+              publication_logical_digest(fixture.runtime.publication) ==
+                  publication_before,
+          "first-failure-red: diagnostic-only copy lacks its footprint producer");
+
+    G1FrameTransactionScratch unavailable_pose = records[2];
+    unavailable_pose.raw_certificate.pose_status =
+        G1ClearanceOutsideDomain;
+    unavailable_pose.raw_certificate.pose_clearance = G1PoseClearance{};
+    unavailable_pose.rejection.attempted_pose_available = false;
+    unavailable_pose.rejection.pose_status = G1ClearanceOutsideDomain;
+    unavailable_pose.rejection.pose_clearance = G1PoseClearance{};
+    check(g1_frame_rejection_is_valid(unavailable_pose.rejection) &&
+              g1_frame_rejection_matches_scratch_transaction(
+                  unavailable_pose.rejection,
+                  unavailable_pose),
+          "first-failure-red: unavailable pose status has a canonical saved certificate");
+    unavailable_pose.raw_certificate.pose_clearance
+        .hips.work.point_queries = 1U;
+    check(!g1_frame_publish_finite_rejection(
+              fixture.runtime,
+              unavailable_pose,
+              fixture.external,
+              true) &&
+              publication_logical_digest(fixture.runtime.publication) ==
+                  publication_before,
+          "first-failure-red: unavailable pose cannot hide saved certificate mutation");
+}
+
+static void test_global_error_after_finite_attempt_publishes_no_finite_evidence()
+{
+    candidate_fixture fixture;
+    G1FrameTransactionScratch records[3];
+    first_failure_configure_three_attempts(fixture, records);
+    candidate_finite_record_at(
+        CandidateA.selected_frame, G1FrameStageIkBegin, records[0]);
+    candidate_global_at(
+        CandidateB.selected_frame, G1FrameStageCandidateApply);
+    const uint64_t publication_before =
+        publication_logical_digest(fixture.runtime.publication);
+    const uint64_t diagnostic_before =
+        diagnostic_logical_digest(fixture.runtime.accepted_diagnostic);
+    const uint64_t accepted_before =
+        state_logical_digest(fixture.runtime.accepted_state);
+    const uint64_t hidden_before = first_failure_ik_state_digest(
+        fixture.runtime.accepted_state.ik);
+    const bool latch_before =
+        fixture.runtime.publication.ik_safe_stop_latched;
+    check(run_candidate_transaction(fixture) ==
+              G1FrameTransactionGlobalError &&
+              publication_logical_digest(fixture.runtime.publication) ==
+                  publication_before &&
+              diagnostic_logical_digest(
+                  fixture.runtime.accepted_diagnostic) ==
+                  diagnostic_before &&
+              state_logical_digest(fixture.runtime.accepted_state) ==
+                  accepted_before &&
+              first_failure_ik_state_digest(
+                  fixture.runtime.accepted_state.ik) == hidden_before &&
+              fixture.runtime.publication.ik_safe_stop_latched ==
+                  latch_before,
+          "first-failure-red: later global error preserves every public and hidden owner");
+}
+
+static void test_success_after_private_failures_publishes_no_rejection()
+{
+    candidate_fixture fixture;
+    G1FrameTransactionScratch records[3];
+    first_failure_configure_three_attempts(fixture, records);
+    candidate_finite_record_at(
+        CandidateA.selected_frame, G1FrameStageIkBegin, records[0]);
+    check(run_candidate_transaction(fixture) ==
+              G1FrameTransactionAccepted &&
+              fixture.runtime.accepted_state.frame_index ==
+                  CandidateB.executed_frame &&
+              g1_frame_rejection_is_canonical(
+                  fixture.runtime.publication.rejection) &&
+              !fixture.runtime.publication.ik_safe_stop_latched &&
+              fixture.runtime.accepted_diagnostic.ready,
+          "first-failure-red: success discards every private finite failure");
+}
+
+static void run_first_failure_tests()
+{
+    test_exhaustion_publishes_complete_first_failing_scratch_once();
+    test_later_failure_cannot_replace_first_branch_or_reason();
+    test_saved_footprint_mutation_is_global_error();
+    test_saved_ik_transaction_mutation_is_global_error();
+    test_diagnostic_only_failure_copy_cannot_publish();
+    test_global_error_after_finite_attempt_publishes_no_finite_evidence();
+    test_success_after_private_failures_publishes_no_rejection();
+}
+
+static void run_all_inherited_and_task2_tests()
 {
     test_abc_selects_b_in_both_modes_and_stops_before_c();
     test_raw_rejection_short_circuits_ik_and_continues();
@@ -6359,5 +6971,20 @@ int main()
     test_coordinator_preflight_rejects_invalid_inputs_and_aliases();
     test_exact_storage_preflight_rejects_within_workspace_alias_before_trace_reset();
     test_safe_stop_latch_lifecycle();
+}
+
+int main(int argc, char** argv)
+{
+    if (argc == 2 &&
+        std::strcmp(argv[1], "--first-failure-red") == 0) {
+        std::fputs("G1_FIRST_FAILURE_RED_SELECTED\n", stderr);
+        run_first_failure_tests();
+        return 0;
+    }
+    if (argc != 1) {
+        return 2;
+    }
+    run_all_inherited_and_task2_tests();
+    run_first_failure_tests();
     return 0;
 }

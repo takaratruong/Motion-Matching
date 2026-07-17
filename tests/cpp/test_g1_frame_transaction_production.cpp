@@ -6335,6 +6335,7 @@ static void check_structural_main_update_contract(
         "constboollog_suffix_ok=::g1_build_task7_log_suffix("
         "log_row,frame_runtime.accepted_state,"
         "frame_runtime.accepted_diagnostic,frame_runtime.publication,"
+        "log_context.ik_enabled,"
         "artifact_error,static_cast<int>(sizeof(artifact_error)));";
     check(cpp_exact_statement_containing(
               tokens,

@@ -1503,13 +1503,19 @@ static void g1_log_swing(
         output.total_work, selection.total_clearance_work);
 }
 
+static void g1_log_canonical_disabled_ik(
+    motion_match_ik_diagnostic& output)
+{
+    output = motion_match_ik_diagnostic{};
+}
+
 static bool g1_log_accepted_ik(
     motion_match_ik_diagnostic& output,
     const g1_controller_state& state,
     char* error,
     int error_capacity)
 {
-    output = motion_match_ik_diagnostic{};
+    g1_log_canonical_disabled_ik(output);
     output.applied = state.ik_frame.applied;
     output.safe_stop_requested = state.ik_frame.safe_stop_requested;
     output.stop_reason = g1_ik_stop_reason_name(state.ik_frame.stop_reason);
@@ -1888,6 +1894,7 @@ static bool g1_build_task7_log_suffix(
     const g1_controller_state& accepted_state,
     const G1FrameAcceptedDiagnostic& accepted_diagnostic,
     const G1FramePublication& publication,
+    bool ik_enabled,
     char* error,
     int error_capacity)
 {
@@ -1901,12 +1908,16 @@ static bool g1_build_task7_log_suffix(
     }
     log_row.query_bits_storage[31 * 8] = '\0';
     log_row.query_bits_hex = log_row.query_bits_storage;
-    if (!g1_log_accepted_ik(
-            log_row.ik,
-            accepted_state,
-            error,
-            error_capacity)) {
-        return false;
+    if (ik_enabled) {
+        if (!g1_log_accepted_ik(
+                log_row.ik,
+                accepted_state,
+                error,
+                error_capacity)) {
+            return false;
+        }
+    } else {
+        g1_log_canonical_disabled_ik(log_row.ik);
     }
     g1_log_directional(
         log_row.directional,
@@ -2581,6 +2592,7 @@ int main(int argc, char** argv)
         const bool log_suffix_ok = ::g1_build_task7_log_suffix(
             log_row, frame_runtime.accepted_state,
             frame_runtime.accepted_diagnostic, frame_runtime.publication,
+            log_context.ik_enabled,
             artifact_error, static_cast<int>(sizeof(artifact_error)));
         if (!log_suffix_ok) {
             ::controlled_runtime_error(artifact_error);
