@@ -199,9 +199,10 @@ static void test_controller_wires_idle_match_transition_cost()
     check(prior != std::string::npos,
           "ordinary matcher captures the incumbent frame");
     const std::size_t policy = source.find(
-        "const float transition_cost =", prior);
+        "scratch.transition_cost = ::g1_idle_match_transition_cost(",
+        prior);
     check(policy != std::string::npos,
-          "ordinary matcher computes a transition cost");
+          "ordinary matcher stores transition cost in transaction scratch");
     const std::string policy_call = source_call_text(
         source,
         "g1_idle_match_transition_cost",
@@ -216,7 +217,8 @@ static void test_controller_wires_idle_match_transition_cost()
           "idle policy consumes raw command and planar simulation speeds");
 
     const std::size_t search = source.find("database_search(", policy);
-    check(search != std::string::npos && policy < search,
+    check(search != std::string::npos && policy < search &&
+              count_occurrences(source, "::database_search(") == 1,
           "idle transition cost is computed immediately before search");
     const std::string search_call = source_call_text(
         source,
@@ -224,8 +226,15 @@ static void test_controller_wires_idle_match_transition_cost()
         policy,
         "ordinary database search follows idle policy");
     check(source_call_argument_count(search_call) == 5 &&
-              search_call.find("transition_cost") != std::string::npos,
-          "idle transition cost is the fifth database_search argument");
+              search_call.find("scratch.transition_cost") !=
+                  std::string::npos,
+          "scratch transition cost is the fifth database_search argument");
+    const std::size_t recovery_cost = source.find(
+        "scratch.recovery_request.transition_cost =\n"
+        "                scratch.transition_cost;",
+        search);
+    check(recovery_cost != std::string::npos && search < recovery_cost,
+          "ordinary search freezes the same scratch transition-cost word into the recovery request");
 }
 
 static void test_controller_validates_ik_geometry_before_window()
@@ -445,15 +454,38 @@ static void test_controller_publishes_independent_travel_and_heading()
         "g1_frame_transaction_run",
         transaction,
         "controller invokes the frame transaction coordinator");
-    check(source_call_argument_count(transaction_call) == 5 &&
-              transaction_call.find("frame_runtime") != std::string::npos &&
-              transaction_call.find("g1_controller_frame_stage_run") !=
-                  std::string::npos &&
-              transaction_call.find("frame_external") != std::string::npos &&
-              transaction_call.find("artifact_error") != std::string::npos &&
+    const std::size_t runtime_argument = transaction_call.find(
+        "frame_runtime");
+    const std::size_t runner_argument = transaction_call.find(
+        "::g1_controller_frame_stage_run", runtime_argument);
+    const std::size_t provider_argument = transaction_call.find(
+        "::g1_recovery_candidates_build", runner_argument);
+    const std::size_t external_argument = transaction_call.find(
+        "frame_external", provider_argument);
+    const std::size_t seam_guard = transaction_call.find(
+        "#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)",
+        external_argument);
+    const std::size_t seam_argument = transaction_call.find(
+        "test_seam_pointer", seam_guard);
+    const std::size_t seam_end = transaction_call.find(
+        "#endif", seam_argument);
+    const std::size_t error_argument = transaction_call.find(
+        "artifact_error", seam_end);
+    const std::size_t capacity_argument = transaction_call.find(
+        "static_cast<int>(sizeof(artifact_error))", error_argument);
+    check(source_call_argument_count(transaction_call) == 7 &&
+              runtime_argument < runner_argument &&
+              runner_argument < provider_argument &&
+              provider_argument < external_argument &&
+              external_argument < seam_guard &&
+              seam_guard < seam_argument && seam_argument < seam_end &&
+              seam_end < error_argument &&
+              error_argument < capacity_argument &&
+              count_occurrences(
+                  transaction_call, "test_seam_pointer") == 1 &&
               source.find("frame_runtime.accepted_state.command =") ==
                   std::string::npos,
-          "controller publishes command state only through the transaction coordinator");
+          "controller publishes command state only through the exact provider-expanded transaction coordinator");
 
     const char* transaction_override =
         std::getenv("G1_FRAME_TRANSACTION_SOURCE");
@@ -498,7 +530,8 @@ static void test_controller_publishes_independent_travel_and_heading()
     const std::size_t accepted_swap = coordinator_path.find(
         "g1_controller_state_swap(", success_validation);
     const std::size_t diagnostic_publication = coordinator_path.find(
-        "runtime.accepted_diagnostic = accepted_diagnostic_candidate;",
+        "runtime.accepted_diagnostic =\n"
+        "                accepted_diagnostic_candidate;",
         accepted_swap);
     const std::size_t intent_publication = coordinator_path.find(
         "runtime.publication = publication_candidate;",
@@ -692,7 +725,7 @@ static void test_live_loop_failure_exit_codes_are_dataflow_complete()
 
     const char* failure_markers[] = {
         "if (!scene_reset_ok)",
-        "if (frame_status == G1FrameTransactionGlobalError)",
+        "if (transaction_failed)",
         "if (!log_row_ok)",
         "if (!log_suffix_ok)",
         "if (!log_ok)",
@@ -807,26 +840,39 @@ static void test_controller_marks_no_route_cursor_inactive_after_resets()
     const std::string typed_path = transaction_source.substr(typed_reset);
     const std::size_t resolved_index = typed_path.find(
         "int route_index = -1;");
+    static const char five_state_owners[] =
+        "g1_controller_state* candidate_states[5] = {\n"
+        "        &candidate.accepted_state,\n"
+        "        &candidate.working_state,\n"
+        "        &candidate.candidates.common_state,\n"
+        "        &candidate.candidates.raw_state,\n"
+        "        &candidate.candidates.ik_state,\n"
+        "    };";
+    const std::size_t state_owners = typed_path.find(
+        five_state_owners, resolved_index);
     const std::size_t route_branch = typed_path.find(
-        "if (config.route_mode)", resolved_index);
+        "if (config.route_mode)", state_owners);
     const std::size_t inactive_branch = typed_path.find(
         "} else {", route_branch);
     check(resolved_index != std::string::npos &&
+              state_owners != std::string::npos &&
               route_branch != std::string::npos &&
               inactive_branch != std::string::npos &&
-              resolved_index < route_branch && route_branch < inactive_branch,
-          "typed reset resolves route mode before its explicit inactive branch");
+              resolved_index < state_owners &&
+              state_owners < route_branch && route_branch < inactive_branch,
+          "typed reset resolves route mode and binds all five state owners before its explicit inactive branch");
     const std::string routed_path = typed_path.substr(
         route_branch, inactive_branch - route_branch);
+    check(routed_path.find(
+              "for (int state_index = 0; state_index < 5; "
+              "++state_index) {") != std::string::npos,
+          "typed route reset iterates all five independent state owners");
     for (const char* assignment : {
-             "candidate.accepted_state.route_index = route_index;",
-             "candidate.accepted_state.route_waypoint = 1;",
-             "candidate.accepted_state.route_frames = 0;",
-             "candidate.working_state.route_index = route_index;",
-             "candidate.working_state.route_waypoint = 1;",
-             "candidate.working_state.route_frames = 0;"}) {
+             "candidate_states[state_index]->route_index = route_index;",
+             "candidate_states[state_index]->route_waypoint = 1;",
+             "candidate_states[state_index]->route_frames = 0;"}) {
         check(routed_path.find(assignment) != std::string::npos,
-              "typed route reset publishes the resolved cursor to both states");
+              "typed route reset publishes the resolved cursor to all five states");
     }
     const std::size_t inactive_end = typed_path.find(
         "    }", inactive_branch + 1U);
@@ -834,15 +880,16 @@ static void test_controller_marks_no_route_cursor_inactive_after_resets()
           "typed inactive cursor branch has a bounded body");
     const std::string inactive_path = typed_path.substr(
         inactive_branch, inactive_end - inactive_branch);
+    check(inactive_path.find(
+              "for (int state_index = 0; state_index < 5; "
+              "++state_index) {") != std::string::npos,
+          "typed inactive reset iterates all five independent state owners");
     for (const char* assignment : {
-             "candidate.accepted_state.route_index = -1;",
-             "candidate.accepted_state.route_waypoint = 0;",
-             "candidate.accepted_state.route_frames = 0;",
-             "candidate.working_state.route_index = -1;",
-             "candidate.working_state.route_waypoint = 0;",
-             "candidate.working_state.route_frames = 0;"}) {
+             "candidate_states[state_index]->route_index = -1;",
+             "candidate_states[state_index]->route_waypoint = 0;",
+             "candidate_states[state_index]->route_frames = 0;"}) {
         check(inactive_path.find(assignment) != std::string::npos,
-              "typed non-route reset publishes the canonical inactive cursor to both states");
+              "typed non-route reset publishes the canonical inactive cursor to all five states");
     }
 }
 

@@ -108,7 +108,8 @@ static void check_task6_publication_contract(const char* path)
 
     const size_t coordinator = main_body.find(
         "g1_frame_transaction_run(frame_runtime,"
-        "::g1_controller_frame_stage_run,frame_external,");
+        "::g1_controller_frame_stage_run,"
+        "::g1_recovery_candidates_build,frame_external,");
     check(coordinator != std::string::npos &&
               source_occurrence_count(
                   main_body, "g1_frame_transaction_run(") == 1,

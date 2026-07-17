@@ -218,20 +218,28 @@ static void test_controller_source_contract(const char* path)
     static const char* stages[] = {
         "caseG1FrameStageInputRouteCommand:",
         "caseG1FrameStageMatcherSearch:",
+        "caseG1FrameStageCandidateApply:",
         "caseG1FrameStageInertialization:",
         "caseG1FrameStageSimulationUpdate:",
         "caseG1FrameStageSupportObservation:",
         "caseG1FrameStageSupportRetarget:",
         "caseG1FrameStageContactUpdate:",
         "caseG1FrameStageFootprintObservation:",
-        "caseG1FrameStageFirstFootIk:",
-        "caseG1FrameStageSecondFootIk:",
-        "caseG1FrameStageFinalFk:",
-        "caseG1FrameStagePoseCertificate:",
+        "caseG1FrameStageRawBegin:",
+        "caseG1FrameStageRawFirstFoot:",
+        "caseG1FrameStageRawSecondFoot:",
+        "caseG1FrameStageRawFinalFk:",
+        "caseG1FrameStageRawPoseCertificate:",
+        "caseG1FrameStageIkBegin:",
+        "caseG1FrameStageIkFirstFoot:",
+        "caseG1FrameStageIkSecondFoot:",
+        "caseG1FrameStageIkFinalFk:",
+        "caseG1FrameStageIkPoseCertificate:",
+        "caseG1FrameStageAcceptedFinalize:",
     };
-    size_t stage_positions[12] = {};
+    size_t stage_positions[20] = {};
     size_t stage_start = 0;
-    for (int index = 0; index < 12; ++index) {
+    for (int index = 0; index < 20; ++index) {
         stage_positions[index] = find_required(
             body, stages[index], stage_start,
             "runner has every authenticated stage exactly once and in order");
@@ -241,7 +249,7 @@ static void test_controller_source_contract(const char* path)
     }
 
     const std::string raw_support = body.substr(
-        stage_positions[4], stage_positions[5] - stage_positions[4]);
+        stage_positions[5], stage_positions[6] - stage_positions[5]);
     const size_t raw_fk = find_required(
         raw_support, "g1_ik_checked_forward_kinematics(", 0,
         "support observation begins with checked raw-pose FK");
@@ -255,12 +263,12 @@ static void test_controller_source_contract(const char* path)
           "raw FK and support observation each execute exactly once");
 
     const std::string retarget = body.substr(
-        stage_positions[5], stage_positions[6] - stage_positions[5]);
+        stage_positions[6], stage_positions[7] - stage_positions[6]);
     check(count_occurrences(retarget, "support_pose_apply(") == 1,
           "support-retarget stage applies the support pose exactly once");
 
     const std::string contact = body.substr(
-        stage_positions[6], stage_positions[7] - stage_positions[6]);
+        stage_positions[7], stage_positions[8] - stage_positions[7]);
     const size_t retargeted_fk = find_required(
         contact, "g1_ik_checked_forward_kinematics(", 0,
         "contact stage begins with checked support-retargeted FK");

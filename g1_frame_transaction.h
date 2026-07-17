@@ -21,6 +21,19 @@ enum G1FrameRejectionStage
     G1FrameRejectPoseCertificate,
 };
 
+static inline const char* g1_frame_rejection_stage_name(
+    G1FrameRejectionStage stage)
+{
+    switch (stage) {
+    case G1FrameRejectNone: return "none";
+    case G1FrameRejectFootprint: return "footprint";
+    case G1FrameRejectLandingPatch: return "landing-patch";
+    case G1FrameRejectIkCandidate: return "ik-candidate";
+    case G1FrameRejectPoseCertificate: return "pose-certificate";
+    default: return "unknown";
+    }
+}
+
 struct G1FrameRejectionDiagnostic
 {
     bool rejected = false;

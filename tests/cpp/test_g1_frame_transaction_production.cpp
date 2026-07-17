@@ -1,4 +1,5 @@
 #include "g1_controller_frame_runtime.h"
+#include "g1_candidate_certification_trace.h"
 
 #include <algorithm>
 #include <cmath>
@@ -9,6 +10,7 @@
 #include <limits>
 #include <type_traits>
 #include <utility>
+#include <unistd.h>
 
 static void check(bool condition, const char* message)
 {
@@ -939,11 +941,101 @@ static bool same_float_bits(float first, float second)
     return terrain_float_bits(first) == terrain_float_bits(second);
 }
 
+static bool finite_float_words_within_ulp(
+    float first,
+    float second,
+    uint32_t maximum_distance)
+{
+    const uint32_t first_bits = terrain_float_bits(first);
+    const uint32_t second_bits = terrain_float_bits(second);
+    if ((first_bits & UINT32_C(0x7f800000)) == UINT32_C(0x7f800000) ||
+        (second_bits & UINT32_C(0x7f800000)) == UINT32_C(0x7f800000)) {
+        return false;
+    }
+    const uint32_t first_ordered =
+        (first_bits & UINT32_C(0x80000000)) != 0U
+            ? ~first_bits
+            : first_bits ^ UINT32_C(0x80000000);
+    const uint32_t second_ordered =
+        (second_bits & UINT32_C(0x80000000)) != 0U
+            ? ~second_bits
+            : second_bits ^ UINT32_C(0x80000000);
+    const uint32_t distance = first_ordered >= second_ordered
+        ? first_ordered - second_ordered
+        : second_ordered - first_ordered;
+    return distance <= maximum_distance;
+}
+
+static bool live_velocity_matches_oracle(vec3 actual, vec3 expected)
+{
+#if defined(__FAST_MATH__)
+    return finite_float_words_within_ulp(actual.x, expected.x, 8U) &&
+           finite_float_words_within_ulp(actual.y, expected.y, 8U) &&
+           finite_float_words_within_ulp(actual.z, expected.z, 8U);
+#else
+    return same_vec3_bits(actual, expected);
+#endif
+}
+
+static bool live_intent_matches_oracle(
+    const G1CommandIntent& actual,
+    const G1CommandIntent& expected)
+{
+    return live_velocity_matches_oracle(
+               actual.requested_velocity, expected.requested_velocity) &&
+           same_quat_bits(actual.desired_heading, expected.desired_heading);
+}
+
 static float production_float_from_bits(uint32_t bits)
 {
     float value = 0.0f;
     std::memcpy(&value, &bits, sizeof(value));
     return value;
+}
+
+static void test_live_velocity_fast_oracle_tolerance_is_bounded()
+{
+    G1CommandIntent expected;
+    expected.requested_velocity = vec3(1.0f, 2.0f, 3.0f);
+    expected.desired_heading = quat(1.0f, 0.0f, 0.0f, 0.0f);
+    G1CommandIntent eight_ulp = expected;
+    eight_ulp.requested_velocity.x = production_float_from_bits(
+        terrain_float_bits(expected.requested_velocity.x) + 8U);
+    G1CommandIntent nine_ulp = expected;
+    nine_ulp.requested_velocity.x = production_float_from_bits(
+        terrain_float_bits(expected.requested_velocity.x) + 9U);
+    G1CommandIntent nonfinite = expected;
+    nonfinite.requested_velocity.x = production_float_from_bits(
+        UINT32_C(0x7f800000));
+    G1CommandIntent wrong_heading = expected;
+    wrong_heading.desired_heading.w = production_float_from_bits(
+        terrain_float_bits(expected.desired_heading.w) + 1U);
+
+    check(finite_float_words_within_ulp(
+              eight_ulp.requested_velocity.x,
+              expected.requested_velocity.x,
+              8U) &&
+              !finite_float_words_within_ulp(
+                  nine_ulp.requested_velocity.x,
+                  expected.requested_velocity.x,
+                  8U) &&
+              !finite_float_words_within_ulp(
+                  nonfinite.requested_velocity.x,
+                  expected.requested_velocity.x,
+                  8U),
+          "fast-oracle ULP helper accepts eight and rejects nine or nonfinite words");
+    check(live_intent_matches_oracle(expected, expected) &&
+              !live_intent_matches_oracle(wrong_heading, expected),
+          "live-oracle intent comparison always keeps heading bit-exact");
+#if defined(__FAST_MATH__)
+    check(live_intent_matches_oracle(eight_ulp, expected) &&
+              !live_intent_matches_oracle(nine_ulp, expected) &&
+              !live_intent_matches_oracle(nonfinite, expected),
+          "fast callers use only the finite componentwise eight-ULP allowance");
+#else
+    check(!live_intent_matches_oracle(eight_ulp, expected),
+          "strict callers keep requested velocity bit-exact");
+#endif
 }
 
 static void test_fixed_nonassociative_root_reach_fk_ownership()
@@ -1716,7 +1808,12 @@ static G1FrameInjectedOutcome production_hook(
         return G1FrameInjectContinue;
     }
     if (control.injected_outcome == G1FrameInjectFiniteReject) {
-        scratch.rejection = production_finite_rejection();
+        const G1FrameRejectionDiagnostic rejection =
+            production_finite_rejection();
+        scratch.footprint_status = rejection.footprint_status;
+        scratch.footprint = rejection.attempted_footprint;
+        scratch.rejection_branch = G1FrameCertificateNone;
+        scratch.rejection = rejection;
     }
     return control.injected_outcome;
 }
@@ -2188,22 +2285,22 @@ static void test_real_runner_covers_all_six_modes_and_lowerings()
                         value.external.input.camera_zoom_axis,
                 0.1f,
                 100.0f);
-            check(same_intent_bits(
-                      value.runtime.publication.requested_intent,
-                      expected_intent) &&
-                      same_float_bits(
-                          value.runtime.accepted_state.desired_gait,
-                          expected_gait) &&
-                      same_float_bits(
-                          value.runtime.accepted_state
-                              .desired_gait_velocity,
-                          expected_gait_velocity) &&
-                      same_float_bits(
-                          value.runtime.accepted_state.camera_altitude,
-                          altitude_before) &&
-                      same_float_bits(
-                          value.runtime.accepted_state.camera_distance,
-                          expected_distance),
+            const bool live_lowering_exact = live_intent_matches_oracle(
+                    value.runtime.publication.requested_intent,
+                    expected_intent) &&
+                same_float_bits(
+                    value.runtime.accepted_state.desired_gait,
+                    expected_gait) &&
+                same_float_bits(
+                    value.runtime.accepted_state.desired_gait_velocity,
+                    expected_gait_velocity) &&
+                same_float_bits(
+                    value.runtime.accepted_state.camera_altitude,
+                    altitude_before) &&
+                same_float_bits(
+                    value.runtime.accepted_state.camera_distance,
+                    expected_distance);
+            check(live_lowering_exact,
                   "live mode independently authenticates move/look/gait/zoom/strafe lowering");
         } else if (mode == G1_TestSequential) {
             check(!value.runtime.accepted_diagnostic.matching_enabled &&
@@ -5184,8 +5281,13 @@ static std::set<std::string> production_authenticated_source_names()
         "G1FrameStageInertialization", "G1FrameStageSimulationUpdate",
         "G1FrameStageSupportObservation", "G1FrameStageSupportRetarget",
         "G1FrameStageContactUpdate", "G1FrameStageFootprintObservation",
-        "G1FrameStageFirstFootIk", "G1FrameStageSecondFootIk",
-        "G1FrameStageFinalFk", "G1FrameStagePoseCertificate",
+        "G1FrameStageCandidateApply", "G1FrameStageRawBegin",
+        "G1FrameStageRawFirstFoot", "G1FrameStageRawSecondFoot",
+        "G1FrameStageRawFinalFk", "G1FrameStageRawPoseCertificate",
+        "G1FrameStageIkBegin", "G1FrameStageIkFirstFoot",
+        "G1FrameStageIkSecondFoot", "G1FrameStageIkFinalFk",
+        "G1FrameStageIkPoseCertificate",
+        "G1FrameStageAcceptedFinalize",
         "G1FrameStageCount", "G1FrameStageContinue",
         "G1FrameStageFiniteReject", "G1FrameStageGlobalError",
         "G1FrameTransactionAccepted", "G1FrameTransactionFiniteRejected",
@@ -6227,41 +6329,56 @@ static void check_structural_main_update_contract(
               coordinator_statement_end),
           "coordinator result is bound once to the exact immutable frame_status declaration and arguments");
 
-    const std::vector<std::string> global_failure_prefix = {
-        "if", "(", "frame_status", "==",
-        "G1FrameTransactionGlobalError", ")", "{",
+    const std::vector<std::string> transaction_failed_declaration = {
+        "bool", "transaction_failed", "=", "frame_status", "==",
+        "G1FrameTransactionGlobalError", ";",
     };
-    const std::vector<std::size_t> global_failures =
+    const std::vector<std::size_t> transaction_failed_declarations =
         cpp_find_token_sequence_at_depth(
             tokens,
             depth,
             coordinator_statement_end + 1,
             update_close,
-            global_failure_prefix,
+            transaction_failed_declaration,
             update_depth);
-    check(global_failures.size() == 1 &&
-              global_failures[0] == coordinator_statement_end + 1,
-          "the exact global-error gate immediately follows the coordinator");
-    const std::size_t global_failure_close = cpp_matching_token(
+    check(transaction_failed_declarations.size() == 1,
+          "the coordinator result initializes one exact post-transaction failure owner");
+
+    const std::vector<std::string> transaction_failure_prefix = {
+        "if", "(", "transaction_failed", ")", "{",
+    };
+    const std::vector<std::size_t> transaction_failures =
+        cpp_find_token_sequence_at_depth(
+            tokens,
+            depth,
+            transaction_failed_declarations[0] +
+                transaction_failed_declaration.size(),
+            update_close,
+            transaction_failure_prefix,
+            update_depth);
+    check(transaction_failures.size() == 1,
+          "one common post-transaction gate owns status, timing, and trace failure");
+    const std::size_t transaction_failure_close = cpp_matching_token(
         tokens,
-        global_failures[0] + global_failure_prefix.size() - 1,
+        transaction_failures[0] + transaction_failure_prefix.size() - 1,
         "{",
         "}");
-    const std::string exact_global_failure =
-        "if(frame_status==G1FrameTransactionGlobalError){"
+    const std::string exact_transaction_failure =
+        "if(transaction_failed){"
         "::controlled_runtime_error(artifact_error);"
         "controller_exit_code=2;controller_exit_requested=true;break;}";
-    check(global_failure_close != std::string::npos &&
+    check(transaction_failure_close != std::string::npos &&
               cpp_compact_tokens(
                   tokens,
-                  global_failures[0],
-                  global_failure_close + 1) == exact_global_failure,
-          "global coordinator failure performs one controlled fatal exit before all observation");
+                  transaction_failures[0],
+                  transaction_failure_close + 1) ==
+                  exact_transaction_failure,
+          "all post-transaction failures perform one controlled fatal exit before ordinary observation");
 
     const std::vector<CppCallRecord> builder_calls =
         cpp_calls_named(
             tokens,
-            global_failure_close + 1,
+            transaction_failure_close + 1,
             update_close,
             "g1_build_accepted_log_row");
     check(builder_calls.size() == 1 &&
@@ -6287,8 +6404,8 @@ static void check_structural_main_update_contract(
               builder_statement,
               builder_statement_end),
           "log builder has exact accepted-owner/context/error arguments and a checked bool result");
-    check(builder_statement == global_failure_close + 1,
-          "accepted-row construction is the direct global-error fallthrough");
+    check(builder_statement == transaction_failure_close + 1,
+          "accepted-row construction is the direct post-transaction success fallthrough");
 
     const std::vector<std::string> row_failure_prefix = {
         "if", "(", "!", "log_row_ok", ")", "{",
@@ -6693,8 +6810,8 @@ static void check_structural_main_update_contract(
         {"break", ";"});
     check(breaks.size() == 6 &&
               breaks[0] < consumption_close &&
-              breaks[1] > global_failures[0] &&
-              breaks[1] < global_failure_close &&
+              breaks[1] > transaction_failures[0] &&
+              breaks[1] < transaction_failure_close &&
               breaks[2] > row_failures[0] &&
               breaks[2] < row_failure_close &&
               breaks[3] > suffix_failures[0] &&
@@ -8280,28 +8397,33 @@ static void check_structural_startup_and_input_contract(
         "if(!desired_strafe_ok){::controlled_runtime_error(startup_error);return1;}"
         "constchar*constcandidate_audit_environment="
         "::getenv(\"MM_CANDIDATE_AUDIT\");"
+        "constchar*constcandidate_trace_environment="
+        "::getenv(\"MM_CANDIDATE_TRACE\");"
+        "constchar*consttransaction_timings_environment="
+        "::getenv(\"MM_TRANSACTION_TIMINGS\");"
         "constG1ProcessConfigprocess_config{parsed_initial_search_time,"
         "parsed_ik_enabled,parsed_inertialize_blending_halflife,"
         "parsed_simulation_rotation_halflife,parsed_desired_strafe};";
     check(cpp_compact_tokens(
               main_tokens, startup_begins[0], startup_end) ==
               exact_startup,
-          "each direct getenv is nested in one checked parser result before immutable process_config construction");
+          "checked process controls and opt-in evidence paths freeze before immutable process_config construction");
 
     const char* environment_names[] = {
         "\"MM_SEARCHT\"", "\"MM_IK\"", "\"MM_HALFLIFE\"",
         "\"MM_SIMROT_HL\"", "\"MM_STRAFE\"",
-        "\"MM_CANDIDATE_AUDIT\"",
+        "\"MM_CANDIDATE_AUDIT\"", "\"MM_CANDIDATE_TRACE\"",
+        "\"MM_TRANSACTION_TIMINGS\"",
     };
     const std::vector<CppCallRecord> main_getenv = cpp_calls_named(
         main_tokens, 0, main_tokens.size(), "getenv");
     const std::vector<CppCallRecord> all_getenv = cpp_calls_named(
         controller_tokens, 0, controller_tokens.size(), "getenv");
-    check(main_getenv.size() == 6 && all_getenv.size() == 6 &&
+    check(main_getenv.size() == 8 && all_getenv.size() == 8 &&
               cpp_identifier_count(
                   controller_tokens, 0, controller_tokens.size(),
-                  "getenv") == 6,
-          "controller has exactly six direct process-environment reads");
+                  "getenv") == 8,
+          "controller has exactly six process controls and two macro-only evidence-path reads");
     for (std::size_t index = 0; index < main_getenv.size(); ++index) {
         check(main_getenv[index].key == "::getenv" &&
                   cpp_compact_tokens(
@@ -8311,7 +8433,7 @@ static void check_structural_startup_and_input_contract(
                       environment_names[index] &&
                   main_getenv[index].name >= startup_begins[0] &&
                   main_getenv[index].closing < startup_end,
-              "each environment key is one exact global-qualified startup call in declared order");
+              "each process or evidence environment key is one exact global-qualified startup call in declared order");
     }
     const char* forbidden_environment_apis[] = {
         "__environ", "environ", "putenv", "secure_getenv", "setenv",
@@ -9497,6 +9619,20 @@ static void test_controller_source_and_no_main_contract()
     check(!audit_controller_macros(
               macro_probe, audited_macro_names, macro_probe_error),
           "macro audit rejects an authenticated status-name definition");
+    macro_probe_error.clear();
+    macro_probe = tokenize_cpp_source(
+        "#define G1FrameStageIkFirstFoot decoy_stage\n",
+        macro_probe_error);
+    check(!audit_controller_macros(
+              macro_probe, audited_macro_names, macro_probe_error),
+          "macro audit rejects an authenticated split-stage definition");
+    macro_probe_error.clear();
+    macro_probe = tokenize_cpp_source(
+        "#undef G1FrameStageRawPoseCertificate\n",
+        macro_probe_error);
+    check(!audit_controller_macros(
+              macro_probe, audited_macro_names, macro_probe_error),
+          "macro audit rejects an authenticated split-stage undefinition");
     macro_probe_error.clear();
     macro_probe = tokenize_cpp_source(
         "#undef frame_status\n", macro_probe_error);
@@ -11542,10 +11678,1261 @@ static void test_production_no_seam_links_with_strict_recovery_provider()
           "the sole production coordinator call binds the real runner directly to the strict provider");
 }
 
-int main()
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM) && \
+    defined(G1_CANDIDATE_RECOVERY_ENABLE_TEST_SEAM)
+
+static const char* const CandidateTraceHeader =
+    "presentation_frame\tcandidate_slot\tcandidate_kind\tscore_owner\t"
+    "selected_frame\texecuted_frame\tsource_range\tcost_bits_hex\t"
+    "recovery_rank\tattempted\tcommon\traw\tik\trejection_stage\t"
+    "stop_reason\tlegacy_traversals\trecovery_provider_calls\t"
+    "recovery_traversals\taccelerated_count\texhaustive_count\t"
+    "oracle_equal";
+
+static float candidate_trace_float_from_bits(uint32_t bits)
 {
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+struct CandidateTraceTempFile
+{
+    char path[64] = "/tmp/g1-candidate-trace-XXXXXX";
+
+    CandidateTraceTempFile()
+    {
+        const int descriptor = ::mkstemp(path);
+        check(descriptor >= 0, "candidate trace temporary path is created");
+        check(::close(descriptor) == 0,
+              "candidate trace temporary descriptor closes");
+        check(::unlink(path) == 0,
+              "candidate trace temporary placeholder is removed");
+    }
+
+    ~CandidateTraceTempFile()
+    {
+        ::unlink(path);
+    }
+
+    std::string read() const
+    {
+        return read_source_file(path);
+    }
+};
+
+static std::vector<std::string> candidate_trace_split(
+    const std::string& text,
+    char delimiter)
+{
+    std::vector<std::string> fields;
+    std::size_t begin = 0U;
+    while (begin <= text.size()) {
+        const std::size_t end = text.find(delimiter, begin);
+        fields.push_back(text.substr(
+            begin,
+            end == std::string::npos ? std::string::npos : end - begin));
+        if (end == std::string::npos) break;
+        begin = end + 1U;
+    }
+    return fields;
+}
+
+static std::vector<std::vector<std::string> > candidate_trace_rows(
+    const std::string& text)
+{
+    std::vector<std::vector<std::string> > rows;
+    std::size_t begin = 0U;
+    while (begin < text.size()) {
+        const std::size_t end = text.find('\n', begin);
+        const std::size_t count = end == std::string::npos
+            ? text.size() - begin
+            : end - begin;
+        rows.push_back(candidate_trace_split(text.substr(begin, count), '\t'));
+        if (end == std::string::npos) break;
+        begin = end + 1U;
+    }
+    return rows;
+}
+
+static bool candidate_trace_record_equal(
+    const G1CandidateRecord& first,
+    const G1CandidateRecord& second)
+{
+    return first.kind == second.kind &&
+           first.selected_frame == second.selected_frame &&
+           first.executed_frame == second.executed_frame &&
+           first.source_range == second.source_range &&
+           terrain_float_bits(first.selected_cost) ==
+               terrain_float_bits(second.selected_cost) &&
+           first.recovery_rank == second.recovery_rank &&
+           first.transitioned == second.transitioned;
+}
+
+struct CandidateTraceFixture
+{
+    database db;
+    G1CandidateCertificationTrace trace;
+
+    CandidateTraceFixture()
+    {
+        make_database(db, 12);
+        db.features.set(20.0f);
+        db.features_offset.set(0.0f);
+        db.features_scale.set(1.0f);
+        for (int frame = 0; frame < 6; ++frame) {
+            for (uint32_t feature = 0U;
+                 feature < G1RecoveryFeatureCount;
+                 ++feature) {
+                db.features(frame, static_cast<int>(feature)) = 0.0f;
+            }
+            db.features(frame, 0) = static_cast<float>(frame + 1);
+        }
+        for (uint32_t feature = 0U;
+             feature < G1RecoveryFeatureCount;
+             ++feature) {
+            db.features(10, static_cast<int>(feature)) = 0.0f;
+        }
+        db.features(10, 0) = 10.0f;
+        database_build_bounds(db);
+
+        g1_frame_certification_trace_reset(trace);
+        trace.legacy_traversals = 1U;
+        trace.recovery_provider_calls = 1U;
+        trace.common_evaluations = 3U;
+        trace.raw_evaluations = 3U;
+        trace.ik_evaluations = 2U;
+        trace.recovery_request_available = true;
+        trace.recovery_request.db = &db;
+        trace.recovery_request.incumbent_frame = 10;
+        trace.recovery_request.legacy_selected_frame = 11;
+        trace.recovery_request.transition_cost = 0.0f;
+        trace.recovery_request.public_incumbent_cost = 100.0f;
+        trace.recovery_request.ignore_range_end = 0;
+        trace.recovery_request.ignore_surrounding = 0;
+        for (uint32_t feature = 0U;
+             feature < G1RecoveryFeatureCount;
+             ++feature) {
+            trace.recovery_request.raw_query[feature] = 0.0f;
+        }
+        rebuild_tail();
+
+        G1CandidateRecord legacy;
+        legacy.kind = G1CandidateLegacy;
+        legacy.selected_frame = 11;
+        legacy.executed_frame = 11;
+        legacy.source_range = 0;
+        legacy.selected_cost = candidate_trace_float_from_bits(
+            UINT32_C(0x3f800001));
+        legacy.recovery_rank = UINT32_MAX;
+        legacy.transitioned = true;
+        trace.attempts[0].candidate = legacy;
+        trace.attempts[0].score_owner = G1CandidateScoreLegacy;
+        trace.attempts[0].common = G1CandidateDispositionAccepted;
+        trace.attempts[0].raw = G1CandidateDispositionAccepted;
+        trace.attempts[0].ik = G1CandidateDispositionFiniteRejected;
+        trace.attempts[0].rejection_stage = G1FrameRejectIkCandidate;
+        trace.attempts[0].stop_reason = G1IkStopNoSwingCandidate;
+
+        trace.attempts[1].candidate = trace.recovery_set.records[0];
+        trace.attempts[1].score_owner = G1CandidateScoreStrictRecovery;
+        trace.attempts[1].common = G1CandidateDispositionAccepted;
+        trace.attempts[1].raw = G1CandidateDispositionFiniteRejected;
+        trace.attempts[1].ik = G1CandidateDispositionNotRun;
+        trace.attempts[1].rejection_stage =
+            G1FrameRejectPoseCertificate;
+        trace.attempts[1].stop_reason =
+            G1IkStopPoseClearanceRejected;
+
+        trace.attempts[2].candidate = trace.recovery_set.records[1];
+        trace.attempts[2].score_owner = G1CandidateScoreStrictRecovery;
+        trace.attempts[2].common = G1CandidateDispositionAccepted;
+        trace.attempts[2].raw = G1CandidateDispositionAccepted;
+        trace.attempts[2].ik = G1CandidateDispositionAccepted;
+        trace.attempt_count = 3U;
+    }
+
+    void rebuild_tail()
+    {
+        char error[512] = {};
+        check(g1_recovery_candidates_build(
+                  trace.recovery_set,
+                  trace.recovery_request,
+                  error,
+                  static_cast<int>(sizeof(error))) ==
+                  G1RecoveryProviderOk,
+              error);
+        check(trace.recovery_set.count == G1RecoveryTailCapacity,
+              "synthetic accelerated trace has six transitions plus incumbent");
+    }
+};
+
+static void candidate_trace_open_for_test(
+    G1CandidateTraceFile& file,
+    const CandidateTraceTempFile& temporary)
+{
+    char error[512] = {};
+    check(g1_candidate_trace_open(
+              file,
+              temporary.path,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+}
+
+static void candidate_trace_check_failed_without_write(
+    G1CandidateTraceFile& file,
+    const CandidateTraceTempFile& temporary,
+    const G1CandidateCertificationTrace& trace,
+    const std::string& before,
+    const char* message)
+{
+    char error[512] = {};
+    check(!g1_candidate_trace_append_after_transaction(
+              file,
+              78U,
+              trace,
+              error,
+              static_cast<int>(sizeof(error))) &&
+              error[0] != '\0' &&
+              temporary.read() == before,
+          message);
+}
+
+static void test_trace_serializes_slot_zero_complete_tail_and_attempts()
+{
+    CandidateTraceFixture fixture_value;
+    CandidateTraceTempFile temporary;
+    G1CandidateTraceFile file;
+    char error[512] = {};
+    G1CandidateTraceFile invalid_file;
+    check(!g1_candidate_trace_open(
+              invalid_file,
+              "relative-candidate-trace.tsv",
+              error,
+              static_cast<int>(sizeof(error))),
+          "candidate trace rejects a relative output path");
+    candidate_trace_open_for_test(file, temporary);
+    error[0] = '\0';
+    check(!g1_candidate_trace_open(
+              file,
+              temporary.path,
+              error,
+              static_cast<int>(sizeof(error))),
+          "candidate trace rejects an already-open owner");
+    error[0] = '\0';
+    check(g1_candidate_trace_append_after_transaction(
+              file,
+              77U,
+              fixture_value.trace,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+
+    const std::string serialized = temporary.read();
+    const std::vector<std::vector<std::string> > rows =
+        candidate_trace_rows(serialized);
+    check(rows.size() == 9U && rows[0].size() == 21U &&
+              serialized.rfind(
+                  std::string(CandidateTraceHeader) + "\n", 0U) == 0U,
+          "trace writes the exact header and eight complete candidate rows");
+    for (std::size_t row = 1U; row < rows.size(); ++row) {
+        check(rows[row].size() == 21U &&
+                  rows[row][0] == "77" &&
+                  rows[row][1] == std::to_string(row - 1U) &&
+                  rows[row][15] == "1" &&
+                  rows[row][16] == "1" &&
+                  rows[row][17] == "1" &&
+                  rows[row][18] == "7" &&
+                  rows[row][19] == "7" &&
+                  rows[row][20] == "1",
+              "every trace row carries exact transaction counters and oracle equality");
+    }
+    check(rows[1][2] == "legacy" && rows[1][3] == "legacy" &&
+              rows[1][9] == "1" &&
+              rows[1][10] == "accepted" &&
+              rows[1][11] == "accepted" &&
+              rows[1][12] == "finite-rejected" &&
+              rows[1][13] == "ik-candidate" &&
+              rows[1][14] == "no-swing-candidate" &&
+              rows[2][2] == "strict-recovery" &&
+              rows[2][3] == "strict-recovery" &&
+              rows[2][9] == "1" &&
+              rows[2][10] == "accepted" &&
+              rows[2][11] == "finite-rejected" &&
+              rows[2][12] == "not-run" &&
+              rows[3][9] == "1" &&
+              rows[3][10] == "accepted" &&
+              rows[3][11] == "accepted" &&
+              rows[3][12] == "accepted" &&
+              rows[8][2] == "incumbent" &&
+              rows[8][3] == "incumbent",
+          "slot zero and the attempted recovery prefix serialize authentic owners and dispositions");
+    g1_candidate_trace_close(file);
+    g1_candidate_trace_close(file);
+    check(file.stream == nullptr && !file.header_written,
+          "candidate trace close is idempotent and clears ownership");
+}
+
+static void test_trace_exhaustive_oracle_uses_exact_live_request_and_database()
+{
+    CandidateTraceFixture fixture_value;
+    const uint64_t database_before = database_logical_digest(fixture_value.db);
+    const G1RecoveryRequest request_before =
+        fixture_value.trace.recovery_request;
+    CandidateTraceTempFile temporary;
+    G1CandidateTraceFile file;
+    candidate_trace_open_for_test(file, temporary);
+    char error[512] = {};
+    check(g1_candidate_trace_append_after_transaction(
+              file,
+              77U,
+              fixture_value.trace,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+    const std::string authentic = temporary.read();
+    check(database_logical_digest(fixture_value.db) == database_before &&
+              fixture_value.trace.recovery_request.db == &fixture_value.db &&
+              fixture_value.trace.recovery_request.db == request_before.db &&
+              std::memcmp(
+                  fixture_value.trace.recovery_request.raw_query,
+                  request_before.raw_query,
+                  sizeof(request_before.raw_query)) == 0 &&
+              terrain_float_bits(
+                  fixture_value.trace.recovery_request.transition_cost) ==
+                  terrain_float_bits(request_before.transition_cost) &&
+              terrain_float_bits(
+                  fixture_value.trace.recovery_request
+                      .public_incumbent_cost) ==
+                  terrain_float_bits(request_before.public_incumbent_cost),
+          "oracle append preserves the exact live database and all request words");
+
+    G1CandidateCertificationTrace mutated = fixture_value.trace;
+    mutated.recovery_set.records[2].selected_frame = 9;
+    candidate_trace_check_failed_without_write(
+        file, temporary, mutated, authentic,
+        "an exhaustive frame mismatch fails before a transaction block");
+    mutated = fixture_value.trace;
+    mutated.recovery_set.records[2].selected_cost =
+        candidate_trace_float_from_bits(
+            terrain_float_bits(mutated.recovery_set.records[2].selected_cost) ^
+            UINT32_C(1));
+    candidate_trace_check_failed_without_write(
+        file, temporary, mutated, authentic,
+        "an exhaustive cost-word mismatch fails before a transaction block");
+    mutated = fixture_value.trace;
+    mutated.recovery_set.records[2].source_range = 1;
+    candidate_trace_check_failed_without_write(
+        file, temporary, mutated, authentic,
+        "an exhaustive source-range mismatch fails before a transaction block");
+    mutated = fixture_value.trace;
+    std::swap(
+        mutated.recovery_set.records[2],
+        mutated.recovery_set.records[3]);
+    candidate_trace_check_failed_without_write(
+        file, temporary, mutated, authentic,
+        "an exhaustive ordering mismatch fails before a transaction block");
+    mutated = fixture_value.trace;
+    mutated.recovery_set.records[2].recovery_rank = 5U;
+    candidate_trace_check_failed_without_write(
+        file, temporary, mutated, authentic,
+        "an exhaustive recovery-rank mismatch fails before a transaction block");
+    mutated = fixture_value.trace;
+    --mutated.recovery_set.count;
+    candidate_trace_check_failed_without_write(
+        file, temporary, mutated, authentic,
+        "an exhaustive count mismatch fails before a transaction block");
+
+    const std::string header_source =
+        read_source_file("g1_candidate_certification_trace.h");
+    const std::size_t oracle_call = header_source.find(
+        "g1_recovery_candidates_exhaustive_for_test(");
+    check(oracle_call != std::string::npos &&
+              header_source.find(
+                  "trace.recovery_request", oracle_call) !=
+                  std::string::npos,
+          "the same-build oracle call receives trace.recovery_request directly");
+    g1_candidate_trace_close(file);
+}
+
+static void test_trace_rejects_impossible_completed_transaction_grammars()
+{
+    bool all_rejected_without_mutation = true;
+    const auto report = [&all_rejected_without_mutation](
+        bool safe,
+        const char* mutation) {
+        if (!safe) {
+            std::fprintf(
+                stderr,
+                "candidate trace mutation was accepted, wrote bytes, or "
+                "mutated evidence: %s\n",
+                mutation);
+            all_rejected_without_mutation = false;
+        }
+    };
+    const auto expect_rejected = [&report](
+        const char* mutation,
+        const auto& mutate) {
+        CandidateTraceFixture fixture_value;
+        G1CandidateCertificationTrace mutated = fixture_value.trace;
+        mutate(mutated);
+        CandidateTraceTempFile temporary;
+        G1CandidateTraceFile file;
+        candidate_trace_open_for_test(file, temporary);
+        char error[512] = {};
+        check(g1_candidate_trace_append_after_transaction(
+                  file,
+                  77U,
+                  fixture_value.trace,
+                  error,
+                  static_cast<int>(sizeof(error))),
+              error);
+        const std::string before = temporary.read();
+        error[0] = '\0';
+        const bool rejected =
+            !g1_candidate_trace_append_after_transaction(
+                file,
+                78U,
+                mutated,
+                error,
+                static_cast<int>(sizeof(error)));
+        report(
+            rejected && error[0] != '\0' && temporary.read() == before,
+            mutation);
+        g1_candidate_trace_close(file);
+    };
+
+    expect_rejected(
+        "legacy traversal counter disagrees with slot-zero legacy owner",
+        [](G1CandidateCertificationTrace& trace) {
+            trace.legacy_traversals = 0U;
+        });
+    expect_rejected(
+        "recovery set omits its one accelerated traversal",
+        [](G1CandidateCertificationTrace& trace) {
+            trace.recovery_set.work.accelerated_traversals = 0U;
+        });
+    expect_rejected(
+        "a request and tail follow an incumbent slot zero",
+        [](G1CandidateCertificationTrace& trace) {
+            trace.legacy_traversals = 0U;
+            trace.attempts[0].candidate.kind = G1CandidateIncumbent;
+            trace.attempts[0].score_owner = G1CandidateScoreIncumbent;
+        });
+    expect_rejected(
+        "slot-zero selected frame disagrees with its exact request",
+        [](G1CandidateCertificationTrace& trace) {
+            --trace.attempts[0].candidate.selected_frame;
+        });
+    expect_rejected(
+        "an attempted record follows terminal dual acceptance",
+        [](G1CandidateCertificationTrace& trace) {
+            trace.attempts[3].candidate = trace.recovery_set.records[2];
+            trace.attempts[3].score_owner =
+                G1CandidateScoreStrictRecovery;
+            trace.attempts[3].common =
+                G1CandidateDispositionFiniteRejected;
+            trace.attempts[3].raw = G1CandidateDispositionNotRun;
+            trace.attempts[3].ik = G1CandidateDispositionNotRun;
+            trace.attempts[3].rejection_stage = G1FrameRejectFootprint;
+            trace.attempts[3].stop_reason = G1IkStopFootprintBlocked;
+            trace.attempt_count = 4U;
+            trace.common_evaluations = 4U;
+        });
+    expect_rejected(
+        "accepted common certification skips raw certification",
+        [](G1CandidateCertificationTrace& trace) {
+            trace.attempts[1].raw = G1CandidateDispositionNotRun;
+            trace.attempts[1].rejection_stage = G1FrameRejectNone;
+            trace.attempts[1].stop_reason = G1IkStopNone;
+        });
+    expect_rejected(
+        "raw acceptance follows a finite common rejection",
+        [](G1CandidateCertificationTrace& trace) {
+            trace.attempts[1].common =
+                G1CandidateDispositionFiniteRejected;
+            trace.attempts[1].raw = G1CandidateDispositionAccepted;
+            trace.raw_evaluations = 2U;
+        });
+    expect_rejected(
+        "evaluation counters disagree with the attempted prefix",
+        [](G1CandidateCertificationTrace& trace) {
+            --trace.common_evaluations;
+        });
+    expect_rejected(
+        "recovery work materialization disagrees with rows tested",
+        [](G1CandidateCertificationTrace& trace) {
+            ++trace.recovery_set.work.full_scores_materialized;
+        });
+    expect_rejected(
+        "a finite rejection has no stage or stop reason",
+        [](G1CandidateCertificationTrace& trace) {
+            trace.attempts[0].rejection_stage = G1FrameRejectNone;
+            trace.attempts[0].stop_reason = G1IkStopNone;
+        });
+    expect_rejected(
+        "an accepted record retains rejection evidence",
+        [](G1CandidateCertificationTrace& trace) {
+            trace.attempts[2].rejection_stage =
+                G1FrameRejectIkCandidate;
+            trace.attempts[2].stop_reason = G1IkStopNoSwingCandidate;
+        });
+    expect_rejected(
+        "finite rejection stage and stop reason are not a canonical pair",
+        [](G1CandidateCertificationTrace& trace) {
+            trace.attempts[1].rejection_stage =
+                G1FrameRejectIkCandidate;
+        });
+    expect_rejected(
+        "a non-accepting attempted prefix stops before tail exhaustion",
+        [](G1CandidateCertificationTrace& trace) {
+            trace.attempts[2].ik =
+                G1CandidateDispositionFiniteRejected;
+            trace.attempts[2].rejection_stage =
+                G1FrameRejectIkCandidate;
+            trace.attempts[2].stop_reason = G1IkStopTargetUnreachable;
+        });
+    expect_rejected(
+        "controller-excluded global-error disposition reaches append",
+        [](G1CandidateCertificationTrace& trace) {
+            trace.attempts[2].ik = G1CandidateDispositionGlobalError;
+        });
+    expect_rejected(
+        "an unavailable request retains live request evidence",
+        [](G1CandidateCertificationTrace& trace) {
+            trace.recovery_request_available = false;
+            trace.recovery_provider_calls = 0U;
+            g1_frame_recovery_set_reset(trace.recovery_set);
+            trace.attempt_count = 1U;
+            trace.common_evaluations = 1U;
+            trace.raw_evaluations = 1U;
+            trace.ik_evaluations = 1U;
+        });
+    expect_rejected(
+        "an unavailable request retains recovery work evidence",
+        [](G1CandidateCertificationTrace& trace) {
+            trace.recovery_request_available = false;
+            trace.recovery_provider_calls = 0U;
+            g1_frame_recovery_request_reset(trace.recovery_request);
+            g1_frame_recovery_set_reset(trace.recovery_set);
+            trace.recovery_set.work.rows_tested = 1U;
+            trace.recovery_set.work.full_scores_materialized = 1U;
+            trace.attempt_count = 1U;
+            trace.common_evaluations = 1U;
+            trace.raw_evaluations = 1U;
+            trace.ik_evaluations = 1U;
+        });
+    expect_rejected(
+        "a finite legacy slot zero omits its required recovery request",
+        [](G1CandidateCertificationTrace& trace) {
+            trace.recovery_request_available = false;
+            trace.recovery_provider_calls = 0U;
+            g1_frame_recovery_request_reset(trace.recovery_request);
+            g1_frame_recovery_set_reset(trace.recovery_set);
+            trace.attempt_count = 1U;
+            trace.common_evaluations = 1U;
+            trace.raw_evaluations = 1U;
+            trace.ik_evaluations = 1U;
+        });
+    expect_rejected(
+        "rejection stage lies outside its exact enum range",
+        [](G1CandidateCertificationTrace& trace) {
+            trace.attempts[0].rejection_stage =
+                static_cast<G1FrameRejectionStage>(UINT32_MAX);
+        });
+    expect_rejected(
+        "stop reason lies outside its exact enum range",
+        [](G1CandidateCertificationTrace& trace) {
+            trace.attempts[0].stop_reason =
+                static_cast<G1IkStopReason>(UINT32_MAX);
+        });
+    expect_rejected(
+        "an attempt slot beyond attempt_count retains hidden evidence",
+        [](G1CandidateCertificationTrace& trace) {
+            trace.attempts[trace.attempt_count].candidate.selected_frame = 4;
+        });
+    expect_rejected(
+        "a hidden attempt slot contains invalid unfixed enum words",
+        [](G1CandidateCertificationTrace& trace) {
+            trace.attempts[trace.attempt_count].rejection_stage =
+                static_cast<G1FrameRejectionStage>(UINT32_MAX);
+            trace.attempts[trace.attempt_count].stop_reason =
+                static_cast<G1IkStopReason>(UINT32_MAX);
+        });
+    expect_rejected(
+        "a recovery slot beyond count retains hidden evidence",
+        [](G1CandidateCertificationTrace& trace) {
+            trace.recovery_set.records[trace.recovery_set.count]
+                .selected_frame = 4;
+        });
+
+    {
+        CandidateTraceFixture fixture_value;
+        fixture_value.trace.recovery_request.raw_query[0] = 1.0f;
+        fixture_value.rebuild_tail();
+        fixture_value.trace.attempts[1].candidate =
+            fixture_value.trace.recovery_set.records[0];
+        fixture_value.trace.attempts[2].candidate =
+            fixture_value.trace.recovery_set.records[1];
+        CandidateTraceTempFile temporary;
+        G1CandidateTraceFile file;
+        candidate_trace_open_for_test(file, temporary);
+        char error[512] = {};
+        check(g1_candidate_trace_append_after_transaction(
+                  file, 77U, fixture_value.trace, error,
+                  static_cast<int>(sizeof(error))),
+              error);
+        const std::string output_before = temporary.read();
+        const G1CandidateCertificationTrace trace_before =
+            fixture_value.trace;
+        unsigned char* const query_bytes =
+            reinterpret_cast<unsigned char*>(
+                &fixture_value.trace.recovery_request.raw_query[0]);
+        std::size_t nonzero = 0U;
+        while (nonzero < sizeof(float) && query_bytes[nonzero] == 0U) {
+            ++nonzero;
+        }
+        check(nonzero < sizeof(float),
+              "trace-alias fixture has one nonzero query byte");
+        const G1CandidateTraceFile file_before = file;
+        const bool rejected =
+            !g1_candidate_trace_append_after_transaction(
+                file,
+                78U,
+                fixture_value.trace,
+                reinterpret_cast<char*>(query_bytes + nonzero),
+                1);
+        report(
+            rejected &&
+                std::memcmp(
+                    &fixture_value.trace,
+                    &trace_before,
+                    sizeof(trace_before)) == 0 &&
+                file.stream == file_before.stream &&
+                file.header_written == file_before.header_written &&
+                temporary.read() == output_before,
+            "diagnostic storage aliases the immutable trace request");
+        g1_candidate_trace_close(file);
+    }
+
+    {
+        CandidateTraceFixture fixture_value;
+        CandidateTraceTempFile temporary;
+        G1CandidateTraceFile file;
+        candidate_trace_open_for_test(file, temporary);
+        char error[512] = {};
+        check(g1_candidate_trace_append_after_transaction(
+                  file, 77U, fixture_value.trace, error,
+                  static_cast<int>(sizeof(error))),
+              error);
+        const std::string output_before = temporary.read();
+        const G1CandidateTraceFile file_before = file;
+        const bool rejected =
+            !g1_candidate_trace_append_after_transaction(
+                file,
+                78U,
+                fixture_value.trace,
+                reinterpret_cast<char*>(&file.header_written),
+                1);
+        report(
+            rejected && file.stream == file_before.stream &&
+                file.header_written == file_before.header_written &&
+                temporary.read() == output_before,
+            "diagnostic storage aliases the trace-file owner");
+        g1_candidate_trace_close(file);
+    }
+
+    const auto check_database_alias = [&report](
+        bool second_owner) {
+        CandidateTraceFixture fixture_value;
+        CandidateTraceTempFile temporary;
+        G1CandidateTraceFile file;
+        candidate_trace_open_for_test(file, temporary);
+        char error[512] = {};
+        check(g1_candidate_trace_append_after_transaction(
+                  file, 77U, fixture_value.trace, error,
+                  static_cast<int>(sizeof(error))),
+              error);
+        const std::string output_before = temporary.read();
+        const uint64_t digest_before =
+            database_logical_digest(fixture_value.db);
+        unsigned char* bytes = second_owner
+            ? reinterpret_cast<unsigned char*>(
+                  fixture_value.db.range_stops.data)
+            : reinterpret_cast<unsigned char*>(
+                  fixture_value.db.features.data);
+        const std::size_t byte_count = second_owner
+            ? static_cast<std::size_t>(fixture_value.db.range_stops.size) *
+                  sizeof(int)
+            : static_cast<std::size_t>(fixture_value.db.features.rows) *
+                  static_cast<std::size_t>(fixture_value.db.features.cols) *
+                  sizeof(float);
+        std::size_t nonzero = 0U;
+        while (nonzero < byte_count && bytes[nonzero] == 0U) ++nonzero;
+        check(nonzero < byte_count,
+              "database-alias fixture has one nonzero owner byte");
+        const unsigned char byte_before = bytes[nonzero];
+        const bool rejected =
+            !g1_candidate_trace_append_after_transaction(
+                file,
+                78U,
+                fixture_value.trace,
+                reinterpret_cast<char*>(bytes + nonzero),
+                1);
+        report(
+            rejected && bytes[nonzero] == byte_before &&
+                database_logical_digest(fixture_value.db) == digest_before &&
+                temporary.read() == output_before,
+            second_owner
+                ? "diagnostic storage aliases a database array1d owner"
+                : "diagnostic storage aliases a database array2d owner");
+        g1_candidate_trace_close(file);
+    };
+    check_database_alias(false);
+    check_database_alias(true);
+
+    {
+        CandidateTraceFixture fixture_value;
+        CandidateTraceTempFile temporary;
+        G1CandidateTraceFile file;
+        candidate_trace_open_for_test(file, temporary);
+        char error[512] = {};
+        check(g1_candidate_trace_append_after_transaction(
+                  file, 77U, fixture_value.trace, error,
+                  static_cast<int>(sizeof(error))),
+              error);
+        const std::string output_before = temporary.read();
+        unsigned char db_before[sizeof(database)] = {};
+        std::memcpy(db_before, &fixture_value.db, sizeof(db_before));
+        unsigned char* const object_bytes =
+            reinterpret_cast<unsigned char*>(
+                &fixture_value.db.features_offset.size);
+        std::size_t nonzero = 0U;
+        while (nonzero < sizeof(fixture_value.db.features_offset.size) &&
+               object_bytes[nonzero] == 0U) {
+            ++nonzero;
+        }
+        check(nonzero < sizeof(fixture_value.db.features_offset.size),
+              "database object has one nonzero owner byte");
+        const bool rejected =
+            !g1_candidate_trace_append_after_transaction(
+                file,
+                78U,
+                fixture_value.trace,
+                reinterpret_cast<char*>(object_bytes + nonzero),
+                1);
+        report(
+            rejected &&
+                std::memcmp(
+                    &fixture_value.db, db_before, sizeof(db_before)) == 0 &&
+                temporary.read() == output_before,
+            "diagnostic storage aliases the database owner object");
+        g1_candidate_trace_close(file);
+    }
+
+    {
+        CandidateTraceTempFile temporary;
+        G1CandidateTraceFile file;
+        file.header_written = true;
+        const G1CandidateTraceFile file_before = file;
+        const bool rejected = !g1_candidate_trace_open(
+            file,
+            temporary.path,
+            reinterpret_cast<char*>(&file.header_written),
+            1);
+        report(
+            rejected && file.stream == file_before.stream &&
+                file.header_written == file_before.header_written,
+            "open diagnostic storage aliases its file owner");
+        if (file.stream != nullptr) g1_candidate_trace_close(file);
+    }
+
+    {
+        CandidateTraceTempFile temporary;
+        G1CandidateTraceFile file;
+        char path_before[sizeof(temporary.path)] = {};
+        std::memcpy(path_before, temporary.path, sizeof(path_before));
+        unsigned char* const path_bytes =
+            reinterpret_cast<unsigned char*>(temporary.path);
+        std::size_t nonzero = 0U;
+        while (nonzero < std::strlen(temporary.path) &&
+               path_bytes[nonzero] == 0U) {
+            ++nonzero;
+        }
+        check(nonzero < std::strlen(temporary.path),
+              "trace path has one nonzero byte");
+        const bool rejected = !g1_candidate_trace_open(
+            file,
+            temporary.path,
+            reinterpret_cast<char*>(path_bytes + nonzero),
+            1);
+        report(
+            rejected && file.stream == nullptr && !file.header_written &&
+                std::memcmp(
+                    temporary.path, path_before, sizeof(path_before)) == 0,
+            "open diagnostic storage aliases its immutable path");
+        if (file.stream != nullptr) g1_candidate_trace_close(file);
+    }
+
+    {
+        CandidateTraceFixture fixture_value;
+        CandidateTraceTempFile temporary;
+        G1CandidateTraceFile file;
+        candidate_trace_open_for_test(file, temporary);
+        const std::string output_before = temporary.read();
+        report(
+            !g1_candidate_trace_append_after_transaction(
+                file, 78U, fixture_value.trace, nullptr, 1) &&
+                temporary.read() == output_before,
+            "append receives null diagnostic storage with positive capacity");
+        g1_candidate_trace_close(file);
+    }
+    {
+        CandidateTraceTempFile temporary;
+        G1CandidateTraceFile file;
+        report(
+            !g1_candidate_trace_open(
+                file, temporary.path, nullptr, 1) &&
+                file.stream == nullptr && !file.header_written,
+            "open receives null diagnostic storage with positive capacity");
+    }
+    {
+        CandidateTraceFixture fixture_value;
+        CandidateTraceTempFile temporary;
+        G1CandidateTraceFile file;
+        candidate_trace_open_for_test(file, temporary);
+        const std::string output_before = temporary.read();
+        char error[1] = {'x'};
+        report(
+            !g1_candidate_trace_append_after_transaction(
+                file, 78U, fixture_value.trace, error, -1) &&
+                error[0] == 'x' && temporary.read() == output_before,
+            "append receives a negative diagnostic capacity");
+        g1_candidate_trace_close(file);
+    }
+    {
+        CandidateTraceTempFile temporary;
+        G1CandidateTraceFile file;
+        char error[1] = {'x'};
+        report(
+            !g1_candidate_trace_open(
+                file, temporary.path, error, -1) &&
+                error[0] == 'x' && file.stream == nullptr &&
+                !file.header_written,
+            "open receives a negative diagnostic capacity");
+    }
+
+    check(all_rejected_without_mutation,
+          "every impossible completed trace grammar and alias is rejected before mutation or output");
+}
+
+static void test_trace_fails_instead_of_truncating_ninth_record()
+{
+    CandidateTraceFixture fixture_value;
+    fixture_value.trace.recovery_set.count = G1CandidateAttemptCapacity;
+    fixture_value.trace.recovery_set.records[7] =
+        fixture_value.trace.recovery_set.records[6];
+    CandidateTraceTempFile temporary;
+    G1CandidateTraceFile file;
+    candidate_trace_open_for_test(file, temporary);
+    candidate_trace_check_failed_without_write(
+        file,
+        temporary,
+        fixture_value.trace,
+        std::string(),
+        "slot zero plus an eighth tail record fails instead of truncating the ninth row");
+    g1_candidate_trace_close(file);
+}
+
+static void test_trace_is_written_only_after_candidate_selection()
+{
+    fixture value;
+    configure_real_candidate_fixture(value, true, false);
+    CandidateTraceTempFile temporary;
+    G1CandidateTraceFile file;
+    candidate_trace_open_for_test(file, temporary);
+    G1CandidateCertificationTrace trace;
+    char error[1024] = {};
+    check(run_real_candidate_fixture(
+              value,
+              trace,
+              error,
+              static_cast<int>(sizeof(error))) ==
+              G1FrameTransactionAccepted &&
+              value.runtime.accepted_state.frame_index ==
+                  RealCandidateBExecutedFrame &&
+              temporary.read().empty(),
+          "candidate selection completes before the trace file has any bytes");
+    check(g1_candidate_trace_append_after_transaction(
+              file,
+              static_cast<uint32_t>(value.external.input.presentation_frame),
+              trace,
+              error,
+              static_cast<int>(sizeof(error))) &&
+              !temporary.read().empty(),
+          error);
+
+    const std::string controller_source = read_source_file("controller.cpp");
+    const std::size_t transaction_call = controller_source.find(
+        "::g1_frame_transaction_run(");
+    const std::size_t trace_call = controller_source.find(
+        "g1_candidate_trace_append_after_transaction(");
+    const std::string coordinator_source =
+        read_source_file("g1_frame_transaction.h");
+    check(transaction_call != std::string::npos &&
+              trace_call != std::string::npos &&
+              trace_call > transaction_call &&
+              coordinator_source.find(
+                  "g1_candidate_trace_append_after_transaction") ==
+                  std::string::npos,
+          "trace append exists only in main after the outer transaction call");
+
+    const std::string trace_header_source =
+        read_source_file("g1_candidate_certification_trace.h");
+    const std::string stage_owner =
+        "g1_frame_rejection_stage_name(";
+    const std::string stage_mapping =
+        "case G1FrameRejectLandingPatch: return \"landing-patch\";";
+    const std::size_t owner_definition =
+        coordinator_source.find(stage_owner);
+    const std::size_t controller_owner_call =
+        controller_source.find(stage_owner);
+    const std::size_t trace_owner_call =
+        trace_header_source.find(stage_owner);
+    check(owner_definition != std::string::npos &&
+              coordinator_source.find(
+                  stage_owner, owner_definition + stage_owner.size()) ==
+                  std::string::npos &&
+              controller_owner_call != std::string::npos &&
+              controller_source.find(
+                  stage_owner,
+                  controller_owner_call + stage_owner.size()) ==
+                  std::string::npos &&
+              trace_owner_call != std::string::npos &&
+              trace_header_source.find(
+                  stage_owner, trace_owner_call + stage_owner.size()) ==
+                  std::string::npos &&
+              coordinator_source.find(stage_mapping) !=
+                  std::string::npos &&
+              controller_source.find(stage_mapping) ==
+                  std::string::npos &&
+              trace_header_source.find(stage_mapping) ==
+                  std::string::npos &&
+              controller_source.find("g1_log_rejection_stage_name") ==
+                  std::string::npos &&
+              trace_header_source.find("rejection_stage_text") ==
+                  std::string::npos,
+          "the frame header solely owns rejection-stage text while controller and trace call it once");
+
+    const std::string provider_source =
+        read_source_file("g1_candidate_recovery.cpp");
+    const std::size_t provider_begin = provider_source.find(
+        "G1RecoveryProviderStatus g1_recovery_candidates_build(");
+    const std::size_t provider_end = provider_source.find(
+        "#if defined(G1_CANDIDATE_RECOVERY_ENABLE_TEST_SEAM)",
+        provider_begin);
+    check(provider_begin != std::string::npos &&
+              provider_end != std::string::npos &&
+              provider_source.substr(
+                  provider_begin, provider_end - provider_begin).find(
+                      "exhaustive_for_test") == std::string::npos,
+          "the production recovery provider contains no exhaustive reference");
+    g1_candidate_trace_close(file);
+}
+
+static void test_exhaustive_oracle_result_cannot_change_selected_candidate()
+{
+    fixture value;
+    configure_real_candidate_fixture(value, true, false);
+    G1CandidateCertificationTrace authentic;
+    char error[1024] = {};
+    check(run_real_candidate_fixture(
+              value,
+              authentic,
+              error,
+              static_cast<int>(sizeof(error))) ==
+              G1FrameTransactionAccepted,
+          error);
+    const uint64_t state_before =
+        state_logical_digest(value.runtime.accepted_state);
+    const uint64_t diagnostic_before =
+        diagnostic_logical_digest(value.runtime.accepted_diagnostic);
+    const uint64_t publication_before =
+        publication_logical_digest(value.runtime.publication);
+    const G1CandidateRecord selected_before = authentic.attempts[1].candidate;
+    const G1CandidateCertificationTrace trace_before = authentic;
+    const uint32_t legacy_before = authentic.legacy_traversals;
+    const uint32_t provider_before = authentic.recovery_provider_calls;
+
+    CandidateTraceTempFile temporary;
+    G1CandidateTraceFile file;
+    candidate_trace_open_for_test(file, temporary);
+    check(g1_candidate_trace_append_after_transaction(
+              file,
+              static_cast<uint32_t>(value.external.input.presentation_frame),
+              authentic,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+    const std::string output_before = temporary.read();
+
+    G1CandidateCertificationTrace mismatched = authentic;
+    check(mismatched.recovery_set.count >= 2U,
+          "post-selection isolation fixture retains an unattempted tail record");
+    mismatched.recovery_set.records[1].selected_cost =
+        candidate_trace_float_from_bits(
+            terrain_float_bits(
+                mismatched.recovery_set.records[1].selected_cost) ^
+            UINT32_C(1));
+    candidate_trace_check_failed_without_write(
+        file,
+        temporary,
+        mismatched,
+        output_before,
+        "a copied accelerated-set cost mismatch cannot alter output or selection");
+
+    G1CandidateCertificationTrace corrupt_request = authentic;
+    corrupt_request.recovery_request.raw_query[0] =
+        std::numeric_limits<float>::quiet_NaN();
+    candidate_trace_check_failed_without_write(
+        file,
+        temporary,
+        corrupt_request,
+        output_before,
+        "a copied request that globally errors in exhaustive traversal cannot alter output or selection");
+
+    check(state_logical_digest(value.runtime.accepted_state) == state_before &&
+              diagnostic_logical_digest(value.runtime.accepted_diagnostic) ==
+                  diagnostic_before &&
+              publication_logical_digest(value.runtime.publication) ==
+                  publication_before &&
+              candidate_trace_record_equal(
+                  authentic.attempts[1].candidate,
+                  selected_before) &&
+              std::memcmp(
+                  &authentic, &trace_before, sizeof(authentic)) == 0 &&
+              authentic.legacy_traversals == legacy_before &&
+              authentic.recovery_provider_calls == provider_before &&
+              temporary.read() == output_before,
+          "oracle success and failures leave accepted state, selection, trace, counters, and complete output byte-identical");
+    g1_candidate_trace_close(file);
+}
+
+static void test_unattempted_tail_records_are_not_run_in_trace()
+{
+    CandidateTraceFixture fixture_value;
+    CandidateTraceTempFile temporary;
+    G1CandidateTraceFile file;
+    candidate_trace_open_for_test(file, temporary);
+    char error[512] = {};
+    check(g1_candidate_trace_append_after_transaction(
+              file,
+              77U,
+              fixture_value.trace,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+    const std::vector<std::vector<std::string> > rows =
+        candidate_trace_rows(temporary.read());
+    check(rows.size() == 9U, "unattempted-tail trace has every row");
+    for (std::size_t row = 4U; row < rows.size(); ++row) {
+        check(rows[row][9] == "0" &&
+                  rows[row][10] == "not-run" &&
+                  rows[row][11] == "not-run" &&
+                  rows[row][12] == "not-run" &&
+                  rows[row][13] == "none" &&
+                  rows[row][14] == "none",
+              "every materialized record after acceptance remains unattempted and not-run");
+    }
+    g1_candidate_trace_close(file);
+}
+
+static void test_trace_cost_words_are_hex_not_reformatted_floats()
+{
+    CandidateTraceFixture fixture_value;
+    CandidateTraceTempFile temporary;
+    G1CandidateTraceFile file;
+    candidate_trace_open_for_test(file, temporary);
+    char error[512] = {};
+    check(g1_candidate_trace_append_after_transaction(
+              file,
+              77U,
+              fixture_value.trace,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+    const std::vector<std::vector<std::string> > rows =
+        candidate_trace_rows(temporary.read());
+    check(rows[1][7] == "3f800001" && rows[1][7].size() == 8U &&
+              rows[1][7].find('.') == std::string::npos &&
+              rows[1][7].find('e') == std::string::npos,
+          "trace emits the exact lowercase eight-digit cost word without float formatting");
+    g1_candidate_trace_close(file);
+}
+
+static void test_trace_slot_zero_uses_authenticated_score_owner()
+{
+    for (int variant = 0; variant < 3; ++variant) {
+        fixture value;
+        configure_real_candidate_fixture(value, false, false);
+        if (variant == 1) {
+            value.runtime.accepted_state.search_timer =
+                value.runtime.accepted_state.search_time;
+        } else if (variant == 2) {
+            value.external.tuning.mode = G1_TestSequential;
+            value.external.tuning.frame_limit = 1;
+        }
+        G1CandidateCertificationTrace trace;
+        char error[1024] = {};
+        check(run_real_candidate_fixture(
+                  value,
+                  trace,
+                  ::g1_recovery_candidates_build,
+                  nullptr,
+                  error,
+                  static_cast<int>(sizeof(error))) ==
+                  G1FrameTransactionAccepted,
+              error);
+        const G1CandidateKind expected_kind = variant == 0
+            ? G1CandidateLegacy
+            : G1CandidateIncumbent;
+        const G1CandidateScoreOwner expected_owner = variant == 0
+            ? G1CandidateScoreLegacy
+            : G1CandidateScoreIncumbent;
+        const char* const expected_text = variant == 0
+            ? "legacy"
+            : "incumbent";
+        check(trace.attempt_count == 1U &&
+                  trace.attempts[0].candidate.kind == expected_kind &&
+                  trace.attempts[0].score_owner == expected_owner,
+              "each slot-zero-only case authenticates its exact score owner");
+
+        CandidateTraceTempFile temporary;
+        G1CandidateTraceFile file;
+        candidate_trace_open_for_test(file, temporary);
+        check(g1_candidate_trace_append_after_transaction(
+                  file,
+                  static_cast<uint32_t>(
+                      value.external.input.presentation_frame),
+                  trace,
+                  error,
+                  static_cast<int>(sizeof(error))),
+              error);
+        const std::vector<std::vector<std::string> > rows =
+            candidate_trace_rows(temporary.read());
+        check(rows.size() == 2U &&
+                  rows[1][2] == expected_text &&
+                  rows[1][3] == expected_text,
+              "scheduled legacy, unscheduled, and matching-disabled slot zero text follows authenticated ownership");
+        const std::string authentic = temporary.read();
+        G1CandidateCertificationTrace mismatched = trace;
+        mismatched.attempts[0].score_owner = variant == 0
+            ? G1CandidateScoreIncumbent
+            : G1CandidateScoreLegacy;
+        candidate_trace_check_failed_without_write(
+            file,
+            temporary,
+            mismatched,
+            authentic,
+            "candidate kind and authenticated score-owner mismatch fails instead of relabeling");
+        g1_candidate_trace_close(file);
+    }
+}
+
+static void test_benchmark_timestamp_surrounds_only_outer_transaction()
+{
+    const std::string source = read_source_file("controller.cpp");
+    const std::size_t begin = source.find(
+        "const auto transaction_begin = std::chrono::steady_clock::now();");
+    const std::size_t end = source.find(
+        "const auto transaction_end = std::chrono::steady_clock::now();",
+        begin);
+    check(begin != std::string::npos && end != std::string::npos && end > begin,
+          "benchmark source has exact steady-clock begin and end timestamps");
+    std::string token_error;
+    const std::vector<CppToken> timed_tokens = tokenize_cpp_source(
+        source.substr(begin, end - begin), token_error);
+    check(token_error.empty(),
+          token_error.empty() ? "benchmark interval tokenizes" :
+                                token_error.c_str());
+    const std::vector<CppCallRecord> transactions = cpp_calls_named(
+        timed_tokens, 0, timed_tokens.size(), "g1_frame_transaction_run");
+    const char* const forbidden[] = {
+        "BeginDrawing", "EndDrawing", "DrawModel", "fwrite", "fflush",
+        "g1_build_accepted_log_row", "g1_build_task7_log_suffix",
+        "g1_candidate_trace_append_after_transaction",
+    };
+    bool clean = transactions.size() == 1U &&
+        transactions[0].key == "::g1_frame_transaction_run";
+    for (const char* identifier : forbidden) {
+        clean = clean && cpp_identifier_count(
+            timed_tokens, 0, timed_tokens.size(), identifier) == 0U;
+    }
+    const std::size_t append = source.find(
+        "transaction_timings.append(transaction_end - transaction_begin);",
+        end);
+    check(clean && append != std::string::npos && append > end &&
+              source.find("presentation_frame\\tduration_ns") !=
+                  std::string::npos,
+          "only the outer transaction is timed and all formatting, I/O, logging, rendering, and trace work follows the end timestamp");
+}
+
+static void emit_candidate_trace_transcript()
+{
+    CandidateTraceFixture fixture_value;
+    CandidateTraceTempFile temporary;
+    G1CandidateTraceFile file;
+    candidate_trace_open_for_test(file, temporary);
+    char error[512] = {};
+    check(g1_candidate_trace_append_after_transaction(
+              file,
+              77U,
+              fixture_value.trace,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+    g1_candidate_trace_close(file);
+    const std::string transcript = temporary.read();
+    check(std::fwrite(
+              transcript.data(),
+              1U,
+              transcript.size(),
+              stdout) == transcript.size(),
+          "candidate trace transcript writes completely");
+}
+
+static void run_candidate_trace_tests()
+{
+    test_trace_serializes_slot_zero_complete_tail_and_attempts();
+    test_trace_exhaustive_oracle_uses_exact_live_request_and_database();
+    test_trace_rejects_impossible_completed_transaction_grammars();
+    test_trace_fails_instead_of_truncating_ninth_record();
+    test_trace_is_written_only_after_candidate_selection();
+    test_exhaustive_oracle_result_cannot_change_selected_candidate();
+    test_unattempted_tail_records_are_not_run_in_trace();
+    test_trace_cost_words_are_hex_not_reformatted_floats();
+    test_trace_slot_zero_uses_authenticated_score_owner();
+    test_benchmark_timestamp_surrounds_only_outer_transaction();
+}
+
+#endif
+
+int main(int argc, char** argv)
+{
+    static_cast<void>(argv);
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM) && \
+    defined(G1_CANDIDATE_RECOVERY_ENABLE_TEST_SEAM)
+    if (argc == 2 && std::strcmp(argv[1], "--trace-transcript") == 0) {
+        run_candidate_trace_tests();
+        emit_candidate_trace_transcript();
+        return 0;
+    }
+#endif
+    if (argc != 1) return 2;
     test_production_root_reach_digest_ownership();
     test_fixed_nonassociative_root_reach_fk_ownership();
+    test_live_velocity_fast_oracle_tolerance_is_bounded();
     test_real_runner_covers_all_six_modes_and_lowerings();
     test_scene_cycle_reaches_exact_dwell_boundary();
     test_search_inertialization_and_simulation_tuning_oracles();
@@ -11579,5 +12966,9 @@ int main()
     test_genuine_begin_time_safe_stop();
     test_real_pose_certificate_classification();
     test_controller_source_and_no_main_contract();
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM) && \
+    defined(G1_CANDIDATE_RECOVERY_ENABLE_TEST_SEAM)
+    run_candidate_trace_tests();
+#endif
     return 0;
 }

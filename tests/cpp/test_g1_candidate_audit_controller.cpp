@@ -1,6 +1,15 @@
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-result"
+#endif
+
 #define main g1_candidate_audit_embedded_controller_main
 #include "controller.cpp"
 #undef main
+
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
 #include <cerrno>
 #include <cstdio>

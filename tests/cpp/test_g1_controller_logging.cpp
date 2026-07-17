@@ -1281,6 +1281,54 @@ static void emit_bounded_fixtures(const char* directory)
     }
 }
 
+static void test_no_seam_preprocessed_controller_has_no_trace_interface()
+{
+    char path[] = "/tmp/g1-controller-no-seam-XXXXXX";
+    const int descriptor = ::mkstemp(path);
+    logging_check(descriptor >= 0,
+                  "no-seam preprocessing temporary file is created");
+    logging_check(::close(descriptor) == 0,
+                  "no-seam preprocessing temporary descriptor closes");
+    char command[1024] = {};
+    const int formatted = std::snprintf(
+        command,
+        sizeof(command),
+        "g++ -std=c++17 -E -P -I. "
+        "-I/home/ubuntu/apps/raylib/src "
+        "-I/home/ubuntu/apps/raygui/src controller.cpp -o %s",
+        path);
+    logging_check(
+        formatted > 0 &&
+            static_cast<std::size_t>(formatted) < sizeof(command) &&
+            std::system(command) == 0,
+        "controller preprocesses without either candidate trace seam");
+    const std::string preprocessed = read_source_file(path);
+    logging_check(::unlink(path) == 0,
+                  "no-seam preprocessing temporary file is removed");
+    std::string token_error;
+    const std::vector<CppToken> tokens =
+        tokenize_cpp_source(preprocessed, token_error);
+    logging_check(
+        token_error.empty(),
+        token_error.empty() ? "no-seam controller output tokenizes" :
+                              token_error.c_str());
+    logging_check(
+        cpp_identifier_count(
+            tokens, 0, tokens.size(), "G1CandidateTraceFile") == 0U &&
+            cpp_identifier_count(
+                tokens,
+                0,
+                tokens.size(),
+                "g1_candidate_trace_append_after_transaction") == 0U &&
+            cpp_identifier_count(
+                tokens,
+                0,
+                tokens.size(),
+                "g1_recovery_candidates_exhaustive_for_test") == 0U &&
+            preprocessed.find("MM_CANDIDATE_TRACE") == std::string::npos,
+        "no-seam preprocessed controller has no trace type, environment key, appender, or exhaustive provider token");
+}
+
 int main(int argc, char** argv)
 {
     if (argc == 3 &&
@@ -1304,5 +1352,6 @@ int main(int argc, char** argv)
     test_log_schema_and_runtime_checker_hashes_are_unchanged();
     test_recovery_selected_cost_uses_strict_word_and_checker_rule();
     test_end_of_animation_incumbent_keeps_public_sentinels();
+    test_no_seam_preprocessed_controller_has_no_trace_interface();
     return 0;
 }

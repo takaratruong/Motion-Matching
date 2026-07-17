@@ -1619,43 +1619,46 @@ static void test_controller_task6_terrain_ik_pipeline()
         body_open, static_cast<size_t>(body_close - body_open + 1));
     const std::string body = compact_source_segment(body_raw);
 
-    const size_t footprint_stage = body.find(
-        "caseG1FrameStageFootprintObservation:");
-    const size_t foot0_stage = body.find("caseG1FrameStageFirstFootIk:");
-    const size_t foot1_stage = body.find("caseG1FrameStageSecondFootIk:");
-    const size_t final_fk_stage = body.find("caseG1FrameStageFinalFk:");
-    const size_t pose_stage = body.find("caseG1FrameStagePoseCertificate:");
-    check(footprint_stage != std::string::npos &&
-              foot0_stage != std::string::npos &&
-              foot1_stage != std::string::npos &&
-              final_fk_stage != std::string::npos &&
-              pose_stage != std::string::npos &&
-              footprint_stage < foot0_stage && foot0_stage < foot1_stage &&
-              foot1_stage < final_fk_stage && final_fk_stage < pose_stage,
-          "footprint, split-foot IK, final FK, and pose certification stages are ordered");
+    static const char* const stage_names[] = {
+        "caseG1FrameStageFootprintObservation:",
+        "caseG1FrameStageRawBegin:",
+        "caseG1FrameStageRawFirstFoot:",
+        "caseG1FrameStageRawSecondFoot:",
+        "caseG1FrameStageRawFinalFk:",
+        "caseG1FrameStageRawPoseCertificate:",
+        "caseG1FrameStageIkBegin:",
+        "caseG1FrameStageIkFirstFoot:",
+        "caseG1FrameStageIkSecondFoot:",
+        "caseG1FrameStageIkFinalFk:",
+        "caseG1FrameStageIkPoseCertificate:",
+        "caseG1FrameStageAcceptedFinalize:",
+    };
+    size_t stage_positions[12] = {};
+    size_t stage_start = 0;
+    for (size_t index = 0; index < 12; ++index) {
+        stage_positions[index] = body.find(stage_names[index], stage_start);
+        check(stage_positions[index] != std::string::npos &&
+                  source_token_count(body.c_str(), stage_names[index]) == 1,
+              "footprint, raw, IK, and accepted-finalize cases are unique and ordered");
+        stage_start = stage_positions[index] + 1;
+    }
 
     const std::string footprint = body.substr(
-        footprint_stage, foot0_stage - footprint_stage);
+        stage_positions[0], stage_positions[1] - stage_positions[0]);
     const size_t schedule = footprint.find(
         "g1_foot_contact_schedule_build(");
     const size_t observe = footprint.find("g1_footprint_observe_v2(");
-    const size_t begin = footprint.find("g1_ik_frame_begin(");
-    const size_t begin_stop = footprint.find(
-        "candidate_result.safe_stop_requested", begin);
-    const size_t begin_snapshot = footprint.find(
-        "g1_ik_frame_rejection_snapshot(", begin_stop);
     check(schedule != std::string::npos && observe != std::string::npos &&
-              begin != std::string::npos && begin_stop != std::string::npos &&
-              begin_snapshot != std::string::npos &&
-              schedule < observe && observe < begin &&
-              begin < begin_stop && begin_stop < begin_snapshot,
-          "contact horizons and footprint precede checked begin-time IK safe-stop inspection");
+              schedule < observe &&
+              footprint.find("g1_ik_frame_") == std::string::npos &&
+              footprint.find("g1_runner_certificate_") ==
+                  std::string::npos,
+          "footprint case owns scheduling and observation but no branch-certificate work");
     check(source_token_count(
               footprint.c_str(), "g1_foot_contact_schedule_build(") == 1 &&
           source_token_count(
-              footprint.c_str(), "g1_footprint_observe_v2(") == 1 &&
-          source_token_count(footprint.c_str(), "g1_ik_frame_begin(") == 1,
-          "footprint stage owns one schedule, observation, and IK begin call");
+              footprint.c_str(), "g1_footprint_observe_v2(") == 1,
+          "footprint stage owns one schedule and one observation call");
     check(footprint.find("state.command") != std::string::npos &&
           footprint.find("external.scene->terrain") != std::string::npos &&
           footprint.find("external.scene->walkability") !=
@@ -1663,44 +1666,137 @@ static void test_controller_task6_terrain_ik_pipeline()
           footprint.find("desired_rotation =") == std::string::npos,
           "physical footprint consumes immutable command/scene data without rewriting heading");
 
-    const std::string foot0 = body.substr(
-        foot0_stage, foot1_stage - foot0_stage);
-    const std::string foot1 = body.substr(
-        foot1_stage, final_fk_stage - foot1_stage);
-    check(source_token_count(foot0.c_str(), "g1_ik_frame_stage_foot(") == 1 &&
-          foot0.find(",0,") != std::string::npos &&
-          foot0.find("G1IkRejectionAfterFoot0") != std::string::npos,
-          "first-foot stage runs only foot zero and snapshots its real rejection checkpoint");
-    check(source_token_count(foot1.c_str(), "g1_ik_frame_stage_foot(") == 1 &&
-          foot1.find(",1,") != std::string::npos &&
-          foot1.find("G1IkRejectionAfterFoot1") != std::string::npos,
-          "second-foot stage runs only foot one and snapshots its real rejection checkpoint");
+    static const char* const delegated_calls[] = {
+        "returng1_runner_certificate_begin(state,scratch.raw_certificate,"
+        "G1FrameCertificateRaw,false,scratch,external,error,error_capacity);",
+        "returng1_runner_certificate_foot(state,scratch.raw_certificate,"
+        "G1FrameCertificateRaw,0,false,scratch,external,error,error_capacity);",
+        "returng1_runner_certificate_foot(state,scratch.raw_certificate,"
+        "G1FrameCertificateRaw,1,false,scratch,external,error,error_capacity);",
+        "returng1_runner_certificate_finish(state,scratch.raw_certificate,"
+        "false,scratch,external,error,error_capacity);",
+        "returng1_runner_pose_certificate(state,scratch.raw_certificate,"
+        "G1FrameCertificateRaw,scratch,external,error,error_capacity);",
+        "returng1_runner_certificate_begin(state,scratch.ik_certificate,"
+        "G1FrameCertificateIk,true,scratch,external,error,error_capacity);",
+        "returng1_runner_certificate_foot(state,scratch.ik_certificate,"
+        "G1FrameCertificateIk,0,true,scratch,external,error,error_capacity);",
+        "returng1_runner_certificate_foot(state,scratch.ik_certificate,"
+        "G1FrameCertificateIk,1,true,scratch,external,error,error_capacity);",
+        "returng1_runner_certificate_finish(state,scratch.ik_certificate,"
+        "true,scratch,external,error,error_capacity);",
+        "returng1_runner_pose_certificate(state,scratch.ik_certificate,"
+        "G1FrameCertificateIk,scratch,external,error,error_capacity);",
+    };
+    for (size_t index = 0; index < 10; ++index) {
+        const std::string stage_body = body.substr(
+            stage_positions[index + 1],
+            stage_positions[index + 2] - stage_positions[index + 1]);
+        check(stage_body.find(delegated_calls[index]) != std::string::npos &&
+                  source_token_count(
+                      stage_body.c_str(), "returng1_runner_") == 1,
+              "each raw and IK case delegates exact branch, kind, foot, and enabled ownership once");
+    }
 
-    const std::string final_fk = body.substr(
-        final_fk_stage, pose_stage - final_fk_stage);
-    check(source_token_count(final_fk.c_str(), "g1_ik_frame_finish(") == 1 &&
-          final_fk.find("state.ik_candidate_bone_positions") !=
-              std::string::npos &&
-          final_fk.find("state.ik_candidate_bone_rotations") !=
-              std::string::npos,
-          "final-FK stage finishes the split transaction from candidate pose owners");
-
-    const std::string pose = body.substr(pose_stage);
-    const size_t clearance_budget = pose.find("g1_pose_clearance_budget(");
-    const size_t clearance = pose.find("g1_measure_pose_clearance(");
+    const std::string source_text(source_begin);
+    const size_t begin_helper_start = source_text.find(
+        "static G1FrameStageOutcome g1_runner_certificate_begin(");
+    const size_t foot_helper_start = source_text.find(
+        "static G1FrameStageOutcome g1_runner_certificate_foot(",
+        begin_helper_start);
+    const size_t finish_helper_start = source_text.find(
+        "static G1FrameStageOutcome g1_runner_certificate_finish(",
+        foot_helper_start);
+    const size_t pose_helper_start = source_text.find(
+        "static G1FrameStageOutcome g1_runner_pose_certificate(",
+        finish_helper_start);
+    const size_t runner_start = source_text.find(
+        "G1FrameStageOutcome g1_controller_frame_stage_run(",
+        pose_helper_start);
+    check(begin_helper_start != std::string::npos &&
+              foot_helper_start != std::string::npos &&
+              finish_helper_start != std::string::npos &&
+              pose_helper_start != std::string::npos &&
+              runner_start != std::string::npos &&
+              begin_helper_start < foot_helper_start &&
+              foot_helper_start < finish_helper_start &&
+              finish_helper_start < pose_helper_start &&
+              pose_helper_start < runner_start,
+          "branch certificate helper definitions are unique and ordered before the runner");
+    const std::string begin_helper = compact_source_segment(
+        source_text.substr(
+            begin_helper_start, foot_helper_start - begin_helper_start));
+    const std::string foot_helper = compact_source_segment(
+        source_text.substr(
+            foot_helper_start, finish_helper_start - foot_helper_start));
+    const std::string finish_helper = compact_source_segment(
+        source_text.substr(
+            finish_helper_start, pose_helper_start - finish_helper_start));
+    const std::string pose_helper = compact_source_segment(
+        source_text.substr(
+            pose_helper_start, runner_start - pose_helper_start));
+    check(source_token_count(begin_helper.c_str(), "g1_ik_frame_begin(") == 1 &&
+              begin_helper.find(
+                  "branch.ik_transaction.candidate_result.safe_stop_requested") !=
+                  std::string::npos &&
+              source_token_count(
+                  begin_helper.c_str(),
+                  "g1_ik_frame_rejection_snapshot(") == 1 &&
+              begin_helper.find("G1IkRejectionAfterBegin") !=
+                  std::string::npos,
+          "begin helper owns one checked IK begin and begin-time safe-stop snapshot");
+    check(source_token_count(
+              foot_helper.c_str(), "g1_ik_frame_stage_foot(") == 1 &&
+              source_token_count(
+                  foot_helper.c_str(),
+                  "g1_ik_frame_rejection_snapshot(") == 1 &&
+              foot_helper.find("G1IkRejectionAfterFoot0") !=
+                  std::string::npos &&
+              foot_helper.find("G1IkRejectionAfterFoot1") !=
+                  std::string::npos,
+          "foot helper owns one per-foot stage and exact foot-zero/foot-one rejection snapshots");
+    check(source_token_count(
+              finish_helper.c_str(), "g1_ik_frame_finish(") == 1 &&
+              finish_helper.find("state.ik_candidate_bone_positions") !=
+                  std::string::npos &&
+              finish_helper.find("state.ik_candidate_bone_rotations") !=
+                  std::string::npos &&
+              finish_helper.find(
+                  "branch.ik_transaction.candidate_state=state.ik;") !=
+                  std::string::npos &&
+              finish_helper.find(
+                  "branch.ik_transaction.candidate_result=state.ik_frame;") !=
+                  std::string::npos,
+          "finish helper owns one terminal IK call and exact candidate pose/result owners");
+    const size_t clearance_budget = pose_helper.find(
+        "g1_pose_clearance_budget(");
+    const size_t clearance = pose_helper.find(
+        "g1_measure_pose_clearance(");
     check(clearance_budget != std::string::npos &&
               clearance != std::string::npos &&
               clearance_budget < clearance &&
-              source_token_count(pose.c_str(),
-                  "g1_measure_pose_clearance(") == 1,
-          "pose stage certifies the final split-IK pose exactly once");
-    check(pose.find("state.footprint=scratch.footprint;") !=
-              std::string::npos &&
-          pose.find("state.footprint_status=G1FootprintOk;") !=
-              std::string::npos &&
-          pose.find("scratch.accepted_diagnostic_candidate") !=
-              std::string::npos,
-          "only the fully certified working frame stages accepted footprint and diagnostics");
+              source_token_count(
+                  pose_helper.c_str(), "g1_measure_pose_clearance(") == 1,
+          "pose helper owns the one branch clearance certification call");
+
+    const std::string accepted_finalize = body.substr(stage_positions[11]);
+    const std::string branch_cases = body.substr(stage_positions[1]);
+    check(accepted_finalize.find(
+              "state.footprint=scratch.footprint;") !=
+                  std::string::npos &&
+              accepted_finalize.find(
+                  "state.footprint_status=G1FootprintOk;") !=
+                  std::string::npos &&
+              accepted_finalize.find(
+                  "scratch.accepted_diagnostic_candidate=diagnostic;") !=
+                  std::string::npos &&
+              accepted_finalize.find(
+                  "scratch.accepted_diagnostic_ready=true;") !=
+                  std::string::npos &&
+              source_token_count(
+                  branch_cases.c_str(),
+                  "scratch.accepted_diagnostic_candidate=") == 1,
+          "AcceptedFinalize alone stages the fully certified branch diagnostic for publication");
 
     check(body.find("g1_ik_frame_evaluate(") == std::string::npos &&
           body.find("ik_two_bone(") == std::string::npos &&

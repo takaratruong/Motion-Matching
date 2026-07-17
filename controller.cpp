@@ -1,11 +1,129 @@
 #include "g1_controller_frame_runtime.h"
+#include "g1_candidate_certification_trace.h"
 
 #if !defined(G1_CONTROLLER_NO_MAIN)
 #include "g1_candidate_audit.h"
 
+#if defined(G1_FRAME_TRANSACTION_BENCHMARK)
+#include <chrono>
+#endif
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+
+#if defined(G1_FRAME_TRANSACTION_BENCHMARK)
+struct G1TransactionTimings
+{
+    std::FILE* stream = nullptr;
+    uint32_t next_presentation_frame = 0U;
+    const char* failure = nullptr;
+
+    bool open(
+        const char* path,
+        char* error,
+        int error_capacity)
+    {
+        if (path == nullptr || path[0] == '\0') return true;
+        const auto fail = [error, error_capacity](const char* message) {
+            if (error != nullptr && error_capacity > 0) {
+                std::snprintf(
+                    error,
+                    static_cast<std::size_t>(error_capacity),
+                    "%s",
+                    message);
+            }
+            return false;
+        };
+        if (stream != nullptr || failure != nullptr) {
+            return fail("transaction timing file is already open");
+        }
+        if (path[0] != '/') {
+            return fail("MM_TRANSACTION_TIMINGS must be an absolute path");
+        }
+        for (const unsigned char* cursor =
+                 reinterpret_cast<const unsigned char*>(path);
+             *cursor != 0U;
+             ++cursor) {
+            if (*cursor == '\r' || *cursor == '\n') {
+                return fail(
+                    "MM_TRANSACTION_TIMINGS path contains a line break");
+            }
+        }
+        std::FILE* const candidate = std::fopen(path, "wb");
+        if (candidate == nullptr) {
+            return fail("transaction timing file could not be opened");
+        }
+        static const char header[] =
+            "presentation_frame\tduration_ns\n";
+        if (std::fwrite(
+                header, 1U, sizeof(header) - 1U, candidate) !=
+                sizeof(header) - 1U ||
+            std::fflush(candidate) != 0) {
+            std::fclose(candidate);
+            return fail("transaction timing header write failed");
+        }
+        stream = candidate;
+        next_presentation_frame = 0U;
+        failure = nullptr;
+        return true;
+    }
+
+    template<class Rep, class Period>
+    void append(std::chrono::duration<Rep, Period> duration)
+    {
+        if (stream == nullptr || failure != nullptr) return;
+        const long long duration_ns = static_cast<long long>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                duration).count());
+        char row[96] = {};
+        const int length = std::snprintf(
+            row,
+            sizeof(row),
+            "%u\t%lld\n",
+            static_cast<unsigned>(next_presentation_frame),
+            duration_ns);
+        if (length < 0 ||
+            static_cast<std::size_t>(length) >= sizeof(row)) {
+            failure = "transaction timing row formatting failed";
+            return;
+        }
+        if (std::fwrite(
+                row,
+                1U,
+                static_cast<std::size_t>(length),
+                stream) != static_cast<std::size_t>(length) ||
+            std::fflush(stream) != 0) {
+            failure = "transaction timing row write failed";
+            return;
+        }
+        ++next_presentation_frame;
+    }
+
+    bool healthy(char* error, int error_capacity) const
+    {
+        if (failure == nullptr) return true;
+        if (error != nullptr && error_capacity > 0) {
+            std::snprintf(
+                error,
+                static_cast<std::size_t>(error_capacity),
+                "%s",
+                failure);
+        }
+        return false;
+    }
+
+    bool close(char* error, int error_capacity)
+    {
+        if (stream != nullptr) {
+            if (std::fclose(stream) != 0 && failure == nullptr) {
+                failure = "transaction timing close failed";
+            }
+            stream = nullptr;
+        }
+        return healthy(error, error_capacity);
+    }
+};
+#endif
 
 
 struct G1CandidateAuditConfig
@@ -906,18 +1024,6 @@ static const char* g1_log_surface_status_name(G1SurfaceQueryStatus status)
     }
 }
 
-static const char* g1_log_rejection_stage_name(G1FrameRejectionStage stage)
-{
-    switch (stage) {
-    case G1FrameRejectNone: return "none";
-    case G1FrameRejectFootprint: return "footprint";
-    case G1FrameRejectLandingPatch: return "landing-patch";
-    case G1FrameRejectIkCandidate: return "ik-candidate";
-    case G1FrameRejectPoseCertificate: return "pose-certificate";
-    default: return "unknown";
-    }
-}
-
 static void g1_log_quat_bits_hex(char output[4 * 8 + 1], quat value)
 {
     const float components[4] = {value.w, value.x, value.y, value.z};
@@ -1669,7 +1775,7 @@ static void g1_log_directional(
     const G1FrameRejectionDiagnostic& rejection = publication.rejection;
     output.frame_rejected = rejection.rejected;
     output.frame_rejection_stage =
-        g1_log_rejection_stage_name(rejection.stage);
+        g1_frame_rejection_stage_name(rejection.stage);
     output.ik_safe_stop_latched = publication.ik_safe_stop_latched;
     output.rejected_attempted_footprint_available =
         rejection.attempted_footprint_available;
@@ -2077,6 +2183,14 @@ int main(int argc, char** argv)
     if (!desired_strafe_ok) { ::controlled_runtime_error(startup_error); return 1; }
     const char* const candidate_audit_environment =
         ::getenv("MM_CANDIDATE_AUDIT");
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM) && defined(G1_CANDIDATE_RECOVERY_ENABLE_TEST_SEAM)
+    const char* const candidate_trace_environment =
+        ::getenv("MM_CANDIDATE_TRACE");
+#endif
+#if defined(G1_FRAME_TRANSACTION_BENCHMARK)
+    const char* const transaction_timings_environment =
+        ::getenv("MM_TRANSACTION_TIMINGS");
+#endif
     const G1ProcessConfig process_config{
         parsed_initial_search_time, parsed_ik_enabled,
         parsed_inertialize_blending_halflife,
@@ -2328,6 +2442,13 @@ int main(int argc, char** argv)
     Model terrain_model = {};
     motion_match_log deterministic_log;
     G1CandidateAuditLog candidate_audit_log;
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM) && defined(G1_CANDIDATE_RECOVERY_ENABLE_TEST_SEAM)
+    G1CandidateTraceFile candidate_trace;
+    G1CandidateCertificationTrace candidate_certification_trace;
+#endif
+#if defined(G1_FRAME_TRANSACTION_BENCHMARK)
+    G1TransactionTimings transaction_timings;
+#endif
     const char* deterministic_log_path = test_config.log_path.empty()
         ? nullptr
         : test_config.log_path.c_str();
@@ -2353,7 +2474,20 @@ int main(int argc, char** argv)
             candidate_audit_log.close(
                 artifact_error,
                 static_cast<int>(sizeof(artifact_error)));
-        if (!candidate_audit_evidence_ok) {
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM) && defined(G1_CANDIDATE_RECOVERY_ENABLE_TEST_SEAM)
+        ::g1_candidate_trace_close(candidate_trace);
+#endif
+#if defined(G1_FRAME_TRANSACTION_BENCHMARK)
+        const bool transaction_timings_evidence_ok =
+            transaction_timings.close(
+                artifact_error,
+                static_cast<int>(sizeof(artifact_error)));
+#endif
+        if (!candidate_audit_evidence_ok
+#if defined(G1_FRAME_TRANSACTION_BENCHMARK)
+            || !transaction_timings_evidence_ok
+#endif
+            ) {
             ::controlled_runtime_error(artifact_error);
             controller_exit_code = 2;
         }
@@ -2398,7 +2532,23 @@ int main(int argc, char** argv)
         !candidate_audit_log.open(
             candidate_audit_config,
             artifact_error,
-            static_cast<int>(sizeof(artifact_error)))) {
+            static_cast<int>(sizeof(artifact_error)))
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM) && defined(G1_CANDIDATE_RECOVERY_ENABLE_TEST_SEAM)
+        || (candidate_trace_environment != nullptr &&
+            candidate_trace_environment[0] != '\0' &&
+            !::g1_candidate_trace_open(
+                candidate_trace,
+                candidate_trace_environment,
+                artifact_error,
+                static_cast<int>(sizeof(artifact_error))))
+#endif
+#if defined(G1_FRAME_TRANSACTION_BENCHMARK)
+        || !transaction_timings.open(
+            transaction_timings_environment,
+            artifact_error,
+            static_cast<int>(sizeof(artifact_error)))
+#endif
+        ) {
         ::controlled_runtime_error(artifact_error);
         controller_exit_code = 2;
         normal_cleanup();
@@ -2559,8 +2709,17 @@ int main(int argc, char** argv)
             process_config.simulation_rotation_halflife;
         frame_external.input.desired_strafe = process_config.desired_strafe;
 #if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM)
-        const G1FrameTransactionTestSeam* const test_seam_pointer =
-            nullptr;
+        const G1FrameTransactionTestSeam* test_seam_pointer = nullptr;
+#if defined(G1_CANDIDATE_RECOVERY_ENABLE_TEST_SEAM)
+        G1FrameTransactionTestSeam test_seam;
+        if (candidate_trace.stream != nullptr) {
+            test_seam.certification_trace = &candidate_certification_trace;
+            test_seam_pointer = &test_seam;
+        }
+#endif
+#endif
+#if defined(G1_FRAME_TRANSACTION_BENCHMARK)
+        const auto transaction_begin = std::chrono::steady_clock::now();
 #endif
         const G1FrameTransactionStatus frame_status =
             ::g1_frame_transaction_run(frame_runtime,
@@ -2572,7 +2731,32 @@ int main(int argc, char** argv)
 #endif
             artifact_error,
             static_cast<int>(sizeof(artifact_error)));
-        if (frame_status == G1FrameTransactionGlobalError) {
+#if defined(G1_FRAME_TRANSACTION_BENCHMARK)
+        const auto transaction_end = std::chrono::steady_clock::now();
+        transaction_timings.append(transaction_end - transaction_begin);
+#endif
+        bool transaction_failed =
+            frame_status == G1FrameTransactionGlobalError;
+#if defined(G1_FRAME_TRANSACTION_BENCHMARK)
+        if (!transaction_timings.healthy(
+                artifact_error,
+                static_cast<int>(sizeof(artifact_error)))) {
+            transaction_failed = true;
+        }
+#endif
+#if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM) && defined(G1_CANDIDATE_RECOVERY_ENABLE_TEST_SEAM)
+        if (!transaction_failed && candidate_trace.stream != nullptr &&
+            !::g1_candidate_trace_append_after_transaction(
+                candidate_trace,
+                static_cast<uint32_t>(
+                    frame_external.input.presentation_frame),
+                candidate_certification_trace,
+                artifact_error,
+                static_cast<int>(sizeof(artifact_error)))) {
+            transaction_failed = true;
+        }
+#endif
+        if (transaction_failed) {
             ::controlled_runtime_error(artifact_error);
             controller_exit_code = 2;
             controller_exit_requested = true;

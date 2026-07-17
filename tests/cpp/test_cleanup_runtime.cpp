@@ -432,30 +432,84 @@ static void test_controller_has_one_post_window_cleanup_path(
     const std::size_t write_cleanup = find_required(
         post_window, "cleanup_report_write(", close_window,
         "normal tail writes cleanup report after window close");
+    static const char main_tail_text[] =
+        "    normal_cleanup();\n"
+        "    return controller_exit_code;\n"
+        "}";
+    const std::size_t main_tail = find_required(
+        post_window, main_tail_text, write_cleanup,
+        "normal cleanup and return form the actual controller-main tail");
     const std::size_t final_return = find_required(
-        post_window, "return controller_exit_code;", write_cleanup,
+        post_window, "return controller_exit_code;", main_tail,
         "normal tail returns only after cleanup reporting");
+    const std::size_t main_end = main_tail + sizeof(main_tail_text) - 1U;
     check(close_log < unload_model && unload_model < close_window &&
               close_window < write_cleanup && write_cleanup < final_return,
           "normal cleanup stage order is fixed");
-    check(post_window.find("return ", final_return + 1) ==
+    const std::string post_window_main = post_window.substr(0, main_end);
+    check(count_occurrences(
+              post_window_main,
+              "        normal_cleanup();\n"
+              "        return controller_exit_code;") == 2 &&
+              count_occurrences(
+                  post_window_main, "normal_cleanup();") == 3 &&
+              count_occurrences(
+                  post_window_main,
+                  "return controller_exit_code;") == 3,
+          "two early failures and the normal tail each use authenticated cleanup returns");
+    check(post_window_main.find("return ", final_return + 1) ==
               std::string::npos,
           "normal cleanup return is the final controller return");
 
     const std::size_t counter = find_required(
         post_window, "int model_load_count = 0;", 0,
         "model load counter starts before initial model allocation");
-    const std::size_t load = find_required(
-        post_window, "LoadModel(active_scene.mesh_path.c_str())", counter,
-        "initial terrain model loads after counter initialization");
-    const std::size_t allocated = find_required(
-        post_window, "terrain_model_allocated", load,
-        "initial terrain allocation is measured");
+    const std::size_t loader_owner = find_required(
+        post_window,
+        "G1ModelLoader initial_model_loader{&model_load_count};",
+        counter,
+        "initial model loader exclusively owns the load counter");
+    static const char initial_load_text[] =
+        "const scene_model_load_result initial_model = initial_model_loader(\n"
+        "        terrain_model,\n"
+        "        active_scene.mesh_path.c_str(),\n"
+        "        artifact_error,\n"
+        "        static_cast<int>(sizeof(artifact_error)));";
+    const std::size_t initial_load = find_required(
+        post_window,
+        initial_load_text,
+        loader_owner,
+        "initial terrain model uses the counted loader owner");
+    static const char initial_failure_text[] =
+        "if (!initial_model.ready || !initial_model.allocated) {\n"
+        "        ::controlled_runtime_error(artifact_error);\n"
+        "        controller_exit_code = 2;\n"
+        "        normal_cleanup();\n"
+        "        return controller_exit_code;\n"
+        "    }";
+    const std::size_t initial_failure = find_required(
+        post_window,
+        initial_failure_text,
+        initial_load,
+        "initial model readiness/allocation gate uses authenticated cleanup");
+    const std::size_t loader_definition = find_required(
+        source, "struct G1ModelLoader", 0,
+        "controller defines the counted model loader");
+    const std::size_t model_load = find_required(
+        source, "output = ::LoadModel(path);", loader_definition,
+        "counted loader performs the unique model load");
     const std::size_t count_load = find_required(
-        post_window, "++model_load_count;", allocated,
-        "initial allocated model increments the load counter");
-    check(counter < load && load < allocated && allocated < count_load,
-          "initial model load is counted transactionally");
+        source, "if (allocated) ++*load_count;", model_load,
+        "counted loader increments only for allocated ownership");
+    const std::size_t loader_definition_end = find_required(
+        source, "struct G1ModelUnloader", count_load,
+        "counted loader ends before the unloader owner");
+    check(counter < loader_owner && loader_owner < initial_load &&
+              initial_load < initial_failure && initial_failure < main_tail &&
+              model_load < count_load && count_load < loader_definition_end &&
+              count_occurrences(
+                  source, "if (allocated) ++*load_count;") == 1,
+          "initial model load is counted transactionally by one loader operator");
 
     for (const char* field : {
              "cleanup.exit_code = controller_exit_code;",
@@ -463,40 +517,47 @@ static void test_controller_has_one_post_window_cleanup_path(
              "cleanup.model_load_count = model_load_count;",
              "cleanup.model_unload_count = model_unload_count;",
              "cleanup.log_closed = log_closed;",
-             "cleanup.window_closed = window_closed;",
-             "getenv(\"MM_CLEANUP_LOG\")"}) {
+             "cleanup.window_closed = window_closed;"}) {
         check(post_window.find(field, close_window) != std::string::npos,
               "cleanup report consumes final controller state");
     }
+    static const char cleanup_path_owner_text[] =
+        "const char* cleanup_path = test_config.cleanup_log_path.empty()\n"
+        "        ? nullptr\n"
+        "        : test_config.cleanup_log_path.c_str();";
+    const std::size_t cleanup_path_owner = find_required(
+        post_window,
+        cleanup_path_owner_text,
+        0,
+        "cleanup report path freezes from checked argument configuration");
+    const std::size_t cleanup_path_use = find_required(
+        post_window,
+        "cleanup_report_write(\n"
+        "                cleanup_path,",
+        cleanup_path_owner,
+        "cleanup report write uses the frozen path owner");
+    check(cleanup_path_owner < close_log &&
+              close_window < cleanup_path_use &&
+              cleanup_path_use < final_return &&
+              count_occurrences(post_window_main, "cleanup_path") == 2,
+          "frozen cleanup path is declared once and consumed only by the report write");
 
     const std::size_t cleanup_lambda = find_required(
         post_window, "auto normal_cleanup =", 0,
         "controller defines one shared normal cleanup operation");
-    const std::size_t platform_loop = find_required(
-        post_window, "#if defined(PLATFORM_WEB)", cleanup_lambda,
-        "shared cleanup is defined before the platform update loop");
-    const std::size_t platform_else = find_required(
-        post_window, "#else", platform_loop,
-        "web and desktop update loops remain explicit");
-    const std::string web_loop = post_window.substr(
-        platform_loop, platform_else - platform_loop);
-    check(web_loop.find(
-              "const bool window_close_requested = WindowShouldClose();") !=
-              std::string::npos &&
-              web_loop.find(
-                  "if (!controller_exit_requested && "
-                  "!window_close_requested)") != std::string::npos,
-          "web loop skips updates after a post-window startup failure");
-    const std::size_t web_cleanup = find_required(
-        web_loop, "normal_cleanup();", 0,
-        "web callback invokes shared cleanup");
-    const std::size_t web_cancel = find_required(
-        web_loop, "emscripten_cancel_main_loop();", web_cleanup,
-        "web callback cancels only after cleanup");
-    check(web_cleanup < web_cancel,
-          "web callback cleans resources before main-loop cancellation");
-    check(count_occurrences(post_window, "normal_cleanup();") == 3,
-          "web callback, web fallback, and desktop tail share cleanup");
+    static const char update_loop_text[] =
+        "while (!::WindowShouldClose() && !controller_exit_requested) {";
+    const std::size_t update_loop = find_required(
+        post_window,
+        update_loop_text,
+        cleanup_lambda,
+        "shared cleanup is defined before the ordinary update loop");
+    check(cleanup_lambda < update_loop && update_loop < main_tail &&
+              count_occurrences(
+                  post_window_main, update_loop_text) == 1 &&
+              count_occurrences(
+                  post_window_main, "normal_cleanup();") == 3,
+          "one ordinary update loop precedes the shared tail cleanup owned by two startup failures and the final return");
     check(post_window.find("if (cleanup_complete) return;", cleanup_lambda) !=
               std::string::npos &&
               post_window.find("cleanup_complete = true;", cleanup_lambda) !=
