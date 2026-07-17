@@ -210,8 +210,9 @@ server process survived finalization. Unrelated GPU and Claude processes were
 not modified or interrupted. No push, merge, tag, physical-robot command, or
 runtime activation was performed.
 
-The prerequisite that blocked the scripted flat MM-to-SONIC experiment is now
-satisfied. Stage B remains the next required result before any claim that the
-motion-matching output itself dynamically drives SONIC. Physical G1 deployment,
-pick/carry/place, and obstacle-task expansion remain separate, explicitly gated
-work.
+The prerequisite that blocked the scripted flat MM-to-SONIC experiment was
+satisfied here. Stage B subsequently passed and establishes that the
+motion-matching output dynamically drives the pinned SONIC simulator; see
+[G1 SONIC Stage B Motion-Matching Pass](2026-07-17-g1-sonic-stage-b-pass.md).
+Physical G1 deployment, pick/carry/place, and obstacle-task expansion remain
+separate, explicitly gated work.
