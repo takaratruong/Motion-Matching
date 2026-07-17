@@ -228,7 +228,7 @@ class SourceFixture:
                 5 if step == 2 else -1 for step in steps
             ],
             "first_rejected_joint_position": [
-                f32(-0.27224052) if step == 2 else 0.0 for step in steps
+                -0.27224052 if step == 2 else 0.0 for step in steps
             ],
             "searched": [bool(step % 2) for step in steps],
             "transitioned": [False for _ in steps],
@@ -406,7 +406,6 @@ class SourceChunkTests(unittest.TestCase):
             "virtual_root_position_holden",
             "virtual_root_orientation_holden",
             "terrain_cost",
-            "first_rejected_joint_position",
             "terrain_values",
             "terrain_points_holden",
             "support_height",
@@ -418,6 +417,11 @@ class SourceChunkTests(unittest.TestCase):
             self.assertTrue(value.flags.owndata, field)
             self.assertTrue(value.flags.c_contiguous, field)
             self.assertFalse(value.flags.writeable, field)
+        rejected_position = chunk.first_rejected_joint_position
+        self.assertEqual(rejected_position.dtype, np.dtype(np.float64))
+        self.assertTrue(rejected_position.flags.owndata)
+        self.assertTrue(rejected_position.flags.c_contiguous)
+        self.assertFalse(rejected_position.flags.writeable)
         integer_fields = (
             "selected_database_frame",
             "candidate_preview_count",
@@ -437,8 +441,8 @@ class SourceChunkTests(unittest.TestCase):
         self.assertEqual(chunk.first_rejected_database_frame[2], 927)
         self.assertEqual(chunk.first_rejected_joint_index[2], 5)
         self.assertEqual(
-            int(chunk.first_rejected_joint_position[2].view(np.uint32)),
-            int(np.float32(-0.27224052).view(np.uint32)),
+            int(chunk.first_rejected_joint_position[2].view(np.uint64)),
+            int(np.float64(-0.27224052).view(np.uint64)),
         )
         self.assertIsInstance(chunk.scene, MappingProxyType)
         self.assertIsInstance(chunk.command, MappingProxyType)
@@ -613,6 +617,9 @@ class SourceChunkTests(unittest.TestCase):
         payload["first_rejected_joint_position"][2] = float("nan")
         cases.append(("non-finite rejected position", payload))
         payload = self.fixture.chunk()
+        payload["first_rejected_joint_position"][2] = True
+        cases.append(("boolean rejected position", payload))
+        payload = self.fixture.chunk()
         payload["searched"][0] = 1
         cases.append(("integer boolean", payload))
         for label, payload in cases:
@@ -634,7 +641,7 @@ class SourceChunkTests(unittest.TestCase):
         for field, value in (
             ("first_rejected_database_frame", 8),
             ("first_rejected_joint_index", 5),
-            ("first_rejected_joint_position", f32(-0.3)),
+            ("first_rejected_joint_position", -0.3),
         ):
             payload = self.fixture.chunk()
             payload[field][0] = value
@@ -655,6 +662,23 @@ class SourceChunkTests(unittest.TestCase):
         for label, payload in mutations:
             with self.subTest(label=label), self.assertRaises(ContractError):
                 parse_source_chunk(payload, self.fixture.contract)
+
+    def test_chunk_retains_sub_binary32_rejection_witness_exactly(self):
+        payload = self.fixture.chunk()
+        row_index = 2
+        lower = self.fixture.contract.rows[row_index].lower
+        witness = float(np.nextafter(lower, -np.inf))
+        self.assertLess(witness, lower)
+        self.assertEqual(np.float32(witness), np.float32(lower))
+        payload["first_rejected_joint_index"][2] = row_index
+        payload["first_rejected_joint_position"][2] = witness
+
+        chunk = parse_source_chunk(payload, self.fixture.contract)
+
+        self.assertEqual(
+            int(chunk.first_rejected_joint_position[2].view(np.uint64)),
+            int(np.float64(witness).view(np.uint64)),
+        )
 
     def test_cpp_nine_digit_decimal_recovers_the_original_binary32_bits(self):
         original = np.float32(1.0 / 3.0)

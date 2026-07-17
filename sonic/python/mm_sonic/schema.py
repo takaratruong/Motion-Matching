@@ -195,6 +195,42 @@ def _float_array(
     return output
 
 
+def _float64_array(
+    value: object,
+    shape: tuple[int, ...],
+    label: str,
+) -> np.ndarray:
+    flat: list[np.float64] = []
+
+    def visit(candidate: object, depth: int, path: str) -> None:
+        if depth == len(shape):
+            if type(candidate) not in (int, float):
+                raise ContractError(f"{path} must be a JSON number")
+            try:
+                number = float(candidate)
+            except (OverflowError, ValueError) as error:
+                raise ContractError(
+                    f"{path} must be a finite binary64 number"
+                ) from error
+            if not math.isfinite(number):
+                raise ContractError(f"{path} must be a finite binary64 number")
+            if type(candidate) is int and int(number) != candidate:
+                raise ContractError(
+                    f"{path} integer does not recover an exact binary64 value"
+                )
+            flat.append(np.float64(number))
+            return
+        if type(candidate) is not list or len(candidate) != shape[depth]:
+            raise ContractError(f"{path} must have length {shape[depth]}")
+        for index, item in enumerate(candidate):
+            visit(item, depth + 1, f"{path}[{index}]")
+
+    visit(value, 0, label)
+    output = np.asarray(flat, dtype=np.float64).reshape(shape).copy(order="C")
+    output.flags.writeable = False
+    return output
+
+
 def _integer_array(value: object, size: int, label: str) -> np.ndarray:
     if type(value) is not list or len(value) != size:
         raise ContractError(f"{label} must have length {size}")
@@ -655,7 +691,7 @@ def parse_source_chunk(
         _STEP_COUNT,
         "source chunk.first_rejected_joint_index",
     )
-    first_rejected_joint_position = _float_array(
+    first_rejected_joint_position = _float64_array(
         source["first_rejected_joint_position"],
         (_STEP_COUNT,),
         "source chunk.first_rejected_joint_position",
@@ -672,7 +708,7 @@ def parse_source_chunk(
             if (
                 rejected_frame != -1
                 or rejected_joint != -1
-                or int(rejected_position.view(np.uint32)) != 0
+                or int(rejected_position.view(np.uint64)) != 0
             ):
                 raise ContractError(
                     "candidate rejection sentinels are inconsistent"

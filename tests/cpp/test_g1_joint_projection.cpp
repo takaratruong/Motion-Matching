@@ -442,7 +442,7 @@ static void test_exact_stage_a_hermite_midpoint_limit_is_structured()
         static_cast<int>(sizeof(fixture.error))));
     CHECK(diagnostic.failure == SonicJointProjectionLimit);
     CHECK(diagnostic.row == row);
-    CHECK(diagnostic.position == static_cast<float>(expected_midpoint));
+    CHECK(diagnostic.position == expected_midpoint);
     CHECK(diagnostic.position < fixture.contract[row].lower);
     CHECK(diagnostic.lower == fixture.contract[row].lower);
     CHECK(diagnostic.upper == fixture.contract[row].upper);
@@ -502,6 +502,85 @@ static void test_hermite_midpoint_malformed_inputs_fail_closed()
         static_cast<int>(sizeof(fixture.error))));
     CHECK(diagnostic.failure == SonicJointProjectionInput);
     CHECK(diagnostic.row == 7);
+}
+
+static void test_hermite_midpoint_uses_exact_json_precision_limits()
+{
+    ProjectionFixture fixture;
+    const int row = 2;
+    fixture.contract[row].lower = -2.7576;
+    fixture.contract[row].upper = 2.7576;
+    float left_position[SonicG1JointCount] = {};
+    float left_velocity[SonicG1JointCount] = {};
+    float right_position[SonicG1JointCount] = {};
+    float right_velocity[SonicG1JointCount] = {};
+    left_position[row] = -2.7575998306274414f;
+    right_position[row] = -2.7575998306274414f;
+    left_velocity[row] = -3.388118784641847e-05f;
+    const float dt = 0.04f;
+    const double expected_midpoint =
+        0.5 * static_cast<double>(left_position[row]) +
+        0.125 * static_cast<double>(dt) *
+            static_cast<double>(left_velocity[row]) +
+        0.5 * static_cast<double>(right_position[row]) +
+        -0.125 * static_cast<double>(dt) *
+            static_cast<double>(right_velocity[row]);
+    CHECK(expected_midpoint == -2.757600000033377);
+    sonic_joint_projection_diagnostic diagnostic;
+
+    CHECK(!sonic_validate_joint_hermite_midpoint(
+        diagnostic,
+        fixture.contract,
+        left_position,
+        left_velocity,
+        right_position,
+        right_velocity,
+        dt,
+        fixture.error,
+        static_cast<int>(sizeof(fixture.error))));
+    CHECK(diagnostic.failure == SonicJointProjectionLimit);
+    CHECK(diagnostic.row == row);
+    CHECK(diagnostic.position == expected_midpoint);
+    CHECK(diagnostic.position < fixture.contract[row].lower);
+}
+
+static void test_sub_binary32_midpoint_violation_retains_exact_witness()
+{
+    ProjectionFixture fixture;
+    const int row = 3;
+    fixture.contract[row].lower = -0.5;
+    fixture.contract[row].upper = 0.5;
+    float left_position[SonicG1JointCount] = {};
+    float left_velocity[SonicG1JointCount] = {};
+    float right_position[SonicG1JointCount] = {};
+    float right_velocity[SonicG1JointCount] = {};
+    left_position[row] = -0.5f;
+    right_position[row] = -0.5f;
+    right_velocity[row] = 1.0e-6f;
+    const float dt = 0.04f;
+    const double expected_midpoint =
+        0.5 * static_cast<double>(left_position[row]) +
+        0.125 * static_cast<double>(dt) *
+            static_cast<double>(left_velocity[row]) +
+        0.5 * static_cast<double>(right_position[row]) +
+        -0.125 * static_cast<double>(dt) *
+            static_cast<double>(right_velocity[row]);
+    sonic_joint_projection_diagnostic diagnostic;
+
+    CHECK(!sonic_validate_joint_hermite_midpoint(
+        diagnostic,
+        fixture.contract,
+        left_position,
+        left_velocity,
+        right_position,
+        right_velocity,
+        dt,
+        fixture.error,
+        static_cast<int>(sizeof(fixture.error))));
+    CHECK(diagnostic.failure == SonicJointProjectionLimit);
+    CHECK(diagnostic.position == expected_midpoint);
+    CHECK(diagnostic.position < fixture.contract[row].lower);
+    CHECK(static_cast<float>(diagnostic.position) == -0.5f);
 }
 
 static void test_structured_success_publishes_all_outputs_atomically()
@@ -755,6 +834,8 @@ int main()
     test_position_failure_classification_keeps_nonfinite_fatal();
     test_exact_stage_a_hermite_midpoint_limit_is_structured();
     test_hermite_midpoint_malformed_inputs_fail_closed();
+    test_hermite_midpoint_uses_exact_json_precision_limits();
+    test_sub_binary32_midpoint_violation_retains_exact_witness();
     test_structured_success_publishes_all_outputs_atomically();
     test_signed_angles_on_all_axes_and_pelvis_copy();
     test_antipodal_local_quaternions_are_equivalent();

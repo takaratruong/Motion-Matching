@@ -128,7 +128,8 @@ The change stays within four existing ownership boundaries:
 - `sonic/cpp/g1_runtime.h` owns scratch pose preview, ordinary-continuation
   scheduling, shared transition/update application, and step diagnostics;
 - `sonic/cpp/g1_joint_projection.h` owns contract-relative endpoint projection
-  and the exact binary32-`dt` Hermite midpoint limit predicate;
+  and the exact binary32-`dt` Hermite midpoint predicate against binary64 JSON
+  contract limits;
 - `sonic/cpp/mm_chunk_server.cpp` owns the real contract-bound validator and
   conversion of runtime diagnostics into protocol diagnostics;
 - `sonic/cpp/mm_chunk_protocol.h`, the C++ JSON writer, strict JSON schema, and
@@ -185,12 +186,14 @@ q_mid = 0.5*q_left + 0.125*float32(0.04)*v_left
       + 0.5*q_right - 0.125*float32(0.04)*v_right
 ```
 
-Endpoint values remain binary32 and are promoted to double for the arithmetic
-and limit comparison, matching the Python bridge. A well-formed endpoint or
-midpoint limit result rejects only that candidate; malformed/non-finite
-projection or midpoint state fails closed. The existing diagnostic records the
-rejected source-joint row and projected position, whether the first violation
-was at the right endpoint or midpoint.
+Endpoint values remain binary32 and are promoted to double for the arithmetic,
+matching the Python bridge. Contract lower/upper values retain the binary64
+values produced by parsing the authoritative JSON; they are never rounded
+through binary32 before the comparison. A well-formed endpoint or midpoint
+limit result rejects only that candidate; malformed/non-finite projection or
+midpoint state fails closed. The diagnostic records the rejected source-joint
+row and the exact binary64 projected position, whether the first violation was
+at the right endpoint or midpoint.
 
 ### 2. Explicit ordinary-continuation preview
 
@@ -301,8 +304,8 @@ The strict `mm-chunk/v1` source chunk gains five ten-element step arrays:
   rejected candidate, or `-1` when none;
 - `first_rejected_joint_index` — fixed source-joint index of the first
   rejection, or `-1` when none;
-- `first_rejected_joint_position` — rejected projected position, or exact
-  `0.0` when none.
+- `first_rejected_joint_position` — rejected projected binary64 position, or
+  exact positive `0.0` when none.
 
 For every successful real step:
 
@@ -310,7 +313,8 @@ For every successful real step:
 - zero rejections require both indices to be `-1` and position to be exact
   zero;
 - a positive rejection count requires in-range database/joint indices, a finite
-  position, and a position outside the corresponding loaded contract interval;
+  binary64 position, and a position outside the corresponding binary64 loaded
+  contract interval;
 - the selected frame is not one of the rejected candidates.
 
 The fake adapter publishes zero counts and the exact no-rejection sentinels.

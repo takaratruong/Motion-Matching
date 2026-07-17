@@ -490,8 +490,9 @@ assert not chunk.candidate_preview_count.flags.writeable
 assert chunk.candidate_limit_rejection_count[2] == 1
 assert chunk.first_rejected_database_frame[2] == 927
 assert chunk.first_rejected_joint_index[2] == expected_left_ankle_row
-assert np.float32(chunk.first_rejected_joint_position[2]).view(np.uint32) \
-    == np.float32(-0.27224052).view(np.uint32)
+assert chunk.first_rejected_joint_position.dtype == np.dtype(np.float64)
+assert chunk.first_rejected_joint_position[2].view(np.uint64) \
+    == np.float64(-0.27224052).view(np.uint64)
 ```
 
 - [ ] **Step 3: Run protocol/schema tests and witness RED**
@@ -510,9 +511,9 @@ Expected: C++ compilation and strict Python parsing fail on the absent diagnosti
 
 - [ ] **Step 4: Implement the atomic strict protocol extension**
 
-Add the five scalar members to `mm_chunk_step_diagnostic`, copy Task 2 diagnostics in the real adapter, and set the fake adapter to `0, 0, -1, -1, 0.0f`. Add all fields to equality, C++ contract validation, and the JSON writer. Add required arrays with exact lengths/types to `mm_chunk_v1.schema.json`.
+Add the five scalar members to `mm_chunk_step_diagnostic`, copy Task 2 diagnostics in the real adapter, and set the fake adapter to `0, 0, -1, -1, 0.0`. Store `first_rejected_joint_position` as binary64 and serialize it with 17 significant decimal digits so a sub-binary32 violation remains outside the authoritative limit. Add all fields to equality, C++ contract validation, and the JSON writer. Add required arrays with exact lengths/types to `mm_chunk_v1.schema.json`.
 
-In Python, add the five fields to `SourceChunk`, the exact-key set, and parsing. Use `_integer_array()`/`_float_array()` for owned immutable arrays, then enforce per step:
+In Python, add the five fields to `SourceChunk`, the exact-key set, and parsing. Use `_integer_array()` for counts/indices and a dedicated finite `_float64_array()` for the rejected-position witness, then enforce per step:
 
 ```python
 if previews < 0 or rejections < 0 or rejections > previews:
@@ -532,6 +533,13 @@ else:
 ```
 
 Use the contract's existing source-row order/accessor rather than introducing a second limit table. Keep hello and `joint_feasibility` JSON unchanged.
+
+Retain each contract `lower`/`upper` JSON number as binary64 in C++, matching
+Python's JSON parser. Endpoint pose values remain binary32, but midpoint
+arithmetic, limit comparison, structured diagnostics, wire serialization, and
+Python audit validation all use those binary64 limits and witnesses. Include a
+counterexample whose midpoint is outside the JSON limit but rounds onto the
+same binary32 value as that limit.
 
 - [ ] **Step 5: Run protocol/schema tests and witness GREEN**
 

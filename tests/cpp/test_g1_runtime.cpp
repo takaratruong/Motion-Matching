@@ -23,6 +23,15 @@ static bool same_float_bits(float first, float second)
     return terrain_float_bits(first) == terrain_float_bits(second);
 }
 
+static bool same_double_bits(double first, double second)
+{
+    std::uint64_t first_bits = 0;
+    std::uint64_t second_bits = 0;
+    std::memcpy(&first_bits, &first, sizeof(first));
+    std::memcpy(&second_bits, &second, sizeof(second));
+    return first_bits == second_bits;
+}
+
 static bool same_vec3_bits(vec3 first, vec3 second)
 {
     return same_float_bits(first.x, second.x) &&
@@ -173,7 +182,7 @@ static g1_runtime_joint_preview_verdict evaluate_scripted_joint_preview(
     slice1d<quat> local_rotations,
     slice1d<vec3> local_angular_velocities,
     int& rejected_joint_index,
-    float& rejected_joint_position,
+    double& rejected_joint_position,
     char* error,
     int capacity)
 {
@@ -194,8 +203,8 @@ static g1_runtime_joint_preview_verdict evaluate_scripted_joint_preview(
         selected_database_frame == script.reject_selected) {
         rejected_joint_index = script.malformed_rejection ? -1 : 5;
         rejected_joint_position = script.malformed_rejection
-            ? std::numeric_limits<float>::quiet_NaN()
-            : -0.30f;
+            ? std::numeric_limits<double>::quiet_NaN()
+            : -0.30;
         return G1RuntimeJointPreviewRejectLimit;
     }
     check(local_rotations.size == G1_BoneCount,
@@ -346,7 +355,7 @@ static g1_runtime_step_result sentinel_result()
     result.candidate_preview.candidate_limit_rejection_count = 82;
     result.candidate_preview.first_rejected_database_frame = 83;
     result.candidate_preview.first_rejected_joint_index = 84;
-    result.candidate_preview.first_rejected_joint_position = 85.0f;
+    result.candidate_preview.first_rejected_joint_position = 85.0;
     return result;
 }
 
@@ -835,9 +844,9 @@ static void test_joint_preview_selection_and_live_parity()
           "preview audit counts exact projection attempts and rejections");
     check(result.candidate_preview.first_rejected_database_frame == 0 &&
               result.candidate_preview.first_rejected_joint_index == 5 &&
-              same_float_bits(
+              same_double_bits(
                   result.candidate_preview.first_rejected_joint_position,
-                  -0.30f),
+                  -0.30),
           "preview audit preserves the first structured rejection");
     check(reject_ordinary.accepted_selected == 20,
           "accepted preview cache identifies the live transition");
@@ -881,9 +890,9 @@ static void test_joint_preview_selection_and_live_parity()
           "the prevalidated incumbent is not projected twice");
     check(result.candidate_preview.first_rejected_database_frame == -1 &&
               result.candidate_preview.first_rejected_joint_index == -1 &&
-              same_float_bits(
+              same_double_bits(
                   result.candidate_preview.first_rejected_joint_position,
-                  0.0f),
+                  0.0),
           "zero rejection audit uses exact sentinels");
 }
 

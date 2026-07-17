@@ -180,12 +180,12 @@ static g1_runtime_joint_preview_verdict mm_real_classify_joint_preview(
     const sonic_joint_projection_diagnostic& projection,
     const sonic_joint_contract_entry (&contract)[SonicG1JointCount],
     int& rejected_joint_index,
-    float& rejected_joint_position,
+    double& rejected_joint_position,
     char* error,
     const int capacity)
 {
     rejected_joint_index = -1;
-    rejected_joint_position = 0.0f;
+    rejected_joint_position = 0.0;
 
     if (projected) {
         const bool diagnostic_is_valid =
@@ -250,7 +250,7 @@ static bool mm_real_project_joint_preview_baseline(
         error,
         capacity);
     int rejected_joint_index = -1;
-    float rejected_joint_position = 0.0f;
+    double rejected_joint_position = 0.0;
     return mm_real_classify_joint_preview(
                projected,
                projection,
@@ -270,7 +270,7 @@ mm_real_project_joint_interval_preview(
     const slice1d<vec3> right_local_angular_velocities,
     const float dt,
     int& rejected_joint_index,
-    float& rejected_joint_position,
+    double& rejected_joint_position,
     char* error,
     const int capacity)
 {
@@ -752,7 +752,7 @@ private:
         const slice1d<quat> local_rotations,
         const slice1d<vec3> local_angular_velocities,
         int& rejected_joint_index,
-        float& rejected_joint_position,
+        double& rejected_joint_position,
         char* error,
         const int capacity)
     {
@@ -1073,14 +1073,14 @@ public:
         diagnostic.candidate_limit_rejection_count = 0;
         diagnostic.first_rejected_database_frame = -1;
         diagnostic.first_rejected_joint_index = -1;
-        diagnostic.first_rejected_joint_position = 0.0f;
+        diagnostic.first_rejected_joint_position = 0.0;
         if (step == 0) {
             const auto set_positive_rejection = [&]() {
                 diagnostic.candidate_preview_count = 1;
                 diagnostic.candidate_limit_rejection_count = 1;
                 diagnostic.first_rejected_database_frame = 927;
                 diagnostic.first_rejected_joint_index = 5;
-                diagnostic.first_rejected_joint_position = -0.3f;
+                diagnostic.first_rejected_joint_position = -0.3;
             };
             if (request.candidate_id == "negative-preview-count") {
                 diagnostic.candidate_preview_count = -1;
@@ -1098,7 +1098,7 @@ public:
                 diagnostic.first_rejected_joint_index = 5;
             } else if (
                 request.candidate_id == "bad-zero-rejected-position") {
-                diagnostic.first_rejected_joint_position = -0.0f;
+                diagnostic.first_rejected_joint_position = -0.0;
             } else if (
                 request.candidate_id == "bad-positive-rejected-frame") {
                 set_positive_rejection();
@@ -1115,7 +1115,13 @@ public:
             } else if (
                 request.candidate_id == "in-range-rejected-position") {
                 set_positive_rejection();
-                diagnostic.first_rejected_joint_position = 0.0f;
+                diagnostic.first_rejected_joint_position = 0.0;
+            } else if (
+                request.candidate_id == "exact-double-rejected-position") {
+                set_positive_rejection();
+                diagnostic.first_rejected_joint_position = std::nextafter(
+                    serialization_contract_[5].lower,
+                    -std::numeric_limits<double>::infinity());
             } else if (
                 request.candidate_id == "selected-equals-rejected-frame") {
                 set_positive_rejection();
@@ -1485,7 +1491,7 @@ static std::string mm_json_generate_data(
             const bool sentinels_valid =
                 step.first_rejected_database_frame == -1 &&
                 step.first_rejected_joint_index == -1 &&
-                step.first_rejected_joint_position == 0.0f &&
+                step.first_rejected_joint_position == 0.0 &&
                 !std::signbit(step.first_rejected_joint_position);
             if (!sentinels_valid) return std::string();
             continue;

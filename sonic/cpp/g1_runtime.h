@@ -35,7 +35,7 @@ struct g1_runtime_candidate_preview_diagnostic
     int candidate_limit_rejection_count = 0;
     int first_rejected_database_frame = -1;
     int first_rejected_joint_index = -1;
-    float first_rejected_joint_position = 0.0f;
+    double first_rejected_joint_position = 0.0;
 };
 
 struct g1_runtime_joint_preview_validator
@@ -48,7 +48,7 @@ struct g1_runtime_joint_preview_validator
         slice1d<quat>,
         slice1d<vec3>,
         int&,
-        float&,
+        double&,
         char*,
         int) = nullptr;
 };
@@ -507,7 +507,7 @@ g1_runtime_preview_joint_candidate(
         context.dt);
 
     int rejected_joint_index = -1;
-    float rejected_joint_position = 0.0f;
+    double rejected_joint_position = 0.0;
     char callback_error[1024] = {};
     ++context.diagnostic->candidate_preview_count;
     const g1_runtime_joint_preview_verdict verdict =
@@ -529,7 +529,7 @@ g1_runtime_preview_joint_candidate(
     {
         if (rejected_joint_index < 0 ||
             rejected_joint_index >= G1_BoneCount - 2 ||
-            !terrain_float_is_finite(rejected_joint_position))
+            !std::isfinite(rejected_joint_position))
         {
             scene_error(
                 context.error,

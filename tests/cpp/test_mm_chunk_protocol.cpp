@@ -172,7 +172,7 @@ struct fake_adapter
         diagnostic.first_rejected_database_frame = step == 2 ? 927 : -1;
         diagnostic.first_rejected_joint_index = step == 2 ? 5 : -1;
         diagnostic.first_rejected_joint_position =
-            step == 2 ? -0.27224052f : 0.0f;
+            step == 2 ? -0.27224052 : 0.0;
         diagnostic.searched = (step % 2) == 0;
         diagnostic.transitioned = step == 5;
         diagnostic.terrain_cost =
@@ -449,12 +449,12 @@ static void test_legal_sequence_is_transactional_and_continuous()
     CHECK(chunk.steps[2].candidate_limit_rejection_count == 1);
     CHECK(chunk.steps[2].first_rejected_database_frame == 927);
     CHECK(chunk.steps[2].first_rejected_joint_index == 5);
-    CHECK(chunk.steps[2].first_rejected_joint_position == -0.27224052f);
+    CHECK(chunk.steps[2].first_rejected_joint_position == -0.27224052);
     CHECK(chunk.steps[0].candidate_preview_count == 0);
     CHECK(chunk.steps[0].candidate_limit_rejection_count == 0);
     CHECK(chunk.steps[0].first_rejected_database_frame == -1);
     CHECK(chunk.steps[0].first_rejected_joint_index == -1);
-    CHECK(chunk.steps[0].first_rejected_joint_position == 0.0f);
+    CHECK(chunk.steps[0].first_rejected_joint_position == 0.0);
     CHECK(chunk.boundaries.front().physical_pelvis_position_holden[0] ==
           initial.physical_pelvis_position_holden[0]);
     CHECK(chunk.boundaries.back().physical_pelvis_position_holden[0] ==
@@ -647,7 +647,7 @@ static void test_candidate_preview_fields_participate_in_step_equality()
     changed.first_rejected_joint_index = 5;
     CHECK(!(changed == baseline));
     changed = baseline;
-    changed.first_rejected_joint_position = -0.3f;
+    changed.first_rejected_joint_position = -0.3;
     CHECK(!(changed == baseline));
 }
 

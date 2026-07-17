@@ -107,7 +107,7 @@ struct mm_chunk_step_diagnostic
     int candidate_limit_rejection_count = 0;
     int first_rejected_database_frame = -1;
     int first_rejected_joint_index = -1;
-    float first_rejected_joint_position = 0.0f;
+    double first_rejected_joint_position = 0.0;
     bool searched = false;
     bool transitioned = false;
     float terrain_cost = 0.0f;

@@ -29,9 +29,9 @@ struct sonic_joint_projection_diagnostic
 {
     sonic_joint_projection_failure failure = SonicJointProjectionValid;
     int row = -1;
-    float position = 0.0f;
-    float lower = 0.0f;
-    float upper = 0.0f;
+    double position = 0.0;
+    double lower = 0.0;
+    double upper = 0.0;
 };
 
 struct sonic_joint_contract_entry
@@ -44,8 +44,8 @@ struct sonic_joint_contract_entry
     quat static_local_holden;
     float sign = 0.0f;
     float zero_offset = 0.0f;
-    float lower = 0.0f;
-    float upper = 0.0f;
+    double lower = 0.0;
+    double upper = 0.0;
     std::string source_joint;
     std::string target_joint;
 };
@@ -76,9 +76,9 @@ static inline bool sonic_projection_diagnostic_error(
     sonic_joint_projection_diagnostic& diagnostic,
     sonic_joint_projection_failure failure,
     int row,
-    float position,
-    float lower,
-    float upper,
+    double position,
+    double lower,
+    double upper,
     char* output,
     int capacity,
     const char* format,
@@ -103,7 +103,7 @@ static inline bool sonic_projection_diagnostic_error(
 
 static inline sonic_joint_projection_failure
 sonic_projection_classify_position(
-    float position, float lower, float upper)
+    double position, double lower, double upper)
 {
     if (!std::isfinite(position)) return SonicJointProjectionInput;
     if (position < lower || position > upper) {
@@ -255,9 +255,9 @@ static inline bool sonic_project_joint_state(
             diagnostic,
             SonicJointProjectionShape,
             -1,
-            0.0f,
-            0.0f,
-            0.0f,
+            0.0,
+            0.0,
+            0.0,
             error,
             error_capacity,
             "projection input shape must contain exactly %d G1 bones",
@@ -276,9 +276,9 @@ static inline bool sonic_project_joint_state(
                 diagnostic,
                 SonicJointProjectionInput,
                 row,
-                0.0f,
-                0.0f,
-                0.0f,
+                0.0,
+                0.0,
+                0.0,
                 error,
                 error_capacity,
                 "projection input contains non-finite or invalid data at bone %d",
@@ -289,9 +289,9 @@ static inline bool sonic_project_joint_state(
                 diagnostic,
                 SonicJointProjectionVelocity,
                 row,
-                0.0f,
-                0.0f,
-                0.0f,
+                0.0,
+                0.0,
+                0.0,
                 error,
                 error_capacity,
                 "projection input contains non-finite or invalid data at bone %d",
@@ -327,9 +327,9 @@ static inline bool sonic_project_joint_state(
                 diagnostic,
                 SonicJointProjectionSingular,
                 row,
-                0.0f,
-                0.0f,
-                0.0f,
+                0.0,
+                0.0,
+                0.0,
                 error,
                 error_capacity,
                 "joint %s has a singular signed twist",
@@ -353,9 +353,9 @@ static inline bool sonic_project_joint_state(
                 diagnostic,
                 SonicJointProjectionResidual,
                 row,
-                0.0f,
-                0.0f,
-                0.0f,
+                0.0,
+                0.0,
+                0.0,
                 error,
                 error_capacity,
                 "joint %s off-axis residual %.9g exceeds %.9g rad",
@@ -397,9 +397,9 @@ static inline bool sonic_project_joint_state(
                 diagnostic,
                 position_failure,
                 row,
-                limit_failure ? position : 0.0f,
-                limit_failure ? entry.lower : 0.0f,
-                limit_failure ? entry.upper : 0.0f,
+                limit_failure ? static_cast<double>(position) : 0.0,
+                limit_failure ? entry.lower : 0.0,
+                limit_failure ? entry.upper : 0.0,
                 error,
                 error_capacity,
                 "joint %s position %.9g is outside range [%.9g, %.9g]",
@@ -462,9 +462,9 @@ static inline bool sonic_validate_joint_hermite_midpoint(
             diagnostic,
             SonicJointProjectionInput,
             -1,
-            0.0f,
-            0.0f,
-            0.0f,
+            0.0,
+            0.0,
+            0.0,
             error,
             error_capacity,
             "joint Hermite midpoint dt must be finite and positive");
@@ -480,9 +480,9 @@ static inline bool sonic_validate_joint_hermite_midpoint(
                 diagnostic,
                 SonicJointProjectionInput,
                 row,
-                0.0f,
-                0.0f,
-                0.0f,
+                0.0,
+                0.0,
+                0.0,
                 error,
                 error_capacity,
                 "joint Hermite midpoint input is non-finite at row %d",
@@ -500,22 +500,21 @@ static inline bool sonic_validate_joint_hermite_midpoint(
                 diagnostic,
                 SonicJointProjectionInput,
                 row,
-                0.0f,
-                0.0f,
-                0.0f,
+                0.0,
+                0.0,
+                0.0,
                 error,
                 error_capacity,
                 "joint Hermite midpoint is non-finite at row %d",
                 row);
         }
         const sonic_joint_contract_entry& entry = contract[row];
-        if (midpoint < static_cast<double>(entry.lower) ||
-            midpoint > static_cast<double>(entry.upper)) {
+        if (midpoint < entry.lower || midpoint > entry.upper) {
             return sonic_projection_diagnostic_error(
                 diagnostic,
                 SonicJointProjectionLimit,
                 row,
-                static_cast<float>(midpoint),
+                midpoint,
                 entry.lower,
                 entry.upper,
                 error,

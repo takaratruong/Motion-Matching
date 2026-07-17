@@ -467,6 +467,25 @@ public:
         text_.append(encoded, static_cast<std::size_t>(count));
     }
 
+    void number(double value)
+    {
+        if (!std::isfinite(value)) {
+            valid_ = false;
+            return;
+        }
+        char encoded[64] = {};
+        const int count = std::snprintf(
+            encoded,
+            sizeof(encoded),
+            "%.17g",
+            value == 0.0 ? 0.0 : value);
+        if (count <= 0 || count >= static_cast<int>(sizeof(encoded))) {
+            valid_ = false;
+            return;
+        }
+        text_.append(encoded, static_cast<std::size_t>(count));
+    }
+
     bool valid() const { return valid_; }
     const std::string& text() const { return text_; }
 

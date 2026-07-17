@@ -527,6 +527,24 @@ class ChunkServerProtocolTest(unittest.TestCase):
                     "abort", f"control-abort-{index}", "c000000"
                 ))["ok"])
 
+    def test_candidate_rejection_serialization_retains_exact_binary64(self):
+        self.assertTrue(self.server.request(hello())["ok"])
+        self.assertTrue(self.server.request(reset())["ok"])
+        response = self.server.request(generate(
+            "exact-double-preview", "exact-double-rejected-position"
+        ))
+        self.assertTrue(response["ok"], response)
+        witness = response["data"]["first_rejected_joint_position"][0]
+        expected = float(np.nextafter(-0.25, -np.inf))
+        self.assertEqual(
+            struct.pack("<d", witness),
+            struct.pack("<d", expected),
+        )
+        self.assertEqual(np.float32(witness), np.float32(-0.25))
+        self.assertTrue(self.server.request(finish(
+            "abort", "exact-double-abort", "exact-double-rejected-position"
+        ))["ok"])
+
 
 class ChunkServerSourceOwnershipTest(unittest.TestCase):
     def test_real_certificate_build_order_ownership_and_runtime_binding(self):

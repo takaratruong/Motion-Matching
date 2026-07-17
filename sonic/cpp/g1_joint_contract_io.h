@@ -109,6 +109,23 @@ static inline bool sonic_joint_contract_float_member(
         output, *value, error, capacity);
 }
 
+static inline bool sonic_joint_contract_double_member(
+    double& output,
+    const json_value& object,
+    const char* key,
+    char* error,
+    int capacity)
+{
+    const json_value* value = json_member(object, key);
+    if (value == nullptr || value->kind != json_number ||
+        !std::isfinite(value->number_value)) {
+        return sonic_projection_error(
+            error, capacity, "joint contract double is invalid");
+    }
+    output = value->number_value;
+    return true;
+}
+
 static inline bool sonic_joint_contract_vec3_member(
     vec3& output,
     const json_value& object,
@@ -293,9 +310,9 @@ static inline bool sonic_joint_contract_load(
                 "zero_offset",
                 error,
                 capacity) ||
-            !sonic_joint_contract_float_member(
+            !sonic_joint_contract_double_member(
                 entry.lower, encoded, "lower", error, capacity) ||
-            !sonic_joint_contract_float_member(
+            !sonic_joint_contract_double_member(
                 entry.upper, encoded, "upper", error, capacity)) {
             return false;
         }
