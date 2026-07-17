@@ -380,6 +380,42 @@ class GatedSimulatorProtocolTests(unittest.TestCase):
 
 
 class ExternalGearBackendBoundaryTests(unittest.TestCase):
+    def test_protocol_backend_forces_headless_nonrendering_simulator(self):
+        captured = {}
+
+        class ConfigLoader:
+            env_name = "default"
+
+            @staticmethod
+            def load_wbc_yaml():
+                return {
+                    "ENABLE_ONSCREEN": True,
+                    "ENABLE_OFFSCREEN": True,
+                }
+
+        def base_simulator(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace()
+
+        bindings = SimpleNamespace(
+            sim_loop_config=ConfigLoader,
+            base_simulator=base_simulator,
+        )
+        with tempfile.TemporaryDirectory() as root_text:
+            scene = Path(root_text) / "scene.xml"
+            scene.write_text("<mujoco/>\n", encoding="utf-8")
+            with patch.object(
+                gated_sim,
+                "load_external_bindings",
+                return_value=bindings,
+            ):
+                ExternalGearBackend("/authenticated/gear", scene)
+
+        self.assertEqual(captured["config"]["ROBOT_SCENE"], str(scene))
+        self.assertFalse(captured["onscreen"])
+        self.assertFalse(captured["offscreen"])
+        self.assertFalse(captured["enable_image_publish"])
+
     def test_production_main_reserves_stdout_for_jsonl_protocol(self):
         protocol_line = '{"v":1,"ok":true}\n'
 

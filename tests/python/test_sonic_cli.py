@@ -1047,6 +1047,30 @@ class SonicCLITests(unittest.TestCase):
                 evidence = self._evidence(self._only_bundle(output))
                 self.assertEqual(evidence["command_status"], status_value)
 
+    def test_finalization_failure_is_reported_once_without_retry_masking(self):
+        calls = []
+
+        def fail_after_transition(bundle, status, *, outcome):
+            calls.append((status, dict(outcome)))
+            bundle._status = "finalizing"
+            raise ContractError("primary finalization failure")
+
+        with patch.object(
+            cli_module.RunBundle,
+            "finalize",
+            autospec=True,
+            side_effect=fail_after_transition,
+        ):
+            code, stdout, stderr = self._run(
+                ["preflight", *self._common()]
+            )
+
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("primary finalization failure", stderr)
+        self.assertNotIn("already finalized or finalizing", stderr)
+        self.assertEqual(len(calls), 1)
+
     def test_each_mode_runs_only_its_ordered_prerequisite_prefix(self) -> None:
         cases = (
             ("mm-reference", 4),

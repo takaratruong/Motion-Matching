@@ -752,8 +752,10 @@ class ExternalGearBackend:
             simulator = bindings.base_simulator(
                 config=config,
                 env_name=config_loader.env_name,
-                onscreen=config.get("ENABLE_ONSCREEN", True),
-                offscreen=config.get("ENABLE_OFFSCREEN", False),
+                # This child is a deterministic JSONL physics gate.  It never
+                # renders and must not inherit GEAR's interactive GLFW default.
+                onscreen=False,
+                offscreen=False,
                 enable_image_publish=False,
             )
         self._bindings = bindings

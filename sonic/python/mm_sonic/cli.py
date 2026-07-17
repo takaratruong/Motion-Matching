@@ -5617,6 +5617,9 @@ def main(
                 stdout=output,
             )
         except (ExternalInputError, ContractError) as error:
+            if bundle.status != "running":
+                errors.write(f"configuration/integration error: {error}\n")
+                return EXIT_CONFIGURATION
             code = _finalize_pre_execution(
                 request,
                 bundle,

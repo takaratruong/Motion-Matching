@@ -2398,6 +2398,15 @@ class GearProcess:
             self._wait_for_control_ready = False
             self._input_prepared = False
             self._control_active = False
+            # The wrapper creates this directory exclusively.  GEAR fills it
+            # during a normal run; an earlier peer failure can leave it empty,
+            # and empty unregistered directories cannot enter sealed evidence.
+            try:
+                self.logs_dir.rmdir()
+            except OSError:
+                # Nonempty evidence (or a path-identity problem) is retained
+                # for the bundle's strict inventory validation.
+                pass
         if self._group_exists():
             raise ProcessError(
                 f"GEAR process group {self.pgid} survived cleanup"

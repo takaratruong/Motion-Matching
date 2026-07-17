@@ -816,6 +816,22 @@ class GearProcessTests(TemporaryScriptCase):
         self.assertEqual(gear.cleanup_history[0], "official-stop-key")
         self.assertFalse(process_exists(gear.pid))
 
+    def test_close_removes_only_its_empty_logs_directory(self):
+        child = self.script("unused_logs.py", "raise SystemExit(0)\n")
+        gear = self.gear(child)
+        logs = gear.logs_dir
+        self.assertTrue(logs.is_dir())
+
+        gear.close()
+
+        self.assertFalse(logs.exists())
+
+        preserved = self.gear(child)
+        marker = preserved.logs_dir / "retained.csv"
+        marker.write_text("evidence\n", encoding="utf-8")
+        preserved.close()
+        self.assertEqual(marker.read_text(encoding="utf-8"), "evidence\n")
+
     def test_default_markers_follow_literal_official_control_then_stream_order(self):
         keys_path = self.root / "default-marker-keys.bin"
         child = self.script(
