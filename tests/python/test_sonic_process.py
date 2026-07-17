@@ -941,6 +941,14 @@ class GearProcessTests(TemporaryScriptCase):
             self.gear(child)
 
         self.assertFalse((self.root / "gear-logs").exists())
+        self.assertEqual(
+            list(
+                self.root.glob(
+                    process_module._OWNED_DIRECTORY_STAGING_PREFIX + "*"
+                )
+            ),
+            [],
+        )
 
     def test_logs_staging_leaf_swap_after_open_is_rejected_without_deletion(self):
         from mm_sonic import process as process_module
@@ -950,19 +958,21 @@ class GearProcessTests(TemporaryScriptCase):
         created = self.root / "wrapper-created-logs"
         replacement = None
         swapped = False
+        staging_stat_calls = 0
 
         def swap_leaf_stat(path, *args, dir_fd=None, **kwargs):
-            nonlocal replacement, swapped
+            nonlocal replacement, staging_stat_calls, swapped
             if (
                 isinstance(path, str)
                 and path.startswith(process_module._OWNED_DIRECTORY_STAGING_PREFIX)
                 and dir_fd is not None
-                and not swapped
             ):
-                swapped = True
-                replacement = self.root / path
-                replacement.rename(created)
-                replacement.mkdir()
+                staging_stat_calls += 1
+                if staging_stat_calls == 2 and not swapped:
+                    swapped = True
+                    replacement = self.root / path
+                    replacement.rename(created)
+                    replacement.mkdir()
             return real_stat(path, *args, dir_fd=dir_fd, **kwargs)
 
         with (

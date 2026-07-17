@@ -376,6 +376,8 @@ def _create_owned_directory(
     parent_fd, name = _open_confined_parent_fd(run_root, candidate, label)
     leaf_fd: int | None = None
     staging_name: str | None = None
+    staging_device: int | None = None
+    staging_inode: int | None = None
     published = False
     retained = False
     try:
@@ -391,6 +393,15 @@ def _create_owned_directory(
             raise ProcessError(
                 f"cannot allocate private staging directory for {label}"
             )
+        created_staging = os.stat(
+            staging_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISDIR(created_staging.st_mode):
+            raise ProcessError(f"{label} staging identity changed during creation")
+        staging_device = created_staging.st_dev
+        staging_inode = created_staging.st_ino
         leaf_fd = os.open(
             staging_name,
             _directory_open_flags(),
@@ -405,6 +416,8 @@ def _create_owned_directory(
         if (
             not stat.S_ISDIR(leaf.st_mode)
             or not stat.S_ISDIR(staged.st_mode)
+            or leaf.st_dev != staging_device
+            or leaf.st_ino != staging_inode
             or staged.st_dev != leaf.st_dev
             or staged.st_ino != leaf.st_ino
         ):
@@ -437,19 +450,30 @@ def _create_owned_directory(
         if not retained:
             remove_created = False
             cleanup_name = name if published else staging_name
-            if leaf_fd is not None and cleanup_name is not None:
+            if cleanup_name is not None:
                 try:
-                    original = os.fstat(leaf_fd)
+                    if leaf_fd is not None:
+                        original = os.fstat(leaf_fd)
+                        expected_device = original.st_dev
+                        expected_inode = original.st_ino
+                        original_is_directory = stat.S_ISDIR(original.st_mode)
+                    else:
+                        expected_device = staging_device
+                        expected_inode = staging_inode
+                        original_is_directory = (
+                            expected_device is not None
+                            and expected_inode is not None
+                        )
                     current = os.stat(
                         cleanup_name,
                         dir_fd=parent_fd,
                         follow_symlinks=False,
                     )
                     remove_created = (
-                        stat.S_ISDIR(original.st_mode)
+                        original_is_directory
                         and stat.S_ISDIR(current.st_mode)
-                        and current.st_dev == original.st_dev
-                        and current.st_ino == original.st_ino
+                        and current.st_dev == expected_device
+                        and current.st_ino == expected_inode
                     )
                 except OSError:
                     remove_created = False
