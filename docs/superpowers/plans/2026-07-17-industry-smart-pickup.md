@@ -803,7 +803,7 @@ Make, and raylib for the final native visualization only.
   revalidation-only `TableBlocked` and `ObstacleBlocked`, and `None` for
   `None`. Assert a failed assist owns no input and can begin a new valid attempt.
 
-- [ ] **Step 2: Write failing approach and travel-accounting tests**
+- [x] **Step 2: Write failing approach and travel-accounting tests**
 
   Starting `0.80 m` from the frozen slot, assert the first observation emits an
   ordinary camera-relative left stick, does not request preview, and does not
