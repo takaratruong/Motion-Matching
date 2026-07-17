@@ -809,7 +809,9 @@ void motion_matching_search(
     const slice1d<float> query_normalized,
     const float transition_cost,
     const int ignore_range_end,
-    const int ignore_surrounding)
+    const int ignore_surrounding,
+    const unsigned char* candidate_mask = nullptr,
+    const int candidate_mask_count = 0)
 {
     // Keep strict header builds warning-clean while these legacy public API
     // parameters remain unused by the normalized-distance implementation.
@@ -820,6 +822,20 @@ void motion_matching_search(
     int nranges = range_starts.size;
     
     int curr_index = best_index;
+
+    if (candidate_mask != nullptr)
+    {
+        if (candidate_mask_count != features.rows)
+        {
+            best_index = -1;
+            return;
+        }
+        if (best_index != -1 && candidate_mask[best_index] != 1)
+        {
+            best_index = -1;
+            best_cost = FLT_MAX;
+        }
+    }
     
     // Find cost for current frame
     if (best_index != -1)
@@ -896,6 +912,12 @@ void motion_matching_search(
                 // Search inside small box
                 while (i < i_sm_next && i < range_end)
                 {
+                    if (candidate_mask != nullptr && candidate_mask[i] != 1)
+                    {
+                        i++;
+                        continue;
+                    }
+
                     // Skip surrounding frames
                     if (curr_index != - 1 && abs(i - curr_index) < ignore_surrounding)
                     {
@@ -936,8 +958,16 @@ void database_search(
     const slice1d<float> query,
     const float transition_cost = 0.0f,
     const int ignore_range_end = 20,
-    const int ignore_surrounding = 20)
+    const int ignore_surrounding = 20,
+    const unsigned char* candidate_mask = nullptr,
+    const int candidate_mask_count = 0)
 {
+    if (candidate_mask != nullptr && candidate_mask_count != db.nframes())
+    {
+        best_index = -1;
+        return;
+    }
+
     // Normalize Query
     array1d<float> query_normalized(db.nfeatures());
     for (int i = 0; i < db.nfeatures(); i++)
@@ -962,5 +992,7 @@ void database_search(
         query_normalized,
         transition_cost,
         ignore_range_end,
-        ignore_surrounding);
+        ignore_surrounding,
+        candidate_mask,
+        candidate_mask_count);
 }

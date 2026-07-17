@@ -567,6 +567,92 @@ static void test_transition_cost_hysteresis_semantics()
     CHECK(float_bits(end_cost) == float_bits(1.0f));
 }
 
+static void test_candidate_mask_search_semantics()
+{
+    database db;
+    fill_search_database(db);
+    array1d<float> query(31);
+    query.zero();
+
+    const unsigned char next_best_mask[4] = {1, 1, 0, 1};
+    int masked_index = -1;
+    float masked_cost = FLT_MAX;
+    database_search(
+        masked_index,
+        masked_cost,
+        db,
+        query,
+        0.0f,
+        0,
+        1,
+        next_best_mask,
+        4);
+    CHECK(masked_index == 1);
+    CHECK(float_bits(masked_cost) == float_bits(4.0f));
+
+    int masked_incumbent = 2;
+    float masked_incumbent_cost = -17.0f;
+    database_search(
+        masked_incumbent,
+        masked_incumbent_cost,
+        db,
+        query,
+        0.0f,
+        0,
+        1,
+        next_best_mask,
+        4);
+    CHECK(masked_incumbent == 1);
+    CHECK(float_bits(masked_incumbent_cost) == float_bits(4.0f));
+
+    int legacy_index = -1;
+    float legacy_cost = FLT_MAX;
+    database_search(legacy_index, legacy_cost, db, query, 0.0f, 0, 1);
+    int null_mask_index = -1;
+    float null_mask_cost = FLT_MAX;
+    database_search(
+        null_mask_index,
+        null_mask_cost,
+        db,
+        query,
+        0.0f,
+        0,
+        1,
+        nullptr,
+        97);
+    CHECK(null_mask_index == legacy_index);
+    CHECK(float_bits(null_mask_cost) == float_bits(legacy_cost));
+
+    int mismatch_index = 2;
+    float mismatch_cost = -23.0f;
+    database_search(
+        mismatch_index,
+        mismatch_cost,
+        db,
+        query,
+        0.0f,
+        0,
+        1,
+        next_best_mask,
+        3);
+    CHECK(mismatch_index == -1);
+
+    const unsigned char empty_mask[4] = {0, 0, 0, 0};
+    int empty_index = 2;
+    float empty_cost = -31.0f;
+    database_search(
+        empty_index,
+        empty_cost,
+        db,
+        query,
+        0.0f,
+        0,
+        1,
+        empty_mask,
+        4);
+    CHECK(empty_index == -1);
+}
+
 int main()
 {
     test_zero_weight_is_exact_and_safe();
@@ -577,5 +663,6 @@ int main()
     test_all_disabled_constant_builder();
     test_cost_and_incumbent_search_semantics();
     test_transition_cost_hysteresis_semantics();
+    test_candidate_mask_search_semantics();
     return 0;
 }

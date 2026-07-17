@@ -35,6 +35,13 @@ struct g1_runtime_step_result
     motion_match_pose_diagnostic projected;
 };
 
+struct g1_runtime_frame_feasibility
+{
+    const unsigned char* raw_safe = nullptr;
+    const unsigned char* search_safe = nullptr;
+    int count = 0;
+};
+
 struct g1_runtime_config
 {
     float dt = 0.04f;
@@ -597,12 +604,13 @@ static inline bool g1_runtime_artifacts_are_valid(
 }
 
 template<typename PredictionBuilder>
-static inline bool g1_runtime_step(
+static inline bool g1_runtime_step_internal(
     g1_runtime_step_result& out,
     g1_controller_state& state,
     database& db,
     const terrain_support_set& support_rows,
     const scene_pack& active_scene,
+    const g1_runtime_frame_feasibility* feasibility,
     const g1_runtime_step_request& request,
     const g1_runtime_config& config,
     PredictionBuilder prediction_builder,
@@ -633,6 +641,13 @@ static inline bool g1_runtime_step(
             state, db, support_rows, active_scene)) {
         return scene_error(
             error, capacity, "runtime step artifact or state shape is invalid");
+    }
+    if (feasibility != nullptr &&
+        (feasibility->raw_safe == nullptr ||
+         feasibility->search_safe == nullptr ||
+         feasibility->count != db.nframes())) {
+        return scene_error(
+            error, capacity, "runtime step feasibility shape is invalid");
     }
 
     g1_controller_state next;
@@ -857,14 +872,18 @@ static inline bool g1_runtime_step(
             error, capacity, "expected exactly 31 finite query values");
     }
 
-    bool end_of_anim = database_trajectory_index_clamp(
-        db, next.frame_index, 1) == next.frame_index;
-    next.searched = request.matching_enabled &&
-        (force_search || next.search_timer <= 0.0f || end_of_anim);
+    const int ordinary_successor = database_trajectory_index_clamp(
+        db, next.frame_index, 1);
+    const bool end_of_anim = ordinary_successor == next.frame_index;
+    const bool unsafe_successor = feasibility != nullptr &&
+        feasibility->raw_safe[ordinary_successor] != 1;
+    next.searched = unsafe_successor ||
+        (request.matching_enabled &&
+         (force_search || next.search_timer <= 0.0f || end_of_anim));
     next.incumbent_cost = 0.0f;
     next.selected_cost = 0.0f;
     next.selected_terrain_error = 0.0f;
-    next.incumbent_cost = end_of_anim
+    next.incumbent_cost = end_of_anim || unsafe_successor
         ? FLT_MAX : database_frame_cost(db, next.frame_index, query);
     next.selected_cost = next.incumbent_cost;
     next.selected_terrain_error = database_raw_terrain_error(
@@ -874,7 +893,7 @@ static inline bool g1_runtime_step(
     if (next.searched)
     {
         const int prior_index = next.frame_index;
-        int best_index = end_of_anim ? -1 : prior_index;
+        int best_index = end_of_anim || unsafe_successor ? -1 : prior_index;
         float best_cost = FLT_MAX;
         const float transition_cost =
             g1_idle_match_transition_cost(
@@ -885,7 +904,17 @@ static inline bool g1_runtime_step(
             best_cost,
             db,
             query,
-            transition_cost);
+            transition_cost,
+            20,
+            20,
+            feasibility == nullptr ? nullptr : feasibility->search_safe,
+            feasibility == nullptr ? 0 : feasibility->count);
+        if (feasibility != nullptr && best_index == -1) {
+            return scene_error(
+                error,
+                capacity,
+                "no joint-limit-safe database candidate");
+        }
         selected_database_frame = best_index;
         if (best_index != prior_index) {
             next.selected_cost = best_cost;
@@ -1227,12 +1256,68 @@ static inline bool g1_runtime_step(
     return true;
 }
 
+template<typename PredictionBuilder>
 static inline bool g1_runtime_step(
     g1_runtime_step_result& out,
     g1_controller_state& state,
     database& db,
     const terrain_support_set& support_rows,
     const scene_pack& active_scene,
+    const g1_runtime_frame_feasibility& feasibility,
+    const g1_runtime_step_request& request,
+    const g1_runtime_config& config,
+    PredictionBuilder prediction_builder,
+    char* error,
+    int capacity)
+{
+    return g1_runtime_step_internal(
+        out,
+        state,
+        db,
+        support_rows,
+        active_scene,
+        &feasibility,
+        request,
+        config,
+        prediction_builder,
+        error,
+        capacity);
+}
+
+template<typename PredictionBuilder>
+static inline bool g1_runtime_step(
+    g1_runtime_step_result& out,
+    g1_controller_state& state,
+    database& db,
+    const terrain_support_set& support_rows,
+    const scene_pack& active_scene,
+    const g1_runtime_step_request& request,
+    const g1_runtime_config& config,
+    PredictionBuilder prediction_builder,
+    char* error,
+    int capacity)
+{
+    return g1_runtime_step_internal(
+        out,
+        state,
+        db,
+        support_rows,
+        active_scene,
+        nullptr,
+        request,
+        config,
+        prediction_builder,
+        error,
+        capacity);
+}
+
+static inline bool g1_runtime_step_direct_internal(
+    g1_runtime_step_result& out,
+    g1_controller_state& state,
+    database& db,
+    const terrain_support_set& support_rows,
+    const scene_pack& active_scene,
+    const g1_runtime_frame_feasibility* feasibility,
     const g1_runtime_step_request& request,
     const g1_runtime_config& config,
     char* error,
@@ -1324,15 +1409,65 @@ static inline bool g1_runtime_step(
                 prediction_error,
                 prediction_capacity);
         };
-    return g1_runtime_step(
+    return g1_runtime_step_internal(
         out,
         state,
         db,
         support_rows,
         active_scene,
+        feasibility,
         request,
         config,
         direct_prediction_builder,
+        error,
+        capacity);
+}
+
+static inline bool g1_runtime_step(
+    g1_runtime_step_result& out,
+    g1_controller_state& state,
+    database& db,
+    const terrain_support_set& support_rows,
+    const scene_pack& active_scene,
+    const g1_runtime_frame_feasibility& feasibility,
+    const g1_runtime_step_request& request,
+    const g1_runtime_config& config,
+    char* error,
+    int capacity)
+{
+    return g1_runtime_step_direct_internal(
+        out,
+        state,
+        db,
+        support_rows,
+        active_scene,
+        &feasibility,
+        request,
+        config,
+        error,
+        capacity);
+}
+
+static inline bool g1_runtime_step(
+    g1_runtime_step_result& out,
+    g1_controller_state& state,
+    database& db,
+    const terrain_support_set& support_rows,
+    const scene_pack& active_scene,
+    const g1_runtime_step_request& request,
+    const g1_runtime_config& config,
+    char* error,
+    int capacity)
+{
+    return g1_runtime_step_direct_internal(
+        out,
+        state,
+        db,
+        support_rows,
+        active_scene,
+        nullptr,
+        request,
+        config,
         error,
         capacity);
 }

@@ -43,7 +43,7 @@ static void make_database(database& db)
         -1, 0, 1, 2, 3, 4, 5, 6, 1, 8, 9, 10, 11, 12, 1, 14,
         15, 16, 17, 18, 19, 20, 21, 22, 16, 24, 25, 26, 27, 28, 29
     };
-    const int frames = 4;
+    const int frames = 48;
     db.bone_positions.resize(frames, G1_BoneCount);
     db.bone_velocities.resize(frames, G1_BoneCount);
     db.bone_rotations.resize(frames, G1_BoneCount);
@@ -110,6 +110,45 @@ static void make_support(terrain_support_set& support, int frames)
 {
     support.values.resize(frames, 3);
     support.values.zero();
+}
+
+static g1_runtime_step_request make_direct_request(bool matching_enabled)
+{
+    g1_runtime_step_request request;
+    request.mode = G1RuntimeDirect;
+    request.requested_velocity_holden = vec3();
+    request.desired_heading_holden = quat();
+    request.matching_enabled = matching_enabled;
+    return request;
+}
+
+static void reset_runtime_state(
+    g1_controller_state& state,
+    database& db,
+    const terrain_support_set& support,
+    const scene_pack& scene)
+{
+    char error[512] = {};
+    check(g1_controller_state_reset(
+              state,
+              db,
+              support,
+              scene,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+}
+
+static g1_runtime_frame_feasibility make_feasibility_view(
+    const array1d<unsigned char>& raw_safe,
+    const array1d<unsigned char>& search_safe,
+    int count)
+{
+    g1_runtime_frame_feasibility feasibility;
+    feasibility.raw_safe = raw_safe.data;
+    feasibility.search_safe = search_safe.data;
+    feasibility.count = count;
+    return feasibility;
 }
 
 static std::uint64_t hash_bytes(
@@ -270,6 +309,96 @@ static void check_failed_step_is_transactional(
           "failed runtime step preserves the complete result object");
 }
 
+static void check_failed_feasible_step_is_transactional(
+    g1_controller_state& state,
+    database& db,
+    const terrain_support_set& support,
+    const scene_pack& scene,
+    const g1_runtime_frame_feasibility& feasibility,
+    const g1_runtime_step_request& request,
+    const g1_runtime_config& config,
+    const char* expected_error,
+    bool exact_error)
+{
+    g1_runtime_step_result result = sentinel_result();
+    unsigned char result_before[sizeof(result)];
+    std::memcpy(result_before, &result, sizeof(result));
+    const state_guard state_before = guard_state(state);
+    char error[512] = {};
+    check(!g1_runtime_step(
+              result,
+              state,
+              db,
+              support,
+              scene,
+              feasibility,
+              request,
+              config,
+              error,
+              static_cast<int>(sizeof(error))),
+          "invalid feasible runtime step is rejected");
+    if (exact_error) {
+        check(std::string(error) == expected_error,
+              "runtime failure publishes the exact checked diagnostic");
+    } else {
+        check(std::string(error).find(expected_error) != std::string::npos,
+              "runtime failure publishes the expected checked diagnostic");
+    }
+    check(state_is_unchanged(state, state_before),
+          "failed feasible runtime step preserves state transactionally");
+    check(std::memcmp(result_before, &result, sizeof(result)) == 0,
+          "failed feasible runtime step preserves the complete result");
+}
+
+static void capture_legacy_query(
+    float (&query)[31],
+    database& db,
+    const terrain_support_set& support,
+    const scene_pack& scene)
+{
+    g1_controller_state state;
+    reset_runtime_state(state, db, support, scene);
+    const g1_runtime_step_request request = make_direct_request(false);
+    const g1_runtime_config config;
+    g1_runtime_step_result result;
+    char error[512] = {};
+    check(g1_runtime_step(
+              result,
+              state,
+              db,
+              support,
+              scene,
+              request,
+              config,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+    for (int dimension = 0; dimension < 31; ++dimension) {
+        query[dimension] = result.query[dimension];
+    }
+}
+
+static void make_masked_candidate_cost_order(
+    database& db,
+    const terrain_support_set& support,
+    const scene_pack& scene)
+{
+    float query[31] = {};
+    capture_legacy_query(query, db, support, scene);
+    for (int frame = 0; frame < db.nframes(); ++frame) {
+        for (int dimension = 0; dimension < 31; ++dimension) {
+            db.features(frame, dimension) = query[dimension] + 50.0f;
+        }
+    }
+    for (int dimension = 0; dimension < 31; ++dimension) {
+        db.features(0, dimension) = 0.0f;
+        db.features(20, dimension) = query[dimension];
+        db.features(21, dimension) = query[dimension];
+    }
+    db.features(21, 0) += 1.0f;
+    database_build_bounds(db);
+}
+
 static void test_direct_runtime_boundary_and_advance()
 {
     database db;
@@ -356,11 +485,168 @@ static void test_direct_runtime_boundary_and_advance()
     check(g1_pose_diagnostic_is_finite(result.raw_selected) &&
               g1_pose_diagnostic_is_finite(result.inertialized) &&
               g1_pose_diagnostic_is_finite(result.projected),
-          "all runtime pose boundaries are finite");
+              "all runtime pose boundaries are finite");
+}
+
+static void test_feasible_runtime_progression_and_masked_search()
+{
+    database db;
+    make_database(db);
+    scene_pack scene = make_scene();
+    terrain_support_set support;
+    make_support(support, db.nframes());
+    array1d<unsigned char> raw_safe(db.nframes());
+    array1d<unsigned char> search_safe(db.nframes());
+    raw_safe.set(1);
+    search_safe.set(1);
+    const g1_runtime_frame_feasibility all_safe = make_feasibility_view(
+        raw_safe, search_safe, db.nframes());
+    const g1_runtime_step_request request = make_direct_request(true);
+    const g1_runtime_config config;
+    char error[512] = {};
+
+    g1_controller_state state;
+    reset_runtime_state(state, db, support, scene);
+    state.search_timer = 100.0f;
+    g1_runtime_step_result result;
+    check(g1_runtime_step(
+              result,
+              state,
+              db,
+              support,
+              scene,
+              all_safe,
+              request,
+              config,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+    check(!state.searched && result.selected_database_frame == 0,
+          "a raw-safe successor keeps ordinary continuation");
+    check(state.frame_index == 1,
+          "safe ordinary continuation emits the exact successor");
+
+    raw_safe.set(1);
+    search_safe.zero();
+    raw_safe(1) = 0;
+    search_safe(20) = 1;
+    const g1_runtime_frame_feasibility guarded = make_feasibility_view(
+        raw_safe, search_safe, db.nframes());
+    const g1_runtime_step_request matching_disabled_request =
+        make_direct_request(false);
+    reset_runtime_state(state, db, support, scene);
+    state.search_timer = 100.0f;
+    std::memset(error, 0, sizeof(error));
+    check(g1_runtime_step(
+              result,
+              state,
+              db,
+              support,
+              scene,
+              guarded,
+              matching_disabled_request,
+              config,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+    check(state.searched && state.transitioned,
+          "an unsafe ordinary successor forces the existing search path");
+    check(result.selected_database_frame == 20 && state.frame_index == 21,
+          "forced search emits the certified target successor without skips");
+
+    make_masked_candidate_cost_order(db, support, scene);
+    raw_safe.set(1);
+    search_safe.zero();
+    raw_safe(1) = 0;
+    search_safe(21) = 1;
+    const g1_runtime_frame_feasibility next_best = make_feasibility_view(
+        raw_safe, search_safe, db.nframes());
+    reset_runtime_state(state, db, support, scene);
+    state.search_timer = 100.0f;
+    std::memset(error, 0, sizeof(error));
+    check(g1_runtime_step(
+              result,
+              state,
+              db,
+              support,
+              scene,
+              next_best,
+              request,
+              config,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+    check(result.selected_database_frame == 21 && state.frame_index == 22,
+          "runtime skips the cheaper search-unsafe candidate");
+}
+
+static void test_feasible_runtime_failures_are_transactional()
+{
+    database db;
+    make_database(db);
+    scene_pack scene = make_scene();
+    terrain_support_set support;
+    make_support(support, db.nframes());
+    array1d<unsigned char> raw_safe(db.nframes());
+    array1d<unsigned char> search_safe(db.nframes());
+    raw_safe.set(1);
+    search_safe.zero();
+    raw_safe(1) = 0;
+    const g1_runtime_step_request request = make_direct_request(true);
+    const g1_runtime_config config;
+    g1_controller_state state;
+
+    reset_runtime_state(state, db, support, scene);
+    state.search_timer = 100.0f;
+    const g1_runtime_frame_feasibility no_candidate = make_feasibility_view(
+        raw_safe, search_safe, db.nframes());
+    check_failed_feasible_step_is_transactional(
+        state,
+        db,
+        support,
+        scene,
+        no_candidate,
+        request,
+        config,
+        "no joint-limit-safe database candidate",
+        true);
+
+    raw_safe.set(1);
+    search_safe.set(1);
+    reset_runtime_state(state, db, support, scene);
+    const g1_runtime_frame_feasibility wrong_count = make_feasibility_view(
+        raw_safe, search_safe, db.nframes() - 1);
+    check_failed_feasible_step_is_transactional(
+        state,
+        db,
+        support,
+        scene,
+        wrong_count,
+        request,
+        config,
+        "feasibility shape",
+        false);
+
+    reset_runtime_state(state, db, support, scene);
+    g1_runtime_frame_feasibility missing_raw = make_feasibility_view(
+        raw_safe, search_safe, db.nframes());
+    missing_raw.raw_safe = nullptr;
+    check_failed_feasible_step_is_transactional(
+        state,
+        db,
+        support,
+        scene,
+        missing_raw,
+        request,
+        config,
+        "feasibility shape",
+        false);
 }
 
 int main()
 {
     test_direct_runtime_boundary_and_advance();
+    test_feasible_runtime_progression_and_masked_search();
+    test_feasible_runtime_failures_are_transactional();
     return 0;
 }
