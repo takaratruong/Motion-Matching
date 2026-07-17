@@ -92,6 +92,7 @@ class RegisteredScene:
     output_hashes: Mapping[str, str]
     allowed_foot_geoms: tuple[int, ...]
     forbidden_geom_groups: Mapping[str, tuple[int, ...]]
+    terrain_geoms: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1238,6 +1239,7 @@ def register_scene(
         output_hashes=_immutable_mapping(output_hashes),
         allowed_foot_geoms=allowed,
         forbidden_geom_groups=forbidden,
+        terrain_geoms=tuple(terrain_geom_ids),
     )
     verify_mm_scene_identity(
         registered,

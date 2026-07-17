@@ -735,6 +735,27 @@ class RunBundleLifecycleTests(unittest.TestCase):
         ):
             failed.finalize("failed", outcome={"reason": "fixture"})
 
+        registered = terminal_metadata()
+        registered_scene = registered["scene_registration"]
+        assert isinstance(registered_scene, dict)
+        registered_scene["terrain_geoms"] = [0]
+        complete_with_terrain = RunBundle.create(
+            self.root, "registered-terrain-geoms", "run"
+        )
+        complete_with_terrain.update_manifest(registered)
+        complete_with_terrain.finalize(
+            "complete", outcome={"integration_pass": True}
+        )
+
+        overlapping = terminal_metadata()
+        overlapping_scene = overlapping["scene_registration"]
+        assert isinstance(overlapping_scene, dict)
+        overlapping_scene["terrain_geoms"] = [11]
+        overlap = RunBundle.create(self.root, "terrain-overlap", "run")
+        overlap.update_manifest(overlapping)
+        with self.assertRaisesRegex(ContractError, "geom groups overlap"):
+            overlap.finalize("complete", outcome={"integration_pass": True})
+
 
 class RunManifestSchemaTests(unittest.TestCase):
     def test_terminal_schema_registers_every_reproducibility_category(self):

@@ -22,6 +22,7 @@ import time
 from types import MappingProxyType
 from typing import Callable, IO, Mapping, Protocol, Sequence
 import uuid
+import xml.etree.ElementTree as ET
 
 import numpy as np
 
@@ -48,10 +49,13 @@ from .joints import (
     reorder_source_to_target,
 )
 from .metrics import (
+    SecondaryMetrics,
     STAGE_A_GATE_NAMES,
     STAGE_A_IDENTITY_KEYS,
+    evaluate_flat_trial,
     stage_a_identity_sha256,
     tracking_metrics,
+    validate_stage_a_prerequisite,
 )
 from .process import (
     GatedSimulatorClient,
@@ -77,6 +81,15 @@ from .schema import (
     JointFeasibilityIdentity,
     parse_joint_feasibility_identity,
 )
+from .stage_b import (
+    STAGE_B_CONTROL_LEAD_ROWS,
+    STAGE_B_FRAME_COUNT,
+    STAGE_B_REFERENCE_DURATION_S,
+    build_stream_transport_plan,
+    canonicalize_sonic_transport,
+    load_flat_simulator_safety,
+    validate_stage_b_coverage,
+)
 from .timeline import CanonicalTargetBuffer, TargetTimeline
 from .transform import (
     holden_to_mujoco_quaternions,
@@ -98,6 +111,7 @@ _LOCK_PATH = _SONIC_ROOT / "configs/gear_sonic.lock.json"
 _JOINT_CONTRACT_PATH = _SONIC_ROOT / "configs/g1_joint_contract.json"
 _SCENE_REGISTRY_PATH = _SONIC_ROOT / "configs/scene_registry.json"
 _STAGE_A_REGISTRY_PATH = _SONIC_ROOT / "configs/experiments/stage_a.json"
+_STAGE_B_REGISTRY_PATH = _SONIC_ROOT / "configs/experiments/stage_b.json"
 _GEAR_TARGET_ORDER_RELATIVE = Path("gear_sonic/envs/manager_env/robots/g1.py")
 _GEAR_MODEL_RELATIVE = Path("gear_sonic_deploy/g1/scene_29dof_with_hand.xml")
 _GEAR_ROBOT_RELATIVE = Path("gear_sonic_deploy/g1/g1_29dof_with_hand.xml")
@@ -564,6 +578,9 @@ def _parser() -> argparse.ArgumentParser:
         choices=("mm-reference", "known-good-file", "known-good-stream"),
     )
     common(stage_a)
+    stage_b = subcommands.add_parser("stage-b")
+    stage_b.add_argument("--stage-a-evidence", required=True)
+    common(stage_b)
     return parser
 
 
@@ -956,6 +973,578 @@ def _execute(
                 "status": command_status,
                 "stage_a_status": stage_a_status,
                 "evidence": str(bundle.path / "stage-a-evidence.json"),
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    return _command_status_exit(command_status)
+
+
+_STAGE_B_GATE_NAMES = (
+    "external_identity",
+    "joint_projection_round_trip",
+    "basis_and_scene_alignment",
+    "flat_mm_kinematic_replay",
+    "stage_b_dynamic",
+)
+_STAGE_B_CURRENT_IDENTITY_KEYS = STAGE_A_IDENTITY_KEYS - {
+    "known_good_reference_buffer"
+}
+
+
+def _stage_b_failure_layer(name: str, status: str) -> str:
+    if name == "flat_mm_kinematic_replay" and status == "scientific_failure":
+        return "reference"
+    if name == "stage_b_dynamic":
+        return "delivery"
+    if name == "external_identity":
+        return "external_identity"
+    return "conversion"
+
+
+def _stage_b_known_good_metrics(
+    prerequisite: Mapping[str, object],
+) -> Mapping[str, object]:
+    metrics = prerequisite.get("metrics")
+    if not isinstance(metrics, Mapping):
+        raise ContractError("Stage A prerequisite metrics are unavailable")
+    for name in (
+        "known_good_stream_dynamic",
+        "known_good_file_dynamic",
+    ):
+        candidate = metrics.get(name)
+        if isinstance(candidate, Mapping):
+            joint = candidate.get("joint_position_rmse_rad")
+            pelvis = candidate.get("pelvis_orientation_rms_rad")
+            if type(joint) in (int, float) and type(pelvis) in (int, float):
+                return candidate
+    raise ContractError("Stage A known-good tracking metrics are unavailable")
+
+
+def _stage_b_json_object(raw: bytes, label: str) -> Mapping[str, object]:
+    def no_duplicates(
+        pairs: list[tuple[str, object]],
+    ) -> dict[str, object]:
+        output: dict[str, object] = {}
+        for name, value in pairs:
+            if name in output:
+                raise ContractError(f"{label} contains a duplicate key")
+            output[name] = value
+        return output
+
+    try:
+        value = json.loads(raw.decode("ascii"), object_pairs_hook=no_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ContractError(f"{label} is invalid JSON") from error
+    if not isinstance(value, Mapping):
+        raise ContractError(f"{label} is not an object")
+    return value
+
+
+def _stage_b_prerequisite_scene_registration(
+    evidence_path: Path,
+) -> Mapping[str, object]:
+    snapshot = _stable_regular_file_snapshot(
+        evidence_path.parent / "manifest.json",
+        "Stage A prerequisite manifest",
+    )
+    if snapshot is None:
+        raise ContractError("Stage A prerequisite manifest is unavailable")
+    manifest = _stage_b_json_object(
+        snapshot[2], "Stage A prerequisite manifest"
+    )
+    registration = manifest.get("scene_registration")
+    if not isinstance(registration, Mapping):
+        raise ContractError(
+            "Stage A prerequisite scene registration is unavailable"
+        )
+    return registration
+
+
+def _stage_b_scene_semantics(
+    registration: Mapping[str, object],
+    *,
+    raw_scene_sha256: object,
+    bundle_root: Path,
+) -> Mapping[str, object]:
+    """Bind generated XML after normalizing only its run-local include path."""
+
+    if not isinstance(registration, Mapping):
+        raise ContractError("Stage B scene registration is unavailable")
+    copied = dict(registration)
+    terrain_value = copied.pop("terrain_geoms", None)
+    terrain_geoms: tuple[int, ...] | None = None
+    if terrain_value is not None:
+        if (
+            type(terrain_value) is not list
+            or not terrain_value
+            or any(type(value) is not int or value < 0 for value in terrain_value)
+            or len(set(terrain_value)) != len(terrain_value)
+        ):
+            raise ContractError("Stage B scene terrain geom IDs are invalid")
+        terrain_geoms = tuple(terrain_value)
+    output_hashes = copied.get("output_hashes")
+    if not isinstance(output_hashes, Mapping):
+        raise ContractError("Stage B scene output hashes are unavailable")
+    outputs = dict(output_hashes)
+    gear_scene = outputs.pop("gear_scene_xml", None)
+    registration_hash = outputs.pop("scene_registration", None)
+    robot_include = outputs.get("robot_include")
+    if (
+        not _is_sha256(raw_scene_sha256)
+        or gear_scene != raw_scene_sha256
+        or not _is_sha256(registration_hash)
+        or not _is_sha256(robot_include)
+        or any(not _is_sha256(value) for value in outputs.values())
+    ):
+        raise ContractError("Stage B scene artifact hashes are invalid")
+    copied["output_hashes"] = dict(sorted(outputs.items()))
+
+    root = Path(bundle_root)
+    scene_path = root / "scene/gear_scene.xml"
+    robot_path = root / "scene/gear_robot.xml"
+    scene_snapshot = _stable_regular_file_snapshot(
+        scene_path, "Stage B generated scene XML"
+    )
+    robot_snapshot = _stable_regular_file_snapshot(
+        robot_path, "Stage B generated robot include"
+    )
+    assert scene_snapshot is not None and robot_snapshot is not None
+    if (
+        _sha256_bytes(scene_snapshot[2]) != gear_scene
+        or _sha256_bytes(robot_snapshot[2]) != robot_include
+    ):
+        raise ContractError("Stage B generated scene artifacts changed")
+    try:
+        xml_root = ET.fromstring(scene_snapshot[2])
+    except ET.ParseError as error:
+        raise ContractError("Stage B generated scene XML is invalid") from error
+    includes = tuple(xml_root.iter("include"))
+    if (
+        xml_root.tag != "mujoco"
+        or len(includes) != 1
+        or set(includes[0].attrib) != {"file"}
+    ):
+        raise ContractError("Stage B generated scene include contract changed")
+    include_value = includes[0].attrib["file"]
+    if not include_value or include_value.startswith("~"):
+        raise ContractError("Stage B generated scene include path is invalid")
+    try:
+        resolved_include = Path(include_value).resolve(strict=True)
+        expected_include = robot_path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ContractError(
+            "Stage B generated scene include path is unavailable"
+        ) from error
+    if resolved_include != expected_include:
+        raise ContractError(
+            "Stage B generated scene include leaves the authenticated bundle"
+        )
+    includes[0].set("file", "__RUN_ROOT__/scene/gear_robot.xml")
+    canonical_xml = ET.tostring(
+        xml_root,
+        encoding="utf-8",
+        xml_declaration=False,
+        short_empty_elements=True,
+    )
+    return MappingProxyType(
+        {
+            "registration": copied,
+            "canonical_scene_xml_sha256": _sha256_bytes(canonical_xml),
+            "terrain_geoms": terrain_geoms,
+        }
+    )
+
+
+def _stage_b_verdict(
+    metrics: Mapping[str, object],
+    prerequisite: Mapping[str, object],
+):
+    coverage = metrics.get("coverage")
+    tracking = metrics.get("tracking")
+    safety = metrics.get("safety")
+    secondary_value = metrics.get("secondary")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (coverage, tracking, safety, secondary_value)
+    ):
+        raise ContractError("Stage B dynamic metrics are incomplete")
+    assert isinstance(coverage, Mapping)
+    assert isinstance(tracking, Mapping)
+    assert isinstance(safety, Mapping)
+    assert isinstance(secondary_value, Mapping)
+    secondary = SecondaryMetrics(
+        swing_foot_scuff_count=secondary_value.get("swing_foot_scuff_count"),
+        minimum_foot_clearance_m=secondary_value.get(
+            "minimum_foot_clearance_m"
+        ),
+        horizontal_path_drift_m=secondary_value.get(
+            "horizontal_path_drift_m"
+        ),
+        joint_tracking_trace_rad=tuple(
+            tracking.get("joint_tracking_trace_rad", ())
+        ),
+        pelvis_tracking_trace_rad=tuple(
+            tracking.get("pelvis_tracking_trace_rad", ())
+        ),
+        contact_impulses_ns=tuple(
+            secondary_value.get("contact_impulses_ns", ())
+        ),
+        policy_execution_timing_ns=secondary_value.get(
+            "policy_execution_timing_ns"
+        ),
+    )
+    known_good = _stage_b_known_good_metrics(prerequisite)
+    return evaluate_flat_trial(
+        integration_pass=True,
+        exact_command_coverage=coverage.get("exact_command_coverage"),
+        exact_frame_coverage=coverage.get("exact_frame_coverage"),
+        exact_control_duration=coverage.get("exact_control_duration"),
+        exact_safety_log_coverage=safety.get("exact_log_coverage"),
+        minimum_pelvis_local_height_m=safety.get(
+            "minimum_pelvis_local_height_m"
+        ),
+        minimum_pelvis_up_dot=safety.get("minimum_pelvis_up_dot"),
+        contact_groups=tuple(safety.get("forbidden_contact_groups", ())),
+        joint_position_rmse_rad=tracking.get("joint_position_rmse_rad"),
+        known_good_joint_position_rmse_rad=known_good.get(
+            "joint_position_rmse_rad"
+        ),
+        pelvis_orientation_rms_rad=tracking.get(
+            "pelvis_orientation_rms_rad"
+        ),
+        known_good_pelvis_orientation_rms_rad=known_good.get(
+            "pelvis_orientation_rms_rad"
+        ),
+        secondary=secondary,
+    )
+
+
+def _execute_stage_b(
+    request: StageARequest,
+    inputs: ExternalInputs,
+    operations: StageAOperations,
+    stdout: IO[str],
+    bundle: RunBundle,
+) -> int:
+    """Authenticate Stage A, replay the full reference, then run flat SONIC."""
+
+    prerequisite_path = Path(request.namespace.stage_a_evidence)
+    prerequisite = validate_stage_a_prerequisite(
+        prerequisite_path,
+        expected_identity=None,
+    )
+    prerequisite_path = prerequisite_path.resolve(strict=True)
+    context = operations.authenticate(request, inputs)
+    if not isinstance(context, StageAContext):
+        raise ContractError("Stage B authentication returned an invalid context")
+
+    records = [_pending_gate(name) for name in _STAGE_B_GATE_NAMES]
+    identity: dict[str, str] = {}
+    accumulated_metrics: dict[str, object] = {}
+    all_outputs: dict[str, str] = {}
+    artifact_hashes = dict(context.artifact_hashes)
+    processes = [dict(value) for value in context.processes]
+    scene_registration: Mapping[str, object] | None = None
+    joint_feasibility: Mapping[str, object] | None = None
+    command_status = "pass"
+    failure_reason: str | None = None
+    failure_layer: str | None = None
+    integration_pass = False
+    kinematic_pass = False
+    dynamic_pass = False
+    scene_semantic_sha256: str | None = None
+
+    for index, name in enumerate(_STAGE_B_GATE_NAMES[:4]):
+        try:
+            raw_result = operations.run_gate(name, request, context, bundle)
+        except CapabilityUnavailable as error:
+            raw_result = GateResult(status="not_run", reason=str(error))
+        except ScientificGateFailure as error:
+            raw_result = GateResult(
+                status="scientific_failure", reason=str(error)
+            )
+        except BaseException as error:
+            raw_result = GateResult(
+                status="integration_failure",
+                reason=f"{type(error).__name__}: {error}",
+            )
+        try:
+            result = _validate_gate_result(raw_result, bundle)
+            if result.status == "pass":
+                _merge_identity(identity, result.identity)
+                for artifact_name, artifact_digest in result.artifact_hashes.items():
+                    current = artifact_hashes.get(artifact_name)
+                    if current is not None and current != artifact_digest:
+                        raise ContractError(
+                            "Stage B artifact identity changed for "
+                            f"{artifact_name}"
+                        )
+                    artifact_hashes[artifact_name] = artifact_digest
+                if name == "basis_and_scene_alignment":
+                    feasibility_value = result.metrics.get("joint_feasibility")
+                    if feasibility_value is None:
+                        raise ContractError(
+                            "basis gate lacks joint feasibility evidence"
+                        )
+                    joint_feasibility = _joint_feasibility_payload(
+                        parse_joint_feasibility_identity(feasibility_value)
+                    )
+            processes.extend(dict(value) for value in result.processes)
+        except ContractError as error:
+            result = GateResult(
+                status="integration_failure", reason=str(error)
+            )
+        records[index] = _gate_record(name, result)
+        all_outputs.update(result.outputs)
+        if result.status == "pass":
+            if result.metrics:
+                accumulated_metrics[name] = dict(result.metrics)
+            if result.scene_registration is not None:
+                if (
+                    scene_registration is not None
+                    and dict(scene_registration)
+                    != dict(result.scene_registration)
+                ):
+                    result = GateResult(
+                        status="integration_failure",
+                        reason="Stage B scene registration identity changed",
+                    )
+                    records[index] = _gate_record(name, result)
+                else:
+                    scene_registration = result.scene_registration
+        if result.status != "pass":
+            command_status = result.status
+            failure_reason = result.reason
+            failure_layer = _stage_b_failure_layer(name, result.status)
+            break
+
+    if command_status == "pass":
+        kinematic_pass = True
+        prerequisite_identity = prerequisite.get("identity")
+        identity_mismatch = (
+            not isinstance(prerequisite_identity, Mapping)
+            or set(identity) != _STAGE_B_CURRENT_IDENTITY_KEYS
+            or any(
+                name != "generated_flat_scene"
+                and prerequisite_identity.get(name) != value
+                for name, value in identity.items()
+            )
+        )
+        try:
+            if not isinstance(prerequisite_identity, Mapping):
+                raise ContractError("Stage A prerequisite identity is unavailable")
+            current_scene_semantics = _stage_b_scene_semantics(
+                scene_registration,
+                raw_scene_sha256=identity.get("generated_flat_scene"),
+                bundle_root=bundle.path,
+            )
+            prerequisite_scene_semantics = _stage_b_scene_semantics(
+                _stage_b_prerequisite_scene_registration(prerequisite_path),
+                raw_scene_sha256=prerequisite_identity.get(
+                    "generated_flat_scene"
+                ),
+                bundle_root=prerequisite_path.parent,
+            )
+            current_terrain = current_scene_semantics.get("terrain_geoms")
+            prerequisite_terrain = prerequisite_scene_semantics.get(
+                "terrain_geoms"
+            )
+            if (
+                type(current_terrain) is not tuple
+                or not current_terrain
+                or current_scene_semantics.get("registration")
+                != prerequisite_scene_semantics.get("registration")
+                or current_scene_semantics.get("canonical_scene_xml_sha256")
+                != prerequisite_scene_semantics.get(
+                    "canonical_scene_xml_sha256"
+                )
+                or (
+                    prerequisite_terrain is not None
+                    and prerequisite_terrain != current_terrain
+                )
+            ):
+                identity_mismatch = True
+            else:
+                scene_semantic_sha256 = _sha256_bytes(
+                    _canonical_json_bytes(
+                        {
+                            "registration": current_scene_semantics[
+                                "registration"
+                            ],
+                            "canonical_scene_xml_sha256": (
+                                current_scene_semantics[
+                                    "canonical_scene_xml_sha256"
+                                ]
+                            ),
+                            "terrain_geoms": list(current_terrain),
+                        },
+                        "Stage B cross-bound scene identity",
+                    )
+                )
+        except ContractError:
+            identity_mismatch = True
+        if identity_mismatch:
+            command_status = "integration_failure"
+            failure_reason = "Stage B identity does not match Stage A prerequisite"
+            failure_layer = "prerequisite"
+
+    if command_status == "pass":
+        index = 4
+        name = _STAGE_B_GATE_NAMES[index]
+        try:
+            raw_result = operations.run_gate(name, request, context, bundle)
+        except CapabilityUnavailable as error:
+            raw_result = GateResult(status="not_run", reason=str(error))
+        except ScientificGateFailure as error:
+            raw_result = GateResult(
+                status="scientific_failure", reason=str(error)
+            )
+        except BaseException as error:
+            raw_result = GateResult(
+                status="integration_failure",
+                reason=f"{type(error).__name__}: {error}",
+            )
+        try:
+            result = _validate_gate_result(raw_result, bundle)
+            processes.extend(dict(value) for value in result.processes)
+        except ContractError as error:
+            result = GateResult(
+                status="integration_failure", reason=str(error)
+            )
+        records[index] = _gate_record(name, result)
+        all_outputs.update(result.outputs)
+        if result.status == "pass":
+            integration_pass = True
+            accumulated_metrics[name] = dict(result.metrics)
+            try:
+                verdict = _stage_b_verdict(result.metrics, prerequisite)
+            except ContractError as error:
+                command_status = "integration_failure"
+                integration_pass = False
+                failure_reason = str(error)
+                failure_layer = "delivery"
+            else:
+                dynamic_pass = verdict.dynamic_pass
+                accumulated_metrics["checks"] = dict(verdict.checks)
+                if not dynamic_pass:
+                    command_status = "scientific_failure"
+                    failure_reason = "Stage B dynamic scientific gates failed"
+                    checks = verdict.checks
+                    if not (
+                        checks["exact_command_coverage"]
+                        and checks["exact_frame_coverage"]
+                        and checks["exact_control_duration"]
+                    ):
+                        failure_layer = "delivery"
+                    elif not (
+                        checks["pelvis_local_height"]
+                        and checks["pelvis_up_dot"]
+                        and checks["forbidden_contacts"]
+                        and checks["exact_safety_log_coverage"]
+                    ):
+                        failure_layer = "safety"
+                    else:
+                        failure_layer = "sonic_tracking"
+        else:
+            command_status = result.status
+            failure_reason = result.reason
+            failure_layer = _stage_b_failure_layer(name, result.status)
+
+    if command_status != "pass":
+        first_pending = next(
+            (
+                index
+                for index, record in enumerate(records)
+                if record["status"] == "pending"
+            ),
+            len(records),
+        )
+        for index in range(first_pending, len(records)):
+            records[index] = _pending_gate(
+                _STAGE_B_GATE_NAMES[index],
+                "not_run",
+                f"blocked by {failure_layer}: {failure_reason}",
+            )
+
+    registry_sha256 = _sha256_file(_STAGE_B_REGISTRY_PATH)
+    prerequisite_sha256 = _sha256_file(prerequisite_path)
+    dynamic_metrics = accumulated_metrics.get("stage_b_dynamic", {})
+    timings = (
+        dict(dynamic_metrics.get("timings", {}))
+        if isinstance(dynamic_metrics, Mapping)
+        and isinstance(dynamic_metrics.get("timings"), Mapping)
+        else {}
+    )
+    evidence_hashes: dict[str, str] = {
+        "registry_sha256": registry_sha256,
+        "stage_a_evidence_sha256": prerequisite_sha256,
+    }
+    if scene_semantic_sha256 is not None:
+        evidence_hashes["scene_semantic_sha256"] = scene_semantic_sha256
+    for record in records:
+        hashes = record.get("evidence_hashes")
+        if isinstance(hashes, Mapping):
+            evidence_hashes.update(
+                (str(name), str(value)) for name, value in hashes.items()
+            )
+    evidence = {
+        "schema": "mm-sonic-trial-verdict/v1",
+        "stage": "B",
+        "scene_id": FLAT_SCENE_ID,
+        "terrain_weight": 0.0,
+        "expected_frames": 601,
+        "expected_sim_time_s": 12.0,
+        "integration_pass": integration_pass,
+        "kinematic_pass": kinematic_pass,
+        "dynamic_pass": dynamic_pass,
+        "failure_layer": failure_layer,
+        "command_status": command_status,
+        "reason": failure_reason,
+        "gates": records,
+        "identity": identity,
+        "metrics": accumulated_metrics,
+        "timings": timings,
+        "evidence_hashes": evidence_hashes,
+        "outputs": all_outputs,
+    }
+    bundle.write_bytes(
+        "stage-b-evidence.json",
+        _canonical_json_bytes(evidence, "Stage B evidence"),
+    )
+    bundle.update_manifest(
+        _context_manifest(
+            request,
+            inputs,
+            context,
+            scene_registration,
+            joint_feasibility,
+            artifact_hashes,
+            processes,
+        )
+    )
+    stage_b_status = (
+        "pass"
+        if command_status == "pass"
+        else "not_run" if command_status == "not_run" else "failed"
+    )
+    outcome: dict[str, object] = {
+        "status": command_status,
+        "stage_b_status": stage_b_status,
+    }
+    if failure_reason is not None:
+        outcome["reason"] = failure_reason
+    bundle.finalize(
+        "complete" if command_status == "pass" else stage_b_status,
+        outcome=outcome,
+    )
+    stdout.write(
+        json.dumps(
+            {
+                "status": command_status,
+                "stage_b_status": stage_b_status,
+                "evidence": str(bundle.path / "stage-b-evidence.json"),
             },
             sort_keys=True,
         )
@@ -1594,15 +2183,7 @@ def _preload_known_good_stream(
 ) -> _StreamPreloadEvidence:
     """Publish the complete logical sequence plus padding/fence while in WAIT."""
 
-    if (
-        not isinstance(canonical, CanonicalTargetBuffer)
-        or canonical.count != _KNOWN_GOOD_PROJECTED_FRAME_COUNT
-        or not np.array_equal(
-            canonical.frame_index,
-            np.arange(_KNOWN_GOOD_PROJECTED_FRAME_COUNT, dtype=np.int64),
-        )
-    ):
-        raise ContractError("known-good preload requires canonical frames 0..440")
+    plan = build_stream_transport_plan(canonical)
     if (
         not bool(getattr(gear, "wait_for_control_ready", False))
         or bool(getattr(gear, "control_active", False))
@@ -1614,23 +2195,10 @@ def _preload_known_good_stream(
     if not isinstance(post_enable_fence, Mapping):
         raise ContractError("known-good preload requires post-enable fence evidence")
 
-    readiness_buffer = _preload_buffer(canonical, np.array([0], dtype="<i8"))
-    logical_buffers = [
-        _preload_buffer(
-            canonical,
-            np.arange(start, start + _STREAM_CHUNK_FRAME_COUNT, dtype="<i8"),
-        )
-        for start in range(
-            1, _KNOWN_GOOD_PROJECTED_FRAME_COUNT, _STREAM_CHUNK_FRAME_COUNT
-        )
-    ]
-    padding = _preload_buffer(
-        canonical,
-        np.arange(_STREAM_PADDING_START, _STREAM_PADDING_STOP, dtype="<i8"),
-    )
-    receipt_fence = _preload_buffer(
-        canonical, np.array([_STREAM_RECEIPT_FENCE_INDEX], dtype="<i8")
-    )
+    readiness_buffer = plan.readiness
+    logical_buffers = list(plan.logical)
+    padding = plan.padding
+    receipt_fence = plan.receipt_fence
 
     consumer_markers: list[Mapping[str, object]] = []
 
@@ -1673,7 +2241,9 @@ def _preload_known_good_stream(
     fences: list[str] = []
     for index in range(len(starts) - 1):
         if index == len(logical_buffers):
-            fences.append("padding-start-fences-logical-440")
+            fences.append(
+                f"padding-start-fences-logical-{canonical.count - 1}"
+            )
         elif index == len(logical_buffers) + 1:
             fences.append("fence-start-fences-padding")
         else:
@@ -1757,29 +2327,19 @@ def _audit_known_good_stream_preload(
 
     if not isinstance(evidence, _StreamPreloadEvidence):
         raise ContractError("preload transcript evidence has the wrong type")
+    plan = build_stream_transport_plan(canonical)
+    expected_marker_count = plan.publication_count
+    expected_fence_count = expected_marker_count - 1
     if (
-        len(evidence.logical_publications) != 22
-        or len(evidence.consumer_markers) != 25
-        or len(evidence.causal_fences) != 24
+        len(evidence.logical_publications) != len(plan.logical)
+        or len(evidence.consumer_markers) != expected_marker_count
+        or len(evidence.causal_fences) != expected_fence_count
     ):
         raise ContractError("preload transport transcript is incomplete")
-    expected_readiness = _preload_buffer(
-        canonical, np.array([0], dtype="<i8")
-    )
-    expected_logical = [
-        _preload_buffer(
-            canonical,
-            np.arange(start, start + _STREAM_CHUNK_FRAME_COUNT, dtype="<i8"),
-        )
-        for start in range(1, canonical.count, _STREAM_CHUNK_FRAME_COUNT)
-    ]
-    expected_padding = _preload_buffer(
-        canonical,
-        np.arange(_STREAM_PADDING_START, _STREAM_PADDING_STOP, dtype="<i8"),
-    )
-    expected_receipt_fence = _preload_buffer(
-        canonical, np.array([_STREAM_RECEIPT_FENCE_INDEX], dtype="<i8")
-    )
+    expected_readiness = plan.readiness
+    expected_logical = list(plan.logical)
+    expected_padding = plan.padding
+    expected_receipt_fence = plan.receipt_fence
     observed_readiness, readiness_payload = _archived_preload_buffer(
         bundle,
         evidence.readiness_publication,
@@ -2040,7 +2600,9 @@ def _audit_known_good_stream_preload(
     expected_fences: list[str] = []
     for index in range(len(starts) - 1):
         if index == len(expected_logical):
-            expected_fences.append("padding-start-fences-logical-440")
+            expected_fences.append(
+                f"padding-start-fences-logical-{canonical.count - 1}"
+            )
         elif index == len(expected_logical) + 1:
             expected_fences.append("fence-start-fences-padding")
         else:
@@ -2167,7 +2729,10 @@ def _validate_target_prefix(
         raise ContractError("official target log ended with a partial row")
     rows = raw.splitlines(keepends=True)
     if len(rows) > len(expected_rows):
-        raise ContractError("official target log overshoot exceeded 441 rows")
+        raise ContractError(
+            "official target log overshoot exceeded "
+            f"{len(expected_rows)} rows"
+        )
     for index, row in enumerate(rows):
         if row != expected_rows[index]:
             raise ContractError(
@@ -2186,18 +2751,32 @@ def _drive_authoritative_target_coverage(
     increment_steps: int = 1,
     maximum_wall_seconds: float = _LOW_STATE_BOOTSTRAP_TIMEOUT_S,
     retain_reader: bool = False,
+    required_control_duration_s: float | None = None,
+    control_lead_rows: int = 0,
 ) -> _TargetCoverageResult:
-    """Advance physics in small increments until GEAR logs exactly 441 targets."""
+    """Advance physics until GEAR logs the complete registered target buffer."""
 
     if (
         not isinstance(canonical, CanonicalTargetBuffer)
-        or canonical.count != _KNOWN_GOOD_PROJECTED_FRAME_COUNT
+        or canonical.count
+        not in (_KNOWN_GOOD_PROJECTED_FRAME_COUNT, STAGE_B_FRAME_COUNT)
         or type(increment_steps) is not int
         or increment_steps <= 0
         or type(maximum_wall_seconds) not in (int, float)
         or not math.isfinite(float(maximum_wall_seconds))
         or maximum_wall_seconds <= 0.0
         or type(retain_reader) is not bool
+        or type(control_lead_rows) is not int
+        or control_lead_rows < 0
+        or (required_control_duration_s is None and control_lead_rows != 0)
+        or (
+            required_control_duration_s is not None
+            and (
+                type(required_control_duration_s) not in (int, float)
+                or not math.isfinite(float(required_control_duration_s))
+                or float(required_control_duration_s) <= 0.0
+            )
+        )
     ):
         raise ValueError("authoritative target coverage bounds are invalid")
     if (
@@ -2231,17 +2810,106 @@ def _drive_authoritative_target_coverage(
         or initial_duration < 0.0
     ):
         raise ContractError("initial simulator boundary counters are invalid")
+    required_control_steps: int | None = None
+    if required_control_duration_s is not None:
+        sim_dt = getattr(simulator, "sim_dt", None)
+        if (
+            type(sim_dt) not in (int, float)
+            or not math.isfinite(float(sim_dt))
+            or float(sim_dt) <= 0.0
+        ):
+            raise ContractError("required control duration needs a finite simulator dt")
+        required_control_steps = round(
+            float(required_control_duration_s) / float(sim_dt)
+        )
+        if (
+            required_control_steps <= 0
+            or abs(
+                required_control_steps * float(sim_dt)
+                - float(required_control_duration_s)
+            )
+            > 1.0e-12
+        ):
+            raise ContractError(
+                "required control duration is not an exact simulator-step count"
+            )
     reader = _AuthoritativeTargetReader(Path(target_motion_logfile))
     completed = False
+    driven_steps = 0
     started_ns = time.monotonic_ns()
     deadline = time.monotonic() + float(maximum_wall_seconds)
     try:
         while True:
             gear.require_alive()
             raw = reader.read()
-            count = _validate_target_prefix(raw, expected_rows)
-            if count == canonical.count:
+            terminal_pre_stopped = False
+            if (
+                required_control_steps is not None
+                and (not raw or raw.endswith(b"\n"))
+                and raw.count(b"\n") >= canonical.count
+            ):
                 gear.stop_group()
+                raw = reader.read()
+                terminal_pre_stopped = True
+            count = _validate_target_prefix(raw, expected_rows)
+            if required_control_steps is not None:
+                desired_steps = (
+                    required_control_steps
+                    if count == canonical.count
+                    else min(
+                        required_control_steps,
+                        max(
+                            1,
+                            math.ceil(
+                                (count + control_lead_rows)
+                                * required_control_steps
+                                / (canonical.count - 1)
+                            ),
+                        ),
+                    )
+                )
+                advance_steps = desired_steps - driven_steps
+                if advance_steps < 0:
+                    raise ContractError(
+                        "active CONTROL physics exceeded its row-paced duration"
+                    )
+                if advance_steps:
+                    advance = simulator.advance(advance_steps)
+                    if (
+                        not hasattr(advance, "steps")
+                        or advance.steps != advance_steps
+                    ):
+                        raise ContractError(
+                            "simulator did not advance the exact row-paced interval"
+                        )
+                    driven_steps += advance_steps
+                if count != canonical.count:
+                    if time.monotonic() >= deadline:
+                        raise ProcessError(
+                            "timed out waiting for exact authoritative target coverage"
+                        )
+                    if advance_steps == 0:
+                        time.sleep(
+                            min(0.001, max(0.0, deadline - time.monotonic()))
+                        )
+                    continue
+            if count == canonical.count:
+                if required_control_steps is not None:
+                    remaining = required_control_steps - driven_steps
+                    if remaining < 0:
+                        raise ContractError(
+                            "active CONTROL physics exceeded the required duration"
+                        )
+                    if remaining:
+                        raise ContractError(
+                            "terminal target row arrived before exact CONTROL physics"
+                        )
+                    if not terminal_pre_stopped:
+                        raise ContractError(
+                            "exact CONTROL coverage lacked its pre-audit stop fence"
+                        )
+                if not bool(gear.group_is_stopped()):
+                    gear.stop_group()
                 stopped = reader.read()
                 if stopped != raw:
                     raise ContractError(
@@ -2274,12 +2942,23 @@ def _drive_authoritative_target_coverage(
                     or duration < initial_duration
                 ):
                     raise ContractError("simulator boundary counters are invalid")
+                control_steps = steps - initial_steps
+                control_duration = float(duration) - float(initial_duration)
+                if required_control_steps is not None and (
+                    control_steps != required_control_steps
+                    or driven_steps != required_control_steps
+                    or abs(
+                        control_duration - float(required_control_duration_s)
+                    )
+                    > 1.0e-9
+                ):
+                    raise ContractError(
+                        "active CONTROL physics duration is not exact"
+                    )
                 result = _TargetCoverageResult(
                     target_rows=count,
-                    control_drive_steps=steps - initial_steps,
-                    control_drive_duration_s=(
-                        float(duration) - float(initial_duration)
-                    ),
+                    control_drive_steps=control_steps,
+                    control_drive_duration_s=control_duration,
                     simulator_steps=steps,
                     simulator_duration_s=float(duration),
                     state_rows=state_rows,
@@ -2296,12 +2975,14 @@ def _drive_authoritative_target_coverage(
                 raise ProcessError(
                     "timed out waiting for exact authoritative target coverage"
                 )
-            advance = simulator.advance(increment_steps)
+            advance_steps = increment_steps
+            advance = simulator.advance(advance_steps)
             if (
                 not hasattr(advance, "steps")
-                or advance.steps != increment_steps
+                or advance.steps != advance_steps
             ):
                 raise ContractError("simulator did not advance the exact increment")
+            driven_steps += advance_steps
     except BaseException as error:
         try:
             if not bool(gear.group_is_stopped()):
@@ -2480,6 +3161,8 @@ def _tracking_from_gear_control_rows(
         "frame_count": canonical.count,
         "joint_position_rmse_rad": metrics.joint_position_rmse_rad,
         "pelvis_orientation_rms_rad": metrics.pelvis_orientation_rms_rad,
+        "joint_tracking_trace_rad": list(metrics.joint_tracking_trace_rad),
+        "pelvis_tracking_trace_rad": list(metrics.pelvis_tracking_trace_rad),
         "pairing": "same-control-tick-positional",
         "tick_period_ms": period_stats,
     }
@@ -2578,6 +3261,8 @@ def _execute_known_good_scoring_epoch(
     bundle: RunBundle,
     bootstrap_cancellation: threading.Event,
     publisher: PosePublisher | None = None,
+    required_control_duration_s: float | None = None,
+    control_lead_rows: int = 0,
 ) -> _KnownGoodExecution:
     """Run the identical cold WAIT -> scored CONTROL lifecycle for file/stream."""
 
@@ -2664,6 +3349,8 @@ def _execute_known_good_scoring_epoch(
             increment_steps=1,
             maximum_wall_seconds=_SCORING_TARGET_TIMEOUT_S,
             retain_reader=True,
+            required_control_duration_s=required_control_duration_s,
+            control_lead_rows=control_lead_rows,
         )
         prime_record = prime.get("prime")
         if not isinstance(prime_record, Mapping):
@@ -3179,6 +3866,7 @@ def _registered_scene_manifest(scene: RegisteredScene) -> Mapping[str, object]:
             "transform_matrix": scene.transform_matrix.tolist(),
             "output_hashes": dict(scene.output_hashes),
             "allowed_foot_geoms": list(scene.allowed_foot_geoms),
+            "terrain_geoms": list(scene.terrain_geoms),
             "forbidden_geom_groups": {
                 name: list(values)
                 for name, values in scene.forbidden_geom_groups.items()
@@ -3667,6 +4355,7 @@ class DefaultStageAOperations:
             if name in (
                 "known_good_file_dynamic",
                 "known_good_stream_delivery",
+                "stage_b_dynamic",
             ):
                 mode = (
                     "file"
@@ -5323,6 +6012,338 @@ class DefaultStageAOperations:
             outputs=_new_outputs(bundle, before),
         )
 
+    def _stage_b_dynamic(
+        self,
+        request: StageARequest,
+        context: StageAContext,
+        bundle: RunBundle,
+    ) -> GateResult:
+        """Stream the complete flat MM reference through the pinned SONIC path."""
+
+        before = _snapshot_outputs(bundle)
+        state = self._state(context)
+        scene = state.get("scene")
+        initial_qpos = state.get("initial_qpos")
+        source_canonical = state.get("mm_reference")
+        diagnostics = state.get("mm_diagnostics")
+        if (
+            not isinstance(scene, RegisteredScene)
+            or not isinstance(initial_qpos, np.ndarray)
+            or not isinstance(source_canonical, CanonicalTargetBuffer)
+            or not isinstance(diagnostics, ReferenceDiagnostics)
+            or source_canonical.count != 601
+            or diagnostics.count != source_canonical.count
+        ):
+            raise ContractError(
+                "Stage B dynamic requires the complete 601-frame kinematic reference"
+            )
+        transport = canonicalize_sonic_transport(source_canonical)
+        canonical = transport.buffer
+
+        projection = self._materialize_known_good_projection(context, bundle)
+        environment = _child_environment(request)
+        inputs = self._inputs(context)
+        runtime_inputs = self._stage_gear_runtime_inputs(
+            context, bundle, "stream"
+        )
+        base_command = self._gear_command(
+            request,
+            context,
+            projection.reference_base,
+            runtime_inputs,
+        )
+        body_position = np.zeros((canonical.count, 3), dtype="<f4")
+        publisher = PosePublisher("tcp://127.0.0.1:*", bundle=bundle)
+        try:
+            endpoint_host, endpoint_port = _parse_local_zmq_endpoint(
+                publisher.endpoint
+            )
+            command = _stream_gear_command(base_command, publisher.endpoint)
+            bootstrap_cancellation = threading.Event()
+            target_log = bundle.path / "dynamic/stream/target.csv"
+            logs_dir = bundle.path / "dynamic/stream/gear-logs"
+            gear_argv = _gear_process_argv(
+                command,
+                launch_profile="zmq_stream",
+                target_motion_logfile=target_log,
+                logs_dir=logs_dir,
+            )
+            self._register_process_attempt(
+                context,
+                _process_record(
+                    "g1_deploy_onnx_ref-stage-b",
+                    gear_argv,
+                    executable=Path(command[0]),
+                    environment=environment,
+                    outputs=(
+                        "dynamic/stream/target.csv",
+                        "dynamic/stream/gear.stdout",
+                        "dynamic/stream/gear.stderr",
+                        "dynamic/stream/gear-logs/",
+                        "runtime-inputs/stream/",
+                    ),
+                ),
+            )
+            gear = GearProcess(
+                run_root=bundle.path,
+                command=command,
+                target_motion_logfile=target_log,
+                logs_dir=logs_dir,
+                stdout_archive=bundle.path / "dynamic/stream/gear.stdout",
+                stderr_archive=bundle.path / "dynamic/stream/gear.stderr",
+                launch_profile="zmq_stream",
+                readiness_timeout_s=_COLD_GEAR_STARTUP_TIMEOUT_S,
+                cancelled=bootstrap_cancellation.is_set,
+                env=environment,
+                cwd=inputs.gear_checkout / "gear_sonic_deploy",
+            )
+        except BaseException:
+            publisher.close()
+            raise
+        try:
+            simulator_command = (
+                sys.executable,
+                "-u",
+                "-B",
+                "-m",
+                "mm_sonic.gated_sim",
+                "--gear-checkout",
+                str(inputs.gear_checkout),
+                "--run-root",
+                str(bundle.path),
+                "--unpaced-physics",
+            )
+            self._register_process_attempt(
+                context,
+                _process_record(
+                    "gated-simulator-stage-b",
+                    simulator_command,
+                    executable=Path(sys.executable).resolve(strict=True),
+                    environment=environment,
+                    outputs=(
+                        "dynamic/stream/simulator.stdout",
+                        "dynamic/stream/simulator.stderr",
+                        "dynamic/stream/bootstrap-sim-logs/",
+                        "dynamic/stream/scored-sim-logs/",
+                    ),
+                    module=Path(__file__).with_name("gated_sim.py"),
+                ),
+            )
+            simulator = GatedSimulatorClient(
+                run_root=bundle.path,
+                gear_checkout=inputs.gear_checkout,
+                unpaced_physics=True,
+                stdout_archive=bundle.path / "dynamic/stream/simulator.stdout",
+                stderr_archive=bundle.path / "dynamic/stream/simulator.stderr",
+                env=environment,
+                cwd=_REPOSITORY_ROOT,
+            )
+        except BaseException:
+            try:
+                gear.close()
+            finally:
+                publisher.close()
+            raise
+
+        execution = _execute_known_good_scoring_epoch(
+            mode="stream",
+            gear=gear,
+            simulator=simulator,
+            scene=scene,
+            initial_qpos=initial_qpos,
+            canonical=canonical,
+            body_position=body_position,
+            bundle=bundle,
+            bootstrap_cancellation=bootstrap_cancellation,
+            publisher=publisher,
+            required_control_duration_s=STAGE_B_REFERENCE_DURATION_S,
+            control_lead_rows=STAGE_B_CONTROL_LEAD_ROWS,
+        )
+        coverage = validate_stage_b_coverage(
+            commands=flat_command_script(),
+            canonical=canonical,
+            accepted_command_indices=tuple(range(30)),
+            observed_target_rows=execution.coverage.target_rows,
+            control_drive_steps=execution.coverage.control_drive_steps,
+            control_drive_duration_s=(
+                execution.coverage.control_drive_duration_s
+            ),
+            sim_dt_s=simulator.sim_dt,
+            control_lead_rows=STAGE_B_CONTROL_LEAD_ROWS,
+        )
+        tracking = dict(execution.metrics)
+        if (
+            tracking.get("frame_count") != canonical.count
+            or len(tracking.get("joint_tracking_trace_rad", ()))
+            != canonical.count
+            or len(tracking.get("pelvis_tracking_trace_rad", ()))
+            != canonical.count
+        ):
+            raise ContractError("Stage B tracking evidence lacks all 601 frames")
+        preload_audit = execution.preload_audit
+        if not isinstance(preload_audit, Mapping):
+            raise ContractError("Stage B delivery lacks the stream preload audit")
+        safety = load_flat_simulator_safety(
+            bundle.path / "dynamic/stream/scored-sim-logs",
+            terrain_geoms=scene.terrain_geoms,
+            allowed_foot_geoms=scene.allowed_foot_geoms,
+            forbidden_geom_groups=scene.forbidden_geom_groups,
+            sim_dt_s=simulator.sim_dt,
+            expected_final_pelvis_xy=tuple(
+                float(value)
+                for value in diagnostics.physical_pelvis_position[-1, :2]
+            ),
+            expected_simulator_steps=execution.coverage.simulator_steps,
+            expected_state_rows=execution.coverage.state_rows,
+            expected_contact_rows=execution.coverage.contact_rows,
+        )
+        coverage_payload = {
+            "command_count": coverage.command_count,
+            "accepted_command_indices": list(range(30)),
+            "frame_count": coverage.frame_count,
+            "observed_target_rows": execution.coverage.target_rows,
+            "reference_duration_s": coverage.reference_duration_s,
+            "exact_command_coverage": coverage.exact_command_coverage,
+            "exact_frame_coverage": coverage.exact_frame_coverage,
+            "exact_control_duration": coverage.exact_control_duration,
+            "sim_dt_s": coverage.sim_dt_s,
+            "control_lead_rows": coverage.control_lead_rows,
+            "control_drive_steps": execution.coverage.control_drive_steps,
+            "control_drive_duration_s": (
+                execution.coverage.control_drive_duration_s
+            ),
+            "total_scored_epoch_steps": execution.coverage.simulator_steps,
+            "total_scored_epoch_duration_s": (
+                execution.coverage.simulator_duration_s
+            ),
+        }
+        safety_payload = {
+            "state_rows": safety.state_rows,
+            "contact_rows": safety.contact_rows,
+            "expected_state_rows": execution.coverage.state_rows,
+            "expected_contact_rows": execution.coverage.contact_rows,
+            "expected_simulator_steps": execution.coverage.simulator_steps,
+            "exact_log_coverage": True,
+            "terrain_geoms": list(scene.terrain_geoms),
+            "minimum_pelvis_local_height_m": (
+                safety.minimum_pelvis_local_height_m
+            ),
+            "minimum_pelvis_up_dot": safety.minimum_pelvis_up_dot,
+            "forbidden_contact_groups": list(
+                safety.forbidden_contact_groups
+            ),
+        }
+        secondary_payload = {
+            "swing_foot_scuff_count": safety.swing_foot_scuff_count,
+            "minimum_foot_clearance_m": safety.minimum_foot_clearance_m,
+            "horizontal_path_drift_m": safety.horizontal_path_drift_m,
+            "contact_impulses_ns": list(safety.contact_impulses_ns),
+            "policy_execution_timing_ns": None,
+        }
+        timing_payload = {
+            "wall_duration_s": execution.coverage.wall_duration_s,
+            "control_drive_duration_s": (
+                execution.coverage.control_drive_duration_s
+            ),
+            "total_scored_epoch_duration_s": (
+                execution.coverage.simulator_duration_s
+            ),
+        }
+        metrics = {
+            "coverage": coverage_payload,
+            "tracking": tracking,
+            "safety": safety_payload,
+            "secondary": secondary_payload,
+            "timings": timing_payload,
+            "delivery_audit": dict(preload_audit),
+            "transport_normalization": {
+                "rule": "float32-subnormal-to-positive-zero",
+                "subnormal_count": transport.subnormal_count,
+                "maximum_subnormal_magnitude": (
+                    transport.maximum_subnormal_magnitude
+                ),
+                "source_reference_sha256": _canonical_target_sha256(
+                    source_canonical
+                ),
+                "transport_reference_sha256": _canonical_target_sha256(
+                    canonical
+                ),
+            },
+        }
+        relative = "gates/stage_b_dynamic.json"
+        payload = _canonical_json_bytes(
+            {
+                "source_reference_buffer_sha256": _canonical_target_sha256(
+                    source_canonical
+                ),
+                "reference_buffer_sha256": _canonical_target_sha256(canonical),
+                "reference_frame_count": canonical.count,
+                "endpoint": {
+                    "bind": "tcp://127.0.0.1:*",
+                    "resolved": publisher.endpoint,
+                    "host": endpoint_host,
+                    "port": endpoint_port,
+                },
+                "bootstrap_reference_projection_sha256": (
+                    projection.evidence.get("projection_sha256")
+                ),
+                "bootstrap": {
+                    "scored": False,
+                    "steps": execution.bootstrap_steps,
+                    "phases": dict(execution.bootstrap),
+                },
+                "wait_low_state_maintenance": {
+                    "scored": False,
+                    "steps": execution.wait_maintenance_steps,
+                    "phase": dict(execution.wait_maintenance),
+                },
+                "wait_for_control": {
+                    "target_rows": execution.wait_epoch.target_rows,
+                    "q_rows": execution.wait_epoch.q_rows,
+                    "base_rows": execution.wait_epoch.base_rows,
+                    "target_device": execution.wait_epoch.target_device,
+                    "target_inode": execution.wait_epoch.target_inode,
+                    "target_sha256": execution.wait_epoch.target_sha256,
+                },
+                "fresh_low_state_prime": dict(execution.prime),
+                "target_log_audit": dict(execution.target_audit),
+                "metrics": metrics,
+            },
+            "Stage B dynamic gate",
+        )
+        bundle.write_bytes(relative, payload)
+        digest = _sha256_bytes(payload)
+        current_outputs = _new_outputs(bundle, before)
+        gear_outputs, simulator_outputs = _dynamic_process_outputs(
+            _snapshot_outputs(bundle), "stream"
+        )
+        process_records = (
+            _process_record(
+                "g1_deploy_onnx_ref-stage-b",
+                gear.argv,
+                executable=Path(command[0]),
+                environment=environment,
+                outputs=gear_outputs,
+            ),
+            _process_record(
+                "gated-simulator-stage-b",
+                simulator.command,
+                executable=Path(sys.executable).resolve(strict=True),
+                environment=environment,
+                outputs=simulator_outputs,
+                module=Path(__file__).with_name("gated_sim.py"),
+            ),
+        )
+        return GateResult(
+            status="pass",
+            evidence_hashes=MappingProxyType(
+                {"stage_b_dynamic_sha256": digest}
+            ),
+            metrics=MappingProxyType(metrics),
+            outputs=current_outputs,
+            processes=process_records,
+        )
+
 
 def _raw_output_and_capability_check(
     namespace: argparse.Namespace,
@@ -5353,6 +6374,8 @@ def _raw_output_and_capability_check(
         ("source_mjcf", False),
         ("terrain_dir", True),
     )
+    if namespace.command == "stage-b":
+        expected = (*expected, ("stage_a_evidence", False))
     diagnoses: list[str] = []
     for name, directory in expected:
         raw = getattr(namespace, name, None)
@@ -5567,6 +6590,151 @@ def _finalize_pre_execution(
     return _command_status_exit(command_status)
 
 
+def _finalize_stage_b_pre_execution(
+    request: StageARequest,
+    bundle: RunBundle,
+    *,
+    command_status: str,
+    reason: str,
+    stdout: IO[str],
+) -> int:
+    """Seal a fail-closed Stage B verdict before authentication can begin."""
+
+    if command_status not in ("not_run", "integration_failure"):
+        raise ContractError("Stage B pre-execution status is invalid")
+    diagnosis = {
+        "schema": "mm-sonic-pre-execution-diagnosis/v1",
+        "status": command_status,
+        "reason": reason,
+        "argv": ["mm_sonic.cli", *request.argv],
+        "invocation_cwd": str(request.invocation_cwd),
+    }
+    diagnosis_bytes = _canonical_json_bytes(
+        diagnosis, "Stage B pre-execution diagnosis"
+    )
+    diagnosis_sha256 = _sha256_bytes(diagnosis_bytes)
+    diagnosis_path = "pre-execution-diagnosis.json"
+    bundle.write_bytes(diagnosis_path, diagnosis_bytes)
+    registry_sha256 = _sha256_file(_STAGE_B_REGISTRY_PATH)
+    stage_b_status = (
+        "not_run" if command_status == "not_run" else "failed"
+    )
+    evidence = {
+        "schema": "mm-sonic-trial-verdict/v1",
+        "stage": "B",
+        "scene_id": FLAT_SCENE_ID,
+        "terrain_weight": 0.0,
+        "expected_frames": 601,
+        "expected_sim_time_s": 12.0,
+        "integration_pass": False,
+        "kinematic_pass": False,
+        "dynamic_pass": False,
+        "failure_layer": "prerequisite",
+        "command_status": command_status,
+        "reason": reason,
+        "gates": [
+            _pending_gate(
+                name,
+                "not_run",
+                f"blocked before authentication: {reason}",
+            )
+            for name in _STAGE_B_GATE_NAMES
+        ],
+        "identity": {},
+        "metrics": {},
+        "timings": {},
+        "evidence_hashes": {
+            "registry_sha256": registry_sha256,
+            "diagnosis_sha256": diagnosis_sha256,
+        },
+        "outputs": {diagnosis_path: diagnosis_sha256},
+    }
+    bundle.write_bytes(
+        "stage-b-evidence.json",
+        _canonical_json_bytes(evidence, "Stage B evidence"),
+    )
+    bundle.update_manifest(
+        {
+            "external": _raw_external_manifest(request.namespace),
+            "repositories": {
+                "motion_matching": {"commit": None, "dirty": None},
+                "gear_sonic": {"commit": None, "dirty": None},
+            },
+            "artifact_hashes": {
+                name: None for name in sorted(_ARTIFACT_HASH_KEYS)
+            },
+            "command_script": dict(_command_script_manifest(request)),
+            "perturbation": {
+                "id": "nominal",
+                "lateral_offset_m": 0.0,
+                "yaw_offset_rad": 0.0,
+            },
+            "coordinate_transform": {
+                "source": HOLDEN_COORDINATE_SIGNATURE,
+                "target": MUJOCO_COORDINATE_SIGNATURE,
+                "matrix": HOLDEN_TO_MUJOCO_MATRIX.tolist(),
+            },
+            "processes": [
+                {
+                    "name": "mm_sonic.cli",
+                    "argv": ["mm_sonic.cli", *request.argv],
+                    "invocation_cwd": str(request.invocation_cwd),
+                    "environment": {
+                        "allowlist": list(_SAFE_ENVIRONMENT_ALLOWLIST),
+                        "values": dict(request.environment),
+                    },
+                }
+            ],
+        }
+    )
+    bundle.finalize(
+        stage_b_status,
+        outcome={
+            "status": command_status,
+            "stage_b_status": stage_b_status,
+            "reason": reason,
+            "diagnosis_sha256": diagnosis_sha256,
+        },
+    )
+    stdout.write(
+        json.dumps(
+            {
+                "status": command_status,
+                "stage_b_status": stage_b_status,
+                "evidence": str(bundle.path / "stage-b-evidence.json"),
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    return _command_status_exit(command_status)
+
+
+def _finalize_command_pre_execution(
+    request: StageARequest,
+    bundle: RunBundle,
+    *,
+    command_status: str,
+    reason: str,
+    stdout: IO[str],
+) -> int:
+    if request.command == "stage-b":
+        return _finalize_stage_b_pre_execution(
+            request,
+            bundle,
+            command_status=command_status,
+            reason=reason,
+            stdout=stdout,
+        )
+    return _finalize_pre_execution(
+        request,
+        bundle,
+        command_status=command_status,
+        reason=reason,
+        stdout=stdout,
+    )
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -5605,13 +6773,14 @@ def main(
         output_root, capability_diagnosis = _raw_output_and_capability_check(
             namespace
         )
+        experiment = "stage-b" if request.command == "stage-b" else "stage-a"
         bundle = RunBundle.create(
             output_root,
-            "stage-a",
+            experiment,
             _run_id(request.command, request.mode),
         )
         if capability_diagnosis is not None:
-            return _finalize_pre_execution(
+            return _finalize_command_pre_execution(
                 request,
                 bundle,
                 command_status="not_run",
@@ -5621,7 +6790,7 @@ def main(
         try:
             inputs = ExternalInputs.from_cli(namespace)
         except ExternalInputError as error:
-            return _finalize_pre_execution(
+            return _finalize_command_pre_execution(
                 request,
                 bundle,
                 command_status="not_run",
@@ -5632,6 +6801,14 @@ def main(
             DefaultStageAOperations() if operations is None else operations
         )
         try:
+            if request.command == "stage-b":
+                return _execute_stage_b(
+                    request,
+                    inputs,
+                    selected_operations,
+                    output,
+                    bundle,
+                )
             return _execute(
                 request,
                 inputs,
@@ -5640,7 +6817,7 @@ def main(
                 bundle,
             )
         except CapabilityUnavailable as error:
-            return _finalize_pre_execution(
+            return _finalize_command_pre_execution(
                 request,
                 bundle,
                 command_status="not_run",
@@ -5650,11 +6827,15 @@ def main(
         except (ExternalInputError, ContractError) as error:
             if (
                 bundle.status != "running"
-                or bundle.output_exists("stage-a-evidence.json")
+                or bundle.output_exists(
+                    "stage-b-evidence.json"
+                    if request.command == "stage-b"
+                    else "stage-a-evidence.json"
+                )
             ):
                 errors.write(f"configuration/integration error: {error}\n")
                 return EXIT_CONFIGURATION
-            code = _finalize_pre_execution(
+            code = _finalize_command_pre_execution(
                 request,
                 bundle,
                 command_status="integration_failure",

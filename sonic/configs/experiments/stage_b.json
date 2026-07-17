@@ -1,0 +1,24 @@
+{
+  "schema": "mm-sonic-stage-b/v1",
+  "scene_id": "sonic-flat-baseline",
+  "route_id": "flat-12s",
+  "terrain_weight": 0.0,
+  "chunk_count": 30,
+  "frame_count": 601,
+  "reference_duration_s": 12.0,
+  "control_lead_rows": 16,
+  "source_rate_hz": 25,
+  "target_rate_hz": 50,
+  "stream_padding_frame_count": 46,
+  "success": {
+    "minimum_pelvis_local_height_m": 0.45,
+    "minimum_pelvis_up_dot": 0.5,
+    "forbidden_contact_groups": ["pelvis", "knees", "torso", "hands"],
+    "known_good_metric_multiplier": 1.5,
+    "known_good_zero_epsilon": 1e-8,
+    "require_exact_command_coverage": true,
+    "require_exact_frame_coverage": true,
+    "require_exact_control_duration": true,
+    "require_exact_safety_log_coverage": true
+  }
+}

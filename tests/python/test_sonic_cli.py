@@ -448,9 +448,9 @@ class SonicCLITests(unittest.TestCase):
     def _evidence(bundle: Path) -> dict[str, object]:
         return json.loads((bundle / "stage-a-evidence.json").read_text("ascii"))
 
-    def _stream_preload_audit_fixture(self, label: str):
+    def _stream_preload_audit_fixture(self, label: str, count: int = 441):
         bundle = RunBundle.create(self.root / f"preload-{label}", "audit", label)
-        canonical = _canonical(441)
+        canonical = _canonical(count)
         enabled = b"\xe2\x9c\x93 cold startup\nZMQ STREAMING MODE: ENABLED\n"
         left = b"Delta heading left: 0.1 rad\n"
         right = b"Delta heading right: 0 rad\n"
@@ -3661,6 +3661,22 @@ class ProductionAdapterBoundaryTests(unittest.TestCase):
                 ).hexdigest(),
                 audit["stdout_prefix_sha256"],
             )
+        finally:
+            bundle.__del__()
+
+    def test_preload_audit_accepts_stage_b_601_frame_transport(self) -> None:
+        bundle, canonical, _stdout_path, evidence = (
+            self._stream_preload_audit_fixture("stage-b-601", 601)
+        )
+        try:
+            audit = cli_module._audit_known_good_stream_preload(
+                canonical, bundle, evidence
+            )
+            self.assertEqual(audit["logical_frames"], 600)
+            self.assertEqual(audit["consumer_marker_count"], 33)
+            self.assertEqual(audit["causal_fence_count"], 32)
+            self.assertTrue(audit["logical_exact"])
+            self.assertTrue(audit["receipt_fence_exact"])
         finally:
             bundle.__del__()
 

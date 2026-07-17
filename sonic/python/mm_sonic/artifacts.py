@@ -253,9 +253,14 @@ def _geom_ids(value: object, label: str) -> tuple[int, ...]:
 
 
 def _validate_scene_registration(value: object) -> None:
-    scene = _exact_keys(
-        value, _SCENE_REGISTRATION_KEYS, "scene_registration"
-    )
+    if type(value) is not dict or set(value) not in (
+        _SCENE_REGISTRATION_KEYS,
+        _SCENE_REGISTRATION_KEYS | {"terrain_geoms"},
+    ):
+        raise ContractError(
+            "terminal manifest scene_registration has invalid keys"
+        )
+    scene = value
     _nonempty_string(scene["scene_id"], "scene_registration.scene_id")
     route_id = scene["route_id"]
     if route_id is not None:
@@ -313,6 +318,23 @@ def _validate_scene_registration(value: object) -> None:
         "scene_registration.forbidden_geom_groups",
     )
     used = set(allowed)
+    terrain = set()
+    if "terrain_geoms" in scene:
+        terrain = set(
+            _geom_ids(
+                scene["terrain_geoms"],
+                "scene_registration.terrain_geoms",
+            )
+        )
+        if not terrain:
+            raise ContractError(
+                "terminal manifest scene_registration.terrain_geoms is empty"
+            )
+        if terrain & used:
+            raise ContractError(
+                "terminal manifest scene_registration geom groups overlap"
+            )
+        used.update(terrain)
     for name in sorted(_FORBIDDEN_GEOM_GROUPS):
         current = set(
             _geom_ids(

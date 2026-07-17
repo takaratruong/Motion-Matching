@@ -143,3 +143,52 @@ not policy-aligned tracking rows. Evidence reports the one-step pre-CONTROL
 prime, CONTROL-active drive steps/duration, and total scored-epoch
 steps/duration separately; retained state/contact row counts cover the full
 scored log epoch, including the prime.
+
+## Stage B motion-matching qualification
+
+Stage B replaces the known-good pose input with the registered flat
+motion-matching route. It accepts only an immutable passing
+`known-good-stream` Stage A evidence file whose inventory, invocation,
+identities, gate outputs, and registry are revalidated against the current
+code. It then executes the same four prerequisite gates, constructs the
+601-frame motion-matching reference, transports frames `0..600` through the
+pinned GEAR ZMQ decoder, and scores the official G1 SONIC dynamics.
+
+```bash
+PYTHONPATH=sonic/python sonic/.venv/bin/python -m mm_sonic.cli stage-b \
+  --stage-a-evidence /read-only/stage-a-evidence.json \
+  --gear-checkout /read-only/GR00T-WholeBodyControl \
+  --policy /read-only/model_decoder.onnx \
+  --observation-config /read-only/observation_config.yaml \
+  --encoder /read-only/model_encoder.onnx \
+  --source-mjcf /read-only/g1_29dof.xml \
+  --terrain-dir /read-only/g1_terrain \
+  --output-root sonic/runs/stage-b
+```
+
+The registered contract in `configs/experiments/stage_b.json` is exact: 30
+accepted 20-frame commands, 601 authoritative target rows, and 12.000 seconds
+of CONTROL-active physics. At the official 0.005-second simulator step this is
+2,400 CONTROL steps. A one-step scored prime makes the retained epoch 2,401
+steps, with exactly 2,401 contact rows and 600 state rows at 50 Hz. Complete but
+truncated JSONL is rejected by validating every step number and sampling time,
+not merely by counting syntactically valid records.
+
+GEAR remains a wall-clock 50 Hz controller. For Stage B only, the simulator
+adapter omits its redundant per-step wall-clock sleep and advances physics in
+row-paced batches. The registered 16-row control lead ensures all 2,400
+CONTROL steps finish before frame 600 is emitted. As soon as a newline-complete
+601st target row exists, the process group is stopped before the full target
+audit; early terminal arrival, overshoot, content mismatch, inode replacement,
+or any post-stop write fails integration. Stage A retains its default paced
+simulator behavior.
+
+The generated run-local scene is bound semantically, not by a path-sensitive
+digest alone. Stage B verifies the complete generated and included XML against
+the authenticated Stage A scene after normalizing only the run-local include
+path, and binds the registered allowed feet, forbidden body groups, and terrain
+geom IDs. A pass additionally requires the exact command/frame/duration/log
+coverage checks, no forbidden contacts, pelvis height and uprightness limits,
+and joint/pelvis tracking ratios relative to the authenticated known-good
+baseline. Secondary drift, clearance, scuff, impulse, and timing measurements
+remain diagnostics and cannot override those registered primary gates.

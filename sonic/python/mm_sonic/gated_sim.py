@@ -910,7 +910,15 @@ def load_external_bindings(gear_checkout: str | Path) -> _ExternalBindings:
 class ExternalGearBackend:
     """Lazy adapter over the pinned official ``BaseSimulator``."""
 
-    def __init__(self, gear_checkout: str | Path, scene_xml: str | Path) -> None:
+    def __init__(
+        self,
+        gear_checkout: str | Path,
+        scene_xml: str | Path,
+        *,
+        wall_clock_pacing: bool = True,
+    ) -> None:
+        if type(wall_clock_pacing) is not bool:
+            raise ProtocolError("wall_clock_pacing must be a boolean")
         scene = Path(scene_xml).resolve(strict=True)
         if not scene.is_file():
             raise ProtocolError(f"scene_xml is not a file: {scene}")
@@ -931,6 +939,7 @@ class ExternalGearBackend:
             )
         self._bindings = bindings
         self._simulator = simulator
+        self._wall_clock_pacing = wall_clock_pacing
 
     @property
     def model(self) -> object:
@@ -974,7 +983,7 @@ class ExternalGearBackend:
         with redirect_stdout(sys.stderr):
             self._simulator.sim_env.sim_step()
         remaining = self.sim_dt - (time.monotonic() - started)
-        if remaining > 0.0:
+        if getattr(self, "_wall_clock_pacing", True) and remaining > 0.0:
             time.sleep(remaining)
 
     def _geom_name(self, geom_id: int) -> str:
@@ -995,6 +1004,8 @@ class ExternalGearBackend:
             )
             contacts.append(
                 {
+                    "geom1_id": int(contact.geom1),
+                    "geom2_id": int(contact.geom2),
                     "geom1": self._geom_name(int(contact.geom1)),
                     "geom2": self._geom_name(int(contact.geom2)),
                     "distance_m": float(contact.dist),
@@ -1076,6 +1087,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--gear-checkout", required=True, type=Path)
     parser.add_argument("--run-root", type=Path)
     parser.add_argument("--import-preflight", action="store_true")
+    parser.add_argument("--unpaced-physics", action="store_true")
     return parser
 
 
@@ -1099,7 +1111,11 @@ def main(argv: list[str] | None = None) -> int:
     with redirect_stdout(sys.stderr):
         serve_jsonl(
             run_root=run_root,
-            backend_factory=lambda scene: ExternalGearBackend(checkout, scene),
+            backend_factory=lambda scene: ExternalGearBackend(
+                checkout,
+                scene,
+                wall_clock_pacing=not args.unpaced_physics,
+            ),
             output_stream=protocol_stdout,
         )
     return 0

@@ -652,6 +652,12 @@ class TargetCoverageTests(TemporaryCase):
                 with self.target.open("ab") as output:
                     output.write(self.hidden_row)
 
+        def continue_group(self) -> None:
+            self.stopped = False
+            callback = getattr(self, "on_continue", None)
+            if callback is not None:
+                callback()
+
     class Simulator:
         sim_dt = 0.002
 
@@ -719,6 +725,54 @@ class TargetCoverageTests(TemporaryCase):
         self.assertEqual(result.contact_rows, 4600)
         self.assertGreater(result.wall_duration_s, 0.0)
         self.assertTrue(gear.stopped)
+
+    def test_stage_b_601_rows_require_exact_12_second_active_control(self) -> None:
+        expected = canonical(601)
+        rows = self.rows(expected)
+        target = self.root / "stage-b.target.csv"
+        target.write_bytes(b"")
+        cursor = 0
+        gear = self.Gear(target)
+
+        def emit() -> None:
+            nonlocal cursor
+            self.assertFalse(gear.stopped)
+            if cursor < len(rows):
+                with target.open("ab") as output:
+                    output.write(rows[cursor])
+                cursor += 1
+
+        validate_prefix = cli_module._validate_target_prefix
+
+        def validate_after_terminal_fence(raw, expected_rows):
+            if raw.count(b"\n") >= expected.count:
+                self.assertTrue(
+                    gear.stopped,
+                    "terminal target coverage must stop GEAR before its full audit",
+                )
+            return validate_prefix(raw, expected_rows)
+
+        with patch.object(
+            cli_module,
+            "_validate_target_prefix",
+            side_effect=validate_after_terminal_fence,
+        ):
+            result = cli_module._drive_authoritative_target_coverage(
+                gear,
+                self.Simulator(emit),
+                target,
+                expected,
+                required_control_duration_s=12.0,
+                maximum_wall_seconds=1.5,
+            )
+
+        self.assertEqual(result.target_rows, 601)
+        self.assertEqual(result.control_drive_steps, 6000)
+        self.assertEqual(result.control_drive_duration_s, 12.0)
+        self.assertEqual(result.simulator_duration_s, 12.0)
+        self.assertEqual(cursor, 601)
+        self.assertTrue(gear.stopped)
+        self.assertTrue(result.target_sha256)
 
     def test_coverage_counters_exclude_the_stopped_wait_low_state_prime(self) -> None:
         expected = canonical()
@@ -1298,6 +1352,8 @@ class GearControlLogTests(TemporaryCase):
         self.assertEqual(metrics["frame_count"], 3)
         self.assertEqual(metrics["joint_position_rmse_rad"], 0.0)
         self.assertEqual(metrics["pelvis_orientation_rms_rad"], 0.0)
+        self.assertEqual(metrics["joint_tracking_trace_rad"], [0.0] * 3)
+        self.assertEqual(metrics["pelvis_tracking_trace_rad"], [0.0] * 3)
         self.assertEqual(metrics["pairing"], "same-control-tick-positional")
         self.assertEqual(metrics["tick_period_ms"]["count"], 2)
 

@@ -1282,6 +1282,7 @@ class GatedSimulatorClient:
         run_root: str | Path,
         command: Sequence[str] | None = None,
         gear_checkout: str | Path | None = None,
+        unpaced_physics: bool = False,
         stdout_archive: str | Path,
         stderr_archive: str | Path,
         cancelled: Callable[[], bool] | None = None,
@@ -1293,6 +1294,8 @@ class GatedSimulatorClient:
         cwd: str | Path | None = None,
     ) -> None:
         self.run_root = _canonical_run_root(run_root)
+        if type(unpaced_physics) is not bool:
+            raise ValueError("unpaced_physics must be a boolean")
         if command is None:
             if gear_checkout is None:
                 raise ValueError(
@@ -1309,6 +1312,7 @@ class GatedSimulatorClient:
                 str(checkout),
                 "--run-root",
                 str(self.run_root),
+                *(("--unpaced-physics",) if unpaced_physics else ()),
             )
         if not command or any(type(item) is not str or not item for item in command):
             raise ValueError("command must contain nonempty strings")

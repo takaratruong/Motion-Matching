@@ -484,6 +484,68 @@ class GatedSimulatorProtocolTests(unittest.TestCase):
 
 
 class ExternalGearBackendBoundaryTests(unittest.TestCase):
+    def test_unpaced_backend_advances_without_wall_clock_sleep(self):
+        backend = ExternalGearBackend.__new__(ExternalGearBackend)
+        backend._wall_clock_pacing = False
+        backend._simulator = SimpleNamespace(
+            sim_dt=0.005,
+            sim_env=SimpleNamespace(sim_step=lambda: None),
+        )
+
+        with patch.object(gated_sim.time, "sleep") as sleep:
+            backend.step()
+
+        sleep.assert_not_called()
+
+    def test_contact_samples_retain_authoritative_geom_ids(self):
+        class FakeMujoco:
+            class mjtObj:
+                mjOBJ_GEOM = 5
+
+            @staticmethod
+            def mj_contactForce(_model, _data, _index, force):
+                force[:] = [1.0, 2.0, 3.0, 0.0, 0.0, 0.0]
+
+            @staticmethod
+            def mj_id2name(_model, _kind, geom_id):
+                return {7: "left_foot", 91: "floor"}[geom_id]
+
+        pelvis = SimpleNamespace(
+            xpos=np.array([0.0, 0.0, 0.8]),
+            xquat=np.array([1.0, 0.0, 0.0, 0.0]),
+            xmat=np.eye(3).reshape(-1),
+        )
+        data = SimpleNamespace(
+            ncon=1,
+            contact=[
+                SimpleNamespace(
+                    geom1=7,
+                    geom2=91,
+                    dist=-0.001,
+                    pos=np.zeros(3),
+                    frame=np.eye(3).reshape(-1),
+                )
+            ],
+            qpos=np.zeros(36),
+            qvel=np.zeros(35),
+            qacc=np.zeros(35),
+            ctrl=np.zeros(29),
+            actuator_force=np.zeros(29),
+            body=lambda name: pelvis if name == "pelvis" else None,
+        )
+        backend = ExternalGearBackend.__new__(ExternalGearBackend)
+        backend._bindings = SimpleNamespace(mujoco=FakeMujoco)
+        backend._simulator = SimpleNamespace(
+            sim_env=SimpleNamespace(mj_model=SimpleNamespace(), mj_data=data)
+        )
+
+        sample = backend.sample()
+
+        self.assertEqual(sample["contacts"][0]["geom1_id"], 7)
+        self.assertEqual(sample["contacts"][0]["geom2_id"], 91)
+        self.assertEqual(sample["contacts"][0]["geom1"], "left_foot")
+        self.assertEqual(sample["contacts"][0]["geom2"], "floor")
+
     def test_protocol_backend_forces_headless_nonrendering_simulator(self):
         captured = {}
 

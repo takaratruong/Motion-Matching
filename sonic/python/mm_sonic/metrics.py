@@ -941,6 +941,8 @@ def evaluate_flat_trial(
     integration_pass: bool,
     exact_command_coverage: bool,
     exact_frame_coverage: bool,
+    exact_control_duration: bool,
+    exact_safety_log_coverage: bool,
     minimum_pelvis_local_height_m: float,
     minimum_pelvis_up_dot: float,
     contact_groups: Iterable[str],
@@ -956,6 +958,8 @@ def evaluate_flat_trial(
         integration_pass,
         exact_command_coverage,
         exact_frame_coverage,
+        exact_control_duration,
+        exact_safety_log_coverage,
     )
     if any(type(value) is not bool for value in booleans):
         raise ContractError("flat trial integration/coverage gates must be booleans")
@@ -967,6 +971,8 @@ def evaluate_flat_trial(
         "integration": integration_pass,
         "exact_command_coverage": exact_command_coverage,
         "exact_frame_coverage": exact_frame_coverage,
+        "exact_control_duration": exact_control_duration,
+        "exact_safety_log_coverage": exact_safety_log_coverage,
         "pelvis_local_height": height >= MINIMUM_PELVIS_LOCAL_HEIGHT_M,
         "pelvis_up_dot": up_dot >= MINIMUM_PELVIS_UP_DOT,
         "forbidden_contacts": not has_forbidden_contact(contact_groups),
