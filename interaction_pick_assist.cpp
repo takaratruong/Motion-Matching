@@ -564,13 +564,32 @@ PickAssistOutput ControllerPickAssist::observe(
                 diagnostics_,
                 pick_assist_reason_from_slot_reason(slot_reason));
         }
-        const float root_error_m = planar_distance(
+        diagnostics_.root_error_m = planar_distance(
             observation.displayed_root.position,
             frozen_slot_.root_world.position);
-        if (!is_finite(root_error_m)) {
-            return output;
+        diagnostics_.speed_mps = planar_speed(
+            observation.simulation_velocity);
+        diagnostics_.yaw_error_radians = yaw_error(
+            yaw_radians(observation.displayed_root.rotation),
+            yaw_radians(frozen_slot_.root_world.rotation));
+        if (!is_finite(diagnostics_.root_error_m) ||
+            !is_finite(diagnostics_.speed_mps) ||
+            !is_finite(diagnostics_.yaw_error_radians)) {
+            return fail_output(
+                diagnostics_, PickAssistReason::OutsideTravelEnvelope);
         }
-        if (root_error_m <= config_.arrival.slow_radius_m) {
+        if (diagnostics_.root_error_m <=
+                config_.arrival.latch_position_error_m &&
+            diagnostics_.speed_mps <=
+                config_.arrival.latch_simulation_speed_mps &&
+            diagnostics_.yaw_error_radians <=
+                config_.arrival.maximum_yaw_error_radians) {
+            diagnostics_.state = PickAssistState::Settling;
+            diagnostics_.settle_ticks = 0U;
+            return braking_output();
+        }
+        if (diagnostics_.root_error_m <=
+            config_.arrival.slow_radius_m) {
             output.override_steering = true;
             output.left_stick = arrival_navigation_stick(
                 frozen_slot_.root_world.position,
