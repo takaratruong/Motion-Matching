@@ -175,6 +175,92 @@ struct mm_real_reset_context
     mm_server_scene_identity identity;
 };
 
+static g1_runtime_joint_preview_verdict mm_real_classify_joint_preview(
+    const bool projected,
+    const sonic_joint_projection_diagnostic& projection,
+    const sonic_joint_contract_entry (&contract)[SonicG1JointCount],
+    int& rejected_joint_index,
+    float& rejected_joint_position,
+    char* error,
+    const int capacity)
+{
+    rejected_joint_index = -1;
+    rejected_joint_position = 0.0f;
+
+    if (projected) {
+        const bool diagnostic_is_valid =
+            projection.failure == SonicJointProjectionValid &&
+            projection.row == -1 &&
+            projection.position == 0.0f &&
+            projection.lower == 0.0f &&
+            projection.upper == 0.0f;
+        if (diagnostic_is_valid) {
+            if (error != nullptr && capacity > 0) error[0] = '\0';
+            return G1RuntimeJointPreviewAccept;
+        }
+    } else if (
+        projection.failure == SonicJointProjectionLimit &&
+        projection.row >= 0 && projection.row < SonicG1JointCount) {
+        const int row = projection.row;
+        const bool diagnostic_is_limit =
+            std::isfinite(projection.position) &&
+            std::isfinite(projection.lower) &&
+            std::isfinite(projection.upper) &&
+            projection.lower < projection.upper &&
+            projection.lower == contract[row].lower &&
+            projection.upper == contract[row].upper &&
+            contract[row].source_index == row &&
+            (projection.position < projection.lower ||
+             projection.position > projection.upper);
+        if (diagnostic_is_limit) {
+            rejected_joint_index = row;
+            rejected_joint_position = projection.position;
+            return G1RuntimeJointPreviewRejectLimit;
+        }
+    }
+
+    if (error != nullptr && capacity > 0 && error[0] == '\0') {
+        std::snprintf(
+            error,
+            static_cast<std::size_t>(capacity),
+            "joint preview projection returned an inconsistent diagnostic");
+    }
+    return G1RuntimeJointPreviewFatal;
+}
+
+static g1_runtime_joint_preview_verdict mm_real_project_joint_preview(
+    const sonic_joint_contract_entry (&contract)[SonicG1JointCount],
+    const slice1d<quat> local_rotations,
+    const slice1d<vec3> local_angular_velocities,
+    int& rejected_joint_index,
+    float& rejected_joint_position,
+    char* error,
+    const int capacity)
+{
+    float positions[SonicG1JointCount] = {};
+    float velocities[SonicG1JointCount] = {};
+    float residuals[SonicG1JointCount] = {};
+    sonic_joint_projection_diagnostic projection;
+    const bool projected = sonic_project_joint_state(
+        positions,
+        velocities,
+        residuals,
+        projection,
+        contract,
+        local_rotations,
+        local_angular_velocities,
+        error,
+        capacity);
+    return mm_real_classify_joint_preview(
+        projected,
+        projection,
+        contract,
+        rejected_joint_index,
+        rejected_joint_position,
+        error,
+        capacity);
+}
+
 class mm_real_adapter
 {
 public:
@@ -516,6 +602,9 @@ public:
         runtime_feasibility.raw_safe = joint_feasibility_.raw_safe.data;
         runtime_feasibility.search_safe = joint_feasibility_.search_safe.data;
         runtime_feasibility.count = joint_feasibility_.frame_count;
+        g1_runtime_joint_preview_validator preview_validator;
+        preview_validator.context = this;
+        preview_validator.evaluate = validate_joint_preview;
         char error[1024] = {};
         if (!g1_runtime_step(
                 result,
@@ -526,6 +615,7 @@ public:
                 runtime_feasibility,
                 runtime_request,
                 config,
+                preview_validator,
                 error,
                 static_cast<int>(sizeof(error)))) {
             message = error;
@@ -558,6 +648,36 @@ public:
     }
 
 private:
+    static g1_runtime_joint_preview_verdict validate_joint_preview(
+        void* raw_context,
+        const int selected_database_frame,
+        const int emitted_database_frame,
+        const slice1d<quat> local_rotations,
+        const slice1d<vec3> local_angular_velocities,
+        int& rejected_joint_index,
+        float& rejected_joint_position,
+        char* error,
+        const int capacity)
+    {
+        (void)selected_database_frame;
+        (void)emitted_database_frame;
+        if (raw_context == nullptr) {
+            sonic_projection_error(
+                error, capacity, "joint preview adapter context is null");
+            return G1RuntimeJointPreviewFatal;
+        }
+        mm_real_adapter& adapter =
+            *static_cast<mm_real_adapter*>(raw_context);
+        return mm_real_project_joint_preview(
+            adapter.contract_,
+            local_rotations,
+            local_angular_velocities,
+            rejected_joint_index,
+            rejected_joint_position,
+            error,
+            capacity);
+    }
+
     bool rebuild_matching_features(
         float terrain_weight,
         mm_matching_feature_storage& prior,

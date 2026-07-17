@@ -519,6 +519,21 @@ class ChunkServerSourceOwnershipTest(unittest.TestCase):
             "sonic_joint_feasibility_certificate joint_feasibility_;",
             adapter_source,
         )
+        classifier_start = source.index(
+            "static g1_runtime_joint_preview_verdict "
+            "mm_real_classify_joint_preview("
+        )
+        classifier_stop = source.index(
+            "\nclass mm_real_adapter",
+            classifier_start,
+        )
+        classifier_source = source[classifier_start:classifier_stop]
+        self.assertIn("sonic_project_joint_state(", classifier_source)
+        self.assertIn("SonicJointProjectionLimit", classifier_source)
+        self.assertIn("projection.row", classifier_source)
+        self.assertIn("std::isfinite(projection.position)", classifier_source)
+        self.assertIn("projection.lower == contract[row].lower", classifier_source)
+        self.assertIn("projection.upper == contract[row].upper", classifier_source)
 
         advance_start = adapter_source.index("    bool advance(\n")
         advance_stop = adapter_source.index("\nprivate:", advance_start)
@@ -528,8 +543,18 @@ class ChunkServerSourceOwnershipTest(unittest.TestCase):
         self.assertIn("joint_feasibility_.raw_safe.data", advance_body)
         self.assertIn("joint_feasibility_.search_safe.data", advance_body)
         self.assertIn("joint_feasibility_.frame_count", advance_body)
+        self.assertIn(
+            "g1_runtime_joint_preview_validator preview_validator",
+            advance_body,
+        )
+        self.assertIn("preview_validator.context = this", advance_body)
+        self.assertIn(
+            "preview_validator.evaluate = validate_joint_preview",
+            advance_body,
+        )
         runtime_call = advance_body[advance_body.index("g1_runtime_step("):]
         self.assertIn("runtime_feasibility", runtime_call)
+        self.assertIn("preview_validator", runtime_call)
 
     def test_fake_certificate_uses_shared_digest_and_projection_gate_remains(self):
         source = (ROOT / "sonic" / "cpp" / "mm_chunk_server.cpp").read_text(
