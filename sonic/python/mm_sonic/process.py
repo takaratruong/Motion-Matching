@@ -37,6 +37,7 @@ _MANAGED_GEAR_FLAGS = frozenset(
         "--target-motion-logfile",
         "--logs-dir",
         "--enable-csv-logs",
+        "--disable-crc-check",
         "--zmq-conflate",
         "--zmq-verbose",
     }
@@ -149,6 +150,7 @@ def _gear_process_argv(
         "--logs-dir",
         str(logs_dir),
         "--enable-csv-logs",
+        "--disable-crc-check",
     )
     if launch_profile == "zmq_stream":
         integration_flags += ("--zmq-verbose",)
@@ -266,17 +268,27 @@ def _create_exclusive_directory(
 @dataclass(frozen=True)
 class _OwnedDirectory:
     parent_fd: int
+    leaf_fd: int
     name: str
     device: int
     inode: int
 
 
-def _bind_owned_directory(
+def _directory_open_flags() -> int:
+    return (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _open_confined_parent_fd(
     run_root: Path,
     candidate: Path,
     label: str,
-) -> _OwnedDirectory:
-    """Retain a no-follow parent descriptor and the created leaf identity."""
+) -> tuple[int, str]:
+    """Open a candidate's parent from the authenticated root without links."""
 
     try:
         relative = candidate.relative_to(run_root)
@@ -285,14 +297,8 @@ def _bind_owned_directory(
     parts = relative.parts
     if not parts:
         raise ProcessError(f"{label} must be a descendant beneath run_root")
-    flags = (
-        os.O_RDONLY
-        | os.O_DIRECTORY
-        | os.O_NOFOLLOW
-        | getattr(os, "O_CLOEXEC", 0)
-    )
+    flags = _directory_open_flags()
     parent_fd: int | None = None
-    leaf_fd: int | None = None
     retained = False
     try:
         expected_root = run_root.stat(follow_symlinks=False)
@@ -308,28 +314,93 @@ def _bind_owned_directory(
             next_fd = os.open(part, flags, dir_fd=parent_fd)
             os.close(parent_fd)
             parent_fd = next_fd
-        leaf_fd = os.open(parts[-1], flags, dir_fd=parent_fd)
-        leaf = os.fstat(leaf_fd)
-        if not stat.S_ISDIR(leaf.st_mode):
-            raise ProcessError(f"{label} is not a directory")
         retained = True
-        return _OwnedDirectory(
+        return parent_fd, parts[-1]
+    except ProcessError:
+        raise
+    except OSError as error:
+        raise ProcessError(f"cannot open {label} parent") from error
+    finally:
+        if parent_fd is not None and not retained:
+            try:
+                os.close(parent_fd)
+            except OSError:
+                pass
+
+
+def _create_owned_directory(
+    run_root: Path,
+    value: str | Path,
+    label: str,
+) -> tuple[Path, _OwnedDirectory]:
+    """Create a directory and retain both parent and live leaf descriptors."""
+
+    candidate = _prepare_confined_output_path(run_root, value, label)
+    parent_fd, name = _open_confined_parent_fd(run_root, candidate, label)
+    leaf_fd: int | None = None
+    created = False
+    retained = False
+    try:
+        try:
+            os.mkdir(name, dir_fd=parent_fd)
+        except FileExistsError as error:
+            raise ProcessError(f"{label} already exists: {candidate}") from error
+        created = True
+        leaf_fd = os.open(
+            name,
+            _directory_open_flags(),
+            dir_fd=parent_fd,
+        )
+        leaf = os.fstat(leaf_fd)
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(leaf.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or current.st_dev != leaf.st_dev
+            or current.st_ino != leaf.st_ino
+        ):
+            raise ProcessError(f"{label} identity changed during creation")
+        retained = True
+        return candidate, _OwnedDirectory(
             parent_fd=parent_fd,
-            name=parts[-1],
+            leaf_fd=leaf_fd,
+            name=name,
             device=leaf.st_dev,
             inode=leaf.st_ino,
         )
     except ProcessError:
         raise
     except OSError as error:
-        raise ProcessError(f"cannot bind {label} identity") from error
+        raise ProcessError(f"cannot create {label}: {candidate}") from error
     finally:
-        if leaf_fd is not None:
-            try:
-                os.close(leaf_fd)
-            except OSError:
-                pass
-        if parent_fd is not None and not retained:
+        if not retained:
+            remove_created = created and leaf_fd is None
+            if created and leaf_fd is not None:
+                try:
+                    original = os.fstat(leaf_fd)
+                    current = os.stat(
+                        name,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                    remove_created = (
+                        stat.S_ISDIR(original.st_mode)
+                        and stat.S_ISDIR(current.st_mode)
+                        and original.st_dev == current.st_dev
+                        and original.st_ino == current.st_ino
+                    )
+                except OSError:
+                    remove_created = False
+            if remove_created:
+                try:
+                    os.rmdir(name, dir_fd=parent_fd)
+                except OSError:
+                    pass
+            if leaf_fd is not None:
+                try:
+                    os.close(leaf_fd)
+                except OSError:
+                    pass
             try:
                 os.close(parent_fd)
             except OSError:
@@ -341,6 +412,10 @@ def _remove_owned_empty_directory(owned: _OwnedDirectory) -> None:
 
     try:
         try:
+            original = os.fstat(owned.leaf_fd)
+        except OSError:
+            return
+        try:
             current = os.stat(
                 owned.name,
                 dir_fd=owned.parent_fd,
@@ -349,9 +424,12 @@ def _remove_owned_empty_directory(owned: _OwnedDirectory) -> None:
         except OSError:
             return
         if (
-            not stat.S_ISDIR(current.st_mode)
-            or current.st_dev != owned.device
-            or current.st_ino != owned.inode
+            not stat.S_ISDIR(original.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or original.st_dev != owned.device
+            or original.st_ino != owned.inode
+            or current.st_dev != original.st_dev
+            or current.st_ino != original.st_ino
         ):
             return
         try:
@@ -360,6 +438,10 @@ def _remove_owned_empty_directory(owned: _OwnedDirectory) -> None:
             # Nonempty evidence or a concurrent identity change is retained.
             pass
     finally:
+        try:
+            os.close(owned.leaf_fd)
+        except OSError:
+            pass
         try:
             os.close(owned.parent_fd)
         except OSError:
@@ -1698,55 +1780,6 @@ class GearProcess:
                 f"command contains managed GEAR flag {managed[0]!r}; "
                 "the wrapper owns all integration flags"
             )
-        self.run_root = _canonical_run_root(run_root)
-        _require_shell_safe_absolute_path(self.run_root, "run_root")
-        target = _validate_confined_output_path(
-            self.run_root,
-            target_motion_logfile,
-            "target motion logfile",
-        )
-        logs = _validate_confined_output_path(
-            self.run_root,
-            logs_dir,
-            "GEAR logs directory",
-        )
-        _require_shell_safe_absolute_path(logs, "GEAR logs directory")
-        stdout_path = _validate_confined_output_path(
-            self.run_root,
-            stdout_archive,
-            "GEAR stdout archive",
-        )
-        stderr_path = _validate_confined_output_path(
-            self.run_root,
-            stderr_archive,
-            "GEAR stderr archive",
-        )
-        if len({target, stdout_path, stderr_path}) != 3:
-            raise ProcessError("GEAR file output paths must be distinct")
-        if logs in (target, stdout_path, stderr_path):
-            raise ProcessError("GEAR logs directory cannot also be a file output")
-        _create_exclusive_directory(
-            self.run_root,
-            logs,
-            "GEAR logs directory",
-        )
-        for path, label in (
-            (target, "target motion logfile"),
-            (stdout_path, "GEAR stdout archive"),
-            (stderr_path, "GEAR stderr archive"),
-        ):
-            _create_confined_parents(self.run_root, path, label=label)
-        self.argv = _gear_process_argv(
-            command,
-            launch_profile=launch_profile,
-            target_motion_logfile=target,
-            logs_dir=logs,
-        )
-        self.launch_profile = launch_profile
-        self.target_motion_logfile = target
-        self.logs_dir = logs
-        self.stdout_archive = stdout_path
-        self.stderr_archive = stderr_path
         if readiness_poll_s <= 0.0 or signal_poll_s <= 0.0:
             raise ValueError("poll intervals must be positive")
         default_startup = (
@@ -1759,31 +1792,92 @@ class GearProcess:
             if launch_profile == "zmq_stream"
             else _LOADED_MOTION_ACTIVE_MARKERS
         )
-        self._startup_markers = tuple(
+        selected_startup_markers = tuple(
             default_startup if startup_markers is None else startup_markers
         )
-        self._active_markers = tuple(
+        selected_active_markers = tuple(
             default_active if active_markers is None else active_markers
         )
-        self._wait_for_control_marker = wait_for_control_marker
-        markers = (*self._startup_markers, *self._active_markers)
+        markers = (*selected_startup_markers, *selected_active_markers)
         if any(type(marker) is not str or not marker for marker in markers):
             raise ValueError("readiness markers must be nonempty strings")
         if (
-            type(self._wait_for_control_marker) is not str
-            or not self._wait_for_control_marker
-            or "\n" in self._wait_for_control_marker
+            type(wait_for_control_marker) is not str
+            or not wait_for_control_marker
+            or "\n" in wait_for_control_marker
         ):
             raise ValueError("wait_for_control_marker must be one nonempty line")
+        selected_environment = None if env is None else dict(env)
+        selected_cwd = None if cwd is None else str(Path(cwd))
+        selected_stop_grace_s = max(0.0, stop_grace_s)
+        selected_term_grace_s = max(0.0, term_grace_s)
+        selected_kill_grace_s = max(0.0, kill_grace_s)
+        output_condition = threading.Condition()
+
+        run_root_path = _canonical_run_root(run_root)
+        _require_shell_safe_absolute_path(run_root_path, "run_root")
+        target = _validate_confined_output_path(
+            run_root_path,
+            target_motion_logfile,
+            "target motion logfile",
+        )
+        logs = _validate_confined_output_path(
+            run_root_path,
+            logs_dir,
+            "GEAR logs directory",
+        )
+        _require_shell_safe_absolute_path(logs, "GEAR logs directory")
+        stdout_path = _validate_confined_output_path(
+            run_root_path,
+            stdout_archive,
+            "GEAR stdout archive",
+        )
+        stderr_path = _validate_confined_output_path(
+            run_root_path,
+            stderr_archive,
+            "GEAR stderr archive",
+        )
+        if len({target, stdout_path, stderr_path}) != 3:
+            raise ProcessError("GEAR file output paths must be distinct")
+        if logs in (target, stdout_path, stderr_path):
+            raise ProcessError("GEAR logs directory cannot also be a file output")
+        for path, label in (
+            (target, "target motion logfile"),
+            (stdout_path, "GEAR stdout archive"),
+            (stderr_path, "GEAR stderr archive"),
+        ):
+            _create_confined_parents(run_root_path, path, label=label)
+        argv = _gear_process_argv(
+            command,
+            launch_profile=launch_profile,
+            target_motion_logfile=target,
+            logs_dir=logs,
+        )
+        logs, owned_logs = _create_owned_directory(
+            run_root_path,
+            logs,
+            "GEAR logs directory",
+        )
+
+        self.run_root = run_root_path
+        self.argv = argv
+        self.launch_profile = launch_profile
+        self.target_motion_logfile = target
+        self.logs_dir = logs
+        self.stdout_archive = stdout_path
+        self.stderr_archive = stderr_path
+        self._startup_markers = selected_startup_markers
+        self._active_markers = selected_active_markers
+        self._wait_for_control_marker = wait_for_control_marker
         self._cancelled = cancelled
         self._readiness_timeout_s = readiness_timeout_s
         self._readiness_poll_s = readiness_poll_s
         self._signal_poll_s = signal_poll_s
-        self._stop_grace_s = max(0.0, stop_grace_s)
-        self._term_grace_s = max(0.0, term_grace_s)
-        self._kill_grace_s = max(0.0, kill_grace_s)
-        self._env = None if env is None else dict(env)
-        self._cwd = None if cwd is None else str(Path(cwd))
+        self._stop_grace_s = selected_stop_grace_s
+        self._term_grace_s = selected_term_grace_s
+        self._kill_grace_s = selected_kill_grace_s
+        self._env = selected_environment
+        self._cwd = selected_cwd
         self._process: subprocess.Popen[bytes] | None = None
         self._pgid: int | None = None
         self._master_fd: int | None = None
@@ -1792,7 +1886,7 @@ class GearProcess:
         self._reader_threads: list[threading.Thread] = []
         self._reader_errors: list[tuple[str, BaseException]] = []
         self._observed = b""
-        self._output_condition = threading.Condition()
+        self._output_condition = output_condition
         self._closed = False
         self._ready = False
         self._startup_markers_ready = False
@@ -1801,11 +1895,7 @@ class GearProcess:
         self._control_active = False
         self.signal_history: list[signal.Signals] = []
         self.cleanup_history: list[str] = []
-        self._owned_logs_directory = _bind_owned_directory(
-            self.run_root,
-            self.logs_dir,
-            "GEAR logs directory",
-        )
+        self._owned_logs_directory = owned_logs
 
     @property
     def pid(self) -> int:

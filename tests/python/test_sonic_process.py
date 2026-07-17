@@ -741,6 +741,7 @@ class GatedSimulatorClientTests(TemporaryScriptCase):
 class GearProcessTests(TemporaryScriptCase):
     def gear(self, child, *, active=("CONTROL READY", "STREAM READY"), **kwargs):
         logs_dir = kwargs.pop("logs_dir", self.root / "gear-logs")
+        readiness_poll_s = kwargs.pop("readiness_poll_s", 0.01)
         return GearProcess(
             run_root=self.root,
             command=[sys.executable, "-u", str(child)],
@@ -751,7 +752,7 @@ class GearProcessTests(TemporaryScriptCase):
             startup_markers=("BOOT READY",),
             active_markers=active,
             wait_for_control_marker="BOOT READY",
-            readiness_poll_s=0.01,
+            readiness_poll_s=readiness_poll_s,
             stop_grace_s=0.05,
             term_grace_s=0.05,
             kill_grace_s=0.2,
@@ -803,6 +804,7 @@ class GearProcessTests(TemporaryScriptCase):
             self.assertEqual(argv.count("--logs-dir"), 1)
             self.assertEqual(argv.count("--enable-csv-logs"), 1)
             self.assertEqual(argv.count("--zmq-verbose"), 1)
+            self.assertEqual(argv.count("--disable-crc-check"), 1)
             self.assertNotIn("--zmq-conflate", argv)
         finally:
             gear.close()
@@ -863,6 +865,78 @@ class GearProcessTests(TemporaryScriptCase):
 
         self.assertTrue(original.is_dir())
         self.assertTrue(gear.logs_dir.is_dir())
+
+    def test_owned_logs_leaf_descriptor_remains_live_until_close(self):
+        child = self.script("unused_live_logs_fd.py", "raise SystemExit(0)\n")
+        gear = self.gear(child)
+        leaf_fd = gear._owned_logs_directory.leaf_fd
+        parent_fd = gear._owned_logs_directory.parent_fd
+        original = os.fstat(leaf_fd)
+        gear.logs_dir.rmdir()
+        gear.logs_dir.mkdir()
+        replacement = gear.logs_dir.stat(follow_symlinks=False)
+
+        self.assertNotEqual(
+            (replacement.st_dev, replacement.st_ino),
+            (original.st_dev, original.st_ino),
+        )
+        gear.close()
+
+        self.assertTrue(gear.logs_dir.is_dir())
+        for descriptor in (leaf_fd, parent_fd):
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    def test_invalid_poll_configuration_does_not_create_logs_directory(self):
+        child = self.script("unused_invalid_poll.py", "raise SystemExit(0)\n")
+
+        with self.assertRaisesRegex(ValueError, "poll intervals"):
+            self.gear(child, readiness_poll_s=0.0)
+
+        self.assertFalse((self.root / "gear-logs").exists())
+
+    def test_environment_is_copied_before_any_logs_parent_is_created(self):
+        child = self.script("unused_environment_order.py", "raise SystemExit(0)\n")
+        parent = self.root / "late-parent"
+        observations = []
+
+        class ObservedEnvironment:
+            def keys(self):
+                observations.append(parent.exists())
+                return ("PATH",)
+
+            @staticmethod
+            def __getitem__(_key):
+                return "/usr/bin"
+
+        gear = self.gear(
+            child,
+            logs_dir=parent / "gear-logs",
+            env=ObservedEnvironment(),
+        )
+        try:
+            self.assertEqual(observations, [False])
+        finally:
+            gear.close()
+
+    def test_logs_leaf_open_failure_rolls_back_created_directory(self):
+        from mm_sonic import process as process_module
+
+        child = self.script("unused_leaf_open_failure.py", "raise SystemExit(0)\n")
+        real_open = process_module.os.open
+
+        def fail_leaf_open(path, flags, mode=0o777, *, dir_fd=None):
+            if path == "gear-logs" and dir_fd is not None:
+                raise OSError("synthetic leaf open failure")
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with (
+            patch.object(process_module.os, "open", side_effect=fail_leaf_open),
+            self.assertRaisesRegex(ProcessError, "cannot create GEAR logs"),
+        ):
+            self.gear(child)
+
+        self.assertFalse((self.root / "gear-logs").exists())
 
     def test_default_markers_follow_literal_official_control_then_stream_order(self):
         keys_path = self.root / "default-marker-keys.bin"
@@ -981,6 +1055,7 @@ class GearProcessTests(TemporaryScriptCase):
                     "--logs-dir",
                     str(logs),
                     "--enable-csv-logs",
+                    "--disable-crc-check",
                 ],
             )
             self.assertTrue(gear.ready)
@@ -1003,8 +1078,9 @@ class GearProcessTests(TemporaryScriptCase):
             GearProcess(**common, launch_profile="arbitrary")
 
         gear = GearProcess(**common)
+        self.addCleanup(gear.close)
         self.assertEqual(gear.launch_profile, "zmq_stream")
-        self.assertEqual(gear.argv[-8:], (
+        self.assertEqual(gear.argv[-9:], (
             "--input-type",
             "zmq",
             "--target-motion-logfile",
@@ -1012,6 +1088,7 @@ class GearProcessTests(TemporaryScriptCase):
             "--logs-dir",
             str(self.root / "profile-logs"),
             "--enable-csv-logs",
+            "--disable-crc-check",
             "--zmq-verbose",
         ))
 
@@ -1737,6 +1814,7 @@ class GearProcessTests(TemporaryScriptCase):
             "--target-motion-logfile=/tmp/override.csv",
             "--logs-dir=/tmp/override",
             "--enable-csv-logs=false",
+            "--disable-crc-check=false",
             "--zmq-verbose=false",
         ):
             with self.subTest(flag=flag):

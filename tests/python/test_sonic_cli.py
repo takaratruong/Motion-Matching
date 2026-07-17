@@ -1071,6 +1071,29 @@ class SonicCLITests(unittest.TestCase):
         self.assertNotIn("already finalized or finalizing", stderr)
         self.assertEqual(len(calls), 1)
 
+    def test_pretransition_finalization_failure_is_not_retried_or_masked(self):
+        calls = []
+
+        def fail_before_transition(_bundle, status, *, outcome):
+            calls.append((status, dict(outcome)))
+            raise ContractError("primary pretransition finalization failure")
+
+        with patch.object(
+            cli_module.RunBundle,
+            "finalize",
+            autospec=True,
+            side_effect=fail_before_transition,
+        ):
+            code, stdout, stderr = self._run(
+                ["preflight", *self._common()]
+            )
+
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("primary pretransition finalization failure", stderr)
+        self.assertNotIn("evidence output already exists", stderr)
+        self.assertEqual(len(calls), 1)
+
     def test_each_mode_runs_only_its_ordered_prerequisite_prefix(self) -> None:
         cases = (
             ("mm-reference", 4),

@@ -5617,7 +5617,11 @@ def main(
                 stdout=output,
             )
         except (ExternalInputError, ContractError) as error:
-            if bundle.status != "running":
+            stage_evidence = bundle.path / "stage-a-evidence.json"
+            if (
+                bundle.status != "running"
+                or os.path.lexists(stage_evidence)
+            ):
                 errors.write(f"configuration/integration error: {error}\n")
                 return EXIT_CONFIGURATION
             code = _finalize_pre_execution(
