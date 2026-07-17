@@ -61,6 +61,56 @@ void require_near(
     require_near(actual.z, expected.z, tolerance, message);
 }
 
+bool same_float_bits_exact(float left, float right) {
+    return std::memcmp(&left, &right, sizeof(left)) == 0;
+}
+
+bool same_transform_bits_exact(
+    interaction::Transform left,
+    interaction::Transform right) {
+    return same_float_bits_exact(left.position.x, right.position.x) &&
+        same_float_bits_exact(left.position.y, right.position.y) &&
+        same_float_bits_exact(left.position.z, right.position.z) &&
+        same_float_bits_exact(left.rotation.w, right.rotation.w) &&
+        same_float_bits_exact(left.rotation.x, right.rotation.x) &&
+        same_float_bits_exact(left.rotation.y, right.rotation.y) &&
+        same_float_bits_exact(left.rotation.z, right.rotation.z);
+}
+
+void require_frozen_slot_provenance_unchanged(
+    const interaction::PickAssistDiagnostics& before,
+    const interaction::PickAssistDiagnostics& after,
+    const char* message) {
+    require(
+        before.slot_selection.selected_index.has_value(),
+        "frozen provenance fixture had no selected index");
+    const size_t selected = *before.slot_selection.selected_index;
+    require(
+        selected < before.slot_selection.ordered.size() &&
+            selected < after.slot_selection.ordered.size() &&
+            after.selected_slot == before.selected_slot &&
+            after.selected_slot_id == before.selected_slot_id &&
+            after.slot_selection.selected_index ==
+                before.slot_selection.selected_index &&
+            after.slot_selection.reason == before.slot_selection.reason &&
+            after.slot_selection.ordered.size() ==
+                before.slot_selection.ordered.size() &&
+            after.slot_selection.ordered[selected].id ==
+                before.slot_selection.ordered[selected].id &&
+            same_transform_bits_exact(
+                after.slot_selection.ordered[selected].root_world,
+                before.slot_selection.ordered[selected].root_world) &&
+            same_float_bits_exact(
+                after.route_length_m,
+                before.route_length_m) &&
+            same_float_bits_exact(
+                after.slot_selection.ordered[selected].route_length_m,
+                before.slot_selection.ordered[selected].route_length_m) &&
+            after.slot_selection.ordered[selected].route_millimetres ==
+                before.slot_selection.ordered[selected].route_millimetres,
+        message);
+}
+
 interaction::InteractionTarget make_target() {
     interaction::InteractionTarget target{};
     target.handle = {41U, 3U};
@@ -598,6 +648,106 @@ void test_slot_approach_accumulates_inclusive_travel_and_rejects_overshoot() {
                 failed.slot_selection.ordered[frozen_index].route_length_m,
                 frozen_slot.route_length_m),
         "assisted-travel overshoot reselected or changed frozen diagnostics");
+}
+
+void test_slot_approach_revalidates_frozen_route_against_table() {
+    FrozenSlotScenario scenario;
+    scenario.target.table_world = {
+        vec3(-0.10F, 0.0F, 0.80F), quat()};
+    scenario.target.table_size = vec3(0.02F, 0.10F, 0.02F);
+    scenario.start.target_snapshot = scenario.target;
+    interaction::ControllerPickAssist assist;
+
+    require(
+        assist.begin(scenario.start, &scenario.target),
+        "table-revalidation fixture begin failed");
+    const interaction::PickAssistDiagnostics frozen_before =
+        assist.diagnostics();
+    require(
+        frozen_before.state == interaction::PickAssistState::SlotApproach &&
+            frozen_before.selected_slot_id == 9U &&
+            frozen_before.slot_selection.selected_index.has_value(),
+        "table-revalidation fixture did not select slot ID 9");
+    const size_t selected =
+        *frozen_before.slot_selection.selected_index;
+    const interaction::MappedPickSlot& frozen_slot =
+        frozen_before.slot_selection.ordered[selected];
+    require(
+        frozen_slot.root_world.position.x == 0.0F &&
+            frozen_slot.root_world.position.y == 0.0F &&
+            frozen_slot.root_world.position.z == 0.50F &&
+            frozen_slot.route_length_m == 0.80F,
+        "table-revalidation fixture froze unexpected slot geometry");
+
+    scenario.observation.displayed_root.position =
+        vec3(-0.20F, 0.0F, 1.10F);
+    const interaction::PickAssistOutput output =
+        assist.observe(scenario.observation);
+    const interaction::PickAssistDiagnostics& failed =
+        assist.diagnostics();
+    require(
+        failed.state == interaction::PickAssistState::Failed &&
+            failed.reason == interaction::PickAssistReason::TableBlocked,
+        "newly blocked frozen route did not fail immediately with TableBlocked");
+    require(
+        !assist.active() && !assist.owns_manual_interact() &&
+            !output.submit_interact &&
+            !assist.take_submission(72U).has_value(),
+        "table-blocked frozen route retained ownership or submitted");
+    require_frozen_slot_provenance_unchanged(
+        frozen_before,
+        failed,
+        "table-blocked frozen route reselected or changed frozen diagnostics");
+}
+
+void test_slot_approach_revalidates_frozen_route_against_obstacles() {
+    FrozenSlotScenario scenario;
+    scenario.start.obstacles.push_back({
+        vec3(-0.10F, 0.0F, 1.20F),
+        vec3(0.02F, 0.10F, 0.02F),
+    });
+    interaction::ControllerPickAssist assist;
+
+    require(
+        assist.begin(scenario.start, &scenario.target),
+        "obstacle-revalidation fixture begin failed");
+    const interaction::PickAssistDiagnostics frozen_before =
+        assist.diagnostics();
+    require(
+        frozen_before.state == interaction::PickAssistState::SlotApproach &&
+            frozen_before.selected_slot_id == 9U &&
+            frozen_before.slot_selection.selected_index.has_value(),
+        "obstacle-revalidation fixture did not select slot ID 9");
+    const size_t selected =
+        *frozen_before.slot_selection.selected_index;
+    const interaction::MappedPickSlot& frozen_slot =
+        frozen_before.slot_selection.ordered[selected];
+    require(
+        frozen_slot.root_world.position.x == 0.0F &&
+            frozen_slot.root_world.position.y == 0.0F &&
+            frozen_slot.root_world.position.z == 0.50F &&
+            frozen_slot.route_length_m == 0.80F,
+        "obstacle-revalidation fixture froze unexpected slot geometry");
+
+    scenario.observation.displayed_root.position =
+        vec3(-0.20F, 0.0F, 1.30F);
+    const interaction::PickAssistOutput output =
+        assist.observe(scenario.observation);
+    const interaction::PickAssistDiagnostics& failed =
+        assist.diagnostics();
+    require(
+        failed.state == interaction::PickAssistState::Failed &&
+            failed.reason == interaction::PickAssistReason::ObstacleBlocked,
+        "newly blocked frozen route did not fail immediately with ObstacleBlocked");
+    require(
+        !assist.active() && !assist.owns_manual_interact() &&
+            !output.submit_interact &&
+            !assist.take_submission(73U).has_value(),
+        "obstacle-blocked frozen route retained ownership or submitted");
+    require_frozen_slot_provenance_unchanged(
+        frozen_before,
+        failed,
+        "obstacle-blocked frozen route reselected or changed frozen diagnostics");
 }
 
 void require_frozen_slot_begin_failure(
@@ -1872,6 +2022,8 @@ int main() {
         test_begin_selects_and_freezes_one_authored_slot();
         test_slot_approach_emits_far_camera_relative_steering();
         test_slot_approach_accumulates_inclusive_travel_and_rejects_overshoot();
+        test_slot_approach_revalidates_frozen_route_against_table();
+        test_slot_approach_revalidates_frozen_route_against_obstacles();
         test_begin_maps_every_aggregate_no_winner_reason();
         test_slot_reason_mapping_is_exhaustive_and_same_named();
         test_failed_begin_can_immediately_begin_a_valid_attempt();
