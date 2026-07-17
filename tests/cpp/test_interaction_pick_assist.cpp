@@ -267,6 +267,67 @@ void test_begin_selects_and_freezes_one_authored_slot() {
 }
 
 void test_slot_approach_emits_far_camera_relative_steering() {
+    const auto same_float_bits = [](float left, float right) {
+        return std::memcmp(&left, &right, sizeof(left)) == 0;
+    };
+    const auto same_vec3_bits = [&](vec3 left, vec3 right) {
+        return same_float_bits(left.x, right.x) &&
+            same_float_bits(left.y, right.y) &&
+            same_float_bits(left.z, right.z);
+    };
+    const auto same_quat_bits = [&](quat left, quat right) {
+        return same_float_bits(left.w, right.w) &&
+            same_float_bits(left.x, right.x) &&
+            same_float_bits(left.y, right.y) &&
+            same_float_bits(left.z, right.z);
+    };
+    const auto same_transform_bits = [&](
+        interaction::Transform left,
+        interaction::Transform right) {
+        return same_vec3_bits(left.position, right.position) &&
+            same_quat_bits(left.rotation, right.rotation);
+    };
+    const auto same_mapped_slot = [&](
+        const interaction::MappedPickSlot& left,
+        const interaction::MappedPickSlot& right) {
+        return left.id == right.id &&
+            same_transform_bits(left.root_world, right.root_world) &&
+            same_float_bits(left.route_length_m, right.route_length_m) &&
+            same_float_bits(
+                left.heading_change_radians,
+                right.heading_change_radians) &&
+            same_float_bits(
+                left.object_origin_distance_m,
+                right.object_origin_distance_m) &&
+            same_float_bits(
+                left.object_bounds_center_distance_m,
+                right.object_bounds_center_distance_m) &&
+            left.route_millimetres == right.route_millimetres &&
+            left.heading_milliradians == right.heading_milliradians &&
+            left.reason == right.reason &&
+            left.obstacle_index == right.obstacle_index;
+    };
+    const auto same_frozen_provenance = [&](
+        const interaction::PickAssistDiagnostics& left,
+        const interaction::PickAssistDiagnostics& right) {
+        if (left.selected_slot != right.selected_slot ||
+            left.selected_slot_id != right.selected_slot_id ||
+            left.slot_selection.selected_index !=
+                right.slot_selection.selected_index ||
+            left.slot_selection.reason != right.slot_selection.reason ||
+            left.slot_selection.ordered.size() !=
+                right.slot_selection.ordered.size() ||
+            !left.slot_selection.selected_index.has_value() ||
+            !same_float_bits(left.route_length_m, right.route_length_m)) {
+            return false;
+        }
+        const size_t selected = *left.slot_selection.selected_index;
+        return selected < left.slot_selection.ordered.size() &&
+            same_mapped_slot(
+                left.slot_selection.ordered[selected],
+                right.slot_selection.ordered[selected]);
+    };
+
     FrozenSlotScenario scenario;
     interaction::ControllerPickAssist assist;
 
@@ -283,6 +344,15 @@ void test_slot_approach_emits_far_camera_relative_steering() {
         frozen_slot.id == 9U && frozen_slot.route_length_m == 0.80F,
         "far-approach fixture did not select the exact 0.80 m slot");
 
+    const interaction::InteractionTarget target_before = scenario.target;
+    const interaction::Transform target_pose_before =
+        scenario.target.object_world;
+    const interaction::Transform start_pose_before =
+        scenario.start.root_world;
+    const interaction::Transform displayed_root_before =
+        scenario.observation.displayed_root;
+    const interaction::PickAssistDiagnostics diagnostics_before =
+        assist.diagnostics();
     const interaction::PickAssistOutput output =
         assist.observe(scenario.observation);
     require(
@@ -291,6 +361,100 @@ void test_slot_approach_emits_far_camera_relative_steering() {
             output.left_stick.y == 0.0F &&
             output.left_stick.z == 0.0F,
         "far SlotApproach did not emit ordinary camera-relative steering");
+    require(
+        !output.needs_preview && is_zero(output.right_stick) &&
+            !output.force_strafe && !output.stationary_constraint &&
+            !output.submit_interact,
+        "far SlotApproach emitted preview, facing, strafe, stationary, or submission output");
+    require(
+        interaction::same_interaction_target_snapshot(
+            scenario.target, target_before) &&
+            interaction::same_interaction_target_snapshot(
+                scenario.start.target_snapshot,
+                target_before) &&
+            same_transform_bits(
+                scenario.target.object_world, target_pose_before) &&
+            same_transform_bits(scenario.start.root_world, start_pose_before) &&
+            same_transform_bits(
+                scenario.observation.displayed_root,
+                displayed_root_before),
+        "far SlotApproach mutated an input target or pose");
+    require(
+        assist.diagnostics().state ==
+                interaction::PickAssistState::SlotApproach &&
+            same_frozen_provenance(
+                assist.diagnostics(), diagnostics_before),
+        "far SlotApproach changed its frozen slot provenance");
+
+    FrozenSlotScenario rotated_scenario;
+    rotated_scenario.observation.camera_azimuth = 0.50F * PIf;
+    interaction::ControllerPickAssist rotated_assist;
+    require(
+        rotated_assist.begin(
+            rotated_scenario.start, &rotated_scenario.target),
+        "rotated far-approach begin failed");
+    const interaction::PickAssistDiagnostics rotated_before =
+        rotated_assist.diagnostics();
+    require(
+        rotated_before.route_length_m == 0.80F &&
+            same_frozen_provenance(rotated_before, diagnostics_before),
+        "rotated far-approach fixture did not freeze the same exact 0.80 m slot");
+    const interaction::InteractionTarget rotated_target_before =
+        rotated_scenario.target;
+    const interaction::Transform rotated_target_pose_before =
+        rotated_scenario.target.object_world;
+    const interaction::Transform rotated_start_pose_before =
+        rotated_scenario.start.root_world;
+    const interaction::Transform rotated_displayed_root_before =
+        rotated_scenario.observation.displayed_root;
+
+    const interaction::PickAssistOutput rotated_output =
+        rotated_assist.observe(rotated_scenario.observation);
+    const vec3 expected_rotated = quat_inv_mul_vec3(
+        quat_from_angle_axis(
+            rotated_scenario.observation.camera_azimuth,
+            vec3(0.0F, 1.0F, 0.0F)),
+        vec3(1.0F, 0.0F, 0.0F));
+    require(
+        rotated_output.override_steering &&
+            !same_vec3_bits(rotated_output.left_stick, output.left_stick),
+        "camera azimuth did not change far camera-relative stick coordinates");
+    require_near(
+        rotated_output.left_stick,
+        expected_rotated,
+        2.0e-5F,
+        "rotated far SlotApproach command was not camera relative");
+    require(
+        !rotated_output.needs_preview &&
+            is_zero(rotated_output.right_stick) &&
+            !rotated_output.force_strafe &&
+            !rotated_output.stationary_constraint &&
+            !rotated_output.submit_interact,
+        "rotated far SlotApproach changed output beyond left-stick coordinates");
+    require(
+        interaction::same_interaction_target_snapshot(
+            rotated_scenario.target, rotated_target_before) &&
+            interaction::same_interaction_target_snapshot(
+                rotated_scenario.start.target_snapshot,
+                rotated_target_before) &&
+            same_transform_bits(
+                rotated_scenario.target.object_world,
+                rotated_target_pose_before) &&
+            same_transform_bits(
+                rotated_scenario.start.root_world,
+                rotated_start_pose_before) &&
+            same_transform_bits(
+                rotated_scenario.observation.displayed_root,
+                rotated_displayed_root_before),
+        "rotated far SlotApproach mutated an input target or pose");
+    require(
+        rotated_assist.diagnostics().state ==
+                interaction::PickAssistState::SlotApproach &&
+            same_frozen_provenance(
+                rotated_assist.diagnostics(), rotated_before) &&
+            same_frozen_provenance(
+                rotated_assist.diagnostics(), assist.diagnostics()),
+        "camera azimuth changed frozen slot ID, index, root, or route provenance");
 }
 
 void require_frozen_slot_begin_failure(
