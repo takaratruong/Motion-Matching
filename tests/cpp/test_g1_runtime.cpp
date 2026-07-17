@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 
 static void check(bool value, const char* message)
@@ -151,6 +152,74 @@ static g1_runtime_frame_feasibility make_feasibility_view(
     return feasibility;
 }
 
+struct scripted_joint_preview
+{
+    int reject_selected = -1;
+    bool reject_all = false;
+    int fatal_selected = -1;
+    bool malformed_rejection = false;
+    int selected[64] = {};
+    int emitted[64] = {};
+    int count = 0;
+    int accepted_selected = -1;
+    quat accepted_rotations[G1_BoneCount] = {};
+    vec3 accepted_angular_velocities[G1_BoneCount] = {};
+};
+
+static g1_runtime_joint_preview_verdict evaluate_scripted_joint_preview(
+    void* raw,
+    int selected_database_frame,
+    int emitted_database_frame,
+    slice1d<quat> local_rotations,
+    slice1d<vec3> local_angular_velocities,
+    int& rejected_joint_index,
+    float& rejected_joint_position,
+    char* error,
+    int capacity)
+{
+    scripted_joint_preview& script =
+        *static_cast<scripted_joint_preview*>(raw);
+    check(script.count < 64, "preview script call capacity is sufficient");
+    script.selected[script.count] = selected_database_frame;
+    script.emitted[script.count] = emitted_database_frame;
+    ++script.count;
+    if (selected_database_frame == script.fatal_selected) {
+        std::snprintf(
+            error,
+            static_cast<std::size_t>(capacity),
+            "scripted joint preview fatal");
+        return G1RuntimeJointPreviewFatal;
+    }
+    if (script.reject_all ||
+        selected_database_frame == script.reject_selected) {
+        rejected_joint_index = script.malformed_rejection ? -1 : 5;
+        rejected_joint_position = script.malformed_rejection
+            ? std::numeric_limits<float>::quiet_NaN()
+            : -0.30f;
+        return G1RuntimeJointPreviewRejectLimit;
+    }
+    check(local_rotations.size == G1_BoneCount,
+          "preview rotation shape is fixed");
+    check(local_angular_velocities.size == G1_BoneCount,
+          "preview angular velocity shape is fixed");
+    script.accepted_selected = selected_database_frame;
+    for (int bone = 0; bone < G1_BoneCount; ++bone) {
+        script.accepted_rotations[bone] = local_rotations(bone);
+        script.accepted_angular_velocities[bone] =
+            local_angular_velocities(bone);
+    }
+    return G1RuntimeJointPreviewAccept;
+}
+
+static g1_runtime_joint_preview_validator make_scripted_preview_validator(
+    scripted_joint_preview& script)
+{
+    g1_runtime_joint_preview_validator validator;
+    validator.context = &script;
+    validator.evaluate = evaluate_scripted_joint_preview;
+    return validator;
+}
+
 static std::uint64_t hash_bytes(
     std::uint64_t hash, const void* memory, std::size_t size)
 {
@@ -273,6 +342,11 @@ static g1_runtime_step_result sentinel_result()
     result.raw_selected.hips_y = 700.0f;
     result.inertialized.hips_y = 701.0f;
     result.projected.hips_y = 702.0f;
+    result.candidate_preview.candidate_preview_count = 81;
+    result.candidate_preview.candidate_limit_rejection_count = 82;
+    result.candidate_preview.first_rejected_database_frame = 83;
+    result.candidate_preview.first_rejected_joint_index = 84;
+    result.candidate_preview.first_rejected_joint_position = 85.0f;
     return result;
 }
 
@@ -348,6 +422,51 @@ static void check_failed_feasible_step_is_transactional(
           "failed feasible runtime step preserves state transactionally");
     check(std::memcmp(result_before, &result, sizeof(result)) == 0,
           "failed feasible runtime step preserves the complete result");
+}
+
+static void check_failed_preview_step_is_transactional(
+    g1_controller_state& state,
+    database& db,
+    const terrain_support_set& support,
+    const scene_pack& scene,
+    const g1_runtime_frame_feasibility& feasibility,
+    const g1_runtime_step_request& request,
+    const g1_runtime_config& config,
+    scripted_joint_preview& script,
+    const char* expected_error,
+    bool exact_error)
+{
+    g1_runtime_step_result result = sentinel_result();
+    unsigned char result_before[sizeof(result)];
+    std::memcpy(result_before, &result, sizeof(result));
+    const state_guard state_before = guard_state(state);
+    const g1_runtime_joint_preview_validator validator =
+        make_scripted_preview_validator(script);
+    char error[512] = {};
+    check(!g1_runtime_step(
+              result,
+              state,
+              db,
+              support,
+              scene,
+              feasibility,
+              request,
+              config,
+              validator,
+              error,
+              static_cast<int>(sizeof(error))),
+          "invalid preview runtime step is rejected");
+    if (exact_error) {
+        check(std::string(error) == expected_error,
+              "preview failure publishes the exact diagnostic");
+    } else {
+        check(std::string(error).find(expected_error) != std::string::npos,
+              "preview failure publishes the checked diagnostic");
+    }
+    check(state_is_unchanged(state, state_before),
+          "failed preview step preserves state transactionally");
+    check(std::memcmp(result_before, &result, sizeof(result)) == 0,
+          "failed preview step preserves the complete result");
 }
 
 static void capture_legacy_query(
@@ -645,6 +764,216 @@ static void test_feasible_runtime_progression_and_masked_search()
           "forced masked search preserves the current-frame neighborhood");
 }
 
+static void test_joint_preview_selection_and_live_parity()
+{
+    database db;
+    make_database(db);
+    scene_pack scene = make_scene();
+    terrain_support_set support;
+    make_support(support, db.nframes());
+    array1d<unsigned char> raw_safe(db.nframes());
+    array1d<unsigned char> search_safe(db.nframes());
+    raw_safe.set(1);
+    search_safe.set(1);
+    const g1_runtime_frame_feasibility feasibility = make_feasibility_view(
+        raw_safe, search_safe, db.nframes());
+    const g1_runtime_config config;
+    char error[512] = {};
+
+    g1_controller_state state;
+    reset_runtime_state(state, db, support, scene);
+    for (int bone = 2; bone < G1_BoneCount; ++bone) {
+        const float scale = static_cast<float>(bone + 1);
+        state.bone_offset_rotations(bone) = quat_from_angle_axis(
+            0.001f * scale,
+            vec3(1.0f, 0.0f, 0.0f));
+        state.bone_offset_angular_velocities(bone) =
+            vec3(0.0003f * scale, -0.0002f * scale, 0.0001f * scale);
+        db.bone_rotations(20, bone) = quat_from_angle_axis(
+            0.002f * scale,
+            vec3(0.0f, 0.0f, 1.0f));
+        db.bone_rotations(21, bone) = quat_from_angle_axis(
+            -0.0015f * scale,
+            vec3(0.0f, 1.0f, 0.0f));
+        db.bone_angular_velocities(20, bone) =
+            vec3(-0.003f * scale, 0.002f * scale, 0.001f * scale);
+        db.bone_angular_velocities(21, bone) =
+            vec3(0.0025f * scale, -0.001f * scale, 0.0015f * scale);
+    }
+    state.search_timer = 100.0f;
+    scripted_joint_preview reject_ordinary;
+    reject_ordinary.reject_selected = 0;
+    const g1_runtime_joint_preview_validator reject_validator =
+        make_scripted_preview_validator(reject_ordinary);
+    g1_runtime_step_result result;
+    check(g1_runtime_step(
+              result,
+              state,
+              db,
+              support,
+              scene,
+              feasibility,
+              make_direct_request(false),
+              config,
+              reject_validator,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+    check(state.searched && state.transitioned,
+          "a rejected ordinary preview forces search when matching is disabled");
+    check(result.selected_database_frame == 20 && state.frame_index == 21,
+          "the next cost-ordered accepted preview becomes live");
+    check(reject_ordinary.count == 2,
+          "ordinary and accepted transition candidates are each previewed once");
+    check(reject_ordinary.selected[0] == 0 &&
+              reject_ordinary.emitted[0] == 1 &&
+              reject_ordinary.selected[1] == 20 &&
+              reject_ordinary.emitted[1] == 21,
+          "preview receives selected and range-clamped emitted frames");
+    check(result.candidate_preview.candidate_preview_count == 2 &&
+              result.candidate_preview.candidate_limit_rejection_count == 1,
+          "preview audit counts exact projection attempts and rejections");
+    check(result.candidate_preview.first_rejected_database_frame == 0 &&
+              result.candidate_preview.first_rejected_joint_index == 5 &&
+              same_float_bits(
+                  result.candidate_preview.first_rejected_joint_position,
+                  -0.30f),
+          "preview audit preserves the first structured rejection");
+    check(reject_ordinary.accepted_selected == 20,
+          "accepted preview cache identifies the live transition");
+    for (int bone = 2; bone < G1_BoneCount; ++bone) {
+        check(same_quat_bits(
+                  reject_ordinary.accepted_rotations[bone],
+                  state.bone_rotations(bone)),
+              "accepted preview rotation matches the live source joint bits");
+        check(same_vec3_bits(
+                  reject_ordinary.accepted_angular_velocities[bone],
+                  state.bone_angular_velocities(bone)),
+              "accepted preview angular velocity matches live source joint bits");
+    }
+
+    reset_runtime_state(state, db, support, scene);
+    state.search_timer = 0.0f;
+    scripted_joint_preview cached_ordinary;
+    const g1_runtime_joint_preview_validator cached_validator =
+        make_scripted_preview_validator(cached_ordinary);
+    std::memset(error, 0, sizeof(error));
+    check(g1_runtime_step(
+              result,
+              state,
+              db,
+              support,
+              scene,
+              feasibility,
+              make_direct_request(true),
+              config,
+              cached_validator,
+              error,
+              static_cast<int>(sizeof(error))),
+          error);
+    check(state.searched && !state.transitioned,
+          "a scheduled search retains its valid ordinary incumbent");
+    check(result.selected_database_frame == 0 && state.frame_index == 1,
+          "the cached ordinary preview advances exactly once");
+    check(cached_ordinary.count == 1 &&
+              result.candidate_preview.candidate_preview_count == 1 &&
+              result.candidate_preview.candidate_limit_rejection_count == 0,
+          "the prevalidated incumbent is not projected twice");
+    check(result.candidate_preview.first_rejected_database_frame == -1 &&
+              result.candidate_preview.first_rejected_joint_index == -1 &&
+              same_float_bits(
+                  result.candidate_preview.first_rejected_joint_position,
+                  0.0f),
+          "zero rejection audit uses exact sentinels");
+}
+
+static void test_joint_preview_failures_are_transactional()
+{
+    database db;
+    make_database(db);
+    scene_pack scene = make_scene();
+    terrain_support_set support;
+    make_support(support, db.nframes());
+    array1d<unsigned char> raw_safe(db.nframes());
+    array1d<unsigned char> search_safe(db.nframes());
+    raw_safe.set(1);
+    search_safe.set(1);
+    g1_runtime_frame_feasibility feasibility = make_feasibility_view(
+        raw_safe, search_safe, db.nframes());
+    const g1_runtime_step_request request = make_direct_request(false);
+    const g1_runtime_config config;
+    g1_controller_state state;
+
+    reset_runtime_state(state, db, support, scene);
+    scripted_joint_preview fatal;
+    fatal.fatal_selected = 0;
+    check_failed_preview_step_is_transactional(
+        state,
+        db,
+        support,
+        scene,
+        feasibility,
+        request,
+        config,
+        fatal,
+        "scripted joint preview fatal",
+        true);
+
+    reset_runtime_state(state, db, support, scene);
+    scripted_joint_preview malformed;
+    malformed.reject_selected = 0;
+    malformed.malformed_rejection = true;
+    check_failed_preview_step_is_transactional(
+        state,
+        db,
+        support,
+        scene,
+        feasibility,
+        request,
+        config,
+        malformed,
+        "preview rejection diagnostic is invalid",
+        false);
+
+    reset_runtime_state(state, db, support, scene);
+    scripted_joint_preview all_rejected;
+    all_rejected.reject_all = true;
+    check_failed_preview_step_is_transactional(
+        state,
+        db,
+        support,
+        scene,
+        feasibility,
+        request,
+        config,
+        all_rejected,
+        "no inertialized-joint-safe database candidate",
+        true);
+    check(all_rejected.count > 1,
+          "dynamic exhaustion previews ordinary and search candidates");
+
+    raw_safe.set(1);
+    raw_safe(1) = 0;
+    search_safe.zero();
+    feasibility = make_feasibility_view(
+        raw_safe, search_safe, db.nframes());
+    reset_runtime_state(state, db, support, scene);
+    scripted_joint_preview no_raw_candidate;
+    check_failed_preview_step_is_transactional(
+        state,
+        db,
+        support,
+        scene,
+        feasibility,
+        request,
+        config,
+        no_raw_candidate,
+        "no joint-limit-safe database candidate",
+        true);
+    check(no_raw_candidate.count == 0,
+          "raw-safe exhaustion performs no dynamic projection");
+}
+
 static void test_feasible_runtime_failures_are_transactional()
 {
     database db;
@@ -713,5 +1042,7 @@ int main()
     test_direct_runtime_boundary_and_advance();
     test_feasible_runtime_progression_and_masked_search();
     test_feasible_runtime_failures_are_transactional();
+    test_joint_preview_selection_and_live_parity();
+    test_joint_preview_failures_are_transactional();
     return 0;
 }

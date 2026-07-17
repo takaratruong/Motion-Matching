@@ -22,6 +22,37 @@ struct g1_runtime_step_request
     bool matching_enabled = true;
 };
 
+enum g1_runtime_joint_preview_verdict
+{
+    G1RuntimeJointPreviewAccept,
+    G1RuntimeJointPreviewRejectLimit,
+    G1RuntimeJointPreviewFatal
+};
+
+struct g1_runtime_candidate_preview_diagnostic
+{
+    int candidate_preview_count = 0;
+    int candidate_limit_rejection_count = 0;
+    int first_rejected_database_frame = -1;
+    int first_rejected_joint_index = -1;
+    float first_rejected_joint_position = 0.0f;
+};
+
+struct g1_runtime_joint_preview_validator
+{
+    void* context = nullptr;
+    g1_runtime_joint_preview_verdict (*evaluate)(
+        void*,
+        int,
+        int,
+        slice1d<quat>,
+        slice1d<vec3>,
+        int&,
+        float&,
+        char*,
+        int) = nullptr;
+};
+
 struct g1_runtime_step_result
 {
     int query_database_frame = -1;
@@ -33,6 +64,7 @@ struct g1_runtime_step_result
     motion_match_pose_diagnostic raw_selected;
     motion_match_pose_diagnostic inertialized;
     motion_match_pose_diagnostic projected;
+    g1_runtime_candidate_preview_diagnostic candidate_preview;
 };
 
 struct g1_runtime_frame_feasibility
@@ -323,6 +355,238 @@ inline G1_RUNTIME_COMPILER_BOUNDARY void inertialize_pose_update(
     }
 }
 
+struct g1_runtime_pose_scratch
+{
+    array1d<vec3> bone_positions;
+    array1d<vec3> bone_velocities;
+    array1d<quat> bone_rotations;
+    array1d<vec3> bone_angular_velocities;
+    array1d<vec3> bone_offset_positions;
+    array1d<vec3> bone_offset_velocities;
+    array1d<quat> bone_offset_rotations;
+    array1d<vec3> bone_offset_angular_velocities;
+    vec3 transition_src_position;
+    quat transition_src_rotation;
+    vec3 transition_dst_position;
+    quat transition_dst_rotation;
+
+    void reset(const g1_controller_state& source)
+    {
+        bone_positions = source.bone_positions;
+        bone_velocities = source.bone_velocities;
+        bone_rotations = source.bone_rotations;
+        bone_angular_velocities = source.bone_angular_velocities;
+        bone_offset_positions = source.bone_offset_positions;
+        bone_offset_velocities = source.bone_offset_velocities;
+        bone_offset_rotations = source.bone_offset_rotations;
+        bone_offset_angular_velocities =
+            source.bone_offset_angular_velocities;
+        transition_src_position = source.transition_src_position;
+        transition_src_rotation = source.transition_src_rotation;
+        transition_dst_position = source.transition_dst_position;
+        transition_dst_rotation = source.transition_dst_rotation;
+    }
+};
+
+template<typename PoseState>
+static inline void g1_runtime_pose_advance(
+    PoseState& pose,
+    database& db,
+    const slice1d<vec3> current_raw_positions,
+    const slice1d<vec3> current_raw_velocities,
+    const slice1d<quat> current_raw_rotations,
+    const slice1d<vec3> current_raw_angular_velocities,
+    const int prior_database_frame,
+    const int selected_database_frame,
+    const int emitted_database_frame,
+    const float halflife,
+    const float dt)
+{
+    if (selected_database_frame != prior_database_frame)
+    {
+        inertialize_pose_transition(
+            pose.bone_offset_positions,
+            pose.bone_offset_velocities,
+            pose.bone_offset_rotations,
+            pose.bone_offset_angular_velocities,
+            pose.transition_src_position,
+            pose.transition_src_rotation,
+            pose.transition_dst_position,
+            pose.transition_dst_rotation,
+            pose.bone_positions(0),
+            pose.bone_velocities(0),
+            pose.bone_rotations(0),
+            pose.bone_angular_velocities(0),
+            current_raw_positions,
+            current_raw_velocities,
+            current_raw_rotations,
+            current_raw_angular_velocities,
+            db.bone_positions(selected_database_frame),
+            db.bone_velocities(selected_database_frame),
+            db.bone_rotations(selected_database_frame),
+            db.bone_angular_velocities(selected_database_frame));
+    }
+
+    inertialize_pose_update(
+        pose.bone_positions,
+        pose.bone_velocities,
+        pose.bone_rotations,
+        pose.bone_angular_velocities,
+        pose.bone_offset_positions,
+        pose.bone_offset_velocities,
+        pose.bone_offset_rotations,
+        pose.bone_offset_angular_velocities,
+        db.bone_positions(emitted_database_frame),
+        db.bone_velocities(emitted_database_frame),
+        db.bone_rotations(emitted_database_frame),
+        db.bone_angular_velocities(emitted_database_frame),
+        pose.transition_src_position,
+        pose.transition_src_rotation,
+        pose.transition_dst_position,
+        pose.transition_dst_rotation,
+        halflife,
+        dt);
+}
+
+struct g1_runtime_joint_preview_context
+{
+    const g1_controller_state* baseline = nullptr;
+    database* db = nullptr;
+    const g1_runtime_joint_preview_validator* validator = nullptr;
+    g1_runtime_candidate_preview_diagnostic* diagnostic = nullptr;
+    int prior_database_frame = -1;
+    float halflife = 0.0f;
+    float dt = 0.0f;
+    char* error = nullptr;
+    int capacity = 0;
+    g1_runtime_pose_scratch scratch;
+};
+
+static inline g1_runtime_joint_preview_verdict
+g1_runtime_preview_joint_candidate(
+    g1_runtime_joint_preview_context& context,
+    const int selected_database_frame)
+{
+    if (context.baseline == nullptr || context.db == nullptr ||
+        context.validator == nullptr ||
+        context.validator->evaluate == nullptr ||
+        context.diagnostic == nullptr ||
+        selected_database_frame < 0 ||
+        selected_database_frame >= context.db->nframes())
+    {
+        scene_error(
+            context.error,
+            context.capacity,
+            "joint preview context is invalid");
+        return G1RuntimeJointPreviewFatal;
+    }
+
+    const int emitted_database_frame = database_trajectory_index_clamp(
+        *context.db, selected_database_frame, 1);
+    if (emitted_database_frame == selected_database_frame)
+    {
+        scene_error(
+            context.error,
+            context.capacity,
+            "joint preview candidate has no emitted successor");
+        return G1RuntimeJointPreviewFatal;
+    }
+
+    context.scratch.reset(*context.baseline);
+    g1_runtime_pose_advance(
+        context.scratch,
+        *context.db,
+        context.baseline->curr_bone_positions,
+        context.baseline->curr_bone_velocities,
+        context.baseline->curr_bone_rotations,
+        context.baseline->curr_bone_angular_velocities,
+        context.prior_database_frame,
+        selected_database_frame,
+        emitted_database_frame,
+        context.halflife,
+        context.dt);
+
+    int rejected_joint_index = -1;
+    float rejected_joint_position = 0.0f;
+    char callback_error[1024] = {};
+    ++context.diagnostic->candidate_preview_count;
+    const g1_runtime_joint_preview_verdict verdict =
+        context.validator->evaluate(
+            context.validator->context,
+            selected_database_frame,
+            emitted_database_frame,
+            context.scratch.bone_rotations,
+            context.scratch.bone_angular_velocities,
+            rejected_joint_index,
+            rejected_joint_position,
+            callback_error,
+            static_cast<int>(sizeof(callback_error)));
+    if (verdict == G1RuntimeJointPreviewAccept)
+    {
+        return verdict;
+    }
+    if (verdict == G1RuntimeJointPreviewRejectLimit)
+    {
+        if (rejected_joint_index < 0 ||
+            rejected_joint_index >= G1_BoneCount - 2 ||
+            !terrain_float_is_finite(rejected_joint_position))
+        {
+            scene_error(
+                context.error,
+                context.capacity,
+                "joint preview rejection diagnostic is invalid");
+            return G1RuntimeJointPreviewFatal;
+        }
+        ++context.diagnostic->candidate_limit_rejection_count;
+        if (context.diagnostic->first_rejected_database_frame == -1)
+        {
+            context.diagnostic->first_rejected_database_frame =
+                selected_database_frame;
+            context.diagnostic->first_rejected_joint_index =
+                rejected_joint_index;
+            context.diagnostic->first_rejected_joint_position =
+                rejected_joint_position;
+        }
+        return verdict;
+    }
+
+    if (callback_error[0] != '\0')
+    {
+        scene_error(
+            context.error,
+            context.capacity,
+            "%s",
+            callback_error);
+    }
+    else
+    {
+        scene_error(
+            context.error,
+            context.capacity,
+            "joint preview validator failed without a diagnostic");
+    }
+    return G1RuntimeJointPreviewFatal;
+}
+
+static inline database_candidate_verdict g1_runtime_validate_database_candidate(
+    void* raw,
+    const int selected_database_frame)
+{
+    g1_runtime_joint_preview_context& context =
+        *static_cast<g1_runtime_joint_preview_context*>(raw);
+    const g1_runtime_joint_preview_verdict verdict =
+        g1_runtime_preview_joint_candidate(context, selected_database_frame);
+    if (verdict == G1RuntimeJointPreviewAccept)
+    {
+        return DatabaseCandidateAccept;
+    }
+    if (verdict == G1RuntimeJointPreviewRejectLimit)
+    {
+        return DatabaseCandidateReject;
+    }
+    return DatabaseCandidateFatal;
+}
+
 inline void query_copy_denormalized_feature(
     slice1d<float> query,
     int& offset,
@@ -611,6 +875,7 @@ static inline bool g1_runtime_step_internal(
     const terrain_support_set& support_rows,
     const scene_pack& active_scene,
     const g1_runtime_frame_feasibility* feasibility,
+    const g1_runtime_joint_preview_validator* joint_preview_validator,
     const g1_runtime_step_request& request,
     const g1_runtime_config& config,
     PredictionBuilder prediction_builder,
@@ -648,6 +913,13 @@ static inline bool g1_runtime_step_internal(
          feasibility->count != db.nframes())) {
         return scene_error(
             error, capacity, "runtime step feasibility shape is invalid");
+    }
+    if (joint_preview_validator != nullptr &&
+        joint_preview_validator->evaluate == nullptr) {
+        return scene_error(
+            error,
+            capacity,
+            "runtime step joint preview validator is invalid");
     }
 
     g1_controller_state next;
@@ -872,44 +1144,132 @@ static inline bool g1_runtime_step_internal(
             error, capacity, "expected exactly 31 finite query values");
     }
 
+    const int prior_index = next.frame_index;
     const int ordinary_successor = database_trajectory_index_clamp(
-        db, next.frame_index, 1);
-    const bool end_of_anim = ordinary_successor == next.frame_index;
+        db, prior_index, 1);
+    const bool end_of_anim = ordinary_successor == prior_index;
     const bool unsafe_successor = feasibility != nullptr &&
         feasibility->raw_safe[ordinary_successor] != 1;
+    g1_runtime_candidate_preview_diagnostic candidate_preview;
+    g1_runtime_joint_preview_context preview_context;
+    preview_context.baseline = &next;
+    preview_context.db = &db;
+    preview_context.validator = joint_preview_validator;
+    preview_context.diagnostic = &candidate_preview;
+    preview_context.prior_database_frame = prior_index;
+    preview_context.halflife = config.inertialize_blending_halflife;
+    preview_context.dt = dt;
+    preview_context.error = error;
+    preview_context.capacity = capacity;
+
+    bool rejected_ordinary_successor = false;
+    if (joint_preview_validator != nullptr &&
+        !end_of_anim && !unsafe_successor)
+    {
+        const g1_runtime_joint_preview_verdict ordinary_verdict =
+            g1_runtime_preview_joint_candidate(preview_context, prior_index);
+        if (ordinary_verdict == G1RuntimeJointPreviewFatal)
+        {
+            return false;
+        }
+        rejected_ordinary_successor =
+            ordinary_verdict == G1RuntimeJointPreviewRejectLimit;
+    }
+
+    const bool incumbent_available =
+        !end_of_anim && !unsafe_successor && !rejected_ordinary_successor;
     next.searched = unsafe_successor ||
+        (joint_preview_validator != nullptr &&
+         (rejected_ordinary_successor || end_of_anim)) ||
         (request.matching_enabled &&
          (force_search || next.search_timer <= 0.0f || end_of_anim));
     next.incumbent_cost = 0.0f;
     next.selected_cost = 0.0f;
     next.selected_terrain_error = 0.0f;
-    next.incumbent_cost = end_of_anim || unsafe_successor
-        ? FLT_MAX : database_frame_cost(db, next.frame_index, query);
+    next.incumbent_cost = incumbent_available
+        ? database_frame_cost(db, prior_index, query) : FLT_MAX;
     next.selected_cost = next.incumbent_cost;
     next.selected_terrain_error = database_raw_terrain_error(
-        db, next.frame_index, query);
+        db, prior_index, query);
     int selected_database_frame = query_database_frame;
 
     if (next.searched)
     {
-        const int prior_index = next.frame_index;
-        int best_index = end_of_anim ? -1 : prior_index;
+        int best_index = joint_preview_validator != nullptr
+            ? (incumbent_available ? prior_index : -1)
+            : (end_of_anim ? -1 : prior_index);
         float best_cost = FLT_MAX;
         const float transition_cost =
             g1_idle_match_transition_cost(
                 traversal.commanded_speed,
                 walkability_xz_length(next.simulation_velocity));
-        database_search(
-            best_index,
-            best_cost,
-            db,
-            query,
-            transition_cost,
-            20,
-            20,
-            feasibility == nullptr ? nullptr : feasibility->search_safe,
-            feasibility == nullptr ? 0 : feasibility->count);
-        if (feasibility != nullptr && best_index == -1) {
+        if (joint_preview_validator != nullptr)
+        {
+            database_candidate_validator database_validator;
+            database_validator.context = &preview_context;
+            database_validator.evaluate =
+                g1_runtime_validate_database_candidate;
+            const database_search_status search_status =
+                database_search_validated(
+                    best_index,
+                    best_cost,
+                    db,
+                    query,
+                    transition_cost,
+                    20,
+                    20,
+                    feasibility == nullptr
+                        ? nullptr : feasibility->search_safe,
+                    feasibility == nullptr ? 0 : feasibility->count,
+                    prior_index,
+                    &database_validator);
+            if (search_status == DatabaseSearchInvalidInput)
+            {
+                return scene_error(
+                    error,
+                    capacity,
+                    "validated database search input is invalid");
+            }
+            if (search_status == DatabaseSearchCandidateFatal)
+            {
+                if (error != nullptr && capacity > 0 && error[0] == '\0')
+                {
+                    scene_error(
+                        error,
+                        capacity,
+                        "joint preview candidate validation failed");
+                }
+                return false;
+            }
+        }
+        else
+        {
+            database_search(
+                best_index,
+                best_cost,
+                db,
+                query,
+                transition_cost,
+                20,
+                20,
+                feasibility == nullptr ? nullptr : feasibility->search_safe,
+                feasibility == nullptr ? 0 : feasibility->count);
+        }
+        if (best_index == -1) {
+            if (candidate_preview.candidate_limit_rejection_count > 0)
+            {
+                return scene_error(
+                    error,
+                    capacity,
+                    "no inertialized-joint-safe database candidate");
+            }
+            if (feasibility == nullptr)
+            {
+                return scene_error(
+                    error,
+                    capacity,
+                    "no database candidate");
+            }
             return scene_error(
                 error,
                 capacity,
@@ -929,61 +1289,32 @@ static inline bool g1_runtime_step_internal(
             next.trns_bone_rotations = db.bone_rotations(best_index);
             next.trns_bone_angular_velocities =
                 db.bone_angular_velocities(best_index);
-            inertialize_pose_transition(
-                next.bone_offset_positions,
-                next.bone_offset_velocities,
-                next.bone_offset_rotations,
-                next.bone_offset_angular_velocities,
-                next.transition_src_position,
-                next.transition_src_rotation,
-                next.transition_dst_position,
-                next.transition_dst_rotation,
-                next.bone_positions(0),
-                next.bone_velocities(0),
-                next.bone_rotations(0),
-                next.bone_angular_velocities(0),
-                next.curr_bone_positions,
-                next.curr_bone_velocities,
-                next.curr_bone_rotations,
-                next.curr_bone_angular_velocities,
-                next.trns_bone_positions,
-                next.trns_bone_velocities,
-                next.trns_bone_rotations,
-                next.trns_bone_angular_velocities);
-            next.frame_index = best_index;
         }
         next.search_timer = next.search_time;
     }
 
     next.search_timer -= dt;
-    next.frame_index = database_trajectory_index_clamp(
-        db, next.frame_index, 1);
+    const int emitted_database_frame = database_trajectory_index_clamp(
+        db, selected_database_frame, 1);
+    g1_runtime_pose_advance(
+        next,
+        db,
+        next.curr_bone_positions,
+        next.curr_bone_velocities,
+        next.curr_bone_rotations,
+        next.curr_bone_angular_velocities,
+        prior_index,
+        selected_database_frame,
+        emitted_database_frame,
+        config.inertialize_blending_halflife,
+        dt);
+    next.frame_index = emitted_database_frame;
     next.curr_bone_positions = db.bone_positions(next.frame_index);
     next.curr_bone_velocities = db.bone_velocities(next.frame_index);
     next.curr_bone_rotations = db.bone_rotations(next.frame_index);
     next.curr_bone_angular_velocities =
         db.bone_angular_velocities(next.frame_index);
     next.curr_bone_contacts = db.contact_states(next.frame_index);
-
-    inertialize_pose_update(
-        next.bone_positions,
-        next.bone_velocities,
-        next.bone_rotations,
-        next.bone_angular_velocities,
-        next.bone_offset_positions,
-        next.bone_offset_velocities,
-        next.bone_offset_rotations,
-        next.bone_offset_angular_velocities,
-        next.curr_bone_positions,
-        next.curr_bone_velocities,
-        next.curr_bone_rotations,
-        next.curr_bone_angular_velocities,
-        next.transition_src_position,
-        next.transition_src_rotation,
-        next.transition_dst_position,
-        next.transition_dst_rotation,
-        config.inertialize_blending_halflife,
-        dt);
 
     array1d<vec3> raw_selected_positions(next.curr_bone_positions);
     array1d<quat> raw_selected_rotations(next.curr_bone_rotations);
@@ -1251,6 +1582,7 @@ static inline bool g1_runtime_step_internal(
     result.raw_selected = raw_selected_diagnostic;
     result.inertialized = inertialized_diagnostic;
     result.projected = projected_diagnostic;
+    result.candidate_preview = candidate_preview;
     g1_controller_state_swap(state, next);
     out = result;
     return true;
@@ -1277,6 +1609,7 @@ static inline bool g1_runtime_step(
         support_rows,
         active_scene,
         &feasibility,
+        nullptr,
         request,
         config,
         prediction_builder,
@@ -1304,6 +1637,7 @@ static inline bool g1_runtime_step(
         support_rows,
         active_scene,
         nullptr,
+        nullptr,
         request,
         config,
         prediction_builder,
@@ -1318,6 +1652,7 @@ static inline bool g1_runtime_step_direct_internal(
     const terrain_support_set& support_rows,
     const scene_pack& active_scene,
     const g1_runtime_frame_feasibility* feasibility,
+    const g1_runtime_joint_preview_validator* joint_preview_validator,
     const g1_runtime_step_request& request,
     const g1_runtime_config& config,
     char* error,
@@ -1416,9 +1751,37 @@ static inline bool g1_runtime_step_direct_internal(
         support_rows,
         active_scene,
         feasibility,
+        joint_preview_validator,
         request,
         config,
         direct_prediction_builder,
+        error,
+        capacity);
+}
+
+static inline bool g1_runtime_step(
+    g1_runtime_step_result& out,
+    g1_controller_state& state,
+    database& db,
+    const terrain_support_set& support_rows,
+    const scene_pack& active_scene,
+    const g1_runtime_frame_feasibility& feasibility,
+    const g1_runtime_step_request& request,
+    const g1_runtime_config& config,
+    const g1_runtime_joint_preview_validator& joint_preview_validator,
+    char* error,
+    int capacity)
+{
+    return g1_runtime_step_direct_internal(
+        out,
+        state,
+        db,
+        support_rows,
+        active_scene,
+        &feasibility,
+        &joint_preview_validator,
+        request,
+        config,
         error,
         capacity);
 }
@@ -1442,6 +1805,7 @@ static inline bool g1_runtime_step(
         support_rows,
         active_scene,
         &feasibility,
+        nullptr,
         request,
         config,
         error,
@@ -1465,6 +1829,7 @@ static inline bool g1_runtime_step(
         db,
         support_rows,
         active_scene,
+        nullptr,
         nullptr,
         request,
         config,
