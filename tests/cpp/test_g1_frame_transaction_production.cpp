@@ -11894,6 +11894,47 @@ static void test_production_no_seam_links_with_strict_recovery_provider()
 #if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM) && \
     defined(G1_CANDIDATE_RECOVERY_ENABLE_TEST_SEAM)
 
+static void test_candidate_trace_implementation_is_out_of_line()
+{
+    const std::string interface_source =
+        read_source_file("g1_candidate_certification_trace.h");
+    check(interface_source.find(
+              "static inline bool g1_candidate_trace_open") ==
+              std::string::npos &&
+          interface_source.find(
+              "static inline bool "
+              "g1_candidate_trace_append_after_transaction") ==
+              std::string::npos &&
+          interface_source.find(
+              "static inline void g1_candidate_trace_close") ==
+              std::string::npos,
+          "candidate trace implementation is out of line from the fast controller owner");
+
+    const std::string implementation_source =
+        read_source_file("g1_candidate_certification_trace.cpp");
+    check(implementation_source.find(
+              "bool g1_candidate_trace_open(") != std::string::npos &&
+          implementation_source.find(
+              "bool g1_candidate_trace_append_after_transaction(") !=
+              std::string::npos &&
+          implementation_source.find(
+              "void g1_candidate_trace_close(") != std::string::npos &&
+          implementation_source.find(
+              "g1_recovery_candidates_exhaustive_for_test(") !=
+              std::string::npos,
+          "strict candidate trace owner contains all definitions and the same-build oracle");
+
+    const std::string controller_source =
+        read_source_file("controller.cpp");
+    check(controller_source.find(
+              "#include \"g1_candidate_certification_trace.h\"") !=
+              std::string::npos &&
+          controller_source.find(
+              "g1_candidate_certification_trace.cpp") ==
+              std::string::npos,
+          "fast controller consumes only the candidate trace interface");
+}
+
 static const char* const CandidateTraceHeader =
     "presentation_frame\tcandidate_slot\tcandidate_kind\tscore_owner\t"
     "selected_frame\texecuted_frame\tsource_range\tcost_bits_hex\t"
@@ -12531,12 +12572,12 @@ static void test_trace_exhaustive_oracle_uses_exact_live_request_and_database()
         file, temporary, mutated, authentic,
         "an exhaustive count mismatch fails before a transaction block");
 
-    const std::string header_source =
-        read_source_file("g1_candidate_certification_trace.h");
-    const std::size_t oracle_call = header_source.find(
+    const std::string implementation_source =
+        read_source_file("g1_candidate_certification_trace.cpp");
+    const std::size_t oracle_call = implementation_source.find(
         "g1_recovery_candidates_exhaustive_for_test(");
     check(oracle_call != std::string::npos &&
-              header_source.find(
+              implementation_source.find(
                   "trace.recovery_request", oracle_call) !=
                   std::string::npos,
           "the same-build oracle call receives trace.recovery_request directly");
@@ -13068,8 +13109,8 @@ static void test_trace_is_written_only_after_candidate_selection()
                   std::string::npos,
           "trace append exists only in main after the outer transaction call");
 
-    const std::string trace_header_source =
-        read_source_file("g1_candidate_certification_trace.h");
+    const std::string trace_implementation_source =
+        read_source_file("g1_candidate_certification_trace.cpp");
     const std::string stage_owner =
         "g1_frame_rejection_stage_name(";
     const std::string stage_mapping =
@@ -13079,7 +13120,7 @@ static void test_trace_is_written_only_after_candidate_selection()
     const std::size_t controller_owner_call =
         controller_source.find(stage_owner);
     const std::size_t trace_owner_call =
-        trace_header_source.find(stage_owner);
+        trace_implementation_source.find(stage_owner);
     check(owner_definition != std::string::npos &&
               coordinator_source.find(
                   stage_owner, owner_definition + stage_owner.size()) ==
@@ -13090,18 +13131,18 @@ static void test_trace_is_written_only_after_candidate_selection()
                   controller_owner_call + stage_owner.size()) ==
                   std::string::npos &&
               trace_owner_call != std::string::npos &&
-              trace_header_source.find(
+              trace_implementation_source.find(
                   stage_owner, trace_owner_call + stage_owner.size()) ==
                   std::string::npos &&
               coordinator_source.find(stage_mapping) !=
                   std::string::npos &&
               controller_source.find(stage_mapping) ==
                   std::string::npos &&
-              trace_header_source.find(stage_mapping) ==
+              trace_implementation_source.find(stage_mapping) ==
                   std::string::npos &&
               controller_source.find("g1_log_rejection_stage_name") ==
                   std::string::npos &&
-              trace_header_source.find("rejection_stage_text") ==
+              trace_implementation_source.find("rejection_stage_text") ==
                   std::string::npos,
           "the frame header solely owns rejection-stage text while controller and trace call it once");
 
@@ -13384,6 +13425,7 @@ static void emit_candidate_trace_transcript()
 
 static void run_candidate_trace_tests()
 {
+    test_candidate_trace_implementation_is_out_of_line();
     test_trace_accepts_exact_unscheduled_incumbent_recovery_grammar();
     test_trace_rejects_exact_unscheduled_binding_mutations();
     test_trace_serializes_slot_zero_complete_tail_and_attempts();
@@ -13396,6 +13438,11 @@ static void run_candidate_trace_tests()
     test_trace_cost_words_are_hex_not_reformatted_floats();
     test_trace_slot_zero_uses_authenticated_score_owner();
     test_benchmark_timestamp_surrounds_only_outer_transaction();
+}
+
+static void run_candidate_trace_linkage_red_tests()
+{
+    test_candidate_trace_implementation_is_out_of_line();
 }
 
 static void run_unscheduled_trace_red_tests()
@@ -13421,6 +13468,12 @@ int main(int argc, char** argv)
         std::strcmp(argv[1], "--unscheduled-trace-red") == 0) {
         std::fputs("G1_UNSCHEDULED_TRACE_RED_SELECTED\n", stderr);
         run_unscheduled_trace_red_tests();
+        return 0;
+    }
+    if (argc == 2 &&
+        std::strcmp(argv[1], "--candidate-trace-linkage-red") == 0) {
+        std::fputs("G1_CANDIDATE_TRACE_LINKAGE_RED_SELECTED\n", stderr);
+        run_candidate_trace_linkage_red_tests();
         return 0;
     }
     if (argc == 2 && std::strcmp(argv[1], "--trace-transcript") == 0) {
