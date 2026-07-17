@@ -8,6 +8,8 @@ namespace interaction {
 namespace {
 
 constexpr float kTravelEnvelopeToleranceM = 2.0e-5F;
+constexpr float kMinimumAffordanceRotationNorm = 1.0e-6F;
+constexpr float kAffordanceRotationNormTolerance = 1.0e-3F;
 
 uint32_t float_bits(float value) {
     uint32_t bits = 0U;
@@ -31,6 +33,85 @@ bool is_finite(quat value) {
 
 bool is_finite(Transform value) {
     return is_finite(value.position) && is_finite(value.rotation);
+}
+
+const GraspAffordance* find_unique_affordance(
+    const InteractionTarget& target,
+    uint32_t affordance_id) {
+    const GraspAffordance* selected = nullptr;
+    for (const GraspAffordance& affordance : target.affordances) {
+        if (affordance.id != affordance_id) continue;
+        if (selected != nullptr) return nullptr;
+        selected = &affordance;
+    }
+    return selected;
+}
+
+bool selected_affordance_is_well_formed(
+    const GraspAffordance& affordance) {
+    const float rotation_norm = quat_length(
+        affordance.hand_in_object.rotation);
+    const float approach_length = length(
+        affordance.approach_direction_object);
+    if (affordance.id == 0U ||
+        static_cast<uint8_t>(affordance.hand) >
+            static_cast<uint8_t>(Hand::Right) ||
+        !is_finite(affordance.hand_in_object) ||
+        !is_finite(rotation_norm) ||
+        rotation_norm <= kMinimumAffordanceRotationNorm ||
+        std::abs(rotation_norm - 1.0F) >
+            kAffordanceRotationNormTolerance ||
+        !is_finite(affordance.approach_direction_object) ||
+        !is_finite(approach_length) ||
+        approach_length <= kMinimumAffordanceRotationNorm ||
+        !is_finite(affordance.clearance_radius) ||
+        affordance.clearance_radius < 0.0F) {
+        return false;
+    }
+    for (size_t left = 0U;
+         left < affordance.interaction_slots.size();
+         ++left) {
+        const GraspInteractionSlot& slot =
+            affordance.interaction_slots[left];
+        if (slot.id == 0U || !is_finite(slot.root_x_object_m) ||
+            !is_finite(slot.root_z_object_m) ||
+            !is_finite(slot.root_yaw_object_radians)) {
+            return false;
+        }
+        for (size_t right = left + 1U;
+             right < affordance.interaction_slots.size();
+             ++right) {
+            if (slot.id == affordance.interaction_slots[right].id) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool same_ordered_authored_slots(
+    const GraspAffordance& frozen,
+    const GraspAffordance& live) {
+    if (frozen.interaction_slots.size() !=
+        live.interaction_slots.size()) {
+        return false;
+    }
+    for (size_t index = 0U;
+         index < frozen.interaction_slots.size();
+         ++index) {
+        const GraspInteractionSlot& left =
+            frozen.interaction_slots[index];
+        const GraspInteractionSlot& right =
+            live.interaction_slots[index];
+        if (left.id != right.id ||
+            left.root_x_object_m != right.root_x_object_m ||
+            left.root_z_object_m != right.root_z_object_m ||
+            left.root_yaw_object_radians !=
+                right.root_yaw_object_radians) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool is_finite(PickEntryRoot value) {
@@ -423,6 +504,37 @@ PickAssistOutput ControllerPickAssist::observe(
     const PickAssistObservation& observation) {
     PickAssistOutput output{};
     if (diagnostics_.state == PickAssistState::SlotApproach) {
+        if (observation.runtime_state != RuntimeState::Locomotion) {
+            return fail_output(
+                diagnostics_, PickAssistReason::RuntimeChanged);
+        }
+        if (observation.target == nullptr ||
+            observation.target->handle.id != start_.target.id) {
+            return fail_output(
+                diagnostics_, PickAssistReason::TargetUnavailable);
+        }
+        const GraspAffordance* frozen_affordance =
+            find_unique_affordance(
+                start_.target_snapshot, start_.affordance_id);
+        const GraspAffordance* live_affordance =
+            find_unique_affordance(
+                *observation.target, start_.affordance_id);
+        if (frozen_affordance == nullptr ||
+            live_affordance == nullptr ||
+            !selected_affordance_is_well_formed(*live_affordance)) {
+            return fail_output(
+                diagnostics_, PickAssistReason::TargetChanged);
+        }
+        if (!same_ordered_authored_slots(
+                *frozen_affordance, *live_affordance)) {
+            return fail_output(
+                diagnostics_, PickAssistReason::SlotChanged);
+        }
+        if (!same_interaction_target_snapshot(
+                start_.target_snapshot, *observation.target)) {
+            return fail_output(
+                diagnostics_, PickAssistReason::TargetChanged);
+        }
         if (!observation_metrics_are_finite(observation)) return output;
         const float travel_segment_m = planar_distance(
             previous_observed_root_.position,
