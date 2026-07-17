@@ -650,7 +650,7 @@ class PosePublisherPhaseTests(unittest.TestCase):
 
 
 class DependencyContractTests(unittest.TestCase):
-    def test_pyzmq_is_declared_only_by_the_integration_extra(self) -> None:
+    def test_runtime_dependencies_are_exactly_in_the_integration_extra(self) -> None:
         root = Path(__file__).resolve().parents[2]
         pyproject = (root / "sonic" / "pyproject.toml").read_text("utf-8")
 
@@ -667,7 +667,16 @@ class DependencyContractTests(unittest.TestCase):
         core = strings_in_array("dependencies")
         integration = strings_in_array("integration")
         self.assertNotIn("pyzmq", core)
-        self.assertEqual(set(integration), {"mujoco", "pyzmq"})
+        self.assertEqual(
+            set(integration),
+            {
+                "mujoco",
+                "pyzmq",
+                "scipy==1.15.3",
+                "PyYAML==6.0.3",
+                "cyclonedds==0.10.2",
+            },
+        )
 
 
 @unittest.skipUnless(
