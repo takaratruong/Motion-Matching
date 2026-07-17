@@ -926,7 +926,11 @@ class GearProcessTests(TemporaryScriptCase):
         real_open = process_module.os.open
 
         def fail_leaf_open(path, flags, mode=0o777, *, dir_fd=None):
-            if path == "gear-logs" and dir_fd is not None:
+            if (
+                isinstance(path, str)
+                and path.startswith(process_module._OWNED_DIRECTORY_STAGING_PREFIX)
+                and dir_fd is not None
+            ):
                 raise OSError("synthetic leaf open failure")
             return real_open(path, flags, mode, dir_fd=dir_fd)
 
@@ -938,29 +942,76 @@ class GearProcessTests(TemporaryScriptCase):
 
         self.assertFalse((self.root / "gear-logs").exists())
 
-    def test_logs_leaf_swap_between_mkdir_and_open_is_rejected_without_deletion(self):
+    def test_logs_staging_leaf_swap_after_open_is_rejected_without_deletion(self):
         from mm_sonic import process as process_module
 
         child = self.script("unused_leaf_swap.py", "raise SystemExit(0)\n")
-        real_open = process_module.os.open
+        real_stat = process_module.os.stat
         created = self.root / "wrapper-created-logs"
-        replacement = self.root / "gear-logs"
+        replacement = None
         swapped = False
 
-        def swap_leaf_open(path, flags, mode=0o777, *, dir_fd=None):
+        def swap_leaf_stat(path, *args, dir_fd=None, **kwargs):
+            nonlocal replacement, swapped
+            if (
+                isinstance(path, str)
+                and path.startswith(process_module._OWNED_DIRECTORY_STAGING_PREFIX)
+                and dir_fd is not None
+                and not swapped
+            ):
+                swapped = True
+                replacement = self.root / path
+                replacement.rename(created)
+                replacement.mkdir()
+            return real_stat(path, *args, dir_fd=dir_fd, **kwargs)
+
+        with (
+            patch.object(process_module.os, "stat", side_effect=swap_leaf_stat),
+            self.assertRaisesRegex(ProcessError, "identity changed"),
+        ):
+            self.gear(child)
+
+        self.assertTrue(created.is_dir())
+        assert replacement is not None
+        self.assertTrue(replacement.is_dir())
+
+    def test_logs_leaf_swap_before_first_public_stat_is_rejected_without_deletion(
+        self,
+    ):
+        from mm_sonic import process as process_module
+
+        real_stat = process_module.os.stat
+        created = self.root / "wrapper-created-before-public-stat"
+        replacement = self.root / "gear-logs"
+        swapped = False
+        owned = None
+
+        def swap_leaf_stat(path, *args, dir_fd=None, **kwargs):
             nonlocal swapped
             if path == "gear-logs" and dir_fd is not None and not swapped:
                 swapped = True
                 replacement.rename(created)
                 replacement.mkdir()
-            return real_open(path, flags, mode, dir_fd=dir_fd)
+            return real_stat(path, *args, dir_fd=dir_fd, **kwargs)
 
-        with (
-            patch.object(process_module.os, "open", side_effect=swap_leaf_open),
-            self.assertRaisesRegex(ProcessError, "identity changed"),
-        ):
-            self.gear(child)
+        try:
+            with patch.object(
+                process_module.os,
+                "stat",
+                side_effect=swap_leaf_stat,
+            ):
+                with self.assertRaisesRegex(ProcessError, "identity changed"):
+                    _, owned = process_module._create_owned_directory(
+                        self.root,
+                        replacement,
+                        "GEAR logs",
+                    )
+        finally:
+            if owned is not None:
+                os.close(owned.leaf_fd)
+                os.close(owned.parent_fd)
 
+        self.assertTrue(swapped)
         self.assertTrue(created.is_dir())
         self.assertTrue(replacement.is_dir())
 
@@ -968,27 +1019,34 @@ class GearProcessTests(TemporaryScriptCase):
         from mm_sonic import process as process_module
 
         child = self.script("unused_leaf_swap_failure.py", "raise SystemExit(0)\n")
-        real_open = process_module.os.open
+        real_stat = process_module.os.stat
         created = self.root / "wrapper-created-on-failure"
-        replacement = self.root / "gear-logs"
+        replacement = None
         swapped = False
 
-        def swap_then_fail(path, flags, mode=0o777, *, dir_fd=None):
-            nonlocal swapped
-            if path == "gear-logs" and dir_fd is not None and not swapped:
+        def swap_then_fail(path, *args, dir_fd=None, **kwargs):
+            nonlocal replacement, swapped
+            if (
+                isinstance(path, str)
+                and path.startswith(process_module._OWNED_DIRECTORY_STAGING_PREFIX)
+                and dir_fd is not None
+                and not swapped
+            ):
                 swapped = True
+                replacement = self.root / path
                 replacement.rename(created)
                 replacement.mkdir()
-                raise OSError("synthetic swapped leaf open failure")
-            return real_open(path, flags, mode, dir_fd=dir_fd)
+                raise OSError("synthetic swapped leaf stat failure")
+            return real_stat(path, *args, dir_fd=dir_fd, **kwargs)
 
         with (
-            patch.object(process_module.os, "open", side_effect=swap_then_fail),
+            patch.object(process_module.os, "stat", side_effect=swap_then_fail),
             self.assertRaisesRegex(ProcessError, "cannot create GEAR logs"),
         ):
             self.gear(child)
 
         self.assertTrue(created.is_dir())
+        assert replacement is not None
         self.assertTrue(replacement.is_dir())
 
     def test_command_is_materialized_once_before_validation_or_output_creation(self):

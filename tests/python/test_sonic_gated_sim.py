@@ -151,6 +151,86 @@ class GatedSimulatorRunnerTests(unittest.TestCase):
         self.assertTrue((second_logs / "contacts.jsonl").is_file())
         self.assertEqual(self.runner.snapshot()["steps"], 0)
 
+    def test_same_path_scene_replacement_requires_a_fresh_child(self):
+        initial = np.zeros(36, dtype=np.float64)
+        initial[2] = 0.8
+        initial[3] = 1.0
+        original_scene = self.root / "original-scene.xml"
+
+        self.reset(initial)
+        self.runner.advance(1)
+        self.scene.rename(original_scene)
+        self.scene.write_text("<mujoco model='replacement'/>", encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            ProtocolError,
+            "scene identity/path changed; fresh simulator process required",
+        ):
+            self.runner.reset(
+                scene_xml=self.scene,
+                initial_qpos=initial,
+                lateral_offset_m=0.0,
+                yaw_offset_rad=0.0,
+                log_dir=self.root / "replacement-scene-logs",
+            )
+
+        self.assertEqual(len(self.backends), 1)
+        self.assertFalse(self.backends[0].closed)
+        self.assertTrue((self.log_dir / "contacts.jsonl").is_file())
+        self.assertFalse((self.root / "replacement-scene-logs").exists())
+        self.assertTrue(original_scene.is_file())
+        self.assertTrue(self.scene.is_file())
+
+    def test_in_place_scene_mutation_requires_a_fresh_child(self):
+        initial = np.zeros(36, dtype=np.float64)
+        initial[2] = 0.8
+        initial[3] = 1.0
+
+        self.reset(initial)
+        original_inode = self.scene.stat().st_ino
+        self.scene.write_text("<mujoco model='mutated'/>", encoding="utf-8")
+        self.assertEqual(self.scene.stat().st_ino, original_inode)
+
+        with self.assertRaisesRegex(
+            ProtocolError,
+            "scene identity/path changed; fresh simulator process required",
+        ):
+            self.runner.reset(
+                scene_xml=self.scene,
+                initial_qpos=initial,
+                lateral_offset_m=0.0,
+                yaw_offset_rad=0.0,
+                log_dir=self.root / "mutated-scene-logs",
+            )
+
+        self.assertEqual(len(self.backends), 1)
+        self.assertFalse(self.backends[0].closed)
+        self.assertFalse((self.root / "mutated-scene-logs").exists())
+
+    def test_different_scene_path_requires_a_fresh_child(self):
+        initial = np.zeros(36, dtype=np.float64)
+        initial[2] = 0.8
+        initial[3] = 1.0
+        other_scene = self.root / "other-scene.xml"
+        other_scene.write_text("<mujoco model='other'/>", encoding="utf-8")
+
+        self.reset(initial)
+        with self.assertRaisesRegex(
+            ProtocolError,
+            "scene identity/path changed; fresh simulator process required",
+        ):
+            self.runner.reset(
+                scene_xml=other_scene,
+                initial_qpos=initial,
+                lateral_offset_m=0.0,
+                yaw_offset_rad=0.0,
+                log_dir=self.root / "other-scene-logs",
+            )
+
+        self.assertEqual(len(self.backends), 1)
+        self.assertFalse(self.backends[0].closed)
+        self.assertFalse((self.root / "other-scene-logs").exists())
+
     def test_reset_perturbs_only_copied_physical_horizontal_root_and_yaw(self):
         initial = np.zeros(36, dtype=np.float64)
         initial[:7] = [1.25, -0.5, 0.82, 1.0, 0.0, 0.0, 0.0]

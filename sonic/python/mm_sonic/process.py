@@ -7,13 +7,16 @@ module never imports GEAR, MuJoCo, Unitree, or DDS.  Those imports belong to the
 
 from __future__ import annotations
 
+import ctypes
 from dataclasses import dataclass
+import errno
 import json
 import math
 import os
 from pathlib import Path
 import pty
 import re
+import secrets
 import select
 import signal
 import stat
@@ -77,6 +80,8 @@ _POST_ENABLE_FENCE_SEMANTICS = (
 )
 _GEAR_LAUNCH_PROFILES = frozenset({"zmq_stream", "loaded_motion"})
 _SHELL_SAFE_ABSOLUTE_PATH = re.compile(r"/[A-Za-z0-9._/-]*\Z")
+_OWNED_DIRECTORY_STAGING_PREFIX = ".mm-sonic-owned-"
+_RENAME_NOREPLACE = 1
 
 
 class ProcessError(RuntimeError):
@@ -283,6 +288,38 @@ def _directory_open_flags() -> int:
     )
 
 
+def _rename_noreplace(parent_fd: int, source: str, target: str) -> None:
+    """Atomically publish one directory name without replacing a peer."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise ProcessError(
+            "atomic no-replace directory publication is unavailable"
+        )
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        parent_fd,
+        os.fsencode(source),
+        parent_fd,
+        os.fsencode(target),
+        _RENAME_NOREPLACE,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number == errno.EEXIST:
+        raise FileExistsError(error_number, os.strerror(error_number), target)
+    raise OSError(error_number, os.strerror(error_number), target)
+
+
 def _open_confined_parent_fd(
     run_root: Path,
     candidate: Path,
@@ -333,38 +370,53 @@ def _create_owned_directory(
     value: str | Path,
     label: str,
 ) -> tuple[Path, _OwnedDirectory]:
-    """Create a directory and retain both parent and live leaf descriptors."""
+    """Create, authenticate, and atomically publish an owned directory."""
 
     candidate = _prepare_confined_output_path(run_root, value, label)
     parent_fd, name = _open_confined_parent_fd(run_root, candidate, label)
     leaf_fd: int | None = None
-    created = False
-    created_device: int | None = None
-    created_inode: int | None = None
+    staging_name: str | None = None
+    published = False
     retained = False
     try:
-        try:
-            os.mkdir(name, dir_fd=parent_fd)
-        except FileExistsError as error:
-            raise ProcessError(f"{label} already exists: {candidate}") from error
-        created = True
-        created_leaf = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        if not stat.S_ISDIR(created_leaf.st_mode):
-            raise ProcessError(f"{label} identity changed during creation")
-        created_device = created_leaf.st_dev
-        created_inode = created_leaf.st_ino
+        for _ in range(8):
+            proposed = _OWNED_DIRECTORY_STAGING_PREFIX + secrets.token_hex(16)
+            try:
+                os.mkdir(proposed, mode=0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                continue
+            staging_name = proposed
+            break
+        if staging_name is None:
+            raise ProcessError(
+                f"cannot allocate private staging directory for {label}"
+            )
         leaf_fd = os.open(
-            name,
+            staging_name,
             _directory_open_flags(),
             dir_fd=parent_fd,
         )
         leaf = os.fstat(leaf_fd)
-        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        staged = os.stat(
+            staging_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
         if (
             not stat.S_ISDIR(leaf.st_mode)
-            or not stat.S_ISDIR(current.st_mode)
-            or leaf.st_dev != created_device
-            or leaf.st_ino != created_inode
+            or not stat.S_ISDIR(staged.st_mode)
+            or staged.st_dev != leaf.st_dev
+            or staged.st_ino != leaf.st_ino
+        ):
+            raise ProcessError(f"{label} identity changed during creation")
+        try:
+            _rename_noreplace(parent_fd, staging_name, name)
+        except FileExistsError as error:
+            raise ProcessError(f"{label} already exists: {candidate}") from error
+        published = True
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(current.st_mode)
             or current.st_dev != leaf.st_dev
             or current.st_ino != leaf.st_ino
         ):
@@ -384,23 +436,27 @@ def _create_owned_directory(
     finally:
         if not retained:
             remove_created = False
-            if created and created_device is not None and created_inode is not None:
+            cleanup_name = name if published else staging_name
+            if leaf_fd is not None and cleanup_name is not None:
                 try:
+                    original = os.fstat(leaf_fd)
                     current = os.stat(
-                        name,
+                        cleanup_name,
                         dir_fd=parent_fd,
                         follow_symlinks=False,
                     )
                     remove_created = (
-                        stat.S_ISDIR(current.st_mode)
-                        and current.st_dev == created_device
-                        and current.st_ino == created_inode
+                        stat.S_ISDIR(original.st_mode)
+                        and stat.S_ISDIR(current.st_mode)
+                        and current.st_dev == original.st_dev
+                        and current.st_ino == original.st_ino
                     )
                 except OSError:
                     remove_created = False
             if remove_created:
                 try:
-                    os.rmdir(name, dir_fd=parent_fd)
+                    assert cleanup_name is not None
+                    os.rmdir(cleanup_name, dir_fd=parent_fd)
                 except OSError:
                     pass
             if leaf_fd is not None:

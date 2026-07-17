@@ -32,6 +32,7 @@
       "root_body_position": "positive-zero-f32",
       "root_body_linear_velocity": "positive-zero-f32",
       "root_body_angular_velocity": "positive-zero-f32",
+      "projected_csv_numeric_encoding": "binary32-promoted-to-binary64-exact-decimal17",
       "control_clock": "wall-clock-50hz-asynchronous-to-simulator",
       "stream_readiness_frame_range": [0, 0],
       "stream_readiness_publication_count": 1,
@@ -64,6 +65,6 @@
       "gear_state_row_count": 441,
       "state_target_pairing": "same-control-tick-positional"
     },
-    "rule_sha256": "ed79d48d64d95d8940fddefbe88169d4416cffd4ee3add9c78e6c5b68f3aa2c4"
+    "rule_sha256": "eedcb24fceb88d4281aed82bee777619c8dec87a65094520a0c9fcb613d1a750"
   }
 }

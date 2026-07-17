@@ -3499,6 +3499,24 @@ class ProductionAdapterBoundaryTests(unittest.TestCase):
         finally:
             bundle.__del__()
 
+    def test_projected_csv_text_parses_to_exact_binary32_values_in_gear_double_loader(
+        self,
+    ) -> None:
+        values = np.array(
+            [[np.float32(1.188205), np.float32(-0.0), np.float32(1.0 / 3.0)]],
+            dtype="<f4",
+        )
+
+        encoded = cli_module._csv_f32_bytes(values, ("a", "b", "c"))
+        parsed = np.array(
+            [float(token) for token in encoded.splitlines()[1].split(b",")],
+            dtype="<f8",
+        )
+        promoted = values.astype("<f8", copy=False).reshape(-1)
+
+        np.testing.assert_array_equal(parsed.view("<u8"), promoted.view("<u8"))
+        self.assertIn(b"1.1882050037384033", encoded)
+
     def test_projection_registry_declares_cold_async_preload_contract(self) -> None:
         rule = dict(cli_module._KNOWN_GOOD_PROJECTION_RULE)
         self.assertEqual(rule["control_clock"], "wall-clock-50hz-asynchronous-to-simulator")

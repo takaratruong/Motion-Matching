@@ -297,6 +297,9 @@ _KNOWN_GOOD_PROJECTION_RULE = MappingProxyType(
         "root_body_position": "positive-zero-f32",
         "root_body_linear_velocity": "positive-zero-f32",
         "root_body_angular_velocity": "positive-zero-f32",
+        "projected_csv_numeric_encoding": (
+            "binary32-promoted-to-binary64-exact-decimal17"
+        ),
         "control_clock": "wall-clock-50hz-asynchronous-to-simulator",
         "stream_readiness_frame_range": [0, 0],
         "stream_readiness_publication_count": 1,
@@ -1216,7 +1219,7 @@ def _csv_f32_bytes(values: np.ndarray, headers: Sequence[str]) -> bytes:
         raise ContractError("projected CSV values are invalid")
     rows = [",".join(headers)]
     rows.extend(
-        ",".join(format(float(value), ".9g") for value in row)
+        ",".join(format(float(value), ".17g") for value in row)
         for row in array
     )
     return ("\n".join(rows) + "\n").encode("ascii")

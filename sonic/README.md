@@ -101,6 +101,9 @@ and the receipt fence repeat canonical pose 440 and are never scored. Every
 publication requires exact, separately ranged pinned Start, processing, merge,
 and `*** End of ZMQ decoding processing ***` lines. Arbitrary pinned decoder
 diagnostics may occur between the merge and End lines and are SHA-256 bound.
+Run-local CSV projection renders every binary32 value as an exact promoted
+binary64 decimal, so GEAR's `std::stod` file path and the stream payload receive
+identical numeric values rather than merely values that round back to binary32.
 Publication N+1's authenticated Start-through-End completion event, rather
 than its boundary snapshot alone, is the causal fence for publication N.
 

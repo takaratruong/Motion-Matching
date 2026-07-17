@@ -9,9 +9,12 @@ from __future__ import annotations
 import argparse
 from contextlib import redirect_stdout
 from dataclasses import dataclass
+import hashlib
 import json
 import math
+import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import time
@@ -25,6 +28,7 @@ from .process import (
     _canonical_run_root,
     _confined_existing_path,
     _create_exclusive_directory,
+    _open_confined_parent_fd,
     _validate_confined_output_path,
 )
 
@@ -155,6 +159,144 @@ def _json_safe(value: object, label: str = "sample") -> object:
     raise ProtocolError(f"{label} contains unsupported value {type(value).__name__}")
 
 
+@dataclass(frozen=True)
+class _SceneIdentity:
+    path: Path
+    parent_fd: int
+    file_fd: int
+    name: str
+    device: int
+    inode: int
+    sha256: str
+
+
+def _scene_descriptor_sha256(file_fd: int) -> tuple[str, os.stat_result]:
+    before = os.fstat(file_fd)
+    if not stat.S_ISREG(before.st_mode):
+        raise ProtocolError("scene_xml must be a regular file")
+    digest = hashlib.sha256()
+    offset = 0
+    while True:
+        chunk = os.pread(file_fd, 1024 * 1024, offset)
+        if not chunk:
+            break
+        digest.update(chunk)
+        offset += len(chunk)
+    after = os.fstat(file_fd)
+    stable_fields = (
+        "st_dev",
+        "st_ino",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    if any(
+        getattr(before, field) != getattr(after, field)
+        for field in stable_fields
+    ):
+        raise ProtocolError("scene identity changed while hashing")
+    return digest.hexdigest(), after
+
+
+def _close_scene_identity(identity: _SceneIdentity | None) -> None:
+    if identity is None:
+        return
+    for descriptor in (identity.file_fd, identity.parent_fd):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _capture_scene_identity(run_root: Path, scene: Path) -> _SceneIdentity:
+    parent_fd: int | None = None
+    file_fd: int | None = None
+    retained = False
+    try:
+        parent_fd, name = _open_confined_parent_fd(run_root, scene, "scene_xml")
+        file_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        digest, opened = _scene_descriptor_sha256(file_fd)
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_dev != opened.st_dev
+            or current.st_ino != opened.st_ino
+            or current.st_size != opened.st_size
+            or current.st_mtime_ns != opened.st_mtime_ns
+            or current.st_ctime_ns != opened.st_ctime_ns
+        ):
+            raise ProtocolError("scene identity changed while opening")
+        retained = True
+        return _SceneIdentity(
+            path=scene,
+            parent_fd=parent_fd,
+            file_fd=file_fd,
+            name=name,
+            device=opened.st_dev,
+            inode=opened.st_ino,
+            sha256=digest,
+        )
+    except ProtocolError:
+        raise
+    except (OSError, ProcessError) as error:
+        raise ProtocolError("scene_xml identity is unavailable") from error
+    finally:
+        if not retained:
+            if file_fd is not None:
+                try:
+                    os.close(file_fd)
+                except OSError:
+                    pass
+            if parent_fd is not None:
+                try:
+                    os.close(parent_fd)
+                except OSError:
+                    pass
+
+
+def _scene_identity_is_current(
+    expected: _SceneIdentity,
+    run_root: Path,
+    scene: Path,
+) -> bool:
+    if scene != expected.path:
+        return False
+    current_identity: _SceneIdentity | None = None
+    try:
+        retained_digest, retained = _scene_descriptor_sha256(expected.file_fd)
+        if (
+            retained.st_dev != expected.device
+            or retained.st_ino != expected.inode
+            or retained_digest != expected.sha256
+        ):
+            return False
+        current_identity = _capture_scene_identity(run_root, scene)
+        return (
+            current_identity.device == expected.device
+            and current_identity.inode == expected.inode
+            and current_identity.sha256 == expected.sha256
+        )
+    except (OSError, ProtocolError):
+        return False
+    finally:
+        _close_scene_identity(current_identity)
+
+
+def _require_current_scene(
+    expected: _SceneIdentity,
+    run_root: Path,
+    scene: Path,
+) -> None:
+    if not _scene_identity_is_current(expected, run_root, scene):
+        raise ProtocolError(
+            "scene identity/path changed; fresh simulator process required"
+        )
+
+
 class GatedSimulatorRunner:
     """Own one idle backend and advance it only by explicit integer requests."""
 
@@ -170,7 +312,7 @@ class GatedSimulatorRunner:
         except ProcessError as error:
             raise ProtocolError(str(error)) from error
         self._backend: SimulatorBackend | None = None
-        self._scene: Path | None = None
+        self._scene_identity: _SceneIdentity | None = None
         self._state_file: IO[str] | None = None
         self._contact_file: IO[str] | None = None
         self._steps = 0
@@ -193,10 +335,15 @@ class GatedSimulatorRunner:
         self._contact_file = None
 
     def _close_backend(self) -> None:
-        if self._backend is not None:
-            self._backend.close()
+        backend = self._backend
+        identity = self._scene_identity
         self._backend = None
-        self._scene = None
+        self._scene_identity = None
+        try:
+            if backend is not None:
+                backend.close()
+        finally:
+            _close_scene_identity(identity)
 
     def _close_active(self) -> None:
         self._close_logs()
@@ -230,14 +377,25 @@ class GatedSimulatorRunner:
         lateral = _finite_number(lateral_offset_m, "lateral_offset_m")
         yaw = _finite_number(yaw_offset_rad, "yaw_offset_rad")
 
-        self._close_logs()
-        if self._backend is None or self._scene != scene:
-            self._close_backend()
-            backend = self._backend_factory(scene)
+        if self._backend is None:
+            identity = _capture_scene_identity(self.run_root, scene)
+            try:
+                backend = self._backend_factory(scene)
+            except BaseException:
+                _close_scene_identity(identity)
+                raise
             self._backend = backend
-            self._scene = scene
+            self._scene_identity = identity
+            try:
+                _require_current_scene(identity, self.run_root, scene)
+            except BaseException:
+                self._close_backend()
+                raise
         else:
             backend = self._backend
+            assert self._scene_identity is not None
+            _require_current_scene(self._scene_identity, self.run_root, scene)
+        self._close_logs()
         try:
             nq = getattr(backend.model, "nq", None)
             if type(nq) is not int or nq <= 0:
