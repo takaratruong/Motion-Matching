@@ -4,7 +4,7 @@
 
 **Goal:** Package the real Unitree G1 mesh and render it from the exact accepted motion-matching pose, with optional bone and physical-sole diagnostics.
 
-**Architecture:** Task 1 converts the existing validated rigid-skinned FBX into one Raylib-compatible, indexed GLB and validates its skin, bounds, weights, and hashes. Task 2 adds a focused renderer that maps 30 articulated skin bones to `G1Bone`, propagates nine fixed attachments from bind-local transforms, and integrates mesh/bone/sole toggles without changing simulation state.
+**Architecture:** Task 1 converts the existing validated rigid-skinned FBX into one Raylib-compatible, indexed GLB with 35 decimated rigid-link primitives and validates its skin, bounds, weights, and hashes. Task 2 adds a focused renderer that maps 30 articulated skin bones to `G1Bone`, propagates nine fixed attachments from bind-local transforms, and integrates mesh/bone/sole toggles without changing simulation state.
 
 **Tech Stack:** C++17, Raylib 5.0, raymath, Blender 4.0.2 Python, Python 3.12 `unittest`, binary glTF 2.0, Git.
 
@@ -23,7 +23,7 @@
 
 ## File Map
 
-- Create `resources/g1_mesh/export_g1_raylib_glb.py`: Blender-only deterministic FBX-to-GLB exporter with a sub-65,536-vertex mesh and canonical manifest.
+- Create `resources/g1_mesh/export_g1_raylib_glb.py`: Blender-only deterministic FBX-to-GLB exporter with 35 sub-65,536-vertex rigid-link primitives and a canonical manifest.
 - Create `resources/g1_mesh/validate_g1_raylib_glb.py`: dependency-free GLB/manifest validator used by tests and the exporter.
 - Create `resources/g1_mesh/__init__.py`: explicit Python package marker for focused tests.
 - Create `resources/g1_mesh/g1_raylib.glb`: committed runtime asset.
@@ -65,8 +65,8 @@ def validate_g1_glb(
 ```
 
 - The returned dictionary contains `bone_count`, `skin_count`, `vertex_count`,
-  `maximum_primitive_vertices`, `rigid_vertex_count`, `height_m`, and
-  `glb_sha256`.
+  `primitive_count`, `maximum_primitive_vertices`, `rigid_vertex_count`,
+  `height_m`, and `glb_sha256`.
 
 - [ ] **Step 1: Write the asset validator tests before creating production files**
 
@@ -93,6 +93,7 @@ class G1MeshAssetTests(unittest.TestCase):
         report = validate_g1_glb(ASSET, MANIFEST, SOURCE)
         self.assertEqual(report["skin_count"], 1)
         self.assertEqual(report["bone_count"], 39)
+        self.assertEqual(report["primitive_count"], 35)
         self.assertLessEqual(report["maximum_primitive_vertices"], 65535)
         self.assertEqual(report["rigid_vertex_count"], report["vertex_count"])
         self.assertGreaterEqual(report["height_m"], 0.8)
@@ -176,11 +177,11 @@ def export(source, output):
     modifier = mesh.modifiers.new("raylib_u16", "DECIMATE")
     modifier.decimate_type = "COLLAPSE"
     modifier.ratio = TARGET_VERTICES / original_vertices
+    mesh.modifiers.move(len(mesh.modifiers) - 1, 0)
     bpy.context.view_layer.objects.active = mesh
     mesh.select_set(True)
     bpy.ops.object.modifier_apply(modifier=modifier.name)
-    if len(mesh.data.vertices) > MAX_VERTICES:
-        raise RuntimeError("decimated G1 mesh exceeds Raylib u16 limit")
+    split_rigid_groups(mesh)
     output.parent.mkdir(parents=True, exist_ok=True)
     bpy.ops.export_scene.gltf(
         filepath=str(output),
@@ -204,6 +205,15 @@ def main():
 if __name__ == "__main__":
     main()
 ```
+
+`split_rigid_groups(mesh)` recovers the 35 rigid visual links that were joined
+when the authenticated FBX was built. After decimation it requires exactly 35
+nonempty vertex groups, exactly one unit weight per vertex, and no polygon
+spanning groups. It fails before export if any group's polygon-corner count is
+over `65535`, then duplicates the decimated object in lexical group-name order,
+retains only that group's vertices, preserves the armature modifier/materials,
+and removes the joined source object. This is an index-compatibility partition,
+not a higher-fidelity mesh pass; it changes no transform, weight, or hierarchy.
 
 After export, the script adds the repository root to `sys.path`, imports
 `inspect_g1_glb` and `validate_g1_glb`, and calls `inspect_g1_glb(output)`.
@@ -260,6 +270,8 @@ must be at most `65535`. Decode weights using the accessor/view byte offsets
 and stride. For every vertex require exactly one weight within `1e-6` of
 `1.0` and the other three within `1e-6` of zero. Union the accessor `min` and
 `max` triples and require the largest bounding-box extent in `[0.8, 1.6]`.
+Require exactly 35 primitives, matching the authenticated source's rigid
+visual groups.
 `validate_g1_glb` calls `inspect_g1_glb`, then requires every recorded
 structural field, the output hash/size, and, when supplied, the exact source
 hash/size to match the manifest. Both functions return the evidence dictionary
@@ -270,16 +282,17 @@ documented in Interfaces.
 Run:
 
 ```bash
-blender --background --python resources/g1_mesh/export_g1_raylib_glb.py -- \
+blender --background --python-exit-code 1 \
+  --python resources/g1_mesh/export_g1_raylib_glb.py -- \
   --source /home/ubuntu/projects/g1_mm/g1.fbx \
   --output resources/g1_mesh/g1_raylib.glb
 /home/ubuntu/miniconda3/envs/diffsim/bin/python -m unittest \
   tests.python.test_g1_mesh_asset -v
 ```
 
-Expected: exporter exits zero; validator reports one 39-bone skin, rigid
-weights, no primitive over 65,535 vertices, and a 0.8–1.6 m extent; all three
-tests pass.
+Expected: exporter exits zero; validator reports one 39-bone skin, 35 rigid
+link primitives, no primitive over 65,535 vertices, and a 0.8–1.6 m extent;
+all three tests pass.
 
 - [ ] **Step 6: Run asset self-review and commit**
 
