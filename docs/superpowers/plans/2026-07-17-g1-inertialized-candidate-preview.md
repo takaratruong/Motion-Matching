@@ -712,7 +712,7 @@ Set the projection CLI to the just-built absolute path and run:
 
 ```bash
 env PYTHONPATH=sonic/python PYTHONDONTWRITEBYTECODE=1 PYTHONWARNINGS=error \
-  SONIC_PROJECT_CLI=/home/ubuntu/projects/motion-matching/.worktrees/g1-sonic-scene-aware-baseline/sonic/cpp/g1_project_pose_cli \
+  SONIC_PROJECT_CLI=/home/ubuntu/projects/motion-matching/.worktrees/g1-sonic-scene-aware-baseline/sonic/build/g1_project_pose_cli \
   /home/ubuntu/miniconda3/envs/diffsim/bin/python -m unittest -v \
   tests.python.test_mm_chunk_server \
   tests.python.test_sonic_artifacts \

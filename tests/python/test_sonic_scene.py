@@ -1214,6 +1214,20 @@ class ManifestSchemaTests(unittest.TestCase):
 
 
 class BuildGraphTests(unittest.TestCase):
+    def test_projection_cli_public_target_builds_the_runtime_binary(self):
+        makefile = (ROOT / "sonic/cpp/Makefile").read_text()
+        self.assertIn(
+            "g1_project_pose_cli: $(BUILD_DIR)/g1_project_pose_cli",
+            makefile,
+        )
+        dependency_block = makefile.split(
+            "$(BUILD_DIR)/g1_project_pose_cli:", 1
+        )[1].split("\n\tmkdir", 1)[0]
+        self.assertIn("g1_project_pose_cli.cpp", dependency_block)
+        self.assertIn("g1_joint_contract_io.h", dependency_block)
+        self.assertIn("g1_joint_projection.h", dependency_block)
+        self.assertIn("../configs/g1_joint_contract.json", dependency_block)
+
     def test_server_build_tracks_and_embeds_the_flat_registry(self):
         makefile = (ROOT / "sonic/cpp/Makefile").read_text()
         self.assertIn(
