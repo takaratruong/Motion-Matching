@@ -245,6 +245,7 @@ ControllerPickAssist::ControllerPickAssist(PickAssistConfig config)
 void ControllerPickAssist::cancel() {
     if (diagnostics_.state == PickAssistState::Submitted) return;
     start_ = {};
+    frozen_slot_ = {};
     entry_point_ = {};
     preview_ticks_ = 0U;
     arrival_ticks_ = 0U;
@@ -332,6 +333,87 @@ bool ControllerPickAssist::begin(const PickAssistStart& start) {
     return true;
 }
 
+bool ControllerPickAssist::begin(
+    const PickAssistStart& start,
+    const InteractionTarget* post_step_target) {
+    if (active()) return false;
+
+    start_ = {};
+    frozen_slot_ = {};
+    entry_point_ = {};
+    preview_ticks_ = 0U;
+    arrival_ticks_ = 0U;
+    diagnostics_ = {};
+    diagnostics_.target = start.target_snapshot.handle;
+    diagnostics_.affordance_id = start.affordance_id;
+
+    const auto fail_begin = [this](PickAssistReason reason) {
+        start_ = {};
+        frozen_slot_ = {};
+        entry_point_ = {};
+        preview_ticks_ = 0U;
+        arrival_ticks_ = 0U;
+        diagnostics_.state = PickAssistState::Failed;
+        diagnostics_.reason = reason;
+        return false;
+    };
+
+    if (post_step_target == nullptr ||
+        post_step_target->handle.id != start.target_snapshot.handle.id) {
+        return fail_begin(PickAssistReason::TargetUnavailable);
+    }
+    if (start.target_snapshot.state != ObjectState::Free ||
+        start.target_snapshot.owner_request != 0U ||
+        !same_interaction_target_snapshot(
+            start.target_snapshot, *post_step_target)) {
+        return fail_begin(PickAssistReason::TargetChanged);
+    }
+
+    const GraspAffordance* selected_affordance = nullptr;
+    for (const GraspAffordance& affordance :
+         start.target_snapshot.affordances) {
+        if (affordance.id == start.affordance_id) {
+            selected_affordance = &affordance;
+            break;
+        }
+    }
+    if (selected_affordance == nullptr) {
+        return fail_begin(PickAssistReason::TargetChanged);
+    }
+
+    PickSlotConfig slot_config{};
+    slot_config.maximum_direct_travel_m =
+        config_.maximum_assisted_path_m;
+    diagnostics_.slot_selection = select_pick_slot(
+        start.root_world,
+        start.target_snapshot,
+        *selected_affordance,
+        start.obstacles,
+        slot_config);
+    if (!diagnostics_.slot_selection.selected_index.has_value()) {
+        return fail_begin(pick_assist_reason_from_slot_reason(
+            diagnostics_.slot_selection.reason));
+    }
+
+    const size_t selected_index =
+        *diagnostics_.slot_selection.selected_index;
+    frozen_slot_ = diagnostics_.slot_selection.ordered[selected_index];
+    start_ = start;
+    start_.target = start.target_snapshot.handle;
+    start_.hand = selected_affordance->hand;
+    start_.object_world = start.target_snapshot.object_world;
+
+    diagnostics_.selected_slot = static_cast<int>(selected_index);
+    diagnostics_.selected_slot_id = frozen_slot_.id;
+    diagnostics_.route_length_m = frozen_slot_.route_length_m;
+    diagnostics_.object_origin_distance_m =
+        frozen_slot_.object_origin_distance_m;
+    diagnostics_.object_bounds_center_distance_m =
+        frozen_slot_.object_bounds_center_distance_m;
+    diagnostics_.state = PickAssistState::SlotApproach;
+    return true;
+}
+
 PickAssistOutput ControllerPickAssist::observe(
     const PickAssistObservation& observation) {
     PickAssistOutput output{};
@@ -373,6 +455,8 @@ PickAssistOutput ControllerPickAssist::observe(
     case PickAssistState::Idle:
     case PickAssistState::Submitted:
     case PickAssistState::Failed:
+        return output;
+    case PickAssistState::SlotApproach:
         return output;
     case PickAssistState::CoarseApproach: {
         diagnostics_.root_error_m = planar_distance(
@@ -660,6 +744,7 @@ bool ControllerPickAssist::active() const {
     case PickAssistState::Settling:
     case PickAssistState::FinalPreview:
     case PickAssistState::ReadyToSubmit:
+    case PickAssistState::SlotApproach:
         return true;
     case PickAssistState::Idle:
     case PickAssistState::Submitted:
@@ -688,6 +773,7 @@ const char* pick_assist_state_name(PickAssistState state) {
     case PickAssistState::ReadyToSubmit: return "ReadyToSubmit";
     case PickAssistState::Submitted: return "Submitted";
     case PickAssistState::Failed: return "Failed";
+    case PickAssistState::SlotApproach: return "SlotApproach";
     }
     throw std::runtime_error("invalid pick-assist state");
 }
@@ -706,8 +792,35 @@ const char* pick_assist_reason_name(PickAssistReason reason) {
     case PickAssistReason::ArrivalDeadline: return "ArrivalDeadline";
     case PickAssistReason::FinalPreviewRejected:
         return "FinalPreviewRejected";
+    case PickAssistReason::SlotChanged: return "SlotChanged";
+    case PickAssistReason::NoAuthoredSlot: return "NoAuthoredSlot";
+    case PickAssistReason::InvalidGeometry: return "InvalidGeometry";
+    case PickAssistReason::TableBlocked: return "TableBlocked";
+    case PickAssistReason::ObstacleBlocked: return "ObstacleBlocked";
+    case PickAssistReason::AllSlotsBlocked: return "AllSlotsBlocked";
+    case PickAssistReason::PoorMatch: return "PoorMatch";
     }
     throw std::runtime_error("invalid pick-assist reason");
+}
+
+PickAssistReason pick_assist_reason_from_slot_reason(PickSlotReason reason) {
+    switch (reason) {
+    case PickSlotReason::None:
+        return PickAssistReason::None;
+    case PickSlotReason::NoAuthoredSlot:
+        return PickAssistReason::NoAuthoredSlot;
+    case PickSlotReason::InvalidGeometry:
+        return PickAssistReason::InvalidGeometry;
+    case PickSlotReason::OutsideTravelEnvelope:
+        return PickAssistReason::OutsideTravelEnvelope;
+    case PickSlotReason::TableBlocked:
+        return PickAssistReason::TableBlocked;
+    case PickSlotReason::ObstacleBlocked:
+        return PickAssistReason::ObstacleBlocked;
+    case PickSlotReason::AllSlotsBlocked:
+        return PickAssistReason::AllSlotsBlocked;
+    }
+    throw std::runtime_error("invalid pick-slot reason");
 }
 
 }  // namespace interaction

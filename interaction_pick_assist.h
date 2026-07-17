@@ -2,6 +2,7 @@
 
 #include "interaction_arrival.h"
 #include "interaction_pick_approach.h"
+#include "interaction_pick_slots.h"
 
 #include <array>
 #include <cstdint>
@@ -19,6 +20,7 @@ enum class PickAssistState : uint8_t {
     ReadyToSubmit,
     Submitted,
     Failed,
+    SlotApproach,
 };
 
 enum class PickAssistReason : uint8_t {
@@ -32,6 +34,13 @@ enum class PickAssistReason : uint8_t {
     PreviewDeadline,
     ArrivalDeadline,
     FinalPreviewRejected,
+    SlotChanged,
+    NoAuthoredSlot,
+    InvalidGeometry,
+    TableBlocked,
+    ObstacleBlocked,
+    AllSlotsBlocked,
+    PoorMatch,
 };
 
 struct PickAssistConfig {
@@ -47,6 +56,10 @@ struct PickAssistConfig {
 };
 
 struct PickAssistStart {
+    InteractionTarget target_snapshot{};
+    std::vector<PickNavigationObstacle> obstacles{};
+
+    // Temporary compatibility surface for the legacy two-slot funnel tests.
     TargetHandle target{};
     uint32_t affordance_id = 0U;
     Hand hand = Hand::Right;
@@ -98,10 +111,15 @@ struct PickAssistDiagnostics {
     TargetHandle target{};
     uint32_t affordance_id = 0U;
     int selected_slot = -1;
+    uint32_t selected_slot_id = 0U;
+    PickSlotSelection slot_selection{};
     uint32_t settle_ticks = 0U;
     std::array<float, 2> slot_route_lengths_m{};
     std::array<bool, 2> slot_permitted{};
     float route_length_m = 0.0F;
+    float assisted_travel_m = 0.0F;
+    float object_origin_distance_m = 0.0F;
+    float object_bounds_center_distance_m = 0.0F;
     float root_error_m = 0.0F;
     float yaw_error_radians = 0.0F;
     float speed_mps = 0.0F;
@@ -112,6 +130,9 @@ class ControllerPickAssist {
 public:
     explicit ControllerPickAssist(PickAssistConfig config = {});
     bool begin(const PickAssistStart& start);
+    bool begin(
+        const PickAssistStart& start,
+        const InteractionTarget* post_step_target);
     void cancel();
     PickAssistOutput observe(const PickAssistObservation& observation);
     std::optional<PickRequest> take_submission(uint64_t request_id);
@@ -122,6 +143,7 @@ public:
 private:
     PickAssistConfig config_{};
     PickAssistStart start_{};
+    MappedPickSlot frozen_slot_{};
     vec3 entry_point_{};
     uint32_t preview_ticks_ = 0U;
     uint32_t arrival_ticks_ = 0U;
@@ -130,5 +152,6 @@ private:
 
 const char* pick_assist_state_name(PickAssistState state);
 const char* pick_assist_reason_name(PickAssistReason reason);
+PickAssistReason pick_assist_reason_from_slot_reason(PickSlotReason reason);
 
 }  // namespace interaction

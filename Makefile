@@ -62,6 +62,7 @@ INTERACTION_SOURCES := interaction_pose.cpp interaction_target.cpp \
   interaction_target_rig_ik.cpp $(INTERACTION_PLACE_SOURCES)
 CONTROLLER_LOCOMOTION_SOURCES := interaction_arrival.cpp \
   interaction_pick_assist.cpp \
+  interaction_pick_slots.cpp \
   interaction_pick_approach.cpp \
   locomotion_controller_update.cpp
 SOURCE := controller.cpp $(INTERACTION_SOURCES) \
@@ -150,10 +151,12 @@ LIVE_FLAT_PICK_ENTRY_ORACLE_TEST := \
 LIVE_FLAT_PICK_ENTRY_ORACLE_RELEASE_TEST := \
   $(CPP_TEST_DIR)/test_live_flat_pick_entry_oracle_release_fast_math
 LIVE_FLAT_PICK_ASSIST_SOURCES := interaction_pick_assist.cpp \
-  interaction_pick_approach.cpp interaction_arrival.cpp \
+  interaction_pick_slots.cpp interaction_pick_approach.cpp \
+  interaction_arrival.cpp \
   locomotion_controller_update.cpp
 LIVE_FLAT_PICK_ASSIST_HEADERS := interaction_pick_assist.h \
-  interaction_pick_approach.h interaction_arrival.h \
+  interaction_pick_slots.h interaction_pick_approach.h \
+  interaction_arrival.h \
   locomotion_controller_update.h
 LIVE_FLAT_PICK_ENTRY_ORACLE_TIMEOUT_SECONDS := 10
 LIVE_FLAT_PICK_ENTRY_ORACLE_GOLDEN := stationary=186 sampled=1 cases=1 ready=1 reach=1 minus=0 plus=0 executed=1 ex_reach=1 ex_minus=0 ex_plus=0 first=0/R/114/139 selection=Reach direct_entry=114
@@ -269,8 +272,8 @@ $(CPP_TEST_DIR)/test_interaction_arrival_controller: tests/cpp/test_interaction_
 $(CPP_TEST_DIR)/test_interaction_pick_approach: tests/cpp/test_interaction_pick_approach.cpp interaction_pick_approach.cpp interaction_pick_approach.h interaction_runtime.h interaction_matcher.h interaction_features.h interaction_pose.cpp interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_pick_approach.cpp interaction_pick_approach.cpp interaction_pose.cpp -o $@
 
-$(CPP_TEST_DIR)/test_interaction_pick_assist: tests/cpp/test_interaction_pick_assist.cpp interaction_pick_assist.cpp interaction_pick_assist.h interaction_pick_approach.cpp interaction_pick_approach.h interaction_arrival.cpp interaction_arrival.h interaction_pose.cpp interaction_pose.h | $(CPP_TEST_DIR)
-	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_pick_assist.cpp interaction_pick_assist.cpp interaction_pick_approach.cpp interaction_arrival.cpp interaction_pose.cpp -o $@
+$(CPP_TEST_DIR)/test_interaction_pick_assist: tests/cpp/test_interaction_pick_assist.cpp interaction_pick_assist.cpp interaction_pick_assist.h interaction_pick_slots.cpp interaction_pick_slots.h interaction_pick_approach.cpp interaction_pick_approach.h interaction_arrival.cpp interaction_arrival.h interaction_target.cpp interaction_target.h interaction_pose.cpp interaction_pose.h | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_pick_assist.cpp interaction_pick_assist.cpp interaction_pick_slots.cpp interaction_pick_approach.cpp interaction_arrival.cpp interaction_target.cpp interaction_pose.cpp -o $@
 
 $(ARRIVAL_CONTROLLER_RELEASE_FAST_MATH_TEST): tests/cpp/test_interaction_arrival_controller.cpp $(INTERACTION_ARRIVAL_BUILD_INPUTS) $(LOCOMOTION_CONTROLLER_UPDATE_BUILD_INPUTS) array.h vec.h quat.h common.h spring.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) -Wno-unused-parameter -O3 -DNDEBUG -ffast-math tests/cpp/test_interaction_arrival_controller.cpp interaction_arrival.cpp locomotion_controller_update.cpp -o $@
