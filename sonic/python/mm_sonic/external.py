@@ -254,6 +254,25 @@ def verify_gear_checkout(
     )
 
 
+def locked_gear_capability_paths(
+    gear_checkout: Path,
+    lock: Path,
+) -> tuple[Path, ...]:
+    """Return the exact GEAR files authenticated through the lock contract."""
+
+    lock_data = _load_lock(lock)
+    sources = tuple(
+        gear_checkout.joinpath(*PurePosixPath(lock_data[key]).parts)
+        for key in SOURCE_PATH_KEYS
+    )
+    reference = gear_checkout.joinpath(
+        *PurePosixPath(lock_data["known_good_reference"]).parts
+    )
+    return sources + tuple(
+        reference / name for name in KNOWN_GOOD_REFERENCE_FILES
+    )
+
+
 def verify_external(
     inputs: ExternalInputs,
     lock: Path,
@@ -626,6 +645,7 @@ __all__ = [
     "ExternalInputs",
     "VerifiedExternal",
     "VerifiedGearCheckout",
+    "locked_gear_capability_paths",
     "verify_external",
     "verify_gear_checkout",
 ]

@@ -2564,85 +2564,172 @@ class ProductionAdapterBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, "body positions"):
             cli_module._require_streamable_body_position(body_position)
 
-    def test_lfs_capability_scan_covers_every_external_payload(self) -> None:
+    def _lfs_runtime_boundary_fixture(self):
         pointer = (
             b"version https://git-lfs.github.com/spec/v1\n"
             + b"oid sha256:"
             + b"0" * 64
             + b"\nsize 123\n"
         )
-        locations = (
-            "policy",
-            "observation_config",
-            "source_mjcf",
-            "encoder",
-            "checkout",
-            "terrain",
-        )
-        for index, location in enumerate(locations):
-            with self.subTest(location=location):
-                root = self.root / f"lfs-{index}"
-                gear = root / "gear"
-                terrain = root / "terrain"
-                gear.mkdir(parents=True)
-                terrain.mkdir()
-                policy = root / "policy.onnx"
-                observation = root / "observation.yaml"
-                source = root / "source.xml"
-                encoder = root / "encoder.onnx"
-                for path in (policy, observation, source, encoder):
-                    path.write_bytes(b"resolved payload\n")
-                (gear / "resolved.bin").write_bytes(b"resolved checkout\n")
-                (terrain / "resolved.bin").write_bytes(b"resolved terrain\n")
-                targets = {
-                    "policy": policy,
-                    "observation_config": observation,
-                    "source_mjcf": source,
-                    "encoder": encoder,
-                    "checkout": gear / "nested/models/checkpoint.bin",
-                    "terrain": terrain / "nested/scenes/heightfield.bin",
-                }
-                target = targets[location]
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(pointer)
-                inputs = ExternalInputs(
-                    gear_checkout=gear,
-                    policy=policy,
-                    observation_config=observation,
-                    encoder=encoder,
-                    terrain_dir=terrain,
-                    source_mjcf=source,
-                )
-                self.assertEqual(
-                    cli_module._find_unresolved_git_lfs_capabilities(inputs),
-                    (target,),
-                )
+        root = self.root / "lfs-runtime-boundary"
+        gear = root / "gear"
+        terrain = root / "terrain"
+        gear.mkdir(parents=True)
+        terrain.mkdir()
+        policy = root / "explicit/policy.onnx"
+        observation = root / "explicit/observation.yaml"
+        source = root / "explicit/source.xml"
+        encoder = root / "explicit/encoder.onnx"
 
-        metadata_root = self.root / "lfs-git-metadata"
-        gear = metadata_root / "gear"
-        terrain = metadata_root / "terrain"
-        (gear / ".git/objects").mkdir(parents=True)
-        terrain.mkdir(parents=True)
-        policy = metadata_root / "policy.onnx"
-        observation = metadata_root / "observation.yaml"
-        source = metadata_root / "source.xml"
-        encoder = metadata_root / "encoder.onnx"
-        for path in (policy, observation, source, encoder):
-            path.write_bytes(b"resolved payload\n")
-        (gear / ".git/objects/not-a-worktree-payload").write_bytes(pointer)
+        lock = json.loads(cli_module._LOCK_PATH.read_text(encoding="utf-8"))
+        locked_sources = tuple(
+            gear / lock[key]
+            for key in (
+                "joint_names_source",
+                "policy_parameters_source",
+                "zmq_example_source",
+                "zmq_decoder_source",
+                "stream_merger_source",
+                "current_frame_advancement_source",
+            )
+        )
+        known_good = tuple(
+            gear / lock["known_good_reference"] / name
+            for name in cli_module.KNOWN_GOOD_REFERENCE_FILES
+        )
+        official_runtime = (
+            gear / cli_module._GEAR_MODEL_RELATIVE,
+            gear / cli_module._GEAR_ROBOT_RELATIVE,
+            gear / cli_module._GEAR_BINARY_RELATIVE,
+            gear / "gear_sonic_deploy/g1/meshes/nested/runtime-mesh.STL",
+        )
+        terrain_payload = terrain / "nested/heightfield.bin"
+        required = (
+            policy,
+            observation,
+            source,
+            encoder,
+            *locked_sources,
+            *known_good,
+            *official_runtime,
+            terrain_payload,
+        )
+        for target in required:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"resolved runtime payload\n")
+        inputs = ExternalInputs(
+            gear_checkout=gear,
+            policy=policy,
+            observation_config=observation,
+            encoder=encoder,
+            terrain_dir=terrain,
+            source_mjcf=source,
+        )
+        return inputs, required, pointer
+
+    def test_lfs_capability_scan_covers_exact_runtime_boundary(self) -> None:
+        inputs, required, pointer = self._lfs_runtime_boundary_fixture()
+        self.assertEqual(len(required), 23)
+
+        for target in required:
+            with self.subTest(target=target):
+                target.write_bytes(pointer)
+                try:
+                    self.assertEqual(
+                        cli_module._find_unresolved_git_lfs_capabilities(inputs),
+                        (target,),
+                    )
+                finally:
+                    target.write_bytes(b"resolved runtime payload\n")
+
         self.assertEqual(
             cli_module._find_unresolved_git_lfs_capabilities(
-                ExternalInputs(
-                    gear_checkout=gear,
-                    policy=policy,
-                    observation_config=observation,
-                    encoder=encoder,
-                    terrain_dir=terrain,
-                    source_mjcf=source,
-                )
+                replace(inputs, encoder=None)
             ),
             (),
         )
+
+        duplicated = required[4]
+        duplicated.write_bytes(pointer)
+        try:
+            self.assertEqual(
+                cli_module._find_unresolved_git_lfs_capabilities(
+                    replace(inputs, policy=duplicated, encoder=None)
+                ),
+                (duplicated,),
+            )
+        finally:
+            duplicated.write_bytes(b"resolved runtime payload\n")
+
+        simultaneous = (required[0], required[-1])
+        for target in simultaneous:
+            target.write_bytes(pointer)
+        try:
+            self.assertEqual(
+                cli_module._find_unresolved_git_lfs_capabilities(inputs),
+                simultaneous,
+            )
+        finally:
+            for target in simultaneous:
+                target.write_bytes(b"resolved runtime payload\n")
+
+    def test_lfs_capability_scan_excludes_unrelated_gear_payloads(self) -> None:
+        inputs, _required, pointer = self._lfs_runtime_boundary_fixture()
+        gear = inputs.gear_checkout
+        excluded = (
+            gear / "datasets/unrelated-corpus.bin",
+            gear / "checkpoints/excluded-training.ckpt",
+            gear / "gear_sonic_deploy/policy/training/excluded-policy.onnx",
+            gear / "gear_sonic_deploy/g1/images/preview.png",
+            gear / ".git/objects/not-a-runtime-payload",
+        )
+        for target in excluded:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(pointer)
+
+        self.assertEqual(
+            cli_module._find_unresolved_git_lfs_capabilities(inputs),
+            (),
+        )
+        explicit_training_policy = replace(inputs, policy=excluded[2], encoder=None)
+        self.assertEqual(
+            cli_module._find_unresolved_git_lfs_capabilities(
+                explicit_training_policy
+            ),
+            (excluded[2],),
+        )
+
+    def test_lfs_capability_scan_is_symlink_safe_and_fail_closed(self) -> None:
+        inputs, _required, pointer = self._lfs_runtime_boundary_fixture()
+        outside_file = self.root / "outside-pointer.bin"
+        outside_file.write_bytes(pointer)
+        outside_directory = self.root / "outside-directory"
+        outside_directory.mkdir()
+        (outside_directory / "nested-pointer.bin").write_bytes(pointer)
+        meshes = inputs.gear_checkout / "gear_sonic_deploy/g1/meshes"
+        (meshes / "linked-file.bin").symlink_to(outside_file)
+        (meshes / "linked-directory").symlink_to(
+            outside_directory,
+            target_is_directory=True,
+        )
+        self.assertEqual(
+            cli_module._find_unresolved_git_lfs_capabilities(inputs),
+            (),
+        )
+
+        def denied_walk(root, *, topdown, onerror, followlinks):
+            self.assertIn(root, (meshes, inputs.terrain_dir))
+            self.assertTrue(topdown)
+            self.assertFalse(followlinks)
+            onerror(PermissionError(f"synthetic traversal denial: {root}"))
+            return ()
+
+        with patch.object(cli_module.os, "walk", side_effect=denied_walk):
+            with self.assertRaisesRegex(
+                cli_module.CapabilityUnavailable,
+                "cannot scan official GEAR mesh assets",
+            ):
+                cli_module._find_unresolved_git_lfs_capabilities(inputs)
 
     def test_authenticated_455_by_14_source_projects_to_explicit_441_by_1_bundle(
         self,

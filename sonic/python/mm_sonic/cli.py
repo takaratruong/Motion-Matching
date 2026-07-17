@@ -36,6 +36,7 @@ from .external import (
     ExternalInputError,
     ExternalInputs,
     KNOWN_GOOD_REFERENCE_FILES,
+    locked_gear_capability_paths,
     verify_external,
 )
 from .joints import (
@@ -94,6 +95,7 @@ _STAGE_A_REGISTRY_PATH = _SONIC_ROOT / "configs/experiments/stage_a.json"
 _GEAR_TARGET_ORDER_RELATIVE = Path("gear_sonic/envs/manager_env/robots/g1.py")
 _GEAR_MODEL_RELATIVE = Path("gear_sonic_deploy/g1/scene_29dof_with_hand.xml")
 _GEAR_ROBOT_RELATIVE = Path("gear_sonic_deploy/g1/g1_29dof_with_hand.xml")
+_GEAR_MESHES_RELATIVE = Path("gear_sonic_deploy/g1/meshes")
 _GEAR_BINARY_RELATIVE = Path(
     "gear_sonic_deploy/target/release/g1_deploy_onnx_ref"
 )
@@ -901,7 +903,6 @@ def _walk_capability_files(
     root: Path,
     *,
     label: str,
-    exclude_git_metadata: bool = False,
 ) -> tuple[Path, ...]:
     """Enumerate every regular capability file without following symlinks."""
 
@@ -916,11 +917,7 @@ def _walk_capability_files(
         onerror=failed,
         followlinks=False,
     ):
-        directories[:] = sorted(
-            name
-            for name in directories
-            if not (exclude_git_metadata and name == ".git")
-        )
+        directories[:] = sorted(directories)
         base = Path(directory)
         for name in sorted(files):
             candidate = base / name
@@ -938,7 +935,7 @@ def _walk_capability_files(
 def _find_unresolved_git_lfs_capabilities(
     inputs: ExternalInputs,
 ) -> tuple[Path, ...]:
-    """Scan every scored external payload that can be backed by Git-LFS."""
+    """Scan only external payloads required by the Stage A runtime."""
 
     candidates = [
         inputs.policy,
@@ -948,17 +945,36 @@ def _find_unresolved_git_lfs_capabilities(
     if inputs.encoder is not None:
         candidates.append(inputs.encoder)
     candidates.extend(
-        _walk_capability_files(
-            inputs.gear_checkout,
-            label="GEAR checkout",
-            exclude_git_metadata=True,
-        )
+        locked_gear_capability_paths(inputs.gear_checkout, _LOCK_PATH)
     )
     candidates.extend(
-        _walk_capability_files(inputs.terrain_dir, label="terrain input")
+        (
+            inputs.gear_checkout / _GEAR_MODEL_RELATIVE,
+            inputs.gear_checkout / _GEAR_ROBOT_RELATIVE,
+            inputs.gear_checkout / _GEAR_BINARY_RELATIVE,
+        )
     )
-    unique = dict.fromkeys(candidates)
-    return tuple(path for path in unique if is_git_lfs_pointer(path))
+
+    scan_errors: list[CapabilityUnavailable] = []
+    for root, label in (
+        (
+            inputs.gear_checkout / _GEAR_MESHES_RELATIVE,
+            "official GEAR mesh assets",
+        ),
+        (inputs.terrain_dir, "terrain input"),
+    ):
+        try:
+            candidates.extend(_walk_capability_files(root, label=label))
+        except CapabilityUnavailable as error:
+            scan_errors.append(error)
+    pointers = tuple(
+        path for path in dict.fromkeys(candidates) if is_git_lfs_pointer(path)
+    )
+    if pointers:
+        return pointers
+    if scan_errors:
+        raise scan_errors[0]
+    return ()
 
 
 def _child_environment(
