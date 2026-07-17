@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -455,6 +456,148 @@ void test_slot_approach_emits_far_camera_relative_steering() {
             same_frozen_provenance(
                 rotated_assist.diagnostics(), assist.diagnostics()),
         "camera azimuth changed frozen slot ID, index, root, or route provenance");
+}
+
+void test_slot_approach_accumulates_inclusive_travel_and_rejects_overshoot() {
+    const auto configure_travel_scenario = [](FrozenSlotScenario& scenario) {
+        scenario.target.object_world.position.x = 0.80F;
+        scenario.start.target_snapshot = scenario.target;
+        scenario.start.root_world = {
+            vec3(0.0F, 0.0F, 0.50F), quat()};
+        scenario.observation.displayed_root = scenario.start.root_world;
+        scenario.observation.target = &scenario.target;
+    };
+    const auto planar_endpoint_distance = [](vec3 left, vec3 right) {
+        return static_cast<float>(std::hypot(
+            static_cast<double>(left.x) - static_cast<double>(right.x),
+            static_cast<double>(left.z) - static_cast<double>(right.z)));
+    };
+    const auto same_float_bits = [](float left, float right) {
+        return std::memcmp(&left, &right, sizeof(left)) == 0;
+    };
+    const auto same_transform_bits = [&](
+        interaction::Transform left,
+        interaction::Transform right) {
+        return same_float_bits(left.position.x, right.position.x) &&
+            same_float_bits(left.position.y, right.position.y) &&
+            same_float_bits(left.position.z, right.position.z) &&
+            same_float_bits(left.rotation.w, right.rotation.w) &&
+            same_float_bits(left.rotation.x, right.rotation.x) &&
+            same_float_bits(left.rotation.y, right.rotation.y) &&
+            same_float_bits(left.rotation.z, right.rotation.z);
+    };
+
+    FrozenSlotScenario inclusive_scenario;
+    configure_travel_scenario(inclusive_scenario);
+    interaction::ControllerPickAssist inclusive_assist;
+    require(
+        inclusive_assist.begin(
+            inclusive_scenario.start, &inclusive_scenario.target),
+        "inclusive-travel fixture begin failed");
+    require(
+        inclusive_assist.diagnostics().selected_slot_id == 9U &&
+            inclusive_assist.diagnostics()
+                .slot_selection.selected_index.has_value(),
+        "inclusive-travel fixture did not select slot ID 9");
+    const size_t inclusive_index =
+        *inclusive_assist.diagnostics().slot_selection.selected_index;
+    const interaction::MappedPickSlot& inclusive_slot =
+        inclusive_assist.diagnostics().slot_selection.ordered[
+            inclusive_index];
+    require(
+        inclusive_slot.root_world.position.x == 0.80F &&
+            inclusive_slot.root_world.position.z == 0.50F,
+        "inclusive-travel fixture did not map slot ID 9 to (0.80, 0.50)");
+
+    const vec3 start_endpoint =
+        inclusive_scenario.start.root_world.position;
+    inclusive_scenario.observation.displayed_root.position =
+        vec3(0.50F, 0.0F, 0.50F);
+    const vec3 middle_endpoint =
+        inclusive_scenario.observation.displayed_root.position;
+    inclusive_assist.observe(inclusive_scenario.observation);
+    require(
+        inclusive_assist.diagnostics().state ==
+                interaction::PickAssistState::SlotApproach &&
+            inclusive_assist.diagnostics().reason ==
+                interaction::PickAssistReason::None,
+        "first inclusive-travel endpoint left SlotApproach");
+
+    inclusive_scenario.observation.displayed_root.position =
+        vec3(1.00002F, 0.0F, 0.50F);
+    const vec3 boundary_endpoint =
+        inclusive_scenario.observation.displayed_root.position;
+    inclusive_assist.observe(inclusive_scenario.observation);
+    const float expected_assisted_travel_m =
+        planar_endpoint_distance(start_endpoint, middle_endpoint) +
+        planar_endpoint_distance(middle_endpoint, boundary_endpoint);
+    require(
+        same_float_bits(expected_assisted_travel_m, 1.00002F),
+        "inclusive endpoint arithmetic did not equal exactly 1.00002 m");
+    require(
+        same_float_bits(
+            inclusive_assist.diagnostics().assisted_travel_m,
+            expected_assisted_travel_m),
+        "inclusive travel did not accumulate consecutive planar endpoint distances");
+    require(
+        inclusive_assist.diagnostics().state ==
+                interaction::PickAssistState::SlotApproach &&
+            inclusive_assist.diagnostics().reason ==
+                interaction::PickAssistReason::None,
+        "exactly 1.00002 m assisted travel left SlotApproach");
+
+    FrozenSlotScenario overshoot_scenario;
+    configure_travel_scenario(overshoot_scenario);
+    interaction::ControllerPickAssist overshoot_assist;
+    require(
+        overshoot_assist.begin(
+            overshoot_scenario.start, &overshoot_scenario.target),
+        "overshoot fixture begin failed");
+    const interaction::PickAssistDiagnostics frozen_before =
+        overshoot_assist.diagnostics();
+    require(
+        frozen_before.selected_slot_id == 9U &&
+            frozen_before.slot_selection.selected_index.has_value(),
+        "overshoot fixture did not select slot ID 9");
+    const size_t frozen_index =
+        *frozen_before.slot_selection.selected_index;
+    const interaction::MappedPickSlot frozen_slot =
+        frozen_before.slot_selection.ordered[frozen_index];
+    const float first_overshoot = std::nextafter(
+        1.00002F, std::numeric_limits<float>::infinity());
+    overshoot_scenario.observation.displayed_root.position =
+        vec3(first_overshoot, 0.0F, 0.50F);
+    const interaction::PickAssistOutput overshoot_output =
+        overshoot_assist.observe(overshoot_scenario.observation);
+    const interaction::PickAssistDiagnostics& failed =
+        overshoot_assist.diagnostics();
+    require(
+        failed.state == interaction::PickAssistState::Failed &&
+            failed.reason ==
+                interaction::PickAssistReason::OutsideTravelEnvelope,
+        "first representable assisted-travel overshoot did not fail visibly");
+    require(
+        !overshoot_assist.active() &&
+            !overshoot_assist.owns_manual_interact() &&
+            !overshoot_output.submit_interact &&
+            !overshoot_assist.take_submission(71U).has_value(),
+        "assisted-travel overshoot retained ownership or submitted");
+    require(
+        failed.selected_slot == frozen_before.selected_slot &&
+            failed.selected_slot_id == frozen_before.selected_slot_id &&
+            failed.slot_selection.selected_index ==
+                frozen_before.slot_selection.selected_index &&
+            failed.slot_selection.ordered.size() ==
+                frozen_before.slot_selection.ordered.size() &&
+            same_float_bits(
+                failed.route_length_m, frozen_before.route_length_m) &&
+            same_transform_bits(
+                failed.slot_selection.ordered[frozen_index].root_world,
+                frozen_slot.root_world) &&
+            same_float_bits(
+                failed.slot_selection.ordered[frozen_index].route_length_m,
+                frozen_slot.route_length_m),
+        "assisted-travel overshoot reselected or changed frozen diagnostics");
 }
 
 void require_frozen_slot_begin_failure(
@@ -1728,6 +1871,7 @@ int main() {
         test_idle_does_not_override_input();
         test_begin_selects_and_freezes_one_authored_slot();
         test_slot_approach_emits_far_camera_relative_steering();
+        test_slot_approach_accumulates_inclusive_travel_and_rejects_overshoot();
         test_begin_maps_every_aggregate_no_winner_reason();
         test_slot_reason_mapping_is_exhaustive_and_same_named();
         test_failed_begin_can_immediately_begin_a_valid_attempt();
