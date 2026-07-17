@@ -711,7 +711,7 @@ void test_slot_approach_target_unavailable_failures_are_stable() {
 }
 
 void test_slot_approach_target_snapshot_failures_are_stable() {
-    const std::array<FrozenSlotObservationFailureCase, 5> cases{{
+    const std::array<FrozenSlotObservationFailureCase, 8> cases{{
         {
             "same-ID generation mutation",
             interaction::PickAssistReason::TargetChanged,
@@ -751,6 +751,39 @@ void test_slot_approach_target_snapshot_failures_are_stable() {
                     affordance.hand_in_object.position.x, 1.0F);
             },
         },
+        {
+            "combined generation and selected-slot mutation",
+            interaction::PickAssistReason::TargetChanged,
+            [](FrozenSlotScenario& scenario) {
+                ++scenario.target.handle.generation;
+                interaction::GraspInteractionSlot& slot =
+                    selected_authored_slot(scenario);
+                slot.root_x_object_m = std::nextafter(
+                    slot.root_x_object_m, 1.0F);
+            },
+        },
+        {
+            "combined targeted state and selected-slot mutation",
+            interaction::PickAssistReason::TargetChanged,
+            [](FrozenSlotScenario& scenario) {
+                scenario.target.state = interaction::ObjectState::Targeted;
+                interaction::GraspInteractionSlot& slot =
+                    selected_authored_slot(scenario);
+                slot.root_x_object_m = std::nextafter(
+                    slot.root_x_object_m, 1.0F);
+            },
+        },
+        {
+            "combined owner request and selected-slot mutation",
+            interaction::PickAssistReason::TargetChanged,
+            [](FrozenSlotScenario& scenario) {
+                scenario.target.owner_request = 811U;
+                interaction::GraspInteractionSlot& slot =
+                    selected_authored_slot(scenario);
+                slot.root_x_object_m = std::nextafter(
+                    slot.root_x_object_m, 1.0F);
+            },
+        },
     }};
     for (const FrozenSlotObservationFailureCase& test_case : cases) {
         expect_frozen_slot_observation_failure(test_case);
@@ -758,7 +791,7 @@ void test_slot_approach_target_snapshot_failures_are_stable() {
 }
 
 void test_slot_approach_slot_identity_failures_precede_snapshot_mismatch() {
-    const std::array<FrozenSlotObservationFailureCase, 4> cases{{
+    const std::array<FrozenSlotObservationFailureCase, 7> cases{{
         {
             "selected authored slot geometry mutation",
             interaction::PickAssistReason::SlotChanged,
@@ -798,6 +831,31 @@ void test_slot_approach_slot_identity_failures_precede_snapshot_mismatch() {
                     slot.root_z_object_m, 1.0F);
                 scenario.target.object_world.position.z = std::nextafter(
                     scenario.target.object_world.position.z, 1.0F);
+            },
+        },
+        {
+            "selected authored slot ID changed to zero",
+            interaction::PickAssistReason::SlotChanged,
+            [](FrozenSlotScenario& scenario) {
+                selected_authored_slot(scenario).id = 0U;
+            },
+        },
+        {
+            "selected authored slot ID changed to a duplicate",
+            interaction::PickAssistReason::SlotChanged,
+            [](FrozenSlotScenario& scenario) {
+                interaction::GraspInteractionSlot& slot =
+                    selected_authored_slot(scenario);
+                slot.id = scenario.target.affordances.front()
+                    .interaction_slots.front().id;
+            },
+        },
+        {
+            "selected authored slot geometry changed to NaN",
+            interaction::PickAssistReason::SlotChanged,
+            [](FrozenSlotScenario& scenario) {
+                selected_authored_slot(scenario).root_x_object_m =
+                    float_from_bits(0x7fc00001U);
             },
         },
     }};
@@ -973,9 +1031,6 @@ void test_slot_approach_latches_inclusive_arrival_boundaries() {
     const float derived_yaw_error_radians = wrapped_yaw_error(
         scenario.observation.displayed_root.rotation,
         frozen_slot.root_world.rotation);
-    const float legacy_object_origin_standoff_m = planar_distance(
-        scenario.observation.displayed_root.position,
-        scenario.target.object_world.position);
     require(
         same_float_bits_exact(
             derived_root_error_m,
@@ -987,11 +1042,6 @@ void test_slot_approach_latches_inclusive_arrival_boundaries() {
                 derived_yaw_error_radians,
                 config.arrival.maximum_yaw_error_radians),
         "inclusive arrival fixture metrics were not exactly on all three boundaries");
-    require(
-        legacy_object_origin_standoff_m >
-            config.arrival.maximum_standoff_m,
-        "inclusive arrival fixture did not exclude the legacy standoff gate");
-
     const interaction::PickAssistOutput output =
         assist.observe(scenario.observation);
     require(
@@ -1064,9 +1114,6 @@ void test_slot_approach_rejects_adjacent_arrival_overshoots() {
         const float derived_yaw_error_radians = wrapped_yaw_error(
             scenario.observation.displayed_root.rotation,
             frozen_slot.root_world.rotation);
-        const float legacy_object_origin_standoff_m = planar_distance(
-            scenario.observation.displayed_root.position,
-            scenario.target.object_world.position);
         require(
             same_float_bits_exact(
                 derived_root_error_m, position_error_above) &&
@@ -1079,11 +1126,6 @@ void test_slot_approach_rejects_adjacent_arrival_overshoots() {
                     derived_yaw_error_radians,
                     config.arrival.maximum_yaw_error_radians),
             "adjacent-position fixture changed more than its position metric");
-        require(
-            legacy_object_origin_standoff_m >
-                config.arrival.maximum_standoff_m,
-            "adjacent-position fixture did not exclude the legacy standoff gate");
-
         const interaction::PickAssistOutput output =
             assist.observe(scenario.observation);
         require(
@@ -1130,9 +1172,6 @@ void test_slot_approach_rejects_adjacent_arrival_overshoots() {
         const float derived_yaw_error_radians = wrapped_yaw_error(
             scenario.observation.displayed_root.rotation,
             frozen_slot.root_world.rotation);
-        const float legacy_object_origin_standoff_m = planar_distance(
-            scenario.observation.displayed_root.position,
-            scenario.target.object_world.position);
         require(
             same_float_bits_exact(
                 derived_root_error_m,
@@ -1146,11 +1185,6 @@ void test_slot_approach_rejects_adjacent_arrival_overshoots() {
                     derived_yaw_error_radians,
                     config.arrival.maximum_yaw_error_radians),
             "adjacent-speed fixture changed more than its simulation-speed metric");
-        require(
-            legacy_object_origin_standoff_m >
-                config.arrival.maximum_standoff_m,
-            "adjacent-speed fixture did not exclude the legacy standoff gate");
-
         const interaction::PickAssistOutput output =
             assist.observe(scenario.observation);
         require(
@@ -1198,9 +1232,6 @@ void test_slot_approach_rejects_adjacent_arrival_overshoots() {
             frozen_slot.root_world.rotation);
         const float first_derived_yaw_above = std::nextafter(
             config.arrival.maximum_yaw_error_radians, infinity);
-        const float legacy_object_origin_standoff_m = planar_distance(
-            scenario.observation.displayed_root.position,
-            scenario.target.object_world.position);
         require(
             same_float_bits_exact(
                 derived_root_error_m,
@@ -1214,11 +1245,6 @@ void test_slot_approach_rejects_adjacent_arrival_overshoots() {
                 derived_yaw_error_radians >
                     config.arrival.maximum_yaw_error_radians,
             "one-ULP yaw quaternion did not produce the first derived yaw above the bound");
-        require(
-            legacy_object_origin_standoff_m >
-                config.arrival.maximum_standoff_m,
-            "adjacent-yaw fixture did not exclude the legacy standoff gate");
-
         const interaction::PickAssistOutput output =
             assist.observe(scenario.observation);
         require(
