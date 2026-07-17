@@ -32,10 +32,34 @@ using ProjectSignature = bool (*)(
     char*,
     int);
 
+using ProjectJointStateSignature = bool (*)(
+    float (&)[SonicG1JointCount],
+    float (&)[SonicG1JointCount],
+    float (&)[SonicG1JointCount],
+    sonic_joint_projection_diagnostic&,
+    const sonic_joint_contract_entry (&)[SonicG1JointCount],
+    slice1d<quat>,
+    slice1d<vec3>,
+    char*,
+    int);
+
 static_assert(SonicG1JointCount == 29, "SONIC G1 joint count");
 static_assert(
     std::is_same<decltype(&sonic_project_pose), ProjectSignature>::value,
     "public projection signature");
+static_assert(
+    std::is_same<
+        decltype(&sonic_project_joint_state),
+        ProjectJointStateSignature>::value,
+    "public joint-state projection signature");
+static_assert(SonicJointProjectionValid == 0, "valid diagnostic value");
+static_assert(SonicJointProjectionShape == 1, "shape diagnostic value");
+static_assert(SonicJointProjectionContract == 2, "contract diagnostic value");
+static_assert(SonicJointProjectionInput == 3, "input diagnostic value");
+static_assert(SonicJointProjectionSingular == 4, "singular diagnostic value");
+static_assert(SonicJointProjectionResidual == 5, "residual diagnostic value");
+static_assert(SonicJointProjectionLimit == 6, "limit diagnostic value");
+static_assert(SonicJointProjectionVelocity == 7, "velocity diagnostic value");
 
 static bool near(float left, float right, float tolerance = 2.0e-5f)
 {
@@ -55,6 +79,25 @@ static void poison(sonic_projected_pose& value)
     for (std::size_t index = 0; index < sizeof(value); ++index) {
         bytes[index] = static_cast<unsigned char>(0xa5U + index % 23U);
     }
+}
+
+static void poison_joint_outputs(
+    float (&positions)[SonicG1JointCount],
+    float (&velocities)[SonicG1JointCount],
+    float (&residuals)[SonicG1JointCount])
+{
+    for (int row = 0; row < SonicG1JointCount; ++row) {
+        positions[row] = 101.0f + static_cast<float>(row);
+        velocities[row] = -202.0f - static_cast<float>(row);
+        residuals[row] = 303.0f + 2.0f * static_cast<float>(row);
+    }
+}
+
+static bool same_joint_output_bytes(
+    const float (&left)[SonicG1JointCount],
+    const float (&right)[SonicG1JointCount])
+{
+    return std::memcmp(left, right, sizeof(left)) == 0;
 }
 
 struct ProjectionFixture
@@ -135,7 +178,218 @@ struct ProjectionFixture
             error,
             static_cast<int>(sizeof(error)));
     }
+
+    bool project_joint_state(
+        float (&positions)[SonicG1JointCount],
+        float (&velocities)[SonicG1JointCount],
+        float (&residuals)[SonicG1JointCount],
+        sonic_joint_projection_diagnostic& diagnostic)
+    {
+        std::memset(error, 0, sizeof(error));
+        return sonic_project_joint_state(
+            positions,
+            velocities,
+            residuals,
+            diagnostic,
+            contract,
+            slice1d<quat>(BoneCount, local_rotations),
+            slice1d<vec3>(BoneCount, local_angular_velocities),
+            error,
+            static_cast<int>(sizeof(error)));
+    }
 };
+
+static void require_structured_failure(
+    ProjectionFixture& fixture,
+    slice1d<quat> local_rotations,
+    slice1d<vec3> local_angular_velocities,
+    sonic_joint_projection_failure expected_failure,
+    int expected_row = -1)
+{
+    float positions[SonicG1JointCount];
+    float velocities[SonicG1JointCount];
+    float residuals[SonicG1JointCount];
+    poison_joint_outputs(positions, velocities, residuals);
+    float positions_before[SonicG1JointCount];
+    float velocities_before[SonicG1JointCount];
+    float residuals_before[SonicG1JointCount];
+    std::memcpy(positions_before, positions, sizeof(positions));
+    std::memcpy(velocities_before, velocities, sizeof(velocities));
+    std::memcpy(residuals_before, residuals, sizeof(residuals));
+    sonic_joint_projection_diagnostic diagnostic;
+    diagnostic.failure = SonicJointProjectionValid;
+    diagnostic.row = 91;
+    diagnostic.position = 92.0f;
+    diagnostic.lower = 93.0f;
+    diagnostic.upper = 94.0f;
+
+    std::memset(fixture.error, 0, sizeof(fixture.error));
+    CHECK(!sonic_project_joint_state(
+        positions,
+        velocities,
+        residuals,
+        diagnostic,
+        fixture.contract,
+        local_rotations,
+        local_angular_velocities,
+        fixture.error,
+        static_cast<int>(sizeof(fixture.error))));
+    CHECK(diagnostic.failure == expected_failure);
+    CHECK(diagnostic.row == expected_row);
+    CHECK(near(diagnostic.position, 0.0f));
+    CHECK(near(diagnostic.lower, 0.0f));
+    CHECK(near(diagnostic.upper, 0.0f));
+    CHECK(same_joint_output_bytes(positions, positions_before));
+    CHECK(same_joint_output_bytes(velocities, velocities_before));
+    CHECK(same_joint_output_bytes(residuals, residuals_before));
+}
+
+static void test_structured_shape_contract_input_and_singularity_failures()
+{
+    {
+        ProjectionFixture fixture;
+        require_structured_failure(
+            fixture,
+            slice1d<quat>(ProjectionFixture::BoneCount - 1,
+                          fixture.local_rotations),
+            slice1d<vec3>(ProjectionFixture::BoneCount,
+                          fixture.local_angular_velocities),
+            SonicJointProjectionShape);
+    }
+    {
+        ProjectionFixture fixture;
+        fixture.contract[1].target_index = fixture.contract[0].target_index;
+        require_structured_failure(
+            fixture,
+            slice1d<quat>(ProjectionFixture::BoneCount,
+                          fixture.local_rotations),
+            slice1d<vec3>(ProjectionFixture::BoneCount,
+                          fixture.local_angular_velocities),
+            SonicJointProjectionContract);
+    }
+    {
+        ProjectionFixture fixture;
+        fixture.local_rotations[fixture.contract[3].source_bone].w =
+            std::numeric_limits<float>::quiet_NaN();
+        require_structured_failure(
+            fixture,
+            slice1d<quat>(ProjectionFixture::BoneCount,
+                          fixture.local_rotations),
+            slice1d<vec3>(ProjectionFixture::BoneCount,
+                          fixture.local_angular_velocities),
+            SonicJointProjectionInput,
+            3);
+    }
+    {
+        ProjectionFixture fixture;
+        fixture.local_rotations[fixture.contract[4].source_bone] =
+            quat_from_angle_axis(
+                std::acos(-1.0f), vec3(0.0f, 1.0f, 0.0f));
+        require_structured_failure(
+            fixture,
+            slice1d<quat>(ProjectionFixture::BoneCount,
+                          fixture.local_rotations),
+            slice1d<vec3>(ProjectionFixture::BoneCount,
+                          fixture.local_angular_velocities),
+            SonicJointProjectionSingular,
+            4);
+    }
+}
+
+static void test_structured_residual_and_velocity_failures()
+{
+    {
+        ProjectionFixture fixture;
+        fixture.local_rotations[fixture.contract[5].source_bone] =
+            quat_from_angle_axis(0.00101f, vec3(0.0f, 1.0f, 0.0f));
+        require_structured_failure(
+            fixture,
+            slice1d<quat>(ProjectionFixture::BoneCount,
+                          fixture.local_rotations),
+            slice1d<vec3>(ProjectionFixture::BoneCount,
+                          fixture.local_angular_velocities),
+            SonicJointProjectionResidual,
+            5);
+    }
+    {
+        ProjectionFixture fixture;
+        fixture.contract[6].axis_holden =
+            normalize(vec3(1.0f, 1.0f, 0.0f));
+        fixture.local_angular_velocities[fixture.contract[6].source_bone] =
+            vec3(
+                std::numeric_limits<float>::max(),
+                std::numeric_limits<float>::max(),
+                0.0f);
+        require_structured_failure(
+            fixture,
+            slice1d<quat>(ProjectionFixture::BoneCount,
+                          fixture.local_rotations),
+            slice1d<vec3>(ProjectionFixture::BoneCount,
+                          fixture.local_angular_velocities),
+            SonicJointProjectionVelocity,
+            6);
+        CHECK(std::strcmp(
+            fixture.error,
+            "joint source_joint_6 velocity is non-finite") == 0);
+    }
+}
+
+static void test_structured_limit_failures_report_both_directions()
+{
+    const float angles[2] = {-0.5001f, 0.5001f};
+    for (int direction = 0; direction < 2; ++direction) {
+        ProjectionFixture fixture;
+        const int row = 7;
+        fixture.contract[row].lower = -0.5f;
+        fixture.contract[row].upper = 0.5f;
+        fixture.pose(row, angles[direction]);
+
+        float positions[SonicG1JointCount];
+        float velocities[SonicG1JointCount];
+        float residuals[SonicG1JointCount];
+        poison_joint_outputs(positions, velocities, residuals);
+        float positions_before[SonicG1JointCount];
+        float velocities_before[SonicG1JointCount];
+        float residuals_before[SonicG1JointCount];
+        std::memcpy(positions_before, positions, sizeof(positions));
+        std::memcpy(velocities_before, velocities, sizeof(velocities));
+        std::memcpy(residuals_before, residuals, sizeof(residuals));
+        sonic_joint_projection_diagnostic diagnostic;
+
+        CHECK(!fixture.project_joint_state(
+            positions, velocities, residuals, diagnostic));
+        CHECK(diagnostic.failure == SonicJointProjectionLimit);
+        CHECK(diagnostic.row == row);
+        CHECK(near(diagnostic.position, angles[direction]));
+        CHECK(near(diagnostic.lower, -0.5f));
+        CHECK(near(diagnostic.upper, 0.5f));
+        CHECK(same_joint_output_bytes(positions, positions_before));
+        CHECK(same_joint_output_bytes(velocities, velocities_before));
+        CHECK(same_joint_output_bytes(residuals, residuals_before));
+    }
+}
+
+static void test_structured_success_publishes_all_outputs_atomically()
+{
+    ProjectionFixture fixture;
+    fixture.pose(0, 0.25f);
+    fixture.velocity(0, -0.75f);
+    float positions[SonicG1JointCount];
+    float velocities[SonicG1JointCount];
+    float residuals[SonicG1JointCount];
+    poison_joint_outputs(positions, velocities, residuals);
+    sonic_joint_projection_diagnostic diagnostic;
+    diagnostic.failure = SonicJointProjectionLimit;
+    diagnostic.row = 12;
+
+    CHECK(fixture.project_joint_state(
+        positions, velocities, residuals, diagnostic));
+    CHECK(diagnostic.failure == SonicJointProjectionValid);
+    CHECK(diagnostic.row == -1);
+    CHECK(near(positions[0], 0.25f));
+    CHECK(near(velocities[0], -0.75f));
+    CHECK(near(residuals[0], 0.0f));
+}
 
 static void test_signed_angles_on_all_axes_and_pelvis_copy()
 {
@@ -227,6 +481,27 @@ static void test_inclusive_range_boundaries_and_transactional_outside_failure()
     const sonic_projected_pose before = output;
     CHECK(!fixture.project(output));
     CHECK(std::strstr(fixture.error, "range") != NULL);
+    CHECK(same_pose_bytes(output, before));
+}
+
+static void test_legacy_left_ankle_roll_limit_message_is_exact()
+{
+    ProjectionFixture fixture;
+    const int row = 12;
+    fixture.contract[row].source_joint = "left_ankle_roll_joint";
+    fixture.contract[row].target_joint = "left_ankle_roll_joint";
+    fixture.contract[row].lower = -0.261799991f;
+    fixture.contract[row].upper = 0.261799991f;
+    fixture.pose(row, -0.307408422f);
+
+    sonic_projected_pose output;
+    poison(output);
+    const sonic_projected_pose before = output;
+    CHECK(!fixture.project(output));
+    CHECK(std::strcmp(
+        fixture.error,
+        "joint left_ankle_roll_joint position -0.307408422 is outside "
+        "range [-0.261799991, 0.261799991]") == 0);
     CHECK(same_pose_bytes(output, before));
 }
 
@@ -339,10 +614,15 @@ static void test_bad_shapes_and_nonfinite_data_are_transactional()
 
 int main()
 {
+    test_structured_shape_contract_input_and_singularity_failures();
+    test_structured_residual_and_velocity_failures();
+    test_structured_limit_failures_report_both_directions();
+    test_structured_success_publishes_all_outputs_atomically();
     test_signed_angles_on_all_axes_and_pelvis_copy();
     test_antipodal_local_quaternions_are_equivalent();
     test_local_angular_velocity_projection_uses_static_frame();
     test_inclusive_range_boundaries_and_transactional_outside_failure();
+    test_legacy_left_ankle_roll_limit_message_is_exact();
     test_off_axis_threshold_is_strict_and_transactional();
     test_bad_shapes_and_nonfinite_data_are_transactional();
     std::puts("G1 joint projection tests passed");
