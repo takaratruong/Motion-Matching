@@ -246,6 +246,7 @@ void ControllerPickAssist::cancel() {
     if (diagnostics_.state == PickAssistState::Submitted) return;
     start_ = {};
     frozen_slot_ = {};
+    previous_observed_root_ = {};
     entry_point_ = {};
     preview_ticks_ = 0U;
     arrival_ticks_ = 0U;
@@ -256,6 +257,7 @@ void ControllerPickAssist::cancel() {
 bool ControllerPickAssist::begin(const PickAssistStart& start) {
     if (active()) return false;
 
+    previous_observed_root_ = {};
     start_ = start;
     preview_ticks_ = 0U;
     arrival_ticks_ = 0U;
@@ -340,6 +342,7 @@ bool ControllerPickAssist::begin(
 
     start_ = {};
     frozen_slot_ = {};
+    previous_observed_root_ = {};
     entry_point_ = {};
     preview_ticks_ = 0U;
     arrival_ticks_ = 0U;
@@ -350,6 +353,7 @@ bool ControllerPickAssist::begin(
     const auto fail_begin = [this](PickAssistReason reason) {
         start_ = {};
         frozen_slot_ = {};
+        previous_observed_root_ = {};
         entry_point_ = {};
         preview_ticks_ = 0U;
         arrival_ticks_ = 0U;
@@ -402,6 +406,7 @@ bool ControllerPickAssist::begin(
     start_.target = start.target_snapshot.handle;
     start_.hand = selected_affordance->hand;
     start_.object_world = start.target_snapshot.object_world;
+    previous_observed_root_ = start.root_world;
 
     diagnostics_.selected_slot = static_cast<int>(selected_index);
     diagnostics_.selected_slot_id = frozen_slot_.id;
@@ -419,6 +424,20 @@ PickAssistOutput ControllerPickAssist::observe(
     PickAssistOutput output{};
     if (diagnostics_.state == PickAssistState::SlotApproach) {
         if (!observation_metrics_are_finite(observation)) return output;
+        const float travel_segment_m = planar_distance(
+            previous_observed_root_.position,
+            observation.displayed_root.position);
+        diagnostics_.assisted_travel_m += travel_segment_m;
+        previous_observed_root_ = observation.displayed_root;
+        if (!is_finite(travel_segment_m) ||
+            !is_finite(diagnostics_.assisted_travel_m) ||
+            diagnostics_.assisted_travel_m >
+                config_.maximum_assisted_path_m +
+                    kTravelEnvelopeToleranceM) {
+            previous_observed_root_ = {};
+            return fail_output(
+                diagnostics_, PickAssistReason::OutsideTravelEnvelope);
+        }
         const float root_error_m = planar_distance(
             observation.displayed_root.position,
             frozen_slot_.root_world.position);

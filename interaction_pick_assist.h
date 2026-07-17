@@ -144,6 +144,7 @@ private:
     PickAssistConfig config_{};
     PickAssistStart start_{};
     MappedPickSlot frozen_slot_{};
+    Transform previous_observed_root_{};
     vec3 entry_point_{};
     uint32_t preview_ticks_ = 0U;
     uint32_t arrival_ticks_ = 0U;
