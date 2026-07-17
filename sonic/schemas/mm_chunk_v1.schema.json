@@ -21,6 +21,11 @@
     "virtual_root_position_holden",
     "virtual_root_orientation_holden",
     "selected_database_frame",
+    "candidate_preview_count",
+    "candidate_limit_rejection_count",
+    "first_rejected_database_frame",
+    "first_rejected_joint_index",
+    "first_rejected_joint_position",
     "searched",
     "transitioned",
     "terrain_cost",
@@ -89,6 +94,18 @@
       "minItems": 10,
       "maxItems": 10
     },
+    "stepNonnegativeInteger": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": 0},
+      "minItems": 10,
+      "maxItems": 10
+    },
+    "stepSentinelInteger": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": -1},
+      "minItems": 10,
+      "maxItems": 10
+    },
     "sha256": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
@@ -123,6 +140,20 @@
       "minItems": 10,
       "maxItems": 10
     },
+    "candidate_preview_count": {"$ref": "#/$defs/stepNonnegativeInteger"},
+    "candidate_limit_rejection_count": {
+      "$ref": "#/$defs/stepNonnegativeInteger"
+    },
+    "first_rejected_database_frame": {
+      "$ref": "#/$defs/stepSentinelInteger"
+    },
+    "first_rejected_joint_index": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": -1, "maximum": 28},
+      "minItems": 10,
+      "maxItems": 10
+    },
+    "first_rejected_joint_position": {"$ref": "#/$defs/stepFloat"},
     "searched": {"$ref": "#/$defs/stepBool"},
     "transitioned": {"$ref": "#/$defs/stepBool"},
     "terrain_cost": {"$ref": "#/$defs/stepFloat"},

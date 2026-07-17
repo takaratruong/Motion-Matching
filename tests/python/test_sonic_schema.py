@@ -217,6 +217,19 @@ class SourceFixture:
                 [1.0, 0.0, 0.0, 0.0] for _ in boundaries
             ],
             "selected_database_frame": [100 + step for step in steps],
+            "candidate_preview_count": [2 if step == 2 else 0 for step in steps],
+            "candidate_limit_rejection_count": [
+                1 if step == 2 else 0 for step in steps
+            ],
+            "first_rejected_database_frame": [
+                927 if step == 2 else -1 for step in steps
+            ],
+            "first_rejected_joint_index": [
+                5 if step == 2 else -1 for step in steps
+            ],
+            "first_rejected_joint_position": [
+                f32(-0.27224052) if step == 2 else 0.0 for step in steps
+            ],
             "searched": [bool(step % 2) for step in steps],
             "transitioned": [False for _ in steps],
             "terrain_cost": [f32(step / 8.0) for step in steps],
@@ -393,6 +406,7 @@ class SourceChunkTests(unittest.TestCase):
             "virtual_root_position_holden",
             "virtual_root_orientation_holden",
             "terrain_cost",
+            "first_rejected_joint_position",
             "terrain_values",
             "terrain_points_holden",
             "support_height",
@@ -404,13 +418,28 @@ class SourceChunkTests(unittest.TestCase):
             self.assertTrue(value.flags.owndata, field)
             self.assertTrue(value.flags.c_contiguous, field)
             self.assertFalse(value.flags.writeable, field)
-        self.assertEqual(chunk.selected_database_frame.dtype, np.dtype(np.int64))
+        integer_fields = (
+            "selected_database_frame",
+            "candidate_preview_count",
+            "candidate_limit_rejection_count",
+            "first_rejected_database_frame",
+            "first_rejected_joint_index",
+        )
+        for field in integer_fields:
+            self.assertEqual(getattr(chunk, field).dtype, np.dtype(np.int64))
         self.assertEqual(chunk.searched.dtype, np.dtype(np.bool_))
         self.assertEqual(chunk.transitioned.dtype, np.dtype(np.bool_))
-        for field in ("selected_database_frame", "searched", "transitioned"):
+        for field in (*integer_fields, "searched", "transitioned"):
             value = getattr(chunk, field)
             self.assertTrue(value.flags.owndata, field)
             self.assertFalse(value.flags.writeable, field)
+        self.assertEqual(chunk.candidate_limit_rejection_count[2], 1)
+        self.assertEqual(chunk.first_rejected_database_frame[2], 927)
+        self.assertEqual(chunk.first_rejected_joint_index[2], 5)
+        self.assertEqual(
+            int(chunk.first_rejected_joint_position[2].view(np.uint32)),
+            int(np.float32(-0.27224052).view(np.uint32)),
+        )
         self.assertIsInstance(chunk.scene, MappingProxyType)
         self.assertIsInstance(chunk.command, MappingProxyType)
         self.assertIsInstance(chunk.artifacts, MappingProxyType)
@@ -502,6 +531,11 @@ class SourceChunkTests(unittest.TestCase):
             "virtual_root_position_holden": lambda value: value[:-1],
             "virtual_root_orientation_holden": lambda value: value[:-1],
             "selected_database_frame": lambda value: value[:-1],
+            "candidate_preview_count": lambda value: value[:-1],
+            "candidate_limit_rejection_count": lambda value: value[:-1],
+            "first_rejected_database_frame": lambda value: value[:-1],
+            "first_rejected_joint_index": lambda value: value[:-1],
+            "first_rejected_joint_position": lambda value: value[:-1],
             "searched": lambda value: value[:-1],
             "transitioned": lambda value: value[:-1],
             "terrain_cost": lambda value: value[:-1],
@@ -573,9 +607,52 @@ class SourceChunkTests(unittest.TestCase):
         payload["selected_database_frame"][0] = True
         cases.append(("boolean integer", payload))
         payload = self.fixture.chunk()
+        payload["candidate_preview_count"][0] = True
+        cases.append(("boolean preview count", payload))
+        payload = self.fixture.chunk()
+        payload["first_rejected_joint_position"][2] = float("nan")
+        cases.append(("non-finite rejected position", payload))
+        payload = self.fixture.chunk()
         payload["searched"][0] = 1
         cases.append(("integer boolean", payload))
         for label, payload in cases:
+            with self.subTest(label=label), self.assertRaises(ContractError):
+                parse_source_chunk(payload, self.fixture.contract)
+
+    def test_chunk_enforces_candidate_preview_count_and_sentinel_invariants(self):
+        mutations = []
+        for field in (
+            "candidate_preview_count",
+            "candidate_limit_rejection_count",
+        ):
+            payload = self.fixture.chunk()
+            payload[field][0] = -1
+            mutations.append((field + "/negative", payload))
+        payload = self.fixture.chunk()
+        payload["candidate_limit_rejection_count"][0] = 1
+        mutations.append(("rejections-exceed-previews", payload))
+        for field, value in (
+            ("first_rejected_database_frame", 8),
+            ("first_rejected_joint_index", 5),
+            ("first_rejected_joint_position", f32(-0.3)),
+        ):
+            payload = self.fixture.chunk()
+            payload[field][0] = value
+            mutations.append(("zero-rejection/" + field, payload))
+        for field, value in (
+            ("first_rejected_database_frame", -1),
+            ("first_rejected_joint_index", -1),
+            ("first_rejected_joint_index", 29),
+            ("first_rejected_joint_position", 0.0),
+        ):
+            payload = self.fixture.chunk()
+            payload[field][2] = value
+            mutations.append(("positive-rejection/" + field + "/" + str(value), payload))
+        payload = self.fixture.chunk()
+        payload["first_rejected_database_frame"][2] = \
+            payload["selected_database_frame"][2]
+        mutations.append(("selected-equals-rejected", payload))
+        for label, payload in mutations:
             with self.subTest(label=label), self.assertRaises(ContractError):
                 parse_source_chunk(payload, self.fixture.contract)
 

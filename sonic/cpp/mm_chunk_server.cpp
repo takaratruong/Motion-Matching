@@ -414,6 +414,10 @@ public:
     }
 
     const mm_server_identity& identity() const { return identity_; }
+    const sonic_joint_contract_entry* joint_preview_contract() const
+    {
+        return contract_;
+    }
     const mm_server_scene_identity& scene_identity() const
     {
         return scene_identity_;
@@ -623,6 +627,16 @@ public:
         }
         diagnostic = mm_chunk_step_diagnostic();
         diagnostic.selected_database_frame = result.selected_database_frame;
+        diagnostic.candidate_preview_count =
+            result.candidate_preview.candidate_preview_count;
+        diagnostic.candidate_limit_rejection_count =
+            result.candidate_preview.candidate_limit_rejection_count;
+        diagnostic.first_rejected_database_frame =
+            result.candidate_preview.first_rejected_database_frame;
+        diagnostic.first_rejected_joint_index =
+            result.candidate_preview.first_rejected_joint_index;
+        diagnostic.first_rejected_joint_position =
+            result.candidate_preview.first_rejected_joint_position;
         diagnostic.searched = state.searched;
         diagnostic.transitioned = state.transitioned;
         diagnostic.terrain_cost = state.selected_terrain_error;
@@ -813,6 +827,11 @@ public:
         identity_.terrain_support_sha256 = std::string(64, '6');
         identity_.scene_index_sha256 = std::string(64, '7');
         identity_.coordinate_signature = G1_RuntimeCoordinateSignature;
+        for (int row = 0; row < SonicG1JointCount; ++row) {
+            serialization_contract_[row].source_index = row;
+            serialization_contract_[row].lower = -0.25f;
+            serialization_contract_[row].upper = 0.25f;
+        }
 
         joint_feasibility_.frame_count = 1;
         joint_feasibility_.raw_safe.resize(1);
@@ -839,6 +858,10 @@ public:
     }
 
     const mm_server_identity& identity() const { return identity_; }
+    const sonic_joint_contract_entry* joint_preview_contract() const
+    {
+        return serialization_contract_;
+    }
     const mm_server_scene_identity& scene_identity() const
     {
         return scene_identity_;
@@ -955,6 +978,60 @@ public:
         state.history.push_back(state.frame);
         diagnostic = mm_chunk_step_diagnostic();
         diagnostic.selected_database_frame = 1000 + state.frame;
+        diagnostic.candidate_preview_count = 0;
+        diagnostic.candidate_limit_rejection_count = 0;
+        diagnostic.first_rejected_database_frame = -1;
+        diagnostic.first_rejected_joint_index = -1;
+        diagnostic.first_rejected_joint_position = 0.0f;
+        if (step == 0) {
+            const auto set_positive_rejection = [&]() {
+                diagnostic.candidate_preview_count = 1;
+                diagnostic.candidate_limit_rejection_count = 1;
+                diagnostic.first_rejected_database_frame = 927;
+                diagnostic.first_rejected_joint_index = 5;
+                diagnostic.first_rejected_joint_position = -0.3f;
+            };
+            if (request.candidate_id == "negative-preview-count") {
+                diagnostic.candidate_preview_count = -1;
+            } else if (
+                request.candidate_id == "negative-rejection-count") {
+                diagnostic.candidate_limit_rejection_count = -1;
+            } else if (
+                request.candidate_id == "rejections-exceed-previews") {
+                diagnostic.candidate_limit_rejection_count = 1;
+            } else if (
+                request.candidate_id == "bad-zero-rejected-frame") {
+                diagnostic.first_rejected_database_frame = 927;
+            } else if (
+                request.candidate_id == "bad-zero-rejected-joint") {
+                diagnostic.first_rejected_joint_index = 5;
+            } else if (
+                request.candidate_id == "bad-zero-rejected-position") {
+                diagnostic.first_rejected_joint_position = -0.0f;
+            } else if (
+                request.candidate_id == "bad-positive-rejected-frame") {
+                set_positive_rejection();
+                diagnostic.first_rejected_database_frame = -1;
+            } else if (
+                request.candidate_id == "bad-positive-rejected-joint") {
+                set_positive_rejection();
+                diagnostic.first_rejected_joint_index = SonicG1JointCount;
+            } else if (
+                request.candidate_id == "bad-positive-rejected-position") {
+                set_positive_rejection();
+                diagnostic.first_rejected_joint_position =
+                    std::numeric_limits<float>::infinity();
+            } else if (
+                request.candidate_id == "in-range-rejected-position") {
+                set_positive_rejection();
+                diagnostic.first_rejected_joint_position = 0.0f;
+            } else if (
+                request.candidate_id == "selected-equals-rejected-frame") {
+                set_positive_rejection();
+                diagnostic.first_rejected_database_frame =
+                    diagnostic.selected_database_frame;
+            }
+        }
         diagnostic.searched = (step % 3) == 0;
         diagnostic.transitioned = step == 6;
         diagnostic.terrain_cost = active_matching_feature_weight_ +
@@ -989,6 +1066,7 @@ private:
     mm_server_identity identity_;
     mm_server_scene_identity scene_identity_;
     float active_matching_feature_weight_ = 0.0f;
+    sonic_joint_contract_entry serialization_contract_[SonicG1JointCount];
     sonic_joint_feasibility_certificate joint_feasibility_;
 };
 
@@ -1236,7 +1314,17 @@ static void mm_json_write_step_scalar_array(
         else if (field == 2) writer.boolean(step.transitioned);
         else if (field == 3) writer.number(step.terrain_cost);
         else if (field == 4) writer.number(step.support_height);
-        else writer.number(step.support_target);
+        else if (field == 5) writer.number(step.support_target);
+        else if (field == 6) writer.integer(step.candidate_preview_count);
+        else if (field == 7) {
+            writer.integer(step.candidate_limit_rejection_count);
+        } else if (field == 8) {
+            writer.integer(step.first_rejected_database_frame);
+        } else if (field == 9) {
+            writer.integer(step.first_rejected_joint_index);
+        } else {
+            writer.number(step.first_rejected_joint_position);
+        }
     }
     writer.character(']');
 }
@@ -1292,8 +1380,45 @@ static std::string mm_json_generate_data(
     const mm_chunk_generate_request& request,
     const mm_chunk_candidate& candidate,
     const mm_server_identity& identity,
-    const mm_server_scene_identity& scene)
+    const mm_server_scene_identity& scene,
+    const sonic_joint_contract_entry* joint_preview_contract)
 {
+    for (const mm_chunk_step_diagnostic& step : candidate.steps) {
+        const bool counts_valid =
+            step.candidate_preview_count >= 0 &&
+            step.candidate_limit_rejection_count >= 0 &&
+            step.candidate_limit_rejection_count <=
+                step.candidate_preview_count;
+        if (!counts_valid) return std::string();
+        if (step.candidate_limit_rejection_count == 0) {
+            const bool sentinels_valid =
+                step.first_rejected_database_frame == -1 &&
+                step.first_rejected_joint_index == -1 &&
+                step.first_rejected_joint_position == 0.0f &&
+                !std::signbit(step.first_rejected_joint_position);
+            if (!sentinels_valid) return std::string();
+            continue;
+        }
+        const int row = step.first_rejected_joint_index;
+        if (joint_preview_contract == nullptr ||
+            step.first_rejected_database_frame < 0 ||
+            row < 0 || row >= SonicG1JointCount ||
+            !std::isfinite(step.first_rejected_joint_position) ||
+            step.selected_database_frame ==
+                step.first_rejected_database_frame) {
+            return std::string();
+        }
+        const sonic_joint_contract_entry& contract =
+            joint_preview_contract[row];
+        if (contract.source_index != row ||
+            !std::isfinite(contract.lower) ||
+            !std::isfinite(contract.upper) ||
+            contract.lower >= contract.upper ||
+            (step.first_rejected_joint_position >= contract.lower &&
+             step.first_rejected_joint_position <= contract.upper)) {
+            return std::string();
+        }
+    }
     mm_chunk_json_writer writer;
     writer.raw("{\"schema\":");
     writer.string(MM_CHUNK_SCHEMA);
@@ -1335,6 +1460,16 @@ static std::string mm_json_generate_data(
         writer, candidate.boundaries, mm_virtual_orientation);
     writer.raw(",\"selected_database_frame\":");
     mm_json_write_step_scalar_array(writer, candidate.steps, 0);
+    writer.raw(",\"candidate_preview_count\":");
+    mm_json_write_step_scalar_array(writer, candidate.steps, 6);
+    writer.raw(",\"candidate_limit_rejection_count\":");
+    mm_json_write_step_scalar_array(writer, candidate.steps, 7);
+    writer.raw(",\"first_rejected_database_frame\":");
+    mm_json_write_step_scalar_array(writer, candidate.steps, 8);
+    writer.raw(",\"first_rejected_joint_index\":");
+    mm_json_write_step_scalar_array(writer, candidate.steps, 9);
+    writer.raw(",\"first_rejected_joint_position\":");
+    mm_json_write_step_scalar_array(writer, candidate.steps, 10);
     writer.raw(",\"searched\":");
     mm_json_write_step_scalar_array(writer, candidate.steps, 1);
     writer.raw(",\"transitioned\":");
@@ -1476,7 +1611,8 @@ static int mm_server_run(Adapter& adapter)
                     request.generate,
                     preparation.candidate,
                     adapter.identity(),
-                    adapter.scene_identity());
+                    adapter.scene_identity(),
+                    adapter.joint_preview_contract());
                 if (data.empty()) {
                     success = false;
                     mm_chunk_fail(

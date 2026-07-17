@@ -167,6 +167,12 @@ struct fake_adapter
         state.history.push_back(state.frame);
         diagnostic = mm_chunk_step_diagnostic();
         diagnostic.selected_database_frame = state.frame;
+        diagnostic.candidate_preview_count = step == 2 ? 2 : 0;
+        diagnostic.candidate_limit_rejection_count = step == 2 ? 1 : 0;
+        diagnostic.first_rejected_database_frame = step == 2 ? 927 : -1;
+        diagnostic.first_rejected_joint_index = step == 2 ? 5 : -1;
+        diagnostic.first_rejected_joint_position =
+            step == 2 ? -0.27224052f : 0.0f;
         diagnostic.searched = (step % 2) == 0;
         diagnostic.transitioned = step == 5;
         diagnostic.terrain_cost =
@@ -439,6 +445,16 @@ static void test_legal_sequence_is_transactional_and_continuous()
     CHECK(chunk.steps.size() ==
           static_cast<std::size_t>(MM_CHUNK_SOURCE_INTERVALS));
     CHECK(chunk.steps.front().applied_velocity_holden[2] == 0.5f);
+    CHECK(chunk.steps[2].candidate_preview_count == 2);
+    CHECK(chunk.steps[2].candidate_limit_rejection_count == 1);
+    CHECK(chunk.steps[2].first_rejected_database_frame == 927);
+    CHECK(chunk.steps[2].first_rejected_joint_index == 5);
+    CHECK(chunk.steps[2].first_rejected_joint_position == -0.27224052f);
+    CHECK(chunk.steps[0].candidate_preview_count == 0);
+    CHECK(chunk.steps[0].candidate_limit_rejection_count == 0);
+    CHECK(chunk.steps[0].first_rejected_database_frame == -1);
+    CHECK(chunk.steps[0].first_rejected_joint_index == -1);
+    CHECK(chunk.steps[0].first_rejected_joint_position == 0.0f);
     CHECK(chunk.boundaries.front().physical_pelvis_position_holden[0] ==
           initial.physical_pelvis_position_holden[0]);
     CHECK(chunk.boundaries.back().physical_pelvis_position_holden[0] ==
@@ -615,6 +631,26 @@ static void test_every_illegal_identity_and_interval_is_rejected()
     CHECK(protocol.abort("s1", "c0", error));
 }
 
+static void test_candidate_preview_fields_participate_in_step_equality()
+{
+    mm_chunk_step_diagnostic baseline;
+    mm_chunk_step_diagnostic changed = baseline;
+    changed.candidate_preview_count = 1;
+    CHECK(!(changed == baseline));
+    changed = baseline;
+    changed.candidate_limit_rejection_count = 1;
+    CHECK(!(changed == baseline));
+    changed = baseline;
+    changed.first_rejected_database_frame = 7;
+    CHECK(!(changed == baseline));
+    changed = baseline;
+    changed.first_rejected_joint_index = 5;
+    CHECK(!(changed == baseline));
+    changed = baseline;
+    changed.first_rejected_joint_position = -0.3f;
+    CHECK(!(changed == baseline));
+}
+
 int main()
 {
     test_complete_protocol_state_matrix();
@@ -622,6 +658,7 @@ int main()
     test_legal_sequence_is_transactional_and_continuous();
     test_failures_never_publish_or_mutate_active_state();
     test_every_illegal_identity_and_interval_is_rejected();
+    test_candidate_preview_fields_participate_in_step_equality();
     std::puts("MM chunk protocol tests passed");
     return 0;
 }

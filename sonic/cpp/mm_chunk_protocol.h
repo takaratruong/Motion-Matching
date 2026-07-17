@@ -103,6 +103,11 @@ static inline bool operator!=(
 struct mm_chunk_step_diagnostic
 {
     int selected_database_frame = -1;
+    int candidate_preview_count = 0;
+    int candidate_limit_rejection_count = 0;
+    int first_rejected_database_frame = -1;
+    int first_rejected_joint_index = -1;
+    float first_rejected_joint_position = 0.0f;
     bool searched = false;
     bool transitioned = false;
     float terrain_cost = 0.0f;
@@ -118,6 +123,15 @@ static inline bool operator==(
     const mm_chunk_step_diagnostic& second)
 {
     if (first.selected_database_frame != second.selected_database_frame ||
+        first.candidate_preview_count != second.candidate_preview_count ||
+        first.candidate_limit_rejection_count !=
+            second.candidate_limit_rejection_count ||
+        first.first_rejected_database_frame !=
+            second.first_rejected_database_frame ||
+        first.first_rejected_joint_index !=
+            second.first_rejected_joint_index ||
+        first.first_rejected_joint_position !=
+            second.first_rejected_joint_position ||
         first.searched != second.searched ||
         first.transitioned != second.transitioned ||
         first.terrain_cost != second.terrain_cost ||

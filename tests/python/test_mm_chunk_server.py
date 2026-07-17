@@ -225,6 +225,19 @@ class ChunkServerProtocolTest(unittest.TestCase):
         self.assertEqual(len(candidate["joint_position_source"]), 11)
         self.assertTrue(all(len(row) == 29 for row in candidate["joint_position_source"]))
         self.assertEqual(len(candidate["selected_database_frame"]), 10)
+        for field in (
+            "candidate_preview_count",
+            "candidate_limit_rejection_count",
+            "first_rejected_database_frame",
+            "first_rejected_joint_index",
+            "first_rejected_joint_position",
+        ):
+            self.assertEqual(len(candidate[field]), 10, field)
+        self.assertEqual(candidate["candidate_preview_count"], [0] * 10)
+        self.assertEqual(candidate["candidate_limit_rejection_count"], [0] * 10)
+        self.assertEqual(candidate["first_rejected_database_frame"], [-1] * 10)
+        self.assertEqual(candidate["first_rejected_joint_index"], [-1] * 10)
+        self.assertEqual(candidate["first_rejected_joint_position"], [0.0] * 10)
         self.assertEqual(len(candidate["terrain_values"]), 10)
         self.assertTrue(all(len(row) == 4 for row in candidate["terrain_values"]))
         self.assertEqual(set(candidate["command"]), {
@@ -479,6 +492,40 @@ class ChunkServerProtocolTest(unittest.TestCase):
         self.assertTrue(self.server.request(finish(
             "abort", "after-bad-generate-abort", "c000000"
         ))["ok"])
+
+    def test_candidate_preview_serialization_failures_never_publish(self):
+        self.assertTrue(self.server.request(hello())["ok"])
+        self.assertTrue(self.server.request(reset())["ok"])
+        cases = (
+            "negative-preview-count",
+            "negative-rejection-count",
+            "rejections-exceed-previews",
+            "bad-zero-rejected-frame",
+            "bad-zero-rejected-joint",
+            "bad-zero-rejected-position",
+            "bad-positive-rejected-frame",
+            "bad-positive-rejected-joint",
+            "bad-positive-rejected-position",
+            "in-range-rejected-position",
+            "selected-equals-rejected-frame",
+        )
+        for index, candidate_id in enumerate(cases):
+            with self.subTest(candidate_id=candidate_id):
+                response = self.server.request(generate(
+                    f"invalid-preview-{index}", candidate_id
+                ))
+                self.assertFalse(response["ok"], response)
+                self.assertEqual(
+                    response["error"]["code"], "serialization_failed"
+                )
+                control = self.server.request(generate(
+                    f"control-{index}", "c000000"
+                ))
+                self.assertTrue(control["ok"], control)
+                self.assertEqual(control["data"]["candidate_preview_count"], [0] * 10)
+                self.assertTrue(self.server.request(finish(
+                    "abort", f"control-abort-{index}", "c000000"
+                ))["ok"])
 
 
 class ChunkServerSourceOwnershipTest(unittest.TestCase):

@@ -53,6 +53,11 @@ class SourceChunk:
     virtual_root_position_holden: np.ndarray
     virtual_root_orientation_holden: np.ndarray
     selected_database_frame: np.ndarray
+    candidate_preview_count: np.ndarray
+    candidate_limit_rejection_count: np.ndarray
+    first_rejected_database_frame: np.ndarray
+    first_rejected_joint_index: np.ndarray
+    first_rejected_joint_position: np.ndarray
     searched: np.ndarray
     transitioned: np.ndarray
     terrain_cost: np.ndarray
@@ -198,6 +203,19 @@ def _integer_array(value: object, size: int, label: str) -> np.ndarray:
     for index, item in enumerate(value):
         if type(item) is not int or item < 0 or item > limit:
             raise ContractError(f"{label}[{index}] must be a nonnegative int64")
+        output[index] = item
+    output.flags.writeable = False
+    return output
+
+
+def _sentinel_integer_array(value: object, size: int, label: str) -> np.ndarray:
+    if type(value) is not list or len(value) != size:
+        raise ContractError(f"{label} must have length {size}")
+    limit = np.iinfo(np.int64).max
+    output = np.empty(size, dtype=np.int64)
+    for index, item in enumerate(value):
+        if type(item) is not int or item < -1 or item > limit:
+            raise ContractError(f"{label}[{index}] must be an int64 at least -1")
         output[index] = item
     output.flags.writeable = False
     return output
@@ -544,6 +562,11 @@ def parse_source_chunk(
         "virtual_root_position_holden",
         "virtual_root_orientation_holden",
         "selected_database_frame",
+        "candidate_preview_count",
+        "candidate_limit_rejection_count",
+        "first_rejected_database_frame",
+        "first_rejected_joint_index",
+        "first_rejected_joint_position",
         "searched",
         "transitioned",
         "terrain_cost",
@@ -607,6 +630,68 @@ def parse_source_chunk(
         ),
         "source chunk.virtual_root_orientation_holden",
     )
+    selected_database_frame = _integer_array(
+        source["selected_database_frame"],
+        _STEP_COUNT,
+        "source chunk.selected_database_frame",
+    )
+    candidate_preview_count = _integer_array(
+        source["candidate_preview_count"],
+        _STEP_COUNT,
+        "source chunk.candidate_preview_count",
+    )
+    candidate_limit_rejection_count = _integer_array(
+        source["candidate_limit_rejection_count"],
+        _STEP_COUNT,
+        "source chunk.candidate_limit_rejection_count",
+    )
+    first_rejected_database_frame = _sentinel_integer_array(
+        source["first_rejected_database_frame"],
+        _STEP_COUNT,
+        "source chunk.first_rejected_database_frame",
+    )
+    first_rejected_joint_index = _sentinel_integer_array(
+        source["first_rejected_joint_index"],
+        _STEP_COUNT,
+        "source chunk.first_rejected_joint_index",
+    )
+    first_rejected_joint_position = _float_array(
+        source["first_rejected_joint_position"],
+        (_STEP_COUNT,),
+        "source chunk.first_rejected_joint_position",
+    )
+    for step in range(_STEP_COUNT):
+        previews = int(candidate_preview_count[step])
+        rejections = int(candidate_limit_rejection_count[step])
+        rejected_frame = int(first_rejected_database_frame[step])
+        rejected_joint = int(first_rejected_joint_index[step])
+        rejected_position = first_rejected_joint_position[step]
+        if rejections > previews:
+            raise ContractError("candidate preview counts are inconsistent")
+        if rejections == 0:
+            if (
+                rejected_frame != -1
+                or rejected_joint != -1
+                or int(rejected_position.view(np.uint32)) != 0
+            ):
+                raise ContractError(
+                    "candidate rejection sentinels are inconsistent"
+                )
+            continue
+        if (
+            rejected_frame < 0
+            or rejected_joint < 0
+            or rejected_joint >= _JOINT_COUNT
+        ):
+            raise ContractError("candidate rejection indices are invalid")
+        row = contract.rows[rejected_joint]
+        position = float(rejected_position)
+        if row.lower <= position <= row.upper:
+            raise ContractError(
+                "candidate rejected position is not outside its contract"
+            )
+        if int(selected_database_frame[step]) == rejected_frame:
+            raise ContractError("selected frame equals first rejected frame")
     scene = _parse_scene(source["scene"])
     artifacts = _parse_artifacts(source["artifacts"])
     if scene["coordinate_signature"] != artifacts["coordinate_signature"]:
@@ -650,11 +735,12 @@ def parse_source_chunk(
             "source chunk.virtual_root_position_holden",
         ),
         virtual_root_orientation_holden=virtual_orientation,
-        selected_database_frame=_integer_array(
-            source["selected_database_frame"],
-            _STEP_COUNT,
-            "source chunk.selected_database_frame",
-        ),
+        selected_database_frame=selected_database_frame,
+        candidate_preview_count=candidate_preview_count,
+        candidate_limit_rejection_count=candidate_limit_rejection_count,
+        first_rejected_database_frame=first_rejected_database_frame,
+        first_rejected_joint_index=first_rejected_joint_index,
+        first_rejected_joint_position=first_rejected_joint_position,
         searched=_boolean_array(
             source["searched"], _STEP_COUNT, "source chunk.searched"
         ),

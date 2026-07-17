@@ -387,7 +387,7 @@ if (projected)
         return G1RuntimeJointPreviewFatal;
     return G1RuntimeJointPreviewAccept;
 }
-const int row = projection.joint_index;
+const int row = projection.row;
 const bool well_formed_limit =
     projection.failure == SonicJointProjectionLimit &&
     row >= 0 && row < SonicG1JointCount &&
@@ -523,8 +523,8 @@ if rejections == 0:
 else:
     if frame < 0 or joint < 0 or joint >= _JOINT_COUNT:
         raise ContractError("candidate rejection indices are invalid")
-    lower = contract.entries[joint].lower
-    upper = contract.entries[joint].upper
+    lower = contract.rows[joint].lower
+    upper = contract.rows[joint].upper
     if not math.isfinite(position) or lower <= position <= upper:
         raise ContractError("candidate rejected position is not outside its contract")
     if selected_frame == frame:
