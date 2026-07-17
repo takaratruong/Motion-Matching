@@ -497,7 +497,10 @@ PickAssistOutput ControllerPickAssist::observe(
             return fail_output(
                 diagnostics_, PickAssistReason::TargetChanged);
         }
-        if (!observation_metrics_are_finite(observation)) return output;
+        if (!observation_metrics_are_finite(observation)) {
+            return fail_output(
+                diagnostics_, PickAssistReason::OutsideTravelEnvelope);
+        }
         const float travel_segment_m = planar_distance(
             previous_observed_root_.position,
             observation.displayed_root.position);
