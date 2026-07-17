@@ -2167,6 +2167,56 @@ class GearProcessTests(TemporaryScriptCase):
         with self.assertRaises(ProcessLookupError):
             os.killpg(pgid, 0)
 
+    def test_live_group_stop_signals_before_slow_proc_inventory(self):
+        child = self.script(
+            "stop_signal_order.py",
+            r'''
+            import os
+            import termios
+
+            print("BOOT READY", flush=True)
+            attrs = termios.tcgetattr(0)
+            attrs[3] &= ~(termios.ICANON | termios.ECHO)
+            termios.tcsetattr(0, termios.TCSANOW, attrs)
+            os.read(0, 1)
+            print("CONTROL READY", flush=True)
+            os.read(0, 1)
+            print("STREAM READY", flush=True)
+            while os.read(0, 1).lower() != b"o":
+                pass
+            ''',
+        )
+        gear = self.gear(child)
+        events = []
+
+        def synthetic_states(_pgid):
+            events.append("inventory")
+            state = "T" if "signal" in events else "S"
+            return {gear.pid: state}
+
+        def synthetic_signal(_signal):
+            events.append("signal")
+            return True
+
+        try:
+            gear.start()
+            with (
+                patch(
+                    "mm_sonic.process._linux_group_states",
+                    side_effect=synthetic_states,
+                ),
+                patch.object(
+                    gear,
+                    "_send_group_signal",
+                    side_effect=synthetic_signal,
+                ),
+            ):
+                gear.stop_group()
+            self.assertEqual(events[0], "signal")
+            self.assertIn("inventory", events)
+        finally:
+            gear.close()
+
     def test_continue_waits_until_every_live_group_member_is_resumed(self):
         child = self.script(
             "continue_verification.py",

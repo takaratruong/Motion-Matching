@@ -2493,7 +2493,12 @@ class GearProcess:
     def stop_group(self) -> None:
         if self._process is None or self._pgid is None:
             raise ProcessError("GEAR process has not started")
-        if not _linux_group_states(self._pgid):
+        # A /proc-wide descendant inventory is intentionally deferred until
+        # after SIGSTOP while the verified leader is live.  On busy hosts that
+        # scan can span several 50 Hz control ticks.  The creation-time PGID
+        # proof and live leader identity are sufficient to signal first; the
+        # full inventory below still proves every surviving member stopped.
+        if self._process.poll() is not None and not _linux_group_states(self._pgid):
             self.require_alive()
         self._send_group_signal(signal.SIGSTOP)
         deadline = time.monotonic() + 2.0
