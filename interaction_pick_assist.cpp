@@ -418,6 +418,19 @@ PickAssistOutput ControllerPickAssist::observe(
     const PickAssistObservation& observation) {
     PickAssistOutput output{};
     if (diagnostics_.state == PickAssistState::SlotApproach) {
+        if (!observation_metrics_are_finite(observation)) return output;
+        const float root_error_m = planar_distance(
+            observation.displayed_root.position,
+            frozen_slot_.root_world.position);
+        if (!is_finite(root_error_m) ||
+            root_error_m <= config_.arrival.slow_radius_m) {
+            return output;
+        }
+        output.override_steering = true;
+        output.left_stick = ordinary_navigation_stick(
+            frozen_slot_.root_world.position,
+            observation.displayed_root.position,
+            observation.camera_azimuth);
         return output;
     }
     if (active()) {
