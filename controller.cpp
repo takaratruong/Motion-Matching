@@ -541,6 +541,7 @@ struct G1CandidateAuditLog
 #pragma GCC diagnostic pop
 #endif
 
+#include "g1_mesh_renderer.h"
 #include "character.h"
 #include "scene_runtime.h"
 #include "route_runtime.h"
@@ -998,6 +999,38 @@ static void draw_g1_skeleton(
                 positions(bone) + 0.10f * ::quat_mul_vec3(
                     rotations(bone), vec3(0.0f, 0.0f, 1.0f))),
             RED);
+    }
+}
+
+static void draw_g1_sole_proxies(
+    const array1d<vec3>& positions,
+    const array1d<quat>& rotations,
+    const array1d<bool>& contacts)
+{
+    const G1LegConfig configs[2] = {
+        g1_left_leg_config(),
+        g1_right_leg_config(),
+    };
+    static const int perimeter[4] = {0, 1, 3, 2};
+    for (int foot = 0; foot < 2; ++foot) {
+        const G1LegConfig& config = configs[foot];
+        vec3 world_points[4];
+        for (int probe = 0; probe < 4; ++probe) {
+            world_points[probe] =
+                positions(config.contact) +
+                ::quat_mul_vec3(
+                    rotations(config.contact),
+                    config.sole_points_local[probe]);
+        }
+        const Color color = contacts(foot) ? GREEN : ORANGE;
+        for (int probe = 0; probe < 4; ++probe) {
+            ::DrawSphere(::to_Vector3(world_points[probe]), 0.009f, color);
+            const int next = (probe + 1) % 4;
+            ::DrawLine3D(
+                ::to_Vector3(world_points[perimeter[probe]]),
+                ::to_Vector3(world_points[perimeter[next]]),
+                color);
+        }
     }
 }
 
@@ -2434,6 +2467,17 @@ int main(int argc, char** argv)
     }
     ::SetTargetFPS(25);
 
+    G1MeshRenderer g1_mesh_renderer = {};
+    bool show_g1_mesh = true;
+    bool show_g1_bones = true;
+    bool show_g1_sole_proxies = true;
+    const char* const configured_g1_mesh_path = ::getenv("MM_G1_MESH_PATH");
+    const char* const g1_mesh_path =
+        configured_g1_mesh_path != nullptr &&
+                configured_g1_mesh_path[0] != '\0'
+            ? configured_g1_mesh_path
+            : "resources/g1_mesh/g1_raylib.glb";
+
     int model_load_count = 0;
     int model_unload_count = 0;
     const int motion_pack_load_count = 1;
@@ -2491,6 +2535,7 @@ int main(int argc, char** argv)
             ::controlled_runtime_error(artifact_error);
             controller_exit_code = 2;
         }
+        ::g1_mesh_renderer_unload(g1_mesh_renderer);
         model_unloader(terrain_model);
         if (window_open) {
             ::CloseWindow();
@@ -2519,6 +2564,16 @@ int main(int argc, char** argv)
         artifact_error,
         static_cast<int>(sizeof(artifact_error)));
     if (!initial_model.ready || !initial_model.allocated) {
+        ::controlled_runtime_error(artifact_error);
+        controller_exit_code = 2;
+        normal_cleanup();
+        return controller_exit_code;
+    }
+    if (!::g1_mesh_renderer_load(
+            g1_mesh_renderer,
+            g1_mesh_path,
+            artifact_error,
+            static_cast<int>(sizeof(artifact_error)))) {
         ::controlled_runtime_error(artifact_error);
         controller_exit_code = 2;
         normal_cleanup();
@@ -2633,6 +2688,9 @@ int main(int argc, char** argv)
     motion_match_log_row log_row;
 
     while (!::WindowShouldClose() && !controller_exit_requested) {
+        if (::IsKeyPressed(KEY_M)) show_g1_mesh = !show_g1_mesh;
+        if (::IsKeyPressed(KEY_B)) show_g1_bones = !show_g1_bones;
+        if (::IsKeyPressed(KEY_P)) show_g1_sole_proxies = !show_g1_sole_proxies;
         if (pending_reset) {
             const int requested_scene_index = pending_scene_index;
             const bool scene_reset_ok = ::g1_apply_pending_scene_reset(
@@ -2823,16 +2881,50 @@ int main(int argc, char** argv)
             frame_runtime.accepted_state.camera_altitude,
             frame_runtime.accepted_state.camera_distance,
             frame_runtime.accepted_state.ik_global_bone_positions(0));
+        if (!::g1_mesh_renderer_update(
+                g1_mesh_renderer,
+                frame_runtime.accepted_state.ik_global_bone_positions,
+                frame_runtime.accepted_state.ik_global_bone_rotations,
+                artifact_error,
+                static_cast<int>(sizeof(artifact_error)))) {
+            ::controlled_runtime_error(artifact_error);
+            controller_exit_code = 2;
+            controller_exit_requested = true;
+            break;
+        }
         ::BeginDrawing();
         ::ClearBackground(Color{18, 20, 25, 255});
         ::BeginMode3D(camera);
         ::DrawModel(terrain_model, Vector3{0.0f, 0.0f, 0.0f}, 1.0f, WHITE);
-        ::draw_g1_skeleton(
-            frame_runtime.accepted_state.ik_global_bone_positions,
-            frame_runtime.accepted_state.ik_global_bone_rotations,
-            frame_external.db->bone_parents);
+        if (show_g1_mesh) {
+            ::g1_mesh_renderer_draw(g1_mesh_renderer);
+        }
+        if (show_g1_bones) {
+            ::draw_g1_skeleton(
+                frame_runtime.accepted_state.ik_global_bone_positions,
+                frame_runtime.accepted_state.ik_global_bone_rotations,
+                frame_external.db->bone_parents);
+        }
+        if (show_g1_sole_proxies) {
+            ::draw_g1_sole_proxies(
+                frame_runtime.accepted_state.ik_global_bone_positions,
+                frame_runtime.accepted_state.ik_global_bone_rotations,
+                frame_runtime.accepted_state.curr_bone_contacts);
+        }
         ::EndMode3D();
         ::DrawText("Transactional terrain IK", 20, 20, 20, RAYWHITE);
+        ::DrawText(
+            show_g1_mesh ? "G1 MESH: ON" : "G1 MESH: OFF",
+            20, 48, 20, RAYWHITE);
+        ::DrawText(
+            show_g1_bones ? "BONES: ON" : "BONES: OFF",
+            20, 74, 20, RAYWHITE);
+        ::DrawText(
+            show_g1_sole_proxies ? "SOLE PROXIES: ON" : "SOLE PROXIES: OFF",
+            20, 100, 20, RAYWHITE);
+        ::DrawText(
+            "M mesh  B bones  P sole proxies",
+            20, 128, 18, LIGHTGRAY);
         ::EndDrawing();
     }
 
