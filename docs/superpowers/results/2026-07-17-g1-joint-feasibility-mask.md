@@ -6,21 +6,29 @@ Date: 2026-07-17 UTC
 
 The authenticated raw-frame feasibility mask is implemented and qualified. It
 removed the original unsafe raw database progression from frame 866 to frame
-867. The unchanged seven-gate Stage A baseline still does not pass: gate 4
-stops at chunk 5 after 101 valid frames because a repeated transition into raw
-frame 866 accumulates inertialization and drives `left_ankle_roll_joint` to
-`-0.280130744`, below the registered lower limit `-0.261799991`.
+867. Final review of the first qualification run found that forced masked search
+had accidentally disabled the matcher's existing 20-frame neighborhood
+exclusion. Commit `02f0a08` repaired that defect test-first.
 
-This is a truthful next scientific result, not a Stage A pass. The database
-certificate, masked search, Python identity binding, and live projection gate
-all behaved as designed. The next intervention must address transition-time
-inertialization feasibility without clipping poses, widening limits, removing
-the hard projection gate, or weakening evidence contracts.
+The fresh repaired Stage A baseline still does not pass. Gate 4 stops at chunk 5
+after 101 valid frames: transition 865 -> 866 is raw-safe and remains
+inertialized-safe, then the restored neighborhood exclusion selects the farther
+certified transition 927 -> 928. Raw frame 928 projects safely at
+`-0.217500582`, but the consecutive transition's inertialized
+`left_ankle_roll_joint` reaches `-0.27224052`, below the registered lower limit
+`-0.261799991`.
+
+This repaired run is a truthful next scientific result, not a Stage A pass. The
+database certificate, masked search, neighborhood semantics, Python identity
+binding, and live projection gate all behaved as designed. The next intervention
+must address state-dependent transition/inertialization feasibility without
+clipping poses, widening limits, removing the hard projection gate, or weakening
+evidence contracts.
 
 ## Scope and commits
 
 - Required base: `05014911828c3b52b38a1651fecf3760ef8f03ee`
-- Implementation qualification HEAD: `0cc200ee57169eddf7d8b0e7f52987596a565ecf`
+- Final production qualification HEAD: `02f0a08d189933fa2cd389ebf1e785f17d419a1d`
 - Worktree: `/home/ubuntu/projects/motion-matching/.worktrees/g1-sonic-scene-aware-baseline`
 - Branch: `g1-sonic-scene-aware-baseline`
 
@@ -31,6 +39,7 @@ the hard projection gate, or weakening evidence contracts.
 | Masked matcher/runtime | `207027b` | Unsafe incumbents/candidates excluded; unsafe progression forces search; unmasked API unchanged |
 | Server ownership/protocol | `989ec5b` | Certificate owned for server lifetime and published in strict protocol-v1 hello identity |
 | Python orchestration binding | `0cc200e` | Strict seven-key parser, preflight/run identity cross-binding, retained evidence, exact scientific classification |
+| Final-review repair | `02f0a08` | Masked incumbent remains unavailable while the prior frame still centers the existing neighborhood exclusion |
 
 The live `sonic_project_pose` call remains enabled after selection and
 inertialization. Its failure is what stopped the real run.
@@ -65,9 +74,17 @@ expected missing-interface or behavioral RED before production changes.
   `9.430s`; the adjacent surface passed 118 with two skips in `29.226s`; the
   protected Python 3.10 warning-strict run passed 110 with six guarded skips in
   `9.457s`. Independent review found no Critical, Important, or Minor findings.
+- Final review rejected the first qualification at `92f5049` with one Important
+  finding: `unsafe_successor` supplied `-1` before `database_search`, so the
+  search could not retain the prior frame as the center of `ignore_surrounding`.
+  The focused regression first failed exactly on `forced masked search preserves
+  the current-frame neighborhood`. Commit `02f0a08` passes the prior frame and
+  lets the immutable mask discard only the incumbent. The focused runtime and
+  database binaries, the four-binary C++ matrix, the protected masked-runtime
+  evaluator, and the ASan/UBSan runtime binary then exited 0.
 
-Fresh protected evaluators after `0cc200e` all passed. Their bound production
-and probe SHA-256 identities were:
+Fresh protected evaluators at the final production state all passed. Their
+bound production and probe SHA-256 identities were:
 
 - Projection: `sonic/cpp/g1_joint_projection.h`
   `feae1193e858fa173951f16d7ed3fd42a621a40a23bfab8ef107a55513611c11`;
@@ -75,10 +92,10 @@ and probe SHA-256 identities were:
 - Certificate: `sonic/cpp/g1_joint_feasibility.h`
   `cfb75c97e64b50562a0a293b0e5eaee6ae3f833810c604a4bf66e8728cd56221`;
   probe `b28709e1d5bbbb25b02ea15cf7140aac20a13f615c1f13b0f4cba39bba6e0edb`.
-- Masked runtime: `database.h`
+- Final masked runtime: `database.h`
   `1a6495d938db97368f4f0f7f81b7ae8e62d969921588fc4b98c1176264e88f6b`,
   `sonic/cpp/g1_runtime.h`
-  `4f83d92437f34837aece7ed8c3f18eb52737795ca226ebad7fadc254dcf73637`,
+  `b6e56638c942a0029c39c6c1ac4541dd32619186bc6fd38099922dbc560bfda9`,
   and probe
   `2a6e71240033d49f4a0dc1795c739ffad38926fe5ab1c6c0dd9b72f1ed8bd8d8`.
 
@@ -111,17 +128,21 @@ Ran 411 tests in 50.957s
 OK (skipped=6)
 ```
 
-A fresh pre-commit rerun of the identical catalog also passed 411 tests with
-six skips in `52.199s`; the C++ loop and all retained evidence assertions were
-re-run in the same verification wave and exited 0.
+A pre-review rerun of the identical catalog passed 411 tests with six skips in
+`52.199s`. After the final-review repair, the final catalog passed 411 tests
+with six skips in `50.580s`. The real-artifact server protocol suite also passed
+all 16 tests in `39.264s`, including generation and abort/regeneration against
+the repaired real binary. The C++ loop, protected evaluators, sanitizer run, and
+retained evidence assertions exited 0.
 
 Qualified executable SHA-256 identities:
 
-- `mm_chunk_server`: `6ddca2f3d6d6fd7d07ba134059f0383d24c93f3acf4a6c998b67de9db9ace44a`
+- `mm_chunk_server`: `cf491c48f0a82b8ca5d55bfb9c7e4205effae2c404464832bb33789bde755fad`
 - `route_schedule_cli`: `b48208fe7eb4fbb3d2757698628bbee8fdcedfb2f6024d322323be36f1c3ba4b`
 - `g1_project_pose_cli`: `a923539a7e130c4ee888ff363294d128b4afaffe85d7263606874af7acd031ad`
 
-The server embeds implementation HEAD `0cc200ee57169eddf7d8b0e7f52987596a565ecf`.
+The server embeds final production HEAD
+`02f0a08d189933fa2cd389ebf1e785f17d419a1d`.
 
 ## Real certificate
 
@@ -143,10 +164,26 @@ identity:
 The 29 violation counts sum to 1,063. Both launches loaded the authenticated
 459,682-frame database and produced the identical digest.
 
-## Real Stage A run
+## Real Stage A runs
 
-The experiment changed only the output root from the prior known-good-stream
-command:
+### Rejected intermediate qualification
+
+The first immutable run at implementation HEAD `0cc200e` is preserved at:
+
+```text
+/home/ubuntu/projects/motion-matching/.worktrees/g1-sonic-scene-aware-baseline/sonic/runs/stage-a-joint-feasibility-integrated-20260717/stage-a/known-good-stream-20260717T104648535827Z-6a17fce5
+```
+
+It exited 3 after 101 frames with inertialized ankle roll `-0.280130744`.
+Although it removed the old raw 866 -> 867 failure, final review correctly
+rejected its scientific interpretation: forced search had lost the existing
+neighborhood center and selected 865 -> 866 repeatedly. The run and its hashes
+remain immutable diagnostic evidence, but they are not the final qualification.
+
+### Final repaired qualification
+
+The final experiment again changed only the output root from the unchanged
+known-good-stream command:
 
 ```bash
 env CUDA_VISIBLE_DEVICES=0 PYTHONPATH=sonic/python \
@@ -157,14 +194,14 @@ env CUDA_VISIBLE_DEVICES=0 PYTHONPATH=sonic/python \
   --observation-config /tmp/groot-wbc-plan-inspect/gear_sonic_deploy/policy/release/observation_config.yaml \
   --source-mjcf /home/ubuntu/projects/mjx-diffphysics/env/g1/assets/g1_29dof.xml \
   --terrain-dir /home/ubuntu/projects/motion-matching/resources/g1_terrain \
-  --output-root /home/ubuntu/projects/motion-matching/.worktrees/g1-sonic-scene-aware-baseline/sonic/runs/stage-a-joint-feasibility-integrated-20260717
+  --output-root /home/ubuntu/projects/motion-matching/.worktrees/g1-sonic-scene-aware-baseline/sonic/runs/stage-a-joint-feasibility-neighborhood-integrated-20260717
 ```
 
 The command exited 3 with `status=scientific_failure` and
 `stage_a_status=failed`. The immutable run is:
 
 ```text
-/home/ubuntu/projects/motion-matching/.worktrees/g1-sonic-scene-aware-baseline/sonic/runs/stage-a-joint-feasibility-integrated-20260717/stage-a/known-good-stream-20260717T104648535827Z-6a17fce5
+/home/ubuntu/projects/motion-matching/.worktrees/g1-sonic-scene-aware-baseline/sonic/runs/stage-a-joint-feasibility-neighborhood-integrated-20260717/stage-a/known-good-stream-20260717T111254537434Z-214bb9bd
 ```
 
 Gates 1--3 passed. Gate 4 reported:
@@ -178,34 +215,37 @@ completed_chunks=5
 partial_frame_count=101
 required_chunks=30
 required_frame_count=601
-generation_failed: joint left_ankle_roll_joint position -0.280130744 is outside range [-0.261799991, 0.261799991]
+generation_failed: joint left_ankle_roll_joint position -0.27224052 is outside range [-0.261799991, 0.261799991]
 ```
 
 Gates 5--7 are `not_run` because gate 4 blocks them. Artifact SHA-256 values:
 
-- `stage-a-evidence.json`: `bb939e7b351cbeff85627bfaef4a1e7e7d9451dd825f87ece204a663edd67025`
-- `manifest.json`: `d84fab8eb8f8aab81040983b71c1b91d99ea61509d53d9272fead95f8ea21c61`
-- `inventory.json`: `e6336158b0e646f5c34b75818040d4ece84ac8ee50287d7976a7c357e7cb767d`
-- Gate 4: `a3cef3ba0c94381f362befd48052e5a07a05f75e4912a39847ff98ceb403c810`
+- `stage-a-evidence.json`: `56ae3099c6d673b96a230b507915243061acfcdb4af70771a2715938888d7065`
+- `manifest.json`: `c0321bd4a12e3411a587852ecf6ccdcf45847a342ed7468ef78d96ff0d1b7f22`
+- `inventory.json`: `f68b461123202ee75baafae4ee6705ae7ffc1930283dd1ab9aede0e7da3d92e9`
+- Gate 4: `c2f6a327c609ec7bd106782e7edb9baedeca3e62331bd62a0fdd5c59c93d977b`
 
 `verify_run_inventory(...)` returned `True` for the finalized run.
 
-## Failure localization
+## Final failure localization
 
-An out-of-tree, read-only C++ diagnostic harness replayed the public real adapter
-at the failure boundary without changing production code:
+An out-of-tree, warning-strict C++ harness compiled against production HEAD
+`02f0a08` and replayed the public real adapter without changing production code:
 
 | Step | Selected/state frame | Transition | Raw left ankle roll | Inertialized result |
 |---|---|---:|---:|---:|
 | 50 | 50 -> 51 | no | `-0.246654257` | `-0.246654257` (safe) |
 | 51 | 865 -> 866 | yes | `-0.190088332` | `-0.254079133` (safe) |
-| 52 | 865 -> 866 | yes | `-0.190088332` | `-0.280130744` (limit failure) |
+| 52 | 927 -> 928 | yes | `-0.217500582` | `-0.27224052` (limit failure) |
 
-The former selected-866-to-emitted-867 path is absent. Raw frame 866 projects
-inside the registered limits on both repeated searches. The second transition's
-inertialized pose, not the raw database pose or its successor mask, crosses the
-limit. This localizes the next research problem to transition/inertialization
-feasibility.
+The former selected-866-to-emitted-867 path is absent. Frame 865 is selected
+once while the prior frame is 51. On the next step, prior frame 866 correctly
+centers the restored 20-frame exclusion, so 865 is not eligible and the matcher
+selects the farther certified frame 927. Both emitted raw frames 866 and 928
+project inside the registered limits. The second consecutive transition's
+state-dependent inertialized pose, not a raw database pose, successor-mask
+error, or repeated-neighbor loop, crosses the limit. This localizes the next
+research problem to transition/inertialization feasibility.
 
 ## Repository and runtime boundaries
 
