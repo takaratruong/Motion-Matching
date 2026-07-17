@@ -576,6 +576,9 @@ class ChunkServerSourceOwnershipTest(unittest.TestCase):
         )
         classifier_source = source[classifier_start:classifier_stop]
         self.assertIn("sonic_project_joint_state(", classifier_source)
+        self.assertIn(
+            "sonic_validate_joint_hermite_midpoint(", classifier_source
+        )
         self.assertIn("SonicJointProjectionLimit", classifier_source)
         self.assertIn("projection.row", classifier_source)
         self.assertIn("std::isfinite(projection.position)", classifier_source)
@@ -594,7 +597,13 @@ class ChunkServerSourceOwnershipTest(unittest.TestCase):
             "g1_runtime_joint_preview_validator preview_validator",
             advance_body,
         )
-        self.assertIn("preview_validator.context = this", advance_body)
+        self.assertIn("mm_real_joint_preview_context preview_context", advance_body)
+        self.assertIn(
+            "mm_real_project_joint_preview_baseline(", advance_body
+        )
+        self.assertIn(
+            "preview_validator.context = &preview_context", advance_body
+        )
         self.assertIn(
             "preview_validator.evaluate = validate_joint_preview",
             advance_body,
@@ -602,6 +611,10 @@ class ChunkServerSourceOwnershipTest(unittest.TestCase):
         runtime_call = advance_body[advance_body.index("g1_runtime_step("):]
         self.assertIn("runtime_feasibility", runtime_call)
         self.assertIn("preview_validator", runtime_call)
+        self.assertLess(
+            advance_body.index("mm_real_project_joint_preview_baseline("),
+            advance_body.index("g1_runtime_step("),
+        )
 
     def test_fake_certificate_uses_shared_digest_and_projection_gate_remains(self):
         source = (ROOT / "sonic" / "cpp" / "mm_chunk_server.cpp").read_text(

@@ -228,17 +228,15 @@ static g1_runtime_joint_preview_verdict mm_real_classify_joint_preview(
     return G1RuntimeJointPreviewFatal;
 }
 
-static g1_runtime_joint_preview_verdict mm_real_project_joint_preview(
+static bool mm_real_project_joint_preview_baseline(
+    float (&positions)[SonicG1JointCount],
+    float (&velocities)[SonicG1JointCount],
     const sonic_joint_contract_entry (&contract)[SonicG1JointCount],
     const slice1d<quat> local_rotations,
     const slice1d<vec3> local_angular_velocities,
-    int& rejected_joint_index,
-    float& rejected_joint_position,
     char* error,
     const int capacity)
 {
-    float positions[SonicG1JointCount] = {};
-    float velocities[SonicG1JointCount] = {};
     float residuals[SonicG1JointCount] = {};
     sonic_joint_projection_diagnostic projection;
     const bool projected = sonic_project_joint_state(
@@ -251,8 +249,70 @@ static g1_runtime_joint_preview_verdict mm_real_project_joint_preview(
         local_angular_velocities,
         error,
         capacity);
+    int rejected_joint_index = -1;
+    float rejected_joint_position = 0.0f;
     return mm_real_classify_joint_preview(
-        projected,
+               projected,
+               projection,
+               contract,
+               rejected_joint_index,
+               rejected_joint_position,
+               error,
+               capacity) == G1RuntimeJointPreviewAccept;
+}
+
+static g1_runtime_joint_preview_verdict
+mm_real_project_joint_interval_preview(
+    const sonic_joint_contract_entry (&contract)[SonicG1JointCount],
+    const float (&left_positions)[SonicG1JointCount],
+    const float (&left_velocities)[SonicG1JointCount],
+    const slice1d<quat> right_local_rotations,
+    const slice1d<vec3> right_local_angular_velocities,
+    const float dt,
+    int& rejected_joint_index,
+    float& rejected_joint_position,
+    char* error,
+    const int capacity)
+{
+    float right_positions[SonicG1JointCount] = {};
+    float right_velocities[SonicG1JointCount] = {};
+    float right_residuals[SonicG1JointCount] = {};
+    sonic_joint_projection_diagnostic projection;
+    const bool projected = sonic_project_joint_state(
+        right_positions,
+        right_velocities,
+        right_residuals,
+        projection,
+        contract,
+        right_local_rotations,
+        right_local_angular_velocities,
+        error,
+        capacity);
+    const g1_runtime_joint_preview_verdict endpoint_verdict =
+        mm_real_classify_joint_preview(
+            projected,
+            projection,
+            contract,
+            rejected_joint_index,
+            rejected_joint_position,
+            error,
+            capacity);
+    if (endpoint_verdict != G1RuntimeJointPreviewAccept) {
+        return endpoint_verdict;
+    }
+
+    const bool midpoint_valid = sonic_validate_joint_hermite_midpoint(
+        projection,
+        contract,
+        left_positions,
+        left_velocities,
+        right_positions,
+        right_velocities,
+        dt,
+        error,
+        capacity);
+    return mm_real_classify_joint_preview(
+        midpoint_valid,
         projection,
         contract,
         rejected_joint_index,
@@ -260,6 +320,15 @@ static g1_runtime_joint_preview_verdict mm_real_project_joint_preview(
         error,
         capacity);
 }
+
+struct mm_real_joint_preview_context
+{
+    const sonic_joint_contract_entry
+        (*contract)[SonicG1JointCount] = nullptr;
+    float left_positions[SonicG1JointCount] = {};
+    float left_velocities[SonicG1JointCount] = {};
+    float dt = 0.0f;
+};
 
 class mm_real_adapter
 {
@@ -606,10 +675,24 @@ public:
         runtime_feasibility.raw_safe = joint_feasibility_.raw_safe.data;
         runtime_feasibility.search_safe = joint_feasibility_.search_safe.data;
         runtime_feasibility.count = joint_feasibility_.frame_count;
-        g1_runtime_joint_preview_validator preview_validator;
-        preview_validator.context = this;
-        preview_validator.evaluate = validate_joint_preview;
+        mm_real_joint_preview_context preview_context;
+        preview_context.contract = &contract_;
+        preview_context.dt = config.dt;
         char error[1024] = {};
+        if (!mm_real_project_joint_preview_baseline(
+                preview_context.left_positions,
+                preview_context.left_velocities,
+                contract_,
+                state.bone_rotations,
+                state.bone_angular_velocities,
+                error,
+                static_cast<int>(sizeof(error)))) {
+            message = error;
+            return false;
+        }
+        g1_runtime_joint_preview_validator preview_validator;
+        preview_validator.context = &preview_context;
+        preview_validator.evaluate = validate_joint_preview;
         if (!g1_runtime_step(
                 result,
                 state,
@@ -680,12 +763,20 @@ private:
                 error, capacity, "joint preview adapter context is null");
             return G1RuntimeJointPreviewFatal;
         }
-        mm_real_adapter& adapter =
-            *static_cast<mm_real_adapter*>(raw_context);
-        return mm_real_project_joint_preview(
-            adapter.contract_,
+        mm_real_joint_preview_context& context =
+            *static_cast<mm_real_joint_preview_context*>(raw_context);
+        if (context.contract == nullptr) {
+            sonic_projection_error(
+                error, capacity, "joint preview contract context is null");
+            return G1RuntimeJointPreviewFatal;
+        }
+        return mm_real_project_joint_interval_preview(
+            *context.contract,
+            context.left_positions,
+            context.left_velocities,
             local_rotations,
             local_angular_velocities,
+            context.dt,
             rejected_joint_index,
             rejected_joint_position,
             error,

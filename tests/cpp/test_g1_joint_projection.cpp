@@ -43,6 +43,17 @@ using ProjectJointStateSignature = bool (*)(
     char*,
     int);
 
+using ValidateHermiteMidpointSignature = bool (*)(
+    sonic_joint_projection_diagnostic&,
+    const sonic_joint_contract_entry (&)[SonicG1JointCount],
+    const float (&)[SonicG1JointCount],
+    const float (&)[SonicG1JointCount],
+    const float (&)[SonicG1JointCount],
+    const float (&)[SonicG1JointCount],
+    float,
+    char*,
+    int);
+
 static_assert(SonicG1JointCount == 29, "SONIC G1 joint count");
 static_assert(
     std::is_same<decltype(&sonic_project_pose), ProjectSignature>::value,
@@ -52,6 +63,11 @@ static_assert(
         decltype(&sonic_project_joint_state),
         ProjectJointStateSignature>::value,
     "public joint-state projection signature");
+static_assert(
+    std::is_same<
+        decltype(&sonic_validate_joint_hermite_midpoint),
+        ValidateHermiteMidpointSignature>::value,
+    "public Hermite midpoint validation signature");
 static_assert(SonicJointProjectionValid == 0, "valid diagnostic value");
 static_assert(SonicJointProjectionShape == 1, "shape diagnostic value");
 static_assert(SonicJointProjectionContract == 2, "contract diagnostic value");
@@ -389,6 +405,105 @@ static void test_position_failure_classification_keeps_nonfinite_fatal()
           SonicJointProjectionValid);
 }
 
+static void test_exact_stage_a_hermite_midpoint_limit_is_structured()
+{
+    ProjectionFixture fixture;
+    const int row = 5;
+    fixture.contract[row].lower = -0.261799991f;
+    fixture.contract[row].upper = 0.261799991f;
+    float left_position[SonicG1JointCount] = {};
+    float left_velocity[SonicG1JointCount] = {};
+    float right_position[SonicG1JointCount] = {};
+    float right_velocity[SonicG1JointCount] = {};
+    left_position[row] = -0.260674924f;
+    left_velocity[row] = -0.94069916f;
+    right_position[row] = -0.259201497f;
+    right_velocity[row] = 0.313621432f;
+    const float dt = 0.04f;
+    const double expected_midpoint =
+        0.5 * static_cast<double>(left_position[row]) +
+        0.125 * static_cast<double>(dt) *
+            static_cast<double>(left_velocity[row]) +
+        0.5 * static_cast<double>(right_position[row]) +
+        -0.125 * static_cast<double>(dt) *
+            static_cast<double>(right_velocity[row]);
+    CHECK(expected_midpoint == -0.2662098130672067);
+    sonic_joint_projection_diagnostic diagnostic;
+
+    CHECK(!sonic_validate_joint_hermite_midpoint(
+        diagnostic,
+        fixture.contract,
+        left_position,
+        left_velocity,
+        right_position,
+        right_velocity,
+        dt,
+        fixture.error,
+        static_cast<int>(sizeof(fixture.error))));
+    CHECK(diagnostic.failure == SonicJointProjectionLimit);
+    CHECK(diagnostic.row == row);
+    CHECK(diagnostic.position == static_cast<float>(expected_midpoint));
+    CHECK(diagnostic.position < fixture.contract[row].lower);
+    CHECK(diagnostic.lower == fixture.contract[row].lower);
+    CHECK(diagnostic.upper == fixture.contract[row].upper);
+    CHECK(std::strstr(fixture.error, "Hermite midpoint") != NULL);
+
+    left_velocity[row] = 0.0f;
+    right_velocity[row] = 0.0f;
+    std::memset(fixture.error, 0, sizeof(fixture.error));
+    CHECK(sonic_validate_joint_hermite_midpoint(
+        diagnostic,
+        fixture.contract,
+        left_position,
+        left_velocity,
+        right_position,
+        right_velocity,
+        dt,
+        fixture.error,
+        static_cast<int>(sizeof(fixture.error))));
+    CHECK(diagnostic.failure == SonicJointProjectionValid);
+    CHECK(diagnostic.row == -1);
+    CHECK(diagnostic.position == 0.0f);
+    CHECK(fixture.error[0] == '\0');
+}
+
+static void test_hermite_midpoint_malformed_inputs_fail_closed()
+{
+    ProjectionFixture fixture;
+    float left_position[SonicG1JointCount] = {};
+    float left_velocity[SonicG1JointCount] = {};
+    float right_position[SonicG1JointCount] = {};
+    float right_velocity[SonicG1JointCount] = {};
+    sonic_joint_projection_diagnostic diagnostic;
+
+    CHECK(!sonic_validate_joint_hermite_midpoint(
+        diagnostic,
+        fixture.contract,
+        left_position,
+        left_velocity,
+        right_position,
+        right_velocity,
+        0.0f,
+        fixture.error,
+        static_cast<int>(sizeof(fixture.error))));
+    CHECK(diagnostic.failure == SonicJointProjectionInput);
+    CHECK(diagnostic.row == -1);
+
+    left_velocity[7] = std::numeric_limits<float>::quiet_NaN();
+    CHECK(!sonic_validate_joint_hermite_midpoint(
+        diagnostic,
+        fixture.contract,
+        left_position,
+        left_velocity,
+        right_position,
+        right_velocity,
+        0.04f,
+        fixture.error,
+        static_cast<int>(sizeof(fixture.error))));
+    CHECK(diagnostic.failure == SonicJointProjectionInput);
+    CHECK(diagnostic.row == 7);
+}
+
 static void test_structured_success_publishes_all_outputs_atomically()
 {
     ProjectionFixture fixture;
@@ -638,6 +753,8 @@ int main()
     test_structured_residual_and_velocity_failures();
     test_structured_limit_failures_report_both_directions();
     test_position_failure_classification_keeps_nonfinite_fatal();
+    test_exact_stage_a_hermite_midpoint_limit_is_structured();
+    test_hermite_midpoint_malformed_inputs_fail_closed();
     test_structured_success_publishes_all_outputs_atomically();
     test_signed_angles_on_all_axes_and_pelvis_copy();
     test_antipodal_local_quaternions_are_equivalent();

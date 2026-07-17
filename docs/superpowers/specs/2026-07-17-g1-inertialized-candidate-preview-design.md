@@ -25,8 +25,8 @@ This intervention asks one narrow research question:
 
 > Can the existing matcher complete its reference while retaining its current
 > cost ordering and neighborhood semantics, but accepting only candidates whose
-> exact next state-dependent inertialized joint pose satisfies the authenticated
-> G1 joint contract?
+> exact next state-dependent inertialized joint interval, including the 50 Hz
+> bridge midpoint, satisfies the authenticated G1 joint contract?
 
 The intervention validates a candidate before selection. It does not repair or
 modify an emitted pose.
@@ -56,8 +56,9 @@ authoritative and must still run.
 
 ## Goals
 
-- Preview the exact one-step inertialized joint state for ordinary continuation
-  and each prospective transition.
+- Preview the exact one-step inertialized joint interval for ordinary
+  continuation and each prospective transition, including its emitted 50 Hz
+  midpoint.
 - Preserve the existing feature query, transition cost, branch-and-bound cost
   order, raw-feasibility mask, range clamp, and 20-frame neighborhood.
 - Reject only candidates whose structured preview fails a registered joint
@@ -126,13 +127,15 @@ The change stays within four existing ownership boundaries:
   tri-state candidate-validation control flow, but no G1 contract knowledge;
 - `sonic/cpp/g1_runtime.h` owns scratch pose preview, ordinary-continuation
   scheduling, shared transition/update application, and step diagnostics;
+- `sonic/cpp/g1_joint_projection.h` owns contract-relative endpoint projection
+  and the exact binary32-`dt` Hermite midpoint limit predicate;
 - `sonic/cpp/mm_chunk_server.cpp` owns the real contract-bound validator and
   conversion of runtime diagnostics into protocol diagnostics;
 - `sonic/cpp/mm_chunk_protocol.h`, the C++ JSON writer, strict JSON schema, and
   Python schema/runtime-log layers own wire representation and validation.
 
-No controller, terrain, support, projection, or feasibility-certificate module
-gains a second responsibility.
+No controller, terrain, support, or feasibility-certificate module gains a
+second responsibility.
 
 ### 1. Shared one-step pose-advance primitive
 
@@ -160,6 +163,34 @@ read-only baseline for each candidate. The implementation does not clone the
 complete controller state or allocate per candidate. Preview never mutates the
 database, live state, output result, search timers, or diagnostics until a
 candidate is selected.
+
+### 1a. Exact emitted-interval predicate
+
+The first immutable Stage A qualification trial exposed a narrower downstream
+gap after the endpoint-preview implementation. At chunk 6, the accepted 25 Hz
+left/right ankle-roll endpoints were `-0.260674924` and `-0.259201497`, but the
+existing 25-to-50 Hz cubic-Hermite bridge produced `-0.2662098130672067` at
+`u=0.5`, outside the unchanged lower limit. That terminal run is preserved as
+scientific evidence; the selector must cover the interval the G1 bridge emits,
+not only its right endpoint.
+
+For each runtime step, the real adapter projects the shared live left boundary
+once before search. A malformed shared projection is fatal and a registered
+left-boundary violation remains a live scientific failure. Each candidate then
+projects its exact scratch right boundary and evaluates the same midpoint as
+`resample.py`:
+
+```text
+q_mid = 0.5*q_left + 0.125*float32(0.04)*v_left
+      + 0.5*q_right - 0.125*float32(0.04)*v_right
+```
+
+Endpoint values remain binary32 and are promoted to double for the arithmetic
+and limit comparison, matching the Python bridge. A well-formed endpoint or
+midpoint limit result rejects only that candidate; malformed/non-finite
+projection or midpoint state fails closed. The existing diagnostic records the
+rejected source-joint row and projected position, whether the first violation
+was at the right endpoint or midpoint.
 
 ### 2. Explicit ordinary-continuation preview
 

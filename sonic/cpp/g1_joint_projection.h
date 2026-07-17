@@ -439,6 +439,100 @@ static inline bool sonic_project_joint_state(
     return true;
 }
 
+static inline bool sonic_validate_joint_hermite_midpoint(
+    sonic_joint_projection_diagnostic& diagnostic,
+    const sonic_joint_contract_entry (&contract)[SonicG1JointCount],
+    const float (&left_positions)[SonicG1JointCount],
+    const float (&left_velocities)[SonicG1JointCount],
+    const float (&right_positions)[SonicG1JointCount],
+    const float (&right_velocities)[SonicG1JointCount],
+    const float dt,
+    char* error,
+    const int error_capacity)
+{
+    if (error != NULL && error_capacity > 0) error[0] = '\0';
+    if (!sonic_projection_contract_valid(contract, error, error_capacity)) {
+        sonic_joint_projection_diagnostic candidate;
+        candidate.failure = SonicJointProjectionContract;
+        diagnostic = candidate;
+        return false;
+    }
+    if (!std::isfinite(dt) || dt <= 0.0f) {
+        return sonic_projection_diagnostic_error(
+            diagnostic,
+            SonicJointProjectionInput,
+            -1,
+            0.0f,
+            0.0f,
+            0.0f,
+            error,
+            error_capacity,
+            "joint Hermite midpoint dt must be finite and positive");
+    }
+
+    const double dt_f64 = static_cast<double>(dt);
+    for (int row = 0; row < SonicG1JointCount; ++row) {
+        if (!std::isfinite(left_positions[row]) ||
+            !std::isfinite(left_velocities[row]) ||
+            !std::isfinite(right_positions[row]) ||
+            !std::isfinite(right_velocities[row])) {
+            return sonic_projection_diagnostic_error(
+                diagnostic,
+                SonicJointProjectionInput,
+                row,
+                0.0f,
+                0.0f,
+                0.0f,
+                error,
+                error_capacity,
+                "joint Hermite midpoint input is non-finite at row %d",
+                row);
+        }
+        const double midpoint =
+            0.5 * static_cast<double>(left_positions[row]) +
+            0.125 * dt_f64 *
+                static_cast<double>(left_velocities[row]) +
+            0.5 * static_cast<double>(right_positions[row]) +
+            -0.125 * dt_f64 *
+                static_cast<double>(right_velocities[row]);
+        if (!std::isfinite(midpoint)) {
+            return sonic_projection_diagnostic_error(
+                diagnostic,
+                SonicJointProjectionInput,
+                row,
+                0.0f,
+                0.0f,
+                0.0f,
+                error,
+                error_capacity,
+                "joint Hermite midpoint is non-finite at row %d",
+                row);
+        }
+        const sonic_joint_contract_entry& entry = contract[row];
+        if (midpoint < static_cast<double>(entry.lower) ||
+            midpoint > static_cast<double>(entry.upper)) {
+            return sonic_projection_diagnostic_error(
+                diagnostic,
+                SonicJointProjectionLimit,
+                row,
+                static_cast<float>(midpoint),
+                entry.lower,
+                entry.upper,
+                error,
+                error_capacity,
+                "joint %s Hermite midpoint %.17g is outside range "
+                "[%.9g, %.9g]",
+                entry.source_joint.c_str(),
+                midpoint,
+                static_cast<double>(entry.lower),
+                static_cast<double>(entry.upper));
+        }
+    }
+
+    diagnostic = sonic_joint_projection_diagnostic();
+    return true;
+}
+
 static inline bool sonic_project_pose(
     sonic_projected_pose& out,
     const sonic_joint_contract_entry (&contract)[SonicG1JointCount],

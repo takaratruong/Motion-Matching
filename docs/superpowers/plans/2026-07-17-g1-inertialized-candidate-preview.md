@@ -735,7 +735,24 @@ env PYTHONPATH=sonic/python PYTHONDONTWRITEBYTECODE=1 PYTHONWARNINGS=error \
   tests.python.test_sonic_zmq_v1
 ```
 
-Expected: the complete supported catalog passes with only its six established optional skips; any additional skip, warning, hang, or failure is investigated before scientific execution.
+Expected: the complete supported catalog passes with only its ten established optional/environment skips; any additional skip, warning, hang, or failure is investigated before scientific execution.
+
+- [ ] **Step 4a: Close any exact downstream interval exposed by qualification**
+
+Preserve a terminal scientific run unchanged. If endpoint-safe source data is
+rejected by the existing 25-to-50 Hz bridge, pin the first observed endpoints,
+velocities, binary32 `dt`, interpolated value, joint row, and limits in a RED
+test. Extend the real preview predicate to project the shared live left boundary
+once, project each scratch right boundary, and evaluate the exact Hermite
+midpoint in double precision. Endpoint/midpoint registered-limit failures are
+candidate rejections; malformed shared state or interpolation is fatal. Re-run
+the protected real validator before another immutable trial.
+
+The first qualification trial at
+`known-good-stream-20260717T132232556131Z-206cc7ad` exercised this branch:
+chunk 6 target joint 17 interpolated to `-0.2662098130672067` from legal 25 Hz
+endpoints. It remains immutable evidence rather than being overwritten or
+reclassified.
 
 - [ ] **Step 5: Re-run protected evaluators and prove immutable identities**
 
