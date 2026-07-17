@@ -152,6 +152,12 @@ def _mujoco() -> Any:
     return mujoco
 
 
+def _ensure_offscreen_framebuffer(model: object, *, width: int, height: int) -> None:
+    global_visual = model.vis.global_
+    global_visual.offwidth = max(int(global_visual.offwidth), width)
+    global_visual.offheight = max(int(global_visual.offheight), height)
+
+
 def load_replay_inputs(run_root: Path) -> tuple[object, tuple[ReplayState, ...], ReplayMetrics, dict[str, str]]:
     root = run_root.expanduser().resolve(strict=True)
     if not root.is_dir() or not verify_run_inventory(root):
@@ -246,6 +252,7 @@ def render_replay(run_root: Path, output_dir: Path, *, ffmpeg: str = "ffmpeg", f
         "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(tmp_video),
     ]
     mujoco = _mujoco()
+    _ensure_offscreen_framebuffer(model, width=WIDTH // 2, height=HEIGHT)
     data = mujoco.MjData(model)
     fixed = mujoco.MjvCamera()
     tracking = mujoco.MjvCamera()

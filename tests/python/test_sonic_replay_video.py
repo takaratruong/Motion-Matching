@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 import numpy as np
@@ -10,12 +11,22 @@ import numpy as np
 from mm_sonic.joints import ContractError
 from mm_sonic.replay_video import (
     ReplayState,
+    _ensure_offscreen_framebuffer,
     load_state_stream,
     validate_probe,
 )
 
 
 class ReplayStateContractTests(unittest.TestCase):
+    def test_expands_offscreen_framebuffer_without_shrinking_it(self) -> None:
+        global_visual = SimpleNamespace(offwidth=320, offheight=1080)
+        model = SimpleNamespace(vis=SimpleNamespace(global_=global_visual))
+
+        _ensure_offscreen_framebuffer(model, width=640, height=720)
+
+        self.assertEqual(global_visual.offwidth, 640)
+        self.assertEqual(global_visual.offheight, 1080)
+
     def test_loads_exact_nested_state_sequence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "state.jsonl"
