@@ -180,8 +180,12 @@ row-paced batches. The registered 16-row control lead ensures all 2,400
 CONTROL steps finish before frame 600 is emitted. As soon as a newline-complete
 601st target row exists, the process group is stopped before the full target
 audit; early terminal arrival, overshoot, content mismatch, inode replacement,
-or any post-stop write fails integration. Stage A retains its default paced
-simulator behavior.
+or any post-stop write fails integration. The terminal fence records simulator
+counters immediately before the stop, requires an identical post-stop and
+final snapshot, and proves that requested, CONTROL-active, and required steps
+were already equal before GEAR stopped. No simulator step may be used to fill
+the duration after that boundary. Stage A retains its default paced simulator
+behavior.
 
 The generated run-local scene is bound semantically, not by a path-sensitive
 digest alone. Stage B verifies the complete generated and included XML against

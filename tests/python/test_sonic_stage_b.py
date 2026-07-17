@@ -44,6 +44,30 @@ def canonical(count: int = 601) -> CanonicalTargetBuffer:
     )
 
 
+def terminal_stop_fence(
+    control_steps: int = 3000,
+    sim_dt_s: float = 0.004,
+) -> MappingProxyType:
+    simulator_steps = control_steps + 1
+    return MappingProxyType(
+        {
+            "target_rows": 601,
+            "required_control_steps": control_steps,
+            "requested_control_steps": control_steps,
+            "control_drive_steps": control_steps,
+            "control_drive_duration_s": control_steps * sim_dt_s,
+            "simulator_steps": simulator_steps,
+            "simulator_duration_s": simulator_steps * sim_dt_s,
+            "state_rows": simulator_steps // round(0.02 / sim_dt_s),
+            "contact_rows": simulator_steps,
+            "gear_stopped_before_audit": True,
+            "post_stop_snapshot_stable": True,
+            "final_snapshot_stable": True,
+            "exact": True,
+        }
+    )
+
+
 class StageBContractTests(unittest.TestCase):
     def test_parser_registers_stage_b_with_authenticated_prerequisite(self) -> None:
         namespace = cli_module._parser().parse_args(
@@ -135,6 +159,7 @@ class StageBContractTests(unittest.TestCase):
             control_drive_duration_s=12.0,
             sim_dt_s=0.004,
             control_lead_rows=16,
+            terminal_stop_fence=terminal_stop_fence(),
         )
         self.assertEqual(result.command_count, 30)
         self.assertEqual(result.frame_count, 601)
@@ -142,6 +167,7 @@ class StageBContractTests(unittest.TestCase):
         self.assertTrue(result.exact_command_coverage)
         self.assertTrue(result.exact_frame_coverage)
         self.assertTrue(result.exact_control_duration)
+        self.assertTrue(result.terminal_stop_fence_exact)
 
         cases = (
             {
@@ -153,6 +179,7 @@ class StageBContractTests(unittest.TestCase):
                 "control_drive_duration_s": 12.0,
                 "sim_dt_s": 0.004,
                 "control_lead_rows": 16,
+                "terminal_stop_fence": terminal_stop_fence(),
             },
             {
                 "commands": flat_command_script(),
@@ -163,6 +190,7 @@ class StageBContractTests(unittest.TestCase):
                 "control_drive_duration_s": 12.0,
                 "sim_dt_s": 0.004,
                 "control_lead_rows": 16,
+                "terminal_stop_fence": terminal_stop_fence(),
             },
             {
                 "commands": flat_command_script(),
@@ -173,6 +201,7 @@ class StageBContractTests(unittest.TestCase):
                 "control_drive_duration_s": 12.0,
                 "sim_dt_s": 0.004,
                 "control_lead_rows": 16,
+                "terminal_stop_fence": terminal_stop_fence(),
             },
             {
                 "commands": flat_command_script(),
@@ -183,6 +212,7 @@ class StageBContractTests(unittest.TestCase):
                 "control_drive_duration_s": 12.0,
                 "sim_dt_s": 0.004,
                 "control_lead_rows": 16,
+                "terminal_stop_fence": terminal_stop_fence(),
             },
             {
                 "commands": flat_command_script(),
@@ -193,6 +223,7 @@ class StageBContractTests(unittest.TestCase):
                 "control_drive_duration_s": 11.996,
                 "sim_dt_s": 0.004,
                 "control_lead_rows": 16,
+                "terminal_stop_fence": terminal_stop_fence(),
             },
             {
                 "commands": flat_command_script(),
@@ -203,11 +234,43 @@ class StageBContractTests(unittest.TestCase):
                 "control_drive_duration_s": 12.0,
                 "sim_dt_s": 0.004,
                 "control_lead_rows": 15,
+                "terminal_stop_fence": terminal_stop_fence(),
+            },
+            {
+                "commands": flat_command_script(),
+                "canonical": canonical(),
+                "accepted_command_indices": tuple(range(30)),
+                "observed_target_rows": 601,
+                "control_drive_steps": 3000,
+                "control_drive_duration_s": 12.0,
+                "sim_dt_s": 0.004,
+                "control_lead_rows": 16,
+                "terminal_stop_fence": terminal_stop_fence(2999),
             },
         )
         for fields in cases:
             with self.subTest(fields=fields), self.assertRaises(ContractError):
                 validate_stage_b_coverage(**fields)
+
+        for name, value in (
+            ("requested_control_steps", 3000.0),
+            ("control_drive_duration_s", math.nan),
+            ("simulator_duration_s", math.inf),
+        ):
+            damaged_fence = dict(terminal_stop_fence())
+            damaged_fence[name] = value
+            with self.subTest(fence_field=name), self.assertRaises(ContractError):
+                validate_stage_b_coverage(
+                    commands=flat_command_script(),
+                    canonical=canonical(),
+                    accepted_command_indices=tuple(range(30)),
+                    observed_target_rows=601,
+                    control_drive_steps=3000,
+                    control_drive_duration_s=12.0,
+                    sim_dt_s=0.004,
+                    control_lead_rows=16,
+                    terminal_stop_fence=damaged_fence,
+                )
 
     def test_flat_simulator_safety_uses_registered_geom_ids_not_names(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -480,6 +543,7 @@ class StageBDefaultDynamicTests(unittest.TestCase):
                 target_device=1,
                 target_inode=2,
                 target_sha256=_sha("target"),
+                terminal_stop_fence=terminal_stop_fence(),
             )
             execution = SimpleNamespace(
                 bootstrap_steps=3,
@@ -618,6 +682,14 @@ class StageBDefaultDynamicTests(unittest.TestCase):
             )
             self.assertEqual(result.metrics["coverage"]["command_count"], 30)
             self.assertEqual(result.metrics["coverage"]["frame_count"], 601)
+            self.assertTrue(
+                result.metrics["coverage"]["terminal_stop_fence_exact"]
+            )
+            fence = result.metrics["coverage"]["terminal_stop_fence"]
+            self.assertEqual(
+                fence["requested_control_steps"],
+                3000,
+            )
             self.assertEqual(
                 result.metrics["tracking"]["joint_tracking_trace_rad"],
                 [0.02] * 601,
@@ -715,6 +787,7 @@ class StageBCLITests(unittest.TestCase):
                             "exact_command_coverage": True,
                             "exact_frame_coverage": True,
                             "exact_control_duration": True,
+                            "terminal_stop_fence_exact": True,
                         },
                         "tracking": {
                             "joint_position_rmse_rad": 0.02,

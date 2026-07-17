@@ -1200,7 +1200,10 @@ def _stage_b_verdict(
         integration_pass=True,
         exact_command_coverage=coverage.get("exact_command_coverage"),
         exact_frame_coverage=coverage.get("exact_frame_coverage"),
-        exact_control_duration=coverage.get("exact_control_duration"),
+        exact_control_duration=(
+            coverage.get("exact_control_duration") is True
+            and coverage.get("terminal_stop_fence_exact") is True
+        ),
         exact_safety_log_coverage=safety.get("exact_log_coverage"),
         minimum_pelvis_local_height_m=safety.get(
             "minimum_pelvis_local_height_m"
@@ -2029,6 +2032,7 @@ class _TargetCoverageResult:
     target_device: int
     target_inode: int
     target_sha256: str
+    terminal_stop_fence: Mapping[str, object] | None = None
     retained_reader: object | None = field(default=None, repr=False, compare=False)
 
 
@@ -2810,6 +2814,36 @@ def _drive_authoritative_target_coverage(
         or initial_duration < 0.0
     ):
         raise ContractError("initial simulator boundary counters are invalid")
+
+    def read_boundary_snapshot(label: str) -> Mapping[str, object]:
+        value = simulator.snapshot()
+        if not isinstance(value, Mapping) or set(value) != required_snapshot:
+            raise ContractError(f"{label} simulator boundary snapshot is invalid")
+        steps = value["steps"]
+        duration = value["sim_time_s"]
+        state_rows = value["state_rows"]
+        contact_rows = value["contact_rows"]
+        if (
+            type(steps) is not int
+            or steps < 0
+            or type(state_rows) is not int
+            or state_rows < 0
+            or type(contact_rows) is not int
+            or contact_rows < 0
+            or type(duration) not in (int, float)
+            or not math.isfinite(float(duration))
+            or float(duration) < 0.0
+        ):
+            raise ContractError(f"{label} simulator boundary counters are invalid")
+        return MappingProxyType(
+            {
+                "steps": steps,
+                "sim_time_s": float(duration),
+                "state_rows": state_rows,
+                "contact_rows": contact_rows,
+            }
+        )
+
     required_control_steps: int | None = None
     if required_control_duration_s is not None:
         sim_dt = getattr(simulator, "sim_dt", None)
@@ -2836,6 +2870,8 @@ def _drive_authoritative_target_coverage(
     reader = _AuthoritativeTargetReader(Path(target_motion_logfile))
     completed = False
     driven_steps = 0
+    terminal_pre_stop_snapshot: Mapping[str, object] | None = None
+    terminal_post_stop_snapshot: Mapping[str, object] | None = None
     started_ns = time.monotonic_ns()
     deadline = time.monotonic() + float(maximum_wall_seconds)
     try:
@@ -2848,15 +2884,32 @@ def _drive_authoritative_target_coverage(
                 and (not raw or raw.endswith(b"\n"))
                 and raw.count(b"\n") >= canonical.count
             ):
+                terminal_pre_stop_snapshot = read_boundary_snapshot(
+                    "terminal pre-stop"
+                )
                 gear.stop_group()
+                terminal_post_stop_snapshot = read_boundary_snapshot(
+                    "terminal post-stop"
+                )
+                if terminal_post_stop_snapshot != terminal_pre_stop_snapshot:
+                    raise ContractError(
+                        "simulator advanced across the terminal GEAR stop fence"
+                    )
                 raw = reader.read()
                 terminal_pre_stopped = True
             count = _validate_target_prefix(raw, expected_rows)
             if required_control_steps is not None:
-                desired_steps = (
-                    required_control_steps
-                    if count == canonical.count
-                    else min(
+                if terminal_pre_stopped:
+                    if driven_steps != required_control_steps:
+                        raise ContractError(
+                            "terminal target row arrived before exact CONTROL physics"
+                        )
+                else:
+                    if count == canonical.count:
+                        raise ContractError(
+                            "exact CONTROL coverage lacked its pre-audit stop fence"
+                        )
+                    desired_steps = min(
                         required_control_steps,
                         max(
                             1,
@@ -2867,23 +2920,21 @@ def _drive_authoritative_target_coverage(
                             ),
                         ),
                     )
-                )
-                advance_steps = desired_steps - driven_steps
-                if advance_steps < 0:
-                    raise ContractError(
-                        "active CONTROL physics exceeded its row-paced duration"
-                    )
-                if advance_steps:
-                    advance = simulator.advance(advance_steps)
-                    if (
-                        not hasattr(advance, "steps")
-                        or advance.steps != advance_steps
-                    ):
+                    advance_steps = desired_steps - driven_steps
+                    if advance_steps < 0:
                         raise ContractError(
-                            "simulator did not advance the exact row-paced interval"
+                            "active CONTROL physics exceeded its row-paced duration"
                         )
-                    driven_steps += advance_steps
-                if count != canonical.count:
+                    if advance_steps:
+                        advance = simulator.advance(advance_steps)
+                        if (
+                            not hasattr(advance, "steps")
+                            or advance.steps != advance_steps
+                        ):
+                            raise ContractError(
+                                "simulator did not advance the exact row-paced interval"
+                            )
+                        driven_steps += advance_steps
                     if time.monotonic() >= deadline:
                         raise ProcessError(
                             "timed out waiting for exact authoritative target coverage"
@@ -2920,12 +2971,7 @@ def _drive_authoritative_target_coverage(
                     raise ContractError(
                         "official target log changed after the post-stop audit"
                     )
-                snapshot = simulator.snapshot()
-                if (
-                    not isinstance(snapshot, Mapping)
-                    or set(snapshot) != required_snapshot
-                ):
-                    raise ContractError("simulator boundary snapshot is invalid")
+                snapshot = read_boundary_snapshot("final")
                 steps = snapshot["steps"]
                 duration = snapshot["sim_time_s"]
                 state_rows = snapshot["state_rows"]
@@ -2944,6 +2990,7 @@ def _drive_authoritative_target_coverage(
                     raise ContractError("simulator boundary counters are invalid")
                 control_steps = steps - initial_steps
                 control_duration = float(duration) - float(initial_duration)
+                terminal_stop_fence: Mapping[str, object] | None = None
                 if required_control_steps is not None and (
                     control_steps != required_control_steps
                     or driven_steps != required_control_steps
@@ -2954,6 +3001,42 @@ def _drive_authoritative_target_coverage(
                 ):
                     raise ContractError(
                         "active CONTROL physics duration is not exact"
+                    )
+                if required_control_steps is not None:
+                    if (
+                        terminal_pre_stop_snapshot is None
+                        or terminal_post_stop_snapshot is None
+                        or terminal_pre_stop_snapshot
+                        != terminal_post_stop_snapshot
+                        or terminal_post_stop_snapshot != snapshot
+                        or terminal_pre_stop_snapshot["steps"] - initial_steps
+                        != required_control_steps
+                        or abs(
+                            float(terminal_pre_stop_snapshot["sim_time_s"])
+                            - float(initial_duration)
+                            - float(required_control_duration_s)
+                        )
+                        > 1.0e-9
+                    ):
+                        raise ContractError(
+                            "terminal stop fence does not bind exact CONTROL physics"
+                        )
+                    terminal_stop_fence = MappingProxyType(
+                        {
+                            "target_rows": count,
+                            "required_control_steps": required_control_steps,
+                            "requested_control_steps": driven_steps,
+                            "control_drive_steps": control_steps,
+                            "control_drive_duration_s": control_duration,
+                            "simulator_steps": steps,
+                            "simulator_duration_s": float(duration),
+                            "state_rows": state_rows,
+                            "contact_rows": contact_rows,
+                            "gear_stopped_before_audit": True,
+                            "post_stop_snapshot_stable": True,
+                            "final_snapshot_stable": True,
+                            "exact": True,
+                        }
                     )
                 result = _TargetCoverageResult(
                     target_rows=count,
@@ -2967,6 +3050,7 @@ def _drive_authoritative_target_coverage(
                     target_device=reader.device,
                     target_inode=reader.inode,
                     target_sha256=_sha256_bytes(stable),
+                    terminal_stop_fence=terminal_stop_fence,
                     retained_reader=reader if retain_reader else None,
                 )
                 completed = True
@@ -6170,6 +6254,7 @@ class DefaultStageAOperations:
             ),
             sim_dt_s=simulator.sim_dt,
             control_lead_rows=STAGE_B_CONTROL_LEAD_ROWS,
+            terminal_stop_fence=execution.coverage.terminal_stop_fence,
         )
         tracking = dict(execution.metrics)
         if (
@@ -6206,6 +6291,10 @@ class DefaultStageAOperations:
             "exact_command_coverage": coverage.exact_command_coverage,
             "exact_frame_coverage": coverage.exact_frame_coverage,
             "exact_control_duration": coverage.exact_control_duration,
+            "terminal_stop_fence_exact": coverage.terminal_stop_fence_exact,
+            "terminal_stop_fence": dict(
+                execution.coverage.terminal_stop_fence or {}
+            ),
             "sim_dt_s": coverage.sim_dt_s,
             "control_lead_rows": coverage.control_lead_rows,
             "control_drive_steps": execution.coverage.control_drive_steps,

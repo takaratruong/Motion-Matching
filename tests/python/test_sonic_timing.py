@@ -773,6 +773,69 @@ class TargetCoverageTests(TemporaryCase):
         self.assertEqual(cursor, 601)
         self.assertTrue(gear.stopped)
         self.assertTrue(result.target_sha256)
+        self.assertEqual(
+            result.terminal_stop_fence,
+            {
+                "target_rows": 601,
+                "required_control_steps": 6000,
+                "requested_control_steps": 6000,
+                "control_drive_steps": 6000,
+                "control_drive_duration_s": 12.0,
+                "simulator_steps": 6000,
+                "simulator_duration_s": 12.0,
+                "state_rows": 0,
+                "contact_rows": 6000,
+                "gear_stopped_before_audit": True,
+                "post_stop_snapshot_stable": True,
+                "final_snapshot_stable": True,
+                "exact": True,
+            },
+        )
+
+    def test_batched_terminal_jump_never_advances_simulator_after_stop(self) -> None:
+        expected = canonical(601)
+        rows = self.rows(expected)
+        target = self.root / "stage-b-batched-terminal.target.csv"
+        target.write_bytes(b"")
+        gear = self.Gear(target)
+        emitted = False
+
+        def emit_all() -> None:
+            nonlocal emitted
+            if not emitted:
+                target.write_bytes(b"".join(rows))
+                emitted = True
+
+        class BatchedSimulator(self.Simulator):
+            sim_dt = 0.005
+
+            def __init__(self) -> None:
+                super().__init__(emit_all)
+                self.stopped_advances: list[int] = []
+
+            def advance(self, steps: int) -> AdvanceResult:
+                if gear.stopped:
+                    self.stopped_advances.append(steps)
+                return super().advance(steps)
+
+        simulator = BatchedSimulator()
+        with self.assertRaisesRegex(
+            ContractError,
+            "terminal target row arrived before exact CONTROL physics",
+        ):
+            cli_module._drive_authoritative_target_coverage(
+                gear,
+                simulator,
+                target,
+                expected,
+                required_control_duration_s=12.0,
+                control_lead_rows=16,
+                maximum_wall_seconds=1.5,
+            )
+
+        self.assertEqual(simulator.steps, 64)
+        self.assertEqual(simulator.stopped_advances, [])
+        self.assertTrue(gear.stopped)
 
     def test_coverage_counters_exclude_the_stopped_wait_low_state_prime(self) -> None:
         expected = canonical()

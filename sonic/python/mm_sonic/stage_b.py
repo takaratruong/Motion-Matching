@@ -155,6 +155,7 @@ class StageBCoverage:
     exact_command_coverage: bool
     exact_frame_coverage: bool
     exact_control_duration: bool
+    terminal_stop_fence_exact: bool
 
 
 def validate_stage_b_coverage(
@@ -167,6 +168,7 @@ def validate_stage_b_coverage(
     control_drive_duration_s: float,
     sim_dt_s: float,
     control_lead_rows: int,
+    terminal_stop_fence: Mapping[str, object] | None,
 ) -> StageBCoverage:
     """Require the one registered flat script and every 50 Hz reference row."""
 
@@ -212,6 +214,76 @@ def validate_stage_b_coverage(
         raise ContractError(
             "Stage B active CONTROL physics must be exactly 12.0 seconds"
         )
+    required_fence_keys = {
+        "target_rows",
+        "required_control_steps",
+        "requested_control_steps",
+        "control_drive_steps",
+        "control_drive_duration_s",
+        "simulator_steps",
+        "simulator_duration_s",
+        "state_rows",
+        "contact_rows",
+        "gear_stopped_before_audit",
+        "post_stop_snapshot_stable",
+        "final_snapshot_stable",
+        "exact",
+    }
+    if (
+        not isinstance(terminal_stop_fence, Mapping)
+        or set(terminal_stop_fence) != required_fence_keys
+    ):
+        raise ContractError("Stage B terminal stop fence is unavailable")
+    target_rows = terminal_stop_fence["target_rows"]
+    required_steps = terminal_stop_fence["required_control_steps"]
+    requested_steps = terminal_stop_fence["requested_control_steps"]
+    fence_control_steps = terminal_stop_fence["control_drive_steps"]
+    fence_control_duration = terminal_stop_fence["control_drive_duration_s"]
+    simulator_steps = terminal_stop_fence["simulator_steps"]
+    simulator_duration = terminal_stop_fence["simulator_duration_s"]
+    state_rows = terminal_stop_fence["state_rows"]
+    contact_rows = terminal_stop_fence["contact_rows"]
+    state_stride_value = 0.02 / dt
+    state_stride = round(state_stride_value)
+    if state_stride <= 0 or abs(state_stride_value - state_stride) > 1.0e-12:
+        raise ContractError("Stage B terminal stop fence has invalid state cadence")
+    if (
+        type(target_rows) is not int
+        or target_rows != STAGE_B_FRAME_COUNT
+        or type(required_steps) is not int
+        or required_steps != expected_steps
+        or type(requested_steps) is not int
+        or requested_steps != expected_steps
+        or type(fence_control_steps) is not int
+        or fence_control_steps != expected_steps
+        or type(fence_control_duration) not in (int, float)
+        or not math.isfinite(float(fence_control_duration))
+        or abs(
+            float(fence_control_duration)
+            - STAGE_B_REFERENCE_DURATION_S
+        )
+        > 1.0e-9
+        or type(simulator_steps) is not int
+        or simulator_steps != expected_steps + 1
+        or type(simulator_duration) not in (int, float)
+        or not math.isfinite(float(simulator_duration))
+        or abs(
+            float(simulator_duration)
+            - (STAGE_B_REFERENCE_DURATION_S + dt)
+        )
+        > 1.0e-9
+        or type(state_rows) is not int
+        or state_rows != simulator_steps // state_stride
+        or type(contact_rows) is not int
+        or contact_rows != simulator_steps
+        or terminal_stop_fence["gear_stopped_before_audit"] is not True
+        or terminal_stop_fence["post_stop_snapshot_stable"] is not True
+        or terminal_stop_fence["final_snapshot_stable"] is not True
+        or terminal_stop_fence["exact"] is not True
+    ):
+        raise ContractError(
+            "Stage B terminal stop fence does not prove active CONTROL duration"
+        )
     return StageBCoverage(
         command_count=len(values),
         frame_count=canonical.count,
@@ -223,6 +295,7 @@ def validate_stage_b_coverage(
         exact_command_coverage=True,
         exact_frame_coverage=True,
         exact_control_duration=True,
+        terminal_stop_fence_exact=True,
     )
 
 
