@@ -1119,6 +1119,246 @@ void test_slot_approach_latches_inclusive_arrival_boundaries() {
         "inclusive arrival latch previewed or submitted on the latch tick");
 }
 
+interaction::PickAssistDiagnostics latch_frozen_slot_settling(
+    interaction::ControllerPickAssist& assist,
+    FrozenSlotScenario& scenario,
+    const interaction::PickAssistConfig& config) {
+    require(
+        assist.begin(scenario.start, &scenario.target),
+        "frozen Settling fixture begin failed");
+    const interaction::PickAssistDiagnostics frozen_before =
+        assist.diagnostics();
+    require(
+        frozen_before.state ==
+                interaction::PickAssistState::SlotApproach &&
+            frozen_before.reason == interaction::PickAssistReason::None &&
+            frozen_before.selected_slot_id == 9U &&
+            frozen_before.slot_selection.selected_index.has_value(),
+        "frozen Settling fixture did not select slot ID 9");
+    const interaction::MappedPickSlot frozen_slot =
+        frozen_before.slot_selection.ordered[
+            *frozen_before.slot_selection.selected_index];
+
+    scenario.observation.displayed_root = frozen_slot.root_world;
+    scenario.observation.displayed_root.position.x =
+        frozen_slot.root_world.position.x -
+        config.arrival.latch_position_error_m;
+    scenario.observation.displayed_root.rotation = quat_from_angle_axis(
+        config.arrival.maximum_yaw_error_radians,
+        vec3(0.0F, 1.0F, 0.0F));
+    scenario.observation.simulation_velocity = vec3(
+        config.arrival.latch_simulation_speed_mps, 0.0F, 0.0F);
+    scenario.observation.displayed_planar_speed_mps = 0.0F;
+
+    const float expected_travel_m = static_cast<float>(std::hypot(
+        static_cast<double>(scenario.observation.displayed_root.position.x) -
+            static_cast<double>(scenario.start.root_world.position.x),
+        static_cast<double>(scenario.observation.displayed_root.position.z) -
+            static_cast<double>(scenario.start.root_world.position.z)));
+    const interaction::PickAssistOutput latch_output =
+        assist.observe(scenario.observation);
+    const interaction::PickAssistDiagnostics latched =
+        assist.diagnostics();
+    require(
+        latched.state == interaction::PickAssistState::Settling &&
+            latched.reason == interaction::PickAssistReason::None &&
+            latched.settle_ticks == 0U,
+        "valid inclusive frozen metrics did not latch Settling");
+    require(
+        latch_output.override_steering && latch_output.force_strafe &&
+            latch_output.stationary_constraint &&
+            is_zero(latch_output.left_stick) &&
+            is_zero(latch_output.right_stick) &&
+            !latch_output.needs_preview && !latch_output.submit_interact,
+        "frozen Settling latch did not emit stationary zero-stick braking");
+    require(
+        assist.active() && assist.owns_manual_interact() &&
+            !assist.take_submission(501U).has_value(),
+        "frozen Settling latch lost ownership or submitted");
+    require(
+        same_float_bits_exact(
+            latched.root_error_m,
+            config.arrival.latch_position_error_m) &&
+            same_float_bits_exact(
+                latched.speed_mps,
+                config.arrival.latch_simulation_speed_mps) &&
+            same_float_bits_exact(
+                latched.yaw_error_radians,
+                config.arrival.maximum_yaw_error_radians) &&
+            same_float_bits_exact(
+                latched.assisted_travel_m, expected_travel_m),
+        "frozen Settling latch did not retain inclusive metrics and travel");
+    require_frozen_slot_provenance_unchanged(
+        frozen_before,
+        latched,
+        "frozen Settling latch changed frozen provenance");
+    return latched;
+}
+
+void test_frozen_slot_settling_revalidates_selected_slot() {
+    const interaction::PickAssistConfig config{};
+    FrozenSlotScenario scenario;
+    interaction::ControllerPickAssist assist(config);
+    const interaction::PickAssistDiagnostics latched =
+        latch_frozen_slot_settling(assist, scenario, config);
+
+    interaction::GraspInteractionSlot& selected =
+        selected_authored_slot(scenario);
+    selected.root_x_object_m = std::nextafter(
+        selected.root_x_object_m, 1.0F);
+    const interaction::PickAssistOutput failed_output =
+        assist.observe(scenario.observation);
+    const interaction::PickAssistDiagnostics failed =
+        assist.diagnostics();
+    require(
+        failed.state == interaction::PickAssistState::Failed &&
+            failed.reason == interaction::PickAssistReason::SlotChanged,
+        "frozen Settling selected-slot mutation did not fail SlotChanged");
+    require_zero_pick_assist_output(
+        failed_output,
+        "frozen Settling selected-slot failure emitted output");
+    require(
+        !assist.active() && !assist.owns_manual_interact() &&
+            !assist.take_submission(502U).has_value(),
+        "frozen Settling selected-slot failure retained ownership or submitted");
+    require(
+        failed.settle_ticks == latched.settle_ticks &&
+            same_float_bits_exact(
+                failed.assisted_travel_m, latched.assisted_travel_m),
+        "frozen Settling selected-slot failure advanced settling or travel");
+    require_frozen_slot_provenance_unchanged(
+        latched,
+        failed,
+        "frozen Settling selected-slot failure changed frozen provenance");
+
+    const interaction::PickAssistOutput terminal_output =
+        assist.observe(scenario.observation);
+    require(
+        assist.diagnostics().state == interaction::PickAssistState::Failed &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::SlotChanged,
+        "frozen Settling selected-slot failure was not terminal");
+    require_zero_pick_assist_output(
+        terminal_output,
+        "terminal frozen Settling selected-slot failure emitted output");
+    require_frozen_slot_provenance_unchanged(
+        latched,
+        assist.diagnostics(),
+        "terminal frozen Settling selected-slot failure changed provenance");
+}
+
+void test_frozen_slot_settling_enforces_consecutive_travel() {
+    const interaction::PickAssistConfig config{};
+    FrozenSlotScenario scenario;
+    interaction::ControllerPickAssist assist(config);
+    const interaction::PickAssistDiagnostics latched =
+        latch_frozen_slot_settling(assist, scenario, config);
+
+    const vec3 previous_position =
+        scenario.observation.displayed_root.position;
+    scenario.observation.displayed_root.position.x -= 0.25F;
+    const float next_segment_m = static_cast<float>(std::hypot(
+        static_cast<double>(scenario.observation.displayed_root.position.x) -
+            static_cast<double>(previous_position.x),
+        static_cast<double>(scenario.observation.displayed_root.position.z) -
+            static_cast<double>(previous_position.z)));
+    const float expected_travel_m =
+        latched.assisted_travel_m + next_segment_m;
+    require(
+        latched.assisted_travel_m < 1.00002F &&
+            expected_travel_m > 1.00002F,
+        "frozen Settling travel fixture did not cross 1.00002 m");
+
+    const interaction::PickAssistOutput failed_output =
+        assist.observe(scenario.observation);
+    const interaction::PickAssistDiagnostics failed =
+        assist.diagnostics();
+    require(
+        failed.state == interaction::PickAssistState::Failed &&
+            failed.reason ==
+                interaction::PickAssistReason::OutsideTravelEnvelope,
+        "frozen Settling travel overshoot did not fail the envelope");
+    require_zero_pick_assist_output(
+        failed_output,
+        "frozen Settling travel overshoot emitted output");
+    require(
+        !assist.active() && !assist.owns_manual_interact() &&
+            !assist.take_submission(503U).has_value(),
+        "frozen Settling travel overshoot retained ownership or submitted");
+    require(
+        failed.settle_ticks == latched.settle_ticks &&
+            same_float_bits_exact(
+                failed.assisted_travel_m, expected_travel_m),
+        "frozen Settling travel overshoot changed settling or accumulation");
+    require_frozen_slot_provenance_unchanged(
+        latched,
+        failed,
+        "frozen Settling travel overshoot changed frozen provenance");
+
+    const interaction::PickAssistOutput terminal_output =
+        assist.observe(scenario.observation);
+    require(
+        assist.diagnostics().state == interaction::PickAssistState::Failed &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::OutsideTravelEnvelope &&
+            same_float_bits_exact(
+                assist.diagnostics().assisted_travel_m,
+                expected_travel_m),
+        "frozen Settling travel failure was not terminal and stable");
+    require_zero_pick_assist_output(
+        terminal_output,
+        "terminal frozen Settling travel failure emitted output");
+    require_frozen_slot_provenance_unchanged(
+        latched,
+        assist.diagnostics(),
+        "terminal frozen Settling travel failure changed provenance");
+}
+
+void test_frozen_slot_settling_keeps_stationary_braking() {
+    const interaction::PickAssistConfig config{};
+    FrozenSlotScenario scenario;
+    interaction::ControllerPickAssist assist(config);
+    const interaction::PickAssistDiagnostics latched =
+        latch_frozen_slot_settling(assist, scenario, config);
+
+    const interaction::PickAssistOutput output =
+        assist.observe(scenario.observation);
+    const interaction::PickAssistDiagnostics settled =
+        assist.diagnostics();
+    require(
+        settled.state == interaction::PickAssistState::Settling &&
+            settled.reason == interaction::PickAssistReason::None &&
+            settled.settle_ticks == 1U,
+        "valid frozen Settling next tick changed state or did not settle");
+    require(
+        output.override_steering && output.force_strafe &&
+            output.stationary_constraint && is_zero(output.left_stick) &&
+            is_zero(output.right_stick) && !output.needs_preview &&
+            !output.submit_interact,
+        "valid frozen Settling next tick did not keep stationary braking");
+    require(
+        assist.active() && assist.owns_manual_interact() &&
+            !assist.take_submission(504U).has_value(),
+        "valid frozen Settling next tick lost ownership or submitted");
+    require(
+        same_float_bits_exact(
+            settled.root_error_m,
+            config.arrival.latch_position_error_m) &&
+            same_float_bits_exact(
+                settled.speed_mps,
+                config.arrival.latch_simulation_speed_mps) &&
+            same_float_bits_exact(
+                settled.yaw_error_radians,
+                config.arrival.maximum_yaw_error_radians) &&
+            same_float_bits_exact(
+                settled.assisted_travel_m, latched.assisted_travel_m),
+        "valid frozen Settling next tick changed frozen metrics or travel");
+    require_frozen_slot_provenance_unchanged(
+        latched,
+        settled,
+        "valid frozen Settling next tick changed frozen provenance");
+}
+
 void test_slot_approach_rejects_adjacent_arrival_overshoots() {
     const interaction::PickAssistConfig config{};
     const float infinity = std::numeric_limits<float>::infinity();
@@ -3086,6 +3326,9 @@ int main() {
         test_slot_approach_unchanged_identity_still_steers();
         test_slot_approach_emits_slow_radius_arrival_steering();
         test_slot_approach_latches_inclusive_arrival_boundaries();
+        test_frozen_slot_settling_revalidates_selected_slot();
+        test_frozen_slot_settling_enforces_consecutive_travel();
+        test_frozen_slot_settling_keeps_stationary_braking();
         test_slot_approach_rejects_adjacent_arrival_overshoots();
         test_slot_approach_accumulates_inclusive_travel_and_rejects_overshoot();
         test_slot_approach_revalidates_frozen_route_against_table();
