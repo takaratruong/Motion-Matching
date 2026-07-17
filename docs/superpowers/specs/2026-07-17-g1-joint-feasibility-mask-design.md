@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-17
 
-**Status:** Approved conversational design, awaiting written-spec review
+**Status:** Approved written design; implementation plan linked
 
 **Base:** `67eb47a20623f9e2ccd2a2a35bc3e9fa2d04afa8`
 
