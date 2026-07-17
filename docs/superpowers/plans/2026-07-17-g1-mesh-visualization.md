@@ -16,6 +16,8 @@
 - No IK or motion-matching behavior is changed in this checkpoint.
 - Use `/home/ubuntu/projects/g1_mm/g1.fbx` only as conversion input; its byte size is `11348604` and SHA-256 is `1546cb574d0c9296f8200c8df8f75d1618e89bf43a6b46b8414fdfc852a4815b`.
 - Do not add empirical root, scale, axis, ankle, or foot offsets.
+- Run Blender conversion with exactly `--threads 1`; the exporter fails closed
+  unless `bpy.context.scene.render` reports fixed one-thread execution.
 - Do not inspect, discover, query, signal, replace, restart, or terminate the old visualizer. Never use `ps`, `pgrep`, `pidof`, `pkill`, `systemctl`, or a visualizer helper.
 - Finite processes and the final candidate launch use direct `DISPLAY=:1` commands and unique output paths.
 - Every coherent test-backed commit is pushed immediately to `checkpoint/g1-footprint-task6`.
@@ -164,6 +166,9 @@ def sha256(path):
 def export(source, output):
     if source.stat().st_size != 11348604 or sha256(source) != SOURCE_SHA256:
         raise RuntimeError("G1 FBX source identity mismatch")
+    if (bpy.context.scene.render.threads_mode != "FIXED" or
+            bpy.context.scene.render.threads != 1):
+        raise RuntimeError("G1 export requires Blender --threads 1")
     bpy.ops.wm.read_factory_settings(use_empty=True)
     bpy.ops.import_scene.fbx(filepath=str(source))
     armatures = [value for value in bpy.data.objects if value.type == "ARMATURE"]
@@ -282,17 +287,25 @@ documented in Interfaces.
 Run:
 
 ```bash
-blender --background --python-exit-code 1 \
+blender --background --threads 1 --python-exit-code 1 \
   --python resources/g1_mesh/export_g1_raylib_glb.py -- \
   --source /home/ubuntu/projects/g1_mm/g1.fbx \
   --output resources/g1_mesh/g1_raylib.glb
+mkdir -p /tmp/g1-mesh-repeat
+blender --background --threads 1 --python-exit-code 1 \
+  --python resources/g1_mesh/export_g1_raylib_glb.py -- \
+  --source /home/ubuntu/projects/g1_mm/g1.fbx \
+  --output /tmp/g1-mesh-repeat/g1_raylib.glb
+cmp resources/g1_mesh/g1_raylib.glb \
+  /tmp/g1-mesh-repeat/g1_raylib.glb
+cmp resources/g1_mesh/manifest.json /tmp/g1-mesh-repeat/manifest.json
 /home/ubuntu/miniconda3/envs/diffsim/bin/python -m unittest \
   tests.python.test_g1_mesh_asset -v
 ```
 
-Expected: exporter exits zero; validator reports one 39-bone skin, 35 rigid
-link primitives, no primitive over 65,535 vertices, and a 0.8–1.6 m extent;
-all three tests pass.
+Expected: both exporters exit zero and produce byte-identical GLB/manifest
+pairs; validator reports one 39-bone skin, 35 rigid link primitives, no
+primitive over 65,535 vertices, and a 0.8–1.6 m extent; all three tests pass.
 
 - [ ] **Step 6: Run asset self-review and commit**
 
