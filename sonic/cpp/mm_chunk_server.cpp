@@ -5,6 +5,7 @@
 #include "sonic/cpp/mm_chunk_json.h"
 #include "sonic/cpp/g1_database_validation.h"
 #include "sonic/cpp/g1_joint_contract_io.h"
+#include "sonic/cpp/g1_joint_feasibility.h"
 #include "sonic/cpp/g1_joint_projection.h"
 #include "sonic/cpp/g1_runtime.h"
 #include "sonic/cpp/sonic_flat_scene.h"
@@ -35,6 +36,18 @@
 #endif
 
 static constexpr const char* MM_CHUNK_SCHEMA = "mm-chunk/v1";
+static constexpr const char* MM_CHUNK_JOINT_FEASIBILITY_SCHEMA =
+    "g1-joint-feasibility-certificate/v1";
+
+struct mm_server_joint_feasibility_identity
+{
+    int frame_count = 0;
+    int raw_safe_count = 0;
+    int raw_unsafe_count = 0;
+    int search_safe_count = 0;
+    std::string mask_sha256;
+    int joint_limit_violation_count[SonicG1JointCount] = {};
+};
 
 struct mm_server_identity
 {
@@ -49,6 +62,7 @@ struct mm_server_identity
     std::string terrain_support_sha256;
     std::string scene_index_sha256;
     std::string coordinate_signature;
+    mm_server_joint_feasibility_identity joint_feasibility;
 };
 
 struct mm_server_scene_identity
@@ -100,6 +114,23 @@ static void mm_server_fill_fixed_joint_names(mm_server_identity& identity)
     identity.target_joint_names.assign(
         mm_server_target_joint_names,
         mm_server_target_joint_names + MM_CHUNK_JOINT_COUNT);
+}
+
+static void mm_server_set_joint_feasibility_identity(
+    mm_server_joint_feasibility_identity& output,
+    const sonic_joint_feasibility_certificate& certificate)
+{
+    mm_server_joint_feasibility_identity candidate;
+    candidate.frame_count = certificate.frame_count;
+    candidate.raw_safe_count = certificate.raw_safe_count;
+    candidate.raw_unsafe_count = certificate.raw_unsafe_count;
+    candidate.search_safe_count = certificate.search_safe_count;
+    candidate.mask_sha256 = certificate.mask_sha256;
+    for (int joint = 0; joint < SonicG1JointCount; ++joint) {
+        candidate.joint_limit_violation_count[joint] =
+            certificate.joint_limit_violation_count[joint];
+    }
+    output = candidate;
 }
 
 struct mm_matching_feature_storage
@@ -263,6 +294,17 @@ public:
                 : "database and terrain feature shapes differ";
             return false;
         }
+        if (!sonic_build_joint_feasibility_certificate(
+                joint_feasibility_,
+                database_,
+                contract_,
+                error,
+                static_cast<int>(sizeof(error)))) {
+            message = error;
+            return false;
+        }
+        mm_server_set_joint_feasibility_identity(
+            identity_.joint_feasibility, joint_feasibility_);
         std::swap(database_.terrain_features.rows, terrain_rows.values.rows);
         std::swap(database_.terrain_features.cols, terrain_rows.values.cols);
         std::swap(database_.terrain_features.data, terrain_rows.values.data);
@@ -470,6 +512,10 @@ public:
         runtime_request.matching_enabled = true;
         g1_runtime_step_result result;
         g1_runtime_config config;
+        g1_runtime_frame_feasibility runtime_feasibility;
+        runtime_feasibility.raw_safe = joint_feasibility_.raw_safe.data;
+        runtime_feasibility.search_safe = joint_feasibility_.search_safe.data;
+        runtime_feasibility.count = joint_feasibility_.frame_count;
         char error[1024] = {};
         if (!g1_runtime_step(
                 result,
@@ -477,6 +523,7 @@ public:
                 database_,
                 support_,
                 active_scene_,
+                runtime_feasibility,
                 runtime_request,
                 config,
                 error,
@@ -613,6 +660,7 @@ private:
     database database_;
     terrain_support_set support_;
     sonic_joint_contract_entry contract_[SonicG1JointCount];
+    sonic_joint_feasibility_certificate joint_feasibility_;
 };
 
 struct mm_fake_state
@@ -633,7 +681,7 @@ public:
     using state_type = mm_fake_state;
     using reset_context_type = mm_fake_reset_context;
 
-    mm_fake_adapter()
+    bool initialize(std::string& message)
     {
         mm_server_fill_fixed_joint_names(identity_);
         identity_.skeleton_signature = std::string(64, '1');
@@ -645,6 +693,29 @@ public:
         identity_.terrain_support_sha256 = std::string(64, '6');
         identity_.scene_index_sha256 = std::string(64, '7');
         identity_.coordinate_signature = G1_RuntimeCoordinateSignature;
+
+        joint_feasibility_.frame_count = 1;
+        joint_feasibility_.raw_safe.resize(1);
+        joint_feasibility_.raw_safe(0) = 1U;
+        joint_feasibility_.search_safe.resize(1);
+        joint_feasibility_.search_safe(0) = 1U;
+        joint_feasibility_.raw_safe_count = 1;
+        joint_feasibility_.raw_unsafe_count = 0;
+        joint_feasibility_.search_safe_count = 1;
+        char error[256] = {};
+        if (!sonic_joint_feasibility_digest(
+                joint_feasibility_.mask_sha256,
+                joint_feasibility_.frame_count,
+                joint_feasibility_.raw_safe,
+                joint_feasibility_.search_safe,
+                error,
+                static_cast<int>(sizeof(error)))) {
+            message = error;
+            return false;
+        }
+        mm_server_set_joint_feasibility_identity(
+            identity_.joint_feasibility, joint_feasibility_);
+        return true;
     }
 
     const mm_server_identity& identity() const { return identity_; }
@@ -798,6 +869,7 @@ private:
     mm_server_identity identity_;
     mm_server_scene_identity scene_identity_;
     float active_matching_feature_weight_ = 0.0f;
+    sonic_joint_feasibility_certificate joint_feasibility_;
 };
 
 static void mm_json_write_string_array(
@@ -901,6 +973,30 @@ static void mm_json_write_artifacts(
     writer.character('}');
 }
 
+static void mm_json_write_joint_feasibility(
+    mm_chunk_json_writer& writer,
+    const mm_server_joint_feasibility_identity& identity)
+{
+    writer.raw("{\"schema\":");
+    writer.string(MM_CHUNK_JOINT_FEASIBILITY_SCHEMA);
+    writer.raw(",\"frame_count\":");
+    writer.integer(identity.frame_count);
+    writer.raw(",\"raw_safe_count\":");
+    writer.integer(identity.raw_safe_count);
+    writer.raw(",\"raw_unsafe_count\":");
+    writer.integer(identity.raw_unsafe_count);
+    writer.raw(",\"search_safe_count\":");
+    writer.integer(identity.search_safe_count);
+    writer.raw(",\"mask_sha256\":");
+    writer.string(identity.mask_sha256);
+    writer.raw(",\"joint_limit_violation_count\":[");
+    for (int joint = 0; joint < SonicG1JointCount; ++joint) {
+        if (joint != 0) writer.character(',');
+        writer.integer(identity.joint_limit_violation_count[joint]);
+    }
+    writer.raw("]}");
+}
+
 static std::string mm_json_hello_data(const mm_server_identity& identity)
 {
     mm_chunk_json_writer writer;
@@ -929,6 +1025,8 @@ static std::string mm_json_hello_data(const mm_server_identity& identity)
     writer.string(identity.scene_index_sha256);
     writer.raw(",\"coordinate_signature\":");
     writer.string(identity.coordinate_signature);
+    writer.raw(",\"joint_feasibility\":");
+    mm_json_write_joint_feasibility(writer, identity.joint_feasibility);
     writer.character('}');
     return writer.valid() ? writer.text() : std::string();
 }
@@ -1330,6 +1428,14 @@ int main()
     if (test_adapter != nullptr && std::strcmp(test_adapter, "1") == 0) {
         std::fprintf(stderr, "MM chunk server: using deterministic test adapter\n");
         mm_fake_adapter adapter;
+        std::string error;
+        if (!adapter.initialize(error)) {
+            std::fprintf(
+                stderr,
+                "MM chunk server test adapter error: %s\n",
+                error.c_str());
+            return 2;
+        }
         return mm_server_run(adapter);
     }
 

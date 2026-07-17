@@ -36,6 +36,37 @@ QUATERNION_BOUNDARY_FIELDS = (
     "physical_pelvis_orientation_holden",
     "virtual_root_orientation_holden",
 )
+JOINT_FEASIBILITY_SCHEMA = "g1-joint-feasibility-certificate/v1"
+JOINT_FEASIBILITY_KEYS = (
+    "schema",
+    "frame_count",
+    "raw_safe_count",
+    "raw_unsafe_count",
+    "search_safe_count",
+    "mask_sha256",
+    "joint_limit_violation_count",
+)
+
+
+def expected_fake_joint_feasibility():
+    frame_count = 1
+    raw_safe = bytes([1])
+    search_safe = bytes([1])
+    mask_sha256 = hashlib.sha256(
+        JOINT_FEASIBILITY_SCHEMA.encode("ascii")
+        + struct.pack("<Q", frame_count)
+        + raw_safe
+        + search_safe
+    ).hexdigest()
+    return {
+        "schema": JOINT_FEASIBILITY_SCHEMA,
+        "frame_count": frame_count,
+        "raw_safe_count": frame_count,
+        "raw_unsafe_count": 0,
+        "search_safe_count": frame_count,
+        "mask_sha256": mask_sha256,
+        "joint_limit_violation_count": [0] * 29,
+    }
 
 
 def hello(request_id="r0"):
@@ -167,6 +198,14 @@ class ChunkServerProtocolTest(unittest.TestCase):
             "scene_index_sha256",
         ):
             self.assertRegex(identity[field], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            tuple(identity["joint_feasibility"]),
+            JOINT_FEASIBILITY_KEYS,
+        )
+        self.assertEqual(
+            identity["joint_feasibility"],
+            expected_fake_joint_feasibility(),
+        )
 
         reset_response = self.server.request(reset())
         self.assertTrue(reset_response["ok"])
@@ -236,6 +275,35 @@ class ChunkServerProtocolTest(unittest.TestCase):
         self.assertEqual(stdout_tail, b"")
         self.assertIn(b"test adapter", stderr)
         self.assertNotIn(b"test adapter", json.dumps(closed).encode())
+
+    def test_fake_joint_feasibility_identity_is_stable_across_fresh_launches(self):
+        first = self.server.request(hello("first"))["data"]["joint_feasibility"]
+        second_server = ChunkServer()
+        try:
+            second = second_server.request(hello("second"))["data"][
+                "joint_feasibility"
+            ]
+        finally:
+            second_server.terminate()
+
+        expected = expected_fake_joint_feasibility()
+        self.assertEqual(first, expected)
+        self.assertEqual(second, expected)
+        self.assertEqual(tuple(first), JOINT_FEASIBILITY_KEYS)
+        self.assertEqual(tuple(second), JOINT_FEASIBILITY_KEYS)
+        for field in (
+            "frame_count",
+            "raw_safe_count",
+            "raw_unsafe_count",
+            "search_safe_count",
+        ):
+            self.assertIs(type(first[field]), int)
+            self.assertGreaterEqual(first[field], 0)
+        self.assertEqual(len(first["joint_limit_violation_count"]), 29)
+        self.assertTrue(all(
+            type(value) is int and value >= 0
+            for value in first["joint_limit_violation_count"]
+        ))
 
     def test_strict_json_exact_keys_and_binary32_numbers(self):
         cases = (
@@ -414,6 +482,80 @@ class ChunkServerProtocolTest(unittest.TestCase):
 
 
 class ChunkServerSourceOwnershipTest(unittest.TestCase):
+    def test_real_certificate_build_order_ownership_and_runtime_binding(self):
+        source = (ROOT / "sonic" / "cpp" / "mm_chunk_server.cpp").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('#include "sonic/cpp/g1_joint_feasibility.h"', source)
+
+        adapter = source.index("class mm_real_adapter")
+        adapter_stop = source.index("\nstruct mm_fake_state", adapter)
+        adapter_source = source[adapter:adapter_stop]
+        initialize_start = adapter_source.index("    bool initialize(\n")
+        initialize_stop = adapter_source.index(
+            "\n    const mm_server_identity& identity() const",
+            initialize_start,
+        )
+        initialize_body = adapter_source[initialize_start:initialize_stop]
+        self.assertLess(
+            initialize_body.index("sonic_joint_contract_load("),
+            initialize_body.index(
+                "joint contract source/target order is not fixed"
+            ),
+        )
+        self.assertLess(
+            initialize_body.index(
+                "joint contract source/target order is not fixed"
+            ),
+            initialize_body.index("g1_database_validate("),
+        )
+        self.assertLess(
+            initialize_body.index("g1_database_validate("),
+            initialize_body.index(
+                "sonic_build_joint_feasibility_certificate("
+            ),
+        )
+        self.assertIn(
+            "sonic_joint_feasibility_certificate joint_feasibility_;",
+            adapter_source,
+        )
+
+        advance_start = adapter_source.index("    bool advance(\n")
+        advance_stop = adapter_source.index("\nprivate:", advance_start)
+        advance_body = adapter_source[advance_start:advance_stop]
+        self.assertEqual(advance_body.count("g1_runtime_step("), 1)
+        self.assertIn("g1_runtime_frame_feasibility", advance_body)
+        self.assertIn("joint_feasibility_.raw_safe.data", advance_body)
+        self.assertIn("joint_feasibility_.search_safe.data", advance_body)
+        self.assertIn("joint_feasibility_.frame_count", advance_body)
+        runtime_call = advance_body[advance_body.index("g1_runtime_step("):]
+        self.assertIn("runtime_feasibility", runtime_call)
+
+    def test_fake_certificate_uses_shared_digest_and_projection_gate_remains(self):
+        source = (ROOT / "sonic" / "cpp" / "mm_chunk_server.cpp").read_text(
+            encoding="utf-8"
+        )
+        fake_start = source.index("class mm_fake_adapter")
+        fake_stop = source.index(
+            "\nstatic void mm_json_write_string_array", fake_start
+        )
+        fake_source = source[fake_start:fake_stop]
+        self.assertIn("sonic_joint_feasibility_digest(", fake_source)
+        self.assertIn(
+            "sonic_joint_feasibility_certificate joint_feasibility_;",
+            fake_source,
+        )
+
+        adapter = source.index("class mm_real_adapter")
+        observe_start = source.index("    bool observe_boundary(\n", adapter)
+        observe_stop = source.index("\n    std::string terrain_root_;", observe_start)
+        observe_body = source[observe_start:observe_stop]
+        self.assertEqual(observe_body.count("sonic_project_pose("), 1)
+        self.assertLess(
+            observe_body.index("sonic_project_pose("),
+            observe_body.index("output = candidate;"),
+        )
+
     def test_real_reset_builds_candidate_features_before_controller_reset(self):
         source = (ROOT / "sonic" / "cpp" / "mm_chunk_server.cpp").read_text(
             encoding="utf-8"
