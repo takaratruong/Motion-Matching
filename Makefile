@@ -139,6 +139,8 @@ RELEASE_FAST_MATH_TARGET_TEST := \
   $(CPP_TEST_DIR)/test_interaction_target_release_fast_math
 RELEASE_FAST_MATH_CARRY_TEST := \
   $(CPP_TEST_DIR)/test_interaction_carry_release_fast_math
+PICK_ASSIST_RELEASE_FAST_MATH_TEST := \
+  $(CPP_TEST_DIR)/test_interaction_pick_assist_release_fast_math
 PLACE_SELECTION_FAST_MATH_TEST := \
   $(CPP_TEST_DIR)/test_interaction_place_selection_fast_math
 PLACE_RELEASE_FAST_MATH_TEST := \
@@ -202,6 +204,7 @@ INTERACTION_RUNTIME_SOURCES += $(INTERACTION_PLACE_SOURCES)
 .PHONY: test-python-interaction-safe test-interaction-safe
 .PHONY: test-interaction-target-release-fast-math
 .PHONY: test-interaction-carry-release-fast-math
+.PHONY: test-interaction-pick-assist-release-fast-math
 .PHONY: test-interaction-place-selection-fast-math
 .PHONY: test-interaction-place-release-fast-math
 .PHONY: test-pick-entry-preview-release-fast-math
@@ -274,6 +277,10 @@ $(CPP_TEST_DIR)/test_interaction_pick_approach: tests/cpp/test_interaction_pick_
 
 $(CPP_TEST_DIR)/test_interaction_pick_assist: tests/cpp/test_interaction_pick_assist.cpp interaction_pick_assist.cpp interaction_pick_assist.h interaction_pick_slots.cpp interaction_pick_slots.h interaction_pick_approach.cpp interaction_pick_approach.h interaction_arrival.cpp interaction_arrival.h interaction_target.cpp interaction_target.h interaction_pose.cpp interaction_pose.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_pick_assist.cpp interaction_pick_assist.cpp interaction_pick_slots.cpp interaction_pick_approach.cpp interaction_arrival.cpp interaction_target.cpp interaction_pose.cpp -o $@
+
+$(PICK_ASSIST_RELEASE_FAST_MATH_TEST): tests/cpp/test_interaction_pick_assist.cpp interaction_pick_assist.cpp interaction_pick_assist.h interaction_pick_slots.cpp interaction_pick_slots.h interaction_pick_approach.cpp interaction_pick_approach.h interaction_arrival.cpp interaction_arrival.h interaction_target.cpp interaction_target.h interaction_pose.cpp interaction_pose.h | $(CPP_TEST_DIR)
+	# GCC 13 misdiagnoses libstdc++'s small-range std::sort as out of bounds.
+	$(CXX) $(CPP_TEST_FLAGS) -Wno-array-bounds -O3 -DNDEBUG -ffast-math tests/cpp/test_interaction_pick_assist.cpp interaction_pick_assist.cpp interaction_pick_slots.cpp interaction_pick_approach.cpp interaction_arrival.cpp interaction_target.cpp interaction_pose.cpp -o $@
 
 $(ARRIVAL_CONTROLLER_RELEASE_FAST_MATH_TEST): tests/cpp/test_interaction_arrival_controller.cpp $(INTERACTION_ARRIVAL_BUILD_INPUTS) $(LOCOMOTION_CONTROLLER_UPDATE_BUILD_INPUTS) array.h vec.h quat.h common.h spring.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) -Wno-unused-parameter -O3 -DNDEBUG -ffast-math tests/cpp/test_interaction_arrival_controller.cpp interaction_arrival.cpp locomotion_controller_update.cpp -o $@
@@ -364,6 +371,9 @@ test-interaction-target-release-fast-math: $(RELEASE_FAST_MATH_TARGET_TEST)
 test-interaction-carry-release-fast-math: $(RELEASE_FAST_MATH_CARRY_TEST)
 	$(RELEASE_FAST_MATH_CARRY_TEST)
 
+test-interaction-pick-assist-release-fast-math: $(PICK_ASSIST_RELEASE_FAST_MATH_TEST)
+	$(PICK_ASSIST_RELEASE_FAST_MATH_TEST)
+
 test-interaction-arrival-release-fast-math: $(ARRIVAL_RELEASE_FAST_MATH_TEST)
 	$(ARRIVAL_RELEASE_FAST_MATH_TEST)
 
@@ -393,6 +403,7 @@ test-python-interaction-safe: interaction_probe $(SAFE_INTERACTION_QUERY_PROBE)
 test-interaction-safe: test-python-interaction-safe test-cpp \
   test-interaction-target-release-fast-math \
   test-interaction-carry-release-fast-math \
+  test-interaction-pick-assist-release-fast-math \
   test-interaction-arrival-release-fast-math \
   test-interaction-arrival-controller-release-fast-math \
   test-pick-entry-preview-release-fast-math \
