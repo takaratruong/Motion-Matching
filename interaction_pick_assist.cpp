@@ -455,8 +455,22 @@ PickAssistOutput ControllerPickAssist::observe(
         const float root_error_m = planar_distance(
             observation.displayed_root.position,
             frozen_slot_.root_world.position);
-        if (!is_finite(root_error_m) ||
-            root_error_m <= config_.arrival.slow_radius_m) {
+        if (!is_finite(root_error_m)) {
+            return output;
+        }
+        if (root_error_m <= config_.arrival.slow_radius_m) {
+            output.override_steering = true;
+            output.left_stick = arrival_navigation_stick(
+                frozen_slot_.root_world.position,
+                observation.displayed_root.position,
+                observation.camera_azimuth,
+                config_.arrival);
+            output.right_stick = arrival_facing_stick(
+                quat_mul_vec3(
+                    frozen_slot_.root_world.rotation,
+                    vec3(0.0F, 0.0F, 1.0F)),
+                observation.camera_azimuth);
+            output.force_strafe = true;
             return output;
         }
         output.override_steering = true;
