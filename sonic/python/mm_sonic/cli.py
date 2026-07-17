@@ -2509,6 +2509,8 @@ def _timeout_evidence_bytes(
 class _KnownGoodExecution:
     bootstrap_steps: int
     bootstrap: Mapping[str, object]
+    wait_maintenance_steps: int
+    wait_maintenance: Mapping[str, object]
     wait_epoch: _WaitForControlEvidence
     prime: Mapping[str, object]
     coverage: _TargetCoverageResult
@@ -2585,6 +2587,8 @@ def _execute_known_good_scoring_epoch(
         raise ValueError("known-good scoring mode/publisher combination is invalid")
     bootstrap: dict[str, object] = {}
     bootstrap_steps = 0
+    wait_maintenance: dict[str, object] = {}
+    wait_maintenance_steps = 0
     wait_epoch: _WaitForControlEvidence | None = None
     prime: Mapping[str, object] | None = None
     coverage: _TargetCoverageResult | None = None
@@ -2612,9 +2616,11 @@ def _execute_known_good_scoring_epoch(
             evidence=bootstrap,
             cancellation=bootstrap_cancellation,
         )
-        if mode == "file":
-            gear.prepare_loaded_motion_for_scoring()
-        else:
+        def prepare_input_while_publishing_low_state() -> None:
+            nonlocal preload
+            if mode == "file":
+                gear.prepare_loaded_motion_for_scoring()
+                return
             assert publisher is not None
             post_enable_fence = gear.enable_stream_for_preload()
             preload = _preload_known_good_stream(
@@ -2623,6 +2629,15 @@ def _execute_known_good_scoring_epoch(
                 gear,
                 post_enable_fence,
             )
+
+        wait_maintenance_steps = _drive_simulator_until(
+            prepare_input_while_publishing_low_state,
+            simulator,
+            label=f"{mode}-input-preparation",
+            evidence=wait_maintenance,
+        )
+        if mode == "stream":
+            assert preload is not None
             preload_audit = _audit_known_good_stream_preload(
                 canonical, bundle, preload
             )
@@ -2729,6 +2744,8 @@ def _execute_known_good_scoring_epoch(
     return _KnownGoodExecution(
         bootstrap_steps=bootstrap_steps,
         bootstrap=MappingProxyType(dict(bootstrap)),
+        wait_maintenance_steps=wait_maintenance_steps,
+        wait_maintenance=MappingProxyType(dict(wait_maintenance)),
         wait_epoch=wait_epoch,
         prime=prime,
         coverage=coverage,
@@ -4820,6 +4837,11 @@ class DefaultStageAOperations:
                     "steps": execution.bootstrap_steps,
                     "phases": dict(execution.bootstrap),
                 },
+                "wait_low_state_maintenance": {
+                    "scored": False,
+                    "steps": execution.wait_maintenance_steps,
+                    "phase": dict(execution.wait_maintenance),
+                },
                 "wait_for_control": {
                     "target_rows": execution.wait_epoch.target_rows,
                     "q_rows": execution.wait_epoch.q_rows,
@@ -5169,6 +5191,11 @@ class DefaultStageAOperations:
                     "scored": False,
                     "steps": execution.bootstrap_steps,
                     "phases": dict(execution.bootstrap),
+                },
+                "wait_low_state_maintenance": {
+                    "scored": False,
+                    "steps": execution.wait_maintenance_steps,
+                    "phase": dict(execution.wait_maintenance),
                 },
                 "wait_for_control": {
                     "target_rows": execution.wait_epoch.target_rows,

@@ -966,8 +966,10 @@ class ScoredEpochTests(TemporaryCase):
         wait = cli_module._WaitForControlEvidence(1, 2, 0, 0, 0, "0" * 64)
         preload = object()
         coverage_reader = SimpleNamespace(close=lambda: None)
+        driven_phases: list[str] = []
 
-        def bootstrap(operation, *_args, **_kwargs):
+        def bootstrap(operation, *_args, **kwargs):
+            driven_phases.append(kwargs["label"])
             operation()
             return 7
 
@@ -1053,6 +1055,17 @@ class ScoredEpochTests(TemporaryCase):
                 self.assertTrue(simulator.closed)
                 if publisher is not None:
                     self.assertTrue(publisher.closed)
+                self.assertEqual(execution.bootstrap_steps, 7)
+                self.assertEqual(execution.wait_maintenance_steps, 7)
+        self.assertEqual(
+            driven_phases,
+            [
+                "file-wait-for-control",
+                "file-input-preparation",
+                "stream-wait-for-control",
+                "stream-input-preparation",
+            ],
+        )
         self.assertEqual(executions[0].metrics, executions[1].metrics)
         self.assertIsNone(executions[0].preload)
         self.assertIs(executions[1].preload, preload)
