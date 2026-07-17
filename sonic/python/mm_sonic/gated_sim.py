@@ -170,6 +170,7 @@ class GatedSimulatorRunner:
         except ProcessError as error:
             raise ProtocolError(str(error)) from error
         self._backend: SimulatorBackend | None = None
+        self._scene: Path | None = None
         self._state_file: IO[str] | None = None
         self._contact_file: IO[str] | None = None
         self._steps = 0
@@ -184,15 +185,22 @@ class GatedSimulatorRunner:
             raise ProtocolError("reset is required before simulator access")
         return self._backend
 
-    def _close_active(self) -> None:
+    def _close_logs(self) -> None:
         for stream in (self._state_file, self._contact_file):
             if stream is not None:
                 stream.close()
         self._state_file = None
         self._contact_file = None
+
+    def _close_backend(self) -> None:
         if self._backend is not None:
             self._backend.close()
         self._backend = None
+        self._scene = None
+
+    def _close_active(self) -> None:
+        self._close_logs()
+        self._close_backend()
 
     def reset(
         self,
@@ -222,9 +230,14 @@ class GatedSimulatorRunner:
         lateral = _finite_number(lateral_offset_m, "lateral_offset_m")
         yaw = _finite_number(yaw_offset_rad, "yaw_offset_rad")
 
-        self._close_active()
-        backend = self._backend_factory(scene)
-        self._backend = backend
+        self._close_logs()
+        if self._backend is None or self._scene != scene:
+            self._close_backend()
+            backend = self._backend_factory(scene)
+            self._backend = backend
+            self._scene = scene
+        else:
+            backend = self._backend
         try:
             nq = getattr(backend.model, "nq", None)
             if type(nq) is not int or nq <= 0:

@@ -938,6 +938,91 @@ class GearProcessTests(TemporaryScriptCase):
 
         self.assertFalse((self.root / "gear-logs").exists())
 
+    def test_logs_leaf_swap_between_mkdir_and_open_is_rejected_without_deletion(self):
+        from mm_sonic import process as process_module
+
+        child = self.script("unused_leaf_swap.py", "raise SystemExit(0)\n")
+        real_open = process_module.os.open
+        created = self.root / "wrapper-created-logs"
+        replacement = self.root / "gear-logs"
+        swapped = False
+
+        def swap_leaf_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal swapped
+            if path == "gear-logs" and dir_fd is not None and not swapped:
+                swapped = True
+                replacement.rename(created)
+                replacement.mkdir()
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with (
+            patch.object(process_module.os, "open", side_effect=swap_leaf_open),
+            self.assertRaisesRegex(ProcessError, "identity changed"),
+        ):
+            self.gear(child)
+
+        self.assertTrue(created.is_dir())
+        self.assertTrue(replacement.is_dir())
+
+    def test_logs_leaf_swap_on_open_failure_preserves_both_directories(self):
+        from mm_sonic import process as process_module
+
+        child = self.script("unused_leaf_swap_failure.py", "raise SystemExit(0)\n")
+        real_open = process_module.os.open
+        created = self.root / "wrapper-created-on-failure"
+        replacement = self.root / "gear-logs"
+        swapped = False
+
+        def swap_then_fail(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal swapped
+            if path == "gear-logs" and dir_fd is not None and not swapped:
+                swapped = True
+                replacement.rename(created)
+                replacement.mkdir()
+                raise OSError("synthetic swapped leaf open failure")
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with (
+            patch.object(process_module.os, "open", side_effect=swap_then_fail),
+            self.assertRaisesRegex(ProcessError, "cannot create GEAR logs"),
+        ):
+            self.gear(child)
+
+        self.assertTrue(created.is_dir())
+        self.assertTrue(replacement.is_dir())
+
+    def test_command_is_materialized_once_before_validation_or_output_creation(self):
+        child = self.script("unused_one_shot_command.py", "raise SystemExit(0)\n")
+
+        class OneShotCommand:
+            def __init__(self):
+                self.iterations = 0
+
+            def __len__(self):
+                return 2
+
+            def __iter__(self):
+                self.iterations += 1
+                if self.iterations > 1:
+                    raise RuntimeError("command was iterated more than once")
+                yield sys.executable
+                yield str(child)
+
+        command = OneShotCommand()
+        gear = GearProcess(
+            run_root=self.root,
+            command=command,
+            target_motion_logfile=self.root / "one-shot" / "target.csv",
+            logs_dir=self.root / "one-shot" / "logs",
+            stdout_archive=self.root / "one-shot" / "out",
+            stderr_archive=self.root / "one-shot" / "err",
+        )
+        try:
+            self.assertEqual(command.iterations, 1)
+            self.assertEqual(gear.argv[:2], (sys.executable, str(child)))
+        finally:
+            gear.close()
+
     def test_default_markers_follow_literal_official_control_then_stream_order(self):
         keys_path = self.root / "default-marker-keys.bin"
         child = self.script(

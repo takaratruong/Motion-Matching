@@ -874,6 +874,27 @@ class RunBundle:
             raise ContractError("evidence text must be a string")
         return self.write_bytes(relative, text.encode("utf-8"))
 
+    def output_exists(self, relative: str | os.PathLike[str]) -> bool:
+        """Check an output through the retained bundle descriptor."""
+
+        parts = _relative_parts(relative)
+        try:
+            parent, filename = self._open_parent(parts, create=False)
+        except FileNotFoundError:
+            return False
+        try:
+            try:
+                os.stat(filename, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                return False
+            except OSError as error:
+                raise ContractError(
+                    f"cannot inspect confined output: {relative}"
+                ) from error
+            return True
+        finally:
+            os.close(parent)
+
     def archive_transmission(
         self,
         message: bytes | bytearray | memoryview,

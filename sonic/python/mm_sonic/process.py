@@ -339,6 +339,8 @@ def _create_owned_directory(
     parent_fd, name = _open_confined_parent_fd(run_root, candidate, label)
     leaf_fd: int | None = None
     created = False
+    created_device: int | None = None
+    created_inode: int | None = None
     retained = False
     try:
         try:
@@ -346,6 +348,11 @@ def _create_owned_directory(
         except FileExistsError as error:
             raise ProcessError(f"{label} already exists: {candidate}") from error
         created = True
+        created_leaf = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(created_leaf.st_mode):
+            raise ProcessError(f"{label} identity changed during creation")
+        created_device = created_leaf.st_dev
+        created_inode = created_leaf.st_ino
         leaf_fd = os.open(
             name,
             _directory_open_flags(),
@@ -356,6 +363,8 @@ def _create_owned_directory(
         if (
             not stat.S_ISDIR(leaf.st_mode)
             or not stat.S_ISDIR(current.st_mode)
+            or leaf.st_dev != created_device
+            or leaf.st_ino != created_inode
             or current.st_dev != leaf.st_dev
             or current.st_ino != leaf.st_ino
         ):
@@ -374,20 +383,18 @@ def _create_owned_directory(
         raise ProcessError(f"cannot create {label}: {candidate}") from error
     finally:
         if not retained:
-            remove_created = created and leaf_fd is None
-            if created and leaf_fd is not None:
+            remove_created = False
+            if created and created_device is not None and created_inode is not None:
                 try:
-                    original = os.fstat(leaf_fd)
                     current = os.stat(
                         name,
                         dir_fd=parent_fd,
                         follow_symlinks=False,
                     )
                     remove_created = (
-                        stat.S_ISDIR(original.st_mode)
-                        and stat.S_ISDIR(current.st_mode)
-                        and original.st_dev == current.st_dev
-                        and original.st_ino == current.st_ino
+                        stat.S_ISDIR(current.st_mode)
+                        and current.st_dev == created_device
+                        and current.st_ino == created_inode
                     )
                 except OSError:
                     remove_created = False
@@ -1761,7 +1768,13 @@ class GearProcess:
         env: Mapping[str, str] | None = None,
         cwd: str | Path | None = None,
     ) -> None:
-        if not command or any(type(item) is not str or not item for item in command):
+        try:
+            selected_command = tuple(command)
+        except TypeError as error:
+            raise ValueError("command must contain nonempty strings") from error
+        if not selected_command or any(
+            type(item) is not str or not item for item in selected_command
+        ):
             raise ValueError("command must contain nonempty strings")
         if launch_profile not in _GEAR_LAUNCH_PROFILES:
             raise ValueError(
@@ -1769,7 +1782,7 @@ class GearProcess:
             )
         managed = [
             item
-            for item in command
+            for item in selected_command
             if any(
                 item == flag or item.startswith(f"{flag}=")
                 for flag in _MANAGED_GEAR_FLAGS
@@ -1848,7 +1861,7 @@ class GearProcess:
         ):
             _create_confined_parents(run_root_path, path, label=label)
         argv = _gear_process_argv(
-            command,
+            selected_command,
             launch_profile=launch_profile,
             target_motion_logfile=target,
             logs_dir=logs,

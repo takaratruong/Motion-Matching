@@ -123,7 +123,10 @@ append to stdout without changing that authenticated prefix.
 
 Before CONTROL, Stage A proves the target, `q.csv`, and `base_quat.csv` logs
 contain zero data rows. It stops GEAR in WAIT, resets a distinct scored MuJoCo
-epoch, and advances one pre-CONTROL step to publish fresh LowState. It then
+epoch, and advances one pre-CONTROL step to publish fresh LowState. The reset
+reuses the already authenticated same-scene simulator backend and DDS publisher
+while rotating the physical log epoch; rebuilding the process-global Unitree
+channel at this boundary is forbidden. It then
 resumes once, activates CONTROL without stopping on the transition marker, and
 advances physics in small increments until the target log is the exact
 canonical 441-row sequence `0..440`. Overshoot, omission, duplication,

@@ -127,6 +127,30 @@ class GatedSimulatorRunnerTests(unittest.TestCase):
         self.assertEqual(self.backends[-1].step_calls, 0)
         self.assertEqual(self.backends[-1].sample_calls, 0)
 
+    def test_same_scene_reset_reuses_backend_and_rotates_log_epoch(self):
+        first_logs = self.log_dir
+        second_logs = self.root / "scored-sim"
+        initial = np.zeros(36, dtype=np.float64)
+        initial[2] = 0.8
+        initial[3] = 1.0
+
+        self.reset(initial)
+        self.runner.advance(1)
+        self.runner.reset(
+            scene_xml=self.scene,
+            initial_qpos=initial,
+            lateral_offset_m=0.0,
+            yaw_offset_rad=0.0,
+            log_dir=second_logs,
+        )
+
+        self.assertEqual(len(self.backends), 1)
+        self.assertEqual(len(self.backends[0].reset_calls), 2)
+        self.assertFalse(self.backends[0].closed)
+        self.assertTrue((first_logs / "contacts.jsonl").is_file())
+        self.assertTrue((second_logs / "contacts.jsonl").is_file())
+        self.assertEqual(self.runner.snapshot()["steps"], 0)
+
     def test_reset_perturbs_only_copied_physical_horizontal_root_and_yaw(self):
         initial = np.zeros(36, dtype=np.float64)
         initial[:7] = [1.25, -0.5, 0.82, 1.0, 0.0, 0.0, 0.0]

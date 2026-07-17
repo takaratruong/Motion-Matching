@@ -1094,6 +1094,30 @@ class SonicCLITests(unittest.TestCase):
         self.assertNotIn("evidence output already exists", stderr)
         self.assertEqual(len(calls), 1)
 
+    def test_bundle_rename_cannot_hide_written_evidence_and_mask_finalization(self):
+        calls = []
+
+        def fail_after_bundle_rename(bundle, status, *, outcome):
+            calls.append((status, dict(outcome)))
+            bundle.path.rename(bundle.path.with_name(f"{bundle.path.name}-moved"))
+            raise ContractError("primary renamed-bundle finalization failure")
+
+        with patch.object(
+            cli_module.RunBundle,
+            "finalize",
+            autospec=True,
+            side_effect=fail_after_bundle_rename,
+        ):
+            code, stdout, stderr = self._run(
+                ["preflight", *self._common()]
+            )
+
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("primary renamed-bundle finalization failure", stderr)
+        self.assertNotIn("evidence output already exists", stderr)
+        self.assertEqual(len(calls), 1)
+
     def test_each_mode_runs_only_its_ordered_prerequisite_prefix(self) -> None:
         cases = (
             ("mm-reference", 4),
