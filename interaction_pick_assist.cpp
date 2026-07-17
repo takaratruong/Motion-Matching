@@ -438,6 +438,20 @@ PickAssistOutput ControllerPickAssist::observe(
             return fail_output(
                 diagnostics_, PickAssistReason::OutsideTravelEnvelope);
         }
+        PickSlotConfig slot_config{};
+        slot_config.maximum_direct_travel_m =
+            config_.maximum_assisted_path_m;
+        const PickSlotReason slot_reason = revalidate_frozen_pick_slot(
+            observation.displayed_root,
+            frozen_slot_.root_world,
+            start_.target_snapshot,
+            start_.obstacles,
+            slot_config);
+        if (slot_reason != PickSlotReason::None) {
+            return fail_output(
+                diagnostics_,
+                pick_assist_reason_from_slot_reason(slot_reason));
+        }
         const float root_error_m = planar_distance(
             observation.displayed_root.position,
             frozen_slot_.root_world.position);
