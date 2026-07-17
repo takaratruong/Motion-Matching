@@ -4326,9 +4326,9 @@ G1FrameStageOutcome g1_controller_frame_stage_run(
         scratch.slot_zero_record = slot_zero;
         scratch.matching_scheduled = state.searched;
         scratch.legacy_search_performed = state.searched;
-        scratch.recovery_request_ready = false;
-        if (state.searched) {
-            scratch.recovery_request = G1RecoveryRequest{};
+        scratch.recovery_request = G1RecoveryRequest{};
+        scratch.recovery_request_ready = matching_enabled;
+        if (matching_enabled) {
             scratch.recovery_request.db = external.db;
             for (uint32_t feature = 0U;
                  feature < G1RecoveryFeatureCount;
@@ -4345,13 +4345,19 @@ G1FrameStageOutcome g1_controller_frame_stage_run(
                 state.incumbent_cost;
             scratch.recovery_request.ignore_range_end = 20;
             scratch.recovery_request.ignore_surrounding = 20;
-            scratch.recovery_request_ready = true;
         }
         return G1FrameStageContinue;
     }
     case G1FrameStageCandidateApply: {
         const G1CandidateRecord& candidate =
             scratch.active_candidate;
+        const bool matching_enabled =
+            external.tuning.mode != G1_TestSequential;
+        const bool recovery_context_valid =
+            matching_enabled &&
+            scratch.recovery_request_ready &&
+            scratch.matching_scheduled ==
+                scratch.legacy_search_performed;
         const int source_range = g1_runner_active_range(
             *external.db, candidate.selected_frame);
         const int executed_frame = g1_runner_trajectory_clamp(
@@ -4375,9 +4381,7 @@ G1FrameStageOutcome g1_controller_frame_stage_run(
                     scratch.slot_zero_record.transitioned;
         } else if (candidate.kind ==
                    G1CandidateRecoveryTransition) {
-            owner_valid = scratch.matching_scheduled &&
-                scratch.legacy_search_performed &&
-                scratch.recovery_request_ready &&
+            owner_valid = recovery_context_valid &&
                 candidate.recovery_rank <
                     G1RecoveryTransitionCapacity &&
                 candidate.transitioned &&
@@ -4391,10 +4395,10 @@ G1FrameStageOutcome g1_controller_frame_stage_run(
                  candidate.selected_cost <
                      scratch.recovery_request.public_incumbent_cost);
         } else if (candidate.kind == G1CandidateIncumbent) {
-            const int incumbent_frame = scratch.matching_scheduled
+            const int incumbent_frame = recovery_context_valid
                 ? scratch.recovery_request.incumbent_frame
                 : scratch.slot_zero_record.selected_frame;
-            const float incumbent_cost = scratch.matching_scheduled
+            const float incumbent_cost = recovery_context_valid
                 ? scratch.recovery_request.public_incumbent_cost
                 : scratch.slot_zero_record.selected_cost;
             owner_valid = candidate.selected_frame ==

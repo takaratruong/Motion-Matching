@@ -3551,16 +3551,27 @@ static inline bool g1_frame_recovery_request_matches_prefix(
     const G1RecoveryRequest& request,
     const G1FrameTransactionScratch& prefix_scratch,
     const g1_controller_state& immutable_baseline,
-    const G1CandidateRecord& legacy_record,
+    const G1CandidateRecord& slot_zero,
     const G1FrameExternalInputs& external)
 {
-    if (!prefix_scratch.matching_scheduled ||
-        !prefix_scratch.legacy_search_performed ||
-        !prefix_scratch.recovery_request_ready ||
+    const bool scheduled_form =
+        prefix_scratch.matching_scheduled &&
+        prefix_scratch.legacy_search_performed &&
+        slot_zero.kind == G1CandidateLegacy &&
+        request.legacy_selected_frame == slot_zero.selected_frame;
+    const bool unscheduled_form =
+        !prefix_scratch.matching_scheduled &&
+        !prefix_scratch.legacy_search_performed &&
+        slot_zero.kind == G1CandidateIncumbent &&
+        !slot_zero.transitioned &&
+        slot_zero.selected_frame == immutable_baseline.frame_index &&
+        request.legacy_selected_frame == request.incumbent_frame &&
+        request.legacy_selected_frame == slot_zero.selected_frame;
+    if (!prefix_scratch.recovery_request_ready ||
+        scheduled_form == unscheduled_form ||
         request.db == nullptr ||
         request.db != external.db ||
         request.incumbent_frame != immutable_baseline.frame_index ||
-        request.legacy_selected_frame != legacy_record.selected_frame ||
         !g1_frame_float_bits_equal(
             request.transition_cost, prefix_scratch.transition_cost) ||
         !g1_frame_float_bits_equal(
@@ -3570,8 +3581,8 @@ static inline bool g1_frame_recovery_request_matches_prefix(
         request.transition_cost < 0.0f ||
         !terrain_float_is_finite(request.public_incumbent_cost) ||
         request.public_incumbent_cost < 0.0f ||
-        request.ignore_range_end < 0 ||
-        request.ignore_surrounding < 0 ||
+        request.ignore_range_end != 20 ||
+        request.ignore_surrounding != 20 ||
         g1_frame_candidate_source_range(
             *request.db, request.incumbent_frame) < 0 ||
         g1_frame_candidate_source_range(
@@ -3830,7 +3841,7 @@ static inline G1FrameTransactionStatus g1_frame_transaction_run(
         matching_enabled && prefix_scratch.matching_scheduled;
     if (prefix_scratch.matching_scheduled != matching_scheduled ||
         prefix_scratch.legacy_search_performed != matching_scheduled ||
-        prefix_scratch.recovery_request_ready != matching_scheduled) {
+        prefix_scratch.recovery_request_ready != matching_enabled) {
         return G1FrameTransactionGlobalError;
     }
 
@@ -3988,7 +3999,7 @@ static inline G1FrameTransactionStatus g1_frame_transaction_run(
         return G1FrameTransactionGlobalError;
     }
 
-    if (!matching_scheduled) {
+    if (!matching_enabled) {
         return publish_first_failure();
     }
 

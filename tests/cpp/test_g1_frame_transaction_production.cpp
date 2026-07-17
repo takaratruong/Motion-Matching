@@ -10975,6 +10975,21 @@ static G1RecoveryProviderStatus real_provider_global_error(
     return G1RecoveryProviderGlobalError;
 }
 
+static int real_unscheduled_provider_calls = 0;
+static G1RecoveryRequest real_unscheduled_provider_request;
+
+static G1RecoveryProviderStatus real_unscheduled_recording_provider(
+    G1RecoveryCandidateSet& output,
+    const G1RecoveryRequest& request,
+    char* error,
+    int error_capacity)
+{
+    ++real_unscheduled_provider_calls;
+    real_unscheduled_provider_request = request;
+    return ::g1_recovery_candidates_build(
+        output, request, error, error_capacity);
+}
+
 static G1FrameTransactionStatus run_real_candidate_fixture(
     fixture& value,
     G1CandidateCertificationTrace& certification,
@@ -11455,7 +11470,7 @@ static void test_legacy_slot_zero_acceptance_never_materializes_recovery()
           "accepted slot zero has counters (1,0), one attempt, and no recovery materialization");
 }
 
-static void test_matching_disabled_and_unscheduled_frames_attempt_only_incumbent()
+static void test_matching_disabled_and_accepted_unscheduled_frames_are_lazy()
 {
     for (int variant = 0; variant < 2; ++variant) {
         fixture value;
@@ -11487,6 +11502,91 @@ static void test_matching_disabled_and_unscheduled_frames_attempt_only_incumbent
                       G1CandidateScoreIncumbent,
               "matching-disabled and unscheduled frames each attempt only the incumbent");
     }
+}
+
+static void test_matching_enabled_unscheduled_finite_incumbent_recovers()
+{
+    fixture value;
+    configure_real_candidate_fixture(value, true, false);
+    value.runtime.accepted_state.search_timer =
+        value.runtime.accepted_state.search_time;
+    value.db.contact_states(RealIncumbentExecutedFrame, 0) = false;
+    value.db.contact_states(RealIncumbentExecutedFrame, 1) = true;
+    real_unscheduled_provider_calls = 0;
+    g1_frame_recovery_request_reset(real_unscheduled_provider_request);
+    G1CandidateCertificationTrace trace;
+    char error[1024] = {};
+    const G1FrameTransactionStatus status = run_real_candidate_fixture(
+        value,
+        trace,
+        real_unscheduled_recording_provider,
+        nullptr,
+        error,
+        static_cast<int>(sizeof(error)));
+    const G1CandidateAttemptTraceRecord& first = trace.attempts[0];
+    const G1CandidateAttemptTraceRecord& winner =
+        trace.attempts[trace.attempt_count > 0U
+            ? trace.attempt_count - 1U
+            : 0U];
+    check(status == G1FrameTransactionAccepted &&
+              real_unscheduled_provider_calls == 1 &&
+              trace.legacy_traversals == 0U &&
+              trace.recovery_provider_calls == 1U &&
+              trace.recovery_set.work.accelerated_traversals == 1U &&
+              trace.attempt_count >= 2U &&
+              first.candidate.kind == G1CandidateIncumbent &&
+              first.candidate.selected_frame ==
+                  RealIncumbentSelectedFrame &&
+              first.score_owner == G1CandidateScoreIncumbent &&
+              first.common == G1CandidateDispositionAccepted &&
+              first.raw == G1CandidateDispositionAccepted &&
+              first.ik == G1CandidateDispositionFiniteRejected &&
+              winner.candidate.kind == G1CandidateRecoveryTransition &&
+              winner.score_owner == G1CandidateScoreStrictRecovery &&
+              winner.common == G1CandidateDispositionAccepted &&
+              winner.raw == G1CandidateDispositionAccepted &&
+              winner.ik == G1CandidateDispositionAccepted &&
+              trace.recovery_request_available &&
+              real_unscheduled_provider_request.db == &value.db &&
+              real_unscheduled_provider_request.incumbent_frame ==
+                  RealIncumbentSelectedFrame &&
+              real_unscheduled_provider_request.legacy_selected_frame ==
+                  RealIncumbentSelectedFrame &&
+              terrain_float_bits(
+                  real_unscheduled_provider_request
+                      .public_incumbent_cost) ==
+                  terrain_float_bits(first.candidate.selected_cost) &&
+              value.runtime.accepted_state.frame_index ==
+                  winner.candidate.executed_frame &&
+              g1_frame_rejection_is_canonical(
+                  value.runtime.publication.rejection),
+          "matching-enabled unscheduled finite incumbent prepares and uses an equal-frame recovery request");
+}
+
+static void test_matching_disabled_finite_incumbent_never_calls_provider()
+{
+    fixture value;
+    configure_real_candidate_fixture(value, true, false);
+    value.external.tuning.mode = G1_TestSequential;
+    value.external.tuning.frame_limit = 1;
+    value.db.contact_states(RealIncumbentExecutedFrame, 0) = false;
+    value.db.contact_states(RealIncumbentExecutedFrame, 1) = true;
+    real_unscheduled_provider_calls = 0;
+    G1CandidateCertificationTrace trace;
+    char error[1024] = {};
+    check(run_real_candidate_fixture(
+              value,
+              trace,
+              real_unscheduled_recording_provider,
+              nullptr,
+              error,
+              static_cast<int>(sizeof(error))) ==
+              G1FrameTransactionFiniteRejected &&
+              real_unscheduled_provider_calls == 0 &&
+              trace.legacy_traversals == 0U &&
+              trace.recovery_provider_calls == 0U &&
+              trace.attempt_count == 1U,
+          "matching-disabled finite incumbent performs no recovery-provider work");
 }
 
 static void test_end_of_animation_public_sentinels_do_not_leak_private_score()
@@ -11586,6 +11686,119 @@ static void test_controller_contains_one_production_database_search_call()
               runner_searches[0].name < apply_cases[0] &&
               runner_providers.empty(),
           "controller production code has one database_search, only MatcherSearch owns it, and the runner never calls recovery");
+}
+
+static void test_controller_unscheduled_recovery_source_ownership()
+{
+    std::string error;
+    const std::vector<CppToken> tokens = tokenize_cpp_source(
+        read_source_file("controller.cpp"), error);
+    check(error.empty(), error.empty() ? "controller tokenizes" : error.c_str());
+    const ExactFunctionRange runner = real_controller_runner_range(tokens);
+    const std::vector<std::size_t> matcher_cases = cpp_find_token_sequence(
+        tokens,
+        runner.body_begin + 1,
+        runner.body_end,
+        {"case", "G1FrameStageMatcherSearch", ":"});
+    const std::vector<std::size_t> apply_cases = cpp_find_token_sequence(
+        tokens,
+        runner.body_begin + 1,
+        runner.body_end,
+        {"case", "G1FrameStageCandidateApply", ":"});
+    const std::vector<std::size_t> inertial_cases = cpp_find_token_sequence(
+        tokens,
+        runner.body_begin + 1,
+        runner.body_end,
+        {"case", "G1FrameStageInertialization", ":"});
+    check(matcher_cases.size() == 1U && apply_cases.size() == 1U &&
+              inertial_cases.size() == 1U,
+          "matcher and candidate recovery source blocks have exact bounds");
+    const std::size_t matcher_begin = matcher_cases[0];
+    const std::size_t matcher_end = apply_cases[0];
+    const std::size_t recovery_end = inertial_cases[0];
+
+    const std::vector<CppCallRecord> all_searches = cpp_calls_named(
+        tokens, 0U, tokens.size(), "database_search");
+    const std::vector<std::size_t> scheduled_blocks =
+        cpp_find_token_sequence(
+            tokens,
+            matcher_begin,
+            matcher_end,
+            {"if", "(", "state", ".", "searched", ")", "{"});
+    const std::size_t scheduled_open = scheduled_blocks.size() == 1U
+        ? scheduled_blocks[0] + 6U
+        : std::string::npos;
+    const std::size_t scheduled_close =
+        scheduled_open != std::string::npos
+            ? cpp_matching_token(tokens, scheduled_open, "{", "}")
+            : std::string::npos;
+    check(all_searches.size() == 1U &&
+              scheduled_blocks.size() == 1U &&
+              scheduled_close != std::string::npos &&
+              all_searches[0].name > scheduled_open &&
+              all_searches[0].name < scheduled_close,
+          "the sole production database_search remains inside if state.searched");
+
+    const std::vector<std::size_t> matching_blocks =
+        cpp_find_token_sequence(
+            tokens,
+            matcher_begin,
+            matcher_end,
+            {"if", "(", "matching_enabled", ")", "{"});
+    const std::size_t matching_open = matching_blocks.size() == 1U
+        ? matching_blocks[0] + 4U
+        : std::string::npos;
+    const std::size_t matching_close =
+        matching_open != std::string::npos
+            ? cpp_matching_token(tokens, matching_open, "{", "}")
+            : std::string::npos;
+    const bool reset_before_guard = matching_open != std::string::npos &&
+        cpp_find_token_sequence(
+            tokens,
+            matcher_begin,
+            matching_open,
+            {"scratch", ".", "recovery_request", "=",
+             "G1RecoveryRequest", "{", "}", ";"}).size() == 1U;
+    const bool readiness_tracks_mode =
+        cpp_find_token_sequence(
+            tokens,
+            matcher_begin,
+            matcher_end,
+            {"scratch", ".", "recovery_request_ready", "=",
+             "matching_enabled", ";"}).size() == 1U;
+    const bool request_database_inside_guard =
+        matching_close != std::string::npos &&
+        cpp_find_token_sequence(
+            tokens,
+            matching_open + 1U,
+            matching_close,
+            {"scratch", ".", "recovery_request", ".", "db", "=",
+             "external", ".", "db", ";"}).size() == 1U;
+    check(matching_blocks.size() == 1U &&
+              matching_close != std::string::npos &&
+              reset_before_guard && readiness_tracks_mode &&
+              request_database_inside_guard,
+          "matching mode owns one unconditional request reset and one guarded exact snapshot");
+
+    check(cpp_identifier_count(
+              tokens, matcher_begin, recovery_end,
+              "commanded_velocity") == 0U &&
+              cpp_identifier_count(
+                  tokens, matcher_begin, recovery_end,
+                  "move_stick") == 0U &&
+              cpp_identifier_count(
+                  tokens, matcher_begin, recovery_end,
+                  "desired_velocity") == 0U,
+          "matcher and recovery blocks never derive or assign heading from live velocity owners");
+}
+
+[[maybe_unused]] static void run_unscheduled_prefix_red_tests()
+{
+    test_matching_enabled_unscheduled_finite_incumbent_recovers();
+    test_matching_disabled_finite_incumbent_never_calls_provider();
+    test_matching_disabled_and_accepted_unscheduled_frames_are_lazy();
+    test_controller_contains_one_production_database_search_call();
+    test_controller_unscheduled_recovery_source_ownership();
 }
 
 static void test_controller_has_no_candidate_contact_rank_gate()
@@ -11865,6 +12078,83 @@ struct CandidateTraceFixture
         check(trace.recovery_set.count == G1RecoveryTailCapacity,
               "synthetic accelerated trace has six transitions plus incumbent");
     }
+
+    void make_unscheduled()
+    {
+        make_database(db, 160);
+        db.range_starts.resize(2);
+        db.range_stops.resize(2);
+        db.range_starts(0) = 0;
+        db.range_stops(0) = 80;
+        db.range_starts(1) = 80;
+        db.range_stops(1) = 160;
+        db.features.set(20.0f);
+        db.features_offset.set(0.0f);
+        db.features_scale.set(1.0f);
+        for (int frame = 32; frame < 38; ++frame) {
+            for (uint32_t feature = 0U;
+                 feature < G1RecoveryFeatureCount;
+                 ++feature) {
+                db.features(frame, static_cast<int>(feature)) = 0.0f;
+            }
+            db.features(frame, 0) = static_cast<float>(frame - 31);
+        }
+        database_build_bounds(db);
+
+        g1_frame_certification_trace_reset(trace);
+        trace.legacy_traversals = 0U;
+        trace.recovery_provider_calls = 1U;
+        trace.common_evaluations = 2U;
+        trace.raw_evaluations = 2U;
+        trace.ik_evaluations = 2U;
+        trace.recovery_request_available = true;
+        trace.recovery_request.db = &db;
+        trace.recovery_request.incumbent_frame = 10;
+        trace.recovery_request.legacy_selected_frame = 10;
+        trace.recovery_request.transition_cost = 0.0f;
+        trace.recovery_request.public_incumbent_cost = 100.0f;
+        trace.recovery_request.ignore_range_end = 20;
+        trace.recovery_request.ignore_surrounding = 20;
+        for (uint32_t feature = 0U;
+             feature < G1RecoveryFeatureCount;
+             ++feature) {
+            trace.recovery_request.raw_query[feature] = 0.25f;
+        }
+        char error[512] = {};
+        check(g1_recovery_candidates_build(
+                  trace.recovery_set,
+                  trace.recovery_request,
+                  error,
+                  static_cast<int>(sizeof(error))) ==
+                  G1RecoveryProviderOk,
+              error);
+        check(trace.recovery_set.count == G1RecoveryTransitionCapacity,
+              "synthetic unscheduled trace has exactly six strict transitions");
+
+        G1CandidateRecord incumbent;
+        incumbent.kind = G1CandidateIncumbent;
+        incumbent.selected_frame = 10;
+        incumbent.executed_frame = 11;
+        incumbent.source_range = 0;
+        incumbent.selected_cost = 100.0f;
+        incumbent.recovery_rank = UINT32_MAX;
+        incumbent.transitioned = false;
+        trace.attempts[0].candidate = incumbent;
+        trace.attempts[0].score_owner = G1CandidateScoreIncumbent;
+        trace.attempts[0].common = G1CandidateDispositionAccepted;
+        trace.attempts[0].raw = G1CandidateDispositionAccepted;
+        trace.attempts[0].ik = G1CandidateDispositionFiniteRejected;
+        trace.attempts[0].rejection_stage = G1FrameRejectIkCandidate;
+        trace.attempts[0].stop_reason = G1IkStopNoSwingCandidate;
+
+        trace.attempts[1].candidate = trace.recovery_set.records[0];
+        trace.attempts[1].score_owner =
+            G1CandidateScoreStrictRecovery;
+        trace.attempts[1].common = G1CandidateDispositionAccepted;
+        trace.attempts[1].raw = G1CandidateDispositionAccepted;
+        trace.attempts[1].ik = G1CandidateDispositionAccepted;
+        trace.attempt_count = 2U;
+    }
 };
 
 static void candidate_trace_open_for_test(
@@ -11972,6 +12262,203 @@ static void test_trace_serializes_slot_zero_complete_tail_and_attempts()
     g1_candidate_trace_close(file);
     check(file.stream == nullptr && !file.header_written,
           "candidate trace close is idempotent and clears ownership");
+}
+
+static void test_trace_accepts_exact_unscheduled_incumbent_recovery_grammar()
+{
+    CandidateTraceFixture fixture_value;
+    fixture_value.make_unscheduled();
+    CandidateTraceTempFile temporary;
+    G1CandidateTraceFile file;
+    candidate_trace_open_for_test(file, temporary);
+    char error[512] = {};
+    check(g1_candidate_trace_append_after_transaction(
+              file,
+              79U,
+              fixture_value.trace,
+              error,
+              static_cast<int>(sizeof(error))),
+          "trace accepts exact unscheduled incumbent recovery grammar");
+    const std::vector<std::vector<std::string> > rows =
+        candidate_trace_rows(temporary.read());
+    check(rows.size() == 8U && rows[0].size() == 21U &&
+              temporary.read().rfind(
+                  std::string(CandidateTraceHeader) + "\n", 0U) == 0U,
+          "unscheduled trace writes one slot zero and six complete strict-tail rows");
+    for (std::size_t row = 1U; row < rows.size(); ++row) {
+        check(rows[row].size() == 21U &&
+                  rows[row][0] == "79" &&
+                  rows[row][1] == std::to_string(row - 1U) &&
+                  rows[row][15] == "0" &&
+                  rows[row][16] == "1" &&
+                  rows[row][17] == "1" &&
+                  rows[row][18] == "6" &&
+                  rows[row][19] == "6" &&
+                  rows[row][20] == "1",
+              "every unscheduled trace row preserves exact counters and exhaustive equality");
+    }
+    check(rows[1][2] == "incumbent" &&
+              rows[1][3] == "incumbent" &&
+              rows[1][4] == "10" &&
+              rows[1][9] == "1" &&
+              rows[1][10] == "accepted" &&
+              rows[1][11] == "accepted" &&
+              rows[1][12] == "finite-rejected" &&
+              rows[2][2] == "strict-recovery" &&
+              rows[2][3] == "strict-recovery" &&
+              rows[2][9] == "1" &&
+              rows[2][10] == "accepted" &&
+              rows[2][11] == "accepted" &&
+              rows[2][12] == "accepted",
+          "unscheduled trace serializes incumbent rejection then the first strict winner");
+    for (std::size_t row = 3U; row < rows.size(); ++row) {
+        check(rows[row][2] == "strict-recovery" &&
+                  rows[row][3] == "strict-recovery" &&
+                  rows[row][9] == "0" &&
+                  rows[row][10] == "not-run" &&
+                  rows[row][11] == "not-run" &&
+                  rows[row][12] == "not-run",
+              "unattempted unscheduled strict records remain complete and not-run");
+    }
+    g1_candidate_trace_close(file);
+}
+
+static void test_trace_rejects_exact_unscheduled_binding_mutations()
+{
+    const auto expect_unscheduled_rejected = [](
+        const char* message,
+        const auto& mutate) {
+        CandidateTraceFixture fixture_value;
+        fixture_value.make_unscheduled();
+        mutate(fixture_value.trace);
+        CandidateTraceTempFile temporary;
+        G1CandidateTraceFile file;
+        candidate_trace_open_for_test(file, temporary);
+        candidate_trace_check_failed_without_write(
+            file,
+            temporary,
+            fixture_value.trace,
+            std::string(),
+            message);
+        g1_candidate_trace_close(file);
+    };
+
+    expect_unscheduled_rejected(
+        "unequal unscheduled request frames fail before transaction bytes",
+        [](G1CandidateCertificationTrace& trace) {
+            ++trace.recovery_request.legacy_selected_frame;
+        });
+    expect_unscheduled_rejected(
+        "equal request frames that miss slot zero fail before transaction bytes",
+        [](G1CandidateCertificationTrace& trace) {
+            trace.recovery_request.incumbent_frame = 9;
+            trace.recovery_request.legacy_selected_frame = 9;
+        });
+    expect_unscheduled_rejected(
+        "unscheduled public-cost mismatch fails before transaction bytes",
+        [](G1CandidateCertificationTrace& trace) {
+            trace.recovery_request.public_incumbent_cost =
+                candidate_trace_float_from_bits(
+                    terrain_float_bits(
+                        trace.recovery_request.public_incumbent_cost) ^
+                    UINT32_C(1));
+        });
+    expect_unscheduled_rejected(
+        "unscheduled range-end exclusion drift fails before transaction bytes",
+        [](G1CandidateCertificationTrace& trace) {
+            --trace.recovery_request.ignore_range_end;
+        });
+    expect_unscheduled_rejected(
+        "unscheduled surrounding exclusion drift fails before transaction bytes",
+        [](G1CandidateCertificationTrace& trace) {
+            --trace.recovery_request.ignore_surrounding;
+        });
+    expect_unscheduled_rejected(
+        "unscheduled slot-zero executed-frame drift fails before transaction bytes",
+        [](G1CandidateCertificationTrace& trace) {
+            ++trace.attempts[0].candidate.executed_frame;
+        });
+    expect_unscheduled_rejected(
+        "unscheduled slot-zero source-range drift fails before transaction bytes",
+        [](G1CandidateCertificationTrace& trace) {
+            trace.attempts[0].candidate.source_range = 1;
+        });
+    expect_unscheduled_rejected(
+        "unscheduled legacy traversal drift fails before transaction bytes",
+        [](G1CandidateCertificationTrace& trace) {
+            trace.legacy_traversals = 1U;
+        });
+    expect_unscheduled_rejected(
+        "legacy score ownership on an incumbent fails before transaction bytes",
+        [](G1CandidateCertificationTrace& trace) {
+            trace.attempts[0].score_owner = G1CandidateScoreLegacy;
+        });
+    {
+        CandidateTraceFixture fixture_value;
+        fixture_value.trace.attempts[0].score_owner =
+            G1CandidateScoreIncumbent;
+        CandidateTraceTempFile temporary;
+        G1CandidateTraceFile file;
+        candidate_trace_open_for_test(file, temporary);
+        candidate_trace_check_failed_without_write(
+            file,
+            temporary,
+            fixture_value.trace,
+            std::string(),
+            "incumbent score ownership on a legacy record fails before transaction bytes");
+        g1_candidate_trace_close(file);
+    }
+    {
+        CandidateTraceFixture fixture_value;
+        fixture_value.make_unscheduled();
+        CandidateTraceFixture substituted;
+        substituted.db.features(0, 0) += 0.5f;
+        database_build_bounds(substituted.db);
+        fixture_value.trace.recovery_request.db = &substituted.db;
+        CandidateTraceTempFile temporary;
+        G1CandidateTraceFile file;
+        candidate_trace_open_for_test(file, temporary);
+        candidate_trace_check_failed_without_write(
+            file,
+            temporary,
+            fixture_value.trace,
+            std::string(),
+            "unscheduled database-pointer substitution fails before transaction bytes");
+        g1_candidate_trace_close(file);
+    }
+    for (uint32_t feature = 0U;
+         feature < G1RecoveryFeatureCount;
+         ++feature) {
+        CandidateTraceFixture fixture_value;
+        fixture_value.make_unscheduled();
+        fixture_value.trace.recovery_request.raw_query[feature] =
+            candidate_trace_float_from_bits(
+                terrain_float_bits(
+                    fixture_value.trace.recovery_request
+                        .raw_query[feature]) ^
+                UINT32_C(0x00800000));
+        CandidateTraceTempFile temporary;
+        G1CandidateTraceFile file;
+        candidate_trace_open_for_test(file, temporary);
+        candidate_trace_check_failed_without_write(
+            file,
+            temporary,
+            fixture_value.trace,
+            std::string(),
+            "each unscheduled query-word one-bit mutation fails before transaction bytes");
+        g1_candidate_trace_close(file);
+    }
+    expect_unscheduled_rejected(
+        "duplicate unscheduled strict frame fails before transaction bytes",
+        [](G1CandidateCertificationTrace& trace) {
+            trace.recovery_set.records[1] = trace.recovery_set.records[0];
+            trace.recovery_set.records[1].recovery_rank = 1U;
+        });
+    expect_unscheduled_rejected(
+        "malformed unscheduled recovery rank fails before transaction bytes",
+        [](G1CandidateCertificationTrace& trace) {
+            trace.recovery_set.records[0].recovery_rank = 1U;
+        });
 }
 
 static void test_trace_exhaustive_oracle_uses_exact_live_request_and_database()
@@ -12112,13 +12599,6 @@ static void test_trace_rejects_impossible_completed_transaction_grammars()
         "recovery set omits its one accelerated traversal",
         [](G1CandidateCertificationTrace& trace) {
             trace.recovery_set.work.accelerated_traversals = 0U;
-        });
-    expect_rejected(
-        "a request and tail follow an incumbent slot zero",
-        [](G1CandidateCertificationTrace& trace) {
-            trace.legacy_traversals = 0U;
-            trace.attempts[0].candidate.kind = G1CandidateIncumbent;
-            trace.attempts[0].score_owner = G1CandidateScoreIncumbent;
         });
     expect_rejected(
         "slot-zero selected frame disagrees with its exact request",
@@ -12904,6 +13384,8 @@ static void emit_candidate_trace_transcript()
 
 static void run_candidate_trace_tests()
 {
+    test_trace_accepts_exact_unscheduled_incumbent_recovery_grammar();
+    test_trace_rejects_exact_unscheduled_binding_mutations();
     test_trace_serializes_slot_zero_complete_tail_and_attempts();
     test_trace_exhaustive_oracle_uses_exact_live_request_and_database();
     test_trace_rejects_impossible_completed_transaction_grammars();
@@ -12916,6 +13398,12 @@ static void run_candidate_trace_tests()
     test_benchmark_timestamp_surrounds_only_outer_transaction();
 }
 
+static void run_unscheduled_trace_red_tests()
+{
+    test_trace_accepts_exact_unscheduled_incumbent_recovery_grammar();
+    test_trace_rejects_exact_unscheduled_binding_mutations();
+}
+
 #endif
 
 int main(int argc, char** argv)
@@ -12923,6 +13411,18 @@ int main(int argc, char** argv)
     static_cast<void>(argv);
 #if defined(G1_FRAME_TRANSACTION_ENABLE_TEST_SEAM) && \
     defined(G1_CANDIDATE_RECOVERY_ENABLE_TEST_SEAM)
+    if (argc == 2 &&
+        std::strcmp(argv[1], "--unscheduled-prefix-red") == 0) {
+        std::fputs("G1_UNSCHEDULED_PREFIX_RED_SELECTED\n", stderr);
+        run_unscheduled_prefix_red_tests();
+        return 0;
+    }
+    if (argc == 2 &&
+        std::strcmp(argv[1], "--unscheduled-trace-red") == 0) {
+        std::fputs("G1_UNSCHEDULED_TRACE_RED_SELECTED\n", stderr);
+        run_unscheduled_trace_red_tests();
+        return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--trace-transcript") == 0) {
         run_candidate_trace_tests();
         emit_candidate_trace_transcript();
@@ -12955,10 +13455,13 @@ int main(int argc, char** argv)
     test_real_provider_global_error_rolls_back_every_owner();
     test_legacy_slot_zero_acceptance_has_exact_pre_feature_public_owners();
     test_legacy_slot_zero_acceptance_never_materializes_recovery();
-    test_matching_disabled_and_unscheduled_frames_attempt_only_incumbent();
+    test_matching_enabled_unscheduled_finite_incumbent_recovers();
+    test_matching_disabled_finite_incumbent_never_calls_provider();
+    test_matching_disabled_and_accepted_unscheduled_frames_are_lazy();
     test_end_of_animation_public_sentinels_do_not_leak_private_score();
     test_stage_runner_trusted_call_closure_is_exact();
     test_controller_contains_one_production_database_search_call();
+    test_controller_unscheduled_recovery_source_ownership();
     test_controller_has_no_candidate_contact_rank_gate();
     test_controller_has_no_persistent_dual_certificate_owner();
     test_production_no_seam_links_with_strict_recovery_provider();

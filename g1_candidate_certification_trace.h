@@ -414,12 +414,32 @@ static inline bool g1_candidate_trace_append_after_transaction(
         trace.ik_evaluations != expected_ik_evaluations) {
         return fail("candidate trace evaluation counters disagree with dispositions");
     }
+    const bool scheduled_recovery =
+        trace.legacy_traversals == 1U &&
+        slot_zero.candidate.kind == G1CandidateLegacy &&
+        slot_zero.score_owner == G1CandidateScoreLegacy &&
+        trace.recovery_request.legacy_selected_frame ==
+            slot_zero.candidate.selected_frame;
+    const bool unscheduled_recovery =
+        trace.legacy_traversals == 0U &&
+        slot_zero.candidate.kind == G1CandidateIncumbent &&
+        slot_zero.score_owner == G1CandidateScoreIncumbent &&
+        !slot_zero.candidate.transitioned &&
+        trace.recovery_request.incumbent_frame ==
+            slot_zero.candidate.selected_frame &&
+        trace.recovery_request.legacy_selected_frame ==
+            slot_zero.candidate.selected_frame &&
+        trace.recovery_request.ignore_range_end == 20 &&
+        trace.recovery_request.ignore_surrounding == 20 &&
+        g1_frame_float_bits_equal(
+            trace.recovery_request.public_incumbent_cost,
+            slot_zero.candidate.selected_cost);
     if (trace.recovery_request_available &&
-        (!slot_zero_finite || trace.legacy_traversals != 1U ||
-         slot_zero.candidate.kind != G1CandidateLegacy ||
-         slot_zero.score_owner != G1CandidateScoreLegacy ||
-         trace.recovery_request.legacy_selected_frame !=
-             slot_zero.candidate.selected_frame)) {
+        (!slot_zero_finite ||
+         !g1_frame_candidate_record_is_valid(
+             slot_zero.candidate,
+             *trace.recovery_request.db) ||
+         scheduled_recovery == unscheduled_recovery)) {
         return fail("candidate trace recovery is not bound to its finite legacy slot zero");
     }
     if (!trace.recovery_request_available && slot_zero_finite &&

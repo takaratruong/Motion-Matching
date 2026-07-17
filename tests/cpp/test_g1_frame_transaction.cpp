@@ -47,11 +47,13 @@ static_assert(std::is_same<G1RecoveryProvider,
     "the coordinator consumes the strict recovery-provider contract unchanged");
 
 static G1RecoveryProviderStatus unexpected_recovery_provider(
-    G1RecoveryCandidateSet&,
+    G1RecoveryCandidateSet& output,
     const G1RecoveryRequest&,
     char*, int)
 {
-    return G1RecoveryProviderGlobalError;
+    g1_frame_recovery_set_reset(output);
+    output.work.accelerated_traversals = 1U;
+    return G1RecoveryProviderOk;
 }
 
 using G1FrameCoordinator = G1FrameTransactionStatus (*)(
@@ -1766,10 +1768,13 @@ static G1FrameStageOutcome test_runner(
         scratch.requested_intent.desired_heading = state.desired_rotation;
         scratch.requested_intent_ready = true;
     } else if (stage == G1FrameStageMatcherSearch) {
+        const bool matching_enabled =
+            external.tuning.mode != G1_TestSequential;
         scratch.matching_scheduled = false;
         scratch.legacy_search_performed = false;
         scratch.transition_cost = 0.0f;
-        scratch.recovery_request_ready = false;
+        scratch.recovery_request = G1RecoveryRequest{};
+        scratch.recovery_request_ready = matching_enabled;
         scratch.slot_zero_record = G1CandidateRecord{};
         scratch.slot_zero_record.kind = G1CandidateIncumbent;
         scratch.slot_zero_record.selected_frame = state.frame_index;
@@ -1782,6 +1787,25 @@ static G1FrameStageOutcome test_runner(
         scratch.slot_zero_record.selected_cost = state.incumbent_cost;
         scratch.slot_zero_record.recovery_rank = UINT32_MAX;
         scratch.slot_zero_record.transitioned = false;
+        if (matching_enabled) {
+            scratch.recovery_request.db = external.db;
+            for (uint32_t feature = 0U;
+                 feature < G1RecoveryFeatureCount;
+                 ++feature) {
+                scratch.recovery_request.raw_query[feature] =
+                    scratch.query[feature];
+            }
+            scratch.recovery_request.incumbent_frame =
+                state.frame_index;
+            scratch.recovery_request.legacy_selected_frame =
+                scratch.slot_zero_record.selected_frame;
+            scratch.recovery_request.transition_cost =
+                scratch.transition_cost;
+            scratch.recovery_request.public_incumbent_cost =
+                state.incumbent_cost;
+            scratch.recovery_request.ignore_range_end = 20;
+            scratch.recovery_request.ignore_surrounding = 20;
+        }
     } else if (stage == G1FrameStageCandidateApply) {
         state.frame_index = scratch.active_candidate.executed_frame;
         state.selected_cost = scratch.active_candidate.selected_cost;
@@ -4615,6 +4639,20 @@ static constexpr G1CandidateRecord CandidateC = {
 static constexpr G1CandidateRecord Incumbent = {
     G1CandidateIncumbent, 32, 33, 0, 2.0f, UINT32_MAX, false};
 
+enum CandidatePrefixMutation
+{
+    CandidatePrefixMutationNone,
+    CandidatePrefixMutationIncumbentFrame,
+    CandidatePrefixMutationLegacyFrame,
+    CandidatePrefixMutationDatabase,
+    CandidatePrefixMutationTransitionCost,
+    CandidatePrefixMutationIncumbentCost,
+    CandidatePrefixMutationIgnoreRangeEnd,
+    CandidatePrefixMutationIgnoreSurrounding,
+    CandidatePrefixMutationQueryWord,
+    CandidatePrefixMutationSlotZeroFrame,
+};
+
 static G1FrameRejectionDiagnostic candidate_finite_rejection(int frame)
 {
     G1FrameRejectionDiagnostic rejection = finite_rejection();
@@ -4656,6 +4694,10 @@ struct CandidateRunnerControl
     uint64_t scratch_boundary_digest[G1CandidateAttemptCapacity] = {};
     bool scratch_copy_boundaries_valid = true;
     uint32_t rejected_a_poison_mask = 0U;
+    CandidatePrefixMutation prefix_mutation =
+        CandidatePrefixMutationNone;
+    const database* substituted_database = nullptr;
+    uint32_t mutated_query_word = 0U;
     struct FiniteRecord
     {
         int frame = 0;
@@ -4694,6 +4736,10 @@ static void reset_candidate_controls()
     candidate_runner_control.common_copy_boundary_valid = true;
     candidate_runner_control.scratch_copy_boundaries_valid = true;
     candidate_runner_control.rejected_a_poison_mask = 0U;
+    candidate_runner_control.prefix_mutation =
+        CandidatePrefixMutationNone;
+    candidate_runner_control.substituted_database = nullptr;
+    candidate_runner_control.mutated_query_word = 0U;
     candidate_runner_control.finite_record_count = 0U;
     for (int stage = 0; stage < G1FrameStageCount; ++stage) {
         candidate_runner_control.stage_calls[stage] = 0;
@@ -4733,6 +4779,14 @@ static void reset_candidate_controls()
     candidate_provider_control.set.work.small_bounds_tested = 1U;
     candidate_provider_control.set.work.rows_tested = 2U;
     candidate_provider_control.set.work.full_scores_materialized = 2U;
+}
+
+static float candidate_flip_low_bit(float value)
+{
+    uint32_t bits = terrain_float_bits(value) ^ UINT32_C(1);
+    float mutated = 0.0f;
+    std::memcpy(&mutated, &bits, sizeof(mutated));
+    return mutated;
 }
 
 static void candidate_finite_at(
@@ -5354,13 +5408,13 @@ static G1FrameStageOutcome candidate_runner(
         scratch.matching_scheduled = scheduled;
         scratch.legacy_search_performed = scheduled;
         scratch.transition_cost = 0.25f;
-        scratch.recovery_request_ready = scheduled;
+        scratch.recovery_request = G1RecoveryRequest{};
+        scratch.recovery_request_ready = matching_enabled;
         scratch.slot_zero_record = scheduled
             ? candidate_runner_control.slot_zero
             : Incumbent;
         state.searched = scheduled;
-        if (scheduled) {
-            scratch.recovery_request = G1RecoveryRequest{};
+        if (matching_enabled) {
             scratch.recovery_request.db = external.db;
             for (uint32_t feature = 0U;
                  feature < G1RecoveryFeatureCount;
@@ -5380,6 +5434,50 @@ static G1FrameStageOutcome candidate_runner(
                 state.incumbent_cost;
             scratch.recovery_request.ignore_range_end = 20;
             scratch.recovery_request.ignore_surrounding = 20;
+        }
+        switch (candidate_runner_control.prefix_mutation) {
+        case CandidatePrefixMutationNone:
+            break;
+        case CandidatePrefixMutationIncumbentFrame:
+            ++scratch.recovery_request.incumbent_frame;
+            break;
+        case CandidatePrefixMutationLegacyFrame:
+            ++scratch.recovery_request.legacy_selected_frame;
+            break;
+        case CandidatePrefixMutationDatabase:
+            scratch.recovery_request.db =
+                candidate_runner_control.substituted_database;
+            break;
+        case CandidatePrefixMutationTransitionCost:
+            scratch.recovery_request.transition_cost =
+                candidate_flip_low_bit(
+                    scratch.recovery_request.transition_cost);
+            break;
+        case CandidatePrefixMutationIncumbentCost:
+            scratch.recovery_request.public_incumbent_cost =
+                candidate_flip_low_bit(
+                    scratch.recovery_request.public_incumbent_cost);
+            break;
+        case CandidatePrefixMutationIgnoreRangeEnd:
+            --scratch.recovery_request.ignore_range_end;
+            break;
+        case CandidatePrefixMutationIgnoreSurrounding:
+            --scratch.recovery_request.ignore_surrounding;
+            break;
+        case CandidatePrefixMutationQueryWord:
+            if (candidate_runner_control.mutated_query_word >=
+                G1RecoveryFeatureCount) {
+                return G1FrameStageGlobalError;
+            }
+            scratch.recovery_request.raw_query[
+                candidate_runner_control.mutated_query_word] =
+                candidate_flip_low_bit(
+                    scratch.recovery_request.raw_query[
+                        candidate_runner_control.mutated_query_word]);
+            break;
+        case CandidatePrefixMutationSlotZeroFrame:
+            ++scratch.slot_zero_record.selected_frame;
+            break;
         }
     } else if (stage == G1FrameStageCandidateApply) {
         if (candidate_runner_control.attempt_count >=
@@ -6047,6 +6145,8 @@ static void test_exact_dt_intent_and_heading_are_immutable_per_attempt()
     }
 }
 
+static void configure_unscheduled_strict_tail(uint32_t count);
+
 static void test_prior_safe_stop_latch_is_shared_and_consumed_once_on_winner()
 {
     candidate_fixture fixture;
@@ -6060,6 +6160,7 @@ static void test_prior_safe_stop_latch_is_shared_and_consumed_once_on_winner()
 
     reset_candidate_controls();
     candidate_runner_control.schedule_search = false;
+    configure_unscheduled_strict_tail(0U);
     candidate_finite_at(
         Incumbent.selected_frame, G1FrameStageIkPoseCertificate);
     check(run_candidate_transaction(fixture) ==
@@ -6109,6 +6210,317 @@ static void test_prefix_camera_route_and_command_work_runs_once()
               candidate_provider_control.calls == 1 &&
               candidate_runner_control.attempt_count == 2U,
           "prefix, provider, winner finalize, and presentation each execute only at their bounded owner");
+}
+
+static void configure_unscheduled_strict_tail(uint32_t count)
+{
+    check(count <= G1RecoveryTransitionCapacity,
+          "unscheduled strict-tail fixture stays within transition capacity");
+    g1_frame_recovery_set_reset(candidate_provider_control.set);
+    for (uint32_t rank = 0U; rank < count; ++rank) {
+        G1CandidateRecord record;
+        record.kind = G1CandidateRecoveryTransition;
+        record.selected_frame = count == 1U
+            ? CandidateB.selected_frame
+            : 52 + static_cast<int>(rank);
+        record.executed_frame = record.selected_frame + 1;
+        record.source_range = count == 1U ? 2 : 1;
+        record.selected_cost = count == 1U
+            ? CandidateB.selected_cost
+            : 1.30f + 0.05f * static_cast<float>(rank);
+        record.recovery_rank = rank;
+        record.transitioned = true;
+        candidate_provider_control.set.records[rank] = record;
+    }
+    candidate_provider_control.set.count = count;
+    candidate_provider_control.set.work.accelerated_traversals = 1U;
+    candidate_provider_control.set.work.large_bounds_tested = 1U;
+    candidate_provider_control.set.work.small_bounds_tested = 1U;
+    candidate_provider_control.set.work.rows_tested = count;
+    candidate_provider_control.set.work.full_scores_materialized = count;
+}
+
+static uint64_t candidate_rejection_logical_digest(
+    const G1FrameRejectionDiagnostic& rejection)
+{
+    uint64_t hash = UINT64_C(1469598103934665603);
+    logical_hash_rejection(hash, rejection);
+    return hash;
+}
+
+static void test_unscheduled_incumbent_finite_rejection_uses_lazy_recovery()
+{
+    candidate_fixture fixture;
+    reset_candidate_controls();
+    candidate_runner_control.schedule_search = false;
+    configure_unscheduled_strict_tail(1U);
+    candidate_finite_at(
+        Incumbent.selected_frame, G1FrameStageIkPoseCertificate);
+
+    check(run_candidate_transaction(fixture) ==
+              G1FrameTransactionAccepted &&
+              candidate_provider_control.calls == 1 &&
+              candidate_runner_control.attempt_count == 2U &&
+              fixture.certification.legacy_traversals == 0U &&
+              fixture.certification.recovery_provider_calls == 1U &&
+              fixture.certification.recovery_set.work
+                      .accelerated_traversals == 1U &&
+              fixture.certification.attempt_count == 2U &&
+              candidate_record_bits_equal(
+                  fixture.certification.attempts[0].candidate,
+                  Incumbent) &&
+              fixture.certification.attempts[0].score_owner ==
+                  G1CandidateScoreIncumbent &&
+              fixture.certification.attempts[0].common ==
+                  G1CandidateDispositionAccepted &&
+              fixture.certification.attempts[0].raw ==
+                  G1CandidateDispositionAccepted &&
+              fixture.certification.attempts[0].ik ==
+                  G1CandidateDispositionFiniteRejected &&
+              candidate_record_bits_equal(
+                  fixture.certification.attempts[1].candidate,
+                  CandidateB) &&
+              fixture.certification.attempts[1].score_owner ==
+                  G1CandidateScoreStrictRecovery &&
+              fixture.certification.attempts[1].common ==
+                  G1CandidateDispositionAccepted &&
+              fixture.certification.attempts[1].raw ==
+                  G1CandidateDispositionAccepted &&
+              fixture.certification.attempts[1].ik ==
+                  G1CandidateDispositionAccepted &&
+              candidate_provider_control.request_seen &&
+              candidate_provider_control.request.incumbent_frame ==
+                  Incumbent.selected_frame &&
+              candidate_provider_control.request.legacy_selected_frame ==
+                  Incumbent.selected_frame &&
+              fixture.runtime.accepted_state.frame_index ==
+                  CandidateB.executed_frame &&
+              g1_frame_rejection_is_canonical(
+                  fixture.runtime.publication.rejection),
+          "unscheduled finite incumbent uses one lazy strict tail and commits first dual winner");
+}
+
+static void test_unscheduled_accepted_incumbent_is_lazy()
+{
+    candidate_fixture fixture;
+    reset_candidate_controls();
+    candidate_runner_control.schedule_search = false;
+    check(run_candidate_transaction(fixture) ==
+              G1FrameTransactionAccepted &&
+              candidate_provider_control.calls == 0 &&
+              fixture.certification.attempt_count == 1U &&
+              fixture.certification.legacy_traversals == 0U &&
+              fixture.certification.recovery_provider_calls == 0U,
+          "accepted unscheduled incumbent performs zero provider work");
+}
+
+static void test_unscheduled_provider_global_error_is_nonpublishing()
+{
+    candidate_fixture fixture;
+    const RuntimeEvidence before = runtime_evidence(fixture.runtime);
+    reset_candidate_controls();
+    candidate_runner_control.schedule_search = false;
+    configure_unscheduled_strict_tail(1U);
+    candidate_provider_control.status = G1RecoveryProviderGlobalError;
+    candidate_finite_at(
+        Incumbent.selected_frame, G1FrameStageIkPoseCertificate);
+    check(run_candidate_transaction(fixture) ==
+              G1FrameTransactionGlobalError &&
+              candidate_provider_control.calls == 1 &&
+              fixture.certification.attempt_count == 1U &&
+              publication_logical_digest(fixture.runtime.publication) ==
+                  before.publication &&
+              state_logical_digest(fixture.runtime.accepted_state) ==
+                  before.accepted,
+          "unscheduled provider global error is nonpublishing");
+}
+
+static void test_unscheduled_exhaustion_preserves_incumbent_failure()
+{
+    candidate_fixture fixture;
+    reset_candidate_controls();
+    candidate_runner_control.schedule_search = false;
+    configure_unscheduled_strict_tail(6U);
+    candidate_finite_at(
+        Incumbent.selected_frame, G1FrameStageIkPoseCertificate);
+    for (uint32_t index = 0U;
+         index < candidate_provider_control.set.count;
+         ++index) {
+        candidate_finite_at(
+            candidate_provider_control.set.records[index].selected_frame,
+            G1FrameStageIkPoseCertificate);
+    }
+    const uint64_t expected = candidate_rejection_logical_digest(
+        candidate_finite_rejection(Incumbent.selected_frame));
+    check(run_candidate_transaction(fixture) ==
+              G1FrameTransactionFiniteRejected &&
+              candidate_provider_control.calls == 1 &&
+              fixture.certification.legacy_traversals == 0U &&
+              fixture.certification.recovery_provider_calls == 1U &&
+              fixture.certification.attempt_count == 7U &&
+              candidate_runner_control.attempt_count == 7U &&
+              candidate_rejection_logical_digest(
+                  fixture.runtime.publication.rejection) == expected,
+          "unscheduled six-record exhaustion publishes the exact first incumbent rejection at seven attempts");
+}
+
+static void test_matching_disabled_finite_failure_stays_provider_free()
+{
+    candidate_fixture fixture;
+    reset_candidate_controls();
+    fixture.external.tuning.mode = G1_TestSequential;
+    fixture.external.tuning.frame_limit = 1;
+    configure_unscheduled_strict_tail(1U);
+    candidate_finite_at(
+        Incumbent.selected_frame, G1FrameStageIkPoseCertificate);
+    check(run_candidate_transaction(fixture) ==
+              G1FrameTransactionFiniteRejected &&
+              candidate_provider_control.calls == 0 &&
+              fixture.certification.legacy_traversals == 0U &&
+              fixture.certification.recovery_provider_calls == 0U &&
+              fixture.certification.attempt_count == 1U,
+          "matching-disabled finite failure performs zero provider work");
+}
+
+static void test_unscheduled_request_and_tail_mutations_are_global()
+{
+    const CandidatePrefixMutation request_mutations[] = {
+        CandidatePrefixMutationIncumbentFrame,
+        CandidatePrefixMutationLegacyFrame,
+        CandidatePrefixMutationTransitionCost,
+        CandidatePrefixMutationIncumbentCost,
+    };
+    for (CandidatePrefixMutation mutation : request_mutations) {
+        candidate_fixture fixture;
+        reset_candidate_controls();
+        candidate_runner_control.schedule_search = false;
+        candidate_runner_control.prefix_mutation = mutation;
+        configure_unscheduled_strict_tail(1U);
+        candidate_finite_at(
+            Incumbent.selected_frame, G1FrameStageIkPoseCertificate);
+        check(run_candidate_transaction(fixture) ==
+                  G1FrameTransactionGlobalError &&
+                  candidate_provider_control.calls == 0 &&
+                  candidate_runner_control.attempt_count == 1U,
+              "an unscheduled request word mutation is global before provider work");
+    }
+    const CandidatePrefixMutation exclusion_mutations[] = {
+        CandidatePrefixMutationIgnoreRangeEnd,
+        CandidatePrefixMutationIgnoreSurrounding,
+    };
+    for (CandidatePrefixMutation mutation : exclusion_mutations) {
+        candidate_fixture fixture;
+        reset_candidate_controls();
+        candidate_runner_control.schedule_search = false;
+        candidate_runner_control.prefix_mutation = mutation;
+        configure_unscheduled_strict_tail(1U);
+        candidate_finite_at(
+            Incumbent.selected_frame, G1FrameStageIkPoseCertificate);
+        check(run_candidate_transaction(fixture) ==
+                  G1FrameTransactionGlobalError &&
+                  candidate_provider_control.calls == 0 &&
+                  candidate_runner_control.attempt_count == 1U,
+              "unscheduled exclusion mutation is global before provider work");
+    }
+    {
+        candidate_fixture fixture;
+        candidate_fixture substituted;
+        reset_candidate_controls();
+        candidate_runner_control.schedule_search = false;
+        candidate_runner_control.prefix_mutation =
+            CandidatePrefixMutationDatabase;
+        candidate_runner_control.substituted_database = &substituted.db;
+        configure_unscheduled_strict_tail(1U);
+        candidate_finite_at(
+            Incumbent.selected_frame, G1FrameStageIkPoseCertificate);
+        check(run_candidate_transaction(fixture) ==
+                  G1FrameTransactionGlobalError &&
+                  candidate_provider_control.calls == 0 &&
+                  candidate_runner_control.attempt_count == 1U,
+              "an unscheduled request database substitution is global before provider work");
+    }
+    for (uint32_t feature = 0U;
+         feature < G1RecoveryFeatureCount;
+         ++feature) {
+        candidate_fixture fixture;
+        reset_candidate_controls();
+        candidate_runner_control.schedule_search = false;
+        candidate_runner_control.prefix_mutation =
+            CandidatePrefixMutationQueryWord;
+        candidate_runner_control.mutated_query_word = feature;
+        configure_unscheduled_strict_tail(1U);
+        candidate_finite_at(
+            Incumbent.selected_frame, G1FrameStageIkPoseCertificate);
+        check(run_candidate_transaction(fixture) ==
+                  G1FrameTransactionGlobalError &&
+                  candidate_provider_control.calls == 0 &&
+                  candidate_runner_control.attempt_count == 1U,
+              "each unscheduled request query-word mutation is global before provider work");
+    }
+    {
+        candidate_fixture fixture;
+        reset_candidate_controls();
+        candidate_runner_control.schedule_search = false;
+        candidate_runner_control.prefix_mutation =
+            CandidatePrefixMutationSlotZeroFrame;
+        configure_unscheduled_strict_tail(1U);
+        candidate_finite_at(
+            Incumbent.selected_frame, G1FrameStageIkPoseCertificate);
+        check(run_candidate_transaction(fixture) ==
+                  G1FrameTransactionGlobalError &&
+                  candidate_provider_control.calls == 0 &&
+                  candidate_runner_control.attempt_count == 0U,
+              "an unscheduled slot-zero owner mutation is global before any tail attempt");
+    }
+
+    for (int mutation = 0; mutation < 3; ++mutation) {
+        candidate_fixture fixture;
+        reset_candidate_controls();
+        candidate_runner_control.schedule_search = false;
+        configure_unscheduled_strict_tail(2U);
+        if (mutation == 0) {
+            candidate_provider_control.set.records[0].kind =
+                G1CandidateLegacy;
+        } else if (mutation == 1) {
+            candidate_provider_control.set.records[0].recovery_rank = 1U;
+        } else {
+            candidate_provider_control.set.records[0].selected_cost = 1.75f;
+            candidate_provider_control.set.records[1].selected_cost = 1.50f;
+        }
+        candidate_finite_at(
+            Incumbent.selected_frame, G1FrameStageIkPoseCertificate);
+        check(run_candidate_transaction(fixture) ==
+                  G1FrameTransactionGlobalError &&
+                  candidate_provider_control.calls == 1 &&
+                  candidate_runner_control.attempt_count == 1U,
+              "an unscheduled tail owner, rank, or ordering mutation is global before a tail attempt");
+    }
+    {
+        candidate_fixture fixture;
+        reset_candidate_controls();
+        candidate_runner_control.schedule_search = false;
+        configure_unscheduled_strict_tail(2U);
+        candidate_provider_control.set.records[1] =
+            candidate_provider_control.set.records[0];
+        candidate_provider_control.set.records[1].recovery_rank = 1U;
+        candidate_finite_at(
+            Incumbent.selected_frame, G1FrameStageIkPoseCertificate);
+        check(run_candidate_transaction(fixture) ==
+                  G1FrameTransactionGlobalError &&
+                  candidate_provider_control.calls == 1 &&
+                  candidate_runner_control.attempt_count == 1U,
+              "an unscheduled duplicate tail record is global before a tail attempt");
+    }
+}
+
+static void run_unscheduled_lazy_recovery_red_tests()
+{
+    test_unscheduled_incumbent_finite_rejection_uses_lazy_recovery();
+    test_unscheduled_accepted_incumbent_is_lazy();
+    test_unscheduled_provider_global_error_is_nonpublishing();
+    test_unscheduled_exhaustion_preserves_incumbent_failure();
+    test_matching_disabled_finite_failure_stays_provider_free();
+    test_unscheduled_request_and_tail_mutations_are_global();
 }
 
 static void configure_seven_record_tail()
@@ -6198,14 +6610,16 @@ static void test_lazy_provider_and_attempt_work_bounds()
         candidate_fixture fixture;
         reset_candidate_controls();
         candidate_runner_control.schedule_search = false;
+        configure_unscheduled_strict_tail(0U);
         candidate_finite_at(
             Incumbent.selected_frame, G1FrameStageIkPoseCertificate);
         check(run_candidate_transaction(fixture) ==
                   G1FrameTransactionFiniteRejected &&
-                  candidate_provider_control.calls == 0 &&
+                  candidate_provider_control.calls == 1 &&
                   fixture.certification.legacy_traversals == 0U &&
+                  fixture.certification.recovery_provider_calls == 1U &&
                   fixture.certification.attempt_count == 1U,
-              "unscheduled incumbent exhaustion never calls recovery");
+              "unscheduled incumbent exhaustion invokes one lazy provider and no tail attempt");
     }
     {
         candidate_fixture fixture;
@@ -6937,6 +7351,7 @@ static void run_first_failure_tests()
 
 static void run_all_inherited_and_task2_tests()
 {
+    run_unscheduled_lazy_recovery_red_tests();
     test_abc_selects_b_in_both_modes_and_stops_before_c();
     test_raw_rejection_short_circuits_ik_and_continues();
     test_raw_pass_ik_reject_cannot_be_selected();
@@ -6975,6 +7390,12 @@ static void run_all_inherited_and_task2_tests()
 
 int main(int argc, char** argv)
 {
+    if (argc == 2 &&
+        std::strcmp(argv[1], "--unscheduled-lazy-recovery-red") == 0) {
+        std::fputs("G1_UNSCHEDULED_LAZY_RECOVERY_RED_SELECTED\n", stderr);
+        run_unscheduled_lazy_recovery_red_tests();
+        return 0;
+    }
     if (argc == 2 &&
         std::strcmp(argv[1], "--first-failure-red") == 0) {
         std::fputs("G1_FIRST_FAILURE_RED_SELECTED\n", stderr);
