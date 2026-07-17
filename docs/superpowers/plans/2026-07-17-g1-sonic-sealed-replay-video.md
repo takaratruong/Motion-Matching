@@ -561,7 +561,8 @@ Expected: visual inspection passes with no clipping that hides the robot or stat
 Run:
 
 ```bash
-PYTHONPATH=sonic/python PYTHONDONTWRITEBYTECODE=1 \
+SONIC_PROJECT_CLI=/home/ubuntu/reliable-claude-projects/motion-matching/evaluators/g1_project_pose_cli-3745069 \
+  PYTHONPATH=sonic/python PYTHONDONTWRITEBYTECODE=1 \
   /home/ubuntu/miniconda3/envs/diffsim/bin/python -B -W error -m unittest \
   tests.python.test_sonic_artifacts tests.python.test_sonic_cli \
   tests.python.test_sonic_commands tests.python.test_sonic_coordinator \
