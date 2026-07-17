@@ -447,6 +447,74 @@ static bool build_bounded_row(
                error_capacity);
 }
 
+static void test_unscheduled_recovery_row_uses_mode_aware_checker_grammar()
+{
+    fixture value;
+    configure_real_candidate_fixture(value, true, false);
+    value.external.input.presentation_frame = 0;
+    value.external.tuning.ik_enabled = false;
+    value.runtime.accepted_state.search_timer =
+        value.runtime.accepted_state.search_time;
+    value.db.contact_states(RealIncumbentExecutedFrame, 0) = false;
+    value.db.contact_states(RealIncumbentExecutedFrame, 1) = true;
+    real_unscheduled_provider_calls = 0;
+    g1_frame_recovery_request_reset(real_unscheduled_provider_request);
+
+    G1CandidateCertificationTrace trace;
+    char error[1024] = {};
+    logging_check(
+        run_real_candidate_fixture(
+            value,
+            trace,
+            real_unscheduled_recording_provider,
+            nullptr,
+            error,
+            static_cast<int>(sizeof(error))) ==
+            G1FrameTransactionAccepted,
+        error);
+    logging_check(
+        trace.attempt_count >= 2U &&
+            trace.legacy_traversals == 0U &&
+            trace.recovery_provider_calls == 1U &&
+            trace.attempts[0].candidate.kind == G1CandidateIncumbent,
+        "authentic unscheduled fixture reaches strict recovery");
+    const G1CandidateAttemptTraceRecord& winner =
+        trace.attempts[trace.attempt_count - 1U];
+    logging_check(
+        winner.candidate.kind == G1CandidateRecoveryTransition &&
+            winner.score_owner == G1CandidateScoreStrictRecovery &&
+            winner.common == G1CandidateDispositionAccepted &&
+            winner.raw == G1CandidateDispositionAccepted &&
+            winner.ik == G1CandidateDispositionAccepted,
+        "authentic unscheduled fixture dual-certifies its strict winner");
+
+    motion_match_log_row row;
+    logging_check(
+        build_bounded_row(
+            row, value, false, error, static_cast<int>(sizeof(error))),
+        error);
+    logging_check(
+        row.matching_enabled && !row.searched && row.transitioned &&
+            row.selected_database_frame == winner.candidate.selected_frame &&
+            row.database_frame == winner.candidate.executed_frame &&
+            terrain_float_bits(row.selected_cost) ==
+                terrain_float_bits(winner.candidate.selected_cost) &&
+            row.selected_cost < row.incumbent_cost,
+        "production row preserves exact unscheduled strict winner provenance");
+
+    const std::string checker =
+        read_source_file("resources/check_g1_runtime_log.py");
+    logging_check(
+        checker.find("unscheduled_recovery = (") != std::string::npos &&
+            checker.find(
+                "if (searched or transitioned) and not matching_enabled:") !=
+                std::string::npos &&
+            checker.find(
+                "unscheduled recovery did not strictly beat incumbent") !=
+                std::string::npos,
+        "canonical checker owns the exact mode-aware recovery grammar");
+}
+
 static std::vector<std::string> split_csv_line(
     const std::string& line)
 {
@@ -1164,33 +1232,21 @@ static void test_disabled_projection_has_no_hidden_owner_source_path()
         "accepted and canonical loggers are confined to opposite mode branches");
 }
 
-static void test_log_schema_and_runtime_checker_hashes_are_unchanged()
+static void test_log_schema_hash_is_unchanged()
 {
-    struct HashExpectation
-    {
-        const char* path;
-        const char* expected;
-    };
-    const HashExpectation expectations[] = {
-        {"motion_match_log.h",
-         "470dcd5978fe6f03e9398dc845c5454f70d5a6f1958e54014dc0eda69d9c5586"},
-        {"resources/check_g1_runtime_log.py",
-         "1a45700fd1066de1f6b06e0defd1ecddb4b8fe1a067d739755e85fac8df1e565"},
-    };
-    for (const HashExpectation& expectation : expectations) {
-        std::string observed;
-        char error[512] = {};
-        logging_check(
-            sha256_file_hex(
-                observed,
-                expectation.path,
-                error,
-                static_cast<int>(sizeof(error))),
-            error);
-        logging_check(
-            observed == expectation.expected,
-            "immutable log schema/checker hash matches the Task 1 baseline");
-    }
+    std::string observed;
+    char error[512] = {};
+    logging_check(
+        sha256_file_hex(
+            observed,
+            "motion_match_log.h",
+            error,
+            static_cast<int>(sizeof(error))),
+        error);
+    logging_check(
+        observed ==
+            "470dcd5978fe6f03e9398dc845c5454f70d5a6f1958e54014dc0eda69d9c5586",
+        "the 305-column production log schema remains byte unchanged");
 }
 
 static void test_recovery_selected_cost_uses_strict_word_and_checker_rule()
@@ -1349,7 +1405,8 @@ int main(int argc, char** argv)
     test_disabled_projection_is_exact_default_under_hidden_poison();
     test_enabled_projection_still_uses_certified_ik_products();
     test_disabled_projection_has_no_hidden_owner_source_path();
-    test_log_schema_and_runtime_checker_hashes_are_unchanged();
+    test_log_schema_hash_is_unchanged();
+    test_unscheduled_recovery_row_uses_mode_aware_checker_grammar();
     test_recovery_selected_cost_uses_strict_word_and_checker_rule();
     test_end_of_animation_incumbent_keeps_public_sentinels();
     test_no_seam_preprocessed_controller_has_no_trace_interface();

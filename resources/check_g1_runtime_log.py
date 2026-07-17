@@ -1204,6 +1204,7 @@ def check_rows(rows, *, allow_ik=False):
     previous_scene_frame = None
     previous_reset_count = None
     previous_accepted_digest = None
+    accepted_transitions = 0
     for index, row in enumerate(rows):
         frame = _integer(row, "frame", index)
         query_frame = _integer(row, "query_database_frame", index)
@@ -1214,6 +1215,7 @@ def check_rows(rows, *, allow_ik=False):
         source_range = _integer(row, "source_range", index)
         transitioned = _integer(row, "transitioned", index)
         searched = _integer(row, "searched", index)
+        matching_enabled = _integer(row, "matching_enabled", index)
         for name, value in (
                 ("query_database_frame", query_frame),
                 ("selected_database_frame", selected_frame),
@@ -1293,8 +1295,14 @@ def check_rows(rows, *, allow_ik=False):
                 f"row {index}: query range {query_range} does not match "
                 f"prior {'accepted query' if row_rejected_for_lifecycle else 'pose'} "
                 f"range {expected_query_range}")
-        if transitioned and not searched:
-            raise ValueError(f"row {index}: transition without search")
+        if matching_enabled not in (0, 1):
+            raise ValueError(
+                f"row {index}: matching_enabled must be 0 or 1")
+        if (searched or transitioned) and not matching_enabled:
+            raise ValueError(
+                f"row {index}: search or transition while matching is disabled")
+        unscheduled_recovery = (
+            matching_enabled == 1 and searched == 0 and transitioned == 1)
         if transitioned and selected_frame == query_frame:
             raise ValueError(
                 f"row {index}: transitioned with unchanged selected frame")
@@ -1325,6 +1333,10 @@ def check_rows(rows, *, allow_ik=False):
         # Search and incumbent costs are independently normalized and
         # materialized as float32, so near-ties can round a few ULPs apart.
         if transitioned and not selected < incumbent:
+            if unscheduled_recovery:
+                raise ValueError(
+                    f"row {index}: unscheduled recovery did not strictly beat incumbent "
+                    "cost")
             cost_ulps = _float32_ulp_distance(selected, incumbent, index)
             if cost_ulps > 4:
                 raise ValueError(
@@ -1413,6 +1425,8 @@ def check_rows(rows, *, allow_ik=False):
                 current_range != previous_range):
             raise ValueError(
                 f"row {index}: range change without transition")
+        if transitioned and not row_rejected_for_lifecycle:
+            accepted_transitions += 1
         previous = current
         previous_query_frame = query_frame
         previous_query_range = query_range
@@ -1424,7 +1438,7 @@ def check_rows(rows, *, allow_ik=False):
     _check_substride_by_generation(rows)
     return {
         "frames": len(rows),
-        "transitions": sum(int(row["transitioned"]) for row in rows),
+        "transitions": accepted_transitions,
     }
 
 

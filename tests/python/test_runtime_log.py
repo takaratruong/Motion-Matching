@@ -2349,6 +2349,16 @@ class RuntimeLogTests(unittest.TestCase):
     def test_rejected_transition_freezes_accepted_query_cursor(self):
         rows = transition_rejection_rows()
         self.assertEqual(check_rows(rows, allow_ik=True)["frames"], 3)
+        self.assertEqual(
+            check_rows(rows, allow_ik=True)["transitions"], 1)
+
+        unscheduled = [dict(item) for item in rows]
+        for item in unscheduled[1:]:
+            item["matching_enabled"] = "1"
+            item["searched"] = "0"
+        self.assertEqual(
+            check_rows(unscheduled, allow_ik=True),
+            {"frames": 3, "transitions": 1})
 
         for name, value, diagnostic in (
                 ("query_database_frame", "101", "accepted query.*frame"),
@@ -3316,6 +3326,31 @@ class RuntimeLogTests(unittest.TestCase):
         )])
         self.assertEqual(summary["transitions"], 1)
 
+        unscheduled = check_rows([row(
+            0, 21, matching_enabled=1, searched=0, transitioned=1,
+            query_database_frame=10, query_range=0,
+            selected_database_frame=20, source_range=1, range=1,
+            incumbent_cost=2.0, selected_cost=1.0,
+        )])
+        self.assertEqual(unscheduled["transitions"], 1)
+
+        for searched, transitioned in ((1, 0), (0, 1), (1, 1)):
+            values = row(
+                0, 21, matching_enabled=0,
+                searched=searched, transitioned=transitioned,
+                query_database_frame=10,
+                selected_database_frame=(20 if transitioned else 10),
+                source_range=(1 if transitioned else 0),
+                range=(1 if transitioned else 0),
+                incumbent_cost=2.0,
+                selected_cost=(1.0 if transitioned else 2.0),
+            )
+            with self.subTest(
+                    searched=searched, transitioned=transitioned):
+                with self.assertRaisesRegex(
+                        ValueError, "matching is disabled"):
+                    check_rows([values])
+
     def test_rejects_range_change_without_transition(self):
         rows = [
             row(0, 10, range=0, source_range=0),
@@ -3351,6 +3386,22 @@ class RuntimeLogTests(unittest.TestCase):
         )]
         with self.assertRaisesRegex(ValueError, "beat incumbent"):
             check_rows(rows)
+
+        for selected in (
+                1.0,
+                float32_offset(1.0, 1),
+                float32_offset(1.0, 4)):
+            values = row(
+                0, 21, matching_enabled=1, searched=0, transitioned=1,
+                query_database_frame=10, query_range=0,
+                selected_database_frame=20, source_range=1, range=1,
+                incumbent_cost=1.0, selected_cost=selected,
+            )
+            with self.subTest(unscheduled_selected=selected):
+                with self.assertRaisesRegex(
+                        ValueError,
+                        "unscheduled recovery did not strictly beat incumbent"):
+                    check_rows([values])
 
     def test_accepts_transition_cost_within_four_ulps_of_incumbent(self):
         summary = check_rows([row(
