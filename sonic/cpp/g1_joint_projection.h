@@ -101,6 +101,17 @@ static inline bool sonic_projection_diagnostic_error(
     return false;
 }
 
+static inline sonic_joint_projection_failure
+sonic_projection_classify_position(
+    float position, float lower, float upper)
+{
+    if (!std::isfinite(position)) return SonicJointProjectionInput;
+    if (position < lower || position > upper) {
+        return SonicJointProjectionLimit;
+    }
+    return SonicJointProjectionValid;
+}
+
 static inline bool sonic_projection_vec3_finite(const vec3 value)
 {
     return std::isfinite(value.x) && std::isfinite(value.y) &&
@@ -376,15 +387,19 @@ static inline bool sonic_project_joint_state(
 
         const float position =
             entry.sign * signed_twist + entry.zero_offset;
-        if (!std::isfinite(position) || position < entry.lower ||
-            position > entry.upper) {
+        const sonic_joint_projection_failure position_failure =
+            sonic_projection_classify_position(
+                position, entry.lower, entry.upper);
+        if (position_failure != SonicJointProjectionValid) {
+            const bool limit_failure =
+                position_failure == SonicJointProjectionLimit;
             return sonic_projection_diagnostic_error(
                 diagnostic,
-                SonicJointProjectionLimit,
+                position_failure,
                 row,
-                position,
-                entry.lower,
-                entry.upper,
+                limit_failure ? position : 0.0f,
+                limit_failure ? entry.lower : 0.0f,
+                limit_failure ? entry.upper : 0.0f,
                 error,
                 error_capacity,
                 "joint %s position %.9g is outside range [%.9g, %.9g]",

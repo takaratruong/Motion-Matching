@@ -369,6 +369,26 @@ static void test_structured_limit_failures_report_both_directions()
     }
 }
 
+static void test_position_failure_classification_keeps_nonfinite_fatal()
+{
+    const float lower = -0.5f;
+    const float upper = 0.5f;
+    CHECK(sonic_projection_classify_position(
+              std::numeric_limits<float>::quiet_NaN(), lower, upper) ==
+          SonicJointProjectionInput);
+    CHECK(sonic_projection_classify_position(
+              std::numeric_limits<float>::infinity(), lower, upper) ==
+          SonicJointProjectionInput);
+    CHECK(sonic_projection_classify_position(-0.5001f, lower, upper) ==
+          SonicJointProjectionLimit);
+    CHECK(sonic_projection_classify_position(0.5001f, lower, upper) ==
+          SonicJointProjectionLimit);
+    CHECK(sonic_projection_classify_position(lower, lower, upper) ==
+          SonicJointProjectionValid);
+    CHECK(sonic_projection_classify_position(upper, lower, upper) ==
+          SonicJointProjectionValid);
+}
+
 static void test_structured_success_publishes_all_outputs_atomically()
 {
     ProjectionFixture fixture;
@@ -617,6 +637,7 @@ int main()
     test_structured_shape_contract_input_and_singularity_failures();
     test_structured_residual_and_velocity_failures();
     test_structured_limit_failures_report_both_directions();
+    test_position_failure_classification_keeps_nonfinite_fatal();
     test_structured_success_publishes_all_outputs_atomically();
     test_signed_angles_on_all_axes_and_pelvis_copy();
     test_antipodal_local_quaternions_are_equivalent();
