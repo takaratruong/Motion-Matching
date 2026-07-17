@@ -2635,6 +2635,7 @@ def _execute_known_good_scoring_epoch(
             simulator,
             label=f"{mode}-input-preparation",
             evidence=wait_maintenance,
+            cancellation=bootstrap_cancellation,
         )
         if mode == "stream":
             assert preload is not None

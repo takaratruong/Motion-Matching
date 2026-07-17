@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 from types import MappingProxyType, SimpleNamespace
 import unittest
@@ -960,6 +961,69 @@ class ScoredEpochTests(TemporaryCase):
 
         def close(self) -> None:
             self.closed = True
+
+    def test_blocked_file_and_stream_preparation_cancel_and_cleanup_promptly(self) -> None:
+        original_drive = cli_module._drive_simulator_until
+
+        def bounded_drive(operation, simulator, **kwargs):
+            return original_drive(
+                operation,
+                simulator,
+                maximum_seconds=0.02,
+                cold_start_maximum_seconds=0.02,
+                **kwargs,
+            )
+
+        for mode in ("file", "stream"):
+            with self.subTest(mode=mode):
+                cancellation = threading.Event()
+
+                class BlockingGear(self.Gear):
+                    def prepare_loaded_motion_for_scoring(inner_self) -> None:
+                        inner_self.events.append("prepare-file-blocked")
+                        cancellation.wait(0.3)
+
+                    def enable_stream_for_preload(inner_self):
+                        inner_self.events.append("enable-stream-blocked")
+                        cancellation.wait(0.3)
+                        return MappingProxyType({})
+
+                gear = BlockingGear(self.root, mode)
+                simulator = self.Simulator()
+                publisher = self.Publisher() if mode == "stream" else None
+                started = time.monotonic()
+                with (
+                    patch.object(
+                        cli_module,
+                        "_drive_simulator_until",
+                        side_effect=bounded_drive,
+                    ),
+                    patch.object(
+                        cli_module, "_process_group_exists", return_value=False
+                    ),
+                ):
+                    with self.assertRaisesRegex(ProcessError, "input-preparation"):
+                        cli_module._execute_known_good_scoring_epoch(
+                            mode=mode,
+                            gear=gear,
+                            simulator=simulator,
+                            scene=SimpleNamespace(
+                                gear_scene_xml=self.root / "scene.xml"
+                            ),
+                            initial_qpos=np.zeros(36),
+                            canonical=canonical(),
+                            body_position=np.zeros((441, 3)),
+                            bundle=SimpleNamespace(path=self.root),
+                            bootstrap_cancellation=cancellation,
+                            publisher=publisher,
+                        )
+                elapsed = time.monotonic() - started
+                self.assertTrue(cancellation.is_set())
+                self.assertLess(elapsed, 0.2)
+                self.assertTrue(gear.closed)
+                self.assertTrue(simulator.closed)
+                if publisher is not None:
+                    self.assertTrue(publisher.closed)
 
     def test_file_and_stream_share_one_cold_wait_to_control_wiring(self) -> None:
         expected = canonical()
