@@ -280,6 +280,7 @@ ControllerPickAssist::ControllerPickAssist(PickAssistConfig config)
 }
 
 void ControllerPickAssist::cancel() {
+    frozen_slot_attempt_ = false;
     if (diagnostics_.state == PickAssistState::Submitted) return;
     start_ = {};
     frozen_slot_ = {};
@@ -294,6 +295,7 @@ void ControllerPickAssist::cancel() {
 bool ControllerPickAssist::begin(const PickAssistStart& start) {
     if (active()) return false;
 
+    frozen_slot_attempt_ = false;
     previous_observed_root_ = {};
     start_ = start;
     preview_ticks_ = 0U;
@@ -379,6 +381,7 @@ bool ControllerPickAssist::begin(
 
     start_ = {};
     frozen_slot_ = {};
+    frozen_slot_attempt_ = false;
     previous_observed_root_ = {};
     entry_point_ = {};
     preview_ticks_ = 0U;
@@ -390,6 +393,7 @@ bool ControllerPickAssist::begin(
     const auto fail_begin = [this](PickAssistReason reason) {
         start_ = {};
         frozen_slot_ = {};
+        frozen_slot_attempt_ = false;
         previous_observed_root_ = {};
         entry_point_ = {};
         preview_ticks_ = 0U;
@@ -453,13 +457,19 @@ bool ControllerPickAssist::begin(
     diagnostics_.object_bounds_center_distance_m =
         frozen_slot_.object_bounds_center_distance_m;
     diagnostics_.state = PickAssistState::SlotApproach;
+    frozen_slot_attempt_ = true;
     return true;
 }
 
 PickAssistOutput ControllerPickAssist::observe(
     const PickAssistObservation& observation) {
     PickAssistOutput output{};
-    if (diagnostics_.state == PickAssistState::SlotApproach) {
+    const bool frozen_slot_phase = frozen_slot_attempt_ &&
+        (diagnostics_.state == PickAssistState::SlotApproach ||
+            diagnostics_.state == PickAssistState::Settling);
+    const bool frozen_slot_settling = frozen_slot_attempt_ &&
+        diagnostics_.state == PickAssistState::Settling;
+    if (frozen_slot_phase) {
         if (observation.runtime_state != RuntimeState::Locomotion) {
             return fail_output(
                 diagnostics_, PickAssistReason::RuntimeChanged);
@@ -543,6 +553,7 @@ PickAssistOutput ControllerPickAssist::observe(
             return fail_output(
                 diagnostics_, PickAssistReason::OutsideTravelEnvelope);
         }
+        if (frozen_slot_settling) return braking_output();
         if (diagnostics_.root_error_m <=
                 config_.arrival.latch_position_error_m &&
             diagnostics_.speed_mps <=

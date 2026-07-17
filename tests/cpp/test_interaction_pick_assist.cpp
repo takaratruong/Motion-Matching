@@ -1328,8 +1328,8 @@ void test_frozen_slot_settling_keeps_stationary_braking() {
     require(
         settled.state == interaction::PickAssistState::Settling &&
             settled.reason == interaction::PickAssistReason::None &&
-            settled.settle_ticks == 1U,
-        "valid frozen Settling next tick changed state or did not settle");
+            settled.settle_ticks == 0U,
+        "valid frozen Settling next tick changed state or advanced progression");
     require(
         output.override_steering && output.force_strafe &&
             output.stationary_constraint && is_zero(output.left_stick) &&
