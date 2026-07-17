@@ -417,6 +417,9 @@ bool ControllerPickAssist::begin(
 PickAssistOutput ControllerPickAssist::observe(
     const PickAssistObservation& observation) {
     PickAssistOutput output{};
+    if (diagnostics_.state == PickAssistState::SlotApproach) {
+        return output;
+    }
     if (active()) {
         if (observation.runtime_state != RuntimeState::Locomotion) {
             diagnostics_.state = PickAssistState::Failed;

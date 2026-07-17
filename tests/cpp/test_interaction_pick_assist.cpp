@@ -254,6 +254,34 @@ void test_begin_selects_and_freezes_one_authored_slot() {
         "begin route did not retain selected-slot provenance");
 }
 
+void test_slot_approach_observe_is_inert_before_legacy_preflight() {
+    const interaction::InteractionTarget target = make_frozen_slot_target();
+    const interaction::PickAssistStart start = make_frozen_slot_start(target);
+    interaction::ControllerPickAssist assist;
+
+    require(assist.begin(start, &target), "SlotApproach begin failed");
+    interaction::PickAssistObservation invalid_observation{};
+    invalid_observation.runtime_state = interaction::RuntimeState::Preflight;
+
+    const interaction::PickAssistOutput output =
+        assist.observe(invalid_observation);
+    require(
+        !output.override_steering && is_zero(output.left_stick) &&
+            is_zero(output.right_stick) && !output.force_strafe &&
+            !output.stationary_constraint && !output.needs_preview &&
+            !output.submit_interact,
+        "SlotApproach processed an invalid legacy observation");
+    require(
+        assist.diagnostics().state ==
+                interaction::PickAssistState::SlotApproach &&
+            assist.diagnostics().reason == interaction::PickAssistReason::None,
+        "invalid legacy observation changed SlotApproach diagnostics");
+    require(assist.active() && assist.owns_manual_interact(),
+        "inert SlotApproach observation released ownership");
+    require(!assist.take_submission(1U).has_value(),
+        "inert SlotApproach observation produced a submission");
+}
+
 void require_frozen_slot_begin_failure(
     interaction::InteractionTarget target,
     interaction::PickAssistStart start,
@@ -1524,6 +1552,7 @@ int main() {
     try {
         test_idle_does_not_override_input();
         test_begin_selects_and_freezes_one_authored_slot();
+        test_slot_approach_observe_is_inert_before_legacy_preflight();
         test_begin_maps_every_aggregate_no_winner_reason();
         test_slot_reason_mapping_is_exhaustive_and_same_named();
         test_failed_begin_can_immediately_begin_a_valid_attempt();
