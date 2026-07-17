@@ -915,6 +915,327 @@ void test_slot_approach_emits_slow_radius_arrival_steering() {
         "slow-radius SlotApproach changed frozen slot provenance");
 }
 
+void test_slot_approach_latches_inclusive_arrival_boundaries() {
+    const interaction::PickAssistConfig config{};
+    FrozenSlotScenario scenario;
+    interaction::ControllerPickAssist assist(config);
+
+    require(
+        assist.begin(scenario.start, &scenario.target),
+        "inclusive arrival-latch fixture begin failed");
+    require(
+        assist.diagnostics().state ==
+                interaction::PickAssistState::SlotApproach &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::None &&
+            assist.diagnostics().slot_selection.selected_index.has_value(),
+        "inclusive arrival-latch fixture did not freeze a slot");
+    const interaction::MappedPickSlot frozen_slot =
+        assist.diagnostics().slot_selection.ordered[
+            *assist.diagnostics().slot_selection.selected_index];
+
+    constexpr float position_error_m = 0.03F;
+    constexpr float simulation_speed_mps = 0.05F;
+    constexpr float yaw_error_radians = 20.0F * PIf / 180.0F;
+    scenario.observation.displayed_root = frozen_slot.root_world;
+    scenario.observation.displayed_root.position.x =
+        frozen_slot.root_world.position.x - position_error_m;
+    scenario.observation.displayed_root.rotation = quat_from_angle_axis(
+        yaw_error_radians, vec3(0.0F, 1.0F, 0.0F));
+    scenario.observation.simulation_velocity =
+        vec3(simulation_speed_mps, 0.0F, 0.0F);
+
+    const auto planar_distance = [](vec3 left, vec3 right) {
+        return static_cast<float>(std::hypot(
+            static_cast<double>(left.x) - static_cast<double>(right.x),
+            static_cast<double>(left.z) - static_cast<double>(right.z)));
+    };
+    const auto planar_speed = [](vec3 velocity) {
+        return static_cast<float>(std::hypot(
+            static_cast<double>(velocity.x),
+            static_cast<double>(velocity.z)));
+    };
+    const auto planar_yaw = [](quat rotation) {
+        const vec3 forward = quat_mul_vec3(
+            rotation, vec3(0.0F, 0.0F, 1.0F));
+        return std::atan2(forward.x, forward.z);
+    };
+    const auto wrapped_yaw_error = [&](quat left, quat right) {
+        const float difference = planar_yaw(left) - planar_yaw(right);
+        return std::abs(std::atan2(
+            std::sin(difference), std::cos(difference)));
+    };
+    const float derived_root_error_m = planar_distance(
+        scenario.observation.displayed_root.position,
+        frozen_slot.root_world.position);
+    const float derived_simulation_speed_mps =
+        planar_speed(scenario.observation.simulation_velocity);
+    const float derived_yaw_error_radians = wrapped_yaw_error(
+        scenario.observation.displayed_root.rotation,
+        frozen_slot.root_world.rotation);
+    const float legacy_object_origin_standoff_m = planar_distance(
+        scenario.observation.displayed_root.position,
+        scenario.target.object_world.position);
+    require(
+        same_float_bits_exact(
+            derived_root_error_m,
+            config.arrival.latch_position_error_m) &&
+            same_float_bits_exact(
+                derived_simulation_speed_mps,
+                config.arrival.latch_simulation_speed_mps) &&
+            same_float_bits_exact(
+                derived_yaw_error_radians,
+                config.arrival.maximum_yaw_error_radians),
+        "inclusive arrival fixture metrics were not exactly on all three boundaries");
+    require(
+        legacy_object_origin_standoff_m >
+            config.arrival.maximum_standoff_m,
+        "inclusive arrival fixture did not exclude the legacy standoff gate");
+
+    const interaction::PickAssistOutput output =
+        assist.observe(scenario.observation);
+    require(
+        assist.diagnostics().state == interaction::PickAssistState::Settling &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::None &&
+            assist.diagnostics().settle_ticks == 0U,
+        "inclusive frozen-slot arrival boundaries did not latch Settling");
+    require(
+        output.override_steering && output.force_strafe &&
+            output.stationary_constraint && is_zero(output.left_stick) &&
+            is_zero(output.right_stick),
+        "inclusive arrival latch did not emit zero-stick stationary braking");
+    require(
+        !output.needs_preview && !output.submit_interact &&
+            !assist.take_submission(74U).has_value(),
+        "inclusive arrival latch previewed or submitted on the latch tick");
+}
+
+void test_slot_approach_rejects_adjacent_arrival_overshoots() {
+    const interaction::PickAssistConfig config{};
+    const float infinity = std::numeric_limits<float>::infinity();
+    const auto planar_distance = [](vec3 left, vec3 right) {
+        return static_cast<float>(std::hypot(
+            static_cast<double>(left.x) - static_cast<double>(right.x),
+            static_cast<double>(left.z) - static_cast<double>(right.z)));
+    };
+    const auto planar_speed = [](vec3 velocity) {
+        return static_cast<float>(std::hypot(
+            static_cast<double>(velocity.x),
+            static_cast<double>(velocity.z)));
+    };
+    const auto planar_yaw = [](quat rotation) {
+        const vec3 forward = quat_mul_vec3(
+            rotation, vec3(0.0F, 0.0F, 1.0F));
+        return std::atan2(forward.x, forward.z);
+    };
+    const auto wrapped_yaw_error = [&](quat left, quat right) {
+        const float difference = planar_yaw(left) - planar_yaw(right);
+        return std::abs(std::atan2(
+            std::sin(difference), std::cos(difference)));
+    };
+
+    {
+        FrozenSlotScenario scenario;
+        interaction::ControllerPickAssist assist(config);
+        require(
+            assist.begin(scenario.start, &scenario.target) &&
+                assist.diagnostics().slot_selection.selected_index.has_value(),
+            "adjacent-position arrival fixture begin failed");
+        const interaction::MappedPickSlot frozen_slot =
+            assist.diagnostics().slot_selection.ordered[
+                *assist.diagnostics().slot_selection.selected_index];
+        const float position_error_above = std::nextafter(
+            config.arrival.latch_position_error_m, infinity);
+        scenario.observation.displayed_root = frozen_slot.root_world;
+        scenario.observation.displayed_root.position.x =
+            frozen_slot.root_world.position.x - position_error_above;
+        scenario.observation.displayed_root.rotation = quat_from_angle_axis(
+            config.arrival.maximum_yaw_error_radians,
+            vec3(0.0F, 1.0F, 0.0F));
+        scenario.observation.simulation_velocity = vec3(
+            config.arrival.latch_simulation_speed_mps, 0.0F, 0.0F);
+
+        const float derived_root_error_m = planar_distance(
+            scenario.observation.displayed_root.position,
+            frozen_slot.root_world.position);
+        const float derived_simulation_speed_mps =
+            planar_speed(scenario.observation.simulation_velocity);
+        const float derived_yaw_error_radians = wrapped_yaw_error(
+            scenario.observation.displayed_root.rotation,
+            frozen_slot.root_world.rotation);
+        const float legacy_object_origin_standoff_m = planar_distance(
+            scenario.observation.displayed_root.position,
+            scenario.target.object_world.position);
+        require(
+            same_float_bits_exact(
+                derived_root_error_m, position_error_above) &&
+                derived_root_error_m >
+                    config.arrival.latch_position_error_m &&
+                same_float_bits_exact(
+                    derived_simulation_speed_mps,
+                    config.arrival.latch_simulation_speed_mps) &&
+                same_float_bits_exact(
+                    derived_yaw_error_radians,
+                    config.arrival.maximum_yaw_error_radians),
+            "adjacent-position fixture changed more than its position metric");
+        require(
+            legacy_object_origin_standoff_m >
+                config.arrival.maximum_standoff_m,
+            "adjacent-position fixture did not exclude the legacy standoff gate");
+
+        const interaction::PickAssistOutput output =
+            assist.observe(scenario.observation);
+        require(
+            assist.diagnostics().state ==
+                    interaction::PickAssistState::SlotApproach &&
+                assist.diagnostics().reason ==
+                    interaction::PickAssistReason::None &&
+                assist.diagnostics().settle_ticks == 0U,
+            "first representable position overshoot latched arrival");
+        require(
+            output.override_steering && !output.stationary_constraint &&
+                !output.needs_preview && !output.submit_interact &&
+                !assist.take_submission(75U).has_value(),
+            "first representable position overshoot latched braking or submitted");
+    }
+
+    {
+        FrozenSlotScenario scenario;
+        interaction::ControllerPickAssist assist(config);
+        require(
+            assist.begin(scenario.start, &scenario.target) &&
+                assist.diagnostics().slot_selection.selected_index.has_value(),
+            "adjacent-speed arrival fixture begin failed");
+        const interaction::MappedPickSlot frozen_slot =
+            assist.diagnostics().slot_selection.ordered[
+                *assist.diagnostics().slot_selection.selected_index];
+        const float simulation_speed_above = std::nextafter(
+            config.arrival.latch_simulation_speed_mps, infinity);
+        scenario.observation.displayed_root = frozen_slot.root_world;
+        scenario.observation.displayed_root.position.x =
+            frozen_slot.root_world.position.x -
+            config.arrival.latch_position_error_m;
+        scenario.observation.displayed_root.rotation = quat_from_angle_axis(
+            config.arrival.maximum_yaw_error_radians,
+            vec3(0.0F, 1.0F, 0.0F));
+        scenario.observation.simulation_velocity =
+            vec3(simulation_speed_above, 0.0F, 0.0F);
+
+        const float derived_root_error_m = planar_distance(
+            scenario.observation.displayed_root.position,
+            frozen_slot.root_world.position);
+        const float derived_simulation_speed_mps =
+            planar_speed(scenario.observation.simulation_velocity);
+        const float derived_yaw_error_radians = wrapped_yaw_error(
+            scenario.observation.displayed_root.rotation,
+            frozen_slot.root_world.rotation);
+        const float legacy_object_origin_standoff_m = planar_distance(
+            scenario.observation.displayed_root.position,
+            scenario.target.object_world.position);
+        require(
+            same_float_bits_exact(
+                derived_root_error_m,
+                config.arrival.latch_position_error_m) &&
+                same_float_bits_exact(
+                    derived_simulation_speed_mps,
+                    simulation_speed_above) &&
+                derived_simulation_speed_mps >
+                    config.arrival.latch_simulation_speed_mps &&
+                same_float_bits_exact(
+                    derived_yaw_error_radians,
+                    config.arrival.maximum_yaw_error_radians),
+            "adjacent-speed fixture changed more than its simulation-speed metric");
+        require(
+            legacy_object_origin_standoff_m >
+                config.arrival.maximum_standoff_m,
+            "adjacent-speed fixture did not exclude the legacy standoff gate");
+
+        const interaction::PickAssistOutput output =
+            assist.observe(scenario.observation);
+        require(
+            assist.diagnostics().state ==
+                    interaction::PickAssistState::SlotApproach &&
+                assist.diagnostics().reason ==
+                    interaction::PickAssistReason::None &&
+                assist.diagnostics().settle_ticks == 0U,
+            "first representable simulation-speed overshoot latched arrival");
+        require(
+            output.override_steering && !output.stationary_constraint &&
+                !output.needs_preview && !output.submit_interact &&
+                !assist.take_submission(76U).has_value(),
+            "first representable simulation-speed overshoot latched braking or submitted");
+    }
+
+    {
+        FrozenSlotScenario scenario;
+        interaction::ControllerPickAssist assist(config);
+        require(
+            assist.begin(scenario.start, &scenario.target) &&
+                assist.diagnostics().slot_selection.selected_index.has_value(),
+            "adjacent-yaw arrival fixture begin failed");
+        const interaction::MappedPickSlot frozen_slot =
+            assist.diagnostics().slot_selection.ordered[
+                *assist.diagnostics().slot_selection.selected_index];
+        const float yaw_angle_above = std::nextafter(
+            config.arrival.maximum_yaw_error_radians, infinity);
+        scenario.observation.displayed_root = frozen_slot.root_world;
+        scenario.observation.displayed_root.position.x =
+            frozen_slot.root_world.position.x -
+            config.arrival.latch_position_error_m;
+        scenario.observation.displayed_root.rotation = quat_from_angle_axis(
+            yaw_angle_above, vec3(0.0F, 1.0F, 0.0F));
+        scenario.observation.simulation_velocity = vec3(
+            config.arrival.latch_simulation_speed_mps, 0.0F, 0.0F);
+
+        const float derived_root_error_m = planar_distance(
+            scenario.observation.displayed_root.position,
+            frozen_slot.root_world.position);
+        const float derived_simulation_speed_mps =
+            planar_speed(scenario.observation.simulation_velocity);
+        const float derived_yaw_error_radians = wrapped_yaw_error(
+            scenario.observation.displayed_root.rotation,
+            frozen_slot.root_world.rotation);
+        const float first_derived_yaw_above = std::nextafter(
+            config.arrival.maximum_yaw_error_radians, infinity);
+        const float legacy_object_origin_standoff_m = planar_distance(
+            scenario.observation.displayed_root.position,
+            scenario.target.object_world.position);
+        require(
+            same_float_bits_exact(
+                derived_root_error_m,
+                config.arrival.latch_position_error_m) &&
+                same_float_bits_exact(
+                    derived_simulation_speed_mps,
+                    config.arrival.latch_simulation_speed_mps) &&
+                same_float_bits_exact(
+                    derived_yaw_error_radians,
+                    first_derived_yaw_above) &&
+                derived_yaw_error_radians >
+                    config.arrival.maximum_yaw_error_radians,
+            "one-ULP yaw quaternion did not produce the first derived yaw above the bound");
+        require(
+            legacy_object_origin_standoff_m >
+                config.arrival.maximum_standoff_m,
+            "adjacent-yaw fixture did not exclude the legacy standoff gate");
+
+        const interaction::PickAssistOutput output =
+            assist.observe(scenario.observation);
+        require(
+            assist.diagnostics().state ==
+                    interaction::PickAssistState::SlotApproach &&
+                assist.diagnostics().reason ==
+                    interaction::PickAssistReason::None &&
+                assist.diagnostics().settle_ticks == 0U,
+            "first representable derived-yaw overshoot latched arrival");
+        require(
+            output.override_steering && !output.stationary_constraint &&
+                !output.needs_preview && !output.submit_interact &&
+                !assist.take_submission(77U).has_value(),
+            "first representable derived-yaw overshoot latched braking or submitted");
+    }
+}
+
 void test_slot_approach_accumulates_inclusive_travel_and_rejects_overshoot() {
     const auto configure_travel_scenario = [](FrozenSlotScenario& scenario) {
         scenario.target.object_world.position.x = 0.80F;
@@ -2679,6 +3000,8 @@ int main() {
         test_slot_approach_slot_identity_failures_precede_snapshot_mismatch();
         test_slot_approach_unchanged_identity_still_steers();
         test_slot_approach_emits_slow_radius_arrival_steering();
+        test_slot_approach_latches_inclusive_arrival_boundaries();
+        test_slot_approach_rejects_adjacent_arrival_overshoots();
         test_slot_approach_accumulates_inclusive_travel_and_rejects_overshoot();
         test_slot_approach_revalidates_frozen_route_against_table();
         test_slot_approach_revalidates_frozen_route_against_obstacles();
