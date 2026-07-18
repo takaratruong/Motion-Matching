@@ -8,6 +8,7 @@ import re
 import struct
 import subprocess
 import unittest
+from unittest import mock
 
 
 _REPOSITORY = Path(__file__).resolve().parents[2]
@@ -15,6 +16,12 @@ _TASK4_REPORT = (
     _REPOSITORY / "build" / "smart-pickup" / "beer10-slot-candidates.json"
 )
 _FLAT_DATABASE = _REPOSITORY / "resources" / "database.bin"
+
+_GATE_ENVIRONMENT_NAMES = (
+    "SMART_PICKUP_FULL_PACK",
+    "SMART_PICKUP_PREVIEW_PROBE",
+    "SMART_PICKUP_SCENE_PROBE",
+)
 
 _EXPECTED_DATABASE_SHA256 = (
     "4d3b65f73e9a207988aaaebded36b988f811ec068988c7e829732701d9d2da1b"
@@ -825,6 +832,28 @@ def _environment_path(name):
     return path
 
 
+def _gate_environment_paths_or_skip():
+    configured = {
+        name: os.environ.get(name) for name in _GATE_ENVIRONMENT_NAMES
+    }
+    if all(value is None for value in configured.values()):
+        raise unittest.SkipTest(
+            "smart-pickup full-pack gate is not configured; set all of "
+            + ", ".join(_GATE_ENVIRONMENT_NAMES)
+        )
+    missing = [
+        name
+        for name, value in configured.items()
+        if type(value) is not str or not value.strip()
+    ]
+    _require(
+        not missing,
+        "smart-pickup full-pack gate is partially configured; "
+        "missing or empty: " + ", ".join(missing),
+    )
+    return tuple(_environment_path(name) for name in _GATE_ENVIRONMENT_NAMES)
+
+
 def _preflight_full_pack(full_pack):
     manifest = _load_json(full_pack / "manifest.json", "full-pack manifest")
     validation = _load_json(
@@ -1458,10 +1487,45 @@ class SmartPickupContractTests(unittest.TestCase):
 
 
 class SmartPickupFullPackGateTests(unittest.TestCase):
+    def _assert_gate_environment_contract(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(
+                unittest.SkipTest,
+                "smart-pickup full-pack gate is not configured",
+            ):
+                _gate_environment_paths_or_skip()
+
+        values = {
+            name: f"configured/{index}"
+            for index, name in enumerate(_GATE_ENVIRONMENT_NAMES)
+        }
+        for mask in range(1, (1 << len(_GATE_ENVIRONMENT_NAMES)) - 1):
+            configured = {
+                name: values[name]
+                for index, name in enumerate(_GATE_ENVIRONMENT_NAMES)
+                if mask & (1 << index)
+            }
+            missing = [
+                name for name in _GATE_ENVIRONMENT_NAMES if name not in configured
+            ]
+            with self.subTest(configured=sorted(configured)):
+                with mock.patch.dict(os.environ, configured, clear=True):
+                    with self.assertRaises(AssertionError) as caught:
+                        _gate_environment_paths_or_skip()
+                message = str(caught.exception)
+                for name in missing:
+                    self.assertIn(name, message)
+
+        with mock.patch.dict(os.environ, values, clear=True):
+            paths = _gate_environment_paths_or_skip()
+        self.assertEqual(
+            paths,
+            tuple(_REPOSITORY / values[name] for name in _GATE_ENVIRONMENT_NAMES),
+        )
+
     def test_full_pack_preview_and_compiled_scene_are_identical(self):
-        full_pack = _environment_path("SMART_PICKUP_FULL_PACK")
-        preview_probe = _environment_path("SMART_PICKUP_PREVIEW_PROBE")
-        scene_probe = _environment_path("SMART_PICKUP_SCENE_PROBE")
+        self._assert_gate_environment_contract()
+        full_pack, preview_probe, scene_probe = _gate_environment_paths_or_skip()
 
         manifest, report = _preflight_full_pack(full_pack)
 
