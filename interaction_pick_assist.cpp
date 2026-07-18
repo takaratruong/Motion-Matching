@@ -205,6 +205,35 @@ void capture_final_preview_diagnostics(
     diagnostics.final_preview = captured;
 }
 
+void capture_frozen_final_preview_diagnostics(
+    PickAssistDiagnostics& diagnostics,
+    PickEntryRoot frozen_preview_root,
+    const PickAssistObservation& observation) {
+    if (diagnostics.state != PickAssistState::FinalPreview ||
+        !observation.preview.has_value()) {
+        return;
+    }
+
+    const PickEntryPreview& preview = *observation.preview;
+    PickAssistFinalPreviewDiagnostics captured{};
+    captured.available = true;
+    captured.all_preview_roots_finite =
+        is_finite(preview.prospective_root);
+    captured.fingerprint_equal =
+        observation.preview_snapshot_fingerprint ==
+        observation.snapshot_fingerprint;
+    captured.path_feasible = preview.path_feasible;
+    captured.path_reason = preview.path_reason;
+    captured.match_ready = preview.match_ready;
+    captured.match_reason = preview.match_reason;
+    captured.prospective_root_equal = same_entry_root(
+        preview.prospective_root, frozen_preview_root);
+    captured.feasible_entry_frame = preview.feasible_entry_frame;
+    captured.contact_frame = preview.contact_frame;
+    captured.total_cost = preview.total_cost;
+    diagnostics.final_preview = captured;
+}
+
 PickAssistOutput fail_output(
     PickAssistDiagnostics& diagnostics,
     PickAssistReason reason) {
@@ -601,7 +630,38 @@ PickAssistOutput ControllerPickAssist::observe(
             return braking_output();
         }
         if (frozen_slot_final_preview) {
-            return braking_output(true, frozen_preview_root_);
+            if (!observation.preview.has_value()) {
+                return braking_output(true, frozen_preview_root_);
+            }
+            capture_frozen_final_preview_diagnostics(
+                diagnostics_, *frozen_preview_root_, observation);
+            const PickAssistFinalPreviewDiagnostics& preview =
+                diagnostics_.final_preview;
+            const bool retryable_poor_match =
+                preview.all_preview_roots_finite &&
+                preview.fingerprint_equal &&
+                preview.prospective_root_equal &&
+                preview.path_feasible &&
+                preview.path_reason == Reason::None &&
+                !preview.match_ready &&
+                preview.match_reason == Reason::PoorMatch;
+            if (retryable_poor_match) {
+                return braking_output(true, frozen_preview_root_);
+            }
+            const bool certified =
+                preview.all_preview_roots_finite &&
+                preview.fingerprint_equal &&
+                preview.prospective_root_equal &&
+                preview.path_feasible && preview.match_ready;
+            if (!certified) {
+                return fail_output(
+                    diagnostics_,
+                    PickAssistReason::FinalPreviewRejected);
+            }
+            diagnostics_.state = PickAssistState::ReadyToSubmit;
+            PickAssistOutput ready = braking_output();
+            ready.submit_interact = true;
+            return ready;
         }
         if (diagnostics_.root_error_m <=
                 config_.arrival.latch_position_error_m &&

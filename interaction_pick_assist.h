@@ -79,6 +79,7 @@ struct PickAssistObservation {
     uint64_t snapshot_fingerprint = 0U;
     uint64_t preview_snapshot_fingerprint = 0U;
     std::optional<std::array<PickEntryPreview, 2>> previews{};
+    std::optional<PickEntryPreview> preview{};
 };
 
 struct PickAssistOutput {
