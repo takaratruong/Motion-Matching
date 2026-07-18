@@ -286,14 +286,9 @@ bool ControllerPickAssist::begin(
         return fail_begin(PickAssistReason::TargetChanged);
     }
 
-    const GraspAffordance* selected_affordance = nullptr;
-    for (const GraspAffordance& affordance :
-         start.target_snapshot.affordances) {
-        if (affordance.id == start.affordance_id) {
-            selected_affordance = &affordance;
-            break;
-        }
-    }
+    const GraspAffordance* selected_affordance =
+        find_unique_affordance(
+            start.target_snapshot, start.affordance_id);
     if (selected_affordance == nullptr) {
         return fail_begin(PickAssistReason::TargetChanged);
     }

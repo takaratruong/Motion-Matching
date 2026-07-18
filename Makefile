@@ -275,10 +275,10 @@ $(CPP_TEST_DIR)/test_interaction_arrival_controller: tests/cpp/test_interaction_
 $(CPP_TEST_DIR)/test_interaction_pick_approach: tests/cpp/test_interaction_pick_approach.cpp interaction_pick_approach.cpp interaction_pick_approach.h interaction_runtime.h interaction_matcher.h interaction_features.h interaction_pose.cpp interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_pick_approach.cpp interaction_pick_approach.cpp interaction_pose.cpp -o $@
 
-$(CPP_TEST_DIR)/test_interaction_pick_assist: tests/cpp/test_interaction_pick_assist.cpp interaction_pick_assist.cpp interaction_pick_assist.h interaction_pick_slots.cpp interaction_pick_slots.h interaction_arrival.cpp interaction_arrival.h interaction_target.cpp interaction_target.h interaction_pose.cpp interaction_pose.h | $(CPP_TEST_DIR)
+$(CPP_TEST_DIR)/test_interaction_pick_assist: tests/cpp/test_interaction_pick_assist.cpp interaction_pick_assist.cpp interaction_pick_assist.h interaction_runtime.h interaction_pick_slots.cpp interaction_pick_slots.h interaction_arrival.cpp interaction_arrival.h interaction_target.cpp interaction_target.h interaction_pose.cpp interaction_pose.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_pick_assist.cpp interaction_pick_assist.cpp interaction_pick_slots.cpp interaction_arrival.cpp interaction_target.cpp interaction_pose.cpp -o $@
 
-$(PICK_ASSIST_RELEASE_FAST_MATH_TEST): tests/cpp/test_interaction_pick_assist.cpp interaction_pick_assist.cpp interaction_pick_assist.h interaction_pick_slots.cpp interaction_pick_slots.h interaction_arrival.cpp interaction_arrival.h interaction_target.cpp interaction_target.h interaction_pose.cpp interaction_pose.h | $(CPP_TEST_DIR)
+$(PICK_ASSIST_RELEASE_FAST_MATH_TEST): tests/cpp/test_interaction_pick_assist.cpp interaction_pick_assist.cpp interaction_pick_assist.h interaction_runtime.h interaction_pick_slots.cpp interaction_pick_slots.h interaction_arrival.cpp interaction_arrival.h interaction_target.cpp interaction_target.h interaction_pose.cpp interaction_pose.h | $(CPP_TEST_DIR)
 	# GCC 13 misdiagnoses libstdc++'s small-range std::sort as out of bounds.
 	$(CXX) $(CPP_TEST_FLAGS) -Wno-array-bounds -O3 -DNDEBUG -ffast-math tests/cpp/test_interaction_pick_assist.cpp interaction_pick_assist.cpp interaction_pick_slots.cpp interaction_arrival.cpp interaction_target.cpp interaction_pose.cpp -o $@
 
