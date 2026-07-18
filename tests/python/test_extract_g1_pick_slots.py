@@ -1,4 +1,5 @@
 import copy
+import json
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -6,10 +7,12 @@ from unittest.mock import patch
 import numpy as np
 
 from resources.extract_g1_pick_slots import (
+    _dedupe_candidates,
     _root_intersects_table,
     _segment_intersects_expanded_box,
     extract_slot_candidates,
     extract_slot_candidates_from_pack,
+    serialize_slot_report,
 )
 from resources.g1_interaction_builder.metadata import GRAIL_DATASET_ID
 from resources.g1_interaction_builder.schema import (
@@ -30,6 +33,8 @@ _HAND_POSITION_LIMIT_M = np.float32(0.12)
 _HAND_ORIENTATION_LIMIT_RADIANS = np.float32(np.deg2rad(25.0))
 _CLEARANCE_RADIUS_M = np.float32(0.04)
 _ROOT_TABLE_EXPANSION_M = np.float32(0.25) - np.float32(0.01)
+_DEDUPE_POSITION_LIMIT_M = np.float32(0.10)
+_DEDUPE_YAW_LIMIT_RADIANS = np.float32(np.deg2rad(10.0))
 _REJECTED_GATE_ORDER = (
     "hand_mismatch",
     "contact_position",
@@ -50,6 +55,50 @@ _SLOT_CANDIDATE_FIELDS = (
     "hand_object_clear",
     "static_path_feasible",
 )
+_SLOT_CANDIDATE_KEYS = {
+    "stable_key",
+    "sequence_id",
+    "object_id",
+    "active_hand",
+    "source_entry_frame",
+    "entry_local_frame",
+    "contact_local_frame",
+    "lift_local_frame",
+    "hold_local_frame",
+    "stop_local_frame",
+    "object_alignment_local_frame",
+    *_SLOT_CANDIDATE_FIELDS,
+}
+_REPORT_KEYS = {
+    "dataset_id",
+    "schema_version",
+    "target",
+    "retained_candidates",
+    "rejected_counts_by_gate",
+    "deduplicated_candidate_count",
+}
+_TARGET_KEYS = {
+    "sequence_id",
+    "object_id",
+    "active_hand",
+    "range_start",
+    "range_stop",
+    "entry_local_frame",
+    "contact_local_frame",
+    "lift_local_frame",
+    "hold_local_frame",
+    "stop_local_frame",
+    "object_alignment_local_frame",
+    "object_alignment_position",
+    "object_alignment_rotation",
+    "table_position",
+    "table_rotation",
+    "table_size",
+    "object_dimensions",
+    "grasp_position_object",
+    "grasp_rotation_object",
+    "approach_direction_object",
+}
 
 _IDENTITY = np.array([1.0, 0.0, 0.0, 0.0], np.float32)
 _CLIP_PHASES = np.array(
@@ -308,7 +357,13 @@ def _set_source_wrist_world(artifact, local_frame, world_position):
     )
 
 
-def _assert_gate_counts(test_case, report, expected_gate=None):
+def _assert_gate_counts(
+    test_case,
+    report,
+    expected_gate=None,
+    *,
+    expected_deduplicated=0,
+):
     counts = report["rejected_counts_by_gate"]
     test_case.assertEqual(list(counts), list(_REJECTED_GATE_ORDER))
     test_case.assertEqual(
@@ -318,7 +373,10 @@ def _assert_gate_counts(test_case, report, expected_gate=None):
             for gate in _REJECTED_GATE_ORDER
         },
     )
-    test_case.assertEqual(report["deduplicated_candidate_count"], 0)
+    test_case.assertEqual(
+        report["deduplicated_candidate_count"],
+        expected_deduplicated,
+    )
 
 
 def _assert_source_rejected(test_case, report, expected_gate):
@@ -348,6 +406,72 @@ def _position_error_fixture(error_m):
     return artifact, manifest
 
 
+def _dedupe_artifact_and_manifest(
+    *,
+    source_root_x=0.0,
+    target_root_x=0.0,
+    source_root_yaw=0.0,
+    target_root_yaw=0.0,
+    source_contact_error_m=0.0,
+):
+    artifact, manifest = _two_clip_artifact_and_manifest()
+    source = slice(0, _CLIP_FRAMES)
+    target = slice(_CLIP_FRAMES, 2 * _CLIP_FRAMES)
+    source_entry = 1
+    target_entry = _CLIP_FRAMES + 1
+    source_contact = 3
+    target_contact = _CLIP_FRAMES + 3
+
+    object_position = np.array([0.0, 1.0, 0.0], np.float32)
+    artifact.object_positions[source] = object_position
+    artifact.object_positions[target] = object_position
+    artifact.object_rotations[:] = _IDENTITY
+
+    artifact.positions[source, 0] = np.array(
+        [source_root_x, 1.0, 0.0], np.float32
+    )
+    artifact.positions[target, 0] = np.array(
+        [target_root_x, 1.0, 0.0], np.float32
+    )
+    artifact.rotations[:, 0] = _IDENTITY
+    artifact.rotations[source_entry, 0] = _yaw_quaternion(
+        source_root_yaw
+    )
+    artifact.rotations[target_entry, 0] = _yaw_quaternion(
+        target_root_yaw
+    )
+
+    artifact.table_positions[1] = np.array(
+        [50.0, -10.0, 50.0], np.float32
+    )
+    target_grasp = np.array([0.25, 0.20, 0.30], np.float32)
+    artifact.grasp_positions_object[1] = target_grasp
+    artifact.grasp_rotations_object[1] = _IDENTITY
+
+    precontact_hand = np.array([0.0, 2.0, 2.0], np.float32)
+    target_contact_hand = object_position + target_grasp
+    source_contact_hand = target_contact_hand + np.array(
+        [source_contact_error_m, 0.0, 0.0], np.float32
+    )
+    artifact.positions[1:source_contact, _RIGHT_WRIST] = (
+        precontact_hand - artifact.positions[1:source_contact, 0]
+    )
+    artifact.positions[
+        target_entry:target_contact, _RIGHT_WRIST
+    ] = precontact_hand - artifact.positions[
+        target_entry:target_contact, 0
+    ]
+    artifact.positions[source_contact:_CLIP_FRAMES, _RIGHT_WRIST] = (
+        source_contact_hand - artifact.positions[source_contact, 0]
+    )
+    artifact.positions[target_contact:, _RIGHT_WRIST] = (
+        target_contact_hand - artifact.positions[target_contact, 0]
+    )
+    artifact.rotations[:, _RIGHT_WRIST] = _IDENTITY
+    artifact.validate()
+    return artifact, manifest
+
+
 class ExtractSlotCandidateIdentityTests(unittest.TestCase):
     def test_resolves_target_events_and_provenance_by_sequence_and_range(self):
         artifact, manifest = _two_clip_artifact_and_manifest()
@@ -372,6 +496,29 @@ class ExtractSlotCandidateIdentityTests(unittest.TestCase):
             "object_alignment_local_frame": 2,
             "object_alignment_position": [4.0, 1.0, 3.0],
             "object_alignment_rotation": [1.0, 0.0, 0.0, 0.0],
+            "table_position": artifact.table_positions[1]
+            .astype(float)
+            .tolist(),
+            "table_rotation": artifact.table_rotations[1]
+            .astype(float)
+            .tolist(),
+            "table_size": artifact.table_sizes[1]
+            .astype(float)
+            .tolist(),
+            "object_dimensions": artifact.object_dimensions[1]
+            .astype(float)
+            .tolist(),
+            "grasp_position_object": artifact.grasp_positions_object[1]
+            .astype(float)
+            .tolist(),
+            "grasp_rotation_object": artifact.grasp_rotations_object[1]
+            .astype(float)
+            .tolist(),
+            "approach_direction_object": artifact.approach_directions_object[
+                1
+            ]
+            .astype(float)
+            .tolist(),
         }
         for key, expected in expected_target.items():
             with self.subTest(target_key=key):
@@ -1113,6 +1260,368 @@ class ExtractSlotCandidatePathGateTests(unittest.TestCase):
         )
 
         _assert_source_rejected(self, report, "root_table")
+
+
+class ExtractSlotCandidateDedupeAndOutputTests(unittest.TestCase):
+    def test_opposite_manifest_orders_serialize_identically_in_stable_key_order(self):
+        outside_distance = np.nextafter(
+            _DEDUPE_POSITION_LIMIT_M, np.float32(np.inf)
+        )
+        cases = (
+            ("outside_distance", outside_distance, 0),
+            ("inclusive_duplicate", _DEDUPE_POSITION_LIMIT_M, 1),
+        )
+        for name, target_root_x, deduplicated in cases:
+            with self.subTest(name=name):
+                artifact, reverse_manifest = (
+                    _dedupe_artifact_and_manifest(
+                        target_root_x=target_root_x
+                    )
+                )
+                forward_manifest = copy.deepcopy(reverse_manifest)
+                forward_manifest["clips"].reverse()
+
+                reverse_report = extract_slot_candidates(
+                    copy.deepcopy(artifact),
+                    reverse_manifest,
+                    _TARGET_SEQUENCE,
+                )
+                forward_report = extract_slot_candidates(
+                    copy.deepcopy(artifact),
+                    forward_manifest,
+                    _TARGET_SEQUENCE,
+                )
+                reverse_text = serialize_slot_report(reverse_report)
+                forward_text = serialize_slot_report(forward_report)
+
+                self.assertEqual(
+                    reverse_text.encode("utf-8"),
+                    forward_text.encode("utf-8"),
+                )
+                for report in (reverse_report, forward_report):
+                    stable_keys = [
+                        candidate["stable_key"]
+                        for candidate in report["retained_candidates"]
+                    ]
+                    self.assertEqual(stable_keys, sorted(stable_keys))
+                    self.assertEqual(
+                        len(stable_keys), 2 - deduplicated
+                    )
+                    if deduplicated:
+                        self.assertEqual(
+                            report["retained_candidates"][0][
+                                "sequence_id"
+                            ],
+                            _SOURCE_SEQUENCE,
+                        )
+                    _assert_gate_counts(
+                        self,
+                        report,
+                        expected_deduplicated=deduplicated,
+                    )
+
+    def test_private_dedupe_accepts_exact_promoted_float32_yaw_limit(self):
+        first = self._minimal_dedupe_row("a", hand=1)
+        boundary = self._minimal_dedupe_row(
+            "b",
+            hand=1,
+            yaw=float(_DEDUPE_YAW_LIMIT_RADIANS),
+        )
+
+        retained, deduplicated = _dedupe_candidates(
+            [boundary, first]
+        )
+
+        self.assertEqual(
+            [candidate["stable_key"] for candidate in retained],
+            [first["stable_key"]],
+        )
+        self.assertEqual(deduplicated, 1)
+
+    def test_private_dedupe_is_stable_key_sorted_and_greedy(self):
+        first = self._minimal_dedupe_row("a", hand=1, root_x=0.0)
+        middle = self._minimal_dedupe_row("b", hand=1, root_x=0.09)
+        last = self._minimal_dedupe_row("c", hand=1, root_x=0.18)
+
+        retained, deduplicated = _dedupe_candidates(
+            [last, middle, first]
+        )
+
+        self.assertEqual(
+            [candidate["stable_key"] for candidate in retained],
+            [first["stable_key"], last["stable_key"]],
+        )
+        self.assertEqual(deduplicated, 1)
+
+    def test_private_dedupe_keeps_an_opposite_hand_duplicate(self):
+        right = self._minimal_dedupe_row("a", hand=1)
+        left = self._minimal_dedupe_row("b", hand=0)
+
+        retained, deduplicated = _dedupe_candidates([left, right])
+
+        self.assertEqual(
+            [candidate["stable_key"] for candidate in retained],
+            [right["stable_key"], left["stable_key"]],
+        )
+        self.assertEqual(deduplicated, 0)
+
+    @staticmethod
+    def _minimal_dedupe_row(
+        suffix,
+        *,
+        hand,
+        root_x=0.0,
+        root_z=0.0,
+        yaw=0.0,
+    ):
+        return {
+            "stable_key": ["dataset", 1, suffix, 1, hand],
+            "active_hand": hand,
+            "root_x_object_m": root_x,
+            "root_z_object_m": root_z,
+            "root_yaw_object_radians": yaw,
+        }
+
+    def test_same_hand_dedupe_uses_inclusive_distance_and_wrapped_yaw(self):
+        outside_distance = np.nextafter(
+            _DEDUPE_POSITION_LIMIT_M, np.float32(np.inf)
+        )
+        outside_yaw = np.float32(np.deg2rad(10.01))
+        self.assertGreater(outside_distance, _DEDUPE_POSITION_LIMIT_M)
+        self.assertGreater(outside_yaw, _DEDUPE_YAW_LIMIT_RADIANS)
+        cases = (
+            (
+                "inclusive_limits",
+                _DEDUPE_POSITION_LIMIT_M,
+                np.float32(0.0),
+                _DEDUPE_YAW_LIMIT_RADIANS,
+                1,
+            ),
+            (
+                "distance_one_float_outside",
+                outside_distance,
+                np.float32(0.0),
+                _DEDUPE_YAW_LIMIT_RADIANS,
+                0,
+            ),
+            (
+                "yaw_just_outside",
+                _DEDUPE_POSITION_LIMIT_M,
+                np.float32(0.0),
+                outside_yaw,
+                0,
+            ),
+            (
+                "wrapped_positive_179_to_negative_171",
+                _DEDUPE_POSITION_LIMIT_M,
+                np.float32(np.deg2rad(179.0)),
+                np.float32(np.deg2rad(-171.0)),
+                1,
+            ),
+        )
+
+        for name, distance, source_yaw, target_yaw, deduplicated in cases:
+            with self.subTest(name=name):
+                artifact, manifest = _dedupe_artifact_and_manifest(
+                    target_root_x=distance,
+                    source_root_yaw=source_yaw,
+                    target_root_yaw=target_yaw,
+                )
+                if name == "wrapped_positive_179_to_negative_171":
+                    # Compose the float32 ten-degree delta onto +179 rather
+                    # than independently rounding both endpoint angles. The
+                    # resulting quaternion is the -171-degree orientation and
+                    # keeps the wrapped separation on the inclusive side.
+                    artifact.rotations[_CLIP_FRAMES + 1, 0] = (
+                        _quaternion_multiply(
+                            _yaw_quaternion(
+                                _DEDUPE_YAW_LIMIT_RADIANS
+                            ),
+                            artifact.rotations[1, 0],
+                        )
+                    )
+                    target_quaternion = artifact.rotations[
+                        _CLIP_FRAMES + 1, 0
+                    ]
+                    target_angle = np.float64(2.0) * np.arctan2(
+                        np.float64(target_quaternion[2]),
+                        np.float64(target_quaternion[0]),
+                    )
+                    wrapped_target_angle = np.arctan2(
+                        np.sin(target_angle), np.cos(target_angle)
+                    )
+                    self.assertAlmostEqual(
+                        np.rad2deg(wrapped_target_angle),
+                        -171.0,
+                        places=5,
+                    )
+                report = extract_slot_candidates(
+                    artifact, manifest, _TARGET_SEQUENCE
+                )
+
+                expected_retained = 2 - deduplicated
+                self.assertEqual(
+                    len(report["retained_candidates"]),
+                    expected_retained,
+                )
+                self.assertTrue(
+                    all(
+                        candidate["active_hand"] == 1
+                        for candidate in report["retained_candidates"]
+                    )
+                )
+                stable_keys = [
+                    candidate["stable_key"]
+                    for candidate in report["retained_candidates"]
+                ]
+                self.assertEqual(stable_keys, sorted(stable_keys))
+                if deduplicated:
+                    self.assertEqual(
+                        report["retained_candidates"][0]["sequence_id"],
+                        _SOURCE_SEQUENCE,
+                    )
+                _assert_gate_counts(
+                    self,
+                    report,
+                    expected_deduplicated=deduplicated,
+                )
+
+    def test_static_rejection_precedes_dedupe(self):
+        artifact, manifest = _dedupe_artifact_and_manifest(
+            source_contact_error_m=np.float32(0.13)
+        )
+
+        report = extract_slot_candidates(
+            artifact, manifest, _TARGET_SEQUENCE
+        )
+
+        self.assertEqual(
+            [
+                candidate["sequence_id"]
+                for candidate in report["retained_candidates"]
+            ],
+            [_TARGET_SEQUENCE],
+        )
+        _assert_gate_counts(self, report, "contact_position")
+
+    def test_candidate_schema_contains_no_runtime_authority_or_global_identity(self):
+        outside_distance = np.nextafter(
+            _DEDUPE_POSITION_LIMIT_M, np.float32(np.inf)
+        )
+        artifact, manifest = _dedupe_artifact_and_manifest(
+            target_root_x=outside_distance
+        )
+        report = extract_slot_candidates(
+            artifact, manifest, _TARGET_SEQUENCE
+        )
+
+        self.assertEqual(set(report), _REPORT_KEYS)
+        self.assertEqual(set(report["target"]), _TARGET_KEYS)
+        self.assertNotIn("candidate_counts", report)
+        self.assertNotIn("near_duplicate", report["rejected_counts_by_gate"])
+        self.assertEqual(
+            set(report["rejected_counts_by_gate"]),
+            set(_REJECTED_GATE_ORDER),
+        )
+        self.assertEqual(report["deduplicated_candidate_count"], 0)
+        for candidate in report["retained_candidates"]:
+            self.assertEqual(set(candidate), _SLOT_CANDIDATE_KEYS)
+            self.assertIn("source_entry_frame", candidate)
+            self.assertTrue(candidate["static_path_feasible"])
+
+        serialized = serialize_slot_report(report)
+        normalized_text = serialized.lower()
+        for forbidden in (
+            "runtime_clip_allowlist",
+            "runtime_allowlist",
+            "runtime allowlist",
+            "match_ready",
+            "match-ready",
+            "runtime_certified",
+            "runtime-certified",
+            "near_duplicate",
+            "candidate_counts",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, normalized_text)
+
+
+class ExtractSlotReportSerializationTests(unittest.TestCase):
+    def test_serializer_is_canonical_and_normalizes_float32_values(self):
+        value = {
+            "z_nested": {
+                "values": [
+                    float(np.float32(0.123456789)),
+                    -0.0,
+                ]
+            },
+            "middle_float": float(np.float32(1.23456789)),
+            "a_large_float": float(np.float32(123456.789)),
+        }
+
+        serialized = serialize_slot_report(value)
+
+        self.assertEqual(
+            serialized,
+            "{\n"
+            '  "a_large_float": 123456.789,\n'
+            '  "middle_float": 1.23456788,\n'
+            '  "z_nested": {\n'
+            '    "values": [\n'
+            "      0.123456791,\n"
+            "      0.0\n"
+            "    ]\n"
+            "  }\n"
+            "}\n",
+        )
+        self.assertEqual(
+            list(json.loads(serialized)),
+            sorted(value),
+        )
+        self.assertTrue(serialized.endswith("\n"))
+        self.assertFalse(serialized.endswith("\n\n"))
+
+    def test_serializer_rejects_every_nonfinite_json_number(self):
+        cases = (
+            ("nested_dict_nan", {"outer": {"value": float("nan")}}),
+            ("nested_list_inf", {"outer": [0.0, float("inf")]}),
+            (
+                "dict_then_list_negative_inf",
+                {"outer": {"values": [float("-inf")]}},
+            ),
+        )
+        for name, value in cases:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    r"(?i)(non.?finite|out of range|nan|infinity)",
+                ):
+                    serialize_slot_report({"value": value})
+
+    def test_nonfinite_artifact_geometry_is_rejected_before_candidate_sorting(self):
+        messages = []
+        error_types = []
+        for reverse_clips in (False, True):
+            artifact, manifest = _dedupe_artifact_and_manifest(
+                target_root_x=np.nextafter(
+                    _DEDUPE_POSITION_LIMIT_M, np.float32(np.inf)
+                )
+            )
+            if reverse_clips:
+                manifest["clips"].reverse()
+            artifact.positions[1, 0, 0] = np.float32(np.nan)
+
+            with self.assertRaisesRegex(
+                ValueError, r"(?i)non.?finite"
+            ) as raised:
+                extract_slot_candidates(
+                    artifact, manifest, _TARGET_SEQUENCE
+                )
+            messages.append(str(raised.exception))
+            error_types.append(type(raised.exception))
+
+        self.assertEqual(error_types[0], error_types[1])
+        self.assertEqual(messages[0], messages[1])
 
 
 class ExtractSlotCandidateValidationTests(unittest.TestCase):
