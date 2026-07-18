@@ -124,7 +124,7 @@ assert report["bone_count"] == 39
 PY
 ```
 
-Expected: all six unit tests pass; the validator exits `0`, reports 35 meshes
+Expected: all seven unit tests pass; the validator exits `0`, reports 35 meshes
 and 39 bones, and reports no bind-frame, hash, rigid-weight, or index-limit
 error.
 
