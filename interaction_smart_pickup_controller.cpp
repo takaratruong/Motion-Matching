@@ -83,7 +83,13 @@ SmartPickupPreStepResult SmartPickupController::pre_step(
     result.right_stick = input.right_stick;
     result.force_strafe = input.force_strafe;
 
-    if (input.cancel_pressed) {
+    const bool owns_cancel =
+        pending_activation_.has_value() ||
+        backend_->active() ||
+        backend_->owns_manual_interact() ||
+        (input.interact_pressed &&
+         input.runtime_state == RuntimeState::Locomotion);
+    if (input.cancel_pressed && owns_cancel) {
         pending_activation_.reset();
         previous_assist_output_ = {};
         backend_->cancel();

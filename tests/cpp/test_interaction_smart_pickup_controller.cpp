@@ -338,6 +338,59 @@ private:
     interaction::PickAssistDiagnostics diagnostics_{};
 };
 
+class InactiveStateAssistBackend final
+    : public interaction::SmartPickupAssistBackend {
+public:
+    explicit InactiveStateAssistBackend(
+        interaction::PickAssistState state) {
+        diagnostics_.state = state;
+    }
+
+    bool begin(
+        const interaction::PickAssistStart&,
+        const interaction::InteractionTarget*) override {
+        ++begin_calls;
+        return false;
+    }
+
+    void cancel() override {
+        ++cancel_calls;
+    }
+
+    interaction::PickAssistOutput observe(
+        const interaction::PickAssistObservation&) override {
+        ++observe_calls;
+        return {};
+    }
+
+    std::optional<interaction::PickRequest> take_submission(
+        uint64_t) override {
+        ++take_submission_calls;
+        return std::nullopt;
+    }
+
+    bool active() const override {
+        return false;
+    }
+
+    bool owns_manual_interact() const override {
+        return false;
+    }
+
+    const interaction::PickAssistDiagnostics& diagnostics()
+        const override {
+        return diagnostics_;
+    }
+
+    uint32_t begin_calls = 0U;
+    uint32_t cancel_calls = 0U;
+    uint32_t observe_calls = 0U;
+    uint32_t take_submission_calls = 0U;
+
+private:
+    interaction::PickAssistDiagnostics diagnostics_{};
+};
+
 // This raylib-free harness establishes only the caller-side pre/ordinary/post
 // order around the coordinator. Production locomotion-provider, live-flat
 // bridge, scheduler-publication, and controller-obstacle identity counts remain
@@ -940,6 +993,112 @@ void test_target_disappearing_during_step_is_observed_once_and_fails() {
         "target disappearance did not fail once after the ordinary step");
 }
 
+void test_cancel_passes_through_without_smart_pickup_ownership() {
+    interaction::InteractionTarget target = make_controller_target();
+    {
+        InactiveStateAssistBackend backend(
+            interaction::PickAssistState::Submitted);
+        interaction::SmartPickupController controller(backend);
+        interaction::SmartPickupPreStepInput input =
+            make_pre_input(&target, false, true);
+        input.runtime_state = interaction::RuntimeState::Carry;
+        input.left_stick = vec3(-0.63F, 0.0F, 0.27F);
+        input.right_stick = vec3(0.48F, 0.0F, -0.92F);
+        input.force_strafe = true;
+
+        const interaction::SmartPickupPreStepResult result =
+            controller.pre_step(input);
+        require(
+            !result.cancel_consumed && !result.interact_consumed &&
+                same_vec3_bits(result.left_stick, input.left_stick) &&
+                same_vec3_bits(result.right_stick, input.right_stick) &&
+                result.force_strafe == input.force_strafe &&
+                backend.cancel_calls == 0U &&
+                controller.diagnostics().state ==
+                    interaction::PickAssistState::Submitted,
+            "Carry X was consumed by an inactive Submitted pickup assist");
+    }
+    {
+        CountingAssistBackend backend;
+        interaction::SmartPickupController controller(backend);
+        interaction::SmartPickupPreStepInput input =
+            make_pre_input(&target, false, true);
+        input.left_stick = vec3(0.31F, 0.0F, -0.74F);
+        input.right_stick = vec3(-0.56F, 0.0F, 0.18F);
+        input.force_strafe = true;
+
+        const interaction::SmartPickupPreStepResult result =
+            controller.pre_step(input);
+        require(
+            !result.cancel_consumed && !result.interact_consumed &&
+                same_vec3_bits(result.left_stick, input.left_stick) &&
+                same_vec3_bits(result.right_stick, input.right_stick) &&
+                result.force_strafe == input.force_strafe &&
+                backend.cancel_calls == 0U &&
+                controller.diagnostics().state ==
+                    interaction::PickAssistState::Idle &&
+                controller.diagnostics().reason ==
+                    interaction::PickAssistReason::None,
+            "idle Locomotion X was consumed without a pickup attempt");
+    }
+    {
+        InactiveStateAssistBackend backend(
+            interaction::PickAssistState::Failed);
+        interaction::SmartPickupController controller(backend);
+        const interaction::SmartPickupPreStepInput input =
+            make_pre_input(&target, false, true);
+        const interaction::SmartPickupPreStepResult result =
+            controller.pre_step(input);
+        require(
+            !result.cancel_consumed && !result.interact_consumed &&
+                same_vec3_bits(result.left_stick, input.left_stick) &&
+                same_vec3_bits(result.right_stick, input.right_stick) &&
+                result.force_strafe == input.force_strafe &&
+                backend.cancel_calls == 0U &&
+                controller.diagnostics().state ==
+                    interaction::PickAssistState::Failed,
+            "failed inactive pickup assist consumed a later X edge");
+    }
+}
+
+void test_pending_activation_owns_cancel_edge() {
+    interaction::InteractionTarget target = make_controller_target();
+    CountingAssistBackend backend;
+    interaction::SmartPickupController controller(backend);
+
+    const interaction::SmartPickupPreStepResult activation =
+        controller.pre_step(make_pre_input(&target, true));
+    require(
+        activation.interact_consumed && backend.begin_calls == 0U,
+        "pending-cancel fixture did not capture its activation");
+
+    interaction::SmartPickupPreStepInput cancel =
+        make_pre_input(&target, false, true);
+    cancel.left_stick = vec3(-0.14F, 0.0F, 0.82F);
+    cancel.right_stick = vec3(0.91F, 0.0F, -0.36F);
+    const interaction::SmartPickupPreStepResult cancelled =
+        controller.pre_step(cancel);
+    require(
+        cancelled.cancel_consumed && !cancelled.interact_consumed &&
+            same_vec3_bits(cancelled.left_stick, cancel.left_stick) &&
+            same_vec3_bits(cancelled.right_stick, cancel.right_stick) &&
+            backend.cancel_calls == 1U && backend.begin_calls == 0U,
+        "pending Smart Pickup did not own and clear X");
+
+    CallerOrderHarness locomotion;
+    const interaction::LocomotionSnapshot snapshot =
+        locomotion.step(cancelled);
+    uint32_t preview_calls = 0U;
+    const interaction::SmartPickupPostStepResult post =
+        controller.post_step(
+            make_post_input(snapshot, &target),
+            rejecting_preview_counter(preview_calls));
+    require(
+        backend.begin_calls == 0U && backend.observe_calls == 0U &&
+            preview_calls == 0U && !post.pick_request.has_value(),
+        "pending cancellation left activation work for post-step");
+}
+
 void test_simultaneous_cancel_wins_without_pending_or_observation() {
     interaction::InteractionTarget target = make_controller_target();
     CountingAssistBackend backend;
@@ -1463,6 +1622,8 @@ int main() {
     test_post_begin_slot_mutations_fail_without_hopping();
     test_missing_target_and_selector_fail_stably_after_consuming_f();
     test_target_disappearing_during_step_is_observed_once_and_fails();
+    test_cancel_passes_through_without_smart_pickup_ownership();
+    test_pending_activation_owns_cancel_edge();
     test_simultaneous_cancel_wins_without_pending_or_observation();
     test_active_assist_owns_sticks_while_camera_and_cancel_remain_live();
     test_active_repeated_f_is_consumed_without_restarting_assist();
