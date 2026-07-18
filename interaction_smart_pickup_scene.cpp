@@ -7,6 +7,7 @@ namespace interaction {
 namespace {
 
 constexpr float kDestinationTranslationZ = 1.20F;
+constexpr float kDestinationObjectInsetZ = 0.04F;
 
 constexpr std::array<SmartPickupSlotProvenance, 3> kSlotProvenance{{
     {1U, "pickup_table__alcohol_10__005", 125, 150},
@@ -103,6 +104,7 @@ PlacementSurface make_smart_pickup_demo_destination_surface(
     affordance.id = 1U;
     affordance.object_in_surface = compose(
         inverse(source_surface), source_target.object_world);
+    affordance.object_in_surface.position.z += kDestinationObjectInsetZ;
     affordance.support_point_object = support_point_in_object(
         source_target, source_surface);
     affordance.approach_direction_surface = vec3(0.0F, 1.0F, 0.0F);

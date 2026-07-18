@@ -15,6 +15,7 @@ namespace {
 
 constexpr float kDerivedTolerance = 1.0e-6F;
 constexpr float kDestinationTranslationZ = 1.20F;
+constexpr float kDestinationObjectInsetZ = 0.04F;
 
 uint32_t float_bits(float value) {
     uint32_t bits = 0U;
@@ -81,6 +82,55 @@ interaction::Transform support_plane_for(
         target.table_world,
         interaction::Transform{
             vec3(0.0F, 0.5F * target.table_size.y, 0.0F), quat()});
+}
+
+vec3 support_point_in_object_for(
+    const interaction::InteractionTarget& target,
+    const interaction::Transform& surface_world) {
+    const vec3 surface_normal = quat_mul_vec3(
+        surface_world.rotation, vec3(0.0F, 1.0F, 0.0F));
+    const float projection_distance = dot(
+        surface_world.position - target.object_world.position,
+        surface_normal);
+    const vec3 projected_support_world =
+        target.object_world.position + projection_distance * surface_normal;
+    return interaction::compose(
+        interaction::inverse(target.object_world),
+        interaction::Transform{projected_support_world, quat()}).position;
+}
+
+void assert_safe_destination_marker(
+    const interaction::InteractionTarget& source,
+    const interaction::PlacementSurface& destination) {
+    using namespace interaction;
+
+    assert(destination.affordances.size() == 1U);
+    const Transform source_surface = support_plane_for(source);
+    const Transform source_object_in_surface = compose(
+        inverse(source_surface), source.object_world);
+    const PlaceAffordance& affordance = destination.affordances.front();
+
+    assert(exact(
+        affordance.object_in_surface.position.x,
+        source_object_in_surface.position.x));
+    assert(exact(
+        affordance.object_in_surface.position.z,
+        source_object_in_surface.position.z + kDestinationObjectInsetZ));
+    assert(exact(
+        affordance.object_in_surface.position.y,
+        source_object_in_surface.position.y));
+    assert(exact(
+        affordance.object_in_surface.rotation,
+        source_object_in_surface.rotation));
+
+    const vec3 expected_support_point = support_point_in_object_for(
+        source, source_surface);
+    assert(near(affordance.support_point_object, expected_support_point));
+    const vec3 destination_support_in_surface =
+        affordance.object_in_surface.position + quat_mul_vec3(
+            affordance.object_in_surface.rotation,
+            affordance.support_point_object);
+    assert(near(destination_support_in_surface.y, 0.0F));
 }
 
 void test_frozen_beer_target_and_provenance() {
@@ -206,6 +256,27 @@ void test_frozen_beer_target_and_provenance() {
     }
 }
 
+void test_baked_destination_uses_safe_inset_marker() {
+    using namespace interaction;
+
+    const InteractionTarget source = make_smart_pickup_demo_target();
+    const InteractionTarget snapshot = source;
+    const PlacementSurface destination =
+        make_smart_pickup_demo_destination_surface(source);
+
+    assert(same_interaction_target_snapshot(source, snapshot));
+    assert_safe_destination_marker(source, destination);
+    const PlacementFit fit = evaluate_placement_fit(
+        destination,
+        destination.affordances.front(),
+        source.object_bounds);
+    assert(fit.accepted);
+    assert(fit.reason == Reason::None);
+    assert(fit.footprint_valid);
+    assert(fit.overhead_valid);
+    assert(same_interaction_target_snapshot(source, snapshot));
+}
+
 void test_destination_is_derived_without_mutating_source() {
     using namespace interaction;
 
@@ -232,17 +303,17 @@ void test_destination_is_derived_without_mutating_source() {
     const InteractionTarget snapshot = source;
 
     const Transform source_surface = support_plane_for(source);
-    const Transform expected_object_in_surface = compose(
+    Transform expected_object_in_surface = compose(
         inverse(source_surface), source.object_world);
+    expected_object_in_surface.position.z += kDestinationObjectInsetZ;
     Transform expected_support_volume = source.table_world;
     expected_support_volume.position.z =
         source.table_world.position.z + kDestinationTranslationZ;
     Transform expected_surface = source_surface;
     expected_surface.position.z =
         source_surface.position.z + kDestinationTranslationZ;
-    Transform expected_object_world = source.object_world;
-    expected_object_world.position.z =
-        source.object_world.position.z + kDestinationTranslationZ;
+    const Transform expected_object_world = compose(
+        expected_surface, expected_object_in_surface);
 
     const PlacementSurface destination =
         make_smart_pickup_demo_destination_surface(source);
@@ -258,6 +329,7 @@ void test_destination_is_derived_without_mutating_source() {
 
     assert(destination.affordances.size() == 1U);
     const PlaceAffordance& affordance = destination.affordances.front();
+    assert_safe_destination_marker(source, destination);
     assert(near(
         affordance.object_in_surface, expected_object_in_surface));
     assert(exact(
@@ -280,5 +352,6 @@ void test_destination_is_derived_without_mutating_source() {
 
 int main() {
     test_frozen_beer_target_and_provenance();
+    test_baked_destination_uses_safe_inset_marker();
     test_destination_is_derived_without_mutating_source();
 }

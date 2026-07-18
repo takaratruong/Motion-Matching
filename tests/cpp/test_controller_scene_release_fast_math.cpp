@@ -1,10 +1,12 @@
 #include "interaction_controller_adapter.h"
+#include "interaction_smart_pickup_scene.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <iostream>
 #include <stdexcept>
+#include <utility>
 
 namespace {
 
@@ -65,10 +67,41 @@ interaction::Database frozen_release_scene_database() {
     return database;
 }
 
+void test_registered_smart_pickup_scene_is_release_placement_fit() {
+    interaction::TargetRegistry registry;
+    interaction::InteractionTarget authored =
+        interaction::make_smart_pickup_demo_target();
+    const interaction::InteractionTarget authored_snapshot = authored;
+    const interaction::TargetHandle handle = registry.upsert(
+        std::move(authored));
+    const interaction::InteractionTarget* registered = registry.find(handle);
+    require(
+        registered != nullptr,
+        "release Smart Pickup target was not registered");
+    require(
+        interaction::same_interaction_target_snapshot(
+            *registered, authored_snapshot),
+        "release registry mutated the authored Smart Pickup target");
+
+    const interaction::PlacementSurface destination =
+        interaction::make_smart_pickup_demo_destination_surface(*registered);
+    require(
+        destination.affordances.size() == 1U,
+        "release Smart Pickup scene did not author one destination affordance");
+    const interaction::PlacementFit fit = interaction::evaluate_placement_fit(
+        destination,
+        destination.affordances.front(),
+        registered->object_bounds);
+    require(
+        fit.accepted,
+        "release registered Smart Pickup destination was rejected");
+}
+
 }  // namespace
 
 int main() {
     try {
+        test_registered_smart_pickup_scene_is_release_placement_fit();
         const interaction::Database database =
             frozen_release_scene_database();
         const interaction::InteractionTarget target =
