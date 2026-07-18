@@ -14,11 +14,20 @@ namespace {
 constexpr float kMinimumRotationNorm = 1.0e-6F;
 constexpr float kRotationNormTolerance = 1.0e-3F;
 
-bool finite(float value) {
+uint32_t float_bits(float value) {
     uint32_t bits = 0U;
     static_assert(sizeof(bits) == sizeof(value));
     std::memcpy(&bits, &value, sizeof(bits));
-    return (bits & 0x7f800000U) != 0x7f800000U;
+    return bits;
+}
+
+bool finite(float value) {
+    return (float_bits(value) & 0x7f800000U) != 0x7f800000U;
+}
+
+bool exact(float left, float right) {
+    return finite(left) && finite(right) &&
+           float_bits(left) == float_bits(right);
 }
 
 bool finite(vec3 value) {
@@ -31,12 +40,13 @@ bool finite(quat value) {
 }
 
 bool exact(vec3 left, vec3 right) {
-    return left.x == right.x && left.y == right.y && left.z == right.z;
+    return exact(left.x, right.x) && exact(left.y, right.y) &&
+           exact(left.z, right.z);
 }
 
 bool exact(quat left, quat right) {
-    return left.w == right.w && left.x == right.x &&
-           left.y == right.y && left.z == right.z;
+    return exact(left.w, right.w) && exact(left.x, right.x) &&
+           exact(left.y, right.y) && exact(left.z, right.z);
 }
 
 bool exact(const Transform& left, const Transform& right) {
@@ -207,7 +217,7 @@ bool same_authored_grasp_affordance(
         !exact(
             left.approach_direction_object,
             right.approach_direction_object) ||
-        left.clearance_radius != right.clearance_radius ||
+        !exact(left.clearance_radius, right.clearance_radius) ||
         left.interaction_slots.size() != right.interaction_slots.size()) {
         return false;
     }
@@ -215,9 +225,11 @@ bool same_authored_grasp_affordance(
         const GraspInteractionSlot& a = left.interaction_slots[i];
         const GraspInteractionSlot& b = right.interaction_slots[i];
         if (a.id != b.id ||
-            a.root_x_object_m != b.root_x_object_m ||
-            a.root_z_object_m != b.root_z_object_m ||
-            a.root_yaw_object_radians != b.root_yaw_object_radians) {
+            !exact(a.root_x_object_m, b.root_x_object_m) ||
+            !exact(a.root_z_object_m, b.root_z_object_m) ||
+            !exact(
+                a.root_yaw_object_radians,
+                b.root_yaw_object_radians)) {
             return false;
         }
     }

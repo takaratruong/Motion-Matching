@@ -20,6 +20,11 @@ bool is_finite(float value) {
     return (float_bits(value) & 0x7f800000U) != 0x7f800000U;
 }
 
+bool same_finite_float_bits(float left, float right) {
+    return is_finite(left) && is_finite(right) &&
+        float_bits(left) == float_bits(right);
+}
+
 bool is_finite(vec3 value) {
     return is_finite(value.x) && is_finite(value.y) && is_finite(value.z);
 }
@@ -60,10 +65,13 @@ bool same_ordered_authored_slots(
         const GraspInteractionSlot& right =
             live.interaction_slots[index];
         if (left.id != right.id ||
-            left.root_x_object_m != right.root_x_object_m ||
-            left.root_z_object_m != right.root_z_object_m ||
-            left.root_yaw_object_radians !=
-                right.root_yaw_object_radians) {
+            !same_finite_float_bits(
+                left.root_x_object_m, right.root_x_object_m) ||
+            !same_finite_float_bits(
+                left.root_z_object_m, right.root_z_object_m) ||
+            !same_finite_float_bits(
+                left.root_yaw_object_radians,
+                right.root_yaw_object_radians)) {
             return false;
         }
     }
