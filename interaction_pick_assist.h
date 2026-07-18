@@ -1,10 +1,9 @@
 #pragma once
 
 #include "interaction_arrival.h"
-#include "interaction_pick_approach.h"
 #include "interaction_pick_slots.h"
+#include "interaction_runtime.h"
 
-#include <array>
 #include <cstdint>
 #include <optional>
 
@@ -12,15 +11,12 @@ namespace interaction {
 
 enum class PickAssistState : uint8_t {
     Idle,
-    CoarseApproach,
-    Preview,
-    FinalApproach,
+    SlotApproach,
     Settling,
     FinalPreview,
     ReadyToSubmit,
     Submitted,
     Failed,
-    SlotApproach,
 };
 
 enum class PickAssistReason : uint8_t {
@@ -28,45 +24,33 @@ enum class PickAssistReason : uint8_t {
     Cancelled,
     TargetUnavailable,
     TargetChanged,
-    RuntimeChanged,
-    OutsideTravelEnvelope,
-    NoFeasibleEntry,
-    PreviewDeadline,
-    ArrivalDeadline,
-    FinalPreviewRejected,
     SlotChanged,
+    RuntimeChanged,
     NoAuthoredSlot,
     InvalidGeometry,
+    OutsideTravelEnvelope,
     TableBlocked,
     ObstacleBlocked,
     AllSlotsBlocked,
+    ArrivalDeadline,
     PoorMatch,
+    FinalPreviewRejected,
 };
 
 struct PickAssistConfig {
     float maximum_assisted_path_m = 1.00F;
-    float reach_entry_distance_m = 0.60F;
-    float reach_entry_tolerance_m = 0.12F;
     float maximum_settle_position_error_m = 0.15F;
     float maximum_settle_displayed_speed_mps = 0.10F;
     uint32_t required_settle_ticks = 5U;
-    uint32_t maximum_preview_ticks = 250U;
     uint32_t maximum_arrival_ticks = 250U;
     ArrivalConfig arrival{};
 };
 
 struct PickAssistStart {
     InteractionTarget target_snapshot{};
-    std::vector<PickNavigationObstacle> obstacles{};
-
-    // Temporary compatibility surface for the legacy two-slot funnel tests.
-    TargetHandle target{};
     uint32_t affordance_id = 0U;
-    Hand hand = Hand::Right;
-    Transform object_world{};
     Transform root_world{};
-    Transform reach_waypoint{};
-    PickEntrySlots slots{};
+    std::vector<PickNavigationObstacle> obstacles{};
 };
 
 struct PickAssistObservation {
@@ -78,7 +62,6 @@ struct PickAssistObservation {
     float camera_azimuth = 0.0F;
     uint64_t snapshot_fingerprint = 0U;
     uint64_t preview_snapshot_fingerprint = 0U;
-    std::optional<std::array<PickEntryPreview, 2>> previews{};
     std::optional<PickEntryPreview> preview{};
 };
 
@@ -112,12 +95,9 @@ struct PickAssistDiagnostics {
     PickAssistReason reason = PickAssistReason::None;
     TargetHandle target{};
     uint32_t affordance_id = 0U;
-    int selected_slot = -1;
     uint32_t selected_slot_id = 0U;
     PickSlotSelection slot_selection{};
     uint32_t settle_ticks = 0U;
-    std::array<float, 2> slot_route_lengths_m{};
-    std::array<bool, 2> slot_permitted{};
     float route_length_m = 0.0F;
     float assisted_travel_m = 0.0F;
     float object_origin_distance_m = 0.0F;
@@ -131,7 +111,6 @@ struct PickAssistDiagnostics {
 class ControllerPickAssist {
 public:
     explicit ControllerPickAssist(PickAssistConfig config = {});
-    bool begin(const PickAssistStart& start);
     bool begin(
         const PickAssistStart& start,
         const InteractionTarget* post_step_target);
@@ -147,11 +126,8 @@ private:
     PickAssistStart start_{};
     MappedPickSlot frozen_slot_{};
     std::optional<PickEntryRoot> frozen_preview_root_{};
-    bool frozen_slot_attempt_ = false;
     bool poor_match_observed_ = false;
     Transform previous_observed_root_{};
-    vec3 entry_point_{};
-    uint32_t preview_ticks_ = 0U;
     uint32_t arrival_ticks_ = 0U;
     PickAssistDiagnostics diagnostics_{};
 };
