@@ -420,6 +420,45 @@ void test_begin_selects_and_freezes_one_authored_slot() {
         "begin route did not retain selected-slot provenance");
 }
 
+void test_begin_rejects_duplicate_affordance_ids_immediately() {
+    interaction::InteractionTarget duplicate_target =
+        make_frozen_slot_target();
+    interaction::GraspAffordance duplicate_affordance =
+        duplicate_target.affordances.front();
+    duplicate_affordance.interaction_slots = {
+        {99U, 0.25F, 0.25F, 0.50F},
+    };
+    duplicate_target.affordances.push_back(duplicate_affordance);
+    const interaction::PickAssistStart duplicate_start =
+        make_frozen_slot_start(duplicate_target);
+    interaction::ControllerPickAssist assist;
+
+    require(
+        !assist.begin(duplicate_start, &duplicate_target),
+        "duplicate affordance IDs were accepted by begin");
+    require(
+        assist.diagnostics().state == interaction::PickAssistState::Failed &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::TargetChanged,
+        "duplicate affordance IDs did not fail begin as TargetChanged");
+    require(
+        !assist.active() && !assist.owns_manual_interact() &&
+            !assist.take_submission(404U).has_value(),
+        "duplicate-affordance begin failure retained ownership or submitted");
+
+    const interaction::InteractionTarget unique_target =
+        make_frozen_slot_target();
+    const interaction::PickAssistStart unique_start =
+        make_frozen_slot_start(unique_target);
+    require(
+        assist.begin(unique_start, &unique_target) &&
+            assist.diagnostics().state ==
+                interaction::PickAssistState::SlotApproach &&
+            assist.diagnostics().reason == interaction::PickAssistReason::None &&
+            assist.active() && assist.owns_manual_interact(),
+        "duplicate-affordance begin failure prevented a valid unique restart");
+}
+
 void test_slot_approach_emits_far_camera_relative_steering() {
     const auto same_float_bits = [](float left, float right) {
         return std::memcmp(&left, &right, sizeof(left)) == 0;
@@ -3199,6 +3238,7 @@ int main() {
     try {
         test_idle_does_not_override_input();
         test_begin_selects_and_freezes_one_authored_slot();
+        test_begin_rejects_duplicate_affordance_ids_immediately();
         test_slot_approach_emits_far_camera_relative_steering();
         test_slot_approach_runtime_change_precedes_target_and_metrics();
         test_slot_approach_target_unavailable_failures_are_stable();
