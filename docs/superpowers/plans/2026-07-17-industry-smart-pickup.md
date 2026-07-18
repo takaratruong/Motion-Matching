@@ -1291,7 +1291,7 @@ Make, and raylib for the final native visualization only.
   `selected_slots` record. No gate was loosened and no motion was hand-selected
   by appearance.
 
-- [ ] **Step 6: Bake only the certified literal scene values**
+- [x] **Step 6: Bake only the certified literal scene values**
 
   Before entering the data, extend the scene test with the exact three ordered
   IDs, local-root float32 bit patterns, and provenance rows emitted by Step 5;
