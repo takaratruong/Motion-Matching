@@ -12,6 +12,7 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
+from mm_sonic.hands import LEFT_HAND_JOINT_ORDER, RIGHT_HAND_JOINT_ORDER
 from mm_sonic.joints import TARGET_JOINT_ORDER
 from mm_sonic.scene import (
     HOLDEN_TO_MUJOCO_MATRIX,
@@ -40,6 +41,39 @@ GEAR_SCENE_SHA256 = (
 )
 GEAR_ROBOT_SHA256 = (
     "8b68d8f06674c5c10cd2cd89764b3cfba9fabba5080b55ea67ee1dd12cf630cd"
+)
+EXPECTED_G1_ACTUATOR_JOINT_ORDER = (
+    "left_hip_pitch_joint",
+    "left_hip_roll_joint",
+    "left_hip_yaw_joint",
+    "left_knee_joint",
+    "left_ankle_pitch_joint",
+    "left_ankle_roll_joint",
+    "right_hip_pitch_joint",
+    "right_hip_roll_joint",
+    "right_hip_yaw_joint",
+    "right_knee_joint",
+    "right_ankle_pitch_joint",
+    "right_ankle_roll_joint",
+    "waist_yaw_joint",
+    "waist_roll_joint",
+    "waist_pitch_joint",
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "left_wrist_roll_joint",
+    "left_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
+    *LEFT_HAND_JOINT_ORDER,
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_roll_joint",
+    "right_wrist_pitch_joint",
+    "right_wrist_yaw_joint",
+    *RIGHT_HAND_JOINT_ORDER,
 )
 
 
@@ -559,6 +593,35 @@ class ActuatorNormalizationTests(unittest.TestCase):
             normalize_run_local_actuators(
                 ET.tostring(root, encoding="utf-8"), label="robot"
             )
+
+    def test_loaded_verifier_requires_free_root_and_joint_transmissions(self):
+        nonfree_root = mujoco.MjModel.from_xml_string(
+            '<mujoco><worldbody><body name="root">'
+            '<joint name="unactuated" type="hinge"/>'
+            '<geom type="sphere" size="0.1" density="100"/>'
+            '<body name="child"><joint name="actuated" type="hinge"/>'
+            '<geom type="sphere" size="0.1" density="100"/>'
+            '</body></body></worldbody><actuator>'
+            '<motor name="motor" joint="actuated" gear="1"/>'
+            '</actuator></mujoco>'
+        )
+        with self.assertRaisesRegex(SceneError, "free root"):
+            verify_loaded_actuator_routing(nonfree_root)
+
+        site_transmission = mujoco.MjModel.from_xml_string(
+            '<mujoco><worldbody><body name="root">'
+            '<freejoint name="floating_base_joint"/>'
+            '<geom type="sphere" size="0.1" density="100"/>'
+            '<site name="first_site" size="0.01"/>'
+            '<body name="child"><joint name="actuated" type="hinge"/>'
+            '<geom type="sphere" size="0.1" density="100"/>'
+            '<site name="target_site" size="0.01"/>'
+            '</body></body></worldbody><actuator>'
+            '<motor name="motor" site="target_site" gear="1 0 0 0 0 0"/>'
+            '</actuator></mujoco>'
+        )
+        with self.assertRaisesRegex(SceneError, "joint transmission"):
+            verify_loaded_actuator_routing(site_transmission)
 
 
 class OverlayAndAuthenticationTests(unittest.TestCase):
@@ -1626,6 +1689,27 @@ class OfficialGearIntegrationTests(unittest.TestCase):
             self.assertEqual(generated_robot.parent, output.resolve(strict=True))
             self.assertFalse(generated_robot.is_symlink())
             self.assertNotEqual(generated_robot, robot)
+
+            loaded_model = mujoco.MjModel.from_xml_path(
+                str(registered.gear_scene_xml)
+            )
+            loaded_order = verify_loaded_actuator_routing(loaded_model)
+            self.assertEqual(
+                loaded_order,
+                EXPECTED_G1_ACTUATOR_JOINT_ORDER,
+            )
+            self.assertEqual(
+                loaded_model.joint(
+                    int(loaded_model.actuator_trnid[22, 0])
+                ).name,
+                LEFT_HAND_JOINT_ORDER[0],
+            )
+            self.assertEqual(
+                loaded_model.joint(
+                    int(loaded_model.actuator_trnid[29, 0])
+                ).name,
+                "right_shoulder_pitch_joint",
+            )
 
             generated_root = ET.parse(generated_robot).getroot()
             generated_compilers = generated_root.findall("compiler")

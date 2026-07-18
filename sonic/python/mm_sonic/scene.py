@@ -943,9 +943,22 @@ def normalize_run_local_actuators(
 def verify_loaded_actuator_routing(model: Any) -> tuple[str, ...]:
     """Verify actuator slot s targets joint id s+1 in the loaded model."""
 
+    import mujoco
+
     njnt = int(model.njnt)
     if njnt < 2:
         raise SceneError("loaded model must contain a free root and joints")
+    free_joint_ids = tuple(
+        int(joint_id)
+        for joint_id in np.flatnonzero(
+            np.asarray(model.jnt_type)
+            == int(mujoco.mjtJoint.mjJNT_FREE)
+        )
+    )
+    if free_joint_ids != (0,) or model.joint(0).name != "floating_base_joint":
+        raise SceneError(
+            "loaded model must have exactly one named free root at joint 0"
+        )
     if int(model.nu) != njnt - 1:
         raise SceneError(
             f"loaded model must have one motor per joint: "
@@ -953,6 +966,12 @@ def verify_loaded_actuator_routing(model: Any) -> tuple[str, ...]:
         )
     order: list[str] = []
     for slot in range(int(model.nu)):
+        if int(model.actuator_trntype[slot]) != int(
+            mujoco.mjtTrn.mjTRN_JOINT
+        ):
+            raise SceneError(
+                f"actuator slot {slot} must use a joint transmission"
+            )
         actual_joint = int(model.actuator_trnid[slot, 0])
         expected_joint = slot + 1
         if actual_joint != expected_joint:

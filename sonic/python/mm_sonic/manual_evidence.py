@@ -21,7 +21,6 @@ from .coordinator import SessionConfig, SourceValidator
 from .hands import (
     Dex3HandTargets,
     HandTrackingReport,
-    NEUTRAL_HAND_TARGETS,
     hand_joint_ranges,
     hand_qpos_addresses,
     hand_targets_record,
@@ -126,7 +125,7 @@ def manual_command_artifact_bytes(
     mode: str,
     preload_chunks: int,
     commands: Sequence[CommandSample],
-    hand_targets: Dex3HandTargets = NEUTRAL_HAND_TARGETS,
+    hand_targets: Dex3HandTargets,
 ) -> bytes:
     values = _validated_commands(commands)
     validated_mode = _validated_mode(mode)
@@ -866,6 +865,8 @@ def _validate_summary(
     artifact: ManualCommandArtifact,
     command_bytes: bytes,
 ) -> tuple[Dex3HandTargets, dict[str, str]]:
+    if summary.get("schema") != _MANUAL_SUMMARY_SCHEMA:
+        raise ContractError("manual summary has an unsupported schema")
     root = _require_keys(
         summary,
         {
@@ -884,7 +885,6 @@ def _validate_summary(
     )
     if (
         root["schema"] != _MANUAL_SUMMARY_SCHEMA
-        or root["mode"] != "interactive"
         or root["mode"] != artifact.mode
         or root["run_root"] != str(run_root)
         or root["preload_chunks"] != _PRELOAD_CHUNKS

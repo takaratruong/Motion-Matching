@@ -20,7 +20,7 @@ from unittest import mock
 import numpy as np
 
 from mm_sonic.artifacts import RunBundle
-from mm_sonic.hands import NEUTRAL_HAND_TARGETS
+from mm_sonic.hands import Dex3HandTargets, NEUTRAL_HAND_TARGETS
 from mm_sonic.joints import ContractError
 from mm_sonic.timeline import CanonicalTargetBuffer
 from mm_sonic.zmq_v1 import (
@@ -400,7 +400,7 @@ class PoseHandCodecTests(unittest.TestCase):
         buffer = make_buffer(2, 40)
         self.assertEqual(encode_pose_v1(buffer), manual_message(buffer))
 
-    def test_enriched_decoder_rejects_one_hand_only_and_invalid_hand_payload(self) -> None:
+    def test_enriched_decoder_rejects_one_hand_only(self) -> None:
         buffer = make_buffer(1, 0)
         message = encode_pose_v1(buffer, hand_targets=NEUTRAL_HAND_TARGETS)
         header = pose_header(1, include_hands=True)
@@ -410,8 +410,63 @@ class PoseHandCodecTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, "both hand"):
             decode_pose_v1(replace_header(message, header))
 
+    def test_direct_encode_and_enriched_decode_reject_invalid_hand_values(self) -> None:
+        buffer = make_buffer(1, 0)
+        for left in (
+            (0.0,) * 6,
+            (0.0,) * 6 + (float("nan"),),
+            (0.0,) * 6 + (9.0,),
+        ):
+            with self.subTest(direct_left=left):
+                invalid = Dex3HandTargets(
+                    profile=NEUTRAL_HAND_TARGETS.profile,
+                    left=left,
+                    right=NEUTRAL_HAND_TARGETS.right,
+                )
+                with self.assertRaises(ContractError):
+                    encode_pose_v1(buffer, hand_targets=invalid)
+
+        message = bytearray(
+            encode_pose_v1(buffer, hand_targets=NEUTRAL_HAND_TARGETS)
+        )
+        left_start = (
+            len(TOPIC)
+            + HEADER_BYTES
+            + (29 + 29 + 4) * np.dtype("<f4").itemsize
+            + np.dtype("<i8").itemsize
+        )
+        for value in (float("nan"), 9.0):
+            with self.subTest(payload_left=value):
+                changed = bytearray(message)
+                changed[left_start:left_start + 4] = np.asarray(
+                    (value,), dtype="<f4"
+                ).tobytes()
+                with self.assertRaises(ContractError):
+                    decode_pose_v1(changed)
+
 
 class PosePublisherHandDefaultTests(unittest.TestCase):
+    def test_publisher_rejects_invalid_default_before_opening_a_socket(self) -> None:
+        invalid = Dex3HandTargets(
+            profile=NEUTRAL_HAND_TARGETS.profile,
+            left=(0.0,) * 6 + (float("nan"),),
+            right=NEUTRAL_HAND_TARGETS.right,
+        )
+        fake_zmq = SimpleNamespace(PUB=1, CONFLATE=2, LINGER=3, LAST_ENDPOINT=4)
+        context = mock.Mock()
+        context.socket.side_effect = AssertionError("socket must not be opened")
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = RunBundle.create(Path(directory), "stage-a", "bad-hands")
+            with mock.patch.dict(sys.modules, {"zmq": fake_zmq}):
+                with self.assertRaises(ContractError):
+                    PosePublisher(
+                        "tcp://127.0.0.1:*",
+                        bundle=bundle,
+                        context=context,
+                        default_hand_targets=invalid,
+                    )
+        context.socket.assert_not_called()
+
     def test_publisher_defaults_to_neutral_and_override_reverts_next_call(self) -> None:
         fake_zmq = SimpleNamespace(PUB=1, CONFLATE=2, LINGER=3, LAST_ENDPOINT=4)
         context = _PublisherContext()

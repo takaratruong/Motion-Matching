@@ -11,7 +11,12 @@ from typing import Mapping
 import numpy as np
 
 from .artifacts import RunBundle
-from .hands import Dex3HandTargets, NEUTRAL_HAND_TARGETS, resolve_hand_targets
+from .hands import (
+    Dex3HandTargets,
+    NEUTRAL_HAND_TARGETS,
+    resolve_hand_targets,
+    validate_hand_targets,
+)
 from .joints import ContractError
 from .timeline import CanonicalTargetBuffer
 
@@ -101,8 +106,8 @@ def encode_pose_v1(
 ) -> bytes:
     _validate_canonical_buffer(buffer)
     include_hands = hand_targets is not None
-    if include_hands and not isinstance(hand_targets, Dex3HandTargets):
-        raise ContractError("hand_targets must be Dex3HandTargets or None")
+    if include_hands:
+        hand_targets = validate_hand_targets(hand_targets)
     header_json = json.dumps(
         pose_header(buffer.count, include_hands),
         separators=(",", ":"),
@@ -285,6 +290,15 @@ def decode_pose_v1(
     _validate_canonical_buffer(canonical)
     left_hand = decoded.get("left_hand_joints")
     right_hand = decoded.get("right_hand_joints")
+    if left_hand is not None and right_hand is not None:
+        validate_hand_targets(
+            Dex3HandTargets(
+                profile=NEUTRAL_HAND_TARGETS.profile,
+                left=tuple(float(value) for value in left_hand),
+                right=tuple(float(value) for value in right_hand),
+            ),
+            label="decoded hand targets",
+        )
     return DecodedPoseV1(
         header=MappingProxyType(header),
         joint_position=canonical.joint_position,
@@ -326,8 +340,7 @@ def verify_pose_v1_parity(
         ("frame_index", decoded.frame_index, buffer.frame_index, "<i8"),
     ]
     if hand_targets is not None:
-        if not isinstance(hand_targets, Dex3HandTargets):
-            raise ContractError("hand_targets must be Dex3HandTargets or None")
+        hand_targets = validate_hand_targets(hand_targets)
         if decoded.left_hand_joints is None or decoded.right_hand_joints is None:
             raise ContractError(
                 "decoded ZMQ v1 message is missing both hand fields for parity"
@@ -365,8 +378,10 @@ class PosePublisher:
             raise ContractError("PosePublisher endpoint must be a nonempty string")
         if not isinstance(bundle, RunBundle):
             raise ContractError("PosePublisher requires a RunBundle")
-        if not isinstance(default_hand_targets, Dex3HandTargets):
-            raise ContractError("PosePublisher requires Dex3HandTargets defaults")
+        validated_hand_targets = validate_hand_targets(
+            default_hand_targets,
+            label="PosePublisher default_hand_targets",
+        )
         try:
             import zmq
         except ImportError as error:
@@ -403,7 +418,7 @@ class PosePublisher:
             raise
 
         self._bundle = bundle
-        self._default_hand_targets = default_hand_targets
+        self._default_hand_targets = validated_hand_targets
         self._context = zmq_context
         self._owns_context = owns_context
         self._socket = socket

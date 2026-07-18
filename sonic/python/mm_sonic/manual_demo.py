@@ -65,7 +65,7 @@ class CommandRecorder:
         *,
         mode: str,
         preload_chunks: int,
-        hand_targets: Dex3HandTargets = NEUTRAL_HAND_TARGETS,
+        hand_targets: Dex3HandTargets,
     ) -> None:
         self._mode = mode
         self._preload_chunks = preload_chunks

@@ -21,7 +21,11 @@ def _forward(index: int) -> CommandSample:
 
 class CommandRecorderTests(unittest.TestCase):
     def test_records_committed_commands_in_chunk_order(self) -> None:
-        recorder = CommandRecorder(mode="script", preload_chunks=2)
+        recorder = CommandRecorder(
+            mode="script",
+            preload_chunks=2,
+            hand_targets=NEUTRAL_HAND_TARGETS,
+        )
         recorder.record(_stand(0))
         recorder.record(_stand(1))
         recorder.record(_forward(2))
@@ -35,14 +39,22 @@ class CommandRecorderTests(unittest.TestCase):
         )
 
     def test_rejects_out_of_order_commit(self) -> None:
-        recorder = CommandRecorder(mode="script", preload_chunks=2)
+        recorder = CommandRecorder(
+            mode="script",
+            preload_chunks=2,
+            hand_targets=NEUTRAL_HAND_TARGETS,
+        )
         recorder.record(_stand(0))
 
         with self.assertRaisesRegex(ContractError, "chunk"):
             recorder.record(_forward(2))
 
     def test_records_neutral_hand_control_in_v3_command_artifact(self) -> None:
-        recorder = CommandRecorder(mode="script", preload_chunks=1)
+        recorder = CommandRecorder(
+            mode="script",
+            preload_chunks=1,
+            hand_targets=NEUTRAL_HAND_TARGETS,
+        )
         recorder.record(_stand(0))
         recorder.record(_forward(1))
 

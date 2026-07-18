@@ -75,7 +75,10 @@ class ManualCommandArtifactTests(unittest.TestCase):
         commands = [_stand(0), _stand(1), _forward(2), _forward(3)]
 
         data = manual_command_artifact_bytes(
-            mode="script", preload_chunks=2, commands=commands
+            mode="script",
+            preload_chunks=2,
+            commands=commands,
+            hand_targets=NEUTRAL_HAND_TARGETS,
         )
         parsed = parse_manual_command_artifact(data)
 
@@ -96,10 +99,16 @@ class ManualCommandArtifactTests(unittest.TestCase):
         commands = [_stand(0), _forward(1)]
 
         first = manual_command_artifact_bytes(
-            mode="interactive", preload_chunks=1, commands=commands
+            mode="interactive",
+            preload_chunks=1,
+            commands=commands,
+            hand_targets=NEUTRAL_HAND_TARGETS,
         )
         second = manual_command_artifact_bytes(
-            mode="interactive", preload_chunks=1, commands=commands
+            mode="interactive",
+            preload_chunks=1,
+            commands=commands,
+            hand_targets=NEUTRAL_HAND_TARGETS,
         )
 
         self.assertEqual(first, second)
@@ -109,7 +118,10 @@ class ManualCommandArtifactTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ContractError, "chunk indices"):
             manual_command_artifact_bytes(
-                mode="script", preload_chunks=1, commands=commands
+                mode="script",
+                preload_chunks=1,
+                commands=commands,
+                hand_targets=NEUTRAL_HAND_TARGETS,
             )
 
 
@@ -337,7 +349,10 @@ def _valid_evidence(**overrides: object) -> dict:
             command_buffer=_buffer(0, 681),
         ),
         "command_artifact": manual_command_artifact_bytes(
-            mode="interactive", preload_chunks=4, commands=_manual_commands()
+            mode="interactive",
+            preload_chunks=4,
+            commands=_manual_commands(),
+            hand_targets=NEUTRAL_HAND_TARGETS,
         ),
         "gear_log": b"startup ok\nCONTROL active\nclean shutdown\n",
         "hand_targets": NEUTRAL_HAND_TARGETS,
@@ -411,7 +426,10 @@ class AuditManualRunTests(unittest.TestCase):
             for index in range(34)
         )
         artifact = manual_command_artifact_bytes(
-            mode="interactive", preload_chunks=4, commands=commands
+            mode="interactive",
+            preload_chunks=4,
+            commands=commands,
+            hand_targets=NEUTRAL_HAND_TARGETS,
         )
         result = audit_manual_run(**_valid_evidence(command_artifact=artifact))
 
@@ -559,7 +577,10 @@ def _write_valid_bundle(root: Path) -> tuple[Path, Path]:
     run.mkdir()
     commands = _manual_commands()
     command_bytes = manual_command_artifact_bytes(
-        mode="interactive", preload_chunks=4, commands=commands
+        mode="interactive",
+        preload_chunks=4,
+        commands=commands,
+        hand_targets=NEUTRAL_HAND_TARGETS,
     )
     (run / "manual-commands.json").write_bytes(command_bytes)
 
@@ -660,6 +681,30 @@ class ManualBundleAuditTests(unittest.TestCase):
         self.assertTrue(result.yaw_pass)
         self.assertTrue(result.final_stop_pass)
 
+    def test_authenticates_the_planned_script_mode_bundle(self) -> None:
+        command_bytes = manual_command_artifact_bytes(
+            mode="script",
+            preload_chunks=4,
+            commands=_manual_commands(),
+            hand_targets=NEUTRAL_HAND_TARGETS,
+        )
+        (self.run / "manual-commands.json").write_bytes(command_bytes)
+        summary_path = self.run / "manual-summary.json"
+        summary = json.loads(summary_path.read_text("ascii"))
+        summary["mode"] = "script"
+        summary["command_artifact"]["sha256"] = hashlib.sha256(
+            command_bytes
+        ).hexdigest()
+        summary_path.write_text(
+            json.dumps(summary, sort_keys=True, indent=2) + "\n",
+            encoding="ascii",
+        )
+
+        result = audit_manual_bundle(self.run, self.canonical, replay=self.replay)
+
+        self.assertTrue(result.passed)
+        self.assertEqual(result.command_artifact.mode, "script")
+
     def test_rejects_a_malformed_state_cadence(self) -> None:
         path = self.run / "scored-sim-logs/state.jsonl"
         rows = path.read_text("utf-8").splitlines()
@@ -706,6 +751,20 @@ class ManualBundleAuditTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ContractError, "command artifact"):
+            audit_manual_bundle(self.run, self.canonical, replay=self.replay)
+
+    def test_rejects_v2_summary_with_clear_version_error(self) -> None:
+        path = self.run / "manual-summary.json"
+        summary = json.loads(path.read_text("ascii"))
+        summary["schema"] = "mm-sonic-manual-demo/v2"
+        summary.pop("hand_control")
+        summary.pop("scene_control")
+        path.write_text(
+            json.dumps(summary, sort_keys=True, indent=2) + "\n",
+            encoding="ascii",
+        )
+
+        with self.assertRaisesRegex(ContractError, "unsupported.*schema"):
             audit_manual_bundle(self.run, self.canonical, replay=self.replay)
 
 

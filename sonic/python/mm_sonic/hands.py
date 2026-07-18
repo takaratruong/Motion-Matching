@@ -150,6 +150,28 @@ NEUTRAL_HAND_TARGETS = Dex3HandTargets(
 )
 
 
+def validate_hand_targets(
+    value: object,
+    *,
+    label: str = "hand_targets",
+) -> Dex3HandTargets:
+    """Validate one complete pinned-profile target without changing its values."""
+
+    if not isinstance(value, Dex3HandTargets):
+        raise ContractError(f"{label} must be Dex3HandTargets")
+    if value.profile != _PROFILE_NAME:
+        raise ContractError(f"{label} profile is not the pinned profile")
+    return Dex3HandTargets(
+        profile=_PROFILE_NAME,
+        left=_validate_side(value.left, LEFT_HAND_JOINT_RANGES, f"{label}.left"),
+        right=_validate_side(
+            value.right,
+            RIGHT_HAND_JOINT_RANGES,
+            f"{label}.right",
+        ),
+    )
+
+
 def resolve_hand_targets(
     *,
     left_hand_joints: object | None = None,
@@ -158,15 +180,16 @@ def resolve_hand_targets(
 ) -> Dex3HandTargets:
     """Resolve each supplied side independently; omission restores its default."""
 
+    validated_default = validate_hand_targets(default, label="default hand targets")
     if left_hand_joints is None:
-        left = default.left
+        left = validated_default.left
     else:
         left = _validate_side(left_hand_joints, LEFT_HAND_JOINT_RANGES, "left_hand_joints")
     if right_hand_joints is None:
-        right = default.right
+        right = validated_default.right
     else:
         right = _validate_side(right_hand_joints, RIGHT_HAND_JOINT_RANGES, "right_hand_joints")
-    return Dex3HandTargets(profile=default.profile, left=left, right=right)
+    return Dex3HandTargets(profile=validated_default.profile, left=left, right=right)
 
 
 def _targets_sha256(targets: Dex3HandTargets) -> str:
@@ -187,9 +210,7 @@ def _targets_sha256(targets: Dex3HandTargets) -> str:
 def hand_targets_record(targets: Dex3HandTargets) -> dict[str, object]:
     """Return profile, mirrored joint orders, f32 vectors, and a domain-separated SHA-256."""
 
-    left = _validate_side(targets.left, LEFT_HAND_JOINT_RANGES, "left")
-    right = _validate_side(targets.right, RIGHT_HAND_JOINT_RANGES, "right")
-    canonical = Dex3HandTargets(profile=targets.profile, left=left, right=right)
+    canonical = validate_hand_targets(targets)
     return {
         "profile": canonical.profile,
         "left_joint_order": list(LEFT_HAND_JOINT_ORDER),
@@ -221,7 +242,9 @@ def parse_hand_targets_record(value: object) -> Dex3HandTargets:
         raise ContractError("hand targets record right joint order is invalid")
     left = _validate_side(value["left_targets"], LEFT_HAND_JOINT_RANGES, "left_targets")
     right = _validate_side(value["right_targets"], RIGHT_HAND_JOINT_RANGES, "right_targets")
-    targets = Dex3HandTargets(profile=_PROFILE_NAME, left=left, right=right)
+    targets = validate_hand_targets(
+        Dex3HandTargets(profile=_PROFILE_NAME, left=left, right=right)
+    )
     if not isinstance(value["sha256"], str) or value["sha256"] != _targets_sha256(targets):
         raise ContractError("hand targets record SHA-256 does not match its vectors")
     return targets
@@ -270,7 +293,11 @@ def measure_hand_tracking(
         raise ContractError("hand tracking requires 14 addresses and ranges")
     if not states:
         raise ContractError("hand tracking requires at least one state")
-    target_vector = np.asarray(targets.left + targets.right, dtype=np.float64)
+    validated_targets = validate_hand_targets(targets)
+    target_vector = np.asarray(
+        validated_targets.left + validated_targets.right,
+        dtype=np.float64,
+    )
 
     times = np.asarray([float(state.sim_time_s) for state in states], dtype=np.float64)
     final_start = float(times.max()) - float(final_seconds)
