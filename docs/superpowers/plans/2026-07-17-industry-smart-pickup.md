@@ -1504,7 +1504,7 @@ Make, and raylib for the final native visualization only.
     build/tests/test_live_flat_pick_entry_oracle
   ```
 
-- [ ] **Step 5: Implement the shared pre-step/post-step production coordinator**
+- [x] **Step 5: Implement the shared pre-step/post-step production coordinator**
 
   Implement `SmartPickupController` first, then replace only the native manual
   pickup branch with calls to it. On the F edge while runtime is in
@@ -1545,7 +1545,7 @@ Make, and raylib for the final native visualization only.
   by Task 3. No controller code may inspect the selected runtime clip to alter
   the authored slot or route.
 
-- [ ] **Step 7: Wire the baked scene without changing auto-demo fixtures**
+- [x] **Step 7: Wire the baked scene without changing auto-demo fixtures**
 
   Manual mode registers `make_smart_pickup_demo_target()` and uses
   `make_smart_pickup_demo_destination_surface()` for the eventual place. Keep
@@ -1558,7 +1558,7 @@ Make, and raylib for the final native visualization only.
   exact binary hash authority. Only the separately detected legacy interaction
   and placement auto-demo fixture modes may load their diagnostic pack.
 
-- [ ] **Step 8: Run focused, structural, and safe regressions**
+- [x] **Step 8: Run focused, structural, and safe regressions**
 
   Run:
 
