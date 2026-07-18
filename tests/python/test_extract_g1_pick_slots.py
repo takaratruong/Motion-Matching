@@ -8,6 +8,7 @@ import numpy as np
 
 from resources.extract_g1_pick_slots import (
     _dedupe_candidates,
+    _quaternion_yaw,
     _root_intersects_table,
     _segment_intersects_expanded_box,
     extract_slot_candidates,
@@ -780,6 +781,86 @@ class ExtractSlotCandidateTransformAndCompatibilityTests(unittest.TestCase):
             candidate["contact_hand_orientation_error_radians"], 1.0e-6
         )
 
+    def test_target_affordance_uses_full_contact_minus_one_object_rotation(self):
+        artifact, manifest = _two_clip_artifact_and_manifest()
+        target = slice(_CLIP_FRAMES, 2 * _CLIP_FRAMES)
+        target_yaw = np.float32(np.deg2rad(35.0))
+        target_object_rotation = _quaternion_multiply(
+            _quaternion_multiply(
+                _yaw_quaternion(target_yaw),
+                _axis_angle_quaternion(
+                    [1.0, 0.0, 0.0], np.deg2rad(25.0)
+                ),
+            ),
+            _axis_angle_quaternion(
+                [0.0, 0.0, 1.0], np.deg2rad(90.0)
+            ),
+        )
+        target_grasp_position = np.array(
+            [0.25, 0.35, -0.20], np.float32
+        )
+        target_grasp_rotation = _axis_angle_quaternion(
+            [1.0, 1.0, 0.0], np.deg2rad(40.0)
+        )
+        artifact.object_rotations[target] = target_object_rotation
+        artifact.grasp_positions_object[1] = target_grasp_position
+        artifact.grasp_rotations_object[1] = target_grasp_rotation
+        artifact.grasp_positions_object[0] = np.array(
+            [-4.0, 3.0, 2.0], np.float32
+        )
+        artifact.grasp_rotations_object[0] = _axis_angle_quaternion(
+            [0.0, 1.0, 0.0], np.deg2rad(120.0)
+        )
+
+        target_object_position = artifact.object_positions[12]
+        target_hand = target_object_position + _rotate_by_quaternion(
+            target_grasp_position, target_object_rotation
+        )
+        target_hand_rotation = _quaternion_multiply(
+            target_object_rotation, target_grasp_rotation
+        )
+        yaw_only_hand = target_object_position + _rotate_y(
+            target_grasp_position, target_yaw
+        )
+        self.assertGreater(
+            float(np.linalg.norm(target_hand - yaw_only_hand)), 0.10
+        )
+
+        source_object_position = artifact.object_positions[2]
+        target_offset = target_hand - target_object_position
+        source_hand = source_object_position + _rotate_y(
+            target_offset, -target_yaw
+        )
+        source_hand[1] = target_hand[1]
+        inverse_scene_yaw = _quaternion_conjugate(
+            _yaw_quaternion(target_yaw)
+        )
+        source_hand_rotation = _quaternion_multiply(
+            inverse_scene_yaw, target_hand_rotation
+        )
+        artifact.positions[3:_CLIP_FRAMES, _RIGHT_WRIST] = (
+            source_hand - artifact.positions[3, 0]
+        )
+        artifact.rotations[3:_CLIP_FRAMES, _RIGHT_WRIST] = (
+            source_hand_rotation
+        )
+        artifact.positions[13:, _RIGHT_WRIST] = (
+            target_hand - artifact.positions[13, 0]
+        )
+        artifact.rotations[13:, _RIGHT_WRIST] = target_hand_rotation
+
+        report = extract_slot_candidates(
+            artifact, manifest, _TARGET_SEQUENCE
+        )
+        candidate = _candidate(report, _SOURCE_SEQUENCE)
+
+        self.assertLessEqual(
+            candidate["contact_hand_position_error_m"], 1.0e-6
+        )
+        self.assertLessEqual(
+            candidate["contact_hand_orientation_error_radians"], 1.0e-6
+        )
+
     def test_root_yaw_is_wrapped_across_positive_pi(self):
         artifact, manifest = _two_clip_artifact_and_manifest()
         artifact.rotations[1, 0] = _yaw_quaternion(np.deg2rad(200.0))
@@ -879,6 +960,39 @@ class ExtractSlotCandidateTransformAndCompatibilityTests(unittest.TestCase):
 
 
 class ExtractSlotGeometryBoundaryTests(unittest.TestCase):
+    def test_quaternion_yaw_tracks_facing_through_large_local_roll(self):
+        expected_yaw = np.float32(np.deg2rad(30.0))
+        composed = _quaternion_multiply(
+            _yaw_quaternion(expected_yaw),
+            _axis_angle_quaternion(
+                [0.0, 0.0, 1.0], np.deg2rad(100.0)
+            ),
+        )
+
+        self.assertAlmostEqual(
+            _quaternion_yaw(composed), float(expected_yaw), places=6
+        )
+
+    def test_slab_epsilon_treats_tiny_boundary_crossing_as_parallel(self):
+        boundary_x = np.float32(0.5)
+        outside_x = np.nextafter(boundary_x, np.float32(np.inf))
+        start = np.array([outside_x, -2.0, 0.0], np.float64)
+        stop = np.array([boundary_x, 0.0, 0.0], np.float64)
+        self.assertLessEqual(
+            abs(stop[0] - start[0]), float(np.float32(1.0e-7))
+        )
+
+        self.assertFalse(
+            _segment_intersects_expanded_box(
+                start,
+                stop,
+                np.zeros(3, np.float64),
+                _IDENTITY.astype(np.float64),
+                np.array([1.0, 2.0, 2.0], np.float64),
+                0.0,
+            )
+        )
+
     def test_identity_table_root_boundary_is_closed_in_float64(self):
         table_position = np.zeros(3, np.float64)
         table_rotation = _IDENTITY.astype(np.float64)
