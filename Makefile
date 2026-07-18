@@ -134,6 +134,7 @@ CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_arrival
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_arrival_controller
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_pick_approach
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_pick_assist
+CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_smart_pickup_scene
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_stationary_motion_matching
 RELEASE_FAST_MATH_TARGET_TEST := \
   $(CPP_TEST_DIR)/test_interaction_target_release_fast_math
@@ -198,6 +199,25 @@ INTERACTION_RUNTIME_SOURCES += interaction_attachment.cpp interaction_playback.c
 INTERACTION_RUNTIME_SOURCES += interaction_matcher.cpp interaction_features.cpp
 INTERACTION_RUNTIME_SOURCES += interaction_pose.cpp interaction_target.cpp
 INTERACTION_RUNTIME_SOURCES += $(INTERACTION_PLACE_SOURCES)
+
+INTERACTION_SMART_PICKUP_SCENE_LINK_SOURCES := \
+  interaction_smart_pickup_scene.cpp \
+  interaction_target.cpp interaction_place_target.cpp interaction_pose.cpp
+INTERACTION_SMART_PICKUP_SCENE_HEADERS := \
+  interaction_smart_pickup_scene.h interaction_target.h \
+  interaction_place_target.h interaction_pose.h interaction_matcher.h \
+  interaction_features.h interaction_database.h g1_skeleton.h vec.h quat.h
+INTERACTION_SMART_PICKUP_PREVIEW_LINK_SOURCES := \
+  interaction_controller_adapter.cpp interaction_target_rig_ik.cpp \
+  $(INTERACTION_RUNTIME_SOURCES)
+INTERACTION_SMART_PICKUP_PREVIEW_HEADERS := \
+  interaction_controller_adapter.h interaction_target_rig_ik.h \
+  stationary_motion_matching.h database.h array.h common.h spring.h \
+  locomotion_timing.h interaction_runtime.h $(INTERACTION_PLACE_HEADERS) \
+  interaction_carry.h interaction_ik.h interaction_rotation_gate.h \
+  g1_arm_joint_metadata.h interaction_attachment.h interaction_playback.h \
+  interaction_matcher.h interaction_features.h interaction_pose.h \
+  interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h
 
 .PHONY: test-python test-cpp test-interaction
 .PHONY: retime-flat-database test-flat-database-retime
@@ -282,6 +302,9 @@ $(PICK_ASSIST_RELEASE_FAST_MATH_TEST): tests/cpp/test_interaction_pick_assist.cp
 	# GCC 13 misdiagnoses libstdc++'s small-range std::sort as out of bounds.
 	$(CXX) $(CPP_TEST_FLAGS) -Wno-array-bounds -O3 -DNDEBUG -ffast-math tests/cpp/test_interaction_pick_assist.cpp interaction_pick_assist.cpp interaction_pick_slots.cpp interaction_arrival.cpp interaction_target.cpp interaction_pose.cpp -o $@
 
+$(CPP_TEST_DIR)/test_interaction_smart_pickup_scene: tests/cpp/test_interaction_smart_pickup_scene.cpp $(INTERACTION_SMART_PICKUP_SCENE_LINK_SOURCES) $(INTERACTION_SMART_PICKUP_SCENE_HEADERS) | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_smart_pickup_scene.cpp $(INTERACTION_SMART_PICKUP_SCENE_LINK_SOURCES) -o $@
+
 $(ARRIVAL_CONTROLLER_RELEASE_FAST_MATH_TEST): tests/cpp/test_interaction_arrival_controller.cpp $(INTERACTION_ARRIVAL_BUILD_INPUTS) $(LOCOMOTION_CONTROLLER_UPDATE_BUILD_INPUTS) array.h vec.h quat.h common.h spring.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) -Wno-unused-parameter -O3 -DNDEBUG -ffast-math tests/cpp/test_interaction_arrival_controller.cpp interaction_arrival.cpp locomotion_controller_update.cpp -o $@
 
@@ -358,6 +381,12 @@ interaction_place_probe: interaction_place_probe.cpp tests/cpp/pick_entry_oracle
 
 $(RELEASE_INTERACTION_PLACE_PROBE): interaction_place_probe.cpp tests/cpp/pick_entry_oracle_roots.h interaction_controller_adapter.cpp interaction_controller_adapter.h interaction_target_rig_ik.cpp interaction_target_rig_ik.h locomotion_timing.h interaction_runtime.h $(INTERACTION_RUNTIME_SOURCES) $(INTERACTION_PLACE_HEADERS) interaction_carry.h interaction_ik.h interaction_rotation_gate.h g1_arm_joint_metadata.h interaction_attachment.h interaction_playback.h interaction_matcher.h interaction_features.h interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) $(CONTROLLER_RELEASE_PARITY_FLAGS) interaction_place_probe.cpp interaction_controller_adapter.cpp interaction_target_rig_ik.cpp $(INTERACTION_RUNTIME_SOURCES) -o $@
+
+interaction_smart_pickup_preview_probe: interaction_smart_pickup_preview_probe.cpp $(INTERACTION_SMART_PICKUP_PREVIEW_LINK_SOURCES) $(INTERACTION_SMART_PICKUP_PREVIEW_HEADERS)
+	$(CXX) $(CPP_TEST_FLAGS) -Wno-unused-parameter -Wno-unused-result -O2 interaction_smart_pickup_preview_probe.cpp $(INTERACTION_SMART_PICKUP_PREVIEW_LINK_SOURCES) -o $@
+
+interaction_smart_pickup_scene_probe: interaction_smart_pickup_scene_probe.cpp $(INTERACTION_SMART_PICKUP_SCENE_LINK_SOURCES) $(INTERACTION_SMART_PICKUP_SCENE_HEADERS)
+	$(CXX) $(CPP_TEST_FLAGS) interaction_smart_pickup_scene_probe.cpp $(INTERACTION_SMART_PICKUP_SCENE_LINK_SOURCES) -o $@
 
 test-python: interaction_probe interaction_query_probe
 	python -m unittest discover -s tests/python -t . -v
