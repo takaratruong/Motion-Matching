@@ -162,6 +162,33 @@ def _segment_intersects_expanded_box(
 
 
 def _dedupe_candidates(candidates: Sequence[dict]) -> tuple[list[dict], int]:
+    def near_in_representation(
+        candidate: dict,
+        existing: dict,
+        *,
+        authored_float32: bool,
+    ) -> bool:
+        def scalar(row: dict, field: str) -> float:
+            value = float(row[field])
+            return float(np.float32(value)) if authored_float32 else value
+
+        distance = math.hypot(
+            scalar(candidate, "root_x_object_m")
+            - scalar(existing, "root_x_object_m"),
+            scalar(candidate, "root_z_object_m")
+            - scalar(existing, "root_z_object_m"),
+        )
+        yaw_distance = abs(
+            _wrap_angle(
+                scalar(candidate, "root_yaw_object_radians")
+                - scalar(existing, "root_yaw_object_radians")
+            )
+        )
+        return (
+            distance <= float(_DEDUPE_POSITION_LIMIT_M)
+            and yaw_distance <= float(_DEDUPE_YAW_LIMIT_RADIANS)
+        )
+
     retained: list[dict] = []
     deduplicated_count = 0
     for candidate in sorted(candidates, key=lambda row: tuple(row["stable_key"])):
@@ -169,21 +196,13 @@ def _dedupe_candidates(candidates: Sequence[dict]) -> tuple[list[dict], int]:
         for existing in retained:
             if candidate["active_hand"] != existing["active_hand"]:
                 continue
-            distance = math.hypot(
-                float(candidate["root_x_object_m"])
-                - float(existing["root_x_object_m"]),
-                float(candidate["root_z_object_m"])
-                - float(existing["root_z_object_m"]),
-            )
-            yaw_distance = abs(
-                _wrap_angle(
-                    float(candidate["root_yaw_object_radians"])
-                    - float(existing["root_yaw_object_radians"])
-                )
-            )
             if (
-                distance <= float(_DEDUPE_POSITION_LIMIT_M)
-                and yaw_distance <= float(_DEDUPE_YAW_LIMIT_RADIANS)
+                near_in_representation(
+                    candidate, existing, authored_float32=False
+                )
+                or near_in_representation(
+                    candidate, existing, authored_float32=True
+                )
             ):
                 duplicate = True
                 break
@@ -249,16 +268,23 @@ def _joined_manifest_records(
     if target_record is None:
         raise ValueError(f"target sequence {target_sequence_id!r} was not found")
 
-    manifest_parents = manifest.get("skeleton_parents")
-    if manifest_parents is not None:
-        try:
-            parents = np.asarray(manifest_parents, dtype=np.int32)
-        except (TypeError, ValueError) as error:
-            raise ValueError("manifest skeleton parents are invalid") from error
-        if not np.array_equal(parents, artifact.parents):
-            raise ValueError(
-                "manifest skeleton parents must match the artifact parents"
-            )
+    if "skeleton_parents" not in manifest:
+        raise ValueError("manifest skeleton_parents is required")
+    manifest_parents = manifest["skeleton_parents"]
+    try:
+        parents = np.asarray(manifest_parents)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "manifest skeleton_parents must match the artifact parents"
+        ) from error
+    if (
+        parents.shape != artifact.parents.shape
+        or not np.issubdtype(parents.dtype, np.integer)
+        or not np.array_equal(parents, artifact.parents)
+    ):
+        raise ValueError(
+            "manifest skeleton_parents must match the artifact parents"
+        )
 
     artifact_ranges = {
         (int(start), int(stop)): index
@@ -422,9 +448,10 @@ def extract_slot_candidates(
     if (
         isinstance(schema_version, bool)
         or not isinstance(schema_version, (int, np.integer))
+        or int(schema_version) != 1
     ):
-        raise ValueError("manifest schema_version must be an integer")
-    schema_version = int(schema_version)
+        raise ValueError("manifest schema_version must be exactly 1")
+    schema_version = 1
 
     joined, target_record, target_index = _joined_manifest_records(
         artifact, manifest, target_sequence_id
