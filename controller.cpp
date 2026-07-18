@@ -50,6 +50,7 @@
 #include "scene_switch.h"
 #include "motion_match_log.h"
 #include "cleanup_runtime.h"
+#include "g1_mesh_renderer.h"
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic push
@@ -1996,6 +1997,27 @@ int main(void)
         controller_exit_requested = true;
     }
 
+    G1MeshRenderer g1_mesh_renderer = {};
+    bool show_g1_mesh = true;
+    bool show_g1_bones = true;
+    if (!controller_exit_requested && !::g1_mesh_renderer_load(
+            g1_mesh_renderer,
+            "resources/g1_mesh/g1_raylib.glb",
+            artifact_error,
+            static_cast<int>(sizeof(artifact_error))))
+    {
+        std::fprintf(stderr, "G1 mesh load error: %s\n", artifact_error);
+        controller_exit_code = 2;
+        controller_exit_requested = true;
+    }
+    if (!controller_exit_requested)
+    {
+        std::fprintf(
+            stdout,
+            "G1 mesh loaded: %d parts\n",
+            g1_mesh_renderer.model.meshCount);
+    }
+
     auto scene_loader = [&](scene_pack& candidate, int index,
                             char* error, int capacity)
     {
@@ -2182,6 +2204,9 @@ int main(void)
 
     auto update_func = [&]()
     {
+        if (::IsKeyPressed(KEY_M)) show_g1_mesh = !show_g1_mesh;
+        if (::IsKeyPressed(KEY_B)) show_g1_bones = !show_g1_bones;
+
         if (pending_reset)
         {
             if (!scene_reset_current(
@@ -3498,6 +3523,17 @@ int main(void)
             desired_strafe,
             dt);
 
+        if (!::g1_mesh_renderer_update(
+                g1_mesh_renderer,
+                state.global_bone_positions,
+                state.global_bone_rotations,
+                artifact_error,
+                static_cast<int>(sizeof(artifact_error))))
+        {
+            controlled_runtime_error(artifact_error);
+            return;
+        }
+
         // Render
         
         BeginDrawing();
@@ -3515,6 +3551,11 @@ int main(void)
             Vector3{ 0.0f, 0.0f, 0.0f },
             1.0f,
             DARKGRAY);
+
+        if (show_g1_mesh)
+        {
+            ::g1_mesh_renderer_draw(g1_mesh_renderer);
+        }
 
         // Draw Simulation Object
         
@@ -3563,15 +3604,23 @@ int main(void)
         
         // G1: no skinned mesh — draw the skeleton directly from bone transforms.
         // Sphere at each joint, capsule (cylinder) from each bone to its parent.
-        for (int bi = 1; bi < db.nbones(); bi++)
+        if (show_g1_bones)
         {
-            vec3 bp = state.global_bone_positions(bi);
-            DrawSphereWires(to_Vector3(bp), 0.028f, 4, 8, DARKBLUE);
-            int par = db.bone_parents(bi);
-            if (par > 0)
+            for (int bi = 1; bi < db.nbones(); bi++)
             {
-                DrawCylinderEx(to_Vector3(state.global_bone_positions(par)), to_Vector3(bp),
-                    0.018f, 0.018f, 6, SKYBLUE);
+                vec3 bp = state.global_bone_positions(bi);
+                DrawSphereWires(to_Vector3(bp), 0.028f, 4, 8, DARKBLUE);
+                int par = db.bone_parents(bi);
+                if (par > 0)
+                {
+                    DrawCylinderEx(
+                        to_Vector3(state.global_bone_positions(par)),
+                        to_Vector3(bp),
+                        0.018f,
+                        0.018f,
+                        6,
+                        SKYBLUE);
+                }
             }
         }
         
@@ -3772,6 +3821,12 @@ int main(void)
         GuiLabel(Rectangle{ 990, ui_ctrl_hei +  60, 250, 20 }, "Left trigger - strafe");
         GuiLabel(Rectangle{ 990, ui_ctrl_hei +  85, 250, 20 }, "Shoulders - zoom");
         GuiLabel(Rectangle{ 990, ui_ctrl_hei + 110, 250, 20 }, "A button - walk");
+        GuiLabel(
+            Rectangle{ 990, ui_ctrl_hei + 135, 250, 20 },
+            TextFormat(
+                "M mesh %s | B bones %s",
+                show_g1_mesh ? "ON" : "OFF",
+                show_g1_bones ? "ON" : "OFF"));
         
 
         
@@ -3990,6 +4045,7 @@ int main(void)
             fprintf(stderr, "G1 runtime log error: %s\n", artifact_error);
             if (controller_exit_code == 0) controller_exit_code = 2;
         }
+        ::g1_mesh_renderer_unload(g1_mesh_renderer);
         model_unloader(terrain_model);
 
         CloseWindow();
