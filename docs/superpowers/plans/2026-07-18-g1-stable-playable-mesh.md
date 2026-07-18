@@ -57,7 +57,7 @@ export G1_TERRAIN_DIR=/home/ubuntu/projects/motion-matching/resources/g1_terrain
 - Consumes: corrected asset tree exactly as recorded at `dbb5f41` and approved design/plan documents from branch `g1-footprint-task6`.
 - Produces: validated `resources/g1_mesh/g1_raylib.glb`, its authenticated manifest, and reproducible validator/exporter code for Task 2.
 
-- [ ] **Step 1: Confirm the isolated stable base before changing files**
+- [x] **Step 1: Confirm the isolated stable base before changing files**
 
 ```bash
 test "$(git rev-parse HEAD)" = "$(git rev-parse 8f7ead2)"
@@ -75,7 +75,7 @@ Expected: every command exits `0`; the stable controller contains the classic
 UI and independent travel/heading/lateral paths and does not contain the
 transactional UI.
 
-- [ ] **Step 2: Install the asset test first**
+- [x] **Step 2: Install the asset test first**
 
 ```bash
 git restore --source=dbb5f41 -- tests/python/test_g1_mesh_asset.py
@@ -84,7 +84,7 @@ git restore --source=dbb5f41 -- tests/python/test_g1_mesh_asset.py
 This restores only the accepted test. Do not restore the asset implementation
 yet.
 
-- [ ] **Step 3: Run the asset test and verify the intended RED failure**
+- [x] **Step 3: Run the asset test and verify the intended RED failure**
 
 ```bash
 python3 -m unittest tests.python.test_g1_mesh_asset -v
@@ -93,7 +93,7 @@ python3 -m unittest tests.python.test_g1_mesh_asset -v
 Expected: FAIL during import because `resources.g1_mesh` does not exist on the
 stable branch. A different failure must be diagnosed before continuing.
 
-- [ ] **Step 4: Import the exact corrected asset implementation**
+- [x] **Step 4: Import the exact corrected asset implementation**
 
 ```bash
 git restore --source=dbb5f41 -- resources/g1_mesh
@@ -105,7 +105,7 @@ git restore --source=g1-footprint-task6 -- \
 Expected: `git status --short` lists only the asset package, its test, and the
 two approved documents.
 
-- [ ] **Step 5: Run the corrected asset GREEN gate**
+- [x] **Step 5: Run the corrected asset GREEN gate**
 
 ```bash
 python3 -m unittest tests.python.test_g1_mesh_asset -v
@@ -128,7 +128,7 @@ Expected: all seven unit tests pass; the validator exits `0`, reports 35 meshes
 and 39 bones, and reports no bind-frame, hash, rigid-weight, or index-limit
 error.
 
-- [ ] **Step 6: Commit and push the asset checkpoint**
+- [x] **Step 6: Commit and push the asset checkpoint**
 
 ```bash
 git add resources/g1_mesh tests/python/test_g1_mesh_asset.py \
@@ -157,7 +157,7 @@ Expected: commit succeeds, the remote branch is created, and
 - Consumes: Task 1 GLB path `resources/g1_mesh/g1_raylib.glb`; stable final pose slices `state.global_bone_positions` and `state.global_bone_rotations`; existing `normal_cleanup` lifecycle.
 - Produces: `G1MeshRenderer` load/update/draw/unload integration; local booleans `show_g1_mesh` and `show_g1_bones`; `M` and `B` edge-triggered display toggles.
 
-- [ ] **Step 1: Add a source-contract test before production code**
+- [x] **Step 1: Add a source-contract test before production code**
 
 Create `tests/python/test_g1_playable_mesh_integration.py` with:
 
@@ -243,7 +243,7 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 2: Run the integration test and verify RED**
+- [x] **Step 2: Run the integration test and verify RED**
 
 ```bash
 python3 -m unittest tests.python.test_g1_playable_mesh_integration -v
@@ -252,7 +252,7 @@ python3 -m unittest tests.python.test_g1_playable_mesh_integration -v
 Expected: the classic UI/control test passes; the mesh pose and lifecycle tests
 fail because the stable controller has no mesh renderer yet.
 
-- [ ] **Step 3: Install the renderer component test and verify RED before importing the header**
+- [x] **Step 3: Install the renderer component test and verify RED before importing the header**
 
 ```bash
 git restore --source=2080266 -- tests/cpp/test_g1_mesh_renderer.cpp
@@ -296,7 +296,7 @@ fi
 
 Expected: compilation fails only because `g1_mesh_renderer.h` is missing.
 
-- [ ] **Step 4: Import the certified renderer component and verify its GREEN gate**
+- [x] **Step 4: Import the certified renderer component and verify its GREEN gate**
 
 ```bash
 git restore --source=2080266 -- g1_mesh_renderer.h
@@ -312,7 +312,7 @@ g++ -std=c++17 -O2 -D_DEFAULT_SOURCE -DPLATFORM_DESKTOP \
 Expected: compilation succeeds and the component test exits `0` with no
 output.
 
-- [ ] **Step 5: Add the renderer include and one owned runtime instance**
+- [x] **Step 5: Add the renderer include and one owned runtime instance**
 
 Add the include beside the other G1 runtime owners:
 
@@ -349,7 +349,7 @@ Immediately after the terrain model readiness gate, add:
 Do not change terrain `model_load_count` or `model_unload_count`; those counters
 remain terrain-only.
 
-- [ ] **Step 6: Transfer and draw the final stable pose**
+- [x] **Step 6: Transfer and draw the final stable pose**
 
 At the beginning of `update_func`, add the edge-triggered display controls:
 
@@ -407,7 +407,7 @@ Wrap the unchanged skeleton loop in:
         }
 ```
 
-- [ ] **Step 7: Preserve the classic UI and expose only two display toggles**
+- [x] **Step 7: Preserve the classic UI and expose only two display toggles**
 
 Keep every existing Raygui group, slider, and control label. Add one line at
 the bottom of the existing `controls` group:
@@ -423,7 +423,7 @@ the bottom of the existing `controls` group:
 
 No other UI dimensions or labels change.
 
-- [ ] **Step 8: Route mesh ownership through normal cleanup**
+- [x] **Step 8: Route mesh ownership through normal cleanup**
 
 In `normal_cleanup`, immediately before `model_unloader(terrain_model);`, add:
 
@@ -434,7 +434,7 @@ In `normal_cleanup`, immediately before `model_unloader(terrain_model);`, add:
 
 There must be exactly one controller call to `g1_mesh_renderer_unload`.
 
-- [ ] **Step 9: Run focused GREEN tests and build the stable controller**
+- [x] **Step 9: Run focused GREEN tests and build the stable controller**
 
 ```bash
 python3 -m unittest \
@@ -463,7 +463,7 @@ build exits `0`. `strings /tmp/g1-playable-mesh-build/controller-g1-playable`
 contains `terrain scene / runtime`, `run sideways speed`, `M mesh`, and
 `G1 mesh loaded`, and does not contain `Transactional terrain IK`.
 
-- [ ] **Step 10: Commit and push the playable renderer checkpoint**
+- [x] **Step 10: Commit and push the playable renderer checkpoint**
 
 ```bash
 git add controller.cpp g1_mesh_renderer.h \
@@ -490,7 +490,28 @@ Expected: commit and push succeed and `git status --short` is empty.
 - Consumes: Task 2 controller binary contract; external authenticated terrain pack; X11 display `:1`.
 - Produces: deterministic 32-frame evidence, live forward/back/lateral/diagonal/strafe/camera input evidence, a pushed source checkpoint, and one running classic-UI mesh visualizer.
 
-- [ ] **Step 1: Rebuild all focused tests from the reviewed commit**
+- [x] **Execution amendment: atomically refresh the stale active terrain pack before certification**
+
+The exact Step 2 command against the prescribed active path failed closed with
+`scene route count changed`: that path held the authenticated July-14 pack,
+while the reviewed stable controller requires the authenticated July-15
+directional-route metadata already present at
+`/tmp/g1-terrain-footprint-runtime-v1`. The trees contain the same 62 files and
+differ only in `manifest.json`, `scenes/index.json`, and the route-bearing
+`scene.json` files for `stairs-shallow`, `stairs-standard`, and
+`mixed-multilevel`. The protected `database.bin`, `terrain_features.bin`,
+`terrain_support.bin`, and `validation.json` payloads, plus every terrain,
+mesh, and walkability payload, are byte-identical. Before exchange, validate
+the candidate, prove the exact five-file difference and zero exact final-binary
+processes, and retain `/tmp/g1-terrain-active-v1.SHA256SUMS` as the stale-pack
+rollback oracle. Use the repository `_rename_exchange` while holding both
+parent-directory locks, then fsync both parents. Validate the new active pack
+and recheck the four protected hashes; on any failure, immediately exchange
+back, fsync both parents, and prove the rollback oracle. After success, the old
+active pack remains intact at the former candidate path and must not be used by
+the remaining gates.
+
+- [x] **Step 1: Rebuild all focused tests from the reviewed commit**
 
 ```bash
 rm -rf /tmp/g1-playable-mesh-final
@@ -522,7 +543,7 @@ g++ -std=c++17 -O3 -ffast-math -march=native -DNDEBUG \
 
 Expected: all tests and builds exit `0` from a clean output directory.
 
-- [ ] **Step 2: Run the deterministic mixed-multilevel 32-frame gate**
+- [x] **Step 2: Run the deterministic mixed-multilevel 32-frame gate**
 
 ```bash
 DISPLAY=:1 \
@@ -548,7 +569,7 @@ Expected: runtime exits `0`; checker prints `VALID runtime-log frames=32`;
 the CSV has one header plus 32 frames; the corrected asset reports 35 parts;
 stderr is empty.
 
-- [ ] **Step 3: Exercise real keyboard input against the live event path**
+- [x] **Step 3: Exercise real keyboard input against the live event path**
 
 ```bash
 DISPLAY=:1 \
@@ -610,7 +631,7 @@ Expected: one live window accepts forward, backward, lateral, diagonal,
 Ctrl-strafe, camera, mesh-toggle, and bone-toggle events without exiting or
 printing an error. The identity-checked smoke process then terminates cleanly.
 
-- [ ] **Step 4: Record and push the certified checkpoint**
+- [x] **Step 4: Record and push the certified checkpoint**
 
 Mark every completed plan checkbox `[x]`, then run:
 
