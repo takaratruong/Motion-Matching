@@ -1486,7 +1486,7 @@ Make, and raylib for the final native visualization only.
   - every activation case has exactly one locomotion provider call, one bridge
     snapshot, and one assist observation—never an extra hidden step.
 
-- [ ] **Step 4: Migrate the old live-flat oracle before implementation**
+- [x] **Step 4: Migrate the old live-flat oracle before implementation**
 
   In `tests/cpp/test_live_flat_pick_entry_oracle.cpp`, retain the proven
   flat-pose bridge, stationary-snapshot, and legacy placement Plus/Minus tests.

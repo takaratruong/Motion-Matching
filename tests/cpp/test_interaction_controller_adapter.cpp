@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -465,6 +466,39 @@ std::string read_text(const std::string& path) {
     std::ostringstream contents;
     contents << input.rdbuf();
     return contents.str();
+}
+
+#ifndef MM_REPO_SOURCE_ROOT
+#error "MM_REPO_SOURCE_ROOT must be the compiled-in repository root"
+#endif
+
+std::string read_project_text(const std::string& relative_path) {
+    return read_text(
+        std::string(MM_REPO_SOURCE_ROOT) + "/" + relative_path);
+}
+
+size_t occurrence_count(
+    const std::string& source,
+    const std::string& needle) {
+    require(!needle.empty(), "cannot count an empty source token");
+    size_t count = 0U;
+    size_t cursor = 0U;
+    while ((cursor = source.find(needle, cursor)) != std::string::npos) {
+        ++count;
+        cursor += needle.size();
+    }
+    return count;
+}
+
+std::string without_ascii_whitespace(const std::string& source) {
+    std::string compact;
+    compact.reserve(source.size());
+    for (unsigned char character : source) {
+        if (!std::isspace(character)) {
+            compact.push_back(static_cast<char>(character));
+        }
+    }
+    return compact;
 }
 
 void test_exact_constants() {
@@ -5835,7 +5869,7 @@ void test_cross_pack_frame_count_validation() {
 }
 
 void test_debug_draw_uses_real_correction_geometry_and_complete_text() {
-    const std::string debug = read_text("interaction_debug_draw.h");
+    const std::string debug = read_project_text("interaction_debug_draw.h");
     assert(debug.find("requested_root_correction_m * right") ==
            std::string::npos);
     assert(debug.find(
@@ -5871,8 +5905,308 @@ void test_debug_draw_uses_real_correction_geometry_and_complete_text() {
            std::string::npos);
 }
 
+void test_controller_smart_pickup_two_phase_production_seam() {
+    const std::string controller = read_project_text("controller.cpp");
+    const std::string adapter =
+        read_project_text("interaction_controller_adapter.cpp");
+
+    require(
+        controller.find(
+            "#include \"interaction_smart_pickup_controller.h\"") !=
+                std::string::npos,
+        "controller does not include the shared Smart Pickup coordinator");
+    require(
+        occurrence_count(
+            controller,
+            "manual_smart_pickup_controller.pre_step(") == 1U &&
+            occurrence_count(
+                controller,
+                "manual_smart_pickup_controller.post_step(") == 1U,
+        "controller does not invoke exactly one Smart Pickup pre/post pair");
+    require(
+        occurrence_count(
+            controller, "interaction_scheduler.tick(") == 1U,
+        "controller has more than one scheduler tick/publication seam");
+    require(
+        occurrence_count(
+            controller,
+            "interaction::LocomotionSnapshot live_flat_snapshot") == 1U,
+        "controller has more than one post-step live-flat snapshot");
+
+    const size_t manual_input_begin = controller.find(
+        "        // Manual pick-assist input begins.");
+    const size_t manual_input_end = controller.find(
+        "        // Manual pick-assist input ends.", manual_input_begin);
+    const size_t manual_observation_begin = controller.find(
+        "        // Manual pick-assist observation begins.");
+    const size_t manual_observation_end = controller.find(
+        "        // Manual pick-assist observation ends.",
+        manual_observation_begin);
+    require(
+        manual_input_begin != std::string::npos &&
+            manual_input_end != std::string::npos &&
+            manual_observation_begin != std::string::npos &&
+            manual_observation_end != std::string::npos,
+        "controller lost the bounded manual Smart Pickup source seams");
+    const std::string manual_input = controller.substr(
+        manual_input_begin, manual_input_end - manual_input_begin);
+    const std::string manual_observation = controller.substr(
+        manual_observation_begin,
+        manual_observation_end - manual_observation_begin);
+    const std::string compact_manual_input =
+        without_ascii_whitespace(manual_input);
+    const std::string compact_manual_observation =
+        without_ascii_whitespace(manual_observation);
+
+    require(
+        compact_manual_input.find(
+            "constinteraction::InteractionTarget*"
+            "manual_smart_pickup_target=interaction_registry.find("
+            "interaction_scene_target_handle);") != std::string::npos,
+        "manual F does not capture the exact baked scene target");
+    require(
+        manual_input.find("resolve_single_target(") == std::string::npos &&
+            manual_input.find("1.45F") == std::string::npos &&
+            manual_input.find("make_pick_reach_waypoint(") ==
+                std::string::npos &&
+            manual_input.find("make_pick_entry_slots(") ==
+                std::string::npos,
+        "manual F retains proximity gating or fixed-two slot synthesis");
+    require(
+        controller.find("interaction::ControllerPickAssist") ==
+                std::string::npos &&
+            controller.find("manual_pick_assist") == std::string::npos,
+        "controller retains a second manual assist state machine");
+
+    const std::array<std::string, 11> ordered_pre_tokens{{
+        "const interaction::InteractionTarget* manual_smart_pickup_target",
+        "interaction_registry.find(",
+        "manual_smart_pickup_pre_input.runtime_state =",
+        "manual_smart_pickup_pre_input.interact_pressed =",
+        "manual_smart_pickup_pre_input.cancel_pressed =",
+        "manual_smart_pickup_pre_input.selected_target =",
+        "manual_smart_pickup_pre_input.selected_affordance_id =",
+        "manual_smart_pickup_pre_input.left_stick =",
+        "manual_smart_pickup_pre_input.right_stick =",
+        "manual_smart_pickup_controller.pre_step(",
+        "gamepadstick_left = manual_smart_pickup_pre_step.left_stick",
+    }};
+    std::array<size_t, 11> pre_positions{};
+    for (size_t index = 0U; index < ordered_pre_tokens.size(); ++index) {
+        pre_positions[index] = manual_input.find(ordered_pre_tokens[index]);
+    }
+    require(
+        std::all_of(
+            pre_positions.begin(), pre_positions.end(),
+            [](size_t position) { return position != std::string::npos; }) &&
+            std::is_sorted(pre_positions.begin(), pre_positions.end()),
+        "manual pre-step data does not flow lookup/input/call/returned-stick");
+    const size_t returned_left = pre_positions.back();
+    const size_t returned_right = manual_input.find(
+        "gamepadstick_right = manual_smart_pickup_pre_step.right_stick",
+        returned_left);
+    require(
+        returned_right != std::string::npos && returned_left < returned_right &&
+            occurrence_count(
+                manual_input,
+                "manual_smart_pickup_controller.pre_step(") == 1U &&
+            compact_manual_input.find(
+                "manual_smart_pickup_controller.pre_step("
+                "manual_smart_pickup_pre_input)") != std::string::npos,
+        "manual pre-step result is not applied exactly once and in order");
+
+    const size_t pre_step = controller.find(
+        "manual_smart_pickup_controller.pre_step(");
+    const size_t velocity_update = controller.find(
+        "vec3 desired_velocity_curr = desired_velocity_update(", pre_step);
+    const size_t simulation_update = controller.find(
+        "        simulation_positions_update(", velocity_update);
+    const size_t live_flat_snapshot = controller.find(
+        "interaction::LocomotionSnapshot live_flat_snapshot",
+        simulation_update);
+    const size_t post_step = controller.find(
+        "manual_smart_pickup_controller.post_step(",
+        live_flat_snapshot);
+    const size_t scheduler_tick = controller.find(
+        "interaction_scheduler.tick(", post_step);
+    require(
+        pre_step != std::string::npos &&
+            velocity_update != std::string::npos &&
+            simulation_update != std::string::npos &&
+            live_flat_snapshot != std::string::npos &&
+            post_step != std::string::npos &&
+            scheduler_tick != std::string::npos &&
+            pre_step < velocity_update &&
+            velocity_update < simulation_update &&
+            simulation_update < live_flat_snapshot &&
+            live_flat_snapshot < post_step &&
+            post_step < scheduler_tick,
+        "production activation is not pre/ordinary-step/bridge/post/scheduler");
+
+    const std::string ordinary_step = controller.substr(
+        velocity_update, live_flat_snapshot - velocity_update);
+    require(
+        occurrence_count(
+            ordinary_step, "simulation_positions_update(") == 1U &&
+            occurrence_count(
+                ordinary_step, "simulation_rotations_update(") == 1U &&
+            ordinary_step.find("obstacles_positions,") !=
+                std::string::npos &&
+            ordinary_step.find("obstacles_scales);") !=
+                std::string::npos,
+        "activation does not reuse one ordinary collision-aware locomotion step");
+    require(
+        manual_input.find(
+            "gamepadstick_left = manual_smart_pickup_pre_step.left_stick") !=
+                std::string::npos &&
+            manual_input.find(
+                "gamepadstick_right = manual_smart_pickup_pre_step.right_stick") !=
+                std::string::npos,
+        "ordinary activation does not consume the coordinator's zeroed sticks");
+
+    const std::array<std::string, 13> ordered_post_tokens{{
+        "interaction::SmartPickupPostStepInput manual_smart_pickup_post_input",
+        "manual_smart_pickup_post_input.runtime_state =",
+        "manual_smart_pickup_post_input.live_flat_snapshot =",
+        "const interaction::InteractionTarget* manual_smart_pickup_current_target",
+        "interaction_registry.find(",
+        "manual_smart_pickup_post_input.current_target =",
+        "manual_smart_pickup_post_input.obstacle_centers.push_back(",
+        "manual_smart_pickup_post_input.obstacle_sizes.push_back(",
+        "manual_smart_pickup_post_input.simulation_velocity =",
+        "manual_smart_pickup_post_input.displayed_planar_speed_mps =",
+        "manual_smart_pickup_post_input.camera_azimuth =",
+        "manual_smart_pickup_post_input.next_request_id =",
+        "preview_manual_smart_pickup",
+    }};
+    std::array<size_t, 13> post_positions{};
+    for (size_t index = 0U; index < ordered_post_tokens.size(); ++index) {
+        post_positions[index] =
+            manual_observation.find(ordered_post_tokens[index]);
+    }
+    require(
+        std::all_of(
+            post_positions.begin(), post_positions.end(),
+            [](size_t position) { return position != std::string::npos; }) &&
+            std::is_sorted(post_positions.begin(), post_positions.end()),
+        "manual post-step fields do not flow snapshot/target/obstacles/metrics/id");
+    require(
+        compact_manual_observation.find(
+            "for(intobstacle_index=0;"
+            "obstacle_index<obstacles_positions.size;++obstacle_index)") !=
+                std::string::npos &&
+            compact_manual_observation.find(
+                "manual_smart_pickup_post_input.obstacle_centers.push_back("
+                "obstacles_positions(obstacle_index));") !=
+                std::string::npos &&
+            compact_manual_observation.find(
+                "manual_smart_pickup_post_input.obstacle_sizes.push_back("
+                "obstacles_scales(obstacle_index));") !=
+                std::string::npos,
+        "post input does not copy the locomotion arrays element-for-element");
+    require(
+        occurrence_count(
+            manual_observation,
+            "interaction_runtime.preview_pick(") == 1U &&
+            compact_manual_observation.find(
+                "returninteraction_runtime.preview_pick("
+                "snapshot,prospective_root,target,affordance_id);") !=
+                std::string::npos,
+        "manual callback is not one direct four-argument runtime preview");
+
+    const size_t post_call = manual_observation.find(
+        "manual_smart_pickup_controller.post_step(",
+        post_positions.back());
+    const size_t request_guard = manual_observation.find(
+        "if (manual_smart_pickup_post_step.pick_request.has_value())",
+        post_call);
+    const size_t request_edge = manual_observation.find(
+        "interaction_edges.interact_pressed = true", request_guard);
+    const size_t request_latch = manual_observation.find(
+        "manual_smart_pickup_request = "
+        "manual_smart_pickup_post_step.pick_request",
+        request_edge);
+    const size_t request_increment = manual_observation.find(
+        "++interaction_next_request_id", request_latch);
+    require(
+        post_call != std::string::npos &&
+            compact_manual_observation.find(
+                "manual_smart_pickup_controller.post_step("
+                "manual_smart_pickup_post_input,"
+                "preview_manual_smart_pickup)") != std::string::npos &&
+            request_guard != std::string::npos &&
+            request_edge != std::string::npos &&
+            request_latch != std::string::npos &&
+            request_increment != std::string::npos &&
+            post_call < request_guard && request_guard < request_edge &&
+            request_edge < request_latch &&
+            request_latch < request_increment,
+        "post-step result does not flow once into edge/request/id handoff");
+    require(
+        compact_manual_observation.find(
+            "manual_smart_pickup_post_input.next_request_id="
+            "interaction_next_request_id;") != std::string::npos &&
+            compact_manual_observation.find(
+                "manual_smart_pickup_post_step.snapshot_fingerprint=="
+                "live_flat_snapshot_fingerprint") != std::string::npos,
+        "post-step does not share the authoritative request ID/fingerprint");
+
+    const std::string pick_resolver_marker =
+        "                [&](const interaction::LocomotionSnapshot& snapshot)\n"
+        "                    -> std::optional<interaction::PickRequest>";
+    const size_t pick_resolver = controller.find(
+        pick_resolver_marker, scheduler_tick);
+    require(
+        pick_resolver != std::string::npos,
+        "cannot bound the scheduler's production locomotion provider");
+    const std::string provider_source = controller.substr(
+        scheduler_tick, pick_resolver - scheduler_tick);
+    const std::string compact_provider =
+        without_ascii_whitespace(provider_source);
+    const size_t provider_alias = compact_provider.find(
+        "constinteraction::LocomotionSnapshot&snapshot="
+        "live_flat_snapshot;");
+    const size_t provider_return = compact_provider.find(
+        "returnsnapshot;", provider_alias);
+    const size_t scheduler_updated = controller.find(
+        "interaction_scheduler.updated_last_tick()", scheduler_tick);
+    require(
+        provider_alias != std::string::npos &&
+            provider_return != std::string::npos &&
+            occurrence_count(provider_source, "return snapshot;") == 1U &&
+            provider_source.find(
+                "manual_smart_pickup_controller.post_step(") ==
+                std::string::npos &&
+            compact_provider.find("live_flat_snapshot=") ==
+                std::string::npos &&
+            scheduler_updated != std::string::npos &&
+            provider_alias < provider_return &&
+            scheduler_tick < scheduler_updated,
+        "scheduler does not publish the sole post-step live-flat snapshot");
+
+    const size_t placement_scheduler = adapter.find(
+        "const PlaceTargetResolver& place_target_resolver");
+    const size_t scheduler_end = adapter.find(
+        "int ControllerInteractionScheduler::phase() const",
+        placement_scheduler);
+    require(
+        placement_scheduler != std::string::npos &&
+            scheduler_end != std::string::npos,
+        "cannot isolate the production placement scheduler overload");
+    const std::string scheduler_source = adapter.substr(
+        placement_scheduler, scheduler_end - placement_scheduler);
+    require(
+        occurrence_count(
+            scheduler_source,
+            "input.locomotion = locomotion_provider();") == 1U &&
+            occurrence_count(
+                scheduler_source,
+                "RuntimeOutput next_output = runtime_update(input);") == 1U,
+        "one scheduler tick does not call one provider and publish one update");
+}
+
 void test_controller_and_make_clock_policy() {
-    const std::string controller = read_text("controller.cpp");
+    const std::string controller = read_project_text("controller.cpp");
     assert(controller.find("SetTargetFPS(25);") != std::string::npos);
     assert(controller.find("SetTargetFPS(60);") == std::string::npos);
     assert(controller.find(
@@ -6048,7 +6382,7 @@ void test_controller_and_make_clock_policy() {
             controller.find("g_frame >= 167") != std::string::npos,
         "MM_DISCRETE input phases do not preserve their 25 Hz durations");
 
-    const std::string database = read_text("database.h");
+    const std::string database = read_project_text("database.h");
     require(
         database.find("locomotion_timing::kTrajectoryFrameOffsets") !=
             std::string::npos,
@@ -6069,7 +6403,7 @@ void test_controller_and_make_clock_policy() {
         "controller trajectory prediction does not use the shared horizons");
     assert(controller.find("20.0f * dt") == std::string::npos);
 
-    const std::string makefile = read_text("Makefile");
+    const std::string makefile = read_project_text("Makefile");
     const size_t sources_begin = makefile.find("INTERACTION_SOURCES :=");
     const size_t sources_end = makefile.find("HEADER =", sources_begin);
     assert(sources_begin != std::string::npos);
@@ -6173,5 +6507,6 @@ int main(int argc, char** argv) {
     test_cross_pack_frame_count_validation();
     test_debug_draw_uses_real_correction_geometry_and_complete_text();
     test_controller_and_make_clock_policy();
+    test_controller_smart_pickup_two_phase_production_seam();
     return 0;
 }

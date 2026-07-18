@@ -134,6 +134,7 @@ CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_arrival
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_arrival_controller
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_pick_approach
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_pick_assist
+CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_smart_pickup_controller
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_smart_pickup_scene
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_stationary_motion_matching
 RELEASE_FAST_MATH_TARGET_TEST := \
@@ -161,6 +162,12 @@ LIVE_FLAT_PICK_ASSIST_HEADERS := interaction_pick_assist.h \
   interaction_pick_slots.h interaction_pick_approach.h \
   interaction_arrival.h \
   locomotion_controller_update.h
+LIVE_FLAT_SMART_PICKUP_SOURCES := \
+  interaction_smart_pickup_controller.cpp \
+  interaction_smart_pickup_scene.cpp
+LIVE_FLAT_SMART_PICKUP_HEADERS := \
+  interaction_smart_pickup_controller.h \
+  interaction_smart_pickup_scene.h
 LIVE_FLAT_PICK_ENTRY_ORACLE_TIMEOUT_SECONDS := 10
 LIVE_FLAT_PICK_ENTRY_ORACLE_GOLDEN := stationary=186 sampled=1 cases=1 ready=1 reach=1 minus=0 plus=0 executed=1 ex_reach=1 ex_minus=0 ex_plus=0 first=0/R/114/139 selection=Reach direct_entry=114
 LIVE_FLAT_PICK_POSITION_MATRIX_GOLDEN := position_cases=3 rows=baseline_reach,positive_plus,negative_reach control=baseline_minus/BlockedPath
@@ -207,6 +214,20 @@ INTERACTION_SMART_PICKUP_SCENE_HEADERS := \
   interaction_smart_pickup_scene.h interaction_target.h \
   interaction_place_target.h interaction_pose.h interaction_matcher.h \
   interaction_features.h interaction_database.h g1_skeleton.h vec.h quat.h
+INTERACTION_SMART_PICKUP_CONTROLLER_LINK_SOURCES := \
+  interaction_smart_pickup_controller.cpp \
+  interaction_smart_pickup_scene.cpp \
+  interaction_pick_assist.cpp interaction_pick_slots.cpp \
+  interaction_arrival.cpp $(INTERACTION_RUNTIME_SOURCES)
+INTERACTION_SMART_PICKUP_CONTROLLER_HEADERS := \
+  interaction_smart_pickup_controller.h interaction_smart_pickup_scene.h \
+  interaction_pick_assist.h interaction_pick_slots.h interaction_arrival.h \
+  interaction_runtime.h interaction_controller_adapter.h \
+  $(INTERACTION_PLACE_HEADERS) interaction_carry.h interaction_ik.h \
+  interaction_rotation_gate.h g1_arm_joint_metadata.h \
+  interaction_attachment.h interaction_playback.h interaction_matcher.h \
+  interaction_features.h interaction_pose.h interaction_target.h \
+  interaction_database.h g1_skeleton.h vec.h quat.h locomotion_timing.h
 INTERACTION_SMART_PICKUP_PREVIEW_LINK_SOURCES := \
   interaction_controller_adapter.cpp interaction_target_rig_ik.cpp \
   $(INTERACTION_RUNTIME_SOURCES)
@@ -302,6 +323,9 @@ $(PICK_ASSIST_RELEASE_FAST_MATH_TEST): tests/cpp/test_interaction_pick_assist.cp
 	# GCC 13 misdiagnoses libstdc++'s small-range std::sort as out of bounds.
 	$(CXX) $(CPP_TEST_FLAGS) -Wno-array-bounds -O3 -DNDEBUG -ffast-math tests/cpp/test_interaction_pick_assist.cpp interaction_pick_assist.cpp interaction_pick_slots.cpp interaction_arrival.cpp interaction_target.cpp interaction_pose.cpp -o $@
 
+$(CPP_TEST_DIR)/test_interaction_smart_pickup_controller: tests/cpp/test_interaction_smart_pickup_controller.cpp $(INTERACTION_SMART_PICKUP_CONTROLLER_LINK_SOURCES) $(INTERACTION_SMART_PICKUP_CONTROLLER_HEADERS) | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_smart_pickup_controller.cpp $(INTERACTION_SMART_PICKUP_CONTROLLER_LINK_SOURCES) -o $@
+
 $(CPP_TEST_DIR)/test_interaction_smart_pickup_scene: tests/cpp/test_interaction_smart_pickup_scene.cpp $(INTERACTION_SMART_PICKUP_SCENE_LINK_SOURCES) $(INTERACTION_SMART_PICKUP_SCENE_HEADERS) | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_smart_pickup_scene.cpp $(INTERACTION_SMART_PICKUP_SCENE_LINK_SOURCES) -o $@
 
@@ -314,11 +338,11 @@ $(PICK_ENTRY_PREVIEW_FAST_MATH_TEST): tests/cpp/test_pick_entry_preview_fast_mat
 $(PICK_ENTRY_ORACLE_TEST): tests/cpp/test_pick_entry_oracle.cpp tests/cpp/pick_entry_oracle_roots.h tests/cpp/interaction_runtime_fixture.h $(INTERACTION_RUNTIME_SOURCES) interaction_runtime.h interaction_matcher.h interaction_pose.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_pick_entry_oracle.cpp $(INTERACTION_RUNTIME_SOURCES) -o $@
 
-$(LIVE_FLAT_PICK_ENTRY_ORACLE_TEST): tests/cpp/test_live_flat_pick_entry_oracle.cpp tests/cpp/pick_entry_oracle_roots.h stationary_motion_matching.h database.h interaction_controller_adapter.cpp interaction_controller_adapter.h interaction_target_rig_ik.cpp interaction_target_rig_ik.h $(INTERACTION_RUNTIME_SOURCES) $(LIVE_FLAT_PICK_ASSIST_SOURCES) $(LIVE_FLAT_PICK_ASSIST_HEADERS) interaction_runtime.h interaction_matcher.h interaction_pose.h array.h common.h locomotion_timing.h | $(CPP_TEST_DIR)
-	$(CXX) $(CPP_TEST_FLAGS) -Wno-unused-parameter -Wno-unused-result -O2 -pthread tests/cpp/test_live_flat_pick_entry_oracle.cpp interaction_controller_adapter.cpp interaction_target_rig_ik.cpp $(INTERACTION_RUNTIME_SOURCES) $(LIVE_FLAT_PICK_ASSIST_SOURCES) -o $@
+$(LIVE_FLAT_PICK_ENTRY_ORACLE_TEST): tests/cpp/test_live_flat_pick_entry_oracle.cpp tests/cpp/pick_entry_oracle_roots.h stationary_motion_matching.h database.h interaction_controller_adapter.cpp interaction_controller_adapter.h interaction_target_rig_ik.cpp interaction_target_rig_ik.h $(INTERACTION_RUNTIME_SOURCES) $(LIVE_FLAT_PICK_ASSIST_SOURCES) $(LIVE_FLAT_PICK_ASSIST_HEADERS) $(LIVE_FLAT_SMART_PICKUP_SOURCES) $(LIVE_FLAT_SMART_PICKUP_HEADERS) interaction_runtime.h interaction_matcher.h interaction_pose.h array.h common.h locomotion_timing.h | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) -Wno-unused-parameter -Wno-unused-result -O2 -pthread tests/cpp/test_live_flat_pick_entry_oracle.cpp interaction_controller_adapter.cpp interaction_target_rig_ik.cpp $(INTERACTION_RUNTIME_SOURCES) $(LIVE_FLAT_PICK_ASSIST_SOURCES) $(LIVE_FLAT_SMART_PICKUP_SOURCES) -o $@
 
-$(LIVE_FLAT_PICK_ENTRY_ORACLE_RELEASE_TEST): tests/cpp/test_live_flat_pick_entry_oracle.cpp tests/cpp/pick_entry_oracle_roots.h stationary_motion_matching.h database.h interaction_controller_adapter.cpp interaction_controller_adapter.h interaction_target_rig_ik.cpp interaction_target_rig_ik.h $(INTERACTION_RUNTIME_SOURCES) $(LIVE_FLAT_PICK_ASSIST_SOURCES) $(LIVE_FLAT_PICK_ASSIST_HEADERS) interaction_runtime.h interaction_matcher.h interaction_pose.h array.h common.h locomotion_timing.h | $(CPP_TEST_DIR)
-	$(CXX) $(CPP_TEST_FLAGS) -Wno-unused-parameter -Wno-unused-variable -Wno-unused-result $(CONTROLLER_RELEASE_PARITY_FLAGS) -pthread tests/cpp/test_live_flat_pick_entry_oracle.cpp interaction_controller_adapter.cpp interaction_target_rig_ik.cpp $(INTERACTION_RUNTIME_SOURCES) $(LIVE_FLAT_PICK_ASSIST_SOURCES) -o $@
+$(LIVE_FLAT_PICK_ENTRY_ORACLE_RELEASE_TEST): tests/cpp/test_live_flat_pick_entry_oracle.cpp tests/cpp/pick_entry_oracle_roots.h stationary_motion_matching.h database.h interaction_controller_adapter.cpp interaction_controller_adapter.h interaction_target_rig_ik.cpp interaction_target_rig_ik.h $(INTERACTION_RUNTIME_SOURCES) $(LIVE_FLAT_PICK_ASSIST_SOURCES) $(LIVE_FLAT_PICK_ASSIST_HEADERS) $(LIVE_FLAT_SMART_PICKUP_SOURCES) $(LIVE_FLAT_SMART_PICKUP_HEADERS) interaction_runtime.h interaction_matcher.h interaction_pose.h array.h common.h locomotion_timing.h | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) -Wno-unused-parameter -Wno-unused-variable -Wno-unused-result $(CONTROLLER_RELEASE_PARITY_FLAGS) -pthread tests/cpp/test_live_flat_pick_entry_oracle.cpp interaction_controller_adapter.cpp interaction_target_rig_ik.cpp $(INTERACTION_RUNTIME_SOURCES) $(LIVE_FLAT_PICK_ASSIST_SOURCES) $(LIVE_FLAT_SMART_PICKUP_SOURCES) -o $@
 
 $(PLACE_SELECTION_FAST_MATH_TEST): tests/cpp/test_interaction_place.cpp interaction_place.cpp interaction_place.h interaction_place_collision.cpp interaction_place_collision.h interaction_place_target.cpp interaction_place_target.h interaction_ik.cpp interaction_ik.h interaction_rotation_gate.h g1_arm_joint_metadata.h interaction_matcher.cpp interaction_matcher.h interaction_features.cpp interaction_features.h interaction_pose.cpp interaction_pose.h interaction_target.cpp interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) -O3 -DNDEBUG -ffast-math tests/cpp/test_interaction_place.cpp interaction_place.cpp interaction_place_collision.cpp interaction_place_target.cpp interaction_ik.cpp interaction_matcher.cpp interaction_features.cpp interaction_pose.cpp interaction_target.cpp -o $@
@@ -350,7 +374,7 @@ $(CPP_TEST_DIR)/test_interaction_runtime: tests/cpp/test_interaction_runtime.cpp
 	$(CXX) $(CPP_TEST_FLAGS) $(CPP_TEST_DIR)/test_interaction_runtime.o $(INTERACTION_RUNTIME_SOURCES) -o $@
 
 $(CPP_TEST_DIR)/test_interaction_controller_adapter: tests/cpp/test_interaction_controller_adapter.cpp tests/cpp/interaction_runtime_fixture.h interaction_controller_adapter.cpp interaction_controller_adapter.h interaction_target_rig_ik.cpp interaction_target_rig_ik.h interaction_runtime.h $(INTERACTION_RUNTIME_SOURCES) $(INTERACTION_PLACE_HEADERS) interaction_carry.h interaction_ik.h interaction_rotation_gate.h g1_arm_joint_metadata.h interaction_attachment.h interaction_playback.h interaction_matcher.h interaction_features.h interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
-	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_controller_adapter.cpp interaction_controller_adapter.cpp interaction_target_rig_ik.cpp $(INTERACTION_RUNTIME_SOURCES) -o $@
+	$(CXX) $(CPP_TEST_FLAGS) -DMM_REPO_SOURCE_ROOT='"$(CURDIR)"' tests/cpp/test_interaction_controller_adapter.cpp interaction_controller_adapter.cpp interaction_target_rig_ik.cpp $(INTERACTION_RUNTIME_SOURCES) -o $@
 
 $(CONTROLLER_SCENE_RELEASE_FAST_MATH_TEST): tests/cpp/test_controller_scene_release_fast_math.cpp interaction_controller_adapter.cpp interaction_controller_adapter.h interaction_target_rig_ik.cpp interaction_target_rig_ik.h interaction_runtime.h $(INTERACTION_RUNTIME_SOURCES) $(INTERACTION_PLACE_HEADERS) interaction_carry.h interaction_ik.h interaction_rotation_gate.h g1_arm_joint_metadata.h interaction_attachment.h interaction_playback.h interaction_matcher.h interaction_features.h interaction_pose.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) $(CONTROLLER_RELEASE_PARITY_FLAGS) tests/cpp/test_controller_scene_release_fast_math.cpp interaction_controller_adapter.cpp interaction_target_rig_ik.cpp $(INTERACTION_RUNTIME_SOURCES) -o $@

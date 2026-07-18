@@ -2,6 +2,8 @@
 #include "interaction_controller_adapter.h"
 #include "interaction_pick_assist.h"
 #include "interaction_pick_approach.h"
+#include "interaction_smart_pickup_controller.h"
+#include "interaction_smart_pickup_scene.h"
 #include "locomotion_controller_update.h"
 #include "stationary_motion_matching.h"
 #include "tests/cpp/pick_entry_oracle_roots.h"
@@ -12,6 +14,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <iostream>
@@ -863,6 +866,90 @@ void run_position_matrix_oracle(
     }
 }
 
+bool same_float_bits(float left, float right) {
+    return std::memcmp(&left, &right, sizeof(left)) == 0;
+}
+
+bool same_vec3_bits(vec3 left, vec3 right) {
+    return same_float_bits(left.x, right.x) &&
+        same_float_bits(left.y, right.y) &&
+        same_float_bits(left.z, right.z);
+}
+
+bool same_controller_obstacles(
+    const std::vector<interaction::PickNavigationObstacle>& copied,
+    const array1d<vec3>& centers,
+    const array1d<vec3>& sizes) {
+    if (centers.size != sizes.size ||
+        copied.size() != static_cast<size_t>(centers.size)) {
+        return false;
+    }
+    for (int index = 0; index < centers.size; ++index) {
+        if (!same_vec3_bits(
+                copied[static_cast<size_t>(index)].center_world,
+                centers(index)) ||
+            !same_vec3_bits(
+                copied[static_cast<size_t>(index)].size_world,
+                sizes(index))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+class OracleCountingSmartPickupBackend final
+    : public interaction::SmartPickupAssistBackend {
+public:
+    bool begin(
+        const interaction::PickAssistStart& start,
+        const interaction::InteractionTarget* post_step_target) override {
+        ++begin_calls;
+        begin_input = start;
+        begin_target = post_step_target;
+        return implementation.begin(start, post_step_target);
+    }
+
+    void cancel() override {
+        ++cancel_calls;
+        implementation.cancel();
+    }
+
+    interaction::PickAssistOutput observe(
+        const interaction::PickAssistObservation& observation) override {
+        ++observe_calls;
+        last_observation = observation;
+        return implementation.observe(observation);
+    }
+
+    std::optional<interaction::PickRequest> take_submission(
+        uint64_t request_id) override {
+        ++take_submission_calls;
+        std::optional<interaction::PickRequest> request =
+            implementation.take_submission(request_id);
+        if (request.has_value()) ++yielded_submissions;
+        return request;
+    }
+
+    bool active() const override { return implementation.active(); }
+    bool owns_manual_interact() const override {
+        return implementation.owns_manual_interact();
+    }
+    const interaction::PickAssistDiagnostics& diagnostics()
+        const override {
+        return implementation.diagnostics();
+    }
+
+    interaction::ControllerPickAssist implementation{};
+    uint32_t begin_calls = 0U;
+    uint32_t cancel_calls = 0U;
+    uint32_t observe_calls = 0U;
+    uint32_t take_submission_calls = 0U;
+    uint32_t yielded_submissions = 0U;
+    interaction::PickAssistStart begin_input{};
+    const interaction::InteractionTarget* begin_target = nullptr;
+    interaction::PickAssistObservation last_observation{};
+};
+
 void run_manual_pick_assist_oracle(
     const database& flat_database,
     const interaction::Database& interaction_database,
@@ -883,33 +970,72 @@ void run_manual_pick_assist_oracle(
         make_stationary_snapshot(flat_database, 0, bridge);
     interaction::TargetRegistry registry{};
     const interaction::TargetHandle target_handle = registry.upsert(
-        interaction::make_controller_demo_target(interaction_database));
+        interaction::make_smart_pickup_demo_target());
     const interaction::InteractionTarget* target =
         registry.find(target_handle);
     require(
-        target != nullptr && target->affordances.size() == 1U,
-        "manual assist oracle target registration failed");
-    const interaction::GraspAffordance affordance =
-        target->affordances.front();
-    const interaction::Transform reach_waypoint =
-        interaction::make_pick_reach_waypoint(
-            interaction_database, *target);
-    const interaction::PickEntrySlots slots =
-        interaction::make_pick_entry_slots(reach_waypoint, *target);
+        target != nullptr && target->affordances.size() == 1U &&
+            target->affordances.front().interaction_slots.size() == 3U,
+        "manual Smart Pickup target registration failed");
+    const interaction::InteractionTarget target_snapshot = *target;
+    const uint32_t affordance_id = target->affordances.front().id;
     const interaction::PickAssistConfig assist_config{};
 
-    vec3 reach_facing = quat_mul_vec3(
-        reach_waypoint.rotation, vec3(0.0F, 0.0F, 1.0F));
-    reach_facing.y = 0.0F;
+    constexpr float velocity_halflife = 0.27F;
+    constexpr float rotation_halflife = 0.27F;
+    constexpr float forward_speed_mps = 0.9F;
+    constexpr float side_speed_mps = 0.6F;
+    constexpr float backward_speed_mps = 0.6F;
+    constexpr float maximum_tick_displacement_m = 0.10F;
+    constexpr float camera_azimuth = 0.0F;
+    static_assert(
+        interaction::kControllerStepSeconds == 1.0F / 25.0F,
+        "manual assist driver must remain at native 25 Hz");
+
+    vec3 simulation_position(
+        0.0F,
+        base_snapshot.pose.positions[g1_skeleton::Simulation].y,
+        1.60F);
+    vec3 simulation_velocity{};
+    vec3 simulation_acceleration{};
+    quat simulation_rotation{};
+    quat desired_rotation = simulation_rotation;
+    vec3 simulation_angular_velocity{};
+
+    array1d<vec3> obstacles_positions(3);
+    array1d<vec3> obstacles_scales(3);
+    obstacles_positions(0) = vec3(5.0F, 0.0F, 6.0F);
+    obstacles_positions(1) = vec3(-3.0F, 0.0F, -5.0F);
+    obstacles_positions(2) = vec3(-8.0F, 0.0F, 3.0F);
+    obstacles_scales(0) = vec3(2.0F, 1.0F, 5.0F);
+    obstacles_scales(1) = vec3(4.0F, 1.0F, 4.0F);
+    obstacles_scales(2) = vec3(2.0F, 1.0F, 2.0F);
+
+    std::vector<interaction::PickNavigationObstacle> navigation_obstacles;
+    for (int obstacle_index = 0;
+         obstacle_index < obstacles_positions.size;
+         ++obstacle_index) {
+        navigation_obstacles.push_back({
+            obstacles_positions(obstacle_index),
+            obstacles_scales(obstacle_index)});
+    }
+    const interaction::Transform starting_root{
+        simulation_position, simulation_rotation};
+    const interaction::PickSlotSelection starting_selection =
+        interaction::select_pick_slot(
+            starting_root,
+            *target,
+            target->affordances.front(),
+            navigation_obstacles);
     require(
-        length(reach_facing) > 1.0e-5F,
-        "manual assist Reach waypoint has no planar facing");
-    reach_facing = normalize(reach_facing);
-    const vec3 common_entry = reach_waypoint.position -
-        assist_config.reach_entry_distance_m * reach_facing;
-    const float entry_yaw = planar_yaw(reach_waypoint.rotation);
-    const float camera_azimuth = std::atan2(
-        std::sin(entry_yaw - PIf), std::cos(entry_yaw - PIf));
+        starting_selection.selected_index.has_value() &&
+            starting_selection.ordered[
+                *starting_selection.selected_index].route_length_m >
+                assist_config.arrival.latch_position_error_m &&
+            starting_selection.ordered[
+                *starting_selection.selected_index].route_length_m <=
+                assist_config.maximum_assisted_path_m,
+        "manual Smart Pickup start is not a nontrivial reachable slot route");
 
     const auto snapshot_at = [&](interaction::PickEntryRoot root) {
         const interaction::runtime_detail::PickSnapshotMap mapped =
@@ -918,131 +1044,15 @@ void run_manual_pick_assist_oracle(
         require(mapped.accepted, "manual assist snapshot mapping failed");
         return mapped.snapshot;
     };
-    const auto preview_slots = [&](
-        interaction::InteractionRuntime& runtime,
-        const interaction::LocomotionSnapshot& snapshot) {
-        std::array<interaction::PickEntryPreview, 2> previews{};
-        for (size_t index = 0U; index < previews.size(); ++index) {
-            previews[index] = runtime.preview_pick(
-                snapshot,
-                slots.ordered[index].prospective_root,
-                target_handle,
-                affordance.id);
-        }
-        return previews;
-    };
 
     interaction::InteractionRuntime runtime(
         interaction_database,
         interaction_features,
         registry,
         interaction::RuntimeConfig{});
-    const interaction::LocomotionSnapshot common_snapshot = snapshot_at({
-        common_entry.x, common_entry.z, entry_yaw});
-    const std::array<interaction::PickEntryPreview, 2> common_previews =
-        preview_slots(runtime, common_snapshot);
-    float minimum_eligible_entry_to_slot_m =
-        assist_config.maximum_assisted_path_m + 1.0F;
-    bool preview_eligible = false;
-    for (size_t index = 0U; index < common_previews.size(); ++index) {
-        const interaction::PickEntryPreview& preview =
-            common_previews[index];
-        const bool eligible = preview.path_feasible && preview.match_ready;
-        if (eligible) {
-            preview_eligible = true;
-            minimum_eligible_entry_to_slot_m = std::min(
-                minimum_eligible_entry_to_slot_m,
-                planar_distance(
-                    common_entry,
-                    slots.ordered[index].waypoint.position));
-        }
-    }
-    require(preview_eligible, "manual assist found no preview-eligible slot");
+    OracleCountingSmartPickupBackend backend{};
+    interaction::SmartPickupController smart_pickup_controller(backend);
 
-    vec3 away_from_object =
-        common_entry - target->object_world.position;
-    away_from_object.y = 0.0F;
-    require(
-        length(away_from_object) > 1.0e-5F,
-        "manual assist common entry coincides with the object");
-    away_from_object = normalize(away_from_object);
-    const float maximum_start_to_entry_m =
-        assist_config.maximum_assisted_path_m -
-        minimum_eligible_entry_to_slot_m;
-    require(
-        maximum_start_to_entry_m > 0.0F,
-        "manual assist eligible slot consumes the whole route budget");
-
-    vec3 start_position{};
-    float root_to_object_m = 0.0F;
-    bool start_found = false;
-    constexpr uint32_t kStartSamples = 400U;
-    for (uint32_t sample = 0U; sample <= kStartSamples; ++sample) {
-        const float alpha = static_cast<float>(sample) /
-            static_cast<float>(kStartSamples);
-        const float start_to_entry_m =
-            alpha * maximum_start_to_entry_m;
-        const vec3 candidate =
-            common_entry + start_to_entry_m * away_from_object;
-        const float candidate_object_distance_m = planar_distance(
-            candidate, target->object_world.position);
-        const float candidate_route_m =
-            planar_distance(candidate, common_entry) +
-            minimum_eligible_entry_to_slot_m;
-        if (start_to_entry_m >
-                assist_config.reach_entry_tolerance_m &&
-            candidate_object_distance_m > 1.00F &&
-            candidate_object_distance_m <= 1.45F &&
-            candidate_route_m <=
-                assist_config.maximum_assisted_path_m) {
-            start_position = candidate;
-            root_to_object_m = candidate_object_distance_m;
-            start_found = true;
-            break;
-        }
-    }
-    require(
-        start_found && root_to_object_m > 1.00F &&
-            root_to_object_m <= 1.45F,
-        "manual assist found no >1.00 m acquisition witness");
-
-    const std::optional<interaction::TargetHandle> acquired_target =
-        registry.resolve_single_target(
-            start_position, 1.45F);
-    require(
-        acquired_target.has_value() && *acquired_target == target_handle,
-        "manual assist 1.45 m acquisition did not resolve the witness");
-
-    interaction::PickAssistStart start{};
-    start.target = *acquired_target;
-    start.affordance_id = affordance.id;
-    start.hand = affordance.hand;
-    start.object_world = target->object_world;
-    start.root_world = {
-        start_position, reach_waypoint.rotation};
-    start.reach_waypoint = reach_waypoint;
-    start.slots = slots;
-    interaction::ControllerPickAssist assist(assist_config);
-
-    constexpr float velocity_halflife = 0.27F;
-    constexpr float rotation_halflife = 0.27F;
-    constexpr float forward_speed_mps = 0.9F;
-    constexpr float side_speed_mps = 0.6F;
-    constexpr float backward_speed_mps = 0.6F;
-    constexpr float maximum_tick_displacement_m = 0.10F;
-    constexpr uint32_t maximum_assist_ticks = 600U;
-    static_assert(
-        interaction::kControllerStepSeconds == 1.0F / 25.0F,
-        "manual assist driver must remain at native 25 Hz");
-
-    vec3 simulation_position = start_position;
-    vec3 simulation_velocity{};
-    vec3 simulation_acceleration{};
-    quat simulation_rotation = reach_waypoint.rotation;
-    quat desired_rotation = simulation_rotation;
-    vec3 simulation_angular_velocity{};
-    array1d<vec3> obstacles_positions;
-    array1d<vec3> obstacles_scales;
     interaction::LocomotionSnapshot live_flat_snapshot = snapshot_at({
         simulation_position.x,
         simulation_position.z,
@@ -1050,111 +1060,13 @@ void run_manual_pick_assist_oracle(
     uint64_t live_flat_snapshot_fingerprint =
         interaction::runtime_detail::locomotion_snapshot_fingerprint(
             live_flat_snapshot);
-
-    interaction::ControllerInteractionScheduler scheduler{};
-    uint32_t provider_calls = 0U;
-    uint32_t resolver_calls = 0U;
-    uint32_t runtime_calls = 0U;
-    uint32_t submission_count = 0U;
-    uint64_t next_request_id = kRequestId;
-    uint64_t certified_provider_snapshot_fingerprint = 0U;
-    const auto scheduler_tick = [&] (
-        interaction::ControllerInteractionEdges edges) {
-        return interaction::RuntimeOutput(scheduler.tick(
-            edges,
-            [&]() {
-                ++provider_calls;
-                certified_provider_snapshot_fingerprint =
-                    interaction::runtime_detail::
-                        locomotion_snapshot_fingerprint(live_flat_snapshot);
-                require(
-                    certified_provider_snapshot_fingerprint ==
-                        live_flat_snapshot_fingerprint,
-                    "manual assist provider did not return the live snapshot");
-                return live_flat_snapshot;
-            },
-            [&](const interaction::LocomotionSnapshot& snapshot)
-                -> std::optional<interaction::PickRequest> {
-                ++resolver_calls;
-                require(
-                    interaction::runtime_detail::
-                            locomotion_snapshot_fingerprint(snapshot) ==
-                        live_flat_snapshot_fingerprint,
-                    "manual assist resolver received a different snapshot");
-                const std::optional<interaction::PickRequest> request =
-                    assist.take_submission(next_request_id);
-                if (request.has_value()) {
-                    ++next_request_id;
-                    ++submission_count;
-                }
-                return request;
-            },
-            [](const interaction::LocomotionSnapshot&)
-                -> std::optional<interaction::ControllerPlaceTarget> {
-                return std::nullopt;
-            },
-            [](interaction::SurfaceHandle, uint32_t) {
-                return interaction::PlaceStagingPreview{};
-            },
-            [&](const interaction::RuntimeInput& input) {
-                ++runtime_calls;
-                require(
-                    input.dt == 1.0F / 25.0F,
-                    "manual assist scheduler escaped exact 25 Hz");
-                return runtime.update(input);
-            }));
-    };
-
-    interaction::RuntimeOutput scheduler_output = scheduler_tick({});
-    require(
-        scheduler_output.diagnostics.state ==
-            interaction::RuntimeState::Locomotion,
-        "manual assist scheduler did not prime Locomotion");
-    require(assist.begin(start), "manual assist rejected the route witness");
-    const interaction::PickAssistDiagnostics& diagnostics =
-        assist.diagnostics();
-    require(
-        *std::min_element(
-            diagnostics.slot_route_lengths_m.begin(),
-            diagnostics.slot_route_lengths_m.end()) <=
-            assist_config.maximum_assisted_path_m,
-        "manual assist route witness exceeds the configured cap");
-
-    interaction::PickAssistOutput prior_assist_output{};
-    bool prior_stationary_constraint = false;
-    bool saw_preview = false;
-    bool saw_final_approach = false;
-    bool saw_settling = false;
-    bool saw_final_preview = false;
-    bool certified = false;
-    uint32_t observation_count = 0U;
+    uint32_t ordinary_locomotion_step_calls = 0U;
     uint32_t materialized_snapshot_count = 0U;
-    uint32_t settled_observation_count = 0U;
-    uint32_t stationary_constraint_edges = 0U;
-    uint32_t stationary_output_applied_ticks = 0U;
-
-    for (uint32_t assist_tick = 0U;
-         assist_tick < maximum_assist_ticks;
-         ++assist_tick) {
-        const bool activation_tick = assist_tick == 0U;
-        vec3 applied_left_stick{};
-        vec3 applied_right_stick{};
-        bool desired_strafe = false;
-        if (!activation_tick &&
-            prior_assist_output.override_steering) {
-            applied_left_stick = prior_assist_output.left_stick;
-            applied_right_stick = prior_assist_output.right_stick;
-        }
-        if (!activation_tick && prior_assist_output.force_strafe) {
-            desired_strafe = true;
-        }
-        if (!activation_tick &&
-            prior_assist_output.stationary_constraint) {
-            ++stationary_output_applied_ticks;
-        }
-
+    const auto advance_ordinary_locomotion = [&] (
+        const interaction::SmartPickupPreStepResult& pre_step_result) {
+        ++ordinary_locomotion_step_calls;
         const vec3 desired_velocity = desired_velocity_update(
-            applied_left_stick,
+            pre_step_result.left_stick,
             camera_azimuth,
             simulation_rotation,
             forward_speed_mps,
@@ -1162,10 +1074,10 @@ void run_manual_pick_assist_oracle(
             backward_speed_mps);
         desired_rotation = desired_rotation_update(
             desired_rotation,
-            applied_left_stick,
-            applied_right_stick,
+            pre_step_result.left_stick,
+            pre_step_result.right_stick,
             camera_azimuth,
-            desired_strafe,
+            pre_step_result.force_strafe,
             desired_velocity);
         const vec3 previous_position = simulation_position;
         simulation_positions_update(
@@ -1183,12 +1095,11 @@ void run_manual_pick_assist_oracle(
             desired_rotation,
             rotation_halflife,
             interaction::kControllerStepSeconds);
-        const float tick_displacement_m = planar_distance(
+        const float displacement_m = planar_distance(
             previous_position, simulation_position);
         require(
-            tick_displacement_m <= maximum_tick_displacement_m,
+            displacement_m <= maximum_tick_displacement_m,
             "manual assist ordinary locomotion teleported the root");
-
         live_flat_snapshot = snapshot_at({
             simulation_position.x,
             simulation_position.z,
@@ -1197,181 +1108,285 @@ void run_manual_pick_assist_oracle(
         live_flat_snapshot_fingerprint =
             interaction::runtime_detail::locomotion_snapshot_fingerprint(
                 live_flat_snapshot);
+        return displacement_m;
+    };
 
-        std::optional<std::array<interaction::PickEntryPreview, 2>> previews;
-        uint64_t preview_snapshot_fingerprint = 0U;
-        if (prior_assist_output.needs_preview) {
-            previews = preview_slots(runtime, live_flat_snapshot);
-            preview_snapshot_fingerprint =
-                live_flat_snapshot_fingerprint;
-        }
-        const interaction::PickAssistState state_before_observe =
-            assist.diagnostics().state;
-        if (state_before_observe ==
-            interaction::PickAssistState::Settling) {
-            ++settled_observation_count;
-        }
-        interaction::PickAssistObservation observation{};
-        observation.runtime_state =
-            scheduler.cached_output().diagnostics.state;
-        observation.target = registry.find(*acquired_target);
-        observation.displayed_root = interaction::Transform{
-            live_flat_snapshot.pose.positions[g1_skeleton::Simulation],
-            live_flat_snapshot.pose.rotations[g1_skeleton::Simulation]};
-        observation.simulation_velocity = simulation_velocity;
-        observation.displayed_planar_speed_mps =
-            tick_displacement_m / interaction::kControllerStepSeconds;
-        observation.camera_azimuth = camera_azimuth;
-        observation.snapshot_fingerprint =
-            live_flat_snapshot_fingerprint;
-        observation.preview_snapshot_fingerprint =
-            preview_snapshot_fingerprint;
-        observation.previews = previews;
-        const interaction::PickAssistOutput observed_output =
-            assist.observe(observation);
-        ++observation_count;
+    interaction::ControllerInteractionScheduler scheduler{};
+    uint32_t provider_calls = 0U;
+    uint32_t resolver_calls = 0U;
+    uint32_t runtime_calls = 0U;
+    uint32_t scheduler_publication_count = 0U;
+    uint64_t provider_snapshot_fingerprint = 0U;
+    uint64_t published_snapshot_fingerprint = 0U;
+    const auto scheduler_tick = [&] (
+        interaction::ControllerInteractionEdges edges) {
+        return interaction::RuntimeOutput(scheduler.tick(
+            edges,
+            [&]() {
+                ++provider_calls;
+                provider_snapshot_fingerprint =
+                    interaction::runtime_detail::
+                        locomotion_snapshot_fingerprint(live_flat_snapshot);
+                require(
+                    provider_snapshot_fingerprint ==
+                        live_flat_snapshot_fingerprint,
+                    "manual assist provider did not return the live snapshot");
+                return live_flat_snapshot;
+            },
+            [&](const interaction::LocomotionSnapshot& snapshot)
+                -> std::optional<interaction::PickRequest> {
+                ++resolver_calls;
+                require(
+                    interaction::runtime_detail::
+                            locomotion_snapshot_fingerprint(snapshot) ==
+                        live_flat_snapshot_fingerprint,
+                    "manual assist resolver received a different snapshot");
+                return std::nullopt;
+            },
+            [](const interaction::LocomotionSnapshot&)
+                -> std::optional<interaction::ControllerPlaceTarget> {
+                return std::nullopt;
+            },
+            [](interaction::SurfaceHandle, uint32_t) {
+                return interaction::PlaceStagingPreview{};
+            },
+            [&](const interaction::RuntimeInput& input) {
+                ++runtime_calls;
+                ++scheduler_publication_count;
+                published_snapshot_fingerprint =
+                    interaction::runtime_detail::
+                        locomotion_snapshot_fingerprint(input.locomotion);
+                require(
+                    input.dt == 1.0F / 25.0F,
+                    "manual assist scheduler escaped exact 25 Hz");
+                return runtime.update(input);
+            }));
+    };
 
-        if (activation_tick) {
-            require(
-                tick_displacement_m <= 1.0e-6F &&
-                    assist.diagnostics().state ==
-                        interaction::PickAssistState::CoarseApproach &&
-                    observed_output.override_steering,
-                "manual assist activation did not observe after zero input");
-        }
-        require(
-            assist.diagnostics().state !=
-                interaction::PickAssistState::Failed,
-            std::string("manual assist ordinary driver failed: ") +
-                interaction::pick_assist_reason_name(
-                    assist.diagnostics().reason) +
-                " tick=" + std::to_string(assist_tick) +
-                " error=" + std::to_string(
-                    assist.diagnostics().root_error_m) +
-                " yaw=" + std::to_string(
-                    assist.diagnostics().yaw_error_radians) +
-                " displayed_speed=" + std::to_string(
-                    assist.diagnostics().speed_mps) +
-                " simulation_speed=" + std::to_string(
-                    planar_distance(vec3(), simulation_velocity)) +
-                " standoff=" + std::to_string(planar_distance(
-                    simulation_position, target->object_world.position)) +
-                " simulation_yaw=" + std::to_string(
-                    planar_yaw(simulation_rotation)) +
-                " desired_yaw=" + std::to_string(
-                    planar_yaw(desired_rotation)) +
-                " selected_yaw=" + std::to_string(
-                    assist.diagnostics().selected_slot >= 0
-                    ? slots.ordered[static_cast<size_t>(
-                          assist.diagnostics().selected_slot)]
-                          .prospective_root.world_yaw_radians
-                    : 0.0F) +
-                " right_x=" + std::to_string(applied_right_stick.x) +
-                " right_z=" + std::to_string(applied_right_stick.z));
-        saw_preview = saw_preview ||
-            assist.diagnostics().state ==
-                interaction::PickAssistState::Preview;
-        saw_final_approach = saw_final_approach ||
-            assist.diagnostics().state ==
-                interaction::PickAssistState::FinalApproach;
-        saw_settling = saw_settling ||
-            assist.diagnostics().state ==
-                interaction::PickAssistState::Settling;
-        saw_final_preview = saw_final_preview ||
-            assist.diagnostics().state ==
-                interaction::PickAssistState::FinalPreview;
-        if (observed_output.stationary_constraint &&
-            !prior_stationary_constraint) {
-            ++stationary_constraint_edges;
-        }
-        prior_stationary_constraint =
-            observed_output.stationary_constraint;
-        prior_assist_output = observed_output;
-
-        interaction::ControllerInteractionEdges edges{};
-        edges.interact_pressed = observed_output.submit_interact;
-        const uint32_t provider_calls_before_certification =
-            provider_calls;
-        const uint32_t resolver_calls_before_certification =
-            resolver_calls;
-        const uint32_t runtime_calls_before_certification = runtime_calls;
-        const uint32_t submissions_before_certification = submission_count;
-        scheduler_output = scheduler_tick(edges);
-        if (observed_output.submit_interact) {
-            require(
-                provider_calls ==
-                        provider_calls_before_certification + 1U &&
-                    resolver_calls ==
-                        resolver_calls_before_certification + 1U &&
-                    runtime_calls ==
-                        runtime_calls_before_certification + 1U &&
-                    submission_count ==
-                        submissions_before_certification + 1U &&
-                    certified_provider_snapshot_fingerprint ==
-                    live_flat_snapshot_fingerprint,
-                "manual assist certified tick did not use one live snapshot");
-            require(
-                scheduler_output.diagnostics.state ==
-                        interaction::RuntimeState::Preflight &&
-                    scheduler_output.diagnostics.reason !=
-                        interaction::Reason::TargetUnavailable,
-                "manual assist request did not enter Preflight");
-            require(
-                !assist.take_submission(next_request_id).has_value(),
-                "manual assist submission was not one-shot");
-            certified = true;
-            break;
-        }
-        require(
-            scheduler_output.diagnostics.state ==
-                interaction::RuntimeState::Locomotion,
-            "manual assist scheduler left Locomotion before certification");
-    }
-
-    require(certified, "manual assist ordinary driver never certified");
-    require(
-        saw_preview && saw_final_approach && saw_settling &&
-            saw_final_preview,
-        "manual assist ordinary driver skipped a required state");
-    require(
-        settled_observation_count == 5U &&
-            settled_observation_count ==
-                assist_config.required_settle_ticks,
-        "manual assist did not preserve five post-latch settled ticks");
-    require(
-        stationary_constraint_edges == 1U &&
-            stationary_output_applied_ticks > 0U,
-        "manual assist did not hand off one stationary-output edge");
-    require(
-        materialized_snapshot_count == observation_count &&
-            observation_count > 1U,
-        "manual assist did not materialize one snapshot per observation");
-    require(
-        diagnostics.selected_slot >= 0 &&
-            diagnostics.route_length_m <=
-                assist_config.maximum_assisted_path_m,
-        "manual assist selected an invalid or over-budget slot");
-    require(
-        resolver_calls == 1U && submission_count == 1U &&
-            next_request_id == kRequestId + 1U,
-        "manual assist scheduler did not submit exactly one request");
-
-    const uint32_t resolver_calls_before_align = resolver_calls;
-    scheduler_output = scheduler_tick({});
+    interaction::RuntimeOutput scheduler_output = scheduler_tick({});
     require(
         scheduler_output.diagnostics.state ==
-                interaction::RuntimeState::Align &&
-            scheduler_output.diagnostics.reason !=
-                interaction::Reason::TargetUnavailable &&
-            scheduler_output.diagnostics.result !=
-                interaction::ResultCode::Rejected &&
-            scheduler_output.diagnostics.result !=
-                interaction::ResultCode::Failed,
-        "manual assist runtime did not progress beyond Preflight");
+            interaction::RuntimeState::Locomotion,
+        "manual assist scheduler did not prime Locomotion");
+    provider_calls = 0U;
+    resolver_calls = 0U;
+    runtime_calls = 0U;
+    scheduler_publication_count = 0U;
+
+    uint32_t preview_callback_calls = 0U;
+    const interaction::SmartPickupPreviewCallback rejecting_preview =
+        [&](const interaction::LocomotionSnapshot&,
+            interaction::PickEntryRoot,
+            interaction::TargetHandle,
+            uint32_t)
+            -> std::optional<interaction::PickEntryPreview> {
+            ++preview_callback_calls;
+            return std::nullopt;
+        };
+
+    const auto make_post_step_input = [&] (float displayed_speed_mps) {
+        interaction::SmartPickupPostStepInput input{};
+        input.runtime_state = scheduler.cached_output().diagnostics.state;
+        input.live_flat_snapshot = live_flat_snapshot;
+        input.current_target = registry.find(target_handle);
+        for (int obstacle_index = 0;
+             obstacle_index < obstacles_positions.size;
+             ++obstacle_index) {
+            input.obstacle_centers.push_back(
+                obstacles_positions(obstacle_index));
+            input.obstacle_sizes.push_back(
+                obstacles_scales(obstacle_index));
+        }
+        input.simulation_velocity = simulation_velocity;
+        input.displayed_planar_speed_mps = displayed_speed_mps;
+        input.camera_azimuth = camera_azimuth;
+        input.next_request_id = kRequestId;
+        return input;
+    };
+
+    interaction::SmartPickupPreStepInput activation_input{};
+    activation_input.runtime_state =
+        scheduler.cached_output().diagnostics.state;
+    activation_input.interact_pressed = true;
+    activation_input.selected_target = registry.find(target_handle);
+    activation_input.selected_affordance_id = affordance_id;
+    activation_input.left_stick = vec3(0.85F, 0.0F, -0.35F);
+    activation_input.right_stick = vec3(-0.25F, 0.0F, 0.75F);
+    const interaction::SmartPickupPreStepResult activation_pre_step =
+        smart_pickup_controller.pre_step(activation_input);
     require(
-        resolver_calls == resolver_calls_before_align &&
-            provider_calls == runtime_calls,
-        "manual assist scheduler cadence or one-shot resolver diverged");
+        activation_pre_step.interact_consumed &&
+            !activation_pre_step.cancel_consumed &&
+            same_vec3_bits(activation_pre_step.left_stick, vec3()) &&
+            same_vec3_bits(activation_pre_step.right_stick, vec3()),
+        "manual Smart Pickup did not consume F and zero activation input");
+
+    const vec3 activation_root_before = simulation_position;
+    const uint32_t ordinary_calls_before_activation =
+        ordinary_locomotion_step_calls;
+    const uint32_t bridge_calls_before_activation =
+        materialized_snapshot_count;
+    const float activation_displacement_m =
+        advance_ordinary_locomotion(activation_pre_step);
+    const uint32_t begins_before_activation = backend.begin_calls;
+    const uint32_t observations_before_activation = backend.observe_calls;
+    interaction::SmartPickupPostStepResult post_step_result =
+        smart_pickup_controller.post_step(
+            make_post_step_input(0.0F),
+            rejecting_preview);
+    require(
+        ordinary_locomotion_step_calls ==
+                ordinary_calls_before_activation + 1U &&
+            materialized_snapshot_count ==
+                bridge_calls_before_activation + 1U &&
+            backend.begin_calls == begins_before_activation + 1U &&
+            backend.observe_calls == observations_before_activation + 1U,
+        "activation did not perform one ordinary step, bridge, begin, and observe");
+    require(
+        activation_displacement_m <= 1.0e-6F &&
+            same_vec3_bits(simulation_position, activation_root_before) &&
+            preview_callback_calls == 0U &&
+            !post_step_result.pick_request.has_value() &&
+            backend.take_submission_calls == 0U,
+        "activation tick moved, previewed, or submitted");
+    require(
+        interaction::same_interaction_target_snapshot(
+            target_snapshot, backend.begin_input.target_snapshot) &&
+            backend.begin_target != nullptr &&
+            interaction::same_interaction_target_snapshot(
+                target_snapshot, *backend.begin_target),
+        "activation did not preserve the exact ordered target snapshot");
+    require(
+        same_controller_obstacles(
+            backend.begin_input.obstacles,
+            obstacles_positions,
+            obstacles_scales),
+        "activation did not freeze controller obstacles element-for-element");
+    require(
+        post_step_result.snapshot_fingerprint ==
+            live_flat_snapshot_fingerprint &&
+            backend.last_observation.snapshot_fingerprint ==
+                live_flat_snapshot_fingerprint,
+        "activation observation did not use the sole live-flat snapshot");
+    require(
+        smart_pickup_controller.diagnostics().state ==
+                interaction::PickAssistState::SlotApproach &&
+            smart_pickup_controller.diagnostics().route_length_m <=
+                assist_config.maximum_assisted_path_m,
+        "manual Smart Pickup rejected the reachable authored slot");
+
+    const uint32_t provider_calls_before_activation = provider_calls;
+    const uint32_t runtime_calls_before_activation = runtime_calls;
+    const uint32_t publications_before_activation =
+        scheduler_publication_count;
+    scheduler_output = scheduler_tick({});
+    require(
+        provider_calls == provider_calls_before_activation + 1U &&
+            runtime_calls == runtime_calls_before_activation + 1U &&
+            scheduler_publication_count ==
+                publications_before_activation + 1U &&
+            resolver_calls == 0U &&
+            scheduler.updated_last_tick() &&
+            published_snapshot_fingerprint ==
+                live_flat_snapshot_fingerprint &&
+            scheduler_output.diagnostics.state ==
+                interaction::RuntimeState::Locomotion,
+        "activation did not publish exactly one scheduler live-flat sample");
+
+    interaction::SmartPickupPreStepInput assisted_input{};
+    assisted_input.runtime_state =
+        scheduler.cached_output().diagnostics.state;
+    assisted_input.selected_target = registry.find(target_handle);
+    assisted_input.selected_affordance_id = affordance_id;
+    assisted_input.left_stick = vec3(-1.0F, 0.0F, -1.0F);
+    assisted_input.right_stick = vec3(1.0F, 0.0F, 1.0F);
+    const interaction::SmartPickupPreStepResult assisted_pre_step =
+        smart_pickup_controller.pre_step(assisted_input);
+    require(
+        post_step_result.assist_output.override_steering &&
+            same_vec3_bits(
+                assisted_pre_step.left_stick,
+                post_step_result.assist_output.left_stick) &&
+            same_vec3_bits(
+                assisted_pre_step.right_stick,
+                post_step_result.assist_output.right_stick) &&
+            assisted_pre_step.force_strafe ==
+                post_step_result.assist_output.force_strafe &&
+            !same_vec3_bits(assisted_pre_step.left_stick, vec3()),
+        "manual assistance was not applied on only the following tick");
+
+    const uint32_t ordinary_calls_before_assisted_tick =
+        ordinary_locomotion_step_calls;
+    const uint32_t bridge_calls_before_assisted_tick =
+        materialized_snapshot_count;
+    const float assisted_displacement_m =
+        advance_ordinary_locomotion(assisted_pre_step);
+    require(
+        assisted_displacement_m > 0.0F &&
+            ordinary_locomotion_step_calls ==
+                ordinary_calls_before_assisted_tick + 1U &&
+            materialized_snapshot_count ==
+                bridge_calls_before_assisted_tick + 1U,
+        "the following assisted tick did not use one ordinary flat step");
+
+    const uint32_t observations_before_assisted_post =
+        backend.observe_calls;
+    post_step_result = smart_pickup_controller.post_step(
+        make_post_step_input(
+            assisted_displacement_m /
+                interaction::kControllerStepSeconds),
+        rejecting_preview);
+    require(
+        backend.begin_calls == 1U &&
+            backend.observe_calls ==
+                observations_before_assisted_post + 1U &&
+            preview_callback_calls == 0U &&
+            !post_step_result.pick_request.has_value() &&
+            backend.take_submission_calls == 0U &&
+            backend.yielded_submissions == 0U,
+        "the one following tick previewed, submitted, or restarted assist");
+
+    const uint32_t provider_calls_before_assisted_tick = provider_calls;
+    const uint32_t runtime_calls_before_assisted_tick = runtime_calls;
+    const uint32_t publications_before_assisted_tick =
+        scheduler_publication_count;
+    scheduler_output = scheduler_tick({});
+    require(
+        provider_calls == provider_calls_before_assisted_tick + 1U &&
+            runtime_calls == runtime_calls_before_assisted_tick + 1U &&
+            scheduler_publication_count ==
+                publications_before_assisted_tick + 1U &&
+            provider_snapshot_fingerprint ==
+                live_flat_snapshot_fingerprint &&
+            published_snapshot_fingerprint ==
+                live_flat_snapshot_fingerprint &&
+            scheduler_output.diagnostics.state ==
+                interaction::RuntimeState::Locomotion,
+        "the following assisted tick did not publish one live-flat sample");
+
+    interaction::SmartPickupPreStepInput cancel_input{};
+    cancel_input.runtime_state =
+        scheduler.cached_output().diagnostics.state;
+    cancel_input.cancel_pressed = true;
+    cancel_input.selected_target = registry.find(target_handle);
+    cancel_input.selected_affordance_id = affordance_id;
+    const interaction::SmartPickupPreStepResult cancelled =
+        smart_pickup_controller.pre_step(cancel_input);
+    require(
+        cancelled.cancel_consumed && !cancelled.interact_consumed &&
+            backend.cancel_calls == 1U && !backend.active() &&
+            smart_pickup_controller.diagnostics().reason ==
+                interaction::PickAssistReason::Cancelled,
+        "bounded manual Smart Pickup witness did not cancel cleanly");
+    require(
+        ordinary_locomotion_step_calls == 2U &&
+            materialized_snapshot_count == 2U &&
+            provider_calls == 2U && runtime_calls == 2U &&
+            scheduler_publication_count == 2U &&
+            backend.begin_calls == 1U && backend.observe_calls == 2U &&
+            resolver_calls == 0U && preview_callback_calls == 0U &&
+            backend.take_submission_calls == 0U,
+        "bounded two-phase witness performed hidden work");
 }
 
 Summary run_default_oracle(
