@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <utility>
 
 namespace {
 
@@ -45,14 +46,30 @@ DEFINE_PUBLIC_MEMBER_TRAIT(
 
 #undef DEFINE_PUBLIC_MEMBER_TRAIT
 
+#define DEFINE_ENUMERATOR_TRAIT(trait_name, enumerator_name) \
+    template <typename Type, typename = void> \
+    struct trait_name : std::false_type {}; \
+    template <typename Type> \
+    struct trait_name< \
+        Type, \
+        std::void_t<decltype(Type::enumerator_name)>> : std::true_type {};
+
+DEFINE_ENUMERATOR_TRAIT(has_state_coarse_approach, CoarseApproach)
+DEFINE_ENUMERATOR_TRAIT(has_state_preview, Preview)
+DEFINE_ENUMERATOR_TRAIT(has_state_final_approach, FinalApproach)
+DEFINE_ENUMERATOR_TRAIT(has_reason_no_feasible_entry, NoFeasibleEntry)
+DEFINE_ENUMERATOR_TRAIT(has_reason_preview_deadline, PreviewDeadline)
+
+#undef DEFINE_ENUMERATOR_TRAIT
+
 template <typename Type, typename = void>
 struct has_one_argument_begin : std::false_type {};
 
 template <typename Type>
 struct has_one_argument_begin<
     Type,
-    std::void_t<decltype(static_cast<bool (Type::*)(
-        const interaction::PickAssistStart&)>(&Type::begin))>>
+    std::void_t<decltype(std::declval<Type&>().begin(
+        std::declval<const interaction::PickAssistStart&>()))>>
     : std::true_type {};
 
 static_assert(
@@ -97,6 +114,21 @@ static_assert(
 static_assert(
     !has_one_argument_begin<interaction::ControllerPickAssist>::value,
     "ControllerPickAssist::begin(start) must be absent");
+static_assert(
+    !has_state_coarse_approach<interaction::PickAssistState>::value,
+    "PickAssistState::CoarseApproach must be absent");
+static_assert(
+    !has_state_preview<interaction::PickAssistState>::value,
+    "PickAssistState::Preview must be absent");
+static_assert(
+    !has_state_final_approach<interaction::PickAssistState>::value,
+    "PickAssistState::FinalApproach must be absent");
+static_assert(
+    !has_reason_no_feasible_entry<interaction::PickAssistReason>::value,
+    "PickAssistReason::NoFeasibleEntry must be absent");
+static_assert(
+    !has_reason_preview_deadline<interaction::PickAssistReason>::value,
+    "PickAssistReason::PreviewDeadline must be absent");
 
 static_assert(
     static_cast<uint8_t>(interaction::PickAssistState::Idle) == 0U);
