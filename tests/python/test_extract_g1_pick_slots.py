@@ -1452,6 +1452,28 @@ class ExtractSlotCandidateDedupeAndOutputTests(unittest.TestCase):
         )
         self.assertEqual(deduplicated, 1)
 
+    def test_private_dedupe_uses_float32_authored_position_fallback(self):
+        promoted_limit = float(_DEDUPE_POSITION_LIMIT_M)
+        just_outside = promoted_limit + 1.0e-10
+        self.assertGreater(just_outside, promoted_limit)
+        self.assertEqual(
+            np.float32(just_outside), _DEDUPE_POSITION_LIMIT_M
+        )
+        first = self._minimal_dedupe_row("a", hand=1)
+        authored_boundary = self._minimal_dedupe_row(
+            "b", hand=1, root_x=just_outside
+        )
+
+        retained, deduplicated = _dedupe_candidates(
+            [authored_boundary, first]
+        )
+
+        self.assertEqual(
+            [candidate["stable_key"] for candidate in retained],
+            [first["stable_key"]],
+        )
+        self.assertEqual(deduplicated, 1)
+
     def test_private_dedupe_is_stable_key_sorted_and_greedy(self):
         first = self._minimal_dedupe_row("a", hand=1, root_x=0.0)
         middle = self._minimal_dedupe_row("b", hand=1, root_x=0.09)
@@ -1750,6 +1772,41 @@ class ExtractSlotCandidateValidationTests(unittest.TestCase):
         self.assertEqual(types[0], types[1])
         self.assertEqual(messages[0], messages[1])
         self.assertRegex(messages[0], pattern)
+
+    def test_rejects_non_v1_schema_version_deterministically(self):
+        artifact, manifest = _two_clip_artifact_and_manifest()
+        unsupported = copy.deepcopy(manifest)
+        unsupported["schema_version"] = 2
+
+        self.assert_rejected_deterministically(
+            lambda: extract_slot_candidates(
+                artifact, unsupported, _TARGET_SEQUENCE
+            ),
+            r"(?i)schema[_ ]version.*1",
+        )
+
+    def test_requires_exact_skeleton_parents_deterministically(self):
+        artifact, manifest = _two_clip_artifact_and_manifest()
+        missing = copy.deepcopy(manifest)
+        del missing["skeleton_parents"]
+
+        self.assert_rejected_deterministically(
+            lambda: extract_slot_candidates(
+                artifact, missing, _TARGET_SEQUENCE
+            ),
+            r"(?i)(skeleton[_ ]parents.*(required|missing)|missing.*skeleton[_ ]parents)",
+        )
+
+        mismatched = copy.deepcopy(manifest)
+        mismatched["skeleton_parents"][0] = (
+            0 if mismatched["skeleton_parents"][0] != 0 else -1
+        )
+        self.assert_rejected_deterministically(
+            lambda: extract_slot_candidates(
+                artifact, mismatched, _TARGET_SEQUENCE
+            ),
+            r"(?i)skeleton[_ ]parents.*match",
+        )
 
     def test_rejects_missing_and_duplicate_sequence_ids(self):
         artifact, manifest = _two_clip_artifact_and_manifest()
