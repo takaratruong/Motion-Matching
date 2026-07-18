@@ -990,7 +990,7 @@ Make, and raylib for the final native visualization only.
     missing events, and a target in the held-out partition; and
   - preserves `source_frames[entry]` only as a separate provenance field.
 
-- [ ] **Step 2: Write failing transform, compatibility, and path tests**
+- [x] **Step 2: Write failing transform, compatibility, and path tests**
 
   Use small canonical 31-bone poses with a nonidentity object yaw. Assert exact
   extraction of:
