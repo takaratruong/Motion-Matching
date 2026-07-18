@@ -18,10 +18,12 @@ from mm_sonic.scene import (
     MUJOCO_COORDINATE_SIGNATURE,
     SceneError,
     load_scene_registry,
+    normalize_run_local_actuators,
     penetration_exceeds_threshold,
     register_scene,
     replay_kinematic_reference,
     transform_obj,
+    verify_loaded_actuator_routing,
     verify_mm_scene_identity,
 )
 
@@ -232,14 +234,26 @@ def _synthetic_robot_xml():
             'size="0.01" density="100"/>'
             "</body>"
         )
+    joint_names = list(reversed(TARGET_JOINT_ORDER)) + [
+        "left_hand_finger_joint",
+        "right_hand_finger_joint",
+    ]
+    # Emit one motor per named joint, intentionally in reverse document order,
+    # so normalization must reorder them to MuJoCo joint traversal.
+    motors = "".join(
+        f'<motor name="{name}_motor" joint="{name}" gear="1"/>'
+        for name in reversed(joint_names)
+    )
     return (
         '<mujoco model="synthetic_g1">'
         '<compiler angle="radian" meshdir="meshes"/>'
         '<worldbody><body name="pelvis" pos="0 0 0.2">'
-        '<freejoint name="floating_base_joint"/>'
+        '<joint name="floating_base_joint" type="free"/>'
         '<geom name="pelvis_geom" type="sphere" size="0.1" density="100"/>'
         + "".join(bodies)
-        + "</body></worldbody></mujoco>\n"
+        + "</body></worldbody>"
+        + f"<actuator>{motors}</actuator>"
+        + "</mujoco>\n"
     )
 
 
@@ -458,6 +472,93 @@ class RegistryAndObjTests(unittest.TestCase):
             malformed.write_text("v 0 0 nan\nf 1 1 1\n", encoding="ascii")
             with self.assertRaisesRegex(SceneError, "finite"):
                 transform_obj(malformed, _sha256(malformed), root / "bad.obj")
+
+
+class ActuatorNormalizationTests(unittest.TestCase):
+    def _register_flat_scene_with_synthetic_actuators(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        root = Path(self.temporary.name)
+        terrain_root = root / "terrain"
+        _terrain_fixture(terrain_root)
+        official, robot = _official_scene_fixture(root)
+        return register_scene(
+            "sonic-flat-baseline",
+            "flat-12s",
+            registry_path=REGISTRY,
+            terrain_dir=terrain_root,
+            official_scene_xml=official,
+            output_dir=root / "flat-output",
+            expected_official_scene_sha256=_sha256(official),
+            expected_robot_sha256=_sha256(robot),
+            mm_hello_identity=_mm_hello_identity(terrain_root),
+            mm_scene_identity=_flat_scene_identity(),
+        )
+
+    def test_run_local_actuators_match_loaded_joint_traversal_with_sentinels(self):
+        registered = self._register_flat_scene_with_synthetic_actuators()
+        model = mujoco.MjModel.from_xml_path(str(registered.gear_scene_xml))
+        order = verify_loaded_actuator_routing(model)
+        self.assertEqual(order, tuple(model.joint(i).name for i in range(1, model.njnt)))
+        sentinels = np.arange(1, model.nu + 1, dtype=np.float64)
+        routed = np.zeros(model.nu, dtype=np.float64)
+        for joint_id, sentinel in enumerate(sentinels, start=1):
+            routed[joint_id - 1] = sentinel
+        for actuator_id in range(model.nu):
+            joint_id = int(model.actuator_trnid[actuator_id, 0])
+            self.assertEqual(routed[actuator_id], sentinels[joint_id - 1])
+
+    def test_normalization_is_deterministic_and_preserves_motor_attributes(self):
+        robot_bytes = _synthetic_robot_xml().encode("utf-8")
+        first, order_first, sha_first = normalize_run_local_actuators(
+            robot_bytes, label="robot"
+        )
+        second, order_second, sha_second = normalize_run_local_actuators(
+            robot_bytes, label="robot"
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(order_first, order_second)
+        self.assertEqual(sha_first, sha_second)
+        self.assertRegex(sha_first, r"^[0-9a-f]{64}$")
+        root = ET.fromstring(first)
+        actuator = root.find("actuator")
+        self.assertIsNotNone(actuator)
+        motors = list(actuator)
+        self.assertEqual(
+            tuple(motor.attrib["joint"] for motor in motors), order_first
+        )
+        for motor in motors:
+            self.assertEqual(motor.attrib["gear"], "1")
+            self.assertTrue(motor.attrib["name"].endswith("_motor"))
+
+    def test_missing_duplicate_and_unknown_motors_fail_closed(self):
+        root = ET.fromstring(_synthetic_robot_xml())
+        actuator = root.find("actuator")
+        motors = list(actuator)
+        # Duplicate motor for the same joint.
+        duplicate = ET.SubElement(actuator, "motor")
+        duplicate.attrib.update(motors[0].attrib)
+        duplicate.attrib["name"] = "dup_motor"
+        with self.assertRaisesRegex(SceneError, "motor"):
+            normalize_run_local_actuators(
+                ET.tostring(root, encoding="utf-8"), label="robot"
+            )
+
+        root = ET.fromstring(_synthetic_robot_xml())
+        actuator = root.find("actuator")
+        actuator.remove(list(actuator)[0])
+        with self.assertRaisesRegex(SceneError, "motor"):
+            normalize_run_local_actuators(
+                ET.tostring(root, encoding="utf-8"), label="robot"
+            )
+
+        root = ET.fromstring(_synthetic_robot_xml())
+        actuator = root.find("actuator")
+        list(actuator)[0].attrib["joint"] = "nonexistent_joint"
+        with self.assertRaisesRegex(SceneError, "joint"):
+            normalize_run_local_actuators(
+                ET.tostring(root, encoding="utf-8"), label="robot"
+            )
 
 
 class OverlayAndAuthenticationTests(unittest.TestCase):
@@ -1531,6 +1632,14 @@ class OfficialGearIntegrationTests(unittest.TestCase):
             self.assertEqual(len(generated_compilers), 1)
             self.assertEqual(generated_compilers[0].attrib.get("meshdir"), str(meshes))
             generated_compilers[0].attrib["meshdir"] = "meshes"
+            for parsed_root in (generated_root, original_root):
+                actuator_blocks = parsed_root.findall("actuator")
+                self.assertEqual(len(actuator_blocks), 1)
+                actuator = actuator_blocks[0]
+                actuator[:] = sorted(
+                    list(actuator),
+                    key=lambda motor: motor.attrib.get("joint", ""),
+                )
             self.assertEqual(
                 _element_structure(generated_root),
                 _element_structure(original_root),

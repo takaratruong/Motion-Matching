@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import math
 import unittest
 
 from mm_sonic.commands import CommandSample
+from mm_sonic.hands import NEUTRAL_HAND_TARGETS, hand_targets_record
 from mm_sonic.joints import ContractError
 from mm_sonic.manual_demo import CommandRecorder
 from mm_sonic.manual_evidence import parse_manual_command_artifact
@@ -38,6 +40,18 @@ class CommandRecorderTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ContractError, "chunk"):
             recorder.record(_forward(2))
+
+    def test_records_neutral_hand_control_in_v3_command_artifact(self) -> None:
+        recorder = CommandRecorder(mode="script", preload_chunks=1)
+        recorder.record(_stand(0))
+        recorder.record(_forward(1))
+
+        document = json.loads(recorder.artifact_bytes())
+
+        self.assertEqual(document["schema"], "mm-sonic-manual-command/v3")
+        self.assertEqual(
+            document["hand_control"], hand_targets_record(NEUTRAL_HAND_TARGETS)
+        )
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ from typing import Mapping
 import numpy as np
 
 from .artifacts import RunBundle
+from .hands import Dex3HandTargets, NEUTRAL_HAND_TARGETS, resolve_hand_targets
 from .joints import ContractError
 from .timeline import CanonicalTargetBuffer
 
@@ -33,18 +34,22 @@ def _tag_failure(error: BaseException, site: str) -> None:
             pass
 
 
-def pose_header(count: int) -> dict[str, object]:
+def pose_header(count: int, include_hands: bool = False) -> dict[str, object]:
+    fields = [
+        {"name": "joint_pos", "dtype": "f32", "shape": [count, 29]},
+        {"name": "joint_vel", "dtype": "f32", "shape": [count, 29]},
+        {"name": "body_quat_w", "dtype": "f32", "shape": [count, 4]},
+        {"name": "frame_index", "dtype": "i64", "shape": [count]},
+    ]
+    if include_hands:
+        fields.append({"name": "left_hand_joints", "dtype": "f32", "shape": [7]})
+        fields.append({"name": "right_hand_joints", "dtype": "f32", "shape": [7]})
+    fields.append({"name": "catch_up", "dtype": "u8", "shape": [1]})
     return {
         "v": 1,
         "endian": "le",
         "count": count,
-        "fields": [
-            {"name": "joint_pos", "dtype": "f32", "shape": [count, 29]},
-            {"name": "joint_vel", "dtype": "f32", "shape": [count, 29]},
-            {"name": "body_quat_w", "dtype": "f32", "shape": [count, 4]},
-            {"name": "frame_index", "dtype": "i64", "shape": [count]},
-            {"name": "catch_up", "dtype": "u8", "shape": [1]},
-        ],
+        "fields": fields,
     }
 
 
@@ -89,24 +94,34 @@ def _validate_canonical_buffer(buffer: CanonicalTargetBuffer) -> None:
         raise ContractError("canonical body_quat_w must contain unit quaternions")
 
 
-def encode_pose_v1(buffer: CanonicalTargetBuffer) -> bytes:
+def encode_pose_v1(
+    buffer: CanonicalTargetBuffer,
+    *,
+    hand_targets: Dex3HandTargets | None = None,
+) -> bytes:
     _validate_canonical_buffer(buffer)
+    include_hands = hand_targets is not None
+    if include_hands and not isinstance(hand_targets, Dex3HandTargets):
+        raise ContractError("hand_targets must be Dex3HandTargets or None")
     header_json = json.dumps(
-        pose_header(buffer.count),
+        pose_header(buffer.count, include_hands),
         separators=(",", ":"),
         ensure_ascii=True,
     ).encode("utf-8")
     if len(header_json) > 1280:
         raise ContractError("ZMQ v1 header exceeds 1280 bytes")
     header = header_json + bytes(1280 - len(header_json))
-    payload = b"".join((
+    parts = [
         buffer.joint_position.astype("<f4", copy=False).tobytes(order="C"),
         buffer.joint_velocity.astype("<f4", copy=False).tobytes(order="C"),
         buffer.body_quat_w.astype("<f4", copy=False).tobytes(order="C"),
         buffer.frame_index.astype("<i8", copy=False).tobytes(order="C"),
-        bytes((0,)),
-    ))
-    return b"pose" + header + payload
+    ]
+    if include_hands:
+        parts.append(hand_targets.left_f32.tobytes(order="C"))
+        parts.append(hand_targets.right_f32.tobytes(order="C"))
+    parts.append(bytes((0,)))
+    return b"pose" + header + b"".join(parts)
 
 
 @dataclass(frozen=True)
@@ -117,6 +132,8 @@ class DecodedPoseV1:
     body_quat_w: np.ndarray
     frame_index: np.ndarray
     catch_up: int
+    left_hand_joints: np.ndarray | None = None
+    right_hand_joints: np.ndarray | None = None
 
     @property
     def count(self) -> int:
@@ -186,7 +203,19 @@ def _decode_header(message: bytes) -> tuple[dict[str, object], bytes]:
     count = header["count"]
     if type(count) is not int or count <= 0:
         raise ContractError("ZMQ v1 header contract has an invalid count")
-    if header != pose_header(count):
+    field_names = [
+        field["name"]
+        for field in header["fields"]
+        if type(field) is dict and "name" in field
+    ]
+    has_left = "left_hand_joints" in field_names
+    has_right = "right_hand_joints" in field_names
+    if has_left != has_right:
+        raise ContractError(
+            "ZMQ v1 enriched header must contain both hand fields or neither"
+        )
+    include_hands = has_left and has_right
+    if header != pose_header(count, include_hands):
         raise ContractError("ZMQ v1 header contract does not match pose v1")
     return header, message[header_end:]
 
@@ -254,6 +283,8 @@ def decode_pose_v1(
         frame_index=decoded["frame_index"],
     )
     _validate_canonical_buffer(canonical)
+    left_hand = decoded.get("left_hand_joints")
+    right_hand = decoded.get("right_hand_joints")
     return DecodedPoseV1(
         header=MappingProxyType(header),
         joint_position=canonical.joint_position,
@@ -261,6 +292,8 @@ def decode_pose_v1(
         body_quat_w=canonical.body_quat_w,
         frame_index=canonical.frame_index,
         catch_up=catch_up,
+        left_hand_joints=left_hand,
+        right_hand_joints=right_hand,
     )
 
 
@@ -271,10 +304,12 @@ def _little_endian_bytes(value: np.ndarray, dtype: str) -> bytes:
 def verify_pose_v1_parity(
     message: bytes | bytearray | memoryview,
     buffer: CanonicalTargetBuffer,
+    *,
+    hand_targets: Dex3HandTargets | None = None,
 ) -> DecodedPoseV1:
     _validate_canonical_buffer(buffer)
     decoded = decode_pose_v1(message, baseline_mode=True)
-    comparisons = (
+    comparisons = [
         (
             "joint_position",
             decoded.joint_position,
@@ -289,7 +324,20 @@ def verify_pose_v1_parity(
         ),
         ("body_quat_w", decoded.body_quat_w, buffer.body_quat_w, "<f4"),
         ("frame_index", decoded.frame_index, buffer.frame_index, "<i8"),
-    )
+    ]
+    if hand_targets is not None:
+        if not isinstance(hand_targets, Dex3HandTargets):
+            raise ContractError("hand_targets must be Dex3HandTargets or None")
+        if decoded.left_hand_joints is None or decoded.right_hand_joints is None:
+            raise ContractError(
+                "decoded ZMQ v1 message is missing both hand fields for parity"
+            )
+        comparisons.append(
+            ("left_hand_joints", decoded.left_hand_joints, hand_targets.left_f32, "<f4")
+        )
+        comparisons.append(
+            ("right_hand_joints", decoded.right_hand_joints, hand_targets.right_f32, "<f4")
+        )
     for name, actual, expected, dtype in comparisons:
         if (
             actual.shape != expected.shape
@@ -311,11 +359,14 @@ class PosePublisher:
         *,
         bundle: RunBundle,
         context: object | None = None,
+        default_hand_targets: Dex3HandTargets = NEUTRAL_HAND_TARGETS,
     ) -> None:
         if type(endpoint) is not str or not endpoint:
             raise ContractError("PosePublisher endpoint must be a nonempty string")
         if not isinstance(bundle, RunBundle):
             raise ContractError("PosePublisher requires a RunBundle")
+        if not isinstance(default_hand_targets, Dex3HandTargets):
+            raise ContractError("PosePublisher requires Dex3HandTargets defaults")
         try:
             import zmq
         except ImportError as error:
@@ -352,6 +403,7 @@ class PosePublisher:
             raise
 
         self._bundle = bundle
+        self._default_hand_targets = default_hand_targets
         self._context = zmq_context
         self._owns_context = owns_context
         self._socket = socket
@@ -372,12 +424,19 @@ class PosePublisher:
         *,
         phase: str = "timeline",
         attempt: int | None = None,
+        left_hand_joints: object | None = None,
+        right_hand_joints: object | None = None,
     ) -> PreparedPosePublication:
         if self._closed:
             raise ContractError("PosePublisher is closed")
         try:
-            message = encode_pose_v1(buffer)
-            decoded = verify_pose_v1_parity(message, buffer)
+            hand_targets = resolve_hand_targets(
+                left_hand_joints=left_hand_joints,
+                right_hand_joints=right_hand_joints,
+                default=self._default_hand_targets,
+            )
+            message = encode_pose_v1(buffer, hand_targets=hand_targets)
+            decoded = verify_pose_v1_parity(message, buffer, hand_targets=hand_targets)
         except BaseException as error:
             _tag_failure(error, "zmq_encoding")
             raise
@@ -437,8 +496,16 @@ class PosePublisher:
         *,
         phase: str = "timeline",
         attempt: int | None = None,
+        left_hand_joints: object | None = None,
+        right_hand_joints: object | None = None,
     ) -> Mapping[str, object]:
-        publication = self.prepare(buffer, phase=phase, attempt=attempt)
+        publication = self.prepare(
+            buffer,
+            phase=phase,
+            attempt=attempt,
+            left_hand_joints=left_hand_joints,
+            right_hand_joints=right_hand_joints,
+        )
         return self.send_prepared(publication)
 
     def close(self) -> None:

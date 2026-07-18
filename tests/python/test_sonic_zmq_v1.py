@@ -20,6 +20,7 @@ from unittest import mock
 import numpy as np
 
 from mm_sonic.artifacts import RunBundle
+from mm_sonic.hands import NEUTRAL_HAND_TARGETS
 from mm_sonic.joints import ContractError
 from mm_sonic.timeline import CanonicalTargetBuffer
 from mm_sonic.zmq_v1 import (
@@ -375,6 +376,68 @@ class PoseCodecRejectionTests(unittest.TestCase):
             verify_pose_v1_parity(bytes(changed), self.buffer)
 
 
+class PoseHandCodecTests(unittest.TestCase):
+    def test_enriched_message_preserves_both_hand_vectors_and_legacy_still_decodes(self) -> None:
+        buffer = make_buffer(2, 40)
+        enriched = encode_pose_v1(buffer, hand_targets=NEUTRAL_HAND_TARGETS)
+        decoded = decode_pose_v1(enriched)
+        self.assertEqual(
+            [field["name"] for field in decoded.header["fields"]],
+            ["joint_pos", "joint_vel", "body_quat_w", "frame_index",
+             "left_hand_joints", "right_hand_joints", "catch_up"],
+        )
+        _assert_array_bits_equal(
+            self, decoded.left_hand_joints, NEUTRAL_HAND_TARGETS.left_f32, "<f4"
+        )
+        _assert_array_bits_equal(
+            self, decoded.right_hand_joints, NEUTRAL_HAND_TARGETS.right_f32, "<f4"
+        )
+        legacy = decode_pose_v1(encode_pose_v1(buffer))
+        self.assertIsNone(legacy.left_hand_joints)
+        self.assertIsNone(legacy.right_hand_joints)
+
+    def test_legacy_encode_is_byte_identical_to_prior_layout(self) -> None:
+        buffer = make_buffer(2, 40)
+        self.assertEqual(encode_pose_v1(buffer), manual_message(buffer))
+
+    def test_enriched_decoder_rejects_one_hand_only_and_invalid_hand_payload(self) -> None:
+        buffer = make_buffer(1, 0)
+        message = encode_pose_v1(buffer, hand_targets=NEUTRAL_HAND_TARGETS)
+        header = pose_header(1, include_hands=True)
+        header["fields"] = [
+            field for field in header["fields"] if field["name"] != "right_hand_joints"
+        ]
+        with self.assertRaisesRegex(ContractError, "both hand"):
+            decode_pose_v1(replace_header(message, header))
+
+
+class PosePublisherHandDefaultTests(unittest.TestCase):
+    def test_publisher_defaults_to_neutral_and_override_reverts_next_call(self) -> None:
+        fake_zmq = SimpleNamespace(PUB=1, CONFLATE=2, LINGER=3, LAST_ENDPOINT=4)
+        context = _PublisherContext()
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = RunBundle.create(Path(directory), "stage-a", "hand-default")
+            with mock.patch.dict(sys.modules, {"zmq": fake_zmq}):
+                publisher = PosePublisher(
+                    "tcp://127.0.0.1:*", bundle=bundle, context=context
+                )
+            try:
+                first = publisher.prepare(make_buffer(1, 0), phase="readiness", attempt=1)
+                second = publisher.prepare(
+                    make_buffer(1, 0), phase="readiness", attempt=2,
+                    left_hand_joints=(0.1, 0.2, 0.8, -0.7, -0.8, -0.6, -0.7),
+                )
+                third = publisher.prepare(make_buffer(1, 0), phase="readiness", attempt=3)
+                self.assertEqual(decode_pose_v1(first.message).left_hand_joints.tolist(),
+                                 NEUTRAL_HAND_TARGETS.left_f32.tolist())
+                self.assertNotEqual(decode_pose_v1(second.message).left_hand_joints.tolist(),
+                                    NEUTRAL_HAND_TARGETS.left_f32.tolist())
+                self.assertEqual(decode_pose_v1(third.message).left_hand_joints.tolist(),
+                                 NEUTRAL_HAND_TARGETS.left_f32.tolist())
+            finally:
+                publisher.close()
+
+
 class TransmissionArtifactTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -630,7 +693,10 @@ class PosePublisherPhaseTests(unittest.TestCase):
             )
 
             self.assertEqual(context.socket_value.sent, [])
-            self.assertEqual(publication.message, encode_pose_v1(buffer))
+            self.assertEqual(
+                publication.message,
+                encode_pose_v1(buffer, hand_targets=NEUTRAL_HAND_TARGETS),
+            )
             archived = bundle.path / publication.archive["message_path"]
             self.assertEqual(archived.read_bytes(), publication.message)
 
@@ -743,10 +809,18 @@ class PosePublisherLoopbackTests(unittest.TestCase):
             if isinstance(received, BaseException):
                 raise received
             initial_message, chunk_message = received
-            self.assertEqual(initial_message, encode_pose_v1(initial))
-            self.assertEqual(chunk_message, encode_pose_v1(chunk))
-            verify_pose_v1_parity(initial_message, initial)
-            verify_pose_v1_parity(chunk_message, chunk)
+            self.assertEqual(
+                initial_message, encode_pose_v1(initial, hand_targets=NEUTRAL_HAND_TARGETS)
+            )
+            self.assertEqual(
+                chunk_message, encode_pose_v1(chunk, hand_targets=NEUTRAL_HAND_TARGETS)
+            )
+            verify_pose_v1_parity(
+                initial_message, initial, hand_targets=NEUTRAL_HAND_TARGETS
+            )
+            verify_pose_v1_parity(
+                chunk_message, chunk, hand_targets=NEUTRAL_HAND_TARGETS
+            )
 
             for record, first, last, message in (
                 (initial_record, 0, 0, initial_message),

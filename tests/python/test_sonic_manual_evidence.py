@@ -10,7 +10,14 @@ import unittest
 import numpy as np
 
 from mm_sonic.commands import CommandSample, flat_command_script
-from mm_sonic.joints import ContractError
+from mm_sonic.hands import (
+    LEFT_HAND_JOINT_ORDER,
+    NEUTRAL_HAND_TARGETS,
+    RIGHT_HAND_JOINT_ORDER,
+    hand_targets_record,
+)
+from mm_sonic.joints import ContractError, TARGET_JOINT_ORDER
+from mm_sonic.scene import normalize_run_local_actuators
 from mm_sonic.manual_evidence import (
     GEAR_FALL_MARKER,
     MANUAL_COMMAND_SCHEMA,
@@ -31,6 +38,14 @@ from mm_sonic.timeline import CanonicalTargetBuffer
 from mm_sonic.zmq_v1 import encode_pose_v1
 
 
+# The 14 hand joints occupy qpos slots 36..49 in the manual state fixtures.
+_HAND_QPOS_ADDRESSES = tuple(range(36, 50))
+_HAND_JOINT_RANGES = tuple((-2.0, 2.0) for _ in range(14))
+_HAND_TARGET_VECTOR = np.asarray(
+    NEUTRAL_HAND_TARGETS.left + NEUTRAL_HAND_TARGETS.right, dtype=np.float64
+)
+
+
 def _stand(index: int) -> CommandSample:
     return CommandSample(index, (0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0))
 
@@ -49,6 +64,9 @@ def _state(index: int, x: float, y: float, z: float, yaw: float) -> ReplayState:
     qpos[1] = y
     qpos[2] = z
     qpos[3:7] = _yaw_quat(yaw)
+    # Settle the 14 Dex3 joints at their commanded target plus 0.05 rad so the
+    # final-second median absolute tracking error stays under the 0.20 bound.
+    qpos[36:50] = _HAND_TARGET_VECTOR + 0.05
     return ReplayState(4 * (index + 1), 0.02 * (index + 1), qpos, np.zeros(49))
 
 
@@ -147,10 +165,24 @@ class PoseStreamTests(unittest.TestCase):
     def test_authenticates_contiguous_frames(self) -> None:
         frames = [encode_pose_v1(_buffer(0, 1)), encode_pose_v1(_buffer(1, 20))]
 
-        buffer = authenticate_pose_stream(frames, expected_first_frame=0)
+        buffer, hand_exact = authenticate_pose_stream(frames, expected_first_frame=0)
 
         self.assertEqual(buffer.count, 21)
         np.testing.assert_array_equal(buffer.frame_index, np.arange(21))
+        self.assertFalse(hand_exact)
+
+    def test_reports_exact_hand_transport_for_neutral_frames(self) -> None:
+        frames = [
+            encode_pose_v1(_buffer(0, 1), hand_targets=NEUTRAL_HAND_TARGETS),
+            encode_pose_v1(_buffer(1, 20), hand_targets=NEUTRAL_HAND_TARGETS),
+        ]
+
+        buffer, hand_exact = authenticate_pose_stream(
+            frames, expected_first_frame=0, hand_targets=NEUTRAL_HAND_TARGETS
+        )
+
+        self.assertEqual(buffer.count, 21)
+        self.assertTrue(hand_exact)
 
     def test_rejects_noncontiguous_frames(self) -> None:
         frames = [encode_pose_v1(_buffer(0, 1)), encode_pose_v1(_buffer(5, 20))]
@@ -283,9 +315,11 @@ def _manual_commands() -> tuple[CommandSample, ...]:
 
 
 def _valid_evidence(**overrides: object) -> dict:
-    pose_frames = [encode_pose_v1(_buffer(0, 1))]
+    pose_frames = [encode_pose_v1(_buffer(0, 1), hand_targets=NEUTRAL_HAND_TARGETS)]
     for chunk in range(34):
-        pose_frames.append(encode_pose_v1(_buffer(1 + chunk * 20, 20)))
+        pose_frames.append(
+            encode_pose_v1(_buffer(1 + chunk * 20, 20), hand_targets=NEUTRAL_HAND_TARGETS)
+        )
     states = []
     for index in range(600):
         if index < 300:
@@ -306,6 +340,10 @@ def _valid_evidence(**overrides: object) -> dict:
             mode="interactive", preload_chunks=4, commands=_manual_commands()
         ),
         "gear_log": b"startup ok\nCONTROL active\nclean shutdown\n",
+        "hand_targets": NEUTRAL_HAND_TARGETS,
+        "hand_qpos_addresses": _HAND_QPOS_ADDRESSES,
+        "hand_joint_ranges": _HAND_JOINT_RANGES,
+        "actuator_routing_pass": True,
     }
     evidence.update(overrides)
     return evidence
@@ -383,20 +421,137 @@ class AuditManualRunTests(unittest.TestCase):
     def test_noncontiguous_pose_stream_fails_closed(self) -> None:
         evidence = _valid_evidence()
         frames = list(evidence["pose_frames"])
-        frames[10] = encode_pose_v1(_buffer(999, 20))
+        frames[10] = encode_pose_v1(_buffer(999, 20), hand_targets=NEUTRAL_HAND_TARGETS)
         evidence["pose_frames"] = frames
         with self.assertRaisesRegex(ContractError, "contiguous"):
             audit_manual_run(**evidence)
 
+    def test_missing_hand_field_fails_closed(self) -> None:
+        evidence = _valid_evidence()
+        frames = list(evidence["pose_frames"])
+        frames[10] = encode_pose_v1(_buffer(1 + 9 * 20, 20))  # legacy, no hands
+        evidence["pose_frames"] = frames
+        with self.assertRaisesRegex(ContractError, "hand fields"):
+            audit_manual_run(**evidence)
+
+    def test_changed_hand_bit_fails_closed(self) -> None:
+        evidence = _valid_evidence()
+        from mm_sonic.hands import Dex3HandTargets
+
+        wrong_left = list(NEUTRAL_HAND_TARGETS.left)
+        wrong_left[1] = 0.2
+        wrong = Dex3HandTargets(
+            profile=NEUTRAL_HAND_TARGETS.profile,
+            left=tuple(wrong_left),
+            right=NEUTRAL_HAND_TARGETS.right,
+        )
+        frames = list(evidence["pose_frames"])
+        frames[10] = encode_pose_v1(_buffer(1 + 9 * 20, 20), hand_targets=wrong)
+        evidence["pose_frames"] = frames
+        result = audit_manual_run(**evidence)
+        self.assertFalse(result.hand_transport_exact)
+        self.assertFalse(result.passed)
+
+    def test_hand_tracking_error_above_bound_fails_closed(self) -> None:
+        evidence = _valid_evidence()
+        states = list(evidence["states"])
+        drifted = []
+        for state in states:
+            qpos = state.qpos.copy()
+            qpos[36:50] = _HAND_TARGET_VECTOR + 0.5
+            drifted.append(ReplayState(state.step, state.sim_time_s, qpos, state.qvel))
+        evidence["states"] = tuple(drifted)
+        result = audit_manual_run(**evidence)
+        self.assertFalse(result.hand_tracking.passed)
+        self.assertFalse(result.passed)
+        self.assertGreater(
+            max(result.hand_tracking.median_absolute_error_rad), 0.20
+        )
+
+    def test_unexpected_limit_pinning_fails_closed(self) -> None:
+        evidence = _valid_evidence()
+        states = list(evidence["states"])
+        pinned = []
+        for state in states:
+            qpos = state.qpos.copy()
+            # Joint index 0 target is 0.0; pin it to the +2.0 range limit.
+            qpos[36] = 2.0
+            pinned.append(ReplayState(state.step, state.sim_time_s, qpos, state.qvel))
+        evidence["states"] = tuple(pinned)
+        result = audit_manual_run(**evidence)
+        self.assertFalse(result.hand_tracking.limit_pass)
+        self.assertFalse(result.passed)
+
+    def test_actuator_routing_failure_fails_closed(self) -> None:
+        result = audit_manual_run(**_valid_evidence(actuator_routing_pass=False))
+        self.assertFalse(result.actuator_routing_pass)
+        self.assertFalse(result.passed)
+
 
 def _store_pose(path: Path, buffer: CanonicalTargetBuffer) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    message = encode_pose_v1(buffer)
+    message = encode_pose_v1(buffer, hand_targets=NEUTRAL_HAND_TARGETS)
     path.write_bytes(message)
     path.with_suffix(".sha256").write_text(
         f"{hashlib.sha256(message).hexdigest()}  {path.name}\n",
         encoding="ascii",
     )
+
+
+def _manual_scene_files(run: Path) -> dict[str, str]:
+    """Write a loadable run-local scene whose hand joints occupy qpos 36..49.
+
+    A free root plus 29 body hinges then 14 hand hinges yields nq == 50 with the
+    hand joints last, matching the synthetic state fixture. Motors are emitted in
+    reverse order so normalization must reorder them to joint traversal.
+    """
+
+    scene_dir = run / "scene"
+    scene_dir.mkdir(parents=True, exist_ok=True)
+    joint_order = list(TARGET_JOINT_ORDER) + list(LEFT_HAND_JOINT_ORDER) + list(
+        RIGHT_HAND_JOINT_ORDER
+    )
+    bodies = []
+    for index, joint in enumerate(joint_order):
+        bodies.append(
+            f'<body name="{joint}_link" pos="{0.05 * index:.4g} 0 1.0">'
+            f'<joint name="{joint}" type="hinge" axis="0 1 0" range="-2 2"/>'
+            f'<geom name="{joint}_geom" type="sphere" size="0.01" density="100"/>'
+            "</body>"
+        )
+    motors = "".join(
+        f'<motor name="{joint}_motor" joint="{joint}" gear="1"/>'
+        for joint in reversed(joint_order)
+    )
+    robot_xml = (
+        '<mujoco model="manual_synthetic">'
+        '<compiler angle="radian"/>'
+        '<worldbody><body name="pelvis" pos="0 0 0.2">'
+        '<freejoint name="floating_base_joint"/>'
+        '<geom name="pelvis_geom" type="sphere" size="0.1" density="100"/>'
+        + "".join(bodies)
+        + "</body></worldbody>"
+        + f"<actuator>{motors}</actuator>"
+        + "</mujoco>\n"
+    ).encode("utf-8")
+    robot_bytes, _, actuator_sha = normalize_run_local_actuators(
+        robot_xml, label="run-local robot XML"
+    )
+    robot_path = scene_dir / "gear_robot.xml"
+    robot_path.write_bytes(robot_bytes)
+    scene_bytes = (
+        '<mujoco model="manual_scene">'
+        f'<include file="{robot_path}"/>'
+        '<worldbody><geom name="floor" type="plane" size="0 0 .05"/>'
+        "</worldbody></mujoco>\n"
+    ).encode("utf-8")
+    scene_path = scene_dir / "gear_scene.xml"
+    scene_path.write_bytes(scene_bytes)
+    return {
+        "gear_scene_sha256": hashlib.sha256(scene_bytes).hexdigest(),
+        "gear_robot_sha256": hashlib.sha256(robot_bytes).hexdigest(),
+        "actuator_joint_order_sha256": actuator_sha,
+    }
 
 
 def _write_valid_bundle(root: Path) -> tuple[Path, Path]:
@@ -452,8 +607,9 @@ def _write_valid_bundle(root: Path) -> tuple[Path, Path]:
 
     canonical = root / "canonical_target.npz"
     canonical.write_bytes(_npz_bytes(_buffer(0, 601)))
+    scene_control = _manual_scene_files(run)
     summary = {
-        "schema": "mm-sonic-manual-demo/v2",
+        "schema": "mm-sonic-manual-demo/v3",
         "mode": "interactive",
         "run_root": str(run.resolve()),
         "preload_chunks": 4,
@@ -463,6 +619,8 @@ def _write_valid_bundle(root: Path) -> tuple[Path, Path]:
             "path": "manual-commands.json",
             "sha256": hashlib.sha256(command_bytes).hexdigest(),
         },
+        "hand_control": hand_targets_record(NEUTRAL_HAND_TARGETS),
+        "scene_control": scene_control,
         "snapshot": {
             "contact_rows": 2401,
             "sim_time_s": 12.005,

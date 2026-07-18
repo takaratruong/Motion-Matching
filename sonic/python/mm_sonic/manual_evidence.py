@@ -18,6 +18,16 @@ import numpy as np
 
 from .commands import CommandSample, flat_command_script
 from .coordinator import SessionConfig, SourceValidator
+from .hands import (
+    Dex3HandTargets,
+    HandTrackingReport,
+    NEUTRAL_HAND_TARGETS,
+    hand_joint_ranges,
+    hand_qpos_addresses,
+    hand_targets_record,
+    measure_hand_tracking,
+    parse_hand_targets_record,
+)
 from .joints import ContractError, load_joint_contract
 from .process import MMChunkClient
 from .replay_video import load_state_stream
@@ -25,13 +35,13 @@ from .timeline import CanonicalTargetBuffer, TargetTimeline
 from .zmq_v1 import decode_pose_v1
 
 
-MANUAL_COMMAND_SCHEMA = "mm-sonic-manual-command/v2"
+MANUAL_COMMAND_SCHEMA = "mm-sonic-manual-command/v3"
 _MANUAL_MODES = ("script", "interactive")
 _TARGET_RATE_HZ = 50.0
 _HEADING_TOLERANCE_RAD = 1.0e-6
 _VELOCITY_TOLERANCE_MPS = 1.0e-9
 _NPZ_ARRAYS = {"joint_position", "joint_velocity", "body_quat_w", "frame_index"}
-_MANUAL_SUMMARY_SCHEMA = "mm-sonic-manual-demo/v2"
+_MANUAL_SUMMARY_SCHEMA = "mm-sonic-manual-demo/v3"
 _PRELOAD_CHUNKS = 4
 _OPERATOR_CHUNKS = 30
 _FRAMES_PER_CHUNK = 20
@@ -59,6 +69,7 @@ class ManualCommandArtifact:
     mode: str
     preload_chunks: int
     commands: tuple[CommandSample, ...]
+    hand_targets: Dex3HandTargets
 
 
 @dataclass(frozen=True)
@@ -115,6 +126,7 @@ def manual_command_artifact_bytes(
     mode: str,
     preload_chunks: int,
     commands: Sequence[CommandSample],
+    hand_targets: Dex3HandTargets = NEUTRAL_HAND_TARGETS,
 ) -> bytes:
     values = _validated_commands(commands)
     validated_mode = _validated_mode(mode)
@@ -124,6 +136,7 @@ def manual_command_artifact_bytes(
         "mode": validated_mode,
         "preload_chunks": validated_preload,
         "chunk_count": len(values),
+        "hand_control": hand_targets_record(hand_targets),
         "commands": [
             {
                 "chunk_index": command.chunk_index,
@@ -194,8 +207,14 @@ def authenticate_pose_stream(
     frames: Sequence[bytes | bytearray | memoryview],
     *,
     expected_first_frame: int,
-) -> CanonicalTargetBuffer:
-    """Decode archived ZMQ v1 frames into one contiguous canonical buffer."""
+    hand_targets: Dex3HandTargets | None = None,
+) -> tuple[CanonicalTargetBuffer, bool]:
+    """Decode archived ZMQ v1 frames into one contiguous canonical buffer.
+
+    When ``hand_targets`` is supplied, every frame must carry both seven-value
+    hand fields; the returned flag reports whether their bits matched exactly.
+    Missing hand fields fail closed structurally.
+    """
 
     if type(expected_first_frame) is not int or expected_first_frame < 0:
         raise ContractError("expected_first_frame must be a nonnegative integer")
@@ -207,23 +226,45 @@ def authenticate_pose_stream(
     body_quat_w: list[np.ndarray] = []
     frame_index: list[np.ndarray] = []
     expected_next = expected_first_frame
+    hand_transport_exact = hand_targets is not None
+    expected_left = None if hand_targets is None else hand_targets.left_f32.view(np.uint32)
+    expected_right = None if hand_targets is None else hand_targets.right_f32.view(np.uint32)
     for message in values:
         decoded = decode_pose_v1(message, baseline_mode=True)
         if int(decoded.frame_index[0]) != expected_next:
             raise ContractError(
                 "pose stream frame indices are not contiguous"
             )
+        if hand_targets is not None:
+            if decoded.left_hand_joints is None or decoded.right_hand_joints is None:
+                raise ContractError(
+                    "archived pose stream is missing explicit hand fields"
+                )
+            left_bits = np.ascontiguousarray(
+                decoded.left_hand_joints, dtype="<f4"
+            ).view(np.uint32)
+            right_bits = np.ascontiguousarray(
+                decoded.right_hand_joints, dtype="<f4"
+            ).view(np.uint32)
+            if not (
+                left_bits.shape == expected_left.shape
+                and np.array_equal(left_bits, expected_left)
+                and right_bits.shape == expected_right.shape
+                and np.array_equal(right_bits, expected_right)
+            ):
+                hand_transport_exact = False
         joint_position.append(decoded.joint_position)
         joint_velocity.append(decoded.joint_velocity)
         body_quat_w.append(decoded.body_quat_w)
         frame_index.append(decoded.frame_index)
         expected_next = int(decoded.frame_index[-1]) + 1
-    return CanonicalTargetBuffer(
+    buffer = CanonicalTargetBuffer(
         joint_position=np.concatenate(joint_position, axis=0),
         joint_velocity=np.concatenate(joint_velocity, axis=0),
         body_quat_w=np.concatenate(body_quat_w, axis=0),
         frame_index=np.concatenate(frame_index),
     )
+    return buffer, hand_transport_exact
 
 
 @dataclass(frozen=True)
@@ -525,6 +566,10 @@ class ManualEvidence:
     path_pass: bool
     yaw_pass: bool
     final_stop_pass: bool
+    hand_transport_exact: bool
+    actuator_routing_pass: bool
+    hand_tracking: HandTrackingReport
+    hand_targets: Dex3HandTargets
     command_phases: CommandPhaseReport
     metrics: StateMetrics
     command_artifact: ManualCommandArtifact
@@ -543,6 +588,9 @@ class ManualEvidence:
             and self.path_pass
             and self.yaw_pass
             and self.final_stop_pass
+            and self.hand_transport_exact
+            and self.actuator_routing_pass
+            and self.hand_tracking.passed
         )
 
 
@@ -553,13 +601,18 @@ def audit_manual_run(
     mm_replay: MMCommandReplay,
     command_artifact: bytes | bytearray | memoryview,
     gear_log: bytes | bytearray | memoryview,
+    hand_targets: Dex3HandTargets,
+    hand_qpos_addresses: Sequence[int],
+    hand_joint_ranges: Sequence[tuple[float, float]],
+    actuator_routing_pass: bool,
 ) -> ManualEvidence:
     """Offline audit of one completed 12-second manual SONIC run.
 
     Structural forgeries (row count, cadence, stream contiguity, malformed
-    archives) raise :class:`ContractError`. Content boundaries (known-good MM
-    qualification, command-conditioned replay parity, absence of the fall
-    marker, ordered command phases) are reported as pass booleans.
+    archives, missing hand fields) raise :class:`ContractError`. Content
+    boundaries (known-good MM qualification, command-conditioned replay parity,
+    absence of the fall marker, ordered command phases, exact hand transport,
+    actuator routing, settled hand tracking) are reported as pass booleans.
     """
 
     validated_states = _validate_state_cadence(states)
@@ -568,7 +621,15 @@ def audit_manual_run(
         raise ContractError(
             "12-second manual run requires 4 preload and 30 operator commands"
         )
-    stream_buffer = authenticate_pose_stream(pose_frames, expected_first_frame=0)
+    if not isinstance(hand_targets, Dex3HandTargets):
+        raise ContractError("manual run requires resolved Dex3 hand targets")
+    if hand_targets_record(hand_targets) != hand_targets_record(artifact.hand_targets):
+        raise ContractError("manual run hand targets disagree with the command artifact")
+    if type(actuator_routing_pass) is not bool:
+        raise ContractError("actuator routing pass must be a boolean")
+    stream_buffer, hand_transport_exact = authenticate_pose_stream(
+        pose_frames, expected_first_frame=0, hand_targets=hand_targets
+    )
     expected_stream_count = 1 + 20 * len(artifact.commands)
     if stream_buffer.count != expected_stream_count:
         raise ContractError(
@@ -592,6 +653,13 @@ def audit_manual_run(
     metrics = state_metrics(
         validated_states, final_stop_seconds=_FINAL_STOP_SECONDS
     )
+    hand_tracking = measure_hand_tracking(
+        validated_states,
+        qpos_addresses=hand_qpos_addresses,
+        joint_ranges=hand_joint_ranges,
+        targets=hand_targets,
+        final_seconds=1.0,
+    )
     return ManualEvidence(
         state_rows_valid=True,
         pose_stream_valid=True,
@@ -611,6 +679,10 @@ def audit_manual_run(
             metrics.final_stop_displacement_m
             <= _MAX_FINAL_STOP_DISPLACEMENT_M
         ),
+        hand_transport_exact=hand_transport_exact,
+        actuator_routing_pass=actuator_routing_pass,
+        hand_tracking=hand_tracking,
+        hand_targets=hand_targets,
         command_phases=phases,
         metrics=metrics,
         command_artifact=artifact,
@@ -671,12 +743,13 @@ def parse_manual_command_artifact(
         raise ContractError("manual command artifact is not valid ASCII JSON") from error
     root = _require_keys(
         document,
-        {"schema", "mode", "preload_chunks", "chunk_count", "commands"},
+        {"schema", "mode", "preload_chunks", "chunk_count", "hand_control", "commands"},
         "manual command artifact",
     )
     if root["schema"] != MANUAL_COMMAND_SCHEMA:
         raise ContractError("manual command artifact has an unsupported schema")
     mode = _validated_mode(root["mode"])
+    hand_targets = parse_hand_targets_record(root["hand_control"])
     raw_commands = root["commands"]
     if type(raw_commands) is not list:
         raise ContractError("manual command artifact commands must be an array")
@@ -704,6 +777,7 @@ def parse_manual_command_artifact(
         mode=mode,
         preload_chunks=preload_chunks,
         commands=commands,
+        hand_targets=hand_targets,
     )
 
 
@@ -762,13 +836,36 @@ def _json_object(data: bytes, *, label: str) -> dict[str, object]:
     return value
 
 
+_SCENE_CONTROL_KEYS = {
+    "gear_scene_sha256",
+    "gear_robot_sha256",
+    "actuator_joint_order_sha256",
+}
+_SHA256_PATTERN = "0123456789abcdef"
+
+
+def _validate_scene_control(value: object) -> dict[str, str]:
+    mapping = _require_keys(value, _SCENE_CONTROL_KEYS, "manual summary scene control")
+    for key in _SCENE_CONTROL_KEYS:
+        digest = mapping[key]
+        if (
+            type(digest) is not str
+            or len(digest) != 64
+            or any(character not in _SHA256_PATTERN for character in digest)
+        ):
+            raise ContractError(
+                f"manual summary scene control {key} must be a lowercase SHA-256"
+            )
+    return mapping
+
+
 def _validate_summary(
     summary: dict[str, object],
     *,
     run_root: Path,
     artifact: ManualCommandArtifact,
     command_bytes: bytes,
-) -> None:
+) -> tuple[Dex3HandTargets, dict[str, str]]:
     root = _require_keys(
         summary,
         {
@@ -779,6 +876,8 @@ def _validate_summary(
             "generated_chunks",
             "lookahead_seconds",
             "command_artifact",
+            "hand_control",
+            "scene_control",
             "snapshot",
         },
         "manual summary",
@@ -796,6 +895,10 @@ def _validate_summary(
         or root["lookahead_seconds"] != 1.6
     ):
         raise ContractError("manual summary identity does not match the run")
+    hand_targets = parse_hand_targets_record(root["hand_control"])
+    if hand_targets_record(hand_targets) != hand_targets_record(artifact.hand_targets):
+        raise ContractError("manual summary hand control disagrees with the commands")
+    scene_control = _validate_scene_control(root["scene_control"])
     command = _require_keys(
         root["command_artifact"],
         {"path", "sha256"},
@@ -821,6 +924,7 @@ def _validate_summary(
         )
     ):
         raise ContractError("manual summary snapshot is not a 12-second run")
+    return hand_targets, scene_control
 
 
 def _expected_archive_paths(
@@ -898,6 +1002,68 @@ def _load_archived_pose_messages(
     return tuple(messages)
 
 
+def _authenticate_run_local_scene(
+    run_root: Path, scene_control: dict[str, str]
+) -> tuple[tuple[int, ...], tuple[tuple[float, float], ...], bool]:
+    """Verify the run-local scene bytes and loaded actuator routing.
+
+    Returns the 14 hand qpos addresses, their joint ranges, and whether the
+    loaded actuator routing satisfies the BaseSimulator slot invariant.
+    """
+
+    import xml.etree.ElementTree as ET
+
+    from .scene import (
+        SceneError,
+        normalize_run_local_actuators,
+        verify_loaded_actuator_routing,
+    )
+
+    scene_path = run_root / "scene/gear_scene.xml"
+    robot_path = run_root / "scene/gear_robot.xml"
+    scene_bytes = _read_regular(
+        scene_path, label="run-local scene XML", maximum_bytes=16 * 1024 * 1024
+    )
+    robot_bytes = _read_regular(
+        robot_path, label="run-local robot XML", maximum_bytes=16 * 1024 * 1024
+    )
+    if hashlib.sha256(scene_bytes).hexdigest() != scene_control["gear_scene_sha256"]:
+        raise ContractError("run-local scene SHA-256 disagrees with scene control")
+    if hashlib.sha256(robot_bytes).hexdigest() != scene_control["gear_robot_sha256"]:
+        raise ContractError("run-local robot SHA-256 disagrees with scene control")
+    try:
+        _, _, actuator_sha = normalize_run_local_actuators(
+            robot_bytes, label="run-local robot XML"
+        )
+    except SceneError as error:
+        raise ContractError(f"run-local robot actuator order is invalid: {error}") from error
+    if actuator_sha != scene_control["actuator_joint_order_sha256"]:
+        raise ContractError(
+            "run-local actuator joint order disagrees with scene control"
+        )
+    scene_root = ET.fromstring(scene_bytes)
+    includes = scene_root.findall("include")
+    if len(includes) != 1 or includes[0].attrib.get("file") != str(robot_path):
+        raise ContractError(
+            "run-local scene include must point to its own gear_robot.xml"
+        )
+
+    try:
+        import mujoco
+
+        model = mujoco.MjModel.from_xml_path(str(scene_path))
+    except (ImportError, ValueError, OSError) as error:
+        raise ContractError(f"run-local scene does not load: {error}") from error
+    try:
+        verify_loaded_actuator_routing(model)
+        actuator_routing_pass = True
+    except SceneError:
+        actuator_routing_pass = False
+    addresses = hand_qpos_addresses(model)
+    ranges = hand_joint_ranges(model)
+    return addresses, ranges, actuator_routing_pass
+
+
 def audit_manual_bundle(
     run_root: str | Path,
     canonical_target: str | Path,
@@ -929,11 +1095,14 @@ def audit_manual_bundle(
         ),
         label="manual summary",
     )
-    _validate_summary(
+    hand_targets, scene_control = _validate_summary(
         summary,
         run_root=root,
         artifact=artifact,
         command_bytes=command_bytes,
+    )
+    hand_addresses, hand_ranges, actuator_routing_pass = _authenticate_run_local_scene(
+        root, scene_control
     )
 
     state_path = root / "scored-sim-logs/state.jsonl"
@@ -972,6 +1141,10 @@ def audit_manual_bundle(
         mm_replay=replay,
         command_artifact=command_bytes,
         gear_log=simulator_log,
+        hand_targets=hand_targets,
+        hand_qpos_addresses=hand_addresses,
+        hand_joint_ranges=hand_ranges,
+        actuator_routing_pass=actuator_routing_pass,
     )
 
 
@@ -979,12 +1152,13 @@ def manual_evidence_document(evidence: ManualEvidence) -> dict[str, object]:
     if not isinstance(evidence, ManualEvidence):
         raise ContractError("manual evidence document requires ManualEvidence")
     return {
-        "schema": "mm-sonic-manual-evidence/v2",
+        "schema": "mm-sonic-manual-evidence/v3",
         "passed": evidence.passed,
         "mode": evidence.command_artifact.mode,
         "preload_chunks": evidence.command_artifact.preload_chunks,
         "command_count": len(evidence.command_artifact.commands),
         "pose_frame_count": evidence.pose_frame_count,
+        "hand_control": hand_targets_record(evidence.hand_targets),
         "checks": {
             "state_rows_valid": evidence.state_rows_valid,
             "pose_stream_valid": evidence.pose_stream_valid,
@@ -1001,11 +1175,25 @@ def manual_evidence_document(evidence: ManualEvidence) -> dict[str, object]:
             "path_distance": evidence.path_pass,
             "yaw_change": evidence.yaw_pass,
             "final_stop": evidence.final_stop_pass,
+            "hand_transport_exact": evidence.hand_transport_exact,
+            "actuator_routing": evidence.actuator_routing_pass,
+            "hand_tracking": evidence.hand_tracking.passed,
         },
         "command_phases": {
             "has_forward": evidence.command_phases.has_forward,
             "has_heading_change": evidence.command_phases.has_heading_change,
             "has_final_stand": evidence.command_phases.has_final_stand,
+        },
+        "hand_tracking": {
+            "median_absolute_error_rad": list(
+                evidence.hand_tracking.median_absolute_error_rad
+            ),
+            "median_position_rad": list(
+                evidence.hand_tracking.median_position_rad
+            ),
+            "unexpected_limit_joints": list(
+                evidence.hand_tracking.unexpected_limit_joints
+            ),
         },
         "metrics": {
             "minimum_root_height_m": evidence.metrics.minimum_root_height_m,

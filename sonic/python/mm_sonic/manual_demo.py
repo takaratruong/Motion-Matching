@@ -19,11 +19,15 @@ from .cli import (
     _reset_and_prime_scored_epoch,
     _stream_gear_command,
 )
+import xml.etree.ElementTree as ET
+
 from .commands import CommandSample, flat_command_script
 from .coordinator import SessionConfig, SourceValidator
+from .hands import Dex3HandTargets, NEUTRAL_HAND_TARGETS, hand_targets_record
 from .joints import ContractError, load_joint_contract
 from .manual_evidence import manual_command_artifact_bytes
 from .operator import OperatorLimits, OperatorSampler
+from .scene import normalize_run_local_actuators, verify_loaded_actuator_routing
 from .operator_terminal import TerminalInputReader, TerminalKeyBuffer
 from .process import (
     GatedSimulatorClient,
@@ -56,9 +60,16 @@ _CHUNK_DURATION_S = 0.4
 class CommandRecorder:
     """Collect every committed preload/operator command in exact chunk order."""
 
-    def __init__(self, *, mode: str, preload_chunks: int) -> None:
+    def __init__(
+        self,
+        *,
+        mode: str,
+        preload_chunks: int,
+        hand_targets: Dex3HandTargets = NEUTRAL_HAND_TARGETS,
+    ) -> None:
         self._mode = mode
         self._preload_chunks = preload_chunks
+        self._hand_targets = hand_targets
         self._commands: list[CommandSample] = []
 
     def record(self, command: CommandSample) -> None:
@@ -76,6 +87,7 @@ class CommandRecorder:
             mode=self._mode,
             preload_chunks=self._preload_chunks,
             commands=self._commands,
+            hand_targets=self._hand_targets,
         )
 
 
@@ -95,11 +107,48 @@ def _environment(terrain_dir: Path) -> dict[str, str]:
     return environment
 
 
-def _copy_scene(bundle: RunBundle, source_run: Path) -> Path:
-    for relative in ("scene/gear_scene.xml", "scene/gear_robot.xml"):
-        source = source_run / relative
-        bundle.write_bytes(relative, source.read_bytes())
-    return bundle.path / "scene/gear_scene.xml"
+def _copy_scene(bundle: RunBundle, source_run: Path) -> tuple[Path, dict[str, str]]:
+    """Materialize a genuinely run-local, actuator-normalized scene.
+
+    Reads the source overlay and robot, normalizes only the copied robot's
+    actuator element order, rewrites the copied overlay's sole include to the
+    new local robot, loads the result to verify BaseSimulator routing, and
+    never mutates the supplied source run.
+    """
+
+    source_scene = (source_run / "scene/gear_scene.xml").read_bytes()
+    source_robot = (source_run / "scene/gear_robot.xml").read_bytes()
+    robot_bytes, _, actuator_sha = normalize_run_local_actuators(
+        source_robot, label="run-local robot XML"
+    )
+    bundle.write_bytes("scene/gear_robot.xml", robot_bytes)
+    robot_path = bundle.path / "scene/gear_robot.xml"
+
+    scene_root = ET.fromstring(source_scene)
+    includes = scene_root.findall("include")
+    if len(includes) != 1 or set(includes[0].attrib) != {"file"}:
+        raise ContractError("source scene must contain exactly one robot include")
+    includes[0].attrib["file"] = str(robot_path)
+    scene_bytes = ET.tostring(
+        scene_root,
+        encoding="utf-8",
+        xml_declaration=True,
+        short_empty_elements=True,
+    ) + b"\n"
+    bundle.write_bytes("scene/gear_scene.xml", scene_bytes)
+    scene_path = bundle.path / "scene/gear_scene.xml"
+
+    import mujoco
+
+    model = mujoco.MjModel.from_xml_path(str(scene_path))
+    verify_loaded_actuator_routing(model)
+
+    scene_control = {
+        "gear_scene_sha256": hashlib.sha256(scene_bytes).hexdigest(),
+        "gear_robot_sha256": hashlib.sha256(robot_bytes).hexdigest(),
+        "actuator_joint_order_sha256": actuator_sha,
+    }
+    return scene_path, scene_control
 
 
 def _initial_qpos(scene_xml: Path) -> np.ndarray:
@@ -125,13 +174,17 @@ def run_demo(namespace: argparse.Namespace) -> Path:
     runtime = Path(namespace.runtime).expanduser().resolve(strict=True)
     terrain_dir = Path(namespace.terrain_dir).expanduser().resolve(strict=True)
     bundle = RunBundle.create(output_root, "manual-sonic", _utc_run_id())
-    scene_xml = _copy_scene(bundle, source_run)
+    scene_xml, scene_control = _copy_scene(bundle, source_run)
     initial_qpos = _initial_qpos(scene_xml)
     environment = _environment(terrain_dir)
 
     contract = load_joint_contract(_SONIC_ROOT / "configs/g1_joint_contract.json")
     validator = SourceValidator(contract)
-    publisher = PosePublisher("tcp://127.0.0.1:*", bundle=bundle)
+    publisher = PosePublisher(
+        "tcp://127.0.0.1:*",
+        bundle=bundle,
+        default_hand_targets=NEUTRAL_HAND_TARGETS,
+    )
     mm = MMChunkClient(
         run_root=bundle.path,
         command=(str(_SONIC_ROOT / "build/mm_chunk_server"),),
@@ -185,7 +238,9 @@ def run_demo(namespace: argparse.Namespace) -> Path:
     session_id = f"manual-{os.getpid()}"
     next_chunk = 0
     recorder = CommandRecorder(
-        mode=namespace.mode, preload_chunks=_PRELOAD_CHUNKS
+        mode=namespace.mode,
+        preload_chunks=_PRELOAD_CHUNKS,
+        hand_targets=NEUTRAL_HAND_TARGETS,
     )
 
     def publish(buffer, *, phase: str, attempt: int | None = None, wait: bool) -> None:
@@ -331,7 +386,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                 )
         command_artifact = recorder.artifact_bytes()
         summary = {
-            "schema": "mm-sonic-manual-demo/v2",
+            "schema": "mm-sonic-manual-demo/v3",
             "mode": namespace.mode,
             "run_root": str(bundle.path),
             "preload_chunks": _PRELOAD_CHUNKS,
@@ -341,6 +396,8 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                 "path": "manual-commands.json",
                 "sha256": hashlib.sha256(command_artifact).hexdigest(),
             },
+            "hand_control": hand_targets_record(NEUTRAL_HAND_TARGETS),
+            "scene_control": scene_control,
             "snapshot": simulator.snapshot(),
         }
         bundle.write_bytes("manual-commands.json", command_artifact)

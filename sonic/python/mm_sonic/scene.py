@@ -833,7 +833,141 @@ def _load_official_scene(
     )
 
 
-def _run_local_robot_bytes(robot_path: Path, robot_bytes: bytes) -> bytes:
+ACTUATOR_JOINT_ORDER_SCHEMA = "mm-sonic-actuator-joint-order/v1"
+
+
+def _collect_worldbody_joint_names(root: ET.Element, label: str) -> tuple[str, ...]:
+    worldbodies = root.findall("worldbody")
+    if len(worldbodies) != 1:
+        raise SceneError(f"{label} must contain exactly one worldbody")
+    names: list[str] = []
+    seen: set[str] = set()
+    for joint in worldbodies[0].iter("joint"):
+        if joint.attrib.get("type") == "free":
+            continue
+        name = joint.attrib.get("name")
+        if name is None or not name:
+            continue
+        if name in seen:
+            raise SceneError(f"{label} contains a duplicate joint name: {name}")
+        seen.add(name)
+        names.append(name)
+    if not names:
+        raise SceneError(f"{label} has no named worldbody joints")
+    return tuple(names)
+
+
+def _actuator_joint_order_sha256(joint_order: Sequence[str]) -> str:
+    payload = {
+        "joint_order": list(joint_order),
+        "schema": ACTUATOR_JOINT_ORDER_SCHEMA,
+    }
+    try:
+        text = json.dumps(
+            payload,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError) as error:
+        raise SceneError("actuator joint order cannot be encoded") from error
+    return _sha256_bytes((text + "\n").encode("utf-8"))
+
+
+def normalize_run_local_actuators(
+    robot_bytes: bytes,
+    *,
+    label: str = "run-local robot XML",
+) -> tuple[bytes, tuple[str, ...], str]:
+    """Reorder <motor> elements to match MuJoCo worldbody joint traversal."""
+
+    root = _parse_xml_root(robot_bytes, label)
+    if root.tag != "mujoco":
+        raise SceneError(f"{label} root must be mujoco")
+    joint_order = _collect_worldbody_joint_names(root, label)
+    joint_set = set(joint_order)
+
+    actuators = root.findall("actuator")
+    if len(actuators) != 1:
+        raise SceneError(f"{label} must contain exactly one actuator block")
+    actuator = actuators[0]
+    children = list(actuator)
+    if len(children) != len(joint_order):
+        raise SceneError(
+            f"{label} must have exactly one motor per named worldbody joint"
+        )
+    motor_by_joint: dict[str, ET.Element] = {}
+    motor_names: set[str] = set()
+    for child in children:
+        if child.tag != "motor":
+            raise SceneError(
+                f"{label} actuator block must contain only motor elements"
+            )
+        joint = child.attrib.get("joint")
+        if joint is None or joint not in joint_set:
+            raise SceneError(
+                f"{label} motor references an unknown joint: {joint}"
+            )
+        if joint in motor_by_joint:
+            raise SceneError(
+                f"{label} has more than one motor for joint {joint}"
+            )
+        name = child.attrib.get("name")
+        if name is not None:
+            if name in motor_names:
+                raise SceneError(
+                    f"{label} has a duplicate motor name: {name}"
+                )
+            motor_names.add(name)
+        motor_by_joint[joint] = child
+    if set(motor_by_joint) != joint_set:
+        raise SceneError(f"{label} must have exactly one motor per joint")
+
+    for child in children:
+        actuator.remove(child)
+    for joint in joint_order:
+        actuator.append(motor_by_joint[joint])
+
+    tree = ET.ElementTree(root)
+    ET.indent(tree, space="  ")
+    normalized = ET.tostring(
+        root,
+        encoding="utf-8",
+        xml_declaration=True,
+        short_empty_elements=True,
+    ) + b"\n"
+    return normalized, joint_order, _actuator_joint_order_sha256(joint_order)
+
+
+def verify_loaded_actuator_routing(model: Any) -> tuple[str, ...]:
+    """Verify actuator slot s targets joint id s+1 in the loaded model."""
+
+    njnt = int(model.njnt)
+    if njnt < 2:
+        raise SceneError("loaded model must contain a free root and joints")
+    if int(model.nu) != njnt - 1:
+        raise SceneError(
+            f"loaded model must have one motor per joint: "
+            f"nu={int(model.nu)}, njnt={njnt}"
+        )
+    order: list[str] = []
+    for slot in range(int(model.nu)):
+        actual_joint = int(model.actuator_trnid[slot, 0])
+        expected_joint = slot + 1
+        if actual_joint != expected_joint:
+            raise SceneError(
+                f"actuator slot {slot} targets joint {actual_joint}; "
+                f"expected joint {expected_joint} "
+                f"({model.joint(expected_joint).name})"
+            )
+        order.append(model.joint(expected_joint).name)
+    return tuple(order)
+
+
+def _run_local_robot_bytes(
+    robot_path: Path, robot_bytes: bytes
+) -> tuple[bytes, tuple[str, ...], str]:
     root = _parse_xml_root(robot_bytes, "official robot XML")
     if root.tag != "mujoco":
         raise SceneError("official robot XML root must be mujoco")
@@ -860,12 +994,15 @@ def _run_local_robot_bytes(robot_path: Path, robot_bytes: bytes) -> bytes:
     compiler.attrib["meshdir"] = str(resolved_mesh_directory)
     tree = ET.ElementTree(root)
     ET.indent(tree, space="  ")
-    return ET.tostring(
+    meshdir_bytes = ET.tostring(
         root,
         encoding="utf-8",
         xml_declaration=True,
         short_empty_elements=True,
     ) + b"\n"
+    return normalize_run_local_actuators(
+        meshdir_bytes, label="run-local robot XML"
+    )
 
 
 def _overlay_bytes(
@@ -1119,7 +1256,11 @@ def register_scene(
         expected_official_scene_sha256,
         expected_robot_sha256,
     )
-    generated_robot_bytes = _run_local_robot_bytes(
+    (
+        generated_robot_bytes,
+        actuator_joint_order,
+        actuator_joint_order_sha256,
+    ) = _run_local_robot_bytes(
         official_robot_path,
         official_robot_bytes,
     )
@@ -1166,6 +1307,11 @@ def register_scene(
         model = mujoco.MjModel.from_xml_path(str(overlay_path))
     except (ValueError, OSError) as error:
         raise SceneError(f"generated GEAR scene does not load: {error}") from error
+    loaded_actuator_order = verify_loaded_actuator_routing(model)
+    if loaded_actuator_order != actuator_joint_order:
+        raise SceneError(
+            "loaded actuator routing disagrees with normalized joint order"
+        )
     terrain_geom_ids = [
         geom_id
         for geom_id in range(int(model.ngeom))
@@ -1205,6 +1351,8 @@ def register_scene(
         "robot_include": str(generated_robot_path),
         "robot_include_sha256": generated_robot_sha,
         "gear_scene_sha256": overlay_sha,
+        "actuator_joint_order": list(actuator_joint_order),
+        "actuator_joint_order_sha256": actuator_joint_order_sha256,
         "transformed_obj_sha256": (
             None
             if transform_record is None
@@ -1487,6 +1635,12 @@ def replay_kinematic_reference(
         scene.output_hashes.get("official_robot"),
         label_prefix="registered ",
     )
+    registered_actuator_order = registration.get("actuator_joint_order")
+    if type(registered_actuator_order) is not list or any(
+        type(name) is not str for name in registered_actuator_order
+    ):
+        raise SceneError("registered actuator joint order is invalid")
+    registered_actuator_order = tuple(registered_actuator_order)
     if (
         registration.get("gear_scene_sha256") != overlay_sha
         or official_scene_value != str(official_scene_path)
@@ -1497,6 +1651,8 @@ def replay_kinematic_reference(
         or registration.get("robot_include") != str(robot_path)
         or registration.get("robot_include_sha256") != robot_sha
         or registration.get("transformed_obj_sha256") != transformed_sha
+        or registration.get("actuator_joint_order_sha256")
+        != _actuator_joint_order_sha256(registered_actuator_order)
     ):
         raise SceneError("registered scene registration identity changed")
     mujoco = _import_mujoco()
@@ -1504,6 +1660,8 @@ def replay_kinematic_reference(
         model = mujoco.MjModel.from_xml_path(str(overlay_path))
     except (ValueError, OSError) as error:
         raise SceneError(f"registered GEAR scene does not load: {error}") from error
+    if verify_loaded_actuator_routing(model) != registered_actuator_order:
+        raise SceneError("registered actuator routing changed at replay")
     allowed, forbidden = _resolve_contact_groups(model)
     if allowed != scene.allowed_foot_geoms or dict(forbidden) != dict(
         scene.forbidden_geom_groups
