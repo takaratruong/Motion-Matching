@@ -1319,7 +1319,7 @@ Make, and raylib for the final native visualization only.
     python -m unittest tests.python.test_smart_pickup_full_pack_gate -v
   ```
 
-- [ ] **Step 7: Write the authored-data record**
+- [x] **Step 7: Write the authored-data record**
 
   Record the exact Task 0 hashes/counts, target source key and local
   entry/contact frames, every selected slot's stable key/local event frames,
@@ -1331,7 +1331,7 @@ Make, and raylib for the final native visualization only.
   the global motion matcher and are not PickRequest authority.
   ```
 
-- [ ] **Step 8: Run scene, full-pack, and safe regressions**
+- [x] **Step 8: Run scene, full-pack, and safe regressions**
 
   Run:
 
