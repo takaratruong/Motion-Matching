@@ -3564,21 +3564,71 @@ class Task12PolicyTests(unittest.TestCase):
         )
         normalized_input = " ".join(manual_input.split())
         reset_statement = "manual_pick_stationary_diagnostics = {};"
+        pre_step_declaration = (
+            "interaction::SmartPickupPreStepResult "
+            "manual_smart_pickup_pre_step{};"
+        )
+        self.assertEqual(
+            normalized_input.count(pre_step_declaration),
+            1,
+            "the per-tick result must have one declaration in the surrounding "
+            "manual scope so prior output can consume it later",
+        )
+        legacy_aliases = re.findall(
+            r"const\s+bool\s+([A-Za-z_]\w*)\s*=\s*(?:"
+            r"pickup_autodemo_enabled\s*\|\|\s*placement_autodemo_enabled|"
+            r"placement_autodemo_enabled\s*\|\|\s*pickup_autodemo_enabled)\s*;",
+            controller,
+        )
+        pre_step_condition, pre_step_guarded_scope = self._first_if_scope(
+            manual_input
+        )
+        self.assertTrue(
+            self._guard_excludes_legacy_autodemos(
+                pre_step_condition,
+                tuple(legacy_aliases),
+            ),
+            "the manual pre-step assignment must be causally guarded from both "
+            "legacy auto-demo modes",
+        )
+        normalized_pre_step_guard = " ".join(pre_step_guarded_scope.split())
+        self.assertNotIn(
+            pre_step_declaration,
+            normalized_pre_step_guard,
+            "the result must be declared outside the nonlegacy guard so the "
+            "same per-tick value remains available to prior-output steering",
+        )
+        self.assertLess(
+            normalized_input.index(pre_step_declaration),
+            normalized_input.index(normalized_pre_step_guard),
+            "the shared per-tick result must be declared before the nonlegacy "
+            "manual block",
+        )
         state_capture = (
             "const interaction::PickAssistState "
             "manual_smart_pickup_state_before_pre_step = "
             "manual_smart_pickup_controller.diagnostics().state;"
         )
         pre_step_assignment = (
-            "const interaction::SmartPickupPreStepResult "
             "manual_smart_pickup_pre_step = "
             "manual_smart_pickup_controller.pre_step("
         )
+        self.assertEqual(
+            normalized_input.count(pre_step_assignment),
+            1,
+            "there must be exactly one assignment from the real coordinator",
+        )
+        self.assertEqual(
+            normalized_pre_step_guard.count(pre_step_assignment),
+            1,
+            "an assignment outside the parsed nonlegacy guard must not satisfy "
+            "the manual pre-step contract",
+        )
         self.assertIn(
             f"{state_capture} {pre_step_assignment}",
-            normalized_input,
+            normalized_pre_step_guard,
             "the caller must snapshot the real assist diagnostics immediately "
-            "before pre_step",
+            "before the guarded pre_step call",
         )
         pre_step_call = normalized_input.index(
             "manual_smart_pickup_controller.pre_step("
