@@ -3,6 +3,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import struct
 import tempfile
 import unittest
@@ -4922,6 +4923,189 @@ class Task8PlacementPolicyTests(unittest.TestCase):
         return source[start:stop]
 
     @staticmethod
+    def _lambda_assignment(source: str, declaration: str) -> str:
+        start = source.index(declaration)
+        stop = source.index("\n    };", start) + len("\n    };")
+        return source[start:stop]
+
+    @staticmethod
+    def _braced_scope_from(source: str, start: int) -> str:
+        opening = source.index("{", start)
+        depth = 0
+        for index in range(opening, len(source)):
+            if source[index] == "{":
+                depth += 1
+            elif source[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[start:index + 1]
+        raise AssertionError(f"unclosed C++ scope at byte {start}")
+
+    @classmethod
+    def _named_braced_scope(cls, source: str, name: str) -> str:
+        for match in re.finditer(rf"\b{re.escape(name)}\b", source):
+            opening = source.find("{", match.end())
+            semicolon = source.find(";", match.end())
+            if opening >= 0 and (semicolon < 0 or opening < semicolon):
+                return cls._braced_scope_from(source, match.start())
+        raise AssertionError(f"C++ definition for {name!r} is missing")
+
+    @staticmethod
+    def _split_cpp_arguments(arguments: str) -> list[str]:
+        result = []
+        start = 0
+        depths = {"(": 0, "[": 0, "{": 0, "<": 0}
+        closing = {")": "(", "]": "[", "}": "{", ">": "<"}
+        for index, character in enumerate(arguments):
+            if character in depths:
+                depths[character] += 1
+            elif character in closing and depths[closing[character]] > 0:
+                depths[closing[character]] -= 1
+            elif character == "," and all(depth == 0 for depth in depths.values()):
+                result.append(arguments[start:index].strip())
+                start = index + 1
+        tail = arguments[start:].strip()
+        if tail:
+            result.append(tail)
+        return result
+
+    @classmethod
+    def _call_arguments(cls, source: str, call_name: str) -> list[str]:
+        try:
+            start = source.index(call_name)
+            opening = source.index("(", start + len(call_name))
+        except ValueError as error:
+            raise AssertionError(
+                f"C++ call to {call_name!r} is missing"
+            ) from error
+        depth = 0
+        for index in range(opening, len(source)):
+            if source[index] == "(":
+                depth += 1
+            elif source[index] == ")":
+                depth -= 1
+                if depth == 0:
+                    return cls._split_cpp_arguments(
+                        source[opening + 1:index]
+                    )
+        raise AssertionError(f"unterminated C++ call to {call_name!r}")
+
+    @classmethod
+    def _frozen_preview_helper(cls, source: str) -> str:
+        candidates = []
+        for match in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", source):
+            name = match.group(1)
+            opening = source.find("{", match.end())
+            semicolon = source.find(";", match.end())
+            if opening < 0 or (semicolon >= 0 and semicolon < opening):
+                continue
+            signature = source[match.start():opening]
+            if (
+                "SmartPickupPreviewCallback" in signature
+                and "PickEntryRoot" in signature
+            ):
+                candidates.append((name, match.start()))
+        definitions = {(name, offset) for name, offset in candidates}
+        if len(definitions) != 1:
+            raise AssertionError(
+                "interaction_smart_pickup_controller.cpp must define exactly "
+                "one narrow helper that accepts both a frozen PickEntryRoot "
+                "and SmartPickupPreviewCallback"
+            )
+        _, start = next(iter(definitions))
+        return cls._braced_scope_from(source, start)
+
+    def _assert_single_root_preview_delegation(
+        self,
+        helper: str,
+        callback_expression: str,
+    ) -> None:
+        opening = helper.index("{")
+        signature = helper[:opening]
+        body = helper[opening + 1:]
+        parameter_patterns = (
+            (
+                "live snapshot",
+                r"(?:const\s+)?(?:interaction::)?LocomotionSnapshot"
+                r"(?:\s+const)?\s*&\s*([A-Za-z_]\w*)",
+            ),
+            (
+                "frozen prospective root",
+                r"(?:const\s+)?(?:interaction::)?PickEntryRoot"
+                r"(?:\s+const)?\s*&?\s*([A-Za-z_]\w*)",
+            ),
+            (
+                "target handle",
+                r"(?:const\s+)?(?:interaction::)?TargetHandle"
+                r"(?:\s+const)?\s*&?\s*([A-Za-z_]\w*)",
+            ),
+            (
+                "affordance ID",
+                r"(?:const\s+)?(?:std::)?uint32_t(?:\s+const)?\s*&?\s*"
+                r"([A-Za-z_]\w*)",
+            ),
+        )
+        parameter_names = []
+        for label, pattern in parameter_patterns:
+            parameter = re.search(pattern, signature)
+            self.assertIsNotNone(
+                parameter,
+                f"single-preview helper must accept the exact {label}",
+            )
+            if parameter is not None:
+                parameter_names.append(parameter.group(1))
+        calls = list(re.finditer(callback_expression, body))
+        self.assertEqual(
+            len(calls),
+            1,
+            "single-preview helper must contain exactly one direct preview "
+            "delegation",
+        )
+        call = calls[0]
+        call_open = call.end() - 1
+        depth = 0
+        call_close = None
+        for index in range(call_open, len(body)):
+            if body[index] == "(":
+                depth += 1
+            elif body[index] == ")":
+                depth -= 1
+                if depth == 0:
+                    call_close = index
+                    break
+        self.assertIsNotNone(call_close, "preview delegation call is unterminated")
+        if call_close is None:
+            return
+        arguments = self._split_cpp_arguments(body[call_open + 1:call_close])
+        self.assertEqual(
+            arguments,
+            parameter_names,
+            "preview delegation must forward the exact live snapshot, frozen "
+            "root, target handle, and affordance ID in native order",
+        )
+        statement_start = max(
+            body.rfind(";", 0, call.start()),
+            body.rfind("{", 0, call.start()),
+            body.rfind("}", 0, call.start()),
+        ) + 1
+        self.assertEqual(
+            body[statement_start:call.start()].strip(),
+            "return",
+            "the native preview result must be returned directly",
+        )
+        for forbidden in (
+            "PickEntrySlots",
+            "std::array",
+            "slots.ordered",
+            "make_pick_entry_slots",
+            "choose_pick_entry_slot",
+            "preview_pick_entry_slots",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, helper)
+        self.assertNotRegex(helper, r"\b(?:for|while)\s*\(")
+
+    @staticmethod
     def _make_target(source: str, name: str) -> str:
         lines = source.splitlines()
         header = f"{name}:"
@@ -5522,7 +5706,7 @@ class Task8PlacementPolicyTests(unittest.TestCase):
             self._choose_pick_entry_slot(tied, both_ready, "Left"), 1
         )
 
-    def test_pick_entry_preview_uses_one_live_snapshot_in_fixed_order(self):
+    def test_legacy_placement_preview_uses_one_live_snapshot_in_fixed_order(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")
         self.assertIn("// Placement pickup preview provider begins.", controller)
         self.assertIn("// Placement pickup preview provider ends.", controller)
@@ -5531,20 +5715,33 @@ class Task8PlacementPolicyTests(unittest.TestCase):
             "// Placement pickup preview provider begins.",
             "// Placement pickup preview provider ends.",
         )
-        helper = self._between(
+        helper = self._lambda_assignment(
             controller,
-            "auto preview_pick_entry_slots =",
-            "auto make_flat_controller_pose =",
+            "    auto preview_pick_entry_slots =",
         )
         normalized_helper = " ".join(helper.split())
         for required in (
+            "std::array<interaction::PickEntryPreview, 2> previews{}",
             "for (size_t index = 0; index < previews.size(); ++index)",
-            "interaction_runtime.preview_pick( snapshot,",
-            "slots.ordered[index].prospective_root",
+            "previews[index] = interaction_runtime.preview_pick( snapshot, "
+            "slots.ordered[index].prospective_root, target, affordance_id);",
+            "return previews;",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, normalized_helper)
+        self.assertEqual(
+            helper.count("interaction_runtime.preview_pick("),
+            1,
+            "the legacy indexed call must execute exactly once for each of the "
+            "ordered Plus-then-Minus slots",
+        )
         normalized_provider = " ".join(provider.split())
+        self.assertEqual(
+            provider.count("preview_pick_entry_slots("),
+            1,
+            "legacy placement must make one fixed-two helper invocation per "
+            "preview epoch; the removed manual path must not leave a dead call",
+        )
         required_in_order = (
             "const interaction::LocomotionSnapshot& snapshot = live_flat_snapshot",
             "const uint64_t fingerprint = live_flat_snapshot_fingerprint",
@@ -5565,7 +5762,6 @@ class Task8PlacementPolicyTests(unittest.TestCase):
             provider.index("pick_entry_previews = previews"),
         )
         self.assertNotIn("locomotion_snapshot_fingerprint(", provider)
-        self.assertEqual(controller.count("interaction_runtime.preview_pick("), 1)
 
         poor = self._pick_entry_preview(
             path_feasible=True, match_ready=False, label="Plus PoorMatch"
@@ -5628,6 +5824,60 @@ class Task8PlacementPolicyTests(unittest.TestCase):
                     self.assertEqual(failed["epochs_consumed_from_script"], 0)
                     self.assertTrue(failed["timeline"][-1]["stick_zero"])
                     self.assertFalse(failed["timeline"][-1]["interact"])
+
+    def test_shared_smart_pickup_coordinator_invokes_frozen_preview_once(self):
+        source_path = Path("interaction_smart_pickup_controller.cpp")
+        if not source_path.is_file():
+            self.fail(
+                "shared Smart Pickup coordinator source is missing its "
+                "frozen-preview helper"
+            )
+        source = source_path.read_text(encoding="utf-8")
+        helper = self._frozen_preview_helper(source)
+        signature = helper[:helper.index("{")]
+        callback_parameter = re.search(
+            r"(?:const\s+)?(?:interaction::)?SmartPickupPreviewCallback"
+            r"(?:\s+const)?\s*&\s*([A-Za-z_]\w*)",
+            signature,
+        )
+        self.assertIsNotNone(
+            callback_parameter,
+            "the shared frozen-preview helper must accept the native preview "
+            "callback by const reference",
+        )
+        self._assert_single_root_preview_delegation(
+            helper,
+            rf"\b{re.escape(callback_parameter.group(1))}\s*\(",
+        )
+
+    def test_native_smart_pickup_preview_callback_is_one_direct_delegation(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        callback_name = "preview_manual_smart_pickup"
+        if callback_name not in controller:
+            self.fail(
+                "controller must supply the shared coordinator a narrow "
+                "preview_manual_smart_pickup runtime callback"
+            )
+        callback = self._named_braced_scope(controller, callback_name)
+        self._assert_single_root_preview_delegation(
+            callback,
+            r"interaction_runtime\.preview_pick\s*\(",
+        )
+        observation = self._between(
+            controller,
+            "// Manual pick-assist observation begins.",
+            "// Manual pick-assist observation ends.",
+        )
+        post_arguments = self._call_arguments(
+            observation,
+            "manual_smart_pickup_controller.post_step",
+        )
+        self.assertEqual(
+            post_arguments.count(callback_name),
+            1,
+            "the native preview callback must be passed exactly once to the "
+            "manual Smart Pickup post-step, not left as a dead delegate",
+        )
 
     def test_pick_entry_preview_runs_inside_provider_and_consumes_prior_epoch(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")
@@ -5978,10 +6228,9 @@ class Task8PlacementPolicyTests(unittest.TestCase):
             "live_flat_snapshot_fingerprint",
             normalized_provider,
         )
-        preview_helper = self._between(
+        preview_helper = self._lambda_assignment(
             controller,
             "    auto preview_pick_entry_slots =",
-            "    auto make_flat_controller_pose =",
         )
         self.assertIn("interaction_runtime.preview_pick(", preview_helper)
         self.assertIn("capture_placement_pick_preview_observation(", provider)
@@ -6008,7 +6257,9 @@ class Task8PlacementPolicyTests(unittest.TestCase):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, provider + consume)
         self.assertEqual(controller.count("interaction_runtime.update("), 1)
-        self.assertEqual(controller.count("interaction_runtime.preview_pick("), 1)
+        self.assertEqual(
+            preview_helper.count("interaction_runtime.preview_pick("), 1
+        )
         reservation_observation = self._between(
             controller,
             "const interaction::InteractionTarget* observed_pick_target =",

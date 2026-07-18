@@ -2073,6 +2073,142 @@ class Task12PolicyTests(unittest.TestCase):
                     return source[start:index + 1]
         raise AssertionError(f"controller function is unterminated: {signature}")
 
+    @staticmethod
+    def _first_if_scope(source: str) -> tuple[str, str]:
+        match = re.search(r"\bif\s*\(", source)
+        if match is None:
+            raise AssertionError("source block has no enclosing if guard")
+        condition_open = source.index("(", match.start())
+        parenthesis_depth = 0
+        condition_close = None
+        for index in range(condition_open, len(source)):
+            if source[index] == "(":
+                parenthesis_depth += 1
+            elif source[index] == ")":
+                parenthesis_depth -= 1
+                if parenthesis_depth == 0:
+                    condition_close = index
+                    break
+        if condition_close is None:
+            raise AssertionError("if guard has an unterminated condition")
+        scope_open = condition_close + 1
+        while scope_open < len(source) and source[scope_open].isspace():
+            scope_open += 1
+        if scope_open >= len(source) or source[scope_open] != "{":
+            raise AssertionError("auto-demo exclusion guard must use a braced scope")
+        brace_depth = 0
+        for index in range(scope_open, len(source)):
+            if source[index] == "{":
+                brace_depth += 1
+            elif source[index] == "}":
+                brace_depth -= 1
+                if brace_depth == 0:
+                    return (
+                        source[condition_open + 1:condition_close],
+                        source[match.start():index + 1],
+                    )
+        raise AssertionError("if guard has an unterminated braced scope")
+
+    @staticmethod
+    def _strip_outer_cpp_parentheses(expression: str) -> str:
+        expression = expression.strip()
+        while expression.startswith("(") and expression.endswith(")"):
+            depth = 0
+            enclosing_close = None
+            for index, character in enumerate(expression):
+                if character == "(":
+                    depth += 1
+                elif character == ")":
+                    depth -= 1
+                    if depth < 0:
+                        raise AssertionError(
+                            "boolean guard has unbalanced parentheses"
+                        )
+                    if depth == 0:
+                        enclosing_close = index
+                        break
+            if enclosing_close != len(expression) - 1:
+                break
+            expression = expression[1:-1].strip()
+        return expression
+
+    @classmethod
+    def _split_top_level_cpp_boolean(
+        cls,
+        expression: str,
+        operator: str,
+    ) -> list[str]:
+        expression = cls._strip_outer_cpp_parentheses(expression)
+        parts = []
+        start = 0
+        depth = 0
+        index = 0
+        while index < len(expression):
+            character = expression[index]
+            if character == "(":
+                depth += 1
+                index += 1
+                continue
+            if character == ")":
+                depth -= 1
+                if depth < 0:
+                    raise AssertionError(
+                        "boolean guard has unbalanced parentheses"
+                    )
+                index += 1
+                continue
+            if depth == 0 and expression.startswith(operator, index):
+                part = expression[start:index].strip()
+                if not part:
+                    raise AssertionError(
+                        f"boolean guard has an empty {operator!r} operand"
+                    )
+                parts.append(part)
+                index += len(operator)
+                start = index
+                continue
+            index += 1
+        if depth != 0:
+            raise AssertionError("boolean guard has unbalanced parentheses")
+        tail = expression[start:].strip()
+        if not tail:
+            raise AssertionError(
+                f"boolean guard has an empty {operator!r} operand"
+            )
+        parts.append(tail)
+        return parts
+
+    @classmethod
+    def _guard_excludes_legacy_autodemos(
+        cls,
+        condition: str,
+        legacy_aliases: tuple[str, ...] = (),
+    ) -> bool:
+        compact = re.sub(r"\s+", "", condition)
+        if len(cls._split_top_level_cpp_boolean(compact, "||")) != 1:
+            return False
+        conjuncts = cls._split_top_level_cpp_boolean(compact, "&&")
+        atoms = {
+            cls._strip_outer_cpp_parentheses(conjunct)
+            for conjunct in conjuncts
+        }
+        if "!autodemo_configuration.has_value()" in atoms:
+            return True
+        if any(f"!{alias}" in atoms for alias in legacy_aliases):
+            return True
+        if {
+            "!pickup_autodemo_enabled",
+            "!placement_autodemo_enabled",
+        }.issubset(atoms):
+            return True
+        return any(
+            negated_pair in atoms
+            for negated_pair in (
+                "!(pickup_autodemo_enabled||placement_autodemo_enabled)",
+                "!(placement_autodemo_enabled||pickup_autodemo_enabled)",
+            )
+        )
+
     def test_safe_query_probe_build_output_is_ignored(self):
         completed = subprocess.run(
             [
@@ -2263,6 +2399,337 @@ class Task12PolicyTests(unittest.TestCase):
             controller,
             "25 Hz scene publication must not add render interpolation lag",
         )
+
+    def test_keyboard_f_x_edges_remain_at_the_input_boundary(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        raw_input = self._source_between(
+            controller,
+            "        // Press edges and runtime updates share the fixed 25 Hz controller",
+            "        if (pickup_autodemo_enabled)",
+        )
+        for key, edge in (
+            ("KEY_F", "interact_pressed"),
+            ("KEY_X", "cancel_pressed"),
+        ):
+            with self.subTest(key=key):
+                self.assertEqual(
+                    controller.count(f"IsKeyPressed({key})"),
+                    1,
+                    f"{key} must be sampled exactly once at the input boundary",
+                )
+                self.assertIn(f"IsKeyPressed({key})", raw_input)
+                self.assertNotIn(
+                    f"IsKeyPressed({key})",
+                    self._source_between(
+                        controller,
+                        "        // Manual pick-assist input begins.",
+                        "        // Manual pick-assist input ends.",
+                    ),
+                    f"manual Smart Pickup must consume {edge}, not poll {key}",
+                )
+        self.assertRegex(
+            raw_input,
+            r"ControllerInteractionEdges\s+interaction_edges\s*\{\s*"
+            r"IsKeyPressed\(KEY_F\)[\s\S]*?IsKeyPressed\(KEY_X\)",
+            "keyboard F/X must remain input-level interact/cancel edges",
+        )
+
+    def test_manual_smart_pickup_activation_uses_only_the_25_hz_clock(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        timing = Path("locomotion_timing.h").read_text(encoding="utf-8")
+        adapter = Path("interaction_controller_adapter.h").read_text(
+            encoding="utf-8"
+        )
+        self.assertRegex(
+            timing,
+            r"kStepSeconds\s*=\s*1\.0F\s*/\s*25\.0F\s*;",
+            "the shared locomotion/interaction tick must remain exactly 1/25 s",
+        )
+        self.assertRegex(
+            adapter,
+            r"kControllerStepSeconds\s*=\s*"
+            r"locomotion_timing::kStepSeconds\s*;",
+        )
+        self.assertEqual(
+            controller.count(
+                "const float dt = interaction::kControllerStepSeconds;"
+            ),
+            1,
+            "the controller must have one authoritative 25 Hz update dt",
+        )
+        self.assertIn("SetTargetFPS(25);", controller)
+        self.assertNotRegex(
+            controller,
+            r"(?:GetFrameTime\s*\(|1\.0[Ff]?\s*/\s*60\.0[Ff]?|"
+            r"0\.0*166(?:6|7))",
+            "manual activation must not introduce a render-rate controller step",
+        )
+
+    def test_manual_smart_pickup_uses_baked_scene_and_shared_one_slot_coordinator(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        self.assertIn(
+            '#include "interaction_smart_pickup_scene.h"',
+            controller,
+            "controller must consume the baked Task 5 scene",
+        )
+        self.assertIn(
+            '#include "interaction_smart_pickup_controller.h"',
+            controller,
+            "controller must consume the shared two-phase coordinator",
+        )
+        self.assertEqual(
+            controller.count("interaction::make_smart_pickup_demo_target()"),
+            1,
+            "ordinary manual Smart Pickup must register the baked Task 5 target",
+        )
+        self.assertRegex(
+            controller,
+            r"interaction::SmartPickupController\s+"
+            r"manual_smart_pickup_controller\b",
+            "manual mode must use the shared raylib-free coordinator",
+        )
+
+        manual_input = self._source_between(
+            controller,
+            "        // Manual pick-assist input begins.",
+            "        // Manual pick-assist input ends.",
+        )
+        self.assertEqual(
+            manual_input.count("manual_smart_pickup_controller.pre_step("),
+            1,
+            "F/X intent must cross the shared coordinator pre-step exactly once",
+        )
+
+        manual_post_step = self._source_between(
+            controller,
+            "        // Manual pick-assist observation begins.",
+            "        // Manual pick-assist observation ends.",
+        )
+        self.assertEqual(
+            manual_post_step.count("manual_smart_pickup_controller.post_step("),
+            1,
+            "the authoritative live-flat snapshot must cross post-step once",
+        )
+
+    def test_manual_smart_pickup_branch_has_no_legacy_slot_synthesis_or_pose_writes(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        for forbidden_state in (
+            r"\binteraction::ControllerPickAssist\b",
+            r"\bmanual_pick_assist(?:_|\b)",
+            r"\bmanual_pick_(?:reach_waypoint|entry_slots|common_entry|"
+            r"final_preview_certified_this_tick)\b",
+        ):
+            with self.subTest(forbidden_state=forbidden_state):
+                self.assertNotRegex(
+                    controller,
+                    forbidden_state,
+                    "controller.cpp must not duplicate SmartPickupController "
+                    "assist, activation, slot, or preview state",
+                )
+        manual_source = "\n".join(
+            (
+                self._source_between(
+                    controller,
+                    "        // Manual pick-assist input begins.",
+                    "        // Manual pick-assist input ends.",
+                ),
+                self._source_between(
+                    controller,
+                    "        // Manual pick-assist observation begins.",
+                    "        // Manual pick-assist observation ends.",
+                ),
+                self._source_between(
+                    controller,
+                    "                    // Manual pick-assist submission begins.",
+                    "                    // Manual pick-assist submission ends.",
+                ),
+            )
+        )
+        for forbidden in (
+            "choose_pick_entry_slot(",
+            "make_pick_reach_waypoint(",
+            "make_pick_entry_slots(",
+            "preview_pick_entry_slots(",
+            "manual_pick_assist.begin(",
+            "manual_pick_assist.observe(",
+            "manual_pick_assist.take_submission(",
+            "start.root_world =",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(
+                    forbidden,
+                    manual_source,
+                    "controller manual code must delegate frozen-slot work to "
+                    "SmartPickupController",
+                )
+        for forbidden_write in (
+            r"\bsimulation_(?:position|rotation)\s*=",
+            r"\bbone_(?:positions|velocities|rotations|angular_velocities)"
+            r"\s*\([^)]*\)\s*=",
+            r"\b(?:locomotion_pose|displayed_pose)\."
+            r"(?:positions|velocities|rotations|angular_velocities)"
+            r"\s*\[[^]]+\]\s*=",
+        ):
+            with self.subTest(forbidden_write=forbidden_write):
+                self.assertNotRegex(
+                    manual_source,
+                    forbidden_write,
+                    "manual activation may steer through input but may not "
+                    "write root, pose, or joint authority",
+                )
+
+    def test_manual_smart_pickup_requires_explicit_pack_except_legacy_fixtures(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        pack_selection = self._source_between(
+            controller,
+            "    const char* interaction_pack_environment =",
+            "    interaction::InteractionRuntime interaction_runtime =",
+        )
+        legacy_match = re.search(
+            r"const\s+bool\s+(?P<name>[A-Za-z_]\w*)\s*=\s*"
+            r"pickup_autodemo_enabled\s*\|\|\s*"
+            r"placement_autodemo_enabled\s*;",
+            controller,
+        )
+        self.assertIsNotNone(
+            legacy_match,
+            "only the two legacy auto-demo modes may use the diagnostic fixture",
+        )
+        legacy_name = legacy_match.group("name") if legacy_match else ""
+        compact_selection = re.sub(r"\s+", "", pack_selection)
+        explicit_match = re.search(
+            r"const\s+bool\s+(?P<name>[A-Za-z_]\w*)\s*=\s*"
+            r"interaction_pack_environment\s*!=\s*nullptr\s*&&\s*"
+            r"interaction_pack_environment\[0\]\s*!=\s*'\\0'\s*;",
+            pack_selection,
+        )
+        self.assertIsNotNone(
+            explicit_match,
+            "pack selection must name the nonempty explicit environment case",
+        )
+        explicit_name = explicit_match.group("name") if explicit_match else ""
+        self.assertRegex(
+            compact_selection,
+            rf"if\(!{re.escape(explicit_name)}&&"
+            rf"!{re.escape(legacy_name)}\)\{{?throwstd::runtime_error\(",
+            "missing packs must throw exactly for nonlegacy manual/acceptance mode",
+        )
+        self.assertEqual(
+            pack_selection.count("./resources/g1_interaction"),
+            1,
+            "the diagnostic-pack path must remain a single legacy fixture fallback",
+        )
+        self.assertRegex(
+            compact_selection,
+            rf"{re.escape(explicit_name)}\?"
+            r"std::filesystem::path\(interaction_pack_environment\):"
+            r"std::filesystem::path\(\"\./resources/g1_interaction\"\)",
+            "the fallback arm must be reachable only after the explicit/nonlegacy "
+            "throw guard",
+        )
+
+    def test_manual_smart_pickup_pack_shape_is_exact_and_fail_closed(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        runtime_initialization = self._source_between(
+            controller,
+            "    interaction::InteractionRuntime interaction_runtime =",
+            "    std::optional<AutodemoCanonicalEntry> autodemo_canonical_entry;",
+        )
+        pack_selection = self._source_between(
+            controller,
+            "    const char* interaction_pack_environment =",
+            "    interaction::InteractionRuntime interaction_runtime =",
+        )
+        legacy_match = re.search(
+            r"const\s+bool\s+(?P<name>[A-Za-z_]\w*)\s*=\s*"
+            r"pickup_autodemo_enabled\s*\|\|\s*"
+            r"placement_autodemo_enabled\s*;",
+            controller,
+        )
+        self.assertIsNotNone(legacy_match)
+        legacy_name = legacy_match.group("name") if legacy_match else ""
+        full_pack_guard = self._source_between(
+            runtime_initialization,
+            "            // Manual Smart Pickup full-pack guard begins.",
+            "            // Manual Smart Pickup full-pack guard ends.",
+        )
+        compact_runtime = re.sub(r"\s+", "", full_pack_guard)
+        self.assertRegex(
+            compact_runtime,
+            rf"^//ManualSmartPickupfull-packguardbegins\."
+            rf"if\(!{re.escape(legacy_name)}\)\{{",
+            "the exact full-pack guard must be scoped to nonlegacy modes",
+        )
+        outer_guard = f"if(!{legacy_name}){{"
+        inner_guard_source = compact_runtime.split(outer_guard, 1)[1]
+        shape_guard_match = re.search(
+            r"if\((?P<condition>[^{}]+)\)\{"
+            r"throwstd::runtime_error\(",
+            inner_guard_source,
+        )
+        self.assertIsNotNone(
+            shape_guard_match,
+            "invalid full-pack shape must directly guard a startup exception",
+        )
+        shape_condition = (
+            shape_guard_match.group("condition") if shape_guard_match else ""
+        )
+        for required in (
+            "interaction_database->fps_numerator!=25U",
+            "interaction_database->fps_denominator!=1U",
+            "interaction_database->clip_count!=2045U",
+            "interaction_database->frame_count!=511250U",
+            "interaction_features->frame_count!="
+            "interaction_database->frame_count",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(
+                    required,
+                    shape_condition,
+                    "ordinary manual/acceptance startup must reject a pack "
+                    "whose full-corpus shape is not exact",
+                )
+        self.assertEqual(
+            shape_condition.count("||"),
+            4,
+            "all five exact shape mismatches must feed the same rejection guard",
+        )
+        self.assertIn("throwstd::runtime_error(", compact_runtime)
+        self.assertNotIn("InteractionRuntime::disabled(", full_pack_guard)
+
+        compact_initialization = re.sub(r"\s+", "", runtime_initialization)
+        self.assertRegex(
+            compact_initialization,
+            rf"interaction::InteractionTargetdemo_target="
+            rf"{re.escape(legacy_name)}\?"
+            r"interaction::make_controller_demo_target\(\*interaction_database\):"
+            r"interaction::make_smart_pickup_demo_target\(\);",
+            "legacy auto-demo must retain its clip-derived fixture while "
+            "nonlegacy manual mode uses only the baked Smart Pickup target",
+        )
+        catch_boundaries = (
+            (
+                "        catch (const interaction::FormatError& error)",
+                "        catch (const std::exception& error)",
+            ),
+            (
+                "        catch (const std::exception& error)",
+                "        catch (...)",
+            ),
+            ("        catch (...)", "    }();"),
+        )
+        for start, stop in catch_boundaries:
+            with self.subTest(catch_boundary=start):
+                catch_source = self._source_between(
+                    runtime_initialization, start, stop
+                )
+                compact_catch = re.sub(r"\s+", "", catch_source)
+                self.assertRegex(
+                    compact_catch,
+                    rf"if\(!{re.escape(legacy_name)}\)\{{?throw;",
+                    "each nonlegacy initialization failure must rethrow",
+                )
+                self.assertIn("InteractionRuntime::disabled(", catch_source)
 
     def test_controller_authors_one_destination_and_retains_direct_identity(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")
@@ -2476,11 +2943,23 @@ class Task12PolicyTests(unittest.TestCase):
 
     def test_controller_keeps_pick_and_release_registry_policies_separate(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")
+        manual_input = self._source_between(
+            controller,
+            "        // Manual pick-assist input begins.",
+            "        // Manual pick-assist input ends.",
+        )
         self.assertEqual(
             controller.count("interaction_registry.resolve_single_target("),
-            2,
-            "manual assist acquisition and auto-demo submission are the only "
-            "target selectors",
+            1,
+            "only the retained legacy pickup auto-demo may use proximity "
+            "target selection",
+        )
+        self.assertNotIn("resolve_single_target(", manual_input)
+        self.assertRegex(
+            manual_input,
+            r"interaction_registry\.find\(\s*"
+            r"interaction_scene_target_handle\s*\)",
+            "manual Smart Pickup must address the baked scene target exactly",
         )
         self.assertNotIn("interaction_registry.reset(", controller)
         self.assertNotIn("interaction_registry.replace_pose(", controller)
@@ -2492,12 +2971,8 @@ class Task12PolicyTests(unittest.TestCase):
 
     def test_manual_pick_assist_owns_locomotion_f_not_legacy_resolver(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")
-        self.assertIn('#include "interaction_pick_assist.h"', controller)
-        self.assertRegex(
-            controller,
-            r"interaction::ControllerPickAssist\s+manual_pick_assist\s*\(\s*"
-            r"manual_pick_assist_config\s*\)\s*;",
-        )
+        self.assertIn('#include "interaction_smart_pickup_controller.h"', controller)
+        self.assertNotRegex(controller, r"\binteraction::ControllerPickAssist\b")
 
         manual_input = self._source_between(
             controller,
@@ -2505,20 +2980,32 @@ class Task12PolicyTests(unittest.TestCase):
             "        // Manual pick-assist input ends.",
         )
         normalized_input = " ".join(manual_input.split())
-        self.assertIn("interaction_edges.interact_pressed", manual_input)
-        self.assertIn(
-            "interaction_scheduler.cached_output().diagnostics.state == "
-            "interaction::RuntimeState::Locomotion",
+        for required in (
+            "interaction::SmartPickupPreStepInput manual_smart_pickup_pre_input{}",
+            "manual_smart_pickup_pre_input.runtime_state = cached_interaction_state",
+            "manual_smart_pickup_pre_input.interact_pressed = interaction_edges.interact_pressed",
+            "manual_smart_pickup_pre_input.cancel_pressed = interaction_edges.cancel_pressed",
+            "manual_smart_pickup_pre_input.left_stick = gamepadstick_left",
+            "manual_smart_pickup_pre_input.right_stick = gamepadstick_right",
+            "manual_smart_pickup_controller.pre_step( manual_smart_pickup_pre_input)",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, normalized_input)
+        self.assertRegex(
             normalized_input,
+            r"if \(manual_smart_pickup_pre_step\.interact_consumed\) \{? "
+            r"interaction_edges\.interact_pressed = false;",
+            "the coordinator result must consume raw F before the scheduler",
         )
-        self.assertIn(
-            "interaction_edges.interact_pressed = false;",
-            manual_input,
-            "raw F must be consumed before the scheduler sees it",
+        self.assertRegex(
+            normalized_input,
+            r"if \(manual_smart_pickup_pre_step\.cancel_consumed\) \{? "
+            r"interaction_edges\.cancel_pressed = false;",
+            "the coordinator result must consume raw X before the scheduler",
         )
         self.assertLess(
             controller.index("        // Manual pick-assist input ends."),
-            controller.index("interaction_scheduler.tick("),
+            controller.index("vec3 desired_velocity_curr = desired_velocity_update("),
         )
 
         resolver = self._source_between(
@@ -2537,32 +3024,27 @@ class Task12PolicyTests(unittest.TestCase):
         self.assertLess(auto_only_guard, legacy_lookup)
         self.assertIn("return std::nullopt;", resolver[auto_only_guard:legacy_lookup])
 
-    def test_manual_pick_assist_activation_rebuilds_current_target_plan(self):
+    def test_manual_smart_pickup_activation_captures_exact_scene_target_only(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")
         manual_input = self._source_between(
             controller,
             "        // Manual pick-assist input begins.",
             "        // Manual pick-assist input ends.",
         )
+        normalized_input = " ".join(manual_input.split())
         for required in (
-            "manual_pick_assist_config.maximum_assisted_path_m +",
-            "manual_pick_assist_config.arrival.maximum_standoff_m",
-            "interaction_registry.resolve_single_target(",
-            "interaction_registry.find(*manual_pick_target_handle)",
-            "manual_pick_target->affordances.size() == 1U",
-            "interaction::make_pick_reach_waypoint(",
-            "interaction::make_pick_entry_slots(",
-            "interaction::PickAssistStart",
-            "manual_pick_assist.begin(",
+            "const interaction::InteractionTarget* manual_smart_pickup_target = interaction_registry.find( interaction_scene_target_handle)",
+            "manual_smart_pickup_pre_input.selected_target = manual_smart_pickup_target",
+            "manual_smart_pickup_pre_input.selected_affordance_id = manual_smart_pickup_target->affordances.front().id",
+            "manual_smart_pickup_controller.pre_step( manual_smart_pickup_pre_input)",
         ):
             with self.subTest(required=required):
-                self.assertIn(required, manual_input)
+                self.assertIn(required, normalized_input)
         ordered = (
-            "interaction_registry.resolve_single_target(",
-            "interaction_registry.find(*manual_pick_target_handle)",
-            "interaction::make_pick_reach_waypoint(",
-            "interaction::make_pick_entry_slots(",
-            "manual_pick_assist.begin(",
+            "interaction_registry.find(",
+            "manual_smart_pickup_pre_input.selected_target =",
+            "manual_smart_pickup_pre_input.selected_affordance_id =",
+            "manual_smart_pickup_controller.pre_step(",
         )
         positions = [manual_input.find(marker) for marker in ordered]
         self.assertTrue(all(position >= 0 for position in positions))
@@ -2572,19 +3054,22 @@ class Task12PolicyTests(unittest.TestCase):
                 sorted(positions),
                 "activation must resolve current identity/pose before planning and begin",
             )
-        self.assertRegex(
-            manual_input,
-            r"start\.root_world\s*=\s*interaction::Transform\s*\{\s*"
-            r"bone_positions\(0\),\s*bone_rotations\(0\)\s*\}\s*;",
-        )
+        for forbidden in (
+            "1.45F",
+            "maximum_assisted_path_m",
+            "resolve_single_target(",
+            "make_pick_reach_waypoint(",
+            "make_pick_entry_slots(",
+            "PickAssistStart",
+            "root_world =",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, manual_input)
         self.assertNotIn("interaction_authored_target", manual_input)
 
     def test_manual_pick_assist_applies_prior_output_without_hijacking_camera(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")
-        self.assertIn(
-            "interaction::PickAssistOutput manual_pick_assist_output{};",
-            controller,
-        )
+        self.assertNotIn("manual_pick_assist_output", controller)
         raw_input = self._source_between(
             controller,
             "        // Get gamepad stick states",
@@ -2599,34 +3084,34 @@ class Task12PolicyTests(unittest.TestCase):
             raw_input,
         )
 
-        prior_output = self._source_between(
-            controller,
-            "        // Manual pick-assist prior output begins.",
-            "        // Manual pick-assist prior output ends.",
-        )
-        for required in (
-            "!manual_pick_assist_activation_tick",
-            "manual_pick_assist_output.override_steering",
-            "gamepadstick_left = manual_pick_assist_output.left_stick;",
-            "gamepadstick_right = manual_pick_assist_output.right_stick;",
-            "manual_pick_assist_output.force_strafe",
-            "desired_strafe = true;",
-        ):
-            with self.subTest(required=required):
-                self.assertIn(required, prior_output)
-        self.assertLess(
-            controller.index("        // Manual pick-assist prior output ends."),
-            controller.index("vec3 desired_velocity_curr = desired_velocity_update("),
-        )
-
         manual_input = self._source_between(
             controller,
             "        // Manual pick-assist input begins.",
             "        // Manual pick-assist input ends.",
         )
-        self.assertIn("manual_pick_assist_activation_tick = true;", manual_input)
-        self.assertIn("gamepadstick_left = vec3();", manual_input)
-        self.assertIn("gamepadstick_right = vec3();", manual_input)
+        normalized_input = " ".join(manual_input.split())
+        for required in (
+            "gamepadstick_left = manual_smart_pickup_pre_step.left_stick",
+            "gamepadstick_right = manual_smart_pickup_pre_step.right_stick",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, normalized_input)
+        self.assertLess(
+            controller.index("        // Manual pick-assist input ends."),
+            controller.index("vec3 desired_velocity_curr = desired_velocity_update("),
+        )
+        prior_output = self._source_between(
+            controller,
+            "        // Manual pick-assist prior output begins.",
+            "        // Manual pick-assist prior output ends.",
+        )
+        normalized_prior = " ".join(prior_output.split())
+        self.assertIn(
+            "if (manual_smart_pickup_pre_step.force_strafe)",
+            normalized_prior,
+        )
+        self.assertIn("desired_strafe = true", normalized_prior)
+        self.assertNotIn("manual_pick_assist_activation_tick", controller)
 
         camera_update = self._source_between(
             controller,
@@ -2635,7 +3120,7 @@ class Task12PolicyTests(unittest.TestCase):
         )
         self.assertIn("raw_gamepadstick_right", camera_update)
         self.assertIn("raw_desired_strafe", camera_update)
-        self.assertNotIn("manual_pick_assist_output", camera_update)
+        self.assertNotIn("manual_smart_pickup_pre_step", camera_update)
 
     def test_controller_materializes_one_post_step_live_flat_snapshot(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")
@@ -2659,86 +3144,149 @@ class Task12PolicyTests(unittest.TestCase):
             "return snapshot;",
             "// Placement pickup preview provider begins.",
             "// Placement pickup preview provider ends.",
+            "manual_smart_pickup_post_input.live_flat_snapshot =\n"
+            "            live_flat_snapshot;",
+            "manual_smart_pickup_controller.post_step(",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, seam)
         snapshot = seam.index(
             "interaction::LocomotionSnapshot live_flat_snapshot"
         )
+        smart_post = seam.find("manual_smart_pickup_controller.post_step(")
         scheduler = seam.index("interaction_scheduler.tick(")
         provider_alias = seam.index(
             "const interaction::LocomotionSnapshot& snapshot ="
         )
         self.assertLess(snapshot, scheduler)
+        self.assertGreaterEqual(
+            smart_post,
+            0,
+            "the one authoritative snapshot must reach Smart Pickup post-step",
+        )
+        if smart_post >= 0:
+            self.assertLess(snapshot, smart_post)
+            self.assertLess(smart_post, scheduler)
         self.assertLess(scheduler, provider_alias)
         self.assertNotIn("interaction::LocomotionSnapshot snapshot;", seam)
 
-    def test_manual_pick_preview_and_observe_share_live_snapshot_fingerprint(self):
+    def test_manual_pick_post_step_uses_live_snapshot_fingerprint_and_request_id(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")
-        self.assertEqual(controller.count("interaction_runtime.preview_pick("), 1)
-        self.assertEqual(controller.count("preview_pick_entry_slots("), 2)
-
-        helper = self._source_between(
-            controller,
-            "    auto preview_pick_entry_slots =",
-            "    auto make_flat_controller_pose =",
-        )
-        for required in (
-            "const interaction::LocomotionSnapshot& snapshot",
-            "const interaction::PickEntrySlots& slots",
-            "interaction::TargetHandle target",
-            "uint32_t affordance_id",
-            "for (size_t index = 0; index < previews.size(); ++index)",
-            "interaction_runtime.preview_pick(",
-            "slots.ordered[index].prospective_root",
-        ):
-            with self.subTest(required=required):
-                self.assertIn(required, helper)
-
         observation = self._source_between(
             controller,
             "        // Manual pick-assist observation begins.",
             "        // Manual pick-assist observation ends.",
         )
+        normalized_observation = " ".join(observation.split())
         for required in (
             "locomotion_snapshot_fingerprint(live_flat_snapshot)",
-            "manual_pick_assist_output.needs_preview",
-            "preview_pick_entry_slots(\n"
-            "                    live_flat_snapshot,",
-            "manual_pick_preview_snapshot_fingerprint =\n"
-            "                    live_flat_snapshot_fingerprint;",
-            "observation.runtime_state = cached_interaction_state;",
-            "observation.displayed_root = interaction::Transform{",
-            "observation.simulation_velocity = simulation_velocity;",
-            "observation.displayed_planar_speed_mps =",
-            "observation.camera_azimuth = camera_azimuth;",
-            "observation.snapshot_fingerprint =\n"
-            "                live_flat_snapshot_fingerprint;",
-            "observation.preview_snapshot_fingerprint =\n"
-            "                manual_pick_preview_snapshot_fingerprint;",
-            "observation.previews = manual_pick_previews;",
-            "manual_pick_assist.observe(observation)",
+            "manual_smart_pickup_post_input.live_flat_snapshot = live_flat_snapshot",
+            "manual_smart_pickup_post_input.runtime_state = cached_interaction_state",
+            "manual_smart_pickup_post_input.next_request_id = interaction_next_request_id",
+            "const interaction::InteractionTarget* manual_smart_pickup_current_target = interaction_registry.find( interaction_scene_target_handle)",
+            "manual_smart_pickup_post_input.current_target = manual_smart_pickup_current_target",
+            "for (int obstacle_index = 0; obstacle_index < obstacles_positions.size; ++obstacle_index)",
+            "manual_smart_pickup_post_input.obstacle_centers.push_back( obstacles_positions(obstacle_index))",
+            "manual_smart_pickup_post_input.obstacle_sizes.push_back( obstacles_scales(obstacle_index))",
+            "manual_smart_pickup_post_input.simulation_velocity = simulation_velocity",
+            "manual_smart_pickup_post_input.displayed_planar_speed_mps =",
+            "manual_smart_pickup_post_input.camera_azimuth = camera_azimuth",
+            "manual_smart_pickup_controller.post_step(",
+            "interaction_runtime.preview_pick(",
+            "manual_smart_pickup_post_step.snapshot_fingerprint",
+            "manual_smart_pickup_post_step.snapshot_fingerprint == live_flat_snapshot_fingerprint",
         ):
-            with self.subTest(required=required):
-                self.assertIn(required, observation)
-        self.assertRegex(
-            observation,
-            r"interaction_registry\.find_by_id\(\s*"
-            r"manual_pick_assist\.diagnostics\(\)\.target\.id\s*\)",
-        )
-        self.assertIn(
-            "if (!manual_pick_assist_cancelled_this_tick)", observation
-        )
-        self.assertNotIn("manual_pick_assist_activation_tick", observation)
-        self.assertEqual(controller.count("manual_pick_assist.observe("), 1)
-        cached_output = observation[observation.index(
-            "manual_pick_assist_output = {};"
-        ):]
-        self.assertNotIn("manual_pick_assist_output.submit_interact", cached_output)
+            with self.subTest(observation_required=required):
+                self.assertIn(required, normalized_observation)
+        for forbidden in (
+            "preview_pick_entry_slots(",
+            "make_pick_reach_waypoint(",
+            "make_pick_entry_slots(",
+            "choose_pick_entry_slot(",
+        ):
+            with self.subTest(observation_forbidden=forbidden):
+                self.assertNotIn(forbidden, observation)
         self.assertLess(
             controller.index("        // Manual pick-assist observation ends."),
             controller.index("interaction_scheduler.tick("),
         )
+
+    def test_manual_smart_pickup_pre_and_post_are_outside_both_legacy_autodemos(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        legacy_aliases = re.findall(
+            r"const\s+bool\s+([A-Za-z_]\w*)\s*=\s*(?:"
+            r"pickup_autodemo_enabled\s*\|\|\s*placement_autodemo_enabled|"
+            r"placement_autodemo_enabled\s*\|\|\s*pickup_autodemo_enabled)\s*;",
+            controller,
+        )
+        for phase, begin, end, coordinator_call in (
+            (
+                "pre-step",
+                "        // Manual pick-assist input begins.",
+                "        // Manual pick-assist input ends.",
+                "manual_smart_pickup_controller.pre_step(",
+            ),
+            (
+                "post-step",
+                "        // Manual pick-assist observation begins.",
+                "        // Manual pick-assist observation ends.",
+                "manual_smart_pickup_controller.post_step(",
+            ),
+        ):
+            with self.subTest(phase=phase):
+                block = self._source_between(controller, begin, end)
+                condition, guarded_scope = self._first_if_scope(block)
+                self.assertEqual(
+                    block.count(coordinator_call),
+                    1,
+                    f"manual Smart Pickup {phase} must cross the coordinator once",
+                )
+                self.assertIn(
+                    coordinator_call,
+                    guarded_scope,
+                    f"synthetic legacy auto-demo F must not enter Smart Pickup {phase}",
+                )
+                self.assertTrue(
+                    self._guard_excludes_legacy_autodemos(
+                        condition,
+                        tuple(legacy_aliases),
+                    ),
+                    f"manual Smart Pickup {phase} guard must exclude both "
+                    "pickup and placement legacy auto-demo modes",
+                )
+
+    def test_legacy_autodemo_guard_parser_rejects_or_bypasses(self):
+        aliases = ("legacy_fixture_mode",)
+        accepted = (
+            "!autodemo_configuration.has_value()",
+            "((!autodemo_configuration.has_value())) && debug_enabled",
+            "!pickup_autodemo_enabled && !placement_autodemo_enabled",
+            "!(pickup_autodemo_enabled || placement_autodemo_enabled)",
+            "ready && (!legacy_fixture_mode) && diagnostics_enabled",
+        )
+        rejected = (
+            "!autodemo_configuration.has_value() || true",
+            "(!legacy_fixture_mode) || debug_enabled",
+            "ready && (!legacy_fixture_mode || debug_enabled)",
+            "!pickup_autodemo_enabled || !placement_autodemo_enabled",
+            "debug_enabled",
+        )
+        for condition in accepted:
+            with self.subTest(accepted=condition):
+                self.assertTrue(
+                    self._guard_excludes_legacy_autodemos(
+                        condition,
+                        aliases,
+                    )
+                )
+        for condition in rejected:
+            with self.subTest(rejected=condition):
+                self.assertFalse(
+                    self._guard_excludes_legacy_autodemos(
+                        condition,
+                        aliases,
+                    )
+                )
 
     def test_manual_pick_activation_observes_post_step_and_caches_next_tick_output(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")
@@ -2752,37 +3300,72 @@ class Task12PolicyTests(unittest.TestCase):
             "        // Manual pick-assist observation begins.",
             "        // Manual pick-assist observation ends.",
         )
-        prior_output = self._source_between(
-            controller,
-            "        // Manual pick-assist prior output begins.",
-            "        // Manual pick-assist prior output ends.",
-        )
-
+        normalized_input = " ".join(manual_input.split())
+        normalized_observation = " ".join(observation.split())
         for required in (
-            "manual_pick_assist_activation_tick = true;",
-            "gamepadstick_left = vec3();",
-            "gamepadstick_right = vec3();",
+            "manual_smart_pickup_controller.pre_step(",
+            "gamepadstick_left = manual_smart_pickup_pre_step.left_stick",
+            "gamepadstick_right = manual_smart_pickup_pre_step.right_stick",
         ):
             with self.subTest(required=required):
-                self.assertIn(required, manual_input)
-        self.assertIn("if (!manual_pick_assist_cancelled_this_tick)", observation)
-        self.assertNotIn("manual_pick_assist_activation_tick", observation)
-        self.assertIn(
-            "manual_pick_assist_output.override_steering =\n"
-            "                observed_output.override_steering;",
-            observation,
+                self.assertIn(required, normalized_input)
+        for required in (
+            "manual_smart_pickup_post_input.live_flat_snapshot = live_flat_snapshot",
+            "manual_smart_pickup_controller.post_step(",
+            "manual_smart_pickup_post_step.assist_observed",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, normalized_observation)
+        self.assertNotIn("manual_pick_assist_activation_tick", controller)
+        self.assertNotIn("gamepadstick_left =", observation)
+        self.assertNotIn("gamepadstick_right =", observation)
+
+        activation_span = self._source_between(
+            controller,
+            "        // Manual pick-assist input begins.",
+            "        // Manual pick-assist observation ends.",
         )
-        self.assertIn(
-            "gamepadstick_left = manual_pick_assist_output.left_stick;",
-            prior_output,
+        for once in (
+            "manual_smart_pickup_controller.pre_step(",
+            "vec3 desired_velocity_curr = desired_velocity_update(",
+            "        simulation_positions_update(",
+            "        simulation_rotations_update(",
+            "interaction::LocomotionSnapshot live_flat_snapshot",
+            "manual_smart_pickup_controller.post_step(",
+        ):
+            with self.subTest(exactly_once=once):
+                self.assertEqual(
+                    activation_span.count(once),
+                    1,
+                    "manual activation must reuse exactly one ordinary 25 Hz "
+                    "controller update and one live-flat bridge",
+                )
+
+        pre_step = controller.index("manual_smart_pickup_controller.pre_step(")
+        velocity_update = controller.index(
+            "vec3 desired_velocity_curr = desired_velocity_update("
         )
+        simulation_update = controller.index(
+            "        simulation_positions_update(", velocity_update
+        )
+        snapshot = controller.index(
+            "interaction::LocomotionSnapshot live_flat_snapshot", simulation_update
+        )
+        post_step = controller.index(
+            "manual_smart_pickup_controller.post_step(", snapshot
+        )
+        scheduler = controller.index("interaction_scheduler.tick(", post_step)
         self.assertLess(
-            controller.index("manual_pick_assist_activation_tick = true;"),
-            controller.index("interaction::LocomotionSnapshot live_flat_snapshot"),
+            pre_step,
+            velocity_update,
         )
-        self.assertLess(
-            controller.index("interaction::LocomotionSnapshot live_flat_snapshot"),
-            controller.index("manual_pick_assist.observe(observation)"),
+        self.assertEqual(
+            [pre_step, velocity_update, simulation_update, snapshot, post_step, scheduler],
+            sorted(
+                [pre_step, velocity_update, simulation_update, snapshot, post_step, scheduler]
+            ),
+            "activation must bracket exactly the existing ordinary locomotion "
+            "step before post-step observation and scheduler publication",
         )
 
     def test_manual_pick_assist_submits_exactly_one_latched_request(self):
@@ -2792,13 +3375,15 @@ class Task12PolicyTests(unittest.TestCase):
             "        // Manual pick-assist observation begins.",
             "        // Manual pick-assist observation ends.",
         )
-        submit_pulse = self._source_between(
-            observation,
-            "            if (observed_output.submit_interact)",
-            "            manual_pick_assist_output = {};",
-        )
-        self.assertIn("interaction_edges.interact_pressed = true;", submit_pulse)
-        self.assertIn("manual_pick_assist_synthetic_interact = true;", submit_pulse)
+        normalized_observation = " ".join(observation.split())
+        for required in (
+            "if (manual_smart_pickup_post_step.pick_request.has_value())",
+            "interaction_edges.interact_pressed = true",
+            "manual_smart_pickup_request = manual_smart_pickup_post_step.pick_request",
+            "++interaction_next_request_id",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, normalized_observation)
 
         resolver = self._source_between(
             controller,
@@ -2813,25 +3398,24 @@ class Task12PolicyTests(unittest.TestCase):
             "                    // Manual pick-assist submission ends.",
         )
         for required in (
-            "manual_pick_assist_synthetic_interact",
-            "manual_pick_assist.owns_manual_interact()",
-            "if (manual_pick_request.has_value())",
-            "++interaction_next_request_id;",
-            "return manual_pick_request;",
+            "manual_smart_pickup_request.has_value()",
+            "return ",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, submission)
         self.assertRegex(
             submission,
-            r"manual_pick_assist\.take_submission\(\s*"
-            r"interaction_next_request_id\s*\)",
+            r"(?:std::exchange\(\s*manual_smart_pickup_request\s*,\s*"
+            r"std::nullopt\s*\)|manual_smart_pickup_request\.reset\(\))",
+            "the scheduler resolver must consume the latched request once",
         )
-        self.assertNotIn("interaction_next_request_id++", submission)
+        self.assertNotIn("interaction_next_request_id", submission)
         self.assertLess(
             resolver.index("// Manual pick-assist submission begins."),
             resolver.index("if (!autodemo_configuration.has_value())"),
         )
-        self.assertEqual(controller.count("manual_pick_assist.take_submission("), 1)
+        self.assertNotIn("take_submission(", controller)
+        self.assertNotIn("manual_pick_assist_synthetic_interact", controller)
 
     def test_manual_braking_uses_combined_stationary_search_only(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")
@@ -2840,9 +3424,10 @@ class Task12PolicyTests(unittest.TestCase):
             "        // Placement stationary search begins.",
             "        // Placement stationary search ends.",
         )
+        normalized_search = " ".join(search.split())
         for required in (
             "const bool manual_pick_stationary_constraint_active =",
-            "manual_pick_assist_output.stationary_constraint",
+            "manual_smart_pickup_post_step.assist_output.stationary_constraint",
             "interaction::RuntimeState::Locomotion",
             "const bool manual_pick_stationary_constraint_latched_this_tick =",
             "manual_pick_stationary_constraint_active &&",
@@ -2858,7 +3443,7 @@ class Task12PolicyTests(unittest.TestCase):
             "manual_pick_stationary_constraint_latched_this_tick",
         ):
             with self.subTest(required=required):
-                self.assertIn(required, search)
+                self.assertIn(required, normalized_search)
 
         constrained = self._source_between(
             search,
@@ -2900,22 +3485,28 @@ class Task12PolicyTests(unittest.TestCase):
             "        // Manual pick-assist input begins.",
             "        // Manual pick-assist input ends.",
         )
+        observation = self._source_between(
+            controller,
+            "        // Manual pick-assist observation begins.",
+            "        // Manual pick-assist observation ends.",
+        )
         self.assertEqual(
-            manual_input.count("manual_pick_stationary_diagnostics = {};"),
+            (manual_input + observation).count(
+                "manual_pick_stationary_diagnostics = {};"
+            ),
             2,
-            "only cancel and a successful new begin may clear manual history",
+            "only coordinator cancellation and a successful post-step begin "
+            "may clear manual history",
         )
-        cancel = manual_input[:manual_input.index(
-            "            interaction_edges.interact_pressed &&"
-        )]
-        self.assertIn("manual_pick_stationary_diagnostics = {};", cancel)
-        successful_begin = self._source_between(
-            manual_input,
-            "                    if (manual_pick_assist.begin(start))",
-            "                    }\n                }",
+        self.assertRegex(
+            " ".join(manual_input.split()),
+            r"if \(manual_smart_pickup_pre_step\.cancel_consumed\)[^{]*"
+            r"\{? manual_pick_stationary_diagnostics = \{\};",
         )
-        self.assertIn(
-            "manual_pick_stationary_diagnostics = {};", successful_begin
+        self.assertRegex(
+            " ".join(observation.split()),
+            r"if \(manual_smart_pickup_post_step\.activation_began\)[^{]*"
+            r"\{? manual_pick_stationary_diagnostics = \{\};",
         )
 
         search_update = self._source_between(
@@ -2973,24 +3564,17 @@ class Task12PolicyTests(unittest.TestCase):
             "        // Manual pick-assist input begins.",
             "        // Manual pick-assist input ends.",
         )
-        cancel = self._source_between(
-            manual_input,
-            "        if (!autodemo_configuration.has_value() &&\n"
-            "            interaction_edges.cancel_pressed &&",
-            "        if (!autodemo_configuration.has_value() &&\n"
-            "            !manual_pick_assist_cancelled_this_tick &&\n"
-            "            interaction_edges.interact_pressed &&",
-        )
+        normalized_input = " ".join(manual_input.split())
         for required in (
-            "manual_pick_assist.owns_manual_interact()",
-            "manual_pick_assist.cancel();",
-            "interaction_edges.cancel_pressed = false;",
-            "manual_pick_assist_output = {};",
-            "manual_pick_assist_cancelled_this_tick = true;",
+            "manual_smart_pickup_pre_input.cancel_pressed = interaction_edges.cancel_pressed",
+            "manual_smart_pickup_controller.pre_step(",
+            "if (manual_smart_pickup_pre_step.cancel_consumed)",
+            "interaction_edges.cancel_pressed = false",
         ):
             with self.subTest(required=required):
-                self.assertIn(required, cancel)
-        self.assertNotIn("RuntimeState::Carry", manual_input)
+                self.assertIn(required, normalized_input)
+        self.assertNotIn("manual_pick_assist.cancel(", controller)
+        self.assertNotIn("manual_pick_assist_cancelled_this_tick", controller)
 
         prior_output = self._source_between(
             controller,
@@ -2998,19 +3582,13 @@ class Task12PolicyTests(unittest.TestCase):
             "        // Manual pick-assist prior output ends.",
         )
         self.assertNotIn("cancel", prior_output)
-        self.assertLess(
-            controller.index("manual_pick_assist_output = {};", controller.index(
-                "// Manual pick-assist input begins."
-            )),
-            controller.index("// Manual pick-assist prior output begins."),
-        )
 
         observation = self._source_between(
             controller,
             "        // Manual pick-assist observation begins.",
             "        // Manual pick-assist observation ends.",
         )
-        self.assertIn("!manual_pick_assist_cancelled_this_tick", observation)
+        self.assertNotIn("cancel", observation)
         carry = self._source_between(
             controller,
             "        if (!autodemo_configuration.has_value() &&",
@@ -3026,43 +3604,39 @@ class Task12PolicyTests(unittest.TestCase):
             "        // Manual pick-assist input begins.",
             "        // Manual pick-assist input ends.",
         )
-        cancel = manual_input[:manual_input.index(
-            "            interaction_edges.interact_pressed &&"
-        )]
-        self.assertIn("interaction_edges.interact_pressed = false;", cancel)
-        self.assertIn(
-            "if (!autodemo_configuration.has_value() &&\n"
-            "            !manual_pick_assist_cancelled_this_tick &&\n"
-            "            interaction_edges.interact_pressed &&",
-            manual_input,
+        normalized_input = " ".join(manual_input.split())
+        required_in_order = (
+            "manual_smart_pickup_pre_input.interact_pressed = interaction_edges.interact_pressed",
+            "manual_smart_pickup_pre_input.cancel_pressed = interaction_edges.cancel_pressed",
+            "manual_smart_pickup_controller.pre_step(",
+            "if (manual_smart_pickup_pre_step.cancel_consumed)",
+            "interaction_edges.cancel_pressed = false",
+            "if (manual_smart_pickup_pre_step.interact_consumed)",
+            "interaction_edges.interact_pressed = false",
         )
-        self.assertLess(
-            manual_input.index("manual_pick_assist.cancel();"),
-            manual_input.index("!manual_pick_assist_cancelled_this_tick"),
+        positions = [normalized_input.find(marker) for marker in required_in_order]
+        self.assertTrue(
+            all(position >= 0 for position in positions),
+            "simultaneous X/F coordinator seam is incomplete",
         )
+        if all(position >= 0 for position in positions):
+            self.assertEqual(
+                positions,
+                sorted(positions),
+                "the coordinator must receive simultaneous X/F before the caller "
+                "consumes either returned edge",
+            )
+        for forbidden in (
+            "manual_pick_assist.cancel(",
+            "manual_pick_assist_cancelled_this_tick",
+            "!manual_pick_assist_cancelled_this_tick",
+        ):
+            self.assertNotIn(forbidden, manual_input)
 
     def test_manual_pick_assist_draws_acceptance_diagnostics_without_pose_writes(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")
-        self.assertIn(
-            "float manual_pick_object_distance_at_begin_m = 0.0F;",
-            controller,
-        )
-        manual_input = self._source_between(
-            controller,
-            "        // Manual pick-assist input begins.",
-            "        // Manual pick-assist input ends.",
-        )
-        self.assertGreaterEqual(
-            manual_input.count("manual_pick_object_distance_at_begin_m = 0.0F;"),
-            2,
-            "cancel and retry must both clear the prior acceptance distance",
-        )
-        self.assertIn("if (manual_pick_assist.begin(start))", manual_input)
-        self.assertIn(
-            "manual_pick_object_distance_at_begin_m =\n"
-            "                            autodemo_planar_distance(",
-            manual_input,
-        )
+        self.assertNotIn("manual_pick_object_distance_at_begin_m", controller)
+        self.assertNotIn("manual_pick_common_entry", controller)
 
         route = self._source_between(
             controller,
@@ -3070,12 +3644,12 @@ class Task12PolicyTests(unittest.TestCase):
             "        // Manual pick-assist route rendering ends.",
         )
         for required in (
-            "manual_pick_assist.active() ||",
-            "manual_pick_final_preview_certified_this_tick",
+            "manual_smart_pickup_controller.diagnostics()",
+            "manual_pick_diagnostics.slot_selection.selected_index",
+            "manual_pick_diagnostics.slot_selection.ordered[",
+            ".root_world.position",
             "DrawLine3D(",
             "bone_positions(0)",
-            "manual_pick_common_entry",
-            "manual_pick_entry_slots.ordered[",
             "interaction::PickAssistState::ReadyToSubmit",
             "? GREEN",
             "DrawSphereWires(",
@@ -3090,11 +3664,11 @@ class Task12PolicyTests(unittest.TestCase):
         )
         for required in (
             '"assist=%s reason=%s slot=%d settle=%u/%u route=%.3fm "',
-            '"object_distance_at_begin=%.3fm"',
             "interaction::pick_assist_state_name(",
             "interaction::pick_assist_reason_name(",
-            "manual_pick_assist_config.required_settle_ticks",
-            "manual_pick_object_distance_at_begin_m",
+            "manual_smart_pickup_controller.diagnostics()",
+            "manual_pick_diagnostics.object_origin_distance_m",
+            "manual_pick_diagnostics.object_bounds_center_distance_m",
             '"error=%.3fm yaw=%.2fdeg speed=%.3fm/s"',
             "diagnostics.yaw_error_radians * 180.0F / PIf",
             '"final=%d fp_equal=%d roots_finite=%d root_equal=%d"',
@@ -3139,6 +3713,9 @@ class Task12PolicyTests(unittest.TestCase):
             "bone_rotations(0) =",
             "interaction_registry.replace_pose(",
             "interaction_registry.reset(",
+            "make_pick_reach_waypoint(",
+            "make_pick_entry_slots(",
+            "choose_pick_entry_slot(",
         ):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, route + diagnostics)
@@ -3166,7 +3743,8 @@ class Task12PolicyTests(unittest.TestCase):
         )
         makefile = Path("Makefile").read_text(encoding="utf-8")
         for include in (
-            '#include "interaction_pick_assist.h"',
+            '#include "interaction_smart_pickup_controller.h"',
+            '#include "interaction_smart_pickup_scene.h"',
             '#include "interaction_pick_approach.h"',
             '#include "locomotion_controller_update.h"',
         ):
@@ -3176,33 +3754,26 @@ class Task12PolicyTests(unittest.TestCase):
             oracle, "void run_manual_pick_assist_oracle("
         )
         for required in (
-            "root_to_object_m > 1.00F",
-            "root_to_object_m <= 1.45F",
-            "registry.resolve_single_target(\n            start_position, 1.45F)",
-            "assist.begin(start)",
-            "diagnostics.slot_route_lengths_m",
-            "assist_config.maximum_assisted_path_m",
+            "interaction::make_smart_pickup_demo_target()",
+            "interaction::SmartPickupController smart_pickup_controller",
+            "interaction::SmartPickupPreStepInput",
+            "smart_pickup_controller.pre_step(",
+            "interaction::SmartPickupPostStepInput",
+            "smart_pickup_controller.post_step(",
             "preview_pick(",
-            "preview.path_feasible && preview.match_ready",
-            "const bool activation_tick = assist_tick == 0U;",
-            "if (!activation_tick &&\n"
-            "            prior_assist_output.override_steering)",
             "desired_velocity_update(",
             "desired_rotation_update(",
             "simulation_positions_update(",
             "simulation_rotations_update(",
             "maximum_tick_displacement_m",
-            "prior_assist_output.needs_preview",
             "locomotion_snapshot_fingerprint(live_flat_snapshot)",
-            "assist.observe(observation)",
             "settled_observation_count == 5U",
             "stationary_constraint_edges == 1U",
             "stationary_output_applied_ticks > 0U",
             "interaction::ControllerInteractionScheduler scheduler",
             "provider_calls_before_certification",
             "resolver_calls_before_certification",
-            "assist.take_submission(next_request_id)",
-            "if (request.has_value())",
+            "post_step_result.pick_request",
             "++next_request_id",
             "certified_provider_snapshot_fingerprint ==\n"
             "                    live_flat_snapshot_fingerprint",
@@ -3214,6 +3785,15 @@ class Task12PolicyTests(unittest.TestCase):
             with self.subTest(required=required):
                 self.assertIn(required, witness)
         for forbidden in (
+            "1.45F",
+            "resolve_single_target(",
+            "make_pick_reach_waypoint(",
+            "make_pick_entry_slots(",
+            "choose_pick_entry_slot(",
+            "ControllerPickAssist",
+            "assist.begin(",
+            "assist.observe(",
+            "assist.take_submission(",
             "observation.displayed_root = {\n        common_entry",
             "observation.displayed_root = frozen_slot.waypoint",
             "const interaction::LocomotionSnapshot settled_snapshot",
@@ -3225,9 +3805,9 @@ class Task12PolicyTests(unittest.TestCase):
             "            flat_database, interaction_database, interaction_features, bridge);",
             oracle,
         )
+        self.assertIn("interaction_smart_pickup_controller.cpp", makefile)
         for source in (
             "interaction_pick_assist.cpp",
-            "interaction_pick_approach.cpp",
             "interaction_arrival.cpp",
             "locomotion_controller_update.cpp",
         ):
@@ -3251,20 +3831,37 @@ class Task12PolicyTests(unittest.TestCase):
 
     def test_readme_documents_manual_pick_assist_contract(self):
         readme = Path("README.md").read_text(encoding="utf-8")
-        normalized_readme = " ".join(readme.split())
+        manual = self._source_between(
+            readme,
+            "For manual play, build the controller and point it at the generated pack:",
+            "The manual demo intentionally supplies no recorded place clips",
+        )
+        normalized_readme = " ".join(manual.split())
         for required in (
-            "bounded 1.45 m root-to-object acquisition query",
+            "MM_INTERACTION_PACK",
+            "25/1",
+            "2,045 clips",
+            "511,250 frames",
+            "baked Smart Pickup target",
+            "post-step live-flat snapshot",
             "assisted route remains at most 1.00 m",
             "ordinary flat-ground locomotion",
-            "both live entry-slot previews",
+            "one frozen authored-slot preview",
             "five consecutive settled 25 Hz ticks",
             "exactly one pickup request",
             "`X` cancels any pre-submission assist",
             "Carry keeps the existing `F` placement controls",
-            "object_distance_at_begin",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, normalized_readme)
+        for forbidden in (
+            "1.45 m",
+            "both live entry-slot previews",
+            "object_distance_at_begin",
+            "MM_INTERACTION_PACK=resources/g1_interaction",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, normalized_readme)
 
     def test_controller_uses_exact_23_pose_bridge_and_flat_toe_indices(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")

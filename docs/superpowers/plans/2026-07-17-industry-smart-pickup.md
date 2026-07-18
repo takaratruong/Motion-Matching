@@ -1410,7 +1410,7 @@ Make, and raylib for the final native visualization only.
   Native/headless callers supply a narrow lambda that delegates directly to
   `InteractionRuntime::preview_pick`; tests supply a counting callback.
 
-- [ ] **Step 1: Write failing source-contract tests for the manual/placement split**
+- [x] **Step 1: Write failing source-contract tests for the manual/placement split**
 
   Update `tests/python/test_playable_interaction_evidence.py` to assert that:
 
@@ -1466,7 +1466,7 @@ Make, and raylib for the final native visualization only.
   calls, zero submissions, and identical observation/scheduler snapshot
   fingerprints. Assisted steering may affect only the next 25 Hz tick.
 
-- [ ] **Step 3: Write failing precedence, mutation, and failure tests**
+- [x] **Step 3: Write failing precedence, mutation, and failure tests**
 
   Cover these exact controller-level cases:
 
