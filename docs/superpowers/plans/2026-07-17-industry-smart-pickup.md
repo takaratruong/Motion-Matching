@@ -1442,7 +1442,7 @@ Make, and raylib for the final native visualization only.
   Expected: the new manual assertions fail because the controller still uses
   the legacy fixed-two pickup path.
 
-- [ ] **Step 2: Write a failing two-phase production-coordinator test**
+- [x] **Step 2: Write a failing two-phase production-coordinator test**
 
   Add `tests/cpp/test_interaction_smart_pickup_controller.cpp` around the new
   production class and the existing adapter seams.
