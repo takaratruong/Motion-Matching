@@ -21,6 +21,8 @@
 #include "interaction_pick_assist.h"
 #include "interaction_pick_approach.h"
 #include "interaction_runtime.h"
+#include "interaction_smart_pickup_controller.h"
+#include "interaction_smart_pickup_scene.h"
 #include "locomotion_controller_update.h"
 #include "locomotion_timing.h"
 #include "stationary_motion_matching.h"
@@ -3624,6 +3626,8 @@ int main(void)
     const bool placement_autodemo_enabled =
         autodemo_configuration.has_value() &&
         autodemo_configuration->mode == AutodemoMode::Placement;
+    const bool legacy_interaction_fixture_mode =
+        pickup_autodemo_enabled || placement_autodemo_enabled;
 
     // Init Window
     
@@ -3764,6 +3768,10 @@ int main(void)
         return 1;
     }
 
+#if !defined(PLATFORM_WEB)
+    try
+    {
+#endif
     // Interaction data is a separate fixed-25 pack. Keep these values alive
     // for the full controller lifetime because InteractionRuntime stores
     // pointers to the loaded database and features.
@@ -3781,10 +3789,18 @@ int main(void)
     bool interaction_pack_loaded = false;
     std::string interaction_pack_diagnostic;
 
-    const char* interaction_pack_environment = std::getenv("MM_INTERACTION_PACK");
-    const std::filesystem::path interaction_pack_path =
+    const char* interaction_pack_environment =
+        std::getenv("MM_INTERACTION_PACK");
+    const bool interaction_pack_explicit =
         interaction_pack_environment != nullptr &&
-            interaction_pack_environment[0] != '\0'
+        interaction_pack_environment[0] != '\0';
+    if (!interaction_pack_explicit && !legacy_interaction_fixture_mode)
+    {
+        throw std::runtime_error(
+            "manual Smart Pickup requires an explicit MM_INTERACTION_PACK");
+    }
+    const std::filesystem::path interaction_pack_path =
+        interaction_pack_explicit
         ? std::filesystem::path(interaction_pack_environment)
         : std::filesystem::path("./resources/g1_interaction");
 
@@ -3799,8 +3815,27 @@ int main(void)
             interaction::validate_controller_interaction_pack(
                 *interaction_database, *interaction_features);
 
+            // Manual Smart Pickup full-pack guard begins.
+            if (!legacy_interaction_fixture_mode)
+            {
+                if (interaction_database->fps_numerator != 25U ||
+                    interaction_database->fps_denominator != 1U ||
+                    interaction_database->clip_count != 2045U ||
+                    interaction_database->frame_count != 511250U ||
+                    interaction_features->frame_count !=
+                        interaction_database->frame_count)
+                {
+                    throw std::runtime_error(
+                        "manual Smart Pickup requires the certified full pack");
+                }
+            }
+            // Manual Smart Pickup full-pack guard ends.
+
             interaction::InteractionTarget demo_target =
-                interaction::make_controller_demo_target(*interaction_database);
+                legacy_interaction_fixture_mode
+                ? interaction::make_controller_demo_target(
+                    *interaction_database)
+                : interaction::make_smart_pickup_demo_target();
             interaction_scene_target_handle =
                 interaction_registry.upsert(std::move(demo_target));
             const interaction::InteractionTarget* registered_target =
@@ -3809,8 +3844,11 @@ int main(void)
             interaction_authored_target = *registered_target;
 
             interaction::PlacementSurface destination_surface =
-                interaction::make_controller_demo_destination_surface(
-                    *interaction_database, interaction_authored_target);
+                legacy_interaction_fixture_mode
+                ? interaction::make_controller_demo_destination_surface(
+                    *interaction_database, interaction_authored_target)
+                : interaction::make_smart_pickup_demo_destination_surface(
+                    interaction_authored_target);
             assert(destination_surface.affordances.size() == 1U);
             interaction_destination_affordance_id =
                 destination_surface.affordances.front().id;
@@ -3833,6 +3871,10 @@ int main(void)
         }
         catch (const interaction::FormatError& error)
         {
+            if (!legacy_interaction_fixture_mode)
+            {
+                throw;
+            }
             interaction_pack_diagnostic = error.what();
             interaction_pack_loaded = false;
             return interaction::InteractionRuntime::disabled(
@@ -3840,7 +3882,7 @@ int main(void)
         }
         catch (const std::exception& error)
         {
-            if (!autodemo_configuration.has_value())
+            if (!legacy_interaction_fixture_mode)
             {
                 throw;
             }
@@ -3851,7 +3893,7 @@ int main(void)
         }
         catch (...)
         {
-            if (!autodemo_configuration.has_value())
+            if (!legacy_interaction_fixture_mode)
             {
                 throw;
             }
@@ -4218,6 +4260,7 @@ int main(void)
 
     const float dt = interaction::kControllerStepSeconds;
     interaction::ControllerInteractionScheduler interaction_scheduler;
+    interaction::SmartPickupController manual_smart_pickup_controller;
     const interaction::PickAssistConfig manual_pick_assist_config{};
     interaction::ControllerPickAssist manual_pick_assist(
         manual_pick_assist_config);
@@ -7876,4 +7919,32 @@ int main(void)
     CloseWindow();
 
     return exit_code;
+#if !defined(PLATFORM_WEB)
+    }
+    catch (const std::exception& error)
+    {
+        if (autodemo_configuration.has_value())
+        {
+            cleanup_autodemo_temporaries(*autodemo_configuration);
+        }
+        std::fprintf(stderr, "controller: %s\n", error.what());
+        UnloadModel(ground_plane_model);
+        UnloadShader(ground_plane_shader);
+        CloseWindow();
+        return 1;
+    }
+    catch (...)
+    {
+        if (autodemo_configuration.has_value())
+        {
+            cleanup_autodemo_temporaries(*autodemo_configuration);
+        }
+        std::fprintf(
+            stderr, "controller: unknown interaction startup failure\n");
+        UnloadModel(ground_plane_model);
+        UnloadShader(ground_plane_shader);
+        CloseWindow();
+        return 1;
+    }
+#endif
 }

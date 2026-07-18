@@ -65,8 +65,11 @@ CONTROLLER_LOCOMOTION_SOURCES := interaction_arrival.cpp \
   interaction_pick_slots.cpp \
   interaction_pick_approach.cpp \
   locomotion_controller_update.cpp
+CONTROLLER_SMART_PICKUP_SOURCES := interaction_smart_pickup_controller.cpp \
+  interaction_smart_pickup_scene.cpp
 SOURCE := controller.cpp $(INTERACTION_SOURCES) \
-  $(CONTROLLER_LOCOMOTION_SOURCES)
+  $(CONTROLLER_LOCOMOTION_SOURCES) \
+  $(CONTROLLER_SMART_PICKUP_SOURCES)
 HEADER = $(wildcard *.h)
 
 .PHONY: all bootstrap-raylib controller
