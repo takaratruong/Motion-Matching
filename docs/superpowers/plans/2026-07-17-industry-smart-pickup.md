@@ -843,7 +843,7 @@ Make, and raylib for the final native visualization only.
   One next representable value above each boundary must not latch. No assertion
   may use object-origin standoff.
 
-- [ ] **Step 4: Write failing settle, preview retry, and one-shot tests**
+- [x] **Step 4: Write failing settle, preview retry, and one-shot tests**
 
   After approach latch, feed five observations at root error `0.15 m`, displayed
   speed `0.10 m/s`, and yaw error `20 degrees`. Assert exactly the fifth stable
@@ -882,7 +882,7 @@ Make, and raylib for the final native visualization only.
 
   and state becomes `Submitted`.
 
-- [ ] **Step 5: Run the rewritten tests and verify red failure**
+- [x] **Step 5: Run the rewritten tests and verify red failure**
 
   Run:
 
@@ -892,7 +892,7 @@ Make, and raylib for the final native visualization only.
 
   Expected: compilation fails on the new states/start/observation interfaces.
 
-- [ ] **Step 6: Implement the minimal frozen-slot state machine**
+- [x] **Step 6: Implement the minimal frozen-slot state machine**
 
   Remove `reach_entry_distance_m`, `reach_entry_tolerance_m`,
   `maximum_preview_ticks`, `entry_point_`, two-slot preview arrays, and every
@@ -919,7 +919,7 @@ Make, and raylib for the final native visualization only.
   errors flags so a new enum value cannot silently fall through to a different
   failure reason.
 
-- [ ] **Step 7: Implement stationary PoorMatch retry and final diagnostics**
+- [x] **Step 7: Implement stationary PoorMatch retry and final diagnostics**
 
   Capture all preview conjuncts before branching. In `FinalPreview`, certify
   only exact fingerprint, prospective-root identity, `path_feasible`, and
@@ -928,7 +928,7 @@ Make, and raylib for the final native visualization only.
   observed so deadline failure reports `PoorMatch`; other elapsed arrival
   failures report `ArrivalDeadline`.
 
-- [ ] **Step 8: Run focused and safe regressions**
+- [x] **Step 8: Run focused and safe regressions**
 
   Run:
 
