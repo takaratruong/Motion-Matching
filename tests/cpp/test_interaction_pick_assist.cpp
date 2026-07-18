@@ -1359,6 +1359,181 @@ void test_frozen_slot_settling_keeps_stationary_braking() {
         "valid frozen Settling next tick changed frozen provenance");
 }
 
+void test_frozen_slot_settling_requests_exact_frozen_preview_root() {
+    const interaction::PickAssistConfig config{};
+    FrozenSlotScenario scenario;
+    interaction::ControllerPickAssist assist(config);
+    const interaction::PickAssistDiagnostics latched =
+        latch_frozen_slot_settling(assist, scenario, config);
+    require(
+        latched.slot_selection.selected_index.has_value(),
+        "frozen settle-preview fixture lost its selected index");
+    const interaction::MappedPickSlot frozen_slot =
+        latched.slot_selection.ordered[
+            *latched.slot_selection.selected_index];
+    const vec3 frozen_forward = quat_mul_vec3(
+        frozen_slot.root_world.rotation,
+        vec3(0.0F, 0.0F, 1.0F));
+    const interaction::PickEntryRoot expected_preview_root{
+        frozen_slot.root_world.position.x,
+        frozen_slot.root_world.position.z,
+        std::atan2(frozen_forward.x, frozen_forward.z),
+    };
+    const float infinity = std::numeric_limits<float>::infinity();
+
+    const auto configure_stable_boundary_observation = [&] {
+        scenario.observation.displayed_root = frozen_slot.root_world;
+        scenario.observation.displayed_root.position.x =
+            frozen_slot.root_world.position.x -
+            config.maximum_settle_position_error_m;
+        scenario.observation.displayed_root.rotation = quat_mul(
+            quat_from_angle_axis(
+                config.arrival.maximum_yaw_error_radians,
+                vec3(0.0F, 1.0F, 0.0F)),
+            frozen_slot.root_world.rotation);
+        scenario.observation.displayed_planar_speed_mps =
+            config.maximum_settle_displayed_speed_mps;
+        scenario.observation.simulation_velocity =
+            vec3(3.0F, 0.0F, 4.0F);
+    };
+    const auto require_stationary_output = [](
+        const interaction::PickAssistOutput& output,
+        bool needs_preview,
+        const char* message) {
+        require(
+            output.override_steering && output.force_strafe &&
+                output.stationary_constraint &&
+                is_zero(output.left_stick) &&
+                is_zero(output.right_stick) &&
+                output.needs_preview == needs_preview &&
+                !output.submit_interact,
+            message);
+    };
+
+    configure_stable_boundary_observation();
+    const float derived_root_error_m = static_cast<float>(std::hypot(
+        static_cast<double>(
+            scenario.observation.displayed_root.position.x) -
+            static_cast<double>(frozen_slot.root_world.position.x),
+        static_cast<double>(
+            scenario.observation.displayed_root.position.z) -
+            static_cast<double>(frozen_slot.root_world.position.z)));
+    const auto planar_yaw = [](quat rotation) {
+        const vec3 forward = quat_mul_vec3(
+            rotation, vec3(0.0F, 0.0F, 1.0F));
+        return std::atan2(forward.x, forward.z);
+    };
+    const float yaw_difference =
+        planar_yaw(scenario.observation.displayed_root.rotation) -
+        planar_yaw(frozen_slot.root_world.rotation);
+    const float derived_yaw_error_radians = std::abs(std::atan2(
+        std::sin(yaw_difference), std::cos(yaw_difference)));
+    require(
+        same_float_bits_exact(
+            derived_root_error_m,
+            config.maximum_settle_position_error_m) &&
+            same_float_bits_exact(
+                scenario.observation.displayed_planar_speed_mps,
+                config.maximum_settle_displayed_speed_mps) &&
+            same_float_bits_exact(
+                derived_yaw_error_radians,
+                config.arrival.maximum_yaw_error_radians),
+        "frozen settle-preview fixture was not exactly on all settle bounds");
+
+    for (uint32_t bound = 0U; bound < 3U; ++bound) {
+        configure_stable_boundary_observation();
+        const interaction::PickAssistOutput stable_output =
+            assist.observe(scenario.observation);
+        require(
+            assist.diagnostics().state ==
+                    interaction::PickAssistState::Settling &&
+                assist.diagnostics().reason ==
+                    interaction::PickAssistReason::None &&
+                assist.diagnostics().settle_ticks == 1U,
+            "stable settle boundary did not begin a consecutive count");
+        require_stationary_output(
+            stable_output,
+            false,
+            "stable settle boundary did not keep no-preview braking");
+
+        if (bound == 0U) {
+            const float root_error_above = std::nextafter(
+                config.maximum_settle_position_error_m, infinity);
+            scenario.observation.displayed_root.position.x =
+                frozen_slot.root_world.position.x - root_error_above;
+        } else if (bound == 1U) {
+            scenario.observation.displayed_planar_speed_mps =
+                std::nextafter(
+                    config.maximum_settle_displayed_speed_mps,
+                    infinity);
+        } else {
+            const float yaw_error_above = std::nextafter(
+                config.arrival.maximum_yaw_error_radians, infinity);
+            scenario.observation.displayed_root.rotation = quat_mul(
+                quat_from_angle_axis(
+                    yaw_error_above, vec3(0.0F, 1.0F, 0.0F)),
+                frozen_slot.root_world.rotation);
+        }
+        const interaction::PickAssistOutput unstable_output =
+            assist.observe(scenario.observation);
+        require(
+            assist.diagnostics().state ==
+                    interaction::PickAssistState::Settling &&
+                assist.diagnostics().reason ==
+                    interaction::PickAssistReason::None &&
+                assist.diagnostics().settle_ticks == 0U,
+            "first representable settle-bound overshoot did not reset the consecutive count");
+        require_stationary_output(
+            unstable_output,
+            false,
+            "unstable settle boundary did not keep no-preview braking");
+    }
+
+    configure_stable_boundary_observation();
+    interaction::PickAssistOutput output{};
+    for (uint32_t tick = 1U; tick <= 5U; ++tick) {
+        output = assist.observe(scenario.observation);
+        require(
+            assist.diagnostics().settle_ticks == tick,
+            "stable frozen settle ticks were not consecutive");
+        if (tick < 5U) {
+            require(
+                assist.diagnostics().state ==
+                        interaction::PickAssistState::Settling &&
+                    assist.diagnostics().reason ==
+                        interaction::PickAssistReason::None,
+                "frozen settling completed before five stable ticks");
+            require_stationary_output(
+                output,
+                false,
+                "pre-final frozen settle tick requested a preview");
+        }
+    }
+    require(
+        assist.diagnostics().state ==
+                interaction::PickAssistState::FinalPreview &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::None &&
+            assist.diagnostics().settle_ticks == 5U,
+        "fifth stable frozen settle tick did not enter FinalPreview");
+    require_stationary_output(
+        output,
+        true,
+        "fifth stable frozen settle tick did not request stationary preview");
+    require(
+        output.preview_root.has_value() &&
+            same_float_bits_exact(
+                output.preview_root->world_x,
+                expected_preview_root.world_x) &&
+            same_float_bits_exact(
+                output.preview_root->world_z,
+                expected_preview_root.world_z) &&
+            same_float_bits_exact(
+                output.preview_root->world_yaw_radians,
+                expected_preview_root.world_yaw_radians),
+        "frozen FinalPreview request did not publish the exact frozen root");
+}
+
 void test_slot_approach_rejects_adjacent_arrival_overshoots() {
     const interaction::PickAssistConfig config{};
     const float infinity = std::numeric_limits<float>::infinity();
@@ -3329,6 +3504,7 @@ int main() {
         test_frozen_slot_settling_revalidates_selected_slot();
         test_frozen_slot_settling_enforces_consecutive_travel();
         test_frozen_slot_settling_keeps_stationary_braking();
+        test_frozen_slot_settling_requests_exact_frozen_preview_root();
         test_slot_approach_rejects_adjacent_arrival_overshoots();
         test_slot_approach_accumulates_inclusive_travel_and_rejects_overshoot();
         test_slot_approach_revalidates_frozen_route_against_table();
