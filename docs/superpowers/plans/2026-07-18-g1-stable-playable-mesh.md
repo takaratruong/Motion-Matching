@@ -644,7 +644,7 @@ git status --short --branch
 
 Expected: the plan checkpoint is pushed and the worktree is clean.
 
-- [ ] **Step 5: Launch exactly one user visualizer on mixed terrain**
+- [x] **Step 5: Launch exactly one user visualizer on mixed terrain**
 
 ```bash
 nohup env \
