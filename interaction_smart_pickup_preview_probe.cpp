@@ -7,23 +7,30 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <locale>
 #include <map>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -38,6 +45,7 @@ constexpr size_t kExpectedClipCount = 2045U;
 constexpr int64_t kExpectedFrameCount = 511250;
 constexpr size_t kExpectedRetainedCandidateCount = 19U;
 constexpr size_t kExpectedStationarySnapshotCount = 186U;
+constexpr size_t kMaximumPreviewWorkers = 16U;
 constexpr int64_t kRightHand = 1;
 constexpr const char* kExpectedDatasetId =
     "nvidia/PhysicalAI-Robotics-Locomanipulation-GRAIL";
@@ -1773,6 +1781,935 @@ std::vector<FrozenStationarySnapshot> make_frozen_stationary_snapshots(
     return frozen;
 }
 
+interaction::PickEntryRoot map_candidate_root_to_world(
+    const RetainedCandidate& candidate,
+    const interaction::InteractionTarget& target) {
+    const vec3 projected = quat_mul_vec3(
+        target.object_world.rotation, vec3(0.0F, 0.0F, 1.0F));
+    const double planar_length_squared =
+        static_cast<double>(projected.x) * projected.x +
+        static_cast<double>(projected.z) * projected.z;
+    require(
+        std::isfinite(planar_length_squared) &&
+            planar_length_squared > 0.0,
+        "preview target has no finite planar object facing");
+    const double inverse_length = 1.0 / std::sqrt(planar_length_squared);
+    const vec3 object_forward(
+        static_cast<float>(projected.x * inverse_length),
+        0.0F,
+        static_cast<float>(projected.z * inverse_length));
+    const vec3 object_right(
+        object_forward.z, 0.0F, -object_forward.x);
+    const float world_x = target.object_world.position.x +
+        candidate.root_x_object_m * object_right.x +
+        candidate.root_z_object_m * object_forward.x;
+    const float world_z = target.object_world.position.z +
+        candidate.root_x_object_m * object_right.z +
+        candidate.root_z_object_m * object_forward.z;
+    const float object_yaw = std::atan2(
+        object_forward.x, object_forward.z);
+    const float unwrapped_yaw =
+        object_yaw + candidate.root_yaw_object_radians;
+    const float world_yaw = std::atan2(
+        std::sin(unwrapped_yaw), std::cos(unwrapped_yaw));
+    require(
+        std::isfinite(world_x) && std::isfinite(world_z) &&
+            std::isfinite(world_yaw),
+        "candidate object-planar root does not map to finite world geometry");
+    return {world_x, world_z, world_yaw};
+}
+
+struct PreviewCaseResult {
+    interaction::PickEntryPreview preview{};
+};
+
+struct ReadyCostEvidence {
+    int stationary_flat_frame = -1;
+    float total_cost = 0.0F;
+};
+
+struct MatcherProvenance {
+    size_t clip_ordinal = 0U;
+    int32_t entry_global_frame = -1;
+    int32_t contact_global_frame = -1;
+    int32_t entry_local_frame = -1;
+    int32_t contact_local_frame = -1;
+    std::string sequence_id;
+};
+
+struct CandidatePreviewSummary {
+    size_t candidate_ordinal = 0U;
+    interaction::PickEntryRoot prospective_root{};
+    bool path_feasible = false;
+    bool match_ready = false;
+    interaction::Reason path_reason = interaction::Reason::None;
+    interaction::Reason match_reason = interaction::Reason::None;
+    int32_t feasible_entry_frame = -1;
+    int32_t preview_contact_frame = -1;
+    std::optional<MatcherProvenance> matcher_provenance{};
+    std::vector<ReadyCostEvidence> runtime_ready_cost_evidence;
+    std::optional<int> selected_stationary_flat_frame{};
+    uint64_t snapshot_fingerprint = 0U;
+    std::optional<float> total_cost{};
+    size_t preview_count = 0U;
+};
+
+struct PreviewEvaluation {
+    std::vector<CandidatePreviewSummary> candidates;
+    size_t case_count = 0U;
+    size_t ready_candidate_count = 0U;
+    size_t worker_count = 0U;
+};
+
+bool same_pick_entry_root(
+    interaction::PickEntryRoot left,
+    interaction::PickEntryRoot right) {
+    return left.world_x == right.world_x &&
+        left.world_z == right.world_z &&
+        left.world_yaw_radians == right.world_yaw_radians;
+}
+
+size_t containing_manifest_clip(
+    const Manifest& manifest,
+    int32_t entry_global,
+    int32_t contact_global,
+    const std::string& label) {
+    size_t found_ordinal = manifest.clips.size();
+    size_t match_count = 0U;
+    for (size_t ordinal = 0U; ordinal < manifest.clips.size(); ++ordinal) {
+        const ManifestClip& clip = manifest.clips[ordinal];
+        if (entry_global >= clip.range_start &&
+            entry_global < contact_global &&
+            contact_global < clip.range_stop) {
+            found_ordinal = ordinal;
+            ++match_count;
+        }
+    }
+    require(
+        match_count == 1U,
+        label + " global entry/contact do not join exactly one manifest clip");
+    return found_ordinal;
+}
+
+MatcherProvenance matcher_provenance_for(
+    const interaction::MatchCandidate& candidate,
+    const Manifest& manifest,
+    const std::string& label) {
+    require(
+        candidate.clip >= 0 &&
+            static_cast<size_t>(candidate.clip) < manifest.clips.size(),
+        label + " selected matcher clip is outside the manifest");
+    const size_t clip_ordinal = static_cast<size_t>(candidate.clip);
+    const size_t joined_ordinal = containing_manifest_clip(
+        manifest,
+        candidate.entry_frame,
+        candidate.contact_frame,
+        label);
+    require(
+        joined_ordinal == clip_ordinal,
+        label + " selected matcher clip ordinal differs from global frames");
+    const ManifestClip& clip = manifest.clips[clip_ordinal];
+    MatcherProvenance provenance;
+    provenance.clip_ordinal = clip_ordinal;
+    provenance.entry_global_frame = candidate.entry_frame;
+    provenance.contact_global_frame = candidate.contact_frame;
+    provenance.entry_local_frame = static_cast<int32_t>(
+        candidate.entry_frame - clip.range_start);
+    provenance.contact_local_frame = static_cast<int32_t>(
+        candidate.contact_frame - clip.range_start);
+    provenance.sequence_id = clip.sequence_id;
+    require(
+        provenance.entry_local_frame >= 0 &&
+            provenance.entry_local_frame < provenance.contact_local_frame &&
+            provenance.contact_local_frame <
+                clip.range_stop - clip.range_start,
+        label + " selected matcher local event frames are invalid");
+    return provenance;
+}
+
+void validate_preview_case(
+    const interaction::PickEntryPreview& preview,
+    interaction::PickEntryRoot expected_root,
+    const Manifest& manifest,
+    const std::string& label) {
+    require(
+        same_pick_entry_root(preview.prospective_root, expected_root),
+        label + " runtime did not preserve the prospective root");
+    require(
+        (preview.path_reason == interaction::Reason::None) ==
+            preview.path_feasible,
+        label + " path reason/feasibility invariant failed");
+    require(
+        (preview.match_reason == interaction::Reason::None) ==
+            preview.match_ready,
+        label + " match reason/readiness invariant failed");
+    require(
+        !preview.match_ready || preview.path_feasible,
+        label + " match-ready preview is not path-feasible");
+    if (preview.path_feasible) {
+        static_cast<void>(containing_manifest_clip(
+            manifest,
+            preview.feasible_entry_frame,
+            preview.contact_frame,
+            label + " path evidence"));
+    } else {
+        require(
+            preview.feasible_entry_frame == -1 &&
+                preview.contact_frame == -1,
+            label + " infeasible preview carries event frames");
+    }
+    if (preview.match_ready) {
+        require(
+            std::isfinite(preview.total_cost) && preview.total_cost >= 0.0F &&
+                preview.match_candidate.total_cost == preview.total_cost,
+            label + " ready preview has invalid selected total cost");
+        static_cast<void>(matcher_provenance_for(
+            preview.match_candidate, manifest, label + " matcher"));
+    }
+}
+
+CandidatePreviewSummary reduce_candidate_previews(
+    size_t candidate_ordinal,
+    interaction::PickEntryRoot prospective_root,
+    const std::vector<PreviewCaseResult>& case_results,
+    const std::vector<FrozenStationarySnapshot>& stationary_snapshots,
+    const Manifest& manifest) {
+    CandidatePreviewSummary summary;
+    summary.candidate_ordinal = candidate_ordinal;
+    summary.prospective_root = prospective_root;
+    summary.preview_count = stationary_snapshots.size();
+    const size_t first_case =
+        candidate_ordinal * stationary_snapshots.size();
+    std::optional<size_t> best_ready_index;
+    std::optional<size_t> first_path_feasible_index;
+    for (size_t stationary_index = 0U;
+         stationary_index < stationary_snapshots.size();
+         ++stationary_index) {
+        const interaction::PickEntryPreview& preview =
+            case_results[first_case + stationary_index].preview;
+        const std::string label =
+            "candidate " + std::to_string(candidate_ordinal) +
+            " stationary frame " +
+            std::to_string(stationary_snapshots[stationary_index].frame);
+        validate_preview_case(preview, prospective_root, manifest, label);
+        if (preview.path_feasible && !first_path_feasible_index.has_value()) {
+            first_path_feasible_index = stationary_index;
+        }
+        if (!preview.match_ready) continue;
+        summary.runtime_ready_cost_evidence.push_back(
+            {stationary_snapshots[stationary_index].frame,
+             preview.total_cost});
+        if (!best_ready_index.has_value()) {
+            best_ready_index = stationary_index;
+            continue;
+        }
+        const interaction::PickEntryPreview& current_best =
+            case_results[first_case + *best_ready_index].preview;
+        const int frame = stationary_snapshots[stationary_index].frame;
+        const int best_frame =
+            stationary_snapshots[*best_ready_index].frame;
+        if (preview.total_cost < current_best.total_cost ||
+            (preview.total_cost == current_best.total_cost &&
+             frame < best_frame)) {
+            best_ready_index = stationary_index;
+        }
+    }
+
+    const size_t representative_index = best_ready_index.has_value()
+        ? *best_ready_index
+        : first_path_feasible_index.value_or(0U);
+    const interaction::PickEntryPreview& representative =
+        case_results[first_case + representative_index].preview;
+    summary.snapshot_fingerprint =
+        stationary_snapshots[representative_index].fingerprint;
+    summary.path_feasible = representative.path_feasible;
+    summary.match_ready = representative.match_ready;
+    summary.path_reason = representative.path_reason;
+    summary.match_reason = representative.match_reason;
+    if (best_ready_index.has_value()) {
+        summary.path_feasible = true;
+        summary.match_ready = true;
+        summary.path_reason = interaction::Reason::None;
+        summary.match_reason = interaction::Reason::None;
+        summary.feasible_entry_frame =
+            representative.match_candidate.entry_frame;
+        summary.preview_contact_frame =
+            representative.match_candidate.contact_frame;
+        summary.matcher_provenance = matcher_provenance_for(
+            representative.match_candidate,
+            manifest,
+            "candidate " + std::to_string(candidate_ordinal));
+        summary.selected_stationary_flat_frame =
+            stationary_snapshots[representative_index].frame;
+        summary.total_cost = representative.total_cost;
+        require(
+            summary.feasible_entry_frame ==
+                    summary.matcher_provenance->entry_global_frame &&
+                summary.preview_contact_frame ==
+                    summary.matcher_provenance->contact_global_frame,
+            "ready candidate frames differ from selected matcher provenance");
+    } else {
+        summary.feasible_entry_frame = representative.feasible_entry_frame;
+        summary.preview_contact_frame = representative.contact_frame;
+        require(
+            summary.runtime_ready_cost_evidence.empty() &&
+                !summary.matcher_provenance.has_value() &&
+                !summary.selected_stationary_flat_frame.has_value() &&
+                !summary.total_cost.has_value(),
+            "non-ready candidate retained ready-only evidence");
+    }
+    require(
+        summary.snapshot_fingerprint != 0U &&
+            summary.preview_count == kExpectedStationarySnapshotCount,
+        "candidate preview summary lost stationary evidence authority");
+    return summary;
+}
+
+PreviewEvaluation evaluate_unrestricted_previews(
+    const interaction::Database& interaction_database,
+    const interaction::Features& interaction_features,
+    interaction::TargetRegistry& immutable_registry,
+    interaction::TargetHandle target_handle,
+    uint32_t affordance_id,
+    const std::vector<RetainedCandidate>& candidates,
+    const std::vector<FrozenStationarySnapshot>& stationary_snapshots,
+    const Manifest& manifest) {
+    const interaction::InteractionTarget* target =
+        immutable_registry.find(target_handle);
+    require(
+        target != nullptr && target->affordances.size() == 1U &&
+            target->affordances.front().id == affordance_id,
+        "unrestricted preview target lookup failed");
+    std::vector<interaction::PickEntryRoot> prospective_roots;
+    prospective_roots.reserve(candidates.size());
+    for (const RetainedCandidate& candidate : candidates) {
+        prospective_roots.push_back(
+            map_candidate_root_to_world(candidate, *target));
+    }
+
+    const size_t case_count =
+        candidates.size() * stationary_snapshots.size();
+    require(case_count > 0U, "unrestricted preview case matrix is empty");
+    std::vector<PreviewCaseResult> case_results(case_count);
+    std::vector<std::exception_ptr> case_errors(case_count);
+    const unsigned int hardware = std::thread::hardware_concurrency();
+    const size_t available_workers =
+        hardware == 0U ? 4U : static_cast<size_t>(hardware);
+    const size_t worker_count = std::min(
+        {kMaximumPreviewWorkers, available_workers, case_count});
+    require(worker_count > 0U, "unrestricted preview has no workers");
+    std::atomic<size_t> next_case{0U};
+    std::vector<std::exception_ptr> worker_errors(worker_count);
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    try {
+        for (size_t worker_index = 0U;
+             worker_index < worker_count;
+             ++worker_index) {
+            workers.emplace_back([&, worker_index]() {
+                try {
+                    interaction::InteractionRuntime runtime(
+                        interaction_database,
+                        interaction_features,
+                        immutable_registry,
+                        interaction::RuntimeConfig{});
+                    for (;;) {
+                        const size_t case_index = next_case.fetch_add(
+                            1U, std::memory_order_relaxed);
+                        if (case_index >= case_count) return;
+                        const size_t candidate_index =
+                            case_index / stationary_snapshots.size();
+                        const size_t stationary_index =
+                            case_index % stationary_snapshots.size();
+                        try {
+                            case_results[case_index].preview =
+                                runtime.preview_pick(
+                                    stationary_snapshots[stationary_index].snapshot,
+                                    prospective_roots[candidate_index],
+                                    target_handle,
+                                    affordance_id);
+                        } catch (...) {
+                            case_errors[case_index] =
+                                std::current_exception();
+                        }
+                    }
+                } catch (...) {
+                    worker_errors[worker_index] = std::current_exception();
+                }
+            });
+        }
+    } catch (...) {
+        for (std::thread& worker : workers) {
+            if (worker.joinable()) worker.join();
+        }
+        throw;
+    }
+    for (std::thread& worker : workers) worker.join();
+    for (size_t worker_index = 0U;
+         worker_index < worker_errors.size();
+         ++worker_index) {
+        if (!worker_errors[worker_index]) continue;
+        try {
+            std::rethrow_exception(worker_errors[worker_index]);
+        } catch (const std::exception& error) {
+            fail(
+                "preview worker " + std::to_string(worker_index) +
+                " failed: " + error.what());
+        } catch (...) {
+            fail(
+                "preview worker " + std::to_string(worker_index) +
+                " failed with a non-standard exception");
+        }
+    }
+    for (size_t case_index = 0U;
+         case_index < case_errors.size();
+         ++case_index) {
+        if (!case_errors[case_index]) continue;
+        try {
+            std::rethrow_exception(case_errors[case_index]);
+        } catch (const std::exception& error) {
+            fail(
+                "preview case " + std::to_string(case_index) +
+                " failed: " + error.what());
+        } catch (...) {
+            fail(
+                "preview case " + std::to_string(case_index) +
+                " failed with a non-standard exception");
+        }
+    }
+
+    PreviewEvaluation evaluation;
+    evaluation.case_count = case_count;
+    evaluation.worker_count = worker_count;
+    evaluation.candidates.reserve(candidates.size());
+    for (size_t candidate_index = 0U;
+         candidate_index < candidates.size();
+         ++candidate_index) {
+        CandidatePreviewSummary summary = reduce_candidate_previews(
+            candidate_index,
+            prospective_roots[candidate_index],
+            case_results,
+            stationary_snapshots,
+            manifest);
+        if (summary.path_feasible && summary.match_ready) {
+            ++evaluation.ready_candidate_count;
+        }
+        evaluation.candidates.push_back(std::move(summary));
+    }
+    return evaluation;
+}
+
+const char* reason_name(interaction::Reason reason) {
+    using interaction::Reason;
+    switch (reason) {
+    case Reason::None: return "None";
+    case Reason::PackUnavailable: return "PackUnavailable";
+    case Reason::TargetUnavailable: return "TargetUnavailable";
+    case Reason::TargetChanged: return "TargetChanged";
+    case Reason::OutOfRange: return "OutOfRange";
+    case Reason::NoCandidate: return "NoCandidate";
+    case Reason::PoorMatch: return "PoorMatch";
+    case Reason::BlockedPath: return "BlockedPath";
+    case Reason::CorrectionLimit: return "CorrectionLimit";
+    case Reason::Cancelled: return "Cancelled";
+    case Reason::ContactPosition: return "ContactPosition";
+    case Reason::ContactOrientation: return "ContactOrientation";
+    case Reason::JointLimit: return "JointLimit";
+    case Reason::LostContact: return "LostContact";
+    case Reason::ClipEnded: return "ClipEnded";
+    case Reason::Reset: return "Reset";
+    case Reason::SurfaceUnavailable: return "SurfaceUnavailable";
+    case Reason::SurfaceChanged: return "SurfaceChanged";
+    case Reason::PlacementOutOfBounds: return "PlacementOutOfBounds";
+    case Reason::ReleasePosition: return "ReleasePosition";
+    case Reason::ReleaseOrientation: return "ReleaseOrientation";
+    }
+    fail("runtime preview produced an unknown reason");
+}
+
+void append_json_string(std::string& output, std::string_view value) {
+    static constexpr char hexadecimal[] = "0123456789abcdef";
+    output.push_back('"');
+    for (unsigned char character : value) {
+        switch (character) {
+        case '"': output += "\\\""; break;
+        case '\\': output += "\\\\"; break;
+        case '\b': output += "\\b"; break;
+        case '\f': output += "\\f"; break;
+        case '\n': output += "\\n"; break;
+        case '\r': output += "\\r"; break;
+        case '\t': output += "\\t"; break;
+        default:
+            if (character < 0x20U) {
+                output += "\\u00";
+                output.push_back(hexadecimal[(character >> 4U) & 0x0fU]);
+                output.push_back(hexadecimal[character & 0x0fU]);
+            } else {
+                require(
+                    character < 0x80U,
+                    "canonical evidence strings must be ASCII");
+                output.push_back(static_cast<char>(character));
+            }
+        }
+    }
+    output.push_back('"');
+}
+
+class CanonicalJsonObject {
+public:
+    explicit CanonicalJsonObject(std::string& output) : output_(output) {
+        output_.push_back('{');
+    }
+
+    void key(std::string_view value) {
+        require(!finished_, "canonical JSON object is already closed");
+        const std::string current(value);
+        require(
+            previous_key_.empty() || previous_key_ < current,
+            "canonical JSON object keys are not strictly alphabetical");
+        if (!first_) output_.push_back(',');
+        append_json_string(output_, value);
+        output_.push_back(':');
+        previous_key_ = current;
+        first_ = false;
+    }
+
+    void finish() {
+        require(!finished_, "canonical JSON object was closed twice");
+        output_.push_back('}');
+        finished_ = true;
+    }
+
+private:
+    std::string& output_;
+    std::string previous_key_;
+    bool first_ = true;
+    bool finished_ = false;
+};
+
+std::string significant_number(double value, int precision) {
+    require(std::isfinite(value), "JSON evidence number must be finite");
+    if (value == 0.0) return "0.0";
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << std::setprecision(precision) << std::defaultfloat << value;
+    const std::string result = output.str();
+    require(!result.empty(), "could not format JSON evidence number");
+    return result;
+}
+
+std::string float32_hex(float value) {
+    require(std::isfinite(value), "float32 evidence must be finite");
+    uint32_t bits = 0U;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << "0x" << std::hex << std::setfill('0')
+           << std::setw(8) << bits;
+    return output.str();
+}
+
+void append_matcher_provenance(
+    std::string& output,
+    const MatcherProvenance& provenance) {
+    CanonicalJsonObject object(output);
+    object.key("clip_ordinal");
+    output += std::to_string(provenance.clip_ordinal);
+    object.key("contact_global_frame");
+    output += std::to_string(provenance.contact_global_frame);
+    object.key("contact_local_frame");
+    output += std::to_string(provenance.contact_local_frame);
+    object.key("entry_global_frame");
+    output += std::to_string(provenance.entry_global_frame);
+    object.key("entry_local_frame");
+    output += std::to_string(provenance.entry_local_frame);
+    object.key("sequence_id");
+    append_json_string(output, provenance.sequence_id);
+    object.finish();
+}
+
+void append_ready_cost_evidence(
+    std::string& output,
+    const std::vector<ReadyCostEvidence>& evidence) {
+    output.push_back('[');
+    int previous_frame = -1;
+    for (size_t index = 0U; index < evidence.size(); ++index) {
+        if (index != 0U) output.push_back(',');
+        require(
+            evidence[index].stationary_flat_frame > previous_frame,
+            "ready cost evidence is not in stationary-frame order");
+        previous_frame = evidence[index].stationary_flat_frame;
+        CanonicalJsonObject object(output);
+        object.key("stationary_flat_frame");
+        output += std::to_string(evidence[index].stationary_flat_frame);
+        object.key("total_cost");
+        output += significant_number(
+            evidence[index].total_cost,
+            std::numeric_limits<float>::max_digits10);
+        object.finish();
+    }
+    output.push_back(']');
+}
+
+std::string serialize_candidate_preview(
+    const RetainedCandidate& source,
+    const CandidatePreviewSummary& summary) {
+    require(
+        summary.candidate_ordinal < kExpectedRetainedCandidateCount &&
+            summary.preview_count == kExpectedStationarySnapshotCount,
+        "candidate summary identity/count differs before serialization");
+    std::string output;
+    CanonicalJsonObject object(output);
+    object.key("candidate_ordinal");
+    output += std::to_string(summary.candidate_ordinal);
+    object.key("contact_local_frame");
+    output += std::to_string(source.contact_local_frame);
+    object.key("entry_local_frame");
+    output += std::to_string(source.entry_local_frame);
+    object.key("feasible_entry_frame");
+    output += std::to_string(summary.feasible_entry_frame);
+    object.key("match_ready");
+    output += summary.match_ready ? "true" : "false";
+    object.key("match_reason");
+    append_json_string(output, reason_name(summary.match_reason));
+    object.key("matcher_provenance");
+    if (summary.matcher_provenance.has_value()) {
+        append_matcher_provenance(output, *summary.matcher_provenance);
+    } else {
+        output += "null";
+    }
+    object.key("path_feasible");
+    output += summary.path_feasible ? "true" : "false";
+    object.key("path_reason");
+    append_json_string(output, reason_name(summary.path_reason));
+    object.key("preview_authority");
+    {
+        CanonicalJsonObject authority(output);
+        authority.key("candidate_subset_authority");
+        output += "false";
+        authority.key("mode");
+        append_json_string(output, "global_unrestricted");
+        authority.key("runtime_clip_allowlist_applied");
+        output += "false";
+        authority.finish();
+    }
+    object.key("preview_contact_frame");
+    output += std::to_string(summary.preview_contact_frame);
+    object.key("preview_count");
+    output += std::to_string(summary.preview_count);
+    object.key("prospective_root_x_object_f32_hex");
+    append_json_string(output, float32_hex(source.root_x_object_m));
+    object.key("prospective_root_x_object_m");
+    output += significant_number(
+        source.root_x_object_report_m, 9);
+    object.key("prospective_root_yaw_object_f32_hex");
+    append_json_string(
+        output, float32_hex(source.root_yaw_object_radians));
+    object.key("prospective_root_yaw_object_radians");
+    output += significant_number(
+        source.root_yaw_object_report_radians, 9);
+    object.key("prospective_root_z_object_f32_hex");
+    append_json_string(output, float32_hex(source.root_z_object_m));
+    object.key("prospective_root_z_object_m");
+    output += significant_number(
+        source.root_z_object_report_m, 9);
+    object.key("record_type");
+    append_json_string(output, "candidate_preview");
+    object.key("runtime_ready_cost_evidence");
+    append_ready_cost_evidence(
+        output, summary.runtime_ready_cost_evidence);
+    object.key("selected_stationary_flat_frame");
+    if (summary.selected_stationary_flat_frame.has_value()) {
+        output += std::to_string(*summary.selected_stationary_flat_frame);
+    } else {
+        output += "null";
+    }
+    object.key("sequence_id");
+    append_json_string(output, source.sequence_id);
+    object.key("snapshot_fingerprint");
+    output += std::to_string(summary.snapshot_fingerprint);
+    object.key("source_clip_ordinal");
+    output += std::to_string(source.source_clip_ordinal);
+    object.key("total_cost");
+    if (summary.total_cost.has_value()) {
+        output += significant_number(
+            *summary.total_cost,
+            std::numeric_limits<float>::max_digits10);
+    } else {
+        output += "null";
+    }
+    object.finish();
+    return output;
+}
+
+void append_target_scalar(
+    CanonicalJsonObject& scalars,
+    std::string& output,
+    std::string_view name,
+    float value) {
+    scalars.key(name);
+    append_json_string(output, float32_hex(value));
+}
+
+void append_target_record(
+    std::string& output,
+    const ReportTarget& source,
+    const interaction::InteractionTarget& target) {
+    require(
+        target.affordances.size() == 1U,
+        "target scalar serialization requires one affordance");
+    const interaction::GraspAffordance& affordance =
+        target.affordances.front();
+    CanonicalJsonObject object(output);
+    object.key("contact_local_frame");
+    output += std::to_string(source.contact_local_frame);
+    object.key("entry_local_frame");
+    output += std::to_string(source.entry_local_frame);
+    object.key("scalars_f32_hex");
+    {
+        CanonicalJsonObject scalars(output);
+        append_target_scalar(
+            scalars, output, "approach_direction_object_x",
+            affordance.approach_direction_object.x);
+        append_target_scalar(
+            scalars, output, "approach_direction_object_y",
+            affordance.approach_direction_object.y);
+        append_target_scalar(
+            scalars, output, "approach_direction_object_z",
+            affordance.approach_direction_object.z);
+        append_target_scalar(
+            scalars, output, "clearance_radius_m",
+            affordance.clearance_radius);
+        append_target_scalar(
+            scalars, output, "grasp_position_object_x",
+            affordance.hand_in_object.position.x);
+        append_target_scalar(
+            scalars, output, "grasp_position_object_y",
+            affordance.hand_in_object.position.y);
+        append_target_scalar(
+            scalars, output, "grasp_position_object_z",
+            affordance.hand_in_object.position.z);
+        append_target_scalar(
+            scalars, output, "grasp_rotation_object_w",
+            affordance.hand_in_object.rotation.w);
+        append_target_scalar(
+            scalars, output, "grasp_rotation_object_x",
+            affordance.hand_in_object.rotation.x);
+        append_target_scalar(
+            scalars, output, "grasp_rotation_object_y",
+            affordance.hand_in_object.rotation.y);
+        append_target_scalar(
+            scalars, output, "grasp_rotation_object_z",
+            affordance.hand_in_object.rotation.z);
+        append_target_scalar(
+            scalars, output, "object_dimensions_x",
+            target.object_dimensions.x);
+        append_target_scalar(
+            scalars, output, "object_dimensions_y",
+            target.object_dimensions.y);
+        append_target_scalar(
+            scalars, output, "object_dimensions_z",
+            target.object_dimensions.z);
+        append_target_scalar(
+            scalars, output, "object_position_x",
+            target.object_world.position.x);
+        append_target_scalar(
+            scalars, output, "object_position_y",
+            target.object_world.position.y);
+        append_target_scalar(
+            scalars, output, "object_position_z",
+            target.object_world.position.z);
+        append_target_scalar(
+            scalars, output, "object_rotation_w",
+            target.object_world.rotation.w);
+        append_target_scalar(
+            scalars, output, "object_rotation_x",
+            target.object_world.rotation.x);
+        append_target_scalar(
+            scalars, output, "object_rotation_y",
+            target.object_world.rotation.y);
+        append_target_scalar(
+            scalars, output, "object_rotation_z",
+            target.object_world.rotation.z);
+        append_target_scalar(
+            scalars, output, "table_position_x",
+            target.table_world.position.x);
+        append_target_scalar(
+            scalars, output, "table_position_y",
+            target.table_world.position.y);
+        append_target_scalar(
+            scalars, output, "table_position_z",
+            target.table_world.position.z);
+        append_target_scalar(
+            scalars, output, "table_rotation_w",
+            target.table_world.rotation.w);
+        append_target_scalar(
+            scalars, output, "table_rotation_x",
+            target.table_world.rotation.x);
+        append_target_scalar(
+            scalars, output, "table_rotation_y",
+            target.table_world.rotation.y);
+        append_target_scalar(
+            scalars, output, "table_rotation_z",
+            target.table_world.rotation.z);
+        append_target_scalar(
+            scalars, output, "table_size_x", target.table_size.x);
+        append_target_scalar(
+            scalars, output, "table_size_y", target.table_size.y);
+        append_target_scalar(
+            scalars, output, "table_size_z", target.table_size.z);
+        scalars.finish();
+    }
+    object.key("sequence_id");
+    append_json_string(output, source.sequence_id);
+    object.finish();
+}
+
+void append_selected_slot(
+    std::string& output,
+    const RetainedCandidate& source,
+    uint32_t slot_id) {
+    CanonicalJsonObject slot(output);
+    slot.key("contact_local_frame");
+    output += std::to_string(source.contact_local_frame);
+    slot.key("entry_local_frame");
+    output += std::to_string(source.entry_local_frame);
+    slot.key("prospective_root_x_object_f32_hex");
+    append_json_string(output, float32_hex(source.root_x_object_m));
+    slot.key("prospective_root_yaw_object_f32_hex");
+    append_json_string(
+        output, float32_hex(source.root_yaw_object_radians));
+    slot.key("prospective_root_z_object_f32_hex");
+    append_json_string(output, float32_hex(source.root_z_object_m));
+    slot.key("sequence_id");
+    append_json_string(output, source.sequence_id);
+    slot.key("slot_id");
+    output += std::to_string(slot_id);
+    slot.finish();
+}
+
+std::string serialize_selected_slots(
+    const std::vector<size_t>& selected_candidate_indices,
+    const std::vector<RetainedCandidate>& candidates,
+    const ReportTarget& source_target,
+    const interaction::InteractionTarget& target,
+    size_t registration_count) {
+    require(
+        selected_candidate_indices.size() == 3U,
+        "selected_slots requires exactly three runtime-ready candidates");
+    std::string output;
+    CanonicalJsonObject object(output);
+    object.key("record_type");
+    append_json_string(output, "selected_slots");
+    object.key("slots");
+    output.push_back('[');
+    size_t previous_index = 0U;
+    for (size_t selected_index = 0U;
+         selected_index < selected_candidate_indices.size();
+         ++selected_index) {
+        if (selected_index != 0U) output.push_back(',');
+        const size_t candidate_index =
+            selected_candidate_indices[selected_index];
+        require(
+            candidate_index < candidates.size() &&
+                (selected_index == 0U || candidate_index > previous_index),
+            "selected candidate indices do not preserve stable report order");
+        previous_index = candidate_index;
+        append_selected_slot(
+            output,
+            candidates[candidate_index],
+            static_cast<uint32_t>(selected_index + 1U));
+    }
+    output.push_back(']');
+    object.key("target");
+    append_target_record(output, source_target, target);
+    object.key("target_registry_registration_count");
+    output += std::to_string(registration_count);
+    object.finish();
+    return output;
+}
+
+void validate_buffered_json_lines(const std::vector<std::string>& lines) {
+    require(
+        lines.size() == kExpectedRetainedCandidateCount + 1U,
+        "buffered preview JSONL record count differs");
+    for (size_t index = 0U; index < lines.size(); ++index) {
+        require(
+            !lines[index].empty() &&
+                lines[index].find('\n') == std::string::npos &&
+                lines[index].find('\r') == std::string::npos,
+            "buffered preview record is empty or multiline");
+        const std::string label =
+            "buffered preview record " + std::to_string(index);
+        const JsonValue record = JsonParser(lines[index], label).parse_document();
+        const auto record_type_member = object_member(
+            record, "record_type", label);
+        const JsonValue& record_type_value = record_type_member.get();
+        const std::string record_type_label = label + ".record_type";
+        const std::string& record_type = json_string(
+            record_type_value, record_type_label);
+        const char* expected = index + 1U == lines.size()
+            ? "selected_slots"
+            : "candidate_preview";
+        require(
+            record_type == expected,
+            label + " has the wrong record_type");
+    }
+}
+
+std::string serialize_complete_preview_evidence(
+    const PreviewEvaluation& evaluation,
+    const SlotReport& report,
+    const interaction::InteractionTarget& target,
+    size_t registration_count) {
+    require(
+        evaluation.candidates.size() == report.retained_candidates.size() &&
+            evaluation.case_count ==
+                report.retained_candidates.size() *
+                    kExpectedStationarySnapshotCount,
+        "preview evaluation dimensions differ before serialization");
+    std::vector<std::string> lines;
+    lines.reserve(evaluation.candidates.size() + 1U);
+    std::vector<size_t> selected_candidate_indices;
+    selected_candidate_indices.reserve(3U);
+    for (size_t candidate_index = 0U;
+         candidate_index < evaluation.candidates.size();
+         ++candidate_index) {
+        const CandidatePreviewSummary& summary =
+            evaluation.candidates[candidate_index];
+        require(
+            summary.candidate_ordinal == candidate_index,
+            "candidate summary order differs from Task4 stable order");
+        lines.push_back(serialize_candidate_preview(
+            report.retained_candidates[candidate_index], summary));
+        if (summary.path_feasible && summary.match_ready &&
+            selected_candidate_indices.size() < 3U) {
+            selected_candidate_indices.push_back(candidate_index);
+        }
+    }
+    require(
+        selected_candidate_indices.size() == 3U,
+        "fewer than three candidates are runtime-ready; refusing partial stdout");
+    lines.push_back(serialize_selected_slots(
+        selected_candidate_indices,
+        report.retained_candidates,
+        report.target,
+        target,
+        registration_count));
+    validate_buffered_json_lines(lines);
+
+    std::string output;
+    size_t byte_count = lines.size();
+    for (const std::string& line : lines) byte_count += line.size();
+    output.reserve(byte_count);
+    for (const std::string& line : lines) {
+        output += line;
+        output.push_back('\n');
+    }
+    return output;
+}
+
 int run(int argc, char** argv) {
     if (argc != 4) {
         std::cerr
@@ -1827,6 +2764,32 @@ int run(int argc, char** argv) {
     require_fixed_reference_calibration(flat_database, bridge);
     const std::vector<FrozenStationarySnapshot> stationary_snapshots =
         make_frozen_stationary_snapshots(flat_database, bridge);
+    const PreviewEvaluation preview_evaluation =
+        evaluate_unrestricted_previews(
+            interaction_database,
+            interaction_features,
+            registered_target.registry,
+            registered_target.handle,
+            1U,
+            report.retained_candidates,
+            stationary_snapshots,
+            manifest);
+    const interaction::InteractionTarget* registered_target_snapshot =
+        registered_target.registry.find(registered_target.handle);
+    require(
+        registered_target_snapshot != nullptr,
+        "registered target disappeared before evidence serialization");
+    const std::string buffered_evidence =
+        serialize_complete_preview_evidence(
+            preview_evaluation,
+            report,
+            *registered_target_snapshot,
+            registered_target.registration_count);
+    require(
+        buffered_evidence.size() <=
+            static_cast<size_t>(
+                std::numeric_limits<std::streamsize>::max()),
+        "buffered preview evidence exceeds stream capacity");
 
     std::cerr
         << "interaction_smart_pickup_preview_probe: loaded flat_frames="
@@ -1842,8 +2805,17 @@ int run(int argc, char** argv) {
         << '/' << stationary_snapshots.front().fingerprint
         << " stationary_last=" << stationary_snapshots.back().frame
         << '/' << stationary_snapshots.back().fingerprint
-        << "; runtime preview evaluation is not yet implemented\n";
-    return 1;
+        << " preview_cases=" << preview_evaluation.case_count
+        << " preview_workers=" << preview_evaluation.worker_count
+        << " ready_candidates=" << preview_evaluation.ready_candidate_count
+        << " evidence_records="
+        << preview_evaluation.candidates.size() + 1U
+        << '\n';
+    std::cout.write(
+        buffered_evidence.data(),
+        static_cast<std::streamsize>(buffered_evidence.size()));
+    if (!std::cout) fail("could not write complete preview evidence");
+    return 0;
 }
 
 }  // namespace

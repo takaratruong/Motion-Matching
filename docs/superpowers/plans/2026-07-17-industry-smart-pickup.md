@@ -1233,7 +1233,7 @@ Make, and raylib for the final native visualization only.
   not yet satisfy the new behavioral contract. A compile-failure-only check is
   not accepted as probe TDD evidence.
 
-- [ ] **Step 4: Implement the unrestricted stationary preview probe**
+- [x] **Step 4: Implement the unrestricted stationary preview probe**
 
   Reuse the proven flat-pose bridge logic from
   `tests/cpp/test_live_flat_pick_entry_oracle.cpp`: validate the 23-bone flat
@@ -1262,7 +1262,7 @@ Make, and raylib for the final native visualization only.
   the prospective root; it must never be passed as a matcher allowlist. Emit one
   final canonically ordered `selected_slots` record for the Python gate.
 
-- [ ] **Step 5: Run the probe and freeze the first three certified constants**
+- [x] **Step 5: Run the probe and freeze the first three certified constants**
 
   Run:
 
@@ -1275,20 +1275,21 @@ Make, and raylib for the final native visualization only.
     > build/smart-pickup/beer10-runtime-preview.jsonl
   ```
 
-  The provisional static candidates that must be evaluated first are, in stable
-  sequence order:
+  The unrestricted runtime probe certified all 19 retained Task 4 candidates.
+  The first three runtime-ready candidates in actual stable Task 4 order are:
 
   ```text
-  pickup_table__avocado_1__001  entry 103  (-0.347025216,-0.243765026, 1.015864730)
-  pickup_table__coffee_cup_4__003 entry 102 (-0.372433871,-0.106620677, 1.297449708)
-  pickup_table__pear_18__003 entry 111       (-0.365832120,-0.188930586, 1.560374737)
+  pickup_table__alcohol_10__005 entry 125 contact 150 (-0.396769345,-0.0414382927,1.38969707) id 1
+  pickup_table__alcohol_13__005 entry 118 contact 143 (-0.402728528,-0.244846597,1.71573567) id 2
+  pickup_table__apple_1__000    entry 90  contact 115 (-0.467868507,-0.194983453,1.29209125) id 3
   ```
 
-  If all three are runtime-ready, assign IDs `1`, `2`, `3` in that exact order.
-  If one is rejected, the probe deterministically advances through the already
-  ordered Task 4 retained candidates; the Python gate independently recomputes
-  that choice and verifies the final `selected_slots` record. Do not loosen any
-  gate or hand-select by appearance.
+  Output was byte-identical across repeated full runs (20 JSONL records,
+  214,595 bytes, SHA-256
+  `3b8b1375a587c9f5b2e04db4578e8e855e0f6099c656d21d2ecbab5aaab68110`).
+  The Python gate independently recomputes this choice and verifies the final
+  `selected_slots` record. No gate was loosened and no motion was hand-selected
+  by appearance.
 
 - [ ] **Step 6: Bake only the certified literal scene values**
 

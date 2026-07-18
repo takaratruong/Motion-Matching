@@ -383,7 +383,7 @@ $(RELEASE_INTERACTION_PLACE_PROBE): interaction_place_probe.cpp tests/cpp/pick_e
 	$(CXX) $(CPP_TEST_FLAGS) $(CONTROLLER_RELEASE_PARITY_FLAGS) interaction_place_probe.cpp interaction_controller_adapter.cpp interaction_target_rig_ik.cpp $(INTERACTION_RUNTIME_SOURCES) -o $@
 
 interaction_smart_pickup_preview_probe: interaction_smart_pickup_preview_probe.cpp $(INTERACTION_SMART_PICKUP_PREVIEW_LINK_SOURCES) $(INTERACTION_SMART_PICKUP_PREVIEW_HEADERS)
-	$(CXX) $(CPP_TEST_FLAGS) -Wno-unused-parameter -Wno-unused-result -O2 interaction_smart_pickup_preview_probe.cpp $(INTERACTION_SMART_PICKUP_PREVIEW_LINK_SOURCES) -o $@
+	$(CXX) $(CPP_TEST_FLAGS) -Wno-unused-parameter -Wno-unused-result -O2 -pthread interaction_smart_pickup_preview_probe.cpp $(INTERACTION_SMART_PICKUP_PREVIEW_LINK_SOURCES) -o $@
 
 interaction_smart_pickup_scene_probe: interaction_smart_pickup_scene_probe.cpp $(INTERACTION_SMART_PICKUP_SCENE_LINK_SOURCES) $(INTERACTION_SMART_PICKUP_SCENE_HEADERS)
 	$(CXX) $(CPP_TEST_FLAGS) interaction_smart_pickup_scene_probe.cpp $(INTERACTION_SMART_PICKUP_SCENE_LINK_SOURCES) -o $@
