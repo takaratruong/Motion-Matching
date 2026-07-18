@@ -1030,7 +1030,7 @@ Make, and raylib for the final native visualization only.
   Expected: import failure because `resources.extract_g1_pick_slots` does not
   exist.
 
-- [ ] **Step 5: Implement the minimal offline extractor**
+- [x] **Step 5: Implement the minimal offline extractor**
 
   Reuse `read_artifact_set` for schema/manifest validation. Reconstruct canonical
   world transforms in parent order using the manifest skeleton parents. Derive
@@ -1050,7 +1050,7 @@ Make, and raylib for the final native visualization only.
   nine decimal digits. Reject non-finite input before arithmetic. Mark the
   resulting records `static_path_feasible`; do not call them runtime-certified.
 
-- [ ] **Step 6: Run focused tests green**
+- [x] **Step 6: Run focused tests green**
 
   Run:
 
@@ -1061,7 +1061,7 @@ Make, and raylib for the final native visualization only.
   Expected: every stable identity, transform, boundary, path, dedupe, and
   deterministic serialization test passes.
 
-- [ ] **Step 7: Generate and inspect the full-pack beer target report**
+- [x] **Step 7: Generate and inspect the full-pack beer target report**
 
   Run:
 
