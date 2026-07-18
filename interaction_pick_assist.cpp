@@ -312,6 +312,13 @@ PickAssistOutput braking_output(
     return output;
 }
 
+PickAssistReason frozen_arrival_deadline_reason(
+    bool poor_match_observed) {
+    return poor_match_observed
+        ? PickAssistReason::PoorMatch
+        : PickAssistReason::ArrivalDeadline;
+}
+
 }  // namespace
 
 ControllerPickAssist::ControllerPickAssist(PickAssistConfig config)
@@ -322,6 +329,7 @@ ControllerPickAssist::ControllerPickAssist(PickAssistConfig config)
 void ControllerPickAssist::cancel() {
     frozen_slot_attempt_ = false;
     frozen_preview_root_.reset();
+    poor_match_observed_ = false;
     if (diagnostics_.state == PickAssistState::Submitted) return;
     start_ = {};
     frozen_slot_ = {};
@@ -338,6 +346,7 @@ bool ControllerPickAssist::begin(const PickAssistStart& start) {
 
     frozen_slot_attempt_ = false;
     frozen_preview_root_.reset();
+    poor_match_observed_ = false;
     previous_observed_root_ = {};
     start_ = start;
     preview_ticks_ = 0U;
@@ -425,6 +434,7 @@ bool ControllerPickAssist::begin(
     frozen_slot_ = {};
     frozen_preview_root_.reset();
     frozen_slot_attempt_ = false;
+    poor_match_observed_ = false;
     previous_observed_root_ = {};
     entry_point_ = {};
     preview_ticks_ = 0U;
@@ -438,6 +448,7 @@ bool ControllerPickAssist::begin(
         frozen_slot_ = {};
         frozen_preview_root_.reset();
         frozen_slot_attempt_ = false;
+        poor_match_observed_ = false;
         previous_observed_root_ = {};
         entry_point_ = {};
         preview_ticks_ = 0U;
@@ -610,6 +621,7 @@ PickAssistOutput ControllerPickAssist::observe(
                 diagnostics_, PickAssistReason::OutsideTravelEnvelope);
         }
         if (frozen_slot_settling) {
+            ++arrival_ticks_;
             const bool stable =
                 diagnostics_.root_error_m <=
                     config_.maximum_settle_position_error_m &&
@@ -622,6 +634,12 @@ PickAssistOutput ControllerPickAssist::observe(
             } else {
                 diagnostics_.settle_ticks = 0U;
             }
+            if (arrival_ticks_ >= config_.maximum_arrival_ticks) {
+                return fail_output(
+                    diagnostics_,
+                    frozen_arrival_deadline_reason(
+                        poor_match_observed_));
+            }
             if (diagnostics_.settle_ticks ==
                 config_.required_settle_ticks) {
                 diagnostics_.state = PickAssistState::FinalPreview;
@@ -630,6 +648,13 @@ PickAssistOutput ControllerPickAssist::observe(
             return braking_output();
         }
         if (frozen_slot_final_preview) {
+            ++arrival_ticks_;
+            if (arrival_ticks_ >= config_.maximum_arrival_ticks) {
+                return fail_output(
+                    diagnostics_,
+                    frozen_arrival_deadline_reason(
+                        poor_match_observed_));
+            }
             if (!observation.preview.has_value()) {
                 return braking_output(true, frozen_preview_root_);
             }
@@ -646,6 +671,7 @@ PickAssistOutput ControllerPickAssist::observe(
                 !preview.match_ready &&
                 preview.match_reason == Reason::PoorMatch;
             if (retryable_poor_match) {
+                poor_match_observed_ = true;
                 return braking_output(true, frozen_preview_root_);
             }
             const bool certified =
@@ -671,6 +697,7 @@ PickAssistOutput ControllerPickAssist::observe(
                 config_.arrival.maximum_yaw_error_radians) {
             diagnostics_.state = PickAssistState::Settling;
             diagnostics_.settle_ticks = 0U;
+            arrival_ticks_ = 0U;
             return braking_output();
         }
         if (diagnostics_.root_error_m <=

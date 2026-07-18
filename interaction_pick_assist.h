@@ -148,6 +148,7 @@ private:
     MappedPickSlot frozen_slot_{};
     std::optional<PickEntryRoot> frozen_preview_root_{};
     bool frozen_slot_attempt_ = false;
+    bool poor_match_observed_ = false;
     Transform previous_observed_root_{};
     vec3 entry_point_{};
     uint32_t preview_ticks_ = 0U;
