@@ -1,0 +1,31 @@
+{
+  "modalities": {
+    "robot": {
+      "allowed_globs": [
+        "data/stair_p1/robot/*.pkl",
+        "data/stair_p2/robot/*.pkl"
+      ],
+      "byte_count": 2421026260,
+      "canonical_inventory_sha256": "595b1276c9191e86bc6101a68929810680ac6790a795c35e692f2f7e8a7f97e2",
+      "file_count": 12188,
+      "partitions": {
+        "stair_p1": {
+          "byte_count": 1210648890,
+          "file_count": 6094,
+          "path_prefix": "data/stair_p1/robot/"
+        },
+        "stair_p2": {
+          "byte_count": 1210377370,
+          "file_count": 6094,
+          "path_prefix": "data/stair_p2/robot/"
+        }
+      }
+    }
+  },
+  "repository": {
+    "id": "nvidia/PhysicalAI-Robotics-Locomanipulation-GRAIL",
+    "revision": "943946a972d5de2eb0d2ff214b236d0e43575fd7",
+    "type": "dataset"
+  },
+  "schema": "g1-grail-terrain-inputs/v1"
+}
