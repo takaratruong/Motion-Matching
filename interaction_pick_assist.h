@@ -88,6 +88,7 @@ struct PickAssistOutput {
     bool force_strafe = false;
     bool stationary_constraint = false;
     bool needs_preview = false;
+    std::optional<PickEntryRoot> preview_root{};
     bool submit_interact = false;
 };
 
@@ -144,6 +145,7 @@ private:
     PickAssistConfig config_{};
     PickAssistStart start_{};
     MappedPickSlot frozen_slot_{};
+    std::optional<PickEntryRoot> frozen_preview_root_{};
     bool frozen_slot_attempt_ = false;
     Transform previous_observed_root_{};
     vec3 entry_point_{};

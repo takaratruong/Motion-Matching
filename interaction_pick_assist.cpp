@@ -271,12 +271,15 @@ float planar_speed(vec3 velocity) {
         static_cast<double>(velocity.z)));
 }
 
-PickAssistOutput braking_output(bool needs_preview = false) {
+PickAssistOutput braking_output(
+    bool needs_preview = false,
+    std::optional<PickEntryRoot> preview_root = {}) {
     PickAssistOutput output{};
     output.override_steering = true;
     output.force_strafe = true;
     output.stationary_constraint = true;
     output.needs_preview = needs_preview;
+    output.preview_root = preview_root;
     return output;
 }
 
@@ -289,6 +292,7 @@ ControllerPickAssist::ControllerPickAssist(PickAssistConfig config)
 
 void ControllerPickAssist::cancel() {
     frozen_slot_attempt_ = false;
+    frozen_preview_root_.reset();
     if (diagnostics_.state == PickAssistState::Submitted) return;
     start_ = {};
     frozen_slot_ = {};
@@ -304,6 +308,7 @@ bool ControllerPickAssist::begin(const PickAssistStart& start) {
     if (active()) return false;
 
     frozen_slot_attempt_ = false;
+    frozen_preview_root_.reset();
     previous_observed_root_ = {};
     start_ = start;
     preview_ticks_ = 0U;
@@ -389,6 +394,7 @@ bool ControllerPickAssist::begin(
 
     start_ = {};
     frozen_slot_ = {};
+    frozen_preview_root_.reset();
     frozen_slot_attempt_ = false;
     previous_observed_root_ = {};
     entry_point_ = {};
@@ -401,6 +407,7 @@ bool ControllerPickAssist::begin(
     const auto fail_begin = [this](PickAssistReason reason) {
         start_ = {};
         frozen_slot_ = {};
+        frozen_preview_root_.reset();
         frozen_slot_attempt_ = false;
         previous_observed_root_ = {};
         entry_point_ = {};
@@ -451,6 +458,15 @@ bool ControllerPickAssist::begin(
     const size_t selected_index =
         *diagnostics_.slot_selection.selected_index;
     frozen_slot_ = diagnostics_.slot_selection.ordered[selected_index];
+    const PickEntryRoot frozen_preview_root{
+        frozen_slot_.root_world.position.x,
+        frozen_slot_.root_world.position.z,
+        yaw_radians(frozen_slot_.root_world.rotation),
+    };
+    if (!is_finite(frozen_preview_root)) {
+        return fail_begin(PickAssistReason::OutsideTravelEnvelope);
+    }
+    frozen_preview_root_ = frozen_preview_root;
     start_ = start;
     start_.target = start.target_snapshot.handle;
     start_.hand = selected_affordance->hand;
@@ -474,9 +490,12 @@ PickAssistOutput ControllerPickAssist::observe(
     PickAssistOutput output{};
     const bool frozen_slot_phase = frozen_slot_attempt_ &&
         (diagnostics_.state == PickAssistState::SlotApproach ||
-            diagnostics_.state == PickAssistState::Settling);
+            diagnostics_.state == PickAssistState::Settling ||
+            diagnostics_.state == PickAssistState::FinalPreview);
     const bool frozen_slot_settling = frozen_slot_attempt_ &&
         diagnostics_.state == PickAssistState::Settling;
+    const bool frozen_slot_final_preview = frozen_slot_attempt_ &&
+        diagnostics_.state == PickAssistState::FinalPreview;
     if (frozen_slot_phase) {
         if (observation.runtime_state != RuntimeState::Locomotion) {
             return fail_output(
@@ -561,7 +580,29 @@ PickAssistOutput ControllerPickAssist::observe(
             return fail_output(
                 diagnostics_, PickAssistReason::OutsideTravelEnvelope);
         }
-        if (frozen_slot_settling) return braking_output();
+        if (frozen_slot_settling) {
+            const bool stable =
+                diagnostics_.root_error_m <=
+                    config_.maximum_settle_position_error_m &&
+                observation.displayed_planar_speed_mps <=
+                    config_.maximum_settle_displayed_speed_mps &&
+                diagnostics_.yaw_error_radians <=
+                    config_.arrival.maximum_yaw_error_radians;
+            if (stable) {
+                ++diagnostics_.settle_ticks;
+            } else {
+                diagnostics_.settle_ticks = 0U;
+            }
+            if (diagnostics_.settle_ticks ==
+                config_.required_settle_ticks) {
+                diagnostics_.state = PickAssistState::FinalPreview;
+                return braking_output(true, frozen_preview_root_);
+            }
+            return braking_output();
+        }
+        if (frozen_slot_final_preview) {
+            return braking_output(true, frozen_preview_root_);
+        }
         if (diagnostics_.root_error_m <=
                 config_.arrival.latch_position_error_m &&
             diagnostics_.speed_mps <=
