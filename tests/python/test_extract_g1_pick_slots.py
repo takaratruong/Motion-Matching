@@ -6,6 +6,8 @@ from unittest.mock import patch
 import numpy as np
 
 from resources.extract_g1_pick_slots import (
+    _root_intersects_table,
+    _segment_intersects_expanded_box,
     extract_slot_candidates,
     extract_slot_candidates_from_pack,
 )
@@ -23,6 +25,30 @@ _SOURCE_OBJECT = "source_object"
 _TARGET_OBJECT = "target_object"
 _CLIP_FRAMES = 10
 _RIGHT_WRIST = 30
+
+_HAND_POSITION_LIMIT_M = np.float32(0.12)
+_HAND_ORIENTATION_LIMIT_RADIANS = np.float32(np.deg2rad(25.0))
+_CLEARANCE_RADIUS_M = np.float32(0.04)
+_REJECTED_GATE_ORDER = (
+    "hand_mismatch",
+    "contact_position",
+    "contact_orientation",
+    "root_table",
+    "hand_table",
+    "hand_object",
+)
+_SLOT_CANDIDATE_FIELDS = (
+    "root_x_object_m",
+    "root_z_object_m",
+    "root_yaw_object_radians",
+    "contact_hand_position_error_m",
+    "contact_hand_orientation_error_radians",
+    "entry_root_planar_speed_mps",
+    "root_table_clear",
+    "hand_table_clear",
+    "hand_object_clear",
+    "static_path_feasible",
+)
 
 _IDENTITY = np.array([1.0, 0.0, 0.0, 0.0], np.float32)
 _CLIP_PHASES = np.array(
@@ -171,6 +197,69 @@ def _candidate(report, sequence_id):
     return matches[0]
 
 
+def _yaw_quaternion(radians):
+    half = np.float32(radians) * np.float32(0.5)
+    return np.array(
+        [np.cos(half), 0.0, np.sin(half), 0.0], np.float32
+    )
+
+
+def _rotate_y(vector, radians):
+    quaternion = _yaw_quaternion(radians)
+    w, _, y, _ = quaternion
+    x, vertical, z = np.asarray(vector, dtype=np.float32)
+    return np.array(
+        [
+            (w * w - y * y) * x + np.float32(2.0) * w * y * z,
+            vertical,
+            -np.float32(2.0) * w * y * x + (w * w - y * y) * z,
+        ],
+        np.float32,
+    )
+
+
+def _box_local_to_world(local, position, yaw_radians):
+    return np.asarray(position, dtype=np.float32) + _rotate_y(
+        local, yaw_radians
+    )
+
+
+def _set_source_wrist_world(artifact, local_frame, world_position):
+    root = artifact.positions[local_frame, 0]
+    artifact.positions[local_frame, _RIGHT_WRIST] = (
+        np.asarray(world_position, dtype=np.float32) - root
+    )
+
+
+def _assert_gate_counts(test_case, report, expected_gate=None):
+    counts = report["rejected_counts_by_gate"]
+    test_case.assertEqual(list(counts), list(_REJECTED_GATE_ORDER))
+    test_case.assertEqual(
+        counts,
+        {
+            gate: int(gate == expected_gate)
+            for gate in _REJECTED_GATE_ORDER
+        },
+    )
+    test_case.assertEqual(report["deduplicated_candidate_count"], 0)
+
+
+def _position_error_fixture(error_m):
+    artifact, manifest = _two_clip_artifact_and_manifest()
+    artifact.object_positions[:_CLIP_FRAMES, 0] = np.float32(0.0)
+    artifact.object_positions[_CLIP_FRAMES:, 0] = np.float32(0.0)
+    artifact.grasp_positions_object[:, 0] = np.float32(0.0)
+    source_hand = np.array([error_m, 1.2, 2.3], np.float32)
+    target_hand = np.array([0.0, 1.2, 3.3], np.float32)
+    artifact.positions[3:_CLIP_FRAMES, _RIGHT_WRIST] = (
+        source_hand - artifact.positions[3, 0]
+    )
+    artifact.positions[13:, _RIGHT_WRIST] = (
+        target_hand - artifact.positions[13, 0]
+    )
+    return artifact, manifest
+
+
 class ExtractSlotCandidateIdentityTests(unittest.TestCase):
     def test_resolves_target_events_and_provenance_by_sequence_and_range(self):
         artifact, manifest = _two_clip_artifact_and_manifest()
@@ -225,6 +314,132 @@ class ExtractSlotCandidateIdentityTests(unittest.TestCase):
             [GRAIL_DATASET_ID, 1, _TARGET_SEQUENCE, 1, 1],
         )
         self.assertEqual(target["source_entry_frame"], 501)
+
+
+class ExtractSlotCandidateTransformAndCompatibilityTests(unittest.TestCase):
+    def test_extracts_exact_slot_fields_under_a_quarter_turn_target_yaw(self):
+        artifact, manifest = _two_clip_artifact_and_manifest()
+        source = slice(0, _CLIP_FRAMES)
+        target = slice(_CLIP_FRAMES, 2 * _CLIP_FRAMES)
+        artifact.positions[source, 0] = np.array(
+            [2.0, 1.0, 4.0], np.float32
+        )
+        artifact.rotations[1, 0] = _yaw_quaternion(np.deg2rad(30.0))
+        artifact.velocities[1, 0] = np.array(
+            [3.0, 12.0, 4.0], np.float32
+        )
+
+        source_hand = np.array([1.1, 1.2, 2.3], np.float32)
+        artifact.positions[3:_CLIP_FRAMES, _RIGHT_WRIST] = (
+            source_hand - artifact.positions[3, 0]
+        )
+
+        quarter_turn = np.float32(np.pi / 2.0)
+        target_hand = np.array([4.3, 1.2, 2.9], np.float32)
+        artifact.object_rotations[target] = _yaw_quaternion(quarter_turn)
+        artifact.positions[13:, _RIGHT_WRIST] = (
+            target_hand - artifact.positions[13, 0]
+        )
+        artifact.rotations[13:, _RIGHT_WRIST] = _yaw_quaternion(quarter_turn)
+
+        report = extract_slot_candidates(
+            artifact, manifest, _TARGET_SEQUENCE
+        )
+        candidate = _candidate(report, _SOURCE_SEQUENCE)
+
+        self.assertEqual(
+            {field: candidate[field] for field in _SLOT_CANDIDATE_FIELDS},
+            {
+                "root_x_object_m": 1.0,
+                "root_z_object_m": 2.0,
+                "root_yaw_object_radians": float(
+                    np.float32(np.deg2rad(30.0))
+                ),
+                "contact_hand_position_error_m": 0.0,
+                "contact_hand_orientation_error_radians": 0.0,
+                "entry_root_planar_speed_mps": 5.0,
+                "root_table_clear": True,
+                "hand_table_clear": True,
+                "hand_object_clear": True,
+                "static_path_feasible": True,
+            },
+        )
+        _assert_gate_counts(self, report)
+
+    def test_contact_position_gate_accepts_equality_and_rejects_next_float(self):
+        cases = (
+            (_HAND_POSITION_LIMIT_M, True),
+            (
+                np.nextafter(
+                    _HAND_POSITION_LIMIT_M, np.float32(np.inf)
+                ),
+                False,
+            ),
+        )
+        for error_m, accepted in cases:
+            with self.subTest(error_m=float(error_m)):
+                artifact, manifest = _position_error_fixture(error_m)
+                report = extract_slot_candidates(
+                    artifact, manifest, _TARGET_SEQUENCE
+                )
+                if accepted:
+                    candidate = _candidate(report, _SOURCE_SEQUENCE)
+                    self.assertEqual(
+                        candidate["contact_hand_position_error_m"],
+                        float(error_m),
+                    )
+                    _assert_gate_counts(self, report)
+                else:
+                    self.assertNotIn(
+                        _SOURCE_SEQUENCE,
+                        {
+                            item["sequence_id"]
+                            for item in report["retained_candidates"]
+                        },
+                    )
+                    _assert_gate_counts(self, report, "contact_position")
+
+    def test_contact_orientation_gate_accepts_equality_and_rejects_next_float(self):
+        cases = (
+            (_HAND_ORIENTATION_LIMIT_RADIANS, True),
+            (
+                np.nextafter(
+                    _HAND_ORIENTATION_LIMIT_RADIANS,
+                    np.float32(np.inf),
+                ),
+                False,
+            ),
+        )
+        for error_radians, accepted in cases:
+            with self.subTest(error_radians=float(error_radians)):
+                artifact, manifest = _two_clip_artifact_and_manifest()
+                artifact.rotations[3:_CLIP_FRAMES, _RIGHT_WRIST] = (
+                    _yaw_quaternion(error_radians)
+                )
+                report = extract_slot_candidates(
+                    artifact, manifest, _TARGET_SEQUENCE
+                )
+                if accepted:
+                    candidate = _candidate(report, _SOURCE_SEQUENCE)
+                    self.assertAlmostEqual(
+                        candidate[
+                            "contact_hand_orientation_error_radians"
+                        ],
+                        float(error_radians),
+                        places=7,
+                    )
+                    _assert_gate_counts(self, report)
+                else:
+                    self.assertNotIn(
+                        _SOURCE_SEQUENCE,
+                        {
+                            item["sequence_id"]
+                            for item in report["retained_candidates"]
+                        },
+                    )
+                    _assert_gate_counts(
+                        self, report, "contact_orientation"
+                    )
 
 
 class ExtractSlotCandidateValidationTests(unittest.TestCase):
