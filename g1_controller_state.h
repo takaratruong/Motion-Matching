@@ -357,7 +357,8 @@ static inline bool g1_controller_state_reset(
     const terrain_support_set& support,
     const scene_pack& scene,
     char* error,
-    const int capacity)
+    const int capacity,
+    const int initial_frame = -1)
 {
     if (db.nframes() <= 0 || db.nbones() != G1_BoneCount ||
         db.nranges() <= 0 || support.values.rows != db.nframes() ||
@@ -381,8 +382,17 @@ static inline bool g1_controller_state_reset(
             scene.metadata.id.c_str());
     }
 
+    const int resolved_initial_frame = initial_frame >= 0
+        ? initial_frame
+        : db.range_starts(0);
+    if (resolved_initial_frame < 0 || resolved_initial_frame >= db.nframes())
+    {
+        return scene_error(
+            error, capacity, "controller reset: initial frame is out of range");
+    }
+
     g1_controller_state candidate;
-    candidate.frame_index = db.range_starts(0);
+    candidate.frame_index = resolved_initial_frame;
     candidate.curr_bone_positions = db.bone_positions(candidate.frame_index);
     candidate.curr_bone_velocities = db.bone_velocities(candidate.frame_index);
     candidate.curr_bone_rotations = db.bone_rotations(candidate.frame_index);

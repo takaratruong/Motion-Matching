@@ -589,11 +589,16 @@ class Coordinator:
         readiness_wait: Callable[[], None] | None = None,
         cancelled: Callable[[], bool] | None = None,
         delivery_auditor: _DeliveryAuditor | None = None,
+        prepared_target_validator: Callable[[object], object] | None = None,
     ) -> None:
         if type(steps_per_chunk) is not int or steps_per_chunk <= 0:
             raise ContractError("steps_per_chunk must be a positive integer")
         if type(source_intervals) is not int or source_intervals != 10:
             raise ContractError("source_intervals must equal the registered value 10")
+        if prepared_target_validator is not None and not callable(
+            prepared_target_validator
+        ):
+            raise ContractError("prepared target validator must be callable")
         self.mm = mm
         self.validator = validator
         self._timeline_factory = timeline_factory
@@ -612,6 +617,7 @@ class Coordinator:
         self._readiness_wait = readiness_wait or (lambda: time.sleep(0.001))
         self._cancelled = cancelled
         self._delivery_auditor = delivery_auditor
+        self._prepared_target_validator = prepared_target_validator
         self._state = CoordinatorState.CREATED
         self._lock = threading.RLock()
         self._pending_command: CommandSample | None = None
@@ -1029,11 +1035,23 @@ class Coordinator:
                 candidate_id=candidate_id,
                 tracker=tracker,
             ) from error
-        try:
+        def prepare_and_validate() -> object:
             assert self._timeline is not None
-            prepared = tracker.call(
-                "resampling", lambda: self._timeline.prepare(checked_source)
-            )
+            candidate = self._timeline.prepare(checked_source)
+            if self._prepared_target_validator is not None:
+                try:
+                    self._prepared_target_validator(candidate.target)
+                except BaseException as error:
+                    if not hasattr(error, "failure_site"):
+                        try:
+                            setattr(error, "failure_site", "kinematic_validation")
+                        except BaseException:
+                            pass
+                    raise
+            return candidate
+
+        try:
+            prepared = tracker.call("resampling", prepare_and_validate)
         except BaseException as error:
             site = self._failure_site(error, "resampling")
             raise self._fail_chunk(

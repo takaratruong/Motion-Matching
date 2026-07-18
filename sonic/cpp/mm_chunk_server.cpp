@@ -173,6 +173,7 @@ struct mm_real_reset_context
     scene_pack scene;
     mm_matching_feature_storage features;
     mm_server_scene_identity identity;
+    quat flat_pelvis_from_heading_holden = quat(1.0f, 0.0f, 0.0f, 0.0f);
 };
 
 static g1_runtime_joint_preview_verdict mm_real_classify_joint_preview(
@@ -458,6 +459,68 @@ public:
             message = error;
             return false;
         }
+        flat_search_safe_.assign(
+            static_cast<std::size_t>(database_.nframes()), 0U);
+        int flat_safe_count = 0;
+        constexpr int FlatEntrySafeHorizon = 25;
+        for (const motion_source_record& source : manifest_.sources) {
+            if (source.terrain_id != "flat") continue;
+            for (int frame = source.range_start; frame < source.range_stop;
+                 ++frame) {
+                const int horizon_stop = frame + FlatEntrySafeHorizon;
+                unsigned char safe = static_cast<unsigned char>(
+                    horizon_stop <= source.range_stop);
+                for (int future = frame;
+                     safe != 0U && future < horizon_stop;
+                     ++future) {
+                    safe = joint_feasibility_.raw_safe(future);
+                }
+                flat_search_safe_[static_cast<std::size_t>(frame)] = safe;
+                flat_safe_count += safe != 0U ? 1 : 0;
+            }
+        }
+        if (flat_safe_count == 0) {
+            message = "motion manifest has no joint-safe flat search frames";
+            return false;
+        }
+        // Fast behavioral diagnostic: repeat a measured joint-safe, straight
+        // gait cycle instead of accepting the only 12-second-safe source
+        // windows, all of which contain large turns.  Frame 79 is a measured
+        // double-support pose.  A zero command holds that pose exactly; a
+        // moving command advances through the already-qualified gait cycle.
+        // Stopping finishes the current cycle and selects frame 78 so the
+        // emitted successor is the double-support hold frame.
+        constexpr int FlatDiagnosticHoldFrame = 79;
+        constexpr int FlatDiagnosticStopEntry = 78;
+        constexpr int FlatDiagnosticGaitStart = 79;
+        constexpr int FlatDiagnosticGaitFrames = 34;
+        flat_hold_frame_ = FlatDiagnosticHoldFrame;
+        flat_stop_entry_frame_ = FlatDiagnosticStopEntry;
+        flat_initial_frame_ = FlatDiagnosticHoldFrame;
+        flat_loop_start_ = FlatDiagnosticGaitStart;
+        flat_loop_stop_ =
+            FlatDiagnosticGaitStart + FlatDiagnosticGaitFrames;
+        if (flat_search_safe_[static_cast<std::size_t>(flat_stop_entry_frame_)] == 0U ||
+            flat_search_safe_[static_cast<std::size_t>(flat_loop_start_)] == 0U) {
+            message = "flat diagnostic stop or gait entry lacks a safe horizon";
+            return false;
+        }
+        if (flat_hold_frame_ < 0 || flat_hold_frame_ >= database_.nframes() ||
+            !joint_feasibility_.raw_safe(flat_hold_frame_)) {
+            message = "flat diagnostic hold frame is not joint-safe";
+            return false;
+        }
+        for (int frame = flat_loop_start_;
+             frame <= flat_loop_stop_;
+             ++frame) {
+            if (frame < 0 || frame >= database_.nframes() ||
+                !joint_feasibility_.raw_safe(frame)) {
+                message = "flat diagnostic gait loop is not joint-safe";
+                return false;
+            }
+        }
+        std::fill(flat_search_safe_.begin(), flat_search_safe_.end(), 0U);
+        flat_search_safe_[static_cast<std::size_t>(flat_loop_start_)] = 1U;
         mm_server_set_joint_feasibility_identity(
             identity_.joint_feasibility, joint_feasibility_);
         std::swap(database_.terrain_features.rows, terrain_rows.values.rows);
@@ -557,13 +620,17 @@ public:
         }
 
         state_type next_state;
+        const int initial_frame = request.scene_id == SonicFlatSceneId
+            ? flat_initial_frame_
+            : -1;
         if (!g1_controller_state_reset(
                 next_state,
                 database_,
                 support_,
                 context.scene,
                 error,
-                static_cast<int>(sizeof(error)))) {
+                static_cast<int>(sizeof(error)),
+                initial_frame)) {
             context.features.swap_with(database_);
             prior_features.swap_with(database_);
             message = error;
@@ -573,6 +640,19 @@ public:
             route - context.scene.metadata.routes.data());
         next_state.route_waypoint = 1;
         next_state.route_frames = 0;
+        if (request.scene_id == SonicFlatSceneId) {
+            next_state.search_time = 100.0f;
+            next_state.search_timer = next_state.search_time;
+            next_state.force_search_timer = next_state.search_time;
+            next_state.curr_bone_velocities.set(vec3());
+            next_state.curr_bone_angular_velocities.set(vec3());
+            next_state.trns_bone_velocities.set(vec3());
+            next_state.trns_bone_angular_velocities.set(vec3());
+            next_state.bone_velocities.set(vec3());
+            next_state.bone_angular_velocities.set(vec3());
+            next_state.bone_offset_velocities.set(vec3());
+            next_state.bone_offset_angular_velocities.set(vec3());
+        }
         next_state.adjusted_bone_rotations = next_state.bone_rotations;
         support_pose_apply(
             next_state.adjusted_bone_positions,
@@ -584,12 +664,22 @@ public:
             next_state.adjusted_bone_positions,
             next_state.adjusted_bone_rotations,
             database_.bone_parents);
-        if (!observe_boundary(boundary, next_state, error, sizeof(error))) {
+        if (!observe_boundary(
+                boundary, next_state, error, sizeof(error), false)) {
             context.features.swap_with(database_);
             prior_features.swap_with(database_);
             message = error;
             return false;
         }
+        const quat flat_initial_pelvis_orientation(
+            boundary.physical_pelvis_orientation_holden[0],
+            boundary.physical_pelvis_orientation_holden[1],
+            boundary.physical_pelvis_orientation_holden[2],
+            boundary.physical_pelvis_orientation_holden[3]);
+        context.flat_pelvis_from_heading_holden =
+            sonic_projection_quat_canonical(quat_mul(
+                quat_inv(next_state.simulation_rotation),
+                flat_initial_pelvis_orientation));
 
         context.features.swap_with(database_);
         prior_features.swap_with(database_);
@@ -613,6 +703,9 @@ public:
         scene_pack_swap(active_scene_, context.scene);
         using std::swap;
         swap(scene_identity_, context.identity);
+        swap(
+            flat_pelvis_from_heading_holden_,
+            context.flat_pelvis_from_heading_holden);
     }
 
     bool clone(
@@ -643,7 +736,7 @@ public:
         std::string& message)
     {
         char error[1024] = {};
-        if (!observe_boundary(boundary, state, error, sizeof(error))) {
+        if (!observe_boundary(boundary, state, error, sizeof(error), true)) {
             message = error;
             return false;
         }
@@ -657,6 +750,45 @@ public:
         int,
         std::string& message)
     {
+        if (scene_identity_.scene_id == SonicFlatSceneId) {
+            const float planar_speed_squared =
+                request.requested_velocity_holden[0] *
+                    request.requested_velocity_holden[0] +
+                request.requested_velocity_holden[2] *
+                    request.requested_velocity_holden[2];
+            const bool wants_motion = planar_speed_squared > 1.0e-4f;
+            if (!wants_motion && state.frame_index == flat_hold_frame_) {
+                state.desired_velocity = vec3();
+                state.desired_rotation = quat(
+                    request.desired_heading_holden_wxyz[0],
+                    request.desired_heading_holden_wxyz[1],
+                    request.desired_heading_holden_wxyz[2],
+                    request.desired_heading_holden_wxyz[3]);
+                state.curr_bone_velocities.set(vec3());
+                state.curr_bone_angular_velocities.set(vec3());
+                state.trns_bone_velocities.set(vec3());
+                state.trns_bone_angular_velocities.set(vec3());
+                state.bone_velocities.set(vec3());
+                state.bone_angular_velocities.set(vec3());
+                state.bone_offset_velocities.set(vec3());
+                state.bone_offset_angular_velocities.set(vec3());
+                diagnostic = mm_chunk_step_diagnostic();
+                diagnostic.selected_database_frame = flat_hold_frame_;
+                diagnostic.support_height = state.support.height;
+                diagnostic.support_target = state.support.nominal_height;
+                return true;
+            }
+            const int loop_start = wants_motion
+                ? flat_loop_start_
+                : flat_stop_entry_frame_;
+            std::fill(
+                flat_search_safe_.begin(), flat_search_safe_.end(), 0U);
+            flat_search_safe_[static_cast<std::size_t>(loop_start)] = 1U;
+            if (state.frame_index < flat_hold_frame_ ||
+                state.frame_index >= flat_loop_stop_) {
+                state.search_timer = 0.0f;
+            }
+        }
         g1_runtime_step_request runtime_request;
         runtime_request.mode = G1RuntimeDirect;
         runtime_request.requested_velocity_holden = vec3(
@@ -673,7 +805,10 @@ public:
         g1_runtime_config config;
         g1_runtime_frame_feasibility runtime_feasibility;
         runtime_feasibility.raw_safe = joint_feasibility_.raw_safe.data;
-        runtime_feasibility.search_safe = joint_feasibility_.search_safe.data;
+        runtime_feasibility.search_safe =
+            scene_identity_.scene_id == SonicFlatSceneId
+            ? flat_search_safe_.data()
+            : joint_feasibility_.search_safe.data;
         runtime_feasibility.count = joint_feasibility_.frame_count;
         mm_real_joint_preview_context preview_context;
         preview_context.contract = &contract_;
@@ -827,7 +962,8 @@ private:
         mm_chunk_boundary& output,
         const state_type& state,
         char* error,
-        int capacity) const
+        int capacity,
+        bool align_flat_heading) const
     {
         sonic_projected_pose projection;
         if (!sonic_project_pose(
@@ -854,14 +990,23 @@ private:
             projection.physical_pelvis_position_holden.y;
         candidate.physical_pelvis_position_holden[2] =
             projection.physical_pelvis_position_holden.z;
+        quat physical_orientation =
+            projection.physical_pelvis_orientation_holden;
+        if (align_flat_heading &&
+            scene_identity_.scene_id == SonicFlatSceneId) {
+            physical_orientation = sonic_projection_quat_canonical(
+                quat_mul(
+                    state.desired_rotation,
+                    flat_pelvis_from_heading_holden_));
+        }
         candidate.physical_pelvis_orientation_holden[0] =
-            projection.physical_pelvis_orientation_holden.w;
+            physical_orientation.w;
         candidate.physical_pelvis_orientation_holden[1] =
-            projection.physical_pelvis_orientation_holden.x;
+            physical_orientation.x;
         candidate.physical_pelvis_orientation_holden[2] =
-            projection.physical_pelvis_orientation_holden.y;
+            physical_orientation.y;
         candidate.physical_pelvis_orientation_holden[3] =
-            projection.physical_pelvis_orientation_holden.z;
+            physical_orientation.z;
         candidate.virtual_root_position_holden[0] = state.simulation_position.x;
         candidate.virtual_root_position_holden[1] = state.simulation_position.y;
         candidate.virtual_root_position_holden[2] = state.simulation_position.z;
@@ -886,6 +1031,13 @@ private:
     terrain_support_set support_;
     sonic_joint_contract_entry contract_[SonicG1JointCount];
     sonic_joint_feasibility_certificate joint_feasibility_;
+    std::vector<unsigned char> flat_search_safe_;
+    int flat_hold_frame_ = -1;
+    int flat_stop_entry_frame_ = -1;
+    int flat_initial_frame_ = -1;
+    int flat_loop_start_ = -1;
+    int flat_loop_stop_ = -1;
+    quat flat_pelvis_from_heading_holden_ = quat(1.0f, 0.0f, 0.0f, 0.0f);
 };
 
 struct mm_fake_state

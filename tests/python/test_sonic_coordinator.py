@@ -521,6 +521,7 @@ class Harness:
         fail_site: str | None = None,
         readiness_match_attempt: int = 1,
         delivery_auditor: object | None = _DEFAULT_AUDITOR,
+        prepared_target_validator: object | None = None,
     ) -> None:
         self.events: list[str] = []
         self.root = Path(temporary.name)
@@ -560,6 +561,7 @@ class Harness:
             wall_time_ns=self.clock.wall_time_ns,
             readiness_wait=lambda: None,
             delivery_auditor=self.auditor,
+            prepared_target_validator=prepared_target_validator,
         )
 
     def preflight(self) -> None:
@@ -1022,6 +1024,62 @@ class CoordinatorSuccessTests(unittest.TestCase):
         accepted = self.harness.coordinator.run_one_chunk()
         self.assertEqual(accepted.advance.steps, 80)
         self.assertEqual(self.harness.coordinator.state, CoordinatorState.READY_PAUSED)
+
+    def test_prepared_target_validator_runs_before_artifact_or_publication(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        observed: list[object] = []
+
+        def validate_prepared_target(target: object) -> None:
+            harness.events.append("target.kinematic_validate")
+            observed.append(target)
+
+        harness = Harness(
+            temporary,
+            prepared_target_validator=validate_prepared_target,
+        )
+        harness.preflight()
+        harness.events.clear()
+        accepted = harness.coordinator.run_one_chunk(Harness.command())
+
+        self.assertEqual(observed, [accepted.target])
+        self.assertLess(
+            harness.events.index("target.kinematic_validate"),
+            harness.events.index("artifact.enqueue"),
+        )
+        self.assertLess(
+            harness.events.index("target.kinematic_validate"),
+            harness.events.index("zmq.send"),
+        )
+
+    def test_prepared_target_rejection_aborts_before_publication_or_commit(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+
+        def reject_prepared_target(_target: object) -> None:
+            raise InjectedFailure("kinematic_validation")
+
+        harness = Harness(
+            temporary,
+            prepared_target_validator=reject_prepared_target,
+        )
+        harness.preflight()
+        harness.events.clear()
+
+        with self.assertRaises(IntegrationFailure) as raised:
+            harness.coordinator.run_one_chunk(Harness.command())
+
+        self.assertEqual(raised.exception.phase, "pre_commit")
+        self.assertEqual(raised.exception.site, "kinematic_validation")
+        self.assertIn("timeline.abort", harness.events)
+        self.assertIn("mm.abort", harness.events)
+        self.assertNotIn("artifact.enqueue", harness.events)
+        self.assertNotIn("zmq.send", harness.events)
+        self.assertNotIn("mm.commit", harness.events)
+        self.assertNotIn("simulator.advance", harness.events)
+        self.assertTrue(harness.gate.is_paused)
+        self.assertEqual(harness.timeline.canonical_buffer.count, 1)
+        self.assertEqual(harness.coordinator.state, CoordinatorState.TERMINAL)
 
 
 class CoordinatorFailureBoundaryTests(unittest.TestCase):
