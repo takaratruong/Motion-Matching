@@ -575,7 +575,7 @@ stderr is empty.
 DISPLAY=:1 \
 G1_TERRAIN_DIR=/home/ubuntu/projects/motion-matching/resources/g1_terrain \
 MM_TERRAIN_SCENE=mixed-multilevel \
-/tmp/g1-playable-mesh-final/controller-g1-playable \
+stdbuf -oL /tmp/g1-playable-mesh-final/controller-g1-playable \
   >/tmp/g1-playable-mesh-final/live-smoke.out \
   2>/tmp/g1-playable-mesh-final/live-smoke.err &
 live_pid=$!
@@ -590,6 +590,13 @@ test "$(readlink -f "/proc/$live_pid/exe")" = \
 
 window_id=$(DISPLAY=:1 xdotool search --sync --pid "$live_pid" \
   --name 'G1 terrain motion matching - Holden runtime' | head -1)
+for attempt in $(seq 1 100); do
+  rg -q -F 'G1 mesh loaded: 35 parts' \
+    /tmp/g1-playable-mesh-final/live-smoke.out && break
+  sleep 0.1
+done
+rg -F 'G1 mesh loaded: 35 parts' \
+  /tmp/g1-playable-mesh-final/live-smoke.out
 DISPLAY=:1 xdotool windowactivate --sync "$window_id"
 DISPLAY=:1 xdotool keydown w
 DISPLAY=:1 xdotool sleep 0.8
@@ -627,6 +634,10 @@ else
 fi
 ```
 
+`stdbuf -oL` is an evidence mechanic: it makes the controller's live mesh-load
+line observable before the identity-checked SIGTERM. It execs the same final
+binary under the recorded PID and does not change controller or input logic.
+
 Expected: one live window accepts forward, backward, lateral, diagonal,
 Ctrl-strafe, camera, mesh-toggle, and bone-toggle events without exiting or
 printing an error. The identity-checked smoke process then terminates cleanly.
@@ -647,16 +658,24 @@ Expected: the plan checkpoint is pushed and the worktree is clean.
 - [x] **Step 5: Launch exactly one user visualizer on mixed terrain**
 
 ```bash
-nohup env \
+nohup setsid env \
   DISPLAY=:1 \
   G1_TERRAIN_DIR=/home/ubuntu/projects/motion-matching/resources/g1_terrain \
   MM_TERRAIN_SCENE=mixed-multilevel \
-  /tmp/g1-playable-mesh-final/controller-g1-playable \
+  stdbuf -oL /tmp/g1-playable-mesh-final/controller-g1-playable \
   >/tmp/g1-playable-mesh-final/user.out \
-  2>/tmp/g1-playable-mesh-final/user.err &
+  2>/tmp/g1-playable-mesh-final/user.err \
+  </dev/null &
 user_pid=$!
 
 printf '%s\n' "$user_pid" >/tmp/g1-playable-mesh-final/user.pid
+```
+
+After the launching shell returns, run the proof from a separate shell:
+
+```bash
+sleep 2
+user_pid=$(cat /tmp/g1-playable-mesh-final/user.pid)
 for attempt in $(seq 1 100); do
   test -e "/proc/$user_pid/exe" && break
   sleep 0.1
@@ -664,10 +683,53 @@ done
 test "$(readlink -f "/proc/$user_pid/exe")" = \
   /tmp/g1-playable-mesh-final/controller-g1-playable
 kill -0 "$user_pid"
+for attempt in $(seq 1 100); do
+  rg -q -F 'G1 mesh loaded: 35 parts' \
+    /tmp/g1-playable-mesh-final/user.out && break
+  sleep 0.1
+done
 rg -F 'G1 mesh loaded: 35 parts' \
   /tmp/g1-playable-mesh-final/user.out
 test ! -s /tmp/g1-playable-mesh-final/user.err
+
+target=/tmp/g1-playable-mesh-final/controller-g1-playable
+count=0
+only_pid=
+for exe in /proc/[0-9]*/exe; do
+  link=$(readlink -f "$exe" 2>/dev/null) || continue
+  if test "$link" = "$target" || test "$link" = "$target (deleted)"; then
+    pid=${exe#/proc/}
+    pid=${pid%/exe}
+    count=$((count + 1))
+    only_pid=$pid
+  fi
+done
+test "$count" -eq 1
+test "$only_pid" = "$user_pid"
+
+client_lines=
+for attempt in $(seq 1 100); do
+  client_lines=$(DISPLAY=:1 wmctrl -lp | awk -v pid="$user_pid" \
+    -v title='G1 terrain motion matching - Holden runtime' \
+    '$3 == pid && index($0, title) {print}')
+  test -n "$client_lines" && break
+  sleep 0.1
+done
+client_count=$(printf '%s\n' "$client_lines" | sed '/^$/d' | wc -l)
+test "$client_count" -eq 1
+client_xid=$(printf '%s\n' "$client_lines" | awk '{print $1}')
+client_pid=$(DISPLAY=:1 xprop -id "$client_xid" _NET_WM_PID | \
+  sed -n 's/.* = //p')
+test "$client_pid" = "$user_pid"
 ```
+
+Plain `setsid` (without `--fork`) and `</dev/null` are lifetime mechanics: they
+let the final binary survive the launching shell and preserve `$!` as the PID
+that is immediately verified through `/proc`. `stdbuf -oL` only exposes the
+live mesh-load evidence. None changes runtime logic. The window gate counts one
+real client through `wmctrl` and binds its XID to `_NET_WM_PID`; it deliberately
+does not require one Xdotool result because Mutter also exposes a decoration
+window for the same client.
 
 Expected: exactly one new window remains alive with the classic UI and
 corrected G1 mesh. The user can use WASD, arrows, Left Ctrl strafe, Left Shift
