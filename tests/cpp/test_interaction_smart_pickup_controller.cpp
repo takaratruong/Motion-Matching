@@ -1099,6 +1099,204 @@ void test_pending_activation_owns_cancel_edge() {
         "pending cancellation left activation work for post-step");
 }
 
+void test_pending_activation_yields_to_manual_override() {
+    interaction::InteractionTarget target = make_controller_target();
+    CountingAssistBackend backend;
+    interaction::SmartPickupController controller(backend);
+
+    const interaction::SmartPickupPreStepResult activation =
+        controller.pre_step(make_pre_input(&target, true));
+    require(
+        activation.interact_consumed && backend.begin_calls == 0U,
+        "pending-manual-override fixture did not capture its activation");
+
+    interaction::SmartPickupPreStepInput override =
+        make_pre_input(&target, false);
+    override.manual_override_pressed = true;
+    override.left_stick = vec3(-0.14F, 0.0F, 0.82F);
+    override.right_stick = vec3(0.91F, 0.0F, -0.36F);
+    override.force_strafe = true;
+    const interaction::SmartPickupPreStepResult cancelled =
+        controller.pre_step(override);
+    require(
+        cancelled.manual_override_consumed &&
+            !cancelled.cancel_consumed &&
+            !cancelled.interact_consumed &&
+            same_vec3_bits(cancelled.left_stick, override.left_stick) &&
+            same_vec3_bits(cancelled.right_stick, override.right_stick) &&
+            cancelled.force_strafe == override.force_strafe &&
+            backend.cancel_calls == 1U && backend.begin_calls == 0U,
+        "pending Smart Pickup did not return manual control");
+
+    CallerOrderHarness locomotion;
+    const interaction::LocomotionSnapshot snapshot =
+        locomotion.step(cancelled);
+    uint32_t preview_calls = 0U;
+    const interaction::SmartPickupPostStepResult post =
+        controller.post_step(
+            make_post_input(snapshot, &target),
+            rejecting_preview_counter(preview_calls));
+    require(
+        backend.begin_calls == 0U && backend.observe_calls == 0U &&
+            backend.take_submission_calls == 0U && preview_calls == 0U &&
+            !post.pick_request.has_value(),
+        "pending manual override left assist work for post-step");
+}
+
+void test_active_assist_yields_to_manual_override() {
+    interaction::InteractionTarget target = make_controller_target();
+    CountingAssistBackend backend;
+    interaction::SmartPickupController controller(backend);
+    CallerOrderHarness locomotion;
+    locomotion.stick_displacement_scale = 0.0F;
+    uint32_t preview_calls = 0U;
+
+    const interaction::SmartPickupPreStepResult activation =
+        controller.pre_step(make_pre_input(&target, true));
+    const interaction::LocomotionSnapshot activation_snapshot =
+        locomotion.step(activation);
+    const interaction::SmartPickupPostStepResult began =
+        controller.post_step(
+            make_post_input(activation_snapshot, &target),
+            rejecting_preview_counter(preview_calls));
+    require(
+        backend.begin_calls == 1U && backend.observe_calls == 1U &&
+            began.assist_output.override_steering && preview_calls == 0U,
+        "active-manual-override fixture did not begin its assist");
+
+    interaction::SmartPickupPreStepInput override =
+        make_pre_input(&target, false);
+    override.manual_override_pressed = true;
+    override.left_stick = vec3(0.13F, 0.0F, -0.77F);
+    override.right_stick = vec3(-0.42F, 0.0F, 0.19F);
+    override.force_strafe = true;
+    const interaction::SmartPickupPreStepResult cancelled =
+        controller.pre_step(override);
+    require(
+        cancelled.manual_override_consumed &&
+            !cancelled.cancel_consumed &&
+            !cancelled.interact_consumed &&
+            same_vec3_bits(cancelled.left_stick, override.left_stick) &&
+            same_vec3_bits(cancelled.right_stick, override.right_stick) &&
+            cancelled.force_strafe == override.force_strafe &&
+            backend.cancel_calls == 1U && backend.begin_calls == 1U &&
+            backend.observe_calls == 1U,
+        "active Smart Pickup did not return manual control");
+
+    const interaction::LocomotionSnapshot cancelled_snapshot =
+        locomotion.step(cancelled);
+    const interaction::SmartPickupPostStepResult cancelled_post =
+        controller.post_step(
+            make_post_input(cancelled_snapshot, &target),
+            rejecting_preview_counter(preview_calls));
+    require(
+        backend.begin_calls == 1U && backend.observe_calls == 1U &&
+            backend.take_submission_calls == 0U && preview_calls == 0U &&
+            !cancelled_post.pick_request.has_value(),
+        "active manual override produced post-step assist work");
+}
+
+void test_idle_interact_activation_wins_over_manual_override() {
+    interaction::InteractionTarget target = make_controller_target();
+    CountingAssistBackend backend;
+    interaction::SmartPickupController controller(backend);
+
+    interaction::SmartPickupPreStepInput input =
+        make_pre_input(&target, true);
+    input.manual_override_pressed = true;
+    const interaction::SmartPickupPreStepResult activation =
+        controller.pre_step(input);
+    require(
+        activation.interact_consumed &&
+            !activation.cancel_consumed &&
+            !activation.manual_override_consumed &&
+            is_zero(activation.left_stick) &&
+            is_zero(activation.right_stick) &&
+            !activation.force_strafe && backend.cancel_calls == 0U &&
+            backend.begin_calls == 0U,
+        "idle simultaneous F and movement did not give activation precedence");
+
+    CallerOrderHarness locomotion;
+    const interaction::LocomotionSnapshot snapshot =
+        locomotion.step(activation);
+    uint32_t preview_calls = 0U;
+    const interaction::SmartPickupPostStepResult post =
+        controller.post_step(
+            make_post_input(snapshot, &target),
+            rejecting_preview_counter(preview_calls));
+    require(
+        backend.begin_calls == 1U && backend.observe_calls == 1U &&
+            backend.take_submission_calls == 0U && preview_calls == 0U &&
+            !post.pick_request.has_value(),
+        "idle simultaneous F and movement cancelled the new activation");
+}
+
+void test_manual_override_passes_through_without_existing_ownership() {
+    interaction::InteractionTarget target = make_controller_target();
+    {
+        CountingAssistBackend backend;
+        interaction::SmartPickupController controller(backend);
+        interaction::SmartPickupPreStepInput input =
+            make_pre_input(&target, false);
+        input.manual_override_pressed = true;
+        input.force_strafe = true;
+        const interaction::SmartPickupPreStepResult result =
+            controller.pre_step(input);
+        require(
+            !result.manual_override_consumed &&
+                !result.cancel_consumed && !result.interact_consumed &&
+                same_vec3_bits(result.left_stick, input.left_stick) &&
+                same_vec3_bits(result.right_stick, input.right_stick) &&
+                result.force_strafe == input.force_strafe &&
+                backend.cancel_calls == 0U &&
+                controller.diagnostics().state ==
+                    interaction::PickAssistState::Idle,
+            "idle pickup assist consumed manual movement");
+    }
+    {
+        InactiveStateAssistBackend backend(
+            interaction::PickAssistState::Failed);
+        interaction::SmartPickupController controller(backend);
+        interaction::SmartPickupPreStepInput input =
+            make_pre_input(&target, false);
+        input.manual_override_pressed = true;
+        input.force_strafe = true;
+        const interaction::SmartPickupPreStepResult result =
+            controller.pre_step(input);
+        require(
+            !result.manual_override_consumed &&
+                !result.cancel_consumed && !result.interact_consumed &&
+                same_vec3_bits(result.left_stick, input.left_stick) &&
+                same_vec3_bits(result.right_stick, input.right_stick) &&
+                result.force_strafe == input.force_strafe &&
+                backend.cancel_calls == 0U &&
+                controller.diagnostics().state ==
+                    interaction::PickAssistState::Failed,
+            "failed inactive pickup assist consumed manual movement");
+    }
+    {
+        InactiveStateAssistBackend backend(
+            interaction::PickAssistState::Submitted);
+        interaction::SmartPickupController controller(backend);
+        interaction::SmartPickupPreStepInput input =
+            make_pre_input(&target, false);
+        input.manual_override_pressed = true;
+        input.force_strafe = true;
+        const interaction::SmartPickupPreStepResult result =
+            controller.pre_step(input);
+        require(
+            !result.manual_override_consumed &&
+                !result.cancel_consumed && !result.interact_consumed &&
+                same_vec3_bits(result.left_stick, input.left_stick) &&
+                same_vec3_bits(result.right_stick, input.right_stick) &&
+                result.force_strafe == input.force_strafe &&
+                backend.cancel_calls == 0U &&
+                controller.diagnostics().state ==
+                    interaction::PickAssistState::Submitted,
+            "submitted inactive pickup assist consumed manual movement");
+    }
+}
+
 void test_simultaneous_cancel_wins_without_pending_or_observation() {
     interaction::InteractionTarget target = make_controller_target();
     CountingAssistBackend backend;
@@ -1624,6 +1822,10 @@ int main() {
     test_target_disappearing_during_step_is_observed_once_and_fails();
     test_cancel_passes_through_without_smart_pickup_ownership();
     test_pending_activation_owns_cancel_edge();
+    test_pending_activation_yields_to_manual_override();
+    test_active_assist_yields_to_manual_override();
+    test_idle_interact_activation_wins_over_manual_override();
+    test_manual_override_passes_through_without_existing_ownership();
     test_simultaneous_cancel_wins_without_pending_or_observation();
     test_active_assist_owns_sticks_while_camera_and_cancel_remain_live();
     test_active_repeated_f_is_consumed_without_restarting_assist();

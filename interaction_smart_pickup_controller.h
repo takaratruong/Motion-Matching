@@ -37,6 +37,7 @@ struct SmartPickupPreStepInput {
     RuntimeState runtime_state = RuntimeState::Locomotion;
     bool interact_pressed = false;
     bool cancel_pressed = false;
+    bool manual_override_pressed = false;
     const InteractionTarget* selected_target = nullptr;
     std::optional<uint32_t> selected_affordance_id{};
     vec3 left_stick{};
@@ -47,6 +48,7 @@ struct SmartPickupPreStepInput {
 struct SmartPickupPreStepResult {
     bool interact_consumed = false;
     bool cancel_consumed = false;
+    bool manual_override_consumed = false;
     vec3 left_stick{};
     vec3 right_stick{};
     bool force_strafe = false;

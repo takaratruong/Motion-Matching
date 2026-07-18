@@ -98,6 +98,19 @@ SmartPickupPreStepResult SmartPickupController::pre_step(
         return result;
     }
 
+    const bool owns_existing_attempt =
+        pending_activation_.has_value() ||
+        backend_->active() ||
+        backend_->owns_manual_interact();
+    if (input.manual_override_pressed && owns_existing_attempt) {
+        pending_activation_.reset();
+        previous_assist_output_ = {};
+        backend_->cancel();
+        result.manual_override_consumed = true;
+        result.interact_consumed = input.interact_pressed;
+        return result;
+    }
+
     if (pending_activation_.has_value()) {
         result.interact_consumed = input.interact_pressed;
         result.left_stick = {};
