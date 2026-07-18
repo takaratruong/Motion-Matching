@@ -523,6 +523,116 @@ class ExtractSlotCandidateTransformAndCompatibilityTests(unittest.TestCase):
         self.assertLessEqual(orientation_error, 1.0e-6)
         _assert_gate_counts(self, report)
 
+    def test_alignment_uses_contact_minus_one_yaws_and_preserves_source_y(self):
+        artifact, manifest = _two_clip_artifact_and_manifest()
+        source = slice(0, _CLIP_FRAMES)
+        target = slice(_CLIP_FRAMES, 2 * _CLIP_FRAMES)
+        source_object_position = np.array(
+            [-2.0, -1.5, 1.0], np.float32
+        )
+        target_object_position = np.array(
+            [5.0, 2.5, -4.0], np.float32
+        )
+        source_object_yaw = np.float32(np.deg2rad(35.0))
+        target_object_yaw = np.float32(np.deg2rad(-70.0))
+        source_object_rotation = _yaw_quaternion(source_object_yaw)
+        target_object_rotation = _yaw_quaternion(target_object_yaw)
+        target_grasp_position = np.array(
+            [0.3, -0.4, 0.2], np.float32
+        )
+        target_grasp_rotation = _axis_angle_quaternion(
+            [1.0, 0.0, 0.0], np.deg2rad(30.0)
+        )
+
+        artifact.object_positions[source] = source_object_position
+        artifact.object_positions[target] = target_object_position
+        artifact.object_rotations[source] = source_object_rotation
+        artifact.object_rotations[target] = target_object_rotation
+        # Contact is poison: alignment authority is Contact-minus-one.
+        artifact.object_positions[3] = np.array(
+            [100.0, -50.0, 200.0], np.float32
+        )
+        artifact.object_positions[13] = np.array(
+            [-100.0, 50.0, -200.0], np.float32
+        )
+        artifact.object_rotations[3] = _yaw_quaternion(
+            np.deg2rad(155.0)
+        )
+        artifact.object_rotations[13] = _yaw_quaternion(
+            np.deg2rad(115.0)
+        )
+        artifact.grasp_positions_object[1] = target_grasp_position
+        artifact.grasp_rotations_object[1] = target_grasp_rotation
+        artifact.grasp_positions_object[0] = np.array(
+            [-6.0, 5.0, -4.0], np.float32
+        )
+        artifact.grasp_rotations_object[0] = _axis_angle_quaternion(
+            [0.0, 1.0, 1.0], np.deg2rad(80.0)
+        )
+
+        target_hand = target_object_position + _rotate_y(
+            target_grasp_position, target_object_yaw
+        )
+        source_hand = source_object_position + _rotate_y(
+            target_grasp_position, source_object_yaw
+        )
+        # Candidate grasp metadata is measured, not trusted. Authoring the
+        # recorded wrist at the target-required Y makes yaw-only alignment
+        # correct; a full object-Y translation would introduce a 4 m error.
+        source_hand[1] = target_hand[1]
+        source_hand_rotation = _quaternion_multiply(
+            source_object_rotation, target_grasp_rotation
+        )
+        target_hand_rotation = _quaternion_multiply(
+            target_object_rotation, target_grasp_rotation
+        )
+
+        expected_root_x = np.float32(1.25)
+        expected_root_z = np.float32(-0.75)
+        expected_root_yaw = np.float32(np.deg2rad(-25.0))
+        source_root = source_object_position + _rotate_y(
+            [expected_root_x, 0.0, expected_root_z],
+            source_object_yaw,
+        )
+        source_root[1] = np.float32(6.25)
+        artifact.positions[source, 0] = source_root
+        artifact.rotations[1, 0] = _yaw_quaternion(
+            source_object_yaw + expected_root_yaw
+        )
+        artifact.positions[3:_CLIP_FRAMES, _RIGHT_WRIST] = (
+            source_hand - source_root
+        )
+        artifact.rotations[3:_CLIP_FRAMES, _RIGHT_WRIST] = (
+            source_hand_rotation
+        )
+        artifact.positions[13:, _RIGHT_WRIST] = (
+            target_hand - artifact.positions[13, 0]
+        )
+        artifact.rotations[13:, _RIGHT_WRIST] = target_hand_rotation
+
+        report = extract_slot_candidates(
+            artifact, manifest, _TARGET_SEQUENCE
+        )
+        candidate = _candidate(report, _SOURCE_SEQUENCE)
+
+        self.assertAlmostEqual(
+            candidate["root_x_object_m"], float(expected_root_x), places=6
+        )
+        self.assertAlmostEqual(
+            candidate["root_z_object_m"], float(expected_root_z), places=6
+        )
+        self.assertAlmostEqual(
+            candidate["root_yaw_object_radians"],
+            float(expected_root_yaw),
+            places=6,
+        )
+        self.assertLessEqual(
+            candidate["contact_hand_position_error_m"], 1.0e-6
+        )
+        self.assertLessEqual(
+            candidate["contact_hand_orientation_error_radians"], 1.0e-6
+        )
+
     def test_root_yaw_is_wrapped_across_positive_pi(self):
         artifact, manifest = _two_clip_artifact_and_manifest()
         artifact.rotations[1, 0] = _yaw_quaternion(np.deg2rad(200.0))
@@ -746,7 +856,7 @@ class ExtractSlotGeometryBoundaryTests(unittest.TestCase):
 
 
 class ExtractSlotCandidatePathGateTests(unittest.TestCase):
-    def test_entry_clear_candidate_is_rejected_when_hold_root_hits_table(self):
+    def test_entry_clear_candidate_is_rejected_when_stop_minus_one_root_hits_table(self):
         artifact, manifest = _two_clip_artifact_and_manifest()
         artifact.table_positions[1] = np.array(
             [5.0, 0.0, 1.0], np.float32
@@ -754,7 +864,8 @@ class ExtractSlotCandidatePathGateTests(unittest.TestCase):
         artifact.table_sizes[1] = np.array(
             [0.02, 0.02, 0.02], np.float32
         )
-        artifact.positions[5, 0] = np.array([2.0, 1.0, 0.0], np.float32)
+        # Local frame 9 is stop - 1 and remains in Hold.
+        artifact.positions[9, 0] = np.array([2.0, 1.0, 0.0], np.float32)
 
         table_position = artifact.table_positions[1]
         table_rotation = artifact.table_rotations[1]
