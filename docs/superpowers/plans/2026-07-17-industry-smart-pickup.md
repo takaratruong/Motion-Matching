@@ -975,7 +975,7 @@ Make, and raylib for the final native visualization only.
   This tool is offline authoring support. No C++ runtime target, controller, or
   Make runtime source list may import or execute it.
 
-- [ ] **Step 1: Write failing synthetic stable-identity and phase tests**
+- [x] **Step 1: Write failing synthetic stable-identity and phase tests**
 
   Build a two-clip `InteractionArtifact` fixture with manifest clips deliberately
   supplied out of caller order. Assert extraction:
