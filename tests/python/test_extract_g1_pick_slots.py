@@ -29,6 +29,7 @@ _RIGHT_WRIST = 30
 _HAND_POSITION_LIMIT_M = np.float32(0.12)
 _HAND_ORIENTATION_LIMIT_RADIANS = np.float32(np.deg2rad(25.0))
 _CLEARANCE_RADIUS_M = np.float32(0.04)
+_ROOT_TABLE_EXPANSION_M = np.float32(0.25) - np.float32(0.01)
 _REJECTED_GATE_ORDER = (
     "hand_mismatch",
     "contact_position",
@@ -621,23 +622,21 @@ class ExtractSlotCandidateTransformAndCompatibilityTests(unittest.TestCase):
 
 
 class ExtractSlotGeometryBoundaryTests(unittest.TestCase):
-    def test_yawed_table_root_boundary_is_closed_at_effective_point_two_four(self):
-        table_position = np.zeros(3, np.float32)
-        table_rotation = _yaw_quaternion(np.float32(np.pi / 2.0))
-        table_size = np.array([2.0, 0.1, 4.0], np.float32)
-        effective_half_x = np.float32(
-            np.float32(0.5) * table_size[0] + np.float32(0.24)
+    def test_identity_table_root_boundary_is_closed_in_float64(self):
+        table_position = np.zeros(3, np.float64)
+        table_rotation = _IDENTITY.astype(np.float64)
+        table_size = np.array([2.0, 0.1, 4.0], np.float64)
+        effective_half_x = (
+            np.float64(0.5) * np.float64(table_size[0])
+            + np.float64(_ROOT_TABLE_EXPANSION_M)
         )
-        outward_half_x = np.nextafter(
-            effective_half_x, np.float32(np.inf)
-        )
-
-        # A +90-degree table yaw maps local +X to world -Z. Root height is
-        # deliberately irrelevant: this proxy is planar.
+        outward_half_x = np.nextafter(effective_half_x, np.inf)
         boundary = np.array(
-            [0.0, 37.0, -effective_half_x], np.float32
+            [effective_half_x, 37.0, 0.0], np.float64
         )
-        outward = np.array([0.0, 37.0, -outward_half_x], np.float32)
+        outward = np.array(
+            [outward_half_x, 37.0, 0.0], np.float64
+        )
 
         self.assertTrue(
             _root_intersects_table(
@@ -650,30 +649,46 @@ class ExtractSlotGeometryBoundaryTests(unittest.TestCase):
             )
         )
 
-    def test_fully_oriented_box_tangent_is_closed_at_point_zero_four(self):
-        box_position = np.zeros(3, np.float32)
-        # This normalized quaternion rotates local (x, y, z) to world
-        # (z, x, y), exercising all three axes rather than yaw alone.
-        box_rotation = np.array([0.5, 0.5, 0.5, 0.5], np.float32)
-        box_size = np.array([2.0, 4.0, 6.0], np.float32)
-        effective_half_x = np.float32(
-            np.float32(0.5) * box_size[0] + _CLEARANCE_RADIUS_M
+    def test_yawed_table_maps_interior_and_clear_points_away_from_boundary(self):
+        table_position = np.array([3.0, 0.0, -2.0], np.float64)
+        table_rotation = _yaw_quaternion(np.pi / 2.0).astype(np.float64)
+        table_size = np.array([2.0, 0.1, 4.0], np.float64)
+        # A +90-degree table yaw maps local +X to world -Z.
+        interior = np.array([3.0, 37.0, -2.5], np.float64)
+        clear = np.array([3.0, 37.0, -3.5], np.float64)
+
+        self.assertTrue(
+            _root_intersects_table(
+                interior, table_position, table_rotation, table_size
+            )
         )
-        outward_half_x = np.nextafter(
-            effective_half_x, np.float32(np.inf)
+        self.assertFalse(
+            _root_intersects_table(
+                clear, table_position, table_rotation, table_size
+            )
         )
 
+    def test_identity_box_tangent_is_closed_in_float64(self):
+        box_position = np.zeros(3, np.float64)
+        box_rotation = _IDENTITY.astype(np.float64)
+        box_size = np.array([2.0, 4.0, 6.0], np.float64)
+        expansion = np.float64(_CLEARANCE_RADIUS_M)
+        effective_half_x = (
+            np.float64(0.5) * np.float64(box_size[0])
+            + np.float64(_CLEARANCE_RADIUS_M)
+        )
+        outward_half_x = np.nextafter(effective_half_x, np.inf)
         boundary_start = np.array(
-            [0.0, effective_half_x, -3.0], np.float32
+            [effective_half_x, -3.0, 0.0], np.float64
         )
         boundary_stop = np.array(
-            [0.0, effective_half_x, 3.0], np.float32
+            [effective_half_x, 3.0, 0.0], np.float64
         )
         outward_start = np.array(
-            [0.0, outward_half_x, -3.0], np.float32
+            [outward_half_x, -3.0, 0.0], np.float64
         )
         outward_stop = np.array(
-            [0.0, outward_half_x, 3.0], np.float32
+            [outward_half_x, 3.0, 0.0], np.float64
         )
 
         self.assertTrue(
@@ -683,7 +698,7 @@ class ExtractSlotGeometryBoundaryTests(unittest.TestCase):
                 box_position,
                 box_rotation,
                 box_size,
-                _CLEARANCE_RADIUS_M,
+                expansion,
             )
         )
         self.assertFalse(
@@ -693,7 +708,39 @@ class ExtractSlotGeometryBoundaryTests(unittest.TestCase):
                 box_position,
                 box_rotation,
                 box_size,
-                _CLEARANCE_RADIUS_M,
+                expansion,
+            )
+        )
+
+    def test_fully_oriented_box_maps_interior_and_clear_segments(self):
+        box_position = np.zeros(3, np.float64)
+        # Exact permutation: local (x, y, z) maps to world (z, x, y).
+        box_rotation = np.array([0.5, 0.5, 0.5, 0.5], np.float64)
+        box_size = np.array([2.0, 4.0, 6.0], np.float64)
+        expansion = np.float64(_CLEARANCE_RADIUS_M)
+        interior_start = np.array([0.0, 0.5, -3.0], np.float64)
+        interior_stop = np.array([0.0, 0.5, 3.0], np.float64)
+        clear_start = np.array([0.0, 1.5, -3.0], np.float64)
+        clear_stop = np.array([0.0, 1.5, 3.0], np.float64)
+
+        self.assertTrue(
+            _segment_intersects_expanded_box(
+                interior_start,
+                interior_stop,
+                box_position,
+                box_rotation,
+                box_size,
+                expansion,
+            )
+        )
+        self.assertFalse(
+            _segment_intersects_expanded_box(
+                clear_start,
+                clear_stop,
+                box_position,
+                box_rotation,
+                box_size,
+                expansion,
             )
         )
 
@@ -862,6 +909,99 @@ class ExtractSlotCandidatePathGateTests(unittest.TestCase):
         )
 
         _assert_source_rejected(self, report, "contact_position")
+
+    def test_contact_orientation_precedes_root_and_hand_table_collisions(self):
+        artifact, manifest = _two_clip_artifact_and_manifest()
+        over_limit, measured_error = _orientation_boundary_quaternion(True)
+        self.assertGreater(
+            measured_error, _HAND_ORIENTATION_LIMIT_RADIANS
+        )
+        artifact.rotations[3:_CLIP_FRAMES, _RIGHT_WRIST] = over_limit
+        artifact.table_positions[1] = np.array(
+            [3.0, 1.0, 1.0], np.float32
+        )
+        artifact.table_sizes[1] = np.array(
+            [0.02, 0.02, 0.02], np.float32
+        )
+        mapped_entry = np.array([3.0, 1.0, 1.0], np.float32)
+        self.assertTrue(
+            _root_intersects_table(
+                mapped_entry,
+                artifact.table_positions[1],
+                artifact.table_rotations[1],
+                artifact.table_sizes[1],
+            )
+        )
+        self.assertTrue(
+            _segment_intersects_expanded_box(
+                mapped_entry,
+                mapped_entry,
+                artifact.table_positions[1],
+                artifact.table_rotations[1],
+                artifact.table_sizes[1],
+                _CLEARANCE_RADIUS_M,
+            )
+        )
+
+        report = extract_slot_candidates(
+            artifact, manifest, _TARGET_SEQUENCE
+        )
+
+        _assert_source_rejected(self, report, "contact_orientation")
+
+    def test_root_table_precedes_hand_table_and_object_collisions(self):
+        artifact, manifest = _two_clip_artifact_and_manifest()
+        mapped_start = np.array([3.9, 1.0, 2.7], np.float32)
+        mapped_stop = np.array([4.1, 1.2, 3.3], np.float32)
+        scene_translation = np.array([3.0, 0.0, 1.0], np.float32)
+        _set_source_wrist_world(
+            artifact, 1, mapped_start - scene_translation
+        )
+        _set_source_wrist_world(
+            artifact, 2, mapped_stop - scene_translation
+        )
+        artifact.table_positions[1] = np.array(
+            [4.0, 1.0, 3.0], np.float32
+        )
+        artifact.table_sizes[1] = np.array(
+            [2.0, 0.02, 4.0], np.float32
+        )
+        self.assertTrue(
+            _root_intersects_table(
+                np.array([3.0, 1.0, 1.0], np.float32),
+                artifact.table_positions[1],
+                artifact.table_rotations[1],
+                artifact.table_sizes[1],
+            )
+        )
+        for position, rotation, size in (
+            (
+                artifact.table_positions[1],
+                artifact.table_rotations[1],
+                artifact.table_sizes[1],
+            ),
+            (
+                artifact.object_positions[12],
+                artifact.object_rotations[12],
+                artifact.object_dimensions[1],
+            ),
+        ):
+            self.assertTrue(
+                _segment_intersects_expanded_box(
+                    mapped_start,
+                    mapped_stop,
+                    position,
+                    rotation,
+                    size,
+                    _CLEARANCE_RADIUS_M,
+                )
+            )
+
+        report = extract_slot_candidates(
+            artifact, manifest, _TARGET_SEQUENCE
+        )
+
+        _assert_source_rejected(self, report, "root_table")
 
 
 class ExtractSlotCandidateValidationTests(unittest.TestCase):
