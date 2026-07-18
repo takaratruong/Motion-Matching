@@ -5991,7 +5991,8 @@ void test_debug_draw_uses_real_correction_geometry_and_complete_text() {
            std::string::npos);
     assert(debug.find("actual fit=%d gap=%.3f low/high=%.3f/%.3f") !=
            std::string::npos);
-    assert(debug.find("Interaction: F pick/place  X cancel  R reset") !=
+    assert(debug.find(
+               "Interaction: F smart pickup/place  WASD/X cancel auto  R reset") !=
            std::string::npos);
 }
 
@@ -6022,6 +6023,31 @@ void test_controller_smart_pickup_two_phase_production_seam() {
             controller,
             "interaction::LocomotionSnapshot live_flat_snapshot") == 1U,
         "controller has more than one post-step live-flat snapshot");
+
+    const size_t press_edges_begin = controller.find(
+        "        // Press edges and runtime updates share the fixed 25 Hz controller");
+    const size_t cached_runtime_state = controller.find(
+        "        const interaction::RuntimeState cached_interaction_state =",
+        press_edges_begin);
+    require(
+        press_edges_begin != std::string::npos &&
+            cached_runtime_state != std::string::npos &&
+            press_edges_begin < cached_runtime_state,
+        "controller lost the bounded 25 Hz press-edge seam");
+    const std::string press_edges = controller.substr(
+        press_edges_begin, cached_runtime_state - press_edges_begin);
+    const std::string compact_press_edges =
+        without_ascii_whitespace(press_edges);
+    require(
+        occurrence_count(
+            press_edges,
+            "const bool manual_smart_pickup_override_pressed") == 1U &&
+            compact_press_edges.find(
+                "constboolmanual_smart_pickup_override_pressed="
+                "IsKeyPressed(KEY_W)||IsKeyPressed(KEY_A)||"
+                "IsKeyPressed(KEY_S)||IsKeyPressed(KEY_D);") !=
+                std::string::npos,
+        "manual Smart Pickup override is not one bounded WASD press edge");
 
     const size_t manual_input_begin = controller.find(
         "        // Manual pick-assist input begins.");
@@ -6057,6 +6083,12 @@ void test_controller_smart_pickup_two_phase_production_seam() {
                 std::string::npos,
         "R reset is not forwarded as coordinator cancel while remaining "
         "scheduler-owned");
+    require(
+        compact_manual_input.find(
+            "manual_smart_pickup_pre_input.manual_override_pressed="
+            "manual_smart_pickup_override_pressed;") !=
+            std::string::npos,
+        "bounded WASD edge is not forwarded to Smart Pickup pre-step");
 
     require(
         compact_manual_input.find(
@@ -6078,12 +6110,13 @@ void test_controller_smart_pickup_two_phase_production_seam() {
             controller.find("manual_pick_assist") == std::string::npos,
         "controller retains a second manual assist state machine");
 
-    const std::array<std::string, 11> ordered_pre_tokens{{
+    const std::array<std::string, 12> ordered_pre_tokens{{
         "const interaction::InteractionTarget* manual_smart_pickup_target",
         "interaction_registry.find(",
         "manual_smart_pickup_pre_input.runtime_state =",
         "manual_smart_pickup_pre_input.interact_pressed =",
         "manual_smart_pickup_pre_input.cancel_pressed =",
+        "manual_smart_pickup_pre_input.manual_override_pressed =",
         "manual_smart_pickup_pre_input.selected_target =",
         "manual_smart_pickup_pre_input.selected_affordance_id =",
         "manual_smart_pickup_pre_input.left_stick =",
@@ -6091,7 +6124,7 @@ void test_controller_smart_pickup_two_phase_production_seam() {
         "manual_smart_pickup_controller.pre_step(",
         "gamepadstick_left = manual_smart_pickup_pre_step.left_stick",
     }};
-    std::array<size_t, 11> pre_positions{};
+    std::array<size_t, 12> pre_positions{};
     for (size_t index = 0U; index < ordered_pre_tokens.size(); ++index) {
         pre_positions[index] = manual_input.find(ordered_pre_tokens[index]);
     }
@@ -6114,6 +6147,14 @@ void test_controller_smart_pickup_two_phase_production_seam() {
                 "manual_smart_pickup_controller.pre_step("
                 "manual_smart_pickup_pre_input)") != std::string::npos,
         "manual pre-step result is not applied exactly once and in order");
+    require(
+        compact_manual_input.find(
+            "if(manual_smart_pickup_pre_step.cancel_consumed||"
+            "manual_smart_pickup_pre_step.manual_override_consumed||"
+            "manual_smart_pickup_new_attempt){"
+            "manual_pick_stationary_diagnostics={};}") !=
+            std::string::npos,
+        "manual override does not reset attempt-local stationary diagnostics");
 
     const size_t pre_step = controller.find(
         "manual_smart_pickup_controller.pre_step(");
@@ -6368,6 +6409,33 @@ void test_controller_smart_pickup_two_phase_production_seam() {
             reset_guard < clear_post_output,
         "scheduler tick does not discard an unconsumed manual latch and clear "
         "persistent post output under reset");
+
+    const size_t manual_diagnostics_begin = controller.find(
+        "        // Manual pick-assist diagnostics begins.");
+    const size_t manual_diagnostics_end = controller.find(
+        "        // Manual pick-assist diagnostics ends.",
+        manual_diagnostics_begin);
+    require(
+        manual_diagnostics_begin != std::string::npos &&
+            manual_diagnostics_end != std::string::npos,
+        "controller lost the bounded manual Smart Pickup diagnostics draw");
+    const std::string compact_manual_diagnostics = without_ascii_whitespace(
+        controller.substr(
+            manual_diagnostics_begin,
+            manual_diagnostics_end - manual_diagnostics_begin));
+    require(
+        compact_manual_diagnostics.find(
+            "if(manual_pick_diagnostics.state=="
+            "interaction::PickAssistState::SlotApproach||"
+            "manual_pick_diagnostics.state=="
+            "interaction::PickAssistState::Settling||"
+            "manual_pick_diagnostics.state=="
+            "interaction::PickAssistState::FinalPreview||"
+            "manual_pick_diagnostics.state=="
+            "interaction::PickAssistState::ReadyToSubmit){"
+            "DrawText(\"SMARTPICKUPAUTO-WASDorXcancels\","
+            "340,242,18,ORANGE);}") != std::string::npos,
+        "active Smart Pickup ownership copy is missing or not state-bounded");
 
     const size_t placement_scheduler = adapter.find(
         "const PlaceTargetResolver& place_target_resolver");

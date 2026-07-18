@@ -3032,7 +3032,7 @@ class Task12PolicyTests(unittest.TestCase):
         self.assertNotIn("interaction_registry.replace_pose(", controller)
         self.assertIn("interaction_registry.find_by_id(", controller)
         self.assertIn(
-            "Interaction: F pick/place  X cancel  R reset",
+            "Interaction: F smart pickup/place  WASD/X cancel auto  R reset",
             Path("interaction_debug_draw.h").read_text(encoding="utf-8"),
         )
 
@@ -3986,15 +3986,13 @@ class Task12PolicyTests(unittest.TestCase):
         )
         self.assertRegex(
             normalized_input,
-            r"if\s*\(\s*(?:"
+            r"if\s*\(\s*"
             r"manual_smart_pickup_pre_step\.cancel_consumed\s*\|\|\s*"
-            r"manual_smart_pickup_new_attempt|"
-            r"manual_smart_pickup_new_attempt\s*\|\|\s*"
-            r"manual_smart_pickup_pre_step\.cancel_consumed"
-            r")\s*\)\s*\{?\s*"
+            r"manual_smart_pickup_pre_step\.manual_override_consumed\s*"
+            r"\|\|\s*manual_smart_pickup_new_attempt\s*\)\s*\{?\s*"
             r"manual_pick_stationary_diagnostics\s*=\s*\{\};",
-            "cancel or a diagnostic-derived new attempt must enter one shared "
-            "reset branch",
+            "cancel, manual override, or a diagnostic-derived new attempt must "
+            "enter one shared reset branch",
         )
         for active_state in (
             "PickAssistState::SlotApproach",

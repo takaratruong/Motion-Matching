@@ -4578,6 +4578,9 @@ int main(void)
                 GAMEPAD_PLAYER, GAMEPAD_BUTTON_RIGHT_FACE_UP),
             IsKeyPressed(KEY_R) || IsGamepadButtonPressed(
                 GAMEPAD_PLAYER, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT)};
+        const bool manual_smart_pickup_override_pressed =
+            IsKeyPressed(KEY_W) || IsKeyPressed(KEY_A) ||
+            IsKeyPressed(KEY_S) || IsKeyPressed(KEY_D);
         const interaction::RuntimeState cached_interaction_state =
             interaction_scheduler.cached_output().diagnostics.state;
         if (interaction_scheduler.cached_output().suppress_steering)
@@ -4943,6 +4946,8 @@ int main(void)
             manual_smart_pickup_pre_input.cancel_pressed =
                 interaction_edges.cancel_pressed ||
                 interaction_edges.reset_pressed;
+            manual_smart_pickup_pre_input.manual_override_pressed =
+                manual_smart_pickup_override_pressed;
             manual_smart_pickup_pre_input.selected_target =
                 manual_smart_pickup_target;
             if (manual_smart_pickup_target != nullptr &&
@@ -4978,6 +4983,7 @@ int main(void)
                  manual_smart_pickup_state_before_pre_step ==
                      interaction::PickAssistState::Failed);
             if (manual_smart_pickup_pre_step.cancel_consumed ||
+                manual_smart_pickup_pre_step.manual_override_consumed ||
                 manual_smart_pickup_new_attempt)
             {
                 manual_pick_stationary_diagnostics = {};
@@ -6470,6 +6476,22 @@ int main(void)
         // Manual pick-assist diagnostics begins.
         const interaction::PickAssistDiagnostics& diagnostics =
             manual_smart_pickup_controller.diagnostics();
+        if (manual_pick_diagnostics.state ==
+                interaction::PickAssistState::SlotApproach ||
+            manual_pick_diagnostics.state ==
+                interaction::PickAssistState::Settling ||
+            manual_pick_diagnostics.state ==
+                interaction::PickAssistState::FinalPreview ||
+            manual_pick_diagnostics.state ==
+                interaction::PickAssistState::ReadyToSubmit)
+        {
+            DrawText(
+                "SMART PICKUP AUTO - WASD or X cancels",
+                340,
+                242,
+                18,
+                ORANGE);
+        }
         const int manual_pick_selected_slot =
             manual_pick_diagnostics.slot_selection.selected_index.has_value()
             ? static_cast<int>(
