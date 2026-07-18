@@ -1011,7 +1011,7 @@ Make, and raylib for the final native visualization only.
   collision boundary is blocked. A candidate whose entry clears but later Hold
   root enters the expanded table must be rejected.
 
-- [ ] **Step 3: Write failing deterministic dedupe/output tests**
+- [x] **Step 3: Write failing deterministic dedupe/output tests**
 
   Feed candidates in reverse order and assert byte-identical JSON output sorted
   by stable provenance. Greedily retain a candidate unless an already-retained
@@ -1019,7 +1019,7 @@ Make, and raylib for the final native visualization only.
   `10 degrees` root yaw. Assert the report includes rejected counts by exact
   static gate and never serializes a runtime clip allowlist.
 
-- [ ] **Step 4: Run the focused tests and verify red failure**
+- [x] **Step 4: Run the focused tests and verify red failure**
 
   Run:
 
