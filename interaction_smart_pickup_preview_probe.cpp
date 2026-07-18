@@ -1,3 +1,10 @@
+#include "database.h"
+#include "interaction_controller_adapter.h"
+#include "interaction_database.h"
+#include "interaction_runtime.h"
+#include "locomotion_timing.h"
+#include "stationary_motion_matching.h"
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -30,6 +37,7 @@ constexpr uintmax_t kMaximumReportBytes = 8U * 1024U * 1024U;
 constexpr size_t kExpectedClipCount = 2045U;
 constexpr int64_t kExpectedFrameCount = 511250;
 constexpr size_t kExpectedRetainedCandidateCount = 19U;
+constexpr size_t kExpectedStationarySnapshotCount = 186U;
 constexpr int64_t kRightHand = 1;
 constexpr const char* kExpectedDatasetId =
     "nvidia/PhysicalAI-Robotics-Locomanipulation-GRAIL";
@@ -1321,6 +1329,450 @@ void validate_report_against_manifest(
     validate_candidates_against_manifest(report, manifest);
 }
 
+void validate_loaded_pack_against_manifest(
+    const interaction::Database& database,
+    const interaction::Features& features,
+    const Manifest& manifest) {
+    require(
+        database.frame_count == static_cast<uint32_t>(kExpectedFrameCount),
+        "loaded interaction database frame count differs from manifest authority");
+    require(
+        database.clip_count == manifest.clips.size() &&
+            database.range_starts.size() == manifest.clips.size() &&
+            database.range_stops.size() == manifest.clips.size() &&
+            database.active_hands.size() == manifest.clips.size(),
+        "loaded interaction database clip arrays differ from manifest count");
+    for (size_t ordinal = 0U; ordinal < manifest.clips.size(); ++ordinal) {
+        const ManifestClip& clip = manifest.clips[ordinal];
+        require(
+            database.range_starts[ordinal] == clip.range_start &&
+                database.range_stops[ordinal] == clip.range_stop,
+            "loaded interaction database range differs from manifest clip " +
+                std::to_string(ordinal));
+        require(
+            database.active_hands[ordinal] == clip.active_hand,
+            "loaded interaction database active hand differs from manifest clip " +
+                std::to_string(ordinal));
+    }
+    require(
+        features.frame_count == database.frame_count,
+        "loaded interaction features frame count differs from database");
+    require(
+        features.feature_count == 71U && features.dimension == 71U &&
+            features.group_count == 5U,
+        "loaded interaction feature dimensions differ from controller authority");
+    require(
+        features.offsets.size() == features.feature_count &&
+            features.scales.size() == features.feature_count &&
+            features.values.size() ==
+                static_cast<size_t>(features.frame_count) *
+                    static_cast<size_t>(features.feature_count),
+        "loaded interaction feature arrays have inconsistent counts");
+}
+
+vec3 report_vec3(const std::array<double, 3>& value) {
+    return vec3(
+        static_cast<float>(value[0]),
+        static_cast<float>(value[1]),
+        static_cast<float>(value[2]));
+}
+
+quat report_quat(const std::array<double, 4>& value) {
+    return quat(
+        static_cast<float>(value[0]),
+        static_cast<float>(value[1]),
+        static_cast<float>(value[2]),
+        static_cast<float>(value[3]));
+}
+
+bool exact_vec3(vec3 left, vec3 right) {
+    return left.x == right.x && left.y == right.y && left.z == right.z;
+}
+
+bool exact_quat(quat left, quat right) {
+    return left.w == right.w && left.x == right.x &&
+        left.y == right.y && left.z == right.z;
+}
+
+interaction::InteractionTarget make_report_demo_target(
+    const ReportTarget& source) {
+    require(
+        exact_quat(
+            report_quat(source.table_rotation),
+            quat(1.0F, 0.0F, 0.0F, 0.0F)),
+        "Task4 report target table rotation must be identity for demo mapping");
+    interaction::InteractionTarget target;
+    target.handle = {1U, 1U};
+    target.object_profile_id = 1U;
+    target.table_world = {
+        vec3(
+            static_cast<float>(source.table_position[0]),
+            static_cast<float>(source.table_position[1]),
+            3.0F),
+        report_quat(source.table_rotation),
+    };
+    target.table_size = report_vec3(source.table_size);
+    const double table_z_translation = 3.0 - source.table_position[2];
+    target.object_world = {
+        vec3(
+            static_cast<float>(source.object_alignment_position[0]),
+            static_cast<float>(source.object_alignment_position[1]),
+            static_cast<float>(
+                source.object_alignment_position[2] + table_z_translation)),
+        report_quat(source.object_alignment_rotation),
+    };
+    target.object_dimensions = report_vec3(source.object_dimensions);
+    target.object_bounds = {
+        vec3(), 0.5F * target.object_dimensions};
+    target.state = interaction::ObjectState::Free;
+    target.owner_request = 0U;
+
+    interaction::GraspAffordance affordance;
+    affordance.id = 1U;
+    affordance.hand = interaction::Hand::Right;
+    affordance.hand_in_object = {
+        report_vec3(source.grasp_position_object),
+        report_quat(source.grasp_rotation_object),
+    };
+    affordance.approach_direction_object =
+        report_vec3(source.approach_direction_object);
+    affordance.clearance_radius = 0.04F;
+    require(
+        affordance.interaction_slots.empty(),
+        "preview target must not bake uncertified interaction slots");
+    target.affordances.push_back(std::move(affordance));
+    return target;
+}
+
+void validate_report_demo_target(
+    const interaction::InteractionTarget& target) {
+    require(
+        target.handle == (interaction::TargetHandle{1U, 1U}) &&
+            target.object_profile_id == 1U &&
+            target.state == interaction::ObjectState::Free &&
+            target.owner_request == 0U,
+        "report-derived demo target identity/state differs");
+    require(
+        exact_vec3(
+            target.table_world.position,
+            vec3(0.0F, 0.360757500F, 3.0F)) &&
+            exact_quat(
+                target.table_world.rotation,
+                quat(1.0F, 0.0F, 0.0F, 0.0F)) &&
+            exact_vec3(
+                target.table_size,
+                vec3(2.0F, 0.0399999991F, 0.600000024F)),
+        "report-derived demo table differs from frozen beer constants");
+    require(
+        exact_vec3(
+            target.object_world.position,
+            vec3(0.00394439697F, 0.503655553F, 2.77000808716F)) &&
+            exact_quat(
+                target.object_world.rotation,
+                quat(
+                    -0.0669774629F,
+                    0.670088462F,
+                    0.0799996098F,
+                    -0.734911910F)) &&
+            exact_vec3(
+                target.object_dimensions,
+                vec3(0.0645366386F, 0.0645366609F, 0.240097240F)) &&
+            exact_vec3(target.object_bounds.center_object, vec3()) &&
+            exact_vec3(
+                target.object_bounds.half_extents_object,
+                0.5F * target.object_dimensions),
+        "report-derived demo object differs from frozen beer constants");
+    require(
+        target.affordances.size() == 1U,
+        "report-derived demo target must have exactly one affordance");
+    const interaction::GraspAffordance& affordance =
+        target.affordances.front();
+    require(
+        affordance.id == 1U &&
+            affordance.hand == interaction::Hand::Right &&
+            affordance.interaction_slots.empty() &&
+            affordance.clearance_radius == 0.04F &&
+            exact_vec3(
+                affordance.hand_in_object.position,
+                vec3(0.0930671170F, -0.119263843F, 0.0375832170F)) &&
+            exact_quat(
+                affordance.hand_in_object.rotation,
+                quat(
+                    0.308746904F,
+                    0.0609171167F,
+                    -0.155041456F,
+                    0.936443567F)) &&
+            exact_vec3(
+                affordance.approach_direction_object,
+                vec3(-0.997760296F, 0.0F, 0.0668911785F)),
+        "report-derived demo grasp differs from frozen beer constants");
+}
+
+struct RegisteredTarget {
+    interaction::TargetRegistry registry;
+    interaction::TargetHandle handle{};
+    size_t registration_count = 0U;
+};
+
+RegisteredTarget register_report_demo_target(const ReportTarget& source) {
+    const interaction::InteractionTarget authored =
+        make_report_demo_target(source);
+    validate_report_demo_target(authored);
+    RegisteredTarget result;
+    result.handle = result.registry.upsert(authored);
+    ++result.registration_count;
+    require(
+        result.registration_count == 1U && result.handle == authored.handle,
+        "preview target must be registered exactly once with handle {1,1}");
+    const interaction::InteractionTarget* found =
+        result.registry.find(result.handle);
+    require(
+        found != nullptr &&
+            result.registry.find_by_id(result.handle.id) == found &&
+            interaction::same_interaction_target_snapshot(*found, authored),
+        "registered preview target lookup differs from authored snapshot");
+    return result;
+}
+
+int containing_flat_clip_stop(const database& flat_database, int frame) {
+    for (int range = 0; range < flat_database.nranges(); ++range) {
+        if (frame >= flat_database.range_starts(range) &&
+            frame < flat_database.range_stops(range)) {
+            return flat_database.range_stops(range);
+        }
+    }
+    return -1;
+}
+
+void validate_flat_database_shape(const database& flat_database) {
+    require(flat_database.nframes() > 0, "flat database has no frames");
+    require(
+        flat_database.nbones() ==
+            static_cast<int>(interaction::kFlatControllerBoneCount),
+        "flat database bone count does not match the 23-bone controller");
+    require(
+        flat_database.bone_velocities.rows == flat_database.nframes() &&
+            flat_database.bone_velocities.cols == flat_database.nbones() &&
+            flat_database.bone_rotations.rows == flat_database.nframes() &&
+            flat_database.bone_rotations.cols == flat_database.nbones() &&
+            flat_database.bone_angular_velocities.rows ==
+                flat_database.nframes() &&
+            flat_database.bone_angular_velocities.cols ==
+                flat_database.nbones() &&
+            flat_database.contact_states.rows == flat_database.nframes() &&
+            flat_database.contact_states.cols >= 2,
+        "flat database pose arrays have inconsistent shapes");
+    require(
+        flat_database.bone_parents.size ==
+            static_cast<int>(interaction::kFlatControllerBoneCount),
+        "flat database parent count does not match the 23-bone controller");
+    for (size_t bone = 0U;
+         bone < interaction::kFlatControllerBoneCount;
+         ++bone) {
+        require(
+            flat_database.bone_parents(static_cast<int>(bone)) ==
+                interaction::kFlatControllerParents[bone],
+            "flat database parent tree does not match the controller");
+    }
+}
+
+interaction::Pose make_interaction_reference(
+    const interaction::Database& interaction_database) {
+    require(
+        interaction_database.clip_count > 0U &&
+            !interaction_database.range_starts.empty(),
+        "interaction pack has no reference frame");
+    interaction::Pose reference = interaction::pose_at_frame(
+        interaction_database, interaction_database.range_starts.at(0U));
+    reference.velocities.fill(vec3());
+    reference.angular_velocities.fill(vec3());
+    reference.hand_dof = interaction::kFlatControllerRestHandDof;
+    reference.hand_dof_velocities =
+        interaction::kFlatControllerRestHandDofVelocities;
+    reference.foot_contacts = {};
+    return reference;
+}
+
+interaction::FlatControllerPose flat_pose_at(
+    const database& flat_database,
+    int frame) {
+    require(
+        frame >= 0 && frame < flat_database.nframes(),
+        "flat pose frame is out of range");
+    interaction::FlatControllerPose pose{};
+    for (size_t bone = 0U;
+         bone < interaction::kFlatControllerBoneCount;
+         ++bone) {
+        const int index = static_cast<int>(bone);
+        pose.positions[bone] = flat_database.bone_positions(frame, index);
+        pose.velocities[bone] = flat_database.bone_velocities(frame, index);
+        pose.rotations[bone] = flat_database.bone_rotations(frame, index);
+        pose.angular_velocities[bone] =
+            flat_database.bone_angular_velocities(frame, index);
+    }
+    pose.foot_contacts[0] =
+        flat_database.contact_states(frame, 0) ? 1U : 0U;
+    pose.foot_contacts[1] =
+        flat_database.contact_states(frame, 1) ? 1U : 0U;
+    return pose;
+}
+
+struct FixedControllerPoseBridge {
+    interaction::FlatControllerPose flat_reference{};
+    interaction::Pose interaction_reference{};
+};
+
+FixedControllerPoseBridge make_fixed_controller_pose_bridge(
+    const database& flat_database,
+    const interaction::Database& interaction_database) {
+    require(
+        flat_database.nranges() > 0,
+        "flat database has no fixed controller reference frame");
+    FixedControllerPoseBridge bridge{};
+    bridge.flat_reference = flat_pose_at(
+        flat_database, flat_database.range_starts(0));
+    bridge.flat_reference.velocities.fill(vec3());
+    bridge.flat_reference.angular_velocities.fill(vec3());
+    bridge.flat_reference.foot_contacts = {};
+
+    bridge.interaction_reference =
+        make_interaction_reference(interaction_database);
+    constexpr size_t root = g1_skeleton::Simulation;
+    bridge.interaction_reference.positions[root] =
+        bridge.flat_reference.positions[0];
+    bridge.interaction_reference.velocities[root] =
+        bridge.flat_reference.velocities[0];
+    bridge.interaction_reference.rotations[root] =
+        bridge.flat_reference.rotations[0];
+    bridge.interaction_reference.angular_velocities[root] =
+        bridge.flat_reference.angular_velocities[0];
+    return bridge;
+}
+
+interaction::LocomotionSnapshot make_stationary_snapshot(
+    const database& flat_database,
+    int frame,
+    const FixedControllerPoseBridge& bridge) {
+    const int clip_stop = containing_flat_clip_stop(flat_database, frame);
+    require(clip_stop > frame, "stationary frame is outside a flat clip");
+    interaction::LocomotionSnapshot snapshot{};
+    snapshot.pose = interaction::expand_flat_controller_pose(
+        flat_pose_at(flat_database, frame),
+        bridge.interaction_reference,
+        bridge.flat_reference);
+    for (size_t index = 0U;
+         index < locomotion_timing::kTrajectoryFrameOffsets.size();
+         ++index) {
+        const int future =
+            frame + locomotion_timing::kTrajectoryFrameOffsets[index];
+        require(
+            future < clip_stop,
+            "stationary snapshot trajectory crosses a flat clip boundary");
+        snapshot.future_root_positions[index] =
+            flat_database.bone_positions(future, 0);
+        snapshot.future_root_rotations[index] =
+            flat_database.bone_rotations(future, 0);
+    }
+    return snapshot;
+}
+
+void require_fixed_reference_calibration(
+    const database& flat_database,
+    const FixedControllerPoseBridge& bridge) {
+    const int reference_frame = flat_database.range_starts(0);
+    const interaction::FlatControllerPose current =
+        flat_pose_at(flat_database, reference_frame);
+    const interaction::Pose expected =
+        interaction::expand_flat_controller_pose(
+            current,
+            bridge.interaction_reference,
+            bridge.flat_reference);
+    const interaction::Pose legacy =
+        interaction::expand_flat_controller_pose(
+            current, bridge.interaction_reference);
+    const interaction::LocomotionSnapshot actual =
+        make_stationary_snapshot(
+            flat_database, reference_frame, bridge);
+    const interaction::WorldPose expected_world =
+        interaction::world_pose(expected);
+    const interaction::WorldPose legacy_world =
+        interaction::world_pose(legacy);
+    const interaction::WorldPose actual_world =
+        interaction::world_pose(actual.pose);
+
+    float legacy_maximum_error_m = 0.0F;
+    float actual_maximum_error_m = 0.0F;
+    for (const interaction::FlatControllerAnchor anchor :
+         interaction::kFlatControllerAnchors) {
+        legacy_maximum_error_m = std::max(
+            legacy_maximum_error_m,
+            length(
+                legacy_world.positions[anchor.g1_bone] -
+                expected_world.positions[anchor.g1_bone]));
+        actual_maximum_error_m = std::max(
+            actual_maximum_error_m,
+            length(
+                actual_world.positions[anchor.g1_bone] -
+                expected_world.positions[anchor.g1_bone]));
+    }
+    require(
+        legacy_maximum_error_m > 0.20F,
+        "fixed-reference witness no longer distinguishes the legacy bridge");
+    require(
+        actual_maximum_error_m <= 1.0e-4F,
+        "stationary snapshot differs from fixed-reference bridge calibration");
+}
+
+void validate_stationary_frames(const std::vector<int>& frames) {
+    require(
+        frames.size() == kExpectedStationarySnapshotCount,
+        "stationary candidate count changed: expected=186 actual=" +
+            std::to_string(frames.size()));
+    require(
+        frames.front() == 0 && frames.at(92U) == 92 &&
+            frames.at(93U) == 118 && frames.back() == 210,
+        "stationary candidate spans changed");
+    for (size_t index = 0U; index < 93U; ++index) {
+        require(
+            frames[index] == static_cast<int>(index) &&
+                frames[93U + index] == 118 + static_cast<int>(index),
+            "stationary candidate span is not contiguous");
+    }
+}
+
+struct FrozenStationarySnapshot {
+    int frame = -1;
+    interaction::LocomotionSnapshot snapshot{};
+    uint64_t fingerprint = 0U;
+};
+
+std::vector<FrozenStationarySnapshot> make_frozen_stationary_snapshots(
+    const database& flat_database,
+    const FixedControllerPoseBridge& bridge) {
+    const std::vector<int> frames =
+        stationary_motion_matching::derive_candidates(flat_database);
+    validate_stationary_frames(frames);
+    std::vector<FrozenStationarySnapshot> frozen;
+    frozen.reserve(frames.size());
+    for (int frame : frames) {
+        FrozenStationarySnapshot record;
+        record.frame = frame;
+        record.snapshot = make_stationary_snapshot(
+            flat_database, frame, bridge);
+        record.fingerprint =
+            interaction::runtime_detail::locomotion_snapshot_fingerprint(
+                record.snapshot);
+        require(
+            record.fingerprint != 0U,
+            "stationary snapshot fingerprint must be nonzero");
+        frozen.push_back(std::move(record));
+    }
+    require(
+        frozen.size() == kExpectedStationarySnapshotCount,
+        "frozen stationary snapshot count changed");
+    return frozen;
+}
+
 int run(int argc, char** argv) {
     if (argc != 4) {
         std::cerr
@@ -1353,11 +1805,44 @@ int run(int argc, char** argv) {
     SlotReport report = parse_slot_report(report_json);
     validate_report_against_manifest(report, manifest);
 
+    database flat_database{};
+    const std::string flat_database_filename = flat_database_path.string();
+    database_load(flat_database, flat_database_filename.c_str());
+    validate_flat_database_shape(flat_database);
+    const interaction::Database interaction_database =
+        interaction::load_database(
+            full_pack_path / "interaction_database.bin");
+    const interaction::Features interaction_features =
+        interaction::load_features(
+            full_pack_path / "interaction_features.bin");
+    interaction::validate_controller_interaction_pack(
+        interaction_database, interaction_features);
+    validate_loaded_pack_against_manifest(
+        interaction_database, interaction_features, manifest);
+    RegisteredTarget registered_target =
+        register_report_demo_target(report.target);
+    const FixedControllerPoseBridge bridge =
+        make_fixed_controller_pose_bridge(
+            flat_database, interaction_database);
+    require_fixed_reference_calibration(flat_database, bridge);
+    const std::vector<FrozenStationarySnapshot> stationary_snapshots =
+        make_frozen_stationary_snapshots(flat_database, bridge);
+
     std::cerr
-        << "interaction_smart_pickup_preview_probe: validated "
-        << manifest.clips.size() << " manifest clips and "
-        << report.retained_candidates.size()
-        << " retained candidates; runtime preview is not yet implemented\n";
+        << "interaction_smart_pickup_preview_probe: loaded flat_frames="
+        << flat_database.nframes()
+        << " flat_bones=" << flat_database.nbones()
+        << " interaction_frames=" << interaction_database.frame_count
+        << " interaction_clips=" << interaction_database.clip_count
+        << " interaction_features=" << interaction_features.feature_count
+        << " retained_candidates=" << report.retained_candidates.size()
+        << " registry_count=" << registered_target.registration_count
+        << " stationary_count=" << stationary_snapshots.size()
+        << " stationary_first=" << stationary_snapshots.front().frame
+        << '/' << stationary_snapshots.front().fingerprint
+        << " stationary_last=" << stationary_snapshots.back().frame
+        << '/' << stationary_snapshots.back().fingerprint
+        << "; runtime preview evaluation is not yet implemented\n";
     return 1;
 }
 
