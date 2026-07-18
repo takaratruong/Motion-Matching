@@ -252,11 +252,10 @@ python3 -m unittest tests.python.test_g1_playable_mesh_integration -v
 Expected: the classic UI/control test passes; the mesh pose and lifecycle tests
 fail because the stable controller has no mesh renderer yet.
 
-- [ ] **Step 3: Import the already-tested renderer and retain only component tests in its C++ owner**
+- [ ] **Step 3: Install the renderer component test and verify RED before importing the header**
 
 ```bash
-git restore --source=2080266 -- \
-  g1_mesh_renderer.h tests/cpp/test_g1_mesh_renderer.cpp
+git restore --source=2080266 -- tests/cpp/test_g1_mesh_renderer.cpp
 ```
 
 In `tests/cpp/test_g1_mesh_renderer.cpp`, remove the two controller-source
@@ -281,7 +280,39 @@ Also remove now-unused `<fstream>`, `<iterator>`, and `<string>` includes. The
 Python test owns controller integration; the C++ test owns renderer math,
 mapping, validation, and idempotent unload.
 
-- [ ] **Step 4: Add the renderer include and one owned runtime instance**
+Run the component build before restoring the production header:
+
+```bash
+mkdir -p /tmp/g1-playable-mesh-build
+if g++ -std=c++17 -O2 -D_DEFAULT_SOURCE -DPLATFORM_DESKTOP \
+  -I. -I/home/ubuntu/apps/raylib/src \
+  tests/cpp/test_g1_mesh_renderer.cpp \
+  -o /tmp/g1-playable-mesh-build/test-g1-mesh-renderer \
+  -L/home/ubuntu/apps/raylib/src \
+  -lraylib -lGL -lm -lpthread -ldl -lrt -lX11; then
+  exit 1
+fi
+```
+
+Expected: compilation fails only because `g1_mesh_renderer.h` is missing.
+
+- [ ] **Step 4: Import the certified renderer component and verify its GREEN gate**
+
+```bash
+git restore --source=2080266 -- g1_mesh_renderer.h
+g++ -std=c++17 -O2 -D_DEFAULT_SOURCE -DPLATFORM_DESKTOP \
+  -I. -I/home/ubuntu/apps/raylib/src \
+  tests/cpp/test_g1_mesh_renderer.cpp \
+  -o /tmp/g1-playable-mesh-build/test-g1-mesh-renderer \
+  -L/home/ubuntu/apps/raylib/src \
+  -lraylib -lGL -lm -lpthread -ldl -lrt -lX11
+/tmp/g1-playable-mesh-build/test-g1-mesh-renderer
+```
+
+Expected: compilation succeeds and the component test exits `0` with no
+output.
+
+- [ ] **Step 5: Add the renderer include and one owned runtime instance**
 
 Add the include beside the other G1 runtime owners:
 
@@ -318,7 +349,7 @@ Immediately after the terrain model readiness gate, add:
 Do not change terrain `model_load_count` or `model_unload_count`; those counters
 remain terrain-only.
 
-- [ ] **Step 5: Transfer and draw the final stable pose**
+- [ ] **Step 6: Transfer and draw the final stable pose**
 
 At the beginning of `update_func`, add the edge-triggered display controls:
 
@@ -376,7 +407,7 @@ Wrap the unchanged skeleton loop in:
         }
 ```
 
-- [ ] **Step 6: Preserve the classic UI and expose only two display toggles**
+- [ ] **Step 7: Preserve the classic UI and expose only two display toggles**
 
 Keep every existing Raygui group, slider, and control label. Add one line at
 the bottom of the existing `controls` group:
@@ -392,7 +423,7 @@ the bottom of the existing `controls` group:
 
 No other UI dimensions or labels change.
 
-- [ ] **Step 7: Route mesh ownership through normal cleanup**
+- [ ] **Step 8: Route mesh ownership through normal cleanup**
 
 In `normal_cleanup`, immediately before `model_unloader(terrain_model);`, add:
 
@@ -403,7 +434,7 @@ In `normal_cleanup`, immediately before `model_unloader(terrain_model);`, add:
 
 There must be exactly one controller call to `g1_mesh_renderer_unload`.
 
-- [ ] **Step 8: Run focused GREEN tests and build the stable controller**
+- [ ] **Step 9: Run focused GREEN tests and build the stable controller**
 
 ```bash
 python3 -m unittest \
@@ -432,7 +463,7 @@ build exits `0`. `strings /tmp/g1-playable-mesh-build/controller-g1-playable`
 contains `terrain scene / runtime`, `run sideways speed`, `M mesh`, and
 `G1 mesh loaded`, and does not contain `Transactional terrain IK`.
 
-- [ ] **Step 9: Commit and push the playable renderer checkpoint**
+- [ ] **Step 10: Commit and push the playable renderer checkpoint**
 
 ```bash
 git add controller.cpp g1_mesh_renderer.h \
