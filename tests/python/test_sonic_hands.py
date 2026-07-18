@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 import unittest
 
@@ -7,8 +8,10 @@ import numpy as np
 
 from mm_sonic.hands import (
     LEFT_HAND_JOINT_ORDER,
+    LEFT_HAND_JOINT_RANGES,
     NEUTRAL_HAND_TARGETS,
     RIGHT_HAND_JOINT_ORDER,
+    RIGHT_HAND_JOINT_RANGES,
     hand_targets_record,
     measure_hand_tracking,
     parse_hand_targets_record,
@@ -62,6 +65,32 @@ class Dex3HandContractTests(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(ContractError):
                     resolve_hand_targets(left_hand_joints=value)
+
+    def test_side_limits_are_strict_before_float32_conversion(self) -> None:
+        for side, ranges in (
+            ("left", LEFT_HAND_JOINT_RANGES),
+            ("right", RIGHT_HAND_JOINT_RANGES),
+        ):
+            keyword = f"{side}_hand_joints"
+            for index, (lower, upper) in enumerate(ranges):
+                for boundary in (lower, upper):
+                    values = [0.0] * 7
+                    values[index] = boundary
+                    with self.subTest(side=side, index=index, accepted=boundary):
+                        resolve_hand_targets(**{keyword: values})
+
+                outside_values = (
+                    math.nextafter(lower, -math.inf),
+                    math.nextafter(upper, math.inf),
+                    float(np.nextafter(np.float32(lower), np.float32(-np.inf))),
+                    float(np.nextafter(np.float32(upper), np.float32(np.inf))),
+                )
+                for outside in outside_values:
+                    values = [0.0] * 7
+                    values[index] = outside
+                    with self.subTest(side=side, index=index, rejected=outside):
+                        with self.assertRaises(ContractError):
+                            resolve_hand_targets(**{keyword: values})
 
     def test_tracking_uses_final_second_and_all_fourteen_joints(self) -> None:
         target = np.asarray(NEUTRAL_HAND_TARGETS.left + NEUTRAL_HAND_TARGETS.right)

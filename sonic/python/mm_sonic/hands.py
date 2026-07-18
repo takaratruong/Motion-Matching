@@ -62,7 +62,6 @@ _RIGHT_NEUTRAL = (0.0, -0.154, -0.875, 0.785, 0.875, 0.785, 0.875)
 
 _PROFILE_NAME = "dex3-relaxed-fist-v1"
 _HASH_DOMAIN = b"mm-sonic-dex3-hand-targets/v1\0"
-_LIMIT_EPSILON = 1.0e-6
 _PIN_MARGIN = 0.01
 
 
@@ -135,7 +134,7 @@ def _validate_side(
         if not math.isfinite(number):
             raise ContractError(f"{label}[{index}] must be a finite number")
         lower, upper = ranges[index]
-        if number < lower - _LIMIT_EPSILON or number > upper + _LIMIT_EPSILON:
+        if number < lower or number > upper:
             raise ContractError(
                 f"{label}[{index}] = {number} is outside limit [{lower}, {upper}]"
             )
