@@ -65,6 +65,15 @@ bool same_float_bits_exact(float left, float right) {
     return std::memcmp(&left, &right, sizeof(left)) == 0;
 }
 
+bool same_pick_entry_root_bits_exact(
+    interaction::PickEntryRoot left,
+    interaction::PickEntryRoot right) {
+    return same_float_bits_exact(left.world_x, right.world_x) &&
+        same_float_bits_exact(left.world_z, right.world_z) &&
+        same_float_bits_exact(
+            left.world_yaw_radians, right.world_yaw_radians);
+}
+
 bool same_vec3_bits_exact(vec3 left, vec3 right) {
     return same_float_bits_exact(left.x, right.x) &&
         same_float_bits_exact(left.y, right.y) &&
@@ -238,6 +247,21 @@ void require_zero_pick_assist_output(
         !output.override_steering && is_zero(output.left_stick) &&
             is_zero(output.right_stick) && !output.force_strafe &&
             !output.stationary_constraint && !output.needs_preview &&
+            !output.preview_root.has_value() && !output.submit_interact,
+        message);
+}
+
+void require_stationary_preview_request(
+    const interaction::PickAssistOutput& output,
+    interaction::PickEntryRoot expected_root,
+    const char* message) {
+    require(
+        output.override_steering && output.force_strafe &&
+            output.stationary_constraint &&
+            is_zero(output.left_stick) && is_zero(output.right_stick) &&
+            output.needs_preview && output.preview_root.has_value() &&
+            same_pick_entry_root_bits_exact(
+                *output.preview_root, expected_root) &&
             !output.submit_interact,
         message);
 }
@@ -1532,6 +1556,414 @@ void test_frozen_slot_settling_requests_exact_frozen_preview_root() {
                 output.preview_root->world_yaw_radians,
                 expected_preview_root.world_yaw_radians),
         "frozen FinalPreview request did not publish the exact frozen root");
+}
+
+interaction::PickEntryRoot enter_frozen_final_preview(
+    interaction::ControllerPickAssist& assist,
+    FrozenSlotScenario& scenario,
+    const interaction::PickAssistConfig& config = {}) {
+    const interaction::PickAssistDiagnostics latched =
+        latch_frozen_slot_settling(assist, scenario, config);
+    require(
+        latched.slot_selection.selected_index.has_value(),
+        "frozen FinalPreview helper lost its selected index");
+    const interaction::MappedPickSlot frozen_slot =
+        latched.slot_selection.ordered[
+            *latched.slot_selection.selected_index];
+    const vec3 frozen_forward = quat_mul_vec3(
+        frozen_slot.root_world.rotation,
+        vec3(0.0F, 0.0F, 1.0F));
+    const interaction::PickEntryRoot expected_root{
+        frozen_slot.root_world.position.x,
+        frozen_slot.root_world.position.z,
+        std::atan2(frozen_forward.x, frozen_forward.z),
+    };
+
+    scenario.observation.displayed_root = frozen_slot.root_world;
+    scenario.observation.simulation_velocity = vec3();
+    scenario.observation.displayed_planar_speed_mps = 0.0F;
+    interaction::PickAssistOutput output{};
+    for (uint32_t tick = 1U;
+         tick <= config.required_settle_ticks;
+         ++tick) {
+        output = assist.observe(scenario.observation);
+        require(
+            assist.diagnostics().settle_ticks == tick,
+            "frozen FinalPreview helper lost a stable settle tick");
+        if (tick < config.required_settle_ticks) {
+            require(
+                assist.diagnostics().state ==
+                        interaction::PickAssistState::Settling &&
+                    assist.diagnostics().reason ==
+                        interaction::PickAssistReason::None &&
+                    output.override_steering && output.force_strafe &&
+                    output.stationary_constraint &&
+                    is_zero(output.left_stick) &&
+                    is_zero(output.right_stick) &&
+                    !output.needs_preview &&
+                    !output.preview_root.has_value() &&
+                    !output.submit_interact,
+                "frozen FinalPreview helper previewed before settling completed");
+        }
+    }
+    require(
+        assist.diagnostics().state ==
+                interaction::PickAssistState::FinalPreview &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::None &&
+            assist.diagnostics().settle_ticks ==
+                config.required_settle_ticks,
+        "frozen FinalPreview helper did not complete settling exactly once");
+    require_stationary_preview_request(
+        output,
+        expected_root,
+        "frozen FinalPreview helper did not request the exact frozen root");
+    require(
+        assist.active() && assist.owns_manual_interact() &&
+            !assist.take_submission(60U).has_value(),
+        "frozen FinalPreview helper lost ownership or submitted");
+    require_frozen_slot_provenance_unchanged(
+        latched,
+        assist.diagnostics(),
+        "frozen FinalPreview helper changed frozen provenance");
+    return *output.preview_root;
+}
+
+interaction::PickEntryPreview certified_frozen_preview(
+    interaction::PickEntryRoot root) {
+    interaction::PickEntryPreview preview{};
+    preview.path_feasible = true;
+    preview.path_reason = interaction::Reason::None;
+    preview.match_ready = true;
+    preview.match_reason = interaction::Reason::None;
+    preview.prospective_root = root;
+    preview.feasible_entry_frame = 114;
+    preview.contact_frame = 139;
+    preview.total_cost = 8.25F;
+    return preview;
+}
+
+void test_frozen_final_preview_missing_singular_preview_rerequests() {
+    FrozenSlotScenario scenario;
+    interaction::ControllerPickAssist assist;
+    const interaction::PickEntryRoot frozen_root =
+        enter_frozen_final_preview(assist, scenario);
+    const interaction::PickAssistDiagnostics before = assist.diagnostics();
+
+    scenario.observation.preview.reset();
+    const interaction::PickAssistOutput output =
+        assist.observe(scenario.observation);
+    require(
+        assist.diagnostics().state ==
+                interaction::PickAssistState::FinalPreview &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::None,
+        "missing singular frozen preview changed FinalPreview outcome");
+    require_stationary_preview_request(
+        output,
+        frozen_root,
+        "missing singular frozen preview did not re-request the frozen root");
+    require(
+        assist.active() && assist.owns_manual_interact() &&
+            !assist.take_submission(61U).has_value(),
+        "missing singular frozen preview lost ownership or submitted");
+    require_frozen_slot_provenance_unchanged(
+        before,
+        assist.diagnostics(),
+        "missing singular frozen preview changed frozen provenance");
+    require_final_preview_diagnostics_cleared(assist.diagnostics());
+}
+
+void test_frozen_final_preview_poor_match_rerequests_then_recovers() {
+    FrozenSlotScenario scenario;
+    interaction::ControllerPickAssist assist;
+    const interaction::PickEntryRoot frozen_root =
+        enter_frozen_final_preview(assist, scenario);
+    const interaction::PickAssistDiagnostics before = assist.diagnostics();
+    scenario.observation.snapshot_fingerprint = 901U;
+    scenario.observation.preview_snapshot_fingerprint = 901U;
+
+    interaction::PickEntryPreview poor_match =
+        certified_frozen_preview(frozen_root);
+    poor_match.match_ready = false;
+    poor_match.match_reason = interaction::Reason::PoorMatch;
+    poor_match.total_cost = 12.50F;
+    scenario.observation.preview = poor_match;
+    interaction::PickAssistOutput output =
+        assist.observe(scenario.observation);
+    require(
+        assist.diagnostics().state ==
+                interaction::PickAssistState::FinalPreview &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::None,
+        "sole PoorMatch preview did not remain retryable");
+    require_stationary_preview_request(
+        output,
+        frozen_root,
+        "sole PoorMatch preview did not re-request the same frozen root");
+    {
+        const auto& diagnostics = assist.diagnostics().final_preview;
+        require(
+            diagnostics.available &&
+                diagnostics.all_preview_roots_finite &&
+                diagnostics.fingerprint_equal &&
+                diagnostics.path_feasible &&
+                diagnostics.path_reason == interaction::Reason::None &&
+                !diagnostics.match_ready &&
+                diagnostics.match_reason ==
+                    interaction::Reason::PoorMatch &&
+                diagnostics.prospective_root_equal &&
+                diagnostics.feasible_entry_frame == 114 &&
+                diagnostics.contact_frame == 139 &&
+                same_float_bits_exact(
+                    diagnostics.total_cost, poor_match.total_cost),
+            "sole PoorMatch preview diagnostics were not captured exactly");
+    }
+    require(
+        assist.active() && assist.owns_manual_interact() &&
+            !assist.take_submission(62U).has_value(),
+        "sole PoorMatch preview lost ownership or submitted");
+    require_frozen_slot_provenance_unchanged(
+        before,
+        assist.diagnostics(),
+        "sole PoorMatch preview changed frozen provenance");
+
+    interaction::PickEntryPreview certified =
+        certified_frozen_preview(frozen_root);
+    certified.feasible_entry_frame = 115;
+    certified.contact_frame = 140;
+    certified.total_cost = 7.50F;
+    scenario.observation.preview = certified;
+    output = assist.observe(scenario.observation);
+    require(
+        assist.diagnostics().state ==
+                interaction::PickAssistState::ReadyToSubmit &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::None &&
+            output.override_steering && output.force_strafe &&
+            output.stationary_constraint &&
+            is_zero(output.left_stick) && is_zero(output.right_stick) &&
+            !output.needs_preview && !output.preview_root.has_value() &&
+            output.submit_interact,
+        "certified singular preview did not recover PoorMatch to ReadyToSubmit");
+    {
+        const auto& diagnostics = assist.diagnostics().final_preview;
+        require(
+            diagnostics.available &&
+                diagnostics.all_preview_roots_finite &&
+                diagnostics.fingerprint_equal &&
+                diagnostics.path_feasible &&
+                diagnostics.path_reason == interaction::Reason::None &&
+                diagnostics.match_ready &&
+                diagnostics.match_reason == interaction::Reason::None &&
+                diagnostics.prospective_root_equal &&
+                diagnostics.feasible_entry_frame == 115 &&
+                diagnostics.contact_frame == 140 &&
+                same_float_bits_exact(
+                    diagnostics.total_cost, certified.total_cost),
+            "recovered certified preview diagnostics were not captured exactly");
+    }
+}
+
+enum class FrozenFinalPreviewDefect : uint8_t {
+    BlockedPath,
+    CorrectionLimit,
+    TargetUnavailable,
+    NonfiniteRoot,
+    FingerprintMismatch,
+    DifferentRoot,
+};
+
+struct FrozenFinalPreviewHardCase {
+    const char* name;
+    FrozenFinalPreviewDefect defect;
+};
+
+void test_frozen_final_preview_hard_rejections_are_terminal() {
+    const std::array<FrozenFinalPreviewHardCase, 6> cases{{
+        {"BlockedPath preview reason", FrozenFinalPreviewDefect::BlockedPath},
+        {"CorrectionLimit preview reason",
+            FrozenFinalPreviewDefect::CorrectionLimit},
+        {"TargetUnavailable preview reason",
+            FrozenFinalPreviewDefect::TargetUnavailable},
+        {"nonfinite preview root", FrozenFinalPreviewDefect::NonfiniteRoot},
+        {"preview fingerprint mismatch",
+            FrozenFinalPreviewDefect::FingerprintMismatch},
+        {"one-ULP different prospective root",
+            FrozenFinalPreviewDefect::DifferentRoot},
+    }};
+    const float infinity = float_from_bits(0x7f800000U);
+
+    for (size_t case_index = 0U; case_index < cases.size(); ++case_index) {
+        const FrozenFinalPreviewHardCase& test_case = cases[case_index];
+        const auto require_case = [&](bool condition, const char* detail) {
+            if (!condition) {
+                throw std::runtime_error(
+                    std::string(test_case.name) + ": " + detail);
+            }
+        };
+        FrozenSlotScenario scenario;
+        interaction::ControllerPickAssist assist;
+        const interaction::PickEntryRoot frozen_root =
+            enter_frozen_final_preview(assist, scenario);
+        const interaction::PickAssistDiagnostics before =
+            assist.diagnostics();
+        scenario.observation.snapshot_fingerprint = 901U;
+        scenario.observation.preview_snapshot_fingerprint = 901U;
+        interaction::PickEntryPreview preview =
+            certified_frozen_preview(frozen_root);
+        bool expected_finite = true;
+        bool expected_fingerprint_equal = true;
+        bool expected_root_equal = true;
+
+        switch (test_case.defect) {
+        case FrozenFinalPreviewDefect::BlockedPath:
+            preview.path_feasible = false;
+            preview.path_reason = interaction::Reason::BlockedPath;
+            preview.match_ready = false;
+            break;
+        case FrozenFinalPreviewDefect::CorrectionLimit:
+            preview.match_ready = false;
+            preview.match_reason = interaction::Reason::CorrectionLimit;
+            break;
+        case FrozenFinalPreviewDefect::TargetUnavailable:
+            preview.path_feasible = false;
+            preview.path_reason = interaction::Reason::TargetUnavailable;
+            preview.match_ready = false;
+            break;
+        case FrozenFinalPreviewDefect::NonfiniteRoot:
+            preview.prospective_root.world_x =
+                float_from_bits(0x7fc00001U);
+            expected_finite = false;
+            expected_root_equal = false;
+            break;
+        case FrozenFinalPreviewDefect::FingerprintMismatch:
+            scenario.observation.preview_snapshot_fingerprint = 902U;
+            expected_fingerprint_equal = false;
+            break;
+        case FrozenFinalPreviewDefect::DifferentRoot:
+            preview.prospective_root.world_x = std::nextafter(
+                preview.prospective_root.world_x, infinity);
+            expected_root_equal = false;
+            break;
+        }
+        require_case(
+            scenario.observation.target == &scenario.target,
+            "fixture invalidated the live observation target");
+        scenario.observation.preview = preview;
+        const interaction::PickAssistOutput output =
+            assist.observe(scenario.observation);
+        require_case(
+            assist.diagnostics().state ==
+                    interaction::PickAssistState::Failed &&
+                assist.diagnostics().reason ==
+                    interaction::PickAssistReason::FinalPreviewRejected,
+            "hard preview outcome was not rejected immediately");
+        require_zero_pick_assist_output(output, test_case.name);
+        require_case(
+            !assist.active() && !assist.owns_manual_interact() &&
+                !assist.take_submission(
+                    63U + static_cast<uint64_t>(case_index)).has_value(),
+            "hard preview rejection retained ownership or submitted");
+        require_frozen_slot_provenance_unchanged(
+            before,
+            assist.diagnostics(),
+            test_case.name);
+        const auto& diagnostics = assist.diagnostics().final_preview;
+        require_case(
+            diagnostics.available &&
+                diagnostics.all_preview_roots_finite == expected_finite &&
+                diagnostics.fingerprint_equal ==
+                    expected_fingerprint_equal &&
+                diagnostics.path_feasible == preview.path_feasible &&
+                diagnostics.path_reason == preview.path_reason &&
+                diagnostics.match_ready == preview.match_ready &&
+                diagnostics.match_reason == preview.match_reason &&
+                diagnostics.prospective_root_equal == expected_root_equal &&
+                diagnostics.feasible_entry_frame ==
+                    preview.feasible_entry_frame &&
+                diagnostics.contact_frame == preview.contact_frame &&
+                same_float_bits_exact(
+                    diagnostics.total_cost, preview.total_cost),
+            "hard preview diagnostics did not capture every supplied fact");
+    }
+}
+
+void test_frozen_final_preview_certifies_and_submits_exactly_once() {
+    FrozenSlotScenario scenario;
+    interaction::ControllerPickAssist assist;
+    const interaction::PickEntryRoot frozen_root =
+        enter_frozen_final_preview(assist, scenario);
+    const interaction::PickAssistDiagnostics before = assist.diagnostics();
+    scenario.observation.snapshot_fingerprint = 901U;
+    scenario.observation.preview_snapshot_fingerprint = 901U;
+    const interaction::PickEntryPreview certified =
+        certified_frozen_preview(frozen_root);
+    scenario.observation.preview = certified;
+
+    interaction::PickAssistOutput output =
+        assist.observe(scenario.observation);
+    require(
+        assist.diagnostics().state ==
+                interaction::PickAssistState::ReadyToSubmit &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::None &&
+            output.override_steering && output.force_strafe &&
+            output.stationary_constraint &&
+            is_zero(output.left_stick) && is_zero(output.right_stick) &&
+            !output.needs_preview && !output.preview_root.has_value() &&
+            output.submit_interact,
+        "certified frozen preview did not emit one stationary submit pulse");
+    require(
+        assist.active() && assist.owns_manual_interact(),
+        "certified frozen preview did not retain ReadyToSubmit ownership");
+    require_frozen_slot_provenance_unchanged(
+        before,
+        assist.diagnostics(),
+        "certified frozen preview changed frozen provenance");
+
+    output = assist.observe(scenario.observation);
+    require(
+        assist.diagnostics().state ==
+                interaction::PickAssistState::ReadyToSubmit &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::None &&
+            output.override_steering && output.force_strafe &&
+            output.stationary_constraint &&
+            is_zero(output.left_stick) && is_zero(output.right_stick) &&
+            !output.needs_preview && !output.preview_root.has_value() &&
+            !output.submit_interact,
+        "ReadyToSubmit repeated the frozen submit pulse");
+
+    const std::optional<interaction::PickRequest> first =
+        assist.take_submission(71U);
+    const std::optional<interaction::PickRequest> second =
+        assist.take_submission(71U);
+    require(
+        first.has_value() && !second.has_value() &&
+            first->target == scenario.target.handle &&
+            first->affordance_id ==
+                scenario.target.affordances.front().id &&
+            first->request_id == 71U &&
+            assist.diagnostics().state ==
+                interaction::PickAssistState::Submitted &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::None &&
+            !assist.active() && !assist.owns_manual_interact(),
+        "take_submission(71) did not yield exactly one frozen PickRequest");
+
+    assist.cancel();
+    require(
+        first.has_value() && first->target == scenario.target.handle &&
+            first->affordance_id ==
+                scenario.target.affordances.front().id &&
+            first->request_id == 71U &&
+            assist.diagnostics().state ==
+                interaction::PickAssistState::Submitted &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::None &&
+            !assist.take_submission(71U).has_value(),
+        "cancel after Submitted revoked or created a frozen request");
 }
 
 void test_slot_approach_rejects_adjacent_arrival_overshoots() {
@@ -3505,6 +3937,10 @@ int main() {
         test_frozen_slot_settling_enforces_consecutive_travel();
         test_frozen_slot_settling_keeps_stationary_braking();
         test_frozen_slot_settling_requests_exact_frozen_preview_root();
+        test_frozen_final_preview_missing_singular_preview_rerequests();
+        test_frozen_final_preview_poor_match_rerequests_then_recovers();
+        test_frozen_final_preview_hard_rejections_are_terminal();
+        test_frozen_final_preview_certifies_and_submits_exactly_once();
         test_slot_approach_rejects_adjacent_arrival_overshoots();
         test_slot_approach_accumulates_inclusive_travel_and_rejects_overshoot();
         test_slot_approach_revalidates_frozen_route_against_table();
