@@ -3194,10 +3194,16 @@ class Task12PolicyTests(unittest.TestCase):
             "manual_smart_pickup_controller.post_step(",
             "interaction_runtime.preview_pick(",
             "manual_smart_pickup_post_step.snapshot_fingerprint",
-            "manual_smart_pickup_post_step.snapshot_fingerprint == live_flat_snapshot_fingerprint",
         ):
             with self.subTest(observation_required=required):
                 self.assertIn(required, normalized_observation)
+        self.assertRegex(
+            normalized_observation,
+            r"if\s*\(\s*manual_smart_pickup_post_step\.snapshot_fingerprint\s*"
+            r"!=\s*live_flat_snapshot_fingerprint\s*\)\s*\{?\s*"
+            r"throw\s+std::(?:logic_error|runtime_error)\s*\(",
+            "snapshot identity must be enforced, not merely compared",
+        )
         for forbidden in (
             "preview_pick_entry_slots(",
             "make_pick_reach_waypoint(",
@@ -3312,10 +3318,45 @@ class Task12PolicyTests(unittest.TestCase):
         for required in (
             "manual_smart_pickup_post_input.live_flat_snapshot = live_flat_snapshot",
             "manual_smart_pickup_controller.post_step(",
-            "manual_smart_pickup_post_step.assist_observed",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, normalized_observation)
+        fingerprint_guard = re.search(
+            r"if\s*\(\s*manual_smart_pickup_post_step\.snapshot_fingerprint\s*"
+            r"!=\s*live_flat_snapshot_fingerprint\s*\)\s*\{?\s*"
+            r"throw\s+std::(?:logic_error|runtime_error)\s*\(",
+            normalized_observation,
+        )
+        self.assertIsNotNone(
+            fingerprint_guard,
+            "the post-step fingerprint mismatch must throw before publication",
+        )
+        stationary_search = self._source_between(
+            controller,
+            "        // Placement stationary search begins.",
+            "        // Placement stationary search ends.",
+        )
+        self.assertRegex(
+            " ".join(stationary_search.split()),
+            r"const\s+bool\s+manual_pick_stationary_constraint_active\s*=\s*"
+            r"[^;]*manual_smart_pickup_post_step\.assist_output\."
+            r"stationary_constraint[^;]*;",
+            "the returned assist output must drive the following ordinary tick's "
+            "stationary search",
+        )
+        smart_pickup_header_path = Path("interaction_smart_pickup_controller.h")
+        smart_pickup_header = (
+            smart_pickup_header_path.read_text(encoding="utf-8")
+            if smart_pickup_header_path.is_file()
+            else ""
+        )
+        for forbidden in ("assist_observed", "activation_began"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(
+                    forbidden,
+                    controller + smart_pickup_header,
+                    "SmartPickupPostStepResult has no self-attested lifecycle flags",
+                )
         self.assertNotIn("manual_pick_assist_activation_tick", controller)
         self.assertNotIn("gamepadstick_left =", observation)
         self.assertNotIn("gamepadstick_right =", observation)
@@ -3354,18 +3395,38 @@ class Task12PolicyTests(unittest.TestCase):
         post_step = controller.index(
             "manual_smart_pickup_controller.post_step(", snapshot
         )
+        fingerprint_use = controller.index(
+            "manual_smart_pickup_post_step.snapshot_fingerprint", post_step
+        )
         scheduler = controller.index("interaction_scheduler.tick(", post_step)
         self.assertLess(
             pre_step,
             velocity_update,
         )
         self.assertEqual(
-            [pre_step, velocity_update, simulation_update, snapshot, post_step, scheduler],
+            [
+                pre_step,
+                velocity_update,
+                simulation_update,
+                snapshot,
+                post_step,
+                fingerprint_use,
+                scheduler,
+            ],
             sorted(
-                [pre_step, velocity_update, simulation_update, snapshot, post_step, scheduler]
+                [
+                    pre_step,
+                    velocity_update,
+                    simulation_update,
+                    snapshot,
+                    post_step,
+                    fingerprint_use,
+                    scheduler,
+                ]
             ),
             "activation must bracket exactly the existing ordinary locomotion "
-            "step before post-step observation and scheduler publication",
+            "step before post-step observation, fingerprint verification, and "
+            "scheduler publication",
         )
 
     def test_manual_pick_assist_submits_exactly_one_latched_request(self):
@@ -3491,23 +3552,118 @@ class Task12PolicyTests(unittest.TestCase):
             "        // Manual pick-assist observation ends.",
         )
         self.assertEqual(
-            (manual_input + observation).count(
-                "manual_pick_stationary_diagnostics = {};"
-            ),
+            manual_input.count("manual_pick_stationary_diagnostics = {};"),
+            1,
+            "one pre-step consume decision must clear the prior attempt exactly "
+            "once, including simultaneous X/F",
+        )
+        self.assertNotIn(
+            "manual_pick_stationary_diagnostics = {};",
+            observation,
+            "post-step observation must not infer that activation began",
+        )
+        normalized_input = " ".join(manual_input.split())
+        reset_statement = "manual_pick_stationary_diagnostics = {};"
+        state_capture = (
+            "const interaction::PickAssistState "
+            "manual_smart_pickup_state_before_pre_step = "
+            "manual_smart_pickup_controller.diagnostics().state;"
+        )
+        pre_step_assignment = (
+            "const interaction::SmartPickupPreStepResult "
+            "manual_smart_pickup_pre_step = "
+            "manual_smart_pickup_controller.pre_step("
+        )
+        self.assertIn(
+            f"{state_capture} {pre_step_assignment}",
+            normalized_input,
+            "the caller must snapshot the real assist diagnostics immediately "
+            "before pre_step",
+        )
+        pre_step_call = normalized_input.index(
+            "manual_smart_pickup_controller.pre_step("
+        )
+        reset = normalized_input.index(reset_statement)
+        self.assertLess(
+            pre_step_call,
+            reset,
+            "attempt-local diagnostics may reset only after the coordinator "
+            "returns its real consume result",
+        )
+        new_attempt_definition = self._source_between(
+            manual_input,
+            "const bool manual_smart_pickup_new_attempt =",
+            ";",
+        )
+        new_attempt_expression = new_attempt_definition.split("=", 1)[1]
+        new_attempt_conjuncts = self._split_top_level_cpp_boolean(
+            re.sub(r"\s+", "", new_attempt_expression),
+            "&&",
+        )
+        self.assertEqual(
+            len(new_attempt_conjuncts),
             2,
-            "only coordinator cancellation and a successful post-step begin "
-            "may clear manual history",
+            "new-attempt gating must combine consumed F with one terminal-state "
+            "predicate",
+        )
+        self.assertIn(
+            "manual_smart_pickup_pre_step.interact_consumed",
+            new_attempt_conjuncts,
+        )
+        terminal_clauses = [
+            conjunct
+            for conjunct in new_attempt_conjuncts
+            if conjunct != "manual_smart_pickup_pre_step.interact_consumed"
+        ]
+        self.assertEqual(
+            len(terminal_clauses),
+            1,
+            "new-attempt gating must have exactly one terminal-state clause",
+        )
+        terminal_clause = terminal_clauses[0]
+        terminal_states = {
+            self._strip_outer_cpp_parentheses(disjunct)
+            for disjunct in self._split_top_level_cpp_boolean(
+                terminal_clause,
+                "||",
+            )
+        }
+        self.assertEqual(
+            terminal_states,
+            {
+                "manual_smart_pickup_state_before_pre_step=="
+                "interaction::PickAssistState::Idle",
+                "manual_smart_pickup_state_before_pre_step=="
+                "interaction::PickAssistState::Submitted",
+                "manual_smart_pickup_state_before_pre_step=="
+                "interaction::PickAssistState::Failed",
+            },
+            "repeated F in an active assist state must not start a new diagnostics "
+            "epoch",
         )
         self.assertRegex(
-            " ".join(manual_input.split()),
-            r"if \(manual_smart_pickup_pre_step\.cancel_consumed\)[^{]*"
-            r"\{? manual_pick_stationary_diagnostics = \{\};",
+            normalized_input,
+            r"if\s*\(\s*(?:"
+            r"manual_smart_pickup_pre_step\.cancel_consumed\s*\|\|\s*"
+            r"manual_smart_pickup_new_attempt|"
+            r"manual_smart_pickup_new_attempt\s*\|\|\s*"
+            r"manual_smart_pickup_pre_step\.cancel_consumed"
+            r")\s*\)\s*\{?\s*"
+            r"manual_pick_stationary_diagnostics\s*=\s*\{\};",
+            "cancel or a diagnostic-derived new attempt must enter one shared "
+            "reset branch",
         )
-        self.assertRegex(
-            " ".join(observation.split()),
-            r"if \(manual_smart_pickup_post_step\.activation_began\)[^{]*"
-            r"\{? manual_pick_stationary_diagnostics = \{\};",
-        )
+        for active_state in (
+            "PickAssistState::SlotApproach",
+            "PickAssistState::Settling",
+            "PickAssistState::FinalPreview",
+            "PickAssistState::ReadyToSubmit",
+        ):
+            with self.subTest(repeated_f_state=active_state):
+                self.assertNotIn(active_state, new_attempt_definition)
+        for forbidden in ("assist_observed", "activation_began"):
+            with self.subTest(observation_forbidden=forbidden):
+                self.assertNotIn(forbidden, observation)
 
         search_update = self._source_between(
             controller,
