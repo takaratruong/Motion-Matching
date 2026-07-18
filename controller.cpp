@@ -46,6 +46,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 //--------------------------------------
@@ -4261,17 +4262,11 @@ int main(void)
     const float dt = interaction::kControllerStepSeconds;
     interaction::ControllerInteractionScheduler interaction_scheduler;
     interaction::SmartPickupController manual_smart_pickup_controller;
-    const interaction::PickAssistConfig manual_pick_assist_config{};
-    interaction::ControllerPickAssist manual_pick_assist(
-        manual_pick_assist_config);
-    interaction::Transform manual_pick_reach_waypoint{};
-    interaction::PickEntrySlots manual_pick_entry_slots{};
-    interaction::PickAssistOutput manual_pick_assist_output{};
+    interaction::SmartPickupPostStepResult manual_smart_pickup_post_step{};
+    std::optional<interaction::PickRequest> manual_smart_pickup_request{};
     ManualPickStationaryDiagnostics manual_pick_stationary_diagnostics{};
     vec3 manual_pick_previous_displayed_root = bone_positions(0);
     bool manual_pick_stationary_constraint_was_active = false;
-    vec3 manual_pick_common_entry{};
-    float manual_pick_object_distance_at_begin_m = 0.0F;
     interaction::ControllerInteractionFrameHandoff interaction_frame_handoff;
     interaction::ControllerInteractionSceneHandoff interaction_scene_handoff;
     uint64_t interaction_next_request_id = 1U;
@@ -4535,10 +4530,6 @@ int main(void)
         bool placement_arrival_facing_override = false;
         bool placement_brake_latched_this_tick = false;
         bool placement_pick_interact_submitted_this_tick = false;
-        bool manual_pick_assist_activation_tick = false;
-        bool manual_pick_assist_cancelled_this_tick = false;
-        bool manual_pick_assist_synthetic_interact = false;
-        bool manual_pick_final_preview_certified_this_tick = false;
 
 #ifdef MM_DISCRETE
         // Camera-azimuth scripting. MM_MODE selects the pattern:
@@ -4587,6 +4578,8 @@ int main(void)
                 GAMEPAD_PLAYER, GAMEPAD_BUTTON_RIGHT_FACE_UP),
             IsKeyPressed(KEY_R) || IsGamepadButtonPressed(
                 GAMEPAD_PLAYER, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT)};
+        const interaction::RuntimeState cached_interaction_state =
+            interaction_scheduler.cached_output().diagnostics.state;
         if (interaction_scheduler.cached_output().suppress_steering)
         {
             gamepadstick_left = vec3();
@@ -4934,92 +4927,63 @@ int main(void)
             // Placement auto-demo input ends.
         }
         // Manual pick-assist input begins.
-        if (!autodemo_configuration.has_value() &&
-            interaction_edges.cancel_pressed &&
-            manual_pick_assist.owns_manual_interact())
+        interaction::SmartPickupPreStepResult
+            manual_smart_pickup_pre_step{};
+        if (!legacy_interaction_fixture_mode)
         {
-            manual_pick_assist.cancel();
-            interaction_edges.cancel_pressed = false;
-            interaction_edges.interact_pressed = false;
-            manual_pick_assist_output = {};
-            manual_pick_stationary_diagnostics = {};
-            manual_pick_common_entry = {};
-            manual_pick_object_distance_at_begin_m = 0.0F;
-            manual_pick_assist_cancelled_this_tick = true;
-        }
-        if (!autodemo_configuration.has_value() &&
-            !manual_pick_assist_cancelled_this_tick &&
-            interaction_edges.interact_pressed &&
-            interaction_scheduler.cached_output().diagnostics.state ==
-                interaction::RuntimeState::Locomotion)
-        {
-            interaction_edges.interact_pressed = false;
-            if (!manual_pick_assist.active())
+            const interaction::InteractionTarget* manual_smart_pickup_target =
+                interaction_registry.find(
+                    interaction_scene_target_handle);
+            interaction::SmartPickupPreStepInput
+                manual_smart_pickup_pre_input{};
+            manual_smart_pickup_pre_input.runtime_state =
+                cached_interaction_state;
+            manual_smart_pickup_pre_input.interact_pressed =
+                interaction_edges.interact_pressed;
+            manual_smart_pickup_pre_input.cancel_pressed =
+                interaction_edges.cancel_pressed ||
+                interaction_edges.reset_pressed;
+            manual_smart_pickup_pre_input.selected_target =
+                manual_smart_pickup_target;
+            if (manual_smart_pickup_target != nullptr &&
+                manual_smart_pickup_target->affordances.size() == 1U)
             {
-                manual_pick_assist_activation_tick = true;
-                manual_pick_assist_output = {};
-                manual_pick_common_entry = {};
-                manual_pick_object_distance_at_begin_m = 0.0F;
-                const interaction::Transform manual_pick_root{
-                    bone_positions(0), bone_rotations(0)};
-                const float manual_pick_acquisition_radius_m =
-                    manual_pick_assist_config.maximum_assisted_path_m +
-                    manual_pick_assist_config.arrival.maximum_standoff_m;
-                const std::optional<interaction::TargetHandle>
-                    manual_pick_target_handle =
-                        interaction_registry.resolve_single_target(
-                            manual_pick_root.position,
-                            manual_pick_acquisition_radius_m);
-                const interaction::InteractionTarget* manual_pick_target =
-                    manual_pick_target_handle.has_value()
-                    ? interaction_registry.find(*manual_pick_target_handle)
-                    : nullptr;
-                if (interaction_pack_loaded &&
-                    interaction_database.has_value() &&
-                    manual_pick_target != nullptr &&
-                    manual_pick_target->state ==
-                        interaction::ObjectState::Free &&
-                    manual_pick_target->affordances.size() == 1U)
-                {
-                    manual_pick_reach_waypoint =
-                        interaction::make_pick_reach_waypoint(
-                            *interaction_database, *manual_pick_target);
-                    manual_pick_entry_slots =
-                        interaction::make_pick_entry_slots(
-                            manual_pick_reach_waypoint,
-                            *manual_pick_target);
-                    interaction::PickAssistStart start{};
-                    start.target = manual_pick_target->handle;
-                    start.affordance_id =
-                        manual_pick_target->affordances.front().id;
-                    start.hand =
-                        manual_pick_target->affordances.front().hand;
-                    start.object_world = manual_pick_target->object_world;
-                    start.root_world = interaction::Transform{
-                        bone_positions(0), bone_rotations(0)};
-                    start.reach_waypoint = manual_pick_reach_waypoint;
-                    start.slots = manual_pick_entry_slots;
-                    if (manual_pick_assist.begin(start))
-                    {
-                        manual_pick_stationary_diagnostics = {};
-                        vec3 reach_facing = quat_mul_vec3(
-                            manual_pick_reach_waypoint.rotation,
-                            vec3(0.0F, 0.0F, 1.0F));
-                        reach_facing.y = 0.0F;
-                        manual_pick_common_entry =
-                            manual_pick_reach_waypoint.position -
-                            manual_pick_assist_config
-                                .reach_entry_distance_m *
-                                normalize(reach_facing);
-                        manual_pick_object_distance_at_begin_m =
-                            autodemo_planar_distance(
-                                manual_pick_root.position,
-                                manual_pick_target->object_world.position);
-                    }
-                }
-                gamepadstick_left = vec3();
-                gamepadstick_right = vec3();
+                manual_smart_pickup_pre_input.selected_affordance_id =
+                    manual_smart_pickup_target->affordances.front().id;
             }
+            manual_smart_pickup_pre_input.left_stick = gamepadstick_left;
+            manual_smart_pickup_pre_input.right_stick = gamepadstick_right;
+            manual_smart_pickup_pre_input.force_strafe =
+                raw_desired_strafe;
+            const interaction::PickAssistState
+                manual_smart_pickup_state_before_pre_step =
+                    manual_smart_pickup_controller.diagnostics().state;
+            manual_smart_pickup_pre_step =
+                manual_smart_pickup_controller.pre_step(
+                    manual_smart_pickup_pre_input);
+            if (manual_smart_pickup_pre_step.cancel_consumed)
+            {
+                interaction_edges.cancel_pressed = false;
+            }
+            if (manual_smart_pickup_pre_step.interact_consumed)
+            {
+                interaction_edges.interact_pressed = false;
+            }
+            const bool manual_smart_pickup_new_attempt =
+                manual_smart_pickup_pre_step.interact_consumed &&
+                (manual_smart_pickup_state_before_pre_step ==
+                     interaction::PickAssistState::Idle ||
+                 manual_smart_pickup_state_before_pre_step ==
+                     interaction::PickAssistState::Submitted ||
+                 manual_smart_pickup_state_before_pre_step ==
+                     interaction::PickAssistState::Failed);
+            if (manual_smart_pickup_pre_step.cancel_consumed ||
+                manual_smart_pickup_new_attempt)
+            {
+                manual_pick_stationary_diagnostics = {};
+            }
+            gamepadstick_left = manual_smart_pickup_pre_step.left_stick;
+            gamepadstick_right = manual_smart_pickup_pre_step.right_stick;
         }
         // Manual pick-assist input ends.
         if (!autodemo_configuration.has_value() &&
@@ -5046,14 +5010,7 @@ int main(void)
             desired_strafe = true;
         }
         // Manual pick-assist prior output begins.
-        if (!manual_pick_assist_activation_tick &&
-            manual_pick_assist_output.override_steering)
-        {
-            gamepadstick_left = manual_pick_assist_output.left_stick;
-            gamepadstick_right = manual_pick_assist_output.right_stick;
-        }
-        if (!manual_pick_assist_activation_tick &&
-            manual_pick_assist_output.force_strafe)
+        if (manual_smart_pickup_pre_step.force_strafe)
         {
             desired_strafe = true;
         }
@@ -5189,9 +5146,11 @@ int main(void)
             (!placement_autodemo_state.interact_pulsed ||
              placement_pick_interact_submitted_this_tick);
         const bool manual_pick_stationary_constraint_active =
-            !autodemo_configuration.has_value() &&
-            manual_pick_assist_output.stationary_constraint &&
-            interaction_scheduler.cached_output().diagnostics.state ==
+            !legacy_interaction_fixture_mode &&
+            !manual_smart_pickup_pre_step.cancel_consumed &&
+            !interaction_edges.reset_pressed &&
+            manual_smart_pickup_post_step.assist_output.stationary_constraint &&
+            cached_interaction_state ==
                 interaction::RuntimeState::Locomotion;
         const bool manual_pick_stationary_constraint_latched_this_tick =
             manual_pick_stationary_constraint_active &&
@@ -5608,8 +5567,6 @@ int main(void)
                 adjusted_rotation);
         }
 
-        const interaction::RuntimeState cached_interaction_state =
-            interaction_scheduler.cached_output().diagnostics.state;
         const bool use_autodemo_canonical_snapshot =
             pickup_autodemo_enabled &&
             autodemo_canonical_entry.has_value() &&
@@ -5651,59 +5608,66 @@ int main(void)
             autodemo_planar_distance(
                 bone_positions(0), manual_pick_previous_displayed_root) / dt;
         manual_pick_previous_displayed_root = bone_positions(0);
-        if (!manual_pick_assist_cancelled_this_tick)
+        if (!legacy_interaction_fixture_mode)
         {
-            std::optional<std::array<interaction::PickEntryPreview, 2>>
-                manual_pick_previews;
-            uint64_t manual_pick_preview_snapshot_fingerprint = 0U;
-            if (manual_pick_assist_output.needs_preview)
+            interaction::SmartPickupPostStepInput manual_smart_pickup_post_input{};
+            manual_smart_pickup_post_input.runtime_state =
+                cached_interaction_state;
+            manual_smart_pickup_post_input.live_flat_snapshot =
+            live_flat_snapshot;
+            const interaction::InteractionTarget* manual_smart_pickup_current_target =
+                interaction_registry.find(
+                    interaction_scene_target_handle);
+            manual_smart_pickup_post_input.current_target =
+                manual_smart_pickup_current_target;
+            for (int obstacle_index = 0;
+                 obstacle_index < obstacles_positions.size;
+                 ++obstacle_index)
             {
-                manual_pick_previews = preview_pick_entry_slots(
-                    live_flat_snapshot,
-                    manual_pick_entry_slots,
-                    manual_pick_assist.diagnostics().target,
-                    manual_pick_assist.diagnostics().affordance_id);
-                manual_pick_preview_snapshot_fingerprint =
-                    live_flat_snapshot_fingerprint;
+                manual_smart_pickup_post_input.obstacle_centers.push_back(
+                    obstacles_positions(obstacle_index));
+                manual_smart_pickup_post_input.obstacle_sizes.push_back(
+                    obstacles_scales(obstacle_index));
             }
-            const interaction::InteractionTarget* manual_pick_target =
-                interaction_registry.find_by_id(
-                    manual_pick_assist.diagnostics().target.id);
-            interaction::PickAssistObservation observation{};
-            observation.runtime_state = cached_interaction_state;
-            observation.target = manual_pick_target;
-            observation.displayed_root = interaction::Transform{
-                bone_positions(0), bone_rotations(0)};
-            observation.simulation_velocity = simulation_velocity;
-            observation.displayed_planar_speed_mps =
+            manual_smart_pickup_post_input.simulation_velocity =
+                simulation_velocity;
+            manual_smart_pickup_post_input.displayed_planar_speed_mps =
                 manual_pick_displayed_planar_speed_mps;
-            observation.camera_azimuth = camera_azimuth;
-            observation.snapshot_fingerprint =
-                live_flat_snapshot_fingerprint;
-            observation.preview_snapshot_fingerprint =
-                manual_pick_preview_snapshot_fingerprint;
-            observation.previews = manual_pick_previews;
-            const interaction::PickAssistOutput observed_output =
-                manual_pick_assist.observe(observation);
-            if (observed_output.submit_interact)
+            manual_smart_pickup_post_input.camera_azimuth = camera_azimuth;
+            manual_smart_pickup_post_input.next_request_id =
+                interaction_next_request_id;
+            const interaction::SmartPickupPreviewCallback
+                preview_manual_smart_pickup =
+                    [&](const interaction::LocomotionSnapshot& snapshot,
+                        interaction::PickEntryRoot prospective_root,
+                        interaction::TargetHandle target,
+                        uint32_t affordance_id)
+                        -> std::optional<interaction::PickEntryPreview>
+            {
+                return interaction_runtime.preview_pick(
+                    snapshot,
+                    prospective_root,
+                    target,
+                    affordance_id);
+            };
+            manual_smart_pickup_post_step =
+                manual_smart_pickup_controller.post_step(
+                    manual_smart_pickup_post_input,
+                    preview_manual_smart_pickup);
+            assert(
+                manual_smart_pickup_post_step.snapshot_fingerprint ==
+                live_flat_snapshot_fingerprint);
+            if (manual_smart_pickup_post_step.snapshot_fingerprint !=
+                live_flat_snapshot_fingerprint)
+            {
+                throw std::logic_error(
+                    "manual Smart Pickup snapshot fingerprint mismatch");
+            }
+            if (manual_smart_pickup_post_step.pick_request.has_value())
             {
                 interaction_edges.interact_pressed = true;
-                manual_pick_assist_synthetic_interact = true;
-                manual_pick_final_preview_certified_this_tick = true;
+                manual_smart_pickup_request = manual_smart_pickup_post_step.pick_request;
             }
-            manual_pick_assist_output = {};
-            manual_pick_assist_output.override_steering =
-                observed_output.override_steering;
-            manual_pick_assist_output.left_stick =
-                observed_output.left_stick;
-            manual_pick_assist_output.right_stick =
-                observed_output.right_stick;
-            manual_pick_assist_output.force_strafe =
-                observed_output.force_strafe;
-            manual_pick_assist_output.stationary_constraint =
-                observed_output.stationary_constraint;
-            manual_pick_assist_output.needs_preview =
-                observed_output.needs_preview;
         }
         // Manual pick-assist observation ends.
         const interaction::RuntimeOutput& interaction_output =
@@ -5836,25 +5800,27 @@ int main(void)
                 [&](const interaction::LocomotionSnapshot& snapshot)
                     -> std::optional<interaction::PickRequest>
                 {
+                    // Manual pick-assist submission begins.
+                    if (manual_smart_pickup_request.has_value())
+                    {
+                        const std::optional<interaction::PickRequest>
+                            manual_pick_request = std::exchange(
+                                manual_smart_pickup_request,
+                                std::nullopt);
+                        if (manual_pick_request->request_id !=
+                            interaction_next_request_id)
+                        {
+                            throw std::logic_error(
+                                "manual Smart Pickup request ID mismatch");
+                        }
+                        ++interaction_next_request_id;
+                        return manual_pick_request;
+                    }
+                    // Manual pick-assist submission ends.
                     if (!interaction_pack_loaded)
                     {
                         return std::nullopt;
                     }
-                    // Manual pick-assist submission begins.
-                    if (manual_pick_assist_synthetic_interact &&
-                        manual_pick_assist.owns_manual_interact())
-                    {
-                        const std::optional<interaction::PickRequest>
-                            manual_pick_request =
-                                manual_pick_assist.take_submission(
-                                    interaction_next_request_id);
-                        if (manual_pick_request.has_value())
-                        {
-                            ++interaction_next_request_id;
-                        }
-                        return manual_pick_request;
-                    }
-                    // Manual pick-assist submission ends.
                     if (placement_autodemo_enabled)
                     {
                         ++placement_autodemo_state.pick_resolver_calls;
@@ -5974,6 +5940,11 @@ int main(void)
                 {
                     return interaction_runtime.update(input);
                 });
+        manual_smart_pickup_request.reset();
+        if (interaction_edges.reset_pressed)
+        {
+            manual_smart_pickup_post_step = {};
+        }
         const uint64_t placement_preview_call_delta =
             placement_autodemo_state.runtime_preview_calls -
             placement_preview_calls_before_tick;
@@ -6412,31 +6383,37 @@ int main(void)
             locomotion_pose,
             interaction_config.matcher.maximum_approach_m);
         // Manual pick-assist route rendering begins.
-        if (manual_pick_assist.active() ||
-            manual_pick_final_preview_certified_this_tick)
+        const interaction::PickAssistDiagnostics& manual_pick_diagnostics =
+            manual_smart_pickup_controller.diagnostics();
+        if (manual_pick_diagnostics.slot_selection.selected_index.has_value())
         {
-            const interaction::PickAssistDiagnostics& diagnostics =
-                manual_pick_assist.diagnostics();
-            DrawLine3D(
-                to_Vector3(bone_positions(0)),
-                to_Vector3(manual_pick_common_entry),
-                GOLD);
-            if (diagnostics.selected_slot >= 0 &&
-                diagnostics.selected_slot <
-                    static_cast<int>(manual_pick_entry_slots.ordered.size()))
+            const size_t selected_index =
+                *manual_pick_diagnostics.slot_selection.selected_index;
+            if (selected_index <
+                manual_pick_diagnostics.slot_selection.ordered.size())
             {
-                const vec3 frozen_slot = manual_pick_entry_slots.ordered[
-                    static_cast<size_t>(diagnostics.selected_slot)]
-                        .waypoint.position;
+                const vec3 frozen_slot =
+                    manual_pick_diagnostics.slot_selection.ordered[
+                        selected_index].root_world.position;
                 const bool final_preview_certified =
-                    diagnostics.state ==
-                        interaction::PickAssistState::ReadyToSubmit ||
-                    manual_pick_final_preview_certified_this_tick;
+                    (manual_pick_diagnostics.state ==
+                         interaction::PickAssistState::ReadyToSubmit ||
+                     manual_pick_diagnostics.state ==
+                         interaction::PickAssistState::Submitted) &&
+                    manual_pick_diagnostics.final_preview.available &&
+                    manual_pick_diagnostics.final_preview
+                        .all_preview_roots_finite &&
+                    manual_pick_diagnostics.final_preview
+                        .fingerprint_equal &&
+                    manual_pick_diagnostics.final_preview
+                        .prospective_root_equal &&
+                    manual_pick_diagnostics.final_preview.path_feasible &&
+                    manual_pick_diagnostics.final_preview.match_ready;
                 const Color frozen_slot_color = final_preview_certified
                     ? GREEN
                     : ORANGE;
                 DrawLine3D(
-                    to_Vector3(manual_pick_common_entry),
+                    to_Vector3(bone_positions(0)),
                     to_Vector3(frozen_slot),
                     frozen_slot_color);
                 DrawSphereWires(
@@ -6491,21 +6468,27 @@ int main(void)
             340,
             20);
         // Manual pick-assist diagnostics begins.
-        const interaction::PickAssistDiagnostics& manual_pick_diagnostics =
-            manual_pick_assist.diagnostics();
+        const interaction::PickAssistDiagnostics& diagnostics =
+            manual_smart_pickup_controller.diagnostics();
+        const int manual_pick_selected_slot =
+            manual_pick_diagnostics.slot_selection.selected_index.has_value()
+            ? static_cast<int>(
+                  *manual_pick_diagnostics.slot_selection.selected_index)
+            : -1;
         DrawText(
             TextFormat(
                 "assist=%s reason=%s slot=%d settle=%u/%u route=%.3fm "
-                "object_distance_at_begin=%.3fm",
+                "origin=%.3fm bounds=%.3fm",
                 interaction::pick_assist_state_name(
                     manual_pick_diagnostics.state),
                 interaction::pick_assist_reason_name(
                     manual_pick_diagnostics.reason),
-                manual_pick_diagnostics.selected_slot,
+                manual_pick_selected_slot,
                 manual_pick_diagnostics.settle_ticks,
-                manual_pick_assist_config.required_settle_ticks,
+                interaction::PickAssistConfig{}.required_settle_ticks,
                 manual_pick_diagnostics.route_length_m,
-                manual_pick_object_distance_at_begin_m),
+                manual_pick_diagnostics.object_origin_distance_m,
+                manual_pick_diagnostics.object_bounds_center_distance_m),
             340,
             262,
             14,
@@ -6513,9 +6496,9 @@ int main(void)
         DrawText(
             TextFormat(
                 "error=%.3fm yaw=%.2fdeg speed=%.3fm/s",
-                manual_pick_diagnostics.root_error_m,
-                manual_pick_diagnostics.yaw_error_radians * 180.0F / PIf,
-                manual_pick_diagnostics.speed_mps),
+                diagnostics.root_error_m,
+                diagnostics.yaw_error_radians * 180.0F / PIf,
+                diagnostics.speed_mps),
             340,
             282,
             14,

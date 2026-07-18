@@ -2074,6 +2074,73 @@ class Task12PolicyTests(unittest.TestCase):
         raise AssertionError(f"controller function is unterminated: {signature}")
 
     @staticmethod
+    def _cpp_call_end(source: str, call_start: int) -> int:
+        try:
+            opening = source.index("(", call_start)
+        except ValueError as error:
+            raise AssertionError("C++ call has no opening parenthesis") from error
+        depth = 0
+        quote = None
+        escaped = False
+        line_comment = False
+        block_comment = False
+        index = opening
+        while index < len(source):
+            character = source[index]
+            following = source[index + 1] if index + 1 < len(source) else ""
+            if line_comment:
+                if character == "\n":
+                    line_comment = False
+                index += 1
+                continue
+            if block_comment:
+                if character == "*" and following == "/":
+                    block_comment = False
+                    index += 2
+                else:
+                    index += 1
+                continue
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = None
+                index += 1
+                continue
+            if character == "/" and following == "/":
+                line_comment = True
+                index += 2
+                continue
+            if character == "/" and following == "*":
+                block_comment = True
+                index += 2
+                continue
+            if character in ('"', "'"):
+                quote = character
+                index += 1
+                continue
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0:
+                    semicolon = index + 1
+                    while (
+                        semicolon < len(source)
+                        and source[semicolon].isspace()
+                    ):
+                        semicolon += 1
+                    if semicolon >= len(source) or source[semicolon] != ";":
+                        raise AssertionError(
+                            "C++ call is not terminated by a semicolon"
+                        )
+                    return semicolon + 1
+            index += 1
+        raise AssertionError("C++ call has unterminated parentheses")
+
+    @staticmethod
     def _first_if_scope(source: str) -> tuple[str, str]:
         match = re.search(r"\bif\s*\(", source)
         if match is None:
@@ -2984,7 +3051,7 @@ class Task12PolicyTests(unittest.TestCase):
             "interaction::SmartPickupPreStepInput manual_smart_pickup_pre_input{}",
             "manual_smart_pickup_pre_input.runtime_state = cached_interaction_state",
             "manual_smart_pickup_pre_input.interact_pressed = interaction_edges.interact_pressed",
-            "manual_smart_pickup_pre_input.cancel_pressed = interaction_edges.cancel_pressed",
+            "manual_smart_pickup_pre_input.cancel_pressed = interaction_edges.cancel_pressed || interaction_edges.reset_pressed",
             "manual_smart_pickup_pre_input.left_stick = gamepadstick_left",
             "manual_smart_pickup_pre_input.right_stick = gamepadstick_right",
             "manual_smart_pickup_controller.pre_step( manual_smart_pickup_pre_input)",
@@ -3441,10 +3508,47 @@ class Task12PolicyTests(unittest.TestCase):
             "if (manual_smart_pickup_post_step.pick_request.has_value())",
             "interaction_edges.interact_pressed = true",
             "manual_smart_pickup_request = manual_smart_pickup_post_step.pick_request",
-            "++interaction_next_request_id",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, normalized_observation)
+        self.assertEqual(
+            observation.count(
+                "manual_smart_pickup_request = "
+                "manual_smart_pickup_post_step.pick_request"
+            ),
+            1,
+            "post-step must latch the already-numbered optional exactly once",
+        )
+        self.assertIsNone(
+            re.search(
+                r"(?:\+\+\s*interaction_next_request_id|"
+                r"interaction_next_request_id\s*\+\+|"
+                r"interaction_next_request_id\s*\+=)",
+                observation,
+            ),
+            "post-step publication must not consume a request ID before the "
+            "scheduler accepts the request",
+        )
+
+        request_guard_source = observation[
+            observation.index(
+                "if (manual_smart_pickup_post_step.pick_request.has_value())"
+            ):
+        ]
+        request_condition, request_scope = self._first_if_scope(
+            request_guard_source
+        )
+        self.assertEqual(
+            "".join(request_condition.split()),
+            "manual_smart_pickup_post_step.pick_request.has_value()",
+        )
+        for required in (
+            "interaction_edges.interact_pressed = true",
+            "manual_smart_pickup_request = "
+            "manual_smart_pickup_post_step.pick_request",
+        ):
+            with self.subTest(latch_guard_required=required):
+                self.assertIn(required, request_scope)
 
         resolver = self._source_between(
             controller,
@@ -3458,25 +3562,214 @@ class Task12PolicyTests(unittest.TestCase):
             "                    // Manual pick-assist submission begins.",
             "                    // Manual pick-assist submission ends.",
         )
-        for required in (
-            "manual_smart_pickup_request.has_value()",
-            "return ",
-        ):
-            with self.subTest(required=required):
-                self.assertIn(required, submission)
-        self.assertRegex(
-            submission,
-            r"(?:std::exchange\(\s*manual_smart_pickup_request\s*,\s*"
-            r"std::nullopt\s*\)|manual_smart_pickup_request\.reset\(\))",
-            "the scheduler resolver must consume the latched request once",
+        submission_condition, submission_scope = self._first_if_scope(
+            submission
         )
-        self.assertNotIn("interaction_next_request_id", submission)
+        self.assertEqual(
+            "".join(submission_condition.split()),
+            "manual_smart_pickup_request.has_value()",
+            "the manual latch must be the scheduler resolver's first guard",
+        )
+        exchange_matches = re.findall(
+            r"std::exchange\(\s*manual_smart_pickup_request\s*,\s*"
+            r"std::nullopt\s*\)",
+            submission_scope,
+        )
+        self.assertEqual(
+            len(exchange_matches),
+            1,
+            "the accepted scheduler path must exchange the latch exactly once",
+        )
+        local_match = re.search(
+            r"(?:(?:const\s+)?std::optional<interaction::PickRequest>|"
+            r"(?:const\s+)?auto)\s+([A-Za-z_]\w*)\s*=\s*"
+            r"std::exchange\(\s*manual_smart_pickup_request\s*,\s*"
+            r"std::nullopt\s*\)\s*;",
+            submission_scope,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(
+            local_match,
+            "the exchanged request must be retained locally for ID validation",
+        )
+        submission_local = local_match.group(1)
+        compact_scope = "".join(submission_scope.split())
+        exchange = compact_scope.index(
+            f"{submission_local}=std::exchange("
+            "manual_smart_pickup_request,std::nullopt);"
+        )
+        mismatch_guard = compact_scope.index(
+            f"if({submission_local}->request_id!="
+            "interaction_next_request_id)",
+            exchange,
+        )
+        mismatch_throw = re.search(
+            r"throwstd::(?:logic_error|runtime_error)\(",
+            compact_scope[mismatch_guard:],
+        )
+        self.assertIsNotNone(
+            mismatch_throw,
+            "request ID mismatch must fail in release builds",
+        )
+        mismatch_throw_position = mismatch_guard + mismatch_throw.start()
+        increment = compact_scope.index(
+            "++interaction_next_request_id;", mismatch_throw_position
+        )
+        returned = compact_scope.index(
+            f"return{submission_local};", increment
+        )
+        self.assertEqual(
+            len(
+                re.findall(
+                    r"(?:\+\+interaction_next_request_id|"
+                    r"interaction_next_request_id\+\+|"
+                    r"interaction_next_request_id\+=)",
+                    compact_scope,
+                )
+            ),
+            1,
+            "the accepted scheduler path must consume exactly one request ID",
+        )
+        self.assertEqual(
+            [exchange, mismatch_guard, mismatch_throw_position, increment, returned],
+            sorted(
+                [
+                    exchange,
+                    mismatch_guard,
+                    mismatch_throw_position,
+                    increment,
+                    returned,
+                ]
+            ),
+            "the resolver must exchange, validate the pre-increment ID, "
+            "increment once, then return that same request",
+        )
         self.assertLess(
             resolver.index("// Manual pick-assist submission begins."),
             resolver.index("if (!autodemo_configuration.has_value())"),
         )
+
+        scheduler_call = controller.index("interaction_scheduler.tick(")
+        scheduler_return = self._cpp_call_end(controller, scheduler_call)
+        post_scheduler_boundary = controller.index(
+            "        const uint64_t placement_preview_call_delta =",
+            scheduler_return,
+        )
+        latch_reset = controller.index(
+            "manual_smart_pickup_request.reset();", scheduler_return
+        )
+        self.assertEqual(
+            controller[scheduler_return:latch_reset].strip(),
+            "",
+            "the caller must discard any scheduler-skipped latch immediately "
+            "after tick returns",
+        )
+        self.assertLess(latch_reset, post_scheduler_boundary)
+        self.assertNotIn(
+            "manual_smart_pickup_request.reset();",
+            controller[
+                controller.index("        // Manual pick-assist observation ends."):
+                scheduler_return
+            ],
+            "clearing before scheduler.tick would discard accepted requests",
+        )
         self.assertNotIn("take_submission(", controller)
         self.assertNotIn("manual_pick_assist_synthetic_interact", controller)
+
+    def test_manual_pick_reset_reaches_scheduler_and_clears_stale_output(self):
+        controller = Path("controller.cpp").read_text(encoding="utf-8")
+        edge_capture = self._source_between(
+            controller,
+            "        interaction::ControllerInteractionEdges interaction_edges{",
+            "        const interaction::RuntimeState cached_interaction_state =",
+        )
+        self.assertIn("IsKeyPressed(KEY_R)", edge_capture)
+
+        manual_input = self._source_between(
+            controller,
+            "        // Manual pick-assist input begins.",
+            "        // Manual pick-assist input ends.",
+        )
+        self.assertNotIn(
+            "interaction_edges.reset_pressed = false",
+            manual_input,
+            "manual Smart Pickup must leave R available to scheduler priority",
+        )
+        self.assertIn(
+            "manual_smart_pickup_pre_input.cancel_pressed = "
+            "interaction_edges.cancel_pressed || "
+            "interaction_edges.reset_pressed",
+            " ".join(manual_input.split()),
+            "R must cancel an active coordinator attempt without consuming the "
+            "scheduler reset edge",
+        )
+
+        stationary_search = self._source_between(
+            controller,
+            "        // Placement stationary search begins.",
+            "        // Placement stationary search ends.",
+        )
+        stationary_match = re.search(
+            r"const\s+bool\s+manual_pick_stationary_constraint_active\s*=\s*"
+            r"(?P<expression>.*?);",
+            stationary_search,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(
+            stationary_match,
+            "manual stationary constraint expression is missing",
+        )
+        stationary_expression = " ".join(
+            stationary_match.group("expression").split()
+        )
+        self.assertIn(
+            "!interaction_edges.reset_pressed",
+            stationary_expression,
+            "R must suppress same-tick stationary interaction matching",
+        )
+
+        scheduler_call = controller.index("interaction_scheduler.tick(")
+        compact_scheduler_prefix = "".join(
+            controller[scheduler_call:scheduler_call + 160].split()
+        )
+        self.assertTrue(
+            compact_scheduler_prefix.startswith(
+                "interaction_scheduler.tick(interaction_edges,"
+            ),
+            "the unconsumed R edge must reach the scheduler",
+        )
+        scheduler_return = self._cpp_call_end(controller, scheduler_call)
+        post_scheduler_boundary = controller.index(
+            "        const uint64_t placement_preview_call_delta =",
+            scheduler_return,
+        )
+        post_scheduler = controller[
+            scheduler_return:post_scheduler_boundary
+        ]
+        self.assertEqual(
+            post_scheduler.count("manual_smart_pickup_request.reset();"),
+            1,
+            "the caller must discard a request skipped by reset priority",
+        )
+        reset_guard_start = post_scheduler.index(
+            "if (interaction_edges.reset_pressed)"
+        )
+        reset_condition, reset_scope = self._first_if_scope(
+            post_scheduler[reset_guard_start:]
+        )
+        self.assertEqual(
+            "".join(reset_condition.split()),
+            "interaction_edges.reset_pressed",
+        )
+        self.assertIn(
+            "manual_smart_pickup_post_step = {};",
+            reset_scope,
+            "R must clear persistent assist output after scheduler priority",
+        )
+        self.assertLess(
+            post_scheduler.index("manual_smart_pickup_request.reset();"),
+            reset_guard_start,
+        )
 
     def test_manual_braking_uses_combined_stationary_search_only(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")
@@ -3772,7 +4065,7 @@ class Task12PolicyTests(unittest.TestCase):
         )
         normalized_input = " ".join(manual_input.split())
         for required in (
-            "manual_smart_pickup_pre_input.cancel_pressed = interaction_edges.cancel_pressed",
+            "manual_smart_pickup_pre_input.cancel_pressed = interaction_edges.cancel_pressed || interaction_edges.reset_pressed",
             "manual_smart_pickup_controller.pre_step(",
             "if (manual_smart_pickup_pre_step.cancel_consumed)",
             "interaction_edges.cancel_pressed = false",
@@ -3813,7 +4106,7 @@ class Task12PolicyTests(unittest.TestCase):
         normalized_input = " ".join(manual_input.split())
         required_in_order = (
             "manual_smart_pickup_pre_input.interact_pressed = interaction_edges.interact_pressed",
-            "manual_smart_pickup_pre_input.cancel_pressed = interaction_edges.cancel_pressed",
+            "manual_smart_pickup_pre_input.cancel_pressed = interaction_edges.cancel_pressed || interaction_edges.reset_pressed",
             "manual_smart_pickup_controller.pre_step(",
             "if (manual_smart_pickup_pre_step.cancel_consumed)",
             "interaction_edges.cancel_pressed = false",

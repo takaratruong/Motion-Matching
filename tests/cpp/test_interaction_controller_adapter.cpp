@@ -15,6 +15,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -1227,6 +1228,95 @@ void test_edges_latch_coalesce_and_clear_after_delivery() {
     assert(immediate.reset_pressed);
     assert(update_calls == 3);
     assert(scheduler.phase() == 0);
+}
+
+void test_manual_pick_request_reset_priority_discards_stale_latch() {
+    ControllerInteractionScheduler scheduler;
+    std::optional<PickRequest> manual_request;
+    uint64_t next_request_id = 71U;
+    uint32_t resolver_calls = 0U;
+    uint32_t exchanges = 0U;
+    bool persistent_manual_post_output = true;
+    std::vector<RuntimeInput> delivered;
+    const PickRequest request{{42U, 7U}, 9U, 71U};
+
+    const auto snapshot = [] { return make_snapshot(4.0F); };
+    const auto resolve_pick = [&](const LocomotionSnapshot&)
+        -> std::optional<PickRequest> {
+        ++resolver_calls;
+        if (!manual_request.has_value()) {
+            return std::nullopt;
+        }
+        ++exchanges;
+        std::optional<PickRequest> submission =
+            std::exchange(manual_request, std::nullopt);
+        require(
+            submission->request_id == next_request_id,
+            "resolver accepted a request with the wrong pre-increment ID");
+        ++next_request_id;
+        return submission;
+    };
+    const auto no_place = [](const LocomotionSnapshot&)
+        -> std::optional<ControllerPlaceTarget> { return std::nullopt; };
+    const auto no_preview = [](SurfaceHandle, uint32_t) {
+        return PlaceStagingPreview{};
+    };
+    const auto update = [&](const RuntimeInput& input) {
+        delivered.push_back(input);
+        return make_complete_output(
+            static_cast<int>(delivered.size()), RuntimeState::Locomotion);
+    };
+
+    manual_request = request;
+    (void)scheduler.tick(
+        {true, false, true},
+        snapshot,
+        resolve_pick,
+        no_place,
+        no_preview,
+        update);
+    manual_request.reset();
+    if (delivered.back().reset_pressed) {
+        persistent_manual_post_output = false;
+    }
+    require(
+        resolver_calls == 0U && exchanges == 0U &&
+            next_request_id == 71U && !manual_request.has_value() &&
+            !persistent_manual_post_output &&
+            delivered.back().reset_pressed &&
+            !delivered.back().interact_pressed &&
+            !delivered.back().pick_request.has_value(),
+        "reset priority consumed or retained the same-tick manual latch");
+
+    (void)scheduler.tick(
+        {true, false, false},
+        snapshot,
+        resolve_pick,
+        no_place,
+        no_preview,
+        update);
+    manual_request.reset();
+    require(
+        resolver_calls == 1U && exchanges == 0U &&
+            next_request_id == 71U &&
+            !delivered.back().pick_request.has_value(),
+        "a later F submitted the request skipped by reset priority");
+
+    manual_request = request;
+    (void)scheduler.tick(
+        {true, false, false},
+        snapshot,
+        resolve_pick,
+        no_place,
+        no_preview,
+        update);
+    manual_request.reset();
+    require(
+        resolver_calls == 2U && exchanges == 1U &&
+            next_request_id == 72U && !manual_request.has_value() &&
+            delivered.back().pick_request.has_value() &&
+            delivered.back().pick_request->request_id == 71U,
+        "accepted manual request did not exchange once with its prior ID");
 }
 
 void test_cache_changes_only_after_successful_due_delivery() {
@@ -5960,6 +6050,16 @@ void test_controller_smart_pickup_two_phase_production_seam() {
 
     require(
         compact_manual_input.find(
+            "manual_smart_pickup_pre_input.cancel_pressed="
+            "interaction_edges.cancel_pressed||"
+            "interaction_edges.reset_pressed;") != std::string::npos &&
+            manual_input.find("interaction_edges.reset_pressed = false") ==
+                std::string::npos,
+        "R reset is not forwarded as coordinator cancel while remaining "
+        "scheduler-owned");
+
+    require(
+        compact_manual_input.find(
             "constinteraction::InteractionTarget*"
             "manual_smart_pickup_target=interaction_registry.find("
             "interaction_scene_target_handle);") != std::string::npos,
@@ -6126,8 +6226,6 @@ void test_controller_smart_pickup_two_phase_production_seam() {
         "manual_smart_pickup_request = "
         "manual_smart_pickup_post_step.pick_request",
         request_edge);
-    const size_t request_increment = manual_observation.find(
-        "++interaction_next_request_id", request_latch);
     require(
         post_call != std::string::npos &&
             compact_manual_observation.find(
@@ -6137,11 +6235,12 @@ void test_controller_smart_pickup_two_phase_production_seam() {
             request_guard != std::string::npos &&
             request_edge != std::string::npos &&
             request_latch != std::string::npos &&
-            request_increment != std::string::npos &&
             post_call < request_guard && request_guard < request_edge &&
             request_edge < request_latch &&
-            request_latch < request_increment,
-        "post-step result does not flow once into edge/request/id handoff");
+            manual_observation.find(
+                "++interaction_next_request_id", request_latch) ==
+                std::string::npos,
+        "post-step must latch its request without advancing the request ID");
     require(
         compact_manual_observation.find(
             "manual_smart_pickup_post_input.next_request_id="
@@ -6159,6 +6258,56 @@ void test_controller_smart_pickup_two_phase_production_seam() {
     require(
         pick_resolver != std::string::npos,
         "cannot bound the scheduler's production locomotion provider");
+    const size_t place_resolver = controller.find(
+        "                [&](const interaction::LocomotionSnapshot& snapshot)\n"
+        "                    -> std::optional<interaction::ControllerPlaceTarget>",
+        pick_resolver);
+    require(
+        place_resolver != std::string::npos,
+        "cannot bound the scheduler's production pick resolver");
+    const std::string pick_resolver_source = controller.substr(
+        pick_resolver, place_resolver - pick_resolver);
+    const std::string compact_pick_resolver =
+        without_ascii_whitespace(pick_resolver_source);
+    std::string manual_request_local;
+    size_t exchange_request = std::string::npos;
+    for (const std::string& candidate : {
+             std::string("manual_pick_request"),
+             std::string("manual_smart_pickup_submission")}) {
+        const std::string request_exchange =
+            "conststd::optional<interaction::PickRequest>" + candidate +
+            "=std::exchange(manual_smart_pickup_request,std::nullopt);";
+        exchange_request = compact_pick_resolver.find(request_exchange);
+        if (exchange_request != std::string::npos) {
+            manual_request_local = candidate;
+            break;
+        }
+    }
+    const size_t validate_request = compact_pick_resolver.find(
+        manual_request_local +
+            "->request_id!=interaction_next_request_id",
+        exchange_request);
+    const size_t increment_request = compact_pick_resolver.find(
+        "++interaction_next_request_id;", validate_request);
+    const size_t return_request = compact_pick_resolver.find(
+        "return" + manual_request_local + ";", increment_request);
+    require(
+        exchange_request != std::string::npos &&
+            validate_request != std::string::npos &&
+            increment_request != std::string::npos &&
+            return_request != std::string::npos &&
+            occurrence_count(
+                compact_pick_resolver,
+                "std::exchange(manual_smart_pickup_request,std::nullopt)") ==
+                1U &&
+            occurrence_count(
+                compact_pick_resolver,
+                "++interaction_next_request_id;") == 1U &&
+            exchange_request < validate_request &&
+            validate_request < increment_request &&
+            increment_request < return_request,
+        "manual resolver must exchange once, validate the pre-increment ID, "
+        "increment once on consumption, and return the local request");
     const std::string provider_source = controller.substr(
         scheduler_tick, pick_resolver - scheduler_tick);
     const std::string compact_provider =
@@ -6183,6 +6332,42 @@ void test_controller_smart_pickup_two_phase_production_seam() {
             provider_alias < provider_return &&
             scheduler_tick < scheduler_updated,
         "scheduler does not publish the sole post-step live-flat snapshot");
+
+    const size_t scheduler_cleanup_end = controller.find(
+        "        const uint64_t placement_preview_call_delta =",
+        scheduler_tick);
+    const std::string scheduler_call_end_marker = "                });";
+    const size_t scheduler_call_end = controller.rfind(
+        scheduler_call_end_marker, scheduler_cleanup_end);
+    require(
+        scheduler_cleanup_end != std::string::npos &&
+            scheduler_call_end != std::string::npos &&
+            scheduler_tick < scheduler_call_end,
+        "cannot bound immediate post-scheduler manual cleanup");
+    const std::string scheduler_cleanup = controller.substr(
+        scheduler_call_end + scheduler_call_end_marker.size(),
+        scheduler_cleanup_end -
+            (scheduler_call_end + scheduler_call_end_marker.size()));
+    const size_t clear_unconsumed = scheduler_cleanup.find(
+        "manual_smart_pickup_request.reset();");
+    const size_t reset_guard = scheduler_cleanup.find(
+        "if (interaction_edges.reset_pressed)", clear_unconsumed);
+    const size_t clear_post_output = scheduler_cleanup.find(
+        "manual_smart_pickup_post_step = {};", reset_guard);
+    require(
+        clear_unconsumed != std::string::npos &&
+            reset_guard != std::string::npos &&
+            clear_post_output != std::string::npos &&
+            occurrence_count(
+                scheduler_cleanup,
+                "manual_smart_pickup_request.reset();") == 1U &&
+            occurrence_count(
+                scheduler_cleanup,
+                "manual_smart_pickup_post_step = {};") == 1U &&
+            clear_unconsumed < reset_guard &&
+            reset_guard < clear_post_output,
+        "scheduler tick does not discard an unconsumed manual latch and clear "
+        "persistent post output under reset");
 
     const size_t placement_scheduler = adapter.find(
         "const PlaceTargetResolver& place_target_resolver");
@@ -6451,6 +6636,7 @@ int main(int argc, char** argv) {
     test_flat_bridge_canaries_prove_exact_23_element_bounds();
     test_scheduler_cadence_and_cache();
     test_edges_latch_coalesce_and_clear_after_delivery();
+    test_manual_pick_request_reset_priority_discards_stale_latch();
     test_cache_changes_only_after_successful_due_delivery();
     test_scheduler_latches_carry_place_and_submits_only_live_ready_preview();
     test_scheduler_cancel_clears_place_latch_before_another_preview();
