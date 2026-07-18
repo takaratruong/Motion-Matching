@@ -221,28 +221,56 @@ For manual play, build the controller and point it at the generated pack:
 
 ```bash
 make controller
-MM_INTERACTION_PACK=resources/g1_interaction ./controller
+MM_FEATURES_OUTPUT=build/smart-pickup/manual-flat-features.bin \
+MM_INTERACTION_PACK=build/smart-pickup/full-pack \
+./controller
 ```
 
-Use WASD or the left gamepad stick to move, the arrow keys or right stick to control the camera/facing, and the existing walk/strafe controls for locomotion. Near the highlighted target, press `F` (gamepad right-face-left) to request pickup or placement. The authored destination table copies the source table dimensions and sits exactly 1.20 m farther along world +Z. While carrying, move within the manual 1.00 m surface-selection envelope and press `F`; the controller then stages through the ordinary Carry movement input and submits placement only from a newly ready runtime preview. Press `X` (right-face-up) to clear staging or cancel while cancellation is allowed, and `R` (right-face-right) to reset the held object. Invalid or out-of-range requests leave the object unmoved and report a diagnostic reason.
+`MM_FEATURES_OUTPUT` keeps the generated ordinary flat-locomotion feature output
+under `build/` instead of rewriting the tracked `resources/features.bin`.
 
-In Locomotion, `F` starts manual pick assist. A bounded 1.45 m
-root-to-object acquisition query finds the sole free target, but the exact
-assisted route remains at most 1.00 m. Its two legs are current root to the
-common Reach entry, then entry to an eligible affordance slot. The controller drives this
-route with ordinary flat-ground locomotion, evaluates both live entry-slot
-previews from one post-step snapshot, freezes one feasible and ready slot, and
-brakes through stationary motion matching. It then requires five consecutive
-settled 25 Hz ticks, certifies a fresh final preview, and hands exactly one
-pickup request to the existing interaction runtime. `X` cancels any
-pre-submission assist and releases its movement override in the same tick;
-Carry keeps the existing `F` placement controls and `X` staging/cancellation
-controls.
+Manual startup is fail-closed: this pack must report rate **25/1**, exactly
+**2,045 clips**, and exactly **511,250 frames** with the matching feature-frame
+count. It loads the baked Smart Pickup target and does not substitute the
+small diagnostic fixture used by legacy evidence gates.
+
+Use **WASD** or the left gamepad stick for ordinary flat-ground locomotion and
+the **arrow keys** or right stick for the camera/facing controls.
+Press `F` (gamepad right-face-left) to request pickup or placement, `X`
+(right-face-up) to cancel the active pre-submission assist or clear placement
+staging, and `R` (right-face-right) to cancel the assist and reset interaction
+state. Carry keeps the existing `F` placement controls. While carrying, move
+within the manual 1.00 m surface-selection envelope and press `F`; the
+controller stages with the ordinary Carry movement input and submits only a
+newly ready runtime placement preview. Invalid, blocked, or out-of-range
+requests leave the object unmoved and report a diagnostic reason.
+
+The retained authored destination copies the source table dimensions and sits
+exactly 1.20 m farther along world +Z. Its safe destination marker preserves
+the baked source-relative X, Y, rotation, and support relation while applying
+a **+0.04 m** inset along destination-local +Z, keeping the object inside the
+table's placement-clearance margin.
+
+In Locomotion, `F` captures the exact baked target intent, consumes the input
+edge, and lets the controller perform its one ordinary 25 Hz locomotion step.
+The coordinator then receives the authoritative post-step live-flat snapshot.
+The exact assisted route remains at most 1.00 m and is driven through ordinary
+flat-ground locomotion. It uses one frozen authored-slot preview from that
+post-step live-flat snapshot, brakes through stationary motion matching,
+requires five consecutive settled 25 Hz ticks, certifies the final preview,
+and hands exactly one pickup request to the existing interaction runtime. `X`
+cancels any pre-submission assist and releases its movement override in the
+same tick; `R` also reaches scheduler reset priority without allowing stale
+assisted steering to resume.
 
 The manual-assist overlay reports state, reason, selected slot, settle count,
-route length, position and yaw errors, displayed speed, and the latched
-`object_distance_at_begin`. Its world-space route and slot marker are
-diagnostic only; green means the final live preview was certified.
+route length, position and yaw errors, and displayed speed. Its world-space
+route and slot marker are diagnostic only; green means the final live preview
+was certified. The current manual scope is one baked tabletop object, one
+known pickup target, one retained table destination, and flat-ground movement.
+Multi-object selection, alternate object profiles, shelves, terrain,
+articulated doors or drawers, and learned approach generation are not yet
+supported.
 
 The manual demo intentionally supplies no recorded place clips, so its successful placement mode is `ReversedPickup`. On release, the object remains at the destination table with that table's support context and is immediately available for a later pickup.
 
