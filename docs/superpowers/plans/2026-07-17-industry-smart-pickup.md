@@ -821,7 +821,7 @@ Make, and raylib for the final native visualization only.
   - inside the slow radius, output uses `arrival_navigation_stick`,
     `arrival_facing_stick`, and `force_strafe=true`.
 
-- [ ] **Step 3: Write failing exact identity, cancellation, and arrival tests**
+- [x] **Step 3: Write failing exact identity, cancellation, and arrival tests**
 
   Independently mutate target generation, target object pose, ownership state,
   affordance grasp, selected slot geometry, selected slot ID, and slot order.
