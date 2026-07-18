@@ -15,6 +15,7 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -289,6 +290,54 @@ private:
     interaction::ControllerPickAssist implementation_;
 };
 
+class ThrowingBeginAssistBackend final
+    : public interaction::SmartPickupAssistBackend {
+public:
+    bool begin(
+        const interaction::PickAssistStart&,
+        const interaction::InteractionTarget*) override {
+        ++begin_calls;
+        throw std::runtime_error("intentional smart-pickup begin failure");
+    }
+
+    void cancel() override {
+        ++cancel_calls;
+    }
+
+    interaction::PickAssistOutput observe(
+        const interaction::PickAssistObservation&) override {
+        ++observe_calls;
+        return {};
+    }
+
+    std::optional<interaction::PickRequest> take_submission(
+        uint64_t) override {
+        ++take_submission_calls;
+        return std::nullopt;
+    }
+
+    bool active() const override {
+        return false;
+    }
+
+    bool owns_manual_interact() const override {
+        return false;
+    }
+
+    const interaction::PickAssistDiagnostics& diagnostics()
+        const override {
+        return diagnostics_;
+    }
+
+    uint32_t begin_calls = 0U;
+    uint32_t cancel_calls = 0U;
+    uint32_t observe_calls = 0U;
+    uint32_t take_submission_calls = 0U;
+
+private:
+    interaction::PickAssistDiagnostics diagnostics_{};
+};
+
 // This raylib-free harness establishes only the caller-side pre/ordinary/post
 // order around the coordinator. Production locomotion-provider, live-flat
 // bridge, scheduler-publication, and controller-obstacle identity counts remain
@@ -513,6 +562,115 @@ void test_activation_brackets_one_caller_step_and_defers_assist_motion() {
         !same_vec3_bits(
             root_transform(next_snapshot).position, next_root_before),
         "assisted steering did not affect the tick after activation");
+}
+
+void test_begin_exception_clears_pending_activation_before_backend_call() {
+    interaction::InteractionTarget target = make_controller_target();
+    ThrowingBeginAssistBackend backend;
+    interaction::SmartPickupController controller(backend);
+    CallerOrderHarness locomotion;
+
+    const interaction::SmartPickupPreStepResult activation =
+        controller.pre_step(make_pre_input(&target, true));
+    require(
+        activation.interact_consumed && is_zero(activation.left_stick) &&
+            is_zero(activation.right_stick),
+        "throwing-begin fixture did not capture the F edge");
+    const interaction::LocomotionSnapshot activation_snapshot =
+        locomotion.step(activation);
+
+    uint32_t preview_calls = 0U;
+    bool begin_threw = false;
+    try {
+        (void)controller.post_step(
+            make_post_input(activation_snapshot, &target),
+            rejecting_preview_counter(preview_calls));
+    } catch (const std::runtime_error& error) {
+        begin_threw = std::string(error.what()) ==
+            "intentional smart-pickup begin failure";
+    }
+    require(
+        begin_threw && backend.begin_calls == 1U &&
+            backend.observe_calls == 0U && preview_calls == 0U,
+        "backend begin exception was not propagated exactly once");
+
+    interaction::SmartPickupPreStepInput raw =
+        make_pre_input(&target, false);
+    raw.left_stick = vec3(-0.81F, 0.0F, 0.37F);
+    raw.right_stick = vec3(0.26F, 0.0F, -0.93F);
+    raw.force_strafe = true;
+    const interaction::SmartPickupPreStepResult after_exception =
+        controller.pre_step(raw);
+    require(
+        !after_exception.interact_consumed &&
+            !after_exception.cancel_consumed &&
+            same_vec3_bits(after_exception.left_stick, raw.left_stick) &&
+            same_vec3_bits(after_exception.right_stick, raw.right_stick) &&
+            after_exception.force_strafe == raw.force_strafe &&
+            backend.begin_calls == 1U,
+        "begin exception left pending activation owning the next pre-step");
+
+    const interaction::LocomotionSnapshot after_snapshot =
+        locomotion.step(after_exception);
+    const interaction::SmartPickupPostStepResult after_post =
+        controller.post_step(
+            make_post_input(after_snapshot, &target),
+            rejecting_preview_counter(preview_calls));
+    require(
+        backend.begin_calls == 1U && backend.observe_calls == 0U &&
+            backend.take_submission_calls == 0U && preview_calls == 0U &&
+            !after_post.pick_request.has_value(),
+        "begin exception retried pending activation on a later post-step");
+}
+
+void test_obstacle_array_exception_clears_pending_activation() {
+    interaction::InteractionTarget target = make_controller_target();
+    CountingAssistBackend backend;
+    interaction::SmartPickupController controller(backend);
+    CallerOrderHarness locomotion;
+
+    const interaction::SmartPickupPreStepResult activation =
+        controller.pre_step(make_pre_input(&target, true));
+    const interaction::LocomotionSnapshot activation_snapshot =
+        locomotion.step(activation);
+    interaction::SmartPickupPostStepInput mismatched =
+        make_post_input(activation_snapshot, &target);
+    mismatched.obstacle_centers.push_back(vec3(1.0F, 2.0F, 3.0F));
+
+    uint32_t preview_calls = 0U;
+    bool mismatch_threw = false;
+    try {
+        (void)controller.post_step(
+            mismatched, rejecting_preview_counter(preview_calls));
+    } catch (const std::invalid_argument&) {
+        mismatch_threw = true;
+    }
+    require(
+        mismatch_threw && backend.begin_calls == 0U &&
+            backend.observe_calls == 0U && preview_calls == 0U,
+        "obstacle-array mismatch did not fail before backend work");
+
+    interaction::SmartPickupPreStepInput raw =
+        make_pre_input(&target, false);
+    raw.left_stick = vec3(-0.52F, 0.0F, 0.43F);
+    raw.right_stick = vec3(0.71F, 0.0F, -0.19F);
+    const interaction::SmartPickupPreStepResult after_exception =
+        controller.pre_step(raw);
+    require(
+        same_vec3_bits(after_exception.left_stick, raw.left_stick) &&
+            same_vec3_bits(after_exception.right_stick, raw.right_stick),
+        "obstacle-array exception left pending activation owning input");
+
+    const interaction::LocomotionSnapshot after_snapshot =
+        locomotion.step(after_exception);
+    const interaction::SmartPickupPostStepResult after_post =
+        controller.post_step(
+            make_post_input(after_snapshot, &target),
+            rejecting_preview_counter(preview_calls));
+    require(
+        backend.begin_calls == 0U && backend.observe_calls == 0U &&
+            !after_post.pick_request.has_value(),
+        "obstacle-array exception retried on a later post-step");
 }
 
 using TargetMutation = void (*)(interaction::InteractionTarget&);
@@ -1299,6 +1457,8 @@ void test_final_preview_and_request_are_each_one_shot() {
 
 int main() {
     test_activation_brackets_one_caller_step_and_defers_assist_motion();
+    test_begin_exception_clears_pending_activation_before_backend_call();
+    test_obstacle_array_exception_clears_pending_activation();
     test_pending_target_mutations_fail_before_slot_freeze();
     test_post_begin_slot_mutations_fail_without_hopping();
     test_missing_target_and_selector_fail_stably_after_consuming_f();
