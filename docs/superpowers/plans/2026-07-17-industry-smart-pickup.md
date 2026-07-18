@@ -1147,7 +1147,7 @@ Make, and raylib for the final native visualization only.
   authority. The Python gate requires this output to match the preview probe's
   final `selected_slots` object byte-for-byte after canonical JSON encoding.
 
-- [ ] **Step 1: Write failing baked-scene unit tests**
+- [x] **Step 1: Write failing baked-scene unit tests**
 
   Assert the authored target has handle `{1,1}`, profile `1`, Free/unowned
   state, one right-hand affordance ID `1`, exactly three nonzero ordered slot
@@ -1171,7 +1171,7 @@ Make, and raylib for the final native visualization only.
   Assert the destination is the same support translated exactly `+1.20 m` in
   world Z and passes `evaluate_placement_fit` for the baked object bounds.
 
-- [ ] **Step 2: Add the safe probe targets and verify red failures**
+- [x] **Step 2: Add the safe probe targets and verify red failures**
 
   Add explicit Make targets for `test_interaction_smart_pickup_scene`,
   `interaction_smart_pickup_preview_probe`, and
@@ -1191,7 +1191,7 @@ Make, and raylib for the final native visualization only.
 
   Expected: compilation fails because the scene/probe sources do not exist.
 
-- [ ] **Step 3: Write the failing manifest-aware preview-and-bake gate**
+- [x] **Step 3: Write the failing manifest-aware preview-and-bake gate**
 
   First create `tests/python/test_smart_pickup_full_pack_gate.py`. The gate
   receives `SMART_PICKUP_FULL_PACK`, `SMART_PICKUP_PREVIEW_PROBE`, and

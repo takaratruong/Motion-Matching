@@ -82,27 +82,65 @@ _EXPECTED_TARGET = {
 }
 
 _F32_HEX = re.compile(r"0x[0-9a-f]{8}\Z")
+_REASON_NAMES = {
+    "BlockedPath",
+    "Cancelled",
+    "ClipEnded",
+    "ContactOrientation",
+    "ContactPosition",
+    "CorrectionLimit",
+    "JointLimit",
+    "LostContact",
+    "NoCandidate",
+    "None",
+    "OutOfRange",
+    "PackUnavailable",
+    "PlacementOutOfBounds",
+    "PoorMatch",
+    "ReleaseOrientation",
+    "ReleasePosition",
+    "Reset",
+    "SurfaceChanged",
+    "SurfaceUnavailable",
+    "TargetChanged",
+    "TargetUnavailable",
+}
 _CANDIDATE_KEYS = {
     "candidate_ordinal",
     "contact_local_frame",
     "entry_local_frame",
+    "feasible_entry_frame",
     "match_ready",
+    "match_reason",
     "matcher_provenance",
     "path_feasible",
+    "path_reason",
     "preview_authority",
+    "preview_contact_frame",
+    "preview_count",
+    "prospective_root_x_object_m",
     "prospective_root_x_object_f32_hex",
+    "prospective_root_yaw_object_radians",
     "prospective_root_yaw_object_f32_hex",
+    "prospective_root_z_object_m",
     "prospective_root_z_object_f32_hex",
     "record_type",
+    "runtime_ready_cost_evidence",
+    "selected_stationary_flat_frame",
     "sequence_id",
+    "snapshot_fingerprint",
     "source_clip_ordinal",
+    "total_cost",
 }
 _MATCHER_KEYS = {
     "clip_ordinal",
+    "contact_global_frame",
     "contact_local_frame",
+    "entry_global_frame",
     "entry_local_frame",
     "sequence_id",
 }
+_READY_COST_KEYS = {"stationary_flat_frame", "total_cost"}
 _SLOT_KEYS = {
     "contact_local_frame",
     "entry_local_frame",
@@ -153,6 +191,15 @@ def _require_int(value, label, minimum=0):
     _require(value >= minimum, f"{label} must be at least {minimum}")
 
 
+def _require_number(value, label, minimum=None):
+    _require(
+        type(value) in (int, float) and math.isfinite(value),
+        f"{label} must be a finite JSON number",
+    )
+    if minimum is not None:
+        _require(value >= minimum, f"{label} must be at least {minimum}")
+
+
 def _require_string(value, label):
     _require(
         type(value) is str and bool(value),
@@ -165,6 +212,11 @@ def _require_f32_hex(value, label):
         type(value) is str and _F32_HEX.fullmatch(value) is not None,
         f"{label} must be canonical lowercase float32 hexadecimal bits",
     )
+
+
+def _require_reason(value, label):
+    _require_string(value, label)
+    _require(value in _REASON_NAMES, f"{label} is not a runtime reason")
 
 
 def _reject_json_constant(value):
@@ -364,6 +416,144 @@ def _validate_matcher_provenance(value, clips, label):
         0 <= entry < contact < clip_length,
         f"{label} local event frames are outside the manifest clip",
     )
+    entry_global = value["entry_global_frame"]
+    contact_global = value["contact_global_frame"]
+    _require_int(entry_global, f"{label}.entry_global_frame")
+    _require_int(contact_global, f"{label}.contact_global_frame")
+    _require(
+        entry_global == clip["range_start"] + entry,
+        f"{label}.entry_global_frame does not join through the manifest",
+    )
+    _require(
+        contact_global == clip["range_start"] + contact,
+        f"{label}.contact_global_frame does not join through the manifest",
+    )
+
+
+def _validate_runtime_preview_evidence(record, clips, label):
+    path_feasible = record["path_feasible"]
+    match_ready = record["match_ready"]
+    path_reason = record["path_reason"]
+    match_reason = record["match_reason"]
+    _require_reason(path_reason, f"{label}.path_reason")
+    _require_reason(match_reason, f"{label}.match_reason")
+    _require(
+        (path_reason == "None") == path_feasible,
+        f"{label}.path_reason must be None exactly when path-feasible",
+    )
+    _require(
+        (match_reason == "None") == match_ready,
+        f"{label}.match_reason must be None exactly when match-ready",
+    )
+
+    feasible_entry = record["feasible_entry_frame"]
+    preview_contact = record["preview_contact_frame"]
+    _require(
+        type(feasible_entry) is int,
+        f"{label}.feasible_entry_frame must be an integer",
+    )
+    _require(
+        type(preview_contact) is int,
+        f"{label}.preview_contact_frame must be an integer",
+    )
+    if path_feasible:
+        _require(
+            0 <= feasible_entry < preview_contact,
+            f"{label} feasible/contact preview frames are invalid",
+        )
+        matching_clips = [
+            clip
+            for clip in clips
+            if clip["range_start"] <= feasible_entry < preview_contact
+            and preview_contact < clip["range_stop"]
+        ]
+        _require(
+            len(matching_clips) == 1,
+            f"{label} feasible/contact preview frames do not join to one manifest clip",
+        )
+    else:
+        _require(
+            (feasible_entry, preview_contact) == (-1, -1),
+            f"{label} infeasible preview frames must both be -1",
+        )
+
+    total_cost = record["total_cost"]
+    if match_ready:
+        _require_number(total_cost, f"{label}.total_cost", minimum=0.0)
+    else:
+        _require(
+            total_cost is None,
+            f"{label}.total_cost must be null when not match-ready",
+        )
+    _require_int(
+        record["snapshot_fingerprint"],
+        f"{label}.snapshot_fingerprint",
+        minimum=1,
+    )
+    _require(
+        record["snapshot_fingerprint"] <= 0xFFFFFFFFFFFFFFFF,
+        f"{label}.snapshot_fingerprint exceeds uint64",
+    )
+    _require_int(record["preview_count"], f"{label}.preview_count", minimum=1)
+
+    evidence = record["runtime_ready_cost_evidence"]
+    _require(
+        type(evidence) is list,
+        f"{label}.runtime_ready_cost_evidence must be an array",
+    )
+    _require(
+        len(evidence) <= record["preview_count"],
+        f"{label}.runtime_ready_cost_evidence exceeds preview_count",
+    )
+    ready_costs = []
+    seen_frames = set()
+    for index, item in enumerate(evidence):
+        item_label = f"{label}.runtime_ready_cost_evidence[{index}]"
+        _require_exact_keys(item, _READY_COST_KEYS, item_label)
+        flat_frame = item["stationary_flat_frame"]
+        cost = item["total_cost"]
+        _require_int(flat_frame, f"{item_label}.stationary_flat_frame")
+        _require_number(cost, f"{item_label}.total_cost", minimum=0.0)
+        _require(
+            flat_frame not in seen_frames,
+            f"{label} repeats stationary flat frame {flat_frame}",
+        )
+        seen_frames.add(flat_frame)
+        ready_costs.append((cost, flat_frame))
+    _require(
+        [flat_frame for _, flat_frame in ready_costs]
+        == sorted(flat_frame for _, flat_frame in ready_costs),
+        f"{label}.runtime_ready_cost_evidence must be in flat-frame order",
+    )
+
+    selected_frame = record["selected_stationary_flat_frame"]
+    if match_ready:
+        _require(
+            ready_costs,
+            f"{label} match-ready result requires ready cost evidence",
+        )
+        _require_int(
+            selected_frame,
+            f"{label}.selected_stationary_flat_frame",
+        )
+        best_cost, best_frame = min(ready_costs)
+        _require(
+            selected_frame == best_frame,
+            f"{label} did not select the lowest-cost, lowest-frame exact tie",
+        )
+        _require(
+            total_cost == best_cost,
+            f"{label}.total_cost differs from selected ready evidence",
+        )
+    else:
+        _require(
+            selected_frame is None,
+            f"{label} non-ready result must not select a stationary frame",
+        )
+        _require(
+            not ready_costs,
+            f"{label} non-ready result cannot carry ready cost evidence",
+        )
 
 
 def _validate_preview_candidates(records, manifest, report):
@@ -418,18 +608,32 @@ def _validate_preview_candidates(records, manifest, report):
             f"{label} local event frames are outside the source manifest clip",
         )
         root_fields = (
-            ("prospective_root_x_object_f32_hex", "root_x_object_m"),
-            ("prospective_root_z_object_f32_hex", "root_z_object_m"),
             (
+                "prospective_root_x_object_m",
+                "prospective_root_x_object_f32_hex",
+                "root_x_object_m",
+            ),
+            (
+                "prospective_root_z_object_m",
+                "prospective_root_z_object_f32_hex",
+                "root_z_object_m",
+            ),
+            (
+                "prospective_root_yaw_object_radians",
                 "prospective_root_yaw_object_f32_hex",
                 "root_yaw_object_radians",
             ),
         )
-        for output_field, source_field in root_fields:
-            _require_f32_hex(record[output_field], f"{label}.{output_field}")
+        for numeric_field, hex_field, source_field in root_fields:
+            _require_number(record[numeric_field], f"{label}.{numeric_field}")
             _require(
-                record[output_field] == _f32_hex(source[source_field]),
-                f"{label}.{output_field} differs from Task4 float32 authorship",
+                record[numeric_field] == source[source_field],
+                f"{label}.{numeric_field} differs from Task4 report",
+            )
+            _require_f32_hex(record[hex_field], f"{label}.{hex_field}")
+            _require(
+                record[hex_field] == _f32_hex(record[numeric_field]),
+                f"{label}.{hex_field} differs from numeric float32 authorship",
             )
         _require(
             record["preview_authority"] == _PREVIEW_AUTHORITY,
@@ -447,11 +651,22 @@ def _validate_preview_candidates(records, manifest, report):
             not record["match_ready"] or record["path_feasible"],
             f"{label}.match_ready requires path_feasible",
         )
+        _validate_runtime_preview_evidence(record, clips, label)
         if record["match_ready"]:
             _validate_matcher_provenance(
                 record["matcher_provenance"],
                 clips,
                 f"{label}.matcher_provenance",
+            )
+            _require(
+                record["feasible_entry_frame"]
+                == record["matcher_provenance"]["entry_global_frame"],
+                f"{label}.feasible_entry_frame differs from selected matcher",
+            )
+            _require(
+                record["preview_contact_frame"]
+                == record["matcher_provenance"]["contact_global_frame"],
+                f"{label}.preview_contact_frame differs from selected matcher",
             )
         else:
             _require(
@@ -706,13 +921,15 @@ def _synthetic_fixture():
         (-0.35, -0.10, 1.20),
         (-0.30, 0.00, 1.40),
         (-0.25, 0.10, 1.60),
+        (-0.20, 0.20, 1.80),
     ]
     report_candidates = []
     preview_candidates = []
-    readiness = (True, False, True, True)
-    matcher_ordinals = (4, None, 1, 2)
-    for ordinal, (root, ready, matcher_ordinal) in enumerate(
-        zip(roots, readiness, matcher_ordinals)
+    path_feasibility = (True, True, True, True, False)
+    readiness = (True, False, True, True, False)
+    matcher_ordinals = (4, None, 1, 2, None)
+    for ordinal, (root, path_feasible, ready, matcher_ordinal) in enumerate(
+        zip(roots, path_feasibility, readiness, matcher_ordinals)
     ):
         sequence_id = sequences[ordinal]
         entry = 40 + ordinal
@@ -732,27 +949,81 @@ def _synthetic_fixture():
         )
         matcher = None
         if matcher_ordinal is not None:
+            matcher_entry = 70 + ordinal
+            matcher_contact = 90 + ordinal
             matcher = {
                 "clip_ordinal": matcher_ordinal,
-                "contact_local_frame": 90 + ordinal,
-                "entry_local_frame": 70 + ordinal,
+                "contact_global_frame": (
+                    clips[matcher_ordinal]["range_start"] + matcher_contact
+                ),
+                "contact_local_frame": matcher_contact,
+                "entry_global_frame": (
+                    clips[matcher_ordinal]["range_start"] + matcher_entry
+                ),
+                "entry_local_frame": matcher_entry,
                 "sequence_id": sequences[matcher_ordinal],
             }
+            feasible_entry = matcher["entry_global_frame"]
+            preview_contact = matcher["contact_global_frame"]
+        elif path_feasible:
+            feasible_entry = clips[ordinal]["range_start"] + 70 + ordinal
+            preview_contact = clips[ordinal]["range_start"] + 90 + ordinal
+        else:
+            feasible_entry = -1
+            preview_contact = -1
+        ready_cost = 2.0 + ordinal
+        ready_cost_evidence = []
+        selected_flat_frame = None
+        total_cost = None
+        if ready:
+            first_flat_frame = 100 + ordinal * 10
+            ready_cost_evidence = [
+                {
+                    "stationary_flat_frame": first_flat_frame,
+                    "total_cost": ready_cost,
+                },
+                {
+                    "stationary_flat_frame": first_flat_frame + 1,
+                    "total_cost": ready_cost,
+                },
+                {
+                    "stationary_flat_frame": first_flat_frame + 2,
+                    "total_cost": ready_cost + 1.0,
+                },
+            ]
+            selected_flat_frame = first_flat_frame
+            total_cost = ready_cost
         preview_candidates.append(
             {
                 "candidate_ordinal": ordinal,
                 "contact_local_frame": contact,
                 "entry_local_frame": entry,
+                "feasible_entry_frame": feasible_entry,
                 "match_ready": ready,
+                "match_reason": (
+                    "None"
+                    if ready
+                    else "PoorMatch" if path_feasible else "BlockedPath"
+                ),
                 "matcher_provenance": matcher,
-                "path_feasible": True,
+                "path_feasible": path_feasible,
+                "path_reason": "None" if path_feasible else "BlockedPath",
                 "preview_authority": copy.deepcopy(_PREVIEW_AUTHORITY),
+                "preview_contact_frame": preview_contact,
+                "preview_count": 5 + ordinal,
+                "prospective_root_x_object_m": root[0],
                 "prospective_root_x_object_f32_hex": _f32_hex(root[0]),
+                "prospective_root_yaw_object_radians": root[2],
                 "prospective_root_yaw_object_f32_hex": _f32_hex(root[2]),
+                "prospective_root_z_object_m": root[1],
                 "prospective_root_z_object_f32_hex": _f32_hex(root[1]),
                 "record_type": "candidate_preview",
+                "runtime_ready_cost_evidence": ready_cost_evidence,
+                "selected_stationary_flat_frame": selected_flat_frame,
                 "sequence_id": sequence_id,
+                "snapshot_fingerprint": 0xABCDEF0000000000 + ordinal,
                 "source_clip_ordinal": ordinal,
+                "total_cost": total_cost,
             }
         )
     report = {
@@ -805,6 +1076,14 @@ class SmartPickupContractTests(unittest.TestCase):
                 candidate_records, selected, scene, manifest, report
             )
 
+    def assert_candidate_mutation_rejected(self, candidate_index, mutate):
+        manifest, report, candidates, selected, scene = _synthetic_fixture()
+        mutated = copy.deepcopy(candidates)
+        mutate(mutated[candidate_index])
+        self.assert_contract_rejected(
+            mutated, selected, scene, manifest, report
+        )
+
     def test_parses_and_accepts_canonical_synthetic_probe_records(self):
         manifest, report, candidates, selected, scene = _synthetic_fixture()
         preview_text = "\n".join(
@@ -831,6 +1110,235 @@ class SmartPickupContractTests(unittest.TestCase):
                 "pickup_table__delta__001",
             ],
         )
+
+    def test_each_candidate_carries_complete_step4_evidence(self):
+        _, _, candidates, _, _ = _synthetic_fixture()
+        required = {
+            "feasible_entry_frame",
+            "match_reason",
+            "path_reason",
+            "preview_contact_frame",
+            "preview_count",
+            "prospective_root_x_object_m",
+            "prospective_root_yaw_object_radians",
+            "prospective_root_z_object_m",
+            "runtime_ready_cost_evidence",
+            "selected_stationary_flat_frame",
+            "snapshot_fingerprint",
+            "total_cost",
+        }
+        matcher_required = {
+            "contact_global_frame",
+            "entry_global_frame",
+        }
+
+        for candidate in candidates:
+            self.assertLessEqual(required, set(candidate))
+            self.assertIs(type(candidate["feasible_entry_frame"]), int)
+            self.assertIs(type(candidate["preview_contact_frame"]), int)
+            self.assertIs(type(candidate["preview_count"]), int)
+            self.assertIs(type(candidate["snapshot_fingerprint"]), int)
+            self.assertIs(type(candidate["path_reason"]), str)
+            self.assertIs(type(candidate["match_reason"]), str)
+            self.assertIs(
+                type(candidate["runtime_ready_cost_evidence"]), list
+            )
+            for field in (
+                "prospective_root_x_object_m",
+                "prospective_root_z_object_m",
+                "prospective_root_yaw_object_radians",
+            ):
+                self.assertIs(type(candidate[field]), float)
+            if candidate["match_ready"]:
+                self.assertIs(type(candidate["total_cost"]), float)
+                self.assertIs(
+                    type(candidate["selected_stationary_flat_frame"]), int
+                )
+                self.assertLessEqual(
+                    matcher_required, set(candidate["matcher_provenance"])
+                )
+            else:
+                self.assertIsNone(candidate["total_cost"])
+                self.assertIsNone(
+                    candidate["selected_stationary_flat_frame"]
+                )
+
+    def test_nonready_rows_are_null_costed_and_include_blocked_path(self):
+        _, _, candidates, _, _ = _synthetic_fixture()
+        nonready = [
+            candidate for candidate in candidates
+            if not candidate["match_ready"]
+        ]
+
+        self.assertTrue(nonready)
+        for candidate in nonready:
+            self.assertIsNone(candidate["total_cost"])
+            self.assertIsNone(candidate["matcher_provenance"])
+            self.assertIsNone(candidate["selected_stationary_flat_frame"])
+            self.assertEqual(candidate["runtime_ready_cost_evidence"], [])
+        blocked = [
+            candidate for candidate in nonready
+            if not candidate["path_feasible"]
+        ]
+        self.assertTrue(blocked)
+        for candidate in blocked:
+            self.assertEqual(candidate["path_reason"], "BlockedPath")
+            self.assertNotEqual(candidate["match_reason"], "None")
+            self.assertEqual(candidate["feasible_entry_frame"], -1)
+            self.assertEqual(candidate["preview_contact_frame"], -1)
+
+    def test_rejects_each_candidate_root_numeric_or_hex_mutation(self):
+        fields = (
+            (
+                "prospective_root_x_object_m",
+                "prospective_root_x_object_f32_hex",
+            ),
+            (
+                "prospective_root_z_object_m",
+                "prospective_root_z_object_f32_hex",
+            ),
+            (
+                "prospective_root_yaw_object_radians",
+                "prospective_root_yaw_object_f32_hex",
+            ),
+        )
+        for numeric_field, hex_field in fields:
+            with self.subTest(field=numeric_field):
+                self.assert_candidate_mutation_rejected(
+                    0,
+                    lambda candidate, field=numeric_field: candidate.__setitem__(
+                        field, candidate[field] + 0.25
+                    ),
+                )
+            with self.subTest(field=hex_field):
+                self.assert_candidate_mutation_rejected(
+                    0,
+                    lambda candidate, field=hex_field: candidate.__setitem__(
+                        field, _mutated_hex(candidate[field])
+                    ),
+                )
+
+    def test_rejects_each_runtime_diagnostic_and_selection_mutation(self):
+        mutations = {
+            "path_reason": lambda candidate: candidate.__setitem__(
+                "path_reason", "BlockedPath"
+            ),
+            "match_reason": lambda candidate: candidate.__setitem__(
+                "match_reason", "PoorMatch"
+            ),
+            "feasible_entry_frame": lambda candidate: candidate.__setitem__(
+                "feasible_entry_frame", -1
+            ),
+            "preview_contact_frame": lambda candidate: candidate.__setitem__(
+                "preview_contact_frame", -1
+            ),
+            "total_cost": lambda candidate: candidate.__setitem__(
+                "total_cost", candidate["total_cost"] + 0.25
+            ),
+            "selected_stationary_flat_frame": lambda candidate: candidate.__setitem__(
+                "selected_stationary_flat_frame",
+                candidate["runtime_ready_cost_evidence"][1][
+                    "stationary_flat_frame"
+                ],
+            ),
+            "runtime_ready_cost_evidence": lambda candidate: candidate[
+                "runtime_ready_cost_evidence"
+            ][0].__setitem__(
+                "total_cost",
+                candidate["runtime_ready_cost_evidence"][0]["total_cost"]
+                + 0.5,
+            ),
+            "snapshot_fingerprint": lambda candidate: candidate.__setitem__(
+                "snapshot_fingerprint", 0
+            ),
+            "preview_count": lambda candidate: candidate.__setitem__(
+                "preview_count",
+                len(candidate["runtime_ready_cost_evidence"]) - 1,
+            ),
+        }
+        for field, mutate in mutations.items():
+            with self.subTest(field=field):
+                self.assert_candidate_mutation_rejected(0, mutate)
+
+        for field in sorted(_MATCHER_KEYS):
+            with self.subTest(matcher_provenance=field):
+                def mutate_matcher(candidate, field=field):
+                    value = candidate["matcher_provenance"][field]
+                    candidate["matcher_provenance"][field] = (
+                        value + "__mutated"
+                        if type(value) is str
+                        else value + 1
+                    )
+
+                self.assert_candidate_mutation_rejected(0, mutate_matcher)
+
+        def replace_with_self_consistent_alternate_matcher(candidate):
+            candidate["matcher_provenance"] = {
+                "clip_ordinal": 3,
+                "contact_global_frame": 850,
+                "contact_local_frame": 100,
+                "entry_global_frame": 830,
+                "entry_local_frame": 80,
+                "sequence_id": "pickup_table__delta__001",
+            }
+
+        self.assert_candidate_mutation_rejected(
+            0, replace_with_self_consistent_alternate_matcher
+        )
+
+        for field in sorted(_READY_COST_KEYS):
+            with self.subTest(ready_cost_evidence=field):
+                self.assert_candidate_mutation_rejected(
+                    0,
+                    lambda candidate, field=field: candidate[
+                        "runtime_ready_cost_evidence"
+                    ][0].__setitem__(
+                        field,
+                        candidate["runtime_ready_cost_evidence"][0][field]
+                        + 1,
+                    ),
+                )
+
+        nonready_mutations = {
+            "total_cost": lambda candidate: candidate.__setitem__(
+                "total_cost", 0.0
+            ),
+            "selected_stationary_flat_frame": lambda candidate: candidate.__setitem__(
+                "selected_stationary_flat_frame", 1
+            ),
+            "runtime_ready_cost_evidence": lambda candidate: candidate.__setitem__(
+                "runtime_ready_cost_evidence",
+                [{"stationary_flat_frame": 1, "total_cost": 1.0}],
+            ),
+            "matcher_provenance": lambda candidate: candidate.__setitem__(
+                "matcher_provenance", {key: 0 for key in _MATCHER_KEYS}
+            ),
+        }
+        for candidate_index in (1, 4):
+            for field, mutate in nonready_mutations.items():
+                with self.subTest(
+                    nonready_candidate=candidate_index,
+                    nonready_field=field,
+                ):
+                    self.assert_candidate_mutation_rejected(
+                        candidate_index, mutate
+                    )
+
+        blocked_mutations = {
+            "path_reason": lambda candidate: candidate.__setitem__(
+                "path_reason", "None"
+            ),
+            "match_reason": lambda candidate: candidate.__setitem__(
+                "match_reason", "None"
+            ),
+            "preview_frames": lambda candidate: candidate.update(
+                feasible_entry_frame=0,
+                preview_contact_frame=1,
+            ),
+        }
+        for field, mutate in blocked_mutations.items():
+            with self.subTest(blocked_field=field):
+                self.assert_candidate_mutation_rejected(4, mutate)
 
     def test_parser_requires_one_final_summary_and_one_scene_record(self):
         _, _, candidates, selected, scene = _synthetic_fixture()
