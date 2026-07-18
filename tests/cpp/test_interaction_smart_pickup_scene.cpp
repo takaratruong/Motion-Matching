@@ -149,8 +149,22 @@ void test_frozen_beer_target_and_provenance() {
 
     const auto& slots = affordance.interaction_slots;
     assert(slots.size() == 3U);
+    constexpr std::array<uint32_t, 3> expected_slot_ids{
+        1U, 2U, 3U};
+    constexpr std::array<uint32_t, 3> expected_root_x_bits{
+        0xbecb255aU, 0xbece326fU, 0xbeef8c76U};
+    constexpr std::array<uint32_t, 3> expected_root_z_bits{
+        0xbd29bb33U, 0xbe7ab911U, 0xbe47a9beU};
+    constexpr std::array<uint32_t, 3> expected_root_yaw_bits{
+        0x3fb1e198U, 0x3fdb9d3aU, 0x3fa5633fU};
     for (size_t index = 0; index < slots.size(); ++index) {
-        assert(slots[index].id != 0U);
+        assert(slots[index].id == expected_slot_ids[index]);
+        assert(float_bits(slots[index].root_x_object_m) ==
+               expected_root_x_bits[index]);
+        assert(float_bits(slots[index].root_z_object_m) ==
+               expected_root_z_bits[index]);
+        assert(float_bits(slots[index].root_yaw_object_radians) ==
+               expected_root_yaw_bits[index]);
         assert(std::isfinite(slots[index].root_x_object_m));
         assert(std::isfinite(slots[index].root_z_object_m));
         assert(std::isfinite(slots[index].root_yaw_object_radians));
@@ -167,16 +181,25 @@ void test_frozen_beer_target_and_provenance() {
     const ProvenanceRows& provenance =
         smart_pickup_demo_slot_provenance();
     assert(provenance.size() == slots.size());
+    constexpr std::array<std::string_view, 3> expected_sequence_ids{
+        "pickup_table__alcohol_10__005",
+        "pickup_table__alcohol_13__005",
+        "pickup_table__apple_1__000"};
+    constexpr std::array<int, 3> expected_entry_local_frames{
+        125, 118, 90};
+    constexpr std::array<int, 3> expected_contact_local_frames{
+        150, 143, 115};
     std::array<std::string_view, 3> sequence_ids{};
     for (size_t index = 0; index < provenance.size(); ++index) {
         const SmartPickupSlotProvenance& row = provenance[index];
+        assert(row.slot_id == expected_slot_ids[index]);
         assert(row.slot_id == slots[index].id);
         assert(row.sequence_id != nullptr);
         sequence_ids[index] = row.sequence_id;
-        assert(!sequence_ids[index].empty());
-        assert(row.entry_local_frame >= 0);
-        assert(row.contact_local_frame >= 0);
-        assert(row.entry_local_frame < row.contact_local_frame);
+        assert(sequence_ids[index] == expected_sequence_ids[index]);
+        assert(row.entry_local_frame == expected_entry_local_frames[index]);
+        assert(row.contact_local_frame ==
+               expected_contact_local_frames[index]);
         for (size_t earlier = 0; earlier < index; ++earlier) {
             assert(sequence_ids[earlier] != sequence_ids[index]);
         }
