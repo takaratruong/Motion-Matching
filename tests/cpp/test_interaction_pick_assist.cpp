@@ -1966,6 +1966,176 @@ void test_frozen_final_preview_certifies_and_submits_exactly_once() {
         "cancel after Submitted revoked or created a frozen request");
 }
 
+void test_frozen_final_preview_missing_preview_hits_arrival_deadline() {
+    interaction::PickAssistConfig config{};
+    config.maximum_arrival_ticks = config.required_settle_ticks + 3U;
+    FrozenSlotScenario scenario;
+    interaction::ControllerPickAssist assist(config);
+    const interaction::PickEntryRoot frozen_root =
+        enter_frozen_final_preview(assist, scenario, config);
+    const interaction::PickAssistDiagnostics before = assist.diagnostics();
+
+    scenario.observation.preview.reset();
+    for (uint32_t retry = 1U; retry <= 2U; ++retry) {
+        const interaction::PickAssistOutput output =
+            assist.observe(scenario.observation);
+        require(
+            assist.diagnostics().state ==
+                    interaction::PickAssistState::FinalPreview &&
+                assist.diagnostics().reason ==
+                    interaction::PickAssistReason::None,
+            "missing frozen preview reached the arrival deadline early");
+        require_stationary_preview_request(
+            output,
+            frozen_root,
+            "pre-deadline missing frozen preview did not re-request");
+        require_frozen_slot_provenance_unchanged(
+            before,
+            assist.diagnostics(),
+            "pre-deadline missing frozen preview changed frozen provenance");
+    }
+
+    const interaction::PickAssistOutput deadline_output =
+        assist.observe(scenario.observation);
+    require(
+        assist.diagnostics().state == interaction::PickAssistState::Failed &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::ArrivalDeadline,
+        "third missing frozen preview did not hit the inclusive arrival deadline");
+    require_zero_pick_assist_output(
+        deadline_output,
+        "missing frozen preview deadline emitted output or another request");
+    require(
+        !assist.active() && !assist.owns_manual_interact() &&
+            !assist.take_submission(72U).has_value(),
+        "missing frozen preview deadline retained ownership or submitted");
+    require_frozen_slot_provenance_unchanged(
+        before,
+        assist.diagnostics(),
+        "missing frozen preview deadline changed frozen provenance");
+}
+
+void test_frozen_final_preview_poor_match_deadline_memory_survives_missing() {
+    interaction::PickAssistConfig config{};
+    config.maximum_arrival_ticks = config.required_settle_ticks + 3U;
+    FrozenSlotScenario scenario;
+    interaction::ControllerPickAssist assist(config);
+    const interaction::PickEntryRoot frozen_root =
+        enter_frozen_final_preview(assist, scenario, config);
+    const interaction::PickAssistDiagnostics before = assist.diagnostics();
+    scenario.observation.snapshot_fingerprint = 901U;
+    scenario.observation.preview_snapshot_fingerprint = 901U;
+
+    interaction::PickEntryPreview poor_match =
+        certified_frozen_preview(frozen_root);
+    poor_match.match_ready = false;
+    poor_match.match_reason = interaction::Reason::PoorMatch;
+    scenario.observation.preview = poor_match;
+    interaction::PickAssistOutput output =
+        assist.observe(scenario.observation);
+    require(
+        assist.diagnostics().state ==
+                interaction::PickAssistState::FinalPreview &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::None,
+        "sole PoorMatch reached the frozen arrival deadline early");
+    require_stationary_preview_request(
+        output,
+        frozen_root,
+        "pre-deadline PoorMatch did not re-request the frozen preview");
+
+    scenario.observation.preview.reset();
+    output = assist.observe(scenario.observation);
+    require(
+        assist.diagnostics().state ==
+                interaction::PickAssistState::FinalPreview &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::None,
+        "missing preview after PoorMatch reached the arrival deadline early");
+    require_stationary_preview_request(
+        output,
+        frozen_root,
+        "missing preview after PoorMatch did not re-request");
+    {
+        const auto& diagnostics = assist.diagnostics().final_preview;
+        require(
+            diagnostics.available && diagnostics.path_feasible &&
+                diagnostics.path_reason == interaction::Reason::None &&
+                !diagnostics.match_ready &&
+                diagnostics.match_reason == interaction::Reason::PoorMatch,
+            "missing preview forgot the prior sole PoorMatch diagnostics");
+    }
+
+    const interaction::PickAssistOutput deadline_output =
+        assist.observe(scenario.observation);
+    require(
+        assist.diagnostics().state == interaction::PickAssistState::Failed &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::PoorMatch,
+        "frozen preview deadline forgot the prior sole PoorMatch outcome");
+    require_zero_pick_assist_output(
+        deadline_output,
+        "PoorMatch deadline emitted output or another preview request");
+    require(
+        !assist.active() && !assist.owns_manual_interact() &&
+            !assist.take_submission(73U).has_value(),
+        "PoorMatch deadline retained ownership or submitted");
+    require_frozen_slot_provenance_unchanged(
+        before,
+        assist.diagnostics(),
+        "PoorMatch deadline changed frozen provenance");
+}
+
+void test_frozen_final_preview_deadline_precedes_certification() {
+    interaction::PickAssistConfig config{};
+    config.maximum_arrival_ticks = config.required_settle_ticks + 3U;
+    FrozenSlotScenario scenario;
+    interaction::ControllerPickAssist assist(config);
+    const interaction::PickEntryRoot frozen_root =
+        enter_frozen_final_preview(assist, scenario, config);
+    const interaction::PickAssistDiagnostics before = assist.diagnostics();
+    scenario.observation.snapshot_fingerprint = 901U;
+    scenario.observation.preview_snapshot_fingerprint = 901U;
+
+    scenario.observation.preview.reset();
+    for (uint32_t retry = 1U; retry <= 2U; ++retry) {
+        const interaction::PickAssistOutput output =
+            assist.observe(scenario.observation);
+        require(
+            assist.diagnostics().state ==
+                    interaction::PickAssistState::FinalPreview &&
+                assist.diagnostics().reason ==
+                    interaction::PickAssistReason::None,
+            "certification-boundary fixture reached the deadline early");
+        require_stationary_preview_request(
+            output,
+            frozen_root,
+            "certification-boundary fixture did not re-request");
+    }
+    require_final_preview_diagnostics_cleared(assist.diagnostics());
+
+    scenario.observation.preview = certified_frozen_preview(frozen_root);
+    const interaction::PickAssistOutput deadline_output =
+        assist.observe(scenario.observation);
+    require(
+        assist.diagnostics().state == interaction::PickAssistState::Failed &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::ArrivalDeadline,
+        "certified frozen preview was processed on the inclusive deadline");
+    require_zero_pick_assist_output(
+        deadline_output,
+        "deadline-boundary certification emitted output or submitted");
+    require_final_preview_diagnostics_cleared(assist.diagnostics());
+    require(
+        !assist.active() && !assist.owns_manual_interact() &&
+            !assist.take_submission(74U).has_value(),
+        "deadline-boundary certification retained ownership or submitted");
+    require_frozen_slot_provenance_unchanged(
+        before,
+        assist.diagnostics(),
+        "deadline-boundary certification changed frozen provenance");
+}
+
 void test_slot_approach_rejects_adjacent_arrival_overshoots() {
     const interaction::PickAssistConfig config{};
     const float infinity = std::numeric_limits<float>::infinity();
@@ -3941,6 +4111,9 @@ int main() {
         test_frozen_final_preview_poor_match_rerequests_then_recovers();
         test_frozen_final_preview_hard_rejections_are_terminal();
         test_frozen_final_preview_certifies_and_submits_exactly_once();
+        test_frozen_final_preview_missing_preview_hits_arrival_deadline();
+        test_frozen_final_preview_poor_match_deadline_memory_survives_missing();
+        test_frozen_final_preview_deadline_precedes_certification();
         test_slot_approach_rejects_adjacent_arrival_overshoots();
         test_slot_approach_accumulates_inclusive_travel_and_rejects_overshoot();
         test_slot_approach_revalidates_frozen_route_against_table();
