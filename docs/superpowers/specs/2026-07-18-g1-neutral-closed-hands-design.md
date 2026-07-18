@@ -32,10 +32,10 @@ The default posture is the midpoint-based relaxed close already defined by the o
 
 | Hand | Joint order | Target radians |
 | --- | --- | --- |
-| Left | thumb0, thumb1, thumb2, index0, index1, middle0, middle1 | 0.000, 0.163, 0.875, -0.785, -0.875, -0.785, -0.875 |
+| Left | thumb0, thumb1, thumb2, middle0, middle1, index0, index1 | 0.000, 0.163, 0.875, -0.785, -0.875, -0.785, -0.875 |
 | Right | thumb0, thumb1, thumb2, index0, index1, middle0, middle1 | 0.000, -0.154, -0.875, 0.785, 0.875, 0.785, 0.875 |
 
-The implementation derives these targets from named joint limits/constants where available and tests the resulting vectors, instead of relying on positional literals at multiple call sites. Every value must be finite, within the corresponding joint range, and exactly seven elements long.
+The different left/right ordering is intentional: it matches the pinned MuJoCo joint traversal and Dex3 motor slots, where the two finger pairs are mirrored. The implementation derives these targets from named joint limits/constants where available and tests the resulting vectors, instead of relying on positional literals at multiple call sites. Every value must be finite, within the corresponding joint range, and exactly seven elements long.
 
 ## Transport and future grasp override
 
