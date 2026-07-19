@@ -1,0 +1,422 @@
+"""Continuous focus-gated X11 key levels feeding the pure Holden mapper.
+
+This module reads real keyboard levels through ``ctypes``/libX11, gates them by
+MuJoCo/G1 window focus, latches Space/X edges, and advances the pure
+``HoldenControlMapper`` on a background thread. It adds no third-party
+dependencies and never imports MuJoCo.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass, field
+import ctypes
+import os
+import threading
+import time
+
+from .commands import CommandSample
+from .holden_control import (
+    HoldenControlMapper,
+    MappedControlState,
+    NormalizedControlState,
+)
+from .joints import ContractError
+
+
+# Exact X11 keysyms for every control the desktop frontend understands.
+KEYSYMS = {
+    "W": 0x0077,
+    "A": 0x0061,
+    "S": 0x0073,
+    "D": 0x0064,
+    "Q": 0x0071,
+    "E": 0x0065,
+    "X": 0x0078,
+    "SPACE": 0x0020,
+    "LEFT": 0xFF51,
+    "UP": 0xFF52,
+    "RIGHT": 0xFF53,
+    "DOWN": 0xFF54,
+    "LEFT_SHIFT": 0xFFE1,
+    "LEFT_CTRL": 0xFFE3,
+}
+
+# Human-readable transition label for each key.
+_ACTIONS = {
+    "W": "forward",
+    "S": "backward",
+    "A": "left",
+    "D": "right",
+    "Q": "zoom_in",
+    "E": "zoom_out",
+    "LEFT": "camera_left",
+    "RIGHT": "camera_right",
+    "UP": "camera_up",
+    "DOWN": "camera_down",
+    "SPACE": "stand",
+    "X": "terminate",
+    "LEFT_SHIFT": "walk",
+    "LEFT_CTRL": "strafe",
+}
+
+_FOCUS_TITLE_MARKERS = ("MuJoCo", "G1 CONTROLS")
+_STALENESS_S = 0.1
+
+
+@dataclass(frozen=True)
+class KeyLevels:
+    """One instantaneous focus flag plus the set of held control keys."""
+
+    focused: bool = False
+    pressed: frozenset = field(default_factory=frozenset)
+
+    def __post_init__(self) -> None:
+        if type(self.focused) is not bool:
+            raise ContractError("KeyLevels focused must be boolean")
+        if type(self.pressed) is not frozenset:
+            raise ContractError("KeyLevels pressed must be a frozenset")
+        for key in self.pressed:
+            if key not in KEYSYMS:
+                raise ContractError(f"KeyLevels pressed contains unknown key {key!r}")
+
+
+def normalized_state_from_pressed(pressed: frozenset) -> NormalizedControlState:
+    """Translate a held-key set into the pure device-independent snapshot."""
+
+    if type(pressed) is not frozenset:
+        raise ContractError("pressed keys must be a frozenset")
+    for key in pressed:
+        if key not in KEYSYMS:
+            raise ContractError(f"pressed contains unknown key {key!r}")
+    return NormalizedControlState(
+        left_x=float("D" in pressed) - float("A" in pressed),
+        left_z=float("S" in pressed) - float("W" in pressed),
+        right_x=float("RIGHT" in pressed) - float("LEFT" in pressed),
+        right_z=float("DOWN" in pressed) - float("UP" in pressed),
+        strafe="LEFT_CTRL" in pressed,
+        walk="LEFT_SHIFT" in pressed,
+        zoom=float("Q" in pressed) - float("E" in pressed),
+        stand="SPACE" in pressed,
+        terminate="X" in pressed,
+    )
+
+
+class BoundaryControlMailbox:
+    """Atomic latest-state boundary that latches Space/X until consumed."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._latest: MappedControlState | None = None
+        self._stand_latched = False
+        self._terminate_latched = False
+        self._last_index = -1
+
+    def publish(self, mapped: MappedControlState) -> None:
+        if type(mapped) is not MappedControlState:
+            raise ContractError("mailbox publish requires a MappedControlState")
+        with self._lock:
+            self._latest = mapped
+            if mapped.stand:
+                self._stand_latched = True
+            if mapped.terminate:
+                self._terminate_latched = True
+
+    def sample(
+        self, chunk_index: int
+    ) -> tuple[CommandSample | None, MappedControlState]:
+        if type(chunk_index) is not int or chunk_index < 0:
+            raise ContractError("mailbox chunk_index must be a nonnegative integer")
+        with self._lock:
+            if chunk_index <= self._last_index:
+                raise ContractError("mailbox chunk_index must be strictly increasing")
+            if self._latest is None:
+                raise ContractError("mailbox has no published control state")
+            latest = self._latest
+            stand = latest.stand or self._stand_latched
+            terminate = latest.terminate or self._terminate_latched
+            self._stand_latched = False
+            self._terminate_latched = False
+            self._last_index = chunk_index
+        if terminate:
+            command: CommandSample | None = None
+        else:
+            command = CommandSample(
+                chunk_index=chunk_index,
+                requested_velocity_mujoco=(
+                    (0.0, 0.0, 0.0) if stand else latest.velocity_mujoco
+                ),
+                desired_heading_mujoco_wxyz=latest.desired_heading_mujoco_wxyz,
+            )
+        return command, latest
+
+
+class ContinuousControlLoop:
+    """Sample a key-level provider on one thread and advance the pure mapper."""
+
+    def __init__(
+        self,
+        provider: object,
+        mapper: HoldenControlMapper,
+        *,
+        event_sink: Callable[[str], None] | None = None,
+        period_s: float = 0.02,
+        cancel_event: threading.Event | None = None,
+        join_timeout_s: float = 2.0,
+    ) -> None:
+        if not hasattr(provider, "sample"):
+            raise ContractError("control loop provider must expose sample()")
+        if type(mapper) is not HoldenControlMapper:
+            raise ContractError("control loop requires a HoldenControlMapper")
+        if (
+            type(period_s) not in (int, float)
+            or period_s <= 0.0
+            or not (period_s < float("inf"))
+        ):
+            raise ContractError("control loop period_s must be positive and finite")
+        if cancel_event is not None and not isinstance(cancel_event, threading.Event):
+            raise ContractError("control loop cancel_event must be a threading.Event")
+        self._provider = provider
+        self._mapper = mapper
+        self._event_sink = event_sink
+        self._period_s = float(period_s)
+        self._cancel_event = cancel_event
+        self._join_timeout_s = float(join_timeout_s)
+        self.mailbox = BoundaryControlMailbox()
+        self._stop = threading.Event()
+        self._finished = threading.Event()
+        self._cond = threading.Condition()
+        self._sequence = 0
+        self._error: ContractError | None = None
+        self._thread: threading.Thread | None = None
+        self._prev_focused = False
+        self._prev_pressed: frozenset = frozenset()
+
+    def __enter__(self) -> "ContinuousControlLoop":
+        self._thread = threading.Thread(target=self._run, daemon=False)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self._join_timeout_s)
+            if self._thread.is_alive():
+                raise ContractError("control loop thread did not stop")
+        if exc_type is not None:
+            return False
+        if self._error is not None:
+            raise self._error
+        return False
+
+    def wait_for_sequence(self, count: int, timeout_s: float) -> bool:
+        if type(count) is not int or count < 0:
+            raise ContractError("wait_for_sequence count must be nonnegative")
+        deadline = time.monotonic() + float(timeout_s)
+        with self._cond:
+            while self._sequence < count and not self._finished.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    break
+                self._cond.wait(remaining)
+            return self._sequence >= count
+
+    def _emit(self, message: str) -> None:
+        if self._event_sink is not None:
+            self._event_sink(message)
+
+    def _process_transitions(self, focused: bool, pressed: frozenset) -> None:
+        if self._prev_focused and not focused:
+            self._emit("FOCUS LOST -> neutral")
+        for key in sorted(pressed - self._prev_pressed):
+            self._emit(f"KEY {key} DOWN -> {_ACTIONS[key]}")
+            if key == "X" and self._cancel_event is not None:
+                self._cancel_event.set()
+        for key in sorted(self._prev_pressed - pressed):
+            self._emit(f"KEY {key} UP -> {_ACTIONS[key]}")
+        self._prev_focused = focused
+        self._prev_pressed = pressed
+
+    def _publish(self, focused: bool, pressed: frozenset) -> None:
+        self._process_transitions(focused, pressed)
+        state = normalized_state_from_pressed(pressed)
+        mapped = self._mapper.update(state, self._period_s)
+        self.mailbox.publish(mapped)
+        with self._cond:
+            self._sequence += 1
+            self._cond.notify_all()
+
+    def _run(self) -> None:
+        last_success = time.monotonic()
+        try:
+            while not self._stop.is_set():
+                try:
+                    levels = self._provider.sample()
+                except Exception as error:  # provider disconnect is fatal
+                    raise ContractError(
+                        f"control loop provider failed: {error}"
+                    ) from error
+                if levels is None:
+                    if time.monotonic() - last_success > _STALENESS_S:
+                        raise ContractError(
+                            "control loop received no fresh sample in time"
+                        )
+                    self._stop.wait(self._period_s)
+                    continue
+                if type(levels) is not KeyLevels:
+                    raise ContractError("control loop provider must return KeyLevels")
+                last_success = time.monotonic()
+                pressed = levels.pressed if levels.focused else frozenset()
+                self._publish(levels.focused, pressed)
+                self._stop.wait(self._period_s)
+        except ContractError as error:
+            self._error = error
+            try:  # publish one neutral focus-lost state before stopping
+                self._process_transitions(False, frozenset())
+                mapped = self._mapper.update(NormalizedControlState(), self._period_s)
+                self.mailbox.publish(mapped)
+            except ContractError:
+                pass
+        finally:
+            self._finished.set()
+            with self._cond:
+                self._cond.notify_all()
+
+
+class X11KeyStateProvider:
+    """Read real key levels through libX11, gated by MuJoCo/G1 window focus."""
+
+    def __init__(self, display_name: str | None = None) -> None:
+        name = display_name if display_name is not None else os.environ.get("DISPLAY")
+        if not name:
+            raise ContractError("X11 provider requires the DISPLAY environment")
+        try:
+            lib = ctypes.CDLL("libX11.so.6")
+        except OSError as error:
+            raise ContractError("X11 provider requires libX11") from error
+        self._configure(lib)
+        self._lib = lib
+        display = lib.XOpenDisplay(name.encode("utf-8"))
+        if not display:
+            raise ContractError(f"X11 provider cannot open display {name!r}")
+        self._display = ctypes.c_void_p(display)
+        self._closed = False
+        self._keycodes: dict[str, int] = {}
+        for key, keysym in KEYSYMS.items():
+            keycode = int(lib.XKeysymToKeycode(self._display, ctypes.c_ulong(keysym)))
+            if keycode != 0:
+                self._keycodes[key] = keycode
+
+    @staticmethod
+    def _configure(lib: ctypes.CDLL) -> None:
+        lib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        lib.XOpenDisplay.restype = ctypes.c_void_p
+        lib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        lib.XCloseDisplay.restype = ctypes.c_int
+        lib.XQueryKeymap.argtypes = [ctypes.c_void_p, ctypes.c_char * 32]
+        lib.XQueryKeymap.restype = ctypes.c_int
+        lib.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        lib.XKeysymToKeycode.restype = ctypes.c_ubyte
+        lib.XGetInputFocus.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        lib.XGetInputFocus.restype = ctypes.c_int
+        lib.XFetchName.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+        lib.XFetchName.restype = ctypes.c_int
+        lib.XQueryTree.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong)),
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        lib.XQueryTree.restype = ctypes.c_int
+        lib.XFree.argtypes = [ctypes.c_void_p]
+        lib.XFree.restype = ctypes.c_int
+
+    def _fetch_name(self, window: int) -> str | None:
+        name_ptr = ctypes.c_char_p()
+        status = int(
+            self._lib.XFetchName(
+                self._display, ctypes.c_ulong(window), ctypes.byref(name_ptr)
+            )
+        )
+        if status == 0 or not name_ptr.value:
+            return None
+        try:
+            return name_ptr.value.decode("utf-8", "replace")
+        finally:
+            self._lib.XFree(ctypes.cast(name_ptr, ctypes.c_void_p))
+
+    def _parent(self, window: int) -> int:
+        root = ctypes.c_ulong()
+        parent = ctypes.c_ulong()
+        children = ctypes.POINTER(ctypes.c_ulong)()
+        count = ctypes.c_uint()
+        status = int(
+            self._lib.XQueryTree(
+                self._display,
+                ctypes.c_ulong(window),
+                ctypes.byref(root),
+                ctypes.byref(parent),
+                ctypes.byref(children),
+                ctypes.byref(count),
+            )
+        )
+        if children:
+            self._lib.XFree(ctypes.cast(children, ctypes.c_void_p))
+        if status == 0:
+            return 0
+        return int(parent.value)
+
+    def _focus_window(self) -> int:
+        window = ctypes.c_ulong()
+        revert = ctypes.c_int()
+        self._lib.XGetInputFocus(
+            self._display, ctypes.byref(window), ctypes.byref(revert)
+        )
+        return int(window.value)
+
+    def _focused_on_target(self, window: int) -> bool:
+        current = window
+        for _ in range(64):
+            if current == 0:
+                return False
+            title = self._fetch_name(current)
+            if title is not None and any(
+                marker in title for marker in _FOCUS_TITLE_MARKERS
+            ):
+                return True
+            parent = self._parent(current)
+            if parent == 0 or parent == current:
+                return False
+            current = parent
+        return False
+
+    def sample(self) -> KeyLevels:
+        if self._closed:
+            raise ContractError("X11 provider is closed")
+        if not self._focused_on_target(self._focus_window()):
+            return KeyLevels(focused=False, pressed=frozenset())
+        keymap = (ctypes.c_char * 32)()
+        self._lib.XQueryKeymap(self._display, keymap)
+        raw = bytes(keymap)
+        pressed = {
+            key
+            for key, keycode in self._keycodes.items()
+            if raw[keycode >> 3] & (1 << (keycode & 7))
+        }
+        return KeyLevels(focused=True, pressed=frozenset(pressed))
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._lib.XCloseDisplay(self._display)

@@ -70,6 +70,16 @@ class OperatorStateFromKeysTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             operator_state_from_keys("z")
 
+    def test_control_byte_is_unsupported(self) -> None:
+        # Ctrl+A (0x01) has no terminal mapping; the decoder rejects it rather
+        # than silently pretending the terminal reader has continuous parity.
+        with self.assertRaises(ContractError):
+            operator_state_from_keys("\x01")
+
+    def test_arrow_escape_sequence_is_unsupported(self) -> None:
+        with self.assertRaises(ContractError):
+            operator_state_from_keys("\x1b[D")
+
 
 class TerminalKeyBufferTests(unittest.TestCase):
     def test_multiple_feeds_union_and_sample_clears(self) -> None:
@@ -160,6 +170,30 @@ class TerminalInputReaderTests(unittest.TestCase):
         self.assertEqual(
             events,
             ["KEY <ESC>[A -> ignored", "KEY W -> forward"],
+        )
+
+    def test_reports_control_byte_and_keeps_reading(self) -> None:
+        controller_fd, follower_fd = pty.openpty()
+        self.addCleanup(os.close, controller_fd)
+        self.addCleanup(os.close, follower_fd)
+        buffer = TerminalKeyBuffer()
+        events: list[str] = []
+
+        with TerminalInputReader(
+            follower_fd,
+            buffer,
+            event_sink=events.append,
+        ):
+            os.write(controller_fd, b"\x01")
+            self.assertTrue(_wait_until(lambda: len(events) == 1))
+            self.assertEqual(buffer.sample(), OperatorState())
+            os.write(controller_fd, b"w")
+            self.assertEqual(_sample_until(buffer), OperatorState(forward=True))
+            self.assertTrue(_wait_until(lambda: len(events) == 2))
+
+        self.assertEqual(
+            events,
+            ["KEY \\x01 -> ignored", "KEY W -> forward"],
         )
 
     def test_restores_attributes_on_exception(self) -> None:
