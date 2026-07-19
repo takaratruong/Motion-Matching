@@ -77,6 +77,13 @@ from .scene import (
     replay_kinematic_reference,
     verify_mm_scene_identity,
 )
+from .scene_runtime import (
+    GEAR_ROBOT_RELATIVE as _GEAR_ROBOT_RELATIVE,
+    GEAR_ROBOT_SHA256 as _GEAR_ROBOT_SHA256,
+    GEAR_SCENE_RELATIVE as _GEAR_MODEL_RELATIVE,
+    GEAR_SCENE_SHA256 as _GEAR_MODEL_SHA256,
+    SCENE_REGISTRY_PATH as _SCENE_REGISTRY_PATH,
+)
 from .schema import (
     JointFeasibilityIdentity,
     parse_joint_feasibility_identity,
@@ -109,21 +116,12 @@ _SONIC_ROOT = Path(__file__).resolve().parents[2]
 _REPOSITORY_ROOT = _SONIC_ROOT.parent
 _LOCK_PATH = _SONIC_ROOT / "configs/gear_sonic.lock.json"
 _JOINT_CONTRACT_PATH = _SONIC_ROOT / "configs/g1_joint_contract.json"
-_SCENE_REGISTRY_PATH = _SONIC_ROOT / "configs/scene_registry.json"
 _STAGE_A_REGISTRY_PATH = _SONIC_ROOT / "configs/experiments/stage_a.json"
 _STAGE_B_REGISTRY_PATH = _SONIC_ROOT / "configs/experiments/stage_b.json"
 _GEAR_TARGET_ORDER_RELATIVE = Path("gear_sonic/envs/manager_env/robots/g1.py")
-_GEAR_MODEL_RELATIVE = Path("gear_sonic_deploy/g1/scene_29dof_with_hand.xml")
-_GEAR_ROBOT_RELATIVE = Path("gear_sonic_deploy/g1/g1_29dof_with_hand.xml")
 _GEAR_MESHES_RELATIVE = Path("gear_sonic_deploy/g1/meshes")
 _GEAR_BINARY_RELATIVE = Path(
     "gear_sonic_deploy/target/release/g1_deploy_onnx_ref"
-)
-_GEAR_MODEL_SHA256 = (
-    "f8538904eb47cada1bfb2dcdc157099092aa63df4307d7e077b651b16bfb6c74"
-)
-_GEAR_ROBOT_SHA256 = (
-    "8b68d8f06674c5c10cd2cd89764b3cfba9fabba5080b55ea67ee1dd12cf630cd"
 )
 _FLAT_ROUTE_ID = "flat-12s"
 _KNOWN_GOOD_LEAF = "known_good"

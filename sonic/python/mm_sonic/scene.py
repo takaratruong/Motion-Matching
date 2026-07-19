@@ -93,6 +93,9 @@ class RegisteredScene:
     allowed_foot_geoms: tuple[int, ...]
     forbidden_geom_groups: Mapping[str, tuple[int, ...]]
     terrain_geoms: tuple[int, ...] = ()
+    source_bounds_holden: np.ndarray | None = None
+    transformed_bounds_mujoco: np.ndarray | None = None
+    collision_hfield: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -126,7 +129,16 @@ class _TerrainSource:
     source_hashes: Mapping[str, str]
     walkability_sha256: str
     mesh_bounds_holden: np.ndarray
+    heightfield_bytes: bytes
     obj_bytes: bytes
+
+
+@dataclass(frozen=True)
+class _MuJoCoHeightfield:
+    file_bytes: bytes
+    position_mujoco: tuple[float, float, float]
+    quaternion_mujoco_wxyz: tuple[float, float, float, float]
+    size: tuple[float, float, float, float]
 
 
 @dataclass(frozen=True)
@@ -575,6 +587,77 @@ def _validate_g1hf(contents: bytes, descriptor: Mapping[str, Any]) -> None:
             raise SceneError(f"terrain.bin {name} disagrees with scene.json")
 
 
+def _mujoco_heightfield(contents: bytes) -> _MuJoCoHeightfield:
+    """Convert G1HF/v2 into MuJoCo's exact binary heightfield orientation.
+
+    Holden's fixed cell diagonal runs from (min-x, min-z) to
+    (max-x, max-z). MuJoCo triangulates the opposite image diagonal. A
+    transposed grid plus a +90 degree Z rotation preserves both world-space
+    sample locations and the authenticated Holden diagonal exactly.
+    """
+
+    if len(contents) < 32:
+        raise SceneError("terrain.bin has a truncated G1HF header")
+    magic, version, nx, nz, origin_x, origin_z, cell, _ = struct.unpack(
+        "<4sIIIffff", contents[:32]
+    )
+    if magic != b"G1HF" or version != 2 or nx < 2 or nz < 2:
+        raise SceneError("terrain.bin is not a valid G1HF/v2 heightfield")
+    if not math.isfinite(float(cell)) or float(cell) <= 0.0:
+        raise SceneError("terrain.bin cell size must be finite and positive")
+    source = np.frombuffer(contents, dtype="<f4", offset=32).reshape(
+        (int(nz), int(nx))
+    )
+    if not np.all(np.isfinite(source)):
+        raise SceneError("terrain.bin heights must be finite")
+    # MuJoCo's binary rows run local -Y to +Y, unlike XML elevation rows.
+    # After the geom's +90 degree Z rotation, output rows therefore advance
+    # in source -X and columns advance in source -Z. This maps samples back
+    # to world-space MuJoCo +X/-Holden-Z and preserves the source diagonal.
+    elevation = np.ascontiguousarray(source.T[::-1, ::-1], dtype="<f4")
+    file_bytes = (
+        struct.pack("<ii", int(nx), int(nz))
+        + elevation.tobytes(order="C")
+    )
+    cell64 = float(cell)
+    x_min = float(origin_x)
+    z_min = float(origin_z)
+    x_extent = (int(nx) - 1) * cell64
+    z_extent = (int(nz) - 1) * cell64
+    x_center = x_min + 0.5 * x_extent
+    z_center = z_min + 0.5 * z_extent
+    minimum_height = float(np.min(source))
+    maximum_height = float(np.max(source))
+    elevation_range = maximum_height - minimum_height
+    if not all(
+        math.isfinite(value)
+        for value in (
+            x_extent,
+            z_extent,
+            x_center,
+            z_center,
+            minimum_height,
+            maximum_height,
+            elevation_range,
+        )
+    ):
+        raise SceneError("terrain.bin heightfield geometry is not finite")
+    if x_extent <= 0.0 or z_extent <= 0.0 or elevation_range < 0.0:
+        raise SceneError("terrain.bin heightfield geometry is invalid")
+    half_sqrt_two = math.sqrt(0.5)
+    return _MuJoCoHeightfield(
+        file_bytes=file_bytes,
+        position_mujoco=(x_center, -z_center, minimum_height),
+        quaternion_mujoco_wxyz=(half_sqrt_two, 0.0, 0.0, half_sqrt_two),
+        size=(
+            0.5 * z_extent,
+            0.5 * x_extent,
+            max(elevation_range, 1.0e-6),
+            max(cell64, 0.05),
+        ),
+    )
+
+
 def _load_mm_catalog_identity(
     terrain_dir: Path | str,
 ) -> _MMCatalogIdentity:
@@ -745,6 +828,7 @@ def _load_terrain_source(
         source_hashes=source_hashes,
         walkability_sha256=walkability_sha,
         mesh_bounds_holden=expected_bounds,
+        heightfield_bytes=terrain_bytes,
         obj_bytes=obj_bytes,
     )
 
@@ -1024,10 +1108,16 @@ def _run_local_robot_bytes(
     )
 
 
+def _xml_numbers(values: Sequence[float]) -> str:
+    return " ".join(format(float(value), ".17g") for value in values)
+
+
 def _overlay_bytes(
     tree: ET.ElementTree,
     scene_id: str,
     transformed_obj: Path | None,
+    collision_hfield: Path | None,
+    hfield: _MuJoCoHeightfield | None,
 ) -> bytes:
     root = tree.getroot()
     worldbodies = root.findall("worldbody")
@@ -1050,32 +1140,72 @@ def _overlay_bytes(
     ):
         raise SceneError("official scene already defines mm_terrain")
     if scene_id == FLAT_SCENE_ID:
-        if transformed_obj is not None:
-            raise SceneError("flat scene must not have a transformed mesh")
+        if (
+            transformed_obj is not None
+            or collision_hfield is not None
+            or hfield is not None
+        ):
+            raise SceneError("flat scene must not have terrain artifacts")
         floors[0].attrib["name"] = "mm_terrain"
     else:
         if transformed_obj is None or not transformed_obj.is_absolute():
             raise SceneError("terrain scene requires an absolute transformed OBJ")
+        if (
+            collision_hfield is None
+            or not collision_hfield.is_absolute()
+            or hfield is None
+        ):
+            raise SceneError("terrain scene requires an absolute collision heightfield")
         worldbody.remove(floors[0])
         if any(
             element.attrib.get("name") == "mm_terrain_mesh"
             for element in root.iter("mesh")
         ):
             raise SceneError("official scene already defines mm_terrain_mesh")
+        if any(
+            element.attrib.get("name") == "mm_terrain_hfield"
+            for element in root.iter("hfield")
+        ):
+            raise SceneError("official scene already defines mm_terrain_hfield")
         ET.SubElement(
             asset,
             "mesh",
             {"name": "mm_terrain_mesh", "file": str(transformed_obj)},
         )
         ET.SubElement(
+            asset,
+            "hfield",
+            {
+                "name": "mm_terrain_hfield",
+                "content_type": "image/vnd.mujoco.hfield",
+                "file": str(collision_hfield),
+                "size": _xml_numbers(hfield.size),
+            },
+        )
+        ET.SubElement(
             worldbody,
             "geom",
             {
                 "name": "mm_terrain",
-                "type": "mesh",
-                "mesh": "mm_terrain_mesh",
+                "type": "hfield",
+                "hfield": "mm_terrain_hfield",
+                "pos": _xml_numbers(hfield.position_mujoco),
+                "quat": _xml_numbers(hfield.quaternion_mujoco_wxyz),
                 "contype": "1",
                 "conaffinity": "1",
+                "rgba": "0 0 0 0.001",
+            },
+        )
+        ET.SubElement(
+            worldbody,
+            "geom",
+            {
+                "name": "mm_terrain_visual",
+                "type": "mesh",
+                "mesh": "mm_terrain_mesh",
+                "contype": "0",
+                "conaffinity": "0",
+                "group": "2",
             },
         )
     if len(
@@ -1208,6 +1338,44 @@ def _canonical_json(value: Mapping[str, Any]) -> bytes:
         raise SceneError("scene registration cannot be encoded") from error
 
 
+def _analytic_flat_bounds(
+    entry: Mapping[str, object],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return Holden and MuJoCo bounds for the analytic flat plane."""
+
+    min_x, min_z, max_x, max_z = (float(value) for value in entry["bounds_xz"])
+    height = float(entry["height_m"])
+    source_corners = np.array(
+        [
+            (x, height, z)
+            for x in (min_x, max_x)
+            for z in (min_z, max_z)
+        ],
+        np.float64,
+    )
+    source_bounds = _readonly_array(
+        np.stack(
+            (np.min(source_corners, axis=0), np.max(source_corners, axis=0))
+        ),
+        np.float32,
+    )
+    target_corners = np.stack(
+        (
+            source_corners[:, 0],
+            -source_corners[:, 2],
+            source_corners[:, 1],
+        ),
+        axis=-1,
+    )
+    target_bounds = _readonly_array(
+        np.stack(
+            (np.min(target_corners, axis=0), np.max(target_corners, axis=0))
+        ),
+        np.float32,
+    )
+    return source_bounds, target_bounds
+
+
 def register_scene(
     scene_id: str,
     route_id: str | None,
@@ -1231,11 +1399,16 @@ def register_scene(
     catalog = _load_mm_catalog_identity(terrain_dir)
     transformed_path: Path | None = None
     transform_record: ObjTransform | None = None
+    collision_hfield_path: Path | None = None
+    collision_hfield_sha: str | None = None
+    mujoco_hfield: _MuJoCoHeightfield | None = None
     terrain: _TerrainSource | None = None
     source_mesh: Path | None = None
     source_heightfield: Path | None = None
     source_bounds: np.ndarray | None = None
     target_bounds: np.ndarray | None = None
+    scene_source_bounds: np.ndarray | None = None
+    scene_target_bounds: np.ndarray | None = None
     if scene_id == FLAT_SCENE_ID:
         if type(route_id) is not str or not route_id:
             raise SceneError("flat registered scene route must be nonempty")
@@ -1248,6 +1421,7 @@ def register_scene(
                 "scene_index": catalog.scene_index_sha256,
             }
         )
+        scene_source_bounds, scene_target_bounds = _analytic_flat_bounds(entry)
     else:
         terrain = _load_terrain_source(catalog, scene_id, route_id)
         source_kind = "authenticated-terrain"
@@ -1317,7 +1491,23 @@ def register_scene(
             raise SceneError("transformed OBJ source bounds changed")
         source_bounds = transform_record.source_bounds_holden
         target_bounds = transform_record.transformed_bounds_mujoco
-    overlay = _overlay_bytes(tree, scene_id, transformed_path)
+        scene_source_bounds = source_bounds
+        scene_target_bounds = target_bounds
+        mujoco_hfield = _mujoco_heightfield(terrain.heightfield_bytes)
+        collision_hfield_path = output / "terrain.hfield"
+        _write_exclusive(
+            collision_hfield_path,
+            mujoco_hfield.file_bytes,
+            "run-local collision heightfield",
+        )
+        collision_hfield_sha = _sha256_bytes(mujoco_hfield.file_bytes)
+    overlay = _overlay_bytes(
+        tree,
+        scene_id,
+        transformed_path,
+        collision_hfield_path,
+        mujoco_hfield,
+    )
     overlay_path = output / "gear_scene.xml"
     _write_exclusive(overlay_path, overlay, "GEAR scene XML")
     overlay_sha = _sha256_bytes(overlay)
@@ -1348,6 +1538,8 @@ def register_scene(
     }
     if transform_record is not None:
         output_hashes["transformed_obj"] = transform_record.transformed_sha256
+    if collision_hfield_sha is not None:
+        output_hashes["collision_hfield"] = collision_hfield_sha
     registration_payload: dict[str, Any] = {
         "schema": "mm-sonic-scene-registration/v1",
         "scene_id": scene_id,
@@ -1358,10 +1550,14 @@ def register_scene(
         "coordinate_target": MUJOCO_COORDINATE_SIGNATURE,
         "transform_matrix": HOLDEN_TO_MUJOCO_MATRIX.tolist(),
         "source_bounds_holden": (
-            None if source_bounds is None else source_bounds.tolist()
+            None
+            if scene_source_bounds is None
+            else scene_source_bounds.tolist()
         ),
         "output_bounds_mujoco": (
-            None if target_bounds is None else target_bounds.tolist()
+            None
+            if scene_target_bounds is None
+            else scene_target_bounds.tolist()
         ),
         "official_scene": str(scene_path),
         "official_scene_sha256": official_sha,
@@ -1377,6 +1573,10 @@ def register_scene(
             if transform_record is None
             else transform_record.transformed_sha256
         ),
+        "collision_hfield": (
+            None if collision_hfield_path is None else str(collision_hfield_path)
+        ),
+        "collision_hfield_sha256": collision_hfield_sha,
         "allowed_foot_geoms": list(allowed),
         "forbidden_geom_groups": {
             name: list(values) for name, values in forbidden.items()
@@ -1407,6 +1607,9 @@ def register_scene(
         allowed_foot_geoms=allowed,
         forbidden_geom_groups=forbidden,
         terrain_geoms=tuple(terrain_geom_ids),
+        source_bounds_holden=scene_source_bounds,
+        transformed_bounds_mujoco=scene_target_bounds,
+        collision_hfield=collision_hfield_path,
     )
     verify_mm_scene_identity(
         registered,
@@ -1529,52 +1732,13 @@ def _finite_matrix(
     return output
 
 
-def replay_kinematic_reference(
+def _load_authenticated_scene_model(
     scene: RegisteredScene,
-    target_joint_names: Sequence[str],
-    joint_position: object,
-    physical_pelvis_position_mujoco: object,
-    physical_pelvis_quaternion_wxyz: object,
-    *,
-    penetration_threshold_m: float = PENETRATION_THRESHOLD_M,
-) -> KinematicReplayReport:
-    """Replay named joints and diagnostic physical pelvis through MuJoCo."""
+) -> tuple[Any, Any, int]:
+    """Authenticate every scene dependency, then compile and re-resolve IDs."""
 
     if not isinstance(scene, RegisteredScene):
         raise SceneError("registered scene is required")
-    if tuple(target_joint_names) != tuple(TARGET_JOINT_ORDER):
-        raise SceneError("target joint names must equal the pinned 29-name order")
-    threshold = _finite_number(
-        penetration_threshold_m, "penetration threshold"
-    )
-    if threshold < 0.0:
-        raise SceneError("penetration threshold must be nonnegative")
-    positions_source = np.asarray(joint_position)
-    if positions_source.ndim != 2 or positions_source.shape[1] != 29:
-        raise SceneError("joint_position must have shape [N,29]")
-    if positions_source.dtype.kind not in "iuf":
-        raise SceneError("joint_position must be numeric")
-    positions = np.asarray(positions_source, np.float64)
-    if not np.all(np.isfinite(positions)):
-        raise SceneError("joint_position must contain only finite values")
-    frames = positions.shape[0]
-    if frames < 1:
-        raise SceneError("kinematic replay requires at least one frame")
-    pelvis_position = _finite_matrix(
-        physical_pelvis_position_mujoco,
-        (frames, 3),
-        "physical pelvis position",
-    )
-    pelvis_quaternion = _finite_matrix(
-        physical_pelvis_quaternion_wxyz,
-        (frames, 4),
-        "physical pelvis quaternion",
-    ).copy()
-    norms = np.linalg.norm(pelvis_quaternion, axis=1)
-    if np.any(norms < 1.0e-12) or np.any(np.abs(norms - 1.0) > 1.0e-5):
-        raise SceneError("physical pelvis quaternion must be unit length")
-    pelvis_quaternion /= norms[:, None]
-
     overlay_path, overlay_bytes, overlay_sha = _read_authenticated(
         scene.gear_scene_xml,
         scene.output_hashes.get("gear_scene_xml"),
@@ -1614,6 +1778,12 @@ def replay_kinematic_reference(
             "registered transformed OBJ",
             maximum_bytes=_MAXIMUM_OBJ_BYTES,
         )
+        try:
+            transformed_path.relative_to(overlay_path.parent)
+        except ValueError as error:
+            raise SceneError(
+                "registered transformed OBJ escapes the scene output"
+            ) from error
         terrain_meshes = overlay_root.findall(
             "./asset/mesh[@name='mm_terrain_mesh']"
         )
@@ -1623,6 +1793,39 @@ def replay_kinematic_reference(
             or terrain_meshes[0].attrib["file"] != str(transformed_path)
         ):
             raise SceneError("registered transformed OBJ path identity changed")
+
+    if scene.collision_hfield is None:
+        collision_hfield_sha: str | None = None
+        if "collision_hfield" in scene.output_hashes:
+            raise SceneError("flat scene unexpectedly registers a collision heightfield")
+        if overlay_root.findall("./asset/hfield[@name='mm_terrain_hfield']"):
+            raise SceneError("flat scene unexpectedly contains a collision heightfield")
+    else:
+        collision_hfield_path, _, collision_hfield_sha = _read_authenticated(
+            scene.collision_hfield,
+            scene.output_hashes.get("collision_hfield"),
+            "registered collision heightfield",
+            maximum_bytes=_MAXIMUM_OBJ_BYTES,
+        )
+        try:
+            collision_hfield_path.relative_to(overlay_path.parent)
+        except ValueError as error:
+            raise SceneError(
+                "registered collision heightfield escapes the scene output"
+            ) from error
+        terrain_hfields = overlay_root.findall(
+            "./asset/hfield[@name='mm_terrain_hfield']"
+        )
+        if (
+            len(terrain_hfields) != 1
+            or terrain_hfields[0].attrib.get("file")
+            != str(collision_hfield_path)
+            or terrain_hfields[0].attrib.get("content_type")
+            != "image/vnd.mujoco.hfield"
+        ):
+            raise SceneError(
+                "registered collision heightfield path identity changed"
+            )
 
     registration_path = overlay_path.parent / "scene_registration.json"
     _, registration_bytes, _ = _read_authenticated(
@@ -1670,8 +1873,23 @@ def replay_kinematic_reference(
         or registration.get("robot_include") != str(robot_path)
         or registration.get("robot_include_sha256") != robot_sha
         or registration.get("transformed_obj_sha256") != transformed_sha
+        or registration.get("collision_hfield")
+        != (
+            None
+            if scene.collision_hfield is None
+            else str(collision_hfield_path)
+        )
+        or registration.get("collision_hfield_sha256")
+        != collision_hfield_sha
         or registration.get("actuator_joint_order_sha256")
         != _actuator_joint_order_sha256(registered_actuator_order)
+        or registration.get("allowed_foot_geoms")
+        != list(scene.allowed_foot_geoms)
+        or registration.get("forbidden_geom_groups")
+        != {
+            name: list(values)
+            for name, values in scene.forbidden_geom_groups.items()
+        }
     ):
         raise SceneError("registered scene registration identity changed")
     mujoco = _import_mujoco()
@@ -1680,17 +1898,71 @@ def replay_kinematic_reference(
     except (ValueError, OSError) as error:
         raise SceneError(f"registered GEAR scene does not load: {error}") from error
     if verify_loaded_actuator_routing(model) != registered_actuator_order:
-        raise SceneError("registered actuator routing changed at replay")
+        raise SceneError("registered actuator routing changed after registration")
     allowed, forbidden = _resolve_contact_groups(model)
     if allowed != scene.allowed_foot_geoms or dict(forbidden) != dict(
         scene.forbidden_geom_groups
     ):
-        raise SceneError("registered geom IDs do not match the replay model")
-    try:
-        terrain_geom = int(model.geom("mm_terrain").id)
-    except KeyError as error:
-        raise SceneError("replay model has no mm_terrain geom") from error
+        raise SceneError("registered geom IDs do not match the loaded model")
+    terrain_geoms = tuple(
+        geom_id
+        for geom_id in range(int(model.ngeom))
+        if model.geom(geom_id).name == "mm_terrain"
+    )
+    if len(terrain_geoms) != 1 or terrain_geoms != scene.terrain_geoms:
+        raise SceneError("registered terrain geom IDs do not match the loaded model")
+    return mujoco, model, terrain_geoms[0]
 
+
+def replay_kinematic_reference(
+    scene: RegisteredScene,
+    target_joint_names: Sequence[str],
+    joint_position: object,
+    physical_pelvis_position_mujoco: object,
+    physical_pelvis_quaternion_wxyz: object,
+    *,
+    penetration_threshold_m: float = PENETRATION_THRESHOLD_M,
+) -> KinematicReplayReport:
+    """Replay named joints and diagnostic physical pelvis through MuJoCo."""
+
+    if not isinstance(scene, RegisteredScene):
+        raise SceneError("registered scene is required")
+    if tuple(target_joint_names) != tuple(TARGET_JOINT_ORDER):
+        raise SceneError("target joint names must equal the pinned 29-name order")
+    threshold = _finite_number(
+        penetration_threshold_m, "penetration threshold"
+    )
+    if threshold < 0.0:
+        raise SceneError("penetration threshold must be nonnegative")
+    positions_source = np.asarray(joint_position)
+    if positions_source.ndim != 2 or positions_source.shape[1] != 29:
+        raise SceneError("joint_position must have shape [N,29]")
+    if positions_source.dtype.kind not in "iuf":
+        raise SceneError("joint_position must be numeric")
+    positions = np.asarray(positions_source, np.float64)
+    if not np.all(np.isfinite(positions)):
+        raise SceneError("joint_position must contain only finite values")
+    frames = positions.shape[0]
+    if frames < 1:
+        raise SceneError("kinematic replay requires at least one frame")
+    pelvis_position = _finite_matrix(
+        physical_pelvis_position_mujoco,
+        (frames, 3),
+        "physical pelvis position",
+    )
+    pelvis_quaternion = _finite_matrix(
+        physical_pelvis_quaternion_wxyz,
+        (frames, 4),
+        "physical pelvis quaternion",
+    ).copy()
+    norms = np.linalg.norm(pelvis_quaternion, axis=1)
+    if np.any(norms < 1.0e-12) or np.any(np.abs(norms - 1.0) > 1.0e-5):
+        raise SceneError("physical pelvis quaternion must be unit length")
+    pelvis_quaternion /= norms[:, None]
+
+    mujoco, model, terrain_geom = _load_authenticated_scene_model(scene)
+    allowed = scene.allowed_foot_geoms
+    forbidden = scene.forbidden_geom_groups
     free_joints = [
         joint_id
         for joint_id in range(int(model.njnt))

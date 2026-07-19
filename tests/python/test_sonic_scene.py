@@ -339,15 +339,21 @@ def _asymmetric_obj(*, textured=True):
     ).encode("ascii")
 
 
-def _terrain_fixture(root, scene_id="synthetic-curb"):
+def _terrain_fixture(root, scene_id="synthetic-curb", *, rectangular=False):
     scene_dir = root / "scenes" / scene_id
     scene_dir.mkdir(parents=True)
     obj = scene_dir / "terrain.obj"
     obj.write_bytes(_asymmetric_obj(textured=False))
     terrain = scene_dir / "terrain.bin"
+    if rectangular:
+        nx, nz, cell = 3, 2, 1.5
+        height_bytes = struct.pack("<ffffff", 0.0, 0.1, 0.2, 0.6, 0.8, 1.0)
+    else:
+        nx, nz, cell = 2, 2, 3.0
+        height_bytes = struct.pack("<ffff", 0.0, 0.2, 0.6, 1.0)
     terrain.write_bytes(
-        struct.pack("<4sIIIffff", b"G1HF", 2, 2, 2, -1.0, -2.0, 3.0, 0.0)
-        + struct.pack("<ffff", 0.0, 0.0, 0.0, 0.0)
+        struct.pack("<4sIIIffff", b"G1HF", 2, nx, nz, -1.0, -2.0, cell, 0.0)
+        + height_bytes
     )
     walkability_sha = "b" * 64
     scene_payload = {
@@ -359,11 +365,11 @@ def _terrain_fixture(root, scene_id="synthetic-curb"):
             "schema": "G1HF/v2",
             "sha256": _sha256(terrain),
             "version": 2,
-            "nx": 2,
-            "nz": 2,
+            "nx": nx,
+            "nz": nz,
             "origin_x": -1.0,
             "origin_z": -2.0,
-            "cell_size_m": 3.0,
+            "cell_size_m": cell,
             "exterior_height_m": 0.0,
         },
         "mesh": {
@@ -722,6 +728,28 @@ class OverlayAndAuthenticationTests(unittest.TestCase):
                 registered.transform_matrix, HOLDEN_TO_MUJOCO_MATRIX
             )
             self.assertIsNone(registered.transformed_obj)
+            np.testing.assert_array_equal(
+                registered.source_bounds_holden,
+                np.array(((-10, 0, -10), (10, 0, 10)), np.float32),
+            )
+            np.testing.assert_array_equal(
+                registered.transformed_bounds_mujoco,
+                np.array(((-10, -10, 0), (10, 10, 0)), np.float32),
+            )
+            registration = json.loads(
+                (
+                    registered.gear_scene_xml.parent
+                    / "scene_registration.json"
+                ).read_text(encoding="utf-8")
+            )
+            np.testing.assert_array_equal(
+                np.asarray(registration["source_bounds_holden"], np.float32),
+                registered.source_bounds_holden,
+            )
+            np.testing.assert_array_equal(
+                np.asarray(registration["output_bounds_mujoco"], np.float32),
+                registered.transformed_bounds_mujoco,
+            )
             root_xml = ET.parse(registered.gear_scene_xml).getroot()
             includes = root_xml.findall("include")
             self.assertEqual(len(includes), 1)
@@ -766,7 +794,8 @@ class OverlayAndAuthenticationTests(unittest.TestCase):
                 tuple(
                     _element_structure(child)
                     for child in root_xml.find("worldbody")
-                    if child.attrib.get("name") != "mm_terrain"
+                    if child.attrib.get("name")
+                    not in ("mm_terrain", "mm_terrain_visual")
                 ),
             )
             model = mujoco.MjModel.from_xml_path(str(registered.gear_scene_xml))
@@ -799,7 +828,7 @@ class OverlayAndAuthenticationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             terrain_root = root / "terrain"
-            identity = _terrain_fixture(terrain_root)
+            identity = _terrain_fixture(terrain_root, rectangular=True)
             official, robot = _official_scene_fixture(root)
             official_root = ET.parse(official).getroot()
             registered = register_scene(
@@ -837,13 +866,32 @@ class OverlayAndAuthenticationTests(unittest.TestCase):
             self.assertEqual(
                 registered.source_hashes["terrain_obj"], identity["mesh_sha256"]
             )
+            np.testing.assert_array_equal(
+                registered.source_bounds_holden,
+                np.array(((-1, 0, -2), (2, 3, 4)), np.float32),
+            )
+            np.testing.assert_array_equal(
+                registered.transformed_bounds_mujoco,
+                np.array(((-1, -4, 0), (2, 2, 3)), np.float32),
+            )
             root_xml = ET.parse(registered.gear_scene_xml).getroot()
             self.assertEqual(root_xml.findall("./worldbody/geom[@name='floor']"), [])
             terrain_geoms = root_xml.findall("./worldbody/geom[@name='mm_terrain']")
             self.assertEqual(len(terrain_geoms), 1)
-            self.assertEqual(terrain_geoms[0].attrib["type"], "mesh")
+            self.assertEqual(terrain_geoms[0].attrib["type"], "hfield")
+            visual_geoms = root_xml.findall(
+                "./worldbody/geom[@name='mm_terrain_visual']"
+            )
+            self.assertEqual(len(visual_geoms), 1)
+            self.assertEqual(visual_geoms[0].attrib["type"], "mesh")
+            self.assertEqual(visual_geoms[0].attrib["contype"], "0")
+            self.assertEqual(visual_geoms[0].attrib["conaffinity"], "0")
             self.assertEqual(
                 len(root_xml.findall("./asset/mesh[@name='mm_terrain_mesh']")),
+                1,
+            )
+            self.assertEqual(
+                len(root_xml.findall("./asset/hfield[@name='mm_terrain_hfield']")),
                 1,
             )
             original_assets = tuple(
@@ -867,11 +915,52 @@ class OverlayAndAuthenticationTests(unittest.TestCase):
                 tuple(
                     _element_structure(child)
                     for child in root_xml.find("worldbody")
-                    if child.attrib.get("name") != "mm_terrain"
+                    if child.attrib.get("name")
+                    not in ("mm_terrain", "mm_terrain_visual")
                 ),
             )
             model = mujoco.MjModel.from_xml_path(str(registered.gear_scene_xml))
-            self.assertEqual(model.geom("mm_terrain").id >= 0, True)
+            terrain_geom = int(model.geom("mm_terrain").id)
+            self.assertEqual(
+                int(model.geom_type[terrain_geom]), int(mujoco.mjtGeom.mjGEOM_HFIELD)
+            )
+            visual_geom = int(model.geom("mm_terrain_visual").id)
+            self.assertEqual(int(model.geom_contype[visual_geom]), 0)
+            self.assertEqual(int(model.geom_conaffinity[visual_geom]), 0)
+            data = mujoco.MjData(model)
+            mujoco.mj_forward(model, data)
+            assert registered.collision_hfield is not None
+            hfield_bytes = registered.collision_hfield.read_bytes()
+            self.assertEqual(struct.unpack("<ii", hfield_bytes[:8]), (3, 2))
+            np.testing.assert_allclose(
+                np.frombuffer(hfield_bytes, dtype="<f4", offset=8),
+                np.array((1.0, 0.2, 0.8, 0.1, 0.6, 0.0), np.float32),
+            )
+            hfield_id = int(model.geom_dataid[terrain_geom])
+            np.testing.assert_allclose(
+                model.hfield_size[hfield_id],
+                np.array((0.75, 1.5, 1.0, 1.5), np.float64),
+            )
+            for tx, tz, expected_height in (
+                (0.75, 0.25, 0.25),
+                (0.25, 0.75, 0.5),
+                (0.5, 0.5, 0.4),
+            ):
+                source_x = -1.0 + 1.5 * tx
+                source_z = -2.0 + 1.5 * tz
+                hit_geom = np.array((-1,), np.int32)
+                distance = mujoco.mj_ray(
+                    model,
+                    data,
+                    np.array((source_x, -source_z, 5.0), np.float64),
+                    np.array((0.0, 0.0, -1.0), np.float64),
+                    np.array((1, 0, 0, 0, 0, 0), np.uint8),
+                    True,
+                    -1,
+                    hit_geom,
+                )
+                self.assertEqual(int(hit_geom[0]), terrain_geom)
+                self.assertAlmostEqual(5.0 - distance, expected_height, places=6)
             expected_bounds = np.array(((-1, -4, 0), (2, 2, 3)), np.float32)
             registration_path = (
                 registered.gear_scene_xml.parent / "scene_registration.json"
@@ -885,6 +974,21 @@ class OverlayAndAuthenticationTests(unittest.TestCase):
                 np.asarray(registration["output_bounds_mujoco"], np.float32),
                 expected_bounds,
             )
+            self.assertIsNotNone(registered.collision_hfield)
+            assert registered.collision_hfield is not None
+            collision_bytes = registered.collision_hfield.read_bytes()
+            registered.collision_hfield.write_bytes(collision_bytes + b"tampered")
+            with self.assertRaisesRegex(
+                SceneError, "registered collision heightfield.*SHA-256"
+            ):
+                replay_kinematic_reference(
+                    registered,
+                    TARGET_JOINT_ORDER,
+                    np.zeros((1, 29), np.float32),
+                    np.array([[0.0, 0.0, 0.3]], np.float32),
+                    np.array([[1.0, 0.0, 0.0, 0.0]], np.float32),
+                )
+            registered.collision_hfield.write_bytes(collision_bytes)
             assert registered.transformed_obj is not None
             registered.transformed_obj.write_bytes(
                 registered.transformed_obj.read_bytes() + b"# tampered\n"
