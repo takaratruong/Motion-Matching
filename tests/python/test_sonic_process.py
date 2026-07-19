@@ -274,6 +274,198 @@ class GatedSimulatorClientTests(TemporaryScriptCase):
         self.assertIn('"op":"advance"', archived)
         self.assertIn('"op":"close"', archived)
 
+    def test_camera_round_trip_echoes_exact_four_fields(self):
+        child = self.script(
+            "camera_child.py",
+            r'''
+            import json
+            import sys
+
+            for line in sys.stdin:
+                request = json.loads(line)
+                op = request["op"]
+                if op == "camera":
+                    data = {
+                        "sequence": request["sequence"],
+                        "azimuth_deg": request["azimuth_deg"],
+                        "elevation_deg": request["elevation_deg"],
+                        "distance_m": request["distance_m"],
+                    }
+                else:
+                    data = {"closed": True}
+                print(json.dumps({
+                    "v": 1,
+                    "ok": True,
+                    "op": op,
+                    "request_id": request["request_id"],
+                    "data": data,
+                }, separators=(",", ":")), flush=True)
+                if op == "close":
+                    break
+            ''',
+        )
+        client = self.client(child)
+        try:
+            applied = client.set_camera(
+                sequence=7,
+                azimuth_deg=45.0,
+                elevation_deg=-20.0,
+                distance_m=4.0,
+            )
+            self.assertEqual(
+                applied,
+                {
+                    "sequence": 7,
+                    "azimuth_deg": 45.0,
+                    "elevation_deg": -20.0,
+                    "distance_m": 4.0,
+                },
+            )
+        finally:
+            client.close()
+
+    def test_camera_accepts_positional_arguments(self):
+        child = self.script(
+            "positional_camera_child.py",
+            r'''
+            import json
+            import sys
+
+            for line in sys.stdin:
+                request = json.loads(line)
+                op = request["op"]
+                if op == "camera":
+                    data = {
+                        "sequence": request["sequence"],
+                        "azimuth_deg": request["azimuth_deg"],
+                        "elevation_deg": request["elevation_deg"],
+                        "distance_m": request["distance_m"],
+                    }
+                else:
+                    data = {"closed": True}
+                print(json.dumps({
+                    "v": 1,
+                    "ok": True,
+                    "op": op,
+                    "request_id": request["request_id"],
+                    "data": data,
+                }, separators=(",", ":")), flush=True)
+                if op == "close":
+                    break
+            ''',
+        )
+        client = self.client(child)
+        try:
+            applied = client.set_camera(11, 33.0, -18.0, 5.0)
+            self.assertEqual(
+                applied,
+                {
+                    "sequence": 11,
+                    "azimuth_deg": 33.0,
+                    "elevation_deg": -18.0,
+                    "distance_m": 5.0,
+                },
+            )
+        finally:
+            client.close()
+
+    def test_camera_rejects_invalid_local_arguments(self):
+        child = self.script(
+            "local_camera_child.py",
+            r'''
+            import json
+            import sys
+
+            for line in sys.stdin:
+                request = json.loads(line)
+                print(json.dumps({
+                    "v": 1,
+                    "ok": True,
+                    "op": request["op"],
+                    "request_id": request["request_id"],
+                    "data": {"closed": True},
+                }, separators=(",", ":")), flush=True)
+                if request["op"] == "close":
+                    break
+            ''',
+        )
+        client = self.client(child)
+        try:
+            with self.assertRaisesRegex(ValueError, "sequence"):
+                client.set_camera(
+                    sequence=True, azimuth_deg=0.0, elevation_deg=0.0, distance_m=1.0
+                )
+            with self.assertRaisesRegex(ValueError, "sequence"):
+                client.set_camera(
+                    sequence=-1, azimuth_deg=0.0, elevation_deg=0.0, distance_m=1.0
+                )
+            with self.assertRaisesRegex(ValueError, "finite"):
+                client.set_camera(
+                    sequence=0,
+                    azimuth_deg=float("inf"),
+                    elevation_deg=0.0,
+                    distance_m=1.0,
+                )
+            with self.assertRaisesRegex(ValueError, "distance_m"):
+                client.set_camera(
+                    sequence=0, azimuth_deg=0.0, elevation_deg=0.0, distance_m=0.0
+                )
+            for field in ("azimuth_deg", "elevation_deg", "distance_m"):
+                with self.subTest(boolean_field=field):
+                    values = {
+                        "sequence": 0,
+                        "azimuth_deg": 0.0,
+                        "elevation_deg": 0.0,
+                        "distance_m": 1.0,
+                    }
+                    values[field] = True
+                    with self.assertRaisesRegex(ValueError, field):
+                        client.set_camera(**values)
+        finally:
+            client.close()
+
+    def test_camera_rejects_response_that_does_not_echo_request(self):
+        child = self.script(
+            "mismatched_camera.py",
+            r'''
+            import json
+            import sys
+
+            for line in sys.stdin:
+                request = json.loads(line)
+                op = request["op"]
+                if op == "camera":
+                    data = {
+                        "sequence": request["sequence"] + 1,
+                        "azimuth_deg": request["azimuth_deg"],
+                        "elevation_deg": request["elevation_deg"],
+                        "distance_m": request["distance_m"],
+                    }
+                else:
+                    data = {"closed": True}
+                print(json.dumps({
+                    "v": 1,
+                    "ok": True,
+                    "op": op,
+                    "request_id": request["request_id"],
+                    "data": data,
+                }, separators=(",", ":")), flush=True)
+                if op == "close":
+                    break
+            ''',
+        )
+        client = self.client(child)
+        try:
+            with self.assertRaisesRegex(ProcessProtocolError, "sequence"):
+                client.set_camera(
+                    sequence=7,
+                    azimuth_deg=45.0,
+                    elevation_deg=-20.0,
+                    distance_m=4.0,
+                )
+        finally:
+            client.close()
+
     def test_close_strictly_validates_response_then_guarantees_cleanup(self):
         child = self.script(
             "malformed_close.py",

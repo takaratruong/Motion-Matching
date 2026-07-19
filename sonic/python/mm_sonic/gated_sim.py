@@ -73,6 +73,14 @@ class SimulatorBackend(Protocol):
     def sample(self) -> Mapping[str, object]:
         raise NotImplementedError
 
+    def set_camera(
+        self,
+        azimuth_deg: float,
+        elevation_deg: float,
+        distance_m: float,
+    ) -> None:
+        raise NotImplementedError
+
     def close(self) -> None:
         raise NotImplementedError
 
@@ -527,6 +535,29 @@ class GatedSimulatorRunner:
             "contact_rows": self._contact_rows,
         }
 
+    def set_camera(
+        self,
+        sequence: int,
+        azimuth_deg: float,
+        elevation_deg: float,
+        distance_m: float,
+    ) -> dict[str, object]:
+        if type(sequence) is not int or sequence < 0:
+            raise ProtocolError("sequence must be a nonnegative integer")
+        azimuth = _finite_number(azimuth_deg, "azimuth_deg")
+        elevation = _finite_number(elevation_deg, "elevation_deg")
+        distance = _finite_number(distance_m, "distance_m")
+        if not (0.1 <= distance <= 100.0):
+            raise ProtocolError("distance_m must lie within [0.1, 100.0]")
+        backend = self.backend
+        backend.set_camera(azimuth, elevation, distance)
+        return {
+            "sequence": sequence,
+            "azimuth_deg": azimuth,
+            "elevation_deg": elevation,
+            "distance_m": distance,
+        }
+
     def close(self) -> None:
         if self._closed:
             return
@@ -668,6 +699,34 @@ def _handle_request(
             "state_rows": result.state_rows,
             "contact_rows": result.contact_rows,
         }
+    if op == "camera":
+        _exact_request(
+            source,
+            {
+                "v",
+                "op",
+                "request_id",
+                "sequence",
+                "azimuth_deg",
+                "elevation_deg",
+                "distance_m",
+            },
+            "camera request",
+        )
+        if type(source["sequence"]) is not int or source["sequence"] < 0:
+            raise ProtocolError("sequence must be a nonnegative integer")
+        return (
+            op,
+            request_id,
+            runner.set_camera(
+                sequence=source["sequence"],
+                azimuth_deg=_finite_number(source["azimuth_deg"], "azimuth_deg"),
+                elevation_deg=_finite_number(
+                    source["elevation_deg"], "elevation_deg"
+                ),
+                distance_m=_finite_number(source["distance_m"], "distance_m"),
+            ),
+        )
     if op == "snapshot":
         _exact_request(source, {"v", "op", "request_id"}, "snapshot request")
         return op, request_id, runner.snapshot()
@@ -1027,6 +1086,24 @@ class ExternalGearBackend:
         remaining = self.sim_dt - (time.monotonic() - started)
         if getattr(self, "_wall_clock_pacing", True) and remaining > 0.0:
             time.sleep(remaining)
+
+    def set_camera(
+        self,
+        azimuth_deg: float,
+        elevation_deg: float,
+        distance_m: float,
+    ) -> None:
+        # Presentation only: adjust an existing running passive viewer and
+        # synchronize exactly once.  This never advances physics and stays on
+        # stderr like the other viewer diagnostics.
+        with redirect_stdout(sys.stderr):
+            viewer = getattr(self._simulator.sim_env, "viewer", None)
+            if viewer is None or not viewer.is_running():
+                raise ProtocolError("passive viewer is not running")
+            viewer.cam.azimuth = azimuth_deg
+            viewer.cam.elevation = elevation_deg
+            viewer.cam.distance = distance_m
+            viewer.sync()
 
     def _geom_name(self, geom_id: int) -> str:
         name = self._bindings.mujoco.mj_id2name(

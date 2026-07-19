@@ -1743,6 +1743,68 @@ class GatedSimulatorClient:
             ),
         }
 
+    def set_camera(
+        self,
+        sequence: int,
+        azimuth_deg: float,
+        elevation_deg: float,
+        distance_m: float,
+    ) -> dict[str, object]:
+        if type(sequence) is not int or sequence < 0:
+            raise ValueError("sequence must be a nonnegative integer")
+
+        def finite(value: object, label: str) -> float:
+            if type(value) not in (int, float, np.float32, np.float64):
+                raise ValueError(f"{label} must be a finite number")
+            number = float(value)
+            if not math.isfinite(number):
+                raise ValueError(f"{label} must be a finite number")
+            return number
+
+        azimuth = finite(azimuth_deg, "azimuth_deg")
+        elevation = finite(elevation_deg, "elevation_deg")
+        distance = finite(distance_m, "distance_m")
+        if not (0.1 <= distance <= 100.0):
+            raise ValueError("distance_m must lie within [0.1, 100.0]")
+        data = _exact_object(
+            self._request(
+                "camera",
+                sequence=sequence,
+                azimuth_deg=azimuth,
+                elevation_deg=elevation,
+                distance_m=distance,
+            ),
+            {"sequence", "azimuth_deg", "elevation_deg", "distance_m"},
+            "camera data",
+        )
+        if data["sequence"] != sequence or type(data["sequence"]) is not int:
+            raise ProcessProtocolError(
+                "camera data.sequence must echo the requested sequence"
+            )
+        response_azimuth = _finite_number(
+            data["azimuth_deg"], "camera data.azimuth_deg"
+        )
+        response_elevation = _finite_number(
+            data["elevation_deg"], "camera data.elevation_deg"
+        )
+        response_distance = _finite_number(
+            data["distance_m"], "camera data.distance_m"
+        )
+        if (
+            response_azimuth != azimuth
+            or response_elevation != elevation
+            or response_distance != distance
+        ):
+            raise ProcessProtocolError(
+                "camera data must echo the requested angles and distance"
+            )
+        return {
+            "sequence": sequence,
+            "azimuth_deg": response_azimuth,
+            "elevation_deg": response_elevation,
+            "distance_m": response_distance,
+        }
+
     def close(self) -> None:
         if self._closed:
             return

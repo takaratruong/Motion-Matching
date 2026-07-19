@@ -35,6 +35,7 @@ class FakeBackend:
         self.reset_calls = []
         self.step_calls = 0
         self.sample_calls = 0
+        self.camera_calls = []
         self.closed = False
 
     @property
@@ -78,6 +79,9 @@ class FakeBackend:
                 }
             ],
         }
+
+    def set_camera(self, azimuth_deg, elevation_deg, distance_m):
+        self.camera_calls.append((azimuth_deg, elevation_deg, distance_m))
 
     def close(self):
         self.closed = True
@@ -326,6 +330,109 @@ class GatedSimulatorRunnerTests(unittest.TestCase):
         self.assertEqual(contact_rows[-1]["contacts"][0]["geom2"], "floor")
         self.assertAlmostEqual(state_rows[-1]["sim_time_s"], 0.4, places=15)
 
+    def test_camera_request_applies_without_advancing_physics(self):
+        self.reset()
+        backend = self.backends[-1]
+        self.runner.advance(4)
+        before = self.runner.snapshot()
+
+        applied = self.runner.set_camera(
+            sequence=7,
+            azimuth_deg=45.0,
+            elevation_deg=-20.0,
+            distance_m=4.0,
+        )
+
+        self.assertEqual(
+            applied,
+            {
+                "sequence": 7,
+                "azimuth_deg": 45.0,
+                "elevation_deg": -20.0,
+                "distance_m": 4.0,
+            },
+        )
+        self.assertEqual(self.runner.snapshot(), before)
+        self.assertEqual(backend.camera_calls[-1], (45.0, -20.0, 4.0))
+        self.assertEqual(backend.step_calls, 4)
+        self.assertEqual(backend.sample_calls, 4)
+
+    def test_camera_accepts_positional_arguments(self):
+        self.reset()
+        backend = self.backends[-1]
+
+        applied = self.runner.set_camera(7, 45.0, -20.0, 4.0)
+
+        self.assertEqual(
+            applied,
+            {
+                "sequence": 7,
+                "azimuth_deg": 45.0,
+                "elevation_deg": -20.0,
+                "distance_m": 4.0,
+            },
+        )
+        self.assertEqual(backend.camera_calls[-1], (45.0, -20.0, 4.0))
+
+    def test_camera_accepts_inclusive_distance_bounds(self):
+        self.reset()
+        backend = self.backends[-1]
+        near = self.runner.set_camera(
+            sequence=0, azimuth_deg=0.0, elevation_deg=0.0, distance_m=0.1
+        )
+        far = self.runner.set_camera(
+            sequence=1, azimuth_deg=0.0, elevation_deg=0.0, distance_m=100.0
+        )
+        self.assertEqual(near["distance_m"], 0.1)
+        self.assertEqual(far["distance_m"], 100.0)
+        self.assertEqual(backend.camera_calls[0], (0.0, 0.0, 0.1))
+        self.assertEqual(backend.camera_calls[1], (0.0, 0.0, 100.0))
+
+    def test_camera_rejects_boolean_or_negative_sequence(self):
+        self.reset()
+        backend = self.backends[-1]
+        for sequence in (True, False, -1):
+            with self.subTest(sequence=sequence):
+                with self.assertRaisesRegex(ProtocolError, "sequence"):
+                    self.runner.set_camera(
+                        sequence=sequence,
+                        azimuth_deg=0.0,
+                        elevation_deg=0.0,
+                        distance_m=1.0,
+                    )
+        self.assertEqual(backend.camera_calls, [])
+
+    def test_camera_rejects_nonfinite_angles(self):
+        self.reset()
+        backend = self.backends[-1]
+        for azimuth, elevation in (
+            (math.inf, 0.0),
+            (0.0, math.nan),
+        ):
+            with self.subTest(azimuth=azimuth, elevation=elevation):
+                with self.assertRaisesRegex(ProtocolError, "finite"):
+                    self.runner.set_camera(
+                        sequence=0,
+                        azimuth_deg=azimuth,
+                        elevation_deg=elevation,
+                        distance_m=1.0,
+                    )
+        self.assertEqual(backend.camera_calls, [])
+
+    def test_camera_rejects_distance_outside_inclusive_range(self):
+        self.reset()
+        backend = self.backends[-1]
+        for distance in (0.0, 0.09, 100.01, math.inf):
+            with self.subTest(distance=distance):
+                with self.assertRaisesRegex(ProtocolError, "distance_m"):
+                    self.runner.set_camera(
+                        sequence=0,
+                        azimuth_deg=0.0,
+                        elevation_deg=0.0,
+                        distance_m=distance,
+                    )
+        self.assertEqual(backend.camera_calls, [])
+
     def test_sampling_phase_and_row_counts_continue_across_advances(self):
         self.reset()
         first = self.runner.advance(3)
@@ -550,6 +657,63 @@ class GatedSimulatorProtocolTests(unittest.TestCase):
         )
         self.assertEqual(rejected_backend.reset_calls, [])
 
+    def test_camera_request_requires_exact_keys_and_echoes_values(self):
+        reset = json.dumps(
+            {
+                "v": 1,
+                "op": "reset",
+                "request_id": "g1",
+                "scene_xml": str(self.scene),
+                "initial_qpos": [0.0] * 3 + [1.0] + [0.0] * 32,
+                "lateral_offset_m": 0.0,
+                "yaw_offset_rad": 0.0,
+                "log_dir": str(self.root / "cam-sim"),
+                "elastic_band_enabled": True,
+            },
+            separators=(",", ":"),
+        )
+        camera = json.dumps(
+            {
+                "v": 1,
+                "op": "camera",
+                "request_id": "g2",
+                "sequence": 5,
+                "azimuth_deg": 30.0,
+                "elevation_deg": -15.0,
+                "distance_m": 3.5,
+            },
+            separators=(",", ":"),
+        )
+        responses, backend = self.run_server(
+            [
+                '{"v":1,"op":"hello","request_id":"g0"}',
+                reset,
+                camera,
+                '{"v":1,"op":"camera","request_id":"g3","sequence":5,'
+                '"azimuth_deg":30.0,"elevation_deg":-15.0}',
+                '{"v":1,"op":"camera","request_id":"g4","sequence":5,'
+                '"azimuth_deg":30.0,"elevation_deg":-15.0,"distance_m":3.5,'
+                '"extra":0}',
+                '{"v":1,"op":"close","request_id":"g5"}',
+            ]
+        )
+        self.assertTrue(responses[2]["ok"])
+        self.assertEqual(
+            responses[2]["data"],
+            {
+                "sequence": 5,
+                "azimuth_deg": 30.0,
+                "elevation_deg": -15.0,
+                "distance_m": 3.5,
+            },
+        )
+        self.assertEqual(backend.camera_calls[-1], (30.0, -15.0, 3.5))
+        self.assertFalse(responses[3]["ok"])
+        self.assertIn("keys differ", responses[3]["error"]["message"])
+        self.assertFalse(responses[4]["ok"])
+        self.assertIn("keys differ", responses[4]["error"]["message"])
+        self.assertEqual(backend.step_calls, 0)
+
     def test_advance_before_reset_is_rejected_without_constructing_backend(self):
         constructed = []
         stdout = io.StringIO()
@@ -761,6 +925,35 @@ class ExternalGearBackendBoundaryTests(unittest.TestCase):
         backend.step()
 
         self.assertEqual(events, ["step"])
+
+    def test_set_camera_assigns_viewer_fields_and_syncs_once(self):
+        events = []
+        cam = SimpleNamespace(azimuth=0.0, elevation=0.0, distance=0.0)
+        viewer = SimpleNamespace(
+            cam=cam,
+            is_running=lambda: True,
+            sync=lambda: events.append("sync"),
+        )
+        sim_env = SimpleNamespace(viewer=viewer)
+        backend = ExternalGearBackend.__new__(ExternalGearBackend)
+        backend._simulator = SimpleNamespace(sim_env=sim_env)
+
+        backend.set_camera(45.0, -20.0, 4.0)
+
+        self.assertEqual(cam.azimuth, 45.0)
+        self.assertEqual(cam.elevation, -20.0)
+        self.assertEqual(cam.distance, 4.0)
+        self.assertEqual(events, ["sync"])
+
+    def test_set_camera_requires_a_running_passive_viewer(self):
+        cam = SimpleNamespace(azimuth=0.0, elevation=0.0, distance=0.0)
+        for viewer in (None, SimpleNamespace(cam=cam, is_running=lambda: False)):
+            with self.subTest(viewer=viewer):
+                sim_env = SimpleNamespace(viewer=viewer)
+                backend = ExternalGearBackend.__new__(ExternalGearBackend)
+                backend._simulator = SimpleNamespace(sim_env=sim_env)
+                with self.assertRaisesRegex(ProtocolError, "viewer"):
+                    backend.set_camera(45.0, -20.0, 4.0)
 
     def test_onscreen_flag_defaults_headless_and_parses_opt_in(self):
         parser = gated_sim._parser()
