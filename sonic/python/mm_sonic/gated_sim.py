@@ -1015,11 +1015,14 @@ class ExternalGearBackend:
         # on stderr instead of allowing a non-JSON line to corrupt the peer.
         with redirect_stdout(sys.stderr):
             sim_env = self._simulator.sim_env
+            viewer = getattr(sim_env, "viewer", None)
+            if viewer is not None and not viewer.is_running():
+                raise ProtocolError("MuJoCo viewer is closed")
             sim_env.sim_step()
             # Presentation only: synchronize an existing passive viewer exactly
             # once after the single authoritative physics step.  This never
             # advances physics and stays on stderr like the fall diagnostics.
-            if getattr(sim_env, "viewer", None) is not None:
+            if viewer is not None:
                 sim_env.update_viewer()
         remaining = self.sim_dt - (time.monotonic() - started)
         if getattr(self, "_wall_clock_pacing", True) and remaining > 0.0:

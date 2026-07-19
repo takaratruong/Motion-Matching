@@ -719,7 +719,7 @@ class ExternalGearBackendBoundaryTests(unittest.TestCase):
     def test_visible_backend_syncs_viewer_once_after_single_step(self):
         events = []
         sim_env = SimpleNamespace(
-            viewer=object(),
+            viewer=SimpleNamespace(is_running=lambda: True),
             sim_step=lambda: events.append("step"),
             update_viewer=lambda: events.append("sync"),
         )
@@ -730,6 +730,22 @@ class ExternalGearBackendBoundaryTests(unittest.TestCase):
         backend.step()
 
         self.assertEqual(events, ["step", "sync"])
+
+    def test_closed_visible_viewer_stops_before_physics_or_sync(self):
+        events = []
+        sim_env = SimpleNamespace(
+            viewer=SimpleNamespace(is_running=lambda: False),
+            sim_step=lambda: events.append("step"),
+            update_viewer=lambda: events.append("sync"),
+        )
+        backend = ExternalGearBackend.__new__(ExternalGearBackend)
+        backend._wall_clock_pacing = False
+        backend._simulator = SimpleNamespace(sim_dt=0.005, sim_env=sim_env)
+
+        with self.assertRaisesRegex(ProtocolError, "viewer is closed"):
+            backend.step()
+
+        self.assertEqual(events, [])
 
     def test_headless_backend_steps_once_without_viewer_sync(self):
         events = []
