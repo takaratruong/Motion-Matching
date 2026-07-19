@@ -57,6 +57,10 @@ _PRELOAD_CHUNKS = 4
 _CHUNK_DURATION_S = 0.4
 
 
+def _print_terminal_event(event: str) -> None:
+    print(event, flush=True)
+
+
 def _validated_preload_chunks(value: object) -> int:
     """Return an exact preload depth in 1..4, rejecting everything else."""
 
@@ -365,7 +369,11 @@ def run_demo(namespace: argparse.Namespace) -> Path:
         )
         key_buffer = TerminalKeyBuffer()
         reader = (
-            TerminalInputReader(sys.stdin.fileno(), key_buffer)
+            TerminalInputReader(
+                sys.stdin.fileno(),
+                key_buffer,
+                event_sink=_print_terminal_event,
+            )
             if namespace.mode == "interactive"
             else None
         )

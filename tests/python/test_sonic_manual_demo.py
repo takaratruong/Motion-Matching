@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+from io import StringIO
 import json
 import math
 import unittest
@@ -12,6 +14,7 @@ from mm_sonic.joints import ContractError
 from mm_sonic.manual_demo import (
     CommandRecorder,
     _parser,
+    _print_terminal_event,
     _validated_preload_chunks,
     main,
 )
@@ -86,6 +89,14 @@ class CommandRecorderTests(unittest.TestCase):
         self.assertEqual(
             document["hand_control"], hand_targets_record(NEUTRAL_HAND_TARGETS)
         )
+
+
+class TerminalEventPrintingTests(unittest.TestCase):
+    def test_prints_one_complete_event_line(self) -> None:
+        output = StringIO()
+        with redirect_stdout(output):
+            _print_terminal_event("KEY W -> forward")
+        self.assertEqual(output.getvalue(), "KEY W -> forward\n")
 
 
 class ValidatedPreloadChunksTests(unittest.TestCase):
