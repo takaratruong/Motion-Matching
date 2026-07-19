@@ -4,6 +4,128 @@ import json
 import numpy as np
 
 
+TERRAIN_FAMILIES = ("flat", "curb", "slope", "stair")
+
+
+def _is_integer(value) -> bool:
+    return type(value) is int or (
+        isinstance(value, np.integer) and not isinstance(value, np.bool_)
+    )
+
+
+@dataclass(frozen=True)
+class SourceFrameRange:
+    source_name: str
+    source_start: int
+    source_stop: int
+    source_frame_count: int
+    global_start: int
+    global_stop: int
+
+    def validate(self, frame_count: int) -> None:
+        if type(self.source_name) is not str or not self.source_name:
+            raise ValueError("source name must be a non-empty string")
+        integer_fields = (
+            self.source_start,
+            self.source_stop,
+            self.source_frame_count,
+            self.global_start,
+            self.global_stop,
+        )
+        if not all(_is_integer(value) for value in integer_fields):
+            raise ValueError("source/global range values must be integers")
+        if self.source_start >= self.source_stop:
+            raise ValueError("empty or reversed source range")
+        if (
+            self.source_frame_count < 1
+            or self.source_start < 0
+            or self.source_stop > self.source_frame_count
+        ):
+            raise ValueError("source range out of bounds")
+        if self.global_start >= self.global_stop:
+            raise ValueError("empty or reversed global range")
+        if self.global_start < 0 or self.global_stop > frame_count:
+            raise ValueError("global range out of bounds")
+        if (
+            self.source_stop - self.source_start
+            != self.global_stop - self.global_start
+        ):
+            raise ValueError("source/global range lengths differ")
+
+
+@dataclass(frozen=True)
+class TerrainBank:
+    family: str
+    range_indices: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "range_indices", tuple(self.range_indices))
+
+
+@dataclass(frozen=True)
+class TerrainBankIndex:
+    frame_count: int
+    ranges: tuple[SourceFrameRange, ...]
+    banks: tuple[TerrainBank, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "ranges", tuple(self.ranges))
+        object.__setattr__(self, "banks", tuple(self.banks))
+
+    def validate(self) -> None:
+        if not _is_integer(self.frame_count) or self.frame_count < 1:
+            raise ValueError("terrain bank frame count must be a positive integer")
+        if not self.ranges:
+            raise ValueError("terrain bank ranges must not be empty")
+        if len(self.banks) != len(TERRAIN_FAMILIES) or not all(
+            isinstance(bank, TerrainBank) for bank in self.banks
+        ):
+            raise ValueError("terrain banks must contain exact terrain families")
+        if tuple(bank.family for bank in self.banks) != TERRAIN_FAMILIES:
+            raise ValueError(
+                f"terrain families must be exactly {TERRAIN_FAMILIES}"
+            )
+
+        source_names = set()
+        expected_start = 0
+        for source_range in self.ranges:
+            if not isinstance(source_range, SourceFrameRange):
+                raise ValueError("terrain bank ranges must be SourceFrameRange records")
+            source_range.validate(self.frame_count)
+            if source_range.source_name in source_names:
+                raise ValueError(
+                    f"duplicate source ownership for {source_range.source_name}"
+                )
+            source_names.add(source_range.source_name)
+            if source_range.global_start < expected_start:
+                raise ValueError("global-frame ranges overlap")
+            if source_range.global_start > expected_start:
+                raise ValueError("gap in global-frame range coverage")
+            expected_start = source_range.global_stop
+        if expected_start != self.frame_count:
+            raise ValueError("incomplete global-frame coverage")
+
+        ownership = [0] * len(self.ranges)
+        for bank in self.banks:
+            for range_index in bank.range_indices:
+                if not _is_integer(range_index) or not (
+                    0 <= range_index < len(self.ranges)
+                ):
+                    raise ValueError("terrain bank range index out of bounds")
+                ownership[int(range_index)] += 1
+        if any(count > 1 for count in ownership):
+            raise ValueError("duplicate terrain-bank range ownership")
+        if any(count == 0 for count in ownership):
+            raise ValueError("incomplete terrain-bank range ownership")
+
+    def ranges_for(self, family: str) -> tuple[SourceFrameRange, ...]:
+        self.validate()
+        if family not in TERRAIN_FAMILIES:
+            raise ValueError(f"unknown terrain family {family!r}")
+        bank = self.banks[TERRAIN_FAMILIES.index(family)]
+        return tuple(self.ranges[index] for index in bank.range_indices)
+
+
 @dataclass
 class SourceClip:
     name: str
