@@ -40,6 +40,16 @@ struct InteractionRuntimeTestAccess {
         return runtime.candidate_;
     }
 
+    static std::optional<PlaceMatchInput> place_match_input(
+        const InteractionRuntime& runtime,
+        SurfaceHandle surface,
+        uint32_t affordance_id) {
+        const InteractionRuntime::PlaceMatchBuildResult built =
+            runtime.make_place_match_input(surface, affordance_id);
+        if (!built.accepted) return std::nullopt;
+        return built.input;
+    }
+
     static float player_elapsed_seconds(
         const InteractionRuntime& runtime) {
         return runtime.player_.value().elapsed_seconds();
@@ -1229,7 +1239,16 @@ interaction::RuntimeConfig precomputed_place_runtime_config() {
     return config;
 }
 
-interaction::RuntimeFixture precomputed_place_runtime_fixture() {
+struct PrecomputedRuntimeSentinels {
+    uint64_t source_id = 2001U;
+    float source_support_height_m = 0.625F;
+    float requested_support_height_m = 0.71875F;
+    float source_contact_offset_m = 0.129953071F;
+    float destination_contact_offset_m = 0.13F;
+};
+
+interaction::RuntimeFixture precomputed_place_runtime_fixture(
+    PrecomputedRuntimeSentinels sentinels = {}) {
     using namespace interaction;
     using namespace interaction::runtime_fixture_detail;
     RuntimeFixture fixture = reverse_place_runtime_fixture();
@@ -1239,11 +1258,14 @@ interaction::RuntimeFixture precomputed_place_runtime_fixture() {
     constexpr int32_t lift = range_start + kLiftLocalFrame;
     constexpr int32_t hold = range_start + kHoldLocalFrame;
     constexpr int32_t reverse_start = hold + 4;
-    constexpr float source_support = 0.625F;
-    constexpr float requested_support = 0.71875F;
-    constexpr float source_contact_offset = 0.129953071F;
-    assert(canonical_float_bits(source_contact_offset) == 0x3e05126bU);
-    constexpr float destination_contact_offset = 0.13F;
+    const float source_support = sentinels.source_support_height_m;
+    const float requested_support = sentinels.requested_support_height_m;
+    const float source_contact_offset = sentinels.source_contact_offset_m;
+    const float destination_contact_offset =
+        sentinels.destination_contact_offset_m;
+    if (source_contact_offset == 0.129953071F) {
+        assert(canonical_float_bits(source_contact_offset) == 0x3e05126bU);
+    }
     const float authored_hand_correction =
         requested_support + destination_contact_offset -
         (source_support + source_contact_offset);
@@ -1252,7 +1274,7 @@ interaction::RuntimeFixture precomputed_place_runtime_fixture() {
     fixture.database.active_hands[static_cast<size_t>(clip)] =
         static_cast<uint8_t>(Hand::Right);
     fixture.database.table_positions[
-        static_cast<size_t>(clip) * 3U + 1U] = 0.275F;
+        static_cast<size_t>(clip) * 3U + 1U] = source_support - 0.35F;
     for (int32_t local = kContactLocalFrame;
          local < kFramesPerClip;
          ++local) {
@@ -1404,7 +1426,7 @@ interaction::RuntimeFixture precomputed_place_runtime_fixture() {
     fixture.surface = fixture.surface_registry.upsert(destination);
 
     PrecomputedReversedPickupClip row{};
-    row.id = 2001U;
+    row.id = sentinels.source_id;
     row.object_profile_id = pickup_target->object_profile_id;
     row.sequence_id = "pickup_table__runtime__001";
     row.clip = clip;
@@ -2849,9 +2871,20 @@ void assert_place_immutable_provenance(
            requested_vertical_correction_m);
 }
 
-void test_runtime_preview_exposes_precomputed_provenance_boundary() {
+struct PrecomputedRuntimeWitness {
+    interaction::PlaceCandidate candidate{};
+    interaction::RuntimePlaceDiagnostics preflight{};
+    interaction::RuntimePlaceDiagnostics accepted_preflight{};
+    interaction::RuntimePlaceDiagnostics full_replay{};
+    float measured_full_applied_vertical_correction_m = 0.0F;
+    bool align_applied_vertical_correction_zero = true;
+    bool first_replay_applied_vertical_correction_zero = false;
+};
+
+PrecomputedRuntimeWitness run_precomputed_runtime_witness(
+    PrecomputedRuntimeSentinels sentinels) {
     using namespace interaction;
-    RuntimeFixture fixture = precomputed_place_runtime_fixture();
+    RuntimeFixture fixture = precomputed_place_runtime_fixture(sentinels);
     InteractionRuntime runtime(
         fixture.database,
         fixture.features,
@@ -2864,109 +2897,244 @@ void test_runtime_preview_exposes_precomputed_provenance_boundary() {
         InteractionRuntimeTestAccess::candidate(runtime);
     assert(pickup_candidate.has_value());
     assert(pickup_candidate->clip == 1);
-    const PlaceStagingPreview preview = runtime.preview_place(
+
+    const std::optional<PlaceMatchInput> direct_input =
+        InteractionRuntimeTestAccess::place_match_input(
+            runtime, fixture.surface, fixture.place_affordance_id);
+    assert(direct_input.has_value());
+    const PlaceStagingPreview free_preview = preview_place_motion(
+        *direct_input);
+    const PlaceStagingPreview runtime_preview = runtime.preview_place(
         fixture.surface, fixture.place_affordance_id);
-    assert(preview.accepted && preview.ready);
-    assert(preview.candidate.mode ==
+    assert(free_preview.accepted && free_preview.ready);
+    assert(runtime_preview.accepted && runtime_preview.ready);
+    assert(exact(free_preview.candidate, runtime_preview.candidate));
+    assert(free_preview.candidate.selection_id ==
+           runtime_preview.candidate.selection_id);
+    assert(free_preview.candidate.mode ==
            PlaceMotionMode::PrecomputedReversedPickup);
-    assert(preview.candidate.source_id == 2001U);
-    assert(preview.candidate.requested_support_height_m == 0.71875F);
-    assert(preview.candidate.source_support_height_m == 0.625F);
-    assert(preview.candidate.target_support_height_m == 0.71875F);
-    assert(preview.candidate.requested_vertical_correction_m == 0.09375F);
-}
+    assert(free_preview.candidate.clip == 0);
+    assert(free_preview.candidate.source_id == sentinels.source_id);
+    assert(free_preview.candidate.requested_support_height_m ==
+           sentinels.requested_support_height_m);
+    assert(free_preview.candidate.source_support_height_m ==
+           sentinels.source_support_height_m);
+    assert(free_preview.candidate.target_support_height_m ==
+           sentinels.requested_support_height_m);
+    const float requested_vertical_correction_m =
+        sentinels.requested_support_height_m -
+        sentinels.source_support_height_m;
+    assert(free_preview.candidate.requested_vertical_correction_m ==
+           requested_vertical_correction_m);
 
-void test_place_preflight_and_replay_preserve_precomputed_provenance() {
-    using namespace interaction;
-    RuntimeFixture fixture = precomputed_place_runtime_fixture();
-    InteractionRuntime runtime(
-        fixture.database,
-        fixture.features,
-        fixture.registry,
-        fixture.surface_registry,
-        fixture.place_library,
-        precomputed_place_runtime_config());
-    enter_carry_before_first_update(runtime, fixture);
-    const std::optional<MatchCandidate>& pickup_candidate =
-        InteractionRuntimeTestAccess::candidate(runtime);
-    assert(pickup_candidate.has_value());
-    assert(pickup_candidate->clip == 1);
-    const PlaceStagingPreview preview = runtime.preview_place(
-        fixture.surface, fixture.place_affordance_id);
-    assert(preview.accepted && preview.ready);
     const PlaceRequest request = place_request_for(runtime, fixture, 2002U);
-
     RuntimeOutput output = runtime.update(place_interact_input(
         fixture.locomotion, request));
     assert(output.diagnostics.state == RuntimeState::PlacePreflight);
+    assert(exact(
+        free_preview.candidate,
+        output.diagnostics.place.preview.candidate));
     assert_place_immutable_provenance(
         output.diagnostics.place,
-        2001U,
-        0.71875F,
-        0.625F,
-        0.71875F,
-        0.09375F);
+        sentinels.source_id,
+        sentinels.requested_support_height_m,
+        sentinels.source_support_height_m,
+        sentinels.requested_support_height_m,
+        requested_vertical_correction_m);
     assert(output.diagnostics.place.applied_vertical_correction_m == 0.0F);
-    assert(output.diagnostics.place.preview.candidate.source_id == 2001U);
-    assert(output.diagnostics.place.preview.candidate
-               .requested_support_height_m == 0.71875F);
-    assert(output.diagnostics.place.preview.candidate
-               .source_support_height_m == 0.625F);
-    assert(output.diagnostics.place.preview.candidate
-               .target_support_height_m == 0.71875F);
-    assert(output.diagnostics.place.preview.candidate
-               .requested_vertical_correction_m == 0.09375F);
+    const RuntimePlaceDiagnostics preflight = output.diagnostics.place;
+
+    output = advance(runtime, fixture.locomotion);
+    assert(output.diagnostics.state == RuntimeState::PlaceAlign);
+    assert(exact(
+        free_preview.candidate,
+        output.diagnostics.place.preview.candidate));
+    assert_place_immutable_provenance(
+        output.diagnostics.place,
+        sentinels.source_id,
+        sentinels.requested_support_height_m,
+        sentinels.source_support_height_m,
+        sentinels.requested_support_height_m,
+        requested_vertical_correction_m);
+    assert(output.diagnostics.place.applied_vertical_correction_m == 0.0F);
+    const RuntimePlaceDiagnostics accepted_preflight =
+        output.diagnostics.place;
 
     bool saw_replay = false;
-    bool saw_full_applied = false;
+    bool saw_first_replay = false;
+    bool saw_nonzero_replay = false;
+    bool saw_full_replay = false;
+    bool align_applied_zero = true;
+    bool first_replay_applied_zero = false;
+    RuntimeOutput full_output{};
+    float previous_replay_applied = 0.0F;
     for (int update = 0; update < kMaximumUpdates; ++update) {
-        output = advance(runtime, fixture.locomotion);
         const RuntimeState state = output.diagnostics.state;
         if (state == RuntimeState::PlaceAlign ||
             state == RuntimeState::PlaceReplay ||
             state == RuntimeState::PlaceRelease) {
             assert_place_immutable_provenance(
                 output.diagnostics.place,
-                2001U,
-                0.71875F,
-                0.625F,
-                0.71875F,
-                0.09375F);
-            assert(output.diagnostics.place.applied_vertical_correction_m >=
-                   0.0F);
-            assert(output.diagnostics.place.applied_vertical_correction_m <=
-                   0.09375F);
+                sentinels.source_id,
+                sentinels.requested_support_height_m,
+                sentinels.source_support_height_m,
+                sentinels.requested_support_height_m,
+                requested_vertical_correction_m);
         }
-        saw_replay = saw_replay || state == RuntimeState::PlaceReplay;
-        saw_full_applied = saw_full_applied ||
-            output.diagnostics.place.applied_vertical_correction_m ==
-                0.09375F;
-        if (state == RuntimeState::PlaceRelease ||
-            state == RuntimeState::Locomotion) {
+        if (state == RuntimeState::PlaceAlign) {
+            align_applied_zero = align_applied_zero &&
+                output.diagnostics.place.applied_vertical_correction_m ==
+                    0.0F;
+        }
+        if (state == RuntimeState::PlaceReplay) {
+            saw_replay = true;
+            const float applied = output.diagnostics.place
+                .applied_vertical_correction_m;
+            if (!saw_first_replay) {
+                first_replay_applied_zero = applied == 0.0F;
+                saw_first_replay = true;
+            } else {
+                assert(applied >= previous_replay_applied);
+            }
+            if (applied != 0.0F && !saw_nonzero_replay) {
+                const double source_frame_exact =
+                    output.diagnostics.place.source_frame_exact;
+                assert(source_frame_exact == std::floor(source_frame_exact));
+                const Transform uncorrected_hand = compose(
+                    free_preview.candidate.scene_from_source,
+                    runtime_right_hand(pose_at_frame(
+                        fixture.database,
+                        static_cast<int32_t>(source_frame_exact))));
+                const float measured_applied =
+                    runtime_right_hand(output.pose).position.y -
+                    uncorrected_hand.position.y;
+                assert(applied == measured_applied);
+                saw_nonzero_replay = true;
+            }
+            previous_replay_applied = applied;
+        }
+        if (state == RuntimeState::PlaceRelease) {
+            full_output = output;
+            saw_full_replay = true;
             break;
         }
+        assert(state != RuntimeState::Locomotion);
+        output = advance(runtime, fixture.locomotion);
     }
     assert(saw_replay);
-    assert(saw_full_applied);
+    assert(saw_first_replay);
+    assert(saw_nonzero_replay);
+    assert(saw_full_replay);
+    assert(full_output.diagnostics.place.released);
+    assert(full_output.diagnostics.place.source_frame ==
+           free_preview.candidate.release_frame);
 
-    RuntimePlaceDiagnostics baseline = output.diagnostics.place;
-    RuntimePlaceDiagnostics changed = baseline;
-    ++changed.source_id;
-    assert(!exact(baseline, changed));
-    using FloatMember = float RuntimePlaceDiagnostics::*;
-    constexpr std::array<FloatMember, 5> fields = {
-        &RuntimePlaceDiagnostics::requested_support_height_m,
-        &RuntimePlaceDiagnostics::source_support_height_m,
-        &RuntimePlaceDiagnostics::target_support_height_m,
-        &RuntimePlaceDiagnostics::requested_vertical_correction_m,
-        &RuntimePlaceDiagnostics::applied_vertical_correction_m,
+    const Transform uncorrected_release_hand = compose(
+        free_preview.candidate.scene_from_source,
+        runtime_right_hand(pose_at_frame(
+            fixture.database, free_preview.candidate.release_frame)));
+    const float measured_full_applied =
+        runtime_right_hand(full_output.pose).position.y -
+        uncorrected_release_hand.position.y;
+    assert(full_output.diagnostics.place.applied_vertical_correction_m ==
+           measured_full_applied);
+
+    const RuntimeOutput after_ack = advance(runtime, fixture.locomotion);
+    assert(after_ack.diagnostics.state == RuntimeState::PlaceRelease);
+    assert(after_ack.diagnostics.place.applied_vertical_correction_m ==
+           full_output.diagnostics.place.applied_vertical_correction_m);
+
+    return {
+        free_preview.candidate,
+        preflight,
+        accepted_preflight,
+        full_output.diagnostics.place,
+        measured_full_applied,
+        align_applied_zero,
+        first_replay_applied_zero,
     };
-    for (FloatMember field : fields) {
-        changed = baseline;
-        changed.*field = std::nextafter(
-            changed.*field, std::numeric_limits<float>::infinity());
-        assert(!exact(baseline, changed));
-    }
+}
+
+void test_runtime_preview_exposes_precomputed_provenance_boundary() {
+    const PrecomputedRuntimeWitness baseline =
+        run_precomputed_runtime_witness({});
+    assert(baseline.candidate.source_id == 2001U);
+    assert(baseline.candidate.clip == 0);
+    assert(baseline.full_replay.applied_vertical_correction_m == 0.09375F);
+    assert(baseline.measured_full_applied_vertical_correction_m ==
+           0.09375F);
+}
+
+void test_place_preflight_and_replay_preserve_precomputed_provenance() {
+    const PrecomputedRuntimeWitness baseline =
+        run_precomputed_runtime_witness({});
+
+    PrecomputedRuntimeSentinels identity_values{};
+    identity_values.source_id = 2111U;
+    const PrecomputedRuntimeWitness identity =
+        run_precomputed_runtime_witness(identity_values);
+    assert(identity.candidate.source_id == 2111U);
+    assert(identity.candidate.source_support_height_m ==
+           baseline.candidate.source_support_height_m);
+    assert(identity.candidate.requested_support_height_m ==
+           baseline.candidate.requested_support_height_m);
+    assert(identity.candidate.target_support_height_m ==
+           baseline.candidate.target_support_height_m);
+    assert(identity.candidate.requested_vertical_correction_m ==
+           baseline.candidate.requested_vertical_correction_m);
+    assert(identity.full_replay.applied_vertical_correction_m ==
+           baseline.full_replay.applied_vertical_correction_m);
+
+    PrecomputedRuntimeSentinels shifted_values{};
+    shifted_values.source_support_height_m -= 0.03125F;
+    shifted_values.requested_support_height_m -= 0.03125F;
+    shifted_values.source_contact_offset_m += 0.03125F;
+    shifted_values.destination_contact_offset_m += 0.03125F;
+    const PrecomputedRuntimeWitness shifted =
+        run_precomputed_runtime_witness(shifted_values);
+    assert(shifted.candidate.source_support_height_m == 0.59375F);
+    assert(shifted.candidate.requested_support_height_m == 0.6875F);
+    assert(shifted.candidate.target_support_height_m == 0.6875F);
+    assert(shifted.candidate.requested_vertical_correction_m ==
+           baseline.candidate.requested_vertical_correction_m);
+    assert(shifted.full_replay.applied_vertical_correction_m ==
+           baseline.full_replay.applied_vertical_correction_m);
+
+    PrecomputedRuntimeSentinels provenance_values{};
+    provenance_values.source_support_height_m -= 0.0078125F;
+    provenance_values.source_contact_offset_m += 0.0078125F;
+    const PrecomputedRuntimeWitness provenance =
+        run_precomputed_runtime_witness(provenance_values);
+    assert(provenance.candidate.source_support_height_m == 0.6171875F);
+    assert(provenance.candidate.requested_support_height_m ==
+           baseline.candidate.requested_support_height_m);
+    assert(provenance.candidate.target_support_height_m ==
+           baseline.candidate.target_support_height_m);
+    assert(provenance.candidate.requested_vertical_correction_m ==
+           0.1015625F);
+    assert(provenance.full_replay.applied_vertical_correction_m ==
+           baseline.full_replay.applied_vertical_correction_m);
+    assert(provenance.full_replay.requested_vertical_correction_m !=
+           provenance.full_replay.applied_vertical_correction_m);
+
+    PrecomputedRuntimeSentinels applied_values{};
+    applied_values.destination_contact_offset_m -= 0.0078125F;
+    const PrecomputedRuntimeWitness applied =
+        run_precomputed_runtime_witness(applied_values);
+    assert(applied.candidate.source_support_height_m ==
+           baseline.candidate.source_support_height_m);
+    assert(applied.candidate.requested_support_height_m ==
+           baseline.candidate.requested_support_height_m);
+    assert(applied.candidate.target_support_height_m ==
+           baseline.candidate.target_support_height_m);
+    assert(applied.candidate.requested_vertical_correction_m ==
+           baseline.candidate.requested_vertical_correction_m);
+    assert(applied.full_replay.applied_vertical_correction_m !=
+           baseline.full_replay.applied_vertical_correction_m);
+    assert(applied.full_replay.applied_vertical_correction_m ==
+           applied.measured_full_applied_vertical_correction_m);
+    assert(baseline.align_applied_vertical_correction_zero);
+    assert(baseline.first_replay_applied_vertical_correction_zero);
 }
 
 void test_place_preview_and_collapsed_success_lifecycle() {

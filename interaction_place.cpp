@@ -1060,12 +1060,9 @@ bool populate_candidate_heights(
     candidate.requested_vertical_correction_m =
         candidate.target_support_height_m -
         candidate.source_support_height_m;
-    const float inclusive_limit = std::nextafter(
-        kMaximumRequestPositionM,
-        std::numeric_limits<float>::infinity());
     if (!finite(candidate.requested_vertical_correction_m) ||
         std::abs(candidate.requested_vertical_correction_m) >
-            inclusive_limit) {
+            kMaximumRequestPositionM) {
         failures.remember(Reason::CorrectionLimit);
         return false;
     }

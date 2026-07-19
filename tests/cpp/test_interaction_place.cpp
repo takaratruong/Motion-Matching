@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <iostream>
 #include <iomanip>
@@ -26,6 +27,14 @@ using namespace interaction;
 constexpr float kPositionLimit = 0.12F;
 constexpr float kOrientationLimit = 0.436332313F;
 constexpr float kTenDegrees = 0.174532925F;
+
+uint32_t float_bits(float value) {
+    uint32_t bits = 0U;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
 constexpr int32_t kFrameCount = 30;
 constexpr int32_t kContactFrame = 8;
 constexpr int32_t kLiftFrame = 12;
@@ -1125,20 +1134,9 @@ void set_database_object_and_hand(
     set_database_hand_world(database, frame, object);
 }
 
-void set_destination_support_height(
+float configure_reachable_reverse_request(
     PlaceFixture& fixture,
-    float support_height_m) {
-    const float delta =
-        support_height_m - fixture.input.surface.surface_world.position.y;
-    fixture.input.surface.surface_world.position.y = support_height_m;
-    fixture.input.surface.support_volume_world.position.y += delta;
-    fixture.input.place_affordance = fixture.input.surface.affordances.front();
-    fixture.input.current_pose.positions[kRoot].y += delta;
-    fixture.input.current_object_world.position.y += delta;
-    refresh_pointers(fixture);
-}
-
-float configure_reachable_reverse_request(PlaceFixture& fixture);
+    bool target_above_source = false);
 
 void test_precomputed_reverse_validation_ties_and_height_boundary() {
     const auto isolated = [] {
@@ -1219,52 +1217,124 @@ void test_precomputed_reverse_validation_ties_and_height_boundary() {
     });
 
     PlaceFixture exact = isolated();
-    const float measured = configure_reachable_reverse_request(exact);
-    TEST_CHECK(measured <= 0.12F);
-    TEST_CHECK(0.12F - measured < 0.000001F);
-    PrecomputedReversedPickupClip& exact_row =
-        exact.library.precomputed_reversed.front();
-    const Transform exact_source_hand = hand_transform(
+    (void)configure_reachable_reverse_request(exact, true);
+    exact.input.held_object_bounds.half_extents_object =
+        vec3(0.001F, 0.001F, 0.001F);
+    exact.library.precomputed_reversed.front()
+        .source_object_bounds.half_extents_object =
+        exact.input.held_object_bounds.half_extents_object;
+    exact.database.object_dimensions[0] = 0.002F;
+    exact.database.object_dimensions[1] = 0.002F;
+    exact.database.object_dimensions[2] = 0.002F;
+    const Transform unshifted_source_hand = hand_transform(
         pose_at_frame(exact.database, kContactFrame));
-    constexpr float source_grasp_height = 0.13F;
-    const float exact_source_support =
-        exact_source_hand.position.y - source_grasp_height;
-    exact.database.table_positions[1] = exact_source_support -
-        0.5F * exact.database.table_sizes[1];
-    exact_row.source_surface = make_surface(
-        502U,
-        vec3(
-            exact_source_hand.position.x,
-            exact_source_support,
-            exact_source_hand.position.z));
-    exact_row.source_surface.affordances.front().object_in_surface = {
-        vec3(0.0F, source_grasp_height, 0.0F),
-        exact_source_hand.rotation,
-    };
-    exact_row.source_surface.affordances.front().support_point_object =
-        quat_mul_vec3(
-            quat_inv(exact_source_hand.rotation),
-            vec3(0.0F, -source_grasp_height, 0.0F));
-    exact_row.source_affordance_id =
-        exact_row.source_surface.affordances.front().id;
-    exact_row.source_support_height_m = exact_source_support;
-    exact_row.source_grasp_height_above_support_m = source_grasp_height;
+    const float world_shift_y =
+        0.13F - unshifted_source_hand.position.y;
+    for (int32_t frame = 0; frame < kFrameCount; ++frame) {
+        vec3 root = pose_at_frame(exact.database, frame).positions[kRoot];
+        root.y += world_shift_y;
+        write_bone_position(
+            exact.database, frame, g1_skeleton::Simulation, root);
+        Transform object = database_object_at(exact.database, frame);
+        object.position.y += world_shift_y;
+        write_vec(
+            exact.database.object_positions,
+            static_cast<size_t>(frame),
+            object.position);
+    }
+    exact.database.table_positions[1] += world_shift_y;
+    exact.input.current_pose.positions[kRoot].y += world_shift_y;
+    exact.input.current_object_world.position.y += world_shift_y;
+    exact.input.surface.surface_world.position.y += world_shift_y;
+    exact.input.surface.support_volume_world.position.y += world_shift_y;
     refresh_pointers(exact);
+    const auto configure_height_contract = [](
+        PlaceFixture& value,
+        float source_support_height_m,
+        float requested_support_height_m) {
+        const Transform source_hand = hand_transform(
+            pose_at_frame(value.database, kContactFrame));
+        const Transform goal_object = placement_goal_world(
+            value.input.surface,
+            value.input.place_affordance.object_in_surface);
+        const float source_grasp_height =
+            source_hand.position.y - source_support_height_m;
+        value.database.table_positions[1] = source_support_height_m -
+            0.5F * value.database.table_sizes[1];
+
+        PrecomputedReversedPickupClip& row =
+            value.library.precomputed_reversed.front();
+        row.source_surface = make_surface(
+            502U,
+            vec3(
+                source_hand.position.x,
+                source_support_height_m,
+                source_hand.position.z));
+        row.source_surface.affordances.front().object_in_surface = {
+            vec3(0.0F, source_grasp_height, 0.0F),
+            source_hand.rotation,
+        };
+        row.source_surface.affordances.front().support_point_object =
+            quat_mul_vec3(
+                quat_inv(source_hand.rotation),
+                vec3(0.0F, -source_grasp_height, 0.0F));
+        row.source_affordance_id =
+            row.source_surface.affordances.front().id;
+        row.source_support_height_m = source_support_height_m;
+        row.source_grasp_height_above_support_m = source_grasp_height;
+
+        value.input.surface.surface_world.position.y =
+            requested_support_height_m;
+        value.input.surface.support_volume_size.y = 0.01F;
+        value.input.surface.support_volume_world.position.y =
+            requested_support_height_m - 0.005F;
+        const float destination_contact_offset =
+            goal_object.position.y - requested_support_height_m;
+        value.input.place_affordance.object_in_surface.position.y =
+            destination_contact_offset;
+        value.input.place_affordance.support_point_object = quat_mul_vec3(
+            quat_inv(goal_object.rotation),
+            vec3(0.0F, -destination_contact_offset, 0.0F));
+        value.input.surface.affordances.front() =
+            value.input.place_affordance;
+        refresh_pointers(value);
+    };
+    configure_height_contract(exact, 0.0F, 0.12F);
+    const PlacementFit exact_source_fit = evaluate_actual_placement_fit(
+        exact.library.precomputed_reversed.front().source_surface,
+        exact.library.precomputed_reversed.front().source_surface
+            .affordances.front(),
+        database_object_at(exact.database, kContactFrame),
+        exact.input.held_object_bounds);
+    const PlacementFit exact_destination_fit = evaluate_placement_fit(
+        exact.input.surface,
+        exact.input.place_affordance,
+        exact.input.held_object_bounds);
+    TEST_CHECK(exact_source_fit.accepted);
+    TEST_CHECK(exact_destination_fit.accepted);
     const PlaceResult exact_result = select_place_motion(exact.input);
     TEST_CHECK(exact_result.accepted);
-    TEST_CHECK(std::abs(
+    TEST_CHECK(
+        exact_result.candidate.requested_vertical_correction_m == 0.12F);
+    TEST_CHECK(float_bits(
                    exact_result.candidate
-                       .requested_vertical_correction_m) <= 0.12F);
+                       .requested_vertical_correction_m) == 0x3df5c28fU);
+
+    PlaceFixture one_ulp_over = copy_fixture(exact);
+    configure_height_contract(
+        one_ulp_over,
+        0.0F,
+        std::nextafter(0.12F, std::numeric_limits<float>::infinity()));
+    const PlaceResult one_ulp_result = select_place_motion(
+        one_ulp_over.input);
+    TEST_CHECK(!one_ulp_result.accepted);
+    TEST_CHECK(one_ulp_result.reason == Reason::CorrectionLimit);
 
     PlaceFixture over = copy_fixture(exact);
-    const float correction_sign =
-        exact.input.surface.surface_world.position.y >= exact_source_support
-        ? 1.0F
-        : -1.0F;
-    set_destination_support_height(
-        over,
-        exact_source_support + correction_sign * 0.120001F);
-    TEST_CHECK(!select_place_motion(over.input).accepted);
+    configure_height_contract(over, 0.0F, 0.120001F);
+    const PlaceResult over_result = select_place_motion(over.input);
+    TEST_CHECK(!over_result.accepted);
+    TEST_CHECK(over_result.reason == Reason::CorrectionLimit);
 
     PlaceFixture tie = make_fixture(false);
     tie.library.precomputed_reversed = {
@@ -2802,7 +2872,9 @@ Transform planar_alignment_for_test(Transform source, Transform target) {
     };
 }
 
-float configure_reachable_reverse_request(PlaceFixture& fixture) {
+float configure_reachable_reverse_request(
+    PlaceFixture& fixture,
+    bool target_above_source) {
     constexpr float angle = 0.40F;
     float link_length = 0.75F;
     Pose contact_source{};
@@ -2810,9 +2882,11 @@ float configure_reachable_reverse_request(PlaceFixture& fixture) {
     Transform source_hand{};
     Transform target_hand{};
     for (int iteration = 0; iteration < 6; ++iteration) {
-        contact_source = reachable_arm_pose(
+        const Pose straight = reachable_arm_pose(
             pose_at_frame(fixture.database, kContactFrame), link_length);
-        target_pose = reachable_arm_target(contact_source, angle);
+        const Pose bent = reachable_arm_target(straight, angle);
+        contact_source = target_above_source ? bent : straight;
+        target_pose = target_above_source ? straight : bent;
         source_hand = hand_transform(contact_source);
         target_hand = hand_transform(target_pose);
         const float vertical_error = std::abs(
@@ -2820,9 +2894,11 @@ float configure_reachable_reverse_request(PlaceFixture& fixture) {
         link_length *= kPositionLimit / vertical_error;
     }
     for (;;) {
-        contact_source = reachable_arm_pose(
+        const Pose straight = reachable_arm_pose(
             pose_at_frame(fixture.database, kContactFrame), link_length);
-        target_pose = reachable_arm_target(contact_source, angle);
+        const Pose bent = reachable_arm_target(straight, angle);
+        contact_source = target_above_source ? bent : straight;
+        target_pose = target_above_source ? straight : bent;
         source_hand = hand_transform(contact_source);
         target_hand = hand_transform(target_pose);
         if (std::abs(source_hand.position.y - target_hand.position.y) <=
@@ -2833,8 +2909,11 @@ float configure_reachable_reverse_request(PlaceFixture& fixture) {
     }
 
     for (int32_t frame = 0; frame < kFrameCount; ++frame) {
-        Pose source = reachable_arm_pose(
+        const Pose straight = reachable_arm_pose(
             pose_at_frame(fixture.database, frame), link_length);
+        const Pose source = target_above_source
+            ? reachable_arm_target(straight, angle)
+            : straight;
         write_database_pose(fixture.database, frame, source);
         const Transform object = hand_transform(source);
         write_vec(
@@ -2848,7 +2927,10 @@ float configure_reachable_reverse_request(PlaceFixture& fixture) {
     }
     contact_source = pose_at_frame(fixture.database, kContactFrame);
     source_hand = hand_transform(contact_source);
-    target_pose = reachable_arm_target(contact_source, angle);
+    target_pose = target_above_source
+        ? reachable_arm_pose(
+              pose_at_frame(fixture.database, kContactFrame), link_length)
+        : reachable_arm_target(contact_source, angle);
     target_hand = hand_transform(target_pose);
 
     constexpr float support_height = 0.13F;

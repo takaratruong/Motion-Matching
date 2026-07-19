@@ -329,6 +329,28 @@ float source_progress(
         1.0F);
 }
 
+float replay_progress(
+    const PlaceCandidate& candidate,
+    double source_frame,
+    bool committed) {
+    if (!committed) return 0.0F;
+    const double numerator =
+        static_cast<double>(candidate.direction) *
+        (source_frame - candidate.commit_frame);
+    const double denominator =
+        static_cast<double>(candidate.direction) *
+        (static_cast<double>(candidate.release_frame) -
+         candidate.commit_frame);
+    if (!(denominator > 0.0) ||
+        !rotation_gate::finite_bits(source_frame)) {
+        return 0.0F;
+    }
+    return std::clamp(
+        static_cast<float>(numerator / denominator),
+        0.0F,
+        1.0F);
+}
+
 Pose corrected_source_pose(
     Pose source,
     const PlaceBeginInput& begin,
@@ -623,9 +645,9 @@ PlaceStep PlaceController::update(float dt) {
         return step;
     }
 
-    const float progress = source_progress(
+    const float source_motion_progress = source_progress(
         begin_.candidate, trial.source_frame_exact());
-    const float root_weight = 1.0F - smoothstep(progress);
+    const float root_weight = 1.0F - smoothstep(source_motion_progress);
     step.requested_root_correction_m = root_weight * std::hypot(
         begin_.candidate.entry_root_offset.x,
         begin_.candidate.entry_root_offset.z);
@@ -644,11 +666,15 @@ PlaceStep PlaceController::update(float dt) {
             pose,
             begin_.match_input.held_affordance.hand,
             root_rotation_evidence);
+    const float hand_progress = replay_progress(
+        begin_.candidate,
+        trial.source_frame_exact(),
+        sample.committed);
     const WeightedHandTarget target_hand = weighted_hand_target(
         current_hand,
         release_hand_translation_,
         release_hand_rotation_,
-        progress);
+        hand_progress);
     if (trial.release_due() &&
         (distance(goal_hand_.position, current_hand.position) >
              ik_config_.maximum_request_position_m ||
@@ -667,7 +693,7 @@ PlaceStep PlaceController::update(float dt) {
     const double requested_position = distance(
         target_hand.value.position, current_hand.position);
     const rotation_gate::Rotation target_hand_rotation_evidence =
-        progress >= 1.0F
+        hand_progress >= 1.0F
             ? goal_hand_rotation_evidence_
             : rotation_gate::multiply(
                   rotation_gate::from_quat(target_hand.correction),
