@@ -598,7 +598,7 @@ void test_activation_brackets_one_caller_step_and_defers_assist_motion() {
         "activation tick previewed or submitted a pick");
     require(
         post.assist_output.override_steering &&
-            post.assist_output.force_strafe &&
+            !post.assist_output.force_strafe &&
             post.assist_output.stationary_constraint &&
             is_zero(post.assist_output.left_stick) &&
             is_zero(post.assist_output.right_stick) &&
@@ -2024,7 +2024,7 @@ interaction::PickEntryPreview make_certified_preview(
 bool is_stationary_preview_retry(
     const interaction::PickAssistOutput& output,
     interaction::PickEntryRoot root) {
-    return output.override_steering && output.force_strafe &&
+    return output.override_steering && !output.force_strafe &&
         output.stationary_constraint && is_zero(output.left_stick) &&
         is_zero(output.right_stick) &&
         output.preview_requests.size() == 1U &&

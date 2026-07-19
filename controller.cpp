@@ -6407,16 +6407,16 @@ int main(void)
         // Manual pick-assist route rendering begins.
         const interaction::PickAssistDiagnostics& manual_pick_diagnostics =
             manual_smart_pickup_controller.diagnostics();
-        if (manual_pick_diagnostics.slot_selection.selected_index.has_value())
+        if (manual_pick_diagnostics.frozen_slot_index.has_value())
         {
-            const size_t selected_index =
-                *manual_pick_diagnostics.slot_selection.selected_index;
-            if (selected_index <
+            const size_t frozen_slot_index =
+                *manual_pick_diagnostics.frozen_slot_index;
+            if (frozen_slot_index <
                 manual_pick_diagnostics.slot_selection.ordered.size())
             {
                 const vec3 frozen_slot =
                     manual_pick_diagnostics.slot_selection.ordered[
-                        selected_index].root_world.position;
+                        frozen_slot_index].root_world.position;
                 const bool final_preview_certified =
                     (manual_pick_diagnostics.state ==
                          interaction::PickAssistState::ReadyToSubmit ||
@@ -6493,6 +6493,8 @@ int main(void)
         const interaction::PickAssistDiagnostics& diagnostics =
             manual_smart_pickup_controller.diagnostics();
         if (manual_pick_diagnostics.state ==
+                interaction::PickAssistState::SlotSelectionPreview ||
+            manual_pick_diagnostics.state ==
                 interaction::PickAssistState::SlotApproach ||
             manual_pick_diagnostics.state ==
                 interaction::PickAssistState::Settling ||
@@ -6575,9 +6577,9 @@ int main(void)
                 RED);
         }
         const int manual_pick_selected_slot =
-            manual_pick_diagnostics.slot_selection.selected_index.has_value()
+            manual_pick_diagnostics.frozen_slot_index.has_value()
             ? static_cast<int>(
-                  *manual_pick_diagnostics.slot_selection.selected_index)
+                  manual_pick_diagnostics.selected_slot_id)
             : -1;
         DrawText(
             TextFormat(

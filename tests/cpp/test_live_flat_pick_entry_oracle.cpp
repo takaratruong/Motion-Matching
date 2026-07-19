@@ -23,6 +23,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace interaction {
@@ -1112,6 +1113,7 @@ void run_manual_pick_assist_oracle(
     };
 
     interaction::ControllerInteractionScheduler scheduler{};
+    std::optional<interaction::PickRequest> pending_pick_request{};
     uint32_t provider_calls = 0U;
     uint32_t resolver_calls = 0U;
     uint32_t runtime_calls = 0U;
@@ -1141,7 +1143,7 @@ void run_manual_pick_assist_oracle(
                             locomotion_snapshot_fingerprint(snapshot) ==
                         live_flat_snapshot_fingerprint,
                     "manual assist resolver received a different snapshot");
-                return std::nullopt;
+                return std::exchange(pending_pick_request, std::nullopt);
             },
             [](const interaction::LocomotionSnapshot&)
                 -> std::optional<interaction::ControllerPlaceTarget> {
@@ -1174,14 +1176,29 @@ void run_manual_pick_assist_oracle(
     scheduler_publication_count = 0U;
 
     uint32_t preview_callback_calls = 0U;
-    const interaction::SmartPickupPreviewCallback rejecting_preview =
-        [&](const interaction::LocomotionSnapshot&,
-            interaction::PickEntryRoot,
-            interaction::TargetHandle,
-            uint32_t)
+    const interaction::SmartPickupPreviewCallback real_preview =
+        [&](const interaction::LocomotionSnapshot& snapshot,
+            interaction::PickEntryRoot root,
+            interaction::TargetHandle preview_target,
+            uint32_t preview_affordance_id)
             -> std::optional<interaction::PickEntryPreview> {
             ++preview_callback_calls;
-            return std::nullopt;
+            require(
+                preview_target == target_handle &&
+                    preview_affordance_id == affordance_id,
+                "manual assist preview changed target authority");
+            const interaction::PickEntryPreview preview =
+                runtime.preview_pick(
+                    snapshot,
+                    root,
+                    preview_target,
+                    preview_affordance_id);
+            require(
+                preview.path_feasible && preview.match_ready &&
+                    preview.path_reason == interaction::Reason::None &&
+                    preview.match_reason == interaction::Reason::None,
+                "manual assist real full-pack preview was not ready");
+            return preview;
         };
 
     const auto make_post_step_input = [&] (float displayed_speed_mps) {
@@ -1233,7 +1250,7 @@ void run_manual_pick_assist_oracle(
     interaction::SmartPickupPostStepResult post_step_result =
         smart_pickup_controller.post_step(
             make_post_step_input(0.0F),
-            rejecting_preview);
+            real_preview);
     require(
         ordinary_locomotion_step_calls ==
                 ordinary_calls_before_activation + 1U &&
@@ -1246,7 +1263,8 @@ void run_manual_pick_assist_oracle(
         activation_displacement_m <= 1.0e-6F &&
             same_vec3_bits(simulation_position, activation_root_before) &&
             preview_callback_calls == 0U &&
-            post_step_result.assist_output.preview_requests.empty() &&
+            post_step_result.assist_output.preview_requests.size() ==
+                starting_selection.ranked_eligible_indices.size() &&
             !post_step_result.pick_request.has_value() &&
             backend.take_submission_calls == 0U,
         "activation tick moved, previewed, or submitted");
@@ -1271,10 +1289,10 @@ void run_manual_pick_assist_oracle(
         "activation observation did not use the sole live-flat snapshot");
     require(
         smart_pickup_controller.diagnostics().state ==
-                interaction::PickAssistState::SlotApproach &&
-            smart_pickup_controller.diagnostics().route_length_m <=
-                assist_config.maximum_assisted_path_m,
-        "manual Smart Pickup rejected the reachable authored slot");
+                interaction::PickAssistState::SlotSelectionPreview &&
+            !smart_pickup_controller.diagnostics().frozen_slot_index
+                 .has_value(),
+        "manual Smart Pickup froze before real preview certification");
 
     const uint32_t provider_calls_before_activation = provider_calls;
     const uint32_t runtime_calls_before_activation = runtime_calls;
@@ -1294,100 +1312,230 @@ void run_manual_pick_assist_oracle(
                 interaction::RuntimeState::Locomotion,
         "activation did not publish exactly one scheduler live-flat sample");
 
-    interaction::SmartPickupPreStepInput assisted_input{};
-    assisted_input.runtime_state =
-        scheduler.cached_output().diagnostics.state;
-    assisted_input.selected_target = registry.find(target_handle);
-    assisted_input.selected_affordance_id = affordance_id;
-    assisted_input.left_stick = vec3(-1.0F, 0.0F, -1.0F);
-    assisted_input.right_stick = vec3(1.0F, 0.0F, 1.0F);
-    const interaction::SmartPickupPreStepResult assisted_pre_step =
-        smart_pickup_controller.pre_step(assisted_input);
-    require(
-        post_step_result.assist_output.override_steering &&
+    const size_t expected_frozen_slot_index =
+        starting_selection.ranked_eligible_indices.front();
+    const uint32_t selection_preview_callback_calls =
+        static_cast<uint32_t>(
+            starting_selection.ranked_eligible_indices.size());
+    bool observed_frozen_entry = false;
+    bool submitted_pick_request = false;
+    for (uint32_t assist_tick = 0U;
+         assist_tick < static_cast<uint32_t>(kMaximumRuntimeTicks);
+         ++assist_tick) {
+        interaction::SmartPickupPreStepInput assisted_input{};
+        assisted_input.runtime_state =
+            scheduler.cached_output().diagnostics.state;
+        assisted_input.selected_target = registry.find(target_handle);
+        assisted_input.selected_affordance_id = affordance_id;
+        assisted_input.left_stick = vec3(-1.0F, 0.0F, -1.0F);
+        assisted_input.right_stick = vec3(1.0F, 0.0F, 1.0F);
+        const interaction::SmartPickupPreStepResult assisted_pre_step =
+            smart_pickup_controller.pre_step(assisted_input);
+        require(
+            post_step_result.assist_output.override_steering,
+            "manual assist prior output did not override steering at tick " +
+                std::to_string(assist_tick) + " state=" +
+                interaction::pick_assist_state_name(
+                    smart_pickup_controller.diagnostics().state) +
+                " reason=" + interaction::pick_assist_reason_name(
+                    smart_pickup_controller.diagnostics().reason) +
+                " root_error=" + std::to_string(
+                    smart_pickup_controller.diagnostics().root_error_m) +
+                " speed=" + std::to_string(
+                    smart_pickup_controller.diagnostics().speed_mps) +
+                " yaw=" + std::to_string(
+                    smart_pickup_controller.diagnostics()
+                        .yaw_error_radians) +
+                " settle=" + std::to_string(
+                    smart_pickup_controller.diagnostics().settle_ticks));
+        require(
             same_vec3_bits(
                 assisted_pre_step.left_stick,
-                post_step_result.assist_output.left_stick) &&
+                post_step_result.assist_output.left_stick),
+            "manual assist left-stick ownership changed at tick " +
+                std::to_string(assist_tick));
+        require(
             same_vec3_bits(
                 assisted_pre_step.right_stick,
-                post_step_result.assist_output.right_stick) &&
+                post_step_result.assist_output.right_stick),
+            "manual assist right-stick ownership changed at tick " +
+                std::to_string(assist_tick));
+        require(
             assisted_pre_step.force_strafe ==
-                post_step_result.assist_output.force_strafe &&
-            !same_vec3_bits(assisted_pre_step.left_stick, vec3()),
-        "manual assistance was not applied on only the following tick");
+                post_step_result.assist_output.force_strafe,
+            "manual assist strafe ownership changed at tick " +
+                std::to_string(assist_tick));
 
-    const uint32_t ordinary_calls_before_assisted_tick =
-        ordinary_locomotion_step_calls;
-    const uint32_t bridge_calls_before_assisted_tick =
-        materialized_snapshot_count;
-    const float assisted_displacement_m =
-        advance_ordinary_locomotion(assisted_pre_step);
-    require(
-        assisted_displacement_m > 0.0F &&
+        const uint32_t ordinary_calls_before_assisted_tick =
+            ordinary_locomotion_step_calls;
+        const uint32_t bridge_calls_before_assisted_tick =
+            materialized_snapshot_count;
+        const float assisted_displacement_m =
+            advance_ordinary_locomotion(assisted_pre_step);
+        require(
             ordinary_locomotion_step_calls ==
-                ordinary_calls_before_assisted_tick + 1U &&
-            materialized_snapshot_count ==
-                bridge_calls_before_assisted_tick + 1U,
-        "the following assisted tick did not use one ordinary flat step");
+                    ordinary_calls_before_assisted_tick + 1U &&
+                materialized_snapshot_count ==
+                    bridge_calls_before_assisted_tick + 1U,
+            "assisted tick did not use one ordinary flat locomotion step");
 
-    const uint32_t observations_before_assisted_post =
-        backend.observe_calls;
-    post_step_result = smart_pickup_controller.post_step(
-        make_post_step_input(
-            assisted_displacement_m /
-                interaction::kControllerStepSeconds),
-        rejecting_preview);
+        const uint32_t observations_before_assisted_post =
+            backend.observe_calls;
+        post_step_result = smart_pickup_controller.post_step(
+            make_post_step_input(
+                assisted_displacement_m /
+                    interaction::kControllerStepSeconds),
+            real_preview);
+        require(
+            backend.begin_calls == 1U &&
+                backend.observe_calls ==
+                    observations_before_assisted_post + 1U,
+            "assisted tick did not make exactly one observation");
+
+        const interaction::PickAssistDiagnostics& assist_diagnostics =
+            smart_pickup_controller.diagnostics();
+        if (assist_diagnostics.frozen_slot_index.has_value()) {
+            require(
+                *assist_diagnostics.frozen_slot_index ==
+                        expected_frozen_slot_index &&
+                    assist_diagnostics.selected_slot_id ==
+                        starting_selection.ordered[
+                            expected_frozen_slot_index].id,
+                "real selection did not freeze the first certified ranked slot");
+            observed_frozen_entry = true;
+        }
+        if (assist_tick == 0U) {
+            require(
+                preview_callback_calls ==
+                        selection_preview_callback_calls &&
+                    observed_frozen_entry,
+                "selection tick did not evaluate every real ranked preview");
+        }
+
+        interaction::ControllerInteractionEdges scheduler_edges{};
+        if (post_step_result.pick_request.has_value()) {
+            require(
+                !pending_pick_request.has_value() &&
+                    post_step_result.pick_request->target == target_handle &&
+                    post_step_result.pick_request->affordance_id ==
+                        affordance_id &&
+                    post_step_result.pick_request->request_id == kRequestId,
+                "Smart Pickup changed three-field PickRequest authority");
+            pending_pick_request = post_step_result.pick_request;
+            scheduler_edges.interact_pressed = true;
+        }
+
+        const uint32_t provider_calls_before_tick = provider_calls;
+        const uint32_t runtime_calls_before_tick = runtime_calls;
+        const uint32_t publications_before_tick =
+            scheduler_publication_count;
+        scheduler_output = scheduler_tick(scheduler_edges);
+        require(
+            provider_calls == provider_calls_before_tick + 1U &&
+                runtime_calls == runtime_calls_before_tick + 1U &&
+                scheduler_publication_count == publications_before_tick + 1U &&
+                provider_snapshot_fingerprint ==
+                    live_flat_snapshot_fingerprint &&
+                published_snapshot_fingerprint ==
+                    live_flat_snapshot_fingerprint,
+            "assist tick did not publish exactly one live-flat sample");
+
+        if (post_step_result.pick_request.has_value()) {
+            require(
+                !pending_pick_request.has_value() && resolver_calls == 1U &&
+                    scheduler_output.diagnostics.state ==
+                        interaction::RuntimeState::Preflight,
+                "same-tick request exchange did not enter runtime Preflight");
+            submitted_pick_request = true;
+            break;
+        }
+        require(
+            resolver_calls == 0U &&
+                scheduler_output.diagnostics.state ==
+                    interaction::RuntimeState::Locomotion,
+            "assist approach changed runtime before submission");
+    }
+
     require(
-        backend.begin_calls == 1U &&
-            backend.observe_calls ==
-                observations_before_assisted_post + 1U &&
-            preview_callback_calls == 0U &&
-            !post_step_result.pick_request.has_value() &&
-            backend.take_submission_calls == 0U &&
-            backend.yielded_submissions == 0U,
-        "the one following tick previewed, submitted, or restarted assist");
+        submitted_pick_request && observed_frozen_entry &&
+            backend.take_submission_calls == 1U &&
+            backend.yielded_submissions == 1U &&
+            preview_callback_calls == selection_preview_callback_calls + 1U,
+        "preview-certified assist did not submit exactly K+1 callbacks once");
 
-    const uint32_t provider_calls_before_assisted_tick = provider_calls;
-    const uint32_t runtime_calls_before_assisted_tick = runtime_calls;
-    const uint32_t publications_before_assisted_tick =
-        scheduler_publication_count;
+    bool observed_align = false;
+    for (int runtime_tick = 0;
+         runtime_tick < kMaximumRuntimeTicks &&
+         scheduler_output.diagnostics.state !=
+             interaction::RuntimeState::Carry;
+         ++runtime_tick) {
+        scheduler_output = scheduler_tick({});
+        observed_align = observed_align ||
+            scheduler_output.diagnostics.state ==
+                interaction::RuntimeState::Align;
+        require(
+            scheduler_output.diagnostics.result !=
+                    interaction::ResultCode::Rejected &&
+                scheduler_output.diagnostics.result !=
+                    interaction::ResultCode::Failed,
+            "ordinary runtime rejected the preview-certified PickRequest");
+    }
+    require(
+        observed_align && scheduler_output.diagnostics.state ==
+                interaction::RuntimeState::Carry &&
+            scheduler_output.diagnostics.object_state ==
+                interaction::ObjectState::Held &&
+            scheduler_output.diagnostics.attached,
+        "ordinary runtime did not reach Held, attached Carry");
+    const interaction::InteractionTarget* held = registry.find(target_handle);
+    require(
+        held != nullptr && held->state == interaction::ObjectState::Held &&
+            held->owner_request == kRequestId,
+        "runtime registry did not retain the attached held object");
+
+    const uint32_t callbacks_before_carry_tick = preview_callback_calls;
+    interaction::SmartPickupPreStepInput carry_input{};
+    carry_input.runtime_state = interaction::RuntimeState::Carry;
+    carry_input.selected_target = held;
+    carry_input.selected_affordance_id = affordance_id;
+    carry_input.left_stick = vec3(0.0F, 0.0F, 1.0F);
+    const interaction::SmartPickupPreStepResult carry_pre_step =
+        smart_pickup_controller.pre_step(carry_input);
+    require(
+        same_vec3_bits(carry_pre_step.left_stick, carry_input.left_stick),
+        "submitted assist did not release raw Carry steering");
+    const float carry_displacement_m =
+        advance_ordinary_locomotion(carry_pre_step);
+    require(
+        carry_displacement_m > 0.0F,
+        "raw forward Carry steering did not move ordinary locomotion");
+    const interaction::SmartPickupPostStepResult carry_post =
+        smart_pickup_controller.post_step(
+            make_post_step_input(
+                carry_displacement_m /
+                    interaction::kControllerStepSeconds),
+            real_preview);
+    require(
+        !carry_post.pick_request.has_value() &&
+            preview_callback_calls == callbacks_before_carry_tick,
+        "Carry tick repeated preview or PickRequest work");
     scheduler_output = scheduler_tick({});
     require(
-        provider_calls == provider_calls_before_assisted_tick + 1U &&
-            runtime_calls == runtime_calls_before_assisted_tick + 1U &&
-            scheduler_publication_count ==
-                publications_before_assisted_tick + 1U &&
-            provider_snapshot_fingerprint ==
-                live_flat_snapshot_fingerprint &&
-            published_snapshot_fingerprint ==
-                live_flat_snapshot_fingerprint &&
-            scheduler_output.diagnostics.state ==
-                interaction::RuntimeState::Locomotion,
-        "the following assisted tick did not publish one live-flat sample");
+        scheduler_output.diagnostics.state ==
+                interaction::RuntimeState::Carry &&
+            scheduler_output.diagnostics.object_state ==
+                interaction::ObjectState::Held &&
+            scheduler_output.diagnostics.attached &&
+            resolver_calls == 1U,
+        "subsequent Carry steering tick lost attachment authority");
 
-    interaction::SmartPickupPreStepInput cancel_input{};
-    cancel_input.runtime_state =
-        scheduler.cached_output().diagnostics.state;
-    cancel_input.cancel_pressed = true;
-    cancel_input.selected_target = registry.find(target_handle);
-    cancel_input.selected_affordance_id = affordance_id;
-    const interaction::SmartPickupPreStepResult cancelled =
-        smart_pickup_controller.pre_step(cancel_input);
-    require(
-        cancelled.cancel_consumed && !cancelled.interact_consumed &&
-            backend.cancel_calls == 1U && !backend.active() &&
-            smart_pickup_controller.diagnostics().reason ==
-                interaction::PickAssistReason::Cancelled,
-        "bounded manual Smart Pickup witness did not cancel cleanly");
-    require(
-        ordinary_locomotion_step_calls == 2U &&
-            materialized_snapshot_count == 2U &&
-            provider_calls == 2U && runtime_calls == 2U &&
-            scheduler_publication_count == 2U &&
-            backend.begin_calls == 1U && backend.observe_calls == 2U &&
-            resolver_calls == 0U && preview_callback_calls == 0U &&
-            backend.take_submission_calls == 0U,
-        "bounded two-phase witness performed hidden work");
+    std::cout
+        << "smart_pickup_attachment=1"
+        << " selection_callbacks=" << selection_preview_callback_calls
+        << " final_callbacks=1"
+        << " total_callbacks=" << preview_callback_calls
+        << " slot=" << smart_pickup_controller.diagnostics().selected_slot_id
+        << " state=Carry object=Held attached=1 carry_tick=1\n";
 }
 
 Summary run_default_oracle(
@@ -1768,15 +1916,19 @@ int main(int argc, char** argv) {
         std::cerr
             << "usage: test_live_flat_pick_entry_oracle "
                "<flat-database.bin> <interaction-pack-directory> "
-               "[--exhaustive|--position-matrix]\n";
+               "[--exhaustive|--position-matrix|"
+               "--smart-pickup-attachment]\n";
         return 2;
     }
     try {
         const std::string option = argc == 4 ? argv[3] : "";
         const bool exhaustive = option == "--exhaustive";
         const bool position_matrix = option == "--position-matrix";
+        const bool smart_pickup_attachment =
+            option == "--smart-pickup-attachment";
         require(
-            option.empty() || exhaustive || position_matrix,
+            option.empty() || exhaustive || position_matrix ||
+                smart_pickup_attachment,
             "unknown live-flat oracle option");
         const std::filesystem::path flat_path = argv[1];
         const std::filesystem::path interaction_pack = argv[2];
@@ -1821,8 +1973,14 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        run_manual_pick_assist_oracle(
-            flat_database, interaction_database, interaction_features, bridge);
+        if (smart_pickup_attachment) {
+            run_manual_pick_assist_oracle(
+                flat_database,
+                interaction_database,
+                interaction_features,
+                bridge);
+            return 0;
+        }
 
         const Summary summary = exhaustive
             ? run_exhaustive_oracle(

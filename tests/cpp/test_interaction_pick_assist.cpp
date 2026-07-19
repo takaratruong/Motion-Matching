@@ -459,7 +459,7 @@ void require_ranked_selection_requests(
     const std::vector<size_t>& ranked =
         diagnostics.slot_selection.ranked_eligible_indices;
     require(
-        output.override_steering && output.force_strafe &&
+        output.override_steering && !output.force_strafe &&
             output.stationary_constraint && is_zero(output.left_stick) &&
             is_zero(output.right_stick) && !output.submit_interact &&
             output.preview_requests.size() == ranked.size(),
@@ -513,7 +513,7 @@ void require_stationary_preview_request(
     interaction::PickEntryRoot expected_root,
     const char* message) {
     require(
-        output.override_steering && output.force_strafe &&
+        output.override_steering && !output.force_strafe &&
             output.stationary_constraint &&
             is_zero(output.left_stick) && is_zero(output.right_stick) &&
             output.preview_requests.size() == 1U &&
@@ -2013,7 +2013,7 @@ void test_slot_approach_latches_inclusive_arrival_boundaries() {
             assist.diagnostics().settle_ticks == 0U,
         "inclusive frozen-slot arrival boundaries did not latch Settling");
     require(
-        output.override_steering && output.force_strafe &&
+        output.override_steering && !output.force_strafe &&
             output.stationary_constraint && is_zero(output.left_stick) &&
             is_zero(output.right_stick),
         "inclusive arrival latch did not emit zero-stick stationary braking");
@@ -2070,7 +2070,7 @@ interaction::PickAssistDiagnostics latch_frozen_slot_settling(
             latched.settle_ticks == 0U,
         "valid inclusive frozen metrics did not latch Settling");
     require(
-        latch_output.override_steering && latch_output.force_strafe &&
+        latch_output.override_steering && !latch_output.force_strafe &&
             latch_output.stationary_constraint &&
             is_zero(latch_output.left_stick) &&
             is_zero(latch_output.right_stick) &&
@@ -2197,7 +2197,7 @@ void test_frozen_slot_settling_records_consecutive_travel_without_failure() {
             continued.settle_ticks == 0U,
         "finite frozen Settling detour failed or retained a nonconsecutive tick");
     require(
-        output.override_steering && output.force_strafe &&
+        output.override_steering && !output.force_strafe &&
             output.stationary_constraint && is_zero(output.left_stick) &&
             is_zero(output.right_stick) &&
             output.preview_requests.empty() &&
@@ -2234,7 +2234,7 @@ void test_frozen_slot_settling_keeps_stationary_braking() {
             settled.settle_ticks == 1U,
         "valid frozen Settling next tick changed state or did not advance exactly once");
     require(
-        output.override_steering && output.force_strafe &&
+        output.override_steering && !output.force_strafe &&
             output.stationary_constraint && is_zero(output.left_stick) &&
             is_zero(output.right_stick) &&
             output.preview_requests.empty() &&
@@ -2305,7 +2305,7 @@ void test_frozen_slot_settling_requests_exact_frozen_preview_root() {
         bool requests_preview,
         const char* message) {
         require(
-            output.override_steering && output.force_strafe &&
+            output.override_steering && !output.force_strafe &&
                 output.stationary_constraint &&
                 is_zero(output.left_stick) &&
                 is_zero(output.right_stick) &&
@@ -2477,7 +2477,7 @@ interaction::PickEntryRoot enter_frozen_final_preview(
                         interaction::PickAssistState::Settling &&
                     assist.diagnostics().reason ==
                         interaction::PickAssistReason::None &&
-                    output.override_steering && output.force_strafe &&
+                    output.override_steering && !output.force_strafe &&
                     output.stationary_constraint &&
                     is_zero(output.left_stick) &&
                     is_zero(output.right_stick) &&
@@ -2523,6 +2523,104 @@ interaction::PickEntryPreview certified_frozen_preview(
     return preview;
 }
 
+void test_stationary_assist_outputs_preserve_desired_yaw() {
+    FrozenSlotScenario scenario;
+    interaction::ControllerPickAssist assist;
+    const auto require_yaw_preserving_brake = [](
+        const interaction::PickAssistOutput& output,
+        const char* message) {
+        require(
+            output.override_steering && output.stationary_constraint &&
+                is_zero(output.left_stick) &&
+                is_zero(output.right_stick) && !output.force_strafe,
+            message);
+    };
+
+    require(
+        assist.begin(scenario.start, &scenario.target),
+        "stationary-yaw fixture begin failed");
+    interaction::PickAssistOutput output =
+        assist.observe(scenario.observation);
+    require(
+        assist.diagnostics().state ==
+            interaction::PickAssistState::SlotSelectionPreview,
+        "stationary-yaw fixture did not request selection previews");
+    require_yaw_preserving_brake(
+        output,
+        "selection-preview braking requested zero-stick strafe");
+
+    set_selection_results(
+        scenario.observation,
+        output,
+        std::vector<SelectionPreviewKind>(
+            output.preview_requests.size(),
+            SelectionPreviewKind::Ready),
+        0x71a710U);
+    output = assist.observe(scenario.observation);
+    require(
+        assist.diagnostics().state ==
+                interaction::PickAssistState::SlotApproach &&
+            assist.diagnostics().frozen_slot_index.has_value(),
+        "stationary-yaw fixture did not freeze a certified slot");
+
+    const interaction::MappedPickSlot& frozen_slot =
+        assist.diagnostics().slot_selection.ordered[
+            *assist.diagnostics().frozen_slot_index];
+    scenario.observation.preview_results.clear();
+    scenario.observation.displayed_root = frozen_slot.root_world;
+    scenario.observation.simulation_velocity = vec3();
+    scenario.observation.displayed_planar_speed_mps = 0.0F;
+    output = assist.observe(scenario.observation);
+    require(
+        assist.diagnostics().state ==
+            interaction::PickAssistState::Settling,
+        "stationary-yaw fixture did not enter Settling");
+    require_yaw_preserving_brake(
+        output,
+        "Settling latch requested zero-stick strafe");
+
+    for (uint32_t tick = 0U;
+         tick < interaction::PickAssistConfig{}.required_settle_ticks;
+         ++tick) {
+        output = assist.observe(scenario.observation);
+        require_yaw_preserving_brake(
+            output,
+            "stationary settle/final-preview braking requested zero-stick strafe");
+    }
+    require(
+        assist.diagnostics().state ==
+                interaction::PickAssistState::FinalPreview &&
+            output.preview_requests.size() == 1U,
+        "stationary-yaw fixture did not request final preview");
+
+    scenario.observation.snapshot_fingerprint = 0x71a711U;
+    scenario.observation.preview_snapshot_fingerprint = 0x71a711U;
+    set_frozen_preview_result(
+        scenario.observation,
+        output.preview_requests.front().root,
+        certified_frozen_preview(output.preview_requests.front().root));
+    output = assist.observe(scenario.observation);
+    require(
+        assist.diagnostics().state ==
+                interaction::PickAssistState::ReadyToSubmit &&
+            output.submit_interact,
+        "stationary-yaw fixture did not certify final preview");
+    require_yaw_preserving_brake(
+        output,
+        "ReadyToSubmit pulse requested zero-stick strafe");
+
+    scenario.observation.preview_results.clear();
+    output = assist.observe(scenario.observation);
+    require(
+        assist.diagnostics().state ==
+                interaction::PickAssistState::ReadyToSubmit &&
+            !output.submit_interact,
+        "stationary-yaw fixture repeated its submit pulse");
+    require_yaw_preserving_brake(
+        output,
+        "ReadyToSubmit hold requested zero-stick strafe");
+}
+
 interaction::PickAssistDiagnostics enter_frozen_ready_to_submit(
     interaction::ControllerPickAssist& assist,
     FrozenSlotScenario& scenario,
@@ -2544,7 +2642,7 @@ interaction::PickAssistDiagnostics enter_frozen_ready_to_submit(
                 interaction::PickAssistState::ReadyToSubmit &&
             assist.diagnostics().reason ==
                 interaction::PickAssistReason::None &&
-            output.override_steering && output.force_strafe &&
+            output.override_steering && !output.force_strafe &&
             output.stationary_constraint &&
             is_zero(output.left_stick) && is_zero(output.right_stick) &&
             output.preview_requests.empty() &&
@@ -2733,7 +2831,7 @@ void test_frozen_final_preview_poor_match_rerequests_then_recovers() {
                 interaction::PickAssistState::ReadyToSubmit &&
             assist.diagnostics().reason ==
                 interaction::PickAssistReason::None &&
-            output.override_steering && output.force_strafe &&
+            output.override_steering && !output.force_strafe &&
             output.stationary_constraint &&
             is_zero(output.left_stick) && is_zero(output.right_stick) &&
             output.preview_requests.empty() &&
@@ -2903,7 +3001,7 @@ void test_frozen_final_preview_certifies_and_submits_exactly_once() {
                 interaction::PickAssistState::ReadyToSubmit &&
             assist.diagnostics().reason ==
                 interaction::PickAssistReason::None &&
-            output.override_steering && output.force_strafe &&
+            output.override_steering && !output.force_strafe &&
             output.stationary_constraint &&
             is_zero(output.left_stick) && is_zero(output.right_stick) &&
             output.preview_requests.empty() &&
@@ -2923,7 +3021,7 @@ void test_frozen_final_preview_certifies_and_submits_exactly_once() {
                 interaction::PickAssistState::ReadyToSubmit &&
             assist.diagnostics().reason ==
                 interaction::PickAssistReason::None &&
-            output.override_steering && output.force_strafe &&
+            output.override_steering && !output.force_strafe &&
             output.stationary_constraint &&
             is_zero(output.left_stick) && is_zero(output.right_stick) &&
             output.preview_requests.empty() &&
@@ -3987,6 +4085,7 @@ int main() {
         test_frozen_slot_settling_revalidates_selected_slot();
         test_frozen_slot_settling_records_consecutive_travel_without_failure();
         test_frozen_slot_settling_keeps_stationary_braking();
+        test_stationary_assist_outputs_preserve_desired_yaw();
         test_frozen_slot_settling_requests_exact_frozen_preview_root();
         test_frozen_final_preview_missing_batch_rerequests();
         test_frozen_final_preview_rejects_nonexact_result_batch();

@@ -262,7 +262,7 @@ float planar_speed(vec3 velocity) {
 PickAssistOutput braking_output() {
     PickAssistOutput output{};
     output.override_steering = true;
-    output.force_strafe = true;
+    output.force_strafe = false;
     output.stationary_constraint = true;
     return output;
 }

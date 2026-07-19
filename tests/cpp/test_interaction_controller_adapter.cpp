@@ -6502,6 +6502,8 @@ void test_controller_smart_pickup_two_phase_production_seam() {
     require(
         compact_manual_diagnostics.find(
             "if(manual_pick_diagnostics.state=="
+            "interaction::PickAssistState::SlotSelectionPreview||"
+            "manual_pick_diagnostics.state=="
             "interaction::PickAssistState::SlotApproach||"
             "manual_pick_diagnostics.state=="
             "interaction::PickAssistState::Settling||"
