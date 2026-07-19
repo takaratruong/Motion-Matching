@@ -786,6 +786,33 @@ void test_shared_pick_evaluation_preserves_match_reason_priority_and_cost_availa
         select_whole_clip(mixed_input, {}), mixed_evaluation.selection);
 }
 
+void test_preview_match_reason_preserves_retryable_poor_match() {
+    using namespace interaction;
+    RuntimeFixture fixture = high_cost_fixture();
+    fixture.database.active_hands.at(0) = 1U;
+    const MatchInput input = match_input_for(fixture);
+
+    const matcher_detail::PickEvaluation result =
+        matcher_detail::evaluate_pick_entries(
+            evaluation_input(input),
+            MatchConfig{},
+            [](const MatchCandidate& candidate) {
+                return candidate.clip == 0
+                    ? Reason::CorrectionLimit
+                    : Reason::None;
+            });
+
+    assert(result.path_feasible);
+    assert(result.path_reason == Reason::None);
+    assert(!result.match_ready);
+    assert(result.feasible_entry_frame == 85);
+    assert(result.contact_frame == 100);
+    assert(result.total_cost_available);
+    assert(near(result.total_cost, 106.40F, 1.0e-4F));
+    assert(result.match_reason == Reason::PoorMatch);
+    assert(result.selection.reason == Reason::CorrectionLimit);
+}
+
 }  // namespace
 
 int main() {
@@ -810,5 +837,6 @@ int main() {
     test_candidate_feasibility_rejection_continues_from_reach_to_approach();
     test_candidate_feasibility_out_of_range_exception_propagates();
     test_shared_pick_evaluation_preserves_match_reason_priority_and_cost_availability();
+    test_preview_match_reason_preserves_retryable_poor_match();
     return 0;
 }

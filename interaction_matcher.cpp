@@ -720,7 +720,10 @@ void finish_evaluation(
     }
     result.match_ready = false;
     result.selection = reject(aggregate_reason(failures));
-    result.match_reason = result.selection.reason;
+    result.match_reason =
+        !failures.out_of_range && failures.poor_match
+            ? Reason::PoorMatch
+            : result.selection.reason;
 }
 
 }  // namespace
