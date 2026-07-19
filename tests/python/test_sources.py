@@ -1,4 +1,6 @@
 import glob
+import os
+import tempfile
 import unittest
 from unittest import mock
 import numpy as np
@@ -42,6 +44,118 @@ EXPECTED_MOVING_SLOPE_OBJECTS = (
 
 
 class SourceTests(unittest.TestCase):
+    @staticmethod
+    def _touch(root, partition, modality, stem, suffix):
+        directory = os.path.join(root, "data", partition, modality)
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, stem + suffix)
+        with open(path, "wb") as stream:
+            stream.write(b"fixture")
+        return path
+
+    def _fake_multifamily_tree(self, root):
+        layout = {
+            "curb": ("c0", "c1", "c2"),
+            "slope": ("a_locked", "s0", "s1", "s2"),
+            "stair_p1": ("p1a", "p1b"),
+            "stair_p2": ("p2a", "p2b"),
+        }
+        for partition, stems in layout.items():
+            pose_modality = "recon" if partition == "curb" else "objects"
+            for stem in stems:
+                self._touch(root, partition, "robot", stem, ".pkl")
+                self._touch(root, partition, pose_modality, stem, ".pkl")
+                self._touch(root, partition, "object_usd", stem, ".usd")
+        return layout
+
+    def test_multifamily_discovery_pairs_then_excludes_and_limits_semantically(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._fake_multifamily_tree(root)
+            corpus = sources_module.discover_grail_source_assets(
+                root,
+                source_limit_per_family=3,
+                moving_slope_basenames=("a_locked",),
+            )
+
+        self.assertTrue(corpus.diagnostic)
+        self.assertEqual(corpus.skipped_basenames, ("a_locked",))
+        self.assertEqual(
+            [(item.partition, item.family, item.name)
+             for item in corpus.motion_sources],
+            [
+                ("curb", "curb", "c0"),
+                ("curb", "curb", "c1"),
+                ("curb", "curb", "c2"),
+                ("slope", "slope", "s0"),
+                ("slope", "slope", "s1"),
+                ("slope", "slope", "s2"),
+                ("stair_p1", "stair", "p1a"),
+                ("stair_p1", "stair", "p1b"),
+                ("stair_p2", "stair", "p2a"),
+            ],
+        )
+        stair = [item for item in corpus.all_sources
+                 if item.family == "stair"]
+        self.assertEqual(
+            [(item.partition, item.name) for item in stair],
+            [("stair_p1", "p1a"), ("stair_p1", "p1b"),
+             ("stair_p2", "p2a"), ("stair_p2", "p2b")],
+        )
+
+    def test_discovery_audits_complete_pairing_before_exclusion_or_limit(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._fake_multifamily_tree(root)
+            os.unlink(os.path.join(
+                root, "data", "slope", "object_usd", "a_locked.usd"))
+            with self.assertRaisesRegex(
+                    ValueError, "slope.*robot/object/USD basename coverage"):
+                sources_module.discover_grail_source_assets(
+                    root,
+                    source_limit_per_family=0,
+                    moving_slope_basenames=("a_locked",),
+                )
+
+    def test_discovery_rejects_cross_family_substitution_and_duplicates(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._fake_multifamily_tree(root)
+            os.unlink(os.path.join(
+                root, "data", "slope", "objects", "s0.pkl"))
+            self._touch(root, "stair_p1", "objects", "s0", ".pkl")
+            with self.assertRaisesRegex(
+                    ValueError, "slope.*robot/object/USD basename coverage"):
+                sources_module.discover_grail_source_assets(
+                    root, moving_slope_basenames=("a_locked",))
+
+        with tempfile.TemporaryDirectory() as root:
+            self._fake_multifamily_tree(root)
+            for modality, suffix in (
+                    ("robot", ".pkl"), ("objects", ".pkl"),
+                    ("object_usd", ".usd")):
+                self._touch(root, "slope", modality, "c0", suffix)
+            with self.assertRaisesRegex(ValueError, "duplicate source basename"):
+                sources_module.discover_grail_source_assets(
+                    root, moving_slope_basenames=("a_locked",))
+
+    def test_semantic_source_limit_none_zero_oversized_and_negative(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._fake_multifamily_tree(root)
+            unlimited = sources_module.discover_grail_source_assets(
+                root, moving_slope_basenames=("a_locked",))
+            flat_only = sources_module.discover_grail_source_assets(
+                root, 0, moving_slope_basenames=("a_locked",))
+            oversized = sources_module.discover_grail_source_assets(
+                root, 99, moving_slope_basenames=("a_locked",))
+            with self.assertRaisesRegex(ValueError, "non-negative"):
+                sources_module.discover_grail_source_assets(
+                    root, -1, moving_slope_basenames=("a_locked",))
+
+        self.assertFalse(unlimited.diagnostic)
+        self.assertEqual(unlimited.motion_sources, unlimited.all_sources)
+        self.assertTrue(flat_only.diagnostic)
+        self.assertEqual(flat_only.motion_sources, ())
+        self.assertTrue(oversized.diagnostic)
+        self.assertEqual(oversized.motion_sources, oversized.all_sources)
+
     @staticmethod
     def _static_object_record(frames=3):
         root_pos = np.tile(

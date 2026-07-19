@@ -13,6 +13,9 @@ import quat as holden_quat
 from .schema import ArtifactSet, HoldenClip, SkeletonSpec
 
 
+DATABASE_WRITE_CHUNK_BYTES = 1024 * 1024
+
+
 @dataclass(frozen=True)
 class ContactConfig:
     speed_threshold: float = 0.15
@@ -207,24 +210,37 @@ def combine_clips(
 
 
 def _write_array2(stream, array: np.ndarray, dtype: str) -> None:
-    values = np.ascontiguousarray(array, dtype=np.dtype(dtype))
-    if values.ndim < 2:
+    source = np.asarray(array)
+    if source.ndim < 2:
         raise ValueError("array2 values must have at least two dimensions")
-    rows, columns = values.shape[:2]
+    rows, columns = source.shape[:2]
     if rows > 0xFFFFFFFF or columns > 0xFFFFFFFF:
         raise ValueError("array2 dimensions exceed the Holden uint32 header")
     stream.write(struct.pack("<II", rows, columns))
-    stream.write(values.tobytes())
+    target = np.dtype(dtype)
+    row_items = int(np.prod(source.shape[1:], dtype=np.int64))
+    row_bytes = row_items * target.itemsize
+    rows_per_chunk = max(1, DATABASE_WRITE_CHUNK_BYTES // max(1, row_bytes))
+    for start in range(0, rows, rows_per_chunk):
+        stop = min(rows, start + rows_per_chunk)
+        values = np.ascontiguousarray(source[start:stop], dtype=target)
+        stream.write(memoryview(values).cast("B"))
 
 
 def _write_array1(stream, array: np.ndarray, dtype: str) -> None:
-    values = np.ascontiguousarray(array, dtype=np.dtype(dtype))
-    if values.ndim != 1:
+    source = np.asarray(array)
+    if source.ndim != 1:
         raise ValueError("array1 values must be one-dimensional")
-    if len(values) > 0xFFFFFFFF:
+    if len(source) > 0xFFFFFFFF:
         raise ValueError("array1 length exceeds the Holden uint32 header")
-    stream.write(struct.pack("<I", len(values)))
-    stream.write(values.tobytes())
+    stream.write(struct.pack("<I", len(source)))
+    target = np.dtype(dtype)
+    items_per_chunk = max(
+        1, DATABASE_WRITE_CHUNK_BYTES // target.itemsize)
+    for start in range(0, len(source), items_per_chunk):
+        stop = min(len(source), start + items_per_chunk)
+        values = np.ascontiguousarray(source[start:stop], dtype=target)
+        stream.write(memoryview(values).cast("B"))
 
 
 def write_holden_database(path: os.PathLike | str, artifacts: ArtifactSet) -> None:

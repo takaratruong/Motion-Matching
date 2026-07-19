@@ -21,6 +21,8 @@ from resources.g1_terrain_builder.artifacts import (
     read_walkability,
 )
 from resources.g1_terrain_builder.database import read_holden_database
+from resources.g1_terrain_builder import database as database_module
+from resources.g1_terrain_builder.schema import ArtifactSet
 from resources.g1_terrain_builder.scenes import REQUIRED_SCENE_IDS
 from resources.g1_terrain_builder.schema import HoldenClip, SkeletonSpec
 
@@ -29,6 +31,88 @@ PYTHON = "/home/ubuntu/miniconda3/envs/diffsim/bin/python"
 
 
 class BuildCliTests(unittest.TestCase):
+    def test_publication_indexes_use_physical_hips_y_and_exact_family_ranges(self):
+        artifacts = ArtifactSet.empty(frames=6, bones=31)
+        artifacts.range_starts = np.array([0, 3], np.int32)
+        artifacts.range_stops = np.array([3, 6], np.int32)
+        artifacts.positions[:, 0, 1] = 0.0
+        artifacts.positions[:, 1, 1] = np.array(
+            [0.0, 0.05, 0.10, 1.0, 0.95, 0.90], np.float32)
+        artifacts.terrain_support[:, 0] = np.array(
+            [10.0, 0.0, -10.0, -10.0, 0.0, 10.0], np.float32)
+        skeleton = SkeletonSpec(
+            ("Simulation", "Hips") + tuple(
+                f"bone-{index}" for index in range(2, 31)),
+            np.arange(-1, 30, dtype=np.int32),
+        )
+        sources = [
+            {
+                "name": "takara_walk_50hz", "terrain_family": "flat",
+                "output_frames": 3, "range_start": 0, "range_stop": 3,
+            },
+            {
+                "name": "stair-a", "terrain_family": "stair",
+                "output_frames": 3, "range_start": 3, "range_stop": 6,
+            },
+        ]
+
+        motion_index, banks = builder._build_publication_indexes(
+            artifacts, sources, skeleton)
+
+        self.assertEqual(
+            tuple(bank.range_indices for bank in banks.banks),
+            ((0,), (), (), (1,)),
+        )
+        np.testing.assert_array_equal(
+            motion_index.elevation_modes, [1, 1, 0, -1, -1, 0])
+
+    def test_holden_writer_is_byte_exact_and_never_encodes_a_full_matrix(self):
+        artifacts = ArtifactSet.empty(frames=8, bones=2)
+        expected = io.BytesIO()
+
+        def array2(values, dtype):
+            values = np.ascontiguousarray(values, dtype=dtype)
+            expected.write(struct.pack("<II", *values.shape[:2]))
+            expected.write(values.tobytes(order="C"))
+
+        def array1(values, dtype):
+            values = np.ascontiguousarray(values, dtype=dtype)
+            expected.write(struct.pack("<I", len(values)))
+            expected.write(values.tobytes(order="C"))
+
+        for name, dtype in (
+                ("positions", "<f4"), ("velocities", "<f4"),
+                ("rotations", "<f4"), ("angular_velocities", "<f4")):
+            array2(getattr(artifacts, name), dtype)
+        for name in ("parents", "range_starts", "range_stops"):
+            array1(getattr(artifacts, name), "<i4")
+        array2(artifacts.contacts, "u1")
+
+        original = np.ascontiguousarray
+        matrix_rows = []
+
+        def bounded(values, *args, **kwargs):
+            array = np.asarray(values)
+            if array.ndim >= 2:
+                matrix_rows.append(array.shape[0])
+            return original(values, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temporary, \
+                mock.patch.object(
+                    database_module, "DATABASE_WRITE_CHUNK_BYTES", 1,
+                    create=True), \
+                mock.patch.object(
+                    database_module.np, "ascontiguousarray",
+                    side_effect=bounded):
+            path = os.path.join(temporary, "database.bin")
+            database_module.write_holden_database(path, artifacts)
+            with open(path, "rb") as stream:
+                observed = stream.read()
+
+        self.assertEqual(observed, expected.getvalue())
+        self.assertTrue(matrix_rows)
+        self.assertLess(max(matrix_rows), len(artifacts.positions))
+
     def test_grail_limit_measures_complete_corpus_before_motion_selection(self):
         args = SimpleNamespace(grail_glob="clips/*.pkl", grail_limit=1)
         paths = [
@@ -103,24 +187,43 @@ class BuildCliTests(unittest.TestCase):
 
     def test_assembly_streams_sources_and_excludes_route_only_clips(self):
         args = SimpleNamespace(
-            output="unused", grail_glob="clips/*.pkl", grail_limit=1,
+            output="unused", source_limit_per_family=2,
+            acquisition_manifest="manifest.json",
+            acquisition_inventory="inventory.json", dataset_root="dataset",
             g1_xml="g1.xml", takara="takara.npz", remap="remap.npy",
         )
-        bases = ("motion", "route-a", "route-b", "route-c")
-        all_paths = tuple(f"clips/{base}.pkl" for base in bases)
-        path_by_base = dict(zip(bases, all_paths))
+        def asset(name, partition, family):
+            return SimpleNamespace(
+                name=name, partition=partition, family=family,
+                robot_path=f"clips/{name}.pkl")
+
+        curb = tuple(asset(f"curb-{index}", "curb", "curb")
+                     for index in range(4))
+        slope = asset("slope-0", "slope", "slope")
+        stair_p1 = asset("stair-p1", "stair_p1", "stair")
+        stair_p2 = asset("stair-p2", "stair_p2", "stair")
+        corpus = SimpleNamespace(
+            all_sources=curb + (slope, stair_p1, stair_p2),
+            motion_sources=(curb[0], slope, stair_p1, stair_p2),
+            skipped_basenames=tuple(f"moving-{index}" for index in range(23)),
+            diagnostic=True,
+        )
         measured_heights = {
-            "motion": 0.10, "route-a": 0.20,
-            "route-b": 0.30, "route-c": 0.40,
+            "curb-0": 0.10, "curb-1": 0.20,
+            "curb-2": 0.30, "curb-3": 0.40,
         }
         selected = {
-            "grail-curb-default": "motion",
-            "grail-curb-low": "route-a",
-            "grail-curb-medium": "route-b",
-            "grail-curb-high": "route-c",
+            "grail-curb-default": "curb-0",
+            "grail-curb-low": "curb-1",
+            "grail-curb-medium": "curb-2",
+            "grail-curb-high": "curb-3",
         }
         skeleton = SkeletonSpec(
-            tuple(f"bone-{index}" for index in range(31)),
+            ("Simulation", "Hips", "LeftHipPitch", "LeftHipRoll",
+             "LeftHipYaw", "LeftKnee", "LeftAnkle", "LeftToe",
+             "RightHipPitch", "RightHipRoll", "RightHipYaw", "RightKnee",
+             "RightAnkle", "RightToe")
+            + tuple(f"bone-{index}" for index in range(14, 31)),
             np.arange(-1, 30, dtype=np.int32))
         source_refs = []
         clip_refs = []
@@ -171,7 +274,7 @@ class BuildCliTests(unittest.TestCase):
 
         def all_definitions(observed_heights, clips_by_terrain):
             self.assertEqual(observed_heights, measured_heights)
-            self.assertEqual(set(clips_by_terrain), set(bases))
+            self.assertEqual(set(clips_by_terrain), set(measured_heights))
             return ("all-definitions",)
 
         scene_pack = SimpleNamespace(scenes=tuple(range(14)))
@@ -179,16 +282,16 @@ class BuildCliTests(unittest.TestCase):
         with (
             mock.patch.object(builder, "_require_file"),
             mock.patch.object(
-                builder, "_inspect_grail_corpus",
-                return_value=(
-                    all_paths, all_paths[:1], path_by_base,
-                    measured_heights, selected)),
+                builder, "_inspect_multifamily_corpus", return_value=corpus),
+            mock.patch.object(
+                builder, "_premeasure_curb_corpus",
+                return_value=(measured_heights, selected, {
+                    item.name: item for item in curb})),
             mock.patch.object(builder, "G1Kinematics", return_value=object()),
             mock.patch.object(builder, "load_takara", side_effect=load_takara),
             mock.patch.object(builder, "load_grail", side_effect=load_grail),
             mock.patch.object(builder, "FlatTerrain", return_value=object()),
-            mock.patch.object(
-                builder.GrailTerrain, "from_base", return_value=object()),
+            mock.patch.object(builder, "_terrain_for_asset", return_value=object()),
             mock.patch.object(builder, "finalize_clip", new=finalize),
             mock.patch.object(
                 builder, "convert_source_clip", new=convert),
@@ -199,19 +302,25 @@ class BuildCliTests(unittest.TestCase):
                 builder, "build_scene_pack",
                 new=lambda definitions: scene_pack, create=True),
         ):
-            artifacts, manifest, observed_pack = \
+            artifacts, manifest, observed_pack, motion_index, banks = \
                 builder._assemble_candidate(args)
 
         gc.collect()
         self.assertIs(observed_pack, scene_pack)
         self.assertEqual(load_events, [
-            "takara_walk_50hz", "motion", "route-a", "route-b", "route-c",
+            "takara_walk_50hz", "curb-0", "slope-0", "stair-p1",
+            "stair-p2", "curb-1", "curb-2", "curb-3",
         ])
         self.assertEqual(
             [entry["name"] for entry in manifest["sources"]],
-            ["takara_walk_50hz", "motion"])
-        self.assertEqual(manifest["total_clips"], 2)
-        self.assertEqual(manifest["grail_clips"], 1)
+            ["takara_walk_50hz", "curb-0", "slope-0", "stair-p1",
+             "stair-p2"])
+        self.assertEqual(
+            [entry["terrain_family"] for entry in manifest["sources"]],
+            ["flat", "curb", "slope", "stair", "stair"])
+        self.assertEqual(manifest["total_clips"], 5)
+        self.assertEqual(manifest["grail_clips"], 4)
+        self.assertEqual(manifest["skipped_clips"], 23)
         self.assertEqual(set(manifest), {
             "schema", "output_fps", "feature_dimensions",
             "terrain_dimensions", "support_dimensions",
@@ -219,7 +328,9 @@ class BuildCliTests(unittest.TestCase):
             "skipped_clips", "database_frames", "diagnostic_mode",
             "sources", "skeleton", "contact", "surface", "validation",
         })
-        self.assertEqual(manifest["schema"], "g1-terrain-artifacts/v2")
+        self.assertEqual(manifest["schema"], "g1-terrain-artifacts/v3")
+        self.assertEqual(manifest["feature_dimensions"], 39)
+        self.assertEqual(manifest["terrain_dimensions"], 12)
         self.assertEqual(manifest["support_dimensions"], 3)
         self.assertEqual(
             manifest["terrain_feature_distances_m"], [0.25, 0.5, 0.75, 1.0])
@@ -231,8 +342,12 @@ class BuildCliTests(unittest.TestCase):
         self.assertEqual(
             manifest["validation"]["schema"],
             "g1-terrain-validation/v1")
-        self.assertEqual(len(artifacts.range_starts), 2)
-        self.assertEqual(len(artifacts.positions), 4)
+        self.assertEqual(len(artifacts.range_starts), 5)
+        self.assertEqual(len(artifacts.positions), 10)
+        self.assertEqual(len(motion_index), 10)
+        self.assertEqual(
+            tuple(bank.range_indices for bank in banks.banks),
+            ((0,), (1,), (2,), (3, 4)))
         self.assertTrue(all(reference() is None for reference in source_refs))
         self.assertTrue(all(reference() is None for _, reference in clip_refs))
 
@@ -251,7 +366,9 @@ class BuildCliTests(unittest.TestCase):
 
     def test_candidate_validator_argv_is_exact_in_both_modes(self):
         base = dict(
-            output="unused", grail_glob="/data/grail/*.pkl",
+            output="unused", acquisition_manifest="/inputs/manifest.json",
+            acquisition_inventory="/inputs/inventory.json",
+            dataset_root="/data/grail",
             g1_xml="/models/g1.xml", takara="/motion/takara.npz",
             remap="/motion/remap.npy",
         )
@@ -266,14 +383,16 @@ class BuildCliTests(unittest.TestCase):
             (None, [
                 builder.sys.executable, validator, "/tmp/candidate",
                 "--full-source-validation",
-                "--grail-glob", "/data/grail/*.pkl",
+                "--acquisition-manifest", "/inputs/manifest.json",
+                "--acquisition-inventory", "/inputs/inventory.json",
+                "--dataset-root", "/data/grail",
                 "--g1-xml", "/models/g1.xml",
                 "--takara", "/motion/takara.npz",
                 "--remap", "/motion/remap.npy",
             ]),
         )
         for limit, expected in cases:
-            args = SimpleNamespace(grail_limit=limit, **base)
+            args = SimpleNamespace(source_limit_per_family=limit, **base)
             with self.subTest(limit=limit), mock.patch.object(
                 subprocess, "run",
             ) as run:
@@ -283,7 +402,9 @@ class BuildCliTests(unittest.TestCase):
 
     def test_candidate_validator_nonzero_is_a_value_error(self):
         args = SimpleNamespace(
-            output="unused", grail_glob="/data/grail/*.pkl", grail_limit=1,
+            output="unused", acquisition_manifest="/inputs/manifest.json",
+            acquisition_inventory="/inputs/inventory.json",
+            dataset_root="/data/grail", source_limit_per_family=1,
             g1_xml="/models/g1.xml", takara="/motion/takara.npz",
             remap="/motion/remap.npy",
         )
@@ -295,7 +416,7 @@ class BuildCliTests(unittest.TestCase):
         ):
             builder._run_candidate_validator("/tmp/candidate", args)
 
-    def test_task7_legacy_builder_still_lacks_explicit_index_arguments(self):
+    def test_build_artifacts_forwards_explicit_v3_indexes(self):
         self.assertEqual(
             tuple(inspect.signature(builder.publish_artifacts).parameters),
             (
@@ -304,18 +425,21 @@ class BuildCliTests(unittest.TestCase):
             ),
         )
         args = SimpleNamespace(
-            output="published", grail_glob="clips/*.pkl", grail_limit=1,
+            output="published", source_limit_per_family=1,
             g1_xml="g1.xml", takara="takara.npz", remap="remap.npy",
         )
         artifacts = object()
-        manifest_base = {"schema": "g1-terrain-artifacts/v2"}
+        manifest_base = {"schema": "g1-terrain-artifacts/v3"}
         scene_pack = object()
+        motion_index = object()
+        terrain_banks = object()
         callback = lambda staging: None
-        finalized = {"schema": "g1-terrain-artifacts/v2"}
+        finalized = {"schema": "g1-terrain-artifacts/v3"}
         with (
             mock.patch.object(
                 builder, "_assemble_candidate",
-                return_value=(artifacts, manifest_base, scene_pack)) as assemble,
+                return_value=(artifacts, manifest_base, scene_pack,
+                              motion_index, terrain_banks)) as assemble,
             mock.patch.object(
                 builder, "_candidate_validation_policy",
                 return_value=callback, create=True) as policy,
@@ -329,7 +453,8 @@ class BuildCliTests(unittest.TestCase):
         assemble.assert_called_once_with(args)
         policy.assert_called_once_with(args)
         publish.assert_called_once_with(
-            "published", artifacts, manifest_base, scene_pack, callback)
+            "published", artifacts, manifest_base, scene_pack,
+            motion_index, terrain_banks, callback)
 
     def test_parser_removes_the_obsolete_runtime_terrain_option(self):
         parser = builder._parser()
@@ -339,7 +464,7 @@ class BuildCliTests(unittest.TestCase):
 
     def test_success_summary_reports_the_complete_scene_count(self):
         manifest = {
-            "schema": "g1-terrain-artifacts/v2",
+            "schema": "g1-terrain-artifacts/v3",
             "database_frames": 7,
             "total_clips": 2,
         }
@@ -355,7 +480,7 @@ class BuildCliTests(unittest.TestCase):
         self.assertEqual(stderr.getvalue(), "")
         self.assertEqual(
             stdout.getvalue(),
-            "BUILT g1-terrain-artifacts/v2 frames=7 clips=2 scenes=14 "
+            "BUILT g1-terrain-artifacts/v3 frames=7 clips=2 scenes=14 "
             "output=/tmp/candidate\n")
 
     @unittest.skip(
@@ -471,21 +596,15 @@ class BuildCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             missing = os.path.join(td, "missing")
             cases = (
-                ("negative_limit", ["--grail-limit", "-1"], "non-negative"),
-                ("empty_positive_glob", [
-                    "--grail-glob", os.path.join(td, "none", "*.pkl"),
-                    "--grail-limit", "1",
-                ], "matched no clips"),
-                ("empty_zero_glob", [
-                    "--grail-glob", os.path.join(td, "none", "*.pkl"),
-                    "--grail-limit", "0",
-                ], "matched no clips"),
-                ("empty_full_glob", [
-                    "--grail-glob", os.path.join(td, "none", "*.pkl"),
-                ], "matched no clips"),
+                ("negative_limit", [
+                    "--source-limit-per-family", "-1"], "non-negative"),
                 ("missing_g1_xml", [
-                    "--g1-xml", missing, "--grail-limit", "0",
+                    "--g1-xml", missing, "--source-limit-per-family", "0",
                 ], "missing G1 XML"),
+                ("missing_manifest", [
+                    "--acquisition-manifest", missing,
+                    "--source-limit-per-family", "0",
+                ], "missing GRAIL acquisition manifest"),
             )
             for name, arguments, message in cases:
                 output = os.path.join(td, name)
@@ -500,28 +619,30 @@ class BuildCliTests(unittest.TestCase):
 
     def test_duplicate_source_names_are_rejected_before_conversion(self):
         args = SimpleNamespace(
-            output="unused", grail_glob="clips/*.pkl", grail_limit=1,
+            output="unused", source_limit_per_family=1,
+            acquisition_manifest="manifest.json",
+            acquisition_inventory="inventory.json", dataset_root="dataset",
             g1_xml="g1.xml", takara="takara.npz", remap="remap.npy",
         )
-        collision = "clips/takara_walk_50hz.pkl"
+        collision = SimpleNamespace(name="takara_walk_50hz")
+        corpus = SimpleNamespace(all_sources=(collision,))
         with (
             mock.patch.object(builder, "_require_file"),
             mock.patch.object(
-                builder, "_inspect_grail_corpus", return_value=(
-                    (collision,), (collision,),
-                    {"takara_walk_50hz": collision},
-                    {"takara_walk_50hz": 0.1},
-                    {"grail-curb-default": "takara_walk_50hz"},
-                )),
+                builder, "_inspect_multifamily_corpus", return_value=corpus),
+            mock.patch.object(builder, "_premeasure_curb_corpus") as measure,
             mock.patch.object(builder, "finalize_clip") as finalize,
         ):
             with self.assertRaisesRegex(ValueError, "duplicate source names"):
                 builder._assemble_candidate(args)
+        measure.assert_not_called()
         finalize.assert_not_called()
 
     def test_skeleton_changes_are_rejected_before_combination(self):
         args = SimpleNamespace(
-            output="unused", grail_glob="clips/*.pkl", grail_limit=1,
+            output="unused", source_limit_per_family=1,
+            acquisition_manifest="manifest.json",
+            acquisition_inventory="inventory.json", dataset_root="dataset",
             g1_xml="g1.xml", takara="takara.npz", remap="remap.npy",
         )
         takara = SimpleNamespace(
@@ -543,24 +664,29 @@ class BuildCliTests(unittest.TestCase):
             "duration_error_s": 0.0,
             "quaternion_norm_max_error": 0.0,
         }
-        grail_path = "clips/grail.pkl"
+        grail_asset = SimpleNamespace(
+            name="grail", robot_path="clips/grail.pkl",
+            partition="curb", family="curb")
+        corpus = SimpleNamespace(
+            all_sources=(grail_asset,), motion_sources=(grail_asset,),
+            skipped_basenames=(), diagnostic=True)
         with (
             mock.patch.object(builder, "_require_file"),
             mock.patch.object(
-                builder, "_inspect_grail_corpus", return_value=(
-                    (grail_path,), (grail_path,), {"grail": grail_path},
+                builder, "_inspect_multifamily_corpus", return_value=corpus),
+            mock.patch.object(
+                builder, "_premeasure_curb_corpus", return_value=(
                     {"grail": 0.1}, {
                         "grail-curb-default": "grail",
                         "grail-curb-low": "grail",
                         "grail-curb-medium": "grail",
                         "grail-curb-high": "grail",
-                    },
-                )),
+                    }, {"grail": grail_asset})),
             mock.patch.object(builder, "G1Kinematics"),
             mock.patch.object(builder, "load_takara", return_value=takara),
             mock.patch.object(builder, "load_grail", return_value=grail),
             mock.patch.object(
-                builder.GrailTerrain, "from_base", return_value=object()),
+                builder, "_terrain_for_asset", return_value=object()),
             mock.patch.object(
                 builder, "finalize_clip",
                 side_effect=((clip_a, skeleton_a, report),

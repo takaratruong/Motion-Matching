@@ -15,6 +15,11 @@ if REPOSITORY_ROOT not in sys.path:
     sys.path.insert(0, REPOSITORY_ROOT)
 
 from resources import quat as holden_quat
+from resources.grail_terrain_acquisition import (
+    load_inventory,
+    load_manifest,
+    verify_local,
+)
 from resources.g1_terrain_builder.artifacts import publish_artifacts
 from resources.g1_terrain_builder.database import (
     ContactConfig,
@@ -28,18 +33,30 @@ from resources.g1_terrain_builder.kinematics import (
     G1Kinematics,
     convert_source_clip,
 )
+from resources.g1_terrain_builder.motion_index import derive_motion_index
 from resources.g1_terrain_builder.scenes import (
     REQUIRED_SCENE_IDS,
     all_scene_definitions,
     build_scene_pack,
     select_grail_scene_bases,
 )
-from resources.g1_terrain_builder.sources import load_grail, load_takara
+from resources.g1_terrain_builder.schema import (
+    SourceFrameRange,
+    TerrainBank,
+    TerrainBankIndex,
+    TERRAIN_FAMILIES,
+)
+from resources.g1_terrain_builder.sources import (
+    GRAIL_PARTITION_SOURCE_COUNTS,
+    discover_grail_source_assets,
+    load_grail,
+    load_takara,
+)
 from resources.g1_terrain_builder.terrain import (
     FlatTerrain,
     GrailTerrain,
     build_facing_centerline,
-    sample_terrain_features,
+    sample_terrain_descriptor,
     surface_semantics,
     surface_semantics_signature,
 )
@@ -48,18 +65,29 @@ from resources.g1_terrain_builder.terrain import (
 DEFAULTS = {
     "output": "resources/g1_terrain",
     "grail_glob": "/home/ubuntu/datasets/GRAIL/data/curb/robot/*.pkl",
+    "acquisition_manifest": os.path.join(
+        REPOSITORY_ROOT, "resources", "grail_terrain_inputs.json"),
+    "dataset_root": "/home/ubuntu/datasets/GRAIL",
+    "acquisition_inventory": (
+        "/home/ubuntu/datasets/GRAIL/g1_mm_inventory.json"),
     "g1_xml": "/home/ubuntu/projects/mjx-diffphysics/env/g1/assets/g1_29dof.xml",
     "takara": "/home/ubuntu/Downloads/takara_walk_50hz.npz_v0/motion.npz",
     "remap": "/home/ubuntu/projects/g1_mm/isaac_to_mj.npy",
 }
 
-SCHEMA = "g1-terrain-artifacts/v2"
+SCHEMA = "g1-terrain-artifacts/v3"
 OUTPUT_FPS = 25.0
 TERRAIN_DISTANCES = [0.25, 0.50, 0.75, 1.00]
+ACQUISITION_MODALITIES = ("object_usd", "objects", "robot")
+ACQUISITION_FILE_COUNT = 40_324
 
 
 def finalize_clip(source, terrain, kin):
     clip, skeleton, report = convert_source_clip(source, kin, OUTPUT_FPS)
+    # kinematics.py retains its legacy four-column allocation seam.  Replace
+    # it immediately so no legacy row can reach validation or publication.
+    clip.terrain_features = np.zeros(
+        (len(clip.positions), 12), dtype=np.float32)
     gp, gq = forward_kinematics_arrays(
         clip.positions, clip.rotations, skeleton.parents)
     # quat.to_scaled_angle_axis uses np.where around its zero-angle branch;
@@ -86,8 +114,8 @@ def finalize_clip(source, terrain, kin):
             np.array([0.0, 0.0, 1.0], np.float64))
         headings = headings3[:, [0, 2]]
         centerline = build_facing_centerline(path[0], headings, path)
-        clip.terrain_features[frame] = sample_terrain_features(
-            terrain, centerline)
+        clip.terrain_features[frame] = sample_terrain_descriptor(
+            terrain, centerline, headings[0])
     clip.validate()
     return clip, skeleton, report
 
@@ -103,14 +131,57 @@ def _require_loaded_grail_source(source, base):
             f"{base}: loaded source name/terrain identity changed")
 
 
+def _build_publication_indexes(artifacts, sources, skeleton):
+    ranges = tuple(
+        SourceFrameRange(
+            source["name"],
+            0,
+            source["output_frames"],
+            source["output_frames"],
+            source["range_start"],
+            source["range_stop"],
+        )
+        for source in sources
+    )
+    banks = TerrainBankIndex(
+        len(artifacts.positions),
+        ranges,
+        tuple(
+            TerrainBank(
+                family,
+                tuple(index for index, source in enumerate(sources)
+                      if source["terrain_family"] == family),
+            )
+            for family in TERRAIN_FAMILIES
+        ),
+    )
+    banks.validate()
+
+    simulation = skeleton.names.index("Simulation")
+    hips = skeleton.names.index("Hips")
+    root_positions = np.asarray(
+        artifacts.positions[:, simulation], np.float64).copy()
+    # Simulation.y is intentionally zero.  Hips is a direct child of the
+    # yaw-only Simulation transform, so its local y is physical global y.
+    root_positions[:, 1] = artifacts.positions[:, hips, 1]
+    forward = holden_quat.mul_vec(
+        artifacts.rotations[:, simulation],
+        np.array([0.0, 0.0, 1.0], np.float64),
+    )
+    headings = np.arctan2(forward[:, 0], forward[:, 2])
+    return derive_motion_index(root_positions, headings, banks), banks
+
+
 def _run_candidate_validator(staging, args):
     validator = os.path.join(
         REPOSITORY_ROOT, "resources", "validate_g1_terrain_database.py")
     argv = [sys.executable, validator, staging]
-    if args.grail_limit is None:
+    if args.source_limit_per_family is None:
         argv.extend([
             "--full-source-validation",
-            "--grail-glob", args.grail_glob,
+            "--acquisition-manifest", args.acquisition_manifest,
+            "--acquisition-inventory", args.acquisition_inventory,
+            "--dataset-root", args.dataset_root,
             "--g1-xml", args.g1_xml,
             "--takara", args.takara,
             "--remap", args.remap,
@@ -166,11 +237,14 @@ def _inspect_grail_corpus(args):
     )
 
 
-def _source_manifest_entry(source, clip, range_start: int) -> dict:
+def _source_manifest_entry(
+    source, clip, range_start: int, terrain_family: str,
+) -> dict:
     output_frames = len(clip.positions)
     return {
         "name": source.name,
         "terrain_id": source.terrain_id,
+        "terrain_family": terrain_family,
         "source_fps": float(source.fps),
         "source_frames": int(len(source.qpos)),
         "output_frames": int(output_frames),
@@ -180,18 +254,89 @@ def _source_manifest_entry(source, clip, range_start: int) -> dict:
     }
 
 
+def _verify_acquisition_inputs(args):
+    manifest = load_manifest(args.acquisition_manifest)
+    inventory = load_inventory(
+        args.acquisition_inventory, manifest, ACQUISITION_MODALITIES)
+    summary = verify_local(
+        manifest, inventory, args.dataset_root, ACQUISITION_MODALITIES)
+    if summary["file_count"] != ACQUISITION_FILE_COUNT:
+        raise ValueError(
+            "GRAIL acquisition inventory must authenticate exactly "
+            f"{ACQUISITION_FILE_COUNT} files")
+    print(
+        "SOURCE authentication "
+        f"files={summary['file_count']} sha256="
+        f"{summary['canonical_inventory_sha256']}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return manifest, inventory, summary
+
+
+def _inspect_multifamily_corpus(args):
+    _require_file(args.acquisition_manifest, "GRAIL acquisition manifest")
+    _require_file(args.acquisition_inventory, "GRAIL acquisition inventory")
+    _verify_acquisition_inputs(args)
+    corpus = discover_grail_source_assets(
+        args.dataset_root,
+        args.source_limit_per_family,
+        expected_partition_counts=GRAIL_PARTITION_SOURCE_COUNTS,
+    )
+    return corpus
+
+
+def _premeasure_curb_corpus(corpus):
+    curb = tuple(item for item in corpus.all_sources
+                 if item.partition == "curb")
+    measured = {}
+    total = len(curb)
+    for index, item in enumerate(curb, 1):
+        if index == 1 or index == total or index % 100 == 0:
+            print(
+                f"SOURCE measure curb {index}/{total} {item.name}",
+                file=sys.stderr, flush=True)
+        terrain = GrailTerrain.from_base(item.name)
+        measured[item.name] = float(terrain.footprint()["height"])
+        del terrain
+    selected = select_grail_scene_bases(measured)
+    expected_scene_ids = tuple(REQUIRED_SCENE_IDS[:4])
+    if tuple(selected) != expected_scene_ids \
+            or len(set(selected.values())) != 4:
+        raise ValueError("GRAIL scene selection must contain four exact bases")
+    by_name = {item.name: item for item in curb}
+    if not set(selected.values()) <= set(by_name):
+        raise ValueError("GRAIL selected scene source is missing")
+    return measured, selected, by_name
+
+
+def _terrain_for_asset(asset):
+    if asset.release_surface:
+        try:
+            return GrailTerrain.from_release(
+                asset.usd_path, asset.object_path)
+        except ValueError as error:
+            if asset.partition == "slope" and "static" in str(error):
+                raise ValueError(
+                    f"{asset.name}: nonlocked moving slope surface rejected") \
+                    from error
+            raise
+    return GrailTerrain.from_base(asset.name)
+
+
 def _assemble_candidate(args):
-    if args.grail_limit is not None and args.grail_limit < 0:
-        raise ValueError("--grail-limit must be non-negative")
+    if args.source_limit_per_family is not None \
+            and args.source_limit_per_family < 0:
+        raise ValueError("--source-limit-per-family must be non-negative")
     _require_file(args.g1_xml, "G1 XML")
     _require_file(args.takara, "Takara motion")
     _require_file(args.remap, "Takara joint remap")
-    (
-        _all_grail_paths, grail_paths, path_by_base,
-        measured_max_heights, selected_scene_bases,
-    ) = _inspect_grail_corpus(args)
-    if "takara_walk_50hz" in path_by_base:
+    corpus = _inspect_multifamily_corpus(args)
+    if any(item.name == "takara_walk_50hz"
+           for item in corpus.all_sources):
         raise ValueError("duplicate source names: ['takara_walk_50hz']")
+    measured_max_heights, selected_scene_bases, curb_by_name = \
+        _premeasure_curb_corpus(corpus)
 
     kinematics = G1Kinematics(args.g1_xml)
     clips = []
@@ -201,7 +346,9 @@ def _assemble_candidate(args):
     expected_skeleton = None
     range_cursor = 0
 
-    def append_motion_source(source, terrain, expected_name, expected_terrain):
+    def append_motion_source(
+        source, terrain, expected_name, expected_terrain, terrain_family,
+    ):
         nonlocal expected_skeleton, range_cursor
         if source.name != expected_name or source.terrain_id != expected_terrain:
             raise ValueError(
@@ -219,7 +366,8 @@ def _assemble_candidate(args):
                 report["quaternion_norm_max_error"]),
         })
         source_manifest.append(
-            _source_manifest_entry(source, clip, range_cursor))
+            _source_manifest_entry(
+                source, clip, range_cursor, terrain_family))
         range_cursor += len(clip.positions)
         if source.terrain_id in selected_scene_bases.values():
             clips_by_terrain[source.terrain_id] = clip
@@ -227,15 +375,20 @@ def _assemble_candidate(args):
     source = load_takara(args.takara, args.remap)
     terrain = FlatTerrain()
     append_motion_source(
-        source, terrain, "takara_walk_50hz", "flat")
+        source, terrain, "takara_walk_50hz", "flat", "flat")
     del source, terrain
 
-    for path in grail_paths:
-        base = os.path.splitext(os.path.basename(path))[0]
-        source = load_grail(path)
-        _require_loaded_grail_source(source, base)
-        terrain = GrailTerrain.from_base(base)
-        append_motion_source(source, terrain, base, base)
+    selected_total = len(corpus.motion_sources)
+    for index, asset in enumerate(corpus.motion_sources, 1):
+        if index == 1 or index == selected_total or index % 100 == 0:
+            print(
+                f"SOURCE convert {asset.family} {index}/{selected_total} "
+                f"{asset.name}", file=sys.stderr, flush=True)
+        source = load_grail(asset.robot_path)
+        _require_loaded_grail_source(source, asset.name)
+        terrain = _terrain_for_asset(asset)
+        append_motion_source(
+            source, terrain, asset.name, asset.name, asset.family)
         del source, terrain
 
     if expected_skeleton is None:
@@ -252,7 +405,7 @@ def _assemble_candidate(args):
     for base in selected_scene_bases.values():
         if base in clips_by_terrain:
             continue
-        route_source = load_grail(path_by_base[base])
+        route_source = load_grail(curb_by_name[base].robot_path)
         _require_loaded_grail_source(route_source, base)
         route_clip, route_skeleton, _route_report = convert_source_clip(
             route_source, kinematics, OUTPUT_FPS)
@@ -267,18 +420,20 @@ def _assemble_candidate(args):
     del clips_by_terrain
 
     contact_config = ContactConfig()
+    motion_index, terrain_banks = _build_publication_indexes(
+        artifacts, source_manifest, expected_skeleton)
     manifest_base = {
         "schema": SCHEMA,
         "output_fps": OUTPUT_FPS,
-        "feature_dimensions": 31,
-        "terrain_dimensions": 4,
+        "feature_dimensions": 39,
+        "terrain_dimensions": 12,
         "support_dimensions": 3,
         "terrain_feature_distances_m": list(TERRAIN_DISTANCES),
         "total_clips": len(source_manifest),
-        "grail_clips": len(grail_paths),
-        "skipped_clips": 0,
+        "grail_clips": len(corpus.motion_sources),
+        "skipped_clips": len(corpus.skipped_basenames),
         "database_frames": len(artifacts.positions),
-        "diagnostic_mode": args.grail_limit is not None,
+        "diagnostic_mode": corpus.diagnostic,
         "sources": source_manifest,
         "skeleton": {
             "names": list(expected_skeleton.names),
@@ -304,23 +459,30 @@ def _assemble_candidate(args):
                 report["quaternion_norm_max_error"] for report in reports],
         },
     }
-    return artifacts, manifest_base, scene_pack
+    return artifacts, manifest_base, scene_pack, motion_index, terrain_banks
 
 
 def build_artifacts(args: argparse.Namespace) -> dict:
-    artifacts, manifest_base, scene_pack = _assemble_candidate(args)
+    artifacts, manifest_base, scene_pack, motion_index, terrain_banks = \
+        _assemble_candidate(args)
     validate_candidate = _candidate_validation_policy(args)
     return publish_artifacts(
         args.output, artifacts, manifest_base, scene_pack,
-        validate_candidate)
+        motion_index, terrain_banks, validate_candidate)
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Build validated Holden G1 terrain motion artifacts")
     parser.add_argument("--output", default=DEFAULTS["output"])
-    parser.add_argument("--grail-glob", default=DEFAULTS["grail_glob"])
-    parser.add_argument("--grail-limit", type=int)
+    parser.add_argument(
+        "--acquisition-manifest",
+        default=DEFAULTS["acquisition_manifest"])
+    parser.add_argument(
+        "--acquisition-inventory",
+        default=DEFAULTS["acquisition_inventory"])
+    parser.add_argument("--dataset-root", default=DEFAULTS["dataset_root"])
+    parser.add_argument("--source-limit-per-family", type=int)
     parser.add_argument("--g1-xml", default=DEFAULTS["g1_xml"])
     parser.add_argument("--takara", default=DEFAULTS["takara"])
     parser.add_argument("--remap", default=DEFAULTS["remap"])

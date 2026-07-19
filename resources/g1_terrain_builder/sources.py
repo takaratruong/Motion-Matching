@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from collections import Counter
 import os
 import joblib
 import numpy as np
@@ -36,6 +37,179 @@ GRAIL_MOVING_SLOPE_OBJECT_BASENAMES = (
 )
 GRAIL_STATIC_SLOPE_CLIP_COUNT = 1_857
 GRAIL_STATIC_SLOPE_FRAME_COUNT = 464_250
+GRAIL_PARTITION_SOURCE_COUNTS = {
+    "curb": 1_769,
+    "slope": 1_880,
+    "stair_p1": 6_094,
+    "stair_p2": 6_094,
+}
+
+
+@dataclass(frozen=True)
+class GrailSourceAsset:
+    name: str
+    partition: str
+    family: str
+    robot_path: str
+    object_path: str
+    usd_path: str
+    release_surface: bool
+
+
+@dataclass(frozen=True)
+class GrailSourceCorpus:
+    all_sources: tuple[GrailSourceAsset, ...]
+    motion_sources: tuple[GrailSourceAsset, ...]
+    skipped_basenames: tuple[str, ...]
+    diagnostic: bool
+
+
+def _regular_stem_map(directory: str, suffix: str, label: str) -> dict:
+    try:
+        entries = tuple(os.scandir(directory))
+    except FileNotFoundError:
+        raise FileNotFoundError(f"missing GRAIL {label} directory: {directory}") \
+            from None
+    result = {}
+    for entry in entries:
+        if not entry.name.endswith(suffix):
+            continue
+        if not entry.is_file(follow_symlinks=False):
+            raise ValueError(f"GRAIL {label} must be a regular file: {entry.path}")
+        stem = entry.name[:-len(suffix)]
+        if not stem or stem in result:
+            raise ValueError(f"duplicate GRAIL {label} basename: {stem}")
+        result[stem] = os.path.abspath(entry.path)
+    return result
+
+
+def _partition_source_assets(
+    dataset_root: str,
+    partition: str,
+    family: str,
+    object_modality: str,
+) -> tuple[GrailSourceAsset, ...]:
+    root = os.path.join(os.path.abspath(os.fspath(dataset_root)), "data", partition)
+    robot = _regular_stem_map(
+        os.path.join(root, "robot"), ".pkl", f"{partition} robot")
+    objects = _regular_stem_map(
+        os.path.join(root, object_modality), ".pkl",
+        f"{partition} {object_modality}")
+    usd = _regular_stem_map(
+        os.path.join(root, "object_usd"), ".usd", f"{partition} USD")
+    stems = set(robot)
+    if not stems or stems != set(objects) or stems != set(usd):
+        raise ValueError(
+            f"{partition} robot/object/USD basename coverage mismatch")
+    return tuple(
+        GrailSourceAsset(
+            stem,
+            partition,
+            family,
+            robot[stem],
+            objects[stem],
+            usd[stem],
+            object_modality == "objects",
+        )
+        for stem in sorted(stems)
+    )
+
+
+def discover_grail_source_assets(
+    dataset_root: str,
+    source_limit_per_family: int | None = None,
+    *,
+    moving_slope_basenames=GRAIL_MOVING_SLOPE_OBJECT_BASENAMES,
+    expected_partition_counts: dict | None = None,
+) -> GrailSourceCorpus:
+    """Audit exact local pairings, exclude locked moving slopes, then limit.
+
+    The cap is semantic: stair-p1 and stair-p2 together form one ``stair``
+    family.  Pairing and global duplicate audits intentionally happen before
+    exclusion and before cap selection.
+    """
+    if source_limit_per_family is not None and (
+        isinstance(source_limit_per_family, (bool, np.bool_))
+        or not isinstance(source_limit_per_family, (int, np.integer))
+        or source_limit_per_family < 0
+    ):
+        raise ValueError("source limit per family must be a non-negative integer")
+    partitions = (
+        ("curb", "curb", "recon"),
+        ("slope", "slope", "objects"),
+        ("stair_p1", "stair", "objects"),
+        ("stair_p2", "stair", "objects"),
+    )
+    by_partition = {
+        partition: _partition_source_assets(
+            dataset_root, partition, family, object_modality)
+        for partition, family, object_modality in partitions
+    }
+    if expected_partition_counts is not None:
+        if type(expected_partition_counts) is not dict:
+            raise TypeError("expected partition counts must be a dictionary")
+        observed = {
+            partition: len(by_partition[partition])
+            for partition, _family, _modality in partitions
+        }
+        if observed != expected_partition_counts:
+            raise ValueError(
+                f"GRAIL partition source counts changed: {observed}")
+
+    all_paired = tuple(
+        item
+        for partition, _family, _modality in partitions
+        for item in by_partition[partition]
+    )
+    names = [item.name for item in all_paired]
+    if len(names) != len(set(names)):
+        duplicates = sorted(
+            name for name, count in Counter(names).items() if count > 1)
+        raise ValueError(f"duplicate source basename across families: {duplicates}")
+    paths = [
+        path
+        for item in all_paired
+        for path in (item.robot_path, item.object_path, item.usd_path)
+    ]
+    if len(paths) != len(set(paths)):
+        raise ValueError("duplicate source path across families")
+
+    moving = tuple(moving_slope_basenames)
+    if len(moving) != len(set(moving)) or tuple(sorted(moving)) != moving:
+        raise ValueError("moving slope exclusions must be unique and lexical")
+    slope_names = {item.name for item in by_partition["slope"]}
+    missing_exclusions = sorted(set(moving) - slope_names)
+    if missing_exclusions:
+        raise ValueError(
+            f"locked slope exclusion is missing: {missing_exclusions}")
+    moving_set = set(moving)
+    accepted_slope = tuple(
+        item for item in by_partition["slope"]
+        if item.name not in moving_set
+    )
+    accepted = (
+        by_partition["curb"]
+        + accepted_slope
+        + by_partition["stair_p1"]
+        + by_partition["stair_p2"]
+    )
+    if source_limit_per_family is None:
+        selected = accepted
+    else:
+        limit = int(source_limit_per_family)
+        selected = tuple(
+            item for family in ("curb", "slope", "stair")
+            for item in tuple(
+                candidate for candidate in accepted
+                if candidate.family == family
+            )[:limit]
+        )
+    return GrailSourceCorpus(
+        accepted,
+        selected,
+        moving,
+        source_limit_per_family is not None,
+    )
 
 
 @dataclass(frozen=True)

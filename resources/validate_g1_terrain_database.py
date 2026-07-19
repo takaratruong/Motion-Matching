@@ -59,7 +59,7 @@ from resources.g1_terrain_builder.terrain import (
     GrailTerrain,
     HeightGrid,
     build_facing_centerline,
-    sample_terrain_features,
+    sample_terrain_descriptor,
     surface_semantics,
     surface_semantics_signature,
 )
@@ -132,7 +132,11 @@ GRAIL_EXPECTED_CLASSES = {
     "grail-curb-high": 2,
 }
 DEFAULT_SOURCE_OPTIONS = {
-    "grail_glob": "/home/ubuntu/datasets/GRAIL/data/curb/robot/*.pkl",
+    "acquisition_manifest": os.path.join(
+        REPOSITORY_ROOT, "resources", "grail_terrain_inputs.json"),
+    "acquisition_inventory": (
+        "/home/ubuntu/datasets/GRAIL/g1_mm_inventory.json"),
+    "dataset_root": "/home/ubuntu/datasets/GRAIL",
     "g1_xml": (
         "/home/ubuntu/projects/mjx-diffphysics/env/g1/assets/g1_29dof.xml"),
     "takara": (
@@ -310,6 +314,8 @@ def _recompute_clip(
 ):
     clip, skeleton, report = convert_source_clip(
         source, kinematics, OUTPUT_FPS)
+    clip.terrain_features = np.zeros(
+        (len(clip.positions), TERRAIN_DIMENSIONS), np.float32)
     expected_names = tuple(skeleton_names)
     _require(tuple(skeleton.names) == expected_names,
              f"{source.name}: converted skeleton names changed")
@@ -340,8 +346,8 @@ def _recompute_clip(
             np.array([0.0, 0.0, 1.0], np.float64))
         centerline = build_facing_centerline(
             path[0], headings3[:, [0, 2]], path)
-        clip.terrain_features[frame] = sample_terrain_features(
-            terrain, centerline)
+        clip.terrain_features[frame] = sample_terrain_descriptor(
+            terrain, centerline, headings3[0, [0, 2]])
     clip.validate()
     return clip, report
 
@@ -435,6 +441,22 @@ def _require_regular_source_file(path, label):
 def _discover_full_source_corpus(manifest, options):
     raise ValueError(
         "Task 7 must provide multi-family source discovery")
+
+
+def _bounded_source_sample(records):
+    """Return first/middle/last from every acquisition partition."""
+    records = tuple(records)
+    sampled = []
+    for partition in ("curb", "slope", "stair_p1", "stair_p2"):
+        family_records = tuple(
+            record for record in records
+            if record.partition == partition)
+        if not family_records:
+            raise ValueError(
+                f"full-source sample is missing partition {partition}")
+        indices = (0, len(family_records) // 2, len(family_records) - 1)
+        sampled.extend(family_records[index] for index in dict.fromkeys(indices))
+    return tuple(sampled)
 
 
 def _premeasure_grail_surfaces(bases, progress=None):
@@ -990,7 +1012,8 @@ def _validate_manifest_header(manifest):
              "total_clips exceeds the database format bound")
     _require(manifest["database_frames"] <= _UINT32_MAX,
              "database_frames exceeds the sidecar format bound")
-    _require(manifest["skipped_clips"] == 0, "skipped_clips must be zero")
+    _require(manifest["skipped_clips"] in (0, 23),
+             "skipped_clips must be zero or the exact locked value 23")
     _require(manifest["grail_clips"] <= manifest["total_clips"],
              "grail_clips exceeds total_clips")
 

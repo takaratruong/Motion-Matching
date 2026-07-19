@@ -1039,6 +1039,43 @@ class FullSourceSeamTests(unittest.TestCase):
 
 
 class ValidatorTests(unittest.TestCase):
+    def test_manifest_header_accepts_only_zero_or_exact_locked_slope_skips(self):
+        manifest = _load_json(self._path("manifest.json"))
+        for skipped in (0, 23):
+            with self.subTest(skipped=skipped):
+                candidate = copy.deepcopy(manifest)
+                candidate["skipped_clips"] = skipped
+                validator_module._validate_manifest_header(candidate)
+        for skipped in (1, 22, 24):
+            with self.subTest(skipped=skipped), self.assertRaisesRegex(
+                    ValueError, "skipped_clips"):
+                candidate = copy.deepcopy(manifest)
+                candidate["skipped_clips"] = skipped
+                validator_module._validate_manifest_header(candidate)
+
+    def test_bounded_validation_sample_covers_every_acquisition_partition(self):
+        records = []
+        for partition in ("curb", "slope", "stair_p1", "stair_p2"):
+            records.extend(
+                types.SimpleNamespace(partition=partition,
+                                      name=f"{partition}-{index:03d}")
+                for index in range(100)
+            )
+        sampled = validator_module._bounded_source_sample(records)
+        self.assertLessEqual(len(sampled), 12)
+        self.assertEqual(
+            {record.partition for record in sampled},
+            {"curb", "slope", "stair_p1", "stair_p2"},
+        )
+        for partition in ("curb", "slope", "stair_p1", "stair_p2"):
+            names = [record.name for record in sampled
+                     if record.partition == partition]
+            self.assertEqual(
+                names,
+                [f"{partition}-000", f"{partition}-050",
+                 f"{partition}-099"],
+            )
+
     @classmethod
     def setUpClass(cls):
         cls._template_temporary = tempfile.TemporaryDirectory()
