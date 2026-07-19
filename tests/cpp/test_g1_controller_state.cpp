@@ -116,8 +116,12 @@ static void check_source_uses_checked_v2_queries(
     check(source_has_call(source, "heightfield_sample_v2"),
           "active controller source uses checked v2 height queries");
     if (requires_centerline) {
-        check(source_has_call(source, "terrain_centerline_snapshot_compute_v2"),
-              "controller source uses the v2 centerline snapshot");
+        check(source_has_call(source, "terrain_centerline_inputs_are_valid"),
+              "controller validates predicted centerline inputs");
+        check(source_has_call(source, "terrain_descriptor_sample_v2"),
+              "controller uses the checked v2 terrain descriptor");
+        check(source_has_call(source, "terrain_dense_profile_sample_v2"),
+              "controller uses the checked v2 dense terrain profile");
     }
 }
 
@@ -153,7 +157,7 @@ static void test_active_scene_sources_use_checked_v2_queries()
     check_source_uses_checked_v2_queries(state_source, false);
 }
 
-static void test_controller_wires_idle_match_transition_cost()
+static void test_controller_wires_indexed_match_transition_cost()
 {
     const std::string source = read_controller_source();
     const std::size_t prior = source.find(
@@ -177,17 +181,23 @@ static void test_controller_wires_idle_match_transition_cost()
                   std::string::npos,
           "idle policy consumes raw command and planar simulation speeds");
 
-    const std::size_t search = source.find("database_search(", policy);
+    check(!source_has_call(source, "database_search"),
+          "G1 controller never calls legacy global database search");
+    const std::size_t search = source.find("database_search_indexed(", policy);
     check(search != std::string::npos && policy < search,
-          "idle transition cost is computed immediately before search");
+          "idle transition cost is computed before indexed search");
     const std::string search_call = source_call_text(
         source,
-        "database_search",
+        "database_search_indexed",
         policy,
-        "ordinary database search follows idle policy");
-    check(source_call_argument_count(search_call) == 5 &&
-              search_call.find("transition_cost") != std::string::npos,
-          "idle transition cost is the fifth database_search argument");
+        "indexed database search follows idle policy");
+    check(source_call_argument_count(search_call) == 14 &&
+              search_call.find("transition_cost") != std::string::npos &&
+              search_call.find("motion_index") != std::string::npos &&
+              search_call.find(
+                  "G1_MOTION_MATCH_MINIMUM_FUTURE_PUBLISHED_FRAMES") !=
+                  std::string::npos,
+          "indexed search consumes transition cost, index, and horizon");
 }
 
 static void test_controller_validates_ik_geometry_before_window()
@@ -364,19 +374,28 @@ static void test_failed_model_load_reaches_counted_shared_cleanup()
 {
     const std::string source = read_controller_source();
     const std::size_t load =
-        source.find("Model terrain_model = LoadModel");
+        source.find("Model terrain_model = {};");
     const std::size_t camera = source.find("// Camera", load);
     check(load != std::string::npos && camera != std::string::npos,
           "terrain model startup block is present");
     const std::string startup = source.substr(load, camera - load);
+    const std::size_t raylib_load =
+        startup.find("terrain_model = LoadModel");
     const std::size_t allocation =
-        startup.find("const bool terrain_model_allocated");
+        startup.find("bool terrain_model_allocated");
+    const std::size_t allocation_record =
+        startup.find("terrain_model_allocated = model_has_allocation");
     const std::size_t readiness = startup.find("IsModelReady(terrain_model)");
     const std::size_t allocation_guard =
         startup.find("if (terrain_model_allocated)");
-    const std::size_t load_count = startup.find("++model_load_count;");
-    check(allocation != std::string::npos &&
-              readiness != std::string::npos && allocation < readiness,
+    const std::size_t load_count =
+        startup.find("++model_load_count;", allocation_guard);
+    check(raylib_load != std::string::npos &&
+              allocation != std::string::npos &&
+              allocation_record != std::string::npos &&
+              readiness != std::string::npos &&
+              raylib_load < allocation_record &&
+              allocation_record < readiness,
           "model allocation is recorded before readiness validation");
     check(allocation_guard != std::string::npos &&
               load_count != std::string::npos &&
@@ -1193,7 +1212,7 @@ static void test_swap_owns_complete_command_snapshot()
 int main()
 {
     test_active_scene_sources_use_checked_v2_queries();
-    test_controller_wires_idle_match_transition_cost();
+    test_controller_wires_indexed_match_transition_cost();
     test_controller_validates_ik_geometry_before_window();
     test_controller_publishes_independent_travel_and_heading();
     test_failed_model_load_reaches_counted_shared_cleanup();

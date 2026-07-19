@@ -64,18 +64,11 @@ def _percentile(values, percentile):
     return _metric(value)
 
 
-def _source_family(source_terrain):
-    normalized = source_terrain.strip().lower()
-    if normalized == "flat" or normalized.startswith("flat_"):
-        return "flat"
-    if "stair" in normalized:
-        return "stair"
-    if "slope" in normalized or "ramp" in normalized:
-        return "slope"
-    if "curb" in normalized:
-        return "curb"
-    raise ValueError(
-        f"unknown source terrain family {source_terrain!r}")
+def _source_family(source_family):
+    normalized = source_family.strip().lower()
+    if normalized not in SOURCE_FAMILIES:
+        raise ValueError(f"unknown source family {source_family!r}")
+    return normalized
 
 
 def _clearance_metrics(values):
@@ -102,7 +95,7 @@ def summarize_route(rows):
     previous_slip = [0.0, 0.0]
 
     for index, row in enumerate(rows):
-        family_counts[_source_family(row["source_terrain"])] += 1
+        family_counts[_source_family(row["source_family"])] += 1
         selected_costs.append(_number(row, "selected_cost", index))
         rendered_clearances.append(
             _number(row, "rendered_min_clearance", index))

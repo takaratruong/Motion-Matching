@@ -38,22 +38,38 @@ static float float_from_bits(const uint32_t bits)
 
 static void check_query_bits_reject_nonfinite()
 {
-    array1d<float> query(31);
+    CHECK(MOTION_MATCH_QUERY_DIMENSIONS == 39);
+    CHECK(MOTION_MATCH_QUERY_HEX_CHARACTERS == 312);
+    array1d<float> query(39);
     query.zero();
-    char output[31 * 8 + 1] = {};
+    char output[39 * 8 + 1] = {};
 
     query(0) = float_from_bits(UINT32_C(0x7f7fffff));
-    CHECK(motion_match_query_is_finite_31d(query));
+    CHECK(motion_match_query_is_finite_39d(query));
     CHECK(motion_match_query_bits_hex(output, sizeof(output), query));
     CHECK(strncmp(output, "7f7fffff", 8) == 0);
+    CHECK(strlen(output) == 312);
 
     query(0) = float_from_bits(UINT32_C(0x7f800000));
-    CHECK(!motion_match_query_is_finite_31d(query));
+    CHECK(!motion_match_query_is_finite_39d(query));
     CHECK(!motion_match_query_bits_hex(output, sizeof(output), query));
 
     query(0) = float_from_bits(UINT32_C(0x7fc00000));
-    CHECK(!motion_match_query_is_finite_31d(query));
+    CHECK(!motion_match_query_is_finite_39d(query));
     CHECK(!motion_match_query_bits_hex(output, sizeof(output), query));
+
+    array1d<float> short_query(38);
+    short_query.zero();
+    CHECK(!motion_match_query_is_finite_39d(short_query));
+    CHECK(!motion_match_query_bits_hex(
+        output, sizeof(output), short_query));
+    array1d<float> long_query(40);
+    long_query.zero();
+    CHECK(!motion_match_query_is_finite_39d(long_query));
+    char short_output[39 * 8] = {};
+    query.zero();
+    CHECK(!motion_match_query_bits_hex(
+        short_output, sizeof(short_output), query));
 }
 
 int main(int argc, char** argv)
@@ -121,11 +137,12 @@ int main(int argc, char** argv)
     {
         motion_match_log log;
         CHECK(log.open(success_path, error, sizeof(error)));
-        array1d<float> query(31);
+        array1d<float> query(39);
         query.zero();
-        char query_bits_hex[31 * 8 + 1] = {};
+        char query_bits_hex[39 * 8 + 1] = {};
         CHECK(motion_match_query_bits_hex(
             query_bits_hex, sizeof(query_bits_hex), query));
+        CHECK(strlen(query_bits_hex) == 312);
         motion_match_log_row row = make_row(query_bits_hex);
         CHECK(log.write(row, error, sizeof(error)));
         CHECK(log.close(error, sizeof(error)));

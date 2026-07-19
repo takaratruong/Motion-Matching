@@ -41,7 +41,26 @@ SOLE_DIAGNOSTIC_SUFFIX = (
     "sole_min_clearance", "left_stance_slip", "right_stance_slip",
     "left_stance_slip_reset", "right_stance_slip_reset",
 )
-RUNTIME_SUFFIX = PRE_SOLE_RUNTIME_SUFFIX + SOLE_DIAGNOSTIC_SUFFIX
+BANKED_MOTION_SUFFIX = (
+    "terrain4", "terrain5", "terrain6", "terrain7",
+    "terrain8", "terrain9", "terrain10", "terrain11",
+    "terrain_root_point_x", "terrain_root_point_y", "terrain_root_point_z",
+    *(f"terrain_center_point{sample}_{axis}"
+      for sample in range(8) for axis in "xyz"),
+    *(f"terrain_left_point{sample}_{axis}"
+      for sample in range(4) for axis in "xyz"),
+    *(f"terrain_right_point{sample}_{axis}"
+      for sample in range(4) for axis in "xyz"),
+    "requested_family", "active_family", "source_family",
+    "direction_mask", "speed_mask", "elevation_mode",
+    "classifier_confidence", "bank_transition", "bank_transition_reason",
+    "eligible_frame_count", "evaluated_frame_count",
+    "considered_bound_count", "skipped_bound_count",
+    "empty_compatible_set",
+)
+RUNTIME_SUFFIX = (
+    PRE_SOLE_RUNTIME_SUFFIX + SOLE_DIAGNOSTIC_SUFFIX + BANKED_MOTION_SUFFIX
+)
 
 TASK11_SCENE_IDS = (
     "grail-curb-default",
@@ -68,7 +87,7 @@ def row(frame, database_frame, **changes):
         "scene_id": "grail-curb-default",
         "mode": "terrain",
         "route": "curb-forward",
-        "query_bits_hex": "00000000" * 31,
+        "query_bits_hex": "00000000" * 39,
         "query_database_frame": str(database_frame),
         "query_range": "0",
         "selected_database_frame": str(database_frame),
@@ -108,7 +127,8 @@ def row(frame, database_frame, **changes):
     values.update({key: str(value) for key, value in changes.items()})
     if "query_bits_hex" not in changes:
         query_values = [0.0] * 27 + [
-            float(values[f"terrain{sample}"]) for sample in range(4)]
+            float(values[f"terrain{sample}"]) for sample in range(4)] + [
+            0.0 for _ in range(8)]
         values["query_bits_hex"] = "".join(
             struct.pack(">f", value).hex() for value in query_values)
     return values
@@ -168,6 +188,7 @@ def runtime_row(frame, **changes):
         "mode": "route", "route": "fixture-route", "scene_id": "fixture",
     })
     values.update({key: str(value) for key, value in changes.items()})
+    searched = int(values["searched"])
     left_clearances = (0.010, 0.011, 0.012, 0.013)
     right_clearances = (0.020, 0.021, 0.022, 0.023)
     for probe, clearance in enumerate(left_clearances):
@@ -183,14 +204,33 @@ def runtime_row(frame, **changes):
     reset = int(values["scene_frame"]) == 0
     values["left_stance_slip_reset"] = str(int(reset))
     values["right_stance_slip_reset"] = str(int(reset))
-    # Sole-specific overrides intentionally win after deterministic defaults.
+    for sample in range(4, 12):
+        values[f"terrain{sample}"] = "0"
+    for axis in "xyz":
+        values[f"terrain_root_point_{axis}"] = "0"
+    for label, count in (("center", 8), ("left", 4), ("right", 4)):
+        for sample in range(count):
+            for axis in "xyz":
+                values[f"terrain_{label}_point{sample}_{axis}"] = "0"
+    values.update({
+        "requested_family": "flat", "active_family": "flat",
+        "source_family": "flat", "direction_mask": "2",
+        "speed_mask": "2", "elevation_mode": "0",
+        "classifier_confidence": "1", "bank_transition": "0",
+        "bank_transition_reason": "retained_same",
+        "eligible_frame_count": str(searched),
+        "evaluated_frame_count": str(searched),
+        "considered_bound_count": str(searched), "skipped_bound_count": "0",
+        "empty_compatible_set": "0",
+    })
+    # Appended-schema overrides intentionally win after deterministic defaults.
     values.update({
         key: str(value) for key, value in changes.items()
-        if key in SOLE_DIAGNOSTIC_SUFFIX
+        if key in SOLE_DIAGNOSTIC_SUFFIX + BANKED_MOTION_SUFFIX
     })
     if "query_bits_hex" not in changes:
         query_values = [0.0] * 27 + [
-            float(values[f"terrain{sample}"]) for sample in range(4)]
+            float(values[f"terrain{sample}"]) for sample in range(12)]
         values["query_bits_hex"] = "".join(
             struct.pack(">f", value).hex() for value in query_values)
     return {name: values[name] for name in RUNTIME_COLUMNS}
@@ -332,7 +372,7 @@ def set_terrain(values, sample, value):
     values[f"terrain{sample}"] = str(value)
     query_values = [0.0] * 27 + [
         float(values[f"terrain{query_sample}"])
-        for query_sample in range(4)
+        for query_sample in range(12)
     ]
     values["query_bits_hex"] = "".join(
         struct.pack(">f", query_value).hex() for query_value in query_values)
@@ -349,13 +389,133 @@ class RuntimeLogTests(unittest.TestCase):
         expected_prefix = tuple(GATE_A_COLUMNS) + PRE_SOLE_RUNTIME_SUFFIX
         self.assertEqual(tuple(RUNTIME_COLUMNS[:len(expected_prefix)]),
                          expected_prefix)
-        self.assertEqual(tuple(RUNTIME_COLUMNS[len(expected_prefix):]),
-                         SOLE_DIAGNOSTIC_SUFFIX)
+        self.assertEqual(
+            tuple(RUNTIME_COLUMNS[
+                len(expected_prefix):len(expected_prefix) +
+                len(SOLE_DIAGNOSTIC_SUFFIX)]),
+            SOLE_DIAGNOSTIC_SUFFIX)
+
+    def test_banked_motion_columns_append_after_the_entire_old_runtime_schema(self):
+        old_schema = (
+            tuple(GATE_A_COLUMNS) + PRE_SOLE_RUNTIME_SUFFIX +
+            SOLE_DIAGNOSTIC_SUFFIX
+        )
+        self.assertEqual(tuple(RUNTIME_COLUMNS[:len(old_schema)]), old_schema)
+        self.assertEqual(tuple(RUNTIME_COLUMNS[len(old_schema):]),
+                         BANKED_MOTION_SUFFIX)
+
+    def test_banked_runtime_snapshot_has_exactly_39_finite_float32_values(self):
+        changes = {f"terrain{sample}": sample / 32.0
+                   for sample in range(12)}
+        item = runtime_row(0, **changes)
+        self.assertEqual(len(item["query_bits_hex"]), 312)
+        self.assertEqual(item["query_bits_hex"], "".join(
+            struct.pack(">f", value).hex()
+            for value in [0.0] * 27 + [sample / 32.0
+                                       for sample in range(12)]))
+        check_rows([item])
+
+    def test_rejects_nonfinite_complete_descriptor_provenance(self):
+        for field in (
+                "terrain11", "terrain_root_point_y",
+                "terrain_center_point7_z", "terrain_left_point3_x",
+                "terrain_right_point3_y"):
+            item = runtime_row(0)
+            item[field] = "nan"
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, f"non-finite {field}"):
+                    check_rows([item])
+
+    def test_rejects_invalid_banked_motion_domains_and_relationships(self):
+        cases = (
+            ("requested_family", "unknown", "requested_family"),
+            ("active_family", "none", "active_family"),
+            ("source_family", "fixture", "source family"),
+            ("direction_mask", "0", "direction_mask"),
+            ("direction_mask", str(0x002 | 0x008), "direction_mask"),
+            ("speed_mask", "4", "speed_mask"),
+            ("elevation_mode", "2", "elevation_mode"),
+            ("classifier_confidence", "1.01", "classifier_confidence"),
+            ("bank_transition", "2", "bank_transition"),
+            ("bank_transition_reason", "invented", "bank_transition_reason"),
+            ("eligible_frame_count", "-1", "eligible_frame_count"),
+            ("evaluated_frame_count", "2", "evaluated_frame_count"),
+            ("skipped_bound_count", "2", "skipped_bound_count"),
+            ("empty_compatible_set", "2", "empty_compatible_set"),
+        )
+        for field, value, message in cases:
+            item = runtime_row(0)
+            item[field] = value
+            with self.subTest(field=field, value=value):
+                with self.assertRaisesRegex(ValueError, message):
+                    check_rows([item])
+
+        item = runtime_row(0, active_family="slope", source_family="flat")
+        with self.assertRaisesRegex(ValueError, "source_family.*active_family"):
+            check_rows([item])
+
+    def test_explicit_empty_set_allows_checked_repeated_last_pose(self):
+        rows = [runtime_row(0)]
+        rows.append(runtime_row(
+            1,
+            query_database_frame=100,
+            selected_database_frame=100,
+            database_frame=100,
+            searched=1,
+            applied_speed=0,
+            active_family="stair",
+            source_family="flat",
+            requested_family="stair",
+            elevation_mode=1,
+            bank_transition=1,
+            bank_transition_reason="confirmed",
+            eligible_frame_count=0,
+            evaluated_frame_count=0,
+            considered_bound_count=3,
+            skipped_bound_count=3,
+            empty_compatible_set=1,
+        ))
+        rows.append(runtime_row(
+            2,
+            query_database_frame=100,
+            selected_database_frame=100,
+            database_frame=100,
+            searched=1,
+            applied_speed=0,
+            active_family="stair",
+            source_family="flat",
+            requested_family="stair",
+            elevation_mode=1,
+            bank_transition=0,
+            bank_transition_reason="retained_same",
+            eligible_frame_count=0,
+            evaluated_frame_count=0,
+            considered_bound_count=3,
+            skipped_bound_count=3,
+            empty_compatible_set=1,
+        ))
+        check_rows(rows)
+
+        mutations = (
+            ("searched", "0", "must be searched"),
+            ("applied_speed", ".1", "applied_speed"),
+            ("eligible_frame_count", "1", "eligible_frame_count"),
+            ("evaluated_frame_count", "1", "evaluated_frame_count"),
+            ("database_frame", "101", "preserve the last accepted pose"),
+        )
+        for field, value, message in mutations:
+            changed = [dict(item) for item in rows]
+            changed[1][field] = value
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, message):
+                    check_rows(changed)
 
     def test_requires_ordered_physical_sole_clearances_and_consistent_minima(self):
         item = runtime_row(0)
         self.assertEqual(
-            tuple(item)[-len(SOLE_DIAGNOSTIC_SUFFIX):],
+            tuple(item)[
+                -len(BANKED_MOTION_SUFFIX) - len(SOLE_DIAGNOSTIC_SUFFIX):
+                -len(BANKED_MOTION_SUFFIX)],
             SOLE_DIAGNOSTIC_SUFFIX)
         check_rows([item])
 
@@ -1365,21 +1525,21 @@ class RuntimeLogTests(unittest.TestCase):
             )])
 
     def test_rejects_incomplete_query_bit_snapshot(self):
-        with self.assertRaisesRegex(ValueError, "31 float bit patterns"):
-            check_rows([row(0, 10, query_bits_hex="0" * 247)])
+        with self.assertRaisesRegex(ValueError, "39 float bit patterns"):
+            check_rows([row(0, 10, query_bits_hex="0" * 311)])
 
     def test_rejects_nonfinite_query_bit_snapshot(self):
         with self.assertRaisesRegex(ValueError, "non-finite query"):
             check_rows([row(
                 0, 10,
-                query_bits_hex="7f800000" + "00000000" * 30,
+                query_bits_hex="7f800000" + "00000000" * 38,
             )])
 
     def test_rejects_query_terrain_bit_disagreement(self):
         with self.assertRaisesRegex(ValueError, "terrain query bits"):
             check_rows([row(
                 0, 10, terrain0=0.125,
-                query_bits_hex="00000000" * 31,
+                query_bits_hex="00000000" * 39,
             )])
 
     def test_gate_a_classifies_only_blended_pose_penetration(self):

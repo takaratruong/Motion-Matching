@@ -1,4 +1,5 @@
 #include "database.h"
+#include "g1_controller_state.h"
 #include "motion_index_runtime.h"
 
 #include <cfloat>
@@ -81,6 +82,20 @@ static bool row_compatible(
            index.elevation_modes[static_cast<size_t>(frame)] == elevation;
 }
 
+static bool row_publishable(
+    const database& db,
+    const motion_index_runtime& index,
+    int frame,
+    uint16_t direction,
+    uint8_t speed,
+    int elevation)
+{
+    const int published = database_trajectory_index_clamp(db, frame, 1);
+    return published != frame &&
+           row_compatible(index, frame, direction, speed, elevation) &&
+           row_compatible(index, published, direction, speed, elevation);
+}
+
 static int source_range_for_frame(const database& db, int frame)
 {
     for (int range = 0; range < db.nranges(); ++range) {
@@ -107,7 +122,8 @@ static database_indexed_search_result brute_force(
     int incumbent,
     float transition_cost,
     int ignore_range_end,
-    int ignore_surrounding)
+    int ignore_surrounding,
+    int minimum_future_published_frames = 1)
 {
     database_indexed_search_result result = {};
     result.status = DATABASE_INDEXED_SEARCH_EMPTY;
@@ -117,7 +133,8 @@ static database_indexed_search_result brute_force(
     const int incumbent_range = source_range_for_frame(db, incumbent);
     const bool incumbent_compatible =
         incumbent >= 0 && selected_range(ranges, incumbent_range) &&
-        row_compatible(index, incumbent, direction, speed, elevation);
+        row_publishable(
+            db, index, incumbent, direction, speed, elevation);
     if (incumbent_compatible) {
         result.status = DATABASE_INDEXED_SEARCH_FOUND;
         result.index = incumbent;
@@ -131,7 +148,9 @@ static database_indexed_search_result brute_force(
             if (range == incumbent_range && incumbent >= 0 &&
                 std::abs(frame - incumbent) < ignore_surrounding)
                 continue;
-            if (!row_compatible(index, frame, direction, speed, elevation))
+            if (!database_indexed_frame_has_compatible_published_horizon(
+                    db, index, frame, direction, speed, elevation,
+                    minimum_future_published_frames))
                 continue;
             ++result.eligible_frame_count;
             ++result.evaluated_frame_count;
@@ -165,14 +184,63 @@ static database_indexed_search_status search(
     int incumbent = -1,
     float transition_cost = 0.0f,
     int ignore_range_end = 0,
-    int ignore_surrounding = 0)
+    int ignore_surrounding = 0,
+    int minimum_future_published_frames = 1)
 {
     return database_search_indexed(
         result, db, index,
         ranges.empty() ? NULL : ranges.data(),
         static_cast<int>(ranges.size()), direction, speed, elevation,
         query, incumbent, transition_cost,
-        ignore_range_end, ignore_surrounding);
+        ignore_range_end, ignore_surrounding,
+        minimum_future_published_frames);
+}
+
+static void test_candidate_requires_configured_compatible_horizon()
+{
+    database db;
+    motion_index_runtime index;
+    make_database(db, 64, 1);
+    make_index(index, 64);
+    for (int frame = 0; frame < 64; ++frame) {
+        db.features(frame, 0) = 100.0f;
+        index.direction_masks[static_cast<size_t>(frame)] =
+            MOTION_DIRECTION_FORWARD;
+    }
+    for (int frame = 0; frame <= 5; ++frame)
+        index.direction_masks[static_cast<size_t>(frame)] =
+            MOTION_DIRECTION_RIGHT;
+    for (int frame = 16; frame <= 40; ++frame)
+        index.direction_masks[static_cast<size_t>(frame)] =
+            MOTION_DIRECTION_RIGHT;
+    db.features(0, 0) = 0.0f;
+    db.features(16, 0) = 1.0f;
+    finish_fixture(db, index);
+
+    array1d<float> query(39);
+    query.zero();
+    database_indexed_search_result result = {};
+    CHECK(search(result, db, index, {0}, MOTION_DIRECTION_RIGHT,
+                 MOTION_SPEED_MOVING, 0, query, -1, 0.0f, 0, 0, 1) ==
+          DATABASE_INDEXED_SEARCH_FOUND);
+    CHECK(result.index == 0);
+    CHECK(search(result, db, index, {0}, MOTION_DIRECTION_RIGHT,
+                 MOTION_SPEED_MOVING, 0, query, -1, 0.0f, 0, 0, 13) ==
+          DATABASE_INDEXED_SEARCH_FOUND);
+    CHECK(result.index == 16);
+
+    for (int frame = 16; frame <= 40; ++frame)
+        index.direction_masks[static_cast<size_t>(frame)] =
+            MOTION_DIRECTION_FORWARD;
+    finish_fixture(db, index);
+    result.index = 123;
+    result.cost = 456.0f;
+    CHECK(search(result, db, index, {0}, MOTION_DIRECTION_RIGHT,
+                 MOTION_SPEED_MOVING, 0, query, -1, 0.0f, 0, 0, 13) ==
+          DATABASE_INDEXED_SEARCH_EMPTY);
+    CHECK(result.status == DATABASE_INDEXED_SEARCH_EMPTY &&
+          result.index == -1 && result.cost == FLT_MAX &&
+          result.eligible_frame_count == 0);
 }
 
 static void test_family_ties_direction_speed_and_elevation()
@@ -193,6 +261,7 @@ static void test_family_ties_direction_speed_and_elevation()
     index.speed_masks[33] =
         static_cast<uint8_t>(MOTION_SPEED_LOW | MOTION_SPEED_MOVING);
     index.speed_masks[34] = MOTION_SPEED_LOW;
+    index.speed_masks[35] = MOTION_SPEED_LOW;
     finish_fixture(db, index);
 
     array1d<float> query(39);
@@ -235,19 +304,27 @@ static void test_family_ties_direction_speed_and_elevation()
     make_database(sectors_db, 32, 1);
     make_index(sectors_index, 32);
     for (int sector = 0; sector < 8; ++sector) {
-        sectors_index.direction_masks[static_cast<size_t>(sector)] = sectors[sector];
-        sectors_db.features(sector, 0) = static_cast<float>(sector);
+        const int first = sector * 2;
+        sectors_index.direction_masks[static_cast<size_t>(first)] =
+            sectors[sector];
+        sectors_index.direction_masks[static_cast<size_t>(first + 1)] =
+            sectors[sector];
+        sectors_db.features(first, 0) = static_cast<float>(sector);
+        sectors_db.features(first + 1, 0) = static_cast<float>(sector);
     }
-    sectors_index.direction_masks[8] = static_cast<uint16_t>(
+    sectors_index.direction_masks[16] = static_cast<uint16_t>(
         MOTION_DIRECTION_FORWARD | MOTION_DIRECTION_FORWARD_RIGHT);
-    sectors_db.features(8, 0) = 8.0f;
+    sectors_index.direction_masks[17] = static_cast<uint16_t>(
+        MOTION_DIRECTION_FORWARD | MOTION_DIRECTION_FORWARD_RIGHT);
+    sectors_db.features(16, 0) = 8.0f;
+    sectors_db.features(17, 0) = 8.0f;
     finish_fixture(sectors_db, sectors_index);
     for (int sector = 0; sector < 8; ++sector) {
         query(0) = static_cast<float>(sector);
         CHECK(search(result, sectors_db, sectors_index, {0}, sectors[sector],
                      MOTION_SPEED_MOVING, 0, query) ==
               DATABASE_INDEXED_SEARCH_FOUND);
-        CHECK(result.index == sector);
+        CHECK(result.index == sector * 2);
     }
     query(0) = 8.0f;
     CHECK(search(result, sectors_db, sectors_index, {0},
@@ -255,7 +332,7 @@ static void test_family_ties_direction_speed_and_elevation()
                                        MOTION_DIRECTION_FORWARD_RIGHT),
                  MOTION_SPEED_MOVING, 0, query) ==
           DATABASE_INDEXED_SEARCH_FOUND);
-    CHECK(result.index == 8);
+    CHECK(result.index == 16);
 }
 
 static void test_incumbent_transition_clip_and_source_surrounding()
@@ -306,6 +383,37 @@ static void test_incumbent_transition_clip_and_source_surrounding()
                  MOTION_SPEED_MOVING, 0, query, 31, 0.0f, 0, 4) ==
           DATABASE_INDEXED_SEARCH_FOUND);
     CHECK(result.index == 32);
+}
+
+static void test_selection_requires_compatible_published_successor()
+{
+    database db;
+    motion_index_runtime index;
+    make_database(db, 64, 1);
+    make_index(index, 64);
+    for (int frame = 0; frame < 64; ++frame)
+        db.features(frame, 0) = 10.0f;
+    db.features(10, 0) = 0.0f;
+    db.features(20, 0) = 1.0f;
+    index.direction_masks[10] = MOTION_DIRECTION_RIGHT;
+    index.direction_masks[20] = MOTION_DIRECTION_RIGHT;
+    index.direction_masks[21] = MOTION_DIRECTION_RIGHT;
+    finish_fixture(db, index);
+
+    array1d<float> query(39);
+    query.zero();
+    database_indexed_search_result result = {};
+    CHECK(search(result, db, index, {0}, MOTION_DIRECTION_RIGHT,
+                 MOTION_SPEED_MOVING, 0, query) ==
+          DATABASE_INDEXED_SEARCH_FOUND);
+    CHECK(result.index == 20);
+    CHECK(result.eligible_frame_count == 1);
+
+    CHECK(search(result, db, index, {0}, MOTION_DIRECTION_RIGHT,
+                 MOTION_SPEED_MOVING, 0, query, 10) ==
+          DATABASE_INDEXED_SEARCH_FOUND);
+    CHECK(result.index == 20);
+    CHECK(result.evaluated_frame_count == 1);
 }
 
 static bool same_result(
@@ -521,7 +629,9 @@ static void test_four_million_row_eligibility_gate()
         const std::chrono::steady_clock::time_point begin =
             std::chrono::steady_clock::now();
         CHECK(search(result, db, index, ranges, value.direction,
-                     MOTION_SPEED_MOVING, value.elevation, query) ==
+                     MOTION_SPEED_MOVING, value.elevation, query,
+                     -1, 0.0f, 0, 0,
+                     G1_MOTION_MATCH_MINIMUM_FUTURE_PUBLISHED_FRAMES) ==
               DATABASE_INDEXED_SEARCH_FOUND);
         const double milliseconds = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - begin).count();
@@ -536,12 +646,51 @@ static void test_four_million_row_eligibility_gate()
     }
 }
 
+static void test_runtime_candidate_requires_fifteen_percent_improvement()
+{
+    CHECK(!g1_motion_match_candidate_beats_continuation(
+        true, 85.0f, 100.0f));
+    CHECK(g1_motion_match_candidate_beats_continuation(
+        true, std::nextafter(85.0f, 0.0f), 100.0f));
+    CHECK(!g1_motion_match_candidate_beats_continuation(
+        true, 90.0f, 100.0f));
+    CHECK(g1_motion_match_candidate_beats_continuation(
+        true, 84.0f, 100.0f));
+
+    CHECK(g1_motion_match_candidate_beats_continuation(
+        false, 1000.0f, 1.0f));
+    CHECK(!g1_motion_match_candidate_beats_continuation(
+        true, 0.0f, 0.0f));
+    CHECK(g1_motion_match_candidate_beats_continuation(
+        true, FLT_MAX * 0.84f, FLT_MAX));
+    CHECK(!g1_motion_match_candidate_beats_continuation(
+        true, FLT_MAX, FLT_MAX));
+
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float infinity = std::numeric_limits<float>::infinity();
+    CHECK(!g1_motion_match_candidate_beats_continuation(
+        false, nan, 100.0f));
+    CHECK(!g1_motion_match_candidate_beats_continuation(
+        false, infinity, 100.0f));
+    CHECK(!g1_motion_match_candidate_beats_continuation(
+        false, -1.0f, 100.0f));
+    CHECK(!g1_motion_match_candidate_beats_continuation(
+        true, 1.0f, nan));
+    CHECK(!g1_motion_match_candidate_beats_continuation(
+        true, 1.0f, infinity));
+    CHECK(!g1_motion_match_candidate_beats_continuation(
+        true, 1.0f, -1.0f));
+}
+
 int main()
 {
     test_family_ties_direction_speed_and_elevation();
     test_incumbent_transition_clip_and_source_surrounding();
+    test_selection_requires_compatible_published_successor();
+    test_candidate_requires_configured_compatible_horizon();
     test_empty_and_invalid_are_transactional();
     test_aggregate_skips_and_randomized_brute_force_parity();
     test_four_million_row_eligibility_gate();
+    test_runtime_candidate_requires_fifteen_percent_improvement();
     return 0;
 }

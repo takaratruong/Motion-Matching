@@ -2720,6 +2720,9 @@ static inline vec3 terrain_centerline_point_at_arc(
 
     vec3 latest_heading = terrain_centerline_flattened_heading(
         trajectory_rotations.data[0], vec3(0.0f, 0.0f, 1.0f));
+    double latest_travel_x = 0.0;
+    double latest_travel_z = 0.0;
+    bool has_travel_tangent = false;
     double previous_x = static_cast<double>(root.x);
     double previous_z = static_cast<double>(root.z);
     double remaining = static_cast<double>(distance);
@@ -2735,6 +2738,9 @@ static inline vec3 terrain_centerline_point_at_arc(
             delta_x * delta_x + delta_z * delta_z);
 
         if (segment_length > 1e-6) {
+            latest_travel_x = delta_x / segment_length;
+            latest_travel_z = delta_z / segment_length;
+            has_travel_tangent = true;
             if (remaining <= segment_length) {
                 const double alpha = remaining / segment_length;
                 return terrain_centerline_safe_point(
@@ -2753,9 +2759,13 @@ static inline vec3 terrain_centerline_point_at_arc(
 
     const vec3 last_point = terrain_centerline_safe_point(
         previous_x, previous_z, safe_root);
+    const double extension_x = has_travel_tangent
+        ? latest_travel_x : static_cast<double>(latest_heading.x);
+    const double extension_z = has_travel_tangent
+        ? latest_travel_z : static_cast<double>(latest_heading.z);
     return terrain_centerline_safe_point(
-        previous_x + static_cast<double>(latest_heading.x) * remaining,
-        previous_z + static_cast<double>(latest_heading.z) * remaining,
+        previous_x + extension_x * remaining,
+        previous_z + extension_z * remaining,
         last_point);
 }
 

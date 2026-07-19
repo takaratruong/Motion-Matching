@@ -8,11 +8,15 @@
 #include <stdint.h>
 #include <string.h>
 
-static inline bool motion_match_query_is_finite_31d(
+static const int MOTION_MATCH_QUERY_DIMENSIONS = 39;
+static const int MOTION_MATCH_QUERY_HEX_CHARACTERS =
+    MOTION_MATCH_QUERY_DIMENSIONS * 8;
+
+static inline bool motion_match_query_is_finite_39d(
     const slice1d<float> query)
 {
-    if (query.size != 31) return false;
-    for (int i = 0; i < 31; ++i) {
+    if (query.size != MOTION_MATCH_QUERY_DIMENSIONS) return false;
+    for (int i = 0; i < MOTION_MATCH_QUERY_DIMENSIONS; ++i) {
         uint32_t bits = 0;
         memcpy(&bits, &query(i), sizeof(bits));
         if ((bits & UINT32_C(0x7f800000)) == UINT32_C(0x7f800000))
@@ -24,15 +28,15 @@ static inline bool motion_match_query_is_finite_31d(
 static inline bool motion_match_query_bits_hex(
     char* output, int capacity, const slice1d<float> query)
 {
-    if (output == NULL || capacity < 31 * 8 + 1 ||
-        !motion_match_query_is_finite_31d(query))
+    if (output == NULL || capacity < MOTION_MATCH_QUERY_HEX_CHARACTERS + 1 ||
+        !motion_match_query_is_finite_39d(query))
         return false;
-    for (int i = 0; i < 31; ++i) {
+    for (int i = 0; i < MOTION_MATCH_QUERY_DIMENSIONS; ++i) {
         uint32_t bits = 0;
         memcpy(&bits, &query(i), sizeof(bits));
         snprintf(output + i * 8, 9, "%08x", (unsigned)bits);
     }
-    output[31 * 8] = '\0';
+    output[MOTION_MATCH_QUERY_HEX_CHARACTERS] = '\0';
     return true;
 }
 
@@ -66,7 +70,7 @@ struct motion_match_log_row
     float selected_cost = 0.0f;
     float selected_terrain_error = 0.0f;
     float effective_terrain_weight = 0.0f;
-    float terrain[4] = {};
+    float terrain[12] = {};
     vec3 terrain_points[4] = {};
     motion_match_pose_diagnostic raw_selected;
     motion_match_pose_diagnostic inertialized;
@@ -131,6 +135,24 @@ struct motion_match_log_row
     float sole_global_minimum_clearance = 0.0f;
     float stance_slip[2] = {};
     bool stance_slip_reset[2] = {};
+    vec3 terrain_root_point;
+    vec3 terrain_center_points[8] = {};
+    vec3 terrain_left_points[4] = {};
+    vec3 terrain_right_points[4] = {};
+    const char* requested_family = "";
+    const char* active_family = "";
+    const char* source_family = "";
+    uint16_t direction_mask = 0;
+    uint8_t speed_mask = 0;
+    int elevation_mode = 0;
+    double classifier_confidence = 0.0;
+    bool bank_transition = false;
+    const char* bank_transition_reason = "";
+    uint64_t eligible_frame_count = 0;
+    uint64_t evaluated_frame_count = 0;
+    uint64_t considered_bound_count = 0;
+    uint64_t skipped_bound_count = 0;
+    bool empty_compatible_set = false;
 };
 
 struct motion_match_log
@@ -159,7 +181,7 @@ struct motion_match_log
         if (file == NULL) {
             return io_error(error, error_capacity, "open", errno);
         }
-        const bool header_ok = fprintf(file,
+        bool header_ok = fprintf(file,
             "frame,fixed_dt,scene_id,mode,route,query_bits_hex,"
             "query_database_frame,query_range,selected_database_frame,"
             "database_frame,range,source_range,searched,transitioned,"
@@ -200,7 +222,35 @@ struct motion_match_log
             "right_sole_clearance_2,right_sole_clearance_3,"
             "left_sole_min_clearance,right_sole_min_clearance,"
             "sole_min_clearance,left_stance_slip,right_stance_slip,"
-            "left_stance_slip_reset,right_stance_slip_reset\n") >= 0;
+            "left_stance_slip_reset,right_stance_slip_reset") >= 0;
+        for (int sample = 4; header_ok && sample < 12; ++sample)
+            header_ok = fprintf(file, ",terrain%d", sample) >= 0;
+        if (header_ok) header_ok = fprintf(
+            file,
+            ",terrain_root_point_x,terrain_root_point_y,terrain_root_point_z")
+            >= 0;
+        for (int sample = 0; header_ok && sample < 8; ++sample)
+            for (int axis = 0; header_ok && axis < 3; ++axis)
+                header_ok = fprintf(
+                    file, ",terrain_center_point%d_%c",
+                    sample, "xyz"[axis]) >= 0;
+        for (int sample = 0; header_ok && sample < 4; ++sample)
+            for (int axis = 0; header_ok && axis < 3; ++axis)
+                header_ok = fprintf(
+                    file, ",terrain_left_point%d_%c",
+                    sample, "xyz"[axis]) >= 0;
+        for (int sample = 0; header_ok && sample < 4; ++sample)
+            for (int axis = 0; header_ok && axis < 3; ++axis)
+                header_ok = fprintf(
+                    file, ",terrain_right_point%d_%c",
+                    sample, "xyz"[axis]) >= 0;
+        if (header_ok) header_ok = fprintf(
+            file,
+            ",requested_family,active_family,source_family,direction_mask,"
+            "speed_mask,elevation_mode,classifier_confidence,bank_transition,"
+            "bank_transition_reason,eligible_frame_count,"
+            "evaluated_frame_count,considered_bound_count,"
+            "skipped_bound_count,empty_compatible_set\n") >= 0;
         if (!header_ok || fflush(file) != 0) {
             const int saved_errno = errno;
             fclose(file);
@@ -291,7 +341,7 @@ struct motion_match_log
         }
         if (ok) ok = fprintf(
             file,
-            ",%.9g,%.9g,%.9g,%.9g,%.9g,%d,%d\n",
+            ",%.9g,%.9g,%.9g,%.9g,%.9g,%d,%d",
             r.sole_minimum_clearance[0],
             r.sole_minimum_clearance[1],
             r.sole_global_minimum_clearance,
@@ -299,6 +349,48 @@ struct motion_match_log
             r.stance_slip[1],
             (int)r.stance_slip_reset[0],
             (int)r.stance_slip_reset[1]) >= 0;
+        for (int sample = 4; ok && sample < 12; ++sample)
+            ok = fprintf(file, ",%.9g", r.terrain[sample]) >= 0;
+        if (ok) ok = fprintf(
+            file, ",%.9g,%.9g,%.9g",
+            r.terrain_root_point.x,
+            r.terrain_root_point.y,
+            r.terrain_root_point.z) >= 0;
+        for (int sample = 0; ok && sample < 8; ++sample)
+            ok = fprintf(
+                file, ",%.9g,%.9g,%.9g",
+                r.terrain_center_points[sample].x,
+                r.terrain_center_points[sample].y,
+                r.terrain_center_points[sample].z) >= 0;
+        for (int sample = 0; ok && sample < 4; ++sample)
+            ok = fprintf(
+                file, ",%.9g,%.9g,%.9g",
+                r.terrain_left_points[sample].x,
+                r.terrain_left_points[sample].y,
+                r.terrain_left_points[sample].z) >= 0;
+        for (int sample = 0; ok && sample < 4; ++sample)
+            ok = fprintf(
+                file, ",%.9g,%.9g,%.9g",
+                r.terrain_right_points[sample].x,
+                r.terrain_right_points[sample].y,
+                r.terrain_right_points[sample].z) >= 0;
+        if (ok) ok = fprintf(
+            file,
+            ",%s,%s,%s,%u,%u,%d,%.17g,%d,%s,%llu,%llu,%llu,%llu,%d\n",
+            r.requested_family,
+            r.active_family,
+            r.source_family,
+            (unsigned)r.direction_mask,
+            (unsigned)r.speed_mask,
+            r.elevation_mode,
+            r.classifier_confidence,
+            (int)r.bank_transition,
+            r.bank_transition_reason,
+            (unsigned long long)r.eligible_frame_count,
+            (unsigned long long)r.evaluated_frame_count,
+            (unsigned long long)r.considered_bound_count,
+            (unsigned long long)r.skipped_bound_count,
+            (int)r.empty_compatible_set) >= 0;
         if (ok) ok = fflush(file) == 0;
         return ok ? true : io_error(error, error_capacity, "write", errno);
     }

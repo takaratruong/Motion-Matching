@@ -501,11 +501,13 @@ static void test_classifier_rejects_bad_profiles_transactionally()
 }
 
 static motion_bank_classification observation(
-    motion_bank_family family, double confidence)
+    motion_bank_family family, double confidence, int elevation_mode = 2)
 {
     motion_bank_classification value = {};
     value.family = family;
-    value.elevation_mode = family == MOTION_BANK_FAMILY_FLAT ? 0 : 1;
+    value.elevation_mode = elevation_mode == 2
+        ? (family == MOTION_BANK_FAMILY_FLAT ? 0 : 1)
+        : elevation_mode;
     value.confidence = confidence;
     value.step_height_m = family == MOTION_BANK_FAMILY_CURB ||
                           family == MOTION_BANK_FAMILY_STAIR
@@ -520,6 +522,8 @@ static void test_fixed_two_frame_hysteresis()
     motion_bank_state_reset(state);
     check(state.current_family == MOTION_BANK_FAMILY_NONE &&
               state.pending_family == MOTION_BANK_FAMILY_NONE &&
+              state.current_elevation_mode == 0 &&
+              state.pending_elevation_mode == 0 &&
               state.pending_count == 0 && !state.transitioned &&
               state.reason == motion_bank_transition_uninitialized,
           "bank state reset is explicit");
@@ -527,6 +531,7 @@ static void test_fixed_two_frame_hysteresis()
     motion_bank_state_observe(
         state, true, observation(MOTION_BANK_FAMILY_STAIR, 1.0));
     check(state.current_family == MOTION_BANK_FAMILY_STAIR &&
+              state.current_elevation_mode == 1 &&
               state.transitioned &&
               state.reason == motion_bank_transition_initial_confident,
           "initial confident family enters immediately");
@@ -579,6 +584,7 @@ static void test_fixed_two_frame_hysteresis()
     motion_bank_state_observe(
         state, true, observation(MOTION_BANK_FAMILY_FLAT, 1.0));
     check(state.current_family == MOTION_BANK_FAMILY_FLAT &&
+              state.current_elevation_mode == 0 &&
               state.pending_family == MOTION_BANK_FAMILY_NONE &&
               state.pending_count == 0 && state.transitioned &&
               state.reason == motion_bank_transition_confirmed,
@@ -594,6 +600,57 @@ static void test_fixed_two_frame_hysteresis()
               state.reason ==
                   motion_bank_transition_pending_cleared_low_confidence,
           "low-confidence startup does not invent flat");
+}
+
+static void test_family_and_elevation_hysterize_atomically()
+{
+    motion_bank_state state;
+    motion_bank_state_reset(state);
+    motion_bank_state_observe(
+        state, true, observation(MOTION_BANK_FAMILY_FLAT, 1.0, 0));
+    check(state.current_family == MOTION_BANK_FAMILY_FLAT &&
+              state.current_elevation_mode == 0,
+          "confident flat initializes the accepted family/elevation pair");
+
+    motion_bank_state_observe(
+        state, true, observation(MOTION_BANK_FAMILY_SLOPE, 0.0, 1));
+    check(state.current_family == MOTION_BANK_FAMILY_FLAT &&
+              state.current_elevation_mode == 0 &&
+              state.pending_family == MOTION_BANK_FAMILY_NONE &&
+              state.pending_elevation_mode == 0 &&
+              !state.transitioned,
+          "low-confidence slope-up retains accepted flat/level atomically");
+
+    motion_bank_state_observe(
+        state, true, observation(MOTION_BANK_FAMILY_SLOPE, 1.0, 1));
+    check(state.current_family == MOTION_BANK_FAMILY_FLAT &&
+              state.current_elevation_mode == 0 &&
+              state.pending_family == MOTION_BANK_FAMILY_SLOPE &&
+              state.pending_elevation_mode == 1 &&
+              state.pending_count == 1 && !state.transitioned,
+          "first confident slope-up observation only starts the pair pending");
+    motion_bank_state_observe(
+        state, true, observation(MOTION_BANK_FAMILY_SLOPE, 1.0, 1));
+    check(state.current_family == MOTION_BANK_FAMILY_SLOPE &&
+              state.current_elevation_mode == 1 &&
+              state.pending_family == MOTION_BANK_FAMILY_NONE &&
+              state.pending_elevation_mode == 0 &&
+              state.pending_count == 0 && state.transitioned,
+          "second confident observation atomically accepts slope-up");
+
+    motion_bank_state_observe(
+        state, true, observation(MOTION_BANK_FAMILY_SLOPE, 1.0, -1));
+    check(state.current_family == MOTION_BANK_FAMILY_SLOPE &&
+              state.current_elevation_mode == 1 &&
+              state.pending_family == MOTION_BANK_FAMILY_SLOPE &&
+              state.pending_elevation_mode == -1 &&
+              state.pending_count == 1 && !state.transitioned,
+          "same-family elevation reversal is hysterized as a pair change");
+    motion_bank_state_observe(
+        state, true, observation(MOTION_BANK_FAMILY_SLOPE, 1.0, -1));
+    check(state.current_family == MOTION_BANK_FAMILY_SLOPE &&
+              state.current_elevation_mode == -1 && state.transitioned,
+          "same-family elevation reversal commits only after confirmation");
 }
 
 static void test_dense_sampling_and_hot_calls_allocate_nothing()
@@ -657,6 +714,7 @@ int main()
     test_locked_python_classifier_oracles();
     test_classifier_rejects_bad_profiles_transactionally();
     test_fixed_two_frame_hysteresis();
+    test_family_and_elevation_hysterize_atomically();
     test_dense_sampling_and_hot_calls_allocate_nothing();
     printf("motion bank runtime tests passed\n");
     return 0;

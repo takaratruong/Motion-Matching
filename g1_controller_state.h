@@ -123,6 +123,28 @@ static inline float g1_idle_match_transition_cost(
         : 0.0f;
 }
 
+// Preserve the user's authored matcher policy: an alternative pose may
+// replace a compatible continuation only when its complete search cost is at
+// least fifteen percent lower. Incompatible incumbents must remain recoverable.
+static const double G1_MOTION_MATCH_CONTINUATION_COST_RATIO = 0.85;
+static const int G1_MOTION_MATCH_MINIMUM_FUTURE_PUBLISHED_FRAMES = 13;
+
+static inline bool g1_motion_match_candidate_beats_continuation(
+    const bool incumbent_compatible,
+    const float candidate_cost,
+    const float incumbent_cost)
+{
+    if (!terrain_float_is_finite(candidate_cost) || candidate_cost < 0.0f)
+        return false;
+    if (!incumbent_compatible) return true;
+    if (!terrain_float_is_finite(incumbent_cost) || incumbent_cost < 0.0f)
+        return false;
+    const double required_cost =
+        G1_MOTION_MATCH_CONTINUATION_COST_RATIO *
+        static_cast<double>(incumbent_cost);
+    return static_cast<double>(candidate_cost) < required_cost;
+}
+
 static inline void g1_controller_state_seed_first_frame_desired_velocity(
     g1_controller_state& state)
 {

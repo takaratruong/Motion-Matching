@@ -1332,6 +1332,9 @@ static inline bool motion_manifest_validate_database(
         index.elevation_modes.size() != frames)
         return scene_error(error, capacity,
             "motion index row count does not match database frames");
+    if (!database_indexed_storage_is_valid(db, index))
+        return scene_error(error, capacity,
+            "motion index aggregate/range contract does not match database");
     return true;
 }
 

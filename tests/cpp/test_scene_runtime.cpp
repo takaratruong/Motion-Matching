@@ -2278,6 +2278,10 @@ static void test_motion_database_contract()
     db.bone_positions.resize(2, G1_BoneCount);
     db.bone_parents.resize(G1_BoneCount);
     db.features.resize(2, 39);
+    db.features_offset.resize(39);
+    db.features_scale.resize(39);
+    db.features_offset.zero();
+    db.features_scale.set(FLT_MAX);
     db.terrain_features.resize(2, 12);
     db.range_starts.resize(2);
     db.range_stops.resize(2);
@@ -2287,6 +2291,17 @@ static void test_motion_database_contract()
     db.range_starts(1) = 1;
     db.range_stops(1) = 2;
     char error[512] = {};
+    database_build_bounds(db);
+    check(motion_index_build_aggregates(
+              index,
+              db.range_starts.data,
+              db.range_stops.data,
+              static_cast<size_t>(db.nranges()),
+              BOUND_SM_SIZE,
+              BOUND_LR_SIZE,
+              error,
+              sizeof(error)),
+          error);
     check(motion_manifest_validate_database(
         manifest, db, index, error, sizeof(error)), error);
     db.terrain_features.cols = 11;

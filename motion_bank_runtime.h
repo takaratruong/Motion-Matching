@@ -496,7 +496,9 @@ static const int MOTION_BANK_TRANSITION_REQUIRED_FRAMES = 2;
 struct motion_bank_state
 {
     motion_bank_family current_family = MOTION_BANK_FAMILY_NONE;
+    int current_elevation_mode = 0;
     motion_bank_family pending_family = MOTION_BANK_FAMILY_NONE;
+    int pending_elevation_mode = 0;
     int pending_count = 0;
     bool transitioned = false;
     motion_bank_transition_reason reason =
@@ -506,7 +508,9 @@ struct motion_bank_state
 static inline void motion_bank_state_reset(motion_bank_state& state)
 {
     state.current_family = MOTION_BANK_FAMILY_NONE;
+    state.current_elevation_mode = 0;
     state.pending_family = MOTION_BANK_FAMILY_NONE;
+    state.pending_elevation_mode = 0;
     state.pending_count = 0;
     state.transitioned = false;
     state.reason = motion_bank_transition_uninitialized;
@@ -528,6 +532,7 @@ static inline bool motion_bank_observation_is_valid(
 static inline void motion_bank_state_clear_pending(motion_bank_state& state)
 {
     state.pending_family = MOTION_BANK_FAMILY_NONE;
+    state.pending_elevation_mode = 0;
     state.pending_count = 0;
 }
 
@@ -548,6 +553,7 @@ static inline void motion_bank_state_observe(
         if (observation.confidence >=
             MOTION_BANK_TRANSITION_MIN_CONFIDENCE) {
             state.current_family = observation.family;
+            state.current_elevation_mode = observation.elevation_mode;
             state.transitioned = true;
             state.reason = motion_bank_transition_initial_confident;
         } else {
@@ -556,7 +562,8 @@ static inline void motion_bank_state_observe(
         }
         return;
     }
-    if (observation.family == state.current_family) {
+    if (observation.family == state.current_family &&
+        observation.elevation_mode == state.current_elevation_mode) {
         motion_bank_state_clear_pending(state);
         state.reason = motion_bank_transition_retained_same;
         return;
@@ -567,8 +574,10 @@ static inline void motion_bank_state_observe(
             motion_bank_transition_pending_cleared_low_confidence;
         return;
     }
-    if (state.pending_family != observation.family) {
+    if (state.pending_family != observation.family ||
+        state.pending_elevation_mode != observation.elevation_mode) {
         state.pending_family = observation.family;
+        state.pending_elevation_mode = observation.elevation_mode;
         state.pending_count = 1;
         state.reason = motion_bank_transition_pending_started;
         return;
@@ -579,6 +588,7 @@ static inline void motion_bank_state_observe(
         return;
     }
     state.current_family = state.pending_family;
+    state.current_elevation_mode = state.pending_elevation_mode;
     motion_bank_state_clear_pending(state);
     state.transitioned = true;
     state.reason = motion_bank_transition_confirmed;

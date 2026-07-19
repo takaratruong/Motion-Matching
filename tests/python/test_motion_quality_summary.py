@@ -26,6 +26,7 @@ def quality_rows():
     changes = (
         {
             "source_terrain": "flat",
+            "source_family": "flat",
             "source_name": "takara_walk_50hz",
             "selected_cost": "1", "incumbent_cost": "1",
             "rendered_min_clearance": "-0.02",
@@ -41,6 +42,7 @@ def quality_rows():
         },
         {
             "source_terrain": "terrain_curbs__curb_000__000",
+            "source_family": "curb",
             "source_name": "terrain_curbs__curb_000__000",
             "searched": "1", "transitioned": "1",
             "query_database_frame": "100",
@@ -60,6 +62,7 @@ def quality_rows():
         },
         {
             "source_terrain": "curb",
+            "source_family": "curb",
             "source_name": "terrain_curbs__curb_000__001",
             "searched": "1", "transitioned": "0",
             "query_database_frame": "201",
@@ -79,6 +82,7 @@ def quality_rows():
         },
         {
             "source_terrain": "stair",
+            "source_family": "stair",
             "source_name": "stair_p1__fixture",
             "searched": "1", "transitioned": "1",
             "query_database_frame": "202",
@@ -100,6 +104,12 @@ def quality_rows():
     )
     for item, update in zip(rows, changes):
         item.update(update)
+        item["requested_family"] = item["source_family"]
+        item["active_family"] = item["source_family"]
+        if int(item["searched"]):
+            item["eligible_frame_count"] = "1"
+            item["evaluated_frame_count"] = "1"
+            item["considered_bound_count"] = "1"
         # Keep the aggregate minima exact after changing one ordered probe.
         for side in ("left", "right"):
             minimum = float(item[f"{side}_sole_min_clearance"])
@@ -230,7 +240,7 @@ class MotionQualitySummaryTests(unittest.TestCase):
 
     def test_rejects_unknown_source_family_and_nonfinite_input(self):
         cases = (
-            ("source_terrain", "mystery", "unknown source terrain family"),
+            ("source_family", "mystery", "unknown source family"),
             ("sole_min_clearance", "nan", "non-finite"),
             ("ik_enabled", "1", "IK must be disabled"),
         )

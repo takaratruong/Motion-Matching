@@ -31,7 +31,7 @@ GATE_A_COLUMNS = (
     "matching_enabled", "adjustment_enabled", "clamping_enabled",
     "support_retargeting_enabled", "ik_enabled",
 )
-RUNTIME_SUFFIX = (
+PRE_BANKED_RUNTIME_SUFFIX = (
     "source_name", "source_terrain", "source_index", "continuation_cost",
     "source_root_height", "source_left_toe_height", "source_right_toe_height",
     "runtime_support_root_height", "runtime_support_left_toe_height",
@@ -54,6 +54,24 @@ RUNTIME_SUFFIX = (
     "sole_min_clearance", "left_stance_slip", "right_stance_slip",
     "left_stance_slip_reset", "right_stance_slip_reset",
 )
+BANKED_MOTION_SUFFIX = (
+    "terrain4", "terrain5", "terrain6", "terrain7",
+    "terrain8", "terrain9", "terrain10", "terrain11",
+    "terrain_root_point_x", "terrain_root_point_y", "terrain_root_point_z",
+    *(f"terrain_center_point{sample}_{axis}"
+      for sample in range(8) for axis in "xyz"),
+    *(f"terrain_left_point{sample}_{axis}"
+      for sample in range(4) for axis in "xyz"),
+    *(f"terrain_right_point{sample}_{axis}"
+      for sample in range(4) for axis in "xyz"),
+    "requested_family", "active_family", "source_family",
+    "direction_mask", "speed_mask", "elevation_mode",
+    "classifier_confidence", "bank_transition", "bank_transition_reason",
+    "eligible_frame_count", "evaluated_frame_count",
+    "considered_bound_count", "skipped_bound_count",
+    "empty_compatible_set",
+)
+RUNTIME_SUFFIX = PRE_BANKED_RUNTIME_SUFFIX + BANKED_MOTION_SUFFIX
 RUNTIME_COLUMNS = list(GATE_A_COLUMNS) + list(RUNTIME_SUFFIX)
 LOCKED_SCENE_IDS = (
     "grail-curb-default",
@@ -89,6 +107,8 @@ FLAG_COLUMNS = {
 }
 RUNTIME_TEXT_COLUMNS = {
     "source_name", "source_terrain", "support_source", "blocked_reason",
+    "requested_family", "active_family", "source_family",
+    "bank_transition_reason",
 }
 RUNTIME_INTEGER_COLUMNS = {
     "source_index", "airborne_frames", "left_contact", "right_contact",
@@ -97,17 +117,37 @@ RUNTIME_INTEGER_COLUMNS = {
     "scene_switch_failed", "motion_pack_load_count", "model_load_count",
     "model_unload_count", "live_model_count", "left_stance_slip_reset",
     "right_stance_slip_reset",
+    "direction_mask", "speed_mask", "elevation_mode", "bank_transition",
+    "eligible_frame_count", "evaluated_frame_count",
+    "considered_bound_count", "skipped_bound_count",
+    "empty_compatible_set",
 }
 RUNTIME_FLAG_COLUMNS = {
     "left_contact", "right_contact", "blocked", "route_complete",
     "scene_switch_failed", "left_stance_slip_reset",
-    "right_stance_slip_reset",
+    "right_stance_slip_reset", "bank_transition", "empty_compatible_set",
 }
 RUNTIME_NONNEGATIVE_INTEGER_COLUMNS = RUNTIME_INTEGER_COLUMNS - {
     "left_contact", "right_contact", "blocked", "route_complete",
     "scene_switch_failed", "left_stance_slip_reset",
-    "right_stance_slip_reset",
+    "right_stance_slip_reset", "bank_transition", "empty_compatible_set",
+    "elevation_mode",
 }
+
+MOTION_BANK_FAMILIES = {"flat", "curb", "slope", "stair"}
+MOTION_BANK_TRANSITION_REASONS = {
+    "uninitialized", "initial_confident", "retained_same",
+    "pending_started", "pending_advanced", "confirmed",
+    "pending_cleared_invalid", "pending_cleared_low_confidence",
+}
+MOTION_DIRECTION_MASKS = {
+    0x001,
+    0x002, 0x004, 0x008, 0x010, 0x020, 0x040, 0x080, 0x100,
+    0x002 | 0x004, 0x004 | 0x008, 0x008 | 0x010,
+    0x010 | 0x020, 0x020 | 0x040, 0x040 | 0x080,
+    0x080 | 0x100, 0x100 | 0x002,
+}
+MOTION_SPEED_MASKS = {0x01, 0x02, 0x03}
 
 
 def read_rows(path):
@@ -171,14 +211,15 @@ def _float32_ulp_distance(left, right, index):
 def _check_query_snapshot(row, index):
     snapshot = row["query_bits_hex"]
     values = []
-    for dimension in range(31):
+    for dimension in range(39):
         bits = snapshot[dimension * 8:(dimension + 1) * 8]
         value = struct.unpack(">f", bytes.fromhex(bits))[0]
         if not math.isfinite(value):
             raise ValueError(
                 f"row {index}: non-finite query dimension {dimension}")
         values.append(value)
-    for sample in range(4):
+    terrain_count = 12 if "terrain11" in row else 4
+    for sample in range(terrain_count):
         terrain = _float32(row, f"terrain{sample}", index)
         terrain_bits = struct.pack(">f", terrain).hex()
         query_bits = snapshot[(27 + sample) * 8:(28 + sample) * 8]
@@ -275,16 +316,128 @@ def _support_alignment_error(row):
         float(row["runtime_support_root_height"]))
 
 
-def check_substride(rows, minimum_period=13):
-    values = [_integer(row, "database_frame", i) for i, row in enumerate(rows)]
-    for period in range(1, minimum_period):
-        width = 3 * period
-        for start in range(0, len(values) - width + 1):
-            a = values[start:start + period]
-            if a == values[start + period:start + 2 * period] == \
-                    values[start + 2 * period:start + 3 * period]:
+def _check_banked_runtime_row(row, index, searched):
+    for sample in range(4, 12):
+        _float32(row, f"terrain{sample}", index)
+    provenance = [
+        f"terrain_root_point_{axis}" for axis in "xyz"
+    ]
+    provenance.extend(
+        f"terrain_center_point{sample}_{axis}"
+        for sample in range(8) for axis in "xyz")
+    provenance.extend(
+        f"terrain_left_point{sample}_{axis}"
+        for sample in range(4) for axis in "xyz")
+    provenance.extend(
+        f"terrain_right_point{sample}_{axis}"
+        for sample in range(4) for axis in "xyz")
+    for name in provenance:
+        _float32(row, name, index)
+
+    for name in ("requested_family", "active_family", "source_family"):
+        if row[name] not in MOTION_BANK_FAMILIES:
+            if name == "source_family":
                 raise ValueError(
-                    f"row {start}: repeated sub-stride period {period}")
+                    f"row {index}: unknown source family {row[name]!r}")
+            raise ValueError(f"row {index}: invalid {name} {row[name]!r}")
+    direction = _integer(row, "direction_mask", index)
+    speed = _integer(row, "speed_mask", index)
+    elevation = _integer(row, "elevation_mode", index)
+    confidence = _finite(row, "classifier_confidence", index)
+    bank_transition = _integer(row, "bank_transition", index)
+    empty = _integer(row, "empty_compatible_set", index)
+    if direction not in MOTION_DIRECTION_MASKS:
+        raise ValueError(f"row {index}: invalid direction_mask")
+    if speed not in MOTION_SPEED_MASKS:
+        raise ValueError(f"row {index}: invalid speed_mask")
+    if elevation not in (-1, 0, 1):
+        raise ValueError(f"row {index}: invalid elevation_mode")
+    if not 0.0 <= confidence <= 1.0:
+        raise ValueError(
+            f"row {index}: classifier_confidence must be in [0, 1]")
+    if bank_transition not in (0, 1):
+        raise ValueError(f"row {index}: bank_transition must be 0 or 1")
+    if empty not in (0, 1):
+        raise ValueError(f"row {index}: empty_compatible_set must be 0 or 1")
+    reason = row["bank_transition_reason"]
+    if reason not in MOTION_BANK_TRANSITION_REASONS:
+        raise ValueError(f"row {index}: invalid bank_transition_reason")
+    transition_reasons = {"initial_confident", "confirmed"}
+    if bank_transition != int(reason in transition_reasons):
+        raise ValueError(
+            f"row {index}: bank_transition disagrees with "
+            "bank_transition_reason")
+
+    eligible = _integer(row, "eligible_frame_count", index)
+    evaluated = _integer(row, "evaluated_frame_count", index)
+    considered = _integer(row, "considered_bound_count", index)
+    skipped = _integer(row, "skipped_bound_count", index)
+    for name, value in (
+            ("eligible_frame_count", eligible),
+            ("evaluated_frame_count", evaluated),
+            ("considered_bound_count", considered),
+            ("skipped_bound_count", skipped)):
+        if value < 0:
+            raise ValueError(f"row {index}: {name} must be nonnegative")
+    if skipped > considered:
+        raise ValueError(
+            f"row {index}: skipped_bound_count exceeds considered_bound_count")
+    if evaluated > eligible + 1:
+        raise ValueError(
+            f"row {index}: evaluated_frame_count exceeds eligible search set")
+    if not searched:
+        if empty:
+            raise ValueError(
+                f"row {index}: empty compatible set must be searched")
+        if eligible or evaluated or considered or skipped:
+            raise ValueError(
+                f"row {index}: unsearched bank counters must be zero")
+    elif considered <= 0:
+        raise ValueError(
+            f"row {index}: searched bank must consider at least one bound")
+    elif empty:
+        if eligible != 0:
+            raise ValueError(
+                f"row {index}: empty set eligible_frame_count must be zero")
+        if evaluated != 0:
+            raise ValueError(
+                f"row {index}: empty set evaluated_frame_count must be zero")
+    elif evaluated <= 0:
+        raise ValueError(
+            f"row {index}: nonempty searched bank evaluated no frames")
+    if not empty and row["source_family"] != row["active_family"]:
+        raise ValueError(
+            f"row {index}: source_family must equal active_family")
+    return bool(empty)
+
+
+def check_substride(rows, minimum_period=13):
+    segments = []
+    segment = []
+    for index, row in enumerate(rows):
+        empty = (
+            "empty_compatible_set" in row and
+            _integer(row, "empty_compatible_set", index) == 1
+        )
+        if empty:
+            if segment:
+                segments.append(segment)
+                segment = []
+            continue
+        segment.append((index, _integer(row, "database_frame", index)))
+    if segment:
+        segments.append(segment)
+    for segment in segments:
+        values = [value for _, value in segment]
+        for period in range(1, minimum_period):
+            width = 3 * period
+            for start in range(0, len(values) - width + 1):
+                a = values[start:start + period]
+                if a == values[start + period:start + 2 * period] == \
+                        values[start + 2 * period:start + 3 * period]:
+                    raise ValueError(
+                        f"row {segment[start][0]}: repeated sub-stride "
+                        f"period {period}")
 
 
 def check_rows(rows):
@@ -299,6 +452,7 @@ def check_rows(rows):
     previous_contacts = None
     previous_stance_slip = None
     for index, row in enumerate(rows):
+        empty_compatible_set = False
         frame = _integer(row, "frame", index)
         query_frame = _integer(row, "query_database_frame", index)
         query_range = _integer(row, "query_range", index)
@@ -423,11 +577,11 @@ def check_rows(rows):
                 if not row.get(name) and not route_may_be_empty:
                     raise ValueError(f"row {index}: empty {name}")
                 if name == "query_bits_hex" and (
-                        len(row[name]) != 31 * 8 or
+                        len(row[name]) != 39 * 8 or
                         any(character not in "0123456789abcdef"
                             for character in row[name])):
                     raise ValueError(
-                        f"row {index}: query_bits_hex is not 31 float bit patterns")
+                        f"row {index}: query_bits_hex is not 39 float bit patterns")
             elif name in INTEGER_COLUMNS:
                 _integer(row, name, index)
             else:
@@ -454,6 +608,20 @@ def check_rows(rows):
             for name in RUNTIME_NONNEGATIVE_INTEGER_COLUMNS:
                 if _integer(row, name, index) < 0:
                     raise ValueError(f"row {index}: {name} must be nonnegative")
+            empty_compatible_set = _check_banked_runtime_row(
+                row, index, bool(searched))
+            if empty_compatible_set:
+                if transitioned:
+                    raise ValueError(
+                        f"row {index}: empty compatible set cannot transition pose")
+                if selected_frame != query_frame or current != query_frame:
+                    raise ValueError(
+                        f"row {index}: empty compatible set must preserve the "
+                        "last accepted pose")
+                if _float32(row, "applied_speed", index) != 0.0:
+                    raise ValueError(
+                        f"row {index}: empty compatible set applied_speed "
+                        "must be zero")
             if _integer(row, "walkability_class", index) not in (0, 1, 2):
                 raise ValueError(
                     f"row {index}: walkability_class must be 0, 1, or 2")
@@ -524,7 +692,8 @@ def check_rows(rows):
                     f"row {index}: global sole minimum disagrees with feet")
         _check_query_snapshot(row, index)
         if (previous is not None and not generation_changed and
-                not transitioned and current != previous + 1):
+                not transitioned and not empty_compatible_set and
+                current != previous + 1):
             raise ValueError(
                 f"row {index}: nonsequential advance {previous}->{current}")
         if (previous_range is not None and not generation_changed and

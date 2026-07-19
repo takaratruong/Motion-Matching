@@ -1155,6 +1155,46 @@ static inline bool database_indexed_range_is_selected(
     return low < range_count && ranges[low] == sought;
 }
 
+static inline bool database_indexed_frame_has_compatible_published_horizon(
+    const database& db,
+    const motion_index_runtime& index,
+    int frame,
+    uint16_t direction_mask,
+    uint8_t speed_mask,
+    int elevation_mode,
+    int minimum_future_published_frames)
+{
+    if (minimum_future_published_frames < 1)
+        return false;
+    const int range = database_range_index_for_frame(db, frame);
+    if (range < 0 ||
+        minimum_future_published_frames >
+            db.range_stops(range) - 1 - frame)
+        return false;
+    for (int offset = 0;
+         offset <= minimum_future_published_frames;
+         ++offset)
+    {
+        if (!motion_index_row_is_compatible(
+                index, static_cast<size_t>(frame + offset), direction_mask,
+                speed_mask, elevation_mode))
+            return false;
+    }
+    return true;
+}
+
+static inline bool database_indexed_frame_is_publishable(
+    const database& db,
+    const motion_index_runtime& index,
+    int frame,
+    uint16_t direction_mask,
+    uint8_t speed_mask,
+    int elevation_mode)
+{
+    return database_indexed_frame_has_compatible_published_horizon(
+        db, index, frame, direction_mask, speed_mask, elevation_mode, 1);
+}
+
 static inline int database_indexed_search_range_end(
     const database& db, int range, int ignore_range_end)
 {
@@ -1180,7 +1220,8 @@ static inline void database_indexed_count_eligible(
     int incumbent_frame,
     int incumbent_range,
     int ignore_range_end,
-    int ignore_surrounding)
+    int ignore_surrounding,
+    int minimum_future_published_frames)
 {
     for (int selected = 0; selected < range_count; ++selected)
     {
@@ -1242,9 +1283,11 @@ static inline void database_indexed_count_eligible(
                     const bool surrounding =
                         incumbent_frame >= 0 && range == incumbent_range &&
                         abs(frame - incumbent_frame) < ignore_surrounding;
-                    if (!surrounding && motion_index_row_is_compatible(
-                            index, static_cast<size_t>(frame), direction_mask,
-                            speed_mask, elevation_mode))
+                    if (!surrounding &&
+                        database_indexed_frame_has_compatible_published_horizon(
+                            db, index, frame, direction_mask,
+                            speed_mask, elevation_mode,
+                            minimum_future_published_frames))
                         ++result.eligible_frame_count;
                     ++frame;
                 }
@@ -1266,7 +1309,8 @@ static inline database_indexed_search_status database_search_indexed(
     int incumbent_frame,
     float transition_cost = 0.0f,
     int ignore_range_end = 20,
-    int ignore_surrounding = 20)
+    int ignore_surrounding = 20,
+    int minimum_future_published_frames = 1)
 {
     if (!database_indexed_storage_is_valid(db, index) ||
         !database_indexed_selected_ranges_are_valid(
@@ -1277,7 +1321,8 @@ static inline database_indexed_search_status database_search_indexed(
         !database_indexed_query_is_valid(db, query) ||
         incumbent_frame < -1 || incumbent_frame >= db.nframes() ||
         !feature_weight_is_valid(transition_cost) ||
-        ignore_range_end < 0 || ignore_surrounding < 0)
+        ignore_range_end < 0 || ignore_surrounding < 0 ||
+        minimum_future_published_frames < 1)
         return DATABASE_INDEXED_SEARCH_INVALID;
 
     array1d<float> query_normalized;
@@ -1294,8 +1339,8 @@ static inline database_indexed_search_status database_search_indexed(
         incumbent_frame >= 0 && incumbent_range >= 0 &&
         database_indexed_range_is_selected(
             compatible_range_indices, compatible_range_count, incumbent_range) &&
-        motion_index_row_is_compatible(
-            index, static_cast<size_t>(incumbent_frame), direction_mask,
+        database_indexed_frame_is_publishable(
+            db, index, incumbent_frame, direction_mask,
             speed_mask, elevation_mode);
     if (incumbent_compatible)
     {
@@ -1310,7 +1355,8 @@ static inline database_indexed_search_status database_search_indexed(
     database_indexed_count_eligible(
         candidate, db, index, compatible_range_indices,
         compatible_range_count, direction_mask, speed_mask, elevation_mode,
-        incumbent_frame, incumbent_range, ignore_range_end, ignore_surrounding);
+        incumbent_frame, incumbent_range, ignore_range_end, ignore_surrounding,
+        minimum_future_published_frames);
     if (candidate.eligible_frame_count == 0)
     {
         output = candidate;
@@ -1406,9 +1452,11 @@ static inline database_indexed_search_status database_search_indexed(
                     const bool surrounding =
                         incumbent_frame >= 0 && range == incumbent_range &&
                         abs(frame - incumbent_frame) < ignore_surrounding;
-                    if (surrounding || !motion_index_row_is_compatible(
-                            index, static_cast<size_t>(frame), direction_mask,
-                            speed_mask, elevation_mode))
+                    if (surrounding ||
+                        !database_indexed_frame_has_compatible_published_horizon(
+                            db, index, frame, direction_mask,
+                            speed_mask, elevation_mode,
+                            minimum_future_published_frames))
                     {
                         ++frame;
                         continue;

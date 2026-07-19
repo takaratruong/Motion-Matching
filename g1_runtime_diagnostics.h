@@ -4,10 +4,13 @@
 #include "g1_sole_diagnostics.h"
 #include "route_runtime.h"
 
+#include <cstring>
+
 struct g1_runtime_diagnostic_snapshot
 {
     const char* source_name = "";
     const char* source_terrain = "";
+    const char* source_family = "";
     int source_index = 0;
     float continuation_cost = 0.0f;
     float source_root_height = 0.0f;
@@ -54,6 +57,15 @@ struct g1_runtime_diagnostic_snapshot
     float stance_slip[2] = {};
     bool stance_slip_reset[2] = {};
 };
+
+static inline bool g1_runtime_source_family_is_valid(const char* family)
+{
+    return family != NULL &&
+           (std::strcmp(family, "flat") == 0 ||
+            std::strcmp(family, "curb") == 0 ||
+            std::strcmp(family, "slope") == 0 ||
+            std::strcmp(family, "stair") == 0);
+}
 
 static inline bool g1_runtime_sole_snapshot_is_valid(
     const G1SoleDiagnosticSnapshot& sole,
@@ -159,6 +171,7 @@ static inline bool g1_runtime_snapshot_is_valid(
     return snapshot.source_name != NULL && snapshot.source_name[0] != '\0' &&
            snapshot.source_terrain != NULL &&
            snapshot.source_terrain[0] != '\0' &&
+           g1_runtime_source_family_is_valid(snapshot.source_family) &&
            snapshot.support_source != NULL &&
            snapshot.support_source[0] != '\0' &&
            snapshot.blocked_reason != NULL &&
@@ -201,10 +214,11 @@ static inline bool g1_runtime_diagnostics_build(
     }
     const motion_source_record& source =
         manifest.sources[static_cast<size_t>(source_index)];
-    if (source.name.empty() || source.terrain_id.empty()) {
+    if (source.name.empty() || source.terrain_id.empty() ||
+        !g1_runtime_source_family_is_valid(source.terrain_family.c_str())) {
         return scene_error(
             error, capacity,
-            "runtime diagnostics: motion source %d has empty metadata",
+            "runtime diagnostics: motion source %d has invalid metadata",
             source_index);
     }
     if (state.global_bone_positions.data == NULL ||
@@ -249,6 +263,7 @@ static inline bool g1_runtime_diagnostics_build(
     g1_runtime_diagnostic_snapshot candidate;
     candidate.source_name = source.name.c_str();
     candidate.source_terrain = source.terrain_id.c_str();
+    candidate.source_family = source.terrain_family.c_str();
     candidate.source_index = source_index;
     candidate.continuation_cost = state.incumbent_cost;
     candidate.source_root_height =

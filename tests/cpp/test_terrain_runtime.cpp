@@ -3357,7 +3357,7 @@ static void test_v2_centerline_uses_checked_triangular_height_samples()
     }
 }
 
-static void test_centerline_uses_root_skips_flat_repeats_and_latest_heading()
+static void test_centerline_uses_root_skips_flat_repeats_and_travel_tangent()
 {
     const vec3 root(1.0f, 7.0f, 1.0f);
     array1d<vec3> positions(5);
@@ -3389,8 +3389,8 @@ static void test_centerline_uses_root_skips_flat_repeats_and_latest_heading()
 
     rotations(4) = quat();
     point = terrain_centerline_point_at_arc(root, positions, rotations, 0.75f);
-    check_close(point.x, 1.5f, "latest heading extension x");
-    check_close(point.z, 1.25f, "latest heading extension z");
+    check_close(point.x, 1.75f, "travel tangent extension x");
+    check_close(point.z, 1.0f, "travel tangent extension z");
 
     positions(1) = root;
     positions(2) = root;
@@ -3402,6 +3402,40 @@ static void test_centerline_uses_root_skips_flat_repeats_and_latest_heading()
     point = terrain_centerline_point_at_arc(root, positions, rotations, 1.0f);
     check_close(point.x, 1.0f, "all-degenerate heading fallback x");
     check_close(point.z, 2.0f, "all-degenerate heading fallback +Z");
+}
+
+static void test_centerline_independent_heading_never_folds_travel()
+{
+    const vec3 root(0.0f, 0.0f, 0.0f);
+    array1d<vec3> positions(3);
+    array1d<quat> rotations(3);
+    rotations.set(quat());
+
+    positions(0) = root;
+    positions(1) = vec3(0.0f, 0.0f, -0.2f);
+    positions(2) = vec3(0.0f, 0.0f, -0.4f);
+    vec3 point = terrain_centerline_point_at_arc(
+        root, positions, rotations, 1.0f);
+    check_close(point.x, 0.0f,
+                "backward travel ignores fixed forward heading x");
+    check_close(point.z, -1.0f,
+                "backward travel ignores fixed forward heading z");
+
+    positions(1) = vec3(0.2f, 0.0f, 0.0f);
+    positions(2) = vec3(0.4f, 0.0f, 0.0f);
+    point = terrain_centerline_point_at_arc(
+        root, positions, rotations, 1.0f);
+    check_close(point.x, 1.0f,
+                "lateral travel ignores independent heading x");
+    check_close(point.z, 0.0f,
+                "lateral travel ignores independent heading z");
+
+    positions.set(root);
+    rotations.set(heading_positive_x());
+    point = terrain_centerline_point_at_arc(
+        root, positions, rotations, 1.0f);
+    check_close(point.x, 1.0f, "stopped centerline falls back to heading x");
+    check_close(point.z, 0.0f, "stopped centerline falls back to heading z");
 }
 
 static void test_centerline_query_uses_heightfield_exterior_at_boundary()
@@ -3723,7 +3757,8 @@ int main(int argc, char** argv)
     test_centerline_walkability_separates_query_and_footprint_roots();
     test_centerline_walkability_latches_out_of_bounds_segment();
     test_v2_centerline_uses_checked_triangular_height_samples();
-    test_centerline_uses_root_skips_flat_repeats_and_latest_heading();
+    test_centerline_uses_root_skips_flat_repeats_and_travel_tangent();
+    test_centerline_independent_heading_never_folds_travel();
     test_centerline_query_uses_heightfield_exterior_at_boundary();
     test_centerline_invalid_shapes_are_release_safe();
     test_centerline_nonfinite_inputs_are_release_safe_under_fast_math();

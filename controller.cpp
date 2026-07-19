@@ -42,10 +42,12 @@
 
 #include "character.h"
 #include "scene_runtime.h"
+#include "motion_bank_runtime.h"
 #include "route_runtime.h"
 #include "support_runtime.h"
 #include "g1_controller_state.h"
 #include "g1_ik.h"
+#include "g1_ik_runtime.h"
 #include "g1_runtime_diagnostics.h"
 #include "scene_switch.h"
 #include "motion_match_log.h"
@@ -426,7 +428,7 @@ static bool g1_feature_value_is_safe(const float value)
 static bool g1_matching_features_validate(
     const database& db, char* error, const int error_capacity)
 {
-    const int expected_features = 31;
+    const int expected_features = DATABASE_G1_MATCHING_FEATURES;
     if (db.features.rows != db.nframes() ||
         db.features.cols != expected_features || db.features.data == NULL ||
         db.features_offset.size != expected_features ||
@@ -522,6 +524,124 @@ static bool g1_matching_features_validate(
             return g1_error(
                 error, error_capacity, "G1 large matching bounds are inverted");
         }
+    }
+    return true;
+}
+
+static bool g1_predicted_motion_request_masks(
+    uint16_t& direction_mask,
+    uint8_t& speed_mask,
+    const slice1d<vec3> predicted_positions,
+    const slice1d<quat> predicted_headings,
+    char* error,
+    const int error_capacity)
+{
+    if (predicted_positions.size < 2 ||
+        predicted_positions.size != predicted_headings.size ||
+        predicted_positions.data == NULL || predicted_headings.data == NULL)
+    {
+        return g1_error(
+            error, error_capacity,
+            "predicted motion request requires aligned trajectory samples");
+    }
+
+    const int horizon = predicted_positions.size - 1;
+    const vec3 start = predicted_positions(0);
+    const vec3 stop = predicted_positions(horizon);
+    if (!terrain_float_is_finite(start.x) ||
+        !terrain_float_is_finite(start.z) ||
+        !terrain_float_is_finite(stop.x) ||
+        !terrain_float_is_finite(stop.z))
+    {
+        return g1_error(
+            error, error_capacity,
+            "predicted motion request contains a non-finite position");
+    }
+
+    const double dx = static_cast<double>(stop.x) -
+        static_cast<double>(start.x);
+    const double dz = static_cast<double>(stop.z) -
+        static_cast<double>(start.z);
+    const double distance = hypot(dx, dz);
+    if (!terrain_double_is_finite(distance))
+    {
+        return g1_error(
+            error, error_capacity,
+            "predicted motion request displacement is non-finite");
+    }
+
+    const vec3 start_heading = terrain_centerline_flattened_heading(
+        predicted_headings(0), vec3(0.0f, 0.0f, 1.0f));
+    const vec3 horizon_heading = terrain_centerline_flattened_heading(
+        predicted_headings(horizon), start_heading);
+    const double heading = atan2(
+        static_cast<double>(start_heading.x),
+        static_cast<double>(start_heading.z));
+    const double future_heading = atan2(
+        static_cast<double>(horizon_heading.x),
+        static_cast<double>(horizon_heading.z));
+    if (!terrain_double_is_finite(heading) ||
+        !terrain_double_is_finite(future_heading))
+    {
+        return g1_error(
+            error, error_capacity,
+            "predicted motion request heading is non-finite");
+    }
+
+    static const double pi = 3.14159265358979323846264338327950288;
+    static const double moving_minimum_m = 0.08;
+    static const double low_speed_maximum_m = 0.12;
+    static const double sector_half_width = 27.5 * pi / 180.0;
+    static const double sector_tolerance = 8.0e-15;
+    static const double lateral_heading_limit = 15.0 * pi / 180.0;
+    static const uint16_t moving_bits[8] = {
+        MOTION_DIRECTION_FORWARD,
+        MOTION_DIRECTION_FORWARD_RIGHT,
+        MOTION_DIRECTION_RIGHT,
+        MOTION_DIRECTION_BACK_RIGHT,
+        MOTION_DIRECTION_BACKWARD,
+        MOTION_DIRECTION_BACK_LEFT,
+        MOTION_DIRECTION_LEFT,
+        MOTION_DIRECTION_FORWARD_LEFT,
+    };
+
+    direction_mask = MOTION_DIRECTION_IDLE;
+    if (distance >= moving_minimum_m)
+    {
+        const double sine = sin(heading);
+        const double cosine = cos(heading);
+        const double local_right = dx * cosine - dz * sine;
+        const double local_forward = dx * sine + dz * cosine;
+        const double travel_angle = atan2(local_right, local_forward);
+        direction_mask = 0;
+        for (int sector = 0; sector < 8; ++sector)
+        {
+            const double center = static_cast<double>(sector) * pi / 4.0;
+            const double angular_distance = fabs(
+                remainder(travel_angle - center, 2.0 * pi));
+            if (angular_distance <= sector_half_width + sector_tolerance)
+                direction_mask |= moving_bits[sector];
+        }
+
+        const double heading_change = fabs(
+            remainder(future_heading - heading, 2.0 * pi));
+        if (heading_change > lateral_heading_limit)
+        {
+            direction_mask &= static_cast<uint16_t>(
+                MOTION_DIRECTION_FORWARD | MOTION_DIRECTION_BACKWARD);
+        }
+        if (direction_mask == 0) direction_mask = MOTION_DIRECTION_IDLE;
+    }
+
+    speed_mask = 0;
+    if (distance <= low_speed_maximum_m) speed_mask |= MOTION_SPEED_LOW;
+    if (distance >= moving_minimum_m) speed_mask |= MOTION_SPEED_MOVING;
+    if (!motion_index_direction_is_valid(direction_mask) ||
+        !motion_index_speed_is_valid(speed_mask))
+    {
+        return g1_error(
+            error, error_capacity,
+            "predicted motion request produced invalid masks");
     }
     return true;
 }
@@ -838,20 +958,11 @@ quat desired_rotation_update(
         return quat_from_angle_axis(atan2f(desired_direction.x, desired_direction.z), vec3(0, 1, 0));            
     }
     
-    // If strafe is not active the desired direction comes from the left 
-    // stick as long as that stick is being used
-    else if (length(gamepadstick_left) > 0.01f)
-    {
-        
-        vec3 desired_direction = normalize(desired_velocity);
-        return quat_from_angle_axis(atan2f(desired_direction.x, desired_direction.z), vec3(0, 1, 0));
-    }
-    
-    // Otherwise desired direction remains the same
-    else
-    {
-        return desired_rotation_curr;
-    }
+    // Travel never rewrites heading. Without an explicit right-stick heading
+    // command, preserve the independently commanded orientation.
+    (void)gamepadstick_left;
+    (void)desired_velocity;
+    return desired_rotation_curr;
 }
 
 //--------------------------------------
@@ -1661,7 +1772,7 @@ int main(void)
     float feature_weight_hip_velocity = 1.0f;
     float feature_weight_trajectory_positions = 1.0f;
     float feature_weight_trajectory_directions = 1.5f;
-    float parsed_terrain_weight = 0.0f;
+    float parsed_terrain_weight = 4.0f;
     g1_test_config test_config;
     G1TestHeadingOverride test_heading;
     if (!g1_parse_terrain_weight(
@@ -1739,6 +1850,7 @@ int main(void)
     std::string database_path;
     std::string feature_path;
     std::string support_path;
+    std::string motion_index_path;
     if (!scene_join(
             database_path,
             terrain_directory,
@@ -1755,6 +1867,12 @@ int main(void)
             support_path,
             terrain_directory,
             motion_manifest.terrain_support.path,
+            artifact_error,
+            static_cast<int>(sizeof(artifact_error))) ||
+        !scene_join(
+            motion_index_path,
+            terrain_directory,
+            motion_manifest.motion_index.path,
             artifact_error,
             static_cast<int>(sizeof(artifact_error))))
     {
@@ -1782,12 +1900,12 @@ int main(void)
         return 2;
     }
     if (terrain_rows.values.rows != db.nframes() ||
-        terrain_rows.values.cols != 4)
+        terrain_rows.values.cols != DATABASE_G1_TERRAIN_FEATURES)
     {
         fprintf(
             stderr,
             "G1 database/G1TF shape error: database=%d terrain=%dx%d "
-            "expected_columns=4\n",
+            "expected_columns=12\n",
             db.nframes(),
             terrain_rows.values.rows,
             terrain_rows.values.cols);
@@ -1824,9 +1942,26 @@ int main(void)
         return 2;
     }
 
+    motion_index_runtime motion_index;
+    if (!motion_index_load(
+            motion_index,
+            motion_index_path.c_str(),
+            db.range_starts.data,
+            db.range_stops.data,
+            static_cast<size_t>(db.nranges()),
+            BOUND_SM_SIZE,
+            BOUND_LR_SIZE,
+            artifact_error,
+            static_cast<int>(sizeof(artifact_error))))
+    {
+        fprintf(stderr, "G1 motion index error: %s\n", artifact_error);
+        return 2;
+    }
+
     if (!motion_manifest_validate_database(
             motion_manifest,
             db,
+            motion_index,
             artifact_error,
             static_cast<int>(sizeof(artifact_error))))
     {
@@ -1942,6 +2077,9 @@ int main(void)
         current.route_frames = 0;
     };
     configure_route_cursor(state);
+    motion_bank_state bank_state;
+    motion_bank_state_reset(bank_state);
+    bool coverage_safe_stop_latched = false;
 
     if (test_config.mode == G1_TestSequential) {
         const int sequential_frames =
@@ -1955,19 +2093,26 @@ int main(void)
         }
     }
 
-    // Open the graphics window only after every artifact and feature gate has
-    // passed, so startup errors stay useful on headless systems.
-    SetConfigFlags(FLAG_VSYNC_HINT | FLAG_MSAA_4X_HINT);
-    InitWindow(
-        screen_width,
-        screen_height,
-        "G1 terrain motion matching - Holden runtime");
-    if (!IsWindowReady())
+    // Bounded deterministic runs exercise the complete controller and log
+    // contract without paying for X11 or render-model startup. Live mode keeps
+    // the classic visualizer unchanged.
+    const bool rendering_enabled = test_config.mode == G1_TestLive;
+    if (rendering_enabled)
     {
-        fprintf(stderr, "G1 terrain visualizer could not open a window\n");
-        return 2;
+        // Open the graphics window only after every artifact and feature gate
+        // has passed, so startup errors stay useful on headless systems.
+        SetConfigFlags(FLAG_VSYNC_HINT | FLAG_MSAA_4X_HINT);
+        InitWindow(
+            screen_width,
+            screen_height,
+            "G1 terrain motion matching - Holden runtime");
+        if (!IsWindowReady())
+        {
+            fprintf(stderr, "G1 terrain visualizer could not open a window\n");
+            return 2;
+        }
+        SetTargetFPS(25);
     }
-    SetTargetFPS(25);
 
     int scene_generation = 0;
     int scene_reset_count = 1;
@@ -1978,29 +2123,41 @@ int main(void)
     bool controller_exit_requested = false;
     int controller_exit_code = 0;
 
-    Model terrain_model = LoadModel(active_scene.mesh_path.c_str());
+    Model terrain_model = {};
     auto model_has_allocation = [](const Model& model)
     {
         return model.meshes != NULL || model.materials != NULL ||
                model.meshMaterial != NULL || model.bones != NULL ||
                model.bindPose != NULL;
     };
-    const bool terrain_model_allocated = model_has_allocation(terrain_model);
-    if (terrain_model_allocated) ++model_load_count;
-    if (!IsModelReady(terrain_model) || terrain_model.meshCount <= 0)
+    bool terrain_model_allocated = false;
+    if (!rendering_enabled)
     {
-        fprintf(
-            stderr,
-            "G1 terrain mesh failed to load: %s\n",
-            active_scene.mesh_path.c_str());
-        controller_exit_code = 2;
-        controller_exit_requested = true;
+        // Preserve the existing one-live-scene ownership diagnostics while
+        // representing the omitted render model with a zero-allocation token.
+        ++model_load_count;
+    }
+    else
+    {
+        terrain_model = LoadModel(active_scene.mesh_path.c_str());
+        terrain_model_allocated = model_has_allocation(terrain_model);
+        if (terrain_model_allocated) ++model_load_count;
+        if (!IsModelReady(terrain_model) || terrain_model.meshCount <= 0)
+        {
+            fprintf(
+                stderr,
+                "G1 terrain mesh failed to load: %s\n",
+                active_scene.mesh_path.c_str());
+            controller_exit_code = 2;
+            controller_exit_requested = true;
+        }
     }
 
     G1MeshRenderer g1_mesh_renderer = {};
     bool show_g1_mesh = true;
     bool show_g1_bones = true;
-    if (!controller_exit_requested && !::g1_mesh_renderer_load(
+    if (rendering_enabled && !controller_exit_requested &&
+        !::g1_mesh_renderer_load(
             g1_mesh_renderer,
             "resources/g1_mesh/g1_raylib.glb",
             artifact_error,
@@ -2010,7 +2167,7 @@ int main(void)
         controller_exit_code = 2;
         controller_exit_requested = true;
     }
-    if (!controller_exit_requested)
+    if (rendering_enabled && !controller_exit_requested)
     {
         std::fprintf(
             stdout,
@@ -2033,6 +2190,12 @@ int main(void)
     auto model_loader = [&](Model& model, const char* path,
                             char* error, int capacity)
     {
+        if (!rendering_enabled)
+        {
+            model = Model{};
+            ++model_load_count;
+            return scene_model_load_result{false, true};
+        }
         model = LoadModel(path);
         const bool allocated = model_has_allocation(model);
         if (allocated) ++model_load_count;
@@ -2045,6 +2208,12 @@ int main(void)
     };
     auto model_unloader = [&](Model& model)
     {
+        if (!rendering_enabled)
+        {
+            model = Model{};
+            ++model_unload_count;
+            return;
+        }
         if (model_has_allocation(model))
         {
             UnloadModel(model);
@@ -2208,8 +2377,10 @@ int main(void)
 
     auto update_func = [&]()
     {
-        if (::IsKeyPressed(KEY_M)) show_g1_mesh = !show_g1_mesh;
-        if (::IsKeyPressed(KEY_B)) show_g1_bones = !show_g1_bones;
+        if (rendering_enabled && ::IsKeyPressed(KEY_M))
+            show_g1_mesh = !show_g1_mesh;
+        if (rendering_enabled && ::IsKeyPressed(KEY_B))
+            show_g1_bones = !show_g1_bones;
 
         if (pending_reset)
         {
@@ -2228,6 +2399,8 @@ int main(void)
                 ++scene_generation;
                 ++scene_reset_count;
                 configure_route_cursor(state);
+                motion_bank_state_reset(bank_state);
+                coverage_safe_stop_latched = false;
             }
             pending_reset = false;
             if (controller_exit_requested) return;
@@ -2261,6 +2434,8 @@ int main(void)
             else
             {
                 configure_route_cursor(state);
+                motion_bank_state_reset(bank_state);
+                coverage_safe_stop_latched = false;
                 ++scene_generation;
                 ++scene_reset_count;
             }
@@ -2309,15 +2484,16 @@ int main(void)
         route_sample.waypoint = state.route_waypoint;
 
         // Get gamepad stick states
-        vec3 gamepadstick_left = gamepad_get_stick(GAMEPAD_STICK_LEFT);
-        vec3 gamepadstick_right = gamepad_get_stick(GAMEPAD_STICK_RIGHT);
-        if (test_config.mode != G1_TestLive) {
-            gamepadstick_left = vec3(0.0f, 0.0f, 0.9f);
-            gamepadstick_right = vec3();
-        }
+        vec3 gamepadstick_left = rendering_enabled
+            ? gamepad_get_stick(GAMEPAD_STICK_LEFT)
+            : vec3(0.0f, 0.0f, 0.9f);
+        vec3 gamepadstick_right = rendering_enabled
+            ? gamepad_get_stick(GAMEPAD_STICK_RIGHT)
+            : vec3();
 
         // Get if strafe is desired
-        bool desired_strafe = desired_strafe_update();
+        bool desired_strafe = rendering_enabled
+            ? desired_strafe_update() : false;
 #ifdef MM_DISCRETE
         desired_strafe = g_force_strafe;
 #endif
@@ -2630,49 +2806,134 @@ int main(void)
                 "terrain centerline inputs are invalid");
             return;
         }
-        terrain_centerline_snapshot terrain_query_snapshot = {};
-        terrain_centerline_snapshot_compute_v2(
-            terrain_query_snapshot,
-            active_scene.terrain,
-            state.bone_positions(0),
-            state.trajectory_positions,
-            state.trajectory_rotations);
-        if (!terrain_centerline_snapshot_apply_walkability_v2(
-                terrain_query_snapshot,
+        vec3 terrain_centerline_points[
+            G1CommandTrajectorySampleCount + 1] = {};
+        int terrain_centerline_count = 1;
+        terrain_centerline_points[0] = vec3(
+            state.bone_positions(0).x, 0.0f,
+            state.bone_positions(0).z);
+        double terrain_centerline_length = 0.0;
+        vec3 terrain_centerline_previous = terrain_centerline_points[0];
+        for (int point = 1;
+             point < state.trajectory_positions.size;
+             ++point)
+        {
+            const vec3 predicted = state.trajectory_positions(point);
+            const double delta_x = static_cast<double>(predicted.x) -
+                static_cast<double>(terrain_centerline_previous.x);
+            const double delta_z = static_cast<double>(predicted.z) -
+                static_cast<double>(terrain_centerline_previous.z);
+            const double segment_length = hypot(delta_x, delta_z);
+            if (segment_length <= 1e-6) continue;
+            terrain_centerline_points[terrain_centerline_count++] = vec3(
+                predicted.x, 0.0f, predicted.z);
+            terrain_centerline_previous = predicted;
+            terrain_centerline_length += segment_length;
+        }
+        if (terrain_centerline_length < TERRAIN_PROFILE_HORIZON_M)
+        {
+            terrain_centerline_points[terrain_centerline_count++] =
+                terrain_centerline_point_at_arc(
+                    state.bone_positions(0),
+                    state.trajectory_positions,
+                    state.trajectory_rotations,
+                    1.125f);
+        }
+        const slice1d<vec3> terrain_centerline(
+            terrain_centerline_count, terrain_centerline_points);
+        const vec3 independent_heading =
+            terrain_centerline_flattened_heading(
+                state.trajectory_desired_rotations(
+                    state.trajectory_desired_rotations.size - 1),
+                terrain_centerline_flattened_heading(
+                    state.desired_rotation, vec3(0.0f, 0.0f, 1.0f)));
+
+        terrain_profile_status terrain_profile_result = terrain_profile_ok;
+        terrain_descriptor_v2 terrain_descriptor = {};
+        terrain_dense_profile_v2 terrain_dense_profile = {};
+        if (!terrain_descriptor_sample_v2(
+                terrain_descriptor,
+                terrain_profile_result,
                 active_scene.terrain,
-                active_scene.walkability,
-                state.bone_positions(0),
-                state.simulation_position,
-                0.20f)) {
-            controlled_runtime_error(
-                "terrain centerline walkability mask is invalid");
+                terrain_centerline,
+                independent_heading) ||
+            !terrain_dense_profile_sample_v2(
+                terrain_dense_profile,
+                terrain_profile_result,
+                active_scene.terrain,
+                terrain_centerline))
+        {
+            snprintf(
+                artifact_error,
+                sizeof(artifact_error),
+                "terrain descriptor/profile sampling failed: %s",
+                terrain_profile_status_name(terrain_profile_result));
+            controlled_runtime_error(artifact_error);
             return;
         }
-        for (int terrain_feature = 0; terrain_feature < 4; ++terrain_feature) {
-            const vec3 point = terrain_query_snapshot.points[terrain_feature];
-            if (!terrain_float_is_finite(
-                    terrain_query_snapshot.values[terrain_feature]) ||
-                !terrain_float_is_finite(point.x) ||
-                !terrain_float_is_finite(point.y) ||
-                !terrain_float_is_finite(point.z)) {
-                snprintf(
-                    artifact_error,
-                    sizeof(artifact_error),
-                    "terrain query snapshot %d is invalid",
-                    terrain_feature);
-                controlled_runtime_error(artifact_error);
-                return;
-            }
-        }
-        for (int terrain_feature = 0; terrain_feature < 4; ++terrain_feature)
+
+        motion_bank_classification bank_classification = {};
+        motion_bank_classification_status bank_classification_result =
+            motion_bank_classification_ok;
+        if (!motion_bank_classify_profile(
+                bank_classification,
+                bank_classification_result,
+                terrain_dense_profile.distances_m,
+                terrain_dense_profile.heights_m,
+                terrain_dense_profile.normals,
+                TERRAIN_DENSE_PROFILE_SAMPLE_COUNT))
         {
-            query(offset++) = terrain_query_snapshot.values[terrain_feature];
+            snprintf(
+                artifact_error,
+                sizeof(artifact_error),
+                "terrain bank classification failed: %s",
+                motion_bank_classification_status_name(
+                    bank_classification_result));
+            controlled_runtime_error(artifact_error);
+            return;
+        }
+        motion_bank_state_observe(
+            bank_state, true, bank_classification);
+        if (bank_state.transitioned) force_search = true;
+
+        const motion_family_bank* active_motion_bank =
+            motion_bank_for_family(
+                motion_manifest,
+                motion_bank_family_name(bank_state.current_family));
+        if (active_motion_bank == NULL ||
+            active_motion_bank->range_indices.empty())
+        {
+            controlled_runtime_error(
+                "terrain classifier did not resolve a nonempty motion bank");
+            return;
+        }
+
+        uint16_t direction_mask = MOTION_DIRECTION_IDLE;
+        uint8_t speed_mask = MOTION_SPEED_LOW;
+        const int elevation_mode = bank_state.current_elevation_mode;
+        if (!g1_predicted_motion_request_masks(
+                direction_mask,
+                speed_mask,
+                state.trajectory_positions,
+                state.trajectory_desired_rotations,
+                artifact_error,
+                static_cast<int>(sizeof(artifact_error))))
+        {
+            controlled_runtime_error(artifact_error);
+            return;
+        }
+
+        for (int terrain_feature = 0;
+             terrain_feature < TERRAIN_DESCRIPTOR_VALUE_COUNT;
+             ++terrain_feature)
+        {
+            query(offset++) = terrain_descriptor.values[terrain_feature];
         }
 
         assert(offset == db.nfeatures());
-        if (!motion_match_query_is_finite_31d(query)) {
+        if (!motion_match_query_is_finite_39d(query)) {
             controlled_runtime_error(
-                "expected exactly 31 finite query values");
+                "expected exactly 39 finite query values");
             return;
         }
 
@@ -2690,17 +2951,36 @@ int main(void)
             return;
         }
         const bool matching_enabled = test_config.mode != G1_TestSequential;
+        const int incumbent_range = g1_active_range(db, state.frame_index);
+        const bool incumbent_compatible =
+            incumbent_range >= 0 &&
+            database_indexed_range_is_selected(
+                active_motion_bank->range_indices.data(),
+                static_cast<int>(active_motion_bank->range_indices.size()),
+                incumbent_range) &&
+            database_indexed_frame_is_publishable(
+                db,
+                motion_index,
+                state.frame_index,
+                direction_mask,
+                speed_mask,
+                elevation_mode);
+        force_search = force_search || coverage_safe_stop_latched ||
+            !incumbent_compatible;
         state.searched = matching_enabled &&
             (force_search || state.search_timer <= 0.0f || end_of_anim);
         state.incumbent_cost = 0.0f;
         state.selected_cost = 0.0f;
         state.selected_terrain_error = 0.0f;
-        state.incumbent_cost = end_of_anim
+        state.incumbent_cost = end_of_anim || !incumbent_compatible
             ? FLT_MAX : database_frame_cost(db, state.frame_index, query);
         state.selected_cost = state.incumbent_cost;
         state.selected_terrain_error = database_raw_terrain_error(
             db, state.frame_index, query);
         int selected_database_frame = query_database_frame;
+        database_indexed_search_result indexed_search_result;
+        bool empty_compatible_set = false;
+        bool skip_frame_advance = false;
         
         // Do we need to search?
 #ifdef MM_DISCRETE
@@ -2713,106 +2993,102 @@ int main(void)
 #endif
         if (state.searched)
         {
-            if (lmm_enabled)
-            {
-                // Project query onto nearest feature vector
-                
-                float best_cost = FLT_MAX;
-                bool transition = false;
-                
-                projector_evaluate(
-                    transition,
-                    best_cost,
-                    features_proj,
-                    latent_proj,
-                    projector_evaluation,
+            const int prior_index = state.frame_index;
+            const float transition_cost =
+                g1_idle_match_transition_cost(
+                    traversal.commanded_speed,
+                    walkability_xz_length(state.simulation_velocity));
+            const database_indexed_search_status search_status =
+                database_search_indexed(
+                    indexed_search_result,
+                    db,
+                    motion_index,
+                    active_motion_bank->range_indices.data(),
+                    static_cast<int>(
+                        active_motion_bank->range_indices.size()),
+                    direction_mask,
+                    speed_mask,
+                    elevation_mode,
                     query,
-                    db.features_offset,
-                    db.features_scale,
-                    features_curr,
-                    projector);
-                
-                // If projection is sufficiently different from current
-                if (transition)
-                {   
-                    // Evaluate pose for projected features
-                    decompressor_evaluate(
-                        state.trns_bone_positions,
-                        state.trns_bone_velocities,
-                        state.trns_bone_rotations,
-                        state.trns_bone_angular_velocities,
-                        state.trns_bone_contacts,
-                        decompressor_evaluation,
-                        features_proj,
-                        latent_proj,
-                        state.curr_bone_positions(0),
-                        state.curr_bone_rotations(0),
-                        decompressor,
-                        dt);
-                    
-                    // Transition inertializer to this pose
-                    inertialize_pose_transition(
-                        state.bone_offset_positions,
-                        state.bone_offset_velocities,
-                        state.bone_offset_rotations,
-                        state.bone_offset_angular_velocities,
-                        state.transition_src_position,
-                        state.transition_src_rotation,
-                        state.transition_dst_position,
-                        state.transition_dst_rotation,
-                        state.bone_positions(0),
-                        state.bone_velocities(0),
-                        state.bone_rotations(0),
-                        state.bone_angular_velocities(0),
-                        state.curr_bone_positions,
-                        state.curr_bone_velocities,
-                        state.curr_bone_rotations,
-                        state.curr_bone_angular_velocities,
-                        state.trns_bone_positions,
-                        state.trns_bone_velocities,
-                        state.trns_bone_rotations,
-                        state.trns_bone_angular_velocities);
-                    
-                    // Update current features and latents
-                    features_curr = features_proj;
-                    latent_curr = latent_proj;
+                    prior_index,
+                    transition_cost,
+                    20,
+                    20,
+                    G1_MOTION_MATCH_MINIMUM_FUTURE_PUBLISHED_FRAMES);
+            if (search_status == DATABASE_INDEXED_SEARCH_INVALID)
+            {
+                controlled_runtime_error(
+                    "indexed motion-bank search rejected runtime inputs");
+                return;
+            }
+            if (search_status == DATABASE_INDEXED_SEARCH_EMPTY)
+            {
+                empty_compatible_set = true;
+                coverage_safe_stop_latched = true;
+                G1IkSafeStopHandoff safe_stop_handoff;
+                if (!g1_ik_safe_stop_handoff(
+                        safe_stop_handoff,
+                        coverage_safe_stop_latched,
+                        state.desired_velocity,
+                        artifact_error,
+                        static_cast<int>(sizeof(artifact_error))) ||
+                    !safe_stop_handoff.cancel_planar_inertia ||
+                    !safe_stop_handoff.force_search)
+                {
+                    controlled_runtime_error(
+                        artifact_error[0] != '\0'
+                            ? artifact_error
+                            : "coverage safe-stop handoff was not latched");
+                    return;
                 }
+                const vec3 applied_velocity = vec3(
+                    safe_stop_handoff.applied_velocity.x,
+                    safe_stop_handoff.applied_velocity.y,
+                    safe_stop_handoff.applied_velocity.z);
+                state.desired_velocity = applied_velocity;
+                state.command.applied_velocity = applied_velocity;
+                traversal.applied_speed = 0.0f;
+                state.simulation_velocity.x = 0.0f;
+                state.simulation_velocity.z = 0.0f;
+                state.simulation_acceleration.x = 0.0f;
+                state.simulation_acceleration.z = 0.0f;
+                force_search = true;
+                state.search_timer = 0.0f;
+                skip_frame_advance = true;
+#ifdef MM_DISCRETE
+                dbg_best_index = -1;
+#endif
             }
             else
             {
-                // Search
-                
-                const int prior_index = state.frame_index;
-                int best_index = end_of_anim ? -1 : prior_index;
-                float best_cost = FLT_MAX;
-                const float transition_cost =
-                    g1_idle_match_transition_cost(
-                        traversal.commanded_speed,
-                        walkability_xz_length(state.simulation_velocity));
-                
-                database_search(
-                    best_index,
-                    best_cost,
-                    db,
-                    query,
-                    transition_cost);
+                coverage_safe_stop_latched = false;
+                const int best_index = indexed_search_result.index;
+                state.selected_cost = indexed_search_result.cost;
+                state.selected_terrain_error = database_raw_terrain_error(
+                    db, best_index, query);
+                const bool accept_alternative =
+                    best_index == prior_index ||
+                    g1_motion_match_candidate_beats_continuation(
+                        incumbent_compatible,
+                        indexed_search_result.cost,
+                        state.incumbent_cost);
                 selected_database_frame = best_index;
-                if (best_index != prior_index) {
-                    state.selected_cost = best_cost;
+                if (!accept_alternative)
+                {
+                    selected_database_frame = prior_index;
+                    state.selected_cost = state.incumbent_cost;
                     state.selected_terrain_error = database_raw_terrain_error(
-                        db, best_index, query);
+                        db, prior_index, query);
                 }
-                
-                // Transition if better frame found
-                
-                if (best_index != prior_index)
+                else if (best_index != prior_index)
                 {
                     state.transitioned = true;
                     state.trns_bone_positions = db.bone_positions(best_index);
                     state.trns_bone_velocities = db.bone_velocities(best_index);
                     state.trns_bone_rotations = db.bone_rotations(best_index);
-                    state.trns_bone_angular_velocities = db.bone_angular_velocities(best_index);
-                    
+                    state.trns_bone_angular_velocities =
+                        db.bone_angular_velocities(best_index);
+
                     inertialize_pose_transition(
                         state.bone_offset_positions,
                         state.bone_offset_velocities,
@@ -2834,7 +3110,7 @@ int main(void)
                         state.trns_bone_velocities,
                         state.trns_bone_rotations,
                         state.trns_bone_angular_velocities);
-                    
+
                     state.frame_index = best_index;
 #ifdef MM_DISCRETE
                     dbg_did_transition = true;
@@ -2842,44 +3118,16 @@ int main(void)
 #endif
                 }
 #ifdef MM_DISCRETE
-                dbg_best_index = best_index;
+                dbg_best_index = selected_database_frame;
 #endif
+                state.search_timer = state.search_time;
             }
-
-            // Reset search timer
-            state.search_timer = state.search_time;
         }
         
         // Tick down search timer
-        state.search_timer -= dt;
-
-        if (lmm_enabled)
+        if (!skip_frame_advance)
         {
-            // Update features and latents
-            stepper_evaluate(
-                features_curr,
-                latent_curr,
-                stepper_evaluation,
-                stepper,
-                dt);
-            
-            // Decompress next pose
-            decompressor_evaluate(
-                state.curr_bone_positions,
-                state.curr_bone_velocities,
-                state.curr_bone_rotations,
-                state.curr_bone_angular_velocities,
-                state.curr_bone_contacts,
-                decompressor_evaluation,
-                features_curr,
-                latent_curr,
-                state.curr_bone_positions(0),
-                state.curr_bone_rotations(0),
-                decompressor,
-                dt);
-        }
-        else
-        {
+            state.search_timer -= dt;
             // Tick frame
             state.frame_index = database_trajectory_index_clamp(
                 db, state.frame_index, 1);
@@ -2890,29 +3138,29 @@ int main(void)
             state.curr_bone_rotations = db.bone_rotations(state.frame_index);
             state.curr_bone_angular_velocities = db.bone_angular_velocities(state.frame_index);
             state.curr_bone_contacts = db.contact_states(state.frame_index);
+
+            // Publish the next inertialized pose only after a compatible frame
+            // has been accepted.
+            inertialize_pose_update(
+                state.bone_positions,
+                state.bone_velocities,
+                state.bone_rotations,
+                state.bone_angular_velocities,
+                state.bone_offset_positions,
+                state.bone_offset_velocities,
+                state.bone_offset_rotations,
+                state.bone_offset_angular_velocities,
+                state.curr_bone_positions,
+                state.curr_bone_velocities,
+                state.curr_bone_rotations,
+                state.curr_bone_angular_velocities,
+                state.transition_src_position,
+                state.transition_src_rotation,
+                state.transition_dst_position,
+                state.transition_dst_rotation,
+                inertialize_blending_halflife,
+                dt);
         }
-        
-        // Update inertializer
-        
-        inertialize_pose_update(
-            state.bone_positions,
-            state.bone_velocities,
-            state.bone_rotations,
-            state.bone_angular_velocities,
-            state.bone_offset_positions,
-            state.bone_offset_velocities,
-            state.bone_offset_rotations,
-            state.bone_offset_angular_velocities,
-            state.curr_bone_positions,
-            state.curr_bone_velocities,
-            state.curr_bone_rotations,
-            state.curr_bone_angular_velocities,
-            state.transition_src_position,
-            state.transition_src_rotation,
-            state.transition_dst_position,
-            state.transition_dst_rotation,
-            inertialize_blending_halflife,
-            dt);
 
         motion_match_pose_diagnostic raw_selected_diagnostic;
         motion_match_pose_diagnostic inertialized_diagnostic;
@@ -3037,7 +3285,7 @@ int main(void)
         
         // Synchronization 
         
-        if (synchronization_enabled)
+        if (synchronization_enabled && !skip_frame_advance)
         {
             vec3 synchronized_position = lerp(
                 state.simulation_position,
@@ -3066,7 +3314,8 @@ int main(void)
         
         // Adjustment 
         
-        if (!synchronization_enabled && adjustment_enabled)
+        if (!skip_frame_advance &&
+            !synchronization_enabled && adjustment_enabled)
         {
             const vec3 before_adjustment =
                 state.bone_positions(G1_Simulation);
@@ -3125,7 +3374,8 @@ int main(void)
         
         // Clamping
         
-        if (!synchronization_enabled && clamping_enabled)
+        if (!skip_frame_advance &&
+            !synchronization_enabled && clamping_enabled)
         {
             const vec3 before_clamp = state.bone_positions(G1_Simulation);
             vec3 adjusted_position = horizontal_clamp_character_position(
@@ -3241,10 +3491,10 @@ int main(void)
             controlled_runtime_error(artifact_error);
             return;
         }
-        char query_bits_hex[31 * 8 + 1] = {};
+        char query_bits_hex[39 * 8 + 1] = {};
         if (!motion_match_query_bits_hex(
                 query_bits_hex, sizeof(query_bits_hex), query)) {
-            controlled_runtime_error("cannot serialize the finite 31D query");
+            controlled_runtime_error("cannot serialize the finite 39D query");
             return;
         }
         motion_match_log_row log_row;
@@ -3267,9 +3517,11 @@ int main(void)
         log_row.selected_terrain_error = state.selected_terrain_error;
         log_row.effective_terrain_weight =
                 effective_terrain_weight;
+        for (int i = 0; i < TERRAIN_DESCRIPTOR_VALUE_COUNT; ++i) {
+            log_row.terrain[i] = terrain_descriptor.values[i];
+        }
         for (int i = 0; i < 4; ++i) {
-            log_row.terrain[i] = terrain_query_snapshot.values[i];
-            log_row.terrain_points[i] = terrain_query_snapshot.points[i];
+            log_row.terrain_points[i] = terrain_descriptor.center_points[i];
         }
         log_row.raw_selected = raw_selected_diagnostic;
         log_row.inertialized = inertialized_diagnostic;
@@ -3362,6 +3614,44 @@ int main(void)
         }
         log_row.sole_global_minimum_clearance =
             snapshot_candidate.sole_global_minimum_clearance;
+        log_row.terrain_root_point = terrain_descriptor.root_point;
+        for (int sample = 0;
+             sample < TERRAIN_DESCRIPTOR_CENTER_SAMPLE_COUNT;
+             ++sample)
+        {
+            log_row.terrain_center_points[sample] =
+                terrain_descriptor.center_points[sample];
+        }
+        for (int sample = 0;
+             sample < TERRAIN_DESCRIPTOR_CORRIDOR_SAMPLE_COUNT;
+             ++sample)
+        {
+            log_row.terrain_left_points[sample] =
+                terrain_descriptor.left_points[sample];
+            log_row.terrain_right_points[sample] =
+                terrain_descriptor.right_points[sample];
+        }
+        log_row.requested_family = motion_bank_family_name(
+            bank_classification.family);
+        log_row.active_family = motion_bank_family_name(
+            bank_state.current_family);
+        log_row.source_family = snapshot_candidate.source_family;
+        log_row.direction_mask = direction_mask;
+        log_row.speed_mask = speed_mask;
+        log_row.elevation_mode = elevation_mode;
+        log_row.classifier_confidence = bank_classification.confidence;
+        log_row.bank_transition = bank_state.transitioned;
+        log_row.bank_transition_reason =
+            motion_bank_transition_reason_name(bank_state.reason);
+        log_row.eligible_frame_count =
+            indexed_search_result.eligible_frame_count;
+        log_row.evaluated_frame_count =
+            indexed_search_result.evaluated_frame_count;
+        log_row.considered_bound_count =
+            indexed_search_result.considered_bound_count;
+        log_row.skipped_bound_count =
+            indexed_search_result.skipped_bound_count;
+        log_row.empty_compatible_set = empty_compatible_set;
         if (!deterministic_log.write(
                 log_row, artifact_error, static_cast<int>(sizeof(artifact_error))))
         {
@@ -3566,8 +3856,10 @@ int main(void)
             }
         }
         
+        if (rendering_enabled)
+        {
         // Update camera
-        
+
         orbit_camera_update(
             camera, 
             state.camera_azimuth,
@@ -3697,7 +3989,7 @@ int main(void)
 
         for (int terrain_sample = 0; terrain_sample < 4; ++terrain_sample)
         {
-            vec3 point = terrain_query_snapshot.points[terrain_sample];
+            vec3 point = terrain_descriptor.center_points[terrain_sample];
             point.y += 0.10f;
             DrawSphereWires(to_Vector3(point), 0.04f, 4, 8, PURPLE);
         }
@@ -3972,10 +4264,10 @@ int main(void)
             Rectangle{ 40, 275, 250, 20 },
             TextFormat(
                 "terrain %.2f %.2f %.2f %.2f",
-                terrain_query_snapshot.values[0],
-                terrain_query_snapshot.values[1],
-                terrain_query_snapshot.values[2],
-                terrain_query_snapshot.values[3]));
+                terrain_descriptor.values[0],
+                terrain_descriptor.values[1],
+                terrain_descriptor.values[2],
+                terrain_descriptor.values[3]));
         
         //---------
         
@@ -4061,6 +4353,7 @@ int main(void)
         }
 
         EndDrawing();
+        }
 
         ++state.scene_frame;
         ++rendered_frames;
@@ -4104,7 +4397,7 @@ int main(void)
         ::g1_mesh_renderer_unload(g1_mesh_renderer);
         model_unloader(terrain_model);
 
-        CloseWindow();
+        if (rendering_enabled) CloseWindow();
         const bool window_closed = true;
 
         cleanup_report cleanup;
@@ -4144,7 +4437,8 @@ int main(void)
     // a platform implementation does.
     normal_cleanup();
 #else
-    while (!WindowShouldClose() && !controller_exit_requested)
+    while (!controller_exit_requested &&
+           (!rendering_enabled || !WindowShouldClose()))
     {
         update_func();
     }
