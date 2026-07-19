@@ -41,6 +41,10 @@ TERRAIN_PROFILE_MIN_UP_NORMAL = 1e-6  # Dimensionless upward component.
 # Two degrees yields only 0.035 m rise over the locked one-metre horizon; both
 # angle and range must be small before a profile is considered negligible.
 TERRAIN_FLAT_MAX_ABS_GRADE_DEGREES = 2.0
+# Admit only the upward binary64 ULP introduced when an analytic boundary
+# slope is reconstructed from sampled heights and normals.
+TERRAIN_FLAT_MAX_ABS_GRADE_COMPARISON_DEGREES = math.nextafter(
+    TERRAIN_FLAT_MAX_ABS_GRADE_DEGREES, math.inf)
 TERRAIN_FLAT_MAX_LEVEL_RANGE_M = 0.04
 # Half the locked 0.12 m curb/stair rise separates a riser from the 10-degree
 # ramp's <= 0.009 m change across the maximum 0.05 m sample interval.
@@ -53,7 +57,8 @@ TERRAIN_STAIR_MAX_TREAD_M = 0.45
 TERRAIN_ELEVATION_MIN_CHANGE_M = 0.03
 # Confidence anchors are the exact analytic cases required by the design.
 TERRAIN_CONFIDENCE_REFERENCE_STEP_M = 0.12
-TERRAIN_CONFIDENCE_REFERENCE_SLOPE_DEGREES = 10.0
+# The shallowest certified ramp/cross-slope is the full-confidence anchor.
+TERRAIN_CONFIDENCE_REFERENCE_SLOPE_DEGREES = 5.0
 TERRAIN_CONFIDENCE_REFERENCE_STAIR_STEPS = 3
 TERRAIN_CONFIDENCE_MAX_LINEAR_RESIDUAL_M = 0.02
 USD_DIR = "/home/ubuntu/datasets/GRAIL/data/curb/object_usd"
@@ -514,8 +519,10 @@ def classify_terrain_profile(
     level_range = float(np.ptp(relative_heights))
     if (
         level_range <= TERRAIN_FLAT_MAX_LEVEL_RANGE_M
-        and abs(grade_degrees) <= TERRAIN_FLAT_MAX_ABS_GRADE_DEGREES
-        and surface_grade_degrees <= TERRAIN_FLAT_MAX_ABS_GRADE_DEGREES
+        and abs(grade_degrees) <=
+            TERRAIN_FLAT_MAX_ABS_GRADE_COMPARISON_DEGREES
+        and surface_grade_degrees <=
+            TERRAIN_FLAT_MAX_ABS_GRADE_COMPARISON_DEGREES
     ):
         range_margin = 1.0 - min(
             1.0, level_range / TERRAIN_FLAT_MAX_LEVEL_RANGE_M)

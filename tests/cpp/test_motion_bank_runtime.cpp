@@ -369,6 +369,22 @@ static void initialize_profile(profile_fixture& profile, oracle_surface surface)
     }
 }
 
+static void initialize_degree_slope_profile(
+    profile_fixture& profile, double degrees)
+{
+    const double grade = tan(
+        degrees * 3.14159265358979323846264338327950288 / 180.0);
+    const double normal_length = sqrt(grade * grade + 1.0);
+    for (int i = 0; i < 51; ++i) {
+        const double distance = static_cast<double>(i) / 50.0;
+        profile.distances[i] = distance;
+        profile.heights[i] = grade * distance;
+        profile.normals[i].x = -grade / normal_length;
+        profile.normals[i].y = 1.0 / normal_length;
+        profile.normals[i].z = 0.0;
+    }
+}
+
 struct classification_oracle
 {
     oracle_surface surface;
@@ -435,6 +451,54 @@ static void test_locked_python_classifier_oracles()
     check(strcmp(motion_bank_family_name(MOTION_BANK_FAMILY_STAIR),
                  "stair") == 0,
           "bank family has stable literal");
+}
+
+static void test_certified_five_degree_slope_owns_confident_bank_boundary()
+{
+    profile_fixture profile;
+    motion_bank_classification classification = {};
+    motion_bank_classification_status status =
+        motion_bank_classification_invalid_value;
+
+    initialize_degree_slope_profile(profile, 2.0);
+    check(motion_bank_classify_profile(
+              classification, status, profile.distances, profile.heights,
+              profile.normals, 51),
+          "analytic two-degree boundary classifies");
+    check(classification.family == MOTION_BANK_FAMILY_FLAT,
+          "analytic two-degree boundary remains flat");
+
+    initialize_degree_slope_profile(profile, 2.0 + 1e-9);
+    check(motion_bank_classify_profile(
+              classification, status, profile.distances, profile.heights,
+              profile.normals, 51),
+          "just-above two-degree boundary classifies");
+    check(classification.family == MOTION_BANK_FAMILY_SLOPE,
+          "just-above two-degree boundary remains slope");
+
+    initialize_degree_slope_profile(profile, 5.0);
+    check(motion_bank_classify_profile(
+              classification, status, profile.distances, profile.heights,
+              profile.normals, 51),
+          "certified five-degree slope classifies");
+    check(status == motion_bank_classification_ok,
+          "certified five-degree slope returns explicit success");
+    check(classification.family == MOTION_BANK_FAMILY_SLOPE,
+          "certified five-degree slope owns the slope family");
+    check(classification.confidence > 0.99,
+          "certified five-degree slope is transition-confident");
+
+    initialize_degree_slope_profile(profile, 3.0);
+    check(motion_bank_classify_profile(
+              classification, status, profile.distances, profile.heights,
+              profile.normals, 51),
+          "three-degree slope classifies");
+    check(status == motion_bank_classification_ok,
+          "three-degree slope returns explicit success");
+    check(classification.family == MOTION_BANK_FAMILY_SLOPE,
+          "three-degree slope owns the slope family");
+    check(classification.confidence >= MOTION_BANK_TRANSITION_MIN_CONFIDENCE,
+          "three-degree slope reaches the transition-confidence threshold");
 }
 
 static void test_classifier_rejects_bad_profiles_transactionally()
@@ -712,6 +776,7 @@ int main()
     test_curved_travel_and_independent_heading();
     test_descriptor_explicit_failures_are_transactional();
     test_locked_python_classifier_oracles();
+    test_certified_five_degree_slope_owns_confident_bank_boundary();
     test_classifier_rejects_bad_profiles_transactionally();
     test_fixed_two_frame_hysteresis();
     test_family_and_elevation_hysterize_atomically();

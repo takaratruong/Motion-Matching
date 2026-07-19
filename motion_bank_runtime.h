@@ -70,6 +70,11 @@ static const double MOTION_BANK_PROFILE_MAX_SAMPLE_SPACING_M = 0.05;
 static const double MOTION_BANK_PROFILE_MIN_NORMAL_LENGTH = 1e-12;
 static const double MOTION_BANK_PROFILE_MIN_UP_NORMAL = 1e-6;
 static const double MOTION_BANK_FLAT_MAX_ABS_GRADE_DEGREES = 2.0;
+// Admit only the upward binary64 ULP introduced when an analytic boundary
+// slope is reconstructed from sampled heights and normals.
+static const double MOTION_BANK_FLAT_MAX_ABS_GRADE_COMPARISON_DEGREES =
+    nextafter(MOTION_BANK_FLAT_MAX_ABS_GRADE_DEGREES,
+              MOTION_BANK_FLAT_MAX_ABS_GRADE_DEGREES + 1.0);
 static const double MOTION_BANK_FLAT_MAX_LEVEL_RANGE_M = 0.04;
 static const double MOTION_BANK_DISCONTINUITY_MIN_STEP_M = 0.06;
 static const int MOTION_BANK_STAIR_MIN_STEP_COUNT = 2;
@@ -77,7 +82,8 @@ static const double MOTION_BANK_STAIR_MIN_TREAD_M = 0.15;
 static const double MOTION_BANK_STAIR_MAX_TREAD_M = 0.45;
 static const double MOTION_BANK_ELEVATION_MIN_CHANGE_M = 0.03;
 static const double MOTION_BANK_CONFIDENCE_REFERENCE_STEP_M = 0.12;
-static const double MOTION_BANK_CONFIDENCE_REFERENCE_SLOPE_DEGREES = 10.0;
+// The shallowest certified ramp/cross-slope is the full-confidence anchor.
+static const double MOTION_BANK_CONFIDENCE_REFERENCE_SLOPE_DEGREES = 5.0;
 static const double MOTION_BANK_CONFIDENCE_REFERENCE_STAIR_STEPS = 3.0;
 static const double MOTION_BANK_CONFIDENCE_MAX_LINEAR_RESIDUAL_M = 0.02;
 
@@ -393,9 +399,9 @@ static inline bool motion_bank_classify_profile(
         const double level_range = maximum_height - minimum_height;
         if (level_range <= MOTION_BANK_FLAT_MAX_LEVEL_RANGE_M &&
             fabs(grade_degrees) <=
-                MOTION_BANK_FLAT_MAX_ABS_GRADE_DEGREES &&
+                MOTION_BANK_FLAT_MAX_ABS_GRADE_COMPARISON_DEGREES &&
             surface_grade_degrees <=
-                MOTION_BANK_FLAT_MAX_ABS_GRADE_DEGREES) {
+                MOTION_BANK_FLAT_MAX_ABS_GRADE_COMPARISON_DEGREES) {
             const double range_margin = 1.0 - motion_bank_clamp_unit(
                 level_range / MOTION_BANK_FLAT_MAX_LEVEL_RANGE_M);
             const double grade_margin = 1.0 - motion_bank_clamp_unit(

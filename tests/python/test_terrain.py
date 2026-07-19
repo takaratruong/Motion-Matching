@@ -135,6 +135,25 @@ class TerrainTests(unittest.TestCase):
         self.assertAlmostEqual(result.step_height_m, 0.0, places=12)
         self.assertAlmostEqual(result.grade_degrees, 10.0, places=10)
 
+    def test_certified_five_degree_slope_owns_confident_bank_boundary(self):
+        cases = ((2.0, "flat"), (3.0, "slope"), (5.0, "slope"))
+        results = {}
+        for degrees, family in cases:
+            grade = math.tan(math.radians(degrees))
+            result = classify_terrain_profile(*_dense_profile(
+                lambda distance, grade=grade: grade * distance, grade))
+            self.assertEqual(result.family, family)
+            results[degrees] = result
+
+        just_above_flat_boundary = 2.0 + 1e-9
+        grade = math.tan(math.radians(just_above_flat_boundary))
+        result = classify_terrain_profile(*_dense_profile(
+            lambda distance: grade * distance, grade))
+        self.assertEqual(result.family, "slope")
+
+        self.assertGreaterEqual(results[3.0].confidence, 0.60)
+        self.assertGreater(results[5.0].confidence, 0.99)
+
     def test_classifier_is_invariant_to_horizontal_normal_rotation(self):
         grade = math.tan(math.radians(10.0))
         distances = np.linspace(0.0, 1.0, 51, dtype=np.float64)
