@@ -39,6 +39,7 @@ struct MappedPickSlot {
 
 struct PickSlotSelection {
     std::vector<MappedPickSlot> ordered{};
+    std::vector<size_t> ranked_eligible_indices{};
     std::optional<size_t> selected_index{};
     PickSlotReason reason = PickSlotReason::NoAuthoredSlot;
 };

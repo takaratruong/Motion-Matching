@@ -672,14 +672,22 @@ PickSlotSelection select_pick_slot(
         selection.ordered.push_back(candidate);
     }
 
+    selection.ranked_eligible_indices.reserve(selection.ordered.size());
     for (size_t index = 0U; index < selection.ordered.size(); ++index) {
-        if (selection.ordered[index].reason != PickSlotReason::None) continue;
-        if (!selection.selected_index.has_value() ||
-            better_candidate(
-                selection.ordered[index],
-                selection.ordered[*selection.selected_index])) {
-            selection.selected_index = index;
+        if (selection.ordered[index].reason == PickSlotReason::None) {
+            selection.ranked_eligible_indices.push_back(index);
         }
+    }
+    std::stable_sort(
+        selection.ranked_eligible_indices.begin(),
+        selection.ranked_eligible_indices.end(),
+        [&selection](size_t left, size_t right) {
+            return better_candidate(
+                selection.ordered[left], selection.ordered[right]);
+        });
+    if (!selection.ranked_eligible_indices.empty()) {
+        selection.selected_index =
+            selection.ranked_eligible_indices.front();
     }
 
     if (selection.selected_index.has_value()) {

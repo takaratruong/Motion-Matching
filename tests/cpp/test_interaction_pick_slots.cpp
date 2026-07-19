@@ -635,6 +635,20 @@ void test_ranking_uses_quantized_route_heading_and_id_tuple() {
                 ranking_key(longer_better_heading),
         "four-slot ordering did not match the exact ranking tuple");
     require(
+        selection.ranked_eligible_indices ==
+            std::vector<size_t>({3U, 2U, 0U, 1U}),
+        "eligible indices did not expose the complete tuple ranking");
+    require(
+        selection.selected_index ==
+            std::optional<size_t>(selection.ranked_eligible_indices.front()),
+        "legacy selection did not remain the first ranked eligible index");
+    require(
+        selection.ordered[0].id == 40U &&
+            selection.ordered[1].id == 5U &&
+            selection.ordered[2].id == 8U &&
+            selection.ordered[3].id == 3U,
+        "ranking reordered authored diagnostics");
+    require(
         selected_mapped_slot(selection, "ranking fixture selected no slot").id ==
             3U,
         "four-slot tuple ranking selected the wrong slot");
@@ -647,6 +661,19 @@ void test_ranking_uses_quantized_route_heading_and_id_tuple() {
             reversed,
             "reversed exact-tie fixture selected no slot").id == 3U,
         "lower-ID exact tie depended on authored vector order");
+    require(
+        reversed.ranked_eligible_indices ==
+            std::vector<size_t>({2U, 3U, 0U, 1U}),
+        "ranked eligible indices depended on authored tie order");
+
+    const PickSlotSelection repeated = select_route(
+        vec3(0.0F, 0.0F, 0.0F),
+        make_tuple_ranking_target(false));
+    require(
+        repeated.ranked_eligible_indices ==
+                selection.ranked_eligible_indices &&
+            repeated.selected_index == selection.selected_index,
+        "repeated slot ranking was not bit-stable");
 }
 
 void test_near_zero_route_uses_mapped_yaw_for_heading() {
@@ -785,6 +812,7 @@ interaction::PickSlotSelection select_blocked_nearest_fixture() {
     const InteractionTarget target = make_multi_slot_target({
         {41U, 0.80F, 0.0F, 0.0F},
         {42U, 0.0F, 0.90F, 0.0F},
+        {43U, 0.0F, 1.10F, 0.0F},
     });
     const PickNavigationObstacle blocks_only_nearest{
         vec3(0.70F, 0.0F, 0.0F),
@@ -801,8 +829,8 @@ void test_blocked_nearest_slot_falls_back_to_next_clear_slot() {
 
     const PickSlotSelection selection = select_blocked_nearest_fixture();
     require(
-        selection.ordered.size() == 2U,
-        "blocked-nearest fixture did not evaluate both authored slots");
+        selection.ordered.size() == 3U,
+        "mixed-eligibility fixture did not retain every authored slot");
     require(
         selection.ordered[0].reason == PickSlotReason::ObstacleBlocked &&
             selection.ordered[0].obstacle_index == 0,
@@ -810,6 +838,22 @@ void test_blocked_nearest_slot_falls_back_to_next_clear_slot() {
     require(
         selection.ordered[1].reason == PickSlotReason::None,
         "next slot was not clear after the nearest slot was blocked");
+    require(
+        selection.ordered[2].reason ==
+            PickSlotReason::OutsideTravelEnvelope,
+        "outside slot did not retain its authored diagnostic");
+    require(
+        selection.ordered[0].id == 41U &&
+            selection.ordered[1].id == 42U &&
+            selection.ordered[2].id == 43U,
+        "eligibility filtering reordered authored diagnostics");
+    require(
+        selection.ranked_eligible_indices == std::vector<size_t>({1U}),
+        "blocked or outside slot leaked into eligible ranking");
+    require(
+        selection.selected_index ==
+            std::optional<size_t>(selection.ranked_eligible_indices.front()),
+        "fallback selection did not equal the first eligible ranking index");
     require(
         selection.reason == PickSlotReason::None &&
             selected_mapped_slot(
