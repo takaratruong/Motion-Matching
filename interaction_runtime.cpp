@@ -2098,8 +2098,34 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
                 }
             }
         }
+    } else if (input.cancel_pressed && !ever_attached_ &&
+               (state_ == RuntimeState::Align ||
+                state_ == RuntimeState::PickupReplay)) {
+        if (owns_reservation_) {
+            (void)registry_->release(
+                request_->target, request_->request_id);
+        }
+        owns_reservation_ = false;
+        state_ = RuntimeState::Locomotion;
+        diagnostics_.state = state_;
+        diagnostics_.result = ResultCode::Cancelled;
+        diagnostics_.reason = Reason::Cancelled;
+        diagnostics_.object_state = ObjectState::Free;
+        diagnostics_.attached = false;
+        player_.reset();
+        event_player_.reset();
+        clearance_player_.reset();
+        attachment_.reset();
+        candidate_.reset();
+        target_.reset();
+        affordance_.reset();
     } else if (state_ == RuntimeState::Align) {
-        if (input.cancel_pressed) {
+        const InteractionTarget* current = registry_->find(
+            request_->target);
+        if (current == nullptr || !target_.has_value() ||
+            !exact(*current, *target_) ||
+            !registry_->validate(
+                request_->target, request_->request_id)) {
             if (owns_reservation_) {
                 (void)registry_->release(
                     request_->target, request_->request_id);
@@ -2107,71 +2133,45 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
             owns_reservation_ = false;
             state_ = RuntimeState::Locomotion;
             diagnostics_.state = state_;
-            diagnostics_.result = ResultCode::Cancelled;
-            diagnostics_.reason = Reason::Cancelled;
+            diagnostics_.result = ResultCode::Rejected;
+            diagnostics_.reason = Reason::TargetChanged;
             diagnostics_.object_state = ObjectState::Free;
             diagnostics_.attached = false;
-            player_.reset();
-            event_player_.reset();
-            clearance_player_.reset();
-            attachment_.reset();
-            candidate_.reset();
-            target_.reset();
-            affordance_.reset();
         } else {
-            const InteractionTarget* current = registry_->find(
-                request_->target);
-            if (current == nullptr || !target_.has_value() ||
-                !exact(*current, *target_) ||
-                !registry_->validate(
-                    request_->target, request_->request_id)) {
-                if (owns_reservation_) {
-                    (void)registry_->release(
-                        request_->target, request_->request_id);
-                }
-                owns_reservation_ = false;
-                state_ = RuntimeState::Locomotion;
-                diagnostics_.state = state_;
-                diagnostics_.result = ResultCode::Rejected;
-                diagnostics_.reason = Reason::TargetChanged;
-                diagnostics_.object_state = ObjectState::Free;
-                diagnostics_.attached = false;
-            } else {
-                player_->advance(input.dt);
-                entry_blend_elapsed_seconds_ += input.dt;
-                advance_pick_clearance(player_->elapsed_seconds());
-                Pose sampled = player_->sample();
-                if (player_->frame() <= candidate_->contact_frame) {
-                    const IKResult ik = apply_reach_ik(
-                        sampled,
-                        player_->frame(),
-                        *candidate_,
-                        *affordance_,
-                        target_hand_world_,
-                        source_contact_hand_world_,
-                        config_.ik);
-                    diagnostics_.hand_position_error_m =
-                        ik.position_error_m;
-                    diagnostics_.hand_orientation_error_radians =
-                        ik.orientation_error_radians;
-                }
-                pose_ = apply_entry_blend(
-                    entry_blend_source_,
+            player_->advance(input.dt);
+            entry_blend_elapsed_seconds_ += input.dt;
+            advance_pick_clearance(player_->elapsed_seconds());
+            Pose sampled = player_->sample();
+            if (player_->frame() <= candidate_->contact_frame) {
+                const IKResult ik = apply_reach_ik(
                     sampled,
-                    entry_blend_elapsed_seconds_,
-                    config_.playback.entry_blend_seconds);
-                diagnostics_.frame = player_->frame();
-                diagnostics_.phase = player_->phase();
-                diagnostics_.applied_root_correction_m = length(
-                    player_->entry_root_correction());
-                diagnostics_.applied_yaw_correction_radians =
-                    diagnostics_.requested_yaw_correction_radians *
-                    correction_weight(
-                        *candidate_, *player_, config_.playback.speed);
-                if (player_->elapsed_seconds() >= commit_seconds_) {
-                    state_ = RuntimeState::PickupReplay;
-                    diagnostics_.state = state_;
-                }
+                    player_->frame(),
+                    *candidate_,
+                    *affordance_,
+                    target_hand_world_,
+                    source_contact_hand_world_,
+                    config_.ik);
+                diagnostics_.hand_position_error_m =
+                    ik.position_error_m;
+                diagnostics_.hand_orientation_error_radians =
+                    ik.orientation_error_radians;
+            }
+            pose_ = apply_entry_blend(
+                entry_blend_source_,
+                sampled,
+                entry_blend_elapsed_seconds_,
+                config_.playback.entry_blend_seconds);
+            diagnostics_.frame = player_->frame();
+            diagnostics_.phase = player_->phase();
+            diagnostics_.applied_root_correction_m = length(
+                player_->entry_root_correction());
+            diagnostics_.applied_yaw_correction_radians =
+                diagnostics_.requested_yaw_correction_radians *
+                correction_weight(
+                    *candidate_, *player_, config_.playback.speed);
+            if (player_->elapsed_seconds() >= commit_seconds_) {
+                state_ = RuntimeState::PickupReplay;
+                diagnostics_.state = state_;
             }
         }
     } else if ((state_ == RuntimeState::PickupReplay ||
