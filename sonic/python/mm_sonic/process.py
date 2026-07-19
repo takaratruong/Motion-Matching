@@ -1273,6 +1273,30 @@ class MMChunkClient:
         self.close()
 
 
+def _gated_simulator_command(
+    run_root: Path,
+    gear_checkout: Path,
+    *,
+    unpaced_physics: bool,
+    onscreen: bool,
+) -> tuple[str, ...]:
+    if type(onscreen) is not bool:
+        raise ValueError("onscreen must be a boolean")
+    return (
+        sys.executable,
+        "-u",
+        "-B",
+        "-m",
+        "mm_sonic.gated_sim",
+        "--gear-checkout",
+        str(gear_checkout),
+        "--run-root",
+        str(run_root),
+        *(("--unpaced-physics",) if unpaced_physics else ()),
+        *(("--onscreen",) if onscreen else ()),
+    )
+
+
 class GatedSimulatorClient:
     """Synchronous, duplicate-key-safe JSONL client with no request deadline."""
 
@@ -1283,6 +1307,7 @@ class GatedSimulatorClient:
         command: Sequence[str] | None = None,
         gear_checkout: str | Path | None = None,
         unpaced_physics: bool = False,
+        onscreen: bool = False,
         stdout_archive: str | Path,
         stderr_archive: str | Path,
         cancelled: Callable[[], bool] | None = None,
@@ -1296,23 +1321,19 @@ class GatedSimulatorClient:
         self.run_root = _canonical_run_root(run_root)
         if type(unpaced_physics) is not bool:
             raise ValueError("unpaced_physics must be a boolean")
+        if type(onscreen) is not bool:
+            raise ValueError("onscreen must be a boolean")
         if command is None:
             if gear_checkout is None:
                 raise ValueError(
                     "gear_checkout is required without an injected command"
                 )
             checkout = Path(gear_checkout).resolve(strict=True)
-            command = (
-                sys.executable,
-                "-u",
-                "-B",
-                "-m",
-                "mm_sonic.gated_sim",
-                "--gear-checkout",
-                str(checkout),
-                "--run-root",
-                str(self.run_root),
-                *(("--unpaced-physics",) if unpaced_physics else ()),
+            command = _gated_simulator_command(
+                self.run_root,
+                checkout,
+                unpaced_physics=unpaced_physics,
+                onscreen=onscreen,
             )
         if not command or any(type(item) is not str or not item for item in command):
             raise ValueError("command must contain nonempty strings")

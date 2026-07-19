@@ -227,6 +227,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
         # advances past them.  The fully preloaded evidence runner can safely
         # use unpaced physics; this live producer cannot.
         unpaced_physics=False,
+        onscreen=namespace.onscreen,
         stdout_archive=bundle.path / "simulator.stdout",
         stderr_archive=bundle.path / "simulator.stderr",
         env=environment,
@@ -432,6 +433,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("script", "interactive"), default="script")
     parser.add_argument("--chunks", type=int, default=30)
+    parser.add_argument("--onscreen", action="store_true")
     parser.add_argument("--output-root", default="/home/ubuntu/mm-sonic-manual-runs")
     parser.add_argument("--source-run", default=str(_DEFAULT_SOURCE_RUN))
     parser.add_argument("--gear-checkout", default=str(_DEFAULT_GEAR))

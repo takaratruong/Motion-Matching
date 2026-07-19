@@ -7,7 +7,7 @@ import unittest
 from mm_sonic.commands import CommandSample
 from mm_sonic.hands import NEUTRAL_HAND_TARGETS, hand_targets_record
 from mm_sonic.joints import ContractError
-from mm_sonic.manual_demo import CommandRecorder
+from mm_sonic.manual_demo import CommandRecorder, _parser
 from mm_sonic.manual_evidence import parse_manual_command_artifact
 
 
@@ -20,6 +20,10 @@ def _forward(index: int) -> CommandSample:
 
 
 class CommandRecorderTests(unittest.TestCase):
+    def test_onscreen_is_explicit_and_opt_in(self) -> None:
+        self.assertFalse(_parser().parse_args([]).onscreen)
+        self.assertTrue(_parser().parse_args(["--onscreen"]).onscreen)
+
     def test_records_committed_commands_in_chunk_order(self) -> None:
         recorder = CommandRecorder(
             mode="script",

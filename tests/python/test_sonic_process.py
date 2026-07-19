@@ -25,6 +25,7 @@ from mm_sonic.process import (
     ProcessProtocolError,
     SimulationPolicyGate,
     _RemoteMMError,
+    _gated_simulator_command,
 )
 
 
@@ -164,6 +165,29 @@ class GatedSimulatorClientTests(TemporaryScriptCase):
             stop_grace_s=0.05,
             term_grace_s=0.05,
         )
+
+    def test_generated_command_propagates_explicit_onscreen_flag(self):
+        headless = _gated_simulator_command(
+            self.root,
+            self.root / "gear",
+            unpaced_physics=False,
+            onscreen=False,
+        )
+        visible = _gated_simulator_command(
+            self.root,
+            self.root / "gear",
+            unpaced_physics=False,
+            onscreen=True,
+        )
+        self.assertNotIn("--onscreen", headless)
+        self.assertIn("--onscreen", visible)
+        with self.assertRaisesRegex(ValueError, "onscreen must be a boolean"):
+            _gated_simulator_command(
+                self.root,
+                self.root / "gear",
+                unpaced_physics=False,
+                onscreen=1,
+            )
 
     def test_strict_jsonl_round_trip_and_exact_step_result(self):
         child = self.script(
