@@ -6,6 +6,8 @@ Make terminal focus and input receipt unambiguous during the interactive G1
 SONIC demo. Every input batch received by the controller must produce an
 immediate, human-readable acknowledgement before the next motion boundary.
 If no acknowledgement appears, the controller did not receive the key.
+The live help and acknowledgement must also identify `A/D` explicitly as
+left/right strafe controls.
 
 ## Scope
 
@@ -17,6 +19,10 @@ formats, or scored paths.
 
 - Accepted input prints an action, for example `KEY W -> forward` and
   `KEY <SPACE> -> stand`.
+- `A` and `D` retain their existing lateral command fields but print
+  `KEY A -> strafe_left` and `KEY D -> strafe_right`.
+- Both the live help and user launcher state `W/S forward/back, A/D strafe,
+  Q/E turn, Space stand, X exit`.
 - An unsupported byte sequence prints a safely escaped acknowledgement ending
   in `-> ignored`.
 - An unsupported sequence is rejected atomically so an ANSI escape sequence
@@ -40,6 +46,10 @@ The interactive manual demo supplies a sink that prints one flushed line per
 event. Non-interactive users and existing callers omit the sink, preserving
 their current API behavior and output.
 
+The display-action mapping is separate from `OperatorState`: only the labels
+for the existing `left` and `right` fields become `strafe_left` and
+`strafe_right`. Lateral velocity generation and all physics remain unchanged.
+
 ## Alternatives rejected
 
 - Adding keys only to the 0.4-second boundary line is delayed and cannot prove
@@ -56,6 +66,8 @@ PTY-based tests will establish a red-green regression for:
    reader;
 3. a valid key still working after the unsupported sequence;
 4. genuine terminal closure remaining a surfaced failure.
+5. `A/D` producing explicit `strafe_left/strafe_right` acknowledgements while
+   retaining the existing lateral operator states.
 
 The replacement live session must then visibly print an injected `W`, show the
 corresponding nonzero boundary command, print Space, return to zero velocity,
