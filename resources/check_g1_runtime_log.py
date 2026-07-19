@@ -46,6 +46,13 @@ RUNTIME_SUFFIX = (
     "scene_frame", "scene_reset_count", "scene_switch_failed",
     "motion_pack_load_count", "model_load_count", "model_unload_count",
     "live_model_count",
+    "left_sole_clearance_0", "left_sole_clearance_1",
+    "left_sole_clearance_2", "left_sole_clearance_3",
+    "right_sole_clearance_0", "right_sole_clearance_1",
+    "right_sole_clearance_2", "right_sole_clearance_3",
+    "left_sole_min_clearance", "right_sole_min_clearance",
+    "sole_min_clearance", "left_stance_slip", "right_stance_slip",
+    "left_stance_slip_reset", "right_stance_slip_reset",
 )
 RUNTIME_COLUMNS = list(GATE_A_COLUMNS) + list(RUNTIME_SUFFIX)
 LOCKED_SCENE_IDS = (
@@ -88,15 +95,18 @@ RUNTIME_INTEGER_COLUMNS = {
     "walkability_class", "blocked", "route_waypoint", "route_complete",
     "scene_generation", "scene_frame", "scene_reset_count",
     "scene_switch_failed", "motion_pack_load_count", "model_load_count",
-    "model_unload_count", "live_model_count",
+    "model_unload_count", "live_model_count", "left_stance_slip_reset",
+    "right_stance_slip_reset",
 }
 RUNTIME_FLAG_COLUMNS = {
     "left_contact", "right_contact", "blocked", "route_complete",
-    "scene_switch_failed",
+    "scene_switch_failed", "left_stance_slip_reset",
+    "right_stance_slip_reset",
 }
 RUNTIME_NONNEGATIVE_INTEGER_COLUMNS = RUNTIME_INTEGER_COLUMNS - {
     "left_contact", "right_contact", "blocked", "route_complete",
-    "scene_switch_failed",
+    "scene_switch_failed", "left_stance_slip_reset",
+    "right_stance_slip_reset",
 }
 
 
@@ -286,6 +296,8 @@ def check_rows(rows):
     previous_generation = None
     previous_scene_frame = None
     previous_reset_count = None
+    previous_contacts = None
+    previous_stance_slip = None
     for index, row in enumerate(rows):
         frame = _integer(row, "frame", index)
         query_frame = _integer(row, "query_database_frame", index)
@@ -455,6 +467,61 @@ def check_rows(rows):
                     f"row {index}: motion pack load count must be 1")
             if _integer(row, "live_model_count", index) != 1:
                 raise ValueError(f"row {index}: live model count must be 1")
+            contacts = (
+                _integer(row, "left_contact", index),
+                _integer(row, "right_contact", index),
+            )
+            slip_resets = (
+                _integer(row, "left_stance_slip_reset", index),
+                _integer(row, "right_stance_slip_reset", index),
+            )
+            stance_slip = (
+                _float32(row, "left_stance_slip", index),
+                _float32(row, "right_stance_slip", index),
+            )
+            for foot, side in enumerate(("left", "right")):
+                clearances = [
+                    _float32(row, f"{side}_sole_clearance_{probe}", index)
+                    for probe in range(4)
+                ]
+                minimum = _float32(
+                    row, f"{side}_sole_min_clearance", index)
+                if minimum != min(clearances):
+                    raise ValueError(
+                        f"row {index}: {side} sole minimum disagrees with "
+                        "ordered physical probes")
+                if stance_slip[foot] < 0.0:
+                    raise ValueError(
+                        f"row {index}: {side} stance slip must be nonnegative")
+                if slip_resets[foot] and stance_slip[foot] != 0.0:
+                    raise ValueError(
+                        f"row {index}: {side} stance slip reset must publish zero")
+                if not contacts[foot] and stance_slip[foot] != 0.0:
+                    raise ValueError(
+                        f"row {index}: {side} non-contact stance slip must be zero")
+                if previous_contacts is None:
+                    if not slip_resets[foot]:
+                        raise ValueError(
+                            f"row {index}: initial {side} stance history must reset")
+                elif generation_changed:
+                    if not slip_resets[foot]:
+                        raise ValueError(
+                            f"row {index}: {side} stance history must reset on scene reset")
+                elif contacts[foot] != previous_contacts[foot]:
+                    if not slip_resets[foot]:
+                        raise ValueError(
+                            f"row {index}: {side} stance history must reset on contact edge")
+                elif (contacts[foot] and not slip_resets[foot] and
+                      stance_slip[foot] < previous_stance_slip[foot]):
+                    raise ValueError(
+                        f"row {index}: {side} cumulative stance slip decreased")
+            global_minimum = _float32(row, "sole_min_clearance", index)
+            expected_global_minimum = min(
+                _float32(row, "left_sole_min_clearance", index),
+                _float32(row, "right_sole_min_clearance", index))
+            if global_minimum != expected_global_minimum:
+                raise ValueError(
+                    f"row {index}: global sole minimum disagrees with feet")
         _check_query_snapshot(row, index)
         if (previous is not None and not generation_changed and
                 not transitioned and current != previous + 1):
@@ -471,6 +538,8 @@ def check_rows(rows):
             previous_generation = generation
             previous_scene_frame = scene_frame
             previous_reset_count = reset_count
+            previous_contacts = contacts
+            previous_stance_slip = stance_slip
     _check_substride_by_generation(rows)
     return {
         "frames": len(rows),

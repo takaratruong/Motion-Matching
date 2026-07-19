@@ -1,6 +1,7 @@
 #pragma once
 
 #include "g1_controller_state.h"
+#include "g1_sole_diagnostics.h"
 #include "route_runtime.h"
 
 struct g1_runtime_diagnostic_snapshot
@@ -47,7 +48,50 @@ struct g1_runtime_diagnostic_snapshot
     int model_load_count = 0;
     int model_unload_count = 0;
     int live_model_count = 0;
+    float sole_clearance[2][4] = {};
+    float sole_minimum_clearance[2] = {};
+    float sole_global_minimum_clearance = 0.0f;
+    float stance_slip[2] = {};
+    bool stance_slip_reset[2] = {};
 };
+
+static inline bool g1_runtime_sole_snapshot_is_valid(
+    const G1SoleDiagnosticSnapshot& sole,
+    int scene_generation,
+    bool left_contact,
+    bool right_contact)
+{
+    if (sole.scene_generation != scene_generation ||
+        sole.contact[0] != left_contact ||
+        sole.contact[1] != right_contact) {
+        return false;
+    }
+    float foot_minima[2] = {FLT_MAX, FLT_MAX};
+    for (int foot = 0; foot < 2; ++foot) {
+        if (!terrain_float_is_finite(sole.stance_slip[foot]) ||
+            sole.stance_slip[foot] < 0.0f ||
+            (sole.slip_reset[foot] &&
+             sole.stance_slip[foot] != 0.0f) ||
+            (!sole.contact[foot] && sole.stance_slip[foot] != 0.0f)) {
+            return false;
+        }
+        for (int probe = 0; probe < 4; ++probe) {
+            if (!g1_sole_vec3_is_finite(sole.world_points[foot][probe]) ||
+                !terrain_float_is_finite(
+                    sole.surface_heights[foot][probe]) ||
+                !terrain_float_is_finite(sole.clearances[foot][probe])) {
+                return false;
+            }
+            if (sole.clearances[foot][probe] < foot_minima[foot]) {
+                foot_minima[foot] = sole.clearances[foot][probe];
+            }
+        }
+        if (sole.minimum_clearance[foot] != foot_minima[foot]) return false;
+    }
+    const float global_minimum = foot_minima[0] < foot_minima[1]
+        ? foot_minima[0] : foot_minima[1];
+    return sole.global_minimum_clearance == global_minimum;
+}
 
 static inline bool g1_runtime_support_state_is_finite(
     const support_frame_state& state)
@@ -103,6 +147,11 @@ static inline bool g1_runtime_snapshot_is_valid(
         snapshot.commanded_speed,
         snapshot.applied_speed,
         snapshot.route_target_height,
+        snapshot.sole_minimum_clearance[0],
+        snapshot.sole_minimum_clearance[1],
+        snapshot.sole_global_minimum_clearance,
+        snapshot.stance_slip[0],
+        snapshot.stance_slip[1],
     };
     for (float value : values) {
         if (!terrain_float_is_finite(value)) return false;
@@ -251,6 +300,46 @@ static inline bool g1_runtime_diagnostics_build(
         return scene_error(
             error, capacity,
             "runtime diagnostics: snapshot validation failed");
+    }
+    out = candidate;
+    return true;
+}
+
+static inline bool g1_runtime_diagnostics_attach_sole(
+    g1_runtime_diagnostic_snapshot& out,
+    const G1SoleDiagnosticSnapshot& sole,
+    char* error,
+    int capacity)
+{
+    if (!g1_runtime_snapshot_is_valid(out) ||
+        !g1_runtime_sole_snapshot_is_valid(
+            sole,
+            out.scene_generation,
+            out.left_contact,
+            out.right_contact)) {
+        return scene_error(
+            error,
+            capacity,
+            "runtime diagnostics: invalid physical sole snapshot");
+    }
+    g1_runtime_diagnostic_snapshot candidate = out;
+    for (int foot = 0; foot < 2; ++foot) {
+        for (int probe = 0; probe < 4; ++probe) {
+            candidate.sole_clearance[foot][probe] =
+                sole.clearances[foot][probe];
+        }
+        candidate.sole_minimum_clearance[foot] =
+            sole.minimum_clearance[foot];
+        candidate.stance_slip[foot] = sole.stance_slip[foot];
+        candidate.stance_slip_reset[foot] = sole.slip_reset[foot];
+    }
+    candidate.sole_global_minimum_clearance =
+        sole.global_minimum_clearance;
+    if (!g1_runtime_snapshot_is_valid(candidate)) {
+        return scene_error(
+            error,
+            capacity,
+            "runtime diagnostics: physical sole snapshot validation failed");
     }
     out = candidate;
     return true;

@@ -1,0 +1,338 @@
+{
+  "candidate_thresholds": {
+    "activated_terrain_wrong_family_frames": {
+      "activation": "first accepted non-flat classifier activation",
+      "comparison": "equal",
+      "routes": [
+        "stairs-standard/ascent-landing-descent",
+        "ramp-10-up-down/up-landing-down",
+        "stairs-standard/ascent-landing-descent@positive-x",
+        "mixed-multilevel/tangent-level-boundary"
+      ],
+      "target": 0
+    },
+    "flat_wrong_family_frames": {
+      "comparison": "equal",
+      "routes": [
+        "stairs-shallow/flat-positive-z",
+        "stairs-shallow/flat-positive-x"
+      ],
+      "target": 0
+    },
+    "lateral_selected_cost_p95": {
+      "baseline": 6.425179219,
+      "comparison": "strictly_less_than_baseline",
+      "route": "stairs-shallow/flat-positive-x"
+    },
+    "lateral_transition_rate": {
+      "baseline": 0.05,
+      "comparison": "strictly_less_than_baseline",
+      "route": "stairs-shallow/flat-positive-x"
+    },
+    "sole_worst_penetration_m": {
+      "aggregation": "maximum over all routes",
+      "baseline": 0.322520494,
+      "comparison": "strictly_less_than_baseline"
+    },
+    "stance_slip_total_m": {
+      "aggregation": "sum over both feet and all routes",
+      "baseline": 13.191935349,
+      "comparison": "strictly_less_than_baseline"
+    }
+  },
+  "ik_enabled": false,
+  "metric_definitions": {
+    "penetration": "strictly negative vertical clearance",
+    "rendered_joint_clearance": "existing rendered_min_clearance across seven joint probes",
+    "selected_cost_percentiles": "Type-7 linear interpolation over every finite selected_cost row",
+    "sole_clearance": "minimum of eight authoritative physical sole clearances per frame",
+    "stance_slip_total_m": "sum of positive increments in cumulative per-stance sole-centroid slip",
+    "transition_rate": "transition_count / frame_count"
+  },
+  "routes": {
+    "mixed-multilevel/tangent-level-boundary": {
+      "frames": 800,
+      "ik_enabled_frames": 0,
+      "rendered_joint_clearance": {
+        "minimum_m": -0.285796702,
+        "p05_m": -0.235782972,
+        "penetrating_frames": 619,
+        "worst_penetration_m": 0.285796702
+      },
+      "route_complete": true,
+      "search_count": 266,
+      "selected_cost": {
+        "max": 15.0972404,
+        "p50": 0.417488605,
+        "p90": 1.391985966,
+        "p95": 1.71268916
+      },
+      "sole_clearance": {
+        "minimum_m": -0.322520494,
+        "p05_m": -0.285952107,
+        "penetrating_frames": 724,
+        "penetrating_probes": 2677,
+        "worst_penetration_m": 0.322520494
+      },
+      "source_family_frames": {
+        "curb": 629,
+        "flat": 171,
+        "slope": 0,
+        "stair": 0
+      },
+      "stance_slip": {
+        "contact_frames": {
+          "left": 646,
+          "right": 632
+        },
+        "maximum_stance_m": {
+          "left": 0.509207189,
+          "right": 0.346555591
+        },
+        "total_m": {
+          "left": 1.327735381,
+          "right": 1.438747127
+        }
+      },
+      "transition_count": 72,
+      "transition_rate": 0.09
+    },
+    "ramp-10-up-down/up-landing-down": {
+      "frames": 800,
+      "ik_enabled_frames": 0,
+      "rendered_joint_clearance": {
+        "minimum_m": -0.032985255,
+        "p05_m": 0.015488822,
+        "penetrating_frames": 18,
+        "worst_penetration_m": 0.032985255
+      },
+      "route_complete": true,
+      "search_count": 266,
+      "selected_cost": {
+        "max": 7.6458416,
+        "p50": 0.424129143,
+        "p90": 0.942772645,
+        "p95": 1.076753867
+      },
+      "sole_clearance": {
+        "minimum_m": -0.078166559,
+        "p05_m": -0.032926896,
+        "penetrating_frames": 253,
+        "penetrating_probes": 620,
+        "worst_penetration_m": 0.078166559
+      },
+      "source_family_frames": {
+        "curb": 452,
+        "flat": 348,
+        "slope": 0,
+        "stair": 0
+      },
+      "stance_slip": {
+        "contact_frames": {
+          "left": 554,
+          "right": 542
+        },
+        "maximum_stance_m": {
+          "left": 0.25351128,
+          "right": 0.387228191
+        },
+        "total_m": {
+          "left": 1.378095029,
+          "right": 1.514369625
+        }
+      },
+      "transition_count": 82,
+      "transition_rate": 0.1025
+    },
+    "stairs-shallow/flat-positive-x": {
+      "frames": 100,
+      "ik_enabled_frames": 0,
+      "rendered_joint_clearance": {
+        "minimum_m": 0.035009094,
+        "p05_m": 0.035174196,
+        "penetrating_frames": 0,
+        "worst_penetration_m": 0.0
+      },
+      "route_complete": true,
+      "search_count": 33,
+      "selected_cost": {
+        "max": 7.35605192,
+        "p50": 1.78369486,
+        "p90": 5.876640178,
+        "p95": 6.425179219
+      },
+      "sole_clearance": {
+        "minimum_m": -0.006031584,
+        "p05_m": -0.0052445,
+        "penetrating_frames": 43,
+        "penetrating_probes": 45,
+        "worst_penetration_m": 0.006031584
+      },
+      "source_family_frames": {
+        "curb": 10,
+        "flat": 90,
+        "slope": 0,
+        "stair": 0
+      },
+      "stance_slip": {
+        "contact_frames": {
+          "left": 59,
+          "right": 65
+        },
+        "maximum_stance_m": {
+          "left": 0.142238259,
+          "right": 0.133744746
+        },
+        "total_m": {
+          "left": 0.246435623,
+          "right": 0.413517854
+        }
+      },
+      "transition_count": 5,
+      "transition_rate": 0.05
+    },
+    "stairs-shallow/flat-positive-z": {
+      "frames": 100,
+      "ik_enabled_frames": 0,
+      "rendered_joint_clearance": {
+        "minimum_m": 0.032488164,
+        "p05_m": 0.032971886,
+        "penetrating_frames": 0,
+        "worst_penetration_m": 0.0
+      },
+      "route_complete": true,
+      "search_count": 33,
+      "selected_cost": {
+        "max": 7.6458416,
+        "p50": 0.47677426,
+        "p90": 1.023855582,
+        "p95": 1.157692041
+      },
+      "sole_clearance": {
+        "minimum_m": -0.008790426,
+        "p05_m": -0.003344917,
+        "penetrating_frames": 49,
+        "penetrating_probes": 73,
+        "worst_penetration_m": 0.008790426
+      },
+      "source_family_frames": {
+        "curb": 97,
+        "flat": 3,
+        "slope": 0,
+        "stair": 0
+      },
+      "stance_slip": {
+        "contact_frames": {
+          "left": 75,
+          "right": 74
+        },
+        "maximum_stance_m": {
+          "left": 0.155660674,
+          "right": 0.11798884
+        },
+        "total_m": {
+          "left": 0.27867896,
+          "right": 0.269096524
+        }
+      },
+      "transition_count": 12,
+      "transition_rate": 0.12
+    },
+    "stairs-standard/ascent-landing-descent": {
+      "frames": 800,
+      "ik_enabled_frames": 0,
+      "rendered_joint_clearance": {
+        "minimum_m": -0.18234694,
+        "p05_m": 0.01519566,
+        "penetrating_frames": 34,
+        "worst_penetration_m": 0.18234694
+      },
+      "route_complete": true,
+      "search_count": 266,
+      "selected_cost": {
+        "max": 7.6458416,
+        "p50": 0.392212823,
+        "p90": 0.946495146,
+        "p95": 1.061887683
+      },
+      "sole_clearance": {
+        "minimum_m": -0.223801464,
+        "p05_m": -0.08125554,
+        "penetrating_frames": 213,
+        "penetrating_probes": 483,
+        "worst_penetration_m": 0.223801464
+      },
+      "source_family_frames": {
+        "curb": 542,
+        "flat": 258,
+        "slope": 0,
+        "stair": 0
+      },
+      "stance_slip": {
+        "contact_frames": {
+          "left": 610,
+          "right": 597
+        },
+        "maximum_stance_m": {
+          "left": 0.397934377,
+          "right": 0.231257647
+        },
+        "total_m": {
+          "left": 1.24535718,
+          "right": 1.120908453
+        }
+      },
+      "transition_count": 73,
+      "transition_rate": 0.09125
+    },
+    "stairs-standard/ascent-landing-descent@positive-x": {
+      "frames": 800,
+      "ik_enabled_frames": 0,
+      "rendered_joint_clearance": {
+        "minimum_m": -0.17720595,
+        "p05_m": -0.026816828,
+        "penetrating_frames": 62,
+        "worst_penetration_m": 0.17720595
+      },
+      "route_complete": true,
+      "search_count": 266,
+      "selected_cost": {
+        "max": 183.190887,
+        "p50": 0.955499292,
+        "p90": 7.045418741,
+        "p95": 7.735966442
+      },
+      "sole_clearance": {
+        "minimum_m": -0.234745979,
+        "p05_m": -0.104135184,
+        "penetrating_frames": 351,
+        "penetrating_probes": 756,
+        "worst_penetration_m": 0.234745979
+      },
+      "source_family_frames": {
+        "curb": 374,
+        "flat": 426,
+        "slope": 0,
+        "stair": 0
+      },
+      "stance_slip": {
+        "contact_frames": {
+          "left": 594,
+          "right": 644
+        },
+        "maximum_stance_m": {
+          "left": 0.250944495,
+          "right": 0.280493051
+        },
+        "total_m": {
+          "left": 1.828912312,
+          "right": 2.130081281
+        }
+      },
+      "transition_count": 94,
+      "transition_rate": 0.1175
+    }
+  },
+  "sample_rate_hz": 25,
+  "schema": "g1-motion-quality-baseline/v1"
+}

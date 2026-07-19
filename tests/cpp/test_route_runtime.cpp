@@ -1247,6 +1247,17 @@ int main(int argc, char** argv)
     row.model_load_count = 8;
     row.model_unload_count = 7;
     row.live_model_count = 1;
+    for (int probe = 0; probe < 4; ++probe) {
+        row.sole_clearance[0][probe] = 22.0f + probe;
+        row.sole_clearance[1][probe] = 26.0f + probe;
+    }
+    row.sole_minimum_clearance[0] = 22.0f;
+    row.sole_minimum_clearance[1] = 26.0f;
+    row.sole_global_minimum_clearance = 22.0f;
+    row.stance_slip[0] = 30.0f;
+    row.stance_slip[1] = 31.0f;
+    row.stance_slip_reset[0] = true;
+    row.stance_slip_reset[1] = false;
     check(log.write(row, error, sizeof(error)), error);
     check(log.close(error, sizeof(error)), error);
     FILE* log_file = std::fopen(log_path, "rb");
@@ -1271,14 +1282,20 @@ int main(int argc, char** argv)
         "applied_speed,route_waypoint,route_complete,route_target_height,"
         "scene_generation,scene_frame,scene_reset_count,scene_switch_failed,"
         "motion_pack_load_count,model_load_count,model_unload_count,"
-        "live_model_count\n";
+        "live_model_count,left_sole_clearance_0,left_sole_clearance_1,"
+        "left_sole_clearance_2,left_sole_clearance_3,"
+        "right_sole_clearance_0,right_sole_clearance_1,"
+        "right_sole_clearance_2,right_sole_clearance_3,"
+        "left_sole_min_clearance,right_sole_min_clearance,"
+        "sole_min_clearance,left_stance_slip,right_stance_slip,"
+        "left_stance_slip_reset,right_stance_slip_reset\n";
     check(std::strstr(header, expected_header_suffix) != NULL,
           "exact append-only runtime header suffix");
     check(std::strstr(
               data,
               ",s,t,3,1,2,3,4,5,6,7,8,9,10,11,12,both,13,1,0,14,15,"
               "16,17,2,1,blocked-cell,18,19,20,0.5,0.25,4,1,21,5,6,7,1,"
-              "1,8,7,1\n") != NULL,
+              "1,8,7,1,22,23,24,25,26,27,28,29,22,26,22,30,31,1,0\n") != NULL,
           "runtime row suffix matches header order");
     check(std::remove(log_path) == 0, "remove exact runtime log");
     return 0;

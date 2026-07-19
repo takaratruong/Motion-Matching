@@ -126,6 +126,11 @@ struct motion_match_log_row
     int model_load_count = 0;
     int model_unload_count = 0;
     int live_model_count = 0;
+    float sole_clearance[2][4] = {};
+    float sole_minimum_clearance[2] = {};
+    float sole_global_minimum_clearance = 0.0f;
+    float stance_slip[2] = {};
+    bool stance_slip_reset[2] = {};
 };
 
 struct motion_match_log
@@ -188,7 +193,14 @@ struct motion_match_log
             "commanded_speed,applied_speed,route_waypoint,route_complete,"
             "route_target_height,scene_generation,scene_frame,"
             "scene_reset_count,scene_switch_failed,motion_pack_load_count,"
-            "model_load_count,model_unload_count,live_model_count\n") >= 0;
+            "model_load_count,model_unload_count,live_model_count,"
+            "left_sole_clearance_0,left_sole_clearance_1,"
+            "left_sole_clearance_2,left_sole_clearance_3,"
+            "right_sole_clearance_0,right_sole_clearance_1,"
+            "right_sole_clearance_2,right_sole_clearance_3,"
+            "left_sole_min_clearance,right_sole_min_clearance,"
+            "sole_min_clearance,left_stance_slip,right_stance_slip,"
+            "left_stance_slip_reset,right_stance_slip_reset\n") >= 0;
         if (!header_ok || fflush(file) != 0) {
             const int saved_errno = errno;
             fclose(file);
@@ -250,7 +262,7 @@ struct motion_match_log
             ",%s,%s,%d,%.9g,"
             "%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,"
             "%s,%d,%d,%d,%.9g,%.9g,%.9g,%.9g,%d,%d,%s,"
-            "%.9g,%.9g,%.9g,%.9g,%.9g,%d,%d,%.9g,%d,%d,%d,%d,%d,%d,%d,%d\n",
+            "%.9g,%.9g,%.9g,%.9g,%.9g,%d,%d,%.9g,%d,%d,%d,%d,%d,%d,%d,%d",
             r.source_name, r.source_terrain, r.source_index,
             r.continuation_cost,
             r.source_root_height, r.source_left_toe_height,
@@ -271,6 +283,22 @@ struct motion_match_log
             r.scene_generation, r.scene_frame, r.scene_reset_count,
             (int)r.scene_switch_failed, r.motion_pack_load_count,
             r.model_load_count, r.model_unload_count, r.live_model_count) >= 0;
+        for (int foot = 0; ok && foot < 2; ++foot) {
+            for (int probe = 0; ok && probe < 4; ++probe) {
+                ok = fprintf(
+                    file, ",%.9g", r.sole_clearance[foot][probe]) >= 0;
+            }
+        }
+        if (ok) ok = fprintf(
+            file,
+            ",%.9g,%.9g,%.9g,%.9g,%.9g,%d,%d\n",
+            r.sole_minimum_clearance[0],
+            r.sole_minimum_clearance[1],
+            r.sole_global_minimum_clearance,
+            r.stance_slip[0],
+            r.stance_slip[1],
+            (int)r.stance_slip_reset[0],
+            (int)r.stance_slip_reset[1]) >= 0;
         if (ok) ok = fflush(file) == 0;
         return ok ? true : io_error(error, error_capacity, "write", errno);
     }

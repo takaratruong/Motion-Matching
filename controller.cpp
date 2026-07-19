@@ -2165,6 +2165,10 @@ int main(void)
     int rendered_frames = 0;
     g1_runtime_diagnostic_snapshot runtime_snapshot;
     bool runtime_snapshot_ready = false;
+    G1SoleDiagnosticState sole_diagnostic_state;
+    const G1LegConfig sole_diagnostic_legs[2] = {
+        g1_left_leg_config(), g1_right_leg_config()
+    };
 
     auto controlled_runtime_error = [&](const char* message)
     {
@@ -3180,6 +3184,34 @@ int main(void)
             return;
         }
 
+        // Stage read-only physical sole diagnostics from the same final
+        // global ankle poses consumed by the corrected mesh. The persistent
+        // slip history is committed only after the complete runtime row is
+        // accepted, so a later diagnostic/log failure remains transactional.
+        G1SoleDiagnosticState sole_state_candidate = sole_diagnostic_state;
+        G1SoleDiagnosticSnapshot sole_snapshot_candidate;
+        const bool sole_contacts[2] = {
+            state.support_observation_now.contact[0],
+            state.support_observation_now.contact[1],
+        };
+        const G1SoleDiagnosticStatus sole_status =
+            g1_sole_diagnostics_observe(
+                sole_snapshot_candidate,
+                sole_state_candidate,
+                active_scene.terrain,
+                state.global_bone_positions,
+                state.global_bone_rotations,
+                sole_diagnostic_legs,
+                sole_contacts,
+                scene_generation,
+                false,
+                artifact_error,
+                static_cast<int>(sizeof(artifact_error)));
+        if (sole_status != G1SoleDiagnosticOk) {
+            controlled_runtime_error(artifact_error);
+            return;
+        }
+
         g1_runtime_diagnostic_snapshot snapshot_candidate;
         if (!g1_runtime_diagnostics_build(
                 snapshot_candidate,
@@ -3194,6 +3226,15 @@ int main(void)
                 motion_pack_load_count,
                 model_load_count,
                 model_unload_count,
+                artifact_error,
+                static_cast<int>(sizeof(artifact_error))))
+        {
+            controlled_runtime_error(artifact_error);
+            return;
+        }
+        if (!g1_runtime_diagnostics_attach_sole(
+                snapshot_candidate,
+                sole_snapshot_candidate,
                 artifact_error,
                 static_cast<int>(sizeof(artifact_error))))
         {
@@ -3307,12 +3348,27 @@ int main(void)
         log_row.model_load_count = snapshot_candidate.model_load_count;
         log_row.model_unload_count = snapshot_candidate.model_unload_count;
         log_row.live_model_count = snapshot_candidate.live_model_count;
+        for (int foot = 0; foot < 2; ++foot) {
+            for (int probe = 0; probe < 4; ++probe) {
+                log_row.sole_clearance[foot][probe] =
+                    snapshot_candidate.sole_clearance[foot][probe];
+            }
+            log_row.sole_minimum_clearance[foot] =
+                snapshot_candidate.sole_minimum_clearance[foot];
+            log_row.stance_slip[foot] =
+                snapshot_candidate.stance_slip[foot];
+            log_row.stance_slip_reset[foot] =
+                snapshot_candidate.stance_slip_reset[foot];
+        }
+        log_row.sole_global_minimum_clearance =
+            snapshot_candidate.sole_global_minimum_clearance;
         if (!deterministic_log.write(
                 log_row, artifact_error, static_cast<int>(sizeof(artifact_error))))
         {
             controlled_runtime_error(artifact_error);
             return;
         }
+        sole_diagnostic_state = sole_state_candidate;
         runtime_snapshot = snapshot_candidate;
         runtime_snapshot_ready = true;
         scene_switch_failed = false;

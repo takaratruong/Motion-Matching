@@ -16,7 +16,7 @@ from resources.check_g1_runtime_log import (
 )
 
 
-RUNTIME_SUFFIX = (
+PRE_SOLE_RUNTIME_SUFFIX = (
     "source_name", "source_terrain", "source_index", "continuation_cost",
     "source_root_height", "source_left_toe_height", "source_right_toe_height",
     "runtime_support_root_height", "runtime_support_left_toe_height",
@@ -32,6 +32,16 @@ RUNTIME_SUFFIX = (
     "motion_pack_load_count", "model_load_count", "model_unload_count",
     "live_model_count",
 )
+SOLE_DIAGNOSTIC_SUFFIX = (
+    "left_sole_clearance_0", "left_sole_clearance_1",
+    "left_sole_clearance_2", "left_sole_clearance_3",
+    "right_sole_clearance_0", "right_sole_clearance_1",
+    "right_sole_clearance_2", "right_sole_clearance_3",
+    "left_sole_min_clearance", "right_sole_min_clearance",
+    "sole_min_clearance", "left_stance_slip", "right_stance_slip",
+    "left_stance_slip_reset", "right_stance_slip_reset",
+)
+RUNTIME_SUFFIX = PRE_SOLE_RUNTIME_SUFFIX + SOLE_DIAGNOSTIC_SUFFIX
 
 TASK11_SCENE_IDS = (
     "grail-curb-default",
@@ -158,6 +168,26 @@ def runtime_row(frame, **changes):
         "mode": "route", "route": "fixture-route", "scene_id": "fixture",
     })
     values.update({key: str(value) for key, value in changes.items()})
+    left_clearances = (0.010, 0.011, 0.012, 0.013)
+    right_clearances = (0.020, 0.021, 0.022, 0.023)
+    for probe, clearance in enumerate(left_clearances):
+        values[f"left_sole_clearance_{probe}"] = str(clearance)
+    for probe, clearance in enumerate(right_clearances):
+        values[f"right_sole_clearance_{probe}"] = str(clearance)
+    values["left_sole_min_clearance"] = str(min(left_clearances))
+    values["right_sole_min_clearance"] = str(min(right_clearances))
+    values["sole_min_clearance"] = str(
+        min(left_clearances + right_clearances))
+    values["left_stance_slip"] = "0"
+    values["right_stance_slip"] = "0"
+    reset = int(values["scene_frame"]) == 0
+    values["left_stance_slip_reset"] = str(int(reset))
+    values["right_stance_slip_reset"] = str(int(reset))
+    # Sole-specific overrides intentionally win after deterministic defaults.
+    values.update({
+        key: str(value) for key, value in changes.items()
+        if key in SOLE_DIAGNOSTIC_SUFFIX
+    })
     if "query_bits_hex" not in changes:
         query_values = [0.0] * 27 + [
             float(values[f"terrain{sample}"]) for sample in range(4)]
@@ -314,6 +344,74 @@ class RuntimeLogTests(unittest.TestCase):
             tuple(RUNTIME_COLUMNS[-len(RUNTIME_SUFFIX):]), RUNTIME_SUFFIX)
         self.assertEqual(
             tuple(RUNTIME_COLUMNS[:-len(RUNTIME_SUFFIX)]), GATE_A_COLUMNS)
+
+    def test_sole_columns_append_without_mutating_the_existing_runtime_prefix(self):
+        expected_prefix = tuple(GATE_A_COLUMNS) + PRE_SOLE_RUNTIME_SUFFIX
+        self.assertEqual(tuple(RUNTIME_COLUMNS[:len(expected_prefix)]),
+                         expected_prefix)
+        self.assertEqual(tuple(RUNTIME_COLUMNS[len(expected_prefix):]),
+                         SOLE_DIAGNOSTIC_SUFFIX)
+
+    def test_requires_ordered_physical_sole_clearances_and_consistent_minima(self):
+        item = runtime_row(0)
+        self.assertEqual(
+            tuple(item)[-len(SOLE_DIAGNOSTIC_SUFFIX):],
+            SOLE_DIAGNOSTIC_SUFFIX)
+        check_rows([item])
+
+        for field, message in (
+                ("left_sole_min_clearance", "left sole minimum"),
+                ("right_sole_min_clearance", "right sole minimum"),
+                ("sole_min_clearance", "global sole minimum")):
+            changed = dict(item)
+            changed[field] = "0.5"
+            with self.assertRaisesRegex(ValueError, message):
+                check_rows([changed])
+
+    def test_rejects_nonfinite_or_negative_sole_and_slip_values(self):
+        for field, value, message in (
+                ("left_sole_clearance_2", "nan", "non-finite"),
+                ("right_sole_min_clearance", "inf", "non-finite"),
+                ("left_stance_slip", "-0.001", "nonnegative"),
+                ("right_stance_slip_reset", "2", "must be 0 or 1")):
+            item = runtime_row(0)
+            item[field] = value
+            with self.assertRaisesRegex(ValueError, message):
+                check_rows([item])
+
+    def test_slip_history_resets_on_contact_edges_and_scene_generation(self):
+        rows = [runtime_row(frame) for frame in range(5)]
+        rows[1].update({
+            "left_stance_slip": "0.01",
+            "right_stance_slip": "0.02",
+        })
+        rows[2].update({
+            "left_contact": "0", "left_stance_slip": "0",
+            "left_stance_slip_reset": "1",
+            "right_stance_slip": "0.03",
+        })
+        rows[3].update({
+            "left_contact": "1", "left_stance_slip": "0",
+            "left_stance_slip_reset": "1",
+            "right_stance_slip": "0.04",
+        })
+        rows[4].update({
+            "scene_generation": "1", "scene_frame": "0",
+            "scene_reset_count": "2",
+            "left_stance_slip": "0", "right_stance_slip": "0",
+            "left_stance_slip_reset": "1",
+            "right_stance_slip_reset": "1",
+        })
+        check_rows(rows)
+
+        for field, message in (
+                ("left_stance_slip_reset", "contact edge"),
+                ("right_stance_slip_reset", "scene reset")):
+            changed = [dict(item) for item in rows]
+            target = 2 if field.startswith("left") else 4
+            changed[target][field] = "0"
+            with self.assertRaisesRegex(ValueError, message):
+                check_rows(changed)
 
     def test_surface_height_names_are_frozen_before_runtime_schema(self):
         for name in (
@@ -810,6 +908,8 @@ class RuntimeLogTests(unittest.TestCase):
                 "database_frame": str(current),
                 "query_database_frame": str(query),
                 "selected_database_frame": str(query),
+                "left_stance_slip_reset": str(int(scene_frame == 0)),
+                "right_stance_slip_reset": str(int(scene_frame == 0)),
             })
         self.assertEqual(check_rows(rows)["frames"], 24)
 
@@ -964,6 +1064,10 @@ class RuntimeLogTests(unittest.TestCase):
                     treatment_row["scene_generation"] = "1"
                     treatment_row["scene_frame"] = str(index - 40)
                     treatment_row["scene_reset_count"] = "2"
+                    treatment_row["left_stance_slip_reset"] = str(
+                        int(index == 40))
+                    treatment_row["right_stance_slip_reset"] = str(
+                        int(index == 40))
             elif field in ("route_waypoint", "route_complete"):
                 treatment[40][field] = "9" if field == "route_waypoint" else "1"
             else:
