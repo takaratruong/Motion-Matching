@@ -20,9 +20,11 @@ class SchemaTests(unittest.TestCase):
         b = SkeletonSpec(("Simulation", "Hips"), np.array([-1, -1], np.int32))
         self.assertNotEqual(a.signature(), b.signature())
 
-    def test_holden_clip_requires_four_terrain_columns(self):
+    def test_holden_clip_empty_factory_and_validation_require_twelve_columns(self):
         clip = HoldenClip.empty(frames=3, bones=2)
-        clip.terrain_features = np.zeros((3, 3), np.float32)
+        self.assertEqual(clip.terrain_features.shape, (3, 12))
+        self.assertEqual(clip.terrain_features.dtype, np.dtype(np.float32))
+        clip.terrain_features = np.zeros((3, 11), np.float32)
         with self.assertRaisesRegex(ValueError, "terrain feature shape"):
             clip.validate()
 
@@ -42,6 +44,14 @@ class SchemaTests(unittest.TestCase):
             artifacts.validate()
         artifacts.terrain_support = np.full((3, 3), np.nan, np.float32)
         with self.assertRaisesRegex(ValueError, "finite"):
+            artifacts.validate()
+
+    def test_artifact_set_empty_factory_and_validation_require_twelve_columns(self):
+        artifacts = ArtifactSet.empty(frames=3, bones=2)
+        self.assertEqual(artifacts.terrain_features.shape, (3, 12))
+        self.assertEqual(artifacts.terrain_features.dtype, np.dtype(np.float32))
+        artifacts.terrain_features = np.zeros((3, 11), np.float32)
+        with self.assertRaisesRegex(ValueError, "terrain feature shape"):
             artifacts.validate()
 
     def test_artifact_set_rejects_range_overlap(self):

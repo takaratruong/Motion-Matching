@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import pickle
 import struct
@@ -29,12 +30,17 @@ from resources.g1_terrain_builder.terrain import (
     GrailTerrain,
     HeightGrid,
     StepTerrain,
+    TERRAIN_CROSS_TRACK_DISTANCES,
+    TERRAIN_LONGITUDINAL_DISTANCES,
+    TERRAIN_SOLE_CORRIDOR_OFFSET_M,
     VerticalTriangleSurface,
     build_facing_centerline,
+    classify_terrain_profile,
     export_heightfield,
     export_heightfield_obj,
     grail_surface_parity,
     rasterize_heightfield,
+    sample_terrain_descriptor,
     sample_terrain_features,
     surface_semantics,
     surface_semantics_signature,
@@ -54,7 +60,276 @@ GRAIL_PARITY_BASES = (
 )
 
 
+class _PlaneTerrain:
+    def __init__(self, slope_x=0.0, slope_z=0.0, origin_x=0.0,
+                 origin_z=0.0, elevation=0.0):
+        self.slope_x = slope_x
+        self.slope_z = slope_z
+        self.origin_x = origin_x
+        self.origin_z = origin_z
+        self.elevation = elevation
+
+    def height(self, x, z):
+        return (
+            self.elevation
+            + self.slope_x * (x - self.origin_x)
+            + self.slope_z * (z - self.origin_z)
+        )
+
+
+def _dense_profile(height_function, grade=0.0):
+    distances = np.linspace(0.0, 1.0, 51, dtype=np.float64)
+    heights = np.asarray(
+        [height_function(float(distance)) for distance in distances],
+        dtype=np.float64,
+    )
+    normal = np.array([-grade, 1.0, 0.0], np.float64)
+    normal /= np.linalg.norm(normal)
+    normals = np.tile(normal, (len(distances), 1))
+    return distances, heights, normals
+
+
+def _straight_centerline(root=(0.0, 0.0), direction=(1.0, 0.0)):
+    root = np.asarray(root, np.float64)
+    direction = np.asarray(direction, np.float64)
+    direction /= np.linalg.norm(direction)
+    return np.stack((root, root + direction))
+
+
 class TerrainTests(unittest.TestCase):
+    def test_flat_descriptor_has_exact_twelve_float32_zeroes(self):
+        descriptor = sample_terrain_descriptor(
+            FlatTerrain(),
+            _straight_centerline((3.0, -2.0)),
+            np.array([0.0, 1.0]),
+        )
+
+        self.assertEqual(
+            TERRAIN_LONGITUDINAL_DISTANCES,
+            (0.125, 0.250, 0.375, 0.500, 0.625, 0.750, 0.875, 1.000),
+        )
+        self.assertEqual(
+            TERRAIN_CROSS_TRACK_DISTANCES, (0.25, 0.50, 0.75, 1.00))
+        self.assertEqual(descriptor.shape, (12,))
+        self.assertEqual(descriptor.dtype, np.dtype(np.float32))
+        self.assertTrue(np.isfinite(descriptor).all())
+        np.testing.assert_array_equal(descriptor, np.zeros(12, np.float32))
+
+    def test_exact_ten_degree_longitudinal_slope_descriptor_and_classifier(self):
+        grade = math.tan(math.radians(10.0))
+        terrain = _PlaneTerrain(slope_x=grade, elevation=4.25)
+        descriptor = sample_terrain_descriptor(
+            terrain, _straight_centerline(), np.array([1.0, 0.0]))
+        expected = np.array([
+            *(grade * distance
+              for distance in TERRAIN_LONGITUDINAL_DISTANCES),
+            0.0, 0.0, 0.0, 0.0,
+        ], np.float32)
+        np.testing.assert_array_equal(descriptor, expected)
+
+        profile = _dense_profile(lambda distance: grade * distance, grade)
+        result = classify_terrain_profile(*profile)
+        self.assertEqual(result.family, "slope")
+        self.assertEqual(result.elevation_mode, 1)
+        self.assertGreater(result.confidence, 0.9)
+        self.assertAlmostEqual(result.step_height_m, 0.0, places=12)
+        self.assertAlmostEqual(result.grade_degrees, 10.0, places=10)
+
+    def test_exact_ten_degree_cross_slope_uses_fixed_sole_corridors(self):
+        grade = math.tan(math.radians(10.0))
+        descriptor = sample_terrain_descriptor(
+            _PlaneTerrain(slope_z=grade),
+            _straight_centerline(),
+            np.array([1.0, 0.0]),
+        )
+        expected_difference = np.float32(
+            2.0 * TERRAIN_SOLE_CORRIDOR_OFFSET_M * grade)
+        np.testing.assert_array_equal(descriptor[:8], np.zeros(8, np.float32))
+        np.testing.assert_array_equal(
+            descriptor[8:], np.full(4, expected_difference, np.float32))
+
+        distances = np.linspace(0.0, 1.0, 51, dtype=np.float64)
+        heights = np.zeros_like(distances)
+        normal = np.array([0.0, 1.0, -grade], np.float64)
+        normal /= np.linalg.norm(normal)
+        normals = np.tile(normal, (len(distances), 1))
+        result = classify_terrain_profile(distances, heights, normals)
+        self.assertEqual(result.family, "slope")
+        self.assertEqual(result.elevation_mode, 0)
+        self.assertGreater(result.confidence, 0.9)
+        self.assertAlmostEqual(result.grade_degrees, 0.0, places=12)
+
+    def test_descriptor_follows_curved_centerline_arc_distance(self):
+        class LinearTerrain:
+            @staticmethod
+            def height(x, z):
+                return x + 10.0 * z
+
+        centerline = np.array([
+            [0.0, 0.0],
+            [0.5, 0.0],
+            [0.5, 0.5],
+        ], np.float64)
+        heading = np.array([0.0, 1.0], np.float64)
+        centerline_before = centerline.copy()
+        heading_before = heading.copy()
+
+        descriptor = sample_terrain_descriptor(
+            LinearTerrain(), centerline, heading)
+
+        np.testing.assert_allclose(
+            descriptor[:8],
+            [0.125, 0.25, 0.375, 0.5, 1.75, 3.0, 4.25, 5.5],
+            rtol=0.0, atol=1e-7)
+        np.testing.assert_allclose(
+            descriptor[8:],
+            np.full(4, -2.0 * TERRAIN_SOLE_CORRIDOR_OFFSET_M),
+            rtol=0.0, atol=1e-7)
+        np.testing.assert_array_equal(centerline, centerline_before)
+        np.testing.assert_array_equal(heading, heading_before)
+
+    def test_descriptor_is_translation_invariant_deterministic_and_pure(self):
+        grade = math.tan(math.radians(10.0))
+        centerline = _straight_centerline((2.0, -3.0)).astype(np.float32)
+        heading = np.array([0.0, 1.0], np.float32)
+        centerline_before, heading_before = centerline.copy(), heading.copy()
+        translated = sample_terrain_descriptor(
+            _PlaneTerrain(slope_x=grade, origin_x=2.0, origin_z=-3.0,
+                          elevation=7.0),
+            centerline, heading)
+        repeated = sample_terrain_descriptor(
+            _PlaneTerrain(slope_x=grade, origin_x=2.0, origin_z=-3.0,
+                          elevation=7.0),
+            centerline, heading)
+        origin = sample_terrain_descriptor(
+            _PlaneTerrain(slope_x=grade),
+            _straight_centerline().astype(np.float32), heading)
+
+        np.testing.assert_array_equal(translated.view(np.uint32),
+                                      repeated.view(np.uint32))
+        np.testing.assert_array_equal(translated, origin)
+        np.testing.assert_array_equal(centerline, centerline_before)
+        np.testing.assert_array_equal(heading, heading_before)
+        self.assertGreater(abs(translated[8]), 0.0)
+
+    def test_descriptor_is_bit_deterministic_at_float32_query_boundaries(self):
+        axis = np.arange(201, dtype=np.float32)
+        heights = (axis[:, None] + 2.0 * axis[None, :]) * np.float32(0.001)
+        terrain = HeightGrid(heights, -0.5, -0.5, 0.01, 0.0)
+        root_x = np.nextafter(
+            np.float32(0.125), np.float32(np.inf), dtype=np.float32)
+        centerline = np.array([
+            [root_x, np.float32(0.0)],
+            [np.float32(root_x + 1.0), np.float32(0.0)],
+        ], np.float32)
+        heading = np.array([1.0, 0.0], np.float32)
+
+        first = sample_terrain_descriptor(terrain, centerline, heading)
+        second = sample_terrain_descriptor(terrain, centerline, heading)
+
+        np.testing.assert_array_equal(first.view(np.uint32),
+                                      second.view(np.uint32))
+        self.assertTrue(np.isfinite(first).all())
+
+    def test_descriptor_rejects_malformed_degenerate_nonfinite_and_domain_inputs(self):
+        valid = (FlatTerrain(), _straight_centerline(), np.array([1.0, 0.0]))
+        cases = (
+            ((FlatTerrain(), np.zeros(3), valid[2]), "centerline"),
+            ((FlatTerrain(), np.array([[0.0, 0.0], [0.999, 0.0]]), valid[2]),
+             "one-metre"),
+            ((FlatTerrain(), valid[1], np.zeros(2)), "heading"),
+            ((FlatTerrain(), np.array([[0.0, 0.0], [np.nan, 0.0]]),
+              valid[2]), "finite"),
+        )
+        for arguments, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    sample_terrain_descriptor(*arguments)
+
+        class NonfiniteTerrain:
+            @staticmethod
+            def height(x, z):
+                return np.nan
+
+        with self.assertRaisesRegex(ValueError, "finite"):
+            sample_terrain_descriptor(
+                NonfiniteTerrain(), valid[1], valid[2])
+
+        bounded = HeightGrid(np.zeros((3, 3), np.float32), 0.0, 0.0, 0.5, 0.0)
+        with self.assertRaisesRegex(ValueError, "domain"):
+            sample_terrain_descriptor(
+                bounded, _straight_centerline((0.5, 0.5)), valid[2])
+
+    def test_flat_curb_stair_and_mirrored_descent_profiles(self):
+        flat = classify_terrain_profile(*_dense_profile(lambda distance: 0.0))
+        self.assertEqual((flat.family, flat.elevation_mode), ("flat", 0))
+
+        cases = (
+            ("curb", lambda distance: 0.12 if distance >= 0.50 else 0.0),
+            ("stair", lambda distance: 0.12 * sum(
+                distance >= edge for edge in (0.20, 0.52, 0.84))),
+        )
+        for family, height_function in cases:
+            with self.subTest(family=family, direction="ascent"):
+                ascent = classify_terrain_profile(*_dense_profile(height_function))
+                self.assertEqual(ascent.family, family)
+                self.assertEqual(ascent.elevation_mode, 1)
+                self.assertGreater(ascent.confidence, 0.8)
+                self.assertAlmostEqual(ascent.step_height_m, 0.12, places=10)
+            with self.subTest(family=family, direction="descent"):
+                descent = classify_terrain_profile(*_dense_profile(
+                    lambda distance: -height_function(distance)))
+                self.assertEqual(descent.family, family)
+                self.assertEqual(descent.elevation_mode, -1)
+                self.assertGreater(descent.confidence, 0.8)
+                self.assertAlmostEqual(descent.step_height_m, -0.12, places=10)
+
+        grade = math.tan(math.radians(10.0))
+        descent_slope = classify_terrain_profile(*_dense_profile(
+            lambda distance: -grade * distance, -grade))
+        self.assertEqual(descent_slope.family, "slope")
+        self.assertEqual(descent_slope.elevation_mode, -1)
+        self.assertAlmostEqual(descent_slope.grade_degrees, -10.0, places=10)
+
+    def test_dense_profile_distinguishes_legacy_four_sample_alias(self):
+        slope_grade = 0.36
+        slope_profile = _dense_profile(
+            lambda distance: slope_grade * distance, slope_grade)
+        stair_profile = _dense_profile(lambda distance: 0.09 * sum(
+            distance >= edge for edge in (0.125, 0.375, 0.625, 0.875)))
+        old_distances = np.array([0.25, 0.50, 0.75, 1.00])
+        old_slope = slope_grade * old_distances
+        old_stair = np.array([0.09 * sum(
+            distance >= edge for edge in (0.125, 0.375, 0.625, 0.875))
+            for distance in old_distances])
+        np.testing.assert_allclose(old_slope, old_stair, rtol=0.0, atol=1e-15)
+
+        slope = classify_terrain_profile(*slope_profile)
+        stair = classify_terrain_profile(*stair_profile)
+        self.assertEqual(slope.family, "slope")
+        self.assertEqual(stair.family, "stair")
+
+    def test_classifier_rejects_nonfinite_degenerate_malformed_and_out_of_domain(self):
+        distances, heights, normals = _dense_profile(lambda distance: 0.0)
+        cases = (
+            ((distances, np.full_like(heights, np.nan), normals), "finite"),
+            ((distances, heights, np.zeros_like(normals)), "normal"),
+            ((distances, heights[:-1], normals), "shape"),
+            ((distances, heights, normals[:, :2]), "shape"),
+            ((distances[:4], heights[:4], normals[:4]), "dense"),
+            ((np.linspace(0.0, 0.9, len(distances)), heights, normals),
+             "domain"),
+        )
+        for arguments, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    classify_terrain_profile(*arguments)
+
+        duplicate = distances.copy()
+        duplicate[2] = duplicate[1]
+        with self.assertRaisesRegex(ValueError, "increasing"):
+            classify_terrain_profile(duplicate, heights, normals)
+
     def test_release_surfaces_match_reconstruction_oracle_on_locked_curbs(self):
         for base in GRAIL_PARITY_BASES:
             with self.subTest(base=base):

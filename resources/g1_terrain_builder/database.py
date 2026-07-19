@@ -125,7 +125,7 @@ def _validate_artifacts(artifacts: ArtifactSet) -> None:
         "rotations": (frames, bones, 4),
         "angular_velocities": (frames, bones, 3),
         "contacts": (frames, 2),
-        "terrain_features": (frames, 4),
+        "terrain_features": (frames, 12),
         "terrain_support": (frames, 3),
     }
     for name, shape in expected.items():
@@ -295,7 +295,7 @@ def read_holden_database(path: os.PathLike | str) -> ArtifactSet:
         range_starts,
         range_stops,
         contacts,
-        np.zeros((len(positions), 4), np.float32),
+        np.zeros((len(positions), 12), np.float32),
         np.zeros((len(positions), 3), np.float32),
     )
     _validate_artifacts(artifacts)

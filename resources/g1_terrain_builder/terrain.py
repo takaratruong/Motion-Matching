@@ -5,6 +5,7 @@ import math
 import os
 import pickle
 import struct
+from typing import NamedTuple
 import warnings
 
 import numpy as np
@@ -16,6 +17,45 @@ from .sources import load_grail_object_pose
 
 
 LOOKAHEAD = np.array([0.25, 0.50, 0.75, 1.00], np.float64)
+TERRAIN_LONGITUDINAL_DISTANCES = (
+    0.125, 0.250, 0.375, 0.500, 0.625, 0.750, 0.875, 1.000,
+)
+TERRAIN_CROSS_TRACK_DISTANCES = (0.25, 0.50, 0.75, 1.00)
+# The corrected neutral G1 ankle is 0.118506455 m from the root centerline and
+# the outer toe sole probe is another 0.030 m laterally.  Their sum fixes the
+# swept outer-sole corridor without consulting any route/classification result.
+TERRAIN_SOLE_CORRIDOR_OFFSET_M = 0.148506455
+
+# Dense profiles cover the same one-metre horizon as the matching descriptor.
+TERRAIN_PROFILE_DOMAIN_START_M = 0.0
+TERRAIN_PROFILE_DOMAIN_STOP_M = 1.0
+TERRAIN_PROFILE_DOMAIN_TOLERANCE_M = 1e-9
+# A nominal one-metre float32 path can be 1.49e-8 m short when independently
+# rounded endpoints straddle a binade; one binary32 ULP at 1 m accepts that
+# representation while still rejecting materially short centerlines.
+TERRAIN_CENTERLINE_HORIZON_TOLERANCE_M = float(np.spacing(np.float32(1.0)))
+TERRAIN_PROFILE_MIN_SAMPLES = 9
+TERRAIN_PROFILE_MAX_SAMPLE_SPACING_M = 0.05
+TERRAIN_PROFILE_MIN_NORMAL_LENGTH = 1e-12  # Dimensionless unit-vector norm.
+TERRAIN_PROFILE_MIN_UP_NORMAL = 1e-6  # Dimensionless upward component.
+# Two degrees yields only 0.035 m rise over the locked one-metre horizon; both
+# angle and range must be small before a profile is considered negligible.
+TERRAIN_FLAT_MAX_ABS_GRADE_DEGREES = 2.0
+TERRAIN_FLAT_MAX_LEVEL_RANGE_M = 0.04
+# Half the locked 0.12 m curb/stair rise separates a riser from the 10-degree
+# ramp's <= 0.009 m change across the maximum 0.05 m sample interval.
+TERRAIN_DISCONTINUITY_MIN_STEP_M = 0.06
+TERRAIN_STAIR_MIN_STEP_COUNT = 2
+# The locked 0.32 m tread and the 0.25 m alias fixture lie inside this band;
+# isolated curb edges and implausibly close noise do not.
+TERRAIN_STAIR_MIN_TREAD_M = 0.15
+TERRAIN_STAIR_MAX_TREAD_M = 0.45
+TERRAIN_ELEVATION_MIN_CHANGE_M = 0.03
+# Confidence anchors are the exact analytic cases required by the design.
+TERRAIN_CONFIDENCE_REFERENCE_STEP_M = 0.12
+TERRAIN_CONFIDENCE_REFERENCE_SLOPE_DEGREES = 10.0
+TERRAIN_CONFIDENCE_REFERENCE_STAIR_STEPS = 3
+TERRAIN_CONFIDENCE_MAX_LINEAR_RESIDUAL_M = 0.02
 USD_DIR = "/home/ubuntu/datasets/GRAIL/data/curb/object_usd"
 RECON_DIR = "/home/ubuntu/datasets/GRAIL/data/curb/recon"
 # GRAIL object poses are expressed for the Isaac-imported asset basis.  Raw
@@ -204,6 +244,286 @@ def _point_at_arc_distance(line: np.ndarray, distance: float) -> np.ndarray:
             return start + (remaining / max(length, 1e-8)) * (end - start)
         remaining -= length
     return line[-1]
+
+
+class TerrainClassification(NamedTuple):
+    family: str
+    elevation_mode: int
+    confidence: float
+    step_height_m: float
+    grade_degrees: float
+
+
+def _descriptor_xz(value, name: str, require_direction: bool) -> np.ndarray:
+    source = np.asarray(value)
+    if np.iscomplexobj(source):
+        raise ValueError(f"{name} must contain real finite coordinates")
+    try:
+        result = np.array(source, np.float64, copy=True)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"{name} must have shape (2,) with finite coordinates") from error
+    if result.shape != (2,):
+        raise ValueError(f"{name} must have shape (2,), got {result.shape}")
+    if not np.all(np.isfinite(result)):
+        raise ValueError(f"{name} coordinates must be finite")
+    if require_direction:
+        length = float(np.linalg.norm(result))
+        if not math.isfinite(length) or length <= 0.0:
+            raise ValueError(f"{name} direction must be non-degenerate")
+        result = result / length
+    return result
+
+
+def _descriptor_centerline(centerline_xz) -> np.ndarray:
+    source = np.asarray(centerline_xz)
+    if np.iscomplexobj(source):
+        raise ValueError("centerline_xz must contain real finite coordinates")
+    try:
+        centerline = np.array(source, np.float64, copy=True)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(
+            "centerline_xz must have shape (N, 2) with finite coordinates") \
+            from error
+    if centerline.ndim != 2 or centerline.shape[1:] != (2,) \
+            or len(centerline) < 2:
+        raise ValueError(
+            f"centerline_xz must have shape (N, 2), got {centerline.shape}")
+    if not np.all(np.isfinite(centerline)):
+        raise ValueError("centerline_xz coordinates must be finite")
+    segment_lengths = np.linalg.norm(np.diff(centerline, axis=0), axis=1)
+    if float(np.sum(segment_lengths)) \
+            < TERRAIN_PROFILE_DOMAIN_STOP_M \
+            - TERRAIN_CENTERLINE_HORIZON_TOLERANCE_M:
+        raise ValueError("centerline_xz must span the one-metre terrain horizon")
+    return centerline
+
+
+def _descriptor_height(terrain, point: np.ndarray) -> float:
+    height_function = getattr(terrain, "height", None)
+    if not callable(height_function):
+        raise TypeError("terrain must provide a callable height(x, z)")
+    if isinstance(terrain, HeightGrid) and terrain._cell(*point) is None:
+        raise ValueError("terrain descriptor query is outside the heightfield domain")
+    try:
+        height = float(height_function(*point))
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError("terrain descriptor height query failed") from error
+    if not math.isfinite(height):
+        raise ValueError("terrain descriptor heights must be finite")
+    return height
+
+
+def sample_terrain_descriptor(
+    terrain,
+    centerline_xz: np.ndarray,
+    heading_xz: np.ndarray,
+) -> np.ndarray:
+    """Sample the G1TF/v2 descriptor without modifying command vectors."""
+    centerline = _descriptor_centerline(centerline_xz)
+    heading = _descriptor_xz(heading_xz, "heading_xz", True)
+    left = np.array([-heading[1], heading[0]], np.float64)
+    root = centerline[0]
+    root_height = _descriptor_height(terrain, root)
+
+    values = []
+    for distance in TERRAIN_LONGITUDINAL_DISTANCES:
+        center = _point_at_arc_distance(centerline, distance)
+        values.append(_descriptor_height(terrain, center) - root_height)
+    for distance in TERRAIN_CROSS_TRACK_DISTANCES:
+        center = _point_at_arc_distance(centerline, distance)
+        left_height = _descriptor_height(
+            terrain, center + left * TERRAIN_SOLE_CORRIDOR_OFFSET_M)
+        right_height = _descriptor_height(
+            terrain, center - left * TERRAIN_SOLE_CORRIDOR_OFFSET_M)
+        values.append(left_height - right_height)
+
+    with np.errstate(over="ignore", invalid="ignore"):
+        descriptor = np.asarray(values, np.float32)
+    if descriptor.shape != (12,) or not np.all(np.isfinite(descriptor)):
+        raise ValueError("terrain descriptor must contain twelve finite float32 values")
+    descriptor[descriptor == 0.0] = np.float32(0.0)
+    return descriptor
+
+
+def _terrain_profile_arrays(
+    distances_m,
+    heights_m,
+    surface_normals,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    sources = tuple(np.asarray(value) for value in (
+        distances_m, heights_m, surface_normals))
+    if any(np.iscomplexobj(value) for value in sources):
+        raise ValueError("terrain profile values must be real and finite")
+    try:
+        distances = np.array(sources[0], np.float64, copy=True)
+        heights = np.array(sources[1], np.float64, copy=True)
+        normals = np.array(sources[2], np.float64, copy=True)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError("terrain profile values must be finite numeric arrays") \
+            from error
+    if distances.ndim != 1 or heights.shape != distances.shape:
+        raise ValueError("terrain profile distance/height shape mismatch")
+    if normals.shape != (len(distances), 3):
+        raise ValueError(
+            "terrain profile normal shape must be (samples, 3)")
+    if len(distances) < TERRAIN_PROFILE_MIN_SAMPLES:
+        raise ValueError("terrain profile must provide a dense sample sequence")
+    if not (
+        np.all(np.isfinite(distances))
+        and np.all(np.isfinite(heights))
+        and np.all(np.isfinite(normals))
+    ):
+        raise ValueError("terrain profile values must be finite")
+    intervals = np.diff(distances)
+    if np.any(intervals <= 0.0):
+        raise ValueError("terrain profile distances must be strictly increasing")
+    if (
+        abs(distances[0] - TERRAIN_PROFILE_DOMAIN_START_M)
+        > TERRAIN_PROFILE_DOMAIN_TOLERANCE_M
+        or abs(distances[-1] - TERRAIN_PROFILE_DOMAIN_STOP_M)
+        > TERRAIN_PROFILE_DOMAIN_TOLERANCE_M
+    ):
+        raise ValueError("terrain profile distances are outside the one-metre domain")
+    if np.max(intervals) > (
+        TERRAIN_PROFILE_MAX_SAMPLE_SPACING_M
+        + TERRAIN_PROFILE_DOMAIN_TOLERANCE_M
+    ):
+        raise ValueError("terrain profile is not dense across its domain")
+    lengths = np.linalg.norm(normals, axis=1)
+    if np.any(lengths < TERRAIN_PROFILE_MIN_NORMAL_LENGTH):
+        raise ValueError("terrain profile contains a degenerate surface normal")
+    normals /= lengths[:, None]
+    if np.any(normals[:, 1] < TERRAIN_PROFILE_MIN_UP_NORMAL):
+        raise ValueError("terrain profile surface normals must face upward")
+    return distances, heights, normals
+
+
+def _profile_discontinuities(
+    distances: np.ndarray,
+    heights: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    deltas = np.diff(heights)
+    candidate_indices = np.flatnonzero(
+        np.abs(deltas) >= TERRAIN_DISCONTINUITY_MIN_STEP_M)
+    if not len(candidate_indices):
+        return np.empty(0, np.float64), np.empty(0, np.float64)
+
+    groups = []
+    start = previous = int(candidate_indices[0])
+    for index_value in candidate_indices[1:]:
+        index = int(index_value)
+        if index != previous + 1:
+            groups.append((start, previous))
+            start = index
+        previous = index
+    groups.append((start, previous))
+    steps = np.array([
+        np.sum(deltas[start:stop + 1]) for start, stop in groups
+    ], np.float64)
+    positions = np.array([
+        0.5 * (distances[start] + distances[stop + 1])
+        for start, stop in groups
+    ], np.float64)
+    return positions, steps
+
+
+def _signed_mode(value: float) -> int:
+    if abs(value) < TERRAIN_ELEVATION_MIN_CHANGE_M:
+        return 0
+    return 1 if value > 0.0 else -1
+
+
+def classify_terrain_profile(
+    distances_m,
+    heights_m,
+    surface_normals,
+) -> TerrainClassification:
+    """Classify a dense one-metre forward height/normal profile."""
+    distances, heights, normals = _terrain_profile_arrays(
+        distances_m, heights_m, surface_normals)
+    relative_heights = heights - heights[0]
+    centered_distances = distances - np.mean(distances)
+    centered_heights = relative_heights - np.mean(relative_heights)
+    grade = float(
+        np.dot(centered_distances, centered_heights)
+        / np.dot(centered_distances, centered_distances))
+    grade_degrees = math.degrees(math.atan(grade))
+    normal_grades = -normals[:, 0] / normals[:, 1]
+    normal_grade_degrees = math.degrees(math.atan(float(np.median(normal_grades))))
+    surface_grades = np.linalg.norm(normals[:, (0, 2)], axis=1) / normals[:, 1]
+    surface_grade_degrees = math.degrees(
+        math.atan(float(np.median(surface_grades))))
+    positions, steps = _profile_discontinuities(distances, relative_heights)
+
+    if len(steps):
+        step_height = float(np.median(steps))
+        same_direction = np.all(np.sign(steps) == np.sign(step_height))
+        tread_widths = np.diff(positions)
+        repeated_treads = (
+            len(steps) >= TERRAIN_STAIR_MIN_STEP_COUNT
+            and same_direction
+            and len(tread_widths) > 0
+            and np.all(tread_widths >= TERRAIN_STAIR_MIN_TREAD_M)
+            and np.all(tread_widths <= TERRAIN_STAIR_MAX_TREAD_M)
+        )
+        if repeated_treads:
+            tread_span = TERRAIN_STAIR_MAX_TREAD_M - TERRAIN_STAIR_MIN_TREAD_M
+            regularity = 1.0 - min(
+                1.0, float(np.ptp(tread_widths)) / tread_span)
+            confidence = min(
+                1.0,
+                len(steps) / TERRAIN_CONFIDENCE_REFERENCE_STAIR_STEPS,
+                abs(step_height) / TERRAIN_CONFIDENCE_REFERENCE_STEP_M,
+                regularity,
+            )
+            return TerrainClassification(
+                "stair", _signed_mode(step_height), float(confidence),
+                step_height, grade_degrees)
+
+        largest_index = int(np.argmax(np.abs(steps)))
+        step_height = float(steps[largest_index])
+        confidence = min(
+            1.0, abs(step_height) / TERRAIN_CONFIDENCE_REFERENCE_STEP_M)
+        return TerrainClassification(
+            "curb", _signed_mode(step_height), float(confidence),
+            step_height, grade_degrees)
+
+    level_range = float(np.ptp(relative_heights))
+    if (
+        level_range <= TERRAIN_FLAT_MAX_LEVEL_RANGE_M
+        and abs(grade_degrees) <= TERRAIN_FLAT_MAX_ABS_GRADE_DEGREES
+        and surface_grade_degrees <= TERRAIN_FLAT_MAX_ABS_GRADE_DEGREES
+    ):
+        range_margin = 1.0 - min(
+            1.0, level_range / TERRAIN_FLAT_MAX_LEVEL_RANGE_M)
+        grade_margin = 1.0 - min(
+            1.0,
+            max(abs(grade_degrees), surface_grade_degrees)
+            / TERRAIN_FLAT_MAX_ABS_GRADE_DEGREES,
+        )
+        confidence = min(range_margin, grade_margin)
+        return TerrainClassification(
+            "flat", 0, float(confidence), 0.0, grade_degrees)
+
+    fitted = grade * distances + relative_heights[0]
+    residual = float(np.max(np.abs(relative_heights - fitted)))
+    residual_confidence = 1.0 - min(
+        1.0, residual / TERRAIN_CONFIDENCE_MAX_LINEAR_RESIDUAL_M)
+    angle_confidence = min(
+        1.0, max(abs(grade_degrees), surface_grade_degrees)
+        / TERRAIN_CONFIDENCE_REFERENCE_SLOPE_DEGREES)
+    normal_agreement = 1.0 - min(
+        1.0,
+        abs(grade_degrees - normal_grade_degrees)
+        / TERRAIN_CONFIDENCE_REFERENCE_SLOPE_DEGREES,
+    )
+    confidence = min(angle_confidence, residual_confidence, normal_agreement)
+    profile_rise_m = grade * (
+        TERRAIN_PROFILE_DOMAIN_STOP_M - TERRAIN_PROFILE_DOMAIN_START_M)
+    return TerrainClassification(
+        "slope", _signed_mode(profile_rise_m), float(confidence), 0.0,
+        grade_degrees)
 
 
 def sample_terrain_features(terrain, centerline: np.ndarray) -> np.ndarray:

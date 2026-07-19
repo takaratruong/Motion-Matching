@@ -84,8 +84,8 @@ class DatabaseBuilderTests(unittest.TestCase):
     def test_combination_preserves_support_rows_at_clip_boundaries(self):
         first = HoldenClip.empty(3, 1)
         second = HoldenClip.empty(2, 1)
-        first.terrain_features[:] = [10.0, 11.0, 12.0, 13.0]
-        second.terrain_features[:] = [20.0, 21.0, 22.0, 23.0]
+        first.terrain_features[:] = np.arange(10.0, 22.0)
+        second.terrain_features[:] = np.arange(20.0, 32.0)
         first.terrain_support[:] = [1.0, 2.0, 3.0]
         second.terrain_support[:] = [4.0, 5.0, 6.0]
         artifacts = combine_clips(
@@ -93,8 +93,8 @@ class DatabaseBuilderTests(unittest.TestCase):
             SkeletonSpec(("Simulation",), np.array([-1], np.int32)),
         )
         np.testing.assert_array_equal(artifacts.terrain_features, [
-            [10, 11, 12, 13], [10, 11, 12, 13], [10, 11, 12, 13],
-            [20, 21, 22, 23], [20, 21, 22, 23],
+            list(range(10, 22)), list(range(10, 22)), list(range(10, 22)),
+            list(range(20, 32)), list(range(20, 32)),
         ])
         np.testing.assert_array_equal(artifacts.terrain_support, [
             [1, 2, 3], [1, 2, 3], [1, 2, 3],
@@ -416,7 +416,17 @@ class DatabaseBuilderTests(unittest.TestCase):
         self.assertEqual(loaded.positions.dtype, np.dtype("<f4"))
         self.assertEqual(loaded.parents.dtype, np.dtype("<i4"))
         np.testing.assert_array_equal(
+            loaded.terrain_features, np.zeros((4, 12), np.float32))
+        np.testing.assert_array_equal(
             loaded.terrain_support, np.zeros((4, 3), np.float32))
+
+    def test_holden_writer_rejects_legacy_four_column_terrain_features(self):
+        artifacts = ArtifactSet.empty(4, 2)
+        artifacts.terrain_features = np.zeros((4, 4), np.float32)
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaisesRegex(ValueError, "terrain_features.*12"):
+                write_holden_database(
+                    os.path.join(td, "database.bin"), artifacts)
 
     def test_holden_writer_rejects_misaligned_arrays(self):
         artifacts = ArtifactSet.empty(4, 2)

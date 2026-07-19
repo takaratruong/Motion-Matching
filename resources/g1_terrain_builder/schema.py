@@ -58,7 +58,7 @@ class HoldenClip:
             np.tile(np.array([1, 0, 0, 0], np.float32), (frames, bones, 1)),
             np.zeros((frames, bones, 3), np.float32),
             np.zeros((frames, 2), np.uint8),
-            np.zeros((frames, 4), np.float32),
+            np.zeros((frames, 12), np.float32),
             np.zeros((frames, 3), np.float32),
             np.arange(frames),
             "flat",
@@ -74,8 +74,8 @@ class HoldenClip:
             raise ValueError("angular velocity shape mismatch")
         if self.contacts.shape != (frames, 2):
             raise ValueError("contact shape mismatch")
-        if self.terrain_features.shape != (frames, 4):
-            raise ValueError("terrain feature shape must be (T, 4)")
+        if self.terrain_features.shape != (frames, 12):
+            raise ValueError("terrain feature shape must be (T, 12)")
         if self.terrain_support.shape != (frames, 3):
             raise ValueError("terrain support shape must be (T, 3)")
         arrays = (
@@ -122,8 +122,8 @@ class ArtifactSet:
             raise ValueError("ranges overlap")
         if np.any(self.range_starts >= self.range_stops):
             raise ValueError("empty animation range")
-        if self.terrain_features.shape != (frames, 4):
-            raise ValueError("terrain feature shape must be (N, 4)")
+        if self.terrain_features.shape != (frames, 12):
+            raise ValueError("terrain feature shape must be (N, 12)")
         if self.terrain_support.shape != (frames, 3):
             raise ValueError("terrain support shape must be (N, 3)")
         if not np.isfinite(self.terrain_support).all():
