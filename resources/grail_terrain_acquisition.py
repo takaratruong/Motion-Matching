@@ -13,6 +13,15 @@ from pathlib import Path, PurePosixPath
 
 MANIFEST_SCHEMA = "g1-grail-terrain-inputs/v1"
 INVENTORY_SCHEMA = "g1-grail-terrain-inventory/v1"
+GRAIL_TERRAIN_ACQUISITION_REPOSITORY = {
+    "id": "nvidia/PhysicalAI-Robotics-Locomanipulation-GRAIL",
+    "revision": "943946a972d5de2eb0d2ff214b236d0e43575fd7",
+    "type": "dataset",
+}
+GRAIL_TERRAIN_ACQUISITION_FILE_COUNT = 47_511
+GRAIL_TERRAIN_ACQUISITION_BYTE_COUNT = 9_498_497_612
+GRAIL_TERRAIN_ACQUISITION_INVENTORY_SHA256 = (
+    "a72b748ba5204be72af8ac4507ca5c91e5e9b3bdb9887b3c3a1f891b9aff872f")
 HASH_CHUNK_BYTES = 1024 * 1024
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _REVISION = re.compile(r"[0-9a-f]{40}")

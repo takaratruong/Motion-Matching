@@ -17,13 +17,16 @@ from resources import grail_terrain_acquisition as acquisition
 REPOSITORY_ID = "nvidia/PhysicalAI-Robotics-Locomanipulation-GRAIL"
 REVISION = "943946a972d5de2eb0d2ff214b236d0e43575fd7"
 ROBOT_INVENTORY_SHA256 = (
-    "595b1276c9191e86bc6101a68929810680ac6790a795c35e692f2f7e8a7f97e2"
+    "cb843662db6ae85b3abc5607c8d31b4d2f0238c5aaa9d14f2aa039aecc4ee7bf"
 )
 OBJECTS_INVENTORY_SHA256 = (
-    "461a6ff0a533dac1bfa069694d491d3382e9a04cab11f1c3268bbf0a94d9f667"
+    "4ecb9063d36c96e7437e4ae0b03f9f48ce8a533ed65c9c96d5a5f0a860ccae20"
 )
 OBJECT_USD_INVENTORY_SHA256 = (
-    "6bc4a91cee21aa9a98214d557e27c1b86c556f585fe9673f222dd66eae767846"
+    "cba537a7c0a80f798954de7f6647bf047ad0bafce98701130f4fc4d36aa9ca77"
+)
+CURB_BASENAME_SHA256 = (
+    "6efec524c28683e141f1b06135483b78e4c2ce8a705c6b3dd2f88fb862d81b7c"
 )
 SLOPE_BASENAME_SHA256 = (
     "73cd3ec78289aa70caad2cd2df05ba0cea0301478c7654409d2c6557306b4b57"
@@ -251,10 +254,22 @@ class GrailTerrainAcquisitionTests(unittest.TestCase):
         )
         robot = manifest["modalities"]["robot"]
         self.assertEqual(robot["allowed_globs"], [
+            "data/curb/robot/*.pkl",
+            "data/slope/robot/*.pkl",
             "data/stair_p1/robot/*.pkl",
             "data/stair_p2/robot/*.pkl",
         ])
         self.assertEqual(robot["partitions"], {
+            "curb": {
+                "byte_count": 351_328_707,
+                "file_count": 1_769,
+                "path_prefix": "data/curb/robot/",
+            },
+            "slope": {
+                "byte_count": 373_373_640,
+                "file_count": 1_880,
+                "path_prefix": "data/slope/robot/",
+            },
             "stair_p1": {
                 "byte_count": 1_210_648_890,
                 "file_count": 6_094,
@@ -266,24 +281,73 @@ class GrailTerrainAcquisitionTests(unittest.TestCase):
                 "path_prefix": "data/stair_p2/robot/",
             },
         })
-        self.assertEqual(robot["file_count"], 12_188)
-        self.assertEqual(robot["byte_count"], 2_421_026_260)
+        self.assertEqual(robot["file_count"], 15_837)
+        self.assertEqual(robot["byte_count"], 3_145_728_607)
         self.assertEqual(
             robot["canonical_inventory_sha256"], ROBOT_INVENTORY_SHA256)
+
+    def test_checked_manifest_authenticates_every_consumed_source_file(self):
+        manifest = acquisition.load_manifest(CHECKED_MANIFEST)
+        self.assertEqual(
+            sum(modality["file_count"]
+                for modality in manifest["modalities"].values()),
+            47_511,
+        )
+        self.assertEqual(manifest["modalities"]["robot"]["allowed_globs"], [
+            "data/curb/robot/*.pkl",
+            "data/slope/robot/*.pkl",
+            "data/stair_p1/robot/*.pkl",
+            "data/stair_p2/robot/*.pkl",
+        ])
+        self.assertEqual(manifest["modalities"]["objects"]["allowed_globs"], [
+            "data/curb/recon/*.pkl",
+            "data/slope/objects/*.pkl",
+            "data/stair_p1/objects/*.pkl",
+            "data/stair_p2/objects/*.pkl",
+        ])
+        self.assertEqual(
+            manifest["modalities"]["object_usd"]["allowed_globs"], [
+                "data/curb/object_usd/*.usd",
+                "data/slope/object_usd/*.usd",
+                "data/stair_p1/object_usd/*.usd",
+                "data/stair_p2/object_usd/*.usd",
+            ])
+        self.assertEqual(set(manifest["source_coverage"]), {"curb", "slope"})
+        self.assertEqual(
+            manifest["source_coverage"]["curb"]["modalities"], {
+                "object_usd": {
+                    "path_prefix": "data/curb/object_usd/",
+                    "suffix": ".usd",
+                },
+                "objects": {
+                    "path_prefix": "data/curb/recon/",
+                    "suffix": ".pkl",
+                },
+                "robot": {
+                    "path_prefix": "data/curb/robot/",
+                    "suffix": ".pkl",
+                },
+            })
 
     def test_checked_manifest_pins_only_matching_object_and_geometry_inputs(self):
         manifest = acquisition.load_manifest(CHECKED_MANIFEST)
         expected = {
             "objects": {
                 "allowed_globs": [
+                    "data/curb/recon/*.pkl",
                     "data/slope/objects/*.pkl",
                     "data/stair_p1/objects/*.pkl",
                     "data/stair_p2/objects/*.pkl",
                 ],
-                "byte_count": 252_587_908,
+                "byte_count": 982_303_685,
                 "canonical_inventory_sha256": OBJECTS_INVENTORY_SHA256,
-                "file_count": 14_068,
+                "file_count": 15_837,
                 "partitions": {
+                    "curb": {
+                        "byte_count": 729_715_777,
+                        "file_count": 1_769,
+                        "path_prefix": "data/curb/recon/",
+                    },
                     "slope": {
                         "byte_count": 36_377_080,
                         "file_count": 1_880,
@@ -303,14 +367,20 @@ class GrailTerrainAcquisitionTests(unittest.TestCase):
             },
             "object_usd": {
                 "allowed_globs": [
+                    "data/curb/object_usd/*.usd",
                     "data/slope/object_usd/*.usd",
                     "data/stair_p1/object_usd/*.usd",
                     "data/stair_p2/object_usd/*.usd",
                 ],
-                "byte_count": 5_357_565_995,
+                "byte_count": 5_370_465_320,
                 "canonical_inventory_sha256": OBJECT_USD_INVENTORY_SHA256,
-                "file_count": 14_068,
+                "file_count": 15_837,
                 "partitions": {
+                    "curb": {
+                        "byte_count": 12_899_325,
+                        "file_count": 1_769,
+                        "path_prefix": "data/curb/object_usd/",
+                    },
                     "slope": {
                         "byte_count": 15_515_596,
                         "file_count": 1_880,
@@ -337,9 +407,27 @@ class GrailTerrainAcquisitionTests(unittest.TestCase):
                     for pattern in config["allowed_globs"]
                 ))
 
-    def test_checked_manifest_locks_slope_robot_source_coverage_separately(self):
+    def test_checked_manifest_locks_curb_and_slope_source_coverage(self):
         manifest = acquisition.load_manifest(CHECKED_MANIFEST)
         self.assertEqual(manifest["source_coverage"], {
+            "curb": {
+                "canonical_basename_sha256": CURB_BASENAME_SHA256,
+                "file_count": 1_769,
+                "modalities": {
+                    "object_usd": {
+                        "path_prefix": "data/curb/object_usd/",
+                        "suffix": ".usd",
+                    },
+                    "objects": {
+                        "path_prefix": "data/curb/recon/",
+                        "suffix": ".pkl",
+                    },
+                    "robot": {
+                        "path_prefix": "data/curb/robot/",
+                        "suffix": ".pkl",
+                    },
+                },
+            },
             "slope": {
                 "canonical_basename_sha256": SLOPE_BASENAME_SHA256,
                 "file_count": 1_880,
@@ -360,8 +448,8 @@ class GrailTerrainAcquisitionTests(unittest.TestCase):
             },
         })
         robot = manifest["modalities"]["robot"]
-        self.assertEqual(robot["file_count"], 12_188)
-        self.assertEqual(robot["byte_count"], 2_421_026_260)
+        self.assertEqual(robot["file_count"], 15_837)
+        self.assertEqual(robot["byte_count"], 3_145_728_607)
         self.assertEqual(
             robot["canonical_inventory_sha256"], ROBOT_INVENTORY_SHA256)
 

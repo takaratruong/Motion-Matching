@@ -593,8 +593,7 @@ def _load_usd_mesh(base: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return _load_usd_mesh_path(os.path.join(USD_DIR, base + ".usd"))
 
 
-def _object_pose0(base: str) -> tuple[np.ndarray, np.ndarray]:
-    path = os.path.join(RECON_DIR, base + ".pkl")
+def _object_pose_path(path: str) -> tuple[np.ndarray, np.ndarray]:
     with open(path, "rb") as stream:
         with warnings.catch_warnings():
             warnings.filterwarnings(
@@ -611,6 +610,10 @@ def _object_pose0(base: str) -> tuple[np.ndarray, np.ndarray]:
     if not np.all(np.isfinite(rotation)) or not np.all(np.isfinite(translation)):
         raise ValueError(f"non-finite GRAIL reconstruction pose in {path}")
     return rotation, translation
+
+
+def _object_pose0(base: str) -> tuple[np.ndarray, np.ndarray]:
+    return _object_pose_path(os.path.join(RECON_DIR, base + ".pkl"))
 
 
 def _validate_mesh_topology(
@@ -773,8 +776,17 @@ class GrailTerrain(VerticalTriangleSurface):
 
     @classmethod
     def from_base(cls, base: str) -> "GrailTerrain":
-        vertices, face_counts, face_indices = _load_usd_mesh(base)
-        rotation, translation = _object_pose0(base)
+        return cls.from_curb_paths(
+            os.path.join(USD_DIR, base + ".usd"),
+            os.path.join(RECON_DIR, base + ".pkl"),
+        )
+
+    @classmethod
+    def from_curb_paths(
+        cls, usd_path: str, reconstruction_path: str,
+    ) -> "GrailTerrain":
+        vertices, face_counts, face_indices = _load_usd_mesh_path(usd_path)
+        rotation, translation = _object_pose_path(reconstruction_path)
         world_vertices = (rotation @ vertices.T).T + translation
         return cls(_mujoco_to_holden(world_vertices), face_counts, face_indices)
 

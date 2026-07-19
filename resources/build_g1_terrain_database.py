@@ -16,6 +16,11 @@ if REPOSITORY_ROOT not in sys.path:
 
 from resources import quat as holden_quat
 from resources.grail_terrain_acquisition import (
+    GRAIL_TERRAIN_ACQUISITION_BYTE_COUNT as ACQUISITION_BYTE_COUNT,
+    GRAIL_TERRAIN_ACQUISITION_FILE_COUNT as ACQUISITION_FILE_COUNT,
+    GRAIL_TERRAIN_ACQUISITION_INVENTORY_SHA256 as
+        ACQUISITION_INVENTORY_SHA256,
+    GRAIL_TERRAIN_ACQUISITION_REPOSITORY as ACQUISITION_REPOSITORY,
     load_inventory,
     load_manifest,
     verify_local,
@@ -79,7 +84,6 @@ SCHEMA = "g1-terrain-artifacts/v3"
 OUTPUT_FPS = 25.0
 TERRAIN_DISTANCES = [0.25, 0.50, 0.75, 1.00]
 ACQUISITION_MODALITIES = ("object_usd", "objects", "robot")
-ACQUISITION_FILE_COUNT = 40_324
 
 
 def finalize_clip(source, terrain, kin):
@@ -256,14 +260,19 @@ def _source_manifest_entry(
 
 def _verify_acquisition_inputs(args):
     manifest = load_manifest(args.acquisition_manifest)
+    if type(manifest) is not dict \
+            or manifest.get("repository") != ACQUISITION_REPOSITORY:
+        raise ValueError("GRAIL acquisition repository identity changed")
     inventory = load_inventory(
         args.acquisition_inventory, manifest, ACQUISITION_MODALITIES)
     summary = verify_local(
         manifest, inventory, args.dataset_root, ACQUISITION_MODALITIES)
-    if summary["file_count"] != ACQUISITION_FILE_COUNT:
-        raise ValueError(
-            "GRAIL acquisition inventory must authenticate exactly "
-            f"{ACQUISITION_FILE_COUNT} files")
+    if type(summary) is not dict \
+            or summary.get("file_count") != ACQUISITION_FILE_COUNT \
+            or summary.get("byte_count") != ACQUISITION_BYTE_COUNT \
+            or summary.get("canonical_inventory_sha256") \
+            != ACQUISITION_INVENTORY_SHA256:
+        raise ValueError("GRAIL acquisition inventory identity changed")
     print(
         "SOURCE authentication "
         f"files={summary['file_count']} sha256="
@@ -296,7 +305,8 @@ def _premeasure_curb_corpus(corpus):
             print(
                 f"SOURCE measure curb {index}/{total} {item.name}",
                 file=sys.stderr, flush=True)
-        terrain = GrailTerrain.from_base(item.name)
+        terrain = GrailTerrain.from_curb_paths(
+            item.usd_path, item.object_path)
         measured[item.name] = float(terrain.footprint()["height"])
         del terrain
     selected = select_grail_scene_bases(measured)
@@ -321,7 +331,8 @@ def _terrain_for_asset(asset):
                     f"{asset.name}: nonlocked moving slope surface rejected") \
                     from error
             raise
-    return GrailTerrain.from_base(asset.name)
+    return GrailTerrain.from_curb_paths(
+        asset.usd_path, asset.object_path)
 
 
 def _assemble_candidate(args):
@@ -415,9 +426,13 @@ def _assemble_candidate(args):
         clips_by_terrain[base] = route_clip
         del route_source, route_clip, route_skeleton, _route_report
 
+    scene_terrains = {
+        base: _terrain_for_asset(curb_by_name[base])
+        for base in selected_scene_bases.values()
+    }
     scene_pack = build_scene_pack(all_scene_definitions(
-        measured_max_heights, clips_by_terrain))
-    del clips_by_terrain
+        measured_max_heights, clips_by_terrain, scene_terrains))
+    del clips_by_terrain, scene_terrains
 
     contact_config = ContactConfig()
     motion_index, terrain_banks = _build_publication_indexes(

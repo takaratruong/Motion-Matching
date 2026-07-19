@@ -1757,6 +1757,29 @@ class TerrainTests(unittest.TestCase):
         self.assertEqual(actual_faces, expected_faces)
         self.assertAlmostEqual(actual_vertices[:, 1].max(), footprint["height"], places=6)
 
+    def test_curb_loader_owns_explicit_usd_and_reconstruction_paths(self):
+        vertices = np.array([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ], np.float64)
+        counts = np.array([3], np.int32)
+        indices = np.array([0, 1, 2], np.int32)
+        rotation = np.eye(3, dtype=np.float64)
+        translation = np.array([1.0, 2.0, 3.0], np.float64)
+        with mock.patch.object(
+            terrain_module, "_load_usd_mesh_path",
+            return_value=(vertices, counts, indices),
+        ) as load_usd, mock.patch.object(
+            terrain_module, "_object_pose_path",
+            return_value=(rotation, translation), create=True,
+        ) as load_pose:
+            terrain = GrailTerrain.from_curb_paths(
+                "/alternate/curb.usd", "/alternate/curb.pkl")
+        load_usd.assert_called_once_with("/alternate/curb.usd")
+        load_pose.assert_called_once_with("/alternate/curb.pkl")
+        self.assertIsInstance(terrain, GrailTerrain)
+
     def test_selected_grail_scene_heightfield_covers_mesh_and_motion_lookahead(
             self):
         base = GRAIL_DEFAULT_BASE

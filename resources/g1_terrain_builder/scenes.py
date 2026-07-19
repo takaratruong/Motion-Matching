@@ -966,13 +966,14 @@ def _root_route_and_yaw(clip):
 
 
 def grail_scene_definition(
-    scene_id, base, clip, target_height_m,
+    scene_id, base, clip, target_height_m, terrain=None,
 ):
     if scene_id not in REQUIRED_SCENE_IDS[:4]:
         raise ValueError(f"unknown GRAIL scene ID {scene_id}")
     if clip.terrain_id != base:
         raise ValueError("GRAIL scene requires its matching converted clip")
-    terrain = GrailTerrain.from_base(base)
+    if terrain is None:
+        terrain = GrailTerrain.from_base(base)
     maximum_height = float(terrain.footprint()["height"])
     path, route_points, spawn, yaw = _root_route_and_yaw(clip)
     mesh_xmin, mesh_xmax, mesh_zmin, mesh_zmax = terrain.xz_bounds()
@@ -1070,7 +1071,11 @@ def grail_scene_definition(
     )
 
 
-def grail_scene_definitions(measured_max_heights, clips_by_terrain):
+def grail_scene_definitions(
+    measured_max_heights, clips_by_terrain, terrains_by_terrain=None,
+):
+    if terrains_by_terrain is None:
+        terrains_by_terrain = {}
     selected = select_grail_scene_bases(measured_max_heights)
     targets = {scene_id: target for scene_id, target in GRAIL_TARGETS}
     targets["grail-curb-default"] = None
@@ -1080,13 +1085,16 @@ def grail_scene_definitions(measured_max_heights, clips_by_terrain):
         if base not in clips_by_terrain:
             raise ValueError(f"missing converted scene clip for {base}")
         definitions.append(grail_scene_definition(
-            scene_id, base, clips_by_terrain[base], targets[scene_id]))
+            scene_id, base, clips_by_terrain[base], targets[scene_id],
+            terrain=terrains_by_terrain.get(base)))
     return tuple(definitions)
 
 
-def all_scene_definitions(measured_max_heights, clips_by_terrain):
+def all_scene_definitions(
+    measured_max_heights, clips_by_terrain, terrains_by_terrain=None,
+):
     definitions = grail_scene_definitions(
-        measured_max_heights, clips_by_terrain) \
+        measured_max_heights, clips_by_terrain, terrains_by_terrain) \
         + procedural_scene_definitions()
     if tuple(scene.scene_id for scene in definitions) != REQUIRED_SCENE_IDS:
         raise ValueError("complete scene definition order changed")

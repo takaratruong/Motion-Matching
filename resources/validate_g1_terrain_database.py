@@ -25,7 +25,11 @@ from resources.g1_terrain_builder.artifacts import (
     read_support_sidecar,
     read_terrain_sidecar,
 )
-from resources.g1_terrain_builder.motion_index import read_motion_index
+from resources.g1_terrain_builder.motion_index import (
+    MotionIndex,
+    derive_motion_index,
+    read_motion_index,
+)
 from resources import quat as holden_quat
 from resources.g1_terrain_builder.database import (
     ContactConfig,
@@ -35,7 +39,18 @@ from resources.g1_terrain_builder.database import (
     sample_terrain_support,
 )
 from resources.g1_terrain_builder.kinematics import (
+    G1Kinematics,
     convert_source_clip,
+)
+from resources.grail_terrain_acquisition import (
+    GRAIL_TERRAIN_ACQUISITION_BYTE_COUNT as ACQUISITION_BYTE_COUNT,
+    GRAIL_TERRAIN_ACQUISITION_FILE_COUNT as ACQUISITION_FILE_COUNT,
+    GRAIL_TERRAIN_ACQUISITION_INVENTORY_SHA256 as
+        ACQUISITION_INVENTORY_SHA256,
+    GRAIL_TERRAIN_ACQUISITION_REPOSITORY as ACQUISITION_REPOSITORY,
+    load_inventory,
+    load_manifest,
+    verify_local,
 )
 from resources.g1_terrain_builder.schema import (
     ArtifactSet,
@@ -54,6 +69,7 @@ from resources.g1_terrain_builder.scenes import (
     select_grail_scene_bases,
 )
 from resources.g1_terrain_builder.terrain import (
+    FlatTerrain,
     HEIGHTFIELD_DIAGONAL,
     HEIGHTFIELD_INTERPOLATION,
     GrailTerrain,
@@ -62,6 +78,13 @@ from resources.g1_terrain_builder.terrain import (
     sample_terrain_descriptor,
     surface_semantics,
     surface_semantics_signature,
+)
+from resources.g1_terrain_builder.sources import (
+    GRAIL_MOVING_SLOPE_OBJECT_BASENAMES,
+    GRAIL_PARTITION_SOURCE_COUNTS,
+    discover_grail_source_assets,
+    load_grail,
+    load_takara,
 )
 
 
@@ -144,6 +167,9 @@ DEFAULT_SOURCE_OPTIONS = {
     "remap": "/home/ubuntu/projects/g1_mm/isaac_to_mj.npy",
 }
 SOURCE_REPORT_ATOL = 1e-12
+ACQUISITION_MODALITIES = ("object_usd", "objects", "robot")
+FULL_SOURCE_GRAIL_FRAMES = 250
+FULL_SOURCE_DATABASE_FRAMES = 3_970_932
 LOCKED_SCENE_IDS = (
     "grail-curb-default",
     "grail-curb-low",
@@ -424,9 +450,89 @@ def _validate_loaded_source_identity(source, entry, index):
              f"{label} raw source frame identity changed")
 
 
-def _validate_full_source_manifest_contract(manifest, database):
-    raise ValueError(
-        "Task 7 must replace legacy single-curb full-source reconstruction")
+def _validate_full_source_manifest_contract(manifest, database, corpus):
+    _require(manifest["diagnostic_mode"] is False,
+             "full source validation requires the full non-diagnostic pack")
+    records = tuple(corpus.motion_sources)
+    expected_total_clips = 1 + len(records)
+    _require(manifest["total_clips"] == expected_total_clips,
+             "full-source total clip count changed")
+    _require(manifest["grail_clips"] == len(records),
+             "full-source GRAIL clip count changed")
+    _require(manifest["skipped_clips"]
+             == len(GRAIL_MOVING_SLOPE_OBJECT_BASENAMES),
+             "full-source slope exclusion count changed")
+    sources = manifest["sources"]
+    _require(len(sources) == expected_total_clips,
+             "full-source manifest source count changed")
+    _require(corpus.diagnostic is False,
+             "full-source discovery unexpectedly entered diagnostic mode")
+    _require(tuple(corpus.skipped_basenames)
+             == tuple(GRAIL_MOVING_SLOPE_OBJECT_BASENAMES),
+             "full-source slope exclusion identities changed")
+    _require(tuple(corpus.all_sources) == records,
+             "full-source accepted and selected records differ")
+    for index, (entry, record) in enumerate(zip(sources[1:], records), 1):
+        _require(entry["name"] == record.name
+                 and entry["terrain_id"] == record.name,
+                 f"sources[{index}] corpus order or identity changed")
+        _require(entry["terrain_family"] == record.family,
+                 f"sources[{index}] terrain family differs from corpus")
+
+    takara = sources[0]
+    _require(takara["name"] == "takara_walk_50hz"
+             and takara["terrain_id"] == "flat"
+             and takara["terrain_family"] == "flat",
+             "full-source Takara identity changed")
+    _require(takara["source_fps"] == 50.0,
+             "full-source Takara FPS changed")
+    takara_source_frames = takara["source_frames"]
+    takara_output_frames = takara["output_frames"]
+    _require(takara_source_frames > 0
+             and takara_output_frames == (takara_source_frames + 1) // 2,
+             "full-source Takara frame counts are inconsistent")
+    _require(takara["range_start"] == 0
+             and takara["range_stop"] == takara_output_frames,
+             "full-source Takara range changed")
+    expected_takara_map = np.rint(
+        np.arange(takara_output_frames, dtype=np.float64)
+        * 2.0).astype(np.int64).tolist()
+    _require(takara["source_frame_map"] == expected_takara_map,
+             "full-source Takara source frame map changed")
+
+    cursor = takara_output_frames
+    for index, entry in enumerate(sources[1:], 1):
+        _require(entry["source_fps"] == 25.0,
+                 f"sources[{index}] full-source GRAIL FPS changed")
+        output_frames = entry["output_frames"]
+        _require(output_frames == FULL_SOURCE_GRAIL_FRAMES
+                 and entry["source_frames"] == FULL_SOURCE_GRAIL_FRAMES,
+                 f"sources[{index}] full-source GRAIL frame counts differ")
+        _require(entry["source_frame_map"]
+                 == list(range(FULL_SOURCE_GRAIL_FRAMES)),
+                 f"sources[{index}] full-source GRAIL source map changed")
+        _require(entry["range_start"] == cursor
+                 and entry["range_stop"]
+                 == cursor + output_frames,
+                 f"sources[{index}] full-source GRAIL range changed")
+        cursor = entry["range_stop"]
+    expected_grail_rows = len(records) * FULL_SOURCE_GRAIL_FRAMES
+    expected_rows = takara_output_frames + expected_grail_rows
+    _require(cursor - takara_output_frames
+             == expected_grail_rows,
+             "full-source aggregate GRAIL row count changed")
+    _require(expected_rows == FULL_SOURCE_DATABASE_FRAMES
+             and cursor == FULL_SOURCE_DATABASE_FRAMES
+             and manifest["database_frames"] == FULL_SOURCE_DATABASE_FRAMES
+             and len(database.positions) == FULL_SOURCE_DATABASE_FRAMES,
+             "full-source final row count changed")
+    expected_starts = np.asarray(
+        [entry["range_start"] for entry in sources], np.int32)
+    expected_stops = np.asarray(
+        [entry["range_stop"] for entry in sources], np.int32)
+    _require(np.array_equal(database.range_starts, expected_starts)
+             and np.array_equal(database.range_stops, expected_stops),
+             "full-source database ranges differ from manifest")
 
 
 def _require_regular_source_file(path, label):
@@ -439,8 +545,47 @@ def _require_regular_source_file(path, label):
 
 
 def _discover_full_source_corpus(manifest, options):
-    raise ValueError(
-        "Task 7 must provide multi-family source discovery")
+    for key, label in (
+        ("acquisition_manifest", "acquisition manifest"),
+        ("acquisition_inventory", "acquisition inventory"),
+        ("g1_xml", "G1 XML"),
+        ("takara", "Takara motion"),
+        ("remap", "Takara remap"),
+    ):
+        _require_regular_source_file(options[key], label)
+    acquisition = load_manifest(options["acquisition_manifest"])
+    _require(
+        type(acquisition) is dict
+        and _json_exact(
+            acquisition.get("repository"), ACQUISITION_REPOSITORY),
+        "full-source acquisition repository identity changed",
+    )
+    inventory = load_inventory(
+        options["acquisition_inventory"], acquisition,
+        ACQUISITION_MODALITIES)
+    summary = verify_local(
+        acquisition, inventory, options["dataset_root"],
+        ACQUISITION_MODALITIES)
+    _require(summary.get("file_count") == ACQUISITION_FILE_COUNT
+             and summary.get("byte_count") == ACQUISITION_BYTE_COUNT
+             and summary.get("canonical_inventory_sha256")
+             == ACQUISITION_INVENTORY_SHA256,
+             "full-source acquisition authentication changed")
+    corpus = discover_grail_source_assets(
+        options["dataset_root"], None,
+        expected_partition_counts=GRAIL_PARTITION_SOURCE_COUNTS)
+    manifest_entries = manifest["sources"][1:]
+    records = tuple(corpus.motion_sources)
+    _require(len(manifest_entries) == len(records),
+             "full-source manifest/authenticated corpus count differs")
+    for index, (entry, record) in enumerate(
+            zip(manifest_entries, records), 1):
+        _require(entry["name"] == record.name
+                 and entry["terrain_id"] == record.name,
+                 f"sources[{index}] basename differs from manifest order")
+        _require(entry["terrain_family"] == record.family,
+                 f"sources[{index}] family differs from authenticated corpus")
+    return corpus
 
 
 def _bounded_source_sample(records):
@@ -459,13 +604,18 @@ def _bounded_source_sample(records):
     return tuple(sampled)
 
 
-def _premeasure_grail_surfaces(bases, progress=None):
+def _premeasure_grail_surfaces(bases, progress=None, assets=None):
     measured = {}
     total = len(bases)
     for index, base in enumerate(bases, 1):
         if progress is not None:
             progress("measure", index, total, base)
-        terrain = GrailTerrain.from_base(base)
+        terrain = (
+            GrailTerrain.from_base(base)
+            if assets is None else
+            GrailTerrain.from_curb_paths(
+                assets[base].usd_path, assets[base].object_path)
+        )
         footprint = terrain.footprint()
         _require(type(footprint) is dict and "height" in footprint,
                  f"{base}: GRAIL footprint height is missing")
@@ -495,7 +645,7 @@ def _validate_takara_support_zero_bits(support):
 
 
 def _validate_selected_scene_reconstruction(
-    scenes, selected_clips, selected,
+    scenes, selected_clips, selected, assets=None,
 ):
     _require(_json_exact(selected, GRAIL_EXPECTED_BASES),
              "full-source selected GRAIL scene mapping changed")
@@ -506,21 +656,95 @@ def _validate_selected_scene_reconstruction(
         base = GRAIL_EXPECTED_BASES[scene_id]
         _require(scene_id in scenes and len(scenes[scene_id]) == 3,
                  f"{scene_id}: authenticated scene is unavailable")
+        terrain = (
+            None if assets is None else
+            GrailTerrain.from_curb_paths(
+                assets[base].usd_path, assets[base].object_path)
+        )
         definition = grail_scene_definition(
             scene_id, base, selected_clips[base],
-            GRAIL_TARGETS[scene_id])
+            GRAIL_TARGETS[scene_id], terrain=terrain)
         rebuilt = build_scene(definition)
         _require(
             _canonical_json_bytes(scenes[scene_id][0])
             == rebuilt.scene_json,
             f"{scene_id}: deterministic converted-source scene changed")
-        del definition, rebuilt
+        del definition, rebuilt, terrain
+
+
+def _derive_rebuilt_motion_index(clip, entry, skeleton_names):
+    """Re-derive one source's G1MI rows using publication semantics."""
+    rows = len(clip.positions)
+    names = tuple(skeleton_names)
+    _require("Simulation" in names and "Hips" in names,
+             "rebuilt motion-index skeleton roots are missing")
+    family = entry.get("terrain_family")
+    _require(family in TERRAIN_FAMILIES,
+             "rebuilt motion-index terrain family is invalid")
+    source_range = SourceFrameRange(
+        entry["name"], 0, rows, rows, 0, rows)
+    banks = TerrainBankIndex(
+        rows,
+        (source_range,),
+        tuple(TerrainBank(
+            candidate, (0,) if candidate == family else ())
+              for candidate in TERRAIN_FAMILIES),
+    )
+    banks.validate()
+
+    simulation = names.index("Simulation")
+    hips = names.index("Hips")
+    root_positions = np.asarray(
+        clip.positions[:, simulation], np.float64).copy()
+    # Publication intentionally substitutes physical Hips height for the
+    # yaw-only Simulation root's zero y coordinate.
+    root_positions[:, 1] = clip.positions[:, hips, 1]
+    forward = holden_quat.mul_vec(
+        clip.rotations[:, simulation],
+        np.array([0.0, 0.0, 1.0], np.float64),
+    )
+    headings = np.arctan2(forward[:, 0], forward[:, 2])
+    return derive_motion_index(root_positions, headings, banks)
+
+
+def _compare_motion_index_values(label, published, rebuilt, dtype):
+    published = np.asarray(published)
+    rebuilt = np.asarray(rebuilt)
+    expected_dtype = np.dtype(dtype)
+    _require(published.shape == rebuilt.shape,
+             f"{label} shape differs: published {published.shape}, "
+             f"rebuilt {rebuilt.shape}")
+    _require(published.dtype == expected_dtype
+             and rebuilt.dtype == expected_dtype,
+             f"{label} must use exact {expected_dtype.name} dtype")
+    if np.array_equal(published, rebuilt):
+        return
+    mismatch = int(np.flatnonzero(published != rebuilt)[0])
+    raise ValueError(
+        f"{label} differ at ({mismatch},): "
+        f"published={int(published[mismatch])}, "
+        f"rebuilt={int(rebuilt[mismatch])}")
+
+
+def _validate_rebuilt_motion_index_rows(published, rebuilt, label):
+    _require(isinstance(published, MotionIndex)
+             and isinstance(rebuilt, MotionIndex),
+             f"motion-index rows for {label} must be MotionIndex values")
+    _compare_motion_index_values(
+        f"motion-index direction masks for {label}",
+        published.direction_masks, rebuilt.direction_masks, "<u2")
+    _compare_motion_index_values(
+        f"motion-index speed masks for {label}",
+        published.speed_masks, rebuilt.speed_masks, "u1")
+    _compare_motion_index_values(
+        f"motion-index elevation modes for {label}",
+        published.elevation_modes, rebuilt.elevation_modes, "i1")
 
 
 def _validate_one_source_rows(
     index, entry, database, validation, kinematics,
     skeleton_names, skeleton_parents,
-    source_loader, terrain_loader, retain_clip,
+    source_loader, terrain_loader, motion_index, retain_clip,
 ):
     source = source_loader()
     _validate_loaded_source_identity(source, entry, index)
@@ -534,6 +758,16 @@ def _validate_one_source_rows(
     stop = entry["range_stop"]
     _compare_rebuilt_clip_rows(
         database, start, stop, clip, f"sources[{index}]")
+    rebuilt_motion_index = _derive_rebuilt_motion_index(
+        clip, entry, skeleton_names)
+    published_motion_index = MotionIndex(
+        motion_index.direction_masks[start:stop],
+        motion_index.speed_masks[start:stop],
+        motion_index.elevation_modes[start:stop],
+    )
+    _validate_rebuilt_motion_index_rows(
+        published_motion_index, rebuilt_motion_index,
+        f"sources[{index}]")
     if index == 0:
         _validate_takara_support_zero_bits(
             database.terrain_support[start:stop])
@@ -545,10 +779,110 @@ def _validate_one_source_rows(
     return rows, retained, (start, stop)
 
 
+def _prepare_full_source_context(manifest, database, source_options):
+    options = _validate_full_source_options(source_options)
+    corpus = _discover_full_source_corpus(manifest, options)
+    _validate_full_source_manifest_contract(manifest, database, corpus)
+    return options, corpus
+
+
 def _validate_all_source_rows(
-    manifest, database, scenes, source_options, progress=None,
+    manifest, database, scenes, motion_index, source_options, progress=None,
+    prepared_context=None,
 ):
-    _validate_full_source_manifest_contract(manifest, database)
+    if prepared_context is None:
+        options, corpus = _prepare_full_source_context(
+            manifest, database, source_options)
+    else:
+        _require(
+            type(prepared_context) is tuple and len(prepared_context) == 2,
+            "prepared full-source context is invalid")
+        options, corpus = prepared_context
+
+    records = tuple(corpus.motion_sources)
+    by_name = {record.name: record for record in records}
+    _require(len(by_name) == len(records),
+             "full-source authenticated basenames are not unique")
+    selected_names = tuple(sorted(GRAIL_EXPECTED_BASES.values()))
+    _require(set(selected_names) <= set(by_name),
+             "full-source selected GRAIL scene source is missing")
+    _measured, selected = _premeasure_grail_surfaces(
+        selected_names, progress, assets=by_name)
+    del _measured
+    _require(_json_exact(selected, GRAIL_EXPECTED_BASES),
+             "full-source selected GRAIL scene mapping changed")
+    sample_names = {
+        record.name for record in _bounded_source_sample(records)
+    }
+    sample_names.update(selected_names)
+    sampled = tuple(record for record in records
+                    if record.name in sample_names)
+    _require(len(sampled) == len(sample_names),
+             "full-source bounded sample contains an unknown source")
+
+    source_index = {
+        entry["name"]: index
+        for index, entry in enumerate(manifest["sources"])
+    }
+    kinematics = G1Kinematics(options["g1_xml"])
+    selected_clips = {}
+    visited_ranges = []
+    rows = 0
+    total = 1 + len(sampled)
+
+    if progress is not None:
+        progress("recompute", 1, total, manifest["sources"][0]["name"])
+    rebuilt_rows, retained, visited = _validate_one_source_rows(
+        0, manifest["sources"][0], database, manifest["validation"],
+        kinematics,
+        manifest["skeleton"]["names"], manifest["skeleton"]["parents"],
+        lambda: load_takara(options["takara"], options["remap"]),
+        FlatTerrain,
+        motion_index,
+        False,
+    )
+    _require(retained is None,
+             "full-source Takara clip must not be retained")
+    rows += rebuilt_rows
+    visited_ranges.append(visited)
+    del retained
+
+    selected_set = set(selected_names)
+    for ordinal, record in enumerate(sampled, 2):
+        index = source_index[record.name]
+        entry = manifest["sources"][index]
+        if progress is not None:
+            progress("recompute", ordinal, total, record.name)
+        terrain_loader = (
+            (lambda asset=record: GrailTerrain.from_release(
+                asset.usd_path, asset.object_path))
+            if record.release_surface else
+            (lambda asset=record: GrailTerrain.from_curb_paths(
+                asset.usd_path, asset.object_path))
+        )
+        rebuilt_rows, retained, visited = _validate_one_source_rows(
+            index, entry, database, manifest["validation"], kinematics,
+            manifest["skeleton"]["names"],
+            manifest["skeleton"]["parents"],
+            lambda path=record.robot_path: load_grail(path),
+            terrain_loader,
+            motion_index,
+            record.name in selected_set,
+        )
+        rows += rebuilt_rows
+        visited_ranges.append(visited)
+        if retained is not None:
+            _require(record.name not in selected_clips,
+                     "full-source retained a duplicate GRAIL scene clip")
+            selected_clips[record.name] = retained
+        del retained
+
+    _require(len(visited_ranges) == total
+             and len(set(visited_ranges)) == total,
+             "full-source bounded sample repeated a manifest range")
+    _validate_selected_scene_reconstruction(
+        scenes, selected_clips, selected, assets=by_name)
+    return rows
 
 
 def _full_source_progress(phase, index, total, name):
@@ -2042,12 +2376,18 @@ def _expected_grail_regions(scene_id, playable, grid, terrain):
     return expected, (central_xmin, central_xmax)
 
 
-def _validate_grail_scene(scene_id, scene, grid, walkability, playable):
+def _validate_grail_scene(
+    scene_id, scene, grid, walkability, playable, asset=None,
+):
     base = GRAIL_EXPECTED_BASES[scene_id]
     _require(scene["label"] == GRAIL_LABELS[scene_id],
              f"{scene_id}: GRAIL label changed")
     provenance = scene["provenance"]
-    terrain = GrailTerrain.from_base(base)
+    terrain = (
+        GrailTerrain.from_base(base)
+        if asset is None else
+        GrailTerrain.from_curb_paths(asset.usd_path, asset.object_path)
+    )
     measured = GRAIL_EXPECTED_HEIGHTS[scene_id]
     source_measured = float(terrain.footprint()["height"])
     _require(np.isfinite(source_measured)
@@ -2202,6 +2542,7 @@ def _independent_grail_surface_parity(terrain, grid):
 
 def _validate_scene(
     root, scene_id, scene_path, scene_digest, manifest_signature,
+    grail_assets=None,
 ):
     scene_root = os.path.join(root, "scenes", scene_id)
     scene = _read_json(scene_path, _MAX_SCENE_JSON_BYTES, f"{scene_id} scene JSON")
@@ -2362,7 +2703,9 @@ def _validate_scene(
              f"{scene_id}: deterministic route IDs changed")
     if scene_id in GRAIL_EXPECTED_BASES:
         _validate_grail_scene(
-            scene_id, scene, grid, walkability, playable)
+            scene_id, scene, grid, walkability, playable,
+            asset=(None if grail_assets is None else
+                   grail_assets[GRAIL_EXPECTED_BASES[scene_id]]))
     else:
         _require(provenance["kind"] == "procedural",
                  f"{scene_id}: procedural provenance kind changed")
@@ -2374,7 +2717,12 @@ def _validate_scene(
 
 def _validate_scene_catalog(
     root, manifest, index_path, index_identity, index_digest,
+    grail_assets=None,
 ):
+    if grail_assets is not None:
+        _require(type(grail_assets) is dict
+                 and set(grail_assets) == set(GRAIL_EXPECTED_BASES.values()),
+                 "authenticated GRAIL scene asset mapping changed")
     index = _read_json(index_path, _MAX_SCENE_JSON_BYTES, "scene index JSON")
     _require(hashlib.sha256(_canonical_json_bytes(index)).hexdigest()
              == index_digest,
@@ -2417,7 +2765,7 @@ def _validate_scene_catalog(
                  f"{scene_id}: scene descriptor SHA-256 mismatch")
         scenes[scene_id] = _validate_scene(
             root, scene_id, scene_path, digest,
-            manifest["surface"]["signature"])
+            manifest["surface"]["signature"], grail_assets=grail_assets)
         _require_file_identity(
             scene_path, scene_identity, f"{scene_id} scene JSON")
     for scene_id, expected in _expected_procedural_scenes():
@@ -2554,9 +2902,23 @@ def validate_artifact_directory(
     quaternion_error = _database_quaternion_norm_error(database.rotations)
     _require(quaternion_error <= 1e-4,
              "database quaternion norm error exceeds 0.0001")
+    full_source_context = None
+    grail_assets = None
+    if full_source_validation:
+        full_source_context = _prepare_full_source_context(
+            manifest, database, source_options)
+        records = tuple(full_source_context[1].motion_sources)
+        by_name = {record.name: record for record in records}
+        selected_bases = set(GRAIL_EXPECTED_BASES.values())
+        _require(len(by_name) == len(records)
+                 and selected_bases <= set(by_name),
+                 "authenticated GRAIL scene assets are unavailable")
+        grail_assets = {
+            base: by_name[base] for base in GRAIL_EXPECTED_BASES.values()
+        }
     scenes = _validate_scene_catalog(
         root, manifest, index_path, index_identity,
-        manifest["scene_index"]["sha256"])
+        manifest["scene_index"]["sha256"], grail_assets=grail_assets)
     for path, identity, label in (
         (database_path, database_identity, "database"),
         (features_path, features_identity, "terrain features"),
@@ -2569,8 +2931,9 @@ def validate_artifact_directory(
     source_rows = 0
     if full_source_validation:
         source_rows = _validate_all_source_rows(
-            manifest, database, scenes, source_options,
-            progress=_full_source_progress)
+            manifest, database, scenes, motion_index, source_options,
+            progress=_full_source_progress,
+            prepared_context=full_source_context)
     return {
         "frames": frames,
         "clips": len(sources),
@@ -2585,7 +2948,9 @@ def _parser():
         description="Validate published Holden G1 terrain motion artifacts")
     parser.add_argument("artifact_directory")
     parser.add_argument("--full-source-validation", action="store_true")
-    parser.add_argument("--grail-glob")
+    parser.add_argument("--acquisition-manifest")
+    parser.add_argument("--acquisition-inventory")
+    parser.add_argument("--dataset-root")
     parser.add_argument("--g1-xml")
     parser.add_argument("--takara")
     parser.add_argument("--remap")
@@ -2597,7 +2962,9 @@ def main(argv=None):
     path = os.path.abspath(args.artifact_directory)
     source_options = {
         key: value for key, value in {
-            "grail_glob": args.grail_glob,
+            "acquisition_manifest": args.acquisition_manifest,
+            "acquisition_inventory": args.acquisition_inventory,
+            "dataset_root": args.dataset_root,
             "g1_xml": args.g1_xml,
             "takara": args.takara,
             "remap": args.remap,

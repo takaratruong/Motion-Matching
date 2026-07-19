@@ -1,3 +1,4 @@
+import copy
 import gc
 import io
 import inspect
@@ -28,9 +29,105 @@ from resources.g1_terrain_builder.schema import HoldenClip, SkeletonSpec
 
 
 PYTHON = "/home/ubuntu/miniconda3/envs/diffsim/bin/python"
+LOCKED_ACQUISITION_REPOSITORY = {
+    "id": "nvidia/PhysicalAI-Robotics-Locomanipulation-GRAIL",
+    "revision": "943946a972d5de2eb0d2ff214b236d0e43575fd7",
+    "type": "dataset",
+}
+LOCKED_ACQUISITION_FILE_COUNT = 47_511
+LOCKED_ACQUISITION_BYTE_COUNT = 9_498_497_612
+LOCKED_ACQUISITION_INVENTORY_SHA256 = (
+    "a72b748ba5204be72af8ac4507ca5c91e5e9b3bdb9887b3c3a1f891b9aff872f")
 
 
 class BuildCliTests(unittest.TestCase):
+    @staticmethod
+    def _locked_acquisition_identity():
+        return (
+            {"repository": dict(LOCKED_ACQUISITION_REPOSITORY)},
+            {
+                "file_count": LOCKED_ACQUISITION_FILE_COUNT,
+                "byte_count": LOCKED_ACQUISITION_BYTE_COUNT,
+                "canonical_inventory_sha256":
+                    LOCKED_ACQUISITION_INVENTORY_SHA256,
+            },
+        )
+
+    def test_builder_acquisition_preflight_owns_exact_identity_and_calls(self):
+        args = SimpleNamespace(
+            acquisition_manifest="/inputs/manifest.json",
+            acquisition_inventory="/inputs/inventory.json",
+            dataset_root="/data/grail",
+        )
+        acquisition, summary = self._locked_acquisition_identity()
+        inventory = object()
+        with mock.patch.object(
+            builder, "load_manifest", return_value=acquisition,
+        ) as load_manifest, mock.patch.object(
+            builder, "load_inventory", return_value=inventory,
+        ) as load_inventory, mock.patch.object(
+            builder, "verify_local", return_value=summary,
+        ) as verify_local:
+            observed = builder._verify_acquisition_inputs(args)
+        self.assertEqual(observed, (acquisition, inventory, summary))
+        load_manifest.assert_called_once_with("/inputs/manifest.json")
+        load_inventory.assert_called_once_with(
+            "/inputs/inventory.json", acquisition,
+            builder.ACQUISITION_MODALITIES)
+        verify_local.assert_called_once_with(
+            acquisition, inventory, "/data/grail",
+            builder.ACQUISITION_MODALITIES)
+
+    def test_builder_rejects_each_changed_acquisition_identity_before_discovery(
+            self):
+        args = SimpleNamespace(
+            acquisition_manifest="/inputs/manifest.json",
+            acquisition_inventory="/inputs/inventory.json",
+            dataset_root="/data/grail", source_limit_per_family=None,
+        )
+        expected_acquisition, expected_summary = \
+            self._locked_acquisition_identity()
+        mutations = (
+            ("repository-id", "repository", {
+                **LOCKED_ACQUISITION_REPOSITORY, "id": "changed/repository",
+            }),
+            ("repository-revision", "repository", {
+                **LOCKED_ACQUISITION_REPOSITORY, "revision": "0" * 40,
+            }),
+            ("file-count", "file_count",
+             LOCKED_ACQUISITION_FILE_COUNT - 1),
+            ("byte-count", "byte_count",
+             LOCKED_ACQUISITION_BYTE_COUNT - 1),
+            ("digest", "canonical_inventory_sha256", "0" * 64),
+        )
+        for diagnostic_limit in (None, 1):
+            for label, field, value in mutations:
+                args.source_limit_per_family = diagnostic_limit
+                acquisition = copy.deepcopy(expected_acquisition)
+                summary = dict(expected_summary)
+                if field == "repository":
+                    acquisition[field] = value
+                else:
+                    summary[field] = value
+                with self.subTest(
+                    mode=("full" if diagnostic_limit is None else "diagnostic"),
+                    identity=label,
+                ), mock.patch.object(
+                    builder, "_require_file",
+                ), mock.patch.object(
+                    builder, "load_manifest", return_value=acquisition,
+                ), mock.patch.object(
+                    builder, "load_inventory", return_value=object(),
+                ), mock.patch.object(
+                    builder, "verify_local", return_value=summary,
+                ), mock.patch.object(
+                    builder, "discover_grail_source_assets",
+                ) as discover, self.assertRaisesRegex(
+                    ValueError, "acquisition.*identity|authenticate exactly",
+                ):
+                    builder._inspect_multifamily_corpus(args)
+                discover.assert_not_called()
+
     def test_publication_indexes_use_physical_hips_y_and_exact_family_ranges(self):
         artifacts = ArtifactSet.empty(frames=6, bones=31)
         artifacts.range_starts = np.array([0, 3], np.int32)
@@ -272,9 +369,11 @@ class BuildCliTests(unittest.TestCase):
         def convert(value, kinematics, output_fps):
             return clip_for(value), skeleton, dict(report)
 
-        def all_definitions(observed_heights, clips_by_terrain):
+        def all_definitions(
+                observed_heights, clips_by_terrain, terrains_by_terrain):
             self.assertEqual(observed_heights, measured_heights)
             self.assertEqual(set(clips_by_terrain), set(measured_heights))
+            self.assertEqual(set(terrains_by_terrain), set(measured_heights))
             return ("all-definitions",)
 
         scene_pack = SimpleNamespace(scenes=tuple(range(14)))
@@ -363,6 +462,62 @@ class BuildCliTests(unittest.TestCase):
                 ValueError, "loaded source name/terrain identity changed",
             ):
                 builder._require_loaded_grail_source(source, "terrain-a")
+
+    def test_curb_terrain_uses_the_discovered_root_explicit_asset_paths(self):
+        asset = SimpleNamespace(
+            name="curb-a", partition="curb", release_surface=False,
+            usd_path="/alternate-root/data/curb/object_usd/curb-a.usd",
+            object_path="/alternate-root/data/curb/recon/curb-a.pkl",
+        )
+        terrain = object()
+        with mock.patch.object(
+            builder.GrailTerrain, "from_curb_paths",
+            return_value=terrain, create=True,
+        ) as load_explicit, mock.patch.object(
+            builder.GrailTerrain, "from_base",
+        ) as load_implicit:
+            self.assertIs(builder._terrain_for_asset(asset), terrain)
+        load_explicit.assert_called_once_with(
+            asset.usd_path, asset.object_path)
+        load_implicit.assert_not_called()
+
+    def test_curb_premeasure_uses_discovered_root_explicit_asset_paths(self):
+        assets = tuple(SimpleNamespace(
+            name=f"curb-{index}", partition="curb",
+            usd_path=f"/alternate/object_usd/curb-{index}.usd",
+            object_path=f"/alternate/recon/curb-{index}.pkl",
+        ) for index in range(4))
+        corpus = SimpleNamespace(all_sources=assets)
+
+        class Terrain:
+            def __init__(self, height):
+                self.height = height
+
+            def footprint(self):
+                return {"height": self.height}
+
+        selected = {
+            scene: asset.name for scene, asset in zip(
+                builder.REQUIRED_SCENE_IDS[:4], assets)
+        }
+        with mock.patch.object(
+            builder.GrailTerrain, "from_curb_paths",
+            side_effect=lambda usd, recon: Terrain(
+                float(usd.split("curb-")[-1].split(".")[0])),
+            create=True,
+        ) as load_explicit, mock.patch.object(
+            builder.GrailTerrain, "from_base",
+        ) as load_implicit, mock.patch.object(
+            builder, "select_grail_scene_bases", return_value=selected,
+        ):
+            _measured, observed, by_name = builder._premeasure_curb_corpus(
+                corpus)
+        self.assertEqual(observed, selected)
+        self.assertEqual(set(by_name), {asset.name for asset in assets})
+        self.assertEqual(load_explicit.call_args_list, [
+            mock.call(asset.usd_path, asset.object_path) for asset in assets
+        ])
+        load_implicit.assert_not_called()
 
     def test_candidate_validator_argv_is_exact_in_both_modes(self):
         base = dict(
