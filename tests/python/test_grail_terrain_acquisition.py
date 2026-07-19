@@ -154,6 +154,85 @@ class GrailTerrainAcquisitionTests(unittest.TestCase):
         stage.GetRootLayer().Save()
         del stage
 
+    def _source_coverage_fixture(self, root):
+        root = Path(root)
+        seed_usd = root / "seed.usd"
+        self._write_usd(seed_usd)
+        usd_payload = seed_usd.read_bytes()
+        seed_usd.unlink()
+
+        payloads = {
+            "data/slope/object_usd/a.usd": usd_payload,
+            "data/slope/objects/a.pkl": b"slope object",
+            "data/stair_p1/object_usd/stair.usd": usd_payload,
+            "data/stair_p1/objects/stair.pkl": b"stair object",
+            "data/stair_p1/robot/stair.pkl": b"stair robot",
+        }
+        entries = {
+            path: _entry(path, payload)
+            for path, payload in payloads.items()
+        }
+        manifest = _manifest({
+            "object_usd": _modality([
+                entries["data/slope/object_usd/a.usd"],
+                entries["data/stair_p1/object_usd/stair.usd"],
+            ], [
+                "data/slope/object_usd/*.usd",
+                "data/stair_p1/object_usd/*.usd",
+            ], {
+                "slope": {
+                    "path_prefix": "data/slope/object_usd/",
+                    "file_count": 1,
+                    "byte_count": len(usd_payload),
+                },
+                "stair_p1": {
+                    "path_prefix": "data/stair_p1/object_usd/",
+                    "file_count": 1,
+                    "byte_count": len(usd_payload),
+                },
+            }),
+            "objects": _modality([
+                entries["data/slope/objects/a.pkl"],
+                entries["data/stair_p1/objects/stair.pkl"],
+            ], [
+                "data/slope/objects/*.pkl",
+                "data/stair_p1/objects/*.pkl",
+            ], {
+                "slope": {
+                    "path_prefix": "data/slope/objects/",
+                    "file_count": 1,
+                    "byte_count": len(payloads[
+                        "data/slope/objects/a.pkl"]),
+                },
+                "stair_p1": {
+                    "path_prefix": "data/stair_p1/objects/",
+                    "file_count": 1,
+                    "byte_count": len(payloads[
+                        "data/stair_p1/objects/stair.pkl"]),
+                },
+            }),
+            "robot": _modality([
+                entries["data/stair_p1/robot/stair.pkl"],
+            ], ["data/stair_p1/robot/*.pkl"], {
+                "stair_p1": {
+                    "path_prefix": "data/stair_p1/robot/",
+                    "file_count": 1,
+                    "byte_count": len(payloads[
+                        "data/stair_p1/robot/stair.pkl"]),
+                },
+            }),
+        }, source_coverage=_slope_source_coverage(["a"]))
+        return manifest, entries, payloads
+
+    @staticmethod
+    def _fake_download(payloads):
+        def download(**kwargs):
+            target = Path(kwargs["local_dir"]) / kwargs["filename"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(payloads[kwargs["filename"]])
+            return str(target)
+        return download
+
     def test_checked_manifest_pins_exact_complete_robot_corpus(self):
         payload = CHECKED_MANIFEST.read_bytes()
         decoded = json.loads(payload)
@@ -480,67 +559,94 @@ class GrailTerrainAcquisitionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unexpected local"):
                 acquisition.verify_local(manifest, inventory, root, ("robot",))
 
-    def test_offline_verifier_enforces_external_slope_robot_basename_coverage(self):
+    def test_robot_only_download_and_verify_skip_unselected_source_coverage(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            object_path = root / "data/slope/objects/a.pkl"
-            geometry_path = root / "data/slope/object_usd/a.usd"
-            robot_path = root / "data/slope/robot/a.pkl"
-            object_path.parent.mkdir(parents=True)
-            geometry_path.parent.mkdir(parents=True)
-            robot_path.parent.mkdir(parents=True)
-            object_path.write_bytes(b"object")
-            self._write_usd(geometry_path)
-            robot_path.write_bytes(b"robot")
-            objects = _entry(
-                "data/slope/objects/a.pkl", object_path.read_bytes())
-            geometry = _entry(
-                "data/slope/object_usd/a.usd", geometry_path.read_bytes())
-            modalities = {
-                "objects": _modality(
-                    [objects], ["data/slope/objects/*.pkl"], {
-                        "slope": {
-                            "path_prefix": "data/slope/objects/",
-                            "file_count": 1,
-                            "byte_count": objects["bytes"],
-                        },
-                    }),
-                "object_usd": _modality(
-                    [geometry], ["data/slope/object_usd/*.usd"], {
-                        "slope": {
-                            "path_prefix": "data/slope/object_usd/",
-                            "file_count": 1,
-                            "byte_count": geometry["bytes"],
-                        },
-                    }),
-            }
-            manifest = _manifest(
-                modalities, source_coverage=_slope_source_coverage(["a"]))
+            manifest, entries, payloads = self._source_coverage_fixture(root)
+            inventory = _inventory([
+                entries["data/stair_p1/robot/stair.pkl"],
+            ])
+            inventory_path = root / "g1_mm_inventory.json"
+
+            downloaded = acquisition.download_inventory(
+                manifest, inventory, root, ("robot",), inventory_path,
+                hf_download=self._fake_download(payloads))
+            verified = acquisition.verify_local(
+                manifest, inventory, root, ("robot",))
+
+            self.assertEqual(downloaded["file_count"], 1)
+            self.assertEqual(verified, downloaded)
+            self.assertFalse((root / "data/slope").exists())
+
+    def test_incremental_terrain_download_and_verify_skip_slope_robot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest, entries, payloads = self._source_coverage_fixture(root)
+            robot_inventory = _inventory([
+                entries["data/stair_p1/robot/stair.pkl"],
+            ])
+            terrain_inventory = _inventory([
+                entries["data/slope/object_usd/a.usd"],
+                entries["data/slope/objects/a.pkl"],
+                entries["data/stair_p1/object_usd/stair.usd"],
+                entries["data/stair_p1/objects/stair.pkl"],
+            ], ("object_usd", "objects"))
+            inventory = acquisition.merge_inventory_documents(
+                manifest, robot_inventory, terrain_inventory)
+            inventory_path = root / "g1_mm_inventory.json"
+
+            downloaded = acquisition.download_inventory(
+                manifest, inventory, root, ("object_usd", "objects"),
+                inventory_path, hf_download=self._fake_download(payloads))
+            verified = acquisition.verify_local(
+                manifest, inventory, root, ("object_usd", "objects"))
+
+            self.assertEqual(downloaded["file_count"], 4)
+            self.assertEqual(verified, downloaded)
+            self.assertFalse((root / "data/slope/robot").exists())
+            self.assertFalse((root / "data/stair_p1/robot").exists())
+
+    def test_full_selection_enforces_external_slope_source_coverage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest, entries, payloads = self._source_coverage_fixture(root)
             inventory = _inventory(
-                [objects, geometry], ("object_usd", "objects"))
+                list(entries.values()),
+                ("object_usd", "objects", "robot"))
+            for path, payload in payloads.items():
+                target = root / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(payload)
+            robot_path = root / "data/slope/robot/a.pkl"
+            robot_path.parent.mkdir(parents=True)
+            robot_path.write_bytes(b"external slope robot")
 
             summary = acquisition.verify_local(
-                manifest, inventory, root, ("object_usd", "objects"))
-            self.assertEqual(summary["file_count"], 2)
+                manifest, inventory, root,
+                ("object_usd", "objects", "robot"))
+            self.assertEqual(summary["file_count"], 5)
 
             robot_path.unlink()
             with self.assertRaisesRegex(ValueError, "source coverage"):
                 acquisition.verify_local(
-                    manifest, inventory, root, ("object_usd", "objects"))
-            robot_path.write_bytes(b"robot")
+                    manifest, inventory, root,
+                    ("object_usd", "objects", "robot"))
+            robot_path.write_bytes(b"external slope robot")
 
             extra = robot_path.with_name("b.pkl")
             extra.write_bytes(b"extra")
             with self.assertRaisesRegex(ValueError, "source coverage"):
                 acquisition.verify_local(
-                    manifest, inventory, root, ("object_usd", "objects"))
+                    manifest, inventory, root,
+                    ("object_usd", "objects", "robot"))
             extra.unlink()
 
             renamed = robot_path.with_name("renamed.pkl")
             robot_path.rename(renamed)
             with self.assertRaisesRegex(ValueError, "source coverage"):
                 acquisition.verify_local(
-                    manifest, inventory, root, ("object_usd", "objects"))
+                    manifest, inventory, root,
+                    ("object_usd", "objects", "robot"))
 
     def test_offline_verifier_rejects_symlinks_directories_and_nonregular_files(self):
         expected = _entry("data/stair_p1/robot/good.pkl", b"good")

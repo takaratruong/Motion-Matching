@@ -602,8 +602,12 @@ def _local_source_coverage_basenames(root, source, name, source_modality):
     return basenames
 
 
-def _verify_source_coverage(manifest, root):
+def _verify_source_coverage(manifest, root, is_modality_selected):
     for source, coverage in manifest["source_coverage"].items():
+        if not all(
+                is_modality_selected(name)
+                for name in coverage["modalities"]):
+            continue
         for name, source_modality in coverage["modalities"].items():
             basenames = _local_source_coverage_basenames(
                 root, source, name, source_modality)
@@ -729,7 +733,7 @@ def verify_local(manifest, inventory, dataset_root, modalities):
     selected = _selected_modalities(manifest, modalities)
     inventory = validate_inventory_document(manifest, inventory, selected)
     root = Path(dataset_root)
-    _verify_source_coverage(manifest, root)
+    _verify_source_coverage(manifest, root, set(selected).__contains__)
     _scan_local_inputs(manifest, inventory, root, selected)
     entries = _entries_for_modalities(manifest, inventory, selected)
     for entry in entries:
