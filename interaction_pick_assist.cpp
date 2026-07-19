@@ -120,6 +120,16 @@ bool same_entry_root(PickEntryRoot left, PickEntryRoot right) {
             float_bits(right.world_yaw_radians);
 }
 
+PickEntryRoot mapped_entry_root(const MappedPickSlot& slot) {
+    const vec3 forward = quat_mul_vec3(
+        slot.root_world.rotation, vec3(0.0F, 0.0F, 1.0F));
+    return {
+        slot.root_world.position.x,
+        slot.root_world.position.z,
+        std::atan2(forward.x, forward.z),
+    };
+}
+
 bool observation_metrics_are_finite(
     const PickAssistObservation& observation) {
     return is_finite(observation.displayed_root) &&
@@ -155,6 +165,48 @@ void capture_frozen_final_preview_diagnostics(
     captured.contact_frame = preview.contact_frame;
     captured.total_cost = preview.total_cost;
     diagnostics.final_preview = captured;
+}
+
+void initialize_selection_preview_diagnostics(
+    PickAssistDiagnostics& diagnostics,
+    const std::vector<PickAssistPreviewRequest>& requests,
+    const PickAssistObservation& observation) {
+    diagnostics.selection_previews.clear();
+    diagnostics.selection_previews.reserve(requests.size());
+    for (const PickAssistPreviewRequest& request : requests) {
+        PickAssistSelectionPreviewDiagnostics preview{};
+        preview.request = request;
+        preview.observation_snapshot_fingerprint =
+            observation.snapshot_fingerprint;
+        preview.preview_snapshot_fingerprint =
+            observation.preview_snapshot_fingerprint;
+        diagnostics.selection_previews.push_back(preview);
+    }
+}
+
+void capture_selection_preview_diagnostics(
+    PickAssistSelectionPreviewDiagnostics& diagnostics,
+    const PickAssistObservation& observation,
+    const PickAssistPreviewResult& result) {
+    if (!result.preview.has_value()) return;
+    const PickEntryPreview& preview = *result.preview;
+    diagnostics.prospective_root = preview.prospective_root;
+    diagnostics.available = true;
+    diagnostics.all_preview_roots_finite =
+        is_finite(diagnostics.request.root) &&
+        is_finite(preview.prospective_root);
+    diagnostics.fingerprint_equal =
+        observation.preview_snapshot_fingerprint ==
+        observation.snapshot_fingerprint;
+    diagnostics.path_feasible = preview.path_feasible;
+    diagnostics.path_reason = preview.path_reason;
+    diagnostics.match_ready = preview.match_ready;
+    diagnostics.match_reason = preview.match_reason;
+    diagnostics.prospective_root_equal = same_entry_root(
+        preview.prospective_root, diagnostics.request.root);
+    diagnostics.feasible_entry_frame = preview.feasible_entry_frame;
+    diagnostics.contact_frame = preview.contact_frame;
+    diagnostics.total_cost = preview.total_cost;
 }
 
 PickAssistOutput fail_output(
@@ -223,6 +275,13 @@ PickAssistOutput preview_braking_output(
     return output;
 }
 
+PickAssistOutput selection_preview_braking_output(
+    const std::vector<PickAssistPreviewRequest>& requests) {
+    PickAssistOutput output = braking_output();
+    output.preview_requests = requests;
+    return output;
+}
+
 PickAssistReason frozen_arrival_deadline_reason(
     bool poor_match_observed) {
     return poor_match_observed
@@ -240,6 +299,8 @@ ControllerPickAssist::ControllerPickAssist(PickAssistConfig config)
 void ControllerPickAssist::cancel() {
     if (diagnostics_.state == PickAssistState::Submitted) return;
     start_ = {};
+    selection_preview_requests_.clear();
+    selection_preview_outstanding_ = false;
     frozen_slot_ = {};
     frozen_preview_root_.reset();
     poor_match_observed_ = false;
@@ -255,6 +316,8 @@ bool ControllerPickAssist::begin(
     if (active()) return false;
 
     start_ = {};
+    selection_preview_requests_.clear();
+    selection_preview_outstanding_ = false;
     frozen_slot_ = {};
     frozen_preview_root_.reset();
     poor_match_observed_ = false;
@@ -266,6 +329,8 @@ bool ControllerPickAssist::begin(
 
     const auto fail_begin = [this](PickAssistReason reason) {
         start_ = {};
+        selection_preview_requests_.clear();
+        selection_preview_outstanding_ = false;
         frozen_slot_ = {};
         frozen_preview_root_.reset();
         poor_match_observed_ = false;
@@ -308,28 +373,25 @@ bool ControllerPickAssist::begin(
             diagnostics_.slot_selection.reason));
     }
 
-    const size_t selected_index =
-        *diagnostics_.slot_selection.selected_index;
-    frozen_slot_ = diagnostics_.slot_selection.ordered[selected_index];
-    const PickEntryRoot frozen_preview_root{
-        frozen_slot_.root_world.position.x,
-        frozen_slot_.root_world.position.z,
-        yaw_radians(frozen_slot_.root_world.rotation),
-    };
-    if (!is_finite(frozen_preview_root)) {
-        return fail_begin(PickAssistReason::OutsideTravelEnvelope);
+    for (size_t index :
+         diagnostics_.slot_selection.ranked_eligible_indices) {
+        if (index >= diagnostics_.slot_selection.ordered.size()) {
+            return fail_begin(PickAssistReason::InvalidGeometry);
+        }
+        const MappedPickSlot& slot =
+            diagnostics_.slot_selection.ordered[index];
+        const PickEntryRoot root = mapped_entry_root(slot);
+        if (!is_finite(root)) {
+            return fail_begin(PickAssistReason::OutsideTravelEnvelope);
+        }
+        selection_preview_requests_.push_back({slot.id, root});
     }
-    frozen_preview_root_ = frozen_preview_root;
+    if (selection_preview_requests_.empty()) {
+        return fail_begin(PickAssistReason::NoAuthoredSlot);
+    }
     start_ = start;
     previous_observed_root_ = start.root_world;
-
-    diagnostics_.selected_slot_id = frozen_slot_.id;
-    diagnostics_.route_length_m = frozen_slot_.route_length_m;
-    diagnostics_.object_origin_distance_m =
-        frozen_slot_.object_origin_distance_m;
-    diagnostics_.object_bounds_center_distance_m =
-        frozen_slot_.object_bounds_center_distance_m;
-    diagnostics_.state = PickAssistState::SlotApproach;
+    diagnostics_.state = PickAssistState::SlotSelectionPreview;
     return true;
 }
 
@@ -341,6 +403,7 @@ PickAssistOutput ControllerPickAssist::observe(
     case PickAssistState::Submitted:
     case PickAssistState::Failed:
         return output;
+    case PickAssistState::SlotSelectionPreview:
     case PickAssistState::SlotApproach:
     case PickAssistState::Settling:
     case PickAssistState::FinalPreview:
@@ -403,6 +466,189 @@ PickAssistOutput ControllerPickAssist::observe(
             diagnostics_, PickAssistReason::OutsideTravelEnvelope);
     }
 
+    if (diagnostics_.state == PickAssistState::SlotSelectionPreview) {
+        if (!selection_preview_outstanding_) {
+            if (!observation.preview_results.empty()) {
+                return fail_output(
+                    diagnostics_,
+                    PickAssistReason::SelectionPreviewRejected);
+            }
+            selection_preview_outstanding_ = true;
+            ++diagnostics_.selection_preview_epochs;
+            initialize_selection_preview_diagnostics(
+                diagnostics_,
+                selection_preview_requests_,
+                observation);
+            return selection_preview_braking_output(
+                selection_preview_requests_);
+        }
+
+        ++arrival_ticks_;
+        diagnostics_.selection_preview_calls +=
+            static_cast<uint32_t>(observation.preview_results.size());
+        initialize_selection_preview_diagnostics(
+            diagnostics_,
+            selection_preview_requests_,
+            observation);
+
+        const size_t expected_count =
+            selection_preview_requests_.size();
+        if (observation.preview_results.size() > expected_count) {
+            return fail_output(
+                diagnostics_,
+                PickAssistReason::SelectionPreviewRejected);
+        }
+        for (size_t index = 0U;
+             index < observation.preview_results.size();
+             ++index) {
+            const PickAssistPreviewResult& result =
+                observation.preview_results[index];
+            const PickAssistPreviewRequest& expected =
+                selection_preview_requests_[index];
+            if (result.request.slot_id != expected.slot_id ||
+                !same_entry_root(result.request.root, expected.root)) {
+                return fail_output(
+                    diagnostics_,
+                    PickAssistReason::SelectionPreviewRejected);
+            }
+            capture_selection_preview_diagnostics(
+                diagnostics_.selection_previews[index],
+                observation,
+                result);
+            if (result.preview.has_value()) {
+                const PickAssistSelectionPreviewDiagnostics& preview =
+                    diagnostics_.selection_previews[index];
+                if (!preview.all_preview_roots_finite ||
+                    !preview.fingerprint_equal ||
+                    !preview.prospective_root_equal ||
+                    !is_finite(result.preview->total_cost)) {
+                    return fail_output(
+                        diagnostics_,
+                        PickAssistReason::SelectionPreviewRejected);
+                }
+            }
+        }
+
+        if (!observation.preview_results.empty() &&
+            observation.preview_snapshot_fingerprint !=
+                observation.snapshot_fingerprint) {
+            return fail_output(
+                diagnostics_,
+                PickAssistReason::SelectionPreviewRejected);
+        }
+
+        const bool complete_count =
+            observation.preview_results.size() == expected_count;
+        bool all_available = complete_count;
+        for (const PickAssistPreviewResult& result :
+             observation.preview_results) {
+            all_available = all_available && result.preview.has_value();
+        }
+        if (!complete_count || !all_available) {
+            if (arrival_ticks_ >= config_.maximum_arrival_ticks) {
+                return fail_output(
+                    diagnostics_,
+                    frozen_arrival_deadline_reason(
+                        diagnostics_.selection_poor_match_observed));
+            }
+            ++diagnostics_.selection_preview_epochs;
+            return selection_preview_braking_output(
+                selection_preview_requests_);
+        }
+
+        std::optional<size_t> certified_rank{};
+        bool retryable_poor_match = false;
+        PickSlotConfig selection_slot_config{};
+        selection_slot_config.maximum_direct_travel_m =
+            config_.maximum_assisted_path_m;
+        for (size_t rank = 0U; rank < expected_count; ++rank) {
+            const size_t slot_index = diagnostics_.slot_selection
+                .ranked_eligible_indices[rank];
+            if (slot_index >= diagnostics_.slot_selection.ordered.size()) {
+                return fail_output(
+                    diagnostics_,
+                    PickAssistReason::SelectionPreviewRejected);
+            }
+            const PickAssistSelectionPreviewDiagnostics& preview =
+                diagnostics_.selection_previews[rank];
+            if (!preview.available ||
+                !preview.all_preview_roots_finite ||
+                !preview.fingerprint_equal ||
+                !preview.prospective_root_equal) {
+                return fail_output(
+                    diagnostics_,
+                    PickAssistReason::SelectionPreviewRejected);
+            }
+            const MappedPickSlot& slot =
+                diagnostics_.slot_selection.ordered[slot_index];
+            const PickSlotReason route_reason =
+                revalidate_frozen_pick_slot(
+                    observation.displayed_root,
+                    slot.root_world,
+                    start_.target_snapshot,
+                    start_.obstacles,
+                    selection_slot_config);
+            const bool route_clear =
+                route_reason == PickSlotReason::None;
+            const bool certified =
+                route_clear &&
+                preview.path_feasible &&
+                preview.path_reason == Reason::None &&
+                preview.match_ready &&
+                preview.match_reason == Reason::None;
+            if (certified && !certified_rank.has_value()) {
+                certified_rank = rank;
+            }
+            retryable_poor_match = retryable_poor_match ||
+                (route_clear &&
+                 preview.path_feasible &&
+                 preview.path_reason == Reason::None &&
+                 !preview.match_ready &&
+                 preview.match_reason == Reason::PoorMatch);
+        }
+        diagnostics_.selection_poor_match_observed =
+            diagnostics_.selection_poor_match_observed ||
+            retryable_poor_match;
+
+        if (certified_rank.has_value()) {
+            if (arrival_ticks_ >= config_.maximum_arrival_ticks) {
+                return fail_output(
+                    diagnostics_,
+                    frozen_arrival_deadline_reason(
+                        diagnostics_.selection_poor_match_observed));
+            }
+            const size_t rank = *certified_rank;
+            const size_t slot_index = diagnostics_.slot_selection
+                .ranked_eligible_indices[rank];
+            frozen_slot_ =
+                diagnostics_.slot_selection.ordered[slot_index];
+            frozen_preview_root_ =
+                selection_preview_requests_[rank].root;
+            diagnostics_.frozen_slot_index = slot_index;
+            diagnostics_.selected_slot_id = frozen_slot_.id;
+            diagnostics_.route_length_m = frozen_slot_.route_length_m;
+            diagnostics_.object_origin_distance_m =
+                frozen_slot_.object_origin_distance_m;
+            diagnostics_.object_bounds_center_distance_m =
+                frozen_slot_.object_bounds_center_distance_m;
+            diagnostics_.state = PickAssistState::SlotApproach;
+            selection_preview_outstanding_ = false;
+            arrival_ticks_ = 0U;
+        } else if (retryable_poor_match) {
+            if (arrival_ticks_ >= config_.maximum_arrival_ticks) {
+                return fail_output(
+                    diagnostics_, PickAssistReason::PoorMatch);
+            }
+            ++diagnostics_.selection_preview_epochs;
+            return selection_preview_braking_output(
+                selection_preview_requests_);
+        } else {
+            return fail_output(
+                diagnostics_,
+                PickAssistReason::SelectionPreviewRejected);
+        }
+    }
+
     PickSlotConfig slot_config{};
     slot_config.maximum_direct_travel_m =
         config_.maximum_assisted_path_m;
@@ -437,6 +683,7 @@ PickAssistOutput ControllerPickAssist::observe(
     case PickAssistState::Idle:
     case PickAssistState::Submitted:
     case PickAssistState::Failed:
+    case PickAssistState::SlotSelectionPreview:
         return output;
     case PickAssistState::SlotApproach:
         if (diagnostics_.root_error_m <=
@@ -591,6 +838,7 @@ std::optional<PickRequest> ControllerPickAssist::take_submission(
 
 bool ControllerPickAssist::active() const {
     switch (diagnostics_.state) {
+    case PickAssistState::SlotSelectionPreview:
     case PickAssistState::SlotApproach:
     case PickAssistState::Settling:
     case PickAssistState::FinalPreview:
@@ -621,6 +869,8 @@ const char* pick_assist_state_name(PickAssistState state) {
     case PickAssistState::ReadyToSubmit: return "ReadyToSubmit";
     case PickAssistState::Submitted: return "Submitted";
     case PickAssistState::Failed: return "Failed";
+    case PickAssistState::SlotSelectionPreview:
+        return "SlotSelectionPreview";
     }
     throw std::runtime_error("invalid pick-assist state");
 }
@@ -644,6 +894,8 @@ const char* pick_assist_reason_name(PickAssistReason reason) {
     case PickAssistReason::PoorMatch: return "PoorMatch";
     case PickAssistReason::FinalPreviewRejected:
         return "FinalPreviewRejected";
+    case PickAssistReason::SelectionPreviewRejected:
+        return "SelectionPreviewRejected";
     }
     throw std::runtime_error("invalid pick-assist reason");
 }

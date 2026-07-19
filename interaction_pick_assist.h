@@ -4,6 +4,7 @@
 #include "interaction_pick_slots.h"
 #include "interaction_runtime.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <vector>
@@ -18,6 +19,7 @@ enum class PickAssistState : uint8_t {
     ReadyToSubmit,
     Submitted,
     Failed,
+    SlotSelectionPreview = 7,
 };
 
 enum class PickAssistReason : uint8_t {
@@ -36,6 +38,7 @@ enum class PickAssistReason : uint8_t {
     ArrivalDeadline,
     PoorMatch,
     FinalPreviewRejected,
+    SelectionPreviewRejected = 15,
 };
 
 struct PickAssistConfig {
@@ -100,6 +103,24 @@ struct PickAssistFinalPreviewDiagnostics {
     float total_cost = 0.0F;
 };
 
+struct PickAssistSelectionPreviewDiagnostics {
+    PickAssistPreviewRequest request{};
+    std::optional<PickEntryRoot> prospective_root{};
+    uint64_t observation_snapshot_fingerprint = 0U;
+    uint64_t preview_snapshot_fingerprint = 0U;
+    bool available = false;
+    bool all_preview_roots_finite = false;
+    bool fingerprint_equal = false;
+    bool path_feasible = false;
+    Reason path_reason = Reason::None;
+    bool match_ready = false;
+    Reason match_reason = Reason::None;
+    bool prospective_root_equal = false;
+    int32_t feasible_entry_frame = -1;
+    int32_t contact_frame = -1;
+    float total_cost = 0.0F;
+};
+
 struct PickAssistDiagnostics {
     PickAssistState state = PickAssistState::Idle;
     PickAssistReason reason = PickAssistReason::None;
@@ -107,6 +128,11 @@ struct PickAssistDiagnostics {
     uint32_t affordance_id = 0U;
     uint32_t selected_slot_id = 0U;
     PickSlotSelection slot_selection{};
+    std::optional<size_t> frozen_slot_index{};
+    std::vector<PickAssistSelectionPreviewDiagnostics> selection_previews{};
+    uint32_t selection_preview_epochs = 0U;
+    uint32_t selection_preview_calls = 0U;
+    bool selection_poor_match_observed = false;
     uint32_t settle_ticks = 0U;
     float route_length_m = 0.0F;
     float assisted_travel_m = 0.0F;
@@ -134,6 +160,8 @@ public:
 private:
     PickAssistConfig config_{};
     PickAssistStart start_{};
+    std::vector<PickAssistPreviewRequest> selection_preview_requests_{};
+    bool selection_preview_outstanding_ = false;
     MappedPickSlot frozen_slot_{};
     std::optional<PickEntryRoot> frozen_preview_root_{};
     bool poor_match_observed_ = false;

@@ -528,6 +528,24 @@ interaction::SmartPickupPreviewCallback rejecting_preview_counter(
     };
 }
 
+interaction::SmartPickupPreviewCallback certified_preview_counter(
+    uint32_t& calls) {
+    return [&calls](
+               const interaction::LocomotionSnapshot&,
+               interaction::PickEntryRoot root,
+               interaction::TargetHandle,
+               uint32_t) -> std::optional<interaction::PickEntryPreview> {
+        ++calls;
+        interaction::PickEntryPreview preview{};
+        preview.path_feasible = true;
+        preview.path_reason = interaction::Reason::None;
+        preview.match_ready = true;
+        preview.match_reason = interaction::Reason::None;
+        preview.prospective_root = root;
+        return preview;
+    };
+}
+
 void test_activation_brackets_one_caller_step_and_defers_assist_motion() {
     interaction::InteractionTarget target = make_controller_target();
     const interaction::InteractionTarget target_before = target;
@@ -580,9 +598,13 @@ void test_activation_brackets_one_caller_step_and_defers_assist_motion() {
         "activation tick previewed or submitted a pick");
     require(
         post.assist_output.override_steering &&
-            post.assist_output.preview_requests.empty() &&
+            post.assist_output.force_strafe &&
+            post.assist_output.stationary_constraint &&
+            is_zero(post.assist_output.left_stick) &&
+            is_zero(post.assist_output.right_stick) &&
+            !post.assist_output.preview_requests.empty() &&
             !post.assist_output.submit_interact,
-        "activation observation did not publish next-tick approach output");
+        "activation observation did not publish the stationary selection batch");
     require(
         same_snapshot_bits(snapshot, snapshot_before),
         "post_step mutated the authoritative live-flat snapshot");
@@ -629,16 +651,16 @@ void test_activation_brackets_one_caller_step_and_defers_assist_motion() {
         diagnostics.slot_selection.ordered[
             *diagnostics.slot_selection.selected_index];
     require(
-        diagnostics.state == interaction::PickAssistState::SlotApproach &&
+        diagnostics.state ==
+                interaction::PickAssistState::SlotSelectionPreview &&
             diagnostics.reason == interaction::PickAssistReason::None &&
-            diagnostics.selected_slot_id == expected_slot.id &&
+            diagnostics.selected_slot_id == 0U &&
+            !diagnostics.frozen_slot_index.has_value() &&
+            post.assist_output.preview_requests.size() ==
+                diagnostics.slot_selection.ranked_eligible_indices.size() &&
             actual_slot.id == expected_slot.id &&
-            same_transform_bits(
-                actual_slot.root_world, expected_slot.root_world) &&
-            same_float_bits(
-                diagnostics.route_length_m,
-                expected_slot.route_length_m),
-        "assist did not freeze its slot from the post-step root");
+            same_transform_bits(actual_slot.root_world, expected_slot.root_world),
+        "assist did not defer its slot freeze until preview certification");
 
     const uint64_t published_fingerprint =
         locomotion.publish_same_snapshot(snapshot);
@@ -666,9 +688,35 @@ void test_activation_brackets_one_caller_step_and_defers_assist_motion() {
     const interaction::LocomotionSnapshot next_snapshot =
         locomotion.step(next);
     require(
-        !same_vec3_bits(
+        same_vec3_bits(
             root_transform(next_snapshot).position, next_root_before),
-        "assisted steering did not affect the tick after activation");
+        "selection certification tick moved before choosing an entry");
+
+    const interaction::SmartPickupPostStepResult certified =
+        controller.post_step(
+            make_post_input(next_snapshot, &target),
+            certified_preview_counter(preview_calls));
+    require(
+        preview_calls == post.assist_output.preview_requests.size() &&
+            backend.observe_calls == 2U &&
+            controller.diagnostics().state ==
+                interaction::PickAssistState::SlotApproach &&
+            controller.diagnostics().selected_slot_id == expected_slot.id &&
+            controller.diagnostics().frozen_slot_index.has_value() &&
+            certified.assist_output.override_steering &&
+            certified.assist_output.preview_requests.empty(),
+        "ranked selection batch did not certify the geometry winner");
+
+    const interaction::SmartPickupPreStepResult approach =
+        controller.pre_step(next_input);
+    const vec3 approach_root_before = locomotion.root_position;
+    const interaction::LocomotionSnapshot approach_snapshot =
+        locomotion.step(approach);
+    require(
+        !same_vec3_bits(
+            root_transform(approach_snapshot).position,
+            approach_root_before),
+        "certified approach steering did not affect the following tick");
 }
 
 void test_prior_preview_batch_uses_one_snapshot_and_echoes_every_request() {
@@ -793,6 +841,194 @@ void test_prior_preview_batch_uses_one_snapshot_and_echoes_every_request() {
     require(
         same_snapshot_bits(live_snapshot, live_snapshot_before),
         "batch preview callbacks mutated the caller live snapshot");
+}
+
+void test_selection_and_final_preview_call_counts_are_exact() {
+    interaction::InteractionTarget target = make_controller_target();
+    CountingAssistBackend backend;
+    interaction::SmartPickupController controller(backend);
+    CallerOrderHarness locomotion;
+    locomotion.root_position = vec3();
+    locomotion.root_yaw_radians = 0.0F;
+    locomotion.stick_displacement_scale = 0.0F;
+    std::vector<interaction::PickEntryRoot> callback_roots;
+    std::vector<uint64_t> callback_fingerprints;
+    const interaction::SmartPickupPreviewCallback preview =
+        [&](const interaction::LocomotionSnapshot& snapshot,
+            interaction::PickEntryRoot root,
+            interaction::TargetHandle handle,
+            uint32_t affordance_id)
+            -> std::optional<interaction::PickEntryPreview> {
+            require(
+                handle == target.handle &&
+                    affordance_id == target.affordances.front().id,
+                "call-count preview changed target identity");
+            callback_roots.push_back(root);
+            callback_fingerprints.push_back(
+                interaction::runtime_detail::
+                    locomotion_snapshot_fingerprint(snapshot));
+            interaction::PickEntryPreview result{};
+            result.path_feasible = true;
+            result.path_reason = interaction::Reason::None;
+            result.match_ready = callback_roots.size() > 3U;
+            result.match_reason = result.match_ready
+                ? interaction::Reason::None
+                : interaction::Reason::PoorMatch;
+            result.prospective_root = root;
+            return result;
+        };
+
+    const interaction::SmartPickupPreStepResult activation_pre =
+        controller.pre_step(make_pre_input(&target, true));
+    const interaction::LocomotionSnapshot activation_snapshot =
+        locomotion.step(activation_pre);
+    interaction::SmartPickupPostStepResult post = controller.post_step(
+        make_post_input(activation_snapshot, &target), preview);
+    require(
+        callback_roots.empty() && backend.begin_calls == 1U &&
+            backend.observe_calls == 1U &&
+            controller.diagnostics().state ==
+                interaction::PickAssistState::SlotSelectionPreview &&
+            post.assist_output.preview_requests.size() == 3U &&
+            post.assist_output.preview_requests[0].slot_id == 11U &&
+            post.assist_output.preview_requests[1].slot_id == 22U &&
+            post.assist_output.preview_requests[2].slot_id == 33U,
+        "activation did not defer the ranked three-entry selection batch");
+    const std::vector<interaction::PickAssistPreviewRequest> ranked_requests =
+        post.assist_output.preview_requests;
+
+    const interaction::SmartPickupPreStepResult first_epoch_pre =
+        controller.pre_step(make_pre_input(&target, false));
+    const interaction::LocomotionSnapshot first_epoch_snapshot =
+        locomotion.step(first_epoch_pre);
+    post = controller.post_step(
+        make_post_input(first_epoch_snapshot, &target), preview);
+    require(
+        callback_roots.size() == 3U && backend.observe_calls == 2U &&
+            controller.diagnostics().state ==
+                interaction::PickAssistState::SlotSelectionPreview &&
+            post.assist_output.preview_requests.size() == 3U,
+        "first PoorMatch selection epoch did not make exactly K calls");
+
+    const interaction::SmartPickupPreStepResult second_epoch_pre =
+        controller.pre_step(make_pre_input(&target, false));
+    const interaction::LocomotionSnapshot second_epoch_snapshot =
+        locomotion.step(second_epoch_pre);
+    post = controller.post_step(
+        make_post_input(second_epoch_snapshot, &target), preview);
+    require(
+        callback_roots.size() == 6U && backend.observe_calls == 3U &&
+            controller.diagnostics().state ==
+                interaction::PickAssistState::Settling &&
+            post.assist_output.preview_requests.empty(),
+        "ready selection epoch did not freeze after exactly K more calls");
+    for (size_t epoch = 0U; epoch < 2U; ++epoch) {
+        for (size_t index = 0U; index < ranked_requests.size(); ++index) {
+            const size_t call = epoch * ranked_requests.size() + index;
+            require(
+                same_pick_entry_root_bits(
+                    callback_roots[call], ranked_requests[index].root),
+                "selection callback order changed between epochs");
+        }
+        require(
+            callback_fingerprints[epoch * 3U] ==
+                    callback_fingerprints[epoch * 3U + 1U] &&
+                callback_fingerprints[epoch * 3U] ==
+                    callback_fingerprints[epoch * 3U + 2U],
+            "selection epoch callbacks did not share one snapshot fingerprint");
+    }
+
+    for (uint32_t tick = 1U; tick <= 5U; ++tick) {
+        const interaction::SmartPickupPreStepResult pre =
+            controller.pre_step(make_pre_input(&target, false));
+        const interaction::LocomotionSnapshot snapshot =
+            locomotion.step(pre);
+        post = controller.post_step(
+            make_post_input(snapshot, &target), preview);
+        require(
+            callback_roots.size() == 6U &&
+                backend.observe_calls == tick + 3U,
+            "Approach/Settling made a hidden preview call or observation");
+    }
+    require(
+        controller.diagnostics().state ==
+                interaction::PickAssistState::FinalPreview &&
+            post.assist_output.preview_requests.size() == 1U,
+        "five settled ticks did not emit one frozen FinalPreview request");
+
+    const interaction::SmartPickupPreStepResult final_pre =
+        controller.pre_step(make_pre_input(&target, false));
+    const interaction::LocomotionSnapshot final_snapshot =
+        locomotion.step(final_pre);
+    post = controller.post_step(
+        make_post_input(final_snapshot, &target), preview);
+    require(
+        callback_roots.size() == 7U && backend.observe_calls == 9U &&
+            backend.take_submission_calls == 1U &&
+            backend.yielded_submissions == 1U &&
+            post.pick_request.has_value() &&
+            controller.diagnostics().state ==
+                interaction::PickAssistState::Submitted,
+        "FinalPreview did not make exactly F=1 call and one submission");
+
+    const interaction::SmartPickupPreStepResult submitted_pre =
+        controller.pre_step(make_pre_input(&target, false));
+    const interaction::LocomotionSnapshot submitted_snapshot =
+        locomotion.step(submitted_pre);
+    (void)controller.post_step(
+        make_post_input(submitted_snapshot, &target), preview);
+    require(
+        callback_roots.size() == 2U * 3U + 1U &&
+            backend.observe_calls == 9U &&
+            backend.take_submission_calls == 1U,
+        "Submitted made callbacks or observations beyond E*K+F");
+
+    CountingAssistBackend failed_backend;
+    interaction::SmartPickupController failed_controller(failed_backend);
+    CallerOrderHarness failed_locomotion;
+    failed_locomotion.root_position = vec3();
+    failed_locomotion.stick_displacement_scale = 0.0F;
+    uint32_t failed_calls = 0U;
+    const interaction::SmartPickupPreviewCallback hard_reject =
+        [&](const interaction::LocomotionSnapshot&,
+            interaction::PickEntryRoot root,
+            interaction::TargetHandle,
+            uint32_t)
+            -> std::optional<interaction::PickEntryPreview> {
+            ++failed_calls;
+            interaction::PickEntryPreview result{};
+            result.path_feasible = true;
+            result.path_reason = interaction::Reason::None;
+            result.match_ready = false;
+            result.match_reason = interaction::Reason::CorrectionLimit;
+            result.prospective_root = root;
+            return result;
+        };
+    const auto failed_activation = failed_controller.pre_step(
+        make_pre_input(&target, true));
+    const auto failed_activation_snapshot =
+        failed_locomotion.step(failed_activation);
+    auto failed_post = failed_controller.post_step(
+        make_post_input(failed_activation_snapshot, &target), hard_reject);
+    require(failed_calls == 0U, "failed fixture previewed on activation");
+    const auto failed_epoch = failed_controller.pre_step(
+        make_pre_input(&target, false));
+    const auto failed_epoch_snapshot = failed_locomotion.step(failed_epoch);
+    failed_post = failed_controller.post_step(
+        make_post_input(failed_epoch_snapshot, &target), hard_reject);
+    require(
+        failed_calls == 3U && failed_backend.observe_calls == 2U &&
+            failed_controller.diagnostics().state ==
+                interaction::PickAssistState::Failed,
+        "hard selection batch did not fail after exactly K callbacks");
+    const auto after_failed = failed_controller.pre_step(
+        make_pre_input(&target, false));
+    const auto after_failed_snapshot = failed_locomotion.step(after_failed);
+    (void)failed_controller.post_step(
+        make_post_input(after_failed_snapshot, &target), hard_reject);
+    require(
+        failed_calls == 3U && failed_backend.observe_calls == 2U,
+        "Failed state made later callback or observation work");
 }
 
 void test_begin_exception_clears_pending_activation_before_backend_call() {
@@ -1030,8 +1266,11 @@ void require_post_begin_slot_mutation_fails_as_slot_changed(
         backend.begin_calls == 1U && backend.observe_calls == 1U &&
             !began.pick_request.has_value() &&
             controller.diagnostics().state ==
-                interaction::PickAssistState::SlotApproach,
+                interaction::PickAssistState::SlotSelectionPreview &&
+            !began.assist_output.preview_requests.empty(),
         "post-begin slot-mutation fixture did not activate");
+    const size_t selection_request_count =
+        began.assist_output.preview_requests.size();
 
     mutate(target);
     const interaction::SmartPickupPreStepResult active =
@@ -1048,7 +1287,8 @@ void require_post_begin_slot_mutation_fails_as_slot_changed(
         locomotion.ordinary_step_calls == 2U &&
         locomotion.materialized_snapshot_count == 2U &&
         backend.begin_calls == 1U && backend.observe_calls == 2U &&
-        backend.take_submission_calls == 0U && preview_calls == 0U &&
+        backend.take_submission_calls == 0U &&
+        preview_calls == selection_request_count &&
         !changed.pick_request.has_value() &&
         diagnostics.state == interaction::PickAssistState::Failed &&
         diagnostics.reason == interaction::PickAssistReason::SlotChanged;
@@ -1527,14 +1767,33 @@ void test_active_assist_owns_sticks_while_camera_and_cancel_remain_live() {
     interaction::SmartPickupPostStepInput first_post =
         make_post_input(first_snapshot, &target);
     first_post.camera_azimuth = 0.0F;
-    const interaction::SmartPickupPostStepResult first =
+    const interaction::SmartPickupPostStepResult selection =
         controller.post_step(
             first_post, rejecting_preview_counter(preview_calls));
     require(
         backend.begin_calls == 1U && backend.observe_calls == 1U &&
+            selection.assist_output.override_steering &&
+            selection.assist_output.stationary_constraint &&
+            !selection.assist_output.preview_requests.empty(),
+        "camera/cancel fixture did not enter selection certification");
+    const size_t selection_request_count =
+        selection.assist_output.preview_requests.size();
+    const interaction::SmartPickupPreStepResult certification_pre =
+        controller.pre_step(make_pre_input(&target, false));
+    const interaction::LocomotionSnapshot certification_snapshot =
+        locomotion.step(certification_pre);
+    const interaction::SmartPickupPostStepResult first =
+        controller.post_step(
+            make_post_input(certification_snapshot, &target),
+            certified_preview_counter(preview_calls));
+    require(
+        backend.begin_calls == 1U && backend.observe_calls == 2U &&
+            preview_calls == selection_request_count &&
+            controller.diagnostics().state ==
+                interaction::PickAssistState::SlotApproach &&
             first.assist_output.override_steering &&
             !is_zero(first.assist_output.left_stick),
-        "camera/cancel fixture did not enter active slot approach");
+        "camera/cancel fixture did not certify an active slot approach");
 
     interaction::SmartPickupPreStepInput raw =
         make_pre_input(&target, false);
@@ -1558,7 +1817,7 @@ void test_active_assist_owns_sticks_while_camera_and_cancel_remain_live() {
         controller.post_step(
             second_post, rejecting_preview_counter(preview_calls));
     require(
-        backend.begin_calls == 1U && backend.observe_calls == 2U &&
+        backend.begin_calls == 1U && backend.observe_calls == 3U &&
             second.assist_output.override_steering &&
             !same_vec3_bits(
                 second.assist_output.left_stick,
@@ -1591,8 +1850,9 @@ void test_active_assist_owns_sticks_while_camera_and_cancel_remain_live() {
             make_post_input(cancelled_snapshot, &target),
             rejecting_preview_counter(preview_calls));
     require(
-        backend.begin_calls == 1U && backend.observe_calls == 2U &&
-            backend.take_submission_calls == 0U && preview_calls == 0U &&
+        backend.begin_calls == 1U && backend.observe_calls == 3U &&
+            backend.take_submission_calls == 0U &&
+            preview_calls == selection_request_count &&
             !cancelled_post.pick_request.has_value(),
         "cancelled active assist produced post-step work");
 }
@@ -1615,8 +1875,11 @@ void test_active_repeated_f_is_consumed_without_restarting_assist() {
             rejecting_preview_counter(preview_calls));
     require(
         backend.begin_calls == 1U && backend.observe_calls == 1U &&
-            first.assist_output.override_steering,
+            first.assist_output.override_steering &&
+            !first.assist_output.preview_requests.empty(),
         "repeated-F fixture did not activate once");
+    const size_t selection_request_count =
+        first.assist_output.preview_requests.size();
 
     interaction::SmartPickupPreStepInput repeated_input =
         make_pre_input(&target, true);
@@ -1643,11 +1906,14 @@ void test_active_repeated_f_is_consumed_without_restarting_assist() {
         locomotion.ordinary_step_calls == 2U &&
             locomotion.materialized_snapshot_count == 2U &&
             backend.begin_calls == 1U && backend.observe_calls == 2U &&
-            backend.take_submission_calls == 0U && preview_calls == 0U &&
+            backend.take_submission_calls == 0U &&
+            preview_calls == selection_request_count &&
             !second.pick_request.has_value() &&
             controller.diagnostics().state ==
-                interaction::PickAssistState::SlotApproach,
-        "active repeated F created a second begin, preview, or request");
+                interaction::PickAssistState::SlotSelectionPreview &&
+            second.assist_output.preview_requests.size() ==
+                selection_request_count,
+        "active repeated F created a second begin or changed selection work");
 }
 
 void test_post_obstacles_are_copied_into_backend_and_frozen() {
@@ -1691,13 +1957,21 @@ void test_post_obstacles_are_copied_into_backend_and_frozen() {
             same_vec3_vector_bits(obstacle_sizes, sizes_before),
         "coordinator did not copy ordered post-step obstacles exactly");
     require(
-        initial.selected_slot_id == 22U &&
+        initial.state == interaction::PickAssistState::SlotSelectionPreview &&
+            initial.selected_slot_id == 0U &&
+            initial.slot_selection.selected_index.has_value() &&
+            initial.slot_selection.ordered[
+                *initial.slot_selection.selected_index].id == 22U &&
             initial.slot_selection.ordered.size() == 3U &&
             initial.slot_selection.ordered[0].id == 11U &&
             initial.slot_selection.ordered[0].reason ==
                 interaction::PickSlotReason::ObstacleBlocked &&
             initial.slot_selection.ordered[0].obstacle_index == 1,
         "ordered obstacle center/size conversion did not block only slot 11");
+    const size_t selection_request_count =
+        began.assist_output.preview_requests.size();
+    const size_t expected_selected_index =
+        *initial.slot_selection.selected_index;
 
     const std::vector<vec3> replacement_centers{
         vec3(-0.40F, 0.0F, -0.50F),
@@ -1716,18 +1990,19 @@ void test_post_obstacles_are_copied_into_backend_and_frozen() {
                 &target,
                 replacement_centers,
                 replacement_sizes),
-            rejecting_preview_counter(preview_calls));
+            certified_preview_counter(preview_calls));
     const interaction::PickAssistDiagnostics& frozen =
         controller.diagnostics();
     require(
         backend.begin_calls == 1U && backend.observe_calls == 2U &&
-            backend.take_submission_calls == 0U && preview_calls == 0U &&
+            backend.take_submission_calls == 0U &&
+            preview_calls == selection_request_count &&
             !observed.pick_request.has_value() &&
             frozen.state == interaction::PickAssistState::SlotApproach &&
             frozen.reason == interaction::PickAssistReason::None &&
-            frozen.selected_slot_id == initial.selected_slot_id &&
-            frozen.slot_selection.selected_index ==
-                initial.slot_selection.selected_index &&
+            frozen.selected_slot_id == 22U &&
+            frozen.frozen_slot_index == expected_selected_index &&
+            frozen.slot_selection.selected_index == expected_selected_index &&
             frozen.slot_selection.ordered[0].obstacle_index == 1,
         "later controller obstacles replaced the attempt's frozen copy");
 }
@@ -1768,8 +2043,8 @@ void test_null_and_poor_match_final_preview_retry_stationary() {
     locomotion.root_yaw_radians = 0.0F;
     locomotion.stick_displacement_scale = 0.0F;
     const interaction::PickEntryRoot expected_root{0.0F, 0.0F, 0.0F};
-    enum class PreviewMode { Missing, PoorMatch };
-    PreviewMode mode = PreviewMode::Missing;
+    enum class PreviewMode { SelectionReady, Missing, PoorMatch };
+    PreviewMode mode = PreviewMode::SelectionReady;
     uint32_t preview_calls = 0U;
     const interaction::SmartPickupPreviewCallback preview =
         [&](const interaction::LocomotionSnapshot&,
@@ -1779,10 +2054,15 @@ void test_null_and_poor_match_final_preview_retry_stationary() {
             -> std::optional<interaction::PickEntryPreview> {
             ++preview_calls;
             require(
-                same_pick_entry_root_bits(root, expected_root) &&
-                    handle == target.handle &&
+                handle == target.handle &&
                     affordance_id == target.affordances.front().id,
-                "retry preview did not receive frozen target/slot identity");
+                "retry preview did not receive frozen target identity");
+            if (mode == PreviewMode::SelectionReady) {
+                return make_certified_preview(root);
+            }
+            require(
+                same_pick_entry_root_bits(root, expected_root),
+                "final retry preview did not receive the frozen slot root");
             if (mode == PreviewMode::Missing) return std::nullopt;
             interaction::PickEntryPreview poor{};
             poor.path_feasible = true;
@@ -1802,9 +2082,25 @@ void test_null_and_poor_match_final_preview_retry_stationary() {
     require(
         backend.begin_calls == 1U && backend.observe_calls == 1U &&
             controller.diagnostics().state ==
-                interaction::PickAssistState::Settling &&
-            preview_calls == 0U && !post.pick_request.has_value(),
-        "retry fixture did not activate at the exact frozen slot");
+                interaction::PickAssistState::SlotSelectionPreview &&
+            preview_calls == 0U && !post.pick_request.has_value() &&
+            !post.assist_output.preview_requests.empty(),
+        "retry fixture did not activate selection at the exact slot");
+    const size_t selection_request_count =
+        post.assist_output.preview_requests.size();
+    const interaction::SmartPickupPreStepResult selection_pre =
+        controller.pre_step(make_pre_input(&target, false));
+    const interaction::LocomotionSnapshot selection_snapshot =
+        locomotion.step(selection_pre);
+    post = controller.post_step(
+        make_post_input(selection_snapshot, &target), preview);
+    require(
+        preview_calls == selection_request_count &&
+            backend.observe_calls == 2U &&
+            controller.diagnostics().state ==
+                interaction::PickAssistState::Settling,
+        "retry fixture did not certify the exact frozen slot");
+    mode = PreviewMode::Missing;
 
     for (uint32_t tick = 1U; tick <= 5U; ++tick) {
         const interaction::SmartPickupPreStepResult pre =
@@ -1815,8 +2111,8 @@ void test_null_and_poor_match_final_preview_retry_stationary() {
             make_post_input(snapshot, &target), preview);
     }
     require(
-        backend.begin_calls == 1U && backend.observe_calls == 6U &&
-            preview_calls == 0U &&
+        backend.begin_calls == 1U && backend.observe_calls == 7U &&
+            preview_calls == selection_request_count &&
             controller.diagnostics().state ==
                 interaction::PickAssistState::FinalPreview &&
             is_stationary_preview_retry(post.assist_output, expected_root),
@@ -1834,8 +2130,9 @@ void test_null_and_poor_match_final_preview_retry_stationary() {
         controller.post_step(
             make_post_input(missing_snapshot, &target), preview);
     require(
-        preview_calls == 1U && backend.begin_calls == 1U &&
-            backend.observe_calls == 7U &&
+        preview_calls == selection_request_count + 1U &&
+            backend.begin_calls == 1U &&
+            backend.observe_calls == 8U &&
             backend.take_submission_calls == 0U &&
             !missing.pick_request.has_value() &&
             controller.diagnostics().state ==
@@ -1855,8 +2152,9 @@ void test_null_and_poor_match_final_preview_retry_stationary() {
         controller.post_step(
             make_post_input(poor_snapshot, &target), preview);
     require(
-        preview_calls == 2U && backend.begin_calls == 1U &&
-            backend.observe_calls == 8U &&
+        preview_calls == selection_request_count + 2U &&
+            backend.begin_calls == 1U &&
+            backend.observe_calls == 9U &&
             backend.take_submission_calls == 0U &&
             !poor.pick_request.has_value() &&
             controller.diagnostics().state ==
@@ -1884,6 +2182,7 @@ void test_final_preview_and_request_are_each_one_shot() {
     uint64_t callback_snapshot_fingerprint = 0U;
     interaction::LocomotionSnapshot expected_preview_snapshot{};
     bool expected_preview_snapshot_available = false;
+    bool certifying_selection = true;
     const interaction::PickEntryRoot expected_root{0.0F, 0.0F, 0.0F};
     const interaction::SmartPickupPreviewCallback preview =
         [&](const interaction::LocomotionSnapshot& snapshot,
@@ -1893,14 +2192,19 @@ void test_final_preview_and_request_are_each_one_shot() {
             -> std::optional<interaction::PickEntryPreview> {
             ++preview_calls;
             require(
+                handle == target.handle &&
+                    affordance_id == target.affordances.front().id,
+                "preview did not receive the frozen target identity");
+            if (certifying_selection) {
+                return make_certified_preview(root);
+            }
+            require(
                 expected_preview_snapshot_available &&
                     same_snapshot_bits(
                         snapshot, expected_preview_snapshot),
                 "preview did not receive the current authoritative snapshot");
             require(
-                same_pick_entry_root_bits(root, expected_root) &&
-                    handle == target.handle &&
-                    affordance_id == target.affordances.front().id,
+                same_pick_entry_root_bits(root, expected_root),
                 "preview did not receive the frozen slot identity");
             callback_snapshot_fingerprint =
                 interaction::runtime_detail::
@@ -1919,8 +2223,24 @@ void test_final_preview_and_request_are_each_one_shot() {
             backend.take_submission_calls == 0U && preview_calls == 0U &&
             !post.pick_request.has_value() &&
             controller.diagnostics().state ==
+                interaction::PickAssistState::SlotSelectionPreview &&
+            !post.assist_output.preview_requests.empty(),
+        "exact-slot activation did not enter selection without previewing");
+    const size_t selection_request_count =
+        post.assist_output.preview_requests.size();
+    const interaction::SmartPickupPreStepResult selection_pre =
+        controller.pre_step(make_pre_input(&target, false));
+    const interaction::LocomotionSnapshot selection_snapshot =
+        locomotion.step(selection_pre);
+    post = controller.post_step(
+        make_post_input(selection_snapshot, &target), preview);
+    require(
+        backend.observe_calls == 2U &&
+            preview_calls == selection_request_count &&
+            controller.diagnostics().state ==
                 interaction::PickAssistState::Settling,
-        "exact-slot activation did not enter Settling without previewing");
+        "exact-slot selection did not certify into Settling");
+    certifying_selection = false;
 
     for (uint32_t tick = 1U; tick <= 5U; ++tick) {
         const interaction::SmartPickupPreStepResult pre =
@@ -1929,9 +2249,9 @@ void test_final_preview_and_request_are_each_one_shot() {
         post = controller.post_step(make_post_input(snapshot, &target), preview);
         require(
             backend.begin_calls == 1U &&
-                backend.observe_calls == tick + 1U &&
+                backend.observe_calls == tick + 2U &&
                 backend.take_submission_calls == 0U &&
-                preview_calls == 0U &&
+                preview_calls == selection_request_count &&
                 !post.pick_request.has_value() &&
                 controller.diagnostics().settle_ticks == tick,
             "settling performed hidden begin, preview, request, or observation work");
@@ -1959,8 +2279,9 @@ void test_final_preview_and_request_are_each_one_shot() {
     post = controller.post_step(
         make_post_input(expected_preview_snapshot, &target), preview);
     require(
-        preview_calls == 1U && backend.begin_calls == 1U &&
-            backend.observe_calls == 7U &&
+        preview_calls == selection_request_count + 1U &&
+            backend.begin_calls == 1U &&
+            backend.observe_calls == 8U &&
             backend.take_submission_calls == 1U &&
             backend.yielded_submissions == 1U &&
             post.assist_output.submit_interact &&
@@ -1982,8 +2303,9 @@ void test_final_preview_and_request_are_each_one_shot() {
         controller.post_step(
             make_post_input(after_snapshot, &target), preview);
     require(
-        preview_calls == 1U && backend.begin_calls == 1U &&
-            backend.observe_calls == 7U &&
+        preview_calls == selection_request_count + 1U &&
+            backend.begin_calls == 1U &&
+            backend.observe_calls == 8U &&
             backend.take_submission_calls == 1U &&
             backend.yielded_submissions == 1U &&
             !after.pick_request.has_value() &&
@@ -1996,6 +2318,7 @@ void test_final_preview_and_request_are_each_one_shot() {
 int main() {
     test_activation_brackets_one_caller_step_and_defers_assist_motion();
     test_prior_preview_batch_uses_one_snapshot_and_echoes_every_request();
+    test_selection_and_final_preview_call_counts_are_exact();
     test_begin_exception_clears_pending_activation_before_backend_call();
     test_obstacle_array_exception_clears_pending_activation();
     test_pending_target_mutations_fail_before_slot_freeze();

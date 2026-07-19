@@ -144,6 +144,9 @@ static_assert(
     static_cast<uint8_t>(interaction::PickAssistState::Submitted) == 5U);
 static_assert(
     static_cast<uint8_t>(interaction::PickAssistState::Failed) == 6U);
+static_assert(
+    static_cast<uint8_t>(
+        interaction::PickAssistState::SlotSelectionPreview) == 7U);
 
 static_assert(
     static_cast<uint8_t>(interaction::PickAssistReason::None) == 0U);
@@ -181,6 +184,9 @@ static_assert(
 static_assert(
     static_cast<uint8_t>(
         interaction::PickAssistReason::FinalPreviewRejected) == 14U);
+static_assert(
+    static_cast<uint8_t>(
+        interaction::PickAssistReason::SelectionPreviewRejected) == 15U);
 
 static_assert(std::is_same_v<
     decltype(interaction::PickAssistOutput{}.preview_requests),
@@ -188,6 +194,12 @@ static_assert(std::is_same_v<
 static_assert(std::is_same_v<
     decltype(interaction::PickAssistObservation{}.preview_results),
     std::vector<interaction::PickAssistPreviewResult>>);
+static_assert(std::is_same_v<
+    decltype(interaction::PickAssistDiagnostics{}.frozen_slot_index),
+    std::optional<size_t>>);
+static_assert(std::is_same_v<
+    decltype(interaction::PickAssistDiagnostics{}.selection_previews),
+    std::vector<interaction::PickAssistSelectionPreviewDiagnostics>>);
 
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -348,6 +360,143 @@ bool is_zero(vec3 value) {
     return value.x == 0.0F && value.y == 0.0F && value.z == 0.0F;
 }
 
+interaction::PickEntryRoot mapped_entry_root(
+    const interaction::MappedPickSlot& slot) {
+    const vec3 forward = quat_mul_vec3(
+        slot.root_world.rotation, vec3(0.0F, 0.0F, 1.0F));
+    return {
+        slot.root_world.position.x,
+        slot.root_world.position.z,
+        std::atan2(forward.x, forward.z),
+    };
+}
+
+interaction::PickAssistObservation make_selection_observation(
+    const interaction::InteractionTarget& target,
+    interaction::Transform displayed_root) {
+    interaction::PickAssistObservation observation{};
+    observation.target = &target;
+    observation.displayed_root = displayed_root;
+    return observation;
+}
+
+enum class SelectionPreviewKind : uint8_t {
+    Ready,
+    PoorMatch,
+    CorrectionLimit,
+    BlockedPath,
+    Missing,
+};
+
+std::optional<interaction::PickEntryPreview> selection_preview(
+    interaction::PickEntryRoot root,
+    SelectionPreviewKind kind,
+    float cost = 1.0F) {
+    if (kind == SelectionPreviewKind::Missing) return std::nullopt;
+    interaction::PickEntryPreview preview{};
+    preview.path_feasible = true;
+    preview.path_reason = interaction::Reason::None;
+    preview.match_ready = true;
+    preview.match_reason = interaction::Reason::None;
+    preview.prospective_root = root;
+    preview.feasible_entry_frame = 114;
+    preview.contact_frame = 139;
+    preview.total_cost = cost;
+    switch (kind) {
+    case SelectionPreviewKind::Ready:
+    case SelectionPreviewKind::Missing:
+        break;
+    case SelectionPreviewKind::PoorMatch:
+        preview.match_ready = false;
+        preview.match_reason = interaction::Reason::PoorMatch;
+        break;
+    case SelectionPreviewKind::CorrectionLimit:
+        preview.match_ready = false;
+        preview.match_reason = interaction::Reason::CorrectionLimit;
+        break;
+    case SelectionPreviewKind::BlockedPath:
+        preview.path_feasible = false;
+        preview.path_reason = interaction::Reason::BlockedPath;
+        preview.match_ready = false;
+        preview.match_reason = interaction::Reason::BlockedPath;
+        break;
+    }
+    return preview;
+}
+
+void set_selection_results(
+    interaction::PickAssistObservation& observation,
+    const interaction::PickAssistOutput& requested,
+    const std::vector<SelectionPreviewKind>& kinds,
+    uint64_t fingerprint,
+    const std::vector<float>& costs = {}) {
+    require(
+        kinds.size() <= requested.preview_requests.size(),
+        "selection-result fixture supplied too many result kinds");
+    require(
+        costs.empty() || costs.size() == kinds.size(),
+        "selection-result fixture cost count changed");
+    observation.snapshot_fingerprint = fingerprint;
+    observation.preview_snapshot_fingerprint = fingerprint;
+    observation.preview_results.clear();
+    for (size_t index = 0U; index < kinds.size(); ++index) {
+        const interaction::PickAssistPreviewRequest& request =
+            requested.preview_requests[index];
+        observation.preview_results.push_back({
+            request,
+            selection_preview(
+                request.root,
+                kinds[index],
+                costs.empty() ? 1.0F : costs[index]),
+        });
+    }
+}
+
+void require_ranked_selection_requests(
+    const interaction::PickAssistOutput& output,
+    const interaction::PickAssistDiagnostics& diagnostics,
+    const char* message) {
+    const std::vector<size_t>& ranked =
+        diagnostics.slot_selection.ranked_eligible_indices;
+    require(
+        output.override_steering && output.force_strafe &&
+            output.stationary_constraint && is_zero(output.left_stick) &&
+            is_zero(output.right_stick) && !output.submit_interact &&
+            output.preview_requests.size() == ranked.size(),
+        message);
+    for (size_t rank = 0U; rank < ranked.size(); ++rank) {
+        const interaction::MappedPickSlot& slot =
+            diagnostics.slot_selection.ordered[ranked[rank]];
+        require(
+            output.preview_requests[rank].slot_id == slot.id &&
+                same_pick_entry_root_bits_exact(
+                    output.preview_requests[rank].root,
+                    mapped_entry_root(slot)),
+            message);
+    }
+}
+
+bool begin_and_certify_geometry_winner(
+    interaction::ControllerPickAssist& assist,
+    const interaction::PickAssistStart& start,
+    const interaction::InteractionTarget* target) {
+    if (!assist.begin(start, target) || target == nullptr) return false;
+    interaction::PickAssistObservation observation =
+        make_selection_observation(*target, start.root_world);
+    const interaction::PickAssistOutput requested =
+        assist.observe(observation);
+    if (requested.preview_requests.empty()) return false;
+    set_selection_results(
+        observation,
+        requested,
+        std::vector<SelectionPreviewKind>(
+            requested.preview_requests.size(),
+            SelectionPreviewKind::Ready),
+        0x5e1ec7U);
+    (void)assist.observe(observation);
+    return assist.diagnostics().frozen_slot_index.has_value();
+}
+
 void require_zero_pick_assist_output(
     const interaction::PickAssistOutput& output,
     const char* message) {
@@ -417,12 +566,612 @@ void test_idle_does_not_override_input() {
         "Idle diagnostics reported the wrong state");
 }
 
+void test_begin_defers_freeze_and_requests_every_ranked_entry() {
+    const interaction::InteractionTarget target = make_frozen_slot_target();
+    const interaction::PickAssistStart start = make_frozen_slot_start(target);
+    interaction::ControllerPickAssist assist;
+
+    require(assist.begin(start, &target), "selection-preview begin failed");
+    const interaction::PickAssistDiagnostics& began = assist.diagnostics();
+    require(
+        began.state == interaction::PickAssistState::SlotSelectionPreview &&
+            began.reason == interaction::PickAssistReason::None &&
+            began.selected_slot_id == 0U &&
+            !began.frozen_slot_index.has_value() &&
+            began.slot_selection.selected_index.has_value() &&
+            began.slot_selection.ranked_eligible_indices.size() == 3U &&
+            began.route_length_m == 0.0F &&
+            began.object_origin_distance_m == 0.0F &&
+            began.object_bounds_center_distance_m == 0.0F,
+        "begin froze geometry-only selection before motion certification");
+    const size_t legacy = *began.slot_selection.selected_index;
+    require(
+        began.slot_selection.ordered[legacy].id == 9U,
+        "begin changed the legacy geometry-only winner diagnostic");
+
+    interaction::PickAssistObservation observation =
+        make_selection_observation(target, start.root_world);
+    observation.snapshot_fingerprint = 0x101U;
+    const interaction::PickAssistOutput output = assist.observe(observation);
+    require_ranked_selection_requests(
+        output,
+        assist.diagnostics(),
+        "activation did not emit every ranked geometry-eligible request");
+    const interaction::PickAssistDiagnostics& requested =
+        assist.diagnostics();
+    require(
+        requested.state ==
+                interaction::PickAssistState::SlotSelectionPreview &&
+            requested.selected_slot_id == 0U &&
+            !requested.frozen_slot_index.has_value() &&
+            requested.selection_preview_epochs == 1U &&
+            requested.selection_preview_calls == 0U &&
+            !requested.selection_poor_match_observed &&
+            requested.selection_previews.size() ==
+                output.preview_requests.size(),
+        "activation changed freeze state or selection counters");
+    for (size_t index = 0U;
+         index < requested.selection_previews.size();
+         ++index) {
+        const auto& preview = requested.selection_previews[index];
+        require(
+            preview.request.slot_id ==
+                    output.preview_requests[index].slot_id &&
+                same_pick_entry_root_bits_exact(
+                    preview.request.root,
+                    output.preview_requests[index].root) &&
+                preview.observation_snapshot_fingerprint == 0x101U &&
+                preview.preview_snapshot_fingerprint == 0U &&
+                !preview.available &&
+                !preview.prospective_root.has_value(),
+            "initial selection diagnostics did not retain request provenance");
+    }
+}
+
+void test_selection_freezes_first_ranked_ready_entry_not_lowest_cost() {
+    const interaction::InteractionTarget target = make_frozen_slot_target();
+    const interaction::PickAssistStart start = make_frozen_slot_start(target);
+    interaction::ControllerPickAssist assist;
+    require(assist.begin(start, &target), "ranked-ready begin failed");
+    interaction::PickAssistObservation observation =
+        make_selection_observation(target, start.root_world);
+    const interaction::PickAssistOutput requested =
+        assist.observe(observation);
+    require(
+        requested.preview_requests.size() == 3U &&
+            requested.preview_requests[0].slot_id == 9U &&
+            requested.preview_requests[1].slot_id == 12U &&
+            requested.preview_requests[2].slot_id == 11U,
+        "ranked-ready fixture did not request 9,12,11 geometry order");
+    set_selection_results(
+        observation,
+        requested,
+        {
+            SelectionPreviewKind::CorrectionLimit,
+            SelectionPreviewKind::Ready,
+            SelectionPreviewKind::Ready,
+        },
+        0x202U,
+        {0.01F, 99.0F, 0.10F});
+
+    const interaction::PickAssistOutput output =
+        assist.observe(observation);
+    const interaction::PickAssistDiagnostics& frozen =
+        assist.diagnostics();
+    require(
+        frozen.state == interaction::PickAssistState::SlotApproach &&
+            frozen.reason == interaction::PickAssistReason::None &&
+            frozen.frozen_slot_index.has_value() &&
+            *frozen.frozen_slot_index == 0U &&
+            frozen.selected_slot_id == 12U &&
+            frozen.slot_selection.selected_index.has_value() &&
+            frozen.slot_selection.ordered[
+                *frozen.slot_selection.selected_index].id == 9U &&
+            frozen.selection_preview_epochs == 1U &&
+            frozen.selection_preview_calls == 3U &&
+            output.preview_requests.empty() &&
+            output.override_steering,
+        "selection did not freeze the first ranked ready entry exactly once");
+    require(
+        frozen.selection_previews.size() == 3U &&
+            !frozen.selection_previews[0].match_ready &&
+            frozen.selection_previews[0].match_reason ==
+                interaction::Reason::CorrectionLimit &&
+            frozen.selection_previews[1].match_ready &&
+            frozen.selection_previews[1].total_cost == 99.0F &&
+            frozen.selection_previews[2].match_ready &&
+            frozen.selection_previews[2].total_cost == 0.10F,
+        "selection diagnostics lost ranked-ready cost evidence");
+    const std::optional<size_t> frozen_slot_index =
+        frozen.frozen_slot_index;
+    const uint32_t frozen_slot_id = frozen.selected_slot_id;
+
+    interaction::PickAssistObservation later =
+        make_selection_observation(target, start.root_world);
+    set_selection_results(
+        later,
+        requested,
+        std::vector<SelectionPreviewKind>(
+            requested.preview_requests.size(),
+            SelectionPreviewKind::Ready),
+        0x203U);
+    (void)assist.observe(later);
+    require(
+        assist.diagnostics().frozen_slot_index == frozen_slot_index &&
+            assist.diagnostics().selected_slot_id == frozen_slot_id,
+        "post-freeze preview evidence switched the selected slot");
+}
+
+void test_selection_incomplete_batches_retry_atomically_then_deadline() {
+    interaction::PickAssistConfig config{};
+    config.maximum_arrival_ticks = 3U;
+    const interaction::InteractionTarget target = make_frozen_slot_target();
+    const interaction::PickAssistStart start = make_frozen_slot_start(target);
+    interaction::ControllerPickAssist assist(config);
+    require(assist.begin(start, &target), "incomplete-batch begin failed");
+    interaction::PickAssistObservation observation =
+        make_selection_observation(target, start.root_world);
+    interaction::PickAssistOutput requested = assist.observe(observation);
+
+    set_selection_results(
+        observation,
+        requested,
+        {SelectionPreviewKind::Ready},
+        0x301U);
+    interaction::PickAssistOutput output = assist.observe(observation);
+    require(
+        assist.diagnostics().state ==
+                interaction::PickAssistState::SlotSelectionPreview &&
+            !assist.diagnostics().frozen_slot_index.has_value() &&
+            assist.diagnostics().selection_preview_epochs == 2U &&
+            assist.diagnostics().selection_preview_calls == 1U,
+        "partial ready batch selected a partial winner");
+    require_ranked_selection_requests(
+        output,
+        assist.diagnostics(),
+        "partial ready batch did not re-request the entire batch");
+
+    requested = output;
+    observation.preview_results.clear();
+    observation.snapshot_fingerprint = 0x302U;
+    observation.preview_snapshot_fingerprint = 0U;
+    output = assist.observe(observation);
+    require(
+        assist.diagnostics().state ==
+                interaction::PickAssistState::SlotSelectionPreview &&
+            assist.diagnostics().selection_preview_epochs == 3U &&
+            assist.diagnostics().selection_preview_calls == 1U,
+        "empty callback epoch reached the deadline early");
+    require_ranked_selection_requests(
+        output,
+        assist.diagnostics(),
+        "empty callback epoch did not re-request all entries");
+
+    observation.preview_results.clear();
+    observation.snapshot_fingerprint = 0x303U;
+    output = assist.observe(observation);
+    require(
+        assist.diagnostics().state == interaction::PickAssistState::Failed &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::ArrivalDeadline &&
+            !assist.diagnostics().frozen_slot_index.has_value() &&
+            output.preview_requests.empty(),
+        "third incomplete selection epoch did not fail ArrivalDeadline");
+}
+
+void test_selection_mixed_poor_match_retries_until_poor_match_deadline() {
+    interaction::PickAssistConfig config{};
+    config.maximum_arrival_ticks = 3U;
+    const interaction::InteractionTarget target = make_frozen_slot_target();
+    const interaction::PickAssistStart start = make_frozen_slot_start(target);
+    interaction::ControllerPickAssist assist(config);
+    require(assist.begin(start, &target), "PoorMatch selection begin failed");
+    interaction::PickAssistObservation observation =
+        make_selection_observation(target, start.root_world);
+    interaction::PickAssistOutput requested = assist.observe(observation);
+
+    set_selection_results(
+        observation,
+        requested,
+        {
+            SelectionPreviewKind::CorrectionLimit,
+            SelectionPreviewKind::PoorMatch,
+            SelectionPreviewKind::BlockedPath,
+        },
+        0x401U);
+    interaction::PickAssistOutput output = assist.observe(observation);
+    require(
+        assist.diagnostics().state ==
+                interaction::PickAssistState::SlotSelectionPreview &&
+            assist.diagnostics().selection_poor_match_observed &&
+            !assist.diagnostics().frozen_slot_index.has_value(),
+        "mixed hard/PoorMatch epoch did not retry atomically");
+    require_ranked_selection_requests(
+        output,
+        assist.diagnostics(),
+        "mixed hard/PoorMatch epoch did not request every entry again");
+
+    for (uint64_t fingerprint : {0x402U, 0x403U}) {
+        requested = output;
+        set_selection_results(
+            observation,
+            requested,
+            std::vector<SelectionPreviewKind>(
+                requested.preview_requests.size(),
+                SelectionPreviewKind::PoorMatch),
+            fingerprint);
+        output = assist.observe(observation);
+    }
+    require(
+        assist.diagnostics().state == interaction::PickAssistState::Failed &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::PoorMatch &&
+            assist.diagnostics().selection_preview_epochs == 3U &&
+            assist.diagnostics().selection_preview_calls == 9U &&
+            !assist.diagnostics().frozen_slot_index.has_value() &&
+            output.preview_requests.empty(),
+        "PoorMatch epochs did not terminate with stable PoorMatch reason");
+}
+
+void test_selection_complete_hard_batch_rejects() {
+    const interaction::InteractionTarget target = make_frozen_slot_target();
+    const interaction::PickAssistStart start = make_frozen_slot_start(target);
+    interaction::ControllerPickAssist assist;
+    require(assist.begin(start, &target), "hard-batch begin failed");
+    interaction::PickAssistObservation observation =
+        make_selection_observation(target, start.root_world);
+    const interaction::PickAssistOutput requested =
+        assist.observe(observation);
+    set_selection_results(
+        observation,
+        requested,
+        {
+            SelectionPreviewKind::CorrectionLimit,
+            SelectionPreviewKind::BlockedPath,
+            SelectionPreviewKind::CorrectionLimit,
+        },
+        0x501U);
+    const interaction::PickAssistOutput output = assist.observe(observation);
+    require(
+        assist.diagnostics().state == interaction::PickAssistState::Failed &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::SelectionPreviewRejected &&
+            !assist.diagnostics().frozen_slot_index.has_value() &&
+            output.preview_requests.empty(),
+        "complete hard-rejected batch did not fail closed");
+}
+
+void test_selection_malformed_batches_fail_closed() {
+    enum class Defect : uint8_t {
+        Misordered,
+        Duplicate,
+        WrongSlot,
+        WrongRequestRoot,
+        WrongFingerprint,
+        NonfiniteProspectiveRoot,
+        NanCost,
+        InfiniteCost,
+        ExtraResult,
+    };
+    const std::array<Defect, 9> defects{
+        Defect::Misordered,
+        Defect::Duplicate,
+        Defect::WrongSlot,
+        Defect::WrongRequestRoot,
+        Defect::WrongFingerprint,
+        Defect::NonfiniteProspectiveRoot,
+        Defect::NanCost,
+        Defect::InfiniteCost,
+        Defect::ExtraResult,
+    };
+    for (Defect defect : defects) {
+        const interaction::InteractionTarget target =
+            make_frozen_slot_target();
+        const interaction::PickAssistStart start =
+            make_frozen_slot_start(target);
+        interaction::ControllerPickAssist assist;
+        require(assist.begin(start, &target), "malformed-batch begin failed");
+        interaction::PickAssistObservation observation =
+            make_selection_observation(target, start.root_world);
+        const interaction::PickAssistOutput requested =
+            assist.observe(observation);
+        set_selection_results(
+            observation,
+            requested,
+            std::vector<SelectionPreviewKind>(
+                requested.preview_requests.size(),
+                SelectionPreviewKind::Ready),
+            0x601U);
+        switch (defect) {
+        case Defect::Misordered:
+            std::swap(
+                observation.preview_results[0],
+                observation.preview_results[1]);
+            break;
+        case Defect::Duplicate:
+            observation.preview_results[1] =
+                observation.preview_results[0];
+            break;
+        case Defect::WrongSlot:
+            ++observation.preview_results[0].request.slot_id;
+            break;
+        case Defect::WrongRequestRoot:
+            observation.preview_results[0].request.root.world_x =
+                std::nextafter(
+                    observation.preview_results[0]
+                        .request.root.world_x,
+                    std::numeric_limits<float>::infinity());
+            break;
+        case Defect::WrongFingerprint:
+            observation.preview_snapshot_fingerprint = 0x602U;
+            break;
+        case Defect::NonfiniteProspectiveRoot:
+            observation.preview_results[0]
+                .preview->prospective_root.world_x =
+                    float_from_bits(0x7fc00001U);
+            break;
+        case Defect::NanCost:
+            observation.preview_results[0].preview->total_cost =
+                float_from_bits(0x7fc00001U);
+            break;
+        case Defect::InfiniteCost:
+            observation.preview_results[0].preview->total_cost =
+                float_from_bits(0x7f800000U);
+            break;
+        case Defect::ExtraResult:
+            observation.preview_results.push_back(
+                observation.preview_results.back());
+            break;
+        }
+        const interaction::PickAssistOutput output =
+            assist.observe(observation);
+        require(
+            assist.diagnostics().state ==
+                    interaction::PickAssistState::Failed &&
+                assist.diagnostics().reason ==
+                    interaction::PickAssistReason::SelectionPreviewRejected &&
+                !assist.diagnostics().frozen_slot_index.has_value() &&
+                output.preview_requests.empty(),
+            "malformed selection batch did not fail closed");
+    }
+
+    const interaction::InteractionTarget target =
+        make_frozen_slot_target();
+    const interaction::PickAssistStart start =
+        make_frozen_slot_start(target);
+    interaction::ControllerPickAssist assist;
+    require(
+        assist.begin(start, &target),
+        "partial-malformed selection begin failed");
+    interaction::PickAssistObservation observation =
+        make_selection_observation(target, start.root_world);
+    const interaction::PickAssistOutput requested =
+        assist.observe(observation);
+    set_selection_results(
+        observation,
+        requested,
+        {SelectionPreviewKind::Ready},
+        0x603U);
+    observation.preview_results.front()
+        .preview->prospective_root.world_x =
+            float_from_bits(0x7fc00001U);
+    const interaction::PickAssistOutput partial_malformed =
+        assist.observe(observation);
+    require(
+        assist.diagnostics().state == interaction::PickAssistState::Failed &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::SelectionPreviewRejected &&
+            !assist.diagnostics().frozen_slot_index.has_value() &&
+            partial_malformed.preview_requests.empty(),
+        "partial batch hid malformed present evidence behind retry");
+}
+
+void test_selection_latches_poor_match_before_ready_deadline() {
+    interaction::PickAssistConfig config{};
+    config.maximum_arrival_ticks = 1U;
+    const interaction::InteractionTarget target = make_frozen_slot_target();
+    const interaction::PickAssistStart start = make_frozen_slot_start(target);
+    interaction::ControllerPickAssist assist(config);
+    require(
+        assist.begin(start, &target),
+        "ready/PoorMatch deadline begin failed");
+    interaction::PickAssistObservation observation =
+        make_selection_observation(target, start.root_world);
+    const interaction::PickAssistOutput requested =
+        assist.observe(observation);
+    set_selection_results(
+        observation,
+        requested,
+        {
+            SelectionPreviewKind::Ready,
+            SelectionPreviewKind::PoorMatch,
+            SelectionPreviewKind::CorrectionLimit,
+        },
+        0x604U);
+
+    const interaction::PickAssistOutput output = assist.observe(observation);
+    require(
+        assist.diagnostics().state == interaction::PickAssistState::Failed &&
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::PoorMatch &&
+            assist.diagnostics().selection_poor_match_observed &&
+            !assist.diagnostics().frozen_slot_index.has_value() &&
+            output.preview_requests.empty(),
+        "ready/PoorMatch deadline did not retain truthful PoorMatch evidence");
+}
+
+void test_selection_target_affordance_and_slot_mutations_fail_closed() {
+    enum class Mutation : uint8_t { Target, Affordance, Slot };
+    for (Mutation mutation :
+         {Mutation::Target, Mutation::Affordance, Mutation::Slot}) {
+        interaction::InteractionTarget target = make_frozen_slot_target();
+        const interaction::PickAssistStart start =
+            make_frozen_slot_start(target);
+        interaction::ControllerPickAssist assist;
+        require(assist.begin(start, &target), "mutation begin failed");
+        interaction::PickAssistObservation observation =
+            make_selection_observation(target, start.root_world);
+        const interaction::PickAssistOutput requested =
+            assist.observe(observation);
+        set_selection_results(
+            observation,
+            requested,
+            std::vector<SelectionPreviewKind>(
+                requested.preview_requests.size(),
+                SelectionPreviewKind::Ready),
+            0x701U);
+        switch (mutation) {
+        case Mutation::Target:
+            ++target.handle.generation;
+            break;
+        case Mutation::Affordance:
+            target.affordances.front().hand_in_object.position.x =
+                std::nextafter(0.0F, 1.0F);
+            break;
+        case Mutation::Slot:
+            target.affordances.front().interaction_slots.front()
+                .root_x_object_m = std::nextafter(0.70F, 1.0F);
+            break;
+        }
+        const interaction::PickAssistOutput output =
+            assist.observe(observation);
+        const interaction::PickAssistReason expected =
+            mutation == Mutation::Slot
+                ? interaction::PickAssistReason::SlotChanged
+                : interaction::PickAssistReason::TargetChanged;
+        require(
+            assist.diagnostics().state ==
+                    interaction::PickAssistState::Failed &&
+                assist.diagnostics().reason == expected &&
+                !assist.diagnostics().frozen_slot_index.has_value() &&
+                output.preview_requests.empty(),
+            "selection provenance mutation did not fail with stable reason");
+    }
+}
+
+void test_selection_revalidates_each_candidate_route_before_freeze() {
+    for (bool obstacle_case : {false, true}) {
+        interaction::InteractionTarget target = make_frozen_slot_target();
+        target.object_world = {vec3(), quat()};
+        target.affordances.front().interaction_slots = {
+            {9U, 0.80F, 0.0F, 0.0F},
+            {11U, -0.80F, 0.0F, 0.0F},
+            {12U, 0.0F, -0.90F, 0.0F},
+        };
+        interaction::PickAssistStart start =
+            make_frozen_slot_start(target);
+        start.root_world = obstacle_case
+            ? interaction::Transform{vec3(0.0F, 10.0F, 0.0F), quat()}
+            : interaction::Transform{vec3(), quat()};
+        if (obstacle_case) {
+            start.obstacles.push_back({
+                vec3(0.64F, 0.0F, 0.62F),
+                vec3(0.02F, 0.10F, 0.02F),
+            });
+        } else {
+            target.table_world = {
+                vec3(0.40F, 0.0F, 0.30F), quat()};
+            target.table_size = vec3(0.02F, 0.10F, 0.02F);
+            start.target_snapshot = target;
+        }
+        interaction::ControllerPickAssist assist;
+        require(assist.begin(start, &target), "route-revalidation begin failed");
+        interaction::PickAssistObservation observation =
+            make_selection_observation(target, start.root_world);
+        const interaction::PickAssistOutput requested =
+            assist.observe(observation);
+        require(
+            requested.preview_requests.size() == 3U &&
+                requested.preview_requests[0].slot_id == 9U &&
+                requested.preview_requests[1].slot_id == 11U,
+            "route-revalidation fixture did not rank slots 9 then 11");
+        observation.displayed_root.position =
+            vec3(0.0F, 0.0F, 0.60F);
+        set_selection_results(
+            observation,
+            requested,
+            std::vector<SelectionPreviewKind>(
+                requested.preview_requests.size(),
+                SelectionPreviewKind::Ready),
+            obstacle_case ? 0x802U : 0x801U);
+        const interaction::PickAssistOutput output =
+            assist.observe(observation);
+        require(
+            assist.diagnostics().frozen_slot_index.has_value() &&
+                assist.diagnostics().selected_slot_id == 11U &&
+                assist.diagnostics().state ==
+                    interaction::PickAssistState::SlotApproach &&
+                output.preview_requests.empty(),
+            obstacle_case
+                ? "obstacle-blocked candidate certified over clear alternate"
+                : "table-blocked candidate certified over clear alternate");
+    }
+}
+
+void test_selection_epochs_do_not_consume_frozen_arrival_budget() {
+    interaction::PickAssistConfig config{};
+    config.required_settle_ticks = 2U;
+    config.maximum_arrival_ticks = 4U;
+    const interaction::InteractionTarget target = make_frozen_slot_target();
+    const interaction::PickAssistStart start = make_frozen_slot_start(target);
+    interaction::ControllerPickAssist assist(config);
+    require(assist.begin(start, &target), "arrival-reset begin failed");
+    interaction::PickAssistObservation observation =
+        make_selection_observation(target, start.root_world);
+    interaction::PickAssistOutput requested = assist.observe(observation);
+    for (uint64_t fingerprint : {0x901U, 0x902U}) {
+        set_selection_results(
+            observation,
+            requested,
+            std::vector<SelectionPreviewKind>(
+                requested.preview_requests.size(),
+                SelectionPreviewKind::PoorMatch),
+            fingerprint);
+        requested = assist.observe(observation);
+        require_ranked_selection_requests(
+            requested,
+            assist.diagnostics(),
+            "pre-freeze PoorMatch did not retain full request batch");
+    }
+    set_selection_results(
+        observation,
+        requested,
+        std::vector<SelectionPreviewKind>(
+            requested.preview_requests.size(),
+            SelectionPreviewKind::Ready),
+        0x903U);
+    (void)assist.observe(observation);
+    require(
+        assist.diagnostics().state == interaction::PickAssistState::SlotApproach &&
+            assist.diagnostics().selected_slot_id == 9U,
+        "arrival-reset fixture did not freeze after two preview retries");
+    const size_t frozen_index = *assist.diagnostics().frozen_slot_index;
+    observation.preview_results.clear();
+    observation.displayed_root = assist.diagnostics()
+        .slot_selection.ordered[frozen_index].root_world;
+    (void)assist.observe(observation);
+    require(
+        assist.diagnostics().state == interaction::PickAssistState::Settling,
+        "arrival-reset fixture did not latch frozen root");
+    (void)assist.observe(observation);
+    const interaction::PickAssistOutput final_settle =
+        assist.observe(observation);
+    require(
+        assist.diagnostics().state == interaction::PickAssistState::FinalPreview &&
+            assist.diagnostics().reason == interaction::PickAssistReason::None &&
+            final_settle.preview_requests.size() == 1U,
+        "selection epochs leaked into the frozen arrival deadline budget");
+}
+
 void test_begin_selects_and_freezes_one_authored_slot() {
     const interaction::InteractionTarget target = make_frozen_slot_target();
     const interaction::PickAssistStart start = make_frozen_slot_start(target);
     interaction::ControllerPickAssist assist;
 
-    require(assist.begin(start, &target), "valid frozen-slot begin failed");
+    require(
+        begin_and_certify_geometry_winner(
+            assist, start, &target),
+        "valid frozen-slot begin/certification failed");
     const interaction::PickAssistDiagnostics& diagnostics =
         assist.diagnostics();
     require(
@@ -472,7 +1221,8 @@ void test_begin_rejects_duplicate_affordance_ids_immediately() {
     const interaction::PickAssistStart unique_start =
         make_frozen_slot_start(unique_target);
     require(
-        assist.begin(unique_start, &unique_target) &&
+        begin_and_certify_geometry_winner(
+            assist, unique_start, &unique_target) &&
             assist.diagnostics().state ==
                 interaction::PickAssistState::SlotApproach &&
             assist.diagnostics().reason == interaction::PickAssistReason::None &&
@@ -545,7 +1295,8 @@ void test_slot_approach_emits_far_camera_relative_steering() {
     interaction::ControllerPickAssist assist;
 
     require(
-        assist.begin(scenario.start, &scenario.target),
+        begin_and_certify_geometry_winner(
+            assist, scenario.start, &scenario.target),
         "far-approach begin failed");
     require(
         assist.diagnostics().slot_selection.selected_index.has_value(),
@@ -603,8 +1354,10 @@ void test_slot_approach_emits_far_camera_relative_steering() {
     rotated_scenario.observation.camera_azimuth = 0.50F * PIf;
     interaction::ControllerPickAssist rotated_assist;
     require(
-        rotated_assist.begin(
-            rotated_scenario.start, &rotated_scenario.target),
+        begin_and_certify_geometry_winner(
+            rotated_assist,
+            rotated_scenario.start,
+            &rotated_scenario.target),
         "rotated far-approach begin failed");
     const interaction::PickAssistDiagnostics rotated_before =
         rotated_assist.diagnostics();
@@ -675,7 +1428,8 @@ void test_slot_approach_runtime_change_precedes_target_and_metrics() {
     interaction::ControllerPickAssist assist;
 
     require(
-        assist.begin(scenario.start, &scenario.target),
+        begin_and_certify_geometry_winner(
+            assist, scenario.start, &scenario.target),
         "runtime-precedence fixture begin failed");
     const interaction::PickAssistDiagnostics frozen_before =
         assist.diagnostics();
@@ -760,7 +1514,8 @@ void expect_frozen_slot_observation_failure(
     FrozenSlotScenario scenario;
     interaction::ControllerPickAssist assist;
     require_case(
-        assist.begin(scenario.start, &scenario.target),
+        begin_and_certify_geometry_winner(
+            assist, scenario.start, &scenario.target),
         "fixture begin failed");
     const interaction::PickAssistDiagnostics frozen_before =
         assist.diagnostics();
@@ -1071,7 +1826,8 @@ void test_slot_approach_unchanged_identity_still_steers() {
     FrozenSlotScenario scenario;
     interaction::ControllerPickAssist assist;
     require(
-        assist.begin(scenario.start, &scenario.target),
+        begin_and_certify_geometry_winner(
+            assist, scenario.start, &scenario.target),
         "unchanged-identity fixture begin failed");
     const interaction::PickAssistDiagnostics frozen_before =
         assist.diagnostics();
@@ -1105,7 +1861,8 @@ void test_slot_approach_emits_slow_radius_arrival_steering() {
     interaction::ControllerPickAssist assist(config);
 
     require(
-        assist.begin(scenario.start, &scenario.target),
+        begin_and_certify_geometry_winner(
+            assist, scenario.start, &scenario.target),
         "slow-radius approach begin failed");
     const interaction::PickAssistDiagnostics frozen_before =
         assist.diagnostics();
@@ -1183,7 +1940,8 @@ void test_slot_approach_latches_inclusive_arrival_boundaries() {
     interaction::ControllerPickAssist assist(config);
 
     require(
-        assist.begin(scenario.start, &scenario.target),
+        begin_and_certify_geometry_winner(
+            assist, scenario.start, &scenario.target),
         "inclusive arrival-latch fixture begin failed");
     require(
         assist.diagnostics().state ==
@@ -1270,7 +2028,8 @@ interaction::PickAssistDiagnostics latch_frozen_slot_settling(
     FrozenSlotScenario& scenario,
     const interaction::PickAssistConfig& config) {
     require(
-        assist.begin(scenario.start, &scenario.target),
+        begin_and_certify_geometry_winner(
+            assist, scenario.start, &scenario.target),
         "frozen Settling fixture begin failed");
     const interaction::PickAssistDiagnostics frozen_before =
         assist.diagnostics();
@@ -2484,7 +3243,8 @@ void test_slot_approach_rejects_adjacent_arrival_overshoots() {
         FrozenSlotScenario scenario;
         interaction::ControllerPickAssist assist(config);
         require(
-            assist.begin(scenario.start, &scenario.target) &&
+            begin_and_certify_geometry_winner(
+                assist, scenario.start, &scenario.target) &&
                 assist.diagnostics().slot_selection.selected_index.has_value(),
             "adjacent-position arrival fixture begin failed");
         const interaction::MappedPickSlot frozen_slot =
@@ -2542,7 +3302,8 @@ void test_slot_approach_rejects_adjacent_arrival_overshoots() {
         FrozenSlotScenario scenario;
         interaction::ControllerPickAssist assist(config);
         require(
-            assist.begin(scenario.start, &scenario.target) &&
+            begin_and_certify_geometry_winner(
+                assist, scenario.start, &scenario.target) &&
                 assist.diagnostics().slot_selection.selected_index.has_value(),
             "adjacent-speed arrival fixture begin failed");
         const interaction::MappedPickSlot frozen_slot =
@@ -2602,7 +3363,8 @@ void test_slot_approach_rejects_adjacent_arrival_overshoots() {
         FrozenSlotScenario scenario;
         interaction::ControllerPickAssist assist(config);
         require(
-            assist.begin(scenario.start, &scenario.target) &&
+            begin_and_certify_geometry_winner(
+                assist, scenario.start, &scenario.target) &&
                 assist.diagnostics().slot_selection.selected_index.has_value(),
             "adjacent-yaw arrival fixture begin failed");
         const interaction::MappedPickSlot frozen_slot =
@@ -2671,7 +3433,8 @@ void test_slot_approach_records_cumulative_travel_without_failure() {
 
     interaction::ControllerPickAssist assist;
     require(
-        assist.begin(scenario.start, &scenario.target),
+        begin_and_certify_geometry_winner(
+            assist, scenario.start, &scenario.target),
         "cumulative-travel fixture begin failed");
     const interaction::PickAssistDiagnostics frozen_before =
         assist.diagnostics();
@@ -2731,7 +3494,8 @@ void test_slot_approach_revalidates_frozen_route_against_table() {
     interaction::ControllerPickAssist assist;
 
     require(
-        assist.begin(scenario.start, &scenario.target),
+        begin_and_certify_geometry_winner(
+            assist, scenario.start, &scenario.target),
         "table-revalidation fixture begin failed");
     const interaction::PickAssistDiagnostics frozen_before =
         assist.diagnostics();
@@ -2831,7 +3595,8 @@ void test_slot_approach_revalidates_frozen_route_against_obstacles() {
     interaction::ControllerPickAssist assist;
 
     require(
-        assist.begin(scenario.start, &scenario.target),
+        begin_and_certify_geometry_winner(
+            assist, scenario.start, &scenario.target),
         "obstacle-revalidation fixture begin failed");
     const interaction::PickAssistDiagnostics frozen_before =
         assist.diagnostics();
@@ -3018,7 +3783,8 @@ void test_failed_begin_can_immediately_begin_a_valid_attempt() {
 
     const interaction::InteractionTarget valid = make_frozen_slot_target();
     require(
-        assist.begin(make_frozen_slot_start(valid), &valid),
+        begin_and_certify_geometry_winner(
+            assist, make_frozen_slot_start(valid), &valid),
         "failed assist could not immediately begin a valid attempt");
     require(
         assist.diagnostics().state ==
@@ -3029,21 +3795,21 @@ void test_failed_begin_can_immediately_begin_a_valid_attempt() {
 }
 
 void test_diagnostic_names_are_stable() {
-    const std::array<const char*, 7> states{
+    const std::array<const char*, 8> states{
         "Idle", "SlotApproach", "Settling", "FinalPreview",
-        "ReadyToSubmit", "Submitted", "Failed"};
+        "ReadyToSubmit", "Submitted", "Failed", "SlotSelectionPreview"};
     for (size_t i = 0; i < states.size(); ++i) {
         require(
             std::string(interaction::pick_assist_state_name(
                 static_cast<interaction::PickAssistState>(i))) == states[i],
             "state diagnostic name changed");
     }
-    const std::array<const char*, 15> reasons{
+    const std::array<const char*, 16> reasons{
         "None", "Cancelled", "TargetUnavailable", "TargetChanged",
         "SlotChanged", "RuntimeChanged", "NoAuthoredSlot",
         "InvalidGeometry", "OutsideTravelEnvelope", "TableBlocked",
         "ObstacleBlocked", "AllSlotsBlocked", "ArrivalDeadline",
-        "PoorMatch", "FinalPreviewRejected"};
+        "PoorMatch", "FinalPreviewRejected", "SelectionPreviewRejected"};
     for (size_t i = 0; i < reasons.size(); ++i) {
         require(
             std::string(interaction::pick_assist_reason_name(
@@ -3118,7 +3884,8 @@ void test_frozen_slot_cancel_clears_state_and_restarts() {
     FrozenSlotScenario scenario;
     interaction::ControllerPickAssist assist;
     require(
-        assist.begin(scenario.start, &scenario.target),
+        begin_and_certify_geometry_winner(
+            assist, scenario.start, &scenario.target),
         "frozen-slot cancel fixture begin failed");
     const interaction::PickAssistDiagnostics frozen_before =
         assist.diagnostics();
@@ -3182,7 +3949,8 @@ void test_frozen_slot_cancel_clears_state_and_restarts() {
 
     FrozenSlotScenario restarted;
     require(
-        assist.begin(restarted.start, &restarted.target) &&
+        begin_and_certify_geometry_winner(
+            assist, restarted.start, &restarted.target) &&
             assist.diagnostics().state ==
                 interaction::PickAssistState::SlotApproach &&
             assist.diagnostics().reason ==
@@ -3195,6 +3963,16 @@ void test_frozen_slot_cancel_clears_state_and_restarts() {
 int main() {
     try {
         test_idle_does_not_override_input();
+        test_begin_defers_freeze_and_requests_every_ranked_entry();
+        test_selection_freezes_first_ranked_ready_entry_not_lowest_cost();
+        test_selection_incomplete_batches_retry_atomically_then_deadline();
+        test_selection_mixed_poor_match_retries_until_poor_match_deadline();
+        test_selection_complete_hard_batch_rejects();
+        test_selection_malformed_batches_fail_closed();
+        test_selection_latches_poor_match_before_ready_deadline();
+        test_selection_target_affordance_and_slot_mutations_fail_closed();
+        test_selection_revalidates_each_candidate_route_before_freeze();
+        test_selection_epochs_do_not_consume_frozen_arrival_budget();
         test_begin_selects_and_freezes_one_authored_slot();
         test_begin_rejects_duplicate_affordance_ids_immediately();
         test_slot_approach_emits_far_camera_relative_steering();
