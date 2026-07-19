@@ -74,9 +74,10 @@ def test_onscreen_is_explicit_and_opt_in(self) -> None:
 Run:
 
 ```bash
-PYTHONPATH=sonic/python sonic/.venv/bin/python -m pytest -q \
-  tests/python/test_sonic_process.py \
-  tests/python/test_sonic_manual_demo.py
+PYTHONPATH=sonic/python sonic/.venv/bin/python -B \
+  tests/python/test_sonic_process.py -q
+PYTHONPATH=sonic/python sonic/.venv/bin/python -B \
+  tests/python/test_sonic_manual_demo.py -q
 ```
 
 Expected: failure because `--onscreen` and `onscreen` do not exist.
@@ -182,8 +183,8 @@ Add parser assertions that `--onscreen` defaults false and parses true.
 Run:
 
 ```bash
-PYTHONPATH=sonic/python sonic/.venv/bin/python -m pytest -q \
-  tests/python/test_sonic_gated_sim.py
+PYTHONPATH=sonic/python sonic/.venv/bin/python -B \
+  tests/python/test_sonic_gated_sim.py -q
 ```
 
 Expected: failures for the missing constructor/CLI flag and missing viewer sync.
@@ -223,10 +224,12 @@ Expected: all gated-simulator tests pass.
 Run:
 
 ```bash
-PYTHONPATH=sonic/python sonic/.venv/bin/python -m pytest -q \
-  tests/python/test_sonic_process.py \
-  tests/python/test_sonic_manual_demo.py \
-  tests/python/test_sonic_gated_sim.py
+PYTHONPATH=sonic/python sonic/.venv/bin/python -B \
+  tests/python/test_sonic_process.py -q
+PYTHONPATH=sonic/python sonic/.venv/bin/python -B \
+  tests/python/test_sonic_manual_demo.py -q
+PYTHONPATH=sonic/python sonic/.venv/bin/python -B \
+  tests/python/test_sonic_gated_sim.py -q
 ```
 
 Expected: all tests pass with no protocol-output regression.
