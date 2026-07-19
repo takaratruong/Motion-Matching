@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import os
 import select
 import termios
@@ -24,6 +25,27 @@ _KEY_TO_FIELD = {
     "x": "terminate",
 }
 _IGNORED = frozenset(("\r", "\n"))
+
+
+def _key_label(character: str) -> str:
+    if character == " ":
+        return "<SPACE>"
+    if character in _IGNORED:
+        return "<ENTER>"
+    if character == "\x1b":
+        return "<ESC>"
+    if character.isprintable():
+        return character.upper()
+    return ascii(character)[1:-1]
+
+
+def _accepted_key_event(character: str) -> str:
+    action = _KEY_TO_FIELD.get(character.lower(), "ignored")
+    return f"KEY {_key_label(character)} -> {action}"
+
+
+def _ignored_key_event(keys: str) -> str:
+    return f"KEY {''.join(_key_label(character) for character in keys)} -> ignored"
 
 
 def _fields_from_keys(keys: str) -> set[str]:
@@ -83,6 +105,7 @@ class TerminalInputReader:
         fd: int,
         buffer: TerminalKeyBuffer,
         *,
+        event_sink: Callable[[str], None] | None = None,
         join_timeout: float = 2.0,
     ) -> None:
         if type(fd) is not int or fd < 0:
@@ -97,6 +120,7 @@ class TerminalInputReader:
             raise ContractError("terminal reader requires a real TTY")
         self._fd = fd
         self._buffer = buffer
+        self._event_sink = event_sink
         self._join_timeout = float(join_timeout)
         self._stop = threading.Event()
         self._closed = threading.Event()
@@ -141,7 +165,16 @@ class TerminalInputReader:
                 data = os.read(self._fd, 1024)
                 if not data:
                     raise ContractError("terminal input stream closed")
-                self._buffer.feed(data.decode("utf-8"))
+                keys = data.decode("utf-8")
+                try:
+                    self._buffer.feed(keys)
+                except ContractError:
+                    if self._event_sink is not None:
+                        self._event_sink(_ignored_key_event(keys))
+                    continue
+                if self._event_sink is not None:
+                    for character in keys:
+                        self._event_sink(_accepted_key_event(character))
         except ContractError as error:
             self._error = error
         except (OSError, UnicodeDecodeError) as error:

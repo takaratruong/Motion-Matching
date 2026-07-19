@@ -26,6 +26,15 @@ def _sample_until(buffer: TerminalKeyBuffer, timeout: float = 1.0) -> OperatorSt
     return OperatorState()
 
 
+def _wait_until(predicate, timeout: float = 1.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return bool(predicate())
+
+
 class OperatorStateFromKeysTests(unittest.TestCase):
     def test_case_insensitive_keys_map_to_complete_state(self) -> None:
         state = operator_state_from_keys("wSaD qeX")
@@ -104,6 +113,54 @@ class TerminalInputReaderTests(unittest.TestCase):
             self.assertNotEqual(termios.tcgetattr(follower_fd), original)
 
         self.assertEqual(termios.tcgetattr(follower_fd), original)
+
+    def test_reports_each_accepted_key(self) -> None:
+        controller_fd, follower_fd = pty.openpty()
+        self.addCleanup(os.close, controller_fd)
+        self.addCleanup(os.close, follower_fd)
+        buffer = TerminalKeyBuffer()
+        events: list[str] = []
+
+        with TerminalInputReader(
+            follower_fd,
+            buffer,
+            event_sink=events.append,
+        ):
+            os.write(controller_fd, b"w ")
+            self.assertEqual(
+                _sample_until(buffer),
+                OperatorState(forward=True, stand=True),
+            )
+            self.assertTrue(_wait_until(lambda: len(events) == 2))
+
+        self.assertEqual(
+            events,
+            ["KEY W -> forward", "KEY <SPACE> -> stand"],
+        )
+
+    def test_reports_unsupported_sequence_and_keeps_reading(self) -> None:
+        controller_fd, follower_fd = pty.openpty()
+        self.addCleanup(os.close, controller_fd)
+        self.addCleanup(os.close, follower_fd)
+        buffer = TerminalKeyBuffer()
+        events: list[str] = []
+
+        with TerminalInputReader(
+            follower_fd,
+            buffer,
+            event_sink=events.append,
+        ):
+            os.write(controller_fd, b"\x1b[A")
+            self.assertTrue(_wait_until(lambda: len(events) == 1))
+            self.assertEqual(buffer.sample(), OperatorState())
+            os.write(controller_fd, b"w")
+            self.assertEqual(_sample_until(buffer), OperatorState(forward=True))
+            self.assertTrue(_wait_until(lambda: len(events) == 2))
+
+        self.assertEqual(
+            events,
+            ["KEY <ESC>[A -> ignored", "KEY W -> forward"],
+        )
 
     def test_restores_attributes_on_exception(self) -> None:
         controller_fd, follower_fd = pty.openpty()
