@@ -88,8 +88,9 @@ def test_reports_unsupported_sequence_and_keeps_reading(self) -> None:
 Run:
 
 ```bash
-PYTHONPATH=sonic/python sonic/.venv/bin/python -m pytest -q \
-  tests/python/test_sonic_operator_terminal.py
+env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sonic/python PYTHONWARNINGS=error \
+  /home/ubuntu/projects/motion-matching/.worktrees/g1-sonic-scene-aware-baseline/sonic/.venv/bin/python \
+  -B -m unittest -v tests.python.test_sonic_operator_terminal
 ```
 
 Expected: the new tests fail because `TerminalInputReader.__init__` does not accept `event_sink`.
@@ -158,8 +159,9 @@ if self._event_sink is not None:
 Run:
 
 ```bash
-PYTHONPATH=sonic/python sonic/.venv/bin/python -m pytest -q \
-  tests/python/test_sonic_operator_terminal.py
+env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sonic/python PYTHONWARNINGS=error \
+  /home/ubuntu/projects/motion-matching/.worktrees/g1-sonic-scene-aware-baseline/sonic/.venv/bin/python \
+  -B -m unittest -v tests.python.test_sonic_operator_terminal
 ```
 
 Expected: all terminal operator tests pass, including the existing EOF failure test.
@@ -200,8 +202,9 @@ class TerminalEventPrintingTests(unittest.TestCase):
 Run:
 
 ```bash
-PYTHONPATH=sonic/python sonic/.venv/bin/python -m pytest -q \
-  tests/python/test_sonic_manual_demo.py
+env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sonic/python PYTHONWARNINGS=error \
+  /home/ubuntu/projects/motion-matching/.worktrees/g1-sonic-scene-aware-baseline/sonic/.venv/bin/python \
+  -B -m unittest -v tests.python.test_sonic_manual_demo
 ```
 
 Expected: collection fails because `_print_terminal_event` does not exist.
@@ -234,11 +237,13 @@ reader = (
 Run:
 
 ```bash
-PYTHONPATH=sonic/python sonic/.venv/bin/python -m pytest -q \
-  tests/python/test_sonic_operator_terminal.py \
-  tests/python/test_sonic_manual_demo.py \
-  tests/python/test_sonic_operator.py \
-  tests/python/test_sonic_operator_runtime.py
+env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sonic/python PYTHONWARNINGS=error \
+  /home/ubuntu/projects/motion-matching/.worktrees/g1-sonic-scene-aware-baseline/sonic/.venv/bin/python \
+  -B -m unittest -v \
+  tests.python.test_sonic_operator_terminal \
+  tests.python.test_sonic_manual_demo \
+  tests.python.test_sonic_operator \
+  tests.python.test_sonic_operator_runtime
 ```
 
 Expected: all selected tests pass with no warnings or errors.
