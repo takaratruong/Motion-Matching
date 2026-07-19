@@ -709,15 +709,6 @@ PickSlotReason revalidate_frozen_pick_slot(
             remaining_route_length_m)) {
         return PickSlotReason::InvalidGeometry;
     }
-    uint64_t remaining_route_millimetres = 0U;
-    if (!half_up_key(
-            remaining_route_length_m,
-            remaining_route_millimetres)) {
-        return PickSlotReason::InvalidGeometry;
-    }
-    if (!within_travel_envelope(remaining_route_length_m, config)) {
-        return PickSlotReason::OutsideTravelEnvelope;
-    }
 
     Transform clearance_endpoint = frozen_root;
     clearance_endpoint.position.y = live_root.position.y;

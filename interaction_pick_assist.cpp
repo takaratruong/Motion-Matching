@@ -7,8 +7,6 @@
 namespace interaction {
 namespace {
 
-constexpr float kTravelEnvelopeToleranceM = 2.0e-5F;
-
 uint32_t float_bits(float value) {
     uint32_t bits = 0U;
     static_assert(sizeof(bits) == sizeof(value));
@@ -396,10 +394,7 @@ PickAssistOutput ControllerPickAssist::observe(
     diagnostics_.assisted_travel_m += travel_segment_m;
     previous_observed_root_ = observation.displayed_root;
     if (!is_finite(travel_segment_m) ||
-        !is_finite(diagnostics_.assisted_travel_m) ||
-        diagnostics_.assisted_travel_m >
-            config_.maximum_assisted_path_m +
-                kTravelEnvelopeToleranceM) {
+        !is_finite(diagnostics_.assisted_travel_m)) {
         previous_observed_root_ = {};
         return fail_output(
             diagnostics_, PickAssistReason::OutsideTravelEnvelope);

@@ -516,6 +516,17 @@ void test_direct_travel_tolerance_boundary_is_inclusive() {
         beyond_boundary.route_length_m,
         1.00003F,
         "ineligible travel-boundary route reported the wrong length");
+
+    const InteractionTarget admitted_target =
+        make_route_target(vec3(1.00003F, 0.0F, 0.0F));
+    const PickSlotReason admitted_revalidation = revalidate_frozen_pick_slot(
+        Transform{vec3(0.0F, 0.0F, 0.0F), quat()},
+        Transform{vec3(1.00003F, 0.0F, 0.0F), quat()},
+        admitted_target,
+        {});
+    require(
+        admitted_revalidation == PickSlotReason::None,
+        "post-admission frozen route reapplied the activation radius");
 }
 
 const interaction::MappedPickSlot& selected_mapped_slot(

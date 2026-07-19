@@ -1371,12 +1371,24 @@ void test_frozen_slot_settling_revalidates_selected_slot() {
         "terminal frozen Settling selected-slot failure changed provenance");
 }
 
-void test_frozen_slot_settling_enforces_consecutive_travel() {
+void test_frozen_slot_settling_records_consecutive_travel_without_failure() {
     const interaction::PickAssistConfig config{};
     FrozenSlotScenario scenario;
     interaction::ControllerPickAssist assist(config);
     const interaction::PickAssistDiagnostics latched =
         latch_frozen_slot_settling(assist, scenario, config);
+
+    assist.observe(scenario.observation);
+    const interaction::PickAssistDiagnostics settling = assist.diagnostics();
+    require(
+        settling.state == interaction::PickAssistState::Settling &&
+            settling.reason == interaction::PickAssistReason::None &&
+            settling.settle_ticks == 1U,
+        "frozen Settling travel fixture did not advance its stable tick");
+    require_frozen_slot_provenance_unchanged(
+        latched,
+        settling,
+        "stable frozen Settling tick changed frozen provenance");
 
     const vec3 previous_position =
         scenario.observation.displayed_root.position;
@@ -1387,55 +1399,39 @@ void test_frozen_slot_settling_enforces_consecutive_travel() {
         static_cast<double>(scenario.observation.displayed_root.position.z) -
             static_cast<double>(previous_position.z)));
     const float expected_travel_m =
-        latched.assisted_travel_m + next_segment_m;
+        settling.assisted_travel_m + next_segment_m;
     require(
-        latched.assisted_travel_m < 1.00002F &&
+        settling.assisted_travel_m < 1.00002F &&
             expected_travel_m > 1.00002F,
         "frozen Settling travel fixture did not cross 1.00002 m");
 
-    const interaction::PickAssistOutput failed_output =
+    const interaction::PickAssistOutput output =
         assist.observe(scenario.observation);
-    const interaction::PickAssistDiagnostics failed =
+    const interaction::PickAssistDiagnostics continued =
         assist.diagnostics();
     require(
-        failed.state == interaction::PickAssistState::Failed &&
-            failed.reason ==
-                interaction::PickAssistReason::OutsideTravelEnvelope,
-        "frozen Settling travel overshoot did not fail the envelope");
-    require_zero_pick_assist_output(
-        failed_output,
-        "frozen Settling travel overshoot emitted output");
+        continued.state == interaction::PickAssistState::Settling &&
+            continued.reason == interaction::PickAssistReason::None &&
+            continued.settle_ticks == 0U,
+        "finite frozen Settling detour failed or retained a nonconsecutive tick");
     require(
-        !assist.active() && !assist.owns_manual_interact() &&
+        output.override_steering && output.force_strafe &&
+            output.stationary_constraint && is_zero(output.left_stick) &&
+            is_zero(output.right_stick) && !output.needs_preview &&
+            !output.submit_interact,
+        "finite frozen Settling detour did not retain active braking");
+    require(
+        assist.active() && assist.owns_manual_interact() &&
             !assist.take_submission(503U).has_value(),
-        "frozen Settling travel overshoot retained ownership or submitted");
-    require(
-        failed.settle_ticks == latched.settle_ticks &&
-            same_float_bits_exact(
-                failed.assisted_travel_m, expected_travel_m),
-        "frozen Settling travel overshoot changed settling or accumulation");
+        "finite frozen Settling detour lost ownership or submitted");
     require_frozen_slot_provenance_unchanged(
-        latched,
-        failed,
-        "frozen Settling travel overshoot changed frozen provenance");
-
-    const interaction::PickAssistOutput terminal_output =
-        assist.observe(scenario.observation);
+        settling,
+        continued,
+        "finite frozen Settling detour changed frozen provenance");
     require(
-        assist.diagnostics().state == interaction::PickAssistState::Failed &&
-            assist.diagnostics().reason ==
-                interaction::PickAssistReason::OutsideTravelEnvelope &&
-            same_float_bits_exact(
-                assist.diagnostics().assisted_travel_m,
-                expected_travel_m),
-        "frozen Settling travel failure was not terminal and stable");
-    require_zero_pick_assist_output(
-        terminal_output,
-        "terminal frozen Settling travel failure emitted output");
-    require_frozen_slot_provenance_unchanged(
-        latched,
-        assist.diagnostics(),
-        "terminal frozen Settling travel failure changed provenance");
+        same_float_bits_exact(
+            continued.assisted_travel_m, expected_travel_m),
+        "frozen Settling did not retain cumulative planar telemetry");
 }
 
 void test_frozen_slot_settling_keeps_stationary_braking() {
@@ -2551,209 +2547,58 @@ void test_slot_approach_rejects_adjacent_arrival_overshoots() {
     }
 }
 
-void test_slot_approach_accumulates_inclusive_travel_and_rejects_overshoot() {
-    const auto configure_travel_scenario = [](FrozenSlotScenario& scenario) {
-        scenario.target.object_world.position.x = 0.80F;
-        scenario.start.target_snapshot = scenario.target;
-        scenario.start.root_world = {
-            vec3(0.0F, 0.0F, 0.50F), quat()};
-        scenario.observation.displayed_root = scenario.start.root_world;
-        scenario.observation.target = &scenario.target;
-    };
-    const auto planar_endpoint_distance = [](vec3 left, vec3 right) {
-        return static_cast<float>(std::hypot(
-            static_cast<double>(left.x) - static_cast<double>(right.x),
-            static_cast<double>(left.z) - static_cast<double>(right.z)));
-    };
-    const auto xyz_endpoint_distance = [](vec3 left, vec3 right) {
-        return static_cast<float>(std::hypot(
-            static_cast<double>(left.x) - static_cast<double>(right.x),
-            static_cast<double>(left.y) - static_cast<double>(right.y),
-            static_cast<double>(left.z) - static_cast<double>(right.z)));
-    };
-    const auto same_float_bits = [](float left, float right) {
-        return std::memcmp(&left, &right, sizeof(left)) == 0;
-    };
-    const auto same_transform_bits = [&](
-        interaction::Transform left,
-        interaction::Transform right) {
-        return same_float_bits(left.position.x, right.position.x) &&
-            same_float_bits(left.position.y, right.position.y) &&
-            same_float_bits(left.position.z, right.position.z) &&
-            same_float_bits(left.rotation.w, right.rotation.w) &&
-            same_float_bits(left.rotation.x, right.rotation.x) &&
-            same_float_bits(left.rotation.y, right.rotation.y) &&
-            same_float_bits(left.rotation.z, right.rotation.z);
-    };
+void test_slot_approach_records_cumulative_travel_without_failure() {
+    FrozenSlotScenario scenario;
+    scenario.target.object_world.position.x = 0.80F;
+    scenario.start.target_snapshot = scenario.target;
+    scenario.start.root_world = {
+        vec3(0.0F, 0.0F, 0.50F), quat()};
+    scenario.observation.displayed_root = scenario.start.root_world;
+    scenario.observation.target = &scenario.target;
 
-    FrozenSlotScenario inclusive_scenario;
-    configure_travel_scenario(inclusive_scenario);
-    interaction::ControllerPickAssist inclusive_assist;
+    interaction::ControllerPickAssist assist;
     require(
-        inclusive_assist.begin(
-            inclusive_scenario.start, &inclusive_scenario.target),
-        "inclusive-travel fixture begin failed");
-    require(
-        inclusive_assist.diagnostics().selected_slot_id == 9U &&
-            inclusive_assist.diagnostics()
-                .slot_selection.selected_index.has_value(),
-        "inclusive-travel fixture did not select slot ID 9");
-    const size_t inclusive_index =
-        *inclusive_assist.diagnostics().slot_selection.selected_index;
-    const interaction::MappedPickSlot& inclusive_slot =
-        inclusive_assist.diagnostics().slot_selection.ordered[
-            inclusive_index];
-    require(
-        inclusive_slot.root_world.position.x == 0.80F &&
-            inclusive_slot.root_world.position.z == 0.50F,
-        "inclusive-travel fixture did not map slot ID 9 to (0.80, 0.50)");
-
-    constexpr float inclusive_travel_cap_m = 1.00002F;
-    const vec3 start_endpoint =
-        inclusive_scenario.start.root_world.position;
-    inclusive_scenario.observation.displayed_root.position =
-        vec3(0.50F, 10.0F, 0.50F);
-    const vec3 middle_endpoint =
-        inclusive_scenario.observation.displayed_root.position;
-    inclusive_assist.observe(inclusive_scenario.observation);
-    require(
-        inclusive_assist.diagnostics().state ==
-                interaction::PickAssistState::SlotApproach &&
-            inclusive_assist.diagnostics().reason ==
-                interaction::PickAssistReason::None,
-        "first inclusive-travel endpoint left SlotApproach");
-
-    inclusive_scenario.observation.displayed_root.position =
-        vec3(0.50F, -10.0F, inclusive_travel_cap_m);
-    const vec3 boundary_endpoint =
-        inclusive_scenario.observation.displayed_root.position;
-    inclusive_assist.observe(inclusive_scenario.observation);
-    const float expected_assisted_travel_m =
-        planar_endpoint_distance(start_endpoint, middle_endpoint) +
-        planar_endpoint_distance(middle_endpoint, boundary_endpoint);
-    const float start_to_boundary_planar_m =
-        planar_endpoint_distance(start_endpoint, boundary_endpoint);
-    const float expected_xyz_travel_m =
-        xyz_endpoint_distance(start_endpoint, middle_endpoint) +
-        xyz_endpoint_distance(middle_endpoint, boundary_endpoint);
-    require(
-        same_float_bits(
-            expected_assisted_travel_m, inclusive_travel_cap_m),
-        "inclusive endpoint arithmetic did not equal exactly 1.00002 m");
-    require(
-        !same_float_bits(
-            start_to_boundary_planar_m, expected_assisted_travel_m),
-        "inclusive endpoint arithmetic matched start-to-current planar distance");
-    require(
-        expected_xyz_travel_m > inclusive_travel_cap_m,
-        "inclusive endpoint XYZ path did not exceed the travel cap");
-    require(
-        same_float_bits(
-            inclusive_assist.diagnostics().assisted_travel_m,
-            expected_assisted_travel_m),
-        "inclusive travel did not accumulate consecutive planar endpoint distances");
-    require(
-        inclusive_assist.diagnostics().state ==
-                interaction::PickAssistState::SlotApproach &&
-            inclusive_assist.diagnostics().reason ==
-                interaction::PickAssistReason::None,
-        "exactly 1.00002 m assisted travel left SlotApproach");
-
-    FrozenSlotScenario overshoot_scenario;
-    configure_travel_scenario(overshoot_scenario);
-    interaction::ControllerPickAssist overshoot_assist;
-    require(
-        overshoot_assist.begin(
-            overshoot_scenario.start, &overshoot_scenario.target),
-        "overshoot fixture begin failed");
+        assist.begin(scenario.start, &scenario.target),
+        "cumulative-travel fixture begin failed");
     const interaction::PickAssistDiagnostics frozen_before =
-        overshoot_assist.diagnostics();
+        assist.diagnostics();
     require(
         frozen_before.selected_slot_id == 9U &&
             frozen_before.slot_selection.selected_index.has_value(),
-        "overshoot fixture did not select slot ID 9");
-    const size_t frozen_index =
-        *frozen_before.slot_selection.selected_index;
-    const interaction::MappedPickSlot frozen_slot =
-        frozen_before.slot_selection.ordered[frozen_index];
-    const float first_overshoot = std::nextafter(
-        inclusive_travel_cap_m,
-        std::numeric_limits<float>::infinity());
-    const vec3 overshoot_start_endpoint =
-        overshoot_scenario.start.root_world.position;
-    const vec3 overshoot_middle_endpoint(0.50F, 10.0F, 0.50F);
-    const vec3 overshoot_endpoint(
-        0.50F, -10.0F, first_overshoot);
-    const float expected_overshoot_travel_m =
-        planar_endpoint_distance(
-            overshoot_start_endpoint, overshoot_middle_endpoint) +
-        planar_endpoint_distance(
-            overshoot_middle_endpoint, overshoot_endpoint);
-    const float overshoot_start_to_current_planar_m =
-        planar_endpoint_distance(
-            overshoot_start_endpoint, overshoot_endpoint);
-    const float expected_overshoot_xyz_travel_m =
-        xyz_endpoint_distance(
-            overshoot_start_endpoint, overshoot_middle_endpoint) +
-        xyz_endpoint_distance(
-            overshoot_middle_endpoint, overshoot_endpoint);
+        "cumulative-travel fixture did not select slot ID 9");
+    const interaction::MappedPickSlot& frozen_slot =
+        frozen_before.slot_selection.ordered[
+            *frozen_before.slot_selection.selected_index];
     require(
-        same_float_bits(expected_overshoot_travel_m, first_overshoot),
-        "overshoot endpoint arithmetic was not the first float above 1.00002 m");
-    require(
-        !same_float_bits(
-            overshoot_start_to_current_planar_m,
-            expected_overshoot_travel_m),
-        "overshoot endpoint arithmetic matched start-to-current planar distance");
-    require(
-        expected_overshoot_xyz_travel_m > inclusive_travel_cap_m,
-        "overshoot endpoint XYZ path did not exceed the travel cap");
+        same_float_bits_exact(
+            frozen_slot.root_world.position.x, 0.80F) &&
+            same_float_bits_exact(
+                frozen_slot.root_world.position.z, 0.50F),
+        "cumulative-travel fixture did not freeze slot 9 at (0.8, 0.5)");
 
-    overshoot_scenario.observation.displayed_root.position =
-        overshoot_middle_endpoint;
-    overshoot_assist.observe(overshoot_scenario.observation);
+    scenario.observation.displayed_root.position.x = 0.50F;
+    assist.observe(scenario.observation);
+    scenario.observation.displayed_root.position.x = 0.0F;
+    assist.observe(scenario.observation);
+    scenario.observation.displayed_root.position.x = 0.50F;
+    const interaction::PickAssistOutput output =
+        assist.observe(scenario.observation);
+
+    require(same_float_bits_exact(
+                assist.diagnostics().assisted_travel_m, 1.50F),
+            "approach did not retain cumulative planar telemetry");
     require(
-        overshoot_assist.diagnostics().state ==
+        assist.diagnostics().state ==
                 interaction::PickAssistState::SlotApproach &&
-            overshoot_assist.diagnostics().reason ==
-                interaction::PickAssistReason::None,
-        "first overshoot-fixture endpoint left SlotApproach");
-    overshoot_scenario.observation.displayed_root.position =
-        overshoot_endpoint;
-    const interaction::PickAssistOutput overshoot_output =
-        overshoot_assist.observe(overshoot_scenario.observation);
-    const interaction::PickAssistDiagnostics& failed =
-        overshoot_assist.diagnostics();
-    require(
-        same_float_bits(
-            failed.assisted_travel_m, expected_overshoot_travel_m),
-        "overshoot travel did not accumulate consecutive planar endpoint distances");
-    require(
-        failed.state == interaction::PickAssistState::Failed &&
-            failed.reason ==
-                interaction::PickAssistReason::OutsideTravelEnvelope,
-        "first representable assisted-travel overshoot did not fail visibly");
-    require(
-        !overshoot_assist.active() &&
-            !overshoot_assist.owns_manual_interact() &&
-            !overshoot_output.submit_interact &&
-            !overshoot_assist.take_submission(71U).has_value(),
-        "assisted-travel overshoot retained ownership or submitted");
-    require(
-        failed.selected_slot_id == frozen_before.selected_slot_id &&
-            failed.slot_selection.selected_index ==
-                frozen_before.slot_selection.selected_index &&
-            failed.slot_selection.ordered.size() ==
-                frozen_before.slot_selection.ordered.size() &&
-            same_float_bits(
-                failed.route_length_m, frozen_before.route_length_m) &&
-            same_transform_bits(
-                failed.slot_selection.ordered[frozen_index].root_world,
-                frozen_slot.root_world) &&
-            same_float_bits(
-                failed.slot_selection.ordered[frozen_index].route_length_m,
-                frozen_slot.route_length_m),
-        "assisted-travel overshoot reselected or changed frozen diagnostics");
+            assist.diagnostics().reason ==
+                interaction::PickAssistReason::None &&
+            assist.active() && output.override_steering &&
+            !output.submit_interact,
+        "finite admitted detour was treated as a terminal travel envelope");
+    require_frozen_slot_provenance_unchanged(
+        frozen_before,
+        assist.diagnostics(),
+        "finite admitted detour changed frozen provenance");
 }
 
 void test_slot_approach_revalidates_frozen_route_against_table() {
@@ -3249,7 +3094,7 @@ int main() {
         test_slot_approach_emits_slow_radius_arrival_steering();
         test_slot_approach_latches_inclusive_arrival_boundaries();
         test_frozen_slot_settling_revalidates_selected_slot();
-        test_frozen_slot_settling_enforces_consecutive_travel();
+        test_frozen_slot_settling_records_consecutive_travel_without_failure();
         test_frozen_slot_settling_keeps_stationary_braking();
         test_frozen_slot_settling_requests_exact_frozen_preview_root();
         test_frozen_final_preview_missing_singular_preview_rerequests();
@@ -3261,7 +3106,7 @@ int main() {
         test_frozen_final_preview_poor_match_deadline_memory_survives_missing();
         test_frozen_final_preview_deadline_precedes_certification();
         test_slot_approach_rejects_adjacent_arrival_overshoots();
-        test_slot_approach_accumulates_inclusive_travel_and_rejects_overshoot();
+        test_slot_approach_records_cumulative_travel_without_failure();
         test_slot_approach_revalidates_frozen_route_against_table();
         test_slot_approach_revalidates_frozen_route_against_obstacles();
         test_begin_maps_every_aggregate_no_winner_reason();
