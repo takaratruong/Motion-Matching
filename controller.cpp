@@ -5154,6 +5154,7 @@ int main(void)
         const bool manual_pick_stationary_constraint_active =
             !legacy_interaction_fixture_mode &&
             !manual_smart_pickup_pre_step.cancel_consumed &&
+            !manual_smart_pickup_pre_step.manual_override_consumed &&
             !interaction_edges.reset_pressed &&
             manual_smart_pickup_post_step.assist_output.stationary_constraint &&
             cached_interaction_state ==

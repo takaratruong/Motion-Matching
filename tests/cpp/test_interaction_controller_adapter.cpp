@@ -6186,6 +6186,32 @@ void test_controller_smart_pickup_two_phase_production_seam() {
 
     const std::string ordinary_step = controller.substr(
         velocity_update, live_flat_snapshot - velocity_update);
+    const size_t manual_stationary_guard_begin = ordinary_step.find(
+        "const bool manual_pick_stationary_constraint_active =");
+    const size_t manual_stationary_guard_end = ordinary_step.find(
+        "const bool manual_pick_stationary_constraint_latched_this_tick =",
+        manual_stationary_guard_begin);
+    require(
+        manual_stationary_guard_begin != std::string::npos &&
+            manual_stationary_guard_end != std::string::npos &&
+            manual_stationary_guard_begin < manual_stationary_guard_end,
+        "ordinary step lost the bounded manual stationary guard");
+    const std::string compact_manual_stationary_guard =
+        without_ascii_whitespace(ordinary_step.substr(
+            manual_stationary_guard_begin,
+            manual_stationary_guard_end - manual_stationary_guard_begin));
+    require(
+        compact_manual_stationary_guard.find(
+            "constboolmanual_pick_stationary_constraint_active="
+            "!legacy_interaction_fixture_mode&&"
+            "!manual_smart_pickup_pre_step.cancel_consumed&&"
+            "!manual_smart_pickup_pre_step.manual_override_consumed&&"
+            "!interaction_edges.reset_pressed&&"
+            "manual_smart_pickup_post_step.assist_output."
+            "stationary_constraint&&cached_interaction_state=="
+            "interaction::RuntimeState::Locomotion;") !=
+            std::string::npos,
+        "WASD override can reuse the prior Smart Pickup stationary constraint");
     require(
         occurrence_count(
             ordinary_step, "simulation_positions_update(") == 1U &&
