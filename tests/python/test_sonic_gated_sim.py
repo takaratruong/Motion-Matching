@@ -667,6 +667,132 @@ class ExternalGearBackendBoundaryTests(unittest.TestCase):
         self.assertFalse(captured["offscreen"])
         self.assertFalse(captured["enable_image_publish"])
 
+    def test_protocol_backend_forwards_explicit_onscreen_to_base_simulator(self):
+        for onscreen in (False, True):
+            with self.subTest(onscreen=onscreen):
+                captured = {}
+
+                class ConfigLoader:
+                    env_name = "default"
+
+                    @staticmethod
+                    def load_wbc_yaml():
+                        return {}
+
+                def base_simulator(**kwargs):
+                    captured.update(kwargs)
+                    return SimpleNamespace()
+
+                bindings = SimpleNamespace(
+                    sim_loop_config=ConfigLoader,
+                    base_simulator=base_simulator,
+                )
+                with tempfile.TemporaryDirectory() as root_text:
+                    scene = Path(root_text) / "scene.xml"
+                    scene.write_text("<mujoco/>\n", encoding="utf-8")
+                    with patch.object(
+                        gated_sim,
+                        "load_external_bindings",
+                        return_value=bindings,
+                    ):
+                        ExternalGearBackend(
+                            "/authenticated/gear", scene, onscreen=onscreen
+                        )
+
+                self.assertIs(captured["onscreen"], onscreen)
+                self.assertFalse(captured["offscreen"])
+                self.assertFalse(captured["enable_image_publish"])
+
+    def test_protocol_backend_rejects_nonboolean_onscreen(self):
+        with tempfile.TemporaryDirectory() as root_text:
+            scene = Path(root_text) / "scene.xml"
+            scene.write_text("<mujoco/>\n", encoding="utf-8")
+            for value in (0, 1, None, "true"):
+                with self.subTest(value=value):
+                    with self.assertRaisesRegex(
+                        ProtocolError, "onscreen must be a boolean"
+                    ):
+                        ExternalGearBackend(
+                            "/authenticated/gear", scene, onscreen=value
+                        )
+
+    def test_visible_backend_syncs_viewer_once_after_single_step(self):
+        events = []
+        sim_env = SimpleNamespace(
+            viewer=object(),
+            sim_step=lambda: events.append("step"),
+            update_viewer=lambda: events.append("sync"),
+        )
+        backend = ExternalGearBackend.__new__(ExternalGearBackend)
+        backend._wall_clock_pacing = False
+        backend._simulator = SimpleNamespace(sim_dt=0.005, sim_env=sim_env)
+
+        backend.step()
+
+        self.assertEqual(events, ["step", "sync"])
+
+    def test_headless_backend_steps_once_without_viewer_sync(self):
+        events = []
+        sim_env = SimpleNamespace(
+            viewer=None,
+            sim_step=lambda: events.append("step"),
+            update_viewer=lambda: events.append("sync"),
+        )
+        backend = ExternalGearBackend.__new__(ExternalGearBackend)
+        backend._wall_clock_pacing = False
+        backend._simulator = SimpleNamespace(sim_dt=0.005, sim_env=sim_env)
+
+        backend.step()
+
+        self.assertEqual(events, ["step"])
+
+    def test_onscreen_flag_defaults_headless_and_parses_opt_in(self):
+        parser = gated_sim._parser()
+        self.assertFalse(parser.parse_args(["--gear-checkout", "/gear"]).onscreen)
+        self.assertTrue(
+            parser.parse_args(
+                ["--gear-checkout", "/gear", "--onscreen"]
+            ).onscreen
+        )
+
+    def test_production_main_forwards_onscreen_through_backend_factory(self):
+        for argv_extra, expected in (([], False), (["--onscreen"], True)):
+            with self.subTest(expected=expected):
+                captured = {}
+
+                def fake_backend(checkout, scene, *, wall_clock_pacing, onscreen):
+                    captured["onscreen"] = onscreen
+                    captured["wall_clock_pacing"] = wall_clock_pacing
+                    return SimpleNamespace()
+
+                def fake_server(**kwargs):
+                    kwargs["backend_factory"](Path("/gear/scene.xml"))
+
+                with (
+                    patch.object(
+                        gated_sim, "_verified_checkout", return_value=Path("/gear")
+                    ),
+                    patch.object(
+                        gated_sim, "serve_jsonl", side_effect=fake_server
+                    ),
+                    patch.object(gated_sim, "ExternalGearBackend", fake_backend),
+                    redirect_stdout(io.StringIO()),
+                    redirect_stderr(io.StringIO()),
+                ):
+                    result = gated_sim.main(
+                        [
+                            "--gear-checkout",
+                            "/gear",
+                            "--run-root",
+                            str(Path.cwd()),
+                            *argv_extra,
+                        ]
+                    )
+
+                self.assertEqual(result, 0)
+                self.assertIs(captured["onscreen"], expected)
+                self.assertTrue(captured["wall_clock_pacing"])
+
     def test_production_main_reserves_stdout_for_jsonl_protocol(self):
         protocol_line = '{"v":1,"ok":true}\n'
 

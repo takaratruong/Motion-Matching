@@ -935,9 +935,12 @@ class ExternalGearBackend:
         scene_xml: str | Path,
         *,
         wall_clock_pacing: bool = True,
+        onscreen: bool = False,
     ) -> None:
         if type(wall_clock_pacing) is not bool:
             raise ProtocolError("wall_clock_pacing must be a boolean")
+        if type(onscreen) is not bool:
+            raise ProtocolError("onscreen must be a boolean")
         scene = Path(scene_xml).resolve(strict=True)
         if not scene.is_file():
             raise ProtocolError(f"scene_xml is not a file: {scene}")
@@ -950,9 +953,10 @@ class ExternalGearBackend:
             simulator = bindings.base_simulator(
                 config=config,
                 env_name=config_loader.env_name,
-                # This child is a deterministic JSONL physics gate.  It never
-                # renders and must not inherit GEAR's interactive GLFW default.
-                onscreen=False,
+                # This child is a deterministic JSONL physics gate.  Rendering is
+                # explicit and opt-in: onscreen is forwarded exactly as requested
+                # while offscreen rendering and image publishing stay disabled.
+                onscreen=onscreen,
                 offscreen=False,
                 enable_image_publish=False,
             )
@@ -1010,7 +1014,13 @@ class ExternalGearBackend:
         # JSONL protocol channel in this child, so preserve those diagnostics
         # on stderr instead of allowing a non-JSON line to corrupt the peer.
         with redirect_stdout(sys.stderr):
-            self._simulator.sim_env.sim_step()
+            sim_env = self._simulator.sim_env
+            sim_env.sim_step()
+            # Presentation only: synchronize an existing passive viewer exactly
+            # once after the single authoritative physics step.  This never
+            # advances physics and stays on stderr like the fall diagnostics.
+            if getattr(sim_env, "viewer", None) is not None:
+                sim_env.update_viewer()
         remaining = self.sim_dt - (time.monotonic() - started)
         if getattr(self, "_wall_clock_pacing", True) and remaining > 0.0:
             time.sleep(remaining)
@@ -1117,6 +1127,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-root", type=Path)
     parser.add_argument("--import-preflight", action="store_true")
     parser.add_argument("--unpaced-physics", action="store_true")
+    parser.add_argument("--onscreen", action="store_true")
     return parser
 
 
@@ -1144,6 +1155,7 @@ def main(argv: list[str] | None = None) -> int:
                 checkout,
                 scene,
                 wall_clock_pacing=not args.unpaced_physics,
+                onscreen=args.onscreen,
             ),
             output_stream=protocol_stdout,
         )
