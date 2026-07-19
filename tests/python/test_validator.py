@@ -4,6 +4,7 @@ import hashlib
 import io
 import inspect
 import json
+import mmap
 import os
 import shutil
 import struct
@@ -1279,6 +1280,82 @@ class ValidatorTests(unittest.TestCase):
                 source_options=UninspectableSourceOptions()),
             self._expected_summary())
 
+    def test_normal_v3_database_is_read_only_mmap_and_scanned_in_chunks(self):
+        real_load = validator_module._load_database
+        real_isfinite = np.isfinite
+        real_norm = np.linalg.norm
+        observed = {}
+        finite_sizes = []
+        quaternion_sizes = []
+
+        def observe_load(path):
+            database = real_load(path)
+            observed["placeholder_free"] = (
+                database.terrain_features is None
+                and database.terrain_support is None
+            )
+            observed["arrays"] = tuple(
+                getattr(database, name) for name in (
+                    "positions", "velocities", "rotations",
+                    "angular_velocities", "parents", "range_starts",
+                    "range_stops", "contacts",
+                )
+            )
+            return database
+
+        def bounded_isfinite(values, *args, **kwargs):
+            array = np.asarray(values)
+            if (
+                array.ndim == 3
+                and array.shape[1] == 31
+                and array.shape[2] in (3, 4)
+            ):
+                finite_sizes.append(array.nbytes)
+                self.assertLessEqual(array.nbytes, 1024)
+            return real_isfinite(values, *args, **kwargs)
+
+        def bounded_norm(values, *args, **kwargs):
+            array = np.asarray(values)
+            if array.ndim == 3 and array.shape[1:] == (31, 4):
+                quaternion_sizes.append(array.nbytes)
+                self.assertLessEqual(array.nbytes, 1024)
+            return real_norm(values, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                validator_module, "read_holden_database", create=True,
+                side_effect=AssertionError("whole database decode"),
+            ),
+            mock.patch.object(
+                validator_module, "_DATABASE_SCAN_CHUNK_BYTES", 1024,
+                create=True,
+            ),
+            mock.patch.object(
+                validator_module, "_load_database", side_effect=observe_load,
+            ),
+            mock.patch.object(
+                validator_module.np, "isfinite", side_effect=bounded_isfinite,
+            ),
+            mock.patch.object(
+                validator_module.np.linalg, "norm", side_effect=bounded_norm,
+            ),
+        ):
+            self.assertEqual(
+                validate_artifact_directory(self.output),
+                self._expected_summary(),
+            )
+
+        self.assertTrue(observed["placeholder_free"])
+        for array in observed["arrays"]:
+            with self.subTest(shape=array.shape, dtype=str(array.dtype)):
+                self.assertFalse(array.flags.writeable)
+                owner = array
+                while getattr(owner, "base", None) is not None:
+                    owner = owner.base
+                self.assertIsInstance(owner, mmap.mmap)
+        self.assertGreaterEqual(len(finite_sizes), 8)
+        self.assertEqual(len(quaternion_sizes), 2)
+
     def test_v3_manifest_motion_and_bank_descriptors_are_exact(self):
         manifest = _load_json(self._path("manifest.json"))
         self.assertEqual(set(manifest), {
@@ -1447,6 +1524,69 @@ class ValidatorTests(unittest.TestCase):
                 16 + 12 * 6_000_003,
                 16 + 4 * 6_000_003,
             ),
+        )
+
+    def test_15815_source_bank_ownership_is_metadata_only_and_complete(self):
+        source_count = 15_815
+        ranges = tuple(
+            SourceFrameRange(
+                f"source-{index:05d}", 0, 1, 1, index, index + 1,
+            )
+            for index in range(source_count)
+        )
+        banks = tuple(
+            TerrainBank(family, tuple(range(offset, source_count, 4)))
+            for offset, family in enumerate(TERRAIN_FAMILIES)
+        )
+        bank_index = TerrainBankIndex(source_count, ranges, banks)
+        bank_index.validate()
+        sources = [
+            {
+                "name": source_range.source_name,
+                "terrain_family": TERRAIN_FAMILIES[index % 4],
+                "output_frames": 1,
+                "range_start": index,
+                "range_stop": index + 1,
+            }
+            for index, source_range in enumerate(ranges)
+        ]
+        payload = {
+            "schema": "g1-terrain-motion-banks/v1",
+            "frame_count": source_count,
+            "ranges": [
+                {
+                    "source_name": source_range.source_name,
+                    "source_start": 0,
+                    "source_stop": 1,
+                    "source_frame_count": 1,
+                    "global_start": source_range.global_start,
+                    "global_stop": source_range.global_stop,
+                }
+                for source_range in ranges
+            ],
+            "banks": [
+                {
+                    "family": bank.family,
+                    "range_indices": list(bank.range_indices),
+                }
+                for bank in banks
+            ],
+        }
+        descriptor = dict(payload)
+        descriptor["sha256"] = hashlib.sha256(
+            canonical_json_bytes(payload)).hexdigest()
+        manifest = {
+            "database_frames": source_count,
+            "motion_banks": descriptor,
+        }
+
+        validated = validator_module._validate_motion_banks(manifest, sources)
+
+        self.assertEqual(validated.frame_count, source_count)
+        self.assertEqual(len(validated.ranges), source_count)
+        self.assertEqual(
+            tuple(bank.family for bank in validated.banks),
+            TERRAIN_FAMILIES,
         )
 
     def test_v1_artifact_set_manifest_is_rejected_without_dispatch(self):

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .database import read_holden_database, write_holden_database
+from .database import write_holden_database
 from .motion_index import (
     G1MI_ROW_WIDTH,
     G1MI_VERSION,
@@ -48,6 +48,7 @@ _HEX_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _SCENE_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
 _AT_FDCWD = -100
 _RENAME_EXCHANGE = 2
+_DATABASE_COMPARE_CHUNK_BYTES = 1024 * 1024
 
 MOTION_MANIFEST_KEYS = {
     "schema", "output_fps", "feature_dimensions", "terrain_dimensions",
@@ -843,6 +844,114 @@ def _inspect_tree(root):
     return files, directories
 
 
+def _regular_file_identity(node):
+    return (
+        node.st_dev, node.st_ino, node.st_size,
+        node.st_mtime_ns, node.st_ctime_ns,
+    )
+
+
+def _compare_staged_database(path, artifacts):
+    try:
+        before = os.lstat(path)
+    except OSError as error:
+        raise ValueError("staged database is missing") from error
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError("staged database must be a regular file")
+    flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_NONBLOCK", 0))
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError("cannot open staged database") from error
+    try:
+        opened = os.fstat(descriptor)
+        identity = _regular_file_identity(opened)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or identity != _regular_file_identity(before)
+        ):
+            raise ValueError("staged database changed during open")
+        offset = 0
+
+        def read_exact(size, label):
+            nonlocal offset
+            chunks = []
+            remaining = size
+            while remaining:
+                block = os.pread(descriptor, remaining, offset)
+                if not block:
+                    raise ValueError(f"staged {label} is truncated")
+                chunks.append(block)
+                offset += len(block)
+                remaining -= len(block)
+            return b"".join(chunks)
+
+        def compare_bytes(expected, label):
+            actual = read_exact(len(expected), label)
+            if actual != expected:
+                raise ValueError(
+                    f"staged {label} does not match requested artifacts")
+
+        def compare_array2(name, dtype):
+            values = np.asarray(getattr(artifacts, name))
+            rows, columns = values.shape[:2]
+            compare_bytes(struct.pack("<II", rows, columns), f"{name} header")
+            row_bytes = int(np.prod(values.shape[1:], dtype=np.int64)) \
+                * np.dtype(dtype).itemsize
+            rows_per_chunk = max(
+                1, _DATABASE_COMPARE_CHUNK_BYTES // row_bytes)
+            for start in range(0, rows, rows_per_chunk):
+                stop = min(rows, start + rows_per_chunk)
+                expected = np.ascontiguousarray(
+                    values[start:stop], dtype=np.dtype(dtype)).tobytes(
+                        order="C")
+                compare_bytes(expected, name)
+
+        def compare_array1(name, dtype):
+            values = np.asarray(getattr(artifacts, name))
+            compare_bytes(struct.pack("<I", len(values)), f"{name} header")
+            items_per_chunk = max(
+                1,
+                _DATABASE_COMPARE_CHUNK_BYTES // np.dtype(dtype).itemsize,
+            )
+            for start in range(0, len(values), items_per_chunk):
+                stop = min(len(values), start + items_per_chunk)
+                expected = np.ascontiguousarray(
+                    values[start:stop], dtype=np.dtype(dtype)).tobytes(
+                        order="C")
+                compare_bytes(expected, name)
+
+        for name, dtype in (
+            ("positions", "<f4"),
+            ("velocities", "<f4"),
+            ("rotations", "<f4"),
+            ("angular_velocities", "<f4"),
+        ):
+            compare_array2(name, dtype)
+        for name in ("parents", "range_starts", "range_stops"):
+            compare_array1(name, "<i4")
+        compare_array2("contacts", "u1")
+        if os.pread(descriptor, 1, offset):
+            raise ValueError("staged database has trailing bytes")
+
+        after = os.fstat(descriptor)
+        if _regular_file_identity(after) != identity:
+            raise ValueError("staged database changed during comparison")
+        try:
+            path_after = os.lstat(path)
+        except OSError as error:
+            raise ValueError(
+                "staged database changed during comparison") from error
+        if (
+            not stat.S_ISREG(path_after.st_mode)
+            or _regular_file_identity(path_after) != identity
+        ):
+            raise ValueError("staged database changed during comparison")
+    finally:
+        os.close(descriptor)
+
+
 def _validate_staged_v3(
     staging, artifacts, manifest, scene_pack, motion_index,
 ):
@@ -907,14 +1016,14 @@ def _validate_staged_v3(
                 raise ValueError(
                     f"{scene.scene_id}: staged asset SHA-256 is not trusted")
 
-    loaded = read_holden_database(os.path.join(staging, "database.bin"))
-    loaded.terrain_features = read_terrain_sidecar(
+    _compare_staged_database(
+        os.path.join(staging, "database.bin"), artifacts)
+    loaded_terrain_features = read_terrain_sidecar(
         os.path.join(staging, "terrain_features.bin"))
-    loaded.terrain_support = read_support_sidecar(
+    loaded_terrain_support = read_support_sidecar(
         os.path.join(staging, "terrain_support.bin"))
     loaded_motion_index = read_motion_index(
         os.path.join(staging, "motion_index.bin"))
-    loaded.validate()
 
     def encoded_equal(actual, expected, dtype):
         actual = np.ascontiguousarray(actual, dtype=dtype)
@@ -925,14 +1034,10 @@ def _validate_staged_v3(
         return np.array_equal(
             actual.view(view_dtype), expected.view(view_dtype))
 
-    for name, dtype in (
-            ("positions", "<f4"), ("velocities", "<f4"),
-            ("rotations", "<f4"), ("angular_velocities", "<f4"),
-            ("parents", "<i4"), ("range_starts", "<i4"),
-            ("range_stops", "<i4"), ("contacts", "u1"),
-            ("terrain_features", "<f4"), ("terrain_support", "<f4")):
-        if not encoded_equal(
-                getattr(loaded, name), getattr(artifacts, name), dtype):
+    for name, loaded, dtype in (
+            ("terrain_features", loaded_terrain_features, "<f4"),
+            ("terrain_support", loaded_terrain_support, "<f4")):
+        if not encoded_equal(loaded, getattr(artifacts, name), dtype):
             raise ValueError(
                 f"staged {name} does not match requested artifacts")
     for name in ("direction_masks", "speed_masks", "elevation_modes"):

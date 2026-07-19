@@ -4,6 +4,7 @@
 import argparse
 import hashlib
 import json
+import mmap
 import os
 import re
 import stat
@@ -31,13 +32,13 @@ from resources.g1_terrain_builder.database import (
     derive_contacts,
     derive_velocities,
     forward_kinematics_arrays,
-    read_holden_database,
     sample_terrain_support,
 )
 from resources.g1_terrain_builder.kinematics import (
     convert_source_clip,
 )
 from resources.g1_terrain_builder.schema import (
+    ArtifactSet,
     SourceFrameRange,
     TERRAIN_FAMILIES,
     TerrainBank,
@@ -235,6 +236,7 @@ _CANONICAL_SOURCE_FPS = (25.0, 50.0)
 _MAX_GRID_AXIS = 2048
 _MAX_GRID_CELLS = 306_726
 _MAX_OBJ_BYTES = 21_762_970
+_DATABASE_SCAN_CHUNK_BYTES = 1024 * 1024
 _ROOT_FILE_LIMITS = {
     "scenes/index.json": _MAX_SCENE_JSON_BYTES,
     "validation.json": _MAX_VALIDATION_BYTES,
@@ -1046,10 +1048,156 @@ def _validate_motion_descriptors(root, manifest):
     )
 
 
+def _database_row_chunks(values):
+    row_bytes = int(np.prod(values.shape[1:], dtype=np.int64)) \
+        * values.dtype.itemsize
+    rows_per_chunk = max(1, _DATABASE_SCAN_CHUNK_BYTES // row_bytes)
+    for start in range(0, len(values), rows_per_chunk):
+        yield values[start:min(len(values), start + rows_per_chunk)]
+
+
+def _validate_mapped_database(database):
+    positions = database.positions
+    _require(
+        positions.ndim == 3 and positions.shape[2] == 3,
+        "database positions shape must be (frames, bones, 3)")
+    frames, bones, _ = positions.shape
+    _require(frames > 0 and bones > 0,
+             "database positions must be non-empty")
+    expected_shapes = {
+        "velocities": (frames, bones, 3),
+        "rotations": (frames, bones, 4),
+        "angular_velocities": (frames, bones, 3),
+        "parents": (bones,),
+        "contacts": (frames, 2),
+    }
+    for name, shape in expected_shapes.items():
+        _require(getattr(database, name).shape == shape,
+                 f"database {name} shape changed")
+
+    for name in (
+        "positions", "velocities", "rotations", "angular_velocities",
+    ):
+        for chunk in _database_row_chunks(getattr(database, name)):
+            _require(np.isfinite(chunk).all(),
+                     f"database {name} contains non-finite values")
+
+    parents = database.parents
+    _require(int(parents[0]) == -1,
+             "database parents must begin with one root")
+    for bone in range(1, bones):
+        parent = int(parents[bone])
+        _require(0 <= parent < bone,
+                 "database parents must be topologically ordered")
+
+    starts = database.range_starts
+    stops = database.range_stops
+    _require(starts.ndim == 1 and stops.shape == starts.shape and len(starts),
+             "database ranges must be aligned and non-empty")
+    _require(int(starts[0]) == 0 and int(stops[-1]) == frames,
+             "database ranges do not cover all frames")
+    items_per_chunk = max(
+        1, _DATABASE_SCAN_CHUNK_BYTES // starts.dtype.itemsize)
+    for start in range(0, len(starts), items_per_chunk):
+        stop = min(len(starts), start + items_per_chunk)
+        _require(np.all(starts[start:stop] < stops[start:stop]),
+                 "database contains an empty animation range")
+        if start:
+            _require(int(starts[start]) == int(stops[start - 1]),
+                     "database ranges are not contiguous")
+        if stop - start > 1:
+            _require(np.array_equal(
+                starts[start + 1:stop], stops[start:stop - 1]),
+                "database ranges are not contiguous")
+
+    for chunk in _database_row_chunks(database.contacts):
+        _require(np.all((chunk == 0) | (chunk == 1)),
+                 "database contacts must be binary")
+
+
+def _database_quaternion_norm_error(rotations):
+    maximum = 0.0
+    for chunk in _database_row_chunks(rotations):
+        norms = np.linalg.norm(chunk, axis=-1)
+        maximum = max(maximum, float(np.max(np.abs(norms - 1.0))))
+    return maximum
+
+
 def _load_database(path):
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    descriptor = None
     try:
-        return read_holden_database(path)
-    except (OSError, TypeError, ValueError) as error:
+        descriptor = os.open(path, flags)
+        node = os.fstat(descriptor)
+        _require(stat.S_ISREG(node.st_mode) and node.st_size > 0,
+                 "database payload must be a non-empty regular file")
+        mapped = mmap.mmap(descriptor, 0, access=mmap.ACCESS_READ)
+    except (OSError, TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"database.bin is invalid: {error}") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    try:
+        size = len(mapped)
+        offset = 0
+
+        def read_header(format_, label):
+            nonlocal offset
+            header = struct.Struct(format_)
+            if header.size > size - offset:
+                raise ValueError(f"truncated database {label} header")
+            values = header.unpack_from(mapped, offset)
+            offset += header.size
+            return values
+
+        def read_array2(label, dtype, components=()):
+            nonlocal offset
+            rows, columns = read_header("<II", label)
+            shape = (rows, columns) + tuple(components)
+            count = rows * columns
+            for component in components:
+                count *= component
+            payload_size = count * np.dtype(dtype).itemsize
+            if payload_size > size - offset:
+                raise ValueError(f"truncated database {label} payload")
+            values = np.ndarray(
+                shape, dtype=np.dtype(dtype), buffer=mapped, offset=offset,
+                order="C")
+            values.setflags(write=False)
+            offset += payload_size
+            return values
+
+        def read_array1(label, dtype):
+            nonlocal offset
+            count, = read_header("<I", label)
+            payload_size = count * np.dtype(dtype).itemsize
+            if payload_size > size - offset:
+                raise ValueError(f"truncated database {label} payload")
+            values = np.ndarray(
+                (count,), dtype=np.dtype(dtype), buffer=mapped, offset=offset,
+                order="C")
+            values.setflags(write=False)
+            offset += payload_size
+            return values
+
+        database = ArtifactSet(
+            read_array2("positions", "<f4", (3,)),
+            read_array2("velocities", "<f4", (3,)),
+            read_array2("rotations", "<f4", (4,)),
+            read_array2("angular velocities", "<f4", (3,)),
+            read_array1("parents", "<i4"),
+            read_array1("range starts", "<i4"),
+            read_array1("range stops", "<i4"),
+            read_array2("contacts", "u1"),
+            None,
+            None,
+        )
+        _require(offset == size, "trailing database bytes")
+        _validate_mapped_database(database)
+        return database
+    except (BufferError, OSError, TypeError, ValueError, OverflowError,
+            struct.error) as error:
         raise ValueError(f"database.bin is invalid: {error}") from error
 
 
@@ -2380,8 +2528,7 @@ def validate_artifact_directory(
     sources = _validate_sources(manifest, database)
     _validate_motion_banks(manifest, sources)
     _validate_parameters(manifest, len(sources))
-    quaternion_error = float(np.max(np.abs(
-        np.linalg.norm(database.rotations, axis=-1) - 1.0)))
+    quaternion_error = _database_quaternion_norm_error(database.rotations)
     _require(quaternion_error <= 1e-4,
              "database quaternion norm error exceeds 0.0001")
     scenes = _validate_scene_catalog(

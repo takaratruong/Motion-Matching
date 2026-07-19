@@ -1240,10 +1240,12 @@ class ArtifactPublicationV3Tests(unittest.TestCase):
             self.assertEqual(os.listdir(output), ["old"])
             self.assertEqual(self._scratch(temporary, output), [])
 
-    def test_database_hashing_and_staging_do_not_read_whole_database_bytes(self):
+    def test_database_validation_is_bounded_and_never_decodes_whole_file(self):
         artifacts = ArtifactSet.empty(4, 2)
         seen = []
+        pread_sizes = []
         real_read = artifacts_module._read_regular_bytes
+        real_pread = os.pread
         with tempfile.TemporaryDirectory() as temporary:
             output = os.path.join(temporary, "published")
 
@@ -1253,38 +1255,85 @@ class ArtifactPublicationV3Tests(unittest.TestCase):
                     raise AssertionError("whole database read")
                 return real_read(path)
 
-            with mock.patch.object(
-                artifacts_module, "_read_regular_bytes",
-                side_effect=reject_database_reads,
+            def bounded_pread(descriptor, size, offset):
+                pread_sizes.append(size)
+                self.assertLessEqual(size, 32)
+                return real_pread(descriptor, size, offset)
+
+            with (
+                mock.patch.object(
+                    artifacts_module, "_read_regular_bytes",
+                    side_effect=reject_database_reads,
+                ),
+                mock.patch.object(
+                    artifacts_module, "read_holden_database", create=True,
+                    side_effect=AssertionError("whole database decode"),
+                ),
+                mock.patch.object(
+                    artifacts_module, "_DATABASE_COMPARE_CHUNK_BYTES", 32,
+                    create=True,
+                ),
+                mock.patch.object(
+                    artifacts_module.os, "pread", side_effect=bounded_pread,
+                ),
             ):
                 publish_artifacts(
                     output, artifacts, tiny_manifest_base(artifacts),
                     tiny_scene_pack(), lambda path: None,
                 )
         self.assertEqual(seen, [])
+        self.assertGreater(len(pread_sizes), 3)
 
-    def test_staged_float_arrays_are_compared_by_encoded_bits(self):
+    def test_database_chunk_mutation_at_each_boundary_preserves_old_output(self):
         artifacts = ArtifactSet.empty(4, 2)
-        real_reader = artifacts_module.read_holden_database
-        with tempfile.TemporaryDirectory() as temporary:
-            output = self._old_output(temporary)
-
-            def signed_zero_reader(path):
-                loaded = real_reader(path)
-                loaded.positions[0, 0, 0] = np.float32(-0.0)
-                return loaded
-
-            with mock.patch.object(
-                artifacts_module, "read_holden_database",
-                side_effect=signed_zero_reader,
+        real_validate = artifacts_module._validate_staged_v3
+        for boundary in (1, 2, 3):
+            with (
+                self.subTest(boundary=boundary),
+                tempfile.TemporaryDirectory() as temporary,
             ):
-                with self.assertRaisesRegex(ValueError, "positions"):
+                output = self._old_output(temporary)
+                calls = 0
+
+                def mutate_at_boundary(staging, *arguments):
+                    nonlocal calls
+                    calls += 1
+                    if calls == boundary:
+                        database_path = os.path.join(staging, "database.bin")
+                        with open(database_path, "r+b") as stream:
+                            # A positive-zero sign bit beyond the first 32-byte
+                            # chunk changes exact bytes without changing value.
+                            stream.seek(8 + 9 * 4 + 3)
+                            stream.write(b"\x80")
+                        manifest = arguments[1]
+                        manifest["database"]["sha256"] = file_sha256(
+                            database_path)
+                        with open(
+                            os.path.join(staging, "manifest.json"), "wb"
+                        ) as stream:
+                            stream.write(scene_json_bytes(manifest))
+                    return real_validate(staging, *arguments)
+
+                with (
+                    mock.patch.object(
+                        artifacts_module, "_DATABASE_COMPARE_CHUNK_BYTES", 32,
+                        create=True,
+                    ),
+                    mock.patch.object(
+                        artifacts_module, "_validate_staged_v3",
+                        side_effect=mutate_at_boundary,
+                    ),
+                    self.assertRaisesRegex(ValueError, "positions|database"),
+                ):
                     publish_artifacts(
                         output, artifacts, tiny_manifest_base(artifacts),
                         tiny_scene_pack(), lambda path: None,
                     )
-            self.assertEqual(os.listdir(output), ["old"])
-            self.assertEqual(self._scratch(temporary, output), [])
+                self.assertEqual(calls, boundary)
+                self.assertEqual(os.listdir(output), ["old"])
+                with open(os.path.join(output, "old"), "rb") as stream:
+                    self.assertEqual(stream.read(), b"last-good")
+                self.assertEqual(self._scratch(temporary, output), [])
 
     def test_sha256_file_streams_without_whole_file_reader(self):
         with tempfile.TemporaryDirectory() as temporary:
