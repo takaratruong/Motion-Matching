@@ -303,14 +303,38 @@ def _descriptor_height(terrain, point: np.ndarray) -> float:
     height_function = getattr(terrain, "height", None)
     if not callable(height_function):
         raise TypeError("terrain must provide a callable height(x, z)")
-    if isinstance(terrain, HeightGrid) and terrain._cell(*point) is None:
-        raise ValueError("terrain descriptor query is outside the heightfield domain")
+    runtime_heightgrid = isinstance(terrain, HeightGrid)
+    if runtime_heightgrid:
+        with np.errstate(over="ignore", invalid="ignore"):
+            runtime_point = np.asarray(point, np.float32)
+        if not np.all(np.isfinite(runtime_point)):
+            raise ValueError(
+                "terrain descriptor query must encode as finite binary32")
+        if not all(_is_normal_or_zero_binary32(float(value))
+                   for value in runtime_point):
+            raise ValueError(
+                "terrain descriptor query must encode as normal-or-zero binary32")
+        runtime_point[runtime_point == 0.0] = np.float32(0.0)
+        point = runtime_point.astype(np.float64)
+        if terrain._cell(*point) is None:
+            raise ValueError(
+                "terrain descriptor query is outside the heightfield domain")
     try:
         height = float(height_function(*point))
     except (OverflowError, TypeError, ValueError) as error:
         raise ValueError("terrain descriptor height query failed") from error
     if not math.isfinite(height):
         raise ValueError("terrain descriptor heights must be finite")
+    if runtime_heightgrid:
+        with np.errstate(over="ignore", invalid="ignore"):
+            runtime_height = np.float32(height)
+        if not np.isfinite(runtime_height):
+            raise ValueError(
+                "terrain descriptor heights must encode as finite binary32")
+        if runtime_height == 0.0 \
+                or abs(float(runtime_height)) < HEIGHTFIELD_MIN_NORMAL:
+            return 0.0
+        return float(runtime_height)
     return height
 
 
@@ -342,7 +366,7 @@ def sample_terrain_descriptor(
         descriptor = np.asarray(values, np.float32)
     if descriptor.shape != (12,) or not np.all(np.isfinite(descriptor)):
         raise ValueError("terrain descriptor must contain twelve finite float32 values")
-    descriptor[descriptor == 0.0] = np.float32(0.0)
+    descriptor[np.abs(descriptor) < HEIGHTFIELD_MIN_NORMAL] = np.float32(0.0)
     return descriptor
 
 
@@ -449,8 +473,6 @@ def classify_terrain_profile(
         np.dot(centered_distances, centered_heights)
         / np.dot(centered_distances, centered_distances))
     grade_degrees = math.degrees(math.atan(grade))
-    normal_grades = -normals[:, 0] / normals[:, 1]
-    normal_grade_degrees = math.degrees(math.atan(float(np.median(normal_grades))))
     surface_grades = np.linalg.norm(normals[:, (0, 2)], axis=1) / normals[:, 1]
     surface_grade_degrees = math.degrees(
         math.atan(float(np.median(surface_grades))))
@@ -513,9 +535,12 @@ def classify_terrain_profile(
     angle_confidence = min(
         1.0, max(abs(grade_degrees), surface_grade_degrees)
         / TERRAIN_CONFIDENCE_REFERENCE_SLOPE_DEGREES)
+    # Profile heights own signed longitudinal rise. Normals can only provide a
+    # basis-free total tilt without an explicit profile basis, so they support
+    # any longitudinal grade no greater than that total surface tilt.
     normal_agreement = 1.0 - min(
         1.0,
-        abs(grade_degrees - normal_grade_degrees)
+        max(0.0, abs(grade_degrees) - surface_grade_degrees)
         / TERRAIN_CONFIDENCE_REFERENCE_SLOPE_DEGREES,
     )
     confidence = min(angle_confidence, residual_confidence, normal_agreement)

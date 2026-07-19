@@ -135,6 +135,38 @@ class TerrainTests(unittest.TestCase):
         self.assertAlmostEqual(result.step_height_m, 0.0, places=12)
         self.assertAlmostEqual(result.grade_degrees, 10.0, places=10)
 
+    def test_classifier_is_invariant_to_horizontal_normal_rotation(self):
+        grade = math.tan(math.radians(10.0))
+        distances = np.linspace(0.0, 1.0, 51, dtype=np.float64)
+        heights = grade * distances
+        horizontal_directions = (
+            (1.0, 0.0),
+            (0.0, 1.0),
+            (math.sqrt(0.5), math.sqrt(0.5)),
+        )
+        results = []
+        for direction_x, direction_z in horizontal_directions:
+            normal = np.array([
+                -grade * direction_x,
+                1.0,
+                -grade * direction_z,
+            ], np.float64)
+            normal /= np.linalg.norm(normal)
+            normals = np.tile(normal, (len(distances), 1))
+            results.append(classify_terrain_profile(
+                distances, heights, normals))
+
+        for result in results:
+            self.assertEqual(result.family, "slope")
+            self.assertEqual(result.elevation_mode, 1)
+            self.assertAlmostEqual(result.grade_degrees, 10.0, places=10)
+            self.assertGreater(result.confidence, 0.9)
+        self.assertAlmostEqual(
+            max(result.confidence for result in results),
+            min(result.confidence for result in results),
+            places=12,
+        )
+
     def test_exact_ten_degree_cross_slope_uses_fixed_sole_corridors(self):
         grade = math.tan(math.radians(10.0))
         descriptor = sample_terrain_descriptor(
@@ -230,6 +262,54 @@ class TerrainTests(unittest.TestCase):
         np.testing.assert_array_equal(first.view(np.uint32),
                                       second.view(np.uint32))
         self.assertTrue(np.isfinite(first).all())
+
+    def test_descriptor_matches_locked_g1hf_v2_runtime_scalar_bits(self):
+        terrain = HeightGrid(
+            np.array([
+                [1000000.0, 1000000.0625, 999999.9375],
+                [1000000.125, 999999.875, 1000000.1875],
+                [999999.8125, 1000000.25, 1000000.0],
+            ], np.float32),
+            -1.0,
+            -1.0,
+            1.0,
+            0.0,
+        )
+        root = np.array([-0.4123456789, -0.3567890123], np.float64)
+        centerline = np.stack((root, root + np.array([0.8, 0.6])))
+        heading = np.array([-0.3, 0.9539392014169457], np.float64)
+        # Locked from terrain_runtime.h heightfield_sample_v2 and
+        # terrain_v2_round_output for the root, center, left, and right probes.
+        expected_bits = np.array([
+            0x00000000,
+            0xbd800000,
+            0xbd800000,
+            0xbd800000,
+            0xbd800000,
+            0x00000000,
+            0x00000000,
+            0x00000000,
+            0x3d800000,
+            0xbd800000,
+            0xbd800000,
+            0xbd800000,
+        ], np.uint32)
+
+        descriptor = sample_terrain_descriptor(
+            terrain, centerline, heading)
+
+        np.testing.assert_array_equal(
+            descriptor.view(np.uint32), expected_bits)
+
+        minimum_subnormal = float(np.nextafter(
+            np.float32(0.0), np.float32(np.inf)))
+        subnormal_centerline = np.array([
+            [minimum_subnormal, 0.0],
+            [1.0, 0.0],
+        ], np.float64)
+        with self.assertRaisesRegex(ValueError, "normal-or-zero"):
+            sample_terrain_descriptor(
+                terrain, subnormal_centerline, np.array([1.0, 0.0]))
 
     def test_descriptor_rejects_malformed_degenerate_nonfinite_and_domain_inputs(self):
         valid = (FlatTerrain(), _straight_centerline(), np.array([1.0, 0.0]))
