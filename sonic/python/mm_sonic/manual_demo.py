@@ -57,6 +57,20 @@ _PRELOAD_CHUNKS = 4
 _CHUNK_DURATION_S = 0.4
 
 
+def _validated_preload_chunks(value: object) -> int:
+    """Return an exact preload depth in 1..4, rejecting everything else."""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ContractError(
+            f"preload chunks must be an int in 1..4, got {value!r}"
+        )
+    if not 1 <= value <= 4:
+        raise ContractError(
+            f"preload chunks must be an int in 1..4, got {value!r}"
+        )
+    return value
+
+
 class CommandRecorder:
     """Collect every committed preload/operator command in exact chunk order."""
 
@@ -168,6 +182,7 @@ def _stand_command(index: int, heading: CommandSample | None = None) -> CommandS
 
 
 def run_demo(namespace: argparse.Namespace) -> Path:
+    preload_chunks = _validated_preload_chunks(namespace.preload_chunks)
     output_root = Path(namespace.output_root).expanduser().resolve()
     source_run = Path(namespace.source_run).expanduser().resolve(strict=True)
     gear_checkout = Path(namespace.gear_checkout).expanduser().resolve(strict=True)
@@ -240,7 +255,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
     next_chunk = 0
     recorder = CommandRecorder(
         mode=namespace.mode,
-        preload_chunks=_PRELOAD_CHUNKS,
+        preload_chunks=preload_chunks,
         hand_targets=NEUTRAL_HAND_TARGETS,
     )
 
@@ -317,7 +332,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                 attempt=1,
                 wait=True,
             )
-            for index in range(_PRELOAD_CHUNKS):
+            for index in range(preload_chunks):
                 generate_and_publish(_stand_command(index), wait=True)
 
         _drive_simulator_until(
@@ -360,7 +375,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
             if namespace.mode == "interactive":
                 print(
                     "LIVE: W forward, space stand, Q/E turn, X exit. "
-                    f"Commands have ~{_PRELOAD_CHUNKS * _CHUNK_DURATION_S:.1f} s "
+                    f"Commands have ~{preload_chunks * _CHUNK_DURATION_S:.1f} s "
                     "lookahead latency.",
                     flush=True,
                 )
@@ -390,9 +405,9 @@ def run_demo(namespace: argparse.Namespace) -> Path:
             "schema": "mm-sonic-manual-demo/v3",
             "mode": namespace.mode,
             "run_root": str(bundle.path),
-            "preload_chunks": _PRELOAD_CHUNKS,
+            "preload_chunks": preload_chunks,
             "generated_chunks": next_chunk,
-            "lookahead_seconds": _PRELOAD_CHUNKS * _CHUNK_DURATION_S,
+            "lookahead_seconds": preload_chunks * _CHUNK_DURATION_S,
             "command_artifact": {
                 "path": "manual-commands.json",
                 "sha256": hashlib.sha256(command_artifact).hexdigest(),
@@ -433,6 +448,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("script", "interactive"), default="script")
     parser.add_argument("--chunks", type=int, default=30)
+    parser.add_argument("--preload-chunks", type=int, default=_PRELOAD_CHUNKS)
     parser.add_argument("--onscreen", action="store_true")
     parser.add_argument("--output-root", default="/home/ubuntu/mm-sonic-manual-runs")
     parser.add_argument("--source-run", default=str(_DEFAULT_SOURCE_RUN))
