@@ -622,6 +622,45 @@ def check_rows(rows):
                     raise ValueError(
                         f"row {index}: empty compatible set applied_speed "
                         "must be zero")
+                if index > 0 and not generation_changed:
+                    previous_row = rows[index - 1]
+                    held_float_columns = (
+                        "simulation_x", "simulation_z",
+                        "support_height", "support_velocity",
+                        "runtime_support_root_height",
+                        "runtime_support_left_toe_height",
+                        "runtime_support_right_toe_height",
+                        "support_root_delta", "support_left_toe_delta",
+                        "support_right_toe_delta",
+                        "support_retargeted_hips_y", "ik_adjusted_hips_y",
+                        "rendered_hips_y", "rendered_min_clearance",
+                        "rendered_hips_clearance",
+                        "rendered_left_toe_clearance",
+                        "rendered_right_toe_clearance",
+                        *(f"{side}_sole_clearance_{probe}"
+                          for side in ("left", "right")
+                          for probe in range(4)),
+                        "left_sole_min_clearance",
+                        "right_sole_min_clearance", "sole_min_clearance",
+                    )
+                    for name in held_float_columns:
+                        if (_float32(row, name, index) !=
+                                _float32(previous_row, name, index - 1)):
+                            raise ValueError(
+                                f"row {index}: empty compatible set held "
+                                f"{name} changed")
+                    for name in (
+                            "airborne_frames", "left_contact",
+                            "right_contact"):
+                        if (_integer(row, name, index) !=
+                                _integer(previous_row, name, index - 1)):
+                            raise ValueError(
+                                f"row {index}: empty compatible set held "
+                                f"{name} changed")
+                    if row["support_source"] != previous_row["support_source"]:
+                        raise ValueError(
+                            f"row {index}: empty compatible set held "
+                            "support_source changed")
             if _integer(row, "walkability_class", index) not in (0, 1, 2):
                 raise ValueError(
                     f"row {index}: walkability_class must be 0, 1, or 2")

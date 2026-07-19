@@ -474,6 +474,7 @@ class RuntimeLogTests(unittest.TestCase):
             considered_bound_count=3,
             skipped_bound_count=3,
             empty_compatible_set=1,
+            simulation_z=0,
         ))
         rows.append(runtime_row(
             2,
@@ -493,6 +494,7 @@ class RuntimeLogTests(unittest.TestCase):
             considered_bound_count=3,
             skipped_bound_count=3,
             empty_compatible_set=1,
+            simulation_z=0,
         ))
         check_rows(rows)
 
@@ -506,6 +508,55 @@ class RuntimeLogTests(unittest.TestCase):
         for field, value, message in mutations:
             changed = [dict(item) for item in rows]
             changed[1][field] = value
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, message):
+                    check_rows(changed)
+
+    def test_explicit_empty_set_rejects_visible_state_drift(self):
+        rows = [runtime_row(0)]
+        rows.append(runtime_row(
+            1,
+            query_database_frame=100,
+            selected_database_frame=100,
+            database_frame=100,
+            searched=1,
+            applied_speed=0,
+            active_family="stair",
+            source_family="flat",
+            requested_family="stair",
+            elevation_mode=1,
+            bank_transition=1,
+            bank_transition_reason="confirmed",
+            eligible_frame_count=0,
+            evaluated_frame_count=0,
+            considered_bound_count=3,
+            skipped_bound_count=3,
+            empty_compatible_set=1,
+            simulation_z=0,
+        ))
+        check_rows(rows)
+
+        mutations = (
+            ("simulation_x", ".001", "held simulation_x"),
+            ("support_height", ".001", "held support_height"),
+            ("support_velocity", ".001", "held support_velocity"),
+            ("support_source", "left", "held support_source"),
+            ("airborne_frames", "1", "held airborne_frames"),
+            ("left_contact", "0", "held left_contact"),
+            ("support_retargeted_hips_y", ".801",
+             "held support_retargeted_hips_y"),
+            ("rendered_hips_y", ".801", "held rendered_hips_y"),
+            ("rendered_left_toe_clearance", ".031",
+             "held rendered_left_toe_clearance"),
+            ("left_sole_clearance_0", ".011",
+             "held left_sole_clearance_0"),
+        )
+        for field, value, message in mutations:
+            changed = [dict(item) for item in rows]
+            changed[1][field] = value
+            if field == "left_sole_clearance_0":
+                changed[1]["left_sole_min_clearance"] = value
+                changed[1]["sole_min_clearance"] = value
             with self.subTest(field=field):
                 with self.assertRaisesRegex(ValueError, message):
                     check_rows(changed)

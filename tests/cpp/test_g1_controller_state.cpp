@@ -78,6 +78,25 @@ static std::string source_call_text(
     return std::string();
 }
 
+static std::string source_braced_block_text(
+    const std::string& source,
+    const std::size_t start,
+    const char* description)
+{
+    const std::size_t open = source.find('{', start);
+    check(open != std::string::npos, description);
+    int depth = 0;
+    for (std::size_t index = open; index < source.size(); ++index) {
+        if (source[index] == '{') {
+            ++depth;
+        } else if (source[index] == '}' && --depth == 0) {
+            return source.substr(start, index - start + 1);
+        }
+    }
+    check(false, description);
+    return std::string();
+}
+
 static int source_call_argument_count(const std::string& call)
 {
     const std::size_t open = call.find('(');
@@ -370,6 +389,43 @@ static void test_controller_publishes_independent_travel_and_heading()
           "immutable intent records requested travel and independent heading");
 }
 
+static void test_coverage_empty_path_guards_every_visible_mutation()
+{
+    const std::string source = read_controller_source();
+    const std::size_t empty_branch = source.find(
+        "if (search_status == DATABASE_INDEXED_SEARCH_EMPTY)");
+    const std::size_t hold = source.find(
+        "g1_controller_state_publish_coverage_empty_hold(", empty_branch);
+    const std::size_t simulation_stage = source.find(
+        "// Update Simulation", hold);
+    const std::size_t guard = source.find(
+        "if (!skip_frame_advance)", simulation_stage);
+    check(empty_branch != std::string::npos && hold != std::string::npos &&
+              simulation_stage != std::string::npos &&
+              guard != std::string::npos && empty_branch < hold &&
+              hold < simulation_stage && simulation_stage < guard,
+          "coverage-empty branch publishes one hold before guarded pose work");
+
+    const std::string guarded = source_braced_block_text(
+        source, guard,
+        "coverage-empty visible-state guard has a complete body");
+    check(source_has_call(guarded, "simulation_positions_update") &&
+              source_has_call(guarded, "simulation_rotations_update") &&
+              source_has_call(guarded, "support_observation_build_walkable") &&
+              source_has_call(guarded, "support_frame_update") &&
+              guarded.find(
+                  "state.adjusted_bone_rotations = state.bone_rotations;") !=
+                  std::string::npos &&
+              source_has_call(guarded, "support_pose_apply") &&
+              count_occurrences(guarded, "forward_kinematics_full(") == 2,
+          "one coverage-empty guard owns simulation, support, adjusted pose, "
+          "and both global-pose publications");
+    check(guarded.find("state.desired_rotation =") == std::string::npos &&
+              guarded.find("command.intent.desired_heading =") ==
+                  std::string::npos,
+          "visible-state hold never derives or overwrites requested heading");
+}
+
 static void test_failed_model_load_reaches_counted_shared_cleanup()
 {
     const std::string source = read_controller_source();
@@ -476,6 +532,38 @@ static bool same_quat_bits(const quat& first, const quat& second)
            same_float_bits(first.z, second.z);
 }
 
+static bool same_support_state_bits(
+    const support_frame_state& first,
+    const support_frame_state& second)
+{
+    return same_float_bits(first.height, second.height) &&
+           same_float_bits(first.velocity, second.velocity) &&
+           same_float_bits(first.nominal_height, second.nominal_height) &&
+           same_float_bits(first.nominal_velocity, second.nominal_velocity) &&
+           same_float_bits(first.offset_height, second.offset_height) &&
+           same_float_bits(first.offset_velocity, second.offset_velocity) &&
+           first.airborne_frames == second.airborne_frames &&
+           first.source == second.source &&
+           first.initialized == second.initialized;
+}
+
+static bool same_support_observation_bits(
+    const support_observation& first,
+    const support_observation& second)
+{
+    for (int index = 0; index < 3; ++index) {
+        if (!same_float_bits(
+                first.source_height[index], second.source_height[index]) ||
+            !same_float_bits(
+                first.runtime_height[index], second.runtime_height[index]) ||
+            !same_float_bits(first.delta[index], second.delta[index])) {
+            return false;
+        }
+    }
+    return first.contact[0] == second.contact[0] &&
+           first.contact[1] == second.contact[1];
+}
+
 static bool same_command_snapshot_bits(
     const G1CommandSnapshot& first,
     const G1CommandSnapshot& second)
@@ -548,6 +636,125 @@ static void test_idle_match_transition_cost_policy()
         check_idle_match_transition_cost(
             0.0f, value, 0.0f,
             "invalid simulation speed has no transition cost");
+    }
+}
+
+static void test_coverage_empty_hold_preserves_complete_visible_state()
+{
+    g1_controller_state state;
+    state.adjusted_bone_positions.resize(G1_BoneCount);
+    state.adjusted_bone_rotations.resize(G1_BoneCount);
+    state.global_bone_positions.resize(G1_BoneCount);
+    state.global_bone_rotations.resize(G1_BoneCount);
+    for (int bone = 0; bone < G1_BoneCount; ++bone) {
+        const float value = static_cast<float>(bone + 1);
+        state.adjusted_bone_positions(bone) =
+            vec3(value, value + 0.25f, -value);
+        state.adjusted_bone_rotations(bone) =
+            quat(value + 0.50f, -value, value + 0.75f, -value - 1.0f);
+        state.global_bone_positions(bone) =
+            vec3(-value - 2.0f, value + 3.0f, value + 4.0f);
+        state.global_bone_rotations(bone) =
+            quat(-value - 5.0f, value + 6.0f, -value - 7.0f, value + 8.0f);
+    }
+    state.simulation_position = vec3(2.0f, 3.0f, 4.0f);
+    state.simulation_rotation = quat(0.25f, -0.50f, 0.75f, -1.0f);
+    state.simulation_angular_velocity = vec3(5.0f, 6.0f, 7.0f);
+    state.simulation_velocity = vec3(8.0f, -0.0f, -9.0f);
+    state.simulation_acceleration = vec3(-10.0f, 11.0f, 12.0f);
+    state.desired_rotation = quat(-0.25f, 0.50f, -0.75f, 1.0f);
+    state.command.intent.desired_heading =
+        quat(0.125f, 0.25f, 0.375f, 0.50f);
+    state.support.height = -0.25f;
+    state.support.velocity = 0.125f;
+    state.support.nominal_height = -0.50f;
+    state.support.nominal_velocity = 0.75f;
+    state.support.offset_height = 1.25f;
+    state.support.offset_velocity = -1.50f;
+    state.support.airborne_frames = 7;
+    state.support.source = support_held;
+    state.support.initialized = true;
+    for (int index = 0; index < 3; ++index) {
+        state.support_observation_now.source_height[index] =
+            20.0f + static_cast<float>(index);
+        state.support_observation_now.runtime_height[index] =
+            30.0f + static_cast<float>(index);
+        state.support_observation_now.delta[index] =
+            40.0f + static_cast<float>(index);
+    }
+    state.support_observation_now.contact[0] = true;
+    state.support_observation_now.contact[1] = false;
+
+    const array1d<vec3> adjusted_positions_before(
+        state.adjusted_bone_positions);
+    const array1d<quat> adjusted_rotations_before(
+        state.adjusted_bone_rotations);
+    const array1d<vec3> global_positions_before(state.global_bone_positions);
+    const array1d<quat> global_rotations_before(state.global_bone_rotations);
+    const vec3 simulation_position_before = state.simulation_position;
+    const quat simulation_rotation_before = state.simulation_rotation;
+    const vec3 simulation_angular_velocity_before =
+        state.simulation_angular_velocity;
+    const quat desired_rotation_before = state.desired_rotation;
+    const quat requested_heading_before =
+        state.command.intent.desired_heading;
+    const support_frame_state support_before = state.support;
+    const support_observation observation_before =
+        state.support_observation_now;
+
+    for (int frame = 0; frame < 8; ++frame) {
+        g1_controller_state_publish_coverage_empty_hold(
+            state, vec3(1.25f, -0.0f, -2.50f));
+
+        check(terrain_float_bits(state.desired_velocity.x) == 0 &&
+                  terrain_float_bits(state.desired_velocity.z) == 0 &&
+                  terrain_float_bits(state.desired_velocity.y) ==
+                      UINT32_C(0x80000000) &&
+                  terrain_float_bits(state.command.applied_velocity.x) == 0 &&
+                  terrain_float_bits(state.command.applied_velocity.z) == 0 &&
+                  terrain_float_bits(state.command.applied_velocity.y) ==
+                      UINT32_C(0x80000000),
+              "coverage-empty hold zeroes only published planar travel");
+        check(terrain_float_bits(state.simulation_velocity.x) == 0 &&
+                  terrain_float_bits(state.simulation_velocity.z) == 0 &&
+                  same_float_bits(state.simulation_velocity.y, -0.0f) &&
+                  terrain_float_bits(state.simulation_acceleration.x) == 0 &&
+                  terrain_float_bits(state.simulation_acceleration.z) == 0 &&
+                  same_float_bits(state.simulation_acceleration.y, 11.0f),
+              "coverage-empty hold cancels only planar inertia");
+        for (int bone = 0; bone < G1_BoneCount; ++bone) {
+            check(same_vec3_bits(
+                      state.adjusted_bone_positions(bone),
+                      adjusted_positions_before(bone)) &&
+                      same_quat_bits(
+                          state.adjusted_bone_rotations(bone),
+                          adjusted_rotations_before(bone)) &&
+                      same_vec3_bits(
+                          state.global_bone_positions(bone),
+                          global_positions_before(bone)) &&
+                      same_quat_bits(
+                          state.global_bone_rotations(bone),
+                          global_rotations_before(bone)),
+                  "repeated coverage-empty frames preserve complete visible pose");
+        }
+        check(same_vec3_bits(
+                  state.simulation_position, simulation_position_before) &&
+                  same_quat_bits(
+                      state.simulation_rotation, simulation_rotation_before) &&
+                  same_vec3_bits(
+                      state.simulation_angular_velocity,
+                      simulation_angular_velocity_before),
+              "repeated coverage-empty frames preserve visible root transform");
+        check(same_support_state_bits(state.support, support_before) &&
+                  same_support_observation_bits(
+                      state.support_observation_now, observation_before),
+              "repeated coverage-empty frames preserve support state");
+        check(same_quat_bits(
+                  state.desired_rotation, desired_rotation_before) &&
+                  same_quat_bits(
+                      state.command.intent.desired_heading,
+                      requested_heading_before),
+              "coverage-empty hold preserves independent requested heading");
     }
 }
 
@@ -1215,9 +1422,11 @@ int main()
     test_controller_wires_indexed_match_transition_cost();
     test_controller_validates_ik_geometry_before_window();
     test_controller_publishes_independent_travel_and_heading();
+    test_coverage_empty_path_guards_every_visible_mutation();
     test_failed_model_load_reaches_counted_shared_cleanup();
     test_controller_marks_no_route_cursor_inactive_after_resets();
     test_idle_match_transition_cost_policy();
+    test_coverage_empty_hold_preserves_complete_visible_state();
     test_scene_first_frame_seeds_desired_trajectory();
     test_reset_clears_every_dynamic_subsystem();
     test_failed_reset_preserves_prior_state();

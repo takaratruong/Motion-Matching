@@ -3045,13 +3045,9 @@ int main(void)
                     safe_stop_handoff.applied_velocity.x,
                     safe_stop_handoff.applied_velocity.y,
                     safe_stop_handoff.applied_velocity.z);
-                state.desired_velocity = applied_velocity;
-                state.command.applied_velocity = applied_velocity;
+                g1_controller_state_publish_coverage_empty_hold(
+                    state, applied_velocity);
                 traversal.applied_speed = 0.0f;
-                state.simulation_velocity.x = 0.0f;
-                state.simulation_velocity.z = 0.0f;
-                state.simulation_acceleration.x = 0.0f;
-                state.simulation_acceleration.z = 0.0f;
                 force_search = true;
                 state.search_timer = 0.0f;
                 skip_frame_advance = true;
@@ -3186,7 +3182,12 @@ int main(void)
         }
         
         // Update Simulation
-        
+
+        // An empty indexed-search result is a full accepted-visible-state
+        // hold.  Keep simulation heading, support, adjusted pose, and global
+        // pose bit-identical until a compatible frame is accepted.
+        if (!skip_frame_advance)
+        {
         const vec3 simulation_before = state.simulation_position;
         simulation_positions_update(
             state.simulation_position,
@@ -3421,6 +3422,7 @@ int main(void)
             state.adjusted_bone_positions,
             state.adjusted_bone_rotations,
             db.bone_parents);
+        }
 
         const motion_match_pose_diagnostic rendered_diagnostic =
             g1_pose_diagnostic(

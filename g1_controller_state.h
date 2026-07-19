@@ -154,6 +154,22 @@ static inline void g1_controller_state_seed_first_frame_desired_velocity(
     }
 }
 
+// Publish the coverage-empty safe stop without touching the last accepted
+// visible pose, simulation heading, requested heading, or support state.
+static inline void g1_controller_state_publish_coverage_empty_hold(
+    g1_controller_state& state,
+    vec3 applied_velocity)
+{
+    applied_velocity.x = 0.0f;
+    applied_velocity.z = 0.0f;
+    state.desired_velocity = applied_velocity;
+    state.command.applied_velocity = applied_velocity;
+    state.simulation_velocity.x = 0.0f;
+    state.simulation_velocity.z = 0.0f;
+    state.simulation_acceleration.x = 0.0f;
+    state.simulation_acceleration.z = 0.0f;
+}
+
 template<typename T>
 static inline void g1_swap(array1d<T>& first, array1d<T>& second)
 {
