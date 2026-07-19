@@ -2226,6 +2226,387 @@ static inline vec3 heightfield_normal(
     return vec3(output_x, output_y, output_z);
 }
 
+// Runtime terrain-bank sampling shares the G1HF/v2 scalar contract above.
+// Failures are explicit and transactional: callers may retain their last
+// accepted descriptor/profile instead of silently treating bad input as flat.
+enum terrain_profile_status
+{
+    terrain_profile_ok = 0,
+    terrain_profile_invalid_field,
+    terrain_profile_invalid_centerline,
+    terrain_profile_invalid_heading,
+    terrain_profile_out_of_domain,
+    terrain_profile_invalid_sample,
+};
+
+static inline const char* terrain_profile_status_name(
+    terrain_profile_status status)
+{
+    switch (status) {
+    case terrain_profile_ok: return "ok";
+    case terrain_profile_invalid_field: return "invalid_field";
+    case terrain_profile_invalid_centerline: return "invalid_centerline";
+    case terrain_profile_invalid_heading: return "invalid_heading";
+    case terrain_profile_out_of_domain: return "out_of_domain";
+    case terrain_profile_invalid_sample: return "invalid_sample";
+    }
+    return "unknown";
+}
+
+static const int TERRAIN_DESCRIPTOR_VALUE_COUNT = 12;
+static const int TERRAIN_DESCRIPTOR_CENTER_SAMPLE_COUNT = 8;
+static const int TERRAIN_DESCRIPTOR_CORRIDOR_SAMPLE_COUNT = 4;
+static const double TERRAIN_DESCRIPTOR_SOLE_CORRIDOR_OFFSET_M =
+    0.148506455;
+static const double TERRAIN_PROFILE_HORIZON_M = 1.0;
+static const double TERRAIN_CENTERLINE_HORIZON_TOLERANCE_M =
+    0x1p-23;
+static const int TERRAIN_DENSE_PROFILE_SAMPLE_COUNT = 51;
+
+struct terrain_descriptor_v2
+{
+    float values[TERRAIN_DESCRIPTOR_VALUE_COUNT];
+    vec3 root_point;
+    vec3 center_points[TERRAIN_DESCRIPTOR_CENTER_SAMPLE_COUNT];
+    vec3 left_points[TERRAIN_DESCRIPTOR_CORRIDOR_SAMPLE_COUNT];
+    vec3 right_points[TERRAIN_DESCRIPTOR_CORRIDOR_SAMPLE_COUNT];
+};
+
+struct terrain_profile_normal_v2
+{
+    double x;
+    double y;
+    double z;
+};
+
+struct terrain_dense_profile_v2
+{
+    double distances_m[TERRAIN_DENSE_PROFILE_SAMPLE_COUNT];
+    double heights_m[TERRAIN_DENSE_PROFILE_SAMPLE_COUNT];
+    terrain_profile_normal_v2 normals[TERRAIN_DENSE_PROFILE_SAMPLE_COUNT];
+    vec3 points[TERRAIN_DENSE_PROFILE_SAMPLE_COUNT];
+};
+
+struct terrain_profile_point_xz
+{
+    double x;
+    double z;
+};
+
+static inline bool terrain_profile_centerline_is_valid(
+    const slice1d<vec3> centerline,
+    double& total_length)
+{
+    if (centerline.size < 2 || centerline.data == NULL) return false;
+    total_length = 0.0;
+    for (int i = 0; i < centerline.size; ++i) {
+        const vec3 point = centerline.data[i];
+        if (!terrain_float_is_normal_or_zero_query(point.x) ||
+            !terrain_float_is_normal_or_zero_query(point.z) ||
+            !terrain_float_is_finite(point.y)) {
+            return false;
+        }
+        if (i == 0) continue;
+        const volatile double delta_x =
+            static_cast<double>(point.x) -
+            static_cast<double>(centerline.data[i - 1].x);
+        const volatile double delta_z =
+            static_cast<double>(point.z) -
+            static_cast<double>(centerline.data[i - 1].z);
+        const volatile double square_x = delta_x * delta_x;
+        const volatile double square_z = delta_z * delta_z;
+        const volatile double square_sum = square_x + square_z;
+        if (!terrain_double_is_finite(square_sum)) return false;
+        const volatile double segment_length = sqrt(square_sum);
+        if (!terrain_double_is_finite(segment_length)) return false;
+        const volatile double next_total = total_length + segment_length;
+        if (!terrain_double_is_finite(next_total)) return false;
+        total_length = next_total;
+    }
+    return total_length >=
+        TERRAIN_PROFILE_HORIZON_M -
+        TERRAIN_CENTERLINE_HORIZON_TOLERANCE_M;
+}
+
+static inline bool terrain_profile_point_at_arc(
+    terrain_profile_point_xz& output,
+    const slice1d<vec3> centerline,
+    double distance_m)
+{
+    if (!terrain_double_is_finite(distance_m) || distance_m < 0.0 ||
+        distance_m > TERRAIN_PROFILE_HORIZON_M) {
+        return false;
+    }
+    if (distance_m == 0.0) {
+        output.x = static_cast<double>(centerline.data[0].x);
+        output.z = static_cast<double>(centerline.data[0].z);
+        return true;
+    }
+
+    double remaining = distance_m;
+    for (int i = 1; i < centerline.size; ++i) {
+        const double start_x =
+            static_cast<double>(centerline.data[i - 1].x);
+        const double start_z =
+            static_cast<double>(centerline.data[i - 1].z);
+        const volatile double delta_x =
+            static_cast<double>(centerline.data[i].x) - start_x;
+        const volatile double delta_z =
+            static_cast<double>(centerline.data[i].z) - start_z;
+        const volatile double square_x = delta_x * delta_x;
+        const volatile double square_z = delta_z * delta_z;
+        const volatile double square_sum = square_x + square_z;
+        const volatile double segment_length = sqrt(square_sum);
+        if (!terrain_double_is_finite(segment_length)) return false;
+        if (remaining <= segment_length && segment_length > 0.0) {
+            const volatile double alpha = remaining / segment_length;
+            const volatile double x_term = delta_x * alpha;
+            const volatile double z_term = delta_z * alpha;
+            const volatile double x = start_x + x_term;
+            const volatile double z = start_z + z_term;
+            if (!terrain_double_is_finite(x) ||
+                !terrain_double_is_finite(z)) {
+                return false;
+            }
+            output.x = x;
+            output.z = z;
+            return true;
+        }
+        remaining -= segment_length;
+    }
+
+    // The Python contract accepts a nominal float32 one-metre path that is at
+    // most one binary32 ULP short and clamps that residual to the final point.
+    output.x = static_cast<double>(
+        centerline.data[centerline.size - 1].x);
+    output.z = static_cast<double>(
+        centerline.data[centerline.size - 1].z);
+    return true;
+}
+
+static inline bool terrain_profile_runtime_query(
+    const heightfield& field,
+    double source_x,
+    double source_z,
+    float& height,
+    vec3& point,
+    terrain_profile_normal_v2* normal,
+    terrain_profile_status& status)
+{
+    float x = 0.0f;
+    float z = 0.0f;
+    if (!terrain_v2_runtime_node_from_double(source_x, x) ||
+        !terrain_v2_runtime_node_from_double(source_z, z) ||
+        !terrain_float_is_normal_or_zero_query(x) ||
+        !terrain_float_is_normal_or_zero_query(z)) {
+        status = terrain_profile_invalid_sample;
+        return false;
+    }
+    if ((terrain_float_bits(x) & UINT32_C(0x7fffffff)) == 0) x = 0.0f;
+    if ((terrain_float_bits(z) & UINT32_C(0x7fffffff)) == 0) z = 0.0f;
+
+    // `exterior_height` is deliberately not consulted here. The authoritative
+    // inclusive v2 node rectangle must contain every required probe.
+    heightfield_cell cell = {};
+    if (!terrain_v2_locate_cell(field, x, z, cell)) {
+        status = terrain_profile_out_of_domain;
+        return false;
+    }
+    double h00 = 0.0;
+    double h10 = 0.0;
+    double h01 = 0.0;
+    double h11 = 0.0;
+    if (!terrain_v2_cell_heights(
+            field, cell, h00, h10, h01, h11)) {
+        status = terrain_profile_invalid_sample;
+        return false;
+    }
+    height = terrain_heightfield_sample_v2_prevalidated(field, x, z);
+    if (!terrain_float_is_normal_or_positive_zero(height)) {
+        status = terrain_profile_invalid_sample;
+        return false;
+    }
+    point = vec3(x, height, z);
+    if (normal != NULL) {
+        const vec3 sampled_normal = heightfield_normal(field, x, z);
+        if (!terrain_float_is_normal_or_zero_query(sampled_normal.x) ||
+            !terrain_float_is_normal_or_zero_query(sampled_normal.y) ||
+            !terrain_float_is_normal_or_zero_query(sampled_normal.z)) {
+            status = terrain_profile_invalid_sample;
+            return false;
+        }
+        normal->x = static_cast<double>(sampled_normal.x);
+        normal->y = static_cast<double>(sampled_normal.y);
+        normal->z = static_cast<double>(sampled_normal.z);
+    }
+    return true;
+}
+
+static inline bool terrain_descriptor_sample_v2(
+    terrain_descriptor_v2& output,
+    terrain_profile_status& status,
+    const heightfield& field,
+    const slice1d<vec3> centerline,
+    vec3 independent_heading)
+{
+    if (field.version != 2 || !terrain_heightfield_is_queryable(field)) {
+        status = terrain_profile_invalid_field;
+        return false;
+    }
+    double total_length = 0.0;
+    if (!terrain_profile_centerline_is_valid(centerline, total_length)) {
+        status = terrain_profile_invalid_centerline;
+        return false;
+    }
+    if (!terrain_float_is_normal_or_zero_query(independent_heading.x) ||
+        !terrain_float_is_normal_or_zero_query(independent_heading.z) ||
+        !terrain_float_is_finite(independent_heading.y)) {
+        status = terrain_profile_invalid_heading;
+        return false;
+    }
+    const double heading_x =
+        static_cast<double>(independent_heading.x);
+    const double heading_z =
+        static_cast<double>(independent_heading.z);
+    const volatile double heading_square_x = heading_x * heading_x;
+    const volatile double heading_square_z = heading_z * heading_z;
+    const volatile double heading_square_sum =
+        heading_square_x + heading_square_z;
+    const volatile double heading_length = sqrt(heading_square_sum);
+    if (!terrain_double_is_finite(heading_length) ||
+        heading_length <= 0.0) {
+        status = terrain_profile_invalid_heading;
+        return false;
+    }
+    const volatile double unit_heading_x = heading_x / heading_length;
+    const volatile double unit_heading_z = heading_z / heading_length;
+    if (!terrain_double_is_finite(unit_heading_x) ||
+        !terrain_double_is_finite(unit_heading_z)) {
+        status = terrain_profile_invalid_heading;
+        return false;
+    }
+    const double left_x = -unit_heading_z;
+    const double left_z = unit_heading_x;
+
+    terrain_descriptor_v2 candidate = {};
+    float root_height = 0.0f;
+    if (!terrain_profile_runtime_query(
+            field,
+            static_cast<double>(centerline.data[0].x),
+            static_cast<double>(centerline.data[0].z),
+            root_height, candidate.root_point, NULL, status)) {
+        return false;
+    }
+
+    static const double longitudinal_distances[8] = {
+        0.125, 0.250, 0.375, 0.500,
+        0.625, 0.750, 0.875, 1.000,
+    };
+    for (int i = 0; i < TERRAIN_DESCRIPTOR_CENTER_SAMPLE_COUNT; ++i) {
+        terrain_profile_point_xz query = {};
+        if (!terrain_profile_point_at_arc(
+                query, centerline, longitudinal_distances[i])) {
+            status = terrain_profile_invalid_sample;
+            return false;
+        }
+        float sample_height = 0.0f;
+        if (!terrain_profile_runtime_query(
+                field, query.x, query.z, sample_height,
+                candidate.center_points[i], NULL, status)) {
+            return false;
+        }
+        const volatile double difference =
+            static_cast<double>(sample_height) -
+            static_cast<double>(root_height);
+        if (!terrain_v2_round_output(difference, candidate.values[i])) {
+            status = terrain_profile_invalid_sample;
+            return false;
+        }
+    }
+
+    static const double corridor_distances[4] = {
+        0.25, 0.50, 0.75, 1.00,
+    };
+    for (int i = 0; i < TERRAIN_DESCRIPTOR_CORRIDOR_SAMPLE_COUNT; ++i) {
+        terrain_profile_point_xz center = {};
+        if (!terrain_profile_point_at_arc(
+                center, centerline, corridor_distances[i])) {
+            status = terrain_profile_invalid_sample;
+            return false;
+        }
+        const volatile double offset_x =
+            left_x * TERRAIN_DESCRIPTOR_SOLE_CORRIDOR_OFFSET_M;
+        const volatile double offset_z =
+            left_z * TERRAIN_DESCRIPTOR_SOLE_CORRIDOR_OFFSET_M;
+        const volatile double left_query_x = center.x + offset_x;
+        const volatile double left_query_z = center.z + offset_z;
+        const volatile double right_query_x = center.x - offset_x;
+        const volatile double right_query_z = center.z - offset_z;
+        float left_height = 0.0f;
+        float right_height = 0.0f;
+        if (!terrain_profile_runtime_query(
+                field, left_query_x, left_query_z, left_height,
+                candidate.left_points[i], NULL, status) ||
+            !terrain_profile_runtime_query(
+                field, right_query_x, right_query_z, right_height,
+                candidate.right_points[i], NULL, status)) {
+            return false;
+        }
+        const volatile double difference =
+            static_cast<double>(left_height) -
+            static_cast<double>(right_height);
+        if (!terrain_v2_round_output(
+                difference,
+                candidate.values[TERRAIN_DESCRIPTOR_CENTER_SAMPLE_COUNT + i])) {
+            status = terrain_profile_invalid_sample;
+            return false;
+        }
+    }
+
+    output = candidate;
+    status = terrain_profile_ok;
+    return true;
+}
+
+static inline bool terrain_dense_profile_sample_v2(
+    terrain_dense_profile_v2& output,
+    terrain_profile_status& status,
+    const heightfield& field,
+    const slice1d<vec3> centerline)
+{
+    if (field.version != 2 || !terrain_heightfield_is_queryable(field)) {
+        status = terrain_profile_invalid_field;
+        return false;
+    }
+    double total_length = 0.0;
+    if (!terrain_profile_centerline_is_valid(centerline, total_length)) {
+        status = terrain_profile_invalid_centerline;
+        return false;
+    }
+
+    terrain_dense_profile_v2 candidate = {};
+    for (int i = 0; i < TERRAIN_DENSE_PROFILE_SAMPLE_COUNT; ++i) {
+        const double distance = static_cast<double>(i) /
+            static_cast<double>(TERRAIN_DENSE_PROFILE_SAMPLE_COUNT - 1);
+        terrain_profile_point_xz query = {};
+        if (!terrain_profile_point_at_arc(query, centerline, distance)) {
+            status = terrain_profile_invalid_sample;
+            return false;
+        }
+        float height = 0.0f;
+        if (!terrain_profile_runtime_query(
+                field, query.x, query.z, height, candidate.points[i],
+                &candidate.normals[i], status)) {
+            return false;
+        }
+        candidate.distances_m[i] = distance;
+        candidate.heights_m[i] = static_cast<double>(height);
+    }
+    output = candidate;
+    status = terrain_profile_ok;
+    return true;
+}
+
 static inline bool terrain_centerline_inputs_are_valid(
     vec3 root,
     const slice1d<vec3> trajectory_positions,
