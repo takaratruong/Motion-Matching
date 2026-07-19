@@ -1633,14 +1633,14 @@ class ValidatorTests(unittest.TestCase):
             np.prod(struct.unpack_from("<II", built.terrain_bin, 8))
             for built in _canonical_scene_pack().scenes
         )
-        self.assertEqual(maximum_grid_cells, 306726)
+        self.assertEqual(maximum_grid_cells, 367476)
         self.assertEqual(
             validator_module._MAX_GRID_CELLS, maximum_grid_cells)
         maximum_obj_bytes = max(
             len(built.terrain_obj)
             for built in _canonical_scene_pack().scenes
         )
-        self.assertEqual(maximum_obj_bytes, 21762970)
+        self.assertEqual(maximum_obj_bytes, 26162357)
         self.assertEqual(
             validator_module._MAX_OBJ_BYTES, maximum_obj_bytes)
 
