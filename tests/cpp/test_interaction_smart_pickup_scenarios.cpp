@@ -169,6 +169,12 @@ void test_checked_frame_conversions_and_local_row_factory() {
         (void)checked_pickup_global_to_local_frame(100, 100, 100);
     }, "empty global range");
     require_throws<std::invalid_argument>([] {
+        (void)checked_pickup_global_to_local_frame(100, 180, 100);
+    }, "reversed global range");
+    require_throws<std::invalid_argument>([] {
+        (void)checked_pickup_local_to_global_frame(0, 100, 100);
+    }, "empty local range");
+    require_throws<std::invalid_argument>([] {
         (void)checked_pickup_local_to_global_frame(0, 180, 100);
     }, "reversed local range");
     require_throws<std::invalid_argument>([] {

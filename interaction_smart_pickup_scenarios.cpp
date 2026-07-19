@@ -374,8 +374,6 @@ SmartPickupLifecycleWitness run_smart_pickup_lifecycle(
         witness.target_after = authoritative->handle;
         witness.owner_request = authoritative->owner_request;
         witness.terminal_object_state = authoritative->state;
-    } else {
-        witness.terminal_object_state = output.diagnostics.object_state;
     }
     witness.terminal_state = output.diagnostics.state;
     witness.attached = output.diagnostics.attached;

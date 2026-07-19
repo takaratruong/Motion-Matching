@@ -64,6 +64,36 @@ bool exact_affordances(
 
 }  // namespace
 
+Reason attachment_contact_geometric_reason(
+    const ContactMeasurement& measurement,
+    Hand expected_hand,
+    const Transform& hand_in_object,
+    const AttachmentConfig& config) {
+    if (!measurement.stable_contact_event ||
+        measurement.hand != expected_hand ||
+        !measurement.hand_contact) {
+        return Reason::LostContact;
+    }
+    if (!valid_position(measurement.hand_world.position) ||
+        !finite_nonnegative(measurement.position_error_m) ||
+        measurement.position_error_m > config.maximum_position_error_m) {
+        return Reason::ContactPosition;
+    }
+    if (!valid_rotation(measurement.hand_world.rotation) ||
+        !finite_nonnegative(measurement.orientation_error_radians) ||
+        measurement.orientation_error_radians >
+            config.maximum_orientation_error_radians) {
+        return Reason::ContactOrientation;
+    }
+    if (!measurement.joints_valid) return Reason::JointLimit;
+    if (!measurement.clearance_valid) return Reason::BlockedPath;
+    if (!valid_transform(compose(
+            measurement.hand_world, inverse(hand_in_object)))) {
+        return Reason::ContactOrientation;
+    }
+    return Reason::None;
+}
+
 AttachmentController::AttachmentController(
     TargetRegistry& registry,
     AttachmentConfig config)
@@ -144,34 +174,11 @@ bool AttachmentController::try_contact(
         stored->owner_request != request_.request_id) {
         return fail(Reason::TargetChanged);
     }
-    if (!measurement.stable_contact_event ||
-        measurement.hand != affordance_.hand ||
-        !measurement.hand_contact) {
-        return fail(Reason::LostContact);
-    }
-    if (!valid_position(measurement.hand_world.position) ||
-        !finite_nonnegative(measurement.position_error_m) ||
-        measurement.position_error_m > config_.maximum_position_error_m) {
-        return fail(Reason::ContactPosition);
-    }
-    if (!valid_rotation(measurement.hand_world.rotation) ||
-        !finite_nonnegative(measurement.orientation_error_radians) ||
-        measurement.orientation_error_radians >
-            config_.maximum_orientation_error_radians) {
-        return fail(Reason::ContactOrientation);
-    }
-    if (!measurement.joints_valid) {
-        return fail(Reason::JointLimit);
-    }
-    if (!measurement.clearance_valid) {
-        return fail(Reason::BlockedPath);
-    }
-
+    const Reason contact_reason = attachment_contact_geometric_reason(
+        measurement, affordance_.hand, affordance_.hand_in_object, config_);
+    if (contact_reason != Reason::None) return fail(contact_reason);
     const Transform attached_object_world = compose(
         measurement.hand_world, inverse(affordance_.hand_in_object));
-    if (!valid_transform(attached_object_world)) {
-        return fail(Reason::ContactOrientation);
-    }
     if (!registry_->attach(request_.target, request_.request_id)) {
         return fail(Reason::TargetChanged);
     }

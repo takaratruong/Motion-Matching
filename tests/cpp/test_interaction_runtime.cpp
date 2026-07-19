@@ -4804,6 +4804,107 @@ void test_realized_transition_rejects_contact_that_cannot_attach() {
     assert(realized.frame == selected.candidate.contact_frame);
 }
 
+void test_realized_transition_rejects_invalid_reconstructed_object() {
+    using namespace interaction;
+    RuntimeFixture fixture = make_runtime_fixture();
+    const RuntimeConfig config{};
+    MatchInput matcher_input = match_input_for(fixture);
+    const MatchResult selected = select_whole_clip(
+        matcher_input, config.matcher);
+    assert(selected.accepted);
+
+    MatchCandidate candidate = selected.candidate;
+    const quat quarter_turn = quat_from_angle_axis(
+        0.25F * 3.14159265358979323846F,
+        vec3(0.0F, 0.0F, 1.0F));
+    const WorldPose source_contact_pose = world_pose(pose_at_frame(
+        fixture.database, candidate.contact_frame));
+    const Transform source_contact_hand = {
+        source_contact_pose.positions[kRightHandBone],
+        source_contact_pose.rotations[kRightHandBone],
+    };
+    const vec3 desired_contact(0.0F, 0.0F, 3.0F);
+    candidate.scene_from_source.rotation = quarter_turn;
+    candidate.scene_from_source.position = desired_contact -
+        quat_mul_vec3(
+            quarter_turn, source_contact_hand.position);
+
+    Pose live_entry_pose = fixture.locomotion.pose;
+    const Transform live_root = compose(
+        candidate.scene_from_source,
+        Transform{
+            live_entry_pose.positions[g1_skeleton::Simulation],
+            live_entry_pose.rotations[g1_skeleton::Simulation],
+        });
+    live_entry_pose.positions[g1_skeleton::Simulation] =
+        live_root.position;
+    live_entry_pose.rotations[g1_skeleton::Simulation] =
+        live_root.rotation;
+
+    InteractionTarget target = matcher_input.target;
+    target.table_world = compose(
+        candidate.scene_from_source, target.table_world);
+    const float maximum = std::numeric_limits<float>::max();
+    target.object_world = {
+        vec3(-maximum, -maximum, desired_contact.z), quat()};
+    GraspAffordance affordance = matcher_input.affordance;
+    affordance.hand_in_object = {
+        vec3(maximum, maximum, 0.0F), quarter_turn};
+    for (GraspAffordance& authored : target.affordances) {
+        if (authored.id == affordance.id) authored = affordance;
+    }
+    const Transform target_hand = compose(
+        target.object_world, affordance.hand_in_object);
+    assert(std::isfinite(target_hand.position.x));
+    assert(std::isfinite(target_hand.position.y));
+    assert(std::isfinite(target_hand.position.z));
+    assert(target_hand.position.x == desired_contact.x);
+    assert(target_hand.position.y == desired_contact.y);
+    assert(target_hand.position.z == desired_contact.z);
+    const Transform mapped_source_contact = compose(
+        candidate.scene_from_source, source_contact_hand);
+    assert(length(mapped_source_contact.position - target_hand.position) ==
+           0.0F);
+    assert(quat_angle_between(
+               mapped_source_contact.rotation,
+               target_hand.rotation) == 0.0F);
+    const Transform reconstructed_object = compose(
+        target_hand, inverse(affordance.hand_in_object));
+    assert(!std::isfinite(reconstructed_object.position.x) ||
+           !std::isfinite(reconstructed_object.position.y) ||
+           !std::isfinite(reconstructed_object.position.z));
+
+    const runtime_detail::RealizedPickTransitionEvaluation realized =
+        runtime_detail::evaluate_realized_pick_transition(
+            fixture.database,
+            live_entry_pose,
+            candidate,
+            target,
+            affordance,
+            config.playback,
+            config.ik,
+            config.attachment);
+    assert(!realized.feasible);
+    assert(realized.reason == Reason::ContactOrientation);
+    assert(realized.frame == candidate.contact_frame);
+}
+
+void test_realized_contact_reason_adapter_preserves_matcher_categories() {
+    using namespace interaction;
+    assert(runtime_detail::realized_pick_hard_rejection_reason(
+               Reason::ContactPosition) == Reason::CorrectionLimit);
+    assert(runtime_detail::realized_pick_hard_rejection_reason(
+               Reason::ContactOrientation) == Reason::CorrectionLimit);
+    assert(runtime_detail::realized_pick_hard_rejection_reason(
+               Reason::JointLimit) == Reason::CorrectionLimit);
+    assert(runtime_detail::realized_pick_hard_rejection_reason(
+               Reason::LostContact) == Reason::NoCandidate);
+    assert(runtime_detail::realized_pick_hard_rejection_reason(
+               Reason::BlockedPath) == Reason::BlockedPath);
+    assert(runtime_detail::realized_pick_hard_rejection_reason(
+               Reason::None) == Reason::None);
+}
+
 void test_canonical_updates_reject_invalid_contact_before_commit() {
     using namespace interaction;
     RuntimeFixture fixture = contact_failure_fixture();
@@ -5787,6 +5888,8 @@ int main(int argc, char** argv) {
     test_commit_at_contact_preserves_the_one_shot_crossing();
     test_nonunit_playback_speed_commits_by_source_contact();
     test_realized_transition_rejects_contact_that_cannot_attach();
+    test_realized_transition_rejects_invalid_reconstructed_object();
+    test_realized_contact_reason_adapter_preserves_matcher_categories();
     test_canonical_updates_reject_invalid_contact_before_commit();
     test_canonical_updates_cannot_skip_post_attach_contact_loss();
     test_pickup_success_precedes_later_canonical_contact_loss();

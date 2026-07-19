@@ -37,6 +37,11 @@ _EXPECTED_FEATURES_SHA256 = (
 _EXPECTED_CLIP_COUNT = 2045
 _EXPECTED_FRAME_COUNT = 511250
 _EXPECTED_SCENARIO_REPEAT_COUNT = 10
+_EXPECTED_HEADLESS_CASE_IDS = (
+    "clear_front",
+    "clear_left",
+    "clear_right",
+)
 _TARGET_SEQUENCE_ID = "pickup_table__beer_10__001"
 
 _PREVIEW_AUTHORITY = {
@@ -1060,6 +1065,12 @@ def _preflight_full_pack(full_pack):
 def _validate_headless_oracle_identity(records, manifest):
     _require(type(records) is list, "headless oracle evidence must be an array")
     _require(records, "headless oracle evidence must contain case results")
+    _require(
+        len(records)
+        == len(_EXPECTED_HEADLESS_CASE_IDS)
+        * _EXPECTED_SCENARIO_REPEAT_COUNT,
+        "headless oracle must contain exactly 30 case results",
+    )
     clips, _ = _manifest_clips(manifest)
     expected_slots = {
         provenance["slot_id"]: provenance
@@ -1107,7 +1118,11 @@ def _validate_headless_oracle_identity(records, manifest):
             )
 
         source_ordinal = record["source_clip_ordinal"]
-        _require_int(source_ordinal, f"{label}.source_clip_ordinal")
+        _require_int(
+            source_ordinal,
+            f"{label}.source_clip_ordinal",
+            minimum=0,
+        )
         _require(
             source_ordinal < len(clips),
             f"{label}.source_clip_ordinal is outside manifest",
@@ -1260,6 +1275,11 @@ def _validate_headless_oracle_identity(records, manifest):
     _require(
         case_order == sorted(case_order),
         "headless oracle case results must be in stable case/repeat order",
+    )
+    _require(
+        set(identities_by_case) == set(_EXPECTED_HEADLESS_CASE_IDS),
+        "headless oracle case IDs must be exactly "
+        + ", ".join(_EXPECTED_HEADLESS_CASE_IDS),
     )
     for case_id, identities in identities_by_case.items():
         _require(
@@ -1996,6 +2016,53 @@ class SmartPickupHeadlessOracleIdentityTests(unittest.TestCase):
         extra.insert(_EXPECTED_SCENARIO_REPEAT_COUNT, extra_record)
         with self.assertRaises(AssertionError):
             _validate_headless_oracle_identity(extra, self.manifest)
+
+    def test_rejects_missing_or_unknown_required_case(self):
+        missing_case = [
+            copy.deepcopy(record)
+            for record in self.records
+            if record["case_id"] != "clear_right"
+        ]
+        with self.assertRaises(AssertionError):
+            _validate_headless_oracle_identity(
+                missing_case, self.manifest
+            )
+
+        unknown_case = copy.deepcopy(self.records)
+        for record in unknown_case:
+            if record["case_id"] == "clear_right":
+                record["case_id"] = "unknown_right"
+        with self.assertRaises(AssertionError):
+            _validate_headless_oracle_identity(
+                unknown_case, self.manifest
+            )
+
+    def test_rejects_self_consistent_negative_source_ordinal(self):
+        records = copy.deepcopy(self.records)
+        clip = self.manifest["clips"][-1]
+        for record in records[:_EXPECTED_SCENARIO_REPEAT_COUNT]:
+            old_start = record["source_range_start"]
+            record.update(
+                source_active_hand=clip["active_hand"],
+                source_clip_ordinal=-1,
+                source_range_start=clip["range_start"],
+                source_range_stop=clip["range_stop"],
+                source_entry_global_frame=clip["range_start"]
+                + record["source_entry_global_frame"]
+                - old_start,
+                source_contact_global_frame=clip["range_start"]
+                + record["source_contact_global_frame"]
+                - old_start,
+                source_lift_global_frame=clip["range_start"]
+                + record["source_lift_global_frame"]
+                - old_start,
+                source_hold_global_frame=clip["range_start"]
+                + record["source_hold_global_frame"]
+                - old_start,
+            )
+        with self.assertRaises(AssertionError):
+            _validate_headless_oracle_identity(records, self.manifest)
+
 
 class SmartPickupContractTests(unittest.TestCase):
     def assert_contract_rejected(

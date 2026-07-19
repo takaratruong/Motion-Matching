@@ -1008,42 +1008,22 @@ ContactMeasurement contact_measurement(
     return measurement;
 }
 
-Reason realized_contact_reason(
-    const ContactMeasurement& measurement,
-    Hand expected_hand,
-    const AttachmentConfig& config) {
-    if (!measurement.stable_contact_event ||
-        measurement.hand != expected_hand ||
-        !measurement.hand_contact) {
-        return Reason::LostContact;
-    }
-    if (!pick_finite(measurement.hand_world.position) ||
-        !finite_nonnegative(measurement.position_error_m) ||
-        measurement.position_error_m > config.maximum_position_error_m) {
-        return Reason::ContactPosition;
-    }
-    const quat rotation = measurement.hand_world.rotation;
-    const double squared_rotation_length =
-        static_cast<double>(rotation.w) * rotation.w +
-        static_cast<double>(rotation.x) * rotation.x +
-        static_cast<double>(rotation.y) * rotation.y +
-        static_cast<double>(rotation.z) * rotation.z;
-    if (!pick_finite(rotation) ||
-        !(squared_rotation_length > 0.0) ||
-        !std::isfinite(squared_rotation_length) ||
-        !finite_nonnegative(measurement.orientation_error_radians) ||
-        measurement.orientation_error_radians >
-            config.maximum_orientation_error_radians) {
-        return Reason::ContactOrientation;
-    }
-    if (!measurement.joints_valid) return Reason::JointLimit;
-    if (!measurement.clearance_valid) return Reason::BlockedPath;
-    return Reason::None;
-}
-
 }  // namespace
 
 namespace runtime_detail {
+
+Reason realized_pick_hard_rejection_reason(Reason reason) {
+    switch (reason) {
+    case Reason::ContactPosition:
+    case Reason::ContactOrientation:
+    case Reason::JointLimit:
+        return Reason::CorrectionLimit;
+    case Reason::LostContact:
+        return Reason::NoCandidate;
+    default:
+        return reason;
+    }
+}
 
 RealizedPickTransitionEvaluation evaluate_realized_pick_transition(
     const Database& database,
@@ -1132,8 +1112,11 @@ RealizedPickTransitionEvaluation evaluate_realized_pick_transition(
         true,
         contact_pose.joints_valid,
         path_clear);
-    const Reason contact_reason = realized_contact_reason(
-        contact, affordance.hand, attachment_config);
+    const Reason contact_reason = attachment_contact_geometric_reason(
+        contact,
+        affordance.hand,
+        affordance.hand_in_object,
+        attachment_config);
     if (contact_reason != Reason::None) {
         return {false, contact_reason, candidate.contact_frame};
     }
@@ -1387,26 +1370,16 @@ InteractionRuntime::evaluate_pick_entries_realized(
         input,
         config_.matcher,
         [this, &input](const MatchCandidate& candidate) {
-            const Reason reason = runtime_detail::
-                evaluate_realized_pick_transition(
-                *input.database,
-                input.locomotion.pose,
-                candidate,
-                input.target,
-                input.affordance,
-                config_.playback,
-                config_.ik,
-                config_.attachment).reason;
-            switch (reason) {
-            case Reason::ContactPosition:
-            case Reason::ContactOrientation:
-            case Reason::JointLimit:
-                return Reason::CorrectionLimit;
-            case Reason::LostContact:
-                return Reason::NoCandidate;
-            default:
-                return reason;
-            }
+            return runtime_detail::realized_pick_hard_rejection_reason(
+                runtime_detail::evaluate_realized_pick_transition(
+                    *input.database,
+                    input.locomotion.pose,
+                    candidate,
+                    input.target,
+                    input.affordance,
+                    config_.playback,
+                    config_.ik,
+                    config_.attachment).reason);
         });
 }
 

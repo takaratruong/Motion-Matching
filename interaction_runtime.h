@@ -157,6 +157,8 @@ struct RealizedPickTransitionEvaluation {
     int32_t frame = -1;
 };
 
+Reason realized_pick_hard_rejection_reason(Reason reason);
+
 RealizedPickTransitionEvaluation evaluate_realized_pick_transition(
     const Database& database,
     const Pose& live_entry_pose,

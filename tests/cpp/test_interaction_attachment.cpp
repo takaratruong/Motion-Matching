@@ -96,7 +96,9 @@ struct AttachmentFixture {
     interaction::GraspAffordance affordance;
 };
 
-AttachmentFixture make_fixture(uint32_t generation = 4U) {
+AttachmentFixture make_fixture(
+    uint32_t generation = 4U,
+    bool invalid_reconstructed_object = false) {
     using namespace interaction;
 
     AttachmentFixture fixture{};
@@ -122,6 +124,15 @@ AttachmentFixture make_fixture(uint32_t generation = 4U) {
         vec3(0.025F, 0.085F, -0.015F),
         quat_from_angle_axis(-0.22F, vec3(1.0F, 0.0F, 0.0F)),
     };
+    if (invalid_reconstructed_object) {
+        const float maximum = std::numeric_limits<float>::max();
+        target.object_world.position.x = -maximum;
+        target.object_world.rotation = quat();
+        affordance.hand_in_object.position.x = maximum;
+        affordance.hand_in_object.rotation = quat_from_angle_axis(
+            0.5F * 3.14159265358979323846F,
+            vec3(0.0F, 0.0F, 1.0F));
+    }
     affordance.approach_direction_object = vec3(0.0F, 0.0F, 1.0F);
     affordance.clearance_radius = 0.04F;
     target.affordances = {affordance};
@@ -300,6 +311,13 @@ void test_frozen_public_contract_and_defaults() {
         AttachmentController, TargetRegistry&>);
     static_assert(std::is_constructible_v<
         AttachmentController, TargetRegistry&, AttachmentConfig>);
+    static_assert(std::is_same_v<
+        decltype(&attachment_contact_geometric_reason),
+        Reason (*)(
+            const ContactMeasurement&,
+            Hand,
+            const Transform&,
+            const AttachmentConfig&)>);
     static_assert(std::is_same_v<
         decltype(&AttachmentController::begin),
         bool (AttachmentController::*)(
@@ -1287,6 +1305,46 @@ void test_overflowing_derived_pose_does_not_attach_or_mutate() {
     assert(target->owner_request == fixture.request.request_id);
 }
 
+void test_shared_contact_gate_rejects_invalid_reconstructed_object() {
+    using namespace interaction;
+
+    AttachmentFixture fixture = make_fixture(4U, true);
+    AttachmentController attachment(fixture.registry);
+    assert(attachment.begin(
+        fixture.target,
+        fixture.request,
+        fixture.affordance,
+        fixture.target.object_world.position.y));
+    const Transform original = attachment.object_world();
+    const ContactMeasurement contact = valid_measurement(fixture);
+    assert(std::isfinite(contact.hand_world.position.x));
+    assert(std::isfinite(contact.hand_world.position.y));
+    assert(std::isfinite(contact.hand_world.position.z));
+    assert(contact.stable_contact_event);
+    assert(contact.hand == fixture.affordance.hand);
+    assert(contact.hand_contact);
+    assert(contact.position_error_m == 0.0F);
+    assert(contact.orientation_error_radians == 0.0F);
+    assert(contact.joints_valid);
+    assert(contact.clearance_valid);
+    assert(attachment_contact_geometric_reason(
+               contact,
+               fixture.affordance.hand,
+               fixture.affordance.hand_in_object,
+               AttachmentConfig{}) == Reason::ContactOrientation);
+
+    assert(!attachment.try_contact(contact));
+    assert(attachment.state() == ObjectState::Targeted);
+    assert(attachment.result() == ResultCode::Failed);
+    assert(attachment.reason() == Reason::ContactOrientation);
+    assert(exact(attachment.object_world(), original));
+    const InteractionTarget* stored = fixture.registry.find(
+        fixture.request.target);
+    assert(stored != nullptr);
+    assert(stored->state == ObjectState::Targeted);
+    assert(stored->owner_request == fixture.request.request_id);
+}
+
 void test_update_rejects_invalid_dt_without_mutating_state() {
     using namespace interaction;
 
@@ -1347,5 +1405,6 @@ int main() {
     test_invalid_configuration_and_nonfinite_prelift_are_rejected();
     test_invalid_contact_scalars_and_transforms_do_not_attach();
     test_overflowing_derived_pose_does_not_attach_or_mutate();
+    test_shared_contact_gate_rejects_invalid_reconstructed_object();
     test_update_rejects_invalid_dt_without_mutating_state();
 }

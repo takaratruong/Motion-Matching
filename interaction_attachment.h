@@ -36,6 +36,12 @@ struct ContactMeasurement {
     bool clearance_valid = false;
 };
 
+Reason attachment_contact_geometric_reason(
+    const ContactMeasurement& measurement,
+    Hand expected_hand,
+    const Transform& hand_in_object,
+    const AttachmentConfig& config);
+
 class AttachmentController {
 public:
     AttachmentController(
