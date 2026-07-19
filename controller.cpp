@@ -4565,6 +4565,7 @@ int main(void)
         // Get gamepad stick states
         vec3 gamepadstick_left = gamepad_get_stick(GAMEPAD_STICK_LEFT);
         vec3 gamepadstick_right = gamepad_get_stick(GAMEPAD_STICK_RIGHT);
+        const vec3 raw_gamepadstick_left = gamepadstick_left;
         const vec3 raw_gamepadstick_right = gamepadstick_right;
         const bool raw_desired_strafe = desired_strafe_update();
 
@@ -4581,9 +4582,23 @@ int main(void)
         const bool manual_smart_pickup_override_pressed =
             IsKeyPressed(KEY_W) || IsKeyPressed(KEY_A) ||
             IsKeyPressed(KEY_S) || IsKeyPressed(KEY_D);
+        const interaction::RuntimeOutput& cached_interaction_output =
+            interaction_scheduler.cached_output();
         const interaction::RuntimeState cached_interaction_state =
-            interaction_scheduler.cached_output().diagnostics.state;
-        if (interaction_scheduler.cached_output().suppress_steering)
+            cached_interaction_output.diagnostics.state;
+        const bool committed_pickup_manual_override =
+            manual_smart_pickup_override_pressed &&
+            !cached_interaction_output.diagnostics.attached &&
+            (cached_interaction_state == interaction::RuntimeState::Align ||
+             cached_interaction_state ==
+                 interaction::RuntimeState::PickupReplay);
+        if (committed_pickup_manual_override)
+        {
+            interaction_edges.cancel_pressed = true;
+            gamepadstick_left = raw_gamepadstick_left;
+        }
+        if (cached_interaction_output.suppress_steering &&
+            !committed_pickup_manual_override)
         {
             gamepadstick_left = vec3();
         }
@@ -6492,6 +6507,72 @@ int main(void)
                 242,
                 18,
                 ORANGE);
+        }
+        else if (!interaction_output.diagnostics.attached &&
+                 (interaction_output.diagnostics.state ==
+                      interaction::RuntimeState::Align ||
+                  interaction_output.diagnostics.state ==
+                      interaction::RuntimeState::PickupReplay))
+        {
+            DrawText(
+                "SMART PICKUP REACH - WASD or X cancels",
+                340,
+                242,
+                18,
+                ORANGE);
+        }
+        else if (interaction_output.diagnostics.attached &&
+                 (interaction_output.diagnostics.state ==
+                      interaction::RuntimeState::PickupReplay ||
+                  interaction_output.diagnostics.state ==
+                      interaction::RuntimeState::Hold))
+        {
+            DrawText(
+                "SMART PICKUP ATTACHED - finishing recorded lift",
+                340,
+                242,
+                18,
+                GOLD);
+        }
+        else if (interaction_output.diagnostics.state ==
+                 interaction::RuntimeState::Carry)
+        {
+            DrawText(
+                "CARRY - WASD moves, F places, R resets",
+                340,
+                242,
+                18,
+                DARKGREEN);
+        }
+        else if (manual_pick_diagnostics.state ==
+                 interaction::PickAssistState::Failed)
+        {
+            DrawText(
+                TextFormat(
+                    "PICKUP FAILED: %s - reposition and press F",
+                    interaction::pick_assist_reason_name(
+                        manual_pick_diagnostics.reason)),
+                340,
+                242,
+                18,
+                RED);
+        }
+        else if (interaction_output.diagnostics.state ==
+                     interaction::RuntimeState::Locomotion &&
+                 (interaction_output.diagnostics.result ==
+                      interaction::ResultCode::Rejected ||
+                  interaction_output.diagnostics.result ==
+                      interaction::ResultCode::Failed))
+        {
+            DrawText(
+                TextFormat(
+                    "PICKUP FAILED: %s - reposition and press F",
+                    interaction::debug_draw::reason_name(
+                        interaction_output.diagnostics.reason)),
+                340,
+                242,
+                18,
+                RED);
         }
         const int manual_pick_selected_slot =
             manual_pick_diagnostics.slot_selection.selected_index.has_value()

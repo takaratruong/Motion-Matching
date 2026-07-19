@@ -346,7 +346,7 @@ inline void draw_interaction_text(
     int x,
     int y) {
     DrawText(
-        "Interaction: F smart pickup/place  WASD/X cancel auto  R reset",
+        "Interaction: F smart pickup/place  WASD/X cancel before attach  R reset",
         x,
         y,
         18,

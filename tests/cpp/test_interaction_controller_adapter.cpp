@@ -5992,7 +5992,7 @@ void test_debug_draw_uses_real_correction_geometry_and_complete_text() {
     assert(debug.find("actual fit=%d gap=%.3f low/high=%.3f/%.3f") !=
            std::string::npos);
     assert(debug.find(
-               "Interaction: F smart pickup/place  WASD/X cancel auto  R reset") !=
+               "Interaction: F smart pickup/place  WASD/X cancel before attach  R reset") !=
            std::string::npos);
 }
 
@@ -6024,18 +6024,26 @@ void test_controller_smart_pickup_two_phase_production_seam() {
             "interaction::LocomotionSnapshot live_flat_snapshot") == 1U,
         "controller has more than one post-step live-flat snapshot");
 
+    const size_t input_poll_begin = controller.find(
+        "        // Get gamepad stick states");
     const size_t press_edges_begin = controller.find(
         "        // Press edges and runtime updates share the fixed 25 Hz controller");
     const size_t cached_runtime_state = controller.find(
         "        const interaction::RuntimeState cached_interaction_state =",
         press_edges_begin);
+    const size_t input_routing_end = controller.find(
+        "        if (pickup_autodemo_enabled)", press_edges_begin);
     require(
-        press_edges_begin != std::string::npos &&
+        input_poll_begin != std::string::npos &&
+            press_edges_begin != std::string::npos &&
             cached_runtime_state != std::string::npos &&
-            press_edges_begin < cached_runtime_state,
+            input_routing_end != std::string::npos &&
+            input_poll_begin < press_edges_begin &&
+            press_edges_begin < cached_runtime_state &&
+            cached_runtime_state < input_routing_end,
         "controller lost the bounded 25 Hz press-edge seam");
     const std::string press_edges = controller.substr(
-        press_edges_begin, cached_runtime_state - press_edges_begin);
+        input_poll_begin, input_routing_end - input_poll_begin);
     const std::string compact_press_edges =
         without_ascii_whitespace(press_edges);
     require(
@@ -6048,6 +6056,47 @@ void test_controller_smart_pickup_two_phase_production_seam() {
                 "IsKeyPressed(KEY_S)||IsKeyPressed(KEY_D);") !=
                 std::string::npos,
         "manual Smart Pickup override is not one bounded WASD press edge");
+    require(
+        compact_press_edges.find(
+            "constvec3raw_gamepadstick_left=gamepadstick_left;") !=
+                std::string::npos &&
+            compact_press_edges.find(
+                "constinteraction::RuntimeOutput&cached_interaction_output="
+                "interaction_scheduler.cached_output();") !=
+                std::string::npos &&
+            compact_press_edges.find(
+                "constinteraction::RuntimeStatecached_interaction_state="
+                "cached_interaction_output.diagnostics.state;") !=
+                std::string::npos,
+        "controller does not preserve raw movement and bind one cached output");
+    const std::string committed_override_definition =
+        "constboolcommitted_pickup_manual_override="
+        "manual_smart_pickup_override_pressed&&"
+        "!cached_interaction_output.diagnostics.attached&&"
+        "(cached_interaction_state==interaction::RuntimeState::Align||"
+        "cached_interaction_state==interaction::RuntimeState::PickupReplay);";
+    const std::string committed_override_branch =
+        "if(committed_pickup_manual_override){"
+        "interaction_edges.cancel_pressed=true;"
+        "gamepadstick_left=raw_gamepadstick_left;}";
+    const std::string steering_suppression_branch =
+        "if(cached_interaction_output.suppress_steering&&"
+        "!committed_pickup_manual_override){gamepadstick_left=vec3();}";
+    const size_t committed_override_definition_position =
+        compact_press_edges.find(committed_override_definition);
+    const size_t committed_override_branch_position =
+        compact_press_edges.find(committed_override_branch);
+    const size_t steering_suppression_position =
+        compact_press_edges.find(steering_suppression_branch);
+    require(
+        committed_override_definition_position != std::string::npos &&
+            committed_override_branch_position != std::string::npos &&
+            steering_suppression_position != std::string::npos &&
+            committed_override_definition_position <
+                committed_override_branch_position &&
+            committed_override_branch_position < steering_suppression_position,
+        "fresh committed pickup movement is not routed to cancel with raw "
+        "steering restored before suppression");
 
     const size_t manual_input_begin = controller.find(
         "        // Manual pick-assist input begins.");
@@ -6445,10 +6494,11 @@ void test_controller_smart_pickup_two_phase_production_seam() {
         manual_diagnostics_begin != std::string::npos &&
             manual_diagnostics_end != std::string::npos,
         "controller lost the bounded manual Smart Pickup diagnostics draw");
-    const std::string compact_manual_diagnostics = without_ascii_whitespace(
-        controller.substr(
-            manual_diagnostics_begin,
-            manual_diagnostics_end - manual_diagnostics_begin));
+    const std::string manual_diagnostics = controller.substr(
+        manual_diagnostics_begin,
+        manual_diagnostics_end - manual_diagnostics_begin);
+    const std::string compact_manual_diagnostics =
+        without_ascii_whitespace(manual_diagnostics);
     require(
         compact_manual_diagnostics.find(
             "if(manual_pick_diagnostics.state=="
@@ -6462,6 +6512,47 @@ void test_controller_smart_pickup_two_phase_production_seam() {
             "DrawText(\"SMARTPICKUPAUTO-WASDorXcancels\","
             "340,242,18,ORANGE);}") != std::string::npos,
         "active Smart Pickup ownership copy is missing or not state-bounded");
+    for (const std::string& phase_copy : {
+             std::string("SMART PICKUP REACH - WASD or X cancels"),
+             std::string("SMART PICKUP ATTACHED - finishing recorded lift"),
+             std::string("CARRY - WASD moves, F places, R resets"),
+             std::string("PICKUP FAILED: %s - reposition and press F")}) {
+        require(
+            manual_diagnostics.find(phase_copy) != std::string::npos,
+            "Smart Pickup diagnostics lost phase-specific or failure copy");
+    }
+    require(
+        compact_manual_diagnostics.find(
+            "interaction_output.diagnostics.attached") !=
+                std::string::npos &&
+            compact_manual_diagnostics.find(
+                "interaction::RuntimeState::Align") != std::string::npos &&
+            compact_manual_diagnostics.find(
+                "interaction::RuntimeState::PickupReplay") !=
+                std::string::npos &&
+            compact_manual_diagnostics.find(
+                "interaction::RuntimeState::Hold") != std::string::npos &&
+            compact_manual_diagnostics.find(
+                "interaction::RuntimeState::Carry") != std::string::npos &&
+            compact_manual_diagnostics.find(
+                "interaction::RuntimeState::Locomotion") !=
+                std::string::npos &&
+            compact_manual_diagnostics.find(
+                "interaction::ResultCode::Rejected") != std::string::npos &&
+            compact_manual_diagnostics.find(
+                "interaction::ResultCode::Failed") != std::string::npos &&
+            compact_manual_diagnostics.find(
+                "interaction::pick_assist_reason_name("
+                "manual_pick_diagnostics.reason)") != std::string::npos &&
+            compact_manual_diagnostics.find(
+                "interaction::debug_draw::reason_name("
+                "interaction_output.diagnostics.reason)") !=
+                std::string::npos &&
+            compact_manual_diagnostics.find(
+                "interaction::PickAssistState::Submitted") ==
+                std::string::npos,
+        "Smart Pickup banner selection is not driven by truthful runtime "
+        "attachment/result state");
 
     const size_t placement_scheduler = adapter.find(
         "const PlaceTargetResolver& place_target_resolver");

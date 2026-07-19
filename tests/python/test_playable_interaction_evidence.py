@@ -3032,7 +3032,7 @@ class Task12PolicyTests(unittest.TestCase):
         self.assertNotIn("interaction_registry.replace_pose(", controller)
         self.assertIn("interaction_registry.find_by_id(", controller)
         self.assertIn(
-            "Interaction: F smart pickup/place  WASD/X cancel auto  R reset",
+            "Interaction: F smart pickup/place  WASD/X cancel before attach  R reset",
             Path("interaction_debug_draw.h").read_text(encoding="utf-8"),
         )
 
@@ -4056,6 +4056,36 @@ class Task12PolicyTests(unittest.TestCase):
 
     def test_manual_pick_cancel_releases_same_tick_and_carry_controls_pass_through(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")
+        input_routing = self._source_between(
+            controller,
+            "        // Get gamepad stick states",
+            "        if (pickup_autodemo_enabled)",
+        )
+        normalized_routing = " ".join(input_routing.split())
+        for required in (
+            "const vec3 raw_gamepadstick_left = gamepadstick_left;",
+            "const interaction::RuntimeOutput& cached_interaction_output = interaction_scheduler.cached_output();",
+            "const interaction::RuntimeState cached_interaction_state = cached_interaction_output.diagnostics.state;",
+            "const bool committed_pickup_manual_override = manual_smart_pickup_override_pressed && !cached_interaction_output.diagnostics.attached && (cached_interaction_state == interaction::RuntimeState::Align || cached_interaction_state == interaction::RuntimeState::PickupReplay);",
+            "if (committed_pickup_manual_override) { interaction_edges.cancel_pressed = true; gamepadstick_left = raw_gamepadstick_left; }",
+            "if (cached_interaction_output.suppress_steering && !committed_pickup_manual_override) { gamepadstick_left = vec3(); }",
+        ):
+            with self.subTest(routing_required=required):
+                self.assertIn(required, normalized_routing)
+        committed_cancel = normalized_routing.find(
+            "if (committed_pickup_manual_override)"
+        )
+        cached_suppression = normalized_routing.find(
+            "if (cached_interaction_output.suppress_steering &&"
+        )
+        self.assertTrue(
+            committed_cancel >= 0
+            and cached_suppression >= 0
+            and committed_cancel < cached_suppression,
+            "movement cancellation must restore the raw stick before the "
+            "cached suppression branch",
+        )
+
         manual_input = self._source_between(
             controller,
             "        // Manual pick-assist input begins.",
@@ -4160,6 +4190,22 @@ class Task12PolicyTests(unittest.TestCase):
             "        // Manual pick-assist diagnostics ends.",
         )
         for required in (
+            '"SMART PICKUP REACH - WASD or X cancels"',
+            '"SMART PICKUP ATTACHED - finishing recorded lift"',
+            '"CARRY - WASD moves, F places, R resets"',
+            '"PICKUP FAILED: %s - reposition and press F"',
+            "interaction_output.diagnostics.attached",
+            "interaction::RuntimeState::Align",
+            "interaction::RuntimeState::PickupReplay",
+            "interaction::RuntimeState::Hold",
+            "interaction::RuntimeState::Carry",
+            "interaction::RuntimeState::Locomotion",
+            "interaction::ResultCode::Rejected",
+            "interaction::ResultCode::Failed",
+            "interaction::pick_assist_reason_name(",
+            "manual_pick_diagnostics.reason",
+            "interaction::debug_draw::reason_name(",
+            "interaction_output.diagnostics.reason",
             '"assist=%s reason=%s slot=%d settle=%u/%u route=%.3fm "',
             "interaction::pick_assist_state_name(",
             "interaction::pick_assist_reason_name(",
@@ -4189,6 +4235,11 @@ class Task12PolicyTests(unittest.TestCase):
         ):
             with self.subTest(required=required):
                 self.assertIn(required, diagnostics)
+        self.assertNotIn(
+            "interaction::PickAssistState::Submitted",
+            diagnostics,
+            "submission alone must not render pickup-success state",
+        )
         self.assertRegex(
             diagnostics,
             r"manual_pick_diagnostics\.final_preview\s*"
