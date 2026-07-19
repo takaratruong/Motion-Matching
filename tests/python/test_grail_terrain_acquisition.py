@@ -25,6 +25,9 @@ OBJECTS_INVENTORY_SHA256 = (
 OBJECT_USD_INVENTORY_SHA256 = (
     "6bc4a91cee21aa9a98214d557e27c1b86c556f585fe9673f222dd66eae767846"
 )
+SLOPE_BASENAME_SHA256 = (
+    "73cd3ec78289aa70caad2cd2df05ba0cea0301478c7654409d2c6557306b4b57"
+)
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 CHECKED_MANIFEST = REPOSITORY_ROOT / "resources" / "grail_terrain_inputs.json"
 
@@ -37,7 +40,9 @@ def _entry(path, payload):
     }
 
 
-def _small_manifest(entries, *, allowed_globs=None, partitions=None):
+def _small_manifest(
+        entries, *, allowed_globs=None, partitions=None,
+        source_coverage=None):
     entries = sorted(entries, key=lambda value: value["path"])
     if allowed_globs is None:
         allowed_globs = ["data/stair_p1/robot/*.pkl"]
@@ -66,6 +71,7 @@ def _small_manifest(entries, *, allowed_globs=None, partitions=None):
                     acquisition.canonical_inventory_sha256(entries),
             }
         },
+        "source_coverage": {} if source_coverage is None else source_coverage,
     }
 
 
@@ -81,7 +87,7 @@ def _modality(entries, allowed_globs, partitions):
     }
 
 
-def _manifest(modalities):
+def _manifest(modalities, source_coverage=None):
     return {
         "schema": acquisition.MANIFEST_SCHEMA,
         "repository": {
@@ -90,6 +96,31 @@ def _manifest(modalities):
             "type": "dataset",
         },
         "modalities": modalities,
+        "source_coverage": {} if source_coverage is None else source_coverage,
+    }
+
+
+def _slope_source_coverage(basenames):
+    return {
+        "slope": {
+            "canonical_basename_sha256":
+                acquisition.canonical_basenames_sha256(basenames),
+            "file_count": len(basenames),
+            "modalities": {
+                "object_usd": {
+                    "path_prefix": "data/slope/object_usd/",
+                    "suffix": ".usd",
+                },
+                "objects": {
+                    "path_prefix": "data/slope/objects/",
+                    "suffix": ".pkl",
+                },
+                "robot": {
+                    "path_prefix": "data/slope/robot/",
+                    "suffix": ".pkl",
+                },
+            },
+        }
     }
 
 
@@ -227,6 +258,34 @@ class GrailTerrainAcquisitionTests(unittest.TestCase):
                     for pattern in config["allowed_globs"]
                 ))
 
+    def test_checked_manifest_locks_slope_robot_source_coverage_separately(self):
+        manifest = acquisition.load_manifest(CHECKED_MANIFEST)
+        self.assertEqual(manifest["source_coverage"], {
+            "slope": {
+                "canonical_basename_sha256": SLOPE_BASENAME_SHA256,
+                "file_count": 1_880,
+                "modalities": {
+                    "object_usd": {
+                        "path_prefix": "data/slope/object_usd/",
+                        "suffix": ".usd",
+                    },
+                    "objects": {
+                        "path_prefix": "data/slope/objects/",
+                        "suffix": ".pkl",
+                    },
+                    "robot": {
+                        "path_prefix": "data/slope/robot/",
+                        "suffix": ".pkl",
+                    },
+                },
+            },
+        })
+        robot = manifest["modalities"]["robot"]
+        self.assertEqual(robot["file_count"], 12_188)
+        self.assertEqual(robot["byte_count"], 2_421_026_260)
+        self.assertEqual(
+            robot["canonical_inventory_sha256"], ROBOT_INVENTORY_SHA256)
+
     def test_inventory_requires_exact_object_geometry_basename_coverage(self):
         robot = _entry("data/stair_p1/robot/a.pkl", b"robot")
         objects = _entry("data/stair_p1/objects/b.pkl", b"objects")
@@ -290,6 +349,49 @@ class GrailTerrainAcquisitionTests(unittest.TestCase):
         self.assertEqual(
             acquisition.canonical_inventory_sha256(list(reversed(entries))),
             hashlib.sha256(expected).hexdigest())
+
+    def test_basename_digest_has_exact_sorted_canonical_encoding(self):
+        expected = '[\n  "a",\n  "z"\n]\n'.encode("utf-8")
+        self.assertEqual(
+            acquisition.canonical_basenames_bytes(["z", "a"]), expected)
+        self.assertEqual(
+            acquisition.canonical_basenames_sha256(["z", "a"]),
+            hashlib.sha256(expected).hexdigest(),
+        )
+        for invalid in (["a", "a"], ["../a"], ["a.pkl"], [1]):
+            with self.subTest(invalid=invalid), self.assertRaises(
+                    (TypeError, ValueError)):
+                acquisition.canonical_basenames_sha256(invalid)
+
+    def test_inventory_requires_locked_slope_source_basename_digest(self):
+        objects = _entry("data/slope/objects/b.pkl", b"objects")
+        geometry = _entry("data/slope/object_usd/b.usd", b"usd")
+        modalities = {
+            "objects": _modality([objects], ["data/slope/objects/*.pkl"], {
+                "slope": {
+                    "path_prefix": "data/slope/objects/",
+                    "file_count": 1,
+                    "byte_count": objects["bytes"],
+                },
+            }),
+            "object_usd": _modality(
+                [geometry], ["data/slope/object_usd/*.usd"], {
+                    "slope": {
+                        "path_prefix": "data/slope/object_usd/",
+                        "file_count": 1,
+                        "byte_count": geometry["bytes"],
+                    },
+                }),
+        }
+        manifest = _manifest(
+            modalities, source_coverage=_slope_source_coverage(["a"]))
+        with self.assertRaisesRegex(ValueError, "source coverage"):
+            acquisition.validate_inventory_document(
+                manifest,
+                _inventory(
+                    [objects, geometry], ("object_usd", "objects")),
+                ("object_usd", "objects"),
+            )
 
     def test_inventory_rejects_duplicates_traversal_and_unexpected_modality(self):
         good = _entry("data/stair_p1/robot/good.pkl", b"good")
@@ -377,6 +479,68 @@ class GrailTerrainAcquisitionTests(unittest.TestCase):
             unexpected.write_bytes(b"unexpected")
             with self.assertRaisesRegex(ValueError, "unexpected local"):
                 acquisition.verify_local(manifest, inventory, root, ("robot",))
+
+    def test_offline_verifier_enforces_external_slope_robot_basename_coverage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            object_path = root / "data/slope/objects/a.pkl"
+            geometry_path = root / "data/slope/object_usd/a.usd"
+            robot_path = root / "data/slope/robot/a.pkl"
+            object_path.parent.mkdir(parents=True)
+            geometry_path.parent.mkdir(parents=True)
+            robot_path.parent.mkdir(parents=True)
+            object_path.write_bytes(b"object")
+            self._write_usd(geometry_path)
+            robot_path.write_bytes(b"robot")
+            objects = _entry(
+                "data/slope/objects/a.pkl", object_path.read_bytes())
+            geometry = _entry(
+                "data/slope/object_usd/a.usd", geometry_path.read_bytes())
+            modalities = {
+                "objects": _modality(
+                    [objects], ["data/slope/objects/*.pkl"], {
+                        "slope": {
+                            "path_prefix": "data/slope/objects/",
+                            "file_count": 1,
+                            "byte_count": objects["bytes"],
+                        },
+                    }),
+                "object_usd": _modality(
+                    [geometry], ["data/slope/object_usd/*.usd"], {
+                        "slope": {
+                            "path_prefix": "data/slope/object_usd/",
+                            "file_count": 1,
+                            "byte_count": geometry["bytes"],
+                        },
+                    }),
+            }
+            manifest = _manifest(
+                modalities, source_coverage=_slope_source_coverage(["a"]))
+            inventory = _inventory(
+                [objects, geometry], ("object_usd", "objects"))
+
+            summary = acquisition.verify_local(
+                manifest, inventory, root, ("object_usd", "objects"))
+            self.assertEqual(summary["file_count"], 2)
+
+            robot_path.unlink()
+            with self.assertRaisesRegex(ValueError, "source coverage"):
+                acquisition.verify_local(
+                    manifest, inventory, root, ("object_usd", "objects"))
+            robot_path.write_bytes(b"robot")
+
+            extra = robot_path.with_name("b.pkl")
+            extra.write_bytes(b"extra")
+            with self.assertRaisesRegex(ValueError, "source coverage"):
+                acquisition.verify_local(
+                    manifest, inventory, root, ("object_usd", "objects"))
+            extra.unlink()
+
+            renamed = robot_path.with_name("renamed.pkl")
+            robot_path.rename(renamed)
+            with self.assertRaisesRegex(ValueError, "source coverage"):
+                acquisition.verify_local(
+                    manifest, inventory, root, ("object_usd", "objects"))
 
     def test_offline_verifier_rejects_symlinks_directories_and_nonregular_files(self):
         expected = _entry("data/stair_p1/robot/good.pkl", b"good")

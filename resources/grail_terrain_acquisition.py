@@ -18,11 +18,17 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 _REVISION = re.compile(r"[0-9a-f]{40}")
 _ENTRY_KEYS = {"bytes", "path", "sha256"}
 _REPOSITORY_KEYS = {"id", "revision", "type"}
+_MANIFEST_KEYS = {"modalities", "repository", "schema", "source_coverage"}
 _MODALITY_KEYS = {
     "allowed_globs", "byte_count", "canonical_inventory_sha256",
     "file_count", "partitions",
 }
 _PARTITION_KEYS = {"byte_count", "file_count", "path_prefix"}
+_SOURCE_COVERAGE_KEYS = {
+    "canonical_basename_sha256", "file_count", "modalities",
+}
+_SOURCE_COVERAGE_MODALITY_KEYS = {"path_prefix", "suffix"}
+_SOURCE_COVERAGE_MODALITIES = {"object_usd", "objects", "robot"}
 
 
 def canonical_json_bytes(value):
@@ -70,6 +76,27 @@ def canonical_inventory_bytes(entries):
 
 def canonical_inventory_sha256(entries):
     return hashlib.sha256(canonical_inventory_bytes(entries)).hexdigest()
+
+
+def canonical_basenames_bytes(basenames):
+    if not isinstance(basenames, (list, tuple)):
+        raise TypeError("source basenames must be a list or tuple")
+    normalized = []
+    for basename in basenames:
+        if type(basename) is not str:
+            raise TypeError("source basename must be a string")
+        pure = PurePosixPath(basename)
+        if not basename or pure.name != basename or pure.suffix \
+                or "\\" in basename or "\x00" in basename:
+            raise ValueError("source basename must be an extensionless file basename")
+        normalized.append(basename)
+    if len(normalized) != len(set(normalized)):
+        raise ValueError("duplicate source basename")
+    return canonical_json_bytes(sorted(normalized))
+
+
+def canonical_basenames_sha256(basenames):
+    return hashlib.sha256(canonical_basenames_bytes(basenames)).hexdigest()
 
 
 def sha256_stream(stream, chunk_size=HASH_CHUNK_BYTES):
@@ -121,8 +148,7 @@ def _validate_repository(repository):
 
 
 def validate_manifest_data(value):
-    _require_exact_keys(
-        value, {"modalities", "repository", "schema"}, "manifest")
+    _require_exact_keys(value, _MANIFEST_KEYS, "manifest")
     if value["schema"] != MANIFEST_SCHEMA:
         raise ValueError(f"manifest schema must be {MANIFEST_SCHEMA}")
     _validate_repository(value["repository"])
@@ -173,6 +199,51 @@ def validate_manifest_data(value):
         if type(digest) is not str or not _SHA256.fullmatch(digest):
             raise ValueError(
                 f"{name} canonical inventory SHA-256 must be lowercase hex")
+    source_coverage = value["source_coverage"]
+    if type(source_coverage) is not dict:
+        raise TypeError("source coverage must be an object")
+    for source, coverage in source_coverage.items():
+        if type(source) is not str or not source:
+            raise ValueError("source coverage names must be nonempty strings")
+        _require_exact_keys(
+            coverage, _SOURCE_COVERAGE_KEYS, f"{source} source coverage")
+        _require_count(
+            coverage["file_count"], f"{source} source coverage file count")
+        if coverage["file_count"] == 0:
+            raise ValueError("source coverage file count must be positive")
+        digest = coverage["canonical_basename_sha256"]
+        if type(digest) is not str or not _SHA256.fullmatch(digest):
+            raise ValueError(
+                f"{source} canonical basename SHA-256 must be lowercase hex")
+        coverage_modalities = coverage["modalities"]
+        _require_exact_keys(
+            coverage_modalities, _SOURCE_COVERAGE_MODALITIES,
+            f"{source} source coverage modalities")
+        prefixes = []
+        for name, source_modality in coverage_modalities.items():
+            _require_exact_keys(
+                source_modality, _SOURCE_COVERAGE_MODALITY_KEYS,
+                f"{source}.{name} source coverage modality")
+            prefix = source_modality["path_prefix"]
+            suffix = source_modality["suffix"]
+            if type(prefix) is not str or not prefix.endswith("/") \
+                    or prefix.startswith("/") or "\\" in prefix \
+                    or ".." in PurePosixPath(prefix).parts:
+                raise ValueError(
+                    "source coverage path prefix must be relative POSIX")
+            if type(suffix) is not str or not suffix.startswith(".") \
+                    or suffix.count(".") != 1 or "/" in suffix \
+                    or "\\" in suffix or len(suffix) == 1:
+                raise ValueError("source coverage suffix must be a file suffix")
+            prefixes.append(prefix)
+            if name in modalities and source in modalities[name]["partitions"]:
+                locked_prefix = modalities[name]["partitions"][source][
+                    "path_prefix"]
+                if prefix != locked_prefix:
+                    raise ValueError(
+                        f"{source}.{name} source coverage partition changed")
+        if len(prefixes) != len(set(prefixes)):
+            raise ValueError("source coverage path prefixes must be unique")
     return json.loads(canonical_json_bytes(value))
 
 
@@ -258,6 +329,39 @@ def _validate_modality_entries(name, config, entries):
             f"{name} canonical inventory SHA-256 changed: {digest}")
 
 
+def _coverage_entry_basenames(entries, source_modality):
+    prefix = source_modality["path_prefix"]
+    suffix = source_modality["suffix"]
+    basenames = []
+    for entry in entries:
+        path = entry["path"]
+        if not path.startswith(prefix):
+            continue
+        relative = path[len(prefix):]
+        if "/" in relative or not relative.endswith(suffix):
+            raise ValueError(f"invalid source coverage input: {path}")
+        basenames.append(relative[:-len(suffix)])
+    return basenames
+
+
+def _validate_source_coverage_inventory(manifest, by_modality):
+    for source, coverage in manifest["source_coverage"].items():
+        for name, source_modality in coverage["modalities"].items():
+            if name not in by_modality or name not in manifest["modalities"]:
+                continue
+            if source not in manifest["modalities"][name]["partitions"]:
+                continue
+            basenames = _coverage_entry_basenames(
+                by_modality[name], source_modality)
+            if len(basenames) != coverage["file_count"]:
+                raise ValueError(
+                    f"{source}.{name} source coverage file count changed")
+            digest = canonical_basenames_sha256(basenames)
+            if digest != coverage["canonical_basename_sha256"]:
+                raise ValueError(
+                    f"{source}.{name} source coverage basename SHA-256 changed")
+
+
 def validate_inventory_document(manifest, inventory, required_modalities):
     manifest = validate_manifest_data(manifest)
     _require_exact_keys(
@@ -298,6 +402,7 @@ def validate_inventory_document(manifest, inventory, required_modalities):
     for name in document_modalities:
         _validate_modality_entries(
             name, manifest["modalities"][name], by_modality[name])
+    _validate_source_coverage_inventory(manifest, by_modality)
     _validate_basename_coverage(manifest, by_modality)
     return {
         "schema": INVENTORY_SCHEMA,
@@ -452,6 +557,65 @@ def _entries_for_modalities(manifest, inventory, modalities):
     ]
 
 
+def _local_source_coverage_basenames(root, source, name, source_modality):
+    prefix = source_modality["path_prefix"]
+    suffix = source_modality["suffix"]
+    directory = Path(root) / prefix.rstrip("/")
+    _ensure_no_symlink_components(root, directory)
+    try:
+        metadata = directory.lstat()
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            f"missing {source}.{name} source coverage directory: {prefix}") \
+            from None
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError(
+            f"{source}.{name} source coverage path must be a directory")
+    basenames = []
+    for current, directories, files in os.walk(directory, followlinks=False):
+        current_path = Path(current)
+        for child_name in directories:
+            child = current_path / child_name
+            child_metadata = child.lstat()
+            if stat.S_ISLNK(child_metadata.st_mode):
+                raise ValueError(
+                    f"{source}.{name} source coverage contains symlink: {child}")
+            if not stat.S_ISDIR(child_metadata.st_mode):
+                raise ValueError(
+                    f"{source}.{name} source coverage contains non-directory: "
+                    f"{child}")
+        for child_name in files:
+            child = current_path / child_name
+            child_metadata = child.lstat()
+            if child.suffix != suffix:
+                continue
+            if current_path != directory:
+                raise ValueError(
+                    f"{source}.{name} source coverage contains nested input: "
+                    f"{child}")
+            if stat.S_ISLNK(child_metadata.st_mode) \
+                    or not stat.S_ISREG(child_metadata.st_mode):
+                raise ValueError(
+                    f"{source}.{name} source coverage input is not regular: "
+                    f"{child}")
+            basenames.append(child.stem)
+    return basenames
+
+
+def _verify_source_coverage(manifest, root):
+    for source, coverage in manifest["source_coverage"].items():
+        for name, source_modality in coverage["modalities"].items():
+            basenames = _local_source_coverage_basenames(
+                root, source, name, source_modality)
+            if len(basenames) != coverage["file_count"]:
+                raise ValueError(
+                    f"{source}.{name} source coverage file count changed")
+            digest = canonical_basenames_sha256(basenames)
+            if digest != coverage["canonical_basename_sha256"]:
+                raise ValueError(
+                    f"{source}.{name} source coverage basename SHA-256 changed")
+
+
 def _scan_local_inputs(manifest, inventory, root, modalities):
     selected = _selected_modalities(manifest, modalities)
     expected = {
@@ -565,6 +729,7 @@ def verify_local(manifest, inventory, dataset_root, modalities):
     selected = _selected_modalities(manifest, modalities)
     inventory = validate_inventory_document(manifest, inventory, selected)
     root = Path(dataset_root)
+    _verify_source_coverage(manifest, root)
     _scan_local_inputs(manifest, inventory, root, selected)
     entries = _entries_for_modalities(manifest, inventory, selected)
     for entry in entries:

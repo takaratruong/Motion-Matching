@@ -6,9 +6,36 @@ import numpy as np
 from .schema import SourceClip
 
 
-GRAIL_OBJECT_POSITION_STATIC_ATOL_M = 1e-5
-GRAIL_OBJECT_QUATERNION_STATIC_ATOL = 1e-5
-GRAIL_OBJECT_QUATERNION_NORM_ATOL = 1e-5
+GRAIL_OBJECT_POSITION_STATIC_MAX_DEVIATION_M = 0.005
+GRAIL_OBJECT_QUATERNION_STATIC_ANGLE_ATOL_RAD = 1e-4
+GRAIL_OBJECT_QUATERNION_NORM_ATOL = 2e-4
+GRAIL_MOVING_SLOPE_OBJECT_BASENAMES = (
+    "terrain_slopes__slope_009__007",
+    "terrain_slopes__slope_011__000",
+    "terrain_slopes__slope_014__004",
+    "terrain_slopes__slope_014__006",
+    "terrain_slopes__slope_018__009",
+    "terrain_slopes__slope_038__004",
+    "terrain_slopes__slope_052__004",
+    "terrain_slopes__slope_055__009",
+    "terrain_slopes__slope_079__000",
+    "terrain_slopes__slope_079__006",
+    "terrain_slopes__slope_088__006",
+    "terrain_slopes__slope_092__004",
+    "terrain_slopes__slope_092__007",
+    "terrain_slopes__slope_127__004",
+    "terrain_slopes__slope_145__007",
+    "terrain_slopes__slope_154__005",
+    "terrain_slopes__slope_154__007",
+    "terrain_slopes__slope_157__001",
+    "terrain_slopes__slope_162__001",
+    "terrain_slopes__slope_165__001",
+    "terrain_slopes__slope_165__008",
+    "terrain_slopes__slope_187__002",
+    "terrain_slopes__slope_193__000",
+)
+GRAIL_STATIC_SLOPE_CLIP_COUNT = 1_857
+GRAIL_STATIC_SLOPE_FRAME_COUNT = 464_250
 
 
 @dataclass(frozen=True)
@@ -69,12 +96,13 @@ def load_grail_object_pose(path: str) -> GrailObjectPose:
         raise ValueError(f"{path}: fps must be finite and positive")
 
     norms = np.linalg.norm(root_quat_xyzw[:, 0], axis=1)
-    if not np.allclose(
-            norms, 1.0, rtol=0.0,
-            atol=GRAIL_OBJECT_QUATERNION_NORM_ATOL):
+    if np.any(np.abs(norms - 1.0) > GRAIL_OBJECT_QUATERNION_NORM_ATOL):
         raise ValueError(f"{path}: root_quat must contain normalized quaternions")
-    if np.max(np.abs(root_pos[:, 0] - root_pos[0, 0])) \
-            > GRAIL_OBJECT_POSITION_STATIC_ATOL_M:
+    position = np.median(root_pos[:, 0], axis=0)
+    position_deviations = np.linalg.norm(
+        root_pos[:, 0] - position, axis=1)
+    if np.max(position_deviations) \
+            > GRAIL_OBJECT_POSITION_STATIC_MAX_DEVIATION_M:
         raise ValueError(f"{path}: terrain object root_pos must be static")
     quaternions = root_quat_xyzw[:, 0] / norms[:, None]
     signs = np.where(
@@ -83,13 +111,28 @@ def load_grail_object_pose(path: str) -> GrailObjectPose:
         1.0,
     )
     aligned = quaternions * signs
-    if np.max(np.abs(aligned - aligned[0])) \
-            > GRAIL_OBJECT_QUATERNION_STATIC_ATOL:
+    quaternion = np.median(aligned, axis=0)
+    quaternion_norm = np.linalg.norm(quaternion)
+    if not np.isfinite(quaternion_norm) or quaternion_norm < 1e-12:
+        raise ValueError(f"{path}: terrain object root_quat has no robust median")
+    quaternion /= quaternion_norm
+    canonical_signs = np.where(
+        np.sum(quaternions * quaternion, axis=1, keepdims=True) < 0.0,
+        -1.0,
+        1.0,
+    )
+    canonical_aligned = quaternions * canonical_signs
+    angular_deviations = 4.0 * np.arctan2(
+        np.linalg.norm(canonical_aligned - quaternion, axis=1),
+        np.linalg.norm(canonical_aligned + quaternion, axis=1),
+    )
+    if np.max(angular_deviations) \
+            > GRAIL_OBJECT_QUATERNION_STATIC_ANGLE_ATOL_RAD:
         raise ValueError(f"{path}: terrain object root_quat must be static")
 
-    position = np.array(root_pos[0, 0], np.float64, copy=True)
+    position = np.array(position, np.float64, copy=True)
     quaternion_wxyz = np.array(
-        aligned[0, [3, 0, 1, 2]], np.float64, copy=True)
+        quaternion[[3, 0, 1, 2]], np.float64, copy=True)
     object_scale = np.array(scale[:, 0], np.float64, copy=True)
     for array in (position, quaternion_wxyz, object_scale):
         array.setflags(write=False)

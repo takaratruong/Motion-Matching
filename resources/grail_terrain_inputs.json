@@ -81,5 +81,25 @@
     "revision": "943946a972d5de2eb0d2ff214b236d0e43575fd7",
     "type": "dataset"
   },
-  "schema": "g1-grail-terrain-inputs/v1"
+  "schema": "g1-grail-terrain-inputs/v1",
+  "source_coverage": {
+    "slope": {
+      "canonical_basename_sha256": "73cd3ec78289aa70caad2cd2df05ba0cea0301478c7654409d2c6557306b4b57",
+      "file_count": 1880,
+      "modalities": {
+        "object_usd": {
+          "path_prefix": "data/slope/object_usd/",
+          "suffix": ".usd"
+        },
+        "objects": {
+          "path_prefix": "data/slope/objects/",
+          "suffix": ".pkl"
+        },
+        "robot": {
+          "path_prefix": "data/slope/robot/",
+          "suffix": ".pkl"
+        }
+      }
+    }
+  }
 }
