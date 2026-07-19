@@ -28,12 +28,19 @@ After normalization, actuator slot `joint_id - 1` names the motor for that one-d
 
 ## Neutral hand profile
 
-The default posture is the midpoint-based relaxed close already defined by the official Dex3 `close()` behavior, rather than the full-limit fallback used when hand fields are absent. In GEAR command order, the targets are:
+The official Dex3 midpoint `close()` posture remained visibly half-open in the
+MuJoCo hand meshes. The default therefore uses a stronger symmetric curl that
+is visibly closed while retaining roughly 0.2 radians of margin from the
+pinned command limits. In GEAR command order, the targets are:
+
+The transport identity for this corrected posture is
+`dex3-closed-fist-v2`; changing the vector necessarily changes its recorded
+profile hash.
 
 | Hand | Joint order | Target radians |
 | --- | --- | --- |
-| Left | thumb0, thumb1, thumb2, middle0, middle1, index0, index1 | 0.000, 0.163, 0.875, -0.785, -0.875, -0.785, -0.875 |
-| Right | thumb0, thumb1, thumb2, index0, index1, middle0, middle1 | 0.000, -0.154, -0.875, 0.785, 0.875, 0.785, 0.875 |
+| Left | thumb0, thumb1, thumb2, middle0, middle1, index0, index1 | 0.000, 0.650, 1.450, -1.350, -1.550, -1.350, -1.550 |
+| Right | thumb0, thumb1, thumb2, index0, index1, middle0, middle1 | 0.000, -0.650, -1.450, 1.350, 1.550, 1.350, 1.550 |
 
 The different left/right ordering is intentional: it matches the pinned MuJoCo joint traversal and Dex3 motor slots, where the two finger pairs are mirrored. The implementation derives these targets from named joint limits/constants where available and tests the resulting vectors, instead of relying on positional literals at multiple call sites. Every value must be finite, within the corresponding joint range, and exactly seven elements long.
 
@@ -64,7 +71,9 @@ The implementation is accepted only when all of the following hold:
 - the loaded model has exactly one actuator per expected actuated joint and every actuator slot resolves to the joint assumed by `BaseSimulator`;
 - a distinct sentinel command for every body and hand joint reaches the intended actuator, including the previous left-hand/right-arm boundary;
 - ZMQ encode/decode tests preserve both seven-value hand vectors and reject missing-width, non-finite, or out-of-range overrides;
-- a close-up physics render is visually inspected and shows two relaxed, substantially symmetric fists with no flailing, hard-limit pinning, or unintended arm response;
+- a close-up physics render is visually inspected and shows two visibly closed,
+  substantially symmetric hands with no flailing, hard-limit pinning, or
+  unintended arm response;
 - after settling, each hand joint's median absolute tracking error over the final simulated second is at most 0.20 radians, and no joint is at a limit unless its commanded target is at that limit;
 - the locomotion physics run remains fall-free, with minimum root height at least 0.65 m, minimum pelvis-up dot product at least 0.90, and stopped-command drift at most 0.25 m;
 - the recorded 29-joint body pose stream still matches the accepted motion-matching command stream frame-for-frame; and

@@ -21,7 +21,7 @@ from mm_sonic.joints import ContractError
 
 
 class Dex3HandContractTests(unittest.TestCase):
-    def test_neutral_profile_has_exact_mirrored_motor_order_and_targets(self) -> None:
+    def test_neutral_profile_has_exact_mirrored_motor_order_and_closed_targets(self) -> None:
         self.assertEqual(
             LEFT_HAND_JOINT_ORDER,
             ("left_hand_thumb_0_joint", "left_hand_thumb_1_joint",
@@ -38,14 +38,14 @@ class Dex3HandContractTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(
             NEUTRAL_HAND_TARGETS.left_f32,
-            np.asarray((0.0, 0.163, 0.875, -0.785, -0.875, -0.785, -0.875), dtype="<f4"),
+            np.asarray((0.0, 0.65, 1.45, -1.35, -1.55, -1.35, -1.55), dtype="<f4"),
         )
         np.testing.assert_array_equal(
             NEUTRAL_HAND_TARGETS.right_f32,
-            np.asarray((0.0, -0.154, -0.875, 0.785, 0.875, 0.785, 0.875), dtype="<f4"),
+            np.asarray((0.0, -0.65, -1.45, 1.35, 1.55, 1.35, 1.55), dtype="<f4"),
         )
         record = hand_targets_record(NEUTRAL_HAND_TARGETS)
-        self.assertEqual(record["profile"], "dex3-relaxed-fist-v1")
+        self.assertEqual(record["profile"], "dex3-closed-fist-v2")
         self.assertRegex(record["sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(
             parse_hand_targets_record(record),

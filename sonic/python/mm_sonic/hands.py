@@ -34,9 +34,9 @@ RIGHT_HAND_JOINT_ORDER = (
 
 HAND_JOINT_COUNT = 7
 
-# Pinned Dex3 motor limits in mirrored command order. The relaxed-fist targets
-# below are the midpoint-derived close posture and lie within these ranges; the
-# ranges are used only to validate overrides, never to alter the pinned targets.
+# Pinned Dex3 motor limits in mirrored command order. The closed-fist targets
+# below retain margin from these limits; the ranges validate overrides but
+# never alter the pinned targets.
 LEFT_HAND_JOINT_RANGES = (
     (-1.0472, 1.0472),
     (-0.72426, 1.0472),
@@ -57,10 +57,10 @@ RIGHT_HAND_JOINT_RANGES = (
     (-0.10472, 1.74533),
 )
 
-_LEFT_NEUTRAL = (0.0, 0.163, 0.875, -0.785, -0.875, -0.785, -0.875)
-_RIGHT_NEUTRAL = (0.0, -0.154, -0.875, 0.785, 0.875, 0.785, 0.875)
+_LEFT_NEUTRAL = (0.0, 0.65, 1.45, -1.35, -1.55, -1.35, -1.55)
+_RIGHT_NEUTRAL = (0.0, -0.65, -1.45, 1.35, 1.55, 1.35, 1.55)
 
-_PROFILE_NAME = "dex3-relaxed-fist-v1"
+_PROFILE_NAME = "dex3-closed-fist-v2"
 _HASH_DOMAIN = b"mm-sonic-dex3-hand-targets/v1\0"
 _PIN_MARGIN = 0.01
 
