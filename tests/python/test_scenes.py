@@ -16,6 +16,7 @@ from resources.g1_terrain_builder.scenes import (
     PLAYABLE_HALF_WIDTH,
     REQUIRED_SCENE_IDS,
     SCENE_CELL_SIZE,
+    TERRAIN_DISTANCES,
     WALKABILITY_CLASSIFICATION_HALO,
     BuiltScene,
     SceneDefinition,
@@ -42,6 +43,7 @@ from resources.g1_terrain_builder.terrain import (
     FlatTerrain,
     GrailTerrain,
     HeightGrid,
+    TERRAIN_SOLE_CORRIDOR_OFFSET_M,
     rasterize_heightfield,
     surface_semantics_signature,
 )
@@ -1087,6 +1089,72 @@ class ProceduralSceneTests(unittest.TestCase):
                     scene.playable_bounds_xz[3])
                 self.assertEqual(scene.surface.height(-2.0, z), 0.0)
                 self.assertEqual(scene.surface.height(+2.0, z), 0.0)
+
+    def test_runtime_sampling_halo_covers_all_outward_displacements(self):
+        fixed_dt = 1.0 / 25.0
+        route_speed = 0.50
+        four_segment_schedule_drift = 4 * fixed_dt * route_speed
+        root_clamp = 0.15
+        profile_horizon = max(TERRAIN_DISTANCES)
+        required_halo = (
+            four_segment_schedule_drift + root_clamp + profile_horizon
+            + TERRAIN_SOLE_CORRIDOR_OFFSET_M
+        )
+
+        self.assertAlmostEqual(required_halo, 1.378506455, places=12)
+        self.assertGreater(LOOKAHEAD_MARGIN, required_halo)
+        self.assertEqual(LOOKAHEAD_MARGIN, 1.5)
+
+    def test_traverse_endpoints_contain_post_stop_corridor_probes(self):
+        fixed_dt = 1.0 / 25.0
+        route_speed = 0.50
+        schedule_drift = 4 * fixed_dt * route_speed
+        root_clamp = 0.15
+        horizon = max(TERRAIN_DISTANCES)
+        inverse_sqrt_two = float(np.sqrt(0.5))
+        headings = (
+            (1.0, 0.0),
+            (inverse_sqrt_two, inverse_sqrt_two),
+            (-inverse_sqrt_two, inverse_sqrt_two),
+        )
+
+        for scene_id in (
+                "stairs-standard", "ramp-10-up-down", "cross-slope-10"):
+            definition = self.definitions[scene_id]
+            route = definition.routes[0]
+            self.assertEqual(len(route.waypoints_xz) - 1, 4)
+            endpoint_x, endpoint_z = route.waypoints_xz[-1]
+            center_x = endpoint_x
+            center_z = endpoint_z + schedule_drift + root_clamp + horizon
+            metadata_bounds = self.built[scene_id].metadata["bounds"]
+            heightfield_min = metadata_bounds["heightfield_min_xyz"]
+            heightfield_max = metadata_bounds["heightfield_max_xyz"]
+            bounds = (
+                ("lookahead", definition.lookahead_bounds_xz),
+                ("heightfield", (
+                    heightfield_min[0], heightfield_max[0],
+                    heightfield_min[2], heightfield_max[2],
+                )),
+            )
+            for heading_x, heading_z in headings:
+                left_x, left_z = -heading_z, heading_x
+                for side in (-1.0, 1.0):
+                    query_x = (
+                        center_x + side * left_x
+                        * TERRAIN_SOLE_CORRIDOR_OFFSET_M
+                    )
+                    query_z = (
+                        center_z + side * left_z
+                        * TERRAIN_SOLE_CORRIDOR_OFFSET_M
+                    )
+                    for label, (xmin, xmax, zmin, zmax) in bounds:
+                        with self.subTest(
+                                scene=scene_id, bounds=label,
+                                heading=(heading_x, heading_z), side=side):
+                            self.assertLessEqual(xmin, query_x)
+                            self.assertLessEqual(query_x, xmax)
+                            self.assertLessEqual(zmin, query_z)
+                            self.assertLessEqual(query_z, zmax)
 
     def test_wide_raster_preserves_central_runtime_heights(self):
         for scene_id, scene in self.definitions.items():

@@ -236,7 +236,11 @@ class ScenePack:
 COURSE_HALF_WIDTH = 0.60
 PLAYABLE_HALF_WIDTH = 3.0
 FLAT_SPAWN_LENGTH = 2.0
-LOOKAHEAD_MARGIN = 1.0
+# The runtime can query beyond a traverse endpoint by the 1.0 m profile
+# horizon, 0.148506455 m sole corridor, 0.15 m root clamp, and less than
+# 4 * (0.50 m/s * 0.04 s) of four-segment route schedule drift.  Round the
+# 1.378506455 m conservative sum outward without changing playable geometry.
+LOOKAHEAD_MARGIN = 1.5
 GRAIL_DEFAULT_BASE = "terrain_curbs__curb_000__000"
 GRAIL_TARGETS = (
     ("grail-curb-low", 0.12),
@@ -755,7 +759,7 @@ def _blocked_definition():
         core_playable[2], core_playable[3],
     )
     classification = _walkability_classification_bounds(playable)
-    core_bounds = (-2.4, 2.4, -1.0, heightfield_end_z)
+    core_bounds = (-2.4, 2.4, -LOOKAHEAD_MARGIN, heightfield_end_z)
     bounds = _wide_heightfield_bounds(core_bounds, playable)
     wall_min_x = _runtime_f32(
         surface.wall_center_x - surface.lane_half_width,
