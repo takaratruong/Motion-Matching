@@ -4526,9 +4526,12 @@ void test_cancel_after_contact_preserves_attached_pickup() {
     RuntimeOutput output = runtime.update(interact_input(
         fixture.locomotion, fixture.request));
     output = advance(runtime, fixture.locomotion);
-    while (!output.diagnostics.attached) {
+    for (int update = 0;
+         update < kMaximumUpdates && !output.diagnostics.attached;
+         ++update) {
         output = advance(runtime, fixture.locomotion);
     }
+    assert(output.diagnostics.attached);
     assert(output.diagnostics.state == RuntimeState::PickupReplay ||
            output.diagnostics.state == RuntimeState::Hold);
     const int32_t attached_frame = output.diagnostics.frame;
