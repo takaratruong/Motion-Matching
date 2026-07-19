@@ -1263,6 +1263,31 @@ static void test_v3_motion_banks_are_authenticated_and_exact()
               "v3 manifest rejection preserves prior object");
     };
 
+    json_value diagnostic_with_locked_skips = base;
+    mutable_member(diagnostic_with_locked_skips, "skipped_clips")
+        ->number_value = 23.0;
+    write_text((root / "manifest.json").c_str(),
+               dump_json(diagnostic_with_locked_skips));
+    motion_pack_manifest diagnostic_pack;
+    check(motion_manifest_load_and_verify(
+              diagnostic_pack, root.c_str(), error, sizeof(error)), error);
+    check(diagnostic_pack.diagnostic_mode &&
+          diagnostic_pack.skipped_clips == 23,
+          "diagnostic v3 pack accepts exact locked slope exclusions");
+
+    json_value full_with_locked_skips = diagnostic_with_locked_skips;
+    mutable_member(full_with_locked_skips, "diagnostic_mode")
+        ->boolean_value = false;
+    write_text((root / "manifest.json").c_str(),
+               dump_json(full_with_locked_skips));
+    motion_pack_manifest full_pack_with_locked_skips;
+    check(motion_manifest_load_and_verify(
+              full_pack_with_locked_skips, root.c_str(),
+              error, sizeof(error)), error);
+    check(!full_pack_with_locked_skips.diagnostic_mode &&
+          full_pack_with_locked_skips.skipped_clips == 23,
+          "full v3 pack accepts exact locked slope exclusions");
+
     json_value full = base;
     mutable_member(full, "diagnostic_mode")->boolean_value = false;
     write_text((root / "manifest.json").c_str(), dump_json(full));
@@ -1271,6 +1296,18 @@ static void test_v3_motion_banks_are_authenticated_and_exact()
               full_pack, root.c_str(), error, sizeof(error)), error);
     check(!full_pack.diagnostic_mode && full_pack.sources.size() == 4,
           "dynamic non-diagnostic v3 pack accepted");
+
+    for (int invalid_skips : {1, 22, 24}) {
+        for (bool diagnostic_mode : {false, true}) {
+            json_value changed_skips = base;
+            mutable_member(changed_skips, "skipped_clips")->number_value =
+                static_cast<double>(invalid_skips);
+            mutable_member(changed_skips, "diagnostic_mode")->boolean_value =
+                diagnostic_mode;
+            rejected(changed_skips,
+                "v3 pack rejects a non-locked slope exclusion count");
+        }
+    }
 
     json_value changed = base;
     json_value* sources = mutable_member(changed, "sources");

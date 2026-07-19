@@ -1021,7 +1021,9 @@ static inline bool motion_manifest_load_and_verify(
                           error, capacity) ||
         candidate.total_clips <= 0 || candidate.grail_clips < 0 ||
         candidate.grail_clips > candidate.total_clips ||
-        candidate.skipped_clips != 0 || candidate.database_frames <= 0)
+        (candidate.skipped_clips != 0 &&
+         candidate.skipped_clips != 23) ||
+        candidate.database_frames <= 0)
         return scene_error(error, capacity,
             "motion manifest clip/frame counts are invalid");
     value = json_member(document, "diagnostic_mode");
