@@ -2,6 +2,7 @@
 
 #include "interaction_attachment.h"
 #include "interaction_carry.h"
+#include "interaction_pickup_provenance.h"
 #include "interaction_place_controller.h"
 #include "interaction_playback.h"
 
@@ -60,6 +61,7 @@ struct PickEntryPreview {
     int32_t contact_frame = -1;
     float total_cost = 0.0F;
     MatchCandidate match_candidate{};
+    CertifiedPickupSourceIdentity pickup_source{};
 };
 
 struct RuntimeInput {
@@ -135,6 +137,7 @@ struct RuntimeDiagnostics {
     bool inactive_arm_targets_locomotion = false;
     bool inactive_arm_tracks_locomotion = false;
     bool pack_available = false;
+    CertifiedPickupSourceIdentity pickup_source{};
     RuntimePlaceDiagnostics place{};
 };
 
@@ -161,7 +164,8 @@ RealizedPickTransitionEvaluation evaluate_realized_pick_transition(
     const InteractionTarget& target,
     const GraspAffordance& affordance,
     const PlaybackConfig& playback_config,
-    const IKConfig& ik_config);
+    const IKConfig& ik_config,
+    const AttachmentConfig& attachment_config = AttachmentConfig{});
 
 struct PickSnapshotMap {
     bool accepted = false;
@@ -183,14 +187,18 @@ public:
         const Database& database,
         const Features& features,
         TargetRegistry& registry,
-        RuntimeConfig config);
+        RuntimeConfig config,
+        const CertifiedPickupSourceRegistry* pickup_source_registry =
+            nullptr);
     InteractionRuntime(
         const Database& database,
         const Features& features,
         TargetRegistry& registry,
         PlacementSurfaceRegistry& surface_registry,
         const PlaceMotionLibrary& place_library,
-        RuntimeConfig config);
+        RuntimeConfig config,
+        const CertifiedPickupSourceRegistry* pickup_source_registry =
+            nullptr);
     static InteractionRuntime disabled(Reason reason);
     RuntimeState state() const;
     const RuntimeDiagnostics& diagnostics() const;
@@ -246,6 +254,7 @@ private:
     TargetRegistry* registry_ = nullptr;
     PlacementSurfaceRegistry* surface_registry_ = nullptr;
     const PlaceMotionLibrary* place_library_ = nullptr;
+    const CertifiedPickupSourceRegistry* pickup_source_registry_ = nullptr;
     RuntimeConfig config_{};
     std::optional<PickRequest> request_{};
     std::optional<InteractionTarget> target_{};

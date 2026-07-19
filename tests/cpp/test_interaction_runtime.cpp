@@ -518,6 +518,47 @@ bool exact(
 }
 
 bool exact(
+    const interaction::PickupSourceProvenance& left,
+    const interaction::PickupSourceProvenance& right) {
+    return left.clip_ordinal == right.clip_ordinal &&
+           left.range_start == right.range_start &&
+           left.range_stop == right.range_stop &&
+           left.entry_global_frame == right.entry_global_frame &&
+           left.contact_global_frame == right.contact_global_frame &&
+           left.lift_global_frame == right.lift_global_frame &&
+           left.hold_global_frame == right.hold_global_frame &&
+           left.active_hand == right.active_hand &&
+           left.object_profile_id == right.object_profile_id &&
+           same_bits(
+               left.object_bounds.center_object,
+               right.object_bounds.center_object) &&
+           same_bits(
+               left.object_bounds.half_extents_object,
+               right.object_bounds.half_extents_object) &&
+           same_bits(
+               left.hand_in_object.position,
+               right.hand_in_object.position) &&
+           same_bits(
+               left.hand_in_object.rotation,
+               right.hand_in_object.rotation) &&
+           same_float_bits(
+               left.source_support_height_m,
+               right.source_support_height_m);
+}
+
+bool exact(
+    const interaction::CertifiedPickupSourceIdentity& left,
+    const interaction::CertifiedPickupSourceIdentity& right) {
+    return exact(left.provenance, right.provenance) &&
+           left.sequence_id == right.sequence_id &&
+           left.object_id == right.object_id &&
+           left.reverse_start_global_frame ==
+               right.reverse_start_global_frame &&
+           left.join_key_sha256 == right.join_key_sha256 &&
+           left.source_id == right.source_id;
+}
+
+bool exact(
     const interaction::RuntimeDiagnostics& left,
     const interaction::RuntimeDiagnostics& right) {
     return left.state == right.state &&
@@ -552,6 +593,7 @@ bool exact(
            left.inactive_arm_tracks_locomotion ==
                right.inactive_arm_tracks_locomotion &&
            left.pack_available == right.pack_available &&
+           exact(left.pickup_source, right.pickup_source) &&
            exact(left.place, right.place);
 }
 
@@ -608,7 +650,8 @@ bool exact(
            left.feasible_entry_frame == right.feasible_entry_frame &&
            left.contact_frame == right.contact_frame &&
            left.total_cost == right.total_cost &&
-           exact(left.match_candidate, right.match_candidate);
+           exact(left.match_candidate, right.match_candidate) &&
+           exact(left.pickup_source, right.pickup_source);
 }
 
 void assert_exact(
@@ -938,60 +981,6 @@ interaction::RuntimeDiagnostics run_rejected(
     assert(!output.owns_pose && !output.suppress_steering);
     assert_free(fixture.registry, fixture.request.target);
     return output.diagnostics;
-}
-
-interaction::RuntimeDiagnostics run_post_commit_failure(
-    interaction::RuntimeFixture fixture) {
-    using namespace interaction;
-    RuntimeConfig config{};
-    config.ik.accepted_position_m =
-        config.ik.maximum_request_position_m;
-    InteractionRuntime runtime(
-        fixture.database, fixture.features, fixture.registry, config);
-    RuntimeOutput output = runtime.update(interact_input(
-        fixture.locomotion, fixture.request));
-    assert(output.diagnostics.state == RuntimeState::Preflight);
-    output = advance(runtime, fixture.locomotion);
-    assert(output.diagnostics.state == RuntimeState::Align);
-
-    bool saw_pickup_replay = false;
-    bool saw_final_owned_frame = false;
-    Reason latched_reason = Reason::None;
-    int32_t previous_frame = output.diagnostics.frame;
-    const int32_t expected_final = fixture.database.range_stops.at(1) - 1;
-    for (int update = 0; update < kMaximumUpdates; ++update) {
-        output = advance(runtime, fixture.locomotion);
-        if (output.diagnostics.frame >= 0 && previous_frame >= 0) {
-            assert(output.diagnostics.frame >= previous_frame);
-        }
-        previous_frame = output.diagnostics.frame;
-        if (output.diagnostics.state == RuntimeState::PickupReplay) {
-            saw_pickup_replay = true;
-        }
-        if (output.diagnostics.result == ResultCode::Failed) {
-            if (latched_reason == Reason::None) {
-                latched_reason = output.diagnostics.reason;
-            }
-            assert(output.diagnostics.reason == latched_reason);
-        }
-        assert(!output.diagnostics.attached);
-        if (output.diagnostics.frame == expected_final &&
-            output.diagnostics.state != RuntimeState::Locomotion) {
-            assert(output.owns_pose);
-            saw_final_owned_frame = true;
-        }
-        if (output.diagnostics.state == RuntimeState::Locomotion) {
-            assert(saw_pickup_replay);
-            assert(saw_final_owned_frame);
-            assert(output.diagnostics.result == ResultCode::Failed);
-            assert(output.diagnostics.reason == latched_reason);
-            assert(!output.owns_pose && !output.suppress_steering);
-            assert_free(fixture.registry, fixture.request.target);
-            return output.diagnostics;
-        }
-    }
-    assert(false && "post-commit failure did not return to locomotion");
-    return {};
 }
 
 interaction::RuntimeFixture post_attach_contact_loss_fixture() {
@@ -1670,9 +1659,9 @@ void test_pick_preview_public_api_reports_path_and_match_separately() {
     assert(!mixed.match_ready);
     assert(mixed.path_reason == Reason::None);
     assert(mixed.match_reason == Reason::OutOfRange);
-    assert(mixed.feasible_entry_frame == 10);
-    assert(mixed.contact_frame == 25);
-    assert(near(mixed.total_cost, 106.40F, 1.0e-4F));
+    assert(mixed.feasible_entry_frame == 85);
+    assert(mixed.contact_frame == 100);
+    assert(mixed.total_cost == 0.0F);
     assert(exact(mixed.match_candidate, MatchCandidate{}));
 }
 
@@ -1965,6 +1954,166 @@ void test_pick_preview_matches_normal_preflight_for_same_realized_snapshot() {
     assert(released != nullptr);
     assert(released->state == ObjectState::Free);
     assert(released->owner_request == 0U);
+}
+
+void test_pickup_source_provenance_preview_preflight_and_registry_join() {
+    using namespace interaction;
+    RuntimeFixture fixture = make_runtime_fixture();
+    InteractionRuntime uncertified_runtime(
+        fixture.database, fixture.features, fixture.registry, RuntimeConfig{});
+    const PickEntryRoot root = live_pick_entry_root(fixture.locomotion);
+    const PickEntryPreview uncertified = uncertified_runtime.preview_pick(
+        fixture.locomotion,
+        root,
+        fixture.request.target,
+        fixture.request.affordance_id);
+    assert(uncertified.path_feasible && uncertified.match_ready);
+    const PickupSourceProvenance& raw = uncertified.pickup_source.provenance;
+    const size_t clip = static_cast<size_t>(
+        uncertified.match_candidate.clip);
+    assert(raw.clip_ordinal == uncertified.match_candidate.clip);
+    assert(raw.range_start == fixture.database.range_starts.at(clip));
+    assert(raw.range_stop == fixture.database.range_stops.at(clip));
+    assert(raw.entry_global_frame ==
+           uncertified.match_candidate.entry_frame);
+    assert(raw.contact_global_frame ==
+           uncertified.match_candidate.contact_frame);
+    assert(raw.lift_global_frame ==
+           uncertified.match_candidate.lift_frame);
+    assert(raw.hold_global_frame ==
+           uncertified.match_candidate.hold_frame);
+    assert(raw.active_hand == static_cast<Hand>(
+        fixture.database.active_hands.at(clip)));
+    assert(raw.object_profile_id ==
+           fixture.registry.find(fixture.request.target)->object_profile_id);
+    assert(same_bits(raw.object_bounds.center_object, vec3()));
+    assert(same_bits(
+        raw.object_bounds.half_extents_object,
+        vec3(
+            0.5F * fixture.database.object_dimensions.at(clip * 3U),
+            0.5F * fixture.database.object_dimensions.at(clip * 3U + 1U),
+            0.5F * fixture.database.object_dimensions.at(clip * 3U + 2U))));
+    assert(same_bits(
+        raw.hand_in_object.position,
+        vec3(
+            fixture.database.grasp_positions_object.at(clip * 3U),
+            fixture.database.grasp_positions_object.at(clip * 3U + 1U),
+            fixture.database.grasp_positions_object.at(clip * 3U + 2U))));
+    assert(same_bits(
+        raw.hand_in_object.rotation,
+        quat(
+            fixture.database.grasp_rotations_object.at(clip * 4U),
+            fixture.database.grasp_rotations_object.at(clip * 4U + 1U),
+            fixture.database.grasp_rotations_object.at(clip * 4U + 2U),
+            fixture.database.grasp_rotations_object.at(clip * 4U + 3U))));
+    const Transform source_support = compose(
+        Transform{
+            vec3(
+                fixture.database.table_positions.at(clip * 3U),
+                fixture.database.table_positions.at(clip * 3U + 1U),
+                fixture.database.table_positions.at(clip * 3U + 2U)),
+            quat(
+                fixture.database.table_rotations.at(clip * 4U),
+                fixture.database.table_rotations.at(clip * 4U + 1U),
+                fixture.database.table_rotations.at(clip * 4U + 2U),
+                fixture.database.table_rotations.at(clip * 4U + 3U)),
+        },
+        Transform{
+            vec3(
+                0.0F,
+                0.5F * fixture.database.table_sizes.at(clip * 3U + 1U),
+                0.0F),
+            quat(),
+        });
+    assert(same_float_bits(
+        raw.source_support_height_m, source_support.position.y));
+    assert(uncertified.pickup_source.sequence_id.empty());
+    assert(uncertified.pickup_source.object_id.empty());
+    assert(uncertified.pickup_source.reverse_start_global_frame == -1);
+    assert(uncertified.pickup_source.join_key_sha256.empty());
+    assert(uncertified.pickup_source.source_id == 0U);
+
+    CertifiedPickupSourceLocalRow local{};
+    local.clip_ordinal = raw.clip_ordinal;
+    local.range_start = raw.range_start;
+    local.range_stop = raw.range_stop;
+    local.entry_local_frame = checked_pickup_global_to_local_frame(
+        raw.entry_global_frame, raw.range_start, raw.range_stop);
+    local.contact_local_frame = checked_pickup_global_to_local_frame(
+        raw.contact_global_frame, raw.range_start, raw.range_stop);
+    local.lift_local_frame = checked_pickup_global_to_local_frame(
+        raw.lift_global_frame, raw.range_start, raw.range_stop);
+    local.hold_local_frame = checked_pickup_global_to_local_frame(
+        raw.hold_global_frame, raw.range_start, raw.range_stop);
+    local.reverse_start_local_frame = local.hold_local_frame;
+    local.active_hand = raw.active_hand;
+    local.object_profile_id = raw.object_profile_id;
+    local.object_bounds = raw.object_bounds;
+    local.hand_in_object = raw.hand_in_object;
+    local.source_support_height_m = raw.source_support_height_m;
+    local.sequence_id = "pickup_table__synthetic_runtime__001";
+    local.object_id = "synthetic_runtime_object";
+    local.join_key_sha256 =
+        "11223344556677881122334455667788"
+        "11223344556677881122334455667788";
+    local.source_id = UINT64_C(0x1122334455667788);
+    const CertifiedPickupSourceIdentity identity =
+        make_certified_pickup_source_identity(local);
+    const CertifiedPickupSourceRegistry registry({identity});
+
+    RuntimeFixture certified_fixture = make_runtime_fixture();
+    InteractionRuntime certified_runtime(
+        certified_fixture.database,
+        certified_fixture.features,
+        certified_fixture.registry,
+        RuntimeConfig{},
+        &registry);
+    const PickEntryPreview certified = certified_runtime.preview_pick(
+        certified_fixture.locomotion,
+        live_pick_entry_root(certified_fixture.locomotion),
+        certified_fixture.request.target,
+        certified_fixture.request.affordance_id);
+    assert(certified.match_ready);
+    assert(exact(certified.pickup_source, identity));
+    assert(exact(
+        certified.pickup_source.provenance,
+        uncertified.pickup_source.provenance));
+
+    RuntimeOutput output = certified_runtime.update(interact_input(
+        certified_fixture.locomotion, certified_fixture.request));
+    assert(output.diagnostics.state == RuntimeState::Preflight);
+    output = certified_runtime.update(idle_input(
+        certified_fixture.locomotion));
+    assert(output.diagnostics.state == RuntimeState::Align);
+    assert(exact(output.diagnostics.pickup_source, identity));
+    assert(exact(
+        output.diagnostics.pickup_source.provenance,
+        certified.pickup_source.provenance));
+
+    CertifiedPickupSourceIdentity nonmatching = identity;
+    nonmatching.provenance.source_support_height_m = std::nextafter(
+        nonmatching.provenance.source_support_height_m,
+        std::numeric_limits<float>::infinity());
+    const CertifiedPickupSourceRegistry nonmatching_registry({nonmatching});
+    RuntimeFixture unmatched_fixture = make_runtime_fixture();
+    InteractionRuntime unmatched_runtime(
+        unmatched_fixture.database,
+        unmatched_fixture.features,
+        unmatched_fixture.registry,
+        RuntimeConfig{},
+        &nonmatching_registry);
+    const PickEntryPreview unmatched = unmatched_runtime.preview_pick(
+        unmatched_fixture.locomotion,
+        live_pick_entry_root(unmatched_fixture.locomotion),
+        unmatched_fixture.request.target,
+        unmatched_fixture.request.affordance_id);
+    assert(unmatched.match_ready);
+    assert(exact(unmatched.pickup_source.provenance, raw));
+    assert(unmatched.pickup_source.sequence_id.empty());
+    assert(unmatched.pickup_source.object_id.empty());
+    assert(unmatched.pickup_source.reverse_start_global_frame == -1);
+    assert(unmatched.pickup_source.join_key_sha256.empty());
+    assert(unmatched.pickup_source.source_id == 0U);
 }
 
 void test_pick_preview_never_reserves_or_constructs_request_authority() {
@@ -2285,6 +2434,12 @@ void test_frozen_public_contract_and_defaults() {
         decltype(RuntimeDiagnostics{}.target), TargetHandle>);
     static_assert(std::is_same_v<
         decltype(RuntimeDiagnostics{}.object_state), ObjectState>);
+    static_assert(std::is_same_v<
+        decltype(RuntimeDiagnostics{}.pickup_source),
+        CertifiedPickupSourceIdentity>);
+    static_assert(std::is_same_v<
+        decltype(PickEntryPreview{}.pickup_source),
+        CertifiedPickupSourceIdentity>);
     static_assert(std::is_same_v<decltype(RuntimeOutput{}.pose), Pose>);
     static_assert(std::is_same_v<
         decltype(RuntimeOutput{}.object_world), Transform>);
@@ -2301,9 +2456,25 @@ void test_frozen_public_contract_and_defaults() {
         const Database&,
         const Features&,
         TargetRegistry&,
+        RuntimeConfig,
+        const CertifiedPickupSourceRegistry*>);
+    static_assert(std::is_constructible_v<
+        InteractionRuntime,
+        const Database&,
+        const Features&,
+        TargetRegistry&,
         PlacementSurfaceRegistry&,
         const PlaceMotionLibrary&,
         RuntimeConfig>);
+    static_assert(std::is_constructible_v<
+        InteractionRuntime,
+        const Database&,
+        const Features&,
+        TargetRegistry&,
+        PlacementSurfaceRegistry&,
+        const PlaceMotionLibrary&,
+        RuntimeConfig,
+        const CertifiedPickupSourceRegistry*>);
     static_assert(std::is_same_v<
         decltype(std::declval<const InteractionRuntime&>().preview_place(
             SurfaceHandle{}, uint32_t{})),
@@ -4226,18 +4397,15 @@ void test_hand_constraint_weight_resets_on_cancel_failure_and_reset() {
             fixture.features,
             fixture.registry,
             config);
-        RuntimeOutput output = enter_align(runtime, fixture);
-        bool saw_failure = false;
-        for (int update = 0; update < kMaximumUpdates; ++update) {
-            output = advance(runtime, fixture.locomotion);
-            assert_valid_hand_constraint_weight(output.diagnostics);
-            if (output.diagnostics.result == ResultCode::Failed) {
-                saw_failure = true;
-                assert(output.diagnostics.hand_constraint_weight == 0.0F);
-                break;
-            }
-        }
-        assert(saw_failure);
+        RuntimeOutput output = runtime.update(interact_input(
+            fixture.locomotion, fixture.request));
+        assert(output.diagnostics.state == RuntimeState::Preflight);
+        output = advance(runtime, fixture.locomotion);
+        assert(output.diagnostics.state == RuntimeState::Locomotion);
+        assert(output.diagnostics.result == ResultCode::Rejected);
+        assert(output.diagnostics.reason == Reason::CorrectionLimit);
+        assert_valid_hand_constraint_weight(output.diagnostics);
+        assert(output.diagnostics.hand_constraint_weight == 0.0F);
     }
 
     {
@@ -4611,7 +4779,32 @@ void test_nonunit_playback_speed_commits_by_source_contact() {
     assert(output.diagnostics.playback_speed == config.playback.speed);
 }
 
-void test_canonical_updates_gate_the_exact_contact_pose() {
+void test_realized_transition_rejects_contact_that_cannot_attach() {
+    using namespace interaction;
+    RuntimeFixture fixture = contact_failure_fixture();
+    RuntimeConfig config{};
+    config.ik.accepted_position_m =
+        config.ik.maximum_request_position_m;
+    const MatchInput matcher_input = match_input_for(fixture);
+    const MatchResult selected = select_whole_clip(
+        matcher_input, config.matcher);
+    assert(selected.accepted);
+
+    const runtime_detail::RealizedPickTransitionEvaluation realized =
+        runtime_detail::evaluate_realized_pick_transition(
+            fixture.database,
+            fixture.locomotion.pose,
+            selected.candidate,
+            matcher_input.target,
+            matcher_input.affordance,
+            config.playback,
+            config.ik);
+    assert(!realized.feasible);
+    assert(realized.reason == Reason::ContactPosition);
+    assert(realized.frame == selected.candidate.contact_frame);
+}
+
+void test_canonical_updates_reject_invalid_contact_before_commit() {
     using namespace interaction;
     RuntimeFixture fixture = contact_failure_fixture();
     RuntimeConfig config{};
@@ -4620,27 +4813,21 @@ void test_canonical_updates_gate_the_exact_contact_pose() {
     InteractionRuntime runtime(
         fixture.database, fixture.features, fixture.registry, config);
 
+    const PickEntryPreview preview = runtime.preview_pick(
+        fixture.locomotion,
+        live_pick_entry_root(fixture.locomotion),
+        fixture.request.target,
+        fixture.request.affordance_id);
+    assert_preview_rejected(preview, Reason::CorrectionLimit);
+
     RuntimeOutput output = runtime.update(interact_input(
         fixture.locomotion, fixture.request));
     assert(output.diagnostics.state == RuntimeState::Preflight);
     output = advance(runtime, fixture.locomotion);
-    assert(output.diagnostics.state == RuntimeState::Align);
-
-    int32_t previous_frame = output.diagnostics.frame;
-    bool saw_failed_contact = false;
-    for (int update = 0; update < kMaximumUpdates; ++update) {
-        output = advance(runtime, fixture.locomotion);
-        assert(output.diagnostics.frame >= previous_frame);
-        previous_frame = output.diagnostics.frame;
-        if (output.diagnostics.result == ResultCode::Failed) {
-            assert(output.diagnostics.reason == Reason::ContactPosition);
-            assert(!output.diagnostics.attached);
-            saw_failed_contact = true;
-            break;
-        }
-        assert(output.diagnostics.state != RuntimeState::Carry);
-    }
-    assert(saw_failed_contact);
+    assert(output.diagnostics.state == RuntimeState::Locomotion);
+    assert(output.diagnostics.result == ResultCode::Rejected);
+    assert(output.diagnostics.reason == Reason::CorrectionLimit);
+    assert(!output.diagnostics.attached);
 }
 
 void test_canonical_updates_cannot_skip_post_attach_contact_loss() {
@@ -5361,14 +5548,32 @@ void test_high_cost_is_rejected_as_poor_match_and_stays_terminal() {
     assert(run_rejected(high_cost_fixture()).reason == Reason::PoorMatch);
 }
 
-void test_contact_failure_is_one_shot_latched_and_drains_final_frame() {
+void test_contact_failure_rejection_is_terminal_and_never_owns_pose() {
     using namespace interaction;
-    const RuntimeDiagnostics diagnostics =
-        run_post_commit_failure(contact_failure_fixture());
-    assert(diagnostics.reason == Reason::ContactPosition);
-    assert(!diagnostics.attached);
-    assert(diagnostics.frame ==
-        runtime_fixture_detail::kFramesPerClip * 2 - 1);
+    RuntimeFixture fixture = contact_failure_fixture();
+    RuntimeConfig config{};
+    config.ik.accepted_position_m =
+        config.ik.maximum_request_position_m;
+    InteractionRuntime runtime(
+        fixture.database, fixture.features, fixture.registry, config);
+    RuntimeOutput output = runtime.update(interact_input(
+        fixture.locomotion, fixture.request));
+    assert(output.diagnostics.state == RuntimeState::Preflight);
+    output = advance(runtime, fixture.locomotion);
+    assert(output.diagnostics.state == RuntimeState::Locomotion);
+    assert(output.diagnostics.result == ResultCode::Rejected);
+    assert(output.diagnostics.reason == Reason::CorrectionLimit);
+    assert(!output.diagnostics.attached);
+    assert(!output.owns_pose && !output.suppress_steering);
+    assert_free(fixture.registry, fixture.request.target);
+
+    const RuntimeDiagnostics terminal = output.diagnostics;
+    output = advance(runtime, fixture.locomotion);
+    assert(output.diagnostics.state == terminal.state);
+    assert(output.diagnostics.result == terminal.result);
+    assert(output.diagnostics.reason == terminal.reason);
+    assert(!output.diagnostics.attached);
+    assert(!output.owns_pose && !output.suppress_steering);
 }
 
 void test_hold_extends_the_frozen_final_pose_without_resetting_timer() {
@@ -5546,6 +5751,7 @@ int main(int argc, char** argv) {
     test_pick_preview_rejects_invalid_runtime_target_and_root_inputs();
     test_pick_preview_is_deterministic_and_const_on_every_outcome();
     test_pick_preview_matches_normal_preflight_for_same_realized_snapshot();
+    test_pickup_source_provenance_preview_preflight_and_registry_join();
     test_pick_preview_never_reserves_or_constructs_request_authority();
     test_pick_preview_rejection_reason_mapping_is_exact();
     test_frozen_public_contract_and_defaults();
@@ -5580,7 +5786,8 @@ int main(int argc, char** argv) {
     test_cancel_after_contact_preserves_attached_pickup();
     test_commit_at_contact_preserves_the_one_shot_crossing();
     test_nonunit_playback_speed_commits_by_source_contact();
-    test_canonical_updates_gate_the_exact_contact_pose();
+    test_realized_transition_rejects_contact_that_cannot_attach();
+    test_canonical_updates_reject_invalid_contact_before_commit();
     test_canonical_updates_cannot_skip_post_attach_contact_loss();
     test_pickup_success_precedes_later_canonical_contact_loss();
     test_hold_interval_precedes_its_canonical_stop_frame_event();
@@ -5596,7 +5803,7 @@ int main(int argc, char** argv) {
     test_runtime_config_is_validated_before_reservation();
     test_exception_after_reservation_rolls_back_and_can_retry();
     test_high_cost_is_rejected_as_poor_match_and_stays_terminal();
-    test_contact_failure_is_one_shot_latched_and_drains_final_frame();
+    test_contact_failure_rejection_is_terminal_and_never_owns_pose();
     test_hold_extends_the_frozen_final_pose_without_resetting_timer();
     test_post_attach_failure_preserves_object_and_frees_registry();
     test_post_attach_target_change_never_clobbers_a_newer_generation();

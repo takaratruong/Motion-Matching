@@ -488,6 +488,90 @@ bool exact(const MatchCandidate& left, const MatchCandidate& right) {
            left.group_costs == right.group_costs;
 }
 
+CertifiedPickupSourceIdentity pickup_source_identity(
+    const Database& database,
+    const MatchCandidate& candidate,
+    uint64_t object_profile_id,
+    const CertifiedPickupSourceRegistry* registry) {
+    if (candidate.clip < 0) {
+        throw std::out_of_range("pickup source clip ordinal is negative");
+    }
+    const size_t clip = static_cast<size_t>(candidate.clip);
+    const int32_t range_start = database.range_starts.at(clip);
+    const int32_t range_stop = database.range_stops.at(clip);
+    (void)checked_pickup_global_to_local_frame(
+        candidate.entry_frame, range_start, range_stop);
+    (void)checked_pickup_global_to_local_frame(
+        candidate.contact_frame, range_start, range_stop);
+    (void)checked_pickup_global_to_local_frame(
+        candidate.lift_frame, range_start, range_stop);
+    (void)checked_pickup_global_to_local_frame(
+        candidate.hold_frame, range_start, range_stop);
+
+    const uint8_t hand = database.active_hands.at(clip);
+    if (hand > static_cast<uint8_t>(Hand::Right)) {
+        throw std::invalid_argument("pickup source active hand is invalid");
+    }
+    const size_t clip3 = clip * 3U;
+    const size_t clip4 = clip * 4U;
+    const vec3 object_dimensions(
+        database.object_dimensions.at(clip3),
+        database.object_dimensions.at(clip3 + 1U),
+        database.object_dimensions.at(clip3 + 2U));
+    const Transform table_world{
+        vec3(
+            database.table_positions.at(clip3),
+            database.table_positions.at(clip3 + 1U),
+            database.table_positions.at(clip3 + 2U)),
+        quat(
+            database.table_rotations.at(clip4),
+            database.table_rotations.at(clip4 + 1U),
+            database.table_rotations.at(clip4 + 2U),
+            database.table_rotations.at(clip4 + 3U)),
+    };
+    const Transform source_support = compose(
+        table_world,
+        Transform{
+            vec3(
+                0.0F,
+                0.5F * database.table_sizes.at(clip3 + 1U),
+                0.0F),
+            quat(),
+        });
+
+    CertifiedPickupSourceIdentity actual{};
+    actual.provenance.clip_ordinal = candidate.clip;
+    actual.provenance.range_start = range_start;
+    actual.provenance.range_stop = range_stop;
+    actual.provenance.entry_global_frame = candidate.entry_frame;
+    actual.provenance.contact_global_frame = candidate.contact_frame;
+    actual.provenance.lift_global_frame = candidate.lift_frame;
+    actual.provenance.hold_global_frame = candidate.hold_frame;
+    actual.provenance.active_hand = static_cast<Hand>(hand);
+    actual.provenance.object_profile_id = object_profile_id;
+    actual.provenance.object_bounds = {
+        vec3(), 0.5F * object_dimensions};
+    actual.provenance.hand_in_object = {
+        vec3(
+            database.grasp_positions_object.at(clip3),
+            database.grasp_positions_object.at(clip3 + 1U),
+            database.grasp_positions_object.at(clip3 + 2U)),
+        quat(
+            database.grasp_rotations_object.at(clip4),
+            database.grasp_rotations_object.at(clip4 + 1U),
+            database.grasp_rotations_object.at(clip4 + 2U),
+            database.grasp_rotations_object.at(clip4 + 3U)),
+    };
+    actual.provenance.source_support_height_m =
+        source_support.position.y;
+    if (registry != nullptr) {
+        const std::optional<CertifiedPickupSourceIdentity> resolved =
+            registry->resolve_exact(actual.provenance);
+        if (resolved.has_value()) return *resolved;
+    }
+    return actual;
+}
+
 bool exact(const PlaceTimingConfig& left, const PlaceTimingConfig& right) {
     return left.canonical_fps == right.canonical_fps &&
            left.playback_speed == right.playback_speed &&
@@ -924,6 +1008,39 @@ ContactMeasurement contact_measurement(
     return measurement;
 }
 
+Reason realized_contact_reason(
+    const ContactMeasurement& measurement,
+    Hand expected_hand,
+    const AttachmentConfig& config) {
+    if (!measurement.stable_contact_event ||
+        measurement.hand != expected_hand ||
+        !measurement.hand_contact) {
+        return Reason::LostContact;
+    }
+    if (!pick_finite(measurement.hand_world.position) ||
+        !finite_nonnegative(measurement.position_error_m) ||
+        measurement.position_error_m > config.maximum_position_error_m) {
+        return Reason::ContactPosition;
+    }
+    const quat rotation = measurement.hand_world.rotation;
+    const double squared_rotation_length =
+        static_cast<double>(rotation.w) * rotation.w +
+        static_cast<double>(rotation.x) * rotation.x +
+        static_cast<double>(rotation.y) * rotation.y +
+        static_cast<double>(rotation.z) * rotation.z;
+    if (!pick_finite(rotation) ||
+        !(squared_rotation_length > 0.0) ||
+        !std::isfinite(squared_rotation_length) ||
+        !finite_nonnegative(measurement.orientation_error_radians) ||
+        measurement.orientation_error_radians >
+            config.maximum_orientation_error_radians) {
+        return Reason::ContactOrientation;
+    }
+    if (!measurement.joints_valid) return Reason::JointLimit;
+    if (!measurement.clearance_valid) return Reason::BlockedPath;
+    return Reason::None;
+}
+
 }  // namespace
 
 namespace runtime_detail {
@@ -935,9 +1052,11 @@ RealizedPickTransitionEvaluation evaluate_realized_pick_transition(
     const InteractionTarget& target,
     const GraspAffordance& affordance,
     const PlaybackConfig& playback_config,
-    const IKConfig& ik_config) {
+    const IKConfig& ik_config,
+    const AttachmentConfig& attachment_config) {
     if (!valid_playback_config(playback_config) ||
-        !valid_ik_config(ik_config)) {
+        !valid_ik_config(ik_config) ||
+        !valid_attachment_config(attachment_config)) {
         throw std::invalid_argument(
             "invalid realized pickup transition configuration");
     }
@@ -992,6 +1111,31 @@ RealizedPickTransitionEvaluation evaluate_realized_pick_transition(
                 clearance_player.frame(),
             };
         }
+    }
+
+    const EventPose contact_pose = event_pose(
+        clearance_player,
+        candidate,
+        affordance,
+        target_hand_world,
+        source_contact_hand_world,
+        ik_config,
+        live_entry_pose,
+        playback_config.entry_blend_seconds);
+    const ContactMeasurement contact = contact_measurement(
+        database,
+        contact_pose.pose,
+        candidate.contact_frame,
+        target.handle,
+        affordance.hand,
+        target_hand_world,
+        true,
+        contact_pose.joints_valid,
+        path_clear);
+    const Reason contact_reason = realized_contact_reason(
+        contact, affordance.hand, attachment_config);
+    if (contact_reason != Reason::None) {
+        return {false, contact_reason, candidate.contact_frame};
     }
 
     return {true, Reason::None, clearance_player.frame()};
@@ -1129,10 +1273,12 @@ InteractionRuntime::InteractionRuntime(
     const Database& database,
     const Features& features,
     TargetRegistry& registry,
-    RuntimeConfig config)
+    RuntimeConfig config,
+    const CertifiedPickupSourceRegistry* pickup_source_registry)
     : database_(&database),
       features_(&features),
       registry_(&registry),
+      pickup_source_registry_(pickup_source_registry),
       config_(config),
       state_(RuntimeState::Locomotion) {
     validate_runtime_config(config_);
@@ -1149,12 +1295,14 @@ InteractionRuntime::InteractionRuntime(
     TargetRegistry& registry,
     PlacementSurfaceRegistry& surface_registry,
     const PlaceMotionLibrary& place_library,
-    RuntimeConfig config)
+    RuntimeConfig config,
+    const CertifiedPickupSourceRegistry* pickup_source_registry)
     : database_(&database),
       features_(&features),
       registry_(&registry),
       surface_registry_(&surface_registry),
       place_library_(&place_library),
+      pickup_source_registry_(pickup_source_registry),
       config_(config),
       state_(RuntimeState::Locomotion) {
     validate_runtime_config(config_);
@@ -1239,14 +1387,26 @@ InteractionRuntime::evaluate_pick_entries_realized(
         input,
         config_.matcher,
         [this, &input](const MatchCandidate& candidate) {
-            return runtime_detail::evaluate_realized_pick_transition(
+            const Reason reason = runtime_detail::
+                evaluate_realized_pick_transition(
                 *input.database,
                 input.locomotion.pose,
                 candidate,
                 input.target,
                 input.affordance,
                 config_.playback,
-                config_.ik).reason;
+                config_.ik,
+                config_.attachment).reason;
+            switch (reason) {
+            case Reason::ContactPosition:
+            case Reason::ContactOrientation:
+            case Reason::JointLimit:
+                return Reason::CorrectionLimit;
+            case Reason::LostContact:
+                return Reason::NoCandidate;
+            default:
+                return reason;
+            }
         });
 }
 
@@ -1320,6 +1480,11 @@ PickEntryPreview InteractionRuntime::preview_pick(
         : 0.0F;
     if (evaluated.match_ready) {
         preview.match_candidate = evaluated.selection.candidate;
+        preview.pickup_source = pickup_source_identity(
+            *database_,
+            preview.match_candidate,
+            built.input.target.object_profile_id,
+            pickup_source_registry_);
     }
     return preview;
 }
@@ -1947,6 +2112,13 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
                                         reject(match.reason);
                                     } else {
                                         candidate_ = match.candidate;
+                                        diagnostics_.pickup_source =
+                                            pickup_source_identity(
+                                                *database_,
+                                                *candidate_,
+                                                built.input.target
+                                                    .object_profile_id,
+                                                pickup_source_registry_);
                                         player_.emplace(*database_);
                                         player_->start(
                                             *candidate_,

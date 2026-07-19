@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import struct
 import subprocess
+import tempfile
 import unittest
 from unittest import mock
 
@@ -22,6 +23,10 @@ _GATE_ENVIRONMENT_NAMES = (
     "SMART_PICKUP_PREVIEW_PROBE",
     "SMART_PICKUP_SCENE_PROBE",
 )
+_HEADLESS_ORACLE_ENVIRONMENT_NAMES = (
+    "SMART_PICKUP_FULL_PACK",
+    "SMART_PICKUP_HEADLESS_ORACLE",
+)
 
 _EXPECTED_DATABASE_SHA256 = (
     "4d3b65f73e9a207988aaaebded36b988f811ec068988c7e829732701d9d2da1b"
@@ -31,6 +36,7 @@ _EXPECTED_FEATURES_SHA256 = (
 )
 _EXPECTED_CLIP_COUNT = 2045
 _EXPECTED_FRAME_COUNT = 511250
+_EXPECTED_SCENARIO_REPEAT_COUNT = 10
 _TARGET_SEQUENCE_ID = "pickup_table__beer_10__001"
 
 _PREVIEW_AUTHORITY = {
@@ -87,6 +93,27 @@ _EXPECTED_TARGET = {
     },
     "sequence_id": _TARGET_SEQUENCE_ID,
 }
+
+_EXPECTED_SLOT_PROVENANCE = (
+    {
+        "slot_id": 1,
+        "sequence_id": "pickup_table__alcohol_10__005",
+        "entry_local_frame": 125,
+        "contact_local_frame": 150,
+    },
+    {
+        "slot_id": 2,
+        "sequence_id": "pickup_table__alcohol_13__005",
+        "entry_local_frame": 118,
+        "contact_local_frame": 143,
+    },
+    {
+        "slot_id": 3,
+        "sequence_id": "pickup_table__apple_1__000",
+        "entry_local_frame": 90,
+        "contact_local_frame": 115,
+    },
+)
 
 _F32_HEX = re.compile(r"0x[0-9a-f]{8}\Z")
 _REASON_NAMES = {
@@ -170,6 +197,48 @@ _SELECTED_KEYS = {
     "target_registry_registration_count",
 }
 _SCENE_KEYS = {"record_type", "slots", "target"}
+_ATTACHMENT_KEYS = {
+    "attached",
+    "attachment_edges",
+    "carry_object_displacement_m",
+    "carry_root_displacement_m",
+    "grasp_preserved",
+    "owner_request",
+    "post_carry_tick_observed",
+    "release_edges",
+    "target_generation_after",
+    "target_generation_before",
+    "target_state",
+    "source_id",
+    "source_join_key_sha256",
+    "source_sequence_id",
+    "source_object_id",
+    "source_clip_ordinal",
+    "source_range_start",
+    "source_range_stop",
+    "source_entry_global_frame",
+    "source_contact_global_frame",
+    "source_lift_global_frame",
+    "source_hold_global_frame",
+    "source_reverse_start_global_frame",
+    "source_active_hand",
+    "source_object_profile_id",
+    "source_object_bounds_f32_hex",
+    "source_hand_in_object_f32_hex",
+    "source_support_height_f32_hex",
+}
+_HEADLESS_ORACLE_IDENTITY_KEYS = _ATTACHMENT_KEYS | {
+    "case_id",
+    "record_type",
+    "repeat",
+    "request_id",
+    "request_count",
+    "selected_slot_contact_local_frame",
+    "selected_slot_entry_local_frame",
+    "selected_slot_id",
+    "selected_slot_sequence_id",
+    "terminal_state",
+}
 
 
 def _fail(message):
@@ -854,13 +923,58 @@ def _gate_environment_paths_or_skip():
     return tuple(_environment_path(name) for name in _GATE_ENVIRONMENT_NAMES)
 
 
+def _headless_oracle_environment_paths_or_skip():
+    configured = {
+        name: os.environ.get(name)
+        for name in _HEADLESS_ORACLE_ENVIRONMENT_NAMES
+    }
+    if all(value is None for value in configured.values()):
+        raise unittest.SkipTest(
+            "smart-pickup headless oracle gate is not configured; set all of "
+            + ", ".join(_HEADLESS_ORACLE_ENVIRONMENT_NAMES)
+        )
+    missing = [
+        name
+        for name, value in configured.items()
+        if type(value) is not str or not value.strip()
+    ]
+    _require(
+        not missing,
+        "smart-pickup headless oracle gate is partially configured; "
+        "missing or empty: " + ", ".join(missing),
+    )
+    return tuple(
+        _environment_path(name) for name in _HEADLESS_ORACLE_ENVIRONMENT_NAMES
+    )
+
+
 def _preflight_full_pack(full_pack):
     manifest = _load_json(full_pack / "manifest.json", "full-pack manifest")
     validation = _load_json(
         full_pack / "validation_report.json", "full-pack validation report"
     )
     report = _load_json(_TASK4_REPORT, "Task4 slot candidate report")
-    clips, _ = _manifest_clips(manifest)
+    clips, sequence_to_ordinal = _manifest_clips(manifest)
+    _require(
+        type(manifest.get("schema_version")) is int
+        and manifest["schema_version"] == 1,
+        "full-pack manifest schema_version must be 1",
+    )
+    _require(
+        type(manifest.get("target_fps")) in (int, float)
+        and manifest["target_fps"] == 25.0,
+        "full-pack manifest target_fps must be 25.0",
+    )
+    _require(
+        type(validation.get("schema_version")) is int
+        and validation["schema_version"] == 1,
+        "full-pack validation schema_version must be 1",
+    )
+    _require(
+        type(report.get("schema_version")) is int
+        and report["schema_version"] == 1,
+        "Task4 report schema_version must be 1",
+    )
     _require(
         manifest.get("diagnostic_limit") is None,
         "full-pack manifest diagnostic_limit must be null",
@@ -887,7 +1001,7 @@ def _preflight_full_pack(full_pack):
         features_hash == _EXPECTED_FEATURES_SHA256,
         "full-pack features SHA-256 differs from the reviewed corpus",
     )
-    _report_candidates(report)
+    candidates = _report_candidates(report)
     _require(
         report.get("target", {}).get("sequence_id") == _TARGET_SEQUENCE_ID,
         "Task4 report target sequence differs from frozen beer target",
@@ -902,7 +1016,263 @@ def _preflight_full_pack(full_pack):
         == _EXPECTED_TARGET["contact_local_frame"],
         "Task4 target contact provenance differs",
     )
+    for expected in _EXPECTED_SLOT_PROVENANCE:
+        sequence_id = expected["sequence_id"]
+        matching_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate["sequence_id"] == sequence_id
+        ]
+        _require(
+            len(matching_candidates) == 1,
+            "Task4 report must contain exactly one baked slot provenance "
+            f"sequence: {sequence_id}",
+        )
+        candidate = matching_candidates[0]
+        _require(
+            candidate["entry_local_frame"]
+            == expected["entry_local_frame"],
+            f"Task4 baked slot {expected['slot_id']} entry provenance differs",
+        )
+        _require(
+            candidate["contact_local_frame"]
+            == expected["contact_local_frame"],
+            f"Task4 baked slot {expected['slot_id']} contact provenance differs",
+        )
+        _require(
+            sequence_id in sequence_to_ordinal,
+            "full-pack manifest is missing baked slot provenance sequence: "
+            f"{sequence_id}",
+        )
+        clip = clips[sequence_to_ordinal[sequence_id]]
+        clip_length = clip["range_stop"] - clip["range_start"]
+        _require(
+            0
+            <= expected["entry_local_frame"]
+            < expected["contact_local_frame"]
+            < clip_length,
+            f"baked slot {expected['slot_id']} provenance is outside its "
+            "manifest range",
+        )
     return manifest, report
+
+
+def _validate_headless_oracle_identity(records, manifest):
+    _require(type(records) is list, "headless oracle evidence must be an array")
+    _require(records, "headless oracle evidence must contain case results")
+    clips, _ = _manifest_clips(manifest)
+    expected_slots = {
+        provenance["slot_id"]: provenance
+        for provenance in _EXPECTED_SLOT_PROVENANCE
+    }
+    seen_case_repeats = set()
+    case_order = []
+    identities_by_case = {}
+    repeats_by_case = {}
+    for index, record in enumerate(records):
+        label = f"headless oracle case result {index}"
+        _require_exact_keys(record, _HEADLESS_ORACLE_IDENTITY_KEYS, label)
+        _require(
+            record["record_type"] == "case_result",
+            f"{label}.record_type must be case_result",
+        )
+        case_id = record["case_id"]
+        repeat = record["repeat"]
+        _require_string(case_id, f"{label}.case_id")
+        _require_int(repeat, f"{label}.repeat")
+        case_repeat = (case_id, repeat)
+        _require(
+            case_repeat not in seen_case_repeats,
+            f"headless oracle case/repeat is duplicated: {case_repeat}",
+        )
+        seen_case_repeats.add(case_repeat)
+        case_order.append(case_repeat)
+
+        slot_id = record["selected_slot_id"]
+        _require_int(slot_id, f"{label}.selected_slot_id", minimum=1)
+        _require(
+            slot_id in expected_slots,
+            f"{label}.selected_slot_id is not baked",
+        )
+        expected_slot = expected_slots[slot_id]
+        for field in (
+            "sequence_id",
+            "entry_local_frame",
+            "contact_local_frame",
+        ):
+            record_field = f"selected_slot_{field}"
+            _require(
+                record[record_field] == expected_slot[field],
+                f"{label}.{record_field} differs from baked slot {slot_id}",
+            )
+
+        source_ordinal = record["source_clip_ordinal"]
+        _require_int(source_ordinal, f"{label}.source_clip_ordinal")
+        _require(
+            source_ordinal < len(clips),
+            f"{label}.source_clip_ordinal is outside manifest",
+        )
+        source_clip = clips[source_ordinal]
+        _require_int(
+            record["source_range_start"],
+            f"{label}.source_range_start",
+        )
+        _require_int(
+            record["source_range_stop"],
+            f"{label}.source_range_stop",
+            minimum=1,
+        )
+        _require(
+            record["source_range_start"] == source_clip["range_start"]
+            and record["source_range_stop"] == source_clip["range_stop"],
+            f"{label} source range does not join through clip ordinal",
+        )
+        _require_int(
+            record["source_active_hand"],
+            f"{label}.source_active_hand",
+        )
+        _require(
+            record["source_active_hand"] == source_clip["active_hand"],
+            f"{label}.source_active_hand differs from joined manifest clip",
+        )
+        for field in (
+            "source_entry_global_frame",
+            "source_contact_global_frame",
+            "source_lift_global_frame",
+            "source_hold_global_frame",
+        ):
+            _require_int(record[field], f"{label}.{field}")
+        _require(
+            record["source_range_start"]
+            <= record["source_entry_global_frame"]
+            < record["source_contact_global_frame"]
+            < record["source_lift_global_frame"]
+            < record["source_hold_global_frame"]
+            < record["source_range_stop"],
+            "invalid global event provenance",
+        )
+        _require_int(
+            record["source_object_profile_id"],
+            f"{label}.source_object_profile_id",
+            minimum=1,
+        )
+        for field, count in (
+            ("source_object_bounds_f32_hex", 6),
+            ("source_hand_in_object_f32_hex", 7),
+        ):
+            values = record[field]
+            _require(
+                type(values) is list and len(values) == count,
+                f"{label}.{field} must contain exactly {count} float32 values",
+            )
+            for component, value in enumerate(values):
+                _require_f32_hex(value, f"{label}.{field}[{component}]")
+        _require_f32_hex(
+            record["source_support_height_f32_hex"],
+            f"{label}.source_support_height_f32_hex",
+        )
+
+        _require_int(record["request_id"], f"{label}.request_id", minimum=1)
+        _require_int(record["request_count"], f"{label}.request_count")
+        _require(record["request_count"] == 1, "request count differs")
+        _require_string(record["terminal_state"], f"{label}.terminal_state")
+        _require(record["terminal_state"] == "Carry", "pickup must end in Carry")
+        _require_string(record["target_state"], f"{label}.target_state")
+        _require(record["target_state"] == "Held", "pickup target must be Held")
+        for field in (
+            "attached",
+            "post_carry_tick_observed",
+            "grasp_preserved",
+        ):
+            _require(
+                type(record[field]) is bool,
+                f"{label}.{field} must be a JSON boolean",
+            )
+        _require(record["attached"] is True, "pickup must be attached")
+        _require_int(
+            record["attachment_edges"], f"{label}.attachment_edges"
+        )
+        _require(record["attachment_edges"] == 1, "pickup needs one attach edge")
+        _require_int(record["release_edges"], f"{label}.release_edges")
+        _require(record["release_edges"] == 0, "pickup must not release")
+        _require_int(record["owner_request"], f"{label}.owner_request")
+        _require(
+            record["owner_request"] == record["request_id"], "owner differs"
+        )
+        _require_int(
+            record["target_generation_before"],
+            f"{label}.target_generation_before",
+            minimum=1,
+        )
+        _require_int(
+            record["target_generation_after"],
+            f"{label}.target_generation_after",
+            minimum=1,
+        )
+        _require(
+            record["target_generation_after"]
+            == record["target_generation_before"],
+            "pickup changed generation",
+        )
+        _require(
+            record["post_carry_tick_observed"] is True, "missing Carry tick"
+        )
+        _require(record["grasp_preserved"] is True, "Carry lost the grasp")
+        for field in (
+            "carry_root_displacement_m",
+            "carry_object_displacement_m",
+        ):
+            _require_number(record[field], f"{label}.{field}")
+            _require(record[field] > 0.0, f"{label}.{field} must be positive")
+        _require_int(record["source_id"], f"{label}.source_id")
+        _require(record["source_id"] == 0, "Task 1 must not fake certification")
+        _require(
+            type(record["source_join_key_sha256"]) is str
+            and record["source_join_key_sha256"] == "",
+            "Task 1 must leave the certification join empty",
+        )
+        _require(
+            type(record["source_sequence_id"]) is str
+            and record["source_sequence_id"] == "",
+            "unexpected sequence identity",
+        )
+        _require(
+            type(record["source_object_id"]) is str
+            and record["source_object_id"] == "",
+            "unexpected object identity",
+        )
+        _require(
+            type(record["source_reverse_start_global_frame"]) is int
+            and record["source_reverse_start_global_frame"] == -1,
+            "unexpected reverse-start identity",
+        )
+
+        stable_identity = tuple(
+            _canonical_json(record[field])
+            for field in sorted(
+                _HEADLESS_ORACLE_IDENTITY_KEYS
+                - {"case_id", "record_type", "repeat"}
+            )
+        )
+        identities_by_case.setdefault(case_id, set()).add(stable_identity)
+        repeats_by_case.setdefault(case_id, []).append(repeat)
+
+    _require(
+        case_order == sorted(case_order),
+        "headless oracle case results must be in stable case/repeat order",
+    )
+    for case_id, identities in identities_by_case.items():
+        _require(
+            len(identities) == 1,
+            f"headless oracle identity changed across repeats for {case_id}",
+        )
+        repeats = repeats_by_case[case_id]
+        _require(
+            repeats == list(range(_EXPECTED_SCENARIO_REPEAT_COUNT)),
+            "headless oracle repeats must be exactly "
+            f"0..{_EXPECTED_SCENARIO_REPEAT_COUNT - 1} for {case_id}",
+        )
+    return records
 
 
 def _run_probe(arguments, label):
@@ -925,6 +1295,60 @@ def _run_probe(arguments, label):
     )
     _require(bool(completed.stdout.strip()), f"{label} emitted no JSON evidence")
     return completed.stdout
+
+
+def _parse_headless_oracle_jsonl(text):
+    _require(type(text) is str and bool(text), "headless oracle JSONL is empty")
+    lines = text.splitlines()
+    _require(lines, "headless oracle JSONL has no records")
+    records = []
+    for index, line in enumerate(lines):
+        _require(bool(line.strip()), f"headless oracle JSONL line {index} is blank")
+        record = _parse_json_object(
+            line, f"headless oracle JSONL line {index}"
+        )
+        _require(
+            record.get("record_type") == "case_result",
+            f"headless oracle JSONL line {index} must be a case_result",
+        )
+        records.append(record)
+    return records
+
+
+def _run_headless_oracle_gate(full_pack, oracle):
+    manifest, _report = _preflight_full_pack(full_pack)
+    _require(
+        oracle.is_file() and os.access(oracle, os.X_OK),
+        f"required smart-pickup headless oracle is unavailable: {oracle}",
+    )
+    _require(
+        _FLAT_DATABASE.is_file(),
+        f"ordinary flat runtime database is missing: {_FLAT_DATABASE}",
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="smart-pickup-headless-oracle-"
+    ) as temporary_directory:
+        evidence_path = Path(temporary_directory) / "case-results.jsonl"
+        _run_probe(
+            [
+                oracle,
+                _FLAT_DATABASE,
+                full_pack,
+                "--jsonl",
+                evidence_path,
+            ],
+            "smart-pickup headless oracle",
+        )
+        _require(
+            evidence_path.is_file(),
+            "smart-pickup headless oracle did not publish JSONL evidence",
+        )
+        try:
+            evidence_text = evidence_path.read_text(encoding="utf-8")
+        except OSError as error:
+            _fail(f"could not read headless oracle evidence: {error}")
+    records = _parse_headless_oracle_jsonl(evidence_text)
+    return _validate_headless_oracle_identity(records, manifest)
 
 
 def _synthetic_fixture():
@@ -1088,6 +1512,144 @@ def _synthetic_fixture():
     return manifest, report, preview_candidates, selected, scene
 
 
+def _synthetic_preflight_fixture():
+    dataset_id = "synthetic/smart-pickup-full-pack"
+    clips = []
+    for ordinal in range(_EXPECTED_CLIP_COUNT):
+        if ordinal < len(_EXPECTED_SLOT_PROVENANCE):
+            sequence_id = _EXPECTED_SLOT_PROVENANCE[ordinal]["sequence_id"]
+        else:
+            sequence_id = f"pickup_table__synthetic__{ordinal:04d}"
+        clips.append(
+            {
+                "active_hand": 1,
+                "range_start": ordinal * 250,
+                "range_stop": (ordinal + 1) * 250,
+                "sequence_id": sequence_id,
+            }
+        )
+    retained_candidates = []
+    for ordinal, provenance in enumerate(_EXPECTED_SLOT_PROVENANCE):
+        retained_candidates.append(
+            {
+                "active_hand": 1,
+                "contact_local_frame": provenance["contact_local_frame"],
+                "entry_local_frame": provenance["entry_local_frame"],
+                "root_x_object_m": -0.40 - 0.01 * ordinal,
+                "root_yaw_object_radians": 1.20 + 0.10 * ordinal,
+                "root_z_object_m": -0.10 - 0.05 * ordinal,
+                "sequence_id": provenance["sequence_id"],
+                "stable_key": [
+                    dataset_id,
+                    1,
+                    provenance["sequence_id"],
+                    provenance["entry_local_frame"],
+                    1,
+                ],
+                "static_path_feasible": True,
+            }
+        )
+    return {
+        "manifest": {
+            "clips": clips,
+            "diagnostic_limit": None,
+            "schema_version": 1,
+            "target_fps": 25.0,
+        },
+        "validation": {
+            "included_frames": _EXPECTED_FRAME_COUNT,
+            "schema_version": 1,
+        },
+        "report": {
+            "dataset_id": dataset_id,
+            "retained_candidates": retained_candidates,
+            "schema_version": 1,
+            "target": {
+                "contact_local_frame": _EXPECTED_TARGET[
+                    "contact_local_frame"
+                ],
+                "entry_local_frame": _EXPECTED_TARGET[
+                    "entry_local_frame"
+                ],
+                "sequence_id": _TARGET_SEQUENCE_ID,
+            },
+        },
+        "hashes": {
+            "interaction_database.bin": _EXPECTED_DATABASE_SHA256,
+            "interaction_features.bin": _EXPECTED_FEATURES_SHA256,
+        },
+    }
+
+
+def _synthetic_headless_oracle_records(manifest):
+    records = []
+    cases = (
+        ("clear_front", 1, 10),
+        ("clear_left", 2, 11),
+        ("clear_right", 3, 12),
+    )
+    expected_by_slot = {
+        value["slot_id"]: value for value in _EXPECTED_SLOT_PROVENANCE
+    }
+    for case_id, slot_id, matcher_ordinal in cases:
+        slot = expected_by_slot[slot_id]
+        clip = manifest["clips"][matcher_ordinal]
+        for repeat in range(_EXPECTED_SCENARIO_REPEAT_COUNT):
+            records.append(
+                {
+                    "attached": True,
+                    "attachment_edges": 1,
+                    "case_id": case_id,
+                    "carry_object_displacement_m": 0.02,
+                    "carry_root_displacement_m": 0.02,
+                    "grasp_preserved": True,
+                    "owner_request": 1,
+                    "post_carry_tick_observed": True,
+                    "record_type": "case_result",
+                    "release_edges": 0,
+                    "repeat": repeat,
+                    "request_id": 1,
+                    "request_count": 1,
+                    "selected_slot_contact_local_frame": slot[
+                        "contact_local_frame"
+                    ],
+                    "selected_slot_entry_local_frame": slot[
+                        "entry_local_frame"
+                    ],
+                    "selected_slot_id": slot_id,
+                    "selected_slot_sequence_id": slot["sequence_id"],
+                    "source_active_hand": 1,
+                    "source_clip_ordinal": matcher_ordinal,
+                    "source_contact_global_frame": clip["range_start"] + 90,
+                    "source_entry_global_frame": clip["range_start"] + 70,
+                    "source_hand_in_object_f32_hex": [
+                        _f32_hex(value)
+                        for value in (0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
+                    ],
+                    "source_hold_global_frame": clip["range_start"] + 110,
+                    "source_id": 0,
+                    "source_join_key_sha256": "",
+                    "source_lift_global_frame": clip["range_start"] + 100,
+                    "source_object_bounds_f32_hex": [
+                        _f32_hex(value)
+                        for value in (0.0, 0.0, 0.0, 0.04, 0.10, 0.04)
+                    ],
+                    "source_object_id": "",
+                    "source_object_profile_id": 1,
+                    "source_range_start": clip["range_start"],
+                    "source_range_stop": clip["range_stop"],
+                    "source_reverse_start_global_frame": -1,
+                    "source_sequence_id": "",
+                    "source_support_height_f32_hex": _f32_hex(0.38),
+                    "target_generation_after": 1,
+                    "target_generation_before": 1,
+                    "target_state": "Held",
+                    "terminal_state": "Carry",
+                }
+            )
+    return records
+
+
 def _canonical_json(value):
     return _canonical_json_bytes(value).decode("ascii")
 
@@ -1095,6 +1657,345 @@ def _canonical_json(value):
 def _mutated_hex(value):
     return f"0x{int(value, 16) ^ 1:08x}"
 
+
+class SmartPickupFullPackPreflightTests(unittest.TestCase):
+    def _preflight(self, fixture):
+        def load_json(path, _label):
+            path = Path(path)
+            if path.name == "manifest.json":
+                return fixture["manifest"]
+            if path.name == "validation_report.json":
+                return fixture["validation"]
+            if path == _TASK4_REPORT:
+                return fixture["report"]
+            raise AssertionError(f"unexpected JSON path: {path}")
+
+        def sha256(path, _label):
+            path = Path(path)
+            try:
+                return fixture["hashes"][path.name]
+            except KeyError as error:
+                raise AssertionError(f"unexpected hash path: {path}") from error
+
+        with mock.patch(
+            f"{__name__}._load_json", side_effect=load_json
+        ), mock.patch(f"{__name__}._sha256", side_effect=sha256):
+            return _preflight_full_pack(Path("synthetic/full-pack"))
+
+    def test_preflight_accepts_complete_reviewed_identity(self):
+        fixture = _synthetic_preflight_fixture()
+
+        manifest, report = self._preflight(fixture)
+
+        self.assertIs(manifest, fixture["manifest"])
+        self.assertIs(report, fixture["report"])
+
+    def test_preflight_rejects_each_pack_identity_field(self):
+        mutations = {
+            "manifest schema": lambda fixture: fixture["manifest"].__setitem__(
+                "schema_version", 2
+            ),
+            "manifest rate": lambda fixture: fixture["manifest"].__setitem__(
+                "target_fps", 24.0
+            ),
+            "diagnostic limit": lambda fixture: fixture[
+                "manifest"
+            ].__setitem__("diagnostic_limit", 5),
+            "clip count": lambda fixture: fixture["manifest"]["clips"].pop(),
+            "validation schema": lambda fixture: fixture[
+                "validation"
+            ].__setitem__("schema_version", 2),
+            "report schema": lambda fixture: fixture["report"].__setitem__(
+                "schema_version", 2
+            ),
+            "included frames": lambda fixture: fixture[
+                "validation"
+            ].__setitem__("included_frames", _EXPECTED_FRAME_COUNT - 1),
+            "database hash": lambda fixture: fixture["hashes"].__setitem__(
+                "interaction_database.bin", "0" * 64
+            ),
+            "features hash": lambda fixture: fixture["hashes"].__setitem__(
+                "interaction_features.bin", "0" * 64
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(field=label):
+                fixture = _synthetic_preflight_fixture()
+                mutate(fixture)
+                with self.assertRaises(AssertionError):
+                    self._preflight(fixture)
+
+    def test_preflight_rejects_each_baked_slot_provenance_join(self):
+        for ordinal, expected in enumerate(_EXPECTED_SLOT_PROVENANCE):
+            with self.subTest(slot=expected["slot_id"], field="manifest sequence"):
+                fixture = _synthetic_preflight_fixture()
+                fixture["manifest"]["clips"][ordinal]["sequence_id"] = (
+                    f"pickup_table__missing__{ordinal:04d}"
+                )
+                with self.assertRaises(AssertionError):
+                    self._preflight(fixture)
+
+            with self.subTest(slot=expected["slot_id"], field="report sequence"):
+                fixture = _synthetic_preflight_fixture()
+                candidate = fixture["report"]["retained_candidates"][ordinal]
+                candidate["sequence_id"] += "__mutated"
+                candidate["stable_key"][2] = candidate["sequence_id"]
+                with self.assertRaises(AssertionError):
+                    self._preflight(fixture)
+
+            with self.subTest(slot=expected["slot_id"], field="entry frame"):
+                fixture = _synthetic_preflight_fixture()
+                candidate = fixture["report"]["retained_candidates"][ordinal]
+                candidate["entry_local_frame"] += 1
+                candidate["stable_key"][3] = candidate["entry_local_frame"]
+                with self.assertRaises(AssertionError):
+                    self._preflight(fixture)
+
+            with self.subTest(slot=expected["slot_id"], field="contact frame"):
+                fixture = _synthetic_preflight_fixture()
+                fixture["report"]["retained_candidates"][ordinal][
+                    "contact_local_frame"
+                ] += 1
+                with self.assertRaises(AssertionError):
+                    self._preflight(fixture)
+
+            with self.subTest(slot=expected["slot_id"], field="manifest range"):
+                fixture = _synthetic_preflight_fixture()
+                clip = fixture["manifest"]["clips"][ordinal]
+                clip["range_stop"] = (
+                    clip["range_start"] + expected["contact_local_frame"]
+                )
+                with self.assertRaises(AssertionError):
+                    self._preflight(fixture)
+
+
+class SmartPickupHeadlessOracleIdentityTests(unittest.TestCase):
+    def setUp(self):
+        self.manifest = _synthetic_preflight_fixture()["manifest"]
+        self.records = _synthetic_headless_oracle_records(self.manifest)
+
+    def assert_identity_rejected(self, mutate):
+        records = copy.deepcopy(self.records)
+        mutate(records)
+        with self.assertRaises(AssertionError):
+            _validate_headless_oracle_identity(records, self.manifest)
+
+    def test_accepts_stable_case_results_joined_to_manifest(self):
+        validated = _validate_headless_oracle_identity(
+            self.records, self.manifest
+        )
+
+        self.assertEqual(validated, self.records)
+
+    def test_rejects_each_identity_and_provenance_field_independently(self):
+        mutations = {
+            "record_type": lambda records: records[0].__setitem__(
+                "record_type", "tick"
+            ),
+            "case_id": lambda records: records[0].__setitem__("case_id", ""),
+            "repeat": lambda records: records[0].__setitem__("repeat", -1),
+            "selected_slot_id": lambda records: records[0].__setitem__(
+                "selected_slot_id", 2
+            ),
+            "selected_slot_sequence_id": lambda records: records[0].__setitem__(
+                "selected_slot_sequence_id", "pickup_table__wrong__001"
+            ),
+            "selected_slot_entry_local_frame": lambda records: records[
+                0
+            ].__setitem__(
+                "selected_slot_entry_local_frame",
+                records[0]["selected_slot_entry_local_frame"] + 1,
+            ),
+            "selected_slot_contact_local_frame": lambda records: records[
+                0
+            ].__setitem__(
+                "selected_slot_contact_local_frame",
+                records[0]["selected_slot_contact_local_frame"] + 1,
+            ),
+            "attached": lambda records: records[0].__setitem__(
+                "attached", False
+            ),
+            "attachment_edges": lambda records: records[0].__setitem__(
+                "attachment_edges", 2
+            ),
+            "carry_object_displacement_m": lambda records: records[
+                0
+            ].__setitem__("carry_object_displacement_m", 0.0),
+            "carry_root_displacement_m": lambda records: records[0].__setitem__(
+                "carry_root_displacement_m", 0.0
+            ),
+            "grasp_preserved": lambda records: records[0].__setitem__(
+                "grasp_preserved", False
+            ),
+            "owner_request": lambda records: records[0].__setitem__(
+                "owner_request", records[0]["request_id"] + 1
+            ),
+            "post_carry_tick_observed": lambda records: records[
+                0
+            ].__setitem__(
+                "post_carry_tick_observed", False
+            ),
+            "release_edges": lambda records: records[0].__setitem__(
+                "release_edges", 1
+            ),
+            "target_generation_after": lambda records: records[0].__setitem__(
+                "target_generation_after",
+                records[0]["target_generation_before"] + 1,
+            ),
+            "target_generation_before": lambda records: records[0].__setitem__(
+                "target_generation_before", 0
+            ),
+            "target_state": lambda records: records[0].__setitem__(
+                "target_state", "Free"
+            ),
+            "source_id": lambda records: records[0].__setitem__(
+                "source_id", 1
+            ),
+            "source_join_key_sha256": lambda records: records[0].__setitem__(
+                "source_join_key_sha256", "0" * 64
+            ),
+            "source_sequence_id": lambda records: records[0].__setitem__(
+                "source_sequence_id", "pickup_table__wrong__002"
+            ),
+            "source_object_id": lambda records: records[0].__setitem__(
+                "source_object_id", "wrong_object"
+            ),
+            "source_clip_ordinal": lambda records: records[0].__setitem__(
+                "source_clip_ordinal",
+                records[0]["source_clip_ordinal"] + 1,
+            ),
+            "source_range_start": lambda records: records[0].__setitem__(
+                "source_range_start", records[0]["source_range_start"] + 1
+            ),
+            "source_range_stop": lambda records: records[0].__setitem__(
+                "source_range_stop", records[0]["source_range_stop"] - 1
+            ),
+            "source_entry_global_frame": lambda records: records[
+                0
+            ].__setitem__(
+                "source_entry_global_frame",
+                records[0]["source_contact_global_frame"],
+            ),
+            "source_contact_global_frame": lambda records: records[
+                0
+            ].__setitem__(
+                "source_contact_global_frame",
+                records[0]["source_entry_global_frame"],
+            ),
+            "source_lift_global_frame": lambda records: records[0].__setitem__(
+                "source_lift_global_frame",
+                records[0]["source_contact_global_frame"],
+            ),
+            "source_hold_global_frame": lambda records: records[0].__setitem__(
+                "source_hold_global_frame",
+                records[0]["source_lift_global_frame"],
+            ),
+            "source_reverse_start_global_frame": lambda records: records[
+                0
+            ].__setitem__("source_reverse_start_global_frame", 0),
+            "source_active_hand": lambda records: records[0].__setitem__(
+                "source_active_hand", 0
+            ),
+            "source_object_profile_id": lambda records: records[0].__setitem__(
+                "source_object_profile_id", 0
+            ),
+            "source_object_bounds_f32_hex": lambda records: records[0][
+                "source_object_bounds_f32_hex"
+            ].__setitem__(
+                0,
+                _mutated_hex(
+                    records[0]["source_object_bounds_f32_hex"][0]
+                ),
+            ),
+            "source_hand_in_object_f32_hex": lambda records: records[0][
+                "source_hand_in_object_f32_hex"
+            ].__setitem__(
+                6,
+                _mutated_hex(
+                    records[0]["source_hand_in_object_f32_hex"][6]
+                ),
+            ),
+            "source_support_height_f32_hex": lambda records: records[
+                0
+            ].__setitem__(
+                "source_support_height_f32_hex",
+                _mutated_hex(records[0]["source_support_height_f32_hex"]),
+            ),
+            "request_id": lambda records: records[0].__setitem__(
+                "request_id", 0
+            ),
+            "request_count": lambda records: records[0].__setitem__(
+                "request_count", 2
+            ),
+            "terminal_state": lambda records: records[0].__setitem__(
+                "terminal_state", "Locomotion"
+            ),
+        }
+        for field, mutate in mutations.items():
+            with self.subTest(field=field):
+                self.assert_identity_rejected(mutate)
+
+    def test_rejects_duplicate_gapped_or_unstable_case_repeats(self):
+        self.assert_identity_rejected(
+            lambda records: records[1].__setitem__("repeat", 0)
+        )
+        self.assert_identity_rejected(
+            lambda records: records[1].__setitem__("repeat", 2)
+        )
+
+        def change_slot_self_consistently(records):
+            slot = _EXPECTED_SLOT_PROVENANCE[1]
+            records[1].update(
+                selected_slot_id=slot["slot_id"],
+                selected_slot_sequence_id=slot["sequence_id"],
+                selected_slot_entry_local_frame=slot["entry_local_frame"],
+                selected_slot_contact_local_frame=slot[
+                    "contact_local_frame"
+                ],
+            )
+
+        self.assert_identity_rejected(change_slot_self_consistently)
+
+        def change_source_self_consistently(records):
+            record = records[1]
+            old_start = record["source_range_start"]
+            ordinal = record["source_clip_ordinal"] + 1
+            clip = self.manifest["clips"][ordinal]
+            record.update(
+                source_active_hand=clip["active_hand"],
+                source_clip_ordinal=ordinal,
+                source_range_start=clip["range_start"],
+                source_range_stop=clip["range_stop"],
+                source_entry_global_frame=clip["range_start"]
+                + record["source_entry_global_frame"]
+                - old_start,
+                source_contact_global_frame=clip["range_start"]
+                + record["source_contact_global_frame"]
+                - old_start,
+                source_lift_global_frame=clip["range_start"]
+                + record["source_lift_global_frame"]
+                - old_start,
+                source_hold_global_frame=clip["range_start"]
+                + record["source_hold_global_frame"]
+                - old_start,
+            )
+
+        self.assert_identity_rejected(change_source_self_consistently)
+
+    def test_rejects_missing_or_extra_required_repeat(self):
+        missing = copy.deepcopy(self.records)
+        del missing[_EXPECTED_SCENARIO_REPEAT_COUNT - 1]
+        with self.assertRaises(AssertionError):
+            _validate_headless_oracle_identity(missing, self.manifest)
+
+        extra = copy.deepcopy(self.records)
+        extra_record = copy.deepcopy(
+            extra[_EXPECTED_SCENARIO_REPEAT_COUNT - 1]
+        )
+        extra_record["repeat"] = _EXPECTED_SCENARIO_REPEAT_COUNT
+        extra.insert(_EXPECTED_SCENARIO_REPEAT_COUNT, extra_record)
+        with self.assertRaises(AssertionError):
+            _validate_headless_oracle_identity(extra, self.manifest)
 
 class SmartPickupContractTests(unittest.TestCase):
     def assert_contract_rejected(
@@ -1487,6 +2388,68 @@ class SmartPickupContractTests(unittest.TestCase):
 
 
 class SmartPickupFullPackGateTests(unittest.TestCase):
+    def test_headless_oracle_environment_is_independent_and_atomic(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(
+                unittest.SkipTest,
+                "smart-pickup headless oracle gate is not configured",
+            ):
+                _headless_oracle_environment_paths_or_skip()
+
+        for configured_name in _HEADLESS_ORACLE_ENVIRONMENT_NAMES:
+            with self.subTest(configured=configured_name):
+                with mock.patch.dict(
+                    os.environ,
+                    {configured_name: "configured/value"},
+                    clear=True,
+                ):
+                    with self.assertRaises(AssertionError) as caught:
+                        _headless_oracle_environment_paths_or_skip()
+                missing = next(
+                    name
+                    for name in _HEADLESS_ORACLE_ENVIRONMENT_NAMES
+                    if name != configured_name
+                )
+                self.assertIn(missing, str(caught.exception))
+
+        configured = {
+            name: f"configured/{index}"
+            for index, name in enumerate(_HEADLESS_ORACLE_ENVIRONMENT_NAMES)
+        }
+        with mock.patch.dict(os.environ, configured, clear=True):
+            paths = _headless_oracle_environment_paths_or_skip()
+        self.assertEqual(
+            paths,
+            tuple(
+                _REPOSITORY / configured[name]
+                for name in _HEADLESS_ORACLE_ENVIRONMENT_NAMES
+            ),
+        )
+
+    def test_preflight_failure_prevents_headless_oracle_subprocess(self):
+        with mock.patch(
+            f"{__name__}._preflight_full_pack",
+            side_effect=AssertionError("preflight rejected"),
+        ) as preflight, mock.patch(
+            f"{__name__}._run_probe"
+        ) as run_probe:
+            with self.assertRaisesRegex(AssertionError, "preflight rejected"):
+                _run_headless_oracle_gate(
+                    Path("invalid/full-pack"), Path("missing/oracle")
+                )
+
+        preflight.assert_called_once_with(Path("invalid/full-pack"))
+        run_probe.assert_not_called()
+
+    def test_full_pack_headless_oracle_joins_runtime_clip_identity(self):
+        full_pack, oracle = _headless_oracle_environment_paths_or_skip()
+
+        records = _run_headless_oracle_gate(full_pack, oracle)
+
+        self.assertTrue(records)
+
+
+class SmartPickupPreviewAndSceneGateTests(unittest.TestCase):
     def _assert_gate_environment_contract(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(
