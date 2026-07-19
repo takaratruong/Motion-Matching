@@ -178,11 +178,28 @@ def _real_derivation_array(values, shape, label: str) -> np.ndarray:
     return np.array(source, dtype=np.float64, copy=True, order="C")
 
 
+def _relative_angle_within_limit(
+    start: float,
+    end: float,
+    limit: float,
+) -> bool:
+    change = abs(math.remainder(end - start, math.tau))
+    if change <= limit:
+        return True
+    # Each stored endpoint is within half an ULP of its source value. Compare
+    # the excess directly so rounding cannot widen the limit itself.
+    endpoint_error = (
+        0.5 * math.ulp(start)
+        + 0.5 * math.ulp(end)
+    )
+    return change - limit <= endpoint_error
+
+
 def _direction_mask(
     dx: float,
     dz: float,
     heading: float,
-    heading_change: float,
+    horizon_heading: float,
     distance: float,
 ) -> int:
     if distance < MOVING_MIN_DISPLACEMENT_METRES:
@@ -204,7 +221,11 @@ def _direction_mask(
         ):
             mask |= bit
 
-    if heading_change > _MAX_LATERAL_HEADING_CHANGE_RADIANS:
+    if not _relative_angle_within_limit(
+        heading,
+        horizon_heading,
+        _MAX_LATERAL_HEADING_CHANGE_RADIANS,
+    ):
         mask &= DIRECTION_FORWARD | DIRECTION_BACKWARD
     return mask or DIRECTION_IDLE
 
@@ -266,14 +287,11 @@ def derive_motion_index(
             dx = float(displacement[0])
             dz = float(displacement[2])
             distance = math.hypot(dx, dz)
-            heading_change = abs(math.remainder(
-                float(headings[horizon] - headings[frame]), math.tau
-            ))
             directions[frame] = _direction_mask(
                 dx,
                 dz,
                 float(headings[frame]),
-                heading_change,
+                float(headings[horizon]),
                 distance,
             )
             speeds[frame] = _speed_mask(distance)

@@ -95,6 +95,23 @@ def _trajectory(
     return derive_motion_index(positions, headings, _bank_index(26))
 
 
+def _lateral_trajectory(heading_degrees, heading_change_degrees):
+    heading = math.radians(heading_degrees)
+    final_heading_degrees = math.remainder(
+        heading_degrees + heading_change_degrees,
+        360.0,
+    )
+    positions = np.zeros((26, 3), dtype=np.float64)
+    positions[:, 0] = np.linspace(0.0, math.cos(heading) * 0.25, 26)
+    positions[:, 2] = np.linspace(0.0, -math.sin(heading) * 0.25, 26)
+    headings = np.linspace(
+        heading,
+        math.radians(final_heading_degrees),
+        26,
+    )
+    return derive_motion_index(positions, headings, _bank_index(26))
+
+
 class MotionIndexDerivationTests(unittest.TestCase):
     def test_numeric_assignments_and_predeclared_thresholds_are_locked(self):
         self.assertEqual(
@@ -214,21 +231,47 @@ class MotionIndexDerivationTests(unittest.TestCase):
         self.assertTrue(np.all(index.direction_masks != 0))
         self.assertTrue(np.all(index.speed_masks != 0))
 
-    def test_lateral_heading_limit_accepts_exactly_fifteen_and_rejects_next_value(self):
+    def test_lateral_heading_limit_keeps_exact_boundary_across_rotated_and_wrapped_baselines(self):
+        for heading_degrees in (0.0, -180.0, -170.0, -90.0, 33.0, 170.0):
+            for heading_change_degrees in (-15.0, 15.0):
+                with self.subTest(
+                    heading_degrees=heading_degrees,
+                    heading_change_degrees=heading_change_degrees,
+                ):
+                    index = _lateral_trajectory(
+                        heading_degrees,
+                        heading_change_degrees,
+                    )
+                    self.assertEqual(
+                        int(index.direction_masks[0]),
+                        DIRECTION_RIGHT,
+                    )
+
+    def test_zero_baseline_lateral_heading_limit_remains_strict_above_boundary(self):
         exact = math.radians(MAX_LATERAL_HEADING_CHANGE_DEGREES)
-        above = np.nextafter(exact, math.inf)
-
-        accepted = _trajectory(
-            travel_degrees=90.0,
-            heading_change_radians=exact,
+        cases = (
+            ("positive-exact", exact, DIRECTION_RIGHT),
+            ("negative-exact", -exact, DIRECTION_RIGHT),
+            (
+                "positive-nextafter",
+                np.nextafter(exact, math.inf),
+                DIRECTION_IDLE,
+            ),
+            (
+                "negative-nextafter",
+                np.nextafter(-exact, -math.inf),
+                DIRECTION_IDLE,
+            ),
+            ("positive-clearly-above", math.radians(30.0), DIRECTION_IDLE),
+            ("negative-clearly-above", math.radians(-30.0), DIRECTION_IDLE),
         )
-        rejected = _trajectory(
-            travel_degrees=90.0,
-            heading_change_radians=above,
-        )
-
-        self.assertEqual(int(accepted.direction_masks[0]), DIRECTION_RIGHT)
-        self.assertEqual(int(rejected.direction_masks[0]), DIRECTION_IDLE)
+        for name, heading_change, expected in cases:
+            with self.subTest(name=name):
+                index = _trajectory(
+                    travel_degrees=90.0,
+                    heading_change_radians=heading_change,
+                )
+                self.assertEqual(int(index.direction_masks[0]), expected)
 
     def test_turning_forward_trajectory_is_never_relabelled_as_strafe_or_diagonal(self):
         index = _trajectory(
