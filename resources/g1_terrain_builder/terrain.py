@@ -10,10 +10,22 @@ import warnings
 import numpy as np
 from pxr import Usd, UsdGeom
 
+from resources import quat as holden_quat
+
+from .sources import load_grail_object_pose
+
 
 LOOKAHEAD = np.array([0.25, 0.50, 0.75, 1.00], np.float64)
 USD_DIR = "/home/ubuntu/datasets/GRAIL/data/curb/object_usd"
 RECON_DIR = "/home/ubuntu/datasets/GRAIL/data/curb/recon"
+# GRAIL object poses are expressed for the Isaac-imported asset basis.  Raw
+# released terrain USD points use the source asset basis; this proper rotation
+# maps those local axes into the simulation frame before applying root_quat.
+GRAIL_ASSET_TO_SIMULATION_BASIS = np.array([
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, -1.0],
+    [-1.0, 0.0, 0.0],
+], np.float64)
 BBOX_TOLERANCE_M = 1e-12
 PROJECTED_AREA_EPSILON_M2 = 1e-12
 BARYCENTRIC_TOLERANCE = 1e-10
@@ -210,8 +222,7 @@ def sample_terrain_features(terrain, centerline: np.ndarray) -> np.ndarray:
     return features
 
 
-def _load_usd_mesh(base: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    path = os.path.join(USD_DIR, base + ".usd")
+def _load_usd_mesh_path(path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     stage = Usd.Stage.Open(path)
     if stage is None:
         raise FileNotFoundError(f"unable to open GRAIL terrain USD: {path}")
@@ -231,6 +242,10 @@ def _load_usd_mesh(base: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             _validate_mesh_topology(points, counts, indices)
             return points, counts, indices
     raise ValueError(f"no mesh found in GRAIL terrain USD: {path}")
+
+
+def _load_usd_mesh(base: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    return _load_usd_mesh_path(os.path.join(USD_DIR, base + ".usd"))
 
 
 def _object_pose0(base: str) -> tuple[np.ndarray, np.ndarray]:
@@ -416,6 +431,17 @@ class GrailTerrain(VerticalTriangleSurface):
         vertices, face_counts, face_indices = _load_usd_mesh(base)
         rotation, translation = _object_pose0(base)
         world_vertices = (rotation @ vertices.T).T + translation
+        return cls(_mujoco_to_holden(world_vertices), face_counts, face_indices)
+
+    @classmethod
+    def from_release(cls, usd_path: str, objects_path: str) -> "GrailTerrain":
+        vertices, face_counts, face_indices = _load_usd_mesh_path(usd_path)
+        pose = load_grail_object_pose(objects_path)
+        scaled_vertices = vertices * pose.scale
+        simulation_vertices = (
+            GRAIL_ASSET_TO_SIMULATION_BASIS @ scaled_vertices.T).T
+        rotation = holden_quat.to_xform(pose.root_quat)
+        world_vertices = (rotation @ simulation_vertices.T).T + pose.root_pos
         return cls(_mujoco_to_holden(world_vertices), face_counts, face_indices)
 
     def footprint(self) -> dict:

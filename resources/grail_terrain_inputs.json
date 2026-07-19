@@ -1,5 +1,59 @@
 {
   "modalities": {
+    "object_usd": {
+      "allowed_globs": [
+        "data/slope/object_usd/*.usd",
+        "data/stair_p1/object_usd/*.usd",
+        "data/stair_p2/object_usd/*.usd"
+      ],
+      "byte_count": 5357565995,
+      "canonical_inventory_sha256": "6bc4a91cee21aa9a98214d557e27c1b86c556f585fe9673f222dd66eae767846",
+      "file_count": 14068,
+      "partitions": {
+        "slope": {
+          "byte_count": 15515596,
+          "file_count": 1880,
+          "path_prefix": "data/slope/object_usd/"
+        },
+        "stair_p1": {
+          "byte_count": 2962501357,
+          "file_count": 6094,
+          "path_prefix": "data/stair_p1/object_usd/"
+        },
+        "stair_p2": {
+          "byte_count": 2379549042,
+          "file_count": 6094,
+          "path_prefix": "data/stair_p2/object_usd/"
+        }
+      }
+    },
+    "objects": {
+      "allowed_globs": [
+        "data/slope/objects/*.pkl",
+        "data/stair_p1/objects/*.pkl",
+        "data/stair_p2/objects/*.pkl"
+      ],
+      "byte_count": 252587908,
+      "canonical_inventory_sha256": "461a6ff0a533dac1bfa069694d491d3382e9a04cab11f1c3268bbf0a94d9f667",
+      "file_count": 14068,
+      "partitions": {
+        "slope": {
+          "byte_count": 36377080,
+          "file_count": 1880,
+          "path_prefix": "data/slope/objects/"
+        },
+        "stair_p1": {
+          "byte_count": 114180950,
+          "file_count": 6094,
+          "path_prefix": "data/stair_p1/objects/"
+        },
+        "stair_p2": {
+          "byte_count": 102029878,
+          "file_count": 6094,
+          "path_prefix": "data/stair_p2/objects/"
+        }
+      }
+    },
     "robot": {
       "allowed_globs": [
         "data/stair_p1/robot/*.pkl",

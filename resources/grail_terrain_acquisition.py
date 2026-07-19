@@ -298,6 +298,7 @@ def validate_inventory_document(manifest, inventory, required_modalities):
     for name in document_modalities:
         _validate_modality_entries(
             name, manifest["modalities"][name], by_modality[name])
+    _validate_basename_coverage(manifest, by_modality)
     return {
         "schema": INVENTORY_SCHEMA,
         "repository": dict(inventory["repository"]),
@@ -312,25 +313,43 @@ def load_inventory(path, manifest, required_modalities):
         required_modalities)
 
 
-def _remote_entry(remote):
+def _remote_entry(remote, repository, hf_download=None):
     path = getattr(remote, "path", None)
     size = getattr(remote, "size", None)
     if size is None:
         return None
+    if type(size) is not int or size < 0:
+        raise ValueError(f"remote byte size changed: {path}")
     lfs = getattr(remote, "lfs", None)
-    if lfs is None:
-        raise ValueError(f"remote input is not LFS-backed: {path}")
-    lfs_size = getattr(lfs, "size", None)
-    if type(size) is not int or type(lfs_size) is not int or size != lfs_size:
-        raise ValueError(f"remote LFS byte size changed: {path}")
+    if lfs is not None:
+        lfs_size = getattr(lfs, "size", None)
+        if type(lfs_size) is not int or size != lfs_size:
+            raise ValueError(f"remote LFS byte size changed: {path}")
+        digest = getattr(lfs, "sha256", None)
+    else:
+        if hf_download is None:
+            from huggingface_hub import hf_hub_download
+            hf_download = hf_hub_download
+        downloaded = Path(hf_download(
+            repo_id=repository["id"], filename=path,
+            repo_type=repository["type"], revision=repository["revision"]))
+        try:
+            metadata = downloaded.stat()
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                f"remote geometry download is missing: {path}") from None
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"remote geometry download is not regular: {path}")
+        if metadata.st_size != size:
+            raise ValueError(
+                f"remote regular-file byte size changed: {path}")
+        digest = sha256_file(downloaded)
     return _canonical_entry({
-        "bytes": size,
-        "path": path,
-        "sha256": getattr(lfs, "sha256", None),
+        "bytes": size, "path": path, "sha256": digest,
     })
 
 
-def build_remote_inventory(manifest, modalities, api=None):
+def build_remote_inventory(manifest, modalities, api=None, hf_download=None):
     manifest = validate_manifest_data(manifest)
     selected = _selected_modalities(manifest, modalities)
     if api is None:
@@ -341,6 +360,11 @@ def build_remote_inventory(manifest, modalities, api=None):
     repository = manifest["repository"]
     for name in selected:
         config = manifest["modalities"][name]
+        target_suffixes = {
+            PurePosixPath(pattern).suffix
+            for pattern in config["allowed_globs"]
+            if PurePosixPath(pattern).suffix
+        }
         for pattern in config["allowed_globs"]:
             prefix = _glob_prefix(pattern)
             if prefix in visited_prefixes:
@@ -352,7 +376,18 @@ def build_remote_inventory(manifest, modalities, api=None):
                 revision=repository["revision"],
                 repo_type=repository["type"])
             for remote in remote_values:
-                entry = _remote_entry(remote)
+                remote_path = getattr(remote, "path", None)
+                if type(remote_path) is not str:
+                    continue
+                if not any(
+                        _path_matches(remote_path, allowed)
+                        for allowed in config["allowed_globs"]):
+                    if PurePosixPath(remote_path).suffix in target_suffixes:
+                        raise ValueError(
+                            f"unexpected remote input: {remote_path}")
+                    continue
+                entry = _remote_entry(
+                    remote, repository, hf_download=hf_download)
                 if entry is None:
                     continue
                 observed_name = _modality_for_path(manifest, entry["path"])
@@ -428,6 +463,16 @@ def _scan_local_inputs(manifest, inventory, root, modalities):
         for name in selected
         for locked in manifest["modalities"][name]["partitions"].values()
     })
+    selected_patterns = [
+        pattern
+        for name in selected
+        for pattern in manifest["modalities"][name]["allowed_globs"]
+    ]
+    selected_suffixes = {
+        PurePosixPath(pattern).suffix
+        for pattern in selected_patterns
+        if PurePosixPath(pattern).suffix
+    }
     for prefix in prefixes:
         directory = Path(root) / prefix
         _ensure_no_symlink_components(root, directory)
@@ -454,8 +499,65 @@ def _scan_local_inputs(manifest, inventory, root, modalities):
                 if not stat.S_ISREG(child_metadata.st_mode):
                     raise ValueError(
                         f"dataset input must be a regular file: {relative}")
-                if relative not in expected:
+                if relative not in expected and any(
+                        _path_matches(relative, pattern)
+                        for pattern in selected_patterns):
                     raise ValueError(f"unexpected local dataset file: {relative}")
+                if relative not in expected \
+                        and PurePosixPath(relative).suffix in selected_suffixes:
+                    raise ValueError(f"unexpected local dataset file: {relative}")
+
+
+def _partition_basename_keys(name, config, entries):
+    keys = []
+    for entry in entries:
+        matches = [
+            partition
+            for partition, locked in config["partitions"].items()
+            if entry["path"].startswith(locked["path_prefix"])
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"{name} inventory path has no unique partition: "
+                f"{entry['path']}")
+        keys.append((matches[0], PurePosixPath(entry["path"]).stem))
+    if len(keys) != len(set(keys)):
+        raise ValueError(f"{name} has duplicate partition basename coverage")
+    return set(keys)
+
+
+def _validate_basename_coverage(manifest, by_modality):
+    if not {"objects", "object_usd"}.issubset(by_modality):
+        return
+    object_keys = _partition_basename_keys(
+        "objects", manifest["modalities"]["objects"],
+        by_modality["objects"])
+    geometry_keys = _partition_basename_keys(
+        "object_usd", manifest["modalities"]["object_usd"],
+        by_modality["object_usd"])
+    if object_keys != geometry_keys:
+        raise ValueError("object/geometry basename coverage mismatch")
+    if "robot" not in by_modality:
+        return
+    robot_keys = _partition_basename_keys(
+        "robot", manifest["modalities"]["robot"], by_modality["robot"])
+    terrain_keys = {
+        key for key in object_keys
+        if key[0] in manifest["modalities"]["robot"]["partitions"]
+    }
+    if robot_keys != terrain_keys:
+        raise ValueError("robot/object/geometry basename coverage mismatch")
+
+
+def _verify_openable_geometry(root, entries):
+    from pxr import Usd, UsdGeom
+    for entry in entries:
+        path = Path(root) / entry["path"]
+        stage = Usd.Stage.Open(str(path))
+        if stage is None or not any(
+                prim.IsA(UsdGeom.Mesh) for prim in stage.Traverse()):
+            raise ValueError(
+                f"object USD lacks openable mesh geometry: {entry['path']}")
 
 
 def verify_local(manifest, inventory, dataset_root, modalities):
@@ -475,6 +577,12 @@ def verify_local(manifest, inventory, dataset_root, modalities):
         if observed != entry["sha256"]:
             raise ValueError(
                 f"dataset SHA-256 changed for {entry['path']}: {observed}")
+    if "object_usd" in selected:
+        geometry_entries = [
+            entry for entry in entries
+            if _modality_for_path(manifest, entry["path"]) == "object_usd"
+        ]
+        _verify_openable_geometry(root, geometry_entries)
     return {
         "file_count": len(entries),
         "byte_count": sum(entry["bytes"] for entry in entries),

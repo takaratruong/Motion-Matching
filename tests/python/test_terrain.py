@@ -7,6 +7,7 @@ import unittest
 from unittest import mock
 import warnings
 
+import joblib
 import numpy as np
 from pxr import Usd, UsdGeom
 
@@ -44,6 +45,7 @@ from resources.g1_terrain_builder.terrain import (
 GRAIL_USD_DIR = "/home/ubuntu/datasets/GRAIL/data/curb/object_usd"
 GRAIL_RECON_DIR = "/home/ubuntu/datasets/GRAIL/data/curb/recon"
 GRAIL_ROBOT_DIR = "/home/ubuntu/datasets/GRAIL/data/curb/robot"
+GRAIL_OBJECTS_DIR = "/home/ubuntu/datasets/GRAIL/data/curb/objects"
 GRAIL_PARITY_BASES = (
     GRAIL_DEFAULT_BASE,
     "terrain_curbs__curb_186__004",
@@ -53,6 +55,77 @@ GRAIL_PARITY_BASES = (
 
 
 class TerrainTests(unittest.TestCase):
+    def test_release_surfaces_match_reconstruction_oracle_on_locked_curbs(self):
+        for base in GRAIL_PARITY_BASES:
+            with self.subTest(base=base):
+                oracle = GrailTerrain.from_base(base)
+                released = GrailTerrain.from_release(
+                    os.path.join(GRAIL_USD_DIR, base + ".usd"),
+                    os.path.join(GRAIL_OBJECTS_DIR, base + ".pkl"),
+                )
+
+                np.testing.assert_allclose(
+                    [released._vertices.min(axis=0),
+                     released._vertices.max(axis=0)],
+                    [oracle._vertices.min(axis=0),
+                     oracle._vertices.max(axis=0)],
+                    rtol=0.0,
+                    atol=1e-6,
+                )
+                self.assertAlmostEqual(
+                    released.footprint()["height"],
+                    oracle.footprint()["height"],
+                    delta=1e-6,
+                )
+
+                oracle_bounds = oracle.xz_bounds()
+                release_bounds = released.xz_bounds()
+                xmin = max(oracle_bounds[0], release_bounds[0]) + 0.0073
+                xmax = min(oracle_bounds[1], release_bounds[1]) - 0.0051
+                zmin = max(oracle_bounds[2], release_bounds[2]) + 0.0097
+                zmax = min(oracle_bounds[3], release_bounds[3]) - 0.0063
+                queries = [
+                    (x, z)
+                    for z in np.linspace(zmin, zmax, 13)
+                    for x in np.linspace(xmin, xmax, 17)
+                ]
+                np.testing.assert_allclose(
+                    [released.height(x, z) for x, z in queries],
+                    [oracle.height(x, z) for x, z in queries],
+                    rtol=0.0,
+                    atol=1e-6,
+                )
+
+    def test_release_surface_preserves_strict_usd_topology_validation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            usd_path = os.path.join(temporary, "bad.usd")
+            objects_path = os.path.join(temporary, "objects.pkl")
+            stage = Usd.Stage.CreateNew(usd_path)
+            mesh = UsdGeom.Mesh.Define(stage, "/model/mesh")
+            mesh.CreatePointsAttr([
+                (0.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0),
+            ])
+            mesh.CreateFaceVertexCountsAttr([3])
+            mesh.CreateFaceVertexIndicesAttr([0, 1, 3])
+            stage.GetRootLayer().Save()
+            del stage
+            joblib.dump({
+                "terrain": {
+                    "root_pos": np.zeros((2, 1, 3), np.float32),
+                    "root_quat": np.tile(
+                        np.array([[[0.0, 0.0, 0.0, 1.0]]], np.float32),
+                        (2, 1, 1),
+                    ),
+                    "fps": 25.0,
+                    "scale": np.ones((3, 1), np.float32),
+                }
+            }, objects_path)
+
+            with self.assertRaisesRegex(ValueError, "face indices"):
+                GrailTerrain.from_release(usd_path, objects_path)
+
     def test_selected_grail_grids_meet_all_surface_parity_tolerances(self):
         for base in GRAIL_PARITY_BASES:
             with self.subTest(base=base):

@@ -9,6 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from pxr import Usd, UsdGeom
+
 from resources import grail_terrain_acquisition as acquisition
 
 
@@ -16,6 +18,12 @@ REPOSITORY_ID = "nvidia/PhysicalAI-Robotics-Locomanipulation-GRAIL"
 REVISION = "943946a972d5de2eb0d2ff214b236d0e43575fd7"
 ROBOT_INVENTORY_SHA256 = (
     "595b1276c9191e86bc6101a68929810680ac6790a795c35e692f2f7e8a7f97e2"
+)
+OBJECTS_INVENTORY_SHA256 = (
+    "461a6ff0a533dac1bfa069694d491d3382e9a04cab11f1c3268bbf0a94d9f667"
+)
+OBJECT_USD_INVENTORY_SHA256 = (
+    "6bc4a91cee21aa9a98214d557e27c1b86c556f585fe9673f222dd66eae767846"
 )
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 CHECKED_MANIFEST = REPOSITORY_ROOT / "resources" / "grail_terrain_inputs.json"
@@ -61,6 +69,30 @@ def _small_manifest(entries, *, allowed_globs=None, partitions=None):
     }
 
 
+def _modality(entries, allowed_globs, partitions):
+    entries = sorted(entries, key=lambda value: value["path"])
+    return {
+        "allowed_globs": allowed_globs,
+        "partitions": partitions,
+        "file_count": len(entries),
+        "byte_count": sum(value["bytes"] for value in entries),
+        "canonical_inventory_sha256":
+            acquisition.canonical_inventory_sha256(entries),
+    }
+
+
+def _manifest(modalities):
+    return {
+        "schema": acquisition.MANIFEST_SCHEMA,
+        "repository": {
+            "id": REPOSITORY_ID,
+            "revision": REVISION,
+            "type": "dataset",
+        },
+        "modalities": modalities,
+    }
+
+
 def _inventory(entries, modalities=("robot",)):
     return {
         "schema": acquisition.INVENTORY_SCHEMA,
@@ -75,6 +107,22 @@ def _inventory(entries, modalities=("robot",)):
 
 
 class GrailTerrainAcquisitionTests(unittest.TestCase):
+    @staticmethod
+    def _write_usd(path, with_mesh=True):
+        stage = Usd.Stage.CreateNew(str(path))
+        UsdGeom.Xform.Define(stage, "/model")
+        if with_mesh:
+            mesh = UsdGeom.Mesh.Define(stage, "/model/mesh")
+            mesh.CreatePointsAttr([
+                (0.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0),
+            ])
+            mesh.CreateFaceVertexCountsAttr([3])
+            mesh.CreateFaceVertexIndicesAttr([0, 1, 2])
+        stage.GetRootLayer().Save()
+        del stage
+
     def test_checked_manifest_pins_exact_complete_robot_corpus(self):
         payload = CHECKED_MANIFEST.read_bytes()
         decoded = json.loads(payload)
@@ -87,7 +135,10 @@ class GrailTerrainAcquisitionTests(unittest.TestCase):
             "revision": REVISION,
             "type": "dataset",
         })
-        self.assertEqual(tuple(manifest["modalities"]), ("robot",))
+        self.assertEqual(
+            tuple(manifest["modalities"]),
+            ("object_usd", "objects", "robot"),
+        )
         robot = manifest["modalities"]["robot"]
         self.assertEqual(robot["allowed_globs"], [
             "data/stair_p1/robot/*.pkl",
@@ -109,6 +160,108 @@ class GrailTerrainAcquisitionTests(unittest.TestCase):
         self.assertEqual(robot["byte_count"], 2_421_026_260)
         self.assertEqual(
             robot["canonical_inventory_sha256"], ROBOT_INVENTORY_SHA256)
+
+    def test_checked_manifest_pins_only_matching_object_and_geometry_inputs(self):
+        manifest = acquisition.load_manifest(CHECKED_MANIFEST)
+        expected = {
+            "objects": {
+                "allowed_globs": [
+                    "data/slope/objects/*.pkl",
+                    "data/stair_p1/objects/*.pkl",
+                    "data/stair_p2/objects/*.pkl",
+                ],
+                "byte_count": 252_587_908,
+                "canonical_inventory_sha256": OBJECTS_INVENTORY_SHA256,
+                "file_count": 14_068,
+                "partitions": {
+                    "slope": {
+                        "byte_count": 36_377_080,
+                        "file_count": 1_880,
+                        "path_prefix": "data/slope/objects/",
+                    },
+                    "stair_p1": {
+                        "byte_count": 114_180_950,
+                        "file_count": 6_094,
+                        "path_prefix": "data/stair_p1/objects/",
+                    },
+                    "stair_p2": {
+                        "byte_count": 102_029_878,
+                        "file_count": 6_094,
+                        "path_prefix": "data/stair_p2/objects/",
+                    },
+                },
+            },
+            "object_usd": {
+                "allowed_globs": [
+                    "data/slope/object_usd/*.usd",
+                    "data/stair_p1/object_usd/*.usd",
+                    "data/stair_p2/object_usd/*.usd",
+                ],
+                "byte_count": 5_357_565_995,
+                "canonical_inventory_sha256": OBJECT_USD_INVENTORY_SHA256,
+                "file_count": 14_068,
+                "partitions": {
+                    "slope": {
+                        "byte_count": 15_515_596,
+                        "file_count": 1_880,
+                        "path_prefix": "data/slope/object_usd/",
+                    },
+                    "stair_p1": {
+                        "byte_count": 2_962_501_357,
+                        "file_count": 6_094,
+                        "path_prefix": "data/stair_p1/object_usd/",
+                    },
+                    "stair_p2": {
+                        "byte_count": 2_379_549_042,
+                        "file_count": 6_094,
+                        "path_prefix": "data/stair_p2/object_usd/",
+                    },
+                },
+            },
+        }
+        for name, config in expected.items():
+            with self.subTest(modality=name):
+                self.assertEqual(manifest["modalities"][name], config)
+                self.assertFalse(any(
+                    "texture" in pattern or pattern.endswith((".jpg", ".png"))
+                    for pattern in config["allowed_globs"]
+                ))
+
+    def test_inventory_requires_exact_object_geometry_basename_coverage(self):
+        robot = _entry("data/stair_p1/robot/a.pkl", b"robot")
+        objects = _entry("data/stair_p1/objects/b.pkl", b"objects")
+        geometry = _entry("data/stair_p1/object_usd/b.usd", b"usd")
+        entries = [robot, objects, geometry]
+        modalities = {
+            "robot": _modality([robot], ["data/stair_p1/robot/*.pkl"], {
+                "stair_p1": {
+                    "path_prefix": "data/stair_p1/robot/",
+                    "file_count": 1,
+                    "byte_count": robot["bytes"],
+                },
+            }),
+            "objects": _modality([objects], ["data/stair_p1/objects/*.pkl"], {
+                "stair_p1": {
+                    "path_prefix": "data/stair_p1/objects/",
+                    "file_count": 1,
+                    "byte_count": objects["bytes"],
+                },
+            }),
+            "object_usd": _modality(
+                [geometry], ["data/stair_p1/object_usd/*.usd"], {
+                    "stair_p1": {
+                        "path_prefix": "data/stair_p1/object_usd/",
+                        "file_count": 1,
+                        "byte_count": geometry["bytes"],
+                    },
+                }),
+        }
+        with self.assertRaisesRegex(ValueError, "basename coverage"):
+            acquisition.validate_inventory_document(
+                _manifest(modalities),
+                _inventory(entries, ("object_usd", "objects", "robot")),
+                ("object_usd", "objects", "robot"),
+            )
 
     def test_inventory_digest_has_exact_sorted_canonical_encoding(self):
         entries = [
@@ -330,6 +483,177 @@ class GrailTerrainAcquisitionTests(unittest.TestCase):
             list_repo_tree=lambda *args, **kwargs: [changed])
         with self.assertRaisesRegex(ValueError, "byte count"):
             acquisition.build_remote_inventory(manifest, ("robot",), api=api)
+
+    def test_remote_inventory_stream_hashes_regular_git_geometry(self):
+        payload = b"ordinary git USD blob"
+        expected = _entry("data/stair_p1/object_usd/a.usd", payload)
+        manifest = _manifest({
+            "object_usd": _modality(
+                [expected], ["data/stair_p1/object_usd/*.usd"], {
+                    "stair_p1": {
+                        "path_prefix": "data/stair_p1/object_usd/",
+                        "file_count": 1,
+                        "byte_count": len(payload),
+                    },
+                }),
+        })
+        remote = SimpleNamespace(
+            path=expected["path"], size=len(payload), lfs=None)
+        api = SimpleNamespace(list_repo_tree=lambda *args, **kwargs: [remote])
+        with tempfile.TemporaryDirectory() as temporary:
+            downloaded = Path(temporary) / "asset.usd"
+            downloaded.write_bytes(payload)
+            calls = []
+
+            def fake_download(**kwargs):
+                calls.append(kwargs)
+                return str(downloaded)
+
+            observed = acquisition.build_remote_inventory(
+                manifest, ("object_usd",), api=api,
+                hf_download=fake_download)
+
+        self.assertEqual(observed, _inventory([expected], ("object_usd",)))
+        self.assertEqual(calls, [{
+            "repo_id": REPOSITORY_ID,
+            "filename": expected["path"],
+            "repo_type": "dataset",
+            "revision": REVISION,
+        }])
+
+    def test_remote_inventory_ignores_nested_texture_tree_entries(self):
+        payload = b"ordinary git USD blob"
+        expected = _entry("data/stair_p1/object_usd/a.usd", payload)
+        manifest = _manifest({
+            "object_usd": _modality(
+                [expected], ["data/stair_p1/object_usd/*.usd"], {
+                    "stair_p1": {
+                        "path_prefix": "data/stair_p1/object_usd/",
+                        "file_count": 1,
+                        "byte_count": len(payload),
+                    },
+                }),
+        })
+        remotes = [
+            SimpleNamespace(
+                path=expected["path"], size=len(payload), lfs=None),
+            SimpleNamespace(
+                path="data/stair_p1/object_usd/textures/a/model.jpg",
+                size=123,
+                lfs=None,
+            ),
+        ]
+        api = SimpleNamespace(list_repo_tree=lambda *args, **kwargs: remotes)
+        with tempfile.TemporaryDirectory() as temporary:
+            downloaded = Path(temporary) / "asset.usd"
+            downloaded.write_bytes(payload)
+            calls = []
+
+            def fake_download(**kwargs):
+                calls.append(kwargs["filename"])
+                return str(downloaded)
+
+            observed = acquisition.build_remote_inventory(
+                manifest, ("object_usd",), api=api,
+                hf_download=fake_download)
+
+        self.assertEqual(observed, _inventory([expected], ("object_usd",)))
+        self.assertEqual(calls, [expected["path"]])
+
+    def test_remote_inventory_rejects_unlisted_nested_geometry(self):
+        payload = b"ordinary git USD blob"
+        expected = _entry("data/stair_p1/object_usd/a.usd", payload)
+        manifest = _manifest({
+            "object_usd": _modality(
+                [expected], ["data/stair_p1/object_usd/*.usd"], {
+                    "stair_p1": {
+                        "path_prefix": "data/stair_p1/object_usd/",
+                        "file_count": 1,
+                        "byte_count": len(payload),
+                    },
+                }),
+        })
+        remotes = [
+            SimpleNamespace(
+                path=expected["path"], size=len(payload), lfs=None),
+            SimpleNamespace(
+                path="data/stair_p1/object_usd/nested/unlisted.usd",
+                size=10,
+                lfs=None,
+            ),
+        ]
+        api = SimpleNamespace(list_repo_tree=lambda *args, **kwargs: remotes)
+        with tempfile.TemporaryDirectory() as temporary:
+            downloaded = Path(temporary) / "asset.usd"
+            downloaded.write_bytes(payload)
+            with self.assertRaisesRegex(ValueError, "unexpected remote"):
+                acquisition.build_remote_inventory(
+                    manifest, ("object_usd",), api=api,
+                    hf_download=lambda **kwargs: str(downloaded))
+
+    def test_offline_verifier_ignores_textures_but_rejects_unlisted_usd(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            usd_path = root / "data/stair_p1/object_usd/a.usd"
+            usd_path.parent.mkdir(parents=True)
+            self._write_usd(usd_path)
+            expected = _entry(
+                "data/stair_p1/object_usd/a.usd", usd_path.read_bytes())
+            manifest = _manifest({
+                "object_usd": _modality(
+                    [expected], ["data/stair_p1/object_usd/*.usd"], {
+                        "stair_p1": {
+                            "path_prefix": "data/stair_p1/object_usd/",
+                            "file_count": 1,
+                            "byte_count": expected["bytes"],
+                        },
+                    }),
+            })
+            inventory = _inventory([expected], ("object_usd",))
+            texture = usd_path.parent / "textures/a/model.jpg"
+            texture.parent.mkdir(parents=True)
+            texture.write_bytes(b"excluded render texture")
+
+            summary = acquisition.verify_local(
+                manifest, inventory, root, ("object_usd",))
+            self.assertEqual(summary["file_count"], 1)
+
+            self._write_usd(usd_path.with_name("unlisted.usd"))
+            with self.assertRaisesRegex(ValueError, "unexpected local"):
+                acquisition.verify_local(
+                    manifest, inventory, root, ("object_usd",))
+            usd_path.with_name("unlisted.usd").unlink()
+
+            nested = usd_path.parent / "nested/unlisted.usd"
+            nested.parent.mkdir()
+            self._write_usd(nested)
+            with self.assertRaisesRegex(ValueError, "unexpected local"):
+                acquisition.verify_local(
+                    manifest, inventory, root, ("object_usd",))
+
+    def test_offline_verifier_requires_openable_mesh_geometry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            usd_path = root / "data/stair_p1/object_usd/a.usd"
+            usd_path.parent.mkdir(parents=True)
+            self._write_usd(usd_path, with_mesh=False)
+            expected = _entry(
+                "data/stair_p1/object_usd/a.usd", usd_path.read_bytes())
+            manifest = _manifest({
+                "object_usd": _modality(
+                    [expected], ["data/stair_p1/object_usd/*.usd"], {
+                        "stair_p1": {
+                            "path_prefix": "data/stair_p1/object_usd/",
+                            "file_count": 1,
+                            "byte_count": expected["bytes"],
+                        },
+                    }),
+            })
+            inventory = _inventory([expected], ("object_usd",))
+
+            with self.assertRaisesRegex(ValueError, "openable mesh geometry"):
+                acquisition.verify_local(
+                    manifest, inventory, root, ("object_usd",))
 
     def test_download_is_resumable_and_publishes_inventory_atomically(self):
         present_payload = b"present"
