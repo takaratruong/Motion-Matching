@@ -3417,6 +3417,30 @@ class Task12PolicyTests(unittest.TestCase):
             if smart_pickup_header_path.is_file()
             else ""
         )
+        assist_header = Path("interaction_pick_assist.h").read_text(
+            encoding="utf-8"
+        )
+        coordinator = Path(
+            "interaction_smart_pickup_controller.cpp"
+        ).read_text(encoding="utf-8")
+        self.assertIn("#include <vector>", assist_header)
+        self.assertRegex(
+            assist_header,
+            r"std::vector<PickAssistPreviewRequest>\s+preview_requests\s*\{\}",
+        )
+        self.assertRegex(
+            assist_header,
+            r"std::vector<PickAssistPreviewResult>\s+preview_results\s*\{\}",
+        )
+        self.assertRegex(
+            coordinator,
+            r"for\s*\(\s*const\s+PickAssistPreviewRequest\s*&\s*request\s*:\s*"
+            r"previous_assist_output_\.preview_requests\s*\)",
+            "the shared post-step must evaluate every prior ordered request",
+        )
+        self.assertNotIn(".needs_preview", coordinator)
+        self.assertNotIn(".preview_root", coordinator)
+        self.assertNotIn("observation.preview =", coordinator)
         for forbidden in ("assist_observed", "activation_began"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(
@@ -4322,6 +4346,7 @@ class Task12PolicyTests(unittest.TestCase):
             "smart_pickup_controller.post_step(",
             "rejecting_preview",
             "preview_callback_calls == 0U",
+            "post_step_result.assist_output.preview_requests.empty()",
             "!post_step_result.pick_request.has_value()",
             "backend.take_submission_calls == 0U",
             "interaction::ControllerInteractionScheduler scheduler",

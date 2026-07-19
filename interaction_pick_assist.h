@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 namespace interaction {
 
@@ -53,6 +54,16 @@ struct PickAssistStart {
     std::vector<PickNavigationObstacle> obstacles{};
 };
 
+struct PickAssistPreviewRequest {
+    uint32_t slot_id = 0U;
+    PickEntryRoot root{};
+};
+
+struct PickAssistPreviewResult {
+    PickAssistPreviewRequest request{};
+    std::optional<PickEntryPreview> preview{};
+};
+
 struct PickAssistObservation {
     RuntimeState runtime_state = RuntimeState::Locomotion;
     const InteractionTarget* target = nullptr;
@@ -62,7 +73,7 @@ struct PickAssistObservation {
     float camera_azimuth = 0.0F;
     uint64_t snapshot_fingerprint = 0U;
     uint64_t preview_snapshot_fingerprint = 0U;
-    std::optional<PickEntryPreview> preview{};
+    std::vector<PickAssistPreviewResult> preview_results{};
 };
 
 struct PickAssistOutput {
@@ -71,8 +82,7 @@ struct PickAssistOutput {
     vec3 right_stick{};
     bool force_strafe = false;
     bool stationary_constraint = false;
-    bool needs_preview = false;
-    std::optional<PickEntryRoot> preview_root{};
+    std::vector<PickAssistPreviewRequest> preview_requests{};
     bool submit_interact = false;
 };
 

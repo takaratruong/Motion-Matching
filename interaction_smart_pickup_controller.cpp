@@ -199,16 +199,23 @@ SmartPickupPostStepResult SmartPickupController::post_step(
     observation.camera_azimuth = input.camera_azimuth;
     observation.snapshot_fingerprint = result.snapshot_fingerprint;
 
-    if (previous_assist_output_.needs_preview &&
-        previous_assist_output_.preview_root.has_value() &&
+    if (!previous_assist_output_.preview_requests.empty() &&
         static_cast<bool>(preview_pick)) {
         const PickAssistDiagnostics& frozen = backend_->diagnostics();
-        observation.preview = preview_frozen_smart_pickup(
-            preview_pick,
-            input.live_flat_snapshot,
-            *previous_assist_output_.preview_root,
-            frozen.target,
-            frozen.affordance_id);
+        observation.preview_results.reserve(
+            previous_assist_output_.preview_requests.size());
+        for (const PickAssistPreviewRequest& request :
+             previous_assist_output_.preview_requests) {
+            observation.preview_results.push_back({
+                request,
+                preview_frozen_smart_pickup(
+                    preview_pick,
+                    input.live_flat_snapshot,
+                    request.root,
+                    frozen.target,
+                    frozen.affordance_id),
+            });
+        }
         observation.preview_snapshot_fingerprint =
             result.snapshot_fingerprint;
     }

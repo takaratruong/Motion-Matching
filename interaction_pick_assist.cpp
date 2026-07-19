@@ -132,13 +132,12 @@ bool observation_metrics_are_finite(
 void capture_frozen_final_preview_diagnostics(
     PickAssistDiagnostics& diagnostics,
     PickEntryRoot frozen_preview_root,
-    const PickAssistObservation& observation) {
-    if (diagnostics.state != PickAssistState::FinalPreview ||
-        !observation.preview.has_value()) {
+    const PickAssistObservation& observation,
+    const PickEntryPreview& preview) {
+    if (diagnostics.state != PickAssistState::FinalPreview) {
         return;
     }
 
-    const PickEntryPreview& preview = *observation.preview;
     PickAssistFinalPreviewDiagnostics captured{};
     captured.available = true;
     captured.all_preview_roots_finite =
@@ -208,15 +207,19 @@ float planar_speed(vec3 velocity) {
         static_cast<double>(velocity.z)));
 }
 
-PickAssistOutput braking_output(
-    bool needs_preview = false,
-    std::optional<PickEntryRoot> preview_root = {}) {
+PickAssistOutput braking_output() {
     PickAssistOutput output{};
     output.override_steering = true;
     output.force_strafe = true;
     output.stationary_constraint = true;
-    output.needs_preview = needs_preview;
-    output.preview_root = preview_root;
+    return output;
+}
+
+PickAssistOutput preview_braking_output(
+    uint32_t slot_id,
+    PickEntryRoot root) {
+    PickAssistOutput output = braking_output();
+    output.preview_requests.push_back({slot_id, root});
     return output;
 }
 
@@ -492,7 +495,9 @@ PickAssistOutput ControllerPickAssist::observe(
         if (diagnostics_.settle_ticks ==
             config_.required_settle_ticks) {
             diagnostics_.state = PickAssistState::FinalPreview;
-            return braking_output(true, frozen_preview_root_);
+            return preview_braking_output(
+                diagnostics_.selected_slot_id,
+                *frozen_preview_root_);
         }
         return braking_output();
     }
@@ -504,11 +509,35 @@ PickAssistOutput ControllerPickAssist::observe(
                 frozen_arrival_deadline_reason(
                     poor_match_observed_));
         }
-        if (!observation.preview.has_value()) {
-            return braking_output(true, frozen_preview_root_);
+        const PickAssistPreviewRequest expected_request{
+            diagnostics_.selected_slot_id, *frozen_preview_root_};
+        if (observation.preview_results.empty()) {
+            return preview_braking_output(
+                expected_request.slot_id, expected_request.root);
+        }
+        if (observation.preview_results.size() != 1U) {
+            return fail_output(
+                diagnostics_,
+                PickAssistReason::FinalPreviewRejected);
+        }
+        const PickAssistPreviewResult& result =
+            observation.preview_results.front();
+        if (result.request.slot_id != expected_request.slot_id ||
+            !same_entry_root(
+                result.request.root, expected_request.root)) {
+            return fail_output(
+                diagnostics_,
+                PickAssistReason::FinalPreviewRejected);
+        }
+        if (!result.preview.has_value()) {
+            return preview_braking_output(
+                expected_request.slot_id, expected_request.root);
         }
         capture_frozen_final_preview_diagnostics(
-            diagnostics_, *frozen_preview_root_, observation);
+            diagnostics_,
+            *frozen_preview_root_,
+            observation,
+            *result.preview);
         const PickAssistFinalPreviewDiagnostics& preview =
             diagnostics_.final_preview;
         const bool retryable_poor_match =
@@ -521,7 +550,8 @@ PickAssistOutput ControllerPickAssist::observe(
             preview.match_reason == Reason::PoorMatch;
         if (retryable_poor_match) {
             poor_match_observed_ = true;
-            return braking_output(true, frozen_preview_root_);
+            return preview_braking_output(
+                expected_request.slot_id, expected_request.root);
         }
         const bool certified =
             preview.all_preview_roots_finite &&

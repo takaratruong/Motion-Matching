@@ -33,6 +33,12 @@ static_assert(std::is_same_v<
     interaction::SmartPickupPreviewCallback,
     ExpectedPreviewCallback>);
 static_assert(std::is_same_v<
+    decltype(interaction::PickAssistOutput{}.preview_requests),
+    std::vector<interaction::PickAssistPreviewRequest>>);
+static_assert(std::is_same_v<
+    decltype(interaction::PickAssistObservation{}.preview_results),
+    std::vector<interaction::PickAssistPreviewResult>>);
+static_assert(std::is_same_v<
     decltype(std::declval<interaction::SmartPickupController&>().pre_step(
         std::declval<const interaction::SmartPickupPreStepInput&>())),
     interaction::SmartPickupPreStepResult>);
@@ -391,6 +397,54 @@ private:
     interaction::PickAssistDiagnostics diagnostics_{};
 };
 
+class BatchProtocolAssistBackend final
+    : public interaction::SmartPickupAssistBackend {
+public:
+    bool begin(
+        const interaction::PickAssistStart& start,
+        const interaction::InteractionTarget*) override {
+        ++begin_calls;
+        active_ = true;
+        diagnostics_.state = interaction::PickAssistState::FinalPreview;
+        diagnostics_.target = start.target_snapshot.handle;
+        diagnostics_.affordance_id = start.affordance_id;
+        return true;
+    }
+
+    void cancel() override {
+        active_ = false;
+    }
+
+    interaction::PickAssistOutput observe(
+        const interaction::PickAssistObservation& observation) override {
+        ++observe_calls;
+        observations.push_back(observation);
+        if (observe_calls == 1U) return first_output;
+        return {};
+    }
+
+    std::optional<interaction::PickRequest> take_submission(
+        uint64_t) override {
+        return std::nullopt;
+    }
+
+    bool active() const override { return active_; }
+    bool owns_manual_interact() const override { return active_; }
+    const interaction::PickAssistDiagnostics& diagnostics()
+        const override {
+        return diagnostics_;
+    }
+
+    bool active_ = false;
+    uint32_t begin_calls = 0U;
+    uint32_t observe_calls = 0U;
+    interaction::PickAssistOutput first_output{};
+    std::vector<interaction::PickAssistObservation> observations{};
+
+private:
+    interaction::PickAssistDiagnostics diagnostics_{};
+};
+
 // This raylib-free harness establishes only the caller-side pre/ordinary/post
 // order around the coordinator. Production locomotion-provider, live-flat
 // bridge, scheduler-publication, and controller-obstacle identity counts remain
@@ -526,7 +580,7 @@ void test_activation_brackets_one_caller_step_and_defers_assist_motion() {
         "activation tick previewed or submitted a pick");
     require(
         post.assist_output.override_steering &&
-            !post.assist_output.needs_preview &&
+            post.assist_output.preview_requests.empty() &&
             !post.assist_output.submit_interact,
         "activation observation did not publish next-tick approach output");
     require(
@@ -615,6 +669,130 @@ void test_activation_brackets_one_caller_step_and_defers_assist_motion() {
         !same_vec3_bits(
             root_transform(next_snapshot).position, next_root_before),
         "assisted steering did not affect the tick after activation");
+}
+
+void test_prior_preview_batch_uses_one_snapshot_and_echoes_every_request() {
+    interaction::InteractionTarget target = make_controller_target();
+    BatchProtocolAssistBackend backend;
+    interaction::SmartPickupController controller(backend);
+    const std::vector<interaction::PickAssistPreviewRequest> requests{
+        {33U, {0.31F, -0.72F, 0.43F}},
+        {11U, {-0.18F, 0.64F, -0.29F}},
+        {22U, {0.91F, 0.08F, 1.17F}},
+    };
+    backend.first_output.override_steering = true;
+    backend.first_output.stationary_constraint = true;
+    backend.first_output.preview_requests = requests;
+
+    const interaction::LocomotionSnapshot activation_snapshot =
+        make_snapshot(vec3(-0.40F, 0.0F, 0.20F), -0.15F);
+    require(
+        controller.pre_step(make_pre_input(&target, true))
+            .interact_consumed,
+        "batch protocol fixture did not capture activation");
+
+    uint32_t callback_calls = 0U;
+    const interaction::SmartPickupPreviewCallback callback =
+        [&](const interaction::LocomotionSnapshot&,
+            interaction::PickEntryRoot,
+            interaction::TargetHandle,
+            uint32_t)
+            -> std::optional<interaction::PickEntryPreview> {
+            ++callback_calls;
+            return std::nullopt;
+        };
+    const interaction::SmartPickupPostStepResult activation =
+        controller.post_step(
+            make_post_input(activation_snapshot, &target), callback);
+    require(
+        backend.begin_calls == 1U && backend.observe_calls == 1U &&
+            callback_calls == 0U &&
+            activation.assist_output.preview_requests.size() ==
+                requests.size(),
+        "activation did not defer the newly published preview batch");
+
+    interaction::LocomotionSnapshot live_snapshot =
+        make_snapshot(vec3(0.73F, 0.0F, -0.44F), 0.82F);
+    live_snapshot.pose.positions[g1_skeleton::Spine2].x = 1.2345F;
+    const interaction::LocomotionSnapshot live_snapshot_before =
+        live_snapshot;
+    std::vector<interaction::LocomotionSnapshot> callback_snapshots;
+    std::vector<interaction::PickEntryRoot> callback_roots;
+    const interaction::SmartPickupPreviewCallback ordered_callback =
+        [&](const interaction::LocomotionSnapshot& snapshot,
+            interaction::PickEntryRoot root,
+            interaction::TargetHandle handle,
+            uint32_t affordance_id)
+            -> std::optional<interaction::PickEntryPreview> {
+            const size_t call_index = callback_roots.size();
+            require(
+                call_index < requests.size(),
+                "batch protocol made an extra preview callback");
+            require(
+                same_snapshot_bits(snapshot, live_snapshot_before),
+                "batch callback did not receive the exact live snapshot");
+            require(
+                handle == target.handle &&
+                    affordance_id == target.affordances.front().id,
+                "batch callback changed frozen target identity");
+            callback_snapshots.push_back(snapshot);
+            callback_roots.push_back(root);
+            if (call_index == 1U) return std::nullopt;
+            interaction::PickEntryPreview preview{};
+            preview.path_feasible = true;
+            preview.path_reason = interaction::Reason::None;
+            preview.match_ready = true;
+            preview.match_reason = interaction::Reason::None;
+            preview.prospective_root = root;
+            return preview;
+        };
+
+    const interaction::SmartPickupPreStepResult active_pre =
+        controller.pre_step(make_pre_input(&target, false));
+    require(
+        same_vec3_bits(active_pre.left_stick, vec3()) &&
+            same_vec3_bits(active_pre.right_stick, vec3()),
+        "batch protocol fixture did not retain stationary input ownership");
+    const interaction::SmartPickupPostStepResult observed =
+        controller.post_step(
+            make_post_input(live_snapshot, &target), ordered_callback);
+    require(
+        backend.observe_calls == 2U && callback_roots.size() == 3U &&
+            callback_snapshots.size() == requests.size(),
+        "prior preview batch did not make one ordered call per request");
+    for (size_t index = 0U; index < requests.size(); ++index) {
+        require(
+            same_pick_entry_root_bits(
+                callback_roots[index], requests[index].root) &&
+                same_snapshot_bits(
+                    callback_snapshots[index], live_snapshot_before),
+            "batch callback order or snapshot identity changed");
+    }
+    require(
+        backend.observations.size() == 2U,
+        "batch protocol did not preserve one observation per fixed tick");
+    const interaction::PickAssistObservation& batch_observation =
+        backend.observations.back();
+    require(
+        batch_observation.preview_results.size() == requests.size() &&
+            batch_observation.preview_snapshot_fingerprint ==
+                observed.snapshot_fingerprint &&
+            observed.snapshot_fingerprint == interaction::runtime_detail::
+                locomotion_snapshot_fingerprint(live_snapshot_before),
+        "batch results did not share the one live-snapshot fingerprint");
+    for (size_t index = 0U; index < requests.size(); ++index) {
+        const interaction::PickAssistPreviewResult& result =
+            batch_observation.preview_results[index];
+        require(
+            result.request.slot_id == requests[index].slot_id &&
+                same_pick_entry_root_bits(
+                    result.request.root, requests[index].root) &&
+                result.preview.has_value() == (index != 1U),
+            "batch result did not echo its ordered request or null result");
+    }
+    require(
+        same_snapshot_bits(live_snapshot, live_snapshot_before),
+        "batch preview callbacks mutated the caller live snapshot");
 }
 
 void test_begin_exception_clears_pending_activation_before_backend_call() {
@@ -796,7 +974,7 @@ void require_pending_mutation_fails_as_target_changed(
         backend.begin_calls == 1U && backend.observe_calls == 1U &&
         backend.take_submission_calls == 0U &&
         preview_calls == 0U && !post.pick_request.has_value() &&
-        !post.assist_output.needs_preview &&
+        post.assist_output.preview_requests.empty() &&
         !post.assist_output.submit_interact &&
         diagnostics.state == interaction::PickAssistState::Failed &&
         diagnostics.reason == interaction::PickAssistReason::TargetChanged;
@@ -1573,9 +1751,11 @@ bool is_stationary_preview_retry(
     interaction::PickEntryRoot root) {
     return output.override_steering && output.force_strafe &&
         output.stationary_constraint && is_zero(output.left_stick) &&
-        is_zero(output.right_stick) && output.needs_preview &&
-        output.preview_root.has_value() &&
-        same_pick_entry_root_bits(*output.preview_root, root) &&
+        is_zero(output.right_stick) &&
+        output.preview_requests.size() == 1U &&
+        output.preview_requests.front().slot_id == 11U &&
+        same_pick_entry_root_bits(
+            output.preview_requests.front().root, root) &&
         !output.submit_interact;
 }
 
@@ -1765,10 +1945,11 @@ void test_final_preview_and_request_are_each_one_shot() {
     require(
         controller.diagnostics().state ==
                 interaction::PickAssistState::FinalPreview &&
-            post.assist_output.needs_preview &&
-            post.assist_output.preview_root.has_value() &&
+            post.assist_output.preview_requests.size() == 1U &&
+            post.assist_output.preview_requests.front().slot_id == 11U &&
             same_pick_entry_root_bits(
-                *post.assist_output.preview_root, expected_root),
+                post.assist_output.preview_requests.front().root,
+                expected_root),
         "fifth settle tick did not request the exact frozen preview root");
 
     const interaction::SmartPickupPreStepResult preview_pre =
@@ -1814,6 +1995,7 @@ void test_final_preview_and_request_are_each_one_shot() {
 
 int main() {
     test_activation_brackets_one_caller_step_and_defers_assist_motion();
+    test_prior_preview_batch_uses_one_snapshot_and_echoes_every_request();
     test_begin_exception_clears_pending_activation_before_backend_call();
     test_obstacle_array_exception_clears_pending_activation();
     test_pending_target_mutations_fail_before_slot_freeze();

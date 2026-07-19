@@ -5849,6 +5849,25 @@ class Task8PlacementPolicyTests(unittest.TestCase):
             helper,
             rf"\b{re.escape(callback_parameter.group(1))}\s*\(",
         )
+        self.assertRegex(
+            source,
+            r"for\s*\(\s*const\s+PickAssistPreviewRequest\s*&\s*request\s*:\s*"
+            r"previous_assist_output_\.preview_requests\s*\)",
+            "the coordinator must delegate every ordered prior request",
+        )
+        self.assertRegex(
+            source,
+            r"observation\.preview_results\.push_back\s*\(\s*\{\s*request\s*,",
+            "each callback result must echo its exact request identity",
+        )
+        self.assertEqual(
+            source.count(
+                "observation.preview_snapshot_fingerprint =\n"
+                "            result.snapshot_fingerprint;"
+            ),
+            1,
+            "one fingerprint must describe the entire preview batch",
+        )
 
     def test_native_smart_pickup_preview_callback_is_one_direct_delegation(self):
         controller = Path("controller.cpp").read_text(encoding="utf-8")

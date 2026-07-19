@@ -1246,6 +1246,7 @@ void run_manual_pick_assist_oracle(
         activation_displacement_m <= 1.0e-6F &&
             same_vec3_bits(simulation_position, activation_root_before) &&
             preview_callback_calls == 0U &&
+            post_step_result.assist_output.preview_requests.empty() &&
             !post_step_result.pick_request.has_value() &&
             backend.take_submission_calls == 0U,
         "activation tick moved, previewed, or submitted");
