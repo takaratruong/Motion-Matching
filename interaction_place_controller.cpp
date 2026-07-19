@@ -180,6 +180,18 @@ bool same_candidate(
     return left.mode == right.mode &&
            left.source_id == right.source_id &&
            left.selection_id == right.selection_id &&
+           same_float(
+               left.source_support_height_m,
+               right.source_support_height_m) &&
+           same_float(
+               left.requested_support_height_m,
+               right.requested_support_height_m) &&
+           same_float(
+               left.target_support_height_m,
+               right.target_support_height_m) &&
+           same_float(
+               left.requested_vertical_correction_m,
+               right.requested_vertical_correction_m) &&
            same_timing(left.timing, right.timing) &&
            same_match(left.match, right.match) &&
            same_ik(left.ik, right.ik) &&
@@ -408,6 +420,18 @@ PlaceStep recovery_step(
     return step;
 }
 
+void copy_candidate_provenance(
+    PlaceStep& step,
+    const PlaceCandidate& candidate) {
+    step.source_id = candidate.source_id;
+    step.source_support_height_m = candidate.source_support_height_m;
+    step.requested_support_height_m =
+        candidate.requested_support_height_m;
+    step.target_support_height_m = candidate.target_support_height_m;
+    step.requested_vertical_correction_m =
+        candidate.requested_vertical_correction_m;
+}
+
 }  // namespace
 
 PlaceController::PlaceController(
@@ -513,6 +537,7 @@ PlaceBeginResult PlaceController::begin(const PlaceBeginInput& input) {
         initial.phase = PlacePhase::Align;
         initial.source_frame = input.candidate.entry_frame;
         initial.source_frame_exact = input.candidate.entry_frame;
+        copy_candidate_provenance(initial, input.candidate);
         initial.support_sweep_clear = true;
 
         player_ = std::move(player);
@@ -585,9 +610,12 @@ PlaceStep PlaceController::update(float dt) {
     step.source_frame_exact = trial.source_frame_exact();
     step.committed = sample.committed;
     step.retract_finished = trial.finished();
+    copy_candidate_provenance(step, begin_.candidate);
 
     if (release_acknowledged_) {
         step.object_world = frozen_object_;
+        step.applied_vertical_correction_m =
+            last_step_.applied_vertical_correction_m;
         step.support_sweep_clear = true;
         player_ = std::move(trial);
         output_ticks_ = next_output_tick;
@@ -686,6 +714,8 @@ PlaceStep PlaceController::update(float dt) {
     step.hand_orientation_error_radians = ik.orientation_error_radians;
     const Transform corrected_hand = hand_world(
         pose, begin_.match_input.held_affordance.hand);
+    step.applied_vertical_correction_m =
+        corrected_hand.position.y - current_hand.position.y;
     step.applied_hand_correction_m = static_cast<float>(distance(
         corrected_hand.position, current_hand.position));
     step.applied_hand_orientation_radians = rotation_gate::radians(

@@ -258,6 +258,7 @@ Database make_reverse_database() {
     database.source_frames.resize(frames);
     database.table_rotations[0] = 1.0F;
     database.grasp_rotations_object[0] = 1.0F;
+    database.table_positions[1] = 0.20F;
 
     for (int32_t frame = 0; frame < kFrameCount; ++frame) {
         Phase phase = Phase::Approach;
@@ -366,6 +367,30 @@ RecordedPlaceClip make_recorded_clip(uint64_t id = 101U) {
     return clip;
 }
 
+PrecomputedReversedPickupClip make_precomputed_reverse(
+    uint64_t id = 2001U,
+    float source_support_height_m = 0.70F) {
+    PrecomputedReversedPickupClip clip{};
+    clip.id = id;
+    clip.object_profile_id = kProfileId;
+    clip.sequence_id = "pickup_table__unit__001";
+    clip.clip = 0;
+    clip.entry_frame = 0;
+    clip.contact_frame = kContactFrame;
+    clip.lift_frame = kLiftFrame;
+    clip.hold_frame = kHoldFrame;
+    clip.reverse_start_frame = kStableWindowStop;
+    clip.hand = Hand::Right;
+    clip.source_hand_in_object = {vec3(), quat()};
+    clip.source_object_bounds = make_bounds();
+    clip.source_surface = make_surface(
+        502U, vec3(0.0F, source_support_height_m, 0.0F));
+    clip.source_affordance_id = 77U;
+    clip.source_support_height_m = source_support_height_m;
+    clip.source_grasp_height_above_support_m = 0.10F;
+    return clip;
+}
+
 struct PlaceFixture {
     Database database{};
     PlaceMotionLibrary library{};
@@ -430,6 +455,20 @@ PlaceFixture copy_fixture(const PlaceFixture& source) {
 void remove_recorded(PlaceFixture& fixture) {
     fixture.library.recorded.clear();
     refresh_pointers(fixture);
+}
+
+void add_precomputed_reverse(
+    PlaceFixture& fixture,
+    uint64_t id = 2001U,
+    float source_support_height_m = 0.70F) {
+    fixture.library.precomputed_reversed.push_back(
+        make_precomputed_reverse(id, source_support_height_m));
+    refresh_pointers(fixture);
+}
+
+void disable_immediate_reverse(PlaceFixture& fixture) {
+    fixture.input.pickup_candidate.contact_frame =
+        fixture.input.pickup_candidate.entry_frame;
 }
 
 void disable_reverse_tier(PlaceFixture& fixture) {
@@ -542,10 +581,69 @@ void expect_rejected(PlaceFixture fixture) {
     TEST_CHECK(!preview_place_motion(fixture.input).accepted);
 }
 
+void check_candidate_heights(
+    const PlaceCandidate& candidate,
+    float source_support_height_m,
+    float requested_support_height_m) {
+    TEST_CHECK(candidate.source_support_height_m == source_support_height_m);
+    TEST_CHECK(
+        candidate.requested_support_height_m == requested_support_height_m);
+    TEST_CHECK(candidate.target_support_height_m == requested_support_height_m);
+    TEST_CHECK(candidate.requested_vertical_correction_m ==
+               requested_support_height_m - source_support_height_m);
+}
+
+void test_precomputed_reverse_priority_and_preview_provenance_boundary() {
+    TEST_CHECK(static_cast<uint8_t>(PlaceMotionMode::ReversedPickup) == 2U);
+    TEST_CHECK(static_cast<uint8_t>(
+                   PlaceMotionMode::PrecomputedReversedPickup) == 3U);
+
+    PlaceFixture fixture = make_fixture();
+    fixture.library.recorded = {make_recorded_clip(1001U)};
+    fixture.library.precomputed_reversed = {
+        make_precomputed_reverse(2001U, 0.70F)};
+    refresh_pointers(fixture);
+
+    PlaceResult selected = select_place_motion(fixture.input);
+    TEST_CHECK(selected.accepted);
+    TEST_CHECK(selected.candidate.mode == PlaceMotionMode::RecordedPlace);
+    TEST_CHECK(selected.candidate.source_id == 1001U);
+    check_candidate_heights(selected.candidate, 0.70F, 0.70F);
+
+    fixture.library.recorded.clear();
+    selected = select_place_motion(fixture.input);
+    TEST_CHECK(selected.accepted);
+    TEST_CHECK(
+        selected.candidate.mode ==
+        PlaceMotionMode::PrecomputedReversedPickup);
+    TEST_CHECK(selected.candidate.source_id == 2001U);
+    check_candidate_heights(selected.candidate, 0.70F, 0.70F);
+
+    const PlaceStagingPreview preview = preview_place_motion(fixture.input);
+    TEST_CHECK(preview.accepted);
+    TEST_CHECK(preview.candidate.source_id == selected.candidate.source_id);
+    TEST_CHECK(preview.candidate.requested_support_height_m ==
+               selected.candidate.requested_support_height_m);
+    TEST_CHECK(preview.candidate.source_support_height_m ==
+               selected.candidate.source_support_height_m);
+    TEST_CHECK(preview.candidate.target_support_height_m ==
+               selected.candidate.target_support_height_m);
+    TEST_CHECK(preview.candidate.requested_vertical_correction_m ==
+               selected.candidate.requested_vertical_correction_m);
+
+    fixture.library.precomputed_reversed.clear();
+    selected = select_place_motion(fixture.input);
+    TEST_CHECK(selected.accepted);
+    TEST_CHECK(selected.candidate.mode == PlaceMotionMode::ReversedPickup);
+    check_candidate_heights(selected.candidate, 0.70F, 0.70F);
+}
+
 void test_frozen_public_contract() {
     static_assert(static_cast<uint8_t>(PlaceMotionMode::None) == 0U);
     static_assert(static_cast<uint8_t>(PlaceMotionMode::RecordedPlace) == 1U);
     static_assert(static_cast<uint8_t>(PlaceMotionMode::ReversedPickup) == 2U);
+    static_assert(static_cast<uint8_t>(
+                      PlaceMotionMode::PrecomputedReversedPickup) == 3U);
     static_assert(static_cast<uint8_t>(PlacePhase::Align) == 0U);
     static_assert(static_cast<uint8_t>(PlacePhase::Lower) == 1U);
     static_assert(static_cast<uint8_t>(PlacePhase::Release) == 2U);
@@ -601,10 +699,25 @@ void test_frozen_public_contract() {
     TEST_CHECK(recorded.commit_frame == -1);
     TEST_CHECK(recorded.release_frame == -1);
     TEST_CHECK(recorded.retract_stop_frame == -1);
+    const PrecomputedReversedPickupClip precomputed{};
+    TEST_CHECK(precomputed.id == 0U);
+    TEST_CHECK(precomputed.sequence_id.empty());
+    TEST_CHECK(precomputed.clip == -1);
+    TEST_CHECK(precomputed.entry_frame == -1);
+    TEST_CHECK(precomputed.contact_frame == -1);
+    TEST_CHECK(precomputed.lift_frame == -1);
+    TEST_CHECK(precomputed.hold_frame == -1);
+    TEST_CHECK(precomputed.reverse_start_frame == -1);
+    TEST_CHECK(precomputed.source_support_height_m == 0.0F);
+    TEST_CHECK(precomputed.source_grasp_height_above_support_m == 0.0F);
     const PlaceCandidate candidate{};
     TEST_CHECK(candidate.mode == PlaceMotionMode::None);
     TEST_CHECK(candidate.selection_id == 0U);
     TEST_CHECK(candidate.direction == 0);
+    TEST_CHECK(candidate.source_support_height_m == 0.0F);
+    TEST_CHECK(candidate.requested_support_height_m == 0.0F);
+    TEST_CHECK(candidate.target_support_height_m == 0.0F);
+    TEST_CHECK(candidate.requested_vertical_correction_m == 0.0F);
     const PlaceSample sample{};
     TEST_CHECK(sample.source_frame == -1);
     TEST_CHECK(sample.phase == PlacePhase::Align);
@@ -1010,6 +1123,158 @@ void set_database_object_and_hand(
         static_cast<size_t>(frame),
         object.rotation);
     set_database_hand_world(database, frame, object);
+}
+
+void set_destination_support_height(
+    PlaceFixture& fixture,
+    float support_height_m) {
+    const float delta =
+        support_height_m - fixture.input.surface.surface_world.position.y;
+    fixture.input.surface.surface_world.position.y = support_height_m;
+    fixture.input.surface.support_volume_world.position.y += delta;
+    fixture.input.place_affordance = fixture.input.surface.affordances.front();
+    fixture.input.current_pose.positions[kRoot].y += delta;
+    fixture.input.current_object_world.position.y += delta;
+    refresh_pointers(fixture);
+}
+
+float configure_reachable_reverse_request(PlaceFixture& fixture);
+
+void test_precomputed_reverse_validation_ties_and_height_boundary() {
+    const auto isolated = [] {
+        PlaceFixture fixture = make_fixture(false);
+        add_precomputed_reverse(fixture);
+        disable_immediate_reverse(fixture);
+        return fixture;
+    };
+    const auto rejected_after = [&](const auto& mutate) {
+        PlaceFixture fixture = isolated();
+        mutate(fixture);
+        refresh_pointers(fixture);
+        const PlaceResult result = select_place_motion(fixture.input);
+        TEST_CHECK(!result.accepted);
+    };
+
+    PlaceFixture valid = isolated();
+    const PlaceResult accepted = select_place_motion(valid.input);
+    TEST_CHECK(accepted.accepted);
+    TEST_CHECK(
+        accepted.candidate.mode ==
+        PlaceMotionMode::PrecomputedReversedPickup);
+    TEST_CHECK(accepted.candidate.source_id == 2001U);
+
+    rejected_after([](PlaceFixture& value) {
+        value.library.precomputed_reversed.front().id = 0U;
+    });
+    rejected_after([](PlaceFixture& value) {
+        value.library.precomputed_reversed.push_back(
+            value.library.precomputed_reversed.front());
+    });
+    rejected_after([](PlaceFixture& value) {
+        value.library.precomputed_reversed.front().sequence_id.clear();
+    });
+    rejected_after([](PlaceFixture& value) {
+        value.database.fps_numerator = 24U;
+    });
+    rejected_after([](PlaceFixture& value) {
+        value.database.fps_denominator = 2U;
+    });
+    rejected_after([](PlaceFixture& value) {
+        value.library.precomputed_reversed.front().contact_frame =
+            value.library.precomputed_reversed.front().entry_frame;
+    });
+    rejected_after([](PlaceFixture& value) {
+        value.database.phases[static_cast<size_t>(kContactFrame + 1)] =
+            static_cast<uint8_t>(Phase::Approach);
+    });
+    rejected_after([](PlaceFixture& value) {
+        value.database.hand_contacts[
+            static_cast<size_t>(kLiftFrame) * 2U + 1U] = 0U;
+    });
+    rejected_after([](PlaceFixture& value) {
+        value.library.precomputed_reversed.front().hand = Hand::Left;
+    });
+    rejected_after([](PlaceFixture& value) {
+        value.library.precomputed_reversed.front()
+            .source_hand_in_object.position.x = 0.020001F;
+    });
+    rejected_after([](PlaceFixture& value) {
+        value.library.precomputed_reversed.front()
+            .source_object_bounds.half_extents_object.x += 0.001001F;
+    });
+    rejected_after([](PlaceFixture& value) {
+        value.library.precomputed_reversed.front()
+            .source_support_height_m += 0.001001F;
+    });
+    rejected_after([](PlaceFixture& value) {
+        value.library.precomputed_reversed.front()
+            .source_grasp_height_above_support_m += 0.020001F;
+    });
+
+    rejected_after([](PlaceFixture& value) {
+        set_database_object_and_hand(
+            value.database,
+            kContactFrame + 2,
+            Transform{vec3(0.0F, 0.60F, 0.0F), quat()});
+    });
+
+    PlaceFixture exact = isolated();
+    const float measured = configure_reachable_reverse_request(exact);
+    TEST_CHECK(measured <= 0.12F);
+    TEST_CHECK(0.12F - measured < 0.000001F);
+    PrecomputedReversedPickupClip& exact_row =
+        exact.library.precomputed_reversed.front();
+    const Transform exact_source_hand = hand_transform(
+        pose_at_frame(exact.database, kContactFrame));
+    constexpr float source_grasp_height = 0.13F;
+    const float exact_source_support =
+        exact_source_hand.position.y - source_grasp_height;
+    exact.database.table_positions[1] = exact_source_support -
+        0.5F * exact.database.table_sizes[1];
+    exact_row.source_surface = make_surface(
+        502U,
+        vec3(
+            exact_source_hand.position.x,
+            exact_source_support,
+            exact_source_hand.position.z));
+    exact_row.source_surface.affordances.front().object_in_surface = {
+        vec3(0.0F, source_grasp_height, 0.0F),
+        exact_source_hand.rotation,
+    };
+    exact_row.source_surface.affordances.front().support_point_object =
+        quat_mul_vec3(
+            quat_inv(exact_source_hand.rotation),
+            vec3(0.0F, -source_grasp_height, 0.0F));
+    exact_row.source_affordance_id =
+        exact_row.source_surface.affordances.front().id;
+    exact_row.source_support_height_m = exact_source_support;
+    exact_row.source_grasp_height_above_support_m = source_grasp_height;
+    refresh_pointers(exact);
+    const PlaceResult exact_result = select_place_motion(exact.input);
+    TEST_CHECK(exact_result.accepted);
+    TEST_CHECK(std::abs(
+                   exact_result.candidate
+                       .requested_vertical_correction_m) <= 0.12F);
+
+    PlaceFixture over = copy_fixture(exact);
+    const float correction_sign =
+        exact.input.surface.surface_world.position.y >= exact_source_support
+        ? 1.0F
+        : -1.0F;
+    set_destination_support_height(
+        over,
+        exact_source_support + correction_sign * 0.120001F);
+    TEST_CHECK(!select_place_motion(over.input).accepted);
+
+    PlaceFixture tie = make_fixture(false);
+    tie.library.precomputed_reversed = {
+        make_precomputed_reverse(2002U),
+        make_precomputed_reverse(2001U)};
+    disable_immediate_reverse(tie);
+    refresh_pointers(tie);
+    const PlaceResult tie_result = select_place_motion(tie.input);
+    TEST_CHECK(tie_result.accepted);
+    TEST_CHECK(tie_result.candidate.source_id == 2001U);
 }
 
 void test_reverse_certification_uses_earliest_stable_prefix() {
@@ -1789,6 +2054,90 @@ void assert_selection_id_changes(
     TEST_CHECK(after != before);
 }
 
+void test_precomputed_library_fingerprint_is_fieldwise_and_ordered() {
+    PlaceFixture base = make_fixture();
+    base.library.precomputed_reversed = {make_precomputed_reverse()};
+    refresh_pointers(base);
+    const std::vector<std::function<void(PlaceFixture&)>> mutations = {
+        [](PlaceFixture& value) {
+            ++value.library.precomputed_reversed.front().id;
+        },
+        [](PlaceFixture& value) {
+            ++value.library.precomputed_reversed.front().object_profile_id;
+        },
+        [](PlaceFixture& value) {
+            value.library.precomputed_reversed.front().sequence_id += "x";
+        },
+        [](PlaceFixture& value) {
+            ++value.library.precomputed_reversed.front().clip;
+        },
+        [](PlaceFixture& value) {
+            ++value.library.precomputed_reversed.front().entry_frame;
+        },
+        [](PlaceFixture& value) {
+            ++value.library.precomputed_reversed.front().contact_frame;
+        },
+        [](PlaceFixture& value) {
+            ++value.library.precomputed_reversed.front().lift_frame;
+        },
+        [](PlaceFixture& value) {
+            ++value.library.precomputed_reversed.front().hold_frame;
+        },
+        [](PlaceFixture& value) {
+            ++value.library.precomputed_reversed.front().reverse_start_frame;
+        },
+        [](PlaceFixture& value) {
+            value.library.precomputed_reversed.front().hand = Hand::Left;
+        },
+        [](PlaceFixture& value) {
+            value.library.precomputed_reversed.front()
+                .source_hand_in_object.position.x += 0.001F;
+        },
+        [](PlaceFixture& value) {
+            value.library.precomputed_reversed.front()
+                .source_hand_in_object.rotation = quat_from_angle_axis(
+                    0.001F, vec3(0.0F, 1.0F, 0.0F));
+        },
+        [](PlaceFixture& value) {
+            value.library.precomputed_reversed.front()
+                .source_object_bounds.center_object.x += 0.001F;
+        },
+        [](PlaceFixture& value) {
+            value.library.precomputed_reversed.front()
+                .source_object_bounds.half_extents_object.x += 0.001F;
+        },
+        [](PlaceFixture& value) {
+            ++value.library.precomputed_reversed.front()
+                  .source_surface.handle.generation;
+        },
+        [](PlaceFixture& value) {
+            ++value.library.precomputed_reversed.front()
+                  .source_affordance_id;
+        },
+        [](PlaceFixture& value) {
+            value.library.precomputed_reversed.front()
+                .source_support_height_m += 0.001F;
+        },
+        [](PlaceFixture& value) {
+            value.library.precomputed_reversed.front()
+                .source_grasp_height_above_support_m += 0.001F;
+        },
+    };
+    for (const auto& mutate : mutations) {
+        assert_selection_id_changes(base, mutate);
+    }
+
+    PlaceFixture ordered = make_fixture();
+    ordered.library.precomputed_reversed = {
+        make_precomputed_reverse(2001U),
+        make_precomputed_reverse(2002U)};
+    assert_selection_id_changes(ordered, [](PlaceFixture& value) {
+        std::swap(
+            value.library.precomputed_reversed[0],
+            value.library.precomputed_reversed[1]);
+    });
+}
+
 void test_complete_snapshot_identity_and_pointer_independence() {
     PlaceFixture base = make_fixture();
     base.input.held_affordance.interaction_slots = {
@@ -2519,6 +2868,9 @@ float configure_reachable_reverse_request(PlaceFixture& fixture) {
         vec3(0.0F, -support_height, 0.0F));
     fixture.input.surface.affordances.front() =
         fixture.input.place_affordance;
+    fixture.database.table_positions[1] =
+        fixture.input.surface.surface_world.position.y -
+        0.5F * fixture.database.table_sizes[1];
     fixture.input.ik.accepted_position_m = 0.001F;
     fixture.input.ik.accepted_orientation_radians = 0.005F;
     fixture.input.ik.maximum_iterations = 64;
@@ -2886,6 +3238,38 @@ void test_reverse_player_native_25hz_and_derivative_direction() {
                        .foot_contacts);
     }
     TEST_CHECK(player.source_frame() >= selected.candidate.stop_frame);
+}
+
+void test_precomputed_reverse_player_uses_database_interpolation() {
+    PlaceFixture fixture = make_fixture(false);
+    add_precomputed_reverse(fixture);
+    disable_immediate_reverse(fixture);
+    fixture.input.timing.playback_speed = 0.85F;
+    const PlaceResult selected = select_place_motion(fixture.input);
+    TEST_CHECK(selected.accepted);
+    TEST_CHECK(
+        selected.candidate.mode ==
+        PlaceMotionMode::PrecomputedReversedPickup);
+    PlacePlayer player;
+    player.start(selected.candidate, fixture.input);
+    player.advance(0.04F);
+    const double source_frame = player.source_frame_exact();
+    const int32_t left = static_cast<int32_t>(std::floor(source_frame));
+    const int32_t right = left + 1;
+    const float alpha = static_cast<float>(source_frame - left);
+    const Pose source = interpolate_pose(
+        pose_at_frame(fixture.database, left),
+        pose_at_frame(fixture.database, right),
+        alpha);
+    const PlaceSample sample = player.sample();
+    TEST_CHECK(near(sample.pose.hand_dof[0], source.hand_dof[0]));
+    TEST_CHECK(near(
+        sample.pose.hand_dof_velocities[0],
+        -0.85F * source.hand_dof_velocities[0]));
+    const Transform mapped_root = compose(
+        selected.candidate.scene_from_source,
+        Transform{source.positions[kRoot], source.rotations[kRoot]});
+    TEST_CHECK(near(sample.pose.positions[kRoot], mapped_root.position));
 }
 
 void test_reverse_player_snaps_fractional_speed_integer_alignment() {
@@ -3290,11 +3674,13 @@ int main(int argc, char** argv) {
         test_fast_math_bit_safe_canary();
         return g_failures == 0 ? 0 : 1;
     }
+    test_precomputed_reverse_priority_and_preview_provenance_boundary();
     test_frozen_public_contract();
     test_recorded_priority_and_dynamic_readiness();
     test_readiness_boundaries_and_tighter_config();
     test_invalid_timing_and_match_configs_reject_before_tiers();
     test_ik_config_validation_and_authoritative_request_limits();
+    test_precomputed_reverse_validation_ties_and_height_boundary();
     test_reverse_certification_uses_earliest_stable_prefix();
     test_reverse_identity_ignores_unconsulted_storage_and_clips();
     test_reverse_certification_rejections();
@@ -3305,6 +3691,7 @@ int main(int argc, char** argv) {
     test_selection_certifies_mapped_support_volume_clearance();
     test_selection_runs_real_ik_with_exact_config();
     test_placement_fit_failure_reasons_are_preserved();
+    test_precomputed_library_fingerprint_is_fieldwise_and_ordered();
     test_complete_snapshot_identity_and_pointer_independence();
     test_ik_fingerprint_is_complete_and_configuration_only();
     test_canonical_identity_normalizes_negative_zero_and_quaternion_sign();
@@ -3312,6 +3699,7 @@ int main(int argc, char** argv) {
     test_mapped_reverse_hand_correction_uses_exact_ik_limit();
     test_player_events_use_strict_ceil_tick_clock();
     test_reverse_player_native_25hz_and_derivative_direction();
+    test_precomputed_reverse_player_uses_database_interpolation();
     test_reverse_player_snaps_fractional_speed_integer_alignment();
     test_reverse_player_shortest_arc_and_hand_derived_object();
     test_scene_mapping_rotates_only_root_derivatives();

@@ -150,6 +150,8 @@ inline const char* place_mode_name(PlaceMotionMode mode) {
     case PlaceMotionMode::None: return "none";
     case PlaceMotionMode::RecordedPlace: return "recorded_place";
     case PlaceMotionMode::ReversedPickup: return "reversed_pickup";
+    case PlaceMotionMode::PrecomputedReversedPickup:
+        return "precomputed_reversed_pickup";
     }
     return "unknown";
 }

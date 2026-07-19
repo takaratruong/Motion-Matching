@@ -110,6 +110,22 @@ bool equivalent(const PlaceStep& left, const PlaceStep& right) {
            left.retract_finished == right.retract_finished &&
            left.recover_to_carry == right.recover_to_carry &&
            left.reason == right.reason &&
+           left.source_id == right.source_id &&
+           near(
+               left.source_support_height_m,
+               right.source_support_height_m) &&
+           near(
+               left.requested_support_height_m,
+               right.requested_support_height_m) &&
+           near(
+               left.target_support_height_m,
+               right.target_support_height_m) &&
+           near(
+               left.requested_vertical_correction_m,
+               right.requested_vertical_correction_m) &&
+           near(
+               left.applied_vertical_correction_m,
+               right.applied_vertical_correction_m) &&
            near(
                left.hand_position_error_m,
                right.hand_position_error_m) &&
@@ -333,6 +349,7 @@ Database make_reverse_database() {
     database.source_frames.resize(frames);
     database.table_rotations[0] = 1.0F;
     database.grasp_rotations_object[0] = 1.0F;
+    database.table_positions[1] = 0.20F;
 
     for (int32_t frame = 0; frame < kFrameCount; ++frame) {
         Phase phase = Phase::Approach;
@@ -720,6 +737,12 @@ void test_frozen_public_contract() {
     TEST_CHECK(begin_result.reason == Reason::None);
     TEST_CHECK(step.phase == PlacePhase::Align);
     TEST_CHECK(step.source_frame_exact == -1.0);
+    TEST_CHECK(step.source_id == 0U);
+    TEST_CHECK(step.source_support_height_m == 0.0F);
+    TEST_CHECK(step.requested_support_height_m == 0.0F);
+    TEST_CHECK(step.target_support_height_m == 0.0F);
+    TEST_CHECK(step.requested_vertical_correction_m == 0.0F);
+    TEST_CHECK(step.applied_vertical_correction_m == 0.0F);
     TEST_CHECK(step.requested_root_correction_m == 0.0F);
     TEST_CHECK(step.applied_root_correction_m == 0.0F);
     TEST_CHECK(step.requested_yaw_correction_radians == 0.0F);
@@ -917,6 +940,18 @@ void test_begin_revalidates_complete_selection_and_is_atomic() {
     });
     forged_rejects([](PlaceCandidate& value) { value.selection_id ^= 1U; });
     forged_rejects([](PlaceCandidate& value) { ++value.source_id; });
+    forged_rejects([](PlaceCandidate& value) {
+        value.source_support_height_m += 0.001F;
+    });
+    forged_rejects([](PlaceCandidate& value) {
+        value.requested_support_height_m += 0.001F;
+    });
+    forged_rejects([](PlaceCandidate& value) {
+        value.target_support_height_m += 0.001F;
+    });
+    forged_rejects([](PlaceCandidate& value) {
+        value.requested_vertical_correction_m += 0.001F;
+    });
     forged_rejects([](PlaceCandidate& value) { ++value.clip; });
     forged_rejects([](PlaceCandidate& value) { ++value.entry_frame; });
     forged_rejects([](PlaceCandidate& value) { ++value.commit_frame; });
@@ -1400,6 +1435,16 @@ void test_step_reports_exact_source_and_zeroes_corrections_after_release() {
     oracle.advance(0.04F);
     const PlaceStep first = controller.update(0.04F);
     TEST_CHECK(first.source_frame_exact == oracle.source_frame_exact());
+    TEST_CHECK(first.source_id == begin.candidate.source_id);
+    TEST_CHECK(first.source_support_height_m ==
+               begin.candidate.source_support_height_m);
+    TEST_CHECK(first.requested_support_height_m ==
+               begin.candidate.requested_support_height_m);
+    TEST_CHECK(first.target_support_height_m ==
+               begin.candidate.target_support_height_m);
+    TEST_CHECK(first.requested_vertical_correction_m ==
+               begin.candidate.requested_vertical_correction_m);
+    TEST_CHECK(std::isfinite(first.applied_vertical_correction_m));
     TEST_CHECK(first.requested_root_correction_m > 0.0F);
     TEST_CHECK(first.applied_root_correction_m >= 0.0F);
     TEST_CHECK(first.requested_yaw_correction_radians > 0.0F);
@@ -1411,9 +1456,23 @@ void test_step_reports_exact_source_and_zeroes_corrections_after_release() {
 
     const PlaceStep release = run_to_terminal_before_ack(controller);
     TEST_CHECK(release.release_due);
+    TEST_CHECK(release.source_id == begin.candidate.source_id);
+    TEST_CHECK(release.requested_vertical_correction_m ==
+               begin.candidate.requested_vertical_correction_m);
     controller.acknowledge_release(release.object_world);
     const PlaceStep retract = controller.update(0.04F);
     TEST_CHECK(retract.source_frame_exact >= 0.0);
+    TEST_CHECK(retract.source_id == begin.candidate.source_id);
+    TEST_CHECK(retract.source_support_height_m ==
+               begin.candidate.source_support_height_m);
+    TEST_CHECK(retract.requested_support_height_m ==
+               begin.candidate.requested_support_height_m);
+    TEST_CHECK(retract.target_support_height_m ==
+               begin.candidate.target_support_height_m);
+    TEST_CHECK(retract.requested_vertical_correction_m ==
+               begin.candidate.requested_vertical_correction_m);
+    TEST_CHECK(retract.applied_vertical_correction_m ==
+               release.applied_vertical_correction_m);
     TEST_CHECK(retract.requested_root_correction_m == 0.0F);
     TEST_CHECK(retract.applied_root_correction_m == 0.0F);
     TEST_CHECK(retract.requested_yaw_correction_radians == 0.0F);
@@ -1654,6 +1713,15 @@ void test_reverse_lifecycle_and_cancel_boundaries() {
     TEST_CHECK(cancelled.reason == Reason::Cancelled);
     TEST_CHECK(near(cancelled.pose, precommit.pose));
     TEST_CHECK(near(cancelled.object_world, precommit.object_world));
+    TEST_CHECK(cancelled.source_id == begin.candidate.source_id);
+    TEST_CHECK(cancelled.source_support_height_m ==
+               begin.candidate.source_support_height_m);
+    TEST_CHECK(cancelled.requested_support_height_m ==
+               begin.candidate.requested_support_height_m);
+    TEST_CHECK(cancelled.target_support_height_m ==
+               begin.candidate.target_support_height_m);
+    TEST_CHECK(cancelled.requested_vertical_correction_m ==
+               begin.candidate.requested_vertical_correction_m);
 
     fixture = make_fixture(false);
     begin = selected_begin(fixture);

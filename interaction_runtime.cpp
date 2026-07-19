@@ -637,6 +637,12 @@ bool exact(const PlacementSurface& left, const PlacementSurface& right) {
 bool exact(const PlaceCandidate& left, const PlaceCandidate& right) {
     return left.mode == right.mode && left.source_id == right.source_id &&
            left.selection_id == right.selection_id &&
+           left.source_support_height_m == right.source_support_height_m &&
+           left.requested_support_height_m ==
+               right.requested_support_height_m &&
+           left.target_support_height_m == right.target_support_height_m &&
+           left.requested_vertical_correction_m ==
+               right.requested_vertical_correction_m &&
            exact(left.timing, right.timing) &&
            exact(left.match, right.match) && exact(left.ik, right.ik) &&
            left.clip == right.clip &&
@@ -1566,6 +1572,14 @@ void InteractionRuntime::reset_place_attempt() {
 
 void InteractionRuntime::update_place_diagnostics(const PlaceStep& step) {
     RuntimePlaceDiagnostics& place = diagnostics_.place;
+    place.source_id = step.source_id;
+    place.source_support_height_m = step.source_support_height_m;
+    place.requested_support_height_m = step.requested_support_height_m;
+    place.target_support_height_m = step.target_support_height_m;
+    place.requested_vertical_correction_m =
+        step.requested_vertical_correction_m;
+    place.applied_vertical_correction_m =
+        step.applied_vertical_correction_m;
     place.source_frame = step.source_frame;
     place.source_frame_exact = step.source_frame_exact;
     place.phase = step.phase;
@@ -2566,6 +2580,20 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
                             preview.candidate.entry_frame;
                         place_step_.source_frame_exact =
                             preview.candidate.entry_frame;
+                        place_step_.source_id =
+                            frozen_place_preview_.candidate.source_id;
+                        place_step_.source_support_height_m =
+                            frozen_place_preview_.candidate
+                                .source_support_height_m;
+                        place_step_.requested_support_height_m =
+                            frozen_place_preview_.candidate
+                                .requested_support_height_m;
+                        place_step_.target_support_height_m =
+                            frozen_place_preview_.candidate
+                                .target_support_height_m;
+                        place_step_.requested_vertical_correction_m =
+                            frozen_place_preview_.candidate
+                                .requested_vertical_correction_m;
                         place_step_.support_sweep_clear = true;
                         state_ = RuntimeState::PlaceAlign;
                         diagnostics_.state = state_;
@@ -2582,6 +2610,8 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
                         diagnostics_.place.affordance_id =
                             place_request_->affordance_id;
                         diagnostics_.place.mode = preview.candidate.mode;
+                        diagnostics_.place.source_id =
+                            frozen_place_preview_.candidate.source_id;
                         diagnostics_.place.selection_id =
                             preview.candidate.selection_id;
                         diagnostics_.place.clip = preview.candidate.clip;
@@ -2931,8 +2961,25 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
                             frozen_place_preview_.accepted;
                         diagnostics_.place.mode =
                             frozen_place_preview_.candidate.mode;
+                        diagnostics_.place.source_id =
+                            frozen_place_preview_.candidate.source_id;
                         diagnostics_.place.selection_id =
                             frozen_place_preview_.candidate.selection_id;
+                        diagnostics_.place.source_support_height_m =
+                            frozen_place_preview_.candidate
+                                .source_support_height_m;
+                        diagnostics_.place.requested_support_height_m =
+                            frozen_place_preview_.candidate
+                                .requested_support_height_m;
+                        diagnostics_.place.target_support_height_m =
+                            frozen_place_preview_.candidate
+                                .target_support_height_m;
+                        diagnostics_.place
+                            .requested_vertical_correction_m =
+                            frozen_place_preview_.candidate
+                                .requested_vertical_correction_m;
+                        diagnostics_.place.applied_vertical_correction_m =
+                            0.0F;
                         diagnostics_.place.ik_config_fingerprint =
                             frozen_place_preview_.ik_config_fingerprint;
                         diagnostics_.place.requested_goal_world =

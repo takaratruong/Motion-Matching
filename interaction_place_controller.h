@@ -25,6 +25,12 @@ struct PlaceStep {
     bool retract_finished = false;
     bool recover_to_carry = false;
     Reason reason = Reason::None;
+    uint64_t source_id = 0U;
+    float source_support_height_m = 0.0F;
+    float requested_support_height_m = 0.0F;
+    float target_support_height_m = 0.0F;
+    float requested_vertical_correction_m = 0.0F;
+    float applied_vertical_correction_m = 0.0F;
     float hand_position_error_m = 0.0F;
     float hand_orientation_error_radians = 0.0F;
     float requested_root_correction_m = 0.0F;

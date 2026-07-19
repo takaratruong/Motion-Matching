@@ -337,6 +337,13 @@ public:
         }
     }
 
+    void text(std::string_view value) {
+        u64(static_cast<uint64_t>(value.size()));
+        for (char character : value) {
+            byte(static_cast<uint8_t>(character));
+        }
+    }
+
     void scalar(float value) {
         uint32_t bits = 0U;
         static_assert(sizeof(bits) == sizeof(value));
@@ -507,6 +514,28 @@ void hash_recorded_clip(CanonicalHash& hash, const RecordedPlaceClip& value) {
     hash.u32(value.source_affordance_id);
 }
 
+void hash_precomputed_reversed_clip(
+    CanonicalHash& hash,
+    const PrecomputedReversedPickupClip& value) {
+    hash.tag(0x5013U);
+    hash.u64(value.id);
+    hash.u64(value.object_profile_id);
+    hash.text(value.sequence_id);
+    hash.i32(value.clip);
+    hash.i32(value.entry_frame);
+    hash.i32(value.contact_frame);
+    hash.i32(value.lift_frame);
+    hash.i32(value.hold_frame);
+    hash.i32(value.reverse_start_frame);
+    hash.u8(static_cast<uint8_t>(value.hand));
+    hash.transform(value.source_hand_in_object);
+    hash_bounds(hash, value.source_object_bounds);
+    hash_surface(hash, value.source_surface);
+    hash.u32(value.source_affordance_id);
+    hash.scalar(value.source_support_height_m);
+    hash.scalar(value.source_grasp_height_above_support_m);
+}
+
 void hash_float_span(
     CanonicalHash& hash,
     const std::vector<float>& values,
@@ -671,6 +700,10 @@ void hash_candidate_without_selection(
     hash.tag(0x5012U);
     hash.u8(static_cast<uint8_t>(value.mode));
     hash.u64(value.source_id);
+    hash.scalar(value.source_support_height_m);
+    hash.scalar(value.requested_support_height_m);
+    hash.scalar(value.target_support_height_m);
+    hash.scalar(value.requested_vertical_correction_m);
     hash_timing(hash, value.timing);
     hash_match(hash, value.match);
     hash_ik(hash, value.ik);
@@ -746,6 +779,28 @@ uint64_t selection_fingerprint(
         for (const RecordedPlaceClip& row : input.library->recorded) {
             hash_recorded_clip(hash, row);
         }
+        hash.u64(static_cast<uint64_t>(
+            input.library->precomputed_reversed.size()));
+        for (const PrecomputedReversedPickupClip& row :
+             input.library->precomputed_reversed) {
+            hash_precomputed_reversed_clip(hash, row);
+            if (input.pickup_database == nullptr) {
+                hash.boolean(false);
+            } else {
+                hash.boolean(true);
+                MatchCandidate source{};
+                source.clip = row.clip;
+                source.entry_frame = row.entry_frame;
+                source.contact_frame = row.contact_frame;
+                source.lift_frame = row.lift_frame;
+                source.hold_frame = row.hold_frame;
+                hash_pickup_prefix(
+                    hash,
+                    *input.pickup_database,
+                    source,
+                    row.reverse_start_frame);
+            }
+        }
     }
     hash_candidate_without_selection(hash, selected);
     return hash.finish();
@@ -760,6 +815,47 @@ uint64_t reverse_source_id(
     hash_pickup_prefix(
         hash, *input.pickup_database, input.pickup_candidate, prefix_stop);
     return hash.finish();
+}
+
+std::optional<float> database_source_support_height(
+    const Database& database,
+    int32_t clip) {
+    if (clip < 0) return std::nullopt;
+    const size_t index = static_cast<size_t>(clip);
+    if (index > std::numeric_limits<size_t>::max() / 4U) {
+        return std::nullopt;
+    }
+    if (index * 3U > database.table_positions.size() ||
+        3U > database.table_positions.size() - index * 3U ||
+        index * 4U > database.table_rotations.size() ||
+        4U > database.table_rotations.size() - index * 4U ||
+        index * 3U > database.table_sizes.size() ||
+        3U > database.table_sizes.size() - index * 3U) {
+        return std::nullopt;
+    }
+    const size_t position = index * 3U;
+    const size_t rotation = index * 4U;
+    const Transform table{
+        vec3(
+            database.table_positions[position],
+            database.table_positions[position + 1U],
+            database.table_positions[position + 2U]),
+        quat(
+            database.table_rotations[rotation],
+            database.table_rotations[rotation + 1U],
+            database.table_rotations[rotation + 2U],
+            database.table_rotations[rotation + 3U]),
+    };
+    const vec3 size(
+        database.table_sizes[position],
+        database.table_sizes[position + 1U],
+        database.table_sizes[position + 2U]);
+    if (!valid_transform(table) || !positive(size)) return std::nullopt;
+    const Transform support = compose(
+        table,
+        Transform{vec3(0.0F, 0.5F * size.y, 0.0F), quat()});
+    if (!valid_transform(support)) return std::nullopt;
+    return support.position.y;
 }
 
 bool valid_timing(const PlaceTimingConfig& timing) {
@@ -945,6 +1041,36 @@ struct SelectionFailures {
         return Reason::NoCandidate;
     }
 };
+
+bool populate_candidate_heights(
+    PlaceCandidate& candidate,
+    const PlaceMatchInput& input,
+    float source_support_height_m,
+    SelectionFailures& failures) {
+    const float requested_support_height_m =
+        input.surface.surface_world.position.y;
+    if (!finite(source_support_height_m) ||
+        !finite(requested_support_height_m)) {
+        failures.remember(Reason::CorrectionLimit);
+        return false;
+    }
+    candidate.source_support_height_m = source_support_height_m;
+    candidate.requested_support_height_m = requested_support_height_m;
+    candidate.target_support_height_m = requested_support_height_m;
+    candidate.requested_vertical_correction_m =
+        candidate.target_support_height_m -
+        candidate.source_support_height_m;
+    const float inclusive_limit = std::nextafter(
+        kMaximumRequestPositionM,
+        std::numeric_limits<float>::infinity());
+    if (!finite(candidate.requested_vertical_correction_m) ||
+        std::abs(candidate.requested_vertical_correction_m) >
+            inclusive_limit) {
+        failures.remember(Reason::CorrectionLimit);
+        return false;
+    }
+    return true;
+}
 
 Reason mapped_clearance_failure(
     const std::vector<Transform>& object_samples,
@@ -1417,6 +1543,13 @@ std::optional<PlaceCandidate> recorded_candidate(
     candidate.staging_root_world = staging_root;
     candidate.entry_root_offset = root_offset;
     candidate.entry_yaw_offset = yaw_offset;
+    if (!populate_candidate_heights(
+            candidate,
+            input,
+            clip.source_surface.surface_world.position.y,
+            failures)) {
+        return std::nullopt;
+    }
     const Transform held_grasp = input.held_affordance.hand_in_object;
     candidate.total_cost = static_cast<float>(
         distance(clip.hand_in_object.position, held_grasp.position) +
@@ -1487,26 +1620,42 @@ bool span_available(size_t size, size_t begin, size_t count) {
     return begin <= size && count <= size - begin;
 }
 
-bool selected_database_metadata_valid(
+bool database_clip_metadata_valid(
     const PlaceMatchInput& input,
+    int32_t clip_value,
+    Hand hand,
     int32_t& range_start,
     int32_t& range_stop) {
     const Database& database = *input.pickup_database;
-    const MatchCandidate& candidate = input.pickup_candidate;
     if (database.fps_numerator != 25U || database.fps_denominator != 1U ||
         database.bone_count != g1_skeleton::BoneCount ||
         database.hand_dof_count != 14U ||
-        candidate.clip < 0 ||
-        static_cast<uint32_t>(candidate.clip) >= database.clip_count ||
-        static_cast<size_t>(candidate.clip) >= database.range_starts.size() ||
-        static_cast<size_t>(candidate.clip) >= database.range_stops.size() ||
-        static_cast<size_t>(candidate.clip) >= database.active_hands.size() ||
+        clip_value < 0 ||
+        static_cast<uint32_t>(clip_value) >= database.clip_count ||
+        static_cast<size_t>(clip_value) >= database.range_starts.size() ||
+        static_cast<size_t>(clip_value) >= database.range_stops.size() ||
+        static_cast<size_t>(clip_value) >= database.active_hands.size() ||
         database.parents.size() != g1_skeleton::BoneCount ||
         !std::equal(
             database.parents.begin(),
             database.parents.end(),
-            g1_skeleton::kParents.begin()) ||
-        !valid_transform(candidate.scene_from_source) ||
+            g1_skeleton::kParents.begin())) {
+        return false;
+    }
+    const size_t clip = static_cast<size_t>(clip_value);
+    range_start = database.range_starts[clip];
+    range_stop = database.range_stops[clip];
+    return range_start >= 0 && range_stop > range_start &&
+           static_cast<uint32_t>(range_stop) <= database.frame_count &&
+           database.active_hands[clip] == static_cast<uint8_t>(hand);
+}
+
+bool selected_database_metadata_valid(
+    const PlaceMatchInput& input,
+    int32_t& range_start,
+    int32_t& range_stop) {
+    const MatchCandidate& candidate = input.pickup_candidate;
+    if (!valid_transform(candidate.scene_from_source) ||
         !finite(candidate.entry_root_offset) ||
         !finite(candidate.entry_yaw_offset) ||
         !finite(candidate.total_cost)) {
@@ -1515,13 +1664,12 @@ bool selected_database_metadata_valid(
     for (float cost : candidate.group_costs) {
         if (!finite(cost)) return false;
     }
-    const size_t clip = static_cast<size_t>(candidate.clip);
-    range_start = database.range_starts[clip];
-    range_stop = database.range_stops[clip];
-    return range_start >= 0 && range_stop > range_start &&
-           static_cast<uint32_t>(range_stop) <= database.frame_count &&
-           database.active_hands[clip] ==
-               static_cast<uint8_t>(input.held_affordance.hand);
+    return database_clip_metadata_valid(
+        input,
+        candidate.clip,
+        input.held_affordance.hand,
+        range_start,
+        range_stop);
 }
 
 bool database_frame_storage_valid(
@@ -1671,52 +1819,62 @@ std::optional<int32_t> earliest_stable_reverse_start(
     return std::nullopt;
 }
 
+struct ReverseSource {
+    PlaceMotionMode mode = PlaceMotionMode::ReversedPickup;
+    uint64_t source_id = 0U;
+    int32_t clip = -1;
+    int32_t entry_frame = -1;
+    int32_t contact_frame = -1;
+    int32_t lift_frame = -1;
+    int32_t hold_frame = -1;
+    int32_t reverse_start_frame = -1;
+};
+
 bool reverse_prefix_valid(
-    const PlaceMatchInput& input,
+    const Database& database,
     int32_t range_start,
     int32_t range_stop,
-    int32_t reverse_start) {
-    const Database& database = *input.pickup_database;
-    const MatchCandidate& candidate = input.pickup_candidate;
-    if (!(range_start <= candidate.entry_frame &&
-          candidate.entry_frame < candidate.contact_frame &&
-          candidate.contact_frame < candidate.lift_frame &&
-          candidate.lift_frame < candidate.hold_frame &&
-          candidate.hold_frame <= reverse_start &&
-          reverse_start < range_stop) ||
-        !database_frame_storage_valid(database, candidate.contact_frame) ||
-        !database_frame_storage_valid(database, candidate.lift_frame) ||
-        !database_frame_storage_valid(database, candidate.hold_frame) ||
-        database.phases[static_cast<size_t>(candidate.contact_frame)] !=
+    const ReverseSource& source,
+    Hand hand) {
+    if (!(range_start <= source.entry_frame &&
+          source.entry_frame < source.contact_frame &&
+          source.contact_frame < source.lift_frame &&
+          source.lift_frame < source.hold_frame &&
+          source.hold_frame <= source.reverse_start_frame &&
+          source.reverse_start_frame < range_stop) ||
+        !database_frame_storage_valid(database, source.contact_frame) ||
+        !database_frame_storage_valid(database, source.lift_frame) ||
+        !database_frame_storage_valid(database, source.hold_frame) ||
+        database.phases[static_cast<size_t>(source.contact_frame)] !=
             static_cast<uint8_t>(Phase::Contact) ||
-        database.phases[static_cast<size_t>(candidate.lift_frame)] !=
+        database.phases[static_cast<size_t>(source.lift_frame)] !=
             static_cast<uint8_t>(Phase::Lift) ||
-        database.phases[static_cast<size_t>(candidate.hold_frame)] !=
+        database.phases[static_cast<size_t>(source.hold_frame)] !=
             static_cast<uint8_t>(Phase::Hold)) {
         return false;
     }
-    const size_t active = static_cast<size_t>(input.held_affordance.hand);
+    const size_t active = static_cast<size_t>(hand);
     uint8_t previous_precontact_phase = static_cast<uint8_t>(Phase::Approach);
-    for (int32_t frame = candidate.entry_frame;
-         frame <= reverse_start;
+    for (int32_t frame = source.entry_frame;
+         frame <= source.reverse_start_frame;
          ++frame) {
         if (!database_frame_valid(database, frame)) return false;
         const uint8_t phase = database.phases[static_cast<size_t>(frame)];
-        if (frame < candidate.contact_frame) {
+        if (frame < source.contact_frame) {
             if (phase > static_cast<uint8_t>(Phase::Reach) ||
-                (frame > candidate.entry_frame &&
+                (frame > source.entry_frame &&
                  phase < previous_precontact_phase)) {
                 return false;
             }
             previous_precontact_phase = phase;
-        } else if (frame < candidate.lift_frame) {
+        } else if (frame < source.lift_frame) {
             if (phase != static_cast<uint8_t>(Phase::Contact)) return false;
-        } else if (frame < candidate.hold_frame) {
+        } else if (frame < source.hold_frame) {
             if (phase != static_cast<uint8_t>(Phase::Lift)) return false;
         } else if (phase != static_cast<uint8_t>(Phase::Hold)) {
             return false;
         }
-        if (frame >= candidate.contact_frame &&
+        if (frame >= source.contact_frame &&
             database.hand_contacts[static_cast<size_t>(frame) * 2U + active] !=
                 1U) {
             return false;
@@ -1725,41 +1883,19 @@ bool reverse_prefix_valid(
     return true;
 }
 
-std::optional<PlaceCandidate> select_reverse_tier(
+std::optional<PlaceCandidate> reverse_candidate(
     const PlaceMatchInput& input,
     const ValidatedInput& validated,
-    int32_t& certified_prefix_stop,
+    const ReverseSource& source,
     SelectionFailures& failures) {
-    int32_t range_start = -1;
-    int32_t range_stop = -1;
-    if (!selected_database_metadata_valid(input, range_start, range_stop)) {
-        return std::nullopt;
-    }
-    const MatchCandidate& pickup = input.pickup_candidate;
-    if (!(range_start <= pickup.entry_frame &&
-          pickup.entry_frame < pickup.contact_frame &&
-          pickup.contact_frame < pickup.lift_frame &&
-          pickup.lift_frame < pickup.hold_frame &&
-          pickup.hold_frame < range_stop)) {
-        return std::nullopt;
-    }
-    const std::optional<int32_t> reverse_start =
-        earliest_stable_reverse_start(input, range_stop);
-    if (!reverse_start.has_value() ||
-        !reverse_prefix_valid(
-            input, range_start, range_stop, *reverse_start)) {
-        return std::nullopt;
-    }
-    certified_prefix_stop = *reverse_start;
-
     const Transform source_contact_hand = pose_hand(
-        pose_at_frame(*input.pickup_database, pickup.contact_frame),
+        pose_at_frame(*input.pickup_database, source.contact_frame),
         input.held_affordance.hand);
     const RotationTransform goal_hand = goal_hand_for_gate(input, validated);
     const Transform scene = planar_alignment(
         source_contact_hand, goal_hand.value);
     const RotationTransform mapped_contact_hand = mapped_pose_hand_for_gate(
-        pose_at_frame(*input.pickup_database, pickup.contact_frame),
+        pose_at_frame(*input.pickup_database, source.contact_frame),
         scene,
         input.held_affordance.hand);
     if (!within_transform_error(
@@ -1773,7 +1909,7 @@ std::optional<PlaceCandidate> select_reverse_tier(
     const std::optional<Transform> solved_release_object =
         solve_release_object(
             pose_at_frame(
-                *input.pickup_database, pickup.contact_frame),
+                *input.pickup_database, source.contact_frame),
             scene,
             input.held_affordance.hand,
             goal_hand,
@@ -1783,7 +1919,8 @@ std::optional<PlaceCandidate> select_reverse_tier(
 
     const Transform staging_root = compose(
         scene,
-        pose_root(pose_at_frame(*input.pickup_database, *reverse_start)));
+        pose_root(pose_at_frame(
+            *input.pickup_database, source.reverse_start_frame)));
     if (!current_attachment_within_request(input, staging_root)) {
         failures.remember(Reason::CorrectionLimit);
         return std::nullopt;
@@ -1792,11 +1929,11 @@ std::optional<PlaceCandidate> select_reverse_tier(
         staging_root, inverse(pose_root(input.current_pose)));
     std::vector<Transform> object_samples;
     object_samples.reserve(static_cast<size_t>(
-        *reverse_start - pickup.contact_frame + 2));
+        source.reverse_start_frame - source.contact_frame + 2));
     object_samples.push_back(compose(
         current_to_staging, input.current_object_world));
-    for (int32_t frame = *reverse_start;
-         frame > pickup.contact_frame;
+    for (int32_t frame = source.reverse_start_frame;
+         frame > source.contact_frame;
          --frame) {
         const Transform mapped_hand = compose(
             scene,
@@ -1824,8 +1961,9 @@ std::optional<PlaceCandidate> select_reverse_tier(
     }
     const int32_t offset = static_cast<int32_t>(std::floor(offset_value));
     if (offset <= 0) return std::nullopt;
-    const int32_t commit = *reverse_start - offset;
-    if (!(pickup.contact_frame < commit && commit < *reverse_start)) {
+    const int32_t commit = source.reverse_start_frame - offset;
+    if (!(source.contact_frame < commit &&
+          commit < source.reverse_start_frame)) {
         return std::nullopt;
     }
     if (!observable_commit_timing_valid(offset, input.timing)) {
@@ -1834,16 +1972,16 @@ std::optional<PlaceCandidate> select_reverse_tier(
 
     const Transform current_root = pose_root(input.current_pose);
     PlaceCandidate candidate{};
-    candidate.mode = PlaceMotionMode::ReversedPickup;
-    candidate.source_id = reverse_source_id(input, *reverse_start);
+    candidate.mode = source.mode;
+    candidate.source_id = source.source_id;
     candidate.timing = input.timing;
     candidate.match = input.match;
     candidate.ik = input.ik;
-    candidate.clip = pickup.clip;
-    candidate.entry_frame = *reverse_start;
+    candidate.clip = source.clip;
+    candidate.entry_frame = source.reverse_start_frame;
     candidate.commit_frame = commit;
-    candidate.release_frame = pickup.contact_frame;
-    candidate.stop_frame = pickup.entry_frame;
+    candidate.release_frame = source.contact_frame;
+    candidate.stop_frame = source.entry_frame;
     candidate.direction = -1;
     candidate.scene_from_source = scene;
     candidate.staging_root_world = staging_root;
@@ -1862,6 +2000,276 @@ std::optional<PlaceCandidate> select_reverse_tier(
             mapped_contact_hand.value.rotation,
             goal_hand.value.rotation));
     if (!finite(candidate.total_cost) || candidate.source_id == 0U) {
+        return std::nullopt;
+    }
+    return candidate;
+}
+
+std::optional<Transform> database_authored_grasp(
+    const Database& database,
+    int32_t clip) {
+    if (clip < 0) return std::nullopt;
+    const size_t index = static_cast<size_t>(clip);
+    if (index > std::numeric_limits<size_t>::max() / 4U ||
+        !span_available(
+            database.grasp_positions_object.size(), index * 3U, 3U) ||
+        !span_available(
+            database.grasp_rotations_object.size(), index * 4U, 4U)) {
+        return std::nullopt;
+    }
+    const size_t position = index * 3U;
+    const size_t rotation = index * 4U;
+    Transform grasp{
+        vec3(
+            database.grasp_positions_object[position],
+            database.grasp_positions_object[position + 1U],
+            database.grasp_positions_object[position + 2U]),
+        quat(
+            database.grasp_rotations_object[rotation],
+            database.grasp_rotations_object[rotation + 1U],
+            database.grasp_rotations_object[rotation + 2U],
+            database.grasp_rotations_object[rotation + 3U]),
+    };
+    if (!valid_transform(grasp)) return std::nullopt;
+    return grasp;
+}
+
+std::optional<ObjectLocalBounds> database_authored_bounds(
+    const Database& database,
+    int32_t clip) {
+    if (clip < 0) return std::nullopt;
+    const size_t index = static_cast<size_t>(clip);
+    if (index > std::numeric_limits<size_t>::max() / 3U ||
+        !span_available(database.object_dimensions.size(), index * 3U, 3U)) {
+        return std::nullopt;
+    }
+    const size_t dimension = index * 3U;
+    const vec3 dimensions(
+        database.object_dimensions[dimension],
+        database.object_dimensions[dimension + 1U],
+        database.object_dimensions[dimension + 2U]);
+    if (!positive(dimensions)) return std::nullopt;
+    return ObjectLocalBounds{vec3(), 0.5F * dimensions};
+}
+
+struct PrecomputedRow {
+    const PrecomputedReversedPickupClip* clip = nullptr;
+    ReverseSource source{};
+};
+
+std::optional<PrecomputedRow> validate_precomputed_row(
+    const PlaceMatchInput& input,
+    const PrecomputedReversedPickupClip& clip,
+    SelectionFailures& failures) {
+    if (clip.id == 0U || clip.object_profile_id == 0U ||
+        clip.sequence_id.empty() ||
+        (clip.hand != Hand::Left && clip.hand != Hand::Right) ||
+        clip.hand != input.held_affordance.hand ||
+        clip.object_profile_id != input.held_object_profile_id ||
+        !valid_transform(clip.source_hand_in_object) ||
+        !valid_bounds(clip.source_object_bounds) ||
+        clip.source_affordance_id == 0U ||
+        !finite(clip.source_support_height_m) ||
+        !finite(clip.source_grasp_height_above_support_m)) {
+        return std::nullopt;
+    }
+    int32_t range_start = -1;
+    int32_t range_stop = -1;
+    if (!database_clip_metadata_valid(
+            input, clip.clip, clip.hand, range_start, range_stop)) {
+        return std::nullopt;
+    }
+    const ReverseSource source{
+        PlaceMotionMode::PrecomputedReversedPickup,
+        clip.id,
+        clip.clip,
+        clip.entry_frame,
+        clip.contact_frame,
+        clip.lift_frame,
+        clip.hold_frame,
+        clip.reverse_start_frame,
+    };
+    const int64_t stable_start =
+        static_cast<int64_t>(clip.reverse_start_frame) -
+        static_cast<int64_t>(kStableHoldSamples - 1U);
+    if (!reverse_prefix_valid(
+            *input.pickup_database,
+            range_start,
+            range_stop,
+            source,
+            clip.hand) ||
+        stable_start < clip.hold_frame || stable_start < 0 ||
+        !stable_hold_window(
+            *input.pickup_database,
+            static_cast<int32_t>(stable_start),
+            clip.hand)) {
+        return std::nullopt;
+    }
+
+    const std::optional<Transform> database_grasp = database_authored_grasp(
+        *input.pickup_database, clip.clip);
+    const std::optional<ObjectLocalBounds> database_bounds =
+        database_authored_bounds(*input.pickup_database, clip.clip);
+    const std::optional<float> database_support =
+        database_source_support_height(*input.pickup_database, clip.clip);
+    if (!database_grasp.has_value() || !database_bounds.has_value() ||
+        !database_support.has_value() ||
+        !within_transform_error(
+            clip.source_hand_in_object,
+            *database_grasp,
+            kRecordedPositionToleranceM,
+            kRecordedOrientationToleranceRadians) ||
+        !within_transform_error(
+            clip.source_hand_in_object,
+            input.held_affordance.hand_in_object,
+            kRecordedPositionToleranceM,
+            kRecordedOrientationToleranceRadians) ||
+        !bounds_compatible(clip.source_object_bounds, *database_bounds) ||
+        !bounds_compatible(
+            clip.source_object_bounds, input.held_object_bounds) ||
+        std::abs(*database_support - clip.source_support_height_m) >
+            kUnitTolerance ||
+        std::abs(
+            clip.source_surface.surface_world.position.y -
+            clip.source_support_height_m) > kUnitTolerance) {
+        return std::nullopt;
+    }
+
+    const Pose contact_pose = pose_at_frame(
+        *input.pickup_database, clip.contact_frame);
+    const Transform contact_hand = pose_hand(contact_pose, clip.hand);
+    const Transform contact_object = database_object(
+        *input.pickup_database, clip.contact_frame);
+    const float grasp_height =
+        contact_hand.position.y - clip.source_support_height_m;
+    if (!finite(grasp_height) ||
+        std::abs(
+            grasp_height - clip.source_grasp_height_above_support_m) >
+            kRecordedPositionToleranceM ||
+        !within_transform_error(
+            contact_hand,
+            compose(contact_object, clip.source_hand_in_object),
+            kRecordedPositionToleranceM,
+            kRecordedOrientationToleranceRadians)) {
+        return std::nullopt;
+    }
+
+    const PlaceAffordance* source_affordance = find_affordance(
+        clip.source_surface, clip.source_affordance_id);
+    if (source_affordance == nullptr) return std::nullopt;
+    try {
+        const PlacementFit fit = evaluate_actual_placement_fit(
+            clip.source_surface,
+            *source_affordance,
+            contact_object,
+            clip.source_object_bounds);
+        if (!fit.accepted) {
+            failures.remember(fit.reason);
+            return std::nullopt;
+        }
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+    return PrecomputedRow{&clip, source};
+}
+
+bool better_reverse(
+    const PlaceCandidate& candidate,
+    const PlaceCandidate& best) {
+    return std::tie(
+               candidate.total_cost,
+               candidate.source_id,
+               candidate.clip,
+               candidate.entry_frame,
+               candidate.commit_frame,
+               candidate.release_frame,
+               candidate.stop_frame) <
+           std::tie(
+               best.total_cost,
+               best.source_id,
+               best.clip,
+               best.entry_frame,
+               best.commit_frame,
+               best.release_frame,
+               best.stop_frame);
+}
+
+std::optional<PlaceCandidate> select_precomputed_reverse_tier(
+    const PlaceMatchInput& input,
+    const ValidatedInput& validated,
+    SelectionFailures& failures) {
+    std::vector<PrecomputedRow> structurally_valid;
+    structurally_valid.reserve(input.library->precomputed_reversed.size());
+    for (const PrecomputedReversedPickupClip& clip :
+         input.library->precomputed_reversed) {
+        const std::optional<PrecomputedRow> row = validate_precomputed_row(
+            input, clip, failures);
+        if (row.has_value()) structurally_valid.push_back(*row);
+    }
+    std::map<uint64_t, size_t> id_counts;
+    for (const PrecomputedRow& row : structurally_valid) {
+        ++id_counts[row.clip->id];
+    }
+
+    std::optional<PlaceCandidate> best;
+    for (const PrecomputedRow& row : structurally_valid) {
+        if (id_counts[row.clip->id] != 1U) continue;
+        std::optional<PlaceCandidate> candidate = reverse_candidate(
+            input, validated, row.source, failures);
+        if (!candidate.has_value() ||
+            !populate_candidate_heights(
+                *candidate,
+                input,
+                row.clip->source_support_height_m,
+                failures)) {
+            continue;
+        }
+        if (!best.has_value() || better_reverse(*candidate, *best)) {
+            best = *candidate;
+        }
+    }
+    return best;
+}
+
+std::optional<PlaceCandidate> select_reverse_tier(
+    const PlaceMatchInput& input,
+    const ValidatedInput& validated,
+    int32_t& certified_prefix_stop,
+    SelectionFailures& failures) {
+    int32_t range_start = -1;
+    int32_t range_stop = -1;
+    if (!selected_database_metadata_valid(input, range_start, range_stop)) {
+        return std::nullopt;
+    }
+    const MatchCandidate& pickup = input.pickup_candidate;
+    const std::optional<int32_t> reverse_start =
+        earliest_stable_reverse_start(input, range_stop);
+    if (!reverse_start.has_value()) return std::nullopt;
+    ReverseSource source{};
+    source.mode = PlaceMotionMode::ReversedPickup;
+    source.source_id = reverse_source_id(input, *reverse_start);
+    source.clip = pickup.clip;
+    source.entry_frame = pickup.entry_frame;
+    source.contact_frame = pickup.contact_frame;
+    source.lift_frame = pickup.lift_frame;
+    source.hold_frame = pickup.hold_frame;
+    source.reverse_start_frame = *reverse_start;
+    if (!reverse_prefix_valid(
+            *input.pickup_database,
+            range_start,
+            range_stop,
+            source,
+            input.held_affordance.hand)) {
+        return std::nullopt;
+    }
+    certified_prefix_stop = *reverse_start;
+    std::optional<PlaceCandidate> candidate = reverse_candidate(
+        input, validated, source, failures);
+    const std::optional<float> source_support =
+        database_source_support_height(*input.pickup_database, pickup.clip);
+    if (!candidate.has_value() || !source_support.has_value() ||
+        !populate_candidate_heights(
+            *candidate, input, *source_support, failures)) {
         return std::nullopt;
     }
     return candidate;
@@ -1922,6 +2330,18 @@ bool same_candidate(
     return left.mode == right.mode &&
            left.source_id == right.source_id &&
            left.selection_id == right.selection_id &&
+           same_float(
+               left.source_support_height_m,
+               right.source_support_height_m) &&
+           same_float(
+               left.requested_support_height_m,
+               right.requested_support_height_m) &&
+           same_float(
+               left.target_support_height_m,
+               right.target_support_height_m) &&
+           same_float(
+               left.requested_vertical_correction_m,
+               right.requested_vertical_correction_m) &&
            same_timing(left.timing, right.timing) &&
            same_match(left.match, right.match) &&
            same_ik(left.ik, right.ik) &&
@@ -1958,6 +2378,13 @@ Pose interpolate_source_pose(
             clip.poses.at(static_cast<size_t>(left)),
             clip.poses.at(static_cast<size_t>(right)),
             alpha);
+    }
+    const bool database_backed =
+        candidate.mode == PlaceMotionMode::ReversedPickup ||
+        candidate.mode == PlaceMotionMode::PrecomputedReversedPickup;
+    if (!database_backed) {
+        throw std::invalid_argument(
+            "place candidate has no motion source");
     }
     if (alpha == 0.0F) {
         return pose_at_frame(*input.pickup_database, left);
@@ -2064,6 +2491,23 @@ std::optional<int32_t> hidden_pending_event_frame(
         : std::optional<int32_t>(candidate.release_frame);
 }
 
+PlaceResult accept_with_fingerprint(
+    const PlaceMatchInput& input,
+    PlaceCandidate candidate,
+    int32_t pickup_prefix_stop) {
+    candidate.selection_id = selection_fingerprint(
+        input, candidate, pickup_prefix_stop);
+    if (candidate.selection_id == 0U) return reject(Reason::NoCandidate);
+    return {true, candidate, Reason::None};
+}
+
+PlaceResult accept_with_fingerprint(
+    const PlaceMatchInput& input,
+    PlaceCandidate candidate) {
+    return accept_with_fingerprint(
+        input, candidate, default_pickup_prefix_stop(input));
+}
+
 }  // namespace
 
 PlaceResult select_place_motion(const PlaceMatchInput& input) {
@@ -2075,23 +2519,24 @@ PlaceResult select_place_motion(const PlaceMatchInput& input) {
 
     SelectionFailures failures{};
 
-    if (std::optional<PlaceCandidate> recorded =
-            select_recorded_tier(input, validated, failures)) {
-        const int32_t pickup_prefix_stop = default_pickup_prefix_stop(input);
-        recorded->selection_id = selection_fingerprint(
-            input, *recorded, pickup_prefix_stop);
-        if (recorded->selection_id == 0U) return reject(Reason::NoCandidate);
-        return {true, *recorded, Reason::None};
+    if (auto recorded = select_recorded_tier(
+            input, validated, failures)) {
+        return accept_with_fingerprint(input, *recorded);
     }
-
+    if (auto precomputed = select_precomputed_reverse_tier(
+            input, validated, failures)) {
+        return accept_with_fingerprint(input, *precomputed);
+    }
     int32_t certified_prefix_stop = -1;
-    std::optional<PlaceCandidate> reversed = select_reverse_tier(
-        input, validated, certified_prefix_stop, failures);
-    if (!reversed.has_value()) return reject(failures.strongest());
-    reversed->selection_id = selection_fingerprint(
-        input, *reversed, certified_prefix_stop);
-    if (reversed->selection_id == 0U) return reject(Reason::NoCandidate);
-    return {true, *reversed, Reason::None};
+    if (auto immediate = select_reverse_tier(
+            input,
+            validated,
+            certified_prefix_stop,
+            failures)) {
+        return accept_with_fingerprint(
+            input, *immediate, certified_prefix_stop);
+    }
+    return reject(failures.strongest());
 }
 
 PlaceStagingPreview preview_place_motion(const PlaceMatchInput& input) {

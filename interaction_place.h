@@ -4,6 +4,7 @@
 #include "interaction_place_target.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace interaction {
@@ -11,9 +12,10 @@ namespace interaction {
 class PlaceController;
 
 enum class PlaceMotionMode : uint8_t {
-    None,
-    RecordedPlace,
-    ReversedPickup,
+    None = 0,
+    RecordedPlace = 1,
+    ReversedPickup = 2,
+    PrecomputedReversedPickup = 3,
 };
 
 enum class PlacePhase : uint8_t {
@@ -56,8 +58,28 @@ struct RecordedPlaceClip {
     uint32_t source_affordance_id = 0;
 };
 
+struct PrecomputedReversedPickupClip {
+    uint64_t id = 0U;
+    uint64_t object_profile_id = 0U;
+    std::string sequence_id{};
+    int32_t clip = -1;
+    int32_t entry_frame = -1;
+    int32_t contact_frame = -1;
+    int32_t lift_frame = -1;
+    int32_t hold_frame = -1;
+    int32_t reverse_start_frame = -1;
+    Hand hand = Hand::Right;
+    Transform source_hand_in_object{};
+    ObjectLocalBounds source_object_bounds{};
+    PlacementSurface source_surface{};
+    uint32_t source_affordance_id = 0U;
+    float source_support_height_m = 0.0F;
+    float source_grasp_height_above_support_m = 0.0F;
+};
+
 struct PlaceMotionLibrary {
     std::vector<RecordedPlaceClip> recorded;
+    std::vector<PrecomputedReversedPickupClip> precomputed_reversed;
 };
 
 struct PlaceMatchInput {
@@ -82,6 +104,10 @@ struct PlaceCandidate {
     PlaceMotionMode mode = PlaceMotionMode::None;
     uint64_t source_id = 0;
     uint64_t selection_id = 0;
+    float source_support_height_m = 0.0F;
+    float requested_support_height_m = 0.0F;
+    float target_support_height_m = 0.0F;
+    float requested_vertical_correction_m = 0.0F;
     PlaceTimingConfig timing{};
     PlaceMatchConfig match{};
     IKConfig ik{};

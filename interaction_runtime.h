@@ -78,7 +78,13 @@ struct RuntimePlaceDiagnostics {
     SurfaceHandle surface{};
     uint32_t affordance_id = 0U;
     PlaceMotionMode mode = PlaceMotionMode::None;
+    uint64_t source_id = 0U;
     uint64_t selection_id = 0U;
+    float source_support_height_m = 0.0F;
+    float requested_support_height_m = 0.0F;
+    float target_support_height_m = 0.0F;
+    float requested_vertical_correction_m = 0.0F;
+    float applied_vertical_correction_m = 0.0F;
     bool preview_available = false;
     PlaceStagingPreview preview{};
     bool candidate_certified = false;

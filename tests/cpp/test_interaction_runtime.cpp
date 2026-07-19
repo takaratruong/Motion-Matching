@@ -1,4 +1,5 @@
 #include "interaction_runtime.h"
+#include "g1_arm_joint_metadata.h"
 #include "tests/cpp/interaction_runtime_fixture.h"
 
 #include <array>
@@ -419,6 +420,12 @@ bool exact(
     const interaction::PlaceCandidate& right) {
     return left.mode == right.mode && left.source_id == right.source_id &&
            left.selection_id == right.selection_id &&
+           left.source_support_height_m == right.source_support_height_m &&
+           left.requested_support_height_m ==
+               right.requested_support_height_m &&
+           left.target_support_height_m == right.target_support_height_m &&
+           left.requested_vertical_correction_m ==
+               right.requested_vertical_correction_m &&
            left.timing.canonical_fps == right.timing.canonical_fps &&
            left.timing.playback_speed == right.timing.playback_speed &&
            left.timing.entry_blend_seconds ==
@@ -474,7 +481,16 @@ bool exact(
     return left.surface == right.surface &&
            left.affordance_id == right.affordance_id &&
            left.mode == right.mode &&
+           left.source_id == right.source_id &&
            left.selection_id == right.selection_id &&
+           left.source_support_height_m == right.source_support_height_m &&
+           left.requested_support_height_m ==
+               right.requested_support_height_m &&
+           left.target_support_height_m == right.target_support_height_m &&
+           left.requested_vertical_correction_m ==
+               right.requested_vertical_correction_m &&
+           left.applied_vertical_correction_m ==
+               right.applied_vertical_correction_m &&
            left.preview_available == right.preview_available &&
            exact(left.preview, right.preview) &&
            left.candidate_certified == right.candidate_certified &&
@@ -1143,6 +1159,288 @@ interaction::RuntimeFixture reverse_place_runtime_fixture() {
             fixture.database, frame, kLeftHandBone, object - root);
     }
     recompute_velocities(fixture.database);
+    return fixture;
+}
+
+interaction::Pose reachable_runtime_arm_pose(
+    interaction::Pose pose,
+    float link_length) {
+    using namespace interaction;
+    for (const HingeJoint& joint : kRightArm) {
+        pose.positions[static_cast<size_t>(joint.bone)] = vec3();
+        pose.rotations[static_cast<size_t>(joint.bone)] =
+            joint.rest_rotation;
+    }
+    pose.positions[static_cast<size_t>(
+        g1_skeleton::RightShoulderPitch)] = vec3(0.0F, 0.0F, 1.0F);
+    const quat shoulder_rest = quat_normalize(quat_mul(
+        kRightArm[0].rest_rotation,
+        kRightArm[1].rest_rotation));
+    const vec3 vertical_link = quat_mul_vec3(
+        quat_inv(shoulder_rest),
+        vec3(0.0F, link_length, 0.0F));
+    pose.positions[static_cast<size_t>(g1_skeleton::RightElbow)] =
+        vertical_link;
+    pose.positions[static_cast<size_t>(g1_skeleton::RightWrist)] =
+        vertical_link;
+    return pose;
+}
+
+interaction::Pose bent_runtime_arm_pose(
+    interaction::Pose pose,
+    float radians) {
+    using namespace interaction;
+    pose.rotations[static_cast<size_t>(g1_skeleton::RightShoulderRoll)] =
+        quat_normalize(quat_mul(
+            kRightArm[1].rest_rotation,
+            quat_from_angle_axis(radians, kRightArm[1].axis)));
+    pose.rotations[static_cast<size_t>(g1_skeleton::RightWristRoll)] =
+        quat_normalize(quat_mul(
+            kRightArm[4].rest_rotation,
+            quat_from_angle_axis(-2.0F * radians, kRightArm[4].axis)));
+    return pose;
+}
+
+interaction::Transform runtime_right_hand(
+    const interaction::Pose& pose) {
+    const interaction::WorldPose world = interaction::world_pose(pose);
+    return {
+        world.positions[interaction::kRightHandBone],
+        world.rotations[interaction::kRightHandBone],
+    };
+}
+
+void write_runtime_database_pose(
+    interaction::Database& database,
+    int32_t frame,
+    const interaction::Pose& pose) {
+    using namespace interaction::runtime_fixture_detail;
+    for (size_t bone = 0; bone < g1_skeleton::BoneCount; ++bone) {
+        write_bone_position(database, frame, bone, pose.positions[bone]);
+        write_bone_rotation(database, frame, bone, pose.rotations[bone]);
+    }
+}
+
+interaction::RuntimeConfig precomputed_place_runtime_config() {
+    interaction::RuntimeConfig config{};
+    config.place.timing.entry_blend_seconds = kDt;
+    config.ik.accepted_orientation_radians = 0.05F;
+    config.ik.maximum_iterations = 64;
+    return config;
+}
+
+interaction::RuntimeFixture precomputed_place_runtime_fixture() {
+    using namespace interaction;
+    using namespace interaction::runtime_fixture_detail;
+    RuntimeFixture fixture = reverse_place_runtime_fixture();
+    constexpr int32_t clip = 0;
+    constexpr int32_t range_start = clip * kFramesPerClip;
+    constexpr int32_t contact = range_start + kContactLocalFrame;
+    constexpr int32_t lift = range_start + kLiftLocalFrame;
+    constexpr int32_t hold = range_start + kHoldLocalFrame;
+    constexpr int32_t reverse_start = hold + 4;
+    constexpr float source_support = 0.625F;
+    constexpr float requested_support = 0.71875F;
+    constexpr float source_contact_offset = 0.129953071F;
+    assert(canonical_float_bits(source_contact_offset) == 0x3e05126bU);
+    constexpr float destination_contact_offset = 0.13F;
+    const float authored_hand_correction =
+        requested_support + destination_contact_offset -
+        (source_support + source_contact_offset);
+    constexpr float bend_radians = 0.40F;
+
+    fixture.database.active_hands[static_cast<size_t>(clip)] =
+        static_cast<uint8_t>(Hand::Right);
+    fixture.database.table_positions[
+        static_cast<size_t>(clip) * 3U + 1U] = 0.275F;
+    for (int32_t local = kContactLocalFrame;
+         local < kFramesPerClip;
+         ++local) {
+        const int32_t frame = range_start + local;
+        fixture.database.hand_contacts[
+            static_cast<size_t>(frame) * 2U + 1U] = 1U;
+        if (local > reverse_start) continue;
+        const float alpha = local <= kContactLocalFrame + 1
+            ? 0.0F : static_cast<float>(
+                  local - (kContactLocalFrame + 1)) /
+                  static_cast<float>(
+                      kHoldLocalFrame - (kContactLocalFrame + 1));
+        vec3 object = read_vec3(
+            fixture.database.object_positions,
+            static_cast<size_t>(frame));
+        if (local == kContactLocalFrame) {
+            object.y = source_support + source_contact_offset;
+        } else if (local >= kHoldLocalFrame) {
+            object.y = 0.97F;
+        } else {
+            object.y = 0.865F + 0.085F * alpha;
+        }
+        write_vec3(
+            fixture.database.object_positions,
+            static_cast<size_t>(frame),
+            object);
+        const vec3 root = read_bone_position(
+            fixture.database, frame, g1_skeleton::Simulation);
+        write_bone_position(
+            fixture.database, frame, kRightHandBone, object - root);
+    }
+
+    const Pose contact_pose = pose_at_frame(fixture.database, contact);
+    const Transform desired_contact_hand = runtime_right_hand(contact_pose);
+    const auto measured_vertical_correction = [&](float link_length) {
+        Pose straight = reachable_runtime_arm_pose(
+            contact_pose, link_length);
+        Pose bent = bent_runtime_arm_pose(straight, bend_radians);
+        const vec3 translation =
+            desired_contact_hand.position - runtime_right_hand(bent).position;
+        straight.positions[static_cast<size_t>(
+            g1_skeleton::Simulation)] =
+            straight.positions[static_cast<size_t>(
+                g1_skeleton::Simulation)] + translation;
+        bent.positions[static_cast<size_t>(g1_skeleton::Simulation)] =
+            bent.positions[static_cast<size_t>(
+                g1_skeleton::Simulation)] + translation;
+        return runtime_right_hand(straight).position.y -
+            runtime_right_hand(bent).position.y;
+    };
+
+    float link_length = 0.75F;
+    for (int iteration = 0; iteration < 8; ++iteration) {
+        const float measured = measured_vertical_correction(link_length);
+        assert(measured > 0.0F);
+        link_length *= authored_hand_correction / measured;
+    }
+    float measured = measured_vertical_correction(link_length);
+    for (int adjustment = 0;
+         measured != authored_hand_correction && adjustment < 100000;
+         ++adjustment) {
+        link_length = std::nextafter(
+            link_length,
+            measured > authored_hand_correction
+                ? 0.0F
+                : std::numeric_limits<float>::infinity());
+        measured = measured_vertical_correction(link_length);
+    }
+    assert(measured == authored_hand_correction);
+
+    Transform source_contact_hand{};
+    Transform target_release_hand{};
+    for (int32_t frame = range_start;
+         frame < range_start + kFramesPerClip;
+         ++frame) {
+        const Pose original = pose_at_frame(fixture.database, frame);
+        const Transform desired_hand = runtime_right_hand(original);
+        Pose straight = reachable_runtime_arm_pose(original, link_length);
+        Pose bent = bent_runtime_arm_pose(straight, bend_radians);
+        const Transform bent_hand = runtime_right_hand(bent);
+        bent.positions[static_cast<size_t>(g1_skeleton::Simulation)] =
+            bent.positions[static_cast<size_t>(g1_skeleton::Simulation)] +
+            (desired_hand.position - bent_hand.position);
+        write_runtime_database_pose(fixture.database, frame, bent);
+        const Transform authored_hand = runtime_right_hand(bent);
+        if (frame >= contact) {
+            write_vec3(
+                fixture.database.object_positions,
+                static_cast<size_t>(frame),
+                authored_hand.position);
+            const size_t rotation = static_cast<size_t>(frame) * 4U;
+            fixture.database.object_rotations[rotation] =
+                authored_hand.rotation.w;
+            fixture.database.object_rotations[rotation + 1U] =
+                authored_hand.rotation.x;
+            fixture.database.object_rotations[rotation + 2U] =
+                authored_hand.rotation.y;
+            fixture.database.object_rotations[rotation + 3U] =
+                authored_hand.rotation.z;
+        }
+        if (frame == contact) {
+            source_contact_hand = authored_hand;
+            straight.positions[static_cast<size_t>(
+                g1_skeleton::Simulation)] =
+                bent.positions[static_cast<size_t>(
+                    g1_skeleton::Simulation)];
+            target_release_hand = runtime_right_hand(straight);
+        }
+        set_group_row(
+            fixture.features,
+            frame,
+            {10.0F, 10.0F, 10.0F, 10.0F, 10.0F});
+    }
+    assert(std::abs(
+        source_contact_hand.position.y -
+        (source_support + source_contact_offset)) < 0.000001F);
+    assert(target_release_hand.position.y -
+           source_contact_hand.position.y == authored_hand_correction);
+    assert(std::abs(
+        target_release_hand.position.x - source_contact_hand.position.x) <
+        0.00001F);
+    assert(std::abs(
+        target_release_hand.position.z - source_contact_hand.position.z) <
+        0.00001F);
+    recompute_velocities(fixture.database);
+
+    const InteractionTarget* pickup_target = fixture.registry.find(
+        fixture.request.target);
+    assert(pickup_target != nullptr);
+
+    PlacementSurface destination =
+        *fixture.surface_registry.find(fixture.surface);
+    destination.surface_world.position.y = requested_support;
+    destination.support_volume_world.position.y =
+        requested_support - 0.35F;
+    destination.surface_world.position.x = target_release_hand.position.x;
+    destination.surface_world.position.z = target_release_hand.position.z;
+    destination.support_volume_world.position.x =
+        target_release_hand.position.x;
+    destination.support_volume_world.position.z =
+        target_release_hand.position.z;
+    destination.affordances.front().object_in_surface = {
+        vec3(0.0F, destination_contact_offset, 0.0F),
+        target_release_hand.rotation,
+    };
+    destination.affordances.front().support_point_object = quat_mul_vec3(
+        quat_inv(target_release_hand.rotation),
+        vec3(0.0F, -destination_contact_offset, 0.0F));
+    fixture.surface = fixture.surface_registry.upsert(destination);
+
+    PrecomputedReversedPickupClip row{};
+    row.id = 2001U;
+    row.object_profile_id = pickup_target->object_profile_id;
+    row.sequence_id = "pickup_table__runtime__001";
+    row.clip = clip;
+    row.entry_frame = range_start + 10;
+    row.contact_frame = contact;
+    row.lift_frame = lift;
+    row.hold_frame = hold;
+    row.reverse_start_frame = reverse_start;
+    row.hand = Hand::Right;
+    row.source_hand_in_object = Transform{};
+    row.source_object_bounds = pickup_target->object_bounds;
+    row.source_surface = destination;
+    row.source_surface.handle = {502U, 3U};
+    row.source_surface.surface_world.position.x =
+        source_contact_hand.position.x;
+    row.source_surface.surface_world.position.y = source_support;
+    row.source_surface.surface_world.position.z =
+        source_contact_hand.position.z;
+    row.source_surface.support_volume_world.position.x =
+        source_contact_hand.position.x;
+    row.source_surface.support_volume_world.position.y =
+        source_support - 0.35F;
+    row.source_surface.support_volume_world.position.z =
+        source_contact_hand.position.z;
+    row.source_surface.affordances.front().object_in_surface = {
+        vec3(0.0F, source_contact_offset, 0.0F),
+        source_contact_hand.rotation,
+    };
+    row.source_surface.affordances.front().support_point_object =
+        quat_mul_vec3(
+            quat_inv(source_contact_hand.rotation),
+            vec3(0.0F, -source_contact_offset, 0.0F));
+    row.source_affordance_id = fixture.place_affordance_id;
+    row.source_support_height_m = source_support;
+    row.source_grasp_height_above_support_m = source_contact_offset;
+    fixture.place_library.precomputed_reversed = {row};
     return fixture;
 }
 
@@ -2524,9 +2822,151 @@ void test_frozen_public_contract_and_defaults() {
     assert(!diagnostics.inactive_arm_targets_locomotion);
     assert(!diagnostics.inactive_arm_tracks_locomotion);
     assert(!diagnostics.pack_available);
+    assert(diagnostics.place.source_id == 0U);
+    assert(diagnostics.place.source_support_height_m == 0.0F);
+    assert(diagnostics.place.requested_support_height_m == 0.0F);
+    assert(diagnostics.place.target_support_height_m == 0.0F);
+    assert(diagnostics.place.requested_vertical_correction_m == 0.0F);
+    assert(diagnostics.place.applied_vertical_correction_m == 0.0F);
 
     const RuntimeOutput output{};
     assert(!output.owns_pose && !output.suppress_steering);
+}
+
+void assert_place_immutable_provenance(
+    const interaction::RuntimePlaceDiagnostics& diagnostics,
+    uint64_t source_id,
+    float requested_support_height_m,
+    float source_support_height_m,
+    float target_support_height_m,
+    float requested_vertical_correction_m) {
+    assert(diagnostics.source_id == source_id);
+    assert(diagnostics.requested_support_height_m ==
+           requested_support_height_m);
+    assert(diagnostics.source_support_height_m == source_support_height_m);
+    assert(diagnostics.target_support_height_m == target_support_height_m);
+    assert(diagnostics.requested_vertical_correction_m ==
+           requested_vertical_correction_m);
+}
+
+void test_runtime_preview_exposes_precomputed_provenance_boundary() {
+    using namespace interaction;
+    RuntimeFixture fixture = precomputed_place_runtime_fixture();
+    InteractionRuntime runtime(
+        fixture.database,
+        fixture.features,
+        fixture.registry,
+        fixture.surface_registry,
+        fixture.place_library,
+        precomputed_place_runtime_config());
+    enter_carry_before_first_update(runtime, fixture);
+    const std::optional<MatchCandidate>& pickup_candidate =
+        InteractionRuntimeTestAccess::candidate(runtime);
+    assert(pickup_candidate.has_value());
+    assert(pickup_candidate->clip == 1);
+    const PlaceStagingPreview preview = runtime.preview_place(
+        fixture.surface, fixture.place_affordance_id);
+    assert(preview.accepted && preview.ready);
+    assert(preview.candidate.mode ==
+           PlaceMotionMode::PrecomputedReversedPickup);
+    assert(preview.candidate.source_id == 2001U);
+    assert(preview.candidate.requested_support_height_m == 0.71875F);
+    assert(preview.candidate.source_support_height_m == 0.625F);
+    assert(preview.candidate.target_support_height_m == 0.71875F);
+    assert(preview.candidate.requested_vertical_correction_m == 0.09375F);
+}
+
+void test_place_preflight_and_replay_preserve_precomputed_provenance() {
+    using namespace interaction;
+    RuntimeFixture fixture = precomputed_place_runtime_fixture();
+    InteractionRuntime runtime(
+        fixture.database,
+        fixture.features,
+        fixture.registry,
+        fixture.surface_registry,
+        fixture.place_library,
+        precomputed_place_runtime_config());
+    enter_carry_before_first_update(runtime, fixture);
+    const std::optional<MatchCandidate>& pickup_candidate =
+        InteractionRuntimeTestAccess::candidate(runtime);
+    assert(pickup_candidate.has_value());
+    assert(pickup_candidate->clip == 1);
+    const PlaceStagingPreview preview = runtime.preview_place(
+        fixture.surface, fixture.place_affordance_id);
+    assert(preview.accepted && preview.ready);
+    const PlaceRequest request = place_request_for(runtime, fixture, 2002U);
+
+    RuntimeOutput output = runtime.update(place_interact_input(
+        fixture.locomotion, request));
+    assert(output.diagnostics.state == RuntimeState::PlacePreflight);
+    assert_place_immutable_provenance(
+        output.diagnostics.place,
+        2001U,
+        0.71875F,
+        0.625F,
+        0.71875F,
+        0.09375F);
+    assert(output.diagnostics.place.applied_vertical_correction_m == 0.0F);
+    assert(output.diagnostics.place.preview.candidate.source_id == 2001U);
+    assert(output.diagnostics.place.preview.candidate
+               .requested_support_height_m == 0.71875F);
+    assert(output.diagnostics.place.preview.candidate
+               .source_support_height_m == 0.625F);
+    assert(output.diagnostics.place.preview.candidate
+               .target_support_height_m == 0.71875F);
+    assert(output.diagnostics.place.preview.candidate
+               .requested_vertical_correction_m == 0.09375F);
+
+    bool saw_replay = false;
+    bool saw_full_applied = false;
+    for (int update = 0; update < kMaximumUpdates; ++update) {
+        output = advance(runtime, fixture.locomotion);
+        const RuntimeState state = output.diagnostics.state;
+        if (state == RuntimeState::PlaceAlign ||
+            state == RuntimeState::PlaceReplay ||
+            state == RuntimeState::PlaceRelease) {
+            assert_place_immutable_provenance(
+                output.diagnostics.place,
+                2001U,
+                0.71875F,
+                0.625F,
+                0.71875F,
+                0.09375F);
+            assert(output.diagnostics.place.applied_vertical_correction_m >=
+                   0.0F);
+            assert(output.diagnostics.place.applied_vertical_correction_m <=
+                   0.09375F);
+        }
+        saw_replay = saw_replay || state == RuntimeState::PlaceReplay;
+        saw_full_applied = saw_full_applied ||
+            output.diagnostics.place.applied_vertical_correction_m ==
+                0.09375F;
+        if (state == RuntimeState::PlaceRelease ||
+            state == RuntimeState::Locomotion) {
+            break;
+        }
+    }
+    assert(saw_replay);
+    assert(saw_full_applied);
+
+    RuntimePlaceDiagnostics baseline = output.diagnostics.place;
+    RuntimePlaceDiagnostics changed = baseline;
+    ++changed.source_id;
+    assert(!exact(baseline, changed));
+    using FloatMember = float RuntimePlaceDiagnostics::*;
+    constexpr std::array<FloatMember, 5> fields = {
+        &RuntimePlaceDiagnostics::requested_support_height_m,
+        &RuntimePlaceDiagnostics::source_support_height_m,
+        &RuntimePlaceDiagnostics::target_support_height_m,
+        &RuntimePlaceDiagnostics::requested_vertical_correction_m,
+        &RuntimePlaceDiagnostics::applied_vertical_correction_m,
+    };
+    for (FloatMember field : fields) {
+        changed = baseline;
+        changed.*field = std::nextafter(
+            changed.*field, std::numeric_limits<float>::infinity());
+        assert(!exact(baseline, changed));
+    }
 }
 
 void test_place_preview_and_collapsed_success_lifecycle() {
@@ -5856,6 +6296,8 @@ int main(int argc, char** argv) {
     test_pick_preview_never_reserves_or_constructs_request_authority();
     test_pick_preview_rejection_reason_mapping_is_exact();
     test_frozen_public_contract_and_defaults();
+    test_runtime_preview_exposes_precomputed_provenance_boundary();
+    test_place_preflight_and_replay_preserve_precomputed_provenance();
     test_place_preview_and_collapsed_success_lifecycle();
     test_runtime_validates_complete_place_and_ik_configuration();
     test_runtime_forwards_nondefault_place_config_exactly();
