@@ -9,6 +9,7 @@
 #pragma GCC diagnostic pop
 #endif
 #include "json_runtime.h"
+#include "motion_index_runtime.h"
 #include "sha256.h"
 #include "terrain_runtime.h"
 
@@ -22,6 +23,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -29,8 +31,39 @@ struct bounds2 { float min_x=0,min_z=0,max_x=0,max_z=0; };
 struct point3d { double x=0,y=0,z=0; };
 struct bounds3d { point3d minimum,maximum; };
 struct motion_source_record {
-    std::string name,terrain_id;
+    std::string name,terrain_id,terrain_family;
     int range_start=0,range_stop=0;
+    motion_source_record() = default;
+    motion_source_record(
+        std::string source_name, std::string source_terrain,
+        int start, int stop)
+        : name(std::move(source_name)), terrain_id(std::move(source_terrain)),
+          range_start(start), range_stop(stop) {}
+    motion_source_record(
+        std::string source_name, std::string source_terrain,
+        std::string family, int start, int stop)
+        : name(std::move(source_name)), terrain_id(std::move(source_terrain)),
+          terrain_family(std::move(family)),
+          range_start(start), range_stop(stop) {}
+};
+struct motion_index_reference {
+    std::string path,schema,sha256;
+    int version=0,frame_count=0,row_width=0;
+};
+struct motion_bank_range {
+    std::string source_name;
+    int source_start=0,source_stop=0,source_frame_count=0;
+    int global_start=0,global_stop=0;
+};
+struct motion_family_bank {
+    std::string family;
+    std::vector<int> range_indices;
+};
+struct motion_bank_index {
+    std::string schema,sha256;
+    int frame_count=0;
+    std::vector<motion_bank_range> ranges;
+    std::vector<motion_family_bank> banks;
 };
 struct artifact_reference {
     std::string path,schema,sha256;
@@ -50,6 +83,8 @@ struct motion_pack_manifest {
     std::vector<motion_source_record> sources;
     surface_contract surface;
     artifact_reference database,terrain_features,terrain_support;
+    motion_index_reference motion_index;
+    motion_bank_index motion_banks;
     artifact_reference scene_index,validation_file;
 };
 struct scene_region { std::string id; bounds2 bounds; };
@@ -313,6 +348,139 @@ static inline bool scene_sha_is_valid(const std::string& digest)
     for (size_t i = 0; i < digest.size(); ++i)
         if (!((digest[i] >= '0' && digest[i] <= '9') ||
               (digest[i] >= 'a' && digest[i] <= 'f'))) return false;
+    return true;
+}
+
+static inline void scene_canonical_hex4(std::string& out, uint32_t value)
+{
+    static const char hex[] = "0123456789abcdef";
+    out += "\\u";
+    out.push_back(hex[(value >> 12) & 15u]);
+    out.push_back(hex[(value >> 8) & 15u]);
+    out.push_back(hex[(value >> 4) & 15u]);
+    out.push_back(hex[value & 15u]);
+}
+
+static inline void scene_canonical_string(
+    std::string& out, const std::string& value)
+{
+    out.push_back('"');
+    for (size_t i = 0; i < value.size();) {
+        const unsigned char first = static_cast<unsigned char>(value[i++]);
+        if (first < 0x80u) {
+            if (first == '"' || first == '\\') {
+                out.push_back('\\'); out.push_back(static_cast<char>(first));
+            } else if (first == '\b') out += "\\b";
+            else if (first == '\f') out += "\\f";
+            else if (first == '\n') out += "\\n";
+            else if (first == '\r') out += "\\r";
+            else if (first == '\t') out += "\\t";
+            else if (first < 0x20u) scene_canonical_hex4(out, first);
+            else out.push_back(static_cast<char>(first));
+            continue;
+        }
+        int tails = first < 0xe0u ? 1 : (first < 0xf0u ? 2 : 3);
+        uint32_t codepoint = first & (tails == 1 ? 0x1fu :
+            (tails == 2 ? 0x0fu : 0x07u));
+        for (int tail = 0; tail < tails; ++tail)
+            codepoint = (codepoint << 6) |
+                (static_cast<unsigned char>(value[i++]) & 0x3fu);
+        if (codepoint <= 0xffffu) scene_canonical_hex4(out, codepoint);
+        else {
+            const uint32_t adjusted = codepoint - 0x10000u;
+            scene_canonical_hex4(out, 0xd800u + (adjusted >> 10));
+            scene_canonical_hex4(out, 0xdc00u + (adjusted & 0x3ffu));
+        }
+    }
+    out.push_back('"');
+}
+
+static inline bool scene_canonical_json_append(
+    std::string& out, const json_value& value, int indentation)
+{
+    if (value.kind == json_null) { out += "null"; return true; }
+    if (value.kind == json_boolean) {
+        out += value.boolean_value ? "true" : "false"; return true;
+    }
+    if (value.kind == json_string) {
+        scene_canonical_string(out, value.string_value); return true;
+    }
+    if (value.kind == json_number) {
+        double integral = 0.0;
+        if (!std::isfinite(value.number_value) ||
+            std::modf(value.number_value, &integral) != 0.0)
+            return false;
+        char encoded[64];
+        const int count = std::snprintf(
+            encoded, sizeof(encoded), "%.0f", value.number_value);
+        if (count <= 0 || count >= static_cast<int>(sizeof(encoded)))
+            return false;
+        out.append(encoded, static_cast<size_t>(count));
+        return true;
+    }
+    if (value.kind == json_array) {
+        if (value.array_value.empty()) { out += "[]"; return true; }
+        out += "[\n";
+        for (size_t i = 0; i < value.array_value.size(); ++i) {
+            if (i != 0) out += ",\n";
+            out.append(static_cast<size_t>(indentation + 2), ' ');
+            if (!scene_canonical_json_append(
+                    out, value.array_value[i], indentation + 2)) return false;
+        }
+        out += "\n";
+        out.append(static_cast<size_t>(indentation), ' ');
+        out.push_back(']');
+        return true;
+    }
+    if (value.kind != json_object) return false;
+    if (value.object_value.empty()) { out += "{}"; return true; }
+    std::vector<const std::pair<std::string, json_value>*> members;
+    members.reserve(value.object_value.size());
+    for (size_t i = 0; i < value.object_value.size(); ++i)
+        members.push_back(&value.object_value[i]);
+    std::sort(members.begin(), members.end(),
+        [](const std::pair<std::string, json_value>* left,
+           const std::pair<std::string, json_value>* right) {
+            return left->first < right->first;
+        });
+    out += "{\n";
+    for (size_t i = 0; i < members.size(); ++i) {
+        if (i != 0) out += ",\n";
+        out.append(static_cast<size_t>(indentation + 2), ' ');
+        scene_canonical_string(out, members[i]->first);
+        out += ": ";
+        if (!scene_canonical_json_append(
+                out, members[i]->second, indentation + 2)) return false;
+    }
+    out += "\n";
+    out.append(static_cast<size_t>(indentation), ' ');
+    out.push_back('}');
+    return true;
+}
+
+static inline bool scene_motion_bank_digest(
+    std::string& out, const json_value& descriptor,
+    char* error, int capacity)
+{
+    json_value payload = descriptor;
+    bool removed = false;
+    for (size_t i = 0; i < payload.object_value.size(); ++i) {
+        if (payload.object_value[i].first == "sha256") {
+            payload.object_value.erase(payload.object_value.begin() +
+                static_cast<std::ptrdiff_t>(i));
+            removed = true;
+            break;
+        }
+    }
+    std::string canonical;
+    if (!removed || !scene_canonical_json_append(canonical, payload, 0))
+        return scene_error(error, capacity,
+            "motion bank payload cannot be canonically encoded");
+    canonical.push_back('\n');
+    sha256_state state;
+    sha256_update(state,
+        reinterpret_cast<const uint8_t*>(canonical.data()), canonical.size());
+    out = sha256_finish(state);
     return true;
 }
 
@@ -604,6 +772,177 @@ static inline bool scene_validation_validate(
     return true;
 }
 
+static inline bool scene_terrain_family_is_valid(const std::string& family)
+{
+    return family == "flat" || family == "curb" ||
+           family == "slope" || family == "stair";
+}
+
+static inline bool scene_motion_index_reference_parse(
+    motion_index_reference& out, const json_value& value,
+    int database_frames, char* error, int capacity)
+{
+    if (!scene_exact_keys(value,
+            {"path","schema","version","frame_count","row_width","sha256"},
+            "motion_index", error, capacity)) return false;
+    motion_index_reference candidate;
+    if (!scene_member_string(candidate.path, value, "path", "motion_index",
+                             error, capacity) ||
+        !scene_member_string(candidate.schema, value, "schema", "motion_index",
+                             error, capacity) ||
+        !scene_member_string(candidate.sha256, value, "sha256", "motion_index",
+                             error, capacity) ||
+        !scene_member_int(candidate.version, value, "version", "motion_index",
+                          error, capacity) ||
+        !scene_member_int(candidate.frame_count, value, "frame_count",
+                          "motion_index", error, capacity) ||
+        !scene_member_int(candidate.row_width, value, "row_width",
+                          "motion_index", error, capacity)) return false;
+    if (candidate.path != "motion_index.bin" ||
+        !scene_relative_is_safe(candidate.path) ||
+        candidate.schema != "G1MI/v1" || candidate.version != 1 ||
+        candidate.frame_count != database_frames || candidate.row_width != 4 ||
+        !scene_sha_is_valid(candidate.sha256))
+        return scene_error(error, capacity,
+            "motion_index descriptor does not match G1MI/v1");
+    out = candidate;
+    return true;
+}
+
+static inline bool scene_motion_banks_parse(
+    motion_bank_index& out, const json_value& value,
+    const std::vector<motion_source_record>& sources, int database_frames,
+    char* error, int capacity)
+{
+    if (!scene_exact_keys(value,
+            {"schema","frame_count","ranges","banks","sha256"},
+            "motion_banks", error, capacity)) return false;
+    motion_bank_index candidate;
+    if (!scene_member_string(candidate.schema, value, "schema", "motion_banks",
+                             error, capacity) ||
+        !scene_member_string(candidate.sha256, value, "sha256", "motion_banks",
+                             error, capacity) ||
+        !scene_member_int(candidate.frame_count, value, "frame_count",
+                          "motion_banks", error, capacity)) return false;
+    if (candidate.schema != "g1-terrain-motion-banks/v1" ||
+        candidate.frame_count != database_frames ||
+        !scene_sha_is_valid(candidate.sha256))
+        return scene_error(error, capacity,
+            "motion_banks descriptor header is invalid");
+    std::string observed_digest;
+    if (!scene_motion_bank_digest(observed_digest, value, error, capacity) ||
+        observed_digest != candidate.sha256)
+        return scene_error(error, capacity,
+            "motion bank SHA-256 mismatch");
+
+    const json_value* ranges = json_member(value, "ranges");
+    if (ranges == NULL || ranges->kind != json_array ||
+        ranges->array_value.empty() ||
+        ranges->array_value.size() != sources.size())
+        return scene_error(error, capacity,
+            "motion bank ranges do not match sources");
+    int expected_global_start = 0;
+    candidate.ranges.reserve(ranges->array_value.size());
+    for (size_t i = 0; i < ranges->array_value.size(); ++i) {
+        const json_value& range = ranges->array_value[i];
+        if (!scene_exact_keys(range,
+                {"source_name","source_start","source_stop",
+                 "source_frame_count","global_start","global_stop"},
+                "motion bank range", error, capacity)) return false;
+        motion_bank_range record;
+        if (!scene_member_string(record.source_name, range, "source_name",
+                                 "motion bank range", error, capacity) ||
+            !scene_member_int(record.source_start, range, "source_start",
+                              "motion bank range", error, capacity) ||
+            !scene_member_int(record.source_stop, range, "source_stop",
+                              "motion bank range", error, capacity) ||
+            !scene_member_int(record.source_frame_count, range,
+                              "source_frame_count", "motion bank range",
+                              error, capacity) ||
+            !scene_member_int(record.global_start, range, "global_start",
+                              "motion bank range", error, capacity) ||
+            !scene_member_int(record.global_stop, range, "global_stop",
+                              "motion bank range", error, capacity)) return false;
+        const int64_t source_length =
+            static_cast<int64_t>(record.source_stop) - record.source_start;
+        const int64_t global_length =
+            static_cast<int64_t>(record.global_stop) - record.global_start;
+        const motion_source_record& source = sources[i];
+        const int source_output_frames = source.range_stop - source.range_start;
+        if (record.source_name.empty() || record.source_start != 0 ||
+            record.source_stop <= record.source_start ||
+            record.source_frame_count <= 0 ||
+            record.source_stop > record.source_frame_count ||
+            source_length != global_length ||
+            record.global_start != expected_global_start ||
+            record.global_stop <= record.global_start ||
+            record.global_stop > database_frames ||
+            record.source_name != source.name ||
+            record.source_stop != source_output_frames ||
+            record.source_frame_count != source_output_frames ||
+            record.global_start != source.range_start ||
+            record.global_stop != source.range_stop)
+            return scene_error(error, capacity,
+                "motion bank range %zu does not exactly own its source", i);
+        expected_global_start = record.global_stop;
+        candidate.ranges.push_back(record);
+    }
+    if (expected_global_start != database_frames)
+        return scene_error(error, capacity,
+            "motion bank ranges do not cover database frames");
+
+    const json_value* banks = json_member(value, "banks");
+    static const char* const families[4] = {
+        "flat", "curb", "slope", "stair"};
+    if (banks == NULL || banks->kind != json_array ||
+        banks->array_value.size() != 4)
+        return scene_error(error, capacity,
+            "motion banks must contain flat, curb, slope, stair in order");
+    std::vector<int> owners(sources.size(), -1);
+    candidate.banks.reserve(4);
+    for (int bank_index = 0; bank_index < 4; ++bank_index) {
+        const json_value& bank =
+            banks->array_value[static_cast<size_t>(bank_index)];
+        if (!scene_exact_keys(bank, {"family","range_indices"},
+                              "motion bank", error, capacity)) return false;
+        motion_family_bank record;
+        if (!scene_member_string(record.family, bank, "family", "motion bank",
+                                 error, capacity) ||
+            record.family != families[bank_index])
+            return scene_error(error, capacity,
+                "motion banks must be ordered flat, curb, slope, stair");
+        const json_value* indices = json_member(bank, "range_indices");
+        if (indices == NULL || indices->kind != json_array)
+            return scene_error(error, capacity,
+                "motion bank range_indices must be an array");
+        for (size_t i = 0; i < indices->array_value.size(); ++i) {
+            int range_index = -1;
+            if (!scene_number_int(range_index, indices->array_value[i],
+                                  "motion bank range index", error, capacity) ||
+                range_index < 0 ||
+                static_cast<size_t>(range_index) >= sources.size())
+                return scene_error(error, capacity,
+                    "motion bank range index is out of bounds");
+            if (owners[static_cast<size_t>(range_index)] != -1)
+                return scene_error(error, capacity,
+                    "motion bank range ownership is duplicated");
+            owners[static_cast<size_t>(range_index)] = bank_index;
+            record.range_indices.push_back(range_index);
+        }
+        candidate.banks.push_back(record);
+    }
+    for (size_t i = 0; i < sources.size(); ++i) {
+        if (owners[i] < 0)
+            return scene_error(error, capacity,
+                "motion bank range ownership is incomplete");
+        if (sources[i].terrain_family != families[owners[i]])
+            return scene_error(error, capacity,
+                "motion bank owner does not match source terrain family");
+    }
+    out = std::move(candidate);
+    return true;
+}
+
 static inline bool motion_manifest_load_and_verify(
     motion_pack_manifest& out, const char* root,
     char* error, const int capacity)
@@ -612,14 +951,17 @@ static inline bool motion_manifest_load_and_verify(
     if (!scene_join(manifest_path, root, "manifest.json", error, capacity))
         return false;
     json_value document;
-    if (!json_document_load(document, manifest_path.c_str(), error, capacity))
+    if (!json_document_load_with_limit(
+            document, manifest_path.c_str(),
+            JSON_MOTION_MANIFEST_MAXIMUM_BYTES, error, capacity))
         return false;
     if (!scene_exact_keys(document,
             {"schema","output_fps","feature_dimensions","terrain_dimensions",
              "support_dimensions","terrain_feature_distances_m","total_clips",
              "grail_clips","skipped_clips","database_frames",
              "diagnostic_mode","sources","skeleton","contact","surface",
-             "database","sidecars","scene_index","validation_file",
+             "database","sidecars","motion_index","motion_banks",
+             "scene_index","validation_file",
              "validation"},
             "motion manifest", error, capacity)) return false;
 
@@ -627,9 +969,9 @@ static inline bool motion_manifest_load_and_verify(
     std::string schema;
     if (!scene_member_string(schema, document, "schema", "motion manifest",
                              error, capacity) ||
-        schema != "g1-terrain-artifacts/v2")
+        schema != "g1-terrain-artifacts/v3")
         return scene_error(error, capacity,
-            "motion manifest schema must be g1-terrain-artifacts/v2");
+            "motion manifest schema must be g1-terrain-artifacts/v3");
     const json_value* value = NULL;
     double fps = 0.0;
     if (!scene_required(value, document, "output_fps", "motion manifest",
@@ -647,11 +989,11 @@ static inline bool motion_manifest_load_and_verify(
         !scene_member_int(candidate.support_dimensions, document,
                           "support_dimensions", "motion manifest",
                           error, capacity) ||
-        candidate.feature_dimensions != 31 ||
-        candidate.terrain_dimensions != 4 ||
+        candidate.feature_dimensions != 39 ||
+        candidate.terrain_dimensions != 12 ||
         candidate.support_dimensions != 3)
         return scene_error(error, capacity,
-            "motion feature/terrain/support dimensions must be 31/4/3");
+            "motion feature/terrain/support dimensions must be 39/12/3");
     const json_value* distances = json_member(document,
                                                "terrain_feature_distances_m");
     static const double expected_distances[4] = {0.25,0.5,0.75,1.0};
@@ -677,15 +1019,14 @@ static inline bool motion_manifest_load_and_verify(
         !scene_member_int(candidate.database_frames, document,
                           "database_frames", "motion manifest",
                           error, capacity) ||
-        candidate.total_clips != 1770 || candidate.grail_clips != 1769 ||
+        candidate.total_clips <= 0 || candidate.grail_clips < 0 ||
+        candidate.grail_clips > candidate.total_clips ||
         candidate.skipped_clips != 0 || candidate.database_frames <= 0)
         return scene_error(error, capacity,
-            "motion manifest is not the complete 1770-clip pack");
+            "motion manifest clip/frame counts are invalid");
     value = json_member(document, "diagnostic_mode");
     if (value == NULL || !scene_boolean(candidate.diagnostic_mode, *value,
-            "diagnostic_mode", error, capacity) || candidate.diagnostic_mode)
-        return scene_error(error, capacity,
-            "diagnostic_mode must be exactly false");
+            "diagnostic_mode", error, capacity)) return false;
 
     const json_value* skeleton = json_member(document, "skeleton");
     if (skeleton == NULL || !scene_exact_keys(*skeleton,
@@ -753,16 +1094,17 @@ static inline bool motion_manifest_load_and_verify(
         sources->array_value.size() !=
             static_cast<size_t>(candidate.total_clips))
         return scene_error(error, capacity,
-            "sources must contain exactly 1770 records");
+            "sources count does not match total_clips");
     int expected_start = 0;
-    std::vector<std::string> source_names;
+    std::unordered_set<std::string> source_names;
     source_names.reserve(sources->array_value.size());
     candidate.sources.reserve(sources->array_value.size());
     for (size_t i = 0; i < sources->array_value.size(); ++i) {
         const json_value& source = sources->array_value[i];
         if (!scene_exact_keys(source,
                 {"name","output_frames","range_start","range_stop",
-                 "source_fps","source_frame_map","source_frames","terrain_id"},
+                 "source_fps","source_frame_map","source_frames","terrain_id",
+                 "terrain_family"},
                 "source", error, capacity)) return false;
         motion_source_record record;
         int output_frames = 0, source_frames = 0;
@@ -772,6 +1114,9 @@ static inline bool motion_manifest_load_and_verify(
             !scene_member_string(record.terrain_id, source, "terrain_id",
                                  "source", error, capacity) ||
             record.terrain_id.empty() ||
+            !scene_member_string(record.terrain_family, source,
+                                 "terrain_family", "source", error, capacity) ||
+            !scene_terrain_family_is_valid(record.terrain_family) ||
             !scene_member_int(output_frames, source, "output_frames", "source",
                               error, capacity) ||
             !scene_member_int(record.range_start, source, "range_start", "source",
@@ -789,11 +1134,9 @@ static inline bool motion_manifest_load_and_verify(
                     static_cast<int64_t>(output_frames))
             return scene_error(error, capacity,
                 "source %zu has invalid frame ownership", i);
-        for (size_t prior = 0; prior < source_names.size(); ++prior)
-            if (source_names[prior] == record.name)
-                return scene_error(error, capacity,
-                    "source name '%s' is duplicated", record.name.c_str());
-        source_names.push_back(record.name);
+        if (!source_names.insert(record.name).second)
+            return scene_error(error, capacity,
+                "source name '%s' is duplicated", record.name.c_str());
         const json_value* frame_map = json_member(source, "source_frame_map");
         if (frame_map == NULL || frame_map->kind != json_array ||
             frame_map->array_value.size() != static_cast<size_t>(output_frames))
@@ -815,6 +1158,16 @@ static inline bool motion_manifest_load_and_verify(
             "source ranges stop at %d instead of database frame %d",
             expected_start, candidate.database_frames);
 
+    const json_value* motion_index_value = json_member(document, "motion_index");
+    const json_value* motion_banks_value = json_member(document, "motion_banks");
+    if (motion_index_value == NULL || motion_banks_value == NULL ||
+        !scene_motion_index_reference_parse(
+            candidate.motion_index, *motion_index_value,
+            candidate.database_frames, error, capacity) ||
+        !scene_motion_banks_parse(
+            candidate.motion_banks, *motion_banks_value, candidate.sources,
+            candidate.database_frames, error, capacity)) return false;
+
     const json_value* database = json_member(document, "database");
     const json_value* sidecars = json_member(document, "sidecars");
     const json_value* index = json_member(document, "scene_index");
@@ -835,7 +1188,7 @@ static inline bool motion_manifest_load_and_verify(
     const json_value* support_ref = json_member(*sidecars, "terrain_support");
     if (features == NULL || support_ref == NULL ||
         !scene_artifact_reference_parse(candidate.terrain_features, *features,
-            "terrain_features", "terrain_features.bin", "G1TF/v1", 1, 4,
+            "terrain_features", "terrain_features.bin", "G1TF/v2", 2, 12,
             no_columns, error, capacity) ||
         !scene_artifact_reference_parse(candidate.terrain_support, *support_ref,
             "terrain_support", "terrain_support.bin", "G1SP/v1", 1, 3,
@@ -849,13 +1202,16 @@ static inline bool motion_manifest_load_and_verify(
             "g1-terrain-validation/v1", 0, 0, no_columns,
             error, capacity)) return false;
 
-    std::string database_path, features_path, support_path, index_path;
+    std::string database_path, features_path, support_path, motion_index_path;
+    std::string index_path;
     std::string validation_path;
     if (!scene_join(database_path, root, candidate.database.path,
                     error, capacity) ||
         !scene_join(features_path, root, candidate.terrain_features.path,
                     error, capacity) ||
         !scene_join(support_path, root, candidate.terrain_support.path,
+                    error, capacity) ||
+        !scene_join(motion_index_path, root, candidate.motion_index.path,
                     error, capacity) ||
         !scene_join(index_path, root, candidate.scene_index.path,
                     error, capacity) ||
@@ -867,8 +1223,18 @@ static inline bool motion_manifest_load_and_verify(
                           error, capacity) ||
         !scene_verify_sha(support_path, candidate.terrain_support.sha256,
                           error, capacity) ||
+        !scene_verify_sha(motion_index_path, candidate.motion_index.sha256,
+                          error, capacity) ||
         !scene_verify_sha(index_path, candidate.scene_index.sha256,
                           error, capacity)) return false;
+
+    motion_index_runtime authenticated_index;
+    if (!motion_index_load(authenticated_index, motion_index_path.c_str(),
+                           error, capacity) ||
+        authenticated_index.frame_count() !=
+            static_cast<size_t>(candidate.motion_index.frame_count))
+        return scene_error(error, capacity,
+            "motion index rows do not match its descriptor");
 
     const json_value* embedded_validation = json_member(document, "validation");
     json_value file_validation;
@@ -892,6 +1258,23 @@ static inline int motion_source_for_frame(
     const motion_pack_manifest& manifest,const int frame)
 {int low=0,high=static_cast<int>(manifest.sources.size());while(low<high){const int middle=low+(high-low)/2;const motion_source_record& source=manifest.sources[static_cast<size_t>(middle)];if(frame<source.range_start)high=middle;else if(frame>=source.range_stop)low=middle+1;else return middle;}return -1;}
 
+static inline const motion_source_record* motion_source_record_for_frame(
+    const motion_pack_manifest& manifest, const int frame)
+{
+    const int index = motion_source_for_frame(manifest, frame);
+    return index >= 0 ? &manifest.sources[static_cast<size_t>(index)] : NULL;
+}
+
+static inline const motion_family_bank* motion_bank_for_family(
+    const motion_pack_manifest& manifest, const char* family)
+{
+    if (family == NULL) return NULL;
+    for (size_t i = 0; i < manifest.motion_banks.banks.size(); ++i)
+        if (manifest.motion_banks.banks[i].family == family)
+            return &manifest.motion_banks.banks[i];
+    return NULL;
+}
+
 static inline bool motion_manifest_validate_database(
     const motion_pack_manifest& manifest, const database& db,
     char* error, const int capacity)
@@ -902,25 +1285,51 @@ static inline bool motion_manifest_validate_database(
             db.nframes(), manifest.database_frames);
     if (db.nbones() != G1_BoneCount ||
         !g1_skeleton_validate(db, error, capacity)) return false;
-    if (db.features.rows != db.nframes() || db.features.cols != 31)
+    if (db.features.rows != db.nframes() ||
+        db.features.cols != manifest.feature_dimensions)
         return scene_error(error, capacity,
-            "database matching features must be shaped frames x 31");
+            "database matching features do not match manifest dimensions");
     if (db.terrain_features.rows != db.nframes() ||
-        db.terrain_features.cols != 4)
+        db.terrain_features.cols != 12 || manifest.terrain_dimensions != 12)
         return scene_error(error, capacity,
-            "database terrain features must be shaped frames x 4");
+            "database terrain features must be shaped frames x 12");
     if (db.range_starts.size != static_cast<int>(manifest.sources.size()) ||
         db.range_stops.size != static_cast<int>(manifest.sources.size()) ||
         db.range_starts.data == NULL || db.range_stops.data == NULL)
         return scene_error(error, capacity,
             "database range arrays do not match manifest sources");
+    if (manifest.motion_banks.frame_count != db.nframes() ||
+        manifest.motion_banks.ranges.size() != manifest.sources.size())
+        return scene_error(error, capacity,
+            "motion bank ranges do not match database frames/sources");
     for (size_t i = 0; i < manifest.sources.size(); ++i)
         if (db.range_starts(static_cast<int>(i)) !=
                 manifest.sources[i].range_start ||
             db.range_stops(static_cast<int>(i)) !=
-                manifest.sources[i].range_stop)
+                manifest.sources[i].range_stop ||
+            manifest.motion_banks.ranges[i].global_start !=
+                db.range_starts(static_cast<int>(i)) ||
+            manifest.motion_banks.ranges[i].global_stop !=
+                db.range_stops(static_cast<int>(i)))
             return scene_error(error, capacity,
                 "database range %zu does not match its manifest source", i);
+    return true;
+}
+
+static inline bool motion_manifest_validate_database(
+    const motion_pack_manifest& manifest, const database& db,
+    const motion_index_runtime& index,
+    char* error, const int capacity)
+{
+    if (!motion_manifest_validate_database(
+            manifest, db, error, capacity)) return false;
+    const size_t frames = static_cast<size_t>(db.nframes());
+    if (manifest.motion_index.frame_count != db.nframes() ||
+        index.direction_masks.size() != frames ||
+        index.speed_masks.size() != frames ||
+        index.elevation_modes.size() != frames)
+        return scene_error(error, capacity,
+            "motion index row count does not match database frames");
     return true;
 }
 

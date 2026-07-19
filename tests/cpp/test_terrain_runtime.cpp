@@ -208,6 +208,14 @@ static byte_buffer make_sidecar(
     return out;
 }
 
+static std::vector<float> sequential_terrain_features(uint32_t frames)
+{
+    std::vector<float> values(static_cast<size_t>(frames) * 12u);
+    for (size_t i = 0; i < values.size(); ++i)
+        values[i] = static_cast<float>(i);
+    return values;
+}
+
 static byte_buffer make_heightfield(
     uint32_t version,
     uint32_t nx,
@@ -362,8 +370,7 @@ static void test_payload_allocation_failures_are_actionable_and_transactional()
     {
         const char* path = "/tmp/test_g1tf_allocation.bin";
         write_payload(path, make_sidecar(
-            1, 2, 4,
-            {0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f}));
+            2, 2, 12, sequential_terrain_features(2)));
         terrain_feature_set destination;
         destination.values.resize(2, 4);
         for (int i = 0; i < 8; ++i)
@@ -1749,7 +1756,7 @@ static void test_sidecar_loads_valid_file()
 {
     const char* path = "/tmp/test_g1tf_valid.bin";
     const byte_buffer payload = make_sidecar(
-        1, 2, 4, {0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f});
+        2, 2, 12, sequential_terrain_features(2));
     write_payload(path, payload);
 
     terrain_feature_set features;
@@ -1760,18 +1767,24 @@ static void test_sidecar_loads_valid_file()
               features, path, error, static_cast<int>(sizeof(error))),
           "valid sidecar loads");
     check(features.values.rows == 2, "valid sidecar rows");
-    check(features.values.cols == 4, "valid sidecar columns");
-    for (int i = 0; i < 8; ++i) {
+    check(features.values.cols == 12, "valid sidecar columns");
+    for (int i = 0; i < 24; ++i) {
         check(features.values.data[i] == static_cast<float>(i),
               "valid sidecar values");
     }
+
+    write_payload(path, make_sidecar(
+        2, 1, 12, std::vector<float>(12, 77.0f)));
+    check(features.values.rows == 2 && features.values.cols == 12 &&
+          features.values(1, 11) == 23.0f,
+          "loaded G1TF values own storage independent of later file bytes");
 }
 
 static void test_sidecar_rejects_every_truncation()
 {
     const char* path = "/tmp/test_g1tf_truncated.bin";
     const byte_buffer payload = make_sidecar(
-        1, 2, 4, {0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f});
+        2, 2, 12, sequential_terrain_features(2));
     for (size_t length = 0; length < payload.size(); ++length) {
         write_prefix(path, payload, length);
         expect_sidecar_rejected(path, "truncated");
@@ -1781,43 +1794,60 @@ static void test_sidecar_rejects_every_truncation()
 static void test_sidecar_rejects_invalid_schema_sizes_and_values()
 {
     const char* path = "/tmp/test_g1tf_corrupt.bin";
-    const std::vector<float> valid_values = {
-        0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f};
+    const std::vector<float> valid_values = sequential_terrain_features(2);
 
-    byte_buffer payload = make_sidecar(1, 2, 4, valid_values);
+    byte_buffer payload = make_sidecar(2, 2, 12, valid_values);
     payload[0] = 'B';
     write_payload(path, payload);
     expect_sidecar_rejected(path, "magic");
 
-    write_payload(path, make_sidecar(2, 2, 4, valid_values));
+    write_payload(path, make_sidecar(1, 2, 4,
+        std::vector<float>(8, 0.0f)));
     expect_sidecar_rejected(path, "version");
 
-    write_payload(path, make_sidecar(1, 2, 3, valid_values));
+    write_payload(path, make_sidecar(3, 2, 12, valid_values));
+    expect_sidecar_rejected(path, "version");
+
+    write_payload(path, make_sidecar(2, 2, 4,
+        std::vector<float>(8, 0.0f)));
     expect_sidecar_rejected(path, "dimension");
 
-    write_payload(path, make_sidecar(1, 0, 4, {}));
+    write_payload(path, make_sidecar(2, 0, 12, {}));
     expect_sidecar_rejected(path, "frame count");
 
     const uint32_t first_unsafe_frame_count =
-        static_cast<uint32_t>(INT_MAX / 4) + 1u;
-    write_payload(path, make_sidecar(1, first_unsafe_frame_count, 4, {}));
+        static_cast<uint32_t>(INT_MAX / 12) + 1u;
+    write_payload(path, make_sidecar(2, first_unsafe_frame_count, 12, {}));
     expect_sidecar_rejected(path, "frame count");
 
     const uint32_t largest_safe_frame_count =
-        static_cast<uint32_t>(INT_MAX / 4);
-    write_payload(path, make_sidecar(1, largest_safe_frame_count, 4, {}));
+        static_cast<uint32_t>(INT_MAX / 12);
+    write_payload(path, make_sidecar(2, largest_safe_frame_count, 12, {}));
     expect_sidecar_rejected(path, "truncated");
 
     const float nan = std::numeric_limits<float>::quiet_NaN();
-    write_payload(path, make_sidecar(1, 1, 4, {0.0f, nan, 2.0f, 3.0f}));
-    expect_sidecar_rejected(path, "finite");
+    std::vector<float> invalid_values(12, 0.0f);
+    invalid_values[1] = nan;
+    write_payload(path, make_sidecar(2, 1, 12, invalid_values));
+    expect_sidecar_rejected(path, "normal-or-positive-zero");
 
     const float infinity = std::numeric_limits<float>::infinity();
-    write_payload(
-        path, make_sidecar(1, 1, 4, {0.0f, 1.0f, -infinity, 3.0f}));
-    expect_sidecar_rejected(path, "finite");
+    invalid_values.assign(12, 0.0f);
+    invalid_values[2] = -infinity;
+    write_payload(path, make_sidecar(2, 1, 12, invalid_values));
+    expect_sidecar_rejected(path, "normal-or-positive-zero");
 
-    payload = make_sidecar(1, 2, 4, valid_values);
+    invalid_values.assign(12, 0.0f);
+    invalid_values[3] = float_from_bits(UINT32_C(0x00000001));
+    write_payload(path, make_sidecar(2, 1, 12, invalid_values));
+    expect_sidecar_rejected(path, "normal-or-positive-zero");
+
+    invalid_values.assign(12, 0.0f);
+    invalid_values[4] = float_from_bits(UINT32_C(0x80000000));
+    write_payload(path, make_sidecar(2, 1, 12, invalid_values));
+    expect_sidecar_rejected(path, "normal-or-positive-zero");
+
+    payload = make_sidecar(2, 2, 12, valid_values);
     payload.push_back(0x7f);
     write_payload(path, payload);
     expect_sidecar_rejected(path, "trailing");
@@ -3614,7 +3644,7 @@ static int probe_generated_artifacts(
           error[0] != '\0' ? error : "generated terrain sidecar load");
     check(features.values.rows > 0,
           "generated terrain sidecar has rows");
-    check(features.values.cols == 4,
+    check(features.values.cols == 12,
           "generated terrain sidecar dimension count");
 
     heightfield field;

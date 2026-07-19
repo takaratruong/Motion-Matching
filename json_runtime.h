@@ -284,12 +284,22 @@ static inline bool json_runtime_error(
     return false;
 }
 
-static inline bool json_document_load(
-    json_value& out, const char* path, char* error, const int error_capacity)
+static const size_t JSON_DOCUMENT_DEFAULT_MAXIMUM_BYTES =
+    16u * 1024u * 1024u;
+static const size_t JSON_MOTION_MANIFEST_MAXIMUM_BYTES =
+    256u * 1024u * 1024u;
+
+static inline bool json_document_load_with_limit(
+    json_value& out, const char* path, const size_t maximum_size,
+    char* error, const int error_capacity)
 {
     if (path == NULL || path[0] == '\0')
         return json_runtime_error(error, error_capacity,
             path != NULL ? path : "<null>", 0, "invalid path");
+    if (maximum_size == 0 ||
+        maximum_size > JSON_MOTION_MANIFEST_MAXIMUM_BYTES)
+        return json_runtime_error(error, error_capacity, path, 0,
+            "invalid maximum document size");
     FILE* file = std::fopen(path, "rb");
     if (file == NULL)
         return json_runtime_error(error, error_capacity, path, 0, "cannot open");
@@ -298,12 +308,18 @@ static inline bool json_document_load(
         return json_runtime_error(error, error_capacity, path, 0, "cannot size");
     }
     const long end = std::ftell(file);
-    static const size_t maximum = 16u * 1024u * 1024u;
-    if (end < 0 || static_cast<unsigned long>(end) > maximum ||
+    if (end < 0 ||
+        static_cast<uintmax_t>(end) > static_cast<uintmax_t>(SIZE_MAX) ||
+        static_cast<uintmax_t>(end) >
+            static_cast<uintmax_t>(maximum_size) ||
         std::fseek(file, 0, SEEK_SET) != 0) {
         std::fclose(file);
+        const char* reason = end < 0 ? "cannot size" :
+            (maximum_size == JSON_DOCUMENT_DEFAULT_MAXIMUM_BYTES ?
+                "document exceeds 16 MiB" :
+                "document exceeds explicit maximum size");
         return json_runtime_error(error, error_capacity, path, 0,
-            end < 0 ? "cannot size" : "document exceeds 16 MiB");
+            reason);
     }
     std::string text(static_cast<size_t>(end), '\0');
     bool read_failed = !text.empty() &&
@@ -323,4 +339,12 @@ static inline bool json_document_load(
             parser.cursor, "trailing data");
     out = std::move(loaded);
     return true;
+}
+
+static inline bool json_document_load(
+    json_value& out, const char* path, char* error, const int error_capacity)
+{
+    return json_document_load_with_limit(
+        out, path, JSON_DOCUMENT_DEFAULT_MAXIMUM_BYTES,
+        error, error_capacity);
 }

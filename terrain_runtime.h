@@ -511,26 +511,26 @@ static inline bool terrain_features_load(
     const uint32_t version = terrain_decode_u32_le(header + 4);
     const uint32_t frames = terrain_decode_u32_le(header + 8);
     const uint32_t dimensions = terrain_decode_u32_le(header + 12);
-    if (version != 1) {
+    if (version != 2) {
         fclose(file);
         return terrain_error(
             error, error_capacity,
-            "%s: unsupported G1TF version %u (expected 1)",
+            "%s: unsupported G1TF version %u (expected 2)",
             path, static_cast<unsigned>(version));
     }
-    if (dimensions != 4) {
+    if (dimensions != 12) {
         fclose(file);
         return terrain_error(
             error, error_capacity,
-            "%s: invalid G1TF dimension %u (expected 4)",
+            "%s: invalid G1TF dimension %u (expected 12)",
             path, static_cast<unsigned>(dimensions));
     }
-    if (frames == 0 || frames > static_cast<uint32_t>(INT_MAX / 4)) {
+    if (frames == 0 || frames > static_cast<uint32_t>(INT_MAX / 12)) {
         fclose(file);
         return terrain_error(
             error, error_capacity,
             "%s: invalid G1TF frame count %u (must be 1..%d)",
-            path, static_cast<unsigned>(frames), INT_MAX / 4);
+            path, static_cast<unsigned>(frames), INT_MAX / 12);
     }
 
     size_t value_count = 0;
@@ -580,11 +580,13 @@ static inline bool terrain_features_load(
     }
     terrain_decode_float_array_le(loaded.values.data, value_count);
     for (size_t i = 0; i < value_count; ++i) {
-        if (!terrain_float_is_finite(loaded.values.data[i])) {
+        if (!terrain_float_is_normal_or_positive_zero(
+                loaded.values.data[i])) {
             fclose(file);
             return terrain_error(
                 error, error_capacity,
-                "%s: G1TF values must all be finite (index %zu)", path, i);
+                "%s: G1TF v2 values must all be normal-or-positive-zero "
+                "binary32 (index %zu)", path, i);
         }
     }
 

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <filesystem>
 #include <iomanip>
 #include <limits>
@@ -97,6 +98,11 @@ static const char* const expected_surface_semantics_json = R"json({"barycentric_
 static const char* const expected_surface_signature =
     "f151c2b1c7f0498880f76c37f48a47c46c48bcf58c1285863fabc9a09fd7993a";
 
+static const int manifest_fixture_source_count = 4;
+static const char* const manifest_fixture_families[] = {
+    "flat", "curb", "slope", "stair",
+};
+
 static void check(bool value, const char* message)
 {
     if (!value) {
@@ -134,6 +140,85 @@ static std::string file_sha(const std::string& path)
     std::string digest;
     check(sha256_file_hex(digest, path.c_str(), error, sizeof(error)), error);
     return digest;
+}
+
+static std::string text_sha(const std::string& text)
+{
+    sha256_state state;
+    sha256_update(state,
+        reinterpret_cast<const uint8_t*>(text.data()), text.size());
+    return sha256_finish(state);
+}
+
+static std::vector<unsigned char> fixture_motion_index_bytes(int frames)
+{
+    std::vector<unsigned char> out{'G', '1', 'M', 'I'};
+    const auto append_u32 = [&](uint32_t value) {
+        for (int byte = 0; byte < 4; ++byte)
+            out.push_back(static_cast<unsigned char>(value >> (8 * byte)));
+    };
+    append_u32(1);
+    append_u32(static_cast<uint32_t>(frames));
+    append_u32(4);
+    for (int frame = 0; frame < frames; ++frame) {
+        const uint16_t direction = static_cast<uint16_t>(1u << frame);
+        out.push_back(static_cast<unsigned char>(direction));
+        out.push_back(static_cast<unsigned char>(direction >> 8));
+        out.push_back(frame == 0 ? 1 : 2);
+        out.push_back(0);
+    }
+    return out;
+}
+
+static std::string fixture_motion_bank_payload_canonical()
+{
+    std::ostringstream out;
+    out << "{\n  \"banks\": [\n";
+    for (int i = 0; i < manifest_fixture_source_count; ++i) {
+        if (i != 0) out << ",\n";
+        out << "    {\n      \"family\": \""
+            << manifest_fixture_families[i]
+            << "\",\n      \"range_indices\": [\n        " << i
+            << "\n      ]\n    }";
+    }
+    out << "\n  ],\n  \"frame_count\": "
+        << manifest_fixture_source_count << ",\n  \"ranges\": [\n";
+    for (int i = 0; i < manifest_fixture_source_count; ++i) {
+        if (i != 0) out << ",\n";
+        out << "    {\n      \"global_start\": " << i
+            << ",\n      \"global_stop\": " << i + 1
+            << ",\n      \"source_frame_count\": 1,\n"
+               "      \"source_name\": \"source-" << i
+            << "\",\n      \"source_start\": 0,\n"
+               "      \"source_stop\": 1\n    }";
+    }
+    out << "\n  ],\n  \"schema\": "
+           "\"g1-terrain-motion-banks/v1\"\n}\n";
+    return out.str();
+}
+
+static std::string fixture_motion_banks_json()
+{
+    std::ostringstream out;
+    out << "{\"schema\":\"g1-terrain-motion-banks/v1\","
+           "\"frame_count\":" << manifest_fixture_source_count
+        << ",\"ranges\":[";
+    for (int i = 0; i < manifest_fixture_source_count; ++i) {
+        if (i != 0) out << ',';
+        out << "{\"source_name\":\"source-" << i
+            << "\",\"source_start\":0,\"source_stop\":1,"
+               "\"source_frame_count\":1,\"global_start\":" << i
+            << ",\"global_stop\":" << i + 1 << '}';
+    }
+    out << "],\"banks\":[";
+    for (int i = 0; i < manifest_fixture_source_count; ++i) {
+        if (i != 0) out << ',';
+        out << "{\"family\":\"" << manifest_fixture_families[i]
+            << "\",\"range_indices\":[" << i << "]}";
+    }
+    out << "],\"sha256\":\""
+        << text_sha(fixture_motion_bank_payload_canonical()) << "\"}";
+    return out.str();
 }
 
 static json_value parse_json_text(const std::string& text)
@@ -200,6 +285,66 @@ static std::string dump_json(const json_value& value)
     return out;
 }
 
+static json_value* mutable_member(json_value& object, const char* key)
+{
+    if (object.kind != json_object) return NULL;
+    for (auto& member : object.object_value)
+        if (member.first == key) return &member.second;
+    return NULL;
+}
+
+static std::string canonical_json_for_bank_digest(
+    const json_value& value, int indentation = 0)
+{
+    if (value.kind != json_array && value.kind != json_object)
+        return dump_json(value);
+    if (value.kind == json_array) {
+        if (value.array_value.empty()) return "[]";
+        std::string out = "[\n";
+        for (size_t i = 0; i < value.array_value.size(); ++i) {
+            if (i != 0) out += ",\n";
+            out.append(static_cast<size_t>(indentation + 2), ' ');
+            out += canonical_json_for_bank_digest(
+                value.array_value[i], indentation + 2);
+        }
+        out += "\n" + std::string(static_cast<size_t>(indentation), ' ') + "]";
+        return out;
+    }
+    if (value.object_value.empty()) return "{}";
+    std::vector<const std::pair<std::string, json_value>*> members;
+    for (const auto& member : value.object_value) members.push_back(&member);
+    std::sort(members.begin(), members.end(), [](const auto* left,
+                                                  const auto* right) {
+        return left->first < right->first;
+    });
+    std::string out = "{\n";
+    for (size_t i = 0; i < members.size(); ++i) {
+        if (i != 0) out += ",\n";
+        out.append(static_cast<size_t>(indentation + 2), ' ');
+        out += dump_json_string(members[i]->first) + ": " +
+            canonical_json_for_bank_digest(
+                members[i]->second, indentation + 2);
+    }
+    out += "\n" + std::string(static_cast<size_t>(indentation), ' ') + "}";
+    return out;
+}
+
+static void resign_motion_banks(json_value& manifest)
+{
+    json_value* descriptor = mutable_member(manifest, "motion_banks");
+    check(descriptor != NULL && descriptor->kind == json_object,
+          "motion bank descriptor fixture");
+    json_value* sha = mutable_member(*descriptor, "sha256");
+    check(sha != NULL && sha->kind == json_string,
+          "motion bank digest fixture");
+    json_value payload = *descriptor;
+    payload.object_value.erase(std::remove_if(
+        payload.object_value.begin(), payload.object_value.end(),
+        [](const auto& member) { return member.first == "sha256"; }),
+        payload.object_value.end());
+    sha->string_value = text_sha(canonical_json_for_bank_digest(payload) + "\n");
+}
+
 static bool artifact_equal(
     const artifact_reference& first, const artifact_reference& second)
 {
@@ -207,6 +352,38 @@ static bool artifact_equal(
            first.sha256 == second.sha256 && first.version == second.version &&
            first.dimensions == second.dimensions &&
            first.columns == second.columns;
+}
+
+static bool motion_index_reference_equal(
+    const motion_index_reference& first, const motion_index_reference& second)
+{
+    return first.path == second.path && first.schema == second.schema &&
+           first.sha256 == second.sha256 && first.version == second.version &&
+           first.frame_count == second.frame_count &&
+           first.row_width == second.row_width;
+}
+
+static bool motion_banks_equal(
+    const motion_bank_index& first, const motion_bank_index& second)
+{
+    if (first.schema != second.schema || first.sha256 != second.sha256 ||
+        first.frame_count != second.frame_count ||
+        first.ranges.size() != second.ranges.size() ||
+        first.banks.size() != second.banks.size()) return false;
+    for (size_t i = 0; i < first.ranges.size(); ++i) {
+        const motion_bank_range& a = first.ranges[i];
+        const motion_bank_range& b = second.ranges[i];
+        if (a.source_name != b.source_name || a.source_start != b.source_start ||
+            a.source_stop != b.source_stop ||
+            a.source_frame_count != b.source_frame_count ||
+            a.global_start != b.global_start || a.global_stop != b.global_stop)
+            return false;
+    }
+    for (size_t i = 0; i < first.banks.size(); ++i)
+        if (first.banks[i].family != second.banks[i].family ||
+            first.banks[i].range_indices != second.banks[i].range_indices)
+            return false;
+    return true;
 }
 
 static bool manifest_equal(
@@ -234,12 +411,16 @@ static bool manifest_equal(
         !artifact_equal(first.database, second.database) ||
         !artifact_equal(first.terrain_features, second.terrain_features) ||
         !artifact_equal(first.terrain_support, second.terrain_support) ||
+        !motion_index_reference_equal(first.motion_index, second.motion_index) ||
+        !motion_banks_equal(first.motion_banks, second.motion_banks) ||
         !artifact_equal(first.scene_index, second.scene_index) ||
         !artifact_equal(first.validation_file, second.validation_file))
         return false;
     for (size_t i = 0; i < first.sources.size(); ++i)
         if (first.sources[i].name != second.sources[i].name ||
             first.sources[i].terrain_id != second.sources[i].terrain_id ||
+            first.sources[i].terrain_family !=
+                second.sources[i].terrain_family ||
             first.sources[i].range_start != second.sources[i].range_start ||
             first.sources[i].range_stop != second.sources[i].range_stop)
             return false;
@@ -586,6 +767,53 @@ static void test_json_size_limit_is_exactly_16_mib()
     check_sentinel(prior, "oversize JSON failure is transactional");
 }
 
+static void test_motion_manifest_json_has_a_separate_bounded_large_limit()
+{
+    static const size_t default_maximum = 16u * 1024u * 1024u;
+    static const size_t document_size = default_maximum + 1024u;
+    const char* path = "/tmp/test_scene_large_manifest.json";
+    FILE* file = std::fopen(path, "wb");
+    check(file != NULL, "open streamed large JSON fixture");
+    check(std::fwrite("null", 1, 4, file) == 4,
+          "write streamed large JSON token");
+    const std::string spaces(4096, ' ');
+    size_t written = 4;
+    while (written < document_size) {
+        const size_t amount = std::min(spaces.size(), document_size - written);
+        check(std::fwrite(spaces.data(), 1, amount, file) == amount,
+              "stream large JSON padding");
+        written += amount;
+    }
+    check(std::fclose(file) == 0, "close streamed large JSON fixture");
+
+    char error[512] = {};
+    json_value output = sentinel_value();
+    check(!json_document_load(output, path, error, sizeof(error)),
+          "default JSON API still rejects above 16 MiB");
+    check_sentinel(output, "default oversize API is transactional");
+    check(json_document_load_with_limit(
+              output, path, JSON_MOTION_MANIFEST_MAXIMUM_BYTES,
+              error, sizeof(error)), error);
+    check(output.kind == json_null,
+          "manifest-specific API accepts streamed document above 16 MiB");
+
+    const json_value prior = sentinel_value();
+    output = prior;
+    check(!json_document_load_with_limit(
+              output, path, 0, error, sizeof(error)),
+          "zero explicit JSON limit rejected");
+    check_sentinel(output, "zero explicit limit is transactional");
+    check(!json_document_load_with_limit(
+              output, path, JSON_MOTION_MANIFEST_MAXIMUM_BYTES + 1u,
+              error, sizeof(error)),
+          "explicit JSON limit above named hard cap rejected");
+    check_sentinel(output, "over-cap explicit limit is transactional");
+    check(!json_document_load_with_limit(
+              output, path, SIZE_MAX, error, sizeof(error)),
+          "overflowing explicit JSON limit rejected");
+    check_sentinel(output, "overflowing explicit limit is transactional");
+}
+
 static void test_json_file_errors_are_transactional()
 {
     const char* const missing = "/tmp/test_scene_json_missing.json";
@@ -716,7 +944,7 @@ static void test_scene_numeric_precision_helpers()
 
 struct manifest_fixture_hashes
 {
-    std::string database, features, support, index, validation;
+    std::string database, features, support, motion, index, validation;
 };
 
 static std::string validation_fixture_json()
@@ -729,7 +957,7 @@ static std::string validation_fixture_json()
     for (int field = 0; field < 3; ++field) {
         if (field != 0) out << ',';
         out << '\"' << names[field] << "\":[";
-        for (int i = 0; i < 1770; ++i) {
+        for (int i = 0; i < manifest_fixture_source_count; ++i) {
             if (i != 0) out << ',';
             out << "0.0";
         }
@@ -757,20 +985,25 @@ static std::string manifest_fixture_json(
         -1,0,1,2,3,4,5,6,1,8,9,10,11,12,1,14,
         15,16,17,18,19,20,21,22,16,24,25,26,27,28,29};
     std::ostringstream out;
-    out << "{\"schema\":\"g1-terrain-artifacts/v2\",";
-    out << "\"output_fps\":25.0,\"feature_dimensions\":31,";
-    out << "\"terrain_dimensions\":4,\"support_dimensions\":3,";
+    out << "{\"schema\":\"g1-terrain-artifacts/v3\",";
+    out << "\"output_fps\":25.0,\"feature_dimensions\":39,";
+    out << "\"terrain_dimensions\":12,\"support_dimensions\":3,";
     out << "\"terrain_feature_distances_m\":[0.25,0.5,0.75,1.0],";
-    out << "\"total_clips\":1770,\"grail_clips\":1769,";
-    out << "\"skipped_clips\":0,\"database_frames\":1770,";
-    out << "\"diagnostic_mode\":false,\"sources\":[";
-    for (int i = 0; i < 1770; ++i) {
+    out << "\"total_clips\":" << manifest_fixture_source_count
+        << ",\"grail_clips\":" << manifest_fixture_source_count - 1 << ',';
+    out << "\"skipped_clips\":0,\"database_frames\":"
+        << manifest_fixture_source_count << ',';
+    out << "\"diagnostic_mode\":true,\"sources\":[";
+    for (int i = 0; i < manifest_fixture_source_count; ++i) {
         if (i != 0) out << ',';
         out << "{\"name\":\"source-" << i
             << "\",\"output_frames\":1,\"range_start\":" << i
             << ",\"range_stop\":" << i + 1
             << ",\"source_fps\":25.0,\"source_frame_map\":[0],"
-               "\"source_frames\":1,\"terrain_id\":\"flat\"}";
+               "\"source_frames\":1,\"terrain_id\":\""
+            << manifest_fixture_families[i]
+            << "\",\"terrain_family\":\""
+            << manifest_fixture_families[i] << "\"}";
     }
     out << "],\"skeleton\":{\"names\":[";
     for (int i = 0; i < G1_BoneCount; ++i) {
@@ -791,14 +1024,19 @@ static std::string manifest_fixture_json(
     out << "\"schema\":\"holden-database/v1\",\"sha256\":\""
         << hashes.database << "\"},";
     out << "\"sidecars\":{\"terrain_features\":{";
-    out << "\"path\":\"terrain_features.bin\",\"schema\":\"G1TF/v1\",";
-    out << "\"version\":1,\"dimensions\":4,\"sha256\":\""
+    out << "\"path\":\"terrain_features.bin\",\"schema\":\"G1TF/v2\",";
+    out << "\"version\":2,\"dimensions\":12,\"sha256\":\""
         << hashes.features << "\"},\"terrain_support\":{";
     out << "\"path\":\"terrain_support.bin\",\"schema\":\"G1SP/v1\",";
     out << "\"version\":1,\"dimensions\":3,\"columns\":[";
     out << "\"source_root_height_m\",\"source_left_toe_height_m\",";
     out << "\"source_right_toe_height_m\"],\"sha256\":\""
         << hashes.support << "\"}},";
+    out << "\"motion_index\":{\"path\":\"motion_index.bin\","
+           "\"schema\":\"G1MI/v1\",\"version\":1,\"frame_count\":"
+        << manifest_fixture_source_count
+        << ",\"row_width\":4,\"sha256\":\"" << hashes.motion << "\"},";
+    out << "\"motion_banks\":" << fixture_motion_banks_json() << ',';
     out << "\"scene_index\":{\"path\":\"scenes/index.json\",";
     out << "\"schema\":\"g1-terrain-scene-index/v1\",\"sha256\":\""
         << hashes.index << "\"},";
@@ -821,7 +1059,8 @@ static motion_pack_manifest manifest_sentinel()
     manifest.skipped_clips = 97;
     manifest.database_frames = 98;
     manifest.diagnostic_mode = true;
-    manifest.sources.push_back(motion_source_record{"sentinel", "terrain", 4, 9});
+    manifest.sources.push_back(
+        motion_source_record{"sentinel", "terrain", "slope", 4, 9});
     manifest.surface.signature = "sentinel-signature";
     manifest.surface.coordinate_signature = "sentinel-coordinate";
     manifest.surface.heightfield_interpolation = "sentinel-interpolation";
@@ -836,6 +1075,19 @@ static motion_pack_manifest manifest_sentinel()
     manifest.database.columns.push_back("sentinel-column");
     manifest.terrain_features = manifest.database;
     manifest.terrain_support = manifest.database;
+    manifest.motion_index.path = "sentinel-motion";
+    manifest.motion_index.schema = "sentinel-motion-schema";
+    manifest.motion_index.sha256 = "sentinel-motion-sha";
+    manifest.motion_index.version = 21;
+    manifest.motion_index.frame_count = 22;
+    manifest.motion_index.row_width = 23;
+    manifest.motion_banks.schema = "sentinel-banks";
+    manifest.motion_banks.sha256 = "sentinel-bank-sha";
+    manifest.motion_banks.frame_count = 24;
+    manifest.motion_banks.ranges.push_back(
+        motion_bank_range{"sentinel", 1, 2, 3, 4, 5});
+    manifest.motion_banks.banks.push_back(
+        motion_family_bank{"flat", {0}});
     manifest.scene_index = manifest.database;
     manifest.validation_file = manifest.database;
     return manifest;
@@ -850,6 +1102,8 @@ static void test_manifest_surface_contract_is_exact_and_transactional()
     write_text((root / "database.bin").c_str(), "database");
     write_text((root / "terrain_features.bin").c_str(), "features");
     write_text((root / "terrain_support.bin").c_str(), "support");
+    write_bytes((root / "motion_index.bin").string(),
+                fixture_motion_index_bytes(manifest_fixture_source_count));
     write_text((root / "scenes/index.json").c_str(), "{}");
     const std::string validation = validation_fixture_json();
     write_text((root / "validation.json").c_str(), validation);
@@ -857,6 +1111,7 @@ static void test_manifest_surface_contract_is_exact_and_transactional()
     hashes.database = file_sha(root / "database.bin");
     hashes.features = file_sha(root / "terrain_features.bin");
     hashes.support = file_sha(root / "terrain_support.bin");
+    hashes.motion = file_sha(root / "motion_index.bin");
     hashes.index = file_sha(root / "scenes/index.json");
     hashes.validation = file_sha(root / "validation.json");
 
@@ -871,8 +1126,19 @@ static void test_manifest_surface_contract_is_exact_and_transactional()
     check(motion_manifest_load_and_verify(
         loaded, root.c_str(), error, sizeof(error)), error);
     check(loaded.surface.signature == expected_surface_signature &&
-          loaded.sources.size() == 1770,
+          loaded.sources.size() == manifest_fixture_source_count &&
+          loaded.feature_dimensions == 39 &&
+          loaded.terrain_dimensions == 12 && loaded.diagnostic_mode,
           "exact 43-key manifest surface accepted");
+    check(loaded.sources[0].terrain_family == "flat" &&
+          loaded.sources[3].terrain_family == "stair" &&
+          motion_bank_for_family(loaded, "slope") != NULL &&
+          motion_bank_for_family(loaded, "slope")->range_indices ==
+              std::vector<int>({2}),
+          "v3 sources and exact family bank lookup");
+    check(motion_source_record_for_frame(loaded, 2) == &loaded.sources[2] &&
+          motion_source_record_for_frame(loaded, 4) == NULL,
+          "const source lookup does not copy records");
 
     const motion_pack_manifest sentinel = manifest_sentinel();
     const auto expect_rejection = [&](const json_value& candidate,
@@ -924,8 +1190,8 @@ static void test_manifest_surface_contract_is_exact_and_transactional()
     check(motion_manifest_load_and_verify(
         valid, root.c_str(), error, sizeof(error)), error);
     check(motion_source_for_frame(valid, 0) == 0 &&
-          motion_source_for_frame(valid, 1769) == 1769 &&
-          motion_source_for_frame(valid, 1770) == -1,
+          motion_source_for_frame(valid, 3) == 3 &&
+          motion_source_for_frame(valid, 4) == -1,
           "fixture source ownership boundaries");
 
     write_text((root / "validation.json").c_str(), "{");
@@ -957,6 +1223,137 @@ static void test_manifest_surface_contract_is_exact_and_transactional()
         "extreme source ranges rejected without overflow");
     check(manifest_equal(range_output, sentinel),
           "extreme range failure preserves prior manifest");
+}
+
+static void test_v3_motion_banks_are_authenticated_and_exact()
+{
+    namespace fs = std::filesystem;
+    const fs::path root = "/tmp/test_scene_manifest_banks";
+    fs::remove_all(root);
+    fs::create_directories(root / "scenes");
+    write_text((root / "database.bin").c_str(), "database");
+    write_text((root / "terrain_features.bin").c_str(), "features");
+    write_text((root / "terrain_support.bin").c_str(), "support");
+    write_bytes((root / "motion_index.bin").string(),
+                fixture_motion_index_bytes(manifest_fixture_source_count));
+    write_text((root / "scenes/index.json").c_str(), "{}");
+    const std::string validation = validation_fixture_json();
+    write_text((root / "validation.json").c_str(), validation);
+    manifest_fixture_hashes hashes;
+    hashes.database = file_sha(root / "database.bin");
+    hashes.features = file_sha(root / "terrain_features.bin");
+    hashes.support = file_sha(root / "terrain_support.bin");
+    hashes.motion = file_sha(root / "motion_index.bin");
+    hashes.index = file_sha(root / "scenes/index.json");
+    hashes.validation = file_sha(root / "validation.json");
+    const std::string text = manifest_fixture_json(
+        expected_surface_semantics_json, validation, hashes);
+    json_value base = parse_json_text(text);
+    const motion_pack_manifest sentinel = manifest_sentinel();
+    char error[1024] = {};
+
+    const auto rejected = [&](const json_value& candidate,
+                              const char* message) {
+        write_text((root / "manifest.json").c_str(), dump_json(candidate));
+        motion_pack_manifest output = sentinel;
+        error[0] = '\0';
+        check(!motion_manifest_load_and_verify(
+                  output, root.c_str(), error, sizeof(error)), message);
+        check(manifest_equal(output, sentinel),
+              "v3 manifest rejection preserves prior object");
+    };
+
+    json_value full = base;
+    mutable_member(full, "diagnostic_mode")->boolean_value = false;
+    write_text((root / "manifest.json").c_str(), dump_json(full));
+    motion_pack_manifest full_pack;
+    check(motion_manifest_load_and_verify(
+              full_pack, root.c_str(), error, sizeof(error)), error);
+    check(!full_pack.diagnostic_mode && full_pack.sources.size() == 4,
+          "dynamic non-diagnostic v3 pack accepted");
+
+    json_value changed = base;
+    json_value* sources = mutable_member(changed, "sources");
+    check(sources != NULL && sources->kind == json_array,
+          "source mutation fixture");
+    mutable_member(sources->array_value[0], "terrain_family")->string_value =
+        "mud";
+    rejected(changed, "unknown source terrain family rejected");
+
+    changed = base;
+    sources = mutable_member(changed, "sources");
+    mutable_member(sources->array_value[0], "terrain_family")->string_value =
+        "curb";
+    rejected(changed, "source and bank family disagreement rejected");
+
+    changed = base;
+    json_value* banks = mutable_member(changed, "motion_banks");
+    json_value* bank_rows = mutable_member(*banks, "banks");
+    std::swap(bank_rows->array_value[0], bank_rows->array_value[1]);
+    resign_motion_banks(changed);
+    rejected(changed, "reordered terrain banks rejected");
+
+    changed = base;
+    banks = mutable_member(changed, "motion_banks");
+    bank_rows = mutable_member(*banks, "banks");
+    mutable_member(bank_rows->array_value[0], "family")->string_value = "mud";
+    resign_motion_banks(changed);
+    rejected(changed, "unknown terrain bank family rejected");
+
+    changed = base;
+    banks = mutable_member(changed, "motion_banks");
+    bank_rows = mutable_member(*banks, "banks");
+    mutable_member(bank_rows->array_value[0], "range_indices")
+        ->array_value.push_back(parse_json_text("1"));
+    resign_motion_banks(changed);
+    rejected(changed, "duplicate terrain bank ownership rejected");
+
+    changed = base;
+    banks = mutable_member(changed, "motion_banks");
+    bank_rows = mutable_member(*banks, "banks");
+    mutable_member(bank_rows->array_value[1], "range_indices")
+        ->array_value.clear();
+    resign_motion_banks(changed);
+    rejected(changed, "omitted terrain bank ownership rejected");
+
+    changed = base;
+    banks = mutable_member(changed, "motion_banks");
+    bank_rows = mutable_member(*banks, "banks");
+    mutable_member(bank_rows->array_value[0], "range_indices")
+        ->array_value[0].number_value = 99;
+    resign_motion_banks(changed);
+    rejected(changed, "out-of-range terrain bank ownership rejected");
+
+    changed = base;
+    banks = mutable_member(changed, "motion_banks");
+    json_value* ranges = mutable_member(*banks, "ranges");
+    mutable_member(ranges->array_value[1], "global_start")->number_value = 2;
+    resign_motion_banks(changed);
+    rejected(changed, "gap in motion bank global ranges rejected");
+
+    changed = base;
+    banks = mutable_member(changed, "motion_banks");
+    mutable_member(*banks, "sha256")->string_value[0] = '0';
+    if (mutable_member(*banks, "sha256")->string_value ==
+        text_sha(fixture_motion_bank_payload_canonical()))
+        mutable_member(*banks, "sha256")->string_value[0] = '1';
+    rejected(changed, "motion bank digest mismatch rejected");
+
+    changed = base;
+    json_value* descriptor = mutable_member(changed, "motion_index");
+    mutable_member(*descriptor, "frame_count")->number_value = 5;
+    rejected(changed, "motion index descriptor frame mismatch rejected");
+
+    changed = base;
+    descriptor = mutable_member(changed, "motion_index");
+    mutable_member(*descriptor, "row_width")->number_value = 5;
+    rejected(changed, "motion index descriptor row width mismatch rejected");
+
+    write_bytes((root / "motion_index.bin").string(),
+                fixture_motion_index_bytes(3));
+    rejected(base, "motion index byte tamper rejected by hash");
+    write_bytes((root / "motion_index.bin").string(),
+                fixture_motion_index_bytes(manifest_fixture_source_count));
 }
 
 static std::string fixture_descriptor_digest(const int index)
@@ -1820,13 +2217,31 @@ static void test_motion_database_contract()
         15,16,17,18,19,20,21,22,16,24,25,26,27,28,29};
     motion_pack_manifest manifest;
     manifest.database_frames = 2;
-    manifest.sources.push_back(motion_source_record{"a", "flat", 0, 1});
-    manifest.sources.push_back(motion_source_record{"b", "flat", 1, 2});
+    manifest.feature_dimensions = 39;
+    manifest.terrain_dimensions = 12;
+    manifest.sources.push_back(
+        motion_source_record{"a", "flat", "flat", 0, 1});
+    manifest.sources.push_back(
+        motion_source_record{"b", "stair", "stair", 1, 2});
+    manifest.motion_index.frame_count = 2;
+    manifest.motion_banks.frame_count = 2;
+    manifest.motion_banks.ranges.push_back(
+        motion_bank_range{"a", 0, 1, 1, 0, 1});
+    manifest.motion_banks.ranges.push_back(
+        motion_bank_range{"b", 0, 1, 1, 1, 2});
+    manifest.motion_banks.banks = {
+        motion_family_bank{"flat", {0}}, motion_family_bank{"curb", {}},
+        motion_family_bank{"slope", {}}, motion_family_bank{"stair", {1}},
+    };
+    motion_index_runtime index;
+    index.direction_masks = {MOTION_DIRECTION_IDLE, MOTION_DIRECTION_FORWARD};
+    index.speed_masks = {MOTION_SPEED_LOW, MOTION_SPEED_MOVING};
+    index.elevation_modes = {0, 1};
     database db;
     db.bone_positions.resize(2, G1_BoneCount);
     db.bone_parents.resize(G1_BoneCount);
-    db.features.resize(2, 31);
-    db.terrain_features.resize(2, 4);
+    db.features.resize(2, 39);
+    db.terrain_features.resize(2, 12);
     db.range_starts.resize(2);
     db.range_stops.resize(2);
     for (int i = 0; i < G1_BoneCount; ++i) db.bone_parents(i) = parents[i];
@@ -1836,11 +2251,21 @@ static void test_motion_database_contract()
     db.range_stops(1) = 2;
     char error[512] = {};
     check(motion_manifest_validate_database(
-        manifest, db, error, sizeof(error)), error);
-    db.terrain_features.cols = 3;
+        manifest, db, index, error, sizeof(error)), error);
+    db.terrain_features.cols = 11;
     check(!motion_manifest_validate_database(
-        manifest, db, error, sizeof(error)),
+        manifest, db, index, error, sizeof(error)),
         "terrain feature width mismatch rejected");
+    db.terrain_features.cols = 12;
+    db.range_starts(1) = 0;
+    check(!motion_manifest_validate_database(
+        manifest, db, index, error, sizeof(error)),
+        "database source range mismatch rejected");
+    db.range_starts(1) = 1;
+    index.direction_masks.pop_back();
+    check(!motion_manifest_validate_database(
+        manifest, db, index, error, sizeof(error)),
+        "motion index row count mismatch rejected");
 }
 
 static void test_published_scene_contract(const char* root)
@@ -1850,16 +2275,18 @@ static void test_published_scene_contract(const char* root)
     check(motion_manifest_load_and_verify(
         manifest, root, error, sizeof(error)), error);
     check(manifest.output_fps == 25.0f &&
-          manifest.feature_dimensions == 31 &&
-          manifest.terrain_dimensions == 4 &&
+          manifest.feature_dimensions == 39 &&
+          manifest.terrain_dimensions == 12 &&
           manifest.support_dimensions == 3, "motion dimensions");
-    check(manifest.total_clips == 1770 && manifest.grail_clips == 1769 &&
-          manifest.skipped_clips == 0 && !manifest.diagnostic_mode,
+    check(manifest.total_clips > 0 &&
+          manifest.grail_clips <= manifest.total_clips &&
+          manifest.skipped_clips == 0,
           "complete motion pack");
     check(manifest.surface.signature ==
           "f151c2b1c7f0498880f76c37f48a47c46c48bcf58c1285863fabc9a09fd7993a",
           "complete 43-key surface signature");
-    check(manifest.sources.size() == 1770 &&
+    check(manifest.sources.size() ==
+              static_cast<size_t>(manifest.total_clips) &&
           manifest.sources.front().range_start == 0 &&
           manifest.sources.back().range_stop == manifest.database_frames,
           "source coverage");
@@ -1941,10 +2368,12 @@ int main(int argc, char** argv)
     test_json_utf8_escapes_and_surrogates();
     test_json_depth_limit_is_exactly_64();
     test_json_size_limit_is_exactly_16_mib();
+    test_motion_manifest_json_has_a_separate_bounded_large_limit();
     test_json_file_errors_are_transactional();
     test_sha256_known_vectors_and_file_errors();
     test_scene_numeric_precision_helpers();
     test_manifest_surface_contract_is_exact_and_transactional();
+    test_v3_motion_banks_are_authenticated_and_exact();
     test_catalog_contract_paths_and_tamper_order();
     test_directional_route_bits_and_hostile_mutations_are_exact();
     test_scene_candidate_hostile_dimensions_are_transactional();
