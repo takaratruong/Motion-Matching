@@ -151,6 +151,10 @@ static void test_exact_heading_parser()
          quat(0.923879504f, 0.0f, 0.382683426f, 0.0f)},
         {"diagonal-negative-x",
          quat(0.923879504f, 0.0f, -0.382683426f, 0.0f)},
+        {"backward-positive-x",
+         quat(0.382683426f, 0.0f, 0.923879504f, 0.0f)},
+        {"backward-negative-x",
+         quat(0.382683426f, 0.0f, -0.923879504f, 0.0f)},
     };
 
     char error[256] = {};

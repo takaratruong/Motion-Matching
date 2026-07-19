@@ -166,6 +166,10 @@ static inline bool g1_test_heading_override_parse(
          quat(0.923879504f, 0.0f, 0.382683426f, 0.0f)},
         {"diagonal-negative-x",
          quat(0.923879504f, 0.0f, -0.382683426f, 0.0f)},
+        {"backward-positive-x",
+         quat(0.382683426f, 0.0f, 0.923879504f, 0.0f)},
+        {"backward-negative-x",
+         quat(0.382683426f, 0.0f, -0.923879504f, 0.0f)},
     };
     for (const auto& value : values) {
         if (std::strcmp(text, value.text) == 0) {
@@ -180,7 +184,7 @@ static inline bool g1_test_heading_override_parse(
         sizeof(output),
         error,
         error_capacity,
-        "MM_TEST_HEADING must be one of the six exact named headings");
+        "MM_TEST_HEADING must be one of the eight exact named headings");
 }
 
 static inline bool g1_command_snapshot_is_valid(
