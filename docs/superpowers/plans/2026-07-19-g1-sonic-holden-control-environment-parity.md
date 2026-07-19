@@ -357,7 +357,7 @@ git commit -m "feat: port Holden operator command mapping"
 
 **Interfaces:**
 - Consumes: `NormalizedControlState` and `HoldenControlMapper` from Task 1.
-- Produces: `KeyLevels`, `X11KeyStateProvider`, `ContinuousControlLoop`, and `BoundaryControlMailbox.sample(chunk_index) -> tuple[CommandSample | None, MappedControlState]`.
+- Produces: `KeyLevels`, `normalized_state_from_pressed(pressed) -> NormalizedControlState`, `X11KeyStateProvider`, `ContinuousControlLoop`, and `BoundaryControlMailbox.sample(chunk_index) -> tuple[CommandSample | None, MappedControlState]`.
 
 - [ ] **Step 1: Write failing provider-independent input tests**
 
@@ -452,7 +452,7 @@ KEYSYMS = {
 
 `ContinuousControlLoop` runs one non-daemon thread, samples every 0.02 seconds by default, emits only state transitions, advances the pure mapper, edge-latches Space/X, neutralizes on focus loss, and joins within two seconds. It accepts the manual driver's shared `threading.Event`; an X rising edge sets that event immediately. The mailbox validates monotonic sequences and provides an atomic latest-state/edge-consumption boundary.
 
-Convert pressed levels into the normalized state exactly as follows:
+Implement `normalized_state_from_pressed` and convert pressed levels into the normalized state exactly as follows:
 
 ```python
 NormalizedControlState(
