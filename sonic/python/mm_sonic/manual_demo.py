@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import sys
 import threading
+from typing import Callable
 
 import numpy as np
 
@@ -24,19 +27,44 @@ import xml.etree.ElementTree as ET
 from .commands import CommandSample, flat_command_script
 from .coordinator import SessionConfig, SourceValidator
 from .hands import Dex3HandTargets, NEUTRAL_HAND_TARGETS, hand_targets_record
+from .holden_control import HoldenControlMapper, MappedControlState
 from .joints import ContractError, load_joint_contract
-from .manual_evidence import manual_command_artifact_bytes
+from .manual_evidence import (
+    environment_control_record,
+    manual_command_artifact_bytes,
+    manual_summary_v4_bytes,
+)
 from .operator import OperatorLimits, OperatorSampler
-from .scene import normalize_run_local_actuators, verify_loaded_actuator_routing
+from .operator_x11 import ContinuousControlLoop, X11KeyStateProvider
+from .scene import (
+    HOLDEN_COORDINATE_SIGNATURE,
+    MUJOCO_COORDINATE_SIGNATURE,
+    normalize_run_local_actuators,
+    register_scene,
+    verify_loaded_actuator_routing,
+)
+from .scene_runtime import (
+    GEAR_ROBOT_RELATIVE,
+    GEAR_ROBOT_SHA256,
+    GEAR_SCENE_RELATIVE,
+    GEAR_SCENE_SHA256,
+    SCENE_REGISTRY_PATH,
+    initial_physics_state,
+)
 from .operator_terminal import TerminalInputReader, TerminalKeyBuffer
 from .process import (
+    ChildProcessDied,
     GatedSimulatorClient,
     GearProcess,
     MMChunkClient,
+    ProcessProtocolError,
     SimulationPolicyGate,
 )
 from .timeline import TargetTimeline
+from .transform import holden_to_mujoco_quaternions
 from .zmq_v1 import PosePublisher
+
+MANUAL_MAPPER_VERSION = "holden-control/v1"
 
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
@@ -185,6 +213,176 @@ def _stand_command(index: int, heading: CommandSample | None = None) -> CommandS
     return CommandSample(index, (0.0, 0.0, 0.0), quaternion)
 
 
+@dataclass(frozen=True)
+class DemoDependencies:
+    """The two authenticated environment builders used by startup.
+
+    Production binds the complete registry, model, contract, and closed-hand
+    arguments in these callables. Tests can replace only the external builders
+    while exercising the real ordering transaction.
+    """
+
+    register_scene: Callable[..., object]
+    build_initial_state: Callable[[object, object], object]
+
+
+@dataclass(frozen=True)
+class StartupTransaction:
+    hello: object
+    reset: object
+    initial_boundary: object
+    scene: object
+    initial_state: object
+
+
+def _run_startup_transaction(
+    dependencies: DemoDependencies,
+    *,
+    mm: object,
+    simulator: object,
+    validator: object,
+    scene_id: str,
+    route_id: str,
+    terrain_weight: float,
+    session_id: str,
+    log_dir: Path,
+) -> StartupTransaction:
+    """Run the fail-closed MM -> scene -> initial-state -> simulator order."""
+
+    hello = mm.hello()
+    reset = mm.reset(
+        SessionConfig(scene_id, route_id, terrain_weight),
+        session_id=session_id,
+    )
+    scene_identity = reset["scene"]
+    scene = dependencies.register_scene(
+        scene_id,
+        route_id,
+        mm_hello_identity=hello,
+        mm_scene_identity=scene_identity,
+    )
+    initial = validator.validate_initial(reset)
+    initial_state = dependencies.build_initial_state(scene, initial)
+    simulator.hello()
+    simulator.reset(
+        scene_xml=scene.gear_scene_xml,
+        initial_qpos=initial_state.qpos,
+        lateral_offset_m=0.0,
+        yaw_offset_rad=0.0,
+        log_dir=log_dir,
+        elastic_band_enabled=True,
+    )
+    return StartupTransaction(hello, reset, initial, scene, initial_state)
+
+
+@dataclass(frozen=True)
+class CameraDeliveryState:
+    """Fail-closed state for the optional, synchronized camera channel."""
+
+    enabled: bool = True
+    last_sequence: int | None = None
+    disabled_reported: bool = False
+
+
+def _initial_camera_delivery_state(onscreen: bool) -> CameraDeliveryState:
+    if type(onscreen) is not bool:
+        raise ContractError("onscreen must be a boolean")
+    return CameraDeliveryState(enabled=onscreen)
+
+
+@dataclass(frozen=True)
+class X11BoundaryResult:
+    command: CommandSample | None
+    mapped: MappedControlState
+    camera_state: CameraDeliveryState
+    advance: object | None
+
+
+def _heading_yaw_rad(quaternion_wxyz: tuple[float, float, float, float]) -> float:
+    w, x, y, z = quaternion_wxyz
+    return math.atan2(
+        2.0 * (w * z + x * y),
+        1.0 - 2.0 * (y * y + z * z),
+    )
+
+
+def _heading_frame_offset_yaw_rad(
+    physical_mujoco_wxyz: tuple[float, float, float, float],
+    virtual_mujoco_wxyz: tuple[float, float, float, float],
+) -> float:
+    """Return the authenticated physical-minus-virtual root yaw offset."""
+
+    return math.remainder(
+        _heading_yaw_rad(physical_mujoco_wxyz)
+        - _heading_yaw_rad(virtual_mujoco_wxyz),
+        2.0 * math.pi,
+    )
+
+
+def _consume_x11_boundary(
+    *,
+    control_loop: object,
+    simulator: object,
+    gate: object,
+    generate_and_publish: Callable[..., None],
+    chunk_index: int,
+    steps_per_chunk: int,
+    preload_chunks: int,
+    camera_state: CameraDeliveryState,
+    event_sink: Callable[[str], None],
+    control_prefix: str,
+    camera_disabled_prefix: str,
+) -> X11BoundaryResult:
+    """Atomically forward one mapped control boundary and synchronized camera."""
+
+    command, mapped = control_loop.mailbox.sample(chunk_index)
+    if command is None:
+        return X11BoundaryResult(None, mapped, camera_state, None)
+
+    next_camera_state = camera_state
+    camera = mapped.camera
+    if camera_state.enabled and camera.sequence != camera_state.last_sequence:
+        try:
+            simulator.set_camera(
+                camera.sequence,
+                math.degrees(camera.azimuth_rad),
+                -math.degrees(camera.altitude_rad),
+                camera.distance_m,
+            )
+        except ProcessProtocolError as error:
+            # Only an exact-object/echo error proves the JSONL response was
+            # fully consumed. Parse/truncation errors remain fatal because the
+            # request/response stream may no longer be synchronized.
+            if not str(error).startswith("camera data"):
+                raise
+            if not camera_state.disabled_reported:
+                event_sink(f"{camera_disabled_prefix}: {error}")
+            next_camera_state = CameraDeliveryState(
+                enabled=False,
+                last_sequence=camera_state.last_sequence,
+                disabled_reported=True,
+            )
+        else:
+            next_camera_state = CameraDeliveryState(
+                enabled=True,
+                last_sequence=camera.sequence,
+                disabled_reported=camera_state.disabled_reported,
+            )
+
+    generate_and_publish(command, wait=False)
+    advance = gate.release_steps(steps_per_chunk)
+    velocity = command.requested_velocity_mujoco
+    heading = _heading_yaw_rad(command.desired_heading_mujoco_wxyz)
+    event_sink(
+        f"{control_prefix}{command.chunk_index:06d} "
+        f"vx={velocity[0]:+.3f} vy={velocity[1]:+.3f} "
+        f"heading={heading:+.3f} strafe={int(mapped.strafe)} "
+        f"walk={int(mapped.walk_blend >= 0.5)} "
+        f"presents_in={preload_chunks * _CHUNK_DURATION_S:.3f}s"
+    )
+    return X11BoundaryResult(command, mapped, next_camera_state, advance)
+
+
 def run_demo(namespace: argparse.Namespace) -> Path:
     preload_chunks = _validated_preload_chunks(namespace.preload_chunks)
     output_root = Path(namespace.output_root).expanduser().resolve()
@@ -193,8 +391,6 @@ def run_demo(namespace: argparse.Namespace) -> Path:
     runtime = Path(namespace.runtime).expanduser().resolve(strict=True)
     terrain_dir = Path(namespace.terrain_dir).expanduser().resolve(strict=True)
     bundle = RunBundle.create(output_root, "manual-sonic", _utc_run_id())
-    scene_xml, scene_control = _copy_scene(bundle, source_run)
-    initial_qpos = _initial_qpos(scene_xml)
     environment = _environment(terrain_dir)
 
     contract = load_joint_contract(_SONIC_ROOT / "configs/g1_joint_contract.json")
@@ -303,12 +499,37 @@ def run_demo(namespace: argparse.Namespace) -> Path:
 
     cancellation = threading.Event()
     try:
-        mm.hello()
+        hello = mm.hello()
         reset = mm.reset(
-            SessionConfig("sonic-flat-baseline", "flat-12s", 0.0),
+            SessionConfig(
+                namespace.scene_id,
+                namespace.route_id,
+                namespace.terrain_weight,
+            ),
             session_id=session_id,
         )
-        timeline = TargetTimeline(validator.validate_initial(reset), contract)
+        scene = register_scene(
+            namespace.scene_id,
+            namespace.route_id,
+            registry_path=SCENE_REGISTRY_PATH,
+            terrain_dir=terrain_dir,
+            official_scene_xml=gear_checkout / GEAR_SCENE_RELATIVE,
+            output_dir=bundle.path / "scene",
+            expected_official_scene_sha256=GEAR_SCENE_SHA256,
+            expected_robot_sha256=GEAR_ROBOT_SHA256,
+            mm_hello_identity=hello,
+            mm_scene_identity=reset["scene"],
+        )
+        initial = validator.validate_initial(reset)
+        initial_state = initial_physics_state(
+            scene,
+            initial,
+            contract,
+            NEUTRAL_HAND_TARGETS,
+        )
+        scene_xml = scene.gear_scene_xml
+        initial_qpos = initial_state.qpos
+        timeline = TargetTimeline(initial, contract)
         simulator.hello()
         simulator.reset(
             scene_xml=scene_xml,
@@ -359,46 +580,16 @@ def run_demo(namespace: argparse.Namespace) -> Path:
         gate.pause()
         steps_per_chunk = round(_CHUNK_DURATION_S / simulator.sim_dt)
 
-        script = flat_command_script()
-        sampler = OperatorSampler(
-            OperatorLimits(
-                forward_mps=0.5,
-                backward_mps=0.5,
-                lateral_mps=0.5,
-            )
-        )
-        key_buffer = TerminalKeyBuffer()
-        reader = (
-            TerminalInputReader(
-                sys.stdin.fileno(),
-                key_buffer,
-                event_sink=_print_terminal_event,
-            )
-            if namespace.mode == "interactive"
-            else None
-        )
-        context = reader if reader is not None else _NullContext()
+        camera_state = _initial_camera_delivery_state(namespace.onscreen)
         last_command: CommandSample | None = None
-        with context:
-            if namespace.mode == "interactive":
-                print(
-                    "LIVE: W forward, space stand, Q/E turn, X exit. "
-                    f"Commands have ~{preload_chunks * _CHUNK_DURATION_S:.1f} s "
-                    "lookahead latency.",
-                    flush=True,
-                )
+        if namespace.mode == "script":
+            script = flat_command_script()
             for consumed_chunk in range(namespace.chunks):
-                if namespace.mode == "script":
-                    command = (
-                        script[next_chunk]
-                        if next_chunk < len(script)
-                        else _stand_command(next_chunk, last_command)
-                    )
-                else:
-                    sampler.update(key_buffer.sample())
-                    command = sampler.sample_boundary(next_chunk)
-                    if command is None:
-                        break
+                command = (
+                    script[next_chunk]
+                    if next_chunk < len(script)
+                    else _stand_command(next_chunk, last_command)
+                )
                 generate_and_publish(command, wait=False)
                 last_command = command
                 advance = gate.release_steps(steps_per_chunk)
@@ -408,27 +599,171 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                     f"vx={command.requested_velocity_mujoco[0]:+.2f}",
                     flush=True,
                 )
+        elif namespace.input_source == "x11":
+            initial_heading = _heading_yaw_rad(
+                tuple(float(value) for value in initial_qpos[3:7])
+            )
+            initial_virtual_quaternion = holden_to_mujoco_quaternions(
+                initial.virtual_root_orientation_holden
+            )
+            heading_frame_offset = _heading_frame_offset_yaw_rad(
+                tuple(float(value) for value in initial_qpos[3:7]),
+                tuple(float(value) for value in initial_virtual_quaternion),
+            )
+            provider = X11KeyStateProvider()
+            mapper = HoldenControlMapper(
+                initial_heading_yaw_rad=initial_heading,
+                heading_frame_offset_yaw_rad=heading_frame_offset,
+            )
+            print(
+                "LIVE X11: W/A/S/D move, Shift walk, Ctrl+arrows strafe/face, "
+                "arrows orbit camera, Q/E zoom, Space stand, X exit. "
+                f"Commands have {preload_chunks * _CHUNK_DURATION_S:.1f}s "
+                "lookahead latency.",
+                flush=True,
+            )
+            try:
+                with ContinuousControlLoop(
+                    provider,
+                    mapper,
+                    event_sink=_print_terminal_event,
+                    cancel_event=cancellation,
+                ) as control_loop:
+                    if not control_loop.wait_for_sequence(1, timeout_s=2.0):
+                        raise ContractError(
+                            "continuous X11 control did not publish an initial state"
+                        )
+                    for _consumed_chunk in range(namespace.chunks):
+                        result = _consume_x11_boundary(
+                            control_loop=control_loop,
+                            simulator=simulator,
+                            gate=gate,
+                            generate_and_publish=generate_and_publish,
+                            chunk_index=next_chunk,
+                            steps_per_chunk=steps_per_chunk,
+                            preload_chunks=preload_chunks,
+                            camera_state=camera_state,
+                            event_sink=_print_terminal_event,
+                            control_prefix="CONTROL chunk=",
+                            camera_disabled_prefix="CAMERA DISABLED",
+                        )
+                        camera_state = result.camera_state
+                        if result.command is None:
+                            break
+                        last_command = result.command
+            finally:
+                provider.close()
+        else:
+            print(
+                "TERMINAL COMPATIBILITY: coarse non-parity W/S/A/D/Q/E "
+                "controls; Space stands and X exits.",
+                flush=True,
+            )
+            sampler = OperatorSampler(
+                OperatorLimits(
+                    forward_mps=0.5,
+                    backward_mps=0.5,
+                    lateral_mps=0.5,
+                )
+            )
+            key_buffer = TerminalKeyBuffer()
+            reader = TerminalInputReader(
+                sys.stdin.fileno(),
+                key_buffer,
+                event_sink=_print_terminal_event,
+            )
+            with reader:
+                for consumed_chunk in range(namespace.chunks):
+                    sampler.update(key_buffer.sample())
+                    command = sampler.sample_boundary(next_chunk)
+                    if command is None:
+                        break
+                    generate_and_publish(command, wait=False)
+                    last_command = command
+                    advance = gate.release_steps(steps_per_chunk)
+                    print(
+                        f"boundary {consumed_chunk + 1:03d}: "
+                        f"sim={advance.sim_time_end_s:.2f}s "
+                        f"queued={next_chunk - 1:03d} "
+                        f"vx={command.requested_velocity_mujoco[0]:+.2f} "
+                        f"vy={command.requested_velocity_mujoco[1]:+.2f}",
+                        flush=True,
+                    )
         command_artifact = recorder.artifact_bytes()
-        summary = {
-            "schema": "mm-sonic-manual-demo/v3",
-            "mode": namespace.mode,
-            "run_root": str(bundle.path),
-            "preload_chunks": preload_chunks,
-            "generated_chunks": next_chunk,
-            "lookahead_seconds": preload_chunks * _CHUNK_DURATION_S,
-            "command_artifact": {
-                "path": "manual-commands.json",
-                "sha256": hashlib.sha256(command_artifact).hexdigest(),
-            },
-            "hand_control": hand_targets_record(NEUTRAL_HAND_TARGETS),
-            "scene_control": scene_control,
-            "snapshot": simulator.snapshot(),
-        }
+        snapshot = simulator.snapshot()
+        if namespace.scene_id == "sonic-flat-baseline":
+            registration = json.loads(
+                (scene_xml.parent / "scene_registration.json").read_bytes()
+            )
+            scene_control = {
+                "gear_scene_sha256": scene.output_hashes["gear_scene_xml"],
+                "gear_robot_sha256": scene.output_hashes["robot_include"],
+                "actuator_joint_order_sha256": registration[
+                    "actuator_joint_order_sha256"
+                ],
+            }
+            summary = {
+                "schema": "mm-sonic-manual-demo/v3",
+                "mode": namespace.mode,
+                "run_root": str(bundle.path),
+                "preload_chunks": preload_chunks,
+                "generated_chunks": next_chunk,
+                "lookahead_seconds": preload_chunks * _CHUNK_DURATION_S,
+                "command_artifact": {
+                    "path": "manual-commands.json",
+                    "sha256": hashlib.sha256(command_artifact).hexdigest(),
+                },
+                "hand_control": hand_targets_record(NEUTRAL_HAND_TARGETS),
+                "scene_control": scene_control,
+                "snapshot": snapshot,
+            }
+            summary_bytes = (
+                json.dumps(summary, sort_keys=True, indent=2) + "\n"
+            ).encode("ascii")
+        else:
+            environment_control = environment_control_record(
+                scene_id=scene.scene_id,
+                route_id=scene.route_id,
+                terrain_weight=namespace.terrain_weight,
+                input_source=namespace.input_source,
+                mapper_version=MANUAL_MAPPER_VERSION,
+                camera_sequence=(
+                    0
+                    if camera_state.last_sequence is None
+                    else camera_state.last_sequence
+                ),
+                mm_hello_identity=dict(hello),
+                mm_scene_identity=dict(reset["scene"]),
+                source_hashes=dict(scene.source_hashes),
+                output_hashes=dict(scene.output_hashes),
+                coordinate_source=scene.coordinate_source,
+                coordinate_target=scene.coordinate_target,
+                transform_matrix=scene.transform_matrix.tolist(),
+                source_bounds_holden=scene.source_bounds_holden.tolist(),
+                transformed_bounds_mujoco=(
+                    scene.transformed_bounds_mujoco.tolist()
+                ),
+                initial_boundary_sha256=(
+                    initial_state.initial_boundary_sha256
+                ),
+                initial_qpos_sha256=initial_state.qpos_sha256,
+            )
+            summary_bytes = manual_summary_v4_bytes(
+                mode=namespace.mode,
+                run_root=str(bundle.path),
+                preload_chunks=preload_chunks,
+                generated_chunks=next_chunk,
+                lookahead_seconds=preload_chunks * _CHUNK_DURATION_S,
+                command_bytes=command_artifact,
+                hand_targets=NEUTRAL_HAND_TARGETS,
+                environment_control=environment_control,
+                snapshot=snapshot,
+            )
+            summary = json.loads(summary_bytes)
+            if summary.get("schema") != "mm-sonic-manual-demo/v4":
+                raise ContractError("terrain manual summary schema changed")
         bundle.write_bytes("manual-commands.json", command_artifact)
-        bundle.write_bytes(
-            "manual-summary.json",
-            (json.dumps(summary, sort_keys=True, indent=2) + "\n").encode(),
-        )
+        bundle.write_bytes("manual-summary.json", summary_bytes)
         print(json.dumps(summary, sort_keys=True), flush=True)
         return bundle.path
     finally:
@@ -452,12 +787,52 @@ class _NullContext:
         return None
 
 
+def _resolve_mode_defaults(namespace: argparse.Namespace) -> None:
+    """Fill mode-dependent defaults left unset on the command line.
+
+    Interactive runs default to the authenticated ``grail-curb-default`` terrain
+    scene, the ``curb-forward`` route, terrain weight ``4.0``, continuous X11
+    input, and two 0.4-second preload chunks. The explicit
+    ``sonic-flat-baseline`` / ``flat-12s`` / ``0.0`` / four-chunk configuration
+    remains the backward-compatible flat diagnostic path.
+    """
+
+    interactive = namespace.mode == "interactive"
+    if namespace.scene_id is None:
+        namespace.scene_id = (
+            "grail-curb-default" if interactive else "sonic-flat-baseline"
+        )
+    if namespace.route_id is None:
+        namespace.route_id = "curb-forward" if interactive else "flat-12s"
+    if namespace.terrain_weight is None:
+        namespace.terrain_weight = 4.0 if interactive else 0.0
+    if namespace.input_source is None:
+        namespace.input_source = "x11"
+    if namespace.preload_chunks is None:
+        namespace.preload_chunks = 2 if interactive else _PRELOAD_CHUNKS
+
+
+class _ManualArgumentParser(argparse.ArgumentParser):
+    """Argument parser that resolves mode-dependent interactive defaults."""
+
+    def parse_known_args(self, args=None, namespace=None):  # type: ignore[override]
+        parsed, extras = super().parse_known_args(args, namespace)
+        _resolve_mode_defaults(parsed)
+        return parsed, extras
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = _ManualArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("script", "interactive"), default="script")
     parser.add_argument("--chunks", type=int, default=30)
-    parser.add_argument("--preload-chunks", type=int, default=_PRELOAD_CHUNKS)
+    parser.add_argument("--preload-chunks", type=int, default=None)
     parser.add_argument("--onscreen", action="store_true")
+    parser.add_argument("--scene-id", default=None)
+    parser.add_argument("--route-id", default=None)
+    parser.add_argument("--terrain-weight", type=float, default=None)
+    parser.add_argument(
+        "--input-source", choices=("x11", "terminal"), default=None
+    )
     parser.add_argument("--output-root", default="/home/ubuntu/mm-sonic-manual-runs")
     parser.add_argument("--source-run", default=str(_DEFAULT_SOURCE_RUN))
     parser.add_argument("--gear-checkout", default=str(_DEFAULT_GEAR))

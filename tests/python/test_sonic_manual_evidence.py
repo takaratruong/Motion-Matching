@@ -27,11 +27,20 @@ from mm_sonic.manual_evidence import (
     audit_manual_run,
     authenticate_pose_stream,
     command_phase_report,
+    environment_control_record,
     load_canonical_target_npz,
     manual_command_artifact_bytes,
+    manual_summary_v4_bytes,
+    parse_environment_control,
     parse_manual_command_artifact,
+    parse_manual_summary_v4,
     scan_for_fall_marker,
     state_metrics,
+)
+from mm_sonic.scene import (
+    HOLDEN_COORDINATE_SIGNATURE,
+    HOLDEN_TO_MUJOCO_MATRIX,
+    MUJOCO_COORDINATE_SIGNATURE,
 )
 from mm_sonic.replay_video import ReplayState
 from mm_sonic.timeline import CanonicalTargetBuffer
@@ -296,6 +305,184 @@ class CommandPhaseTests(unittest.TestCase):
 
         self.assertFalse(report.has_final_stand)
         self.assertFalse(report.phases_ordered)
+
+
+def _environment_control_fields() -> dict:
+    return {
+        "scene_id": "grail-curb-default",
+        "route_id": "curb-forward",
+        "terrain_weight": 4.0,
+        "input_source": "x11",
+        "mapper_version": "holden-control/v1",
+        "camera_sequence": 7,
+        "mm_hello_identity": {
+            "coordinate_signature": HOLDEN_COORDINATE_SIGNATURE,
+            "motion_manifest_sha256": "a" * 64,
+            "scene_index_sha256": "b" * 64,
+        },
+        "mm_scene_identity": {
+            "scene_id": "grail-curb-default",
+            "route_id": "curb-forward",
+            "coordinate_signature": HOLDEN_COORDINATE_SIGNATURE,
+            "heightfield_sha256": "c" * 64,
+            "mesh_sha256": "d" * 64,
+            "walkability_sha256": "e" * 64,
+        },
+        "source_hashes": {
+            "manifest": "a" * 64,
+            "scene_index": "b" * 64,
+            "terrain_bin": "c" * 64,
+            "terrain_obj": "d" * 64,
+            "walkability": "e" * 64,
+        },
+        "output_hashes": {
+            "gear_scene_xml": "f" * 64,
+            "transformed_obj": "0" * 64,
+        },
+        "coordinate_source": HOLDEN_COORDINATE_SIGNATURE,
+        "coordinate_target": MUJOCO_COORDINATE_SIGNATURE,
+        "transform_matrix": HOLDEN_TO_MUJOCO_MATRIX.tolist(),
+        "source_bounds_holden": [[-1.0, -2.0, -3.0], [1.0, 2.0, 3.0]],
+        "transformed_bounds_mujoco": [[-3.0, -1.0, -2.0], [3.0, 1.0, 2.0]],
+        "initial_boundary_sha256": "1" * 64,
+        "initial_qpos_sha256": "2" * 64,
+    }
+
+
+class EnvironmentControlCodecTests(unittest.TestCase):
+    def test_round_trips_all_bound_fields(self) -> None:
+        fields = _environment_control_fields()
+
+        record = environment_control_record(**fields)
+        parsed = parse_environment_control(record)
+
+        self.assertEqual(parsed["scene_id"], "grail-curb-default")
+        self.assertEqual(parsed["route_id"], "curb-forward")
+        self.assertEqual(parsed["terrain_weight"], 4.0)
+        self.assertEqual(parsed["input_source"], "x11")
+        self.assertEqual(parsed["mapper_version"], "holden-control/v1")
+        self.assertEqual(parsed["camera_sequence"], 7)
+        self.assertEqual(parsed["initial_qpos_sha256"], "2" * 64)
+        self.assertEqual(
+            parsed["transform_matrix"], HOLDEN_TO_MUJOCO_MATRIX.tolist()
+        )
+
+    def test_rejects_unknown_field(self) -> None:
+        record = environment_control_record(**_environment_control_fields())
+        record["unexpected"] = 1
+        with self.assertRaisesRegex(ContractError, "environment control"):
+            parse_environment_control(record)
+
+    def test_rejects_missing_field(self) -> None:
+        record = environment_control_record(**_environment_control_fields())
+        del record["camera_sequence"]
+        with self.assertRaisesRegex(ContractError, "environment control"):
+            parse_environment_control(record)
+
+    def test_rejects_mutated_digest(self) -> None:
+        record = environment_control_record(**_environment_control_fields())
+        record["initial_qpos_sha256"] = "z" * 64
+        with self.assertRaisesRegex(ContractError, "initial_qpos_sha256"):
+            parse_environment_control(record)
+
+    def test_rejects_nonfinite_transform_entry(self) -> None:
+        fields = _environment_control_fields()
+        matrix = [list(row) for row in fields["transform_matrix"]]
+        matrix[0][0] = float("inf")
+        fields["transform_matrix"] = matrix
+        with self.assertRaisesRegex(ContractError, "finite"):
+            environment_control_record(**fields)
+
+    def test_rejects_unknown_input_source(self) -> None:
+        fields = _environment_control_fields()
+        fields["input_source"] = "gamepad"
+        with self.assertRaisesRegex(ContractError, "input_source"):
+            environment_control_record(**fields)
+
+    def test_rejects_negative_camera_sequence(self) -> None:
+        fields = _environment_control_fields()
+        fields["camera_sequence"] = -1
+        with self.assertRaisesRegex(ContractError, "camera_sequence"):
+            environment_control_record(**fields)
+
+    def test_rejects_malformed_bounds_shape(self) -> None:
+        fields = _environment_control_fields()
+        fields["source_bounds_holden"] = [[0.0, 0.0, 0.0]]
+        with self.assertRaisesRegex(ContractError, "source_bounds_holden"):
+            environment_control_record(**fields)
+
+
+def _v4_summary_fields(run_root: str) -> dict:
+    commands = _manual_commands()
+    command_bytes = manual_command_artifact_bytes(
+        mode="interactive",
+        preload_chunks=2,
+        commands=commands,
+        hand_targets=NEUTRAL_HAND_TARGETS,
+    )
+    return {
+        "mode": "interactive",
+        "run_root": run_root,
+        "preload_chunks": 2,
+        "generated_chunks": len(commands),
+        "lookahead_seconds": 0.8,
+        "command_bytes": command_bytes,
+        "hand_targets": NEUTRAL_HAND_TARGETS,
+        "environment_control": environment_control_record(
+            **_environment_control_fields()
+        ),
+        "snapshot": {
+            "contact_rows": 12,
+            "sim_time_s": 3.5,
+            "state_rows": 10,
+            "steps": 12,
+        },
+    }
+
+
+class ManualSummaryV4Tests(unittest.TestCase):
+    def test_round_trips_terrain_summary(self) -> None:
+        fields = _v4_summary_fields("/runs/manual-x")
+
+        data = manual_summary_v4_bytes(**fields)
+        parsed = parse_manual_summary_v4(data)
+
+        self.assertEqual(parsed["schema"], "mm-sonic-manual-demo/v4")
+        self.assertEqual(parsed["mode"], "interactive")
+        self.assertEqual(parsed["preload_chunks"], 2)
+        self.assertEqual(
+            parsed["environment_control"]["scene_id"], "grail-curb-default"
+        )
+
+    def test_rejects_v3_summary_as_v4(self) -> None:
+        fields = _v4_summary_fields("/runs/manual-x")
+        data = manual_summary_v4_bytes(**fields)
+        document = json.loads(data)
+        document["schema"] = "mm-sonic-manual-demo/v3"
+        with self.assertRaisesRegex(ContractError, "schema"):
+            parse_manual_summary_v4(
+                (json.dumps(document, sort_keys=True) + "\n").encode("ascii")
+            )
+
+    def test_rejects_mutated_environment_digest(self) -> None:
+        fields = _v4_summary_fields("/runs/manual-x")
+        data = manual_summary_v4_bytes(**fields)
+        document = json.loads(data)
+        document["environment_control"]["initial_qpos_sha256"] = "z" * 64
+        with self.assertRaisesRegex(ContractError, "initial_qpos_sha256"):
+            parse_manual_summary_v4(
+                (json.dumps(document, sort_keys=True) + "\n").encode("ascii")
+            )
+
+    def test_rejects_unknown_top_level_field(self) -> None:
+        fields = _v4_summary_fields("/runs/manual-x")
+        data = manual_summary_v4_bytes(**fields)
+        document = json.loads(data)
+        document["surprise"] = 1
+        with self.assertRaisesRegex(ContractError, "manual summary"):
+            parse_manual_summary_v4(
+                (json.dumps(document, sort_keys=True) + "\n").encode("ascii")
+            )
 
 
 def _npz_bytes(buffer: CanonicalTargetBuffer) -> bytes:

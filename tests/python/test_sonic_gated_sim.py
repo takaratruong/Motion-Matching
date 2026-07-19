@@ -1083,7 +1083,11 @@ class ExternalGearBackendBoundaryTests(unittest.TestCase):
             sim_env=SimpleNamespace(
                 mj_model=model,
                 mj_data=data,
-                elastic_band=SimpleNamespace(enable=False),
+                elastic_band=SimpleNamespace(
+                    enable=False,
+                    point=np.array([0.0, 0.0, 1.0], dtype=np.float64),
+                    kp_ang=1000.0,
+                ),
             )
         )
         initial = np.zeros(36, dtype=np.float64)
@@ -1136,7 +1140,11 @@ class ExternalGearBackendBoundaryTests(unittest.TestCase):
         return backend, events
 
     def test_external_reset_applies_band_state_before_mujoco_reset(self):
-        band = SimpleNamespace(enable=True)
+        band = SimpleNamespace(
+            enable=True,
+            point=np.array([0.0, 0.0, 1.0], dtype=np.float64),
+            kp_ang=1000.0,
+        )
         backend, events = self._band_backend(band)
         qpos = np.r_[np.zeros(3), 1.0, np.zeros(32)]
 
@@ -1151,6 +1159,33 @@ class ExternalGearBackendBoundaryTests(unittest.TestCase):
         )
         self.assertTrue(band.enable)
         self.assertEqual(events[2], ("reset", True))
+
+    def test_external_reset_centers_enabled_band_on_physical_spawn_xy(self):
+        band = SimpleNamespace(
+            enable=False,
+            point=np.array([0.0, 0.0, 1.0], dtype=np.float64),
+            kp_ang=1000.0,
+        )
+        backend, _events = self._band_backend(band)
+        qpos = np.r_[
+            np.array([1.2, -0.4, 0.81, 1.0, 0.0, 0.0, 0.0]),
+            np.zeros(29),
+        ]
+
+        backend.reset_from_qpos(
+            qpos,
+            lateral_offset_m=0.09,
+            yaw_offset_rad=0.0,
+            elastic_band_enabled=True,
+        )
+
+        np.testing.assert_allclose(
+            band.point,
+            [1.2, -0.31, 1.0],
+            rtol=0.0,
+            atol=1.0e-15,
+        )
+        self.assertEqual(band.kp_ang, 0.0)
 
     def test_external_reset_rejects_missing_band_or_nonboolean_state(self):
         qpos = np.r_[np.zeros(3), 1.0, np.zeros(32)]

@@ -1059,6 +1059,39 @@ class ExternalGearBackend:
             raise ProtocolError(
                 "pinned simulator is missing its elastic_band object"
             )
+        try:
+            angular_gain = float(band.kp_ang)
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ProtocolError(
+                "pinned simulator elastic_band angular gain is invalid"
+            ) from error
+        if not math.isfinite(angular_gain) or angular_gain < 0.0:
+            raise ProtocolError(
+                "pinned simulator elastic_band angular gain is invalid"
+            )
+        if not hasattr(self, "_elastic_band_angular_gain"):
+            self._elastic_band_angular_gain = angular_gain
+        if elastic_band_enabled:
+            try:
+                anchor = np.asarray(band.point, dtype=np.float64)
+            except (AttributeError, TypeError, ValueError) as error:
+                raise ProtocolError(
+                    "pinned simulator elastic_band point is invalid"
+                ) from error
+            if anchor.shape != (3,) or not np.all(np.isfinite(anchor)):
+                raise ProtocolError(
+                    "pinned simulator elastic_band point is invalid"
+                )
+            translated_anchor = anchor.copy()
+            translated_anchor[:2] = physical[:2]
+            band.point = translated_anchor
+            # The upstream spring is hard-coded to world-identity orientation.
+            # That is valid only for flat identity-yaw starts; an authenticated
+            # route may begin at any heading. Keep angular damping, but remove
+            # the invalid absolute-orientation spring during bootstrap.
+            band.kp_ang = 0.0
+        else:
+            band.kp_ang = self._elastic_band_angular_gain
         band.enable = elastic_band_enabled
         self._bindings.mujoco.mj_resetData(self.model, self.data)
         self.data.qpos[:] = physical

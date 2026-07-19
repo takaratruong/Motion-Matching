@@ -35,6 +35,8 @@ from .zmq_v1 import decode_pose_v1
 
 
 MANUAL_COMMAND_SCHEMA = "mm-sonic-manual-command/v3"
+MANUAL_MAPPER_VERSION = "holden-control/v1"
+_MANUAL_INPUT_SOURCES = ("x11", "terminal")
 _MANUAL_MODES = ("script", "interactive")
 _TARGET_RATE_HZ = 50.0
 _HEADING_TOLERANCE_RAD = 1.0e-6
@@ -856,6 +858,350 @@ def _validate_scene_control(value: object) -> dict[str, str]:
                 f"manual summary scene control {key} must be a lowercase SHA-256"
             )
     return mapping
+
+
+_ENVIRONMENT_CONTROL_KEYS = {
+    "scene_id",
+    "route_id",
+    "terrain_weight",
+    "input_source",
+    "mapper_version",
+    "camera_sequence",
+    "mm_hello_identity",
+    "mm_scene_identity",
+    "source_hashes",
+    "output_hashes",
+    "coordinate_source",
+    "coordinate_target",
+    "transform_matrix",
+    "source_bounds_holden",
+    "transformed_bounds_mujoco",
+    "initial_boundary_sha256",
+    "initial_qpos_sha256",
+}
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(character in _SHA256_PATTERN for character in value)
+    )
+
+
+def _validate_digest(value: object, label: str) -> str:
+    if not _is_sha256(value):
+        raise ContractError(f"environment control {label} must be a lowercase SHA-256")
+    return value
+
+
+def _validate_nonempty_str(value: object, label: str) -> str:
+    if type(value) is not str or not value:
+        raise ContractError(f"environment control {label} must be a nonempty string")
+    return value
+
+
+def _validate_finite_float(value: object, label: str) -> float:
+    if (
+        type(value) not in (int, float)
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+    ):
+        raise ContractError(f"environment control {label} must be a finite number")
+    return float(value)
+
+
+def _validate_finite_matrix(
+    value: object, rows: int, cols: int, label: str
+) -> list[list[float]]:
+    if type(value) is not list or len(value) != rows:
+        raise ContractError(f"environment control {label} must be a {rows}x{cols} array")
+    result: list[list[float]] = []
+    for row in value:
+        if type(row) is not list or len(row) != cols:
+            raise ContractError(
+                f"environment control {label} must be a {rows}x{cols} array"
+            )
+        result.append([_validate_finite_float(entry, label) for entry in row])
+    return result
+
+
+def _validate_hash_mapping(value: object, label: str) -> dict[str, str]:
+    if type(value) is not dict or not value:
+        raise ContractError(f"environment control {label} must be a nonempty object")
+    result: dict[str, str] = {}
+    for key, digest in value.items():
+        if type(key) is not str or not key:
+            raise ContractError(f"environment control {label} keys must be strings")
+        result[key] = _validate_digest(digest, f"{label}.{key}")
+    return result
+
+
+def _validate_identity_mapping(value: object, label: str) -> dict[str, object]:
+    if type(value) is not dict or not value:
+        raise ContractError(f"environment control {label} must be a nonempty object")
+    for key in value:
+        if type(key) is not str or not key:
+            raise ContractError(f"environment control {label} keys must be strings")
+    return dict(value)
+
+
+def _validate_environment_control(mapping: dict) -> dict[str, object]:
+    """Validate every bound field of one environment_control object."""
+
+    validated: dict[str, object] = {
+        "scene_id": _validate_nonempty_str(mapping["scene_id"], "scene_id"),
+        "route_id": _validate_nonempty_str(mapping["route_id"], "route_id"),
+        "terrain_weight": _validate_finite_float(
+            mapping["terrain_weight"], "terrain_weight"
+        ),
+        "mapper_version": _validate_nonempty_str(
+            mapping["mapper_version"], "mapper_version"
+        ),
+        "coordinate_source": _validate_nonempty_str(
+            mapping["coordinate_source"], "coordinate_source"
+        ),
+        "coordinate_target": _validate_nonempty_str(
+            mapping["coordinate_target"], "coordinate_target"
+        ),
+        "transform_matrix": _validate_finite_matrix(
+            mapping["transform_matrix"], 3, 3, "transform_matrix"
+        ),
+        "source_bounds_holden": _validate_finite_matrix(
+            mapping["source_bounds_holden"], 2, 3, "source_bounds_holden"
+        ),
+        "transformed_bounds_mujoco": _validate_finite_matrix(
+            mapping["transformed_bounds_mujoco"], 2, 3, "transformed_bounds_mujoco"
+        ),
+        "mm_hello_identity": _validate_identity_mapping(
+            mapping["mm_hello_identity"], "mm_hello_identity"
+        ),
+        "mm_scene_identity": _validate_identity_mapping(
+            mapping["mm_scene_identity"], "mm_scene_identity"
+        ),
+        "source_hashes": _validate_hash_mapping(
+            mapping["source_hashes"], "source_hashes"
+        ),
+        "output_hashes": _validate_hash_mapping(
+            mapping["output_hashes"], "output_hashes"
+        ),
+        "initial_boundary_sha256": _validate_digest(
+            mapping["initial_boundary_sha256"], "initial_boundary_sha256"
+        ),
+        "initial_qpos_sha256": _validate_digest(
+            mapping["initial_qpos_sha256"], "initial_qpos_sha256"
+        ),
+    }
+    if mapping["input_source"] not in _MANUAL_INPUT_SOURCES:
+        raise ContractError("environment control input_source is unsupported")
+    validated["input_source"] = mapping["input_source"]
+    camera_sequence = mapping["camera_sequence"]
+    if type(camera_sequence) is not int or camera_sequence < 0:
+        raise ContractError(
+            "environment control camera_sequence must be a nonnegative integer"
+        )
+    validated["camera_sequence"] = camera_sequence
+    return validated
+
+
+def environment_control_record(
+    *,
+    scene_id: str,
+    route_id: str,
+    terrain_weight: float,
+    input_source: str,
+    mapper_version: str,
+    camera_sequence: int,
+    mm_hello_identity: dict,
+    mm_scene_identity: dict,
+    source_hashes: dict,
+    output_hashes: dict,
+    coordinate_source: str,
+    coordinate_target: str,
+    transform_matrix: object,
+    source_bounds_holden: object,
+    transformed_bounds_mujoco: object,
+    initial_boundary_sha256: str,
+    initial_qpos_sha256: str,
+) -> dict[str, object]:
+    """Build one validated ``environment_control`` object for a v4 terrain run."""
+
+    return _validate_environment_control(
+        {
+            "scene_id": scene_id,
+            "route_id": route_id,
+            "terrain_weight": terrain_weight,
+            "input_source": input_source,
+            "mapper_version": mapper_version,
+            "camera_sequence": camera_sequence,
+            "mm_hello_identity": mm_hello_identity,
+            "mm_scene_identity": mm_scene_identity,
+            "source_hashes": source_hashes,
+            "output_hashes": output_hashes,
+            "coordinate_source": coordinate_source,
+            "coordinate_target": coordinate_target,
+            "transform_matrix": transform_matrix,
+            "source_bounds_holden": source_bounds_holden,
+            "transformed_bounds_mujoco": transformed_bounds_mujoco,
+            "initial_boundary_sha256": initial_boundary_sha256,
+            "initial_qpos_sha256": initial_qpos_sha256,
+        }
+    )
+
+
+def parse_environment_control(value: object) -> dict[str, object]:
+    """Strictly parse one ``environment_control`` object, rejecting tampering."""
+
+    mapping = _require_keys(value, _ENVIRONMENT_CONTROL_KEYS, "environment control")
+    return _validate_environment_control(mapping)
+
+
+_MANUAL_SUMMARY_V4_SCHEMA = "mm-sonic-manual-demo/v4"
+_MANUAL_SUMMARY_V4_KEYS = {
+    "schema",
+    "mode",
+    "run_root",
+    "preload_chunks",
+    "generated_chunks",
+    "lookahead_seconds",
+    "command_artifact",
+    "hand_control",
+    "environment_control",
+    "snapshot",
+}
+_SNAPSHOT_KEYS = {"contact_rows", "sim_time_s", "state_rows", "steps"}
+
+
+def _validate_snapshot(value: object) -> dict[str, object]:
+    snapshot = _require_keys(value, _SNAPSHOT_KEYS, "manual summary snapshot")
+    for key in ("contact_rows", "state_rows", "steps"):
+        if type(snapshot[key]) is not int or snapshot[key] < 0:
+            raise ContractError(
+                f"manual summary snapshot {key} must be a nonnegative integer"
+            )
+    sim_time = snapshot["sim_time_s"]
+    if (
+        type(sim_time) not in (int, float)
+        or isinstance(sim_time, bool)
+        or not math.isfinite(float(sim_time))
+    ):
+        raise ContractError("manual summary snapshot sim_time_s must be finite")
+    return dict(snapshot)
+
+
+def manual_summary_v4_bytes(
+    *,
+    mode: str,
+    run_root: str,
+    preload_chunks: int,
+    generated_chunks: int,
+    lookahead_seconds: float,
+    command_bytes: bytes,
+    hand_targets: Dex3HandTargets,
+    environment_control: dict,
+    snapshot: dict,
+) -> bytes:
+    """Serialize one strict ``mm-sonic-manual-demo/v4`` terrain summary."""
+
+    validated_mode = _validated_mode(mode)
+    if type(run_root) is not str or not run_root:
+        raise ContractError("manual summary run_root must be a nonempty string")
+    if type(preload_chunks) is not int or preload_chunks < 0:
+        raise ContractError("manual summary preload_chunks must be nonnegative")
+    if type(generated_chunks) is not int or generated_chunks < preload_chunks:
+        raise ContractError(
+            "manual summary generated_chunks must be at least preload_chunks"
+        )
+    if (
+        type(lookahead_seconds) not in (int, float)
+        or isinstance(lookahead_seconds, bool)
+        or not math.isfinite(float(lookahead_seconds))
+    ):
+        raise ContractError("manual summary lookahead_seconds must be finite")
+    if not isinstance(command_bytes, (bytes, bytearray, memoryview)):
+        raise ContractError("manual summary command_bytes must be bytes")
+    document = {
+        "schema": _MANUAL_SUMMARY_V4_SCHEMA,
+        "mode": validated_mode,
+        "run_root": run_root,
+        "preload_chunks": preload_chunks,
+        "generated_chunks": generated_chunks,
+        "lookahead_seconds": float(lookahead_seconds),
+        "command_artifact": {
+            "path": "manual-commands.json",
+            "sha256": hashlib.sha256(bytes(command_bytes)).hexdigest(),
+        },
+        "hand_control": hand_targets_record(hand_targets),
+        "environment_control": _validate_environment_control(
+            dict(_require_keys(
+                environment_control,
+                _ENVIRONMENT_CONTROL_KEYS,
+                "environment control",
+            ))
+        ),
+        "snapshot": _validate_snapshot(snapshot),
+    }
+    try:
+        return (
+            json.dumps(document, sort_keys=True, indent=2) + "\n"
+        ).encode("ascii")
+    except (TypeError, ValueError) as error:
+        raise ContractError("manual summary v4 cannot be serialized") from error
+
+
+def parse_manual_summary_v4(
+    data: bytes | bytearray | memoryview,
+) -> dict[str, object]:
+    """Strictly parse one ``mm-sonic-manual-demo/v4`` terrain summary."""
+
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        raise ContractError("manual summary must be bytes")
+    document = _json_object(bytes(data), label="manual summary")
+    root = _require_keys(document, _MANUAL_SUMMARY_V4_KEYS, "manual summary")
+    if root["schema"] != _MANUAL_SUMMARY_V4_SCHEMA:
+        raise ContractError("manual summary has an unsupported schema")
+    mode = _validated_mode(root["mode"])
+    if type(root["run_root"]) is not str or not root["run_root"]:
+        raise ContractError("manual summary run_root must be a nonempty string")
+    if type(root["preload_chunks"]) is not int or root["preload_chunks"] < 0:
+        raise ContractError("manual summary preload_chunks must be nonnegative")
+    if (
+        type(root["generated_chunks"]) is not int
+        or root["generated_chunks"] < root["preload_chunks"]
+    ):
+        raise ContractError("manual summary generated_chunks is invalid")
+    lookahead = root["lookahead_seconds"]
+    if (
+        type(lookahead) not in (int, float)
+        or isinstance(lookahead, bool)
+        or not math.isfinite(float(lookahead))
+    ):
+        raise ContractError("manual summary lookahead_seconds must be finite")
+    command = _require_keys(
+        root["command_artifact"], {"path", "sha256"}, "manual summary command artifact"
+    )
+    if command["path"] != "manual-commands.json" or not _is_sha256(
+        command["sha256"]
+    ):
+        raise ContractError("manual summary command artifact identity is invalid")
+    hand_targets = parse_hand_targets_record(root["hand_control"])
+    environment_control = parse_environment_control(root["environment_control"])
+    snapshot = _validate_snapshot(root["snapshot"])
+    return {
+        "schema": _MANUAL_SUMMARY_V4_SCHEMA,
+        "mode": mode,
+        "run_root": root["run_root"],
+        "preload_chunks": root["preload_chunks"],
+        "generated_chunks": root["generated_chunks"],
+        "lookahead_seconds": float(lookahead),
+        "command_artifact": {
+            "path": command["path"],
+            "sha256": command["sha256"],
+        },
+        "hand_control": hand_targets_record(hand_targets),
+        "environment_control": environment_control,
+        "snapshot": snapshot,
+    }
 
 
 def _validate_summary(

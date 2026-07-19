@@ -65,6 +65,22 @@ class HoldenControlMapperTests(unittest.TestCase):
             mapped.desired_heading_mujoco_wxyz, (1.0, 0.0, 0.0, 0.0)
         )
 
+    def test_physical_to_virtual_heading_offset_does_not_rotate_forward_velocity(self) -> None:
+        mapper = HoldenControlMapper(
+            initial_heading_yaw_rad=-math.pi / 2.0,
+            heading_frame_offset_yaw_rad=-math.pi / 2.0,
+        )
+
+        mapped = mapper.update(
+            NormalizedControlState(left_z=-1.0),
+            0.02,
+        )
+
+        self.assertAlmostEqual(mapped.velocity_mujoco[0], 0.0, places=6)
+        self.assertAlmostEqual(mapped.velocity_mujoco[1], -0.9, places=6)
+        self.assertAlmostEqual(mapped.desired_heading_mujoco_wxyz[0], 1.0, places=6)
+        self.assertAlmostEqual(mapped.desired_heading_mujoco_wxyz[3], 0.0, places=6)
+
     def test_shift_converges_to_registered_walk_speeds(self) -> None:
         mapper = HoldenControlMapper(initial_heading_yaw_rad=0.0)
         mapped = None

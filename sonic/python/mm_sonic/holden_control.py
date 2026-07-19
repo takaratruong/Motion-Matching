@@ -124,11 +124,13 @@ class HoldenControlMapper:
         self,
         *,
         initial_heading_yaw_rad: float,
+        heading_frame_offset_yaw_rad: float = 0.0,
         initial_altitude_rad: float = 0.4,
         initial_distance_m: float = 3.0,
     ) -> None:
         values = (
             initial_heading_yaw_rad,
+            heading_frame_offset_yaw_rad,
             initial_altitude_rad,
             initial_distance_m,
         )
@@ -138,6 +140,7 @@ class HoldenControlMapper:
         ):
             raise ContractError("Holden control initial state must be finite")
         self._desired_yaw = float(initial_heading_yaw_rad)
+        self._heading_frame_offset = float(heading_frame_offset_yaw_rad)
         self._camera_azimuth = float(initial_heading_yaw_rad)
         self._camera_altitude = min(max(float(initial_altitude_rad), 0.0), 0.4 * math.pi)
         self._camera_distance = min(max(float(initial_distance_m), 0.1), 100.0)
@@ -245,7 +248,11 @@ class HoldenControlMapper:
         if state.stand:
             velocity_x = 0.0
             velocity_y = 0.0
-        half = 0.5 * self._desired_yaw
+        command_yaw = math.remainder(
+            self._desired_yaw - self._heading_frame_offset,
+            2.0 * math.pi,
+        )
+        half = 0.5 * command_yaw
         return MappedControlState(
             velocity_mujoco=(velocity_x, velocity_y, 0.0),
             desired_heading_mujoco_wxyz=(
