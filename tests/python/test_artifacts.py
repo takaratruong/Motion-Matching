@@ -17,7 +17,6 @@ import numpy as np
 from resources.g1_terrain_builder import artifacts as artifacts_module
 from resources.g1_terrain_builder.artifacts import (
     SUPPORT_COLUMNS,
-    publish_artifacts,
     read_support_sidecar,
     read_terrain_sidecar,
     read_walkability,
@@ -28,6 +27,11 @@ from resources.g1_terrain_builder.artifacts import (
     write_terrain_sidecar,
     write_walkability,
 )
+from resources.g1_terrain_builder.motion_index import (
+    DIRECTION_IDLE,
+    MotionIndex,
+    SPEED_LOW,
+)
 from resources.g1_terrain_builder.scenes import (
     REQUIRED_SCENE_IDS,
     BuiltScene,
@@ -37,7 +41,13 @@ from resources.g1_terrain_builder.scenes import (
     build_scene_pack,
     canonical_json_bytes as scene_json_bytes,
 )
-from resources.g1_terrain_builder.schema import ArtifactSet
+from resources.g1_terrain_builder.schema import (
+    ArtifactSet,
+    SourceFrameRange,
+    TERRAIN_FAMILIES,
+    TerrainBank,
+    TerrainBankIndex,
+)
 from resources.g1_terrain_builder.terrain import (
     FlatTerrain,
     surface_semantics,
@@ -81,10 +91,10 @@ def tiny_scene_pack():
 def tiny_manifest_base(artifacts, *, diagnostic_mode=True):
     frames = len(artifacts.positions)
     return {
-        "schema": "g1-terrain-artifacts/v2",
+        "schema": "g1-terrain-artifacts/v3",
         "output_fps": 25.0,
-        "feature_dimensions": 31,
-        "terrain_dimensions": 4,
+        "feature_dimensions": 39,
+        "terrain_dimensions": 12,
         "support_dimensions": 3,
         "terrain_feature_distances_m": [0.25, 0.5, 0.75, 1.0],
         "total_clips": 1,
@@ -94,6 +104,7 @@ def tiny_manifest_base(artifacts, *, diagnostic_mode=True):
         "diagnostic_mode": diagnostic_mode,
         "sources": [{
             "name": "fixture", "terrain_id": "flat", "source_fps": 25.0,
+            "terrain_family": "flat",
             "source_frames": frames, "output_frames": frames,
             "range_start": 0, "range_stop": frames,
             "source_frame_map": list(range(frames)),
@@ -119,6 +130,51 @@ def tiny_manifest_base(artifacts, *, diagnostic_mode=True):
     }
 
 
+def tiny_motion_indexes(artifacts, manifest_base=None):
+    if manifest_base is None:
+        manifest_base = tiny_manifest_base(artifacts)
+    ranges = tuple(
+        SourceFrameRange(
+            source_name=source["name"],
+            source_start=0,
+            source_stop=source["output_frames"],
+            source_frame_count=source["output_frames"],
+            global_start=source["range_start"],
+            global_stop=source["range_stop"],
+        )
+        for source in manifest_base["sources"]
+    )
+    range_indices = {family: [] for family in TERRAIN_FAMILIES}
+    for index, source in enumerate(manifest_base["sources"]):
+        range_indices[source["terrain_family"]].append(index)
+    banks = tuple(
+        TerrainBank(family, tuple(range_indices[family]))
+        for family in TERRAIN_FAMILIES
+    )
+    frame_count = len(artifacts.positions)
+    motion_index = MotionIndex(
+        np.full(frame_count, DIRECTION_IDLE, np.uint16),
+        np.full(frame_count, SPEED_LOW, np.uint8),
+        np.zeros(frame_count, np.int8),
+    )
+    return motion_index, TerrainBankIndex(frame_count, ranges, banks)
+
+
+def publish_artifacts(
+    output_dir, artifacts, manifest_base, scene_pack, validate_candidate,
+):
+    """Task-6 test helper supplying explicit index/bank candidates."""
+    try:
+        motion_index, terrain_banks = tiny_motion_indexes(
+            artifacts, manifest_base)
+    except (KeyError, TypeError, ValueError):
+        motion_index, terrain_banks = tiny_motion_indexes(artifacts)
+    return artifacts_module.publish_artifacts(
+        output_dir, artifacts, manifest_base, scene_pack,
+        motion_index, terrain_banks, validate_candidate,
+    )
+
+
 def file_sha256(path):
     with open(path, "rb") as stream:
         return hashlib.sha256(stream.read()).hexdigest()
@@ -142,9 +198,9 @@ def repack_with_scene_metadata(pack, mutation):
 class ArtifactTests(unittest.TestCase):
 
     def test_terrain_sidecar_round_trip_is_exact_little_endian(self):
-        features = np.arange(20, dtype=np.float32).reshape(5, 4)
+        features = np.arange(60, dtype=np.float32).reshape(5, 12)
         expected = (
-            struct.pack("<4sIII", b"G1TF", 1, 5, 4)
+            struct.pack("<4sIII", b"G1TF", 2, 5, 12)
             + features.astype("<f4").tobytes()
         )
         with tempfile.TemporaryDirectory() as temporary:
@@ -162,21 +218,21 @@ class ArtifactTests(unittest.TestCase):
 
     def test_terrain_sidecar_writer_rejects_invalid_values_and_shapes(self):
         cases = (
-            (np.zeros((0, 4), np.float32), "finite.*\\(N, 4\\)"),
-            (np.zeros((2, 3), np.float32), "finite.*\\(N, 4\\)"),
-            (np.zeros((2, 4, 1), np.float32), "finite.*\\(N, 4\\)"),
-            (np.full((2, 4), np.nan), "finite"),
-            (np.full((2, 4), np.inf), "finite"),
-            (np.ones((2, 4), np.float16), "float32 or float64"),
-            (np.ones((2, 4), np.int32), "float32 or float64"),
-            (np.ones((2, 4), np.bool_), "float32 or float64"),
-            (np.full((2, 4), "1.0", dtype="<U3"), "float32 or float64"),
+            (np.zeros((0, 12), np.float32), "finite.*\\(N, 12\\)"),
+            (np.zeros((2, 11), np.float32), "finite.*\\(N, 12\\)"),
+            (np.zeros((2, 12, 1), np.float32), "finite.*\\(N, 12\\)"),
+            (np.full((2, 12), np.nan), "finite"),
+            (np.full((2, 12), np.inf), "finite"),
+            (np.ones((2, 12), np.float16), "float32 or float64"),
+            (np.ones((2, 12), np.int32), "float32 or float64"),
+            (np.ones((2, 12), np.bool_), "float32 or float64"),
+            (np.full((2, 12), "1.0", dtype="<U3"), "float32 or float64"),
             (
-                np.ones((2, 4), np.complex64) * (1 + 1j),
+                np.ones((2, 12), np.complex64) * (1 + 1j),
                 "float32 or float64",
             ),
-            (np.ones((2, 4), dtype=object), "float32 or float64"),
-            (np.full((2, 4), 1.0e300, np.float64), "float32"),
+            (np.ones((2, 12), dtype=object), "float32 or float64"),
+            (np.full((2, 12), 1.0e300, np.float64), "float32"),
         )
         with tempfile.TemporaryDirectory() as temporary:
             path = os.path.join(temporary, "terrain_features.bin")
@@ -188,15 +244,14 @@ class ArtifactTests(unittest.TestCase):
                             write_terrain_sidecar(path, features)
 
     def test_float_matrix_codec_allows_finite_float64_rounding(self):
-        features = np.array(
-            [
-                [1.0 / 3.0, -1.0 / 7.0, 1.0e-20, -1.0e20],
-                [np.pi, -np.e, 0.0, np.finfo(np.float32).max],
-            ],
-            dtype=np.float64,
-        )
+        row = [
+            1.0 / 3.0, -1.0 / 7.0, 1.0e-20, -1.0e20,
+            np.pi, -np.e, 0.0, np.finfo(np.float32).max,
+            1.0, -2.0, 3.0, -4.0,
+        ]
+        features = np.array([row, list(reversed(row))], dtype=np.float64)
         expected = (
-            struct.pack("<4sIII", b"G1TF", 1, 2, 4)
+            struct.pack("<4sIII", b"G1TF", 2, 2, 12)
             + features.astype("<f4").tobytes(order="C")
         )
         with warnings.catch_warnings():
@@ -213,35 +268,35 @@ class ArtifactTests(unittest.TestCase):
 
     def test_terrain_sidecar_reader_rejects_corrupt_schema_and_payload(self):
         valid = (
-            struct.pack("<4sIII", b"G1TF", 1, 2, 4)
-            + np.zeros((2, 4), "<f4").tobytes()
+            struct.pack("<4sIII", b"G1TF", 2, 2, 12)
+            + np.zeros((2, 12), "<f4").tobytes()
         )
         corruptions = (
             ("header", valid[:8], "truncated"),
             ("magic", b"BAD!" + valid[4:], "schema"),
             (
                 "version",
-                struct.pack("<4sIII", b"G1TF", 2, 2, 4) + valid[16:],
+                struct.pack("<4sIII", b"G1TF", 1, 2, 12) + valid[16:],
                 "schema",
             ),
             (
                 "dims",
-                struct.pack("<4sIII", b"G1TF", 1, 2, 3) + valid[16:],
+                struct.pack("<4sIII", b"G1TF", 2, 2, 11) + valid[16:],
                 "schema",
             ),
             ("payload", valid[:-1], "truncated"),
             ("trailing", valid + b"x", "trailing"),
-            ("empty", struct.pack("<4sIII", b"G1TF", 1, 0, 4), "invalid"),
+            ("empty", struct.pack("<4sIII", b"G1TF", 2, 0, 12), "invalid"),
             (
                 "nan",
-                struct.pack("<4sIII", b"G1TF", 1, 1, 4)
-                + np.full((1, 4), np.nan, "<f4").tobytes(),
+                struct.pack("<4sIII", b"G1TF", 2, 1, 12)
+                + np.full((1, 12), np.nan, "<f4").tobytes(),
                 "finite",
             ),
             (
                 "inf",
-                struct.pack("<4sIII", b"G1TF", 1, 1, 4)
-                + np.full((1, 4), np.inf, "<f4").tobytes(),
+                struct.pack("<4sIII", b"G1TF", 2, 1, 12)
+                + np.full((1, 12), np.inf, "<f4").tobytes(),
                 "finite",
             ),
         )
@@ -372,6 +427,24 @@ class ArtifactTests(unittest.TestCase):
             ):
                 read_support_sidecar(path)
 
+    def test_terrain_writer_rejects_platform_overflow_before_open(self):
+        sentinel = b"last-good-terrain-sidecar"
+        with tempfile.TemporaryDirectory() as temporary:
+            path = os.path.join(temporary, "terrain_features.bin")
+            with open(path, "wb") as stream:
+                stream.write(sentinel)
+            simulated_iinfo = mock.Mock(max=47)
+            with (
+                mock.patch.object(
+                    artifacts_module.np, "iinfo",
+                    return_value=simulated_iinfo,
+                ),
+                self.assertRaisesRegex(ValueError, "platform index limit"),
+            ):
+                write_terrain_sidecar(path, np.zeros((1, 12), np.float32))
+            with open(path, "rb") as stream:
+                self.assertEqual(stream.read(), sentinel)
+
     def test_walkability_round_trip_is_exact_little_endian_row_major(self):
         walkability = np.array([[0, 1, 2], [2, 1, 0]], dtype=np.uint8)
         expected = (
@@ -484,7 +557,7 @@ class ArtifactTests(unittest.TestCase):
     def test_invalid_serializers_do_not_truncate_existing_files(self):
         sentinel = b"last-good-sidecar"
         cases = (
-            (write_terrain_sidecar, np.full((2, 4), np.nan)),
+            (write_terrain_sidecar, np.full((2, 12), np.nan)),
             (
                 write_support_sidecar,
                 np.ones((2, 3), np.complex64) * (1 + 1j),
@@ -502,7 +575,7 @@ class ArtifactTests(unittest.TestCase):
                     with open(path, "rb") as stream:
                         self.assertEqual(stream.read(), sentinel)
 
-class ArtifactPublicationV2Tests(unittest.TestCase):
+class ArtifactPublicationV3Tests(unittest.TestCase):
     def _scratch(self, parent, output):
         prefix = f".{os.path.basename(output)}.staging-"
         return sorted(
@@ -518,22 +591,24 @@ class ArtifactPublicationV2Tests(unittest.TestCase):
             stream.write(b"last-good")
         return output
 
-    def test_v2_publish_api_has_explicit_candidate_validator(self):
-        parameters = inspect.signature(publish_artifacts).parameters
+    def test_v3_publish_api_requires_explicit_indexes_and_candidate_validator(self):
+        parameters = inspect.signature(
+            artifacts_module.publish_artifacts).parameters
         self.assertEqual(tuple(parameters), (
             "output_dir", "artifacts", "manifest_base", "scene_pack",
-            "validate_candidate",
+            "motion_index", "terrain_banks", "validate_candidate",
         ))
         self.assertIs(
             parameters["validate_candidate"].default,
             inspect.Parameter.empty,
         )
         with self.assertRaises(TypeError):
-            publish_artifacts(None, None, None, None)
+            artifacts_module.publish_artifacts(
+                None, None, None, None, None, None)
 
     def test_publish_writes_exact_complete_tree_and_final_hash_manifest(self):
         artifacts = ArtifactSet.empty(4, 2)
-        artifacts.terrain_features[:] = np.arange(16).reshape(4, 4)
+        artifacts.terrain_features[:] = np.arange(48).reshape(4, 12)
         artifacts.terrain_support[:] = np.arange(12).reshape(4, 3)
         pack = tiny_scene_pack()
         validated = []
@@ -549,7 +624,7 @@ class ArtifactPublicationV2Tests(unittest.TestCase):
             self.assertNotEqual(validated[0], output)
             self.assertEqual(set(os.listdir(output)), {
                 "database.bin", "terrain_features.bin", "terrain_support.bin",
-                "manifest.json", "validation.json", "scenes",
+                "motion_index.bin", "manifest.json", "validation.json", "scenes",
             })
             scenes_root = os.path.join(output, "scenes")
             self.assertEqual(
@@ -575,6 +650,26 @@ class ArtifactPublicationV2Tests(unittest.TestCase):
                 file_sha256(os.path.join(output, "terrain_support.bin")),
             )
             self.assertEqual(
+                manifest["motion_index"]["sha256"],
+                file_sha256(os.path.join(output, "motion_index.bin")),
+            )
+            self.assertEqual(
+                set(manifest["motion_index"]),
+                {"path", "schema", "version", "frame_count", "row_width", "sha256"},
+            )
+            self.assertEqual(
+                set(manifest["motion_banks"]),
+                {"schema", "frame_count", "ranges", "banks", "sha256"},
+            )
+            bank_payload = dict(manifest["motion_banks"])
+            bank_digest = bank_payload.pop("sha256")
+            self.assertEqual(
+                bank_digest,
+                hashlib.sha256(
+                    artifacts_module.canonical_json_bytes(bank_payload)
+                ).hexdigest(),
+            )
+            self.assertEqual(
                 manifest["scene_index"]["sha256"],
                 file_sha256(os.path.join(scenes_root, "index.json")),
             )
@@ -586,6 +681,67 @@ class ArtifactPublicationV2Tests(unittest.TestCase):
                 self.assertEqual(stream.read(), scene_json_bytes(manifest))
             with open(os.path.join(scenes_root, "index.json"), "rb") as stream:
                 self.assertEqual(stream.read(), pack.index_json)
+            self.assertEqual(self._scratch(temporary, output), [])
+
+    def test_index_and_bank_candidates_are_validated_before_staging(self):
+        artifacts = ArtifactSet.empty(4, 2)
+        base = tiny_manifest_base(artifacts)
+        motion_index, terrain_banks = tiny_motion_indexes(artifacts, base)
+        short_index = MotionIndex(
+            motion_index.direction_masks[:-1],
+            motion_index.speed_masks[:-1],
+            motion_index.elevation_modes[:-1],
+        )
+        mismatched_range = SourceFrameRange(
+            "fixture", 0, 4, 4, 0, 3)
+        bad_banks = TerrainBankIndex(
+            4,
+            (mismatched_range,),
+            tuple(
+                TerrainBank(family, (0,) if family == "flat" else ())
+                for family in TERRAIN_FAMILIES
+            ),
+        )
+        for name, candidate_index, candidate_banks, message in (
+            (
+                "index-count", short_index, terrain_banks,
+                "motion index frame count",
+            ),
+            (
+                "bank-range", motion_index, bad_banks,
+                "range lengths differ|source range",
+            ),
+        ):
+            with (
+                self.subTest(name=name),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                output = self._old_output(temporary)
+                with self.assertRaisesRegex(ValueError, message):
+                    artifacts_module.publish_artifacts(
+                        output, artifacts, base, tiny_scene_pack(),
+                        candidate_index, candidate_banks, lambda path: None,
+                    )
+                self.assertEqual(os.listdir(output), ["old"])
+                self.assertEqual(self._scratch(temporary, output), [])
+
+    def test_post_callback_motion_index_mutation_preserves_previous_output(self):
+        artifacts = ArtifactSet.empty(4, 2)
+        with tempfile.TemporaryDirectory() as temporary:
+            output = self._old_output(temporary)
+
+            def mutate(staging):
+                with open(os.path.join(staging, "motion_index.bin"), "ab") as stream:
+                    stream.write(b"corruption")
+
+            with self.assertRaisesRegex(
+                ValueError, r"motion[ _]index|staged"
+            ):
+                publish_artifacts(
+                    output, artifacts, tiny_manifest_base(artifacts),
+                    tiny_scene_pack(), mutate,
+                )
+            self.assertEqual(os.listdir(output), ["old"])
             self.assertEqual(self._scratch(temporary, output), [])
 
     def test_post_callback_byte_mutation_preserves_previous_output(self):
@@ -1057,7 +1213,7 @@ class ArtifactPublicationV2Tests(unittest.TestCase):
     def test_staged_tree_is_revalidated_under_parent_lock(self):
         artifacts = ArtifactSet.empty(4, 2)
         pack = tiny_scene_pack()
-        real_validate = artifacts_module._validate_staged_v2
+        real_validate = artifacts_module._validate_staged_v3
         calls = 0
         with tempfile.TemporaryDirectory() as temporary:
             output = self._old_output(temporary)
@@ -1072,7 +1228,7 @@ class ArtifactPublicationV2Tests(unittest.TestCase):
                 return real_validate(staging, *arguments)
 
             with mock.patch.object(
-                artifacts_module, "_validate_staged_v2",
+                artifacts_module, "_validate_staged_v3",
                 side_effect=mutate_on_locked_validation,
             ):
                 with self.assertRaisesRegex(ValueError, "tree"):

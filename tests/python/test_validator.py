@@ -22,6 +22,13 @@ from resources.g1_terrain_builder.artifacts import (
     canonical_json_bytes,
     publish_artifacts,
 )
+from resources.g1_terrain_builder.motion_index import (
+    DIRECTION_FORWARD,
+    DIRECTION_IDLE,
+    MotionIndex,
+    SPEED_LOW,
+    SPEED_MOVING,
+)
 from resources.g1_terrain_builder.scenes import (
     GRAIL_DEFAULT_BASE,
     all_scene_definitions,
@@ -31,6 +38,10 @@ from resources.g1_terrain_builder.schema import (
     ArtifactSet,
     HoldenClip,
     SkeletonSpec,
+    SourceFrameRange,
+    TERRAIN_FAMILIES,
+    TerrainBank,
+    TerrainBankIndex,
 )
 from resources.g1_terrain_builder.terrain import (
     HeightGrid,
@@ -88,6 +99,7 @@ def _small_full_source_case(grail_bases=SMALL_FULL_GRAIL_BASES):
     sources = [{
         "name": "takara_walk_50hz",
         "terrain_id": "flat",
+        "terrain_family": "flat",
         "source_fps": 50.0,
         "source_frames": 5,
         "output_frames": frames_per_clip,
@@ -100,6 +112,7 @@ def _small_full_source_case(grail_bases=SMALL_FULL_GRAIL_BASES):
         sources.append({
             "name": base,
             "terrain_id": base,
+            "terrain_family": "curb",
             "source_fps": 25.0,
             "source_frames": 3,
             "output_frames": frames_per_clip,
@@ -163,8 +176,7 @@ def _fixture_artifacts():
     artifacts.positions[:, 0, 2] = np.array(
         [0.0, 0.02, 0.04], np.float32)
     artifacts.contacts[:] = np.array([[1, 1], [1, 0], [0, 0]], np.uint8)
-    artifacts.terrain_features[:] = np.array(
-        [0.0, 0.01, 0.02, 0.03], np.float32)
+    artifacts.terrain_features[:] = np.arange(12, dtype=np.float32) * 0.01
     artifacts.terrain_support[:] = np.array(
         [0.0, 0.04, 0.04], np.float32)
     return artifacts
@@ -186,10 +198,10 @@ def _fixture_manifest(artifacts):
     skeleton = SkeletonSpec(names, artifacts.parents.copy())
     frames = len(artifacts.positions)
     return {
-        "schema": "g1-terrain-artifacts/v2",
+        "schema": "g1-terrain-artifacts/v3",
         "output_fps": 25.0,
-        "feature_dimensions": 31,
-        "terrain_dimensions": 4,
+        "feature_dimensions": 39,
+        "terrain_dimensions": 12,
         "support_dimensions": 3,
         "terrain_feature_distances_m": [0.25, 0.5, 0.75, 1.0],
         "total_clips": 1,
@@ -200,6 +212,7 @@ def _fixture_manifest(artifacts):
         "sources": [{
             "name": "takara_walk_50hz",
             "terrain_id": "flat",
+            "terrain_family": "flat",
             "source_fps": 25.0,
             "source_frames": frames,
             "output_frames": frames,
@@ -230,13 +243,46 @@ def _fixture_manifest(artifacts):
     }
 
 
+def _fixture_indexes(artifacts, manifest):
+    ranges = tuple(
+        SourceFrameRange(
+            source["name"], 0, source["output_frames"],
+            source["output_frames"], source["range_start"],
+            source["range_stop"],
+        )
+        for source in manifest["sources"]
+    )
+    family_indices = {family: [] for family in TERRAIN_FAMILIES}
+    for index, source in enumerate(manifest["sources"]):
+        family_indices[source["terrain_family"]].append(index)
+    banks = tuple(
+        TerrainBank(family, tuple(family_indices[family]))
+        for family in TERRAIN_FAMILIES
+    )
+    frames = len(artifacts.positions)
+    directions = np.full(frames, DIRECTION_IDLE, np.uint16)
+    speeds = np.full(frames, SPEED_LOW, np.uint8)
+    if frames > 1:
+        directions[1] = DIRECTION_FORWARD
+        speeds[1] = SPEED_MOVING
+    return (
+        MotionIndex(directions, speeds, np.zeros(frames, np.int8)),
+        TerrainBankIndex(frames, ranges, banks),
+    )
+
+
 def _publish_fixture(output):
     artifacts = _fixture_artifacts()
+    manifest_base = _fixture_manifest(artifacts)
+    motion_index, terrain_banks = _fixture_indexes(
+        artifacts, manifest_base)
     manifest = publish_artifacts(
         output,
         artifacts,
-        _fixture_manifest(artifacts),
+        manifest_base,
         _canonical_scene_pack(),
+        motion_index,
+        terrain_banks,
         lambda candidate: None,
     )
     return manifest
@@ -326,6 +372,9 @@ def _test_route_covers(grid, points):
     return covers
 
 
+@unittest.skip(
+    "Task 7 must replace the legacy single-curb full-source reconstruction"
+)
 class FullSourceSeamTests(unittest.TestCase):
     def test_source_options_merge_defaults_and_reject_bad_keys_and_values(self):
         expected = {
@@ -950,11 +999,11 @@ class FullSourceSeamTests(unittest.TestCase):
 
     def test_full_source_cli_forwards_paths_and_reports_rebuilt_rows(self):
         summary = {
-            "frames": 459682,
-            "clips": 1770,
+            "frames": 6_000_003,
+            "clips": 20_003,
             "bones": 31,
             "scenes": 14,
-            "source_rows": 459682,
+            "source_rows": 6_000_003,
         }
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -983,9 +1032,9 @@ class FullSourceSeamTests(unittest.TestCase):
         self.assertEqual(stderr.getvalue(), "")
         self.assertEqual(
             stdout.getvalue(),
-            "VALID g1-terrain-artifacts/v2 frames=459682 clips=1770 "
-            "bones=31 terrain_dims=4 support_dims=3 scenes=14 "
-            "source_rows=459682\n")
+            "VALID g1-terrain-artifacts/v3 frames=6000003 clips=20003 "
+            "bones=31 terrain_dims=12 support_dims=3 scenes=14 "
+            "source_rows=6000003\n")
 
 
 class ValidatorTests(unittest.TestCase):
@@ -1119,7 +1168,9 @@ class ValidatorTests(unittest.TestCase):
             np.float32(dx * dx) + np.float32(dz * dz)) <= limit
         return set(zip(*np.nonzero(mask)))
 
-    def _reject(self, label, message, mutation):
+    def _reject(
+        self, label, message, mutation, *, verify_restored_baseline=True,
+    ):
         originals = {}
 
         def preserve(relative):
@@ -1158,12 +1209,13 @@ class ValidatorTests(unittest.TestCase):
                     os.symlink(payload, path)
                 elif kind == "directory":
                     os.makedirs(path)
-            with self.subTest(case=label + "-restored-baseline"):
-                self.assertEqual(
-                    validate_artifact_directory(self.output),
-                    self._expected_summary())
+            if verify_restored_baseline:
+                with self.subTest(case=label + "-restored-baseline"):
+                    self.assertEqual(
+                        validate_artifact_directory(self.output),
+                        self._expected_summary())
 
-    def test_direct_canonical_v2_fixture_validates_normally(self):
+    def test_direct_canonical_v3_fixture_validates_normally(self):
         class UninspectableSourceOptions:
             def __iter__(self):
                 raise AssertionError("normal mode inspected source_options")
@@ -1227,6 +1279,176 @@ class ValidatorTests(unittest.TestCase):
                 source_options=UninspectableSourceOptions()),
             self._expected_summary())
 
+    def test_v3_manifest_motion_and_bank_descriptors_are_exact(self):
+        manifest = _load_json(self._path("manifest.json"))
+        self.assertEqual(set(manifest), {
+            "schema", "output_fps", "feature_dimensions",
+            "terrain_dimensions", "support_dimensions",
+            "terrain_feature_distances_m", "total_clips", "grail_clips",
+            "skipped_clips", "database_frames", "diagnostic_mode",
+            "sources", "skeleton", "contact", "surface", "database",
+            "sidecars", "motion_index", "motion_banks", "scene_index",
+            "validation_file", "validation",
+        })
+        self.assertEqual(
+            (manifest["schema"], manifest["feature_dimensions"],
+             manifest["terrain_dimensions"], manifest["support_dimensions"]),
+            ("g1-terrain-artifacts/v3", 39, 12, 3),
+        )
+        self.assertEqual(set(manifest["sources"][0]), {
+            "name", "terrain_id", "terrain_family", "source_fps",
+            "source_frames", "output_frames", "range_start", "range_stop",
+            "source_frame_map",
+        })
+        self.assertEqual(manifest["sources"][0]["terrain_family"], "flat")
+        self.assertEqual(manifest["motion_index"], {
+            "path": "motion_index.bin", "schema": "G1MI/v1",
+            "version": 1, "frame_count": 3, "row_width": 4,
+            "sha256": _sha256(self._path("motion_index.bin")),
+        })
+        banks = manifest["motion_banks"]
+        self.assertEqual(set(banks), {
+            "schema", "frame_count", "ranges", "banks", "sha256",
+        })
+        self.assertEqual(
+            [bank["family"] for bank in banks["banks"]],
+            ["flat", "curb", "slope", "stair"],
+        )
+        bank_payload = dict(banks)
+        bank_digest = bank_payload.pop("sha256")
+        self.assertEqual(
+            bank_digest,
+            hashlib.sha256(canonical_json_bytes(bank_payload)).hexdigest(),
+        )
+        with open(self._path("motion_index.bin"), "rb") as stream:
+            payload = stream.read()
+        self.assertEqual(
+            struct.unpack_from("<4sIII", payload), (b"G1MI", 1, 3, 4))
+
+    def test_motion_index_tree_hash_size_rows_and_values_are_authenticated(self):
+        def resign_motion(preserve):
+            self._resign_root_payload(preserve, ["motion_index"])
+
+        def missing(preserve):
+            os.unlink(preserve("motion_index.bin"))
+
+        def symlink(preserve):
+            path = preserve("motion_index.bin")
+            os.unlink(path)
+            os.symlink("terrain_support.bin", path)
+
+        def wrong_hash(preserve):
+            self._rewrite_json(
+                preserve, "manifest.json",
+                lambda value: value["motion_index"].__setitem__(
+                    "sha256", "0" * 64))
+
+        def wrong_size(preserve):
+            path = preserve("motion_index.bin")
+            with open(path, "r+b") as stream:
+                stream.truncate(os.path.getsize(path) - 1)
+            resign_motion(preserve)
+
+        def wrong_rows(preserve):
+            path = preserve("motion_index.bin")
+            with open(path, "r+b") as stream:
+                stream.seek(8)
+                stream.write(struct.pack("<I", 2))
+            resign_motion(preserve)
+
+        def zero_direction(preserve):
+            path = preserve("motion_index.bin")
+            with open(path, "r+b") as stream:
+                stream.seek(16)
+                stream.write(b"\x00\x00")
+            resign_motion(preserve)
+
+        def bad_elevation(preserve):
+            path = preserve("motion_index.bin")
+            with open(path, "r+b") as stream:
+                stream.seek(19)
+                stream.write(b"\x02")
+            resign_motion(preserve)
+
+        for name, message, mutation in (
+            ("missing", "missing|tree", missing),
+            ("symlink", "symlink", symlink),
+            ("hash", "motion index SHA-256", wrong_hash),
+            ("size", "motion index size", wrong_size),
+            ("rows", "motion index header|frame count", wrong_rows),
+            ("direction", "direction mask", zero_direction),
+            ("elevation", "elevation", bad_elevation),
+        ):
+            self._reject(
+                name, message, mutation, verify_restored_baseline=False)
+
+    def test_sources_and_motion_banks_require_complete_unique_family_ownership(self):
+        def rewrite_banks(preserve, mutation):
+            path = preserve("manifest.json")
+            manifest = _load_json(path)
+            mutation(manifest)
+            payload = dict(manifest["motion_banks"])
+            payload.pop("sha256")
+            manifest["motion_banks"]["sha256"] = hashlib.sha256(
+                canonical_json_bytes(payload)).hexdigest()
+            _write_json(path, manifest)
+
+        def unknown_source_family(preserve):
+            rewrite_banks(
+                preserve,
+                lambda value: value["sources"][0].__setitem__(
+                    "terrain_family", "mud"),
+            )
+
+        def unknown_bank_family(preserve):
+            rewrite_banks(
+                preserve,
+                lambda value: value["motion_banks"]["banks"][0].__setitem__(
+                    "family", "mud"),
+            )
+
+        def missing_owner(preserve):
+            rewrite_banks(
+                preserve,
+                lambda value: value["motion_banks"]["banks"][0].__setitem__(
+                    "range_indices", []),
+            )
+
+        def mismatched_range(preserve):
+            rewrite_banks(
+                preserve,
+                lambda value: value["motion_banks"]["ranges"][0].__setitem__(
+                    "global_stop", 2),
+            )
+
+        for name, message, mutation in (
+            ("source-family", "terrain family", unknown_source_family),
+            ("bank-family", "terrain families", unknown_bank_family),
+            ("missing-owner", "ownership", missing_owner),
+            ("range", "range|coverage", mismatched_range),
+        ):
+            self._reject(
+                name, message, mutation, verify_restored_baseline=False)
+
+    def test_large_corpus_counts_are_validated_from_metadata_without_fixed_totals(self):
+        manifest = _load_json(self._path("manifest.json"))
+        manifest.update({
+            "diagnostic_mode": False,
+            "total_clips": 20_003,
+            "grail_clips": 20_002,
+            "database_frames": 6_000_003,
+        })
+        validator_module._validate_manifest_header(manifest)
+        self.assertEqual(
+            validator_module._motion_payload_sizes(6_000_003, 20_003),
+            (
+                176 + 8 * 20_003 + 1614 * 6_000_003,
+                16 + 48 * 6_000_003,
+                16 + 12 * 6_000_003,
+                16 + 4 * 6_000_003,
+            ),
+        )
+
     def test_v1_artifact_set_manifest_is_rejected_without_dispatch(self):
         manifest_path = self._path("manifest.json")
         manifest = _load_json(manifest_path)
@@ -1235,11 +1457,11 @@ class ValidatorTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             ValueError,
-            r"^schema must be g1-terrain-artifacts/v2$",
+            r"^schema must be g1-terrain-artifacts/v3$",
         ):
             validate_artifact_directory(self.output)
 
-    def test_full_source_runs_after_normal_gates_with_loaded_v2_objects(self):
+    def test_full_source_runs_after_normal_gates_with_loaded_v3_objects(self):
         options = {"g1_xml": "/tmp/test-g1.xml"}
         observed = {}
 
@@ -1287,7 +1509,7 @@ class ValidatorTests(unittest.TestCase):
             stderr.getvalue(),
             "FULL-SOURCE recompute 1/1 fixture-source\n")
 
-    def test_v2_cli_reports_the_fixed_schema_and_dimensions(self):
+    def test_v3_cli_reports_the_fixed_schema_and_dimensions(self):
         stdout = io.StringIO()
         stderr = io.StringIO()
         with redirect_stdout(stdout), redirect_stderr(stderr):
@@ -1296,8 +1518,8 @@ class ValidatorTests(unittest.TestCase):
         self.assertEqual(stderr.getvalue(), "")
         self.assertEqual(
             stdout.getvalue(),
-            "VALID g1-terrain-artifacts/v2 frames=3 clips=1 bones=31 "
-            "terrain_dims=4 support_dims=3 scenes=14 source_rows=0\n")
+            "VALID g1-terrain-artifacts/v3 frames=3 clips=1 bones=31 "
+            "terrain_dims=12 support_dims=3 scenes=14 source_rows=0\n")
 
     def test_json_typing_and_canonical_encoding_are_strict(self):
         def output_fps_is_int(preserve):

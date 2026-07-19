@@ -2,7 +2,6 @@
 """Independently reload and validate a published G1 terrain artifact set."""
 
 import argparse
-import glob
 import hashlib
 import json
 import os
@@ -12,7 +11,6 @@ import struct
 import sys
 from contextlib import contextmanager
 from functools import lru_cache
-from itertools import islice
 
 import numpy as np
 
@@ -26,6 +24,7 @@ from resources.g1_terrain_builder.artifacts import (
     read_support_sidecar,
     read_terrain_sidecar,
 )
+from resources.g1_terrain_builder.motion_index import read_motion_index
 from resources import quat as holden_quat
 from resources.g1_terrain_builder.database import (
     ContactConfig,
@@ -36,8 +35,13 @@ from resources.g1_terrain_builder.database import (
     sample_terrain_support,
 )
 from resources.g1_terrain_builder.kinematics import (
-    G1Kinematics,
     convert_source_clip,
+)
+from resources.g1_terrain_builder.schema import (
+    SourceFrameRange,
+    TERRAIN_FAMILIES,
+    TerrainBank,
+    TerrainBankIndex,
 )
 from resources.g1_terrain_builder.scenes import (
     COORDINATE_SIGNATURE,
@@ -48,9 +52,7 @@ from resources.g1_terrain_builder.scenes import (
     procedural_scene_definitions,
     select_grail_scene_bases,
 )
-from resources.g1_terrain_builder.sources import load_grail, load_takara
 from resources.g1_terrain_builder.terrain import (
-    FlatTerrain,
     HEIGHTFIELD_DIAGONAL,
     HEIGHTFIELD_INTERPOLATION,
     GrailTerrain,
@@ -62,11 +64,12 @@ from resources.g1_terrain_builder.terrain import (
 )
 
 
-SCHEMA = "g1-terrain-artifacts/v2"
+SCHEMA = "g1-terrain-artifacts/v3"
 OUTPUT_FPS = 25.0
-FEATURE_DIMENSIONS = 31
-TERRAIN_DIMENSIONS = 4
+FEATURE_DIMENSIONS = 39
+TERRAIN_DIMENSIONS = 12
 SUPPORT_DIMENSIONS = 3
+BONE_COUNT = 31
 SCENE_CELL_SIZE = float(np.float32(0.02))
 WALKABILITY_HALO = float(np.float32(0.25))
 ENDPOINT_RADIUS = float(np.float32(0.20))
@@ -75,11 +78,12 @@ MANIFEST_KEYS = {
     "support_dimensions", "terrain_feature_distances_m", "total_clips",
     "grail_clips", "skipped_clips", "database_frames", "diagnostic_mode",
     "sources", "skeleton", "contact", "surface", "database", "sidecars",
-    "scene_index", "validation_file", "validation",
+    "motion_index", "motion_banks", "scene_index", "validation_file",
+    "validation",
 }
 SOURCE_KEYS = {
     "name", "terrain_id", "source_fps", "source_frames", "output_frames",
-    "range_start", "range_stop", "source_frame_map",
+    "range_start", "range_stop", "source_frame_map", "terrain_family",
 }
 SCENE_KEYS = {
     "schema", "id", "label", "provenance", "coordinate_signature",
@@ -135,14 +139,6 @@ DEFAULT_SOURCE_OPTIONS = {
     "remap": "/home/ubuntu/projects/g1_mm/isaac_to_mj.npy",
 }
 SOURCE_REPORT_ATOL = 1e-12
-FULL_SOURCE_GRAIL_CLIPS = 1769
-FULL_SOURCE_TOTAL_CLIPS = 1770
-FULL_SOURCE_TAKARA_SOURCE_FRAMES = 34863
-FULL_SOURCE_TAKARA_OUTPUT_FRAMES = 17432
-FULL_SOURCE_GRAIL_SOURCE_FRAMES = 250
-FULL_SOURCE_GRAIL_OUTPUT_FRAMES = 250
-FULL_SOURCE_GRAIL_ROWS = 442250
-FULL_SOURCE_ROWS = 459682
 LOCKED_SCENE_IDS = (
     "grail-curb-default",
     "grail-curb-low",
@@ -227,26 +223,19 @@ _HEIGHTFIELD_HEADER = struct.Struct("<4sIII4f")
 _WALKABILITY_HEADER = struct.Struct("<4sIII")
 _HEX_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _SAFE_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
-_MAX_MANIFEST_BYTES = 16 * 1024 * 1024
+_MAX_MANIFEST_BYTES = 256 * 1024 * 1024
 _MAX_VALIDATION_BYTES = 1024 * 1024
 _MAX_SCENE_JSON_BYTES = 64 * 1024
 _MAX_JSON_DEPTH = 32
-_MAX_JSON_NODES = 1_000_000
-_MAX_JSON_LIST = 50_000
-_MAX_CLIPS = 1770
-_MAX_FRAMES = 459682
+_MAX_JSON_NODES = 50_000_000
+_MAX_JSON_LIST = 5_000_000
+_UINT32_MAX = (1 << 32) - 1
 _MAX_SOURCE_FRAMES = 50_000
 _CANONICAL_SOURCE_FPS = (25.0, 50.0)
 _MAX_GRID_AXIS = 2048
 _MAX_GRID_CELLS = 306_726
 _MAX_OBJ_BYTES = 21_762_970
-_MAX_DATABASE_BYTES = 176 + 8 * _MAX_CLIPS + 1614 * _MAX_FRAMES
-_MAX_FEATURE_BYTES = 16 + 16 * _MAX_FRAMES
-_MAX_SUPPORT_BYTES = 16 + 12 * _MAX_FRAMES
 _ROOT_FILE_LIMITS = {
-    "database.bin": _MAX_DATABASE_BYTES,
-    "terrain_features.bin": _MAX_FEATURE_BYTES,
-    "terrain_support.bin": _MAX_SUPPORT_BYTES,
     "scenes/index.json": _MAX_SCENE_JSON_BYTES,
     "validation.json": _MAX_VALIDATION_BYTES,
 }
@@ -428,63 +417,8 @@ def _validate_loaded_source_identity(source, entry, index):
 
 
 def _validate_full_source_manifest_contract(manifest, database):
-    _require(manifest["diagnostic_mode"] is False,
-             "full source validation requires the full non-diagnostic pack")
-    _require(manifest["total_clips"] == FULL_SOURCE_TOTAL_CLIPS,
-             "full-source total clip count changed")
-    _require(manifest["grail_clips"] == FULL_SOURCE_GRAIL_CLIPS,
-             "full-source GRAIL clip count changed")
-    _require(manifest["database_frames"] == FULL_SOURCE_ROWS
-             and len(database.positions) == FULL_SOURCE_ROWS,
-             "full-source row count changed")
-    sources = manifest["sources"]
-    _require(len(sources) == FULL_SOURCE_TOTAL_CLIPS,
-             "full-source manifest source count changed")
-
-    takara = sources[0]
-    _require(takara["source_fps"] == 50.0,
-             "full-source Takara FPS changed")
-    _require(takara["source_frames"] == FULL_SOURCE_TAKARA_SOURCE_FRAMES,
-             "full-source Takara source frame count changed")
-    _require(takara["output_frames"] == FULL_SOURCE_TAKARA_OUTPUT_FRAMES,
-             "full-source Takara output frame count changed")
-    _require(takara["range_start"] == 0
-             and takara["range_stop"] == FULL_SOURCE_TAKARA_OUTPUT_FRAMES,
-             "full-source Takara range changed")
-    expected_takara_map = np.rint(
-        np.arange(FULL_SOURCE_TAKARA_OUTPUT_FRAMES, dtype=np.float64)
-        * 2.0).astype(np.int64).tolist()
-    _require(takara["source_frame_map"] == expected_takara_map,
-             "full-source Takara source frame map changed")
-
-    cursor = FULL_SOURCE_TAKARA_OUTPUT_FRAMES
-    for index, entry in enumerate(sources[1:], 1):
-        _require(entry["source_fps"] == 25.0,
-                 f"sources[{index}] full-source GRAIL FPS changed")
-        _require(entry["source_frames"] == FULL_SOURCE_GRAIL_SOURCE_FRAMES
-                 and entry["output_frames"]
-                 == FULL_SOURCE_GRAIL_OUTPUT_FRAMES,
-                 f"sources[{index}] full-source GRAIL frame count changed")
-        _require(entry["source_frame_map"]
-                 == list(range(FULL_SOURCE_GRAIL_OUTPUT_FRAMES)),
-                 f"sources[{index}] full-source GRAIL source map changed")
-        _require(entry["range_start"] == cursor
-                 and entry["range_stop"]
-                 == cursor + FULL_SOURCE_GRAIL_OUTPUT_FRAMES,
-                 f"sources[{index}] full-source GRAIL range changed")
-        cursor = entry["range_stop"]
-    _require(cursor - FULL_SOURCE_TAKARA_OUTPUT_FRAMES
-             == FULL_SOURCE_GRAIL_ROWS,
-             "full-source aggregate GRAIL row count changed")
-    _require(cursor == FULL_SOURCE_ROWS,
-             "full-source final row count changed")
-    expected_starts = np.asarray(
-        [entry["range_start"] for entry in sources], np.int32)
-    expected_stops = np.asarray(
-        [entry["range_stop"] for entry in sources], np.int32)
-    _require(np.array_equal(database.range_starts, expected_starts)
-             and np.array_equal(database.range_stops, expected_stops),
-             "full-source database ranges differ from manifest")
+    raise ValueError(
+        "Task 7 must replace legacy single-curb full-source reconstruction")
 
 
 def _require_regular_source_file(path, label):
@@ -497,36 +431,8 @@ def _require_regular_source_file(path, label):
 
 
 def _discover_full_source_corpus(manifest, options):
-    for key, label in (
-        ("g1_xml", "G1 XML"),
-        ("takara", "Takara motion"),
-        ("remap", "Takara remap"),
-    ):
-        _require_regular_source_file(options[key], label)
-    paths = sorted(islice(
-        glob.iglob(options["grail_glob"]),
-        FULL_SOURCE_GRAIL_CLIPS + 1))
-    _require(len(paths) == FULL_SOURCE_GRAIL_CLIPS,
-             f"full-source GRAIL glob must contain exactly "
-             f"{FULL_SOURCE_GRAIL_CLIPS} clips")
-    path_by_base = {}
-    for path in paths:
-        _require_regular_source_file(path, "GRAIL clip")
-        base = os.path.splitext(os.path.basename(path))[0]
-        _require(base and base not in path_by_base,
-                 "full-source GRAIL basenames are not unique")
-        path_by_base[base] = path
-    manifest_bases = tuple(entry["name"] for entry in manifest["sources"][1:])
-    _require(all(
-        entry["name"] == entry["terrain_id"]
-        for entry in manifest["sources"][1:]),
-        "full-source GRAIL manifest name/terrain identities differ")
-    _require(manifest_bases == tuple(sorted(manifest_bases))
-             and manifest_bases == tuple(sorted(path_by_base)),
-             "full-source GRAIL basename set differs from manifest order")
-    return manifest_bases, {
-        base: path_by_base[base] for base in manifest_bases
-    }
+    raise ValueError(
+        "Task 7 must provide multi-family source discovery")
 
 
 def _premeasure_grail_surfaces(bases, progress=None):
@@ -618,68 +524,7 @@ def _validate_one_source_rows(
 def _validate_all_source_rows(
     manifest, database, scenes, source_options, progress=None,
 ):
-    options = _validate_full_source_options(source_options)
     _validate_full_source_manifest_contract(manifest, database)
-    bases, path_by_base = _discover_full_source_corpus(manifest, options)
-    measured, selected = _premeasure_grail_surfaces(bases, progress)
-    del measured
-
-    kinematics = G1Kinematics(options["g1_xml"])
-    selected_bases = set(selected.values())
-    selected_clips = {}
-    visited_ranges = []
-    rows = 0
-    total = len(manifest["sources"])
-
-    if progress is not None:
-        progress("recompute", 1, total, manifest["sources"][0]["name"])
-    rebuilt_rows, retained, visited = _validate_one_source_rows(
-        0, manifest["sources"][0], database, manifest["validation"],
-        kinematics,
-        manifest["skeleton"]["names"], manifest["skeleton"]["parents"],
-        lambda: load_takara(options["takara"], options["remap"]),
-        FlatTerrain,
-        False,
-    )
-    _require(retained is None,
-             "full-source Takara clip must not be retained")
-    rows += rebuilt_rows
-    visited_ranges.append(visited)
-    del retained
-
-    for index, (entry, base) in enumerate(
-        zip(manifest["sources"][1:], bases), 1,
-    ):
-        if progress is not None:
-            progress("recompute", index + 1, total, base)
-        rebuilt_rows, retained, visited = _validate_one_source_rows(
-            index, entry, database, manifest["validation"], kinematics,
-            manifest["skeleton"]["names"],
-            manifest["skeleton"]["parents"],
-            lambda path=path_by_base[base]: load_grail(path),
-            lambda terrain_base=base: GrailTerrain.from_base(terrain_base),
-            base in selected_bases,
-        )
-        rows += rebuilt_rows
-        visited_ranges.append(visited)
-        if retained is not None:
-            _require(base not in selected_clips,
-                     "full-source retained a duplicate GRAIL scene clip")
-            selected_clips[base] = retained
-        del retained
-
-    expected_ranges = tuple(
-        (entry["range_start"], entry["range_stop"])
-        for entry in manifest["sources"])
-    _require(len(visited_ranges) == FULL_SOURCE_TOTAL_CLIPS
-             and tuple(visited_ranges) == expected_ranges,
-             "full source validation did not visit every manifest range")
-    _require(rows == FULL_SOURCE_ROWS
-             and rows == len(database.positions),
-             "full source validation did not cover every frame")
-    _validate_selected_scene_reconstruction(
-        scenes, selected_clips, selected)
-    return rows
 
 
 def _full_source_progress(phase, index, total, name):
@@ -1022,7 +867,8 @@ def _authenticated_reader_path(
 def _expected_tree():
     files = {
         "database.bin", "terrain_features.bin", "terrain_support.bin",
-        "manifest.json", "validation.json", os.path.join("scenes", "index.json"),
+        "motion_index.bin", "manifest.json", "validation.json",
+        os.path.join("scenes", "index.json"),
     }
     directories = {".", "scenes"}
     for scene_id in LOCKED_SCENE_IDS:
@@ -1102,7 +948,7 @@ def _regular_relative_file(root, relative, label):
     return path
 
 
-def _hash_descriptor(root, value, label, fixed):
+def _hash_descriptor(root, value, label, fixed, maximum_size=None):
     _require(type(value) is dict and set(value) == set(fixed) | {"sha256"},
              f"{label} descriptor keys are invalid")
     for key, expected in fixed.items():
@@ -1111,7 +957,8 @@ def _hash_descriptor(root, value, label, fixed):
     _require(type(digest) is str and _HEX_SHA256.fullmatch(digest),
              f"{label} SHA-256 is invalid")
     path = _regular_relative_file(root, fixed["path"], label)
-    maximum_size = _ROOT_FILE_LIMITS[fixed["path"]]
+    if maximum_size is None:
+        maximum_size = _ROOT_FILE_LIMITS[fixed["path"]]
     actual_digest, identity = _sha256_file(path, maximum_size)
     _require(actual_digest == digest, f"{label} SHA-256 mismatch")
     return path, identity
@@ -1137,18 +984,13 @@ def _validate_manifest_header(manifest):
         ("database_frames", 1),
     ):
         _json_int(manifest[name], name, minimum)
-    _require(manifest["total_clips"] <= _MAX_CLIPS,
-             "total_clips exceeds the canonical corpus bound")
-    _require(manifest["database_frames"] <= _MAX_FRAMES,
-             "database_frames exceeds the canonical corpus bound")
+    _require(manifest["total_clips"] <= _UINT32_MAX,
+             "total_clips exceeds the database format bound")
+    _require(manifest["database_frames"] <= _UINT32_MAX,
+             "database_frames exceeds the sidecar format bound")
     _require(manifest["skipped_clips"] == 0, "skipped_clips must be zero")
-    if not manifest["diagnostic_mode"]:
-        _require(manifest["total_clips"] == 1770,
-                 "full pack total_clips must be 1770")
-        _require(manifest["grail_clips"] == 1769,
-                 "full pack grail_clips must be 1769")
-        _require(manifest["database_frames"] == 459682,
-                 "full pack database_frames must be 459682")
+    _require(manifest["grail_clips"] <= manifest["total_clips"],
+             "grail_clips exceeds total_clips")
 
 
 def _validate_motion_descriptors(root, manifest):
@@ -1162,24 +1004,35 @@ def _validate_motion_descriptors(root, manifest):
              "surface signature is invalid")
     _require(surface["signature"] == surface_semantics_signature(),
              "surface signature changed")
-    database_path = _hash_descriptor(root, manifest["database"], "database", {
-        "path": "database.bin", "schema": "holden-database/v1",
-    })
+    database_size, features_size, support_size, motion_index_size = \
+        _motion_payload_sizes(
+            manifest["database_frames"], manifest["total_clips"])
+    database_path = _hash_descriptor(
+        root, manifest["database"], "database", {
+            "path": "database.bin", "schema": "holden-database/v1",
+        }, database_size)
     sidecars = manifest["sidecars"]
     _require(type(sidecars) is dict
              and set(sidecars) == {"terrain_features", "terrain_support"},
              "sidecar descriptor keys are invalid")
     features_path = _hash_descriptor(
         root, sidecars["terrain_features"], "terrain features", {
-            "path": "terrain_features.bin", "schema": "G1TF/v1",
-            "version": 1, "dimensions": 4,
-        })
+            "path": "terrain_features.bin", "schema": "G1TF/v2",
+            "version": 2, "dimensions": TERRAIN_DIMENSIONS,
+        }, features_size)
     support_path = _hash_descriptor(
         root, sidecars["terrain_support"], "terrain support", {
             "path": "terrain_support.bin", "schema": "G1SP/v1",
             "version": 1, "dimensions": 3,
             "columns": list(SUPPORT_COLUMNS),
-        })
+        }, support_size)
+    motion_path = _hash_descriptor(
+        root, manifest["motion_index"], "motion index", {
+            "path": "motion_index.bin", "schema": "G1MI/v1",
+            "version": 1,
+            "frame_count": manifest["database_frames"],
+            "row_width": 4,
+        }, motion_index_size)
     index_path = _hash_descriptor(root, manifest["scene_index"], "scene index", {
         "path": "scenes/index.json", "schema": "g1-terrain-scene-index/v1",
     })
@@ -1187,7 +1040,10 @@ def _validate_motion_descriptors(root, manifest):
         root, manifest["validation_file"], "validation file", {
             "path": "validation.json", "schema": "g1-terrain-validation/v1",
         })
-    return database_path, features_path, support_path, index_path, validation_path
+    return (
+        database_path, features_path, support_path, motion_path, index_path,
+        validation_path,
+    )
 
 
 def _load_database(path):
@@ -1209,6 +1065,13 @@ def _load_terrain_support(path):
         return read_support_sidecar(path)
     except (OSError, TypeError, ValueError) as error:
         raise ValueError(f"terrain_support.bin is invalid: {error}") from error
+
+
+def _load_motion_index(path):
+    try:
+        return read_motion_index(path)
+    except (OSError, TypeError, ValueError) as error:
+        raise ValueError(f"motion_index.bin is invalid: {error}") from error
 
 
 def _pread_exact(descriptor, size, offset, label):
@@ -1233,10 +1096,10 @@ def _preflight_database_payload(descriptor, expected_size, frames, clips):
         return payload
 
     for label, columns, components, itemsize in (
-        ("positions", FEATURE_DIMENSIONS, 3, 4),
-        ("velocities", FEATURE_DIMENSIONS, 3, 4),
-        ("rotations", FEATURE_DIMENSIONS, 4, 4),
-        ("angular velocities", FEATURE_DIMENSIONS, 3, 4),
+        ("positions", BONE_COUNT, 3, 4),
+        ("velocities", BONE_COUNT, 3, 4),
+        ("rotations", BONE_COUNT, 4, 4),
+        ("angular velocities", BONE_COUNT, 3, 4),
     ):
         rows, actual_columns = struct.unpack(
             "<II", read_exact(8, label))
@@ -1244,7 +1107,7 @@ def _preflight_database_payload(descriptor, expected_size, frames, clips):
                  f"database {label} dimensions changed")
         offset += rows * actual_columns * components * itemsize
     parents, = struct.unpack("<I", read_exact(4, "parents"))
-    _require(parents == FEATURE_DIMENSIONS,
+    _require(parents == BONE_COUNT,
              "database parent count changed")
     offset += parents * 4
     for label in ("range starts", "range stops"):
@@ -1260,22 +1123,24 @@ def _preflight_database_payload(descriptor, expected_size, frames, clips):
 
 
 def _preflight_sidecar_payload(
-    descriptor, expected_size, frames, magic, dimensions, label,
+    descriptor, expected_size, frames, magic, expected_version, dimensions,
+    label,
 ):
     _require(expected_size >= 16, f"{label} size is invalid")
     header = _pread_exact(descriptor, 16, 0, label)
     actual_magic, version, actual_frames, actual_dimensions = \
         struct.unpack("<4sIII", header)
     _require((actual_magic, version, actual_frames, actual_dimensions)
-             == (magic, 1, frames, dimensions),
+             == (magic, expected_version, frames, dimensions),
              f"{label} header differs from manifest dimensions")
 
 
 def _motion_payload_sizes(frames, clips):
     return (
         176 + 8 * clips + 1614 * frames,
-        16 + 16 * frames,
+        16 + 48 * frames,
         16 + 12 * frames,
+        16 + 4 * frames,
     )
 
 
@@ -1311,7 +1176,7 @@ def _validate_skeleton(manifest, database):
              "skeleton signature is invalid")
     _require(signature == _manifest_signature(names, parents),
              "skeleton signature does not match names and parents")
-    _require(database.positions.shape[1] == FEATURE_DIMENSIONS,
+    _require(database.positions.shape[1] == BONE_COUNT,
              "database.bin bone count does not match the G1 skeleton")
     return names
 
@@ -1320,16 +1185,16 @@ def _expected_output_frames(source_frames, source_fps):
     with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
         duration = np.float64(source_frames - 1) / np.float64(source_fps)
         count = duration * np.float64(OUTPUT_FPS)
-    _require(np.isfinite(count) and count <= _MAX_FRAMES,
-             "source duration exceeds the canonical frame bound")
+    _require(np.isfinite(count) and count <= _UINT32_MAX,
+             "source duration exceeds the sidecar frame bound")
     return int(np.floor(count + 1e-9)) + 1
 
 
 def _validate_sources(manifest, database):
     sources = manifest["sources"]
     _require(type(sources) is list and sources, "sources must be non-empty")
-    _require(len(sources) <= _MAX_CLIPS,
-             "sources exceeds the canonical clip bound")
+    _require(len(sources) <= _UINT32_MAX,
+             "sources exceeds the database range-count bound")
     _require(len(sources) == manifest["total_clips"],
              "total_clips does not match sources")
     _require(manifest["grail_clips"] == len(sources) - 1,
@@ -1347,11 +1212,15 @@ def _validate_sources(manifest, database):
                  f"{label} keys are invalid")
         name = source["name"]
         terrain_id = source["terrain_id"]
+        terrain_family = source["terrain_family"]
         _require(type(name) is str and name, f"{label} name is invalid")
         _require(name not in names, f"duplicate source name {name}")
         names.append(name)
         _require(type(terrain_id) is str and terrain_id,
                  f"{label} terrain_id is invalid")
+        _require(type(terrain_family) is str
+                 and terrain_family in TERRAIN_FAMILIES,
+                 f"{label} terrain family is invalid")
         if index == 0:
             _require(name == "takara_walk_50hz", "first source must be Takara")
             _require(terrain_id == "flat", "Takara terrain_id must be flat")
@@ -1388,13 +1257,100 @@ def _validate_sources(manifest, database):
         _require(source_map == expected_map,
                  f"{label} source frame map violates 25 Hz provenance")
         source_map_total += len(source_map)
-        _require(source_map_total <= _MAX_FRAMES,
-                 "source frame maps exceed the canonical frame bound")
+        _require(source_map_total <= manifest["database_frames"],
+                 "source frame maps exceed database_frames")
         cursor = range_stop
-    _require(names[1:] == sorted(names[1:]), "GRAIL sources must be lexically sorted")
     _require(cursor == len(database.positions),
              "source ranges do not cover database.bin frames")
     return sources
+
+
+def _validate_motion_banks(manifest, sources):
+    descriptor = manifest["motion_banks"]
+    descriptor_keys = {
+        "schema", "frame_count", "ranges", "banks", "sha256",
+    }
+    _require(type(descriptor) is dict and set(descriptor) == descriptor_keys,
+             "motion bank descriptor keys are invalid")
+    digest = descriptor["sha256"]
+    _require(type(digest) is str and _HEX_SHA256.fullmatch(digest),
+             "motion bank SHA-256 is invalid")
+    payload = dict(descriptor)
+    payload.pop("sha256")
+    _require(
+        hashlib.sha256(_canonical_json_bytes(payload)).hexdigest() == digest,
+        "motion bank SHA-256 mismatch")
+    _require(descriptor["schema"] == "g1-terrain-motion-banks/v1",
+             "motion bank schema is invalid")
+    frame_count = _json_int(
+        descriptor["frame_count"], "motion bank frame_count", 1)
+    _require(frame_count == manifest["database_frames"],
+             "motion bank frame count does not match database_frames")
+
+    raw_ranges = descriptor["ranges"]
+    _require(type(raw_ranges) is list and raw_ranges,
+             "motion bank ranges must be non-empty")
+    range_keys = {
+        "source_name", "source_start", "source_stop", "source_frame_count",
+        "global_start", "global_stop",
+    }
+    ranges = []
+    for index, value in enumerate(raw_ranges):
+        label = f"motion_banks.ranges[{index}]"
+        _require(type(value) is dict and set(value) == range_keys,
+                 f"{label} keys are invalid")
+        _require(type(value["source_name"]) is str
+                 and bool(value["source_name"]),
+                 f"{label} source_name is invalid")
+        integers = {
+            key: _json_int(value[key], f"{label}.{key}", 0)
+            for key in range_keys - {"source_name"}
+        }
+        ranges.append(SourceFrameRange(
+            value["source_name"], integers["source_start"],
+            integers["source_stop"], integers["source_frame_count"],
+            integers["global_start"], integers["global_stop"],
+        ))
+
+    raw_banks = descriptor["banks"]
+    _require(type(raw_banks) is list,
+             "motion banks must be a list")
+    banks = []
+    for index, value in enumerate(raw_banks):
+        label = f"motion_banks.banks[{index}]"
+        _require(type(value) is dict
+                 and set(value) == {"family", "range_indices"},
+                 f"{label} keys are invalid")
+        indices = value["range_indices"]
+        _require(type(indices) is list
+                 and all(type(item) is int for item in indices),
+                 f"{label} range_indices must contain exact integers")
+        banks.append(TerrainBank(value["family"], tuple(indices)))
+    bank_index = TerrainBankIndex(frame_count, tuple(ranges), tuple(banks))
+    try:
+        bank_index.validate()
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"motion bank index is invalid: {error}") from error
+
+    _require(len(sources) == len(ranges),
+             "motion bank ranges do not match sources")
+    owners = [None] * len(ranges)
+    for bank in bank_index.banks:
+        for range_index in bank.range_indices:
+            owners[int(range_index)] = bank.family
+    for index, (source, source_range, owner) in enumerate(zip(
+            sources, ranges, owners)):
+        _require(
+            source_range.source_name == source["name"]
+            and source_range.source_start == 0
+            and source_range.source_stop == source["output_frames"]
+            and source_range.source_frame_count == source["output_frames"]
+            and source_range.global_start == source["range_start"]
+            and source_range.global_stop == source["range_stop"],
+            f"sources[{index}] does not match its motion bank range")
+        _require(owner == source["terrain_family"],
+                 f"sources[{index}] terrain family does not own its range")
+    return bank_index
 
 
 def _validate_parameters(manifest, clip_count):
@@ -2346,11 +2302,14 @@ def validate_artifact_directory(
         type(manifest) is dict and manifest.get("schema") == SCHEMA,
         f"schema must be {SCHEMA}")
     _validate_manifest_header(manifest)
-    database_entry, features_entry, support_entry, index_entry, validation_entry = \
-        _validate_motion_descriptors(root, manifest)
+    (
+        database_entry, features_entry, support_entry, motion_entry,
+        index_entry, validation_entry,
+    ) = _validate_motion_descriptors(root, manifest)
     database_path, database_identity = database_entry
     features_path, features_identity = features_entry
     support_path, support_identity = support_entry
+    motion_path, motion_identity = motion_entry
     index_path, index_identity = index_entry
     validation_path, validation_identity = validation_entry
     validation_file = _read_json(
@@ -2362,7 +2321,7 @@ def validate_artifact_directory(
         validation_path, validation_identity, "validation file")
     _require(_json_exact(validation_file, manifest["validation"]),
              "validation.json does not match manifest validation")
-    database_size, features_size, support_size = _motion_payload_sizes(
+    database_size, features_size, support_size, motion_size = _motion_payload_sizes(
         manifest["database_frames"], manifest["total_clips"])
     with _authenticated_reader_path(
         database_path, manifest["database"]["sha256"],
@@ -2379,7 +2338,7 @@ def validate_artifact_directory(
         features_size, "terrain features",
         lambda descriptor: _preflight_sidecar_payload(
             descriptor, features_size, manifest["database_frames"],
-            b"G1TF", TERRAIN_DIMENSIONS, "terrain sidecar"),
+            b"G1TF", 2, TERRAIN_DIMENSIONS, "terrain sidecar"),
     ) as authenticated_path:
         database.terrain_features = _load_terrain_features(authenticated_path)
     _require_file_identity(
@@ -2390,25 +2349,36 @@ def validate_artifact_directory(
         support_size, "terrain support",
         lambda descriptor: _preflight_sidecar_payload(
             descriptor, support_size, manifest["database_frames"],
-            b"G1SP", SUPPORT_DIMENSIONS, "support sidecar"),
+            b"G1SP", 1, SUPPORT_DIMENSIONS, "support sidecar"),
     ) as authenticated_path:
         database.terrain_support = _load_terrain_support(authenticated_path)
     _require_file_identity(
         support_path, support_identity, "terrain support")
+    with _authenticated_reader_path(
+        motion_path, manifest["motion_index"]["sha256"],
+        motion_size, "motion index",
+        lambda descriptor: _preflight_sidecar_payload(
+            descriptor, motion_size, manifest["database_frames"],
+            b"G1MI", 1, 4, "motion index"),
+    ) as authenticated_path:
+        motion_index = _load_motion_index(authenticated_path)
+    _require_file_identity(motion_path, motion_identity, "motion index")
     try:
         database.validate()
     except (TypeError, ValueError) as error:
         raise ValueError(f"ArtifactSet validation failed: {error}") from error
     frames = len(database.positions)
     _require(frames == len(database.terrain_features)
-             and frames == len(database.terrain_support),
-             "database and sidecar frame counts differ")
+             and frames == len(database.terrain_support)
+             and frames == len(motion_index),
+             "database and sidecar/index frame counts differ")
     _require(database.terrain_features.shape == (frames, TERRAIN_DIMENSIONS),
-             "terrain_features.bin dimension count must be 4")
+             "terrain_features.bin dimension count must be 12")
     _require(database.terrain_support.shape == (frames, SUPPORT_DIMENSIONS),
              "terrain_support.bin dimension count must be 3")
     names = _validate_skeleton(manifest, database)
     sources = _validate_sources(manifest, database)
+    _validate_motion_banks(manifest, sources)
     _validate_parameters(manifest, len(sources))
     quaternion_error = float(np.max(np.abs(
         np.linalg.norm(database.rotations, axis=-1) - 1.0)))
@@ -2421,6 +2391,7 @@ def validate_artifact_directory(
         (database_path, database_identity, "database"),
         (features_path, features_identity, "terrain features"),
         (support_path, support_identity, "terrain support"),
+        (motion_path, motion_identity, "motion index"),
         (validation_path, validation_identity, "validation file"),
     ):
         _require_file_identity(path, identity, label)

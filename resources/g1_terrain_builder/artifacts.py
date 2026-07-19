@@ -14,13 +14,25 @@ from dataclasses import dataclass
 import numpy as np
 
 from .database import read_holden_database, write_holden_database
-from .schema import ArtifactSet
+from .motion_index import (
+    G1MI_ROW_WIDTH,
+    G1MI_VERSION,
+    MotionIndex,
+    motion_index_bytes,
+    read_motion_index,
+)
+from .schema import (
+    ArtifactSet,
+    TERRAIN_FAMILIES,
+    TerrainBankIndex,
+)
 
 
 MAGIC = b"G1TF"
-VERSION = 1
-DIMS = 4
+VERSION = 2
+DIMS = 12
 SUPPORT_MAGIC = b"G1SP"
+SUPPORT_VERSION = 1
 SUPPORT_DIMS = 3
 SUPPORT_COLUMNS = (
     "source_root_height_m",
@@ -28,6 +40,7 @@ SUPPORT_COLUMNS = (
     "source_right_toe_height_m",
 )
 WALKABILITY_MAGIC = b"G1WM"
+WALKABILITY_VERSION = 1
 _HEADER = struct.Struct("<4sIII")
 _UINT32_MAX = (1 << 32) - 1
 _FLOAT32_BYTES = np.dtype("<f4").itemsize
@@ -41,14 +54,20 @@ MOTION_MANIFEST_KEYS = {
     "support_dimensions", "terrain_feature_distances_m", "total_clips",
     "grail_clips", "skipped_clips", "database_frames", "diagnostic_mode",
     "sources", "skeleton", "contact", "surface", "database", "sidecars",
-    "scene_index", "validation_file", "validation",
+    "motion_index", "motion_banks", "scene_index", "validation_file",
+    "validation",
 }
 MANIFEST_BASE_KEYS = MOTION_MANIFEST_KEYS - {
-    "database", "sidecars", "scene_index", "validation_file",
+    "database", "sidecars", "motion_index", "motion_banks", "scene_index",
+    "validation_file",
 }
 VALIDATION_KEYS = {
     "schema", "duration_error_s", "fk_max_error_m",
     "quaternion_norm_max_error",
+}
+SOURCE_KEYS = {
+    "name", "terrain_id", "terrain_family", "source_fps", "source_frames",
+    "output_frames", "range_start", "range_stop", "source_frame_map",
 }
 INDEX_KEYS = {
     "schema", "default_scene_id", "scene_ids", "scenes",
@@ -117,7 +136,7 @@ class _ScenePackSnapshot:
 
 
 def _float_matrix_bytes(
-    values: np.ndarray, *, magic: bytes, dims: int, label: str
+    values: np.ndarray, *, magic: bytes, version: int, dims: int, label: str
 ) -> bytes:
     error_message = (
         f"{label} must be a finite real floating matrix shaped (N, {dims}) "
@@ -138,6 +157,9 @@ def _float_matrix_bytes(
         raise ValueError(error_message)
     if not np.isfinite(source).all():
         raise ValueError(error_message)
+    payload_size = source.shape[0] * dims * _FLOAT32_BYTES
+    if payload_size > np.iinfo(np.intp).max:
+        raise ValueError(f"{label} payload exceeds platform index limit")
     try:
         with np.errstate(over="ignore", invalid="ignore"):
             encoded = np.ascontiguousarray(source, dtype="<f4")
@@ -147,13 +169,14 @@ def _float_matrix_bytes(
         raise ValueError(
             f"{label} must remain finite when encoded as float32"
         )
-    return _HEADER.pack(magic, VERSION, len(encoded), dims) + encoded.tobytes(
+    return _HEADER.pack(magic, version, len(encoded), dims) + encoded.tobytes(
         order="C"
     )
 
 
 def _read_float_matrix(
-    path: os.PathLike | str, *, magic: bytes, dims: int, label: str
+    path: os.PathLike | str, *, magic: bytes, expected_version: int, dims: int,
+    label: str,
 ) -> np.ndarray:
     with open(path, "rb") as stream:
         header = stream.read(_HEADER.size)
@@ -162,7 +185,7 @@ def _read_float_matrix(
         actual_magic, version, frames, actual_dims = _HEADER.unpack(header)
         if (
             actual_magic != magic
-            or version != VERSION
+            or version != expected_version
             or actual_dims != dims
         ):
             raise ValueError(f"{path}: unsupported {label} schema")
@@ -192,7 +215,8 @@ def _read_float_matrix(
 
 def terrain_sidecar_bytes(features: np.ndarray) -> bytes:
     return _float_matrix_bytes(
-        features, magic=MAGIC, dims=DIMS, label="terrain sidecar"
+        features, magic=MAGIC, version=VERSION, dims=DIMS,
+        label="terrain sidecar"
     )
 
 
@@ -206,7 +230,8 @@ def write_terrain_sidecar(
 
 def read_terrain_sidecar(path: os.PathLike | str) -> np.ndarray:
     return _read_float_matrix(
-        path, magic=MAGIC, dims=DIMS, label="terrain sidecar"
+        path, magic=MAGIC, expected_version=VERSION, dims=DIMS,
+        label="terrain sidecar"
     )
 
 
@@ -214,6 +239,7 @@ def support_sidecar_bytes(support: np.ndarray) -> bytes:
     return _float_matrix_bytes(
         support,
         magic=SUPPORT_MAGIC,
+        version=SUPPORT_VERSION,
         dims=SUPPORT_DIMS,
         label="support sidecar",
     )
@@ -231,6 +257,7 @@ def read_support_sidecar(path: os.PathLike | str) -> np.ndarray:
     return _read_float_matrix(
         path,
         magic=SUPPORT_MAGIC,
+        expected_version=SUPPORT_VERSION,
         dims=SUPPORT_DIMS,
         label="support sidecar",
     )
@@ -260,7 +287,7 @@ def walkability_bytes(walkability: np.ndarray) -> bytes:
         raise ValueError(error_message)
     encoded = np.ascontiguousarray(source, dtype=np.uint8)
     return _HEADER.pack(
-        WALKABILITY_MAGIC, VERSION, nx, nz
+        WALKABILITY_MAGIC, WALKABILITY_VERSION, nx, nz
     ) + encoded.tobytes(order="C")
 
 
@@ -279,7 +306,7 @@ def read_walkability(path: os.PathLike | str) -> np.ndarray:
         if len(header) < _HEADER.size:
             raise ValueError(f"{path}: truncated {label} header")
         magic, version, nx, nz = _HEADER.unpack(header)
-        if magic != WALKABILITY_MAGIC or version != VERSION:
+        if magic != WALKABILITY_MAGIC or version != WALKABILITY_VERSION:
             raise ValueError(f"{path}: unsupported {label} schema")
         if nx < 2 or nz < 2:
             raise ValueError(f"{path}: invalid walkability dimensions")
@@ -354,8 +381,16 @@ def _normalized_manifest_base(manifest):
         raise ValueError(
             f"manifest base keys must be {sorted(MANIFEST_BASE_KEYS)}")
     normalized = json.loads(canonical_json_bytes(manifest))
-    if normalized["schema"] != "g1-terrain-artifacts/v2":
-        raise ValueError("manifest schema must be g1-terrain-artifacts/v2")
+    if normalized["schema"] != "g1-terrain-artifacts/v3":
+        raise ValueError("manifest schema must be g1-terrain-artifacts/v3")
+    fixed_dimensions = {
+        "feature_dimensions": 39,
+        "terrain_dimensions": DIMS,
+        "support_dimensions": SUPPORT_DIMS,
+    }
+    if any(normalized.get(key) != value
+           for key, value in fixed_dimensions.items()):
+        raise ValueError("manifest v3 feature dimensions must be 39/12/3")
     validation = normalized["validation"]
     if type(validation) is not dict or set(validation) != VALIDATION_KEYS \
             or validation["schema"] != "g1-terrain-validation/v1":
@@ -377,6 +412,103 @@ def _normalized_manifest_base(manifest):
     if signature != expected_signature:
         raise ValueError("manifest surface signature does not match semantics")
     return normalized
+
+
+def _bank_descriptor(terrain_banks: TerrainBankIndex) -> dict:
+    if not isinstance(terrain_banks, TerrainBankIndex):
+        raise TypeError("terrain_banks must be a TerrainBankIndex")
+    terrain_banks.validate()
+    payload = {
+        "schema": "g1-terrain-motion-banks/v1",
+        "frame_count": int(terrain_banks.frame_count),
+        "ranges": [
+            {
+                "source_name": source_range.source_name,
+                "source_start": int(source_range.source_start),
+                "source_stop": int(source_range.source_stop),
+                "source_frame_count": int(source_range.source_frame_count),
+                "global_start": int(source_range.global_start),
+                "global_stop": int(source_range.global_stop),
+            }
+            for source_range in terrain_banks.ranges
+        ],
+        "banks": [
+            {
+                "family": bank.family,
+                "range_indices": [int(index) for index in bank.range_indices],
+            }
+            for bank in terrain_banks.banks
+        ],
+    }
+    payload["sha256"] = hashlib.sha256(
+        canonical_json_bytes(payload)).hexdigest()
+    return payload
+
+
+def _validated_publication_indexes(
+    artifacts, manifest_base, motion_index, terrain_banks,
+):
+    if not isinstance(motion_index, MotionIndex):
+        raise TypeError("motion_index must be a MotionIndex")
+    motion_index = MotionIndex(
+        motion_index.direction_masks,
+        motion_index.speed_masks,
+        motion_index.elevation_modes,
+    )
+    frame_count = len(artifacts.positions)
+    if len(motion_index) != frame_count:
+        raise ValueError("motion index frame count does not match database")
+    bank_descriptor = _bank_descriptor(terrain_banks)
+    if terrain_banks.frame_count != frame_count:
+        raise ValueError("terrain bank frame count does not match database")
+
+    sources = manifest_base.get("sources")
+    if type(sources) is not list or not sources:
+        raise ValueError("manifest sources must be a non-empty list")
+    if len(sources) != len(terrain_banks.ranges):
+        raise ValueError("manifest sources do not match terrain bank ranges")
+    if manifest_base.get("total_clips") != len(sources):
+        raise ValueError("manifest total_clips does not match sources")
+    if manifest_base.get("database_frames") != frame_count:
+        raise ValueError("manifest database_frames does not match artifacts")
+    if len(artifacts.range_starts) != len(sources):
+        raise ValueError("artifact ranges do not match manifest sources")
+
+    owners = [None] * len(terrain_banks.ranges)
+    for bank in terrain_banks.banks:
+        for index in bank.range_indices:
+            owners[int(index)] = bank.family
+    for index, (source, source_range, owner) in enumerate(zip(
+            sources, terrain_banks.ranges, owners)):
+        label = f"sources[{index}]"
+        if type(source) is not dict or set(source) != SOURCE_KEYS:
+            raise ValueError(f"{label} keys are invalid")
+        family = source["terrain_family"]
+        if type(family) is not str or family not in TERRAIN_FAMILIES:
+            raise ValueError(f"{label} terrain family is invalid")
+        if family != owner:
+            raise ValueError(f"{label} terrain family does not own its range")
+        output_frames = source["output_frames"]
+        global_start = source["range_start"]
+        global_stop = source["range_stop"]
+        if any(type(value) is not int for value in (
+                output_frames, global_start, global_stop)):
+            raise ValueError(f"{label} range values must be exact integers")
+        if (
+            source_range.source_name != source["name"]
+            or source_range.source_start != 0
+            or source_range.source_stop != output_frames
+            or source_range.source_frame_count != output_frames
+            or source_range.global_start != global_start
+            or source_range.global_stop != global_stop
+        ):
+            raise ValueError(f"{label} does not match its terrain bank range")
+        if (
+            int(artifacts.range_starts[index]) != global_start
+            or int(artifacts.range_stops[index]) != global_stop
+        ):
+            raise ValueError(f"{label} range does not match database")
+    return motion_index, bank_descriptor
 
 
 def _snapshot_scene_pack(scene_pack, manifest_base):
@@ -610,7 +742,7 @@ def _write_scene_pack(staging, scene_pack):
             _write_bytes_fsync(os.path.join(scene_dir, name), payload)
 
 
-def _finalize_manifest(staging, manifest_base):
+def _finalize_manifest(staging, manifest_base, bank_descriptor):
     manifest = dict(manifest_base)
     manifest["database"] = {
         "path": "database.bin", "schema": "holden-database/v1",
@@ -618,8 +750,8 @@ def _finalize_manifest(staging, manifest_base):
     }
     manifest["sidecars"] = {
         "terrain_features": {
-            "path": "terrain_features.bin", "schema": "G1TF/v1",
-            "version": 1, "dimensions": 4,
+            "path": "terrain_features.bin", "schema": "G1TF/v2",
+            "version": VERSION, "dimensions": DIMS,
             "sha256": sha256_file(
                 os.path.join(staging, "terrain_features.bin")),
         },
@@ -631,6 +763,14 @@ def _finalize_manifest(staging, manifest_base):
                 os.path.join(staging, "terrain_support.bin")),
         },
     }
+    manifest["motion_index"] = {
+        "path": "motion_index.bin", "schema": "G1MI/v1",
+        "version": G1MI_VERSION,
+        "frame_count": manifest_base["database_frames"],
+        "row_width": G1MI_ROW_WIDTH,
+        "sha256": sha256_file(os.path.join(staging, "motion_index.bin")),
+    }
+    manifest["motion_banks"] = bank_descriptor
     manifest["scene_index"] = {
         "path": "scenes/index.json",
         "schema": "g1-terrain-scene-index/v1",
@@ -650,7 +790,8 @@ def _finalize_manifest(staging, manifest_base):
 def _expected_tree(scene_pack):
     files = {
         "database.bin", "terrain_features.bin", "terrain_support.bin",
-        "manifest.json", "validation.json", os.path.join("scenes", "index.json"),
+        "motion_index.bin", "manifest.json", "validation.json",
+        os.path.join("scenes", "index.json"),
     }
     directories = {".", "scenes"}
     for scene in scene_pack.scenes:
@@ -702,7 +843,9 @@ def _inspect_tree(root):
     return files, directories
 
 
-def _validate_staged_v2(staging, artifacts, manifest, scene_pack):
+def _validate_staged_v3(
+    staging, artifacts, manifest, scene_pack, motion_index,
+):
     actual_files, actual_directories = _inspect_tree(staging)
     expected_files, expected_directories = _expected_tree(scene_pack)
     if actual_files != expected_files or actual_directories != expected_directories:
@@ -732,6 +875,7 @@ def _validate_staged_v2(staging, artifacts, manifest, scene_pack):
         (manifest["database"], "database.bin"),
         (manifest["sidecars"]["terrain_features"], "terrain_features.bin"),
         (manifest["sidecars"]["terrain_support"], "terrain_support.bin"),
+        (manifest["motion_index"], "motion_index.bin"),
         (manifest["scene_index"], os.path.join("scenes", "index.json")),
         (manifest["validation_file"], "validation.json"),
     )
@@ -768,6 +912,8 @@ def _validate_staged_v2(staging, artifacts, manifest, scene_pack):
         os.path.join(staging, "terrain_features.bin"))
     loaded.terrain_support = read_support_sidecar(
         os.path.join(staging, "terrain_support.bin"))
+    loaded_motion_index = read_motion_index(
+        os.path.join(staging, "motion_index.bin"))
     loaded.validate()
 
     def encoded_equal(actual, expected, dtype):
@@ -789,6 +935,12 @@ def _validate_staged_v2(staging, artifacts, manifest, scene_pack):
                 getattr(loaded, name), getattr(artifacts, name), dtype):
             raise ValueError(
                 f"staged {name} does not match requested artifacts")
+    for name in ("direction_masks", "speed_masks", "elevation_modes"):
+        if not np.array_equal(
+                getattr(loaded_motion_index, name),
+                getattr(motion_index, name)):
+            raise ValueError(
+                f"staged motion index {name} does not match requested index")
 
 
 def _fsync_regular_file(path):
@@ -918,12 +1070,15 @@ def _remove_path(path: str) -> None:
 
 
 def publish_artifacts(
-    output_dir, artifacts, manifest_base, scene_pack, validate_candidate,
+    output_dir, artifacts, manifest_base, scene_pack, motion_index,
+    terrain_banks, validate_candidate,
 ):
     manifest_base = _normalized_manifest_base(manifest_base)
     if not isinstance(artifacts, ArtifactSet):
         raise TypeError("artifacts must be an ArtifactSet")
     artifacts.validate()
+    motion_index, bank_descriptor = _validated_publication_indexes(
+        artifacts, manifest_base, motion_index, terrain_banks)
     if not callable(validate_candidate):
         raise TypeError("validate_candidate must be callable")
     scene_pack = _snapshot_scene_pack(scene_pack, manifest_base)
@@ -951,22 +1106,33 @@ def publish_artifacts(
         _write_bytes_fsync(
             os.path.join(staging, "terrain_support.bin"),
             support_sidecar_bytes(artifacts.terrain_support))
+        _write_bytes_fsync(
+            os.path.join(staging, "motion_index.bin"),
+            motion_index_bytes(
+                motion_index.direction_masks,
+                motion_index.speed_masks,
+                motion_index.elevation_modes,
+            ))
         _write_scene_pack(staging, scene_pack)
         _write_bytes_fsync(
             os.path.join(staging, "validation.json"),
             canonical_json_bytes(manifest_base["validation"]))
-        manifest = _finalize_manifest(staging, manifest_base)
+        manifest = _finalize_manifest(
+            staging, manifest_base, bank_descriptor)
         _write_bytes_fsync(
             os.path.join(staging, "manifest.json"),
             canonical_json_bytes(manifest))
 
-        _validate_staged_v2(staging, artifacts, manifest, scene_pack)
+        _validate_staged_v3(
+            staging, artifacts, manifest, scene_pack, motion_index)
         validate_candidate(staging)
-        _validate_staged_v2(staging, artifacts, manifest, scene_pack)
+        _validate_staged_v3(
+            staging, artifacts, manifest, scene_pack, motion_index)
         _fsync_tree(staging)
 
         with _locked_parent(parent) as parent_descriptor:
-            _validate_staged_v2(staging, artifacts, manifest, scene_pack)
+            _validate_staged_v3(
+                staging, artifacts, manifest, scene_pack, motion_index)
             output_identity = _output_directory_identity(output_dir)
             exchanged = False
             if output_identity is not None:
