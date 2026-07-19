@@ -52,7 +52,7 @@ static bool close_enough(float actual, float expected, float tolerance = 2e-4f)
     return std::fabs(actual - expected) <= tolerance;
 }
 
-static void fill_source_database(database& db, int frames)
+static void fill_source_database(database& db, int frames, int terrain_dimensions = 4)
 {
     db.bone_positions.resize(frames, G1_BoneCount);
     db.bone_velocities.resize(frames, G1_BoneCount);
@@ -61,7 +61,7 @@ static void fill_source_database(database& db, int frames)
     db.bone_parents.resize(G1_BoneCount);
     db.range_starts.resize(1);
     db.range_stops.resize(1);
-    db.terrain_features.resize(frames, 4);
+    db.terrain_features.resize(frames, terrain_dimensions);
 
     db.bone_parents.set(-1);
     db.bone_parents(G1_Hips) = G1_Simulation;
@@ -95,7 +95,7 @@ static void fill_source_database(database& db, int frames)
         db.bone_velocities(frame, G1_Hips) =
             vec3(0.02f + 0.003f * f, -0.01f + 0.001f * f, 0.04f + 0.005f * f);
 
-        for (int dimension = 0; dimension < 4; ++dimension) {
+        for (int dimension = 0; dimension < terrain_dimensions; ++dimension) {
             db.terrain_features(frame, dimension) =
                 0.1f * static_cast<float>(dimension + 1) +
                 0.006f * static_cast<float>((dimension + 1) * frame);
@@ -242,6 +242,64 @@ static void test_builder_layout_and_real_horizons()
     CHECK(horizons[0] == 8);
     CHECK(horizons[1] == 17);
     CHECK(horizons[2] == 25);
+}
+
+static void test_v3_builder_layout_and_strict_feature_contract()
+{
+    database db;
+    fill_source_database(db, 30, 12);
+    build_features(db);
+
+    CHECK(db.features.rows == 30);
+    CHECK(db.features.cols == 39);
+    CHECK(db.features_offset.size == 39);
+    CHECK(db.features_scale.size == 39);
+    CHECK(database_matching_feature_contract_is_valid(db, 12));
+    CHECK(!database_matching_feature_contract_is_valid(db, 4));
+
+    array1d<float> query(39);
+    query.zero();
+    for (int dimension = 0; dimension < 12; ++dimension) {
+        query(27 + dimension) =
+            db.terrain_features(7, dimension) + 0.25f;
+    }
+    const float expected = 12.0f * 0.25f * 0.25f;
+    CHECK(close_enough(database_raw_terrain_error(db, 7, query), expected));
+
+    database legacy;
+    fill_source_database(legacy, 30, 4);
+    build_features(legacy);
+    CHECK(legacy.features.cols == 31);
+    CHECK(database_matching_feature_contract_is_valid(legacy, 4));
+    CHECK(!database_matching_feature_contract_is_valid(legacy, 12));
+}
+
+static void test_source_range_lookup_is_logarithmic()
+{
+    database db;
+    const int range_count = 15815;
+    db.range_starts.resize(range_count);
+    db.range_stops.resize(range_count);
+    for (int range = 0; range < range_count; ++range) {
+        db.range_starts(range) = range * 3;
+        db.range_stops(range) = (range + 1) * 3;
+    }
+
+    const int frames[] = {0, 1, 23720, range_count * 3 - 1};
+    for (int frame : frames) {
+        int probes = 0;
+        const int range = database_range_index_for_frame(db, frame, &probes);
+        CHECK(range == frame / 3);
+        CHECK(probes > 0 && probes <= 15);
+        CHECK(database_trajectory_index_clamp(db, frame, 25) ==
+              db.range_stops(range) - 1);
+    }
+    int probes = 0;
+    CHECK(database_range_index_for_frame(db, -1, &probes) == -1);
+    CHECK(probes <= 15);
+    probes = 0;
+    CHECK(database_range_index_for_frame(db, range_count * 3, &probes) == -1);
+    CHECK(probes <= 15);
 }
 
 static void seed_matching_outputs(database& db)
@@ -571,6 +629,8 @@ int main()
 {
     test_zero_weight_is_exact_and_safe();
     test_builder_layout_and_real_horizons();
+    test_v3_builder_layout_and_strict_feature_contract();
+    test_source_range_lookup_is_logarithmic();
     test_builder_rejects_bad_terrain_before_mutation();
     test_builder_rejects_every_nonfinite_weight_before_mutation();
     test_positive_weight_flat_terrain_is_release_safe();

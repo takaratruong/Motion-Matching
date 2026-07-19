@@ -42,10 +42,13 @@ struct motion_index_runtime
 
     std::vector<uint16_t> range_direction_masks;
     std::vector<uint8_t> range_speed_masks;
+    std::vector<uint8_t> range_elevation_masks;
     std::vector<uint16_t> small_bound_direction_masks;
     std::vector<uint8_t> small_bound_speed_masks;
+    std::vector<uint8_t> small_bound_elevation_masks;
     std::vector<uint16_t> large_bound_direction_masks;
     std::vector<uint8_t> large_bound_speed_masks;
+    std::vector<uint8_t> large_bound_elevation_masks;
     int small_bound_size = 0;
     int large_bound_size = 0;
 
@@ -113,6 +116,38 @@ static inline bool motion_index_speed_is_valid(uint8_t mask)
     return mask == MOTION_SPEED_LOW || mask == MOTION_SPEED_MOVING ||
            mask == static_cast<uint8_t>(
                MOTION_SPEED_LOW | MOTION_SPEED_MOVING);
+}
+
+static inline bool motion_index_elevation_is_valid(int elevation)
+{
+    return elevation >= -1 && elevation <= 1;
+}
+
+static inline uint8_t motion_index_elevation_bit(int elevation)
+{
+    return motion_index_elevation_is_valid(elevation)
+        ? static_cast<uint8_t>(UINT8_C(1) << (elevation + 1))
+        : UINT8_C(0);
+}
+
+static inline bool motion_index_row_is_compatible(
+    const motion_index_runtime& index, size_t frame,
+    uint16_t direction_mask, uint8_t speed_mask, int elevation_mode)
+{
+    return frame < index.frame_count() &&
+           (index.direction_masks[frame] & direction_mask) != 0 &&
+           (index.speed_masks[frame] & speed_mask) != 0 &&
+           index.elevation_modes[frame] == elevation_mode;
+}
+
+static inline bool motion_index_aggregate_is_compatible(
+    uint16_t direction_presence, uint8_t speed_presence,
+    uint8_t elevation_presence, uint16_t direction_mask,
+    uint8_t speed_mask, int elevation_mode)
+{
+    return (direction_presence & direction_mask) != 0 &&
+           (speed_presence & speed_mask) != 0 &&
+           (elevation_presence & motion_index_elevation_bit(elevation_mode)) != 0;
 }
 
 static inline bool motion_index_file_size(FILE* file, size_t& size)
@@ -265,6 +300,13 @@ static inline bool motion_index_build_aggregates(
         index.elevation_modes.size() != frames)
         return motion_index_error(error, capacity,
                                   "invalid motion index row vectors");
+    for (size_t frame = 0; frame < frames; ++frame) {
+        if (!motion_index_direction_is_valid(index.direction_masks[frame]) ||
+            !motion_index_speed_is_valid(index.speed_masks[frame]) ||
+            !motion_index_elevation_is_valid(index.elevation_modes[frame]))
+            return motion_index_error(error, capacity,
+                                      "invalid motion index row %zu", frame);
+    }
     if (range_starts == NULL || range_stops == NULL || range_count == 0 ||
         range_count > static_cast<size_t>(INT_MAX))
         return motion_index_error(error, capacity,
@@ -287,21 +329,27 @@ static inline bool motion_index_build_aggregates(
 
     std::vector<uint16_t> range_directions;
     std::vector<uint8_t> range_speeds;
+    std::vector<uint8_t> range_elevations;
     std::vector<uint16_t> small_directions;
     std::vector<uint8_t> small_speeds;
+    std::vector<uint8_t> small_elevations;
     std::vector<uint16_t> large_directions;
     std::vector<uint8_t> large_speeds;
+    std::vector<uint8_t> large_elevations;
     try {
         range_directions.assign(range_count, 0);
         range_speeds.assign(range_count, 0);
+        range_elevations.assign(range_count, 0);
         const size_t small_count =
             (frames - 1) / static_cast<size_t>(small_bound_size) + 1;
         const size_t large_count =
             (frames - 1) / static_cast<size_t>(large_bound_size) + 1;
         small_directions.assign(small_count, 0);
         small_speeds.assign(small_count, 0);
+        small_elevations.assign(small_count, 0);
         large_directions.assign(large_count, 0);
         large_speeds.assign(large_count, 0);
+        large_elevations.assign(large_count, 0);
     } catch (const std::bad_alloc&) {
         return motion_index_error(error, capacity,
                                   "cannot allocate motion index aggregates");
@@ -315,6 +363,8 @@ static inline bool motion_index_build_aggregates(
                 index.direction_masks[static_cast<size_t>(frame)];
             range_speeds[range] |=
                 index.speed_masks[static_cast<size_t>(frame)];
+            range_elevations[range] |= motion_index_elevation_bit(
+                index.elevation_modes[static_cast<size_t>(frame)]);
         }
     }
     for (size_t frame = 0; frame < frames; ++frame) {
@@ -322,16 +372,23 @@ static inline bool motion_index_build_aggregates(
         const size_t large = frame / static_cast<size_t>(large_bound_size);
         small_directions[small] |= index.direction_masks[frame];
         small_speeds[small] |= index.speed_masks[frame];
+        small_elevations[small] |=
+            motion_index_elevation_bit(index.elevation_modes[frame]);
         large_directions[large] |= index.direction_masks[frame];
         large_speeds[large] |= index.speed_masks[frame];
+        large_elevations[large] |=
+            motion_index_elevation_bit(index.elevation_modes[frame]);
     }
 
     index.range_direction_masks.swap(range_directions);
     index.range_speed_masks.swap(range_speeds);
+    index.range_elevation_masks.swap(range_elevations);
     index.small_bound_direction_masks.swap(small_directions);
     index.small_bound_speed_masks.swap(small_speeds);
+    index.small_bound_elevation_masks.swap(small_elevations);
     index.large_bound_direction_masks.swap(large_directions);
     index.large_bound_speed_masks.swap(large_speeds);
+    index.large_bound_elevation_masks.swap(large_elevations);
     index.small_bound_size = small_bound_size;
     index.large_bound_size = large_bound_size;
     return true;

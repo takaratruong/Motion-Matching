@@ -4,6 +4,7 @@
 #include "vec.h"
 #include "quat.h"
 #include "array.h"
+#include "motion_index_runtime.h"
 
 #include <assert.h>
 #include <float.h>
@@ -18,6 +19,11 @@ enum
 {
     BOUND_SM_SIZE = 16,
     BOUND_LR_SIZE = 64,
+    DATABASE_POSE_TRAJECTORY_FEATURES = 27,
+    DATABASE_LEGACY_TERRAIN_FEATURES = 4,
+    DATABASE_G1_TERRAIN_FEATURES = 12,
+    DATABASE_LEGACY_MATCHING_FEATURES = 31,
+    DATABASE_G1_MATCHING_FEATURES = 39,
 };
 
 struct database
@@ -84,16 +90,42 @@ void database_save_matching_features(const database& db, const char* filename)
 // When we add an offset to a frame in the database there is a chance
 // it will go out of the relevant range so here we can clamp it to 
 // the last frame of that range.
-int database_trajectory_index_clamp(database& db, int frame, int offset)
+static inline int database_range_index_for_frame(
+    const database& db, int frame, int* probe_count = NULL)
 {
-    for (int i = 0; i < db.nranges(); i++)
+    int probes = 0;
+    int low = 0;
+    int high = db.nranges();
+    while (low < high)
     {
-        if (frame >= db.range_starts(i) && frame < db.range_stops(i))
+        ++probes;
+        const int middle = low + (high - low) / 2;
+        if (frame < db.range_starts(middle))
         {
-            return clamp(frame + offset, db.range_starts(i), db.range_stops(i) - 1);
+            high = middle;
+        }
+        else if (frame >= db.range_stops(middle))
+        {
+            low = middle + 1;
+        }
+        else
+        {
+            if (probe_count != NULL) *probe_count = probes;
+            return middle;
         }
     }
-    
+    if (probe_count != NULL) *probe_count = probes;
+    return -1;
+}
+
+int database_trajectory_index_clamp(const database& db, int frame, int offset)
+{
+    const int range = database_range_index_for_frame(db, frame);
+    if (range >= 0)
+    {
+        return clamp(frame + offset, db.range_starts(range), db.range_stops(range) - 1);
+    }
+
     assert(false);
     return -1;
 }
@@ -638,19 +670,37 @@ static inline void compute_terrain_feature(
     database& db, int& offset, const float weight)
 {
     assert(db.terrain_features.rows == db.nframes());
-    assert(db.terrain_features.cols == 4);
+    assert(db.terrain_features.cols == DATABASE_LEGACY_TERRAIN_FEATURES ||
+           db.terrain_features.cols == DATABASE_G1_TERRAIN_FEATURES);
 
     for (int i = 0; i < db.nframes(); ++i)
     {
-        for (int j = 0; j < 4; ++j)
+        for (int j = 0; j < db.terrain_features.cols; ++j)
         {
             db.features(i, offset + j) = db.terrain_features(i, j);
         }
     }
 
     normalize_feature(
-        db.features, db.features_offset, db.features_scale, offset, 4, weight);
-    offset += 4;
+        db.features, db.features_offset, db.features_scale, offset,
+        db.terrain_features.cols, weight);
+    offset += db.terrain_features.cols;
+}
+
+static inline bool database_matching_feature_contract_is_valid(
+    const database& db, const int expected_terrain_dimensions)
+{
+    if (expected_terrain_dimensions != DATABASE_LEGACY_TERRAIN_FEATURES &&
+        expected_terrain_dimensions != DATABASE_G1_TERRAIN_FEATURES)
+        return false;
+    const int expected_features =
+        DATABASE_POSE_TRAJECTORY_FEATURES + expected_terrain_dimensions;
+    return db.terrain_features.rows == db.nframes() &&
+           db.terrain_features.cols == expected_terrain_dimensions &&
+           db.features.rows == db.nframes() &&
+           db.features.cols == expected_features &&
+           db.features_offset.size == expected_features &&
+           db.features_scale.size == expected_features;
 }
 
 static inline float database_frame_cost(
@@ -673,14 +723,18 @@ static inline float database_raw_terrain_error(
     const database& db, const int frame, const slice1d<float> query)
 {
     assert(frame >= 0 && frame < db.nframes());
-    assert(query.size >= 31);
+    assert(query.size >= DATABASE_POSE_TRAJECTORY_FEATURES +
+                         db.terrain_features.cols);
     assert(db.terrain_features.rows == db.nframes());
-    assert(db.terrain_features.cols == 4);
+    assert(db.terrain_features.cols == DATABASE_LEGACY_TERRAIN_FEATURES ||
+           db.terrain_features.cols == DATABASE_G1_TERRAIN_FEATURES);
 
     float error = 0.0f;
-    for (int j = 0; j < 4; ++j)
+    for (int j = 0; j < db.terrain_features.cols; ++j)
     {
-        error += squaref(query(27 + j) - db.terrain_features(frame, j));
+        error += squaref(
+            query(DATABASE_POSE_TRAJECTORY_FEATURES + j) -
+            db.terrain_features(frame, j));
     }
     return error;
 }
@@ -755,7 +809,8 @@ void database_build_matching_features(
     }
 
     if (db.terrain_features.rows != db.nframes() ||
-        db.terrain_features.cols != 4)
+        (db.terrain_features.cols != DATABASE_LEGACY_TERRAIN_FEATURES &&
+         db.terrain_features.cols != DATABASE_G1_TERRAIN_FEATURES))
     {
         return;
     }
@@ -768,7 +823,7 @@ void database_build_matching_features(
         3 + // Hip Velocity
         6 + // Trajectory Positions 2D
         6 + // Trajectory Directions 2D
-        4 ; // Terrain Centerline Heights
+        db.terrain_features.cols; // Terrain profile/corridor descriptor
         
     db.features.resize(db.nframes(), nfeatures);
     db.features_offset.resize(nfeatures);
@@ -963,4 +1018,427 @@ void database_search(
         transition_cost,
         ignore_range_end,
         ignore_surrounding);
+}
+
+//--------------------------------------
+// Terrain-bank and direction-compatible indexed search.
+
+enum database_indexed_search_status
+{
+    DATABASE_INDEXED_SEARCH_INVALID = -1,
+    DATABASE_INDEXED_SEARCH_EMPTY = 0,
+    DATABASE_INDEXED_SEARCH_FOUND = 1,
+};
+
+struct database_indexed_search_result
+{
+    database_indexed_search_status status = DATABASE_INDEXED_SEARCH_EMPTY;
+    int index = -1;
+    float cost = FLT_MAX;
+    uint64_t eligible_frame_count = 0;
+    uint64_t evaluated_frame_count = 0;
+    uint64_t considered_bound_count = 0;
+    uint64_t skipped_bound_count = 0;
+};
+
+static inline bool database_indexed_range_contract_is_valid(const database& db)
+{
+    if (db.nranges() <= 0 || db.range_stops.size != db.nranges()) return false;
+    int cursor = 0;
+    for (int range = 0; range < db.nranges(); ++range)
+    {
+        if (db.range_starts(range) != cursor ||
+            db.range_stops(range) <= db.range_starts(range) ||
+            db.range_stops(range) > db.nframes())
+            return false;
+        cursor = db.range_stops(range);
+    }
+    return cursor == db.nframes();
+}
+
+static inline bool database_indexed_storage_is_valid(
+    const database& db, const motion_index_runtime& index)
+{
+    if (db.nframes() <= 0 ||
+        !database_matching_feature_contract_is_valid(
+            db, db.terrain_features.cols) ||
+        !database_indexed_range_contract_is_valid(db))
+        return false;
+
+    const int small_bounds =
+        (db.nframes() + BOUND_SM_SIZE - 1) / BOUND_SM_SIZE;
+    const int large_bounds =
+        (db.nframes() + BOUND_LR_SIZE - 1) / BOUND_LR_SIZE;
+    if (db.bound_sm_min.rows != small_bounds ||
+        db.bound_sm_max.rows != small_bounds ||
+        db.bound_lr_min.rows != large_bounds ||
+        db.bound_lr_max.rows != large_bounds ||
+        db.bound_sm_min.cols != db.nfeatures() ||
+        db.bound_sm_max.cols != db.nfeatures() ||
+        db.bound_lr_min.cols != db.nfeatures() ||
+        db.bound_lr_max.cols != db.nfeatures())
+        return false;
+
+    const size_t frames = static_cast<size_t>(db.nframes());
+    return index.direction_masks.size() == frames &&
+           index.speed_masks.size() == frames &&
+           index.elevation_modes.size() == frames &&
+           index.range_direction_masks.size() ==
+               static_cast<size_t>(db.nranges()) &&
+           index.range_speed_masks.size() ==
+               static_cast<size_t>(db.nranges()) &&
+           index.range_elevation_masks.size() ==
+               static_cast<size_t>(db.nranges()) &&
+           index.small_bound_direction_masks.size() ==
+               static_cast<size_t>(small_bounds) &&
+           index.small_bound_speed_masks.size() ==
+               static_cast<size_t>(small_bounds) &&
+           index.small_bound_elevation_masks.size() ==
+               static_cast<size_t>(small_bounds) &&
+           index.large_bound_direction_masks.size() ==
+               static_cast<size_t>(large_bounds) &&
+           index.large_bound_speed_masks.size() ==
+               static_cast<size_t>(large_bounds) &&
+           index.large_bound_elevation_masks.size() ==
+               static_cast<size_t>(large_bounds) &&
+           index.small_bound_size == BOUND_SM_SIZE &&
+           index.large_bound_size == BOUND_LR_SIZE;
+}
+
+static inline bool database_indexed_selected_ranges_are_valid(
+    const database& db, const int* ranges, int range_count)
+{
+    if (range_count < 0 || (range_count > 0 && ranges == NULL)) return false;
+    int prior = -1;
+    for (int selected = 0; selected < range_count; ++selected)
+    {
+        if (ranges[selected] <= prior || ranges[selected] >= db.nranges())
+            return false;
+        prior = ranges[selected];
+    }
+    return true;
+}
+
+static inline bool database_indexed_query_is_valid(
+    const database& db, const slice1d<float> query)
+{
+    if (query.size != db.nfeatures() ||
+        (query.size > 0 && query.data == NULL)) return false;
+    for (int dimension = 0; dimension < db.nfeatures(); ++dimension)
+    {
+        if (!feature_float_is_finite(db.features_offset(dimension))) return false;
+        const float scale = db.features_scale(dimension);
+        if (!feature_scale_is_disabled(scale) &&
+            !feature_float_is_positive_finite(scale))
+            return false;
+        if (!feature_scale_is_disabled(scale) &&
+            !feature_float_is_finite(query(dimension)))
+            return false;
+        const float normalized = normalize_query_feature(
+            query(dimension), db.features_offset(dimension), scale);
+        if (!feature_float_is_finite(normalized)) return false;
+    }
+    return true;
+}
+
+static inline bool database_indexed_range_is_selected(
+    const int* ranges, int range_count, int sought)
+{
+    int low = 0;
+    int high = range_count;
+    while (low < high)
+    {
+        const int middle = low + (high - low) / 2;
+        if (ranges[middle] < sought) low = middle + 1;
+        else high = middle;
+    }
+    return low < range_count && ranges[low] == sought;
+}
+
+static inline int database_indexed_search_range_end(
+    const database& db, int range, int ignore_range_end)
+{
+    const int start = db.range_starts(range);
+    const int stop = db.range_stops(range);
+    return ignore_range_end >= stop - start ? start : stop - ignore_range_end;
+}
+
+static inline int database_indexed_min_int(int first, int second)
+{
+    return first < second ? first : second;
+}
+
+static inline void database_indexed_count_eligible(
+    database_indexed_search_result& result,
+    const database& db,
+    const motion_index_runtime& index,
+    const int* ranges,
+    int range_count,
+    uint16_t direction_mask,
+    uint8_t speed_mask,
+    int elevation_mode,
+    int incumbent_frame,
+    int incumbent_range,
+    int ignore_range_end,
+    int ignore_surrounding)
+{
+    for (int selected = 0; selected < range_count; ++selected)
+    {
+        const int range = ranges[selected];
+        ++result.considered_bound_count;
+        if (!motion_index_aggregate_is_compatible(
+                index.range_direction_masks[static_cast<size_t>(range)],
+                index.range_speed_masks[static_cast<size_t>(range)],
+                index.range_elevation_masks[static_cast<size_t>(range)],
+                direction_mask, speed_mask, elevation_mode))
+        {
+            ++result.skipped_bound_count;
+            continue;
+        }
+
+        int frame = db.range_starts(range);
+        const int range_end = database_indexed_search_range_end(
+            db, range, ignore_range_end);
+        while (frame < range_end)
+        {
+            const int large = frame / BOUND_LR_SIZE;
+            const int large_end = database_indexed_min_int(
+                (large + 1) * BOUND_LR_SIZE, range_end);
+            ++result.considered_bound_count;
+            if (!motion_index_aggregate_is_compatible(
+                    index.large_bound_direction_masks[
+                        static_cast<size_t>(large)],
+                    index.large_bound_speed_masks[static_cast<size_t>(large)],
+                    index.large_bound_elevation_masks[
+                        static_cast<size_t>(large)],
+                    direction_mask, speed_mask, elevation_mode))
+            {
+                ++result.skipped_bound_count;
+                frame = large_end;
+                continue;
+            }
+
+            while (frame < large_end)
+            {
+                const int small = frame / BOUND_SM_SIZE;
+                const int small_end = database_indexed_min_int(
+                    (small + 1) * BOUND_SM_SIZE, large_end);
+                ++result.considered_bound_count;
+                if (!motion_index_aggregate_is_compatible(
+                        index.small_bound_direction_masks[
+                            static_cast<size_t>(small)],
+                        index.small_bound_speed_masks[
+                            static_cast<size_t>(small)],
+                        index.small_bound_elevation_masks[
+                            static_cast<size_t>(small)],
+                        direction_mask, speed_mask, elevation_mode))
+                {
+                    ++result.skipped_bound_count;
+                    frame = small_end;
+                    continue;
+                }
+                while (frame < small_end)
+                {
+                    const bool surrounding =
+                        incumbent_frame >= 0 && range == incumbent_range &&
+                        abs(frame - incumbent_frame) < ignore_surrounding;
+                    if (!surrounding && motion_index_row_is_compatible(
+                            index, static_cast<size_t>(frame), direction_mask,
+                            speed_mask, elevation_mode))
+                        ++result.eligible_frame_count;
+                    ++frame;
+                }
+            }
+        }
+    }
+}
+
+static inline database_indexed_search_status database_search_indexed(
+    database_indexed_search_result& output,
+    const database& db,
+    const motion_index_runtime& index,
+    const int* compatible_range_indices,
+    int compatible_range_count,
+    uint16_t direction_mask,
+    uint8_t speed_mask,
+    int elevation_mode,
+    const slice1d<float> query,
+    int incumbent_frame,
+    float transition_cost = 0.0f,
+    int ignore_range_end = 20,
+    int ignore_surrounding = 20)
+{
+    if (!database_indexed_storage_is_valid(db, index) ||
+        !database_indexed_selected_ranges_are_valid(
+            db, compatible_range_indices, compatible_range_count) ||
+        !motion_index_direction_is_valid(direction_mask) ||
+        !motion_index_speed_is_valid(speed_mask) ||
+        !motion_index_elevation_is_valid(elevation_mode) ||
+        !database_indexed_query_is_valid(db, query) ||
+        incumbent_frame < -1 || incumbent_frame >= db.nframes() ||
+        !feature_weight_is_valid(transition_cost) ||
+        ignore_range_end < 0 || ignore_surrounding < 0)
+        return DATABASE_INDEXED_SEARCH_INVALID;
+
+    array1d<float> query_normalized;
+    query_normalized.resize(db.nfeatures());
+    for (int dimension = 0; dimension < db.nfeatures(); ++dimension)
+        query_normalized(dimension) = normalize_query_feature(
+            query(dimension), db.features_offset(dimension),
+            db.features_scale(dimension));
+
+    database_indexed_search_result candidate;
+    const int incumbent_range = incumbent_frame >= 0
+        ? database_range_index_for_frame(db, incumbent_frame) : -1;
+    const bool incumbent_compatible =
+        incumbent_frame >= 0 && incumbent_range >= 0 &&
+        database_indexed_range_is_selected(
+            compatible_range_indices, compatible_range_count, incumbent_range) &&
+        motion_index_row_is_compatible(
+            index, static_cast<size_t>(incumbent_frame), direction_mask,
+            speed_mask, elevation_mode);
+    if (incumbent_compatible)
+    {
+        candidate.status = DATABASE_INDEXED_SEARCH_FOUND;
+        candidate.index = incumbent_frame;
+        candidate.cost = database_frame_cost(db, incumbent_frame, query);
+        ++candidate.evaluated_frame_count;
+        if (!feature_float_is_finite(candidate.cost))
+            return DATABASE_INDEXED_SEARCH_INVALID;
+    }
+
+    database_indexed_count_eligible(
+        candidate, db, index, compatible_range_indices,
+        compatible_range_count, direction_mask, speed_mask, elevation_mode,
+        incumbent_frame, incumbent_range, ignore_range_end, ignore_surrounding);
+    if (candidate.eligible_frame_count == 0)
+    {
+        output = candidate;
+        return candidate.status;
+    }
+
+    for (int selected = 0; selected < compatible_range_count; ++selected)
+    {
+        const int range = compatible_range_indices[selected];
+        if (!motion_index_aggregate_is_compatible(
+                index.range_direction_masks[static_cast<size_t>(range)],
+                index.range_speed_masks[static_cast<size_t>(range)],
+                index.range_elevation_masks[static_cast<size_t>(range)],
+                direction_mask, speed_mask, elevation_mode))
+            continue;
+
+        int frame = db.range_starts(range);
+        const int range_end = database_indexed_search_range_end(
+            db, range, ignore_range_end);
+        while (frame < range_end)
+        {
+            const int large = frame / BOUND_LR_SIZE;
+            const int large_end = database_indexed_min_int(
+                (large + 1) * BOUND_LR_SIZE, range_end);
+            if (!motion_index_aggregate_is_compatible(
+                    index.large_bound_direction_masks[
+                        static_cast<size_t>(large)],
+                    index.large_bound_speed_masks[static_cast<size_t>(large)],
+                    index.large_bound_elevation_masks[
+                        static_cast<size_t>(large)],
+                    direction_mask, speed_mask, elevation_mode))
+            {
+                frame = large_end;
+                continue;
+            }
+
+            float bound_cost = transition_cost;
+            for (int dimension = 0; dimension < db.nfeatures(); ++dimension)
+            {
+                bound_cost += squaref(
+                    query_normalized(dimension) -
+                    clampf(query_normalized(dimension),
+                           db.bound_lr_min(large, dimension),
+                           db.bound_lr_max(large, dimension)));
+                if (bound_cost >= candidate.cost) break;
+            }
+            if (!feature_float_is_finite(bound_cost))
+                return DATABASE_INDEXED_SEARCH_INVALID;
+            if (bound_cost >= candidate.cost)
+            {
+                frame = large_end;
+                continue;
+            }
+
+            while (frame < large_end)
+            {
+                const int small = frame / BOUND_SM_SIZE;
+                const int small_end = database_indexed_min_int(
+                    (small + 1) * BOUND_SM_SIZE, large_end);
+                if (!motion_index_aggregate_is_compatible(
+                        index.small_bound_direction_masks[
+                            static_cast<size_t>(small)],
+                        index.small_bound_speed_masks[
+                            static_cast<size_t>(small)],
+                        index.small_bound_elevation_masks[
+                            static_cast<size_t>(small)],
+                        direction_mask, speed_mask, elevation_mode))
+                {
+                    frame = small_end;
+                    continue;
+                }
+
+                bound_cost = transition_cost;
+                for (int dimension = 0; dimension < db.nfeatures(); ++dimension)
+                {
+                    bound_cost += squaref(
+                        query_normalized(dimension) -
+                        clampf(query_normalized(dimension),
+                               db.bound_sm_min(small, dimension),
+                               db.bound_sm_max(small, dimension)));
+                    if (bound_cost >= candidate.cost) break;
+                }
+                if (!feature_float_is_finite(bound_cost))
+                    return DATABASE_INDEXED_SEARCH_INVALID;
+                if (bound_cost >= candidate.cost)
+                {
+                    frame = small_end;
+                    continue;
+                }
+
+                while (frame < small_end)
+                {
+                    const bool surrounding =
+                        incumbent_frame >= 0 && range == incumbent_range &&
+                        abs(frame - incumbent_frame) < ignore_surrounding;
+                    if (surrounding || !motion_index_row_is_compatible(
+                            index, static_cast<size_t>(frame), direction_mask,
+                            speed_mask, elevation_mode))
+                    {
+                        ++frame;
+                        continue;
+                    }
+
+                    ++candidate.evaluated_frame_count;
+                    float cost = transition_cost;
+                    for (int dimension = 0; dimension < db.nfeatures(); ++dimension)
+                    {
+                        cost += squaref(
+                            query_normalized(dimension) -
+                            db.features(frame, dimension));
+                        if (cost >= candidate.cost) break;
+                    }
+                    if (!feature_float_is_finite(cost))
+                        return DATABASE_INDEXED_SEARCH_INVALID;
+                    if (cost < candidate.cost)
+                    {
+                        candidate.status = DATABASE_INDEXED_SEARCH_FOUND;
+                        candidate.index = frame;
+                        candidate.cost = cost;
+                    }
+                    ++frame;
+                }
+            }
+        }
+    }
+
+    if (candidate.status != DATABASE_INDEXED_SEARCH_FOUND)
+        return DATABASE_INDEXED_SEARCH_INVALID;
+    output = candidate;
+    return candidate.status;
 }
