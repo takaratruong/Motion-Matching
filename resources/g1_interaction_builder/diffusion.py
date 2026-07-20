@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 
-MODEL_CONDITION_DIM = 18
+MODEL_CONDITION_DIM = 24
 FUNNEL_CHANNELS = 4
 FUNNEL_SAMPLES = 16
 DIFFUSION_STEPS = 1000
@@ -83,7 +83,7 @@ class FunnelDenoiser(nn.Module):
         if x.ndim != 3 or tuple(x.shape[1:]) != (FUNNEL_CHANNELS, FUNNEL_SAMPLES):
             raise ValueError(f"expected x shape [B, 4, 16], got {tuple(x.shape)}")
         if condition.ndim != 2 or condition.shape[1] != MODEL_CONDITION_DIM:
-            raise ValueError("condition must have shape [B, 18]")
+            raise ValueError("condition must have shape [B, 24]")
         embedding = torch.cat(
             (self.timestep(_timestep_embedding(timestep)), self.condition(condition)),
             dim=1,
@@ -113,7 +113,7 @@ def sample_ddim(
 ) -> torch.Tensor:
     """Sample a deterministic proposal-major batch, shaped [B, 32, 16, 4]."""
     if condition.ndim != 2 or condition.shape[1] != MODEL_CONDITION_DIM:
-        raise ValueError("condition must have shape [B, 18]")
+        raise ValueError("condition must have shape [B, 24]")
     generator = torch.Generator(device="cpu").manual_seed(seed)
     batch = condition.shape[0]
     x = torch.randn(
@@ -160,7 +160,7 @@ def sample_x0(
 ) -> torch.Tensor:
     """Predict clean funnels once from maximum-noise latent proposals."""
     if condition.ndim != 2 or condition.shape[1] != MODEL_CONDITION_DIM:
-        raise ValueError("condition must have shape [B, 18]")
+        raise ValueError("condition must have shape [B, 24]")
     generator = torch.Generator(device="cpu").manual_seed(seed)
     batch = condition.shape[0]
     latent = torch.randn(
@@ -192,8 +192,8 @@ def train_funnel(
     device: str | None = None,
 ) -> dict:
     """Train and publish one self-contained, normalized funnel checkpoint."""
-    if conditions.ndim != 2 or tuple(conditions.shape[1:]) != (18,):
-        raise ValueError("conditions must have shape [N, 18]")
+    if conditions.ndim != 2 or tuple(conditions.shape[1:]) != (MODEL_CONDITION_DIM,):
+        raise ValueError("conditions must have shape [N, 24]")
     if funnels.ndim != 3 or tuple(funnels.shape[1:]) != (16, 4):
         raise ValueError("funnels must have shape [N, 16, 4]")
     if len(conditions) != len(funnels) or len(conditions) == 0:
@@ -220,14 +220,20 @@ def train_funnel(
         noise = torch.randn(clean.shape, generator=generator, device=target_device)
         noised = torch.sqrt(alpha_bar) * clean + torch.sqrt(1.0 - alpha_bar) * noise
         prediction = model(noised, timestep, condition)
-        loss = torch.nn.functional.mse_loss(prediction, clean)
+        loss = torch.nn.functional.mse_loss(
+            prediction[:, :, :15], noise[:, :, :15])
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
     checkpoint = {
-        "schema_version": 1,
-        "prediction_type": "x0",
+        "schema_version": 2,
+        "condition_dim": MODEL_CONDITION_DIM,
+        "knot_frame_offsets": (
+            0, 5, 10, 15, 20, 25, 30, 35,
+            39, 44, 49, 54, 59, 64, 69, 74,
+        ),
+        "prediction_type": "epsilon",
         "seed": seed,
         "model": model.cpu().state_dict(),
         "condition_mean": condition_mean.cpu(),
@@ -244,8 +250,15 @@ def train_funnel(
 
 def load_funnel_checkpoint(path: Path, *, device: str = "cpu") -> tuple[FunnelDenoiser, DiffusionSchedule, dict]:
     checkpoint = torch.load(Path(path), map_location=device, weights_only=False)
-    if checkpoint.get("schema_version") != 1:
+    if checkpoint.get("schema_version") != 2:
         raise ValueError("unsupported funnel checkpoint schema")
+    if checkpoint.get("condition_dim") != MODEL_CONDITION_DIM:
+        raise ValueError("unsupported funnel checkpoint condition dimension")
+    if tuple(checkpoint.get("knot_frame_offsets", ())) != (
+        0, 5, 10, 15, 20, 25, 30, 35,
+        39, 44, 49, 54, 59, 64, 69, 74,
+    ):
+        raise ValueError("unsupported funnel checkpoint knot timing")
     if checkpoint.get("prediction_type") not in {"epsilon", "x0"}:
         raise ValueError("checkpoint has no valid prediction type")
     model = FunnelDenoiser().to(device)
@@ -281,9 +294,13 @@ def sample_checkpoint(
             prediction_type="epsilon",
         )
     samples = normalized_samples * checkpoint["funnel_scale"].to(device) + checkpoint["funnel_mean"].to(device)
-    yaw = samples[..., 2:4].to(torch.float64)
+    samples[..., 15, 0] = 0.0
+    samples[..., 15, 1] = 0.0
+    samples[..., 15, 2] = 0.0
+    samples[..., 15, 3] = 1.0
+    yaw = samples[..., :15, 2:4].to(torch.float64)
     norm = torch.linalg.vector_norm(yaw, dim=-1, keepdim=True)
     if not torch.isfinite(norm).all() or (norm < 1e-8).any():
         raise ValueError("sampled yaw direction is degenerate")
-    samples[..., 2:4] = (yaw / norm).to(torch.float32)
+    samples[..., :15, 2:4] = (yaw / norm).to(torch.float32)
     return samples

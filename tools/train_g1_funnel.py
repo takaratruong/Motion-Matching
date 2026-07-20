@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train the object/grasp-conditioned interaction funnel model."""
+"""Train the object/grasp/entry-conditioned interaction funnel model."""
 
 import argparse
 from pathlib import Path

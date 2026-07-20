@@ -33,7 +33,7 @@
 
 - Modify: `resources/g1_interaction_builder/funnel_dataset.py`
 - Modify: `resources/g1_interaction_builder/diffusion.py`
-- Modify: `tools/train_g1_funnel_diffusion.py`
+- Modify: `tools/train_g1_funnel.py`
 - Modify: `tests/python/test_funnel_dataset.py`
 - Modify: `tests/python/test_diffusion_model.py`
 - Replace generated: `build/g1-funnels/checkpoint.pt`
@@ -73,15 +73,16 @@ Add a synthetic world-transform invariance test: apply the same planar translati
 
 - [ ] **Step 2: Write failing model and checkpoint tests**
 
-Change test tensors to `[B,24]` and require knot 15 to be restored exactly after sampling:
+Change test tensors to `[B,24]` and require knot 15 to be restored exactly by
+`sample_checkpoint`, after denormalization:
 
 ```python
-condition = torch.zeros((2, 24), dtype=torch.float32)
-samples = sample_x0(model, condition, seed=11)
-self.assertEqual(tuple(samples.shape), (2, 32, 16, 4))
+condition = torch.zeros((1, 24), dtype=torch.float32)
+samples = sample_checkpoint(checkpoint_path, condition, seed=11)
+self.assertEqual(tuple(samples.shape), (1, 32, 16, 4))
 expected = torch.tensor([0.0, 0.0, 0.0, 1.0])
 self.assertTrue(torch.equal(
-    samples[:, :, 15], expected.expand(2, 32, 4)))
+    samples[:, :, 15], expected.expand(1, 32, 4)))
 ```
 
 Require a one-step training checkpoint to have `schema_version == 2`, condition normalization shape `(24,)`, and `knot_frame_offsets` equal the frozen tuple.
@@ -157,13 +158,19 @@ Run:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 build/venvs/g1-funnels/bin/python \
-  tools/train_g1_funnel_diffusion.py \
+  -m tools.train_g1_funnel \
   --pack build/smart-pickup/full-pack \
   --output build/g1-funnels/checkpoint.pt \
   --steps 20000
 ```
 
-Then sample 64 spread-out retained conditions with seed `2026071901`. Require at least 95% of all 2,048 proposals and at least 60 of 64 condition batches to contain one certifiable proposal. Stop and diagnose if either gate fails.
+Then sample 64 spread-out retained conditions with seed `2026071901`.
+Require every condition to retain at least eight certifiable proposals and the
+median within-batch pairwise flattened-trajectory distance to be at least
+`0.05`. Report total acceptance as a diagnostic, not as a gate: requiring nearly
+every noisy proposal to pass rewards conditional-mean mode collapse rather than
+useful diffusion diversity. Stop and diagnose if either survivor or diversity
+gate fails.
 
 - [ ] **Step 8: Commit and push**
 
@@ -490,4 +497,3 @@ The feature is complete only when:
 - two entry bearings select different learned trajectories for the same grasp;
 - authored fallback regressions pass; and
 - the exact verified commit is pushed to `checkpoint/g1-tabletop-placement`.
-
