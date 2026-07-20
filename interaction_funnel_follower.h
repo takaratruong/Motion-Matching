@@ -2,14 +2,13 @@
 
 // Pure 25 Hz learned-funnel follower.
 //
-// The follower consumes one certified proposal's execution-order samples and
-// publishes each sample exactly once on consecutive 25 Hz ticks. It is a pure
-// state machine: it reads the tracked planar pose and produces a target to
-// publish, but never writes the simulation root, displayed root, joints, the
-// object registry, or attachment state. Callers apply the published target.
+// The follower consumes one certified proposal's execution-order samples as a
+// geometric route. On consecutive 25 Hz ticks it advances monotonic spatial
+// progress and publishes a point ahead of the tracked root. It never writes
+// simulation state; callers apply the published target through locomotion.
 //
-// The follower cancels (terminally) on a missed tick or when tracking error
-// exceeds 0.18 m of translation or 25 degrees of yaw.
+// The follower cancels on missed ticks, timeout, or when the tracked root is
+// more than 0.18 m or 25 degrees from the remaining route.
 
 #include "interaction_funnel_timing.h"
 
@@ -30,11 +29,17 @@ enum class FunnelCancelReason {
     MissedTick,
     TranslationError,
     YawError,
+    Timeout,
 };
 
 // Tracking thresholds above which the follower cancels.
 constexpr float kFunnelMaxTrackingTranslation = 0.18F;        // metres
 constexpr float kFunnelMaxTrackingYawRadians = 0.43633231F;   // 25 degrees
+constexpr float kFunnelLookaheadDistance = 0.12F;
+constexpr float kFunnelTerminalPositionTolerance = 0.04F;
+constexpr float kFunnelTerminalYawTolerance = 0.34906585F;   // 20 degrees
+constexpr uint32_t kFunnelRequiredTerminalTicks = 3U;
+constexpr uint32_t kFunnelMaximumFollowTicks = 250U;
 
 // One 25 Hz observation: the monotonically increasing tick index and the
 // current tracked object-local planar pose (x, z, sin(yaw), cos(yaw)).
@@ -55,6 +60,9 @@ struct FunnelFollowerDiagnostics {
     FunnelFollowerState state = FunnelFollowerState::Following;
     FunnelCancelReason cancel_reason = FunnelCancelReason::None;
     int published_count = 0;
+    int progress_index = 0;
+    int lookahead_index = 0;
+    uint32_t terminal_settle_ticks = 0U;
     uint64_t proposal_seed = 0U;
 };
 
@@ -80,8 +88,8 @@ private:
     const uint64_t proposal_seed_;
     const FunnelExecutionTargets targets_;
     uint64_t expected_tick_index_;
-    bool started_ = false;
-    int next_sample_ = 0;
+    uint32_t follow_ticks_ = 0U;
+    int progress_index_ = 0;
     FunnelFollowerDiagnostics diagnostics_{};
 };
 
