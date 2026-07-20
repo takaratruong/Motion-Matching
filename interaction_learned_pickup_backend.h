@@ -83,6 +83,7 @@ private:
     PickAssistStart start_{};
     FunnelCaptureSelection capture_{};
     Transform frozen_entry_world_{};
+    Transform frozen_object_world_{};
     FunnelProposalRequest proposal_request_{};
     std::vector<PickAssistPreviewRequest> selection_requests_{};
     std::vector<size_t> selection_proposal_indices_{};

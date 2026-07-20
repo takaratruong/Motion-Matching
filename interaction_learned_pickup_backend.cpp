@@ -53,52 +53,52 @@ bool same_root(PickEntryRoot left, PickEntryRoot right) {
     return std::memcmp(a, b, sizeof(a)) == 0;
 }
 
-Transform relative_to_world(
-    Transform entry,
-    const FunnelSample& relative) {
-    const double entry_yaw = yaw_of(entry.rotation);
-    const double sine = std::sin(entry_yaw);
-    const double cosine = std::cos(entry_yaw);
-    const double relative_yaw = std::atan2(
-        static_cast<double>(relative.yaw_sin),
-        static_cast<double>(relative.yaw_cos));
+Transform object_local_to_world(
+    Transform object,
+    const FunnelSample& local) {
+    const double object_yaw = yaw_of(object.rotation);
+    const double sine = std::sin(object_yaw);
+    const double cosine = std::cos(object_yaw);
+    const double local_yaw = std::atan2(
+        static_cast<double>(local.yaw_sin),
+        static_cast<double>(local.yaw_cos));
     return {
         vec3(
-            static_cast<float>(entry.position.x +
-                cosine * relative.x + sine * relative.z),
-            entry.position.y,
-            static_cast<float>(entry.position.z -
-                sine * relative.x + cosine * relative.z)),
+            static_cast<float>(object.position.x +
+                cosine * local.x - sine * local.z),
+            object.position.y,
+            static_cast<float>(object.position.z +
+                sine * local.x + cosine * local.z)),
         quat_from_angle_axis(
-            static_cast<float>(entry_yaw + relative_yaw),
+            static_cast<float>(object_yaw + local_yaw),
             vec3(0.0F, 1.0F, 0.0F)),
     };
 }
 
-FunnelSample world_to_relative(Transform entry, Transform world) {
-    const double entry_yaw = yaw_of(entry.rotation);
+FunnelSample world_to_object_local(Transform object, Transform world) {
+    const double object_yaw = yaw_of(object.rotation);
     const double world_yaw = yaw_of(world.rotation);
-    const double sine = std::sin(entry_yaw);
-    const double cosine = std::cos(entry_yaw);
-    const double dx = static_cast<double>(world.position.x) - entry.position.x;
-    const double dz = static_cast<double>(world.position.z) - entry.position.z;
-    const double relative_yaw = world_yaw - entry_yaw;
+    const double sine = std::sin(object_yaw);
+    const double cosine = std::cos(object_yaw);
+    const double dx = static_cast<double>(world.position.x) - object.position.x;
+    const double dz = static_cast<double>(world.position.z) - object.position.z;
+    const double local_yaw = world_yaw - object_yaw;
     return {
-        static_cast<float>(cosine * dx - sine * dz),
-        static_cast<float>(sine * dx + cosine * dz),
-        static_cast<float>(std::sin(relative_yaw)),
-        static_cast<float>(std::cos(relative_yaw)),
+        static_cast<float>(cosine * dx + sine * dz),
+        static_cast<float>(-sine * dx + cosine * dz),
+        static_cast<float>(std::sin(local_yaw)),
+        static_cast<float>(std::cos(local_yaw)),
     };
 }
 
 FunnelExecutionTargets world_targets(
-    Transform entry,
+    Transform object,
     const FunnelProposal& proposal) {
-    const FunnelExecutionTargets relative =
+    const FunnelExecutionTargets local =
         expand_funnel_execution(proposal.samples);
     FunnelExecutionTargets world{};
     for (size_t index = 0U; index < world.size(); ++index) {
-        const Transform target = relative_to_world(entry, relative[index]);
+        const Transform target = object_local_to_world(object, local[index]);
         world[index] = {
             target.position.x,
             target.position.z,
@@ -164,6 +164,7 @@ bool LearnedSmartPickupBackend::begin(
         return false;
     }
     start_ = start;
+    frozen_object_world_ = start_.target_snapshot.object_world;
     if (start_.live_obstacles.empty()) start_.live_obstacles = start_.obstacles;
     capture_ = select_funnel_capture(
         start.root_world, start.target_snapshot,
@@ -212,6 +213,23 @@ PickAssistOutput LearnedSmartPickupBackend::observe_learned(
         return fail(observation.runtime_state == RuntimeState::Locomotion
             ? LearnedPickupFailureReason::TargetChanged
             : LearnedPickupFailureReason::RuntimeChanged);
+    }
+
+    const float object_radius = planar_distance(
+        observation.displayed_root.position,
+        start_.target_snapshot.object_world.position);
+    if ((learned_diagnostics_.state == LearnedPickupState::CoarseCapture ||
+         learned_diagnostics_.state == LearnedPickupState::CaptureSettling) &&
+        object_radius >= config_.capture.minimum_object_radius_m &&
+        object_radius <= config_.capture.maximum_object_radius_m) {
+        const FunnelCaptureSelection live_capture = select_funnel_capture(
+            observation.displayed_root,
+            start_.target_snapshot,
+            observation.live_obstacles,
+            config_.capture);
+        if (live_capture.reason == PickSlotReason::None) {
+            capture_ = live_capture;
+        }
     }
 
     const float capture_error = planar_distance(
@@ -327,7 +345,7 @@ PickAssistOutput LearnedSmartPickupBackend::observe_learned(
             if (!proposal.accepted) continue;
             ++accepted;
             const FunnelExecutionTargets targets =
-                world_targets(frozen_entry_world_, proposal);
+                world_targets(frozen_object_world_, proposal);
             bool route_valid = true;
             Transform previous = frozen_entry_world_;
             for (const FunnelSample& target : targets) {
@@ -382,7 +400,7 @@ PickAssistOutput LearnedSmartPickupBackend::observe_learned(
             }
             const size_t proposal_index = selection_proposal_indices_[index];
             const FunnelExecutionTargets targets = world_targets(
-                frozen_entry_world_, artifact_->proposals()[proposal_index]);
+                frozen_object_world_, artifact_->proposals()[proposal_index]);
             double route = 0.0;
             for (size_t tick = 1U; tick < targets.size(); ++tick) {
                 route += planar_distance(
@@ -423,7 +441,7 @@ PickAssistOutput LearnedSmartPickupBackend::observe_learned(
         }
         const size_t proposal_index = selection_proposal_indices_[*winner];
         const FunnelProposal& proposal = artifact_->proposals()[proposal_index];
-        selected_world_targets_ = world_targets(frozen_entry_world_, proposal);
+        selected_world_targets_ = world_targets(frozen_object_world_, proposal);
         final_root_ = entry_root(selected_world_targets_.back());
         follower_.emplace(
             proposal.seed, proposal.samples, observation.controller_tick + 1U);
@@ -436,7 +454,7 @@ PickAssistOutput LearnedSmartPickupBackend::observe_learned(
         return braking_output();
     }
     case LearnedPickupState::FunnelFollow: {
-        const int next = follower_->diagnostics().published_count;
+        const int next = follower_->diagnostics().progress_index;
         Transform previous = observation.displayed_root;
         for (int tick = next; tick < kFunnelExecutionTickCount; ++tick) {
             const Transform target = target_transform(
@@ -452,8 +470,8 @@ PickAssistOutput LearnedSmartPickupBackend::observe_learned(
         }
         const FunnelFollowerOutput followed = follower_->tick({
             observation.controller_tick,
-            world_to_relative(
-                frozen_entry_world_, observation.displayed_root),
+            world_to_object_local(
+                frozen_object_world_, observation.displayed_root),
         });
         refresh_follower_diagnostics();
         if (followed.state == FunnelFollowerState::Cancelled) {
@@ -471,8 +489,8 @@ PickAssistOutput LearnedSmartPickupBackend::observe_learned(
             return output;
         }
         if (!followed.published) return braking_output();
-        const Transform target = relative_to_world(
-            frozen_entry_world_, followed.sample);
+        const Transform target = object_local_to_world(
+            frozen_object_world_, followed.sample);
         PickAssistOutput output{};
         output.override_steering = true;
         output.left_stick = arrival_navigation_stick(
@@ -579,6 +597,10 @@ void LearnedSmartPickupBackend::refresh_follower_diagnostics() {
     learned_diagnostics_.follower_state = follower.state;
     learned_diagnostics_.follower_cancel_reason = follower.cancel_reason;
     learned_diagnostics_.follower_published_count = follower.published_count;
+    learned_diagnostics_.follower_progress_index = follower.progress_index;
+    learned_diagnostics_.follower_lookahead_index = follower.lookahead_index;
+    learned_diagnostics_.follower_terminal_settle_ticks =
+        follower.terminal_settle_ticks;
 }
 
 PickAssistOutput LearnedSmartPickupBackend::fail(

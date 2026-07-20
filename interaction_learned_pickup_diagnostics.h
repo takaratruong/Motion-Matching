@@ -59,6 +59,9 @@ struct LearnedPickupDiagnostics {
     FunnelFollowerState follower_state = FunnelFollowerState::Following;
     FunnelCancelReason follower_cancel_reason = FunnelCancelReason::None;
     int follower_published_count = 0;
+    int follower_progress_index = 0;
+    int follower_lookahead_index = 0;
+    uint32_t follower_terminal_settle_ticks = 0U;
     int selected_proposal_index = -1;
     uint32_t settled_capture_ticks = 0U;
     uint32_t proposal_pending_ticks = 0U;
