@@ -21,6 +21,8 @@ using interaction::PickAssistReason;
 using interaction::PickAssistState;
 using interaction::SmartPickupAssistBackend;
 using interaction::kFunnelConditionDim;
+using interaction::kFunnelExecutionTickCount;
+using interaction::kFunnelKnotCount;
 using interaction::kFunnelProposalCount;
 using interaction::kFunnelSampleCount;
 using interaction::kFunnelSampleWidth;
@@ -119,17 +121,29 @@ void test_arm_selects_first_accepted_seed() {
 void test_follower_publishes_accepted_samples_once() {
     LearnedSmartPickupBackend backend(make_artifact());
     assert(backend.arm(0U));
+    std::array<interaction::FunnelSample, kFunnelKnotCount> knots{};
+    for (int knot = 0; knot < kFunnelKnotCount; ++knot) {
+        knots[static_cast<size_t>(knot)] = sample_at(
+            0.04F * static_cast<float>(knot));
+    }
+    const auto targets = interaction::expand_funnel_execution(knots);
     interaction::FunnelFollowerOutput first = backend.follow({0U, sample_at(0.0F)});
     assert(first.published);
     assert(first.sample.x == 0.0F);
-    for (int s = 1; s < kFunnelSampleCount; ++s) {
+    for (int tick = 1; tick < kFunnelExecutionTickCount; ++tick) {
         interaction::FunnelFollowerOutput out =
-            backend.follow({static_cast<uint64_t>(s), sample_at(0.04F * static_cast<float>(s - 1))});
+            backend.follow({static_cast<uint64_t>(tick),
+                            targets[static_cast<size_t>(tick - 1)]});
         assert(out.published);
-        assert(out.sample.x == 0.04F * static_cast<float>(s));
+        assert(out.sample.x == targets[static_cast<size_t>(tick)].x);
     }
+    assert(backend.learned_diagnostics().follower_state == FunnelFollowerState::Following);
+    const auto completed = backend.follow(
+        {static_cast<uint64_t>(kFunnelExecutionTickCount), targets.back()});
+    assert(!completed.published);
     assert(backend.learned_diagnostics().follower_state == FunnelFollowerState::Completed);
-    assert(backend.learned_diagnostics().follower_published_count == kFunnelSampleCount);
+    assert(backend.learned_diagnostics().follower_published_count ==
+           kFunnelExecutionTickCount);
 }
 
 void test_follow_before_arm_publishes_nothing() {

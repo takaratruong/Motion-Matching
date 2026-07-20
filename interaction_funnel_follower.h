@@ -11,7 +11,7 @@
 // The follower cancels (terminally) on a missed tick or when tracking error
 // exceeds 0.18 m of translation or 25 degrees of yaw.
 
-#include "interaction_funnel_artifact.h"
+#include "interaction_funnel_timing.h"
 
 #include <array>
 #include <cstdint>
@@ -78,7 +78,7 @@ public:
 
 private:
     const uint64_t proposal_seed_;
-    const std::array<FunnelSample, kFunnelSampleCount> samples_;
+    const FunnelExecutionTargets targets_;
     uint64_t expected_tick_index_;
     bool started_ = false;
     int next_sample_ = 0;

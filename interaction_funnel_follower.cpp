@@ -25,7 +25,7 @@ InteractionFunnelFollower::InteractionFunnelFollower(
     const std::array<FunnelSample, kFunnelSampleCount>& samples,
     uint64_t first_tick_index)
     : proposal_seed_(proposal_seed),
-      samples_(samples),
+      targets_(expand_funnel_execution(samples)),
       expected_tick_index_(first_tick_index) {
     diagnostics_.proposal_seed = proposal_seed;
     diagnostics_.state = FunnelFollowerState::Following;
@@ -52,7 +52,7 @@ FunnelFollowerOutput InteractionFunnelFollower::tick(const FunnelFollowerInput& 
     // Before publishing anything past the first sample, verify the robot has
     // tracked the previously published target closely enough.
     if (started_) {
-        const FunnelSample& last_target = samples_[static_cast<size_t>(next_sample_ - 1)];
+        const FunnelSample& last_target = targets_[static_cast<size_t>(next_sample_ - 1)];
         if (translation_error(input.tracked_pose, last_target) >
             kFunnelMaxTrackingTranslation) {
             cancel(FunnelCancelReason::TranslationError);
@@ -64,14 +64,19 @@ FunnelFollowerOutput InteractionFunnelFollower::tick(const FunnelFollowerInput& 
         }
     }
 
-    FunnelSample published = samples_[static_cast<size_t>(next_sample_)];
+    // Target 74 must be observed on the following native tick before the
+    // learned approach is considered complete.
+    if (next_sample_ >= kFunnelExecutionTickCount) {
+        ++expected_tick_index_;
+        diagnostics_.state = FunnelFollowerState::Completed;
+        return {false, FunnelSample{}, diagnostics_.state};
+    }
+
+    FunnelSample published = targets_[static_cast<size_t>(next_sample_)];
     ++next_sample_;
     ++expected_tick_index_;
     started_ = true;
     ++diagnostics_.published_count;
-    if (next_sample_ >= kFunnelSampleCount) {
-        diagnostics_.state = FunnelFollowerState::Completed;
-    }
     return {true, published, diagnostics_.state};
 }
 
