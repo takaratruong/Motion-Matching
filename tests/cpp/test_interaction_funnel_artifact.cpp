@@ -17,9 +17,11 @@ using interaction::kFunnelProposalCount;
 using interaction::kFunnelSampleCount;
 using interaction::kFunnelSampleWidth;
 
+static_assert(kFunnelConditionDim == 24);
+
 // Mirror the on-disk canonical little-endian layout so the test can build
 // deliberately corrupt buffers without depending on the loader internals.
-constexpr char kMagic[8] = {'G', '1', 'F', 'U', 'N', 'N', 'L', '1'};
+constexpr char kMagic[8] = {'G', '1', 'F', 'U', 'N', 'N', 'L', '2'};
 
 void append_u32(std::vector<uint8_t>& bytes, uint32_t value) {
     for (int i = 0; i < 4; ++i) {
@@ -40,6 +42,9 @@ void append_f32(std::vector<uint8_t>& bytes, float value) {
 }
 
 struct BufferPlan {
+    uint64_t request_id = 7U;
+    uint64_t batch_seed = 2026071901U;
+    std::array<uint8_t, 32> checkpoint_sha256{};
     std::array<float, kFunnelConditionDim> condition{};
     // proposals[p][s][component]
     std::array<std::array<std::array<float, kFunnelSampleWidth>, kFunnelSampleCount>,
@@ -49,17 +54,20 @@ struct BufferPlan {
     std::array<uint8_t, kFunnelProposalCount> accepted{};
 };
 
-// A smooth, certifiable proposal: advances 0.2 m along x over 16 samples with a
-// constant object-local z and unit yaw vector (sin=0.6, cos=0.8).
+// A smooth, certifiable execution proposal beginning at the exact entry
+// identity and advancing 0.2 m in x, 0.125 m in z, and 0.1 rad in yaw.
 BufferPlan make_valid_plan() {
     BufferPlan plan{};
+    for (size_t i = 0; i < plan.checkpoint_sha256.size(); ++i) {
+        plan.checkpoint_sha256[i] = static_cast<uint8_t>(i);
+    }
     for (int p = 0; p < kFunnelProposalCount; ++p) {
         for (int s = 0; s < kFunnelSampleCount; ++s) {
             float t = static_cast<float>(s) / static_cast<float>(kFunnelSampleCount - 1);
             plan.proposals[p][s][0] = 0.2F * t;  // x
-            plan.proposals[p][s][1] = 0.125F;     // z
-            plan.proposals[p][s][2] = 0.6F;       // yaw sin
-            plan.proposals[p][s][3] = 0.8F;       // yaw cos
+            plan.proposals[p][s][1] = 0.125F * t;  // z
+            plan.proposals[p][s][2] = std::sin(0.1F * t);  // yaw sin
+            plan.proposals[p][s][3] = std::cos(0.1F * t);  // yaw cos
         }
         plan.seeds[p] = static_cast<uint64_t>(p);
         plan.accepted[p] = 1U;
@@ -72,11 +80,15 @@ std::vector<uint8_t> serialize(const BufferPlan& plan) {
     for (char c : kMagic) {
         bytes.push_back(static_cast<uint8_t>(c));
     }
-    append_u32(bytes, 1U);  // schema_version
+    append_u32(bytes, 2U);  // schema_version
     append_u32(bytes, static_cast<uint32_t>(kFunnelConditionDim));
     append_u32(bytes, static_cast<uint32_t>(kFunnelProposalCount));
     append_u32(bytes, static_cast<uint32_t>(kFunnelSampleCount));
     append_u32(bytes, static_cast<uint32_t>(kFunnelSampleWidth));
+    append_u64(bytes, plan.request_id);
+    append_u64(bytes, plan.batch_seed);
+    bytes.insert(
+        bytes.end(), plan.checkpoint_sha256.begin(), plan.checkpoint_sha256.end());
     for (float value : plan.condition) {
         append_f32(bytes, value);
     }
@@ -114,6 +126,9 @@ void test_valid_round_trip_preserves_all_fields() {
 
     InteractionFunnelArtifact artifact = InteractionFunnelArtifact::load(serialize(plan));
 
+    assert(artifact.request_id() == 7U);
+    assert(artifact.batch_seed() == 2026071901U);
+    assert(artifact.checkpoint_sha256()[31] == 31U);
     for (int i = 0; i < kFunnelConditionDim; ++i) {
         assert(artifact.condition()[static_cast<size_t>(i)] == static_cast<float>(i) * 0.5F);
     }
@@ -122,9 +137,9 @@ void test_valid_round_trip_preserves_all_fields() {
         assert(proposals[static_cast<size_t>(p)].seed == static_cast<uint64_t>(p));
         assert(proposals[static_cast<size_t>(p)].accepted == (p != 5));
         assert(proposals[static_cast<size_t>(p)].samples[15].x == 0.2F);
-        assert(proposals[static_cast<size_t>(p)].samples[0].z == 0.125F);
-        assert(proposals[static_cast<size_t>(p)].samples[0].yaw_sin == 0.6F);
-        assert(proposals[static_cast<size_t>(p)].samples[0].yaw_cos == 0.8F);
+        assert(proposals[static_cast<size_t>(p)].samples[15].z == 0.125F);
+        assert(proposals[static_cast<size_t>(p)].samples[15].yaw_sin == std::sin(0.1F));
+        assert(proposals[static_cast<size_t>(p)].samples[15].yaw_cos == std::cos(0.1F));
     }
 }
 
@@ -148,7 +163,7 @@ void test_bad_magic_is_rejected() {
 
 void test_bad_schema_version_is_rejected() {
     std::vector<uint8_t> bytes = serialize(make_valid_plan());
-    bytes[8] = 2U;  // first byte of schema_version
+    bytes[8] = 3U;  // first byte of schema_version
     assert(throws_runtime(bytes));
 }
 

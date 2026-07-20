@@ -2,10 +2,9 @@
 
 // Strict, portable learned-funnel proposal artifact.
 //
-// The controller loads a complete offline artifact before learned mode starts;
-// it never runs Python or Torch. The artifact is a canonical little-endian
-// binary blob produced by resources/g1_interaction_builder/proposal_artifact.py
-// and owned here by a strict C++ loader that rejects any malformed input.
+// An asynchronous worker publishes a complete canonical little-endian binary
+// blob. The controller only loads the completed response and strictly matches
+// it to the frozen request before learned movement starts.
 
 #include <array>
 #include <cstddef>
@@ -17,7 +16,7 @@ namespace interaction {
 // Frozen artifact dimensions. Exactly one condition vector, 32 proposals, 16
 // samples per proposal, and four float32 values per sample. The byte and field
 // order is frozen as object-local (x, z, sin(yaw), cos(yaw)).
-constexpr int kFunnelConditionDim = 18;
+constexpr int kFunnelConditionDim = 24;
 constexpr int kFunnelProposalCount = 32;
 constexpr int kFunnelSampleCount = 16;
 constexpr int kFunnelSampleWidth = 4;
@@ -53,6 +52,11 @@ public:
     // violates the translation, yaw, or arc-length constraints.
     static InteractionFunnelArtifact load(const std::vector<uint8_t>& bytes);
 
+    uint64_t request_id() const { return request_id_; }
+    uint64_t batch_seed() const { return batch_seed_; }
+    const std::array<uint8_t, 32>& checkpoint_sha256() const {
+        return checkpoint_sha256_;
+    }
     const std::array<float, kFunnelConditionDim>& condition() const {
         return condition_;
     }
@@ -63,6 +67,9 @@ public:
 private:
     InteractionFunnelArtifact() = default;
 
+    uint64_t request_id_ = 0U;
+    uint64_t batch_seed_ = 0U;
+    std::array<uint8_t, 32> checkpoint_sha256_{};
     std::array<float, kFunnelConditionDim> condition_{};
     std::array<FunnelProposal, kFunnelProposalCount> proposals_{};
 };

@@ -20,8 +20,11 @@ def _smooth_artifact():
     proposals[..., 3] = 1.0
     proposals[..., 0] = np.linspace(0.0, 0.2, 16)
     return ProposalArtifact(
-        1,
-        np.arange(18, dtype=np.float32) * 0.25,
+        2,
+        7,
+        2_026_071_901,
+        bytes(range(32)),
+        np.arange(24, dtype=np.float32) * 0.25,
         proposals,
         np.arange(32, dtype=np.uint64),
         np.ones(32, bool),
@@ -42,18 +45,25 @@ class ProposalArtifactTests(unittest.TestCase):
         proposals = np.zeros((32, 16, 4), dtype=np.float32)
         proposals[..., 3] = 1.0
         proposals[..., 0] = np.linspace(0.0, 0.2, 16)
-        artifact = ProposalArtifact(1, np.zeros(18, np.float32), proposals, np.arange(32, dtype=np.uint64), np.ones(32, bool))
+        artifact = ProposalArtifact(
+            2, 7, 2_026_071_901, bytes(range(32)),
+            np.zeros(24, np.float32), proposals,
+            np.arange(32, dtype=np.uint64), np.ones(32, bool))
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "proposals.npz"
             write_proposal_artifact(path, artifact)
             loaded = read_proposal_artifact(path)
         np.testing.assert_array_equal(loaded.proposals, proposals)
         self.assertEqual(int(loaded.accepted.sum()), 32)
+        self.assertEqual(loaded.request_id, 7)
+        self.assertEqual(loaded.batch_seed, 2_026_071_901)
+        self.assertEqual(loaded.checkpoint_sha256, bytes(range(32)))
 
     def test_serialized_blob_is_canonical_little_endian_length(self):
         blob = serialize_proposal_artifact(_smooth_artifact())
-        # header (28) + condition (72) + proposals (8192) + seeds (256) + flags (32)
-        self.assertEqual(len(blob), 8580)
+        # header (28) + IDs (16) + digest (32) + condition (96) +
+        # proposals (8192) + seeds (256) + flags (32)
+        self.assertEqual(len(blob), 8652)
         self.assertEqual(blob[:8], MAGIC)
 
     def test_truncated_blob_is_rejected(self):
@@ -76,7 +86,10 @@ class ProposalArtifactTests(unittest.TestCase):
         artifact = _smooth_artifact()
         seeds = np.arange(32, dtype=np.uint64)
         seeds[5] = seeds[4]
-        artifact = ProposalArtifact(1, artifact.condition, artifact.proposals, seeds, artifact.accepted)
+        artifact = ProposalArtifact(
+            2, artifact.request_id, artifact.batch_seed,
+            artifact.checkpoint_sha256, artifact.condition,
+            artifact.proposals, seeds, artifact.accepted)
         with self.assertRaises(ValueError):
             serialize_proposal_artifact(artifact)
 
@@ -84,7 +97,10 @@ class ProposalArtifactTests(unittest.TestCase):
         artifact = _smooth_artifact()
         proposals = np.array(artifact.proposals)
         proposals[3, 8, 0] = 1.0  # violates 0.08 m translation step
-        artifact = ProposalArtifact(1, artifact.condition, proposals, artifact.seeds, artifact.accepted)
+        artifact = ProposalArtifact(
+            2, artifact.request_id, artifact.batch_seed,
+            artifact.checkpoint_sha256, artifact.condition,
+            proposals, artifact.seeds, artifact.accepted)
         with self.assertRaises(ValueError):
             serialize_proposal_artifact(artifact)
 

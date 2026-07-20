@@ -145,6 +145,7 @@ CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_smart_pickup_scene
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_smart_pickup_scenarios
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_stationary_motion_matching
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_funnel_artifact
+CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_funnel_worker
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_funnel_follower
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_learned_pickup_backend
 RELEASE_FAST_MATH_TARGET_TEST := \
@@ -342,6 +343,9 @@ $(PICK_ASSIST_RELEASE_FAST_MATH_TEST): tests/cpp/test_interaction_pick_assist.cp
 
 $(CPP_TEST_DIR)/test_interaction_funnel_artifact: tests/cpp/test_interaction_funnel_artifact.cpp interaction_funnel_artifact.cpp interaction_funnel_artifact.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_funnel_artifact.cpp interaction_funnel_artifact.cpp -o $@
+
+$(CPP_TEST_DIR)/test_interaction_funnel_worker: tests/cpp/test_interaction_funnel_worker.cpp interaction_funnel_worker.cpp interaction_funnel_worker.h interaction_funnel_artifact.cpp interaction_funnel_artifact.h | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_funnel_worker.cpp interaction_funnel_worker.cpp interaction_funnel_artifact.cpp -o $@
 
 $(CPP_TEST_DIR)/test_interaction_funnel_follower: tests/cpp/test_interaction_funnel_follower.cpp interaction_funnel_follower.cpp interaction_funnel_follower.h interaction_funnel_artifact.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_funnel_follower.cpp interaction_funnel_follower.cpp -o $@

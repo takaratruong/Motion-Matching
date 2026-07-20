@@ -10,9 +10,9 @@ namespace interaction {
 
 namespace {
 
-// Canonical little-endian header magic. "G1FUNNL1".
-constexpr char kMagic[8] = {'G', '1', 'F', 'U', 'N', 'N', 'L', '1'};
-constexpr uint32_t kSchemaVersion = 1U;
+// Canonical little-endian header magic. "G1FUNNL2".
+constexpr char kMagic[8] = {'G', '1', 'F', 'U', 'N', 'N', 'L', '2'};
+constexpr uint32_t kSchemaVersion = 2U;
 
 // Yaw unit-length tolerance; mirrors the Python writer's np.allclose atol.
 constexpr float kYawUnitTolerance = 2.0e-5F;
@@ -139,6 +139,14 @@ InteractionFunnelArtifact InteractionFunnelArtifact::load(
     }
 
     InteractionFunnelArtifact artifact;
+    artifact.request_id_ = cursor.read_u64();
+    artifact.batch_seed_ = cursor.read_u64();
+    if (artifact.request_id_ == 0U) {
+        throw std::runtime_error("funnel artifact: zero request id");
+    }
+    for (uint8_t& byte : artifact.checkpoint_sha256_) {
+        byte = cursor.read_u8();
+    }
     for (int i = 0; i < kFunnelConditionDim; ++i) {
         artifact.condition_[static_cast<size_t>(i)] = read_finite(cursor, "condition");
     }
@@ -155,6 +163,12 @@ InteractionFunnelArtifact InteractionFunnelArtifact::load(
                 sample.yaw_cos * sample.yaw_cos + sample.yaw_sin * sample.yaw_sin);
             if (std::abs(norm - 1.0F) > kYawUnitTolerance) {
                 throw std::runtime_error("funnel artifact: non-unit yaw vector");
+            }
+            if (s == 0 &&
+                (sample.x != 0.0F || sample.z != 0.0F ||
+                 sample.yaw_sin != 0.0F || sample.yaw_cos != 1.0F)) {
+                throw std::runtime_error(
+                    "funnel artifact: execution proposal does not start at entry");
             }
         }
     }

@@ -2,6 +2,7 @@
 """Generate and certify one learned object/grasp funnel proposal batch."""
 
 import argparse
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -23,17 +24,29 @@ def main() -> None:
     parser.add_argument("--row", type=int, default=0)
     parser.add_argument("--seed", type=int, default=2026071901)
     parser.add_argument("--sampling-steps", type=int, default=1000)
-    parser.add_argument("--output", type=Path, default=Path("build/g1-funnels/beer10-proposals.npz"))
+    parser.add_argument("--request-id", type=int, default=1)
+    parser.add_argument("--output", type=Path, default=Path("build/g1-funnels/beer10-proposals.funnel"))
     args = parser.parse_args()
     dataset = load_dataset(args.pack)
     if not 0 <= args.row < len(dataset.conditions):
         raise SystemExit(f"row must be in [0, {len(dataset.conditions)})")
     condition = torch.from_numpy(dataset.conditions[args.row:args.row + 1])
-    proposals = sample_checkpoint(
+    outward = sample_checkpoint(
         args.checkpoint, condition, seed=args.seed, step_count=args.sampling_steps
     )[0].cpu().numpy()
+    proposals = np.ascontiguousarray(outward[:, ::-1], dtype=np.float32)
     accepted = certify_proposals(proposals)
-    artifact = ProposalArtifact(1, condition[0].numpy(), proposals, np.arange(32, dtype=np.uint64), accepted)
+    checkpoint_sha256 = hashlib.sha256(args.checkpoint.read_bytes()).digest()
+    artifact = ProposalArtifact(
+        2,
+        args.request_id,
+        args.seed,
+        checkpoint_sha256,
+        condition[0].numpy(),
+        proposals,
+        np.asarray([(args.seed + index) % 2**64 for index in range(32)], dtype=np.uint64),
+        accepted,
+    )
     write_proposal_artifact(args.output, artifact)
     print(f"wrote {args.output}: accepted {int(accepted.sum())}/32 proposals")
 

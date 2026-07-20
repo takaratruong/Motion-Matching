@@ -29,7 +29,7 @@ using interaction::kFunnelSampleWidth;
 static_assert(std::is_base_of_v<SmartPickupAssistBackend, LearnedSmartPickupBackend>);
 static_assert(std::has_virtual_destructor_v<SmartPickupAssistBackend>);
 
-constexpr char kMagic[8] = {'G', '1', 'F', 'U', 'N', 'N', 'L', '1'};
+constexpr char kMagic[8] = {'G', '1', 'F', 'U', 'N', 'N', 'L', '2'};
 
 void append_u32(std::vector<uint8_t>& bytes, uint32_t value) {
     for (int i = 0; i < 4; ++i) bytes.push_back(static_cast<uint8_t>((value >> (8 * i)) & 0xFFU));
@@ -43,6 +43,12 @@ void append_f32(std::vector<uint8_t>& bytes, float value) {
     append_u32(bytes, raw);
 }
 
+void append_identity(std::vector<uint8_t>& bytes) {
+    append_u64(bytes, 7U);
+    append_u64(bytes, 2026071901U);
+    for (uint8_t value = 0U; value < 32U; ++value) bytes.push_back(value);
+}
+
 struct SampleTuple {
     float x, z, sin, cos;
 };
@@ -52,11 +58,12 @@ struct SampleTuple {
 InteractionFunnelArtifact make_artifact() {
     std::vector<uint8_t> bytes;
     for (char c : kMagic) bytes.push_back(static_cast<uint8_t>(c));
-    append_u32(bytes, 1U);
+    append_u32(bytes, 2U);
     append_u32(bytes, static_cast<uint32_t>(kFunnelConditionDim));
     append_u32(bytes, static_cast<uint32_t>(kFunnelProposalCount));
     append_u32(bytes, static_cast<uint32_t>(kFunnelSampleCount));
     append_u32(bytes, static_cast<uint32_t>(kFunnelSampleWidth));
+    append_identity(bytes);
     for (int i = 0; i < kFunnelConditionDim; ++i) append_f32(bytes, 0.0F);
     for (int p = 0; p < kFunnelProposalCount; ++p) {
         for (int s = 0; s < kFunnelSampleCount; ++s) {
@@ -162,11 +169,12 @@ void test_arm_is_rejected_when_no_proposal_accepted() {
     // Build an artifact with every proposal rejected.
     std::vector<uint8_t> bytes;
     for (char c : kMagic) bytes.push_back(static_cast<uint8_t>(c));
-    append_u32(bytes, 1U);
+    append_u32(bytes, 2U);
     append_u32(bytes, static_cast<uint32_t>(kFunnelConditionDim));
     append_u32(bytes, static_cast<uint32_t>(kFunnelProposalCount));
     append_u32(bytes, static_cast<uint32_t>(kFunnelSampleCount));
     append_u32(bytes, static_cast<uint32_t>(kFunnelSampleWidth));
+    append_identity(bytes);
     for (int i = 0; i < kFunnelConditionDim; ++i) append_f32(bytes, 0.0F);
     for (int p = 0; p < kFunnelProposalCount; ++p) {
         for (int s = 0; s < kFunnelSampleCount; ++s) {
