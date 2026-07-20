@@ -1,6 +1,6 @@
 # G1 SONIC Responsive Motion-Matching Control Design
 
-**Status:** Approved conversational design, awaiting written-spec review
+**Status:** Approved
 
 ## Purpose
 
