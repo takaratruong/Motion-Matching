@@ -94,8 +94,10 @@ class FunnelDenoiser(nn.Module):
         return self.output(torch.nn.functional.silu(self.output_norm(hidden)))
 
 
-def ddim_timesteps() -> tuple[int, ...]:
-    return tuple(math.floor(i * 999 / 49) for i in range(49, -1, -1))
+def ddim_timesteps(step_count: int = DDIM_STEPS) -> tuple[int, ...]:
+    if step_count <= 0 or step_count > DIFFUSION_STEPS:
+        raise ValueError("step_count must be in [1, 1000]")
+    return tuple(math.floor(i * 999 / (step_count - 1)) for i in range(step_count - 1, -1, -1))
 
 
 @torch.no_grad()
@@ -106,6 +108,7 @@ def sample_ddim(
     *,
     seed: int,
     proposal_count: int = 32,
+    step_count: int = DDIM_STEPS,
 ) -> torch.Tensor:
     """Sample a deterministic proposal-major batch, shaped [B, 32, 16, 4]."""
     if condition.ndim != 2 or condition.shape[1] != MODEL_CONDITION_DIM:
@@ -119,7 +122,7 @@ def sample_ddim(
         dtype=torch.float32,
     ).to(condition.device)
     repeated_condition = condition.repeat_interleave(proposal_count, dim=0)
-    timesteps = ddim_timesteps()
+    timesteps = ddim_timesteps(step_count)
     for index, timestep in enumerate(timesteps):
         previous = timesteps[index + 1] if index + 1 < len(timesteps) else -1
         t = torch.full((x.shape[0],), timestep, dtype=torch.long, device=x.device)
@@ -215,11 +218,12 @@ def sample_checkpoint(
     *,
     device: str = "cpu",
     seed: int,
+    step_count: int = DDIM_STEPS,
 ) -> torch.Tensor:
     model, schedule, checkpoint = load_funnel_checkpoint(path, device=device)
     raw_condition = condition.to(device=device, dtype=torch.float32)
     normalized = (raw_condition - checkpoint["condition_mean"].to(device)) / checkpoint["condition_scale"].to(device)
-    normalized_samples = sample_ddim(model, normalized, schedule, seed=seed)
+    normalized_samples = sample_ddim(model, normalized, schedule, seed=seed, step_count=step_count)
     samples = normalized_samples * checkpoint["funnel_scale"].to(device) + checkpoint["funnel_mean"].to(device)
     yaw = samples[..., 2:4].to(torch.float64)
     norm = torch.linalg.vector_norm(yaw, dim=-1, keepdim=True)

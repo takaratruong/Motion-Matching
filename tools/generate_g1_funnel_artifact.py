@@ -22,13 +22,16 @@ def main() -> None:
     parser.add_argument("--pack", type=Path, default=Path("build/smart-pickup/full-pack"))
     parser.add_argument("--row", type=int, default=0)
     parser.add_argument("--seed", type=int, default=2026071901)
+    parser.add_argument("--sampling-steps", type=int, default=1000)
     parser.add_argument("--output", type=Path, default=Path("build/g1-funnels/beer10-proposals.npz"))
     args = parser.parse_args()
     dataset = load_dataset(args.pack)
     if not 0 <= args.row < len(dataset.conditions):
         raise SystemExit(f"row must be in [0, {len(dataset.conditions)})")
     condition = torch.from_numpy(dataset.conditions[args.row:args.row + 1])
-    proposals = sample_checkpoint(args.checkpoint, condition, seed=args.seed)[0].cpu().numpy()
+    proposals = sample_checkpoint(
+        args.checkpoint, condition, seed=args.seed, step_count=args.sampling_steps
+    )[0].cpu().numpy()
     accepted = certify_proposals(proposals)
     artifact = ProposalArtifact(1, condition[0].numpy(), proposals, np.arange(32, dtype=np.uint64), accepted)
     write_proposal_artifact(args.output, artifact)

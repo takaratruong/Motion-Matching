@@ -26,6 +26,22 @@ class FunnelDataset:
             raise ValueError("dataset contains non-finite values")
 
 
+def is_certifiable_funnel(funnel: np.ndarray) -> bool:
+    funnel = np.asarray(funnel, dtype=np.float32)
+    if funnel.shape != (16, 4) or not np.isfinite(funnel).all():
+        return False
+    translation_step = np.linalg.norm(np.diff(funnel[:, :2], axis=0), axis=1)
+    yaw_step = np.abs(np.arctan2(
+        funnel[1:, 2] * funnel[:-1, 3] - funnel[1:, 3] * funnel[:-1, 2],
+        funnel[1:, 2] * funnel[:-1, 2] + funnel[1:, 3] * funnel[:-1, 3],
+    ))
+    return bool(
+        translation_step.max() <= 0.08
+        and yaw_step.max() <= np.deg2rad(15.0)
+        and translation_step.sum() >= 0.15
+    )
+
+
 def _yaw(quaternion: np.ndarray) -> float:
     w, x, y, z = np.asarray(quaternion, dtype=np.float64)
     return float(np.arctan2(2.0 * (w * y + x * z), 1.0 - 2.0 * (y * y + z * z)))
@@ -77,7 +93,10 @@ def extract_dataset(artifact: InteractionArtifact) -> FunnelDataset:
             relative_yaw = _yaw(artifact.rotations[frame, 0]) - object_yaw
             rows.append((local_x, local_z, np.sin(relative_yaw), np.cos(relative_yaw)))
         # Model convention is outward terminal-to-entrance order.
-        funnels.append(np.asarray(rows[::-1], np.float32))
+        funnel = np.asarray(rows[::-1], np.float32)
+        if not is_certifiable_funnel(funnel):
+            continue
+        funnels.append(funnel)
         conditions.append(_condition(artifact, clip, reach))
         indices.append(clip)
     dataset = FunnelDataset(

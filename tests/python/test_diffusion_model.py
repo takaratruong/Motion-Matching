@@ -50,6 +50,19 @@ class DiffusionModelTests(unittest.TestCase):
         self.assertEqual(tuple(first.shape), (2, 32, 16, 4))
         self.assertEqual(first.dtype, torch.float32)
 
+    def test_full_reverse_process_produces_certifiable_sample_shape(self):
+        from resources.g1_interaction_builder.diffusion import (
+            FunnelDenoiser,
+            make_schedule,
+            sample_ddim,
+        )
+
+        model = FunnelDenoiser()
+        samples = sample_ddim(
+            model, torch.zeros((1, 18)), make_schedule(), seed=3, step_count=1000
+        )
+        self.assertEqual(tuple(samples.shape), (1, 32, 16, 4))
+
     def test_tiny_training_publishes_self_contained_checkpoint(self):
         from resources.g1_interaction_builder.diffusion import train_funnel
 
