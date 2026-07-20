@@ -17,10 +17,22 @@ from mm_sonic.operator_x11 import (
     KEYSYMS,
     BoundaryControlMailbox,
     ContinuousControlLoop,
+    IntentSnapshot,
     KeyLevels,
     X11KeyStateProvider,
     normalized_state_from_pressed,
 )
+
+
+class _StepClock:
+    """Monotonic integer-ns clock returning a fresh value on each read."""
+
+    def __init__(self, start: int = 1_000) -> None:
+        self._value = start
+
+    def __call__(self) -> int:
+        self._value += 7
+        return self._value
 
 
 class FakeProvider:
@@ -210,6 +222,135 @@ class BoundaryControlMailboxTests(unittest.TestCase):
         mailbox = BoundaryControlMailbox()
         with self.assertRaises(ContractError):
             mailbox.sample(0)
+
+
+class RevisionedMailboxTests(unittest.TestCase):
+    @staticmethod
+    def _mapped(
+        *,
+        velocity: tuple[float, float, float] = (0.5, 0.0, 0.0),
+        heading: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0),
+        camera: CameraState | None = None,
+        stand: bool = False,
+        terminate: bool = False,
+    ) -> MappedControlState:
+        return MappedControlState(
+            velocity_mujoco=velocity,
+            desired_heading_mujoco_wxyz=heading,
+            camera=camera if camera is not None else CameraState(0, 0.0, 0.4, 3.0),
+            strafe=False,
+            walk_blend=0.0,
+            stand=stand,
+            terminate=terminate,
+        )
+
+    def test_effective_locomotion_revision_starts_at_one(self) -> None:
+        mailbox = BoundaryControlMailbox(monotonic_ns=_StepClock())
+        self.assertEqual(mailbox.current_revision, 1)
+        mailbox.publish(self._mapped())
+        self.assertEqual(mailbox.current_revision, 1)
+
+    def test_sample_intent_returns_snapshot_with_revision_and_stamp(self) -> None:
+        clock = _StepClock()
+        mailbox = BoundaryControlMailbox(monotonic_ns=clock)
+        mailbox.publish(self._mapped(velocity=(0.5, 0.0, 0.0)))
+        snapshot, mapped = mailbox.sample_intent(0)
+        self.assertIsInstance(snapshot, IntentSnapshot)
+        self.assertIsInstance(mapped, MappedControlState)
+        self.assertEqual(snapshot.revision, 1)
+        self.assertIsInstance(snapshot.observed_ns, int)
+        self.assertGreater(snapshot.observed_ns, 0)
+        self.assertEqual(
+            snapshot.command.requested_velocity_mujoco, (0.5, 0.0, 0.0)
+        )
+
+    def test_locomotion_changes_increment_revision(self) -> None:
+        mailbox = BoundaryControlMailbox(monotonic_ns=_StepClock())
+        mailbox.publish(self._mapped(velocity=(0.5, 0.0, 0.0)))
+        self.assertEqual(mailbox.current_revision, 1)
+        mailbox.publish(self._mapped(velocity=(-0.5, 0.0, 0.0)))
+        self.assertEqual(mailbox.current_revision, 2)
+        mailbox.publish(
+            self._mapped(
+                velocity=(-0.5, 0.0, 0.0), heading=(0.0, 0.0, 0.0, 1.0)
+            )
+        )
+        self.assertEqual(mailbox.current_revision, 3)
+        mailbox.publish(
+            self._mapped(velocity=(-0.5, 0.0, 0.0), heading=(0.0, 0.0, 0.0, 1.0), stand=True)
+        )
+        self.assertEqual(mailbox.current_revision, 4)
+        mailbox.publish(
+            self._mapped(velocity=(-0.5, 0.0, 0.0), heading=(0.0, 0.0, 0.0, 1.0), stand=True, terminate=True)
+        )
+        self.assertEqual(mailbox.current_revision, 5)
+
+    def test_camera_only_change_retains_revision(self) -> None:
+        mailbox = BoundaryControlMailbox(monotonic_ns=_StepClock())
+        mailbox.publish(self._mapped(camera=CameraState(0, 0.0, 0.4, 3.0)))
+        self.assertEqual(mailbox.current_revision, 1)
+        mailbox.publish(self._mapped(camera=CameraState(1, 0.3, 0.5, 2.0)))
+        self.assertEqual(mailbox.current_revision, 1)
+
+    def test_same_prefix_sample_allowed_only_after_supersession(self) -> None:
+        mailbox = BoundaryControlMailbox(monotonic_ns=_StepClock())
+        mailbox.publish(self._mapped(velocity=(0.5, 0.0, 0.0)))
+        first, _ = mailbox.sample_intent(0)
+        self.assertEqual(first.revision, 1)
+        # No newer locomotion revision -> repeated index is still rejected.
+        with self.assertRaises(ContractError):
+            mailbox.sample_intent(0)
+        # A newer locomotion revision permits retrying the same chunk index.
+        mailbox.publish(self._mapped(velocity=(-0.5, 0.0, 0.0)))
+        retried, _ = mailbox.sample_intent(0)
+        self.assertEqual(retried.revision, 2)
+        # Once consumed at the new revision, the same index is rejected again.
+        with self.assertRaises(ContractError):
+            mailbox.sample_intent(0)
+
+    def test_terminate_snapshot_carries_no_command(self) -> None:
+        mailbox = BoundaryControlMailbox(monotonic_ns=_StepClock())
+        mailbox.publish(self._mapped(terminate=True))
+        snapshot, _ = mailbox.sample_intent(0)
+        self.assertIsNone(snapshot.command)
+
+    def test_sample_wrapper_preserves_tuple_shape(self) -> None:
+        mailbox = BoundaryControlMailbox(monotonic_ns=_StepClock())
+        mailbox.publish(self._mapped(velocity=(0.5, 0.0, 0.0)))
+        command, mapped = mailbox.sample(0)
+        self.assertEqual(command.requested_velocity_mujoco, (0.5, 0.0, 0.0))
+        self.assertIsInstance(mapped, MappedControlState)
+
+
+class IntentSnapshotTests(unittest.TestCase):
+    @staticmethod
+    def _command() -> CommandSample:
+        return CommandSample(
+            chunk_index=0,
+            requested_velocity_mujoco=(0.5, 0.0, 0.0),
+            desired_heading_mujoco_wxyz=(1.0, 0.0, 0.0, 0.0),
+        )
+
+    def test_is_immutable(self) -> None:
+        from dataclasses import FrozenInstanceError
+
+        snapshot = IntentSnapshot(
+            revision=1, observed_ns=100, command=self._command()
+        )
+        with self.assertRaises(FrozenInstanceError):
+            snapshot.revision = 2
+
+    def test_rejects_nonpositive_revision(self) -> None:
+        with self.assertRaises(ContractError):
+            IntentSnapshot(revision=0, observed_ns=100, command=self._command())
+
+    def test_rejects_negative_stamp(self) -> None:
+        with self.assertRaises(ContractError):
+            IntentSnapshot(revision=1, observed_ns=-1, command=self._command())
+
+    def test_allows_none_command_for_terminate(self) -> None:
+        snapshot = IntentSnapshot(revision=1, observed_ns=100, command=None)
+        self.assertIsNone(snapshot.command)
 
 
 class X11KeyStateProviderTests(unittest.TestCase):

@@ -71,6 +71,20 @@ class IntegrationFailure(RuntimeError):
         super().__init__(f"{phase} integration failure at {site}: {cause}")
 
 
+class CandidateSuperseded(RuntimeError):
+    """A pre-publication candidate was aborted because a newer command exists.
+
+    This is a typed nonterminal outcome: the coordinator has discarded the
+    stale candidate via the existing precommit cleanup, restored READY_PAUSED,
+    and released no physics.  It is not a failure and never terminalizes.
+    """
+
+    def __init__(self, candidate_id: str, command: CommandSample):
+        self.candidate_id = candidate_id
+        self.command = command
+        super().__init__(f"candidate {candidate_id} superseded before publication")
+
+
 @dataclass(frozen=True)
 class SessionConfig:
     scene_id: str
@@ -947,7 +961,56 @@ class Coordinator:
             failure.__context__ = error
         return failure
 
-    def run_one_chunk(self, command: CommandSample | None = None) -> AcceptedChunk:
+    def _supersede_chunk(
+        self,
+        *,
+        candidate_id: str,
+        latched: CommandSample,
+        tracker: _TimingTracker,
+    ) -> CandidateSuperseded:
+        """Discard a stale pre-publication candidate without terminalizing.
+
+        Reuses the existing pre-commit cleanup to abort the pending timeline
+        candidate and the outstanding MM candidate, records the rejection and
+        timing, restores READY_PAUSED, clears the latched command, and releases
+        no physics.  Any cleanup/evidence error remains a normal terminal
+        IntegrationFailure with physics paused.
+        """
+
+        outcome = CandidateSuperseded(candidate_id, latched)
+        evidence_error: BaseException | None = None
+        try:
+            self._reject_precommit(candidate_id, "command_superseded", outcome)
+        except BaseException as failure:
+            evidence_error = failure
+        try:
+            self._write_timing(tracker.finish("command_superseded"))
+        except BaseException as failure:
+            if evidence_error is None:
+                evidence_error = failure
+        if evidence_error is not None:
+            self._terminalize_failure(
+                phase="pre_commit",
+                site="command_superseded",
+                error=evidence_error,
+                candidate_id=candidate_id,
+            )
+            raise IntegrationFailure(
+                "pre_commit", "command_superseded", evidence_error
+            ) from evidence_error
+        with self._lock:
+            self._latched_command = None
+            self._state = CoordinatorState.READY_PAUSED
+        return outcome
+
+    def run_one_chunk(
+        self,
+        command: CommandSample | None = None,
+        *,
+        command_is_current: Callable[[CommandSample], bool] | None = None,
+    ) -> AcceptedChunk:
+        if command_is_current is not None and not callable(command_is_current):
+            raise ContractError("command_is_current must be callable")
         with self._lock:
             self._require_state(CoordinatorState.READY_PAUSED)
             if command is not None:
@@ -1075,6 +1138,29 @@ class Coordinator:
                 candidate_id=candidate_id,
                 tracker=tracker,
             ) from error
+
+        # Last pre-publication supersession check.  A false result aborts the
+        # stale candidate via the existing precommit cleanup, releases no
+        # physics, and raises the typed nonterminal CandidateSuperseded.  A
+        # predicate error is a normal fail-closed pre-commit failure.
+        if command_is_current is not None:
+            try:
+                current = command_is_current(latched)
+            except BaseException as error:
+                site = self._failure_site(error, "command_currency")
+                raise self._fail_chunk(
+                    phase="pre_commit",
+                    site=site,
+                    error=error,
+                    candidate_id=candidate_id,
+                    tracker=tracker,
+                ) from error
+            if not current:
+                raise self._supersede_chunk(
+                    candidate_id=candidate_id,
+                    latched=latched,
+                    tracker=tracker,
+                )
 
         def publish() -> object:
             try:

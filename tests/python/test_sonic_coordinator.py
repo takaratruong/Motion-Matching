@@ -1082,6 +1082,91 @@ class CoordinatorSuccessTests(unittest.TestCase):
         self.assertEqual(harness.coordinator.state, CoordinatorState.TERMINAL)
 
 
+class CoordinatorSupersessionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.harness = Harness(self.temporary)
+        self.harness.preflight()
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_stale_command_aborts_before_publication_without_release(self) -> None:
+        from mm_sonic.coordinator import CandidateSuperseded
+
+        self.harness.coordinator.queue_command(Harness.command())
+        with self.assertRaises(CandidateSuperseded) as raised:
+            self.harness.coordinator.run_one_chunk(command_is_current=lambda _c: False)
+
+        # The typed nonterminal outcome carries the identity and command.
+        self.assertEqual(
+            raised.exception.candidate_id,
+            "session-000000:candidate:000000",
+        )
+        self.assertIsInstance(raised.exception.command, CommandSample)
+        # Pre-commit cleanup ran; no publication, commit, or physics release.
+        self.assertIn("timeline.abort", self.harness.events)
+        self.assertIn("mm.abort", self.harness.events)
+        self.assertNotIn("zmq.send", self.harness.events)
+        self.assertNotIn("mm.commit", self.harness.events)
+        self.assertNotIn("timeline.commit", self.harness.events)
+        self.assertNotIn("simulator.advance", self.harness.events)
+        # Not terminal: restore READY_PAUSED and stay paused; latch cleared.
+        self.assertEqual(
+            self.harness.coordinator.state, CoordinatorState.READY_PAUSED
+        )
+        self.assertTrue(self.harness.gate.is_paused)
+        self.assertIsNone(self.harness.coordinator.terminal_verdict)
+        self.assertEqual(self.harness.timeline.canonical_buffer.count, 1)
+        self.assertEqual(self.harness.gate.sim_steps, 0)
+
+    def test_predicate_checked_after_prepared_enqueue_and_before_publish(self) -> None:
+        from mm_sonic.coordinator import CandidateSuperseded
+
+        self.harness.coordinator.queue_command(Harness.command())
+        with self.assertRaises(CandidateSuperseded):
+            self.harness.coordinator.run_one_chunk(command_is_current=lambda _c: False)
+        # Generation, validation, prepare and prepared-artifact enqueue all ran
+        # before the supersession check aborted the candidate.
+        self.assertIn("mm.generate", self.harness.events)
+        self.assertIn("source.validate", self.harness.events)
+        self.assertIn("target.prepare", self.harness.events)
+        self.assertIn("artifact.enqueue", self.harness.events)
+
+    def test_current_command_predicate_publishes_and_commits(self) -> None:
+        self.harness.coordinator.queue_command(Harness.command())
+        accepted = self.harness.coordinator.run_one_chunk(
+            command_is_current=lambda _c: True
+        )
+        self.assertIsInstance(accepted, AcceptedChunk)
+        self.assertIn("zmq.send", self.harness.events)
+        self.assertIn("mm.commit", self.harness.events)
+        self.assertEqual(self.harness.gate.sim_steps, 80)
+
+    def test_retry_after_supersession_accepts_same_chunk_index(self) -> None:
+        from mm_sonic.coordinator import CandidateSuperseded
+
+        self.harness.coordinator.queue_command(Harness.command(chunk_index=0))
+        with self.assertRaises(CandidateSuperseded):
+            self.harness.coordinator.run_one_chunk(command_is_current=lambda _c: False)
+        # The same chunk index 0 can be retried after supersession.
+        accepted = self.harness.coordinator.run_one_chunk(
+            Harness.command(chunk_index=0)
+        )
+        self.assertIsInstance(accepted, AcceptedChunk)
+        self.assertEqual(self.harness.timeline.canonical_buffer.count, 21)
+
+    def test_cleanup_error_during_supersession_is_terminal_failure(self) -> None:
+        # A cleanup/evidence error during supersession remains a normal terminal
+        # IntegrationFailure with physics paused.
+        self.harness.coordinator.queue_command(Harness.command())
+        self.harness.run.fail_site = "artifact_rejection"
+        with self.assertRaises(IntegrationFailure):
+            self.harness.coordinator.run_one_chunk(command_is_current=lambda _c: False)
+        self.assertEqual(self.harness.coordinator.state, CoordinatorState.TERMINAL)
+        self.assertTrue(self.harness.gate.is_paused)
+
+
 class CoordinatorFailureBoundaryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporaries: list[tempfile.TemporaryDirectory[str]] = []

@@ -102,42 +102,102 @@ def normalized_state_from_pressed(pressed: frozenset) -> NormalizedControlState:
     )
 
 
-class BoundaryControlMailbox:
-    """Atomic latest-state boundary that latches Space/X until consumed."""
+@dataclass(frozen=True)
+class IntentSnapshot:
+    """One immutable revisioned locomotion intent latched at a boundary."""
 
-    def __init__(self) -> None:
+    revision: int
+    observed_ns: int
+    command: CommandSample | None
+
+    def __post_init__(self) -> None:
+        if type(self.revision) is not int or self.revision <= 0:
+            raise ContractError("intent revision must be a positive integer")
+        if type(self.observed_ns) is not int or self.observed_ns < 0:
+            raise ContractError("intent observed_ns must be a nonnegative integer")
+        if self.command is not None and not isinstance(self.command, CommandSample):
+            raise ContractError("intent command must be a CommandSample or None")
+
+
+class BoundaryControlMailbox:
+    """Atomic latest-state boundary that latches Space/X until consumed.
+
+    It also tracks an effective locomotion ``revision`` that increments only
+    when velocity, heading, stand, or terminate changes; camera-only updates
+    retain the revision.  A same chunk index may be re-sampled only after a
+    newer locomotion revision has arrived (a supersession retry); otherwise the
+    existing repeated-index rejection is preserved.
+    """
+
+    def __init__(self, monotonic_ns: Callable[[], int] = time.monotonic_ns) -> None:
+        if not callable(monotonic_ns):
+            raise ContractError("mailbox monotonic_ns must be callable")
         self._lock = threading.Lock()
+        self._monotonic_ns = monotonic_ns
         self._latest: MappedControlState | None = None
         self._stand_latched = False
         self._terminate_latched = False
         self._last_index = -1
+        self._revision = 1
+        self._last_sampled_revision = 0
+        self._effective_key: tuple[object, ...] | None = None
+
+    @property
+    def current_revision(self) -> int:
+        with self._lock:
+            return self._revision
+
+    @staticmethod
+    def _locomotion_key(mapped: MappedControlState) -> tuple[object, ...]:
+        return (
+            mapped.velocity_mujoco,
+            mapped.desired_heading_mujoco_wxyz,
+            mapped.stand,
+            mapped.terminate,
+        )
+
+    def _monotonic(self) -> int:
+        value = self._monotonic_ns()
+        if type(value) is not int or value < 0:
+            raise ContractError("mailbox clock must return nonnegative integer ns")
+        return value
 
     def publish(self, mapped: MappedControlState) -> None:
         if type(mapped) is not MappedControlState:
             raise ContractError("mailbox publish requires a MappedControlState")
         with self._lock:
+            key = self._locomotion_key(mapped)
+            if self._effective_key is not None and key != self._effective_key:
+                self._revision += 1
+            self._effective_key = key
             self._latest = mapped
             if mapped.stand:
                 self._stand_latched = True
             if mapped.terminate:
                 self._terminate_latched = True
 
-    def sample(
+    def _sample(
         self, chunk_index: int
-    ) -> tuple[CommandSample | None, MappedControlState]:
+    ) -> tuple[IntentSnapshot, MappedControlState]:
         if type(chunk_index) is not int or chunk_index < 0:
             raise ContractError("mailbox chunk_index must be a nonnegative integer")
+        observed_ns = self._monotonic()
         with self._lock:
-            if chunk_index <= self._last_index:
+            if chunk_index < self._last_index or (
+                chunk_index == self._last_index
+                and self._revision <= self._last_sampled_revision
+            ):
                 raise ContractError("mailbox chunk_index must be strictly increasing")
             if self._latest is None:
                 raise ContractError("mailbox has no published control state")
             latest = self._latest
+            revision = self._revision
             stand = latest.stand or self._stand_latched
             terminate = latest.terminate or self._terminate_latched
             self._stand_latched = False
             self._terminate_latched = False
             self._last_index = chunk_index
+            self._last_sampled_revision = revision
         if terminate:
             command: CommandSample | None = None
         else:
@@ -148,7 +208,21 @@ class BoundaryControlMailbox:
                 ),
                 desired_heading_mujoco_wxyz=latest.desired_heading_mujoco_wxyz,
             )
-        return command, latest
+        snapshot = IntentSnapshot(
+            revision=revision, observed_ns=observed_ns, command=command
+        )
+        return snapshot, latest
+
+    def sample_intent(
+        self, chunk_index: int
+    ) -> tuple[IntentSnapshot, MappedControlState]:
+        return self._sample(chunk_index)
+
+    def sample(
+        self, chunk_index: int
+    ) -> tuple[CommandSample | None, MappedControlState]:
+        snapshot, latest = self._sample(chunk_index)
+        return snapshot.command, latest
 
 
 class ContinuousControlLoop:
