@@ -97,16 +97,11 @@ class BoundaryTrace:
             _nonempty_identity(self.presented_prefix_id, "presented_prefix_id"),
         )
 
-        stamps = []
         for name in _TIMESTAMP_FIELDS:
-            stamp = _timestamp(getattr(self, name), name)
-            object.__setattr__(self, name, stamp)
-            stamps.append(stamp)
+            object.__setattr__(self, name, _timestamp(getattr(self, name), name))
         for earlier, later in zip(_TIMESTAMP_FIELDS, _TIMESTAMP_FIELDS[1:]):
             if getattr(self, later) < getattr(self, earlier):
-                raise ContractError(
-                    f"trace {later} must not precede {earlier}"
-                )
+                raise ContractError(f"trace {later} must not precede {earlier}")
 
         for name, width in _VECTOR_FIELDS:
             object.__setattr__(
