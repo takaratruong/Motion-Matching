@@ -5,11 +5,27 @@ from pathlib import Path
 import numpy as np
 
 from resources.g1_interaction_builder.proposal_artifact import (
+    MAGIC,
     ProposalArtifact,
     certify_proposals,
+    deserialize_proposal_artifact,
     read_proposal_artifact,
+    serialize_proposal_artifact,
     write_proposal_artifact,
 )
+
+
+def _smooth_artifact():
+    proposals = np.zeros((32, 16, 4), dtype=np.float32)
+    proposals[..., 3] = 1.0
+    proposals[..., 0] = np.linspace(0.0, 0.2, 16)
+    return ProposalArtifact(
+        1,
+        np.arange(18, dtype=np.float32) * 0.25,
+        proposals,
+        np.arange(32, dtype=np.uint64),
+        np.ones(32, bool),
+    )
 
 
 class ProposalArtifactTests(unittest.TestCase):
@@ -33,6 +49,44 @@ class ProposalArtifactTests(unittest.TestCase):
             loaded = read_proposal_artifact(path)
         np.testing.assert_array_equal(loaded.proposals, proposals)
         self.assertEqual(int(loaded.accepted.sum()), 32)
+
+    def test_serialized_blob_is_canonical_little_endian_length(self):
+        blob = serialize_proposal_artifact(_smooth_artifact())
+        # header (28) + condition (72) + proposals (8192) + seeds (256) + flags (32)
+        self.assertEqual(len(blob), 8580)
+        self.assertEqual(blob[:8], MAGIC)
+
+    def test_truncated_blob_is_rejected(self):
+        blob = serialize_proposal_artifact(_smooth_artifact())
+        with self.assertRaises(ValueError):
+            deserialize_proposal_artifact(blob[:-1])
+
+    def test_trailing_bytes_are_rejected(self):
+        blob = serialize_proposal_artifact(_smooth_artifact())
+        with self.assertRaises(ValueError):
+            deserialize_proposal_artifact(blob + b"\x00")
+
+    def test_bad_magic_is_rejected(self):
+        blob = bytearray(serialize_proposal_artifact(_smooth_artifact()))
+        blob[0] = ord("X")
+        with self.assertRaises(ValueError):
+            deserialize_proposal_artifact(bytes(blob))
+
+    def test_write_rejects_duplicate_seeds(self):
+        artifact = _smooth_artifact()
+        seeds = np.arange(32, dtype=np.uint64)
+        seeds[5] = seeds[4]
+        artifact = ProposalArtifact(1, artifact.condition, artifact.proposals, seeds, artifact.accepted)
+        with self.assertRaises(ValueError):
+            serialize_proposal_artifact(artifact)
+
+    def test_write_rejects_accepted_discontinuous_proposal(self):
+        artifact = _smooth_artifact()
+        proposals = np.array(artifact.proposals)
+        proposals[3, 8, 0] = 1.0  # violates 0.08 m translation step
+        artifact = ProposalArtifact(1, artifact.condition, proposals, artifact.seeds, artifact.accepted)
+        with self.assertRaises(ValueError):
+            serialize_proposal_artifact(artifact)
 
 
 if __name__ == "__main__":

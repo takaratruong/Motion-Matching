@@ -144,6 +144,9 @@ CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_smart_pickup_controller
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_smart_pickup_scene
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_smart_pickup_scenarios
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_stationary_motion_matching
+CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_funnel_artifact
+CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_funnel_follower
+CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_learned_pickup_backend
 RELEASE_FAST_MATH_TARGET_TEST := \
   $(CPP_TEST_DIR)/test_interaction_target_release_fast_math
 RELEASE_FAST_MATH_CARRY_TEST := \
@@ -336,6 +339,25 @@ $(CPP_TEST_DIR)/test_interaction_pick_assist: tests/cpp/test_interaction_pick_as
 $(PICK_ASSIST_RELEASE_FAST_MATH_TEST): tests/cpp/test_interaction_pick_assist.cpp interaction_pick_assist.cpp interaction_pick_assist.h interaction_runtime.h interaction_pick_slots.cpp interaction_pick_slots.h interaction_arrival.cpp interaction_arrival.h interaction_target.cpp interaction_target.h interaction_pose.cpp interaction_pose.h | $(CPP_TEST_DIR)
 	# GCC 13 misdiagnoses libstdc++'s small-range std::sort as out of bounds.
 	$(CXX) $(CPP_TEST_FLAGS) -Wno-array-bounds -O3 -DNDEBUG -ffast-math tests/cpp/test_interaction_pick_assist.cpp interaction_pick_assist.cpp interaction_pick_slots.cpp interaction_arrival.cpp interaction_target.cpp interaction_pose.cpp -o $@
+
+$(CPP_TEST_DIR)/test_interaction_funnel_artifact: tests/cpp/test_interaction_funnel_artifact.cpp interaction_funnel_artifact.cpp interaction_funnel_artifact.h | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_funnel_artifact.cpp interaction_funnel_artifact.cpp -o $@
+
+$(CPP_TEST_DIR)/test_interaction_funnel_follower: tests/cpp/test_interaction_funnel_follower.cpp interaction_funnel_follower.cpp interaction_funnel_follower.h interaction_funnel_artifact.h | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_funnel_follower.cpp interaction_funnel_follower.cpp -o $@
+
+INTERACTION_LEARNED_PICKUP_BACKEND_LINK_SOURCES := \
+  interaction_learned_pickup_backend.cpp interaction_funnel_artifact.cpp \
+  interaction_funnel_follower.cpp interaction_pick_assist.cpp \
+  interaction_pick_slots.cpp interaction_arrival.cpp \
+  interaction_target.cpp interaction_pose.cpp
+INTERACTION_LEARNED_PICKUP_BACKEND_HEADERS := \
+  interaction_learned_pickup_backend.h interaction_learned_pickup_diagnostics.h \
+  interaction_funnel_artifact.h interaction_funnel_follower.h \
+  interaction_smart_pickup_controller.h interaction_pick_assist.h
+
+$(CPP_TEST_DIR)/test_interaction_learned_pickup_backend: tests/cpp/test_interaction_learned_pickup_backend.cpp $(INTERACTION_LEARNED_PICKUP_BACKEND_LINK_SOURCES) $(INTERACTION_LEARNED_PICKUP_BACKEND_HEADERS) | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_learned_pickup_backend.cpp $(INTERACTION_LEARNED_PICKUP_BACKEND_LINK_SOURCES) -o $@
 
 $(CPP_TEST_DIR)/test_interaction_smart_pickup_controller: tests/cpp/test_interaction_smart_pickup_controller.cpp $(INTERACTION_SMART_PICKUP_CONTROLLER_LINK_SOURCES) $(INTERACTION_SMART_PICKUP_CONTROLLER_HEADERS) | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_smart_pickup_controller.cpp $(INTERACTION_SMART_PICKUP_CONTROLLER_LINK_SOURCES) -o $@
