@@ -13,6 +13,7 @@ from resources.g1_interaction_builder.funnel_dataset import load_dataset
 from resources.g1_interaction_builder.proposal_artifact import (
     ProposalArtifact,
     certify_proposals,
+    project_object_local_funnels,
     write_proposal_artifact,
 )
 
@@ -34,11 +35,12 @@ def main() -> None:
     outward = sample_checkpoint(
         args.checkpoint, condition, seed=args.seed, step_count=args.sampling_steps
     )[0].cpu().numpy()
-    proposals = np.ascontiguousarray(outward[:, ::-1], dtype=np.float32)
+    proposals = project_object_local_funnels(
+        np.ascontiguousarray(outward[:, ::-1], dtype=np.float32))
     accepted = certify_proposals(proposals)
     checkpoint_sha256 = hashlib.sha256(args.checkpoint.read_bytes()).digest()
     artifact = ProposalArtifact(
-        2,
+        3,
         args.request_id,
         args.seed,
         checkpoint_sha256,

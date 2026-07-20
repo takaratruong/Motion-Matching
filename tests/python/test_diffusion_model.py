@@ -95,14 +95,15 @@ class DiffusionModelTests(unittest.TestCase):
         )
 
         conditions = torch.zeros((4, 24), dtype=torch.float32)
+        conditions[:, 18:22] = torch.tensor([0.42, -0.17, 0.6, 0.8])
         funnels = torch.zeros((4, 16, 4), dtype=torch.float32)
         funnels[..., 3] = 1.0
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "checkpoint.pt"
             train_funnel(conditions, funnels, path, steps=1, batch_size=4, device="cpu")
             checkpoint = torch.load(path, weights_only=False)
-            samples = sample_checkpoint(path, torch.zeros((1, 24)), seed=11)
-        self.assertEqual(checkpoint["schema_version"], 2)
+            samples = sample_checkpoint(path, conditions[:1], seed=11)
+        self.assertEqual(checkpoint["schema_version"], 3)
         self.assertEqual(checkpoint["prediction_type"], "epsilon")
         self.assertIn("model", checkpoint)
         self.assertEqual(tuple(checkpoint["condition_mean"].shape), (24,))
@@ -112,7 +113,7 @@ class DiffusionModelTests(unittest.TestCase):
         )
         self.assertEqual(tuple(checkpoint["funnel_mean"].shape), (1, 16, 4))
         self.assertEqual(tuple(checkpoint["funnel_scale"].shape), (1, 16, 4))
-        expected_entry = torch.tensor([0.0, 0.0, 0.0, 1.0])
+        expected_entry = conditions[0, 18:22]
         self.assertTrue(torch.equal(samples[:, :, 15], expected_entry.expand(1, 32, 4)))
 
 

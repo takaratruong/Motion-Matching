@@ -8,8 +8,8 @@ starts, so the byte layout here and the loader there must stay identical.
 Layout (all integers and floats little-endian):
 
     offset  bytes  field
-    0       8      magic b"G1FUNNL2"
-    8       4      uint32 schema_version (== 2)
+    0       8      magic b"G1FUNNL3"
+    8       4      uint32 schema_version (== 3)
     12      4      uint32 condition_dim  (== 24)
     16      4      uint32 proposal_count (== 32)
     20      4      uint32 sample_count   (== 16)
@@ -29,8 +29,8 @@ import struct
 
 import numpy as np
 
-MAGIC = b"G1FUNNL2"
-SCHEMA_VERSION = 2
+MAGIC = b"G1FUNNL3"
+SCHEMA_VERSION = 3
 CONDITION_DIM = 24
 PROPOSAL_COUNT = 32
 SAMPLE_COUNT = 16
@@ -41,6 +41,7 @@ _YAW_UNIT_ATOL = 2e-5
 MAX_TRANSLATION_STEP = 0.08
 MAX_YAW_STEP_RADIANS = np.deg2rad(15.0)
 MIN_ARC_LENGTH = 0.15
+INTERIOR_RESIDUAL_WEIGHT = 0.20
 
 
 @dataclass(frozen=True)
@@ -75,18 +76,69 @@ class ProposalArtifact:
             np.linalg.norm(self.proposals[..., 2:4], axis=-1), 1.0, atol=_YAW_UNIT_ATOL
         ):
             raise ValueError("proposal yaw vectors are not unit length")
-        expected_entry = np.asarray((0.0, 0.0, 0.0, 1.0), dtype=np.float32)
+        expected_entry = np.asarray(self.condition[18:22], dtype=np.float32)
         if not np.array_equal(
             self.proposals[:, 0],
             np.broadcast_to(expected_entry, self.proposals[:, 0].shape),
         ):
-            raise ValueError("execution proposals must start at the entry identity")
+            raise ValueError(
+                "execution proposals must start at the conditioned object-local entry")
         if len(np.unique(self.seeds)) != PROPOSAL_COUNT:
             raise ValueError("proposal seeds must be unique")
         accepted = np.asarray(self.accepted, dtype=bool)
         certifiable = certify_proposals(self.proposals)
         if np.any(accepted & ~certifiable):
             raise ValueError("accepted proposals must satisfy continuity constraints")
+
+
+def project_object_local_funnels(proposals: np.ndarray) -> np.ndarray:
+    """Regularize interiors while preserving both object-local endpoints."""
+    source = np.asarray(proposals, dtype=np.float32)
+    if source.shape != (PROPOSAL_COUNT, SAMPLE_COUNT, SAMPLE_WIDTH):
+        raise ValueError("proposals must have shape (32, 16, 4)")
+    if not np.isfinite(source).all():
+        raise ValueError("proposals must be finite")
+
+    progress = np.linspace(0.0, 1.0, SAMPLE_COUNT, dtype=np.float64)
+    blend = progress[None, :, None]
+    window = np.sin(np.pi * progress)[None, :, None]
+    source64 = source.astype(np.float64)
+    projected = source64.copy()
+
+    position_line = (
+        source64[:, :1, :2]
+        + blend * (source64[:, -1:, :2] - source64[:, :1, :2])
+    )
+    projected[:, :, :2] = (
+        position_line
+        + INTERIOR_RESIDUAL_WEIGHT
+        * window
+        * (source64[:, :, :2] - position_line)
+    )
+
+    raw_yaw = np.unwrap(
+        np.arctan2(source64[:, :, 2], source64[:, :, 3]), axis=1)
+    start_yaw = raw_yaw[:, :1]
+    terminal_delta = np.arctan2(
+        np.sin(raw_yaw[:, -1:] - start_yaw),
+        np.cos(raw_yaw[:, -1:] - start_yaw),
+    )
+    yaw_line = start_yaw + progress[None, :] * terminal_delta
+    yaw_residual = np.arctan2(
+        np.sin(raw_yaw - yaw_line), np.cos(raw_yaw - yaw_line))
+    yaw = (
+        yaw_line
+        + INTERIOR_RESIDUAL_WEIGHT
+        * window[:, :, 0]
+        * yaw_residual
+    )
+    projected[:, :, 2] = np.sin(yaw)
+    projected[:, :, 3] = np.cos(yaw)
+
+    result = np.ascontiguousarray(projected, dtype=np.float32)
+    result[:, 0] = source[:, 0]
+    result[:, -1] = source[:, -1]
+    return result
 
 
 def certify_proposals(proposals: np.ndarray) -> np.ndarray:

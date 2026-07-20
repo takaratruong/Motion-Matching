@@ -227,7 +227,7 @@ def train_funnel(
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
     checkpoint = {
-        "schema_version": 2,
+        "schema_version": 3,
         "condition_dim": MODEL_CONDITION_DIM,
         "knot_frame_offsets": (
             0, 5, 10, 15, 20, 25, 30, 35,
@@ -250,7 +250,7 @@ def train_funnel(
 
 def load_funnel_checkpoint(path: Path, *, device: str = "cpu") -> tuple[FunnelDenoiser, DiffusionSchedule, dict]:
     checkpoint = torch.load(Path(path), map_location=device, weights_only=False)
-    if checkpoint.get("schema_version") != 2:
+    if checkpoint.get("schema_version") != 3:
         raise ValueError("unsupported funnel checkpoint schema")
     if checkpoint.get("condition_dim") != MODEL_CONDITION_DIM:
         raise ValueError("unsupported funnel checkpoint condition dimension")
@@ -294,10 +294,8 @@ def sample_checkpoint(
             prediction_type="epsilon",
         )
     samples = normalized_samples * checkpoint["funnel_scale"].to(device) + checkpoint["funnel_mean"].to(device)
-    samples[..., 15, 0] = 0.0
-    samples[..., 15, 1] = 0.0
-    samples[..., 15, 2] = 0.0
-    samples[..., 15, 3] = 1.0
+    entry = raw_condition[:, None, 18:22]
+    samples[:, :, 15] = entry.expand(-1, samples.shape[1], -1)
     yaw = samples[..., :15, 2:4].to(torch.float64)
     norm = torch.linalg.vector_norm(yaw, dim=-1, keepdim=True)
     if not torch.isfinite(norm).all() or (norm < 1e-8).any():

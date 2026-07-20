@@ -9,6 +9,7 @@ from resources.g1_interaction_builder.proposal_artifact import (
     ProposalArtifact,
     certify_proposals,
     deserialize_proposal_artifact,
+    project_object_local_funnels,
     read_proposal_artifact,
     serialize_proposal_artifact,
     write_proposal_artifact,
@@ -16,15 +17,19 @@ from resources.g1_interaction_builder.proposal_artifact import (
 
 
 def _smooth_artifact():
+    condition = np.arange(24, dtype=np.float32) * 0.25
+    condition[18:22] = (0.42, -0.17, 0.6, 0.8)
     proposals = np.zeros((32, 16, 4), dtype=np.float32)
-    proposals[..., 3] = 1.0
-    proposals[..., 0] = np.linspace(0.0, 0.2, 16)
+    proposals[..., 2] = 0.6
+    proposals[..., 3] = 0.8
+    proposals[..., 0] = np.linspace(0.42, 0.62, 16)
+    proposals[..., 1] = -0.17
     return ProposalArtifact(
-        2,
+        3,
         7,
         2_026_071_901,
         bytes(range(32)),
-        np.arange(24, dtype=np.float32) * 0.25,
+        condition,
         proposals,
         np.arange(32, dtype=np.uint64),
         np.ones(32, bool),
@@ -32,9 +37,29 @@ def _smooth_artifact():
 
 
 class ProposalArtifactTests(unittest.TestCase):
-    def test_certification_rejects_a_single_discontinuous_proposal(self):
+    def test_projection_preserves_endpoints_and_regularizes_interior(self):
         proposals = np.zeros((32, 16, 4), dtype=np.float32)
         proposals[..., 3] = 1.0
+        proposals[..., 0] = np.linspace(0.0, 0.4, 16)
+        for index in range(1, 15):
+            proposals[:, index, 1] = 0.15 if index % 2 else -0.15
+            yaw = 0.5 if index % 2 else -0.5
+            proposals[:, index, 2] = np.sin(yaw)
+            proposals[:, index, 3] = np.cos(yaw)
+        original_start = proposals[:, 0].copy()
+        original_end = proposals[:, -1].copy()
+        self.assertFalse(bool(certify_proposals(proposals).any()))
+
+        projected = project_object_local_funnels(proposals)
+
+        np.testing.assert_array_equal(projected[:, 0], original_start)
+        np.testing.assert_array_equal(projected[:, -1], original_end)
+        self.assertTrue(bool(certify_proposals(projected).all()))
+
+    def test_certification_rejects_a_single_discontinuous_proposal(self):
+        proposals = np.zeros((32, 16, 4), dtype=np.float32)
+        proposals[..., 2] = 0.6
+        proposals[..., 3] = 0.8
         proposals[..., 0] = np.linspace(0.0, 0.2, 16)
         proposals[0, 8, 0] = 1.0
         accepted = certify_proposals(proposals)
@@ -42,12 +67,16 @@ class ProposalArtifactTests(unittest.TestCase):
         self.assertTrue(bool(accepted[1]))
 
     def test_round_trip_preserves_strict_artifact(self):
+        condition = np.zeros(24, np.float32)
+        condition[18:22] = (0.42, -0.17, 0.6, 0.8)
         proposals = np.zeros((32, 16, 4), dtype=np.float32)
-        proposals[..., 3] = 1.0
-        proposals[..., 0] = np.linspace(0.0, 0.2, 16)
+        proposals[..., 2] = 0.6
+        proposals[..., 3] = 0.8
+        proposals[..., 0] = np.linspace(0.42, 0.62, 16)
+        proposals[..., 1] = -0.17
         artifact = ProposalArtifact(
-            2, 7, 2_026_071_901, bytes(range(32)),
-            np.zeros(24, np.float32), proposals,
+            3, 7, 2_026_071_901, bytes(range(32)),
+            condition, proposals,
             np.arange(32, dtype=np.uint64), np.ones(32, bool))
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "proposals.npz"
@@ -87,7 +116,7 @@ class ProposalArtifactTests(unittest.TestCase):
         seeds = np.arange(32, dtype=np.uint64)
         seeds[5] = seeds[4]
         artifact = ProposalArtifact(
-            2, artifact.request_id, artifact.batch_seed,
+            3, artifact.request_id, artifact.batch_seed,
             artifact.checkpoint_sha256, artifact.condition,
             artifact.proposals, seeds, artifact.accepted)
         with self.assertRaises(ValueError):
@@ -98,11 +127,22 @@ class ProposalArtifactTests(unittest.TestCase):
         proposals = np.array(artifact.proposals)
         proposals[3, 8, 0] = 1.0  # violates 0.08 m translation step
         artifact = ProposalArtifact(
-            2, artifact.request_id, artifact.batch_seed,
+            3, artifact.request_id, artifact.batch_seed,
             artifact.checkpoint_sha256, artifact.condition,
             proposals, artifact.seeds, artifact.accepted)
         with self.assertRaises(ValueError):
             serialize_proposal_artifact(artifact)
+
+    def test_write_rejects_execution_start_not_equal_to_condition_entry(self):
+        artifact = _smooth_artifact()
+        proposals = np.array(artifact.proposals)
+        proposals[4, 0, 0] = np.nextafter(proposals[4, 0, 0], np.float32(1.0))
+        malformed = ProposalArtifact(
+            3, artifact.request_id, artifact.batch_seed,
+            artifact.checkpoint_sha256, artifact.condition,
+            proposals, artifact.seeds, artifact.accepted)
+        with self.assertRaisesRegex(ValueError, "object-local entry"):
+            serialize_proposal_artifact(malformed)
 
 
 if __name__ == "__main__":

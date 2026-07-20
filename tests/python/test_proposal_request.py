@@ -91,12 +91,10 @@ class ProposalRequestTests(unittest.TestCase):
         self.assertEqual(artifact.batch_seed, request.batch_seed)
         self.assertEqual(artifact.checkpoint_sha256, request.checkpoint_sha256)
         np.testing.assert_array_equal(artifact.condition, condition)
+        self.assertEqual(artifact.schema_version, 3)
         np.testing.assert_array_equal(
             artifact.proposals[:, 0],
-            np.broadcast_to(
-                np.asarray((0.0, 0.0, 0.0, 1.0), np.float32),
-                artifact.proposals[:, 0].shape,
-            ),
+            np.broadcast_to(condition[18:22], artifact.proposals[:, 0].shape),
         )
         self.assertGreaterEqual(int(artifact.accepted.sum()), 1)
 

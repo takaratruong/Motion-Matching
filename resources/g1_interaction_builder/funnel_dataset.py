@@ -107,28 +107,6 @@ def _condition(artifact: InteractionArtifact, clip: int, reach: int) -> np.ndarr
          support_height, grasp_height], np.float32)
 
 
-def _entry_relative_execution(execution_object: np.ndarray) -> np.ndarray:
-    execution_object = np.asarray(execution_object, dtype=np.float32)
-    if execution_object.shape != (16, 4):
-        raise ValueError("execution_object must have shape (16, 4)")
-    entry_x, entry_z, entry_sin, entry_cos = execution_object[0]
-    delta_x = execution_object[:, 0] - entry_x
-    delta_z = execution_object[:, 1] - entry_z
-    relative = np.empty_like(execution_object)
-    relative[:, 0] = entry_cos * delta_x + entry_sin * delta_z
-    relative[:, 1] = -entry_sin * delta_x + entry_cos * delta_z
-    relative[:, 2] = (
-        execution_object[:, 2] * entry_cos
-        - execution_object[:, 3] * entry_sin
-    )
-    relative[:, 3] = (
-        execution_object[:, 3] * entry_cos
-        + execution_object[:, 2] * entry_sin
-    )
-    relative[0] = np.asarray((0.0, 0.0, 0.0, 1.0), dtype=np.float32)
-    return relative
-
-
 def extract_dataset(artifact: InteractionArtifact) -> FunnelDataset:
     artifact.validate()
     conditions, funnels, indices = [], [], []
@@ -152,10 +130,9 @@ def extract_dataset(artifact: InteractionArtifact) -> FunnelDataset:
             object_position,
             object_yaw,
         )
-        execution_entry = _entry_relative_execution(execution_object)
         # Model convention is outward terminal-to-entrance order.
-        funnel = np.ascontiguousarray(execution_entry[::-1], dtype=np.float32)
-        funnel[15] = np.asarray((0.0, 0.0, 0.0, 1.0), dtype=np.float32)
+        funnel = np.ascontiguousarray(execution_object[::-1], dtype=np.float32)
+        funnel[15] = execution_object[0]
         if not is_certifiable_funnel(funnel):
             continue
         velocity_x, velocity_z = _object_local_delta(

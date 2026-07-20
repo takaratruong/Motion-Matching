@@ -16,6 +16,7 @@ from resources.g1_interaction_builder.diffusion import sample_checkpoint
 from resources.g1_interaction_builder.proposal_artifact import (
     ProposalArtifact,
     certify_proposals,
+    project_object_local_funnels,
     write_proposal_artifact,
 )
 from resources.g1_interaction_builder.proposal_request import read_proposal_request
@@ -40,14 +41,15 @@ def run_proposal_worker(
         device=target_device,
         seed=request.batch_seed,
     )[0].cpu().numpy()
-    execution = np.ascontiguousarray(outward[:, ::-1], dtype=np.float32)
+    execution = project_object_local_funnels(
+        np.ascontiguousarray(outward[:, ::-1], dtype=np.float32))
     accepted = certify_proposals(execution)
     seeds = np.asarray(
         [(request.batch_seed + index) % 2**64 for index in range(32)],
         dtype=np.uint64,
     )
     artifact = ProposalArtifact(
-        2,
+        3,
         request.request_id,
         request.batch_seed,
         request.checkpoint_sha256,

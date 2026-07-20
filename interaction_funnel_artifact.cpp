@@ -10,9 +10,9 @@ namespace interaction {
 
 namespace {
 
-// Canonical little-endian header magic. "G1FUNNL2".
-constexpr char kMagic[8] = {'G', '1', 'F', 'U', 'N', 'N', 'L', '2'};
-constexpr uint32_t kSchemaVersion = 2U;
+// Canonical little-endian header magic. "G1FUNNL3".
+constexpr char kMagic[8] = {'G', '1', 'F', 'U', 'N', 'N', 'L', '3'};
+constexpr uint32_t kSchemaVersion = 3U;
 
 // Yaw unit-length tolerance; mirrors the Python writer's np.allclose atol.
 constexpr float kYawUnitTolerance = 2.0e-5F;
@@ -165,10 +165,13 @@ InteractionFunnelArtifact InteractionFunnelArtifact::load(
                 throw std::runtime_error("funnel artifact: non-unit yaw vector");
             }
             if (s == 0 &&
-                (sample.x != 0.0F || sample.z != 0.0F ||
-                 sample.yaw_sin != 0.0F || sample.yaw_cos != 1.0F)) {
+                (sample.x != artifact.condition_[18] ||
+                 sample.z != artifact.condition_[19] ||
+                 sample.yaw_sin != artifact.condition_[20] ||
+                 sample.yaw_cos != artifact.condition_[21])) {
                 throw std::runtime_error(
-                    "funnel artifact: execution proposal does not start at entry");
+                    "funnel artifact: execution proposal does not start at "
+                    "conditioned object-local entry");
             }
         }
     }

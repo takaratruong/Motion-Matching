@@ -71,6 +71,17 @@ No generated sample is transformed through the frozen entry root. Runtime
 maps every object-local sample directly through the frozen target object's
 world transform.
 
+### Boundary-Preserving Geometric Decode
+
+Raw diffusion knots are decoded into the stored object-local route before
+certification. The decoder preserves the generated interaction-side endpoint
+and conditioned entry endpoint bit-exactly. It forms the shortest position/yaw
+bridge between those endpoints and retains 20 percent of each generated
+interior residual under a sine window that reaches zero at both boundaries.
+This suppresses independent-knot noise without moving either anchor or erasing
+proposal endpoint diversity. Certification still rejects any decoded route
+that violates continuity, arc, collision, or matcher constraints.
+
 ## Proposal Certification and Selection
 
 The worker still generates one deterministic batch of 32 proposals. A proposal

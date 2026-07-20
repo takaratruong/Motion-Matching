@@ -53,10 +53,9 @@ class FunnelDatasetTests(unittest.TestCase):
         )
         dataset = funnel_dataset.load_dataset("build/smart-pickup/full-pack")
         self.assertEqual(dataset.conditions.shape[1], 24)
-        expected_entry = np.array([0.0, 0.0, 0.0, 1.0], np.float32)
         np.testing.assert_array_equal(
             dataset.funnels[:, 15],
-            np.broadcast_to(expected_entry, dataset.funnels[:, 15].shape),
+            dataset.conditions[:, 18:22],
         )
         self.assertTrue(np.isfinite(dataset.conditions).all())
         self.assertTrue(

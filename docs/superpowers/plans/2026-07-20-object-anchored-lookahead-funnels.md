@@ -122,6 +122,12 @@ each proposal's execution sample zero exactly against condition entries 18
 through 21. The worker reverses sampled outward arrays once, certifies the
 execution arrays, and writes schema 3 atomically.
 
+Before certification, decode each object-local route with a boundary-preserving
+geometric projection: retain both endpoints exactly, interpolate their shortest
+position/yaw bridge, and add 20 percent of generated interior residual under a
+sine window. Test endpoint bit equality and require the decoder to regularize a
+deliberately jagged interior into a certifiable route.
+
 - [ ] **Step 6: Run GREEN and retrain**
 
 Run the Step 3 tests, then:

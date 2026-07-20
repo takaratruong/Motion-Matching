@@ -21,7 +21,7 @@ static_assert(kFunnelConditionDim == 24);
 
 // Mirror the on-disk canonical little-endian layout so the test can build
 // deliberately corrupt buffers without depending on the loader internals.
-constexpr char kMagic[8] = {'G', '1', 'F', 'U', 'N', 'N', 'L', '2'};
+constexpr char kMagic[8] = {'G', '1', 'F', 'U', 'N', 'N', 'L', '3'};
 
 void append_u32(std::vector<uint8_t>& bytes, uint32_t value) {
     for (int i = 0; i < 4; ++i) {
@@ -54,21 +54,30 @@ struct BufferPlan {
     std::array<uint8_t, kFunnelProposalCount> accepted{};
 };
 
-// A smooth, certifiable execution proposal beginning at the exact entry
-// identity and advancing 0.2 m in x, 0.125 m in z, and 0.1 rad in yaw.
+// A smooth, certifiable object-local proposal beginning at the conditioned
+// entry and advancing 0.2 m in x, 0.125 m in z, and 0.1 rad in yaw.
 BufferPlan make_valid_plan() {
     BufferPlan plan{};
     for (size_t i = 0; i < plan.checkpoint_sha256.size(); ++i) {
         plan.checkpoint_sha256[i] = static_cast<uint8_t>(i);
     }
+    plan.condition[18] = 0.42F;
+    plan.condition[19] = -0.17F;
+    plan.condition[20] = 0.6F;
+    plan.condition[21] = 0.8F;
+    const float entry_yaw = std::atan2(plan.condition[20], plan.condition[21]);
     for (int p = 0; p < kFunnelProposalCount; ++p) {
         for (int s = 0; s < kFunnelSampleCount; ++s) {
             float t = static_cast<float>(s) / static_cast<float>(kFunnelSampleCount - 1);
-            plan.proposals[p][s][0] = 0.2F * t;  // x
-            plan.proposals[p][s][1] = 0.125F * t;  // z
-            plan.proposals[p][s][2] = std::sin(0.1F * t);  // yaw sin
-            plan.proposals[p][s][3] = std::cos(0.1F * t);  // yaw cos
+            plan.proposals[p][s][0] = plan.condition[18] + 0.2F * t;
+            plan.proposals[p][s][1] = plan.condition[19] + 0.125F * t;
+            plan.proposals[p][s][2] = std::sin(entry_yaw + 0.1F * t);
+            plan.proposals[p][s][3] = std::cos(entry_yaw + 0.1F * t);
         }
+        plan.proposals[p][0][0] = plan.condition[18];
+        plan.proposals[p][0][1] = plan.condition[19];
+        plan.proposals[p][0][2] = plan.condition[20];
+        plan.proposals[p][0][3] = plan.condition[21];
         plan.seeds[p] = static_cast<uint64_t>(p);
         plan.accepted[p] = 1U;
     }
@@ -80,7 +89,7 @@ std::vector<uint8_t> serialize(const BufferPlan& plan) {
     for (char c : kMagic) {
         bytes.push_back(static_cast<uint8_t>(c));
     }
-    append_u32(bytes, 2U);  // schema_version
+    append_u32(bytes, 3U);  // schema_version
     append_u32(bytes, static_cast<uint32_t>(kFunnelConditionDim));
     append_u32(bytes, static_cast<uint32_t>(kFunnelProposalCount));
     append_u32(bytes, static_cast<uint32_t>(kFunnelSampleCount));
@@ -122,6 +131,10 @@ void test_valid_round_trip_preserves_all_fields() {
     for (int i = 0; i < kFunnelConditionDim; ++i) {
         plan.condition[i] = static_cast<float>(i) * 0.5F;
     }
+    plan.condition[18] = 0.42F;
+    plan.condition[19] = -0.17F;
+    plan.condition[20] = 0.6F;
+    plan.condition[21] = 0.8F;
     plan.accepted[5] = 0U;  // a non-accepted proposal is still preserved
 
     InteractionFunnelArtifact artifact = InteractionFunnelArtifact::load(serialize(plan));
@@ -130,16 +143,20 @@ void test_valid_round_trip_preserves_all_fields() {
     assert(artifact.batch_seed() == 2026071901U);
     assert(artifact.checkpoint_sha256()[31] == 31U);
     for (int i = 0; i < kFunnelConditionDim; ++i) {
-        assert(artifact.condition()[static_cast<size_t>(i)] == static_cast<float>(i) * 0.5F);
+        assert(artifact.condition()[static_cast<size_t>(i)] == plan.condition[static_cast<size_t>(i)]);
     }
     const auto& proposals = artifact.proposals();
     for (int p = 0; p < kFunnelProposalCount; ++p) {
         assert(proposals[static_cast<size_t>(p)].seed == static_cast<uint64_t>(p));
         assert(proposals[static_cast<size_t>(p)].accepted == (p != 5));
-        assert(proposals[static_cast<size_t>(p)].samples[15].x == 0.2F);
-        assert(proposals[static_cast<size_t>(p)].samples[15].z == 0.125F);
-        assert(proposals[static_cast<size_t>(p)].samples[15].yaw_sin == std::sin(0.1F));
-        assert(proposals[static_cast<size_t>(p)].samples[15].yaw_cos == std::cos(0.1F));
+        assert(proposals[static_cast<size_t>(p)].samples[15].x ==
+               plan.proposals[static_cast<size_t>(p)][15][0]);
+        assert(proposals[static_cast<size_t>(p)].samples[15].z ==
+               plan.proposals[static_cast<size_t>(p)][15][1]);
+        assert(proposals[static_cast<size_t>(p)].samples[15].yaw_sin ==
+               plan.proposals[static_cast<size_t>(p)][15][2]);
+        assert(proposals[static_cast<size_t>(p)].samples[15].yaw_cos ==
+               plan.proposals[static_cast<size_t>(p)][15][3]);
     }
 }
 
@@ -163,7 +180,7 @@ void test_bad_magic_is_rejected() {
 
 void test_bad_schema_version_is_rejected() {
     std::vector<uint8_t> bytes = serialize(make_valid_plan());
-    bytes[8] = 3U;  // first byte of schema_version
+    bytes[8] = 2U;  // first byte of schema_version
     assert(throws_runtime(bytes));
 }
 
@@ -188,6 +205,13 @@ void test_non_finite_float_is_rejected() {
 void test_non_unit_yaw_vector_is_rejected() {
     BufferPlan plan = make_valid_plan();
     plan.proposals[7][3][2] = 2.0F;  // (2, 1) is not unit length
+    assert(throws_runtime(serialize(plan)));
+}
+
+void test_execution_start_must_equal_conditioned_object_local_entry() {
+    BufferPlan plan = make_valid_plan();
+    plan.proposals[4][0][0] = std::nextafter(
+        plan.proposals[4][0][0], 1.0F);
     assert(throws_runtime(serialize(plan)));
 }
 
@@ -216,7 +240,8 @@ void test_accepted_arc_violation_is_rejected() {
     BufferPlan plan = make_valid_plan();
     // Collapse proposal 4 to a stationary point: arc = 0 < 0.15 m.
     for (int s = 0; s < kFunnelSampleCount; ++s) {
-        plan.proposals[4][s][0] = 0.0F;
+        plan.proposals[4][s][0] = plan.condition[18];
+        plan.proposals[4][s][1] = plan.condition[19];
     }
     assert(throws_runtime(serialize(plan)));
 }
@@ -242,6 +267,7 @@ int main() {
     test_wrong_dimension_header_is_rejected();
     test_non_finite_float_is_rejected();
     test_non_unit_yaw_vector_is_rejected();
+    test_execution_start_must_equal_conditioned_object_local_entry();
     test_duplicate_seeds_are_rejected();
     test_accepted_translation_violation_is_rejected();
     test_accepted_yaw_violation_is_rejected();
