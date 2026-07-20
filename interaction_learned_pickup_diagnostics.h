@@ -9,11 +9,46 @@
 
 #include "interaction_funnel_follower.h"
 
+#include <array>
 #include <cstdint>
 
 namespace interaction {
 
+enum class LearnedPickupState : uint8_t {
+    Idle,
+    CoarseCapture,
+    CaptureSettling,
+    ProposalPending,
+    SelectionPreview,
+    FunnelFollow,
+    FinalPreview,
+    ReadyToSubmit,
+    Submitted,
+    Failed,
+};
+
+enum class LearnedPickupFailureReason : uint8_t {
+    None,
+    Cancelled,
+    TargetChanged,
+    RuntimeChanged,
+    NoSafeCapture,
+    InvalidCondition,
+    ProposalLaunchFailed,
+    ProposalTimeout,
+    ProposalWorkerFailed,
+    ProposalIdentityMismatch,
+    NoAcceptedProposal,
+    SelectionPreviewRejected,
+    RouteBlocked,
+    FollowerFailed,
+    FinalPreviewRejected,
+};
+
 struct LearnedPickupDiagnostics {
+    LearnedPickupState state = LearnedPickupState::Idle;
+    LearnedPickupFailureReason failure_reason =
+        LearnedPickupFailureReason::None;
     // True once an accepted proposal has been selected to drive the follower.
     bool armed = false;
     // Seed of the accepted proposal currently armed (0 when not armed).
@@ -24,6 +59,10 @@ struct LearnedPickupDiagnostics {
     FunnelFollowerState follower_state = FunnelFollowerState::Following;
     FunnelCancelReason follower_cancel_reason = FunnelCancelReason::None;
     int follower_published_count = 0;
+    int selected_proposal_index = -1;
+    uint32_t settled_capture_ticks = 0U;
+    uint32_t proposal_pending_ticks = 0U;
+    std::array<float, kFunnelConditionDim> frozen_condition{};
 };
 
 }  // namespace interaction

@@ -39,6 +39,13 @@ static_assert(std::is_same_v<
     decltype(interaction::PickAssistObservation{}.preview_results),
     std::vector<interaction::PickAssistPreviewResult>>);
 static_assert(std::is_same_v<
+    decltype(interaction::PickAssistStart{}.controller_tick), uint64_t>);
+static_assert(std::is_same_v<
+    decltype(interaction::PickAssistObservation{}.live_obstacles),
+    std::vector<interaction::PickNavigationObstacle>>);
+static_assert(std::is_same_v<
+    decltype(interaction::SmartPickupPostStepInput{}.controller_tick), uint64_t>);
+static_assert(std::is_same_v<
     decltype(std::declval<interaction::SmartPickupController&>().pre_step(
         std::declval<const interaction::SmartPickupPreStepInput&>())),
     interaction::SmartPickupPreStepResult>);
@@ -502,13 +509,21 @@ interaction::SmartPickupPostStepInput make_post_input(
     const interaction::LocomotionSnapshot& snapshot,
     const interaction::InteractionTarget* target,
     const std::vector<vec3>& obstacle_centers = {},
-    const std::vector<vec3>& obstacle_sizes = {}) {
+    const std::vector<vec3>& obstacle_sizes = {},
+    uint64_t controller_tick = 0U) {
     interaction::SmartPickupPostStepInput input{};
     input.runtime_state = interaction::RuntimeState::Locomotion;
     input.live_flat_snapshot = snapshot;
     input.current_target = target;
+    input.controller_tick = controller_tick;
     input.obstacle_centers = obstacle_centers;
     input.obstacle_sizes = obstacle_sizes;
+    if (obstacle_centers.size() == obstacle_sizes.size()) {
+        for (size_t index = 0U; index < obstacle_centers.size(); ++index) {
+            input.live_obstacles.push_back({
+                obstacle_centers[index], obstacle_sizes[index]});
+        }
+    }
     input.simulation_velocity = vec3();
     input.displayed_planar_speed_mps = 0.0F;
     input.camera_azimuth = 0.0F;
@@ -1953,6 +1968,11 @@ void test_post_obstacles_are_copied_into_backend_and_frozen() {
                 backend.begin_inputs.front().obstacles,
                 obstacle_centers,
                 obstacle_sizes) &&
+            backend.begin_inputs.front().controller_tick == 0U &&
+            same_navigation_obstacle_bits(
+                backend.begin_inputs.front().live_obstacles,
+                obstacle_centers,
+                obstacle_sizes) &&
             same_vec3_vector_bits(obstacle_centers, centers_before) &&
             same_vec3_vector_bits(obstacle_sizes, sizes_before),
         "coordinator did not copy ordered post-step obstacles exactly");
@@ -2005,6 +2025,13 @@ void test_post_obstacles_are_copied_into_backend_and_frozen() {
             frozen.slot_selection.selected_index == expected_selected_index &&
             frozen.slot_selection.ordered[0].obstacle_index == 1,
         "later controller obstacles replaced the attempt's frozen copy");
+    require(
+        backend.observations.back().controller_tick == 0U &&
+            same_navigation_obstacle_bits(
+                backend.observations.back().live_obstacles,
+                replacement_centers,
+                replacement_sizes),
+        "active observation did not receive exact ordered live obstacles");
 }
 
 interaction::PickEntryPreview make_certified_preview(

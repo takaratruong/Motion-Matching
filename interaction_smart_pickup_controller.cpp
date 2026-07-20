@@ -63,6 +63,22 @@ std::optional<PickEntryPreview> preview_frozen_smart_pickup(
     return preview_pick(live_snapshot, frozen_root, target, affordance_id);
 }
 
+std::vector<PickNavigationObstacle> collect_live_obstacles(
+    const SmartPickupPostStepInput& input) {
+    if (input.obstacle_centers.size() != input.obstacle_sizes.size()) {
+        throw std::invalid_argument(
+            "smart-pickup obstacle arrays must have equal length");
+    }
+    if (!input.live_obstacles.empty()) return input.live_obstacles;
+    std::vector<PickNavigationObstacle> obstacles;
+    obstacles.reserve(input.obstacle_centers.size());
+    for (size_t index = 0U; index < input.obstacle_centers.size(); ++index) {
+        obstacles.push_back({
+            input.obstacle_centers[index], input.obstacle_sizes[index]});
+    }
+    return obstacles;
+}
+
 }  // namespace
 
 SmartPickupController::SmartPickupController()
@@ -156,32 +172,24 @@ SmartPickupPostStepResult SmartPickupController::post_step(
         locomotion_snapshot_fingerprint(input.live_flat_snapshot);
 
     bool observe_assist = false;
+    std::vector<PickNavigationObstacle> live_obstacles{};
     if (pending_activation_.has_value()) {
         std::optional<PendingManualPickActivation> activation =
             std::exchange(pending_activation_, std::nullopt);
-        if (input.obstacle_centers.size() != input.obstacle_sizes.size()) {
-            throw std::invalid_argument(
-                "smart-pickup obstacle arrays must have equal length");
-        }
-
+        live_obstacles = collect_live_obstacles(input);
         PickAssistStart start{};
         start.target_snapshot = activation->target_snapshot;
         start.affordance_id = activation->affordance_id;
         start.root_world = snapshot_root(input.live_flat_snapshot);
-        start.obstacles.reserve(input.obstacle_centers.size());
-        for (size_t index = 0U;
-             index < input.obstacle_centers.size();
-             ++index) {
-            start.obstacles.push_back({
-                input.obstacle_centers[index],
-                input.obstacle_sizes[index],
-            });
-        }
+        start.obstacles = live_obstacles;
+        start.controller_tick = input.controller_tick;
+        start.live_obstacles = live_obstacles;
 
         backend_->begin(start, input.current_target);
         observe_assist = true;
     } else {
         observe_assist = backend_->active();
+        if (observe_assist) live_obstacles = collect_live_obstacles(input);
     }
 
     if (!observe_assist) {
@@ -190,6 +198,7 @@ SmartPickupPostStepResult SmartPickupController::post_step(
     }
 
     PickAssistObservation observation{};
+    observation.controller_tick = input.controller_tick;
     observation.runtime_state = input.runtime_state;
     observation.target = input.current_target;
     observation.displayed_root = snapshot_root(input.live_flat_snapshot);
@@ -198,6 +207,7 @@ SmartPickupPostStepResult SmartPickupController::post_step(
         input.displayed_planar_speed_mps;
     observation.camera_azimuth = input.camera_azimuth;
     observation.snapshot_fingerprint = result.snapshot_fingerprint;
+    observation.live_obstacles = live_obstacles;
 
     if (!previous_assist_output_.preview_requests.empty() &&
         static_cast<bool>(preview_pick)) {

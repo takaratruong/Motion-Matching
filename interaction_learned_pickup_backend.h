@@ -14,19 +14,38 @@
 // state. Callers apply the follower's published targets.
 
 #include "interaction_funnel_artifact.h"
+#include "interaction_funnel_capture.h"
 #include "interaction_funnel_follower.h"
+#include "interaction_funnel_worker.h"
 #include "interaction_learned_pickup_diagnostics.h"
 #include "interaction_pick_assist.h"
 #include "interaction_smart_pickup_controller.h"
 
+#include <array>
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 namespace interaction {
+
+struct LearnedPickupConfig {
+    FunnelCaptureConfig capture{};
+    ArrivalConfig arrival{};
+    uint32_t required_capture_settle_ticks = 3U;
+    uint32_t maximum_proposal_pending_ticks = 250U;
+    float capture_position_tolerance_m = 0.03F;
+    float capture_yaw_tolerance_radians = 20.0F * PIf / 180.0F;
+    float capture_speed_tolerance_mps = 0.10F;
+    uint64_t batch_seed = 2026071901U;
+    std::array<uint8_t, 32> checkpoint_sha256{};
+};
 
 class LearnedSmartPickupBackend final : public SmartPickupAssistBackend {
 public:
     explicit LearnedSmartPickupBackend(InteractionFunnelArtifact artifact);
+    LearnedSmartPickupBackend(
+        FunnelProposalProvider& provider,
+        LearnedPickupConfig config);
 
     // Authored SmartPickupAssistBackend interface, delegated unchanged.
     bool begin(
@@ -52,10 +71,25 @@ public:
 
 private:
     void refresh_follower_diagnostics();
+    PickAssistOutput observe_learned(const PickAssistObservation& observation);
+    PickAssistOutput fail(LearnedPickupFailureReason reason);
+    PickAssistOutput braking_output() const;
+    bool authority_matches(const PickAssistObservation& observation) const;
 
-    InteractionFunnelArtifact artifact_;
+    std::optional<InteractionFunnelArtifact> artifact_{};
+    FunnelProposalProvider* provider_ = nullptr;
+    LearnedPickupConfig config_{};
     ControllerPickAssist authored_{};
+    PickAssistStart start_{};
+    FunnelCaptureSelection capture_{};
+    Transform frozen_entry_world_{};
+    FunnelProposalRequest proposal_request_{};
+    std::vector<PickAssistPreviewRequest> selection_requests_{};
+    std::vector<size_t> selection_proposal_indices_{};
+    FunnelExecutionTargets selected_world_targets_{};
+    PickEntryRoot final_root_{};
     std::optional<InteractionFunnelFollower> follower_{};
+    PickAssistDiagnostics diagnostics_{};
     LearnedPickupDiagnostics learned_diagnostics_{};
 };
 

@@ -55,6 +55,8 @@ struct PickAssistStart {
     uint32_t affordance_id = 0U;
     Transform root_world{};
     std::vector<PickNavigationObstacle> obstacles{};
+    uint64_t controller_tick = 0U;
+    std::vector<PickNavigationObstacle> live_obstacles{};
 };
 
 struct PickAssistPreviewRequest {
@@ -68,6 +70,7 @@ struct PickAssistPreviewResult {
 };
 
 struct PickAssistObservation {
+    uint64_t controller_tick = 0U;
     RuntimeState runtime_state = RuntimeState::Locomotion;
     const InteractionTarget* target = nullptr;
     Transform displayed_root{};
@@ -77,6 +80,7 @@ struct PickAssistObservation {
     uint64_t snapshot_fingerprint = 0U;
     uint64_t preview_snapshot_fingerprint = 0U;
     std::vector<PickAssistPreviewResult> preview_results{};
+    std::vector<PickNavigationObstacle> live_obstacles{};
 };
 
 struct PickAssistOutput {

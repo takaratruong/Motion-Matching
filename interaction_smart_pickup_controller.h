@@ -55,11 +55,13 @@ struct SmartPickupPreStepResult {
 };
 
 struct SmartPickupPostStepInput {
+    uint64_t controller_tick = 0U;
     RuntimeState runtime_state = RuntimeState::Locomotion;
     LocomotionSnapshot live_flat_snapshot{};
     const InteractionTarget* current_target = nullptr;
     std::vector<vec3> obstacle_centers{};
     std::vector<vec3> obstacle_sizes{};
+    std::vector<PickNavigationObstacle> live_obstacles{};
     vec3 simulation_velocity{};
     float displayed_planar_speed_mps = 0.0F;
     float camera_azimuth = 0.0F;
