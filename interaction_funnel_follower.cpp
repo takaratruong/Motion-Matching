@@ -8,8 +8,8 @@ namespace {
 
 float translation_error(const FunnelSample& tracked, const FunnelSample& target) {
     float dx = tracked.x - target.x;
-    float dy = tracked.y - target.y;
-    return std::sqrt(dx * dx + dy * dy);
+    float dz = tracked.z - target.z;
+    return std::sqrt(dx * dx + dz * dz);
 }
 
 float yaw_error(const FunnelSample& tracked, const FunnelSample& target) {

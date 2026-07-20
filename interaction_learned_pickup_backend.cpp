@@ -21,6 +21,12 @@ bool LearnedSmartPickupBackend::begin(
 
 void LearnedSmartPickupBackend::cancel() {
     authored_.cancel();
+    if (follower_.has_value()) {
+        follower_->cancel(FunnelCancelReason::ExplicitCancel);
+        learned_diagnostics_.armed = false;
+        learned_diagnostics_.armed_seed = 0U;
+        refresh_follower_diagnostics();
+    }
 }
 
 PickAssistOutput LearnedSmartPickupBackend::observe(

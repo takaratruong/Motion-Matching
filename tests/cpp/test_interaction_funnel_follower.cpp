@@ -20,9 +20,9 @@ std::array<FunnelSample, kFunnelSampleCount> smooth_samples() {
     std::array<FunnelSample, kFunnelSampleCount> samples{};
     for (int s = 0; s < kFunnelSampleCount; ++s) {
         samples[static_cast<size_t>(s)].x = 0.04F * static_cast<float>(s);
-        samples[static_cast<size_t>(s)].y = 0.0F;
-        samples[static_cast<size_t>(s)].yaw_cos = 1.0F;
+        samples[static_cast<size_t>(s)].z = 0.0F;
         samples[static_cast<size_t>(s)].yaw_sin = 0.0F;
+        samples[static_cast<size_t>(s)].yaw_cos = 1.0F;
     }
     return samples;
 }
@@ -98,7 +98,7 @@ void test_translation_tracking_error_cancels() {
     follower.tick({0U, samples[0]});  // publishes sample 0
     // At tick 1 the robot should be near sample 0; place it 0.2 m away.
     FunnelSample drifted = samples[0];
-    drifted.y = 0.2F;  // exceeds 0.18 m
+    drifted.z = 0.2F;  // exceeds 0.18 m
     FunnelFollowerOutput out = follower.tick({1U, drifted});
     assert(!out.published);
     assert(out.state == FunnelFollowerState::Cancelled);
@@ -111,7 +111,7 @@ void test_translation_within_threshold_keeps_following() {
     InteractionFunnelFollower follower(3U, samples, 0U);
     follower.tick({0U, samples[0]});
     FunnelSample drifted = samples[0];
-    drifted.y = 0.17F;  // within 0.18 m
+    drifted.z = 0.17F;  // within 0.18 m
     FunnelFollowerOutput out = follower.tick({1U, drifted});
     assert(out.published);
     assert(out.state == FunnelFollowerState::Following);

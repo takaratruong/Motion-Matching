@@ -15,7 +15,7 @@ Layout (all integers and floats little-endian):
     20      4      uint32 sample_count   (== 16)
     24      4      uint32 sample_width   (== 4)
     28      72     float32[18] condition
-    100     8192   float32[32][16][4] proposals
+    100     8192   float32[32][16][4] proposals, each (x,z,sin_yaw,cos_yaw)
     8292    256    uint64[32] seeds
     8548    32     uint8[32] accepted flags (0 or 1)
 """

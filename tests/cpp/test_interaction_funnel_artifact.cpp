@@ -50,16 +50,16 @@ struct BufferPlan {
 };
 
 // A smooth, certifiable proposal: advances 0.2 m along x over 16 samples with a
-// constant unit yaw vector (0, 1). translation step ~= 0.0133 m, arc = 0.2 m.
+// constant object-local z and unit yaw vector (sin=0.6, cos=0.8).
 BufferPlan make_valid_plan() {
     BufferPlan plan{};
     for (int p = 0; p < kFunnelProposalCount; ++p) {
         for (int s = 0; s < kFunnelSampleCount; ++s) {
             float t = static_cast<float>(s) / static_cast<float>(kFunnelSampleCount - 1);
             plan.proposals[p][s][0] = 0.2F * t;  // x
-            plan.proposals[p][s][1] = 0.0F;       // y
-            plan.proposals[p][s][2] = 0.0F;       // yaw cos
-            plan.proposals[p][s][3] = 1.0F;       // yaw sin
+            plan.proposals[p][s][1] = 0.125F;     // z
+            plan.proposals[p][s][2] = 0.6F;       // yaw sin
+            plan.proposals[p][s][3] = 0.8F;       // yaw cos
         }
         plan.seeds[p] = static_cast<uint64_t>(p);
         plan.accepted[p] = 1U;
@@ -122,7 +122,9 @@ void test_valid_round_trip_preserves_all_fields() {
         assert(proposals[static_cast<size_t>(p)].seed == static_cast<uint64_t>(p));
         assert(proposals[static_cast<size_t>(p)].accepted == (p != 5));
         assert(proposals[static_cast<size_t>(p)].samples[15].x == 0.2F);
-        assert(proposals[static_cast<size_t>(p)].samples[0].yaw_sin == 1.0F);
+        assert(proposals[static_cast<size_t>(p)].samples[0].z == 0.125F);
+        assert(proposals[static_cast<size_t>(p)].samples[0].yaw_sin == 0.6F);
+        assert(proposals[static_cast<size_t>(p)].samples[0].yaw_cos == 0.8F);
     }
 }
 

@@ -90,10 +90,10 @@ float read_finite(Cursor& cursor, const char* what) {
     return value;
 }
 
-// Signed yaw step between two consecutive unit vectors (cos, sin).
+// Signed yaw step between two consecutive unit vectors (sin, cos).
 float yaw_step(const FunnelSample& previous, const FunnelSample& current) {
-    float cross = current.yaw_cos * previous.yaw_sin - current.yaw_sin * previous.yaw_cos;
-    float dot = current.yaw_cos * previous.yaw_cos + current.yaw_sin * previous.yaw_sin;
+    float cross = current.yaw_sin * previous.yaw_cos - current.yaw_cos * previous.yaw_sin;
+    float dot = current.yaw_sin * previous.yaw_sin + current.yaw_cos * previous.yaw_cos;
     return std::abs(std::atan2(cross, dot));
 }
 
@@ -103,8 +103,8 @@ void certify_accepted(const FunnelProposal& proposal) {
         const FunnelSample& previous = proposal.samples[static_cast<size_t>(s - 1)];
         const FunnelSample& current = proposal.samples[static_cast<size_t>(s)];
         float dx = current.x - previous.x;
-        float dy = current.y - previous.y;
-        float step = std::sqrt(dx * dx + dy * dy);
+        float dz = current.z - previous.z;
+        float step = std::sqrt(dx * dx + dz * dz);
         arc += step;
         if (step > kFunnelMaxTranslationStep) {
             throw std::runtime_error(
@@ -148,9 +148,9 @@ InteractionFunnelArtifact InteractionFunnelArtifact::load(
         for (int s = 0; s < kFunnelSampleCount; ++s) {
             FunnelSample& sample = proposal.samples[static_cast<size_t>(s)];
             sample.x = read_finite(cursor, "sample");
-            sample.y = read_finite(cursor, "sample");
-            sample.yaw_cos = read_finite(cursor, "sample");
+            sample.z = read_finite(cursor, "sample");
             sample.yaw_sin = read_finite(cursor, "sample");
+            sample.yaw_cos = read_finite(cursor, "sample");
             float norm = std::sqrt(
                 sample.yaw_cos * sample.yaw_cos + sample.yaw_sin * sample.yaw_sin);
             if (std::abs(norm - 1.0F) > kYawUnitTolerance) {

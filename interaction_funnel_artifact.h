@@ -15,8 +15,8 @@
 namespace interaction {
 
 // Frozen artifact dimensions. Exactly one condition vector, 32 proposals, 16
-// samples per proposal, and four float32 values per sample (planar x, y and a
-// unit yaw vector cos, sin).
+// samples per proposal, and four float32 values per sample. The byte and field
+// order is frozen as object-local (x, z, sin(yaw), cos(yaw)).
 constexpr int kFunnelConditionDim = 18;
 constexpr int kFunnelProposalCount = 32;
 constexpr int kFunnelSampleCount = 16;
@@ -30,9 +30,9 @@ constexpr float kFunnelMinArcLength = 0.15F;             // metres, total path
 // One execution-order sample of a funnel proposal.
 struct FunnelSample {
     float x = 0.0F;
-    float y = 0.0F;
-    float yaw_cos = 0.0F;
+    float z = 0.0F;
     float yaw_sin = 0.0F;
+    float yaw_cos = 0.0F;
 };
 
 // One proposal: an immutable seed, an acceptance flag, and its samples.

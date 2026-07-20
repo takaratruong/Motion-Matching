@@ -26,6 +26,7 @@ enum class FunnelFollowerState {
 
 enum class FunnelCancelReason {
     None,
+    ExplicitCancel,
     MissedTick,
     TranslationError,
     YawError,
@@ -36,8 +37,7 @@ constexpr float kFunnelMaxTrackingTranslation = 0.18F;        // metres
 constexpr float kFunnelMaxTrackingYawRadians = 0.43633231F;   // 25 degrees
 
 // One 25 Hz observation: the monotonically increasing tick index and the
-// current tracked planar pose (a FunnelSample carries planar x, y and a unit
-// yaw vector).
+// current tracked object-local planar pose (x, z, sin(yaw), cos(yaw)).
 struct FunnelFollowerInput {
     uint64_t tick_index = 0U;
     FunnelSample tracked_pose{};
@@ -70,12 +70,13 @@ public:
     // Advance one 25 Hz tick. Publishes the next sample, or cancels.
     FunnelFollowerOutput tick(const FunnelFollowerInput& input);
 
+    // Terminally cancel an armed follower without publishing another sample.
+    void cancel(FunnelCancelReason reason);
+
     uint64_t proposal_seed() const { return proposal_seed_; }
     const FunnelFollowerDiagnostics& diagnostics() const { return diagnostics_; }
 
 private:
-    void cancel(FunnelCancelReason reason);
-
     const uint64_t proposal_seed_;
     const std::array<FunnelSample, kFunnelSampleCount> samples_;
     uint64_t expected_tick_index_;

@@ -44,7 +44,7 @@ void append_f32(std::vector<uint8_t>& bytes, float value) {
 }
 
 struct SampleTuple {
-    float x, y, cos, sin;
+    float x, z, sin, cos;
 };
 
 // Build a valid artifact where proposal 0 is rejected-and-discontinuous and the
@@ -60,12 +60,12 @@ InteractionFunnelArtifact make_artifact() {
     for (int i = 0; i < kFunnelConditionDim; ++i) append_f32(bytes, 0.0F);
     for (int p = 0; p < kFunnelProposalCount; ++p) {
         for (int s = 0; s < kFunnelSampleCount; ++s) {
-            SampleTuple sample{0.04F * static_cast<float>(s), 0.0F, 1.0F, 0.0F};
+            SampleTuple sample{0.04F * static_cast<float>(s), 0.0F, 0.0F, 1.0F};
             if (p == 0 && s == 8) sample.x = 5.0F;  // discontinuous, only ok if rejected
             append_f32(bytes, sample.x);
-            append_f32(bytes, sample.y);
-            append_f32(bytes, sample.cos);
+            append_f32(bytes, sample.z);
             append_f32(bytes, sample.sin);
+            append_f32(bytes, sample.cos);
         }
     }
     for (int p = 0; p < kFunnelProposalCount; ++p) append_u64(bytes, static_cast<uint64_t>(100 + p));
@@ -76,9 +76,9 @@ InteractionFunnelArtifact make_artifact() {
 interaction::FunnelSample sample_at(float x) {
     interaction::FunnelSample s{};
     s.x = x;
-    s.y = 0.0F;
-    s.yaw_cos = 1.0F;
+    s.z = 0.0F;
     s.yaw_sin = 0.0F;
+    s.yaw_cos = 1.0F;
     return s;
 }
 
@@ -142,6 +142,22 @@ void test_missed_tick_cancellation_is_mirrored() {
     assert(backend.learned_diagnostics().follower_cancel_reason == FunnelCancelReason::MissedTick);
 }
 
+void test_backend_cancel_terminates_the_learned_follower() {
+    LearnedSmartPickupBackend backend(make_artifact());
+    assert(backend.arm(10U));
+    assert(backend.follow({10U, sample_at(0.0F)}).published);
+
+    backend.cancel();
+
+    assert(!backend.learned_diagnostics().armed);
+    assert(backend.learned_diagnostics().follower_state == FunnelFollowerState::Cancelled);
+    assert(backend.learned_diagnostics().follower_cancel_reason ==
+           FunnelCancelReason::ExplicitCancel);
+    interaction::FunnelFollowerOutput out = backend.follow({11U, sample_at(0.0F)});
+    assert(!out.published);
+    assert(out.state == FunnelFollowerState::Cancelled);
+}
+
 void test_arm_is_rejected_when_no_proposal_accepted() {
     // Build an artifact with every proposal rejected.
     std::vector<uint8_t> bytes;
@@ -156,8 +172,8 @@ void test_arm_is_rejected_when_no_proposal_accepted() {
         for (int s = 0; s < kFunnelSampleCount; ++s) {
             append_f32(bytes, 0.04F * static_cast<float>(s));
             append_f32(bytes, 0.0F);
-            append_f32(bytes, 1.0F);
             append_f32(bytes, 0.0F);
+            append_f32(bytes, 1.0F);
         }
     }
     for (int p = 0; p < kFunnelProposalCount; ++p) append_u64(bytes, static_cast<uint64_t>(p));
@@ -177,6 +193,7 @@ int main() {
     test_follower_publishes_accepted_samples_once();
     test_follow_before_arm_publishes_nothing();
     test_missed_tick_cancellation_is_mirrored();
+    test_backend_cancel_terminates_the_learned_follower();
     test_arm_is_rejected_when_no_proposal_accepted();
     return 0;
 }
