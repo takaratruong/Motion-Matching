@@ -3562,10 +3562,13 @@ void update_callback(void* args)
 int main(void)
 {
     std::optional<AutodemoConfiguration> autodemo_configuration;
+    interaction::SmartPickupProductionConfig smart_pickup_configuration{};
     std::filesystem::path matching_features_output =
         "./resources/features.bin";
     try
     {
+        smart_pickup_configuration =
+            interaction::load_smart_pickup_production_config();
         autodemo_configuration = parse_autodemo_environment();
 #if !defined(PLATFORM_WEB)
         if (autodemo_configuration.has_value())
@@ -4261,7 +4264,8 @@ int main(void)
 
     const float dt = interaction::kControllerStepSeconds;
     interaction::ControllerInteractionScheduler interaction_scheduler;
-    interaction::SmartPickupController manual_smart_pickup_controller;
+    interaction::SmartPickupController manual_smart_pickup_controller(
+        smart_pickup_configuration);
     interaction::SmartPickupPostStepResult manual_smart_pickup_post_step{};
     std::optional<interaction::PickRequest> manual_smart_pickup_request{};
     ManualPickStationaryDiagnostics manual_pick_stationary_diagnostics{};
@@ -4270,6 +4274,7 @@ int main(void)
     interaction::ControllerInteractionFrameHandoff interaction_frame_handoff;
     interaction::ControllerInteractionSceneHandoff interaction_scene_handoff;
     uint64_t interaction_next_request_id = 1U;
+    uint64_t smart_pickup_controller_tick = 0U;
     interaction::ControllerInteractionFrameState interaction_frame_state{};
 
     auto resolve_autodemo_place_target =
@@ -5633,6 +5638,8 @@ int main(void)
         if (!legacy_interaction_fixture_mode)
         {
             interaction::SmartPickupPostStepInput manual_smart_pickup_post_input{};
+            manual_smart_pickup_post_input.controller_tick =
+                smart_pickup_controller_tick;
             manual_smart_pickup_post_input.runtime_state =
                 cached_interaction_state;
             manual_smart_pickup_post_input.live_flat_snapshot =
@@ -7935,6 +7942,8 @@ int main(void)
                 }
             }
         }
+
+        ++smart_pickup_controller_tick;
 
     };
 

@@ -1,7 +1,12 @@
 #include "interaction_smart_pickup_controller.h"
 
 #include "g1_skeleton.h"
+#include "interaction_funnel_worker.h"
+#include "interaction_learned_pickup_backend.h"
+#include "interaction_sha256.h"
 
+#include <cstdlib>
+#include <filesystem>
 #include <stdexcept>
 #include <utility>
 
@@ -81,10 +86,80 @@ std::vector<PickNavigationObstacle> collect_live_obstacles(
 
 }  // namespace
 
+SmartPickupProductionConfig parse_smart_pickup_production_config(
+    const std::map<std::string, std::string>& environment) {
+    SmartPickupProductionConfig config{};
+    const auto provider = environment.find("G1_SMART_PICKUP_PROVIDER");
+    if (provider == environment.end()) return config;
+    if (provider->second == "authored") return config;
+    if (provider->second != "learned") {
+        throw std::invalid_argument(
+            "G1_SMART_PICKUP_PROVIDER must be authored or learned");
+    }
+
+    const auto required_path = [&environment](const char* name) {
+        const auto value = environment.find(name);
+        if (value == environment.end() || value->second.empty()) {
+            throw std::invalid_argument(
+                std::string("learned Smart Pickup requires ") + name);
+        }
+        return std::filesystem::path(value->second);
+    };
+    config.mode = SmartPickupProviderMode::Learned;
+    config.python = required_path("G1_FUNNEL_PYTHON");
+    config.checkpoint = required_path("G1_FUNNEL_CHECKPOINT");
+    config.worker = required_path("G1_FUNNEL_WORKER");
+    config.work_directory = required_path("G1_FUNNEL_WORK_DIR");
+    for (const auto& path :
+         {config.python, config.checkpoint, config.worker}) {
+        if (!std::filesystem::is_regular_file(path)) {
+            throw std::invalid_argument(
+                "learned Smart Pickup file is unavailable: " + path.string());
+        }
+    }
+    std::filesystem::create_directories(config.work_directory);
+    config.checkpoint_sha256 = sha256_file_bytes(config.checkpoint);
+    return config;
+}
+
+SmartPickupProductionConfig load_smart_pickup_production_config() {
+    std::map<std::string, std::string> environment;
+    const char* names[]{
+        "G1_SMART_PICKUP_PROVIDER",
+        "G1_FUNNEL_PYTHON",
+        "G1_FUNNEL_CHECKPOINT",
+        "G1_FUNNEL_WORKER",
+        "G1_FUNNEL_WORK_DIR",
+    };
+    for (const char* name : names) {
+        if (const char* value = std::getenv(name); value != nullptr) {
+            environment.emplace(name, value);
+        }
+    }
+    return parse_smart_pickup_production_config(environment);
+}
+
 SmartPickupController::SmartPickupController()
-    : owned_backend_(
-          std::make_unique<ProductionSmartPickupAssistBackend>()),
-      backend_(owned_backend_.get()) {}
+    : SmartPickupController(SmartPickupProductionConfig{}) {}
+
+SmartPickupController::SmartPickupController(
+    const SmartPickupProductionConfig& config) {
+    if (config.mode == SmartPickupProviderMode::Authored) {
+        owned_backend_ =
+            std::make_unique<ProductionSmartPickupAssistBackend>();
+    } else {
+        owned_provider_ = std::make_unique<AsyncPythonFunnelProvider>(
+            config.python,
+            config.worker,
+            config.checkpoint,
+            config.work_directory);
+        LearnedPickupConfig learned{};
+        learned.checkpoint_sha256 = config.checkpoint_sha256;
+        owned_backend_ = std::make_unique<LearnedSmartPickupBackend>(
+            *owned_provider_, learned);
+    }
+    backend_ = owned_backend_.get();
+}
 
 SmartPickupController::SmartPickupController(
     SmartPickupAssistBackend& backend)

@@ -69,7 +69,11 @@ CONTROLLER_LOCOMOTION_SOURCES := interaction_arrival.cpp \
   interaction_pick_approach.cpp \
   locomotion_controller_update.cpp
 CONTROLLER_SMART_PICKUP_SOURCES := interaction_smart_pickup_controller.cpp \
-  interaction_smart_pickup_scene.cpp
+  interaction_smart_pickup_scene.cpp \
+  interaction_learned_pickup_backend.cpp interaction_funnel_artifact.cpp \
+  interaction_funnel_capture.cpp interaction_funnel_follower.cpp \
+  interaction_funnel_timing.cpp interaction_funnel_worker.cpp \
+  interaction_sha256.cpp
 SOURCE := controller.cpp $(INTERACTION_SOURCES) \
   $(CONTROLLER_LOCOMOTION_SOURCES) \
   $(CONTROLLER_SMART_PICKUP_SOURCES)
@@ -150,6 +154,7 @@ CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_funnel_capture
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_funnel_timing
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_funnel_follower
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_learned_pickup_backend
+CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_learned_pickup_end_to_end
 RELEASE_FAST_MATH_TARGET_TEST := \
   $(CPP_TEST_DIR)/test_interaction_target_release_fast_math
 RELEASE_FAST_MATH_CARRY_TEST := \
@@ -233,10 +238,18 @@ INTERACTION_SMART_PICKUP_SCENE_HEADERS := \
 INTERACTION_SMART_PICKUP_CONTROLLER_LINK_SOURCES := \
   interaction_smart_pickup_controller.cpp \
   interaction_smart_pickup_scene.cpp \
+  interaction_learned_pickup_backend.cpp interaction_funnel_artifact.cpp \
+  interaction_funnel_capture.cpp interaction_funnel_follower.cpp \
+  interaction_funnel_timing.cpp interaction_funnel_worker.cpp \
+  interaction_sha256.cpp \
   interaction_pick_assist.cpp interaction_pick_slots.cpp \
   interaction_arrival.cpp $(INTERACTION_RUNTIME_SOURCES)
 INTERACTION_SMART_PICKUP_CONTROLLER_HEADERS := \
   interaction_smart_pickup_controller.h interaction_smart_pickup_scene.h \
+  interaction_learned_pickup_backend.h interaction_learned_pickup_diagnostics.h \
+  interaction_funnel_artifact.h interaction_funnel_capture.h \
+  interaction_funnel_follower.h interaction_funnel_timing.h \
+  interaction_funnel_worker.h interaction_sha256.h \
   interaction_pick_assist.h interaction_pick_slots.h interaction_arrival.h \
   interaction_runtime.h interaction_controller_adapter.h \
   $(INTERACTION_PLACE_HEADERS) interaction_carry.h interaction_ik.h \
@@ -374,6 +387,9 @@ INTERACTION_LEARNED_PICKUP_BACKEND_HEADERS := \
 
 $(CPP_TEST_DIR)/test_interaction_learned_pickup_backend: tests/cpp/test_interaction_learned_pickup_backend.cpp $(INTERACTION_LEARNED_PICKUP_BACKEND_LINK_SOURCES) $(INTERACTION_LEARNED_PICKUP_BACKEND_HEADERS) | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_learned_pickup_backend.cpp $(INTERACTION_LEARNED_PICKUP_BACKEND_LINK_SOURCES) -o $@
+
+$(CPP_TEST_DIR)/test_interaction_learned_pickup_end_to_end: tests/cpp/test_interaction_learned_pickup_end_to_end.cpp tests/cpp/interaction_runtime_fixture.h $(INTERACTION_LEARNED_PICKUP_BACKEND_LINK_SOURCES) $(INTERACTION_LEARNED_PICKUP_BACKEND_HEADERS) $(INTERACTION_RUNTIME_SOURCES) $(INTERACTION_RUNTIME_HEADERS) | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_learned_pickup_end_to_end.cpp $(INTERACTION_LEARNED_PICKUP_BACKEND_LINK_SOURCES) interaction_runtime.cpp interaction_carry.cpp interaction_ik.cpp interaction_attachment.cpp interaction_playback.cpp interaction_matcher.cpp interaction_features.cpp interaction_place_target.cpp interaction_place_collision.cpp interaction_place.cpp interaction_place_controller.cpp interaction_pickup_provenance.cpp -o $@
 
 $(CPP_TEST_DIR)/test_interaction_smart_pickup_controller: tests/cpp/test_interaction_smart_pickup_controller.cpp $(INTERACTION_SMART_PICKUP_CONTROLLER_LINK_SOURCES) $(INTERACTION_SMART_PICKUP_CONTROLLER_HEADERS) | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_smart_pickup_controller.cpp $(INTERACTION_SMART_PICKUP_CONTROLLER_LINK_SOURCES) -o $@

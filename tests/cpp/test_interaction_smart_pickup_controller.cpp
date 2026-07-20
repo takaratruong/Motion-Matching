@@ -13,6 +13,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -66,6 +67,17 @@ static_assert(locomotion_timing::kStepSeconds == 1.0F / 25.0F);
 
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+template<class Exception, class Callback>
+void require_throws(Callback&& callback, const char* message) {
+    bool threw = false;
+    try {
+        std::forward<Callback>(callback)();
+    } catch (const Exception&) {
+        threw = true;
+    }
+    require(threw, message);
 }
 
 bool same_float_bits(float left, float right) {
@@ -732,6 +744,50 @@ void test_activation_brackets_one_caller_step_and_defers_assist_motion() {
             root_transform(approach_snapshot).position,
             approach_root_before),
         "certified approach steering did not affect the following tick");
+}
+
+void test_production_provider_configuration_is_explicit_and_strict() {
+    const interaction::SmartPickupProductionConfig defaulted =
+        interaction::parse_smart_pickup_production_config({});
+    require(defaulted.mode == interaction::SmartPickupProviderMode::Authored,
+        "absent provider did not preserve authored default");
+
+    require_throws<std::invalid_argument>([] {
+        (void)interaction::parse_smart_pickup_production_config({
+            {"G1_SMART_PICKUP_PROVIDER", "mystery"},
+        });
+    }, "unknown Smart Pickup provider");
+    require_throws<std::invalid_argument>([] {
+        (void)interaction::parse_smart_pickup_production_config({
+            {"G1_SMART_PICKUP_PROVIDER", "learned"},
+        });
+    }, "missing learned provider paths");
+
+    const std::map<std::string, std::string> learned_environment{
+        {"G1_SMART_PICKUP_PROVIDER", "learned"},
+        {"G1_FUNNEL_PYTHON", "/bin/true"},
+        {"G1_FUNNEL_CHECKPOINT", "build/g1-funnels/checkpoint.pt"},
+        {"G1_FUNNEL_WORKER", "tools/run_g1_funnel_proposal_worker.py"},
+        {"G1_FUNNEL_WORK_DIR", "build/g1-funnels/runtime"},
+    };
+    const interaction::SmartPickupProductionConfig learned =
+        interaction::parse_smart_pickup_production_config(
+            learned_environment);
+    require(
+        learned.mode == interaction::SmartPickupProviderMode::Learned &&
+            learned.python == "/bin/true" &&
+            learned.checkpoint == "build/g1-funnels/checkpoint.pt" &&
+            learned.worker == "tools/run_g1_funnel_proposal_worker.py" &&
+            learned.work_directory == "build/g1-funnels/runtime",
+        "learned provider paths were not preserved exactly");
+    const std::array<uint8_t, 32> expected_checkpoint_sha256{
+        0x2aU, 0x2cU, 0x85U, 0x1cU, 0x59U, 0x58U, 0x9bU, 0xf8U,
+        0x45U, 0xb0U, 0x5fU, 0x89U, 0xd6U, 0xd3U, 0x90U, 0x3cU,
+        0xd1U, 0x36U, 0xc1U, 0x15U, 0x91U, 0x77U, 0x07U, 0xc1U,
+        0x5bU, 0xb7U, 0x48U, 0x3dU, 0xdcU, 0xa5U, 0xf3U, 0xaaU,
+    };
+    require(learned.checkpoint_sha256 == expected_checkpoint_sha256,
+        "C++ checkpoint SHA-256 did not match the pinned model bytes");
 }
 
 void test_prior_preview_batch_uses_one_snapshot_and_echoes_every_request() {
@@ -2343,6 +2399,7 @@ void test_final_preview_and_request_are_each_one_shot() {
 }  // namespace
 
 int main() {
+    test_production_provider_configuration_is_explicit_and_strict();
     test_activation_brackets_one_caller_step_and_defers_assist_motion();
     test_prior_preview_batch_uses_one_snapshot_and_echoes_every_request();
     test_selection_and_final_preview_call_counts_are_exact();

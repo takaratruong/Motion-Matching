@@ -2,13 +2,37 @@
 
 #include "interaction_pick_assist.h"
 
+#include <array>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace interaction {
+
+class FunnelProposalProvider;
+
+enum class SmartPickupProviderMode {
+    Authored,
+    Learned,
+};
+
+struct SmartPickupProductionConfig {
+    SmartPickupProviderMode mode = SmartPickupProviderMode::Authored;
+    std::filesystem::path python{};
+    std::filesystem::path checkpoint{};
+    std::filesystem::path worker{};
+    std::filesystem::path work_directory{};
+    std::array<uint8_t, 32> checkpoint_sha256{};
+};
+
+SmartPickupProductionConfig parse_smart_pickup_production_config(
+    const std::map<std::string, std::string>& environment);
+SmartPickupProductionConfig load_smart_pickup_production_config();
 
 using SmartPickupPreviewCallback = std::function<std::optional<PickEntryPreview>(
     const LocomotionSnapshot&,
@@ -77,6 +101,7 @@ struct SmartPickupPostStepResult {
 class SmartPickupController {
 public:
     SmartPickupController();
+    explicit SmartPickupController(const SmartPickupProductionConfig& config);
     explicit SmartPickupController(SmartPickupAssistBackend& backend);
     ~SmartPickupController();
 
@@ -99,6 +124,7 @@ private:
         uint32_t affordance_id = 0U;
     };
 
+    std::unique_ptr<FunnelProposalProvider> owned_provider_{};
     std::unique_ptr<SmartPickupAssistBackend> owned_backend_{};
     SmartPickupAssistBackend* backend_ = nullptr;
     std::optional<PendingManualPickActivation> pending_activation_{};
