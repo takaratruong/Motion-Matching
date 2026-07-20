@@ -9,6 +9,9 @@ from .artifacts import read_artifact_set
 from .schema import InteractionArtifact, InteractionPhase
 
 
+APPROACH_HORIZON_FRAMES = 75
+
+
 @dataclass(frozen=True)
 class FunnelDataset:
     conditions: np.ndarray  # [N, 18], float32
@@ -82,13 +85,17 @@ def extract_dataset(artifact: InteractionArtifact) -> FunnelDataset:
     for clip, (start, stop) in enumerate(zip(artifact.range_starts, artifact.range_stops)):
         clip_phases = artifact.phases[start:stop]
         reaches = np.flatnonzero(clip_phases == int(InteractionPhase.REACH))
-        if len(reaches) == 0 or int(reaches[0]) < 15:
+        contacts = np.flatnonzero(clip_phases == int(InteractionPhase.CONTACT))
+        if len(reaches) == 0 or len(contacts) == 0 or int(reaches[0]) < 1:
             continue
         reach = int(start + reaches[0])
-        object_yaw = _yaw(artifact.object_rotations[reach])
-        object_position = artifact.object_positions[reach]
+        object_frame = int(start + contacts[0] - 1)
+        object_yaw = _yaw(artifact.object_rotations[object_frame])
+        object_position = artifact.object_positions[object_frame]
+        anchor = max(int(start), reach - APPROACH_HORIZON_FRAMES)
+        frame_indices = np.rint(np.linspace(anchor, reach, 16)).astype(np.int64)
         rows = []
-        for frame in range(reach - 15, reach + 1):
+        for frame in frame_indices:
             local_x, local_z = _object_local_delta(artifact.positions[frame, 0] - object_position, object_yaw)
             relative_yaw = _yaw(artifact.rotations[frame, 0]) - object_yaw
             rows.append((local_x, local_z, np.sin(relative_yaw), np.cos(relative_yaw)))

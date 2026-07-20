@@ -109,6 +109,7 @@ def sample_ddim(
     seed: int,
     proposal_count: int = 32,
     step_count: int = DDIM_STEPS,
+    prediction_type: str = "epsilon",
 ) -> torch.Tensor:
     """Sample a deterministic proposal-major batch, shaped [B, 32, 16, 4]."""
     if condition.ndim != 2 or condition.shape[1] != MODEL_CONDITION_DIM:
@@ -126,16 +127,58 @@ def sample_ddim(
     for index, timestep in enumerate(timesteps):
         previous = timesteps[index + 1] if index + 1 < len(timesteps) else -1
         t = torch.full((x.shape[0],), timestep, dtype=torch.long, device=x.device)
-        epsilon = model(x, t, repeated_condition)
+        prediction = model(x, t, repeated_condition)
         alpha_bar = schedule.alpha_bars[timestep].to(x.device, torch.float32)
         previous_bar = (
             torch.tensor(1.0, device=x.device)
             if previous < 0
             else schedule.alpha_bars[previous].to(x.device, torch.float32)
         )
-        x0 = (x - torch.sqrt(1.0 - alpha_bar) * epsilon) / torch.sqrt(alpha_bar)
+        if prediction_type == "epsilon":
+            epsilon = prediction
+            x0 = (x - torch.sqrt(1.0 - alpha_bar) * epsilon) / torch.sqrt(alpha_bar)
+        elif prediction_type == "x0":
+            x0 = prediction
+            epsilon = (x - torch.sqrt(alpha_bar) * x0) / torch.sqrt(1.0 - alpha_bar)
+        else:
+            raise ValueError(f"unsupported prediction_type {prediction_type!r}")
         x = torch.sqrt(previous_bar) * x0 + torch.sqrt(1.0 - previous_bar) * epsilon
-    return x.reshape(batch, proposal_count, FUNNEL_SAMPLES, FUNNEL_CHANNELS).contiguous()
+    return (
+        x.reshape(batch, proposal_count, FUNNEL_CHANNELS, FUNNEL_SAMPLES)
+        .permute(0, 1, 3, 2)
+        .contiguous()
+    )
+
+
+@torch.no_grad()
+def sample_x0(
+    model: nn.Module,
+    condition: torch.Tensor,
+    *,
+    seed: int,
+    proposal_count: int = 32,
+) -> torch.Tensor:
+    """Predict clean funnels once from maximum-noise latent proposals."""
+    if condition.ndim != 2 or condition.shape[1] != MODEL_CONDITION_DIM:
+        raise ValueError("condition must have shape [B, 18]")
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    batch = condition.shape[0]
+    latent = torch.randn(
+        (batch * proposal_count, FUNNEL_CHANNELS, FUNNEL_SAMPLES),
+        generator=generator,
+        device="cpu",
+        dtype=torch.float32,
+    ).to(condition.device)
+    repeated = condition.repeat_interleave(proposal_count, dim=0)
+    timestep = torch.full(
+        (len(latent),), DIFFUSION_STEPS - 1, dtype=torch.long, device=condition.device
+    )
+    clean = model(latent, timestep, repeated)
+    return (
+        clean.reshape(batch, proposal_count, FUNNEL_CHANNELS, FUNNEL_SAMPLES)
+        .permute(0, 1, 3, 2)
+        .contiguous()
+    )
 
 
 def train_funnel(
@@ -159,8 +202,8 @@ def train_funnel(
     target_device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     condition_mean = conditions.mean(dim=0)
     condition_scale = conditions.std(dim=0, unbiased=False).clamp_min(1e-6)
-    funnel_mean = funnels.mean(dim=(0, 1), keepdim=True)
-    funnel_scale = funnels.std(dim=(0, 1), unbiased=False, keepdim=True).clamp_min(1e-6)
+    funnel_mean = funnels.mean(dim=0, keepdim=True)
+    funnel_scale = funnels.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6)
     normalized_conditions = ((conditions - condition_mean) / condition_scale).to(target_device)
     normalized_funnels = ((funnels - funnel_mean) / funnel_scale).permute(0, 2, 1).to(target_device)
     schedule = make_schedule()
@@ -177,13 +220,14 @@ def train_funnel(
         noise = torch.randn(clean.shape, generator=generator, device=target_device)
         noised = torch.sqrt(alpha_bar) * clean + torch.sqrt(1.0 - alpha_bar) * noise
         prediction = model(noised, timestep, condition)
-        loss = torch.nn.functional.mse_loss(prediction, noise)
+        loss = torch.nn.functional.mse_loss(prediction, clean)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
     checkpoint = {
         "schema_version": 1,
+        "prediction_type": "x0",
         "seed": seed,
         "model": model.cpu().state_dict(),
         "condition_mean": condition_mean.cpu(),
@@ -202,6 +246,8 @@ def load_funnel_checkpoint(path: Path, *, device: str = "cpu") -> tuple[FunnelDe
     checkpoint = torch.load(Path(path), map_location=device, weights_only=False)
     if checkpoint.get("schema_version") != 1:
         raise ValueError("unsupported funnel checkpoint schema")
+    if checkpoint.get("prediction_type") not in {"epsilon", "x0"}:
+        raise ValueError("checkpoint has no valid prediction type")
     model = FunnelDenoiser().to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
@@ -223,7 +269,17 @@ def sample_checkpoint(
     model, schedule, checkpoint = load_funnel_checkpoint(path, device=device)
     raw_condition = condition.to(device=device, dtype=torch.float32)
     normalized = (raw_condition - checkpoint["condition_mean"].to(device)) / checkpoint["condition_scale"].to(device)
-    normalized_samples = sample_ddim(model, normalized, schedule, seed=seed, step_count=step_count)
+    if checkpoint["prediction_type"] == "x0":
+        normalized_samples = sample_x0(model, normalized, seed=seed)
+    else:
+        normalized_samples = sample_ddim(
+            model,
+            normalized,
+            schedule,
+            seed=seed,
+            step_count=step_count,
+            prediction_type="epsilon",
+        )
     samples = normalized_samples * checkpoint["funnel_scale"].to(device) + checkpoint["funnel_mean"].to(device)
     yaw = samples[..., 2:4].to(torch.float64)
     norm = torch.linalg.vector_norm(yaw, dim=-1, keepdim=True)

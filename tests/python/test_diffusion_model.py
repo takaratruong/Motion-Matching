@@ -63,6 +63,26 @@ class DiffusionModelTests(unittest.TestCase):
         )
         self.assertEqual(tuple(samples.shape), (1, 32, 16, 4))
 
+    def test_x0_sampling_is_one_step_and_deterministic(self):
+        from resources.g1_interaction_builder.diffusion import sample_x0
+
+        class CountingModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def forward(self, x, timestep, condition):
+                self.calls += 1
+                return torch.zeros_like(x)
+
+        model = CountingModel()
+        condition = torch.zeros((1, 18), dtype=torch.float32)
+        first = sample_x0(model, condition, seed=11)
+        second = sample_x0(model, condition, seed=11)
+        self.assertTrue(torch.equal(first, second))
+        self.assertEqual(tuple(first.shape), (1, 32, 16, 4))
+        self.assertEqual(model.calls, 2)
+
     def test_tiny_training_publishes_self_contained_checkpoint(self):
         from resources.g1_interaction_builder.diffusion import train_funnel
 
@@ -73,8 +93,11 @@ class DiffusionModelTests(unittest.TestCase):
             train_funnel(conditions, funnels, path, steps=1, batch_size=4, device="cpu")
             checkpoint = torch.load(path, weights_only=False)
         self.assertEqual(checkpoint["schema_version"], 1)
+        self.assertEqual(checkpoint["prediction_type"], "x0")
         self.assertIn("model", checkpoint)
         self.assertEqual(tuple(checkpoint["condition_mean"].shape), (18,))
+        self.assertEqual(tuple(checkpoint["funnel_mean"].shape), (1, 16, 4))
+        self.assertEqual(tuple(checkpoint["funnel_scale"].shape), (1, 16, 4))
 
 
 if __name__ == "__main__":
