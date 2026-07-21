@@ -1018,8 +1018,9 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                         flush=True,
                     )
         # Artifact generation can exceed GEAR's 500 ms LowState watchdog after
-        # the final physics step. Stop the process only after live control ends.
-        gate.quiesce()
+        # the final physics step. Use its official stop path while LowState is
+        # still fresh, then serialize evidence with GEAR already reaped.
+        gate.finish_policy()
         command_artifact = recorder.artifact_bytes()
         responsive_evidence = _write_responsive_evidence(
             bundle,

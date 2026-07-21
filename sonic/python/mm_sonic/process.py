@@ -3357,6 +3357,14 @@ class SimulationPolicyGate:
             raise ProcessError("GEAR process group did not verify as stopped")
         self.simulator.require_alive()
 
+    def finish_policy(self) -> None:
+        """Gracefully stop live GEAR before post-run evidence serialization."""
+
+        if self._closed:
+            raise RuntimeError("simulation policy gate is closed")
+        self.gear.close()
+        self._paused = True
+
     def release_steps(self, steps: int) -> AdvanceResult:
         _positive_integer(steps, "steps")
         self.require_paused()
