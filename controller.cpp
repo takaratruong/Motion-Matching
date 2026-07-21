@@ -52,6 +52,7 @@
 #include "cleanup_runtime.h"
 #include "g1_mesh_renderer.h"
 #include "interaction_native_g1_bridge.h"
+#include "interaction_arrival.h"
 #include "interaction_smart_pickup_controller.h"
 #include "interaction_smart_pickup_scene.h"
 
@@ -86,6 +87,58 @@ static_assert(G1_BoneCount == 31, "native G1 controller requires 31 bones");
 static inline Vector3 to_Vector3(vec3 v)
 {
     return Vector3{ v.x, v.y, v.z };
+}
+
+static constexpr float kNativePlaceMaximumRootErrorM = 0.25F;
+static constexpr float kNativePlaceMaximumYawErrorRadians = 0.436332313F;
+
+static vec3 controller_place_staging_stick(
+    const interaction::PlaceStagingPreview& preview,
+    const interaction::Transform& current_root,
+    float camera_azimuth)
+{
+    if (!preview.accepted || preview.ready)
+    {
+        return vec3();
+    }
+
+    vec3 root_error_world =
+        preview.staging_root_world.position - current_root.position;
+    root_error_world.y = 0.0F;
+    vec3 world_command;
+    if (preview.root_error_m > 0.02F && length(root_error_world) > 1.0e-5F)
+    {
+        const float position_weight = clampf(
+            preview.root_error_m / 0.75F, 0.20F, 1.00F);
+        world_command = position_weight * normalize(root_error_world);
+    }
+
+    if (preview.yaw_error_radians > 0.02F)
+    {
+        vec3 staging_facing = quat_mul_vec3(
+            preview.staging_root_world.rotation,
+            vec3(0.0F, 0.0F, 1.0F));
+        staging_facing.y = 0.0F;
+        if (length(staging_facing) > 1.0e-5F)
+        {
+            const float yaw_weight = 0.25F * clampf(
+                preview.yaw_error_radians /
+                    kNativePlaceMaximumYawErrorRadians,
+                0.0F,
+                1.0F);
+            world_command = world_command +
+                yaw_weight * normalize(staging_facing);
+        }
+    }
+
+    const float command_length = length(world_command);
+    if (command_length > 1.0F)
+    {
+        world_command = world_command / command_length;
+    }
+    const quat camera_control_basis = quat_from_angle_axis(
+        camera_azimuth, vec3(0.0F, 1.0F, 0.0F));
+    return quat_inv_mul_vec3(camera_control_basis, world_command);
 }
 
 static interaction::SmartPickupProductionConfig
@@ -2128,6 +2181,9 @@ int main(void)
     interaction::NativeG1PoseHandoff native_g1_pose_handoff;
     interaction::RuntimeOutput interaction_output{};
     interaction::SmartPickupPostStepResult smart_pickup_post_step{};
+    std::optional<interaction::PlaceStagingPreview> native_place_preview;
+    bool native_place_latched = false;
+    uint64_t native_place_request_id = 0U;
     uint64_t interaction_next_request_id = 1U;
     uint64_t smart_pickup_controller_tick = 0U;
     vec3 smart_pickup_previous_root =
@@ -2506,6 +2562,7 @@ int main(void)
 
         const bool smart_pickup_interact_pressed = IsKeyPressed(KEY_F);
         const bool smart_pickup_cancel_pressed = IsKeyPressed(KEY_X);
+        const bool smart_pickup_reset_pressed = IsKeyPressed(KEY_R);
         const bool smart_pickup_manual_override_pressed =
             IsKeyPressed(KEY_W) || IsKeyPressed(KEY_A) ||
             IsKeyPressed(KEY_S) || IsKeyPressed(KEY_D);
@@ -2522,7 +2579,7 @@ int main(void)
         smart_pickup_pre_input.interact_pressed =
             smart_pickup_interact_pressed;
         smart_pickup_pre_input.cancel_pressed =
-            smart_pickup_cancel_pressed;
+            smart_pickup_cancel_pressed || smart_pickup_reset_pressed;
         smart_pickup_pre_input.manual_override_pressed =
             smart_pickup_manual_override_pressed;
         smart_pickup_pre_input.selected_target = smart_pickup_target;
@@ -2540,6 +2597,50 @@ int main(void)
         gamepadstick_left = smart_pickup_pre_step.left_stick;
         gamepadstick_right = smart_pickup_pre_step.right_stick;
 
+        bool native_place_force_strafe = false;
+        if (smart_pickup_cancel_pressed || smart_pickup_reset_pressed ||
+            interaction_runtime.state() != interaction::RuntimeState::Carry)
+        {
+            native_place_latched = false;
+            native_place_preview.reset();
+            native_place_request_id = 0U;
+        }
+        if (!smart_pickup_cancel_pressed && !smart_pickup_reset_pressed &&
+            smart_pickup_interact_pressed &&
+            interaction_runtime.state() ==
+                interaction::RuntimeState::Carry &&
+            interaction_destination_surface_handle.id != 0U &&
+            interaction_destination_affordance_id != 0U)
+        {
+            native_place_latched = true;
+            native_place_request_id = interaction_next_request_id;
+            ++interaction_next_request_id;
+        }
+        if (native_place_latched &&
+            interaction_runtime.state() == interaction::RuntimeState::Carry)
+        {
+            native_place_preview = interaction_runtime.preview_place(
+                interaction_destination_surface_handle,
+                interaction_destination_affordance_id);
+            if (native_place_preview->accepted)
+            {
+                const interaction::Transform native_root{
+                    state.simulation_position,
+                    state.simulation_rotation};
+                gamepadstick_left = controller_place_staging_stick(
+                    *native_place_preview,
+                    native_root,
+                    state.camera_azimuth);
+                vec3 staging_forward = quat_mul_vec3(
+                    native_place_preview->staging_root_world.rotation,
+                    vec3(0.0F, 0.0F, 1.0F));
+                gamepadstick_right = interaction::arrival_facing_stick(
+                    staging_forward,
+                    state.camera_azimuth);
+                native_place_force_strafe = true;
+            }
+        }
+
         const bool smart_pickup_immediate_stop =
             smart_pickup_pre_step.interact_consumed ||
             smart_pickup_post_step.assist_output.planning_barrier ||
@@ -2556,6 +2657,10 @@ int main(void)
         // Get if strafe is desired
         bool desired_strafe = desired_strafe_update();
         if (smart_pickup_pre_step.force_strafe)
+        {
+            desired_strafe = true;
+        }
+        if (native_place_force_strafe)
         {
             desired_strafe = true;
         }
@@ -3825,16 +3930,72 @@ int main(void)
             }
         }
 
+        std::optional<interaction::PlaceRequest> pending_native_place_request;
+        if (native_place_latched &&
+            interaction_runtime.state() == interaction::RuntimeState::Carry)
+        {
+            native_place_preview = interaction_runtime.preview_place(
+                interaction_destination_surface_handle,
+                interaction_destination_affordance_id);
+            const bool native_place_ready =
+                native_place_preview->accepted &&
+                native_place_preview->ready &&
+                native_place_preview->root_error_m <=
+                    kNativePlaceMaximumRootErrorM &&
+                native_place_preview->yaw_error_radians <=
+                    kNativePlaceMaximumYawErrorRadians &&
+                native_place_preview->candidate.selection_id != 0U &&
+                native_place_request_id != 0U;
+            if (native_place_ready)
+            {
+                interaction::PlaceRequest native_place_request{};
+                native_place_request.held_target =
+                    interaction_output.diagnostics.target;
+                native_place_request.surface =
+                    interaction_destination_surface_handle;
+                native_place_request.affordance_id =
+                    interaction_destination_affordance_id;
+                native_place_request.request_id =
+                    native_place_request_id;
+                native_place_request.selection_id =
+                    native_place_preview->candidate.selection_id;
+                pending_native_place_request = native_place_request;
+            }
+        }
+
         interaction::RuntimeInput interaction_input{};
         interaction_input.dt = dt;
         interaction_input.locomotion = native_g1_locomotion;
         interaction_input.interact_pressed =
-            smart_pickup_request.has_value();
+            smart_pickup_request.has_value() ||
+            pending_native_place_request.has_value();
         interaction_input.pick_request = smart_pickup_request;
+        interaction_input.place_request = pending_native_place_request;
         interaction_input.cancel_pressed =
             smart_pickup_cancel_pressed &&
             !smart_pickup_pre_step.cancel_consumed;
+        interaction_input.reset_pressed = smart_pickup_reset_pressed;
         interaction_output = interaction_runtime.update(interaction_input);
+        if (smart_pickup_reset_pressed)
+        {
+            native_g1_pose_handoff.reset();
+        }
+        if (pending_native_place_request.has_value() ||
+            interaction_output.diagnostics.state !=
+                interaction::RuntimeState::Carry)
+        {
+            native_place_latched = false;
+            native_place_preview.reset();
+            native_place_request_id = 0U;
+        }
+        const interaction::InteractionTarget* refreshed_interaction_target =
+            interaction_registry.find_by_id(
+                interaction_scene_target_handle.id);
+        if (refreshed_interaction_target != nullptr)
+        {
+            interaction_scene_target_handle =
+                refreshed_interaction_target->handle;
+        }
         ++smart_pickup_controller_tick;
         const interaction::NativeG1FrameState native_g1_frame =
             native_g1_pose_handoff.apply(
@@ -4003,6 +4164,41 @@ int main(void)
                 rendered_interaction_target->table_size.y,
                 rendered_interaction_target->table_size.z,
                 DARKGRAY);
+        }
+
+        const interaction::PlacementSurface* rendered_destination_surface =
+            interaction_surface_registry.find_by_id(
+                interaction_destination_surface_handle.id);
+        if (rendered_destination_surface != nullptr)
+        {
+            DrawCubeWires(
+                to_Vector3(
+                    rendered_destination_surface
+                        ->support_volume_world.position),
+                rendered_destination_surface->support_volume_size.x,
+                rendered_destination_surface->support_volume_size.y,
+                rendered_destination_surface->support_volume_size.z,
+                BLUE);
+        }
+        if (native_place_preview.has_value() &&
+            native_place_preview->accepted)
+        {
+            const vec3 staging_position =
+                native_place_preview->staging_root_world.position;
+            const vec3 staging_forward = quat_mul_vec3(
+                native_place_preview->staging_root_world.rotation,
+                vec3(0.0F, 0.0F, 1.0F));
+            DrawCylinderWires(
+                to_Vector3(staging_position),
+                0.14F,
+                0.14F,
+                0.01F,
+                16,
+                native_place_preview->ready ? GREEN : BLUE);
+            DrawLine3D(
+                to_Vector3(staging_position),
+                to_Vector3(staging_position + 0.35F * staging_forward),
+                native_place_preview->ready ? GREEN : BLUE);
         }
 
         const std::optional<interaction::LearnedPickupDebugSnapshot>

@@ -84,6 +84,36 @@ class NativeG1ControllerTests(unittest.TestCase):
         self.assertIn("g1_skeleton::kParents", skeleton_block)
         self.assertNotIn("state.global_bone_positions", skeleton_block)
 
+    def test_native_carry_places_and_refreshes_for_repickup(self):
+        self.assertIn("controller_place_staging_stick(", SOURCE)
+        self.assertIn("interaction_runtime.preview_place(", SOURCE)
+        self.assertIn("interaction::PlaceRequest native_place_request", SOURCE)
+        self.assertIn("native_place_request.selection_id =", SOURCE)
+        self.assertIn(
+            "interaction_input.place_request = pending_native_place_request",
+            SOURCE,
+        )
+        self.assertIn("interaction_input.reset_pressed =", SOURCE)
+        self.assertIn("native_g1_pose_handoff.reset();", SOURCE)
+        self.assertIn("rendered_destination_surface", SOURCE)
+        self.assertIn("native_place_preview->staging_root_world.position", SOURCE)
+
+        carry_block = SOURCE.split(
+            "interaction_runtime.state() ==\n"
+            "                interaction::RuntimeState::Carry", 1)[1]
+        self.assertIn("++interaction_next_request_id", carry_block)
+        self.assertIn("interaction::arrival_facing_stick(", carry_block)
+
+        refresh_block = SOURCE.split(
+            "interaction_output = interaction_runtime.update(interaction_input)",
+            1,
+        )[1]
+        self.assertIn(
+            "interaction_registry.find_by_id(\n"
+            "                interaction_scene_target_handle.id)",
+            refresh_block,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
