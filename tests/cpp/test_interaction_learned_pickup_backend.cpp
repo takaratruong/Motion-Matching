@@ -361,7 +361,7 @@ void test_provider_backed_lifecycle_submits_after_native_funnel() {
         backend.observe(lifecycle_observation(10U, target, entry));
     assert(provider.begin_calls == 1);
     assert(provider.poll_calls == 1);
-    assert(provider.wait_calls == 0);
+    assert(provider.wait_calls == 1);
     assert(selection.preview_requests.size() == 31U);
     assert(backend.learned_diagnostics().state ==
            interaction::LearnedPickupState::SelectionPreview);
@@ -394,24 +394,18 @@ void test_provider_backed_lifecycle_submits_after_native_funnel() {
         vec3(0.18F, entry.position.y, 0.94F),
         entry.rotation,
     };
-    const interaction::PickAssistOutput route_follow =
+    const interaction::PickAssistOutput final_request =
         backend.observe(lifecycle_observation(12U, target, tracked));
-    assert(route_follow.override_steering);
-    assert(route_follow.force_strafe);
-    assert(backend.observe(lifecycle_observation(13U, target, tracked))
-               .override_steering);
-    const interaction::PickAssistOutput final_request = backend.observe(
-        lifecycle_observation(14U, target, tracked));
     assert(final_request.preview_requests.size() == 1U);
     assert(backend.learned_diagnostics().state ==
            interaction::LearnedPickupState::FinalPreview);
     assert(backend.learned_diagnostics().follower_progress_index ==
-           interaction::kFunnelExecutionTickCount - 1);
+           static_cast<int>(debug->world_route.size() - 1U));
     assert(backend.learned_diagnostics().follower_lookahead_index ==
-           interaction::kFunnelExecutionTickCount - 1);
+           static_cast<int>(debug->world_route.size() - 1U));
 
     interaction::PickAssistObservation final =
-        lifecycle_observation(15U, target, tracked);
+        lifecycle_observation(13U, target, tracked);
     final.preview_snapshot_fingerprint = final.snapshot_fingerprint;
     interaction::PickEntryPreview preview{};
     preview.path_feasible = true;
@@ -449,8 +443,9 @@ void test_provider_timeout_fails_closed_and_cancels_worker() {
     assert(!backend.take_submission(1U).has_value());
 }
 
-void test_moving_entry_prefetch_keeps_walking_until_handoff() {
+void test_moving_activation_freezes_and_builds_complete_route() {
     FakeProposalProvider provider;
+    provider.ready = true;
     LearnedSmartPickupBackend backend(provider, {});
     const auto target = lifecycle_target();
     const interaction::Transform far_root{
@@ -470,42 +465,24 @@ void test_moving_entry_prefetch_keeps_walking_until_handoff() {
     moving.displayed_planar_speed_mps = 0.4F;
     const interaction::PickAssistOutput launched = backend.observe(moving);
     assert(provider.begin_calls == 1);
-    assert(provider.wait_calls == 0);
-    assert(std::abs(provider.request.condition[18]) < 1.0e-6F);
-    assert(std::abs(provider.request.condition[19] - 1.0F) < 1.0e-6F);
-    assert(launched.override_steering);
+    assert(provider.wait_calls == 1);
+    const float entry_radius = std::hypot(
+        provider.request.condition[18], provider.request.condition[19]);
+    const float entry_speed = std::hypot(
+        provider.request.condition[22], provider.request.condition[23]);
+    assert(entry_radius >= 0.45F && entry_radius <= 0.75F);
+    assert(entry_speed >= 0.05F && entry_speed <= 0.30F);
+    assert(launched.planning_barrier);
     assert(!launched.stationary_constraint);
-    assert(length(vec2(launched.left_stick.x, launched.left_stick.z)) > 0.0F);
-
-    interaction::Transform approaching = far_root;
-    approaching.position.z = 2.5F;
-    interaction::PickAssistObservation pending =
-        lifecycle_observation(11U, target, approaching);
-    pending.simulation_velocity = moving.simulation_velocity;
-    pending.displayed_planar_speed_mps = moving.displayed_planar_speed_mps;
-    const interaction::PickAssistOutput still_walking = backend.observe(pending);
-    assert(provider.poll_calls == 2);
-    assert(provider.wait_calls == 0);
-    assert(still_walking.override_steering);
-    assert(!still_walking.stationary_constraint);
-    assert(still_walking.preview_requests.empty());
-
-    provider.ready = true;
-    approaching.position.z = 2.0F;
-    const interaction::PickAssistOutput selection = backend.observe(
-        lifecycle_observation(12U, target, approaching));
-    assert(selection.preview_requests.size() == 31U);
-    assert(selection.override_steering);
-    assert(!selection.stationary_constraint);
+    assert(launched.preview_requests.size() == 31U);
     assert(backend.learned_diagnostics().state ==
            interaction::LearnedPickupState::SelectionPreview);
 
-    approaching.position.z = 1.8F;
     interaction::PickAssistObservation selected =
-        lifecycle_observation(13U, target, approaching);
+        lifecycle_observation(10U, target, far_root);
     selected.preview_snapshot_fingerprint = selected.snapshot_fingerprint;
     for (const interaction::PickAssistPreviewRequest& request :
-         selection.preview_requests) {
+         launched.preview_requests) {
         interaction::PickEntryPreview preview{};
         preview.path_feasible = true;
         preview.match_ready = true;
@@ -513,34 +490,25 @@ void test_moving_entry_prefetch_keeps_walking_until_handoff() {
         preview.total_cost = static_cast<float>(request.slot_id);
         selected.preview_results.push_back({request, preview});
     }
-    const interaction::PickAssistOutput waiting = backend.observe(selected);
-    assert(backend.learned_diagnostics().state ==
-           interaction::LearnedPickupState::AwaitEntry);
-    assert(waiting.override_steering);
-    assert(!waiting.stationary_constraint);
-    const auto prefetched_debug = backend.learned_debug_snapshot();
-    assert(prefetched_debug.has_value());
-    assert(prefetched_debug->active);
-    assert(!prefetched_debug->world_route.empty());
-
-    approaching.position.z = 1.3F;
-    const interaction::PickAssistOutput outside_entry = backend.observe(
-        lifecycle_observation(14U, target, approaching));
-    assert(backend.learned_diagnostics().state ==
-           interaction::LearnedPickupState::AwaitEntry);
-    assert(outside_entry.override_steering);
-    assert(!outside_entry.stationary_constraint);
-
-    approaching.position.z = 1.11F;
-    const interaction::PickAssistOutput handed_off = backend.observe(
-        lifecycle_observation(15U, target, approaching));
+    const interaction::PickAssistOutput following = backend.observe(selected);
     assert(backend.learned_diagnostics().state ==
            interaction::LearnedPickupState::FunnelFollow);
-    assert(handed_off.override_steering);
-    assert(!handed_off.stationary_constraint);
+    assert(following.override_steering);
+    assert(!following.stationary_constraint);
+    const auto debug = backend.learned_debug_snapshot();
+    assert(debug.has_value());
+    assert(debug->world_route.size() > interaction::kFunnelExecutionTickCount);
+    assert(std::abs(debug->world_route.front().x - far_root.position.x) < 1.0e-5F);
+    assert(std::abs(debug->world_route.front().z - far_root.position.z) < 1.0e-5F);
+    bool contains_entry = false;
+    for (const interaction::FunnelSample& sample : debug->world_route) {
+        const float radius = std::hypot(sample.x, sample.z);
+        contains_entry = contains_entry || std::abs(radius - entry_radius) < 1.0e-4F;
+    }
+    assert(contains_entry);
 }
 
-void test_capture_handoff_freezes_actual_pose_after_entering_annulus() {
+void test_activation_conditions_supported_entry_from_exact_live_pose() {
     FakeProposalProvider provider;
     provider.ready = true;
     LearnedSmartPickupBackend backend(provider, {});
@@ -554,34 +522,26 @@ void test_capture_handoff_freezes_actual_pose_after_entering_annulus() {
     };
     assert(backend.begin(start, &target));
 
-    const float facing = std::atan2(-0.4F, -0.8F);
     const interaction::Transform crossed{
         vec3(0.4F, 0.0F, 0.8F),
         quat(1.0F, 0.0F, 0.0F, 0.0F),
     };
-    const interaction::PickAssistOutput handoff_turn =
-        backend.observe(lifecycle_observation(10U, target, crossed));
-    assert(handoff_turn.override_steering);
-    assert(handoff_turn.force_strafe);
-    assert(std::abs(handoff_turn.left_stick.x) < 1.0e-6F);
-    assert(std::abs(handoff_turn.left_stick.z) < 1.0e-6F);
-    interaction::Transform turned = crossed;
-    turned.rotation = quat_from_angle_axis(
-        facing, vec3(0.0F, 1.0F, 0.0F));
     interaction::PickAssistObservation moving =
-        lifecycle_observation(11U, target, turned);
+        lifecycle_observation(10U, target, crossed);
     moving.simulation_velocity = vec3(0.2F, 0.0F, -0.3F);
     moving.displayed_planar_speed_mps = 0.4F;
     const interaction::PickAssistOutput selection = backend.observe(moving);
 
     assert(provider.begin_calls == 1);
     assert(provider.poll_calls == 1);
-    assert(provider.wait_calls == 0);
+    assert(provider.wait_calls == 1);
     assert(selection.preview_requests.size() == 31U);
-    assert(std::abs(provider.request.condition[18] - 0.4F) < 1.0e-6F);
-    assert(std::abs(provider.request.condition[19] - 0.8F) < 1.0e-6F);
-    assert(std::abs(provider.request.condition[22] - 0.2F) < 1.0e-6F);
-    assert(std::abs(provider.request.condition[23] + 0.3F) < 1.0e-6F);
+    assert(std::abs(std::hypot(
+        provider.request.condition[18], provider.request.condition[19]) -
+        0.75F) < 1.0e-5F);
+    assert(std::abs(std::hypot(
+        provider.request.condition[22], provider.request.condition[23]) -
+        0.30F) < 1.0e-5F);
 }
 
 void test_provider_proposal_terminal_is_anchored_to_object_not_entry() {
@@ -673,8 +633,8 @@ int main() {
     test_arm_is_rejected_when_no_proposal_accepted();
     test_provider_backed_lifecycle_submits_after_native_funnel();
     test_provider_timeout_fails_closed_and_cancels_worker();
-    test_moving_entry_prefetch_keeps_walking_until_handoff();
-    test_capture_handoff_freezes_actual_pose_after_entering_annulus();
+    test_moving_activation_freezes_and_builds_complete_route();
+    test_activation_conditions_supported_entry_from_exact_live_pose();
     test_provider_proposal_terminal_is_anchored_to_object_not_entry();
     test_no_accepted_proposal_and_malformed_preview_fail_closed();
     test_target_mutation_and_cancel_fail_closed();

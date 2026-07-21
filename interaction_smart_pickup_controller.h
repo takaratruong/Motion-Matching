@@ -46,7 +46,7 @@ struct LearnedPickupDebugSnapshot {
     FunnelSample frozen_entry_world{};
     FunnelSample tracked_root_world{};
     FunnelSample terminal_root_world{};
-    FunnelExecutionTargets world_route{};
+    std::vector<FunnelSample> world_route{};
     int progress_index = 0;
     int lookahead_index = 0;
 };

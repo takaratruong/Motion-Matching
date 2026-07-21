@@ -16,6 +16,7 @@
 #include "interaction_funnel_artifact.h"
 #include "interaction_funnel_capture.h"
 #include "interaction_funnel_follower.h"
+#include "interaction_funnel_plan.h"
 #include "interaction_funnel_worker.h"
 #include "interaction_learned_pickup_diagnostics.h"
 #include "interaction_pick_assist.h"
@@ -36,6 +37,10 @@ struct LearnedPickupConfig {
     float handoff_position_tolerance_m = 0.12F;
     float capture_yaw_tolerance_radians = 20.0F * PIf / 180.0F;
     float prefetch_minimum_planar_speed_mps = 0.05F;
+    float supported_minimum_entry_radius_m = 0.45F;
+    float supported_maximum_entry_radius_m = 0.75F;
+    float supported_minimum_entry_speed_mps = 0.05F;
+    float supported_maximum_entry_speed_mps = 0.30F;
     uint64_t batch_seed = 2026071901U;
     std::array<uint8_t, 32> checkpoint_sha256{};
 };
@@ -79,8 +84,6 @@ private:
         FunnelProposalPoll poll);
     PickAssistOutput coarse_capture_output(
         const PickAssistObservation& observation) const;
-    bool arm_selected_if_at_entry(
-        const PickAssistObservation& observation);
     PickAssistOutput fail(LearnedPickupFailureReason reason);
     PickAssistOutput braking_output() const;
     bool authority_matches(const PickAssistObservation& observation) const;
@@ -91,13 +94,16 @@ private:
     ControllerPickAssist authored_{};
     PickAssistStart start_{};
     FunnelCaptureSelection capture_{};
+    FunnelApproachPlan approach_plan_{};
+    Transform frozen_root_world_{};
     Transform frozen_entry_world_{};
     Transform frozen_object_world_{};
     Transform tracked_root_world_{};
     FunnelProposalRequest proposal_request_{};
     std::vector<PickAssistPreviewRequest> selection_requests_{};
     std::vector<size_t> selection_proposal_indices_{};
-    FunnelExecutionTargets selected_world_targets_{};
+    FunnelRoute selected_route_object_{};
+    std::vector<FunnelSample> selected_world_targets_{};
     PickEntryRoot final_root_{};
     std::optional<InteractionFunnelFollower> follower_{};
     PickAssistDiagnostics diagnostics_{};

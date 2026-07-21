@@ -89,6 +89,7 @@ struct PickAssistOutput {
     vec3 right_stick{};
     bool force_strafe = false;
     bool stationary_constraint = false;
+    bool planning_barrier = false;
     std::vector<PickAssistPreviewRequest> preview_requests{};
     bool submit_interact = false;
 };
