@@ -2188,6 +2188,11 @@ int main(void)
     uint64_t smart_pickup_controller_tick = 0U;
     vec3 smart_pickup_previous_root =
         state.adjusted_bone_positions(G1_Simulation);
+    array1d<vec3> final_g1_local_positions(G1_BoneCount);
+    array1d<vec3> final_g1_local_velocities(G1_BoneCount);
+    array1d<quat> final_g1_local_rotations(G1_BoneCount);
+    array1d<vec3> final_g1_local_angular_velocities(G1_BoneCount);
+    array1d<bool> final_g1_contacts(2);
 
     if (test_config.mode == G1_TestSequential) {
         const int sequential_frames =
@@ -2455,6 +2460,7 @@ int main(void)
         if (::IsKeyPressed(KEY_M)) show_g1_mesh = !show_g1_mesh;
         if (::IsKeyPressed(KEY_B)) show_g1_bones = !show_g1_bones;
 
+        const bool scene_reset_requested = pending_reset;
         if (pending_reset)
         {
             if (!scene_reset_current(
@@ -2562,7 +2568,8 @@ int main(void)
 
         const bool smart_pickup_interact_pressed = IsKeyPressed(KEY_F);
         const bool smart_pickup_cancel_pressed = IsKeyPressed(KEY_X);
-        const bool smart_pickup_reset_pressed = IsKeyPressed(KEY_R);
+        const bool smart_pickup_reset_pressed =
+            IsKeyPressed(KEY_R) || scene_reset_requested;
         const bool smart_pickup_manual_override_pressed =
             IsKeyPressed(KEY_W) || IsKeyPressed(KEY_A) ||
             IsKeyPressed(KEY_S) || IsKeyPressed(KEY_D);
@@ -3972,14 +3979,10 @@ int main(void)
         interaction_input.pick_request = smart_pickup_request;
         interaction_input.place_request = pending_native_place_request;
         interaction_input.cancel_pressed =
-            smart_pickup_cancel_pressed &&
+            (smart_pickup_cancel_pressed || smart_pickup_reset_pressed) &&
             !smart_pickup_pre_step.cancel_consumed;
         interaction_input.reset_pressed = smart_pickup_reset_pressed;
         interaction_output = interaction_runtime.update(interaction_input);
-        if (smart_pickup_reset_pressed)
-        {
-            native_g1_pose_handoff.reset();
-        }
         if (pending_native_place_request.has_value() ||
             interaction_output.diagnostics.state !=
                 interaction::RuntimeState::Carry)
@@ -4005,11 +4008,11 @@ int main(void)
         const interaction::Pose final_g1_pose = native_g1_frame.pose;
         interaction::write_native_g1_pose(
             final_g1_pose,
-            state.adjusted_bone_positions,
-            state.bone_velocities,
-            state.adjusted_bone_rotations,
-            state.bone_angular_velocities,
-            state.curr_bone_contacts);
+            final_g1_local_positions,
+            final_g1_local_velocities,
+            final_g1_local_rotations,
+            final_g1_local_angular_velocities,
+            final_g1_contacts);
         interaction::WorldPose final_g1_world_pose =
             interaction::world_pose(final_g1_pose);
         if (native_g1_frame.synchronize_simulation_root)
@@ -4043,7 +4046,8 @@ int main(void)
             state.camera_azimuth,
             state.camera_altitude,
             state.camera_distance,
-            state.adjusted_bone_positions(0) + vec3(0, 1, 0),
+            final_g1_world_pose.positions[g1_skeleton::Simulation] +
+                vec3(0, 1, 0),
             // state.simulation_position + vec3(0, 1, 0),
             gamepadstick_right,
             desired_strafe,

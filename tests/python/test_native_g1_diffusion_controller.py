@@ -94,7 +94,7 @@ class NativeG1ControllerTests(unittest.TestCase):
             SOURCE,
         )
         self.assertIn("interaction_input.reset_pressed =", SOURCE)
-        self.assertIn("native_g1_pose_handoff.reset();", SOURCE)
+        self.assertNotIn("native_g1_pose_handoff.reset();", SOURCE)
         self.assertIn("rendered_destination_surface", SOURCE)
         self.assertIn("native_place_preview->staging_root_world.position", SOURCE)
 
@@ -113,6 +113,25 @@ class NativeG1ControllerTests(unittest.TestCase):
             "                interaction_scene_target_handle.id)",
             refresh_block,
         )
+
+    def test_reset_releases_without_bypassing_handoff(self):
+        self.assertIn("const bool scene_reset_requested = pending_reset", SOURCE)
+        self.assertIn(
+            "smart_pickup_cancel_pressed || smart_pickup_reset_pressed",
+            SOURCE,
+        )
+        self.assertNotIn("native_g1_pose_handoff.reset();", SOURCE)
+
+    def test_final_pose_uses_dedicated_channels(self):
+        self.assertIn("array1d<vec3> final_g1_local_positions", SOURCE)
+        write_block = SOURCE.split(
+            "interaction::write_native_g1_pose(\n            final_g1_pose",
+            1,
+        )[1].split("interaction::WorldPose final_g1_world_pose", 1)[0]
+        self.assertIn("final_g1_local_velocities", write_block)
+        self.assertIn("final_g1_local_angular_velocities", write_block)
+        self.assertNotIn("state.bone_velocities", write_block)
+        self.assertNotIn("state.bone_angular_velocities", write_block)
 
 
 if __name__ == "__main__":
